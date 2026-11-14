@@ -8,6 +8,62 @@
       "severity": "suggestion",
       "description": "The test's local `_shape_task` helper copies the recency key from `task.get('updated_at')` (snake_case), whereas production `tasks.py:_shape_task` reads `task.get('updatedAt')` (camelCase, the actual MCP/Taskmaster field name). The three new tests feed already-snake_cased fake tasks, so they exercise the max/None logic but never validate the real camelCase\u2192snake_case conversion; a regression in that field mapping would silently make `last_update` always None and go uncaught.",
       "mutation_type": "test_gap"
+    },
+    {
+      "id": "mined_1751_pool_01",
+      "location": "dashboard/src/dashboard/data/orchestrator.py:303",
+      "category": "comments_stance",
+      "severity": "suggestion",
+      "description": "A six-line inline comment above last_update defends the lexicographic max, names a rejected alternative and a scope rationale; it relies on an unenforced cross-package invariant (updatedAt always written by fused-memory sqlite_task_backend._now as UTC 'YYYY-MM-DDTHH:MM:SS.mmmZ') and its last line ('flatten the task tree first') is misleading since tasks._shape_task drops subtasks. The max itself is correct today.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1751_pool_02",
+      "location": "dashboard/src/dashboard/static/redux/tabs.jsx:328",
+      "category": "spec_wording_deviation",
+      "severity": "suggestion",
+      "description": "The task's user-observable signal is 'updated 4m ago', but DF_SHELL.timeago returns a bare unit ('4m'), so OrchTab renders 'Updated \u00b7 4m' and the overview renders '4m' under an 'Updated' header. The '\u2014' empty state is met by timeago itself.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1751_pool_03",
+      "location": "dashboard/src/dashboard/static/redux/tab_overview.jsx:229",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "Neither new render site (tab_overview.jsx Updated column, tabs.jsx 'Updated \u00b7' line) is covered by the repo's existing text-wiring JSX tests, so removing or misnaming timeago(o.last_update) would not be caught.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1751_pool_04",
+      "location": "dashboard/tests/test_orchestrator.py:1019",
+      "category": "unrealistic_fixtures",
+      "severity": "suggestion",
+      "description": "The new last_update tests use naive '2026-06-12T15:30:00' values instead of the production 'YYYY-MM-DDTHH:MM:SS.mmmZ' format, and no case covers an empty-string updated_at (the backend COALESCEs NULL to '').",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1751_pool_05",
+      "location": "dashboard/tests/test_orchestrator.py:1009",
+      "category": "test_duplication",
+      "severity": "suggestion",
+      "description": "The three new last_update tests repeat identical setup (function-local imports, config, find_running_orchestrators patch, discover call, length assert), differing only in the task list and expected value.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1751_pool_06",
+      "location": "dashboard/src/dashboard/data/redux_api.py:63",
+      "category": "inconsistent_absent_encoding",
+      "severity": "suggestion",
+      "description": "In the ORCHESTRATORS payload the sibling 'started' field encodes absence as '' while the new 'last_update' passes None through, giving two absent encodings for timestamp-like fields; both render as '\u2014' today only because timeago treats any falsy value alike.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1751_pool_07",
+      "location": "dashboard/src/dashboard/data/orchestrator.py:247",
+      "category": "stale_docstring",
+      "severity": "suggestion",
+      "description": "discover_orchestrators' docstring lists the enrichment keys it attaches (tasks, worktrees, summary) but was not updated for the new derived 'last_update' key.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

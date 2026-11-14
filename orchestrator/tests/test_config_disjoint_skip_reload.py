@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
+import pytest
+
 from orchestrator.config import (
     RELOADABLE_FIELDS,
     OrchestratorConfig,
@@ -23,15 +25,14 @@ from orchestrator.config import (
 )
 
 if TYPE_CHECKING:
-    from orchestrator.merge_types import MergeRequest
+    from orchestrator.merge_lane.types import MergeRequest
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestDisjointSkipGateDefault:
-    def test_defaults_to_requiring_verified_drift(self, monkeypatch, tmp_path):
+    def test_defaults_to_requiring_verified_drift(self):
         """Fail-safe by default: an extra verify costs minutes, a laundered
         red main cost nine hours."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         assert OrchestratorConfig().merge_disjoint_skip_requires_verified_drift is True
 
 
@@ -48,20 +49,16 @@ class TestDisjointSkipGateReloadDisposition:
         """Guard against a copy-paste that green-tiers the breadth knob too."""
         assert 'merge_verify_breadth' not in RELOADABLE_FIELDS
 
-    def test_edit_lands_in_applied_candidates_not_restart_required(
-        self, monkeypatch, tmp_path,
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_edit_lands_in_applied_candidates_not_restart_required(self):
         live = OrchestratorConfig(merge_disjoint_skip_requires_verified_drift=True)
         fresh = OrchestratorConfig(merge_disjoint_skip_requires_verified_drift=False)
         diff = diff_config(live, fresh)
         assert 'merge_disjoint_skip_requires_verified_drift' in diff.applied_candidates
         assert 'merge_disjoint_skip_requires_verified_drift' not in diff.restart_required
 
-    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_applies_in_place(self):
         live = OrchestratorConfig(merge_disjoint_skip_requires_verified_drift=True)
         fresh = OrchestratorConfig(merge_disjoint_skip_requires_verified_drift=False)
         report = apply_reload(live, fresh)
@@ -80,64 +77,66 @@ class TestDisjointSkipBlockers:
         from types import SimpleNamespace
         return cast('MergeRequest', SimpleNamespace(task_id='t', config=config))
 
-    def test_verified_drift_and_scoped_breadth_has_no_blockers(
-        self, monkeypatch, tmp_path,
-    ):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        from orchestrator.merge_gates import (
+    @pytest.mark.usefixtures("code_default_config")
+    def test_verified_drift_and_scoped_breadth_has_no_blockers(self, tmp_path):
+        from orchestrator.merge_lane.gates import (
             _disjoint_skip_blockers,
             note_queue_verified_main_tip,
         )
         sha = 'f' * 40
-        note_queue_verified_main_tip(sha)
+        note_queue_verified_main_tip(tmp_path, sha)
         cfg = OrchestratorConfig(merge_verify_breadth='scoped')
-        assert _disjoint_skip_blockers(self._req(cfg), rebased_onto=sha) == []
+        assert _disjoint_skip_blockers(
+            self._req(cfg), project_root=tmp_path, rebased_onto=sha,
+        ) == []
 
-    def test_unverified_drift_blocks(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        from orchestrator.merge_gates import _disjoint_skip_blockers
+    @pytest.mark.usefixtures("code_default_config")
+    def test_unverified_drift_blocks(self, tmp_path):
+        from orchestrator.merge_lane.gates import _disjoint_skip_blockers
         cfg = OrchestratorConfig(merge_verify_breadth='scoped')
-        blockers = _disjoint_skip_blockers(self._req(cfg), rebased_onto='0' * 40)
+        blockers = _disjoint_skip_blockers(
+            self._req(cfg), project_root=tmp_path, rebased_onto='0' * 40,
+        )
         assert len(blockers) == 1 and 'unverified drift' in blockers[0]
 
-    def test_kill_switch_restores_legacy_trust(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        from orchestrator.merge_gates import _disjoint_skip_blockers
+    @pytest.mark.usefixtures("code_default_config")
+    def test_kill_switch_restores_legacy_trust(self, tmp_path):
+        from orchestrator.merge_lane.gates import _disjoint_skip_blockers
         cfg = OrchestratorConfig(
             merge_verify_breadth='scoped',
             merge_disjoint_skip_requires_verified_drift=False,
         )
-        assert _disjoint_skip_blockers(self._req(cfg), rebased_onto='0' * 40) == []
+        assert _disjoint_skip_blockers(
+            self._req(cfg), project_root=tmp_path, rebased_onto='0' * 40,
+        ) == []
 
-    def test_whole_tree_breadth_blocks_even_with_kill_switch_off(
-        self, monkeypatch, tmp_path,
-    ):
+    @pytest.mark.usefixtures("code_default_config")
+    def test_whole_tree_breadth_blocks_even_with_kill_switch_off(self, tmp_path):
         """A project that declares a whole-tree merge gate has declared the
         skip unsound outright, not merely expensive — so the P2 kill switch
         does not reach this arm."""
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        from orchestrator.merge_gates import (
+        from orchestrator.merge_lane.gates import (
             _disjoint_skip_blockers,
             note_queue_verified_main_tip,
         )
         sha = 'e' * 40
-        note_queue_verified_main_tip(sha)
+        note_queue_verified_main_tip(tmp_path, sha)
         cfg = OrchestratorConfig(
             merge_verify_breadth='full',
             merge_disjoint_skip_requires_verified_drift=False,
         )
-        blockers = _disjoint_skip_blockers(self._req(cfg), rebased_onto=sha)
+        blockers = _disjoint_skip_blockers(
+            self._req(cfg), project_root=tmp_path, rebased_onto=sha,
+        )
         assert len(blockers) == 1 and 'whole-tree' in blockers[0]
 
-    def test_missing_config_fails_safe(self):
+    def test_missing_config_fails_safe(self, tmp_path):
         """Unknown premises answer 'distrust', matching the overlap probe's
         own fail-CLOSED policy."""
         from types import SimpleNamespace
 
-        from orchestrator.merge_gates import _disjoint_skip_blockers
+        from orchestrator.merge_lane.gates import _disjoint_skip_blockers
         req = cast('MergeRequest', SimpleNamespace(task_id='t'))
-        assert _disjoint_skip_blockers(req, rebased_onto='0' * 40) != []
+        assert _disjoint_skip_blockers(
+            req, project_root=tmp_path, rebased_onto='0' * 40,
+        ) != []

@@ -10,13 +10,13 @@ single writer for freeing a task's module locks — see contract C5 of
 plans/scheduler-dispatch-scoring-and-lock-layer-prd.md. It is the only path
 that emits a *full-release* ``lock_released`` (``lock_table.release_subset``
 emits the narrower ``reason='plan_refinement'`` partial, which closes only
-the modules it narrows away), and it also snapshots the held modules before
-releasing, clears ``_dispatched`` / ``_dispatched_priority``, arms the
+the modules it narrows away), and it also names the modules ``release``
+returns in that event, clears ``_dispatched`` / ``_dispatched_priority``, arms the
 requeue cooldown, and runs the defensive ``clear_parks_for``.
 
 A call that reaches ``lock_table.release`` directly is worse than a silent
 release: it empties ``_held[task_id]`` first, so the workflow's later
-teardown ``Scheduler.release`` snapshots ``modules == []`` and skips its
+teardown ``Scheduler.release`` gets ``modules == []`` back and skips its
 emit too. The stream is then left with a ``lock_acquired`` that has no
 matching ``lock_released`` anywhere — a stuck-lock artifact that reads as an
 infinite hold to any consumer measuring hold durations from acquire/release
@@ -33,8 +33,8 @@ orchestrator/tests/test_scheduler.py as direct ``ModuleLockTable`` unit
 tests, which are legitimate — scanning the tests tree would make the
 assertion fail against itself.
 
-Mirrors the AST-walk / rglob / offender file:line list / skip-self pattern
-of orchestrator/tests/test_prune_chokepoint_guard.py, whose
+Mirrors the AST-walk / offender file:line list / skip-self pattern of
+orchestrator/tests/test_prune_chokepoint_guard.py, whose
 ``_chokepoint_ranges`` class-qualification recursion is reused here.
 """
 from __future__ import annotations
@@ -45,16 +45,21 @@ from pathlib import Path
 from typing import TypeGuard
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _tree_scan import (
+    ORCHESTRATOR_SRC_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# This guard AST-parses every *.py under orchestrator/src/orchestrator/ via
-# rglob. Not individually reproduced under load; marked because it is
-# structurally identical to the three members that crashed.
-# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
-# ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 _THIS_FILE = Path(__file__).name
 
@@ -63,7 +68,7 @@ _GUARDED_METHOD = 'release'
 _CHOKEPOINT_CLASS = 'Scheduler'
 _CHOKEPOINT_METHOD = 'release'
 
-_SRC_DIR = Path(__file__).parent.parent / 'src'
+_SRC_DIR = ORCHESTRATOR_SRC_DIR.parent
 
 
 def _lock_table_aliases(tree: ast.Module) -> frozenset[str]:
@@ -119,7 +124,7 @@ def _is_lock_table_release(
     Four properties this matcher must have:
 
     - ``ast.Call``-only, so ``ModuleLockTable.release``'s own DEFINITION in
-      scheduler.py (an ``ast.FunctionDef``) is not matched — the invariant
+      lock_table.py (an ``ast.FunctionDef``) is not matched — the invariant
       is about call sites, not about the implementation they call.
     - ``attr == 'release'`` exactly, so ``lock_table.release_subset(...)``
       — which emits its own ``reason='plan_refinement'`` partial — is not
@@ -190,7 +195,11 @@ def _find_lock_table_releases(source: str) -> list[tuple[int, bool]]:
         tree = ast.parse(source)
     except SyntaxError:
         return []
+    return _find_lock_table_releases_in(tree)
 
+
+def _find_lock_table_releases_in(tree: ast.Module) -> list[tuple[int, bool]]:
+    """:func:`_find_lock_table_releases` over an already-parsed module."""
     chokepoint_ranges = _chokepoint_ranges(tree)
     aliases = _lock_table_aliases(tree)
 
@@ -207,57 +216,58 @@ def _find_lock_table_releases(source: str) -> list[tuple[int, bool]]:
     return results
 
 
-@functools.lru_cache(maxsize=1)
-def _scan_src() -> tuple[int, tuple[str, ...], tuple[str, ...]]:
+def _release_sites(module: ParsedModule) -> tuple[tuple[int, bool, str], ...]:
+    """``(lineno, inside_chokepoint, line_text)`` per ``lock_table.release(...)`` call; none if unparseable."""
+    if not module.may_name(_GUARDED_RECEIVER):
+        return ()
+    try:
+        tree = module.tree
+    except SyntaxError:
+        return ()
+    source_lines = module.source.splitlines()
+    return tuple(
+        (lineno, inside, source_lines[lineno - 1].strip() if lineno <= len(source_lines) else '')
+        for lineno, inside in _find_lock_table_releases_in(tree)
+    )
+
+
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem, files=functools.partial(python_files, _SRC_DIR), extract=_release_sites,
+)
+TREE_ANALYSES = (ANALYSIS,)
+
+
+def _scan_src(tree_pass: TreePass) -> tuple[int, tuple[str, ...], tuple[str, ...]]:
     """Scan orchestrator/src, returning (total, offenders, outside_chokepoint).
 
     Entries are ``'<rel_path>:<lineno>: <line_text>'`` strings.
-
-    Cached: parsing the whole src tree (scheduler.py alone is ~7k lines) is
-    the module's dominant cost and every test here wants the same answer —
-    nothing that could change it moves within a session. Results are tuples
-    so a caller cannot mutate the shared cached value.
     """
     offenders: list[str] = []
     outside_chokepoint: list[str] = []
-    total = 0
-
-    for py_file in sorted(_SRC_DIR.rglob('*.py')):
+    for py_file, sites in tree_pass.facts(ANALYSIS).items():
         if py_file.name == _THIS_FILE:
             continue  # skip-self, in case this guard ever lives under src
-        source = py_file.read_text(encoding='utf-8')
-        source_lines = source.splitlines()
         rel = py_file.relative_to(_SRC_DIR)
-        for lineno, inside in _find_lock_table_releases(source):
-            total += 1
-            line_text = (
-                source_lines[lineno - 1].strip()
-                if lineno <= len(source_lines)
-                else ''
-            )
+        for lineno, inside, line_text in sites:
             entry = f'{rel}:{lineno}: {line_text}'
             offenders.append(entry)
             if not inside:
                 outside_chokepoint.append(entry)
+    return len(offenders), tuple(offenders), tuple(outside_chokepoint)
 
-    return total, tuple(offenders), tuple(outside_chokepoint)
 
-
-def test_no_lock_table_release_outside_scheduler_release() -> None:
+def test_no_lock_table_release_outside_scheduler_release(tree_pass: TreePass) -> None:
     """Every ``lock_table.release(...)`` must route through
     ``Scheduler.release`` — the single writer, and the only emitter of a
     full-release ``lock_released``.
     """
-    total, offenders, outside_chokepoint = _scan_src()
+    total, offenders, outside_chokepoint = _scan_src(tree_pass)
 
     remediation = (
         'route it through `Scheduler.release(task_id, ...)`, the only site '
-        'that emits a full-release `lock_released` (`release_subset` emits '
-        'only the narrower `plan_refinement` partial) — see contract C5 of '
-        'plans/scheduler-dispatch-scoring-and-lock-layer-prd.md. A direct '
-        '`lock_table.release` empties _held[task_id] first, so the later '
-        'teardown release() snapshots modules == [] and skips its emit too, '
-        'leaving a lock_acquired with no matching lock_released.'
+        'that emits a full-release `lock_released`. Why a direct call leaves '
+        'a lock_acquired with no matching lock_released: see the module '
+        f'docstring of orchestrator/tests/{_THIS_FILE}.'
     )
 
     # Assert the TOTAL as well as the outside-list (belt and braces): a
@@ -280,14 +290,14 @@ def test_no_lock_table_release_outside_scheduler_release() -> None:
         raise AssertionError('\n'.join(message_lines))
 
 
-def test_scanner_finds_the_sanctioned_site() -> None:
+def test_scanner_finds_the_sanctioned_site(tree_pass: TreePass) -> None:
     """Anti-vacuity: the scanner must actually find the one real site.
 
     Without this, a matcher that silently broke (a renamed receiver, an AST
     shape change) would report zero hits and turn the guard above
     permanently, silently green.
     """
-    total, offenders, outside_chokepoint = _scan_src()
+    total, offenders, outside_chokepoint = _scan_src(tree_pass)
 
     assert total == 1, (
         'the scanner must find the one sanctioned lock_table.release site '

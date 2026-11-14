@@ -33,7 +33,8 @@ from _orch_helpers import wire_scheduler_liveness_mock
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import AdvanceOutcome, GitOps, TrainMembership, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     ABANDONED_REASON_PREFIX,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
     TRAIN_REBASE_CONFLICT_REASON_PREFIX,
@@ -42,7 +43,7 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
 )
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.quarantine_provenance import QuarantineOutcome
 from orchestrator.verify import VerifyResult, run_scoped_verification
 
 # Real git + real cargo integration module (see module docstring): a workspace
@@ -203,8 +204,24 @@ def build_group_merge_request(
 
 
 # ---------------------------------------------------------------------------
-# Helper: build an OrchestratorConfig for cargo workspace train tests
+# Helpers: build this file's OrchestratorConfigs
 # ---------------------------------------------------------------------------
+
+
+def _probe_on_scene_config(project_root: Path, **overrides: Any) -> OrchestratorConfig:
+    """This file's scene config: the main-health probe stays on, as shipped."""
+    return OrchestratorConfig(
+        project_root=project_root,
+        escalate_preexisting_main_break=True,
+        git=GitConfig(
+            main_branch="main",
+            branch_prefix="task/",
+            remote="origin",
+            worktree_dir=".worktrees",
+            push_after_advance=False,
+        ),
+        **overrides,
+    )
 
 
 def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
@@ -218,8 +235,8 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
       use the shared incremental build cache
     - verify_command_timeout_secs=300  (generous for CI; trivial workspace is fast)
     """
-    return OrchestratorConfig(
-        project_root=repo,
+    return _probe_on_scene_config(
+        repo,
         test_command="cargo test --workspace --quiet",
         # Use no-op shell builtins so lint/type_check don't interfere with
         # the Rust workspace.  'true' always exits 0.
@@ -227,13 +244,6 @@ def make_train_config(repo: Path, target_dir: Path) -> OrchestratorConfig:
         type_check_command="true",
         verify_env={"CARGO_TARGET_DIR": str(target_dir)},
         verify_command_timeout_secs=300.0,
-        git=GitConfig(
-            main_branch="main",
-            branch_prefix="task/",
-            remote="origin",
-            worktree_dir=".worktrees",
-            push_after_advance=False,
-        ),
     )
 
 
@@ -448,7 +458,7 @@ class TestScenario2WorktreeBase:
 
         # Create α branch off main with one commit so it has a non-main tip.
         wt_a, alpha_sha = await make_stacked_member(
-            git_ops, "alpha", (await git_ops._freshen_main())[0],
+            git_ops, "alpha", await git_ops._freshen_main(),
             lambda wt: (wt / "alpha.txt").write_text("alpha\n"),
         )
 
@@ -500,16 +510,7 @@ class TestScenario3IntraTrainDispatch:
 
         from orchestrator.scheduler import Scheduler
 
-        config = OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config = _probe_on_scene_config(tmp_path)
         scheduler = Scheduler(config)
 
         alpha_task = {
@@ -554,16 +555,7 @@ class TestScenario4ExtraTrainDispatchBlocked:
         """_deps_satisfied returns False when dependent has no train metadata."""
         from orchestrator.scheduler import Scheduler
 
-        config = OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config = _probe_on_scene_config(tmp_path)
         scheduler = Scheduler(config)
 
         alpha_task = {
@@ -602,16 +594,7 @@ class TestScenario4ExtraTrainDispatchBlocked:
         """
         from orchestrator.scheduler import Scheduler
 
-        config = OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config = _probe_on_scene_config(tmp_path)
         scheduler = Scheduler(config)
 
         alpha_task = {
@@ -712,7 +695,7 @@ class TestScenario5GroupMergeVerify:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         lane = MergeLane(git_ops, queue)
 
-        with patch("orchestrator.merge_queue.run_scoped_verification", side_effect=_spy_verify):
+        with patch("orchestrator.merge_lane.worker.run_scoped_verification", side_effect=_spy_verify):
             outcome = await merge_through_lane(lane, queue, req)
 
         # (i) Outcome is done.
@@ -1002,17 +985,10 @@ class TestScenario6ParkPrefixDerail:
         await _run(["git", "add", "-A"], cwd=repo6)
         await _run(["git", "commit", "-m", "initial"], cwd=repo6)
 
-        config6 = OrchestratorConfig(
-            project_root=repo6,
+        config6 = _probe_on_scene_config(
+            repo6,
             max_verify_attempts=5,
             max_failure_signature_repeat=3,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
         )
         git_ops6 = GitOps(config6.git, repo6)
 
@@ -1070,16 +1046,7 @@ class TestScenario6ParkPrefixDerail:
         await _run(["git", "add", "-A"], cwd=repo6b)
         await _run(["git", "commit", "-m", "initial"], cwd=repo6b)
 
-        config6b = OrchestratorConfig(
-            project_root=repo6b,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config6b = _probe_on_scene_config(repo6b)
         git_ops6b = GitOps(config6b.git, repo6b)
 
         wt_info = await git_ops6b.create_worktree("gamma6")
@@ -1131,7 +1098,7 @@ class TestScenario6ParkPrefixDerail:
         # to this test's live-vs-orphan routing.
         harness.git_ops.mark_pool_storage_present()
         harness.git_ops.worktree_has_unsaved_work = AsyncMock(return_value=False)
-        harness.git_ops.quarantine_worktree = AsyncMock(return_value=tmp_path / "q-dest")
+        harness.git_ops.quarantine_worktree = AsyncMock(return_value=QuarantineOutcome(dest=tmp_path / "q-dest"))
         harness.git_ops.cleanup_worktree = AsyncMock()
         harness.git_ops.prune_worktrees = AsyncMock()
         harness.config.worktree_orphan_reaper_enabled = True
@@ -1213,18 +1180,11 @@ class TestScenario7TrainResume:
         await _run(["git", "add", "-A"], cwd=repo)
         await _run(["git", "commit", "-m", "initial"], cwd=repo)
 
-        config7 = OrchestratorConfig(
-            project_root=repo,
+        config7 = _probe_on_scene_config(
+            repo,
             test_command="true",   # no real cargo — verify is mocked
             lint_command="true",
             type_check_command="true",
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
         )
         git_ops7 = GitOps(config7.git, repo)
 
@@ -1490,18 +1450,11 @@ class TestScenario8MainAdvances:
         await _run(["git", "add", "-A"], cwd=repo)
         await _run(["git", "commit", "-m", "initial"], cwd=repo)
 
-        config8r = OrchestratorConfig(
-            project_root=repo,
+        config8r = _probe_on_scene_config(
+            repo,
             test_command="true",
             lint_command="true",
             type_check_command="true",
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
         )
         git_ops8r = GitOps(config8r.git, repo)
 
@@ -1623,17 +1576,10 @@ class TestScenario9LoopGuardNonTrain:
         await _run(["git", "add", "-A"], cwd=repo9)
         await _run(["git", "commit", "-m", "initial"], cwd=repo9)
 
-        config9 = OrchestratorConfig(
-            project_root=repo9,
+        config9 = _probe_on_scene_config(
+            repo9,
             max_verify_attempts=5,
             max_failure_signature_repeat=3,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
         )
         git_ops9 = GitOps(config9.git, repo9)
 
@@ -1699,16 +1645,7 @@ class TestScenario10DoneProvGateUnweakened:
 
         # Build a real Scheduler with a minimal OrchestratorConfig.
         # mcp_session=None → uses mcp_call HTTP path (monkeypatched below).
-        config10 = OrchestratorConfig(
-            project_root=tmp_path,
-            git=GitConfig(
-                main_branch="main",
-                branch_prefix="task/",
-                remote="origin",
-                worktree_dir=".worktrees",
-                push_after_advance=False,
-            ),
-        )
+        config10 = _probe_on_scene_config(tmp_path)
         sched10 = Scheduler(config10)
 
         # Stub the MCP transport to return a done_provenance_invalid rejection.
@@ -2028,8 +1965,6 @@ async def _setup_gate_train(
     Returns (git_ops, config, req) ready to submit to a lane.
     Each member adds one unique .txt file so diffs are always non-empty.
     """
-    from orchestrator.config import GitConfig, OrchestratorConfig
-
     repo = tmp_path / "repo"
     repo.mkdir()
     await _run(["git", "init", "-b", "main"], cwd=repo)
@@ -2039,15 +1974,8 @@ async def _setup_gate_train(
     await _run(["git", "add", "-A"], cwd=repo)
     await _run(["git", "commit", "-m", "initial"], cwd=repo)
 
-    git_cfg = GitConfig(
-        main_branch="main",
-        branch_prefix="task/",
-        remote="origin",
-        worktree_dir=".worktrees",
-        push_after_advance=False,
-    )
-    config = OrchestratorConfig(project_root=repo, git=git_cfg)
-    git_ops = GitOps(git_cfg, repo)
+    config = _probe_on_scene_config(repo)
+    git_ops = GitOps(config.git, repo)
 
     a_name, b_name, c_name = member_names
 
@@ -2110,11 +2038,11 @@ class TestGate01TrainDiskGuard:
 
         with (
             patch(
-                "orchestrator.merge_queue.run_scoped_verification",
+                "orchestrator.merge_lane.worker.run_scoped_verification",
                 AsyncMock(return_value=_make_passing_verify_result()),
             ),
             patch(
-                "orchestrator.merge_queue.shutil.disk_usage",
+                "orchestrator.merge_lane.worker.shutil.disk_usage",
                 return_value=MagicMock(free=1 * _GIB),  # 1 GiB << 10 GiB threshold
             ),
             patch.object(
@@ -2190,7 +2118,7 @@ class TestGate03TrainVerifyTimeoutLoopBreaker:
         lane = MergeLane(git_ops, queue)
         verify = AsyncMock(return_value=times_out().result)
 
-        with patch("orchestrator.merge_queue.run_scoped_verification", verify):
+        with patch("orchestrator.merge_lane.worker.run_scoped_verification", verify):
             async with running_lane(lane) as run:
                 # Submissions 1..MAX run merge + verify and surface the timeout.
                 requests = [first_req]
@@ -2264,7 +2192,7 @@ class TestGate05TrainPostMergeEquivalence:
 
         with (
             patch(
-                "orchestrator.merge_queue.run_scoped_verification",
+                "orchestrator.merge_lane.worker.run_scoped_verification",
                 AsyncMock(return_value=_make_passing_verify_result()),
             ),
             patch(

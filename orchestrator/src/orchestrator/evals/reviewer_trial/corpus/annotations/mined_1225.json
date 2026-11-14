@@ -32,6 +32,54 @@
       "severity": "suggestion",
       "description": "The docstring guarantees a canonical, alphabetically-ordered, period-terminated string for stable cycle-over-cycle diffs, but the tests only assert individual substrings ('42 total', '18 done', etc.) and the prefix. They do not assert full-string equality or the alphabetical key ordering, so a regression in ordering, separator, or trailing period would pass undetected.",
       "mutation_type": "test_gap"
+    },
+    {
+      "id": "mined_1225_pool_01",
+      "location": "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py:407-451",
+      "category": "dead_code_spot",
+      "severity": "blocking",
+      "description": "The change adds format_snapshot_fact, a speculative helper with no caller (its docstring says so), placed in the MemoryConsolidator stage module, which has no snapshot-writing role. Its docstring claims it keeps the LLM prompt and readers aligned on fact format, but the Stage 1 prompt hand-writes its own example strings (and also a second 'reify task counts as of {ISO_date}: total=N, ...' format) with nothing deriving or checking them against the helper, so the snapshot fact format now has unlinked homes that can drift. The docstring's Note paragraph is reviewer-facing rationale and ends with `TODO(task-1225)`, naming the very task under review as owner of the deferred wiring, so once the task closes the debt has no owner.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1225_pool_02",
+      "location": "fused-memory/src/fused_memory/reconciliation/stages/memory_consolidator.py:441-451",
+      "category": "input_validation",
+      "severity": "suggestion",
+      "description": "format_snapshot_fact validates only that as_of is tz-aware. An empty counts mapping yields the malformed fact 'As of <date>: project X has .', and negative counts or keys with spaces/commas are accepted unchecked. The read-only counts parameter is typed dict rather than Mapping.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1225_pool_03",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:190",
+      "category": "dangling_reference",
+      "severity": "suggestion",
+      "description": "The new Snapshot Discipline text tells the LLM to 'see `## Graphiti Queued Writes`' for the memory_ids: [] invariant, but the Stage 1 prompt has no heading with that name; _STAGE1_GRAPHITI_QUEUED_GUIDANCE is interpolated as an unheaded paragraph under '## Verifying Writes'.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1225_pool_04",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:212-251",
+      "category": "prompt_inconsistency",
+      "severity": "suggestion",
+      "description": "After the change the prompt states snapshot policy in two places with conflicting wording. Snapshot Discipline says snapshot edges need no invalidation and accumulation is acceptable, yet still warns about 'the stale-edge surface you or a later cycle will have to clean up'; the untouched update_edge Temporal Limitation section still calls the invalidate+add_memory workaround 'Mandatory ... for all temporal/snapshot edge updates', lists task counts/task status under 'When this applies', and asks for a cycle-summary note about 'N snapshot edges'. Only an added Note paragraph carves snapshots out, leaving the LLM to reconcile contradictory rules.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1225_pool_05",
+      "location": "fused-memory/tests/test_stages.py:7434-7510",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "The change's behavioural payload is the Stage 1 prompt's new snapshot policy, but no test pins it (e.g. that the pre-search/invalidate steps are gone, that the cross-referenced section exists, or that readers see the newest snapshot first); the only new tests exercise the uncalled helper.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1225_pool_06",
+      "location": "fused-memory/tests/test_stages.py:7443-7448",
+      "category": "needless_local_import",
+      "severity": "suggestion",
+      "description": "TestFormatSnapshotFact._import_helper imports format_snapshot_fact inside a method although test_stages.py already imports from fused_memory.reconciliation.stages.memory_consolidator at module level; there is no cycle to avoid, so the indirection is unnecessary.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

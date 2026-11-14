@@ -1,0 +1,18 @@
+{
+  "task_id": "6155",
+  "reason": "Review amendment: SpeculativeMergeWorker._finalize_passthrough adds one guard (if entry.gate is not None) so a passthrough finalize that parks on a gate re-verify is refused and its gate torn down rather than orphaned; the other amendments (drain worktree release, live keep set) are cognitive-neutral.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2276,
+      "current": 2277
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5029,
+      "current": 5030
+    }
+  ]
+}

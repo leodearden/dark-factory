@@ -1,7 +1,7 @@
 """Elo rating system for pairwise eval judging.
 
 DEMOTED (task 2477 λ / decision 10): the primary eval leaderboard is now
-:func:`orchestrator.evals.report.build_composite_report` — every run yields a
+``composite_report.py::build_composite_report`` — every run yields a
 dense composite score, whereas pairwise judge data is sparse and this Elo path
 was ~32% self-admitted noise. The pairwise machinery below is RETAINED, not
 deleted (``judge.run_elo_tournament`` and the CLI ``--judge`` path still use
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import combinations
@@ -26,7 +27,11 @@ STATE_FILE = Path(__file__).parent / 'judge_state.json'
 DEFAULT_RATING = 1500.0
 K_FACTOR = 32.0
 MAX_PER_PAIR = 3
+MAX_UNMEASURED_PER_PAIR = 2
 INDISTINGUISHABLE_THRESHOLD = 50.0
+
+PAIRWISE_RESULT: dict[str, float] = {'A': 1.0, 'B': 0.0, 'tie': 0.5}
+"""Each pairwise winner and the score it gives config A: the winner vocabulary."""
 
 
 @dataclass
@@ -111,7 +116,7 @@ def is_pairwise_data_dense(
       least *min_matches_per_pair* times per ``pool.pair_counts``.
 
     A single under-filled (or unjudged → 0) pair makes the pool non-dense, so a
-    caller can fall back to :func:`report.build_composite_report` (the dense
+    caller can fall back to ``composite_report.py::build_composite_report`` (the dense
     composite-score leaderboard) rather than trusting a sparse Elo ranking. Pure
     query over ``pool.ratings`` / ``pool.pair_counts``.
     """
@@ -149,16 +154,17 @@ def ensure_config_in_pool(pool: TaskPool, config_name: str) -> None:
 
 
 def next_matchup(
-    pool: TaskPool, max_per_pair: int = MAX_PER_PAIR,
+    pool: TaskPool, max_per_pair: int = MAX_PER_PAIR, *, skip: Collection[str] = (),
 ) -> tuple[str, str] | None:
     """Pick the pair with the smallest rating gap that hasn't hit match cap.
 
-    Returns ``None`` when all pairs have been judged *max_per_pair* times.
+    Pairs whose :func:`_pair_key` is in *skip* are never picked. Returns
+    ``None`` when every other pair has been judged *max_per_pair* times.
     """
     candidates: list[tuple[float, str, str]] = []
     for a, b in combinations(sorted(pool.ratings.keys()), 2):
         key = _pair_key(a, b)
-        if pool.pair_counts.get(key, 0) >= max_per_pair:
+        if key in skip or pool.pair_counts.get(key, 0) >= max_per_pair:
             continue
         gap = abs(pool.ratings[a] - pool.ratings[b])
         candidates.append((gap, a, b))
@@ -177,8 +183,16 @@ def record_match(
     confidence: float,
     reasoning: str,
 ) -> None:
-    """Record a match result: update Elo ratings and bookkeeping."""
-    result_val = {'A': 1.0, 'B': 0.0, 'tie': 0.5}.get(winner, 0.5)
+    """Record a match result: update Elo ratings and bookkeeping.
+
+    Raises ``ValueError``, leaving *pool* untouched, for a winner outside
+    :data:`PAIRWISE_RESULT`.
+    """
+    if winner not in PAIRWISE_RESULT:
+        raise ValueError(
+            f'winner must be one of {sorted(PAIRWISE_RESULT)}, got {winner!r}'
+        )
+    result_val = PAIRWISE_RESULT[winner]
     ra, rb = pool.ratings[config_a], pool.ratings[config_b]
     new_a, new_b = update_elo(ra, rb, result_val)
     pool.ratings[config_a] = round(new_a, 1)

@@ -17,8 +17,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from fused_memory.eval import topic_registry
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'census_memory_metadata.py'
 
@@ -1335,7 +1339,7 @@ class TestRegistryCoverageGauge:
     set -- and it is precisely the set E1's retrieval-health run scores.
 
     NOT a duplicate of E1's METRIC_TOPIC_CANONICAL_PRESENT (INV-5): that one
-    is computed from _tripwire_items(observations, TRIPWIRE_K) -- from SEARCH
+    is computed from tripwire_items(observations, TRIPWIRE_K) -- from SEARCH
     observations -- so it cannot distinguish "the canonical does not exist"
     from "it exists but ranks below K".  Only a deterministic metadata count
     can establish the former, which is this task's central claim.
@@ -1353,52 +1357,18 @@ class TestRegistryCoverageGauge:
         }
         return _mod.build_report(cells, cov, top_n=50, registry=registry, **kwargs)
 
-    def test_loader_is_the_probes_pinned_by_identity(self):
-        # Imported through the same _load_probe_module importlib idiom
-        # fused-memory/scripts/retro_stamp_topics.py::_load_probe_module and
-        # ::load_topic_registry already established, so the schema
-        # check, the zero-entry rejection and the RegistryError type stay
-        # single-homed rather than re-parsed here.
-        assert _mod.__file__ is not None
-        # The shared loader IS the reuse check this test used to hand-roll:
-        # test_memory_eval_retrieval_probe.py owns this key, so the probe
-        # comes back rather than being executed a second time (task 3895).
-        probe = load_script_module(
-            Path(_mod.__file__).parent / 'memory_eval_retrieval_probe.py',
-            mod_name='memory_eval_retrieval_probe',
-        )
-        # Through the ACCESSOR, not a module attribute: the loader is bound
-        # lazily so an unloadable probe degrades to registry_error instead of
-        # killing the import (and with it the whole census). The reuse is
-        # still pinned by identity.
-        assert _mod.topic_registry_loader() is probe.load_topic_registry
+    def test_a_registry_the_strict_loader_rejects_is_disclosed_by_name(self, tmp_path):
+        # The census reuses the registry's strict loader rather than a hand-rolled
+        # json.load, so a registry it rejects comes back as the loader's own
+        # named RegistryError -- disclosed, never fatal to the census.
+        path = tmp_path / 'registry.json'
+        path.write_text(json.dumps({'schema_version': 99, 'entries': []}), encoding='utf-8')
 
-    # DELIBERATELY NOT TESTED HERE (review of 2026-08-16): that the probe is
-    # not loaded AT IMPORT TIME, via `inspect.getsource` +
-    # `'_load_probe_module()' in src` and an AST sweep for top-level call
-    # nodes.  That test made a RUNTIME claim its own body never observed at
-    # runtime: a correct lazy rewrite reaching the helper through an alias or
-    # attribute failed it, while an eager load reached via `getattr` passed
-    # it.  The property that actually matters -- an unloadable probe degrades
-    # to `registry_error` instead of killing the census import -- is asserted
-    # behaviourally by the test directly below, and the loader's lazy binding
-    # and reuse are pinned by identity in the test directly above.  Do not
-    # reinstate this as a tightened regex or AST pin.
+        registry, error = _mod.load_registry_or_error(str(path))
 
-    def test_an_unloadable_probe_is_DISCLOSED_not_fatal(self, monkeypatch):
-        # The registry gauge is one optional block. A probe that cannot be
-        # loaded must take the same registry_error path every other registry
-        # failure takes -- not abort the measurement.
-        monkeypatch.setattr(_mod, '_TOPIC_REGISTRY_LOADER', None)
-
-        def _boom():
-            raise ImportError('memory_eval_retrieval_probe moved')
-
-        monkeypatch.setattr(_mod, '_load_probe_module', _boom)
-        registry, error = _mod.load_registry_or_error(_mod.DEFAULT_REGISTRY_PATH)
         assert registry is None
         assert error is not None
-        assert error.startswith('ImportError:')
+        assert error.startswith('RegistryError:')
 
     def test_default_registry_path_is_the_committed_fixture(self):
         assert _mod.DEFAULT_REGISTRY_PATH.endswith(
@@ -1531,21 +1501,20 @@ class TestRegistryCoverageGauge:
     def test_a_registry_of_the_wrong_SHAPE_is_disclosed_not_fatal(self):
         """A loaded-but-misshapen registry degrades like every other failure.
 
-        The load path is already careful -- `topic_registry_loader` is lazily
-        memoized and `load_registry_or_error` catches everything -- precisely
-        so the optional gauge cannot take the measurement down with it. But
-        SCORING happens after the load, reaching `entry.project_id` /
-        `entry.topic` by attribute on objects owned by ANOTHER script's
-        dataclass. A `RegistryEntry` field rename (or a loader that starts
-        returning dicts) therefore raised straight out of `build_report`:
-        no report, no markdown, no trend row, from a block the design says
-        is optional.
+        The load path is already careful -- `load_registry_or_error` catches
+        everything -- precisely so the optional gauge cannot take the
+        measurement down with it. But SCORING happens after the load,
+        reaching `entry.project_id` / `entry.topic` by attribute on objects
+        owned by ANOTHER module's dataclass. A `RegistryEntry` field rename
+        (or a loader that starts returning dicts) therefore raised straight
+        out of `build_report`: no report, no markdown, no trend row, from a
+        block the design says is optional.
 
         This is not hypothetical reach: the registry, its loader and its
-        models all live in `memory_eval_retrieval_probe.py`, a file this task
-        does not own and does not test, and the census reuses them by import
-        exactly so they stay single-homed. Reuse across that seam is right;
-        inheriting an abort from it is not.
+        models all live in `fused_memory/eval/topic_registry.py`, which the
+        census does not own and does not test, and the census reuses them by
+        import exactly so they stay single-homed. Reuse across that seam is
+        right; inheriting an abort from it is not.
         """
         class _ShapelessEntry:
             project_id = 'dark_factory'
@@ -1586,7 +1555,7 @@ class TestRegistryCoverageGauge:
     def test_the_committed_registry_holds_the_gauged_targets(self):
         # The accountable set this task names as the TARGET. If the fixture
         # grows or shrinks, the target moved and the docs must say so.
-        registry = _mod.topic_registry_loader()(_mod.DEFAULT_REGISTRY_PATH)
+        registry = topic_registry.load_topic_registry(_mod.DEFAULT_REGISTRY_PATH)
         assert sum(1 for e in registry.entries if not e.is_query_surface) == 31
         assert {e.topic for e in registry.entries if e.is_query_surface} == {
             'briefing-conventions-generic',

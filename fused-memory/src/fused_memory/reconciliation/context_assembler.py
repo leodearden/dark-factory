@@ -13,16 +13,17 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
+    ContextFetchFailure,
     ContextItem,
     EventType,
     ReconciliationEvent,
     Watermark,
 )
+from fused_memory.reconciliation.child_memory_link import render_parent_link
 from fused_memory.services.read_telemetry import (
     summarize_search_query,
     summarize_search_results,
@@ -33,6 +34,7 @@ from fused_memory.utils.clip_disclosure import elide_text
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.config.schema import ReconciliationConfig
+    from fused_memory.models.memory import MemoryResult
     from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
@@ -52,10 +54,14 @@ HINT_QUERIES_EXECUTED = 3
 #: read from an agent-originated one without re-deriving it from `operation`.
 _HINT_JOURNAL_SOURCE = 'reconciliation_hint'
 
-#: Per-item render caps. Budget-relevant: ContextItem derives token_estimate from
-#: the clipped text, so raising either spends token_budget that buys whole events.
-_TASK_DESC_CHARS = 300
-_MEMORY_BODY_CHARS = 500
+#: Per-item render caps from the 2026-10 corpus measurement; reconciliation.token_budget is sized to
+#: hold a measured backlog chunk at these values, so they change together (plans/recon-evidence-caps-measurement-2026-10.md).
+_TASK_DESC_CHARS = 4_000
+_MEMORY_BODY_CHARS = 2_000
+
+#: Cap on a failed fetch's error text, which Stage 1 reads verbatim: a handler
+#: exception can carry a whole JSON or stderr body.
+_FETCH_ERROR_CHARS = 300
 
 
 def estimate_tokens(text: str) -> int:
@@ -64,16 +70,16 @@ def estimate_tokens(text: str) -> int:
 
 
 def format_event(event: ReconciliationEvent) -> str:
-    """Format an event the same way _format_events does in memory_consolidator."""
+    """Format an event the same way ``stage1_payload_format.py::format_events`` does."""
     return f'- [{event.type.value}] {event.timestamp.isoformat()}: {json.dumps(event.payload)}'
 
 
-def _format_memory_result(result) -> str:
+def _format_memory_result(result: MemoryResult) -> str:
     """Format a MemoryResult into a context line."""
     content = elide_text(result.content, _MEMORY_BODY_CHARS, field='content').text
     source = result.source_store.value if result.source_store else '?'
     cat = result.category.value if result.category else '?'
-    return f'- [{result.id}] ({source}/{cat}): {content}'
+    return f'- [{result.id}]{render_parent_link(result.metadata)} ({source}/{cat}): {content}'
 
 
 def _format_task(task: dict, *, display_id: str | None = None) -> str:
@@ -137,9 +143,7 @@ class ContextAssembler:
         used = 1_400
         chunk_events: list[ReconciliationEvent] = []
         context_items: dict[str, ContextItem] = {}
-
-        # Compute effective watermark: align context window with event batch
-        effective_wm = self._compute_effective_watermark(events, watermark)
+        context_fetch_failures: list[ContextFetchFailure] = []
 
         # Process events in batches for parallelized context fetching
         event_idx = 0
@@ -158,13 +162,20 @@ class ContextAssembler:
             # signals — this preserves the structured-cancellation contract and
             # prevents the assembler from silently converting a shutdown signal
             # into an empty context list.
-            # Pass 2 (below): per-event degrade-to-empty on ordinary Exceptions.
+            # Pass 2 (below): an ordinary Exception degrades that event to empty
+            # context AND is recorded, once the event is in the chunk, so the
+            # consumer reads its context as unknown rather than absent.
             batch_contexts = await gather_collect(fetch_tasks)
 
             for event, ctx_result in zip(batch, batch_contexts, strict=True):
+                fetch_failure = None
                 if isinstance(ctx_result, Exception):
-                    logger.warning(
-                        f'Context fetch failed for event {event.id}: {ctx_result}'
+                    error = f'{type(ctx_result).__name__}: {ctx_result}'
+                    logger.warning(f'Context fetch failed for event {event.id}: {error}')
+                    fetch_failure = ContextFetchFailure(
+                        event_id=event.id,
+                        event_type=event.type.value,
+                        error=elide_text(error, _FETCH_ERROR_CHARS, field='error').text,
                     )
                     ctx_result = []
 
@@ -187,6 +198,8 @@ class ContextAssembler:
 
                 # Add event and its context
                 chunk_events.append(event)
+                if fetch_failure is not None:
+                    context_fetch_failures.append(fetch_failure)
                 for item in new_items:
                     context_items[item.id] = item
                 used += total_cost
@@ -205,27 +218,9 @@ class ContextAssembler:
             context_items=context_items,
             total_tokens=used,
             events_remaining=events_remaining,
-            effective_watermark=effective_wm,
             token_budget=budget,
+            context_fetch_failures=tuple(context_fetch_failures),
         )
-
-    def _compute_effective_watermark(
-        self,
-        events: list[ReconciliationEvent],
-        watermark: Watermark,
-    ) -> datetime:
-        """Effective watermark = min(last_run_completed, earliest_event.timestamp).
-
-        Ensures the context window covers the period the events are about.
-        """
-        candidates: list[datetime] = []
-        if watermark.last_full_run_completed:
-            candidates.append(watermark.last_full_run_completed)
-        if events:
-            candidates.append(min(e.timestamp for e in events))
-        if not candidates:
-            return datetime.now(UTC)
-        return min(candidates)
 
     async def _fetch_context(
         self,
@@ -245,11 +240,7 @@ class ContextAssembler:
         handler = dispatch.get(event.type)
         if handler is None:
             return []
-        try:
-            return await handler(event, project_id)
-        except Exception as e:
-            logger.warning(f'Context handler {event.type.value} failed: {e}')
-            return []
+        return await handler(event, project_id)
 
     async def _ctx_memory_added(
         self, event: ReconciliationEvent, project_id: str,

@@ -1,0 +1,24 @@
+{
+  "schema": "review-all-prd-return/1",
+  "run_id": "review-all-fixture-20261019",
+  "stream": "S1",
+  "pass": "investigate",
+  "session": {
+    "kind": "spawn",
+    "title": "team:fixture S1 Q2"
+  },
+  "item": "Q2",
+  "rulings_in_session": [
+    {
+      "id": "R1",
+      "question": "Should the alpha shim be retired before S2 releases C1?",
+      "ruling": "hold until S2 releases C1",
+      "options": [
+        "retire now",
+        "hold until S2 releases C1"
+      ],
+      "consequence": "103 stays held on S2 C1"
+    }
+  ],
+  "notes": "Probed the shim's importers with the human; the hold stands."
+}

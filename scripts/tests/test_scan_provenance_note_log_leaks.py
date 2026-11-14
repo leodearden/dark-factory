@@ -27,7 +27,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from _task_db_scan import TaskDbProblem, TaskDbUnreadable
 from scan_provenance_note_log_leaks import (
     NoteLeakMatch,
     detect_log_leak,
@@ -35,6 +34,7 @@ from scan_provenance_note_log_leaks import (
     format_report,
     scan_db,
 )
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 # The tasks-table schema and the fake-db builder live in scripts/tests/
 # conftest.py, behind the `make_tasks_db` fixture (task

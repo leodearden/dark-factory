@@ -1,0 +1,13 @@
+```json
+{
+  "cancelled": ["567", "931"],
+  "skipped": [],
+  "repathed": [
+    {"task": "443", "entry": "schedule-first-fire-fn", "ok": true},
+    {"task": "484", "entry": "rows-per-home-month-imported", "ok": true}
+  ],
+  "edges_added": ["477->1143"],
+  "notes_appended": ["477", "479", "465", "646", "469", "485", "810"],
+  "errors": []
+}
+```

@@ -3,16 +3,21 @@
 import asyncio
 import contextlib
 import logging
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_helpers import QDRANT_URL, collection_vector_size, qdrant_skipif
+from _fm_qdrant_live import QDRANT_URL, collection_vector_size, qdrant_skipif
 from _qdrant_responses import missing_collection_404
+from _stub_qdrant_server import StubQdrantServer, stub_qdrant_server
+from mem0 import AsyncMemory
+from mem0.configs.base import MemoryConfig
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 
 from fused_memory.backends.mem0_client import Mem0Backend, is_missing_collection_error
+from fused_memory.config.schema import Mem0BackendConfig
 from fused_memory.models.scope import Scope
 
 # Sentinel distinguishing "caller passed vector=None" (model a Qdrant point
@@ -197,8 +202,8 @@ class TestMem0BackendScrollByMetadata:
         Mirrors count_by_metadata's propagate-by-default contract: a timed-out
         scroll must never be indistinguishable from a genuinely-empty result
         (no-silent-fail invariant).  Since task 5265 the read is bounded by
-        Mem0Backend._timed, whose only handling of a TimeoutError is to re-raise
-        it naming the operation and the budget.
+        backends/timeout_budget.py::await_within, whose only handling of a
+        TimeoutError is to re-raise it naming the operation and the budget.
         """
         mock_client = AsyncMock()
         mock_client.scroll = AsyncMock(side_effect=TimeoutError('too slow'))
@@ -1097,7 +1102,7 @@ class TestMem0BackendScrollCollectionPages:
 
         with (
             patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)),
-            patch('fused_memory.backends.mem0_client.asyncio.wait_for', _spy),
+            patch('fused_memory.backends.timeout_budget.asyncio.wait_for', _spy),
         ):
             got = await _drain(backend.scroll_collection_pages('c', page_size=1))
 
@@ -1380,9 +1385,10 @@ class TestMem0BackendSemanticReadTimeouts:
     """One contract, one test: every mem0-instance read propagates and NAMES itself.
 
     ``search`` / ``get_all`` / ``get`` share a single implementation of this —
-    ``Mem0Backend._timed``, the sole ``asyncio.wait_for`` call site on the
-    class — so they are asserted together.  Three near-identical copies of
-    this test could drift apart without noticing; one parametrized copy cannot,
+    ``Mem0Backend._timed_read`` over ``backends/timeout_budget.py::await_within``,
+    the sole ``asyncio.wait_for`` call site — so they are asserted together.
+    Three near-identical copies of this test could drift apart without
+    noticing; one parametrized copy cannot,
     which matters because the MESSAGE is a contract and not decoration: it is
     what reaches ``MemoryService._store_failure_diagnostics['error']``, and
     ``asyncio.wait_for``'s own ``TimeoutError`` stringifies EMPTY, so a bare
@@ -2132,7 +2138,6 @@ async def _build_asr_backend(mock_config, scope, monkeypatch) -> Mem0Backend:
     config = mock_config.model_copy(deep=True)
     backend = Mem0Backend(config)
     inst = await backend._get_instance(scope)
-    inst.db.add_history = lambda *a, **kw: None
 
     collection = scope.mem0_collection_name(config.mem0.collection_prefix)
     # Race-safe vector-dim read: under `-n auto` load the just-created
@@ -3265,6 +3270,86 @@ class TestBuildConfigDictEndpointPlumbing:
         assert 'embedding_model_dims' in vector_store_params
 
 
+@pytest.fixture
+def stub_qdrant(mock_config) -> Iterator[StubQdrantServer]:
+    """Point ``mock_config`` at a local stub Qdrant (tests/_stub_qdrant_server.py).
+
+    Mem0Backend provisions its collection itself before mem0 is built, so a
+    test that builds an instance needs a Qdrant to answer, and this keeps it
+    off the live one.
+    """
+    with stub_qdrant_server() as stub:
+        mock_config.mem0.qdrant_url = stub.url
+        yield stub
+
+
+@pytest.fixture
+def mem0_built_from(monkeypatch) -> list[dict]:
+    """Every config dict mem0 is built from, captured at mem0's own boundary.
+
+    The recorder hands back a double whose ``add`` answers the way mem0's does,
+    so the public ``Mem0Backend.add`` runs end to end with no OpenAI.
+    """
+    captured: list[dict] = []
+
+    class _BuiltInstance:
+        async def add(self, **kwargs):
+            return {'results': [{'id': 'm1'}]}
+
+    def _record(cls, config_dict):
+        captured.append(config_dict)
+        return _BuiltInstance()
+
+    monkeypatch.setattr(AsyncMemory, 'from_config', classmethod(_record))
+    return captured
+
+
+class TestMem0HistoryPersistence:
+    """``mem0.persist_history`` decides which SQLite DB mem0 keeps its change
+    history in.
+
+    Every assertion reads mem0's PARSED ``MemoryConfig``: it ignores unknown
+    keys, so a misspelt key would silently fall back to the shared file, and
+    only the parsed value can catch that.
+    """
+
+    @pytest.mark.asyncio
+    async def test_history_goes_to_a_private_in_memory_db_when_persistence_is_off(
+        self, mock_config, stub_qdrant, mem0_built_from,
+    ):
+        mock_config.mem0.persist_history = False
+
+        await Mem0Backend(mock_config).add('x', Scope(project_id='p'))
+
+        assert MemoryConfig(**mem0_built_from[0]).history_db_path == ':memory:'
+
+    @pytest.mark.asyncio
+    async def test_the_shipped_default_leaves_mem0_on_its_own_shared_history_db(
+        self, mock_config, stub_qdrant, mem0_built_from,
+    ):
+        assert Mem0BackendConfig().persist_history is True
+        config = mock_config.model_copy(deep=True)
+        config.mem0.persist_history = True
+
+        await Mem0Backend(config).add('x', Scope(project_id='p'))
+
+        assert 'history_db_path' not in mem0_built_from[0]
+        assert (
+            MemoryConfig(**mem0_built_from[0]).history_db_path
+            == MemoryConfig().history_db_path
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_shared_test_config_keeps_history_off_the_shared_db(
+        self, mock_config, stub_qdrant, mem0_built_from,
+    ):
+        """Every test that builds a real mem0 instance derives its config from
+        ``mock_config``, and relies on this to stay off the shared file."""
+        await Mem0Backend(mock_config).add('x', Scope(project_id='p'))
+
+        assert MemoryConfig(**mem0_built_from[0]).history_db_path == ':memory:'
+
+
 class TestNonDefaultDimsAgainstAnExistingCollection:
     """The migration hazard behind plumbing embedder.dimensions at all.
 
@@ -3274,6 +3359,10 @@ class TestNonDefaultDimsAgainstAnExistingCollection:
     Both now follow the config — but only for a collection that does not exist
     yet. Changing the knob on a live deployment therefore requires recreating
     and re-embedding the collection; it is not live-migratable.
+
+    This class pins only mem0's skip of an existing collection. The product
+    creates a new one itself, and that create is pinned at
+    tests/test_mem0_collection_provisioning.py::test_a_new_collection_is_created_at_the_configured_width_under_cosine_distance.
     """
 
     @staticmethod
@@ -3310,19 +3399,6 @@ class TestNonDefaultDimsAgainstAnExistingCollection:
         )
 
         client.create_collection.assert_not_called()
-
-    def test_a_fresh_collection_is_created_at_the_configured_dimensionality(self):
-        """Control: the plumbing does work — on a collection that does not yet
-        exist, which is the only case where changing dimensions is safe."""
-        from mem0.vector_stores.qdrant import Qdrant
-
-        client = self._fake_qdrant_client([])
-
-        Qdrant(collection_name='brand_new', embedding_model_dims=768, client=client)
-
-        client.create_collection.assert_called_once()
-        vectors_config = client.create_collection.call_args.kwargs['vectors_config']
-        assert vectors_config.size == 768
 
 
 class TestAmbientBaseUrlPrecedenceIsReported:

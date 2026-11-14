@@ -11,6 +11,7 @@ creating an escalation or writing a merge-failure review.
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
@@ -21,7 +22,7 @@ from _orch_helpers import pydantic_spec
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.worker import (
     WORKTREE_MISSING_REASON_PREFIX,
     MergeOutcome,
 )
@@ -180,6 +181,27 @@ async def test_worktree_missing_with_nonterminal_status_falls_through(
         f'the fall-through must leave a merge-failure review, got: {review}'
     )
     cast(AsyncMock, wf.scheduler.set_task_status).assert_awaited_once_with('999', 'blocked')
+
+
+@pytest.mark.asyncio
+async def test_worktree_missing_with_its_task_root_gone_still_blocks(
+    tmp_path: Path,
+):
+    """A real out-of-band worktree deletion takes the legacy ``<worktree>/.task``
+    root with it, so the forensic merge record cannot be written (task 3158).
+    Losing it must not derail merge-failure routing: the task still blocks.
+    """
+    wf, _cancel_event = _make_workflow(tmp_path=tmp_path)
+    wf.scheduler.get_status = AsyncMock(return_value='in-progress')
+    assert wf.artifacts is not None
+    task_root = wf.artifacts.task_root
+    shutil.rmtree(task_root)
+
+    driven = await _drive_worktree_missing(wf)
+
+    assert driven.result == WorkflowOutcome.BLOCKED
+    cast(AsyncMock, wf.scheduler.set_task_status).assert_awaited_once_with('999', 'blocked')
+    assert not task_root.exists()
 
 
 @pytest.mark.asyncio

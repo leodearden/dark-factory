@@ -1,0 +1,55 @@
+import json,re,time,calendar,collections,math
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+# sar timestamps are host local: BST(+1) through 10-24, GMT from 10-25 02:00 local
+def load(fn):
+    O={}
+    for l in open(fn):
+        d,h,ap,tps,r,w,dk,aq,aw,ut=l.split()
+        H,M,S=map(int,h.split(':'))
+        H=(H%12)+(12 if ap=='PM' else 0)
+        t=calendar.timegm((2026,10,int(d),H,M,S))
+        if int(d)<25 or (int(d)==25 and H<2): t-=3600
+        O[t]=dict(tps=float(tps),r=float(r),w=float(w),d=float(dk),aq=float(aq),aw=float(aw),ut=float(ut))
+    return O
+L=load('/tmp/3190s/sar_loop0.txt');D=load('/tmp/3190s/sar_dm0.txt')
+S=json.load(open('/tmp/3190s/phases.json'))['seeds']
+b=collections.defaultdict(list);rl=collections.defaultdict(list)
+for s in S:
+    if 'clone0' in s and 'clone1' in s:
+        # sar stamp is END of its 600s interval; assign by clone midpoint
+        m=(s['clone0']+s['clone1'])/2;k=int(m//600+1)*600
+        b[k].append(s['clone1']-s['clone0'])
+        if 'relink' in s and 'reloc' in s: rl[k].append(s['relink']-s['reloc'])
+X=[(k,L[k],D.get(k),pct(b[k],.5),len(b[k]),pct(rl[k],.5) if rl[k] else None) for k in sorted(b) if k in L]
+print('10-min bins with >=1 clone',len(X))
+def spear(a,b):
+    def rk(v):
+        o=sorted(range(len(v)),key=lambda i:v[i]);r=[0]*len(v)
+        for i,x in enumerate(o):r[x]=i
+        return r
+    ra,rb=rk(a),rk(b);n=len(a);ma=(n-1)/2
+    return sum((x-ma)*(y-ma) for x,y in zip(ra,rb))/math.sqrt(sum((x-ma)**2 for x in ra)*sum((y-ma)**2 for y in rb))
+for f in ('tps','r','w','aq','aw','ut'):
+    print('spearman clone_p50 ~ loop0',f,round(spear([x[3] for x in X],[x[1][f] for x in X]),2),' dm0',f,round(spear([x[3] for x in X if x[2]],[x[2][f] for x in X if x[2]]),2))
+print('relink ~ loop0 await',round(spear([x[5] for x in X if x[5]],[x[1]['aw'] for x in X if x[5]]),2))
+print('clone p50 (median of bins), n bins, by loop0 await band; tps median; dm0 await median')
+for a,c in ((0,1),(1,5),(5,20),(20,100),(100,500),(500,99999)):
+    v=[x for x in X if a<=x[1]['aw']<c]
+    if v:print(f'[{a},{c}) bins={len(v)} clone_p50={pct([x[3] for x in v],.5):.0f} p90={pct([x[3] for x in v],.9):.0f} tps={pct([x[1]["tps"] for x in v],.5):.0f} util={pct([x[1]["ut"] for x in v],.5):.0f} aqu={pct([x[1]["aq"] for x in v],.5):.0f} w={pct([x[1]["w"] for x in v],.5)/1024:.0f}MB/s dm_aw={pct([x[2]["aw"] for x in v if x[2]],.5):.1f} relink={pct([x[5] for x in v if x[5]],.5):.1f}')
+print('per-UTC-day loop0: tps r_MB w_MB disc_MB aqu await(mean) await_p50 await_p90 util | dm0 await_p50 util_p50 | clone p50')
+dd=collections.defaultdict(list)
+for k,v in L.items():dd[time.strftime('%m-%d',time.gmtime(k))].append((v,D.get(k)))
+cl=collections.defaultdict(list)
+for k,vs in b.items():cl[time.strftime('%m-%d',time.gmtime(k))]+=vs
+for k in sorted(dd):
+    v=[a for a,_ in dd[k]];m=[b_ for _,b_ in dd[k] if b_]
+    f=lambda q:sum(a[q] for a in v)/len(v)
+    print(k,len(v),f"{f('tps'):.0f} {f('r')/1024:.0f} {f('w')/1024:.0f} {f('d')/1024:.0f} {f('aq'):.0f} {f('aw'):.1f} {pct([a['aw'] for a in v],.5):.1f} {pct([a['aw'] for a in v],.9):.1f} {f('ut'):.0f} | {pct([a['aw'] for a in m],.5):.1f} {pct([a['ut'] for a in m],.5):.0f} | {pct(cl[k],.5) if cl[k] else 0:.0f}")
+print('window 10-25 20:00 to 10-27 12:00 hourly: await_mean tps disc_MB/s clone_p50 n')
+h=collections.defaultdict(list);hc=collections.defaultdict(list)
+for k,v in L.items():h[k//3600].append(v)
+for k,vs in b.items():hc[k//3600]+=vs
+for k in sorted(h):
+    if calendar.timegm((2026,10,25,20,0,0))<=k*3600<calendar.timegm((2026,10,27,12,0,0)):
+        v=h[k];print(time.strftime('%m-%d %H',time.gmtime(k*3600)),f"{sum(a['aw'] for a in v)/len(v):.1f} {sum(a['tps'] for a in v)/len(v):.0f} {sum(a['d'] for a in v)/len(v)/1024:.0f} {pct(hc[k],.5) if hc[k] else 0:.0f} {len(hc[k])}")

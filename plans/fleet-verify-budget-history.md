@@ -10,7 +10,7 @@ The measured figures are not copied into this file either. They live once, in
 `tests/scripts/test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS`
 (with dated provenance in `MEASURED_FLEET_SEGMENT_PROVENANCE`). Since task 3496
 the table's `orchestrator` row is derived from
-`tests/scripts/test_module_verify_budgets.py::ORCHESTRATOR_BUDGET_CENSUS`. The
+`tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS`. The
 figures below are dated snapshots of those records.
 
 Value history (warm / cold):

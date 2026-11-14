@@ -46,7 +46,7 @@ const {
   stepPaths,
   plottableMax,
   axisY,
-  niceCountMax,
+  axisMax,
   axisPaths,
   barFractions,
   stackedAreaPaths,
@@ -64,13 +64,9 @@ const MODULE_SPECIFIER = '../../src/dashboard/static/redux/spark_path.js';
 // live here rather than in a second module because they share this file's hole
 // predicate and its two private helpers.
 //
-// `formatCountTick` (task 4232) is the one entry that is not scale/path math: it
-// is the y-tick LABEL formatter for an integer-count axis. It lives here for the
-// same reason the rest do — it composes with `plottableMax`/`axisY`, and unlike
-// anything defined in charts.jsx it can actually be EXECUTED by a test.
-// `niceCountMax` (task 5121) is the count-axis MAXIMUM rule that pairs with
-// formatCountTick's label rule.
-// Both count-axis rules are tested in spark_path_count_axis.test.mjs.
+// `axisMax` (task 6370) is the count-axis maximum rule charts.jsx calls, tested
+// in spark_path_count_axis.test.mjs; `bandPaths` (task 8461) is LineChart's
+// bound-band builder, tested in spark_path_band.test.mjs.
 const EXPECTED_FUNCTION_NAMES = [
   'isPlottable',
   'sparkPaths',
@@ -78,9 +74,9 @@ const EXPECTED_FUNCTION_NAMES = [
   'stepPaths',
   'plottableMax',
   'axisY',
-  'formatCountTick',
-  'niceCountMax',
+  'axisMax',
   'axisPaths',
+  'bandPaths',
   'barFractions',
   'stackedAreaPaths',
 ];
@@ -1522,7 +1518,7 @@ test('stackedAreaPaths: does not mutate its input stacks', () => {
 const SNAP_STACKS = [layer('a', [3, 4, 3]), layer('b', [2, 3, 2])];
 
 test('stackedAreaPaths: a snapMax policy rescales every band against the snapped axis', () => {
-  const { max, paths } = stackedAreaPaths(SNAP_STACKS, STACK_GEOM_3, m => niceCountMax(m, 4));
+  const { max, paths } = stackedAreaPaths(SNAP_STACKS, STACK_GEOM_3, m => axisMax(m, 4, true));
   assert.equal(max, 8, 'the folded max 7 snaps up to 8');
   assert.deepEqual(paths, [
     'M38,126.75 L88,103 L138,126.75 L138,198 L88,198 L38,198 Z',
@@ -1549,7 +1545,7 @@ test('stackedAreaPaths: snapMax is called once, on the folded max INCLUDING the 
   assert.deepEqual(seen, [7], 'one call, on the folded stack maximum');
 
   assert.deepEqual(
-    stackedAreaPaths([], STACK_GEOM_3, m => niceCountMax(m, 4)),
+    stackedAreaPaths([], STACK_GEOM_3, m => axisMax(m, 4, true)),
     { max: 4, paths: [], stepX: 50 },
     'the idle seed floor of 1 snaps to 4',
   );

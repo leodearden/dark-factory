@@ -1,10 +1,13 @@
-"""Shared helpers for the serial-recovery tests (task 5079).
+"""Shared helpers for the serial re-run tests (task 5079, task 6650).
 
-``verify_cmd.py::serial_pytest`` forces a pytest command serial with
-``-p no:xdist -o addopts=<value>``. Its tests, and those of the resolver that
-supplies ``<value>``, share three things kept here once: xdist's option
-surface read from xdist itself, the ``-o addopts=`` value extractor, and the
-repo-shaped governing configs they build trees from.
+``verify_cmd.py::serial_pytest`` forces a pytest command serial for a
+recovery re-run with ``-p no:xdist -o addopts=<value>``;
+``verify_cmd.py::serial_confirm_pytest`` does it for a confirm re-run with
+``-n 0`` where xdist is in play. Their tests, and those of the resolver that
+supplies ``<value>``, share four things kept here once: xdist's option
+surface read from xdist itself, the ``-o addopts=`` value extractor, the
+effective worker-count reader, and the repo-shaped governing configs they
+build trees from.
 """
 
 from __future__ import annotations
@@ -87,6 +90,27 @@ def addopts_values(tokens: Sequence[str]) -> list[str]:
         for flag, value in zip(tokens, tokens[1:], strict=False)
         if flag == '-o' and value.startswith('addopts=')
     ]
+
+
+_WORKER_COUNT_OPTIONS = ('-n', '--numprocesses')
+
+
+def effective_worker_count(tokens: Sequence[str]) -> str | None:
+    """The value of the LAST xdist worker-count option in argv *tokens*, or None.
+
+    argparse keeps the last value, so this is the count pytest applies. Reads
+    the separate-token (``-n 0``, ``--numprocesses 0``) and attached
+    (``-n0``, ``-n=0``, ``--numprocesses=0``) spellings.
+    """
+    count = None
+    for index, token in enumerate(tokens):
+        if token in _WORKER_COUNT_OPTIONS and index + 1 < len(tokens):
+            count = tokens[index + 1]
+        elif token.startswith(('--numprocesses=', '-n=')):
+            count = token.partition('=')[2]
+        elif token.startswith('-n') and not token.startswith('--') and len(token) > 2:
+            count = token[2:]
+    return count
 
 
 #: The repo root's addopts shape: an import mode and a three-clause marker filter.

@@ -45,6 +45,10 @@ from fused_memory.maintenance.cross_graph_move import (
     CreateResult,
     SubgraphEdgeResult,
 )
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'cgl_eta_auto_apply_impl.py'
@@ -134,11 +138,13 @@ class TestInheritedStoreMutationPreflight:
         """
         migrate = _load_migrate_from_this_tree(monkeypatch)
 
-        assert hasattr(migrate, 'assert_store_mutation_allowed'), (
-            'migrate must import the preflight at MODULE scope — this script '
-            'inherits its guard and has none of its own'
+        assert (
+            getattr(migrate, 'assert_store_mutation_allowed', None)
+            is assert_store_mutation_allowed
+        ), (
+            'migrate must import the REAL preflight at MODULE scope — this '
+            'script inherits its guard and has none of its own'
         )
-        assert hasattr(migrate, 'StoreMutationUnavailable')
 
     def test_the_script_loads_migrate_by_file_path_not_via_sys_modules(
         self, monkeypatch,
@@ -195,7 +201,7 @@ class TestInheritedStoreMutationPreflight:
         )
 
         with pytest.raises(
-            migrate.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await migrate.run(apply_args, shim)
 

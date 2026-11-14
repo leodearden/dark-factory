@@ -1,0 +1,18 @@
+{
+  "task_id": "8524",
+  "reason": "step-6: SpeculationController.on_base_invalidated re-anchors the merger's spec_base/pending_spec_base onto the live tip or releases the retained permit (plans/merge-lane-policy-prd.md D2); net-additive, partly offset by sharing the new _release_held with on_abort/on_shutdown",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/speculation_controller.py",
+      "baseline": 22,
+      "current": 29
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5105,
+      "current": 5112
+    }
+  ]
+}

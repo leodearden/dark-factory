@@ -1,6 +1,6 @@
 """Parity checker for the installed orchestrator systemd units.
 
-Verifies that the sixteen units committed under ``scripts/`` still agree with
+Verifies that the eighteen units committed under ``scripts/`` still agree with
 the copies actually installed in ``~/.config/systemd/user/``:
 
     orchestrator-watchdog.service          orchestrator-watchdog.timer
@@ -8,8 +8,9 @@ the copies actually installed in ``~/.config/systemd/user/``:
     orchestrator-autopilot-video.service   orchestrator-my-solar-challenge.service
     orchestrator-solar-challenge-platform.service
     orchestrator-know-live.service         orchestrator-pump-web-ui.service
+    orchestrator-stream-touch.service
 
-and the seven ``orchestrator-<project>.socket`` units (one per project
+and the eight ``orchestrator-<project>.socket`` units (one per project
 orchestrator above; the watchdog pair has none) that hold each project's
 escalation MCP port across a restart. Each socket's committed copy lives at
 ``scripts/<unit>.template`` — see the ``UNITS`` registry below for why.
@@ -41,7 +42,7 @@ per-unit ``(section, key)`` registry, because one of its units is RENDERED
 from a template (``__REPO_ROOT__`` / ``__UV_PATH__`` substitution) and an
 unbounded diff there would be a false-positive machine.
 
-That reasoning does not transfer.  ``setup-host.sh`` installs all sixteen
+That reasoning does not transfer.  ``setup-host.sh`` installs all eighteen
 units here by ``cp``-ing them VERBATIM — no substitution at all, not even for the
 host paths, which are hardcoded in the committed files.  So the two sides are
 supposed to be character-identical by construction, every parsed-directive
@@ -76,10 +77,10 @@ that needs to act per UNIT rather than per run wants the
 
 Machine-readable verdicts
 -------------------------
-The exit code above is a WHOLE-RUN verdict: with sixteen units, one drifted
+The exit code above is a WHOLE-RUN verdict: with eighteen units, one drifted
 unit collapses the entire run to 1 and tells a consumer nothing about the
 other fifteen.  That is fine for an operator reading the report, and was not
-fine for ``setup-host.sh``, which used it to decline the install of ALL sixteen
+fine for ``setup-host.sh``, which used it to decline the install of ALL eighteen
 units when
 any one of them was unverifiable — so a single deliberate drop-in on
 ``orchestrator-reify.service`` also blocked the watchdog pair from being
@@ -416,7 +417,9 @@ UNITS: dict[str, str] = {
     # KNOWN RED section, which retired the REBASE NOTE that stood here.
     "orchestrator-know-live.service": "scripts/orchestrator-know-live.service",
     "orchestrator-pump-web-ui.service": "scripts/orchestrator-pump-web-ui.service",
-    # The seven escalation-port-holding sockets (task: escalation socket
+    # stream-touch joined 2026-10-22 (escalation 8110), installed and committed together.
+    "orchestrator-stream-touch.service": "scripts/orchestrator-stream-touch.service",
+    # The eight escalation-port-holding sockets (task: escalation socket
     # activation). Each pairs with the like-named .service above and is
     # installed by the SAME verbatim `cp` as every other unit here — `.socket`
     # is only not itself the committed EXTENSION, because it is not in the
@@ -440,6 +443,9 @@ UNITS: dict[str, str] = {
     "orchestrator-know-live.socket": "scripts/orchestrator-know-live.socket.template",
     "orchestrator-pump-web-ui.socket": (
         "scripts/orchestrator-pump-web-ui.socket.template"
+    ),
+    "orchestrator-stream-touch.socket": (
+        "scripts/orchestrator-stream-touch.socket.template"
     ),
 }
 

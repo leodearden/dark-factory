@@ -53,6 +53,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
@@ -60,6 +61,8 @@ from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.middleware.ticket_store import TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Import-resolution smoke test (prerequisite pre-1)

@@ -17,11 +17,22 @@ Step-by-step TDD (matching plan.json):
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from shared.scheduler_state import SchedulerStateSnapshot
 
+from dashboard.data.scheduler import clear_scheduler_state
 from dashboard.data.task_snapshot import SnapshotFailure, unmeasured_snapshot
+
+
+@pytest.fixture(autouse=True)
+def _forget_scheduler_state():
+    """Each test reads its own scheduler state rather than one an earlier test cached."""
+    clear_scheduler_state()
+    yield
+    clear_scheduler_state()
 
 
 def _tasks_read(active=(), *, offline=(), degraded=()):
@@ -48,7 +59,7 @@ def _tasks_read(active=(), *, offline=(), degraded=()):
 
 
 def _scheduler_snapshot(**overrides):
-    """Return a base scheduler-state snapshot dict with the 6 standard fields.
+    """Return a base scheduler-state snapshot in its WIRE form (the MCP reply dict).
 
     Canonical base fields (all empty/default):
       skip_counts, parks, effective_priorities, pin_queue, overrides,
@@ -71,23 +82,8 @@ def _scheduler_snapshot(**overrides):
     return base
 
 
-# ---------------------------------------------------------------------------
-# task-1454 step-1: aliasing safety check for _scheduler_snapshot helper
-# ---------------------------------------------------------------------------
-
-
-def test_scheduler_snapshot_returns_independent_dicts():
-    """Successive calls return independent dicts; mutating one doesn't affect another."""
-    snap1 = _scheduler_snapshot()
-    snap2 = _scheduler_snapshot()
-    snap1['skip_counts']['1'] = 99
-    assert snap2['skip_counts'] == {}, (
-        'snap2 was mutated by modifying snap1 — base dict is being aliased'
-    )
-    snap1['pin_queue'].append('X')
-    assert snap2['pin_queue'] == [], (
-        'snap2 pin_queue was mutated by modifying snap1 — base list is being aliased'
-    )
+def _parsed_snapshot(**overrides) -> SchedulerStateSnapshot:
+    return SchedulerStateSnapshot.from_json(_scheduler_snapshot(**overrides))
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +184,7 @@ def test_compose_rows_joins_active_tasks_with_snapshot():
         current_holders={'src/a.py': '1'},
     )
 
-    rows = _compose_rows(active_tasks, snapshot)
+    rows = _compose_rows(active_tasks, SchedulerStateSnapshot.from_json(snapshot))
 
     assert len(rows) == 2
 
@@ -359,7 +355,7 @@ def test_compose_rows_park_age_uses_provided_now():
         parks={'1': {'modules': ['src/a.py'], 'installed_at': installed_at}},
     )
 
-    rows = _compose_rows(active_tasks, snapshot, now=fixed)
+    rows = _compose_rows(active_tasks, SchedulerStateSnapshot.from_json(snapshot), now=fixed)
 
     assert rows[0]['age_seconds'] == 200
 
@@ -404,7 +400,7 @@ async def test_collect_scheduler_state_happy_path(dummy_client, dummy_config):
 
     from dashboard.data.scheduler import collect_scheduler_state
 
-    project = dummy_config.project_root.name  # _project_label result
+    project = dummy_config.project_root.name  # a lone root's label is its basename
 
     snapshot = _scheduler_snapshot(
         skip_counts={'1': 2},
@@ -614,28 +610,24 @@ async def test_degraded_project_parks_are_never_reported_stranded(
 
 
 # ---------------------------------------------------------------------------
-# task-2218 step-3: guard the first_success + whole-pair-retry + None-sentinel
-# contract that the upcoming _one_project -> first_success conversion must
-# preserve.
+# The first_success + None-sentinel contract, and the two retry axes: the
+# scheduler state fails over inside its own access datum (task 6584), the
+# two event reads fail over together on their own.
 # ---------------------------------------------------------------------------
 
 
-async def test_collect_scheduler_state_retries_whole_pair_on_second_url_when_events_fail(
+async def test_collect_scheduler_state_fails_over_only_the_events_when_events_fail(
     dummy_client, two_url_config
 ):
-    """A mid-run failure on url1 re-issues EVERY call on url2, not just events.
+    """A failed events read on url1 re-issues the two event reads on url2, not the state.
 
-    url1's get_scheduler_state succeeds but get_scheduler_events raises; the
-    whole (state, skip-events, recovery-events) group is then re-issued against
-    url2 rather than reusing url1's already-successful snapshot. Distinguishes
-    the two URLs' snapshots (skip_counts 99 vs 7) so a stray use of url1's
-    snapshot would be caught, and asserts get_scheduler_state is called again
-    on url2 (total 2 calls) rather than only retrying the events leg (which
-    would be 1 state call + N events calls).
+    url1's get_scheduler_state succeeds but get_scheduler_events raises. The
+    state is ``acquire_scheduler_state``'s datum, answered once by url1; only
+    the events legs move to url2. Distinguishes the two URLs' snapshots
+    (skip_counts 99 vs 7), so a row reading url2's snapshot would be caught.
 
-    The two event classes are fetched with independent row budgets, so a
-    successful project issues THREE calls, not two — the retry axis is still
-    the whole group.
+    The two event classes are fetched with independent row budgets, so url2
+    answers TWO events calls.
     """
     from unittest.mock import AsyncMock, patch
 
@@ -689,9 +681,8 @@ async def test_collect_scheduler_state_retries_whole_pair_on_second_url_when_eve
 
     assert project not in offline_projects
     assert len(rows) == 1
-    assert rows[0]['skip_count'] == 7, (
-        'row must reflect url2 snapshot (7) — a stray url1 value (99) means '
-        'the pair was not fully re-issued on url2'
+    assert rows[0]['skip_count'] == 99, (
+        "row must reflect url1's snapshot (99), the state datum's one answer"
     )
 
     composite_key = f'{project}/1'
@@ -700,13 +691,12 @@ async def test_collect_scheduler_state_retries_whole_pair_on_second_url_when_eve
 
     state_calls = [c for c in calls if c[1] == 'get_scheduler_state']
     events_calls = [c for c in calls if c[1] == 'get_scheduler_events']
-    assert len(state_calls) == 2, (
-        'get_scheduler_state must be re-issued on url2, not reused from url1'
+    assert state_calls == [(url1, 'get_scheduler_state')], (
+        'get_scheduler_state is answered once, by url1, inside its own access datum'
     )
     # url1: the skip-events call raises before the recovery one is reached.
     # url2: both event classes are fetched (independent row budgets).
-    assert len(events_calls) == 3
-    assert [c[0] for c in calls] == [url1, url1, url2, url2, url2]
+    assert [c[0] for c in events_calls] == [url1, url2, url2]
 
 
 async def test_collect_scheduler_state_all_urls_fail_marks_project_offline(
@@ -814,6 +804,7 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
         snapshot_at='2026-05-15T00:00:00+00:00',
     )
 
+    clear_scheduler_state()
     mock_mcp_not_paused = AsyncMock(side_effect=[not_paused_snapshot, [], []])
     mock_active2 = AsyncMock(return_value=_tasks_read())
 
@@ -833,6 +824,7 @@ async def test_collect_scheduler_state_surfaces_paused_projects(
         snapshot_at='2026-05-15T00:00:00+00:00',
     )
 
+    clear_scheduler_state()
     mock_mcp_legacy = AsyncMock(side_effect=[legacy_snapshot, [], []])
     mock_active3 = AsyncMock(return_value=_tasks_read())
 
@@ -1462,23 +1454,7 @@ def test_override_endpoint_rejects_invalid_body(client, body, expected_error):
             resp = client.post('/api/v2/dashboard/scheduler/override', json=body)
 
     assert resp.status_code == 400
-    # Background monitoring tasks call mcp_tool_call via get_memory_status /
-    # get_queue_stats (both defined in memory.py, so they resolve through the
-    # patched module attribute).  Build a robust tool-name extractor that handles
-    # both positional and kwarg-style invocations, then assert an explicit
-    # allowlist: only the two known background tools are permitted; anything else
-    # (including 'set_task_priority_override') signals a regression where the
-    # override endpoint is invoking MCP before validation completes.
-    _BACKGROUND_MCP_TOOLS = frozenset({'get_status', 'get_queue_stats'})
-
-    def _tool_name(c):
-        return c.kwargs.get('tool_name') or (c.args[2] if len(c.args) >= 3 else None)
-
-    unexpected = {_tool_name(c) for c in mock_mcp.call_args_list} - _BACKGROUND_MCP_TOOLS - {None}
-    assert not unexpected, (
-        f'Unexpected MCP tool call(s) on 400 path: {unexpected!r}. '
-        f'Full call list: {mock_mcp.call_args_list}'
-    )
+    assert mock_mcp.call_count == 0
     if expected_error is not None:
         assert resp.json().get('error') == expected_error
 
@@ -1532,6 +1508,9 @@ _CLEAR_INVALID_BODIES = [
     pytest.param({'task_id': ''}, id='empty-task_id'),
     pytest.param({'task_id': 'T1', 'fields': 'not-a-list'}, id='fields-not-list'),
     pytest.param({'task_id': 'T1', 'fields': ['bad_field']}, id='invalid-field'),
+    pytest.param(
+        {'task_id': 'T1', 'project_root': '/proj', 'fields': []}, id='fields-empty',
+    ),
 ]
 
 
@@ -1540,13 +1519,7 @@ def test_clear_override_rejects_invalid_body(client, body):
     """Invalid body → 400 with no MCP call."""
     from unittest.mock import AsyncMock, patch
 
-    # Also suppress the background _metrics_loop task: its initial _run_once()
-    # can fire during await request.json() and call mcp_tool_call, incrementing
-    # call_count before the endpoint even runs its validation logic.
-    with (
-        patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp,
-        patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock()),
-    ):
+    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
         if body is None:
             resp = client.post(
                 '/api/v2/dashboard/scheduler/clear-override',
@@ -1630,10 +1603,7 @@ def test_reorder_pin_queue_rejects_invalid_body(client, body):
     """Invalid body → 400 with no MCP call."""
     from unittest.mock import AsyncMock, patch
 
-    # Patch collect_metrics_snapshot to prevent the background _metrics_loop
-    # from calling mcp_tool_call during the request and inflating call_count.
-    with patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock()), \
-         patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
         if body is None:
             resp = client.post(
                 '/api/v2/dashboard/scheduler/reorder-pin-queue',
@@ -1662,7 +1632,7 @@ def test_reorder_pin_queue_proxies_verbatim_on_success(client):
     assert resp.json() == mcp_result
     _client, _url, tool_arg, args = mock_mcp.call_args.args
     assert tool_arg == 'reorder_pin_queue'
-    assert args['task_ids'] == ['T1', 'T2']
+    assert args == {'ordered_task_ids': ['T1', 'T2'], 'project_root': '/proj'}
     assert args['project_root'] == '/proj'
 
 
@@ -1698,7 +1668,7 @@ _EVICT_PARK_INVALID_BODIES = [
 
 @pytest.mark.parametrize('body,expected_error', _EVICT_PARK_INVALID_BODIES)
 def test_evict_park_endpoint_rejects_invalid_body(client, body, expected_error):
-    """Invalid body → 400 with no request_park_eviction MCP call."""
+    """Invalid body → 400 with no MCP call."""
     from unittest.mock import AsyncMock, patch
 
     with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
@@ -1713,17 +1683,7 @@ def test_evict_park_endpoint_rejects_invalid_body(client, body, expected_error):
 
     assert resp.status_code == 400
     assert resp.json().get('error') == expected_error
-
-    _BACKGROUND_MCP_TOOLS = frozenset({'get_status', 'get_queue_stats'})
-
-    def _tool_name(c):
-        return c.kwargs.get('tool_name') or (c.args[2] if len(c.args) >= 3 else None)
-
-    unexpected = {_tool_name(c) for c in mock_mcp.call_args_list} - _BACKGROUND_MCP_TOOLS - {None}
-    assert not unexpected, (
-        f'Unexpected MCP tool call(s) on 400 path: {unexpected!r}. '
-        f'Full call list: {mock_mcp.call_args_list}'
-    )
+    assert mock_mcp.call_count == 0
 
 
 def test_evict_park_endpoint_proxies_verbatim_on_success(client):
@@ -1799,7 +1759,7 @@ def test_compose_rows_propagates_project_and_project_root():
 
     snapshot = _scheduler_snapshot()
 
-    rows = _compose_rows(active_tasks, snapshot)
+    rows = _compose_rows(active_tasks, SchedulerStateSnapshot.from_json(snapshot))
 
     assert len(rows) == 2
     assert rows[0]['project'] == 'my-project'
@@ -1946,7 +1906,7 @@ def test_compose_rows_supports_project_filter_isolation():
 
     snapshot = _scheduler_snapshot()
 
-    rows = _compose_rows(active_tasks, snapshot)
+    rows = _compose_rows(active_tasks, SchedulerStateSnapshot.from_json(snapshot))
     assert len(rows) == 3
 
     # Python equivalent of JSX visibleRows filter
@@ -2017,9 +1977,55 @@ def test_clear_override_translates_ttl_until_to_mcp_ttl(client):
     _client, _url, tool_arg, args = mock_mcp.call_args.args
     assert tool_arg == 'clear_task_priority_override'
     # Dashboard must translate 'ttl_until' → 'ttl' before forwarding to MCP
-    assert args.get('fields') == ['ttl'], (
-        f"Expected MCP fields=['ttl'], got {args.get('fields')!r}"
-    )
+    assert args == {'task_id': 'T1', 'project_root': '/p', 'field': 'ttl'}
+
+
+def test_clear_override_clears_each_named_field_by_its_own_call(client):
+    """The tool declares one ``field`` per call; a 'fields' key would be refused."""
+    from unittest.mock import AsyncMock, patch
+
+    mcp_result = {'status': 'ok', 'task_id': 'T1'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/p', 'fields': ['pinned', 'boost_tier']},
+        )
+
+    assert resp.status_code == 200
+    sent = [call.args[3] for call in mock_mcp.call_args_list]
+    assert sent == [
+        {'task_id': 'T1', 'project_root': '/p', 'field': 'pinned'},
+        {'task_id': 'T1', 'project_root': '/p', 'field': 'boost_tier'},
+    ]
+
+
+def test_clear_override_without_fields_clears_the_whole_row(client):
+    from unittest.mock import AsyncMock, patch
+
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value={'status': 'ok'})) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/p'},
+        )
+
+    assert resp.status_code == 200
+    assert [call.args[3] for call in mock_mcp.call_args_list] == [
+        {'task_id': 'T1', 'project_root': '/p'},
+    ]
+
+
+def test_clear_override_stops_at_the_first_field_that_is_not_found(client):
+    from unittest.mock import AsyncMock, patch
+
+    not_found = {'error': 'not_found', 'task_id': 'T1'}
+    with patch(_PATCH_TARGET, new=AsyncMock(return_value=not_found)) as mock_mcp:
+        resp = client.post(
+            '/api/v2/dashboard/scheduler/clear-override',
+            json={'task_id': 'T1', 'project_root': '/p', 'fields': ['pinned', 'ttl_until']},
+        )
+
+    assert resp.status_code == 404
+    assert mock_mcp.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2068,10 +2074,7 @@ def test_override_endpoint_rejects_invalid_ttl_minutes(client, bad_ttl):
     """POST /override with invalid ttl_minutes → 400 invalid_ttl_minutes, no MCP call."""
     from unittest.mock import AsyncMock, patch
 
-    # Patch collect_metrics_snapshot to prevent the background _metrics_loop
-    # from calling mcp_tool_call during the request and inflating call_count.
-    with patch('dashboard.loops.collect_metrics_snapshot', new=AsyncMock()), \
-         patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
+    with patch(_PATCH_TARGET, new=AsyncMock()) as mock_mcp:
         resp = client.post(
             '/api/v2/dashboard/scheduler/override',
             json={
@@ -2364,36 +2367,109 @@ async def test_collect_scheduler_state_keeps_module_contention_per_project(
 # ---------------------------------------------------------------------------
 
 
-def test_compose_rows_tolerates_non_string_installed_at():
-    """park_state.installed_at coerced to str so non-string values don't AttributeError.
+@pytest.mark.parametrize(
+    'installed_at', [12345, {'nested': 'oops'}], ids=['number', 'dict'],
+)
+async def test_collect_scheduler_state_refuses_a_malformed_reply_at_the_parse_boundary(
+    dummy_client, dummy_config, caplog, installed_at,
+):
+    """A malformed producer reply is refused whole, not tolerated field-by-field.
 
-    Regression guard: if a buggy producer writes installed_at as a number or
-    dict, age_seconds must fall back to 0 rather than raising AttributeError
-    on `.replace(...)`.
+    A parse failure is not a transport failure, so the project stays online,
+    but nothing from the refused reply is shown and the refusal is logged.
     """
-    from dashboard.data.scheduler import _compose_rows
+    from unittest.mock import AsyncMock, patch
 
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    reply = _scheduler_snapshot(
+        parks={'1': {'modules': ['src/a.py'], 'installed_at': installed_at}},
+        is_paused=True,
+        pause_reason='park-stop: test',
+        pin_queue=[{'task_id': '1', 'order': 1}],
+    )
+    mock_mcp = AsyncMock(side_effect=[reply, [], []])
+    mock_active = AsyncMock(return_value=_tasks_read())
+
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
+        patch('dashboard.data.scheduler.collect_tasks_with_counts', mock_active),
+        caplog.at_level(logging.WARNING, logger='dashboard.data.scheduler'),
+    ):
+        _rows, _modules, pin_queue, _events, offline, paused, _recovery, _degraded = \
+            await collect_scheduler_state(dummy_client, dummy_config)
+
+    assert offline == []
+    assert paused == []
+    assert pin_queue == []
+    assert any(
+        r.levelno == logging.WARNING and r.name == 'dashboard.data.scheduler'
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+async def test_collect_scheduler_state_ignores_an_unknown_key_from_a_newer_producer(
+    dummy_client, dummy_config,
+):
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    fixed = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+    reply = _scheduler_snapshot(
+        is_paused=True,
+        pause_reason='park-stop: test',
+        pin_queue=[{'task_id': '1', 'order': 1}],
+        park_stacks={'src/a': [{'owner': '9', 'rank': 2, 'shadowed': False,
+                                'installed_at': '', 'source': 'fairness', 'tier': 'medium'}]},
+    )
+
+    async def collect(snapshot):
+        with (
+            patch('dashboard.data.scheduler.mcp_tool_call',
+                  AsyncMock(side_effect=[snapshot, [], []])),
+            patch('dashboard.data.scheduler.collect_tasks_with_counts',
+                  AsyncMock(return_value=_tasks_read())),
+        ):
+            return await collect_scheduler_state(dummy_client, dummy_config, now=fixed)
+
+    baseline = await collect(reply)
+    _rows, modules, pin_queue, _events, _offline, paused, _recovery, _degraded = baseline
+    project = dummy_config.project_root.name
+    assert paused == [{'project': project, 'reason': 'park-stop: test'}]
+    assert [pin['task_id'] for pin in pin_queue] == ['1']
+    assert [(m['path'], m['parked_by']) for m in modules] == [('src/a', '9')]
+
+    assert await collect({**reply, 'added_by_a_newer_producer': {'x': 1}}) == baseline
+
+
+async def test_collect_scheduler_state_without_lock_depth_uses_depth_two(
+    dummy_client, dummy_config,
+):
+    from unittest.mock import AsyncMock, patch
+
+    from dashboard.data.scheduler import collect_scheduler_state
+
+    project = dummy_config.project_root.name
     active_tasks = [{
-        'task_id': '1',
-        'title': 'T',
+        'id': f'{project}/T-1',
+        'project': project,
+        'title': 'Deep task',
         'priority': 'high',
-        'started': 0,
-        'locks': [],
+        'status': 'in-progress',
+        'started': 5,
+        'meta_files': ['orchestrator/src/orchestrator/scheduler.py'],
     }]
+    mock_mcp = AsyncMock(side_effect=[_scheduler_snapshot(), [], []])
+    mock_active = AsyncMock(return_value=_tasks_read(active_tasks))
 
-    # Number for installed_at — used to crash on .replace(...)
-    snapshot_num = _scheduler_snapshot(
-        parks={'1': {'installed_at': 12345}},
-    )
-    rows_num = _compose_rows(active_tasks, snapshot_num)
-    assert rows_num[0]['age_seconds'] == 0
+    with (
+        patch('dashboard.data.scheduler.mcp_tool_call', mock_mcp),
+        patch('dashboard.data.scheduler.collect_tasks_with_counts', mock_active),
+    ):
+        rows, *_rest = await collect_scheduler_state(dummy_client, dummy_config)
 
-    # Dict for installed_at — same crash path
-    snapshot_dict = _scheduler_snapshot(
-        parks={'1': {'installed_at': {'nested': 'oops'}}},
-    )
-    rows_dict = _compose_rows(active_tasks, snapshot_dict)
-    assert rows_dict[0]['age_seconds'] == 0
+    assert rows[0]['lock_set'] == ['orchestrator/src']
 
 
 async def test_collect_scheduler_state_normalises_non_dict_snapshot(
@@ -2466,7 +2542,7 @@ def test_compose_rows_normalizes_meta_files_to_module_locks():
         }
     ]
 
-    rows = _compose_rows(active_tasks, _scheduler_snapshot(), depth=2)
+    rows = _compose_rows(active_tasks, _parsed_snapshot(), depth=2)
 
     assert rows[0]['lock_set'] == ['orchestrator/src'], (
         f"Expected normalized module lock, got {rows[0]['lock_set']!r}"
@@ -2494,7 +2570,7 @@ def test_compose_rows_with_no_meta_files_produces_empty_lock_set():
         }
     ]
 
-    rows = _compose_rows(active_tasks, _scheduler_snapshot(), depth=2)
+    rows = _compose_rows(active_tasks, _parsed_snapshot(), depth=2)
     assert rows[0]['lock_set'] == []
 
 
@@ -2519,7 +2595,7 @@ def test_compose_rows_deep_path_holder_resolves_in_module_contention():
     ]
     snapshot = _scheduler_snapshot(current_holders={'orchestrator/src': '7'})
 
-    rows = _compose_rows(active_tasks, snapshot, depth=2)
+    rows = _compose_rows(active_tasks, SchedulerStateSnapshot.from_json(snapshot), depth=2)
     modules = _module_contention_counts(rows, snapshot['current_holders'], project='orch')
 
     assert len(modules) == 1
@@ -3492,8 +3568,8 @@ async def test_two_same_basename_roots_each_keep_their_own_snapshot(
 
     A label-keyed join would emit one root's pin entry under the other's
     ``project_root``, and the React drawer's override POSTs would then target
-    the wrong project.  No task rows are returned: the row filter is still
-    label-keyed, and this test is about the per-root SNAPSHOT join only.
+    the wrong project.  No task rows are returned: this test is about the
+    per-root SNAPSHOT join only.
     """
     from unittest.mock import AsyncMock, patch
 

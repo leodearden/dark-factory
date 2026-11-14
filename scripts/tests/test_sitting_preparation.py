@@ -8,9 +8,12 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import preparation as mod
 from sitting.gates import UNKNOWN, Fact
 from sitting.inventory import decision_key, escalation_key, key_str
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 KEY = escalation_key('/src/dark-factory/data/escalations', 'esc-3881-3')

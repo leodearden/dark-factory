@@ -34,9 +34,9 @@ from dashboard.data.mcp_fanout import (
     describe_exc,
     fanout_label,
     first_success,
-    project_label,
 )
 from dashboard.data.memory import (
+    enclosing_deadline,
     get_curator_state,
     get_memory_status,
     get_queue_stats,
@@ -58,7 +58,8 @@ logger = logging.getLogger(__name__)
 # 5s ceiling on any individual fused-memory HTTP call so a hung MCP cannot
 # extend the 10-minute sampling cycle.  Note: this is per-(root, url) call,
 # not per-loop — worst-case latency for the pending-count accumulation loop
-# scales as N_roots × M_urls × 5s if all URLs hang for every root.
+# scales as N_roots × M_urls × enclosing_deadline(5s) if all URLs hang for
+# every root.
 _HTTP_SAMPLER_TIMEOUT_SECONDS = 5.0
 # Default per-(root, url) page size for list_tickets; saturation triggers a WARNING.
 _LIST_TICKETS_LIMIT = 2000
@@ -99,13 +100,9 @@ async def fan_out_list_tickets(
     # Resolve limit at call time so monkeypatching _LIST_TICKETS_LIMIT in tests
     # takes effect without needing to pass an explicit kwarg.
     effective_limit = limit if limit is not None else _LIST_TICKETS_LIMIT
-    seen_roots: set[str] = set()
-    all_roots: list[str] = []
-    for root in [config.project_root, *config.known_project_roots]:
-        key = str(root)
-        if key not in seen_roots:
-            seen_roots.add(key)
-            all_roots.append(key)
+    per_url_deadline = enclosing_deadline(timeout)
+    all_roots = [str(root) for root in config.all_project_roots]
+    labels = config.project_labels
 
     async def _fan_out_one_root(root_str: str) -> tuple[int, list[dict]]:
         """Query list_tickets for *root_str* across all configured URLs.
@@ -128,12 +125,11 @@ async def fan_out_list_tickets(
                         # Per-HTTP-request budget: bounds connect/read/write AND
                         # pool acquisition on the shared client, which otherwise
                         # ran to mcp_tool_call's 10s default regardless of the
-                        # sampler's own deadline. The enclosing wait_for stays —
-                        # a cold session is three posts, so this layer alone
-                        # would permit roughly 3x timeout.
+                        # sampler's own deadline. The enclosing wait_for stays,
+                        # at a larger bound — see memory.py::enclosing_deadline.
                         timeout=timeout,
                     ),
-                    timeout=timeout,
+                    timeout=per_url_deadline,
                 )
                 count = result.get('count', 0) or 0
                 if count >= effective_limit:
@@ -163,7 +159,7 @@ async def fan_out_list_tickets(
                 # prefix is correct rather than doubled. The two branches
                 # below DO pre-render, hence PreformattedFanoutError there.
                 raise ValueError(
-                    f'timed out after {timeout:.1f}s (project_root={root_str})'
+                    f'timed out after {per_url_deadline:.1f}s (project_root={root_str})'
                 ) from None
             except (httpx.HTTPError, ValueError) as exc:
                 # DEBUG (not WARNING) and exc_info: this is the traceback
@@ -201,7 +197,7 @@ async def fan_out_list_tickets(
         return await first_success(
             config.fused_memory_urls,
             _call,
-            log_label=fanout_label('list_tickets', root_str),
+            log_label=fanout_label('list_tickets', root_str, labels),
             offline_result=lambda errs: (0, []),
         )
 
@@ -380,7 +376,7 @@ async def _sample_curator(
 
     Args:
         http_client: Shared AsyncClient for MCP HTTP calls.
-        config: Dashboard configuration (fused_memory_urls, known_project_roots).
+        config: Dashboard configuration (fused_memory_urls, all_project_roots).
         tickets_db: Read-only aiosqlite connection to tickets.db. If None,
             ticket latency fields are all None and only pending/capped are set.
         runs_dbs: Per-project runs.db connections for cap-event lookup.
@@ -581,7 +577,7 @@ async def collect_metrics_snapshot(
             get_memory_status(
                 http_client, config, timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
             ),
-            timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+            timeout=enclosing_deadline(_HTTP_SAMPLER_TIMEOUT_SECONDS),
         )
         pairs, _queue_inline = _split_status(status)
         for pid, payload in pairs:
@@ -606,7 +602,7 @@ async def collect_metrics_snapshot(
             get_queue_stats(
                 http_client, config, timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
             ),
-            timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+            timeout=enclosing_deadline(_HTTP_SAMPLER_TIMEOUT_SECONDS),
         )
         pending, retry, dead = _split_queue_stats(qstats)
         await conn.execute(
@@ -641,8 +637,9 @@ async def collect_metrics_snapshot(
     # dashboard-one-datum-one-path, decisions 5 and 11).
     try:
         live_map = await fetch_live_merge_queues(http_client, config.escalation_urls)
+        labels = config.project_labels
         for pid, _db in merge_dbs:
-            live = live_map.get(project_label(pid))
+            live = live_map.get(labels.of(pid))
             if live is None or not live.get('reachable'):
                 logger.debug(
                     'merge sampler: no live queue reading for %s: %s',

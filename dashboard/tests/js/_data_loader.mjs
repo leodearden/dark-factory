@@ -17,6 +17,8 @@ import { createRequire } from 'node:module';
 
 // The object datum.js reads at load; see loadDataJs's comment.
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+// The maps data.js destructures at load for pollSetFor.
+import pollScope from '../../src/dashboard/static/redux/poll_scope.js';
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/data.js';
 const DATUM_MODULE_SPECIFIER = '../../src/dashboard/static/redux/datum.js';
@@ -52,8 +54,13 @@ export function loadDataJs({ fetchStub } = {}) {
   // shim so it can publish DF_DATUM, which data.js in turn destructures at
   // module scope. index.html gives them exactly this order —
   // endpoint_staleness.js -> datum.js -> data.js — and test_index_html.py pins
-  // both edges.
-  const win = { dispatchEvent: ev => events.push(ev), DF_ENDPOINT_STALENESS: staleness };
+  // both edges. DF_POLL_SCOPE is installed for data.js too, which destructures
+  // poll_scope.js's surface -> endpoint maps at module scope for pollSetFor.
+  const win = {
+    dispatchEvent: ev => events.push(ev),
+    DF_ENDPOINT_STALENESS: staleness,
+    DF_POLL_SCOPE: pollScope,
+  };
   globalThis.window = win;
   globalThis.fetch = (url, init) => {
     fetchCalls.push({ url, init });

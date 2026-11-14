@@ -86,7 +86,7 @@ class TestClassifyBlockReason:
     unrecognized (totality — Open Q5 resolution)."""
 
     def test_post_merge_pyright_prefix_maps_to_post_merge_red_main(self):
-        from orchestrator.merge_gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane.gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
         from orchestrator.unblock_types import BlockClass, classify_block_reason
         reason = (
             POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
@@ -100,7 +100,7 @@ class TestClassifyBlockReason:
         'PLAN_FILES_NOT_TOUCHED_REASON_PREFIX',
     ])
     def test_merge_verify_prefixes_map_to_merge_verify_red(self, prefix_name):
-        from orchestrator import merge_gates
+        from orchestrator.merge_lane import gates as merge_gates
         from orchestrator.unblock_types import BlockClass, classify_block_reason
         prefix = getattr(merge_gates, prefix_name)
         assert classify_block_reason(f'{prefix}: some detail') == BlockClass.MERGE_VERIFY_RED
@@ -119,7 +119,7 @@ class TestClassifyBlockReason:
         # startswith semantics: the bare prefix (no ': detail' suffix) must
         # still classify correctly — proves this is a prefix match, not an
         # exact-template match.
-        from orchestrator.merge_gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane.gates import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
         from orchestrator.unblock_types import BlockClass, classify_block_reason
         assert (
             classify_block_reason(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX)

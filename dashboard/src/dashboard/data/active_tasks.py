@@ -4,7 +4,10 @@ Joins three sources — the per-root task snapshot unit
 (``dashboard.data.task_snapshot``, which owns every read of the task tree),
 per-task runtime state (via the orchestrator's escalation MCP,
 ``get_task_runtime_state``), and optional burst state from reconciliation —
-into the ``ACTIVE_TASKS`` shape consumed by the React dashboard's tasks tab.
+into the per-root task rows that ``/api/v2/dashboard/tasks`` serves as
+``TASKS_SNAPSHOT[p].rows`` and that
+``dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state`` joins
+against.
 
 THIS MODULE READS NOTHING ITSELF beyond the runtime fan-out and the batched
 external-status tail. A root's task state arrives as a ``TaskSnapshot``,
@@ -13,9 +16,11 @@ half, whether that measurement succeeded and why not. What lives here is the
 WALK — the budget, the admission width, the rotation, the canonical
 re-assembly — and the SHAPING of one root's rows out of one unit.
 
-Output shape (per task) matches ``data.js`` mock fixtures. A task's
-description/details are NOT on it: the Task Detail pane fetches them for the
-selected task from ``dashboard/src/dashboard/api/task_prose.py::api_task_prose``.
+Output shape (per row); the ``TASKS_SNAPSHOT`` seed comment in
+``dashboard/src/dashboard/static/redux/data.js`` documents the same shape for
+the client. A task's description/details are NOT on it: the Task Detail pane
+fetches them for the selected task from
+``dashboard/src/dashboard/api/task_prose.py::api_task_prose``.
 
     {
         'id': 'dark_factory/T-19',
@@ -30,6 +35,11 @@ selected task from ``dashboard/src/dashboard/api/task_prose.py::api_task_prose``
                                     # claimant (null/blank claimant, or a heartbeat older than
                                     # DEFAULT_CLAIMANT_HEARTBEAT_TTL). Independent of 'agent': a leftover
                                     # worktree makes 'agent' truthy while nothing is running.
+        'created_at': '2026-11-12T09:10:17.253Z',  # FILING TIME (tasks.created_at); None when
+                                                   # the store predates the columns or the row
+                                                   # is not yet backfilled
+        'created_at_source': 'stamped',  # its PROXY: how that time was learned —
+                                         # shared/src/shared/task_created_at.py::CreatedAtSource
         'started': 14,              # minutes since TaskRuntimeEntry.started (runtime snapshot);
                                     # None when the entry's own started is None
                                     # (per-task read failure)
@@ -59,6 +69,8 @@ selected task from ``dashboard/src/dashboard/api/task_prose.py::api_task_prose``
         'meta_files': ['src/...py', ...],  # taskmaster metadata.files; retained on API for
                                            # debugging/tooling — no frontend UI reads it directly
         'train': {'id': 'demo', 'order': 0},  # present when metadata.train is set; None otherwise
+        'deferral': {...},  # ONLY on a deferred row: dashboard.data.deferral_summary's summary,
+                            # or None when the row carries no record
     }
 
 Lock state is surfaced via the scheduler endpoint (see /api/v2/dashboard/scheduler).
@@ -71,7 +83,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -81,12 +93,15 @@ from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
 from shared.timestamps import parse_timestamp_or_warn
 
 from dashboard.config import DashboardConfig
-from dashboard.data.mcp_fanout import project_label
+from dashboard.data.deferral_summary import UNREAD, HoldReads, deferral_row_fields
+from dashboard.data.prd_attribution import coalesce_prd
 from dashboard.data.task_runtime import fetch_task_runtime
 from dashboard.data.task_snapshot import (
     SnapshotFailure,
     TaskSnapshot,
     acquire_snapshot,
+    clear_snapshot_cache,
+    measured_status_map,
     unmeasured_snapshot,
     withhold_rows,
 )
@@ -150,7 +165,11 @@ RuntimeStatus = Literal[
 # residual is exactly what this ``wait_for`` layer exists to cap: the two
 # layers are complementary, not redundant (the same two-layer note
 # ``dashboard/src/dashboard/data/task_runtime.py``'s module docstring carries).
-_TASKS_PER_PROJECT_BUDGET = 14.0
+TASKS_PER_PROJECT_BUDGET = 14.0
+"""Shipped per-root deadline of the Tasks tab and census projection; shorter than ``mcp_fanout.LOCK_ACQUIRE_TIMEOUT_SECONDS``.
+
+The collectors read it only through ``TASKS_BUDGET.per_project``, copied at import, so patching this name changes nothing: pass ``budget=`` instead.
+"""
 
 # Whole-handler deadline for the entire multi-project aggregation.
 #
@@ -160,7 +179,7 @@ _TASKS_PER_PROJECT_BUDGET = 14.0
 # structural worst case of roughly ``roots * 3 posts * 10 s`` with no cap at
 # all.
 #
-# DELIBERATELY UNCHANGED at 20.0 while ``_TASKS_PER_PROJECT_BUDGET`` doubled.
+# DELIBERATELY UNCHANGED at 20.0 while ``TASKS_PER_PROJECT_BUDGET`` doubled.
 # The obvious "fix" for a cold render that runs out of budget is to widen this
 # toward ``data.js``'s 30 000 ms abort, and it is the wrong one: the measured
 # payload is ~14 MB, and the 10 s of remaining headroom is what serialises and
@@ -211,12 +230,13 @@ _TASKS_PER_PROJECT_BUDGET = 14.0
 # called in-process against the live fused-memory with the production roots,
 # served 30.4 MB: 9 roots, all fresh on both halves, and 3128 active rows.
 # ACTIVE_TASKS was 15.2 MB, and the same rows again under
-# TASKS_SNAPSHOT[p].rows were another 15.2 MB, until γ3 (task 5590) retires
-# ACTIVE_TASKS. Main's live endpoint, at the same hour, served 17.4 MB
-# for 3634 rows. 506 of those rows were terminal, at 2.2 MB, so that 2.2 MB is
-# all that leaving terminal rows out of the default render saved on the wire.
-# The PRD baseline's 9.4 MB terminal-window row measures the READ (its caption:
-# the dashboard's own fetch_tasks), not the capped slice of it that shipped.
+# TASKS_SNAPSHOT[p].rows were another 15.2 MB, until γ3 (task 5590) retired
+# ACTIVE_TASKS (sizes not re-measured since). Main's live endpoint, at the same
+# hour, served 17.4 MB for 3634 rows. 506 of those rows were terminal, at
+# 2.2 MB, so that 2.2 MB is all that leaving terminal rows out of the default
+# render saved on the wire. The PRD baseline's 9.4 MB terminal-window row
+# measures the READ (its caption: the dashboard's own fetch_tasks), not the
+# capped slice of it that shipped.
 _TASKS_TOTAL_BUDGET = 20.0
 
 # How many project roots ``collect_tasks_with_counts`` may have in flight.
@@ -227,16 +247,14 @@ _TASKS_TOTAL_BUDGET = 20.0
 # SAME trailing roots were reported degraded on every render (the journal's
 # repeated ``project pump-web-ui: skipped — the 20.0s Tasks budget was
 # already spent``). At width W the worst case becomes roughly
-# ``ceil(N / W) * _TASKS_PER_PROJECT_BUDGET``.
+# ``ceil(N / W) * TASKS_PER_PROJECT_BUDGET``.
 #
-# WHY BOUNDED rather than a plain unbounded ``gather``: ``burndown.py``
-# records the measurement (see ``_SNAPSHOT_PAGE_SIZE`` and
-# ``_fetch_snapshot_tasks``). A full fan-out over every root goes against a
-# SINGLE fused-memory server where the requests serialise SERVER-side anyway,
-# on the SAME shared httpx client the 3 s render polls use — "a live
-# httpx.PoolTimeout risk for request-path handlers". Unbounded concurrency
-# would therefore buy this endpoint nothing (the server is the bottleneck)
-# while spending every other endpoint's connections.
+# WHY BOUNDED rather than a plain unbounded ``gather``: a full fan-out over
+# every root goes against a SINGLE fused-memory server where the requests
+# serialise SERVER-side anyway, on the SAME shared httpx client the 3 s render
+# polls use — a live httpx.PoolTimeout risk for request-path handlers.
+# Unbounded concurrency would therefore buy this endpoint nothing (the server
+# is the bottleneck) while spending every other endpoint's connections.
 #
 # NOTE that ``app._build_http_limits`` scales ``max_connections`` with the
 # fleet size, which makes the POOL look like the constraint it is not. Raising
@@ -248,47 +266,60 @@ _TASKS_TOTAL_BUDGET = 20.0
 # ``ceil(9/4) = 3`` waves. ``test_tasks_budget.py`` (f) holds it in (1, 8].
 _TASKS_ROOT_CONCURRENCY = 4
 
-def _all_project_roots(config: DashboardConfig) -> list[Path]:
-    """All known project roots, deduped, primary first."""
-    seen: set[Path] = {config.project_root}
-    roots: list[Path] = [config.project_root]
-    for r in config.known_project_roots:
-        if r not in seen:
-            seen.add(r)
-            roots.append(r)
-    return roots
 
+@dataclass(frozen=True, slots=True)
+class TasksBudget:
+    """The three bounds a per-root fan-out runs under.
 
-def project_roots_for_label(config: DashboardConfig, label: str) -> list[Path]:
-    """Every configured root whose display label is *label*, primary first.
-
-    A LIST, because the label is the directory basename and two configured
-    roots can share one — the collision ``collect_tasks_with_counts`` keys by
-    root to survive. A caller that needs one root must refuse rather than guess
-    when the list is not exactly one long.
+    Both collectors here take one as ``budget=``, and ``/prds`` ships its own
+    (``dashboard/src/dashboard/api/prds.py::PRDS_BUDGET``). Every bound must
+    be able to serve a root: a non-positive time bound serves nothing, and a
+    zero-width semaphore admits no root and hangs the walk.
     """
-    return [root for root in _all_project_roots(config) if project_label(root) == label]
 
+    per_project: float
+    total: float
+    root_concurrency: int
+
+    def __post_init__(self) -> None:
+        for name, seconds in (('per_project', self.per_project), ('total', self.total)):
+            if not seconds > 0:
+                raise ValueError(f'TasksBudget.{name} must be positive, got {seconds!r}')
+        if self.root_concurrency < 1:
+            raise ValueError(
+                f'TasksBudget.root_concurrency must be at least 1, got {self.root_concurrency!r}'
+            )
+
+
+TASKS_BUDGET = TasksBudget(
+    per_project=TASKS_PER_PROJECT_BUDGET,
+    total=_TASKS_TOTAL_BUDGET,
+    root_concurrency=_TASKS_ROOT_CONCURRENCY,
+)
+"""The shipped budget; ``dashboard/tests/test_tasks_budget.py`` checks its constants' mutual constraints."""
 
 # Admission-order rotation offset for `collect_tasks_with_counts`, advanced by
 # one slot per render. Module state, like the `_*_cache` objects elsewhere in
-# this package, with a matching `_reset_root_rotation()` test hook.
+# this package, reset by `reset_task_snapshot_state()`.
 _root_rotation_offset: int = 0
 
 
-def _reset_root_rotation() -> None:
-    """Reset the admission-order rotation. Test hook.
+def reset_task_snapshot_state() -> None:
+    """The ONE reset of the task-snapshot collectors' per-process state.
 
-    Same shape as the ``_*_cache_clear`` hooks in ``tasks.py``: rotation is
-    module state, so a test that asserts an ORDER has to be able to start from
-    a known offset rather than inherit whatever the previous test left.
+    That state is the unit cache, the last-good store and the admission
+    rotation. It is for tests and admin use; tests reach it through
+    ``dashboard/tests/conftest.py::fresh_task_snapshot_state``. A test that
+    asserts an ORDER or a cold read must start from a known state rather
+    than inherit whatever the previous test left.
     """
     global _root_rotation_offset
+    clear_snapshot_cache()
     _root_rotation_offset = 0
 
 
-def _rotated_project_roots(config: DashboardConfig) -> list[Path]:
-    """``_all_project_roots`` rotated left by one more slot on each call.
+def _rotated_project_roots(config: DashboardConfig) -> tuple[Path, ...]:
+    """``DashboardConfig.all_project_roots`` rotated left by one more slot on each call.
 
     WHAT THIS CLOSES. `collect_tasks_with_counts` cannot always serve every
     root inside `_TASKS_TOTAL_BUDGET`, and with a FIXED walk order the roots
@@ -316,18 +347,11 @@ def _rotated_project_roots(config: DashboardConfig) -> list[Path]:
     Reproducibility in an incident is worth more here than any property a
     random order would buy.
 
-    SEPARATE HELPER, deliberately. ``_all_project_roots`` stays byte-identical
-    and primary-first: ``app.py``, ``scheduler.py``, ``collect_done_counts``
-    and ``test_app.py``'s patch point all depend on that ordering, so rotating
-    in place would silently repoint every one of them at a different project.
-    Only ``collect_tasks_with_counts``' admission loop calls this.
-
-    Rotation changes ADMISSION order only. Output is re-assembled in canonical
-    ``_all_project_roots`` order by the caller, so the rendered table does not
-    reshuffle on every 3 s poll.
+    Rotation changes ADMISSION order only: the caller re-assembles output in
+    ``DashboardConfig.all_project_roots`` order.
     """
     global _root_rotation_offset
-    roots = _all_project_roots(config)
+    roots = config.all_project_roots
     if not roots:
         return roots
     offset = _root_rotation_offset % len(roots)
@@ -375,26 +399,6 @@ def _minutes_since(iso: str | None, *, now: datetime | None = None) -> int | Non
     return max(minutes, 0)
 
 
-def _coalesce_prd(metadata: dict) -> str | None:
-    """Coalesce PRD provenance from *metadata* into a single normalized string.
-
-    Checks ``prd_path``, then ``prd``, then ``prd_ref`` (in that precedence
-    order); the first value that is a non-empty string after stripping a
-    trailing ``#anchor`` or ``§section`` suffix and surrounding whitespace
-    wins. Non-string values are skipped. A value that cleans to ``''`` (e.g.
-    it was only a suffix) falls through to the next key. Returns ``None``
-    when no key yields a non-empty result.
-    """
-    for key in ('prd_path', 'prd', 'prd_ref'):
-        raw = metadata.get(key)
-        if not isinstance(raw, str):
-            continue
-        cleaned = raw.split('#', 1)[0].split('§', 1)[0].strip()
-        if cleaned:
-            return cleaned
-    return None
-
-
 def _build_task_row(
     project: str,
     task: dict,
@@ -402,8 +406,8 @@ def _build_task_row(
     rt: dict,
     uid: str,
     *,
-    prd: str | None = None,
     now: datetime | None = None,
+    hold_reads: HoldReads = UNREAD,
 ) -> dict:
     """Build the common row fields shared by active and done task rows.
 
@@ -420,6 +424,10 @@ def _build_task_row(
     (a terminal row is simply never stranded — the shared predicate gates on
     ``status == 'in-progress'``).
 
+    Every row also carries the filing-time pair ``created_at``/
+    ``created_at_source``, ``None`` when the store predates the columns or
+    the row is not yet backfilled (see ``tasks.py::_shape_task``).
+
     ``stranded`` is deliberately independent of ``agent``: see the comment at
     the ``agent`` assignment in :func:`_runtime_fields`.
 
@@ -430,14 +438,6 @@ def _build_task_row(
     ``0``). Missing keys default to ``None``/``False`` so a bare ``{}`` (used
     by direct unit tests of this function) is still valid.
 
-    *prd*, if given, is used verbatim as the row's ``prd`` value instead of
-    re-deriving it from *task*'s metadata via ``_coalesce_prd`` — callers
-    that already computed it (e.g. the terminal-bucket loop, to decide
-    live-PRD membership) can pass it through to avoid doing the same
-    split/strip work twice. Omitting it (or passing ``None``, the actual
-    no-provenance value) falls back to deriving it from metadata, which is
-    safe because re-deriving a true ``None`` is idempotent.
-
     *now* is the reference instant for the strand verdict — this function
     never reads the clock itself, so every row in one pass is judged against
     the same instant. ``_shape_one_project`` passes the rows' own ``as_of``
@@ -445,6 +445,10 @@ def _build_task_row(
     NOT the render instant, so a stale half is not re-judged against a later
     clock; ``shape_terminal_rows`` passes the render instant, which a terminal
     row never consults (the predicate gates on ``in-progress``).
+
+    ``deferral`` is present only on a deferred row, worded against
+    *hold_reads* by ``dashboard.data.deferral_summary``, and ``None`` when the
+    row carries no record.
     """
     metadata = task.get('metadata') or {}
     meta_files = list(metadata.get('files') or [])
@@ -477,10 +481,13 @@ def _build_task_row(
         'claimant_run_id': task.get('claimant_run_id'),
         'heartbeat_at': task.get('heartbeat_at'),
         'stranded': task_is_stranded(task, now=now),
+        'created_at': task.get('created_at'),
+        'created_at_source': task.get('created_at_source'),
         'meta_files': meta_files,
         'train': train,
         'external_deps': external_deps,
-        'prd': prd if prd is not None else _coalesce_prd(metadata),
+        'prd': coalesce_prd(metadata),
+        **deferral_row_fields(task, now=resolve_now(now), reads=hold_reads),
     }
 
 
@@ -628,7 +635,7 @@ def _resolve_deps(
 
 
 def _shape_one_project(
-    project_root: Path,
+    project: str,
     snapshot: TaskSnapshot,
     *,
     now: datetime,
@@ -680,7 +687,6 @@ def _shape_one_project(
     degrade to an honest ``None`` via :func:`_runtime_fields`, which is a
     DIFFERENT fault domain from the task-tree read the snapshot reports on.
     """
-    project = project_label(project_root)
     tasks = snapshot.rows.value or []
     if not tasks:
         return []
@@ -695,6 +701,10 @@ def _shape_one_project(
 
     # Lookup table for dep title/status resolution within the same project.
     by_id: dict[int, dict] = {t['id']: t for t in tasks if isinstance(t.get('id'), int)}
+    hold_reads = HoldReads(
+        carrier_statuses=measured_status_map(snapshot),
+        holder_liveness=snapshot.holder_liveness,
+    )
 
     active: list[dict] = []
     for task in tasks:
@@ -703,7 +713,9 @@ def _shape_one_project(
             continue
         rt = _runtime_fields(runtime_index, runtime_status, task_id, now=now)
         uid = task_uid(project, task_id)
-        row = _build_task_row(project, task, task_id, rt, uid, now=judged_at)
+        row = _build_task_row(
+            project, task, task_id, rt, uid, now=judged_at, hold_reads=hold_reads,
+        )
         # active rows: started from the runtime entry; deps from task tree.
         row['started'] = rt['started']
         row['deps'] = _resolve_deps(task, by_id, project, status_map=snapshot.status_map)
@@ -712,7 +724,7 @@ def _shape_one_project(
 
 
 def shape_terminal_rows(
-    project_root: Path,
+    project: str,
     rows: list[dict],
     *,
     now: datetime,
@@ -745,7 +757,6 @@ def shape_terminal_rows(
     ``lower_bound`` state is what tells it the list is a window rather than a
     population.
     """
-    project = project_label(project_root)
     runtime_status = _probe_status(None)
     shaped: list[dict] = []
     for task in rows:
@@ -779,7 +790,9 @@ async def _acquire_and_shape(
     have no provenance, and a snapshot with no rows renders nothing.
     """
     snapshot = await acquire_snapshot(client, config, project_root, now=now)
-    rows = _shape_one_project(project_root, snapshot, now=now, runtime=runtime)
+    rows = _shape_one_project(
+        config.project_labels.of(project_root), snapshot, now=now, runtime=runtime,
+    )
     return rows, snapshot
 
 
@@ -793,8 +806,9 @@ async def _serve_roots_within_budget(
     *,
     now: datetime,
     deadline: float,
+    budget: TasksBudget,
 ) -> list[tuple[Path, list[dict], TaskSnapshot]]:
-    """Run *share* for every configured root inside the Tasks budget.
+    """Run *share* for every configured root inside the Tasks *budget*.
 
     THE budgeted per-root fan-out, shared by every collector of the snapshot
     units so they honour the same invariants: one bad root must not blank the
@@ -817,12 +831,13 @@ async def _serve_roots_within_budget(
     # the same trailing roots being starved on every render; see
     # _rotated_project_roots. `roots` below is the canonical order the results
     # are re-assembled in.
-    roots = _all_project_roots(config)
+    roots = config.all_project_roots
+    labels = config.project_labels
     admission_order = _rotated_project_roots(config)
     # Admission control, not a work queue: the coroutines are all created up
     # front and the semaphore decides how many shares are running at once.
     # See _TASKS_ROOT_CONCURRENCY for why the width is bounded.
-    slots = asyncio.Semaphore(_TASKS_ROOT_CONCURRENCY)
+    slots = asyncio.Semaphore(budget.root_concurrency)
 
     def _unreached(
         root: Path, reason: str, failure: SnapshotFailure,
@@ -850,7 +865,7 @@ async def _serve_roots_within_budget(
         and how much of it remained, and is then carried verbatim by both the
         WARNING and the unit — one sentence, one place, two readers.
         """
-        label = project_label(root)
+        label = labels.of(root)
         async with slots:
             # AFTER admission, deliberately: a root that queued for a slot has
             # already spent part of the whole-handler budget, and handing it a
@@ -863,7 +878,7 @@ async def _serve_roots_within_budget(
                 # invisible failure the fan-out logging policy was raised to
                 # WARNING to close.
                 reason = (
-                    f'skipped — the {_TASKS_TOTAL_BUDGET:.1f}s Tasks budget was '
+                    f'skipped — the {budget.total:.1f}s Tasks budget was '
                     'already spent before this project was reached'
                 )
                 logger.warning(
@@ -874,12 +889,12 @@ async def _serve_roots_within_budget(
                 return _unreached(root, reason, SnapshotFailure.BUDGET)
             try:
                 return await asyncio.wait_for(
-                    share(root), timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET),
+                    share(root), timeout=min(remaining, budget.per_project),
                 )
             except TimeoutError:
                 reason = (
-                    f'exceeded its {_TASKS_PER_PROJECT_BUDGET:.1f}s share of the '
-                    f'{_TASKS_TOTAL_BUDGET:.1f}s Tasks budget '
+                    f'exceeded its {budget.per_project:.1f}s share of the '
+                    f'{budget.total:.1f}s Tasks budget '
                     f'({remaining:.1f}s remained)'
                 )
                 logger.warning(
@@ -934,15 +949,10 @@ async def _serve_roots_within_budget(
     # assembly code, a CancelledError) must still propagate rather than be
     # silently converted into a result object.
     results = await asyncio.gather(*(_one(root) for root in admission_order))
-    # Keyed by ROOT, never by label. `project_label` is the directory
-    # BASENAME, so two configured roots can share one (``/a/proj`` and
-    # ``/b/proj``) — and a label-keyed dict collapses them, which would emit
-    # the survivor's rows TWICE (duplicate `task_uid`s, the React tab's map
-    # key) and drop the other root's rows entirely. Roots are deduped by
-    # `_all_project_roots`, so this pairing is total and 1:1; `strict=True`
-    # says so rather than trusting it. (The callers' snapshot dicts are
-    # label-keyed because the wire addresses projects by label; the collision
-    # costs an ENTRY there, never a row.)
+    # Keyed by ROOT, never by label: the root is the identity each result was
+    # produced for, so the pairing holds however the roots are labelled. Roots
+    # are deduped by `DashboardConfig.all_project_roots`, so this pairing is
+    # total and 1:1; `strict=True` says so rather than trusting it.
     by_root = dict(zip(admission_order, results, strict=True))
     return [(root, *by_root[root]) for root in roots]
 
@@ -953,6 +963,7 @@ async def collect_tasks_with_counts(
     *,
     resolve_external: bool = False,
     now: datetime | None = None,
+    budget: TasksBudget = TASKS_BUDGET,
 ) -> tuple[list[dict], dict[str, TaskSnapshot]]:
     """Aggregate every root's active rows and its task snapshot in one pass.
 
@@ -968,11 +979,8 @@ async def collect_tasks_with_counts(
     A project therefore cannot be named offline while its census says it was
     measured, because there is only one thing to read.
 
-    The entries are keyed by project LABEL, which is the directory basename,
-    so two configured roots sharing one collapse to a single entry. That is
-    pre-existing and deliberate: the label is what the wire and the front end
-    address a project by, and the ROW assembly below is still keyed by root,
-    so no root's rows are lost to the collision.
+    The entries are keyed by project label, unique across the configured roots
+    (see ``dashboard/project_labels.py::ProjectLabels``).
 
     **The units it returns carry the SHAPED rows**, not the raw rows
     ``acquire_snapshot`` cached. Each measured unit comes back with
@@ -987,17 +995,17 @@ async def collect_tasks_with_counts(
     ``value is None``, because ``[]`` would claim a measured zero.
 
     **Bounded as a whole, not merely per call.**  A ``loop.time()`` deadline
-    (``_TASKS_TOTAL_BUDGET``) is taken up front and each project is run under
-    ``asyncio.wait_for`` at ``min(remaining, _TASKS_PER_PROJECT_BUDGET)``,
+    (``budget.total``) is taken up front and each project is run under
+    ``asyncio.wait_for`` at ``min(remaining, budget.per_project)``,
     copying ``app.healthz``'s loop shape rather than inventing one.
 
     **Concurrent at a bounded width.**  The walk used to be SEQUENTIAL, which
     made this function's worst case the SUM of every project's worst case —
     so at the 9 roots of the 2026-08-27 incident the total budget could not
     fit them all and the trailing roots degraded on every render.  Roots are
-    now admitted through an ``asyncio.Semaphore(_TASKS_ROOT_CONCURRENCY)``, so
-    the worst case is roughly ``ceil(roots / _TASKS_ROOT_CONCURRENCY) *
-    _TASKS_PER_PROJECT_BUDGET``.  The deadline is still what BOUNDS it —
+    now admitted through an ``asyncio.Semaphore(budget.root_concurrency)``, so
+    the worst case is roughly ``ceil(roots / budget.root_concurrency) *
+    budget.per_project``.  The deadline is still what BOUNDS it —
     concurrency changes the cost, not the guarantee.  The width is bounded
     rather than unbounded because the fan-out targets a single fused-memory
     server (where the requests serialise server-side regardless) over the
@@ -1057,33 +1065,37 @@ async def collect_tasks_with_counts(
     stamped with one instant, so the skew between them is measured and
     reported (``snapshot.skew_seconds``) rather than implied by two caches at
     different TTLs. That skew used to be up to ~15 s and undisclosed.
+
+    *budget* bounds the walk; production callers pass none and get the
+    shipped :data:`TASKS_BUDGET`.
     """
     effective_now = resolve_now(now)
     # The deadline is taken BEFORE the runtime fan-out, so that fan-out is
     # inside the budget too rather than being free time the projects then pay
     # for. Same shape as app.healthz's whole-handler deadline.
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + _TASKS_TOTAL_BUDGET
+    deadline = loop.time() + budget.total
+    labels = config.project_labels
     runtime_by_label = await fetch_task_runtime(client, config.escalation_urls)
 
     async def _share(root: Path) -> tuple[list[dict], TaskSnapshot]:
         return await _acquire_and_shape(
             client, config, root,
             now=effective_now,
-            runtime=runtime_by_label.get(project_label(root)),
+            runtime=runtime_by_label.get(labels.of(root)),
         )
 
     all_active: list[dict] = []
     snapshots: dict[str, TaskSnapshot] = {}
     served = await _serve_roots_within_budget(
-        config, _share, now=effective_now, deadline=deadline,
+        config, _share, now=effective_now, deadline=deadline, budget=budget,
     )
     # This is the only place the shared accumulators are written, in the
     # canonical root order the fan-out hands back.
     for root, rows, snapshot in served:
         if snapshot.rows.value is not None:
             snapshot = replace(snapshot, rows=replace(snapshot.rows, value=rows))
-        snapshots[project_label(root)] = snapshot
+        snapshots[labels.of(root)] = snapshot
         all_active.extend(rows)
 
     if resolve_external:
@@ -1107,7 +1119,7 @@ async def collect_tasks_with_counts(
                 'external dep statuses skipped for %d id(s) — the %.1fs Tasks '
                 'budget was spent by the per-project walk; every external dep '
                 "keeps its 'unknown' sentinel for this render",
-                len(dep_ids), _TASKS_TOTAL_BUDGET,
+                len(dep_ids), budget.total,
             )
         elif dep_ids:
             # BOUNDED, not merely deadline-checked. The check above only
@@ -1130,7 +1142,7 @@ async def collect_tasks_with_counts(
                     'external dep statuses for %d id(s) exceeded the %.1fs '
                     'remaining of the %.1fs Tasks budget — every external dep '
                     "keeps its 'unknown' sentinel for this render",
-                    len(dep_ids), ext_remaining, _TASKS_TOTAL_BUDGET,
+                    len(dep_ids), ext_remaining, budget.total,
                 )
                 status_map = {}
             map_offline = bool(status_map.get('offline'))
@@ -1151,6 +1163,7 @@ async def collect_census_snapshots(
     config: DashboardConfig,
     *,
     now: datetime | None = None,
+    budget: TasksBudget = TASKS_BUDGET,
 ) -> dict[str, TaskSnapshot]:
     """Every root's task snapshot with its rows WITHHELD: the census-only render.
 
@@ -1170,15 +1183,18 @@ async def collect_census_snapshots(
     which carries the whole ``metadata`` blob, can reach the wire through a
     caller forgetting to strip it. An unmeasured half keeps its producer's
     reason.
+
+    *budget* bounds the walk exactly as it does for the full collector.
     """
     effective_now = resolve_now(now)
-    deadline = asyncio.get_running_loop().time() + _TASKS_TOTAL_BUDGET
+    deadline = asyncio.get_running_loop().time() + budget.total
 
     async def _share(root: Path) -> tuple[list[dict], TaskSnapshot]:
         snapshot = await acquire_snapshot(client, config, root, now=effective_now)
         return [], withhold_rows(snapshot)
 
     served = await _serve_roots_within_budget(
-        config, _share, now=effective_now, deadline=deadline,
+        config, _share, now=effective_now, deadline=deadline, budget=budget,
     )
-    return {project_label(root): snapshot for root, _rows, snapshot in served}
+    labels = config.project_labels
+    return {labels.of(root): snapshot for root, _rows, snapshot in served}

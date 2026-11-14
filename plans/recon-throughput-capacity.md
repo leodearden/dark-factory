@@ -59,7 +59,8 @@ hour.
 
 The rule, enforced in code and pinned by a dedicated test: **bucket by parsing, never by
 SQL string comparison against a `datetime('now')` literal.** `utc_hour_bucket` is the
-single place parsing happens; the rollup and every reader route through it.
+single place bucketing happens (on top of `_parse_utc`); the rollup and every reader
+route through it.
 
 ---
 
@@ -209,13 +210,74 @@ regimes) and conservative in another (marginal cost taken at its upper bound). T
 constants' docstrings say so, and both the config comment and the report tell an operator
 to **re-derive them from live data** rather than trust them indefinitely.
 
-### Lever 3 — coalesce redundant events *(deliberately deferred)*
+### Lever 3 — coalesce redundant events *(landed, task 4278)*
 
-Filed as a follow-up, not done here. The per-event_type composition the report now emits
-is precisely the evidence needed to size it: on the live DB, `task_modified` is
-1157/1741 (66%) of dark_factory's recent inflow and `task_status_changed` + `task_modified`
-together are 92/117 (79%) of reify's. Coalescing is a **behavioural change to the buffer**
-and should not ride along with a measurement + scheduling change.
+Deferred here and landed as task 4278. The per-event_type composition this task added
+sized it: `task_modified` was 1157/1741 (66%) of dark_factory's inflow and
+`task_status_changed` + `task_modified` were 92/117 (79%) of reify's.
+
+**The fold rule** (`reconciliation/coalescing.py`, applied in `EventBuffer.push`):
+
+- It runs at push time. The INSERT is the write unit's first statement, so the unit is a
+  write transaction from the start and serialises against the other MCP processes'
+  connections. A read-first unit could raise `SQLITE_BUSY_SNAPSHOT`
+  (`AtomicConnection.write`).
+- A `task_status_changed` event folds by task id. A `task_modified` event folds only when
+  its `operation` is `update_task`.
+- A `task_status_changed` into `done` is a fold barrier: it never folds and never becomes a
+  fold target, because its row stores no `coalesce_key`.
+- `add_dependency` / `remove_dependency` never fold: each `depends_on` is a distinct fact.
+  On 2026-10-19, 113 live dependency events covered 111 distinct edges. Task creation and
+  deletion, `deferral_restamped` and every memory event never fold either.
+- The event folds into the OLDEST `status='buffered'` row with the same
+  `(project_id, coalesce_key)`. The just-inserted row is deleted inside the same
+  uncommitted unit, so no reader ever sees it.
+
+**How each constraint is discharged:**
+
+- **(a) The stage still sees what happened.** The merged payload describes itself.
+  `old_status` comes from the earliest constituent. `new_status` and every producer key
+  (`reopen_*`, `deferral`, `deferral_cleared`, `_project_root`) come from the newest,
+  replaced rather than unioned, so no stale per-transition key survives.
+  `_coalesced_status_path` (capped at 20 and flagged when truncated) and
+  `_coalesced_count` record the chain; the path bridges a status event held in another
+  row, such as a `done` barrier. Pushes can arrive out of timestamp order (several
+  processes, an async queue), and the merge classifies each arrival as older, newer or
+  middle so the result does not depend on arrival order.
+  `unlanded_path_check` reads each `done` transition's own `done_provenance`, and every
+  other drained-event reader uses `task_id` or live task state. A new reader of a
+  per-transition key adds its transition to `coalescing._FOLD_BARRIER_STATUSES`.
+- **(b) Drain ids stay stable.** The target row keeps its id, so an id `peek_buffered`
+  handed out still drains through `drain_by_ids`. Scoping to `status='buffered'` means a
+  drained or dead-lettered row is never mutated; a later push starts a fresh row.
+- **(c) Ordering and latency hold.** The row timestamp never moves later (only earlier,
+  when an older event arrives late). Every `ORDER BY timestamp` position and the
+  `MIN(timestamp)` staleness trigger therefore hold, and a task edited every minute
+  cannot walk its event past `max_staleness_seconds`.
+
+A fold landing between `peek_buffered` and `drain_by_ids` reaches the stage as the
+pre-fold payload. That is benign: the task is already in that batch, `_ctx_task_event`
+reads its live state, and no `done` event can have folded into it.
+
+**Fold ratios, 2026-10-19** (live `event_buffer`, rows per distinct task id, `update_task`):
+2.28x dark_factory, 2.69x solar_challenge, 2.62x solar_challenge_platform, 1.31x reify.
+`task_status_changed` ran 1.0x–1.36x.
+
+**Reading the report now.** Every folded event is counted in `event_coalesced_hourly` in
+the fold's own write unit. Each pushed event is therefore a live row, in
+`event_arrival_hourly`, or in `event_coalesced_hourly`, exactly once, with one bound.
+A fold recognises a redelivery only when the redelivered event is its row's newest
+constituent. At-least-once journal redelivery of an older or middle constituent
+therefore folds again, and over-counts that event by one.
+
+- `inflow.total_events` still counts every event producers emitted.
+- `inflow.coalesced` (same shape) is the folded share, and `total − coalesced` is the drain
+  demand: the rows that actually reached the buffer.
+- The concentration section weighs each live row by its fold count, and reports events
+  on `live_rows` rows.
+
+**Switch.** `reconciliation.coalesce_task_events` (default `true`) is restart-only.
+`false` restores pre-4278 behaviour. `coalesce_key` is stored either way.
 
 ### Lever 4 — `backlog_hard_limit_overrides.reify` *(deliberately UNCHANGED)*
 
@@ -324,12 +386,129 @@ which is why the readable summary leads with it.
 
 ---
 
+## solar_challenge, 2026-10 (task 7076): an inflow loop, not a capacity shortfall
+
+The backlog L1 (`esc-reconciliation-backlog-2026-09-29T144132`, under solar-challenge
+esc-infra-1) held at ~3,000 against the 500 default from 10-11. The drainer was not
+wedged, and inflow had risen roughly tenfold. Neither a threshold override nor a
+drain-capacity purchase was the fix: two tasks were looping.
+
+### Method
+
+```bash
+python -m fused_memory.reconciliation.throughput \
+    --db data/reconciliation/reconciliation.db --project solar_challenge --since 2026-10-11T00
+```
+
+The report's per-task **concentration** section (`inflow_concentration`, added by this
+task) ranks task ids by live `event_buffer` rows. Payloads, and so task ids, exist only
+on live rows: `cleanup_drained` rolls a swept row up to (project, hour, event_type). The
+section therefore covers the window it prints, never the rolled-up history. While a
+backlog exists the buffered rows *are* the backlog, so it always covers the alarm
+condition. `cleanup_drained` also skips a project holding its reconciliation lock, so a
+busy project keeps many hours of drained rows live as well.
+
+### Measurements
+
+**Daily inflow** (`inflow.daily`, read 2026-10-17):
+
+| period | events/day |
+|---|---|
+| Aug 1 – Sep 28 | ~50 (mean 51 over 47 days) |
+| 09-29 | 9,432, the day the backlog L1 was first filed |
+| 09-30 – 10-02 | 1,422 / 4,747 / 5,716 |
+| 10-03 – 10-10 | 690 – 1,375 |
+| 10-11 – 10-16 | 5,403 – 19,279 (the loop) |
+
+The 09-29 to 10-02 bursts are **unattributable**: their payloads were already swept.
+
+**Composition alone was insufficient.** Since 10-04, task_modified made up 69% of
+inflow and task_status_changed 23%. That says *which* event types dominate, but
+organic growth and one task cycling through the same transitions produce the same
+composition.
+
+**Concentration** (2026-10-17 ~08:20Z): of 10,296 live rows, covering
+10-16T17:08:12Z..10-17T08:07:47Z, task **644** had 5,558 (54.0%) and task **636** had
+4,047 (39.3%), together **93.3%**.
+
+- Their transitions cycled pending→in-progress (847), in-progress→blocked (802) and
+  blocked→pending (807), about one cycle per minute per task.
+- Both were gated by an info-severity L2 ticket_failure escalation ("Steward re-escalated
+  to human"), and unblock_auto ran on each block. 644 had been pending since
+  10-11T02:01Z, matching the step up in inflow on 10-11.
+- Leo ruled close_only on esc-644-1 / esc-636-1 at 10-17T06:48Z. The two tasks'
+  events per hour then fell from 1,218 (06Z) to 53 (07Z) to 0 (08Z).
+
+**Drain** (since 10-04, read ~08:20Z):
+
+- 71,172 events drained at 5.33 s/event, remediation-inclusive: **16,208/day
+  observed**.
+- **19,943/day remediation-free**, at duty 0.187.
+- On 10-16 the pipeline held the lock 21.1h and drained 15,426 events, about
+  **730/h**.
+
+That clears the 10-03..10-10 baseline by roughly 12x and the Aug–Sep baseline by over
+100x.
+
+**Fresh reading, 2026-10-17 15:04–15:07Z** (the CLI above, plus a read-only count over
+the same DB):
+
+- **Below threshold.** `event_buffer` holds **402** buffered solar_challenge rows, and
+  `get_queue_stats(solar_challenge)` reads `reconciliation_backlog` **405**,
+  `halted=false`. That is down from 3,155 at 08:19Z.
+- **Lag.** The oldest buffered event is from 11:33:03Z, about 3.5h old. The last
+  backlog chunk drained 296 events in 97 min (12:55→14:32Z), and a remediation pass has
+  been in flight since 14:32Z.
+- **Hourly inflow** on 10-17: 1,235 (06Z), 151 (07Z), then 19–159/h from 08Z through
+  14Z.
+- **Concentration** over 10,835 live rows (10-16T17:08Z..10-17T15:04Z): 644 = 5,567
+  (51.4%), 636 = 4,051 (37.4%). The next-largest task is 25 (0.2%), and 442 rows are
+  unattributed.
+- **Drain since 10-11**: 16,441/day observed, 20,415/day remediation-free, duty
+  0.195.
+
+### Decision
+
+- **No `backlog_hard_limit_overrides.solar_challenge`.** The 500 default correctly
+  flagged a pathological inflow. A threshold sized to cover it (≥3k–7k) would have masked
+  the loop, which is the "masking a real runaway" failure the reify-1500 rationale itself
+  warns against.
+- **No drain-capacity purchase.** Measured capacity already clears baseline inflow by
+  over 10x. Buying more would only drain faster a loop that should never have been
+  produced.
+- **Lag tolerance: the 500 default**, about 41 min at the measured ~730 events/h
+  lock-held rate. At baseline inflow the steady-state buffer is one batch: 150 events
+  by conditional trigger, or the 1800s staleness backstop. That never approaches 500.
+  By Lever 4's `S`-vs-`I` argument, with `S ≫ I` any excursion is transient.
+- **Lever 3 (DF 4278) stays deferred.** Baseline inflow does not need it, and the
+  concentration section is now its sizing input.
+
+The loop's mechanism is owned upstream by DF **5222** (info never gates), **3125**
+(unblock_auto sha dedup) and **4082** (stranded-blocked repend). The evidence is in
+esc-7076-1.
+
+**Caveat.** Until 5222 lands, any task gated only by an info L2 can loop again. If it
+does, the alarm firing is correct. Re-run the concentration section before touching the
+threshold.
+
+**After lever 3 (task 4278).** A loop of this shape now folds into about one buffered row
+per task, so it no longer builds backlog: the 500 `reconciliation_backlog` alarm would not
+have flagged it. The remaining signals are the `reconciliation.coalesce_hot_task` WARNING,
+logged each time a row's fold count reaches a multiple of 100, and the fold-weighted
+concentration section. An escalation-grade alarm is the filed follow-up, DF **7148**.
+
+---
+
 ## Where things live
 
 | Thing | Path |
 |---|---|
 | Report + capacity arithmetic | `fused-memory/src/fused_memory/reconciliation/throughput.py` |
+| Per-task inflow attribution | `throughput.py` — `inflow_concentration` (live `event_buffer` rows only) |
 | Inflow rollup | `event_buffer.py` — `event_arrival_hourly`, written in `cleanup_drained` |
+| Fold rule (lever 3) | `fused-memory/src/fused_memory/reconciliation/coalescing.py` — `coalesce_key`, `merge_coalesced_payload` |
+| Fold count | `event_buffer.py` — `event_coalesced_hourly`, written in `push`'s fold |
+| Fold switch | `reconciliation.coalesce_task_events: true` in `fused-memory/config/config.yaml` (restart-only) |
 | Deferral gate | `harness.py` — `_maybe_remediate`, `_backlog_state`, `is_backlog_size` |
 | Deferral bound | `ReconciliationConfig.max_backlog_remediation_deferrals` (default 1, `le=1`) |
 | Batch size | `reconciliation.conditional_trigger_ratio: 0.6` in `fused-memory/config/config.yaml` |

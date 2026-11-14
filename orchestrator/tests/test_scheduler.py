@@ -3,32 +3,41 @@
 
 import asyncio
 import dataclasses
+import json
 import logging
 import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _orch_helpers import HermeticMcpSession
 from _recording_event_store import _RecordingEventStore
 from shared.locking import directory_locks
 from shared.task_metadata_wire import coerce_task_metadata
 
+from orchestrator.already_landed_tick_view import AlreadyLandedTickView
 from orchestrator.config import (
     TIER_BASE,
     TIER_WIDTH,
     FairnessConfig,
     ModuleConfig,
     OrchestratorConfig,
-    StarvationWatchdogConfig,
 )
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import fm_retry_backoffs
+from orchestrator.lock_table import ModuleLockTable
+from orchestrator.pause_policy import (
+    HaltNotPermittedError,
+    PauseClass,
+    PausePolicy,
+    policy_for,
+)
 from orchestrator.scheduler import (
     BlastRadiusResult,
     ExternalResolverError,
-    ModuleLockTable,
     Scheduler,
+    SchedulerCallbacks,
     TickContext,
     files_to_modules,
     normalize_lock,
@@ -2211,6 +2220,7 @@ class TestRequeueCooldown:
 class TestDispatchCooldownConfig:
     """Validate the dispatch_cooldown_secs config field defaults and constraints."""
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_default_dispatch_cooldown_secs(self):
         """OrchestratorConfig() defaults dispatch_cooldown_secs to 1800.0."""
         config = OrchestratorConfig()
@@ -3190,9 +3200,10 @@ class TestFairness:
         # H's park on m1 blocks ALL other tasks (including shadowed L).
         assert not scheduler.lock_table.try_acquire('X', ['m1'])   # stranger blocked
         assert not scheduler.lock_table.try_acquire('L', ['m1'])   # shadowed L blocked (INV-2)
-        # L's park on m2 remains active — H cannot acquire m2.
+        # L's park on m2 remains active: it blocks a parkless task, and H,
+        # which outranks it, passes it (task 7799, INV-8).
         assert not scheduler.lock_table.try_acquire('Y', ['m2'])   # L's active park
-        assert not scheduler.lock_table.try_acquire('H', ['m2'])   # H cannot acquire L's m2
+        assert scheduler.lock_table.park_owners_blocking('H', ['m2']) == []
 
         # L's skip_count was NOT cleared by preemption.
         assert scheduler._skip_count['L'] == 3
@@ -4622,21 +4633,27 @@ class TestAgeAnchor:
 
     def test_cancelled_resurrection_no_age_jump(self):
         """A previously-cancelled task re-pended scores no higher than brand-new medium."""
+        filed, reopened = '2026-10-01T00:00:00+00:00', '2026-10-05T00:00:00+00:00'
+
+        def stamped(task_id: str, status: str, pending_since: str) -> dict:
+            task = _pending_task(task_id, status=status)
+            task['metadata']['pending_since'] = pending_since
+            return task
+
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
-        # Tick 1: task 1 is cancelled, task 100 is pending.
-        tasks_tick1 = [
-            _pending_task('1', status='cancelled'),
-            _pending_task('100', status='pending'),
-        ]
-        scheduler._update_age_anchors(tasks_tick1, max_id=100)
+        # Tick 1: task 1 and task 100 are pending.
+        scheduler._update_age_anchors(
+            [stamped('1', 'pending', filed), stamped('100', 'pending', filed)], max_id=100,
+        )
         age_100_t1 = scheduler._compute_age('100', max_id=100)
-        # Tick 2: task 1 is reinstated to pending, task 100 still pending.
-        tasks_tick2 = [
-            _pending_task('1', status='pending'),
-            _pending_task('100', status='pending'),
-        ]
-        scheduler._update_age_anchors(tasks_tick2, max_id=100)
+        # Tick 2: task 1 is cancelled; its stamp is unchanged.
+        scheduler._update_age_anchors(
+            [stamped('1', 'cancelled', filed), stamped('100', 'pending', filed)], max_id=100,
+        )
+        # Tick 3: task 1 is reinstated, which D3 marks with a new stamp.
+        tasks_tick3 = [stamped('1', 'pending', reopened), stamped('100', 'pending', filed)]
+        scheduler._update_age_anchors(tasks_tick3, max_id=100)
         age_1 = scheduler._compute_age('1', max_id=100)
         age_100 = scheduler._compute_age('100', max_id=100)
         # Resurrected 1 must not leapfrog brand-new 100.
@@ -4958,15 +4975,18 @@ class TestBlastRadiusRefinement:
         assert lt.try_acquire(
             'other', ['crates/reify-compiler/src/conformance.rs']
         )
-        # 936 can't expand; since update_task → set_task_status hit MCP,
-        # patch scheduler methods to no-ops for this assertion scope.
-        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
-        scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        ok = await scheduler.handle_blast_radius_expansion(
-            '936',
-            current=['crates/reify-compiler/src/lib.rs'],
-            needed=['crates/reify-compiler/src/conformance.rs'],
-        )
+        # 936 can't expand; since get_task, update_task and set_task_status
+        # hit MCP, stub all three for this assertion scope.
+        with (
+            patch.object(scheduler, 'get_task', AsyncMock(return_value={'id': '936'})),
+            patch.object(scheduler, 'update_task', AsyncMock(return_value=True)),
+            patch.object(scheduler, 'set_task_status', AsyncMock(return_value=None)),
+        ):
+            ok = await scheduler.handle_blast_radius_expansion(
+                '936',
+                current=['crates/reify-compiler/src/lib.rs'],
+                needed=['crates/reify-compiler/src/conformance.rs'],
+            )
         assert ok.applied is False
         # Full release ran: 936 should no longer hold anything
         assert '936' not in lt._held
@@ -6158,6 +6178,7 @@ class TestFairnessConfigSchema:
             'scheduler_v2 field must be removed from FairnessConfig'
         )
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_skip_threshold_is_per_tier_dict(self):
         """Default skip_threshold is a per-tier dict."""
         cfg = OrchestratorConfig()
@@ -7545,6 +7566,13 @@ class TestDeferredWatchDispatchGate:
 # Milestone time-gate (task 2335 β — docs/prds/milestone-tasks.md §6.2)
 # ---------------------------------------------------------------------------
 
+def _delayed_milestone_metadata(after_secs: object, anchor: object) -> dict:
+    return {
+        'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+        'milestone_deps_satisfied_at': anchor,
+    }
+
+
 class TestMilestoneTimeGate:
     """Unit tests for the pure predicate Scheduler._milestone_time_gated.
 
@@ -7665,6 +7693,71 @@ class TestMilestoneTimeGate:
             task, datetime(2026, 9, 1, tzinfo=UTC)
         ) is False
 
+    def test_tz_naive_anchor_is_treated_as_utc(self):
+        naive_anchor = datetime(2026, 7, 25, 9, 0, 0)  # no tzinfo
+        task = self._task_with({
+            'milestone': {'mode': 'delayed', 'after_secs': 3600},
+            'milestone_deps_satisfied_at': naive_anchor.isoformat(),
+        })
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 7, 25, 9, 59, tzinfo=UTC)
+        ) is True
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 7, 25, 10, 0, tzinfo=UTC)
+        ) is False
+
+    def test_delayed_without_anchor_withholds_silently(self, caplog):
+        """An unset anchor means 'not due yet', not 'malformed': no WARNING."""
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = self._task_with({'milestone': {'mode': 'delayed', 'after_secs': 60}})
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
+
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.parametrize('metadata', [
+        pytest.param(_delayed_milestone_metadata(60, 12345), id='non_str_anchor'),
+        pytest.param(_delayed_milestone_metadata(60, 0), id='falsy_non_str_anchor'),
+        pytest.param(
+            _delayed_milestone_metadata(60, 'not-a-timestamp'), id='unparseable_anchor'
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(10**12, '2026-11-01T00:00:00+00:00'),
+            id='deadline_overflow_1e12',
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(10**15, '2026-11-01T00:00:00+00:00'),
+            id='deadline_overflow_1e15',
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(0, '2026-11-01T00:00:00+00:00'),
+            id='milestone_rejects_zero_after_secs',
+        ),
+        pytest.param(
+            {'milestone': {
+                'mode': 'dated', 'at': '2026-11-01T00:00:00+00:00', 'after_secs': 60,
+            }},
+            id='milestone_rejects_dated_with_after_secs',
+        ),
+    ])
+    def test_malformed_input_fails_safe_and_warns_once(self, metadata, caplog):
+        """``now`` is after every anchor and ``at``, so a lenient read would dispatch."""
+        now = datetime(2026, 11, 13, tzinfo=UTC)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = self._task_with(metadata)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert scheduler._milestone_time_gated(task, now) is True
+
+        warnings = [
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
     def test_malformed_milestone_warning_deduped_per_task_and_cause(self, caplog):
         """reviewer_comprehensive observability finding (task 2335 β
         amendment): _milestone_time_gated is invoked once per candidate loop
@@ -7698,7 +7791,7 @@ class TestMilestoneTimeGate:
             assert scheduler._milestone_time_gated(task_changed, datetime.now(UTC)) is True
 
         unknown_mode_warnings = [
-            r for r in caplog.records if 'unknown mode' in r.getMessage()
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
         ]
         assert len(unknown_mode_warnings) == 1, (
             f'Expected a fresh WARNING when the malformed cause changes; '
@@ -7848,6 +7941,45 @@ class TestMilestoneEligibilityGate:
             'Milestone must dispatch once now_wall >= at'
         )
 
+    @pytest.mark.asyncio
+    async def test_acquire_next_withholds_milestone_rejected_spec_and_warns_once(
+        self, monkeypatch, caplog
+    ):
+        """A delayed spec Milestone rejects (after_secs=0) whose anchor is long
+        past is withheld tick after tick, with exactly one WARNING."""
+        now = datetime(2026, 8, 1, tzinfo=UTC)
+        task = {
+            'id': '4008',
+            'title': 'Milestone-rejected delayed task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': _delayed_milestone_metadata(
+                0, (now - timedelta(days=1)).isoformat()
+            ),
+        }
+        task_response = {
+            'result': {
+                'content': [{'type': 'text', 'text': json.dumps({'tasks': [task]})}]
+            }
+        }
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1), wall_time_source=lambda: now
+        )
+        scheduler.finish_startup()
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call', AsyncMock(return_value=task_response)
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert await scheduler.acquire_next() is None
+
+        warnings = [
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
 
 class TestClaimantLivenessDispatchGate:
     """Mechanism 1 (task 2408): Scheduler._eligible_for_dispatch refuses to
@@ -7884,7 +8016,10 @@ class TestClaimantLivenessDispatchGate:
 
     def test_live_claimant_refuses_dispatch(self):
         heartbeat = (self.FIXED_DT - timedelta(minutes=1)).isoformat()  # fresh (ttl=300s default)
-        config = OrchestratorConfig(max_per_module=1)
+        # pin: this test is about the gate refusing dispatch, not the default
+        config = OrchestratorConfig(
+            max_per_module=1, claimant_dispatch_gate_enabled=True,
+        )
         scheduler = Scheduler(config, wall_time_source=lambda: self.FIXED_DT)
 
         task = self._pending_task_with_claimant('5001', 'run-x/session-y/pid=1', heartbeat)
@@ -8261,15 +8396,70 @@ class TestSchedulerPause:
         return scheduler
 
     def test_pause_sets_is_paused_and_reason(self, scheduler: Scheduler):
-        scheduler.pause('parked-threshold')
+        scheduler.pause('parked-threshold', PauseClass.PARK_STOP)
         assert scheduler.is_paused is True
         assert scheduler.pause_reason == 'parked-threshold'
 
     def test_resume_clears_pause(self, scheduler: Scheduler):
-        scheduler.pause('parked-threshold')
+        scheduler.pause('parked-threshold', PauseClass.PARK_STOP)
         scheduler.resume()
         assert scheduler.is_paused is False
         assert scheduler.pause_reason is None
+
+    def test_pause_records_its_class(self, scheduler: Scheduler):
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        assert scheduler.is_paused is True
+        assert scheduler.pause_class is PauseClass.COST_CEILING
+
+    def test_resume_clears_the_class(self, scheduler: Scheduler):
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        scheduler.resume()
+        assert scheduler.pause_class is None
+
+    def test_second_pause_keeps_the_original_class(self, scheduler: Scheduler):
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        scheduler.pause('operator halt', PauseClass.OPERATOR)
+        assert scheduler.pause_class is PauseClass.COST_CEILING
+        assert scheduler.pause_reason == 'cost_ceiling_orch_exceeded'
+
+    def test_snapshot_reports_the_pause_class(self, scheduler: Scheduler):
+        scheduler.pause('cost_ceiling_orch_exceeded', PauseClass.COST_CEILING)
+        assert scheduler.get_state_snapshot().pause_class == 'cost_ceiling'
+        scheduler.resume()
+        assert scheduler.get_state_snapshot().pause_class is None
+
+    @staticmethod
+    def _refusing_ewa_rate(pause_class: PauseClass) -> PausePolicy:
+        policy = policy_for(pause_class)
+        if pause_class is PauseClass.EWA_RATE:
+            return dataclasses.replace(policy, may_halt=False)
+        return policy
+
+    def test_a_class_the_policy_refuses_is_never_held(self):
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            pause_policy_lookup=self._refusing_ewa_rate,
+        )
+
+        with pytest.raises(HaltNotPermittedError, match='ewa_rate'):
+            scheduler.pause('digest halt', PauseClass.EWA_RATE)
+
+        assert scheduler.is_paused is False
+        assert scheduler.pause_reason is None
+        assert scheduler.pause_class is None
+
+    def test_a_refused_class_is_refused_even_over_an_existing_hold(self):
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            pause_policy_lookup=self._refusing_ewa_rate,
+        )
+        scheduler.pause('operator halt', PauseClass.OPERATOR)
+
+        with pytest.raises(HaltNotPermittedError):
+            scheduler.pause('digest halt', PauseClass.EWA_RATE)
+
+        assert scheduler.pause_class is PauseClass.OPERATOR
+        assert scheduler.pause_reason == 'operator halt'
 
     @pytest.mark.asyncio
     async def test_acquire_next_returns_none_when_paused(self, scheduler: Scheduler):
@@ -8291,7 +8481,7 @@ class TestSchedulerPause:
         scheduler.release('1')
 
         # Now pause and confirm acquire_next returns None.
-        scheduler.pause('test')
+        scheduler.pause('test', PauseClass.OPERATOR)
         result_paused = await scheduler.acquire_next()
         assert result_paused is None, (
             f'Expected None while paused; got {result_paused}'
@@ -8313,32 +8503,32 @@ class TestSchedulerPause:
         """
         # Fresh scheduler — not paused.
         snap = scheduler.get_state_snapshot()
-        assert snap['is_paused'] is False, (
-            f"Expected is_paused=False on fresh scheduler; got {snap['is_paused']!r}"
+        assert snap.is_paused is False, (
+            f"Expected is_paused=False on fresh scheduler; got {snap.is_paused!r}"
         )
-        assert snap['pause_reason'] is None, (
-            f"Expected pause_reason=None on fresh scheduler; got {snap['pause_reason']!r}"
+        assert snap.pause_reason is None, (
+            f"Expected pause_reason=None on fresh scheduler; got {snap.pause_reason!r}"
         )
 
         # After pause — snapshot must reflect the paused state.
         reason = 'park-stop: 3 tasks parked in 1h'
-        scheduler.pause(reason)
+        scheduler.pause(reason, PauseClass.PARK_STOP)
         snap_paused = scheduler.get_state_snapshot()
-        assert snap_paused['is_paused'] is True, (
-            f"Expected is_paused=True after pause; got {snap_paused['is_paused']!r}"
+        assert snap_paused.is_paused is True, (
+            f"Expected is_paused=True after pause; got {snap_paused.is_paused!r}"
         )
-        assert snap_paused['pause_reason'] == reason, (
-            f"Expected pause_reason={reason!r}; got {snap_paused['pause_reason']!r}"
+        assert snap_paused.pause_reason == reason, (
+            f"Expected pause_reason={reason!r}; got {snap_paused.pause_reason!r}"
         )
 
         # After resume — snapshot must return to unpaused state.
         scheduler.resume()
         snap_resumed = scheduler.get_state_snapshot()
-        assert snap_resumed['is_paused'] is False, (
-            f"Expected is_paused=False after resume; got {snap_resumed['is_paused']!r}"
+        assert snap_resumed.is_paused is False, (
+            f"Expected is_paused=False after resume; got {snap_resumed.is_paused!r}"
         )
-        assert snap_resumed['pause_reason'] is None, (
-            f"Expected pause_reason=None after resume; got {snap_resumed['pause_reason']!r}"
+        assert snap_resumed.pause_reason is None, (
+            f"Expected pause_reason=None after resume; got {snap_resumed.pause_reason!r}"
         )
 
 
@@ -8526,6 +8716,7 @@ class TestParkStopTrip:
         import re
 
         config = OrchestratorConfig(
+            park_stop_enabled=True,  # pin: these tests are about the trip, not the default
             max_per_module=1,
             park_stop_parked_threshold=3,
             park_stop_parked_window_hours=1.0,
@@ -8533,10 +8724,10 @@ class TestParkStopTrip:
         scheduler = Scheduler(config)
         scheduler.finish_startup()
 
-        callback_args: list[str] = []
+        callback_args: list[tuple[str, PauseClass]] = []
 
-        async def recording_callback(reason: str) -> None:
-            callback_args.append(reason)
+        async def recording_callback(reason: str, pause_class: PauseClass) -> None:
+            callback_args.append((reason, pause_class))
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=recording_callback)
         mock = AsyncMock(return_value={})
@@ -8551,8 +8742,10 @@ class TestParkStopTrip:
         assert len(callback_args) == 1, (
             f'Expected callback called once; got {len(callback_args)}'
         )
+        assert scheduler.pause_class is PauseClass.PARK_STOP
+        reason, pause_class = callback_args[0]
+        assert pause_class is PauseClass.PARK_STOP
         # Reason must reference the trip parameters.
-        reason = callback_args[0]
         assert re.search(r'3', reason), f'Reason must mention threshold count: {reason!r}'
         assert re.search(r'1\.0', reason), f'Reason must mention window hours: {reason!r}'
 
@@ -8570,7 +8763,7 @@ class TestParkStopTrip:
 
         callback_count = [0]
 
-        async def counting_callback(reason: str) -> None:
+        async def counting_callback(reason: str, pause_class: PauseClass) -> None:
             callback_count[0] += 1
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=counting_callback)
@@ -8580,7 +8773,7 @@ class TestParkStopTrip:
         # Pause manually before the third transition reaches the threshold.
         await scheduler.set_task_status('1', 'blocked')
         await scheduler.set_task_status('2', 'blocked')
-        scheduler.pause('manual')  # already paused; trip check should be suppressed
+        scheduler.pause('manual', PauseClass.OPERATOR)  # already paused; trip check should be suppressed
         await scheduler.set_task_status('3', 'blocked')
         await asyncio.sleep(0)
 
@@ -8612,7 +8805,7 @@ class TestParkStopTrip:
 
         callback_count = [0]
 
-        async def counting_callback(reason: str) -> None:
+        async def counting_callback(reason: str, pause_class: PauseClass) -> None:
             callback_count[0] += 1
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=counting_callback)
@@ -8648,6 +8841,7 @@ class TestParkStopTrip:
         reached the guard returns early.
         """
         config = OrchestratorConfig(
+            park_stop_enabled=True,  # pin: these tests are about the trip, not the default
             max_per_module=1,
             park_stop_parked_threshold=3,
             park_stop_parked_window_hours=1.0,
@@ -8657,10 +8851,10 @@ class TestParkStopTrip:
 
         callback_args: list[str] = []
 
-        async def recording_callback(reason: str) -> None:
+        async def recording_callback(reason: str, pause_class: PauseClass) -> None:
             # Mirror harness.pause_scheduler shape: call scheduler.pause()
             # so any concurrent guard check sees _paused=True immediately.
-            scheduler.pause(reason)
+            scheduler.pause(reason, pause_class)
             callback_args.append(reason)
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=recording_callback)
@@ -8697,6 +8891,7 @@ class TestParkStopTrip:
         is_paused must still be False.
         """
         config = OrchestratorConfig(
+            park_stop_enabled=True,  # pin: these tests are about the trip, not the default
             max_per_module=1,
             park_stop_parked_threshold=3,
             park_stop_parked_window_hours=1.0,
@@ -8706,11 +8901,11 @@ class TestParkStopTrip:
 
         callback_count = [0]
 
-        async def trip_callback(reason: str) -> None:
+        async def trip_callback(reason: str, pause_class: PauseClass) -> None:
             callback_count[0] += 1
             # Mirror harness.pause_scheduler — scheduler.pause is idempotent
             # because the synchronous latch already set _paused=True.
-            scheduler.pause(reason)
+            scheduler.pause(reason, pause_class)
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=trip_callback)
         mock = AsyncMock(return_value={})
@@ -8760,7 +8955,7 @@ class TestParkStopDisabled:
 
         callback_count = [0]
 
-        async def recording_callback(reason: str) -> None:
+        async def recording_callback(reason: str, pause_class: PauseClass) -> None:
             callback_count[0] += 1
 
         scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_park_stop_trip=recording_callback)
@@ -9730,83 +9925,6 @@ class TestGetExternalStatusesPartialResult:
             f'Empty deps should not trigger partial-result guard; got err={err!r}'
         )
         assert statuses == {}
-
-
-# ---------------------------------------------------------------------------
-# TestTaskExternalDeps (task 2167 — W3-δ: shared TaskMetadata seam, SEAM A)
-# ---------------------------------------------------------------------------
-
-class TestTaskExternalDeps:
-    """Unit tests for the ``_task_external_deps`` helper (SEAM A).
-
-    ``_task_external_deps`` is the single seam every scheduler
-    ``metadata.external_deps`` read routes through:
-    ``parse_metadata(task.get('metadata'), direction='read')[0].external_deps``.
-    ``direction='read'`` is best-effort (never raises) so a corrupt
-    historical metadata row cannot break a scheduler dispatch tick — matching
-    the scheduler's existing fail-safe philosophy.  The return value stays
-    the canonical "project_id:task_id" wire STRING form (PRD Open Question
-    #4) — it is never converted to ``list[ExternalDep]``.
-
-    Plain dict task fixtures only — no Scheduler construction needed.
-    """
-
-    def test_no_metadata_key_returns_empty_list(self):
-        """A task dict with no 'metadata' key at all -> []."""
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '1'}
-        assert _task_external_deps(task) == []
-
-    def test_metadata_none_returns_empty_list(self):
-        """metadata=None -> [] (benign-absent, same as a missing key)."""
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '2', 'metadata': None}
-        assert _task_external_deps(task) == []
-
-    def test_dict_metadata_returns_external_deps(self):
-        """dict metadata {'external_deps': [...]} -> the list, unchanged."""
-        from orchestrator.scheduler import _task_external_deps
-        task = {
-            'id': '3',
-            'metadata': {'external_deps': ['dark_factory:42', 'p:9']},
-        }
-        assert _task_external_deps(task) == ['dark_factory:42', 'p:9']
-
-    def test_json_string_metadata_is_parsed(self):
-        """metadata as a JSON *string* is parsed through the shared parser.
-
-        The old inline idiom ``(task.get('metadata') or {}).get(...)`` would
-        ``AttributeError`` on a str (``str`` has no ``.get``) — the shared
-        parser handles a JSON string natively.
-        """
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '4', 'metadata': '{"external_deps": ["a:1"]}'}
-        assert _task_external_deps(task) == ['a:1']
-
-    def test_corrupt_metadata_string_returns_empty_list_no_raise(self):
-        """Unparseable metadata string -> [] with no exception raised.
-
-        ``direction='read'`` is best-effort: a corrupt historical metadata
-        row must not break a scheduler dispatch tick.
-        """
-        from orchestrator.scheduler import _task_external_deps
-        task = {'id': '5', 'metadata': 'not json{'}
-        assert _task_external_deps(task) == []
-
-    def test_returned_elements_stay_string_wire_form(self):
-        """Every returned element is a str — NOT converted to ExternalDep.
-
-        Resolves PRD Open Question #4 for task W3-δ: the scheduler keeps
-        consuming the canonical "project_id:task_id" STRING wire form fed to
-        ``get_external_statuses`` / the external-status cache.
-        """
-        from orchestrator.scheduler import _task_external_deps
-        task = {
-            'id': '6',
-            'metadata': {'external_deps': ['dark_factory:42', 'p:9']},
-        }
-        result = _task_external_deps(task)
-        assert all(isinstance(dep, str) for dep in result)
 
 
 # ---------------------------------------------------------------------------
@@ -11160,7 +11278,7 @@ class TestAcquireNextDepBackfillFromGetStatuses:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        scheduler = Scheduler(config)
+        scheduler = Scheduler(config, mcp_session=HermeticMcpSession())
         scheduler.finish_startup()
         return scheduler
 
@@ -11500,12 +11618,9 @@ class TestAcquireNextBookkeepingPurgesAbsentTasks:
         assert 'X' not in scheduler._pending_anchor, (
             f"Expected 'X' purged from _pending_anchor but it's still there: {scheduler._pending_anchor}"
         )
-        # _was_non_pending must record X so that if it is resurrected to pending
-        # it gets a fresh max_id anchor (resurrection semantics) instead of
-        # re-using its old stale numeric id.
-        assert 'X' in scheduler._was_non_pending, (
-            f"Expected 'X' recorded in _was_non_pending for resurrection semantics: {scheduler._was_non_pending}"
-        )
+        # Absence is not a cancellation (D3): X returns with the anchor it left with.
+        scheduler._update_age_anchors([_pending_task('X')], max_id=100)
+        assert scheduler._compute_age('X', 100) == 95
 
 
 class TestOrchestratorStatusSetsMatchShared:
@@ -12043,7 +12158,11 @@ class TestDrainParkEvictionRequests:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # T's parks gone.
         assert not scheduler.lock_table.has_parks('T')
@@ -12078,7 +12197,11 @@ class TestDrainParkEvictionRequests:
         status_map = {}
         tasks_by_id = {}
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # No eviction event.
         evicted_events = [
@@ -12130,7 +12253,11 @@ class TestDrainParkEvictionGuard:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # T's park must be INTACT.
         assert scheduler.lock_table.has_parks('T'), (
@@ -12172,7 +12299,11 @@ class TestDrainParkEvictionGuard:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # T's park must be gone — unsatisfied deps → not live-dispatchable → evict.
         assert not scheduler.lock_table.has_parks('T'), (
@@ -12318,8 +12449,8 @@ class TestDrainFiresWithNoActiveTasks:
 class TestAcquireNextFmReadFailureFailSafe:
     """acquire_next() must NOT drain park-evictions when get_tasks signals a
     read FAILURE (get_tasks(distinguish_failure=True) returns None) — draining
-    with empty status_map/tasks_by_id would make _owner_is_live_dispatchable
-    return False for every id, bypassing the D4 live-owner guard and
+    with empty status_map/tasks_by_id would make _park_hold_refusal name a
+    refusal ('missing') for every id, bypassing the D4 live-owner guard and
     force-evicting still-live owners during an fm outage/restart.
 
     A genuine empty result ([]) is NOT a failure and still drains exactly as
@@ -12600,7 +12731,11 @@ class TestDrainBuriedOwnerRestoredEvents:
             },
         }
 
-        scheduler._drain_park_eviction_requests(status_map, tasks_by_id)
+        scheduler._drain_park_eviction_requests(
+            TickContext(
+                tasks=list(tasks_by_id.values()), status_map=status_map, tasks_by_id=tasks_by_id
+            )
+        )
 
         # B's park on m2 is gone.
         assert not scheduler.lock_table.has_parks('B')
@@ -12622,655 +12757,6 @@ class TestDrainBuriedOwnerRestoredEvents:
         assert len(restored) == 1
         assert restored[0][1]['task_id'] == 'L2'
         assert 'm2' in restored[0][1]['data']['modules']
-
-
-# ---- Starvation watchdog (task 1880) ----
-
-
-class TestStarvationWatchdog:
-    """Tests for Scheduler._apply_starvation_watchdog and dispatch-site resolve.
-
-    The watchdog fires an INFO escalation when a dispatch-eligible task
-    keeps being skipped as the TOP-scored candidate past BOTH skip_threshold
-    AND idle_secs.  It self-resolves when the task dispatches.
-    """
-
-    def _make_scheduler(
-        self,
-        *,
-        skip_threshold: int = 3,
-        idle_secs: float = 100.0,
-        idle_only_secs: float = 259200.0,
-        enabled: bool = True,
-    ) -> tuple['Scheduler', list]:
-        """Build a Scheduler with watchdog config tuned small and a mutable clock.
-
-        ``idle_only_secs`` defaults to 259200 (the schema default) so existing
-        dual-gate tests — whose fake clock never advances past a few hundred
-        seconds — are unaffected by the never-top-scored idle-only backstop.
-        """
-        t: list[float] = [0.0]
-
-        def fake_clock() -> float:
-            return t[0]
-
-        config = OrchestratorConfig(
-            max_per_module=1,
-            starvation_watchdog=StarvationWatchdogConfig(
-                enabled=enabled,
-                skip_threshold=skip_threshold,
-                idle_secs=idle_secs,
-                idle_only_secs=idle_only_secs,
-            ),
-        )
-        # Prevent fairness parks from installing before the watchdog threshold
-        # is reached (the watchdog skip_threshold=3 is deliberately smaller
-        # than the test's default fairness skip_threshold per tier so we can
-        # isolate the watchdog logic cleanly).
-        config.fairness.skip_threshold = 9999
-        scheduler = Scheduler(config, time_source=fake_clock)
-        scheduler.finish_startup()
-        return scheduler, t
-
-    @staticmethod
-    def _starved_task(tid: str = 'starved') -> dict:
-        return {
-            'id': tid,
-            'title': f'Starved task {tid}',
-            'status': 'pending',
-            'priority': 'medium',
-            'dependencies': [],
-            'metadata': {'files': ['backend/main.py']},
-        }
-
-    @pytest.mark.asyncio
-    async def test_positive_fires_once_after_both_thresholds(self):
-        """Watchdog fires exactly once when skip_count >= threshold AND clock >= idle_secs.
-
-        Positive firing path:
-        - Drive 3 acquire_next ticks (skip_count bumps to 3 via loop-exhausted path).
-        - Advance clock to 150s (>= idle_secs=100).
-        - One more tick → _on_starvation_warn called exactly once, with task_id='starved'
-          and summary containing the stable 'STARVATION_WATCHDOG' marker.
-        - Additional ticks do NOT re-fire (dedup / no re-arm spam).
-        - 'starved' is in scheduler._starvation_escalated.
-        """
-        scheduler, t = self._make_scheduler()
-        callback = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
-
-        # Seed a held lock on a dispatched 'seed' task so 'starved' can never
-        # acquire its module (loop-exhausted path → skip_count bumped each tick).
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Drive 3 ticks to accumulate skip_count >= skip_threshold (3).
-        # Clock stays at 0 during these ticks.
-        for _ in range(3):
-            result = await scheduler.acquire_next()
-            assert result is None, 'Expected no dispatch while seed holds the lock'
-
-        assert scheduler._skip_count.get('starved', 0) >= 3, (
-            f'Expected skip_count >= 3 after 3 loop-exhausted ticks; '
-            f'got {scheduler._skip_count!r}'
-        )
-
-        # Advance clock past idle_secs (100s) and tick once more.
-        t[0] = 150.0
-        await scheduler.acquire_next()
-
-        # Both thresholds are now crossed → callback must fire exactly once.
-        callback.assert_called_once()
-        call_args = callback.call_args
-        args = call_args.args if call_args.args else ()
-        kwargs = call_args.kwargs if call_args.kwargs else {}
-
-        # task_id must be 'starved'.
-        task_id_arg = args[0] if args else kwargs.get('task_id')
-        assert str(task_id_arg) == 'starved', (
-            f'Expected task_id="starved"; got {task_id_arg!r}'
-        )
-
-        # summary must carry the stable STARVATION_WATCHDOG marker.
-        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
-        assert 'STARVATION_WATCHDOG' in str(summary_arg), (
-            f'Expected STARVATION_WATCHDOG in summary; got {summary_arg!r}'
-        )
-
-        # Further ticks must NOT re-fire the callback (dedup guard).
-        for _ in range(5):
-            await scheduler.acquire_next()
-
-        callback.assert_called_once()  # still exactly once
-
-        # 'starved' must be in _starvation_escalated after the first fire.
-        assert 'starved' in scheduler._starvation_escalated, (
-            '_starvation_escalated must contain task_id after the watchdog fires'
-        )
-
-    @pytest.mark.asyncio
-    async def test_self_resolve_on_dispatch(self):
-        """_on_starvation_resolve is called exactly once when the escalated task dispatches.
-
-        Drive 'starved' to the escalated state (task_id in _starvation_escalated).
-        Then release the 'seed' lock so the next acquire_next dispatches 'starved'.
-        Assert:
-        - acquire_next returns a TaskAssignment for 'starved'
-        - _on_starvation_resolve called exactly once with task_id='starved'
-        - 'starved' NOT in scheduler._starvation_escalated
-        - 'starved' NOT in scheduler._starvation_first_seen
-        """
-        scheduler, t = self._make_scheduler()
-        warn_cb = AsyncMock()
-        resolve_cb = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=warn_cb)
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_resolve=resolve_cb)
-
-        # Seed a held lock on 'seed' so 'starved' can't acquire initially.
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Drive 3 ticks to hit skip_threshold, then advance clock past idle_secs.
-        for _ in range(3):
-            await scheduler.acquire_next()
-
-        t[0] = 150.0
-        await scheduler.acquire_next()
-
-        # Verify warn callback fired (task is now in _starvation_escalated).
-        warn_cb.assert_called_once()
-        assert 'starved' in scheduler._starvation_escalated, (
-            'Precondition: starved must be in _starvation_escalated'
-        )
-        resolve_cb.assert_not_called()
-
-        # Release 'seed' so 'starved' can acquire 'backend'.
-        scheduler.lock_table.release('seed')
-        scheduler._dispatched.discard('seed')
-
-        # Next acquire_next must dispatch 'starved'.
-        result = await scheduler.acquire_next()
-        assert result is not None, 'Expected TaskAssignment after releasing seed lock'
-        assert result.task_id == 'starved', (
-            f'Expected task_id="starved"; got {result.task_id!r}'
-        )
-
-        # Resolve callback must have fired exactly once with 'starved'.
-        resolve_cb.assert_called_once()
-        call_args = resolve_cb.call_args
-        args = call_args.args if call_args.args else ()
-        kwargs = call_args.kwargs if call_args.kwargs else {}
-        task_id_arg = args[0] if args else kwargs.get('task_id')
-        assert str(task_id_arg) == 'starved', (
-            f'Expected task_id="starved" in resolve callback; got {task_id_arg!r}'
-        )
-
-        # State cleanup: 'starved' must no longer be in the escalated set or seen dict.
-        assert 'starved' not in scheduler._starvation_escalated, (
-            '_starvation_escalated must be cleared on dispatch'
-        )
-        assert 'starved' not in scheduler._starvation_first_seen, (
-            '_starvation_first_seen must be cleared on dispatch'
-        )
-
-    @pytest.mark.asyncio
-    async def test_below_skip_threshold_no_callback(self):
-        """(a) Below skip_threshold: fewer skips than threshold → callback NOT called.
-
-        skip_threshold=3, only 2 ticks (skip_count=2 < 3).  Clock advanced well
-        past idle_secs (100s) to prove the skip-count gate blocks firing.
-        """
-        scheduler, t = self._make_scheduler()
-        callback = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
-
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # 2 ticks → skip_count = 2 < threshold=3.
-        for _ in range(2):
-            await scheduler.acquire_next()
-
-        # Advance clock well past idle_secs.
-        t[0] = 500.0
-        await scheduler.acquire_next()
-
-        callback.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_idle_gate_below_idle_secs_no_callback(self):
-        """(b) Idle gate: skip_count >= threshold but clock < idle_secs → NOT called.
-
-        Proves BOTH conditions are required — the skip-gate alone is not sufficient.
-        Clock advances only to 50s < idle_secs=100s.
-        """
-        scheduler, t = self._make_scheduler()
-        callback = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
-
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Drive 3+ ticks to cross skip_threshold.
-        for _ in range(4):
-            await scheduler.acquire_next()
-
-        assert scheduler._skip_count.get('starved', 0) >= 3, (
-            'Precondition: skip_count must be >= 3 for this test to be meaningful'
-        )
-
-        # Clock below idle_secs (50s < 100s) — callback must NOT fire.
-        t[0] = 50.0
-        await scheduler.acquire_next()
-
-        callback.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_idle_only_backstop_fires_with_zero_skips(self):
-        """Idle-only backstop fires for a never-top-scored task (skip_count stays 0).
-
-        Drives _apply_starvation_watchdog DIRECTLY (not acquire_next) so
-        _skip_count is never bumped — the faithful reify-5166 shape where a low
-        task can never outscore a medium/high candidate, is never the top-scored
-        candidate, and accrues ZERO skips.  With idle_secs=100, idle_only_secs=200:
-        - t=0: first call stamps first_seen; skip_count==0; no fire.
-        - t=250 (>= idle_only_secs, skip still 0): warn fires EXACTLY once with
-          task_id='starved' and 'STARVATION_WATCHDOG' in the summary; tid escalated.
-        - further calls do not re-fire (dedup).
-
-        RED under the current AND-only gate, which never fires with skip_count==0.
-        """
-        scheduler, t = self._make_scheduler(idle_secs=100.0, idle_only_secs=200.0)
-        callback = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
-
-        task = self._starved_task()
-
-        # t=0: stamp first_seen.  Direct call must never bump skip_count.
-        await scheduler._apply_starvation_watchdog([task])
-        assert scheduler._skip_count.get('starved', 0) == 0, (
-            f'Direct _apply_starvation_watchdog must never bump skip_count; '
-            f'got {scheduler._skip_count!r}'
-        )
-        callback.assert_not_called()
-
-        # Advance past idle_only_secs (200); skip_count is still 0 (never top).
-        t[0] = 250.0
-        await scheduler._apply_starvation_watchdog([task])
-
-        assert scheduler._skip_count.get('starved', 0) == 0, (
-            'skip_count must remain 0 across the idle-only fire (never top-scored)'
-        )
-        callback.assert_called_once()
-        call_args = callback.call_args
-        args = call_args.args if call_args.args else ()
-        kwargs = call_args.kwargs if call_args.kwargs else {}
-        task_id_arg = args[0] if args else kwargs.get('task_id')
-        assert str(task_id_arg) == 'starved', (
-            f'Expected task_id="starved"; got {task_id_arg!r}'
-        )
-        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
-        assert 'STARVATION_WATCHDOG' in str(summary_arg), (
-            f'Expected STARVATION_WATCHDOG in summary; got {summary_arg!r}'
-        )
-        assert 'starved' in scheduler._starvation_escalated, (
-            '_starvation_escalated must contain task_id after the idle-only fire'
-        )
-
-        # Further calls must NOT re-fire (dedup / no re-arm spam).
-        for _ in range(3):
-            await scheduler._apply_starvation_watchdog([task])
-        callback.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_idle_only_does_not_fire_below_idle_only_secs(self):
-        """Guard: skip_count==0 and idle_secs <= elapsed < idle_only_secs → NOT fired.
-
-        Proves the idle-only backstop does not fire prematurely: crossing the
-        dual-gate's idle_secs component (100) is NOT sufficient without skips —
-        only crossing idle_only_secs (200) fires when skip_count==0.
-        """
-        scheduler, t = self._make_scheduler(idle_secs=100.0, idle_only_secs=200.0)
-        callback = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
-
-        task = self._starved_task()
-
-        # t=0: stamp first_seen.
-        await scheduler._apply_starvation_watchdog([task])
-
-        # t=150: >= idle_secs (100) but < idle_only_secs (200), skip_count==0.
-        t[0] = 150.0
-        await scheduler._apply_starvation_watchdog([task])
-
-        assert scheduler._skip_count.get('starved', 0) == 0, (
-            'Precondition: skip_count must be 0 (never top-scored)'
-        )
-        callback.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_never_top_scored_low_task_e2e_rca_reproduction(self):
-        """End-to-end reify-5166 reproduction: a never-top-scored low task fires idle-only.
-
-        A single 'low'-priority task on module 'backend' is kept perpetually
-        eligible while a stream of FRESH 'high'-priority tasks on the DISJOINT
-        module 'frontend' dispatch first EVERY tick (TIER_BASE high=8000 always
-        outscores low's max of 2999).  Because 'low' is never the top-scored
-        candidate, the scored loop acquires+dispatches the high task and returns
-        BEFORE 'low' is ever reached: _skip_count['low'] stays 0 and the dual
-        skip+idle gate can NEVER trip — the exact structural blind spot from
-        reify-5166 (77h eligible, 547 higher-tier dispatches, zero skips).
-
-        Once continuous eligibility crosses idle_only_secs, the idle-only
-        backstop files exactly one STARVATION_WATCHDOG escalation for 'low'.
-        When contention finally clears, 'low' dispatches and self-resolves
-        (proving the existing resolve/GC state is reused after an idle-only fire).
-        """
-        scheduler, t = self._make_scheduler(
-            skip_threshold=3, idle_secs=100.0, idle_only_secs=200.0,
-        )
-        warn_cb = AsyncMock()
-        resolve_cb = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(
-            scheduler._callbacks,
-            on_starvation_warn=warn_cb,
-            on_starvation_resolve=resolve_cb,
-        )
-
-        low = {
-            'id': 'low',
-            'title': 'Low-priority never-top task',
-            'status': 'pending',
-            'priority': 'low',
-            'dependencies': [],
-            'metadata': {'files': ['backend/main.py']},
-        }
-
-        def high_task(n: int) -> dict:
-            return {
-                'id': f'high{n}',
-                'title': f'High task {n}',
-                'status': 'pending',
-                'priority': 'high',
-                'dependencies': [],
-                'metadata': {'files': ['frontend/main.py']},
-            }
-
-        # Contention phase: many ticks below idle_only_secs.  Each tick a fresh
-        # high task on 'frontend' dispatches first; 'low' is never reached.
-        for n in range(4):
-            scheduler.get_tasks = AsyncMock(return_value=[low, high_task(n)])
-            result = await scheduler.acquire_next()
-            assert result is not None and result.task_id == f'high{n}', (
-                f'Expected high{n} to dispatch first (top-scored); got {result!r}'
-            )
-            # 'low' is continuously eligible (anchored) but never top-scored.
-            assert 'low' in scheduler._starvation_first_seen, (
-                f'low must stay continuously eligible (anchored) at tick {n}'
-            )
-            assert scheduler._skip_count.get('low', 0) == 0, (
-                f'low must NEVER accrue skips (never top-scored); '
-                f'got {scheduler._skip_count!r} at tick {n}'
-            )
-            # Release the dispatched high so next tick's high acquires 'frontend'.
-            scheduler.lock_table.release(f'high{n}')
-            scheduler._dispatched.discard(f'high{n}')
-
-        # No escalation yet (elapsed 0 < idle_only_secs=200).
-        warn_cb.assert_not_called()
-
-        # Advance past idle_only_secs and tick once more (still contended).
-        t[0] = 250.0
-        scheduler.get_tasks = AsyncMock(return_value=[low, high_task(99)])
-        result = await scheduler.acquire_next()
-        assert result is not None and result.task_id == 'high99', (
-            f'high99 must still dispatch first this tick; got {result!r}'
-        )
-        # low still never reached: zero skips, never dispatched.
-        assert scheduler._skip_count.get('low', 0) == 0, (
-            f'low must still have zero skips; got {scheduler._skip_count!r}'
-        )
-
-        # Idle-only backstop fired EXACTLY once for 'low'.
-        warn_cb.assert_called_once()
-        call_args = warn_cb.call_args
-        args = call_args.args if call_args.args else ()
-        kwargs = call_args.kwargs if call_args.kwargs else {}
-        task_id_arg = args[0] if args else kwargs.get('task_id')
-        assert str(task_id_arg) == 'low', (
-            f'Expected watchdog to fire for low; got {task_id_arg!r}'
-        )
-        summary_arg = kwargs.get('summary', '') or (args[1] if len(args) > 1 else '')
-        assert 'STARVATION_WATCHDOG' in str(summary_arg), (
-            f'Expected STARVATION_WATCHDOG in summary; got {summary_arg!r}'
-        )
-        assert 'low' in scheduler._starvation_escalated, (
-            'low must be escalated after the idle-only fire'
-        )
-        scheduler.lock_table.release('high99')
-        scheduler._dispatched.discard('high99')
-
-        # Clear all higher-tier contention: only 'low' remains eligible.
-        scheduler.get_tasks = AsyncMock(return_value=[low])
-        result = await scheduler.acquire_next()
-        assert result is not None and result.task_id == 'low', (
-            f'low must finally dispatch once contention clears; got {result!r}'
-        )
-
-        # Self-resolve reuse works after an idle-only fire.
-        resolve_cb.assert_called_once()
-        r_args = resolve_cb.call_args.args
-        r_kwargs = resolve_cb.call_args.kwargs
-        r_task_id = r_args[0] if r_args else r_kwargs.get('task_id')
-        assert str(r_task_id) == 'low', (
-            f'Expected resolve callback for low; got {r_task_id!r}'
-        )
-        assert 'low' not in scheduler._starvation_escalated, (
-            '_starvation_escalated must clear on dispatch (self-resolve reuse)'
-        )
-        assert 'low' not in scheduler._starvation_first_seen, (
-            '_starvation_first_seen must clear on dispatch'
-        )
-        # warn must not have re-fired during the resolve tick.
-        warn_cb.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_disabled_no_callback(self):
-        """(c) Disabled: starvation_watchdog.enabled=False → NOT called even when both thresholds crossed.
-
-        Set enabled=False, drive skip_count >= threshold, advance clock past
-        idle_secs → callback must never fire.
-        """
-        scheduler, t = self._make_scheduler(enabled=False)
-        callback = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=callback)
-
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Drive 5 ticks to clearly cross skip_threshold=3.
-        for _ in range(5):
-            await scheduler.acquire_next()
-
-        # Advance clock well past idle_secs=100s.
-        t[0] = 500.0
-        await scheduler.acquire_next()
-
-        callback.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_gc_terminal_task_resolves_escalation(self):
-        """(a) GC backstop: escalated task resolved + state cleared when task goes terminal.
-
-        Drive 'starved' to the escalated state (task_id in _starvation_escalated).
-        Then make get_tasks report it as 'done' (terminal).  One more
-        acquire_next tick must:
-        - call _on_starvation_resolve exactly once with task_id='starved',
-        - clear 'starved' from _starvation_escalated, AND
-        - clear 'starved' from _starvation_first_seen.
-
-        Fails until the dedicated watchdog GC block is added to the stale-id
-        sweep inside acquire_next (step-10).
-        """
-        scheduler, t = self._make_scheduler()
-        warn_cb = AsyncMock()
-        resolve_cb = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=warn_cb)
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_resolve=resolve_cb)
-
-        # Seed a held lock on 'seed' so 'starved' can never acquire.
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Drive 3 ticks to cross skip_threshold (3), then advance clock past idle_secs.
-        for _ in range(3):
-            await scheduler.acquire_next()
-        t[0] = 150.0
-        await scheduler.acquire_next()
-
-        # Pre-condition: warn fired, task is escalated.
-        warn_cb.assert_called_once()
-        assert 'starved' in scheduler._starvation_escalated, (
-            'Precondition: starved must be in _starvation_escalated before GC tick'
-        )
-        resolve_cb.assert_not_called()
-
-        # Change get_tasks to return 'starved' as terminal ('done').
-        terminal_task = dict(task, status='done')
-        scheduler.get_tasks = AsyncMock(return_value=[terminal_task])
-
-        # One tick — the GC backstop must detect 'starved' is terminal,
-        # call _on_starvation_resolve, and clear all watchdog state.
-        await scheduler.acquire_next()
-
-        resolve_cb.assert_called_once()
-        call_args = resolve_cb.call_args
-        args = call_args.args if call_args.args else ()
-        kwargs = call_args.kwargs if call_args.kwargs else {}
-        task_id_arg = args[0] if args else kwargs.get('task_id')
-        assert str(task_id_arg) == 'starved', (
-            f'Expected task_id="starved" in resolve callback; got {task_id_arg!r}'
-        )
-        assert 'starved' not in scheduler._starvation_escalated, (
-            '_starvation_escalated must be cleared by GC sweep for terminal task'
-        )
-        assert 'starved' not in scheduler._starvation_first_seen, (
-            '_starvation_first_seen must be cleared for terminal task'
-        )
-
-    @pytest.mark.asyncio
-    async def test_gc_non_eligible_status_resolves_escalation(self):
-        """GC backstop resolves escalation when task moves to blocked/deferred.
-
-        A task in 'blocked' or 'deferred' is non-terminal but leaves the
-        candidate pool.  The dispatch-site resolve never fires (no dispatch)
-        and the _stale_ids sweep skips it (not terminal).  The extended GC
-        backstop must detect the non-eligible status and auto-resolve.
-
-        Drive 'starved' to escalated state, then flip its status to 'blocked'.
-        One acquire_next tick must:
-        - call _on_starvation_resolve exactly once with task_id='starved', AND
-        - clear 'starved' from _starvation_escalated.
-
-        Fails until the GC block checks _STARVATION_NON_ELIGIBLE in addition
-        to _stale_ids.
-        """
-        scheduler, t = self._make_scheduler()
-        warn_cb = AsyncMock()
-        resolve_cb = AsyncMock()
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_warn=warn_cb)
-        scheduler._callbacks = dataclasses.replace(scheduler._callbacks, on_starvation_resolve=resolve_cb)
-
-        # Seed a held lock on 'seed' so 'starved' can never acquire.
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Drive 3 ticks to cross skip_threshold (3), then advance past idle_secs.
-        for _ in range(3):
-            await scheduler.acquire_next()
-        t[0] = 150.0
-        await scheduler.acquire_next()
-
-        # Pre-condition: warn fired, task is escalated.
-        warn_cb.assert_called_once()
-        assert 'starved' in scheduler._starvation_escalated, (
-            'Precondition: starved must be in _starvation_escalated before GC tick'
-        )
-        resolve_cb.assert_not_called()
-
-        # Change get_tasks to return 'starved' as 'blocked' (non-terminal, non-candidate).
-        blocked_task = dict(task, status='blocked')
-        scheduler.get_tasks = AsyncMock(return_value=[blocked_task])
-
-        # One tick — the extended GC backstop must detect 'starved' is blocked,
-        # call _on_starvation_resolve, and clear watchdog state.
-        await scheduler.acquire_next()
-
-        resolve_cb.assert_called_once()
-        call_args = resolve_cb.call_args
-        args = call_args.args if call_args.args else ()
-        kwargs = call_args.kwargs if call_args.kwargs else {}
-        task_id_arg = args[0] if args else kwargs.get('task_id')
-        assert str(task_id_arg) == 'starved', (
-            f'Expected task_id="starved" in resolve callback; got {task_id_arg!r}'
-        )
-        assert 'starved' not in scheduler._starvation_escalated, (
-            '_starvation_escalated must be cleared by GC sweep for blocked task'
-        )
-
-    @pytest.mark.asyncio
-    async def test_continuity_reset_drops_first_seen_when_not_candidate(self):
-        """(b) Continuity reset: _starvation_first_seen cleared when task leaves candidates.
-
-        A task eligible in tick 1 (pending, deps satisfied, in candidates) gets
-        its _starvation_first_seen stamped.  When it becomes terminal (absent
-        from candidates) on tick 2, the entry is dropped so the idle clock
-        resets on any future re-appearance as a candidate.
-        """
-        scheduler, _t = self._make_scheduler()
-
-        # Seed a held lock so 'starved' is a candidate but can't acquire.
-        scheduler.lock_table.try_acquire('seed', ['backend'])
-        scheduler._dispatched.add('seed')
-
-        task = self._starved_task()
-        scheduler.get_tasks = AsyncMock(return_value=[task])
-
-        # Tick 1: 'starved' appears in candidates → _starvation_first_seen stamped.
-        await scheduler.acquire_next()
-        assert 'starved' in scheduler._starvation_first_seen, (
-            'Precondition: _starvation_first_seen must be stamped after tick 1'
-        )
-
-        # Now make 'starved' terminal so it is no longer a dispatch-eligible candidate.
-        terminal_task = dict(task, status='done')
-        scheduler.get_tasks = AsyncMock(return_value=[terminal_task])
-
-        # Tick 2: continuity reset in _apply_starvation_watchdog must drop the entry.
-        await scheduler.acquire_next()
-
-        assert 'starved' not in scheduler._starvation_first_seen, (
-            '_starvation_first_seen must be cleared by the continuity reset '
-            'when the task is no longer a dispatch-eligible candidate'
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -13325,9 +12811,6 @@ class TestStreakRegistryMigration:
             '_external_resolver_degraded_counts must alias '
             '_streak_resolver_degraded.counts'
         )
-        assert scheduler._starvation_first_seen is (
-            scheduler._streak_starvation.first_seen
-        ), '_starvation_first_seen must alias _streak_starvation.first_seen'
         assert scheduler._starvation_escalated is scheduler._streak_starvation.escalated, (
             '_starvation_escalated must alias _streak_starvation.escalated'
         )
@@ -13353,11 +12836,10 @@ class TestStreakRegistryMigration:
 
         NOTE: the spine entry uses ``_skip_count`` rather than
         ``_pending_anchor`` — ``_update_age_anchors`` (called earlier in the
-        same tick, before the stale-id sweep) unconditionally pops
-        ``_pending_anchor`` for any tid observed with a non-'pending' status,
-        so a task reported as already-'done' in its very first observed tick
-        never survives in ``_pending_anchor`` long enough to reach the
-        stale-id sweep.  ``_skip_count`` has no such early-pop and is one of
+        same tick, before the stale-id sweep) never anchors a tid observed
+        with a terminal status, so a task reported as already-'done' in its
+        very first observed tick never enters ``_pending_anchor`` and so
+        never reaches the stale-id sweep through it.  ``_skip_count`` has no such early-pop and is one of
         the four ``_all_tracked`` spine dicts, so it reliably lands 'T' in
         ``_stale_ids`` for this single-tick repro.
         """
@@ -13373,7 +12855,7 @@ class TestStreakRegistryMigration:
         scheduler._external_hold_streak['T'] = 1
         scheduler._external_hold_cause['T'] = 'deps_live'
         scheduler._external_resolver_degraded_counts['T'] = 1
-        scheduler._starvation_first_seen['T'] = 0.0
+        scheduler._starvation_escalated.add('T')
 
         # Spine entry so 'T' enters _all_tracked -> _stale_ids once terminal.
         scheduler._skip_count['T'] = 0
@@ -13570,6 +13052,160 @@ class TestConsultAlreadyLanded:
             'a raising gate hook should be logged, not silently swallowed'
         )
 
+    async def test_tick_view_is_read_once_and_threaded_with_each_candidate(self):
+        view = AlreadyLandedTickView(local_branches=frozenset())
+        reader = AsyncMock(return_value=view)
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+        candidates = [_pending_task(tid) for tid in ('A', 'B', 'C')]
+
+        await scheduler._consult_already_landed(candidates)
+
+        reader.assert_awaited_once()
+        assert gate.await_count == len(candidates)
+        for call, candidate in zip(gate.await_args_list, candidates, strict=True):
+            assert call.args == (candidate['id'],)
+            assert call.kwargs['task'] is candidate
+            assert call.kwargs['tick_view'] is view
+
+    async def test_without_a_reader_the_gate_gets_no_tick_view(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+        candidate = _pending_task('Z')
+
+        await scheduler._consult_already_landed([candidate])
+
+        (call,) = gate.await_args_list
+        assert call.kwargs['task'] is candidate
+        assert call.kwargs['tick_view'] is None
+
+    async def test_a_raising_reader_fails_open_to_per_candidate_reads(self, caplog):
+        caplog.set_level('WARNING')
+        reader = AsyncMock(side_effect=RuntimeError('for-each-ref hiccup'))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
+        scheduler._already_landed_gate = gate
+
+        result = await scheduler._consult_already_landed(
+            [_pending_task('Z'), _pending_task('Y')]
+        )
+
+        assert result == {'Z'}
+        assert {call.args[0] for call in gate.await_args_list} == {'Z', 'Y'}
+        assert all(call.kwargs['tick_view'] is None for call in gate.await_args_list)
+        assert any(record.levelname == 'WARNING' for record in caplog.records)
+
+    async def test_the_pending_escalations_are_read_once_after_the_view_and_threaded(self):
+        """Task 8073: one store read per consult, whatever the candidate count."""
+        reads: list[str] = []
+        snapshot = {'B': []}
+
+        async def read_view() -> AlreadyLandedTickView:
+            reads.append('view')
+            return AlreadyLandedTickView(local_branches=frozenset())
+
+        async def read_escalations() -> dict:
+            reads.append('escalations')
+            return snapshot
+
+        async def gate(task_id: str, **kwargs) -> bool:
+            reads.append(f'gate:{task_id}')
+            return False
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(
+                read_already_landed_tick_view=read_view,
+                read_pending_escalations_by_task=read_escalations,
+            ),
+        )
+        scheduler.finish_startup()
+        spy = AsyncMock(side_effect=gate)
+        scheduler._already_landed_gate = spy
+        candidates = [_pending_task(tid) for tid in ('A', 'B', 'C')]
+
+        await scheduler._consult_already_landed(candidates)
+
+        assert reads == ['view', 'escalations', 'gate:A', 'gate:B', 'gate:C']
+        assert all(
+            call.kwargs['pending_escalations'] is snapshot for call in spy.await_args_list
+        )
+
+    async def test_without_an_escalation_reader_the_gate_reads_per_candidate(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+
+        await scheduler._consult_already_landed([_pending_task('Z')])
+
+        (call,) = gate.await_args_list
+        assert call.kwargs['pending_escalations'] is None
+
+    async def test_a_raising_escalation_reader_fails_open_to_per_candidate_reads(
+        self, caplog,
+    ):
+        caplog.set_level('WARNING')
+        view = AlreadyLandedTickView(local_branches=frozenset())
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(
+                read_already_landed_tick_view=AsyncMock(return_value=view),
+                read_pending_escalations_by_task=AsyncMock(
+                    side_effect=OSError('escalation queue dir unreadable'),
+                ),
+            ),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
+        scheduler._already_landed_gate = gate
+
+        result = await scheduler._consult_already_landed(
+            [_pending_task('Z'), _pending_task('Y')]
+        )
+
+        assert result == {'Z'}
+        assert all(call.kwargs['pending_escalations'] is None for call in gate.await_args_list)
+        assert all(call.kwargs['tick_view'] is view for call in gate.await_args_list)
+        assert any(
+            record.levelname == 'WARNING' and 'pending escalation snapshot' in record.getMessage()
+            for record in caplog.records
+        )
+
+    async def test_without_a_gate_the_tick_view_is_not_read(self):
+        reader = AsyncMock(return_value=AlreadyLandedTickView(local_branches=frozenset()))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+
+        assert await scheduler._consult_already_landed([_pending_task('Z')]) == set()
+        reader.assert_not_awaited()
+
+    async def test_with_no_candidates_the_tick_view_is_not_read(self):
+        reader = AsyncMock(return_value=AlreadyLandedTickView(local_branches=frozenset()))
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(read_already_landed_tick_view=reader),
+        )
+        scheduler.finish_startup()
+        scheduler._already_landed_gate = AsyncMock(return_value=False)
+
+        assert await scheduler._consult_already_landed([]) == set()
+        reader.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # acquire_next() honors the already-landed gate (task 2313).
@@ -13591,27 +13227,33 @@ class TestAcquireNextAlreadyLandedGate:
         scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
-        scheduler._already_landed_gate = AsyncMock(return_value=True)
+        gate = AsyncMock(return_value=True)
+        scheduler._already_landed_gate = gate
 
         result = await scheduler.acquire_next()
 
         assert result is None, 'a gated task must not be dispatched this tick'
         assert 'Z' not in scheduler._dispatched
-        scheduler._already_landed_gate.assert_awaited_once_with('Z')
+        (call,) = gate.await_args_list
+        assert call.args == ('Z',)
+        assert call.kwargs['task']['id'] == 'Z'
 
     async def test_gate_false_dispatches_normally(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         task = _pending_task('Z')
         scheduler.get_tasks = AsyncMock(return_value=[task])
-        scheduler._already_landed_gate = AsyncMock(return_value=False)
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
 
         result = await scheduler.acquire_next()
 
         assert result is not None
         assert result.task_id == 'Z'
         assert 'Z' in scheduler._dispatched
-        scheduler._already_landed_gate.assert_awaited_once_with('Z')
+        (call,) = gate.await_args_list
+        assert call.args == ('Z',)
+        assert call.kwargs['task']['id'] == 'Z'
 
     async def test_gated_pinned_candidate_is_not_dispatched(self, tmp_path):
         """Pin-loop parity: a gated PINNED candidate must also be skipped."""
@@ -13624,7 +13266,7 @@ class TestAcquireNextAlreadyLandedGate:
         scheduler = Scheduler(config, override_store=store)
         scheduler.finish_startup()
         scheduler._project_root = '/proj'
-        scheduler._already_landed_gate = AsyncMock(side_effect=lambda task_id: task_id == 'Z')
+        scheduler._already_landed_gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
 
         task_z = _pending_task('Z', files=['z/src'])
         task_y = _pending_task('Y', files=['y/src'])

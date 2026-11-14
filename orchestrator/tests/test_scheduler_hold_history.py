@@ -3,46 +3,30 @@
 Task 3822 / plans/scheduler-dispatch-scoring-and-lock-layer-prd.md task ζ
 (D11, INV-5).
 
-Two things are asserted here, and they are different in kind:
+The wiring has two halves, and they are different in kind:
 
-1. BEHAVIOUR — the Scheduler builds a ``HoldHistory`` unconditionally, and
+1. BEHAVIOUR, asserted here — the Scheduler builds a ``HoldHistory`` unconditionally, and
    ``finish_startup()`` seeds it from the event store when one is attached.
    The harness attaches the store AFTER construction (harness.py:2121-2122)
    and calls ``finish_startup()`` later (harness.py:2445), so a seed in
    ``__init__`` would silently read ``None`` forever.
 
-2. STRUCTURE — a single-writer guard, modelled on
-   test_lock_release_single_writer_guard.py.  Both lock events must be
-   emitted from exactly one call site each, inside ``_emit_lock_event``, so
-   a future emit site cannot record a lock event without also feeding the
-   predictor.  A behavioural test can only prove today's four sites feed it;
-   this proves a fifth cannot be added that doesn't.
+2. STRUCTURE — both lock events are emitted from exactly one call site
+   each, inside ``_emit_lock_event``, so a future emit site cannot record a
+   lock event without also feeding the predictor.  That single-writer guard
+   lives in test_lock_event_emit_site_guard.py.
 """
 
 from __future__ import annotations
 
-import ast
 from datetime import UTC, datetime
-from pathlib import Path
 
 import _hold_history_fixtures as F
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.hold_history import HoldHistory
 from orchestrator.scheduler import Scheduler
-
-# test_lock_events_are_emitted_from_exactly_one_site AST-parses every *.py
-# under orchestrator/src via rglob. MEASURED at 2.90s and 3.07s per call
-# unloaded and serial (-n0) here: it is parametrized over two event names, so
-# the whole sweep runs twice. Not individually reproduced under load; marked
-# because it is structurally identical to the three members that crashed.
-# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
-# ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 FIXED_DT = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
 
@@ -126,92 +110,6 @@ def test_finish_startup_is_idempotent_for_the_seed_too():
     assert scheduler._hold_history.sample_count(
         list(F.EXPECTED_SAMPLES)
     ) == F.EXPECTED_SPAN_COUNT
-
-
-# --- (b) the single-writer structural guard --------------------------------
-#
-# AST, not text grep: an ``emit(`` call can span lines, and the enclosing
-# function is exactly what the invariant is about.
-
-_SRC_DIR = Path(__file__).parent.parent / 'src'
-_CHOKEPOINT = '_emit_lock_event'
-_GUARDED_EVENTS = ('lock_acquired', 'lock_released')
-
-
-def _enclosing_function_ranges(tree: ast.Module) -> list[tuple[str, int, int]]:
-    """``(name, lineno, end_lineno)`` for every function/method in *tree*."""
-    ranges: list[tuple[str, int, int]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            ranges.append((node.name, node.lineno, node.end_lineno or node.lineno))
-    return ranges
-
-
-def _emit_sites(path: Path, event_name: str) -> list[tuple[str, int, str]]:
-    """``(file, line, enclosing function)`` for each ``…emit(EventType.<event>…)``."""
-    tree = ast.parse(path.read_text())
-    ranges = _enclosing_function_ranges(tree)
-    sites: list[tuple[str, int, str]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (isinstance(func, ast.Attribute) and func.attr == 'emit'):
-            continue
-        args = list(node.args) + [kw.value for kw in node.keywords if kw.arg == 'event_type']
-        for arg in args:
-            if (
-                isinstance(arg, ast.Attribute)
-                and arg.attr == event_name
-                and isinstance(arg.value, ast.Name)
-                and arg.value.id == 'EventType'
-            ):
-                enclosing = [
-                    name for name, lo, hi in ranges if lo <= node.lineno <= hi
-                ]
-                sites.append((path.name, node.lineno, enclosing[-1] if enclosing else '<module>'))
-    return sites
-
-
-@pytest.mark.parametrize('event_name', _GUARDED_EVENTS)
-def test_lock_events_are_emitted_from_exactly_one_site(event_name: str):
-    """One emit site per lock event, and it is ``_emit_lock_event``.
-
-    A second site would emit an event the predictor never sees — and the gap
-    is invisible: the event stream stays complete, so nothing looks broken
-    while the in-process history silently drifts from what the durable seed
-    would reconstruct.  Scoped to ``orchestrator/src`` deliberately; the tests
-    tree legitimately constructs these events in fixtures.
-    """
-    sites = [
-        site
-        for path in sorted(_SRC_DIR.rglob('*.py'))
-        for site in _emit_sites(path, event_name)
-    ]
-
-    assert len(sites) == 1, f'expected exactly one EventType.{event_name} emit site, got {sites}'
-    assert sites[0][2] == _CHOKEPOINT, (
-        f'EventType.{event_name} emitted from {sites[0][2]}, not {_CHOKEPOINT}: '
-        f'a lock event emitted outside the chokepoint never reaches the predictor'
-    )
-
-
-def test_the_guard_can_actually_find_emit_sites(tmp_path):
-    """Meta-test: a scanner that finds nothing would pass the guard vacuously.
-
-    The probe goes in ``tmp_path``, never in the tests tree: this suite runs
-    under pytest-xdist, so a fixed path shared by every worker is a race, and a
-    hard interrupt mid-test would strand an untracked .py file in
-    ``orchestrator/tests/`` — where the guard's own ``rglob`` would then find it.
-    """
-    source = 'from x import EventType\ndef f(self):\n    self.event_store.emit(\n' \
-             '        EventType.lock_acquired, task_id="T1", data={})\n'
-    probe = tmp_path / '_guard_meta_probe.py'
-    probe.write_text(source)
-
-    found = _emit_sites(probe, 'lock_acquired')
-
-    assert [(line, fn) for _f, line, fn in found] == [(3, 'f')]
 
 
 # ===========================================================================

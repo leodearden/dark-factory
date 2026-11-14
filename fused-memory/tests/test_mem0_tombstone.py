@@ -12,6 +12,9 @@ Two units live in that module:
   task 4375, consulted at the same choke point, so no marker sweep can take a
   DELIBERATELY-PERMANENT audit-log record (``kind`` in
   :data:`PROTECTED_AUDIT_KINDS`) that happens to carry the sweep's match key.
+- :func:`is_foreign_kind_record` — the pool-membership predicate added by task
+  6241: a record declaring a kind other than its pool's marker kind belongs to
+  another pool, so no marker-GC sweep of this pool may take it.
 - :func:`record_mem0_deletion_tombstone` — writes the queryable audit row that
   makes a designed eviction distinguishable from silent data loss (the defining
   signature of the recon-gate-165 / esc-165-1 finding).
@@ -30,6 +33,7 @@ from fused_memory.reconciliation.mem0_tombstone import (
     MEM0_TOMBSTONE_TTL_DAYS,
     PROTECTED_AUDIT_KINDS,
     RECORD_KIND_MEM0_TOMBSTONE,
+    is_foreign_kind_record,
     is_protected_audit_record,
     is_protected_mirror_record,
     record_mem0_deletion_tombstone,
@@ -215,6 +219,55 @@ class TestIsProtectedAuditRecord:
 
         assert 'is_protected_audit_record' in mem0_tombstone.__all__
         assert 'PROTECTED_AUDIT_KINDS' in mem0_tombstone.__all__
+
+
+_MARKER_KIND = 'stage1_flag_marker'
+
+
+class TestIsForeignKindRecord:
+    """The pool-membership predicate shared by every marker collector (task 6241)."""
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            {'kind': 'cadence_check'},
+            {'kind': 'unregistered_audit_log', 'source': _MARKER_KIND},
+            {'kind': ''},
+            # UNHASHABLE kinds: answered by ``!=``, never by set membership,
+            # so they are foreign and never raise TypeError.
+            {'kind': [_MARKER_KIND]},
+            {'kind': {'nested': 'x'}},
+        ],
+    )
+    def test_a_declared_other_kind_is_foreign(self, metadata):
+        assert is_foreign_kind_record(metadata, _MARKER_KIND) is True
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            {'source': _MARKER_KIND, 'task_id': '1'},
+            {},
+            {'kind': None},
+            {'kind': _MARKER_KIND},
+        ],
+    )
+    def test_an_absent_or_matching_kind_is_a_member(self, metadata):
+        assert is_foreign_kind_record(metadata, _MARKER_KIND) is False
+
+    @pytest.mark.parametrize('metadata', [None, 'string', 42, ['kind', 'x']])
+    def test_non_dict_metadata_returns_false_without_raising(self, metadata):
+        assert is_foreign_kind_record(metadata, _MARKER_KIND) is False
+
+    def test_pool_kind_is_a_real_parameter(self):
+        relay = {'kind': 'flag_for_stage2'}
+
+        assert is_foreign_kind_record(relay, _MARKER_KIND) is True
+        assert is_foreign_kind_record(relay, 'flag_for_stage2') is False
+
+    def test_is_exported(self):
+        from fused_memory.reconciliation import mem0_tombstone
+
+        assert 'is_foreign_kind_record' in mem0_tombstone.__all__
 
 
 # Probe run in a FRESH interpreter by TestReconPoolMapIsImportFreeLeaf: import

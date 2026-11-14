@@ -14,19 +14,35 @@ verdict.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import sqlite3
 import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from _merge_tool_calls import call_merge_cancel, call_merge_status
+from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
 from orchestrator.config import (
     GitConfig,
     OrchestratorConfig,
 )
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane import (
+    GroupMergeRequest,
+    InFlightMergeRegistry,
+    MergeCancelRefusal,
+    MergeCancelVerdict,
+    MergeLane,
+    MergeOutcome,
+    MergeRequest,
+    OperatorMergeCancel,
+    QueuedBranch,
+    WaiterRecord,
+    enqueue_merge_request,
+)
 from orchestrator.merge_lane.queue_store import (
     MergeQueueStore,
 )
@@ -72,7 +88,7 @@ def _finalize(
     *,
     request_id: str,
     state: str,
-    branch: str = _BRANCH,
+    branch: str = _TASK,
     task_id: str = _TASK,
     **extra: Any,
 ) -> None:
@@ -86,7 +102,7 @@ def _finalize(
 def _journal_entry(
     request_id: str,
     *,
-    branch: str = _BRANCH,
+    branch: str = _TASK,
     task_id: str = _TASK,
     enqueued_at: float = 1_700_000_000.0,
 ) -> dict[str, Any]:
@@ -117,6 +133,77 @@ class _UnreadableJournal(MergeQueueStore):
         raise OSError('journal unreadable')
 
 
+class _OneReadFails(EventStore):
+    """A runs.db on which one merge_finalized reader fails in one run scope; every other read is real.
+
+    The failing read does what the real store does with a failed read: a
+    strict one raises, a fire-safe one reads as a miss.
+    """
+
+    def __init__(self, db_path: Path, *, reader: Any, cross_run: bool) -> None:
+        super().__init__(db_path, _CURRENT)
+        self._failing = (reader, cross_run)
+
+    def _fails(self, reader: Any, *, cross_run: bool, fire_safe: bool) -> bool:
+        if (reader, cross_run) != self._failing:
+            return False
+        if fire_safe:
+            return True
+        raise sqlite3.OperationalError('disk I/O error')
+
+    def latest_merge_finalized(
+        self,
+        request_id: str | None = None,
+        branch: str | None = None,
+        task_id: str | None = None,
+        *,
+        cross_run: bool = False,
+        fire_safe: bool = True,
+    ) -> dict | None:
+        if self._fails(EventStore.latest_merge_finalized, cross_run=cross_run, fire_safe=fire_safe):
+            return None
+        return super().latest_merge_finalized(
+            request_id, branch, task_id, cross_run=cross_run, fire_safe=fire_safe,
+        )
+
+    def merge_finalized_absorbing(
+        self, request_id: str, *, cross_run: bool = False, fire_safe: bool = True,
+    ) -> dict | None:
+        if self._fails(
+            EventStore.merge_finalized_absorbing, cross_run=cross_run, fire_safe=fire_safe,
+        ):
+            return None
+        return super().merge_finalized_absorbing(
+            request_id, cross_run=cross_run, fire_safe=fire_safe,
+        )
+
+    def merge_finalized_superseded_by(
+        self, superseded_by: str, *, cross_run: bool = False, fire_safe: bool = True,
+    ) -> list[dict]:
+        if self._fails(
+            EventStore.merge_finalized_superseded_by, cross_run=cross_run, fire_safe=fire_safe,
+        ):
+            return []
+        return super().merge_finalized_superseded_by(
+            superseded_by, cross_run=cross_run, fire_safe=fire_safe,
+        )
+
+
+def _history_unreadable(tmp_path: Path) -> _OneReadFails:
+    """A runs.db whose prior-run read fails while this run's rows still read."""
+    return _OneReadFails(
+        tmp_path / 'runs.db', reader=EventStore.latest_merge_finalized, cross_run=True,
+    )
+
+
+def _unreadable(store: Any) -> Any:
+    """Overwrite *store*'s runs.db with non-database bytes, so every later read fails to open it."""
+    store.db_path.write_bytes(b'not a database' * 64)
+    for sidecar in ('-wal', '-shm'):
+        Path(f'{store.db_path}{sidecar}').unlink(missing_ok=True)
+    return store
+
+
 def _live_worker(*entries: dict[str, Any]) -> types.SimpleNamespace:
     return types.SimpleNamespace(snapshot=lambda: {'entries': list(entries)})
 
@@ -126,7 +213,7 @@ def _live_entry(
 ) -> dict[str, Any]:
     return {
         'request_id': request_id,
-        'branch': _BRANCH,
+        'branch': _TASK,
         'task_id': _TASK,
         'state': state,
         'position': 0,
@@ -161,6 +248,7 @@ def _server(
     worker: Any = None,
     journal: Any = None,
     git_ops: Any = None,
+    merge_queue: asyncio.Queue[Any] | None = None,
 ) -> Any:
     harness = types.SimpleNamespace(
         _merge_worker=worker,
@@ -172,6 +260,7 @@ def _server(
         orch_config=_config(tmp_path),
         event_store=current,
         harness=harness,
+        merge_queue=merge_queue,
     )
 
 
@@ -181,6 +270,25 @@ def _verdict(outcome: GitAuthorityOutcome) -> GitAuthorityVerdict:
             outcome=outcome, merge_sha=_MERGE_SHA, arm=GitAuthorityArm.ancestor,
         )
     return GitAuthorityVerdict(outcome=outcome)
+
+
+def _lane_request(
+    tmp_path: Path, *, train: dict[str, Any] | None = None, **flags: Any,
+) -> MergeRequest:
+    fields: dict[str, Any] = dict(
+        task_id=_TASK,
+        branch=QueuedBranch.parse(_BRANCH, 'task/'),
+        worktree=tmp_path,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=_config(tmp_path),
+        result=asyncio.get_running_loop().create_future(),
+        **flags,
+    )
+    if train is None:
+        return MergeRequest(**fields)
+    return GroupMergeRequest(**fields, **train)
 
 
 @pytest.fixture(autouse=True)
@@ -240,6 +348,108 @@ class TestHistoryNeverSetsAnOutcomeState:
         assert 'hint' not in response
         assert response['last_outcome']['is_current_run'] is True
         assert response['last_outcome']['run_id'] == _CURRENT
+
+
+class TestCurrentRunTierCarriesTheRowsMergeSha:
+    async def _finalize_through_the_lane(
+        self,
+        current: Any,
+        request: MergeRequest,
+        outcome: MergeOutcome,
+        registry: InFlightMergeRegistry | None = None,
+    ) -> None:
+        await enqueue_merge_request(asyncio.Queue(), request, current, registry=registry)
+        request.result.set_result(outcome)
+        await asyncio.sleep(0)
+
+    @pytest.mark.parametrize(
+        'key',
+        [{'request_id': 'mr-1'}, {'branch': _BRANCH}, {'task_id': _TASK}],
+        ids=['request_id', 'branch', 'task_id'],
+    )
+    async def test_a_done_finalized_this_run_answers_with_its_merge_sha(
+        self, tmp_path: Path, key: dict[str, str],
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        await self._finalize_through_the_lane(
+            current,
+            _lane_request(tmp_path, request_id='mr-1'),
+            MergeOutcome('done', merge_sha=_MERGE_SHA),
+        )
+
+        response = await _poll(_server(tmp_path, current), **key)
+
+        assert response['state'] is MergeState.done
+        assert response['source'] == 'event_store'
+        assert response['merge_sha'] == _MERGE_SHA
+        assert response['last_outcome']['merge_sha'] == _MERGE_SHA
+        assert 'kind' not in response, 'only the git tier is kind: found_on_main'
+
+    async def test_a_superseded_row_answers_with_its_merge_sha(self, tmp_path: Path) -> None:
+        _, current = _event_stores(tmp_path)
+        await self._finalize_through_the_lane(
+            current,
+            _lane_request(tmp_path, request_id='mr-1'),
+            MergeOutcome('superseded', superseded_by='mr-2', merge_sha=_MERGE_SHA),
+        )
+
+        response = await _poll(_server(tmp_path, current), request_id='mr-1')
+
+        assert response['state'] is MergeState.superseded
+        assert response['source'] == 'event_store'
+        assert response['superseded_by'] == 'mr-2'
+        assert response['merge_sha'] == _MERGE_SHA
+
+    async def test_an_absorbed_loser_answers_with_its_primarys_merge_sha(
+        self, tmp_path: Path,
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        request = _lane_request(tmp_path, request_id='mr-1')
+        registry = InFlightMergeRegistry()
+        registry.acquire(
+            request.branch.bare_id, _TASK, request.result, request_id=request.request_id,
+        )
+        registry.attach(request.branch.bare_id, WaiterRecord(
+            request_id='mr-loser',
+            future=asyncio.get_running_loop().create_future(),
+            source='workflow',
+        ))
+        await self._finalize_through_the_lane(
+            current, request, MergeOutcome('done', merge_sha=_MERGE_SHA), registry,
+        )
+
+        response = await _poll(_server(tmp_path, current), request_id='mr-loser')
+
+        assert response['state'] is MergeState.done
+        assert response['source'] == 'event_store'
+        assert response['request_id'] == 'mr-1'
+        assert response['merge_sha'] == _MERGE_SHA
+
+    async def test_a_row_without_a_merge_sha_renders_no_merge_sha_key(
+        self, tmp_path: Path,
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        await self._finalize_through_the_lane(
+            current, _lane_request(tmp_path, request_id='mr-1'), MergeOutcome('done'),
+        )
+
+        response = await _poll(_server(tmp_path, current), request_id='mr-1')
+
+        assert response['state'] is MergeState.done
+        assert response['source'] == 'event_store'
+        assert 'merge_sha' not in response
+
+    async def test_a_prior_run_merge_sha_stays_in_last_outcome(
+        self, tmp_path: Path,
+    ) -> None:
+        prior, current = _event_stores(tmp_path)
+        _finalize(prior, request_id='mr-old', state='done', merge_sha=_MERGE_SHA)
+
+        response = await _poll(_server(tmp_path, current), request_id='mr-old')
+
+        assert response['state'] is MergeState.stale_record
+        assert 'merge_sha' not in response
+        assert response['last_outcome']['merge_sha'] == _MERGE_SHA
 
 
 class TestJournalTier:
@@ -412,6 +622,117 @@ class TestProbeFailureEndsTheWalk:
         assert response['reason'] == MergeReason.probe_failed
         assert response['source'] == 'live'
 
+    @pytest.mark.parametrize(
+        'key',
+        [{'request_id': 'mr-1'}, {'branch': _BRANCH}, {'task_id': _TASK}],
+        ids=['request_id', 'branch', 'task_id'],
+    )
+    async def test_an_unreadable_event_store_is_an_event_store_probe_failure(
+        self, tmp_path: Path, key: dict[str, str]
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        _finalize(current, request_id='mr-1', state='done')
+        server = _server(tmp_path, _unreadable(current))
+
+        response = await _poll(server, **key)
+
+        assert response['state'] is MergeState.unknown
+        assert response['reason'] == MergeReason.probe_failed
+        assert response['source'] == 'event_store'
+        assert response['hint'] == hint_for(MergeReason.probe_failed)
+        assert response['last_outcome'] is None
+
+    @pytest.mark.parametrize(
+        'key', [{'task_id': _TASK}, {'request_id': 'mr-x'}], ids=['task_id', 'request_id'],
+    )
+    async def test_unreadable_history_is_a_cross_run_probe_failure(
+        self, tmp_path: Path, key: dict[str, str]
+    ) -> None:
+        store = _history_unreadable(tmp_path)
+
+        response = await _poll(_server(tmp_path, store), **key)
+
+        assert response['state'] is MergeState.unknown
+        assert response['reason'] == MergeReason.probe_failed
+        assert response['source'] == 'event_store_cross_run'
+        assert response['last_outcome'] is None
+
+    @pytest.mark.parametrize(
+        ('reader', 'cross_run', 'source'),
+        [
+            (EventStore.latest_merge_finalized, False, 'event_store'),
+            (EventStore.merge_finalized_absorbing, False, 'event_store'),
+            (EventStore.latest_merge_finalized, True, 'event_store_cross_run'),
+            (EventStore.merge_finalized_absorbing, True, 'event_store_cross_run'),
+            (EventStore.merge_finalized_superseded_by, True, 'event_store_cross_run'),
+        ],
+        ids=[
+            'current-latest', 'current-absorbing',
+            'cross-latest', 'cross-absorbing', 'cross-superseded_by',
+        ],
+    )
+    async def test_each_read_a_request_id_poll_makes_reports_its_own_failure(
+        self, tmp_path: Path, reader: Any, cross_run: bool, source: str
+    ) -> None:
+        store = _OneReadFails(tmp_path / 'runs.db', reader=reader, cross_run=cross_run)
+
+        response = await _poll(_server(tmp_path, store), request_id='mr-x')
+
+        assert response['state'] is MergeState.unknown
+        assert response['reason'] == MergeReason.probe_failed
+        assert response['source'] == source
+        assert response['last_outcome'] is None
+
+    async def test_unreadable_history_does_not_preempt_the_current_run_tier(
+        self, tmp_path: Path
+    ) -> None:
+        store = _history_unreadable(tmp_path)
+        _finalize(store, request_id='mr-1', state='done')
+
+        response = await _poll(_server(tmp_path, store), request_id='mr-1')
+
+        assert response['state'] is MergeState.done
+        assert response['source'] == 'event_store'
+        assert response['last_outcome'] is None
+
+    async def test_unreadable_history_does_not_preempt_the_journal_tier(
+        self, tmp_path: Path
+    ) -> None:
+        store = _history_unreadable(tmp_path)
+        journal = _journal(tmp_path, _journal_entry('mr-j'))
+
+        response = await _poll(_server(tmp_path, store, journal=journal), task_id=_TASK)
+
+        assert response['state'] is MergeState.journaled
+        assert response['source'] == 'journal'
+        assert response['last_outcome'] is None
+
+    async def test_unreadable_history_does_not_preempt_the_git_tier(
+        self, tmp_path: Path, probe: AsyncMock
+    ) -> None:
+        probe.return_value = _verdict(GitAuthorityOutcome.found_on_main)
+        store = _history_unreadable(tmp_path)
+
+        response = await _poll(_server(tmp_path, store), task_id=_TASK)
+
+        assert response['state'] is MergeState.done
+        assert response['source'] == 'git'
+        assert response['last_outcome'] is None
+
+    async def test_an_unreadable_event_store_does_not_preempt_a_live_answer(
+        self, tmp_path: Path
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        server = _server(
+            tmp_path, _unreadable(current), worker=_live_worker(_live_entry('mr-new')),
+        )
+
+        response = await _poll(server, branch=_BRANCH)
+
+        assert response['state'] == 'queued'
+        assert response['source'] == 'live'
+        assert response['last_outcome'] is None
+
 
 class TestAliasResolution:
     async def test_b6_a_train_id_resolves_to_its_newest_member_record(
@@ -419,11 +740,11 @@ class TestAliasResolution:
     ) -> None:
         prior, current = _event_stores(tmp_path)
         _finalize(
-            prior, request_id='mr-a', state='superseded', branch='task/1', task_id='1',
+            prior, request_id='mr-a', state='superseded', branch='1', task_id='1',
             superseded_by='coalesce-x-1',
         )
         _finalize(
-            prior, request_id='mr-b', state='superseded', branch='task/2', task_id='2',
+            prior, request_id='mr-b', state='superseded', branch='2', task_id='2',
             superseded_by='coalesce-x-1',
         )
 
@@ -436,7 +757,7 @@ class TestAliasResolution:
         assert last['state'] == 'superseded'
         assert last['superseded_by'] == 'coalesce-x-1'
         assert last['request_id'] == 'mr-b'
-        assert last['branch'] == 'task/2'
+        assert last['branch'] == '2'
 
     async def test_b7_a_prior_run_absorbed_loser_resolves_to_its_primary(
         self, tmp_path: Path
@@ -469,6 +790,52 @@ class TestAliasResolution:
         assert response['source'] == 'event_store'
         assert response['request_id'] == 'mr-primary'
         assert response['last_outcome']['request_id'] == 'mr-primary'
+
+
+@pytest.mark.parametrize('branch', [_TASK, _BRANCH], ids=['bare', 'full_ref'])
+class TestBranchKeySpelling:
+    """Each non-git tier answers a branch poll whether or not it carries the prefix."""
+
+    async def test_the_live_tier(self, tmp_path: Path, branch: str) -> None:
+        _, current = _event_stores(tmp_path)
+        server = _server(tmp_path, current, worker=_live_worker(_live_entry('mr-live')))
+
+        response = await _poll(server, branch=branch)
+
+        assert response['state'] == 'queued'
+        assert response['source'] == 'live'
+        assert response['request_id'] == 'mr-live'
+
+    async def test_the_current_run_tier(self, tmp_path: Path, branch: str) -> None:
+        _, current = _event_stores(tmp_path)
+        _finalize(current, request_id='mr-1', state='blocked')
+
+        response = await _poll(_server(tmp_path, current), branch=branch)
+
+        assert response['state'] is MergeState.blocked
+        assert response['source'] == 'event_store'
+        assert response['request_id'] == 'mr-1'
+
+    async def test_the_journal_tier(self, tmp_path: Path, branch: str) -> None:
+        _, current = _event_stores(tmp_path)
+        journal = _journal(tmp_path, _journal_entry('mr-j'))
+
+        response = await _poll(_server(tmp_path, current, journal=journal), branch=branch)
+
+        assert response['state'] is MergeState.journaled
+        assert response['source'] == 'journal'
+        assert response['request_id'] == 'mr-j'
+
+    async def test_the_prior_run_tier(self, tmp_path: Path, branch: str) -> None:
+        prior, current = _event_stores(tmp_path)
+        _finalize(prior, request_id='mr-old', state='conflict')
+
+        response = await _poll(_server(tmp_path, current), branch=branch)
+
+        assert response['state'] is MergeState.stale_record
+        assert response['reason'] == MergeReason.prior_run_terminal
+        assert response['source'] == 'event_store_cross_run'
+        assert response['last_outcome']['request_id'] == 'mr-old'
 
 
 class TestMergeCancelDurableResolution:
@@ -521,21 +888,31 @@ class TestMergeCancelDurableResolution:
 
         assert response['state'] is MergeState.unknown
 
-    async def test_a_live_waiterless_request_reports_its_live_state(
+    async def test_an_unreadable_event_store_is_unknown(self, tmp_path: Path) -> None:
+        _, current = _event_stores(tmp_path)
+
+        response = await self._cancel(_server(tmp_path, _unreadable(current)), 'mr-x')
+
+        assert response['state'] is MergeState.unknown
+
+    async def test_a_live_request_the_lane_refuses_reports_its_live_state(
         self, tmp_path: Path
     ) -> None:
         _, current = _event_stores(tmp_path)
+        worker = _live_worker(_live_entry('mr-live', state='finalizing'))
+        worker.cancel_request = lambda request_id: MergeCancelVerdict(
+            request_id, MergeCancelRefusal.FINALIZE_WINDOW,
+        )
         server = _server(
-            tmp_path,
-            current,
-            worker=_live_worker(_live_entry('mr-live', state='verifying')),
+            tmp_path, current, worker=worker,
             journal=_journal(tmp_path, _journal_entry('mr-live')),
         )
 
         response = await self._cancel(server, 'mr-live')
 
         assert response['state'] is not MergeState.journaled
-        assert response['state'] is MergeState.verifying
+        assert response['state'] is MergeState.finalizing
+        assert response['code'] == 'finalize_window'
 
 
 class TestLiveTier:
@@ -560,3 +937,145 @@ class TestLiveTier:
         assert cancelled['cancelled'] is False
         assert cancelled['state'] == 'abandoned'
         assert cancelled['reason'] == 'Request already finalized; cannot cancel.'
+
+    async def test_the_live_eta_reads_the_registry_merge_request_filled(
+        self, tmp_path: Path,
+    ) -> None:
+        """With a merge queue wired and no registry injected, merge_status's live ETA
+        comes from the same lazily-created registry merge_request acquired (task 6610).
+        """
+        _, current = _event_stores(tmp_path)
+        git_ops = _git_ops_spies()
+        git_ops.find_inflight_merge_worktree = AsyncMock(return_value=None)
+        entries: list[dict[str, Any]] = []
+        worker = types.SimpleNamespace(snapshot=lambda: {'entries': list(entries)})
+        mq: asyncio.Queue[Any] = asyncio.Queue()
+        server = _server(tmp_path, current, worker=worker, git_ops=git_ops, merge_queue=mq)
+
+        submitted = await call_merge_request(
+            server, task_id=_TASK, branch=_TASK, worktree=str(tmp_path), lane='normal',
+        )
+        assert submitted['status'] == 'queued'
+        assert submitted['eta_seconds'] is not None
+        try:
+            entries.append(_live_entry(submitted['request_id']))
+            polled = await _poll(server, request_id=submitted['request_id'])
+        finally:
+            mq.get_nowait().result.cancel()
+
+        assert polled['source'] == 'live'
+        assert polled['request_id'] == submitted['request_id']
+        assert polled['eta_seconds'] is not None
+        assert 0 < polled['eta_seconds'] <= submitted['eta_seconds']
+
+
+class TestMergeCancelThroughTheLane:
+    """merge_cancel of a live request no caller is blocked on (task 5248).
+
+    The request reaches a real lane the way a workflow's does, through
+    ``enqueue_merge_request``, so this server holds no waiter for it.  Every
+    operator cancel ends with someone owning it: the TaskWorkflow that awaits
+    the request, or else an L1 this server files.
+    """
+
+    async def _lane_holding(
+        self, tmp_path: Path, current: Any, request: MergeRequest,
+        registry: InFlightMergeRegistry | None = None,
+    ) -> Any:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        lane = MergeLane(GitOps(_config(tmp_path).git, tmp_path), queue)
+        await enqueue_merge_request(queue, request, current)
+        git_ops = _git_ops_spies()
+        git_ops.find_inflight_merge_worktree = AsyncMock(return_value=None)
+        return create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            orch_config=_config(tmp_path),
+            event_store=current,
+            harness=types.SimpleNamespace(
+                _merge_worker=lane, _merge_store=_journal(tmp_path), git_ops=git_ops,
+            ),
+            merge_inflight_registry=registry,
+        )
+
+    def _escalations(self, tmp_path: Path) -> list[Any]:
+        return EscalationQueue(tmp_path / 'esc').get_by_task(_TASK)
+
+    async def test_a_queued_request_is_cancelled_and_then_polls_abandoned(
+        self, tmp_path: Path,
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        request = _lane_request(tmp_path, awaited_by_workflow=True)
+        server = await self._lane_holding(tmp_path, current, request)
+        queued = await _poll(server, request_id=request.request_id)
+
+        response = await call_merge_cancel(server, request_id=request.request_id)
+
+        assert queued['state'] is MergeState.queued
+        assert response == {'cancelled': True, 'state': MergeState.abandoned, 'reason': None}
+        assert (await _poll(server, request_id=request.request_id))['state'] is (
+            MergeState.abandoned
+        )
+        assert self._escalations(tmp_path) == [], 'the awaiting workflow owns the cancel'
+
+    async def test_a_workflowless_request_is_cancelled_and_escalated_here(
+        self, tmp_path: Path,
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        request = _lane_request(tmp_path)
+        server = await self._lane_holding(tmp_path, current, request)
+
+        response = await call_merge_cancel(server, request_id=request.request_id)
+
+        assert response['cancelled'] is True
+        [escalation] = self._escalations(tmp_path)
+        assert escalation.category == 'merge_cancelled_by_operator'
+        assert escalation.level == 1
+        assert request.request_id in escalation.summary
+        assert _TASK in escalation.summary
+
+    async def test_an_attached_workflow_peer_receives_the_operator_cancel(
+        self, tmp_path: Path,
+    ) -> None:
+        _, current = _event_stores(tmp_path)
+        request = _lane_request(tmp_path)
+        registry = InFlightMergeRegistry()
+        registry.acquire(
+            request.branch.bare_id, _TASK, request.result, request_id=request.request_id,
+        )
+        peer = asyncio.get_running_loop().create_future()
+        registry.attach(request.branch.bare_id, WaiterRecord(
+            request_id='mr-peer', future=peer, source='workflow',
+        ))
+        server = await self._lane_holding(tmp_path, current, request, registry)
+
+        response = await call_merge_cancel(server, request_id=request.request_id)
+
+        assert response['cancelled'] is True
+        assert peer.cancelled()
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            peer.result()
+        assert OperatorMergeCancel.carried_by(cancelled.value) == (
+            OperatorMergeCancel(request.request_id)
+        )
+        assert self._escalations(tmp_path) == [], 'the attached workflow owns the cancel'
+
+    async def test_a_train_is_refused_with_its_code(self, tmp_path: Path) -> None:
+        _, current = _event_stores(tmp_path)
+        train = _lane_request(tmp_path, train=dict(
+            train_id='train-1',
+            member_task_ids=['41', _TASK],
+            tip_branch=QueuedBranch.parse(_BRANCH, 'task/'),
+            tip_task_id=_TASK,
+            status_check=AsyncMock(return_value={}),
+            mark_member_done=AsyncMock(),
+        ))
+        server = await self._lane_holding(tmp_path, current, train)
+
+        response = await call_merge_cancel(server, request_id=train.request_id)
+
+        assert response['cancelled'] is False
+        assert response['state'] is MergeState.queued
+        assert response['code'] == 'train_cancel_unsupported'
+        assert 'Block the member' in response['reason']
+        assert not train.result.done()
+        assert self._escalations(tmp_path) == []

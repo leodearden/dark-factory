@@ -33,6 +33,8 @@ The concrete check that proves an assumed capability exists, with command + pass
 - Web/service project: "the route exists in the router table"; "the migration adds the column".
 - If the project has no such substrate, say so → G3 reduces to the generic manual check.
 
+Separately from the verifier, and optionally, name the **manifest-pointer resolver**: the command that resolves a capability manifest's `grep:` pointers (`gates.md` → *Capability Manifest* → *Evidence pointers*). It is its own field, not one more kind of verifier, and does not replace the one above. Decompose mode runs it over a new manifest before committing it, and a failure blocks the commit; without one, the pointers are checked by hand.
+
 ### 4. G1 integration-seam catalogue (optional)
 If the project has a fixed set of legitimate in-system integration seams (dispatch points, route table, plugin registry), list them so an in-system mechanism's named consumer must plug into a catalogued seam, and a NEW seam is flagged as a G4 design question.
 
@@ -73,7 +75,7 @@ project_root: <abs path>
 PRD path: <convention>
 
 ## G2 signals      — <project-specific signal types>
-## G3 verifier     — <command + semantics, or "none">
+## G3 verifier     — <command + semantics, or "none">; manifest-pointer resolver: <command, or "none">
 ## G5 seams        — <load-bearing seams; threshold overrides>
 ## G6 domain       — numerical | not; <hazards>
 ## Exemplars       — <paths by shape>

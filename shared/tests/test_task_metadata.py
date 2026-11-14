@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import copy
 import json
+import re
+from datetime import UTC, datetime, timedelta
 from typing import get_args
 
 import pytest
@@ -37,8 +39,12 @@ from shared.task_metadata import (
     apply_migrations,
     parse_metadata,
     register_metadata_submodel,
+    script_root_kind_conflict,
     validate_model_overrides,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _assert_only_test_owned_registry_keys(added: set[str]) -> None:
@@ -169,6 +175,51 @@ class TestBeforeDone:
         with pytest.raises(ValidationError):
             BeforeDone(script='scripts/x.sh', timeout_secs=60, kind='bogus')  # type: ignore[arg-type]
 
+    def test_script_root_defaults_to_project(self):
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60)
+        assert bd.script_root == 'project'
+
+    def test_factory_script_root_accepted_on_predicate(self):
+        bd = BeforeDone(
+            script='scripts/x.sh', timeout_secs=60, kind='predicate', script_root='factory',
+        )
+        assert bd.script_root == 'factory'
+
+    @pytest.mark.parametrize('kind_fields', [{'kind': 'deploy'}, {}], ids=['explicit', 'default'])
+    def test_factory_script_root_rejected_on_deploy(self, kind_fields):
+        with pytest.raises(ValidationError) as excinfo:
+            BeforeDone(script='scripts/x.sh', timeout_secs=60, script_root='factory', **kind_fields)
+        assert 'script_root' in str(excinfo.value)
+        assert 'predicate' in str(excinfo.value)
+
+    @pytest.mark.parametrize('kind', ['deploy', 'predicate'])
+    def test_project_script_root_accepted_on_both_kinds(self, kind):
+        bd = BeforeDone(script='scripts/x.sh', timeout_secs=60, kind=kind, script_root='project')
+        assert bd.script_root == 'project'
+
+    def test_script_root_bogus_rejected(self):
+        with pytest.raises(ValidationError):
+            BeforeDone.model_validate(
+                {'script': 'scripts/x.sh', 'timeout_secs': 60, 'script_root': 'elsewhere'},
+            )
+
+    @pytest.mark.parametrize(
+        ('script_root', 'kind', 'refused'),
+        [
+            ('project', 'deploy', False),
+            ('project', 'predicate', False),
+            ('factory', 'predicate', False),
+            ('factory', 'deploy', True),
+        ],
+    )
+    def test_script_root_kind_conflict_matches_the_model(self, script_root, kind, refused):
+        conflict = script_root_kind_conflict(script_root, kind)
+
+        assert (conflict is not None) == refused
+        if conflict is not None:
+            with pytest.raises(ValidationError, match=re.escape(conflict)):
+                BeforeDone(script='scripts/x.sh', timeout_secs=60, kind=kind, script_root=script_root)
+
 
 class TestDoneProvenance:
     def test_merged_with_commit_constructs(self):
@@ -200,11 +251,17 @@ class TestDoneProvenance:
             DoneProvenance(kind='bogus')  # type: ignore[arg-type]
 
     def test_extra_subfields_retained_through_round_trip(self):
+        dp = DoneProvenance.model_validate(
+            {'kind': 'deterministic-deploy-scheduled', 'x_restart_reason': 'self-restart'}
+        )
+        assert dp.model_dump()['x_restart_reason'] == 'self-restart'
+
+    def test_scheduled_deploy_evidence_round_trips(self):
         dp = DoneProvenance(
             kind='deterministic-deploy-scheduled',
             unit='fused-memory.service',
-            transient_unit='fused-memory-restart-1234.service',  # type: ignore[call-arg]
-            fire_delay_secs=5,  # type: ignore[call-arg]
+            transient_unit='fused-memory-restart-1234.service',
+            fire_delay_secs=5,
         )
         dumped = dp.model_dump()
         assert dumped['transient_unit'] == 'fused-memory-restart-1234.service'
@@ -624,6 +681,77 @@ class TestMilestone:
         m = Milestone(mode='delayed', after_secs=604800, x_extra='keep')  # type: ignore[call-arg]
         dumped = m.model_dump()
         assert dumped['x_extra'] == 'keep'
+
+
+
+class TestMilestoneFired:
+    """``Milestone.fired(anchor, now)`` — the pure home of milestone semantics."""
+
+    NOW = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+
+    @staticmethod
+    def _dated(at: str) -> Milestone:
+        return Milestone.model_validate({'mode': 'dated', 'at': at})
+
+    @staticmethod
+    def _delayed(after_secs: int = 3600) -> Milestone:
+        return Milestone.model_validate({'mode': 'delayed', 'after_secs': after_secs})
+
+    def test_dated_in_the_past_fires(self):
+        assert self._dated('2026-11-03T12:00:00+00:00').fired(None, self.NOW)
+
+    def test_dated_at_now_fires(self):
+        assert self._dated(self.NOW.isoformat()).fired(None, self.NOW)
+
+    def test_dated_in_the_future_does_not_fire(self):
+        assert not self._dated('2026-11-05T12:00:00+00:00').fired(None, self.NOW)
+
+    def test_dated_naive_at_is_read_as_utc(self):
+        milestone = self._dated('2026-11-04T12:00:00')
+        assert milestone.fired(None, self.NOW)
+        assert not milestone.fired(None, self.NOW - timedelta(seconds=1))
+
+    def test_dated_ignores_anchor(self):
+        milestone = self._dated('2026-11-05T12:00:00+00:00')
+        assert not milestone.fired('2020-01-01T00:00:00+00:00', self.NOW)
+
+    @pytest.mark.parametrize('anchor', [None, ''], ids=['none', 'empty'])
+    def test_delayed_without_anchor_never_fires(self, anchor):
+        assert not self._delayed().fired(anchor, self.NOW)
+
+    def test_delayed_at_anchor_plus_after_secs_fires(self):
+        anchor = (self.NOW - timedelta(seconds=3600)).isoformat()
+        assert self._delayed(3600).fired(anchor, self.NOW)
+
+    def test_delayed_before_anchor_plus_after_secs_does_not_fire(self):
+        anchor = (self.NOW - timedelta(seconds=3599)).isoformat()
+        assert not self._delayed(3600).fired(anchor, self.NOW)
+
+    def test_delayed_naive_anchor_is_read_as_utc(self):
+        milestone = self._delayed(3600)
+        assert milestone.fired('2026-11-04T11:00:00', self.NOW)
+        assert not milestone.fired('2026-11-04T11:00:01', self.NOW)
+
+    def test_delayed_unparseable_anchor_raises(self):
+        with pytest.raises(ValueError):
+            self._delayed().fired('not-a-timestamp', self.NOW)
+
+    @pytest.mark.parametrize('anchor', [12345, 0], ids=['int', 'falsy_int'])
+    def test_delayed_non_string_anchor_raises_value_error(self, anchor):
+        with pytest.raises(ValueError):
+            self._delayed().fired(anchor, self.NOW)
+
+    @pytest.mark.parametrize(
+        ('after_secs', 'anchor'),
+        [
+            pytest.param(10**12, '2026-11-01T00:00:00+00:00', id='date_out_of_range'),
+            pytest.param(10**15, '2026-11-01T00:00:00+00:00', id='int_too_large_for_c'),
+            pytest.param(1, '9999-12-31T23:59:59', id='anchor_at_datetime_max'),
+        ],
+    )
+    def test_delayed_unrepresentable_deadline_raises_value_error(self, after_secs, anchor):
+        with pytest.raises(ValueError):
+            self._delayed(after_secs).fired(anchor, self.NOW)
 
 
 class TestRecurrence:
@@ -1925,6 +2053,23 @@ class TestParseMetadataFailurePolicy:
         with pytest.raises((ValidationError, TypeError)):
             parse_metadata({_DEPLOY_STATE_STUB_KEY: [1, 2]}, direction='write', enforce=True)
 
+    # A RootModel submodel raises a bare ValueError, not ValidationError, when
+    # the splatted mapping carries a `root` key beside any other key.
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            pytest.param({'deferral': {'root': 1, 'kind': 'x'}}, id='deferral'),
+            pytest.param(
+                {'cancel_dispositions': [{'root': 1, 'parent': 'x'}]}, id='cancel_dispositions'
+            ),
+        ],
+    )
+    def test_a_root_model_slice_with_a_root_key_read_warns_never_raises(self, raw):
+        (key,) = raw
+        model, warnings = parse_metadata(raw, direction='read')
+        assert [(w.field, w.code) for w in warnings] == [(key, 'invalid_submodel')]
+        assert model.model_dump()[key] == raw[key]
+
     def test_x_prefixed_unknown_key_silent_zero_warnings(self):
         model, warnings = parse_metadata({'x_experimental': 'v'}, direction='write')
         assert warnings == []
@@ -2029,6 +2174,27 @@ class TestParseMetadataFailurePolicy:
             w for w in warnings if w.code == 'unknown_key' and w.field == 'files_tagged_at'
         ]
         assert offending == [], f'Expected no unknown_key warning for files_tagged_at; got: {offending}'
+
+    def test_dedupe_skipped_metadata_key_is_blessed(self):
+        """The task curator's no-dedupe-verdict marker must not census-warn (task 4503).
+
+        Stamped on every create the curator's dedupe pass did not judge, and
+        the key a re-dedupe sweep selects on. The unblessed control key shows
+        the scan is live for this blob.
+        """
+        _, warnings = parse_metadata(
+            {
+                'dedupe_skipped': {
+                    'reason': 'create: curator-failed: llm unavailable',
+                    'at': '2026-10-18T12:00:00+00:00',
+                },
+                'dedupe_skipped_control': 'v',
+            },
+            direction='read',
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'dedupe_skipped' not in unknown_key_fields
+        assert 'dedupe_skipped_control' in unknown_key_fields
 
     def test_recurrence_metadata_key_is_blessed(self):
         """The recurring-chain link spec is deliberately blessed AND registered (task 4676).
@@ -2315,6 +2481,23 @@ class TestParseMetadataFailurePolicy:
             f'{near_miss_alias} must stay unblessed so its drift line keeps appearing '
             f'in the census; got warnings: {warnings}'
         )
+
+    def test_cancel_with_children_keys_are_known(self):
+        """`superseded_by` and `cancel_dispositions` never census-warn (plans/cancel-with-children-prd.md §4.8)."""
+        _, warnings = parse_metadata(
+            {'superseded_by': [8032], 'cancel_dispositions': []}, direction='read'
+        )
+
+        assert [w for w in warnings if w.code == 'unknown_key'] == []
+
+    def test_superseded_by_tier_b_alias_still_warns(self):
+        """`subsumed_by` is the one un-prefixed Tier-B alias of `superseded_by`, so it carries the drift line.
+
+        The row's `x_`-prefixed aliases are Tier-C silent by the parser's `x_` rule (esc-8142-1).
+        """
+        _, warnings = parse_metadata({'subsumed_by': [8032]}, direction='read')
+
+        assert 'subsumed_by' in {w.field for w in warnings if w.code == 'unknown_key'}
 
     def test_execution_class_metadata_key_is_blessed(self):
         """The recon-stage execution-class discriminator must not census-warn (task 3780).
@@ -2685,7 +2868,7 @@ class TestParseMetadataFailurePolicy:
 
     @pytest.mark.parametrize('blob', _NON_OBJECT_BLOBS)
     def test_non_object_blob_read_warns_never_raises(self, blob):
-        model, warnings = parse_metadata(blob, direction='read')  # type: ignore[arg-type]
+        model, warnings = parse_metadata(blob, direction='read')
         assert model == TaskMetadata()
         assert len(warnings) == 1
         assert warnings[0].code == 'not_an_object'
@@ -2693,7 +2876,7 @@ class TestParseMetadataFailurePolicy:
 
     @pytest.mark.parametrize('blob', _NON_OBJECT_BLOBS)
     def test_non_object_blob_write_warn_mode_accepts(self, blob):
-        model, warnings = parse_metadata(  # type: ignore[arg-type]
+        model, warnings = parse_metadata(
             blob, direction='write', enforce=False
         )
         assert model == TaskMetadata()
@@ -2703,7 +2886,20 @@ class TestParseMetadataFailurePolicy:
     @pytest.mark.parametrize('blob', _NON_OBJECT_BLOBS)
     def test_non_object_blob_write_enforce_raises(self, blob):
         with pytest.raises((TypeError, ValueError)):
-            parse_metadata(blob, direction='write', enforce=True)  # type: ignore[arg-type]
+            parse_metadata(blob, direction='write', enforce=True)
+
+    def test_non_str_non_dict_python_value_is_not_an_object(self):
+        results = [
+            (parse_metadata(42, direction='read'), 'int'),
+            (parse_metadata(1.5, direction='read'), 'float'),
+            (parse_metadata(False, direction='read'), 'bool'),
+            (parse_metadata(['a'], direction='read'), 'list'),
+        ]
+        for (model, warnings), type_name in results:
+            assert model == TaskMetadata()
+            assert len(warnings) == 1, (type_name, warnings)
+            assert warnings[0].code == 'not_an_object'
+            assert warnings[0].message.endswith(f'got {type_name}')
 
 
 class _CheckStub(BaseModel):

@@ -112,10 +112,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fused_memory.models.scope import Scope
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('prune_recon_cycle_summaries')
 
@@ -698,7 +695,7 @@ async def run(
     # Placing it here also saves the dominant cost of a doomed run: the scan
     # loop issues one ``scroll_by_metadata`` plus a conditional
     # ``count_by_metadata`` PER PROJECT, and ``--project-id`` is optional.
-    # That saving is scoped to ``run``, and the message below is worded to
+    # That saving is scoped to ``run``, and the extra_detail below is worded to
     # match rather than claiming a doomed --apply costs nothing: ``main`` has
     # already constructed the MemoryService and awaited ``initialize()`` before
     # this function is entered. Neither mutates, so what is claimed -- no
@@ -710,21 +707,15 @@ async def run(
     # only overrides the per-project deletable-count cap, so it must not gate
     # this.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(operation='prune_recon_cycle_summaries --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'prune_recon_cycle_summaries: --apply NOT started (fail-closed) -- '
-                "this process cannot write mem0's history directory, so a prune "
-                'would delete Qdrant points and then fail to write their history, '
-                'destroying cycle summaries that would survive nowhere but this '
-                'run\'s log. No project was scanned and nothing was mutated. Route the '
-                'prune through the fused-memory MCP server (the unsandboxed owner '
-                'of the store), or re-run from an unsandboxed operator shell. To '
-                'obtain the prune report safely from anywhere, re-run without '
-                '--apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='prune_recon_cycle_summaries --apply',
+            logger=logger,
+            extra_detail=(
+                'a prune would delete Qdrant points and then fail to write their '
+                "history, destroying cycle summaries that would survive nowhere but "
+                "this run's log. No project was scanned and nothing was mutated."
+            ),
+        )
 
     if known_projects_map is None:
         from fused_memory.config.schema import FusedMemoryConfig as _FMC  # noqa: PLC0415

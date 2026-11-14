@@ -23,6 +23,8 @@ import pytest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.routing import PlanShape, RoleDefaults, RouteInputs, resolve_route
 
+pytestmark = pytest.mark.usefixtures("code_default_config")
+
 # Deliberately nonsense -- config/policy_rule always win for these known
 # roles (each has a config field), so a sentinel role_defaults value makes a
 # silent role_default-layer fallback (a bug where the config/policy_rule
@@ -32,17 +34,6 @@ _SENTINEL_ROLE_DEFAULTS = RoleDefaults(
     model='role-default-sentinel', effort='role-default-sentinel',
     budget_usd=-1.0, max_turns=-1,
 )
-
-
-@pytest.fixture(autouse=True)
-def _isolated_config_env(monkeypatch, tmp_path):
-    """Every OrchestratorConfig() built in this module reads ONLY the
-    package's shipped defaults.yaml -- no stray project config.yaml, no
-    ambient ORCH_CONFIG_PATH. Mirrors test_routing_byte_equivalence.py's
-    per-test convention.
-    """
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
 
 
 def _inputs_for(role_name: str, *, plan_shape: PlanShape | None = None) -> RouteInputs:

@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_checkouts import git, main_checkout_with_lane
 from _markup_helpers import (
     INVOKE_CLOSER,
     LT,
@@ -187,7 +188,7 @@ class Harness:
 
     @property
     def plan_path(self) -> Path:
-        return self.artifacts.root / 'plan.json'
+        return self.artifacts.artifact_path('plan.json')
 
     def plan_bytes(self) -> bytes:
         return self.plan_path.read_bytes()
@@ -1249,11 +1250,11 @@ class TestUnrepairableResidueIsPreserved:
     ):
         """The record is filed under a NON-TASK anchor, and that is deliberate.
 
-        The middleware declares residue at ``level=2``, and a PENDING level>=2
-        escalation carrying a live task id is a stop-the-line event in this
-        repo: ``workflow._is_gating_escalation`` gates on ``level >= 2``,
+        The middleware declares residue at ``level=2``, and a PENDING non-info
+        level>=2 escalation carrying a live task id is a stop-the-line event in this
+        repo: ``workflow._is_gating_escalation`` gates on a non-info ``level >= 2``,
         ``_check_escalations`` looks records up by task id alone, and
-        ``_wait_for_resolution`` raises ``_StewardReescalated`` — which
+        ``_wait_for_resolution`` raises ``_NoStewardApplicable`` — which
         ``run()`` turns into ``_mark_blocked``.
 
         So filing under the leaking task's own id would turn ONE leaked tool
@@ -1548,7 +1549,7 @@ class TestTheStormEscape:
                 'crossing_subject_agent_role': None,
                 'callers': [],
             },
-            plan_tools._MARKUP_SINK_SPEC,
+            plan_tools.MARKUP_SINK_SPEC,
         )
 
     def test_the_open_records_subject_reads_back_through_one_spelling(self):
@@ -1802,7 +1803,7 @@ class TestTheStormEscape:
                 'callers': [spoof],
             },
             'test-1',
-            plan_tools._MARKUP_SINK_SPEC,
+            plan_tools.MARKUP_SINK_SPEC,
         )
 
         assert spoof not in detail, 'the raw newline reached the body verbatim'
@@ -1914,13 +1915,6 @@ class TestTheStormEscape:
 # data exactly where this leaf promises none is lost.
 
 
-def _git(*args: str, cwd: Path) -> None:
-    """Run one git command in *cwd*, failing loudly."""
-    subprocess.run(
-        ['git', *args], cwd=str(cwd), check=True, capture_output=True, text=True,
-    )
-
-
 class TestWhereTheRecordLands:
     """``_markup_project_root`` decides which queue every record reaches."""
 
@@ -1932,7 +1926,7 @@ class TestWhereTheRecordLands:
         """
         checkout = tmp_path / 'repo'
         checkout.mkdir()
-        _git('init', cwd=checkout)
+        git('init', cwd=checkout)
 
         assert plan_tools._markup_project_root(checkout) == checkout.resolve()
 
@@ -1944,13 +1938,7 @@ class TestWhereTheRecordLands:
         would answer with the lane itself, filing each record into a directory
         that is deleted when the lane is reset.
         """
-        checkout = tmp_path / 'repo'
-        checkout.mkdir()
-        _git('init', cwd=checkout)
-        _git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit',
-             '--allow-empty', '-m', 'root', cwd=checkout)
-        lane = tmp_path / 'lane'
-        _git('worktree', 'add', str(lane), '-b', 'task/1', cwd=checkout)
+        checkout, lane = main_checkout_with_lane(tmp_path)
 
         assert plan_tools._markup_project_root(lane) == checkout.resolve()
         assert plan_tools._markup_project_root(lane) != lane.resolve()

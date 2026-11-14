@@ -36,8 +36,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.git_ops import GitOps
-from orchestrator.landed_outbox import LandedOutbox, LandedRow
-from orchestrator.merge_queue import SpeculativeMergeWorker
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 # ---------------------------------------------------------------------------
 # step-1 — record() + lookup() round-trip across a simulated restart
@@ -224,7 +224,7 @@ def _restore_merge_provenance_binding():
     (not at module scope) so this fixture itself does not exist — and thus
     cannot break collection — until step-10 defines MergeProvenance.
     """
-    from orchestrator.landed_outbox import MergeProvenance
+    from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
     original = MergeProvenance._outbox
     yield
@@ -237,7 +237,7 @@ class TestMergeProvenanceFacade:
     def test_lookup_with_nothing_bound_returns_none(
         self, _restore_merge_provenance_binding: None,
     ) -> None:
-        from orchestrator.landed_outbox import MergeProvenance
+        from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
         MergeProvenance._outbox = None  # explicit: nothing bound
         assert MergeProvenance.lookup('42') is None
@@ -245,7 +245,7 @@ class TestMergeProvenanceFacade:
     def test_lookup_routes_to_bound_outbox(
         self, tmp_path: Path, _restore_merge_provenance_binding: None,
     ) -> None:
-        from orchestrator.landed_outbox import MergeProvenance
+        from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
         outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
         row = LandedRow(task_id='42', branch_tip_sha='a', advanced_sha='b', landed_at=1.0)
@@ -270,7 +270,7 @@ class TestMergeProvenanceConsume:
     def test_consume_prunes_bound_outbox_durably(
         self, tmp_path: Path, _restore_merge_provenance_binding: None,
     ) -> None:
-        from orchestrator.landed_outbox import MergeProvenance
+        from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
         path = tmp_path / 'landed_outbox.json'
         outbox = LandedOutbox(path)
@@ -290,7 +290,7 @@ class TestMergeProvenanceConsume:
     def test_consume_with_nothing_bound_is_noop(
         self, _restore_merge_provenance_binding: None,
     ) -> None:
-        from orchestrator.landed_outbox import MergeProvenance
+        from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
         MergeProvenance._outbox = None  # explicit: nothing bound
         # Fail-safe: must not raise (mirrors lookup's unbound contract).
@@ -299,7 +299,7 @@ class TestMergeProvenanceConsume:
     def test_consume_absent_id_is_idempotent_noop(
         self, tmp_path: Path, _restore_merge_provenance_binding: None,
     ) -> None:
-        from orchestrator.landed_outbox import MergeProvenance
+        from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
         outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
         MergeProvenance.bind(outbox)
@@ -321,7 +321,7 @@ class TestSpeculativeMergeWorkerHoldsLandedOutbox:
     def test_worker_holds_and_binds_landed_outbox(
         self, tmp_path: Path, _restore_merge_provenance_binding: None,
     ) -> None:
-        from orchestrator.landed_outbox import MergeProvenance
+        from orchestrator.merge_lane.landed_outbox import MergeProvenance
 
         git_ops = MagicMock(spec=GitOps)
         git_ops.project_root = tmp_path

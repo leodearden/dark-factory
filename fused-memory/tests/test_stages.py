@@ -11,8 +11,11 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _clip_assertions import assert_elided
 from _flag_for_stage2_pool_fake import LiveFlagPool
+from _fm_git_repos import init_ab_commit_repo, init_merge_history_repo
 from _fm_helpers import (
+    LoopFreedomProbe,
     as_async_run_git,
     assert_id_title_pairing,
     complete_paged_read,
@@ -24,7 +27,9 @@ from _fused_memory_tool_surface import (
     registered_fused_memory_tools,
 )
 from _tool_surface_classification import assert_tool_surface_classified
+from reconciliation.harness_fixtures import make_harness
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
@@ -42,7 +47,9 @@ from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_CONSOLIDATION_OP,
     DISALLOW_CONSOLIDATION_PROPOSALS,
+    DISALLOW_ESCALATION_MERGE_LANE_CONTROL,
     DISALLOW_ESCALATION_READS,
+    DISALLOW_ESCALATION_RUNTIME_READS,
     DISALLOW_ESCALATION_WRITES,
     DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES,
     DISALLOW_MEMORY_WRITES,
@@ -56,6 +63,9 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _extract_report,
     _normalize_report,
     run_stage_via_cli,
+)
+from fused_memory.reconciliation.consolidation_auto_executor import (
+    auto_consolidation_initial_stats,
 )
 from fused_memory.reconciliation.live_workflow_section import NO_PER_TASK_SIGNAL_TOKEN
 from fused_memory.reconciliation.prompts import (
@@ -73,18 +83,21 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
     _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS,
     _FLAGGED_ITEMS_CHAR_BUDGET,
+    STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS,
     IntegrityCheck,
     TaskKnowledgeSync,
     _format_flagged,
     _git_show_name_only,
     _needs_hint_attention,
-    _queue_briefing_refresh_tasks,
     _render_done_provenance_section,
     _run_briefing_known_gaps_script,
     _select_proactive_sample,
     _suppress_same_run_human_operator_dups,
     _sweep_stale_mem0_flag_for_stage2_markers,
+    _sweep_stale_mem0_flag_markers,
+    queue_briefing_refresh_tasks,
     retire_flag_markers_for_terminal_task,
+    select_tasks_needing_hint_attention,
 )
 from fused_memory.reconciliation.standing_decision_constants import (
     CATEGORY_STANDING_DECISION_STORM,
@@ -206,20 +219,27 @@ class TestMockTypesConstant:
 #     record the caller holds and has just mutated, in the queue it is connected
 #     to — never an arbitrary per-task query, so it answers no existence
 #     question either.
-#   - merge_* / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
-#     reload_config / get_task_runtime_state — orchestrator control-plane and
-#     merge-lane surface, unrelated to the escalation-record question.
+#   - merge_* (except merge_relane, denied by DISALLOW_ESCALATION_MERGE_LANE_CONTROL) / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
+#     reload_config — orchestrator control-plane and merge-lane surface,
+#     unrelated to the escalation-record question.
 #
 # This is the reviewed-safe half of the classification asserted by
-# test_every_escalation_server_tool_is_classified; the denied half is
-# DISALLOW_ESCALATION_READS plus DISALLOW_ESCALATION_WRITES. Adding a name here is a decision that the tool
+# test_every_escalation_server_tool_is_classified; the denied half is every
+# DISALLOW_ESCALATION_* bucket in that test's map. Adding a name here is a decision that the tool
 # cannot mislead a stage about the reconciliation queue — not a formality.
 _REVIEWED_STAGE_SAFE = {
     # amend_escalation (task 4886) acts on a record the caller already holds
     # an id for and reads no per-task state, so against the reconciliation
     # queue it can only ever answer "not found" — never a categorical [].
     'mcp__escalation__amend_escalation',
+    # claim_policy_class (task 8422) refuses every identity except the
+    # escalation executor, so a recon stage can only ever be refused; it reads
+    # no per-task state.
+    'mcp__escalation__claim_policy_class',
     'mcp__escalation__claim_warm_worktree',
+    # clear_verify_host_quarantine (task 6565) is merge-lane control plane: it
+    # re-admits a benched verify host and reads no per-task escalation state.
+    'mcp__escalation__clear_verify_host_quarantine',
     # declare_pin (task 4377) is stamp_triage's structural twin: a
     # restrictive-only write that marks a record as load-bearing.  Against the
     # reconciliation queue it can only ever answer "not found" — it reads no
@@ -228,7 +248,6 @@ _REVIEWED_STAGE_SAFE = {
     'mcp__escalation__declare_pin',
     'mcp__escalation__get_merge_halt_status',
     'mcp__escalation__get_merge_queue',
-    'mcp__escalation__get_task_runtime_state',
     'mcp__escalation__halt_merge_queue',
     'mcp__escalation__halt_scheduler',
     'mcp__escalation__merge_cancel',
@@ -463,14 +482,19 @@ class TestDisallowedToolLists:
         ``..._the_three_read_tools`` when the fourth member landed, and a name
         that promises a count forces a rename on every accession (and reads as a
         lie in between — see the RETIRED ASSERTION note above).
+
+        ``resolve_escalation_shas`` joined it in task 5751: a by-id record read,
+        denied for the same reason as ``get_escalation`` (against the
+        reconciliation queue it can only answer not-found).
         """
         assert set(DISALLOW_ESCALATION_READS) == {
             'mcp__escalation__get_pending_escalations',
             'mcp__escalation__get_escalation',
             'mcp__escalation__get_task_escalations',
             'mcp__escalation__get_task_escalation_history',
+            'mcp__escalation__resolve_escalation_shas',
         }
-        assert len(DISALLOW_ESCALATION_READS) == 4, 'no duplicate entries'
+        assert len(DISALLOW_ESCALATION_READS) == 5, 'no duplicate entries'
 
     def test_every_escalation_server_tool_is_classified(self):
         """Every tool the SHARED escalation server registers is denied or reviewed.
@@ -511,7 +535,9 @@ class TestDisallowedToolLists:
             registered,
             {
                 'DISALLOW_ESCALATION_READS': DISALLOW_ESCALATION_READS,
+                'DISALLOW_ESCALATION_RUNTIME_READS': DISALLOW_ESCALATION_RUNTIME_READS,
                 'DISALLOW_ESCALATION_WRITES': DISALLOW_ESCALATION_WRITES,
+                'DISALLOW_ESCALATION_MERGE_LANE_CONTROL': DISALLOW_ESCALATION_MERGE_LANE_CONTROL,
                 '_REVIEWED_STAGE_SAFE': _REVIEWED_STAGE_SAFE,
             },
             remedy=(
@@ -519,7 +545,11 @@ class TestDisallowedToolLists:
                 '(cli_stage_runner.py) if a stage must not call it — the default for '
                 'anything that READS per-task escalation state, since a stage is wired '
                 'to the reconciliation queue and would read a categorical [] as proof '
-                'of absence — or to DISALLOW_ESCALATION_WRITES if it FILES an '
+                'of absence — or to DISALLOW_ESCALATION_RUNTIME_READS if, with no '
+                'orchestrator harness attached, it answers a silent empty-but-live '
+                'result instead of an error (a runtime read that fails loudly '
+                'standalone, like get_merge_queue, is reviewed-safe) — or to '
+                'DISALLOW_ESCALATION_WRITES if it FILES an '
                 'escalation (denied in Stage 1/3, kept by Stage 2 for FIX D), or to '
                 '_REVIEWED_STAGE_SAFE here once you have confirmed it is harmless '
                 'against that store.'
@@ -635,6 +665,20 @@ class TestDisallowedToolLists:
             assert set(DISALLOW_ESCALATION_WRITES).issubset(set(stage_list)), (
                 f'{name} must deny the escalation filing tools'
             )
+
+    def test_merge_relane_is_denied_in_every_stage(self):
+        """Operator merge-lane control: no reconciliation stage may re-prioritise merges."""
+        deps = _mock_stage_deps()
+        assert DISALLOW_ESCALATION_MERGE_LANE_CONTROL == ['mcp__escalation__merge_relane']
+        for stage_list in (STAGE1_DISALLOWED, STAGE2_DISALLOWED, STAGE3_DISALLOWED):
+            assert set(DISALLOW_ESCALATION_MERGE_LANE_CONTROL).issubset(set(stage_list))
+        for cls, stage_id in (
+            (MemoryConsolidator, StageId.memory_consolidator),
+            (TaskKnowledgeSync, StageId.task_knowledge_sync),
+            (IntegrityCheck, StageId.integrity_check),
+        ):
+            hook = set(cls(stage_id, **deps).get_disallowed_tools())
+            assert set(DISALLOW_ESCALATION_MERGE_LANE_CONTROL).issubset(hook)
 
     def test_escalate_blocker_stays_allowed_in_stage2_only(self):
         """Stage 2 keeps both filing tools for FIX D; Stages 1 and 3 deny escalate_blocker."""
@@ -1302,7 +1346,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
     """assemble_payload renders a since-boundary Done-Task Completion-Memory Audit (step-5).
 
     The audit enumerates every done task updated at/after the watermark's
-    ``last_full_run_completed`` boundary (not a fixed 5-item sample), so
+    ``last_task_change_timestamp`` boundary (not a fixed 5-item sample), so
     completion-memory gaps outside the small Proactive Task Sample are no longer
     systematically missed as done-task throughput grows.
     """
@@ -1341,7 +1385,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
             ],
         }
 
-        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        wm = Watermark(project_id='p', last_task_change_timestamp=boundary)
         payload = await stage.assemble_payload([], wm, [])
 
         assert '### Done-Task Completion-Memory Audit' in payload, (
@@ -1354,6 +1398,47 @@ class TestTaskKnowledgeSyncDoneAuditSection:
             'a done task updated before the boundary must be excluded from the audit section'
         )
         assert '[8900]' not in section, 'an active task must never appear in the done-task audit'
+
+    @pytest.mark.asyncio
+    async def test_audit_window_starts_at_task_change_timestamp_not_completion(
+        self, mock_deps, tmp_path
+    ):
+        """The audit starts at the previous run's start, so a task done mid-run is audited.
+
+        This is the Stage 2 half of the done-audit invariant. The harness half, that
+        the persisted ``last_task_change_timestamp`` is the run's start, is
+        tests/reconciliation/test_recon_window_anchor.py::test_task_done_mid_cycle_is_inside_next_cycles_task_change_window.
+        """
+        previous_run_started = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
+        previous_run_completed = datetime(2026, 7, 14, 12, 30, 0, tzinfo=UTC)
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='p', project_root=str(tmp_path)
+        )
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                {'id': 8811, 'status': 'done', 'title': 'Done mid-previous-run',
+                 'updatedAt': '2026-07-14T12:10:00.000Z'},
+                {'id': 8812, 'status': 'done', 'title': 'Done before the previous run',
+                 'updatedAt': '2026-07-14T11:00:00.000Z'},
+                {'id': 8813, 'status': 'done', 'title': 'Done after the previous run',
+                 'updatedAt': '2026-07-14T13:00:00.000Z'},
+            ],
+        }
+
+        wm = Watermark(
+            project_id='p',
+            last_task_change_timestamp=previous_run_started,
+            last_full_run_completed=previous_run_completed,
+        )
+        payload = await stage.assemble_payload([], wm, [])
+
+        section = _extract_section(payload, '### Done-Task Completion-Memory Audit')
+        assert '[8811]' in section
+        assert '[8813]' in section
+        assert '[8812]' not in section
+        boundary_line = next(ln for ln in section.splitlines() if ln.startswith('Boundary'))
+        assert previous_run_started.isoformat() in boundary_line
+        assert previous_run_completed.isoformat() not in boundary_line
 
     @pytest.mark.asyncio
     async def test_audit_section_render_cap_drops_oldest_with_overflow_note(
@@ -1392,7 +1477,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
         ]
         mock_deps['taskmaster'].get_tasks.return_value = {'tasks': tasks}
 
-        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        wm = Watermark(project_id='p', last_task_change_timestamp=boundary)
         payload = await stage.assemble_payload([], wm, [])
 
         section = _extract_section(payload, '### Done-Task Completion-Memory Audit')
@@ -1443,7 +1528,7 @@ class TestTaskKnowledgeSyncDoneAuditSection:
             ],
         }
 
-        wm = Watermark(project_id='p', last_full_run_completed=boundary)
+        wm = Watermark(project_id='p', last_task_change_timestamp=boundary)
         payload = await stage.assemble_payload([], wm, [])
 
         assert '### Done-Task Completion-Memory Audit' not in payload, (
@@ -1643,139 +1728,10 @@ class TestDoneProvenanceSection:
             'scope': _scope('test_project', '/tmp/test'),
         }
 
-    @staticmethod
-    def _init_repo(path):
-        import subprocess
-        subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
-        subprocess.run(
-            ['git', '-C', str(path), 'config', 'user.email', 't@e.example'], check=True,
-        )
-        subprocess.run(
-            ['git', '-C', str(path), 'config', 'user.name', 'T'], check=True,
-        )
-        (path / 'a.txt').write_text('a\n')
-        (path / 'b.txt').write_text('b\n')
-        subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
-        subprocess.run(
-            ['git', '-C', str(path), 'commit', '-q', '-m', 'feat: ship a + b'],
-            check=True,
-        )
-        return subprocess.run(
-            ['git', '-C', str(path), 'rev-parse', 'HEAD'],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-
-    @staticmethod
-    def _init_repo_with_merge(path):
-        """Build a repo with a single-parent commit, a clean --no-ff merge,
-        and a --no-ff merge that resolves a real conflict.
-
-        Commit graph on ``main``:
-
-          1. ``single`` — adds a.txt + b.txt (a genuine single-parent commit,
-             used to pin ``--first-parent -m`` as a no-op on non-merge commits).
-          2. a ``feature`` branch off commit 1 adds feature.py plus
-             extra_1.py..extra_4.py (five files total, so max_files
-             truncation is reachable for merge provenance — see
-             test_merge_commit_file_list_respects_max_files_truncation);
-             main then merges it via ``git merge --no-ff`` — recorded as
-             ``merge``. Plain ``git show --name-only`` reports NOTHING for
-             this commit (git's combined diff is empty for a clean merge);
-             this is the fixture that reproduces the Stage-2 provenance bug.
-          3. a ``conflict`` branch off commit 1 edits a.txt and adds
-             conflict_only.py; main separately edits a.txt after ``merge``.
-             Merging ``conflict`` into main therefore CONFLICTS on a.txt —
-             resolved by hand and committed, recorded as ``conflict_merge``.
-             This pins the OTHER, worse symptom the task's analysis found:
-             plain ``git show --name-only`` on a merge that resolved a
-             conflict reports ONLY the conflict-resolution file(s), silently
-             omitting every non-conflicting file the branch also brought in
-             (measured on this repo's own history: commit a75568bd11 showed
-             1 file under the bare invocation vs. 6 real first-parent files,
-             none of which was that 1 file — see
-             test_merge_commit_with_resolved_conflict_reports_full_first_parent_file_list).
-             ``conflict_only.py`` deliberately does NOT reuse the
-             feature/extra_* names from scenario 2: this branch forks off
-             ``single`` (before the feature merge), so those names are free
-             to reuse on disk, but doing so would make feature.py conflict
-             too (both sides would have independently "added" it), muddying
-             the one conflict this scenario needs.
-
-        Mirrors the branch/merge sequence in
-        fused-memory/tests/test_audit_found_on_main_provenance.py::_build_test_repo,
-        including its defensive ``commit.gpgsign false`` + ``--no-verify`` on
-        every commit, so a developer's global gpgsign setting or a stray hook
-        can't hang or fail this throwaway repo.
-
-        Returns a dict of full 40-char SHAs:
-        ``{'single': ..., 'merge': ..., 'conflict_merge': ...}``.
-        Does NOT modify ``_init_repo`` — five pre-existing tests depend on its
-        exact linear shape and single-SHA return value.
-        """
-        import subprocess
-
-        def _git(*args):
-            return subprocess.run(
-                ['git', '-C', str(path), *args], check=True, capture_output=True, text=True,
-            ).stdout.strip()
-
-        subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
-        _git('config', 'user.email', 't@e.example')
-        _git('config', 'user.name', 'T')
-        _git('config', 'commit.gpgsign', 'false')
-
-        (path / 'a.txt').write_text('a\n')
-        (path / 'b.txt').write_text('b\n')
-        _git('add', '-A')
-        _git('commit', '-q', '--no-verify', '-m', 'feat: ship a + b')
-        single = _git('rev-parse', 'HEAD')
-
-        _git('checkout', '-q', '-b', 'feature')
-        (path / 'feature.py').write_text('feature = 1\n')
-        for i in range(1, 5):
-            (path / f'extra_{i}.py').write_text(f'extra_{i} = 1\n')
-        _git('add', '-A')
-        _git('commit', '-q', '--no-verify', '-m', 'feat: add feature')
-        _git('checkout', '-q', 'main')
-        _git('merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge feature into main', 'feature')
-        merge = _git('rev-parse', 'HEAD')
-
-        # A second branch that edits a.txt independently of main's own later
-        # edit of the same file — merging it conflicts, exercising the
-        # (worse) symptom where a bare `git show` on a resolved-conflict
-        # merge reports only the conflicted path and hides everything else.
-        _git('checkout', '-q', '-b', 'conflict', single)
-        (path / 'a.txt').write_text('a-conflict-branch\n')
-        (path / 'conflict_only.py').write_text('conflict_only = 1\n')
-        _git('add', '-A')
-        _git('commit', '-q', '--no-verify', '-m', 'feat: edit a.txt on conflict branch')
-        _git('checkout', '-q', 'main')
-        (path / 'a.txt').write_text('a-main-edit\n')
-        _git('add', '-A')
-        _git('commit', '-q', '--no-verify', '-m', 'chore: edit a.txt on main after feature merge')
-
-        # Deliberately not using `_git` (check=True): a real conflict makes
-        # `git merge` exit 1 and leave conflict markers instead of a commit.
-        conflict_result = subprocess.run(
-            ['git', '-C', str(path), 'merge', '--no-ff', '--no-verify', '-q',
-             '-m', 'Merge conflict into main', 'conflict'],
-            capture_output=True, text=True,
-        )
-        assert conflict_result.returncode != 0, (
-            'expected a.txt to conflict (both branches edited it since the '
-            'common ancestor); merge unexpectedly succeeded cleanly'
-        )
-        (path / 'a.txt').write_text('a-resolved\n')
-        _git('add', 'a.txt')
-        _git('commit', '-q', '--no-verify', '-m', 'Merge conflict into main (resolved)')
-        conflict_merge = _git('rev-parse', 'HEAD')
-
-        return {'single': single, 'merge': merge, 'conflict_merge': conflict_merge}
-
     @pytest.mark.asyncio
     async def test_commit_provenance_renders_file_list(self, mock_deps, tmp_path):
         """Task with commit provenance → git show file list injected."""
-        sha = self._init_repo(tmp_path)
+        sha = init_ab_commit_repo(tmp_path)
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='p', project_root=str(tmp_path))
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [{
@@ -1838,7 +1794,7 @@ class TestDoneProvenanceSection:
     @pytest.mark.asyncio
     async def test_invalid_commit_gracefully_omits_file_list(self, mock_deps, tmp_path):
         """Unresolvable commit → section header emitted, no file list, no exception."""
-        self._init_repo(tmp_path)
+        init_ab_commit_repo(tmp_path)
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='p', project_root=str(tmp_path))
         bad = 'deadbeef' * 5  # 40 chars but not a real SHA
         mock_deps['taskmaster'].get_tasks.return_value = {
@@ -1880,7 +1836,7 @@ class TestDoneProvenanceSection:
         against a misleading conflict-only subset naming files the task
         never actually touched.
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
 
         block = await _git_show_name_only(
             ProjectRoot(str(tmp_path)), shas['merge'], max_files=50, max_chars=2000,
@@ -1932,7 +1888,7 @@ class TestDoneProvenanceSection:
         (which does not conflict). The first-parent file list for the
         resolved merge must contain BOTH — not just the conflicted a.txt.
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
 
         block = await _git_show_name_only(
             ProjectRoot(str(tmp_path)), shas['conflict_merge'], max_files=50, max_chars=2000,
@@ -1965,7 +1921,7 @@ class TestDoneProvenanceSection:
         ``-m``, which is exactly the change that would reintroduce
         per-parent diffs and duplicate/bogus paths.
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
 
         block = await _git_show_name_only(
             ProjectRoot(str(tmp_path)), shas['merge'], max_files=50, max_chars=2000,
@@ -2002,7 +1958,7 @@ class TestDoneProvenanceSection:
         derived from it, so it kept passing regardless of what the helper's
         actual argv was and pinned nothing about the implementation.)
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
 
         block = await _git_show_name_only(
             ProjectRoot(str(tmp_path)), shas['single'], max_files=50, max_chars=2000,
@@ -2025,7 +1981,7 @@ class TestDoneProvenanceSection:
         helper directly). Before the argv fix, this section rendered
         `commit: <sha>` with no `files:` entries at all for a clean merge.
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='p', project_root=str(tmp_path))
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [{
@@ -2053,7 +2009,7 @@ class TestDoneProvenanceSection:
         the test naturally — no pytest.raises is used because none should
         ever fire.
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
         bad_sha = 'deadbeef' * 5  # 40 chars but not a real SHA
 
         # rc != 0 path — well-formed but unresolvable commit against a real repo.
@@ -2084,7 +2040,7 @@ class TestDoneProvenanceSection:
         `... (N more)` marker — pinning that the marker isn't silently
         dropped now that it can actually fire for a merge.
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
 
         block = await _git_show_name_only(
             ProjectRoot(str(tmp_path)), shas['merge'], max_files=2, max_chars=2000,
@@ -2399,6 +2355,11 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # filters — the only place that increments this counter — never run,
             # leaving it at its __init__/reset value of 0.
             'stage1_undatable_freshness_records': 0,
+            # Always present (task 5499): None because no backlog payload was assembled.
+            'stage1_assembled_budget': None,
+            # Always present (task 4620); None because assemble_payload never ran
+            # here, so Stage 1 took no unfinished-Graphiti-write sample.
+            'stage1_unfinished_graphiti_write_start': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -2420,6 +2381,17 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # Always present (task 5626), pre-initialised before the
+            # remediation early-return; 0 here because no task completed.
+            'unlanded_path_check_checked': 0,
+            'unlanded_path_check_skipped': 0,
+            'unlanded_path_check_errors': 0,
+            'unlanded_path_check_flags_emitted': 0,
+            # The auto-consolidation post-step's keys (task 5240). This bare
+            # AsyncMock memory's enabled_projects contains nothing, so the
+            # post-step stops at its project gate.
+            **auto_consolidation_initial_stats(),
+            'auto_consolidations_skipped_project': 1,
             # THIRTEEN keys from the two stale-edge sweeps, not the four this
             # task added (task 4386).  The count is what needs explaining: the
             # consolidator's per-sweep `else:` branch copies out the WHOLE key
@@ -2608,6 +2580,11 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # filters — the only place that increments this counter — never run,
             # leaving it at its __init__/reset value of 0.
             'stage1_undatable_freshness_records': 0,
+            # Always present (task 5499): None because no backlog payload was assembled.
+            'stage1_assembled_budget': None,
+            # Always present (task 4620); None because assemble_payload never ran
+            # here, so Stage 1 took no unfinished-Graphiti-write sample.
+            'stage1_unfinished_graphiti_write_start': None,
             # Always present (task 3052), zeroed in the same block as the
             # task-3084 curator-gate trio above and for the same reason: they
             # are set BEFORE the remediation early-return, so a caller reading
@@ -2629,6 +2606,17 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # Always present (task 5626), pre-initialised before the
+            # remediation early-return; 0 here because no task completed.
+            'unlanded_path_check_checked': 0,
+            'unlanded_path_check_skipped': 0,
+            'unlanded_path_check_errors': 0,
+            'unlanded_path_check_flags_emitted': 0,
+            # The auto-consolidation post-step's keys (task 5240). This bare
+            # AsyncMock memory's enabled_projects contains nothing, so the
+            # post-step stops at its project gate.
+            **auto_consolidation_initial_stats(),
+            'auto_consolidations_skipped_project': 1,
             # THIRTEEN keys from the two stale-edge sweeps, not the four this
             # task added (task 4386).  The count is what needs explaining: the
             # consolidator's per-sweep `else:` branch copies out the WHOLE key
@@ -3149,6 +3137,91 @@ class TestNeedsHintAttention:
         assert _needs_hint_attention(task) is True
 
 
+class TestSelectTasksNeedingHintAttention:
+    """select_tasks_needing_hint_attention: hint-attention candidates minus live-claimed tasks.
+
+    A claim is live when it carries a non-blank claimant_run_id whose heartbeat_at
+    is within DEFAULT_CLAIMANT_HEARTBEAT_TTL of ``claims_read_at`` (task 5093).
+    READ_AT lies far in the past, so every live-claim exclusion below also shows
+    that freshness is judged at ``claims_read_at``, not at wall clock.
+    """
+
+    READ_AT = datetime(2026, 1, 1, tzinfo=UTC)
+    CLAIMANT = 'orch-run/sess/pid=1'
+    _UNSET = object()
+
+    @classmethod
+    def _task(cls, tid: int = 1, *, claimant=_UNSET, heartbeat_at=_UNSET, metadata=None) -> dict:
+        task: dict = {'id': tid, 'title': f'T{tid}', 'status': 'pending', 'metadata': metadata or {}}
+        if claimant is not cls._UNSET:
+            task['claimant_run_id'] = claimant
+        if heartbeat_at is not cls._UNSET:
+            task['heartbeat_at'] = (
+                heartbeat_at.isoformat() if isinstance(heartbeat_at, datetime) else heartbeat_at
+            )
+        return task
+
+    @classmethod
+    def _claimed(cls, tid: int = 1, *, heartbeat_age: timedelta, metadata=None) -> dict:
+        return cls._task(
+            tid,
+            claimant=cls.CLAIMANT,
+            heartbeat_at=cls.READ_AT - heartbeat_age,
+            metadata=metadata,
+        )
+
+    def _select(self, tasks: list[dict]) -> list[dict]:
+        return select_tasks_needing_hint_attention(tasks, claims_read_at=self.READ_AT)
+
+    def test_live_claimed_hintless_task_is_excluded(self):
+        assert self._select([self._claimed(heartbeat_age=timedelta(minutes=1))]) == []
+
+    def test_unclaimed_hintless_task_is_included(self):
+        absent = self._task(1)
+        none_claimant = self._task(2, claimant=None)
+        assert self._select([absent, none_claimant]) == [absent, none_claimant]
+
+    def test_claim_just_past_the_shared_ttl_is_stale_and_included(self):
+        task = self._claimed(heartbeat_age=DEFAULT_CLAIMANT_HEARTBEAT_TTL + timedelta(minutes=1))
+        assert self._select([task]) == [task]
+
+    def test_claim_just_inside_the_shared_ttl_is_live_and_excluded(self):
+        task = self._claimed(heartbeat_age=DEFAULT_CLAIMANT_HEARTBEAT_TTL - timedelta(minutes=1))
+        assert self._select([task]) == []
+
+    @pytest.mark.parametrize('heartbeat_at', [None, 'not-a-timestamp'])
+    def test_claim_without_a_readable_heartbeat_is_included(self, heartbeat_at):
+        task = self._task(claimant=self.CLAIMANT, heartbeat_at=heartbeat_at)
+        assert self._select([task]) == [task]
+
+    def test_blank_claimant_with_fresh_heartbeat_is_included(self):
+        task = self._task(claimant='   ', heartbeat_at=self.READ_AT - timedelta(minutes=1))
+        assert self._select([task]) == [task]
+
+    def test_live_claimed_legacy_list_hints_task_is_excluded(self):
+        task = self._claimed(
+            heartbeat_age=timedelta(minutes=1),
+            metadata={'memory_hints': [{'entity': 'X', 'query': 'q'}]},
+        )
+        assert self._select([task]) == []
+
+    def test_unclaimed_task_with_valid_hints_is_excluded(self):
+        task = self._task(metadata={'memory_hints': {'entities': ['E'], 'queries': ['q']}})
+        assert self._select([task]) == []
+
+    def test_mixed_input_keeps_survivors_in_order_and_is_not_mutated(self):
+        tasks = [
+            self._task(1),
+            self._claimed(2, heartbeat_age=timedelta(minutes=1)),
+            self._task(3, metadata={'memory_hints': {'entities': ['E'], 'queries': ['q']}}),
+            self._claimed(4, heartbeat_age=DEFAULT_CLAIMANT_HEARTBEAT_TTL * 3),
+            self._task(5),
+        ]
+        snapshot = [dict(t) for t in tasks]
+        assert [t['id'] for t in self._select(tasks)] == [1, 4, 5]
+        assert tasks == snapshot
+
+
 class TestRunIdValidation(BaseStageValidationTest):
     """BaseStage.run() validates run_id before prompt interpolation."""
 
@@ -3423,6 +3496,7 @@ class TestTierConfig:
         memory_mock.mem0 = AsyncMock()
         memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
         memory_mock.get_status = AsyncMock(return_value={})
+        memory_mock.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
             memory_mock, AsyncMock(), AsyncMock(), config,
@@ -3531,6 +3605,7 @@ class TestStagePayloadProjectIdGuideline:
         m.mem0 = AsyncMock()
         m.mem0.get_all = AsyncMock(return_value={'results': []})
         m.get_status = AsyncMock(return_value={})
+        m.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         return m
 
     @pytest.fixture
@@ -3979,6 +4054,7 @@ class TestMemoryConsolidatorFilteredTaskTree:
         svc.get_status = AsyncMock(return_value={})
         svc.mem0 = AsyncMock()
         svc.mem0.get_all = AsyncMock(return_value={'results': []})
+        svc.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         return svc
 
     @pytest.fixture
@@ -4941,16 +5017,13 @@ class TestFormatFlaggedFirstItemEdgeCase:
         ):
             text = _format_flagged(items)
 
-        # The LLM must see SOMETHING about the item — not just a footer
-        assert '… [item truncated]' in text, (
-            f'Expected truncation marker in text; got first 200 chars: {text[:200]!r}'
-        )
+        assert text.startswith('- ')
+        assert_elided(text[len('- '):], json.dumps(items[0]))
         # No "... and N more" footer when there are no additional items to report
         assert '... and ' not in text, (
             f'Unexpected "... and N more" footer for single-item list; text: {text[:200]!r}'
         )
-        # Text must not exceed the budget by more than the marker length
-        assert len(text) <= _FLAGGED_ITEMS_CHAR_BUDGET + len('… [item truncated]') + 10, (
+        assert len(text) <= _FLAGGED_ITEMS_CHAR_BUDGET, (
             f'Text too long: {len(text)} chars; expected ≤ {_FLAGGED_ITEMS_CHAR_BUDGET}'
         )
         # A truncation warning must still be emitted
@@ -4976,9 +5049,8 @@ class TestFormatFlaggedFirstItemEdgeCase:
         ):
             text = _format_flagged(items)
 
-        assert '… [item truncated]' in text, (
-            'Expected truncation marker for oversized first item'
-        )
+        first_line = text.splitlines()[0]
+        assert_elided(first_line[len('- '):], json.dumps(items[0]))
         # The second item was not rendered; the footer should note it
         assert '... and 1 more (truncated: char budget)' in text, (
             f'Expected "... and 1 more" footer; got last 200 chars: {text[-200:]!r}'
@@ -5051,6 +5123,11 @@ class TestFormatFlaggedFirstItemEdgeCase:
         assert rec.total == rec.rendered + rec.dropped, (
             f'total={rec.total} must equal rendered={rec.rendered} + dropped={rec.dropped}'
         )
+
+    def test_budget_too_small_for_the_marker_raises(self):
+        """A budget that cannot hold the counted marker is refused, not rendered as a footer-only body."""
+        with pytest.raises(ValueError, match='elision marker'):
+            _format_flagged([{'description': 'y' * 100}], budget_chars=10)
 
 
 # ---------------------------------------------------------------------------
@@ -5175,7 +5252,7 @@ class TestStage2HandoffShortfallWarning:
 
 
 class TestBriefingKnownGapsRefresh:
-    """Tests for _run_briefing_known_gaps_script and _queue_briefing_refresh_tasks helpers."""
+    """Tests for _run_briefing_known_gaps_script and queue_briefing_refresh_tasks helpers."""
 
     @pytest.fixture
     def mock_deps(self, tmp_path):
@@ -5293,7 +5370,7 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(warning_records[0], 'returncode', None) == 2
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks                                         #
+    # queue_briefing_refresh_tasks                                          #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5308,7 +5385,7 @@ class TestBriefingKnownGapsRefresh:
             {'task_id': '1820', 'title': 'Other', 'subproject': 'orchestrator', 'what': 'Other gap'},
         ]
 
-        await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+        await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert taskmaster.add_task.call_count == 2
 
@@ -5334,7 +5411,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+        result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         taskmaster.add_task.assert_not_called()
         assert '1751' in result['skipped']
@@ -5354,7 +5431,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+        result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         taskmaster.add_task.assert_called_once()
         assert '1751' not in result['skipped']
@@ -5382,7 +5459,7 @@ class TestBriefingKnownGapsRefresh:
 
         mismatches = [{'task_id': '1751', 'title': 'Foo', 'subproject': 'bar', 'what': 'gap'}]
 
-        result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+        result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         # Neither near-miss deduped → add_task must be called exactly once
         taskmaster.add_task.assert_called_once()
@@ -5673,7 +5750,7 @@ class TestBriefingKnownGapsRefresh:
         assert isinstance(getattr(warning_records[0], 'error', None), str)
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks — exception path                        #
+    # queue_briefing_refresh_tasks — exception path                         #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5689,7 +5766,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger=_TKS_LOGGER,
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+            result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['failed'] == ['1751']
         assert result['created'] == []
@@ -5704,7 +5781,7 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(warning_records[0], 'task_id', None) == '1751'
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks — candidate_key dedup (task 2402)       #
+    # queue_briefing_refresh_tasks — candidate_key dedup (task 2402)        #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5733,7 +5810,7 @@ class TestBriefingKnownGapsRefresh:
             logging.INFO,
             logger=_TKS_LOGGER,
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+            result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['skipped'] == ['1751'], (
             f"expected the collision folded into skipped, got {result['skipped']!r}"
@@ -5765,7 +5842,7 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(dedup_records[0], 'existing_id', None) == 42
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks — unexpected-shape (contract-drift)     #
+    # queue_briefing_refresh_tasks — unexpected-shape (contract-drift)      #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5808,7 +5885,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger=_TKS_LOGGER,
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+            result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['created'] == [], (
             f'created should be [] when add_task returns {bogus_result!r}, got {result["created"]!r}'
@@ -5827,7 +5904,7 @@ class TestBriefingKnownGapsRefresh:
         assert getattr(warning_records[0], 'task_id', None) == '1751'
 
     # ------------------------------------------------------------------ #
-    # _queue_briefing_refresh_tasks — mixed success/failure in one call    #
+    # queue_briefing_refresh_tasks — mixed success/failure in one call     #
     # ------------------------------------------------------------------ #
 
     @pytest.mark.asyncio
@@ -5857,7 +5934,7 @@ class TestBriefingKnownGapsRefresh:
             logging.WARNING,
             logger=_TKS_LOGGER,
         ):
-            result = await _queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
+            result = await queue_briefing_refresh_tasks(taskmaster, ProjectRoot('/tmp/p'), mismatches)
 
         assert result['created'] == ['100', '300'], (
             f'expected created=[100, 300], got {result["created"]!r}'
@@ -5918,7 +5995,7 @@ class TestMemoryConsolidatorFlagDedup:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -5964,7 +6041,7 @@ class TestMemoryConsolidatorFlagDedup:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=dedup_mock,
             ),
         ):
@@ -6042,11 +6119,11 @@ class TestMemoryConsolidatorTerminalMetadataFilter:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=_dedup_spy,
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
         ):
@@ -6150,15 +6227,15 @@ class TestMemoryConsolidatorStaleBulkGetStatusesFilter:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=_dedup_spy,
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                 new=ack_mock,
             ),
         ):
@@ -6233,7 +6310,7 @@ async def _run_consolidator_filter_chain(
         return kwargs.get('flags', [])
 
     ack_mock = AsyncMock(return_value=1)
-    module = 'fused_memory.reconciliation.stages.memory_consolidator'
+    module = 'fused_memory.reconciliation.stage1_flag_chain'
     with (
         patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
         patch(f'{module}.dedup_flags', new=_dedup_spy),
@@ -6502,15 +6579,15 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                 new=ack_mock,
             ),
         ):
@@ -6564,15 +6641,15 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                 new=ack_mock,
             ),
         ):
@@ -6668,15 +6745,15 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=_fake_dedup),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                 new=ack_mock,
             ),
         ):
@@ -6756,15 +6833,15 @@ class TestMemoryConsolidatorFlagAcknowledgment:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=_fake_dedup),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                 new=ack_mock,
             ),
         ):
@@ -6829,7 +6906,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stage1_flag_chain.dedup_flags', new=dedup_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.compute_stalled_task_ids', new=compute_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
@@ -6873,7 +6950,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stage1_flag_chain.dedup_flags', new=dedup_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.compute_stalled_task_ids', new=compute_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
@@ -6908,7 +6985,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stage1_flag_chain.dedup_flags', new=dedup_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
         ):
@@ -6946,7 +7023,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stage1_flag_chain.dedup_flags', new=dedup_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
         ):
@@ -6983,7 +7060,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
-            patch('fused_memory.reconciliation.stages.memory_consolidator.dedup_flags', new=dedup_mock),
+            patch('fused_memory.reconciliation.stage1_flag_chain.dedup_flags', new=dedup_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.track_human_operator_stalls', new=track_mock),
             patch('fused_memory.reconciliation.stages.memory_consolidator.maybe_escalate_stalled_tasks', new=escalate_mock),
         ):
@@ -9200,6 +9277,140 @@ class TestSweepStaleMem0FlagMarkers:
         messages = [rec.message for rec in scroll_cap_warnings]
         assert any("{'source': 'stage1_flag_marker'}" in m for m in messages)
         assert any("{'kind': 'stage1_flag_marker'}" in m for m in messages)
+
+
+_FOREIGN_KIND_NOW = datetime(2026, 10, 30, 12, 0, 0, tzinfo=UTC)
+_STAGE1_MARKER = 'stage1_flag_marker'
+
+
+def _stage1_member(mid: str, **metadata) -> dict:
+    """A stage1_flag_marker pool member far past the pool's age cutoff."""
+    age = timedelta(days=STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS + 30)
+    return {
+        'id': mid,
+        'created_at': (_FOREIGN_KIND_NOW - age).isoformat(),
+        'metadata': metadata,
+    }
+
+
+class TestSweepStaleMem0FlagMarkersWithholdsForeignKinds:
+    """The in-cycle stage1_flag_marker collector keeps foreign-kind records (task 6241).
+
+    A record declaring a kind other than ``stage1_flag_marker`` belongs to
+    another pool, whatever ``source`` it carries, so this collector and the
+    manual ``sweep_orphan_flag_markers.py`` agree on what the pool is.
+    """
+
+    @pytest.mark.asyncio
+    async def test_foreign_kind_is_kept_on_every_cycle_while_markers_drain(self):
+        pool = LiveFlagPool([
+            _stage1_member('canonical', source=_STAGE1_MARKER, kind=_STAGE1_MARKER),
+            _stage1_member('source-only', source=_STAGE1_MARKER),
+            _stage1_member('kind-only', kind=_STAGE1_MARKER),
+            _stage1_member(
+                'foreign', source=_STAGE1_MARKER, kind='unregistered_audit_log', task_id='452',
+            ),
+        ])
+
+        first = await _sweep_stale_mem0_flag_markers(
+            pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+        )
+
+        assert first == 3
+        assert set(pool.deleted_ids()) == {'canonical', 'source-only', 'kind-only'}
+        assert 'foreign' in pool.members
+
+        second = await _sweep_stale_mem0_flag_markers(
+            pool, 'dark_factory', 'r2', now=_FOREIGN_KIND_NOW,
+        )
+
+        assert second == 0
+        assert len(pool.deleted_ids()) == 3
+        assert 'foreign' in pool.members
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', [[_STAGE1_MARKER], {'nested': 'x'}])
+    async def test_unhashable_kind_is_kept_without_raising(self, kind):
+        pool = LiveFlagPool([
+            _stage1_member('canonical', source=_STAGE1_MARKER, kind=_STAGE1_MARKER),
+            _stage1_member('odd-kind', source=_STAGE1_MARKER, kind=kind),
+        ])
+
+        result = await _sweep_stale_mem0_flag_markers(
+            pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+        )
+
+        assert result == 1
+        assert pool.deleted_ids() == ['canonical']
+        assert 'odd-kind' in pool.members
+
+    @pytest.mark.asyncio
+    async def test_one_aggregate_warning_and_per_record_debug(self, caplog):
+        pool = LiveFlagPool([
+            _stage1_member('foreign-alpha', source=_STAGE1_MARKER, kind='alpha_log'),
+            _stage1_member('foreign-beta', source=_STAGE1_MARKER, kind='beta_log'),
+            _stage1_member('canonical', source=_STAGE1_MARKER, kind=_STAGE1_MARKER),
+        ])
+
+        with caplog.at_level(logging.DEBUG, logger=_TKS_LOGGER):
+            result = await _sweep_stale_mem0_flag_markers(
+                pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+            )
+
+        assert result == 1
+        tks_records = [r for r in caplog.records if r.name == _TKS_LOGGER]
+        foreign_warnings = [
+            r for r in tks_records
+            if r.levelno == logging.WARNING and 'foreign kind' in r.getMessage()
+        ]
+        assert len(foreign_warnings) == 1
+        message = foreign_warnings[0].getMessage()
+        assert 'RETAINED 2 ' in message
+        assert 'alpha_log' in message
+        assert 'beta_log' in message
+        assert '_sweep_stale_mem0_flag_markers' in message
+        assert 'foreign-alpha' not in message
+        assert 'foreign-beta' not in message
+        assert 'protected audit' not in message
+
+        debug_ids = sorted(
+            r.__dict__['memory_id'] for r in tks_records
+            if r.levelno == logging.DEBUG and 'foreign-kind' in r.getMessage()
+        )
+        assert debug_ids == ['foreign-alpha', 'foreign-beta']
+
+    @pytest.mark.asyncio
+    async def test_a_registered_audit_kind_is_attributed_as_audit_not_foreign(self, caplog):
+        pool = LiveFlagPool([
+            _stage1_member('audit', source=_STAGE1_MARKER, kind='cadence_check'),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger=_TKS_LOGGER):
+            result = await _sweep_stale_mem0_flag_markers(
+                pool, 'dark_factory', 'r1', now=_FOREIGN_KIND_NOW,
+            )
+
+        assert result == 0
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == _TKS_LOGGER and r.levelno == logging.WARNING
+        ]
+        assert any('RETAINED 1 protected audit record(s)' in m for m in messages)
+        assert not any('foreign kind' in m for m in messages)
+
+    @pytest.mark.asyncio
+    async def test_the_wide_relay_pool_does_not_opt_in(self):
+        """The flag_for_stage2 pool is drained by its closure gate, not by pool kind."""
+        pool = LiveFlagPool([
+            _relay_marker('relay', _STALE_DAYS, task_id='T', kind='stage1_flag'),
+        ])
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            pool, 'dark_factory', 'r1', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+        )
+
+        assert result == 1
+        assert pool.deleted_ids() == ['relay']
 
 
 class TestSweepStaleMem0FlagForStage2Markers:
@@ -12073,6 +12284,7 @@ class TestMemoryConsolidatorPayloadIncludesProjectRoot:
         m.mem0 = AsyncMock()
         m.mem0.get_all = AsyncMock(return_value={'results': []})
         m.get_status = AsyncMock(return_value={})
+        m.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         return m
 
     @pytest.fixture
@@ -12910,48 +13122,40 @@ class TestBaseStageEscalationQueueAttribute:
         assert stage._escalation_queue is fake_queue
 
 
-@pytest.fixture
-def minimal_harness():
+def _minimal_harness(*, escalation_queue=None):
     """Construct a minimal ReconciliationHarness with all deps mocked."""
     from fused_memory.config.schema import FusedMemoryConfig
-    from fused_memory.reconciliation.harness import ReconciliationHarness
 
-    config = FusedMemoryConfig()
-    memory_service = AsyncMock()
-    taskmaster = AsyncMock()
-    journal = AsyncMock()
-    event_buffer = AsyncMock()
-    harness = ReconciliationHarness(
-        memory_service=memory_service,
-        taskmaster=taskmaster,
-        journal=journal,
-        event_buffer=event_buffer,
-        config=config,
+    return make_harness(
+        journal=AsyncMock(),
+        event_buffer=AsyncMock(),
+        memory_service=AsyncMock(),
+        taskmaster=AsyncMock(),
+        config=FusedMemoryConfig(),
+        escalation_queue=escalation_queue,
     )
-    return harness
 
 
 class TestHarnessWiresEscalationQueueOntoStages:
     """ReconciliationHarness._make_stages wires _escalation_queue onto each stage."""
 
-    def test_make_stages_wires_escalation_queue(self, minimal_harness):
-        """_make_stages() propagates harness._escalation_queue to each returned stage."""
+    def test_make_stages_wires_escalation_queue(self):
+        """_make_stages() propagates the harness's escalation queue to each returned stage."""
         fake_queue = MagicMock()
-        minimal_harness._escalation_queue = fake_queue
+        harness = _minimal_harness(escalation_queue=fake_queue)
 
-        stages = minimal_harness._make_stages(_scope('test_project', '/tmp/test'))
+        stages = harness._make_stages(_scope('test_project', '/tmp/test'))
 
         for stage in stages:
             assert stage._escalation_queue is fake_queue, (
                 f'Stage {stage.stage_id} did not receive _escalation_queue from harness'
             )
 
-    def test_make_stages_no_queue_leaves_stages_at_none(self, minimal_harness):
-        """When _escalation_queue is None, stages are left with _escalation_queue=None."""
-        # Ensure harness has no queue (default)
-        minimal_harness._escalation_queue = None
+    def test_make_stages_no_queue_leaves_stages_at_none(self):
+        """When the harness has no queue, stages are left with _escalation_queue=None."""
+        harness = _minimal_harness()
 
-        stages = minimal_harness._make_stages(_scope('test_project', '/tmp/test'))
+        stages = harness._make_stages(_scope('test_project', '/tmp/test'))
 
         for stage in stages:
             assert stage._escalation_queue is None
@@ -12960,14 +13164,14 @@ class TestHarnessWiresEscalationQueueOntoStages:
 class TestPropagateEscalationQueueHelper:
     """ReconciliationHarness._propagate_escalation_queue wires URL and queue onto an arbitrary stage list."""
 
-    def test_propagates_url_and_queue_onto_pre_existing_stages(self, minimal_harness):
+    def test_propagates_url_and_queue_onto_pre_existing_stages(self):
         """Helper propagates harness URL and queue to every stage in the supplied list."""
         fake_queue = MagicMock()
-        minimal_harness._escalation_url = 'http://test.local:9999/mcp'
-        minimal_harness._escalation_queue = fake_queue
+        harness = _minimal_harness(escalation_queue=fake_queue)
+        harness._escalation_url = 'http://test.local:9999/mcp'
 
         stages = [MagicMock(_escalation_url=None, _escalation_queue=None) for _ in range(3)]
-        minimal_harness._propagate_escalation_queue(stages)
+        harness._propagate_escalation_queue(stages)
 
         for stage in stages:
             assert stage._escalation_url == 'http://test.local:9999/mcp', (
@@ -12977,17 +13181,16 @@ class TestPropagateEscalationQueueHelper:
                 'Stage did not receive _escalation_queue from harness'
             )
 
-    def test_no_op_when_harness_has_no_url_or_queue(self, minimal_harness):
+    def test_no_op_when_harness_has_no_url_or_queue(self):
         """When harness has no URL or queue, pre-existing stage values are not overwritten."""
         sentinel_queue = MagicMock()
-        minimal_harness._escalation_url = None
-        minimal_harness._escalation_queue = None
+        harness = _minimal_harness()
 
         stages = [
             MagicMock(_escalation_url='preexisting', _escalation_queue=sentinel_queue)
             for _ in range(3)
         ]
-        minimal_harness._propagate_escalation_queue(stages)
+        harness._propagate_escalation_queue(stages)
 
         for stage in stages:
             assert stage._escalation_url == 'preexisting', (
@@ -12997,17 +13200,17 @@ class TestPropagateEscalationQueueHelper:
                 'Helper must not overwrite _escalation_queue when harness has no queue'
             )
 
-    def test_propagates_url_only_when_queue_is_none(self, minimal_harness):
+    def test_propagates_url_only_when_queue_is_none(self):
         """When only URL is set on harness, URL propagates but queue is left at pre-existing value."""
         sentinel_queue = MagicMock()
-        minimal_harness._escalation_url = 'http://test.local:9999/mcp'
-        minimal_harness._escalation_queue = None
+        harness = _minimal_harness()
+        harness._escalation_url = 'http://test.local:9999/mcp'
 
         stages = [
             MagicMock(_escalation_url=None, _escalation_queue=sentinel_queue)
             for _ in range(3)
         ]
-        minimal_harness._propagate_escalation_queue(stages)
+        harness._propagate_escalation_queue(stages)
 
         for stage in stages:
             assert stage._escalation_url == 'http://test.local:9999/mcp', (
@@ -13017,14 +13220,14 @@ class TestPropagateEscalationQueueHelper:
                 'Helper must not overwrite _escalation_queue when harness queue is None'
             )
 
-    def test_propagates_to_single_pass_iterable(self, minimal_harness):
+    def test_propagates_to_single_pass_iterable(self):
         """Helper must propagate URL and queue even when stages is a single-pass iterable (e.g., generator/iter())."""
         fake_queue = MagicMock()
-        minimal_harness._escalation_url = 'http://test.local:9999/mcp'
-        minimal_harness._escalation_queue = fake_queue
+        harness = _minimal_harness(escalation_queue=fake_queue)
+        harness._escalation_url = 'http://test.local:9999/mcp'
 
         stages = [MagicMock(_escalation_url=None, _escalation_queue=None) for _ in range(3)]
-        minimal_harness._propagate_escalation_queue(iter(stages))
+        harness._propagate_escalation_queue(iter(stages))
 
         for stage in stages:
             assert stage._escalation_url == 'http://test.local:9999/mcp', (
@@ -13034,21 +13237,20 @@ class TestPropagateEscalationQueueHelper:
                 'Stage did not receive _escalation_queue — single-pass iterator was exhausted by URL pass'
             )
 
-    def test_propagates_queue_only_when_url_is_none(self, minimal_harness):
+    def test_propagates_queue_only_when_url_is_none(self):
         """When only queue is set on harness, queue propagates but URL is left at pre-existing value.
 
         Symmetric counterpart of test_propagates_url_only_when_queue_is_none; completes
         the asymmetric-guard matrix: (url+queue, neither, url-only, queue-only).
         """
         fake_queue = MagicMock()
-        minimal_harness._escalation_url = None
-        minimal_harness._escalation_queue = fake_queue
+        harness = _minimal_harness(escalation_queue=fake_queue)
 
         stages = [
             MagicMock(_escalation_url='preexisting', _escalation_queue=None)
             for _ in range(3)
         ]
-        minimal_harness._propagate_escalation_queue(stages)
+        harness._propagate_escalation_queue(stages)
 
         for stage in stages:
             assert stage._escalation_queue is fake_queue, (
@@ -13102,6 +13304,14 @@ class TestStage2HintAttentionDetection:
         ``_make_task_no_metadata``.
         """
         return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': [], 'metadata': {}}
+
+    def _make_claimed_task_no_hints(self, tid: int, status: str, *, heartbeat_at: datetime) -> dict:
+        """A hintless task claimed by an orchestrator run that heartbeated at *heartbeat_at*."""
+        return {
+            **self._make_task_no_hints(tid, status),
+            'claimant_run_id': 'orch-run/sess/pid=1',
+            'heartbeat_at': heartbeat_at.isoformat(),
+        }
 
     def _make_task_no_metadata(self, tid: int, status: str) -> dict:
         """Build a task dict with no ``metadata`` key at all.
@@ -13442,6 +13652,121 @@ class TestStage2HintAttentionDetection:
             f'Hint section references task IDs absent from the Active Task Tree: {sorted(orphaned)}\n'
             f'hint_ids={sorted(hint_ids)}, active_tree_ids={sorted(active_tree_ids)}'
         )
+
+    # ------------------------------------------------- live-claimed exclusion (task 5093)
+
+    _READ_INSTANT_MISSING_EVENT = 'reconciliation.task_tree_read_instant_missing'
+
+    def _stage(self, mock_deps) -> TaskKnowledgeSync:
+        return make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+
+    def _read_instant_missing_warnings(self, caplog) -> list[logging.LogRecord]:
+        return [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and self._READ_INSTANT_MISSING_EVENT in r.getMessage()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_live_claimed_task_left_out_of_hint_section_only(self, mock_deps, watermark):
+        fetched_at = datetime.now(UTC)
+        stage = self._stage(mock_deps)
+        stage.filtered_task_tree = self._make_tree([
+            self._make_claimed_task_no_hints(70, 'pending', heartbeat_at=fetched_at - timedelta(minutes=1)),
+            self._make_task_no_hints(71, 'pending'),
+            self._make_claimed_task_no_hints(72, 'pending', heartbeat_at=fetched_at - timedelta(minutes=30)),
+        ])
+        stage.filtered_task_tree_fetched_at = fetched_at
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, self._SECTION_HEADER)
+        assert '[70]' not in section, section
+        assert '[71]' in section, section
+        assert '[72]' in section, section
+        assert '[70]' in _extract_section(payload, '### Active Task Tree')
+
+    @pytest.mark.asyncio
+    async def test_section_omitted_when_every_candidate_is_live_claimed(self, mock_deps, watermark):
+        fetched_at = datetime.now(UTC)
+        fresh = fetched_at - timedelta(minutes=1)
+        stage = self._stage(mock_deps)
+        stage.filtered_task_tree = self._make_tree([
+            self._make_claimed_task_no_hints(70, 'pending', heartbeat_at=fresh),
+            self._make_claimed_task_no_hints(71, 'in-progress', heartbeat_at=fresh),
+        ])
+        stage.filtered_task_tree_fetched_at = fetched_at
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self._SECTION_HEADER not in payload
+
+    @pytest.mark.asyncio
+    async def test_claims_are_aged_at_the_tree_read_instant_not_wall_clock(
+        self, mock_deps, watermark
+    ):
+        read_at = datetime(2026, 1, 1, tzinfo=UTC)
+        stage = self._stage(mock_deps)
+        stage.filtered_task_tree = self._make_tree([
+            self._make_claimed_task_no_hints(73, 'pending', heartbeat_at=read_at - timedelta(minutes=1)),
+            self._make_task_no_hints(74, 'pending'),
+        ])
+        stage.filtered_task_tree_fetched_at = read_at
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, self._SECTION_HEADER)
+        assert '[73]' not in section, section
+        assert '[74]' in section, section
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('read_instant', 'reason'),
+        [(None, 'not_supplied'), (datetime(2026, 1, 1), 'naive_datetime')],
+        ids=['missing', 'naive'],
+    )
+    async def test_injected_tree_without_usable_read_instant_warns_and_ages_at_wall_clock(
+        self, mock_deps, watermark, caplog, read_instant, reason
+    ):
+        stage = self._stage(mock_deps)
+        stage.filtered_task_tree = self._make_tree([
+            self._make_claimed_task_no_hints(
+                75, 'pending', heartbeat_at=datetime.now(UTC) - timedelta(minutes=1)
+            ),
+        ])
+        stage.filtered_task_tree_fetched_at = read_instant
+
+        with caplog.at_level(logging.WARNING):
+            payload = await stage.assemble_payload([], watermark, [])
+
+        assert '[75]' not in _extract_section(payload, self._SECTION_HEADER)
+        assert [r.__dict__['reason'] for r in self._read_instant_missing_warnings(caplog)] == [
+            reason
+        ]
+
+    @pytest.mark.asyncio
+    async def test_self_fetched_tree_excludes_live_claimed_task_without_warning(
+        self, mock_deps, watermark, caplog
+    ):
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [
+                self._make_claimed_task_no_hints(
+                    76, 'pending', heartbeat_at=datetime.now(UTC) - timedelta(minutes=1)
+                ),
+                self._make_task_no_hints(77, 'pending'),
+            ]
+        }
+        stage = self._stage(mock_deps)
+
+        with caplog.at_level(logging.WARNING):
+            payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, self._SECTION_HEADER)
+        assert '[76]' not in section, section
+        assert '[77]' in section, section
+        assert not self._read_instant_missing_warnings(caplog)
 
 
 # ── Regression: cycle 8df8bdcd — Stage 2 Recently-Completed/Done-Provenance
@@ -14044,16 +14369,18 @@ class TestAssemblePayloadRequiredSections:
     def watermark(self):
         return Watermark(project_id='dark_factory')
 
-    def _install_stub_registry(self, stage, monkeypatch) -> dict[str, FilteredTaskTree]:
-        """Swap in STUB_REGISTRY; return the tree each stub renderer received, by stub."""
-        received: dict[str, FilteredTaskTree] = {}
+    def _install_stub_registry(
+        self, stage, monkeypatch
+    ) -> dict[str, tuple[FilteredTaskTree, datetime]]:
+        """Swap in STUB_REGISTRY; return the (tree, read instant) each stub received, by stub."""
+        received: dict[str, tuple[FilteredTaskTree, datetime]] = {}
 
-        async def stub_alpha(filtered: FilteredTaskTree) -> str:
-            received['alpha'] = filtered
+        async def stub_alpha(filtered: FilteredTaskTree, tree_read_at: datetime) -> str:
+            received['alpha'] = (filtered, tree_read_at)
             return '\n### Alpha\nfirst\n'
 
-        async def stub_beta(filtered: FilteredTaskTree) -> str:
-            received['beta'] = filtered
+        async def stub_beta(filtered: FilteredTaskTree, tree_read_at: datetime) -> str:
+            received['beta'] = (filtered, tree_read_at)
             return '\n### Beta\nsecond\n'
 
         monkeypatch.setattr(stage, 'stub_alpha', stub_alpha, raising=False)
@@ -14082,8 +14409,8 @@ class TestAssemblePayloadRequiredSections:
             'concatenated in REGISTRY ORDER, with no separator and no '
             f'post-processing; expected {self.EXPECTED_SECTIONS!r} in:\n{payload!r}'
         )
-        assert received.get('alpha') is stage.filtered_task_tree
-        assert received.get('beta') is stage.filtered_task_tree
+        assert received['alpha'][0] is stage.filtered_task_tree
+        assert received['beta'][0] is stage.filtered_task_tree
 
     @pytest.mark.asyncio
     async def test_self_fetched_tree_reaches_every_registry_renderer(
@@ -14092,25 +14419,37 @@ class TestAssemblePayloadRequiredSections:
         """With no harness-injected tree, renderers get the tree assemble_payload fetched.
 
         Pins Stage 2's contract over Stage 1's zero-arg aggregator: a renderer
-        reading self.filtered_task_tree would see None on this path.
+        reading self.filtered_task_tree would see None on this path.  The tree
+        travels with the instant it was read, stamped once the fetch returned.
         """
-        mock_deps['taskmaster'].get_tasks.return_value = {
-            'tasks': [{'id': 7, 'title': 'Fetched task', 'status': 'pending'}]
-        }
+        fetch_returned_by: list[datetime] = []
+
+        async def get_tasks(**_kwargs):
+            fetch_returned_by.append(datetime.now(UTC))
+            return {'tasks': [{'id': 7, 'title': 'Fetched task', 'status': 'pending'}]}
+
+        mock_deps['taskmaster'].get_tasks.side_effect = get_tasks
         stage = make_configured_task_knowledge_sync_stage(
             mock_deps, project_id='dark_factory', project_root='/project'
         )
         received = self._install_stub_registry(stage, monkeypatch)
 
         payload = await stage.assemble_payload([], watermark, [])
+        assembled_by = datetime.now(UTC)
 
         assert self.EXPECTED_SECTIONS in payload
         assert stage.filtered_task_tree is None
-        assert received['alpha'] is received['beta'], (
+        tree, tree_read_at = received['alpha']
+        assert received['beta'][0] is tree and received['beta'][1] == tree_read_at, (
             'Every Stage-2 registry renderer must receive the SAME resolved '
-            f'FilteredTaskTree; received {received!r}'
+            f'FilteredTaskTree and read instant; received {received!r}'
         )
-        assert [task['id'] for task in received['alpha'].active_tasks] == [7]
+        assert [task['id'] for task in tree.active_tasks] == [7]
+        assert tree_read_at.tzinfo is not None
+        assert fetch_returned_by[0] <= tree_read_at <= assembled_by, (
+            'A self-fetched tree is read when the fetch returns; got '
+            f'{tree_read_at!r}, fetch returned by {fetch_returned_by[0]!r}'
+        )
 
 
 class TestRenderLiveWorkflowSectionEmptyTasksNoOp:
@@ -14748,6 +15087,7 @@ class TestMemoryConsolidatorMem0ResultsKeyWarns:
         mem_svc.get_status = AsyncMock(return_value={})
         mem_svc.mem0 = AsyncMock()
         mem_svc.mem0.get_all = AsyncMock(return_value=get_all_return)
+        mem_svc.earliest_unfinished_graphiti_write_start = MagicMock(return_value=None)
         stage = MemoryConsolidator(
             StageId.memory_consolidator,
             mem_svc, AsyncMock(), AsyncMock(), config,
@@ -17621,11 +17961,12 @@ class TestLiveWorkflowRenderIsNonBlocking:
     nothing else on the loop — health checks, heartbeats, MCP replies — could
     run at all.
 
-    The assertion is a TICKER: a coroutine incrementing a counter every 50 ms
-    runs concurrently with a render whose git probes each take real awaited
-    time. A non-blocking renderer lets the ticker keep ticking; a blocking one
-    pins it at ~0. This is what a `loop_lag`-style field could only report
-    after the fact.
+    The assertion is a loop-turn oracle: every stubbed git probe suspends on
+    fused-memory/tests/_fm_helpers.py::LoopFreedomProbe, which records whether
+    a marker queued on the test loop ran while that probe was suspended. A
+    renderer that ran its probes inline instead of awaiting them reads False.
+    It counts loop turns, never seconds, so host or GIL contention cannot red
+    it (task 5920 introduced the probe; task 5925 for this site).
     """
 
     _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -17652,50 +17993,28 @@ class TestLiveWorkflowRenderIsNonBlocking:
 
     @pytest.mark.asyncio
     async def test_render_does_not_starve_the_event_loop(self, monkeypatch):
-        import asyncio
-
         from shared.git_async import GitResult
 
         import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services import live_workflow_detector as lwd
 
-        probe_delay = 0.02
+        probe = LoopFreedomProbe()
         n_tasks = 20
 
         async def slow_run_git(cmd, cwd=None, *, input_text=None, timeout=None):
-            await asyncio.sleep(probe_delay)
+            await probe.suspend()
             return GitResult(returncode=1, stdout='', stderr='')
 
         monkeypatch.setattr(lwd, 'run_git', slow_run_git)
         monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: False)
 
-        ticks = 0
-        stop = False
-
-        async def ticker():
-            nonlocal ticks
-            while not stop:
-                await asyncio.sleep(0.005)
-                ticks += 1
-
-        tick_task = asyncio.create_task(ticker())
-        try:
-            await lws_module.render_live_workflow_section(
-                tasks=[{'id': str(i), 'status': 'pending'} for i in range(n_tasks)],
-                project_root=ProjectRoot('/p'),
-                now=self._NOW,
-            )
-        finally:
-            stop = True
-            tick_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await tick_task
-
-        assert ticks > 5, (
-            f'the loop was starved during the render — only {ticks} ticks fired '
-            f'while {n_tasks} tasks were probed; a non-blocking renderer must '
-            f'let other coroutines run'
+        await lws_module.render_live_workflow_section(
+            tasks=[{'id': str(i), 'status': 'pending'} for i in range(n_tasks)],
+            project_root=ProjectRoot('/p'),
+            now=self._NOW,
         )
+
+        probe.assert_loop_stayed_free()
 
 
 # ---------------------------------------------------------------------------
@@ -17798,15 +18117,15 @@ class TestMemoryConsolidatorEntityStandingDecision:
             with (
                 patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                     new=_dedup_spy,
                 ),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                     new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
                 ),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                     new=AsyncMock(return_value=0),
                 ),
             ):
@@ -17853,15 +18172,15 @@ class TestMemoryConsolidatorEntityStandingDecision:
             with (
                 patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                     new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
                 ),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                     new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
                 ),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                     new=ack_mock,
                 ),
             ):
@@ -17915,15 +18234,15 @@ class TestMemoryConsolidatorEntityStandingDecision:
             with (
                 patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                     new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
                 ),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                     new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
                 ),
                 patch(
-                    'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                    'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                     new=AsyncMock(return_value=0),
                 ),
             ):
@@ -17974,7 +18293,7 @@ class TestMemoryConsolidatorEntityStandingDecision:
         with (
             patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.'
+                'fused_memory.reconciliation.stage1_flag_chain.'
                 'filter_entity_standing_decisions',
                 new=esd_mock,
             ),
@@ -18040,15 +18359,15 @@ class TestMemoryConsolidatorSuppressionStreak:
                 BaseStage, 'run', new=AsyncMock(return_value=self._make_base_report(flags))
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.dedup_flags',
                 new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.filter_false_absence_flags',
                 new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
             ),
             patch(
-                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                'fused_memory.reconciliation.stage1_flag_chain.acknowledge_resolved_flags',
                 new=AsyncMock(return_value=0),
             ),
         ):
@@ -18328,29 +18647,33 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
     def _full_cycle(base_report, **extra):
         """BaseStage.run stubbed to *base_report*, plus the filter-chain stubs.
 
+        An *extra* stub replaces the flag-chain stub of the same name; any other
+        name is stubbed in memory_consolidator.
+
         An ExitStack rather than a parenthesized ``with``: the stub set is built
         per test, and ``with (a, *stubs)`` parses as a TUPLE, not as a group of
         context managers.
         """
+        flag_chain = 'fused_memory.reconciliation.stage1_flag_chain'
+        consolidator = 'fused_memory.reconciliation.stages.memory_consolidator'
         stubs = {
-            'dedup_flags': AsyncMock(side_effect=lambda **kw: kw.get('flags', [])),
-            'filter_false_absence_flags': AsyncMock(
+            f'{flag_chain}.dedup_flags': AsyncMock(
+                side_effect=lambda **kw: kw.get('flags', []),
+            ),
+            f'{flag_chain}.filter_false_absence_flags': AsyncMock(
                 side_effect=lambda taskmaster, project_root, flags: flags,
             ),
-            'acknowledge_resolved_flags': AsyncMock(return_value=0),
+            f'{flag_chain}.acknowledge_resolved_flags': AsyncMock(return_value=0),
         }
-        stubs.update(extra)
+        for name, mock in extra.items():
+            owner = flag_chain if f'{flag_chain}.{name}' in stubs else consolidator
+            stubs[f'{owner}.{name}'] = mock
         with contextlib.ExitStack() as stack:
             stack.enter_context(
                 patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
             )
-            for name, mock in stubs.items():
-                stack.enter_context(
-                    patch(
-                        f'fused_memory.reconciliation.stages.memory_consolidator.{name}',
-                        new=mock,
-                    ),
-                )
+            for target, mock in stubs.items():
+                stack.enter_context(patch(target, new=mock))
             yield
 
     @pytest.mark.asyncio
@@ -18375,6 +18698,29 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         assert report.stats['preservation_specimen_unresolved'] == 0
         # Not just the count: the citation travels into the stats blob Stage 2
         # is handed verbatim, so the suppression is never anonymous there.
+        assert report.stats['preservation_specimen_citations'] == {'3105': self._CITATION}
+
+    @pytest.mark.asyncio
+    async def test_a_novel_flag_type_is_suppressed_through_the_action_channel(self, mock_deps):
+        """A naming with no 'strand' stem is still caught by its prose.
+
+        The fixture is this class's realistic finding verbatim apart from
+        flag_type: the status sits in description, the reset in suggested_action.
+        """
+        stage = self._make_stage(mock_deps)
+        self._corroborating_memory(stage)
+
+        specimen = self._stranded_flag(flag_type='liveness_anomaly_unattended_workflow')
+        base_report = self._make_base_report([specimen])
+
+        with self._full_cycle(base_report):
+            report = await stage.run(
+                events=[], watermark=Watermark(project_id='p'), prior_reports=[],
+                run_id='r-5463-action-channel',
+            )
+
+        assert specimen not in (report.items_flagged or [])
+        assert report.stats['preservation_specimen_suppressed'] == 1
         assert report.stats['preservation_specimen_citations'] == {'3105': self._CITATION}
 
     @pytest.mark.asyncio

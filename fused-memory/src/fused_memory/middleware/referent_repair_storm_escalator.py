@@ -2,8 +2,8 @@
 
 The INV-4 storm escape for the write-time referent REPAIR sub-pass (task 3672,
 PRD leaf eta of ``plans/memory-referent-fidelity-prd.md``).  This is the FIRE
-half of the alarm; the counter half is
-``MemoryService._referent_repair_streaks``, which counts CONSECUTIVE episodes
+half of the alarm; the counter half is the streak reported by
+``MemoryService.referent_repair_counts``, which counts CONSECUTIVE episodes
 whose repair pass moved at least one edge endpoint and resets on any pass that
 looked and found nothing to move.
 
@@ -154,9 +154,6 @@ def emit_referent_repair_storm_escalation(
             existing.id, project_id, streak, repairs,
         )
 
-    # Both quiet arms are raised to WARNING: a repair storm is a sustained
-    # scanner/resolver regression against a ~0.22% base rate, so neither a lost
-    # alarm nor a folded one may sit below the default threshold.
     return file_folded_escalation(
         project_root,
         anchor_task_id=_ANCHOR_TASK_ID,
@@ -184,6 +181,5 @@ def emit_referent_repair_storm_escalation(
             f'{repairs} repair(s) this episode; repairs continue'
         ),
         level=1,
-        no_escalation_level=logging.WARNING,
         on_fold=_announce_fold,
     )

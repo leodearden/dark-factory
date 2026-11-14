@@ -258,7 +258,7 @@ worktree, and return a structured JSON verdict.
 You MUST output ONLY valid JSON matching the schema provided by the
 --json-schema flag. No markdown fences, no prose outside the JSON.
 """,
-    allowed_tools=[*_READ_ONLY_TOOLS, *_JCODEMUNCH_TOOLS],
+    allowed_tools=[*_ANALYSIS_TOOLS, *_JCODEMUNCH_TOOLS],
     disallowed_tools=['Edit', 'Write'],
     default_model='sonnet',
     default_budget=0.50,
@@ -795,7 +795,7 @@ closing the cross-group route.
 |---|---|---|
 | The **instrument** | `judge_plan_quality` refuses a non-`is_scorable_plan` artifact up front — before a prompt is built, before `invoke_agent` — and returns the floor's own value | 3303 |
 | The **writer** | `run_architect_eval` gates the judge call site on `is_scorable_plan`, so no new incoherent cell is written | 3302 |
-| The **reader** | `report._plan_quality_score` floors a no-plan cell at read time, because the 2026-07-27 / 07-29 corpus is already on disk carrying the old shape | 3302 |
+| The **reader** | `cell_admission.plan_quality_score` floors a no-plan cell at read time, because the 2026-07-27 / 07-29 corpus is already on disk carrying the old shape | 3302 |
 
 ### The validity bound: judged without a reference (task 3628)
 
@@ -827,7 +827,7 @@ therefore valid ground-truth-independently.
 `EvalMetrics.to_dict` writes the key on *every* architect cell, so a healthy
 cell says `False` explicitly; a cell whose metrics predate task 3628 carries no
 key at all, and its validity was therefore never measured. The report layer
-keeps those apart (`report._judged_without_reference`): one keyless cell in a
+keeps those apart (`cell_admission.judged_without_reference`): one keyless cell in a
 config's admitted pool makes that config's count — and the report-level total —
 `None`, rendered `-`, with `judged_without_reference_unmeasured` carrying how
 many cells drove it and the trailer printing `UNMEASURED` rather than being
@@ -835,7 +835,7 @@ suppressed. Reporting `0` there would let a rebuild over the 2026-07-27 / 07-29
 corpus — the campaign this doc's provenance note says was judged blind on half
 the hard subset — render byte-identically to a campaign graded entirely against
 landed diffs, which is the very degradation σ exists to remove, reintroduced at
-the reader. It is the same read-time discipline `report._plan_quality_score`
+the reader. It is the same read-time discipline `cell_admission.plan_quality_score`
 applies to the no-plan floor, and the same rule
 `scripts/run_fable_trial_v2_campaign.py` (task 3632) states as its rule 3 and
 enforces per cell with `MARKER_KEY not in metrics`; the two consumers of this
@@ -868,9 +868,10 @@ cost_per_plan = (spend over ADMITTED plan-only cells) / (n_admitted - no_plan)
 | `plan_rate` | `plan_rate` (beside `plan_quality_n`, the denominator) | `plan_rate` | `plan_rate` on `format_composite_table` **and** in the `plan_quality by config:` block |
 | `cost_per_plan` | `cost_per_plan` (immediately after `cost_usd`) | — (see below) | `cost_per_plan` on `format_composite_table` |
 
-Both reduce through the shared `report._plan_rate` / `report._cost_per_plan`,
-and `_plan_rate` is called by **both** builders — the `_mean_plan_quality`
-discipline, so the two tables the CLI prints adjacently cannot drift.
+Both reduce through the shared `cell_admission.plan_rate` /
+`cell_admission.cost_per_plan`, and `cell_admission.plan_rate` is called by
+**both** builders — the `cell_admission.mean_plan_quality` discipline, so the
+two tables the CLI prints adjacently cannot drift.
 `cost_per_plan` is composite-row-only because `build_plan_quality_report`
 carries no cost data at all; threading some there would create a *second* cost
 surface free to drift from `cost_usd`.
@@ -895,9 +896,9 @@ arithmetic makes the point — fable read `$3.456`/fixture against the opus-max
 incumbent but `$4.731` per usable plan, i.e. *no cheaper at all*, while failing
 to plan 5× as often. Netting the failed attempts out of the numerator would
 report that illusion rather than remove it. An *unmeasurable* cell's `$0.00` is
-still excluded, for the same reason `_is_unmeasurable` keeps it out of the
-`cost` pool: it is the price of a run that never happened, and letting it in
-would report the cap window as a discount.
+still excluded, for the same reason `cell_admission.is_unmeasurable` keeps it
+out of the `cost` pool: it is the price of a run that never happened, and
+letting it in would report the cap window as a discount.
 
 **`select_survivors` ranks on `plan_rate` as a TIE-BREAK, below
 `plan_quality`** (axes 5–6 of 7; the name tiebreak falls to 7). Not above:
@@ -975,7 +976,7 @@ Code: `orchestrator/src/orchestrator/evals/measurement.py` (`UnmeasuredCause`,
 `classify_unmeasured`, `measured_call`), persisted on
 `metrics.py::EvalMetrics.invocation_errors`, mapped from legacy cells by
 `results.py::_invocation_errors_from_marker`, rendered by
-`report.py::format_invocation_errors`.
+`measurement.py::format_invocation_errors`.
 
 An LLM invocation behind an eval cell either produced a measurement (`Scored`)
 or did not (`Unmeasured`, naming its stage, cause, reason and spend). The cell
@@ -1013,7 +1014,7 @@ tainted. The ladder, in order:
   refusal.
 
 The runner adds the causes no `AgentResult` can show: `timeout`,
-`cap_exhausted` (every account stayed capped past the eval's cap-wait patience),
+`cap_exhausted` (every account stayed capped past the shared cap-wait patience),
 and `harness_error` (our own crash: worktree, config, briefing or artifact read
 raised). The plan judge adds `raised` and `unparseable` (a non-JSON, null or
 non-finite answer).
@@ -1070,6 +1071,124 @@ unrecognised stage or cause loads as `(architect, legacy_unclassified, <raw
 string>)`, and a tainted legacy cell with no string gets `(architect,
 legacy_unclassified, '')`. A live run never produces `legacy_unclassified`.
 
+### Scoring instruments: unmeasured, never a tie or zero (task 6736)
+
+Code: `reviewer_trial/scorer.py::match_issues`, `judge.py::run_judge` and
+`::run_elo_tournament`, `compare.py::compare_models`,
+`elo.py::MAX_UNMEASURED_PER_PAIR`, and the reducers
+`reviewer_trial/campaign.py::summarize_arm` and
+`reviewer_trial/report.py::build_trial_report` (all under
+`orchestrator/src/orchestrator/evals/`).
+
+**Instruments measure or say they did not (PRD D1).** The reviewer-trial
+matcher, the pairwise judge, the comparison assessor and the synthesizer are
+instruments, like the plan judge above. Each runs through `measured_call`, so a
+refusal is `Unmeasured`. So is an answer that does not carry the measurement: a
+missing winner, a winner outside A/B/tie, a missing or non-finite confidence,
+or a `matches` that is not a list of objects. Before this task those cases came
+back as a tie (the pairwise judge and the assessor), an overall tie (the
+synthesizer) or an empty match list and F1 0.0 (the matcher). Each of those
+is a measurement nobody made. Prose fields such as reasoning, summary and
+strengths stay lenient, because rejecting on them would throw away a valid
+score. A verdict record (`JudgeVerdict`, `TaskAssessment`) has `winner` None
+exactly when `unmeasured` is set, enforced at construction by
+`measurement.py::require_answer_iff_measured`. The winner vocabulary has one
+home, `elo.PAIRWISE_RESULT`, and every schema enum derives from it.
+
+**Reducers exclude and count (PRD D2).** Every reducer above an instrument
+leaves an unmeasured record out of its figures and reports how many it left
+out: `ArmMetrics.unmeasured`, `VariantSummary.unmeasured`,
+`HeadToHead.unmeasured`, `ComparisonReport.unmeasured` and
+`TournamentTally.unmeasured`. The `corpus-sanity` command does the same, and
+it exits 1 while any cell is unmeasured, because the sanity run is incomplete.
+A group with nothing measured reports None, never 0.0. Per-group cost ratios
+are taken over measured records only, so an unmeasured record moves no mean,
+cost-per-review included. Its spend is still reported, beside the ratios
+(`unmeasured_cost_usd`) and in the trial and campaign totals, because a
+refused call still spent. The synthesizer reads the measured assessments
+only, and it is not called when none measured (`synthesis` is None).
+
+**Elo.** An unmeasured verdict never reaches `record_match`, so it moves no
+rating and adds nothing to the pair's `MAX_PER_PAIR` count. Unmeasured calls
+spend `max_rounds` like measured ones. A pair that returns
+`MAX_UNMEASURED_PER_PAIR` (2) unmeasured verdicts is retired for the rest of
+that run, so a capped account cannot spin the loop. A pair with a missing
+contender joins the same per-run skip set. That replaces the old write of a
+fabricated `pair_counts[key] = MAX_PER_PAIR`, which `is_pairwise_data_dense`
+then read as density. Nothing about the skip set is persisted in `TaskPool`,
+so a later run measures those pairs again. As a second line of defence,
+`record_match` raises on a winner outside `PAIRWISE_RESULT` rather than
+scoring it 0.5.
+
+**Cache and gates.** The reviewer-trial `campaign` command never caches an
+unmeasured score, so a rerun measures that cell again. The matcher draws on the
+campaign's existing usage gate. The pairwise judge, the assessor and the
+synthesizer get no gate, because their drivers build none (PRD §12 q1). Wiring
+one in later is a single `usage_gate=` argument to `measured_call`.
+
+**Backfill (INV-13).** Score files a campaign cached before task 6736 carry no
+`unmeasured` key, so they cannot be told apart from a refused matcher's
+fabricated zero. They are abandoned, not migrated, and they load as measured.
+A campaign that needs a trustworthy mean must rerun into a fresh
+`--results-dir`.
+
+### Reviewer-trial panel cache and score loop (task 6741)
+
+Code: `reviewer_trial/runner.py::PanelRunKey`, `::run_panel_cached`,
+`::run_trial` and `::run_and_score` (under
+`orchestrator/src/orchestrator/evals/`).
+
+**One keyed panel cache.** `run_panel_cached` is the only panel cache, and
+`run_panel` stamps every result with a `PanelRunKey`. That key holds three
+things: a sha256 of the price table the caller passed (None when the call was
+unpriced), whether a usage gate was offered, and the diff cap. Each key has
+its own file, `<results_dir>/<variant>__<diff>__<key digest>.json`, written
+atomically. A stored panel is reused only when it records the requested
+variant and diff and an equal key. So an entry written by `smoke` or
+`calibrate` (unpriced, ungated, default cap) is never reused by a priced,
+pooled or cap-lifted run such as a campaign. And because the keys do not share
+a file, `full`/`sweep` (unpriced) and `refresh` (priced) each keep their own
+`variant_a` panels rather than re-running and overwriting each other's. A
+corrupt or foreign entry is re-run and overwritten. Before this task, two
+hand-rolled caches reused any parseable file, whatever produced it.
+
+**The key hashes what the caller passed.** `prices=None` and
+`prices=default_price_table()` are different keys, even though
+`orchestrator/agents/invoke.py::_estimate_cost` prices both the same way.
+Treating them as one would re-encode that function's private resolution of
+None in a second place. The worst case is a false miss, which costs a rerun.
+A false hit cannot happen. Because the key is a content digest, an edit to the
+packaged price seeds also invalidates every priced entry stored under the old
+table.
+
+**Backfill (INV-13).** Panel entries written before this task carry no
+`run_key` and sit at the bare `<variant>__<diff>.json`. One is honoured as a
+cache hit for any key whose own file is absent, and it is not migrated. This
+mirrors the task-6736 rule for score files above. Each hit is logged at INFO
+naming the file, and `run_trial` logs one WARNING per call counting the legacy
+panels it reused and naming the directory. The packaged results directory and
+finished campaign directories hold such entries, and treating them as misses
+would re-spend every one of them. To re-measure one, delete it or rerun into a
+fresh `--results-dir`.
+
+**One score loop.** `run_and_score` runs `run_trial`'s panels and then scores
+each one through `scorer.py::score_panel_run`, under the same usage gate as
+the panels. It is the run-and-score loop of every reviewer-trial subcommand
+(`calibrate`, `corpus-sanity`, `full`, `sweep`, `refresh` and `campaign`). Its
+optional `score_dir` is the campaign score cache. A score is stored under
+the same file name as the panel it scored, so it is keyed by that panel's key,
+and a legacy panel's score keeps the bare name. A stored score is reused, an
+unreadable one is re-scored and overwritten, and an unmeasured score is never
+stored, so a rerun measures that cell again.
+
+**Resuming a campaign.** Each trial directory's panels and scores are keyed by
+the invocation that wrote them. Resumed with the options it was started with,
+a campaign only reduces what is on disk. Resumed with a different
+`--pool`/`--no-pool` or `--diff-cap`, it runs and scores new panels beside the
+old ones, and the report reads only the new ones. A campaign whose panels
+predate the key only reduces, whatever options it is resumed with, because a
+legacy panel is reused under every key (see Backfill above).
+
 ### Terminal outcome (`terminal_kind`, task 4760)
 
 The three counts above all describe the *quality* axis. This one describes what
@@ -1108,7 +1227,7 @@ a reader who tests presence directly; no consumer has to.
 
 The five decline kinds (`metrics.py::DECLINE_KINDS`) are single-sourced against
 the `artifacts.TaskArtifacts.read_*` readers that produce them via
-`metrics.py::_DECLINE_READERS`, so the vocabulary cannot drift away from the
+`metrics.py::DECLINE_READERS`, so the vocabulary cannot drift away from the
 artifacts it names.
 
 **A DECLINE IS NOT A FAILURE.** It is the architect reading the fixture and
@@ -1140,11 +1259,11 @@ way and neither reading is destroyed. `declined - no_plan_declined` recovers tha
 population exactly.
 
 **planRate is DELIBERATELY unchanged.** `produced_a_plan` is still
-`plan_steps > 0`, `_plan_rate` still reduces the same two numbers, and
+`plan_steps > 0`, `cell_admission.plan_rate` still reduces the same two numbers, and
 `is_scorable_plan` / `score_plan_structure` / `cap_tainted` are untouched — so
 every campaign artifact already committed stays comparable. The split is
 reported ALONGSIDE it, by
-`report.py::build_plan_quality_report` (`declined`, `declined_by_kind`,
+`plan_quality_report.py::build_plan_quality_report` (`declined`, `declined_by_kind`,
 `no_plan_declined`, `terminal_kind_unmeasured`, over the SAME admitted pool `n`)
 and surfaced verbatim by `scripts/run_fable_trial_v2_campaign.py`. **The number
 to read beside `plan_rate` is `no_plan_declined`**: when it equals `no_plan`,
@@ -1177,11 +1296,518 @@ explicit, server-accepted decline calls — none silent, none capped — made af
 a median of 41–98 assistant turns of real investigation. Establishing that took
 manual forensics over `~/.claude/projects/*run-<id>/` transcripts, because the
 decline artifacts themselves were already gone: `snapshots.py::cleanup_eval_worktree`
-`rmtree`s the relocated meta root from `runner.py::run_architect_eval`'s
-`finally`. The runner therefore reads the decline artifacts **inside that
-`finally`, immediately before the cleanup call** — the one site reached by all
-four exits (success, timeout, cap exhaustion, harness error) and the last moment
-the artifacts exist.
+`rmtree`s the relocated meta root once the architect invoke ends. The cell
+therefore reads the decline artifacts **immediately before the cleanup call**
+(`architect_eval.py::invoke_architect`, below) — a site reached by all four
+exits (success, timeout, cap exhaustion, harness error) and the last moment the
+artifacts exist.
+
+### The composite report (task 3099)
+
+Code: `composite_report.py::build_composite_report`, `::format_composite_table`,
+`::build_methodology_report` and `::format_methodology_report`, reducing
+through `cell_admission.py` and `stats.py::mean_ci95` (all under
+`orchestrator/src/orchestrator/evals/`).
+
+**One row per config, over the union of configs.** A config that ran in any
+fixture gets a row. That retires the April all-tasks *intersection* collapse
+(`elo_report.py::compute_aggregate_ratings`), which silently dropped a config
+present in only one fixture. Each trial's composite is normalized within its
+fixture, then each config's trials are pooled across every fixture into a mean
+with a small-sample 95% CI (Open-Q3 / decision 10).
+
+**The efficiency floor is per `(fixture, role_group)`, drawn from measured
+trials.** `role_group` is `plan_only` for an architect trial and `workflow`
+otherwise. A trial's cost and latency scores are `best / value` against the
+minimum positive cost and latency of its own group, taken over the trials that
+*passed*: `tests_pass` for a workflow trial, a plan-quality score and a plan
+for a plan-only one. A cheap run that was wrong, or that could not be
+measured, must not set the floor and deflate the runs that were measured. A
+group in which nothing passed falls back to the minima over all its measurable
+trials, so its denominator stays defined. An unmeasurable trial seeds neither
+map.
+
+The floor is scoped by role because `ofat_candidates()` puts both kinds of
+cell over the same fixtures in one result set. A plan-only cell is one
+architect invocation (~$0.30, ~60s); a workflow cell is a full run (~$5,
+~900s). One shared floor would deflate every workflow row about 16x and clamp
+every plan-only row's efficiency axes to 1.0, so one architect campaign would
+rank differently depending on which implementer rows happened to be in the
+run.
+
+A no-plan cell is barred from seeding its group's floor, because it is cheap
+and fast precisely because it failed. That closes only the intra-group route.
+The cross-group route needs the composite hard gate. Both are set out in "The
+plan-production predicate (task 3302)" above.
+
+**One admission decision for every measured pool.** An unmeasurable plan-only
+trial (`cell_admission.py::is_unmeasurable`) leaves the plan-quality, composite,
+quality, cost and latency pools, the efficiency floors and the `cost_source`
+label together, so no two of them can disagree about a cell. An earlier scope
+kept tainted trials in the composite pool, on the grounds that the composite
+measured the implementer-path gates. That stopped holding once the composite
+was derived from `plan_quality`: a fabricated `0.0` there penalises whichever
+candidate was scheduled inside a cap window. That is task 3118's defect one
+layer up, in the number `select_survivors` ranks on. Keeping such a trial in
+the cost and latency pools was the mirror image. The cell reports the $0.00
+and 0 ms of a run that never happened, so averaging them in *rewarded* the cap
+window: a config read "2x cheaper and 2x faster" than an identically priced
+sibling because one of its trials was refused. `trials`, `fixtures` and the
+`judge` spend totals still count every trial, and `plan_quality_cap_excluded`
+counts the skipped ones.
+
+**An empty pool is `None`, never `0.0`.** A config with no measured trial
+reports `None`, rendered `-`, for every value taken over its measured pools.
+The keys are listed in `composite_report.py::build_composite_report`'s
+docstring. `mean_ci95([])` returns a mean of `0.0`
+with a zero-width interval, which would read as "it scored nothing, for free,
+instantly, and we are confident". The pools share one admission decision, so
+they are empty together or not at all.
+
+**A plan-only row's quality axis is `plan_quality`.** An architect trial
+(`cell_admission.py::is_plan_only`) ran no test, so it is blended with
+`quality=plan_quality, plan_only=True` instead of being hard-gated to `0.0` by
+its absent `tests_pass`. `quality` reports the axis that fed the composite;
+otherwise every architect row would render `quality 0.0000` beside a non-zero
+composite. An all-plan-only config's `tests_pass_rate` is `None`: no test ran,
+so there is no pass rate, not a 0% one.
+
+**`cost_source` labels the mean actually taken.** `cost_usd` is a mean over
+the measured trials, so when they carry more than one distinct source the row
+says `mixed` rather than the first trial's source. A trial dropped from the
+mean drops its source with it. A config with no measured trial says `cli`, for
+back-compat.
+
+**`plan_quality` is the config's pooled mean.** It reduces through
+`cell_admission.py::mean_plan_quality`, the reduction `build_plan_quality_report`
+also uses, so the two tables the CLI prints together cannot disagree. Its pool
+admits a cell through `cell_admission.py::plan_quality_score`, the same accessor
+that table uses. It was once the first untainted trial's value, passed
+through. That was defensible only while it was a diagnostic echo, and stopped
+being so when `select_survivors` began ranking on it.
+`plan_quality_cap_excluded` counts architect trials only, so it agrees exactly
+with that table's `cap_excluded`. A tainted non-architect trial has no
+plan-quality score to exclude, and neither surface counts it.
+
+**The ranking surface carries every count that qualifies `plan_quality`.**
+`format_composite_table` is the table `select_survivors` ranks on, and the one
+an operator reads to choose between candidates. So `pq_excluded`,
+`pq_no_plan`, `pq_no_ref`, `plan_rate` and `cost_per_plan` sit on it, not only
+on the plan-quality table.
+
+- `pq_excluded` counts the cap-tainted architect cells. The breakdown by
+  cause, which separates a transient cap window from a permanent
+  model-not-found, is only on the plan-quality table, so the CLI prints both
+  for an architect result set.
+- `pq_no_plan` counts the floored cells. Without it, a column of
+  `plan_quality 0.0000` reads as "these candidates planned badly" when it
+  means "they produced no plan at all".
+- `pq_no_ref` changes no number on the row: it bounds the confidence in
+  `plan_quality`. It is the one of the three that renders `-`, because a
+  missing validity marker means the question was never asked (see "The
+  validity bound: judged without a reference (task 3628)").
+- `plan_rate` and `cost_per_plan` are set out in "The derived reliability
+  surface (task 3379)". `cost_per_plan` sits immediately after `cost_usd`,
+  because it exists to correct it.
+
+**The μ methodology functions** (`select_survivors`,
+`build_methodology_report`, `format_methodology_report`) are the tested
+substrate of an automatic ofat → survivors → matrix → confirm → report driver
+that is not wired yet. The shipped `eval-ofat`, `eval-matrix` and
+`eval-confirm` commands run each stage on its own, and the operator picks the
+survivors with `--arch` / `--impl`.
+
+### Survivor ranking (`select_survivors`, tasks 3099 and 3379)
+
+Code: `orchestrator/src/orchestrator/evals/composite_report.py::select_survivors`.
+
+`select_survivors` keeps the top *k* configs per `role_under_test`. The ranking
+order is that function's docstring, which is the contract. This section only
+says why the order has that shape.
+
+`None` sorts last on each axis because it means "we measured nothing", which
+must never outrank a config that genuinely scored zero. Coercing it with
+`or 0.0` would tie the two and hand the win to the name sort, promoting the
+candidate we know least about. The config name is the last key, kept only as
+the final byte-stability guarantee.
+
+**Why the `plan_quality` axis exists.** While every architect composite was
+hard-gated to `0.0` (the bug task 3099 fixed), the name tiebreak had silently
+become the whole selection mechanism for the architect role.
+`architect-fable-high` was "selected" for sorting first, not for planning best
+(`plans/eval-architect-effort-verdict-2026-07-27.md`, defect 2). Fixing the
+composite alone would leave the same trap armed for the next pair of genuinely
+tied composites, so the alphabet sits below every axis that carries signal. A
+workflow row carries neither `plan_quality` nor `plan_rate`, so both axes are
+inert for it and the implementer ordering is unchanged.
+
+**The `plan_rate` axis** is the reliability tie-break, and it sits below
+`plan_quality` rather than above it. The reason is the TIE-BREAK paragraph of
+"The derived reliability surface (task 3379)".
+
+### The plan-quality report: four treatments (tasks 3118, 3302, 3628, 4760)
+
+Code: `plan_quality_report.py::build_plan_quality_report` and
+`::format_plan_quality_table`, reducing through `cell_admission.py` (both
+under `orchestrator/src/orchestrator/evals/`). The same module holds the
+recovery-score column, `::build_recovery_report` and `::format_recovery_table`.
+
+**The invariant (task 3118).** A cap-tainted cell is an infra failure: we
+never got to ask the model. It is EXCLUDED from `mean_plan_quality` and
+counted in `cap_excluded`, never averaged in as a zero. Averaging it in would
+penalise whichever candidate was scheduled inside a cap window, which is a
+property of the schedule, not of the candidate.
+
+**`cap_excluded_by_cause`** breaks that total out by cause, because the causes
+are not interchangeable (see "Unmeasured cells: typed causes (task 6734)"). A
+single total would let a config that can never run hide behind `n=0,
+mean=None`, looking like one that merely hit a cap window.
+
+**The marker cell is `excluded`.** A cap-tainted row's `plan_quality` cell is
+neither a number nor the `-` a non-architect row shows, so "this candidate
+scored nothing" and "we could not measure this candidate" read differently at
+a glance. It is spelled `excluded`, not `cap-excluded`, because `cap_tainted`
+covers every unmeasurable cause, and a permanent configuration error must not
+render as a transient cap. The cause is in the adjacent `invocation_error`
+column and in the by-cause trailer line.
+
+**Four treatments, each counted.** Every count is over architect rows only.
+An implementer run never invokes the plan judge, and its null score must not
+dilute the architect mean.
+
+| Cause | Treatment | `n` and the mean | Count | Why |
+|---|---|---|---|---|
+| Transport refusal (`cap_tainted`) | **EXCLUDED** | leaves both | `cap_excluded`, `cap_excluded_by_cause` | the invariant above |
+| No plan produced | **FLOORED** to `0.0` | kept, at `0.0` | `no_plan` | "The plan-production predicate (task 3302)" |
+| Judged without a reference diff | **KEPT + FLAGGED** | kept, at its real score | `judged_without_reference` | "The validity bound: judged without a reference (task 3628)" |
+| Terminal decline | **KEPT + EXPLAINED** | kept, unchanged | `declined`, `declined_by_kind`, `no_plan_declined` | "Terminal outcome (`terminal_kind`, task 4760)" |
+
+The last three are counted inside the admitted pool, so each is a subset of
+`n`. A cap-tainted cell belongs to `cap_excluded` alone, even when it carries
+a stale terminal kind.
+
+**Trailer lines.** After the rows, the table prints the exclusion count, then
+the judged-without-reference bound and the decline split. Each of the last two
+is stated against its own pool, the scored cells, and is suppressed only when
+it is *measured* and zero: a clean campaign must not grow a scary line, and
+that also keeps the output byte-stable. An UNMEASURED population always
+prints. Over a corpus that predates task 3628 or 4760 nothing was measured,
+and a missing line there would make "nothing bounded these scores" look like
+"every score was graded against a landed diff", or "no terminal statement was
+resolved" look like "every candidate tried and failed to plan". The
+terminal-kind line says the cells "carry no resolved terminal kind", not that
+they "predate the field", because `metrics.py::terminal_kind_of` reads an
+absent key and a written null alike.
+
+The report-level decline totals are summed from the per-config counters
+(through `_merge_counts` for `declined_by_kind`), so the two levels cannot
+disagree. Unmeasured cells make those totals PARTIAL, not unknown, and
+`terminal_kind_unmeasured` says by how much. The report-level
+`judged_without_reference` is different: one keyless admitted cell anywhere
+makes it `None`.
+
+**`declined` sits immediately after `no_plan`** in the `plan_quality by
+config:` block, because it explains that number. Appending it at the far end
+would separate the count from the one it qualifies. A measured zero renders
+`0`, not the `-` that means "unmeasurable" on this surface.
+
+**`produced_a_plan` is computed from the metrics dict, never re-derived from
+the row.** The row carries `plan_steps` for a reader. Asking
+`produced_a_plan(row)` instead would work only while the row spells that key
+exactly as the metrics dict does. A rename would silently answer False for
+every row and floor every scored cell to `0.0`, with no exception, no log and
+no failing test. The aggregate reads the answer by subscript, so a dropped key
+raises. `scored_plan_quality`, the accessor's score, sits beside the raw
+persisted `plan_quality`, so the judge's number that a floor overrode stays
+visible on the row.
+
+### The architect cell: invoke, classify, assemble (task 6737)
+
+Code: `orchestrator/src/orchestrator/evals/architect_eval.py`, composed by
+`runner.py::run_architect_eval`.
+
+`run_architect_eval` runs one architect cell as a short composition. The
+architect is invoked and its attempt recorded as a frozen `ArchitectAttempt`:
+outcome, plan, declines, usage, resolved architect cost and, when something
+went wrong, one architect `Unmeasured`. The reference diff is read
+(`read_reference_diff`). `classify_attempt` decides how the plan is scored.
+The plan judge is asked (`judge_plan`) only when that decision is `JUDGE`.
+`assemble_metrics` builds the persisted `EvalMetrics`, and
+`log_architect_cell` writes the route's warning and the completion line.
+`classify_attempt` and `assemble_metrics` are pure. Every effect boundary of a
+cell (worktree, artifacts, briefing, invoke, judge, reference-diff read, gate
+factory, cap-retry wrapper, store) is a field of `ArchitectEvalDeps`, whose
+defaults are the production collaborators, so a test injects fakes rather than
+patching module paths. The orchestrator config the cell runs under is an
+input, not a boundary: `invoke_architect` takes it as `build_orch_config`,
+because the runner derives it from the base config and the candidate.
+
+**The invoke step (`invoke_architect`).** It is the only step with effects on
+the architect, and it drives only the architect: the worktree at the fixture's
+`pre_task_commit`, `TaskArtifacts.init` at the relocated `.task-meta/<name>/`
+root, the replay-framed architect prompt (docs/eval-replay-frame.md), one gated
+`invoke_with_cap_retry` with this candidate's model, backend, effort and
+`env_overrides`, then `read_plan`. Every downstream role is frozen. The
+architect reaches plan-tools and no other MCP server
+(`architect_eval_mcp_scope`): plan-tools is wired through the same seam real
+dispatch uses, so the server writes `plan.json` where the artifacts read it,
+and the strict flag drops the worktree's ambient `.mcp.json` with its live
+escalation and fused-memory servers. The cell's address (`CellName`) is built
+right after the worktree exists, before anything spends, so an unaddressable
+cell fails without a run.
+
+Each way the invoke can end is one row:
+
+| Exit | `outcome` | Architect `Unmeasured` | Plan | Usage |
+|---|---|---|---|---|
+| Answered | `done`, or `blocked` when not `success` | the transport refusal, if `classify_unmeasured` finds one | `read_plan()` | the last attempt's |
+| Answered, then `read_plan` raised | `blocked` | the refusal if any, else `harness_error` | `{}` | the last attempt's |
+| `TimeoutError` | `timeout` | `timeout` | not read | zeros |
+| `AllAccountsCappedException` | `blocked` | `cap_exhausted` | re-read, `{}` if that raises | zeros |
+| Any other exception (config, artifacts, briefing, invoke) | `blocked` | `harness_error` | `{}` | zeros |
+
+Every marker carries the spend banked so far. A classifier that raises leaves
+the cell unmarked rather than losing it.
+
+- The operator's `--timeout` bounds each attempt, never the cap-retry loop.
+  Around the loop, a cap wait longer than the timeout would surface as
+  `outcome='timeout'`, which is candidate-attributable and so not tainted: a
+  cap-starved cell would be scored on a fabricated 0.0 and included in the
+  mean, the differential-exclusion bias φ exists to remove. Per attempt, the
+  two clocks keep their meanings: slowness is a timeout and scores on content,
+  cap starvation is cap exhaustion and taints. A capped attempt is near-instant
+  and free, so the attempt that burns the whole timeout is never the one being
+  retried.
+- Spend is banked per attempt, as each attempt returns.
+  `invoke_with_cap_retry` returns only the last `AgentResult`, so a cap landing
+  mid-run, after the architect spent real money, would otherwise vanish. That
+  matters because the cell is now included: under-reported cost biases the
+  cost comparison the same way exclusion biased quality. Duration is the
+  winning attempt's alone, because cap waits and abandoned attempts are infra
+  time, not candidate latency.
+- Cap exhaustion re-reads the plan. The exception is raised at the invoke, so
+  the ordinary `read_plan` never ran, and a plan written through plan-tools
+  before the pool ran dry would be discarded, turning a scorable cell into an
+  exclusion. The re-read makes exhaustion follow the same taint row an inline
+  mid-run 429 follows. It is caught ahead of the generic handler so it is not
+  labelled our own crash.
+- A transport refusal outranks a later harness error: when `read_plan` raises
+  after a classified refusal, the refusal is the more specific statement of
+  why the cell is not measured.
+- The decline artifacts are read once the call has ended, on every exit and
+  before `cleanup_worktree`, which removes the meta root they live under: it
+  is the last moment they exist. The call turns every `Exception` into an exit
+  row, so the read is reached on each one; the artifacts it reads travel on
+  that exit, with the prices and the banked spend. A read that raises costs
+  the declines, never the cell.
+
+The architect component's cost is resolved per Invariant P5 through
+`metrics.resolve_cost_usd`, the seam `collect_metrics` uses. Its model is
+`config.model`, the model the invoke was handed; `orch_config.models.architect`
+is pinned to the frozen `opus` default for every architect eval and would
+price a fable or vLLM candidate as opus. Its prices come from the built orch
+config, which seeds `claude_endpoint_price_table()` for a proxied candidate
+(task 2820), and its proxy flag is `is_proxied_endpoint(config.env_overrides)`,
+the predicate that seeding keys on. A cell that spent nothing (no tokens, $0.00
+banked) skips resolution and reads `(0.0, 'cli')`: there is no provenance to
+resolve, and resolving would fire the unpriced-proxy warning for spend that
+never happened. The judge's spend keeps its CLI figure (the judge is always a
+native opus call) and the two are composed by `compose_cost_source`.
+
+**The taint table (`classify_attempt`).** "Never asked" means the attempt
+carries an architect `Unmeasured` whose cause is not candidate-attributable;
+`CANDIDATE_ATTRIBUTABLE_CAUSES` holds `timeout` alone. "Scorable" is
+`plan_predicates.is_scorable_plan`, the same predicate the floor and the
+judge's own refusal consult.
+
+| Never asked | Scorable plan | Scoring | `plan_quality` |
+|---|---|---|---|
+| yes | no | `TAINTED` | `None`, `cap_tainted=True` |
+| yes | yes | `FLOORED` | `score_plan_structure(plan)` |
+| no | no | `FLOORED` | `score_plan_structure(plan)`, i.e. `0.0` |
+| no | yes | `JUDGE` | the judge's score, or the floor when the judge is unmeasured |
+
+Per row, and why the line falls there (the general recorded-vs-tainted
+argument is in "Unmeasured cells: typed causes" above):
+
+- A transport refusal (cap hit, auth failure, model not found, body-less 429,
+  5xx, zero-output wedge), cap exhaustion or a harness error, with no scorable
+  plan, is tainted. The candidate was never asked, and charging a schedule,
+  a configuration or our own crash to it would be a fabricated score. "No
+  scorable plan" covers an absent artifact and the header-only stub
+  `create_plan` writes.
+- The same failures after a plan with steps landed (a cap landing mid-run,
+  after the architect wrote real steps through plan-tools) are floored, not
+  tainted: model content exists, so the structural floor is a genuine content
+  measurement. The judge is skipped, because inside the same cap window it
+  would 429 too.
+- A healthy architect with no scorable plan is floored to `0.0` and not marked
+  at all: that is a real reliability signal. The judge is skipped, so the
+  score is never the judge's opinion of an artifact with nothing to judge, and
+  the judge refuses such an artifact itself as well (task 3303).
+- A timeout is marked but is candidate-attributable, so it keeps scoring on
+  content: floored without a plan, judged with one.
+- A failure of the judge alone is recorded (stage `judge`) and never taints:
+  the cell falls back to the floor of a real plan.
+
+The table is today's ladder exactly. Deriving "never asked" from the cause,
+instead of carrying a second flag on the attempt, keeps one fact in one place,
+and a test sweeps every `UnmeasuredCause` so a new cause lands on a row
+deliberately.
+
+**The reference diff and the two warnings.** The reference diff is read on
+every route, so the fixture-level warning ("fixture carries no
+`reference.post_task_commit`") fires once per cell even when the cell is
+tainted and never reaches the judge. That warning states only the fixture-level
+fact. The claim that a score was judged blind is made separately, by
+`judge_plan`, exactly where the judge is invoked with an empty diff.
+`judged_without_reference` is set only where the judge's own number is kept
+(`Scored`), for the reasons in "The validity bound" above: every other path
+persists the structural floor, which never consults a reference.
+
+**Judge spend and calls.** `judge_invocations` is 1 whenever the judge was
+called, even for a $0.00 refusal or an unparseable answer. A judge that raised
+is recorded as `raised` with `cost_usd=0.0` and credits no call, because
+whether the judge was ever reached is unknowable from the caller; its record
+keeps the cell from reading as judge-free. `judge_plan` states that on the
+judgement itself (`PlanJudgement.reached` is false only on that raise), and
+crediting routes on it rather than re-deriving it from the cause.
+`judge_cost_usd` is a subset of the cell's `cost_usd`, as "Spend" above
+states.
+
+**`tests_pass` is `None`.** No test signal exists for a plan-only cell:
+implementer, debugger, reviewer and verify are frozen, so verification never
+runs. `None` is the documented "unknown" value. The dataclass default `False`
+would read as "the tests failed" and hard-gate `blend_composite` to `0.0`,
+collapsing every architect row's composite and leaving `select_survivors`'
+alphabetical tie-break as the whole selection mechanism. `True` is wrong too:
+`build_composite_report` draws each fixture's cost and latency floor from
+passing trials, and `ofat_candidates()` mixes architect, implementer and judge
+candidates over the same fixtures, so a cheap plan-only cell marked passing
+would become the floor for full-workflow cells, and it would fabricate a 100%
+`tests_pass_rate` for a cell that never ran a test.
+
+### Eval usage-gate lifecycle (task 6737)
+
+Code: `orchestrator/src/orchestrator/evals/eval_gate.py`
+(`build_eval_usage_gate`, `owned_usage_gate`, `campaign_usage_gate`,
+`GATE_UNSET`, `InjectedGate`). Consumers:
+`runner.py`'s three executors and stage fan-outs, `cli.py::_run_single_eval`
+and `reviewer_trial/__main__.py::campaign`.
+
+**Why an eval invoke is gated at all (eval-revival φ).** Ungated, a capped
+account refuses the architect outright and the cell is recorded `cap_tainted`,
+so it is excluded from the reported mean. The 2026-07-28 architect wave lost
+about 40% of its cells that way (37 blocked). Exclusion is not neutral: the
+costlier candidate runs longer, is more cap-exposed, and so loses more cells
+than its cheaper rival. The surviving cells are then a biased sample, and the
+comparison the campaign exists to make is silently wrong. Failing over to a
+healthy account measures the candidate instead of the schedule.
+
+**One builder.** `build_eval_usage_gate` is the single construction every eval
+entry point uses. It replaced three byte-identical copies, the shape that
+drifts: the zero-account degrade below would otherwise have had to be
+remembered in three places. It comes back ungated (`None`) three ways, all
+warn-and-degrade rather than raise. Losing failover costs cells, but raising
+costs the whole campaign, for a reason that has nothing to do with the
+candidate under test.
+
+1. `usage_cap.enabled=False`. This is a real production configuration: a
+   deployment that opted out of the account pool must not pay for probe dirs
+   and account state it never asked for.
+2. The constructor raised.
+3. The gate constructed but resolved zero accounts. `_init_accounts` logs "No
+   configured account resolved a token, and the ~/.claude default-credential
+   fallback is disabled" and returns `[]` (the fallback is an explicit opt-in
+   since task 8161), so
+   construction succeeds and the failure is deferred to the first
+   `before_invoke`, which raises `RuntimeError('No OAuth accounts available
+   ...')`. That lands in the caller's harness-error handler, so the cell is
+   tainted and excluded. With `usage_cap.enabled=True` but no `CLAUDE_OAUTH_*`
+   exported (an ordinary CI shell), every
+   architect cell would be lost, where the same campaign ran fine ungated on
+   ambient credentials before φ. An empty pool has nothing to fail over to, so
+   degrading forfeits nothing. The discarded gate is still shut down
+   (best-effort): even with no accounts the constructor allocated a fallback
+   probe `TaskConfigDir` and installed a SIGHUP handler, and this runs once
+   per cell.
+
+**The three readings of a `usage_gate=` argument (`InjectedGate`, task 4427).**
+A `UsageGate` is a live gate a campaign owner handed down. `None` is a campaign
+owner that is deliberately ungated: run without failover and do not build one.
+`GATE_UNSET`, the default, means nobody supplied anything: build a gate and own
+it. A plain `None` default cannot express this, because `build_eval_usage_gate`
+legitimately returns `None` three ways. A campaign whose gate degraded would
+hand `None` to every cell, and each cell would read that as "nothing was
+supplied" and build its own, silently restoring the per-cell construction the
+campaign gate exists to remove (and re-paying a probe-dir allocation plus a
+SIGHUP-handler steal per cell on the zero-account path). `GATE_UNSET` is an
+instance of a private class so the annotation and the `isinstance` check are
+pyright-clean.
+
+**Whoever built the gate tears it down, and nobody else.** `owned_usage_gate`
+is that contract, stated once for all three executors. Given `GATE_UNSET` it
+builds through its factory, yields, and shuts the gate down on exit, whether
+the body returned or raised. Given a gate or `None` it yields the argument and
+touches nothing.
+
+- An owned gate must come down. A campaign loops fixtures × candidates ×
+  trials in one process, so a gate left running leaks a live account-resume
+  probe loop firing real CLI probes for the rest of the campaign, and each new
+  gate steals the SIGHUP handler from predecessors kept alive by exactly those
+  background tasks.
+- A borrowed gate must not. It carries the one cap-state view every sibling
+  cell shares, so cell N+1 no longer re-leases the account cell N proved
+  capped. Shutting it down would take failover from every sibling still to
+  run, including ones already in flight.
+- Teardown is best-effort everywhere: the cell (or the campaign) is already
+  complete by then, so a failing `shutdown()` logs and never turns a finished
+  result into a raise.
+
+In the architect cell the owned gate wraps only the `invoke_with_cap_retry`
+call, the one call that uses it. A harness error before the invoke therefore
+builds no gate at all.
+
+**One gate per campaign (`campaign_usage_gate`).** A campaign is any loop that
+runs several cells in one process. It builds through `owned_usage_gate`, so
+build, yield and teardown have one implementation. It builds from
+`base_config`, which is right because the builder reads exactly one leaf,
+`usage_cap`, and every cell's orch config is
+`apply_eval_profile(base_config).model_copy(update=...)` with neither
+`EVAL_PROFILE` nor the update dict mentioning `usage_cap`. The leaf is
+inherited verbatim and the campaign gate is identical to the one each cell
+would have built. That equivalence is emergent across two files, so
+`test_eval_architect.py::TestCampaignGatePremise` pins it as a tripwire. A
+`None` base config yields `None` without building: there is nothing to build
+from, and every stage function defaults it. A `None` yield, from that or from
+a degraded build, must be threaded to cells as an explicit `usage_gate=None`,
+never dropped, for the reason in the readings above.
+
+Sharing one gate across concurrent cells is the production shape, not a new
+one: `orchestrator.harness.Harness` builds one `UsageGate` per orchestrator
+process, shares it across every concurrently running workflow, and tears it
+down once. Account leasing exists to arbitrate concurrent consumers, and
+sharing is what makes cap state mean anything: a cell that proves an account
+capped must inform its in-flight siblings, not merely its successors.
+
+Sharing also makes the gate's runtime state campaign-scoped, including
+`UsageGate._cumulative_cost`. `before_invoke` raises `SessionBudgetExhausted`
+once that tally reaches `usage_cap.session_budget_usd`, and nothing resets it
+between cells, so one gate means one session ceiling for the whole campaign
+where a per-cell gate gave each cell a fresh budget. With the ceiling set, a
+long campaign would trip partway through and every remaining cell would block
+or be stamped `harness_error`, losses the report would attribute to the
+candidate. This is latent, not live: `session_budget_usd` defaults to `None`
+and no config in this repo sets it. A campaign that wants per-cell budgeting
+should build from a `usage_cap` copy with `session_budget_usd=None` and let
+each invocation's `max_budget_usd` bound it instead.
+
+**Cap-wait patience: the shared default.** The architect call passes no
+`cap_wait_sanity_secs` and no `max_cap_retries`, so it takes the shared default
+(`shared/src/shared/cli_invoke.py::_DEFAULT_CAP_WAIT_SANITY_SECS`; esc-4002-1,
+task 7320). Waiting is about free, because `--resume` carries banked spend
+across the account switch, while tainting re-spends it. A fixed retry count
+would give a bigger pool less patience.
 
 ---
 

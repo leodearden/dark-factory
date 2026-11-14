@@ -53,6 +53,9 @@ from shared.memory_eval_metrics import (
     serialize_metric_series,
     validate_metric_series,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 EXEMPLAR_ROOT = REPO_ROOT / 'plans' / 'memory-eval-e1-first-live-run'

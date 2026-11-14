@@ -32,6 +32,11 @@ class KeyedStreaks(Generic[K]):
         self._threshold = threshold
         self._counts: dict[K, int] = {}
 
+    @property
+    def tracked_keys(self) -> frozenset[K]:
+        """The keys currently in a live failure run, as a read-only snapshot."""
+        return frozenset(self._counts)
+
     def failure(self, key: K) -> StreakStep:
         """Extend *key*'s run by one; ``fired`` is true only at the call that reaches the threshold."""
         count = self._counts.get(key, 0) + 1

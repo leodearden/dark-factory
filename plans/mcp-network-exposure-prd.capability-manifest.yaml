@@ -1,0 +1,184 @@
+prd: plans/mcp-network-exposure-prd.md
+schema_version: 1
+signal_leaves:
+- γ
+tasks:
+- label: α
+  task_id: 8128
+  title: scripts/check_network_exposure.py — behavioural loopback-only probe, wired into setup-host §11
+  note: Table of self-bound/docker ports pinned to compose and ServerConfig.recon_report_port by a test, not a delivered_check (a grep cannot assert set equality).
+  capabilities:
+  - name: exposure-check-script-exists
+    binding: capability→producer — α creates scripts/check_network_exposure.py; absent on main.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - scripts/check_network_exposure.py
+  - name: exposure-check-tests-exist
+    binding: capability→producer — α creates tests/scripts/test_check_network_exposure.py; absent on main.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      expect: present
+      paths:
+      - tests/scripts/test_check_network_exposure.py
+  - name: wired-into-setup-host-health-checks
+    binding: anti-orphan — α adds the probe to scripts/setup-host.sh section 11 beside the parity checkers; the name does not appear there on main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: check_network_exposure
+      paths:
+      - scripts/setup-host.sh
+      expect: present
+  - name: tagged-output-parity-convention
+    binding: capability→producer — every emitted line carries the [network_exposure] tag, the scripts/systemd_unit_parity.py::emit convention (substrate present on main).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \[network_exposure\]
+      paths:
+      - scripts/check_network_exposure.py
+      expect: present
+  - name: structured-sources-no-ss-parser
+    binding: capability→producer — port set from `systemctl --user list-sockets -o json` (verified live), addresses from `ip -j addr`; no ss text parsing.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: list-sockets
+      paths:
+      - scripts/check_network_exposure.py
+      expect: present
+  - name: red-on-todays-host
+    binding: behaviour — with 0.0.0.0 binds present the check exits non-zero naming port, accepting address and owner; judged by α's tests with in-process wildcard binds.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behaviour asserted by α's tests against in-process 0.0.0.0 and 127.0.0.1 listeners
+- label: β
+  task_id: 8129
+  title: Loopback in the committed truth (socket template, config.yaml, schema default, compose) plus restart-fused-memory.sh --rebind-socket
+  note: γ's before_done names this script with --rebind-socket; the authored wrapper scripts/deploy/apply-loopback-binds.sh was dropped at decompose because the deterministic guard requires before_done.script to exist on main at filing (PRD §13).
+  capabilities:
+  - name: socket-template-loopback-8002
+    binding: capability→producer — β changes scripts/fused-memory.socket.template ListenStream to 127.0.0.1:8002; today 0.0.0.0:8002.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^ListenStream=127\.0\.0\.1:8002$
+      paths:
+      - scripts/fused-memory.socket.template
+      expect: present
+  - name: no-wildcard-bind-in-socket-template
+    binding: rejection — no 0.0.0.0 remains in the socket template after β.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 0\.0\.0\.0
+      paths:
+      - scripts/fused-memory.socket.template
+      expect: absent
+  - name: config-server-host-loopback
+    binding: capability→producer — β sets fused-memory/config/config.yaml server.host to 127.0.0.1, which re-binds :8003 (main.py::_build_recon_report_components reads config.server.host) and keeps test_socket_listens_on_the_configured_endpoints green with the template.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^  host: "127\.0\.0\.1"'
+      paths:
+      - fused-memory/config/config.yaml
+      expect: present
+  - name: server-config-default-loopback
+    binding: capability→producer — β flips ServerConfig.host default from '0.0.0.0' to '127.0.0.1' in fused-memory/src/fused_memory/config/schema.py; config-docker.yaml keeps its explicit 0.0.0.0.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "^    host: str = Field\\(default='127\\.0\\.0\\.1'"
+      paths:
+      - fused-memory/src/fused_memory/config/schema.py
+      expect: present
+  - name: compose-loopback-publish
+    binding: capability→producer — β prefixes every compose ports mapping with 127.0.0.1:; today "6379:6379", "6333:6333", "6334:6334".
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 127\.0\.0\.1:6379:6379
+      paths:
+      - fused-memory/docker/docker-compose.yml
+      expect: present
+  - name: no-unprefixed-publish-in-compose
+    binding: rejection — no bare "host:container" ports entry remains; also the invariant 7792's added service inherits (PRD §7).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^\s*-\s*"[0-9]+:[0-9]+"'
+      paths:
+      - fused-memory/docker/docker-compose.yml
+      expect: absent
+  - name: rebind-socket-mode-exists
+    binding: capability→producer — β adds --rebind-socket to scripts/restart-fused-memory.sh; today the script rejects it with its usage line (exit 1). γ's before_done substrate.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: rebind-socket
+      paths:
+      - scripts/restart-fused-memory.sh
+      expect: present
+  - name: rebind-uses-stop-then-start
+    binding: capability→producer — the mode issues `systemctl --user stop fused-memory` then `systemctl --user start fused-memory.socket fused-memory` (OPERATIONS.md section "Socket activation" procedure) instead of a plain restart.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: start fused-memory\.socket fused-memory
+      paths:
+      - scripts/restart-fused-memory.sh
+      expect: present
+  - name: rebind-runs-exposure-check
+    binding: anti-orphan — β consumes α's script as the mode's post-condition.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: check_network_exposure
+      paths:
+      - scripts/restart-fused-memory.sh
+      expect: present
+  - name: operations-socket-table-updated
+    binding: one-fact-one-home — OPERATIONS.md section 8 socket table row stops saying `0.0.0.0:8002`.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '`0\.0\.0\.0:8002`'
+      paths:
+      - OPERATIONS.md
+      expect: absent
+  - name: test-legs-green-recon-report-untouched
+    binding: behaviour — fused-memory, scripts and whole-tree legs pass; fused-memory/tests/server/test_recon_report.py already asserts '127.0.0.1' and needs no edit.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: judged by the merge gate, not greppable
+- label: γ
+  task_id: 8130
+  title: Apply loopback binds on the workstation — deterministic auto-deploy via restart-fused-memory.sh --rebind-socket
+  note: No batch task depends on γ (7792 depends on β), so these checks gate no dispatch; they feed the dashboard's delivered mark. Primary record is done_provenance kind deterministic-deploy.
+  capabilities:
+  - name: host-loopback-only
+    binding: behaviour — after the stop/start, scripts/check_network_exposure.py exits 0 on the workstation (refused on 192.168.1.105 / 100.107.28.56 / global IPv6 for 8002, 8003, 8103, 81xx, 6379, 6333, 6334; accepted on 127.0.0.1).
+    verdict: PASS
+    delivered_check:
+      kind: script
+      script: scripts/check_network_exposure.py
+      timeout_secs: 60
+  - name: fused-memory-restarted-on-new-socket-unit
+    binding: capability→producer — DeterministicRunner verifies a fresh MainPID/ActiveEnterTimestamp on fused-memory.service (docs/task-authoring.md section 5) and stamps done_provenance.kind deterministic-deploy.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: stamped by the runner on the task record, not on the tree
+  - name: local-consumers-unchanged
+    binding: behaviour — all nine orchestrator-*.service active, dashboard fused-memory and escalation panels green, a reconciliation cycle completes against 127.0.0.1:8003.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: operational observation after the deploy

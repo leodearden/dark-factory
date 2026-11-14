@@ -32,7 +32,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import extract_function_body, strip_js_comments
 
 
 def _parameter_list(source: str, func_name: str) -> str:
@@ -50,7 +50,7 @@ def _parameter_list(source: str, func_name: str) -> str:
     rule ``extract_function_body`` follows).
 
     Same paren-depth walk as test_charts_axis_labels.py's ``_extract_signature``.
-    Its proper home is ``_dashboard_helpers`` beside ``extract_function_body``/
+    Its proper home is ``_jsx_source_helpers`` beside ``extract_function_body``/
     ``strip_js_comments``, and hoisting it there is tracked by ticket
     tkt_0RSN5VVGAVK7BQ8K9GX4PM2YBZ (see test_esc_flow_diagram.py's header note
     on this helper family); task 4137 holds a lock on neither file, so it fixes
@@ -83,7 +83,7 @@ def _parameter_list(source: str, func_name: str) -> str:
 def tasks_tab_body(tab_tasks_jsx_body):
     """TasksTab's brace-delimited body, signature excluded.
 
-    Scoped away from the other component functions (TaskGraph, PrdBox,
+    Scoped away from the other component functions (TaskGraph,
     TaskDetail, ...) in the same file so an assertion cannot be satisfied by
     an unrelated component.
     """
@@ -179,17 +179,10 @@ class TestFocusHeaderWiring:
             'shownCount is its shown array\'s length by construction.'
         )
 
-    @pytest.mark.parametrize(
-        'component, prop', [('TaskGraph', 'tasks'), ('ProjectPrdGroups', 'graphTasks')]
-    )
-    def test_group_body_renders_the_array_the_header_counts(
-        self, tasks_tab_code, component, prop
-    ):
+    def test_group_body_renders_the_array_the_header_counts(self, tasks_tab_code):
         """The other half of the header/body agreement: the body is fed ``groupView.shown``."""
-        assert re.search(
-            rf'<{component}\s+{prop}=\{{\s*groupView\.shown\s*\}}', tasks_tab_code
-        ), (
-            f'TasksTab does not pass groupView.shown as <{component} {prop}=...> '
+        assert re.search(r'<TaskGraph\s+tasks=\{\s*groupView\.shown\s*\}', tasks_tab_code), (
+            'TasksTab does not pass groupView.shown as <TaskGraph tasks=...> '
             '— the group body must render the same array whose length the header '
             'displays as shownCount.'
         )
@@ -213,16 +206,13 @@ class TestFocusHeaderWiring:
             'array the group body did not render.'
         )
 
-    @pytest.mark.parametrize('component', ['TaskGraph', 'ProjectPrdGroups'])
     @pytest.mark.parametrize('focus_prop', ['focusMode', 'focusAnchorId'])
-    def test_rendering_components_take_no_focus_state(
-        self, tab_tasks_jsx_body, component, focus_prop
-    ):
-        """Neither component the group body renders may take focus state.
+    def test_rendering_components_take_no_focus_state(self, tab_tasks_jsx_body, focus_prop):
+        """The component the group body renders may not take focus state.
 
-        These are the two the projects.map callback hands ``groupView.shown``
-        to — TaskGraph for the flat view, ProjectPrdGroups for the grouped one.
-        Keeping focusMode/focusAnchorId out of their parameter lists is what
+        TaskGraph draws ``groupView.shown`` in the flat view and, through the
+        lanes page's renderMembers, inside an expanded PRD row.
+        Keeping focusMode/focusAnchorId out of its parameter list is what
         prevents a second narrowing site growing back and diverging from the
         header count again.
 
@@ -238,6 +228,7 @@ class TestFocusHeaderWiring:
         defaulted parameter (``focusMode = false``) is not an exact set member
         but is every bit the focus state this forbids.
         """
+        component = 'TaskGraph'
         params = _parameter_list(tab_tasks_jsx_body, component)
         assert params.strip(), (
             f'{component} declares an empty parameter list. It is rendered with '
@@ -261,10 +252,7 @@ class TestFocusHeaderWiring:
         prose, and a cosmetic rewrite of a message must not turn this red.
 
         Why the branch has to exist at all: the filter-empty sentence is
-        actively false there (the filter matched; focus removed the tasks),
-        and on the grouped path there is no message at all today —
-        groupTasksByPrd([]) yields zero boxes, so the body renders a silently
-        blank .prd-groups div.
+        actively false there (the filter matched; focus removed the tasks).
         """
         assert re.search(
             r'\.emptiedByFocus\b[^;]{0,200}?className="empty"',
@@ -272,9 +260,7 @@ class TestFocusHeaderWiring:
             re.DOTALL,
         ), (
             'TasksTab has no .empty element inside an emptiedByFocus branch — a '
-            'group emptied by focus renders blank (grouped view: '
-            'groupTasksByPrd([]) yields zero boxes) or claims the filter '
-            'emptied it (flat view). The two tokens are required in ONE '
+            'group emptied by focus claims the filter emptied it. The two tokens are required in ONE '
             'expression on purpose: as independent whole-body existence checks '
             'this passed on the header suffix plus any unrelated .empty element '
             'in TasksTab, so deleting the body branch left it green.'

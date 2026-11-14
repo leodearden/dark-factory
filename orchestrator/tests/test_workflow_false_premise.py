@@ -259,7 +259,7 @@ async def test_no_steward_present_does_not_raise(tmp_path: Path):
 async def test_missing_premise_still_escalates_design_concern(tmp_path: Path):
     """Malformed artifact (missing premise): still design_concern L1."""
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
-    (f.artifacts.root / 'false_premise.json').write_text(
+    f.artifacts.artifact_path('false_premise.json').write_text(
         '{"classification": "exactness", "evidence": "e"}\n'
     )
 

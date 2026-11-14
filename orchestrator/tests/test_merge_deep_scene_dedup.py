@@ -13,10 +13,10 @@ sweep also forbids a consumer from re-DEFINING any name the scene defines.
 Both checks carry a positive control, because a satisfied check and an inert
 one look the same.
 
-Scope: the deep integration gate and deep landing modules, plus the invariant
-gate's re-definition sweep.  test_merge_queue_deep_dispatch.py and
-test_merge_queue_build_chain.py are NOT yet covered; task 5172 owns extending
-this file to them.
+Scope: the four deep consumers -- the deep integration gate, deep landing,
+deep dispatch and build-chain modules -- get both the identity check and the
+re-definition sweep.  The invariant gate gets the re-definition sweep alone,
+minus the by-design name collisions INVARIANT_GATE_LOCAL_BY_DESIGN lists.
 """
 from __future__ import annotations
 
@@ -33,6 +33,8 @@ import pytest
 
 DEEP_GATE = 'test_merge_queue_deep_integration_gate'
 DEEP_LANDING = 'test_merge_queue_deep_landing'
+DEEP_DISPATCH = 'test_merge_queue_deep_dispatch'
+BUILD_CHAIN = 'test_merge_queue_build_chain'
 INVARIANT_GATE = 'test_merge_queue_invariant_integration_gate'
 
 _TESTS_DIR = Path(__file__).parent
@@ -44,6 +46,7 @@ SHARED_SCENE_LAYER: tuple[str, ...] = (
     # repo fixtures and builders
     '_setup_repo',
     '_add_recording_seed_to_repo',
+    '_commit_seed_script',
     'git_repo',
     '_make_spec_git_config',
     '_make_git_ops',
@@ -61,6 +64,7 @@ SHARED_SCENE_LAYER: tuple[str, ...] = (
     '_merge_commit_onto',
     '_external_main_bump',
     '_abort_hook_at',
+    '_worktree_names',
 
     # spies, census and readers
     '_local_lease',
@@ -72,6 +76,10 @@ SHARED_SCENE_LAYER: tuple[str, ...] = (
     '_drain_residue',
     '_events_for_task',
     '_canary_predicate_items_per',
+    '_count_spec_lane_acquires',
+    '_spy_post_merge_verify',
+    '_StubRemoteAllocator',
+    '_fail_verify_result',
 )
 
 # These share a NAME with scene helpers, not a body: a README-only repo with no
@@ -192,7 +200,9 @@ def test_the_scene_defines_every_name_in_the_shared_layer() -> None:
 
 
 _EACH_DEEP_CONSUMER = pytest.mark.parametrize(
-    'consumer_name', [DEEP_GATE, DEEP_LANDING], ids=['deep_gate', 'deep_landing'],
+    'consumer_name',
+    [DEEP_GATE, DEEP_LANDING, DEEP_DISPATCH, BUILD_CHAIN],
+    ids=['deep_gate', 'deep_landing', 'deep_dispatch', 'build_chain'],
 )
 
 

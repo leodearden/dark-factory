@@ -1,0 +1,24 @@
+{
+  "task_id": "6133",
+  "reason": "Net-additive defect fix (task 6133): stack_train_branches now un-stacks the train ANCHOR from an earlier unlanded stack base before stacking successors onto it, and abandons formation when it cannot (BLOCKED/CONFLICT), so a coalesce/former train anchored on a member still carrying a never-landed predecessor's commits can no longer land that predecessor's deliverable through _do_train_merge. The un-stack-and-log policy is extracted from _stack_member into GitOps._shed_unlanded_base so both paths share it. Not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1480,
+      "current": 1482
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::stack_train_branches",
+      "baseline": 7,
+      "current": 8
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5015,
+      "current": 5017
+    }
+  ]
+}

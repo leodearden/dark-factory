@@ -1,0 +1,60 @@
+{
+  "task_id": "6647",
+  "reason": "same-tree gate skip: _reverify_rebased_tree returns a typed GateClearance and compares the rebased tree with the verified one before the overlap probe; merge_attempt gate_retry rows carry the clearance",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 335,
+      "current": 342
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_emit_merge_attempt",
+      "baseline": 18,
+      "current": 20
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_reverify_rebased_tree",
+      "baseline": 4,
+      "current": 6
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 3493,
+      "current": 3550
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22172,
+      "current": 22178
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 1581,
+      "current": 1604
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4862,
+      "current": 4869
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57233,
+      "current": 57296
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31584,
+      "current": 31607
+    }
+  ]
+}

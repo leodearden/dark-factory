@@ -16,6 +16,46 @@
       "severity": "suggestion",
       "description": "The change removes asyncio/FastMCP overhead but keeps an absolute wall-clock 50ms bound measured with time.perf_counter, which still includes OS scheduling latency. Under pytest-xdist -n auto with 32 workers on a contended CPU, the process can be descheduled for tens of milliseconds during json.loads of the ~500KB file, so the median-of-20 assertion can still intermittently trip \u2014 the de-flake root cause (CI load sensitivity of a wall-clock latency bound) is only partially addressed.",
       "mutation_type": "test_gap"
+    },
+    {
+      "id": "mined_1335_pool_01",
+      "location": "fused-memory/tests/test_scheduler_state_tools.py:384",
+      "category": "weak_assertion",
+      "severity": "suggestion",
+      "description": "The non-trivial-read guard checks only len(result['skip_counts']) == n; asserting result == snapshot once after the timing loop would check the whole payload at no cost to the timed region and make the ten-line justification comment unnecessary. Minor, since json.loads is all-or-nothing and the length check already catches the empty-skeleton fallback.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1335_pool_02",
+      "location": "fused-memory/tests/test_scheduler_state_tools.py:393",
+      "category": "inaccurate_comment",
+      "severity": "suggestion",
+      "description": "Several factual claims in the new comments are false: the payload is called 'a ~500KB file' but json.dumps of the fixture is 114,675 bytes (~115KB); the docstring attributes flakiness to 'pytest-xdist -n auto with 32 workers' though pyproject sets only '-n auto' (worker count is machine-dependent); the warm-up comment says it absorbs 'OS page-cache warm-up' although _write_snapshot has just written the file; and the guard comment says 'json.loads of a non-existent path is microseconds' whereas read_bytes raises FileNotFoundError and json.loads never runs.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1335_pool_03",
+      "location": "fused-memory/tests/test_scheduler_state_tools.py:327",
+      "category": "comments_stance",
+      "severity": "suggestion",
+      "description": "About 30-40 lines of new docstring and comments surround about 20 lines of test logic, and most of it is addressed to a reviewer rather than describing the code: rejected alternatives ('Do NOT loosen this to 150-250ms', 'Do NOT confuse this with an MCP-layer perf bound'), history ('vs. the previous 9-sample window'), task-id provenance (1230, 1335), and a ten-line block restating what the assertion message already says, naming the private _empty_skeleton().",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1335_pool_04",
+      "location": "fused-memory/tests/test_scheduler_state_tools.py:365",
+      "category": "magic_numbers",
+      "severity": "suggestion",
+      "description": "The loop uses 'range(22)' and 'if i >= 2' to encode 2 warm-ups plus 20 measured samples; the two literals must be kept consistent by hand and a comment is needed to explain them. Named constants (or a separate warm-up loop) would remove the branch and the comment.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1335_pool_05",
+      "location": "fused-memory/tests/test_scheduler_state_tools.py:321",
+      "category": "test_placement",
+      "severity": "suggestion",
+      "description": "TestSnapshotPerformance now targets the sync helper fused_memory.mcp_tools.scheduler_state.read_scheduler_state directly, but still sits in test_scheduler_state_tools.py whose other classes exercise the MCP tool surface via create_mcp_server, and its class name does not say it tests the helper rather than the tool.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

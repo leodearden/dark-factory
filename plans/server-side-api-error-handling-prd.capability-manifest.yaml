@@ -365,3 +365,7 @@ tasks:
       kind: manual
       reason: the task IS the check suite; signal is rows 11-13 green in one harness
         run
+signal_leaves:
+- ζ
+- κ
+- π

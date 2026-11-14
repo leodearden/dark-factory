@@ -14,7 +14,13 @@ source cannot reach the model. Of the maintenance package, it imports only
 The seam is :class:`ShardAsker`: a structured :class:`Shard` in, a
 :class:`ShardReply` out. :func:`adjudicate_links` owns sharding, id validation,
 parsing and the failed-shard streak, so every asker, fake or real, runs through
-them. :class:`ClaudeShardAsker` is the production asker, in the shape of
+them. :func:`configured_adjudicator` reads the brief once and binds it, with
+the ``link_heal`` leaves, into a :class:`ConfiguredAdjudicator` that names its
+model and prompt version (:func:`prompt_sha256`), so every verdict of a run is
+attributable to the one prompt it was asked under. The model is named as
+``link_heal.adjudicator_model`` spells it: an alias such as ``opus`` names the
+same adjudicator after the CLI moves it to a newer model.
+:class:`ClaudeShardAsker` is the production asker, in the shape of
 ``middleware/path_scope_adjudicator.py::PathScopeAdjudicator.adjudicate`` and
 ``reconciliation/judge.py::Judge._call_judge_cli``: the Claude CLI over OAuth,
 schema-bound output, every tool denied, no MCP servers, a neutral cwd.
@@ -23,6 +29,7 @@ schema-bound output, every tool denied, no MCP servers, a neutral cwd.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -33,7 +40,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
 from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers_config
 from shared.neutral_cwd import neutral_cli_cwd
-from shared.storm_counter import StormCounter
+from shared.streak import KeyedStreaks
 
 from fused_memory.maintenance.link_heal import Verdict
 
@@ -154,6 +161,14 @@ def render_system_prompt(brief_text: str) -> str:
     return f'{brief_text.rstrip()}\n\n## Protocol for this call\n\n{_PROTOCOL}\n'
 
 
+def prompt_sha256(brief_text: str, field_chars: int) -> str:
+    """The prompt version: the sha256 of everything besides the model that decides what
+    the model is asked, the system prompt *brief_text* renders and the *field_chars*
+    cap its pair texts are cut to."""
+    identity = {'system_prompt': render_system_prompt(brief_text), 'field_chars': field_chars}
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode('utf-8')).hexdigest()
+
+
 def render_user_prompt(shard: Shard) -> str:
     return '\n\n'.join(
         f'ITEM {item.item_id}\nCHILD: {item.child_text}\nPARENT: {item.parent_text}'
@@ -168,9 +183,6 @@ class ShardAsker(Protocol):
 StormHook: TypeAlias = Callable[[Mapping[str, Any]], None]
 ShardVerdicts: TypeAlias = dict[str, tuple[Verdict, str]]
 ShardFailure: TypeAlias = tuple[AdjudicationFailure, str]
-
-#: A streak is consecutive shards of one run, so its window must outlast any run.
-_STREAK_WINDOW_SECONDS = 7 * 24 * 3600.0
 
 
 async def adjudicate_links(
@@ -192,18 +204,39 @@ async def adjudicate_links(
     _refuse_duplicate_keys(pairs)
     ask = ask if ask is not None else ClaudeShardAsker()
     chunks = _chunks(pairs, shard_size)
-    streak = _ShardFailureStreak(failure_streak)
+    failures: KeyedStreaks[None] = KeyedStreaks(threshold=failure_streak)
+    failed_shards: list[ShardFailure] = []
     verdicts: list[LinkVerdict] = []
     for index, chunk in enumerate(chunks):
         outcome = await _judge_chunk(ask, chunk, model=model, field_chars=field_chars)
         verdicts.extend(_link_verdicts(chunk, model, outcome))
-        storm = streak.observe(outcome)
-        if storm is not None:
+        if not isinstance(outcome, tuple):
+            failures.success(None)
+            continue
+        failed_shards.append(outcome)
+        step = failures.failure(None)
+        if step.fired:
             if on_failure_storm is not None:
+                storm = _storm_summary(
+                    failed_shards[-step.count:],
+                    threshold=failure_streak,
+                    shards_failed=len(failed_shards),
+                )
                 on_failure_storm({**storm, 'model': model, 'shards_total': len(chunks)})
-            verdicts.extend(_not_attempted(chunks[index + 1:], model, streak.shards_failed))
+            verdicts.extend(_not_attempted(chunks[index + 1:], model, len(failed_shards)))
             break
     return verdicts
+
+
+def _storm_summary(
+    run: Sequence[ShardFailure], *, threshold: int, shards_failed: int,
+) -> dict[str, Any]:
+    return {
+        'count': len(run),
+        'threshold': threshold,
+        'labels': sorted({failure.value for failure, _ in run}),
+        'shards_failed': shards_failed,
+    }
 
 
 def _refuse_duplicate_keys(pairs: Sequence[LinkPair]) -> None:
@@ -324,28 +357,6 @@ def _not_attempted(
     ]
 
 
-class _ShardFailureStreak:
-    """Consecutive failed shards, on a latched StormCounter that a success replaces."""
-
-    def __init__(self, threshold: int) -> None:
-        self._threshold = threshold
-        self._counter = StormCounter(fire_mode='latched')
-        self.shards_failed = 0
-
-    def observe(self, outcome: ShardVerdicts | ShardFailure) -> dict[str, Any] | None:
-        """The storm summary on the shard that completes the streak, else ``None``."""
-        if not isinstance(outcome, tuple):
-            self._counter = StormCounter(fire_mode='latched')
-            return None
-        self.shards_failed += 1
-        storm = self._counter.record(
-            threshold=self._threshold,
-            window_seconds=_STREAK_WINDOW_SECONDS,
-            label=outcome[0].value,
-        )
-        return None if storm is None else {**storm, 'shards_failed': self.shards_failed}
-
-
 #: Never 1; see reconciliation/judge.py::_JUDGE_CLI_MAX_TURNS for why.
 _MAX_TURNS = 3
 #: One shard is up to 40 pairs of two 4,000-character texts: ~80k input tokens.
@@ -358,17 +369,20 @@ Invoke: TypeAlias = Callable[..., Awaitable[AgentResult]]
 
 
 class ClaudeShardAsker:
-    """Asks one shard of the Claude CLI, with the rater brief read afresh as its instructions."""
+    """Asks one shard of the Claude CLI with the rater brief as its instructions:
+    *brief_text* when given, else the brief at *brief_path* read afresh per shard."""
 
     def __init__(
         self,
         *,
+        brief_text: str | None = None,
         brief_path: Path = RATER_BRIEF_PATH,
         invoke: Invoke = invoke_with_cap_retry,
         timeout_seconds: float = _SHARD_TIMEOUT_SECONDS,
         max_budget_usd: float = _SHARD_MAX_BUDGET_USD,
         max_turns: int = _MAX_TURNS,
     ) -> None:
+        self._brief_text = brief_text
         self._brief_path = brief_path
         self._invoke = invoke
         self._timeout_seconds = timeout_seconds
@@ -377,7 +391,9 @@ class ClaudeShardAsker:
 
     async def __call__(self, shard: Shard) -> ShardReply:
         try:
-            brief = await asyncio.to_thread(self._brief_path.read_text, encoding='utf-8')
+            brief = self._brief_text
+            if brief is None:
+                brief = await asyncio.to_thread(self._brief_path.read_text, encoding='utf-8')
             result = await self._invoke(
                 usage_gate=None,
                 label=f'link-adjudicator[{shard.model}]',
@@ -417,27 +433,64 @@ def _shard_reply(result: AgentResult) -> ShardReply:
 
 
 class LinkAdjudicator(Protocol):
+    """Judges pairs, naming the model and the prompt version its verdicts come from."""
+
+    @property
+    def model(self) -> str: ...
+
+    @property
+    def prompt_sha256(self) -> str: ...
+
     async def __call__(
         self, pairs: Sequence[LinkPair], *, on_failure_storm: StormHook | None = None,
     ) -> list[LinkVerdict]: ...
 
 
-def configured_adjudicator(
-    config: LinkHealConfig, *, ask: ShardAsker | None = None,
-) -> LinkAdjudicator:
-    """:func:`adjudicate_links` with the ``link_heal`` leaves bound, as read now."""
+@dataclass(frozen=True)
+class ConfiguredAdjudicator:
+    """:func:`adjudicate_links` with its leaves and one rendered prompt bound."""
 
-    async def adjudicate(
-        pairs: Sequence[LinkPair], *, on_failure_storm: StormHook | None = None,
+    model: str
+    prompt_sha256: str
+    shard_size: int
+    field_chars: int
+    failure_streak: int
+    ask: ShardAsker
+
+    async def __call__(
+        self, pairs: Sequence[LinkPair], *, on_failure_storm: StormHook | None = None,
     ) -> list[LinkVerdict]:
         return await adjudicate_links(
             pairs,
-            model=config.adjudicator_model,
-            shard_size=config.shard_size,
-            field_chars=config.field_chars,
-            failure_streak=config.shard_failure_streak,
-            ask=ask,
+            model=self.model,
+            shard_size=self.shard_size,
+            field_chars=self.field_chars,
+            failure_streak=self.failure_streak,
+            ask=self.ask,
             on_failure_storm=on_failure_storm,
         )
 
-    return adjudicate
+
+def configured_adjudicator(
+    config: LinkHealConfig,
+    *,
+    ask: ShardAsker | None = None,
+    brief_text: str | None = None,
+    brief_path: Path = RATER_BRIEF_PATH,
+    invoke: Invoke = invoke_with_cap_retry,
+) -> ConfiguredAdjudicator:
+    """The ``link_heal`` leaves and the brief, both read now, bound for a run.
+
+    *brief_text* defaults to the brief at *brief_path*, read once here; *ask*
+    defaults to a :class:`ClaudeShardAsker` over that same text, calling the CLI
+    through *invoke*.
+    """
+    brief = brief_path.read_text(encoding='utf-8') if brief_text is None else brief_text
+    return ConfiguredAdjudicator(
+        model=config.adjudicator_model,
+        prompt_sha256=prompt_sha256(brief, config.field_chars),
+        shard_size=config.shard_size,
+        field_chars=config.field_chars,
+        failure_streak=config.shard_failure_streak,
+        ask=ClaudeShardAsker(brief_text=brief, invoke=invoke) if ask is None else ask,
+    )

@@ -1,4 +1,4 @@
-"""Tests for orchestrator.merge_completion — merge_completion_eligible(event_store, task_id).
+"""Tests for orchestrator.merge_lane.completion — merge_completion_eligible(event_store, task_id).
 
 Covers the (b)+(c) run-scoped eligibility predicate for the merge-stage
 completion mode (task 2633): a passing ``workflow_verify`` event (b, VERIFY
@@ -6,9 +6,9 @@ passed) AND a ``phase_enter`` event with ``phase=='merge'`` (c, REVIEW
 passed), both keyed by task_id, read from the current run's event-store
 history. (a) ``block_class == BlockClass.MERGE_VERIFY_RED`` is the CALLER's
 precondition and is deliberately not modeled here — see
-``orchestrator.merge_completion``'s module docstring.
+``orchestrator.merge_lane.completion``'s module docstring.
 
-step-1: failing tests, written before ``orchestrator.merge_completion``
+step-1: failing tests, written before ``orchestrator.merge_lane.completion``
 exists (RED — ``ModuleNotFoundError``). step-2 adds the module and makes
 these green.
 """
@@ -60,7 +60,7 @@ class TestMergeCompletionEligible:
     # -- (i) both conditions present -----------------------------------
 
     def test_true_when_both_conditions_present(self):
-        from orchestrator.merge_completion import merge_completion_eligible
+        from orchestrator.merge_lane.completion import merge_completion_eligible
 
         store = _FakeEventStore({
             EventType.workflow_verify: [_verify_row('42', passed=True)],
@@ -71,7 +71,7 @@ class TestMergeCompletionEligible:
     # -- (ii) condition (b) unmet ----------------------------------------
 
     def test_false_when_workflow_verify_row_missing_entirely(self):
-        from orchestrator.merge_completion import merge_completion_eligible
+        from orchestrator.merge_lane.completion import merge_completion_eligible
 
         store = _FakeEventStore({
             EventType.phase_enter: [_phase_enter_row('42', phase='merge')],
@@ -79,7 +79,7 @@ class TestMergeCompletionEligible:
         assert merge_completion_eligible(store, '42') is False
 
     def test_false_when_workflow_verify_present_but_not_passed(self):
-        from orchestrator.merge_completion import merge_completion_eligible
+        from orchestrator.merge_lane.completion import merge_completion_eligible
 
         store = _FakeEventStore({
             EventType.workflow_verify: [_verify_row('42', passed=False)],
@@ -88,7 +88,7 @@ class TestMergeCompletionEligible:
         assert merge_completion_eligible(store, '42') is False
 
     def test_false_when_workflow_verify_passed_only_for_different_task(self):
-        from orchestrator.merge_completion import merge_completion_eligible
+        from orchestrator.merge_lane.completion import merge_completion_eligible
 
         store = _FakeEventStore({
             EventType.workflow_verify: [_verify_row('99', passed=True)],
@@ -99,7 +99,7 @@ class TestMergeCompletionEligible:
     # -- (iii) condition (c) unmet ----------------------------------------
 
     def test_false_when_phase_enter_merge_row_missing_entirely(self):
-        from orchestrator.merge_completion import merge_completion_eligible
+        from orchestrator.merge_lane.completion import merge_completion_eligible
 
         store = _FakeEventStore({
             EventType.workflow_verify: [_verify_row('42', passed=True)],
@@ -107,7 +107,7 @@ class TestMergeCompletionEligible:
         assert merge_completion_eligible(store, '42') is False
 
     def test_false_when_phase_enter_present_but_wrong_phase(self):
-        from orchestrator.merge_completion import merge_completion_eligible
+        from orchestrator.merge_lane.completion import merge_completion_eligible
 
         store = _FakeEventStore({
             EventType.workflow_verify: [_verify_row('42', passed=True)],
@@ -116,7 +116,7 @@ class TestMergeCompletionEligible:
         assert merge_completion_eligible(store, '42') is False
 
     def test_false_when_phase_enter_merge_only_for_different_task(self):
-        from orchestrator.merge_completion import merge_completion_eligible
+        from orchestrator.merge_lane.completion import merge_completion_eligible
 
         store = _FakeEventStore({
             EventType.workflow_verify: [_verify_row('42', passed=True)],
@@ -127,12 +127,12 @@ class TestMergeCompletionEligible:
     # -- (iv) fail-closed inputs ------------------------------------------
 
     def test_false_when_event_store_is_none(self):
-        from orchestrator.merge_completion import merge_completion_eligible
+        from orchestrator.merge_lane.completion import merge_completion_eligible
 
         assert merge_completion_eligible(None, '42') is False
 
     def test_false_when_task_id_is_none(self):
-        from orchestrator.merge_completion import merge_completion_eligible
+        from orchestrator.merge_lane.completion import merge_completion_eligible
 
         store = _FakeEventStore({
             EventType.workflow_verify: [_verify_row('42', passed=True)],
@@ -141,7 +141,7 @@ class TestMergeCompletionEligible:
         assert merge_completion_eligible(store, None) is False
 
     def test_false_when_fetch_events_by_type_raises(self):
-        from orchestrator.merge_completion import merge_completion_eligible
+        from orchestrator.merge_lane.completion import merge_completion_eligible
 
         store = _FakeEventStore(raises=True)
         assert merge_completion_eligible(store, '42') is False

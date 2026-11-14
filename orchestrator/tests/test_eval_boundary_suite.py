@@ -1,6 +1,6 @@
-"""Phase-1 eval↔production integration gate — boundary suite B1–B9 (+ capstone).
+"""Phase-1 eval↔production integration gate — boundary suite B1–B10 (+ capstone).
 
-PRD eval-framework-revival §ι, Contract H, Boundary-test sketch B1–B9.
+PRD eval-framework-revival §ι, Contract H, Boundary-test sketch B1–B10.
 
 This is the "C-as-integration-gate" for the eval-framework-revival PRD: the
 two-way eval↔production seam test proving that the mechanisms delivered by the
@@ -16,6 +16,7 @@ REAL composed eval code paths against one refreshed fixture:
   - ``workflow._spawn_dry_run_unblock`` disabled early-return               (D4)
   - ``workflow.build_workflow`` single construction point               (α/P2)
   - ``metrics.compute_composite`` contract-agnostic scoring            (P4/B8)
+  - ``build_eval_orch_config`` ``strict_mcp_config`` vs the tracked ``.mcp.json`` (B10)
 
 Each B# faces BOTH sides of its seam: the production default AND the eval-side
 divergence, so the test proves the profile actually flips the behaviour rather
@@ -32,6 +33,7 @@ B# → mechanism map
   B7  no unblock spawn    ``_spawn_dry_run_unblock`` spawns 0 tasks with ``unblock_auto`` off
   B8  contract-agnostic   ``quality_from_review_artifact`` scores legacy == envelope shape
   B9  no claimant spam    a real eval ``Scheduler`` heartbeat logs zero warnings
+  B10 mcp isolation       eval config turns ``strict_mcp_config`` on against the live servers ``.mcp.json`` declares
 
 Why this suite is deterministic and CI-runnable (design decision)
 -----------------------------------------------------------------
@@ -76,18 +78,17 @@ via ``run_eval`` only when you want to capture the writes. See
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import subprocess
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.cli_invoke import AgentResult
 from test_scheduler_dispatch_literal_tripwire import _dispatch_tool_literals
 from test_workflow_factory import (
-    _CONSTRUCT_RE,
     _FACTORY_CALL_RE,
     _orchestrator_src_root,
 )
@@ -107,16 +108,6 @@ from orchestrator.evals.runner import (
 )
 from orchestrator.mcp import verdict_tools as _verdict_tools
 from orchestrator.workflow import TaskWorkflow
-
-# test_b2_factory_single_construction_point reuses test_workflow_factory's
-# _orchestrator_src_root().rglob('*.py') helper (imported above) to scan every
-# *.py under orchestrator/src. Not individually reproduced under load; marked
-# because it is structurally identical to the three members that crashed.
-# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
-# ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # The non-routable null sentinel EVAL_PROFILE pins fused_memory.url to, and the
 # production endpoint an un-isolated eval run would otherwise write into.
@@ -195,7 +186,7 @@ def committed_diff_fixture(tmp_path: Path) -> tuple[Path, str]:
 
 def _fake_invoke_agent(
     captured_prompts: list[str],
-) -> Callable[..., Coroutine[Any, Any, SimpleNamespace]]:
+) -> Callable[..., Coroutine[Any, Any, AgentResult]]:
     """Return an ``invoke_agent`` replacement that records prompts.
 
     Monkeypatch the returned coroutine over ``judge.invoke_agent`` (or
@@ -205,15 +196,17 @@ def _fake_invoke_agent(
     reads).  No real agent runs, so B4 grades the real committed diff for free.
     """
 
-    async def _fake(**kwargs: Any) -> SimpleNamespace:
+    async def _fake(**kwargs: Any) -> AgentResult:
         captured_prompts.append(str(kwargs.get('prompt', '')))
-        return SimpleNamespace(
+        return AgentResult(
+            success=True,
             structured_output={
                 'winner': 'A',
                 'confidence': 0.9,
                 'reasoning': 'canned boundary-suite verdict',
             },
             output='{"winner": "A", "confidence": 0.9, "reasoning": "r"}',
+            cost_usd=0.0,
         )
 
     return _fake
@@ -264,8 +257,8 @@ def test_b1_eval_profile_divergence_parity_and_tripwire(
 
     Exactness holds by construction: ``apply_eval_profile`` is a
     ``model_copy(update=)`` that changes exactly the profile leaves, and β
-    proves all 6 differ from their code defaults, so the divergence is
-    precisely the 6 documented keys — never more (a leak) or fewer (a no-op).
+    proves all 7 differ from their code defaults, so the divergence is
+    precisely the 7 documented keys — never more (a leak) or fewer (a no-op).
     """
     base = _load_default_config(tmp_path)
 
@@ -391,10 +384,11 @@ def test_b8_quality_from_review_artifact_contract_agnostic() -> None:
 
 # ── B2: factory single construction point (P2) ─────────────────────────────
 
-# The single-construction-point scanner — the ``_CONSTRUCT_RE`` /
-# ``_FACTORY_CALL_RE`` regexes and ``_orchestrator_src_root`` — is IMPORTED from
-# test_workflow_factory (the ONE authoritative scanner for the P2 grep-guard
-# invariant), so a fix there propagates here instead of drifting from a copy.
+# The tree-wide "only workflow.py constructs TaskWorkflow(" sweep is
+# test_taskworkflow_construction_point_guard.py::test_single_taskworkflow_construction_point,
+# the ONE static sweep for P2.  The dispatch-site regex ``_FACTORY_CALL_RE`` and
+# ``_orchestrator_src_root`` are IMPORTED from test_workflow_factory so a fix
+# there propagates here instead of drifting from a copy.
 
 
 def test_b2_factory_single_construction_point(
@@ -411,9 +405,10 @@ def test_b2_factory_single_construction_point(
         a new required ``TaskWorkflow`` param breaks the single construction
         point, hence BOTH dispatch sites (harness.py + evals/runner.py, which
         both route through ``build_workflow``) at once.
-    (2) Static: ``workflow.py`` is the ONLY production-source file constructing
-        ``TaskWorkflow(``, and both dispatch sites contain a ``build_workflow(``
-        call — proving there is no third bypass site.
+    (2) Static: both dispatch sites contain a ``build_workflow(`` call.  That
+        ``workflow.py`` is the ONLY production-source file constructing
+        ``TaskWorkflow(``, so there is no third bypass site, is proven by
+        test_taskworkflow_construction_point_guard.py::test_single_taskworkflow_construction_point.
     """
     from orchestrator import workflow as workflow_mod
     from orchestrator.workflow import build_workflow
@@ -434,21 +429,8 @@ def test_b2_factory_single_construction_point(
             mcp=object(),  # type: ignore[arg-type]
         )
 
-    # (2) Static single-point (compose the existing grep-guard invariant).
+    # (2) Static: both dispatch sites route through the factory.
     src_root = _orchestrator_src_root()
-    offenders: set[str] = set()
-    for path in src_root.rglob('*.py'):
-        text = path.read_text(encoding='utf-8', errors='ignore')
-        for line in text.splitlines():
-            code = line.split('#', 1)[0]  # drop trailing comment
-            if _CONSTRUCT_RE.search(code):
-                offenders.add(path.relative_to(src_root).as_posix())
-                break
-    assert offenders == {'workflow.py'}, (
-        f'Direct TaskWorkflow(...) construction is only permitted in workflow.py; '
-        f'offending files: {sorted(offenders)}'
-    )
-
     for rel in ('harness.py', 'evals/runner.py'):
         source = (src_root / rel).read_text(encoding='utf-8')
         assert _FACTORY_CALL_RE.search(source), (
@@ -766,6 +748,36 @@ async def test_b9_set_task_claimant_heartbeat_no_warning(
         'set_task_claimant heartbeat emitted WARNING(s) (B9/D2 regression):\n'
         + '\n'.join(offenders)
     )
+
+
+# ── B10: eval agent MCP isolation (task 4757) ──────────────────────────────
+
+
+def test_b10_eval_agent_mcp_isolation_two_way(tmp_path: Path) -> None:
+    """B10 — eval agents are strictly MCP-scoped; production agents are not.
+
+    The premise: the tracked ``.mcp.json`` every eval worktree carries really
+    declares the live ``escalation`` and ``fused-memory`` servers, which the CLI
+    merges into any agent not run with ``--strict-mcp-config``. The two sides:
+    the deployed ``load_config()`` leaves ``strict_mcp_config`` off, and
+    ``build_eval_orch_config`` turns it on for the ``TaskWorkflow._invoke`` path.
+    What each eval spawn site then hands the argv builder is pinned in
+    ``test_eval_mcp_isolation.py``, which drives the real call sites.
+    """
+    ambient = json.loads(
+        (_orchestrator_src_root().parents[2] / '.mcp.json').read_text(),
+    )['mcpServers']
+    assert {'escalation', 'fused-memory'} <= set(ambient), (
+        f'tracked .mcp.json changed shape ({sorted(ambient)}); re-derive the '
+        'eval MCP isolation guard against the new ambient servers'
+    )
+
+    base = _load_default_config(tmp_path)
+    assert base.strict_mcp_config is False
+
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path)}
+    assert build_eval_orch_config(cfg, task, base).strict_mcp_config is True
 
 
 # ── Capstone: one refreshed fixture through the composed eval framework ─────

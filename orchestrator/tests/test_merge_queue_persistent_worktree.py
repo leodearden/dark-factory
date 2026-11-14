@@ -16,13 +16,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
+from _merge_lane_fakes import lane_scene_config
 from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import MergeOutcome, MergeRequest, SpeculativeMergeWorker
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest, SpeculativeMergeWorker
 
 # ---------------------------------------------------------------------------
 # Real-git fixtures (mirroring test_merge_queue_restart_hook.py)
@@ -73,7 +74,7 @@ def _make_persistent_config(git_repo: Path, *, persistent: bool) -> Orchestrator
         push_after_advance=False,
         persistent_merge_worktree=persistent,
     )
-    return OrchestratorConfig(project_root=git_repo, git=git)
+    return lane_scene_config(git_repo, git)
 
 
 async def _make_branch_with_file(
@@ -129,7 +130,7 @@ def _make_config(
         persistent_merge_worktree=persistent,
         persistent_merge_worktree_safety_valve_every_n=safety_valve,
     )
-    return OrchestratorConfig(project_root=tmp_path, git=git)
+    return lane_scene_config(tmp_path, git)
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +269,7 @@ class TestAcquireWarmVerifyWorktree:
     @pytest.mark.asyncio
     async def test_knob_off_returns_ephemeral_unchanged(self, tmp_path: Path):
         """Knob OFF: returns merge_wt unchanged, no reset/cleanup calls."""
-        from orchestrator.merge_queue import _acquire_warm_verify_worktree  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _acquire_warm_verify_worktree
 
         warm_path = tmp_path / '_merge-verify'
         ephemeral = tmp_path / '_merge-abc123'
@@ -286,7 +287,7 @@ class TestAcquireWarmVerifyWorktree:
     @pytest.mark.asyncio
     async def test_knob_on_not_due_swaps_to_warm(self, tmp_path: Path):
         """Knob ON, safety_valve_due=False → resets warm wt, cleans up ephemeral, returns warm path."""
-        from orchestrator.merge_queue import _acquire_warm_verify_worktree  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _acquire_warm_verify_worktree
 
         warm_path = tmp_path / '_merge-verify'
         ephemeral = tmp_path / '_merge-abc123'
@@ -304,7 +305,7 @@ class TestAcquireWarmVerifyWorktree:
     @pytest.mark.asyncio
     async def test_knob_on_due_returns_ephemeral_unchanged(self, tmp_path: Path):
         """Knob ON, safety_valve_due=True → returns merge_wt unchanged (cold throwaway path)."""
-        from orchestrator.merge_queue import _acquire_warm_verify_worktree  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _acquire_warm_verify_worktree
 
         warm_path = tmp_path / '_merge-verify'
         ephemeral = tmp_path / '_merge-abc123'
@@ -322,7 +323,7 @@ class TestAcquireWarmVerifyWorktree:
     @pytest.mark.asyncio
     async def test_knob_on_not_due_none_merge_wt_no_cleanup(self, tmp_path: Path):
         """Knob ON, merge_wt=None (edge case) → no cleanup_merge_worktree call, returns warm path."""
-        from orchestrator.merge_queue import _acquire_warm_verify_worktree  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _acquire_warm_verify_worktree
 
         warm_path = tmp_path / '_merge-verify'
         stub = _make_stub_git_ops(warm_path)
@@ -452,7 +453,7 @@ class TestSafetyValveDue:
 
     def test_every_n_zero_always_false(self):
         """every_n=0 (disabled) → always False regardless of attempt_count."""
-        from orchestrator.merge_queue import _safety_valve_due  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _safety_valve_due
 
         for attempt in range(0, 20):
             assert _safety_valve_due(attempt, 0) is False, (
@@ -461,14 +462,14 @@ class TestSafetyValveDue:
 
     def test_every_n_negative_always_false(self):
         """every_n<0 → always False (guard against invalid config)."""
-        from orchestrator.merge_queue import _safety_valve_due  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _safety_valve_due
 
         for attempt in range(0, 10):
             assert _safety_valve_due(attempt, -1) is False
 
     def test_every_n_3_due_on_multiples(self):
         """every_n=3 → True exactly at attempt_count 3, 6, 9; False otherwise."""
-        from orchestrator.merge_queue import _safety_valve_due  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _safety_valve_due
 
         due_at = {3, 6, 9}
         for attempt in range(0, 12):
@@ -479,7 +480,7 @@ class TestSafetyValveDue:
 
     def test_attempt_zero_never_due(self):
         """attempt_count=0 must never trigger the valve (first attempt is 1-based)."""
-        from orchestrator.merge_queue import _safety_valve_due  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _safety_valve_due
 
         for every_n in [1, 2, 3, 5]:
             assert _safety_valve_due(0, every_n) is False, (
@@ -488,7 +489,7 @@ class TestSafetyValveDue:
 
     def test_every_n_1_due_at_every_positive_attempt(self):
         """every_n=1 → True for every positive attempt (cold on every land)."""
-        from orchestrator.merge_queue import _safety_valve_due  # noqa: PLC0415
+        from orchestrator.merge_lane.worker import _safety_valve_due
 
         assert _safety_valve_due(0, 1) is False  # attempt 0 never due
         for attempt in range(1, 6):
@@ -517,7 +518,7 @@ class TestSafetyValveIntegration:
             persistent_merge_worktree=True,
             persistent_merge_worktree_safety_valve_every_n=1,
         )
-        cfg = OrchestratorConfig(project_root=git_repo, git=cfg_git)
+        cfg = lane_scene_config(git_repo, cfg_git)
 
         wt = await _make_branch_with_file(git_ops, 'valve-test', 'valve.py', 'z = 3\n')
         req = _make_merge_request('valve-test', 'valve-test', wt, cfg)

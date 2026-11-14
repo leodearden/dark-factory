@@ -1,57 +1,87 @@
-"""hooks/project-checks' PYRIGHT_PACKAGES must list what the merge gate type-checks.
+"""The pre-commit hook's module checks are the merge gate's, read from one registry.
 
-Task 5338. ``dark-factory-orchestrator.yaml``'s ``type_check_command`` is the
-source of truth for which packages get type-checked. The pre-commit hook's
-``PYRIGHT_PACKAGES`` array is a second, hand-edited copy; it drifted to three
-members while the gate walked seven, so a direct commit to main touching
-``shared``, ``escalation``, ``sampler`` or ``cockpit`` never type-checked the
-package it changed.
-
-Pins the package DIRECTORIES and their order (the chain walk's semantics), read
-live from both artifacts. Placed in ``tests/scripts/`` so it runs under merge
-verify, like the neighbouring mirror guards.
+Task 5338 found the hook's hand-kept PYRIGHT_PACKAGES list three members short
+of the gate; task 8531 retired the list. hooks/project-checks now runs what
+scripts/hook_module_checks.py derives from the gate's own registry
+(verify_plan.py::effective_merge_module_configs), so this guard drives the REAL
+helper over this checkout: one staged probe per registered module, every lint
+and type leg the gate configures must be listed, with its command verbatim,
+``scripts`` included, which the retired list never named. Each probe must
+also list its OWN module's legs: the shared and escalation probes fan out to
+every type leg, so the union alone would hide a module whose own probe
+dropped its type check.
 """
 from __future__ import annotations
 
-import pathlib
-import re
+import subprocess
+import sys
+from collections.abc import Callable
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-import verify_command_invariants as vci
-import yaml
+import pytest
+from hook_checks_fixture import HELPER_TIMEOUT_SECS, parse_listing
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-REPO_ROOT = pathlib.Path(__file__).parents[2]
-HOOK_PATH = REPO_ROOT / "hooks" / "project-checks"
-DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
-_PYRIGHT_PACKAGES_DECL = re.compile(r"^PYRIGHT_PACKAGES=\(([^)]*)\)", re.MULTILINE)
+if TYPE_CHECKING:
+    from orchestrator.config import ModuleConfig, OrchestratorConfig
 
-
-def _hook_pyright_packages(hook_text: str) -> list[str]:
-    match = _PYRIGHT_PACKAGES_DECL.search(hook_text)
-    assert match, (
-        "no PYRIGHT_PACKAGES=(...) declaration found in hooks/project-checks "
-        "(task 5338); this guard would otherwise pass vacuously"
-    )
-    return match.group(1).split()
+REPO_ROOT = Path(__file__).parents[2]
+HELPER = REPO_ROOT / 'scripts' / 'hook_module_checks.py'
 
 
-def test_hook_pyright_packages_match_the_fleet_type_check_command() -> None:
-    gate_cmd = yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["type_check_command"]
-    gate_packages = vci.pyright_clause_cwds(gate_cmd, skip_uv_project=False)
-    hook_packages = _hook_pyright_packages(HOOK_PATH.read_text(encoding="utf-8"))
+def _probe_listings(prefixes: list[str]) -> dict[str, list[tuple[str, str]]]:
+    procs = {
+        prefix: subprocess.Popen(
+            [sys.executable, str(HELPER)],
+            cwd=REPO_ROOT,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for prefix in prefixes
+    }
+    listings: dict[str, list[tuple[str, str]]] = {}
+    try:
+        for prefix, proc in procs.items():
+            out, err = proc.communicate(f'{prefix}/_drift_probe.py\n', timeout=HELPER_TIMEOUT_SECS)
+            assert proc.returncode == 0, f'helper failed for a {prefix} probe: {err}'
+            listings[prefix] = parse_listing(out)
+    finally:
+        for proc in procs.values():
+            proc.kill()
+            proc.wait()
+    return listings
 
-    assert gate_packages, f"type_check_command walked to no pyright clause: {gate_cmd!r}"
-    assert hook_packages == gate_packages, (
-        "hooks/project-checks PYRIGHT_PACKAGES has drifted from "
-        "dark-factory-orchestrator.yaml's type_check_command (task 5338).\n"
-        f"  MISSING from the hook: {[p for p in gate_packages if p not in hook_packages]}\n"
-        f"  EXTRA in the hook: {[p for p in hook_packages if p not in gate_packages]}\n"
-        "Widen both together; the yaml chain is the source of truth."
-    )
+
+def _configured_legs(mc: ModuleConfig) -> dict[str, str]:
+    legs = (('lint', mc.lint_command), ('type', mc.type_check_command))
+    return {f'module:{mc.prefix}:{leg}': command for leg, command in legs if command is not None}
 
 
-def test_hook_pyright_packages_extractor_refuses_a_missing_declaration() -> None:
-    import pytest
+def test_the_hooks_module_legs_are_the_gates(
+    root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    from orchestrator.verify_plan import effective_merge_module_configs
 
-    with pytest.raises(AssertionError, match="PYRIGHT_PACKAGES"):
-        _hook_pyright_packages("ALL_PACKAGES=(a b)\n")
+    registry = effective_merge_module_configs(root_config, list(discover_module_configs().values()))
+    own_legs = {mc.prefix: _configured_legs(mc) for mc in registry}
+    expected = {unit: command for legs in own_legs.values() for unit, command in legs.items()}
+    listings = _probe_listings(list(own_legs))
+    emitted: dict[str, str] = {}
+    for units in listings.values():
+        for unit, command in units:
+            assert emitted.setdefault(unit, command) == command, f'{unit} listed with two commands'
+    unlisted_own = {
+        prefix: sorted(legs.items() - set(listings[prefix]))
+        for prefix, legs in own_legs.items()
+        if legs.items() - set(listings[prefix])
+    }
+
+    assert 'module:scripts:type' in own_legs['scripts']
+    assert unlisted_own == {}
+    assert emitted == expected

@@ -35,6 +35,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # shared/src bootstrap, same idiom and same precedence argument as
 # scripts/scan_task_toolcall_leaks.py:113-115. Needed HERE, independently of
@@ -57,6 +58,8 @@ from shared.toolcall_markup import (  # noqa: E402
     detect_for,
 )
 from shared.toolcall_markup import INVOKE_CLOSER as SHARED_INVOKE_CLOSER  # noqa: E402
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Sentinel spellings. THE ONLY PLACE this file writes an envelope literal.

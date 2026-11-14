@@ -168,30 +168,33 @@ tasks:
           reason: "the deliverable is REUSE of an existing choke point, which emits no new production symbol — `_handle_no_plan_failure` already has 4 hits in workflow.py, so any `present` grep on it is vacuously green"
   - label: "γ"
     task_id: 4033
-    title: "Converse merge gate at submission: branch commits ⊆ owned ∪ descoped"
+    title: "Disposition gate at submission: no orphan/revert-descoped commit lands (rescoped 2026-11-01, PRD D14, esc-4033-2)"
     capabilities:
       - name: "gate-reads-the-descope-record"
         binding: "capability→producer + DAG-direction — the producer of _descoped_steps is β, which is UPSTREAM of γ (dependency wired). C6's DESCOPED set is exactly β's C4 record, so γ adds no second descope vocabulary."
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "_descoped_steps"
+          pattern: "_descoped_steps|DESCOPED_STEPS_KEY"
           paths: ["orchestrator/src/orchestrator/merge_lane/gates.py"]
+          # 2026-11-01: DESCOPED_STEPS_KEY added; γ's task text requires the
+          # SPOT spelling, which never writes the bare literal.
           expect: present
           # RED today: 0 hits.  Deliberately scoped to merge_lane/gates.py and NOT
           # to orchestrator/src/: β lands the same key in workflow.py, which
           # would vacuously green γ under a wider scope.
-      - name: "commit-ownership-gate-at-the-sibling-gate-site"
-        binding: "capability→producer (wired) — D9: _check_plan_files_touched_in_branch (merge_gates.py:1333) ALREADY runs inside TaskWorkflow._submit_to_merge_queue (called at workflow.py:10090) BEFORE register_and_enqueue_merge_request (workflow.py:1740), with an in-place remedy-and-recheck precedent at workflow.py:10108 (_try_narrow_plan). γ goes at the same site so the workflow can address a rejection immediately instead of waiting for the queue front."
+      - name: "disposition-gate-at-the-sibling-gate-site"
+        binding: "capability→producer (wired) — D9: orchestrator/src/orchestrator/merge_lane/gates.py::_check_plan_files_touched_in_branch ALREADY runs inside TaskWorkflow._submit_to_merge_queue BEFORE register_and_enqueue_merge_request, with an in-place remedy-and-recheck precedent (TaskWorkflow._try_narrow_plan). γ goes at the same site so the workflow can address a rejection immediately instead of waiting for the queue front. Rescoped by PRD D14: γ checks that orphan/revert dispositions hold on the branch, not that every commit has an owning step."
         verdict: PASS
         delivered_check:
           kind: grep
-          pattern: "unowned_commit|commit_ownership|owned_commits|branch_commits_owned|_check_branch_commits"
+          pattern: "descope_disposition|descoped_commit|DescopedStep|_check_descoped|plan_descope"
           paths: ["orchestrator/src/orchestrator/merge_lane/gates.py"]
           expect: present
-          # RED today: 0 hits.  Five-way disjunction over plausible gate
-          # namings so γ's choice cannot false-RED it, scoped to the sibling
-          # gates' own module.
+          # RED on 2026-11-01: 0 hits.  Five-way disjunction over plausible
+          # descope-check namings (incl. importing β's plan_descope module) so
+          # γ's choice cannot false-RED it; bare "disposition" is deliberately
+          # absent — merge-skew attribution already uses it 13x in this module.
       - name: "fail-open-branch-carries-a-storm-escape"
         binding: "G7 REDESIGN (INV-4, storm-escape-required) — C6 says 'fail-open on git error (matching the sibling gates' documented convention)'. That convention, read at _check_plan_files_touched_in_branch, is 'Loud-log so regressions surface in ops' — a WARNING with NO counter. A γ fail-open firing 100× in an hour would be silent by inheritance. γ's fail-open must carry a streak counter and escalate on it. Recorded in the .md manifest's G7 section; required conjunct in γ's task text."
         verdict: PASS
@@ -199,7 +202,7 @@ tasks:
           kind: manual
           reason: "the counter's channel is not fixed by the PRD (the sibling gates have none to reuse and remedying THEM is outside γ's scope), so a grep on a guessed counter name would be a false RED at the dispatch gate"
       - name: "commit-walk-is-loop-safe-and-bounded"
-        binding: "loop-thread-occupancy-bounded (INV-8) via C6 — the commit walk uses the async git runner (git_ops._run, git_ops.py:1726, wrapping asyncio.create_subprocess_exec), never a blocking subprocess.run; fan-out bounded by the branch's commit count with loop-invariant probes hoisted. The house pattern the task-3778 incident established."
+        binding: "loop-thread-occupancy-bounded (INV-8) via C6 — the branch probes use the async git runner (orchestrator/src/orchestrator/git_ops.py::_run, wrapping asyncio.create_subprocess_exec), never a blocking subprocess.run; fan-out bounded by |CHECKED| and the branch's commit count with loop-invariant probes hoisted. The house pattern the task-3778 incident established."
         verdict: PASS
         delivered_check:
           kind: manual
@@ -316,7 +319,7 @@ tasks:
     title: "End-to-end amendment-delivery boundary tests (B+H integration gate)"
     capabilities:
       - name: "orchestrator-side-boundary-rows-exercised"
-        binding: "capability→producer + DAG-direction — §10 rows 1–12 (fingerprint trigger, no-amendment skip, mid-EXECUTE non-refresh, missing-fingerprint fault, whitespace-vs-case, silent wipe refused, 2971 replay, 3143 replay, duplicate-sha, γ's two ride-along rows) are delivered by α/β/γ, ALL UPSTREAM of η (dependencies wired). No §10 row depends on a task that depends on η. TEST-ANCHORED BY CONSTRUCTION: η's whole deliverable IS the boundary-test table."
+        binding: "capability→producer + DAG-direction — §10 rows 1–12 (fingerprint trigger, no-amendment skip, mid-EXECUTE non-refresh, missing-fingerprint fault, whitespace-vs-case, silent wipe refused, 2971 replay, 3143 replay, duplicate-sha, γ's two disposition rows) are delivered by α/β/γ, ALL UPSTREAM of η (dependencies wired). No §10 row depends on a task that depends on η. TEST-ANCHORED BY CONSTRUCTION: η's whole deliverable IS the boundary-test table."
         verdict: PASS
         delivered_check:
           kind: grep
@@ -342,3 +345,5 @@ tasks:
         delivered_check:
           kind: manual
           reason: "both are NEGATIVE properties spread across α's and δ's production shapes (a stamp that must not happen; an I/O call that must not be made), and the two positive anchors above already prove η's test modules exist and exercise both packages"
+signal_leaves:
+- "η"

@@ -69,6 +69,7 @@ from setup_host_parsing import (
 from setup_host_parsing import (
     shell_statements as _shell_statements,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Imported UNALIASED, for the same reason the origin module states: the sibling
 # modules import these under exactly these public names, and a private alias
@@ -77,6 +78,8 @@ from systemd_unit_invariants import (
     ALL_ORCHESTRATOR_SERVICE_FILES,
     parse_sections,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

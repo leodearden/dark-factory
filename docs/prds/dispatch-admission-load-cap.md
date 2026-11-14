@@ -1,6 +1,10 @@
 # PRD — Dispatch-admission load cap (L3b, dark-factory)
 
 **Status:** draft (2026-07-07) — for `/prd` check + decompose.
+**Amended (2026-10-18, landed by task 3590):** `plans/load-throttle-harmonisation-prd.md`
+D1/D3/D10 amend DA-D1 (the CPU arm is the runqueue ratio, `cpu_some_avg10` is off by default,
+and `dispatch_deferred.metric` follows the D10 rank) and DA-D3 (equal floors are set in yaml).
+Read that PRD for the current contract.
 **Slug:** `dispatch-admission-load-cap`.
 **Item:** L3b of reify PRD `docs/prds/run-all-pool-contention-tiering-fix.md` (§9), flagged there
 as **dark-factory-owned, "not built here."**

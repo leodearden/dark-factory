@@ -20,6 +20,13 @@ Type=oneshot
 # there, silently stopping the whole nightly job. The census exits 1 by design
 # whenever coverage.complete is false, which is routine on a live corpus.
 WorkingDirectory=/home/leo/src/dark-factory
+# Persistent=true boot catch-up runs before the login session pushes the user
+# PATH, so uv in ~/.local/bin is unfindable; see
+# scripts/fused-memory-flag-marker-sweep.service for the observed status=127.
+# The wrapper resolves uv itself via scripts/lib/resolve_uv.sh, which also
+# covers a stale installed unit; this line is belt-and-braces for everything
+# else it runs.
+Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/usr/local/cuda-12.6/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 ExecStart=/home/leo/src/dark-factory/scripts/memory-metadata-coverage-census.sh
 StandardOutput=journal
 StandardError=journal

@@ -5,7 +5,9 @@ non-zero even when every test passed. A fixture cannot fail its own session, so
 the only way to observe that contract is to spawn a nested pytest session wired
 to the guard and read its exit code and output. Every guard module in this
 directory does that through :func:`run_nested_pytest`, so the copy, rootdir
-isolation, spawn and timeout cannot drift between them.
+isolation, private basetemp, spawn and timeout cannot drift between them. Why
+the basetemp is private:
+test_nested_pytest_session.py::test_a_nested_session_leaves_the_hosts_default_temp_root_untouched.
 
 It lives here, a sibling helper module, rather than in ``df_pytest_isolation``
 for two reasons. Every caller is in ``tests/scripts/``. And that plugin is
@@ -79,10 +81,19 @@ def run_nested_pytest(
     inside it (e.g. a pidfile) before the run starts and clean up even if this
     raises. *files* maps root-relative paths to source text. Relative *targets*
     resolve against *root* (the cwd); with none, the whole tree is collected.
+    The session runs under a private basetemp beside *root*, never in the
+    host's default pytest temp root.
     """
     clobbered = sorted(_HARNESS_FILES.intersection(files))
     if clobbered:
         raise ValueError(f"files may not replace the harness's own files: {clobbered}")
+    smuggled = [t for t in targets if t == '--basetemp' or t.startswith('--basetemp=')]
+    if smuggled:
+        raise ValueError(
+            "a nested session runs under the harness's own basetemp; "
+            f'targets may not set --basetemp: {smuggled}'
+        )
+    basetemp = root.with_name(f'{root.name}.basetemp')
     root.mkdir(parents=True)
     shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
     (root / 'pytest.ini').write_text(_NESTED_INI)
@@ -93,6 +104,7 @@ def run_nested_pytest(
     return subprocess.run(
         [
             sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider',
+            f'--basetemp={basetemp}',
             *(targets or (str(root),)),
         ],
         cwd=root, capture_output=True, text=True, timeout=NESTED_SESSION_TIMEOUT_SECS,

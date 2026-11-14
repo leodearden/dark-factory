@@ -1,0 +1,25 @@
+{
+ "stream": "S4",
+ "prd_path": "docs/prds/review-all-control-feedback-as-typed-values-and-provenance-by-type.md",
+ "manifest_path": "docs/prds/review-all-control-feedback-as-typed-values-and-provenance-by-type.capability-manifest.yaml",
+ "leaves_estimate": 17,
+ "lead_rulings_on_open_questions": [
+  "Q1 task 511 vs S4-eta (esc-511-8; lead ruling, Leo may overturn): re-scope 511 onto eta \u2014 511 depends on eta and its ruled neutral Mode-2 write (esc-585-7 A) becomes the RELEASED transition's action; S4 decompose wires the edge and appends the note.",
+  "Q2: lambda carries no finding key; metadata.x_completes = {task: 734, key: fk-f87240eea84a} (the key stays on 734)."
+ ],
+ "lead_actions_at_decompose": [
+  "add_dependency 511 -> S4-eta with a dated note",
+  "1032 -> gamma, delta1, delta3 edges; 734 -> lambda",
+  "high leaves alpha, beta, gamma, eta, theta, xi -> gate 1065",
+  "program row S4: add fk-ce84f840bb9a; upstream deps S26, S9, S24 (nu only)"
+ ],
+ "cross_reference_lines": [
+  "S26-kappa (517): drop the clause asserting submitted commands carry CommandProvenance.window_at (production provenance is NULL on main; S4-iota produces it) or make it a held check on S4-iota \u2014 lead applies: the clause is dropped from 517's signal and S4-iota's B6 asserts window_at.",
+  "S23-gamma: ActuationView.from_metric_rows requires every ControlMetric member (six after S4-delta2 incl. setpoint_as_commanded); ActuationView carries as_commanded; classify_divergence = divergent iff not as_commanded (after the passive rule); S23-gamma depends on S4-delta2.",
+  "S3-beta2/omega: ops reads the command log through control/command_log.py::read_command_log(session, ...) (S4-delta3); StoredCommandFeedbackSink becomes write-only; second to land adapts.",
+  "S10: BatchOutcome status invariant includes PLANNED/SUBMITTED <=> provenance non-None (S4-iota); runner leaves depend on S4-iota, kappa; PlanStaleness (S4-theta) owns to_setpoint's expiry.",
+  "S20-gamma depends on S4-eta, iota, lambda, mu (PlannedOutcome declares provenance; disposition = control-typed WindowApplication, no BatchStatus import).",
+  "S7: kappa uses default_fleet's predicate; S7 swaps it.",
+  "Upstream: S9-gamma2 -> gamma, delta1, delta2, delta3; S9-alpha/epsilon -> delta1; S26-alpha -> delta1; S26-epsilon -> epsilon; S26-beta -> iota; S26-kappa -> eta, theta, iota, kappa; S24-alpha -> nu."
+ ]
+}

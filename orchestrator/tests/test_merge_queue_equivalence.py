@@ -16,7 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, make_lane, running_lane
+from _merge_lane_fakes import FakeVerifier, lane_scene_config, make_lane, running_lane
 from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
@@ -24,13 +24,13 @@ from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
 from orchestrator.merge_lane.gates import PostMergePyrightResult
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     MergeOutcome,
     MergeRequest,
     _check_post_merge_pyright,
     _run_unscoped_typechecks,
 )
-from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures — shared real-git setup (mirrors TestCheckPostMergeEquivalence)
@@ -73,7 +73,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # Stand-in type_check_command that exits 0 on a clean tree and exits 1 with

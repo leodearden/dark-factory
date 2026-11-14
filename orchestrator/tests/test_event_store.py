@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 from typing import TypedDict
 
 import pytest
 
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventStore, EventType, MergeFinalizedKey
 
 
 def _query_all(db_path: Path) -> list[dict]:
@@ -1037,6 +1040,27 @@ class TestMergeFinalizedAbsorbing:
         assert store.merge_finalized_absorbing('mr-legacy', cross_run=True) is None
         assert store.merge_finalized_absorbing('mr-l1', cross_run=True) is None
 
+    def test_only_a_list_of_ids_aliases_a_loser_never_a_scalar(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(
+            store, request_id='mr-listed', task_id='T', branch='b', state='done',
+            absorbed_request_ids=['mr-l1'],
+        )
+        _emit_finalized(
+            store, request_id='mr-scalar', task_id='T', branch='b', state='done',
+            absorbed_request_ids='mr-l1',
+        )
+        _emit_finalized(
+            store, request_id='mr-scalar-only', task_id='T', branch='b', state='done',
+            absorbed_request_ids='mr-l2',
+        )
+
+        for cross_run in (True, False):
+            row = store.merge_finalized_absorbing('mr-l1', cross_run=cross_run)
+            assert row is not None
+            assert row['request_id'] == 'mr-listed'
+            assert store.merge_finalized_absorbing('mr-l2', cross_run=cross_run) is None
+
     def test_empty_id_returns_none(self, tmp_path: Path) -> None:
         store = EventStore(tmp_path / 'runs.db', 'run-A')
         _emit_finalized(
@@ -1045,6 +1069,209 @@ class TestMergeFinalizedAbsorbing:
         )
 
         assert store.merge_finalized_absorbing('', cross_run=True) is None
+
+
+def _unreadable(store: EventStore) -> EventStore:
+    """Overwrite *store*'s file with non-database bytes, so every later read fails to open it."""
+    store.db_path.write_bytes(b'not a database' * 64)
+    for sidecar in ('-wal', '-shm'):
+        Path(f'{store.db_path}{sidecar}').unlink(missing_ok=True)
+    return store
+
+
+_Read = Callable[..., object]
+
+_READS = pytest.mark.parametrize(
+    ('reader', 'read', 'miss'),
+    [
+        (
+            'latest_merge_finalized',
+            lambda store, **kw: store.latest_merge_finalized(task_id='T1', **kw),
+            None,
+        ),
+        (
+            'merge_finalized_absorbing',
+            lambda store, **kw: store.merge_finalized_absorbing('mr-x', **kw),
+            None,
+        ),
+        (
+            'merge_finalized_superseded_by',
+            lambda store, **kw: store.merge_finalized_superseded_by('coalesce-x', **kw),
+            [],
+        ),
+    ],
+    ids=['latest', 'absorbing', 'superseded_by'],
+)
+_CROSS_RUN = pytest.mark.parametrize('cross_run', [False, True], ids=['run_scoped', 'cross_run'])
+
+
+class TestMergeFinalizedReadFailure:
+    """The merge_finalized readers' two read-failure policies: fire-safe by default, strict on request."""
+
+    @_READS
+    @_CROSS_RUN
+    def test_an_unreadable_store_raises_when_not_fire_safe(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        reader: str,
+        read: _Read,
+        miss: object,
+        cross_run: bool,
+    ) -> None:
+        store = _unreadable(EventStore(tmp_path / 'runs.db', 'run-A'))
+        caplog.set_level(logging.WARNING, logger='orchestrator.event_store')
+
+        with pytest.raises(sqlite3.DatabaseError):
+            read(store, cross_run=cross_run, fire_safe=False)
+
+        assert f'event_store.{reader} failed' not in caplog.messages
+
+    @_READS
+    @_CROSS_RUN
+    def test_an_unreadable_store_reads_as_a_miss_by_default(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        reader: str,
+        read: _Read,
+        miss: object,
+        cross_run: bool,
+    ) -> None:
+        store = _unreadable(EventStore(tmp_path / 'runs.db', 'run-A'))
+        caplog.set_level(logging.WARNING, logger='orchestrator.event_store')
+
+        assert read(store, cross_run=cross_run) == miss
+        assert any(
+            record.levelno == logging.WARNING
+            and record.getMessage() == f'event_store.{reader} failed'
+            for record in caplog.records
+        )
+
+    @_READS
+    @_CROSS_RUN
+    def test_a_clean_miss_is_not_a_failure(
+        self, tmp_path: Path, reader: str, read: _Read, miss: object, cross_run: bool,
+    ) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+
+        assert read(store, cross_run=cross_run, fire_safe=False) == miss
+
+    @_READS
+    @_CROSS_RUN
+    def test_a_hit_reads_the_same_either_way(
+        self, tmp_path: Path, reader: str, read: _Read, miss: object, cross_run: bool,
+    ) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(
+            store, request_id='mr-p', task_id='T1', branch='b1', state='done',
+            absorbed_request_ids=['mr-x'],
+        )
+        _emit_finalized(
+            store, request_id='mr-m', task_id='T2', branch='b2', state='superseded',
+            superseded_by='coalesce-x',
+        )
+
+        strict = read(store, cross_run=cross_run, fire_safe=False)
+
+        assert strict != miss
+        assert strict == read(store, cross_run=cross_run)
+
+
+_MF_INDEXES = {
+    MergeFinalizedKey.request_id: 'idx_mf_request_id',
+    MergeFinalizedKey.branch: 'idx_mf_branch',
+    MergeFinalizedKey.task_id: 'idx_mf_task_id',
+    MergeFinalizedKey.superseded_by: 'idx_mf_superseded_by',
+    MergeFinalizedKey.absorbs: 'idx_mf_absorbs',
+}
+
+
+def _plan(db_path: Path, statement: tuple[str, tuple[str, ...]]) -> str:
+    sql, params = statement
+    with closing(sqlite3.connect(db_path)) as conn:
+        return ' | '.join(row[3] for row in conn.execute(f'EXPLAIN QUERY PLAN {sql}', params))
+
+
+def _index_names(db_path: Path) -> set[str]:
+    with closing(sqlite3.connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='events'"
+        ).fetchall()
+    return {row[0] for row in rows}
+
+
+class TestMergeFinalizedIndexes:
+    """Every merge_finalized read seeks a partial index instead of filtering every such row.
+
+    Plans are read with no sqlite_stat1, as on production's runs.db.
+    """
+
+    @pytest.mark.parametrize(
+        ('key', 'index', 'latest_only'),
+        [
+            pytest.param(
+                key, index, latest_only,
+                id=f'{key.name}-{"latest" if latest_only else "all"}',
+            )
+            for key, index in _MF_INDEXES.items()
+            for latest_only in (True, False)
+        ],
+    )
+    def test_cross_run_lookup_searches_its_own_partial_index(
+        self, tmp_path: Path, key: MergeFinalizedKey, index: str, latest_only: bool,
+    ) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+
+        plan = _plan(store.db_path, key.select('mr-miss', run_id=None, latest_only=latest_only))
+
+        assert f'SEARCH events USING INDEX {index} (' in plan, plan
+
+    @pytest.mark.parametrize('key', list(MergeFinalizedKey), ids=lambda key: key.name)
+    def test_run_scoped_lookup_never_filters_every_merge_finalized_row(
+        self, tmp_path: Path, key: MergeFinalizedKey,
+    ) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+
+        plan = _plan(store.db_path, key.select('mr-miss', run_id='run-A', latest_only=True))
+
+        assert plan.startswith('SEARCH events USING INDEX'), plan
+        assert 'idx_events_type' not in plan, plan
+
+    def test_a_store_written_before_the_indexes_gains_them_at_startup(
+        self, tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / 'runs.db'
+        _emit_finalized(
+            EventStore(db_path, 'run-A'),
+            request_id='mr-old',
+            task_id='T-old',
+            branch='feature-old',
+            state='blocked',
+            superseded_by='coalesce-old',
+            absorbed_request_ids=['mr-loser'],
+        )
+        with closing(sqlite3.connect(db_path)) as conn:
+            for name in _MF_INDEXES.values():
+                conn.execute(f'DROP INDEX IF EXISTS {name}')
+            conn.commit()
+        assert set(_MF_INDEXES.values()).isdisjoint(_index_names(db_path))
+
+        store_b = EventStore(db_path, 'run-B')
+
+        assert set(_MF_INDEXES.values()) <= _index_names(db_path)
+        keys: list[_LookupKey] = [
+            {'request_id': 'mr-old'}, {'branch': 'feature-old'}, {'task_id': 'T-old'},
+        ]
+        for key in keys:
+            row = store_b.latest_merge_finalized(**key, cross_run=True)
+            assert row is not None, key
+            assert (row['request_id'], row['run_id']) == ('mr-old', 'run-A'), key
+        members = store_b.merge_finalized_superseded_by('coalesce-old', cross_run=True)
+        assert [r['request_id'] for r in members] == ['mr-old']
+        primary = store_b.merge_finalized_absorbing('mr-loser', cross_run=True)
+        assert primary is not None
+        assert primary['request_id'] == 'mr-old'
 
 
 class TestFetchEventsByTypeAllRuns:

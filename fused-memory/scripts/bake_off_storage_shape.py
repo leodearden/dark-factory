@@ -185,11 +185,13 @@ a standing exemption for whatever it becomes:
     itself.  No CLI flag reaches the prefix (``--project-suffix`` moves the
     suffix only), so no invocation can point these deletes or writes at a
     ``fused``-prefixed production collection;
-  * it does not write mem0's shared SQLite history: ``seed_arm`` stubs
-    ``instance.db.add_history`` per instance before the first ``add`` (that
-    writer is process-shared, xdist-contended, and read-only in the sandbox —
-    see ``seed_arm``'s own docstring).  So the capability the preflight probes
-    for is not one the seeding path needs.
+  * it does not write mem0's shared SQLite history: ``run_bake_off`` sets
+    ``config.mem0.persist_history = False`` on its own config copy, so every
+    arm's mem0 instance keeps its history in a private in-memory DB and never
+    opens the shared ``$MEM0_DIR/history.db`` (process-shared, xdist-contended,
+    and read-only in the sandbox — see
+    ``fused_memory/config/schema.py::Mem0BackendConfig.persist_history``).  So
+    the capability the preflight probes for is not one the seeding path needs.
 
 THE RESIDUAL, stated rather than papered over — and scoped to the LIVE path
 (i.e. absent ``--replay-fetches``): on that path ``run_bake_off`` builds a
@@ -214,6 +216,8 @@ mutations, overstating one is still drift.
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import shutil
 import sys
@@ -1312,13 +1316,12 @@ def build_canonical_by_topic(records: list[ArmRecord]) -> dict[str, ArmRecord]:
     depend on scroll order — non-deterministic between runs, and invisible in
     the report.
     """
+    from fused_memory.canonical_marker import is_canonical
+
     index: dict[str, ArmRecord] = {}
     for record in records:
         topic = record.metadata.get('topic')
-        # Bool identity, matching β's `invalid_canonical_type` rule: a truthy
-        # 1 is a FATAL violation at the write boundary, so it must not be
-        # treated as canonical here either.
-        if topic is None or record.metadata.get('canonical') is not True:
+        if topic is None or not is_canonical(record.metadata):
             continue
         existing = index.get(topic)
         if existing is not None:
@@ -2117,6 +2120,35 @@ def audit_recall_over_labeled_fixture(
     }
 
 
+_AUDIT_RECALL_BY_CONTENT: dict[tuple[str, float, object], dict[str, Any]] = {}
+
+
+def memoized_audit_recall(
+    records: list[dict[str, Any]],
+    threshold: float | None = None,
+) -> dict[str, Any]:
+    """:func:`audit_recall_over_labeled_fixture`, computed once per process per content.
+
+    The audit is an O(n^2) sweep over the WHOLE alpha fixture that
+    ``cluster_limit`` does not shrink.  Keyed on the records actually audited,
+    the resolved threshold and the detector function itself, so a swapped-in
+    detector neither reads another detector's result nor leaves its own for
+    the next caller.  Every caller gets its own deep copy.
+    """
+    if threshold is None:
+        threshold = resolve_audit_threshold()
+    content = hashlib.sha256(
+        json.dumps(records, sort_keys=True, ensure_ascii=False).encode(),
+    ).hexdigest()
+    detector = load_audit_script().find_near_duplicate_memory_groups
+    key = (content, threshold, detector)
+    if key not in _AUDIT_RECALL_BY_CONTENT:
+        _AUDIT_RECALL_BY_CONTENT[key] = audit_recall_over_labeled_fixture(
+            records, threshold,
+        )
+    return copy.deepcopy(_AUDIT_RECALL_BY_CONTENT[key])
+
+
 # ---------------------------------------------------------------------------
 # The report — the artifact gate η reads
 # ---------------------------------------------------------------------------
@@ -2363,43 +2395,83 @@ def _protocol_fixture_paths(
     return [*base, DEFAULT_REGROWTH_INJECTION_PATH]
 
 
+def _git_stdout(args: list[str], cwd: Path) -> str | None:
+    """Stripped stdout of ``git <args>``, or ``None`` when git cannot answer.
+
+    ``None`` covers no git, no repo, a nonzero exit and an empty answer
+    alike.  Provenance that cannot be verified must not look verified, so a
+    stamp is either git's own answer or absent — never a guess.
+    """
+    import subprocess  # noqa: PLC0415
+
+    try:
+        completed = subprocess.run(
+            ['git', *args], cwd=str(cwd), capture_output=True, text=True,
+            timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+_LAST_TOUCHING_COMMIT: dict[tuple[str | None, str, str], str] = {}
+
+
+def _last_touching_commit(head: str | None, path: Path, repo_root: Path) -> str | None:
+    """``git log -1`` for *path*, walked once per process per HEAD.
+
+    A path's last-touching commit is a pure function of the history reachable
+    from HEAD, so a moved HEAD re-walks.  Only git's answers are remembered:
+    with no HEAD, or after a walk that failed (a timeout under load, a
+    transient OSError), the next call asks git again.
+    """
+    key = (head, str(path), str(repo_root))
+    if key in _LAST_TOUCHING_COMMIT:
+        return _LAST_TOUCHING_COMMIT[key]
+    commit = _git_stdout(['log', '-1', '--format=%H', '--', str(path)], repo_root)
+    if head is not None and commit is not None:
+        _LAST_TOUCHING_COMMIT[key] = commit
+    return commit
+
+
 def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
-    """Repo-relative path + last-touching commit for each fixture.
+    """Repo-relative path, content blob and last-touching commit per fixture.
 
     Git history IS the blind-authoring audit trail: the arm decomposition and
     query set were committed BEFORE any metric function existed in the tree,
-    and these SHAs are what lets a reader verify that rather than take it on
-    trust.
+    and these stamps are what lets a reader verify that rather than take it
+    on trust.
+
+    ``blob`` is the git object id of the bytes this run read (``git
+    hash-object``), so it is present for an untracked but readable file.  It
+    depends only on content, so a rebase cannot rewrite it, and ``git log
+    --find-object=<blob>`` names the commit(s) that introduced that content:
+    it is the verifiable identity.  ``commit`` is the commit that last touched
+    the path when the stamp was taken, kept for the audit trail; a rebase
+    rewrites it.
 
     Paths are reported repo-relative (``fused-memory/tests/fixtures/…``, never
     ``/home/<user>/src/dark-factory/…``) — an artifact naming somebody's
     absolute home-directory checkout is neither reproducible nor readable by
     anyone else, and it leaks the worktree the run happened in.
 
-    ``commit`` is ``None`` for a path git does not track.  Reporting None
-    rather than falling back to HEAD is the point: a wrong SHA in an audit
-    trail is worse than an absent one, because it looks checkable.
+    Either stamp is ``None`` when git cannot produce it — ``commit`` for a
+    path git does not track, ``blob`` for a file git cannot read.  Reporting
+    None rather than falling back to HEAD is the point: a wrong stamp in an
+    audit trail is worse than an absent one, because it looks checkable.
     """
-    import subprocess  # noqa: PLC0415
-
     repo_root = _PACKAGE_ROOT.parent
+    head = _git_stdout(['rev-parse', 'HEAD'], repo_root)
     provenance: list[dict[str, Any]] = []
     for raw in paths:
         path = Path(raw).resolve()
-        relative = _repo_relative(path)
-        commit: str | None = None
-        try:
-            completed = subprocess.run(
-                ['git', 'log', '-1', '--format=%H', '--', str(path)],
-                cwd=str(repo_root), capture_output=True, text=True, timeout=30,
-                check=False,
-            )
-            commit = completed.stdout.strip() or None
-        except (OSError, subprocess.SubprocessError):
-            # No git, or no repo: the report says so rather than inventing a
-            # SHA. Provenance that cannot be verified must not look verified.
-            commit = None
-        provenance.append({'path': relative, 'commit': commit})
+        provenance.append({
+            'path': _repo_relative(path),
+            'commit': _last_touching_commit(head, path, repo_root),
+            'blob': _git_stdout(['hash-object', '--', str(path)], repo_root),
+        })
     return provenance
 
 
@@ -3917,19 +3989,10 @@ async def seed_arm(
     """Write every record of one arm into its own ephemeral collection.
 
     Populates ``by_stored_id`` in place and returns the same object.
-
-    ``instance.db.add_history`` is stubbed first: mem0's SQLite history
-    writer is process-shared and xdist-contended (and read-only in the
-    sandbox).  It is not the question under test, and its failure would mask
-    the one that is — the same reason ``test_recon_dedup_premise.py:135`` and
-    the E1 probe stub it.
     """
     from fused_memory.models.scope import Scope  # noqa: PLC0415
 
     scope = Scope(project_id=seeded.project_id, agent_id=SEED_AGENT_ID)
-    instance = await backend._get_instance(scope)
-    instance.db.add_history = lambda *args, **kwargs: None
-
     semaphore = asyncio.Semaphore(concurrency)
 
     async def _write(record: ArmRecord) -> None:
@@ -4140,8 +4203,6 @@ def corpus_fingerprint(records: list[ArmRecord]) -> str:
     ``json.dumps(sort_keys=True)`` rather than ``str(dict)`` so the digest
     does not depend on metadata insertion order either.
     """
-    import hashlib  # noqa: PLC0415
-
     digest = hashlib.sha256()
     for record_id, content, metadata in sorted(
         (
@@ -4162,19 +4223,20 @@ def corpus_fingerprint(records: list[ArmRecord]) -> str:
 def fixture_digests(paths: list[str | Path]) -> list[dict[str, Any]]:
     """Repo-relative path + sha256 of each fixture's CONTENT.
 
-    Deliberately not folded into :func:`fixture_provenance`, which stamps the
-    last-touching COMMIT.  The two answer different questions and the cache
-    needs both: a commit sha is the blind-authoring audit trail, but it does
-    not move when a fixture is edited in the working tree — which is exactly
-    the drift that silently invalidates a dumped cache.
+    Deliberately not folded into :func:`fixture_provenance`, whose ``blob`` is
+    also a content hash.  The two answer different questions: the provenance
+    blob is a git object id — it needs git, and is addressable in history,
+    which is what the blind-authoring audit trail wants.  This sha256 needs
+    no git, so it is the git-free drift check that refuses a replay once a
+    fixture moves, and the committed fetch cache and
+    ``fused-memory/tests/test_bake_off_fetch_cache.py::ANCHOR_FIXTURE_SHA256``
+    pin it.
 
     Paths are reported repo-relative for the same reason
-    :func:`fixture_provenance` does it (:1852): an artifact naming somebody's
+    :func:`fixture_provenance` does it: an artifact naming somebody's
     absolute home-directory checkout is neither reproducible nor readable by
     anyone else.
     """
-    import hashlib  # noqa: PLC0415
-
     rows: list[dict[str, Any]] = []
     for raw in paths:
         path = Path(raw).resolve()
@@ -4189,6 +4251,27 @@ def fixture_digests(paths: list[str | Path]) -> list[dict[str, Any]]:
             'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
         })
     return rows
+
+
+def digest_pinned_fixtures(
+    *,
+    alpha_fixture: str | Path = DEFAULT_ALPHA_FIXTURE_PATH,
+    arm_claims: str | Path = DEFAULT_ARM_CLAIMS_PATH,
+    query_set: str | Path = DEFAULT_QUERY_SET_PATH,
+    distractor_slab: str | Path = DEFAULT_DISTRACTOR_SLAB_PATH,
+) -> list[str | Path]:
+    """The fixtures a fetch cache pins by whole-file sha256.
+
+    These are the inputs :func:`corpus_fingerprint` cannot see:
+    :func:`materialize_arm` takes no queries, and guard probes are drawn from
+    the alpha fixture.
+
+    The topic registry is absent on purpose.  E2 reads from it only each
+    curator_gate cluster's topic slug, which lands in record metadata and so
+    is pinned by :func:`corpus_fingerprint`; see the registry section of
+    ``fused-memory/tests/fixtures/README.md``.
+    """
+    return [alpha_fixture, arm_claims, query_set, distractor_slab]
 
 
 def fetch_cache_provenance(
@@ -5556,6 +5639,7 @@ async def run_bake_off(
 
     config = (config or FusedMemoryConfig()).model_copy(deep=True)
     config.mem0.collection_prefix = ephemeral_collection_prefix()
+    config.mem0.persist_history = False
     # Clearing the pinned key makes mem0's OpenAIEmbedding fall back to the
     # real OPENAI_API_KEY.  A stub constant vector would make every ranking in
     # this report meaningless.  `providers.openai` is optional in the schema
@@ -5753,11 +5837,11 @@ async def run_bake_off(
                 # run.  Additive: `load_fetches` compares fixtures as a
                 # path -> sha MAPPING over the CALLER's list, so a wider cache
                 # still satisfies `read_transform_selection`'s narrower
-                # five-fixture check.
-                fixtures=_protocol_fixture_paths([
-                    alpha_fixture, registry, arm_claims, query_set,
-                    distractor_slab,
-                ], regrowth=regrowth_block),
+                # check over `digest_pinned_fixtures()` alone.
+                fixtures=_protocol_fixture_paths(digest_pinned_fixtures(
+                    alpha_fixture=alpha_fixture, arm_claims=arm_claims,
+                    query_set=query_set, distractor_slab=distractor_slab,
+                ), regrowth=regrowth_block),
                 search_limit=limit,
                 guard_threshold=guard_threshold,
                 embedder_model=config.embedder.model,
@@ -5766,9 +5850,7 @@ async def run_bake_off(
 
     return build_report(
         arms=arms,
-        audit_recall=audit_recall_over_labeled_fixture(
-            load_labeled_fixture(alpha_fixture),
-        ),
+        audit_recall=memoized_audit_recall(load_labeled_fixture(alpha_fixture)),
         regrowth=regrowth_block,
         protocol={
             'blind_authoring': BLIND_AUTHORING_PROTOCOL,
@@ -5890,11 +5972,10 @@ async def _replay_bake_off(
         expect_query_ids=[query.query_id for query in queries],
         expect_probe_ids=expect_probe_ids,
         expect_limit=limit,
-        # The same five paths, in the same order, that the protocol block
-        # stamps below (:4197-4199) and that the live dump records.
-        expect_fixtures=[
-            alpha_fixture, registry, arm_claims, query_set, distractor_slab,
-        ],
+        expect_fixtures=digest_pinned_fixtures(
+            alpha_fixture=alpha_fixture, arm_claims=arm_claims,
+            query_set=query_set, distractor_slab=distractor_slab,
+        ),
     )
 
     guard_threshold = float(provenance['guard_threshold'])
@@ -5927,8 +6008,8 @@ async def _replay_bake_off(
             for mode in REGROWTH_MODES
         }
         # A SECOND `load_fetches`, with the injection slab as its own
-        # expectation, rather than folding a sixth path into the call above.
-        # The five originals must keep verifying on their own: a cache dumped
+        # expectation, rather than folding another path into the call above.
+        # The originals must keep verifying on their own: a cache dumped
         # before this probe existed (4004's committed `e2_fetch_cache.json`,
         # which `read_transform_selection` reads) carries no injection digest,
         # and a merged list would make it unloadable for the E2 arms.
@@ -5965,9 +6046,7 @@ async def _replay_bake_off(
 
     return build_report(
         arms=arms,
-        audit_recall=audit_recall_over_labeled_fixture(
-            load_labeled_fixture(alpha_fixture),
-        ),
+        audit_recall=memoized_audit_recall(load_labeled_fixture(alpha_fixture)),
         regrowth=regrowth_block,
         protocol={
             'blind_authoring': BLIND_AUTHORING_PROTOCOL,

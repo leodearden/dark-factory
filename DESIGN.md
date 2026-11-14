@@ -471,6 +471,16 @@ on `not_found` and returns 404 immediately.  The executable contract for this be
 `dashboard/tests/test_api_curator_cancel.py:test_two_url_not_found_short_circuits_loop`
 (asserts `call_count == 1`, only URL[0] called).
 
+**Routing consequence for every write proxy.** Because the URLs are network paths to one store,
+a write that may have reached the server is never retried on another URL: the second attempt
+would apply it again, and none of the tools behind `dashboard/src/dashboard/app.py::_mcp_write_proxy`
+dedupes server-side. Only connect-phase failures, raised before a request byte is sent and
+listed in `dashboard/src/dashboard/data/mcp_fanout.py::_UNDELIVERED_FAILURES`, fail over. Anything else, the
+whole-operation deadline included, answers 502 `fused_memory_outcome_unknown`. The mechanism is
+`dashboard/src/dashboard/data/mcp_fanout.py::first_success`'s `ambiguous_result`; the
+executable contract is
+`dashboard/tests/test_mcp_write_proxy.py::test_ambiguous_failure_on_the_first_url_is_never_repeated_on_the_next`.
+
 **Trigger for revisiting.** If a future infra change introduces ticket replication or
 multi-region deployment, this invariant must be re-evaluated and the cancel proxy
 short-circuit relaxed to fan-out-then-quorum.

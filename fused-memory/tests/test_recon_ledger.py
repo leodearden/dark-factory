@@ -2139,6 +2139,64 @@ async def test_gc_reaps_an_expired_consolidation_proposal_row_and_keeps_a_live_o
 
 
 # ---------------------------------------------------------------------------
+# list_by_flag_type: every row of one (project, kind, task_id, flag_type)
+# across run ids and states (task 5240).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_by_flag_type_returns_every_state_and_run_in_created_order(store):
+    refused = _kind_row(
+        state='refused', run_id='run-b', created_at='2026-07-02T00:00:00+00:00',
+    )
+    addressed = _kind_row(
+        state='addressed', run_id='run-a', created_at='2026-07-03T00:00:00+00:00',
+    )
+    proposed = _kind_row(
+        state='proposed', run_id='run-c', created_at='2026-07-01T00:00:00+00:00',
+    )
+    decoys = [
+        _kind_row(flag_type='topic-b', run_id='run-d'),
+        _kind_row(kind='kind-b', run_id='run-e'),
+        _kind_row(project='proj-q', run_id='run-f'),
+        _kind_row(task_id='42', run_id='run-g'),
+    ]
+    await store.upsert_many([refused, addressed, proposed, *decoys])
+
+    listed = await store.list_by_flag_type('proj-p', 'kind-a', 'topic-a')
+
+    assert listed == [proposed, refused, addressed]
+    assert [r.state for r in listed] == ['proposed', 'refused', 'addressed']
+
+
+@pytest.mark.asyncio
+async def test_list_by_flag_type_ties_on_created_at_order_by_run_id(store):
+    run2 = _kind_row(run_id='run-2')
+    run1 = _kind_row(run_id='run-1')
+    await store.upsert_many([run2, run1])
+
+    assert await store.list_by_flag_type('proj-p', 'kind-a', 'topic-a') == [run1, run2]
+
+
+@pytest.mark.asyncio
+async def test_list_by_flag_type_honours_an_explicit_task_id(store):
+    scoped = _kind_row(task_id='42')
+    unscoped = _kind_row(run_id='run-2')
+    await store.upsert_many([scoped, unscoped])
+
+    assert await store.list_by_flag_type('proj-p', 'kind-a', 'topic-a', task_id='42') == [
+        scoped
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_by_flag_type_unknown_flag_type_is_empty(store):
+    await store.upsert(_kind_row())
+
+    assert await store.list_by_flag_type('proj-p', 'kind-a', 'topic-zzz') == []
+
+
+# ---------------------------------------------------------------------------
 # upsert_if_state: an overwrite that applies only while the stored row is
 # still in the named state (task 5239 amendment).
 # ---------------------------------------------------------------------------

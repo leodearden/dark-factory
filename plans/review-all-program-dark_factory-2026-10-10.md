@@ -4,7 +4,7 @@ Program of 26 PRD streams acting on `plans/review-all-dark_factory-20261008.md` 
 `plans/review-all-dark_factory-20261008.json`, run `review-all-dark_factory-20261008`, pinned at
 `6551b75aba6b1885a2aea4bfc46ac82446fba4d4`). This document is the authoritative G4 seam map and
 shared convention set for every `/prd` session in the program. Each stream's session MUST read this
-file before authoring. Deliberation rulings were made by Leo on 2026-10-10 with the run's lead
+file before authoring. Deliberation rulings R1–R24 were made by Leo on 2026-10-10 (R25 onward carry their own date and `ruled_by`) with the run's lead
 (`skills/review-all/references/deliberation.md`); they are recorded under Resolved decisions and
 are not relitigated unless a finding's evidence changed.
 
@@ -73,29 +73,29 @@ first leaf where a consumer stream depends on it.
 | `VerifyContext`, typed `VerifyResult` (`FailureCategory` enum, `CheckRun`) | S4 | merge lane (S6/S7), workflow (S9), harness (S8), cli build it; `verify_categories` owns the vocabulary |
 | `attempt-*` verify artefact grammar helper | S4 | `scripts/verify_budget_census` (S25) parses through it |
 | `MergeOutcome.kind`, `GroupMergeRequest.train_kind`, `ItemLifecycle` as operative state, `MainHealthAutoHeal` collaborator, landed-row journal injected by harness | S6 | workflow (S9) and unblock_types consume; harness (S8) constructs the journal |
-| `GateMeasurement`; target-verify adapter; one adjacent placement | S7 | worker (S6) injects the fail-open policy |
-| `MergeLaneQueries` port (definition) | S3 defines, S6 implements | escalation server consumes |
-| `escalation/filing.py::file(record, FilingPolicy)`; `EscalationPort.file(record, dedupe)` widening | S1 | merge lane, scheduler port, `TaskWorkflow._file_escalation`, recon registry (S12) choose a policy only |
+| `GateMeasurement` | S7 | worker (S6) injects the fail-open policy |
+| `MergeLaneQueries` port (definition, `orchestrator/merge_lane/queries.py`) | S3 defines (α 9152), S6 implements natively (μ 9201, with the one total mapping onto the public `MergeState`); no interim adapter anywhere (R25, R27) | the merge tools registered from `orchestrator/mcp/` (S3 ε1 9188, ε2 9193) consume |
+| `escalation/filing.py::EscalationFiler` (three entry points; callers pass an `EscalationDraft` and a `FilingPolicy`; R62); `EscalationPort.file(record, policy)` widening | S1 | merge lane, scheduler port, `TaskWorkflow._file_escalation`, recon registry (S12) choose a policy only |
 | `escalation/models.py` typed vocabulary, `cascade_parent_id`, `ACTION_EFFECTS` with `record_disposition`, headers + sentinel prefixes, `parse_caller_identity` | S2 | dashboard (S22), harness (S8), scripts/sitting (S25), S1/S3 import |
-| `queue.py::_mutate_pending`, per-task index; ladder tools registered from an escalation module; merge/ops tools registered from `orchestrator/mcp/` | S3 | server never calls `_rewrite`; S8's `SlotRegistry` reaches the server through S3's port |
+| `queue.py::_mutate_pending`, per-task index; ladder tools registered from an escalation module; merge/ops tools registered from `orchestrator/mcp/`; the `WorkflowSlots` Protocol (S3 δ 9167, `orchestrator/mcp/ops_tools.py`) | S3 | server never calls `_rewrite`; S8's `SlotRegistry` reaches the server through S3's port and implements `WorkflowSlots` (S8 keeps no second definition) |
 | `SlotRegistry`; `SchedulerCallbacks` as the only Scheduler hook mechanism; `ManagedServices` teardown order; `PauseClass` | S8 | escalation server (via S3), scheduler (S17) |
 | `TaskGroundTruth.derive_truth` with condition rows as the one recovery classifier | S8 (task_ground_truth) | both harness sweeps, scheduler stranded phase (S17) |
 | `stranded_verified_green.py` merge-done classification; typed `BlockReason`; Plan model with `PlanState` in `artifacts.py`; `IterationEntry` | S9 | harness (S8) consumes the classification; dry_run_unblock consumes `BlockReason`; plan_tools, harness, evals/judge read the Plan model |
 | `shared.task_metadata` wire contract (`metadata_mode`, `text_mode`, static slice registry, `declared_files`), `MetadataWriteFailed`, `PrivilegedAuditWriter`, candidate-key scope SQL | S10 | fused-memory backend and interceptor, orchestrator scheduler (S17) and workflow (S9) import; `SchedulerFacade`/`FakeScheduler` parity in S10 |
 | `curator_types.py`; `resolve_ticket` status vocabulary (non-terminal `pending`) | S11 | roles.py quotes the vocabulary |
-| `RunContext`/`StageId`; the one recon run driver with `RunKind` | S12 | stats_verifier, judge, recon_report; `BacklogIterator` calls the driver |
-| flag identity leaf; `RunFindingIndex`; `FindingCategory` enum; `shared.task_statuses`-derived lexicon | S13 | server/recon_report, scope_freshness import the leaf; cli_stage_runner schema derives |
+| `RunContext`/`StageId`; the one recon run driver with `RunKind`; the stage-identity and run-id connection headers and their refusal (R65) | S12 | stats_verifier, judge, recon_report; `BacklogIterator` calls the driver; S13 ξ (recon-report server) and S15's tool-family moves apply the same refusal |
+| flag identity leaf; `RunFindingIndex`; `FindingCategory` enum; `shared.task_statuses`-derived lexicon (built once in `reconciliation/recon_prose_grammar.py`, R92) | S13 | server/recon_report, scope_freshness import the leaf; cli_stage_runner schema derives |
 | `shared/project_layout.py`, `project_id.py`, `merge_subject.py`, `scheduler_overrides.py`, `SchedulerStateSnapshot`, claimant TTL constant, shared streak primitive, `shared.mcp_post` as the only MCP client | S14 | dashboard, fused-memory, orchestrator, scripts, legibility import; S12/S13/S17/S19/S24/S25 depend |
-| `ToolContext`; dispatch wrapper as the one scope/markup gate; shutdown tuple; fused-memory read model for dashboard panels | S15 | tool family modules import downward; config/schema.py mirror derives; dashboard (S22) consumes the read model |
-| shared routing resolver + allowlist; shared hot-reload engine; `RoleName`/`Backend` enums; field defaults as the one home | S16 | orchestrator and fused-memory config import; cli_invoke/invocation_outcome (S20) import the enums |
+| `ToolContext`; dispatch wrapper as the one scope/markup gate; the shutdown plan in `config/shutdown_plan.py` (declared phases, R68); fused-memory read model for dashboard panels (`get_status(panels=…)`, wire models in `shared/dashboard_panels.py`, R92) | S15 | tool family modules import downward; config/schema.py mirror derives; dashboard (S22) consumes the read model |
+| shared routing resolver + allowlist; shared hot-reload engine; `RoleName`/`Backend` enums; field defaults as the one home (a field default may name one constant of the dependency-free shared defaults module, R92) | S16 | orchestrator and fused-memory config import; cli_invoke/invocation_outcome (S20) import the enums |
 | `get_state_snapshot` typed test seam; `delivered_checks.run` as the one evaluator | S17 | landing_evidence (S6) and scheduler call the evaluator |
 | `evals/results.py ResultStore`; `ReviewPayload` normaliser | S18 | scripts/_eval_results_io, backfill import |
-| `shared.config_dir.pid_alive`; `fused_memory.recon_state`; shared sandbox module; shared session package | S19 | the five other `_pid_alive` copies become imports; S12/S13 populate recon_state; invoke and sandbox_guard import the sandbox module; cockpit and scripts import the session package |
+| `shared.proc_liveness.pid_alive` (R74); `fused_memory.recon_state`; shared sandbox module; shared session package; `shared/escalation_layout.py` (terminal escalation status names and archive layout, θ0 9777, R92) | S19 | every liveness caller imports `pid_alive` (task 6615 done; S24 γ deletes the watchdog's copy); S2's vocabulary and invariant build on `escalation_layout`; S12/S13 populate recon_state; invoke and sandbox_guard import the sandbox module; cockpit and scripts import the session package |
 | `classify_invocation` as the one classifier; `slot.observe -> Decision`; `CliSubtype`; transcript leaf; `shared.capability_manifest` public surface | S20 | usage_gate and cli_invoke consume; dry_run_unblock, routing, steward, path_scope_adjudicator import `CliSubtype`; S25 files `sidecar_for` as a dependency on S20 |
 | legibility detector module; codebook merge result | S21 | sampling, census_window consume |
-| label→root resolver (active_tasks); one fan-out classification + `TTLCache` owner | S22 | all dashboard readers |
+| label→root resolver (active_tasks); one fan-out classification + `TTLCache` owner; the cross-package `runs.db` events read model (S8-3 follow-up, R36) | S22 | all dashboard readers; fused-memory, the client feed, the quality series and scripts for the events read model |
 | `MetricGroup` table; `sampler.store` schema public | S23 | dashboard load.py and calibration import |
-| shared fleet-coordination leaf (lease keyed by tier, clock, ages); `scripts/_systemd.py` host reader | S24 | service_restart, watchdogs, df_pytest_isolation, bash via `python3 -c` |
+| shared fleet-coordination leaf (lease keyed by tier, clock, ages, and `fused_memory_restart_min_interval_secs`, R78); `scripts/_systemd.py` host reader | S24 | service_restart, watchdogs, df_pytest_isolation, bash via `python3 -c`; S16 ζ1 9702 names the interval constant |
 | `scripts/_checkout.py` bootstrap; `run_parity` driver | S25 | every script |
 | `shared.route_rejection` (structured routing rejections {layer, reason, model}) | S25 (λ 6766) | S16 consumes when it moves the resolver; S9 one-line emit-site change |
 | `GraphAccess` protocol; queued-write value types; `MemoryService` as the only graph mutator; `EpisodeIdentityReconciler`; identity lock as public context manager | S26 | tests and cross_graph_move use the public provider; durable_queue imports the value types; sweeps call the read surface and `delete_entity` |
@@ -108,6 +108,34 @@ only (INV-9): filing entry point (S1), escalation literal ban (S2), fused_memory
 static metadata-slice registry (S10), config default single home (S16), `GateMeasurement` unmeasurable
 (S7), sampler metric table (S23), lane timing-budget ordering validator (S6). The INV ids are appended to
 the FILED table rows of the landing leaves.
+
+Owners after wave 2 (filed 2026-11-11; landing order R51, every check anchored on the slug, never the
+number):
+
+| Invariant (slug) | INV id at landing | Stream | Landing leaf | Status 2026-11-11 |
+|---|---|---|---|---|
+| `lane-budgets-exceed-verify-timeouts` (lane timing-budget ordering validator; R1, R22 item 8) | INV-15 (first) | S6 | α 9140 (the lockstep edit folded into α) | pending |
+| `metadata-slices-one-table` (static metadata-slice registry; R3, R22 item 4) | INV-16 (after 9140) | S10 | θ 9242 | pending |
+| `merge-gate-unmeasured-typed` (`GateMeasurement` unmeasurable; R11, R22 item 6) | INV-17 (after 9242) | S7 | ζ 9154 | pending |
+| `sampler-vocabulary-one-table` (sampler metric table; R22 item 7) | minted | S23 | β 6773 | done |
+
+S3, S4, S5, S8, S9 and S26 promote no invariant.
+
+Owners after wave 3 (filed 2026-11-13; landing order R88, every check anchored on the slug, never the
+number). Wave 3 owns R22's four remaining invariants and the two Leo added on 2026-11-12 (R80, R79):
+
+| Invariant (slug) | INV id at landing | Stream | Landing leaf | Status 2026-11-13 |
+|---|---|---|---|---|
+| `fused-memory-subpackage-dag` (fused_memory subpackage DAG; R17, R22 item 3) | INV-18 (first after 9154) | S19 | ε 9773 | pending |
+| `eval-writes-no-production-state` (Leo's hermetic-evals rule; R61, R80) | INV-19 | S1 | λ2 9855 | pending |
+| `escalation-filing-one-door` (filing entry point; R8, R22 item 1) | INV-20 | S1 | ω 9856 | pending |
+| `escalation-vocabulary-imported` (escalation literal ban; R9, R22 item 2; also names `shared.escalation_layout`, R92) | INV-21 | S2 | ι 9809 | pending |
+| `config-default-one-home` (config default single home; R15, R22 item 5) | INV-22 | S16 | ι 9692 | pending |
+| `one-decision-partition-per-area` (Leo's decision-partition principle; R79) | INV-23 (last, by ruling) | S17 | ν 9685 | pending |
+
+Every invariant the program promoted now has a filed owner: R22's eight (one minted by S23, three owned by
+wave 2, four by wave 3) and Leo's two of 2026-11-12. The lead corrects a number in task text at landing if the
+order changes (R88).
 
 ## Resolved decisions (do not relitigate)
 
@@ -284,6 +312,620 @@ Consequence that decided it: none has a reason worth recording as an acceptance,
 ## R24 — Launch plan (2026-10-10)
 Ruling: wave 1 now = the six agent-mode streams (S11, S14, S18, S21, S23, S25) as one `/team` run, one `/prd` author+decompose seat per stream (S25 waits on S20's leaf for `sidecar_for` and files that part as a dependency). The 20 spawn-mode streams are launched in later sittings from this program doc, high-risk first (S4, S5, S6, S8, S9, S10, S26), then the rest. The trigger chain (interim form) is filed when the first stream files and committed only when the FILED table is complete.
 
+## R25 — S3 merge tools wait for the native lane-query port; no interim adapter (2026-11-10)
+Ruling: option A (sitting key S3-1). The two merge-tool moves — S3 ε1 9188 (read/cancel/relane tools) and S3 ε2 9193 (`merge_request`) — wait for S6 μ 9201, which builds `MergeLaneQueries` natively over the lifecycle registry. No `SnapshotLaneQueries` adapter exists anywhere. S3 α 9152 shrinks to the Protocol, the two state records, the query-unavailable error and the dedupe rename; the three snapshot-dict parsers in `merge_lane/intake.py` stay until ε2, which converts the dedupe gate onto the native port, deletes them and adds the `lane_unanswerable` answer field. S6 μ depends on S3 α only and must never depend on an S3 merge-tool move (that edge closes a cycle). Tasks 5409 (tip_sha on every workflow_verify green) and 4651 (periodic landed reconciler) have their edges reversed: each lands first in today's files and the move carries its code (S3 ε2 → 5409; S3 ε1 → 4651). The history index θ 9177, the gate tables ι 9181 and the header-constants task κ 9173 are ordered ahead of the ladder split ζ 9200 so they are not held. S6 μ's priority comes from the scheduler's priority inheritance through the dependency graph; it is not hand-raised.
+Options considered: (A) wait for the native implementation (ruled); (B, recommended) ship a typed interim adapter, `SnapshotLaneQueries` over `snapshot()`, deleted later by S6 μ; (C) build the native version inside S3.
+Consequence that decided it: Leo chose A without a stated reason beyond the choice; the measured effect in `digests/discussion/S3.md` §S3-1 (two live fixes held behind ~20 tasks, and a cycle) was accepted together with the mitigations above, which are part of the ruling.
+Supersedes: none (R10 named the port, not an interim form of it).
+ruled_by: human
+Carried by: `plans/review-all-s3-escalation-server-and-queue-boundary-prd.md` α 9152, ε1 9188, ε2 9193; `plans/review-all-s6-merge-lane-lifecycle-outcome-types-and-provenance-prd.md` μ 9201; existing tasks 5409, 4651.
+Keys: fk-c8c3406fd7f4, fk-0de72a91f89a, fk-a8d3003e9d83, fk-e903cc072b15, fk-f8e9e0da3786, fk-d9e6c03dc259; fk-bc64099a1cd0 is `filed:5409`.
+
+## R26 — S3 history index covers the archive tier only; the fused-memory writer sentence corrected (2026-11-10)
+Ruling: option A (sitting key S3-4): index the archive tier only; the pending tier stays the root glob. The plan's false sentence is corrected everywhere: each project's queue directory has two long-running writers — that project's orchestrator (which hosts the escalation MCP server) and the single system-wide fused-memory service — restarting on separate clocks. The integration signal names a fused-memory restart through `scripts/restart-fused-memory.sh` or its staleness backstop, not the fleet sweep.
+Options considered: (A, recommended) index the archive only, pending stays a scan (ruled); (B) the index serves every read, pending too; (C) a SQLite index database; (D) narrow the scan by file name.
+Consequence that decided it: Leo asked whether fused-memory is not one system-wide process; it is (one singleton per host, the counted modules all inside it). The corrected picture makes B safer during rollout but not safe, and it still buys almost nothing (`digests/discussion/S3.md` §S3-4).
+Supersedes: none.
+ruled_by: human
+Carried by: S3 θ 9177 and the S3 integration gate μ 9210.
+Keys: fk-e5d81cc1f1d4, fk-ce2dc99e0305.
+
+## R27 — One internal merge-lane state enum and one total mapping to the public `MergeState` (2026-11-10)
+Ruling: the plan's recommendation for sitting key S3-5 is superseded by Leo. Inside the orchestrator there is one internal enum, `ItemLifecycleState`, and one total, test-checked mapping to the public `MergeState`; an unrecognised state cannot occur, and the internal enum is not made the public vocabulary. The port record carries `state: MergeState` (no raw state crosses the port; `raw_state` is dropped); the enum-to-enum table lives in `merge_lane/queries.py` and is built by S6 μ 9201; `MergeCancelVerdict.state` is typed (S3 ε1 9188); the pinned pass-through test is replaced by an exhaustiveness test. Task 6827 is cancelled as covered.
+Options considered: (A, recommended) a typed state that may be empty with the raw string kept beside it; (B) treat an unknown state as 'cannot answer'; (C) map an unknown state to a generic 'unknown'; superseded by Leo with one internal enum and one total mapping.
+Consequence that decided it: the worker already holds a closed enum and renders strings only because the escalation server could read nothing but a dictionary; once the merge tools move into the orchestrator (R10, R25) both sides are in one package, so one enum and one total mapping are possible (`digests/discussion/S3.md` §S3-5).
+Supersedes: none.
+ruled_by: human
+Carried by: S6 μ 9201; S3 ε1 9188.
+Keys: fk-d9e6c03dc259, fk-a8d3003e9d83, fk-e903cc072b15, fk-f8e9e0da3786.
+
+## R28 — `VerifyHost` with `host` required on every verify function (2026-11-10)
+Ruling: option A (sitting key S4-1), a `VerifyHost` value, with Leo's change: `host` is REQUIRED on every verify function (entry points and public probes), with no default anywhere inside the verify modules. The process host is resolved once, by `VerifyHost.process()`, at the long-lived boundary objects the harness builds (task workflow, merge-lane worker, review checkpoint, eval runner) and at the two remote verify CLI commands. Two guards: no `host` default in any verify signature, and production code outside the composition roots never calls `VerifyHost.fresh()`. The ContextVar stays only as the process slot and the per-test reset.
+Options considered: (A, recommended) a process-wide `VerifyHost` value (drafted with `host` optional); (B) a runner keyword, caches stay global; (C) the runner as a sixth context field; A with `host` required (ruled).
+Consequence that decided it: every production caller wants the same process host, so the real risk is verify code that forgets to pass its host on, which in tests silently drops the scripted runner and runs real commands; a required parameter turns that omission into a type error (`digests/discussion/S4.md` §S4-1).
+Supersedes: none.
+ruled_by: human
+Carried by: `plans/review-all-s4-verify-run-context-and-runner-contract-prd.md` ι1 9134 (lands C5), ι3 9141 (moves it), κ 9142 (extends it); S8 β 9218 keeps the one `VerifyHost.process()` call in the composition root.
+Keys: fk-126a75a57ca5 (κ; ι1 and ι3 carry no key).
+
+## R29 — A bare worker crash is re-run once at both gates, then is a real failure (2026-11-10)
+Ruling: new option ruled by Leo (sitting key S4-5). At BOTH gates (task verify and merge gate) a bare worker crash is re-run once; a second crash is a real failure whose report names the crash and the test running at the time, and it goes to the fix loop — the debugger at task verify, the steward at the merge gate — never to a human hold. The bare-crash category is not infra-transient. The cross-check fleet halt behaves as today.
+Options considered: (A, recommended) route merge-gate crashes to the infra hold; (B) the merge gate keeps blaming the branch; (C) an isolated rerun decides first; Leo's question whether task verify should also fail on a crash; re-run once then a real failure at both gates (ruled).
+Consequence that decided it: today's split has no principled reason (in July 2026 the merge path had no handler for the raise, a reason now gone), and failing on every crash would bring back the debugger churn on overload crashes that the task-path change stopped (`digests/discussion/S4.md` §S4-5).
+Supersedes: R4 — a clarification, not a reversal: R4 retired the raise and made the crash data; this rules where that datum goes.
+ruled_by: human
+Carried by: S4 α 9128; S9 κ 9241 keeps the rule on the workflow side.
+Keys: fk-5037fafc755c, fk-09ad1a19f587.
+
+## R30 — `orchestrator verdict-parity` command (2026-11-10)
+Ruling: option A (sitting key S4-8; the recommendation was to defer). Expose `verify_runner.py::run_verdict_parity` as the CLI command `orchestrator verdict-parity`, defaulting to the single divergent SHA; rewrite both escalation action texts to name it and `clear_verify_host_quarantine`. One new leaf.
+Options considered: (A) expose it as a CLI command (ruled); (B) delete it and change the procedure; (C, recommended) leave it for a later run.
+Consequence that decided it: Leo chose to give the operator the tool the escalation text points at; the discussion confirmed it buildable in a CLI process (`digests/discussion/S4.md` §S4-8).
+Supersedes: none.
+ruled_by: human
+Carried by: S4 ρ 9166.
+Keys: fk-e906c4e914c2.
+
+## R31 — Task 5040 finishes before S6's lifecycle work (2026-11-10)
+Ruling: option B (sitting key S6-2): task 5040 (the verify-dispatch extraction) finishes first and nothing parks it. S6 δ 9171, ζ 9182 and κ 9192 depend on 5040 and build on its result (δ because 5040's part 2 moves the arm δ rewrites); 5040 waits on no S6 or S7 task, which voids the lead's earlier S7/OQ-3 edge set onto 5040. Every other clause of R1 stands.
+Options considered: (A) hold 5040 and rebase it later onto S6's lifecycle work; (B) let it finish first (the lead's changed recommendation for the sitting; ruled); (C) hold it for the first phase only.
+Consequence that decided it: 5040 was dispatched 2026-11-03/04 and holds a half-built branch (5 commits, 2,315 lines added), which is the plan's own stated fallback trigger; the lead changed the recommendation to B for the sitting and Leo accepted it.
+Supersedes: R1 — its order only ("then `ItemLifecycle` as the operative state … then the collaborator decomposition"), for task 5040 alone. Recorded by the lead.
+ruled_by: human
+Carried by: S6 δ 9171, ζ 9182, κ 9192; existing task 5040. Measured consequence: 92 of the 162 wave-2 tasks now sit behind 5040 (measured 2026-11-11; rule and breakdown in Program status, open items).
+Keys: fk-7f2bce2d482c, fk-75fc1b96098d, fk-313f404f3cc6, fk-a2984bf98f85, fk-769c3bb58ce1, fk-201d70aaf409, fk-e7deb8bcfa95.
+
+## R32 — Lifecycle refusals: escalate now, stop the lane after a clean 14 days (2026-11-10)
+Ruling: option B staged into stop-the-line (sitting key S6-5). On landing, a refused lifecycle transition is a typed refusal that escalates and the lane continues. After the operative registry has run 14 days with zero refusals on dark-factory and reify, a refusal places a per-lane holder of kind `lifecycle_refused` owned by the refusal's escalation and leaves the request in place. One restart-only config value, `merge_lane.lifecycle_refusal_policy: escalate | hold_lane` (default `escalate`), is flipped per project by a dated deterministic gate task. Storm guard: one holder per lane per refused edge. A `lifecycle_refused` holder is rehydrated from its pending escalation across a restart, so a redeploy never silently restarts a stopped lane (lead, as authored). Decision 4 of `plans/merge-queue-modularization-invariants-prd.md` gets a written amendment naming this invariant.
+Options considered: (A) fail the request on refusal; (B, recommended) typed refusal, escalate and continue; (C) fail early, continue late; (D) refuse and leave it in place; Leo's question whether a broken invariant should halt and be fixed at once (Toyota stop-the-line); B staged into stop-the-line at lane scope (ruled).
+Consequence that decided it: refusals are rare (25 in total, all 2026-07-11 to 2026-08-07, none in the last 90 days), about two thirds pointed at real lane defects, and escalate-and-continue let one real defect sit unfixed for 90 days (task 4151); staging guards against a storm caused by a bug in the registry's own table (`digests/discussion/S6.md` §S6-5).
+Supersedes: decision 4 of `plans/merge-queue-modularization-invariants-prd.md` (escalate-and-continue becomes stage 1 only); extends R1 by giving R1's operative `ItemLifecycle` a refusal policy R1 did not state (R1's text otherwise stands).
+ruled_by: human
+Carried by: S6 ζ 9182 (typed refusal, default branch), θ 9176 (holder kind), φ 9186 (policy value, hold arm, storm guard, rehydration, `scripts/lifecycle_refusal_census.py`, the decision-4 amendment). NOT filed yet: ξ (the 14-day quiet-period gate: deterministic, milestone delayed 1209600 s, predicate `scripts/lifecycle_refusal_census.py` over dark-factory and reify `runs.db`, `--window-days 14`) and υ (arm `hold_lane` in `dark-factory-orchestrator.yaml`), which the lead files once 9186 is on main (R58); after ξ is done the lead commits reify's one-line yaml flip; the other seven projects stay `escalate`.
+Keys: fk-313f404f3cc6, fk-a2984bf98f85, fk-83625b943aa5, fk-ba531799522b.
+
+## R33 — Deep chain is kept; only the probe and auto-chain are deleted (2026-11-10)
+Ruling: option A (sitting key S7-1): keep deep chain; delete the variable-depth probe (~275 lines) and auto-chain (~194 lines). The lane keeps adjacent placement plus deep chain. Deep chain is owned by the deep merge-ahead and merge-lane policy plans; merge-lane policy tasks 8527 and 8528 join S7's same-file neighbours; task 6242 is amended (it listed finishing auto-chain as a possible fix). S6 re-measures any count that assumed ~1,450 deleted lines.
+Options considered: (A, recommended) keep deep chain, delete the probe and auto-chain (ruled); (B) delete deep chain too, as R11 ruled; (C) keep deep chain behind a new placement port.
+Consequence that decided it: R11's premise, "every project config has them off", still holds for the probe and auto-chain but has been false for deep chain since 2026-10-20 (reify) and 2026-10-27 (dark-factory), and Leo has since ruled twice more to build on deep chain (`digests/discussion/S7.md` §S7-1).
+Supersedes: R11 — the deletion of the deep-chain placement mechanism only.
+ruled_by: human
+Carried by: `plans/review-all-s7-merge-lane-gates-placement-mechanisms-and-target-adapters-prd.md` β 9133; existing tasks 8527, 8528, 6242.
+Keys: fk-7d1580bb3f03.
+
+## R34 — Reify retry narrowing is deleted end to end (2026-11-10)
+Ruling: option B (sitting key S7-3; the recommendation was to move it behind an adapter). Delete reify retry narrowing end to end: the producer, the narrowed-retry budget, the flag, the `merge_request` tool parameter (`retry_failed_only`), the event marker fields, the narrowed-retry arm of the warm shadow, tests, fixtures and docs. No `target_verify.py` module is created. Task 6576 is cancelled as moot; task 6575 (measure-then-decide on narrowing, temporarily parked on 5040) is cancelled with `x_acceptance_reason` naming the deletion task and this ruling. The deletion lands before S3's `merge_request` move (S3 ε2 9193 → S7 δ 9127); S4 drops its `build_retry_env` consumer row.
+Options considered: (A, recommended) move it behind `build_retry_env` in a target-verify adapter; (B) delete the feature end to end (ruled).
+Consequence that decided it: "preserving the code is not worth the effort and complexity" (Leo); measured, 0 of 5,408 merge verifies since 2026-07-20 were narrowed and no caller sets the flag (`digests/discussion/S7.md` §S7-3).
+Supersedes: R11 — the remedy clause "reify retry narrowing behind `build_retry_env` in a target-verify adapter module with a contract pointer" (the ~700 reify-specific lines still leave the worker, by deletion); and Leo's 2026-10-07 ruling on task 6285 (dormant becomes removed).
+ruled_by: human
+Carried by: S7 δ 9127 (first in S7's chain, lead sequencing R54); existing tasks 6576, 6575 (cancels).
+Keys: fk-dd411ada7c29.
+
+## R35 — Durable per-task steward spend and a $25 default cap (2026-11-10)
+Ruling: option A (sitting key S8-1): steward lifetime spend is durable per task; task 3566 is cancelled. PLUS Leo: the default cap rises to $25 (`orchestrator/src/orchestrator/config.py::OrchestratorConfig.steward_lifetime_budget` Field default and `orchestrator/src/orchestrator/defaults.yaml`, both 12.0 today), and this repo's own yaml line (20.0) is deleted with its comment, ALL IN THE SAME COMMIT as durable spend; no other project sets it. Gate task 5822's budget item is amended to a read-only spend-distribution report.
+Options considered: (A, recommended) durable per-task spend, cancel the rename task 3566 (ruled, with Leo's addition); (B) rename the key, leave spend per-instance; (C) durable spend held until the steward-mode gate rules.
+Consequence that decided it: Leo asked to raise the default and remove lower caps; the measurement found only this repo sets one and no other dollar cap binds a task's total steward spend below $25 (`digests/discussion/S8.md` §S8-1).
+Supersedes: none.
+ruled_by: human
+Carried by: `plans/review-all-s8-harness-composition-root-and-slot-registry-prd.md` θ 9229; existing tasks 3566 (cancel), 5822 (amend).
+Keys: fk-a1085af3a290.
+
+## R36 — One event writer, and the orchestrator reads events only through `EventStore` (2026-11-10)
+Ruling: option A (sitting key S8-3): batched full-durability writes, reads drain first. PLUS Leo: encapsulate the orchestrator process now — `digest.py` and `strict_event_reads.py` move onto typed `EventStore` read methods, the offline orchestrator tools (`storm_window_bound.py` included) are allow-listed explicitly, and a guard test fails on a raw `FROM events` anywhere in `orchestrator/src` except `event_store.py`. The "flush at named sites" alternative is dropped as subsumed. The cross-package `runs.db` read model (dashboard, fused-memory, client feed, quality series, scripts) is an S22 follow-up (wave 3; seam table), not an S8 task.
+Options considered: (A, recommended) batched full-durability writes, reads drain first (ruled, with Leo's addition); (B) batched writes with an explicit flush at named sites; (C) relax to `synchronous=NORMAL` under WAL; (D) a persistent connection only.
+Consequence that decided it: raw-SQL readers are a missing abstraction (Leo); only two raw readers run inside the orchestrator process at runtime, and no in-process design can give the out-of-process readers read-your-writes, so the ban is scoped to `orchestrator/src` and the rest goes to S22 (`digests/discussion/S8.md` §S8-3).
+Supersedes: none.
+ruled_by: human
+Carried by: S8 ι 9230, ι2 9231; S22 (follow-up, unfiled until S22 is authored).
+Keys: fk-f1a7f57fa58e.
+
+## R37 — `convert_to_blocked_enforce` is deleted, in a safe order (2026-11-10)
+Ruling: option B (sitting key S8-7; the recommendation was A), in Leo's confirmed order: (1) a tiny independent first task flips the field's code default to True; (2) after that is deployed fleet-wide the LEAD removes the key from the eight other project yamls (autopilot-video, know-live, pump-web-ui, reify, scoping-intake, solar-challenge, solar-challenge-platform, stream-touch), best effort, one yaml-only `git commit --only` per repo, recording each sha or skip reason in S8 δ's description — a lead action with no task dependency; (3) the rule-table task deletes the field and this repo's yaml line. A project missed gets one self-closing unknown-key L2.
+Options considered: (A, recommended) delete the log-mode rewrite and keep the field as deprecated and ignored, a later task deleting it; (B) delete the field outright (ruled, in the order above); (C) keep it as a classifier policy; (D) flip the default now, delete the field later; Leo's addition: a milestone to edit every other project's yaml before the deletion deploys, best effort.
+Consequence that decided it: the code default is False (log mode), so a yaml line removed before the default flips puts that project in log mode until the deletion lands; flipping first makes the yaml edits safe at any time (`digests/discussion/S8.md` §S8-7).
+Supersedes: none.
+ruled_by: human
+Carried by: S8 η 9212 (default flip), δ 9219 (deletion); the lead's eight yaml edits after 9212 deploys.
+Keys: none of its own (η carries none; δ's keys are R6's).
+
+## R38 — The harness fails closed when a store cannot be built (2026-11-10)
+Ruling: option A, fail closed (sitting key S8-8; the recommendation was B, stand-in stores). `Harness.__init__` builds `EscalationQueue` first, then the event, run and cost stores with no degrade; it retries only SQLite locked/busy (bounded, about 3 attempts over about 30 s); on failure it files one born-at-L2 critical escalation on a fixed sentinel naming the store, path and exception, logs ERROR and raises. The stand-in store classes are dropped. The composition-root task depends on the watchdog crash-loop alarm (task 8270).
+Options considered: (A) fail closed (ruled); (B, recommended) do-nothing stand-in stores, loudly; (C) keep the optional stores.
+Consequence that decided it: "fail loud and hard, do not degrade" (Leo); the 8270 edge and the L2 before the raise keep a bad `runs.db` from becoming a quiet systemd restart loop (`digests/discussion/S8.md` §S8-8).
+Supersedes: none.
+ruled_by: human
+Carried by: S8 β 9218 (depends on 8270).
+Keys: fk-d8f08696dd66, fk-fc3c4cba6a0f, fk-5d0a66a2d32e.
+
+## R39 — The state machine records a failed row write and keeps going (2026-11-10)
+Ruling: option B (sitting key S9-5, as recommended), with one added contract sentence: done and cancelled writes stay OUTSIDE the state machine and keep `Scheduler.mark_done`'s raise-on-failure. Leo also ruled a follow-up outside S9: a periodic (about 2-minute) pass over the existing landed-merge journal with a one-hour give-up to an L1, after task 4646, listed with S8's sweeps — a program-level follow-up the lead files or routes, not a task of S9.
+Options considered: (A) raise on a failed write; (B, recommended) record the failure and keep going (ruled); Leo's open side question: also queue and retry failed writes.
+Consequence that decided it: the machine never writes done (the store's done paths own it); over 30 days no dark-factory done write was lost to a transient failure, and the failures were refusals a retry cannot fix (`digests/discussion/S9.md` §S9-5).
+Supersedes: none.
+ruled_by: human
+Carried by: `plans/review-all-s9-workflow-phase-spine-and-recovery-ledger-prd.md` ν 9284; the landed-journal pass is unfiled (Program status, open items).
+Keys: fk-ee708be4436f, fk-f37f7e253cd5.
+
+## R40 — The L0 settle move is measured 14 days after it lands (2026-11-10)
+Ruling: option A (sitting key S9-7, as recommended) PLUS Leo's check: a small early script task, `scripts/check_l0_settle_outcomes.py` (read-only, with a test), on which the steward-outcome task depends; and a deterministic delayed-milestone check task 14 days after the steward-outcome task lands, measuring stranded or wrongly dismissed blocking L0s with the thresholds in `digests/discussion/S9.md` §S9-7 (baseline: 3.6 harness-stranded blocking L0s per 100 filed; 1 wrong dismissal in 30 days). Large numbers mean a joint redesign with the harness. The check task is filed by the lead once the script is on main.
+Options considered: (A, recommended) the steward decides, the workflow believes it, one settle (ruled, with Leo's check); (B) full ownership with a terminal hand-off.
+Consequence that decided it: the store refuses a deterministic task whose script does not yet exist, so the script lands first and the check is filed after it (`digests/discussion/S9.md` §S9-7).
+Supersedes: none.
+ruled_by: human
+Carried by: S9 π 9164 (script, high), ε 9190 (steward outcome; depends on π); the 14-day check is unfiled (R58).
+Keys: fk-bab6058b23c8, fk-e39550272df9.
+
+## R41 — The status-transition rule is enforced in the backend only (2026-11-10)
+Ruling: new option ruled by Leo (sitting key S10-3). One verdict function in `shared.task_transitions`, one call site in the backend's status writers inside the write transaction, `actor` required, the reopen reason passed. The interceptor's terminal-exit gate and legality gate are deleted; the interceptor renders the backend's refusal through the one error renderer and keeps the tokens.
+Options considered: (A, recommended) one verdict with today's policy in both layers; (B) the backend refuses every illegal change; (C) the backend refuses terminal exits only; Leo's question whether the backend should enforce at all; backend only (ruled, a new option).
+Consequence that decided it: every routine status write already passes the interceptor and only three paths write straight to the backend, none illegally; the backend floor protects against future direct writers, so one enforcement point in the backend is enough (`digests/discussion/S10.md` §S10-3).
+Supersedes: R3 — its clause "the status FSM enforced in the backend as well as the interceptor" becomes "in the backend only". The rest of R3 stands.
+ruled_by: human
+Carried by: `plans/review-all-s10-task-write-contract-metadata-modes-success-signal-and-registry-prd.md` κ1 9248; ν 9282 (the `StatusTransitionGate` partition adapts).
+Keys: fk-d80c1c44bca1, fk-1eb04ceac9e8, fk-e3e99447e11e.
+
+## R42 — `metadata.files_to_modify` is destroyed (2026-11-10)
+Ruling: new, ruled by Leo (sitting key S10-5). Fused-memory refuses an incoming metadata payload carrying `files_to_modify` (submit and update; incoming keys only) with an error naming `files`; the shared declared-files reader reads `files` only; every other reader of the key is deleted; a test fails if any module under `*/src` reads it. The lead backfills the three rows that differ (dark-factory 2507, reify 4344 and 4865 as of 2026-11-10) after the refusal deploys. The precedence question is withdrawn. The details-text prefix stays as planned (stop writing, age out). Renaming the curator's internal field is an optional low follow-up outside S10.
+Options considered: (A, recommended) keep the store's precedence rule between the two keys; (B) adopt the interceptor's skip-empty rule; search-and-destroy the key (Leo, ruled).
+Consequence that decided it: the key is nearly extinct — 4 rows across all 11 stores, all done, the newest from July, no code writing it — so destroying it is mostly deleting readers and the precedence question goes moot (`digests/discussion/S10.md` §S10-5).
+Supersedes: none.
+ruled_by: human
+Carried by: S10 δ 9204, ε 9209; the lead's three-row backfill after 9204 deploys.
+Keys: fk-fa3e3d765f50, fk-fa355c2c0498.
+
+## R43 — One rule for a human gate task (2026-11-10)
+Ruling: new, ruled by Leo (sitting key S10-6). A task is a human gate when it is deterministic AND `always_escalates` is true (stored shape; for a submission, after the submit-time coercion). Refinements are named properties (pure vs act-then-ask; a curator gate is also `operational_mode == 'gate'`). The blocked-gate audit and the curator sweep keep their own honestly named selectors; the four other consumers move onto the one rule. Live signal: a one-week count of extra recon duplicate-gate refusals.
+Options considered: (A, recommended) one home, the named rules unchanged; (B) every consumer uses the interceptor's rule; one uniform rule, to be chosen (Leo) — ruled as above.
+Consequence that decided it: the interceptor's rule over-reports (14 tasks it calls gates dispatch to an agent), while the orchestrator hands a task to a human exactly when it is deterministic and always-escalating (`digests/discussion/S10.md` §S10-6).
+Supersedes: none.
+ruled_by: human
+Carried by: S10 λ 9254 (`shared.gate_declaration`).
+Keys: fk-06ab2d3e9148.
+
+## R44 — Candidate-key collisions refused with their own token and counted after 30 days (2026-11-10)
+Ruling: option A (sitting key S10-7, as recommended) PLUS Leo's check: a collision in the curator combine is an audited refusal with the distinct token `candidate_key_collision` (with the survivor id and both file sets); a census script, `scripts/combine_collision_census.py`, must be on main before the check task is filed; a deterministic delayed-milestone check 30 days after the combine task counts occurrences across all projects, and "frequent" (≥ 5 collisions or ≥ 1% of combine writes) means address it more elegantly.
+Options considered: (A, recommended) refuse, record the survivor, create (ruled, with Leo's check); (B) retarget the combine into the survivor; (C) refuse and drop the candidate.
+Consequence that decided it: Leo wants the frequency measured before a redesign; a deterministic task's script must exist on main at filing (`digests/discussion/S10.md` §S10-7).
+Supersedes: none.
+ruled_by: human
+Carried by: S10 ζ 9214 (combine), ρ 9237 (census script); the 30-day check (S10 σ) is unfiled (R58).
+Keys: fk-de3df95984a5.
+
+## R45 — The memory service's mutators split out past the identity third (2026-11-10)
+Ruling: Leo ruled three extra tasks (sitting key S26-2) after the backends-private task and before the integration test: (1) move the write-metadata policy and store-codec helpers out of `memory_service.py` (`memory_metadata_policy.py`, `store_records.py`); (2) extract `GraphMutations` over a small shared journaled-operations module, `journaled_ops.py` (`journaled_op`, `journaled_backend_call`, event sink; NOT inside `write_journal.py`); (3) extract `MemoryMutations` (after 1). `MemoryService` keeps thin public delegates. A follow-up records the read-path split (`memory_reads.py`) and a prose pass. Same-file edges or notes go on the live tasks that name moved mutators.
+Options considered: (A, recommended) stop at the identity split; (B) also move the metadata policy; (C) also move the maintenance mutators; a deeper clean decomposition (Leo) — ruled as the three tasks above.
+Consequence that decided it: measured, the graph mutators are already almost independent of the write path, and the plan's reason for not splitting them stops being true once the plan lands (`digests/discussion/S26.md` §S26-2).
+Supersedes: none — it carries R7's partition past the identity third R7 named and does not change R7's choice of the reconciler; it moves `journaled_op`'s home to `journaled_ops.py`.
+ruled_by: human
+Carried by: `plans/review-all-s26-memory-service-write-path-and-graph-client-prd.md` ρ 9243, τ 9245, υ 9247, φ 9252 (follow-up, dispatched after the integration gate π 9250).
+Keys: fk-da5b47d0493a, fk-343c4a42be6b, fk-50cc281018fb.
+
+## R46 — The cross-process identity exclusion is designed in a human session (2026-11-10)
+Ruling: option D (sitting key S26-3, as recommended) as a HUMAN DESIGN SESSION: the follow-up is a deterministic, always-escalating gate task asking for an interactive `/spawn` `/team --fable` session (investigate, discuss designs, answer every open question before the PRD) with a committed brief file, `plans/fm-cross-process-identity-exclusion-session-brief.md`; it is not an architect task. Lead sequencing: the gate depends only on S26's public-identity-lock task and absorbs task 6293's design question; task 6730 must not depend on the gate.
+Options considered: (A) accept the race as standing; (B) build a cross-process lease now; (C) run cross-graph moves inside the server; (D, recommended) file a follow-up that owns it (ruled, as a human design session).
+Consequence that decided it: Leo wants the design discussed before a PRD exists; the gate costs no agent dispatch (`digests/discussion/S26.md` §S26-3).
+Supersedes: none.
+ruled_by: human (sequencing: lead)
+Carried by: S26 σ 9198 (high, so gate 6698 waits on it; depends on λ 9194); existing tasks 6293, 6730.
+Keys: fk-9804ecc4567d.
+
+## R47 — Task 4867 is hand-carried and S10's first task waits on it (2026-11-10)
+Ruling: task 4867 (a write-nothing `update_task` fails; unknown MCP arguments are loud) is hand-carried now by Leo's ruling; S10's first task depends on 4867 as originally drafted. The lead's inversion of that edge, ruled earlier the same day because 4867 was lock-starved, is void.
+Options considered: invert the edge for 4867 alone (the lead's ruling); hand-carry 4867 and keep the drafted edge (Leo).
+Consequence that decided it: hand-carrying removes the lock starvation that motivated the inversion.
+Supersedes: the lead's S10/OQ-7 ruling of 2026-11-10 (`digests/wave2-lead-rulings.md`), not an R entry.
+ruled_by: human
+Carried by: S10 α 9180; existing task 4867 (deferred under its carry).
+Keys: fk-ff5234ac1013, fk-116481623cfb.
+
+## R48 — Wave-2 design questions accepted as recommended (2026-11-10)
+Ruling: every question below was accepted as the plan recommended ("Otherwise, your recommendation LGTM"); the PRD text authored under the recommendation stands and is the record of what was decided. Sitting keys, with the plan's question id:
+- S3: S3-2 (OQ-2, all three emitters write `merge_deduplicated`), S3-3 (OQ-5).
+- S4: S4-2 (OQ-2), S4-3 (OQ-3), S4-4 (OQ-4), S4-6 (OQ-7), S4-7 (OQ-8, option b).
+- S5: S5-1 (OQ-3, A′: task 4752 folded into λ 9267), S5-2 (OQ-5, B′, including the low-priority re-entrant lane-lease follow-up σ 9277), S5-3 (OQ-9).
+- S6: S6-1 (OQ-1; tasks 4581, 7396 cancelled into α 9140), S6-3 (OQ-3), S6-4 (OQ-4; task 5046 cancelled), S6-6 (OQ-10; acceptance record 9211, cancelled with `x_acceptance_reason`), S6-7 (OQ-11; live effect accepted: dark-factory no-progress budget 5400 s → 7800 s, hung-verify hold 4.5 h → 6.5 h, reify 9.5 h), S6-8 (OQ-12, option b).
+- S7: S7-2 (OQ-2), S7-4 (OQ-CQ1), S7-5 (OQ-CQ3).
+- S8: S8-2 (OQ-2; 4651 depends on ε2a 9223), S8-4 (OQ-5), S8-5 (OQ-6; confirms the lead's reading of R6's "both recovery sweeps": `CrashRecovery` and `StrandedReconciler`), S8-6 (OQ-7).
+- S9: S9-1 (OQ-1), S9-2 (Q-C1), S9-3 (OQ-2), S9-4 (OQ-3), S9-6 (OQ-4), S9-8 (OQ-6), S9-9 (Q-C4).
+- S10: S10-1 (OQ-3), S10-2 (OQ-4), S10-4 (OQ-8; task 3260 amended).
+- S26: S26-1 (OQ-2), S26-4 (OQ-8), S26-5 (OQ-9), S26-6 (OQ-10; task 5612 cancelled into ξ 9215), S26-7 (OQ-11).
+Options considered: as each plan's `## Rulings (sitting of 2026-11-10)` section states.
+Consequence that decided it: Leo found each recommendation sound; none reverses an R entry.
+Supersedes: none.
+ruled_by: human
+
+## R49 — R5's git-runner wording clarified (2026-11-10)
+Ruling: the `WorktreeMissing` adaptation is the leaf `orchestrator/git_run.py::run_in_worktree`; `git_ops._run` is deleted (S5/OQ-6, option A; ruled by the lead 2026-11-02 and shown to Leo in the sitting's uncontested block 2026-11-10).
+Options considered: keep the adaptation in `git_ops._run`, as R5's letter says; a leaf module (ruled).
+Consequence that decided it: R5's intent is one `WorktreeMissing` adaptation over `shared.git_async.run_git`; the lead recorded the leaf as satisfying that intent (S5 PRD §Rulings OQ-6, D2, C1).
+Supersedes: R5 — wording only: "git_ops keeps only the `WorktreeMissing` adaptation" is read as its intent (one adaptation site), not its letter (the site is `git_run.py`).
+ruled_by: lead
+Carried by: `plans/review-all-s5-gitops-ports-query-contract-and-the-git-runner-prd.md` α 9255, β 9258 (C1).
+Keys: fk-d73aeaebb792, fk-3a4cc6298c02.
+
+## R50 — R11's resource-audit fingerprint clarified (2026-11-10)
+Ruling: resource-audit violation records are fingerprinted on (kind, subject, grace_secs, detail) (S7/OQ-CQ6; ruled by the lead, shown to Leo 2026-11-10).
+Options considered: R11's literal (kind, subject); the four-field form (ruled).
+Consequence that decided it: the four-field form keeps task 3203's pinned grace and permit-growth re-log.
+Supersedes: R11 — clarification of "fingerprinted on (kind, subject)".
+ruled_by: lead
+Carried by: S7 ε 9149.
+Keys: fk-5d4406afeade.
+
+## R51 — Invariant landing order INV-15 → INV-16 → INV-17 (2026-11-10)
+Ruling: S6 α 9140 (`lane-budgets-exceed-verify-timeouts`) lands first as INV-15; then S10 θ 9242 (`metadata-slices-one-table`) as INV-16; then S7 ζ 9154 (`merge-gate-unmeasured-typed`) as INV-17. Edges on the three invariant files: S10 θ depends on S6 α, S7 ζ on S10 θ. Every check anchors on the slug, never the number. S6's separate invariant docs leaf was folded into α.
+Options considered: the lead's earlier order (S10 θ → S7 ζ → S6 α); this order.
+Consequence that decided it: the budget validator fixes a live misconfiguration (a 5400 s budget under a 7200 s timeout) and R1 made it a first leaf; the earlier order held it behind S10's deep chain and all of S7 (the S10 critic's delta pass N1).
+Supersedes: the lead's invariant numbering of 2026-11-02 (`digests/wave2-lead-rulings.md` "Invariant numbering (S10/OQ-5)"); R22 set no order.
+ruled_by: lead
+Carried by: S6 α 9140, S10 θ 9242, S7 ζ 9154.
+Keys: fk-4b76c9695674, fk-f528087f44c7, fk-88e3c228b649.
+
+## R52 — Tasks 4833, 5409 and 4651 land first in today's files (2026-11-10)
+Ruling: three live tasks land before the wave-2 moves that would otherwise carry them: 5409 (S3 ε2 9193 depends on it) and 4651 (S3 ε1 9188 depends on it), both from Leo's S3-1 mitigations (R25); and 4833 (delete `TerminalOutcomeRetention`), by the lead: S3 ε1 9188 and S6 κ 9192 depend on 4833, 4833 waits on no S3 or S6 task, and S6 α is not held behind it. `fk-66746efddd4d` is `filed:4833`; `fk-bc64099a1cd0` is `filed:5409`. Task 4651 additionally depends on S8 ε2a 9223 (R48, S8-2), and its temporary parking edge on 5040 was removed at S8's decompose. Task 4567 is a prerequisite of S3 θ 9177 only.
+Options considered: each task waits for the move and is re-scoped onto the moved code; each lands first and the move carries its code (ruled).
+Consequence that decided it: holding three live fixes behind the merge-tool moves (which wait on S6's native-port chain and on 5040) delays them by ~20 tasks for no design gain.
+Supersedes: none (the plans' earlier edge directions only).
+ruled_by: lead (5409 and 4651: human, R25)
+Carried by: existing tasks 4833, 5409, 4651, 4567; S3 ε1 9188, ε2 9193, θ 9177; S6 κ 9192; S8 ε2a 9223.
+Keys: fk-66746efddd4d, fk-bc64099a1cd0.
+
+## R53 — Task 6236 is kept as an extraction and lands before S10's interceptor partition (2026-11-11)
+Ruling: task 6236 (done-provenance extraction) is KEPT, amended to "extraction only" (the git-runner seam half belongs to S5 μ 9276), and S10 ν 9282 depends on 6236: 6236 lands first, and `StatusTransitionGate` imports `done_provenance.py` downward. 6236 depends on task 5274; if 5274 stalls, the fallback is to cancel 6236 into ν.
+Options considered: cancel 6236 into S10 ν; keep it after ν (the S5 seat); keep it before ν (the S10 seat; ruled).
+Consequence that decided it: ν's rule that it imports nothing back from `task_interceptor.py` would otherwise force ν to move the done-provenance cluster itself (`critique/S10.align.md` §Not applied).
+Supersedes: none.
+ruled_by: lead
+Carried by: existing task 6236 (its text refreshed at filing); S10 ν 9282; S5 μ 9276.
+
+## R54 — Wave-2 decompose procedure and the one per-file order (2026-11-11)
+Ruling: all nine wave-2 plans were filed IN PARALLEL in planning mode with intra-plan and existing-task edges only, no seat committing; the lead then wired every cross-plan edge from `digests/wave2-order.json` (in the program state home; built from the nine `critique/<S>.align.md` chains, the live store's edges and the rulings; verified acyclic: 165 tasks, 702 edges, 90 per-file edges on the 73 non-test files shared across plans), re-checked the live store for cycles, and only then were batches committed. The per-file order is one global topological order — free tasks first, then tasks behind 8528, then tasks behind 5040; within a level S6's first task, then priority, then seam order S5 S4 S10 S7 S3 S6 S9 S8 S26 — and on each non-test file shared across plans consecutive tasks in that order are chained; test files are left to the scheduler's file locks. Rulings applied within it: S6 α 9140 lands first on every file it shares with another plan and takes no edge on S5 α 9255, S5 λ0 9256, S7 δ 9127, S7 β 9133, S3 or task 4833 (S3 α 9152 → S6 α); S7 δ heads S7's chain (δ → β → α1 → α2 → γ → ε → ζ); S5 λ0 is second in S5's chain; S5 ν 9274 keeps its chain position, so S9 δ 9184 onward waits on 5040 through S5 (accepted); the S8 ↔ S3 cycle cut (S8 β 9218 depends only on S3 β 9157 and δ 9167; S3 ε1 depends on S8 ε2b 9224; S8 ε3 9225 and ω 9236 depend on S3 ζ 9200); S8 ε2b depends on S9 θ 9213, one way.
+Options considered: decompose seat by seat in seam order, each committing its batch (the protocol's default).
+Consequence that decided it: `add_dependency` does not reject cycles, and a batch committed before its cross-plan edges exist can dispatch early.
+Supersedes: none (deliberation.md §Launching step 3's sequential form, for this wave).
+ruled_by: lead
+Carried by: all 162 wave-2 tasks.
+
+## R55 — New worker.py tasks park behind 8528, except S6's first task (2026-11-11)
+Ruling: every new wave-2 task declaring `merge_lane/worker.py` depends on task 8528, extending Leo's 2026-11-10 chain protection (which parked every pending worker.py task behind 8528) to the program's new tasks so none takes the lock at a handoff. EXCEPTION: S6 α 9140 (the timing-budget validator, INV-15, a small fix of a live misconfiguration) is NOT parked, because it is ruled first on every shared file and parking it would put about 50 otherwise free tasks behind the chain. One edge reverses the exception; it is flagged to Leo (Program status). Measured side effect: S7 δ 9127, and S3 ε2 9193 through it, now wait on 8528 → 8527 → 7720, unlike S7's PRD sentence "δ does not wait on 7720".
+Options considered: park every new worker.py task; park none; park all but 9140 (ruled).
+Consequence that decided it: the chain protection is Leo's; the single exception is the one task whose delay costs a live misconfiguration and ~50 tasks.
+Supersedes: none.
+ruled_by: lead
+Carried by: the parking edges on 8528 in S3, S4, S5, S6 and S7; S6 α 9140.
+
+## R56 — S26's graph-access task waits on task 7743 (2026-11-11)
+Ruling: S26-D1 = (a): S26 θ 9179 depends on task 7743, which lands `backends/paged_read.py` first; `graph_access` imports it. Edge wired by the lead with the cross-plan wiring.
+Options considered: (a) θ depends on 7743 (ruled); (b) cancel 7743 into θ; (c) leave them unordered under file locks.
+Consequence that decided it: both tasks re-home `graphiti_client._paged_ro_query`; 7743's graphiti_core-free `paged_read.py` keeps `falkor_read_only` from loading the FalkorDB driver, which a home inside `graph_access.py` would undo, so 7743 owns the home and `graph_access` imports it.
+Supersedes: none.
+ruled_by: lead
+Carried by: S26 θ 9179; existing task 7743.
+
+## R57 — S8's Scheduler-construction codemod keeps its declared files (2026-11-11)
+Ruling: S8-d1: task 9217 (S8 β0, the Scheduler-construction codemod) keeps its 73 declared files as the plan rules; it is hand-carried if lock-starved for more than 24 h. Mentioned to Leo with the 5040 question (same lock-starvation class).
+Options considered: keep the 73 files with a hand-carry trigger (ruled); declare only the 13 non-codemod files and let the architect widen.
+Consequence that decided it: the codemod touches every one of the files, so an undeclared edit would be a scope violation; the lock-starvation risk (as with 5040 and 4867) is met by the hand-carry trigger.
+Supersedes: none.
+ruled_by: lead
+Carried by: S8 β0 9217.
+
+## R58 — Dated check and policy-flip tasks are filed only after their prerequisite lands (2026-11-11)
+Ruling: four ruled tasks are deliberately NOT filed at decompose; the lead files each under `planning_mode` with its `prd_path`/`prd_task_label` once its trigger holds: S6 ξ and υ (R32) after S6 φ 9186 lands; S10 σ, the 30-day combine-collision check (R44), after S10 ρ 9237 (`scripts/combine_collision_census.py`) is on main; the S9 14-day L0 check (R40) after S9 π 9164 (`scripts/check_l0_settle_outcomes.py`) is on main.
+Options considered: file them now with an edge on the script task (refused by the store); file later (ruled).
+Consequence that decided it: `submit_task` validates a deterministic task's `before_done.script`, so a check filed before its script is on main fails at submit.
+Supersedes: none.
+ruled_by: lead
+Carried by: S6 φ 9186, S10 ρ 9237, S9 π 9164 (the triggers).
+
+## R59 — The idle-workflow slot leak fix lands before the slot-registry rewrite (2026-11-11)
+Ruling: task 5153 (a registered-but-idle workflow is invisible to all three reapers and holds its slot; high, no prerequisites) lands first, in today's code. The S8 slot-registry task 9216 depends on 5153 and folds the container 5153 adds into `SlotRegistry`. The edge 9216 depends on 5153 was wired on 2026-11-11.
+Options considered: A the fix lands first and the registry task absorbs it (ruled); B the fix waits for the registry task, as the S8 draft suggested.
+Consequence that decided it: on 2026-11-11 task 9216 had 207 unfinished transitive prerequisites, including task 5040, so option B would have left a live slot leak open behind a long refactoring chain.
+Supersedes: the S8 PRD's recommended edge "5153 depends on the slot-registry task" (a recommendation, never a ruling; never kept in the store).
+ruled_by: human (Leo, in the first lead's thread, 2026-11-11: "agreed" on "the fix lands first"; record `~/.claude/review-all/review-all-dark_factory-20261008/digests/leo-answers-via-predecessor-2026-11-11.md`)
+Carried by: task 5153; S8 α 9216 (`plans/review-all-s8-harness-composition-root-and-slot-registry-prd.md`).
+
+## R60 — Task 5040 is hand-carried once the merge-lane policy chain's last task is done (2026-11-11)
+Ruling: task 5040 (the verify-dispatch extraction; 90 declared files, a half-built branch) is carried by a dedicated session through the merge queue as soon as task 8528 is done. It is not carried ahead of the chain. A scheduled check launches the carry and stands down if one already exists.
+Options considered: A hand-carry after 8528 (ruled); B leave it to the factory and carry only after 24 hours of lock starvation; C hand-carry now, ahead of the policy chain.
+Consequence that decided it: 92 of the 162 wave-2 tasks wait on 5040 (measured 2026-11-11, R31 made it a prerequisite), and a 90-file task starved for file locks from 2026-11-04; carrying it ahead of the chain would take the merge worker file from the chain protected on 2026-11-10.
+Supersedes: none (it completes R31 and follows the precedent of R47).
+ruled_by: human (Leo, in the first lead's thread, 2026-11-11: "do", confirmed "do this"; same record file)
+Carried by: task 5040; brief `~/.claude/spawn-briefs/hand-carry-5040.md`.
+
+
+## R61 — Eval filings are contained at levels 1 and 2, and evals are made hermetic inside the filing plan (2026-11-12, 2026-11-13)
+Ruling: option B as recommended (sitting key S1-2, S1/OQ-8): an eval task's filings are contained at levels 1 and 2 through the filing policy's two-value eval scope; the agent tools' policies contain every level; the filing door does not contain an in-process level-0 record, and the reason is reworded: at main an eval cell has no queue and no steward, so that exclusion is a backstop for the future, not a protection of current behaviour. PLUS Leo, in his words: "we need to make sure that the filed level zeros from evals don't end up leaking into the task store via any automated filer, or indeed leaking out of the eval in any way. We want the evals to be both realistic (within their scope) and hermetic (with respect to the main work of the orchestrator, and all of the project-wide non-eval state. )." Applied inside the S1 plan (ruled by Leo 2026-11-13: carried as tasks of the plan, not as a follow-up outside it): the workflow migration states that the eval cell factory passes no filer and a test asserts it; the orphan reaper's and the info-level-0 router's eval exclusions stay; λ1 makes the eval package hermetic at once (eval transcript root, the cell factory refuses a production queue, filer or event store, a zero-write row in the eval boundary suite); λ2 gives the workflow a verify-log root seam at the end of `workflow.py`'s order and mints `eval-writes-no-production-state`; μ runs corpus eval cells under the production sandbox with the same backend and grants (residual R-7 = A), records that past corpus results stop being comparable, and needs a fresh baseline for the next campaign. The separate eval clone (residual option C) is not filed; the shared `.git` is a known residual. The daily memory-eval runner's `eval_regression` escalations are outside the rule (they are meant for a human; lead reading shown to Leo, not objected to).
+Options considered: (A) contain eval filings at every level including level 0; (B, recommended) levels 1 and 2 only (ruled), plus Leo's hermeticity addition; (C) contain only on the agent tool path; for the sandbox, (A, recommended) production sandbox for corpus cells (ruled), (B) leave corpus cells unsandboxed, (C) a separate eval clone.
+Consequence that decided it: before task 4757 closed the agent-tool path, one 53-cell campaign wrote 36 memories, 7 escalations and 3 task submissions into production; at main four paths stayed open (172 eval transcripts in the production transcript archive, verify logs under the production root, the shared `.git`, unsandboxed corpus cells; `digests/discussion/S1.md` §S1-2), and none of them passes through the filing door, so containment at the door alone cannot close them.
+Supersedes: none (R8 named eval-lane containment as one of the five gates; this states its level scope and adds the hermeticity work).
+ruled_by: human (the `evals/runner.py` order μ → λ1, λ2 → μ: lead)
+Carried by: `plans/review-all-s1-one-escalation-filing-entry-point-prd.md` δ 9715, κ1 9808, η1 9755, λ1 9845, μ 9849, λ2 9855 (INV-19, R88). The cross-plan rule is R80.
+
+## R62 — R8's filing interface wording clarified: one filer with three entry points, a frozen draft, and `policy` (2026-11-12)
+Ruling: R8's single `file(record, policy: FilingPolicy)` is read by its intent, one door: `escalation/filing.py::EscalationFiler` has three entry points chosen by where the caller runs (await; fire-and-forget on the loop; blocking off the loop) and the record carries a typed subject (sitting key S1-1, option 1, as recommended; accepted consequence: three synchronous on-loop alarm callers, the reconciliation harness's alarm method with 10 call sites, the scheduler's work-product probe alarm and the merge-gate storm reporter task 9136 adds, become fire-and-forget and can lose a record on a crash). Callers build a frozen `EscalationDraft` and only `filing.py` constructs the stored record (S1/OQ-2). The merge-lane port's second argument is named `policy`, not `dedupe`: `EscalationPort.file(record, policy)` (S1/OQ-10). The steward hand-off and the merge lane's halt-owner filing become async and await their filing (S1/OQ-9).
+Options considered: as `plans/review-all-s1-one-escalation-filing-entry-point-prd.md` §Rulings states for OQ-1, OQ-2, OQ-9, OQ-10.
+Consequence that decided it: one door cannot keep a single synchronous signature when its callers run on the loop, off it and in async code; three named entries make the wrong offload impossible to pick. The word `dedupe` undersells a value that also chooses the level.
+Supersedes: R8 — wording only: "a queue-layer filing function `escalation/filing.py::file(record, policy: FilingPolicy)`" is read as the `EscalationFiler` door with three entries, and "a widened `EscalationPort.file(record, dedupe)`" becomes `EscalationPort.file(record, policy)`. R8's seam row is updated to match.
+ruled_by: human (S1-1); lead (S1/OQ-2, OQ-9, OQ-10)
+Carried by: S1 α 9686, β 9688, ε1 9716, ε2a 9722, ε2b 9723, ε3 9725, ω 9856.
+Keys: fk-7d1f3a0d12ca, fk-333277fb4bd7, fk-32903f2e64e0, fk-2e0a4419290b.
+
+## R63 — A caller with no identity header loses every authority-bearing escalation action (2026-11-12, 2026-11-13)
+Ruling: option B (sitting key S2-2) widened by residual R-6 = B: a caller that sends no `X-Escalation-Identity` header loses every authority-bearing action at every level (resolve, park, promote, `stamp_triage`, `amend_escalation`, `claim_policy_class`, pin declarations); filings and reads stay open and are stamped `unidentified`. PLUS Leo, in his words: "(deploy the MCP configuration to all existing projects before denying, make the denial self-explaining via the error message, especially for the no identity header case). the headless channel should not be supported." Order: (1) ε parses identity, stamps `filed_via`/`resolved_via` and builds the `identity_required` message, with no denial; (2) the deploy: μ changes dark-factory's `.mcp.json`, the watcher skills' launch config and `orchestrator/src/orchestrator/mcp_lifecycle.py::mcp_config_json`, so every spawned agent sends its role as identity, and ν, a pre-authorised operator-sweep gate on S16 χ's mechanism, changes the other eleven projects' `.mcp.json`; (3) ξ checks for three days that no resolve, park or promote came from an unidentified caller (Leo's "a few days" read as three, confirmed by the lead); (4) ο refuses. ξ and ο are filed by the lead when their triggers hold (R58). A header-less `promote_to_l2` is refused too. The five esc-2087-2 test pins change, and the change records that it ends the 2026-08-20 human-channel guarantee (esc-2087-2). A missed client loses an action, never an escalation. The edit to `reify/scripts/docs-truth-sweep.py` is not a dark-factory task: the lead filed it in reify's own store on 2026-11-13 as reify task 9996 (low), which depends on `dark_factory:9760` (ε); ν takes no edge on it.
+Options considered: (a, recommended) keep authority for header-less callers and record the channel; (B) refuse level-2 actions to them (ruled), widened at R-6 from level-2 actions to (b) every authority-bearing action at any level.
+Consequence that decided it: Leo's "the headless channel should not be supported"; the discussion measured that every spawned agent, five timer scripts and every interactive `.mcp.json` (twelve projects, none sending headers) use that channel today, so the denial is safe only after the deploy (`digests/discussion/S2.md` §S2-2).
+Supersedes: the lead ruling S2/OQ-9's clause "one that sends no header is allowed" (`digests/wave3-lead-rulings.md`), not an R entry; the 2026-08-20 esc-2087-2 guarantee. R9's `parse_caller_identity` stands.
+ruled_by: human (the three-day window, ν on S16 χ's mechanism, μ's one-line exemption (R87) and the reify-store task: lead)
+Carried by: `plans/review-all-s2-typed-escalation-record-facts-prd.md` ε 9760, μ 9817, ν 9843, and the not-yet-filed ξ and ο (§Not filed); reify task 9996; S1's door writes `filed_via` on every record (S1 β 9688); S16 χ 9712 builds the spawn mechanism ν uses. Who keeps authority afterwards: R91.
+Keys: fk-ece88b7661b7 (closed by ο), fk-755f786c32be.
+
+## R64 — The task store refuses a dependency edge that closes a cycle (2026-11-12, 2026-11-13)
+Ruling: Leo asked under sitting key S2-3: "add_dependency should detect dependency cycles and reject them … What do you think?" The answer was yes (`digests/discussion/add-dependency-cycles.md`) and became task 9490, outside every plan: `SqliteTaskBackend` refuses a cycle-closing edge for both `add_dependency` and `update_task(dependencies=…)`, walking the literal edge table across all statuses with one reachability helper shared with `shared/cancel_dispositions.py::_reaches`; task 8343 carries a pointer to it, and task 8143 consumes the helper if it lands first. PLUS Leo on 2026-11-13, in his words: "File the task(s) (inculding updating all prompts, skils, docstrings & memories that say to check for cycles or that cycles are possible), high priority." So 9490 is HIGH and also updates every prompt, skill and docstring that says to check for cycles or that cycles are possible (`skills/prd/references/decompose-mode.md` added to its files); memories that say so are amended after it lands through the human gate 9634. Plan text that told a wiring script to run its own cycle pre-pass now names 9490's refusal; a pre-pass may stay as an early check, not as the guard.
+Options considered: no check (today: only self-loops refused); a check in the MCP tool; a check in the storage layer in the same transaction as the insert (ruled).
+Consequence that decided it: `add_dependency` refused only self-loops, `update_task(dependencies=…)` checked nothing, and R54's own procedure had to simulate cycles by script; the check is deterministic and cost 0.033 s on the largest closure, and the live graph had 0 cycles, so turning it on refuses nothing that exists (measured 2026-11-12).
+Supersedes: none (R54's "`add_dependency` does not reject cycles" stays true until 9490 lands, and is the reason for R54's procedure).
+ruled_by: human (the memory amendment carried as human gate 9634: lead)
+Carried by: task 9490 (high); human gate 9634 (depends on 9490); pointer on task 8343.
+
+## R65 — A reconciliation stage's identity and run id come from the connection; a differing argument is refused (2026-11-12, 2026-11-13)
+Ruling: option B (sitting key S12-2): the fused-memory server refuses a stage write whose `agent_id` differs from the stage-identity header, with a structured error naming both values and saying the connection already identifies the stage, and one log event per refusal; a matching or missing value lands, attributed to the header. PLUS Leo, in his words: "Make sure to sweep all the relevant prompts and skills to update them in line with the new requirement." Leo confirmed on 2026-11-13 ("S12-2 LGTM.") the answer to his question: the model sends no id because a deterministic route carries it; this applies to reconciliation stages only, and every other client (task agents, interactive sessions, scripts, skills) keeps passing `agent_id`. The lead added (S12.md residual R-1 = A, shown to Leo, not objected to) that the refusal also covers a `_causation_id` that differs from the run-id header, and confirmed three readings: the refusal covers `get_entity`, `get_entity_by_uuid` and `get_episodes` but not `search` (whose `agent_id` is an authoring-agent filter, carried through verbatim by S15's tool-family moves); `docs/task-authoring.md` and the server's `FUSED_MEMORY_INSTRUCTIONS` join the sweep. The sweep lands in the same commit as the refusal: `stages/base.py` ("The connection already identifies you and this run. Do not pass `agent_id` or `_causation_id`."), `prompts/stage1.py`, `prompts/stage2.py`, `recon_self_model.py`, `CLAUDE.md` §"Write-Tagging Convention" (drops the `"reconciliation-stage-1"` example), `.claude/commands/memory.md`. Task filing reads the run id from the header. `recon_stage_identity_override` exists nowhere. The recon-report server follows the same rule: S13 ξ refuses a mismatching `run_id` and drops the prompts' "echo run_id" line.
+Options considered: (1, the plan as authored) the header wins and an override event records both values; (B, the sitting's recommendation after the lead changed it) refuse (ruled).
+Consequence that decided it: 0 mismatching writes in 7 days, so refusal costs nothing today and makes the next drift loud, as Leo's fail-loud ruling of 2026-11-10 (R38) prefers.
+Supersedes: the lead's withdrawn ruling S12/OQ-3 ("header wins, one override event") and the lead's 2026-11-11 alignment line on recon-report identity; sharpens R12's "`StageId` in the run context rather than a prompt-echoed agent_id string" (an echoed differing value is now refused, not merely unneeded).
+ruled_by: human (run-id clause and the three readings: lead)
+Carried by: `plans/review-all-s12-reconciliation-run-lifecycle-and-stage-interface-prd.md` δ 9813; `plans/review-all-s13-recon-sweeps-flag-identity-and-recon-report-state-prd.md` ξ 9750; S15's tool-family moves ε1–ε5 (9827–9831); task 6895 cancelled as superseded by δ.
+Keys: fk-a3598aec7dca, fk-d2c7f1b902ac.
+
+## R66 — Task status lives only in the task store; reconciliation stops writing it into memory (2026-11-12, 2026-11-13)
+Ruling: option (b) as recommended for sitting keys S13-1 and S13-4, settled through residual R-1 = A on 2026-11-13. Leo's principle, in his words: "fundamentally nothing should put task status or read task status from the memory store. The current task status has one point of truth, the task statuses in the tasks database." The stale-status sweep stops writing its replacement status sentence and only retires stale facts; the Stage-1 prompt's "Resulting-state-only temporal_facts" and "update_edge Temporal Limitation" sections are rewritten so that for a task's status the agent invalidates the stale edge and writes nothing (other temporal facts keep the two-step). The typed status record (S13-1 option (a)) is not built, because it would keep a copy of status inside memory. fk-9b76dd8a1cdb is accepted: the detector stays as a cleanup backstop for status prose from other writers until the recall design session sets the write and read rules; re-raise it if that session lands a write rule for every writer. The recall-from-the-task-store design session (Leo: "Agreed. /spawn fable /team investigate, discuss & design") is SPAWNED as its own fable /team session, outside every plan and not a task of any; nothing in S13 waits on it; its rulings return into `digests/leo-rulings-fused-recall.md`.
+Options considered: (a) a typed status record in memory; (b, recommended) the sweep only invalidates (ruled); for the broader question, a human-gate task later (`A-later`) or a session spawned now (ruled).
+Consequence that decided it: of 46,627 `add_memory` writes since 2026-10-08, 115 matched the status-phrase rule; recon Stage 1 made 37 of them (30 were the sweep's own sentence), and none of the other writers is gated (`digests/discussion/S13.md` §S13-1); a typed record would have been a second home for status.
+Supersedes: R13 — its treatment of fk-9b76dd8a1cdb: the typed claim the finding proposed is rejected, not deferred.
+ruled_by: human
+Carried by: `plans/review-all-s13-recon-sweeps-flag-identity-and-recon-report-state-prd.md` η 9739; acceptance record 9753 (filed, cancelled with `x_acceptance_reason`); the spawned session (record `~/.claude/fleet/sessions/team-df-2370851`, brief `~/.claude/spawn-briefs/design-fused-recall-from-task-store-2026-11-13.md`).
+Keys: fk-9b76dd8a1cdb (accepted), fk-cdb8c20a3d0f.
+
+## R67 — Refused recon finding categories are recorded and analysed by a recurring check (2026-11-12)
+Ruling: option (a) as recommended (sitting key S13-2): `add_finding` refuses an off-list category with `invalid_category`, listing the nine values, and the stage prompts list the vocabulary. PLUS Leo, in his words: "Record rejections with adequate context for later analysis + File a delayed recruring task to analyze the rejected findings to see whether our category set is optimally complete or should be expanded, and escalate if any good candidates occur." Applied: ε gains an append-only `rejected_findings` table in `recon_report_state.db` owned by `server/recon_report_store.py` (180-day retention, pruned on write, untouched by run cleanup), a `retried_as` stamp and a per-stage `findings_rejected_invalid_category` count; π writes `fused-memory/scripts/check_recon_category_candidates.py`, which exits non-zero when one normalised label is refused at least 10 times across at least 3 runs, or when the lost-finding share is above 20% (thresholds are arguments; code decides, judgement happens at the escalation); ρ is the seed link of a native recurrence chain (`task_kind='deterministic'`, predicate `before_done` on that script, a dated milestone about 30 days after filing, `recurrence {key: recon-category-candidates, interval_secs: 1209600}`). ρ is filed by the lead once π is on main, because `submit_task` refuses a `before_done.script` that is not on main (R58). A firing link blocks the chain until its escalation is resolved; ρ is the project's first live recurrence chain.
+Options considered: (a, recommended) refuse off-list categories (ruled), plus Leo's addition; (b) keep the free string.
+Consequence that decided it: 345 of 714 live findings carried 207 distinct off-list labels; no refusal was recorded anywhere, so a refusal without a record would have hidden whether the vocabulary is complete (`digests/discussion/S13.md` §S13-2).
+Supersedes: none (implements R13's `FindingCategory` StrEnum parsed at `add_finding`).
+ruled_by: human (filing ρ after π lands, its re-check interval and minimum sample of 20: lead)
+Carried by: S13 ε 9737, π 9751; ρ not yet filed.
+Keys: fk-7c13df0b988c.
+
+## R68 — fused-memory shuts down in concurrent phases inside the 90 s stop timeout (2026-11-12)
+Ruling: option D (sitting key S15-1): independent closes run concurrently in declared phases, each phase under one timeout, with a dependency order pinned by test; the budget is the sum of each phase's largest timeout (computed at the fold: 50 s + 5 s headroom = 55 s); `TimeoutStopSec` stays 90 in the unit template and the parity script reads it from there; the seven background-loop cancels, the recon-report stop and the topic store join the phases. Leo's reason, in his words: "I don't want sessions to drop fused-memory MCP connections because it takes too long to reply if a request straddles a deploy". The lead ruled (S15.md residual R-S15-a = B) that the double SIGTERM that cuts running tool calls is fixed by task 9493, high, outside every plan (one stop signal, no direct kill of running tool calls' subprocesses, a test that two SIGTERMs still drain, drain stays 10 s, operator reinstalls the unit once); S15's shutdown task lands after 9493 and lengthens the drain from measured tool-call durations inside the room D frees, with a budget check (drain + 2 s watchdog join + phase budget < `TimeoutStopSec`). Signal: with both landed, a live restart during a slow `submit_task` returns that call's answer. S15's xref asking S24 for a stop timeout of at least 123 s is withdrawn.
+Options considered: (A, recommended) raise `TimeoutStopSec` to at least 123 s; (D) concurrent phases (ruled); others as `digests/discussion/S15.md` §S15-1 states.
+Consequence that decided it: 11 sequential close steps had a 90 s worst case against a 75 s budget; phases bring the budget to 55 s without lengthening every restart, and only a drain that runs (one signal) keeps a straddling request alive.
+Supersedes: R14 — refines its "shutdown as a declared (name, closer, timeout) tuple that the budget test … derive from" into declared phases summed per phase; the tuple's home is `config/shutdown_plan.py` (lead S15/OQ-4; seam row updated).
+ruled_by: human (task 9493's split and scope: lead)
+Carried by: `plans/review-all-s15-fused-memory-mcp-server-boundary-prd.md` ζ 9824; task 9493 (done); gate 9521 (operator reinstall, blocked at level 2).
+Keys: fk-d085b903f01c.
+
+## R69 — `add_memory` replies carry a typed per-store error map; no acceptance (2026-11-12)
+Ruling: option B (sitting key S15-4): a small task after 9147 gives the `add_memory` and `add_system_record` replies `AddMemoryResponse.store_errors: dict[SourceStore, str]`, empty by default, filled by both producers; a store in `store_errors` appears in none of the three store lists; the 9147 renderer reads the field; it is placed after 9252 under the per-file rule. The acceptance record the plan drafted is dropped. 9147 is amended (lead, no ruling needed) so its renderer keeps each failed store's error text meanwhile.
+Options considered: (A, recommended) an acceptance record; (B) the typed map (ruled).
+Consequence that decided it: the per-leg error text was only prose in `message` after 9147's `stores_queued`; a typed field completes R14's "per-store outcomes" for a small task.
+Supersedes: none (completes R14's "`AddMemoryResponse` carries per-store outcomes").
+ruled_by: human
+Carried by: S15 σ 9839; task 9147 (amended; fk-05a87fd1777d stamped on it).
+Keys: fk-05a87fd1777d (closed by σ).
+
+## R70 — Old setting names are translated while the moves land, swept once by a pre-authorised session, then refused (2026-11-12, 2026-11-13)
+Ruling: option B (sitting key S16-1) with residual R-5 = B: while the seven setting moves land, each moved setting declares its old name and both services translate it at load and at reload, reported as deprecated by `check-config`, the reload report and fused-memory's status (no level-2 escalation; an old and a new name with different values is a load error; NOT `extra='forbid'`, so other unknown keys keep today's self-closing census escalation). PLUS Leo, in his words: "a L2 task for the watcher to /spawn a pre-authorised /team session to update all the project yamls before the deploy". Then one human-gate task, in the operator-sweep shape (deterministic, `always_escalates`, no `before_done`, files a born-at-L2 escalation, its description quotes Leo's pre-authorisation of 2026-11-12 and says the spawn may run while he is away), has the watcher spawn a /team session that rewrites the nine project yamls and the two leo-laptop host yamls, one yaml-only `git commit --only` per repository with sha or skip recorded and `check-config` on each; it carries a delayed milestone of 72 hours after its prerequisites (lead). Then one small task deletes the translation path and makes every declared old name a load error and a hot-reload refusal naming the old and the new path, ending with an integration check over all eleven yamls. This repository's own yaml and operator prose are rewritten once, in one task (lead). The same pre-authorised-spawn mechanism serves S2's identity-header deploy (R63).
+Options considered: (A, recommended) translate and report, never refuse; (B) refuse after a sweep (ruled); at R-5, refuse from the first move, or (B) translate during the moves, one sweep, then refuse (ruled).
+Consequence that decided it: nine orchestrator units run from this checkout and pick up new code at their own next start, up to 72 hours after a merge; outside this repository nine project yamls hold 60 old names and the two leo-laptop files 7 more (dark-factory's own yaml holds 36), so refusing from the first move would take seven sweeps, and a unit restarting in a gap would refuse to start (`digests/discussion/S16.md` §S16-1).
+Supersedes: none — it follows R37's precedent (a best-effort cross-repository yaml edit), now carried as a task, the gate σ; R37's own `convert_to_blocked_enforce` yaml edits stay the lead's action. The dated removal follow-up the S16 draft carried is replaced by ξ.
+ruled_by: human (the 72-hour milestone and the single dark-factory yaml rewrite: lead)
+Carried by: `plans/review-all-s16-orchestrator-config-shape-defaults-and-routing-prd.md` κ 9711, χ 9712 (the watcher spawns a pre-authorised gate's session), σ 9718 (the sweep gate), ξ 9719 (the refusal).
+Keys: fk-dae2a050b5d3.
+
+## R71 — A code row of the recovery table returns a clean stranded blocked task to pending; the scheduler's step goes (2026-11-12, 2026-11-13)
+Ruling: new option D (sitting keys S17-1 and S17-4, residual R-2 = A). Leo asked, in his words: "How much deterministic work would A push to the L1 LLM? We've got a recover table. How many lines of it can be applied deterministically? … How would this apply here?" (his general principle is R79). The scheduler's stranded-blocked step is deleted; task 4082 is re-scoped to the blocked-task rules of the one recovery table: three code rows that leave a task alone, each with a named reason (merge queued, the `needs_recheck_against_main` recheck park, blocked behind a lane halted for a heal); a code row that re-pends a clean stranded blocked task within 900 s with a recovery event naming the rule; a loop cap (a task re-pended twice in 24 hours that blocks again gets one level-1 escalation and no third re-pend; the cap is a hot-reloadable setting beside `stranded_reconcile_interval_secs`); the watcher's `stranded_blocked` playbook becomes "work out why this task keeps blocking, fix the cause or promote". 4082 waits on 9219 and precedes the deletion. Task 9219 adds no scheduler recovery hook. The heal-adoption case keeps a rule, so the item-3 part of Leo's 2026-10-09 re-scope of 4082 is preserved. The table's "no silent return to pending" rule is relaxed for proven-unparked shapes only, never silently.
+Options considered: (A, recommended) the sweep files a level-1 escalation and the watcher resumes; (D) a code row re-pends (ruled); for S17-4, (A, recommended) the table leaves them alone and the watcher re-checks; A plus a third row (behind a heal-halted lane), all carried out by code rows (ruled).
+Consequence that decided it: option A would have handed the watcher a three-condition predicate over facts the code already holds; in October the step and the table both decided these tasks and the step re-pended two solar-challenge tasks 3,896 times in one week, for 5,019 block cycles costing $674 (`digests/discussion/S17.md` §S17-1).
+Supersedes: R16 — its stated reason "instead of performing the revert the recovery table forbids". No R6 sentence changes: the recovery table R6 made the one classifier relaxes its blocked row's "no silent return to pending" rule (code in `orchestrator/src/orchestrator/task_ground_truth.py`, not R6 wording) for proven-unparked shapes only. The aim of R6 and R16, one classifier the sweeps apply verbatim, stands.
+ruled_by: human
+Carried by: `plans/review-all-s17-scheduler-seams-and-tick-state-prd.md` ζ 9672 (deletes the step); existing tasks 4082 (rows, re-scoped and wired onto 9219, 9223, 9229, 9231, 9232) and 9219 (amended); task 9529 cancelled into 4082 and ζ.
+Keys: fk-cc01eb7b143f.
+
+## R72 — The delivered-check gate does its own transient mechanics; a slow phase raises an alarm (2026-11-12, 2026-11-13)
+Ruling: option B as recommended (sitting key S17-2): author-fixable delivered-check causes reach a human after the grace period and block the dependent. Leo also asked, in his words: "I'm concerned about the slow checks holding the tick for 120 seconds. Is this the scheduler tick? Perhaps they should be offloaded? What do you think?" Answer: it is the scheduler tick, but each check is an async subprocess and the loop stays free; no offload is built. Under Leo's principle (R79) the gate's code does the transient mechanics and the planned watcher playbook section is removed: the gate records transient grace windows 1 and 2 as its own `delivered_check_errored` events with no queue record (a `cleared` event marks the check running again) and the third consecutive window files the human-level record; no level-1 record is filed, so no watcher rotation starts and no LLM is called (lead, S17/OQ-9 = A). PLUS Leo on 2026-11-13, in his words: "OK for now. File a low priority task to escalate if the phase is >30s so that we can address it if it grows significantly." The scheduler files an escalation when a tick's `delivered_check_gate` phase takes more than 30 s (threshold a hot-reloadable setting), naming the project, the phase time and the checks run, with remedy text pointing at a wall-clock budget for the phase; one open record per project; it is born at level 2 at severity `critical`, the floor of `BORN_AT_L2_SEVERITIES`, because anything lower would need an LLM promotion (lead). Both new scheduler filers file through S1's door (`FilingPolicy.born_at_l2()`, the λ alarm on the sentinel `__delivered_check_phase_slow__`), and neither lands before it.
+Options considered: (A) every cause pages a human after 20 sweeps; (B, recommended) as ruled; (C) events only, no escalation; for the slow phase, offload now, or an alarm (ruled).
+Consequence that decided it: the phase never reached 60 s in the 7 days to 2026-11-12 (longest 12.8 s, reify), so an offload buys nothing yet and an alarm shows growth.
+Supersedes: the lead's earlier wording "files a level-1 and closes it itself" (`digests/wave3-lead-rulings.md`), not an R entry. Implements R16's "an event on ERRORED".
+ruled_by: human (S17/OQ-9, the alarm's severity and dedupe: lead)
+Carried by: S17 δ2 9676, λ 9677 (low).
+Keys: fk-6c103745c784.
+
+## R73 — Cockpit decisions stay polled now; moving their closing into the escalation package is explored after the capstone (2026-11-12)
+Ruling: option (a) as recommended (sitting key S19-2): the cockpit's decision records keep their polled join, the archive layout gets one home, and the polled-join arm is accepted. PLUS Leo, in his words: "file a milestone to explore, assess, and discuss B in depth after the review-all capstone." Gate λ: "Operator gate: explore, assess and discuss moving cockpit decision closing into the escalation package, after the review-all capstone" (`task_kind='deterministic'`, `always_escalates=true`, no `before_done`, `metadata.milestone = {"mode": "delayed", "after_secs": 604800}`, medium, no finding key); it depends on gate 6698 (lead) and on the plan's session-integration task θ2; its description is the session brief (options B and D, the facts, three questions); output a ruling, and a /prd if B or D is chosen. The acceptance record's reason names λ.
+Options considered: (a, recommended) as ruled; (B) close decisions at the escalation source; (D) as `digests/discussion/S19.md` §S19-2 states.
+Consequence that decided it: Leo wanted B explored in depth, but not ahead of the program's capstone.
+Supersedes: none.
+ruled_by: human (the edge onto 6698: lead)
+Carried by: `plans/review-all-s19-package-layering-and-private-seams-prd.md` θ2 9779, λ 9780 (depends on 6698); acceptance record 9794 (filed, cancelled).
+Keys: fk-e8c835c3f412.
+
+## R74 — One portable liveness check everywhere; zombie detection is negligible until evidence (2026-11-12, 2026-11-13)
+Ruling: option (a) as recommended (sitting key S19-3, S19/Q-C1). Leo had asked "How serious is the Zombie issue? I'm leaning A so long as the issue is minor in practice"; the lead ruled (a) on 2026-11-12 on his condition, measured minor; Leo then, in his words: "Good. Consider the zombie detection negligable (until evidence to the contrary), and use the portable liveness detection throughout." `shared/proc_liveness.py::pid_alive` (signal 0, portable, built by task 6615, done `f750373949`) is the one liveness check every caller uses, in S19 and in S24's lease task (which deletes the watchdog's copy and task 6615's parity test); no zombie-aware variant is public (`shared/proc_group.py::pid_running` stays the process-group snapshot's own helper); no zombie-detection task is filed; a zombie-aware change to `pid_alive` is considered only on evidence of a real misread. S19/OQ-2 follows as (a) (lead).
+Options considered: (a, recommended) the portable check (ruled); (b) a zombie-aware public check; (c) as the discussion states.
+Consequence that decided it: no misread in 60 days, every caller fails safe, and task 6615 had already made `pid_alive` public (`digests/discussion/S19.md` §S19-3).
+Supersedes: R17 — its seam name `shared.config_dir.pid_alive` is reworded to `shared.proc_liveness.pid_alive` (seam row updated).
+ruled_by: human (S19/OQ-2: lead)
+Carried by: S19 ν 9781; S24 γ 9754; task 6615 (done; stamped with fk-e22732500172).
+Keys: fk-e22732500172.
+
+## R75 — No cap file for any process (task 8253, 2026-11-12)
+Ruling: under sitting key S20-1 (option A as recommended: the long-running processes keep rediscovering caps, with acceptance record ω) Leo asked, in his words: "/spawn investigate and discuss 8253: I'm concerned that the proposed fix isn't the right one. What's the problem? What's the proposed fix? what are the alternatives and what are their ramifications?" The spawned investigation reported and Leo ruled in that thread (`digests/leo-rulings-8253.md`): (1) task 8253's persisted cap record (the "gate cap ledger") is not built; no process, long-running or one-shot, reads or writes a cap file; (2) no retry-at-reset for the return-brief preparer; (3) the confusion census needs coverage over the mid-term, not timeliness, and a census that finds no seat already defers without consuming its window, so nothing is built; (4) the 5-second pause between seat attempts is irrelevant: no task, no note, no plan effort. In the store: 8252 is cancelled; 8253 is rescoped to its return-brief half (trial agreement over 14 days and lifetime), low, depending only on 8563. S20 applies the four consequences (its first code task's edge onto 8252/8253 removed; the account-pool split drops the cap-ledger sentence; ω's reason says no process has a cap file; the out-of-scope line naming 8253 deleted). The lead routed the investigation's two side findings: the cap classifier reads the CLI result's structured `api_error` field (S20, low); the three spellings of the scoped-cap model (`fable`, `claude-fable-5`, `[claude-fable-5, claude-fable-5-1]`) become one config point of truth (S16, which absorbs task 5407; told to Leo: one-shot pools treat a Fable cap as Fable-only and dark-factory's yaml loses its two-id list).
+Options considered: build the cap ledger as task 8253 proposed; reject it (ruled); retry the preparer at reset; build census catch-up.
+Consequence that decided it: since task 6214 (merged `3e5b2bafd3`) the preparer loses 18 to 49 seconds per night rediscovering capped seats at $0; the only night lost had all seven seats capped, which no memory of caps fixes; so a cap file's benefit is seconds (a stale entry could also bench a seat, since one-shot pools never probe, but that was not observed in 30 days and is not the basis of the ruling).
+Supersedes: none (R18's remedy never included per-process cap state).
+ruled_by: human (in the spawned investigation thread; the side-finding routing: lead)
+Carried by: task 8253 (rescoped), 8252 (cancelled); `plans/review-all-s20-cli-invocation-and-usage-gate-prd.md` acceptance record ω 9900 (filed, cancelled), π 9890 (low, the structured cap field); `plans/review-all-s16-orchestrator-config-shape-defaults-and-routing-prd.md` π 9720 (low, one Fable id).
+Keys: fk-49b55c1270ae (accepted), fk-005378a1b462.
+
+## R76 — Source-text dashboard tests are converted to render tests now, under a shrink-only guard (2026-11-12)
+Ruling: option B (sitting key S22-3): the guard plus eight conversion tasks filed now, seven grouped by tab and one cleanup, all medium, each tagged with the source-text finding, each writing its own `.test.mjs` with no chain among the seven, each recording every fidelity pin it drops with the reason; the cleanup task carries a delivered check that the grep rule returns nothing under `dashboard/tests`. The guard's exempted modules are owned by their live conversion tasks (INV-12 owned debt), so no ratification row is written; the list is shrink-only through `shared/src/shared/ratchet.py`, and each conversion task deletes its own modules from it. The guard covers both clauses, a direct read of a frontend source file and a read through the helper (lead, after the fold-verifiers). The lead cancels 4244, 4287, 4351, 4461, 7004, 7971, 9037 and 9046 naming the absorbing task (6562 was already done), subsumes 7907 and 8703 into π1 and 7566 into π7, amends 6963, and gives feature tasks 5816, 5922, 6254, 6926, 6947 and 7931 an edge onto their tab's conversion task and an amendment to test through the jsdom harness.
+Options considered: (A, recommended) a frozen exception for the existing tests and a guard against new ones; (B) the guard plus conversions now (ruled).
+Consequence that decided it: the measured cost is 30 modules and 397 tests, about 8,400 new lines and 17,000 deleted (`digests/discussion/S22.md` §S22-3), against a jsdom harness that already renders any tab.
+Supersedes: none.
+ruled_by: human
+Carried by: `plans/review-all-s22-dashboard-readers-and-aggregation-prd.md` ο 9892 (guard), π1 9879, π2 9881, π3 9884, π4 9885, π5 9886, π6 9887, π7 9888, π8 9889 (cleanup).
+Keys: fk-1bdd95e804cb.
+
+## R77 — The watchdog restarts a wedged orchestrator at a 900 s heartbeat age and escalates every restart (2026-11-12, 2026-11-13)
+Ruling: option B with a 900 s heartbeat age (sitting key S24-1, residual R-3 = A). Leo, in his words: "D (or B) + escalate on restart so that this doesn't go unnoticed. D is preferred, but B is acceptable if it's more elegant or makes it more feasible to reliability has to escalate and restart." The watchdog script sets the orchestrator row's wedge action to restart from day one: a stale heartbeat on its own 3-tick streak joins the dead-unit path; the heartbeat age rises from 600 s to 900 s, so a restart comes about 1,020 s into a wedge; every wedge revive files one critical escalation (`orchestrator-liveness-heartbeat-<unit>`, category `infra_issue`, agent role `orchestrator-watchdog`) in the same tested code path as the revive, naming the heartbeat age, the threshold and the recipe; pages stay bounded by task 8270's one revive per 900 s per unit and by the storm ceiling. The page-only mode, its 14-day soak and dated flip task are dropped; systemd's own watchdog (the sitting's D) stays a possible later change and no unit file changes. The directory walk behind the long stalls is moved off the loop by task 9492, an ordinary defect outside the plan, parked behind 8528 because it edits the merge worker file, and not ordered before the heartbeat task.
+Options considered: (A, recommended) page now, restart after 14 clean days; (B) the script restarts and escalates (ruled); (D) systemd's watchdog.
+Consequence that decided it: the measured longest legitimate stall is 635.7 s, so 900 s restarts no healthy orchestrator, and B is buildable in the tested script without a unit change (`digests/discussion/S24.md` §S24-1).
+Supersedes: none.
+ruled_by: human
+Carried by: `plans/review-all-s24-fleet-watchdog-and-redeploy-coordination-prd.md` ε 9854 (high); task 9492.
+Keys: fk-1cc71283157c.
+
+## R78 — fused-memory's on-merge coordinator watches its full import closure, under a 4-hour interval until the stop fix is in effect, then 1 hour (2026-11-12, 2026-11-13)
+Ruling: option B (sitting key S24-2): one code table per tier, and the fused-memory on-merge coordinator watches fused-memory's full import closure; its config default becomes the table's fused-memory row (a test pins equality); task 6543 is cancelled into the watched-path task, which also picks one fix for other projects' root `uv.lock`. The interval (residual R-4), Leo in his words: "R-4 C using a drain restart that allows recon runs to finish, and until the shutdown fix (then A)." So the new restart-only field `fused_memory_restart_min_interval_secs` defaults to 14400 (4 hours, residual option C) with a persisted clock file registered as a fleet file, and a follow-up task changes the default to 3600 (1 hour, option A) once the stop fix is in effect: it follows task 9493 (done, so no edge is wired) and depends on gate 9521 (the operator reinstall that puts 9493 into effect) and on ζ 9764 and ι 9795, and its one-line `OPERATIONS.md` edit is exempt from the same-file chain so it lands as soon as 9521 is done (lead). The coordinator's restart is a drain restart (`--drain`, pinned by a test) that lets running reconciliation runs finish; the drain's bound is R90. The constant lives in `shared/fleet_coordination.py` (lead placement), and S16's restart-settings task carries the field into the fused-memory section.
+Options considered: (A, recommended) one code table, with no new interval; (B) the closure under a minimum interval (ruled); at R-4, (A) 1 hour, (B, recommended) 2 hours, (C) 4 hours, and Leo's C-then-A with a drain restart (ruled).
+Consequence that decided it: watching the full closure restarts fused-memory more often, and until 9493 is in effect a restart cuts running tool calls, so the interval stays long until then.
+Supersedes: R20 — "watched paths derived from orchestrator config": the config default now derives from the code table.
+ruled_by: human (the clock-file placement, the flip's dependence on 9521 and its exemption: lead)
+Carried by: S24 ζ 9764, θ 9861 (depends on 9521, ζ 9764 and ι 9795); S16 ζ1 9702; task 6543 cancelled into ζ.
+Keys: fk-68efae8a36fc.
+
+## R79 — One decision partition per decision area, minted as INV-23 (2026-11-12, 2026-11-13)
+Ruling: Leo's general principle, stated under sitting key S17-1, in his words: "General principle: for each decision area we should have a single (therefore uniform by construction) clean partition between deterministic work done by deterministic code and judgement applied to ambiguous or infeasibly complex situations by LLMs (with a to-human escape hatch). Record that somewhere other agents can find it." As recorded: each decision area has exactly one partition between what code decides and what an LLM judges; code decides every case that facts available to code settle, in one table or function applied in one place; an LLM gets only the cases that table names as needing judgement (facts that contradict each other, a state that keeps recurring, a situation too complex to enumerate), each with a path to a human; an LLM playbook step that is a pure predicate over facts the code already holds is a defect and moves into the table. Every wave-3 plan checked its recovery tables, policy rows, alarm rules and watcher playbooks against it (applied in R71, R72, R67, R77 and S2's corroboration, decided by the task store). Recording (ruled by Leo 2026-11-13): a memory, and a design invariant through a task of the S17 plan, in checkable form "every row of a recovery or policy table names who decides it", slug `one-decision-partition-per-area`, minted last of the six wave-3 invariants as INV-23 (R88), landing with or after task 4082's rows, its house pattern `orchestrator/src/orchestrator/task_ground_truth.py::RECOVERY_RULES` with a `decided_by` on every row. Plans cite it by slug and do not restate it.
+Options considered: record it as a memory only; a memory and a design invariant (ruled).
+Consequence that decided it: the S17-1 measurement (R71): the scheduler step, a second code decider beside the recovery table, re-pended two tasks 3,896 times in one week, and the watcher's `stranded_blocked` playbook was a pure predicate over facts the code already holds.
+Supersedes: none.
+ruled_by: human (the number INV-23: lead, R88)
+Carried by: S17 ν 9685; task 4082 (its first conforming table); memory `feedback_deterministic_vs_llm_single_partition` (amended to cite the number when ν lands).
+
+## R80 — Evals are realistic within their scope and hermetic with respect to all non-eval project state (2026-11-12)
+Ruling: Leo's standing rule, stated under sitting key S1-2 (his words are in R61): evals must be realistic within their scope and hermetic with respect to the orchestrator's main work and all project-wide non-eval state; no eval level-0 record reaches the task store through any automated filer, and nothing an eval run produces leaks out of the eval in any other way. It binds every plan that adds or moves a store, sink, filer, queue or archive an eval cell can reach: the eval build passes no production filer, queue, event store or cost store, and a test pins that. Ten of the eleven wave-3 plans state whether they engage it (the S24 plan does not mention it); S1 carries the work (R61) and mints `eval-writes-no-production-state` (INV-19). The daily memory-eval runner's `eval_regression` escalations are outside it (lead reading, shown to Leo, not objected to).
+Options considered: none; a standing rule Leo added.
+Consequence that decided it: R61's measurement (before task 4757, one campaign wrote 36 memories, 7 escalations and 3 task submissions into production; four leak paths stay open at main).
+Supersedes: none.
+ruled_by: human
+Carried by: S1 λ1 9845, μ 9849, λ2 9855; each plan's own check (S2 D13, S12 D13, S13 D17, S20 boundary row B19 in ο2 9896).
+
+## R81 — The sitting brings only residual questions; the ruling-digest format is the skill's (2026-11-12)
+Ruling: Leo, in his words: "This format for the Ruling Digest works well for me. It's an appropriate amount of context. Encode the relevant digest content and structure instructions back into the skill." and, on the list of points the lead rules: "SOP change: Stop generating this section (I'm not going to read it). Instead, process my rulings above and bring me only residual or new open questions." The sitting document keeps the approved digest shape and carries no list of lead-ruled points; after his answers the lead brings back only the questions they leave open or newly raise, in a residual-questions document, until none remains. Committed to the skill at `1b106418da` (`skills/review-all/references/deliberation.md` §Preparing a sitting, §The sitting document, §Reading the answers and §Recording; `report-format.md`; `SKILL.md`). A lead ruling is recorded `ruled_by: lead`, which no sitting document lists. Follow-up tooling for the sitting document is task 9491 (after 7195).
+Options considered: none; a procedure change by Leo.
+Consequence that decided it: Leo would not read the minor-points list (142 points at the wave-3 sitting).
+Supersedes: none (a procedure change: the sitting document's list of lead-ruled points, wave 2's "Worth a glance" section and wave 3's Part 2, is no longer produced; no R entry's content changes).
+ruled_by: human
+Carried by: commit `1b106418da`; task 9491.
+
+## R82 — Task 9140 stays exempt from the parking behind task 8528 (2026-11-12)
+Ruling: Part 0 point W-3 = A: task 9140 (the lane timing-budget validator, high, INV-15) is not parked behind 8528 and may take the merge worker file once between chain tasks. The same answers confirmed W-1 = A (R60) and W-2 = A (R59).
+Options considered: (A, recommended) keep the exemption (ruled); (B) park it like the rest.
+Consequence that decided it: parking it would hold a live misconfiguration (a 5,400 s budget under a 7,200 s timeout) and about 50 otherwise free tasks behind the four remaining chain tasks.
+Supersedes: none (confirms R55's exception, which the lead ruled and flagged to Leo).
+ruled_by: human
+Carried by: S6 α 9140 (no dependency on 8528, read 2026-11-13).
+
+## R83 — R23's eight weakened mechanical findings are disposed (2026-11-12)
+Ruling: Part 0 point W-4, accepted as proposed except row 5. Row 1 (fk-f12106b3adaf): filed as task 9486 (low, after 9241), each verify guard records its own block reason. Row 2 (fk-04c4612589ea): accepted, record 9483. Row 3 (fk-5564cc32de5c): stamped on pending task 4980, which closes it; if 4980 is dropped the finding reopens. Row 4 (fk-6b0dec845d9e): fixed by task 4614 (`25a1278147`), key stamped on 4614. Row 5 (fk-c0932f0b7df1), changed by Leo, in his words: "File this one as a set of cleanup tasks, low priority, not to be scheduled individually, like the handling of the info severity autofiled cleanups - mirror the private name to a public name; and then one per file import the public symbol and use that instead of the private symbol; and then remove the private symbol." Filed as the chain 9494 (public mirror of `fused_memory/reconciliation/__init__.py::_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS`) → 9495–9500 (one importer each) → 9501 (remove the private name), all low, parked by dependency behind held-cleanup promotion task 8418, with a note on holder task 8417 that its holder should also hold cleanup sets carrying a review finding. Row 6 (fk-0165547376d8): filed as task 9487 (low). Row 7 (fk-b49ccd852736): accepted, record 9484. Row 8 (fk-c9935b02f118): accepted, record 9485. The three acceptance records are cancelled with `x_acceptance_reason`.
+Options considered: (A, recommended) the table; (B) accept all eight; (C) a task for every one still present; row 5 changed from acceptance to a parked cleanup set.
+Consequence that decided it: only rows 1 and 6 still cost someone (a block reason that names the wrong guard; an empty task list that blinded reconciliation five times this spring); Leo wanted row 5's private name fixed, but not scheduled one task at a time.
+Supersedes: R23 — for these eight keys, "routed to their owning streams … dispositions stay open" (no stream owned them).
+ruled_by: human (row 5's parking behind 8418 and the note on 8417: lead)
+Carried by: tasks 9483, 9484, 9485 (cancelled), 9486, 9487, 9494–9501; stamps on 4980 and 4614 (`clerk/r23-applied.json`, `clerk/followups-2026-11-12.json`).
+Keys: fk-f12106b3adaf, fk-04c4612589ea, fk-5564cc32de5c, fk-6b0dec845d9e, fk-c0932f0b7df1, fk-0165547376d8, fk-b49ccd852736, fk-c9935b02f118.
+
+## R84 — Wave-3 design questions accepted as recommended (2026-11-12, 2026-11-13)
+Ruling: Leo listed only exceptions, additions and questions ("Otherwise your recs LGTM" on 2026-11-13); every question below was accepted as the plan recommended and the PRD text authored under the recommendation stands. Sitting keys, with the plan's question id:
+- S1: S1-1 (OQ-1; the filer's three entry points and a typed subject, with three on-loop alarm callers made fire-and-forget; recorded as R8's wording in R62).
+- S2: S2-1 (OQ-1, option (a′); an automated close of a human-facing escalation needs the task store to say the subject task is done or cancelled; carried by S2 ε2 9765).
+- S12: S12-1 (OQ-1, option 3; a streak alarm files on every bad cycle at or over its threshold, folds repeats onto the open record, and files again after the 24-hour recently-resolved window).
+- S13: S13-3 (OQ-7, option (b); the dormant Mem0 relay, FIX D's markers and the human-operator stall marker are deleted and recon-stage relay writes refused; its effect on R13's wording is in R92).
+- S15: S15-2 (OQ-2; `create_mcp_server` installs the whole guard stack through one installer), S15-3 (OQ-3; the six ungated graph mutators refuse an unregistered project, a behaviour change accepted), S15-5 (OQ-9, (a); the reconciler through S12's provider member; one ruling with S12/OQ-2), S15-6 (OQ-10; every declared scope validates, raw included; the five tools are a listed behaviour change).
+- S17: S17-3 (S17-OQ-6, option A; a delayed milestone's clock starts when its prerequisites' delivered checks pass on main).
+- S19: S19-1 (S19/OQ-1, (a); `models` and `utils` sit below `backends`; its effect on R17's wording is in R92).
+- S22: S22-1 (OQ-1; the event and merge-outcome names move into the shared package now, with the 22-task amend set), S22-2 (OQ-3; revalidation only; the scope and tag-order tests stay the enforcement of the other two loading rules).
+- S24: S24-3 (OQ-4, option A; orchestrators page and stop reviving at the storm ceiling, fused-memory pages and keeps reviving under its cap, the dashboard keeps today's page and stop).
+The other nineteen questions carry an exception, an addition or a question and are recorded in their own entries: S1-2 (R61), S2-2 (R63), S2-3 (option (a) as recommended; its addition is R64), S12-2 (R65), S13-1 and S13-4 (R66), S13-2 (R67), S15-1 (R68), S15-4 (R69), S16-1 (R70), S17-1 and S17-4 (R71), S17-2 (R72), S19-2 (R73), S19-3 (R74), S20-1 (option A as recommended; its addition is R75), S22-3 (R76), S24-1 (R77), S24-2 (R78).
+Options considered: as each plan's `## Rulings (sitting of 2026-11-12)` section states.
+Consequence that decided it: Leo found each recommendation sound.
+Supersedes: none here (the wording effects are recorded in R62 and R92).
+ruled_by: human
+
+## R85 — Wave-3 question triage, decompose procedure and parking (2026-11-11 to 2026-11-13)
+Ruling: the 108 open questions of the eleven wave-3 drafts were triaged: 32 to Leo (two promoted from the lead after cold reads: S12/OQ-3 and S1/OQ-1), 53 ruled by the lead, 14 ruled by the lead and flagged, 9 duplicates of a Leo question. Every lead ruling, with its reason, is in `digests/wave3-lead-rulings.md` (program state home; later blocks win, and its blocks "Cross-stream alignments" and "Lead rulings after the wave-3 fold-verifiers" bind), plus the lead decisions marked `ruled_by: lead` in `digests/wave3-rulings-applied.md`; the wave-3 sitting still listed them in its Part 2 (142 points); from R81 on, no sitting document lists them. The plans were then ruling-folded, fold-verified, aligned, and decomposed as in R54: eleven seats in parallel in planning mode, intra-plan and existing-task edges only, no seat committing; the lead joined one global order (`digests/wave3-order.json`: 241 wave-3 nodes, the 236 filed, the three filed later and the two acceptance records S19 ω and S20 ω; wave-2 and older tasks enter the order as existing ids with their live edges; 0 cycles), applied 239 cross-plan edges, re-checked the store for cycles, committed the plans (`c0dc063475`) and only then ran `commit_planning`; stamped sidecars followed (`a0c105c9bc`). New wave-3 tasks declaring `merge_lane/worker.py` are parked behind 8528 as in R55: S1 ε1 9716, ε2a 9722, ε2b 9723, ε3 9725; S2 κ 9814, γ3 9730; S16 ζ4b 9708, ζ5a 9709, ζ5b 9710 (and follow-up 9492). Tasks deliberately filed later (R58): S13 ρ, S2 ξ and S2 ο.
+Options considered: seat-by-seat decompose in seam order (the protocol's default).
+Consequence that decided it: the same as R54's: a batch committed before its cross-plan edges exist can dispatch early.
+Supersedes: none.
+ruled_by: lead
+Carried by: all 236 wave-3 tasks.
+
+## R86 — Edges that rest only on a test file or a prose document are not wired (2026-11-12, 2026-11-13)
+Ruling: an edge that rests only on a shared test file is not wired, inside a plan or across plans; test files are rebase-only and left to the scheduler's file locks, and the later task rebases. The cross-plan same-file order of wave 3 chains only shared non-test SOURCE and CONFIG files; prose documents (`*.md`: `OPERATIONS.md`, `CLAUDE.md`, `docs/`, skill text) are not chained, because tasks edit different sections. Two tasks of one plan that edit the same non-test file are chained (S1's `evals/runner.py`: μ after λ1, λ2 after μ). Applied: S19's store move opens its plan (drops α → ζ, θ1 → ζ, ι → ζ where each rests only on a test file); S20's requested edges S19 θ0/θ1/θ2 → S20 γ are not wired; S1 κ3 → ζ1 is dropped; S17 ι2 → ι1, ι3 → ι2 and κ2 → 8778 are not wired.
+Options considered: chain every shared file (R54's letter); chain non-test files only (ruled).
+Consequence that decided it: a test-file or prose edge serialises tasks that never conflict in code and would put high tasks behind long wave-2 chains (5040, 8528).
+Supersedes: R54 — its reach: "on each non-test file shared across plans consecutive tasks in that order are chained" now excludes prose documents, and the test-file rule is stated for intra-plan edges too.
+ruled_by: lead
+Carried by: the wave-3 edge set (`digests/wave3-order.json`).
+
+## R87 — Measured exemptions from the per-file chain (2026-11-12, 2026-11-13)
+Ruling: these edits take no per-file ordering edge; file locks serialise them and the later task rebases: (1) an edit that only rewrites an import line or a prose citation in a non-test file (S19/Q-C6 (a)); (2) S2 μ 9817's one-line configuration-deploy edits in source files whose wave-2 tails wait on task 5040 (`steward.py`, `workflow.py`, `review_checkpoint.py`, `dry_run_unblock.py`, `evals/runner.py`, the watcher files), so the identity deploy Leo wants before the denial does not wait on 5040; (3) S20 η 9846's three one-line edits in test files held by wave-2 tasks; (4) S24 θ 9861's one-line `OPERATIONS.md` edit, so the interval flip lands as soon as gate 9521 is done (R78); (5) S13 ι 9743 and δ2 9736 against wave-2 task 9180 on `stages/task_knowledge_sync.py` and `targeted.py` (S13-D1: different symbols); (6) generally, an existing task that shares a file with a wave-3 task but edits a different symbol region gets no edge; same-region overlaps get the edges the seats wired or returned. The 24-hour hand-carry trigger of R57 applies to every S19 move above 50 files (α 9767, β1 9768, β2 9770, γ 9771, δ 9772, η1 9775, θ1 9778, κ1 9783); S19 α 9767 (158 files at `565d15a06f`) is watched for lock starvation like 5040 and 4867.
+Options considered: chain every same-file pair as R54 orders (would hold, among others, S2's deploy and S20 η behind 5040, and S13 ι and S12's run chain behind 9180's 22 live ancestors).
+Consequence that decided it: each exemption is a one-line or disjoint-region edit whose conflict is a trivial rebase, while the edge it replaces would delay a high or ruled-urgent task behind a long chain.
+Supersedes: R54 — its per-file chaining rule, for these named classes; extends R57's hand-carry trigger beyond task 9217.
+ruled_by: lead
+Carried by: the tasks named above.
+
+## R88 — Wave-3 invariant landing order INV-18 to INV-23 (2026-11-13)
+Ruling: the six wave-3 minting tasks take INV-18 to INV-23 in landing order, and no wave-3 invariant leaf waits on 9154 for a number (lead S2/OQ-10 (b)). The order wired at decompose on the three invariant files: INV-18 S19 ε 9773 `fused-memory-subpackage-dag`; INV-19 S1 λ2 9855 `eval-writes-no-production-state`; INV-20 S1 ω 9856 `escalation-filing-one-door`; INV-21 S2 ι 9809 `escalation-vocabulary-imported`; INV-22 S16 ι 9692 `config-default-one-home`; INV-23 S17 ν 9685 `one-decision-partition-per-area`, minted last by ruling. The lead corrects the numbers in task text if the landing order changes; every check anchors on the slug, never the number. S16 ι depends on 9154 because both edit the same invariant files, not for a number.
+Options considered: (a) wave-3 leaves wait on 9154 and number from INV-18 in R22 order; (b) next free number at landing, chained on the files (ruled).
+Consequence that decided it: R51's order fixes INV-15 to INV-17 for wave 2; the invariant files are shared non-test files, so the leaves must be chained anyway, and a slug-anchored check makes the number cosmetic.
+Supersedes: R51 — its numbering clause ("lands … as INV-15 … INV-16 … INV-17") is extended: wave 3 numbers by landing order after INV-17, with the decision-partition invariant last.
+ruled_by: lead
+Carried by: S19 ε 9773, S1 λ2 9855, S1 ω 9856, S2 ι 9809, S16 ι 9692, S17 ν 9685.
+
+## R89 — The filing plan keeps writing the dedupe fingerprint; the typed-records plan retires it (2026-11-13)
+Ruling: the escalation filing plan (S1) keeps writing `dedupe_fingerprint`, because five readers that neither plan's door work moves still read it and S1's own open-at-level key rests on it. The retirement is carried by the typed-records plan (S2) as two tasks, for size: γ2 moves those five readers onto the typed failure signature (after S2's failure-signature task γ; it changes no write), and γ3 deletes the field and S1's fingerprint arguments (after γ2 and S1 ω).
+Options considered: S1 retires new fingerprint writes (the lead's earlier S2/OQ-3 (a) clause); S2 retires the field in one task; two tasks (ruled).
+Consequence that decided it: retiring writes before the readers move would leave five readers and S1's dedupe key reading nothing.
+Supersedes: the lead ruling S2/OQ-3 (a)'s clause "S1 retires new fingerprint writes" and the lead's later "one task" wording (`digests/wave3-lead-rulings.md`), not R entries.
+ruled_by: lead
+Carried by: S2 γ 9724, γ2 9726, γ3 9730 (parked behind 8528); S1 ω 9856.
+Keys: fk-638cca2f65bb.
+
+## R90 — The fused-memory drain restart waits up to 7,200 s for running reconciliation runs (2026-11-13)
+Ruling: the on-merge coordinator's drain restart (R78) waits for running reconciliation runs up to 7,200 s, then restarts and files an urgent `fused-memory-drain-timeout` escalation: bounded, so a hung run cannot hold fused-memory drained and stale. The drain task and the reclaim task stay early in the S24 plan. `restart-fused-memory.sh --rebind-socket` during a fused-memory sweep exits 75 instead of 3 after the lease task, with `OPERATIONS.md` following in the same task. Told to Leo as a one-line reading of his "allows recon runs to finish"; he may ask for unbounded.
+Options considered: unbounded (Leo's words read literally); today's `DRAIN_TIMEOUT` of 2,100 s, which cuts a run still going; 7,200 s (ruled).
+Consequence that decided it: 7,200 s covers every completed run, full or remediation (longest 6,407 s and 6,897 s), between 2026-10-14T07:00Z and 2026-11-13T07:00Z; the window excludes five long runs of the morning of 2026-10-14 (up to 16,890 s), as decision 17 of the S24 plan states.
+Supersedes: none (a reading of R78's addition).
+ruled_by: lead
+Carried by: S24 ι 9795, γ 9754.
+
+## R91 — Who keeps escalation authority once header-less callers lose it (2026-11-13)
+Ruling: following R63: sessions that send the identity `interactive` or `escalation-watcher` keep promotion, because they are added to `PROMOTE_ALLOWED` (today they promote only by sending no header); the header names the channel, with default `${ESCALATION_IDENTITY:-interactive}`, so the watcher launcher can set `escalation-watcher`, and the server keeps the tool's `resolved_by` as detail for human identities; `interactive:coordinator` is not reused as the header default (it stays the identity `scripts/sitting/apply.py` sends and one of `authority.HUMAN_IDENTITIES`, which `PROMOTE_ALLOWED` gains); `unblock-low-risk` closes move to the human/attended tier with the name kept as `resolver_detail`; a watcher hosted in T3 reads as `interactive` with the same authority; every spawned agent sends its role (R63); identities are self-declared, not authenticated, as today.
+Options considered: one static header for every human session (every human resolve would read the same value and `classify.py::_HUMAN_RESOLVERS` would class most as `other-auto`); the channel-naming header (ruled).
+Consequence that decided it: without these rows the denial would strip promotion from the two human channels that use it today and break resolver attribution.
+Supersedes: none (R63 left the post-denial authority table to the plan).
+ruled_by: lead (confirmed and told to Leo)
+Carried by: S2 ε 9760, μ 9817, ν 9843; the not-yet-filed ο.
+
+## R92 — Wave-3 readings and amendments of R9, R13, R15, R17, R18, R19 and R20 wording (2026-11-11 to 2026-11-13)
+Ruling: each line amends or reads one sentence of a 2026-10-10 ruling; the ruling's remedy otherwise stands.
+- R9: the category enum stays in `escalation/categories.py` (task 5257 landed it), no re-export; R9's "`escalation/models.py` as the typed vocabulary" is read as the escalation package (S2/OQ-4 (a), lead). R9's invariant text gains a second home: the terminal status names and the archive layout live in the stdlib module `shared/escalation_layout.py`, created first by S19 θ0 9777; S2's vocabulary task builds its status type from it and S2's invariant names it (S19/Q-C8 (a), lead, flagged to Leo).
+- R13: "marker pools move from Mem0 to the recon ledger" — the dormant pools are deleted rather than moved, meeting R13's intent with less code (S13-3, option (b), Leo as recommended; S13 κ1 9744, κ2 9745, κ3 9746). The seam row's lexicon is built once in `reconciliation/recon_prose_grammar.py` (S13 δ1 9735 splits `task_filter.py`).
+- R15: a field default that names one shared constant in a dependency-free shared module counts as the one home (S16/OQ-4 option 2, lead, flagged; also corrects the dashboard's lock depth, 2 shown, 4 run; S22/OQ-5 and S24's restart defaults follow it); the write-triage judge becomes Claude-CLI-only and `JUDGE_VERDICT_SCHEMA` is the verdict format's one home, extending R15's deletion of the judge's else-arm (S16/OQ-3, lead, flagged); the write-triage judge's inheritance of the main memory model is retired (S16/OQ-8, lead, flagged).
+- R17: its order clause is reworded to the code's imports: `models` and `utils` sit below `backends` (S19-1, Leo as recommended; an R49-style reading); its seam name becomes `shared.proc_liveness.pid_alive` (R74).
+- R18: "one `cost_store` write per attempt" is read as one writer: the retry loop writes one row per attempt in `invocations` (`invocation_id`, `attempt`, `returned`), and the task workflow and the deep reviewer pass their cost store and row fields into it instead of writing their own (S20/OQ-4, OQ-6, lead; S20 ζ 9812, η 9846, ο2 9896).
+- R19: the fused-memory read model is `get_status(panels=…)` with wire models in `shared/dashboard_panels.py`, which carries no SQL, table or index names; read as R19's option 1 (the producer's MCP tools publish the read model), not the rejected shared-schema option (S15/OQ-7, lead, flagged; S15 κ 9821).
+- R20: "acquires the lease under `flock`" is implemented literally as a kernel lock held for each restart script's life; a live overrunning sweep is not displaced, reads `OVERRUN` and pages hourly (S24/OQ-8 D, lead, flagged); a deliberate redeploy during a sweep needs `--lease-wait SECS`, otherwise `restart-fused-memory.sh --now` is refused with exit 75 (S24/OQ-9 B, lead, flagged); reclaim covers other projects once the operator installs the known-project-roots drop-in after S24 η 9801 (S24/OQ-3 A, lead, flagged).
+Options considered: as each plan's `## Rulings (sitting of 2026-11-12)` section states.
+Consequence that decided it: each reading keeps the ruling's intent where its letter no longer matched the code or a decision the plan had to make.
+Supersedes: R9, R13, R15, R17, R18, R19, R20 — wording only, the sentences named above.
+ruled_by: lead, except R13's marker sentence and R17's order clause: human (as recommended)
+Carried by: the tasks named in each line.
+
 
 ## Shared conventions (every session)
 
@@ -321,18 +963,155 @@ designed behaviour, not a regression; `merge_gate_unmeasured` events (S7) replac
 should be read as the gate reporting, not failing; the lane timing-budget validator (S6) refuses a yaml
 that raises a verify timeout above the budget at config load, which is the intended loud failure.
 
+## Program status (2026-11-13)
+
+Read by the next `/review-all`'s Phase 0 (contract §9). Wave-1 figures are from the 2026-11-01 store sweep
+(`find_tasks_by_metadata(key="x_finding_run", value="review-all-dark_factory-20261008")`: 118 tasks then,
+confirmed with `get_task`) and were not re-swept, except the six wave-1 dependencies of gate 6698. Wave-2 and
+wave-3 figures are from a store read at 2026-11-13T14:15Z (`get_statuses` over the 236 wave-3 ids, the three
+acceptance records and the named follow-ups; read-only `dependencies` and `tasks` queries for gate 6698 and the
+162 wave-2 ids), re-read read-only at 2026-11-13T15:15Z with no status change among them. The live tooling under
+`skills/review-all/scripts/program/` is still not usable against this server until task 7178 lands (7178
+`pending` on 2026-11-13).
+
+**Counts, measured 2026-11-13T15:15Z** (read-only sqlite on `.taskmaster/tasks/tasks.db`). Rule: a task counts
+when its `metadata.x_finding_run` is `review-all-dark_factory-20261008`. 545 tasks: 451 pending, 78 done, 14
+cancelled, 1 in-progress, 1 blocked. Of them, the 236 wave-3 tasks are all pending; the wave-2 band 9127–9289
+holds 163 (157 pending, 5 done, the cancelled acceptance record 9211); the other 146 (wave 1, Phase 5,
+follow-ups, the wave-3 acceptance records and foreign leaves that absorbed a key) are 73 done, 58 pending, 13
+cancelled, 1 in-progress, 1 blocked. Blocking rule: a task is "behind" X when it reaches X through dependency
+edges whose every task is open (not done or cancelled). Behind task 5040: 276 open tasks, 70 of them wave-3 and
+92 wave-2. Behind task 8528: 460 open tasks, 74 of them wave-3 and 110 wave-2; every wave-3 task behind 5040 is
+also behind 8528 (5040 depends on 8528). Behind gate 9521: 47 open tasks, 38 of them wave-3 (through S24 θ 9861
+→ ω 9867 → S16 ζ1 9702).
+
+**All 26 streams are authored, ruled and filed.** Wave 1: 60 tasks (six streams). Wave 2: 162 tasks plus the
+acceptance record 9211. Wave 3: 236 tasks plus the acceptance records 9753, 9794 and 9900. Follow-ups filed
+outside the plans: 9305, 9306, 9307 (wave 2, 2026-11-11); 9483–9487 and 9494–9501 (R23's eight keys, R83);
+9490, 9491, 9492, 9493 (2026-11-12); 9634 (2026-11-13).
+
+**Wave 1 — done.** Deliberation (R1–R24, 2026-10-10) and wave 1 of R24: the six agent-mode streams S11,
+S14, S18, S21, S23 and S25 were authored, critiqued and decomposed on 2026-10-10/11 (PRDs and stamped
+sidecars in `plans/review-all-s{11,14,18,21,23,25}-*-prd.md`, commits `4cfbb33757`, `ae3047ec3a`,
+`81731dc052`). Those six streams filed 60 tasks (59 leaves plus 6709, an acceptance record); as of
+2026-11-01: 31 done, 26 pending, 2 held `deferred` (6764, 6770), 1 cancelled-as-accepted (6709). Both holds
+were released on 2026-11-13 (S20 released ι 6764 onto α 9756, S2 released ξ 6770 onto δ 9758; both `pending`;
+task 7724 still depends on 6764). One foreign leaf, 6861 (`plans/offline-lane-red-path-prd.md` δ2, done), also
+carries the run id because it absorbed mechanical 6639's key. S23 is complete. Phase 5 filed 55 mechanical
+tasks 6587–6646 (as of 2026-11-01: 16 done, 36 pending, 1 in-progress (6615, done since: `f750373949`), 2
+cancelled (6639, 6644)). Two skill defects found during the run carry the run id without a finding key (6785
+done, 6786 pending as of 2026-11-01).
+
+**Wave 2 — authored, ruled, filed.** S3 S4 S5 S6 S7 S8 S9 S10 S26 (S3 and S7 taken from the Streams table's wave
+3): ruled 2026-11-10 (R25–R48; lead R49–R58; Leo R59–R60 on 2026-11-11), decomposed in parallel under one
+cross-plan wiring (R54): 162 tasks, ids 9127–9289 except 9211, plus the cancelled acceptance record 9211. On
+2026-11-13: 5 done (9143, 9164, 9170, 9238, 9276), 157 pending, none held. The 45 high leaves are dependencies of
+gate 6698. PRDs, manifests and stamped sidecars on main (`53c17d997f`, `eedd7cde9a`, `e22018b057`, `11bb013b5c`).
+Wave 2 owns INV-15 (S6 9140), INV-16 (S10 9242), INV-17 (S7 9154), all pending (R51). The lead's three owed
+follow-ups are filed: 9305 (S4's residual fk-591206484ea5), 9306 (the periodic landed-journal pass, R39; depends
+on 4646 and 9218), 9307 (the curator field rename, R42; depends on 9204). The clerk pass of 2026-11-11
+(`clerk/clerk-{A,B,C}.json`) applied the decompose returns' actions on pre-existing tasks.
+
+**Wave 3 — authored, ruled, filed.** S1 S2 S12 S13 S15 S16 S17 S19 S20 S22 S24. The eleven plans were authored
+and critiqued to convergence on 2026-11-11; Leo answered the sitting on 2026-11-12 and the residual questions on
+2026-11-13 (R61–R84, his two standing rules R79 and R80, the sitting SOP R81, the cap-file ruling R75, W-3 R82
+and W-4 R83; the lead's rulings worth an entry are R85–R92, every other in `digests/wave3-lead-rulings.md`). The
+plans were ruling-folded, fold-verified, aligned and decomposed in parallel (R85): 236 tasks, ids 9664–9903 (the
+ranges interleave; not every id in the span is the program's), all `pending` on 2026-11-13, none held; 45 high
+leaves on gate 6698. PRDs, manifests and sidecars on main (`c0dc063475` plans, `a0c105c9bc` stamped sidecars and
+the two releases 6764 and 6770, `c997ef9d2b` four delivered checks repointed ahead of the moves); the sitting SOP
+change in the skill is `1b106418da` (R81); R59 and R60 were recorded at `72e95978ff`.
+Wave 3 owns six invariants, INV-18 to INV-23 in landing order (§Design invariants promoted, R88).
+
+**Open — lead (each filed or done when its trigger holds; R58).**
+- S6's two dated policy-flip tasks ξ and υ (R32): after S6 φ 9186 lands (9186 `pending`).
+- S10 σ, the 30-day combine-collision check (R44): after S10 ρ 9237's script is on main (9237 `pending`).
+- S9's 14-day L0 settle check (R40): its script task S9 π 9164 is done; it waits for the steward-outcome task
+  S9 ε 9190 (`pending`).
+- S13 ρ, the recurring category-candidate check (R67): after S13 π 9751 is on main.
+- S2 ξ, the three-day unidentified-action check (R63): after S2 ν 9843 is done and every project's orchestrator
+  and fused-memory runs S2 μ 9817; then S2 ο, the denial, after ξ is done. Both join gate 6698.
+- The wave-3 clerk pass over the eleven returns' `lead_actions` ran on 2026-11-13 (`clerk/clerk-w3-{A,B,C,D}.json`:
+  224 actions applied, 19 skipped, 1 kept for the lead, 4 rejected because they would write gate 6698; S16's 24
+  same-region edges were found already present). Still open from it, each when the task's branch lands or is
+  dropped (`plans/review-all-program-dark_factory-2026-10-10.owed-followups.md`, each owned by a "Review-all follow-up" gate task, 9924–9932): the amends to 5258, 6254, 8143, 8262, 7008, 3678 and 4875 and the
+  notes to 4809 and 3498 (each task carries unmerged commits); whether to cancel 5912 and 5700 (unmerged real
+  work); the key stamp on 6695 (in-progress) after it lands; the S13 cancel of 6843, kept for the lead's call.
+  The moves scan (`clerk/moves-scan-w3.json`) repointed four delivered checks (3825, 8143, 9748, 9790; commit
+  `c997ef9d2b`) and left two residuals for the lead (9748's sibling `project-policies-config` pattern; 9790's
+  check is vacuous at HEAD until 9768's move lands).
+- The eight yaml edits of R37 (after S8 η 9212's default flip deploys fleet-wide), the three-row
+  `files_to_modify` backfill of R42 (after S10 δ 9204's refusal deploys), and the reify-side removal of the
+  `speculation_probe` stanza before S7 β 9133 deploys (all three tasks `pending`).
+- S17's xref: the scheduler's fused-memory task-store client partition (the largest left after S17 θ, not ruled
+  by R16) needs a follow-up task or an acceptance; not routed yet.
+- Memories that say `add_dependency` accepts cycles: amended through human gate 9634 after task 9490 (high,
+  `pending`) lands (R64).
+
+**Open — sessions and Leo.**
+1. **Task 5040's hand-carry** (R60) launches when task 8528 is done; 8525 is done, 8526, 8527 and 8528 are
+   `pending` (2026-11-13). A scheduled check launches the carry and stands down if one exists. 276 open tasks
+   wait on 5040, 92 of them wave-2 and 70 wave-3 (S17's scheduler chain through S8 9234 among them); 460 wait on
+   8528 (counts and rule above).
+2. **Gate 9521** (`blocked` at level 2, waiting on Leo): the operator reinstall of the fused-memory unit that puts
+   task 9493's single-stop-signal fix (done) into effect. S24 θ 9861 (the 4 h → 1 h interval flip, R78) depends
+   on it (S15 ζ 9824 needed only 9493, which is done); 47 open tasks sit behind the gate, 38 of them wave-3.
+3. **The recall-from-the-task-store design session** (R66), spawned 2026-11-13 as its own fable /team session
+   (record `~/.claude/fleet/sessions/team-df-2370851`): idle at 2026-11-13T15:15Z, waiting on Leo's rulings on
+   nine decisions it put to him in its thread (its `result.md`: design drafted and critic-checked, nothing filed
+   or committed; the design file sits under `/tmp` and is volatile). After he rules, its rulings return into
+   `digests/leo-rulings-fused-recall.md` (absent on 2026-11-13), are recorded here as a new R entry, and it
+   authors a PRD.
+4. **The task-8253 investigation**: done and ruled (R75).
+5. **Lock-starvation watch** (24-hour hand-carry trigger): S19 α 9767 (158 files) and the other S19 moves above 50
+   files (R87); S8 β0 9217 (R57); task 7876, which S12 α waits on.
+
+**Triage briefing.** `## Triage briefing` describes behaviour of S6, S7 and S10; their tasks are filed but
+none has landed (S6 α 9140, S7 α1 9136/α2 9139, S10 β2 9191 deliver it; all `pending` on 2026-11-13).
+
+**Gate.** Human gate 6698 (interim form, delayed milestone 259200 s, `pending` since its 2026-11-01 release
+on Leo's instruction) depends on 96 tasks: wave 1's six (6707, 6721, 6736, 6740, 6747, 6750), wave 2's 45 high
+leaves and wave 3's 45 high leaves; it covers every high leaf of all 26 streams. On 2026-11-13, 7 are done (6707,
+6736, 6740, 6747, 6750, 9164, 9170) and 89 pending (6721 waits on 6720, `pending`), so the milestone has not
+started. One task depends on the gate: S19's operator gate 9780 (R73). S2 ξ and ο join the gate when the lead files
+them. When the gate fires, the next run re-derives streams from the open findings per contract §9.
+
 ## FILED — program status
 
-Appended by each `/prd` session as it files. Columns: stream · PRD path · task anchors (ids) · gate
-dependencies added · notes. The trigger-chain gate id, the superseded chain (none: first run) and the
+Appended by each `/prd` session as it files; completed by the 2026-11-01 cleanup sitting with one row per
+stream; the nine wave-2 rows (S3 S4 S5 S6 S7 S8 S9 S10 S26) replaced their "not authored" rows on
+2026-11-11 from the decompose returns, and the eleven wave-3 rows (S1 S2 S12 S13 S15 S16 S17 S19 S20 S22 S24)
+theirs on 2026-11-13 (wave-3 leaf status as of the 2026-11-13 store read: all 236 pending). Columns: stream · PRD path · task anchors (ids) · gate dependencies
+added · notes. Wave-1 leaf status is as of the 2026-11-01 store sweep; wave-2 leaf status as of the
+2026-11-11 store read (all 162 pending). The trigger-chain gate id, the superseded chain (none: first run) and the
 `review_due` escalation resolved (none: hand launch) are recorded here by the lead.
 
 | Stream | PRD | Tasks | Gate deps added | Notes |
 |---|---|---|---|---|
-| (trigger chain) | — | human gate **6698** (deferred, planning mode; deps after wave 1: 6707, 6721, 6736, 6740, 6747, 6750; `metadata.trigger_chain.skill=review-all`, `run_id=review-all-dark_factory-20261008`, milestone delayed 259200 s) | — | interim form (`scripts/check_run_completion.py` absent at as_of); no prior chain to supersede; launched_from none; `commit_planning` on 6698 when this table is complete |
-| S11 curator-pipeline-and-candidate-types | plans/review-all-s11-curator-pipeline-prd.md | α 6703 (low), β 6704, γ 6705, δ 6706, ε 6707 (high), ζ 6708; ω acceptance 6709 (cancelled, fk-85234d9d39c4) | 6698 → 6707 | ext deps 4513 (α), 4503 (ε; looks subsumed by 4513's branch), 6385 (ζ); 6176 cancelled (→β); 6332 depends on 6708; RISK: whole chain gates on 4513, whose finished branch waits on esc-4513-9 ack; priority inversion α low → ε high recorded, no override (contract §4) |
-| S14 shared-leaves-for-cross-package-facts | plans/review-all-s14-shared-leaves-prd.md | α 6710, ζ 6711, λ 6712, ε 6713, β 6714, γ 6715, δ 6716, η 6717, θ 6718, ξ 6719 (low), ν 6720, μ 6721 (high), κ 6722, ι 6723, ο 6724, π 6725, ρ 6726 (integration gate) | 6698 → 6721 | fk-06de98fa328b dropped (cost gone, task 4618); 4709 depends on 6718; 6333 cancelled (→6720); ζ 6711 widened to SyncMcpSession per S21's extent; OPEN: 6713 → depends on S25's bootstrap leaf (wired by S25 at its phase B); 6726 allow-list references S21's transport leaf id |
-| S18 evals-measurement-integrity | plans/review-all-s18-evals-measurement-prd.md | α 6733, β 6734, γ 6736 (high), δ 6737 (medium per critic correction of fk-3505aba0481d), ε 6738, ζ 6739, η 6741 (low), θ 6743 (low), ι 6746 (low), κ 6748 (low), λ 6752 (low) | 6698 → 6736 | 6324 cancelled (→6737/6738); λ depends on 6597 and 6710 (adds a narrow tickets_db locator inside S14's project_layout seam); leaves β/ε/θ/ι/κ declare orchestrator/cli.py — S16/S20 sessions wire that same-file edge; S25 wires the scripts/ same-file edges |
-| S21 legibility-pipeline | plans/review-all-s21-legibility-pipeline-prd.md | α 6740 (high), β 6742, γ 6744, δ 6745, ε 6747 (high), ζ 6749, η 6750 (high), θ 6751, ι 6753 | 6698 → 6740, 6747, 6750 | cancelled (→leaf): 5960→6740, 6357→6742, 6466→6747, 5927→6749, 6009→6750, 4241→6750; 5693 KEPT as a dependency of 6740 (finished branch), PRD §8 "cancel" line superseded by this row; 5785 depends on 6740, 5513 on 6744; ext deps 5678/6548/5783 (γ), 6549/6358/5754 (δ), 6619/6711 (ε), 6408 (ζ); 6747 is the transport leaf S14's 6726 allow-list references; census-incremental §4.7 C7 cross-reference line to be added by the lead |
-| S25 scripts-instruments-shared-locators-and-parity-checkers | plans/review-all-s25-scripts-instruments-prd.md | α 6756, β 6757, γ 6758 (bootstrap; binds every member's src incl. sampler), δ 6759, ε 6760, ζ 6761, η 6762, θ 6763 (low), ι 6764 (HELD deferred, x_seam_wait S20/C3), κ 6765 (low), λ 6766 (shared.route_rejection, S25-owned, S16 consumes), μ 6767 (low), ν 6769, ξ 6770 (HELD deferred, x_seam_wait S2/C5; esc-3169-2 declare_pin migration is its step 1) | none (no high leaves) | 6713 (S14 ε) now depends on 6758; 6723 → 6758 edge added by the lead (shared trial_module_tagger_haiku.py); 6037 amended + 6764 depends on it; 6447 cancelled (→6756); 6381 depends on 6756; 6422 depends on 6769; PRD text lags rulings 3/6/7 in four places (task descriptions + sidecar are authoritative); S20 session: add_dependency(6764 → its C3 leaf) + commit_planning 6764 + re-stamp sidecar; S2 session: same for 6770 with its C5 leaf |
-| S23 sampler-collection-groups-and-schema | plans/review-all-s23-sampler-metric-groups-prd.md | α 6772, β 6773 (mints INV `sampler-vocabulary-one-table`, next free number at implementation) | none (no high leaves) | 6644 cancelled (→6773); 6643 depends on 6772; β depends on 6758 (S25 bootstrap); S22 leaves touching dashboard data/load.py or tests/test_load_data.py must depend on 6772/6773 |
+| (trigger chain) | — | human gate **6698**: `metadata.trigger_chain.skill=review-all`, `run_id=review-all-dark_factory-20261008`, `task_kind=deterministic`, `always_escalates`, milestone delayed 259200 s; deps 6707, 6721, 6736, 6740, 6747, 6750 | — | interim form (`scripts/check_run_completion.py` still absent 2026-11-01); no prior chain to supersede; launched_from none; `commit_planning(task_ids="6698", target_status="pending")` run 2026-11-01 by the cleanup sitting on Leo's instruction — echo `deferred → pending`, `deferral_cleared: null`; the delayed milestone runs from that release. 2026-11-11: the 45 high leaves of the nine wave-2 streams were added (deps now 51 — the six above plus 9130, 9135, 9138, 9140, 9156, 9157, 9159, 9160, 9164, 9167, 9168, 9170, 9175, 9176, 9179, 9180, 9182, 9184, 9187, 9188, 9190, 9191, 9192, 9193, 9194, 9195, 9198, 9200, 9206, 9207, 9210, 9215, 9219, 9223, 9224, 9240, 9241, 9242, 9246, 9249, 9260, 9261, 9267, 9284, 9286); 6721 and 6750 were still pending, so the milestone had not started. 2026-11-13: the 45 high leaves of the eleven wave-3 streams were added (deps now 96 — the 51 above plus 9665, 9666, 9667, 9668, 9672, 9674, 9676, 9683, 9686, 9688, 9732, 9738, 9744, 9745, 9746, 9747, 9754, 9758, 9760, 9762, 9765, 9786, 9802, 9805, 9807, 9813, 9815, 9817, 9820, 9833, 9842, 9843, 9844, 9846, 9848, 9852, 9854, 9856, 9857, 9860, 9863, 9874, 9896, 9898, 9903), so the gate covers every high leaf of all 26 streams; it has one dependent, S19's operator gate 9780 (R73); S2 ξ and ο join it when the lead files them. Read 2026-11-13: 7 of the 96 done (6707, 6736, 6740, 6747, 6750, 9164, 9170), 89 pending (6721 among them), so the milestone has not started |
+| S11 curator-pipeline-and-candidate-types (agent, wave 1) | plans/review-all-s11-curator-pipeline-prd.md | α 6703 (low) done, β 6704 done, γ 6705 done, δ 6706 done, ε 6707 (high) pending, ζ 6708 pending; ω acceptance 6709 cancelled (fk-85234d9d39c4, `x_acceptance_reason` present) | 6698 → 6707 | 4/6 leaves done; ε's deps (6705, 6706, 4503) are all done, so it is dispatchable; ext deps 4513 (α, landed), 6385 (ζ); 6176 cancelled (→β, reason stamped); 6332 depends on 6708; priority inversion α low → ε high recorded, no override (contract §4) |
+| S14 shared-leaves-for-cross-package-facts (agent, wave 1) | plans/review-all-s14-shared-leaves-prd.md | done: α 6710, ζ 6711, λ 6712, ε 6713, β 6714, γ 6715, η 6717, π 6725; pending: δ 6716, θ 6718, ξ 6719 (low), ν 6720, μ 6721 (high), κ 6722, ι 6723, ο 6724, ρ 6726 (integration gate) | 6698 → 6721 | 8/17 done; μ waits on ν 6720; fk-06de98fa328b dropped (cost gone, task 4618) — the stream's only key with no task; 4709 depends on 6718; 6333 cancelled (→6720, reason stamped); ζ 6711 widened to SyncMcpSession per S21's extent; the 10-11 OPEN item is closed: 6713 depends on 6758 (S25 γ) and both are done — the sidecar's ε `scripts-checkout-bootstrap` verdict still reads OPEN (stale, not re-stamped); 6726 allow-list references S21's transport leaf 6747 (done) |
+| S18 evals-measurement-integrity (agent, wave 1) | plans/review-all-s18-evals-measurement-prd.md | done: α 6733, β 6734, γ 6736 (high), δ 6737, ε 6738, ζ 6739, η 6741 (low), θ 6743 (low); pending: ι 6746 (low), κ 6748 (low), λ 6752 (low) | 6698 → 6736 | 8/11 done, every remaining leaf low; 6324 cancelled (→6737/6738, reason stamped); λ depends on 6597 (done) and 6710 (done); the S16/S20 same-file edges on orchestrator/cli.py were never wired because S16/S20 were never authored (no harm observed: β/ε/θ/ι/κ landed or wait on nothing from them) |
+| S21 legibility-pipeline (agent, wave 1) | plans/review-all-s21-legibility-pipeline-prd.md | done: α 6740 (high), β 6742, γ 6744, δ 6745, ε 6747 (high); pending: ζ 6749, η 6750 (high), θ 6751, ι 6753 | 6698 → 6740, 6747, 6750 | 5/9 done; η waits on ζ 6749; cancelled (→leaf, reasons stamped): 5960→6740, 6357→6742, 6466→6747, 5927→6749, 6009→6750, 4241→6750; 5693 (done) kept as a dependency of 6740; 5785 depends on 6740, 5513 on 6744; 6747 is the transport leaf S14's 6726 allow-list references; census-incremental §4.7 cross-reference to D8/6749 is in `plans/census-incremental-prd.md` (landed) |
+| S23 sampler-collection-groups-and-schema (agent, wave 1) | plans/review-all-s23-sampler-metric-groups-prd.md | α 6772 done, β 6773 done (INV `sampler-vocabulary-one-table` minted) | none (no high leaves) | STREAM COMPLETE; 6644 cancelled (→6773, reason stamped); 6643 (pending, mechanical) depends on 6772; β depended on 6758 (done) |
+| S25 scripts-instruments-shared-locators-and-parity-checkers (agent, wave 1) | plans/review-all-s25-scripts-instruments-prd.md | done: α 6756, β 6757, γ 6758 (bootstrap), ν 6769; pending: δ 6759, ε 6760, ζ 6761, η 6762, θ 6763 (low), κ 6765 (low), λ 6766, μ 6767 (low); HELD deferred until 2026-11-13, then RELEASED (ι 6764 by S20 onto α 9756, ξ 6770 by S2 onto δ 9758; both pending, sidecar labels stamped at `a0c105c9bc`): ι 6764 (`x_seam_wait` S20/C3; sidecar `task_id: null`), ξ 6770 (`x_seam_wait` S2/C5; sidecar `task_id: null`; esc-3169-2 declare_pin migration is its step 1) | none (no high leaves) | 4/14 done; the two holds were released at S20's and S2's wave-3 decompose (2026-11-13); 7724 (pending) depends on held 6764; 6713 (S14 ε) and 6723 → 6758 edges present; 6037 amended, 6764 depends on it (and on θ 6763); 6770 depends on ε 6760; 6447 cancelled (→6756) WITHOUT `x_acceptance_reason`; 6381 depends on 6756; 6422 depends on 6769; PRD text lags rulings 3/6/7 in four places (task descriptions + sidecar authoritative) |
+| S1 one-escalation-filing-entry-point (spawn, wave 3) | plans/review-all-s1-one-escalation-filing-entry-point-prd.md | 26 leaves, ids 9686–9856 (not contiguous; the eleven streams were filed in parallel), all pending 2026-11-13: α 9686 (high), β 9688 (high), γ 9713, δ 9715, ε1 9716, ε2a 9722, ε2b 9723, ε3 9725, ζ1 9727, ζ2 9731, η1 9755, η2 9759, η3 9763, θ1a 9769, θ1b 9789, θ2 9792, ι1 9797, ι2 9806, κ1 9808, κ2 9810, κ3 9811, κ4 9841, λ1 9845, μ 9849, λ2 9855, ω 9856 (high) | 6698 → 9686, 9688, 9856 | none held. λ2 9855 mints INV-19 `eval-writes-no-production-state`, ω 9856 INV-20 `escalation-filing-one-door` (R88); ω is the closing leaf. R61 (δ 9715, κ1 9808, η1 9755, λ1 9845, μ 9849 corpus sandbox, λ2 9855), R62 (α, β, ε1, ε2a, ε2b, ω), R89 (S1 keeps writing the fingerprint). fk-1b573c2428c2 is `fixed:2ef04c8241` (no leaf); α carries fk-14e1510916ab (Phase-5 task 6609, cancelled into α). S3 ε1 9188 and S3 9187 wait on β (S1/OQ-3, OQ-6); 9188 and 9200 amended to call the filer. Parked on 8528: ε1, ε2a, ε2b, ε3 (R85). Lead actions for the wave-3 clerk: cancels 6609, 3887, 8355, 6942, 6348, 7070, 6689; amends 8665, 9188, 9200, 5258; notes on 9176, 9171, 9186, 4746, 7109, 9411. 24 same-region edges wired onto 21 existing tasks. No acceptance record. |
+| S2 typed-escalation-record-facts (spawn, wave 3; upstream S1) | plans/review-all-s2-typed-escalation-record-facts-prd.md | 17 leaves, ids 9687–9843 (not contiguous; the eleven streams were filed in parallel), all pending 2026-11-13: α 9687, β1 9714, β2 9717, γ 9724, γ2 9726, γ3 9730, δ 9758 (high), ε 9760 (high), ε2 9765 (high), ζ 9785, η 9790, θ1 9798, θ2 9799, ι 9809, κ 9814 (low), μ 9817 (high), ν 9843 (high) | 6698 → 9758, 9760, 9765, 9817, 9843 | none held; RELEASED S25 ξ 6770 onto δ 9758 (contract C5 as delivered: a persisted `Escalation.duplicate_of`, written only by `resolve` with `duplicate_of=<survivor>` on an archive-dismissed action; `pending` 2026-11-13). ι 9809 mints INV-21 `escalation-vocabulary-imported` (R88). R63 (ε 9760 parser, stamp and message without denial; μ 9817 and ν 9843 the identity deploy; ν uses S16 χ 9712), R91, R89 (γ2 9726, γ3 9730), R84 S2-1 (ε2 9765). NOT FILED (R58), filed by the lead: ξ, the three-day unidentified-action check, after ν is done and every project runs μ; ο, the denial, after ξ (it closes fk-ece88b7661b7); both join 6698. Filed in reify's store 2026-11-13: reify task 9996 (low), the `reify/scripts/docs-truth-sweep.py` identity header, depending on `dark_factory:9760`; ν takes no edge on it. α waits on S19 θ0 9777 (R92). Parked on 8528: κ 9814, γ3 9730 (R85). Lead actions: cancels 8777, 8784, 4727, 4749; amends 9176 and 9216 (read `ResolutionEvent`). At `commit_planning` θ1 9798's check `summary-substring-discriminator-removed` was refused as `vacuous_absent` (that clause of θ1 is already gone at main; the lead may amend θ1), and three substrate checks as `vacuous_present`, by design. γ3 filed medium (contract §4; the PRD said low). |
+| S3 escalation-server-and-queue-boundary (wave 2 by the 2026-11-10 sitting; Streams table: spawn, wave 3; upstream S6, S2) | plans/review-all-s3-escalation-server-and-queue-boundary-prd.md | 12 leaves, ids 9152–9210 (not contiguous; the nine streams were filed in parallel), all pending 2026-11-11: α 9152, β 9157 (high), γ 9162, δ 9167 (high), κ 9173 (low), θ 9177, ι 9181, ε1 9188 (high), ε2 9193 (high), ζ 9200 (high), λ 9205, μ 9210 (high) | 6698 → 9157, 9167, 9188, 9193, 9200, 9210 | none held. ε1 9188 and ε2 9193 wait on S6 μ 9201 by dependency (R25), ζ λ μ behind them; existing-task edges κ → 3176, θ → 4567, ε1 → 4651/4833/8528, ε2 → 5409 and → S7 δ 9127 (R34, R52). Keys: fk-bc64099a1cd0 → `filed:5409`, fk-66746efddd4d → `filed:4833` (both stamped by the clerk pass 2026-11-11); 6827 cancelled as covered (R27). WorkflowSlots declared in δ 9167 (seam table). Integration gate / signal leaf μ 9210. No invariant (R22 none). |
+| S4 verify-run-context-and-runner-contract (wave 2; Streams table: spawn, wave 2, high-risk) | plans/review-all-s4-verify-run-context-and-runner-contract-prd.md | 20 leaves, ids 9128–9169 (not contiguous; the nine streams were filed in parallel), all pending 2026-11-11: α 9128, β 9129, γ 9130 (high), δ 9131, ζ 9132, ι1 9134, η 9135 (high), θ 9137, ι2 9138 (high), ι3 9141, κ 9142 (low), λ 9146, μ 9148, μ0 9150, ν 9153, ξ 9156 (high), ε 9160 (high), ο 9163 (low), ρ 9166, π 9169 | 6698 → 9130, 9135, 9138, 9156, 9160 | none held. fk-5fa21a4b85cb is `fixed:31d2464f04` (no leaf); fk-3756ad2f3357's builder half is `fixed:fca89bd55b` (task 7918), its policy half in ζ 9132 (which also absorbs 5615); fk-591206484ea5 residual stays open: the lead files one mechanical task for it (not yet filed). Rulings R28 (ι1 9134), R29 (α 9128), R30 (ρ 9166). Parked on 8528: α β η θ ι1 μ0 ξ ρ (R55). Integration gate / signal leaf π 9169. Every S4 task waits on 5040 through S6 (R31, Program status). No invariant. |
+| S5 gitops-ports-query-contract-and-the-git-runner (wave 2; Streams table: spawn, wave 2, high-risk) | plans/review-all-s5-gitops-ports-query-contract-and-the-git-runner-prd.md | 23 leaves, ids 9255–9277 (contiguous), all pending 2026-11-11: α 9255, λ0 9256, β0 9257, β 9258, γ 9259, δ 9260 (high), ι 9261 (high), κ 9262, ε 9263, ζ 9264, η 9265, θ 9266, λ 9267 (high), ξ0 9268, ξ 9269, ο0 9270, ο 9271, ρ0 9272, ρ 9273, ν 9274 (low), π 9275, μ 9276 (low), σ 9277 (low) | 6698 → 9260, 9261, 9267 | none held. Chain α → λ0 → β0 → β → γ → δ → ι → κ → ε → ζ → η → θ → λ → ξ0 → ξ → ο0 → ο → ρ0 → ρ → ν → π, plus μ and the low re-entrant lane-lease follow-up σ 9277 (no key; depends on θ 9266; R48 S5-2). fk-54eb9f7cc0be is `filed:5697` (`x_finding_key`/`x_finding_run` stamped on 5697 by the clerk pass 2026-11-11; its `source` stays `steward-sweepup`); S6's fk-59b3df6f52a3 is disposed in η 9265; 4752 cancelled into λ 9267, 6914 cancelled into ε 9263. R49 (git runner, α/β). Eight leaves parked on 8528. At `commit_planning` three substrate checks were refused as `vacuous_present` (already true on main) and not copied into task metadata: α 9255 `substrate-run-git-exists`, ι 9261 `substrate-lifecycle-exists`, κ 9262 `substrate-acquire-route-enum`; every id is stamped. 17 of its 21 chain tasks wait on 5040 through S6 ζ 9182 (R31). No invariant. |
+| S6 merge-lane-lifecycle-outcome-types-and-provenance (wave 2; Streams table: spawn, wave 2, high-risk; upstream S5, S7) | plans/review-all-s6-merge-lane-lifecycle-outcome-types-and-provenance-prd.md | 13 leaves, ids 9140–9206 (not contiguous; the nine streams were filed in parallel), all pending 2026-11-11: α 9140 (high), β1 9144, β2 9155, γ1 9159 (high), γ2 9165, δ 9171, θ 9176 (high), ζ 9182 (high), φ 9186, κ 9192 (high), λ 9197, μ 9201 (low), ι 9206 (high) | 6698 → 9140, 9159, 9176, 9182, 9192, 9206 | none held. Acceptance record 9211 (S6-6): filed and cancelled with `x_acceptance_reason`, keys fk-c55b12f4b66d, fk-e8a03e4ec067 (the coalesce-train arm of fk-ba531799522b named in the reason). fk-d41caf6b6331 is `fixed:9d0dfb0079`; fk-59b3df6f52a3 → S5 η 9265. α 9140 mints INV-15 `lane-budgets-exceed-verify-timeouts` (R51) and is the one new worker.py task NOT parked on 8528 (R55); β1 γ1 δ θ ζ φ κ λ are parked. δ 9171, ζ 9182, κ 9192 → 5040 (R31). 4581, 7396 (into α) and 5046 cancelled. NOT FILED: ξ (14-day quiet-period gate) and υ (dark-factory `hold_lane` flip), filed by the lead after φ 9186 lands (R32, R58). Integration gate / signal leaf ι 9206. |
+| S7 merge-lane-gates-placement-mechanisms-and-target-adapters (wave 2 by the 2026-11-10 sitting; Streams table: spawn, wave 3) | plans/review-all-s7-merge-lane-gates-placement-mechanisms-and-target-adapters-prd.md | 7 leaves, ids 9127–9154 (not contiguous; the nine streams were filed in parallel), all pending 2026-11-11: δ 9127 (low), β 9133, α1 9136, α2 9139, γ 9145, ε 9149 (low), ζ 9154 | none (no high leaves) | none held; no high leaf, so no 6698 edge. Chain δ → β → α1 → α2 → γ → ε → ζ (R54); ζ 9154 mints INV-17 `merge-gate-unmeasured-typed` and is the integration gate. β, ε → 7720; γ → 3918; 4767, 6242 → β; δ β α1 α2 ε parked on 8528, so δ (and S3 ε2 through it) waits on 8528 → 8527 → 7720 (R55; 7720 done 2026-11-12, 8527 and 8528 `pending` on 2026-11-13). R33 (β 9133), R34 (δ 9127), R50 (ε 9149). 6575 and 6576 cancelled and 6242 amended by the clerk pass 2026-11-11. Lead action open: file the reify-side change removing the `speculation_probe` stanza from reify's live yaml before β deploys (β's reify external dependency awaits that id). |
+| S8 harness-composition-root-and-slot-registry (wave 2; Streams table: spawn, wave 2, high-risk; upstream S5, S9, S3) | plans/review-all-s8-harness-composition-root-and-slot-registry-prd.md | 22 leaves, ids 9212–9236 (not contiguous; the nine streams were filed in parallel), all pending 2026-11-11: η 9212, α 9216, β0 9217, β 9218, δ 9219 (high), γ 9220 (low), ε1a 9221, ε1b 9222, ε2a 9223 (high), ε2b 9224 (high), ε3 9225, ζ1a 9226, ζ1b 9227, ζ2 9228, θ 9229, ι 9230, ι2 9231, κ1 9232 (low), κ2 9233, μ1 9234 (low), μ2 9235 (low), ω 9236 | 6698 → 9219, 9223, 9224 | none held. fk-b01dac97e6e9 is `fixed:730794ca3b` (task 4686, `PauseClass`; the residual memory/disk divergence is owned by live task 4691); fk-5cad48d24b6f's legality half was a false premise at as_of, its recovery half lands in δ 9219. R35 (θ 9229), R36 (ι 9230, ι2 9231), R37 (η 9212, δ 9219), R38 (β 9218 → 8270), R57 (β0 9217). 4651 → ε2a 9223, and 4651's parking edge on 5040 removed. 3566 cancelled and 5822 amended by the clerk pass 2026-11-11. Lead action open: the eight yaml edits after 9212 deploys (R37). The edge 5153 → α 9216 is NOT wired (5153 has no dependency on 2026-11-11) and awaits Leo's yes. (Later 2026-11-11: Leo said yes, R59; 9216 depends on 5153, both `pending` on 2026-11-13.) Integration gate / signal leaf ω 9236. No invariant. |
+| S9 workflow-phase-spine-and-recovery-ledger (wave 2; Streams table: spawn, wave 2, high-risk; upstream S10, S4) | plans/review-all-s9-workflow-phase-spine-and-recovery-ledger-prd.md | 21 leaves, ids 9164–9289 (not contiguous; the nine streams were filed in parallel), all pending 2026-11-11: π 9164 (high), α 9170 (high), β 9175 (high), γ 9178, δ 9184 (high), ε 9190 (high), ζ1 9196, ζ2 9202, η 9207 (high), θ 9213, ι 9239, κ 9241 (high), λ1 9246 (high), λ2 9249 (high), μ1 9253, μ2 9279, μ3 9281, ν 9284 (high), ξ 9287, ο 9288, ω 9289 | 6698 → 9164, 9170, 9175, 9184, 9190, 9207, 9241, 9246, 9249, 9284 | none held. π 9164 (the L0 settle check script, R40) is high and first; ε 9190 depends on it. NOT FILED: the 14-day L0 check, filed by the lead once 9164 is on main (R40, R58); the S9-5 periodic landed-journal pass is a program follow-up (R39). Existing-task edges include 7052 → α, 7054 → β, κ → 7054; 7115 cancelled. At `commit_planning` eleven substrate checks (π 9164 `escalation-archive-substrate` among them) were refused as `vacuous_present` (already true on main) and not copied into task metadata, by design; every id is stamped and all producer checks were copied. δ 9184 onward waits on 5040 through S5 (R54). Integration gate / signal leaf ω 9289. No invariant. |
+| S10 task-write-contract-metadata-modes-success-signal-and-registry (wave 2; Streams table: spawn, wave 2, high-risk) | plans/review-all-s10-task-write-contract-metadata-modes-success-signal-and-registry-prd.md | 21 leaves, ids 9180–9286 (not contiguous; the nine streams were filed in parallel), all pending 2026-11-11: α 9180 (high), β1 9187 (high), β2 9191 (high), γ 9195 (high), π 9199, δ 9204, ε 9209, ζ 9214, ρ 9237, η 9240 (high), θ 9242 (high), ι 9244, κ1 9248, κ2 9251, λ 9254, μ1 9278, μ2 9280, ν 9282, ξ 9283, ο 9285, ω 9286 (high) | 6698 → 9180, 9187, 9191, 9195, 9240, 9242, 9286 | none held. θ 9242 mints INV-16 `metadata-slices-one-table` (R51). α 9180 → 4867 (hand-carried, R47; 4867 done 2026-11-11); ν 9282 → 6236 (R53). R41 (κ1 9248), R42 (δ 9204, ε 9209), R43 (λ 9254), R44 (ζ 9214, ρ 9237). 3260 is amended (clerk pass 2026-11-11) and waits on ο 9285 and ξ 9283 (R48 S10-4). NOT FILED: σ, the 30-day combine-collision check, filed by the lead once ρ 9237 is on main (R44, R58). S14 ξ 6719 amended to import `error_envelope` and 6236 amended to extraction only (clerk pass 2026-11-11). Lead actions open: the three-row `files_to_modify` backfill after δ deploys (R42); the optional low curator-field rename. β1 9187 also carries fk-5c98cc0bb7e0 in metadata only. Integration gate / signal leaf ω 9286. |
+| S12 reconciliation-run-lifecycle-and-stage-interface (spawn, wave 3; upstream S14) | plans/review-all-s12-reconciliation-run-lifecycle-and-stage-interface-prd.md | 17 leaves, ids 9729–9880 (not contiguous; the eleven streams were filed in parallel), all pending 2026-11-13: α 9729, β1 9757, β2 9762 (high), γ0 9788, γ1 9796, γ2 9803, δ 9813 (high), ι1 9844 (high), ε 9851, ζ 9858, κ1 9862, κ2 9866, ι2 9869, η1 9873, η2 9876, θ 9877, ω 9880 | 6698 → 9762, 9813, 9844 | none held. R65 (δ 9813: the stage identity and run-id refusal and the prompt-and-skill sweep; δ waits on 9282 and S15 α 9823, and S15 δ 9832 and ε1 9827 wait on δ). ε 9851 waits on S1 ι1 9797 and S1 ω waits on ε (S12/OQ-7); γ0, γ1, ε, κ2 wait on S13 ι 9743 (S12/OQ-8). κ2 9866 carries the INV-12 ratification row `inv12-recon-hazard-gate-raw-backend` (S12/OQ-9, lead, flagged). Task 6695 (in-progress) stamped with fk-0485729893fe; β1 9757 depends on it and on 9655. fk-37356472614a is `fixed:f600f869db`. Priority inversion recorded, no override: β2, δ, ι1 (high) wait on low 7876 and others through the run chain. Lead actions: cancels 5912, 6783, 7343, 8835, 7604, 6895; 6694 to close as found on main. Four substrate checks `vacuous_present`, by design. No invariant. Integration leaf ω 9880. |
+| S13 recon-sweeps-flag-identity-and-recon-report-state (spawn, wave 3; upstream S14, S12) | plans/review-all-s13-recon-sweeps-flag-identity-and-recon-report-state-prd.md | 21 leaves, ids 9732–9752 (not contiguous; the eleven streams were filed in parallel), all pending 2026-11-13: α 9732 (high), β 9733, γ 9734, δ1 9735, δ2 9736, ε 9737, ζ 9738 (high), η 9739, θ1 9740, θ2 9741, θ3 9742, ι 9743, κ1 9744 (high), κ2 9745 (high), κ3 9746 (high), ν 9747 (high), λ 9748 (low), μ 9749, ξ 9750, π 9751, ω 9752 | 6698 → 9732, 9738, 9744, 9745, 9746, 9747 | none held. Acceptance record 9753 (fk-9b76dd8a1cdb; filed, cancelled with `x_acceptance_reason`; R66). R66 (η 9739), R67 (ε 9737, π 9751), R65 (ξ 9750 refuses a mismatching `run_id`), R92 (κ1 9744, κ2 9745, κ3 9746 delete the dormant Mem0 relay). NOT FILED: ρ, the recurring category-candidate chain, filed by the lead once π is on main (R67). ι 9743 and δ2 9736 take no edge on 9180 (R87). The recall design session is spawned outside the plan (R66); xref only. Lead actions: cancels 7388, 5996, 6846, 7807, 7065, 6843; amends 7941, 6599, 7086; notes on 6719, 5270, 4011, 5154, 3498. No invariant. Integration leaf ω 9752. |
+| S15 fused-memory-mcp-server-boundary (spawn, wave 3) | plans/review-all-s15-fused-memory-mcp-server-boundary-prd.md | 20 leaves, ids 9821–9840 (not contiguous; the eleven streams were filed in parallel), all pending 2026-11-13: κ 9821, α0 9822, α 9823 (low), ζ 9824, β0 9825, β 9826, ε1 9827, ε2 9828, ε3 9829, ε4 9830, ε5 9831, δ 9832 (low), γ 9833 (high), ι 9834, λ 9835 (low), θ1 9836, θ2 9837, η 9838, σ 9839, ω 9840 | 6698 → 9833 | none held. R68 (ζ 9824, after task 9493, which is done, so no edge), R69 (σ 9839; fk-05a87fd1777d stamped on 9147, which is amended), R65 (the tool-family moves ε1–ε5 carry `search`'s exclusion), S15/OQ-11 (ε1 9827 and δ 9832 wait on S12 δ 9813), S15/OQ-8 (κ 9821, the dashboard read model, first after 9280 and S19 α). Lead actions: cancels 4469, 5511, 6235, 4044; amends 9147, 5270, 5071, 8804, 5717, 6295; after each move lands (ε1–ε5, β0, θ1, θ2, η) the clerk repaths live tasks' files. Five substrate checks `vacuous_present`, by design. No invariant. Integration leaf ω 9840. |
+| S16 orchestrator-config-shape-defaults-and-routing (spawn, wave 3) | plans/review-all-s16-orchestrator-config-shape-defaults-and-routing-prd.md | 28 leaves, ids 9689–9721 (not contiguous; the eleven streams were filed in parallel), all pending 2026-11-13: β0 9689, γ0 9690, α 9691, ι 9692, β2 9693 (low), β1 9694, γ1 9695, γ2 9696, δ 9697, ε1 9698, ε2a 9699, ε2b 9700, η 9701 (low), ζ1 9702, ζ2 9703, ζ3 9704, ζ4a 9705, ζ6a 9706, ζ6b 9707, ζ4b 9708, ζ5a 9709, ζ5b 9710, κ 9711, χ 9712, σ 9718, ξ 9719, π 9720 (low), ω 9721 | none (no high leaves) | none held; no high leaf, so no 6698 edge. ι 9692 mints INV-22 `config-default-one-home` (R88; it depends on 9154 for the shared invariant files). R70 (κ 9711, χ 9712 the pre-authorised-spawn mechanism, σ 9718 the yaml-sweep gate with a 72-hour delayed milestone, ξ 9719 the refusal), R75 (π 9720 one Fable id; 5407 cancelled into it), R78 (ζ1 9702 carries `fused_memory_restart_min_interval_secs`), R92 (ε1 9698, the judge CLI-only). Parked on 8528: ζ4b 9708, ζ5a 9709, ζ5b 9710 (R85). 60 lead actions: cancels 3038, 4602, 5407, 8405; 24 same-region edges returned unwired for the lead's cycle check (all present in the store at the clerk pass, `clerk/clerk-w3-B.json`); amends of the pending tasks declaring `defaults.yaml` (47 on 2026-11-13) to edit field defaults instead; delivered-check widenings on 9229, 3792, 8143, 8452, 8373, 3587 and 8528. Integration leaf ω 9721. |
+| S17 scheduler-seams-and-tick-state (spawn, wave 3; upstream S14, S8) | plans/review-all-s17-scheduler-seams-and-tick-state-prd.md | 22 leaves, ids 9664–9685 (not contiguous; the eleven streams were filed in parallel), all pending 2026-11-13: α0 9664 (low), β 9665 (high), ι1 9666 (high), ι2 9667 (high), ι3 9668 (high), ξ1 9669, ξ2 9670, α 9671 (low), ζ 9672 (high), ζ2 9673 (low), γ 9674 (high), δ1 9675, δ2 9676 (high), λ 9677 (low), ε 9678, η 9679, θ 9680, κ1 9681, κ2 9682, ω 9683 (high), μ 9684 (low), ν 9685 | 6698 → 9665, 9666, 9667, 9668, 9672, 9674, 9676, 9683 | none held. ν 9685 mints INV-23 `one-decision-partition-per-area`, last (R79, R88). R71 (ζ 9672 deletes the scheduler's stranded-blocked step; existing task 4082 carries the recovery rows and waits on 9219, 9223, 9229, 9231, 9232; 9219 amended; 9529 cancelled), R72 (δ2 9676; λ 9677, the low phase-time alarm). The scheduler.py chain (β, α, ζ, γ, δ1, δ2, λ, ε, η, θ, κ1) ends behind S8 9234, which waits on 5040; off it: α0 9664, ξ1 9669 and ξ2 9670 (behind 8528 through 9191), μ 9684. Lead actions: cancels 8356, 7627, 9529, 6143; amends 4082, 6035, 9219, 8778. Its xref on the scheduler's task-store client partition is open (Program status). Seven substrate checks `vacuous_present`, by design. Integration leaf ω 9683. |
+| S19 package-layering-and-private-seams (spawn, wave 3; upstream S14) | plans/review-all-s19-package-layering-and-private-seams-prd.md | 17 leaves, ids 9767–9784 (not contiguous; the eleven streams were filed in parallel), all pending 2026-11-13: α 9767, β1 9768, β2 9770, γ 9771, δ 9772, ε 9773, ζ 9774, η1 9775, η2 9776, θ0 9777, θ1 9778, θ2 9779, λ 9780, ν 9781, ι 9782 (low), κ1 9783, κ2 9784 (low) | none (no high leaves) | none held; no high leaf, so no 6698 edge; its operator gate λ 9780 depends ON 6698 and on θ2 9779 (R73). Acceptance record 9794 (the polled-join arm of fk-e8c835c3f412; filed, cancelled, no `x_finding_key`, names λ). ε 9773 mints INV-18 `fused-memory-subpackage-dag` (R88). R74 (ν 9781), R92 (θ0 9777 `shared/escalation_layout.py`; R17's order clause). The 24-hour hand-carry trigger covers α, β1, β2, γ, δ, η1, θ1, κ1 (R87); α 9767 declares 158 files (at `565d15a06f`). fk-e22732500172 is `filed:6615` plus ν (6615 stamped). Lead actions: cancels 6955, 9100, 5983, 7444, 5768, 7434; amends 6179 (stamped fk-cfcf00669c46), 7902, 5345, 6918; the clerk repaths live tasks' files as each move lands. |
+| S20 cli-invocation-and-usage-gate (spawn, wave 3; upstream S16) | plans/review-all-s20-cli-invocation-and-usage-gate-prd.md | 22 leaves, ids 9756–9898 (not contiguous; the eleven streams were filed in parallel), all pending 2026-11-13: α 9756, β 9761, γ 9787, δ 9793, ε 9804, ζ 9812, η 9846 (high), θ 9850, ι 9857 (high), κ1 9860 (high), κ2 9863 (high), ξ1 9870, ξ2 9872, ξ3 9875, ξ4 9878, λ 9882 (low), μ 9883 (low), π 9890 (low), ν 9891 (low), ο1 9893, ο2 9896 (high), ο3 9898 (high) | 6698 → 9846, 9857, 9860, 9863, 9896, 9898 | none held; RELEASED S25 ι 6764 onto α 9756 (contract C3 as delivered: public `SIDECAR_SUFFIX`, `sidecar_for` returning a root-relative path or None, `ManifestDiscoveryUnavailable`, `tracked_sidecar_paths` raising on failure; `pending` 2026-11-13; 6764 also depends on 9240, and 7724 still depends on 6764). Acceptance record ω 9900 (fk-49b55c1270ae; filed, cancelled; R75). R75 (π 9890, low: the structured cap field), S20/OQ-8 (η 9846: a non-Claude call gets an account-less slot; 6994 cancelled into η). η's three one-line test edits take no edge (R87). Lead actions: cancels 7084, 6930, 6996, 7334, 6729, 6994, 8234, 7376; amend 5727; 6605 found done. Three substrate checks `vacuous_present`, by design. No invariant. |
+| S22 dashboard-readers-and-aggregation (agent, wave 1 in the Streams table; not in R21/R24's wave-1 six; filed with wave 3; upstream S15, S14) | plans/review-all-s22-dashboard-readers-and-aggregation-prd.md | 33 leaves, ids 9766–9903 (not contiguous; the eleven streams were filed in parallel), all pending 2026-11-13: α 9766, β 9800, γ1 9791, γ2 9802 (high), δ1 9807 (high), δ2 9816, ε 9818, ζ 9820 (high), η 9847, θ 9852 (high), ι 9853, κ 9859, λ 9864, μ 9865, ν 9868, ξ1 9871, ξ2 9874 (high), ο 9892, π1 9879, π2 9881, π3 9884, π4 9885, π5 9886, π6 9887, π7 9888, π8 9889, ρ1 9894, ρ2 9895, ρ3 9897, σ 9899, τ 9901, υ 9902, ω 9903 (high) | 6698 → 9802, 9807, 9820, 9852, 9874, 9903 | none held. R76 (ο 9892 the guard; π1 9879, π2 9881, π3 9884, π4 9885, π5 9886, π6 9887, π7 9888 the conversions; π8 9889 the cleanup). Signal leaves ω 9903 and π8 9889. Edges onto the instruments-honesty and quality-dashboard tasks 8559, 8563, 8465 wired. fk-389c36ad02d1 is `fixed:7fc275667e`; fk-8dfa5e5a75aa is `fixed:c3ed0f677b` (residue owned by 5717 and 3396). 57 lead actions: cancels 6872, 8119, 7628, 7503, 6842, 6875, 8700, 7815 and the R76 set; amends of the 22 tasks named by the event and outcome vocabulary move (S22-1) and of the six feature tasks; housekeeping notes on 4406 and 5108. Seven substrate checks `vacuous_present`, by design. No invariant. |
+| S24 fleet-watchdog-and-redeploy-coordination (spawn, wave 3; upstream S14) | plans/review-all-s24-fleet-watchdog-and-redeploy-coordination-prd.md | 13 leaves, ids 9728–9867 (not contiguous; the eleven streams were filed in parallel), all pending 2026-11-13: α 9728 (low), γ 9754 (high), ζ 9764, β 9786 (high), ι 9795, η 9801, δ1 9805 (high), δ2a 9815 (high), δ2b 9842 (high), δ3 9848 (high), ε 9854 (high), θ 9861 (low), ω 9867 | 6698 → 9754, 9786, 9805, 9815, 9842, 9848, 9854 | none held. R77 (ε 9854), R78 (ζ 9764; θ 9861 depends on 9521, ζ and ι), R90 (ι 9795), R74 (γ 9754 imports `pid_alive` and deletes the watchdog copy). Operator step after η 9801 lands: install the known-project-roots drop-in (R92). γ's transition residual: until the next fleet redeploy a coordinator fire into a live sweep is refused with exit 75 (one 72 h window). Lead actions: cancels 5719, 6543, 5700, 4253, 8362, 9389; amends 7517, 7310, 7139, 7314, 7307, 8295, 9383, 4681, 7444; 9321 is cancelled if still unclaimed when δ2a 9815 is claimed. Priority inversion α (low) and ζ, ι, η (medium) ahead of high leaves recorded, no override. No invariant. Integration leaf ω 9867. |
+| S26 memory-service-write-path-and-graph-client (wave 2; Streams table: spawn, wave 2, high-risk) | plans/review-all-s26-memory-service-write-path-and-graph-client-prd.md | 23 leaves, ids 9143–9252 (not contiguous; the nine streams were filed in parallel), all pending 2026-11-11: α 9143, β 9147, γ0 9151, γ 9158, δ 9161, ε 9168 (high), ζ 9172, η 9174, θ 9179 (high), θ2 9183, ι 9185, κ 9189, λ 9194 (high), σ 9198 (high), μ 9203, ν 9208, ξ 9215 (high), ο 9238, ρ 9243, τ 9245, υ 9247, π 9250, φ 9252 (low) | 6698 → 9168, 9179, 9194, 9198, 9215 | none held. σ 9198 is the deterministic, always-escalating human design-session gate (R46; `files: []`), pointing at `plans/fm-cross-process-identity-exclusion-session-brief.md`, which goes into the wave-2 commit; it depends on λ 9194 only. R45 (ρ 9243, τ 9245, υ 9247, φ 9252), R56 (θ 9179 → 7743). 5612 cancelled into ξ 9215 by the clerk pass 2026-11-11 (its branch `task/5612`, 54 commits ahead of main, is set aside under the S26-6 ruling); 6293 → σ, ν; 6730 does not depend on σ. ε 9168 also carries fk-ec3de5b6cf2b (6601) in metadata. At `commit_planning` seven substrate checks (β 9147 `mem0-reading-exists` among them) were refused as `vacuous_present` (already true on main) and not copied into task metadata; every id is stamped. Integration gate π 9250. No invariant. |

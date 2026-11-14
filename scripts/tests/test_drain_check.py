@@ -13,8 +13,12 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 from drain_check import classify, heartbeat_path, resolve_fleet_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 FRESH_WINDOW = 120.0
 NOW = 1_000_000.0
@@ -154,6 +158,7 @@ def test_classify_reads_the_orchestrators_own_drain_heartbeat():
         return build_heartbeat_payload(
             unit='u', merge_idle=False, depth=3, queue_empty=False, ts_epoch=now,
             drain=drain, verifies_in_flight=verifies,
+            deployed_sha=None,
         )
 
     def verify(deadline_ts):

@@ -377,3 +377,23 @@ class TestApplyIsolatedEnvNeutralizesAmbientFusedMemoryUrls:
             f'{client.app.state.config.fused_memory_urls} — the suite is fanning '
             f'out somewhere other than the measured-dead endpoint'
         )
+
+
+class TestFunctionScopedClientsRunWithoutSamplers:
+    """The burndown/metrics samplers discover roots by a ``ps aux`` scan.
+
+    That scan (dashboard/src/dashboard/data/orchestrator.py::find_running_orchestrators)
+    reaches the operator's real roots and no env var can isolate it, so the
+    function-scoped request clients do not run the samplers at all (task 5826).
+    """
+
+    def test_client_fixture_lifespan_has_samplers_off(self, client):
+        assert client.app.state.config.samplers_enabled is False
+
+    def test_two_url_client_fixture_lifespan_has_samplers_off(self, two_url_client):
+        assert two_url_client.app.state.config.samplers_enabled is False
+
+    def test_samplers_off_fixture_sets_the_switch(self, samplers_off):
+        from dashboard.config import DashboardConfig
+
+        assert DashboardConfig.from_env().samplers_enabled is False

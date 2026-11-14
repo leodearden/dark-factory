@@ -164,8 +164,7 @@ class TestFetchStatusesPaging:
         full count would skip the clipped entries and then terminate normally.
         A page that under-reports would re-read entries already held. Neither
         can be detected afterwards, so the read is refused: the caller gets
-        the offline marker, never a short map. ``_walk_pages`` performs the
-        same check on the ``get_tasks`` envelope.
+        the offline marker, never a short map.
         """
         from dashboard.data.tasks import fetch_statuses
 
@@ -195,8 +194,7 @@ class TestFetchStatusesPaging:
 
         An entry whose id is not an integer is dropped from the map. Counting
         only the parsed entries against ``returned`` would turn that one entry
-        into an offline marker for the whole project. ``_walk_pages`` draws
-        the same line with ``_Page.delivered``.
+        into an offline marker for the whole project.
         """
         from dashboard.data.tasks import fetch_statuses
 

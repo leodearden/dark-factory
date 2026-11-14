@@ -32,21 +32,18 @@ from test_verify_merge_flake_suppression import _module_config
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.merge_lane import MergeOutcome
-from orchestrator.merge_lane.worker import enqueue_merge_request, select_recovery_winner
-from orchestrator.merge_queue import (
-    GroupMergeRequest,
-    MergeRequest,
-    patch_content_contained,
-)
+from orchestrator.merge_lane.intake import enqueue_merge_request
 
 # Import the module under test — will fail (ImportError) until step-2 creates it.
-from orchestrator.merge_queue_store import (
+from orchestrator.merge_lane.queue_store import (
     MergeQueueStore,
     PersistedMergeRequest,
     reconstruct_merge_request,
     recover_pending_merges,
 )
-from orchestrator.merge_types import InFlightMergeRegistry, QueuedBranch
+from orchestrator.merge_lane.tip_relation import select_recovery_winner
+from orchestrator.merge_lane.types import InFlightMergeRegistry, QueuedBranch
+from orchestrator.merge_lane.worker import GroupMergeRequest, MergeRequest, patch_content_contained
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -1945,7 +1942,7 @@ class TestUnrecoverableModuleSetStaysLoudAcrossRestarts:
     THE FAILURE THIS PINS.  A legacy record with nothing to re-derive from
     reconstructs to ``[]`` with the loud "unrecoverable" WARNING.  The
     recovered request is then re-journaled by
-    ``SpeculativeMergeWorker._buffer_owned_request``.  If that write persisted
+    ``MergeIntake.buffer_owned_request``.  If that write persisted
     a plain ``[]``, the NEXT crash+recovery would take the "task genuinely had
     no assigned modules" early-return and say NOTHING — so a request still
     verifying narrower than its original goes silent from the second restart
@@ -1958,7 +1955,7 @@ class TestUnrecoverableModuleSetStaysLoudAcrossRestarts:
     ) -> tuple[MergeRequest, MergeQueueStore]:
         """One full crash-recovery cycle: read the journal, reconstruct, and
         re-journal the recovered request exactly as the worker's
-        ``_buffer_owned_request`` does."""
+        ``buffer_owned_request`` does."""
         store = MergeQueueStore(store_path)
         [record] = store.load()
         req = reconstruct_merge_request(record, config)

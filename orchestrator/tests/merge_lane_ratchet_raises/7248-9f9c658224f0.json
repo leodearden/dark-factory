@@ -1,0 +1,60 @@
+{
+  "task_id": "7248",
+  "reason": "net-additive: same-tree history-leg arm in gates.py::_decide_reverify_gate/_reverify_rebased_tree, the same_tree_history_leg/history_leg vocabulary, and the new merge_lane/history_leg.py that runs the declared leg",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 345,
+      "current": 353
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_decide_reverify_gate",
+      "baseline": 5,
+      "current": 7
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_reverify_rebased_tree",
+      "baseline": 2,
+      "current": 6
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 3584,
+      "current": 3606
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py",
+      "baseline": 120,
+      "current": 125
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 1616,
+      "current": 1622
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4988,
+      "current": 5000
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58604,
+      "current": 58701
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31933,
+      "current": 31957
+    }
+  ]
+}

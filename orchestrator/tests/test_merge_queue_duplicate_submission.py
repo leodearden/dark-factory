@@ -1,5 +1,5 @@
 """Tests making the two hardcoded-from_state ItemLifecycle hops
-(``_buffer_owned_request``'s QUEUED->LANE_BUFFERED and
+(``buffer_owned_request``'s QUEUED->LANE_BUFFERED and
 ``_finalize_inflight``'s VERIFYING->FINALIZING) re-entry-tolerant, so a
 duplicate/re-entrant submission coalesces as a benign no-op instead of
 firing a ``merge_lifecycle_transition_rejected`` escalation (task 2852;
@@ -7,7 +7,7 @@ SHARPER RCA, reify cluster mr-8cafbaf0 / mr-99585bb8 / original incident
 mr-c69ca480).
 
 Both offender sites hardcode the transition's ``from_state`` instead of
-reading the :class:`~orchestrator.merge_queue.ItemLifecycle` registry's
+reading the :class:`~orchestrator.merge_lane.worker.ItemLifecycle` registry's
 CURRENT state first (the pattern already used by ``_note_requeue``) — so a
 duplicate/re-entrant driver that touches a request_id already deep in the
 pipeline gets an illegal-edge rejection (non-corrupting, but persistently
@@ -20,12 +20,12 @@ Steps covered:
   step-3  impl  — _finalize_inflight wired through _advance_if_at (no new
                   test here — proven by step-1(b) at the exact seam; normal-
                   path firing regression-covered by test_merge_speculation.py)
-  step-4  RED   — _buffer_owned_request twin-drain repro (headline incident)
-  step-5  GREEN — _buffer_owned_request restructured + _coalesce_reentrant_drain
+  step-4  RED   — buffer_owned_request twin-drain repro (headline incident)
+  step-5  GREEN — buffer_owned_request restructured + the intake's re-entrant coalesce
                   (drop-only)
   step-6  RED   — fresh/requeue regressions + twin-future-resolved +
                   observability
-  step-7  GREEN — _coalesce_reentrant_drain resolves the twin's future +
+  step-7  GREEN — the intake's re-entrant coalesce resolves the twin's future +
                   emits a merge_coalesced event
 
 Amendment (reviewer_comprehensive, task 2852): ``_advance_if_at`` gained a
@@ -39,7 +39,7 @@ coalesced upstream of ``_finalize_inflight`` entirely, so that method's own
 downstream hardcoded-from_state hops are never reached by this incident
 class (``test_twin_drain_at_finalizing_state_never_reaches_finalize_inflight``).
 
-This module imports orchestrator.merge_queue LOCALLY inside each test
+This module imports orchestrator.merge_lane.worker LOCALLY inside each test
 method (not at module scope) so a not-yet-implemented symbol (e.g.
 ``_advance_if_at``, before step-2) never breaks collection of the rest of
 the file during the RED steps — mirrors
@@ -56,10 +56,12 @@ from unittest.mock import MagicMock
 
 import pytest
 from _merge_lane_census import census_for
+from _merge_lane_fakes import lane_scene_config
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_types import MergeRequest, QueuedBranch
+from orchestrator.merge_lane.intake import MERGE_LANES
+from orchestrator.merge_lane.types import MergeRequest, QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures + helpers (per-file duplication convention — copied from
@@ -104,7 +106,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 class _FakeEscalationQueue:
@@ -140,7 +142,7 @@ def _make_worker(git_ops: GitOps, *, escalation_queue: Any = None, event_store: 
     extended with an optional ``event_store`` passthrough for the
     observability test (step-6(d) / step-7).
     """
-    from orchestrator.merge_queue import SpeculativeMergeWorker
+    from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
     return SpeculativeMergeWorker(
         git_ops, asyncio.Queue(), event_store=event_store, escalation_queue=escalation_queue,
@@ -203,7 +205,7 @@ class TestAdvanceIfAt:
     async def test_fires_when_current_matches_from_state(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
@@ -237,7 +239,7 @@ class TestAdvanceIfAt:
         longer unconditionally tolerated (see
         ``TestAdvanceIfAtToleratesOnlyNamedStates`` below).
         """
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
@@ -245,7 +247,7 @@ class TestAdvanceIfAt:
         rid = entry.request_id
         worker._register_item(entry, initial=ItemLifecycleState.FINALIZING)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = worker._advance_if_at(
                 rid, ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING,
                 live_obj=entry,
@@ -289,7 +291,7 @@ class TestAdvanceIfAtToleratesOnlyNamedStates:
         the entry has not even reached verify yet. Must escalate exactly
         like the pre-``_advance_if_at`` hardcoded call would have.
         """
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
@@ -320,12 +322,12 @@ class TestAdvanceIfAtToleratesOnlyNamedStates:
     async def test_off_path_current_with_no_tolerate_argument_still_escalates(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        """Default ``tolerate=frozenset()`` (the ``_buffer_owned_request``
+        """Default ``tolerate=frozenset()`` (the ``buffer_owned_request``
         call site never passes ``tolerate`` — its own pre-branching already
         guarantees ``current == QUEUED``) keeps the strict pre-existing
         behavior: ANY mismatch escalates.
         """
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
@@ -352,7 +354,7 @@ class TestAdvanceIfAtToleratesOnlyNamedStates:
         must ALSO coalesce as a benign no-op — proving ``tolerate`` is a
         real set, not just a single-value special case.
         """
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
@@ -360,7 +362,7 @@ class TestAdvanceIfAtToleratesOnlyNamedStates:
         rid = entry.request_id
         worker._register_item(entry, initial=ItemLifecycleState.MERGING)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'):
             result = worker._advance_if_at(
                 rid, ItemLifecycleState.VERIFYING, ItemLifecycleState.FINALIZING,
                 live_obj=entry,
@@ -383,14 +385,14 @@ class TestAdvanceIfAtToleratesOnlyNamedStates:
 
 
 # ---------------------------------------------------------------------------
-# step-4 RED / step-5 GREEN: _buffer_owned_request duplicate/twin-drain
+# step-4 RED / step-5 GREEN: buffer_owned_request duplicate/twin-drain
 # (SHARPER-RCA offender #2 + original incident mr-c69ca480)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 class TestBufferOwnedRequestDuplicateDrain:
-    """``_buffer_owned_request`` (SHARPER-RCA offender #2, mr-8cafbaf0 — and
+    """``buffer_owned_request`` (SHARPER-RCA offender #2, mr-8cafbaf0 — and
     the original incident mr-c69ca480): draining a DISTINCT ``MergeRequest``
     object that shares its request_id with an item already live in the
     registry at a non-QUEUED state (e.g. VERIFYING) is a duplicate/re-entrant
@@ -399,14 +401,14 @@ class TestBufferOwnedRequestDuplicateDrain:
     benign no-op: no escalation, no divergent second pipeline item buffered
     under the shared request_id, and the live original left untouched.
 
-    RED until step-5 GREEN restructures ``_buffer_owned_request`` with the
-    registry-state three-way discrimination + ``_coalesce_reentrant_drain``.
+    RED until step-5 GREEN restructures ``buffer_owned_request`` with the
+    registry-state three-way discrimination + ``the intake's re-entrant coalesce``.
     """
 
     async def test_twin_drain_does_not_escalate_or_buffer_and_leaves_original_live(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
@@ -420,7 +422,7 @@ class TestBufferOwnedRequestDuplicateDrain:
         )
         assert twin is not original, 'twin must be a DISTINCT object sharing the request_id'
 
-        worker._buffer_owned_request(twin)
+        worker._intake.buffer_owned_request(twin)
 
         assert fake_eq.submitted == [], (
             f'a recognized duplicate/re-entrant drain must not escalate: {fake_eq.submitted!r}'
@@ -449,7 +451,7 @@ class TestBufferOwnedRequestDuplicateDrain:
         wiring for THIS incident class: there is no second entry object left
         to drive them re-entrantly once the twin is coalesced here.
         """
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
@@ -462,7 +464,7 @@ class TestBufferOwnedRequestDuplicateDrain:
             'mr-twin-finalizing', 'mr-twin-finalizing-branch', tmp_path, config, request_id=rid,
         )
 
-        worker._buffer_owned_request(twin)
+        worker._intake.buffer_owned_request(twin)
 
         assert fake_eq.submitted == [], (
             f'a duplicate drain onto an already-FINALIZING request_id must not '
@@ -483,7 +485,7 @@ class TestBufferOwnedRequestDuplicateDrain:
 # ---------------------------------------------------------------------------
 # step-6 RED (twin-future-resolved / observability) + regression guards
 # (fresh-path / legit-requeue) — step-7 GREEN extends
-# _coalesce_reentrant_drain to resolve the twin's future + emit
+# the intake's re-entrant coalesce to resolve the twin's future + emit
 # merge_coalesced.
 # ---------------------------------------------------------------------------
 
@@ -503,7 +505,7 @@ class _FakeEventStore:
 @pytest.mark.asyncio
 class TestBufferOwnedRequestFreshAndRequeueRegression:
     """Regression guards proving the fresh-request and legit-requeue paths
-    through the step-5-restructured ``_buffer_owned_request`` still behave
+    through the step-5-restructured ``buffer_owned_request`` still behave
     exactly as before (task 2852 step-6(a)/(b)) — only the NEW
     already-advanced-past-QUEUED branch changed. Both pass immediately
     after step-5 (no RED here).
@@ -512,17 +514,17 @@ class TestBufferOwnedRequestFreshAndRequeueRegression:
     async def test_fresh_request_still_buffers_and_advances_to_lane_buffered(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
         req = _make_request('fresh-task', 'fresh-branch', tmp_path, config)
         rid = req.request_id
 
-        worker._buffer_owned_request(req)
+        worker._intake.buffer_owned_request(req)
 
         assert worker._lifecycle.current(rid) == ItemLifecycleState.LANE_BUFFERED
-        assert any(req in buf for buf in worker._lane_buffers.values()), (
+        assert any(req in worker._intake.buffered(lane) for lane in MERGE_LANES), (
             'fresh request must be appended to its lane buffer'
         )
         assert fake_eq.submitted == []
@@ -533,9 +535,9 @@ class TestBufferOwnedRequestFreshAndRequeueRegression:
         """Mirrors test_merge_queue_lifecycle_registry.py:602-638's
         legit-requeue re-drain: the SAME object left registered at QUEUED
         (as ``_note_requeue`` leaves it) re-drains through
-        ``_buffer_owned_request`` without being dropped as a duplicate.
+        ``buffer_owned_request`` without being dropped as a duplicate.
         """
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
@@ -543,7 +545,7 @@ class TestBufferOwnedRequestFreshAndRequeueRegression:
         rid = req.request_id
         worker._register_item(req, initial=ItemLifecycleState.QUEUED)
 
-        worker._buffer_owned_request(req)
+        worker._intake.buffer_owned_request(req)
 
         assert worker._lifecycle.current(rid) == ItemLifecycleState.LANE_BUFFERED
         assert worker._live_items[rid] is req, 'the same object must not be dropped'
@@ -557,14 +559,14 @@ class TestCoalescedTwinFutureAndObservability:
     ``merge_coalesced`` observability event is emitted (task 2852
     step-6/step-7).
 
-    RED until step-7 GREEN extends ``_coalesce_reentrant_drain`` — the
+    RED until step-7 GREEN extends ``the intake's re-entrant coalesce`` — the
     step-5 drop-only version resolves no future and emits no event.
     """
 
     async def test_twin_future_resolved_to_already_merged(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
@@ -575,7 +577,7 @@ class TestCoalescedTwinFutureAndObservability:
             'twin-future-task', 'twin-future-branch', tmp_path, config, request_id=rid,
         )
 
-        worker._buffer_owned_request(twin)
+        worker._intake.buffer_owned_request(twin)
 
         assert twin.result.done(), 'no (hypothetical) waiter on the twin future may hang'
         assert twin.result.result().status == 'already_merged'
@@ -584,7 +586,7 @@ class TestCoalescedTwinFutureAndObservability:
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
         from orchestrator.event_store import EventType
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         fake_es = _FakeEventStore()
@@ -596,7 +598,7 @@ class TestCoalescedTwinFutureAndObservability:
             'twin-event-task', 'twin-event-branch', tmp_path, config, request_id=rid,
         )
 
-        worker._buffer_owned_request(twin)
+        worker._intake.buffer_owned_request(twin)
 
         coalesced = [e for e in fake_es.emitted if e['event_type'] == EventType.merge_coalesced]
         assert len(coalesced) == 1, (
@@ -610,7 +612,7 @@ class TestCoalescedTwinFutureAndObservability:
 # task 3082 step-7 RED / step-8 GREEN: the coalesce must never fabricate
 # success for a SELF-requeue.
 #
-# `_coalesce_reentrant_drain` resolves the drained item's future to
+# `the intake's re-entrant coalesce` resolves the drained item's future to
 # `already_merged` UNCONDITIONALLY. That is genuinely benign for the task-2852
 # journal-recovery TWIN (a DISTINCT object with a fresh, unobserved future), but
 # when the arriving item IS the live original — a requeue-wiring bug — it hands a
@@ -646,7 +648,7 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
         Mirrors the operator-halt item built in
         test_merge_queue_lifecycle_registry.py's requeue-pairing test.
         """
-        from orchestrator.merge_queue import RealMergeItem
+        from orchestrator.merge_lane.worker import RealMergeItem
 
         return RealMergeItem(
             request=req, merge_result=MagicMock(),
@@ -659,7 +661,7 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
         and the shape ``_live_items`` actually holds once the item is deepest in
         the pipeline (post ``_inflight_append``).
         """
-        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.merge_lane.worker import InflightEntry
         from orchestrator.verify_runner import HostLease
 
         return InflightEntry(
@@ -682,11 +684,11 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
         an object-identity check would fail open on (amendment review,
         task 3082).
         """
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         worker._register_item(live_obj if live_obj is not None else req,
                               initial=ItemLifecycleState.VERIFYING)
-        worker._buffer_owned_request(req)
+        worker._intake.buffer_owned_request(req)
 
     async def test_live_original_redrain_does_not_resolve_its_future(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -856,7 +858,7 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
         future — keeps today's benign ``already_merged`` resolution and fires no
         wiring-bug escalation.
         """
-        from orchestrator.merge_queue import ItemLifecycleState
+        from orchestrator.merge_lane.worker import ItemLifecycleState
 
         fake_eq = _FakeEscalationQueue(open_l1=False)
         worker = _make_worker(git_ops, escalation_queue=fake_eq)
@@ -865,7 +867,7 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
         worker._register_item(original, initial=ItemLifecycleState.VERIFYING)
         twin = _make_request('df3082-twin', 'df3082-twin', tmp_path, config, request_id=rid)
 
-        worker._buffer_owned_request(twin)
+        worker._intake.buffer_owned_request(twin)
 
         assert twin.result.done(), 'no (hypothetical) waiter on the twin future may hang'
         assert twin.result.result().status == 'already_merged'

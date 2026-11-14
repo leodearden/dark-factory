@@ -12,9 +12,10 @@ ok()    { printf '\033[1;32m  ✓ %s\033[0m\n' "$*"; }
 warn()  { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 fail()  { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; }
 
-# Classify what a parity checker just told us. Defined HERE, once, immediately
-# below the log shims and above every parity call site — the five sites share
-# one shell scope, and every sliced block is executed by the test harness under
+# Classify what a tagged checker just told us: the five parity checkers and the
+# network exposure check. Defined HERE, once, immediately below the log shims
+# and above every call site — the sites share one shell scope, and every sliced
+# block is executed by the test harness under
 # a preamble that provides this helper (tests/scripts/setup_host_sections.py
 # slices it live out of this file, so there is no second copy to drift).
 #
@@ -33,13 +34,14 @@ fail()  { printf '\033[1;31m  ✗ %s\033[0m\n' "$*"; }
 #
 # CLASSIFICATION ONLY. Each call site keeps its own wording, severity and side
 # effects, because those legitimately differ — `absent` is `info` at the
-# orchestrator, dashboard pre-install and lms sites but `warn` at the
-# fused-memory and dashboard post-install ones; the orchestrator gate may
-# `fail` and sets _orch_install_blocked, while the lms gate is forbidden from
-# ever calling `fail` (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
+# orchestrator, dashboard pre-install and lms sites, `warn` at the
+# fused-memory and dashboard post-install ones and `fail` at the network
+# exposure one; the orchestrator gate may `fail` and sets
+# _orch_install_blocked, while the lms gate is forbidden from ever calling
+# `fail` (test_setup_host_lms_parity_gate.py::test_the_lms_gate_is_warn_only).
 # A helper that also emitted messages would have to collapse those distinctions
-# or take five message parameters — either way re-creating the coupling the
-# extraction removes.
+# or take a message and a severity per verdict from every site — either way
+# re-creating the coupling the extraction removes.
 #
 # The tag is matched with bash's own `[[ ]]`, never `printf | grep -q`. grep
 # exits the instant it matches and the tag is on line 1, so once the report
@@ -62,9 +64,10 @@ _parity_verdict() {
   fi
 }
 
-# Does FalkorDB answer? ONE probe, two callers — the section-2 wait loop and the
-# section-12 health check ask exactly the same question, and a copy at each site
-# is how the two drift apart.
+# Does FalkorDB answer? ONE probe, every caller — the section-2 wait loops and the
+# section-11 health check ask exactly the same question, and a copy at each site
+# is how they drift apart. The optional argument names the compose service
+# (default `falkordb`; the scratch server is `falkordb-scratch`).
 #
 # The verdict is read from the captured REPLY, not from a pipeline's exit
 # status. `... ping | grep -q PONG` answers with the PRODUCER's status, which is
@@ -86,8 +89,8 @@ _parity_verdict() {
 # `local` confines the reply to the call, so neither caller can ever read a
 # verdict the other left behind in the shared shell scope.
 falkordb_pings() {
-  local out
-  out="$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli ping 2>/dev/null)" || true
+  local service="${1:-falkordb}" out
+  out="$(docker compose -f "$COMPOSE_FILE" exec -T "$service" redis-cli ping 2>/dev/null)" || true
   [[ "$out" == *PONG* ]]
 }
 
@@ -154,7 +157,10 @@ info "Starting backing stores (FalkorDB + Qdrant)"
 mkdir -p "$REPO_ROOT/fused-memory/data/falkordb"
 mkdir -p "$REPO_ROOT/fused-memory/data/qdrant"
 
-docker compose -f "$COMPOSE_FILE" up -d falkordb qdrant
+# Through the AOF gate, never a bare compose-up: on a host that already has a
+# falkordb container, a compose-up recreates it onto whatever AOF is on disk
+# (task 6330). The gate creates it on a fresh host and refuses over stale data.
+python3 "$REPO_ROOT/scripts/falkordb_aof_gate.py" --compose-file "$COMPOSE_FILE"
 
 # Wait for healthy
 for i in $(seq 1 30); do
@@ -177,15 +183,30 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-# ---------------------------------------------------------------------------
-# 3. Python subprojects — uv sync (dependency order)
-# ---------------------------------------------------------------------------
-info "Syncing Python subprojects"
+# The scratch FalkorDB that tests, the offline lane and evals write to
+# (OPERATIONS.md "The scratch FalkorDB"). Production does not depend on it, so
+# every failure here is a warning.
+if docker compose -f "$COMPOSE_FILE" up -d --no-deps falkordb-scratch; then
+  for i in $(seq 1 30); do
+    if falkordb_pings falkordb-scratch; then
+      ok "Scratch FalkorDB healthy"
+      break
+    fi
+    [ "$i" -eq 30 ] && warn "Scratch FalkorDB did not become healthy in 30s"
+    sleep 1
+  done
+else
+  warn "Scratch FalkorDB did not start; start it with: docker compose -f $COMPOSE_FILE up -d --no-deps falkordb-scratch"
+fi
 
-for proj in shared escalation fused-memory orchestrator dashboard; do
-  (cd "$REPO_ROOT/$proj" && uv sync --quiet)
-  ok "$proj"
-done
+# ---------------------------------------------------------------------------
+# 3. Python workspace — uv sync --all-packages
+# ---------------------------------------------------------------------------
+info "Syncing Python workspace (all members)"
+
+# A member-scoped sync is exact and prunes the other members from the shared .venv; see scripts/sync-orchestrator-env.sh.
+(cd "$REPO_ROOT" && uv sync --all-packages --quiet)
+ok "Python workspace synced (every member, client-feed included)"
 
 # ---------------------------------------------------------------------------
 # 4. Systemd user unit for fused-memory
@@ -336,7 +357,7 @@ fi
 # ---------------------------------------------------------------------------
 # The install is gated PER UNIT (task 4198). Each unit is judged on its own
 # parity verdict, so a finding on one no longer declines the install of all
-# sixteen. The POLICY is unchanged and still ratified — a unit that did not clear
+# eighteen. The POLICY is unchanged and still ratified — a unit that did not clear
 # is never overwritten without DF_INSTALL_ORCH_UNITS=1, because a difference
 # does not tell you which side is stale — only the blast radius shrinks.
 #
@@ -437,7 +458,7 @@ install -m 0755 "$REPO_ROOT/scripts/wait-for-port.py" "$HOME/bin/wait-for-port.p
 # a second run would only restate what the copy just did.)
 #
 # NON-FATAL, but not merely advisory: a finding never aborts this script (the
-# sections below still run, and two of the sixteen registered units carry a
+# sections below still run, and two of the eighteen registered units carry a
 # standing, deliberate finding on this host — re-measured 2026-09-05, see the
 # checker's KNOWN RED section) — it makes the install of THAT UNIT opt-in
 # instead. A bare warning would not be an intervention point
@@ -515,6 +536,7 @@ _orch_units=(
   orchestrator-solar-challenge-platform.service  # joined 2026-06-21, escalation 8107
   orchestrator-know-live.service                 # escalation 8105; committed since e5273d8623, wired in by task 3641 (its absence was an omission, not a policy)
   orchestrator-pump-web-ui.service               # joined 2026-07-17, escalation 8108; ran on the host with no committed template until task 3641 transcribed it
+  orchestrator-stream-touch.service              # joined 2026-10-22, escalation 8110 (project_id stream_touch)
   orchestrator-watchdog.service                  # static (no [Install]) — pulled in by the .timer, so the enable loop below skips it
   orchestrator-watchdog.timer                    # 60s liveness probe + dead-enabled revival: the safety net that revives an orchestrator killed by e.g. a boot-race dependency cancel
   orchestrator-dark-factory.socket               # holds escalation port 8102 across a restart (socket activation)
@@ -524,6 +546,7 @@ _orch_units=(
   orchestrator-solar-challenge-platform.socket   # holds escalation port 8107 across a restart
   orchestrator-know-live.socket                  # holds escalation port 8105 across a restart
   orchestrator-pump-web-ui.socket                # holds escalation port 8108 across a restart
+  orchestrator-stream-touch.socket               # holds escalation port 8110 across a restart
 )
 
 # `.socket` is not in the shared lock-charter extension allowlist, so each
@@ -802,7 +825,7 @@ else
 
   # Reports what was ACTUALLY done, not what was attempted: with a per-unit
   # gate a partial install is now a normal outcome, and an unqualified success
-  # line would read as "all sixteen" on a run that installed one. Counted from the
+  # line would read as "all eighteen" on a run that installed one. Counted from the
   # units that COPIED, so a failed `cp` is never reported as an install.
   if [ "${#_orch_installed_units[@]}" -eq 0 ]; then
     warn "NO orchestrator unit was installed — every copy that cleared the gate"
@@ -1109,6 +1132,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 7a. Client-feed publisher unit template (rendered, never enabled)
+# ---------------------------------------------------------------------------
+info "Installing the client-feed publisher unit template"
+
+# One instance per client project is enabled by hand: OPERATIONS.md §"Client feed".
+_cf_render_script="$REPO_ROOT/scripts/render_systemd_unit.py"
+if python3 "$_cf_render_script" \
+     --unit      client-feed \
+     --template  "$REPO_ROOT/scripts/client-feed.service.template" \
+     --repo-root "$REPO_ROOT" \
+     --uv-path   "$UV_PATH" \
+     --output    "$UNIT_DIR/client-feed@.service"; then
+  systemctl --user daemon-reload
+  ok "client-feed@.service installed; no instance enabled (one per client project, by hand: OPERATIONS.md §\"Client feed\")"
+else
+  fail "client-feed@.service render FAILED — see the [client_feed_unit_render] report above."
+  fail "  Any installed $UNIT_DIR/client-feed@.service was left untouched."
+fi
+
+# ---------------------------------------------------------------------------
 # 8. Claude Code skill symlinks
 # ---------------------------------------------------------------------------
 info "Creating Claude Code skill symlinks"
@@ -1178,6 +1221,15 @@ if [ -x "$REPO_ROOT/hooks/setup.sh" ]; then
   ok "Git hooks configured"
 else
   warn "hooks/setup.sh not found or not executable"
+fi
+
+# dark-factory's own merge driver for the ratchet baseline (.gitattributes names
+# it). hooks/setup.sh is a generic bootstrap any repo can copy, so this lives
+# here. Without it a two-branch baseline merge conflicts instead of composing.
+if (cd "$REPO_ROOT" && python3 scripts/merge_lane_ratchet_merge.py install); then
+  ok "Ratchet-baseline merge driver installed"
+else
+  warn "Ratchet-baseline merge driver NOT installed -- baseline merges will conflict"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1454,6 +1506,35 @@ else
     warn "  Inspect:  systemctl --user cat lms-arm@<arm>.service"
     warn "  Remove:   scripts/remove-lms-arm-worktree-dropin.sh (checks its"
     warn "            safety preconditions first)"
+    ;;
+  esac
+fi
+
+# Every factory port must refuse off-loopback connects and accept on 127.0.0.1
+# (contract: plans/mcp-network-exposure-prd.md §3). The status is believed only
+# with the [network_exposure] tag; the check never exits 2 under it, so `absent`
+# is a failure here.
+_net_exposure_script="$REPO_ROOT/scripts/check_network_exposure.py"
+if [ ! -f "$_net_exposure_script" ]; then
+  fail "Network exposure check missing: $_net_exposure_script"
+  fail "  Not treating that as 'nothing exposed' — it is 'nothing checked'."
+else
+  _net_exposure_out="$(python3 "$_net_exposure_script" 2>&1)" \
+       && _net_exposure_exit=0 || _net_exposure_exit=$?
+  printf '%s\n' "$_net_exposure_out"
+  _net_exposure_verdict="$(_parity_verdict "$_net_exposure_out" \
+       "$_net_exposure_exit" '[network_exposure]')"
+  case "$_net_exposure_verdict" in
+  unreported)
+    fail "Network exposure check produced no [network_exposure] report"
+    fail "  (status $_net_exposure_exit) — it did not run, so nothing was checked."
+    ;;
+  parity)
+    ok "Network exposure: every factory port refuses off-loopback connects and accepts on 127.0.0.1"
+    ;;
+  absent | finding | *)
+    fail "Network exposure: a factory port is reachable off loopback, unreachable on it, or unverified —"
+    fail "  see the [network_exposure] report above."
     ;;
   esac
 fi

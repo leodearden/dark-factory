@@ -349,7 +349,8 @@ def test_scoped_hits_are_counted_per_account_with_each_first_hit():
         )
     )
     scan = audit_model_admission.ScopedCapScan(
-        scoped_hits=hits, unscoped_cap_hit_count=0, restarts=(),
+        scoped_hits=hits, unscoped_cap_hit_count=0, restarts=(), orchestrator_startups=(),
+        restart_required_reloads=(),
     )
 
     assert review_model_admission.scoped_hits_by_account(scan) == (

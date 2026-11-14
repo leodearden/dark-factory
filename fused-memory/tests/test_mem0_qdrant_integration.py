@@ -14,7 +14,7 @@ import uuid
 from typing import cast
 
 import pytest
-from _fm_helpers import QDRANT_URL, ensure_fresh_collection, qdrant_skipif
+from _fm_qdrant_live import QDRANT_URL, ensure_fresh_collection, qdrant_skipif
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance
 

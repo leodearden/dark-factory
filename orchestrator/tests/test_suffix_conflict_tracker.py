@@ -20,14 +20,19 @@ from __future__ import annotations
 import asyncio
 import collections
 from pathlib import Path
+from types import MappingProxyType
+from typing import Literal
 from unittest.mock import AsyncMock
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 
 import orchestrator.suffix_graph as suffix_graph
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.outcome_facts import ConflictEvidence, MergeBlockCategory
+from orchestrator.merge_lane.types import MergeBounceRegistry, QueuedBranch
+from orchestrator.merge_lane.worker import (
     MERGE_BOUNCE_CAP,
     NEEDS_REBASE_REASON_PREFIX,
     GroupMergeRequest,
@@ -35,7 +40,6 @@ from orchestrator.merge_queue import (
     MergeRequest,
     SpeculativeMergeWorker,
 )
-from orchestrator.merge_types import MergeBounceRegistry, QueuedBranch
 from orchestrator.suffix_graph import (
     EMPTY_SUFFIX_CONFLICT_GRAPH,
     SuffixConflictGraph,
@@ -82,7 +86,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 def _make_req(
@@ -109,8 +113,10 @@ def _make_tracker(
     git_ops: GitOps,
     *,
     lane_buffers=None,
-    frozen_prefix=None,
+    frozen_requests=None,
     frozen_prefix_tip=None,
+    retire_item=None,
+    is_reserved=None,
 ) -> SuffixConflictTracker:
     """Build a bare SuffixConflictTracker with trivial default callables.
 
@@ -126,19 +132,29 @@ def _make_tracker(
         def _default_lane_buffers():
             return {'high': collections.deque(), 'normal': collections.deque()}
         lane_buffers = _default_lane_buffers
-    if frozen_prefix is None:
-        def _default_frozen_prefix():
+    if frozen_requests is None:
+        def _default_frozen_requests():
             return ()
-        frozen_prefix = _default_frozen_prefix
+        frozen_requests = _default_frozen_requests
     if frozen_prefix_tip is None:
         def _default_frozen_prefix_tip(main_sha):
             return main_sha
         frozen_prefix_tip = _default_frozen_prefix_tip
+    if retire_item is None:
+        def _default_retire_item(rid):
+            return None
+        retire_item = _default_retire_item
+    if is_reserved is None:
+        def _default_is_reserved(rid):
+            return False
+        is_reserved = _default_is_reserved
     return SuffixConflictTracker(
         git_ops=lambda: git_ops,
         lane_buffers=lane_buffers,
-        frozen_prefix=frozen_prefix,
+        frozen_requests=frozen_requests,
         frozen_prefix_tip=frozen_prefix_tip,
+        retire_item=retire_item,
+        is_reserved=is_reserved,
     )
 
 
@@ -186,14 +202,12 @@ class TestModuleSurface:
 
 
 class TestModuleLogger:
-    """suffix_graph's module logger must share merge_queue's logger name so
-    existing caplog-based log-message assertions keep matching post-extraction.
+    """suffix_graph is the worker's suffix tracker kept outside the package, so
+    it logs under the merge lane's one logger name and caplog filters on
+    'orchestrator.merge_lane' see its records."""
 
-    RED until step-2 GREEN sets logger = logging.getLogger('orchestrator.merge_queue').
-    """
-
-    def test_logger_name_matches_merge_queue(self):
-        assert suffix_graph.logger.name == 'orchestrator.merge_queue'
+    def test_logger_name_is_the_merge_lanes(self):
+        assert suffix_graph.logger.name == 'orchestrator.merge_lane'
 
 
 # ── step-1: tracker construction without a worker ──────────────────────────────
@@ -286,6 +300,10 @@ class TestTrackerRecomputeWithoutWorker:
         assert pair_ab in tracker.graph.textual_edges
         assert tracker.graph.textual_edges <= tracker.graph.footprint_edges
         assert req_c.request_id in tracker.graph.conflicts_with_main
+        # An empty frozen prefix: C conflicted against main itself.
+        assert tracker.graph.conflict_evidence[req_c.request_id] == ConflictEvidence(
+            conflicted_paths=('conflict.txt',), counterpart_task_ids=(),
+        )
         # nodes are in pick order: high (empty) then normal, FIFO.
         assert tracker.graph.nodes == (
             req_a.request_id, req_b.request_id, req_c.request_id,
@@ -388,8 +406,8 @@ class TestTrackerBounceWithoutWorker:
     items that conflict with the frozen tip — no SpeculativeMergeWorker
     involved.
 
-    RED until step-6 GREEN moves the _bounce_conflicting_suffix_items() body
-    (verbatim) into SuffixConflictTracker.bounce_conflicting_suffix_items().
+    RED until step-6 GREEN moves the worker's bounce body (verbatim) into
+    SuffixConflictTracker.bounce_conflicting_suffix_items().
     """
 
     async def test_clean_rebase_requeues_item(self, git_ops, config, git_repo):
@@ -567,6 +585,40 @@ class TestTrackerBounceWithoutWorker:
             'escalated by bounce_conflicting_suffix_items().'
         )
 
+    async def test_reserved_request_is_neither_rebased_nor_escalated(
+        self, git_ops, config, git_repo,
+    ):
+        """A deep chain's reserved link is under a tip verify (task 7720): the
+        bounce leaves it alone, while an unreserved conflicting peer is still
+        bounced."""
+        reserved = _make_req('591', '591', config, git_repo)
+        reserved.worktree = git_repo / 'reserved-wt'
+        peer = _make_req('592', '592', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([reserved, peer])}
+        tracker = _make_tracker(
+            git_ops, lane_buffers=lambda: buffers,
+            frozen_prefix_tip=lambda s: 'FROZENTIP',
+            is_reserved=lambda rid: rid == reserved.request_id,
+        )
+        tracker.graph = SuffixConflictGraph(
+            nodes=(reserved.request_id, peer.request_id),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({reserved.request_id, peer.request_id}),
+        )
+        tracker.signature = ((reserved.request_id, peer.request_id), 'deadbeef0000')
+        git_ops.rebase_onto_main = AsyncMock(return_value=False)
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        rebased = [call.args[0] for call in git_ops.rebase_onto_main.await_args_list]
+        assert rebased == [peer.worktree]
+        assert list(buffers['normal']) == [reserved]
+        assert not reserved.result.done()
+        assert tracker.bounce_registry.count('591') == 0
+        assert peer.result.done()
+        assert peer.result.result().status == 'blocked'
+
     async def test_empty_conflicts_with_main_is_a_noop(self, git_ops, config, git_repo):
         """Empty conflicts_with_main -> return immediately; signature untouched."""
         tracker = _make_tracker(git_ops, frozen_prefix_tip=lambda s: 'FROZENTIP')
@@ -626,10 +678,10 @@ class TestWorkerRecomputeIsPubliclyObservable:
     ):
         """Two guarantees in one drive, because each is the other's discriminator.
 
-        LIVE STATE: the worker injects ``frozen_prefix`` into its tracker as a
-        callable that RE-READS the attribute on every call (merge_queue.py::
+        LIVE STATE: the worker injects ``frozen_prefix_requests`` into its tracker
+        as a callable that RE-READS the attribute on every call (merge_queue.py::
         SpeculativeMergeWorker.__init__), not as a bound-method snapshot taken
-        at construction.  So a ``frozen_prefix`` reassigned AFTER the worker
+        at construction.  So a ``frozen_prefix_requests`` reassigned AFTER the worker
         exists is the one the recompute consults — which is what the spy
         below observes, and what proves the drive really reached the tracker
         rather than returning early.  ``git_ops`` / ``lane_buffers`` /
@@ -648,20 +700,135 @@ class TestWorkerRecomputeIsPubliclyObservable:
         worker = _make_worker(git_ops)
         consulted: list[str] = []
 
-        def _spy_frozen_prefix() -> tuple[str, ...]:
-            consulted.append('frozen_prefix')
+        def _spy_frozen_prefix_requests() -> tuple[MergeRequest, ...]:
+            consulted.append('frozen_prefix_requests')
             return ()
 
-        worker.frozen_prefix = _spy_frozen_prefix
+        worker.frozen_prefix_requests = _spy_frozen_prefix_requests
 
         await worker.recompute_suffix_conflict_graph()
 
-        assert consulted == ['frozen_prefix'], (
+        assert consulted == ['frozen_prefix_requests'], (
             'Expected recompute_suffix_conflict_graph() to consult the '
-            'frozen_prefix reassigned after construction (a re-reading '
+            'frozen_prefix_requests reassigned after construction (a re-reading '
             f'callable, not a construction-time snapshot); consulted={consulted!r}.'
         )
         assert (
             worker.snapshot()['suffix_conflict_graph']
             == EMPTY_SUFFIX_CONFLICT_GRAPH.to_snapshot_dict()
         ), 'Expected snapshot() to publish the graph the recompute just built.'
+
+
+@pytest.mark.asyncio
+class TestBounceRecordsItsConflict:
+    """A graph-time bounce carries its own category and the conflict the probe
+    saw: the paths, and the frozen-prefix tasks it conflicted with (task 7302)."""
+
+    @pytest.mark.parametrize('arm', ['real_conflict', 'cap_exceeded'])
+    async def test_the_bounced_outcome_records_paths_counterparts_and_category(
+        self, git_ops, config, git_repo, arm: Literal['real_conflict', 'cap_exceeded'],
+    ):
+        frozen_sha = await _create_branch_editing(
+            git_repo, 'task/frozen', 'shared.txt', 'FROZEN\nline2\nline3\n',
+        )
+        await _create_branch_editing(
+            git_repo, 'task/suffix', 'shared.txt', 'SUFFIX\nline2\nline3\n',
+        )
+        frozen_req = _make_req('frozen-task', 'frozen', config, git_repo)
+        suffix_req = _make_req('suffix-task', 'suffix', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([suffix_req])}
+        tracker = _make_tracker(
+            git_ops, lane_buffers=lambda: buffers,
+            frozen_requests=lambda: (frozen_req,),
+            frozen_prefix_tip=lambda _s: frozen_sha,
+        )
+        await tracker.recompute()
+        if arm == 'cap_exceeded':
+            for _ in range(MERGE_BOUNCE_CAP):
+                tracker.bounce_registry.record_bounce('suffix')
+        git_ops.rebase_onto_main = AsyncMock(return_value=False)
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        outcome: MergeOutcome = suffix_req.result.result()
+        assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), outcome.reason
+        assert outcome.block_category is MergeBlockCategory.MERGE_NEEDS_REBASE
+        assert outcome.conflict_evidence == ConflictEvidence(
+            conflicted_paths=('shared.txt',), counterpart_task_ids=('frozen-task',),
+        )
+
+    @pytest.mark.parametrize('change', ['grows_from_empty', 'shrinks'])
+    async def test_counterparts_are_the_frozen_prefix_whose_tip_was_probed(
+        self, git_ops, config, git_repo, change: Literal['grows_from_empty', 'shrinks'],
+    ):
+        frozen_sha = await _create_branch_editing(
+            git_repo, 'task/frozen', 'shared.txt', 'FROZEN\nline2\nline3\n',
+        )
+        await _create_branch_editing(
+            git_repo, 'task/suffix', 'shared.txt', 'SUFFIX\nline2\nline3\n',
+        )
+        req_a = _make_req('frozen-a', 'frozen-a', config, git_repo)
+        req_b = _make_req('frozen-b', 'frozen-b', config, git_repo)
+        suffix_req = _make_req('suffix-task', 'suffix', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([suffix_req])}
+        before, after = {
+            'grows_from_empty': ({'requests': (), 'tip': None},
+                                 {'requests': (req_b,), 'tip': frozen_sha}),
+            'shrinks': ({'requests': (req_a, req_b), 'tip': frozen_sha},
+                        {'requests': (req_b,), 'tip': frozen_sha}),
+        }[change]
+        live = dict(before)
+        tracker = _make_tracker(
+            git_ops, lane_buffers=lambda: buffers,
+            frozen_requests=lambda: live['requests'],
+            frozen_prefix_tip=lambda main_sha: live['tip'] or main_sha,
+        )
+        real_get_main_sha = git_ops.get_main_sha
+
+        async def _prefix_changes_while_awaiting():
+            live.update(after)
+            return await real_get_main_sha()
+
+        git_ops.get_main_sha = _prefix_changes_while_awaiting
+
+        await tracker.recompute()
+
+        assert tracker.graph.conflict_evidence[suffix_req.request_id] == ConflictEvidence(
+            conflicted_paths=('shared.txt',), counterpart_task_ids=('frozen-b',),
+        ), (
+            f'frozen prefix moved from {[r.task_id for r in before["requests"]]} '
+            f'to {[r.task_id for r in after["requests"]]} during recompute'
+        )
+
+    async def test_fail_open_probe_records_no_evidence(self, git_ops, config, git_repo):
+        await _create_branch_editing(
+            git_repo, 'task/suffix', 'shared.txt', 'SUFFIX\nline2\nline3\n',
+        )
+        req = _make_req('suffix-task', 'suffix', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([req])}
+        tracker = _make_tracker(git_ops, lane_buffers=lambda: buffers)
+        git_ops.merge_tree_conflicts = AsyncMock(side_effect=RuntimeError('probe failed'))
+        git_ops.rebase_onto_main = AsyncMock(return_value=False)
+
+        await tracker.recompute()
+
+        assert req.request_id in tracker.graph.conflicts_with_main
+        assert req.request_id not in tracker.graph.conflict_evidence
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        outcome: MergeOutcome = req.result.result()
+        assert outcome.block_category is MergeBlockCategory.MERGE_NEEDS_REBASE
+        assert outcome.conflict_evidence is None
+
+
+class TestSuffixConflictGraphInvariant:
+    def test_graph_rejects_evidence_for_a_rid_not_conflicting(self):
+        with pytest.raises(ValueError, match='mr-x'):
+            SuffixConflictGraph(
+                nodes=(),
+                textual_edges=frozenset(),
+                footprint_edges=frozenset(),
+                conflicts_with_main=frozenset(),
+                conflict_evidence=MappingProxyType({'mr-x': ConflictEvidence(('a',))}),
+            )

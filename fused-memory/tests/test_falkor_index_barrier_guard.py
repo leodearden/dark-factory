@@ -1,5 +1,5 @@
 """Migration guard: every live-index test module must route through the shared
-``_fm_helpers.await_index_operational`` barrier — and may not re-fork it.
+``_fm_falkor_live.await_index_operational`` barrier — and may not re-fork it.
 
 Task 3377. FalkorDB builds indices **asynchronously**, so a test that queries
 an index immediately after creating it can silently succeed for a query the
@@ -30,8 +30,10 @@ barrier and this guard fails on the next run, with no edit here required.
 Selection criterion (the intersection the task verified by hand):
   1. contains a **string constant** matching ``CREATE INDEX`` /
      ``createNodeIndex`` — i.e. it creates an index; and
-  2. contains a real **call** to ``select_graph(...)`` — i.e. it drives a live
-     FalkorDB graph rather than a mock.
+  2. contains a real **call** to ``select_graph(...)``, or to
+     ``_falkor_index_live.scratch_graphs(...)``, which calls ``select_graph`` on
+     the module's behalf — i.e. it drives a live FalkorDB graph rather than a
+     mock.
 Both are AST facts, so a comment or docstring that merely *mentions* index
 creation cannot drag an unrelated module into scope. The other
 ``select_graph`` users (test_startup_identity_scan, test_reassign_edge,
@@ -39,10 +41,11 @@ test_merge_entities, test_refresh_entity_summary, test_falkor_fulltext_query)
 build no index and are correctly excluded — they are not forced to adopt a
 barrier they do not need.
 
-A cheap ``'select_graph' in source`` text prefilter runs before any parsing so
-discovery costs ~130ms rather than ~15s: an ``ast.Call`` to ``select_graph``
-cannot exist without that identifier appearing literally in the source, so the
-prefilter is a strict superset of criterion (2) and cannot hide a module. Only
+A cheap text prefilter — does either live-graph call name appear in the
+source? — runs before any parsing so discovery costs ~130ms rather than ~15s:
+an ``ast.Call`` to ``select_graph`` or ``scratch_graphs`` cannot exist without
+that identifier appearing literally in the source, so the prefilter is a strict
+superset of criterion (2) and cannot hide a module. Only
 the ~7 survivors are parsed. The prefilter narrows the candidate set; every
 actual assertion below is still AST-based.
 
@@ -54,7 +57,7 @@ of quietly passing zero modules.
 
 AST (not string grep) for the assertions themselves so a docstring or comment
 that merely *describes* the barrier — e.g. "see
-_fm_helpers.await_index_operational" — cannot satisfy the check; only real
+_fm_falkor_live.await_index_operational" — cannot satisfy the check; only real
 ImportFrom / Call / FunctionDef nodes count. The parse and node-search
 machinery is shared with the sibling guards via ``_ast_guard``
 (``parse_python_module`` / ``calls_named`` / ``imported_names_from``), so the
@@ -75,11 +78,14 @@ import re
 
 import pytest
 from _ast_guard import calls_named, imported_names_from, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 TESTS_ROOT = pathlib.Path(__file__).parent
 SELF = pathlib.Path(__file__).resolve()
 
-HELPERS_MODULE = '_fm_helpers'
+HELPERS_MODULE = '_fm_falkor_live'
 BARRIER = 'await_index_operational'
 # The pre-extraction private spelling (task 3334) must not come back either.
 LOCAL_FORKS = {BARRIER, f'_{BARRIER}'}
@@ -88,9 +94,10 @@ LOCAL_FORKS = {BARRIER, f'_{BARRIER}'}
 # the range form (`CREATE INDEX FOR (n:Entity) ON (n.name)`) and the fulltext
 # procedure (`CALL db.idx.fulltext.createNodeIndex(...)`).
 _INDEX_CREATION = re.compile(r'CREATE\s+INDEX|createNodeIndex', re.IGNORECASE)
-# Criterion (2): the module drives a live FalkorDB graph. Also the text
-# prefilter — see the module docstring for why that is safe.
-_LIVE_GRAPH_CALL = 'select_graph'
+# Criterion (2): the module drives a live FalkorDB graph, directly or through
+# the shared scratch-graph helper. Also the text prefilter — see the module
+# docstring for why that is safe.
+_LIVE_GRAPH_CALLS = ('select_graph', 'scratch_graphs')
 
 # The floor: modules verified by hand (task 3377) to create an index on a live
 # async graph. Discovery must keep finding at least these; it is free to find
@@ -98,6 +105,10 @@ _LIVE_GRAPH_CALL = 'select_graph'
 VERIFIED_LIVE_INDEX_MODULES = {
     'test_falkor_fulltext_integration.py',
     'test_list_indices_integration.py',
+    # Task 6210 builds these two modules' graphs only through
+    # _falkor_index_live.scratch_graphs, so they prove discovery follows it.
+    'test_ensure_indices_integration.py',
+    'test_index_provisioning_wiring_integration.py',
 }
 
 
@@ -115,25 +126,27 @@ def _has_index_creating_literal(tree: ast.Module) -> bool:
     )
 
 
-def _discover_live_index_modules() -> list[pathlib.Path]:
-    """Every test module that creates an index on a live async FalkorDB graph.
+def _discover_live_index_modules(root: pathlib.Path = TESTS_ROOT) -> list[pathlib.Path]:
+    """Every test module under *root* that creates an index on a live async FalkorDB graph.
 
     Derived rather than hand-listed so a newly-added live-index module is
     covered automatically — see the module docstring.
     """
     found: list[pathlib.Path] = []
-    for path in sorted(TESTS_ROOT.glob('**/test_*.py')):
+    for path in sorted(root.glob('**/test_*.py')):
         if path.resolve() == SELF:
             # This guard names the tokens in prose; it drives no graph.
             continue
-        if _LIVE_GRAPH_CALL not in path.read_text():
+        source = path.read_text()
+        if not any(name in source for name in _LIVE_GRAPH_CALLS):
             # Cheap prefilter — strict superset of criterion (2). Deliberately a
             # discarded raw read rather than parse_python_module: that would
             # parse AND retain a tree for every test module here, when only ~7
             # survive the prefilter to be parsed at all.
             continue
         tree = parse_python_module(path)
-        if _has_index_creating_literal(tree) and calls_named(tree, _LIVE_GRAPH_CALL):
+        drives_live_graph = any(calls_named(tree, name) for name in _LIVE_GRAPH_CALLS)
+        if _has_index_creating_literal(tree) and drives_live_graph:
             found.append(path)
     return found
 
@@ -156,10 +169,32 @@ class TestDiscoveryItself:
             f'live-index module discovery no longer finds {sorted(missing)} '
             f'(found {sorted(discovered) or "nothing"}). The selection criteria in '
             f'this file have gone stale — most likely FalkorDB or the fixtures '
-            f'renamed {_LIVE_GRAPH_CALL!r} or the index-creation syntax. Fix the '
+            f'renamed one of {_LIVE_GRAPH_CALLS!r} or the index-creation syntax. Fix the '
             f'criteria; do NOT shrink the floor, or this guard silently checks '
             f'nothing.'
         )
+
+    def test_discovery_follows_graphs_made_through_the_shared_scratch_helper(self, tmp_path):
+        (tmp_path / 'test_helper_route.py').write_text(
+            'from _falkor_index_live import scratch_graphs\n'
+            '\n'
+            '\n'
+            'async def build():\n'
+            "    async with scratch_graphs('x') as make:\n"
+            "        name, graph = make('y')\n"
+            "        await graph.query('CREATE INDEX FOR (n:E) ON (n.f)')\n"
+        )
+        assert [p.name for p in _discover_live_index_modules(tmp_path)] == [
+            'test_helper_route.py'
+        ]
+
+    def test_a_module_only_mentioning_the_scratch_helper_is_not_discovered(self, tmp_path):
+        (tmp_path / 'test_helper_mention.py').write_text(
+            '"""Graphs here would come from scratch_graphs, but none is made."""\n'
+            '\n'
+            "STATEMENT = 'CREATE INDEX FOR (n:E) ON (n.f)'\n"
+        )
+        assert _discover_live_index_modules(tmp_path) == []
 
 
 @pytest.mark.parametrize('path', LIVE_INDEX_MODULES, ids=lambda p: p.name)

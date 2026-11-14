@@ -140,14 +140,29 @@ class TestEnvTransientNonMisattributionWiring:
     absent from all three collections.
     """
 
-    def test_worst_category_ranks_env_transient_above_test_failure(self):
-        """A mixed-category run resolves to env_transient, not test_failure.
+    def test_worst_category_keeps_another_legs_test_failure_over_env_transient(self):
+        """Across legs, a test red is never masked by another leg's env_transient.
 
-        This mirrors how a xdist-death run whose output contains BOTH the
-        env_transient signature and collateral FAILED lines must resolve to
-        the infra category, not the test-drift category.
+        ``_worst_category`` only ever decides between DIFFERENT legs. Task
+        #4103: a genuine test red plus a guard-3 false env_transient type leg
+        must not be held by the merge lane as transient infra (task 4843
+        inverted task 2048's original pin). Task 2048's own case is WITHIN one
+        leg: xdist-death output carrying both the env_transient signature and
+        collateral FAILED lines. ``classify_failure`` decides that one by arm
+        order, pinned in
+        test_xdist_death_with_collateral_failed_line_is_env_transient_within_the_leg.
         """
-        assert verify._worst_category(['test_failure', 'env_transient']) == 'env_transient'
+        assert verify._worst_category(['test_failure', 'env_transient']) == 'test_failure'
+
+    def test_xdist_death_with_collateral_failed_line_is_env_transient_within_the_leg(self):
+        """Task 2048's property, pinned where it lives: inside ONE pytest leg,
+        the xdist-vanished usage error beats a collateral FAILED line."""
+        output = (
+            'usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n'
+            'pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0\n'
+            'FAILED orchestrator/tests/test_x.py::test_y - AssertionError\n'
+        )
+        assert classify_failure(ToolKind.PYTEST, 4, output, False) == 'env_transient'
 
     def test_env_transient_skips_preexisting_break_probe(self):
         """env_transient is non-deterministic to re-probe on main (like infra_timeout)."""
@@ -171,12 +186,18 @@ class TestEnvTransientNonMisattributionWiring:
         """
         assert verify._should_archive_category('env_transient') is True
 
-    def test_env_transient_ranked_above_test_failure_in_category_priority(self):
-        """env_transient must outrank test_failure in the severity list."""
+    def test_test_failure_ranked_above_env_transient_in_category_priority(self):
+        """test_failure must outrank env_transient in the severity list.
+
+        The list only decides between legs, and a host condition reported by
+        one leg must never mask another leg's verdict about the branch (task
+        #4103, task 4843). The within-leg xdist-death case task 2048 cared
+        about is decided by ``classify_failure``'s arm order instead.
+        """
         assert 'env_transient' in verify._CATEGORY_PRIORITY
         assert (
-            verify._CATEGORY_PRIORITY.index('env_transient')
-            < verify._CATEGORY_PRIORITY.index('test_failure')
+            verify._CATEGORY_PRIORITY.index('test_failure')
+            < verify._CATEGORY_PRIORITY.index('env_transient')
         )
 
 
@@ -1307,6 +1328,163 @@ class TestRunVerificationXdistWorkerCrashRetry:
 
         assert exc_info.value.phase == 'xdist_worker_crash'
         assert exc_info.value.errno is None
+        assert XDIST_IN_FLIGHT_NODEID in str(exc_info.value)
+
+    @staticmethod
+    def _make_persisting_config(
+        tmp_path: Path, test_command: str = 'uv run pytest tests/',
+    ) -> OrchestratorConfig:
+        (tmp_path / '.task').mkdir(exist_ok=True)
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command=test_command,
+            lint_command='echo lint',
+            type_check_command='echo type',
+            verify_admission_enabled=False,
+            verify_cold_preprovision_command='',
+        )
+
+    @staticmethod
+    def _streaming_fake_cmd(pytest_result):
+        """A `_run_cmd` stub that streams pytest output to *log_path* as the real one does.
+
+        *pytest_result* maps the spawn's cwd to the ``(rc, output)`` pytest returns.
+        """
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if 'pytest' not in cmd:
+                return 0, '', False
+            rc, output = pytest_result(Path(cwd))
+            if log_path is not None:
+                Path(log_path).write_text(output)
+            return rc, output, False
+
+        return fake_cmd
+
+    @pytest.mark.asyncio
+    async def test_task_path_crash_archives_its_log_before_raising(self, tmp_path: Path):
+        config = self._make_persisting_config(tmp_path)
+        archive_root = tmp_path / 'verify-logs'
+        fake_cmd = self._streaming_fake_cmd(
+            lambda cwd: (1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', side_effect=fake_cmd),
+            pytest.raises(verify.VerifyInfraError) as exc_info,
+        ):
+            await verify.run_verification(
+                tmp_path, config, attempt_id=1, task_id='5527', archive_root=archive_root,
+            )
+
+        exc = exc_info.value
+        assert exc.phase == 'xdist_worker_crash'
+        assert exc.errno is None
+        archived_logs = list((archive_root / '5527').glob('attempt-1.test-*.log'))
+        assert len(archived_logs) == 1
+        assert XDIST_IN_FLIGHT_NODEID in archived_logs[0].read_text()
+        archived_summaries = list((archive_root / '5527').glob('attempt-1.summary-*.json'))
+        assert len(archived_summaries) == 1
+        summary = json.loads(archived_summaries[0].read_text())
+        assert summary['role'] == 'task'
+        assert summary['category'] == classify_failure(
+            ToolKind.PYTEST, 1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT, False,
+        ) == 'test_failure'
+        assert 'xdist_worker_crash' in summary['cause_hint']
+        assert (tmp_path / '.task' / 'verify' / 'attempt-1.summary.json').exists()
+        assert XDIST_IN_FLIGHT_NODEID in str(exc)
+        assert str(archived_logs[0]) in str(exc)
+
+    @pytest.mark.asyncio
+    async def test_segmented_task_leg_crash_archives_the_aggregated_log(
+        self, tmp_path: Path,
+    ):
+        config = self._make_persisting_config(
+            tmp_path,
+            test_command='cd shared && uv run pytest tests/ && cd ../orchestrator && uv run pytest tests/',
+        )
+        (tmp_path / 'shared').mkdir()
+        (tmp_path / 'orchestrator').mkdir()
+        archive_root = tmp_path / 'verify-logs'
+        fake_cmd = self._streaming_fake_cmd(
+            lambda cwd: (
+                (1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT)
+                if cwd.name == 'shared'
+                else (0, '3 passed in 0.10s\n')
+            ),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', side_effect=fake_cmd),
+            pytest.raises(verify.VerifyInfraError) as exc_info,
+        ):
+            await verify.run_verification(
+                tmp_path, config, attempt_id=1, task_id='5527',
+                archive_root=archive_root, segment_chained_test=True,
+            )
+
+        worktree_test_log = tmp_path / '.task' / 'verify' / 'attempt-1.test.log'
+        assert worktree_test_log.exists()
+        assert XDIST_IN_FLIGHT_NODEID in worktree_test_log.read_text()
+        archived_logs = list((archive_root / '5527').glob('attempt-1.test-*.log'))
+        assert len(archived_logs) == 1
+        assert XDIST_IN_FLIGHT_NODEID in archived_logs[0].read_text()
+        assert str(archived_logs[0]) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_crash_without_archive_root_names_the_worktree_log(self, tmp_path: Path):
+        config = self._make_persisting_config(tmp_path)
+        fake_cmd = self._streaming_fake_cmd(
+            lambda cwd: (1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT),
+        )
+
+        with (
+            patch('orchestrator.verify._run_cmd', side_effect=fake_cmd),
+            pytest.raises(verify.VerifyInfraError) as exc_info,
+        ):
+            await verify.run_verification(
+                tmp_path, config, attempt_id=1, task_id='5527', archive_root=None,
+            )
+
+        worktree_test_log = tmp_path / '.task' / 'verify' / 'attempt-1.test.log'
+        assert worktree_test_log.exists()
+        assert XDIST_IN_FLIGHT_NODEID in str(exc_info.value)
+        assert str(worktree_test_log) in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_genuine_failure_beside_crash_is_not_force_archived(self, tmp_path: Path):
+        config = self._make_persisting_config(tmp_path)
+        archive_root = tmp_path / 'verify-logs'
+        fake_cmd = self._streaming_fake_cmd(
+            lambda cwd: (1, _XDIST_CRASH_WITH_REAL_FAILURE_OUTPUT),
+        )
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(
+                tmp_path, config, attempt_id=1, task_id='5527', archive_root=archive_root,
+            )
+
+        assert result.passed is False
+        assert result.category == 'test_failure'
+        assert list((archive_root / '5527').glob('attempt-1.test-*.log')) == []
+
+    @pytest.mark.asyncio
+    async def test_merge_verify_crash_still_returns_and_archives(self, tmp_path: Path):
+        config = self._make_persisting_config(tmp_path)
+        archive_root = tmp_path / 'verify-logs'
+        fake_cmd = self._streaming_fake_cmd(
+            lambda cwd: (1, XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT),
+        )
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(
+                tmp_path, config, is_merge_verify=True, role='merge',
+                task_id='5527', archive_root=archive_root,
+            )
+
+        assert result.passed is False
+        assert result.archive_log_paths
+        assert all(Path(p).exists() for p in result.archive_log_paths)
 
     @pytest.mark.asyncio
     async def test_crash_with_real_failure_does_not_raise(self, tmp_path: Path):

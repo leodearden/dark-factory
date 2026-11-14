@@ -519,6 +519,15 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .node .id { font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
 .taskgraph .node .ttl { font-size: 11px; color: var(--fg-1); line-height: 1.25; white-space: normal; }
 .taskgraph .node .meta { display: flex; gap: 6px; align-items: center; margin-top: 2px; }
+.deferral { display: flex; gap: 6px; align-items: baseline; min-width: 0; font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.taskgraph .node .deferral { font-size: 10px; margin-top: 2px; }
+.deferral .deferral-text { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.deferral .deferral-age { flex: none; color: var(--fg-3); }
+.deferral .deferral-human { flex: none; font-size: 9px; padding: 0 3px; border: 1px solid currentColor; border-radius: 3px; }
+.deferral[data-state="held"] { color: var(--fg-2); }
+.deferral[data-state="needs_human"], .deferral[data-state="unrecorded"] { color: var(--warn); }
+.deferral[data-state="unknown"] { color: var(--fg-3); font-style: italic; }
+.proj-head .deferral-chip { color: var(--warn); font-size: 10px; }
 .taskgraph .node.dim { opacity: 0.5; }
 .taskgraph .node .status-pip { width: 6px; height: 6px; border-radius: 50%; }
 .taskgraph .node.s-in-progress .status-pip { background: var(--accent); box-shadow: 0 0 4px oklch(0.72 0.14 230 / 0.6); }
@@ -551,64 +560,74 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .singleton-strip .strip-label { font-size: 10px; color: var(--fg-3); font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 6px; }
 .taskgraph .singleton-strip .row { gap: 6px; margin-bottom: 0; }
 
-/* ── Tasks tab: "group by PRD" boxes (task 2530) ──
-   The hoisted cross-box edges overlay (step-14) is a direct child of
-   .prd-groups rather than of a .taskgraph, so it needs its own positioned
-   container + absolute-overlay rule mirroring ".taskgraph svg.edges" above;
-   nodes rendered inside each box still get that rule for free because each
-   box's body is its own nested .taskgraph (TaskGraph with renderEdges=false). */
-.prd-groups { position: relative; display: flex; flex-direction: column; gap: 14px; }
-.prd-groups > svg.edges { position: absolute; inset: 0; pointer-events: none; width: 100%; height: 100%; }
-
-.prd-box {
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--bg-1);
-  overflow: hidden;
+/* ── Tasks tab: the PRD lanes page (prd_lanes.jsx, task 6585) ── */
+.prd-lanes { display: flex; flex-direction: column; gap: 12px; padding: 4px 0; }
+.prd-lanes-head { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; font-size: 11px; color: var(--fg-1); }
+.prd-legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 10px; color: var(--fg-2); font-family: var(--mono); }
+.prd-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+.prd-legend-swatch { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.prd-lane { border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg-1); overflow: hidden; }
+.prd-lane-head {
+  padding: 6px 10px; border-bottom: 1px solid var(--line);
+  font-size: 10px; font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.1em; color: var(--fg-2);
 }
-.prd-box-head {
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 10px;
-  cursor: pointer; user-select: none;
-  border-bottom: 1px solid var(--line);
-  transition: background .12s;
-}
-.prd-box-head:hover { background: var(--bg-2); }
-.prd-box-head .twirl {
-  width: 14px; height: 14px; flex: none;
-  display: inline-flex; align-items: center; justify-content: center;
-  color: var(--fg-3);
-  transition: transform .15s ease;
-}
-.prd-box-head[data-open="true"] .twirl { transform: rotate(90deg); color: var(--fg-1); }
-.prd-box-head .status-pip { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--fg-3); }
-.prd-box-title {
-  flex: 1 1 auto; min-width: 0;
-  font-weight: 600; font-size: 12px; color: var(--fg-1);
+.prd-tail-line {
+  display: block; width: 100%; padding: 8px 10px; text-align: left;
+  border: none; background: transparent; color: var(--fg-2); font-size: 12px; cursor: pointer;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.prd-box-count { flex: none; font-family: var(--mono); font-size: 10px; color: var(--fg-3); }
-
-/* Thin stacked status bar: one segment per summarizePrdMembers() bucket,
-   width set inline (data-driven) by the JSX; color comes from the class. */
-.prd-bar { height: 4px; background: var(--bg-2); display: flex; overflow: hidden; }
-.prd-bar-seg { display: block; height: 100%; }
-
-.prd-box-body { padding-top: 2px; } /* the nested .taskgraph supplies its own 12px padding */
-
-/* Status-colored outline + pip, driven by aggregatePrdStatus() via a
-   status class on the box — mirrors the .taskgraph .node.s-* idiom:
-   blocked->bad, in-progress->accent, pending->warn, done->ok, cancelled->fg-3. */
-.prd-box.s-blocked     { border-color: oklch(0.68 0.18 25  / 0.5); }
-.prd-box.s-in-progress { border-color: oklch(0.72 0.14 230 / 0.5); }
-.prd-box.s-pending      { border-color: oklch(0.80 0.14 80  / 0.5); }
-.prd-box.s-done         { border-color: oklch(0.74 0.14 155 / 0.35); opacity: 0.85; }
-.prd-box.s-cancelled    { border-color: var(--line); opacity: 0.6; }
-.prd-box.s-blocked      .status-pip { background: var(--bad); box-shadow: 0 0 4px oklch(0.68 0.18 25 / 0.5); }
-.prd-box.s-in-progress  .status-pip { background: var(--accent); box-shadow: 0 0 4px oklch(0.72 0.14 230 / 0.6); }
-.prd-box.s-pending      .status-pip { background: var(--warn); }
-.prd-box.s-done         .status-pip { background: var(--ok); }
-.prd-box.s-cancelled    .status-pip { background: var(--fg-3); }
+.prd-tail-line:hover { background: var(--bg-2); color: var(--fg-0); }
+.prd-row + .prd-row { border-top: 1px solid var(--line); }
+.prd-row-head {
+  display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 2fr) 120px auto auto auto auto;
+  align-items: center; gap: 10px; padding: 6px 10px;
+  font-size: 12px; cursor: pointer; user-select: none;
+}
+.prd-row-head:hover { background: var(--bg-2); }
+.prd-title { font-weight: 600; color: var(--fg-1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prd-state { color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prd-total, .prd-signal, .prd-ready { font-family: var(--mono); font-size: 11px; color: var(--fg-2); white-space: nowrap; }
+.prd-ready.overdue { color: var(--bad); }
+.prd-action {
+  font-size: 10px; font-family: var(--mono); padding: 1px 6px; border-radius: 999px; white-space: nowrap;
+  border: 1px solid var(--line); color: var(--fg-1);
+}
+.prd-action-rule_on { color: var(--bad); border-color: var(--bad); }
+.prd-action-dispatch { color: var(--warn); border-color: var(--warn); }
+.prd-action-unblock_dependency { color: var(--info); border-color: var(--info); }
+.prd-action-record_deferral { color: var(--fg-2); }
+.prd-bar { display: flex; gap: 2px; height: 6px; background: transparent; overflow: hidden; border-radius: 2px; }
+.prd-bar-seg { display: block; height: 100%; min-width: 2px; flex-basis: 0; }
+.prd-bar-seg-empty { display: none; }
+.prd-row-body { padding: 4px 10px 10px; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.prd-detail { display: flex; flex-direction: column; gap: 4px; }
+.prd-detail > div { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.prd-not-drawn, .prd-lanes .muted, .prd-contention.muted { color: var(--fg-3); font-size: 11px; }
+.dark-matter { border: 1px dashed var(--line); border-radius: var(--radius); padding: 6px 10px; font-size: 11px; color: var(--fg-2); }
+.dark-matter-head { display: flex; align-items: center; gap: 6px; }
+.dark-matter-toggle, .dark-matter-more {
+  font-size: 10px; font-family: var(--mono); color: var(--fg-3); cursor: pointer;
+  padding: 1px 6px; border-radius: 3px; border: 1px solid var(--line); background: transparent;
+}
+.dark-matter-toggle:hover, .dark-matter-more:hover { color: var(--fg-0); border-color: var(--line-strong); }
+.dark-matter-hidden-high { color: var(--warn); margin-top: 4px; }
+.dark-matter-group { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
+.dark-matter-row {
+  text-align: left; border: none; background: transparent; color: var(--fg-1); cursor: pointer; padding: 1px 0; font-size: 11px;
+}
+.dark-matter-row:hover { color: var(--accent); }
+.prd-footer { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; font-size: 11px; color: var(--fg-3); }
+.prd-footer .pip, .prd-lanes-head .pip, .prd-contention-head .pip {
+  display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 10px;
+}
+.prd-footer .pip-dot, .prd-lanes-head .pip-dot, .prd-contention-head .pip-dot { width: 7px; height: 7px; border-radius: 50%; }
+.prd-contention {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  padding: 4px 0 8px; font-size: 11px; font-family: var(--mono); color: var(--fg-2);
+}
+.prd-contention-head { display: inline-flex; align-items: center; gap: 6px; color: var(--fg-1); }
+.prd-contention-entry { color: var(--fg-1); }
+.prd-unknown { font-style: normal; }
 
 /* Focus mode affordance: chip in the filter bar naming the active focus
    target, and the panel-head "focus" button that enters it (sized/colored

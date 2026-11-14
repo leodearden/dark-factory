@@ -54,7 +54,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import math
 import sys
@@ -78,39 +77,22 @@ from fused_memory.server.write_triage_judge import (
     resolve_judge_provider,
     resolve_judge_reasoning_effort,
 )
+from fused_memory.utils.script_loader import load_script
 
 _SCRIPTS = Path(__file__).resolve().parent
 _PACKAGE_ROOT = _SCRIPTS.parent
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_scorer = _load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
-_wording = _load_script(_SCRIPTS / 'write_triage_judge_wording.py', 'write_triage_judge_wording')
-_freeze = _load_script(
+_scorer = load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
+_wording = load_script(_SCRIPTS / 'write_triage_judge_wording.py', 'write_triage_judge_wording')
+_freeze = load_script(
     _SCRIPTS / 'freeze_write_triage_population.py', 'freeze_write_triage_population',
 )
-_arms = _load_script(
+_arms = load_script(
     _SCRIPTS / 'run_write_triage_population_arms.py', 'run_write_triage_population_arms',
 )
-_gate = _load_script(
+_gate = load_script(
     _REPO_ROOT / 'scripts' / 'check_write_triage_readiness_gate.py',
     'check_write_triage_readiness_gate',
 )

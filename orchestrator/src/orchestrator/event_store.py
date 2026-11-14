@@ -12,9 +12,12 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum, StrEnum
+from enum import Enum, StrEnum, unique
 from pathlib import Path
+from typing import Any
 
 from shared.sqlite_sync_base import CheckpointResult, apply_full_durability_pragmas_sync
 
@@ -84,13 +87,23 @@ class EventType(StrEnum):
     # One info-severity L0 was dispositioned by the router or the reviewer leg
     # (plans/info-l0-disposition-router-prd.md D11).  The escalation record is
     # the fact's home; this row is telemetry naming it, keyed on the subject's
-    # REAL task_id.
+    # REAL task_id (a reviewer-leg row on the reviewing task's, which is the
+    # subject's own whenever the disposition is applied).
     # data: {escalation_id, class, by, exit_kind, ticket, task_id, decided_at}
     #   class: the escalation.disposition class written (a RESOLUTION_CLASSES
     #   member when the record closed); by: the dispositioning actor;
-    #   exit_kind: an escalation.disposition.ExitKind value; ticket: the
+    #   exit_kind: an escalation.disposition.ExitKind value, or null for a
+    #   reviewer-leg disposition, which is made at no exit; ticket: the
     #   curator ticket id, or null; decided_at: ISO-8601 UTC.
     info_l0_dispositioned = 'info_l0_dispositioned'
+    # A briefing carried the task's escalation rulings (task 4764).  Producer:
+    # orchestrator/workflow.py::TaskWorkflow._record_rulings_briefed, once per
+    # build that found any and, for a review round, which reads the rulings
+    # once, once per reviewer briefed; the role column is the briefed role.
+    # data: {escalation_ids, since}
+    #   escalation_ids: the rulings listed, oldest first; since: the ISO-8601
+    #   plan-confirmation cutoff they were selected after, or null for every ruling.
+    escalation_rulings_briefed = 'escalation_rulings_briefed'
 
     # Waste detection
     waste_detected = 'waste_detected'
@@ -105,10 +118,31 @@ class EventType(StrEnum):
     # by evidencing the DURABLE write; persisted=False means the in-memory
     # narrowing applied but the metadata write failed (non-critical).
     set_to_plan = 'set_to_plan'
+    # A writer's scope moving past its declared files, one row per boundary
+    # that had something to apply; the row's phase is the workflow phase the
+    # boundary ran in.  Payload: {reason, boundary, role, iteration,
+    # requested, acquired, contested: {path: holder}}.  The reasons and the
+    # boundary kinds live in orchestrator/src/orchestrator/scope_drift.py
+    # (ScopeDriftReason, ScopeBoundary); task 4371 adds its own reason there.
+    scope_drift = 'scope_drift'
+    # Declared-vs-landed at done, from
+    # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_landed_scope.
+    # One row per done-time reconcile of a MEASURED merge diff.  data:
+    # {merge_sha, landed, plan_files: BASIS | null, metadata_files: BASIS | null}
+    # where BASIS is {declared, undeclared, undelivered}.  plan_files: plan.json
+    # files as held at done (architect declaration plus steward scope grants;
+    # the census basis), null when no plan was loaded.  metadata_files: the
+    # last-persisted metadata.files this reconcile overwrites, null when the
+    # backend read failed.  Coverage rule:
+    # orchestrator/src/orchestrator/merge_lane/gates.py::declaration_coverage
+    # (no rename arm).  Reading the series: docs/landed-scope-diff.md.
+    landed_scope_diff = 'landed_scope_diff'
     merge_attempt = 'merge_attempt'
     # The merge worker's POST-rebase verify verdict (task_id-keyed).  data:
     # {runner, merge_sha, passed, duration_ms, attempt, depth, speculative}
-    # (depth/speculative always-present, None when absent — task 2340), PLUS
+    # (depth/speculative always-present, None when absent — task 2340;
+    # duration_ms, the dispatch wall time in ms, rides in data ONLY: the
+    # events.duration_ms column stays NULL for this type), PLUS
     # two always-present retry-scope keys (task 2837, PRD verify-retry-
     # failed-only D5) derived from spec.verify_env — the D2 failed-only retry
     # contract the orchestrator ITSELF built and shipped to reify, NOT a reify
@@ -153,7 +187,13 @@ class EventType(StrEnum):
     #                verified (see ProbePlacement's known-limitation note), so
     #                probe-era `depth` values are excluded from calibration.
     #                `chain_items` is derived from the tree that actually ran
-    #                and carries no such caveat.
+    #                and carries no such caveat.  PRD OQ#4 (task 3188 ε):
+    #                `depth` keeps being emitted alongside `chain_items` for
+    #                one release and task 4767 retires it; where both are
+    #                present `chain_items` is authoritative, and a `depth`-only
+    #                row is counted by
+    #                orchestrator/src/orchestrator/chain_telemetry.py::_is_legacy_deep_label,
+    #                never bucketed.
     # PLUS its always-present-but-NULLABLE companion (task 3185 amend,
     # reviewer_comprehensive performance):
     #   chain_build_ms  int | None.  Wall-clock milliseconds the deep chain
@@ -179,7 +219,23 @@ class EventType(StrEnum):
     #                Measured by _deep_chain_placement, not by build_chain, so
     #                it covers the FULL stall: lane acquisition, the sequential
     #                merges, and the asyncio.timeout wrapper's overhead.
+    # PLUS three always-present, nullable keys (task 5651): plan_hash,
+    # cache_mode and units, defined by
+    # orchestrator/src/orchestrator/verify_evidence.py::verify_event_fields.
+    # PLUS two always-present, nullable keys (task 8523): runner_reason (why
+    # the verify ran on that host) and base_relation (what the merge was built
+    # on); vocabulary in orchestrator/src/orchestrator/merge_verify_facts.py,
+    # rationale in plans/merge-lane-policy-prd.md D10.
     merge_verify = 'merge_verify'
+    # The merge lane cancelled a still-running merge verify (task 8523).
+    # task_id-keyed, phase='merge'; emitted by
+    # orchestrator/src/orchestrator/merge_lane/worker.py::
+    # SpeculativeMergeWorker._teardown_verify_task.  data {elapsed_ms, fraction,
+    # cause, host} per orchestrator/src/orchestrator/merge_lane/
+    # verify_cancellation.py::merge_verify_cancelled_data: elapsed from the
+    # entry's dispatch; fraction against the host's rolling median completed
+    # verify, null until that host has completed one in this process.
+    merge_verify_cancelled = 'merge_verify_cancelled'
     # A merge-role scoped-verify red that the isolated-rerun-confirm gate
     # (verify.apply_merge_flake_suppression, PRD task α) demonstrated was a
     # CPU-starvation flake and suppressed so the merge could proceed.
@@ -194,18 +250,29 @@ class EventType(StrEnum):
     # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::
     # NoProgressAbort.event_data.
     merge_verify_progress_abort = 'merge_verify_progress_abort'
-    # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
-    # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from
-    # merge_verify, which is the merge worker's POST-rebase verify (branch
-    # already merged onto CURRENT main).  task_id-keyed; data carries at least
-    # {passed: bool, base_sha: str, branch: str}.  Consumed by the merge-skew
-    # attribution classifier's I5 branch-green fact (merge_disposition.
-    # _branch_pre_merge_verify_green).  Task 2381 α adds this member + the
-    # reader; task 2383 β emits it at the workflow VERIFY-pass site.  Its
-    # ABSENCE is honest, not a bug: non-orchestrator paths (/merge-queue,
-    # /unblock, /do) submit branches without emitting it -> classifier
-    # degrades to INDETERMINATE by design.
+    # One decision of the post-rebase re-verify gate, skip and fire alike,
+    # written before any re-verify runs. task_id-keyed, phase='merge'; data is
+    # defined by orchestrator/src/orchestrator/merge_lane/reverify_gate_decision.py::
+    # ReverifyGateDecision.event_data. A fire's verdict is the merge_verify row
+    # with the same task_id and merge_sha.
+    merge_reverify_gate = 'merge_reverify_gate'
+    # The branch's OWN verify verdict at its tip, before any merge onto main —
+    # distinct from merge_verify, the merge worker's verify of the branch
+    # merged onto CURRENT main.  task_id-keyed; data is defined by
+    # orchestrator/src/orchestrator/verify_evidence.py::workflow_verify_event_data,
+    # and VerifySite there names every emitting site and what each reader
+    # makes of its rows.  A 2752 checkpoint hit emits
+    # phase_skipped(verify, reason='durable_verified_green') INSTEAD of this
+    # row.  A non-orchestrator path (/merge-queue, /unblock, /do) emits it only
+    # through merge_request(verified_green=True); without that vouch it is
+    # absent, honestly, and the I5 branch-green fact
+    # (orchestrator/src/orchestrator/merge_lane/disposition.py::
+    # _branch_pre_merge_verify_green) degrades to INDETERMINATE by design.
     workflow_verify = 'workflow_verify'
+    # Client-feed θ (plans/client-feed-prd.md §4 decision 16). Producer:
+    # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._emit_review_completed; data:
+    # orchestrator/src/orchestrator/review_outcome.py::review_completed_payload.
+    review_completed = 'review_completed'
     # Local-vs-remote verdict AGREEMENT.  THREE producers emit this member with
     # deliberately DIFFERENT data shapes — read the producer before the payload:
     #   - verify_runner.DriftDetector.check (the off-lane drift detective) emits
@@ -221,6 +288,11 @@ class EventType(StrEnum):
     #   - merge_shadow's warm/cold compare emits a wholly different
     #     {merge_commit, shadow_compare, warm_test_count, cold_test_count}.
     verdict_parity_ok = 'verdict_parity_ok'
+    # A due drift check could not acquire both host slots within its settle
+    # window, so it ran nothing and re-arms for the next landing.  Producer:
+    # merge_lane/drift.py::_run_drift_check.  Payload {merge_sha,
+    # consecutive_deferrals, hosts}, hosts being HostAllocator.host_states().
+    drift_check_deferred = 'drift_check_deferred'
     # Land-time remote-green cross-check (task 2822, fix b) telemetry. The
     # AGREE case reuses verdict_parity_ok above; these two give the divergence
     # and local-infra-inconclusive outcomes their own auditable types.
@@ -232,6 +304,24 @@ class EventType(StrEnum):
     # is recorded.
     verify_cross_check_mismatch = 'verify_cross_check_mismatch'
     verify_cross_check_inconclusive = 'verify_cross_check_inconclusive'
+    # Host-ENVIRONMENT parity at the drift-check cadence (task 4537, Lever C).
+    # Sibling of verdict_parity_ok above, and deliberately NOT folded into it:
+    # verdict_parity_ok says the two hosts reached the same verdict, which two
+    # hosts running different tool versions do on almost every commit — right
+    # up until the one where they don't.  These two say whether the hosts are
+    # running the same TOOLS in the first place.
+    #   verify_env_parity_ok: every compared probe matched.  Payload
+    #     {local_runner, remote_runner, probe_keys: [str], dimensions: [str]}.
+    #   verify_env_divergence: at least one probe differs.  Payload
+    #     {local_runner, remote_runner, drift_dimensions: [str],
+    #      diverging_probes: {key: {'local': str, 'remote': str}}} — both
+    #     values are carried so an operator can read the skew straight off the
+    #     event without re-probing either host.
+    # Env divergence is a DETECTIVE control only: it alarms (one deduped L1)
+    # and never quarantines, so a cosmetic probe difference cannot bench a
+    # verify host.  Absent when verify_env_probes is [] (the shipped default).
+    verify_env_parity_ok = 'verify_env_parity_ok'
+    verify_env_divergence = 'verify_env_divergence'
     # data.queue_depth = depth-at-enqueue INCLUDING the newly-queued item
     # (CAS-retry: qsize()+len(urgent)+1; plain enqueue: qsize() after put)
     merge_queued = 'merge_queued'
@@ -246,18 +336,29 @@ class EventType(StrEnum):
     # crossing the streak or time threshold).  Payload: {host, reason}.
     verify_host_unreachable = 'verify_host_unreachable'
     # Emitted when a previously-unreachable remote verify host passes health()
-    # and is cleared back into the live pool.  Payload: {host, downtime_s}.
+    # and is cleared back into the live pool.  Payload: {host, downtime_s}; a
+    # host re-admitted from a skew bench adds quarantine_class='skew'.
     verify_host_recovered = 'verify_host_recovered'
+    # Task 6565 (design D6): a remote verify host was benched in the 'skew'
+    # class — reached, but it could not run the dispatcher's gate or gave no
+    # usable verdict.  Emitted by the merge worker on every such bench.
+    # Payload: {host, kind, reason, sticky, code_sha, identity} where identity
+    # is GateIdentityPair.to_wire() or null.
+    verify_host_skew = 'verify_host_skew'
     # Emitted from enqueue_merge_request's terminal done-callback when a
     # MergeRequest future reaches its final state (resolved, cancelled, or
     # exception).  Payload shape: {request_id, branch, state, snapshot_tip,
-    # merge_sha, superseded_by, generation, reason, landed_via_chain}.  state
+    # merge_sha, superseded_by, generation, reason, landed_via_chain,
+    # absorbed_request_ids, queue_to_land_secs}.  state
     # is one of MergeOutcome.status values, 'abandoned' (cancelled future), or
     # 'error' (unexpected exception).  landed_via_chain is 1 on an item landed
     # by a deep merge-ahead chain walk and None otherwise (task 3186 δ); it is
     # what scripts/merge-deep-canary-predicate.sh sums for its items-landed-
     # per-deep-verify statistic.  (superseded_by/generation/reason had been
     # emitted but undocumented here; listed now rather than left stale.)
+    # queue_to_land_secs (task 8523) is seconds on the monotonic clock from
+    # this request's own enqueue to its finalize, present on every state;
+    # readers filter state='done'.
     merge_finalized = 'merge_finalized'
     # Unconditional observability of the generic merge-blocked fall-through in
     # TaskWorkflow._submit_to_merge_queue.  Emitted BEFORE _mark_blocked and
@@ -295,35 +396,41 @@ class EventType(StrEnum):
     # in-worktree path is None-safe (correctness fix still applies; only the
     # event is dispatch-local, mirroring merge_flake_suppressed).
     trivial_pass_escalated = 'trivial_pass_escalated'
-    # Contract-currency (INV-2, plans/merge-verdict-integrity-prd.md §1, §3.1,
-    # §3.7) telemetry for the RemoteRunner auto-sync-at-dispatch gate.  A
-    # RemoteRunner's adoptable post-merge verdict is trustworthy only if the
-    # runner executed CURRENT gate logic; incident bb834dd42a is the laptop's
-    # Dark-Factory *code* checkout frozen ~5 weeks, rubber-stamping trivial
-    # PASSes (966f23a6).  Both are queue/runner-scoped (task_id optional; the
-    # sync happens before/around dispatch, not necessarily bound to one task).
+    # Contract-currency (INV-2, plans/merge-verdict-integrity-prd.md §1, §3.1)
+    # telemetry: a RemoteRunner's verdict is adoptable only if the remote ran
+    # the dispatcher's own gate code.  Since task 6565 every remote verify runs
+    # in an immutable gate checkout of the dispatcher's deployed sha
+    # (RemoteRunner.ensure_gate).  Both are runner-scoped (task_id optional).
     #
-    # runner_stale: emitted by RemoteRunner.sync_if_stale when the remote
-    # DF-code checkout HEAD differs from the dispatcher's local DF HEAD
-    # (staleness detected, BEFORE any sync/pull is attempted).  data carries
-    # {runner, local_head, remote_head}.
+    # runner_stale: emitted by RemoteRunner.ensure_gate when the remote had no
+    # ready gate of the deployed sha and ensure-gate.sh had to build one.  data
+    # carries {runner, local_head: the deployed sha, remote_head: the sha this
+    # runner's previous successful ensure used, or null}.
     #
-    # runner_synced: emitted when the remote git state was brought current with
-    # the dispatcher — either the DF-code checkout (git pull --ff-only + uv
-    # sync, kind='df_checkout') or the project checkout's main ref (mirror
-    # force-push after a non-fast-forward, kind='project_main_mirror').  data
-    # carries {runner, kind, from_head, to_head, forced}; kind ∈ {'df_checkout',
-    # 'project_main_mirror'}; forced is True only on the project-main mirror
-    # force-push arm.
+    # runner_synced: emitted when the remote was brought current with the
+    # dispatcher — a gate checkout built for the deployed sha (right after
+    # runner_stale, kind='gate_checkout'), or the project checkout's main ref
+    # mirror-forced after a non-fast-forward (kind='project_main_mirror').  data
+    # carries {runner, kind, from_head, to_head, forced}; forced is True only on
+    # the project-main mirror arm.
     runner_stale = 'runner_stale'
     runner_synced = 'runner_synced'
+    # Task 6565 (design D1): the process's deployed sha is flagged — HEAD moved
+    # while the wire path was being imported (indeterminate), or a tracked
+    # wire-path file was dirty.  Emitted once at startup by
+    # Harness._announce_deployed_sha; data is DeployedSha.to_wire():
+    # {sha, indeterminate, dirty_wire_path}.  The remote gate stays in use.
+    deployed_sha_indeterminate = 'deployed_sha_indeterminate'
     # INV-3 chain-intact enforcement (PRD plans/merge-verdict-integrity-prd.md
     # §3.7 new vocab).  Emitted whenever a verdict (PASS or FAIL) is VOIDED
     # because its verified tree no longer chains onto a still-live prefix — the
     # item's base_sha points at a dead commit (failed/ejected/superseded/
     # re-merged since verify dispatch).  A distinct type (not speculative_discard)
     # so the phantom-block-avoided signal is separately countable via the event
-    # census.  data: {dead_link, reason ('chain_dead'), point ('dispatch'|'adoption')}.
+    # census.  data: {dead_link, reason ('chain_dead'), point ('dispatch'|'adoption'),
+    # item_commit (the voided item's own merge commit), killer ({site, task_id}:
+    # the DeadBaseSite and task whose lane event recorded dead_link dead, null
+    # when unknown; vocabulary in merge_lane/dead_base_ledger.py, task 8523)}.
     verdict_voided = 'verdict_voided'
 
     # Task lifecycle
@@ -493,15 +600,18 @@ class EventType(StrEnum):
     # That is also why this population, and not the guard's, is dense enough to
     # carry an alarm — see the streak note below.
     #
-    # THE INV-4 STORM STREAK'S SOLE GENUINE FEEDER since task ε/3733. Every row
-    # here is also reported to Harness.note_resume_failed, which subtracts the
-    # by-design carve-out and counts what is left as a chained run. FEEDS the
-    # streak: stage='cli' always (the restore ran a phase earlier and is not
-    # what failed), and stage='pre_flight' with restore 'fault' or 'published'.
-    # Does NOT feed it: restore 'disabled' (the kill switch) and 'miss' (the
-    # archive-COVERAGE signal, which belongs on a RATE watch rather than a
-    # consecutive-run detector) — harness.py::_BY_DESIGN_RESTORE_OUTCOMES. A
-    # restore outcome added later is GENUINE by default and must be added to
+    # THE INV-4 STORM STREAK'S SOLE GENUINE FEEDER since task ε/3733. Every
+    # TaskWorkflow row here is also reported to Harness.note_resume_failed,
+    # which subtracts the by-design carve-out and counts what is left as a
+    # chained run. FEEDS the streak: stage='cli' from a task workflow — since
+    # task 5579 that means the CLI rejected the armed session before any model
+    # turn (the restore ran a phase earlier and is not what failed) — and
+    # stage='pre_flight' with restore 'fault' or 'published'. Does NOT feed it:
+    # restore 'disabled' (the kill switch) and 'miss' (the archive-COVERAGE
+    # signal, which belongs on a RATE watch rather than a consecutive-run
+    # detector) — harness.py::_BY_DESIGN_RESTORE_OUTCOMES — and steward rows
+    # (data.role == 'steward'), which never reach Harness.note_resume_failed.
+    # A restore outcome added later is GENUINE by default and must be added to
     # that constant to be exempted. No new EventType was introduced for the
     # feeder and no fourth term was added to the ratio denominator below: these
     # rows already ARE the population, and a second event would be a second
@@ -510,10 +620,10 @@ class EventType(StrEnum):
     # NOT part of the ratio recipe's denominator above, and this is the one
     # thing to get right when querying it. The three events above are emitted by
     # the _run_slot guard, exactly once per DISPATCH that carried a recovered
-    # session. This one is emitted by TaskWorkflow._invoke, i.e. once per
-    # INVOCATION — and a single dispatch invokes several roles — so adding it to
-    # that sum would compare populations counted on different units and silently
-    # inflate the attempt count.
+    # session. This one is emitted by TaskWorkflow._invoke (and by the steward),
+    # i.e. once per INVOCATION — and a single dispatch invokes several roles —
+    # so adding it to that sum would compare populations counted on different
+    # units and silently inflate the attempt count.
     #
     # data.stage splits the two ways an adopted resume dies:
     #   pre_flight — _invoke corroborated the session against the config dir it
@@ -532,9 +642,11 @@ class EventType(StrEnum):
     #                'published' (restore claimed success yet the CLI-facing
     #                locator still cannot see it: pathological, unreachable by
     #                construction, counted rather than assumed away).
-    #   cli        — the resume WAS armed and the CLI rejected it;
-    #                invoke_with_cap_retry silently retried fresh and returned a
-    #                SUCCESS, so nothing else anywhere records the loss. data:
+    #   cli        — the resume WAS armed and the CLI REJECTED it before any
+    #                model turn (shared/cli_invoke.py::is_resume_rejected), so
+    #                invoke_with_cap_retry retried fresh — a retry that may
+    #                itself fail — and nothing else anywhere records the loss.
+    #                data, built by cli_resume_failed_data:
     #                {stage, session_id, session_ids, role, fallbacks}, where
     #                `fallbacks` is AgentResult.resume_fallbacks — the count of
     #                fresh retries this one invocation had to make — and
@@ -545,19 +657,44 @@ class EventType(StrEnum):
     #                resume its retry loop re-armed internally after a cap hit,
     #                which a plain fresh dispatch can reach, and counting those
     #                would inflate the ratio below past 1.
+    #                A resumed run that ran turns and THEN ended non-success
+    #                (the ended_awaiting_background downgrade, a budget kill) is
+    #                a SURVIVING resume: it emits nothing here and reports
+    #                note_resume_succeeded (task 5579). Rows written before 5579
+    #                are contaminated by exactly that population: 0 of 25
+    #                measured were rejections.
+    #                The steward also emits stage='cli' rows, data.role ==
+    #                'steward'. Those are live-continuation resumes, never
+    #                adopted by the _run_slot guard and never fed to the INV-4
+    #                streak, so exclude them from the ratio below.
     #
     # SQL split, alongside session_resume_fallback's '$.reasons' /
     # '$.archive_available' ones:
     #   SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
     #     FROM events WHERE event_type = 'session_resume_failed'
     #    GROUP BY stage;
-    # Read it against session_resume (the adopted-resume count) rather than
-    # against the three-event sum: it answers "of the resumes we decided to
-    # make, how many did not survive to the agent?".
+    # Read it, without the steward rows, against session_resume (the
+    # adopted-resume count) rather than against the three-event sum: it answers
+    # "of the resumes we decided to make, how many did not survive to the
+    # agent?".
     session_resume_failed = 'session_resume_failed'
+
+    # Boot reap of a zombie agent_session.json (plans/session-resume-eligibility-seam-prd.md
+    # γ/D7), producer harness.py::Harness._reap_zombie_sidecars. One row per
+    # cleared sidecar; data: {sidecar_path, task_id, owner_pid, age_secs, status}.
+    sidecar_reaped = 'sidecar_reaped'
+    # One row per boot scan, zero-reap boots included; data:
+    # agent_session_reaper.py::ReapTally.event_data.
+    sidecar_reap_summary = 'sidecar_reap_summary'
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
+    # Producer: scheduler.py::Scheduler._update_age_anchors.  Payload
+    # {anchor: int, pending_since: str}: the max_id the task's age now counts
+    # from, and the stamp whose change signalled the reset.  Emitted once per
+    # applied reset; restoring that anchor at a later process start emits
+    # nothing.
+    age_anchor_reset = 'age_anchor_reset'
     # Producer of both: scheduler.py::Scheduler._complete_parks (semantics there).
     # Every emitted reservation_* event carries data.source in {pin, fairness}
     # (task 6040): an operator pin's reservation, or the automatic machinery's.
@@ -566,6 +703,8 @@ class EventType(StrEnum):
     # lies above every tier, so no tier describes it.
     reservation_installed = 'reservation_installed'
     reservation_install_blocked = 'reservation_install_blocked'
+    # reservation_expired reasons: owner-state ones on scheduler.py::Scheduler._park_hold_refusal,
+    # pin-phase ones on pin_reservation.py::PinReleaseReason.
     reservation_expired = 'reservation_expired'
     reservation_evicted = 'reservation_evicted'
     reservation_shadowed = 'reservation_shadowed'
@@ -580,6 +719,13 @@ class EventType(StrEnum):
     # when the pin becomes blocked, then at most once per
     # pin_blocked_emit_interval_secs while it stays blocked.
     pin_blocked = 'pin_blocked'
+    # The starvation watchdog fired on a task (task 3821).  Producer, and the
+    # one statement of the payload: scheduler.py::Scheduler._deliver_starvation_finding,
+    # whose pin fields come from starvation_watchdog.py::PinOutcome.as_payload;
+    # predicate in starvation_watchdog.py::classify.  Emitted once per firing
+    # (deduped by the watchdog's escalated set, which survives restarts), and
+    # once more when a firing the auto-pin cap turned away gets a slot.
+    starvation_detected = 'starvation_detected'
     # Emitted once per acquire_next tick when the fused-memory task read
     # FAILED (distinct from a genuinely empty project) and the park-eviction
     # drain was therefore SKIPPED (fail-safe, survey finding C3).
@@ -665,6 +811,15 @@ class EventType(StrEnum):
 
     # Plan revalidation
     plan_revalidated = 'plan_revalidated'
+    # Task 4031 — the revalidation branch found the plan's _task_text_fp absent or unequal to the
+    #   task's current text; the Lever-B skip is declined and the architect told.
+    #   data: {drift, plan_text_fp, task_text_fp, plan_session_id}
+    plan_text_drift = 'plan_text_drift'
+    # Task 4032 — a revalidated plan dropped a done step without a descope record or newly
+    #   shared a done commit, and one remedy architect pass did not fix it; the prior plan is
+    #   restored and the task takes the no-plan hold.
+    #   data: DoneStepIntegrityVerdict.to_dict()
+    done_step_integrity_refused = 'done_step_integrity_refused'
 
     # Config hot-reload (plans/config-hot-reload-prd.md, task beta) — emitted
     # by Harness.reload_config() on every call, success or failure. Data
@@ -721,8 +876,14 @@ class EventType(StrEnum):
     # Audit (task 1333): exhaustive repo search found ZERO in-repo consumers
     # that ever filtered reservation_installed by data.reason == 'reserve_now'.
     # Downstream consumers outside this repo must migrate; see CHANGELOG.md.
+    # reserve_now_refused (task 6518): producer
+    # scheduler.py::Scheduler._phase_reserve_now, when the owner fails the
+    # park-hold predicate; the flag is consumed and nothing installs.  Data
+    # {reason}, in the owner-state reservation_expired vocabulary documented
+    # on scheduler.py::Scheduler._park_hold_refusal.
     reserve_now_armed = 'reserve_now_armed'
     reserve_now_consumed = 'reserve_now_consumed'
+    reserve_now_refused = 'reserve_now_refused'
 
     # Worktree hygiene (Fix B/C) — emitted when an orphaned or identity-
     # mismatched worktree is relocated to the sibling ``-orphaned`` base
@@ -787,13 +948,16 @@ class EventType(StrEnum):
     # candidates are exempt (DA-D4) and never produce this event.  Emitted at
     # most once per ``acquire_next`` tick — on the FIRST heavy candidate
     # skipped, across both the pinned and scored dispatch loops.
-    # data keys: {metric, value, in_flight, floor}
-    #   metric:    the PSI field name that tripped saturation, chosen in
-    #              ranked order cpu_some_avg10 > mem_some_avg10 >
-    #              mem_full_avg10 > io_some_avg10 (DA-D1)
-    #   value:     that metric's sampled avg10 value (float)
+    # data keys: {metric, in_flight, floor, sample}
+    #   metric:    the tripping PsiAdmissionConfig threshold field name, ranked
+    #              by shared/src/shared/psi.py::PsiSample.tripping_metric (rank
+    #              owned by plans/load-throttle-harmonisation-prd.md D10)
     #   in_flight: len(Scheduler._dispatched) at decision time (int)
     #   floor:     config.psi_admission.min_inflight_floor (int)
+    #   sample:    dataclasses.asdict(PsiSample) — every reading, every
+    #              per-component read_ok, and own_cgroup
+    # Rows written before task 3590 carry `value` (the metric's reading)
+    # instead of `sample`.
     dispatch_deferred = 'dispatch_deferred'
 
     # Per-tick latency breakdown for Scheduler.acquire_next, emitted once at
@@ -926,6 +1090,19 @@ class EventType(StrEnum):
     # these rows for a stranded task is therefore meaningful: nothing held it.
     recovery_vetoed = 'recovery_vetoed'
     recovery_left = 'recovery_left'
+    # strand_converted — one row per convert-to-blocked the stranded-task sweep
+    # actually applied (task 6476).  Payload:
+    # orchestrator/src/orchestrator/strand_conversion.py::strand_converted_payload.
+    # An ACTION, not a hold, so not signature-gated: one row per conversion.
+    # task_id is ALSO a first-class column.
+    strand_converted = 'strand_converted'
+
+    # A validate_landing_evidence reject at one of the two call sites that
+    # file no escalation (the already-landed gate's ancestry arm, the reconcile
+    # sweep's MARK_DONE arm).  data = the verdict probe verbatim plus
+    # site/task_status; transition-gated per (site, task_id).  Canonical WHY:
+    # orchestrator/src/orchestrator/landing_reject_emission.py (module docstring).
+    landing_evidence_rejected = 'landing_evidence_rejected'
 
     # workflow_exit_contract — one row per run() exit whose contract verdict is
     # a violation or store-unavailable (spec docs/task-escalation-state-spec.md
@@ -943,6 +1120,20 @@ class EventType(StrEnum):
     # task_id is ALSO a first-class column.  Task mu's soak counts
     # verdict='violation' rows with mode='log' before flipping enforce on.
     workflow_exit_contract = 'workflow_exit_contract'
+
+    # A wedged terminal cleanup (task 6660).
+    # workflow_cleanup_abandoned — run()'s CancellationScope cut off on_terminal
+    #   entries that were still running past their grace after a hard-cancel;
+    #   the slot was still released.  Payload {entries}: the entry names, in
+    #   order.
+    # workflow_slot_force_released — the terminal-status watcher released the
+    #   slot and module locks of a workflow that never ended after its
+    #   hard-cancel (the row was already done/cancelled).  Payload
+    #   {status, polls, modules}: the terminal status, the watcher's poll count
+    #   and the modules held at release.  A workflow_slot_wedged L1 goes with it.
+    # task_id is ALSO a first-class column on both.
+    workflow_cleanup_abandoned = 'workflow_cleanup_abandoned'
+    workflow_slot_force_released = 'workflow_slot_force_released'
 
     # Task-verify admission gate (task 5628; plans/verify-admission-fifo-prd.md).
     # Every payload carries `order`, so before/after a policy flip is read from
@@ -971,19 +1162,139 @@ class EventType(StrEnum):
     #   (INV-4). Age surfacing only; nothing times out. Payload:
     #   {waiter: {task_id, module, role, plan_id, wait_secs}, aged_count, alarm_secs}
     verify_admission_wait_aged = 'verify_admission_wait_aged'
+    # predicate_rearmed / predicate_recheck_stalled — from DeterministicRunner
+    #   when a declared predicate exits 75 ("not yet") and re-arms, or reaches
+    #   deterministic.predicate_recheck_stall_cap and files milestone_check_stalled
+    #   (plans/completion-driven-triggers-prd.md C1). Payload:
+    #   {rc, consecutive, stall_cap, recheck_secs, next_check_at, verdict}
+    predicate_rearmed = 'predicate_rearmed'
+    predicate_recheck_stalled = 'predicate_recheck_stalled'
+
+    # Shadow eval (plans/live-shadow-eval-prd.md C2). task_id is the PRODUCTION
+    # task the cell shadows; shadow_cell_skipped's data.reason is a
+    # ShadowSkipReason value. The payloads are owned by the coordinator (ε1).
+    # shadow_cell_settled marks a cell whose settled_at was written (settled |
+    # expired); shadow_cell_ended marks one that ended without it (failed | cap_excluded).
+    shadow_cell_opened = 'shadow_cell_opened'
+    shadow_cell_skipped = 'shadow_cell_skipped'
+    shadow_cell_settled = 'shadow_cell_settled'
+    shadow_cell_ended = 'shadow_cell_ended'
+
+    # startup_step_failed — one row per startup step whose outcome is not ok
+    #   (plans/startup-hardening-prd.md §3.1). Producer:
+    #   orchestrator/src/orchestrator/startup_steps.py::run_startup_step. Payload:
+    #   {step, status ('failed'|'partial'), exception_type, message,
+    #    failed_entries: [{entry, exception_type, message}]}
+    startup_step_failed = 'startup_step_failed'
 
 
-class _MergeFinalizedKey(Enum):
-    """The field a merge_finalized read matches on; each value is its fixed SQL predicate."""
+def cli_resume_failed_data(
+    *,
+    armed_session_id: str | None,
+    role: str,
+    fallbacks: int,
+    dropped_session_ids: Sequence[str],
+) -> dict[str, Any] | None:
+    """The ``session_resume_failed`` stage='cli' payload, or None unless the
+    caller's own armed resume was rejected (see the
+    ``EventType.session_resume_failed`` taxonomy note)."""
+    if not (fallbacks and armed_session_id):
+        return None
+    ids = [str(s) for s in dropped_session_ids]
+    return {
+        'stage': 'cli',
+        'session_id': ids[0] if ids else armed_session_id,
+        'session_ids': ids,
+        'role': role,
+        'fallbacks': fallbacks,
+    }
 
-    request_id = "json_extract(data, '$.request_id') = ?"
-    branch = "json_extract(data, '$.branch') = ?"
-    task_id = 'task_id = ?'
-    superseded_by = "json_extract(data, '$.superseded_by') = ?"
-    absorbs = (
-        "EXISTS (SELECT 1 FROM json_each(events.data, '$.absorbed_request_ids') "
-        'WHERE json_each.value = ?)'
+
+@unique
+class ShadowSkipReason(StrEnum):
+    """The closed vocabulary of why a shadow trigger opened no cell (INV-11).
+
+    CREDITS_EXHAUSTED is also the reason that settles a running Coding Plan cell
+    cap_excluded (PRD decision 16).
+    """
+
+    SAMPLED_OUT = 'sampled_out'
+    NO_CREDENTIALS = 'no_credentials'
+    ISOLATION_UNAVAILABLE = 'isolation_unavailable'
+    BUDGET_EXHAUSTED = 'budget_exhausted'
+    CREDITS_EXHAUSTED = 'credits_exhausted'
+    CONCURRENCY_FULL = 'concurrency_full'
+    HOST_SATURATED = 'host_saturated'
+    SHAPE_DISABLED = 'shape_disabled'
+    ALREADY_OPEN = 'already_open'
+    PAUSED = 'paused'
+    UNKNOWN_CANDIDATE = 'unknown_candidate'
+    NO_BASE_SHA = 'no_base_sha'
+
+
+_MERGE_FINALIZED_ROWS = f"event_type = '{EventType.merge_finalized.value}'"
+
+
+@dataclass(frozen=True)
+class _Lookup:
+    """A partial index serves a read only if the read's WHERE implies it: reads repeat ``scope``."""
+
+    indexed: str
+    match: str
+    narrowing: str | None = None
+
+    @property
+    def scope(self) -> str:
+        if self.narrowing is None:
+            return _MERGE_FINALIZED_ROWS
+        return f'{_MERGE_FINALIZED_ROWS} AND {self.narrowing}'
+
+    @classmethod
+    def equality(cls, indexed: str) -> _Lookup:
+        return cls(indexed, f'{indexed} = ?')
+
+
+class MergeFinalizedKey(Enum):
+    """The field a merge_finalized read matches on, with the partial index that serves it."""
+
+    request_id = _Lookup.equality("json_extract(data, '$.request_id')")
+    branch = _Lookup.equality("json_extract(data, '$.branch')")
+    task_id = _Lookup.equality('task_id')
+    superseded_by = _Lookup.equality("json_extract(data, '$.superseded_by')")
+    absorbs = _Lookup(
+        indexed='event_type',
+        narrowing="json_array_length(data, '$.absorbed_request_ids') > 0",
+        match=(
+            "EXISTS (SELECT 1 FROM json_each(events.data, '$.absorbed_request_ids') "
+            'WHERE json_each.value = ?)'
+        ),
     )
+
+    @property
+    def index_ddl(self) -> str:
+        return (
+            f'CREATE INDEX IF NOT EXISTS idx_mf_{self.name} '
+            f'ON events({self.value.indexed}) WHERE {self.value.scope};'
+        )
+
+    def select(
+        self, value: str, *, run_id: str | None, latest_only: bool,
+    ) -> tuple[str, tuple[str, ...]]:
+        """The read's statement and parameters; ``run_id=None`` reads every run."""
+        lookup: _Lookup = self.value
+        if run_id is None:
+            where, params = (lookup.scope, lookup.match), (value,)
+        else:
+            where, params = (lookup.scope, 'run_id = ?', lookup.match), (run_id, value)
+        order = 'id DESC LIMIT 1' if latest_only else 'id'
+        return (
+            'SELECT run_id, task_id, data, timestamp FROM events '
+            f'WHERE {" AND ".join(where)} ORDER BY {order}',
+            params,
+        )
+
+
+_MERGE_FINALIZED_INDEXES = '\n'.join(key.index_ddl for key in MergeFinalizedKey)
 
 
 class EventStore:
@@ -1025,7 +1336,7 @@ class EventStore:
         try:
             conn = self._connect()
             try:
-                conn.executescript(_SCHEMA)
+                conn.executescript(_SCHEMA + _MERGE_FINALIZED_INDEXES)
             finally:
                 conn.close()
         except Exception:
@@ -1076,6 +1387,7 @@ class EventStore:
         task_id: str | None = None,
         *,
         cross_run: bool = False,
+        fire_safe: bool = True,
     ) -> dict | None:
         """Return the most-recent merge_finalized row matching the given key.
 
@@ -1094,43 +1406,50 @@ class EventStore:
         events-table timestamp), run_id, is_current_run and
         absorbed_request_ids (None on rows written before that key existed).
 
-        Returns None on miss.  Errors are logged and return None (read path is
-        fire-safe).
+        Returns None on miss.  Fire-safe by default: an error is logged and
+        reads as a miss.  ``fire_safe=False`` re-raises it instead, so a caller
+        can tell a failed read from a miss.
         """
         if request_id is not None:
-            key, value = _MergeFinalizedKey.request_id, request_id
+            key, value = MergeFinalizedKey.request_id, request_id
         elif branch is not None:
-            key, value = _MergeFinalizedKey.branch, branch
+            key, value = MergeFinalizedKey.branch, branch
         elif task_id is not None:
-            key, value = _MergeFinalizedKey.task_id, task_id
+            key, value = MergeFinalizedKey.task_id, task_id
         else:
             return None
         rows = self._select_merge_finalized(
-            'latest_merge_finalized', key, value, cross_run=cross_run, latest_only=True,
+            'latest_merge_finalized',
+            key,
+            value,
+            cross_run=cross_run,
+            latest_only=True,
+            fire_safe=fire_safe,
         )
         return rows[0] if rows else None
 
     def merge_finalized_superseded_by(
-        self, superseded_by: str, *, cross_run: bool = False,
+        self, superseded_by: str, *, cross_run: bool = False, fire_safe: bool = True,
     ) -> list[dict]:
         """Return the member rows a coalesce-* train id or a gen-(n+1) request id superseded.
 
         Oldest first, in latest_merge_finalized's projection and run scope
-        (plans/merge-status-durable-non-landed-prd.md D7).  Fire-safe: errors
-        are logged and return [].
+        (plans/merge-status-durable-non-landed-prd.md D7).  Same read-failure
+        policy as latest_merge_finalized; a fire-safe miss is [].
         """
         if not superseded_by:
             return []
         return self._select_merge_finalized(
             'merge_finalized_superseded_by',
-            _MergeFinalizedKey.superseded_by,
+            MergeFinalizedKey.superseded_by,
             superseded_by,
             cross_run=cross_run,
             latest_only=False,
+            fire_safe=fire_safe,
         )
 
     def merge_finalized_absorbing(
-        self, request_id: str, *, cross_run: bool = False,
+        self, request_id: str, *, cross_run: bool = False, fire_safe: bool = True,
     ) -> dict | None:
         """Return the newest primary row whose absorbed_request_ids lists *request_id*.
 
@@ -1139,43 +1458,39 @@ class EventStore:
         replacement for TerminalOutcomeRetention.record_alias
         (plans/merge-status-durable-non-landed-prd.md D6/D7).  Kept apart from
         latest_merge_finalized so a caller can tell an alias hit from a direct
-        one.  Whole-id match; same projection, run scope and fire-safe policy.
+        one.  Whole-id match; same projection, run scope and read-failure
+        policy as latest_merge_finalized.
         """
         if not request_id:
             return None
         rows = self._select_merge_finalized(
             'merge_finalized_absorbing',
-            _MergeFinalizedKey.absorbs,
+            MergeFinalizedKey.absorbs,
             request_id,
             cross_run=cross_run,
             latest_only=True,
+            fire_safe=fire_safe,
         )
         return rows[0] if rows else None
 
     def _select_merge_finalized(
         self,
         reader: str,
-        key: _MergeFinalizedKey,
+        key: MergeFinalizedKey,
         value: str,
         *,
         cross_run: bool,
         latest_only: bool,
+        fire_safe: bool,
     ) -> list[dict]:
-        """Every merge_finalized read: run scope, key match, order and projection.
+        """Every merge_finalized read: runs *key*'s statement in this run's scope and projects it.
 
-        *reader* names the public method in the fire-safe warning.
+        *reader* names the public method in the warning a fire-safe read logs
+        when it swallows an error; a strict read re-raises and logs nothing.
         """
-        sql = (
-            'SELECT run_id, task_id, data, timestamp FROM events '
-            "WHERE event_type = 'merge_finalized'"
+        sql, params = key.select(
+            value, run_id=None if cross_run else self.run_id, latest_only=latest_only,
         )
-        params: list[str] = []
-        if not cross_run:
-            sql += ' AND run_id = ?'
-            params.append(self.run_id)
-        sql += f' AND {key.value}'
-        params.append(value)
-        sql += ' ORDER BY id DESC LIMIT 1' if latest_only else ' ORDER BY id'
         try:
             conn = self._connect()
             try:
@@ -1184,6 +1499,8 @@ class EventStore:
                 conn.close()
             return [self._merge_finalized_row(*row) for row in rows]
         except Exception:
+            if not fire_safe:
+                raise
             logger.warning('event_store.%s failed', reader, exc_info=True)
             return []
 

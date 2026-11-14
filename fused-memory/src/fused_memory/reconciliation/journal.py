@@ -22,16 +22,16 @@ from shared.async_sqlite_base import (
 # circular import.  The rule lives in shared precisely so this module and the
 # dashboard can both reach it; judge.py delegates to the same primitives.
 from shared.phantom_verdict import UNPARSEABLE_VERDICT_CODE, is_phantom_verdict_json
+from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.models.reconciliation import (
-    JournalEntry,
     JudgeVerdict,
     ReconciliationRun,
     RunStatus,
-    StageId,
     StageReport,
     Watermark,
 )
+from fused_memory.utils.sqlite_connector import Connector
 
 if TYPE_CHECKING:
     from fused_memory.services.write_journal import WriteJournal
@@ -53,10 +53,11 @@ CITATION_REPAIRS_KEY = 'citation_repairs'
 # REFUSING yields a loud, recoverable error. So a status absent from the
 # enum-of-today must land on the refusing side by default.
 #
-# These four are genuinely terminal: nothing re-adopts them. ``interrupted`` is
-# excluded precisely because something does — ``get_interrupted_runs()`` feeds
-# the startup adopt-and-resume pass, and the resumed cycle rewrites the whole
-# stage_reports blob from its own loaded copy.
+# These four are genuinely terminal. ``interrupted`` stays excluded as a legacy
+# status (task 5514): nothing writes it any more, but the startup sweep
+# ``harness.py::ReconciliationHarness._recover_legacy_interrupted_runs`` still
+# converts each such row to ``failed`` with a ``complete_run_if_status``
+# wholesale stage_reports write from its own loaded copy.
 #
 # It lives here, beside CITATION_REPAIRS_KEY, because it is also this layer's
 # invariant: a write that does not carry repairs forward must never land on a
@@ -108,20 +109,6 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
-
-CREATE TABLE IF NOT EXISTS journal_entries (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    stage TEXT,
-    timestamp TEXT NOT NULL,
-    operation TEXT NOT NULL,
-    target_system TEXT NOT NULL,
-    before_state TEXT,
-    after_state TEXT,
-    reasoning TEXT DEFAULT '',
-    evidence TEXT DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_journal_run ON journal_entries(run_id);
 
 CREATE TABLE IF NOT EXISTS judge_verdicts (
     run_id TEXT PRIMARY KEY,
@@ -241,7 +228,12 @@ def _extract_target(op: dict) -> str:
 class ReconciliationJournal:
     """Persistent journal backed by SQLite — one database per project directory."""
 
-    def __init__(self, data_dir: Path):
+    def __init__(
+        self,
+        data_dir: Path,
+        *,
+        connect: Connector = connect_daemon,
+    ):
         """Store *data_dir* VERBATIM — it may be RELATIVE, and by default is.
 
         Nothing coerces it here, and nothing upstream does either (task 4592;
@@ -260,8 +252,12 @@ class ReconciliationJournal:
         the ``CLAUDE_CONFIG_DIR`` chain, and
         ``fused-memory/src/fused_memory/reconciliation/sandbox_guard.py::_assert_config_dir_writable``
         fails closed if anything bypasses it.
+
+        *connect* is how ``initialize`` opens the journal's one connection, given
+        the ``reconciliation.db`` path; it defaults to ``connect_daemon``.
         """
         self.data_dir = data_dir
+        self._connect = connect
         self._access: AtomicConnection | None = None
         self._write_journal: WriteJournal | None = None
 
@@ -277,56 +273,36 @@ class ReconciliationJournal:
     async def initialize(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self.data_dir / 'reconciliation.db'
-        conn = await connect_daemon(str(db_path))
+        conn = await self._connect(str(db_path))
         conn.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
         self._access = AtomicConnection(conn)
         async with self._access.write() as db:
             await db.executescript(SCHEMA_SQL)
 
-        # Safe migration: add triggered_by column to existing DBs
-        await self._add_column('ALTER TABLE runs ADD COLUMN triggered_by TEXT')
+        async with self._access.write() as db:
+            # Safe migration: add triggered_by column to existing DBs
+            await add_column_if_missing(db, 'runs', 'triggered_by', 'TEXT')
 
-        # Safe migration: add instance_id column to existing DBs.  Lets the
-        # stale-run reaper distinguish runs owned by the current process from
-        # runs orphaned by a prior process whose lock has since been re-acquired
-        # by a fresh instance — see _recover_stale_runs.
-        await self._add_column('ALTER TABLE runs ADD COLUMN instance_id TEXT')
+            # Safe migration: add instance_id column to existing DBs.  Lets the
+            # stale-run reaper distinguish runs owned by the current process from
+            # runs orphaned by a prior process whose lock has since been re-acquired
+            # by a fresh instance — see _recover_stale_runs.
+            await add_column_if_missing(db, 'runs', 'instance_id', 'TEXT')
 
-        # Safe migration: add session-capture columns to existing DBs (task 2744).
-        # session_id / stage_cursor snapshot the in-flight stage subprocess's CLI
-        # session (cleared between stages); attempt is a monotonic count of
-        # stage-subprocess launches, the substrate task σ's resume gate consumes.
-        await self._add_column('ALTER TABLE runs ADD COLUMN session_id TEXT')
-        await self._add_column('ALTER TABLE runs ADD COLUMN stage_cursor TEXT')
-        await self._add_column('ALTER TABLE runs ADD COLUMN attempt INTEGER DEFAULT 0')
+            # Safe migration: add session-capture columns to existing DBs (task 2744).
+            # session_id / stage_cursor snapshot the in-flight stage subprocess's CLI
+            # session (cleared between stages); attempt is a monotonic count of
+            # stage-subprocess launches, kept as durable launch history.
+            await add_column_if_missing(db, 'runs', 'session_id', 'TEXT')
+            await add_column_if_missing(db, 'runs', 'stage_cursor', 'TEXT')
+            await add_column_if_missing(db, 'runs', 'attempt', 'INTEGER DEFAULT 0')
+
+            # Retired mutation-audit ledger (task 5890), dropped from DBs created
+            # before its DDL was removed; its idx_journal_run index goes with it.
+            await db.execute('DROP TABLE IF EXISTS journal_entries')
 
         logger.info(f'Reconciliation journal initialized at {db_path}')
-
-    async def _add_column(self, ddl: str) -> None:
-        """Run one ALTER migration, tolerating a DB that already has the column.
-
-        Each ALTER is its OWN write unit: a column that already exists must roll
-        back only its own statement, never a sibling migration that just
-        succeeded.
-
-        "duplicate column name" is the ONLY tolerated failure, and the catch is
-        narrowed to it (loud-over-silent) exactly as ``EventBuffer._migrate`` and
-        ``ReconLedgerStore.initialize`` narrow theirs.  SQLite's ALTER TABLE has
-        no IF NOT EXISTS, so re-running these against an already-migrated DB is
-        expected; a locked or partially-created DB or a disk error is NOT, and
-        swallowing it here would let initialize() log success and leave the
-        failure to re-surface much later as a confusing "no such column" from the
-        first statement that needs the column.
-        """
-        access = self._require_access()
-        try:
-            async with access.write() as db:
-                await db.execute(ddl)
-        except Exception as exc:
-            # The write unit has already rolled itself back.
-            if 'duplicate column name' not in str(exc).lower():
-                raise  # Not the benign "column already exists" case — surface it.
 
     async def close(self) -> None:
         if self._access is not None:
@@ -458,6 +434,15 @@ class ReconciliationJournal:
             applied = cursor.rowcount == 1
         return applied
 
+    async def is_run_completed(self, run_id: str) -> bool:
+        """The one definition of 'durably completed', consulted by both the
+        drained-event restore policy and ``run_full_cycle``'s failure arms:
+        durable completion is final."""
+        row = await self._require_access().read_one(
+            'SELECT status FROM runs WHERE id = ?', (run_id,)
+        )
+        return row is not None and row['status'] == RunStatus.completed.value
+
     async def update_run_stage_reports(
         self, run_id: str, stage_reports: dict[str, StageReport | dict]
     ) -> None:
@@ -562,10 +547,8 @@ class ReconciliationJournal:
         such a retry the CLI's live session differs from the value stored here.
         Note too that ``attempt`` counts ``BaseStage.run`` stage invocations, not
         the underlying subprocess spawns — a cap retry spawns again without
-        bumping ``attempt``. Task σ's resume gate therefore must treat this
-        snapshot as best-effort: validate that the transcript for the persisted
-        session actually exists before trusting it to ``--resume`` rather than
-        resuming the persisted id blindly.
+        bumping ``attempt``. Any reader must therefore treat this snapshot as
+        best-effort rather than as the CLI's live session id.
         """
         async with self._require_access().write() as db:
             await db.execute(
@@ -626,21 +609,20 @@ class ReconciliationJournal:
         """Is ``stage_reports`` a FINISHED account of the run, safe to read as
         evidence that a stage did or did not execute?
 
-        A persisted status is necessary but not sufficient, because
-        ``'interrupted'`` is the one terminal status a run can leave: the
-        startup pass (``reconciliation/harness.py::_resume_interrupted_runs``)
-        adopts exactly those runs, and ``run_full_cycle`` marks the adopted run
-        running only on the in-memory object — :meth:`complete_run` is the sole
-        writer of the column, so a run re-executing this very stage still reads
-        back ``'interrupted'`` on disk. Pairing that terminal-looking status
-        with the stale blob its interrupted attempt flushed is worse than the
-        empty first-attempt case: the stage key is absent precisely BECAUSE
-        this attempt has not re-filed it yet, which is the shape most likely to
-        be a genuine lost write.
+        A persisted status is necessary but not sufficient for a legacy
+        ``'interrupted'`` row. Before task 5514 retired resume, the startup
+        adopt-and-resume pass took over exactly those runs, and ``run_full_cycle``
+        marked the adopted run running only on the in-memory object —
+        :meth:`complete_run` is the sole writer of the column, so a run
+        re-executing a stage still read back ``'interrupted'`` on disk. Pairing
+        that terminal-looking status with the stale blob its interrupted attempt
+        flushed is worse than the empty first-attempt case: the stage key is
+        absent precisely BECAUSE that attempt had not re-filed it yet, which is
+        the shape most likely to be a genuine lost write.
 
-        ``_resume`` bookkeeping is persisted before the adopt, so its presence
+        ``_resume`` bookkeeping was persisted before each adopt, so its presence
         is the durable signal. A resumed run that has since reached any other
-        terminal status has been flushed by that run's own ``finally`` and is
+        terminal status was flushed by that run's own ``finally`` and is
         settled again, which is why this narrows ``'interrupted'`` alone rather
         than distrusting every run that was ever resumed.
         """
@@ -673,22 +655,22 @@ class ReconciliationJournal:
           silently suppress a real data-loss finding.
 
         The membership test is keyed on ``stage``, never "is there any report at
-        all": ``reconciliation/harness.py`` writes the out-of-band ``_error`` and
-        ``_resume`` keys straight into ``run.stage_reports`` before persisting,
-        and a run holding only those did not run the stage.
+        all": ``reconciliation/harness.py`` writes the out-of-band ``_error`` key
+        (and, before task 5514, ``_resume``) straight into ``run.stage_reports``
+        before persisting, and a run holding only those did not run the stage.
 
         ``settled`` is the signal a caller weighing ``stage_ran`` as evidence
         should consume: ``stage_ran=False`` means "the stage never ran" ONLY
         when the blob is a finished account of the run. Deciding that needs
         harness lifecycle knowledge — which statuses flush the blob, and that
-        an adopted run is executing again behind a terminal-looking disk status
-        — so it is answered here, next to the read, rather than re-derived by
+        a legacy adopted run may have been executing again behind a
+        terminal-looking disk status — so it is answered here, next to the read, rather than re-derived by
         every consumer (see :meth:`_stage_reports_are_settled`).
 
         ``resumed`` is the raw evidence behind that verdict: whether the
-        ``_resume`` key is present, i.e. whether the startup adopt-and-resume
-        pass (``reconciliation/harness.py::_resume_interrupted_runs``) has taken
-        this run over at least once. It is three-valued for the same reason
+        ``_resume`` key is present, i.e. whether task 2717's startup
+        adopt-and-resume pass (retired by task 5514) took this run over at
+        least once. It is three-valued for the same reason
         ``stage_ran`` is — an unparseable blob answers neither question, and
         collapsing it to ``False`` would read as positive evidence the run was
         never adopted.
@@ -777,56 +759,6 @@ class ReconciliationJournal:
             (project_id,),
         )
         return row is not None
-
-    # ── Journal entries ────────────────────────────────────────────────
-
-    async def add_entry(self, entry: JournalEntry) -> None:
-        async with self._require_access().write() as db:
-            await db.execute(
-                """INSERT INTO journal_entries
-                   (id, run_id, stage, timestamp, operation, target_system,
-                    before_state, after_state, reasoning, evidence)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    entry.id,
-                    entry.run_id,
-                    entry.stage.value if entry.stage else None,
-                    entry.timestamp.isoformat(),
-                    entry.operation,
-                    entry.target_system,
-                    json.dumps(entry.before_state) if entry.before_state is not None else None,
-                    json.dumps(entry.after_state) if entry.after_state is not None else None,
-                    entry.reasoning,
-                    json.dumps(entry.evidence),
-                ),
-            )
-
-    async def get_entries(self, run_id: str) -> list[JournalEntry]:
-        rows = await self._require_access().read_all(
-            'SELECT * FROM journal_entries WHERE run_id = ? ORDER BY timestamp',
-            (run_id,),
-        )
-        entries = []
-        for row in rows:
-            entries.append(
-                JournalEntry(
-                    id=row['id'],
-                    run_id=row['run_id'],
-                    stage=StageId(row['stage']) if row['stage'] else None,
-                    timestamp=datetime.fromisoformat(row['timestamp']),
-                    operation=row['operation'],
-                    target_system=row['target_system'],
-                    before_state=json.loads(row['before_state'])
-                    if row['before_state']
-                    else None,
-                    after_state=json.loads(row['after_state'])
-                    if row['after_state']
-                    else None,
-                    reasoning=row['reasoning'],
-                    evidence=json.loads(row['evidence']),
-                )
-            )
-        return entries
 
     # ── Judge verdicts ─────────────────────────────────────────────────
 
@@ -1069,12 +1001,10 @@ class ReconciliationJournal:
     async def get_interrupted_runs(self) -> list[ReconciliationRun]:
         """Return every run marked 'interrupted', with no age filter.
 
-        Mirrors ``get_running_runs`` but filters the restart-interrupt status
-        (see ``RunStatus.interrupted``). Consumed by the startup
-        adopt-and-resume pass (task σ / ``_resume_interrupted_runs``): a run left
-        ``interrupted`` by a dead predecessor still carries its session_id /
-        stage_cursor snapshot and its drained events, so the pass can --resume
-        the same run_id rather than re-run it from scratch.
+        Mirrors ``get_running_runs`` but filters the legacy status (see
+        ``RunStatus.interrupted``). Consumed by the startup sweep
+        ``harness.py::ReconciliationHarness._recover_legacy_interrupted_runs``,
+        which converts each row a pre-5514 process left behind to ``failed``.
         """
         rows = await self._require_access().read_all(
             "SELECT * FROM runs WHERE status = 'interrupted'"

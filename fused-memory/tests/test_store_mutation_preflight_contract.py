@@ -9,9 +9,10 @@ underscore-prefixed so pytest does not collect it, and is imported bare
 
 Two things live here:
 
-1. Unit coverage of the four exports as REAL behaviour — the fixture factory
-   actually sets and restores the attribute, `deny` actually installs a
-   raiser, `fail_closed_records` actually filters. None of these assert on
+1. Unit coverage of the four exports as REAL behaviour — both helpers leave
+   the REAL guard bound and rig only its probe's directory, so the fixture
+   factory's guard actually passes, `deny`'s actually refuses and emits its
+   record, and `fail_closed_records` actually filters. None of these assert on
    docstring prose: `neutralise_fixture` still composes its `__doc__` from the
    shared rationale plus the per-suite note (which is what makes
    `pytest --fixtures -v` useful -- the `-v` is required, since pytest hides
@@ -28,11 +29,13 @@ from __future__ import annotations
 
 import ast
 import logging
+import os
 import pathlib
 import types
+from collections.abc import Iterable
+from typing import NamedTuple
 
 import pytest
-from _ast_guard import parse_python_module
 from _store_mutation_preflight_contract import (
     FAIL_CLOSED_MARKERS,
     SENTINEL,
@@ -40,6 +43,15 @@ from _store_mutation_preflight_contract import (
     fail_closed_records,
     neutralise_fixture,
 )
+from shared.testing_xdist_groups import single_xdist_group
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+from fused_memory.utils.store_mutation_preflight import (
+    StoreMutationUnavailable,
+    assert_store_mutation_allowed,
+)
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -69,32 +81,41 @@ def _is_autouse(fixture) -> bool:
 def _stub_script_module(*, with_guard: bool = True) -> types.ModuleType:
     """A stand-in for one of the `scripts/` modules under test.
 
-    Carries its own `StoreMutationUnavailable` **subclass of `RuntimeError`**,
-    matching the real
-    `fused-memory/src/fused_memory/utils/store_mutation_preflight.py::StoreMutationUnavailable`.
-    The real subclassing matters: the guarded scripts wrap per-record work in
-    `except Exception` handlers, which is precisely why the guard must run
-    once for the whole run rather than per record — a stub raising a bare
-    `Exception` would not exercise that.
+    Binds the REAL guard, exactly as a script's own
+    `from fused_memory.utils.store_mutation_preflight import
+    assert_store_mutation_allowed` does, because both helpers now leave that
+    binding alone and rig only the probe's directory.
     """
     mod = types.ModuleType('_stub_script_module')
-
-    class StoreMutationUnavailable(RuntimeError):
-        pass
-
     # Populate via __dict__.update: pyright rejects attribute assignment on a
     # bare ModuleType instance (reportAttributeAccessIssue), but a module
     # namespace is a plain dict[str, Any], so this is runtime-equivalent and
     # type-clean -- the same spelling escalation/tests/conftest.py uses for its
-    # module stubs. `monkeypatch.setattr(mod, ...)` still sees these, since
-    # attribute access on a module IS its `__dict__`.
-    mod.__dict__.update(StoreMutationUnavailable=StoreMutationUnavailable)
+    # module stubs.
     if with_guard:
-        def _real_guard(*, operation: str) -> None:
-            raise AssertionError(f'the real guard ran for {operation!r}')
-
-        mod.__dict__.update(assert_store_mutation_allowed=_real_guard)
+        mod.__dict__.update(assert_store_mutation_allowed=assert_store_mutation_allowed)
     return mod
+
+
+def _stand_in_script_module() -> types.ModuleType:
+    """A script module that shadows the guard's name with some other callable.
+
+    The shape that would make `deny` vacuous: nothing real is left to refuse.
+    """
+    mod = _stub_script_module(with_guard=False)
+
+    def _local_no_op_guard(**_kwargs: object) -> None:
+        return None
+
+    mod.__dict__.update(assert_store_mutation_allowed=_local_no_op_guard)
+    return mod
+
+
+_SCRIPT_LOGGER = 'contract_probe_script_logger'
+
+
+def _script_logger() -> logging.Logger:
+    return logging.getLogger(_SCRIPT_LOGGER)
 
 
 # ---------------------------------------------------------------------------
@@ -104,29 +125,12 @@ def _stub_script_module(*, with_guard: bool = True) -> types.ModuleType:
 
 class TestNeutraliseFixture:
     """`neutralise_fixture(mod, *, note)` builds the autouse fixture that keeps
-    a MOCK-unit suite independent of the real `~/.mem0`."""
+    a MOCK-unit suite independent of the real `~/.mem0`, by pointing the REAL
+    guard's probe at a writable scratch directory."""
 
     def test_returns_an_autouse_fixture(self) -> None:
         fx = neutralise_fixture(_stub_script_module(), note='a note')
         assert _is_autouse(fx) is True
-
-    def test_sets_a_noop_guard_and_restores_it(self) -> None:
-        """The whole point: while the fixture is active the guard is a no-op,
-        and afterwards the module is exactly as it was."""
-        mod = _stub_script_module()
-        original = mod.assert_store_mutation_allowed
-        fx = neutralise_fixture(mod, note='a note')
-
-        mp = pytest.MonkeyPatch()
-        try:
-            _underlying(fx)(mp)
-            # Neutralised: calling it neither raises nor does anything.
-            assert mod.assert_store_mutation_allowed(operation='anything') is None
-            assert mod.assert_store_mutation_allowed is not original
-        finally:
-            mp.undo()
-
-        assert mod.assert_store_mutation_allowed is original
 
     def test_note_is_required(self) -> None:
         """The forcing function: a conversion that forgets to carry its suite's
@@ -134,22 +138,55 @@ class TestNeutraliseFixture:
         with pytest.raises(TypeError):
             neutralise_fixture(_stub_script_module())  # type: ignore[call-arg]
 
-    def test_breaks_loudly_when_the_script_has_no_guard(self) -> None:
-        """Deliberately NOT `raising=False`.
-
-        Every one of the docstrings this factory replaces calls this out: if the
-        guard is ever removed from the script, the fixture must break loudly
-        rather than silently no-op and leave the suite asserting nothing.
-        """
-        mod = _stub_script_module(with_guard=False)
+    def test_the_real_guard_stays_bound_and_passes_silently(
+        self, tmp_path_factory: pytest.TempPathFactory, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        mod = _stub_script_module()
         fx = neutralise_fixture(mod, note='a note')
 
         mp = pytest.MonkeyPatch()
         try:
-            with pytest.raises(AttributeError):
-                _underlying(fx)(mp)
+            _underlying(fx)(mp, tmp_path_factory)
+            assert mod.assert_store_mutation_allowed is assert_store_mutation_allowed
+            with caplog.at_level(logging.DEBUG):
+                result = mod.assert_store_mutation_allowed(
+                    operation='sweep --apply', logger=_script_logger()
+                )
         finally:
             mp.undo()
+
+        assert result is None
+        assert caplog.records == []
+
+    def test_the_probe_leaves_the_redirected_directory_empty(
+        self, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        mod = _stub_script_module()
+        fx = neutralise_fixture(mod, note='a note')
+
+        mp = pytest.MonkeyPatch()
+        try:
+            _underlying(fx)(mp, tmp_path_factory)
+            redirected = pathlib.Path(os.environ['MEM0_DIR'])
+            mod.assert_store_mutation_allowed(operation='sweep --apply')
+            assert list(redirected.iterdir()) == []
+        finally:
+            mp.undo()
+
+    def test_mem0_dir_is_restored_on_undo(
+        self, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv('MEM0_DIR', 'the-value-before-the-fixture')
+        fx = neutralise_fixture(_stub_script_module(), note='a note')
+
+        mp = pytest.MonkeyPatch()
+        try:
+            _underlying(fx)(mp, tmp_path_factory)
+            assert os.environ['MEM0_DIR'] != 'the-value-before-the-fixture'
+        finally:
+            mp.undo()
+
+        assert os.environ['MEM0_DIR'] == 'the-value-before-the-fixture'
 
 
 # ---------------------------------------------------------------------------
@@ -158,56 +195,121 @@ class TestNeutraliseFixture:
 
 
 class TestDeny:
-    """`deny(mod, monkeypatch)` rigs the preflight to refuse, as it would
-    inside an agent sandbox."""
+    """`deny(mod, monkeypatch)` makes the REAL guard refuse, as it would inside
+    an agent sandbox, by pointing its probe at a directory that never exists."""
 
-    def test_installs_a_sentinel_raiser(self) -> None:
+    def test_the_real_guard_stays_bound_and_refuses_with_the_sentinel(self) -> None:
         mod = _stub_script_module()
         mp = pytest.MonkeyPatch()
         try:
             deny(mod, mp)
-            with pytest.raises(mod.StoreMutationUnavailable) as excinfo:
-                mod.assert_store_mutation_allowed(operation='sweep')
+            assert mod.assert_store_mutation_allowed is assert_store_mutation_allowed
+            with pytest.raises(StoreMutationUnavailable, match=SENTINEL) as excinfo:
+                mod.assert_store_mutation_allowed(operation='sweep --apply')
         finally:
             mp.undo()
 
-        assert str(excinfo.value) == SENTINEL
+        assert isinstance(excinfo.value, RuntimeError)
 
-    def test_raises_the_modules_own_exception_type(self) -> None:
-        """Parameterised on *mod*, so the raiser is always the type the script
-        under test will actually catch — and it is a RuntimeError subclass, the
-        shape the scripts' per-record `except Exception` handlers would swallow."""
+    def test_the_refusal_record_goes_through_the_scripts_logger(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         mod = _stub_script_module()
         mp = pytest.MonkeyPatch()
         try:
             deny(mod, mp)
-            with pytest.raises(mod.StoreMutationUnavailable):
-                mod.assert_store_mutation_allowed(operation='sweep')
-            assert issubclass(mod.StoreMutationUnavailable, RuntimeError)
+            with caplog.at_level(logging.DEBUG), pytest.raises(StoreMutationUnavailable):
+                mod.assert_store_mutation_allowed(
+                    operation='sweep --apply',
+                    logger=_script_logger(),
+                    extra_detail='nothing was swept',
+                )
         finally:
             mp.undo()
 
-    def test_accepts_arbitrary_positional_and_keyword_args(self) -> None:
-        """Call sites pass keywords (`operation=`), but the raiser must not
-        constrain the signature it stands in for."""
+        (record,) = fail_closed_records(caplog, _SCRIPT_LOGGER)
+        assert SENTINEL in record.getMessage()
+
+    def test_refuses_inside_an_active_neutralise(
+        self, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        """The real suites' composition: the autouse neutralise is already
+        active when a test calls `deny`."""
         mod = _stub_script_module()
         mp = pytest.MonkeyPatch()
         try:
+            _underlying(neutralise_fixture(mod, note='a note'))(mp, tmp_path_factory)
             deny(mod, mp)
-            with pytest.raises(mod.StoreMutationUnavailable):
-                mod.assert_store_mutation_allowed()
-            with pytest.raises(mod.StoreMutationUnavailable):
-                mod.assert_store_mutation_allowed('positional', 2, kw='x', other=None)
+            with pytest.raises(StoreMutationUnavailable, match=SENTINEL):
+                mod.assert_store_mutation_allowed(operation='sweep --apply')
         finally:
             mp.undo()
 
-    def test_is_undone_with_the_monkeypatch(self) -> None:
+    def test_is_undone_with_the_monkeypatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv('MEM0_DIR', 'the-value-before-deny')
         mod = _stub_script_module()
-        original = mod.assert_store_mutation_allowed
+
         mp = pytest.MonkeyPatch()
         deny(mod, mp)
         mp.undo()
-        assert mod.assert_store_mutation_allowed is original
+
+        assert os.environ['MEM0_DIR'] == 'the-value-before-deny'
+        assert mod.assert_store_mutation_allowed is assert_store_mutation_allowed
+
+
+# ---------------------------------------------------------------------------
+# Both helpers: the script must bind the REAL guard
+# ---------------------------------------------------------------------------
+
+
+def _apply_neutralise(mod, mp, tmp_path_factory) -> None:
+    _underlying(neutralise_fixture(mod, note='a note'))(mp, tmp_path_factory)
+
+
+def _apply_deny(mod, mp, _tmp_path_factory) -> None:
+    deny(mod, mp)
+
+
+_HELPERS = (
+    pytest.param(_apply_neutralise, id='neutralise_fixture'),
+    pytest.param(_apply_deny, id='deny'),
+)
+
+
+@pytest.mark.parametrize('apply_helper', _HELPERS)
+class TestBothHelpersRequireTheRealGuard:
+    """Rigging the probe's directory only means something while the script
+    calls the REAL guard, so both helpers refuse to run against anything else.
+
+    Without this, a script that dropped the guard would leave its suite's
+    `--apply` tests asserting nothing, and one that shadowed it with a local
+    no-op would make every `deny` test vacuous.
+    """
+
+    def test_breaks_loudly_when_the_script_has_no_guard(
+        self, apply_helper, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        mp = pytest.MonkeyPatch()
+        try:
+            with pytest.raises(AttributeError):
+                apply_helper(_stub_script_module(with_guard=False), mp, tmp_path_factory)
+        finally:
+            mp.undo()
+
+    def test_breaks_loudly_when_the_script_binds_a_stand_in(
+        self, apply_helper, tmp_path_factory: pytest.TempPathFactory
+    ) -> None:
+        mod = _stand_in_script_module()
+        mp = pytest.MonkeyPatch()
+        try:
+            with pytest.raises(AssertionError) as excinfo:
+                apply_helper(mod, mp, tmp_path_factory)
+        finally:
+            mp.undo()
+
+        message = str(excinfo.value)
+        assert mod.__name__ in message
+        assert 'fused_memory.utils.store_mutation_preflight.assert_store_mutation_allowed' in message
 
 
 # ---------------------------------------------------------------------------
@@ -340,12 +442,14 @@ TESTS_DIR = pathlib.Path(__file__).parent
 # real-time budget approaching 60s MUST set @pytest.mark.timeout(N) to opt up
 # -- otherwise a single slow run takes down the whole suite."
 #
-# These three qualify since the sweep went recursive: each parses/walks 328
-# modules (~1.46M AST nodes), measured at 20-49s per sweep on a machine at load
-# average 290. That is 82% of the default cap, i.e. inside its noise band --
-# and the failure it would cause is a whole-suite deadlock, not a red test.
-# Sized at 5x the observed worst case: this is a backstop against a genuine
-# hang, NOT a performance assertion, so it must not trip on load alone.
+# These three qualify because they share one recursive sweep,
+# `preflight_sweep`: it parses and walks 328 modules (~1.46M AST nodes),
+# measured at 20-49s per sweep on a machine at load average 290. pytest-timeout
+# arms over setup too, so that sweep is charged to whichever of the three runs
+# first. That is 82% of the default cap, i.e. inside its noise band -- and the
+# failure it would cause is a whole-suite deadlock, not a red test. Sized at 5x
+# the observed worst case: this is a backstop against a genuine hang, NOT a
+# performance assertion, so it must not trip on load alone.
 _SWEEP_TIMEOUT = 300
 
 # The name every one of the 14 suites gave its hand-rolled autouse fixture
@@ -430,6 +534,35 @@ def _neutralising_autouse_fixture(node: ast.AST) -> bool:
     return any(_neutralises_the_guard(stmt) for stmt in node.body)
 
 
+def _raises_store_mutation_unavailable(node: ast.Raise) -> bool:
+    """Whether *node* raises the sentinel itself; guard #2's shape."""
+    return node.exc is not None and 'StoreMutationUnavailable' in ast.unparse(node.exc)
+
+
+# Guarding the marker LITERAL rather than a `_fail_closed_records` function
+# name is the stronger check: it also catches a re-divergence that inlines the
+# filter into a test body, or renames the helper.
+#
+# Guards the FAIL-CLOSED marker only -- `FAIL_CLOSED_MARKERS[0]`, not the whole
+# tuple -- and that is deliberate, not an arity oversight. Measured 2026-09-04
+# across all 328 test modules: the fail-closed marker appears as an
+# `ast.Constant` in 0 of them, while the remedy noun (`FAIL_CLOSED_MARKERS[1]`)
+# appears in 48, because it is ordinary English that unrelated suites have
+# every right to mention. Sweeping the whole tuple would buy 48 false positives
+# and an allowlist, which is self-defeating for a drift guard -- the same
+# reasoning guard #2 gives for keying on the `raise` shape rather than setattr.
+#
+# The narrower sweep is still sufficient for the property that matters: the two
+# markers travel together in one tuple, and a suite inlining the diagnosis has
+# to spell the distinctive half in order to match a real record.
+_GUARDED_MARKER = FAIL_CLOSED_MARKERS[0]
+
+
+def _spells_the_guarded_marker(node: ast.Constant) -> bool:
+    """Whether *node* is a str literal carrying the marker; guard #3's shape."""
+    return isinstance(node.value, str) and _GUARDED_MARKER in node.value
+
+
 def _test_modules() -> list[pathlib.Path]:
     """Every collected test module in this TREE, in a stable order.
 
@@ -450,16 +583,63 @@ def _test_modules() -> list[pathlib.Path]:
     Cost: 328 modules and ~1.46M AST nodes, against 257 modules / ~1.25M nodes
     top-level. Wall clock is dominated by the parse and swings widely with
     machine load (6-23s measured for the identical work on 2026-09-04), so no
-    figure is pinned here. What is structural: the parse is paid ONCE per
-    session, not once per guard — `parse_python_module` is `functools.cache`d on
-    the path, so the three guards below share it, and each then pays only its
-    own `ast.walk` (~2-5s).
+    figure is pinned here. What is structural: one pass, `_sweep_test_modules`,
+    serves all three guards on one pinned xdist worker (`_SWEEP_GROUP_NAME`).
     """
     return sorted(
         path
         for path in TESTS_DIR.rglob('test_*.py')
         if '__pycache__' not in path.parts
     )
+
+
+class _PreflightSweep(NamedTuple):
+    """Each guard's offender labels, in path order and then walk order."""
+
+    hand_rolled_fixtures: tuple[str, ...]
+    deny_raisers: tuple[str, ...]
+    inlined_markers: tuple[str, ...]
+
+
+def _sweep_test_modules(paths: Iterable[pathlib.Path], *, root: pathlib.Path) -> _PreflightSweep:
+    """Parse and walk each module ONCE, classifying every node for all three guards.
+
+    Keeps labels, not trees: a plain `ast.parse` rather than the
+    `functools.cache`d `_ast_guard.parse_python_module`, so each tree is
+    released after its module instead of being pinned for the worker's whole
+    session.
+    """
+    hand_rolled_fixtures: list[str] = []
+    deny_raisers: list[str] = []
+    inlined_markers: list[str] = []
+    for path in paths:
+        rel = path.relative_to(root)
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name == _HAND_ROLLED_FIXTURE_NAME:
+                    hand_rolled_fixtures.append(f'{rel}:{node.lineno}:{node.name} (name)')
+                elif _neutralising_autouse_fixture(node):
+                    hand_rolled_fixtures.append(f'{rel}:{node.lineno}:{node.name} (shape)')
+            elif isinstance(node, ast.Raise) and _raises_store_mutation_unavailable(node):
+                deny_raisers.append(f'{rel}:{node.lineno}')
+            elif isinstance(node, ast.Constant) and _spells_the_guarded_marker(node):
+                inlined_markers.append(f'{rel}:{node.lineno}')
+    return _PreflightSweep(
+        hand_rolled_fixtures=tuple(hand_rolled_fixtures),
+        deny_raisers=tuple(deny_raisers),
+        inlined_markers=tuple(inlined_markers),
+    )
+
+
+# One loadgroup worker runs the three sweep consumers, so `preflight_sweep` is
+# built once per run rather than once per worker that drew one of them.
+_SWEEP_GROUP_NAME = 'store_mutation_preflight_sweep'
+
+
+@pytest.fixture(scope='module')
+def preflight_sweep() -> _PreflightSweep:
+    return _sweep_test_modules(_test_modules(), root=TESTS_DIR)
 
 
 class TestNoHandRolledNeutraliseFixture:
@@ -476,22 +656,16 @@ class TestNoHandRolledNeutraliseFixture:
     under ANY name whose body rebinds `assert_store_mutation_allowed`, which is
     what a rename would actually look like. The second is the one with teeth.
 
-    Asserts over PARSED source (`_ast_guard.parse_python_module`), so prose in a
+    Asserts over PARSED source (the shared `preflight_sweep`), so prose in a
     docstring that merely names the old fixture cannot trip it.
     """
 
+    @pytest.mark.xdist_group(_SWEEP_GROUP_NAME)
     @pytest.mark.timeout(_SWEEP_TIMEOUT)
-    def test_no_test_module_defines_its_own_neutralise_fixture(self) -> None:
-        offenders: list[str] = []
-        for path in _test_modules():
-            tree = parse_python_module(path)
-            for node in ast.walk(tree):
-                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                if node.name == _HAND_ROLLED_FIXTURE_NAME:
-                    offenders.append(f'{path.relative_to(TESTS_DIR)}:{node.lineno}:{node.name} (name)')
-                elif _neutralising_autouse_fixture(node):
-                    offenders.append(f'{path.relative_to(TESTS_DIR)}:{node.lineno}:{node.name} (shape)')
+    def test_no_test_module_defines_its_own_neutralise_fixture(
+        self, preflight_sweep: _PreflightSweep
+    ) -> None:
+        offenders = preflight_sweep.hand_rolled_fixtures
 
         assert not offenders, (
             f'{len(offenders)} hand-rolled neutralising fixture(s) found — an '
@@ -529,18 +703,12 @@ class TestNoHandRolledDenyRaiser:
     so the assertion sites that name the exception are untouched.
     """
 
+    @pytest.mark.xdist_group(_SWEEP_GROUP_NAME)
     @pytest.mark.timeout(_SWEEP_TIMEOUT)
-    def test_no_test_module_raises_store_mutation_unavailable(self) -> None:
-        offenders: list[str] = []
-        for path in _test_modules():
-            tree = parse_python_module(path)
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Raise)
-                    and node.exc is not None
-                    and 'StoreMutationUnavailable' in ast.unparse(node.exc)
-                ):
-                    offenders.append(f'{path.relative_to(TESTS_DIR)}:{node.lineno}')
+    def test_no_test_module_raises_store_mutation_unavailable(
+        self, preflight_sweep: _PreflightSweep
+    ) -> None:
+        offenders = preflight_sweep.deny_raisers
 
         assert not offenders, (
             f'{len(offenders)} hand-rolled `StoreMutationUnavailable` raiser(s) '
@@ -554,25 +722,6 @@ class TestNoHandRolledDenyRaiser:
 # ---------------------------------------------------------------------------
 # Drift guard #3 — the fail-closed marker literal lives only in the helper
 # ---------------------------------------------------------------------------
-
-# Guarding the marker LITERAL rather than a `_fail_closed_records` function
-# name is the stronger check: it also catches a re-divergence that inlines the
-# filter into a test body, or renames the helper.
-#
-# Guards the FAIL-CLOSED marker only -- `FAIL_CLOSED_MARKERS[0]`, not the whole
-# tuple -- and that is deliberate, not an arity oversight. Measured 2026-09-04
-# across all 328 test modules: the fail-closed marker appears as an
-# `ast.Constant` in 0 of them, while the remedy noun (`FAIL_CLOSED_MARKERS[1]`)
-# appears in 48, because it is ordinary English that unrelated suites have
-# every right to mention. Sweeping the whole tuple would buy 48 false positives
-# and an allowlist, which is self-defeating for a drift guard -- the same
-# reasoning guard #2 gives for keying on the `raise` shape rather than setattr.
-#
-# The narrower sweep is still sufficient for the property that matters: the two
-# markers travel together in one tuple, and a suite inlining the diagnosis has
-# to spell the distinctive half in order to match a real record.
-_GUARDED_MARKER = FAIL_CLOSED_MARKERS[0]
-
 
 class TestNoInlinedFailClosedMarker:
     """Whole-tree AST drift guard: the fail-closed marker may not be spelled in
@@ -593,18 +742,12 @@ class TestNoInlinedFailClosedMarker:
     and are correctly outside this sweep.
     """
 
+    @pytest.mark.xdist_group(_SWEEP_GROUP_NAME)
     @pytest.mark.timeout(_SWEEP_TIMEOUT)
-    def test_no_test_module_spells_the_fail_closed_marker(self) -> None:
-        offenders: list[str] = []
-        for path in _test_modules():
-            tree = parse_python_module(path)
-            for node in ast.walk(tree):
-                if (
-                    isinstance(node, ast.Constant)
-                    and isinstance(node.value, str)
-                    and _GUARDED_MARKER in node.value
-                ):
-                    offenders.append(f'{path.relative_to(TESTS_DIR)}:{node.lineno}')
+    def test_no_test_module_spells_the_fail_closed_marker(
+        self, preflight_sweep: _PreflightSweep
+    ) -> None:
+        offenders = preflight_sweep.inlined_markers
 
         assert not offenders, (
             f'{len(offenders)} inlined `{_GUARDED_MARKER}` literal(s) found. '
@@ -613,3 +756,117 @@ class TestNoInlinedFailClosedMarker:
             "'<the script's logger name>')` instead, so the fail-closed "
             'marker is spelled once:\n  ' + '\n  '.join(offenders)
         )
+
+
+# ---------------------------------------------------------------------------
+# The one pass the three guards share
+# ---------------------------------------------------------------------------
+
+
+def _write_module(root: pathlib.Path, rel: str, source: str) -> pathlib.Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding='utf-8')
+    return path
+
+
+_SHAPED_FIXTURE_BODY = (
+    "    monkeypatch.setattr(mod, 'assert_store_mutation_allowed', lambda **_kw: None)\n"
+)
+
+
+class TestSweepTestModules:
+    def test_the_historical_fixture_name_is_flagged_by_name(self, tmp_path: pathlib.Path) -> None:
+        path = _write_module(
+            tmp_path, 'test_a.py', f'def {_HAND_ROLLED_FIXTURE_NAME}():\n    pass\n'
+        )
+
+        sweep = _sweep_test_modules([path], root=tmp_path)
+
+        assert sweep.hand_rolled_fixtures == (f'test_a.py:1:{_HAND_ROLLED_FIXTURE_NAME} (name)',)
+
+    def test_an_autouse_fixture_rebinding_the_guard_is_flagged_by_shape(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _write_module(
+            tmp_path,
+            'test_a.py',
+            'import pytest\n\n\n'
+            '@pytest.fixture(autouse=True)\n'
+            'def _no_preflight(monkeypatch):\n' + _SHAPED_FIXTURE_BODY,
+        )
+
+        sweep = _sweep_test_modules([path], root=tmp_path)
+
+        assert sweep.hand_rolled_fixtures == ('test_a.py:5:_no_preflight (shape)',)
+
+    def test_a_non_autouse_fixture_rebinding_the_guard_is_not_flagged(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _write_module(
+            tmp_path,
+            'test_a.py',
+            'import pytest\n\n\n'
+            '@pytest.fixture\n'
+            'def _rigged(monkeypatch):\n' + _SHAPED_FIXTURE_BODY,
+        )
+
+        assert _sweep_test_modules([path], root=tmp_path).hand_rolled_fixtures == ()
+
+    def test_a_raise_of_the_sentinel_is_a_deny_raiser(self, tmp_path: pathlib.Path) -> None:
+        path = _write_module(
+            tmp_path, 'test_a.py', "def f():\n    raise mod.StoreMutationUnavailable('x')\n"
+        )
+
+        assert _sweep_test_modules([path], root=tmp_path).deny_raisers == ('test_a.py:2',)
+
+    def test_an_assertion_naming_the_sentinel_is_not_a_deny_raiser(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _write_module(
+            tmp_path,
+            'test_a.py',
+            'def f():\n    with pytest.raises(StoreMutationUnavailable):\n        pass\n',
+        )
+
+        assert _sweep_test_modules([path], root=tmp_path).deny_raisers == ()
+
+    def test_a_string_carrying_the_marker_is_an_inlined_marker(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        path = _write_module(tmp_path, 'test_a.py', f'X = {FAIL_CLOSED_MARKERS[0]!r}\n')
+
+        assert _sweep_test_modules([path], root=tmp_path).inlined_markers == ('test_a.py:1',)
+
+    def test_a_clean_module_reports_nothing(self, tmp_path: pathlib.Path) -> None:
+        path = _write_module(tmp_path, 'test_a.py', 'def test_ok():\n    assert True\n')
+
+        assert _sweep_test_modules([path], root=tmp_path) == _PreflightSweep(
+            hand_rolled_fixtures=(), deny_raisers=(), inlined_markers=()
+        )
+
+    def test_labels_follow_the_path_order_and_are_relative_to_the_root(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        raiser = "def f():\n    raise StoreMutationUnavailable('x')\n"
+        later = _write_module(tmp_path, 'test_z.py', raiser)
+        nested = _write_module(tmp_path, 'sub/test_b.py', raiser)
+
+        sweep = _sweep_test_modules([later, nested], root=tmp_path)
+
+        assert sweep.deny_raisers == ('test_z.py:2', 'sub/test_b.py:2')
+
+
+def test_the_tree_sweeps_share_one_xdist_worker(request: pytest.FixtureRequest) -> None:
+    sweeps = {
+        TestNoHandRolledNeutraliseFixture.test_no_test_module_defines_its_own_neutralise_fixture,
+        TestNoHandRolledDenyRaiser.test_no_test_module_raises_store_mutation_unavailable,
+        TestNoInlinedFailClosedMarker.test_no_test_module_spells_the_fail_closed_marker,
+    }
+    selected = [
+        item for item in request.session.items if getattr(item, 'function', None) in sweeps
+    ]
+    if not selected:
+        pytest.skip('no tree sweep is selected in this session')
+
+    assert single_xdist_group(selected) == _SWEEP_GROUP_NAME

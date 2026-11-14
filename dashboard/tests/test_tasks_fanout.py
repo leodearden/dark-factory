@@ -191,6 +191,26 @@ class TestFanoutCore:
         assert isinstance(result, list)
         assert [row['id'] for row in result] == [7, 8]
 
+    async def test_an_error_alongside_tasks_is_served_not_failed(
+        self, dummy_client, dummy_config
+    ):
+        """An ``error`` WITH ``tasks`` is a partial-warning payload, not a failure.
+
+        The soft-failure guard is ``'error' in result and 'tasks' not in
+        result``. Loosening it to ``'error' in result`` would turn a served
+        tree into a fan-out failure.
+        """
+        async def _mcp(*_args, **_kwargs):
+            return {**canned_get_tasks_result(), 'error': 'partial warning'}
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=_mcp):
+            result = await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/core-partial',
+            )
+
+        assert isinstance(result, list), result
+        assert [row['id'] for row in result] == [7, 8]
+
     async def test_every_url_failing_yields_the_marker_naming_each_failure(
         self, dummy_client, two_url_config
     ):

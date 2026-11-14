@@ -57,13 +57,14 @@ KEEPS ITS PIN and does not self-heal — its exit is a human, or the shared
 resolved, or the orphan-L0 reaper promotes a dead-filer L0 to L1 and a human
 consumes it).
 
-That "does not self-heal" property is a statement about a pin OUTSIDE
-``orchestrator.recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES``, and the
-APPLIER is what makes it
-unconditionally true: a row pinned only by a merge-remediable escalation would
-be picked straight back up by the blocked-arm upgrade clauses on the next
-sweep, so ``Harness._reconcile_one_stranded`` holds those rows at their
-pre-3539 LEAVE instead of converting them (amendment pass, review finding #3).
+That "does not self-heal" property is a statement about a pin OUTSIDE the set
+the blocked arm relaxes on — ``orchestrator.recovery_pins.MERGE_REMEDIABLE_ESC_CATEGORIES``
+off main, ``ON_MAIN_REMEDIABLE_ESC_CATEGORIES`` on main — and the APPLIER is
+what makes it unconditionally true: a row pinned only by a record the blocked
+arm relaxes on would be picked straight back up by its upgrade clauses on the
+next sweep, so ``Harness._reconcile_one_stranded`` holds those rows at their
+pre-3539 LEAVE instead of converting them, asking :func:`report_blocked_arm_would_move`
+(amendment pass, review finding #3).
 This table cannot express that — it keys on a BOOLEAN ``has_open_escalation``
 and stays pure and config-free — which is exactly why the scoping lives with
 the two sibling sweep-side clauses rather than here. The escalation veto itself is unchanged (no
@@ -81,7 +82,6 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -89,6 +89,7 @@ from typing import TYPE_CHECKING
 from escalation.pins import classify_pins
 from pydantic import ValidationError
 from shared.deploy_state import DeployPhase, DeployState
+from shared.proc_liveness import pid_alive
 from shared.task_claimant import (
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     compose_claimant_run_id,
@@ -97,7 +98,7 @@ from shared.task_claimant import (
 from shared.task_statuses import TaskStatus
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.recovery_emission import LeaveReason, render_shape
 from orchestrator.recovery_pins import (
     records_pin_blocked_done_flip,
@@ -124,12 +125,14 @@ __all__ = [
     'ClaimantSource',
     'EscalationRef',
     'LeaveReason',
+    'ON_MAIN_BRANCH_KINDS',
     'RecoveryAction',
     'TaskGroundTruth',
     'TruthReport',
     'classify_recovery',
     'leave_reason',
     'recovery_shape_str',
+    'report_blocked_arm_would_move',
     'report_pins_blocked_done_flip',
     'report_pins_blocked_recovery',
     'report_pins_recovery',
@@ -149,6 +152,15 @@ class BranchStateKind(enum.StrEnum):
     EXISTS_OFF_MAIN = 'exists_off_main'
     GONE_WITH_MERGE_MARKER = 'gone_with_merge_marker'
     GONE_NO_MARKER = 'gone_no_marker'
+
+
+#: The branch shapes that are evidence the work is ON MAIN.  The one definition
+#: behind the blocked arm's MARK_DONE upgrade and the question of whether that
+#: upgrade would fire (:func:`report_blocked_arm_would_move`).
+ON_MAIN_BRANCH_KINDS: frozenset[BranchStateKind] = frozenset({
+    BranchStateKind.ON_MAIN,
+    BranchStateKind.GONE_WITH_MERGE_MARKER,
+})
 
 
 class ClaimantSource(enum.StrEnum):
@@ -266,8 +278,12 @@ class EscalationRef:
     means "unknown"; ``orchestrator.recovery_emission.escalation_ages_secs``
     maps that to a ``None`` age rather than dropping the id.
 
-    All three added fields are DEFAULTED so every existing construction site
-    keeps working untouched.
+    ``members`` carries an L2's held member ids, so
+    ``escalation.pins.pinned_only_by_human_parked`` can see a promoted hold
+    without a second read.
+
+    Every field after ``level`` is DEFAULTED so every existing construction
+    site keeps working untouched.
     """
 
     id: str
@@ -276,6 +292,7 @@ class EscalationRef:
     severity: str = ''
     filing_claimant_run_id: str | None = None
     created_at: str | None = None
+    members: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -316,33 +333,6 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _pid_alive(pid: int) -> bool:
-    """Return True if the process identified by *pid* is alive.
-
-    Duplicates ``orchestrator.harness._pid_alive`` (itself mirroring
-    fused-memory's ``orchestrator_detector.py:58-72``) rather than importing
-    it, to avoid a harness->task_ground_truth->harness circular import once
-    θ2 migrates the harness's reconcile sweeps to call derive_truth/
-    recovery_for.
-
-    - Returns False for pid <= 0 (invalid).
-    - Uses os.kill(pid, 0): success → alive; ProcessLookupError → dead;
-      PermissionError → alive (we can see it but lack permission to signal it);
-      other OSError → treat as dead.
-    """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
 def _known_str(value: object) -> str | None:
     """Return *value* VERBATIM if it is a non-blank ``str``, else ``None``.
 
@@ -357,6 +347,26 @@ def _known_str(value: object) -> str | None:
     stamp built from those same components.
     """
     return value if isinstance(value, str) and value.strip() else None
+
+
+def _parse_owner_pid(raw: object) -> int | None:
+    """Parse a plan.lock ``owner_pid`` into an int, or ``None`` when malformed.
+
+    A bool is rejected before any int() conversion: ``int(True) == 1`` would
+    turn a JSON ``true`` into pid 1 (init), a phantom live claimant.  A str is
+    accepted, so a zero-padded ``'00123'`` parses to the int the composed
+    identity must embed.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    return None
 
 
 def _lock_fresh(locked_at: object, now: datetime, ttl: timedelta) -> bool:
@@ -600,9 +610,9 @@ class TaskGroundTruth:
         *worktree_path* is :meth:`derive_truth`'s single
         ``worktree_resolver(tid)`` resolution (also shared with
         ``worktree_present``, review finding #2) — this method makes no I/O
-        of its own beyond the plan.lock read, which is addressed at
-        *worktree_path*'s ``.task-meta`` SIBLING, not inside it (task 4028;
-        see the comment on that leg below).
+        of its own beyond the plan.lock read, which is addressed at *tid*'s
+        own ``.task-meta/task-<tid>`` root beside *worktree_path* (see the
+        comment on that leg below).
         """
         if self.scheduler.is_actively_held(tid):
             return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.IN_MEMORY)
@@ -617,42 +627,36 @@ class TaskGroundTruth:
                 source=ClaimantSource.DB,
             )
 
-        # Addressed at the ``.task-meta`` SIBLING — where the lock's sole
-        # writer puts it (``TaskWorkflow`` builds its ``TaskArtifacts`` with
-        # ``_meta_root_for_worktree(self.worktree)``, workflow.py) — via
-        # ``meta_root_for``, the single owner of that path shape, so neither
-        # side hand-joins ``.task-meta`` (task 4028).
+        # Addressed at the task's own root, ``.task-meta/task-<tid>`` — where
+        # the lock's sole writer puts it (plan.lock is task-scoped in
+        # ``ARTIFACT_ROOTS``, and ``TaskWorkflow._artifact_roots`` hands every
+        # dispatch that root) — via ``TaskArtifacts.for_task``, so neither side
+        # hand-joins ``.task-meta`` (tasks 4028, 3155).
         #
-        # Deliberately NO legacy fallback: nothing has written
-        # ``<worktree>/.task/plan.lock`` since the meta-root migration, so a
-        # new-then-old read (as in ``Harness._resolve_recovery_artifact``)
-        # would be dead code on arrival, and any legacy lock still on disk
-        # necessarily predates that migration and so fails ``_lock_fresh``
-        # below anyway. Pinned by
-        # ``TestPlanLockIsReadFromTheMetaRoot::test_lock_at_the_legacy_root_is_ignored``.
+        # Deliberately NO fallback to the lane root ``.task-meta/<name>`` or
+        # the legacy ``<worktree>/.task``: nothing writes a lock there any
+        # more, so a new-then-old read would be dead code on arrival (PRD
+        # ``plans/task-meta-task-keying-prd.md`` decision 7), and a lock still
+        # sitting at either address predates the move and so fails
+        # ``_lock_fresh`` below anyway. Pinned by
+        # ``test_task_ground_truth.py::TestPlanLockIsReadFromTheTaskRoot``.
         #
         # ATTRIBUTION IS BY ADDRESS, NOT BY SESSION IDENTITY: any fresh,
-        # live-pid lock at this task's resolved meta root is taken to be
-        # *tid*'s, WITHOUT checking that ``session_id`` carries the
-        # ``'{tid}-'`` prefix ``clear_stale_plan_lock`` keys on.  Deliberate,
-        # and deliberately not symmetric with that method:
+        # live-pid lock at this task's root is taken to be *tid*'s, WITHOUT
+        # checking that ``session_id`` carries the ``'{tid}-'`` prefix
+        # ``clear_stale_plan_lock`` keys on.  Deliberate, and deliberately not
+        # symmetric with that method:
         #   * The dominant stale-lock case is a crashed PRIOR incarnation of
-        #     the SAME task (a same-task lane reuse preserves the meta root
-        #     precisely because those artifacts are the task's own), and it
-        #     carries a MATCHING prefix — so a prefix gate would not catch
-        #     the case that actually happens.
-        #   * The cross-task case a gate WOULD catch — a warm lane's meta
-        #     root outliving its previous occupant, since it is a sibling of
-        #     the worktree and survives cleanup — is already cleared on every
-        #     different-task acquisition route by
-        #     ``GitOps._clear_foreign_meta_root`` (RECYCLE /
-        #     RESET_IN_PLACE_REATTACH / CREATE_ONCE_FRESH /
-        #     CREATE_ONCE_REATTACH).
+        #     the SAME task, and it carries a MATCHING prefix — so a prefix
+        #     gate would not catch the case that actually happens.
+        #   * The root is keyed by task id, so no lane lifecycle can leave
+        #     another task's lock there; a gate would guard only against a
+        #     writer bug.
         #   * A gate would fail DANGEROUS. Rejecting a lock this resolver
         #     cannot positively attribute makes a LIVE task read as
         #     unclaimed, which is the task-2588 un-claim incident class.
         #     Mis-attributing the other way only DELAYS recovery.
-        # What bounds that delay is ``_lock_fresh`` alone, not ``_pid_alive``:
+        # What bounds that delay is ``_lock_fresh`` alone, not ``pid_alive``:
         # ``owner_pid`` is the ORCHESTRATOR's pid, which outlives any single
         # task, so the liveness half is nearly always true. Freshness caps the
         # exposure at ``heartbeat_ttl`` — a window in which the harness's R3
@@ -660,12 +664,17 @@ class TaskGroundTruth:
         # recovery mid-run. Pinned (both the attribution and its freshness
         # bound) by test_task_ground_truth.py::TestPlanLockAttributionIsByAddress.
         #
-        # Derived OUTSIDE the try: this is pure path algebra with no I/O, and
-        # must not be swallowed by the degradation arm below, which exists for
-        # a corrupt lock FILE — not for a mis-derived root.
-        meta_root = TaskArtifacts.meta_root_for(worktree_path.parent, worktree_path.name)
+        # Derived OUTSIDE the corrupt-file try below: an id ``task_root_for``
+        # refuses is an unaddressable task, not a corrupt lock FILE. It has no
+        # lock to read, so it degrades to "no plan-lock claimant" on its own
+        # arm rather than aborting the sweep.
         try:
-            lock_data = TaskArtifacts(worktree_path, meta_root).read_plan_lock()
+            artifacts = TaskArtifacts.for_task(worktree_path, tid)
+        except ValueError:
+            logger.warning('No plan-lock claimant for unaddressable task id %r', tid)
+            return None
+        try:
+            lock_data = artifacts.read_plan_lock()
         except (ValueError, OSError):
             # A truncated/corrupt plan.lock is a realistic outcome of the
             # very crash this resolver recovers from — degrade to "no
@@ -695,18 +704,12 @@ class TaskGroundTruth:
         # test_vestigial_worktree_lock_is_inert_and_unlinked, which is what it
         # always actually pinned, task 4028).
         if isinstance(lock_data, dict):
-            owner_pid = lock_data.get('owner_pid')
             # Retain the PARSED pid: the composed identity below must embed the
             # same int this liveness check validated, not a re-parse of the raw
             # value (which could be e.g. the string '123', composing a
             # different byte sequence than the DB stamp's int).
-            parsed_pid: int | None = None
-            try:
-                parsed_pid = None if owner_pid is None else int(owner_pid)
-                owner_alive = parsed_pid is not None and _pid_alive(parsed_pid)
-            except (TypeError, ValueError):
-                parsed_pid = None
-                owner_alive = False
+            parsed_pid = _parse_owner_pid(lock_data.get('owner_pid'))
+            owner_alive = pid_alive(parsed_pid)
             lock_fresh = _lock_fresh(lock_data.get('locked_at'), self.now_fn(), self.heartbeat_ttl)
             if owner_alive and lock_fresh:
                 # Compose ONLY when every component is known and well-formed;
@@ -735,9 +738,11 @@ class TaskGroundTruth:
     ) -> tuple[list[EscalationRef], bool]:
         """Map *tid*'s pending escalations to refs, plus the store's readability.
 
-        ``severity``, ``filing_claimant_run_id`` and ``created_at`` travel with
-        each ref so consumers can feed ``escalation.pins.classify_pins``
-        directly, and age a hold, without re-reading the store (spec
+        ``severity``, ``filing_claimant_run_id``, ``created_at`` and
+        ``members`` travel with each ref so consumers can feed
+        ``escalation.pins.classify_pins`` and
+        ``escalation.pins.pinned_only_by_human_parked`` directly, and age a
+        hold, without re-reading the store (spec
         ``docs/task-escalation-state-spec.md`` S6/E7).  ``row.severity or ''``
         normalises a null/absent severity to the unknown-severity sentinel, so
         the classifier reaches its documented fail-safe-to-pinning branch
@@ -777,6 +782,7 @@ class TaskGroundTruth:
                 severity=row.severity or '',
                 filing_claimant_run_id=row.filing_claimant_run_id,
                 created_at=getattr(row, 'timestamp', None),
+                members=tuple(row.members or ()),
             )
             for row in rows
         ], False
@@ -887,12 +893,12 @@ _RECOVERY: dict[_RecoveryShape, RecoveryAction] = {
     # READ THAT PARENTHESIS AS THE PRECONDITION IT IS, not as a property of
     # every converting row (amendment pass, review finding #3). It holds for a
     # `task_failure` pin — the measured 3717 population — and NOT for a
-    # `stranded_blocked` one, which `only_merge_remediable` accepts, so the
-    # next sweep's blocked-arm clauses would move the converted row again
-    # (MARK_DONE on main, RE_FILE off it). The applier therefore holds
-    # merge-remediable-pinned rows at their pre-3539 LEAVE and only genuinely
-    # at-rest rows reach the conversion; see the scoping clause in
-    # `Harness._reconcile_one_stranded`.
+    # `stranded_blocked` one (or, on main, a `preexisting_main_break` one),
+    # which `only_merge_remediable` accepts, so the next sweep's blocked-arm
+    # clauses would move the converted row again (MARK_DONE on main, RE_FILE
+    # off it). The applier therefore holds such rows at their pre-3539 LEAVE
+    # and only genuinely at-rest rows reach the conversion; the scoping clause
+    # in `Harness._reconcile_one_stranded` asks `report_blocked_arm_would_move`.
     #
     # Every CONVERT row is keyed `TaskStatus.IN_PROGRESS` BY CONSTRUCTION.
     # That single fact does two jobs: a converted (`blocked`) task can never
@@ -1179,8 +1185,9 @@ def report_pins_blocked_recovery(report: TruthReport) -> bool:
 def report_pins_blocked_done_flip(report: TruthReport) -> bool:
     """Do *report*'s open records forbid flipping a BLOCKED task to done?
 
-    :func:`report_pins_blocked_recovery`'s deliberately-more-conservative twin;
-    they differ on exactly one input class.  See
+    :func:`report_pins_blocked_recovery`'s twin; they differ on exactly two
+    input classes (a dead-filer L0, and a ``preexisting_main_break``-only pin,
+    which only the done-flip relaxes).  See
     :func:`orchestrator.recovery_pins.records_pin_blocked_done_flip`.
     """
     return records_pin_blocked_done_flip(
@@ -1188,6 +1195,28 @@ def report_pins_blocked_done_flip(report: TruthReport) -> bool:
         report.open_escalations,
         live_claimant=report.live_claimant is not None,
         live_claimant_id=_live_claimant_id(report),
+    )
+
+
+def report_blocked_arm_would_move(report: TruthReport) -> bool:
+    """Would a blocked-arm upgrade clause move a BLOCKED row with these records?
+
+    The blocked arm's own question, asked about a row that is NOT yet blocked:
+    "if this were status ``blocked`` next sweep, would the self-heal clauses of
+    ``Harness._reconcile_one_stranded`` act on it?"  True when the recovery
+    predicate lets go (the EXISTS_OFF_MAIN re-file clause may fire), or when the
+    branch is ON MAIN and the done-flip predicate lets go.  The CONVERT scoping
+    clause consumes it so a converted row can only ever be one that ``blocked``
+    genuinely rests (task 3539 amendment).
+
+    One function so the clause never re-spells the two predicates: they diverge
+    on exactly the rows task 4645 enumerates, and the clause must follow both.
+    """
+    if not report_pins_blocked_recovery(report):
+        return True
+    return (
+        report.branch_state.kind in ON_MAIN_BRANCH_KINDS
+        and not report_pins_blocked_done_flip(report)
     )
 
 

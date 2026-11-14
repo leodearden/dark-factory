@@ -317,7 +317,10 @@ log-mode-first behind a soak, and only after the producer fixes land**
 ## 8. Divergence register (code vs this spec, 2026-08-02)
 
 Verified sites; consequences characterized. E-numbers are referenced by
-the PRD's tasks.
+the PRD's tasks. Each entry's original text stays as the audit trail; the
+closing sentences appended to it ("Closed by task N (leaf X)", "Partly
+closed …", or "Still open …") record what later landed, re-verified
+against code on 2026-10-26 (task 6082).
 
 - **E1 — Path B merge-entry bail** (`workflow.py:3457-3464`): returns
   ESCALATED with no steward, no status write → permanent strand vetoed
@@ -326,11 +329,24 @@ the PRD's tasks.
   observational" comment). Fix: enter the same escalated-wait machinery
   as Path A (bounded; L2/critical short-circuits to `_mark_blocked`).
   The *gate itself is correct* (stop-the-line, repend D4) — the defect
-  is the missing post-bail owner.
+  is the missing post-bail owner. Closed by task 3536 (leaf γ1):
+  `workflow.py::TaskWorkflow._handle_merge_gate_escalations` enters the
+  same steward + `_wait_for_resolution` machinery as Path A. A born-at-L2
+  record, wait expiry, or a gating record still open at the single-shot
+  re-check parks the row via `_mark_blocked`; a steward terminal decision
+  is honoured as written; a cleared gate merges in-slot. No exit leaves
+  `in-progress` without a claimant (pinned by
+  `orchestrator/tests/test_workflow_merge_gating_strand.py`).
 - **E2 — `_mark_blocked(merge_phase=True)` writes no status** (every
   `_submit_to_merge_queue` block path): BLOCKED exits leave
   `in-progress`. Investigate the carve-out's original rationale, then
-  make merge-phase blocks write their park status.
+  make merge-phase blocks write their park status. Closed by task 3537
+  (leaf γ2): every slot-exiting return of `_mark_blocked(merge_phase=True)`
+  writes its park status through
+  `workflow.py::TaskWorkflow._park_merge_phase_row`. The entry-write
+  suppression remains only for the in-slot merge-retry loop, whose live
+  claimant keeps `in-progress` truthful (the investigation is recorded as
+  MERGE_PHASE_RATIONALE in `_mark_blocked`'s docstring).
 - **E3 — merge-halt trio** (`_handle_wip_recovery_no_advance` /
   `_handle_unmerged_state` / `_handle_stash_failed`): unbounded
   `_escalation_event.wait()` (violates S5) and post-resolution BLOCKED
@@ -339,19 +355,52 @@ the PRD's tasks.
   exit when the waiter owns the halt — a bound or an escalate-and-block
   rewrite must exit without that cleanup, and halt rehydration's
   `level == 1` filter must widen before any promotion of halt-owner
-  records is possible.
+  records is possible. Closed by task 3537 (leaf γ2) for the three named
+  handlers: each files its halt-owning L1 (`_file_halt_owning_l1`) and
+  returns `_mark_blocked(...)` without waiting. The record's resolution is
+  the sole unhalt edge, and `harness.py::Harness._rehydrate_merge_halt`
+  matches the halt categories at `level >= 1`. Outside this entry's list
+  and still open: `_handle_wip_conflict` and `_handle_wip_recovery` still
+  await `_submit_halt_escalation_and_wait`'s unbounded
+  `_escalation_event.wait()` in-slot (live claimant, so no strand, but no
+  S5 bound). Task 4224 owns that.
 - **E4 — REQUEUED without `pending`**: `WarmLaneRequeue`
   (`workflow.py:2853-2901`) and the soft-cancel spurious-wakeup fallback
   rely on the sweep; any open escalation converts a transient capacity
-  signal into a Path-B-class strand.
+  signal into a Path-B-class strand. Closed by task 3538 (leaf γ3):
+  `workflow.py::TaskWorkflow._repend_for_requeue` writes `pending` before
+  the REQUEUED exit on the `WarmLaneRequeue` path and the soft-cancel
+  spurious-wakeup fallback (and, since task 3316,
+  `_requeue_on_server_error`). A failed write is recorded in the
+  run()-exit write-failure ledger (`_note_exit_status_write`; §5's
+  status-write-failure relaxation) instead of escaping.
 - **E5 — infra-hold resume manufactures the strand shape**
   (`harness.py:12846-12866` writes claimant-less `in-progress` and
   waits for the sweep): re-creates the 3465 starvation whenever any
   record is open. Resume should write a truthful dispatchable status.
+  Closed by task 3538 (leaf γ3): the infra-hold arm of
+  `harness.py::Harness._cascade_unblock_member` writes `pending`, not
+  claimant-less `in-progress`. Resume-at-verify is branch-keyed
+  (`TaskWorkflow._has_prior_implementation`), not status-keyed. A refused
+  write escalates via `_escalate_cascade_status_rejection` (pinned by
+  `orchestrator/tests/test_harness_infra_resume_truthful.py`).
 - **E6 — blast-radius requeue pending-write failure**
   (`scheduler.py:7024-7037`): held in-memory locks make the row read as
   actively-held → LEAVE until restart; the "next reconcile cycle"
-  comment is false.
+  comment is false. Partly closed by task 6051 (spawned from θ's review;
+  not a PRD leaf): `scheduler.py::Scheduler.handle_blast_radius_expansion`
+  returns `BlastRadiusResult(applied=False, repend_error=e)` instead of a
+  bare `False`, and `workflow.py::TaskWorkflow._requeue_on_lock_conflict`
+  records the error in the run()-exit write-failure ledger, so the failure
+  yields one STORE_UNAVAILABLE exit-contract record. Still open: the
+  scheduler keeps its locks "for reconcile to recover", but
+  `harness.py::Harness._run_slot`'s exit releases them anyway
+  (`SlotLease.release` → `Scheduler.release`). The row is left
+  `(in-progress, NULL claimant)`, an ordinary strand for the stranded
+  sweep rather than the actively-held LEAVE described above. Task 5735
+  owns making that contract explicit; task 6119 owns
+  `TaskWorkflow._apply_revalidation_skip` falling through on a
+  not-applied result instead of exiting.
 - **E7 — the recovery veto is `bool(open)` at any level/severity**,
   five hand-rolled copies (task_ground_truth `_shape`; harness
   `:5560`; scheduler `:5719`; harness `:11759`+`:11373`), silent at
@@ -359,17 +408,42 @@ the PRD's tasks.
   a structured fact); `EscalationRef` drops severity so no site *can*
   discriminate (S6), and no site distinguishes a wrong/unavailable
   store from "no records" (S6 store-correctness). The in-progress applier re-derives resolver policy
-  in guard order (INV-5).
+  in guard order (INV-5). Closed by tasks 3533 (leaf α), 3535 (leaf β)
+  and 3541 (leaf η): `EscalationRef` carries `severity`,
+  `filing_claimant_run_id` and `created_at`. Every recovery, redispatch
+  and done-flip veto asks the one predicate,
+  `escalation/src/escalation/pins.py::classify_pins`, through
+  `orchestrator/src/orchestrator/recovery_pins.py`: `.pins` for recovery
+  and redispatch (including `Scheduler._phase_redispatch_stranded_blocked`),
+  `.vetoes_done_flip` for MARK_DONE (`task_ground_truth.py::_shape`). The
+  in-progress applier consumes the resolver's answer, and the duplicate
+  deterministic-recon pair is collapsed. A failed store read is the third
+  state `TruthReport.escalation_store_unavailable`, which maps to
+  `recovery_left(reason=escalation_store_unavailable)`; every veto emits
+  `recovery_vetoed`/`recovery_left`.
+  `orchestrator/tests/test_recovery_veto_predicate_collapse.py` guards the
+  single predicate.
 - **E8 — `_already_landed_dispatch_gate` (`harness.py:10137-10142`) is
   still L1-only** while every sibling went any-level: a pending task
   with only an open L0/L2 can be auto-flipped to done past a human
   handoff — the live *inverse* hazard (phantom-done). Highest-urgency
-  small fix in the family.
+  small fix in the family. Closed by task 3534 (leaf η0):
+  `harness.py::Harness._already_landed_dispatch_gate` vetoes on
+  `classify_pins(...).vetoes_done_flip` over every open record at any
+  level (info carved out). A failed read is treated as store-unavailable,
+  and since task 3535 both of its holds emit a structured
+  `recovery_vetoed`.
 - **E9 — B2/goal-5 unimplemented**: `_cascade_unblock_member` requires
   `status == 'blocked'` (`harness.py:12873`) and the resolution path
   gates L0 at `level >= 1` (`harness.py:12014`) — `resume` on a strand
   reaches no re-pend path at all; `granted_files` scope grants deliver
-  to nobody.
+  to nobody. Closed by task 3540 (leaf ζ):
+  `harness.py::Harness._cascade_unblock_member` re-pends any
+  `_RESUME_REPEND_STATUSES` row (`blocked`, `in-progress`) with no live
+  claimant (`_resume_repend_liveness`), with an INV-3 corroborating
+  re-read before the write. `Harness._on_escalation_resolved` no longer
+  wraps `resume` in `level >= 1`, and `_fold_granted_files_on_repend`
+  delivers `granted_files` on the re-pend path.
 - **E10 — `_OUTCOME_ALLOWED` loose entries are documented strand
   windows** (`task_transitions.py:279-330`): `escalated`/`requeued`/
   `blocked`/`soft-cancelled` ⊇ {IN_PROGRESS}; `planned` unreachable;
@@ -381,12 +455,31 @@ the PRD's tasks.
   "wherever it was". That part stays open.
 - **E11 — SM-2 violation handling is soft-fail**: AssertionError →
   generic catch → synthetic BLOCKED with empty reason, no escalation —
-  the false-done detector's alarm goes to a log line (INV-4).
+  the false-done detector's alarm goes to a log line (INV-4). Closed by
+  task 3542 (leaf θ), enforced by task 3546 (leaf μ): `run()` judges both
+  SM-2 halves through
+  `orchestrator/src/orchestrator/exit_contract.py::judge_exit` and
+  records the verdict with `record_exit_verdict` (a WARNING plus a
+  `workflow_exit_contract` event). It always returns its real report, so
+  there is no synthetic BLOCKED. Since μ, the
+  `workflow_exit_contract_enforce` key in `dark-factory-orchestrator.yaml`
+  is on, so a violation also files one deduped blocking L1.
 - **E12 — silent sweeps**: the stranded sweep logs nothing when every
   candidate is vetoed; summary tallies omit vetoed/left; Path B's bail
   logs a count, not ids; burndown counts strands as active (859/7871
   snapshots over cap, peak 33 vs 24) with no parity alarm; dashboards
   drop claimant fields at ingest and render strands with an agent chip.
+  Closed by tasks 3535 (leaf β) and 3543 (leaf ι); Path B's bail is gone
+  (E1). The stranded sweep logs a summary every pass, with held/left
+  tallies and pinning ids
+  (`orchestrator/src/orchestrator/recovery_emission.py::RecoverySweepTally`);
+  vetoes emit `recovery_vetoed`/`recovery_left` naming the ids; and a veto
+  streak raises an alarm. The burndown splits `in_progress` into
+  live/stranded with a parity alarm
+  (`dashboard/src/dashboard/data/burndown.py::compute_parity_alarm`).
+  Dashboard task rows keep `claimant_run_id`/`heartbeat_at` and render a
+  stranded badge, and escalations carry a `pins_recovery` annotation
+  shown as a PINNING chip.
 - **E13 — doc/comment divergences**: ARCHITECTURE.md §3.6 (no Path B),
   §3.7 (veto omitted; "sole choke point" false — six other blocked
   writers), transition diagram missing 8+ live edges (incl. the
@@ -395,14 +488,42 @@ the PRD's tasks.
   pre-veto sweep; `_reconcile_one_stranded` docstring says "L1-only"
   and cites a dead line; `workflow.py:3438-3439` "purely observational";
   stale `resolve_issue` docstring; `_UNION`'s call-site anchors rotted.
+  Partly closed.
+  - Closed:
+    - ARCHITECTURE.md §3.1 (the diagram now draws Table A in full,
+      including the deterministic `pending→blocked` edge), §3.6 (both
+      ESCALATED dispositions, MERGE entry included) and §3.7 (the veto
+      and every sibling `blocked` writer), by task 3544 (leaf κ); task
+      4172 later moved §3.7/§6 to present tense.
+    - The "purely observational" tripwire comment, by task 3536 (leaf γ1).
+    - The `_reconcile_one_stranded` veto bullet, by task 3541 (leaf η).
+    - The `_UNION` anchors, now `path::symbol`, by task 3542 (leaf θ).
+    - The `resolve_issue` NOTE calling Table B wiring an out-of-scope
+      follow-up, by task 6607.
+  - Still open (task 7506 owns all three):
+    - `escalation/src/escalation/server.py`'s `resolve_issue` action
+      table still lists `resume`'s task-status effect as "stays
+      in-progress", true since task 3540 only for a live claimant.
+    - `harness.py::Harness._warm_lane_reclaim_candidates` still grounds
+      its ownership invariant on the sweep reverting stranded rows.
+    - `_reconcile_one_stranded`'s merge-deferred bullet still says
+      "open-L1 veto pattern".
 - **E14 — `review` status has zero code writers** — vocabulary residue;
-  decide retire-or-document.
+  decide retire-or-document. Still open, by decision: no code writer
+  exists (`TaskStatus.REVIEW` appears only in Table A pairs and
+  `shared/src/shared/task_claimant.py`). The PRD's out-of-scope list and
+  open question 3 keep `review` in the vocabulary as human-only, and no
+  task owns its retirement.
 - **E15 — adjacent tasks**: 3429 (tripwire gating decision — correctly
   identifies the contradiction and defers the strand to 3423) and 3423
   (the strand-fix owner on paper, but recon has since redirected its
   description to the reify-5879 flap investigation, so no task currently
   owns the strand fix; its `metadata.files` still names the never-landed
-  strand test). Reconciled at PRD queue time.
+  strand test). Reconciled at PRD queue time. Closed at PRD queue time
+  per PRD D11: task 3423's strand-fix half moved to 3536/3542 (its
+  `metadata.files` were emptied) and the task was cancelled on
+  2026-08-03; task 3429 is done; and task 3536 (leaf γ1) delivered the
+  promised `orchestrator/tests/test_workflow_merge_gating_strand.py`.
 
 ## 9. Non-goals
 

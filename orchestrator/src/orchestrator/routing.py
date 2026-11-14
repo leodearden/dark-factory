@@ -12,7 +12,8 @@ Task epsilon adds ``resolve_route`` -- the single layered authority for
 ``orchestrator.workflow.TaskWorkflow._invoke``. See ``resolve_route``'s own
 docstring for the layer precedence.
 
-Kept import-light at module top (stdlib only) so ``config.py`` can
+Kept import-light at module top (stdlib, plus the stdlib-only
+``orchestrator.implementer_brief_variant``) so ``config.py`` can
 ``from orchestrator.routing import DEFAULT_ALLOWED_MODELS`` with no circular
 import; heavier imports (e.g. ``shared.cli_invoke.invoke_claude_agent``) are
 deferred to inside the functions that need them. ``OrchestratorConfig`` is
@@ -28,6 +29,8 @@ import logging
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from orchestrator.implementer_brief_variant import invocation_bounds
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -75,24 +78,15 @@ DEFAULT_PROBE_ARTIFACT_PATH: str = 'config/model-availability.yaml'
 # turn, without incurring meaningful cost.
 DEFAULT_PROBE_PROMPT: str = 'Reply with the single word: ok'
 
-# AgentResult.subtype the Claude CLI stamps when the local --max-budget-usd
-# ceiling fires: ``error_max_budget_usd``, WITH the ``_usd`` suffix -- not
-# ``error_max_budget`` (the same warning
-# ``orchestrator.dry_run_unblock::_BUDGET_SUBTYPES`` carries). This is a CLI
-# wire contract, so its canonical home is beside AgentResult in
-# ``shared.cli_invoke``, which every package that spells it already depends
-# on; consolidating the several per-package copies is filed follow-up work,
-# outside this module's scope.
-PROBE_BUDGET_EXHAUSTED_SUBTYPE: str = 'error_max_budget_usd'
-
 # Per-invocation USD ceiling probe_models forwards as max_budget_usd.
 # INVARIANT: it must clear one turn of the most expensive probed model. A
 # one-turn probe still pays for the CLI's own preamble, and one
 # FABLE_CANDIDATE_MODEL turn measures ~$0.15-0.25 that way, so a ceiling
-# below that aborts every such probe with PROBE_BUDGET_EXHAUSTED_SUBTYPE and
-# yields no availability evidence at all. $1.00 leaves ~4x headroom while
-# staying a trivially small per-(account, model) spend, and it is a CEILING,
-# not a spend: a probe that completes normally still costs one cheap turn.
+# below that aborts every such probe with
+# shared.cli_invoke.BUDGET_EXHAUSTED_SUBTYPE and yields no availability
+# evidence at all. $1.00 leaves ~4x headroom while staying a trivially small
+# per-(account, model) spend, and it is a CEILING, not a spend: a probe that
+# completes normally still costs one cheap turn.
 DEFAULT_PROBE_BUDGET_USD: float = 1.0
 
 # The status classify_probe_outcome returns for a turn that aborted on that
@@ -128,9 +122,9 @@ def classify_probe_outcome(result: AgentResult) -> str:
     """Map one probe invocation's ``AgentResult`` to a probe status string.
 
     A budget abort is checked FIRST, above every other tier including cap
-    detection: ``PROBE_BUDGET_EXHAUSTED_SUBTYPE`` means the API accepted the
-    request and consumed real tokens, so the model resolved for this account
-    and the account is NOT capped -- the distinction
+    detection: ``shared.cli_invoke.BUDGET_EXHAUSTED_SUBTYPE`` means the API
+    accepted the request and consumed real tokens, so the model resolved for
+    this account and the account is NOT capped -- the distinction
     ``shared.usage_gate::_probe_hit_local_budget_cap`` draws. Detection keys
     on that subtype ALONE, never on a ``cost_usd >= budget_usd`` heuristic:
     an agent can spend close to the ceiling and then fail for an unrelated
@@ -146,6 +140,7 @@ def classify_probe_outcome(result: AgentResult) -> str:
     Pure -- reads only *result*. ``'invoke_error'`` and ``'no_token'`` are
     assigned by ``probe_models`` around this function, never by it.
     """
+    from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE
     from shared.invocation_outcome import (
         OK,
         AuthFailed,
@@ -155,7 +150,7 @@ def classify_probe_outcome(result: AgentResult) -> str:
         classify_invocation,
     )
 
-    if (result.subtype or '') == PROBE_BUDGET_EXHAUSTED_SUBTYPE:
+    if result.subtype == BUDGET_EXHAUSTED_SUBTYPE:
         return PROBE_BUDGET_TOO_LOW_STATUS
 
     outcome = classify_invocation(result, strict_confirm=False, backend='claude')
@@ -545,6 +540,10 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
        always available and unconditional -- this is the only layer never
        subject to fail-safe validation -- so this function never raises).
 
+    Then a final, non-layer transform: under ``config.implementer_brief_variant``
+    one-step the implementer's budget_usd/max_turns are divided per
+    ``orchestrator/src/orchestrator/implementer_brief_variant.py``.
+
     Each of effort/budget_usd/max_turns is resolved independently
     field-by-field from the highest layer that specifies it;
     ``source_layer`` tracks only ``model``'s provenance. Pure and
@@ -669,6 +668,10 @@ def resolve_route(inputs: RouteInputs, config: OrchestratorConfig) -> RoutingDec
             source_layer = 'metadata_override'
         else:
             rejected.append(f'metadata_override:{reason}')
+
+    budget_usd, max_turns = invocation_bounds(
+        config.implementer_brief_variant, inputs.role_name, budget_usd, max_turns,
+    )
 
     return RoutingDecision(
         model=model,

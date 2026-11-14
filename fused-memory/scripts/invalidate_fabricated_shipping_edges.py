@@ -47,10 +47,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('invalidate_shipping_edges')
 
@@ -206,26 +203,19 @@ async def _run(args: argparse.Namespace) -> int:
     # so a write-denied environment would report a clean exit over a
     # half-applied invalidation.
     #
-    # ``logging.basicConfig`` already ran above, so this error is emitted.
+    # ``logging.basicConfig`` already ran above, so the guard's refusal record
+    # is emitted.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(
-                operation='invalidate_fabricated_shipping_edges --apply'
-            )
-        except StoreMutationUnavailable:
-            logger.error(
-                'invalidate_fabricated_shipping_edges: --apply NOT started '
-                "(fail-closed) -- this process cannot write mem0's history "
-                'directory, so each invalidation would supersede its edge and '
-                'then fail to record the change, leaving the fabricated-edge '
-                'sweep half-applied with no trace of which edges were already '
-                'retired. Nothing was scanned and nothing was mutated, and no '
-                'client was opened. Route the invalidations through the '
-                'fused-memory MCP server (the unsandboxed owner of the store), '
-                'or re-run from an unsandboxed operator shell. To obtain the '
-                'candidate report safely from anywhere, re-run without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='invalidate_fabricated_shipping_edges --apply',
+            logger=logger,
+            extra_detail=(
+                'each invalidation would supersede its edge and then fail to '
+                'record the change, leaving the fabricated-edge sweep half-applied '
+                'with no trace of which edges were already retired. Nothing was '
+                'scanned and nothing was mutated, and no client was opened.'
+            ),
+        )
 
     import os  # noqa: PLC0415
 

@@ -156,6 +156,27 @@ done
 REIFY_WARM_LANE_DISK_GUARD_MIN_FREE_GIB=010 run_helper check --mount /tmp --min-free-inodes 100000
 assert "A9: env MIN_FREE_GIB=010 exits 2" test "$RC" -eq 2
 
+# A10: a multi-line value whose FIRST line is valid is still not an integer.
+# Each case must exit 2 with that knob's own validator message.
+a10_rejects() {
+    local label="$1" knob="$2"
+    assert "A10: multi-line $label exits 2" test "$RC" -eq 2
+    assert "A10: multi-line $label names its validator" \
+        bash -c 'grep -qF -- "$2 is not a valid integer" <<<"$1"' _ "$ERR_OUT" "$knob"
+}
+run_helper check --mount /tmp --min-free-gib $'5\nx' --min-free-inodes 100000
+a10_rejects "--min-free-gib" "MIN_FREE_GIB (or --min-free-gib)"
+run_helper check --mount /tmp --min-free-gib 5 --min-free-inodes $'100000\nx'
+a10_rejects "--min-free-inodes" "MIN_FREE_INODES (or --min-free-inodes)"
+run_helper check --mount /tmp --soft --min-free-gib 10 --soft-free-gib $'20\nx' \
+    --min-free-inodes 100000 --soft-free-inodes 200000
+a10_rejects "--soft-free-gib" "SOFT_FREE_GIB (or --soft-free-gib)"
+run_helper check --mount /tmp --soft --min-free-gib 10 --soft-free-gib 20 \
+    --min-free-inodes 100000 --soft-free-inodes $'200000\nx'
+a10_rejects "--soft-free-inodes" "SOFT_FREE_INODES (or --soft-free-inodes)"
+REIFY_WARM_LANE_DISK_GUARD_MIN_FREE_GIB=$'5\nx' run_helper check --mount /tmp --min-free-inodes 100000
+a10_rejects "env MIN_FREE_GIB" "MIN_FREE_GIB (or --min-free-gib)"
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Block B — happy path: ample bytes AND inodes → exits 0
 # ──────────────────────────────────────────────────────────────────────────────

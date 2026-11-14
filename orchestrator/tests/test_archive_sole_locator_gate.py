@@ -51,18 +51,21 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _tree_scan import (
+    REPO_ROOT,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# This module rglob()s every *.py under the production src trees and
-# ast.parse()s each one, so it is a member of the whole-tree-scanner family and
-# carries that family's mark. The derivation of the ceiling and the full
-# measurement record live at WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py;
-# test_whole_tree_scan_timeout_guard.py recomputes the family census from
-# source, so omitting this would turn that meta-guard red rather than merely
-# risking a truncated verify run.
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 # Applied to paths RELATIVE to REPO_ROOT, never to their absolute parts. This
 # is not a stylistic choice: every checkout of this repo used by an agent lives
@@ -148,21 +151,21 @@ def _looks_like_session_id(name: str) -> bool:
     return any(t in _SESSION_TOKENS for t in tokens)
 
 
-def _production_python_files() -> list[Path]:
+def _production_python_files() -> tuple[Path, ...]:
     """Every ``.py`` under a top-level ``<package>/src`` tree.
 
-    Resolved from THIS FILE rather than the process CWD: merge-verify runs
-    pytest from ``orchestrator/`` while a plain ``pytest orchestrator/tests``
-    runs from the repo root, and the census must come out identical under both
-    (same idiom as test_killpg_frozen_pgid_guard.py::REPO_ROOT).
+    Anchored at ``_tree_scan.py::REPO_ROOT``, which is resolved from a file
+    and never from the process CWD: merge-verify runs pytest from
+    ``orchestrator/`` while a plain ``pytest orchestrator/tests`` runs from the
+    repo root, and the census must come out identical under both.  A src root
+    whose own path crosses a skipped part is dropped whole, so the skip stays
+    judged relative to REPO_ROOT end to end.
     """
-    out: set[Path] = set()
-    for src_root in REPO_ROOT.glob('*/src'):
-        for path in src_root.rglob('*.py'):
-            if any(part in _SKIP_PARTS for part in path.relative_to(REPO_ROOT).parts):
-                continue
-            out.add(path)
-    return sorted(out)
+    src_roots = sorted(
+        root for root in REPO_ROOT.glob('*/src')
+        if root.is_dir() and _SKIP_PARTS.isdisjoint(root.relative_to(REPO_ROOT).parts)
+    )
+    return python_files(*src_roots, exclude_parts=_SKIP_PARTS)
 
 
 def _session_id_globs(source: str, relpath: str) -> list[_Site]:
@@ -183,7 +186,11 @@ def _session_id_globs(source: str, relpath: str) -> list[_Site]:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return []
+    return _session_id_globs_in(tree, relpath)
 
+
+def _session_id_globs_in(tree: ast.Module, relpath: str) -> list[_Site]:
+    """:func:`_session_id_globs` over an already-parsed module."""
     parents: dict[ast.AST, ast.AST] = {}
     for node in ast.walk(tree):
         for child in ast.iter_child_nodes(node):
@@ -229,12 +236,28 @@ def _session_id_globs(source: str, relpath: str) -> list[_Site]:
     return sites
 
 
-def _scan() -> list[_Site]:
-    sites: list[_Site] = []
-    for path in _production_python_files():
-        relpath = path.relative_to(REPO_ROOT).as_posix()
-        sites.extend(_session_id_globs(path.read_text(encoding='utf-8'), relpath))
-    return sites
+def _archive_sites(module: ParsedModule) -> tuple[_Site, ...]:
+    """Session-id-keyed globs in *module*: loud if it cannot be read, none if it cannot be parsed.
+
+    ``may_name`` reads the source strictly, so an undecodable file raises there,
+    before the parse's fail-soft ``ValueError`` clause could swallow its
+    ``UnicodeDecodeError``.
+    """
+    if not module.may_name(*_GLOB_METHODS):
+        return ()
+    try:
+        tree = module.tree
+    except (SyntaxError, ValueError):
+        return ()
+    return tuple(_session_id_globs_in(tree, module.path.relative_to(REPO_ROOT).as_posix()))
+
+
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=_production_python_files, extract=_archive_sites)
+TREE_ANALYSES = (ANALYSIS,)
+
+
+def _scan(tree_pass: TreePass) -> list[_Site]:
+    return [site for sites in tree_pass.facts(ANALYSIS).values() for site in sites]
 
 
 def _violation_message(unexpected: list[_Site]) -> str:
@@ -274,9 +297,9 @@ def _violation_message(unexpected: list[_Site]) -> str:
     )
 
 
-def test_durable_archive_path_is_the_sole_archive_locator() -> None:
+def test_durable_archive_path_is_the_sole_archive_locator(tree_pass: TreePass) -> None:
     """I-E: exactly one production site globs the archive by session id."""
-    sites = _scan()
+    sites = _scan(tree_pass)
     unexpected = [
         s for s in sites
         if (s.path, s.function) != _ARCHIVE_LOCATOR
@@ -322,14 +345,14 @@ def test_durable_archive_path_is_the_sole_archive_locator() -> None:
     assert 'line 42' in msg
 
 
-def test_every_allowlist_entry_is_still_live() -> None:
+def test_every_allowlist_entry_is_still_live(tree_pass: TreePass) -> None:
     """An allowlist entry whose site is gone must be DELETED, not left to rot.
 
     A stale entry is worse than no entry: it is standing permission for the
     next author to re-add a glob at that exact (path, function) — the one place
     a second archive locator would be least visible.
     """
-    found = {(s.path, s.function) for s in _scan()}
+    found = {(s.path, s.function) for s in _scan(tree_pass)}
     stale = sorted(set(_LIVE_CONFIG_TREE_ALLOWLIST) - found)
     assert not stale, (
         f'these allowlist entries no longer match any site: {stale}. Delete '
@@ -379,7 +402,7 @@ def test_restore_calls_the_locator_rather_than_reglobbing() -> None:
     )
 
 
-def test_sweep_is_not_vacuous() -> None:
+def test_sweep_is_not_vacuous(tree_pass: TreePass) -> None:
     """A broken walk must not pass as a clean tree.
 
     The floor is load-bearing rather than ceremonial, with a measured witness:
@@ -388,7 +411,7 @@ def test_sweep_is_not_vacuous() -> None:
     ``.worktrees`` — so the sweep visited 0 files and the census assertion
     above passed on an empty set. This is the assertion that caught it.
     """
-    scanned = _production_python_files()
+    scanned = tree_pass.facts(ANALYSIS)
     assert len(scanned) >= _MIN_SCANNED_FILES, (
         f'sweep scanned only {len(scanned)} production .py files, expected '
         f'>= {_MIN_SCANNED_FILES} — the gate is vacuous. Most likely the '
@@ -396,7 +419,8 @@ def test_sweep_is_not_vacuous() -> None:
         'task worktree lives under a `.worktrees` directory, so that skips '
         'everything), or the */src root glob no longer matches this layout.'
     )
-    assert len(scanned) == len(set(scanned)), 'the walk visited a path twice'
+    listed = _production_python_files()
+    assert len(listed) == len(set(listed)), 'the walk visited a path twice'
 
 
 # ── Falsifiability: a guard that cannot go red is measuring nothing ──────────

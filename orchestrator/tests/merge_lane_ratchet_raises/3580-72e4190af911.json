@@ -1,0 +1,18 @@
+{
+  "task_id": "3580",
+  "reason": "net-additive regression tests for the _try_narrow_plan scope-reconcile fix (conjuncts a-d: accepted, same-module, rejected and zero-module narrowings drive private seams _try_narrow_plan/_submit_to_merge_queue/_check_scope_invariant); re-recorded after squash-rebase onto main split the raise ledger",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_workflow.py",
+      "baseline": 146,
+      "current": 151
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6586,
+      "current": 6591
+    }
+  ]
+}

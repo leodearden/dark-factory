@@ -14,7 +14,9 @@ This tool therefore states no column names of its own. It introspects whatever
 store it is pointed at and prints what is actually there, which is the only
 answer that cannot rot. The hand-maintained prose copies of the tasks column
 list were collapsed onto this tool (task 5334); the few DDL copies that remain
-are deliberate SUBSET test fixtures, executed rather than read.
+are deliberate SUBSET test fixtures, executed rather than read, each guarded by
+:func:`columns_outside` against
+``shared/src/shared/task_store_schema.py::TASK_STORE_DDL``.
 
 SQLITE IS DYNAMICALLY TYPED, so the reported python type is a statement about
 AFFINITY — what a value is coerced to on the way in — and not a guarantee
@@ -48,11 +50,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 from _task_db_scan import (
-    TABLE_NAMES_SQL,
-    TaskDbUnreadable,
-    connect_ro,
     tasks_db_path,
 )
+from shared.tasks_db_readonly import TABLE_NAMES_SQL, TaskDbUnreadable, connect_ro
 
 _GIT_TIMEOUT_SECS = 30
 
@@ -205,6 +205,37 @@ def introspect(conn: sqlite3.Connection) -> tuple[Table, ...]:
     names = [row[0] for row in conn.execute(f"{TABLE_NAMES_SQL} ORDER BY name")]
     return tuple(Table(name=name, columns=_table_columns(conn, name)) for name in names)
 
+
+def introspect_ddl(ddl: str) -> tuple[Table, ...]:
+    """What :func:`introspect` reports for a fresh store built from *ddl*.
+
+    The store lives in memory and is discarded. Callers hand the DDL in as text
+    (``shared/src/shared/task_store_schema.py::TASK_STORE_DDL`` for the fixture
+    subset guards).
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(ddl)
+        return introspect(conn)
+    finally:
+        conn.close()
+
+
+def columns_outside(
+    candidate: Sequence[Table], reference: Sequence[Table]
+) -> tuple[tuple[str, Column], ...]:
+    """Each ``(table name, Column)`` of *candidate* that *reference* does not declare identically.
+
+    Empty means *candidate* is a column-wise subset of *reference*: same table,
+    name, declared type, nullability and primary-key position.
+    """
+    declared = {(table.name, column) for table in reference for column in table.columns}
+    return tuple(
+        (table.name, column)
+        for table in candidate
+        for column in table.columns
+        if (table.name, column) not in declared
+    )
 
 def _rendered_python_type(column: Column) -> str:
     return column.python_type.__name__ if column.python_type is not None else "unconstrained"

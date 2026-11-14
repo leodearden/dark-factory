@@ -56,7 +56,9 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 import yaml
+from shared.project_layout import tasks_db
 from shared.task_statuses import TERMINAL
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 
 logger = logging.getLogger(__name__)
 
@@ -341,11 +343,6 @@ def _warn_once(path: str, message: str, *args: Any) -> None:
     logger.warning(message, *args)
 
 
-def tasks_db_path(project_root: Path | str) -> Path:
-    """Conventional task-store location for *project_root*."""
-    return Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
-
-
 def read_task_statuses(project_root: Path | str) -> dict[int, TaskCiteStatus] | None:
     """Read ``{id: TaskCiteStatus}`` for the ``master`` tag, or ``None``.
 
@@ -356,9 +353,10 @@ def read_task_statuses(project_root: Path | str) -> dict[int, TaskCiteStatus] | 
     leaves a breadcrumb naming the path it looked for, so the degradation is
     visible rather than silent (INV-4).
 
-    Opened strictly read-only via the ``mode=ro`` URI, mirroring
-    ``sandbox_soak._connect_ro`` and ``b3_gate`` — a predicate must never mutate
-    the store it measures.  Deliberately NOT a call into
+    Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro`` — a
+    predicate must never mutate the store it measures.  An ABSENT store is
+    debug-only; every other refusal leaves a WARN breadcrumb naming the
+    mistake.  Deliberately NOT a call into
     ``sandbox_soak.read_task_status``: that one returns status only (we also
     need ``metadata`` for ``do_not_complete``) and RAISES on a missing store,
     whereas this caller must fail open.
@@ -367,13 +365,20 @@ def read_task_statuses(project_root: Path | str) -> dict[int, TaskCiteStatus] | 
     a broad ``except Exception: return None`` — the latter is what
     ``shared/tests/test_silent_fallthrough_gate.py`` exists to ratchet against.
     """
-    db = tasks_db_path(project_root)
-    if not db.exists():
-        logger.debug('census-ignore audit: no task store at %s', db)
-        return None
-
+    db = tasks_db(project_root)
     try:
-        conn = sqlite3.connect(f'file:{db}?mode=ro', uri=True)
+        conn = connect_ro(db)
+    except TaskDbUnreadable as refusal:
+        if refusal.reason is TaskDbProblem.ABSENT:
+            logger.debug('census-ignore audit: no task store at %s', db)
+            return None
+        _warn_once(
+            str(db),
+            'census-ignore audit: %s — citation liveness checks are SKIPPED '
+            'for this config',
+            refusal,
+        )
+        return None
     except sqlite3.Error as exc:
         _warn_once(
             str(db),

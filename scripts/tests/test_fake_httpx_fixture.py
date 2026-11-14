@@ -40,12 +40,8 @@ def test_install_fake_httpx_shadows_the_real_module_for_lazy_imports(
 ):
     """The stub must satisfy a function-local ``import httpx``, not just a dict read.
 
-    The four production call-sites this fixture serves each reach httpx through
-    a lazy, function-local ``import httpx``: ``census._post_mcp_tool_call``,
-    ``census_trigger.default_status_fetcher``, ``nightly._default_poster`` and
-    ``check_transcript_persistence._default_poster``.  ("Six" elsewhere in this
-    file counts the deduplicated *test* copies, not production functions.)
-    Asserting only ``sys.modules['httpx'] is fake`` would also pass against a
+    The production call-sites this fixture serves reach httpx through a lazy,
+    function-local ``import httpx``.  Asserting only ``sys.modules['httpx'] is fake`` would also pass against a
     stub that the real import machinery bypasses, so the identity check is made
     on the binding produced by an actual ``import`` statement.
     """
@@ -84,13 +80,11 @@ def test_install_fake_httpx_shadows_the_real_module_for_lazy_imports(
 def test_install_fake_httpx_fails_loudly_on_an_unstubbed_attribute(install_fake_httpx):
     """A miss must escape ``except Exception``, not be swallowed as a fake failure.
 
-    The stub exposes only ``post``.  That suffices for all four consumers today,
-    but ``default_status_fetcher`` wraps *any* ``Exception`` into
-    ``StatusFetchUnavailable``, so a production change adding e.g.
-    ``except httpx.HTTPError:`` would otherwise keep
-    ``test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable``
-    green off a plain ``AttributeError`` — passing for the wrong reason.  The
-    fixture therefore reports a miss as a ``BaseException`` (``pytest.fail``),
+    The stub exposes only what its caller supplies.  A module under test whose
+    error boundary is ``except Exception`` would turn a plain ``AttributeError``
+    into its own failure, so a production change adding e.g.
+    ``except httpx.HTTPError:`` would keep that module's unreachable-server test
+    green — passing for the wrong reason.  The fixture therefore reports a miss as a ``BaseException`` (``pytest.fail``),
     which such a handler cannot eat.
     """
     fake = install_fake_httpx(lambda *args, **kwargs: None)

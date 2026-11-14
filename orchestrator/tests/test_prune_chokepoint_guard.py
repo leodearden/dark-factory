@@ -11,7 +11,7 @@ reintroducing the hazard the PRD guards against (pool-storage guard races,
 missing escalation debounce, etc.).
 
 This test uses AST parsing (NOT text grep) to scan every *.py under
-orchestrator/src (recursively via rglob, excluding this file), and flags
+orchestrator/src (through the shared tree pass, excluding this file), and flags
 any List or Tuple literal whose first element is the string Constant
 ``'git'`` and whose remaining elements contain ``'worktree'`` followed
 later by ``'prune'`` as an in-order subsequence — catching not just the
@@ -22,28 +22,33 @@ phrase (e.g. verify.py's DD5 notes, git_ops.py's own docstrings) are never
 matched, avoiding false positives. A literal only counts as "inside the
 chokepoint" when it falls within a ``_prune_registrations`` method defined
 directly on the ``GitOps`` class (not merely any same-named function).
-Mirrors the AST-walk / rglob / offender file:line list / skip-self pattern
-used by orchestrator/tests/test_event_loop_antipattern_guard.py.
 """
 from __future__ import annotations
 
 import ast
+import functools
 from pathlib import Path
 from typing import TypeGuard
 
 import pytest
-from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from _tree_scan import (
+    ORCHESTRATOR_SRC_DIR,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    python_files,
+)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# This guard AST-parses every *.py under orchestrator/src recursively via
-# rglob. Not individually reproduced under load; marked because it is
-# structurally identical to the three members that crashed.
-# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
-# ENFORCES this mark rather than trusting it to be sprinkled: see
-# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 _THIS_FILE = Path(__file__).name
+_SRC_DIR = ORCHESTRATOR_SRC_DIR.parent
 
 _EXPECTED_ARGV = ('git', 'worktree', 'prune')
 _CHOKEPOINT_FUNCTION = '_prune_registrations'
@@ -130,7 +135,11 @@ def _find_prune_argv_literals(source: str) -> list[tuple[int, bool]]:
         tree = ast.parse(source)
     except SyntaxError:
         return []
+    return _find_prune_argv_literals_in(tree)
 
+
+def _find_prune_argv_literals_in(tree: ast.Module) -> list[tuple[int, bool]]:
+    """:func:`_find_prune_argv_literals` over an already-parsed module."""
     chokepoint_ranges = _chokepoint_ranges(tree)
 
     results: list[tuple[int, bool]] = []
@@ -142,24 +151,39 @@ def _find_prune_argv_literals(source: str) -> list[tuple[int, bool]]:
     return results
 
 
-def test_exactly_one_prune_argv_literal_inside_chokepoint() -> None:
+def _prune_sites(module: ParsedModule) -> tuple[tuple[int, bool, str], ...]:
+    """``(lineno, inside_chokepoint, line_text)`` per prune argv literal; none if unparseable."""
+    try:
+        tree = module.tree
+    except SyntaxError:
+        return ()
+    source_lines = module.source.splitlines()
+    return tuple(
+        (lineno, inside, source_lines[lineno - 1].strip() if lineno <= len(source_lines) else '')
+        for lineno, inside in _find_prune_argv_literals_in(tree)
+    )
+
+
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem, files=functools.partial(python_files, _SRC_DIR), extract=_prune_sites,
+)
+TREE_ANALYSES = (ANALYSIS,)
+
+
+def test_exactly_one_prune_argv_literal_inside_chokepoint(tree_pass: TreePass) -> None:
     """Every raw ``['git', 'worktree', 'prune']`` argv must route through
     ``GitOps._prune_registrations`` — the single chokepoint.
     """
-    src_dir = Path(__file__).parent.parent / 'src'
     offenders: list[str] = []
     outside_chokepoint: list[str] = []
     total = 0
 
-    for py_file in sorted(src_dir.rglob('*.py')):
+    for py_file, sites in tree_pass.facts(ANALYSIS).items():
         if py_file.name == _THIS_FILE:
             continue  # skip-self, in case this guard ever lives under src
-        source = py_file.read_text(encoding='utf-8')
-        source_lines = source.splitlines()
-        rel = py_file.relative_to(src_dir)
-        for lineno, inside in _find_prune_argv_literals(source):
+        rel = py_file.relative_to(_SRC_DIR)
+        for lineno, inside, line_text in sites:
             total += 1
-            line_text = source_lines[lineno - 1].strip() if lineno <= len(source_lines) else ''
             entry = f'{rel}:{lineno}: {line_text}'
             offenders.append(entry)
             if not inside:

@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_polling import poll_until_dead
+from _queued_write_fixtures import queued
+from reconciliation.harness_fixtures import (
+    make_harness,
+    make_harness_config,
+    open_event_buffer,
+    open_journal,
+)
 from test_backlog_policy import _seed_buffered, _StubQueue
 
 from fused_memory.reconciliation.backlog_policy import BacklogPolicy
@@ -68,32 +75,6 @@ class TestGetQueueStatsProjectScoping:
 # ── step-3: real-queue acceptance test ──────────────────────────────────────
 
 
-async def _poll_until_dead(
-    q: DurableWriteQueue,
-    *,
-    group_id: str | None = None,
-    expected_dead: int,
-    timeout: float = 20.0,
-) -> None:
-    """Poll queue stats until at least *expected_dead* items have status='dead'.
-
-    Mirrors the helper in test_durable_queue.py: avoids a fixed wall-clock
-    sleep, which was a source of flakiness under xdist load.
-    """
-    deadline = asyncio.get_event_loop().time() + timeout
-    while True:
-        stats = await q.get_stats(group_id=group_id)
-        if stats['counts'].get('dead', 0) >= expected_dead:
-            return
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
-            raise AssertionError(
-                f'Timed out waiting for {expected_dead} dead item(s) '
-                f'(group_id={group_id!r}); last counts={stats["counts"]}'
-            )
-        await asyncio.sleep(0.05)
-
-
 class TestGetQueueStatsConsistencyWithDeadLetters:
     """Reproduces the reported symptom: get_queue_stats' dead count must agree
     with get_dead_letters for the same project, against a real durable queue.
@@ -122,15 +103,9 @@ class TestGetQueueStatsConsistencyWithDeadLetters:
         await q.initialize()
         try:
             for i in range(2):
-                await q.enqueue(
-                    group_id='proj_a', operation='add_episode',
-                    payload={'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'},
-                )
-            await q.enqueue(
-                group_id='proj_b', operation='add_episode',
-                payload={'content': 'b0', 'group_id': 'proj_b', 'name': 'b0'},
-            )
-            await _poll_until_dead(q, expected_dead=3)
+                await q.enqueue(queued('add_episode', {'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'}, group_id='proj_a'))
+            await q.enqueue(queued('add_episode', {'content': 'b0', 'group_id': 'proj_b', 'name': 'b0'}, group_id='proj_b'))
+            await poll_until_dead(q, expected_dead=3)
 
             svc = AsyncMock()
             svc.durable_queue = q
@@ -252,15 +227,9 @@ class TestGetQueueStatsDeadByOperation:
         await q.initialize()
         try:
             for i in range(2):
-                await q.enqueue(
-                    group_id='proj_a', operation='add_episode',
-                    payload={'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'},
-                )
-            await q.enqueue(
-                group_id='proj_b', operation='add_memory_graphiti',
-                payload={'content': 'b0', 'group_id': 'proj_b'},
-            )
-            await _poll_until_dead(q, expected_dead=3)
+                await q.enqueue(queued('add_episode', {'content': f'a{i}', 'group_id': 'proj_a', 'name': f'a{i}'}, group_id='proj_a'))
+            await q.enqueue(queued('add_memory_graphiti', {'content': 'b0', 'group_id': 'proj_b'}, group_id='proj_b'))
+            await poll_until_dead(q, expected_dead=3)
 
             svc = AsyncMock()
             svc.durable_queue = q
@@ -334,37 +303,20 @@ class TestUnhaltReconciliationClosesEscalation:
     async def test_unhalt_resolves_pending_halt_escalation(self, tmp_path):
         from escalation.queue import EscalationQueue
 
-        from fused_memory.config.schema import (
-            FusedMemoryConfig,
-            ReconciliationConfig,
-        )
-        from fused_memory.reconciliation.harness import ReconciliationHarness
-        from fused_memory.reconciliation.journal import ReconciliationJournal
-
         project_root = tmp_path / 'proj_root'
         project_root.mkdir()
 
-        buf = EventBuffer(db_path=tmp_path / 'eb.db', buffer_size_threshold=100)
-        await buf.initialize()
-        journal = ReconciliationJournal(tmp_path / 'journal')
-        await journal.initialize()
-        try:
+        async with (
+            open_event_buffer(tmp_path / 'eb.db', buffer_size_threshold=100) as buf,
+            open_journal(tmp_path / 'journal') as journal,
+        ):
             policy = BacklogPolicy(buf, _StubQueue(), lambda _: True)
-            config = FusedMemoryConfig(
-                reconciliation=ReconciliationConfig(
-                    enabled=True,
-                    judge_enabled=True,
-                    explore_codebase_root='/tmp/test',
-                    agent_llm_provider='anthropic',
-                    agent_llm_model='claude-sonnet-4-20250514',
-                )
-            )
-            harness = ReconciliationHarness(
-                memory_service=AsyncMock(),
-                taskmaster=AsyncMock(),
+            harness = make_harness(
                 journal=journal,
                 event_buffer=buf,
-                config=config,
+                memory_service=AsyncMock(),
+                taskmaster=AsyncMock(),
+                config=make_harness_config(judge_enabled=True),
                 backlog_policy=policy,
                 known_projects={'proj': str(project_root)},
             )
@@ -407,9 +359,6 @@ class TestUnhaltReconciliationClosesEscalation:
             assert again['status'] == 'already_running'
             assert again['escalations_resolved'] == []
             assert esc_id not in again['message']
-        finally:
-            await journal.close()
-            await buf.close()
 
     @pytest.mark.asyncio
     async def test_not_halted_discards_rather_than_reports_a_stale_stash(
@@ -424,33 +373,16 @@ class TestUnhaltReconciliationClosesEscalation:
         minutes or hours ago. The stash is still TAKEN, so the stale entry is
         cleared rather than left to mislead the next caller too.
         """
-        from fused_memory.config.schema import (
-            FusedMemoryConfig,
-            ReconciliationConfig,
-        )
-        from fused_memory.reconciliation.harness import ReconciliationHarness
-        from fused_memory.reconciliation.journal import ReconciliationJournal
-
-        buf = EventBuffer(db_path=tmp_path / 'eb.db', buffer_size_threshold=100)
-        await buf.initialize()
-        journal = ReconciliationJournal(tmp_path / 'journal')
-        await journal.initialize()
-        try:
-            config = FusedMemoryConfig(
-                reconciliation=ReconciliationConfig(
-                    enabled=True,
-                    judge_enabled=True,
-                    explore_codebase_root='/tmp/test',
-                    agent_llm_provider='anthropic',
-                    agent_llm_model='claude-sonnet-4-20250514',
-                )
-            )
-            harness = ReconciliationHarness(
-                memory_service=AsyncMock(),
-                taskmaster=AsyncMock(),
+        async with (
+            open_event_buffer(tmp_path / 'eb.db', buffer_size_threshold=100) as buf,
+            open_journal(tmp_path / 'journal') as journal,
+        ):
+            harness = make_harness(
                 journal=journal,
                 event_buffer=buf,
-                config=config,
+                memory_service=AsyncMock(),
+                taskmaster=AsyncMock(),
+                config=make_harness_config(judge_enabled=True),
             )
             assert harness.judge is not None
             assert not harness.judge.is_halted('proj')
@@ -468,6 +400,3 @@ class TestUnhaltReconciliationClosesEscalation:
             assert 'esc-reconciliation-halt-OLD' not in result['message']
             # Taken, not merely hidden — the stale entry is gone.
             assert harness.take_resolved_halt_escalations('proj') == []
-        finally:
-            await journal.close()
-            await buf.close()

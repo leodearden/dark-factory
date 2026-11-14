@@ -73,19 +73,27 @@ _LANE_GIT = {
 }
 
 
-def _lane_config(tmp_path: Path) -> OrchestratorConfig:
+def _lane_config(tmp_path: Path, **overrides: Any) -> OrchestratorConfig:
     project_root = tmp_path / 'project'
     project_root.mkdir()
-    return OrchestratorConfig(project_root=project_root, git=GitConfig(**_LANE_GIT))
+    return OrchestratorConfig(
+        project_root=project_root, git=GitConfig(**_LANE_GIT), **overrides,
+    )
 
 
-def _gated_lane_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
-    """A project whose one module, ``lib``, has a passing test command, loaded the
-    way the orchestrator loads it, with verify admission on in a tmp slots dir.
-    The project root is *tmp_path*, where conftest's ORCH_PROJECT_ROOT pins it."""
+def _gated_lane_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, exit_code: int = 0,
+) -> OrchestratorConfig:
+    """A project whose one module, ``lib``, has a test command exiting *exit_code*
+    (passing by default), loaded the way the orchestrator loads it, with verify
+    admission on in a tmp slots dir. The project root is *tmp_path*, where
+    conftest's ORCH_PROJECT_ROOT pins it."""
     project_root = tmp_path
     (project_root / 'lib').mkdir()
-    sleep = f'{shlex.quote(sys.executable)} -c "import time; time.sleep(0.05)"'
+    sleep = (
+        f'{shlex.quote(sys.executable)} -c '
+        f'"import sys, time; time.sleep(0.05); sys.exit({exit_code})"'
+    )
     (project_root / 'lib' / 'orchestrator.yaml').write_text(yaml.safe_dump({
         'test_command': sleep, 'lint_command': None, 'type_check_command': None,
     }))
@@ -188,10 +196,11 @@ async def test_implement_phase_verify_records_one_admission_plan_for_its_task(
 
 @pytest.mark.asyncio
 async def test_post_rebase_reverify_carries_task_id_and_event_store(tmp_path, monkeypatch):
+    """Rollback arm only: the re-verify runs when ``pre_merge_reverify`` is on (task 6580)."""
     store = _RecordingEventStore()
-    workflow = _workflow_on_real_lane(_lane_config(tmp_path), store)
-    workflow._maybe_defer_as_train_member = AsyncMock(return_value=None)
-    workflow._check_scope_invariant = AsyncMock(return_value=None)
+    workflow = _workflow_on_real_lane(_lane_config(tmp_path, pre_merge_reverify=True), store)
+    monkeypatch.setattr(workflow, '_maybe_defer_as_train_member', AsyncMock(return_value=None))
+    monkeypatch.setattr(workflow, '_check_scope_invariant', AsyncMock(return_value=None))
     workflow.git_ops.get_main_sha = AsyncMock(return_value='mainsha')
     workflow.git_ops.rebase_onto_main = AsyncMock(return_value=True)
     verify = AsyncMock(side_effect=_StopMergePhase)
@@ -206,6 +215,34 @@ async def test_post_rebase_reverify_carries_task_id_and_event_store(tmp_path, mo
     kwargs = _awaited_kwargs(verify)
     assert kwargs['event_store'] is store
     assert kwargs['task_id'] == workflow.task_id
+
+
+@pytest.mark.real_verify_admission
+@pytest.mark.usefixtures('code_default_config')
+@pytest.mark.asyncio
+async def test_default_merge_phase_records_no_admission_plan(tmp_path, monkeypatch):
+    """Task 6580: by default a rebased tip whose task-scope verify is RED reaches
+    the merge-queue submit without taking a task admission slot."""
+    store = EventStore(tmp_path / 'runs.db', run_id='t')
+    workflow = _workflow_on_real_lane(
+        _gated_lane_config(tmp_path, monkeypatch, exit_code=1), store,
+    )
+    monkeypatch.setattr(workflow, '_maybe_defer_as_train_member', AsyncMock(return_value=None))
+    monkeypatch.setattr(workflow, '_check_scope_invariant', AsyncMock(return_value=None))
+    monkeypatch.setattr(workflow.git_ops, 'get_main_sha', AsyncMock(return_value='mainsha'))
+    monkeypatch.setattr(workflow.git_ops, 'rebase_onto_main', AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        'orchestrator.workflow._run', AsyncMock(return_value=(0, 'headsha\n', '')),
+    )
+    submit = AsyncMock(side_effect=_StopMergePhase)
+    monkeypatch.setattr(workflow, '_submit_to_merge_queue', submit)
+
+    async with asyncio.timeout(60):
+        with pytest.raises(_StopMergePhase):
+            await workflow._run_merge_phase('task/42')
+
+    assert store.fetch_events_by_type(EventType.verify_admission_plan) == []
+    assert _awaited_kwargs(submit)['pre_rebased'] is True
 
 
 @pytest.mark.asyncio

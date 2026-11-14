@@ -18,8 +18,11 @@ Description=Fused Memory MCP listening socket (held across service restarts)
 # Must match fused-memory/config/config.yaml server.host:port and
 # reconciliation.escalation_host:escalation_port (pinned by
 # fused-memory/tests/test_systemd_unit_config.py::TestSocketActivation).
+# Both listeners are loopback-only, pinned by the same class.
+# `scripts/restart-fused-memory.sh --rebind-socket` applies an edited copy of
+# this template to a running host.
 [Socket]
-ListenStream=0.0.0.0:8002
+ListenStream=127.0.0.1:8002
 ListenStream=127.0.0.1:8103
 
 [Install]

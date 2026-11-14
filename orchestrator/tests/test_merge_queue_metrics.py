@@ -29,7 +29,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, hangs_until, passes
+from _merge_lane_fakes import FakeVerifier, hangs_until, lane_scene_config, passes
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
@@ -40,8 +40,8 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_lane.ports import VerifyPort
-from orchestrator.merge_queue import MergeMetrics, MergeRequest
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import MergeMetrics, MergeRequest
 
 _STOP_TIMEOUT = 30.0
 
@@ -89,7 +89,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
     """Single-host (no verify_runners) OrchestratorConfig."""
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ---------------------------------------------------------------------------

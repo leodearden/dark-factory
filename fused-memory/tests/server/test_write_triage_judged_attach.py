@@ -21,6 +21,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _sdk_client_stubs import sdk_client_double
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
@@ -46,6 +48,8 @@ from fused_memory.server.write_triage import (
 )
 from fused_memory.server.write_triage_judge import CANDIDATE_ID_KEY, VERDICT_KEY
 from fused_memory.services.memory_service import RRF_K, SearchResults
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _T_HIGH = 0.90
 _T_LOW = 0.70
@@ -356,14 +360,12 @@ def _tool_service(results: list[MemoryResult]) -> AsyncMock:
 
 
 def _provider_answering(answer: dict) -> MagicMock:
-    """A fake ``AsyncOpenAI``, its own async context manager as the SDK's is.
+    """A fake ``AsyncOpenAI`` that answers *answer* on the Responses API.
 
-    It answers on the Responses API with a real-shaped usage, reasoning tokens
-    included, so the tool-level path carries a verdict with usage end to end.
+    Its usage is real-shaped, reasoning tokens included, so the tool-level
+    path carries a verdict with usage end to end.
     """
-    client = MagicMock()
-    client.__aenter__ = AsyncMock(return_value=client)
-    client.__aexit__ = AsyncMock(return_value=False)
+    client = sdk_client_double()
     client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
         output_text=json.dumps(answer),
         status='completed',

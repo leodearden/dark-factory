@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.memory_metadata import SUPERSEDED_BY_METADATA_KEY
 from fused_memory.reconciliation.consolidation_auto import (
     CORRECTION_METADATA_KEYS,
     UNREADABLE,
@@ -799,6 +800,20 @@ class TestMemberHazards:
         assert [r.ids for r in reasons] == [('m2',)]
         assert key in reasons[0].detail
 
+    def test_a_member_marked_superseded_fails(self):
+        """Folding a marked record would delete the mark and re-promote its claim."""
+        marked: dict[str, Any] = {
+            SUPERSEDED_BY_METADATA_KEY: 'ce8590f1-cc05-48da-9428-1cf1f54f3fff',
+        }
+        members = _members(_member('m1'), _member('m2', **marked))
+
+        verdict = _judge(members)
+
+        assert verdict.outcome is AutoOutcome.FAIL
+        reasons = _reasons_for(verdict, AutoReasonCode.member_carries_correction_metadata)
+        assert [r.ids for r in reasons] == [('m2',)]
+        assert SUPERSEDED_BY_METADATA_KEY in reasons[0].detail
+
     @pytest.mark.parametrize(
         'body',
         CORRECTION_BANNER_SPECIMENS.values(),
@@ -1277,6 +1292,42 @@ class TestCountAndMemberSetContradictions:
         assert AutoReasonCode.member_already_canonical not in _codes(verdict)
         assert verdict.stripped_ids == ('C',)
         assert verdict.retain_ids == ('m1',)
+
+
+_NON_BOOL_CANONICALS = [1, 1.0, 'true']
+
+
+class TestOnlyTheBoolTrueIsCanonical:
+    """A ``canonical`` value that is not the bool ``True`` claims nothing.
+
+    Contrast ``test_a_named_incumbent_contradicting_a_zero_count_fails``,
+    where ``canonical=True`` makes C this topic's incumbent.
+    """
+
+    @pytest.mark.parametrize('value', _NON_BOOL_CANONICALS)
+    def test_a_non_bool_canonical_of_this_topic_is_not_the_incumbent(self, value):
+        m1 = _member('m1', topic=TOPIC)
+        c = _member('C', topic=TOPIC)
+        c['metadata']['canonical'] = value
+
+        verdict = _judge(_members(m1, c), canonical_count=0)
+
+        assert AutoReasonCode.canonical_count_contradicted not in _codes(verdict)
+        assert AutoReasonCode.member_already_canonical not in _codes(verdict)
+        assert 'C' in verdict.retain_ids
+        assert 'C' not in verdict.stripped_ids
+
+    @pytest.mark.parametrize('value', _NON_BOOL_CANONICALS)
+    def test_a_non_bool_canonical_of_another_topic_is_not_member_already_canonical(
+        self, value
+    ):
+        x1 = _member('x1', topic='some-other-topic')
+        x1['metadata']['canonical'] = value
+
+        verdict = _judge(_members(_member('m1'), x1), canonical_count=0)
+
+        assert AutoReasonCode.member_different_topic in _codes(verdict)
+        assert AutoReasonCode.member_already_canonical not in _codes(verdict)
 
 
 class TestCallerContractViolationsReturnAVerdict:

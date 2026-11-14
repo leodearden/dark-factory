@@ -25,8 +25,8 @@ from orchestrator.config import OrchestratorConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import AdvanceOutcome
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.worker import (
     TRAIN_VERIFY_FAILED_REASON_PREFIX,
     MergeOutcome,
     SoloVerifyResult,
@@ -176,7 +176,7 @@ class TestDetectionWiring:
 
     async def test_tagged_outcome_calls_attribute_train_failure(self) -> None:
         """Tagged blocked outcome → _attribute_train_failure is called; _mark_blocked is NOT."""
-        from orchestrator.merge_queue import TRAIN_VERIFY_FAILED_REASON_PREFIX
+        from orchestrator.merge_lane.worker import TRAIN_VERIFY_FAILED_REASON_PREFIX
 
         members = _train_members(train_id='T-attr', tip_id='103')
         f = _make(
@@ -248,7 +248,7 @@ class TestDetectionWiring:
 
     async def test_train_incomplete_path_unaffected(self) -> None:
         """train_incomplete blocked outcome still returns None (park) — unaffected."""
-        from orchestrator.merge_queue import TRAIN_INCOMPLETE_REASON_PREFIX
+        from orchestrator.merge_lane.worker import TRAIN_INCOMPLETE_REASON_PREFIX
 
         members = _train_members(train_id='T-incomplete', tip_id='103')
         f = _make(
@@ -1687,3 +1687,20 @@ class TestAttributeTrainFailurePasserDeliveredChecksGuard:
         )
         assert _train_merged_ids(f) == ['103']
         assert result == WorkflowOutcome.DONE
+
+
+@pytest.mark.asyncio
+class TestSoloReverifyCarriesTheEscalationQueue:
+    async def test_the_workflow_hands_its_queue_to_the_solo_reverify(self) -> None:
+        """Task 3788: the solo re-verify's main-health probe records suppressed
+        flakes, and the INV-4 storm escalation needs the workflow's queue."""
+        f = _make(task_id='103')
+        f.git_ops.materialize_member_solo = AsyncMock(
+            return_value=MagicMock(path=Path('/tmp/solo-101'), base_commit='sha-101'),
+        )
+        reverify = AsyncMock(return_value=_solo_pass('101'))
+
+        with patch('orchestrator.merge_lane.worker.reverify_member_solo', new=reverify):
+            await f.wf._reverify_one_member({'id': '101'}, 'pred-ref')
+
+        assert reverify.call_args.kwargs['escalation_queue'] is f.esc_queue

@@ -24,6 +24,38 @@
       "severity": "blocking",
       "description": "test_get_tasks_returns_flat_dto was changed to mock ids as int ({'id': 1, ...}) and assert dto['tasks'][0]['id'] == 1, but the real get_tasks wire shape surfaces string ids (_row_to_task returns str(row['id']); only get_task coerces to int). The canned mock now misrepresents live behavior, so the static and live suites are pinned to contradictory shapes rather than kept in lockstep as the comment claims.",
       "mutation_type": "type"
+    },
+    {
+      "id": "mined_1060_pool_01",
+      "location": "fused-memory/tests/integration/test_taskmaster_mcp_contract.py:101-108",
+      "category": "comment_line_pin_and_reviewer_prose",
+      "severity": "suggestion",
+      "description": "The rewritten add_task comment block at (a) grows to 8 lines of reviewer-answering rationale (why the canned suite uses prompt=, the server error text) and introduces a new cross-file line-number citation `test_taskmaster_client_contract.py:84`, which is already off by one (the prompt= call is at line 83) and violates the repo convention of citing `path::symbol` (e.g. `test_add_task_returns_flat_dto`) rather than `file:line`.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1060_pool_02",
+      "location": "fused-memory/tests/integration/test_taskmaster_mcp_contract.py:118-122",
+      "category": "stale_contradictory_comment",
+      "severity": "suggestion",
+      "description": "The retained comment above the round-trip assertion still hedges that get_task 'may return the id as int' and cites `taskmaster_client.py:380` for the str(taskId) coercion (now at line 376), while the change adds a strict `isinstance(task['id'], int)` pin a few lines below; the comment now contradicts the code it sits beside and carries a stale line pin.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1060_pool_03",
+      "location": "fused-memory/tests/integration/test_taskmaster_mcp_contract.py:112",
+      "category": "unrelated_churn",
+      "severity": "suggestion",
+      "description": "The add_task description literal is changed from 'Integration test task description.' to 'Round-trip integration test task' with no assertion depending on it and no task requirement asking for it; pure diff churn.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1060_pool_04",
+      "location": "fused-memory/tests/integration/test_taskmaster_mcp_contract.py:1-22",
+      "category": "doc_scope_drift",
+      "severity": "suggestion",
+      "description": "The change adds a live get_tasks call (block b2, lines 140-155) to the round-trip test, beyond the task's stated scope (pin get_task only; touch the canned suite only on a discovered get_task mismatch), but leaves the module docstring stating the live suite covers only add_task/get_task/set_task_status/remove_task and should expand only on observed drift, and leaves the test name `test_add_task_get_task_set_status_remove_task_round_trip` unchanged; file and name now misdescribe what is exercised.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

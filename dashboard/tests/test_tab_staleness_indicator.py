@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import extract_function_body, strip_js_comments
 
 _TESTID = 'endpoint-stale-banner'
 
@@ -70,7 +70,7 @@ def test_app_passes_the_current_tab_and_the_published_stale_map(app_jsx_body: st
     args = call.group(1)
 
     assert re.search(r'\btab\b', args), (
-        f'the call must pass the CURRENT tab id; got: {args!r}'
+        f"the call must pass the CURRENT tab's paths; got: {args!r}"
     )
     assert '__stale' in args, (
         'the call must read the published map DF_DATA.__stale — that is where '
@@ -227,7 +227,7 @@ def test_app_passes_the_tab_the_receipts_and_the_stale_map(app_jsx_body: str) ->
     call = re.search(r'loadingNoticeForTab\(\s*\{(.*?)\}\s*\)', body, re.S)
     assert call, 'App() must call loadingNoticeForTab({...})'
     args = call.group(1)
-    assert re.search(r'\btab\b', args), f'the call must pass the CURRENT tab id; got: {args!r}'
+    assert re.search(r'\btab\b', args), f"the call must pass the CURRENT tab's paths; got: {args!r}"
     assert re.search(r'DD\.__receipt', args), (
         f'the call must read DF_DATA.__receipt, the success-only map; got: {args!r}'
     )

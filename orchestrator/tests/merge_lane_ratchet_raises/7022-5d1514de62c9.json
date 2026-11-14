@@ -1,0 +1,54 @@
+{
+  "task_id": "7022",
+  "reason": "net-additive custody read for the abandoned-member sweep: InFlightMergeRegistry.task_ids_in_flight() so a merge-deferred task with a live single merge request is owned, plus the wiring test's one read of the harness's shared registry",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 69,
+      "current": 70
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 1907,
+      "current": 1911
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_harness_abandoned_merge_deferred_wiring.py",
+      "baseline": 3,
+      "current": 4
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 985,
+      "current": 986
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4842,
+      "current": 4843
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57103,
+      "current": 57107
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6547,
+      "current": 6548
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31572,
+      "current": 31573
+    }
+  ]
+}

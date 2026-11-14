@@ -16,6 +16,38 @@
       "severity": "suggestion",
       "description": "The rewritten test (formerly test_recently_completed_shows_count_when_no_done_tasks_objects) and the other edited fixtures all switch done_count to 0, deleting every remaining test that exercises the done_count>0 with empty done_tasks path. Combined with removing the elif branch, there is now zero coverage of that scenario, so the misleading 'No tasks.' fallback regression is untested.",
       "mutation_type": "test_gap"
+    },
+    {
+      "id": "mined_643_pool_01",
+      "location": "fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py:77-80",
+      "category": "redundant_branch_magic_number",
+      "severity": "suggestion",
+      "description": "After the elif removal, the remaining if/else in TaskKnowledgeSync.assemble_payload is redundant: format_task_list([]) already returns 'No tasks.', so both branches equal format_task_list(filtered.done_tasks[:30]). The literal 30 in the slice duplicates task_filter.MAX_DONE_TASKS_RETAINED (and filter_task_tree already applies that cap), so a change to the constant leaves this slice stale.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_643_pool_02",
+      "location": "fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py:73-76",
+      "category": "comment_stance",
+      "severity": "suggestion",
+      "description": "The new 4-line comment argues for the deleted branch ('No fallback summary branch is needed'), restates another module's internals (filter_task_tree's append/increment behaviour) and hard-codes the constant's value ('MAX_DONE_TASKS_RETAINED=30'), so it can drift silently and belongs in the commit message or an enforced invariant rather than inline prose.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_643_pool_03",
+      "location": "fused-memory/tests/test_stages.py:1555-1563",
+      "category": "test_tests_fixture",
+      "severity": "suggestion",
+      "description": "The new test_make_active_tree_summary_line_has_consistent_total asserts only that the test class's own fixture helper _make_active_tree produces a self-consistent total_count; it cannot detect a regression in production code, its '5 total' substring check would also pass on '15 total', and it sits in the MemoryConsolidator test class without exercising MemoryConsolidator.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_643_pool_04",
+      "location": "fused-memory/tests/test_stages.py:1733-1761",
+      "category": "duplicate_test",
+      "severity": "suggestion",
+      "description": "The rewritten test_recently_completed_renders_done_titles_via_primary_path largely duplicates the existing test_recently_completed_shows_done_tasks_from_harness_tree (same harness path, hand-built FilteredTaskTree, asserts done titles render); the new one is stronger because it scopes assertions to the extracted section, leaving two near-identical tests where the older one asserts 'Task 99' anywhere in the payload.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

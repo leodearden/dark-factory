@@ -5,9 +5,9 @@ driver via ``get_config_by_name`` (mirrors ν's ``claude_endpoint_candidates()``
 pattern, PRD §ξ):
 
   - a three-arm codex slate, a price/capability ladder with effort held at
-    'xhigh' so only the model varies: GPT-6 "Astra", GPT-5.6 "Sol" (the
+    'xhigh' so only the model varies: GPT-6 "Astra", GPT-6.1 "Sol" (the
     Rust implementer: evaluate-only, no architect variant, no production
-    wiring — RUST CAUTION, PRD decision 14) and GPT-5.6 "Terra" (mid-price
+    wiring — RUST CAUTION, PRD decision 14) and GPT-6.1 "Terra" (mid-price
     control).
   - pi + Sonnet harness-isolating control: same model+effort as the
     claude-sonnet-max incumbent, backend swapped to 'pi' only — isolates
@@ -28,13 +28,13 @@ from __future__ import annotations
 
 import pytest
 
-# The 2026-09 codex slate as LITERALS (task 5384), deliberately not read from
-# the ``CODEX_*_MODEL`` constants: a pin that reads what it protects guards
-# nothing (INV-10).
+# The 2026-11-01 frontier codex slate as LITERALS (task 8086), deliberately
+# not read from the ``CODEX_*_MODEL`` constants: a pin that reads what it
+# protects guards nothing (INV-10).
 _CODEX_SLATE_MODELS_BY_NAME = {
     'codex-gpt6-astra': 'gpt-6-astra',
-    'codex-gpt5.6-sol': 'gpt-5.6-sol',
-    'codex-gpt5.6-terra': 'gpt-5.6-terra',
+    'codex-gpt6.1-sol': 'gpt-6.1-sol',
+    'codex-gpt6.1-terra': 'gpt-6.1-terra',
 }
 
 
@@ -135,9 +135,9 @@ class TestGetConfigByNameAndPropagation:
 
 
 class TestCodexSlatePin:
-    """The 2026-09 codex slate, pinned by LITERAL ids and list prices (task
-    5384), so a stale id, a drifted price, or an unnoticed addition or
-    removal fails loudly."""
+    """The 2026-11-01 frontier codex slate, pinned by LITERAL ids and list
+    prices (task 5384, refreshed by task 8086), so a stale id, a drifted
+    price, or an unnoticed addition or removal fails loudly."""
 
     def test_roster_is_exactly_the_codex_slate_plus_the_pi_control(self):
         from orchestrator.evals.configs import codex_pi_candidates
@@ -166,21 +166,38 @@ class TestCodexSlatePin:
             assert cfg.backend == 'codex'
             assert cfg.model == model
 
-    @pytest.mark.parametrize(('model', 'input_per_1m', 'output_per_1m'), [
-        ('gpt-6-astra', 10.00, 50.00),
-        ('gpt-5.6-sol', 4.00, 20.00),
-        ('gpt-5.6-terra', 2.00, 12.00),
-    ])
-    def test_list_prices_are_pinned(self, model, input_per_1m, output_per_1m):
+    @pytest.mark.parametrize(
+        ('model', 'input_per_1m', 'cached_input_per_1m', 'output_per_1m'), [
+            ('gpt-6-astra', 10.00, 1.00, 50.00),
+            ('gpt-6.1-sol', 2.00, 0.10, 10.00),
+            ('gpt-6.1-terra', 1.00, 0.05, 5.00),
+        ],
+    )
+    def test_list_prices_are_pinned(
+        self, model, input_per_1m, cached_input_per_1m, output_per_1m,
+    ):
         """Codex reports no native cost, so its rates are the default price seeds."""
         from orchestrator.config import default_price_table
 
         entry = default_price_table()[model]
         assert entry['input_per_1m'] == input_per_1m
+        assert entry['cached_input_per_1m'] == cached_input_per_1m
         assert entry['output_per_1m'] == output_per_1m
 
-    def test_every_codex_arm_has_a_price_seed(self):
-        """Derived from the roster, so a future arm without a seed reddens."""
+    def test_retired_codex_names_resolve_to_none(self):
+        """A retired candidate name never resolves to its line's newer model."""
+        from orchestrator.evals.configs import get_config_by_name
+
+        assert get_config_by_name('codex-gpt5.6-sol') is None
+        assert get_config_by_name('codex-gpt5.6-terra') is None
+
+    def test_every_codex_arm_has_a_price_seed_with_a_cached_rate(self):
+        """Derived from the roster, so a future arm without a seed or a cached rate reddens.
+
+        codex reports cached_input_tokens inside input_tokens, so a seed
+        without cached_input_per_1m would price that share at the full input
+        rate.
+        """
         from orchestrator.config import default_price_table
         from orchestrator.evals.configs import codex_pi_candidates
 
@@ -188,6 +205,7 @@ class TestCodexSlatePin:
         codex_models = {c.model for c in codex_pi_candidates() if c.backend == 'codex'}
         assert codex_models
         assert codex_models <= table.keys()
+        assert {m for m in codex_models if table[m].get('cached_input_per_1m') is None} == set()
 
     def test_pi_control_is_unchanged(self):
         from orchestrator.evals.configs import (
@@ -195,8 +213,9 @@ class TestCodexSlatePin:
             EvalConfig,
             codex_pi_candidates,
         )
+        from orchestrator.evals.metrics import RoleUnderTest
 
         by_name = {c.name: c for c in codex_pi_candidates()}
         assert by_name['pi-sonnet-control'] == EvalConfig(
-            'pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max', role='implementer',
+            'pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max', role=RoleUnderTest.IMPLEMENTER,
         )

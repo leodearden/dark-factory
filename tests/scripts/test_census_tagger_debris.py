@@ -32,6 +32,7 @@ import sqlite3
 import subprocess
 import sys
 from collections import Counter
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -39,8 +40,6 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
-    TaskDbProblem,
-    TaskDbUnreadable,
 )
 from audit_wiped_metadata_files import (
     _EVENT_PLAN_SOURCES,
@@ -81,6 +80,9 @@ from census_tagger_debris import (
     write_artifacts,
 )
 from shared.project_id import project_id_for_root
+from shared.task_store_schema import TASK_STORE_DDL
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
+from tasks_db_schema import columns_outside, introspect, introspect_ddl
 
 from shared import project_layout
 
@@ -590,7 +592,9 @@ def test_evidence_carries_the_deciding_events_fidelity_on_both_axes():
 # only), and the two test directories cannot share imports for the same reason
 # recorded in the header comment above
 # orchestrator/tests/test_deterministic_runner.py::POLLUTED_PREDICATE_OUTPUT.
-# The schemas mirror the live ones so the census exercises real column shapes.
+# The schemas mirror the live ones so the census exercises real column shapes;
+# the subset guard right after ``_make_tasks_db`` checks ``_TASKS_SCHEMA``
+# against ``shared/src/shared/task_store_schema.py::TASK_STORE_DDL``.
 #
 # Two deliberate departures from that sibling:
 #   * ``_make_runs_db`` honours an explicit per-event ``timestamp``, falling
@@ -670,6 +674,11 @@ def _make_tasks_db(dir_path: Path, rows: list[dict]) -> Path:
     finally:
         conn.close()
     return db_path
+
+
+def test_make_tasks_db_declares_only_columns_production_declares(tmp_path):
+    with closing(sqlite3.connect(_make_tasks_db(tmp_path, []))) as fixture_conn:
+        assert columns_outside(introspect(fixture_conn), introspect_ddl(TASK_STORE_DDL)) == ()
 
 
 def _make_runs_db(dir_path: Path, events: list[dict]) -> Path:

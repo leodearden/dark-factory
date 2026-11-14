@@ -1,0 +1,36 @@
+import json,time,collections,bisect,calendar
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+rows=[]
+for l in open('/home/leo/src/reify/data/verify-logs/verify-runs.jsonl',errors='replace'):
+    try:r=json.loads(l)
+    except Exception:continue
+    if r.get('started_at') and r.get('ended_at'):rows.append(r)
+S=[s for s in json.load(open('/tmp/3190s/phases.json'))['seeds'] if 'clone0' in s and 'clone1' in s]
+def idx(sel):
+    a=sorted(r['started_at'] for r in rows if sel(r));b=sorted(r['ended_at'] for r in rows if sel(r))
+    return lambda t:bisect.bisect_right(a,t)-bisect.bisect_right(b,t)
+rolef={k:idx(lambda r,k=k:r.get('role')==k) for k in ('task','merge','offline','background')}
+spec=idx(lambda r:str(r.get('lane','')).rsplit('/',1)[-1].startswith('_spec'))
+print('lane name share of ledger runs',collections.Counter(str(r.get('lane','')).rsplit('/',1)[-1].split('-')[0] for r in rows).most_common(8))
+for en,lo,hi in (('10-15..20 18:00UTC',calendar.timegm((2026,10,15,0,0,0)),calendar.timegm((2026,10,20,18,0,0))),('10-20 18:00..10-30',calendar.timegm((2026,10,20,18,0,0)),9e12)):
+    v=[s for s in S if lo<=s['clone0']<hi];print(en,'n',len(v),'clone p50',round(pct([s['clone1']-s['clone0'] for s in v],.5)))
+    for k,f in list(rolef.items())+[('spec-lane',spec)]:
+        B=collections.defaultdict(list)
+        for s in v:B[min(f((s['clone0']+s['clone1'])/2),4)].append(s['clone1']-s['clone0'])
+        tavg=sum(f(s['clone0']) for s in v)/len(v)
+        print('  ',k,'mean_active_at_clone',round(tavg,2),'; '.join(f"{a}:{len(b)}/{pct(b,.5):.0f}" for a,b in sorted(B.items())))
+print('per day: merge runs, spec-lane runs, merge wall h, spec wall h')
+d=collections.defaultdict(lambda:[0,0,0,0])
+for r in rows:
+    k=time.strftime('%m-%d',time.gmtime(r['started_at']));m=r.get('role')=='merge';sp=str(r.get('lane','')).rsplit('/',1)[-1].startswith('_spec')
+    d[k][0]+=m;d[k][1]+=sp;d[k][2]+=m*(r.get('wall_secs') or 0)/3600;d[k][3]+=sp*(r.get('wall_secs') or 0)/3600
+print({k:[v[0],v[1],round(v[2],1),round(v[3],1)] for k,v in sorted(d.items())})
+c=idx(lambda r:True)
+print('10-26 hourly active verifies mean / clone p50 / n')
+H=collections.defaultdict(list)
+for s in S:
+    if calendar.timegm((2026,10,26,4,0,0))<=s['clone0']<calendar.timegm((2026,10,26,14,0,0)):H[int(s['clone0']//3600)].append(s)
+for h in sorted(H):
+    print(time.strftime('%H',time.gmtime(h*3600)),round(sum(c(s['clone0']) for s in H[h])/len(H[h]),1),round(pct([s['clone1']-s['clone0'] for s in H[h]],.5)),len(H[h]),end=' | ')
+print()

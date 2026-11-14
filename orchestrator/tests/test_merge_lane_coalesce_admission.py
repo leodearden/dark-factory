@@ -59,7 +59,9 @@ def scene(tmp_path: Path) -> _Scene:
     )
 
 
-async def _single(scene: _Scene, name: str, **flags: bool) -> MergeRequest:
+async def _single(
+    scene: _Scene, name: str, *, awaited_by_workflow: bool = False,
+) -> MergeRequest:
     """A single request for a fresh branch that adds one file of its own."""
     worktree = (await scene.git_ops.create_worktree(name)).path
     (worktree / f'{name}.txt').write_text(f'{name}\n')
@@ -73,7 +75,7 @@ async def _single(scene: _Scene, name: str, **flags: bool) -> MergeRequest:
         module_configs=[],
         config=scene.config,
         result=asyncio.get_running_loop().create_future(),
-        **flags,
+        awaited_by_workflow=awaited_by_workflow,
     )
 
 

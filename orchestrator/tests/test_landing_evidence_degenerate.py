@@ -1,7 +1,7 @@
 """Tests for the degenerate-branch predicate extracted into landing_evidence.
 
 Task 3103 moves ``harness._is_valid_sha_40`` and the body of
-``Harness._branch_is_degenerate`` into ``orchestrator.landing_evidence`` so a
+``Harness._branch_is_degenerate`` into ``orchestrator.merge_lane.landing_evidence`` so a
 single implementation backs all consumers: the harness (×3 call sites) and
 the escalation server's merge_status Tier-3.5 (×2 arms) + merge_request
 fast-path.  This module pins:
@@ -27,7 +27,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from orchestrator.harness import Harness
-from orchestrator.landing_evidence import branch_is_degenerate, is_valid_sha_40
+from orchestrator.merge_lane.landing_evidence import branch_is_degenerate, is_valid_sha_40
 
 BASE = 'a' * 40
 OTHER = 'b' * 40

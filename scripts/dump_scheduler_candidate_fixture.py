@@ -22,9 +22,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import _checkout as _checkout
-from _task_db_scan import TaskDbUnreadable, connect_ro, decode_metadata, tasks_db_path
+from _task_db_scan import decode_metadata, tasks_db_path
 from orchestrator.config import coerce_tier
 from orchestrator.scheduler import Scheduler
+from shared.tasks_db_readonly import TaskDbUnreadable, connect_ro
 from tasks_db_schema import EXIT_OK, EXIT_UNREADABLE, MainCheckoutUnresolved, resolve_live_db_path
 
 POPULATION_NOTE = 'every pending task of the tag, anchorless rows included'

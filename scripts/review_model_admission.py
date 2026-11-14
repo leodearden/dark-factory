@@ -59,11 +59,11 @@ from escalation_ladder import (
     load_escalation_corpus,
     summarize_steward_dispositions,
 )
+from shared.cli_invoke import BUDGET_EXHAUSTED_SUBTYPE
 
-# The CLI's result subtypes for a run killed at its dispatch caps. The _usd
-# spelling is orchestrator/src/orchestrator/routing.py::PROBE_BUDGET_EXHAUSTED_SUBTYPE.
+# The CLI's result subtype for a run killed at its turn cap; the budget one is
+# imported from shared.cli_invoke.
 TURN_CAP_SUBTYPE = 'error_max_turns'
-BUDGET_CAP_SUBTYPE = 'error_max_budget_usd'
 
 MERGE_DONE_STATE = 'done'
 MERGE_CONFLICT_STATE = 'conflict'
@@ -150,7 +150,7 @@ def summarize_outcomes(records: Sequence[InvocationRecord]) -> OutcomeSummary:
         runs=len(records),
         succeeded=sum(1 for r in records if r.succeeded is True),
         turn_cap_kills=sum(1 for r in records if r.subtype == TURN_CAP_SUBTYPE),
-        budget_kills=sum(1 for r in records if r.subtype == BUDGET_CAP_SUBTYPE),
+        budget_kills=sum(1 for r in records if r.subtype == BUDGET_EXHAUSTED_SUBTYPE),
         timed_out=sum(1 for r in records if r.timed_out is True),
         no_end_event=sum(1 for r in records if r.succeeded is None and r.subtype is None),
         over_flat_ceiling=sum(1 for r in records if r.at_or_over_flat_role_ceiling is True),

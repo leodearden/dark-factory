@@ -34,6 +34,22 @@ implementation time. Machine-readable twin: `verify-result-cache-prd.capability-
 | "Completes under 10 min with every unit `cache_hit`" | floor when every unit replays = git merge + plan + registry lookups + the unscoped leg's consult; no pytest/pyright executes; today's p50 is 39.8 min | PASS — floor stated |
 | Tree tier for any project | `verify_runner.py::RemoteRunner`/`LocalRunner` dispatch is project-agnostic; key = merge tree OID + spec hash | PASS — wired |
 
+## γ2 — Remote runners decide against a dispatcher-shipped view (leaf; Amendment A5)
+
+Bindings in this section checked against main `38a200d213` (2026-11-10).
+
+| capability | evidence | verdict |
+|---|---|---|
+| A decision can be made against a view, with no registry handle | `grep:orchestrator/src/orchestrator/verify_cache/policy.py::decide` reads the `RegistryView | Unavailable` that `consult` returns | PASS — wired |
+| The runner-side merge entry receives the dispatcher's spec | `grep:orchestrator/src/orchestrator/verify_runner.py::run_merge_verify_on_worktree` | PASS — wired |
+| Both remote commands take a spec | `grep:orchestrator/src/orchestrator/cli.py` (`verify-merge` and `verify-task` commands) | PASS — wired |
+| Both verify specs can carry a new block | `grep:orchestrator/src/orchestrator/verify_runner.py::MergeVerifySpec` `grep:orchestrator/src/orchestrator/task_verify_spec.py::TaskVerifySpec` and the census `grep:orchestrator/tests/test_merge_verify_config_fidelity.py::MERGE_PATH_CONFIG_READS` | PASS |
+| Unit outcomes with keys already cross the wire | `grep:orchestrator/src/orchestrator/verify_runner.py::result_to_dict` serialises the result's `VerifyUnit` rows | PASS — wired |
+| A remote result with no usable verdict has an existing path | `grep:orchestrator/src/orchestrator/verify_runner.py::RunnerUnavailable` | PASS — wired |
+| Keyed toolchain inputs have one producer | `grep:orchestrator/src/orchestrator/verify_cache/toolchain.py::ToolchainFingerprint.as_inputs` | PASS |
+| The local decision, recorder and `consumed` write that γ2 reuses | producer: task 5653 (γ), upstream by dependency edge | PASS — producer upstream |
+| `toolchain.runner` keyed input; `verify_cache` block on both specs; the candidate query | capability→producer (built here) in `orchestrator/src/orchestrator/verify_cache/` and the two spec modules | PASS |
+
 ## δ — Repo-wide guard module (leaf)
 
 | capability | evidence | verdict |

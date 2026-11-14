@@ -16,13 +16,13 @@
         "amendments": [
           {
             "id": "22222222-2222-4222-8222-222222222221",
-            "digest": "Applies to coalesce-train verifies as well.",
+            "content": "Applies to coalesce-train verifies as well.",
             "created_at": "2026-08-10T00:00:00+00:00",
             "kind": "amendment"
           },
           {
             "id": "22222222-2222-4222-8222-222222222222",
-            "digest": "Correction: the 600-second merge-lane verify timeout is outdated. Since the coalesce-train rollout the lane runs every verify under a 900-second ceiling, set as git.merge_verify_timeout_seconds in dark-factory-orchestrator.yaml, and a verif…",
+            "content": "Correction: the 600-second merge-lane verify timeout is outdated. Since the coalesce-train rollout the lane runs every verify under a 900-second ceiling, set as git.merge_verify_timeout_seconds in dark-factory-orchestrator.yaml, and a verify that overruns it is parked as verify_timeout rather than retried. Plan around 900 seconds, not 600.",
             "created_at": "2026-09-20T00:00:00+00:00",
             "kind": "amendment",
             "contested": true

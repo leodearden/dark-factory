@@ -17,7 +17,7 @@ from _recording_event_store import _RecordingEventStore
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
+from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewOutcome, ReviewReport
 from orchestrator.verify import VerifyResult
 
 
@@ -92,6 +92,7 @@ class TestReviewCheckpointCapHandling:
 
         # Must return a ReviewReport (not raise)
         assert isinstance(report, ReviewReport)
+        assert report.outcome is ReviewOutcome.SKIPPED_CAPPED
         assert report.mode == 'focused'
         assert report.findings_count == 0
         assert report.tasks_created == []

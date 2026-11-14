@@ -1,0 +1,17 @@
+# steward_aplus_tier.py output, esc-9542-1, read-only GRAPH.RO_QUERY localhost:6379 graph dark_factory, 2026-11-13T01:27:06Z, code HEAD bfb62cbf44
+live 65148 stride 325 n 200 fired 51
+M1 A recall@20 0.61 mean rank 2.0491803278688523
+M1 A+livetier recall@20 0.665 mean rank 1.8045112781954886
+M1 A+tier recall@20 0.665 mean rank 1.8045112781954886
+M1 C recall@20 0.615 mean rank 3.5447154471544717
+M1 C+livetier recall@20 0.615 mean rank 3.5447154471544717
+877 C [('5bf20c42', 'INV'), ('4acfcebd', 'INV'), ('1330ec7b', 'INV'), ('5d8b1c36', 'INV'), ('bba24b78', 'live'), ('38241d9e', 'live'), ('4effe5d2', 'live'), ('dbf74612', 'live'), ('f0465663', 'live'), ('8813cc31', 'INV')]
+    named ranks {'f0465663': 9, 'dbf74612': 8, '38241d9e': 6, 'bba24b78': 5}
+877 A [('b0ead89e', 'live'), ('5bf20c42', 'INV'), ('6b5c0138', 'live'), ('fdc87d44', 'live'), ('574b72b6', 'live'), ('75263002', 'live'), ('7c34a516', 'live'), ('e64ad3d5', 'live'), ('0fa5860e', 'live'), ('52698983', 'live')]
+    named ranks {'f0465663': None, 'dbf74612': None, '38241d9e': None, 'bba24b78': None}
+877 A+tier [('5bf20c42', 'INV'), ('1330ec7b', 'INV'), ('4acfcebd', 'INV'), ('8813cc31', 'INV'), ('5d8b1c36', 'INV'), ('f0465663', 'live'), ('dbf74612', 'live'), ('4effe5d2', 'live'), ('bba24b78', 'live'), ('38241d9e', 'live')]
+    named ranks {'f0465663': 6, 'dbf74612': 7, '38241d9e': 10, 'bba24b78': 9}
+877 A+livetier [('f0465663', 'live'), ('dbf74612', 'live'), ('4effe5d2', 'live'), ('bba24b78', 'live'), ('38241d9e', 'live'), ('b0ead89e', 'live'), ('5bf20c42', 'INV'), ('63a916ee', 'live'), ('52698983', 'live'), ('6b5c0138', 'live')]
+    named ranks {'f0465663': 1, 'dbf74612': 2, '38241d9e': 5, 'bba24b78': 4}
+877 C+livetier [('38241d9e', 'live'), ('bba24b78', 'live'), ('f0465663', 'live'), ('dbf74612', 'live'), ('4effe5d2', 'live'), ('408c786a', 'live'), ('27f6edcd', 'live'), ('e06fa4e7', 'live'), ('45d58b1f', 'INV'), ('50c281e1', 'live')]
+    named ranks {'f0465663': 3, 'dbf74612': 4, '38241d9e': 1, 'bba24b78': 2}

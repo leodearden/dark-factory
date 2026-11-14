@@ -1,0 +1,18 @@
+{
+  "task_id": "7266",
+  "reason": "dead-lease strand: a remote verify that raises RunnerUnavailable benches its host and frees its slot at bench time through the new SpeculativeMergeWorker._bench_from_verify, instead of holding the dead lease in _inflight until the head's in-order finalize",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2258,
+      "current": 2260
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5059,
+      "current": 5061
+    }
+  ]
+}

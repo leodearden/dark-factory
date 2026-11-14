@@ -13,6 +13,11 @@ hand-rolled three times: ``dashboard/src/dashboard/data/db.py``,
 helper is shared; each call site keeps its OWN registry set, because callers
 drain, await or gauge their registry independently.
 
+:func:`cancel_bounded` is the bounded counterpart for a caller that must see
+the task end, or learn that it would not, within a known time (task 6660). A
+single ``cancel()`` followed by an unbounded ``await`` hangs forever on a task
+that survives one cancel.
+
 This module is intentionally NOT re-exported from ``shared/__init__.py``.
 Consumers import via the fully-qualified path
 (``from shared.asyncio_tasks import track_task``), consistent with the
@@ -25,7 +30,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 
-__all__ = ['abandon_task', 'track_task']
+__all__ = ['abandon_task', 'cancel_bounded', 'track_task']
 
 logger = logging.getLogger(__name__)
 
@@ -92,3 +97,31 @@ def abandon_task(
     """
     task.cancel()
     track_task(task, *registries, on_done=on_done)
+
+
+async def cancel_bounded(
+    task: asyncio.Task,
+    *registries: set[asyncio.Task],
+    grace_secs: float,
+) -> bool:
+    """Cancel *task* and wait a bounded time for it to end; True iff it ended.
+
+    A task can survive one ``cancel()``: an inner ``except CancelledError``
+    that awaits again, or asyncio's subprocess transport cancelled between
+    spawning a child and connecting its pipes. So a task still running after
+    the first window of *grace_secs* is cancelled once more and given a second
+    window. One that outlives both is handed to :func:`track_task` with
+    *registries*, so it stays referenced until it ends, and False is returned.
+
+    Never raises the task's own exception; it is consumed, as
+    :func:`track_task` consumes it.
+    """
+    for _attempt in range(2):
+        task.cancel()
+        await asyncio.wait({task}, timeout=grace_secs)
+        if task.done():
+            if not task.cancelled():
+                task.exception()
+            return True
+    track_task(task, *registries)
+    return False

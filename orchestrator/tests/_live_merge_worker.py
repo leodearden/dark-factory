@@ -12,6 +12,8 @@ import contextlib
 from collections.abc import AsyncIterator
 from typing import Protocol
 
+from _orch_helpers import RESPONSIVE_WAIT_STRETCH
+
 # Nominal ``wait_responsive`` budget for a ``MergeRequest.result`` whose merge
 # runs real ``git`` subprocesses.  These waits were ``asyncio.wait_for(...,
 # timeout=60)`` before task 4920 moved them onto ``wait_responsive``, and the
@@ -22,6 +24,17 @@ from typing import Protocol
 # bill is unchanged: min(RESPONSIVE_WAIT_STRETCH * 60, RESPONSIVE_WAIT_WALL_CAP)
 # is the same 90s a MERGE_RESULT_TIMEOUT site is billed.  Never-narrow.
 REAL_GIT_MERGE_RESULT_TIMEOUT = 60
+
+# Nominal for a wait spanning a coalesced train's real-``git`` round trip.
+# Commit 97266df6ae doubled these bounds from 60 to 120 under load.
+# Never-narrow.  Pass it WITH ``max_wall_s=REAL_GIT_TRAIN_MAX_WALL_S``:
+# ``wait_responsive``'s default cap clamps at RESPONSIVE_WAIT_WALL_CAP (90s),
+# which would narrow a 120s nominal.  The explicit cap is the helper's own
+# stretch, unclamped; ``_wait_budget_audit.py::_wait_responsive_budget`` bills
+# it verbatim, so test_wait_budget_coverage_guard.py still checks the paired
+# timeout mark.
+REAL_GIT_TRAIN_TIMEOUT = 2 * REAL_GIT_MERGE_RESULT_TIMEOUT
+REAL_GIT_TRAIN_MAX_WALL_S = RESPONSIVE_WAIT_STRETCH * REAL_GIT_TRAIN_TIMEOUT
 
 
 class _MergeWorker(Protocol):

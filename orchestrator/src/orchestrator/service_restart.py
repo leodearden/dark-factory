@@ -63,6 +63,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.proc_liveness import pid_alive
+
 if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
     from orchestrator.git_ops import GitOps
@@ -70,13 +72,6 @@ if TYPE_CHECKING:
 
 from orchestrator.event_store import EventType
 from orchestrator.proc_supervision import RestartDisposition, RestartPlan
-
-# IMPORTED, not copied (heuristic 11): session_registry._pid_alive already
-# encodes the pid contract lease_is_live needs, down to rejecting pid <= 0
-# before os.kill. Safe by inspection — session_registry imports nothing from
-# the orchestrator package, so there is no cycle — and it also spares this
-# module an `os` import it does not otherwise need.
-from orchestrator.session_registry import _pid_alive
 
 logger = logging.getLogger(__name__)
 
@@ -112,9 +107,9 @@ FLEET_DEPLOY_CLOCK_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
 FLEET_LEASE_RELPATH = 'data/orchestrator/fleet_redeploy_lease.json'
 
 # How old a lease may be before its readers stop believing it. The default of
-# orchestrator.config's orchestrator_restart_lease_max_age_secs, where its
-# derivation from the worst legitimate --drain sweep lives (task 5371: the
-# verify-wait cap made that ~13,300s, so 4h). A lease leaked by a SIGKILLed
+# orchestrator.config's orchestrator_restart_lease_max_age_secs; a --drain sweep
+# is fitted under it at scripts/restart-all-orchestrators.sh::DRAIN_SWEEP_VERIFY_MAX_WAIT_SECS.
+# A lease leaked by a SIGKILLed
 # sweep (whose EXIT trap cannot run, by construction) therefore delays at most
 # ONE redeploy window and can never wedge the fleet.
 DEFAULT_FLEET_LEASE_MAX_AGE_SECS = 14400.0
@@ -178,14 +173,8 @@ def lease_is_live(path: Path | None, *, now: float, max_age_secs: float) -> bool
     costs at most one collision — exactly pre-4755 behaviour. A backwards clock
     step is the cheap failure; a wedged fleet is not.
 
-    The pid predicate is ``session_registry._pid_alive``, IMPORTED rather than
-    re-implemented (heuristic 11): it already encodes the required contract,
-    including rejecting ``pid <= 0`` BEFORE ``os.kill`` — ``os.kill(0, 0)``
-    signals the caller's whole process group. The type checks here are this
-    function's own share of that contract, because JSON can hand us a string
-    or a bool where that predicate expects an int. The watchdog's fourth copy
-    of the same predicate is FORCED by its stdlib-only constraint, not a
-    second opinion.
+    The type checks here gate this function's WARNING for a malformed lease,
+    which ``pid_alive``'s silent False would not give.
     """
     if path is None:
         return False
@@ -235,7 +224,7 @@ def lease_is_live(path: Path | None, *, now: float, max_age_secs: float) -> bool
         return False
     if age >= max_age_secs:
         return False
-    return _pid_alive(pid)
+    return pid_alive(pid)
 
 
 # ---------------------------------------------------------------------------

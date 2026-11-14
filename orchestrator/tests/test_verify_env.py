@@ -4,18 +4,15 @@ Guards the 2026-05-29 ghost-venv fix: a target project's verify/build/test
 subprocess must NOT inherit the orchestrator's own venv/uv activation vars, or
 the target's ``uv`` resolves dark-factory/.venv and a target ``uv sync``
 corrupts the orchestrator runtime interpreter. See
-orchestrator/src/orchestrator/verify.py: ``_VENV_ISOLATION_KEYS`` /
-``_strip_venv_bin_from_path`` / ``_target_subprocess_env``.
+shared/src/shared/python_env.py::without_python_env_selection and
+orchestrator/src/orchestrator/verify.py::_target_subprocess_env.
 """
 
 import os
 from pathlib import Path
 
 from orchestrator import verify
-from orchestrator.verify import (
-    _strip_venv_bin_from_path,
-    _target_subprocess_env,
-)
+from orchestrator.verify import _target_subprocess_env
 
 ORCH_VENV = "/home/leo/src/dark-factory/.venv"
 
@@ -270,24 +267,3 @@ class TestOrchEnvScrub:
         assert env["MY_ORCH_CONFIG"] == "/my"
         assert env["FOO_ORCH"] == "1"
 
-
-class TestStripVenvBinFromPath:
-    def test_removes_leading_venv_bin(self):
-        path = f"{ORCH_VENV}/bin:/home/leo/.cargo/bin:/usr/bin"
-        assert _strip_venv_bin_from_path(path, ORCH_VENV) == (
-            "/home/leo/.cargo/bin:/usr/bin"
-        )
-
-    def test_removes_venv_bin_even_when_not_leading(self):
-        path = f"/usr/bin:{ORCH_VENV}/bin:/bin"
-        assert _strip_venv_bin_from_path(path, ORCH_VENV) == "/usr/bin:/bin"
-
-    def test_noop_when_venv_is_none(self):
-        assert _strip_venv_bin_from_path("/a:/b", None) == "/a:/b"
-
-    def test_noop_when_path_is_none(self):
-        assert _strip_venv_bin_from_path(None, ORCH_VENV) is None
-
-    def test_trailing_slash_on_venv_is_normalized(self):
-        path = f"{ORCH_VENV}/bin:/usr/bin"
-        assert _strip_venv_bin_from_path(path, ORCH_VENV + "/") == "/usr/bin"

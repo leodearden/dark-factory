@@ -1,0 +1,48 @@
+{
+  "task_id": "6160",
+  "reason": "H1: RunnerUnavailable on a train's remote host re-runs on local (step-8)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2209,
+      "current": 2215
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::_leased_train_verify",
+      "baseline": 1,
+      "current": 6
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22240,
+      "current": 22273
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12566,
+      "current": 12574
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4856,
+      "current": 4862
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57694,
+      "current": 57727
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 32062,
+      "current": 32070
+    }
+  ]
+}

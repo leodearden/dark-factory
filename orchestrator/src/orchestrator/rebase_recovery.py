@@ -240,7 +240,7 @@ def _suspicion(
     )
 
 
-#: Backup names are ``MERGE_RR.quarantined-<stamp>`` plus a counter when a
+#: Backup names are ``MERGE_RR.<worktree>-<stamp>`` plus a counter when a
 #: same-second repeat would collide.  The stamp orders the evidence for a
 #: reader; the EXCLUSIVE CLAIM in :func:`quarantine_merge_rr` is what
 #: guarantees nothing is ever overwritten — the counter only supplies the next

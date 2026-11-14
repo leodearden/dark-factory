@@ -138,13 +138,13 @@ TWO PLACEMENT RULES, which are the non-obvious part
   refusal is never 0". It is NOT "a refusal is distinguishable from every
   other exit code": each script ends in ``sys.exit(main())``, and wherever
   ``main()`` merely returns ``asyncio.run(_run(args))`` an uncaught
-  ``TargetStoreMissing`` propagates and CPython exits **1** — which collides
+  ``TargetStoreUnpopulated`` propagates and CPython exits **1** — which collides
   with the exit-1 rung the three task-store scripts already use
   (``audit_duplicate_tasks``'s "apply errors",
   ``correct_found_on_main_backlog``'s task-1175 "a write did not persist",
   ``audit_found_on_main_provenance``'s ``--fail-on-findings`` middle rung).
   A caller that needs the two told apart must catch
-  ``TargetStoreMissing`` and map it onto a reserved code of its own; do not
+  ``TargetStoreUnpopulated`` and map it onto a reserved code of its own; do not
   assume the traceback is self-identifying to an exit-code-only consumer.
   ``scripts/check_found_on_main_spurious_rate.py`` is the worked exemplar of
   that remedy: it catches the refusal in ``main()`` and returns a reserved
@@ -178,7 +178,7 @@ from pathlib import Path
 from shared.project_layout import tasks_db
 
 __all__ = [
-    'TargetStoreMissing',
+    'TargetStoreUnpopulated',
     'assert_queue_dir_populated',
     'assert_task_store_populated',
 ]
@@ -186,11 +186,8 @@ __all__ = [
 _TASKS_TABLE = 'tasks'
 
 
-class TargetStoreMissing(RuntimeError):
-    """Raised when the store an operation would touch is missing or EMPTY.
-
-    An empty placeholder counts as missing: it is what the auto-creates leave
-    behind for a run aimed at the wrong location, not the store itself.
+class TargetStoreUnpopulated(RuntimeError):
+    """Raised when the store an operation would touch is missing or holds no record.
 
     CALLER CONTRACT: on this exception the caller MUST NOT begin the scan, let
     alone the mutation. Refusing before the scan is the entire point — the
@@ -240,14 +237,14 @@ def _refuse_unless_populated(
     if state in (_StoreState.POPULATED, _StoreState.UNDETERMINED):
         return
     if state is _StoreState.MISSING:
-        raise TargetStoreMissing(
+        raise TargetStoreUnpopulated(
             f'Refusing to begin {operation!r}: {what} does not exist at '
             f'{str(resolved)!r}. Proceeding would CREATE it empty and report a '
             f'clean run — both the escalation queue and tasks.db auto-create '
             f'silently, so a wrong target is indistinguishable from a quiet one. '
             f'Remedy: {remedy}'
         )
-    raise TargetStoreMissing(
+    raise TargetStoreUnpopulated(
         f'Refusing to begin {operation!r}: {what} at {str(resolved)!r} exists '
         f'but holds nothing. That is exactly what the store a run aimed at the '
         f'wrong location auto-creates looks like, so a scan could only report '

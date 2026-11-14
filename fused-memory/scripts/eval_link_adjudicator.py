@@ -16,8 +16,9 @@ defined here and nowhere else:
 A pair with no verdict is a miss for both recalls and neither a detach nor a
 flag. A figure whose denominator is 0 is ``None``, never 0, so a gate reading
 it fails closed. ι's ``score_write_triage_pairs.py::score_pairs`` is not used:
-its metrics are rates over a judge's attaches, a different quantity. Only its
-majority rule, ``resolve_verdicts``, is reused, because that rule has one home.
+its metrics are rates over a judge's attaches, a different quantity. Both evals
+resolve rater rows by the one majority rule,
+``fused_memory/maintenance/verdict_majority.py::resolve_verdicts``.
 
 Two populations:
 
@@ -50,12 +51,10 @@ import argparse
 import asyncio
 import copy
 import hashlib
-import importlib.util
 import json
 import logging
 import math
 import sys
-import types
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
@@ -63,7 +62,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from shared.safe_io import atomic_write_text
 
@@ -98,35 +97,10 @@ from fused_memory.maintenance.link_heal_store import (
     ToolCaller,
     server_tool_caller,
 )
+from fused_memory.maintenance.verdict_majority import Pair, Resolution, resolve_verdicts
 from fused_memory.server.grouped_read import AMENDMENT_KIND
 
 _SCRIPTS = Path(__file__).resolve().parent
-
-
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-# Pyright cannot follow the by-path loader, so it alone resolves `_iota` through
-# the scripts/ extraPath; at runtime the module is always the by-path load.
-if TYPE_CHECKING:
-    import score_write_triage_pairs as _iota
-else:
-    _iota = _load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
 
 
 class TruthClass(StrEnum):
@@ -150,11 +124,11 @@ def truth_class(verdict: Verdict) -> TruthClass:
     return TruthClass.UNCLEAR
 
 
-_RESOLUTION_TRUTH: Mapping[Any, TruthClass] = MappingProxyType({
-    _iota.Resolution.MISFILE: TruthClass.MISFILE,
-    _iota.Resolution.CORRECTS: TruthClass.CORRECTS,
-    _iota.Resolution.AGREEING: TruthClass.AGREEING,
-    _iota.Resolution.UNCLEAR: TruthClass.UNCLEAR,
+_RESOLUTION_TRUTH: Mapping[Resolution, TruthClass] = MappingProxyType({
+    Resolution.MISFILE: TruthClass.MISFILE,
+    Resolution.CORRECTS: TruthClass.CORRECTS,
+    Resolution.AGREEING: TruthClass.AGREEING,
+    Resolution.UNCLEAR: TruthClass.UNCLEAR,
 })
 
 
@@ -322,8 +296,6 @@ TRIAGE_CHILD_TEXT_KEY = 'entry_text'
 TRIAGE_PARENT_TEXT_KEY = 'target_text'
 _TRIAGE_PAIR_KEYS = ('entry_id', 'target_id', TRIAGE_CHILD_TEXT_KEY, TRIAGE_PARENT_TEXT_KEY)
 
-Pair = tuple[str, str]
-
 
 def _pair_texts(pair_rows: Iterable[Mapping[str, Any]]) -> dict[Pair, tuple[Any, Any]]:
     """Each pair's (child, parent) texts; a row lacking a key, or a pair listed twice, is refused."""
@@ -347,12 +319,12 @@ def triage_items(
 ) -> Population:
     """The λ population: each rated pair resolved by majority, with its texts."""
     texts = _pair_texts(pair_rows)
-    resolved = _iota.resolve_verdicts(verdict_rows)
+    resolved = resolve_verdicts(verdict_rows)
     items: list[ScoredItem] = []
     excluded: list[Exclusion] = [Exclusion.UNRATED for pair in texts if pair not in resolved]
     for (entry_id, target_id), resolution in resolved.items():
         child, parent = texts.get((entry_id, target_id), (None, None))
-        if resolution is _iota.Resolution.TIED:
+        if resolution is Resolution.TIED:
             excluded.append(Exclusion.TIED)
         elif not isinstance(child, str) or not isinstance(parent, str):
             excluded.append(Exclusion.NO_TEXTS)

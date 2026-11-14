@@ -1,0 +1,32 @@
+{
+ "stream": "S7",
+ "prd_path": "docs/prds/review-all-tenant-reach-has-one-predicate.md",
+ "manifest_path": "docs/prds/review-all-tenant-reach-has-one-predicate.capability-manifest.yaml",
+ "leaves_estimate": 10,
+ "lead_rulings_on_open_questions": [
+  "Supply-rule home reconciled: S1 lands supplied(), SupplySpan/supply_span, OverlappingSupply and SUPPLY_MOVES in billing/supply_dates.py (tasks 365 zeta1 and 422 zeta4, already filed) as the interim home; S7-alpha then moves SupplySpan, supply_window/supply_span, supplied() and OverlappingSupply to models/occupancy.py and depends on 365 + 422; window_after, next_period_start, _SUPPLY_DATES and MisstatedSupplyDate stay in billing. The seam row 'the occupancy predicate's module' resolves to models/occupancy.py (S7).",
+  "Q1: RoleReach.FLEET as a required connection-level reach per role, no BYPASSRLS login (no extra secret or apply step; no isolation gain against a compromised scp-api) — accepted as drafted.",
+  "Q2: consent_current, consent_events and billing_statements stay in RLS as drafted.",
+  "Q3: zeta and kappa are raised to high and join gate 1065 (zeta flips the database to deny for every process).",
+  "Q4 RULED by Leo 2026-10-15 (ruled_by: human): OPERATOR MAY READ consent. GET /consent, /consent/audit and /consent/check admit OPERATOR beside CUSTOMER and ADMIN; the two write routes stay CUSTOMER/ADMIN. Applied in S7-theta (task 1271: require_role(CUSTOMER, ADMIN, OPERATOR) on the reads; _consent_target resolves a fleet-scoped staff read from an explicit customer_id, as the CRM readers do); task 752 shrinks to what theta leaves and keeps its edge to 1271.",
+  "Q5: no EXCLUDE gist overlap backstop (S1 Q6 concurs); occupancy raises OverlappingSupply at use."
+ ],
+ "lead_actions_at_decompose": [
+  "nothing held — every upstream is filed: alpha, iota -> 365 + 422 (S1) and 1136 (S17-epsilon); eta -> 1195 (S13-gamma3) and 517 (S26-kappa); theta -> 1193 (S13-beta) + 1196 (S13-delta1); epsilon -> 1137 (S3-alpha) + 1145 (S3-beta2); alpha, beta, delta -> 1078 (S26-alpha); zeta -> 1066 (S27-alpha) + 707 (in progress); beta, theta -> 442; delta -> 445",
+  "zeta, kappa filed high and added to gate 1065; the sidecar's priorities for zeta/kappa updated to high before the seat validates it",
+  "edges 972 -> eta and 752 -> theta with coordination notes (lead); 323 stays with S1; 707 stays in progress and zeta supersedes it after it lands"
+ ],
+ "cross_reference_lines": [
+  "Program row S7 upstream deps: S1, S3, S13, S17, S26, S27 (+ tasks 442, 445, 707); wave stays 4.",
+  "S1: B8's row 'CLOSED undated' becomes 'CLOSED never supplied (empty window)' once S7-iota lands; iota changes SUPPLY_MOVES's (PENDING, CLOSED) row to date an empty window on the closing day.",
+  "S27 / INV-6: the statement names 'the tenant-scope GUC' (S7-zeta renames app.current_customer_id to app.tenant_scope + app.tenant_scope_on); enforcing test tests/integration/test_tenant_reach_postgres.py::test_a_connection_with_no_scope_sees_no_tenant_rows.",
+  "S3: open_role_database(script, settings, *, reach: RoleReach) takes a required reach (S7-epsilon); create_app(graph) builds the ops broadcaster over fleet_sessions(graph.database.session_factory); the 34 Depends(get_session) sites become Depends(tenant_session) after S7-delta.",
+  "P-Gate 445: audited_session takes Depends(tenant_session); P-Gate alpha's TenantScope.from_principal adaptation is superseded by S7-beta's scope_of.",
+  "S13: 'S7 rebases on beta/delta1' confirmed (theta depends on both); eta depends on gamma3 (1195).",
+  "S16: when the current-tariff pointer is dropped, the tariffs rule in tenancy/reach.py::TENANT_TABLES reads the assignment ledger, account_tariff_assignments joins TENANT_TABLES, and S16's leaf lands the regenerated policy migration (S7's drift test fails otherwise).",
+  "S10: the one skip-reason enum absorbs ResolveSkipReason.NO_OCCUPANT (renamed from NO_ACTIVE_ACCOUNT by S7-eta).",
+  "S5: an OverlappingSupply raised by GateConsentChecker is a per-device integrity fault, not a store blip; D2's 'CHECK_FAILED retries the batch' must not wedge the fleet on it.",
+  "S12: validation engines that connect as the deployed app role open with RoleReach.FLEET (tenancy.rls.install_role_reach).",
+  "Shared conventions (new): a new table carrying a customer, account, property, device, statement or segment reference lands with a TENANT_TABLES rule (and a regenerated policy migration) or a reasoned REACH_EXEMPT entry (tests/tenancy/test_tenant_table_coverage.py)."
+ ]
+}

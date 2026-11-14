@@ -65,7 +65,7 @@ dev = [
     # tests/test_cli_invoke.py need @pytest.mark.xdist_group pins first (task
     # 5408; pinned by tests/scripts/test_merge_gate_parallelism_config.py::
     # RULED_SERIAL_MEMBERS).
-    "pytest-xdist>=3.5.0",
+    "pytest-xdist>=3.6.0",
     "ruff>=0.4",
     "aiohttp>=3.9",
 ]
@@ -94,28 +94,30 @@ filterwarnings = [
 # WHY A LARGE VALUE AND NOT THE ORIGINAL 60 (2026-09-12). The cap is
 # WALL-CLOCK, not CPU time. On this 32-core host under sustained load (~180 at
 # the time of that change) a perfectly healthy test can exceed 60s from CPU
-# STARVATION alone, without being hung at all. The cost of that is not one
-# honest red: under timeout_method = "thread" pytest-timeout answers a breach by
-# os._exit()ing the xdist worker, and --max-worker-restart=0 degrades that into
-# a clean per-test FAILURE whose victim is whatever test happened to be on the
-# dead worker — NOT the starved one. That is the "shifting victim" false-red
-# mechanism from the CPU-contention RCA (memory:
-# project_cpu_contention_test_flakiness_rootcause_2026_07_18).
+# STARVATION alone, without being hung at all. In the thread era the cost of
+# that was not one honest red: under timeout_method = "thread" pytest-timeout
+# answered a breach by os._exit()ing the xdist worker, and
+# --max-worker-restart=0 degraded that into a clean per-test FAILURE whose
+# victim was whatever test happened to be on the dead worker — NOT the starved
+# one. That is the "shifting victim" false-red mechanism from the CPU-contention
+# RCA (memory: project_cpu_contention_test_flakiness_rootcause_2026_07_18).
+# Under signal a starved test reds itself, and an isolated re-run can confirm
+# it as a flake.
 #
-# So the value attacks the TRIGGER and deliberately leaves both safety
-# mechanisms intact: timeout_method and --max-worker-restart=0 are UNCHANGED,
-# each having been chosen against a measured worse failure (task 1907).
+# So the value attacks the TRIGGER. The method is decided in
+# tests/scripts/test_timeout_method_policy.py; which configs keep
+# --max-worker-restart=0 is recorded in
+# tests/scripts/test_xdist_worker_restart_policy.py::RESTART_DISABLED_CONFIGS.
 #
 # 420 IS DERIVED FROM MEASUREMENT. The worst per-test wall clock of an UNMARKED
 # test, across every suite and both inifile-resolution modes under real fleet
 # load, measured 45.48s (orchestrator/tests/test_hard_v2_fixture_pool.py,
 # root-bound); times the 8x headroom factor whose rationale is
 # orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR = 363.84,
-# rounded up to a whole minute = 420, floored at
-# orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS
-# (also 420). Marked tests are excluded by design, including the slower
-# repo-wide scans in fused-memory/tests/test_check_bare_magicmock_config.py,
-# which carry their own mark. The full corpus, the run-to-run spread, the
+# rounded up to a whole minute = 420. Marked tests are excluded by design,
+# including the slower repo-wide scans in
+# fused-memory/tests/test_check_bare_magicmock_config.py, which carry their own
+# mark. The full corpus, the run-to-run spread, the
 # arithmetic and the value's history are in
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md — read that before
 # moving this number, and re-measure rather than re-judging it.

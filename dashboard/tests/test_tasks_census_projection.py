@@ -13,12 +13,16 @@ so the real ``fetch_tasks`` / ``fetch_statuses`` / unit cache run underneath.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from _canned_mcp import CannedMCP, _raw_row
 from shared.task_statuses import ACTIVE
+
+pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')
+"""No unit, last good or rotation offset may cross a test."""
 
 NOW = datetime(2026, 9, 20, 12, 0, 0, tzinfo=UTC)
 """The one injected instant every collector call here stamps against."""
@@ -34,18 +38,6 @@ def _canned(pairs=_PAIRS) -> CannedMCP:
         status_map=dict(pairs),
         status_page_size=2000,
     )
-
-
-@pytest.fixture(autouse=True)
-def _isolate_caches():
-    """No unit, last good or rotation offset may cross a test."""
-    import dashboard.data.active_tasks as active_tasks_mod
-    import dashboard.data.task_snapshot as snapshot_mod
-
-    snapshot_mod._snapshot_cache_clear()
-    active_tasks_mod._reset_root_rotation()
-    yield
-    snapshot_mod._snapshot_cache_clear()
 
 
 @pytest.fixture()
@@ -232,29 +224,34 @@ class TestCollectCensusSnapshots:
             assert census[label].census.value == full[label].census.value
 
     async def test_a_root_past_its_budget_is_degraded_exactly_as_the_full_collector_says(
-        self, two_roots, dummy_client, no_runtime, monkeypatch,
+        self, two_roots, dummy_client, no_runtime,
     ):
         """The same per-root budget routes the same root to the same banner.
 
-        The budget is squeezed through the module constant, the idiom
-        ``test_active_tasks.py`` uses to cut off a real acquisition without
-        waiting out the shipped 14 s budget.
+        Both collectors are handed the same budget with a small per-project
+        share, so a real acquisition is cut off without waiting out the
+        shipped 14 s one.
         """
-        import dashboard.data.task_snapshot as snapshot_mod
         from dashboard.data.active_tasks import (
+            TASKS_BUDGET,
             collect_census_snapshots,
             collect_tasks_with_counts,
+            reset_task_snapshot_state,
         )
         from dashboard.data.task_snapshot import SnapshotFailure, SnapshotHealth, classify
 
         async def _hangs(client, url, tool, args, **kwargs):
             await asyncio.Event().wait()
 
-        monkeypatch.setattr('dashboard.data.active_tasks._TASKS_PER_PROJECT_BUDGET', 0.05)
+        budget = replace(TASKS_BUDGET, per_project=0.05)
         with patch('dashboard.data.tasks.mcp_tool_call', new=_hangs):
-            census = await collect_census_snapshots(dummy_client, two_roots, now=NOW)
-            snapshot_mod._snapshot_cache_clear()
-            _rows, full = await collect_tasks_with_counts(dummy_client, two_roots, now=NOW)
+            census = await collect_census_snapshots(
+                dummy_client, two_roots, now=NOW, budget=budget,
+            )
+            reset_task_snapshot_state()
+            _rows, full = await collect_tasks_with_counts(
+                dummy_client, two_roots, now=NOW, budget=budget,
+            )
 
         assert set(census) == set(full) == {'alpha', 'beta'}
         for label in full:
@@ -275,7 +272,8 @@ _CENSUS = f'{_TASKS}?projection=census'
 
 _BANNER_KEYS = (
     'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'TASKS_DEGRADED_PROJECTS',
-    'TASKS_COUNT_UNKNOWN_PROJECTS', 'TASKS_PROJECT_COUNT',
+    'TASKS_COUNT_UNKNOWN_PROJECTS', 'TASKS_COUNT_STALE_PROJECTS',
+    'TASKS_PROJECT_COUNT',
 )
 
 
@@ -387,7 +385,7 @@ const fs = require('fs');
 const path = require('path');
 const [redux, mode, url] = process.argv.slice(1);
 globalThis.window = { dispatchEvent() {} };
-for (const name of ['endpoint_staleness.js', 'datum.js']) require(path.join(redux, name));
+for (const name of ['poll_scope.js', 'endpoint_staleness.js', 'datum.js']) require(path.join(redux, name));
 const api = require(path.join(redux, 'data.js'));
 for (const name of ['task_vocab.js', 'task_snapshot.js']) require(path.join(redux, name));
 const TASKS = '/api/v2/dashboard/tasks';
@@ -414,7 +412,7 @@ def _census_client(mode: str, url: str = '', body: dict | None = None):
     import subprocess
     from pathlib import Path
 
-    from _lock_chip_matrix import node_path
+    from _dashboard_helpers import node_path
 
     redux = Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
     result = subprocess.run(

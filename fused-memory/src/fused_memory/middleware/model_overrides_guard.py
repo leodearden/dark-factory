@@ -32,10 +32,11 @@ silently inert at resolve time — see the ``KNOWN_ROLE_NAMES`` docstring in
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from shared.task_metadata import validate_model_overrides
+
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 
 __all__ = [
     'model_overrides_error',
@@ -45,29 +46,6 @@ __all__ = [
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _parse_metadata(metadata: Any) -> dict:
-    """Return *metadata* as a dict (best-effort; unknown shapes -> {}).
-
-    Mirrors ``execution_class_guard._parse_metadata`` /
-    ``routing_intent_guard._parse_metadata``: None -> {}; empty string ->
-    {}; dict -> returned as-is; JSON string -> parsed dict (or {} on parse
-    failure / non-dict result); anything else -> {}.
-    """
-    if metadata is None:
-        return {}
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
-        if not metadata:
-            return {}
-        try:
-            parsed = json.loads(metadata)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
 
 
 def _validation_error(message: str, *, hint: str | None = None) -> dict[str, Any]:
@@ -104,7 +82,7 @@ def model_overrides_error(metadata: str | dict[str, Any] | None) -> dict[str, An
     Args:
         metadata: Task metadata (dict, JSON string, or None).
     """
-    parsed = _parse_metadata(metadata)
+    parsed = raw_metadata_dict(metadata, source='model_overrides_guard')
     if 'model_overrides' not in parsed:
         # Key not present at all -- nothing to validate.
         return None

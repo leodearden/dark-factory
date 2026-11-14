@@ -15,7 +15,9 @@ import pytest
 
 # RED in step-1: module does not exist yet; import will fail until step-2.
 from _fm_helpers import as_async_run_git as _as_async_run_git
-from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
+from shared.scheduler_state import SchedulerStateSnapshot
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, carries_claimant
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import fused_memory.services.live_workflow_detector as detector_module
 from fused_memory.services.live_workflow_detector import (
@@ -23,14 +25,16 @@ from fused_memory.services.live_workflow_detector import (
     ClaimantLabel,
     WorkflowLiveness,
     _routing_decided_after_restart,
-    _task_in_scheduler_holders_or_parks,
     claimant_label,
     corroboration_for_task,
     detect_live_workflow,
     has_live_workflow_corroboration,
     is_pure_gate_metadata,
+    is_unclaimed_awaiting_dependency,
     is_workflow_live_for_task,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1082,6 +1086,208 @@ class TestPendingDeterministicPureGateOrchestratorSuppression:
 
 
 # ---------------------------------------------------------------------------
+# Unclaimed-awaiting-dependency classifier (task 8330)
+# ---------------------------------------------------------------------------
+
+
+def _awaiting_task(**overrides: object) -> dict:
+    """reify task 8162's shape: pending, unclaimed, no heartbeat, one local dependency."""
+    task: dict = {
+        'id': '8162',
+        'status': 'pending',
+        'claimant_run_id': None,
+        'heartbeat_at': None,
+        'dependencies': [9739],
+    }
+    task.update(overrides)
+    return task
+
+
+# Claimant values covering None, blank strings, a non-str value and a real id;
+# the detector must read them as shared.task_claimant.carries_claimant does.
+_CLAIMANT_SHAPES = [None, '', '   ', '\t\n', 0, 'run-x/y/pid=1']
+
+
+class TestIsUnclaimedAwaitingDependency:
+    """is_unclaimed_awaiting_dependency: positive evidence that a task has no claimant,
+    no heartbeat and at least one local dependency the scheduler cannot count satisfied.
+
+    Fail-safe toward live: absent, unreadable or ambiguous input returns False.
+    """
+
+    def test_reify_8162_shape_is_awaiting(self):
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), {'9739': 'pending'}) is True
+
+    @pytest.mark.parametrize(
+        'dep_status', ['pending', 'in-progress', 'blocked', 'deferred', 'review', 'infra-hold'],
+    )
+    def test_every_non_terminal_non_merge_deferred_dep_status_is_unmet(self, dep_status):
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), {'9739': dep_status}) is True
+
+    @pytest.mark.parametrize('dep_status', ['done', 'cancelled'])
+    def test_terminal_dep_is_satisfied(self, dep_status):
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), {'9739': dep_status}) is False
+
+    def test_all_deps_terminal_is_not_awaiting(self):
+        task = _awaiting_task(dependencies=[9739, 9740])
+        statuses = {'9739': 'done', '9740': 'cancelled'}
+        assert is_unclaimed_awaiting_dependency(task, statuses) is False
+
+    def test_one_unmet_dep_among_satisfied_ones_is_awaiting(self):
+        task = _awaiting_task(dependencies=[9739, 9740])
+        statuses = {'9739': 'done', '9740': 'pending'}
+        assert is_unclaimed_awaiting_dependency(task, statuses) is True
+
+    def test_merge_deferred_dep_is_not_evidence(self):
+        """The scheduler's same-train allowance (dependency_verdict._local_verdict)
+        may count a merge-deferred dep satisfied, so it proves nothing here."""
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), {'9739': 'merge-deferred'}) is False
+
+    def test_dep_absent_from_status_map_is_not_evidence(self):
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), {}) is False
+
+    def test_unknown_sentinel_is_not_evidence(self):
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), {'9739': 'unknown'}) is False
+
+    def test_claimant_disqualifies(self):
+        task = _awaiting_task(claimant_run_id='run-x/y/pid=1')
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is False
+
+    def test_blank_claimant_counts_as_no_claimant(self):
+        task = _awaiting_task(claimant_run_id='  ')
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is True
+
+    def test_heartbeat_disqualifies_even_without_claimant(self):
+        task = _awaiting_task(heartbeat_at='2026-11-04T10:00:00+00:00')
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is False
+
+    @pytest.mark.parametrize(
+        'task',
+        [_awaiting_task(dependencies=[]), {k: v for k, v in _awaiting_task().items() if k != 'dependencies'}],
+        ids=['empty', 'key_absent'],
+    )
+    def test_no_dependencies_is_not_awaiting(self, task):
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is False
+
+    @pytest.mark.parametrize('task', [None, 'x'], ids=['none', 'str'])
+    def test_non_mapping_task_is_not_awaiting(self, task):
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is False
+
+    @pytest.mark.parametrize('statuses', [None, [('9739', 'pending')]], ids=['none', 'list'])
+    def test_non_mapping_status_map_is_not_awaiting(self, statuses):
+        assert is_unclaimed_awaiting_dependency(_awaiting_task(), statuses) is False
+
+    def test_csv_string_dependencies_resolve(self):
+        task = _awaiting_task(dependencies='9739, 9740')
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'done', '9740': 'pending'}) is True
+
+    @pytest.mark.parametrize('dep_id', [9739, '9739'], ids=['int', 'str'])
+    def test_int_and_str_dep_ids_match_the_string_key(self, dep_id):
+        task = _awaiting_task(dependencies=[dep_id])
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) is True
+
+    @pytest.mark.parametrize('claimant', _CLAIMANT_SHAPES)
+    def test_no_claimant_reading_is_the_shared_one(self, claimant):
+        task = _awaiting_task(claimant_run_id=claimant)
+        assert is_unclaimed_awaiting_dependency(task, {'9739': 'pending'}) == (
+            not carries_claimant({'claimant_run_id': claimant})
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pending-normal awaiting-dependency orchestrator_live suppression (task 8330)
+# ---------------------------------------------------------------------------
+
+
+class TestPendingAwaitingDependencyOrchestratorSuppression:
+    """detect_live_workflow(status='pending', task_kind in (None, 'normal'),
+    unclaimed_awaiting_dependency=True) drops the bare project-wide lock — rule 6.
+
+    The scheduler never dispatches a task with an unmet local dependency, so for an
+    unclaimed pending task the lock cannot be evidence of a dispatch a recon write
+    could race. Any per-task git evidence keeps the signal.
+    """
+
+    _NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    async def _detect(self, tmp_path, *, worktree_stdout=None, log_rc=1, log_stdout='', **kwargs):
+        side_effect, _ = _git_side_effect(
+            worktree_stdout=worktree_stdout or _worktree_porcelain_no_branch(),
+            log_rc=log_rc,
+            log_stdout=log_stdout,
+        )
+        with patch.object(detector_module, 'run_git', side_effect=_as_async_run_git(side_effect)):
+            return await detect_live_workflow(
+                _TASK_ID, str(tmp_path), now=self._NOW, _orchestrator_live=True, **kwargs,
+            )
+
+    @pytest.mark.parametrize('task_kind', ['normal', None], ids=['normal', 'absent'])
+    @pytest.mark.asyncio
+    async def test_bare_lock_dropped_for_unclaimed_task_awaiting_dependency(self, tmp_path, task_kind):
+        result = await self._detect(
+            tmp_path, status='pending', task_kind=task_kind, unclaimed_awaiting_dependency=True,
+        )
+
+        assert result.orchestrator_live is False
+        assert result.is_live is False
+        assert result.indeterminate is False
+
+    @pytest.mark.asyncio
+    async def test_registered_worktree_keeps_the_signal(self, tmp_path):
+        result = await self._detect(
+            tmp_path,
+            worktree_stdout=_worktree_porcelain_with_branch(_BRANCH),
+            status='pending', task_kind='normal', unclaimed_awaiting_dependency=True,
+        )
+
+        assert result.orchestrator_live is True
+        assert result.worktree_registered is True
+        assert result.is_live is True
+
+    @pytest.mark.asyncio
+    async def test_recent_commit_keeps_the_signal(self, tmp_path):
+        result = await self._detect(
+            tmp_path,
+            log_rc=0, log_stdout=(self._NOW - timedelta(hours=1)).isoformat(),
+            status='pending', task_kind='normal', unclaimed_awaiting_dependency=True,
+        )
+
+        assert result.orchestrator_live is True
+        assert result.recent_commit is True
+        assert result.is_live is True
+
+    @pytest.mark.parametrize(
+        'awaiting_kwargs',
+        [{'unclaimed_awaiting_dependency': False}, {}],
+        ids=['false', 'omitted'],
+    )
+    @pytest.mark.asyncio
+    async def test_dispatch_eligible_pending_task_keeps_the_signal(self, tmp_path, awaiting_kwargs):
+        result = await self._detect(tmp_path, status='pending', task_kind='normal', **awaiting_kwargs)
+
+        assert result.orchestrator_live is True
+        assert result.is_live is True
+
+    @pytest.mark.parametrize('task_kind', ['deterministic', 'other'])
+    @pytest.mark.asyncio
+    async def test_other_task_kinds_keep_the_signal(self, tmp_path, task_kind):
+        result = await self._detect(
+            tmp_path, status='pending', task_kind=task_kind, unclaimed_awaiting_dependency=True,
+        )
+
+        assert result.orchestrator_live is True
+
+    @pytest.mark.parametrize('status', ['in-progress', 'review', 'merge-deferred'])
+    @pytest.mark.asyncio
+    async def test_non_pending_statuses_keep_the_signal(self, tmp_path, status):
+        result = await self._detect(
+            tmp_path, status=status, task_kind='normal', unclaimed_awaiting_dependency=True,
+        )
+
+        assert result.orchestrator_live is True
+
+
+# ---------------------------------------------------------------------------
 # reify#5245 hardening: reaped-worktree / bare-branch / stranded-orchestrator
 # false-positive (task 2767)
 # ---------------------------------------------------------------------------
@@ -1265,10 +1471,9 @@ class TestBareStrandedOrchestratorSuppression:
     by the bare project-wide orchestrator_live signal — that signal only
     reflects a running orchestrator process is dispatching SOME task in the
     project, not necessarily this one.  Status-agnostic (unlike rules 1-3):
-    recon_write_policy Gate 2 calls the detector without task_kind and with
-    whatever status the task currently holds, so the suppression must fire
-    regardless of status (excluding the statuses/combinations already handled
-    by rules 1-3).
+    a bare branch with a reaped worktree is per-task proof whatever the task's
+    status or kind, so the suppression fires regardless of status (excluding
+    the statuses/combinations already handled by rules 1-3).
     """
 
     def _side_effect(
@@ -1708,32 +1913,47 @@ def _routing_metadata(decided_at: str | None) -> dict:
     }
 
 
-class TestTaskInSchedulerHoldersOrParks:
-    """_task_in_scheduler_holders_or_parks: task_id in parks-keys OR holders-values."""
+def _snap(**wire_fields: object) -> SchedulerStateSnapshot:
+    return SchedulerStateSnapshot.from_json(wire_fields)
+
+
+def _scheduler_corroborates(
+    task_id: str | int, scheduler_state: SchedulerStateSnapshot | None,
+) -> bool:
+    return has_live_workflow_corroboration(
+        task_id,
+        claimant_live=False,
+        scheduler_state=scheduler_state,
+        routing_latest_decided_at=None,
+        orchestrator_started_at=None,
+    )
+
+
+class TestSchedulerHoldersOrParksCorroboration:
+    """The scheduler signal: task_id is a parks key OR a current-holders value."""
 
     def test_true_when_task_id_is_parks_key(self):
-        state = {'parks': {_CORROB_TASK_ID: {'reason': 'x'}}, 'current_holders': {}}
-        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, state) is True
+        state = _snap(parks={_CORROB_TASK_ID: {'modules': ['x']}})
+        assert _scheduler_corroborates(_CORROB_TASK_ID, state) is True
 
     def test_true_when_task_id_is_current_holders_value(self):
         # current_holders is {module: task_id}; the task_id is a VALUE, not a key.
-        state = {'parks': {}, 'current_holders': {'reconciliation': _CORROB_TASK_ID}}
-        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, state) is True
+        state = _snap(current_holders={'reconciliation': _CORROB_TASK_ID})
+        assert _scheduler_corroborates(_CORROB_TASK_ID, state) is True
 
     def test_false_when_in_neither(self):
-        state = {'parks': {'9999': {}}, 'current_holders': {'mod': '9999'}}
-        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, state) is False
+        state = _snap(parks={'9999': {}}, current_holders={'mod': '9999'})
+        assert _scheduler_corroborates(_CORROB_TASK_ID, state) is False
 
-    def test_no_raise_when_state_none(self):
-        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, None) is False
+    def test_false_when_state_none(self):
+        assert _scheduler_corroborates(_CORROB_TASK_ID, None) is False
 
-    def test_no_raise_when_keys_missing(self):
-        assert _task_in_scheduler_holders_or_parks(_CORROB_TASK_ID, {}) is False
+    def test_false_when_no_producer_has_written(self):
+        assert _scheduler_corroborates(_CORROB_TASK_ID, SchedulerStateSnapshot.empty()) is False
 
-    def test_int_task_id_coerced_to_str(self):
-        # scheduler_state keys/values are strings (JSON); an int task_id still matches.
-        state = {'parks': {'2763': {}}, 'current_holders': {}}
-        assert _task_in_scheduler_holders_or_parks(2763, state) is True
+    def test_int_task_id_matches_str_key(self):
+        # Snapshot keys/values are strings (JSON); an int task_id still matches.
+        assert _scheduler_corroborates(2763, _snap(parks={'2763': {}})) is True
 
 
 class TestRoutingDecidedAfterRestart:
@@ -1780,7 +2000,7 @@ class TestHasLiveWorkflowCorroboration:
         assert has_live_workflow_corroboration(
             _CORROB_TASK_ID,
             claimant_live=False,
-            scheduler_state={'parks': {_CORROB_TASK_ID: {}}, 'current_holders': {}},
+            scheduler_state=_snap(parks={_CORROB_TASK_ID: {}}),
             routing_latest_decided_at=None,
             orchestrator_started_at=None,
         ) is True
@@ -1798,7 +2018,7 @@ class TestHasLiveWorkflowCorroboration:
         assert has_live_workflow_corroboration(
             _CORROB_TASK_ID,
             claimant_live=False,
-            scheduler_state={'parks': {}, 'current_holders': {}},
+            scheduler_state=SchedulerStateSnapshot.empty(),
             routing_latest_decided_at='2026-07-23T09:00:00Z',  # before started
             orchestrator_started_at=self._STARTED,
         ) is False
@@ -1857,7 +2077,7 @@ class TestCorroborationForTask:
         }
         assert corroboration_for_task(
             task, _CORROB_TASK_ID, now=_CORROB_NOW,
-            scheduler_state={'parks': {}, 'current_holders': {}},
+            scheduler_state=SchedulerStateSnapshot.empty(),
             orchestrator_started_at=self._STARTED,
         ) is False
 
@@ -1891,7 +2111,7 @@ class TestCorroborationForTask:
         task = {'id': _CORROB_TASK_ID, 'status': 'in-progress', 'claimant_run_id': None}
         assert corroboration_for_task(
             task, _CORROB_TASK_ID, now=_CORROB_NOW,
-            scheduler_state={'parks': {_CORROB_TASK_ID: {}}, 'current_holders': {}},
+            scheduler_state=_snap(parks={_CORROB_TASK_ID: {}}),
             orchestrator_started_at=self._STARTED,
         ) is True
 
@@ -1938,6 +2158,13 @@ class TestClaimantLabel:
 
     def test_empty_task_is_none(self):
         assert self._label({}) is ClaimantLabel.NONE
+
+    @pytest.mark.parametrize('claimant', _CLAIMANT_SHAPES)
+    def test_none_label_follows_the_shared_reading(self, claimant):
+        label = self._label({'claimant_run_id': claimant, 'heartbeat_at': None})
+        assert (label is ClaimantLabel.NONE) == (
+            not carries_claimant({'claimant_run_id': claimant})
+        )
 
     @pytest.mark.parametrize('unreadable', [None, 'task 3254'])
     def test_unreadable_task_is_unknown_never_none(self, unreadable: object):

@@ -1,0 +1,200 @@
+[
+  {
+    "intent_id": "9aae88af-30de-530d-b9cc-d562811eb7f6",
+    "child_memory_id": "c0df8437-b320-5cc6-849e-96f41d431487",
+    "parent_id": "d8e7c832-b662-5387-ac3f-baed2c67488e",
+    "project": "proj_alpha",
+    "outcome": "contested",
+    "child_text": "SYNTHETIC child proj_alpha#0: a later note about retry backoff in the merge lane.",
+    "parent_text": "SYNTHETIC parent proj_alpha#0: the first note about retry backoff in the merge lane."
+  },
+  {
+    "intent_id": "d072243f-59fd-51c5-ae77-dcdbdca87eb6",
+    "child_memory_id": "fe72534f-1172-5529-acb7-4a48b7cd7ea6",
+    "parent_id": "0479b210-853f-5b5a-aeb6-25bf65f83aee",
+    "project": "proj_alpha",
+    "outcome": "amended",
+    "child_text": "SYNTHETIC child proj_alpha#1: a later note about nightly timer persistence.",
+    "parent_text": "SYNTHETIC parent proj_alpha#1: the first note about nightly timer persistence."
+  },
+  {
+    "intent_id": "2c5b4d34-0416-5575-8039-a1e91d95cbbf",
+    "child_memory_id": "ca13773a-68be-5196-9c2c-84c57cfb6c8c",
+    "parent_id": "dde441f8-ed59-5e76-9297-806a870afdff",
+    "project": "proj_alpha",
+    "outcome": "restated",
+    "child_text": "SYNTHETIC child proj_alpha#2: a later note about ledger schema migration.",
+    "parent_text": "SYNTHETIC parent proj_alpha#2: the first note about ledger schema migration."
+  },
+  {
+    "intent_id": "5256f168-4064-515e-aa73-db87f6fe9e52",
+    "child_memory_id": "804bc8d7-5a8a-5e63-a8b1-dd82d1aaa395",
+    "parent_id": "f7f56b79-a90d-52a9-8268-e98a81d24a5e",
+    "project": "proj_alpha",
+    "outcome": "contested",
+    "child_text": "SYNTHETIC child proj_alpha#3: a later note about escalation dedupe window.",
+    "parent_text": "SYNTHETIC parent proj_alpha#3: the first note about escalation dedupe window."
+  },
+  {
+    "intent_id": "67cc66d5-f586-50f7-8a6a-34d7a7e37aec",
+    "child_memory_id": "e45e733f-9676-5607-98ca-e027684b52d5",
+    "parent_id": "a058651f-a1be-51c1-828a-fdf6546033c3",
+    "project": "proj_alpha",
+    "outcome": "amended",
+    "child_text": "SYNTHETIC child proj_alpha#4: a later note about warm worktree reuse.",
+    "parent_text": "SYNTHETIC parent proj_alpha#4: the first note about warm worktree reuse."
+  },
+  {
+    "intent_id": "04c37272-6b49-5d1e-a703-26494b2f5698",
+    "child_memory_id": "5c1803a4-bb81-5bf0-a189-bcceda045990",
+    "parent_id": "a09bf8ef-3e42-5c1d-8eb2-4536fb686e6f",
+    "project": "proj_alpha",
+    "outcome": "restated",
+    "child_text": "SYNTHETIC child proj_alpha#5: a later note about curator gate ordering.",
+    "parent_text": "SYNTHETIC parent proj_alpha#5: the first note about curator gate ordering."
+  },
+  {
+    "intent_id": "a59419b0-2985-5675-8690-1484f4823f83",
+    "child_memory_id": "c18d210c-1660-55ed-a29b-d26aecccfaaf",
+    "parent_id": "80917706-5bfd-563d-8f35-cb67683d4784",
+    "project": "proj_alpha",
+    "outcome": "contested",
+    "child_text": "SYNTHETIC child proj_alpha#6: a later note about verify host quarantine.",
+    "parent_text": "SYNTHETIC parent proj_alpha#6: the first note about verify host quarantine."
+  },
+  {
+    "intent_id": "8161e1f5-e55e-5cd9-af48-75265a3eb833",
+    "child_memory_id": "e114e468-8e7e-5cf7-8eeb-f29afe8a8b50",
+    "parent_id": "76246c0e-fd95-5975-af54-c38c0a2fe2c0",
+    "project": "proj_alpha",
+    "outcome": "amended",
+    "child_text": "SYNTHETIC child proj_alpha#7: a later note about routing allowlist.",
+    "parent_text": "SYNTHETIC parent proj_alpha#7: the first note about routing allowlist."
+  },
+  {
+    "intent_id": "346f9ae3-a511-536f-8bd3-ae202ac2f1cc",
+    "child_memory_id": "082f169b-8c30-551b-9f98-f38dadeec200",
+    "parent_id": "02445ef9-699a-551b-bc6c-da922ce32c60",
+    "project": "proj_alpha",
+    "outcome": "restated",
+    "child_text": "SYNTHETIC child proj_alpha#8: a later note about drain sweep ceiling.",
+    "parent_text": "SYNTHETIC parent proj_alpha#8: the first note about drain sweep ceiling."
+  },
+  {
+    "intent_id": "ae5dd84d-f177-51ac-8d0f-29ddb218c5f7",
+    "child_memory_id": "cbfc3e76-7db8-53ce-a367-510d8c25018e",
+    "parent_id": "1fcd2e44-4bcc-5f19-a269-91d63a4350ea",
+    "project": "proj_alpha",
+    "outcome": "contested",
+    "child_text": "SYNTHETIC child proj_alpha#9: a later note about pin queue order.",
+    "parent_text": "SYNTHETIC parent proj_alpha#9: the first note about pin queue order."
+  },
+  {
+    "intent_id": "7d246351-b00d-549c-b2ef-dc7d6635d80e",
+    "child_memory_id": "d1a42a18-4796-5f4b-b070-3512ee029868",
+    "parent_id": "0e2733fa-33f3-57a8-b279-4a7c570c2523",
+    "project": "proj_beta",
+    "outcome": "contested",
+    "child_text": "SYNTHETIC child proj_beta#0: a later note about panel load budget.",
+    "parent_text": "SYNTHETIC parent proj_beta#0: the first note about panel load budget."
+  },
+  {
+    "intent_id": "29cdc192-f30e-5cb7-b83b-ee55fad96eff",
+    "child_memory_id": "46c1e466-1938-5fed-807a-417957b940db",
+    "parent_id": "27633bbb-1882-535e-81ff-6b8892fdd6b0",
+    "project": "proj_beta",
+    "outcome": "amended",
+    "child_text": "SYNTHETIC child proj_beta#1: a later note about inverter clipping estimate.",
+    "parent_text": "SYNTHETIC parent proj_beta#1: the first note about inverter clipping estimate."
+  },
+  {
+    "intent_id": "58dbc9eb-3855-5081-8a62-d7b668012deb",
+    "child_memory_id": "33c31cd9-ac94-594a-af06-118539c46905",
+    "parent_id": "8f5ce9f6-4df3-5675-be20-50fcfd5d99b2",
+    "project": "proj_beta",
+    "outcome": "restated",
+    "child_text": "SYNTHETIC child proj_beta#2: a later note about tariff import format.",
+    "parent_text": "SYNTHETIC parent proj_beta#2: the first note about tariff import format."
+  },
+  {
+    "intent_id": "8fb7b261-2861-56c8-92ea-74d49d2ee992",
+    "child_memory_id": "41f6a312-efb6-5e29-86f6-1dc4cc3db14f",
+    "parent_id": "9f22b64a-f1e5-5459-82ef-62f140957e77",
+    "project": "proj_beta",
+    "outcome": "contested",
+    "child_text": "SYNTHETIC child proj_beta#3: a later note about roof tilt default.",
+    "parent_text": "SYNTHETIC parent proj_beta#3: the first note about roof tilt default."
+  },
+  {
+    "intent_id": "db48e50b-ee6e-58ec-9bdf-85d9c6f31355",
+    "child_memory_id": "e6fdee06-168f-5400-85af-34a20b402865",
+    "parent_id": "cf2afa90-7fda-5b72-9dea-bb32a331c720",
+    "project": "proj_beta",
+    "outcome": "amended",
+    "child_text": "SYNTHETIC child proj_beta#4: a later note about battery reserve floor.",
+    "parent_text": "SYNTHETIC parent proj_beta#4: the first note about battery reserve floor."
+  },
+  {
+    "intent_id": "5528b4e8-1a3a-568b-be1c-256923deb1b8",
+    "child_memory_id": "925cacac-065f-5f4a-a458-4d30f0260cba",
+    "parent_id": "89f39c57-37df-51e2-a096-90311205e0c7",
+    "project": "proj_beta",
+    "outcome": "restated",
+    "child_text": "SYNTHETIC child proj_beta#5: a later note about export limit rounding.",
+    "parent_text": "SYNTHETIC parent proj_beta#5: the first note about export limit rounding."
+  },
+  {
+    "intent_id": "9fcf1ebc-8f07-5908-8291-4c723d617aee",
+    "child_memory_id": "9519ca27-d04a-54a6-9f78-8a589f199dff",
+    "parent_id": "b491f83a-b4e1-55e3-9d55-585cdad2124b",
+    "project": "proj_beta",
+    "outcome": "contested",
+    "child_text": "SYNTHETIC child proj_beta#6: a later note about irradiance cache expiry.",
+    "parent_text": "SYNTHETIC parent proj_beta#6: the first note about irradiance cache expiry."
+  },
+  {
+    "intent_id": "d6b9deca-4d02-566c-87c7-22fb74185449",
+    "child_memory_id": "f10364b4-aeb7-50ff-bd3f-f894fe3aa884",
+    "parent_id": "e3c7bff4-c6db-5bc4-b6a7-9b6eb70576d5",
+    "project": "proj_beta",
+    "outcome": "amended",
+    "child_text": "SYNTHETIC child proj_beta#7: a later note about site survey form.",
+    "parent_text": "SYNTHETIC parent proj_beta#7: the first note about site survey form."
+  },
+  {
+    "intent_id": "5ec45747-8eb8-59d5-a586-3ffdc9ae1c0e",
+    "child_memory_id": "6b7b3f5d-cc67-5178-917a-5fe1439f3c5a",
+    "parent_id": "b5cb8d3c-34a5-5164-ab0b-ac62e2f9446a",
+    "project": "proj_beta",
+    "outcome": "restated",
+    "child_text": "SYNTHETIC child proj_beta#8: a later note about quote PDF footer.",
+    "parent_text": "SYNTHETIC parent proj_beta#8: the first note about quote PDF footer."
+  },
+  {
+    "intent_id": "2b93763e-d11a-5688-8cfd-da09af840664",
+    "child_memory_id": "f1fe810c-f639-516c-8612-0966f986c171",
+    "parent_id": "70e9d57c-f419-5f05-a46f-d67e7139e710",
+    "project": "proj_beta",
+    "outcome": "contested",
+    "child_text": "SYNTHETIC child proj_beta#9: a later note about grid code lookup.",
+    "parent_text": "SYNTHETIC parent proj_beta#9: the first note about grid code lookup."
+  },
+  {
+    "intent_id": "1077fb56-f611-524f-bae0-d21fa54e3b3d",
+    "child_memory_id": "fe658d94-de69-5ab3-b00d-3cbdcf61f329",
+    "parent_id": "61ed036f-70d2-51d9-864c-0e7685b43e5e",
+    "project": "proj_gamma",
+    "outcome": "contested",
+    "child_text": "SYNTHETIC child proj_gamma#0: a later note about intake form required fields.",
+    "parent_text": "SYNTHETIC parent proj_gamma#0: the first note about intake form required fields."
+  },
+  {
+    "intent_id": "4b08180c-181e-5832-b3f7-7502680eeb36",
+    "child_memory_id": "af9923f2-deb4-5e6a-839a-514aae872547",
+    "parent_id": "f403a27c-cac7-520b-96ab-b5d72ee25b46",
+    "project": "proj_gamma",
+    "outcome": "amended",
+    "child_text": "SYNTHETIC child proj_gamma#1: a later note about scoping call checklist.",
+    "parent_text": "SYNTHETIC parent proj_gamma#1: the first note about scoping call checklist."
+  }
+]

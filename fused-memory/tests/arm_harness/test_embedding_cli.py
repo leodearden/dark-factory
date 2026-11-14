@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 import yaml
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from arm_harness import _embedding_doubles as doubles
 from arm_harness._fakes import (
@@ -76,6 +77,10 @@ from fused_memory.arm_harness.topology import (
     topology_hash,
 )
 from fused_memory.config.schema import EmbedderConfig, FusedMemoryConfig
+from fused_memory.eval import topic_registry
+from fused_memory.eval.retrieval_probe import content_key
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 LME_DIR = Path(__file__).parents[2] / 'scripts' / 'local_memory_models_eval'
 STAMP = '20261009T120000Z'
@@ -338,10 +343,8 @@ class ProbeInputs:
 
 
 def _probe_inputs(
-    harness: ModuleType, tmp_path: Path, *, reference_hash: str | None = None,
-    control_scratch: str = REFERENCE,
+    tmp_path: Path, *, reference_hash: str | None = None, control_scratch: str = REFERENCE,
 ) -> ProbeInputs:
-    content_key = harness.load_probe_module().content_key
     reference_json = tmp_path / 'frozen-reference.json'
     reference_json.write_text(json.dumps({
         'graph': REFERENCE, 'node_count': len(NODE_ROWS), 'edge_count': len(EDGE_ROWS),
@@ -377,8 +380,7 @@ def _probe_inputs(
                        tmp_path / 'probe-set.json')
 
 
-def _expected_probe_set(harness: ModuleType, inputs: ProbeInputs) -> ProbeSet:
-    content_key = harness.load_probe_module().content_key
+def _expected_probe_set(inputs: ProbeInputs) -> ProbeSet:
     snapshot = load_snapshot(inputs.snapshot)
     return build_probe_set(
         corpus_sha=incumbent_control_spec().corpus_sha,
@@ -413,21 +415,20 @@ def _expected_probe_set(harness: ModuleType, inputs: ProbeInputs) -> ProbeSet:
 def test_probe_set_reads_the_reference_read_only_and_writes_the_derived_probe(
     harness, live, tmp_path, capsys, monkeypatch
 ):
-    inputs = _probe_inputs(harness, tmp_path)
-    probe = harness.load_probe_module()
+    inputs = _probe_inputs(tmp_path)
     registry_reads: list[Path] = []
-    real_load = probe.load_topic_registry
+    real_load = topic_registry.load_topic_registry
 
     def recording_load(path: Any) -> Any:
         registry_reads.append(Path(path))
         return real_load(path)
 
-    monkeypatch.setattr(probe, 'load_topic_registry', recording_load)
+    monkeypatch.setattr(harness, 'load_topic_registry', recording_load)
 
     code = harness.main(inputs.argv(), deps=live.factory(harness))
 
     assert code == harness.EXIT_OK
-    expected = _expected_probe_set(harness, inputs)
+    expected = _expected_probe_set(inputs)
     assert inputs.out.read_text() == serialize_probe_set(expected)
     assert expected.query_words == 4
     assert [item.episode_uuid for item in expected.known_items] == list(CITED)
@@ -438,7 +439,7 @@ def test_probe_set_reads_the_reference_read_only_and_writes_the_derived_probe(
 
 
 def test_probe_set_whose_reference_moved_exits_3_writing_nothing(harness, live, tmp_path, capsys):
-    inputs = _probe_inputs(harness, tmp_path, reference_hash='f' * 64)
+    inputs = _probe_inputs(tmp_path, reference_hash='f' * 64)
 
     code = harness.main(inputs.argv(), deps=live.factory(harness))
 
@@ -450,7 +451,7 @@ def test_probe_set_whose_reference_moved_exits_3_writing_nothing(harness, live, 
 def test_probe_set_refuses_a_control_a_that_did_not_build_the_reference(
     harness, live, tmp_path, capsys
 ):
-    inputs = _probe_inputs(harness, tmp_path, control_scratch='evalmem_lme_ref_other')
+    inputs = _probe_inputs(tmp_path, control_scratch='evalmem_lme_ref_other')
 
     err = _refused(harness, inputs.argv(), live.factory(harness), capsys, harness.EXIT_REFUSED)
 
@@ -459,7 +460,7 @@ def test_probe_set_refuses_a_control_a_that_did_not_build_the_reference(
 
 
 def test_probe_set_never_overwrites_an_existing_probe_set(harness, live, tmp_path, capsys):
-    inputs = _probe_inputs(harness, tmp_path)
+    inputs = _probe_inputs(tmp_path)
     inputs.out.write_text('committed\n')
 
     _refused(harness, inputs.argv(), live.factory(harness), capsys, harness.EXIT_REFUSED)

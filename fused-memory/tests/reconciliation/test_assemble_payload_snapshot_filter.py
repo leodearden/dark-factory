@@ -223,6 +223,20 @@ class TestTimeWindowedPayloadDisclosesClips:
         assert stage._entity_summary_snapshot_lines_stripped == 2
 
     @pytest.mark.asyncio
+    async def test_typical_long_records_render_whole(self):
+        """Bodies near the measured p90 reach Stage 1 whole (plans/recon-evidence-caps-measurement-2026-10.md, M5)."""
+        episode_body = 'e' * 1_950
+        memory_body = 'm' * 1_950
+        stage = make_consolidator()
+        stage.memory.get_episodes = AsyncMock(return_value=_episodes(episode_body))
+        stage.memory.mem0.get_all = AsyncMock(return_value=_memories(memory_body))
+
+        result = await _time_windowed_payload(stage)
+
+        assert _rendered_from(_section(result, _EPISODES_HEADER), episode_body) == episode_body
+        assert _rendered_from(_section(result, _MEMORIES_HEADER), memory_body) == memory_body
+
+    @pytest.mark.asyncio
     async def test_a_fetch_that_fills_its_limit_renders_a_fetch_cap_note(self):
         stage = make_consolidator()
         stage.episode_limit = 2

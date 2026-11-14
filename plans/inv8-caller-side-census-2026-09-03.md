@@ -31,6 +31,8 @@ pass: **62 findings** — one withdrawn as a scanner false positive (§4a),
 three added by widening the vocabulary to `shutil.rmtree` (§4a).
 Task 5099 re-measured at HEAD `b4e1349e1c` when it widened the vocabulary to
 the directory-walk/metadata calls: **190 files, 55 → 91 findings** (§4c).
+Task 6089 re-measured at HEAD `d8b04e7aaa` when it widened the vocabulary to
+`Path.resolve` / `os.path.realpath`: **290 files, 80 → 90 findings** (§4d).
 
 ---
 
@@ -261,9 +263,89 @@ a row pointing at a done task that never touched its site.
 **Still absent.** `replace`, `remove` and `walk` stay out of the method table
 for good. By attribute name alone they are `str.replace`, `list.remove` and
 `ast.walk`, and every string edit would become a merge-blocking row. Their
-`os.*` spellings are matched as receiver-pinned dotted paths instead. `resolve`
-(`Path.resolve`, +12 rows measured on top of this table) and
-`os.path.realpath` are the next widening, owned by task 6089.
+`os.*` spellings are matched as receiver-pinned dotted paths instead.
+`resolve` and `os.path.realpath` have since been added: see §4d.
+
+## 4d. Task 6089: path normalisation
+
+Measured at HEAD `d8b04e7aaa`, and again at main `bb1bc1dbf8` with identical
+results: **290 files scanned, 80 → 90 findings, +10 rows, 0 stale.** The rows
+are in the ledger; this section carries the cluster-level triage only.
+
+**Marginal counts.** `resolve` +10, `os.path.realpath` +0. Its only caller,
+`reconciliation/sandbox_guard.py`, is reached through `run_stage_via_cli`, and
+that coroutine is already a blessed row. The task text expected +13, measured
+at `b4e1349e1c`. The tree drifted between the two measurements:
+`TaskCurator._call_llm` became `_invoke_curator`, and `run_stage_via_cli`'s
+`realpath` reach now lands on an existing row rather than a new one.
+
+**Name collisions, measured as the task asked.** `resolve` is matched by method
+name on any receiver, like every other method entry. Two of the ten new rows
+are not `Path.resolve`:
+- `BacklogPolicy.on_judge_unhalt` calls `escalation.queue.EscalationQueue.resolve`:
+  an `escalation_id_lock` flock, an atomic record rewrite and an archive move.
+- `TaskCurator._invoke_curator` reaches
+  `shared.prompt_artifact.PromptArtifactStore.resolve`: an `exists()` probe,
+  plus a JSON provenance load and a `heuristics.txt` read when a prompt is
+  pinned, unmemoised.
+
+Both genuinely block, and both live in packages outside the `fused-memory/src`
+scope the scanner otherwise cannot follow. So the name match gained true
+coverage, not a false RED. No call-shape or arity filter was added. It would
+have turned exactly these two rows into silent misses, and it would add a
+second matching axis for one name. Revisit that decision when the first
+`.resolve(...)` row appears whose receiver does NOT block.
+
+**Re-labelled rows.** 29 existing rows keep their key but now REPORT `resolve` or
+`os.path.realpath` as the first primitive they reach, because the scanner stops
+at the first one:
+- the 23 `_normalize_project_root` handlers (the 22-handler cluster plus its
+  23rd), through `models/scope.py::resolve_main_checkout`;
+- both reconciliation `resolve_main_checkout` callers,
+  `_write_task_count_snapshot` and `read_live_override_state`;
+- `run_stage_via_cli` (`os.path.realpath` through `sandbox_guard`);
+- `CodebaseVerifier.verify`;
+- `create_mcp_server.submit_task`'s `32c0a08cd635` row;
+- `run_server`'s `f38dc5fc1e4c` row.
+
+Their keys did not change, so the ratchet is unaffected. Each disposition still
+describes the dominant cost of its call, so no ledger text changed. One
+consequence is worth knowing. `resolve_main_checkout` calls
+`Path(path).resolve()` on EVERY call, ahead of its `_MAIN_CHECKOUT_CACHE`
+lookup, so a warm call pays it too (the `Path.resolve` cost below). That cost
+is cheap. It is not part of the cold-miss fork+exec that the 23-row ticket owns.
+
+**Per-call cost**, measured for the rows task 7572 owns. The task 6089
+justifications in the ledger and the scanner cite this paragraph rather than
+restating it, so a re-measurement edits only here (CPython 3.13.9, min of
+5 × 20000-call timeit, host load average ~160–180): `Path.resolve` 19–33 µs
+for a 4–9 component path; `os.path.realpath` 25–43 µs; `exists` 3–5 µs. An
+unpinned `PromptArtifactStore.resolve` costs 16–21 µs. The live main checkout
+has no `data/prompt_artifacts`, so nothing is pinned there.
+
+**Owner of the nine cheap rows.** Under the INV-12 day-one ruling (esc-5603-1,
+`docs/legibility/inv12-day-one-rulings.md`), `accepted` is no longer a resting
+state in this ledger: an accepted row borrows task 5270's default, whose scope
+lists 28 specific rows. So the nine measured-cheap rows cite their own
+follow-up, task 7572 (created from ticket `tkt_0RW94QBGG9RSRP47XQXGGV1KFK`),
+which offloads each site or seeks a per-row Policy ruling, and
+`LOOP_BLOCKING_LEDGER`'s `default_covers` stays 28.
+
+| root cause | rows | disposition | owner / reason |
+|---|---|---|---|
+| one `resolve()` of a root or DB path before an awaited `aiosqlite` / `connect_daemon` open | 3 | filed | task 7572; one lstat per component, ahead of far costlier awaited work |
+| verifier LLM-tool containment guard (`read_file`, `grep_search`) | 2 | filed | task 7572; once per tool call, each after an LLM turn; `read_file`'s `read_text` stays 5270's |
+| `run_server` startup `resolve()` | 3 | filed | task 7572; once per process, before `server.serve()` binds, though it may stall already-started background loops once |
+| `PromptArtifactStore.resolve` per curator LLM call | 1 | filed | task 7572; once per LLM round-trip of seconds |
+| `EscalationQueue.resolve` in `on_judge_unhalt` | 1 | filed | task 6086, whose offload moves the whole closing loop into one `asyncio.to_thread` hop |
+
+**Sibling gate.** `shared/tests/test_orchestrator_rmtree_gate.py` filters the
+same scanner's findings by first-reached primitive `== 'shutil.rmtree'`. At
+`d8b04e7aaa` an rmtree-only vocabulary finds 0 coroutine sites in
+`orchestrator/src` (240 files), so this widening masks nothing and that gate
+does not move. It does grow the masking surface: orchestrator findings go
+348 → 439, so a future resolve-then-rmtree helper would report `resolve` and
+slip past the filter. Filed as ticket `tkt_0RW8VZR8TAFNV9J6X26NHF28QS`.
 
 ## 5. Headline finding: four same-shape sites in one file, two of them unfiled
 

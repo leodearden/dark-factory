@@ -1,0 +1,36 @@
+{
+  "task_id": "5827",
+  "reason": "Net-additive defect fix, not a failed refactor: the merge_request_stuck alarm re-filed an L1 on every heartbeat once its L1 was closed (reify mr-97cb9456, 2026-09-23). The per-dequeue-episode alarm ladder (STUCK_ALARM_THRESHOLD_MULTIPLES, _alarm_due, mark_alarmed), its per-sweep reporter and the ladder-derived alarm wording (_stuck_alarm_summary, _stuck_alarm_close_note) moved from merge_lane/worker.py::_check_request_liveness into merge_lane/request_ledger.py::report_stuck_requests. request_ledger.py lines 358->436, prose_lines 182->186 and cognitive 13->21 rise, while worker.py lines 22813->22791, prose_lines 12664->12653 and cognitive 2272->2267 fall; the cluster totals rise net by lines +56 and cognitive +3.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/request_ledger.py",
+      "baseline": 13,
+      "current": 21
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/request_ledger.py",
+      "baseline": 358,
+      "current": 436
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/request_ledger.py",
+      "baseline": 182,
+      "current": 186
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4992,
+      "current": 4995
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58693,
+      "current": 58749
+    }
+  ]
+}

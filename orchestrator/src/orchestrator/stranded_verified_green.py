@@ -39,7 +39,7 @@ from orchestrator.task_runtime import _derive_phase
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
     from orchestrator.git_ops import GitOps
-    from orchestrator.merge_types import MergeOutcome, MergeRequest, QueuedBranch
+    from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, QueuedBranch
 
 logger = logging.getLogger(__name__)
 
@@ -147,8 +147,7 @@ def last_verified_green_tip(
 class VerifiedGreenMatch:
     """A stranded task whose warm lane holds verified-green, mergeable work.
 
-    - ``lane``: the warm-lane name (``all_records()`` key) — used to derive the
-      ``.task-meta`` root for the plan read.
+    - ``lane``: the warm-lane name (``all_records()`` key).
     - ``branch``: the lane branch (``record.branch`` or the configured
       ``task/<id>`` fallback) whose tip is the verified-green tip.
     - ``tip_sha``: the lane branch tip == the last passed ``workflow_verify``
@@ -180,7 +179,8 @@ async def detect_verified_green(
     (b) the lane branch tip (``git_ops.resolve_branch_sha``) equals the task's
         last passed ``workflow_verify`` tip (:func:`last_verified_green_tip`,
         read cross-run so it survives the restart the strand may span); AND
-    (c) the lane's ``plan.json`` has every step done
+    (c) the task's ``plan.json`` (task-scoped, so read from its task root,
+        never the lane's) has every step done
         (``_derive_phase(...) == 'DONE'``).
 
     Any miss — or ANY exception from a collaborator — yields ``None`` (fail-safe:
@@ -208,8 +208,12 @@ async def detect_verified_green(
             return None
 
         worktree = worktree_resolver(task_id)
-        meta_root = TaskArtifacts.meta_root_for(git_ops.worktree_base, lane_name)
-        plan = TaskArtifacts(worktree, meta_root).read_plan()
+        base = git_ops.worktree_base
+        plan = TaskArtifacts(
+            worktree,
+            TaskArtifacts.meta_root_for(base, lane_name),
+            TaskArtifacts.task_root_for(base, task_id),
+        ).read_plan()
         if _derive_phase(plan) != 'DONE':
             return None
 
@@ -314,8 +318,8 @@ async def submit_verified_green_merge_request(
 
     Returns the submitted ``MergeRequest`` (callers read ``.request_id``).
     """
-    from orchestrator.merge_queue import enqueue_merge_request  # noqa: PLC0415
-    from orchestrator.merge_types import MergeRequest  # noqa: PLC0415
+    from orchestrator.merge_lane import enqueue_merge_request
+    from orchestrator.merge_lane.types import MergeRequest
 
     future: asyncio.Future[MergeOutcome] = (
         asyncio.get_running_loop().create_future()

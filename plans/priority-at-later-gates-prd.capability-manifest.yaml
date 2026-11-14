@@ -1,0 +1,233 @@
+# Machine-readable twin of priority-at-later-gates-prd.capability-manifest.md
+prd: plans/priority-at-later-gates-prd.md
+schema_version: 1
+signal_leaves: ["κ1", "κ2"]
+tasks:
+  - label: "α1"
+    task_id: 9933
+    title: "TaskPriority with base tier, pin order and age anchor; order_key; the lookup answers before the first tick and while paused; merge_pool config"
+    capabilities:
+      - name: "priority-value-and-lookup"
+        binding: "producer:task-9908 upstream (TaskPriority, read_task_priority, Scheduler.task_priority; hand-carried, wired as a dependency)"
+        verdict: PASS
+      - name: "pin-rows-readable-at-construction"
+        binding: "`grep:orchestrator/src/orchestrator/overrides.py::OverrideStore.get_overrides` exists; α1 adds the construction-time read"
+        verdict: PASS
+      - name: "state-snapshot-written"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler.get_state_snapshot` writes effective_priorities; α1 adds the start-up read"
+        verdict: PASS
+      - name: "order-key"
+        binding: "built here; grep absent on main a8bd0b5eb1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def order_key"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "gate-rank-with-pinned"
+        binding: "built here; grep absent on main a8bd0b5eb1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "GATE_RANK"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "merge-pool-config"
+        binding: "built here; grep absent on main a8bd0b5eb1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class MergePoolConfig"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "age-from-on-merge-queued"
+        binding: "built here; grep absent on main a8bd0b5eb1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "age_from"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "α2"
+    task_id: 9934
+    title: "The first-eligible table, its status-read cleanup and its seed"
+    capabilities:
+      - name: "candidate-stamp-each-tick"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._apply_starvation_watchdog` wired: calls EligibilityClock.observe for every candidate each tick"
+        verdict: PASS
+      - name: "status-read-for-absent-tasks"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler.get_statuses` exists and returns (statuses, error)"
+        verdict: PASS
+      - name: "age-anchor-field"
+        binding: "producer:α1 upstream (TaskPriority.age_anchor)"
+        verdict: PASS
+      - name: "first-eligible-table"
+        binding: "built here; grep absent on main a8bd0b5eb1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "first_eligible"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+  - label: "β"
+    task_id: 8261
+    title: "Verify admission orders by order_key behind verify_admission_order: priority (task 8261, text replaced)"
+    capabilities:
+      - name: "admission-pick-site"
+        binding: "`grep:orchestrator/src/orchestrator/verify_admission_gate.py::AdmissionGate._pick` is the one pick; `grep:orchestrator/src/orchestrator/verify.py::admission_policy` builds its policy"
+        verdict: PASS
+      - name: "second-gate-site"
+        binding: "`grep:orchestrator/src/orchestrator/verify_hosts.py::HostPool` holds one AdmissionGate per remote host"
+        verdict: PASS
+      - name: "order-key-producer"
+        binding: "producer:α1 upstream"
+        verdict: PASS
+      - name: "priority-admission-order"
+        binding: "built here; grep absent on main a8bd0b5eb1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "order_key"
+          paths: ["orchestrator/src/orchestrator/verify_admission_gate.py"]
+          expect: present
+  - label: "γ"
+    task_id: 9935
+    title: "The pool order behind merge_pool.order: one order function and its readers, the narrowed footprint under priority, bounce_cap"
+    capabilities:
+      - name: "one-pick-site"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._acquire_next_request` and `grep:orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._look_ahead` wired: the only callers of MergeIntake.pop_next_pickable"
+        verdict: PASS
+      - name: "fork-point-changed-files"
+        binding: "`grep:orchestrator/src/orchestrator/git_ops.py::GitOps.get_branch_changed_files` exists and returns (files, error)"
+        verdict: PASS
+      - name: "footprint-site"
+        binding: "`grep:orchestrator/src/orchestrator/suffix_graph.py::SuffixConflictTracker.recompute` wired: computes the footprint for every waiting request"
+        verdict: PASS
+      - name: "suspect-list-producer"
+        binding: "producer:task-8528 upstream (the suspect list it requeues)"
+        verdict: PASS
+      - name: "config-and-order-key-producer"
+        binding: "producer:α1 upstream (merge_pool config, order_key)"
+        verdict: PASS
+      - name: "pool-order"
+        binding: "built here; grep absent on main a8bd0b5eb1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def pool_order"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: present
+      - name: "bounce-cap-read-from-config"
+        binding: "built here on α1's config field; the lane reads it in place of the constant"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "MERGE_BOUNCE_CAP = 3"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: absent
+  - label: "ι1"
+    task_id: 9936
+    title: "The order readout over recorded picks"
+    capabilities:
+      - name: "pick-records-producer"
+        binding: "producer:task-9908 upstream (waiting set on merge_dequeued); producer:γ upstream (rank and age_secs on each entry); producer:α2 upstream (age from the anchor)"
+        verdict: PASS
+      - name: "order-readout-script"
+        binding: "built here; grep absent on main a8bd0b5eb1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "no pick records yet"
+          paths: ["scripts/"]
+          expect: present
+  - label: "ι2"
+    task_id: 9937
+    title: "Human gate: flip merge_pool.order to priority"
+    capabilities:
+      - name: "readout-producer"
+        binding: "producer:ι1 upstream"
+        verdict: PASS
+      - name: "lane-readout-taken"
+        binding: "producer:task-8532 upstream (the seven-day readout of the lane)"
+        verdict: PASS
+      - name: "priority-order-observed-recording"
+        binding: "the readout must show picks recorded after γ deployed; a human reads it at the gate"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "The gate's escalation attaches the readout run on the live event store; the reader confirms it covers picks recorded after γ deployed before setting merge_pool.order."
+  - label: "θ2"
+    task_id: 9938
+    title: "pinned in the shared tier vocabulary, with its refusals"
+    capabilities:
+      - name: "shared-vocabulary-producer"
+        binding: "producer:task-6718 upstream (shared/task_priority.py)"
+        verdict: PASS
+      - name: "pinned-name-producer"
+        binding: "producer:α1 upstream (PINNED, GATE_RANK)"
+        verdict: PASS
+      - name: "pinned-in-shared-vocabulary"
+        binding: "built here; grep absent on main a8bd0b5eb1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "PINNED"
+          paths: ["shared/src/shared/"]
+          expect: present
+  - label: "θ1"
+    task_id: 9939
+    title: "pinned inside the scheduler: base tier plus pin order, tier-first sort, fairness unchanged, the bounded reservation"
+    capabilities:
+      - name: "effective-tier-walk"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_compute_priorities` wired: runs the inheritance walk each tick"
+        verdict: PASS
+      - name: "bounded-pin-reservation"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._bound_pin_reservations` wired: enforces pin_reservation_max_active"
+        verdict: PASS
+      - name: "top-candidate-fairness"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_select_scored` wired: only the top-scored candidate accrues skips"
+        verdict: PASS
+      - name: "pin-pass-to-fold"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_select_pins` exists today as the separate pass θ1 folds into the one loop"
+        verdict: PASS
+      - name: "vocabulary-producer"
+        binding: "producer:θ2 upstream"
+        verdict: PASS
+      - name: "pin-orders-in-snapshot"
+        binding: "built here; grep absent on main a8bd0b5eb1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "pin_orders"
+          paths: ["shared/src/shared/scheduler_state.py"]
+          expect: present
+  - label: "κ1"
+    task_id: 9940
+    title: "Integration gate for the two later gates"
+    capabilities:
+      - name: "gate-producers"
+        binding: "producer:β upstream; producer:γ upstream; producer:α2 upstream"
+        verdict: PASS
+      - name: "boundary-module"
+        binding: "built here; grep absent on main a8bd0b5eb1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class TestPriorityGatesBoundary"
+          paths: ["orchestrator/tests/"]
+          expect: present
+  - label: "κ2"
+    task_id: 9941
+    title: "Integration gate for the pin tier"
+    capabilities:
+      - name: "pin-tier-producers"
+        binding: "producer:κ1 upstream; producer:θ1 upstream"
+        verdict: PASS
+      - name: "pin-tier-boundary-module"
+        binding: "built here; grep absent on main a8bd0b5eb1"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class TestPinTierBoundary"
+          paths: ["orchestrator/tests/"]
+          expect: present

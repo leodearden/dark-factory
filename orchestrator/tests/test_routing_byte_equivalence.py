@@ -31,6 +31,8 @@ import pytest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.routing import PlanShape, RoleDefaults, RouteInputs, resolve_route
 
+pytestmark = pytest.mark.usefixtures("code_default_config")
+
 # Every role _invoke can dispatch today (task epsilon boundary test 3) -- the
 # 11 full-name config-addressable roles (task alpha) plus one representative
 # reviewer* variant, proving the reviewer-prefix collapse holds through the
@@ -58,16 +60,6 @@ _SENTINEL_ROLE_DEFAULTS = RoleDefaults(
     model='role-default-sentinel', effort='role-default-sentinel',
     budget_usd=-1.0, max_turns=-1,
 )
-
-
-@pytest.fixture(autouse=True)
-def _isolated_config_env(monkeypatch, tmp_path):
-    """Every OrchestratorConfig() built in this module reads ONLY the
-    package's shipped defaults.yaml -- no stray project config.yaml, no
-    ambient ORCH_CONFIG_PATH. Mirrors test_routing.py's per-test convention.
-    """
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
 
 
 def _config_key(role_name: str) -> str:

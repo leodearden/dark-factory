@@ -25,15 +25,7 @@ from orchestrator.agents.roles import ROLES
 from orchestrator.config import ModelsConfig, OrchestratorConfig
 from orchestrator.routing import RoleDefaults, RouteInputs, resolve_route
 
-
-@pytest.fixture(autouse=True)
-def _isolated_config_env(monkeypatch, tmp_path):
-    """Every OrchestratorConfig() built in this module reads ONLY the
-    package's shipped defaults.yaml -- no stray project config.yaml, no
-    ambient ORCH_CONFIG_PATH. Mirrors test_routing_resolver.py's convention.
-    """
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+pytestmark = pytest.mark.usefixtures("code_default_config")
 
 
 class TestModelOverridesTypedFieldRoundTripsIntoResolver:

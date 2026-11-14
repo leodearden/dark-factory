@@ -1,0 +1,1207 @@
+prd: plans/review-all-s16-orchestrator-config-shape-defaults-and-routing-prd.md
+schema_version: 1
+signal_leaves:
+- ω
+tasks:
+- label: β0
+  task_id: 9689
+  title: Shared config-field declarations (reload tier, legacy spelling, role-table pivot) and the generic hot-reload engine
+  note: 'Contracts C3 (TableLegacy included) and C4. Carries fk-efae65b1f9af and fk-dae2a050b5d3 (tier-on-field half). Free: touches only new shared/ modules.'
+  capabilities:
+  - name: annotation-descent-port-substrate
+    binding: '`grep:fused-memory/src/fused_memory/config/reload.py::_ABSENT` substrate at authoring (deleted by β2) — the annotation-driven descent β0 generalises exists on main'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^_ABSENT = '
+      paths:
+      - fused-memory/src/fused_memory/config/reload.py
+      expect: present
+  - name: reload-engine-in-shared
+    binding: built here — shared/src/shared/config_reload.py::apply_reload (C4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def apply_reload\(
+      paths:
+      - shared/src/shared/config_reload.py
+      expect: present
+  - name: reload-tier-derivation-in-shared
+    binding: built here — shared/src/shared/config_fields.py::reloadable_paths (C3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def reloadable_paths\(
+      paths:
+      - shared/src/shared/config_fields.py
+      expect: present
+  - name: legacy-spelling-pivot-in-shared
+    binding: built here — shared/src/shared/config_fields.py::pivot_legacy_spellings (C3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def pivot_legacy_spellings\(
+      paths:
+      - shared/src/shared/config_fields.py
+      expect: present
+  - name: restart-only-rows-marker
+    binding: built here — shared/src/shared/config_fields.py::RestartOnlyRows, per-row tiers on a GREEN role-table field (C3, D4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class RestartOnlyRows
+      paths:
+      - shared/src/shared/config_fields.py
+      expect: present
+  - name: table-pivot-declaration-in-shared
+    binding: built here — shared/src/shared/config_fields.py::TableLegacy, the role-table pivot form (C3, boundary row 4b)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class TableLegacy
+      paths:
+      - shared/src/shared/config_fields.py
+      expect: present
+- label: γ0
+  task_id: 9690
+  title: 'Shared role and backend vocabulary: Backend, RoleName, config_role, RoleSettings'
+  note: 'Contracts C1 (six CLI members: zcode and mimo landed by tasks 5399 and 7993) and C2. Carries fk-ba569525f6e0 and fk-5805ae6f97f1 (vocabulary half). Free. S20 ν holds on S16/C1 = this leaf.'
+  capabilities:
+  - name: backend-enum-in-shared
+    binding: built here — shared/src/shared/backends.py::Backend (C1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class Backend\(StrEnum\)
+      paths:
+      - shared/src/shared/backends.py
+      expect: present
+  - name: backend-enum-carries-zcode
+    binding: built here — shared/src/shared/backends.py::Backend.ZCODE (C1; task 5399 landed the zcode backend)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ZCODE = 'zcode'
+      paths:
+      - shared/src/shared/backends.py
+      expect: present
+  - name: backend-enum-carries-mimo
+    binding: built here — shared/src/shared/backends.py::Backend.MIMO (C1; task 7993 landed the mimo backend)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: MIMO = 'mimo'
+      paths:
+      - shared/src/shared/backends.py
+      expect: present
+  - name: role-name-enum-in-shared
+    binding: built here — shared/src/shared/roles.py::RoleName (C2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class RoleName\(StrEnum\)
+      paths:
+      - shared/src/shared/roles.py
+      expect: present
+  - name: reviewer-collapse-declared-once
+    binding: built here — shared/src/shared/roles.py::config_role (C2, D8)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def config_role\(
+      paths:
+      - shared/src/shared/roles.py
+      expect: present
+  - name: reviewer-variants-declared
+    binding: built here — shared/src/shared/roles.py::REVIEWER_VARIANTS and DISPATCHABLE_ROLES (C2, D8)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^REVIEWER_VARIANTS
+      paths:
+      - shared/src/shared/roles.py
+      expect: present
+  - name: role-settings-model-in-shared
+    binding: built here — shared/src/shared/roles.py::RoleSettings (C2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class RoleSettings\(
+      paths:
+      - shared/src/shared/roles.py
+      expect: present
+- label: α
+  task_id: 9691
+  title: 'Config defaults have one home: field defaults are authoritative, defaults.yaml keeps only environment-layered leaves'
+  note: 'Closes fk-2a67692ff456. Survivors per PRD D2 (the yaml value at α''s base); C7 guard; C8 cross-package defaults (OQ-4 option 2, ruled by the lead). Deps: 9229, 8375, 9146, S19 κ2 (no edge onto S24: it homes its restart defaults in shared/fleet_coordination.py).'
+  capabilities:
+  - name: census-walk-substrate
+    binding: '`grep:orchestrator/src/orchestrator/config.py::census_config_keys` substrate — the model_fields walk the guard mirrors exists on main'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def census_config_keys\(
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: defaults-yaml-sheds-restated-concurrency
+    binding: built here — the restating max_concurrent_tasks leaf leaves orchestrator/src/orchestrator/defaults.yaml
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^max_concurrent_tasks:'
+      paths:
+      - orchestrator/src/orchestrator/defaults.yaml
+      expect: absent
+  - name: one-home-guard-test
+    binding: built here — orchestrator/tests/test_config_default_one_home.py (C7)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/tests/test_config_default_one_home.py
+      expect: present
+  - name: dashboard-stops-restating-24
+    binding: built here — `grep:dashboard/src/dashboard/data/orchestrator.py::_ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS` is deleted
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _ORCHESTRATOR_DEFAULT_MAX_CONCURRENT_TASKS = 24
+      paths:
+      - dashboard/src/dashboard/data/orchestrator.py
+      expect: absent
+  - name: dashboard-stops-restating-lock-depth
+    binding: built here — `grep:dashboard/src/dashboard/data/scheduler.py::_DEFAULT_LOCK_DEPTH` (2, against the survivor 4) is deleted or repointed
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^_DEFAULT_LOCK_DEPTH = 2
+      paths:
+      - dashboard/src/dashboard/data/scheduler.py
+      expect: absent
+  - name: cross-package-defaults-module
+    binding: built here — shared/src/shared/config_defaults.py (C8, OQ-4 ruled by the lead) holds DEFAULT_MAX_CONCURRENT_TASKS and DEFAULT_LOCK_DEPTH; created here
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^DEFAULT_MAX_CONCURRENT_TASKS
+      paths:
+      - shared/src/shared/config_defaults.py
+      expect: present
+  - name: concurrency-field-default-names-the-constant
+    binding: built here — the max_concurrent_tasks Field default names C8's constant (value 24, the D2 survivor)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'max_concurrent_tasks: int = Field\(default=DEFAULT_MAX_CONCURRENT_TASKS'
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: dashboard-reads-shared-default
+    binding: built here — the dashboard imports the cross-package default from shared.config_defaults (OQ-4)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from shared\.config_defaults import
+      paths:
+      - dashboard/src/dashboard/data/orchestrator.py
+      expect: present
+- label: ι
+  task_id: 9692
+  title: Promote the config-default-one-home design invariant through the four-site lockstep edit
+  note: 'R22 item 5. The six wave-3 minting tasks take INV-18 to INV-23 in landing order (one-decision-partition-per-area last, INV-23), so ι takes one of INV-18 to INV-22; the lead wires the invariant-file chain at decompose; every check anchors on the slug. Deps: α, 9154 (same three invariant files).'
+  capabilities:
+  - name: house-pattern-guard
+    binding: producer:α upstream — orchestrator/tests/test_config_default_one_home.py (C7)
+    verdict: PASS
+  - name: invariant-minted
+    binding: built here — docs/legibility/design-invariants.md section for config-default-one-home
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: config-default-one-home
+      paths:
+      - docs/legibility/design-invariants.md
+      expect: present
+  - name: trigger-shape-registered
+    binding: built here — skills/prd/references/gates.md family row and inv-trigger-shapes span
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: config-default-one-home
+      paths:
+      - skills/prd/references/gates.md
+      expect: present
+  - name: fixtures-registered
+    binding: built here — docs/legibility/design-invariants-fixtures.md PRD and CODE fixtures plus the addendum walk
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: config-default-one-home
+      paths:
+      - docs/legibility/design-invariants-fixtures.md
+      expect: present
+- label: β2
+  task_id: 9693
+  title: Fused-memory declares reload tiers and legacy spellings on its fields; its engine copy config/reload.py is deleted
+  note: 'Carries fk-efae65b1f9af. Fused-memory pivot + deprecation report. Deps: β0, 9194, 9280, 9254, 9252, 8143, 8452, S15 ε1, S19 δ. Starts without 5040.'
+  capabilities:
+  - name: fm-reload-tool-substrate
+    binding: '`grep:fused-memory/src/fused_memory/server/tools.py` substrate — the reload_config tool registration β2 repoints; scoped to server/ because S15 ε1 may move it to server/tool_families/ops.py first'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def reload_config\(
+      paths:
+      - fused-memory/src/fused_memory/server/
+      expect: present
+  - name: fm-engine-copy-gone
+    binding: built here — `grep:fused-memory/src/fused_memory/config/reload.py::apply_reload` and the module are deleted
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def apply_reload\(
+      paths:
+      - fused-memory/src/fused_memory/config/reload.py
+      expect: absent
+  - name: fm-reloads-through-shared-engine
+    binding: built here — fused-memory's reload_config tool imports shared.config_reload (wherever S15 placed the tool under server/)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from shared\.config_reload import
+      paths:
+      - fused-memory/src/fused_memory/server/
+      expect: present
+  - name: fm-pivots-legacy-spellings
+    binding: built here — FusedMemoryConfig's root mode='before' validator calls shared.config_fields.pivot_legacy_spellings (B1 of the critique; boundary row 13b)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: pivot_legacy_spellings
+      paths:
+      - fused-memory/src/fused_memory/config/schema.py
+      expect: present
+- label: β1
+  task_id: 9694
+  title: The orchestrator declares reload tiers and legacy spellings on its fields; its engine copy goes
+  note: 'Closes fk-efae65b1f9af (the later engine deletion); carries fk-dae2a050b5d3. D6 translation phase: model_copy pivot; check-config (cli.py) prints the deprecated bucket. Deps: α, β0, β2, 9236, 9210, 3792, 5366.'
+  capabilities:
+  - name: hand-allowlist-gone
+    binding: built here — the 338-line RELOADABLE_FIELDS literal in `grep:orchestrator/src/orchestrator/config.py::RELOADABLE_FIELDS` becomes a derivation
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'RELOADABLE_FIELDS: frozenset\[str\] = frozenset\(\)\.union\('
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: absent
+  - name: derived-reloadable-set
+    binding: built here — RELOADABLE_FIELDS derived by shared.config_fields.reloadable_paths
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: reloadable_paths\(OrchestratorConfig\)
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: orchestrator-engine-copy-gone
+    binding: built here — `grep:orchestrator/src/orchestrator/config.py::_iter_leaves` (runtime-value descent) is deleted
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def _iter_leaves\(
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: absent
+  - name: harness-reloads-through-shared-engine
+    binding: built here — `grep:orchestrator/src/orchestrator/harness.py::Harness.reload_config` calls shared.config_reload
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from shared\.config_reload import
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: model-copy-pivots-legacy-keys
+    binding: built here — OrchestratorConfig.model_copy pivots a declared legacy spelling in update= and raises on an unknown key (boundary row 18b)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def model_copy\(
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: census-reports-deprecated-spellings
+    binding: built here — census_config_keys gains a deprecated bucket (name decided in β1, tactical 2); boundary row 5
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: bucket name is decided in the leaf; a reviewer confirms boundary row 5 (a declared legacy spelling is reported deprecated, never unknown, and files no L2)
+- label: γ1
+  task_id: 9695
+  title: Orchestrator backend fields are Backend; invoke_agent dispatches through one total table
+  note: 'Closes fk-ba569525f6e0 on the orchestrator side. Deps: β1, γ0, 9233.'
+  capabilities:
+  - name: invoke-dispatch-substrate
+    binding: '`grep:orchestrator/src/orchestrator/agents/invoke.py::invoke_agent` substrate — the dispatch entry γ1 rewires'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^async def invoke_agent\(
+      paths:
+      - orchestrator/src/orchestrator/agents/invoke.py
+      expect: present
+  - name: invoke-if-elif-chain-gone
+    binding: built here — the backend if/elif chain in invoke_agent becomes a Mapping[Backend, Invoker]
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'elif backend == ''pi'':'
+      paths:
+      - orchestrator/src/orchestrator/agents/invoke.py
+      expect: absent
+  - name: backend-fields-typed
+    binding: built here — UnblockAutoConfig.backend and watcher_backend typed Backend
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'backend: str = Field\(default=''claude''\)'
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: absent
+- label: γ2
+  task_id: 9696
+  title: One role-keyed RoleSettings table replaces the knob-major submodels, the unblock-auto role knobs and the watcher role knobs
+  note: 'Closes fk-5805ae6f97f1. Over the 15-file trigger as one codemod (both orientations must not be readable at once). Deps: γ1, 9232, 9188, 9150, 9202, 9235.'
+  capabilities:
+  - name: knob-major-submodels-gone
+    binding: built here — `grep:orchestrator/src/orchestrator/config.py::ModelsConfig` and its five siblings are deleted
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class (ModelsConfig|BudgetsConfig|TurnsConfig|EffortConfig|TimeoutsConfig|BackendsConfig)\(
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: absent
+  - name: role-table-on-config
+    binding: 'built here — OrchestratorConfig.roles: dict[RoleName, RoleSettings] (D7), with or without its Reload marker'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'roles: (Annotated\[)?dict\[RoleName, RoleSettings\]'
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: inline-reviewer-collapse-gone
+    binding: built here — `grep:orchestrator/src/orchestrator/routing.py::_config_key` and the inline startswith in TaskWorkflow._invoke go
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: startswith\('reviewer'\)
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: watcher-role-knobs-gone
+    binding: built here — watcher_model and its four sibling role knobs become roles.watcher
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'watcher_model: str'
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: absent
+  - name: known-role-names-derived
+    binding: built here — shared.task_metadata.KNOWN_ROLE_NAMES derived from DISPATCHABLE_ROLES and REVIEWER_VARIANTS (D8)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: DISPATCHABLE_ROLES
+      paths:
+      - shared/src/shared/task_metadata.py
+      expect: present
+- label: δ
+  task_id: 9697
+  title: The route resolver and the allowlist move to shared; orchestrator.routing keeps the availability probe
+  note: 'Carries fk-dac0a2a67201 (orchestrator half). Deps: γ2, 6766 (S25 C4), 8373, 5366, S20 δ (S20 C6).'
+  capabilities:
+  - name: resolver-substrate
+    binding: '`grep:orchestrator/src/orchestrator/routing.py::resolve_route` substrate at authoring (deleted by δ) — the resolver δ moves'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def resolve_route\(
+      paths:
+      - orchestrator/src/orchestrator/routing.py
+      expect: present
+  - name: structured-rejections
+    binding: producer:task-6766 upstream — shared.route_rejection.RouteRejection (S25 C4)
+    verdict: PASS
+  - name: invocation-cost-floor
+    binding: producer:S20-δ upstream — shared.claude_argv.INVOCATION_COST_FLOOR_USD (S20 C6)
+    verdict: PASS
+  - name: resolver-in-shared
+    binding: built here — shared/src/shared/route_resolver.py::resolve_route (C6)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def resolve_route\(
+      paths:
+      - shared/src/shared/route_resolver.py
+      expect: present
+  - name: route-inputs-for-a-role
+    binding: built here — shared/src/shared/route_resolver.py::RouteInputs.for_role, the fused-memory caller's constructor (C6)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def for_role\(
+      paths:
+      - shared/src/shared/route_resolver.py
+      expect: present
+  - name: policy-in-shared
+    binding: built here — shared/src/shared/route_policy.py::RoutingPolicy (C5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class RoutingPolicy\(
+      paths:
+      - shared/src/shared/route_policy.py
+      expect: present
+  - name: role-budgets-checked-against-floor
+    binding: built here — shared.route_policy.validate_role_models refuses a Claude row whose budget is below S20's floor (C5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: INVOCATION_COST_FLOOR_USD
+      paths:
+      - shared/src/shared/route_policy.py
+      expect: present
+  - name: orchestrator-stock-rules-default
+    binding: built here — orchestrator/src/orchestrator/config.py::OrchestratorRoutingPolicy carries the stock rule table as its rules default (C5, D2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class OrchestratorRoutingPolicy\(RoutingPolicy\)
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: config-stops-importing-routing
+    binding: built here — config.py's import of DEFAULT_ALLOWED_MODELS/DEFAULT_LADDER goes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from orchestrator\.routing import DEFAULT_ALLOWED_MODELS
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: absent
+  - name: type-checking-cycle-gone
+    binding: built here — routing.py's TYPE_CHECKING import of OrchestratorConfig goes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from orchestrator\.config import OrchestratorConfig, RoutingRule
+      paths:
+      - orchestrator/src/orchestrator/routing.py
+      expect: absent
+- label: ε1
+  task_id: 9698
+  title: Recon agent and judge providers are Backend; the dead SDK arms go
+  note: 'Closes fk-34d8da6424f4 and fk-709d4d84ee37. Deps: β2, γ0, S12 α. The judge becomes Claude-CLI-only (OQ-3, ruled by the lead, flagged). Starts without 5040.'
+  capabilities:
+  - name: live-cli-judge-path-substrate
+    binding: '`grep:fused-memory/src/fused_memory/reconciliation/judge.py::Judge._call_judge_cli` substrate — the production path that stays'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def _call_judge_cli\(
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/judge.py
+      expect: present
+  - name: judge-typo-to-openai-arm-gone
+    binding: built here — the else → OpenAI arm of `grep:fused-memory/src/fused_memory/reconciliation/judge.py::Judge._call_llm` goes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: from openai import AsyncOpenAI
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/judge.py
+      expect: absent
+  - name: agentloop-sdk-adapters-gone
+    binding: built here — `grep:fused-memory/src/fused_memory/reconciliation/agent_loop.py::_OpenAIResponseAdapter` and the SDK arms go
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class _OpenAIResponseAdapter
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/agent_loop.py
+      expect: absent
+  - name: recon-provider-fields-typed
+    binding: built here — agent_llm_provider/judge_llm_provider stop being bare str
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '_llm_provider: str = Field'
+      paths:
+      - fused-memory/src/fused_memory/config/schema.py
+      expect: absent
+  - name: shared-recon-fixture-on-cli
+    binding: built here — fused-memory/tests/reconciliation/harness_fixtures.py stops configuring the anthropic SDK provider the leaf removes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '''agent_llm_provider'': ''anthropic'''
+      paths:
+      - fused-memory/tests/reconciliation/harness_fixtures.py
+      expect: absent
+  - name: judge-anthropic-arm-and-prose-path-retired
+    binding: built here — the judge becomes claude-CLI-only and JUDGE_VERDICT_SCHEMA is the one verdict contract home (OQ-3, ruled by the lead)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: import anthropic
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/judge.py
+      expect: absent
+- label: ε2a
+  task_id: 9699
+  title: Recon LLM calls declare a role and receive a validated route
+  note: 'Carries fk-dac0a2a67201. Complete fused-memory role table; five non-recon rows derived until ε2b; per-row reload tiers. Deps: δ, ε1, 9188, S12 β1.'
+  capabilities:
+  - name: tier-selection-substrate
+    binding: '`grep:fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._select_tier` substrate — the tier choice ε2a routes'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def _select_tier\(
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/harness.py
+      expect: present
+  - name: shared-resolver
+    binding: producer:δ upstream — shared.route_resolver.resolve_route, RouteInputs.for_role and shared.route_policy.validate_role_models
+    verdict: PASS
+  - name: recon-budget-hardcode-gone
+    binding: built here — cli_stage_runner's max_budget_usd=5.0 becomes the stage role's budget_usd
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: max_budget_usd=5\.0
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py
+      expect: absent
+  - name: recon-model-fields-gone
+    binding: built here — sonnet_model, opus_model, agent_llm_model, judge_llm_model become legacy spellings of roles rows
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    (sonnet_model|opus_model|agent_llm_model|judge_llm_model): str'
+      paths:
+      - fused-memory/src/fused_memory/config/schema.py
+      expect: absent
+  - name: fm-allowlist-validation
+    binding: built here — FusedMemoryConfig validates its role table against model_routing at load and reload
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: validate_role_models\(
+      paths:
+      - fused-memory/src/fused_memory/config/schema.py
+      expect: present
+- label: ε2b
+  task_id: 9700
+  title: Curator, adjudicators, write-triage judge and the memory LLM take their route from the role table
+  note: 'Closes fk-dac0a2a67201. Deps: ε2a, 9204, 9203, S19 δ. Write-triage inheritance retired (OQ-8, ruled by the lead). Also moves the new replay_overreach_extraction script''s config.llm readers, and rewrites config-docker.yaml''s llm.provider/llm.model.'
+  capabilities:
+  - name: write-triage-inheritance-substrate
+    binding: '`grep:fused-memory/src/fused_memory/server/write_triage_judge.py::resolve_judge_model` substrate at authoring (deleted by ε2b) — the inheritance rule OQ-8 retires'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def resolve_judge_model\(
+      paths:
+      - fused-memory/src/fused_memory/server/write_triage_judge.py
+      expect: present
+  - name: write-triage-inheritance-resolvers-gone
+    binding: built here — resolve_judge_provider/resolve_judge_model are replaced by roles.write_triage_judge (OQ-8, ruled by the lead)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def resolve_judge_(provider|model)\(
+      paths:
+      - fused-memory/src/fused_memory/server/write_triage_judge.py
+      expect: absent
+  - name: adjudicator-model-field-gone
+    binding: built here — LinkHealConfig.adjudicator_model becomes a legacy spelling of roles.link_adjudicator.model
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'adjudicator_model: str'
+      paths:
+      - fused-memory/src/fused_memory/config/schema.py
+      expect: absent
+  - name: curator-routes-per-call
+    binding: built here — the curator resolves its route per call through shared.route_resolver
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: resolve_route\(
+      paths:
+      - fused-memory/src/fused_memory/middleware/task_curator.py
+      expect: present
+- label: η
+  task_id: 9701
+  title: Service-path knobs leave ReconciliationConfig; fused-memory consumers trust the validated schema
+  note: 'Closes fk-c520d5374ba5 and fk-a3dfde6f0664. Deps: ε2b, 9174, 9245, 9247, 9282. Rewrites the one docs/task-authoring.md mention of a moved knob.'
+  capabilities:
+  - name: storm-threshold-bounds-substrate
+    binding: '`grep:fused-memory/src/fused_memory/config/schema.py::Mem0UpdateConfig` substrate — storm_threshold is already Field(default=20, gt=0) (multi-line), so the schema is the invariant home'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    storm_threshold: int = Field\($'
+      paths:
+      - fused-memory/src/fused_memory/config/schema.py
+      expect: present
+  - name: reconciliation-attr-copies-gone
+    binding: built here — `grep:fused-memory/src/fused_memory/server/near_duplicate_guard.py::_reconciliation_attr` and its two copies go
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def _reconciliation_attr\(
+      paths:
+      - fused-memory/src/fused_memory/
+      expect: absent
+  - name: restated-anchor-default-gone
+    binding: built here — `grep:fused-memory/src/fused_memory/services/topic_anchor.py::_DEFAULT_TOPIC_ANCHOR_ENABLED` goes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _DEFAULT_TOPIC_ANCHOR_ENABLED
+      paths:
+      - fused-memory/src/fused_memory/services/topic_anchor.py
+      expect: absent
+  - name: seed-data-out-of-schema
+    binding: built here — `grep:fused-memory/src/fused_memory/config/schema.py::_default_topic_guard_clusters` moves to its own module
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def _default_topic_guard_clusters\(
+      paths:
+      - fused-memory/src/fused_memory/config/schema.py
+      expect: absent
+- label: ζ1
+  task_id: 9702
+  title: 'Harness supervision knobs become submodels: service restart keyed by service, fleet redeploy, watcher, digest, escalation revalidation, info-L0 router'
+  note: 'Carries fk-dae2a050b5d3. Deps: δ, 9173, 9251, 9272, S24 γ, S24 ζ. Carries S24 ζ''s restart-only fused_memory_restart_min_interval_secs into service_restart[fused_memory].'
+  capabilities:
+  - name: restart-flat-fields-gone
+    binding: built here — the 18 restart flat fields S24 γ leaves become service_restart[<service>] / fleet_redeploy (the submodel names absorb the whole prefix)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    (fused_memory|dashboard|orchestrator)_restart_[a-z_]+: '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: absent
+  - name: watcher-flat-fields-gone
+    binding: built here — the remaining watcher_* flat fields become the watcher submodel
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    watcher_[a-z_]+: '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: absent
+  - name: digest-flat-fields-gone
+    binding: built here — digest_* become the digest submodel
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    digest_[a-z_]+: '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: absent
+  - name: service-restart-declared
+    binding: built here — OrchestratorConfig.service_restart keyed by RestartedService
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    service_restart: '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+- label: ζ2
+  task_id: 9703
+  title: Recovery sweeps become one submodel per sweep
+  note: 'Carries fk-dae2a050b5d3. Deps: ζ1, 9160, S17 ζ (OQ-11, ruled by the lead). Picks up task 4082''s re-pend loop cap at the filing re-scan.'
+  capabilities:
+  - name: sweep-flat-fields-gone
+    binding: built here — the orphan-L0, stranded, main-tip, terminal-status, no-landings and warm-lane-GC flat fields become recovery_sweeps.<sweep> (the nested names absorb the prefix)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    (orphan_l0|stranded|main_tip_sweep|terminal_status|no_landings_breaker|warm_lane_gc)_[a-z_]+: '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: absent
+  - name: recovery-sweeps-declared
+    binding: built here — OrchestratorConfig.recovery_sweeps
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    recovery_sweeps: '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+- label: ζ3
+  task_id: 9704
+  title: The scheduler submodel, and the two double-duty knobs get their own fields
+  note: 'Closes fk-da71e5bb1679; carries fk-dae2a050b5d3. Decides the tier of task 4602''s scalars. Deps: ζ2, 9234, S17 κ1 (OQ-11, ruled by the lead); also rewrites S17''s new scheduler modules.'
+  capabilities:
+  - name: double-duty-reads-substrate
+    binding: '`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_backfill_terminal_dep_records` substrate — the second reader ζ3 repoints'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: async def _phase_backfill_terminal_dep_records\(
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+  - name: local-backfill-threshold-field
+    binding: built here — scheduler.max_local_backfill_unresolved_cycles (declared in config.py or config_sections/ (OQ-9, ruled by the lead))
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: max_local_backfill_unresolved_cycles
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      - orchestrator/src/orchestrator/config_sections/
+      expect: present
+  - name: record-fetch-budget-field
+    binding: built here — delivered_checks.max_record_fetches_per_tick
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: max_record_fetches_per_tick
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: deferral-comment-gone
+    binding: built here — the scheduler comment deferring the dedicated field goes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: deferred \(config\.py is out of scope\)
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: absent
+  - name: scheduler-readers-on-submodel
+    binding: built here — no production reader names a moved scheduler knob at the config root (attribute or getattr string); config.scheduler.<field> cannot match
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: (config\.|getattr\([^)]*['"])(age_alpha|cpm_beta|backfill_[a-z_]+|claimant_dispatch_gate_enabled|claimant_liveness_ttl_secs|dispatch_cooldown_secs|park_stop_[a-z_]+|pin_[a-z_]+|requeue_[a-z_]+|transient_requeue_[a-z_]+|snapshot_min_write_interval_secs|max_external_dep_unresolved_cycles)
+      paths: &id001
+      - orchestrator/src/orchestrator/
+      - shared/src/shared/
+      expect: absent
+  - name: scheduler-submodel-declared
+    binding: built here — OrchestratorConfig.scheduler
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    scheduler: '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+- label: ζ4a
+  task_id: 9705
+  title: Verify admission, clock-stop and cgroup knobs become submodels
+  note: 'Carries fk-dae2a050b5d3. Deps: ζ3.'
+  capabilities:
+  - name: verify-admission-flat-fields-gone
+    binding: built here — verify_admission_*, verify_clock_stop_*, verify_cgroup_cpu_weight_* and verify_use_cgroup_scope become submodels (the submodel names absorb the prefix)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    verify_(admission_[a-z_]+|clock_stop_[a-z_]+|cgroup_cpu_weight_[a-z_]+|use_cgroup_scope): '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: absent
+  - name: verify-admission-declared
+    binding: built here — OrchestratorConfig.verify_admission
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    verify_admission: '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+- label: ζ6a
+  task_id: 9706
+  title: Workflow iteration caps and review cadence become the workflow submodel
+  note: 'Carries fk-dae2a050b5d3. Deps: ζ4a, 9153, S20 β. Declares shared/cli_result.py (S20 β creates it); no longer declares shared/cli_invoke.py (S20''s ask).'
+  capabilities:
+  - name: workflow-cap-readers-on-submodel
+    binding: built here — no production reader names a moved iteration cap at the config root; config.workflow.<field> cannot match; shared/ is scoped to cli_result.py, where S20 β moves the one docstring that names a cap (ζ6a no longer declares cli_invoke.py)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: (config\.|getattr\([^)]*['"])(max_execute_iterations|max_progress_resume_iterations|max_verify_attempts|max_opaque_timeout_attempts|max_review_cycles|max_reviewer_retries|max_amendment_rounds|max_consecutive_[a-z_]+|max_failure_signature_repeat|max_pre_merge_retries|max_merge_retries|judge_after_each_iteration|reviewer_stagger_secs|suppress_resettled_review_suggestions)
+      paths:
+      - orchestrator/src/orchestrator/
+      - shared/src/shared/cli_result.py
+      expect: absent
+  - name: workflow-submodel-declared
+    binding: built here — OrchestratorConfig.workflow
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    workflow: '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+- label: ζ6b
+  task_id: 9707
+  title: Steward knobs become the steward submodel; rebase, revalidation and cleanup knobs join the workflow submodel
+  note: 'Carries fk-dae2a050b5d3. Deps: ζ6a, 9284.'
+  capabilities:
+  - name: steward-and-workflow-knob-readers-on-submodel
+    binding: built here — no production reader names a moved steward/rebase/revalidation knob at the config root
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: (config\.|getattr\([^)]*['"])(steward_[a-z_]+|suggestion_triage_threshold|inter_iteration_rebase|rebase_before_verify|rebase_reseed_distance_threshold|pre_merge_reverify|revalidation_skip_enabled|max_revalidation_age_hours|terminal_cleanup_cancel_grace_secs|claimant_heartbeat_interval_secs|workflow_exit_contract_enforce|worktree_identity_guard_enabled)
+      paths: *id001
+      expect: absent
+  - name: steward-submodel-declared
+    binding: built here — OrchestratorConfig.steward (non-role steward knobs)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    steward: (Annotated\[)?StewardConfig'
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+- label: ζ4b
+  task_id: 9708
+  title: Verify timeouts, retries, cold commands and concurrency become the verify submodel; per-module overrides map onto it
+  note: 'Carries fk-dae2a050b5d3. Declares merge_lane/worker.py: parked behind 8528 (R55). Deps: ζ6b, 8528, 9188, 9166, 9135.'
+  capabilities:
+  - name: verify-timeout-readers-on-submodel
+    binding: built here — no production reader names a moved verify timeout/retry/cold-command knob on the root config (ModuleConfig keeps its flat override names, so module_config.<name> is excluded)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: (^|[^_a-zA-Z0-9])(config|cfg)\.(verify_command_timeout_secs|verify_cold_command_timeout_secs|verify_timeout_retries|verify_cold_preprovision_command|verify_infra_retry_[a-z_]+|verify_drift_check_every_n_lands|concurrent_verify|sequential_lint_first|max_concurrent_module_verifies)|getattr\((|[^,)]*[^_a-zA-Z0-9])(config|cfg), *['"](verify_command_timeout_secs|verify_cold_command_timeout_secs|verify_timeout_retries|verify_cold_preprovision_command|verify_infra_retry_[a-z_]+|verify_drift_check_every_n_lands|concurrent_verify|sequential_lint_first|max_concurrent_module_verifies)
+      paths: *id001
+      expect: absent
+  - name: module-override-targets-declared
+    binding: built here — orchestrator/src/orchestrator/config.py::MODULE_OVERRIDE_TARGETS maps each flat module key to its root path (D5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^MODULE_OVERRIDE_TARGETS
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: spec-overrides-take-dotted-paths
+    binding: built here — orchestrator/src/orchestrator/verify_spec_shared.py::apply_config_overrides, the dotted-path override helper S4 η's apply_merge_verify_spec calls (task 9135 deletes apply_spec_to_host_config); polarity re-measured at ζ4b's filing, after 9135 has landed
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def apply_config_overrides\(
+      paths:
+      - orchestrator/src/orchestrator/verify_spec_shared.py
+      expect: present
+  - name: verify-submodel-declared
+    binding: built here — OrchestratorConfig.verify
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    verify: '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+- label: ζ5a
+  task_id: 9709
+  title: Merge-lane knobs become the merge_lane submodel
+  note: 'Carries fk-dae2a050b5d3. Declares merge_lane/worker.py: parked behind 8528 (R55). Deps: ζ4b, 8528.'
+  capabilities:
+  - name: merge-lane-readers-on-submodel
+    binding: built here — no production reader names a moved merge-lane knob at the config root (attribute or getattr string, gates.py's merge_verify_breadth included)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: (config\.|getattr\([^)]*['"])(merge_train_[a-z_]+|merge_verify_[a-z_]+|merge_gate_history_[a-z_]+|merge_heartbeat_interval_secs|merge_disjoint_skip_requires_verified_drift|escalate_preexisting_main_break|max_advance_attempts)
+      paths: *id001
+      expect: absent
+  - name: merge-lane-submodel-declared
+    binding: built here — OrchestratorConfig.merge_lane
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    merge_lane: '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+- label: ζ5b
+  task_id: 9710
+  title: Verify-host knobs become the verify_hosts submodel
+  note: 'Closes fk-dae2a050b5d3 (last ζ). Declares merge_lane/worker.py: parked behind 8528 (R55). Deps: ζ5a, 8528.'
+  capabilities:
+  - name: verify-host-readers-on-submodel
+    binding: built here — no production reader names a moved verify-host knob at the config root
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: (config\.|getattr\([^)]*['"])(verify_host_[a-z_]+|verify_task_[a-z_]+|verify_cross_check_remote_green)
+      paths: *id001
+      expect: absent
+  - name: verify-hosts-submodel-declared
+    binding: built here — OrchestratorConfig.verify_hosts
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^    verify_hosts: '
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+- label: κ
+  task_id: 9711
+  title: Dark-factory's operator yaml, its dashboard module yaml and its operator docs use the new setting names
+  note: 'Carries fk-dae2a050b5d3. Filed after the clerk amends the yaml-anchored checks (PRD §Delivered checks on moved paths). Deps: ζ5b. 36 old names in dark-factory-orchestrator.yaml, 6 in dashboard/orchestrator.yaml, 94 prose lines in 10 files (measured at ce6673c7e1).'
+  capabilities:
+  - name: repo-yaml-knob-major-blocks-gone
+    binding: built here — dark-factory-orchestrator.yaml's models/budgets/max_turns/effort/timeouts blocks become roles
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^(models|budgets|max_turns|effort|timeouts):'
+      paths:
+      - dark-factory-orchestrator.yaml
+      expect: absent
+  - name: repo-yaml-flat-watcher-gone
+    binding: built here — the flat watcher_* keys move under watcher / roles.watcher
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^watcher_[a-z_]+:'
+      paths:
+      - dark-factory-orchestrator.yaml
+      expect: absent
+  - name: dashboard-module-yaml-root-keys-moved
+    binding: built here — dashboard/orchestrator.yaml's project-level role blocks move to roles (D5); its module-override keys stay flat
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^(models|budgets|max_turns):'
+      paths:
+      - dashboard/orchestrator.yaml
+      expect: absent
+  - name: operator-prose-names-new-paths
+    binding: built here — the instruction-bearing operator prose stops naming moved orchestrator settings (94 lines in 10 files at ce6673c7e1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \b(merge_verify_breadth|verify_admission_task_slots|max_review_cycles)\b
+      paths:
+      - OPERATIONS.md
+      - ARCHITECTURE.md
+      - SETUP.md
+      - CLAUDE.md
+      - skills/orchestrate/SKILL.md
+      - skills/orchestrate/references/project-setup.md
+      - skills/escalation-watcher-auto/SKILL.md
+      - docs/plan-scoring-and-judge.md
+      - docs/task-escalation-state-spec.md
+      - docs/config-retune-gate.md
+      expect: absent
+- label: χ
+  task_id: 9712
+  title: The escalation watcher spawns the session of a gate Leo pre-authorised, in attended and AFK posture alike
+  note: 'Fold-verify 2026-11-13: σ''s milestone_gate is otherwise always asked and never spawned while Leo is away (skill §Always ask; AFK shift 2). Third milestone-gate exception keyed on metadata.x_preauthorised_spawn; the watcher never resolves the gate. complexity=simple. No finding key. Deps: none (S2 μ''s stated R54 exception for this skill file). S2 ν carries the same key and depends on χ (lead ruling: the mechanism stays in S16; χ has no prerequisite inside S16).'
+  capabilities:
+  - name: watcher-honours-preauthorised-gate
+    binding: built here — skills/escalation-watcher/SKILL.md §"Always ask — keyed on record content" gains the x_preauthorised_spawn exception, and AFK shift 2 names it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: x_preauthorised_spawn
+      paths:
+      - skills/escalation-watcher/SKILL.md
+      expect: present
+- label: σ
+  task_id: 9718
+  title: 'Operator gate: a pre-authorised /team session rewrites the nine project yamls and the two leo-laptop host yamls to the new setting names'
+  note: 'Ruling OQ-2 = B (Leo, 2026-11-12; R-5 = B 2026-11-13). Cross-stream operator-sweep shape: task_kind=deterministic, always_escalates=true, no before_done; metadata.milestone delayed 259200 s (lead ruling); metadata.x_preauthorised_spawn, which the watcher rule χ keys on; born-at-L2; description carries the /team brief and Leo''s pre-authorisation (the spawn may run while he is away); the spawned session resumes the gate. No finding key; no files in this repo. Deps: ζ5b, κ, χ, 6754.'
+  capabilities:
+  - name: sweep-session-pre-authorised
+    binding: gate shape — the description quotes Leo's pre-authorisation of 2026-11-12 and states the spawn may run while he is away
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a reviewer confirms the filed gate is task_kind=deterministic, always_escalates=true, has no before_done, carries metadata.milestone {mode delayed, after_secs 259200} and metadata.x_preauthorised_spawn {ruled_by human, ruled_on 2026-11-12, ruling_ref, prompt_from description}, and its description quotes the pre-authorisation and the AFK statement
+  - name: deploy-check-before-any-edit
+    binding: one-decision-partition-per-area (INV-23) — step 1 (every running unit runs ζ5b's code) is decided by code before any file is edited
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the session's report shows the --report shas and the merge-base results before the first edit
+  - name: operated-yamls-carry-new-names
+    binding: the session's report records one yaml-only commit sha or skip reason per repository and check-config per file
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the nine project yamls are in other repositories and the two host yamls on leo-laptop; not a property of this tree
+- label: ξ
+  task_id: 9719
+  title: Old setting names are refused at load and at hot reload in both services, with an error naming the new path; the translation path is deleted
+  note: 'Ruling OQ-2 = B, R-5 = B: replaces the dated pivot-removal follow-up. Carries fk-dae2a050b5d3. Not extra=forbid. Deps: σ, η.'
+  capabilities:
+  - name: refusal-type-in-shared
+    binding: built here — shared/src/shared/config_fields.py::LegacySpellingRefused (C3 end state)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class LegacySpellingRefused
+      paths:
+      - shared/src/shared/config_fields.py
+      expect: present
+  - name: refusal-function-in-shared
+    binding: built here — shared/src/shared/config_fields.py::refuse_legacy_spellings replaces the pivot (C3)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def refuse_legacy_spellings\(
+      paths:
+      - shared/src/shared/config_fields.py
+      expect: present
+  - name: orchestrator-refuses-old-names
+    binding: built here — OrchestratorConfig's root validator calls refuse_legacy_spellings
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: refuse_legacy_spellings
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: fused-memory-refuses-old-names
+    binding: built here — FusedMemoryConfig's root validator calls refuse_legacy_spellings
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: refuse_legacy_spellings
+      paths:
+      - fused-memory/src/fused_memory/config/schema.py
+      expect: present
+  - name: golden-fixture-asserts-refusal
+    binding: built here — the row-18 golden test asserts the old-spelled copies are refused (rows 21-23)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: LegacySpellingRefused
+      paths:
+      - orchestrator/tests/test_config_shape_golden.py
+      expect: present
+  - name: operated-yamls-integration-check
+    binding: the refusing check-config over the nine project yamls and both laptop files, recorded in the commit message
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the files are in other repositories and on leo-laptop; the commit message records each result
+- label: π
+  task_id: 9720
+  title: 'The scoped-cap model has one spelling: one shared Fable id, one alias decoder, and scope_for matches through it'
+  note: 'Lead decision on the task-8253 investigation''s side finding (D15, C9). No finding key. Absorbs task 5407 (cancel). Deps: κ, S20 ι (which follows S20 ε, the creator of shared/account_state.py); S20 ν also edits that file and the lead orders it against π.'
+  capabilities:
+  - name: scope-for-substrate
+    binding: '`grep:shared/src/shared/usage_gate.py::scope_for` substrate — the exact-match scope derivation π widens (S20 ε moves it to shared/account_state.py first)'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def scope_for\(
+      paths:
+      - shared/src/shared/usage_gate.py
+      - shared/src/shared/account_state.py
+      expect: present
+  - name: fable-model-one-home
+    binding: built here — shared/src/shared/model_names.py::FABLE_MODEL (C9)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^FABLE_MODEL
+      paths:
+      - shared/src/shared/model_names.py
+      expect: present
+  - name: alias-decoder
+    binding: built here — shared/src/shared/model_names.py::canonical_model, the one alias decoder (C9)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def canonical_model\(
+      paths:
+      - shared/src/shared/model_names.py
+      expect: present
+  - name: scope-default-names-the-constant
+    binding: built here — UsageCapConfig.scoped_cap_models defaults to [FABLE_MODEL]
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \[FABLE_MODEL\]
+      paths:
+      - shared/src/shared/config_models.py
+      expect: present
+  - name: stale-fable-literal-gone
+    binding: built here — the ['claude-fable-5'] default literal goes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \['claude-fable-5'\]
+      paths:
+      - shared/src/shared/config_models.py
+      expect: absent
+  - name: repo-yaml-scope-override-gone
+    binding: built here — dark-factory's scoped_cap_models override (it would restate the default) goes
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'scoped_cap_models: \[claude-fable-5, claude-fable-5-1\]'
+      paths:
+      - dark-factory-orchestrator.yaml
+      expect: absent
+  - name: admitted-literal-named-once
+    binding: built here — orchestrator/routing.py stops restating the admitted Fable id
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^FABLE_CANDIDATE_MODEL: str = ''claude-fable-5-1'''
+      paths:
+      - orchestrator/src/orchestrator/routing.py
+      expect: absent
+- label: ω
+  task_id: 9721
+  title: 'Integration gate: both services load, reload, refuse old names and route through the shared config contracts'
+  note: 'Signal leaf. Runs boundary rows 1-24 end to end, the translation-era rows in their refusal form. Deps: ξ, ι.'
+  capabilities:
+  - name: orchestrator-integration-gate
+    binding: built here — orchestrator/tests/test_config_shape_integration_gate.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/tests/test_config_shape_integration_gate.py
+      expect: present
+  - name: fused-memory-integration-gate
+    binding: built here — fused-memory/tests/test_routing_integration_gate.py
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - fused-memory/tests/test_routing_integration_gate.py
+      expect: present
+  - name: live-fleet-loads-and-reloads
+    binding: INV-13 producer proof — after deploy, both running services' reload_config with unchanged yamls applies nothing, and check-config across the known roots and the two remote-verify host yamls lists no old name, unknown key or conflict
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: live-fleet read after deploy, not a tree property

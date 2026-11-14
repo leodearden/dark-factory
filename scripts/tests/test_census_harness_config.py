@@ -14,9 +14,20 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
 from legibility import census as mod
-from legibility import census_trigger, filing_policy, session_runner
+from legibility import (
+    census_run,
+    census_trigger,
+    disposition,
+    filing_policy,
+    landing_gate,
+    session_runner,
+)
 from legibility import config as config_mod
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 def _write_legibility_yaml(config_path, *, project_id="target_project", project_root=None):
@@ -43,9 +54,15 @@ def _make_fake_main_run_census():
 
     def fake_run_census(**kwargs):
         calls.append(kwargs)
-        return mod.CensusOutcome(
-            status="done", report_path="plans/confusion-census-2026-09-27.md",
-            filed_ticket_ids=[], stop_reason="exhausted",
+        return census_run.Done(
+            report_path="plans/confusion-census-2026-09-27.md",
+            record_path="plans/confusion-census-2026-09-27.json",
+            run_id="census-dark_factory-20260927",
+            stop_reason="exhausted",
+            gate=landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
+            filing=disposition.FilingReport(
+                disposition.Disposal((), ()), disposition.Resolutions(), disposition.Backfill(),
+            ),
         )
 
     fake_run_census.calls = calls
@@ -102,7 +119,7 @@ def _setup_main(tmp_path, monkeypatch):
     # Every test here passes --force, which must never reach the gate.
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
     fake_run_census = _make_fake_main_run_census()
-    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_run, "run_census", fake_run_census)
     return target, fake_run_census
 
 
@@ -137,7 +154,7 @@ def test_main_defaults_the_harness_to_the_census_checkouts_own_config(tmp_path, 
 
 def test_main_fails_loud_on_an_unloadable_harness_config(tmp_path, monkeypatch, capsys):
     target, _ = _setup_main(tmp_path, monkeypatch)
-    monkeypatch.setattr(mod, "run_census", _poison("run_census"))
+    monkeypatch.setattr(census_run, "run_census", _poison("run_census"))
     monkeypatch.setattr(
         session_runner, "open_pooled_runner", _poison("session_runner.open_pooled_runner"),
     )

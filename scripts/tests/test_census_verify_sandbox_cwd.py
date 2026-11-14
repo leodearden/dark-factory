@@ -7,7 +7,7 @@ Regression origin: fleet session census-reify-3386101, 2026-08-03
 /home/leo/src/dark-factory cwd. `claude -p` sandboxes its tool access to
 the cwd tree, so every verifier Read/Bash against /home/leo/src/reify was
 permission-denied — and non-interactively there is no prompt to approve.
-Because `_build_default_verify_fn` fails CLOSED per cluster (census.py, "an
+Because `census_verify.build_verify_fn` fails CLOSED per cluster ("an
 unverifiable claim rejects, never crashes"), that surfaced not as a crash
 but as a SILENT mass rejection of every single cluster. The fail-closed
 default is right; what made it dishonest was the subprocess being rooted in
@@ -29,11 +29,20 @@ from pathlib import Path
 
 import census as mod
 import pytest
-from legibility import account_pool, census_trigger, session_runner
+from legibility import (
+    account_pool,
+    census_run,
+    census_trigger,
+    disposition,
+    landing_gate,
+    session_runner,
+    synthesis,
+)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import config as config_mod
 
-pytestmark = pytest.mark.timeout(120)
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _VERDICT = '{"verified": true, "reason": "observed"}'
 _REAL_OPEN_POOLED_RUNNER = session_runner.open_pooled_runner
@@ -71,6 +80,12 @@ def _flag_values(argv, flag):
     return values
 
 
+_EMPTY_BRIEF = synthesis.Brief.of(
+    run_id="census-dark_factory-20260803", before={"version": 2, "entries": []},
+    after={"version": 2, "entries": []}, verdicts=[], adopted={}, run_sessions=(), counts={},
+)
+
+
 def _make_seam_driving_run_census():
     """Fake `run_census(**kwargs) -> CensusOutcome` that drives each stage
     seam main() built exactly once — mining, verify, synthesis, in that order
@@ -79,12 +94,18 @@ def _make_seam_driving_run_census():
 
     def fake_run_census(**kwargs):
         calls.append(kwargs)
-        kwargs["invoke"]("ping", "haiku")
-        kwargs["verify_fn"]([{"title": "x"}], model="sonnet")
-        kwargs["synthesize_fn"]([{"title": "x"}], model="fable")
-        return mod.CensusOutcome(
-            status="done", report_path="plans/confusion-census-2026-08-03.md",
-            filed_ticket_ids=[], stop_reason="exhausted",
+        kwargs["effects"].invoke("ping", "haiku")
+        kwargs["effects"].verify_fn([{"title": "x"}], model="sonnet")
+        kwargs["effects"].synthesize_fn(_EMPTY_BRIEF, model="fable")
+        return census_run.Done(
+            report_path="plans/confusion-census-2026-08-03.md",
+            record_path="plans/confusion-census-2026-08-03.json",
+            run_id="census-dark_factory-20260803",
+            stop_reason="exhausted",
+            gate=landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
+            filing=disposition.FilingReport(
+                disposition.Disposal((), ()), disposition.Resolutions(), disposition.Backfill(),
+            ),
         )
 
     fake_run_census.calls = calls
@@ -133,7 +154,7 @@ def census_main(tmp_path, monkeypatch, fake_claude_cli, pool_roster, sentinel_lo
             label, accounts_file=accounts_file, env_file=env_file,
         ),
     )
-    monkeypatch.setattr(mod, "run_census", _make_seam_driving_run_census())
+    monkeypatch.setattr(census_run, "run_census", _make_seam_driving_run_census())
     # Every test here passes --force, which must never reach the gate.
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
@@ -220,7 +241,7 @@ def test_build_stage_invokes_runs_each_stage_in_the_project_under_the_runners_co
 
     gate = account_pool.build_pool(accounts_file=accounts_file, env_file=env_file)
     with session_runner.SessionRunner(gate, label="census-test") as runner:
-        mining, verify, synth = mod._build_stage_invokes(
+        mining, verify, synth = mod.build_stage_invokes(
             cfg, project_root=tmp_path, runner=runner,
         )
         mining("p", "haiku")

@@ -1,0 +1,30 @@
+{
+  "task_id": "4845",
+  "reason": "esc-4845-4 review fix: quarantine parks task/<bare> unless ANOTHER registered worktree holds it (detached/foreign registered worktrees no longer strand it), park_prior_incarnation reads the parked branch from the outcome, the move/branch rollback checks and logs its rc, and outcome enrichment can no longer report a moved lane as unmoved",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1528,
+      "current": 1538
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_parked_outcome",
+      "baseline": 1,
+      "current": 2
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_relocate_into_quarantine",
+      "baseline": 3,
+      "current": 5
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5218,
+      "current": 5228
+    }
+  ]
+}

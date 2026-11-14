@@ -26,6 +26,7 @@ suppress_resettled_review_suggestions: true
 # Merge conflict reduction
 max_advance_attempts: 3
 max_pre_merge_retries: 2
+pre_merge_reverify: false
 max_merge_retries: 3
 inter_iteration_rebase: true
 # Rebase onto main before each verify retry (Fix 3 — closes the verify-only
@@ -162,12 +163,15 @@ prices:
   gpt-6-astra:
     input_per_1m: 10.00
     output_per_1m: 50.00
-  gpt-5.6-sol:
-    input_per_1m: 4.00
-    output_per_1m: 20.00
-  gpt-5.6-terra:
+    cached_input_per_1m: 1.00
+  gpt-6.1-sol:
     input_per_1m: 2.00
-    output_per_1m: 12.00
+    output_per_1m: 10.00
+    cached_input_per_1m: 0.10
+  gpt-6.1-terra:
+    input_per_1m: 1.00
+    output_per_1m: 5.00
+    cached_input_per_1m: 0.05
   o4-mini:
     input_per_1m: 1.10
     output_per_1m: 4.40
@@ -390,7 +394,8 @@ budgets:
 
 # Turn limits per invocation
 max_turns:
-  architect: 100
+  # Leo 2026-11-04: matches the df/reify value; seat U's 17 mechanical no-plan failures were the 100-turn cap.
+  architect: 180
   implementer: 80
   debugger: 50
   # 30 -> 60 (2026-08-17, task-3543 /unblock investigation; see task 3321).
@@ -402,7 +407,9 @@ max_turns:
   # operation, which makes it a throttle rather than a runaway guard. 60 leaves
   # ~40% headroom over the observed max. NB the observed maxima are CENSORED by
   # the cap itself, so true demand may run higher.
-  reviewer: 60
+  # 60 -> 90 with effort xhigh (Leo 2026-10-31, task 7972): opus high's p99 is 28 turns in
+  # production and xhigh runs about 2.25x longer, so xhigh's p99 is about 63. Gate 7973 re-measures.
+  reviewer: 90
   merger: 50
   steward: 100
   triage: 25
@@ -417,12 +424,15 @@ max_turns:
 # Reasoning effort per role
 effort:
   # architect: EVAL-GOVERNED -- see the models.architect comment above and
-  # plans/architect-effort-adoption-decision-2026-07-28.md (task iota; MARGINAL
-  # verdict 2026-07-27, held at max rather than flipped to high).
-  architect: "max"
+  # plans/architect-effort-adoption-decision-2026-07-28.md (task iota; its
+  # 2026-07-27 run compared opus-max vs opus-high only, MARGINAL, held at max).
+  # Leo 2026-11-03: xhigh, as max is no longer a good choice since Opus 5.5
+  # (reviewer moved to xhigh 2026-10-31, task 7972).
+  architect: "xhigh"
   implementer: "max"
   debugger: "max"
-  reviewer: "high"
+  # Leo 2026-10-31 (task 7972); evidence and revert: gate task 7973.
+  reviewer: "xhigh"
   merger: "max"
   steward: "high"
   triage: "medium"
@@ -452,6 +462,8 @@ review:
   full_review_on_complete: true
   briefing_path: "review/briefing.yaml"
   reports_dir: "data/review-checkpoints"
+  # d2 fleet-wide: Leo 2026-10-31 (task 7972), first adopted for dark_factory by commit 6bd91df23d.
+  reviewer_briefing: "d2"
 
 # Scheduler fairness — anti-starvation for broad-footprint tasks.
 #
@@ -519,6 +531,29 @@ config_key_census:
 #     regardless of skip_count (see idle_only_secs below).
 # Auto-resolves when the task finally dispatches.  Set enabled: false to silence.
 #
+# PREDICATE RETUNE (task 3821, esc-4851-3): age alone NEVER fires.  The
+# idle-only backstop below fired on age alone, so in a deep backlog every
+# low/medium task crossed 72h and the watchdog filed hundreds of alarms with
+# skip_count=0.  Every gate now needs the eligibility-age floor AND a stuck
+# signal seen while the task was a dispatch candidate:
+#   - dual         — skip_threshold top-skips AND age >= idle_secs.
+#   - lock_refused — skip_threshold scans in which the task was refused its
+#                    locks while a LOWER-ranked candidate dispatched, AND
+#                    age >= idle_only_secs.  Replaces the idle-only backstop;
+#                    idle_only_secs keeps its name as this gate's age floor.
+#   - park_blocked — the task's live park has a module held by another task
+#                    for park_blocked_age_secs.  Takes precedence; never pins.
+# The age is measured from a DURABLE anchor stamped at first dispatch
+# candidacy (data/orchestrator/scheduler_eligibility.db).  It survives
+# restarts and transient candidacy gaps, so a restart no longer stamps the
+# whole backlog into one cohort that fires 72h later.
+# Consequence: dual / lock_refused auto-pin the task when it has no overrides
+# row (source starvation_watchdog, ttl auto_pin_ttl_secs), at most
+# auto_pin_max_concurrent at once; firings beyond the cap share ONE level-1
+# escalation instead of one each.  park_blocked files a level-1 escalation
+# naming the blocking holder.  Every firing emits a starvation_detected event.
+# Watchdog escalations no longer feed the digest's EWA numerator.
+#
 # idle_secs default raised to 259200 (72h) — task 2631, owner decision (Leo
 # 2026-07-15): archive analysis of 209 prior firings found max starving
 # duration 5.8h and legitimate sibling-project lock waits of ~48h, so 72h
@@ -541,11 +576,16 @@ config_key_census:
 # violates the idle_only_secs >= idle_secs validator and FAILS config load AND
 # hot-reload (both knobs are green-tier reloadable).  This is loud-over-silent by
 # design — bump BOTH knobs together whenever you push idle_secs past 259200.
+# Task 3821 retains that validator: idle_only_secs is now the lock_refused
+# gate's age floor, and the coupling still holds.
 starvation_watchdog:
   enabled: true
   skip_threshold: 50
   idle_secs: 259200.0
   idle_only_secs: 259200.0
+  park_blocked_age_secs: 14400.0
+  auto_pin_max_concurrent: 3
+  auto_pin_ttl_secs: 86400.0
 
 # Warm-lane base hard-down watchdog (task 2061).
 #
@@ -576,7 +616,6 @@ sandbox:
 
 # Escalation
 escalation:
-  queue_dir: "data/escalations"
   port: 8100
   host: "127.0.0.1"
 
@@ -644,6 +683,10 @@ git:
 # cap-staging plan: plans/deep-merge-ahead-prd.md.
 merge_deep:
   chain_cap: 0
+  # Chain-build deadline (s); above reify's measured whole-process build p99 (~1230 s).
+  chain_build_timeout_secs: 1800
+  # How long a built chain's links stay reserved for its tip verify (s).
+  chain_reservation_timeout_secs: 7200
 
 # Chronic pool-infra flake auto-file detector (task 2358). Gated OFF until
 # reify task 5142's flaky-ledger.jsonl + CHRONIC-FLAKY marker substrate is
@@ -980,3 +1023,21 @@ verify_host_unreachable_escalate_after_n: 3
 verify_host_unreachable_escalate_after_secs: 600.0
 verify_host_policy: prefer_local
 verify_host_reprobe_interval_s: 120.0
+
+# Remote task-leg verifies (task 6670; plans/remote-task-leg-verify-prd.md
+# §5.7).  All four are green-tier: the dispatcher reads them per dispatch.
+#
+# verify_task_host_policy: local (default) runs every task verify locally and
+#   writes no dispatch sidecar.  remote_modules makes a verify eligible when its
+#   executed modules intersect verify_task_remote_modules (which must then be
+#   non-empty); remote_all makes every verify eligible.  Rollback is one reload
+#   back to local.
+# verify_task_remote_cross_check_every_n: every n-th verify that returns a
+#   remote verdict (green or red, counted per orchestrator process) is re-run
+#   locally, local authoritative (0 = off).
+# verify_task_remote_red_confirms_locally: a remote red is re-run locally and
+#   the local verdict returned.
+verify_task_host_policy: local
+verify_task_remote_modules: []
+verify_task_remote_cross_check_every_n: 0
+verify_task_remote_red_confirms_locally: false

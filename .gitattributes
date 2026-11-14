@@ -1,0 +1,5 @@
+# The merge-lane ratchet baseline merges through a structured 3-way driver,
+# installed by `python3 scripts/merge_lane_ratchet_merge.py install`
+# (scripts/setup-host.sh step 9). Where it is not installed, git reports a
+# conflict, exactly as before the driver existed.
+orchestrator/tests/merge_lane_ratchet_baseline.json merge=ratchet-baseline

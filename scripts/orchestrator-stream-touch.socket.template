@@ -1,0 +1,18 @@
+# Installed as ~/.config/systemd/user/orchestrator-stream-touch.socket; committed as .socket.template
+# only because `.socket` is not in the shared lock-charter extension
+# allowlist (see scripts/fused-memory.socket.template).
+[Unit]
+Description=Stream Touch Orchestrator escalation MCP socket (held across restarts)
+
+# systemd owns the escalation MCP listening socket so it stays bound while
+# orchestrator-stream-touch.service restarts: clients connecting mid-restart
+# wait in the kernel backlog instead of being refused. The service's
+# ExecStopPost stops this socket on a deliberate stop, so a stopped or disabled
+# orchestrator is not restarted by the next connection.
+#
+# Must match escalation.port in /home/leo/src/stream-touch/dark-factory-orchestrator.yaml.
+[Socket]
+ListenStream=127.0.0.1:8110
+
+[Install]
+WantedBy=sockets.target

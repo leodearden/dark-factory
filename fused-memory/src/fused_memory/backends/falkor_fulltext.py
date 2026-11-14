@@ -48,6 +48,7 @@ rules stay unit-testable with a plain import and no client/LLM/embedder stack.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from graphiti_core.driver.falkordb_driver import STOPWORDS
 
@@ -70,6 +71,34 @@ def is_searchable_term(token: str) -> bool:
     against token classes we failed to enumerate.
     """
     return any(ch.isalnum() for ch in token)
+
+
+def searchable_terms(sanitized_text: str) -> list[str]:
+    """The terms of ALREADY-sanitized text that a RediSearch query may carry, in order.
+
+    Upstream's ``STOPWORDS`` (case-insensitive) and every token failing
+    :func:`is_searchable_term` are dropped.
+    """
+    # `is_searchable_term` is the repair, and it is NOT redundant with sanitize().
+    # sanitize() leaves `_` and backticks alone, but RediSearch's own tokenizer
+    # reduces a token like `_`, `__` or ``` `` ``` to NOTHING.  Emitted into the
+    # ' | '-joined operand list, such a token leaves the union operator with no
+    # right-hand operand, and the whole query fails to parse:
+    #     RediSearch: Syntax error at offset N near <the PRECEDING word>
+    # The message names the word BEFORE the fault, so it reads as a reserved-word
+    # collision and has twice sent an investigation down that path (dead-letter
+    # 9950, and an identical 2026-04-02 occurrence). Do not "simplify" this
+    # predicate away because the tokens look harmless in the source text.
+    return [
+        w
+        for w in sanitized_text.split()
+        if w.lower() not in STOPWORDS and is_searchable_term(w)
+    ]
+
+
+def is_identifier_term(term: str) -> bool:
+    """True when *term* carries a digit, as a task id, a sha or a label like ``C1`` does."""
+    return any(ch.isdigit() for ch in term)
 
 
 def escape_group_id(group_id: str) -> str:
@@ -147,21 +176,7 @@ def build_query(
     the short-circuit stays inside the contract callers already implement rather
     than introducing a new one.
     """
-    # `is_searchable_term` is the repair, and it is NOT redundant with sanitize().
-    # sanitize() leaves `_` and backticks alone, but RediSearch's own tokenizer
-    # reduces a token like `_`, `__` or ``` `` ``` to NOTHING.  Emitted into the
-    # ' | '-joined operand list, such a token leaves the union operator with no
-    # right-hand operand, and the whole query fails to parse:
-    #     RediSearch: Syntax error at offset N near <the PRECEDING word>
-    # The message names the word BEFORE the fault, so it reads as a reserved-word
-    # collision and has twice sent an investigation down that path (dead-letter
-    # 9950, and an identical 2026-04-02 occurrence). Do not "simplify" this
-    # predicate away because the tokens look harmless in the source text.
-    terms = [
-        w
-        for w in sanitized_text.split()
-        if w.lower() not in STOPWORDS and is_searchable_term(w)
-    ]
+    terms = searchable_terms(sanitized_text)
     # Second failure mode, independent of the first: when NOTHING survives
     # filtering, upstream still emits `(@group_id:"dark_factory") ()`, and the
     # empty operand group is itself unparseable. Short-circuit BEFORE the group
@@ -190,3 +205,43 @@ def build_query(
         return ''
 
     return group_filter + ' (' + joined + ')'
+
+
+@dataclass(frozen=True)
+class EdgeFulltextQueries:
+    """The edge BM25 leg's two RediSearch queries; ``''`` means "no query".
+
+    ``union`` OR-joins every searchable term and ranks the leg.  ``intersection``
+    AND-joins the identifier terms and selects the edges the leg promotes.
+    There is never an intersection without a union.
+    """
+
+    union: str
+    intersection: str
+
+    def __post_init__(self) -> None:
+        if self.intersection and not self.union:
+            raise ValueError(
+                f'identifier intersection {self.intersection!r} without a union query'
+            )
+
+
+def build_edge_queries(
+    sanitized_text: str,
+    group_ids: list[str] | None,
+    max_query_length: int,
+) -> EdgeFulltextQueries:
+    """Assemble the edge BM25 leg's queries from ALREADY-sanitized text.
+
+    The union is :func:`build_query`'s, group filter included.  The identifier
+    tier, every searchable term carrying a digit, is a precision signal: an edge
+    holding all of them is what the query names
+    (``plans/edge-bm25-leg-ranking-9542/README.md``).
+    """
+    union = build_query(sanitized_text, group_ids, max_query_length)
+    identifier_terms = [t for t in searchable_terms(sanitized_text) if is_identifier_term(t)]
+    if not union or not identifier_terms:
+        return EdgeFulltextQueries(union=union, intersection='')
+    return EdgeFulltextQueries(
+        union=union, intersection='(' + ' '.join(identifier_terms) + ')'
+    )

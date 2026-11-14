@@ -24,6 +24,7 @@ from escalation.models import Escalation
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.harness import Harness
+from orchestrator.pause_policy import PauseClass
 from orchestrator.run_store import RunStore
 
 SENTINEL = Harness._SCHEDULER_PAUSE_SENTINEL
@@ -74,7 +75,7 @@ class TestForceResumeScheduler:
     @pytest.mark.asyncio
     async def test_resume_when_paused_reports_and_clears(self, tmp_path: Path) -> None:
         harness, mock_run_store = _make_harness(tmp_path)
-        await harness.pause_scheduler('park-stop: test burst')
+        await harness.pause_scheduler('park-stop: test burst', PauseClass.PARK_STOP)
 
         result = await harness.force_resume_scheduler('collision burst cleared')
 
@@ -83,6 +84,7 @@ class TestForceResumeScheduler:
             'resumed': True,
             'was_paused': True,
             'prior_reason': 'park-stop: test burst',
+            'prior_pause_class': 'park_stop',
             'reason': 'collision burst cleared',
         }
         # Persisted pause cleared so a restart won't resurrect it.
@@ -99,6 +101,7 @@ class TestForceResumeScheduler:
         assert result['resumed'] is False
         assert result['was_paused'] is False
         assert result['prior_reason'] is None
+        assert result['prior_pause_class'] is None
         # Disk-heal: clear is called unconditionally so a divergent runs.db row
         # (memory says running, disk says paused) cannot re-pause on restart.
         mock_run_store.clear_scheduler_pause.assert_called_once()
@@ -110,7 +113,7 @@ class TestAutoResumeOnEscalationResolve:
     @pytest.mark.asyncio
     async def test_resolve_sentinel_resumes_in_loop(self, tmp_path: Path) -> None:
         harness, _ = _make_harness(tmp_path)
-        await harness.pause_scheduler('park-stop: collision burst')
+        await harness.pause_scheduler('park-stop: collision burst', PauseClass.PARK_STOP)
 
         # Called on the loop thread (like the watcher supervisor) → create_task.
         harness._on_escalation_resolved(_sentinel_esc())
@@ -136,7 +139,7 @@ class TestAutoResumeOnEscalationResolve:
     async def test_dismissed_sentinel_does_not_resume(self, tmp_path: Path) -> None:
         """Dismissing (not resolving) the pause L1 means abandon — stay paused."""
         harness, _ = _make_harness(tmp_path)
-        await harness.pause_scheduler('park-stop: abandoned')
+        await harness.pause_scheduler('park-stop: abandoned', PauseClass.PARK_STOP)
 
         harness._on_escalation_resolved(_sentinel_esc(status='dismissed'))
         await asyncio.gather(*list(harness._background_tasks))
@@ -158,7 +161,7 @@ class TestAutoResumeOnEscalationResolve:
         harness, _ = _make_harness(tmp_path)
         # run() normally captures this; set it directly since we don't start run().
         harness._loop = asyncio.get_running_loop()
-        await harness.pause_scheduler('park-stop: off-loop burst')
+        await harness.pause_scheduler('park-stop: off-loop burst', PauseClass.PARK_STOP)
 
         # Run the callback on a worker thread — no event loop in that thread.
         await asyncio.to_thread(harness._on_escalation_resolved, _sentinel_esc())

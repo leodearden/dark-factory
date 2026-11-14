@@ -3,7 +3,8 @@
 Non-fixture helpers (MockEdge, make_rebuild_detail, extract_cypher, …)
 live in `_fm_helpers.py` — a uniquely-named sibling module — so they can
 be imported from test files without conflicting with sibling subprojects'
-conftests under `sys.modules['conftest']`.
+conftests under `sys.modules['conftest']`, and in the `_fm_*.py` siblings
+that `_fm_helpers`' module docstring lists.
 
 Testing a `scripts/` script? `scripts/` is not a package and is not on
 PYTHONPATH, so import it with `from _fm_helpers import
@@ -21,13 +22,18 @@ import re
 import sys
 import warnings
 import weakref
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+from graphiti_core.cross_encoder.client import CrossEncoderClient
+from graphiti_core.embedder import EmbedderClient
+from graphiti_core.llm_client import LLMClient
 
 # Make this file's directory importable by test modules so
 # `from _fm_helpers import ...` resolves regardless of whether pytest
@@ -70,21 +76,20 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from _fm_helpers import (  # noqa: E402
-    _leaked_async_httpx_clients,
-    _warn_if_drain_closed_a_foreign_client,
     complete_paged_read,
     install_identity_mocks,
     pydantic_spec,
-    reap_leaked_async_httpx_clients,
     reap_leaked_ticket_workers,
     resolve_xdist_worker_id,
-    track_async_httpx_clients,
 )
 from _graphiti_fake import FakeGraphitiClient  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
+    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+    arm_leaked_drain_process_guard,
+    arm_usage_gate_sweep_confinement,
     reject_unsafe_basetemp,
 )
 
@@ -103,15 +108,44 @@ from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV  # noqa: E402
 
 
 def pytest_configure(config):
-    """Session-start hooks: basetemp safety, and async-httpx leak tracking.
+    """Session-start hooks: basetemp safety, the drain-leak guard, UsageGate sweep confinement, async-httpx leak tracking.
 
     ``track_async_httpx_clients()`` runs HERE — at session start, before
     collection — rather than lazily from a fixture, so clients constructed at
     module import time are tracked too and can be reaped like any other
     (task 4412).
+
+    ``shared.usage_gate`` here, and ``_fm_httpx_leaks`` here and in the two
+    httpx-reaping fixtures, are imported function-locally because a
+    module-level import after this file's ``sys.path`` setup would need a new
+    ``E402`` suppression, which ``scripts/inline_suppressions.py`` refuses.
+
+    ``_aim_falkordb_at_scratch`` ends the session with a usage error (exit 4)
+    when it is aimed at the production FalkorDB, or, under the offline lane,
+    when the scratch FalkorDB is unreachable (task 7792).
     """
     reject_unsafe_basetemp(config)
+    arm_leaked_drain_process_guard(config)
+    from _fm_httpx_leaks import track_async_httpx_clients
+    from shared import usage_gate
+
+    arm_usage_gate_sweep_confinement(config, usage_gate)
     track_async_httpx_clients()
+    _aim_falkordb_at_scratch()
+
+
+def _aim_falkordb_at_scratch() -> None:
+    """Importing ``_fm_falkor_live`` resolves the scratch endpoint, so the import is where production is refused."""
+    from fused_memory.config.falkordb_endpoints import ProductionFalkorDBTarget
+
+    try:
+        from _fm_falkor_live import ScratchFalkorDBUnreachable, prepare_scratch_falkordb_session
+    except ProductionFalkorDBTarget as error:
+        raise pytest.UsageError(str(error)) from None
+    try:
+        prepare_scratch_falkordb_session(os.environ)
+    except ScratchFalkorDBUnreachable as error:
+        raise pytest.UsageError(str(error)) from None
 
 
 @pytest.fixture(scope='session')
@@ -298,6 +332,27 @@ def _no_inherited_project_registry(monkeypatch):
     monkeypatch.delenv(KNOWN_PROJECT_ROOTS_ENV, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_fm_data_dir(monkeypatch, tmp_path):
+    """Pin ``DARK_FACTORY_DATA_DIR`` at this test's ``tmp_path / 'data'`` (task 6456).
+
+    Unpinned, ``fused_memory.middleware.task_interceptor::_combine_audit_path``
+    appends every curator combine to ``<CWD>/data/combine_audit.jsonl``; run
+    from the repo root that is the live service's own audit file, since the
+    service's ``WorkingDirectory`` is the repo root.
+
+    Separate from ``_isolate_fm_config`` because this variable is a
+    module-level ``os.getenv``, not a config leaf.  The ``tmp_path / 'data'``
+    layout mirrors a deployment rooted at ``tmp_path``, which is where
+    ``_isolate_fm_config`` puts ``PROJECT_ROOT``.  ``setenv`` overwrites an
+    inherited value; a test-body ``setenv`` still wins, as
+    ``test_task_interceptor.py::audit_dir`` relies on.  See
+    ``test_data_dir_hermeticity.py`` and
+    ``plans/fused-memory-config-cwd-leak-rca-2026-09-13.md``.
+    """
+    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
+
+
 @pytest.fixture
 def code_default_config(monkeypatch, tmp_path):
     """Resolve ``FusedMemoryConfig()`` from the SCHEMA alone, on request.
@@ -421,7 +476,7 @@ async def _reap_leaked_ticket_workers():
 # a real defence for a hypothetical one is the wrong way round, so the
 # constraint is enforced by DISCOVERABILITY instead: the sync arm snapshots
 # the already-leaked clients at SETUP and warns via
-# _fm_helpers._warn_if_drain_closed_a_foreign_client whenever the drain closed
+# _fm_httpx_leaks._warn_if_drain_closed_a_foreign_client whenever the drain closed
 # one that pre-dated the current test — naming the trap at the teardown that
 # sprang it, instead of leaving it to be diagnosed from the far-away symptom.
 # ---------------------------------------------------------------------------
@@ -435,7 +490,7 @@ def _reap_leaked_async_httpx_clients_sync():
     exception was never retrieved`` ERROR into some unrelated test's ``caplog``
     window, and why closing it at teardown makes that record unreachable, see
     the ONE canonical write-up of the mechanism —
-    ``_fm_helpers.reap_leaked_async_httpx_clients``. It is deliberately not
+    ``_fm_httpx_leaks.reap_leaked_async_httpx_clients``. It is deliberately not
     restated here.
 
     THIS ARM IS DEFENCE IN DEPTH, NOT COVERAGE OF A GAP THE ASYNC ARM LEAVES.
@@ -469,6 +524,12 @@ def _reap_leaked_async_httpx_clients_sync():
     innocent test's teardown. A warning keeps it loud without letting the
     BACKSTOP arm become a flake source itself.
     """
+    from _fm_httpx_leaks import (
+        _leaked_async_httpx_clients,
+        _warn_if_drain_closed_a_foreign_client,
+        reap_leaked_async_httpx_clients,
+    )
+
     # Snapshot at SETUP (this arm is set up first, before the test body runs):
     # the clients already leaked by someone else. Weak refs, so the snapshot
     # never keeps a client alive or changes its GC timing.
@@ -483,7 +544,7 @@ def _reap_leaked_async_httpx_clients_sync():
                 f'closes clients from a throwaway asyncio.run loop, so an '
                 f'exception type beyond the suppressed TimeoutError/'
                 f'RuntimeError reached it — widen the suppression in '
-                f'_fm_helpers.reap_leaked_async_httpx_clients or fix the '
+                f'_fm_httpx_leaks.reap_leaked_async_httpx_clients or fix the '
                 f'ordering that sent this client to the fallback (task 4412).',
                 stacklevel=2,
             )
@@ -494,7 +555,7 @@ def _reap_leaked_async_httpx_clients_sync():
 async def _reap_leaked_async_httpx_clients(_reap_leaked_async_httpx_clients_sync):
     """Close leaked openai/anthropic httpx clients before this test's loop closes.
 
-    Task 4412 — mechanism in ``_fm_helpers.reap_leaked_async_httpx_clients``,
+    Task 4412 — mechanism in ``_fm_httpx_leaks.reap_leaked_async_httpx_clients``,
     same as the sync arm above.
 
     THE ARGUMENT IS THE ORDERING, and it is the only reason it is there.
@@ -509,9 +570,11 @@ async def _reap_leaked_async_httpx_clients(_reap_leaked_async_httpx_clients_sync
     ``test_async_httpx_leak_isolation.py::test_aab_the_leak_was_closed_in_its_own_test_loop``.
 
     Best-effort and bounded — see ``reap_leaked_async_httpx_clients`` in
-    ``_fm_helpers.py``: it never fails a test, and is a cheap no-op for the
+    ``_fm_httpx_leaks.py``: it never fails a test, and is a cheap no-op for the
     vast majority of tests that leak nothing.
     """
+    from _fm_httpx_leaks import reap_leaked_async_httpx_clients
+
     yield
     await reap_leaked_async_httpx_clients()
 
@@ -548,12 +611,81 @@ def make_backend():
 
     For a client that enforces graphiti_core's uuid= contract, use
     make_backend_over_fake_graphiti.
+
+    ``driver=`` replaces the default MagicMock driver; make_graph_driver builds one.
+    For a real driver and spec'd sub-clients, use make_wired_backend.
     """
-    def _factory(config, *, registered_graph_ids=()) -> GraphitiBackend:
-        backend = GraphitiBackend(config, registered_graph_ids=registered_graph_ids)
+    def _factory(config, *, registered_graph_ids=(), driver=None) -> GraphitiBackend:
+        backend = GraphitiBackend.with_driver(
+            config,
+            MagicMock() if driver is None else driver,
+            registered_graph_ids=registered_graph_ids,
+        )
         backend.client = MagicMock()
-        backend._driver = MagicMock()
         return backend
+
+    return _factory
+
+
+@pytest.fixture
+def make_graph_driver():
+    """Factory fixture: returns a callable(graphs) -> a real _MultiTenantFalkorDriver over *graphs*.
+
+    The driver runs over a FalkorDB double whose ``select_graph(name)`` answers
+    ``graphs[name]``; names are the canonical group ids the backend selects.  Pass
+    it as ``make_backend(config, driver=...)`` instead of assigning
+    ``backend._driver._get_graph``.
+    """
+    from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
+
+    def _factory(graphs: Mapping[str, Any]) -> _MultiTenantFalkorDriver:
+        def _select(name: str) -> Any:
+            if name not in graphs:
+                raise KeyError(f'no graph wired for {name!r}; wired: {sorted(graphs)}')
+            return graphs[name]
+
+        falkor = MagicMock()
+        falkor.select_graph.side_effect = _select
+        return _MultiTenantFalkorDriver(falkor_db=falkor)
+
+    return _factory
+
+
+class SubClients(NamedTuple):
+    """Spec'd sub-client doubles, named as GraphitiBackend.with_driver's keywords."""
+
+    llm_client: LLMClient
+    embedder: EmbedderClient
+    cross_encoder: CrossEncoderClient
+
+
+class WiredBackend(NamedTuple):
+    backend: GraphitiBackend
+    sub_clients: SubClients
+
+
+@pytest.fixture
+def make_wired_backend(make_graph_driver):
+    """Factory fixture: returns a callable(config, driver=None) -> WiredBackend.
+
+    The backend is GraphitiBackend.with_driver over *driver* and fresh spec'd
+    sub-client doubles, returned beside it so a test can assert identity.  The
+    default driver is ``make_graph_driver({})``, which wires no graph.  Unlike
+    make_backend, it assigns no base ``client``.  The registry is empty.
+    """
+    def _factory(config, driver=None) -> WiredBackend:
+        sub_clients = SubClients(
+            llm_client=MagicMock(spec=LLMClient),
+            embedder=MagicMock(spec=EmbedderClient),
+            cross_encoder=MagicMock(spec=CrossEncoderClient),
+        )
+        backend = GraphitiBackend.with_driver(
+            config,
+            make_graph_driver({}) if driver is None else driver,
+            registered_graph_ids=(),
+            **sub_clients._asdict(),
+        )
+        return WiredBackend(backend, sub_clients)
 
     return _factory
 
@@ -596,7 +728,7 @@ def make_graph_mock():
     defaults to ``[]`` rather than to the auto-``MagicMock`` attribute a bare
     ``MagicMock()`` would otherwise supply.  Code that resolves FalkorDB result
     columns BY NAME (``GraphitiBackend.list_indices``, and
-    ``_fm_helpers.await_index_operational`` before it) iterates
+    ``_fm_falkor_live.await_index_operational`` before it) iterates
     ``result.header``, and an auto-``MagicMock`` is not iterable — every mocked
     call would raise ``TypeError`` instead of exercising the code under test.
     The ``[]`` default is safe because no existing consumer of this fixture
@@ -631,9 +763,7 @@ def make_graph_mock():
     carries the stateful query log the truncation tests need — because two
     doubles that both claim to stand in for the same server drift, and the
     drift shows up as a test that passes against a fake nothing else agrees
-    with.  A test that needs the cap should use that one (or, for episode
-    reads through graphiti-core, its API-level counterpart
-    ``FakeCappedEpisodeStore`` in the same module).
+    with.  A test that needs the cap should use that one.
     """
     skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
     # Deliberately NARROW: only a query whose entire projection is a bare row
@@ -745,6 +875,14 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
     off: the tracked YAML ships it on (task 3169), and with it on every
     Mem0-primary ``add_memory`` in a unit test would reach the real judge
     client.  A test of the triage path opts in on its own config.
+    ``overreach_guard.shadow_enabled`` is pinned off for the same reason: with
+    it on, every decision write in a unit test would reach the real overreach
+    judge; a test of the shadow opts in on its own config.
+    ``mem0.persist_history`` is pinned off too: with it on, any test that
+    builds a real mem0 instance from this config would write the
+    process-shared, xdist-contended, sandbox-read-only
+    ``$MEM0_DIR/history.db`` rather than a private in-memory DB; a test of the
+    persisted default opts in on its own config.
     """
     config = FusedMemoryConfig(
         llm=LLMConfig(
@@ -776,6 +914,8 @@ def mock_config(tmp_path) -> FusedMemoryConfig:
         ),
     )
     config.write_triage.enabled = False
+    config.overreach_guard.shadow_enabled = False
+    config.mem0.persist_history = False
     return config
 
 
@@ -811,10 +951,10 @@ def _integration_collection_lease(request):
     ``-m 'not integration'``) never writes into the machine-global lease
     directory the live cron reads.
 
-    The reaper is loaded LAZILY here rather than at conftest import time, for
-    the reason ``_fm_helpers.qdrant_skipif`` documents for deferring its own
-    probe: a session that never runs an integration test must not pay for
-    it.  Via ``load_script_module`` — do not add another local
+    The reaper is loaded LAZILY here rather than at conftest import time, so
+    a session that never runs an integration test does not pay for it — the
+    same deferral ``_fm_qdrant_live.qdrant_skipif`` applies to its probe.
+    Via ``load_script_module`` — do not add another local
     ``spec_from_file_location`` loader (tasks 3738/3895).
     """
     if request.node.get_closest_marker('integration') is None:

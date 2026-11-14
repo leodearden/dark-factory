@@ -9,9 +9,13 @@ conflicts with the probe exactly as the orchestrator's own lock does.
 from __future__ import annotations
 
 import fcntl
+import os
 from pathlib import Path
 
-from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
+from fused_memory.services.orchestrator_detector import (
+    is_orchestrator_live_for,
+    is_orchestrator_lock_held,
+)
 
 
 def _lock_path(root: Path) -> Path:
@@ -45,3 +49,15 @@ def test_unopenable_lock_path_reads_not_held(tmp_path):
     _lock_path(tmp_path).mkdir()
 
     assert is_orchestrator_lock_held(tmp_path) is False
+
+
+def test_lock_naming_this_process_reads_live(tmp_path):
+    _lock_path(tmp_path).write_text(f'PID {os.getpid()} started 2026-10-10T00:00:00+00:00\n')
+
+    assert is_orchestrator_live_for(tmp_path) is True
+
+
+def test_lock_naming_a_pid_no_pid_t_can_hold_reads_not_live(tmp_path):
+    _lock_path(tmp_path).write_text('PID 100000000000000000000 started 2026-10-10T00:00:00+00:00\n')
+
+    assert is_orchestrator_live_for(tmp_path) is False

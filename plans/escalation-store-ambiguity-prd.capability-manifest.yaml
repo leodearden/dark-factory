@@ -268,3 +268,5 @@ tasks:
       kind: manual
       reason: an agent-facing observation asserted qualitatively by B5, not by a repo
         pattern
+signal_leaves:
+- γ4

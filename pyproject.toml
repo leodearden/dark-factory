@@ -6,6 +6,7 @@ requires-python = ">=3.11,<4"
 
 [tool.uv.workspace]
 members = [
+    "client-feed",
     "cockpit",
     "dashboard",
     "escalation",
@@ -31,6 +32,7 @@ extraPaths = [
     "scripts",
     "scripts/legibility",
     "scripts/local-model-serving",
+    "client-feed/src",
     "cockpit/src",
     "dashboard/src",
     "escalation/src",
@@ -38,6 +40,11 @@ extraPaths = [
     "orchestrator/src",
     "sampler/src",
     "shared/src",
+    # Only the orchestrator test helpers this table's targets import by bare
+    # name (task 8507), never a whole test directory: an entry here claims its
+    # names over same-directory siblings. Why, and the guards that enforce it:
+    # tests/scripts/test_no_vestigial_import_pragmas.py.
+    "orchestrator/tests/cross_suite_helpers",
 ]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"

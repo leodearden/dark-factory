@@ -29,7 +29,7 @@ port's method list suggests and a reader should not have to re-derive it:
   ``merge_queue.py::_check_post_merge_equivalence`` through a deferred
   ``import``, which bypasses the injected port -- so both gates still run
   PRODUCTION code under an injected verifier, exactly as they did under the
-  ``patch('orchestrator.merge_queue.run_scoped_verification', ...)`` these
+  ``patch('orchestrator.merge_lane.worker.run_scoped_verification', ...)`` these
   tests replaced.
 * ``run_unscoped_typechecks`` IS injected, but
   ``merge_queue.py::_run_unscoped_typechecks`` returns a clean

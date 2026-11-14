@@ -2,12 +2,12 @@
 
 import asyncio
 import logging
-import shutil
 from collections.abc import Sequence
 from pathlib import Path
 from uuid import uuid4
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.tree_removal import remove_tree
 from orchestrator.verify import _target_subprocess_env
 
 logger = logging.getLogger(__name__)
@@ -300,14 +300,14 @@ async def cleanup_eval_worktree(
     # delete it. Remove it here (best-effort, mirroring the worktree removal)
     # so run_architect_eval — the sole caller — leaves no residue behind.
     meta_root = TaskArtifacts.meta_root_for(worktree_path.parent, worktree_path.name)
-    shutil.rmtree(meta_root, ignore_errors=True)
+    await remove_tree(meta_root, ignore_errors=True)
 
 
 async def get_diff(worktree_path: Path, base_commit: str) -> str:
     """Get the full committed diff of an eval worktree vs its base commit.
 
     ``base_commit`` is the authoritative ``task['pre_task_commit']`` carried
-    on the task record — the same base ``metrics._git_diff_stats`` uses. The
+    on the task record — the same base ``runner._git_diff_stats`` uses. The
     diff is ``git diff {base_commit}..HEAD`` (two-dot range), i.e. the full
     change committed on the ``evals/<id>`` branch.
 

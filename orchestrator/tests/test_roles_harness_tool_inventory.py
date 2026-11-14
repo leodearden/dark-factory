@@ -17,27 +17,30 @@ prohibition.
 
 WHAT IS SCANNED -- two surfaces, and BOTH are required.
   (a) every role's `system_prompt` in `ROLES`;
-  (b) every module-level `str` constant in `roles.py` whose NAME matches
-      `_?[A-Z][A-Z0-9_]*`, reached by introspection over `vars(roles)`.
+  (b) every module-level `str` constant in `roles.py` and
+      `harness_guidance.py` (`_PROMPT_MODULES`) whose NAME matches
+      `_?[A-Z][A-Z0-9_]*`, reached by introspection over each module's `vars()`.
 Surface (a) alone is a false green, measured: `WAIT_PATTERN_REMINDER`
 carried `BashOutput` and appears in NO role system_prompt -- `briefing.py`
 interpolates it into `build_amender_prompt` only -- so a system-prompt-only
 scan reports green while the defect survives at the exact failure site the
 reminder exists to cover. The optional leading underscore in the constant
-pattern is required too: roles.py holds a family of PRIVATE prompt constants
+pattern is required too: the two modules hold a family of PRIVATE prompt constants
 (`_GREP_ENGINE_LIMITS`, `_TOOL_CALL_REJECTION_KNOWN_SHAPES`,
 `_SCOPE_BOUNDARY_FACTS`, `_MEMORY_INSTRUCTIONS`, the `_REVIEWER_*_TEMPLATE`s)
 that a pattern anchored at `[A-Z]` would skip. Introspection rather than a
-hand-listed import set means a prompt constant added later is covered the day
-it is added, with no second place to remember.
+hand-listed import set means a prompt constant added later to a listed module
+is covered the day it is added, with no second place to remember;
+`test_scan_reaches_the_turn_prompt_only_constant` fails if the witness's home
+module drops out of `_PROMPT_MODULES`.
 
 COMMENTS ARE NOT SCANNED, and that is deliberate rather than an accepted
-gap. roles.py's `_GREP_ENGINE_LIMITS` comment cites `BashOutput` CORRECTLY,
-as the cautionary precedent for naming a tool that is not there (task 5331).
-A scan over roles.py's source TEXT would fail on that correct comment and
-pressure a future editor into deleting the citation -- the guard would attack
-the documentation of the very defect it polices. Scanning constant VALUES
-gets the comment/prompt distinction right for free, with no exclusion list.
+gap. A comment may correctly name a phantom tool, as the cautionary precedent
+for naming a tool that is not there. A scan over source TEXT would fail on
+that correct comment and pressure a future editor into deleting the citation
+-- the guard would attack the documentation of the very defect it polices.
+Scanning constant VALUES gets the comment/prompt distinction right for free,
+with no exclusion list.
 
 THE MAINTENANCE CONTRACT. `HARNESS_TOOLS` is hand-maintained from live
 measurement; extend it when a prompt legitimately names a newly-shipped tool,
@@ -62,8 +65,9 @@ file path, and `ToolSearch` as the way to discover the current termination
 tool. The hole has little left to bite on.
 
 WHAT THIS DOES NOT COVER, deliberately:
-  * prompt text assembled outside roles.py -- `briefing.py`'s f-strings, the
-    `skills/` sources -- since the scan reads roles.py's own constants;
+  * prompt text assembled outside those two modules -- `briefing.py`'s
+    f-strings, the `skills/` sources -- since the scan reads only their
+    module-level constants;
   * comments, per the paragraph above;
   * a tool named in PLAIN PROSE. Only backtick spans are scanned, so "poll it
     with BashOutput" escapes. Dropping the backtick requirement is not the fix
@@ -71,8 +75,8 @@ WHAT THIS DOES NOT COVER, deliberately:
     KNOWN HOLE above is not the only hole, and reading it as exhaustive is
     what would let this one through unnoticed;
   * tool GRANTS. Unlike its MCP sibling this guard asserts EXISTENCE only,
-    and the reason is measured and recorded in roles.py's own TOOL
-    AVAILABILITY comment: `--allowed-tools` is a PERMISSION allowlist, not a
+    and the reason is measured and recorded in the MEASURED REACHABLE comment
+    below: `--allowed-tools` is a PERMISSION allowlist, not a
     tool-registry filter, so built-ins stay present and callable whether or
     not a role lists them. An MCP tool missing from `allowed_tools` really is
     a permission denial, which is why the sibling checks grants; a built-in
@@ -85,9 +89,13 @@ WHAT THIS DOES NOT COVER, deliberately:
 from __future__ import annotations
 
 import re
+import types
+from collections.abc import Iterable
+from typing import NamedTuple
 
 import pytest
 
+from orchestrator.agents import harness_guidance as harness_guidance_module
 from orchestrator.agents import roles as roles_module
 from orchestrator.agents.roles import ROLES
 
@@ -141,13 +149,14 @@ HARNESS_TOOLS = frozenset({
 })
 
 # THE SINGLE HOME OF THE TOOL-REGISTRY MEASUREMENT.  The query, its dates and
-# the census figure live HERE and are cited from everywhere else -- roles.py's
-# retraction, this module's docstring, `_failure_message`, cli_invoke.py's
+# the census figure live HERE and are cited from everywhere else -- this
+# module's docstring, `_failure_message`, cli_invoke.py's
 # `_BACKGROUND_REAP_TOOLS`, test_cli_invoke_background.py.  An earlier revision
 # hand-copied them to six sites and two had already drifted apart in shape, the
-# same failure roles.py records for its size figures ("Prose copies do not move
-# when the string they describe does").  Do NOT restate a date, the query or the
-# census figure elsewhere -- cite this comment instead.
+# same failure test_roles_wait_pattern.py's docstring records for its size
+# figures: a prose copy does not move when the string it describes does.  Do
+# NOT restate a date, the query or the census figure elsewhere -- cite this
+# comment instead.
 #
 # THE QUERY, from a live dispatched session:
 #     ToolSearch("select:BashOutput,KillShell,KillBash,TaskOutput,TaskStop,Monitor")
@@ -175,6 +184,15 @@ MEASURED_ABSENT_TOOLS = frozenset({
     'TaskOutput',
 })
 
+# MEASURED REACHABLE, 2026-08-05 -- why this guard checks existence, never
+# grants.  A dispatched implementer whose cmdline was exactly
+# `--allowed-tools Read Edit Write Bash Glob Grep mcp__...` had `ToolSearch` and
+# `ScheduleWakeup` live in its tool list, and a `ToolSearch` select query
+# returned deferred tools' schemas.  So `--allowed-tools` is a PERMISSION
+# allowlist, not a registry filter: a built-in stays callable whether or not a
+# role lists it.  Never trim a built-in from a prompt because a role's
+# allowed_tools omits it.
+
 # Backticked CamelCase words the prompts legitimately use that name no tool.
 # Because the scan takes the LEADING identifier of a span (below), this holds
 # both bare words and the head of a longer span -- a prose label (`Hypothesis:`)
@@ -201,6 +219,20 @@ _BACKTICKED = re.compile(r'`([A-Za-z][A-Za-z0-9_]*)[^`]*`')
 # docstring on why the leading underscore is not optional.
 _PROMPT_CONSTANT_NAME = re.compile(r'^_?[A-Z][A-Z0-9_]*$')
 
+# The modules whose namespaces scan surface (b) introspects, lowest layer
+# first, so a constant roles.py imports is reported under harness_guidance.
+_PROMPT_MODULES = (harness_guidance_module, roles_module)
+
+
+class _PromptConstant(NamedTuple):
+    module: str
+    name: str
+    text: str
+
+    @property
+    def where(self) -> str:
+        return f'{self.module}.{self.name}'
+
 
 def _is_camel_case(token: str) -> bool:
     """A leading capital plus at least one lowercase letter.
@@ -211,13 +243,26 @@ def _is_camel_case(token: str) -> bool:
     return token[0].isupper() and any(char.islower() for char in token)
 
 
-def _prompt_constants() -> list[tuple[str, str]]:
-    """Every module-level string constant in roles.py, by introspection."""
-    return sorted(
-        (name, value)
-        for name, value in vars(roles_module).items()
-        if _PROMPT_CONSTANT_NAME.match(name) and isinstance(value, str)
-    )
+def _prompt_constants(modules: Iterable[types.ModuleType]) -> list[_PromptConstant]:
+    """Every module-level string constant in `modules`, by introspection.
+
+    One entry per distinct binding of a name to an object: an import is the
+    same object under the same name, so it is scanned once, under the first
+    module that binds it; a shadowing value is another object, so it is
+    scanned too.
+    """
+    first_binding: dict[tuple[str, int], _PromptConstant] = {}
+    for module in modules:
+        module_name = module.__name__.rpartition('.')[2]
+        for name, value in vars(module).items():
+            if _PROMPT_CONSTANT_NAME.match(name) and isinstance(value, str):
+                first_binding.setdefault(
+                    (name, id(value)), _PromptConstant(module_name, name, value),
+                )
+    return sorted(first_binding.values())
+
+
+_SCANNED_CONSTANTS = _prompt_constants(_PROMPT_MODULES)
 
 
 def _unknown_tool_tokens(text: str) -> list[str]:
@@ -242,7 +287,7 @@ def _failure_message(where: str, unknown: list[str]) -> str:
             'reachable next step and will improvise a forbidden poll loop. Name a tool '
             'that exists, and do NOT reach for another poll-tool name: what agents are '
             'told to do instead is stated once, in '
-            'orchestrator/src/orchestrator/agents/roles.py::WAIT_PATTERN_GUIDANCE.',
+            'orchestrator/src/orchestrator/agents/harness_guidance.py::WAIT_PATTERN_GUIDANCE.',
         )
     if unrecognised:
         lines.append(
@@ -285,6 +330,44 @@ def test_detector_detects() -> None:
     assert _unknown_tool_tokens('prefix it `Hypothesis:` so a reviewer can tell') == []
 
 
+def test_scan_keeps_a_shadowed_name_and_folds_an_import() -> None:
+    """Two listed modules binding one name to different text are both scanned.
+
+    Keyed by name alone, the later module's value would silently replace the
+    earlier one's and the earlier text would never be scanned -- the
+    false-green shape this module exists to rule out. An import binds the
+    same object under the same name, so it is scanned once, under the first
+    module listed. Fixtures are synthetic modules, so this pins no prompt.
+    """
+    imported = 'imported text'
+    lower = types.ModuleType('pkg.lower')
+    upper = types.ModuleType('pkg.upper')
+    vars(lower).update(SHARED=imported, SHADOWED='lower text')
+    vars(upper).update(SHARED=imported, SHADOWED='upper text')
+
+    assert _prompt_constants((lower, upper)) == [
+        _PromptConstant('lower', 'SHADOWED', 'lower text'),
+        _PromptConstant('lower', 'SHARED', 'imported text'),
+        _PromptConstant('upper', 'SHADOWED', 'upper text'),
+    ]
+
+
+def test_scan_reaches_the_turn_prompt_only_constant() -> None:
+    """The scan surface still holds this module's false-green witness.
+
+    WAIT_PATTERN_REMINDER reaches agents only through briefing.py and is in no
+    role system_prompt, so scan surface (b) is its only cover. Dropping its
+    home module from `_PROMPT_MODULES` would silently un-scan it; this test
+    fails first. It is the detector-coverage twin of `test_detector_detects`,
+    not a prose pin.
+    """
+    scanned = {constant.name for constant in _SCANNED_CONSTANTS}
+    assert 'WAIT_PATTERN_REMINDER' in scanned, (
+        'WAIT_PATTERN_REMINDER is no longer among the scanned prompt constants. '
+        'Add the module that defines it to _PROMPT_MODULES.'
+    )
+
+
 @pytest.mark.parametrize('role_key', sorted(ROLES))
 def test_role_prompt_names_no_phantom_harness_tool(role_key: str) -> None:
     """Every built-in tool a role's system_prompt prescribes must exist.
@@ -298,14 +381,16 @@ def test_role_prompt_names_no_phantom_harness_tool(role_key: str) -> None:
     assert not unknown, _failure_message(f"{role_key}'s system_prompt", unknown)
 
 
-@pytest.mark.parametrize('const_name', [name for name, _ in _prompt_constants()])
-def test_prompt_constant_names_no_phantom_harness_tool(const_name: str) -> None:
-    """Same invariant over roles.py's prompt constants, spliced or not.
+@pytest.mark.parametrize(
+    'constant', _SCANNED_CONSTANTS, ids=lambda constant: constant.where,
+)
+def test_prompt_constant_names_no_phantom_harness_tool(constant: _PromptConstant) -> None:
+    """Same invariant over the scanned modules' prompt constants, spliced or not.
 
     The surface that catches what the system_prompt scan cannot:
     WAIT_PATTERN_REMINDER reaches an agent only through briefing.py's
     build_amender_prompt, so it is absent from every role's system_prompt
     while still being prompt text an agent is expected to act on.
     """
-    unknown = _unknown_tool_tokens(getattr(roles_module, const_name))
-    assert not unknown, _failure_message(f'roles.{const_name}', unknown)
+    unknown = _unknown_tool_tokens(constant.text)
+    assert not unknown, _failure_message(constant.where, unknown)

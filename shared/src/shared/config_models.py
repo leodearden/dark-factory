@@ -62,6 +62,18 @@ class UsageCapConfig(BaseModel):
     wait_for_reset: bool = Field(default=True)
     probe_interval_secs: int = Field(default=300)
     max_probe_interval_secs: int = Field(default=1800)
+    probe_slot_hold_secs: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            "The longest a resumed account's single probe claim waits for its "
+            "holder's verdict before the account opens to every caller. A "
+            'capped account fails its first API call during CLI startup, so a '
+            'holder still running past this bound is being served (task 9327). '
+            'A bound shorter than CLI startup opens the account before that '
+            'first call can report a cap, which forfeits single-task testing.'
+        ),
+    )
     auth_reprobe_secs: int = Field(
         default=3600,
         description='Seconds between auth re-probes for auth_failed accounts.',
@@ -78,12 +90,13 @@ class UsageCapConfig(BaseModel):
     )
     accounts: list[AccountConfig] = Field(default_factory=list)
     fallback_to_default_credential: bool = Field(
-        default=True,
+        default=False,
         description=(
-            'When no configured account resolves a token, adopt the operator\'s '
-            'own ~/.claude login as a single "default" account. False leaves the '
-            'pool empty instead, so a caller never authenticates as that login '
-            '(consumer: scripts/legibility, task 6042).'
+            'Explicit opt-in for interactive tooling: when no configured account '
+            'resolves a token, adopt the operator\'s own ~/.claude login as a '
+            'single "default" account. Off by default, so fleet tooling never '
+            'authenticates as that login and an unresolvable roster leaves the '
+            'pool empty (ruling 2026-11-01, task 8161; task 6042).'
         ),
     )
     accounts_file: str | None = Field(

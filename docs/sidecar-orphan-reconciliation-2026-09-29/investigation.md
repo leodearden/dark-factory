@@ -147,6 +147,39 @@ Once 4731 lands, it will rebind ρ1–ρ3 and os-sandbox γ7a–e to their regis
 `external_task_id`, refresh the stale ρ notes, and adjudicate warm-lane κ's `vacuous_absent`
 descriptor.
 
+## Follow-up outcome (task 6047)
+
+Measured 2026-10-24 against dark-factory main `cd48063ade` and reify main `dc3c59104c`.
+
+- **Rebound.** Eight blocks now bind `external_task_id` in place of a bare foreign `task_id`.
+  ρ1–ρ3 are `reify:7334`–`reify:7336`. γ7a–e are `autopilot_video:649`, `know_live:592`,
+  `pump_web_ui:16`, `solar_challenge:95` and `solar_challenge_platform:164`. Each spelling is
+  that root's `fused_memory.project_id`. The stale ρ notes are refreshed.
+- **The misjoin had already happened.** dark-factory's ids passed 7336 (the max was 7433), so
+  the 12 remaining mechanical ρ rows were no longer `no_task`. They joined to unrelated DF
+  tasks and read as false actionable defects. γ7a–e are manual-only, so they leaked no rows;
+  only their provenance was misattributed.
+- **κ: not delivered, so the descriptor was re-pointed.** All seven relocated scripts are still
+  tracked at reify main. The old grep passed vacuously because `scripts/verify-pipeline-paths.txt`
+  has never listed them (`git log -S` is empty); the lint rejects it as `vacuous_absent`. It is
+  now `kind: path`, `expect: absent` over the seven scripts. That lints clean and evaluates
+  FAIL at reify main.
+- **κ stamped.** reify 5616 (pending, no moved-check marker) now carries that check as its only
+  `metadata.delivered_checks` entry. The read-only readback matched the write, and every other
+  key was byte-identical. Its owner was told that step 3 and the signal grep are already
+  satisfied (esc-6047-1).
+
+Rows these foreign labels contribute, from an in-process probe (`load_manifest_checks`,
+`evaluate_row` and `classify_descriptor` over the live DF store):
+
+| sidecars | rows | dispositions | `no_task`, whole corpus |
+|---|---|---|---|
+| main | 12 | ρ1 → DF 7334: 2 `vacuous_live_gate`, 2 `unwired_live_gate`; ρ2 → DF 7335: 8 `broken` | 0 |
+| this branch | 0 | — | 0 |
+
+The literal `audit_delivered_checks.py --project-root /home/leo/src/dark-factory` run reads
+main's tracked sidecars, so it stops reporting these 12 rows only once this branch merges.
+
 ## Reproduce
 
 ```bash

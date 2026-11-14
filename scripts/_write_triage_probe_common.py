@@ -118,7 +118,7 @@ class Candidate:
 
     ``.id``/``.content``/``.metadata`` is all the ref's readers use:
     ``near_duplicate_guard._cosine_of`` takes the per-store cosine from
-    ``metadata['store_score']``, and ``_canonical_id_of`` a child's parent from
+    ``metadata['store_score']``, and ``canonical_id_of`` a child's parent from
     the metadata too. Constructing one avoids importing ``MemoryResult``, whose
     module pulls in third-party deps a bare extracted tree may lack.
     """

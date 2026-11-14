@@ -1,0 +1,48 @@
+{
+  "task_id": "7248",
+  "reason": "history leg routed through _run_post_merge_verify via HistoryLegRunner: a _local_merge_verify_runner helper and a history_leg_command keyword in worker.py, and the gate passes the leg to its one run_post_merge_verify call, so a red leg gets the re-verify failure handling (net-additive review fix)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2271,
+      "current": 2272
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 3606,
+      "current": 3607
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22779,
+      "current": 22815
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+      "baseline": 1622,
+      "current": 1624
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12653,
+      "current": 12664
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 58701,
+      "current": 58735
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31957,
+      "current": 31968
+    }
+  ]
+}

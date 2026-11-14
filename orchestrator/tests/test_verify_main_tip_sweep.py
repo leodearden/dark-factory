@@ -39,7 +39,7 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.verify import VerifyResult
 
@@ -1711,20 +1711,24 @@ class TestGroupNodeIdsBySubproject:
 
         return _discover_module_configs(root)
 
+    @staticmethod
+    def _group(root: Path, module_configs, node_ids: list[str], *, log_label: str = 'unit'):
+        from orchestrator import verify as verify_module
+
+        return verify_module._group_node_ids_by_subproject(
+            root, module_configs, node_ids, log_label=log_label,
+        )
+
     def test_subproject_relative_node_id_resolves_to_qualified_id(
         self, tmp_path: Path
     ) -> None:
         """(a) A bare subproject-relative node-id resolves to its owning
         prefix, and the returned id is PREFIX-QUALIFIED (worktree-root
         relative) so the scoped re-run command names a real path."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
-            tmp_path, mcs, ['tests/test_a.py::test_a'], log_label='unit',
-        )
+        groups = self._group(tmp_path, mcs, ['tests/test_a.py::test_a'])
 
         assert groups == {'alpha': ['alpha/tests/test_a.py::test_a']}, groups
 
@@ -1733,14 +1737,10 @@ class TestGroupNodeIdsBySubproject:
     ) -> None:
         """(b) An ALREADY prefix-qualified node-id maps to that prefix and is
         returned verbatim (never double-prefixed)."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
-            tmp_path, mcs, ['beta/tests/test_b.py::test_b'], log_label='unit',
-        )
+        groups = self._group(tmp_path, mcs, ['beta/tests/test_b.py::test_b'])
 
         assert groups == {'beta': ['beta/tests/test_b.py::test_b']}, groups
 
@@ -1749,12 +1749,10 @@ class TestGroupNodeIdsBySubproject:
     ) -> None:
         """(c) Node-ids owned by different subprojects land in separate
         groups, with input order preserved WITHIN each group."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
+        groups = self._group(
             tmp_path,
             mcs,
             [
@@ -1762,7 +1760,6 @@ class TestGroupNodeIdsBySubproject:
                 'tests/test_b.py::test_two',
                 'tests/test_a.py::test_three',
             ],
-            log_label='unit',
         )
 
         assert groups == {
@@ -1777,16 +1774,13 @@ class TestGroupNodeIdsBySubproject:
         """(d) A node-id whose file exists under NO discovered subproject
         returns the None sentinel — the caller's fail-safe signal. One bad
         node-id poisons the whole batch (no partial guessing)."""
-        from orchestrator import verify as verify_module
-
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
 
-        groups = verify_module._group_node_ids_by_subproject(
+        groups = self._group(
             tmp_path,
             mcs,
             ['tests/test_a.py::test_a', 'tests/test_nonexistent.py::test_ghost'],
-            log_label='unit',
         )
 
         assert groups is None, f'Expected None for an unmapped node-id, got {groups!r}'
@@ -1803,7 +1797,7 @@ class TestGroupNodeIdsBySubproject:
         assert list(mcs) == ['alpha', 'beta'], f'fixture precondition: {list(mcs)}'
 
         with patch.object(verify_module, 'logger') as mock_logger:
-            groups = verify_module._group_node_ids_by_subproject(
+            groups = self._group(
                 tmp_path, mcs, [CONFIRM_AMBIGUOUS_NODE_ID], log_label='my-call-site',
             )
 
@@ -1825,16 +1819,63 @@ class TestGroupNodeIdsBySubproject:
         """(f) An empty node-id list is NOT the unmapped sentinel — it returns
         an empty dict, so callers distinguish "nothing to run" from
         "unmappable" via their own cheap early-out."""
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+
+        groups = self._group(tmp_path, mcs, [])
+
+        assert groups == {}, f'Expected {{}} for an empty node-id list, got {groups!r}'
+
+    def test_empty_prefix_config_is_not_a_universal_matcher(
+        self, tmp_path: Path
+    ) -> None:
+        """(g) A ModuleConfig keyed on prefix='' must not match every node-id
+        (pathlib drops the empty component) nor yield a '/'-leading qualified
+        id: it is skipped with a WARNING, real prefixes still map unambiguously,
+        and an id only the empty prefix could own is unmapped (None). The
+        WARNING names the caller's log_label and the stray config's
+        test_command, once per call."""
         from orchestrator import verify as verify_module
 
         _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
         mcs = self._discover(tmp_path)
+        stray = ModuleConfig(prefix='', test_command='pytest stray-root')
+        expected_warning_args = [('unit', 'pytest stray-root')]
 
-        groups = verify_module._group_node_ids_by_subproject(
-            tmp_path, mcs, [], log_label='unit',
-        )
+        with patch.object(verify_module, 'logger') as mock_logger:
+            groups = self._group(
+                tmp_path, {'': stray, **mcs}, ['tests/test_a.py::test_a'],
+            )
+        assert groups == {'alpha': ['alpha/tests/test_a.py::test_a']}, groups
+        assert [
+            call.args[1:] for call in mock_logger.warning.call_args_list
+        ] == expected_warning_args, mock_logger.warning.call_args_list
 
-        assert groups == {}, f'Expected {{}} for an empty node-id list, got {groups!r}'
+        with patch.object(verify_module, 'logger') as mock_logger:
+            only_empty = self._group(
+                tmp_path, {'': stray}, ['tests/test_a.py::test_a'],
+            )
+        assert only_empty is None, only_empty
+        assert [
+            call.args[1:] for call in mock_logger.warning.call_args_list
+        ] == expected_warning_args, mock_logger.warning.call_args_list
+
+    def test_empty_prefix_config_does_not_warn_without_node_ids(
+        self, tmp_path: Path
+    ) -> None:
+        """(h) With nothing to map, the empty-prefix config is never consulted,
+        so it costs no WARNING and the result stays ``{}``."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+        stray = ModuleConfig(prefix='', test_command='pytest stray-root')
+
+        with patch.object(verify_module, 'logger') as mock_logger:
+            groups = self._group(tmp_path, {'': stray, **mcs}, [])
+
+        assert groups == {}, groups
+        mock_logger.warning.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

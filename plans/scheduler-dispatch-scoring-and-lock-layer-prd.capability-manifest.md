@@ -163,7 +163,7 @@ so both bind to real gates rather than to already-satisfied greps.
 
 | Capability | Binding | Verdict |
 |---|---|---|
-| The scan-order pass-over is real and unrecorded | `grep:orchestrator/src/orchestrator/scheduler.py:6425,6436` — `_bump_skip_and_maybe_park` is called only for `top_id`, so ranks 2..k leave no record at all today | PASS |
+| The scan-order pass-over is real and unrecorded | `grep:orchestrator/src/orchestrator/scheduler.py:6425,6436` — `_bump_skip_and_maybe_park` is called only for `top_id`, so ranks 2..k leave no record at all today; delivered check: grep `_?passed_over_count` in `scheduler.py`, `dispatch_ledger.py` (S17 η moves scheduler per-task state into the dispatch ledger) | PASS |
 | Counter surfaces through the product read path | `producer:ι` + the `read_scheduler_state` pass-through (as θ) | PASS |
 | "never reaches `_bump_skip_and_maybe_park`" (negative assertion) | `rejection-check:` — asserted by a test on the call graph, since §7 rejects below-rank-1 park *installation* on measured grounds. Bound as a test property, not a grep (a plain ERE cannot express "this counter is not an argument to that function") | PASS |
 | Storm escape | stride-gated `task_passed_over` emission (default 100) against ~291 candidates × 4 ticks/min (INV-4) | PASS |

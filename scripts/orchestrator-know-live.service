@@ -13,13 +13,16 @@ Wants=fused-memory.service
 # cannot start, the orchestrator still starts and binds the port itself.
 Wants=orchestrator-know-live.socket
 
-# Restart-rate guard: 10 starts within 600s tolerates cap-rotation churn and
-# recoverable cascades but blocks a true crash loop. Default StartLimitAction
+# Restart-rate guard: with RestartSec=10 RestartSteps=4 RestartMaxDelaySec=60 the
+# backoff is 10/15.7/24.5/38.3/60 s, so ten starts fit inside 1800s for a crash up
+# to ~120s into startup (600s caught only a crash within ~15s of a fresh start).
+# That tolerates cap-rotation churn and recoverable cascades but blocks a true
+# crash loop. Default StartLimitAction
 # (none) stops auto-restart so an operator inspects the journal, then restarts
 # manually -- the intended fail-safe.
 # Per systemd >=230 these MUST live under [Unit]; placing them under [Service]
 # is silently ignored (guarded by test_start_limit_directives_under_unit_section).
-StartLimitIntervalSec=600
+StartLimitIntervalSec=1800
 StartLimitBurst=10
 
 [Service]

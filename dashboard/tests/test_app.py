@@ -9,13 +9,17 @@ response *shape*, not the contents, which exercises the shape adapters.
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _dashboard_helpers import bug_warnings
 
 from dashboard.api.burndown import _BURNDOWN_WINDOWS
 from dashboard.api.window import ServedWindow, _parse_window, with_window
+from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
 
 # ---------------------------------------------------------------------------
@@ -172,7 +176,7 @@ def _snapshot(*, health='ok', done=0):
     about. Stamped at the live clock so a FRESH half is inside its own
     freshness bound at the instant the handler serves it.
     """
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
     from types import MappingProxyType
 
     from dashboard.data.census import build_census
@@ -184,11 +188,16 @@ def _snapshot(*, health='ok', done=0):
     )
 
     as_of = datetime.now(UTC)
+    stale_age = timedelta(seconds=60)
     status_map = {task_id: 'done' for task_id in range(1, done + 1)}
     fresh_rows = Datum([], as_of, DatumState.FRESH, None, FRESHNESS_BOUND_SECONDS)
     fresh_census = Datum(
         build_census(status_map), as_of, DatumState.FRESH, None,
         FRESHNESS_BOUND_SECONDS,
+    )
+    stale_census = Datum(
+        build_census(status_map), as_of - stale_age, DatumState.STALE,
+        f'canned {health} root', FRESHNESS_BOUND_SECONDS,
     )
     unknown = Datum(
         None, None, DatumState.UNKNOWN, f'canned {health} root',
@@ -199,22 +208,30 @@ def _snapshot(*, health='ok', done=0):
         'offline': (SnapshotFailure.UNREACHABLE, unknown, unknown),
         'degraded': (SnapshotFailure.BUDGET, unknown, unknown),
         'count_unknown': (SnapshotFailure.NONE, fresh_rows, unknown),
+        'count_stale': (SnapshotFailure.NONE, fresh_rows, stale_census),
     }[health]
+    if unknown in (rows, census):
+        skew_seconds = None
+    else:
+        skew_seconds = int((rows.as_of - census.as_of).total_seconds())
     return TaskSnapshot(
         census=census, rows=rows,
         in_progress_live=None if rows is unknown else 0,
         in_progress_stranded=None if rows is unknown else 0,
-        skew_seconds=None if unknown in (rows, census) else 0,
+        skew_seconds=skew_seconds,
         status_map=MappingProxyType(status_map), failure=failure,
     )
 
 
-def _snapshots(labels, *, offline=(), degraded=(), count_unknown=(), done=None):
+def _snapshots(
+    labels, *, offline=(), degraded=(), count_unknown=(), count_stale=(), done=None,
+):
     """``{label: TaskSnapshot}`` for *labels*, in order, routed by membership."""
     counts = done or {}
     health = dict.fromkeys(offline, 'offline')
     health.update(dict.fromkeys(degraded, 'degraded'))
     health.update(dict.fromkeys(count_unknown, 'count_unknown'))
+    health.update(dict.fromkeys(count_stale, 'count_stale'))
     return {
         label: _snapshot(health=health.get(label, 'ok'), done=counts.get(label, 0))
         for label in labels
@@ -224,7 +241,7 @@ def _snapshots(labels, *, offline=(), degraded=(), count_unknown=(), done=None):
 _TASKS_KEYS = {
     'TASKS_SNAPSHOT', 'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS',
     'TASKS_DEGRADED_PROJECTS', 'TASKS_COUNT_UNKNOWN_PROJECTS',
-    'TASKS_PROJECT_COUNT', 'served_at',
+    'TASKS_COUNT_STALE_PROJECTS', 'TASKS_PROJECT_COUNT', 'served_at',
 }
 """The default render's whole payload. DONE_COUNTS and ACTIVE_TASKS are gone,
 and their ABSENCE is asserted rather than an empty value. Both were top-level
@@ -337,12 +354,12 @@ def _render_through_the_real_collector(client, canned):
     """
     import dashboard.data.task_snapshot as snapshot_mod
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             return client.get('/api/v2/dashboard/tasks')
     finally:
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
 
 
 def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, caplog):
@@ -371,7 +388,7 @@ def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, cap
     import logging
     from datetime import datetime
 
-    from test_task_snapshot import CannedMCP, _raw_row
+    from _canned_mcp import CannedMCP, _raw_row
 
     label = client.app.state.config.project_root.name
     pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'done'))
@@ -391,6 +408,7 @@ def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, cap
     assert entry['rows']['state'] == 'fresh', entry['rows']
     # (b) A healthy tree is named in no banner.
     assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == []
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == []
     assert body['TASKS_OFFLINE_PROJECTS'] == []
     # (c) Nothing on the payload claims to have been measured after it was served.
     served_at = datetime.fromisoformat(body['served_at'])
@@ -421,10 +439,11 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
     import logging
     from datetime import datetime, timedelta
 
-    from test_task_snapshot import CannedMCP, _raw_row
+    from _canned_mcp import CannedMCP, _raw_row
+    from _dt_helpers import installed_clock
 
     import dashboard.data.task_snapshot as snapshot_mod
-    from dashboard.data.utils import resolve_now
+    from dashboard.api.clock import live_clock
 
     config = client.app.state.config
     root = config.project_root
@@ -436,10 +455,10 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
     )
     instants = iter(())
 
-    def b_clock(now):
-        return next(instants, None) or resolve_now(now)
+    def b_clock():
+        return next(instants, None) or live_clock()
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             render_a = client.get('/api/v2/dashboard/tasks')
@@ -450,12 +469,12 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
             render_b = a_as_of - timedelta(seconds=1)
             instants = iter([render_b])
             with (
-                patch('dashboard.api.tasks.resolve_now', new=b_clock),
+                installed_clock(client.app, b_clock),
                 caplog.at_level(logging.WARNING),
             ):
                 resp = client.get('/api/v2/dashboard/tasks')
     finally:
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -468,13 +487,6 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
     assert datetime.fromisoformat(body['served_at']) >= a_as_of
     assert not [
         record for record in caplog.records
-        if 'this is a BUG, not an outage' in record.getMessage()
-    ]
-
-
-def _bug_warnings(caplog):
-    return [
-        record.getMessage() for record in caplog.records
         if 'this is a BUG, not an outage' in record.getMessage()
     ]
 
@@ -493,10 +505,9 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
     import logging
     from dataclasses import replace
     from datetime import UTC, datetime, timedelta
-    from pathlib import Path
 
     import httpx
-    from test_task_snapshot import CannedMCP, _raw_row
+    from _canned_mcp import CannedMCP, _raw_row
 
     import dashboard.data.task_snapshot as snapshot_mod
     from dashboard.data.datum import DatumInvariant
@@ -519,20 +530,18 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
         healthy,
         census=replace(healthy.census, as_of=datetime.now(UTC) + timedelta(hours=1)),
     )
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             asyncio.run(_measure_earlier())
+        _install_roots(client, [Path('/proj') / label])
         with patch(
             'dashboard.api.tasks.collect_tasks_with_counts',
             new=AsyncMock(return_value=([], {label: broken})),
-        ), patch(
-            'dashboard.api.tasks._all_project_roots',
-            new=lambda config: [Path('/proj') / label],
         ), caplog.at_level(logging.WARNING):
             resp = client.get('/api/v2/dashboard/tasks')
     finally:
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
 
     assert resp.status_code == 200, resp.text
     entry = resp.json()['TASKS_SNAPSHOT'][label]
@@ -542,52 +551,14 @@ def test_a_snapshot_that_breaks_the_envelope_borrows_no_last_good(client, caplog
     assert DatumInvariant.FRESHNESS_BOUND.value in entry['census']['reason']
     assert (entry['in_progress_live'], entry['in_progress_stranded']) == (None, None)
     assert entry['skew_seconds'] is None
-    assert len(_bug_warnings(caplog)) == 1, _bug_warnings(caplog)
-
-
-def test_a_terminal_window_that_breaks_the_envelope_is_unknown_not_a_500(client, caplog):
-    """The window degrades to unknown by the same rule as a root's snapshot.
-
-    A ``lower_bound`` datum with no reason breaks the envelope. The key still
-    answers, as an explained unknown, and the rest of the payload survives.
-    """
-    import logging
-    from datetime import UTC, datetime
-    from pathlib import Path
-
-    from dashboard.data.datum import Datum, DatumInvariant, DatumState
-    from dashboard.data.task_snapshot import FRESHNESS_BOUND_SECONDS
-
-    label = 'p0'
-    unexplained = Datum(
-        [], datetime.now(UTC), DatumState.LOWER_BOUND, None, FRESHNESS_BOUND_SECONDS,
-    )
-    with patch(
-        'dashboard.api.tasks.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], _snapshots([label]))),
-    ), patch(
-        'dashboard.api.tasks._all_project_roots',
-        new=lambda config: [Path('/proj') / label],
-    ), patch(
-        'dashboard.api.tasks.acquire_terminal_window',
-        new=AsyncMock(return_value=unexplained),
-    ), caplog.at_level(logging.WARNING):
-        resp = client.get(f'/api/v2/dashboard/tasks?terminal={label}')
-
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    window = body[f'TASKS_TERMINAL:{label}']
-    assert window['state'] == 'unknown', window
-    assert window['value'] is None and window['as_of'] is None
-    assert DatumInvariant.REASON_REQUIRED.value in window['reason']
-    assert body['TASKS_SNAPSHOT'][label]['census']['state'] == 'fresh'
-    assert len(_bug_warnings(caplog)) == 1, _bug_warnings(caplog)
+    assert len(bug_warnings(caplog)) == 1, bug_warnings(caplog)
 
 
 _TASK_ROW_KEYS = frozenset({
     'id', 'project', 'title', 'status', 'agent',
     'loops', 'attempts', 'lane', 'phase', 'lane_state', 'runtime_offline',
     'runtime_status', 'claimant_run_id', 'heartbeat_at', 'stranded',
+    'created_at', 'created_at_source',
     'meta_files', 'train', 'external_deps', 'prd', 'started', 'deps',
 })
 """One active ``TaskRow``'s keys: ``_build_task_row``'s plus ``started`` and ``deps``.
@@ -595,6 +566,9 @@ _TASK_ROW_KEYS = frozenset({
 A literal rather than a derivation, so that adding a field to the wire is a
 deliberate edit here.
 """
+
+_DEFERRED_TASK_ROW_KEYS = _TASK_ROW_KEYS | {'deferral'}
+"""A deferred row's keys: every active row's plus ``deferral``, which no other row carries."""
 
 _RAW_ONLY_KEYS = frozenset({
     'description', 'priority', 'dependencies', 'metadata', 'updated_at',
@@ -612,13 +586,20 @@ def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
     ``Datum[list[TaskRow]]``. The snapshot is now the rows' only exposure, so
     each one must carry exactly the shaped fields.
     """
-    from test_task_snapshot import CannedMCP, _raw_row
+    from datetime import UTC
+
+    from _canned_mcp import CannedMCP, _raw_row
+    from shared.task_deferral import PlanningDeferral, record_to_json
 
     label = client.app.state.config.project_root.name
-    pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'blocked'))
+    pairs = ((1, 'in-progress'), (2, 'pending'), (3, 'blocked'), (4, 'deferred'))
+    stamped = datetime.now(UTC)
+    planning = record_to_json(PlanningDeferral(deferred_at=stamped, stamped_at=stamped))
     canned = CannedMCP(
         rows=[
-            _raw_row(task_id, status, metadata={'files': ['a.py'], 'prd': 'plans/x.md'})
+            _raw_row(task_id, status, metadata={
+                'files': ['a.py'], 'prd': 'plans/x.md', 'deferral': planning,
+            })
             for task_id, status in pairs
         ],
         status_map=dict(pairs),
@@ -632,18 +613,17 @@ def test_the_snapshot_rows_on_the_wire_are_the_shaped_task_rows(client):
     wire_rows = body['TASKS_SNAPSHOT'][label]['rows']['value']
     assert len(wire_rows) == len(pairs)
     for row in wire_rows:
-        assert set(row) == _TASK_ROW_KEYS, sorted(set(row) ^ _TASK_ROW_KEYS)
+        keys = _DEFERRED_TASK_ROW_KEYS if row['status'] == 'deferred' else _TASK_ROW_KEYS
+        assert set(row) == keys, sorted(set(row) ^ keys)
         assert not set(row) & _RAW_ONLY_KEYS
 
 
 def test_tasks_surfaces_offline_marker_when_mcp_unreachable(client):
     """When every root's read demonstrably failed, the payload sets ``offline=True``."""
+    _install_roots(client, _fake_roots(1))
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([], _snapshots(['dark-factory'], offline=['dark-factory']))),
-    ), patch(
-        'dashboard.api.tasks._all_project_roots',
-        new=lambda config: _fake_roots(1),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
@@ -728,32 +708,50 @@ def test_tasks_endpoint_asks_for_no_terminal_cap(client):
 
 
 def _fake_roots(n):
-    """N distinct project roots, for patching ``app._all_project_roots``.
+    """N distinct project roots: the roster ``_install_roots`` puts on the running config.
 
     The route-level ``client`` fixture runs against a single isolated temp
     root, so "k of N failed with k < N" is not expressible against the real
-    config at all. Patching the root enumerator is the seam ``api_tasks``
-    itself uses to learn N, so a test that patches it is asserting on the same
-    fact the handler reads — not on a parallel fixture that could drift.
+    config at all. The installed config is the same one ``api_tasks`` reads to
+    learn N, so a test that installs it is asserting on the same fact the
+    handler reads — not on a parallel fixture that could drift.
     """
-    from pathlib import Path
-
     return [Path(f'/proj/p{i}') for i in range(n)]
+
+
+class _NoRoots(DashboardConfig):
+    """The degenerate empty roster, which no stock config can spell: it always names a primary."""
+
+    @property
+    def all_project_roots(self) -> tuple[Path, ...]:
+        return ()
+
+
+def _install_roots(client, roots):
+    """Install, on the running app, a config whose roster is exactly *roots*."""
+    config = client.app.state.config
+    if roots:
+        client.app.state.config = dataclasses.replace(
+            config, project_root=roots[0], known_project_roots=list(roots[1:]),
+        )
+    else:
+        client.app.state.config = _NoRoots(**dataclasses.asdict(config))
 
 
 def _tasks_body(
     client, *, offline_projects, degraded_projects=(),
-    count_unknown_projects=(), total_roots,
+    count_unknown_projects=(), count_stale_projects=(), total_roots,
 ):
     """GET /api/v2/dashboard/tasks with a canned collector result and N roots.
 
-    The three lists are no longer RETURNED by the collector — they are derived
+    The project lists are not RETURNED by the collector — they are derived
     from the per-root units — so the fixture builds the units that must yield
     them. A test that could only state the lists directly would be asserting
     the handler copies a list; this one asserts it reads a state machine.
     """
     labels = sorted(
-        {*offline_projects, *degraded_projects, *count_unknown_projects}
+        {*offline_projects, *degraded_projects, *count_unknown_projects,
+         *count_stale_projects}
         | {f'p{i}' for i in range(total_roots)}
     )
     collector = AsyncMock(
@@ -764,12 +762,12 @@ def _tasks_body(
                 offline=offline_projects,
                 degraded=degraded_projects,
                 count_unknown=count_unknown_projects,
+                count_stale=count_stale_projects,
             ),
         )
     )
-    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=collector), patch(
-        'dashboard.api.tasks._all_project_roots', new=lambda config: _fake_roots(total_roots)
-    ):
+    _install_roots(client, _fake_roots(total_roots))
+    with patch('dashboard.api.tasks.collect_tasks_with_counts', new=collector):
         resp = client.get('/api/v2/dashboard/tasks')
     assert resp.status_code == 200
     return resp.json()
@@ -860,7 +858,7 @@ def test_tasks_payload_carries_the_root_count_the_banner_denominates_with(client
 
     The partial-outage notice reads "k of N projects". ``k`` counts entries in
     ``TASKS_OFFLINE_PROJECTS`` — task project roots, from
-    ``active_tasks._all_project_roots``. ``N`` was
+    ``DashboardConfig.all_project_roots``. ``N`` was
     ``(DF_T.PROJECTS || []).length``, the ORCHESTRATOR-derived project list
     from /api/v2/dashboard/orchestrators — a different population. A root with
     no orchestrator, or an orchestrator with no task root, makes them diverge,
@@ -904,479 +902,6 @@ def test_tasks_payload_keeps_file_locks_out_and_carries_the_banner_facts(client)
         'an absent key leaves the client on its seeded default; an empty dict '
         'would read as a measured "no project has any done tasks"'
     )
-
-
-# ---------------------------------------------------------------------------
-# /api/v2/dashboard/tasks?terminal=<project> — the on-demand window (task 5587)
-# ---------------------------------------------------------------------------
-
-
-def _terminal_row(task_id, status='done'):
-    """One raw MCP ``get_tasks`` row in a terminal status, distinguishable by id."""
-    return {
-        'id': task_id,
-        'title': f'task {task_id}',
-        'status': status,
-        'dependencies': [],
-        'metadata': {},
-        'updatedAt': f'2026-01-0{task_id % 9 + 1}T00:00:00+00:00',
-    }
-
-
-def _terminal_render(
-    client, monkeypatch, *, terminal, labels=('dark-factory',),
-    terminal_rows=(), done=None, window=None, count_unknown=(),
-):
-    """``GET /tasks?terminal=<terminal>`` over a canned substrate; ``(body, calls)``.
-
-    The collector and the root enumerator are canned so the CENSUS the window
-    is positioned from is known exactly — the window's offset is a function of
-    the terminal population, so a test that cannot state that population
-    cannot check the offset. ``mcp_tool_call`` is left REAL underneath, so the
-    terminal read is asserted at the wire: "the handler discards the rows
-    afterwards" is precisely the defect, and which rows the server was asked
-    for is observable nowhere else.
-    """
-    from pathlib import Path
-
-    import dashboard.data.task_snapshot as snapshot_mod
-
-    if window is not None:
-        monkeypatch.setattr(snapshot_mod, '_TERMINAL_FETCH_WINDOW', window)
-
-    roots = [Path('/proj') / label for label in labels]
-    rendered = {str(root) for root in roots}
-    calls: list[dict] = []
-
-    async def _mcp(http_client, url, tool, args, **kwargs):
-        # Only THIS render's roots are logged. The lifespan's burndown loop
-        # snapshots the real configured roots through this same patched seam
-        # as the app starts, and its reads landed here whenever the two
-        # overlapped (measured: 5 of 10 runs of this class failed on them).
-        # Nothing but the handler can reach a /proj root: only the patched
-        # enumerator below hands one out.
-        if args.get('project_root') in rendered:
-            # kwargs is kept: the per-request budget rides as ``timeout=`` and
-            # is assertable at the wire nowhere else.
-            calls.append({'tool': tool, 'args': dict(args), 'kwargs': dict(kwargs)})
-        if tool == 'get_statuses':
-            return {'statuses': {}}
-        rows = sorted(terminal_rows, key=lambda row: int(row['id']))  # ORDER BY id ASC
-        statuses = args.get('statuses')
-        if statuses is not None:
-            rows = [row for row in rows if row.get('status') in statuses]
-        page_size = args.get('page_size')
-        if page_size is not None:
-            start = args.get('offset') or 0
-            rows = rows[start:start + page_size]
-        return {'tasks': rows}
-
-    snapshots = _snapshots(labels, count_unknown=count_unknown, done=done)
-    with patch(
-        'dashboard.api.tasks.collect_tasks_with_counts',
-        new=AsyncMock(return_value=([], snapshots)),
-    ), patch(
-        'dashboard.api.tasks._all_project_roots',
-        new=lambda config: list(roots),
-    ), patch('dashboard.data.tasks.mcp_tool_call', new=_mcp):
-        resp = client.get(f'/api/v2/dashboard/tasks?terminal={terminal}')
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    # data.js::ON_DEMAND_KEYS.terminal.key names the body key AND the DF_DATA
-    # key, and refreshOne applies body[key] verbatim, so the window must answer
-    # under exactly one flat per-project key. A nested TASKS_TERMINAL map would
-    # pass every read below and never reach the browser.
-    assert _terminal_keys(body) == [f'TASKS_TERMINAL:{terminal}'], (
-        'the window must answer under the ONE flat key the client reads, and '
-        f'under no other terminal key; got {_terminal_keys(body)}'
-    )
-    return body, calls
-
-
-def _terminal_keys(body):
-    """Every key of *body* naming a terminal window, bare or per-project."""
-    return sorted(key for key in body if key.startswith('TASKS_TERMINAL'))
-
-
-def _terminal_get_tasks(calls):
-    return [call for call in calls if call['tool'] == 'get_tasks']
-
-
-def _node():
-    """The ``node`` binary: a skip locally, a FAILURE under CI.
-
-    The ``test_chip_label_disambiguation.py::_node`` idiom — CI carries node,
-    so its absence there is a toolchain regression, not an optional extra.
-    """
-    import os
-    import shutil
-
-    path = shutil.which('node')
-    if not path:
-        if os.environ.get('CI'):
-            pytest.fail('node is required in CI but not found on PATH')
-        pytest.skip('node not available')
-    return path
-
-
-# The REAL client's on-demand path, run over a body handed in on stdin. The
-# three scripts load in index.html's order because each destructures the one
-# before it at module scope, and `document` stays undefined on purpose: data.js
-# starts polling only in a real browser document, so without one it loads
-# inert (dashboard/tests/js/_data_loader.mjs::loadDataJs records why).
-_ON_DEMAND_CLIENT = r"""
-const fs = require('fs');
-const path = require('path');
-const [redux, project] = process.argv.slice(1);
-const body = JSON.parse(fs.readFileSync(0, 'utf8'));
-globalThis.window = { dispatchEvent() {} };
-require(path.join(redux, 'endpoint_staleness.js'));
-require(path.join(redux, 'datum.js'));
-const api = require(path.join(redux, 'data.js'));
-api.requestOnDemand('terminal', project, {
-  state: api.createPollState(),
-  deps: { fetchImpl: () => Promise.resolve({ ok: true, json: async () => body }), now: () => 1 },
-}).then(outcome => {
-  const datum = api.datumFor(`TASKS_TERMINAL:${project}`);
-  process.stdout.write(JSON.stringify({ outcome, datum }));
-});
-"""
-
-
-def _request_on_demand(body, project):
-    """``(outcome, datum)`` from data.js's REAL ``requestOnDemand`` over *body*."""
-    import json
-    import subprocess
-    from pathlib import Path
-
-    redux = Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
-    result = subprocess.run(
-        [_node(), '-e', _ON_DEMAND_CLIENT, str(redux), project],
-        input=json.dumps(body), capture_output=True, text=True, timeout=60,
-    )
-    assert result.returncode == 0, (
-        f'the client driver exited {result.returncode}\n'
-        f'--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}'
-    )
-    applied = json.loads(result.stdout)
-    return applied['outcome'], applied['datum']
-
-
-class TestTerminalWindow:
-    """``?terminal=<project>`` — the only render that pays for terminal rows.
-
-    The default render stopped fetching them, so every fact the retired
-    ``TestShapeOneProjectNarrowing`` terminal cases protected — the window
-    reaches the HIGH-id end, it goes through ``fetch_task_page``, truncation
-    WARNS rather than capping silently, and an unpositionable window is not
-    fetched at all — has to hold HERE or it holds nowhere.
-    """
-
-    def test_the_window_is_a_lower_bound_datum_naming_the_bound(
-        self, client, monkeypatch
-    ):
-        """(a) The disclosure IS the state: a windowed read under-reports, and says so.
-
-        The window size is parsed OUT of ``reason`` and compared to the module
-        constant rather than matched against a fixed string, so a reworded
-        message cannot silently change the bound the payload discloses.
-        """
-        import re
-        from datetime import datetime
-
-        from dashboard.data.task_snapshot import _TERMINAL_FETCH_WINDOW
-
-        body, _calls = _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
-            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            done={'dark-factory': 10},
-        )
-
-        entry = body['TASKS_TERMINAL:dark-factory']
-        assert entry['state'] == 'lower_bound', (
-            'a windowed read is a measured value known to under-report — the '
-            f'state is the disclosure, got {entry["state"]!r}'
-        )
-        assert len(entry['value']) == 10
-        assert all(row['started'] == 0 for row in entry['value']), (
-            'a finished task has no elapsed runtime to report'
-        )
-        assert all(row['completed'] for row in entry['value']), (
-            'a terminal row carries the completion instant the substrate offers'
-        )
-        as_of = datetime.fromisoformat(entry['as_of'])
-        assert as_of.utcoffset() is not None, (
-            'as_of must name one moment, not a local-clock reading'
-        )
-        assert as_of <= datetime.fromisoformat(body['served_at'])
-        assert _TERMINAL_FETCH_WINDOW in [
-            int(number) for number in re.findall(r'\d+', entry['reason'] or '')
-        ], (
-            'the reason must disclose the window the rows were read under, so '
-            'a consumer can tell "these are all of them" from "these are the '
-            f'newest {_TERMINAL_FETCH_WINDOW}"; got {entry["reason"]!r}'
-        )
-
-    def test_the_window_reaches_the_high_id_end(self, client, monkeypatch):
-        """(b) ``offset`` must select the NEWEST terminal rows, not the oldest.
-
-        Relocated from ``TestShapeOneProjectNarrowing``. ``page_size``/
-        ``offset`` slice an ASCENDING-id list, so a naive ``offset=0`` returns
-        the oldest terminal rows — the opposite of what the tab renders.
-        """
-        body, calls = _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
-            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            done={'dark-factory': 10}, window=3,
-        )
-
-        page = _terminal_get_tasks(calls)
-        assert len(page) == 1, f'exactly one windowed read, got {page}'
-        assert page[0]['args'].get('statuses') == ['cancelled', 'done']
-        assert page[0]['args'].get('page_size') == 3
-        assert page[0]['args'].get('offset') == 7, 'max(0, n_terminal - window)'
-
-        emitted = sorted(
-            int(row['id'].rsplit('T-', 1)[-1])
-            for row in body['TASKS_TERMINAL:dark-factory']['value']
-        )
-        assert emitted == [107, 108, 109], (
-            f'the window must reach the high-id end, got {emitted}'
-        )
-
-    def test_the_terminal_window_goes_through_fetch_task_page(
-        self, client, monkeypatch
-    ):
-        """(b) The read that wants a PARTIAL answer names itself one.
-
-        Relocated from ``TestShapeOneProjectNarrowing``. After task 5018 the
-        partial-answer intent lives in the function name rather than in an
-        argument combination, so a reader cannot mistake this for a whole-tree
-        read — and ``fetch_tasks``, the whole-set read, must not be reached at
-        all on this path.
-        """
-        from shared.task_statuses import TERMINAL
-
-        import dashboard.data.task_snapshot as snapshot_mod
-
-        whole: list[dict] = []
-        paged: list[dict] = []
-
-        async def _whole_set(client_, config, project_root, **kwargs):
-            whole.append(kwargs)
-            return []
-
-        async def _one_page(client_, config, project_root, **kwargs):
-            paged.append(kwargs)
-            return []
-
-        monkeypatch.setattr(snapshot_mod, 'fetch_tasks', _whole_set)
-        monkeypatch.setattr(snapshot_mod, 'fetch_task_page', _one_page)
-
-        _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
-            done={'dark-factory': 10},
-        )
-
-        assert len(paged) == 1, f'exactly one windowed read, got {paged}'
-        assert paged[0]['statuses'] == sorted(TERMINAL)
-        assert paged[0]['page_size'] == snapshot_mod._TERMINAL_FETCH_WINDOW
-        assert paged[0]['offset'] == max(
-            0, 10 - snapshot_mod._TERMINAL_FETCH_WINDOW
-        )
-        assert whole == [], (
-            'the terminal window is a PARTIAL read and must not borrow the '
-            f'whole-set read to make it, got {whole}'
-        )
-
-    def test_no_truncation_warning_when_the_population_fits(
-        self, client, monkeypatch, caplog
-    ):
-        """(c) n_terminal <= window → offset 0, every terminal row, no WARNING."""
-        import logging
-
-        body, calls = _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
-            terminal_rows=[_terminal_row(i) for i in range(100, 106)],
-            done={'dark-factory': 6}, window=10,
-        )
-
-        assert _terminal_get_tasks(calls)[0]['args'].get('offset') == 0
-        assert len(body['TASKS_TERMINAL:dark-factory']['value']) == 6
-        assert not [
-            record for record in caplog.records
-            if record.name == 'dashboard.data.task_snapshot'
-            and record.levelno >= logging.WARNING
-        ], 'no truncation WARNING may fire when the population fits the window'
-
-    def test_truncation_warns_naming_project_and_counts(
-        self, client, monkeypatch, caplog
-    ):
-        """(c) n_terminal > window → a WARNING naming project, count and window.
-
-        Relocated from ``TestShapeOneProjectNarrowing``. No silent cap: the
-        window selects by descending id while a reader expects recency, so
-        when the gap can bite it has to be visible in the log.
-        """
-        import logging
-
-        with caplog.at_level(logging.WARNING, logger='dashboard.data.task_snapshot'):
-            _terminal_render(
-                client, monkeypatch, terminal='dark-factory',
-                terminal_rows=[_terminal_row(i) for i in range(100, 112)],
-                done={'dark-factory': 12}, window=3,
-            )
-
-        messages = [
-            record.getMessage() for record in caplog.records
-            if record.name == 'dashboard.data.task_snapshot'
-            and record.levelno >= logging.WARNING
-        ]
-        assert any(
-            'dark-factory' in message and '12' in message and '3' in message
-            for message in messages
-        ), f'expected a truncation WARNING naming project/count/window, got {messages}'
-
-    def test_an_unpositionable_window_is_unknown_not_the_oldest_rows(
-        self, client, monkeypatch
-    ):
-        """(d) No census, no offset — and offset 0 would serve the OLDEST rows.
-
-        Relocated from ``test_offline_status_map_never_emits_the_oldest_
-        terminal_rows``. The offset is ``n_terminal - window`` and
-        ``n_terminal`` comes from the census; with the census unmeasured the
-        offset collapses to ``max(0, 0 - window) == 0``, which slices the
-        ASCENDING-id list at its OLDEST end — months-old rows presented as the
-        newest. Emitting nothing and saying why is the honest failure.
-        """
-        body, calls = _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
-            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            count_unknown=['dark-factory'], window=3,
-        )
-
-        entry = body['TASKS_TERMINAL:dark-factory']
-        assert entry['state'] == 'unknown'
-        assert entry['value'] is None, (
-            'omitting the rows is honest; showing the OLDEST as the newest is not'
-        )
-        assert entry['as_of'] is None
-        assert (entry['reason'] or '').strip(), (
-            'an unknown datum must say why it is unknown'
-        )
-        assert _terminal_get_tasks(calls) == [], (
-            'a window that cannot be positioned must not be fetched at all, '
-            f'got {_terminal_get_tasks(calls)}'
-        )
-        # The rest of the payload is unaffected — this is a partial
-        # degradation of one key, not a failed render.
-        assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['dark-factory']
-
-    def test_an_unconfigured_project_is_unknown_not_a_500(
-        self, client, monkeypatch
-    ):
-        """(e) A name that resolves to no root is answered, not crashed on.
-
-        An empty success would be the worse failure of the two: it reads as
-        "this project has no terminal tasks", which is a measurement nobody
-        made.
-        """
-        body, calls = _terminal_render(
-            client, monkeypatch, terminal='no-such-project',
-            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            done={'dark-factory': 10},
-        )
-
-        entry = body['TASKS_TERMINAL:no-such-project']
-        assert entry['state'] == 'unknown'
-        assert entry['value'] is None
-        assert 'no-such-project' in (entry['reason'] or ''), (
-            f'the reason must name what could not be resolved, got {entry["reason"]!r}'
-        )
-        assert _terminal_get_tasks(calls) == []
-
-    def test_no_terminal_query_carries_no_terminal_key(self, client):
-        """(f) No terminal key at all, bare or per-project — an empty one is a claim."""
-        with patch(
-            'dashboard.api.tasks.collect_tasks_with_counts',
-            new=AsyncMock(return_value=([], _snapshots(['dark-factory']))),
-        ):
-            resp = client.get('/api/v2/dashboard/tasks')
-
-        assert resp.status_code == 200
-        body = resp.json()
-        assert _terminal_keys(body) == []
-        assert set(body) == _TASKS_KEYS
-
-    def test_the_terminal_fetch_spends_the_third_roster_slot(
-        self, client, monkeypatch
-    ):
-        """(g) The window is bounded by the budget the roster reserved for it.
-
-        The roster names three bounded OPERATIONS and the default render spends
-        two; this render spends the third. The arithmetic
-        ``PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <=
-        _TASKS_PER_PROJECT_BUDGET`` is what makes that affordable, and the
-        ``timeout=`` at the wire is what makes it true rather than aspirational.
-        """
-        from dashboard.data.active_tasks import _TASKS_PER_PROJECT_BUDGET
-        from dashboard.data.task_snapshot import (
-            PER_CALL_TIMEOUT,
-            PER_PROJECT_MCP_CALLS,
-        )
-
-        _body, calls = _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
-            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            done={'dark-factory': 10},
-        )
-
-        page = _terminal_get_tasks(calls)
-        assert len(page) == 1
-        assert page[0]['kwargs'].get('timeout') == PER_CALL_TIMEOUT, (
-            'the terminal read must carry the per-operation budget its roster '
-            f'slot reserves, got {page[0]["kwargs"]}'
-        )
-        assert any('terminal' in slot for slot in PER_PROJECT_MCP_CALLS), (
-            'the roster must name the slot this read spends, or the budget '
-            f'arithmetic is not about it: {PER_PROJECT_MCP_CALLS}'
-        )
-        assert PER_CALL_TIMEOUT * len(PER_PROJECT_MCP_CALLS) <= _TASKS_PER_PROJECT_BUDGET
-
-    def test_the_real_client_applies_the_window_this_endpoint_serves(
-        self, client, monkeypatch
-    ):
-        """(h) Both halves of the key contract, run against each other.
-
-        ``data.js::ON_DEMAND_KEYS.terminal.key`` names the body key AND the
-        DF_DATA key, and ``refreshOne`` applies ``body[key]`` verbatim. Each
-        side once pinned only its own literal, both suites were green, and the
-        pair still disagreed: this endpoint nested the window under
-        ``TASKS_TERMINAL`` while the client read ``TASKS_TERMINAL:<project>``,
-        so the window would never have applied — and nothing would have said
-        so, because ``applied`` is reported for a body that merely LACKS the
-        key. Feeding this endpoint's own JSON through the REAL
-        ``requestOnDemand`` fails on a rename on either side.
-        """
-        body, _calls = _terminal_render(
-            client, monkeypatch, terminal='dark-factory',
-            terminal_rows=[_terminal_row(i) for i in range(100, 110)],
-            done={'dark-factory': 10},
-        )
-
-        outcome, stored = _request_on_demand(body, 'dark-factory')
-
-        assert outcome == 'applied'
-        assert stored['state'] == 'lower_bound', (
-            'the client found no window under the key it reads, so it still '
-            f'holds its pre-request placeholder: {stored}'
-        )
-        assert stored['_served_at'] == body['served_at'], (
-            'the receipt must come from the body the window arrived in'
-        )
-        assert stored['value'] == body['TASKS_TERMINAL:dark-factory']['value'], (
-            'the client must store the row list the server served, unchanged'
-        )
 
 
 def test_memory_returns_memory_status(client):
@@ -1815,7 +1340,7 @@ def escalation_caches():
     def _clear() -> None:
         escalation_corpus._corpus_cache_clear()
         escalation_routes._analytics_memo_clear()
-        task_snapshot._snapshot_cache_clear()
+        task_snapshot.clear_snapshot_cache()
         task_lookup._lookup_cache_clear()
 
     _clear()
@@ -2260,13 +1785,17 @@ def _proj_raw(*roots: str) -> dict:
     from datetime import UTC
 
     from dashboard.data.datum import Datum, DatumState
+    from dashboard.data.merge_queue import MergeAttempts
 
     read_at = datetime.now(UTC)
     return {
         root: {
-            'depth_timeseries': {'labels': [], 'values': []},
-            'outcomes': {'labels': [], 'values': []},
-            'latency': {},
+            'depth_timeseries': Datum(
+                {'labels': [], 'values': [], 'bucket_minutes': 15},
+                read_at, DatumState.FRESH, None, 30,
+            ),
+            'attempts': Datum(MergeAttempts(), read_at, DatumState.FRESH, None, 30),
+            'train_throughput': Datum({}, read_at, DatumState.FRESH, None, 30),
             'recent': [],
             'recent_total': Datum(0, read_at, DatumState.FRESH, None, 30),
             'speculative': Datum(
@@ -2399,7 +1928,7 @@ def test_tasks_offline_flag_survives_a_hang_that_degrades_most_roots(client):
     """No root produced rows + at least one demonstrably failed IS the outage.
 
     The handler's own budget caps how many roots can reach the offline state:
-    in a hang each root burns up to ``_TASKS_PER_PROJECT_BUDGET`` before
+    in a hang each root burns up to ``TASKS_PER_PROJECT_BUDGET`` before
     ``wait_for`` cuts it, and a cut root lands in ``degraded``, not
     ``offline``. A stricter ``len(offline) == total_roots`` test therefore
     made this flag unreachable on a nine-root config for the most likely total
@@ -2460,6 +1989,42 @@ def test_tasks_count_unknown_root_vetoes_the_outage_flag(client):
     assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['p1']
 
 
+def test_tasks_count_stale_root_vetoes_the_outage_flag(client):
+    """A count-stale root's row read succeeded, so like a count-unknown root it is no absence of data."""
+    body = _tasks_body(
+        client,
+        offline_projects=['p0'],
+        count_stale_projects=['p1'],
+        total_roots=2,
+    )
+
+    assert body['TASKS_OFFLINE'] is False, (
+        "p1's rows were read — only its done count is aged, "
+        'which is a different (and separately reported) fact from an outage'
+    )
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == ['p1']
+    assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == []
+
+
+def test_tasks_count_stale_root_is_listed_apart_from_count_unknown(client):
+    """A stale census is named on its own list, not as an unknown count.
+
+    Its surfaces render the last measured value with an age badge, so a banner
+    calling its done count unknown would contradict them.
+    """
+    body = _tasks_body(
+        client,
+        offline_projects=['p0'],
+        count_unknown_projects=['p1'],
+        count_stale_projects=['p2'],
+        total_roots=3,
+    )
+
+    assert body['TASKS_OFFLINE_PROJECTS'] == ['p0']
+    assert body['TASKS_COUNT_UNKNOWN_PROJECTS'] == ['p1']
+    assert body['TASKS_COUNT_STALE_PROJECTS'] == ['p2']
+
+
 def test_last_good_rows_do_not_veto_the_outage_flag(client):
     """Rows served from a root's last good were not measured this render.
 
@@ -2480,11 +2045,10 @@ def test_last_good_rows_do_not_veto_the_outage_flag(client):
         'canned offline root', FRESHNESS_BOUND_SECONDS,
     )
     offline = replace(_snapshot(health='offline'), rows=last_good)
+    _install_roots(client, _fake_roots(1))
     with patch(
         'dashboard.api.tasks.collect_tasks_with_counts',
         new=AsyncMock(return_value=([row], {'p0': offline})),
-    ), patch(
-        'dashboard.api.tasks._all_project_roots', new=lambda config: _fake_roots(1),
     ):
         resp = client.get('/api/v2/dashboard/tasks')
 

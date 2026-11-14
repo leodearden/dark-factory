@@ -1,0 +1,34 @@
+{
+ "stream": "S2",
+ "prd_path": "docs/prds/review-all-billing-push-lifecycle-and-unit-of-work.md",
+ "manifest_path": "docs/prds/review-all-billing-push-lifecycle-and-unit-of-work.capability-manifest.yaml",
+ "leaves_estimate": 8,
+ "lead_rulings_on_open_questions": [
+  "In-session rulings by Leo (2026-10-14, ruled_by: human): (1) S2 owns the billing_run_status ledger mechanism and the row's birth; P-Gate (459/460) builds the gate states on it. (2) All three dead states are deleted now; P-Collect gamma (644) re-adds INVOICED and DD_SCHEDULED with its producer.",
+  "Q1: yes — tasks 295 and 1046 set deferred by the lead on 2026-10-15; S2 gamma adopts 295 and zeta adopts 1046 (amend in place at decompose), epsilon adopts 301.",
+  "Q2: whether the monthly close fails on a BREACHED run is P-Gate delta's (task 461, which redefines close success); S2 leaves FleetBillingSummary's verdict alone and leaves a coordination note on 461.",
+  "Q3: keep alpha -> 1180 (S6-theta) as an edge (add-the-edge rule); relax to contention only if S6 lags past S2's dispatch — the lead's call at that time.",
+  "Q4: keep beta2 -> 1211 (S1-theta); P-Gate 459 sits behind S1 by design because the ledger birth is S2's and S2's persist step is S1's.",
+  "Q5: stamp fk-43579bc83b3d on P-Gate mu (476) at decompose; 476 does not join gate 1065 (gate dependencies are program leaves; pre-existing tasks get the key stamp only).",
+  "Q6: resolved under S15 Q2 — task 466 is re-scoped onto S15 alpha1/epsilon; S2 only names 466 as owner of the duplicate-invoice residual."
+ ],
+ "lead_actions_at_decompose": [
+  "gamma = 295 amended in place; epsilon = 301 amended in place; zeta = 1046 amended in place (metadata merge prd_path/prd_task_label/files/keys; set dependencies; dated supersession note)",
+  "S1 is filed, so nothing is held: beta2 -> 1211 (S1-theta); gamma -> 1212 (S1-zeta3), 1214 (S1-kappa), 365 (S1-zeta1); delta -> 1211, 1212, 1214; alpha -> 1147 (S3-beta3), 1151 (S3-epsilon), 1180 (S6-theta); beta1 -> 1100 (S9-gamma1); gamma, delta -> 493 (S13-gamma2); epsilon -> 221",
+  "lead edges after the seat returns: 459 -> beta2 (re-scope note; repath its 4 lifecycle delivered_checks to 459's own delta), 460 -> alpha + beta2 + epsilon (repath bill-account-split-retired to billing/push.py), 637 -> beta2, 639 -> beta1, 644 -> beta2, 663 -> beta1; notes on 461, 462, 464, 465, 466; stamp fk-43579bc83b3d on 476; release S23-beta2 (1117) onto beta1; S15-gamma depends on beta2",
+  "high leaves beta1, beta2, eta -> gate 1065"
+ ],
+ "cross_reference_lines": [
+  "Program row S2: upstream deps S1, S3, S6, S9, S13 (+ task 221); 8 leaves.",
+  "Seam row 'billing_run_status row and its state machine': S2 owns billing/lifecycle.py (codec, LEGAL, transition, typed reads) and the row's birth with its statement; P-Gate adds gate states, actor columns and the close record through it; S15 adds mode and its guarded re-push row; P-Collect deletes arrears, renames recon_collected and re-adds INVOICED/DD_SCHEDULED, each through the one codec.",
+  "P-Gate: 459 (delta0a) depends on S2-beta2 and is re-scoped to APPROVED/ISSUE_REQUESTED, actor columns and stamps, close_run_id + close_record.py, the transitional system:scp-bill path and run_billing(close_run); its migration no longer deletes billing rows. 460 (delta0b) depends on S2-alpha/beta2/epsilon and splits billing/push.py::bill_account into calculate_account + issue_row over push_input. 461: the gate closes by deleting (CALCULATED, RECORD_ATTEMPT|RECORD_PUSH_OUTCOME) from LEGAL; persisting SkipReason moves it to models/ (S9 D3); bill_fleet's outcome commit joins UNIT_OF_WORK_MODULES. 462: the UNDER_METERED refusal is a LEGAL guard. 464: hold_released rides PushInput. 465: issue_attempts exists; eta moves RECORD_ATTEMPT to ISSUE_REQUESTED and adds the lease. 466: owns the duplicate-invoice residual. 476: stamp fk-43579bc83b3d.",
+  "docs/prds/billing-approve-issue-gate.md: dated AMENDED notes at section 0.4, section 4 D1 and section 9.1 pointing at the S2 PRD (reciprocal-ownership fix; the lead applies them as a docs-only commit).",
+  "P-Collect: 637 -> beta2 (drop the nullable arrears and its CHECK clause); 639 -> beta1 (rename via the codec); 644 -> beta2 (re-add INVOICED/DD_SCHEDULED with a CHECK-replacing migration, LEGAL rows and RECON_STATUS_OF entries); 638 serves S23-beta2's arrears axis. Task 663 depends on S2-beta1.",
+  "S23: 1117 (beta2, held) depends on S2-beta1; the lead releases it (commit_planning 1117) after S2 files and re-stamps S23's sidecar.",
+  "S15: gamma depends on S2-beta2; BillingPorts' stripe/gocardless pair becomes providers: ProviderPorts.",
+  "S18: S2-alpha removes 2 validation -> runtime sites; the allowlist entry stays until S12-delta removes the remaining runtime.composition sites.",
+  "S16 / task 221: whichever deletes the no_tariff/tariff_not_found or import_shape_unavailable skip also deletes its SkipReason member and its section 10.2 row.",
+  "S27: S2 owns no INV-1..10; once 1066 lands, S2's leaves re-walk G7 by slug.",
+  "Briefing (interactive on main, after beta2): restate the billing scenarios 'statement committed before the push; only the run goes unrecorded' and the run-state list."
+ ]
+}

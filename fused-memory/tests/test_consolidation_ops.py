@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from fused_memory.config.schema import Mem0UpdateConfig
+from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.services.consolidation_ops import (
     TOPIC_MEMBER_LIMIT,
@@ -284,6 +285,32 @@ class TestTheCanonicalIsMinted:
         assert result['topic'] == TOPIC
         svc.update_memory.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_the_mint_opts_out_of_mem0_retry_deferral(self):
+        """A canonical deferred for retry would land after this op refused,
+        and a re-run would then mint a second canonical for the topic."""
+        svc = make_service()
+
+        await call_execute(svc)
+
+        assert svc.add_memory.await_args.kwargs['defer_transient_mem0_failure'] is False
+
+    @pytest.mark.asyncio
+    async def test_a_mint_left_pending_retry_refuses_and_patches_nothing(self):
+        svc = make_service()
+        svc.add_memory = AsyncMock(
+            return_value=AddMemoryResponse(
+                memory_ids=[], stores_pending_retry=[SourceStore.mem0]
+            )
+        )
+
+        result = await call_execute(svc)
+
+        assert result['error_type'] == 'CanonicalWriteFailed'
+        assert result['topic'] == TOPIC
+        svc.update_memory.assert_not_awaited()
+        svc.delete_memory.assert_not_awaited()
+
 
 class TestThePeersAreTaggedInPlace:
     """Each peer keeps its Qdrant point id, so every citation, parent
@@ -317,6 +344,76 @@ class TestThePeersAreTaggedInPlace:
             assert 'parent_id' not in call.kwargs['metadata_patch']
 
 
+class TestExtraPeerMetaRidesTheTopicPatch:
+    """`extra_peer_meta` carries caller provenance (the executor's run stamp)
+    onto each retained peer in the SAME write as the topic (task 5240)."""
+
+    STAMP = {'x_auto_consolidated_run': RUN_ID}
+
+    @pytest.mark.asyncio
+    async def test_the_stamp_lands_in_the_one_topic_patch(self):
+        svc = make_service()
+
+        await call_execute(svc, extra_peer_meta=self.STAMP)
+
+        assert _patched_ids(svc) == [M1, M2]
+        for call in svc.update_memory.await_args_list:
+            assert call.kwargs['metadata_patch'] == {
+                'topic': TOPIC,
+                'x_auto_consolidated_run': RUN_ID,
+            }
+            assert call.kwargs['content'] is None
+            assert call.kwargs['metadata_mode'] == 'merge'
+
+    @pytest.mark.asyncio
+    async def test_apply_retain_arm_takes_it_directly(self):
+        svc = make_service()
+
+        arm = await apply_retain_arm(svc, **_arm_args(extra_peer_meta=self.STAMP))
+
+        assert isinstance(arm, RetainArmApplied)
+        assert arm.retained == [M1, M2]
+        patches = [c.kwargs['metadata_patch'] for c in svc.update_memory.await_args_list]
+        assert patches == [{'topic': TOPIC, 'x_auto_consolidated_run': RUN_ID}] * 2
+
+    @pytest.mark.asyncio
+    async def test_none_keeps_the_topic_alone(self):
+        svc = make_service()
+
+        await call_execute(svc, extra_peer_meta=None)
+
+        patches = [c.kwargs['metadata_patch'] for c in svc.update_memory.await_args_list]
+        assert patches == [{'topic': TOPIC}] * 2
+
+    @pytest.mark.parametrize(
+        'bad_key', ['run_stamp', 'topic', 'canonical', 'parent_id'],
+    )
+    @pytest.mark.asyncio
+    async def test_a_non_experimental_key_raises_before_any_write(self, bad_key):
+        svc = make_service()
+
+        with pytest.raises(ValueError, match=bad_key):
+            await call_execute(svc, extra_peer_meta={bad_key: 'v'})
+
+        svc.add_memory.assert_not_awaited()
+        svc.update_memory.assert_not_awaited()
+        svc.get_memory_by_id.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_tag_only_stamps_peers_and_leaves_the_incumbent_alone(self):
+        svc = make_service(members=[INCUMBENT, M1, M2], canonical_peers=[INCUMBENT])
+
+        await call_execute(svc, canonical_content=None, extra_peer_meta=self.STAMP)
+
+        svc.add_memory.assert_not_awaited()
+        assert INCUMBENT not in _patched_ids(svc)
+        for call in svc.update_memory.await_args_list:
+            assert call.kwargs['metadata_patch'] == {
+                'topic': TOPIC,
+                'x_auto_consolidated_run': RUN_ID,
+            }
+
+
 class TestAPeerThatCannotBeTaggedIsNamed:
     """One failure costs one peer, never the arm: the peers that CAN be
     tagged are, because re-running to catch the rest would re-write the
@@ -337,6 +434,37 @@ class TestAPeerThatCannotBeTaggedIsNamed:
         ]
         assert result['retain_failures'][0]['id'] == M1
         assert M1 not in _patched_ids(svc)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'metadata',
+        [{'topic': TOPIC, 'canonical': 1}, {'topic': TOPIC, 'canonical': 'true'}, None],
+        ids=['canonical-int-1', 'canonical-string-true', 'metadata-null'],
+    )
+    async def test_a_peer_without_the_bool_marker_is_tagged_not_refused(
+        self, metadata
+    ):
+        """Only the bool True claims canonical, so such a peer is ordinary —
+        including a row whose metadata is not a mapping at all, which
+        degrades to "not canonical" rather than raising out of the arm."""
+        svc = make_service()
+        read = svc.get_memory_by_id.side_effect
+
+        async def _get_with_peer_metadata(*args, **kwargs):
+            row = await read(*args, **kwargs)
+            if row['id'] == M1:
+                row['metadata'] = metadata
+            return row
+
+        svc.get_memory_by_id.side_effect = _get_with_peer_metadata
+
+        result = await call_execute(svc)
+
+        assert not [
+            f for f in result['retain_failures']
+            if f['error_type'] == 'RetainedPeerIsCanonical'
+        ]
+        assert M1 in _patched_ids(svc)
 
     @pytest.mark.asyncio
     async def test_a_peer_that_cannot_be_read_fails_closed(self):

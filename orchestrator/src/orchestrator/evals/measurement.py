@@ -11,7 +11,7 @@ import dataclasses
 import json
 import logging
 import math
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Generic, TypedDict, TypeVar
@@ -37,6 +37,14 @@ T = TypeVar('T')
 
 _REASON_CHARS = 80
 
+_EVAL_HARNESS_PROJECT = 'dark_factory'
+"""The eval harness is dark-factory's instrument, so its LLM calls are
+dark-factory sessions whichever repository's fixture they grade. It names the
+same project as dark-factory-orchestrator.yaml's ``fused_memory.project_id``,
+which nothing derives:
+orchestrator/tests/test_eval_spawn_identity.py::test_eval_calls_file_under_the_operational_project_id
+checks it."""
+
 
 class MeasurementStage(StrEnum):
     ARCHITECT = 'architect'
@@ -45,6 +53,13 @@ class MeasurementStage(StrEnum):
     MATCHER = 'matcher'
     ASSESSOR = 'assessor'
     SYNTHESIZER = 'synthesizer'
+
+
+def _eval_spawn_env(stage: MeasurementStage) -> dict[str, str]:
+    return {
+        'CLAUDE_SPAWN_ROLE': f'eval_{stage.value}',
+        'CLAUDE_SPAWN_PROJECT': _EVAL_HARNESS_PROJECT,
+    }
 
 
 class UnmeasuredCause(StrEnum):
@@ -68,6 +83,15 @@ class UnmeasuredRecord(TypedDict):
     stage: str
     cause: str
     reason: str
+
+
+def format_invocation_errors(
+    records: Sequence[UnmeasuredRecord] | None,
+) -> str | None:
+    """*records* on one line as ``stage:cause: reason``, ``'; '``-joined; ``None`` if none."""
+    if not records:
+        return None
+    return '; '.join(f"{r['stage']}:{r['cause']}: {r['reason']}" for r in records)
 
 
 def _require_type(owner: str, field: str, value: object, expected: type) -> None:
@@ -109,6 +133,17 @@ class Unmeasured:
             'cause': self.cause.value,
             'reason': self.reason,
         }
+
+
+def require_answer_iff_measured(
+    owner: str, field: str, answer: object, unmeasured: Unmeasured | None,
+) -> None:
+    """A verdict either answered or says why it did not — never both, never neither."""
+    if (answer is None) == (unmeasured is None):
+        raise ValueError(
+            f'{owner}.{field} must be None exactly when unmeasured is set; '
+            f'got {field}={answer!r}, unmeasured={unmeasured!r}'
+        )
 
 
 @dataclass(frozen=True)
@@ -220,9 +255,18 @@ async def measured_call(
     with ``ValueError``/``TypeError``/``KeyError``. Never fabricates a value.
     ``cost_usd`` is the spend summed over every attempt. With *usage_gate* the
     call runs through ``invoke_with_cap_retry``, which injects each account's
-    credentials into *invoke_kwargs*. Any other exception propagates.
+    credentials into *invoke_kwargs*. Any other exception propagates. Every
+    call declares the fleet identity ``_eval_spawn_env`` builds for *stage*
+    as ``spawn_env``, because the ``/tmp`` cwd the judges run in names no
+    project; a caller passing its own ``spawn_env`` gets a ``TypeError``.
     """
+    if 'spawn_env' in invoke_kwargs:
+        raise TypeError(
+            'measured_call declares the eval fleet identity itself; got a '
+            f'caller spawn_env={invoke_kwargs["spawn_env"]!r}'
+        )
     name = label or str(stage)
+    spawn_env = _eval_spawn_env(stage)
     spent = 0.0
 
     async def _attempt(**dispatch: Any) -> AgentResult:
@@ -233,11 +277,13 @@ async def measured_call(
 
     try:
         if usage_gate is None:
-            result = await _attempt(backend=backend, **invoke_kwargs)
+            result = await _attempt(
+                backend=backend, spawn_env=spawn_env, **invoke_kwargs,
+            )
         else:
             result = await invoke_with_cap_retry(
                 usage_gate, name, invoke_fn=_attempt, backend=backend,
-                **invoke_kwargs,
+                spawn_env=spawn_env, **invoke_kwargs,
             )
     except AllAccountsCappedException as e:
         logger.warning(f'{name}: unmeasured, cap patience exhausted: {e}')

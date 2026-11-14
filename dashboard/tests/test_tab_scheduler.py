@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import destructure_bindings, extract_function_body, strip_js_comments
 from _lock_chip_matrix import chip_classes_over_the_matrix
 
 
@@ -486,24 +486,28 @@ def test_scheduler_heatmap_iterates_the_bounded_axes(scheduler_heatmap_jsx_body)
 
 
 def test_scheduler_heatmap_discloses_what_it_is_not_showing(scheduler_heatmap_jsx_body):
-    """A truncated grid must say so, naming the totals.
+    """A truncated grid must say so, in the caption the selection composes.
 
     A silently-truncated heatmap is worse than a slow one: an operator reading
-    60 rows has no way to tell whether that is the whole picture or the top
-    2% of it. The affordance reads rowsTotal/modulesTotal — the INPUT sizes —
-    so it stays honest whether the shrinkage came from the contention filter
-    or from the hard cap.
+    60 rows has no way to tell whether that is the whole picture or the top 2%
+    of it. The copy's truth is pinned executably in
+    dashboard/tests/js/scheduler_heatmap_bounds.test.mjs; this probe pins only
+    that the component renders that caption.
     """
+    src = strip_js_comments(scheduler_heatmap_jsx_body)
+    assert re.search(
+        r'const\s*\{[^}]*describeHeatmapCap[^}]*\}\s*=\s*window\.DF_SCHED_HEATMAP_BOUNDS',
+        src,
+    ), (
+        'scheduler_heatmap.jsx must destructure describeHeatmapCap from '
+        'window.DF_SCHED_HEATMAP_BOUNDS at module scope'
+    )
     body = _heatmap_body(scheduler_heatmap_jsx_body)
 
-    assert 'rowsTotal' in body and 'modulesTotal' in body, (
-        'SchedulerHeatmap must render the input totals so a truncated grid '
-        'discloses what it is hiding'
+    assert re.search(r'describeHeatmapCap\s*\(', body), (
+        'SchedulerHeatmap must render the caption describeHeatmapCap composes'
     )
-    assert 'rowsTruncated' in body or 'modulesTruncated' in body, (
-        'the disclosure must be conditioned on the truncation flags rather '
-        'than shown unconditionally'
-    )
+    assert 'sched-heatmap-cap' in body, 'the caption keeps its styled container'
 
 
 def test_cell_state_delegates_membership_to_the_shared_predicate(scheduler_heatmap_jsx_body):
@@ -672,8 +676,6 @@ def test_scheduler_tab_renders_degraded_projects_distinctly(tab_scheduler_jsx_bo
     WIRING assertion rather than a prose pin — a mention in the banner's own
     explanatory comment cannot satisfy it.
     """
-    from _dashboard_helpers import destructure_bindings
-
     body = strip_js_comments(extract_function_body(tab_scheduler_jsx_body, 'SchedulerTab'))
 
     match = re.search(r'const\s*\{(.*?)\}\s*=\s*sched\s*;', body, re.S)

@@ -8,6 +8,9 @@ Commands:
     smoke          Run baseline panel on 1 diff (step 2)
     calibrate      Run scorer on 3 diffs for human inspection (step 3)
     corpus-sanity  Run baseline on all 15 diffs and score (step 4)
+    campaign       Run arms x fixtures x N trials and reduce them; ``--briefing
+                   diff-only,d2`` adds a context-complete arm per variant,
+                   ``--briefing d2`` runs only the context-complete arms
 """
 
 from __future__ import annotations
@@ -16,20 +19,22 @@ import asyncio
 import json
 import logging
 import os
-import re
-import sqlite3
 import subprocess
 import sys
-from collections import Counter
-from collections.abc import Iterable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
+from shared import project_layout
+
+from orchestrator.agents.review_briefing import ReviewBriefing
+from orchestrator.main_checkout_defaults import cli_default
+from orchestrator.review_payload import Verdict, normalize_review
 
 if TYPE_CHECKING:
-    from .corpus import CorpusManifest
+    from .corpus import CorpusDiff, CorpusManifest
+    from .scorer import ScoringResult
 
 _PKG_DIR = Path(__file__).parent
 _CORPUS_PATH = _PKG_DIR / 'corpus' / 'manifest.json'
@@ -49,36 +54,30 @@ def _print_check(passed: bool, message: str) -> bool:
     return passed
 
 
-async def _load_or_run_panel(variant, diff, stagger_secs: float = 2.0):
-    """Load cached result or run panel and save.
+def _mean_or_none(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
 
-    Mirrors the caching logic in runner.py _run_and_save() so results
-    from one step are reused by later steps.
-    """
-    from .runner import PanelRunResult, run_panel
 
-    _RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    result_path = _RESULTS_DIR / f'{variant.name}__{diff.diff_id}.json'
+def _fmt_mean(value: float | None) -> str:
+    return 'n/a' if value is None else f'{value:.3f}'
 
-    if result_path.exists():
-        try:
-            data = json.loads(result_path.read_text())
-            click.echo(f'  [cached] {variant.name}__{diff.diff_id}')
-            return PanelRunResult(
-                variant_name=data['variant_name'],
-                diff_id=data['diff_id'],
-                reviews=data.get('reviews', {}),
-                total_cost_usd=data.get('total_cost_usd', 0.0),
-                wall_clock_ms=data.get('wall_clock_ms', 0),
-                errors=data.get('errors', []),
-            )
-        except (json.JSONDecodeError, KeyError):
-            pass
 
-    click.echo(f'  [running] {variant.name}__{diff.diff_id}')
-    result = await run_panel(variant, diff, stagger_secs=stagger_secs)
-    result_path.write_text(json.dumps(asdict(result), indent=2))
-    return result
+def _metrics_text(f1: float, blocking_recall: float, cost_usd: float) -> str:
+    return f'F1={f1:.3f} BR={blocking_recall:.3f} ${cost_usd:.2f}'
+
+
+def _cell_text(score: ScoringResult) -> str:
+    """One scored cell for a progress line: its metrics and spend, or why it has none."""
+    if score.unmeasured is None:
+        return _metrics_text(score.f1, score.blocking_recall, score.total_cost_usd)
+    from orchestrator.evals.measurement import format_invocation_errors
+
+    why = format_invocation_errors([score.unmeasured.to_record()])
+    return f'UNMEASURED {why} ${score.total_cost_usd:.2f}'
+
+
+def _echo_cell(score: ScoringResult) -> None:
+    click.echo(f'  {score.variant_name:22s} x {score.diff_id:<28s} {_cell_text(score)}')
 
 
 def _load_corpus():
@@ -173,7 +172,7 @@ def smoke(diff_id: str, stagger: float) -> None:
     """Step 2: Smoke test -- run baseline panel on 1 diff."""
 
     async def _run() -> int:
-        from .runner import REVIEW_SCHEMA
+        from .runner import REVIEW_SCHEMA, run_panel_cached
         from .variants import VARIANT_BASELINE
 
         corpus = _load_corpus()
@@ -186,8 +185,9 @@ def smoke(diff_id: str, stagger: float) -> None:
         click.echo('=' * 50)
         click.echo()
 
-        result = await _load_or_run_panel(VARIANT_BASELINE, diff, stagger_secs=stagger)
+        result = await run_panel_cached(VARIANT_BASELINE, diff, stagger_secs=stagger)
         click.echo()
+        payloads = {name: normalize_review(rev) for name, rev in result.reviews.items()}
 
         checks_passed = 0
         total_checks = 5
@@ -211,20 +211,13 @@ def smoke(diff_id: str, stagger: float) -> None:
             checks_passed += 1
 
         # Check C: No ERROR verdicts
-        error_count = sum(1 for rev in result.reviews.values() if rev.get('verdict') == 'ERROR')
+        error_count = sum(1 for p in payloads.values() if p.verdict is Verdict.ERROR)
         if _print_check(error_count == 0, f'{error_count} ERROR verdicts'):
             checks_passed += 1
 
         # Check D: At least 1 blocking issue found
-        blocking_count = sum(
-            1 for rev in result.reviews.values()
-            for issue in rev.get('issues', [])
-            if issue.get('severity') == 'blocking'
-        )
-        reviewers_with_blocking = sum(
-            1 for rev in result.reviews.values()
-            if any(i.get('severity') == 'blocking' for i in rev.get('issues', []))
-        )
+        blocking_count = sum(len(p.blocking_issues) for p in payloads.values())
+        reviewers_with_blocking = sum(1 for p in payloads.values() if p.blocking_issues)
         if _print_check(blocking_count > 0, f'{reviewers_with_blocking}/{expected} reviewers found blocking issues ({blocking_count} total)'):
             checks_passed += 1
 
@@ -237,11 +230,11 @@ def smoke(diff_id: str, stagger: float) -> None:
         # Reviewer summary
         click.echo()
         click.echo(click.style('Reviewer Summary:', bold=True))
-        for name, rev in sorted(result.reviews.items()):
-            verdict = rev.get('verdict', '?')
-            issues = rev.get('issues', [])
-            blocking = sum(1 for i in issues if i.get('severity') == 'blocking')
-            click.echo(f'  {name:25s} {verdict:15s} ({len(issues)} issues, {blocking} blocking)')
+        for name, p in sorted(payloads.items()):
+            click.echo(
+                f'  {name:25s} {p.verdict:15s} '
+                f'({len(p.issues)} issues, {len(p.blocking_issues)} blocking)'
+            )
 
         if result.errors:
             click.echo()
@@ -266,6 +259,44 @@ def smoke(diff_id: str, stagger: float) -> None:
 # Step 3: Scorer calibration
 # ---------------------------------------------------------------------------
 
+def _echo_calibration(diff: CorpusDiff, score: ScoringResult) -> None:
+    """*score* beside *diff*'s ground truth: what matched, what was missed, what was spurious."""
+    click.echo(f'\n{"=" * 50}')
+    click.echo(click.style(f'Calibration: {diff.diff_id} ({diff.language}, {diff.source})', bold=True))
+    click.echo(f'{"=" * 50}')
+    if score.unmeasured is not None:
+        click.echo(f'  Scorer: {_cell_text(score)}')
+        return
+
+    click.echo(f'\n{click.style("Ground Truth", bold=True)} ({len(diff.ground_truth)} issues):')
+    for gt in diff.ground_truth:
+        sev_color = 'red' if gt.severity == 'blocking' else 'yellow'
+        click.echo(f'  [{gt.id}] {click.style(gt.severity.upper(), fg=sev_color)}  {gt.category}  {gt.location}')
+        click.echo(f'    {gt.description[:120]}')
+
+    click.echo(f'\n{click.style("Matched Issues", bold=True)} ({len(score.matches)}):')
+    if score.matches:
+        for m in score.matches:
+            ri = m.reviewer_issue
+            click.echo(f'  [{m.ground_truth_id}] <-> {ri.get("reviewer", "?")} (confidence: {m.match_confidence:.2f})')
+            click.echo(f'    Found: {ri.get("description", "?")[:100]}')
+            click.echo(f'    Reasoning: {m.match_reasoning[:100]}')
+    else:
+        click.echo('  (none)')
+
+    if score.unmatched_gt:
+        click.echo(f'\n{click.style("Unmatched Ground Truth", fg="red")} ({len(score.unmatched_gt)}):')
+        for gt_id in score.unmatched_gt:
+            click.echo(f'  - {gt_id}')
+
+    if score.false_positives:
+        click.echo(f'\n{click.style("False Positives", fg="yellow")} ({len(score.false_positives)}):')
+        for fp in score.false_positives:
+            click.echo(f'  - {fp.get("reviewer", "?")}: {fp.get("description", "?")[:80]} ({fp.get("severity", "?")})')
+
+    click.echo(f'\nMetrics: recall={score.recall:.3f}  precision={score.precision:.3f}  F1={score.f1:.3f}  blocking_recall={score.blocking_recall:.3f}')
+
+
 @cli.command()
 @click.option('--diff-ids', default='py_missing_await,rs_off_by_one,ts_shallow_mutate',
               help='Comma-separated diff IDs (1 per language)')
@@ -274,7 +305,8 @@ def calibrate(diff_ids: str, stagger: float) -> None:
     """Step 3: Scorer calibration -- run scorer on 3 diffs for human inspection."""
 
     async def _run() -> None:
-        from .scorer import score_panel_run
+        from .corpus import CorpusManifest
+        from .runner import run_and_score
         from .variants import VARIANT_BASELINE
 
         corpus = _load_corpus()
@@ -283,55 +315,25 @@ def calibrate(diff_ids: str, stagger: float) -> None:
         click.echo(click.style(f'Scorer Calibration: {len(ids)} diffs', bold=True))
         click.echo('=' * 50)
 
+        found = []
         for diff_id in ids:
             diff = corpus.get_diff(diff_id)
             if diff is None:
                 click.echo(f'\nDiff not found: {diff_id}', err=True)
-                continue
-
-            click.echo(f'\n{"=" * 50}')
-            click.echo(click.style(f'Calibration: {diff_id} ({diff.language}, {diff.source})', bold=True))
-            click.echo(f'{"=" * 50}')
-
-            # Run panel
-            result = await _load_or_run_panel(VARIANT_BASELINE, diff, stagger_secs=stagger)
-
-            # Score
-            click.echo('\n  Scoring with haiku...')
-            score = await score_panel_run(result, diff)
-
-            # Display ground truth
-            click.echo(f'\n{click.style("Ground Truth", bold=True)} ({len(diff.ground_truth)} issues):')
-            for gt in diff.ground_truth:
-                sev_color = 'red' if gt.severity == 'blocking' else 'yellow'
-                click.echo(f'  [{gt.id}] {click.style(gt.severity.upper(), fg=sev_color)}  {gt.category}  {gt.location}')
-                click.echo(f'    {gt.description[:120]}')
-
-            # Display matches
-            click.echo(f'\n{click.style("Matched Issues", bold=True)} ({len(score.matches)}):')
-            if score.matches:
-                for m in score.matches:
-                    ri = m.reviewer_issue
-                    click.echo(f'  [{m.ground_truth_id}] <-> {ri.get("reviewer", "?")} (confidence: {m.match_confidence:.2f})')
-                    click.echo(f'    Found: {ri.get("description", "?")[:100]}')
-                    click.echo(f'    Reasoning: {m.match_reasoning[:100]}')
             else:
-                click.echo('  (none)')
+                found.append(diff)
 
-            # Display unmatched GT
-            if score.unmatched_gt:
-                click.echo(f'\n{click.style("Unmatched Ground Truth", fg="red")} ({len(score.unmatched_gt)}):')
-                for gt_id in score.unmatched_gt:
-                    click.echo(f'  - {gt_id}')
-
-            # Display false positives
-            if score.false_positives:
-                click.echo(f'\n{click.style("False Positives", fg="yellow")} ({len(score.false_positives)}):')
-                for fp in score.false_positives:
-                    click.echo(f'  - {fp.get("reviewer", "?")}: {fp.get("description", "?")[:80]} ({fp.get("severity", "?")})')
-
-            # Metrics
-            click.echo(f'\nMetrics: recall={score.recall:.3f}  precision={score.precision:.3f}  F1={score.f1:.3f}  blocking_recall={score.blocking_recall:.3f}')
+        click.echo('\nRunning panels and scoring with haiku...')
+        scores = await run_and_score(
+            [VARIANT_BASELINE], CorpusManifest(diffs=found), stagger_secs=stagger, on_scored=_echo_cell,
+        )
+        score_by_id = {score.diff_id: score for score in scores}
+        for diff in found:
+            score = score_by_id.get(diff.diff_id)
+            if score is None:
+                click.echo(f'\nNo score for {diff.diff_id}: its fixture was skipped (see the log)', err=True)
+            else:
+                _echo_calibration(diff, score)
 
         click.echo(f'\n{"=" * 50}')
         click.echo(click.style('ACTION: Review matches above. If accuracy < 0.85, scorer prompts need tuning.', fg='cyan', bold=True))
@@ -357,8 +359,7 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
 
     async def _run() -> int:
         from .report import build_trial_report, save_report
-        from .runner import run_trial
-        from .scorer import score_panel_run
+        from .runner import run_and_score
         from .variants import VARIANT_BASELINE
 
         corpus = _load_corpus()
@@ -367,22 +368,12 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
         click.echo('=' * 50)
         click.echo()
 
-        # Run baseline against all diffs
-        click.echo('Running panels...')
-        results = await run_trial([VARIANT_BASELINE], corpus, max_parallel_panels=max_parallel)
-        click.echo(f'  Completed {len(results)} panel runs.')
-
-        # Score all results
-        click.echo('\nScoring results...')
-        scores = []
-        for result in results:
-            diff = corpus.get_diff(result.diff_id)
-            if diff is None:
-                click.echo(f'  Warning: no corpus diff for {result.diff_id}', err=True)
-                continue
-            score = await score_panel_run(result, diff)
-            scores.append(score)
-            click.echo(f'  {result.diff_id}: recall={score.recall:.3f} blocking_recall={score.blocking_recall:.3f} F1={score.f1:.3f}')
+        click.echo('Running and scoring panels...')
+        scores = await run_and_score(
+            [VARIANT_BASELINE], corpus, max_parallel_panels=max_parallel, stagger_secs=stagger,
+            on_scored=_echo_cell,
+        )
+        click.echo(f'  Scored {len(scores)} panel runs.')
 
         # Build report
         report = build_trial_report(scores, [VARIANT_BASELINE], corpus)
@@ -398,35 +389,41 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
         synthetic_recalls: list[float] = []
         synthetic_blocking_recalls: list[float] = []
         zero_recall_diffs: list[str] = []
+        measured = [s for s in scores if s.unmeasured is None]
+        unmeasured = [s for s in scores if s.unmeasured is not None]
 
         for score in sorted(scores, key=lambda s: s.diff_id):
             diff = corpus.get_diff(score.diff_id)
             lang = diff.language[:5] if diff else '?'
             source = diff.source if diff else '?'
+            metric_columns = (
+                f'{score.recall:>7.3f} {score.blocking_recall:>7.3f} {score.f1:>7.3f}'
+                if score.unmeasured is None else f'{"UNMEASURED":>23s}'
+            )
             click.echo(
                 f'{score.diff_id:<26s} {lang:<5s} {source:<10s} '
-                f'{score.recall:>7.3f} {score.blocking_recall:>7.3f} {score.f1:>7.3f} '
-                f'${score.total_cost_usd:>6.2f}'
+                f'{metric_columns} ${score.total_cost_usd:>6.2f}'
             )
+            if score.unmeasured is not None:
+                continue
             if diff and diff.source == 'synthetic':
                 synthetic_recalls.append(score.recall)
                 synthetic_blocking_recalls.append(score.blocking_recall)
             if score.recall == 0.0:
                 zero_recall_diffs.append(score.diff_id)
 
-        # Aggregate metrics
-        mean_recall = sum(synthetic_recalls) / len(synthetic_recalls) if synthetic_recalls else 0.0
-        mean_blocking = sum(synthetic_blocking_recalls) / len(synthetic_blocking_recalls) if synthetic_blocking_recalls else 0.0
-        all_recalls = [s.recall for s in scores]
-        all_f1s = [s.f1 for s in scores]
+        # Aggregate metrics, over measured cells only
+        mean_recall = _mean_or_none(synthetic_recalls)
+        mean_blocking = _mean_or_none(synthetic_blocking_recalls)
         total_cost = sum(s.total_cost_usd for s in scores)
 
         click.echo()
         click.echo(click.style('Aggregate Metrics:', bold=True))
-        click.echo(f'  Mean recall (synthetic):          {mean_recall:.3f}')
-        click.echo(f'  Mean blocking recall (synthetic):  {mean_blocking:.3f}')
-        click.echo(f'  Mean recall (all):                 {sum(all_recalls) / len(all_recalls):.3f}' if all_recalls else '')
-        click.echo(f'  Mean F1 (all):                     {sum(all_f1s) / len(all_f1s):.3f}' if all_f1s else '')
+        click.echo(f'  Mean recall (synthetic):          {_fmt_mean(mean_recall)}')
+        click.echo(f'  Mean blocking recall (synthetic):  {_fmt_mean(mean_blocking)}')
+        click.echo(f'  Mean recall (all):                 {_fmt_mean(_mean_or_none([s.recall for s in measured]))}')
+        click.echo(f'  Mean F1 (all):                     {_fmt_mean(_mean_or_none([s.f1 for s in measured]))}')
+        click.echo(f'  Unmeasured: {len(unmeasured)} (excluded from every mean)')
         click.echo(f'  Total cost:                        ${total_cost:.2f}')
 
         # Threshold checks
@@ -434,9 +431,15 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
         checks_passed = 0
         total_checks = 2
 
-        if _print_check(mean_recall > 0.6, f'Mean recall (synthetic) = {mean_recall:.3f} > 0.6'):
+        if _print_check(
+            mean_recall is not None and mean_recall > 0.6,
+            f'Mean recall (synthetic) = {_fmt_mean(mean_recall)} > 0.6',
+        ):
             checks_passed += 1
-        if _print_check(mean_blocking > 0.5, f'Mean blocking recall (synthetic) = {mean_blocking:.3f} > 0.5'):
+        if _print_check(
+            mean_blocking is not None and mean_blocking > 0.5,
+            f'Mean blocking recall (synthetic) = {_fmt_mean(mean_blocking)} > 0.5',
+        ):
             checks_passed += 1
 
         if zero_recall_diffs:
@@ -445,10 +448,18 @@ def corpus_sanity(max_parallel: int, stagger: float, report_dir: Path | None) ->
             for d in zero_recall_diffs:
                 click.echo(f'  - {d}')
 
+        if unmeasured:
+            click.echo()
+            click.echo(click.style(
+                f'Sanity run incomplete: {len(unmeasured)} cell(s) unmeasured — rerun to measure them.',
+                fg='red',
+            ))
+
         click.echo()
         color = 'green' if checks_passed == total_checks else 'red'
         click.echo(click.style(f'Result: {checks_passed}/{total_checks} thresholds met', fg=color, bold=True))
-        return 0 if checks_passed == total_checks and not zero_recall_diffs else 1
+        complete = checks_passed == total_checks and not zero_recall_diffs and not unmeasured
+        return 0 if complete else 1
 
     try:
         sys.exit(asyncio.run(_run()))
@@ -513,120 +524,28 @@ def corpus_audit(min_diffs: int) -> None:
 # Mine: FN-candidate mining + frontier labeling (task 2495 / PRD D-6)
 # ---------------------------------------------------------------------------
 
-# Overridable via env var for portability across checkouts -- the mining
-# sources are offline, gitignored data that live in the MAIN repo, not a
-# task worktree (see corpus/README.md "Regenerating / extending the
-# corpus"). Defaults match this deployment's on-disk layout unchanged.
-_MINE_DEFAULT_DB = Path(os.environ.get(
-    'REVIEWER_TRIAL_RUNS_DB', '/home/leo/src/dark-factory/data/orchestrator/runs.db',
-))
-_MINE_DEFAULT_ESC_DIR = Path(os.environ.get(
-    'REVIEWER_TRIAL_ESCALATIONS_DIR', '/home/leo/src/dark-factory/data/escalations',
-))
-_MINE_DEFAULT_REPO = Path(os.environ.get(
-    'REVIEWER_TRIAL_REPO_ROOT', '/home/leo/src/dark-factory',
-))
 _MINE_SPLIT_SEED = 'reviewer_trial-2495-fn-mining'
 
-_LANG_EXTENSIONS = {
-    'python': {'.py', '.pyi'},
-    'rust': {'.rs'},
-    'typescript': {'.ts', '.tsx'},
-}
+@dataclass
+class _MineTally:
+    """How far one `mine` run's labelling has got, across its concurrent workers."""
 
-
-def _infer_language(diff_text: str) -> str:
-    """Best-effort language sniff from a unified diff's ``diff --git`` headers.
-
-    Tallies changed-file extensions against the corpus's three known
-    languages and returns the majority; defaults to 'python' (dark_factory
-    is an all-Python monorepo) when no file matches or the diff carries no
-    recognizable header.
-    """
-    paths = re.findall(r'^diff --git a/(\S+) b/\S+', diff_text, re.M)
-    counts: Counter[str] = Counter()
-    for p in paths:
-        suffix = Path(p).suffix
-        for lang, exts in _LANG_EXTENSIONS.items():
-            if suffix in exts:
-                counts[lang] += 1
-                break
-    if not counts:
-        return 'python'
-    return counts.most_common(1)[0][0]
-
-
-_FETCH_TITLES_CHUNK_SIZE = 500  # stay well under SQLite's SQLITE_MAX_VARIABLE_NUMBER
-                                  # (999 on older builds, 32766 on modern ones) -- the
-                                  # candidate set scales with run history and is unbounded.
-
-
-def _fetch_titles(db_path: Path, task_ids: list[str]) -> dict[str, str]:
-    """Supplementary read-only lookup of ``task_results.title``, keyed by task_id.
-
-    Kept separate from ``mining.mine_fn_candidates`` (whose FnCandidate field
-    set is unit-tested) -- this is CLI-only convenience for building a
-    human-readable frontier-prompt description.
-
-    Queries in chunks of ``_FETCH_TITLES_CHUNK_SIZE`` task_ids rather than one
-    giant ``IN (...)`` so an unbounded candidate set never risks a
-    ``sqlite3.OperationalError`` from exceeding SQLite's placeholder limit.
-    """
-    if not task_ids:
-        return {}
-    conn = sqlite3.connect(str(db_path))
-    try:
-        titles: dict[str, str] = {}
-        for i in range(0, len(task_ids), _FETCH_TITLES_CHUNK_SIZE):
-            chunk = task_ids[i:i + _FETCH_TITLES_CHUNK_SIZE]
-            placeholders = ','.join('?' for _ in chunk)
-            rows = conn.execute(
-                f'SELECT task_id, title FROM task_results WHERE task_id IN ({placeholders})',
-                chunk,
-            ).fetchall()
-            titles.update((row[0], row[1] or '') for row in rows)
-        return titles
-    finally:
-        conn.close()
-
-
-def _select_spot_check_subset(
-    diff_ids: list[str],
-    fraction: float = 0.1,
-    minimum: int = 5,
-    sticky: Iterable[str] = (),
-) -> set[str]:
-    """Deterministic, evenly-spread sample of *diff_ids* for the documented
-    human spot-check subset (~10% of mined diffs, floor 5, capped at N).
-
-    Membership only grows: any id in *sticky* (already flagged
-    ``in_spot_check_subset=True``, or carrying a non-``'pending'``
-    ``spot_check_status`` from a prior save -- i.e. a human has already
-    acted on it) is always kept in the result, even though the
-    deterministic even-spread sample below runs over a larger *diff_ids* on
-    every call as the corpus grows and would not, on its own, land on the
-    same ids twice. New ids are added -- via that same deterministic
-    sampling -- only to grow the subset toward the target fraction; prior
-    sign-off is never silently dropped (see corpus/README.md's spot-check
-    protocol)."""
-    ordered = sorted(diff_ids)
-    n = len(ordered)
-    if n == 0:
-        return set()
-    sticky_ids = {diff_id for diff_id in sticky if diff_id in ordered}
-    k = min(n, max(minimum, round(n * fraction)))
-    step = n / k
-    sampled = {ordered[int(i * step)] for i in range(k)}
-    return sticky_ids | sampled
+    attempted: int
+    completed: int = 0
+    added: int = 0
+    cost: float = 0.0
 
 
 @cli.command('mine')
-@click.option('--runs-db', default=str(_MINE_DEFAULT_DB), type=click.Path(path_type=Path),
-              help='Path to the offline orchestrator runs.db (env: REVIEWER_TRIAL_RUNS_DB)')
-@click.option('--escalations-dir', default=str(_MINE_DEFAULT_ESC_DIR), type=click.Path(path_type=Path),
-              help='Path to the offline escalations directory (env: REVIEWER_TRIAL_ESCALATIONS_DIR)')
-@click.option('--repo-path', default=str(_MINE_DEFAULT_REPO), type=click.Path(path_type=Path),
-              help='Git repo to recover mined diffs from')
+@click.option('--runs-db', default=None, type=click.Path(path_type=Path),
+              help='Path to the offline orchestrator runs.db (env: REVIEWER_TRIAL_RUNS_DB; '
+                   "default: the main checkout's runs.db)")
+@click.option('--escalations-dir', default=None, type=click.Path(path_type=Path),
+              help='Path to the offline escalations directory (env: REVIEWER_TRIAL_ESCALATIONS_DIR; '
+                   "default: the main checkout's escalation queue)")
+@click.option('--repo-path', default=None, type=click.Path(path_type=Path),
+              help='Git repo to recover mined diffs from (env: REVIEWER_TRIAL_REPO_ROOT; '
+                   'default: the main checkout)')
 @click.option('--target-total', default=100, type=int, help='Aim for this many total diffs (existing + mined)')
 @click.option('--max-parallel', default=8, type=int, help='Max concurrent frontier-labeling calls')
 @click.option('--model', default='opus', help='Frontier model for propose_labels_frontier')
@@ -638,7 +557,7 @@ def _select_spot_check_subset(
 @click.option('--min-diffs', default=_DEFAULT_MIN_DIFFS, type=int,
               help="Minimum required diff count for the post-run audit (kept consistent with corpus-audit's --min-diffs)")
 def mine(
-    runs_db: Path, escalations_dir: Path, repo_path: Path, target_total: int,
+    runs_db: Path | None, escalations_dir: Path | None, repo_path: Path | None, target_total: int,
     max_parallel: int, model: str, max_turns: int, seed: str, oauth_token_env: str,
     limit: int | None, min_diffs: int,
 ) -> None:
@@ -650,27 +569,41 @@ def mine(
     after every successfully-labeled diff, so an interrupted run only loses
     whatever was still in flight.
     """
+    runs_db = runs_db or cli_default(
+        '--runs-db', project_layout.runs_db, env_var='REVIEWER_TRIAL_RUNS_DB',
+    )
+    escalations_dir = escalations_dir or cli_default(
+        '--escalations-dir', project_layout.escalation_queue_dir,
+        env_var='REVIEWER_TRIAL_ESCALATIONS_DIR',
+    )
+    repo_path = repo_path or cli_default('--repo-path', Path, env_var='REVIEWER_TRIAL_REPO_ROOT')
 
     async def _run() -> int:
+        from orchestrator.config import GitConfig
+
         from .adjudication import AdjudicationLog
-        from .corpus import CorpusDiff
         from .mining import (
-            FnCandidate,
-            assign_split,
+            RecoveredCandidate,
+            admit_mined_diff,
             audit_corpus,
+            backfill_hand_authored,
+            candidate_pool,
+            fetch_task_titles,
+            frontier_description,
             mine_escalation_refs,
             mine_fn_candidates,
+            mined_corpus_diff,
             propose_labels_frontier,
-            recover_diff,
-            resolve_merge_sha_by_task_id,
+            recover_candidates,
+            save_corpus,
         )
 
         if not runs_db.is_file():
             click.echo(
                 f'runs.db not found at {runs_db}\n'
                 '  This is an offline generation tool that reads the gitignored '
-                'orchestrator run history (data/orchestrator/runs.db in the MAIN repo '
-                "checkout, not a task worktree -- see corpus/README.md). Pass --runs-db, "
+                'orchestrator run history, which lives in the MAIN repo checkout, not '
+                "a task worktree (see corpus/README.md). Pass --runs-db, "
                 'or set REVIEWER_TRIAL_RUNS_DB, to point at a real runs.db -- otherwise '
                 "sqlite3 silently creates an empty one and this fails later with "
                 "'no such table: task_results'.",
@@ -693,123 +626,39 @@ def mine(
         ))
         click.echo('=' * 60)
 
-        def _resave() -> None:
-            """Persist manifest + adjudication log, re-deriving split + the
-            spot-check subset from the CURRENT full diff set. Synchronous (no
-            ``await`` inside) so it's safe to call from within a worker's
-            critical section -- called after every successfully-labeled
-            diff, so an interrupted run leaves a fully consistent, resumable
-            on-disk corpus as of the last save.
-
-            Spot-check subset membership is STICKY: a diff already flagged
-            ``in_spot_check_subset=True`` (or carrying a non-``'pending'``
-            ``spot_check_status`` -- i.e. a human has already acted on it) is
-            always kept, even though the deterministic even-spread sample
-            below runs over a larger ``mined_ids`` on every call as the
-            corpus grows. Only newly-sampled ids are added to grow the
-            subset toward the target fraction; prior human sign-off is never
-            silently dropped (see corpus/README.md's spot-check protocol)."""
-            mined_ids = sorted(d.diff_id for d in manifest.diffs if d.source == 'mined')
-            entries_by_id = {e.diff_id: e for e in log.entries}
-            sticky = {
-                diff_id for diff_id in mined_ids
-                if (entry := entries_by_id.get(diff_id)) is not None
-                and (entry.in_spot_check_subset or entry.spot_check_status != 'pending')
-            }
-            subset = _select_spot_check_subset(mined_ids, sticky=sticky) if mined_ids else set()
-            for diff_id in mined_ids:
-                entry = entries_by_id.get(diff_id)
-                if entry is not None:
-                    entry.in_spot_check_subset = diff_id in subset
-
-            assignment = assign_split([d.diff_id for d in manifest.diffs], seed=seed)
-            for d in manifest.diffs:
-                d.split = assignment.get(d.diff_id)
-            manifest.split_seed = seed
-
-            manifest.save(_CORPUS_PATH)
-            log.save(_ADJUDICATION_LOG_PATH)
-
-        # Backfill adjudication coverage for pre-existing hand-authored diffs
-        # (never fabricated as "frontier" -- logged with their own original
-        # ground truth, tagged with a frontier_model that names them as
-        # hand-authored so the provenance is honest).
-        logged_ids = {e.diff_id for e in log.entries}
-        backfilled = 0
-        for diff in manifest.diffs:
-            if diff.diff_id in logged_ids or diff.source == 'mined':
-                continue
-            log.append(
-                diff.diff_id,
-                frontier_proposal=diff.ground_truth,
-                in_spot_check_subset=False,
-                frontier_model='hand-authored',
-                notes=(
-                    'Pre-existing hand-authored ground truth from the original '
-                    '15-diff corpus (predates task 2495 FN mining); not frontier-proposed.'
-                ),
-            )
-            logged_ids.add(diff.diff_id)
-            backfilled += 1
+        backfilled = backfill_hand_authored(manifest, log)
         if backfilled:
             click.echo(f'  Backfilled {backfilled} adjudication entries for pre-existing hand-authored diffs.')
-            _resave()
+            save_corpus(manifest, log, seed=seed, manifest_path=_CORPUS_PATH, log_path=_ADJUDICATION_LOG_PATH)
 
         candidates = mine_fn_candidates(runs_db)
         esc_refs = mine_escalation_refs(escalations_dir)
         click.echo(f'  {len(candidates)} FN candidates mined from runs.db')
 
-        titles = _fetch_titles(runs_db, [c.task_id for c in candidates])
-
-        existing_ids = {d.diff_id for d in manifest.diffs}
-        recovered: list[tuple[FnCandidate, str, str]] = []
-        for c in candidates:
-            diff_id = f'mined_{c.task_id}'
-            if diff_id in existing_ids:
-                continue
-            sha = c.merge_sha or resolve_merge_sha_by_task_id(c.task_id, repo_path)
-            if not sha:
-                continue
-            text = recover_diff(sha, repo_path)
-            if not text or not text.strip():
-                continue
-            recovered.append((c, sha, text))
-
-        # Smallest diffs first: propose_labels_frontier truncates its prompt
-        # context to 10K chars, so prioritizing smaller (fully-visible) diffs
-        # both biases toward higher-fidelity frontier labels and, since most
-        # recovered merge-commit diffs are far larger than 10K chars, keeps
-        # per-call prompt size (and cost) down across the batch.
-        recovered.sort(key=lambda item: len(item[2]))
-
-        needed = max(0, target_total - len(manifest.diffs))
-        if needed == 0:
-            pool = []
-        else:
-            pool_size = needed + max(5, needed // 4)  # buffer for attrition
-            pool = recovered[:pool_size]
-        if limit is not None:
-            pool = pool[:limit]
+        titles = fetch_task_titles(runs_db, [c.task_id for c in candidates])
+        git = GitConfig()
+        recovered = recover_candidates(
+            candidates, existing_ids={d.diff_id for d in manifest.diffs}, repo_path=repo_path,
+            branch_prefix=git.branch_prefix, main_branch=git.main_branch,
+        )
+        pool = candidate_pool(
+            recovered, corpus_size=len(manifest.diffs), target_total=target_total, limit=limit,
+        )
 
         click.echo(f'  {len(recovered)} candidates have a recoverable diff not already in the corpus')
         click.echo(f'  Attempting {len(pool)} this run (target_total={target_total}, limit={limit})')
         click.echo()
 
         semaphore = asyncio.Semaphore(max(1, max_parallel))
-        total = len(pool)
-        state = {'completed': 0, 'added': 0, 'cost': 0.0}
+        tally = _MineTally(attempted=len(pool))
 
-        async def _worker(candidate: FnCandidate, sha: str, diff_text: str) -> None:
+        async def _label(item: RecoveredCandidate) -> None:
+            candidate = item.candidate
+            description = frontier_description(candidate, titles.get(candidate.task_id, ''))
             async with semaphore:
-                title = titles.get(candidate.task_id, '')
-                description = (
-                    f'Task {candidate.task_id} ({candidate.project_id}): {title}. '
-                    f'Flagged as a false-negative candidate -- review passed but '
-                    f'{"; ".join(candidate.signal_reason)}.'
-                )
                 try:
                     issues, cost = await propose_labels_frontier(
-                        diff_text, model=model, description=description,
+                        item.diff_text, model=model, description=description,
                         oauth_token=oauth_token, max_turns=max_turns,
                     )
                 except Exception as exc:  # noqa: BLE001 -- offline generation script; one bad candidate must not sink the batch
@@ -818,70 +667,30 @@ def mine(
                     )
                     issues, cost = [], 0.0
 
-            state['completed'] += 1
-            state['cost'] += cost
-            diff_id = f'mined_{candidate.task_id}'
+            tally.completed += 1
+            tally.cost += cost
+            progress = f'  [{tally.completed}/{tally.attempted}] {candidate.diff_id}:'
             if not issues:
-                click.echo(f'  [{state["completed"]}/{total}] {diff_id}: no issues proposed -- skipping (cost=${cost:.3f})')
+                click.echo(f'{progress} no issues proposed -- skipping (cost=${cost:.3f})')
                 return
 
-            provenance = {
-                'kind': 'mined',
-                'task_id': candidate.task_id,
-                'project_id': candidate.project_id,
-                'outcome': candidate.outcome,
-                'review_cycles': candidate.review_cycles,
-                'verify_attempts': candidate.verify_attempts,
-                'signal_reason': candidate.signal_reason,
-                'merge_sha': sha,
-                'runs_db_path': str(runs_db),
-                'runs_db_query': (
-                    'SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM '
-                    'task_results WHERE review_cycles >= 1, cross-referenced with events '
-                    '(escalation_created, merge_finalized) -- see mining.mine_fn_candidates.'
-                ),
-                'escalation_refs': [
-                    {
-                        'task_id': ref.task_id,
-                        'category': ref.category,
-                        'severity': ref.severity,
-                        'summary': ref.summary,
-                        'level': ref.level,
-                        'path': str(ref.path),
-                    }
-                    for ref in esc_refs.get(candidate.task_id, [])
-                ],
-            }
-            diff = CorpusDiff(
-                diff_id=diff_id,
-                language=_infer_language(diff_text),
-                source='mined',
-                diff_text=diff_text,
-                description=description,
-                ground_truth=issues,
-                project='dark-factory',
-                split=None,
-                provenance=provenance,
+            diff = mined_corpus_diff(
+                item, issues=issues, description=description,
+                escalation_refs=esc_refs.get(candidate.task_id, []), runs_db=runs_db,
             )
-            manifest.diffs.append(diff)
-            log.append(
-                diff.diff_id,
-                frontier_proposal=diff.ground_truth,
-                in_spot_check_subset=False,  # corrected by _resave()'s stratified pass
-                frontier_model=model,
-                notes=f'Frontier-proposed labels for FN candidate task {candidate.task_id}.',
-            )
-            _resave()
-            state['added'] += 1
+            admit_mined_diff(manifest, log, diff, frontier_model=model)
+            save_corpus(manifest, log, seed=seed, manifest_path=_CORPUS_PATH, log_path=_ADJUDICATION_LOG_PATH)
+            tally.added += 1
             click.echo(
-                f'  [{state["completed"]}/{total}] {diff_id}: {len(issues)} issues added '
-                f'(cost=${cost:.3f}, corpus now {len(manifest.diffs)})'
+                f'{progress} {len(issues)} issues added (cost=${cost:.3f}, corpus now {len(manifest.diffs)})'
             )
 
-        await asyncio.gather(*(_worker(c, sha, text) for c, sha, text in pool))
+        await asyncio.gather(*(_label(item) for item in pool))
 
         click.echo()
-        click.echo(f'Mined {state["added"]}/{total} new diffs this run (frontier cost: ${state["cost"]:.2f}).')
+        click.echo(
+            f'Mined {tally.added}/{tally.attempted} new diffs this run (frontier cost: ${tally.cost:.2f}).'
+        )
         click.echo(f'Corpus: {len(manifest.diffs)} diffs total.')
 
         report = audit_corpus(manifest, log, min_diffs=min_diffs)
@@ -912,8 +721,7 @@ def full_trial(max_parallel: int, stagger: float, report_dir: Path | None) -> No
 
     async def _run() -> int:
         from .report import build_trial_report, format_markdown, save_report
-        from .runner import run_trial
-        from .scorer import score_panel_run
+        from .runner import run_and_score
         from .variants import ALL_VARIANTS
 
         corpus = _load_corpus()
@@ -924,21 +732,11 @@ def full_trial(max_parallel: int, stagger: float, report_dir: Path | None) -> No
             click.echo(f'  {v.name:15s} {v.description} ({len(v.reviewers)} reviewers)')
         click.echo()
 
-        # Run all variants
-        click.echo('Running panels...')
-        results = await run_trial(ALL_VARIANTS, corpus, max_parallel_panels=max_parallel)
-        click.echo(f'  Completed {len(results)} panel runs.')
-
-        # Score all results
-        click.echo('\nScoring results...')
-        scores = []
-        for result in results:
-            diff = corpus.get_diff(result.diff_id)
-            if diff is None:
-                continue
-            score = await score_panel_run(result, diff)
-            scores.append(score)
-            click.echo(f'  {result.variant_name:15s} x {result.diff_id:<25s} F1={score.f1:.3f} BR={score.blocking_recall:.3f}')
+        click.echo('Running and scoring panels...')
+        scores = await run_and_score(
+            ALL_VARIANTS, corpus, max_parallel_panels=max_parallel, stagger_secs=stagger,
+            on_scored=_echo_cell,
+        )
 
         # Build and save report
         report = build_trial_report(scores, ALL_VARIANTS, corpus)
@@ -950,7 +748,7 @@ def full_trial(max_parallel: int, stagger: float, report_dir: Path | None) -> No
         click.echo(format_markdown(report))
         click.echo(f'\nReport saved to: {report_path}')
 
-        total_cost = sum(r.total_cost_usd for r in results)
+        total_cost = sum(s.cost_usd for s in scores)
         click.echo(f'Total panel cost: ${total_cost:.2f}')
         return 0
 
@@ -973,8 +771,7 @@ def effort_sweep(max_parallel: int, stagger: float) -> None:
 
     async def _run() -> int:
         from .report import build_trial_report, format_markdown, save_report
-        from .runner import run_trial
-        from .scorer import score_panel_run
+        from .runner import run_and_score
         from .variants import EFFORT_SWEEP_VARIANTS
 
         corpus = _load_corpus()
@@ -989,19 +786,11 @@ def effort_sweep(max_parallel: int, stagger: float) -> None:
             click.echo(f'  {v.name:18s} effort={effort:6s} {v.description}')
         click.echo()
 
-        click.echo('Running panels...')
-        results = await run_trial(EFFORT_SWEEP_VARIANTS, corpus, max_parallel_panels=max_parallel)
-        click.echo(f'  Completed {len(results)} panel runs.')
-
-        click.echo('\nScoring results...')
-        scores = []
-        for result in results:
-            diff = corpus.get_diff(result.diff_id)
-            if diff is None:
-                continue
-            score = await score_panel_run(result, diff)
-            scores.append(score)
-            click.echo(f'  {result.variant_name:18s} x {result.diff_id:<25s} F1={score.f1:.3f} BR={score.blocking_recall:.3f}')
+        click.echo('Running and scoring panels...')
+        scores = await run_and_score(
+            EFFORT_SWEEP_VARIANTS, corpus, max_parallel_panels=max_parallel, stagger_secs=stagger,
+            on_scored=_echo_cell,
+        )
 
         report = build_trial_report(scores, EFFORT_SWEEP_VARIANTS, corpus)
         report_path = save_report(report, _RESULTS_DIR / 'effort_sweep_report')
@@ -1010,7 +799,7 @@ def effort_sweep(max_parallel: int, stagger: float) -> None:
         click.echo(format_markdown(report))
         click.echo(f'\nReport saved to: {report_path}')
 
-        total_cost = sum(r.total_cost_usd for r in results)
+        total_cost = sum(s.cost_usd for s in scores)
         click.echo(f'Total panel cost: ${total_cost:.2f}')
         return 0
 
@@ -1044,8 +833,7 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
         from orchestrator.config import default_price_table
 
         from .report import build_trial_report, format_markdown, save_report
-        from .runner import run_trial
-        from .scorer import score_panel_run
+        from .runner import run_and_score
         from .variants import REVIEWER_REFRESH_VARIANTS
 
         corpus = _select_original_corpus(_load_corpus())
@@ -1060,24 +848,11 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
             click.echo(f'  {v.name:20s} {v.description} ({len(v.reviewers)} reviewers)')
         click.echo()
 
-        click.echo('Running panels...')
-        results = await run_trial(
-            REVIEWER_REFRESH_VARIANTS, corpus, max_parallel_panels=max_parallel, prices=prices,
+        click.echo('Running and scoring panels...')
+        scores = await run_and_score(
+            REVIEWER_REFRESH_VARIANTS, corpus, max_parallel_panels=max_parallel, stagger_secs=stagger,
+            prices=prices, on_scored=_echo_cell,
         )
-        click.echo(f'  Completed {len(results)} panel runs.')
-
-        click.echo('\nScoring results...')
-        scores = []
-        for result in results:
-            diff = corpus.get_diff(result.diff_id)
-            if diff is None:
-                continue
-            score = await score_panel_run(result, diff)
-            scores.append(score)
-            click.echo(
-                f'  {result.variant_name:20s} x {result.diff_id:<25s} '
-                f'F1={score.f1:.3f} BR={score.blocking_recall:.3f}'
-            )
 
         # Build and save report
         report = build_trial_report(scores, REVIEWER_REFRESH_VARIANTS, corpus)
@@ -1089,7 +864,7 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
         click.echo(format_markdown(report))
         click.echo(f'\nReport saved to: {report_path}')
 
-        total_cost = sum(r.total_cost_usd for r in results)
+        total_cost = sum(s.cost_usd for s in scores)
         click.echo(f'Total panel cost: ${total_cost:.2f}')
         return 0
 
@@ -1105,7 +880,33 @@ def refresh_trial(max_parallel: int, stagger: float, report_dir: Path | None) ->
 # the same fixtures for N trials, scored, reduced by campaign.py.
 # ---------------------------------------------------------------------------
 
-_CAMPAIGN_DEFAULT_CONFIG = Path('/home/leo/src/dark-factory/dark-factory-orchestrator.yaml')
+def _parse_briefings(
+    _ctx: click.Context, _param: click.Parameter, value: str,
+) -> list[ReviewBriefing]:
+    """The generations to run, each once; diff-only, when listed, leads.
+
+    Every arm is paired against the first arm's first generation, so ``d2``
+    alone pairs every d2 arm against the first arm's d2 arm, while d2 listed
+    before diff-only would invert the gate. A repeat would collide on its
+    result paths.
+    """
+    valid = [b.value for b in ReviewBriefing]
+    names = [name.strip() for name in value.split(',') if name.strip()]
+    unknown = [name for name in names if name not in valid]
+    if unknown or not names:
+        raise click.BadParameter(
+            f'{", ".join(unknown) or "(none)"}: each must be one of {", ".join(valid)}',
+        )
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise click.BadParameter(f'each generation runs once; repeated: {", ".join(repeated)}')
+    briefings = [ReviewBriefing(name) for name in names]
+    if ReviewBriefing.DIFF_ONLY in briefings and briefings[0] is not ReviewBriefing.DIFF_ONLY:
+        raise click.BadParameter(
+            f'{ReviewBriefing.DIFF_ONLY.value} must come first when listed: it is the incumbent '
+            f'{ReviewBriefing.CONTEXT_COMPLETE.value} is paired against',
+        )
+    return briefings
 
 
 @cli.command('campaign')
@@ -1114,39 +915,49 @@ _CAMPAIGN_DEFAULT_CONFIG = Path('/home/leo/src/dark-factory/dark-factory-orchest
 @click.option('--trials', default=3, type=int, help='Independent repeats per arm (replication by fixture)')
 @click.option('--split', default='test', help='Corpus split to run (train|selection|test|all)')
 @click.option('--arms', default=None, help='Comma-separated variant names (default: FABLE_EVIDENCE_VARIANTS)')
+@click.option('--briefing', 'briefings', default=ReviewBriefing.DIFF_ONLY.value, callback=_parse_briefings,
+              help='Comma-separated reviewer briefing generations, each run once for every arm '
+                   '(diff-only | d2; default: diff-only; diff-only first when both are listed; '
+                   "d2 alone pairs every arm against the first arm's d2 arm)")
 @click.option('--diff-cap', default=None, type=int,
               help='Diff truncation in chars (default: runner.DIFF_CAP_CHARS; 0 lifts the cap)')
 @click.option('--max-parallel', default=3, type=int, help='Max concurrent panel runs')
 @click.option('--pool/--no-pool', default=True,
               help='Draw on the shared OAuth account pool via a UsageGate (default) or the CLI default login')
-@click.option('--config', 'config_path', default=str(_CAMPAIGN_DEFAULT_CONFIG),
-              type=click.Path(path_type=Path), help='Orchestrator config supplying usage_cap accounts')
+@click.option('--config', 'config_path', default=None, type=click.Path(path_type=Path),
+              help="Orchestrator config supplying usage_cap accounts (default: the main checkout's)")
 def campaign(
-    results_dir: Path, trials: int, split: str, arms: str | None, diff_cap: int | None,
-    max_parallel: int, pool: bool, config_path: Path,
+    results_dir: Path, trials: int, split: str, arms: str | None,
+    briefings: list[ReviewBriefing], diff_cap: int | None,
+    max_parallel: int, pool: bool, config_path: Path | None,
 ) -> None:
     """Run the Fable evidence campaign: every arm x every fixture x N trials.
+
+    Each arm runs once per ``--briefing`` generation; the first arm's first
+    generation is the incumbent every other arm is paired against.
 
     Panel results checkpoint to ``<results-dir>/trial-<n>/`` and scores to
     ``<results-dir>/trial-<n>/scores/``, so a killed campaign resumes
     without re-spending. Re-running with the same arguments only reduces.
     """
+    from orchestrator.config import PROJECT_CONFIG_FILENAME, default_price_table, load_config
+
+    config_path = config_path or cli_default('--config', lambda root: root / PROJECT_CONFIG_FILENAME)
 
     async def _run() -> int:
-        from orchestrator.config import default_price_table, load_config
-        from orchestrator.evals.runner import campaign_usage_gate
+        from orchestrator.evals.eval_gate import campaign_usage_gate
 
         from . import campaign as reduce
-        from .runner import DIFF_CAP_CHARS, run_trial
-        from .scorer import score_panel_run
-        from .variants import FABLE_EVIDENCE_VARIANTS
+        from .runner import DIFF_CAP_CHARS, run_and_score
+        from .variants import FABLE_EVIDENCE_VARIANTS, campaign_arms
 
         manifest = _load_corpus()
         corpus = manifest if split == 'all' else _select_split(manifest, split)
         by_name = {v.name: v for v in FABLE_EVIDENCE_VARIANTS}
-        variants = (
+        variants = campaign_arms(
             [by_name[a.strip()] for a in arms.split(',') if a.strip()]
-            if arms else list(FABLE_EVIDENCE_VARIANTS)
+            if arms else FABLE_EVIDENCE_VARIANTS,
+            briefings,
         )
         incumbent = variants[0].name
         cap = DIFF_CAP_CHARS if diff_cap is None else diff_cap
@@ -1165,46 +976,33 @@ def campaign(
 
             click.echo(click.style(
                 f'Campaign: {len(variants)} arms x {len(corpus.diffs)} diffs ({split}) x {trials} trials, '
-                f'diff cap {cap or "lifted"}, pool={"on" if usage_gate else "off"}',
+                f'briefings {",".join(briefings)}, diff cap {cap or "lifted"}, '
+                f'pool={"on" if usage_gate else "off"}',
                 bold=True,
             ))
             blocking_gt = {d.diff_id: {g.id for g in d.blocking_issues()} for d in corpus.diffs}
             records: list[dict] = []
             for trial in range(1, trials + 1):
                 trial_dir = results_dir / f'trial-{trial}'
-                score_dir = trial_dir / 'scores'
-                score_dir.mkdir(parents=True, exist_ok=True)
                 click.echo(f'\n== trial {trial}/{trials}')
-                results = await run_trial(
-                    variants, corpus, max_parallel_panels=max_parallel, prices=prices,
-                    results_dir=trial_dir, usage_gate=usage_gate, diff_cap_chars=cap,
+                scores = await run_and_score(
+                    variants, corpus, results_dir=trial_dir, score_dir=trial_dir / 'scores',
+                    max_parallel_panels=max_parallel, prices=prices, usage_gate=usage_gate,
+                    diff_cap_chars=cap, on_scored=_echo_cell,
                 )
-                for result in results:
-                    diff = corpus.get_diff(result.diff_id)
-                    if diff is None:
-                        continue
-                    score_path = score_dir / f'{result.variant_name}__{result.diff_id}.json'
-                    if score_path.exists():
-                        rec = json.loads(score_path.read_text())
-                    else:
-                        rec = asdict(await score_panel_run(result, diff))
-                        score_path.write_text(json.dumps(rec, indent=2))
-                    rec['trial'] = trial
-                    records.append(rec)
-                    click.echo(
-                        f'  {result.variant_name:22s} x {result.diff_id:<28s} '
-                        f'F1={rec["f1"]:.3f} BR={rec["blocking_recall"]:.3f} ${rec["cost_usd"]:.2f}'
-                    )
+                records.extend({**asdict(s), 'trial': trial} for s in scores)
 
             arms_out, decisions = reduce.summarize_campaign(records, incumbent, blocking_gt)
             md = reduce.format_markdown(arms_out, decisions)
+            results_dir.mkdir(parents=True, exist_ok=True)
             (results_dir / 'campaign_report.md').write_text(md + '\n')
             (results_dir / 'campaign_report.json').write_text(
                 json.dumps(reduce.to_json(arms_out, decisions), indent=2),
             )
             click.echo()
             click.echo(md)
-            click.echo(f'\nTotal campaign cost (panels + matcher): ${sum(a.total_cost_usd for a in arms_out):.2f}')
+            spent = sum(a.total_cost_usd + a.unmeasured_cost_usd for a in arms_out)
+            click.echo(f'\nTotal campaign cost (panels + matcher): ${spent:.2f}')
             click.echo(f'Report saved to: {results_dir / "campaign_report.md"}')
             return 0
 

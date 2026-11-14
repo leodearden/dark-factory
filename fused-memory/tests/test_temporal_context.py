@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _queued_write_fixtures import queued
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.server.tools import create_mcp_server
@@ -160,7 +161,7 @@ class TestGraphitiBackendTemporalContext:
 
 
 class TestExecuteGraphitiWriteTemporalContext:
-    """_execute_graphiti_write pops temporal_context from payload and forwards it."""
+    """_execute_graphiti_write forwards the value's temporal_context to graphiti."""
 
     @pytest.mark.asyncio
     async def test_temporal_context_in_payload_forwarded_to_graphiti(self, service):
@@ -174,7 +175,7 @@ class TestExecuteGraphitiWriteTemporalContext:
             'source_description': 'notes',
             'temporal_context': 'retrospective',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
         call_kwargs = service.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('temporal_context') == 'retrospective'
 
@@ -189,26 +190,10 @@ class TestExecuteGraphitiWriteTemporalContext:
             'group_id': 'test',
             'source_description': 'notes',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
         call_kwargs = service.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('temporal_context') is None
 
-    @pytest.mark.asyncio
-    async def test_temporal_context_popped_not_leaked_into_graphiti_call(self, service):
-        """temporal_context must not appear in leftover payload passed to graphiti."""
-        payload = {
-            'uuid': 'test-uuid',
-            'name': 'episode_test',
-            'content': 'test content',
-            'source': 'text',
-            'group_id': 'test',
-            'source_description': 'notes',
-            'temporal_context': 'planning',
-        }
-        await service._execute_graphiti_write('add_episode', payload)
-        # temporal_context is an explicit kwarg, not part of remaining payload
-        # The payload dict itself should have had temporal_context popped
-        assert 'temporal_context' not in payload
 
 
 # ---------------------------------------------------------------------------
@@ -227,9 +212,8 @@ class TestAddEpisodeTemporalContext:
             project_id='test',
             temporal_context='planning',
         )
-        call_kwargs = service.durable_queue.enqueue.call_args[1]
-        payload = call_kwargs['payload']
-        assert payload.get('temporal_context') == 'planning'
+        value = service.durable_queue.enqueue.call_args.args[0]
+        assert value.temporal_context == 'planning'
 
     @pytest.mark.asyncio
     async def test_temporal_context_none_in_enqueue_payload(self, service):
@@ -239,9 +223,8 @@ class TestAddEpisodeTemporalContext:
             project_id='test',
             temporal_context=None,
         )
-        call_kwargs = service.durable_queue.enqueue.call_args[1]
-        payload = call_kwargs['payload']
-        assert payload.get('temporal_context') is None
+        value = service.durable_queue.enqueue.call_args.args[0]
+        assert value.temporal_context is None
 
     @pytest.mark.asyncio
     async def test_temporal_context_retrospective_in_enqueue_payload(self, service):
@@ -251,9 +234,8 @@ class TestAddEpisodeTemporalContext:
             project_id='test',
             temporal_context='retrospective',
         )
-        call_kwargs = service.durable_queue.enqueue.call_args[1]
-        payload = call_kwargs['payload']
-        assert payload.get('temporal_context') == 'retrospective'
+        value = service.durable_queue.enqueue.call_args.args[0]
+        assert value.temporal_context == 'retrospective'
 
     @pytest.mark.asyncio
     async def test_default_temporal_context_omitted_is_none(self, service):
@@ -262,9 +244,8 @@ class TestAddEpisodeTemporalContext:
             content='default content',
             project_id='test',
         )
-        call_kwargs = service.durable_queue.enqueue.call_args[1]
-        payload = call_kwargs['payload']
-        assert payload.get('temporal_context') is None
+        value = service.durable_queue.enqueue.call_args.args[0]
+        assert value.temporal_context is None
 
 
 # ---------------------------------------------------------------------------
@@ -571,8 +552,7 @@ class TestGraphitiBackendReferenceTime:
 
 
 class TestExecuteGraphitiWriteReferenceTime:
-    """_execute_graphiti_write pops reference_time ISO string from payload and
-    forwards it as a parsed datetime to graphiti.add_episode.
+    """A queued reference_time ISO string reaches graphiti.add_episode as a parsed datetime.
 
     These tests will FAIL until step-4 implementation.
     """
@@ -591,7 +571,7 @@ class TestExecuteGraphitiWriteReferenceTime:
             'source_description': 'notes',
             'reference_time': ref_iso,
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
         call_kwargs = service.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('reference_time') == ref_expected
 
@@ -606,26 +586,10 @@ class TestExecuteGraphitiWriteReferenceTime:
             'group_id': 'test',
             'source_description': 'notes',
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
         call_kwargs = service.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('reference_time') is None
 
-    @pytest.mark.asyncio
-    async def test_reference_time_popped_not_leaked(self, service):
-        """reference_time must be popped from payload dict (not passed via remaining kwargs)."""
-        ref_iso = '2026-03-22T00:00:00+00:00'
-        payload = {
-            'uuid': 'test-uuid',
-            'name': 'episode_test',
-            'content': 'test content',
-            'source': 'text',
-            'group_id': 'test',
-            'source_description': 'notes',
-            'reference_time': ref_iso,
-        }
-        await service._execute_graphiti_write('add_episode', payload)
-        # The key should have been popped from the payload dict
-        assert 'reference_time' not in payload
 
 
 # ---------------------------------------------------------------------------
@@ -642,16 +606,15 @@ class TestAddEpisodeReferenceTime:
 
     @pytest.mark.asyncio
     async def test_explicit_datetime_serialized_to_iso_in_payload(self, service):
-        """add_episode(reference_time=datetime(2026,3,22,...)) → payload has ISO string."""
+        """add_episode(reference_time=datetime(2026,3,22,...)) → the queued value carries the datetime."""
         ref_dt = datetime(2026, 3, 22, 0, 0, 0, tzinfo=UTC)
         await service.add_episode(
             content='historical content',
             project_id='test',
             reference_time=ref_dt,
         )
-        call_kwargs = service.durable_queue.enqueue.call_args[1]
-        payload = call_kwargs['payload']
-        assert payload.get('reference_time') == ref_dt.isoformat()
+        value = service.durable_queue.enqueue.call_args.args[0]
+        assert value.reference_time == ref_dt
 
     @pytest.mark.asyncio
     async def test_none_reference_time_in_payload(self, service):
@@ -661,10 +624,9 @@ class TestAddEpisodeReferenceTime:
             project_id='test',
             reference_time=None,
         )
-        call_kwargs = service.durable_queue.enqueue.call_args[1]
-        payload = call_kwargs['payload']
+        value = service.durable_queue.enqueue.call_args.args[0]
         # Either None or absent — both acceptable
-        assert payload.get('reference_time') is None
+        assert value.reference_time is None
 
     @pytest.mark.asyncio
     async def test_default_omission_reference_time_is_none(self, service):
@@ -673,9 +635,8 @@ class TestAddEpisodeReferenceTime:
             content='default content',
             project_id='test',
         )
-        call_kwargs = service.durable_queue.enqueue.call_args[1]
-        payload = call_kwargs['payload']
-        assert payload.get('reference_time') is None
+        value = service.durable_queue.enqueue.call_args.args[0]
+        assert value.reference_time is None
 
 
 # ---------------------------------------------------------------------------
@@ -806,10 +767,9 @@ class TestReferenceTimeTemporalContextInteraction:
             temporal_context='retrospective',
             reference_time=ref_dt,
         )
-        call_kwargs = service.durable_queue.enqueue.call_args[1]
-        payload = call_kwargs['payload']
-        assert payload.get('temporal_context') == 'retrospective'
-        assert payload.get('reference_time') == ref_dt.isoformat()
+        value = service.durable_queue.enqueue.call_args.args[0]
+        assert value.temporal_context == 'retrospective'
+        assert value.reference_time == ref_dt
 
     @pytest.mark.asyncio
     async def test_execute_graphiti_write_forwards_both(self, service):
@@ -828,7 +788,7 @@ class TestReferenceTimeTemporalContextInteraction:
             'temporal_context': 'retrospective',
             'reference_time': ref_iso,
         }
-        await service._execute_graphiti_write('add_episode', payload)
+        await service._execute_graphiti_write(queued('add_episode', payload))
         call_kwargs = service.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('temporal_context') == 'retrospective'
         assert call_kwargs.get('reference_time') == ref_expected
@@ -865,7 +825,7 @@ class TestExecuteGraphitiWriteReferenceTimeErrorHandling:
         }
         with caplog.at_level(logging.WARNING):
             # Must NOT raise — invalid value should be silently discarded with a warning
-            await service._execute_graphiti_write('add_episode', payload)
+            await service._execute_graphiti_write(queued('add_episode', payload))
 
         # graphiti.add_episode must still be called with reference_time=None
         call_kwargs = service.graphiti.add_episode.call_args[1]
@@ -896,7 +856,7 @@ class TestExecuteGraphitiWriteReferenceTimeErrorHandling:
         }
         with caplog.at_level(logging.WARNING):
             # Must NOT raise
-            await service._execute_graphiti_write('add_episode', payload)
+            await service._execute_graphiti_write(queued('add_episode', payload))
 
         call_kwargs = service.graphiti.add_episode.call_args[1]
         assert call_kwargs.get('reference_time') is None

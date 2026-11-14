@@ -1,0 +1,31 @@
+import json,time,collections,re
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+def summ(xs):
+    return f"n={len(xs)} min={min(xs):.0f} p50={pct(xs,.5):.0f} p90={pct(xs,.9):.0f} p95={pct(xs,.95):.0f} p99={pct(xs,.99):.0f} p99.9={pct(xs,.999):.0f} max={max(xs):.0f}"
+seeds={}
+for l in open('/home/leo/src/reify/data/verify-logs/verify-runs.jsonl',errors='replace'):
+    try:r=json.loads(l)
+    except Exception:continue
+    b=r.get('lane_seed')
+    if isinstance(b,dict) and isinstance(b.get('seed'),dict):
+        s=b['seed']
+        if s.get('started_at') and s.get('exited_at'):
+            seeds[s['seed_id']]=(s['exited_at']-s['started_at'],s['lane_dir'].rsplit('/',1)[-1],s['started_at'],s.get('mode'))
+v=list(seeds.values())
+print('distinct seeds',len(v),time.strftime('%m-%d',time.gmtime(min(x[2] for x in v))),'->',time.strftime('%m-%d',time.gmtime(max(x[2] for x in v))))
+print('ALL',summ([x[0] for x in v]))
+print('fresh',summ([x[0] for x in v if x[3]=='fresh-checkout']))
+now=max(x[2] for x in v)
+for d in (7,14,30):
+    xs=[x[0] for x in v if x[2]>now-d*86400]
+    if xs: print(f'last {d}d',summ(xs))
+for k,pre in (('_spec','_spec'),('_lane','_lane'),('_merge','_merge'),('other','')):
+    xs=[x[0] for x in v if x[1].startswith(pre)] if pre else []
+    if xs: print(k,summ(xs))
+print('over 120',sum(x[0]>120 for x in v),'over 600',sum(x[0]>600 for x in v),'over 900',sum(x[0]>900 for x in v),'over 1200',sum(x[0]>1200 for x in v),'over 1800',sum(x[0]>1800 for x in v))
+for x in sorted(v,reverse=True)[:8]: print(round(x[0]),x[1],time.strftime('%m-%d %H:%M',time.gmtime(x[2])))
+# weekly trend
+wk=collections.defaultdict(list)
+for x in v: wk[time.strftime('%G-W%V',time.gmtime(x[2]))].append(x[0])
+for k in sorted(wk):print(k,summ(wk[k]))

@@ -3,7 +3,7 @@
 //
 // WHY THIS FILE EXISTS — the per-module suites structurally cannot catch this
 // bug class. Every other suite in this directory (`graph_layout.test.mjs`,
-// `esc_flow_layout.test.mjs`, `prd_grouping.test.mjs`, ...) `import`s exactly
+// `esc_flow_layout.test.mjs`, `prd_lanes_view.test.mjs`, ...) `import`s exactly
 // one module, which resolves as CommonJS (no package.json in this repo) and is
 // evaluated in its OWN module scope. In the browser these same files are NOT
 // modules: index.html loads each as a classic `<script src=...>` tag, and
@@ -42,6 +42,7 @@ import {
   VENDORED_BABEL,
   babelScriptSrcs,
   classicScriptSrcs,
+  compileAsScriptTag,
   loadVendoredBabel,
   readIndexHtml,
 } from './_served_bundle.mjs';
@@ -53,7 +54,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'datum.js': 'DF_DATUM',
   'data.js': 'DF_DATA_LOADER',
   'graph_layout.js': 'DF_GRAPH_LAYOUT',
-  'prd_grouping.js': 'DF_PRD_GROUPING',
+  'prd_lanes_view.js': 'DF_PRD_LANES_VIEW',
   'runtime_format.js': 'DF_RUNTIME_FMT',
   'tasks_offline_banner.js': 'DF_TASKS_OFFLINE_BANNER',
   'orch_filter.js': 'DF_ORCH_FILTER',
@@ -64,6 +65,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'burndown_bands.js': 'DF_BURNDOWN_BANDS',
   'pins_recovery.js': 'DF_PINS_RECOVERY',
   'endpoint_staleness.js': 'DF_ENDPOINT_STALENESS',
+  'poll_scope.js': 'DF_POLL_SCOPE',
   'recon_status.js': 'DF_RECON_STATUS',
   'task_vocab.js': 'DF_TASK_VOCAB',
   'task_snapshot.js': 'DF_TASK_SNAPSHOT',
@@ -73,11 +75,16 @@ const EXPECTED_WINDOW_GLOBALS = {
   'performance_cards.js': 'DF_PERFORMANCE_CARDS',
   'escalation_views.js': 'DF_ESCALATION_VIEWS',
   'escalation_focus.js': 'DF_ESCALATION_FOCUS',
+  'escalation_check_owner.js': 'DF_ESCALATION_CHECK_OWNER',
   'memory_readings.js': 'DF_MEMORY_READINGS',
   'system_health.js': 'DF_SYSTEM_HEALTH',
   'spend_readings.js': 'DF_SPEND_READINGS',
   'persisted_state.js': 'DF_PERSISTED_STATE',
   'invariant_chip.js': 'DF_INVARIANT_CHIP',
+  'deferral_cell.js': 'DF_DEFERRAL_CELL',
+  'render_failure.js': 'DF_RENDER_FAILURE',
+  'chart_marks.js': 'DF_CHART_MARKS',
+  'quality_view.js': 'DF_QUALITY_VIEW',
 };
 
 // NOTE — no `document` shim, and that omission is load-bearing rather than an
@@ -176,7 +183,7 @@ test('every classic /static/redux/*.js script loads into ONE shared global lexic
       'scripts share ONE global lexical scope, so the second one to declare ' +
       'the name dies before its body runs and never reaches its ' +
       '`window.DF_* = ...` assignment. Fix: give the offending module a ' +
-      'module-unique `<MODULE>_API` const, per the existing PRD_GROUPING_API / ' +
+      'module-unique `<MODULE>_API` const, per the existing PRD_LANES_VIEW_API / ' +
       'RUNTIME_FORMAT_API / ORCH_FILTER_API / DF_DATA_LOADER_API precedent.',
   );
 });
@@ -226,7 +233,7 @@ test('no classic script leaks a bare `API` binding into the shared global lexica
     'undefined',
     'a classic /static/redux/*.js script still declares a bare top-level ' +
       '`const API`. The convention is that every such module exposes its ' +
-      'surface under a module-unique `<MODULE>_API` const — PRD_GROUPING_API, ' +
+      'surface under a module-unique `<MODULE>_API` const — PRD_LANES_VIEW_API, ' +
       'RUNTIME_FORMAT_API, ORCH_FILTER_API, DF_DATA_LOADER_API, ' +
       'ESC_FLOW_LAYOUT_API, GRAPH_LAYOUT_API — never a bare `API`. A bare ' +
       '`API` is a live landmine rather than a style nit: the NEXT module to ' +
@@ -265,10 +272,6 @@ test('the harness actually detects a duplicate top-level const (negative control
 });
 
 // ── The text/babel .jsx tags ──────────────────────────────────────────────
-
-function compileAsScriptTag(source, filename) {
-  return loadVendoredBabel().transform(source, { ...SCRIPT_TAG_BABEL_OPTIONS, filename, sourceFileName: filename }).code;
-}
 
 const PROBE_SENTINEL = 'classic-scope probe: declarations instantiated, body not run';
 

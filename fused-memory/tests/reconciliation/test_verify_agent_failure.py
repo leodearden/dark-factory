@@ -65,15 +65,15 @@ def git_root(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    'agent_return',
+    'result_dict',
     [
-        ({'warning': 'no_tool_calls', 'text': 'gave up'}, []),
-        ({'warning': 'max_steps_reached'}, []),
+        {'warning': 'no_tool_calls', 'text': 'gave up'},
+        {'warning': 'max_steps_reached'},
     ],
     ids=['no_tool_calls', 'max_steps_reached'],
 )
 async def test_verify_agent_failure_emits_warning_and_sentinel_summary(
-    agent_return, caplog, git_root
+    result_dict, caplog, git_root
 ):
     """When AgentLoop.run() returns a warning shape, verify() must:
 
@@ -85,12 +85,11 @@ async def test_verify_agent_failure_emits_warning_and_sentinel_summary(
       STRUCTURED fields, so a downstream consumer never has to parse the
       ``agent-failed:`` prefix back out of the summary prose
     """
-    result_dict, journal = agent_return
     expected_token = result_dict['warning']
 
     with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
         mock_agent_instance = AsyncMock()
-        mock_agent_instance.run = AsyncMock(return_value=(result_dict, journal))
+        mock_agent_instance.run = AsyncMock(return_value=result_dict)
         MockAgentLoop.return_value = mock_agent_instance
 
         verifier = CodebaseVerifier(_default_config())
@@ -147,7 +146,7 @@ async def test_verify_agent_failure_non_dict_uses_error_summary(caplog, git_root
     """
     with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
         mock_agent_instance = AsyncMock()
-        mock_agent_instance.run = AsyncMock(return_value=(None, []))
+        mock_agent_instance.run = AsyncMock(return_value=None)
         MockAgentLoop.return_value = mock_agent_instance
 
         verifier = CodebaseVerifier(_default_config())
@@ -209,7 +208,7 @@ async def test_verify_failure_token_prefers_cli_warning_origin(origin_token, git
 
     with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
         mock_agent_instance = AsyncMock()
-        mock_agent_instance.run = AsyncMock(return_value=(result_dict, []))
+        mock_agent_instance.run = AsyncMock(return_value=result_dict)
         MockAgentLoop.return_value = mock_agent_instance
 
         verifier = CodebaseVerifier(_default_config())
@@ -241,7 +240,7 @@ async def test_verify_failure_token_falls_back_when_no_origin(git_root):
     """
     with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
         mock_agent_instance = AsyncMock()
-        mock_agent_instance.run = AsyncMock(return_value=({'warning': 'max_steps_reached'}, []))
+        mock_agent_instance.run = AsyncMock(return_value={'warning': 'max_steps_reached'})
         MockAgentLoop.return_value = mock_agent_instance
 
         verifier = CodebaseVerifier(_default_config())
@@ -282,7 +281,7 @@ async def test_verify_failure_token_coerces_malformed_origin(raw_origin, expecte
 
     with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
         mock_agent_instance = AsyncMock()
-        mock_agent_instance.run = AsyncMock(return_value=(result_dict, []))
+        mock_agent_instance.run = AsyncMock(return_value=result_dict)
         MockAgentLoop.return_value = mock_agent_instance
 
         verifier = CodebaseVerifier(_default_config())
@@ -436,11 +435,10 @@ async def test_verify_success_path_preserved(caplog, git_root):
         'summary': 'looks good',
         'git_context': {'author': 'x', 'latest_relevant_commit': 'abc123'},
     }
-    journal: list = []
 
     with patch('fused_memory.reconciliation.verify.AgentLoop') as MockAgentLoop:
         mock_agent_instance = AsyncMock()
-        mock_agent_instance.run = AsyncMock(return_value=(terminal_result, journal))
+        mock_agent_instance.run = AsyncMock(return_value=terminal_result)
         MockAgentLoop.return_value = mock_agent_instance
 
         verifier = CodebaseVerifier(_default_config())

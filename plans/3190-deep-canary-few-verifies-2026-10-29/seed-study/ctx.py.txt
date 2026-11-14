@@ -1,0 +1,93 @@
+import json,time,collections,bisect,math,calendar,statistics as st
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+S=json.load(open('/tmp/3190s/phases.json'))['seeds']
+fp=sorted(float(l.split()[0]) for l in open('/tmp/3190s/fp.list'))
+def units(t):return bisect.bisect_right(fp,t)
+print('backcast fingerprint units surviving in gen602 by dir mtime (UTC) vs ledger median units_total (rule: dir mtime = unit creation; ledger measured on seeded lanes)')
+for d in ('10-01','10-08','10-13','10-15','10-18','10-20','10-23','10-26','10-29','10-30'):
+    m,dd=map(int,d.split('-'));print(d,units(calendar.timegm((2026,m,dd,12,0,0))))
+R=json.load(open('/tmp/3190s/clone_psi.json'))
+Q=[r for r in R if r['psi_cpu_some_avg10']<15 and r['psi_io_some_avg10']<5]
+print('QUIET clones (mean PSI in clone window cpu<15 and io<5) by ISO week: n p10 p50 p90 units_mid ms_per_unit_p50')
+b=collections.defaultdict(list)
+for r in Q:b[time.strftime('%G-W%V',time.gmtime(r['t']))].append(r)
+for k in sorted(b):
+    v=[r['c'] for r in b[k]];u=st.median(units(r['t']) for r in b[k])
+    print(k,len(v),f"{pct(v,.1):.0f} {pct(v,.5):.0f} {pct(v,.9):.0f} {u:.0f} {1000*pct(v,.5)/u:.2f}")
+print('ALL clones by ISO week: n p50 units ms_per_unit; and at PSI band')
+b=collections.defaultdict(list)
+for r in R:b[time.strftime('%G-W%V',time.gmtime(r['t']))].append(r)
+for k in sorted(b):
+    v=[r['c'] for r in b[k]];u=st.median(units(r['t']) for r in b[k])
+    print(k,len(v),f"{pct(v,.5):.0f} {u:.0f} {1000*pct(v,.5)/u:.2f}", 'mean_psi io %.1f mem_some %.1f mem_full %.1f cpu %.1f'%tuple(st.mean(r[x] for r in b[k]) for x in ('psi_io_some_avg10','psi_mem_some_avg10','psi_mem_full_avg10','psi_cpu_some_avg10')))
+# OLS log(clone)~log(units)+psi_io+psi_mem_some+psi_cpu
+import random
+X=[];Y=[]
+for r in R:
+    if r['c']>0:
+        X.append([1,math.log(units(r['t'])),r['psi_io_some_avg10']/10,r['psi_mem_some_avg10']/10,r['psi_cpu_some_avg10']/10]);Y.append(math.log(r['c']))
+n=len(X);p=len(X[0]);A=[[sum(X[i][a]*X[i][b] for i in range(n)) for b in range(p)] for a in range(p)];B=[sum(X[i][a]*Y[i] for i in range(n)) for a in range(p)]
+for i in range(p):
+    piv=A[i][i]
+    for j in range(i,p):A[i][j]/=piv
+    B[i]/=piv
+    for k in range(p):
+        if k!=i:
+            f=A[k][i]
+            for j in range(i,p):A[k][j]-=f*A[i][j]
+            B[k]-=f*B[i]
+print('OLS log(clone)=b0+b1 log(units)+b2 io/10+b3 mem/10+b4 cpu/10; n=',n,'coef',[round(x,3) for x in B])
+yh=[sum(a*b for a,b in zip(x,B)) for x in X];ym=sum(Y)/n
+print('R2',round(1-sum((y-h)**2 for y,h in zip(Y,yh))/sum((y-ym)**2 for y in Y),3))
+def mean(k,lo,hi):
+    v=[r[k] for r in R if lo<=r['t']<hi];return sum(v)/len(v)
+a,b1=calendar.timegm((2026,9,28,0,0,0)),calendar.timegm((2026,10,5,0,0,0));c,d=calendar.timegm((2026,10,26,0,0,0)),calendar.timegm((2026,11,2,0,0,0))
+ua=st.median(units(r['t']) for r in R if a<=r['t']<b1);ud=st.median(units(r['t']) for r in R if c<=r['t']<d)
+print('W40 vs W44 units',ua,ud)
+print('contrib log-points: units',round(B[1]*math.log(ud/ua),3),'io',round(B[2]*(mean('psi_io_some_avg10',c,d)-mean('psi_io_some_avg10',a,b1))/10,3),'mem',round(B[3]*(mean('psi_mem_some_avg10',c,d)-mean('psi_mem_some_avg10',a,b1))/10,3),'cpu',round(B[4]*(mean('psi_cpu_some_avg10',c,d)-mean('psi_cpu_some_avg10',a,b1))/10,3))
+# Verify runs concurrency
+runs=[];seeds={};uw=collections.defaultdict(list)
+for l in open('/home/leo/src/reify/data/verify-logs/verify-runs.jsonl',errors='replace'):
+    try:r=json.loads(l)
+    except Exception:continue
+    if r.get('started_at') and r.get('ended_at'):runs.append((r['started_at'],r['ended_at'],r.get('role')))
+    b=r.get('lane_seed')
+    if isinstance(b,dict) and isinstance(b.get('seed'),dict):
+        s=b['seed'];seeds.setdefault(s['seed_id'],(s['lane_dir'].rsplit('/',1)[-1],s['started_at'],s['exited_at']))
+        f=b.get('fingerprint') or {}
+        if f.get('units_written_since_seed') is not None:uw[time.strftime('%m-%d',time.gmtime(s['started_at']))].append(f['units_written_since_seed'])
+print('units_written_since_seed per day median',{k:int(st.median(v)) for k,v in sorted(uw.items())})
+st0=sorted(a for a,b,_ in runs);en0=sorted(b for a,b,_ in runs)
+def conc(t):return bisect.bisect_right(st0,t)-bisect.bisect_right(en0,t)
+print('Clone p50 by concurrent local verify runs at clone midpoint, n / p50, per era (ledger runs only, from 10-15)')
+for nm,lo,hi in (('10-15..18',calendar.timegm((2026,10,15,0,0,0)),calendar.timegm((2026,10,19,0,0,0))),('10-19..25',calendar.timegm((2026,10,19,0,0,0)),calendar.timegm((2026,10,26,0,0,0))),('10-26..30',calendar.timegm((2026,10,26,0,0,0)),9e12)):
+    bins=collections.defaultdict(list)
+    for s in S:
+        if 'clone0' in s and 'clone1' in s and lo<=s['clone0']<hi:
+            c=conc((s['clone0']+s['clone1'])/2);k=min(c,8);bins[k].append(s['clone1']-s['clone0'])
+    print(nm,'; '.join(f"{k}:{len(v)}/{pct(v,.5):.0f}" for k,v in sorted(bins.items())))
+# H5: non-sweep ledger seeds overlap with sweep clones
+intv=sorted((s['clone0'],s['clone1']) for s in S if 'clone0' in s and 'clone1' in s)
+by=collections.defaultdict(list)
+for s in S:
+    if s.get('lane') and s.get('start'):by[s['lane']].append(s['start'])
+ov={'lo':[],'hi':[]};O=[]
+for k,(ln,a,b) in seeds.items():
+    if any(abs(a-x)<20 for x in by.get(ln,[])):continue
+    d=0
+    i=bisect.bisect_left(intv,(a-3000,0))
+    for x,y in intv[i:i+40]:
+        d+=max(0,min(b,y)-max(a,x))
+    f=d/(b-a);O.append((f,b-a,a))
+for nm,lo,hi in (('10-15..21',calendar.timegm((2026,10,15,0,0,0)),calendar.timegm((2026,10,22,0,0,0))),('10-22..30',calendar.timegm((2026,10,22,0,0,0)),9e12)):
+    v=[x for x in O if lo<=x[2]<hi]
+    for a1,b1_ in ((0,.5),(.5,.8),(.8,1.01)):
+        w=[x[1] for x in v if a1<=x[0]<b1_]
+        if w:print('non-sweep ledger seed',nm,'sweep-clone overlap in',(a1,b1_),'n',len(w),f"p50={pct(w,.5):.0f}")
+# inter-run gaps of the sweep
+SW=sorted(json.load(open('/tmp/3190s/phases.json'))['sweep']);byp=collections.OrderedDict()
+for t,k,l,p in SW:
+    byp.setdefault(p,[t,t]);byp[p][1]=t
+vals=list(byp.values());gap=[(b[0]-a[1]) for a,b in zip(vals,vals[1:])]
+print('sweep runs',len(vals),'inter-run gap s p50/p90/max',f"{pct(gap,.5):.0f} {pct(gap,.9):.0f} {max(gap):.0f}")

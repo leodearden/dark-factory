@@ -16,6 +16,22 @@
       "severity": "suggestion",
       "description": "The test mocks add dom: { isConnected: true } to satisfy the new guard, but there is no test case verifying the guard actually prevents dispatch when isConnected is false. A negative test case would validate the fix works.",
       "mutation_type": "real_world"
+    },
+    {
+      "id": "ts_real_01_pool_01",
+      "location": "gui/src/__tests__/gotoDefinition.test.ts:57",
+      "category": "test_fixture_duplication",
+      "severity": "suggestion",
+      "description": "The mockView (and mockEvent) literal is copied into three tests, so this change had to add dom: { isConnected: true } three times, and every future field the handler reads needs the same multi-site edit; the tests also reach the handler through an 'as any' cast to ext.handlers.mousedown, an internal representation of the CodeMirror extension. The duplication predates the change but the change extends it.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "ts_real_01_pool_02",
+      "location": "gui/src/editor/gotoDefinition.ts:105",
+      "category": "implicit_guard_policy",
+      "severity": "suggestion",
+      "description": "The new guard uses view.dom.isConnected as an unnamed proxy for 'view destroyed' and, because it precedes the same-file/cross-file branch, also drops the onNavigate callback; neither the intent nor the fact that onNavigate will not fire after unmount is stated in the reifyGotoDefinition docstring, and Editor.tsx keeps a separate 'destroyed' flag for the same lifecycle. The behaviour itself matches the task.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "context": {

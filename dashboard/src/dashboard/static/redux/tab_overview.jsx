@@ -1,5 +1,5 @@
 /* Overview tab — command-center grid */
-const { Sparkline, LineChart, StatTile, PALETTE: P, niceCountMax } = window.DF_CHARTS;
+const { Sparkline, LineChart, StatTile, PALETTE: P } = window.DF_CHARTS;
 const { Glyph, LiveFeed, DatumReading } = window.DF_SHELL;
 const D = window.DF_DATA;
 // The census readers and the Datum wrappers. Module scope, no fallback — see
@@ -57,7 +57,7 @@ function formatLoadValue(type, v) {
  * unit's `--timeout-keep-alive` must stay strictly ABOVE the slowest such
  * poller, or the server closes this socket in the gap between polls and exposes
  * the server-closes-while-client-writes race. The value is parsed from this
- * declaration by tests/scripts/test_dashboard_service_template.py
+ * declaration by tests/scripts/dashboard_client_pollers.py
  * (CLIENT_POLLERS), so RAISING IT REQUIRES raising --timeout-keep-alive in BOTH
  * scripts/dashboard.service.template and
  * dashboard/dark-factory-dashboard.service.
@@ -265,7 +265,7 @@ function OverviewTab({ paused }) {
               ]}
               height={210}
               formatY={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : Math.round(v)}
-              snapMax={niceCountMax}
+              countAxis
               formatX={window.DF_SHELL.fmtDateTime}
             />
           </div>

@@ -1,0 +1,154 @@
+{
+ "stream": "S10",
+ "prd_path": "docs/prds/review-all-planner-boundary-contracts.md",
+ "sidecar_path": "docs/prds/review-all-planner-boundary-contracts.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "alpha",
+   "task_id": "1202",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-81b3980217eb"
+   ],
+   "depends_on": [
+    "1082",
+    "517",
+    "899"
+   ]
+  },
+  {
+   "label": "beta",
+   "task_id": "1203",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-c0ef97acd037"
+   ],
+   "depends_on": [
+    "517",
+    "1171"
+   ]
+  },
+  {
+   "label": "gamma",
+   "task_id": "1204",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-58fff4d62d5a"
+   ],
+   "depends_on": [
+    "1173",
+    "1175"
+   ]
+  },
+  {
+   "label": "delta",
+   "task_id": "516",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-6de37ba38543"
+   ],
+   "depends_on": [
+    "207",
+    "1204",
+    "517",
+    "1194"
+   ],
+   "note": "delta, amended in place; priority medium->high"
+  },
+  {
+   "label": "epsilon",
+   "task_id": "1205",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-cf71c63d7303",
+    "fk-e3c5dde1f18b",
+    "fk-d202a5c83e5f"
+   ],
+   "depends_on": [
+    "516",
+    "1204",
+    "1142",
+    "1097",
+    "1066",
+    "517"
+   ],
+   "note": "epsilon; held on S1 at filing, released onto 267 on 2026-10-15"
+  },
+  {
+   "label": "zeta",
+   "task_id": "1206",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-3f39f0deb462"
+   ],
+   "depends_on": [
+    "1205"
+   ]
+  },
+  {
+   "label": "eta",
+   "task_id": "1207",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-826944df8276",
+    "fk-78897b9985f1"
+   ],
+   "depends_on": [
+    "1202",
+    "1203",
+    "1206"
+   ]
+  },
+  {
+   "label": "theta",
+   "task_id": "1020",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-160bca1a028e",
+    "fk-643fb20ec130"
+   ],
+   "depends_on": [
+    "1203",
+    "516",
+    "1171",
+    "517"
+   ],
+   "note": "theta, amended in place"
+  },
+  {
+   "label": "iota",
+   "task_id": "1208",
+   "priority": "low",
+   "x_finding_key": [],
+   "depends_on": []
+  },
+  {
+   "label": "acceptance record (cancelled)",
+   "task_id": "1210",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-d7b318454411",
+    "fk-b7d697ff03ef",
+    "fk-62f3e4afcf3f"
+   ],
+   "depends_on": [],
+   "note": "acceptance record, cancelled, names 1208"
+  }
+ ],
+ "held_leaves": [
+  "1205 (epsilon) x_seam_wait S1 BillingConfig.from_governed_finance(store, at, *, base) as-o"
+ ],
+ "gate_dependencies_added": [
+  "1203",
+  "516",
+  "1205"
+ ],
+ "commit_planning_result": "commit_planning(1202,1203,1204,516,1206,1207,1020,1208 -> pending) success: 6 flipped deferred->pending, 516 and 1020 no_op (already pending, amended in place). manifest_stamping stamped α β γ δ ζ η θ ι, missing_labels [], errors []. Mechanical delivered_checks were copied to the tasks: 1202=4, 1203",
+ "lead_rulings": [
+  "516 (delta) and 1020 (theta) amended in place; 1202 -> 899 edge (in-flight Forecast index work, coordination note on 899); gamma and delta wired, not held (S4 1173/1175, S13 1194 filed).",
+  "Held leaf epsilon 1205 released onto S1-epsilon 267 (2026-10-15): add_dependency 1205 -> 267, commit_planning 1205, sidecar binding builder-production-caller OPEN -> PASS naming 267.",
+  "P-Fleet edges 601 -> 1205, 602 -> 1203, 603 -> 1204 with dated notes; fk-643fb20ec130 encoder half stamped on 699 (blocked) with a dated note; fk-6de37ba38543 now on 516.",
+  "Stale pre-amendment worktrees .worktrees/516 and .worktrees/1020 (EXECUTE phase, no commits, no claimant) and their .task-meta plans are for Leo to discard before re-dispatch; the tasks' details already mark pre-2026-10-14 plans superseded.",
+  "Acceptance record 1210 cancelled by the seat (fk-62f3e4afcf3f -> MPC PRD via 1208)."
+ ]
+}

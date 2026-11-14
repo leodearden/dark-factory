@@ -9,11 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from shared.project_layout import escalation_queue_dir
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.memory_metadata import normalize_supersedes
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 from fused_memory.middleware.task_interceptor import (
     _extract_metadata_files,
     _missing_files,
@@ -29,6 +29,12 @@ from fused_memory.models.reconciliation import (
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.reconciler_escalation import (
+    INSTALLED_ESCALATION_QUEUE_FACTORY,
+    EscalationQueueFactory,
+    file_reconciler_l1,
+    pending_escalations,
+)
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     retire_flag_markers_for_terminal_task,
 )
@@ -47,19 +53,6 @@ from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
 from fused_memory.utils.clip_disclosure import fit_at_word
 from fused_memory.utils.task_dependency_ids import task_dependency_ids
 from fused_memory.utils.validation import InputValidationError, require_project_root
-
-# Defensive import — escalation is an optional workspace package (mirrors
-# scope_violation_escalator.py:43-48).  When absent, L1 escalation degrades
-# to a logged no-op; the sweep still cancels deterministic orphans and
-# blocks ambiguous ones, so the dashboard still surfaces orphan state.
-try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-    _HAS_ESCALATION = True
-except ImportError:  # pragma: no cover — exercised only in minimal envs
-    Escalation = None  # type: ignore[assignment,misc]
-    EscalationQueue = None  # type: ignore[assignment,misc]
-    _HAS_ESCALATION = False
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -227,6 +220,10 @@ class TargetedReconciler:
         journal: ReconciliationJournal,
         config: FusedMemoryConfig,
         event_buffer: EventBuffer | None = None,
+        *,
+        escalation_queue_factory: EscalationQueueFactory | None = (
+            INSTALLED_ESCALATION_QUEUE_FACTORY
+        ),
     ):
         self.memory = memory_service
         self.taskmaster = taskmaster
@@ -234,6 +231,7 @@ class TargetedReconciler:
         self.config = config.reconciliation
         self.verifier = CodebaseVerifier(config.reconciliation)
         self.buffer = event_buffer
+        self._escalation_queue_factory = escalation_queue_factory
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         # Wire post-construction (mirroring the planned_episode_registry pattern) so that
         # _on_task_blocked routes metadata writes through the interceptor's write_lock.
@@ -908,15 +906,9 @@ class TargetedReconciler:
                         )
                         if esc_action is not None:
                             result['actions'].append(esc_action)
-                        # Deliberately NO add_run_action(run_id, 'verify',
-                        # 'codebase', ...) row here: task 4343's contract is
-                        # exactly ONE outcome row per invocation of this
-                        # branch, which is what makes the operator census
-                        # truthful by construction.  A second verify row would
-                        # double-count it.  The escalation's durable records
-                        # are its own JSON file plus the outcome row already
-                        # written above; the run-level signal is the
-                        # result['actions'] entry.
+                        # _escalate_contradicted_l1 journals the escalation as
+                        # a write|skip escalation/submit row, never as a verify
+                        # row, so task 4343's one-outcome-row census holds.
                     written = await self._fenced_add_memory(
                         content=_VERDICT_MEMORY_TEMPLATES[verification.verdict].format(
                             title=title, summary=verification.summary,
@@ -1754,13 +1746,12 @@ class TargetedReconciler:
     ) -> dict | None:
         """File an L1 escalation for an ambiguous descendant when orch is live.
 
-        Journals the filing as write/skip under ``escalation``/``submit``,
-        symmetric with :meth:`_sweep_cancel_orphan` and
-        :meth:`_sweep_block_orphan`.
+        Journals the filing as write/skip under ``escalation``/``submit``
+        through :meth:`_journal_l1_filed` / :meth:`_journal_l1_failed`, symmetric with
+        :meth:`_sweep_cancel_orphan` and :meth:`_sweep_block_orphan`.
         """
-        # is-None narrows the optional types for pyright (mirrors
-        # stage1_stall_detector.py:241).  HAS_ESCALATION is informational.
-        if not _HAS_ESCALATION or Escalation is None or EscalationQueue is None:
+        factory = self._escalation_queue_factory
+        if factory is None:
             logger.debug(
                 'sweep: escalation pkg unavailable; cannot file L1 for orphan %s',
                 task_id,
@@ -1781,53 +1772,30 @@ class TargetedReconciler:
         if escalation_id:
             detail_lines.append(f'Originating review escalation: {escalation_id}')
         detail = '\n'.join(detail_lines)
+        filing = {
+            'task_id': task_id,
+            'parent_id': parent_id,
+            'type': 'descendant_escalated',
+        }
 
         try:
-            queue = EscalationQueue(escalation_queue_dir(project_root))
-            esc = Escalation(
-                id=queue.make_id(task_id),
+            esc_id = await asyncio.to_thread(
+                file_reconciler_l1, factory, project_root,
                 task_id=task_id,
-                agent_role='reconciler',
                 severity='blocking',
                 category='scope_violation',
                 summary=summary,
                 detail=detail,
                 suggested_action='expand_scope|abort_task',
-                level=1,
             )
-            esc_id = queue.submit(esc)
         except Exception as e:
             logger.warning(
                 'sweep: L1 escalate failed for orphan %s (parent %s): %s',
                 task_id, parent_id, e,
             )
-            await self.journal.add_run_action(
-                run_id, 'skip', 'escalation', 'submit',
-                {
-                    'task_id': task_id,
-                    'parent_id': parent_id,
-                    'type': 'descendant_escalated',
-                    'error': str(e)[:200],
-                },
-                causation_id=run_id,
-            )
+            await self._journal_l1_failed(run_id, filing, e)
             return None
-        await self.journal.add_run_action(
-            run_id, 'write', 'escalation', 'submit',
-            {
-                'task_id': task_id,
-                'parent_id': parent_id,
-                'type': 'descendant_escalated',
-                'escalation_id': esc_id,
-            },
-            causation_id=run_id,
-        )
-        return {
-            'type': 'descendant_escalated',
-            'task_id': task_id,
-            'parent_id': parent_id,
-            'escalation_id': esc_id,
-        }
+        return await self._journal_l1_filed(run_id, filing, esc_id)
 
     async def _escalate_contradicted_l1(
         self,
@@ -1882,24 +1850,19 @@ class TargetedReconciler:
           preferred over silently dropping the finding.
 
         Returns the action dict for `result['actions']`, or None when the
-        escalation package is unavailable.
+        escalation package is unavailable or the filing failed.  A filing is
+        journaled through :meth:`_journal_l1_filed` / :meth:`_journal_l1_failed`,
+        the same as in :meth:`_sweep_escalate_l1`; an unavailable package stays
+        journal-silent.
         """
-        # is-None narrows the optional types for pyright (mirrors
-        # _sweep_escalate_l1). _HAS_ESCALATION is informational.
-        if not _HAS_ESCALATION or Escalation is None or EscalationQueue is None:
+        factory = self._escalation_queue_factory
+        if factory is None:
             logger.debug(
                 'verify: escalation pkg unavailable; cannot file L1 for '
                 'contradicted task %s',
                 task_id,
             )
             return None
-        # Rebound to locals because pyright's narrowing above does NOT reach
-        # into the nested `_file` scope below: a module-level global could be
-        # reassigned between closure capture and call, so reading
-        # `Escalation`/`EscalationQueue` there re-widens to `... | None` and
-        # trips reportOptionalCall.  These locals are never reassigned, so the
-        # narrowed types survive into the closure.
-        esc_cls, queue_cls = Escalation, EscalationQueue
 
         # One line, and a free-text title must not be what breaks that
         # contract — hence both the newline scrub and the bounded truncate.
@@ -1932,59 +1895,58 @@ class TargetedReconciler:
             f'verify|codebase|contradicted audit row for run {run_id}.',
         ])
         detail = '\n'.join(detail_lines)
+        filing = {'task_id': task_id, 'type': 'verification_contradicted_escalated'}
 
-        def _file() -> str:
-            # Constructed HERE, not hoisted: EscalationQueue.__init__ does
-            # mkdir(parents=True, exist_ok=True), so building it outside the
-            # contradicted branch would create data/escalations/ in every
-            # target project as a side effect of an unrelated done
-            # transition — the trap _escalation_pin_index_for documents.
-            queue = queue_cls(escalation_queue_dir(project_root))
-            esc = esc_cls(
-                id=queue.make_id(task_id),
+        # Offloaded (INV-8): _on_task_done runs on the shared event loop.
+        # Contained HERE, not at the call site, which sits inside
+        # _on_task_done's broad verify `except`: an escaping raise would skip
+        # the contradiction memory write, emit a spurious `post_verify_error`
+        # row (double-counting task 4343's verify census and blaming the
+        # verifier for a queue failure), and log the misleading generic
+        # 'Verification failed for task'.  A broken escalation store must cost
+        # the escalation and nothing else, yet stay visible to an operator —
+        # hence warn, never a silent `pass`.
+        try:
+            esc_id = await asyncio.to_thread(
+                file_reconciler_l1, factory, project_root,
                 task_id=task_id,
-                agent_role='reconciler',
                 severity='info',
                 category='risk_identified',
                 summary=summary,
                 detail=detail,
                 suggested_action='reopen_task|create_followup_task|dismiss',
-                level=1,
             )
-            return queue.submit(esc)
-
-        # Offloaded because EscalationQueue is synchronous blocking filesystem
-        # I/O and _on_task_done runs on the shared fused-memory event loop
-        # (INV-8) — following _escalation_pin_index_for's precedent, not
-        # _sweep_escalate_l1's older un-offloaded inline call.
-        #
-        # Contained HERE rather than at the call site, and this placement is
-        # the whole point rather than a stylistic choice.  The call site sits
-        # inside _on_task_done's broad verify `except`, so an escaping raise
-        # would (a) skip the contradiction memory write entirely, costing the
-        # corpus its record over a filesystem outage, (b) emit a spurious
-        # `post_verify_error` row that both double-counts task 4343's verify
-        # census and blames the verifier for a queue failure, and (c) log the
-        # misleading generic 'Verification failed for task' message.  A broken
-        # escalation store must cost the escalation and nothing else — which is
-        # also why this is a warn-and-return-None arm (_sweep_escalate_l1's
-        # precedent) and not a silent `except Exception: pass`: the failure
-        # still has to be visible to an operator.
-        # asyncio.to_thread re-raises in the awaiting coroutine, so this one
-        # try covers construction, make_id and submit alike.
-        try:
-            esc_id = await asyncio.to_thread(_file)
         except Exception as e:
             logger.warning(
                 'verification_contradicted_escalate_failed task=%s project_root=%s: %s',
                 task_id, project_root, e,
             )
+            await self._journal_l1_failed(run_id, filing, e)
             return None
-        return {
-            'type': 'verification_contradicted_escalated',
-            'task_id': task_id,
-            'escalation_id': esc_id,
-        }
+        return await self._journal_l1_filed(run_id, filing, esc_id)
+
+    async def _journal_l1_filed(
+        self, run_id: str, filing: dict, esc_id: str,
+    ) -> dict:
+        """Journal a filed reconciler L1 as an ``escalation``/``submit`` write row.
+
+        Returns the row detail, which is also the action for ``result['actions']``.
+        """
+        action = {**filing, 'escalation_id': esc_id}
+        await self.journal.add_run_action(
+            run_id, 'write', 'escalation', 'submit', action, causation_id=run_id,
+        )
+        return action
+
+    async def _journal_l1_failed(
+        self, run_id: str, filing: dict, error: Exception,
+    ) -> None:
+        """Journal a failed reconciler-L1 filing as an ``escalation``/``submit`` skip row."""
+        await self.journal.add_run_action(
+            run_id, 'skip', 'escalation', 'submit',
+            {**filing, 'error': str(error)[:200]},
+            causation_id=run_id,
+        )
 
     async def _sweep_unblock_dependents(
         self,
@@ -2101,14 +2063,13 @@ class TargetedReconciler:
         dependent: both read the same ``queue_dir/esc-*.json`` glob and apply
         the same ``status == 'pending'`` filter, so one scan plus a dict
         lookup is equivalent to D scans while turning a D x E parse into
-        1 x E. The scan runs in ``asyncio.to_thread`` because
-        ``EscalationQueue`` is synchronous blocking filesystem I/O and this
-        coroutine runs on the shared fused-memory event loop.
+        1 x E. Construction and scan run in one ``asyncio.to_thread`` hop
+        because ``EscalationQueue`` is synchronous blocking filesystem I/O and
+        this coroutine runs on the shared fused-memory event loop.
 
-        Returns the index, or ``None`` when the store is unavailable -- the
-        ``escalation`` package isn't importable in this env (mirrors the
-        module's defensive import at the top of this file), construction
-        raised, or the scan itself raised (all logged at warning with
+        Returns the index, or ``None`` when the store is unavailable -- there
+        is no escalation-queue factory, construction raised, or the scan
+        itself raised (the latter two logged at warning with
         ``exc_info=True``). Every such arm vetoes rather than flips: a store
         you cannot read cannot prove "no open escalation", and a false
         negative would unblock a task the orchestrator (or a human)
@@ -2125,14 +2086,14 @@ class TargetedReconciler:
         """
         if queue_memo:
             return queue_memo[0]
-        if not _HAS_ESCALATION or EscalationQueue is None:
+        factory = self._escalation_queue_factory
+        if factory is None:
             queue_memo.append(None)
             return None
         index: dict[str, list[str]] | None
         try:
-            queue = EscalationQueue(escalation_queue_dir(project_root))
             index = {}
-            for esc in await asyncio.to_thread(queue.get_pending):
+            for esc in await asyncio.to_thread(pending_escalations, factory, project_root):
                 # str() both sides of what get_by_task compared with ==, so an
                 # int-typed task_id still pins its dependent rather than
                 # silently missing the lookup.
@@ -2618,18 +2579,12 @@ def _unblock_veto_reason(dependent: dict) -> str | None:
     BEFORE the escalation-store I/O, exactly as that sibling sweep orders
     them: a park that can be recognized for free must never cost a scan.
 
-    Reads metadata defensively: a JSON-string metadata value (as stored by
-    some callers) is tolerated the same way the rest of this module treats
-    task metadata, and anything else unparseable is treated as empty.
+    Reads metadata through
+    :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`: a
+    JSON-string value (as stored by some callers) is read like a dict, and
+    unreadable metadata is logged and read as empty, so it raises no veto.
     """
-    metadata = dependent.get('metadata')
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (TypeError, ValueError):
-            metadata = {}
-    if not isinstance(metadata, dict):
-        metadata = {}
+    metadata = raw_metadata_dict(dependent.get('metadata'), source='targeted._unblock_veto_reason')
 
     if metadata.get('parent_cancelled') or metadata.get('needs_recheck_against_main'):
         return 'parent_cancelled'

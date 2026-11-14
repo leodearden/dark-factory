@@ -86,10 +86,7 @@ from fused_memory.maintenance.rehome_scope_tag import (
     scope_tag_for,
 )
 from fused_memory.models.scope import Scope
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('tag_cgl_eta_rehome_scope')
 
@@ -406,22 +403,16 @@ async def run(
     # probe inside it would be downgraded into N warnings while the updates
     # proceeded.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(operation='tag_cgl_eta_rehome_scope --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'tag_cgl_eta_rehome_scope: --apply NOT started (fail-closed) '
-                "-- this process cannot write mem0's history directory, so "
+        assert_store_mutation_allowed(
+            operation='tag_cgl_eta_rehome_scope --apply',
+            logger=logger,
+            extra_detail=(
                 'each tag would rewrite a record and then fail to record the '
-                'change, leaving the rehome pool half-tagged and its '
-                'provenance metadata unreconstructable. No record was tagged '
-                'and nothing was mutated. Route the tagging through the '
-                'fused-memory MCP server (the unsandboxed owner of the '
-                'store), or re-run from an unsandboxed operator shell. To '
-                'obtain the tag report safely from anywhere, re-run without '
-                '--apply.'
-            )
-            raise
+                'change, leaving the rehome pool half-tagged and its provenance '
+                'metadata unreconstructable. No record was tagged and nothing was '
+                'mutated.'
+            ),
+        )
 
     # Scan + classify every selected project.
     decisions_by_project: dict[str, list[dict[str, Any]]] = {}

@@ -3,14 +3,13 @@ from a freshly built one, to porcelain AND plumbing, and costs one git spawn.
 """
 from __future__ import annotations
 
-import asyncio
 import os
+import re
 import shlex
 import shutil
 import subprocess
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import pytest
 from _git_fixtures import README_SEED, RepoSeed, RepoTemplates, build_repo, seed_repo
@@ -33,7 +32,7 @@ def _out(repo: Path, *args: str) -> str:
 
 def _worktree_files(repo: Path) -> dict[str, str]:
     return {
-        path.relative_to(repo).as_posix(): path.read_text()
+        path.relative_to(repo).as_posix(): path.read_bytes().decode('utf-8')
         for path in repo.rglob('*')
         if path.is_file() and '.git' not in path.relative_to(repo).parts
     }
@@ -158,6 +157,107 @@ def test_distinct_seeds_get_distinct_contents(
     assert _out(readme, 'log', '-1', '--format=%s') == 'Initial commit'
 
 
+def _write_workspace_tree(src: Path) -> dict[str, str]:
+    contents = {
+        'Cargo.toml': '[workspace]\nmembers = ["crate_a", "crate_b"]\n',
+        'crate_a/src/lib.rs': '// crate a — the first member\npub fn a() {}\n',
+        'crate_b/Cargo.toml': '[package]\nname = "crate_b"\n',
+    }
+    for relpath, text in contents.items():
+        target = src / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding='utf-8')
+    return contents
+
+
+def test_a_tree_seed_commits_every_file_under_the_directory(
+    templates: RepoTemplates, tmp_path: Path,
+) -> None:
+    src = tmp_path / 'src'
+    contents = {**_write_workspace_tree(src), 'dos.txt': 'one\r\ntwo\r\n'}
+    (src / 'dos.txt').write_bytes(b'one\r\ntwo\r\n')
+    seed = RepoSeed.from_tree(src, 'initial workspace')
+
+    repo = templates.seed(tmp_path / 'repo', seed)
+
+    assert _worktree_files(repo) == contents
+    assert _tracked_paths(repo) == set(contents)
+    assert _out(repo, 'log', '-1', '--format=%s') == 'initial workspace'
+
+
+def test_tree_seeds_of_one_directory_are_equal(tmp_path: Path) -> None:
+    src = tmp_path / 'src'
+    _write_workspace_tree(src)
+
+    first = RepoSeed.from_tree(src, 'initial workspace')
+    second = RepoSeed.from_tree(src, 'initial workspace')
+
+    assert first == second
+    assert hash(first) == hash(second)
+
+
+def test_a_tree_seed_keeps_line_endings(tmp_path: Path) -> None:
+    src = tmp_path / 'src'
+    _write_workspace_tree(src)
+    (src / 'dos.txt').write_bytes(b'one\r\ntwo\r\n')
+
+    assert dict(RepoSeed.from_tree(src, 'm').files)['dos.txt'] == 'one\r\ntwo\r\n'
+
+
+def test_an_empty_tree_is_rejected(tmp_path: Path) -> None:
+    src = tmp_path / 'empty'
+    src.mkdir()
+
+    with pytest.raises(ValueError, match='at least one file'):
+        RepoSeed.from_tree(src, 'm')
+
+
+@pytest.mark.parametrize('make_root', [
+    pytest.param(lambda root: None, id='missing'),
+    pytest.param(lambda root: root.write_text('not a tree\n', encoding='utf-8'), id='a-file'),
+])
+def test_a_missing_tree_is_rejected_by_path(
+    make_root: Callable[[Path], object], tmp_path: Path,
+) -> None:
+    root = tmp_path / 'atomic_train'
+    make_root(root)
+
+    with pytest.raises(ValueError, match=re.escape(str(root))):
+        RepoSeed.from_tree(root, 'm')
+
+
+def test_a_tree_symlink_is_rejected_by_path(tmp_path: Path) -> None:
+    src = tmp_path / 'src'
+    _write_workspace_tree(src)
+    link = src / 'link.toml'
+    link.symlink_to(src / 'Cargo.toml')
+
+    with pytest.raises(ValueError, match=re.escape(str(link))):
+        RepoSeed.from_tree(src, 'm')
+
+
+def test_a_tree_executable_is_rejected_by_path(tmp_path: Path) -> None:
+    src = tmp_path / 'src'
+    _write_workspace_tree(src)
+    script = src / 'bin' / 'run.sh'
+    script.parent.mkdir()
+    script.write_text('#!/bin/sh\n', encoding='utf-8')
+    script.chmod(0o755)
+
+    with pytest.raises(ValueError, match=re.escape(str(script))):
+        RepoSeed.from_tree(src, 'm')
+
+
+def test_a_tree_binary_file_is_rejected_by_path(tmp_path: Path) -> None:
+    src = tmp_path / 'src'
+    _write_workspace_tree(src)
+    blob = src / 'blob.bin'
+    blob.write_bytes(b'\xff\xfe\x00')
+
+    with pytest.raises(ValueError, match=re.escape(str(blob))):
+        RepoSeed.from_tree(src, 'm')
+
+
 def test_a_non_empty_destination_commits_its_existing_files(
     templates: RepoTemplates, tmp_path: Path,
 ) -> None:
@@ -217,7 +317,7 @@ def test_session_templates_live_under_this_runs_basetemp(
     assert pristine_repo_templates.root.resolve().is_relative_to(basetemp)
 
 
-Seeder = Callable[[Path], Coroutine[Any, Any, None]]
+Seeder = Callable[[Path], None]
 
 
 @pytest.mark.parametrize(('seeder', 'files', 'subject'), [
@@ -248,7 +348,7 @@ class TestSharedWorkflowSeeders:
         repo = tmp_path / 'repo'
         repo.mkdir()
 
-        asyncio.run(seeder(repo))
+        seeder(repo)
 
         assert _tracked_paths(repo) == set(files)
         assert _worktree_files(repo) == files
@@ -264,10 +364,10 @@ class TestSharedWorkflowSeeders:
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         (tmp_path / 'warm').mkdir()
-        asyncio.run(seeder(tmp_path / 'warm'))
+        seeder(tmp_path / 'warm')
         log = _install_git_spawn_counter(monkeypatch, tmp_path / 'shim')
         (tmp_path / 'measured').mkdir()
 
-        asyncio.run(seeder(tmp_path / 'measured'))
+        seeder(tmp_path / 'measured')
 
         assert _spawns(log) == 1

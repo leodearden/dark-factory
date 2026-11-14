@@ -18,6 +18,7 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_missing_arguments import MISSING_ARGUMENT_CODE, MissingArgumentMiddleware
+from shared.task_read import TaskFound
 from shared.toolcall_markup import INVOKE_CLOSER, closer_for
 
 from escalation.queue import EscalationQueue
@@ -25,7 +26,7 @@ from escalation.server import create_server
 
 try:
     from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (
         InFlightMergeRegistry,
     )
     _ORCHESTRATOR_AVAILABLE = True
@@ -62,7 +63,9 @@ class Wired:
                 is_ancestor=AsyncMock(return_value=False),
                 find_inflight_merge_worktree=AsyncMock(return_value=None),
             ),
-            scheduler=types.SimpleNamespace(get_task=AsyncMock(return_value={'metadata': {}})),
+            scheduler=types.SimpleNamespace(
+                read_task=AsyncMock(return_value=TaskFound({'metadata': {}})),
+            ),
         )
         self.server = create_server(
             self.queue,
@@ -109,7 +112,7 @@ async def test_refusal_happens_before_any_slow_path(wired):
     await wired.refusal('merge_request', SIGHTING_CALL)
 
     wired.harness.git_ops.resolve_branch_sha.assert_not_awaited()
-    wired.harness.scheduler.get_task.assert_not_awaited()
+    wired.harness.scheduler.read_task.assert_not_awaited()
     assert wired.mq.empty()
 
 

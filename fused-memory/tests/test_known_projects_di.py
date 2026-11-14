@@ -9,31 +9,27 @@ from __future__ import annotations
 
 import pytest
 import pytest_asyncio
+from reconciliation.harness_fixtures import (
+    make_harness,
+    make_memory_service,
+    open_event_buffer,
+    open_journal,
+)
 
 from fused_memory.middleware.ticket_janitor import TicketJanitor
 from fused_memory.middleware.ticket_store import TicketStore
-from fused_memory.reconciliation.event_buffer import EventBuffer
-from fused_memory.reconciliation.journal import ReconciliationJournal
 
 
 @pytest_asyncio.fixture
 async def journal(tmp_path):
-    j = ReconciliationJournal(tmp_path / 'di_test_journal')
-    await j.initialize()
-    yield j
-    await j.close()
+    async with open_journal(tmp_path / 'di_test_journal') as j:
+        yield j
 
 
 @pytest_asyncio.fixture
 async def event_buffer(tmp_path):
-    buf = EventBuffer(
-        db_path=tmp_path / 'di_test_eb.db',
-        buffer_size_threshold=2,
-        max_staleness_seconds=3600,
-    )
-    await buf.initialize()
-    yield buf
-    await buf.close()
+    async with open_event_buffer(tmp_path / 'di_test_eb.db') as b:
+        yield b
 
 
 @pytest_asyncio.fixture
@@ -46,17 +42,7 @@ async def store(tmp_path):
 
 @pytest.fixture
 def mock_memory_service():
-    from unittest.mock import AsyncMock
-    svc = AsyncMock()
-    svc.search = AsyncMock(return_value=[])
-    svc.get_episodes = AsyncMock(return_value=[])
-    svc.get_status = AsyncMock(
-        return_value={'graphiti': {'connected': True}, 'mem0': {'connected': True}, 'projects': {}}
-    )
-    svc.get_entity = AsyncMock(return_value={'nodes': [], 'edges': []})
-    svc.mem0 = AsyncMock()
-    svc.mem0.get_all = AsyncMock(return_value={'results': []})
-    return svc
+    return make_memory_service()
 
 
 @pytest.mark.asyncio
@@ -73,26 +59,13 @@ async def test_single_registry_propagates_to_harness_and_janitor(
     (e) Defensive-copy contract: mutating registry after construction does NOT
         affect either harness or janitor.
     """
-    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
-    from fused_memory.reconciliation.harness import ReconciliationHarness
-
     registry = {'pid_a': '/path/a', 'pid_b': '/path/b'}
 
-    config = FusedMemoryConfig(
-        reconciliation=ReconciliationConfig(
-            enabled=True,
-            explore_codebase_root='/tmp/test',
-            agent_llm_provider='anthropic',
-            agent_llm_model='claude-sonnet-4-20250514',
-        )
-    )
-
-    harness = ReconciliationHarness(
-        memory_service=mock_memory_service,
-        taskmaster=None,
+    harness = make_harness(
         journal=journal,
         event_buffer=event_buffer,
-        config=config,
+        memory_service=mock_memory_service,
+        taskmaster=None,
         known_projects=registry,
     )
 

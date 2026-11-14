@@ -7,7 +7,7 @@ no defensive ``.get('data')`` unwrapping. Id-bearing fields surface as
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Any, NotRequired, TypedDict
 
 
 class AddTaskResult(TypedDict):
@@ -15,11 +15,32 @@ class AddTaskResult(TypedDict):
     message: str
 
 
+class DefectWriteResult(TypedDict):
+    """``apply_defect_events``' reply: both defect keys as stored after the write."""
+
+    id: str
+    message: str
+    defects: list[dict[str, Any]]
+    defect_test_retirements: list[dict[str, Any]]
+
+
+class AmendmentAdvisory(TypedDict):
+    """A write changed a planned task's text; plans/task-amendment-delivery-prd.md §9 C7."""
+
+    task_id: str
+    plan_authored_at: str | None
+    fields_changed: list[str]
+    will_replan: bool
+    plan_text_fp_before: str
+    task_text_fp_after: str
+
+
 class UpdateTaskResult(TypedDict):
     id: str
     message: str
     updated: bool
     updated_task: dict | None
+    amendment_advisory: NotRequired[AmendmentAdvisory]
 
 
 class SetTaskStatusResult(TypedDict):
@@ -74,16 +95,46 @@ class GetTasksResult(TypedDict):
     """DTO for ``get_tasks`` — the task-tree snapshot.
 
     Task objects in ``tasks`` have their top-level ``id``, ``title``,
-    ``status``, etc. already flattened — no further unwrapping needed.
+    ``status``, etc. already flattened — no further unwrapping needed. They
+    are full ``_row_to_task`` rows unless ``fields`` projected them
+    (``fused_memory/backends/task_projection.py``).
     """
 
     tasks: list[dict]
 
 
+class MetadataLookupRow(TypedDict):
+    """One task carrying the looked-up metadata key; ``task_id`` is an int."""
+
+    task_id: int
+    title: str
+    status: str
+    priority: str
+    updated_at: str
+    matched_value: NotRequired[Any]
+
+
+class MetadataLookupResult(TypedDict):
+    """DTO for ``find_tasks_by_metadata`` — one page plus whole-corpus counts.
+
+    ``total`` counts every match and ``tasks_with_key`` every task carrying
+    the key, both over the status-filtered corpus, not just this page.
+    """
+
+    results: list[MetadataLookupRow]
+    total: int
+    tasks_with_key: int
+    malformed_metadata_ids: list[int]
+
+
 __all__ = [
     'AddTaskResult',
+    'AmendmentAdvisory',
+    'DefectWriteResult',
     'DependencyResult',
     'GetTasksResult',
+    'MetadataLookupResult',
+    'MetadataLookupRow',
     'RemoveTaskResult',
     'SetTaskStatusResult',
     'StatusWriteNotPersistedResult',

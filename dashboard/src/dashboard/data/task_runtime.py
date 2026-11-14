@@ -19,7 +19,9 @@ fast-polling dashboard):
 2. **Per whole operation** — the enclosing ``asyncio.wait_for`` stays,
    because layer 1 alone cannot cap the call: a *cold* session performs
    three posts (initialize, notifications/initialized, tools/call), so a
-   per-request bound of T permits roughly 3T overall.
+   per-request bound of T permits roughly 3T overall. It sits at
+   ``memory.py::enclosing_deadline(per_call_timeout)``, strictly above the
+   per-request budget, so the transport's own exception is not pre-empted.
 
 The wire payload is decoded through ``TaskRuntimeSnapshot.model_validate`` —
 the SAME shared model the server projects into (INV-1 contracts-machine-
@@ -28,9 +30,12 @@ that ONE project to ``TaskRuntimeSnapshot(offline=True, offline_reason=...)``
 — the model's own fields, synthesized client-side exactly as its docstring
 prescribes — and names the FAULT DOMAIN of the failure (task 3517):
 
-- ``'deadline_exceeded'`` — our OWN ``per_call_timeout`` fired. This says
-  nothing about the orchestrator's health: under a starved dashboard event
-  loop the probe never got enough CPU to complete, so the fault is the
+- ``'deadline_exceeded'`` — a client-side budget expired: either the
+  whole-operation deadline (``memory.py::enclosing_deadline`` of
+  ``per_call_timeout``) or an httpx per-request timeout, ``httpx.PoolTimeout``
+  included (the dashboard's own connection pool is saturated). None of them
+  says anything about the orchestrator's health: under a starved dashboard
+  event loop the probe never got enough CPU to complete, so the fault is the
   DASHBOARD's. See the aggregate warning in ``fetch_task_runtime``.
 - ``'unreachable'`` — ANY ``httpx.TransportError`` (connect refused, a
   connection reset or protocol error mid-response, a proxy failure), an HTTP
@@ -69,7 +74,8 @@ import logging
 import httpx
 from shared.task_runtime_state import TaskRuntimeSnapshot
 
-from dashboard.data.memory import mcp_tool_call
+from dashboard.data.mcp_fanout import describe_exc
+from dashboard.data.memory import enclosing_deadline, mcp_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -158,28 +164,29 @@ async def _probe_one(
     base_url: str,
     timeout: float,
 ) -> TaskRuntimeSnapshot:
+    operation_bound = enclosing_deadline(timeout)
     try:
         result = await asyncio.wait_for(
             mcp_tool_call(
                 client, base_url, 'get_task_runtime_state', {}, timeout=timeout,
             ),
-            timeout=timeout,
+            timeout=operation_bound,
         )
     except _DEADLINE_EXC as exc:
         # OUR budget expired, not necessarily their outage — see module docstring.
         _log_probe_failure(
             base_url, 'deadline_exceeded',
-            'get_task_runtime_state: deadline_exceeded for %s after %.2fs budget '
-            '(the orchestrator may be healthy; a starved dashboard event loop '
-            'produces this too): %s',
-            base_url, timeout, exc,
+            'get_task_runtime_state: deadline_exceeded for %s (per-request budget '
+            '%.2fs, operation bound %.2fs; the orchestrator may be healthy; a '
+            'starved dashboard event loop produces this too): %s',
+            base_url, timeout, operation_bound, describe_exc(exc),
         )
         return TaskRuntimeSnapshot(offline=True, offline_reason='deadline_exceeded')
     except _UNREACHABLE_EXC as exc:
         _log_probe_failure(
             base_url, 'unreachable',
             'get_task_runtime_state: unreachable for %s (transport/HTTP failure): %s',
-            base_url, exc,
+            base_url, describe_exc(exc),
         )
         return TaskRuntimeSnapshot(offline=True, offline_reason='unreachable')
     try:
@@ -208,7 +215,7 @@ async def fetch_task_runtime(
     """Probe every escalation URL concurrently; return ``{label: TaskRuntimeSnapshot}``.
 
     Per-project labels match the keys used elsewhere in the dashboard
-    (project basename — see ``mcp_fanout.project_label``). A failure
+    (project label — ``dashboard/project_labels.py::ProjectLabels``). A failure
     degrades that project's entry to ``TaskRuntimeSnapshot(offline=True,
     offline_reason=...)`` so the caller can render an honest ``—`` rather
     than a fabricated zero, AND say which fault domain produced it —
@@ -250,12 +257,13 @@ async def fetch_task_runtime(
     # is at fault would be the same unfounded diagnosis in the other direction.
     # dashboard.static.redux.runtime_format.rtProbeSummary applies the same
     # threshold and the same all-probed-must-be-deadline_exceeded rule, but the
-    # two are NOT guaranteed to agree: its denominator is derived from
-    # ACTIVE_TASKS rows, so a probed project with zero task rows is invisible
-    # to it while it is counted in `labels` here. Row-less projects are the one
-    # remaining source of divergence. (This comment previously claimed the two
-    # "can never disagree"; that was false for a second reason as well — the JS
-    # denominator omitted healthy projects entirely — and is not restored.)
+    # two are NOT guaranteed to agree: its denominator is derived from the
+    # snapshot rows (``TASKS_SNAPSHOT[p].rows``), so a probed project with zero
+    # task rows is invisible to it while it is counted in `labels` here.
+    # Row-less projects are the one remaining source of divergence. (This
+    # comment previously claimed the two "can never disagree"; that was false
+    # for a second reason as well — the JS denominator omitted healthy projects
+    # entirely — and is not restored.)
     deadline = [
         lbl for lbl, snap in zip(labels, results, strict=True)
         if snap.offline_reason == 'deadline_exceeded'

@@ -104,6 +104,13 @@ caller string. The annotations `GraphitiBackend.add_episode` prepends,
 classification, so a tagged write stays in its category's stratum; any other
 leading text is a caller string and buckets as `add_episode`.
 
+**The axis is closed.** `build_corpus.KNOWN_PAYLOAD_KINDS` declares the four
+measured kinds, and `add_episode` is deliberately not among them. A build (or
+`--dry-run`) over a population carrying any other kind exits 1, naming the
+kinds and the `source_description` values that produced them. The remedy is to
+re-measure the census before building the next corpus, or, when the cause is a
+new writer annotation, to extend the annotation regex.
+
 Allocation is **min-1 floor + largest-remainder proportional, capped at cell
 size**. The floor is load-bearing, not tidiness: the
 `('2026-04', 'procedural_knowledge')` cell holds exactly **one** episode of
@@ -148,11 +155,20 @@ record of what that pipeline produced, so it is the exact outcome proxy that
 must stay untouched. The guarantee is mechanized three ways, each tested in
 `fused-memory/tests/test_local_memory_models_eval_corpus.py`:
 
-1. **The projection cannot see it.** The single query is
-   `MATCH (e:Episodic) RETURN e.uuid, e.name, e.group_id, e.source_description,
-   e.created_at, e.content` — built from the `PROJECTED_FIELDS` constant, with
-   no `WHERE`, no `LIMIT`, and no `entity_edges`. Tests assert the RETURN list
-   by equality and assert the absence of a filter clause directly.
+1. **The projection cannot see it.** The builder reads the population through
+   `build_corpus.py::POPULATION_READ`, built from the `PROJECTED_FIELDS`
+   constant, with no `WHERE` and no `entity_edges`. The population is read
+   whole: FalkorDB truncates every answer silently at its result-set cap
+   (`fused_memory/backends/paged_read.py::RESULTSET_SIZE`), so the read is
+   paged in `e.uuid` order and checked against a `count(e)` census. The
+   `LIMIT` each page carries is the page size, not a filter. The build exits
+   1 on a short read, a missing census or the page cap, and on any row count
+   that differs from the census, which catches any single write during the
+   read. The check is on the count, not on which rows came back: two writes
+   that offset each other mid-read leave the count equal and are not
+   caught. Tests assert the
+   projected field set by equality and assert the absence of a filter clause
+   directly.
 2. **The record cannot hold it.** `EpisodeRecord` has no outcome field, so no
    sampling rule *can* condition on one. A test pins the field set exactly.
 3. **The sampler has nowhere to hide it.** Every input episode leaves
@@ -172,12 +188,17 @@ guarantee.
 
 ## Read-only, and no graphiti driver
 
-The builder issues exactly one `GRAPH.RO_QUERY`. Read-only here is
+The builder issues only `GRAPH.RO_QUERY` reads: a `count(e)` census plus
+uuid-ordered pages. Read-only here is
 **server-enforced**, not a client-side promise: a `CREATE` issued through that
 command path is refused by FalkorDB and materializes nothing. A client-side
-guard sits on top of it so a violation surfaces as a typed `CorpusBuildError`
-at the seam that owns the guarantee, rather than as a redis error three layers
-down.
+guard sits on top of it: the graph handle the builder reads through forwards
+only the read primitive, so no write primitive can even be resolved on it.
+Should that guard ever fire on the builder's read, the refusal surfaces as a
+typed `CorpusBuildError` rather than as a redis error three layers down. Both
+the guard and the client opener live in
+`fused-memory/src/fused_memory/backends/falkor_read_only.py`, the read-only
+seam every audit and corpus script shares.
 
 It connects with `falkordb.asyncio.FalkorDB(...).select_graph(...)` and
 **never** constructs `graphiti_core.driver.falkordb_driver.FalkorDriver`, whose
@@ -191,11 +212,14 @@ handle so only `ro_query` can be reached.
 
 Test lane: the offline suite runs by default; the single live test is
 `@pytest.mark.integration` (per-test, never module-level — `addopts` is
-`-m 'not integration'`) and skips cleanly with no FalkorDB.
+`-m 'not integration'`) and skips cleanly with no FalkorDB. It seeds and
+deletes a throwaway graph on the scratch FalkorDB and reads it read-only. No
+automated check asserts the real population's size, month span or window
+start; the build report prints them for the operator.
 
 ```bash
 uv run pytest fused-memory/tests/test_local_memory_models_eval_corpus.py            # offline
-uv run pytest fused-memory/tests/test_local_memory_models_eval_corpus.py -m integration  # live, read-only
+uv run pytest fused-memory/tests/test_local_memory_models_eval_corpus.py -m integration  # live, scratch FalkorDB
 ```
 
 ## Self-check
@@ -230,7 +254,14 @@ commit, or this self-check quietly stops meaning anything.
 `harness.py` is thin CLI wiring over `fused_memory.arm_harness`; read the
 module named in each row for behaviour. Run it from `fused-memory/` with
 `uv run python scripts/local_memory_models_eval/harness.py <subcommand> …`.
-Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
+Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`), with
+one split. The corpus read follows the config (`FALKORDB_URI`), because the
+corpus graph lives only on production; it is `GRAPH.RO_QUERY`, read-only.
+Every write, copy, index build and teardown goes to the scratch FalkorDB
+(`FALKOR_HOST`/`FALKOR_PORT`, default `localhost:6380`), which must hold
+`evalmem_lme_ref_incumbent_a`, seeded by
+`scripts/seed_scratch_reference_graph.py` (OPERATIONS.md "The scratch
+FalkorDB").
 
 | Subcommand | Invoked by | What it does |
 |---|---|---|
@@ -255,8 +286,13 @@ Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
 `screen_slate.py`, beside `harness.py`, is η's sweep driver. It runs every LLM
 arm in turn: start, smoke, run, α's healthcheck, stop and teardown, all through
 the pinned harness. Each arm's traffic passes through the in-process usage tap
-(`usage_tap.py`), which records the server's own per-call `usage`. Its
-provenance and run record:
+(`usage_tap.py`), which records the server's own per-call `usage`. Leaving a
+tap session waits, up to the tap's upstream timeout, for calls the harness
+abandoned but the arm is still serving, so the arm is healthchecked and stopped
+only after they land; a call outlasting that bound is marked
+`outlived_session`. The tap prints a `usage tap:` line to stdout when it starts
+waiting, and another if the bound expires, so a pause before the healthcheck is
+explained in the journal. The sweep's provenance and run record:
 `plans/local-memory-models-eval-screening/README.md`.
 
 `run` refuses before touching any store unless the spec's `code_sha` is the
@@ -320,15 +356,17 @@ the rule's one home. Protected graphs are unreachable by construction.
 uv run pytest -m integration tests/arm_harness
 ```
 
-It replays two episodes onto `evalmem_test_` graphs on the FalkorDB at
-`FALKOR_HOST`/`FALKOR_PORT` against a local mock endpoint, and asserts that no
-protected graph or index changed. `test_live_embedding_integration.py` does
+It replays two episodes onto `evalmem_test_` graphs on the scratch FalkorDB
+at `FALKOR_HOST`/`FALKOR_PORT` (default `localhost:6380`; a test session aimed
+at production `:6379` exits 4) against a local mock endpoint, and asserts that
+no protected graph or index changed. `test_live_embedding_integration.py` does
 the same for an embedding arm's copy, re-embed and index transitions.
 
 ## Known limitations
 
-- `GraphitiBackend.search` returns `[]` on timeout, so a timed-out retrieval
-  probe reads as a miss. That is the production behaviour being measured.
+- `GraphitiBackend.search` raises a `TimeoutError` naming its read budget when
+  it times out. A timed-out retrieval probe therefore stops the run; it is not
+  recorded as a miss.
 - The harness never sets graphiti's `SEMAPHORE_LIMIT`, whose env name collides
   with the queue knob. `run.json` records the effective value, and the
   symmetry check requires it to be equal across arms.

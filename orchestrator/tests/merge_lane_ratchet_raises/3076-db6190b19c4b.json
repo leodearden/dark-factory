@@ -1,0 +1,42 @@
+{
+  "task_id": "3076",
+  "reason": "net-additive \u03b4 work \u2014 reset_stale_in_use startup sweep so a crash mid-span cannot leave a lane IN_USE (unreclaimable) forever",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 46,
+      "current": 53
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 725,
+      "current": 757
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 319,
+      "current": 327
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4834,
+      "current": 4841
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57401,
+      "current": 57433
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31966,
+      "current": 31974
+    }
+  ]
+}

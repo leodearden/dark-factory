@@ -2,21 +2,22 @@
 assembly (PRD task epsilon: plans/confusion-reduction-prd.md §5.5, decisions
 7/8, boundary test §8.8).
 
-Every stage is exercised behind a dependency-injection seam (invoke for the
-LLM, status_fetcher for the census, poster for escalation, committer for
-git) plus pytest-monkeypatched module functions — no test here ever touches
-a real LLM, the machine-operated main git checkout, a live escalation
-server, or real systemd. The one true end-to-end test
-(test_run_nightly_happy_path_end_to_end) uses a real temp `git init` repo so
-the commit path is genuinely exercised without risking main.
+Every stage is exercised through run_nightly's injected seams (selector,
+digest_builder, invoke, committer, census_launcher, completion_runner, poster,
+recorder) — no test here ever touches a real LLM, the machine-operated main
+git checkout, a live escalation server, a real census, or real systemd. The
+main()-entry tests, which can inject nothing, spy the census.py subprocess.
+The one true end-to-end test (test_run_nightly_happy_path_end_to_end) uses a
+real temp `git init` repo so the commit path is genuinely exercised without
+risking main.
 """
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -29,12 +30,15 @@ import yaml
 from legibility import (
     account_pool,
     census_trigger,
+    check_trickle_health,
     codebook,
     digest,
     invariants,
     nightly,
+    plan_deviation_census,
     session_ledger,
     session_runner,
+    state_docs,
     trickle_state,
     unlanded,
 )
@@ -45,6 +49,11 @@ from legibility.config import TrickleCensusCaps, load_config
 from pydantic import ValidationError
 from quality_doc_texts import definition_body, heuristic_headlines
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
+from shared.cli_invoke import resolve_claude_binary
+from shared.testing_mcp_stub import StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
@@ -54,7 +63,7 @@ from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 def _isolate_trickle_state(tmp_path, monkeypatch):
     """Point the legibility state root at tmp_path for EVERY test here.
 
-    ``run_nightly`` records run state through ``trickle_state.record_run``
+    ``run_nightly`` records run state through ``trickle_state.write_night``
     on every exit path (task 3340), so without this an ordinary test run
     would write real state files for the fixture's synthetic
     ``project_id=testproj`` into the operator's real
@@ -267,6 +276,89 @@ def test_select_scored_records_includes_matching_session(tmp_path):
     assert record.stratum
 
 
+def _two_session_night(tmp_path) -> tuple[config_mod.LegibilityConfig, Path]:
+    """One date carrying two signal-bearing sessions, 'session-a' and
+    'session-b', whose first turns differ so the sampler's dedupe keeps both."""
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    for session_id, user_text in (
+        ('session-a', 'please fix this confusing bug'),
+        ('session-b', 'why does the merge lane keep parking my task'),
+    ):
+        _write_transcript(
+            projects_root / _encode_cwd(work_cwd) / f'{session_id}.jsonl',
+            cwd=work_cwd, timestamp='2026-07-13T10:00:00Z',
+            session_id=session_id, user_text=user_text,
+        )
+    return cfg, projects_root
+
+
+def _scored_session_names(scored: list) -> list[str]:
+    return sorted(record.session.path.stem for record in scored)
+
+
+class TestSamplingSkipsAlreadyCodedSessions:
+    """A retry pass must not re-code a session the ledger already holds; the
+    identity is the transcript's sessionId, the key the census skips on."""
+
+    def test_skipped_session_is_not_scored(self, tmp_path):
+        cfg, projects_root = _two_session_night(tmp_path)
+
+        scored = nightly.select_scored_records(
+            cfg, projects_root, date(2026, 7, 13), skip_sessions=frozenset({'session-a'}),
+        )
+
+        assert _scored_session_names(scored) == ['session-b']
+
+    def test_the_default_skips_nothing(self, tmp_path):
+        cfg, projects_root = _two_session_night(tmp_path)
+
+        scored = nightly.select_scored_records(cfg, projects_root, date(2026, 7, 13))
+
+        assert _scored_session_names(scored) == ['session-a', 'session-b']
+
+    def test_a_skipped_session_never_enters_the_sample_accounting(self, tmp_path):
+        cfg, projects_root = _two_session_night(tmp_path)
+
+        sample = nightly.select_digest_sessions(
+            cfg, projects_root, date(2026, 7, 13), skip_sessions=frozenset({'session-a'}),
+        )
+
+        assert sample.total_records == 1
+        assert [record.path.stem for record in sample.selected] == ['session-b']
+
+    def test_a_skip_that_removed_sessions_logs_their_count_once(self, tmp_path, caplog):
+        cfg, projects_root = _two_session_night(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            nightly.select_scored_records(
+                cfg, projects_root, date(2026, 7, 13),
+                skip_sessions=frozenset({'session-a'}),
+            )
+
+        skipped_lines = [
+            record.getMessage() for record in caplog.records
+            if record.levelno == logging.INFO and 'already-coded' in record.getMessage()
+        ]
+        assert len(skipped_lines) == 1
+        assert 'skipped 1 ' in skipped_lines[0]
+
+    def test_a_skip_that_matched_nothing_logs_no_skip_line(self, tmp_path, caplog):
+        cfg, projects_root = _two_session_night(tmp_path)
+
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            scored = nightly.select_scored_records(
+                cfg, projects_root, date(2026, 7, 13),
+                skip_sessions=frozenset({'session-elsewhere'}),
+            )
+
+        assert _scored_session_names(scored) == ['session-a', 'session-b']
+        assert not [
+            record for record in caplog.records if 'already-coded' in record.getMessage()
+        ]
+
+
 def test_select_scored_records_reads_archive_root(tmp_path):
     # End-to-end proof that the shipped agent_transcript_roots is LIVE with no
     # operator flip: resolve (cfg.project_root) -> enumerate (walk the archive)
@@ -353,16 +445,7 @@ def _write_multi_mb_transcript(
     path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n', encoding='utf-8')
 
 
-def test_nightly_cap_is_an_alias_of_the_sampler_cap_not_a_second_literal():
-    """``DEFAULT_MAX_DIGEST_BYTES`` and ``sampling.DEFAULT_DIGEST_MAX_BYTES``
-    are a word-order swap apart. If they were independent literals, a drift
-    between the cost basis and the render basis would be invisible to every
-    test — so nightly's name BINDS to the sampler's rather than re-declaring
-    it (reviewer_comprehensive, task 3268 amendment pass)."""
-    assert nightly.DEFAULT_MAX_DIGEST_BYTES is nightly.sampling.DEFAULT_DIGEST_MAX_BYTES
-
-
-def test_select_digest_sessions_charges_real_digest_bytes(tmp_path, monkeypatch):
+def test_select_digest_sessions_charges_real_digest_bytes(tmp_path):
     """The cost basis handed to the sampler must be the REAL rendered digest
     size -- what makes ``max_daily_digest_bytes`` mean what it says.
 
@@ -383,37 +466,22 @@ def test_select_digest_sessions_charges_real_digest_bytes(tmp_path, monkeypatch)
     session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
     _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
 
-    captured = {}
+    sample = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
 
-    def spy_stratified_sample(records, config, *, cost_fn=None):
-        captured['cost_fn'] = cost_fn
-        captured['records'] = list(records)
-        return nightly.sampling.SampleResult(
-            selected=list(records), per_stratum_counts={}, zero_signal_dropped=0,
-            bytes_used=0,
-        )
-
-    monkeypatch.setattr(nightly.sampling, 'stratified_sample', spy_stratified_sample)
-
-    nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
-
-    cost_fn = captured['cost_fn']
-    assert cost_fn is not None, 'select_digest_sessions passed no cost_fn'
-
-    record = captured['records'][0]
+    [record] = sample.selected
     expected = len(
         digest.build_digest(
             record.path,
             agent_class_override=record.stratum,
-            max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
+            max_bytes=digest.DEFAULT_MAX_BYTES,
         ).encode('utf-8')
     )
-    assert cost_fn(record) == expected
+    assert sample.bytes_used == expected
     assert expected != record.size_bytes
 
 
 def test_select_digest_sessions_costs_at_the_max_bytes_build_digests_renders_with(
-    tmp_path, monkeypatch,
+    tmp_path,
 ):
     """The cap the sampler CHARGES at and the cap ``build_digests`` RENDERS
     at must be the same number, or ``bytes_used`` describes a digest nobody
@@ -437,19 +505,18 @@ def test_select_digest_sessions_costs_at_the_max_bytes_build_digests_renders_wit
         caps.append(kwargs.get('max_bytes'))
         return 'a digest'
 
-    # COST side: select_digest_sessions -> digest_byte_cost_fn, which
-    # resolves digest.build_digest at call time.
-    monkeypatch.setattr(nightly.sampling.digest, 'build_digest', recording_build)
-    sample = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
-    assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES], (
-        'the sampler must charge at the nightly cap, not at build_digest\'s own default'
+    sample = nightly.select_digest_sessions(
+        cfg, projects_root, date(2026, 7, 13), build=recording_build,
+    )
+    assert caps == [digest.DEFAULT_MAX_BYTES], (
+        'the sampler must charge at the cap build_digests renders with'
     )
 
     # RENDER side: build_digests, called by run_nightly with no max_bytes
     # override, must reach the renderer with that SAME cap.
     caps.clear()
     nightly.build_digests(sample.selected, build=recording_build)
-    assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES]
+    assert caps == [digest.DEFAULT_MAX_BYTES]
 
 
 def test_select_digest_sessions_selects_multi_mb_session_under_stock_budget(tmp_path):
@@ -552,21 +619,15 @@ def test_build_digests_reuses_the_costing_render(tmp_path):
         renders.append(path)
         return real_build(path, **kwargs)
 
-    # select_digest_sessions has no build seam of its own -- the costing
-    # renderer is digest.build_digest, resolved at call time.
-    digest.build_digest = counting_build
-    try:
-        rendered: dict = {}
-        sample = nightly.select_digest_sessions(
-            cfg, projects_root, date(2026, 7, 13), rendered=rendered,
-        )
-        assert renders == [session_path], 'costing must render exactly once'
+    rendered: dict = {}
+    sample = nightly.select_digest_sessions(
+        cfg, projects_root, date(2026, 7, 13), rendered=rendered, build=counting_build,
+    )
+    assert renders == [session_path], 'costing must render exactly once'
 
-        digests, extractor_failures = nightly.build_digests(
-            sample.selected, build=counting_build, rendered=rendered,
-        )
-    finally:
-        digest.build_digest = real_build
+    digests, extractor_failures = nightly.build_digests(
+        sample.selected, build=counting_build, rendered=rendered,
+    )
 
     # Still exactly one render in total: build_digests served the cache.
     assert renders == [session_path]
@@ -574,7 +635,7 @@ def test_build_digests_reuses_the_costing_render(tmp_path):
     assert digests == [
         digest.build_digest(
             session_path, agent_class_override=sample.selected[0].stratum,
-            max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
+            max_bytes=digest.DEFAULT_MAX_BYTES,
         )
     ], 'the cached digest must be byte-identical to a fresh render'
 
@@ -596,7 +657,7 @@ def test_build_digests_re_renders_when_no_cache_is_shared(tmp_path):
     assert digests[0].startswith('---\n')
 
 
-def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkeypatch):
+def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path):
     """``run_nightly`` is the only production wiring of the two stages, so
     the reuse only pays off if IT threads one dict through both."""
     work_cwd = str(tmp_path / 'work')
@@ -611,16 +672,13 @@ def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkey
     real_select = nightly.select_digest_sessions
     real_build = nightly.build_digests
 
-    def spy_select(cfg, roots, target, *, rendered=None):
+    def spy_select(cfg, roots, target, *, rendered=None, **kwargs):
         seen['select'] = rendered
-        return real_select(cfg, roots, target, rendered=rendered)
+        return real_select(cfg, roots, target, rendered=rendered, **kwargs)
 
     def spy_build(selected, **kwargs):
         seen['build'] = kwargs.get('rendered')
         return real_build(selected, **kwargs)
-
-    monkeypatch.setattr(nightly, 'select_digest_sessions', spy_select)
-    monkeypatch.setattr(nightly, 'build_digests', spy_build)
 
     nightly.run_nightly(
         config_path=config_path,
@@ -628,8 +686,10 @@ def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkey
         target_date=date(2026, 7, 13),
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=lambda prompt, model: '{"proposals": []}',
-        status_fetcher=None,
-        poster=lambda url, envelope: None,
+        poster=lambda url, arguments: None,
+        selector=spy_select,
+        digest_builder=spy_build,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert seen['select'] is not None, 'run_nightly passed no render cache to costing'
@@ -693,233 +753,44 @@ def test_git_status_changed_detects_dirty_codebook(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# step-9/10: escalation (_build_escalation_arguments, post_escalation)
-# ---------------------------------------------------------------------------
-
-def test_build_escalation_arguments_shape(tmp_path):
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
-
-    arguments = nightly._build_escalation_arguments(cfg, 'summary text', 'detail text')
-
-    assert arguments == {
-        'task_id': 'legibility-trickle-proj_a',
-        'agent_role': 'legibility-trickle',
-        'category': 'infra_issue',
-        'severity': 'info',
-        'summary': 'summary text',
-        'detail': 'detail text',
-    }
-
-
-def test_post_escalation_calls_poster_with_mcp_envelope(tmp_path):
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a', escalation_port=8199))
-    calls = []
-
-    def fake_poster(url, envelope):
-        calls.append((url, envelope))
-
-    ok = nightly.post_escalation(cfg, 'summary text', 'detail text', poster=fake_poster)
-
-    assert ok is True
-    assert len(calls) == 1
-    url, envelope = calls[0]
-    assert url == 'http://localhost:8199/mcp'
-    assert envelope['method'] == 'tools/call'
-    assert envelope['params']['name'] == 'escalate_info'
-    assert envelope['params']['arguments'] == {
-        'task_id': 'legibility-trickle-proj_a',
-        'agent_role': 'legibility-trickle',
-        'category': 'infra_issue',
-        'severity': 'info',
-        'summary': 'summary text',
-        'detail': 'detail text',
-    }
-
-
-def test_post_escalation_is_best_effort_on_poster_failure(tmp_path):
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
-
-    def raising_poster(url, envelope):
-        raise RuntimeError('escalation server unreachable')
-
-    ok = nightly.post_escalation(cfg, 'summary text', 'detail text', poster=raising_poster)
-
-    assert ok is False
-# ---------------------------------------------------------------------------
-# task 4511 step-1/2: post_escalation journals the summary/detail pair ITSELF,
-# before the POST.
-#
-# The 2026-08-18 incident (esc-legibility-trickle-reify-3): the only copy of
-# 'coder storm: 6/6 digests failed ... [Errno 2] No such file or directory:
-# claude' lived inside the archived escalation JSON, and
-# `journalctl --user -u legibility-trickle@reify.service` showed nothing but
-# an unexplained benign 400 and `status=1/FAILURE`. Logging from inside
-# `post_escalation` -- the only path to the POST -- makes the reason survive
-# both a future branch that forgets to log and an escalation server that is
-# down.
-# ---------------------------------------------------------------------------
-
-def test_post_escalation_journals_the_pair_before_the_post(tmp_path, caplog):
-    """The escalation reason reaches the journal from `post_escalation`
-    itself, at ERROR, carrying BOTH halves.
-
-    The "before the POST" half is asserted from INSIDE the injected poster
-    rather than after the call returns, because that is the property that
-    actually survives an unreachable escalation server: a write ordered
-    after a successful POST would still be missing in exactly the case an
-    operator needs it.
-    """
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
-    seen_inside_poster = []
-
-    def _recording_poster(url, envelope):
-        seen_inside_poster.extend(_nightly_warnings(caplog))
-
-    with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
-        ok = nightly.post_escalation(
-            cfg, 'summary text', 'detail text', poster=_recording_poster,
-        )
-
-    assert ok is True
-
-    loud = _nightly_warnings(caplog)
-    assert len(loud) == 1, (
-        f'expected exactly one record; got {[r.getMessage() for r in loud]}'
-    )
-    assert loud[0].levelno == logging.ERROR, (
-        'a fail-loud escalation IS the reason for the non-zero exit, so it '
-        'belongs in `journalctl -p err`'
-    )
-    message = loud[0].getMessage()
-    assert 'summary text' in message
-    assert 'detail text' in message, (
-        'the DETAIL is the diagnosis; a summary-only journal line is exactly '
-        f'what the 2026-08-18 incident already had. got {message!r}'
-    )
-
-    assert len(seen_inside_poster) == 1, (
-        'the journal write must already have happened when the poster is '
-        f'entered; saw {seen_inside_poster!r}'
-    )
-
-
-def test_post_escalation_journals_the_pair_even_when_the_poster_raises(
-    tmp_path, caplog,
-):
-    """The escalation-server-down case, which loses the diagnosis entirely
-    today. The pre-existing best-effort contract is unchanged and re-pinned
-    here so the new write cannot be mistaken for a behaviour change."""
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
-
-    def _raising_poster(url, envelope):
-        raise RuntimeError('escalation server unreachable')
-
-    with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
-        ok = nightly.post_escalation(
-            cfg, 'summary text', 'detail text', poster=_raising_poster,
-        )
-
-    # Unchanged best-effort behaviour: never raises, reports False, and
-    # still emits its own post-failure WARNING.
-    assert ok is False
-    loud = _nightly_warnings(caplog)
-    warned = [r.getMessage() for r in loud if r.levelno == logging.WARNING]
-    assert any('escalation post failed' in m for m in warned), warned
-
-    errors = [r for r in loud if r.levelno == logging.ERROR]
-    assert len(errors) == 1, (
-        f'expected exactly one ERROR; got {[r.getMessage() for r in errors]}'
-    )
-    message = errors[0].getMessage()
-    assert 'summary text' in message
-    assert 'detail text' in message, (
-        'a down escalation server must not cost the diagnosis -- that is the '
-        f'whole point of journaling before the POST. got {message!r}'
-    )
-
-
-class _FakeHttpxResponse:
-    """A 200 `application/json` reply with an empty JSON-RPC body.
-
-    `status_code`, `headers` and `json()` were added for task 3644:
-    `_default_poster` now delegates to `census_trigger.post_mcp_envelope`,
-    which reads `status_code` (to detect the stateful escalation server's 400
-    "Missing session ID") and `content-type` (to detect an SSE-framed body)
-    before decoding. Without them this fake would die on an AttributeError
-    and stop exercising the real code path -- so the task-2953 header
-    contract below keeps being asserted against the transport that actually
-    ships, not against a fake the implementation has outgrown."""
-
-    status_code = 200
-    headers = {'content-type': 'application/json'}
-
-    def raise_for_status(self):
-        pass
-
-    def json(self):
-        return {}
-
-
-def test_default_poster_sends_streamable_http_accept_headers(install_fake_httpx):
-    """Task 2953: the streamable-HTTP MCP transport 406s any tools/call POST
-    lacking an Accept header covering both application/json and
-    text/event-stream (verified live against a local MCP /mcp endpoint).
-    `_default_poster`'s httpx import is lazy, but httpx IS importable here --
-    a direct dependency of `shared` (shared/pyproject.toml, `httpx>=0.27`,
-    task 2965) -- so an un-faked call would really hit the network. The
-    shared `install_fake_httpx` fixture substitutes a stub so the outbound
-    request shape is assertable independent of any live listener."""
-    captured_kwargs = {}
-
-    def _fake_post(url, **kwargs):
-        captured_kwargs.update(kwargs)
-        return _FakeHttpxResponse()
-
-    install_fake_httpx(_fake_post)
-
-    nightly._default_poster('http://localhost:8199/mcp', {'jsonrpc': '2.0'})
-
-    headers = captured_kwargs.get('headers') or {}
-    assert 'application/json' in headers.get('Accept', '')
-    assert 'text/event-stream' in headers.get('Accept', '')
-    # Content-Type is part of the same transport contract -- pin it too so a
-    # future edit dropping it can't pass on the Accept assertions alone.
-    assert headers.get('Content-Type') == 'application/json'
-    # The envelope must still ride along unchanged on the same POST.
-    assert captured_kwargs.get('json') == {'jsonrpc': '2.0'}
-
-
-# ---------------------------------------------------------------------------
 # step-11/12: evaluate_census_step
 # ---------------------------------------------------------------------------
 
 def test_evaluate_census_step_no_fire_never_launches(tmp_path):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
-        return census_trigger.Decision(fire=False, reasons=['max-interval: 1.0d (threshold 10d)'])
+    def fake_decide(cfg, *, now=None, completion_runner=None):
+        return census_trigger.Decision(
+            fire=False,
+            reasons=['completion: 0.5 of census-proj_a-20260601 (threshold 0.70)'],
+            completion=census_trigger.Completion(
+                census_trigger.CompletionStatus.NOT_YET, 'census-proj_a-20260601', 70, share=0.5,
+            ),
+        )
 
     launcher_calls = []
-    line, fire = nightly.evaluate_census_step(
-        cfg, now=None, status_fetcher=None, decide=fake_decide,
+    evaluation = nightly.evaluate_census_step(
+        cfg, now=None, decide=fake_decide,
         entrypoint_exists=lambda: True, launcher=lambda: launcher_calls.append(1),
     )
 
-    assert fire is False
-    assert 'NO-FIRE' in line
+    assert isinstance(evaluation, nightly.CensusEvaluation)
+    assert evaluation.fire is False
+    assert 'NO-FIRE' in evaluation.line
+    assert evaluation.completion is census_trigger.CompletionStatus.NOT_YET
     assert launcher_calls == []
 
 
 def test_evaluate_census_step_fire_without_entrypoint_logs_loud_no_launch(tmp_path, caplog):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
-        return census_trigger.Decision(fire=True, reasons=['max-interval: 11.0d -> FIRE'])
+    def fake_decide(cfg, *, now=None, completion_runner=None):
+        return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
     launcher_calls = []
     with caplog.at_level('WARNING'):
-        line, fire = nightly.evaluate_census_step(
-            cfg, now=None, status_fetcher=None, decide=fake_decide,
+        line, fire, _completion = nightly.evaluate_census_step(
+            cfg, now=None, decide=fake_decide,
             entrypoint_exists=lambda: False, launcher=lambda: launcher_calls.append(1),
         )
 
@@ -932,18 +803,37 @@ def test_evaluate_census_step_fire_without_entrypoint_logs_loud_no_launch(tmp_pa
 def test_evaluate_census_step_fire_with_entrypoint_launches(tmp_path):
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
-        return census_trigger.Decision(fire=True, reasons=['max-interval: 11.0d -> FIRE'])
+    def fake_decide(cfg, *, now=None, completion_runner=None):
+        return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
     launcher_calls = []
-    line, fire = nightly.evaluate_census_step(
-        cfg, now=None, status_fetcher=None, decide=fake_decide,
+    line, fire, _completion = nightly.evaluate_census_step(
+        cfg, now=None, decide=fake_decide,
         entrypoint_exists=lambda: True,
         launcher=lambda project_root, **kwargs: launcher_calls.append(1),
     )
 
     assert fire is True
     assert launcher_calls == [1]
+
+
+def test_evaluate_census_step_decides_on_the_config_it_was_handed(tmp_path):
+    """Task 3269 / PRD D8: the trigger decides on the very config the trickle
+    loaded from its pinned config_path, never a re-read of one."""
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
+    received = []
+
+    def recording_decide(cfg, *, now=None, completion_runner=None):
+        received.append(cfg)
+        return census_trigger.Decision(fire=False, reasons=['completion: N/A'])
+
+    nightly.evaluate_census_step(
+        cfg, now=None, decide=recording_decide,
+        entrypoint_exists=lambda: True, launcher=lambda **kwargs: None,
+    )
+
+    assert len(received) == 1
+    assert received[0] is cfg
 
 
 def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplog):
@@ -961,9 +851,9 @@ def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplo
     """
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         return census_trigger.Decision(fire=True, reasons=[
-            'tasks-landed: 130 landed since last census (threshold 120) -> FIRE',
+            'completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE',
         ])
 
     # Snapshots the journal as the census subprocess would start, then dies
@@ -975,8 +865,8 @@ def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplo
         raise subprocess.TimeoutExpired(cmd='census.py', timeout=1800)
 
     with caplog.at_level(logging.INFO, logger='legibility.nightly'):
-        line, fire = nightly.evaluate_census_step(
-            cfg, now=None, status_fetcher=None, decide=fake_decide,
+        line, fire, _completion = nightly.evaluate_census_step(
+            cfg, now=None, decide=fake_decide,
             entrypoint_exists=lambda: True, launcher=_dying_launcher,
         )
 
@@ -986,7 +876,7 @@ def test_evaluate_census_step_logs_the_decision_before_launching(tmp_path, caplo
     assert any(
         'legibility trickle: census trigger: FIRE' in m for m in logged_at_launch
     ), logged_at_launch
-    assert any('tasks-landed: 130 landed' in m for m in logged_at_launch), logged_at_launch
+    assert any('completion: 0.9 of' in m for m in logged_at_launch), logged_at_launch
 
     # ...and a launcher that never returns cleanly cannot take it away.
     messages = [r.getMessage() for r in caplog.records]
@@ -1002,12 +892,12 @@ def test_evaluate_census_step_logs_a_failed_evaluation_too(tmp_path, caplog):
     an operator greps for the healthy one."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
 
     with caplog.at_level(logging.INFO, logger='legibility.nightly'):
-        line, fire = nightly.evaluate_census_step(
-            cfg, now=None, status_fetcher=None, decide=fake_decide,
+        line, fire, _completion = nightly.evaluate_census_step(
+            cfg, now=None, decide=fake_decide,
             entrypoint_exists=lambda: True, launcher=lambda: None,
         )
 
@@ -1034,7 +924,7 @@ def test_evaluate_census_step_survives_a_raising_decide(tmp_path, caplog):
     `entrypoint_exists` is even consulted."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         raise TypeError("unsupported operand type(s) for -: 'int' and 'str'")
 
     launcher_calls = []
@@ -1045,13 +935,14 @@ def test_evaluate_census_step_survives_a_raising_decide(tmp_path, caplog):
         return True
 
     with caplog.at_level('WARNING', logger='legibility.nightly'):
-        line, fire = nightly.evaluate_census_step(
-            cfg, now=None, status_fetcher=None, decide=fake_decide,
+        line, fire, completion = nightly.evaluate_census_step(
+            cfg, now=None, decide=fake_decide,
             entrypoint_exists=_recording_entrypoint_exists,
             launcher=lambda: launcher_calls.append(1),
         )
 
     assert fire is False
+    assert completion is None, 'a failed evaluation established no completion verdict'
     # A downstream reader of NightlyResult.census_line must still see a
     # well-formed decision line -- the one case an operator most needs to read
     # is the worst possible place to emit a novel shape.
@@ -1078,12 +969,12 @@ def test_evaluate_census_step_bounds_a_huge_decide_failure(tmp_path, caplog):
     is the opposite of the legible failure this trigger exists for."""
     cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
 
-    def fake_decide(project_root, *, now=None, status_fetcher=None):
+    def fake_decide(cfg, *, now=None, completion_runner=None):
         raise RuntimeError('boom ' + 'x' * 50_000 + '\nsecond line')
 
     with caplog.at_level('WARNING', logger='legibility.nightly'):
-        line, fire = nightly.evaluate_census_step(
-            cfg, now=None, status_fetcher=None, decide=fake_decide,
+        line, fire, _completion = nightly.evaluate_census_step(
+            cfg, now=None, decide=fake_decide,
             entrypoint_exists=lambda: True, launcher=lambda: None,
         )
 
@@ -1198,8 +1089,8 @@ def _adjacent_pair(argv: list[str], flag: str) -> list[str] | None:
     return None
 
 
-def _fire_decide(project_root, *, now=None, status_fetcher=None):
-    return census_trigger.Decision(fire=True, reasons=['max-interval: 11.0d -> FIRE'])
+def _fire_decide(cfg, *, now=None, completion_runner=None):
+    return census_trigger.Decision(fire=True, reasons=['completion: 0.9 of census-proj_a-20260601 (threshold 0.70) -> FIRE'])
 
 
 def test_default_census_launcher_argv_names_the_target_project(monkeypatch):
@@ -1336,8 +1227,8 @@ def test_evaluate_census_step_launches_against_the_configs_project_root(tmp_path
     def rec(project_root, *, config_path=None, caps=None):
         calls.append((project_root, config_path))
 
-    _line, fire = nightly.evaluate_census_step(
-        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+    _line, fire, _completion = nightly.evaluate_census_step(
+        cfg, now=None, decide=_fire_decide,
         entrypoint_exists=lambda: True, launcher=rec,
     )
 
@@ -1358,7 +1249,7 @@ def test_evaluate_census_step_two_project_configs_produce_two_distinct_launches(
 
     for cfg in (cfg_a, cfg_b):
         nightly.evaluate_census_step(
-            cfg, now=None, status_fetcher=None, decide=_fire_decide,
+            cfg, now=None, decide=_fire_decide,
             entrypoint_exists=lambda: True, launcher=rec,
         )
 
@@ -1374,7 +1265,7 @@ def test_evaluate_census_step_forwards_config_path_to_launcher(tmp_path):
         calls.append((project_root, config_path))
 
     nightly.evaluate_census_step(
-        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        cfg, now=None, decide=_fire_decide,
         entrypoint_exists=lambda: True, launcher=rec, config_path=config_path,
     )
 
@@ -1395,7 +1286,7 @@ def test_evaluate_census_step_forwards_the_configs_trickle_caps_to_launcher(tmp_
         calls.append(caps)
 
     nightly.evaluate_census_step(
-        cfg, now=None, status_fetcher=None, decide=_fire_decide,
+        cfg, now=None, decide=_fire_decide,
         entrypoint_exists=lambda: True, launcher=rec,
     )
 
@@ -1412,46 +1303,99 @@ def test_run_nightly_forwards_the_resolved_config_path_to_the_census_step(
     absolute, so an operator's relative ``--config`` is never re-resolved
     against the census subprocess's cwd."""
     monkeypatch.chdir(tmp_path)
-    _write_config(tmp_path / 'proj_a', project_id='proj_a')
-    calls = []
+    project_root = tmp_path / 'proj_a'
+    _write_config(project_root, project_id='proj_a')
+    _write_census_state(project_root, _OLD_CENSUS)
+    launcher, launches = _recording_census_launcher()
 
-    def _spy_evaluate(cfg, **kwargs):
-        calls.append((cfg, kwargs))
-        return 'census trigger: NO-FIRE -- stub', False
-
-    monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
-
-    nightly.run_nightly(
+    result = nightly.run_nightly(
         config_path='proj_a/docs/legibility/legibility.yaml',
         projects_root=tmp_path / 'projects',
         target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
         invoke=lambda prompt, model: '{"proposals": []}',
-        status_fetcher=lambda: {'statuses': {}},
-        poster=lambda url, envelope: None,
+        completion_runner=_passing_completion_runner,
+        poster=lambda url, arguments: None,
+        census_launcher=launcher,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
-    assert len(calls) == 1
-    cfg, kwargs = calls[0]
-    expected = (tmp_path / 'proj_a' / 'docs' / 'legibility' / 'legibility.yaml').resolve()
+    assert result.census_fire is True
+    [(args, kwargs)] = launches
+    expected = (project_root / 'docs' / 'legibility' / 'legibility.yaml').resolve()
     assert kwargs['config_path'] == expected
     assert Path(kwargs['config_path']).is_absolute()
-    # The cfg and the config path name the SAME project.
-    assert cfg.project_root == str(tmp_path / 'proj_a')
+    # The launch and the config path name the SAME project.
+    assert args == (str(project_root),)
 
 
-def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
-    tmp_path, monkeypatch, install_fake_httpx,
+def test_the_completion_streak_alarm_reproduces_with_the_config_the_nights_loaded(tmp_path):
+    project_root = tmp_path / 'proj_a'
+    config_path = _write_config(project_root, project_id='proj_a')
+    _write_census_state(project_root, _OLD_CENSUS)
+    launcher, _launches = _recording_census_launcher()
+    failing_check = _scripted_completion_runner(
+        2, {'run': _PREVIOUS_RUN, 'verdict': 'error', 'error': 'store_unreachable'},
+    )
+    posted: list[dict] = []
+
+    for night in range(3):
+        nightly.run_nightly(
+            config_path=config_path,
+            projects_root=tmp_path / 'projects',
+            target_date=date(2026, 7, 13) + timedelta(days=night),
+            now=datetime(2026, 7, 14 + night, 3, 0, tzinfo=UTC),
+            invoke=lambda prompt, model: '{"proposals": []}',
+            completion_runner=failing_check,
+            poster=lambda url, arguments: posted.append(arguments),
+            census_launcher=launcher,
+            pass_kind=nightly.PassKind.MANUAL,
+        )
+
+    [streak_alarm] = [post for post in posted if 'completion check' in post['summary']]
+    assert (
+        f'evaluate --project-root {project_root} --config {config_path.resolve()}'
+        in streak_alarm['detail']
+    )
+
+
+@pytest.mark.parametrize('fire', [True, False], ids=['fire', 'no-fire'])
+def test_run_nightly_launches_the_census_once_through_the_injected_launcher(
+    tmp_path, fire,
 ):
-    """End to end: a max-interval FIRE through run_nightly and the REAL default
-    launcher carries the project's census.trickle_caps into census.py's argv.
+    launcher, launches = _recording_census_launcher()
 
-    The injected invoke means no pool is built, so run_nightly hands
-    evaluate_census_step no launcher and the default one runs. Only
+    result, repo = _run_e2e_nightly(
+        tmp_path, census_state=_OLD_CENSUS if fire else None, census_launcher=launcher,
+    )
+
+    cfg = load_config(repo / 'docs' / 'legibility' / 'legibility.yaml')
+    if not fire:
+        assert result.census_fire is False
+        assert launches == []
+        return
+    assert result.census_fire is True
+    assert launches == [(
+        (cfg.project_root,),
+        {
+            'config_path': (repo / 'docs' / 'legibility' / 'legibility.yaml').resolve(),
+            'caps': cfg.census.trickle_caps,
+        },
+    )]
+
+
+@pytest.mark.usefixtures('unreached_fused_memory')
+def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(tmp_path, monkeypatch):
+    """End to end: a completion FIRE through run_nightly and the REAL default
+    launcher carries the project's census.trickle_caps into census.py's argv,
+    and no env: census.py opens its own pooled runner (task 6042), so a pinned
+    env would hand it one account for every stage.
+
+    No census_launcher is injected, so the default one runs. Only
     subprocess.run is spied -- recording every call, since nightly.subprocess
     is the global module -- so no census really starts. Non-default caps
     (7/9) make a silent fall-back to the schema default fail.
     """
-    install_fake_httpx(_no_outbound_post)
     root = tmp_path / 'proj_a'
     config_path = _write_config(
         root, project_id='proj_a',
@@ -1459,15 +1403,7 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
     )
     legibility_dir = root / 'docs' / 'legibility'
     now = datetime(2026, 7, 14, 3, 0, tzinfo=UTC)
-    # 11 days stale with a null done-count: only max-interval can fire, and
-    # condition (b) never reaches a status fetcher.
-    (legibility_dir / 'census-state.json').write_text(
-        json.dumps({
-            'last_census_at': (now - timedelta(days=11)).isoformat(),
-            'last_census_done_count': None,
-        }),
-        encoding='utf-8',
-    )
+    _write_census_state(root, _completion_census_state(now))
     codebook.dump(
         {'version': 2, 'entries': [], 'candidates': []},
         legibility_dir / 'confusion-codebook.yaml',
@@ -1475,7 +1411,7 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
     runs = []
 
     def _record_run(args, **kwargs):
-        runs.append(list(args))
+        runs.append((list(args), kwargs))
         return subprocess.CompletedProcess(args, 0)
 
     monkeypatch.setattr(nightly.subprocess, 'run', _record_run)
@@ -1486,138 +1422,140 @@ def test_run_nightly_launches_the_census_with_the_configs_trickle_caps(
         target_date=date(2026, 7, 13),
         now=now,
         invoke=lambda prompt, model: '{"matches": [], "candidates": []}',
-        status_fetcher=lambda: {'statuses': {}},
-        poster=lambda url, envelope: None,
+        completion_runner=_passing_completion_runner,
+        poster=lambda url, arguments: None,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.census_fire is True
     census_launches = [
-        argv for argv in runs if len(argv) > 1 and str(argv[1]).endswith('census.py')
+        (argv, kwargs) for argv, kwargs in runs
+        if len(argv) > 1 and str(argv[1]).endswith('census.py')
     ]
     assert len(census_launches) == 1
-    argv = census_launches[0]
+    argv, kwargs = census_launches[0]
+    assert kwargs.get('env') is None
     assert _adjacent_pair(argv, '--max-batches') == ['--max-batches', '7']
     assert _adjacent_pair(argv, '--max-verify-clusters') == ['--max-verify-clusters', '9']
     assert _adjacent_pair(argv, '--project-root') == ['--project-root', str(root)]
 
 
 # ---------------------------------------------------------------------------
-# task 4148: run_nightly must DEFAULT the census status_fetcher seam
-#
-# The production path is the systemd `nightly.py run --project-id %i`
-# ExecStart -> main() -> run_nightly, and main() holds only --config /
-# --project-id -- no project_root to build a fetcher from. So NOTHING on that
-# path ever constructed one, `status_fetcher=None` reached
-# compute_tasks_landed on every real run, and its `status_fetcher is None`
-# fail-safe arm logged "tasks-landed: no status_fetcher configured" instead of
-# a delta: condition (b) could not fire AT ALL. Every OTHER seam in
-# run_nightly already resolves None to its real implementation (committer ->
-# unlanded.commit_only, recorder -> trickle_state.record_run, poster ->
-# _default_poster); status_fetcher alone resolved to nothing, which is how
-# three prior repairs of this exact code (2953, 3291, 4085) each left the
-# wiring loop open.
+# run_nightly DEFAULTS the census completion_runner seam to the real
+# scripts/check_run_completion.py run. main() injects nothing, so None must
+# mean "the real check", never "no check" -- the asymmetry that kept the
+# retired tasks-landed condition dead in production (task 4148).
 # ---------------------------------------------------------------------------
 
-class TestRunNightlyDefaultsTheCensusStatusFetcher:
-    """Pin run_nightly's status_fetcher seam: None means "build the real
-    MCP-backed fetcher for cfg.project_root", an explicit value is honoured.
+_PREVIOUS_RUN = 'census-proj_a-20260701'
 
-    The spy replaces ``evaluate_census_step`` ITSELF rather than the inner
-    ``decide`` seam. That is load-bearing: task 4085 wrapped the inner
-    ``decide`` call in a never-raises try/except (nightly.py:590-606) that
-    converts any failure into a synthetic ``NO-FIRE`` line, so a spy placed
-    inside it could turn a genuine wiring fault into a quiet pass.
-    """
+_LANDED_RUN_ROWS = (
+    {'task_id': 1, 'priority': 'high', 'status': 'done'},
+    {'task_id': 2, 'priority': 'high', 'status': 'done'},
+    {'task_id': 3, 'priority': 'low', 'status': 'pending'},
+)
+"""The previous run's filed tasks, 6 landed of 7 weighted: a pass at 0.70."""
 
-    @staticmethod
-    def _install_spies(monkeypatch):
-        """Record the factory's argument and what evaluate_census_step got.
 
-        Returns ``(sentinel, factory_calls, seen)`` where *sentinel* is the
-        object the stubbed factory hands back -- asserted by IDENTITY, so
-        "some fetcher got built" cannot pass for "the real factory's fetcher
-        got through".
-        """
-        sentinel = object()
-        factory_calls = []
-        seen = {}
+def _run_lookup_store(rows):
+    """A find_tasks_by_metadata backend serving *rows*. Returns
+    ``(call_tool, lookups)``, *lookups* recording each call's arguments."""
+    lookups = []
 
-        def _recording_factory(project_root):
-            factory_calls.append(project_root)
-            return sentinel
+    def _call_tool(name, arguments):
+        assert name == 'find_tasks_by_metadata', name
+        lookups.append(dict(arguments))
+        return {
+            'results': list(rows),
+            'pagination': {'has_more': False},
+            'tasks_with_key': len(rows),
+        }
 
-        def _spy_evaluate(
-            cfg, *, now=None, status_fetcher=None, launcher=None, config_path=None,
-        ):
-            seen['status_fetcher'] = status_fetcher
-            return 'census trigger: NO-FIRE -- stub', False
+    return _call_tool, lookups
 
-        monkeypatch.setattr(
-            nightly.census_trigger, 'default_status_fetcher', _recording_factory,
-        )
-        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
-        return sentinel, factory_calls, seen
 
-    @staticmethod
-    def _run_quiet_night(tmp_path, **kwargs):
+def _completion_census_state(now):
+    """A census-state whose floor is clear and whose previous run is
+    :data:`_PREVIOUS_RUN`, so the completion arm decides the night."""
+    month_ago = (now - timedelta(days=30)).isoformat()
+    return {
+        'last_census_at': month_ago,
+        'last_census_report': 'docs/legibility/census-prior.md',
+        'last_census_run_id': _PREVIOUS_RUN,
+        'session_watermark': month_ago,
+    }
+
+
+def _scripted_completion_runner(returncode, verdict, calls=None):
+    """A ``completion_runner=`` seam answering *returncode* with *verdict* as
+    the last stdout line, recording each argv into *calls*."""
+
+    def _run(args):
+        if calls is not None:
+            calls.append(list(args))
+        return subprocess.CompletedProcess(list(args), returncode, stdout=json.dumps(verdict) + '\n')
+
+    return _run
+
+
+_passing_completion_runner = _scripted_completion_runner(
+    0, {'verdict': 'pass', 'share': 0.9, 'vacuous': False},
+)
+"""The ``completion_runner=`` the e2e helpers default to: the previous run has
+landed, so a census-state carrying a run id FIREs on completion."""
+
+
+class TestRunNightlyDefaultsTheCompletionRunner:
+    """Pin run_nightly's completion_runner seam: None runs the real
+    check_run_completion.py against cfg.project_root, an injected runner is
+    honoured and nothing else is reached."""
+
+    _NOW = datetime(2026, 7, 14, 3, 0, tzinfo=UTC)
+
+    def _run_quiet_night(self, tmp_path, **kwargs):
         """Drive run_nightly over the light quiet-night path (empty
         projects_root -> empty sample -> no LLM, no commit) and return the
-        loaded config, so a caller can assert against ``cfg.project_root``."""
+        loaded config."""
         config_path = _write_config(tmp_path, project_id='proj_a')
+        _write_census_state(tmp_path, _completion_census_state(self._NOW))
         nightly.run_nightly(
             config_path=config_path,
             projects_root=tmp_path / 'projects',
             target_date=date(2026, 7, 13),
+            now=self._NOW,
             invoke=lambda prompt, model: '{"proposals": []}',
-            poster=lambda url, envelope: None,
+            poster=lambda url, arguments: None,
+            census_launcher=_no_census_launch,
+            pass_kind=nightly.PassKind.MANUAL,
             **kwargs,
         )
         return load_config(config_path)
 
-    def test_defaults_to_the_real_mcp_backed_fetcher(self, tmp_path, monkeypatch):
-        sentinel, _factory_calls, seen = self._install_spies(monkeypatch)
+    def test_defaults_to_the_real_completion_check(self, tmp_path, monkeypatch):
+        call_tool, lookups = _run_lookup_store(_LANDED_RUN_ROWS)
 
-        # No status_fetcher argument at all -- exactly what main() passes.
-        self._run_quiet_night(tmp_path)
+        with StubMcpServer(stateful=False, tools=call_tool) as fused_memory:
+            monkeypatch.setenv('FUSED_MEMORY_MCP_URL', fused_memory.url)
+            # No completion_runner argument at all -- exactly what main() passes.
+            cfg = self._run_quiet_night(tmp_path)
 
-        assert seen['status_fetcher'] is sentinel, (
-            'run_nightly handed evaluate_census_step '
-            f'{seen["status_fetcher"]!r} instead of the fetcher built by '
-            'census_trigger.default_status_fetcher -- with None, '
-            'compute_tasks_landed fails safe and condition (b) can never fire'
+        assert lookups, 'the census decision never ran check_run_completion.py'
+        assert {lookup['key'] for lookup in lookups} == {'x_finding_run'}
+        assert {lookup['value'] for lookup in lookups} == {_PREVIOUS_RUN}
+        assert {lookup['project_root'] for lookup in lookups} == {str(cfg.project_root)}
+
+    def test_an_injected_runner_is_called_once_and_fused_memory_never_reached(
+        self, tmp_path, unreached_fused_memory,
+    ):
+        calls = []
+        runner = _scripted_completion_runner(
+            75, {'verdict': 'not_yet', 'share': 0.5, 'vacuous': False}, calls,
         )
 
-    def test_the_fetcher_is_built_for_the_configs_project_root(self, tmp_path, monkeypatch):
-        _sentinel, factory_calls, _seen = self._install_spies(monkeypatch)
+        self._run_quiet_night(tmp_path, completion_runner=runner)
 
-        cfg = self._run_quiet_night(tmp_path)
-
-        assert len(factory_calls) == 1, (
-            'default_status_fetcher must be called exactly once per run, '
-            f'got {len(factory_calls)} call(s)'
-        )
-        # The SAME project_root evaluate_census_step hands to decide()
-        # (nightly.py:591), so the fetcher and the decision can never disagree
-        # about which project they are for.
-        assert factory_calls[0] == cfg.project_root
-        # Absolute is the wire contract task 3291 fixed: fused-memory's
-        # _normalize_project_root hard-rejects any relative path.
-        assert Path(str(factory_calls[0])).is_absolute()
-
-    def test_an_injected_fetcher_is_not_overridden(self, tmp_path, monkeypatch):
-        """DI-seam regression guard: the default must not clobber an explicit
-        fetcher (every run_nightly test that injects one depends on this)."""
-        _sentinel, factory_calls, seen = self._install_spies(monkeypatch)
-
-        def my_fake():
-            return {'statuses': {}}
-
-        self._run_quiet_night(tmp_path, status_fetcher=my_fake)
-
-        assert seen['status_fetcher'] is my_fake
-        assert factory_calls == [], (
-            'an injected status_fetcher must short-circuit the default factory'
-        )
+        assert len(calls) == 1
+        assert calls[0][:2] == ['--run', _PREVIOUS_RUN]
 
 
 # ---------------------------------------------------------------------------
@@ -1654,12 +1592,9 @@ _AUTH_403 = {
 _CAPPED = {'is_error': True, 'rc': 1, 'result': REAL_CLI_CAP_HIT_MESSAGES[2]}
 """A verbatim cap whose "resets in 3 hours" parses to a FUTURE reset, so the
 gate's reset sweep cannot reopen the account mid-test."""
-_EXIT_ZERO_BANNER = {'result': REAL_CLI_CAP_HIT_MESSAGES[2]}
-"""The same banner delivered as an rc-0, ``is_error`` false reply (task 5637)."""
 
 
 _REAL_OPEN_POOLED_RUNNER = session_runner.open_pooled_runner
-_REAL_DEFAULT_CENSUS_LAUNCHER = nightly._default_census_launcher
 
 
 def _pool_the_night_on(monkeypatch, accounts_file, env_file):
@@ -1692,19 +1627,43 @@ def _pool_the_night_on(monkeypatch, accounts_file, env_file):
 
 
 def _capture_poster():
-    """A ``poster=`` seam that keeps every envelope. Returns (fn, envelopes)."""
-    envelopes = []
+    """A ``poster=`` seam that keeps every escalation's arguments. Returns (fn, posted)."""
+    posted = []
 
-    def _post(url, envelope):
-        envelopes.append(envelope)
+    def _post(url, arguments):
+        posted.append(arguments)
 
-    return _post, envelopes
+    return _post, posted
 
 
-def _one_escalation(envelopes):
-    """The ``escalate_info`` arguments of the one envelope posted."""
-    assert len(envelopes) == 1, f'expected exactly ONE escalation, got {envelopes}'
-    return envelopes[0]['params']['arguments']
+def _one_escalation(posted):
+    """The ``escalate_info`` arguments of the one escalation posted."""
+    assert len(posted) == 1, f'expected exactly ONE escalation, got {posted}'
+    return posted[0]
+
+
+def _no_census_launch(project_root, **kwargs):
+    """The ``census_launcher=`` every e2e helper injects unless a test passes
+    its own: a FIRE must never spawn the real census.py from a test."""
+
+
+def _recording_census_launcher(on_launch=None):
+    """A ``census_launcher=`` seam recording each launch as ``(args, kwargs)``;
+    *on_launch(project_root)* runs inside each. Returns (launcher, launches)."""
+    launches = []
+
+    def _launch(*args, **kwargs):
+        launches.append((args, kwargs))
+        if on_launch is not None:
+            on_launch(Path(args[0]))
+
+    return _launch, launches
+
+
+_OLD_CENSUS = {'last_census_at': '2026-06-01', 'last_census_run_id': _PREVIOUS_RUN}
+"""A census-state that FIREs on completion under
+:func:`_passing_completion_runner`: no session_watermark, so the floor anchors
+on last_census_at, weeks clear of it."""
 
 
 def _run_one_digest_night(tmp_path, **kwargs):
@@ -1719,8 +1678,10 @@ def _run_one_digest_night(tmp_path, **kwargs):
         cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
     )
     poster, escalations = _capture_poster()
-    kwargs.setdefault('status_fetcher', lambda: {'statuses': {}})
+    kwargs.setdefault('completion_runner', _passing_completion_runner)
+    kwargs.setdefault('census_launcher', _no_census_launch)
     kwargs.setdefault('poster', poster)
+    kwargs.setdefault('pass_kind', nightly.PassKind.MANUAL)
     result = nightly.run_nightly(
         config_path=config_path,
         projects_root=projects_root,
@@ -1735,14 +1696,11 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
 
     @pytest.fixture
     def night(
-        self, tmp_path, monkeypatch, install_fake_httpx, fake_claude_cli,
+        self, tmp_path, monkeypatch, unreached_fused_memory, fake_claude_cli,
         pool_roster, sentinel_login,
     ):
-        """A two-account pool behind the fake CLI, the census launch stubbed
-        out (a FIRE would spawn census.py: real spend, real git), and the
-        operator's login a sentinel no call may read."""
-        install_fake_httpx(_no_outbound_post)
-        monkeypatch.setattr(nightly, '_default_census_launcher', lambda *a, **k: None)
+        """A two-account pool behind the fake CLI and the operator's login a
+        sentinel no call may read."""
         accounts_file, env_file = pool_roster(_P, _Q)
         opened = _pool_the_night_on(monkeypatch, accounts_file, env_file)
         return fake_claude_cli, pool_roster, sentinel_login, opened
@@ -1818,16 +1776,13 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
             'a capped night is weather (task 4503): nothing belongs in journalctl -p err'
         )
 
-    @pytest.mark.parametrize(
-        'capped', [_CAPPED, _EXIT_ZERO_BANNER], ids=['nonzero-exit', 'exit-zero'],
-    )
     def test_one_capped_account_is_weather_the_digest_codes_on_the_next(
-        self, tmp_path, night, capped,
+        self, tmp_path, night,
     ):
         """The commonest night: the first account is capped, the second is
-        not. Either way the cap arrives, the digest must complete next door."""
+        not. The digest must complete next door."""
         fake, roster, _home, _opened = night
-        fake.plan({roster.token(_P): capped}, default={'result': _EMPTY_VERDICT})
+        fake.plan({roster.token(_P): _CAPPED}, default={'result': _EMPTY_VERDICT})
 
         result, _escalations = _run_one_digest_night(tmp_path)
 
@@ -1848,7 +1803,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         empty_bin = tmp_path / 'empty-bin'
         empty_bin.mkdir()
         monkeypatch.setenv('PATH', f'{empty_bin}{os.pathsep}/usr/bin')
-        assert shutil.which('claude') is None, 'the premise: no claude is reachable'
+        assert resolve_claude_binary() is None, 'the premise: no claude is reachable'
 
         with caplog.at_level(logging.DEBUG):
             result, escalations = _run_one_digest_night(tmp_path)
@@ -1886,35 +1841,6 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         assert result.capped is True
         assert _one_recorded(recorded) is not None
         assert fake.calls() == []
-
-    def test_the_census_builds_its_own_pool_so_its_launch_carries_no_env(
-        self, tmp_path, night, monkeypatch,
-    ):
-        fake, _roster, _home, _opened = night
-        fake.plan(default={'result': _EMPTY_VERDICT})
-        seen = {}
-
-        def _spy_evaluate(cfg, *, now=None, status_fetcher=None, launcher=None, config_path=None):
-            seen['launcher'] = launcher
-            return 'census trigger: NO-FIRE -- stub', False
-
-        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy_evaluate)
-        monkeypatch.setattr(nightly, '_default_census_launcher', _REAL_DEFAULT_CENSUS_LAUNCHER)
-        _run_one_digest_night(tmp_path)
-
-        assert seen['launcher'] is None, (
-            'the trickle leaves the census launch to _default_census_launcher; '
-            'any launcher it injected would bypass the assertion below'
-        )
-        launched = _spy_subprocess_run(monkeypatch)
-        nightly._default_census_launcher(
-            '/some/project', caps=TrickleCensusCaps(max_batches=7),
-        )
-        assert launched.get('env') is None, (
-            'the census opens its own pooled runner; a pinned env would hand it '
-            'one account for every stage'
-        )
-        assert _adjacent_pair(launched['args'], '--max-batches') == ['--max-batches', '7']
 
     @pytest.mark.parametrize('outcome', ['ok', 'capped', 'storm', 'raised'])
     def test_the_runner_is_closed_on_every_exit_path(
@@ -1968,12 +1894,11 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         assert result.coder_status == 'ok'
         assert [record['closed'] for record in opened] == [1]
 
-    def test_an_injected_invoke_opens_no_runner(self, tmp_path, monkeypatch, install_fake_httpx):
+    @pytest.mark.usefixtures('unreached_fused_memory')
+    def test_an_injected_invoke_opens_no_runner(self, tmp_path, monkeypatch):
         """Every other run_nightly test here injects an invoke stub and
         depends on the default never clobbering it -- nor opening a pool,
         which would read the operator's own .env."""
-        install_fake_httpx(_no_outbound_post)
-        monkeypatch.setattr(nightly, '_default_census_launcher', lambda *a, **k: None)
         monkeypatch.setattr(
             session_runner, 'open_pooled_runner',
             lambda *a, **k: pytest.fail('no runner may be opened on the injected path'),
@@ -2026,12 +1951,15 @@ _HAND_DIGEST_FOR_IDENTITY = (
 )
 
 
-def _no_outbound_post(url, **kwargs):
-    """An httpx.post stub that fails LOUDLY rather than returning a plausible
-    reply. Every seam in these runs is injected, so a POST reaching the wire
-    means a seam silently resolved to its live implementation -- exactly the
-    fault this class exists to pin, and it must not pass quietly."""
-    pytest.fail(f'unexpected outbound POST to {url!r} -- every seam is injected')
+@pytest.fixture
+def unreached_fused_memory(monkeypatch):
+    """A live fused-memory stand-in behind FUSED_MEMORY_MCP_URL that the test
+    must never reach. Every seam in these runs is injected, so a request
+    arriving here means a seam silently resolved to its live implementation."""
+    with StubMcpServer(stateful=False) as server:
+        monkeypatch.setenv('FUSED_MEMORY_MCP_URL', server.url)
+        yield server
+    assert server.requests == (), f'unexpected fused-memory requests: {server.requests}'
 
 
 # ---------------------------------------------------------------------------
@@ -2062,6 +1990,20 @@ def test_resolve_config_path_unknown_id_raises(tmp_path):
 
     with pytest.raises(FileNotFoundError):
         nightly.resolve_config_path("does-not-exist", search_roots=[tmp_path])
+
+
+def test_resolve_config_path_unknown_id_names_each_candidate_that_failed_to_load(tmp_path):
+    _write_config(tmp_path / "proj-a", project_id="proj_a")
+    broken = _write_config(tmp_path / "proj-b", project_id="proj_b")
+    broken.write_text(broken.read_text() + "census: {floor_days: '5'}\n")
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        nightly.resolve_config_path("proj_b", search_roots=[tmp_path])
+
+    message = str(excinfo.value)
+    assert str(broken) in message
+    assert "floor_days" in message
+    assert "input_value='5'" in message
 
 
 def test_resolve_config_path_env_override(tmp_path, monkeypatch):
@@ -2158,8 +2100,8 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_known_cause,
-        status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -2197,8 +2139,8 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_known_cause,
-        status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result_2.exit_code == 0
@@ -2254,8 +2196,8 @@ def test_run_nightly_logs_the_sampler_summary_on_a_healthy_night(tmp_path, caplo
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
-            status_fetcher=None,
-            poster=lambda url, envelope: None,
+            poster=lambda url, arguments: None,
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     assert result.exit_code == 0
@@ -2289,8 +2231,8 @@ def test_run_nightly_logs_the_sampler_summary_when_there_are_no_sessions(tmp_pat
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
-            status_fetcher=None,
-            poster=lambda url, envelope: None,
+            poster=lambda url, arguments: None,
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     assert result.exit_code == 0
@@ -2304,8 +2246,13 @@ def test_run_nightly_logs_the_sampler_summary_when_there_are_no_sessions(tmp_pat
     assert '2026-07-13' in line
 
 
+_TRICKLE_LOGGERS = frozenset({'legibility.nightly', 'legibility.alarm'})
+"""The trickle's own logger and the alarm's, which journals every alarm the
+trickle raises."""
+
+
 def _nightly_warnings(caplog):
-    """Records at >= WARNING on this module's OWN logger.
+    """Records at >= WARNING on the trickle's OWN loggers.
 
     Filtered by logger name deliberately: ``legibility.census_trigger`` emits
     its own fail-safe WARNING on a fixture with no census baseline, which says
@@ -2313,7 +2260,7 @@ def _nightly_warnings(caplog):
     """
     return [
         r for r in caplog.records
-        if r.levelno >= logging.WARNING and r.name == 'legibility.nightly'
+        if r.levelno >= logging.WARNING and r.name in _TRICKLE_LOGGERS
     ]
 
 
@@ -2365,8 +2312,8 @@ def test_run_nightly_reports_a_totally_budget_suppressed_night(tmp_path, caplog)
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
-            status_fetcher=None,
-            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+            poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     # Exit code stays 0 ON PURPOSE: a non-zero exit would flip
@@ -2377,11 +2324,9 @@ def test_run_nightly_reports_a_totally_budget_suppressed_night(tmp_path, caplog)
     assert result.budget_suppressed is True
     assert result.escalated is True
 
-    # Structured facts, not log-scraping: ONE durable escalation, on the
-    # existing decision-8 envelope, unchanged.
+    # Structured facts, not log-scraping: ONE durable escalation.
     assert len(escalation_calls) == 1
-    _url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    _url, arguments = escalation_calls[0]
     assert arguments['category'] == 'infra_issue'
     assert arguments['severity'] == 'info'
     summary = arguments['summary'].lower()
@@ -2446,8 +2391,8 @@ def test_run_nightly_quiet_night_is_not_reported_as_suppressed(tmp_path, caplog)
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_known_cause,
-            status_fetcher=None,
-            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+            poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     assert result.exit_code == 0
@@ -2504,8 +2449,8 @@ def test_run_nightly_defers_an_all_capped_night(tmp_path, caplog):
     """
     codebook_path_holder = {}
 
-    def _poster(url, envelope):
-        escalation_calls.append((url, envelope))
+    def _poster(url, arguments):
+        escalation_calls.append((url, arguments))
 
     escalation_calls = []
     with caplog.at_level(logging.DEBUG):
@@ -2533,8 +2478,7 @@ def test_run_nightly_defers_an_all_capped_night(tmp_path, caplog):
     # (d) Exactly ONE escalation, naming the deferral rather than a storm, and
     # carrying the cap text so the journal names the cause on first read.
     assert len(escalation_calls) == 1
-    _url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    _url, arguments = escalation_calls[0]
     summary = arguments['summary'].lower()
     assert 'storm' not in summary, (
         f"a deferral must not be announced as a storm; got {summary!r}"
@@ -2545,17 +2489,17 @@ def test_run_nightly_defers_an_all_capped_night(tmp_path, caplog):
         f"reads a deferral with no stated cause; got {arguments['detail']!r}"
     )
 
-    # (e) WARNING, not ERROR: post_escalation's own level rule is ERROR iff
-    # this escalation is itself the fail-loud trigger returning exit_code=1.
+    # (e) WARNING, not ERROR: AlarmKind.level is ERROR iff this alarm is
+    # itself the fail-loud trigger returning exit_code=1.
     errors = [r for r in caplog.records
-              if r.name == 'legibility.nightly' and r.levelno >= logging.ERROR]
+              if r.name in _TRICKLE_LOGGERS and r.levelno >= logging.ERROR]
     assert not errors, (
         f"a deferred night must not journal at ERROR -- exit_code is 0, so "
         f"this escalation is not a fail-loud trigger; got "
         f"{[r.getMessage() for r in errors]!r}"
     )
     warnings = [r.getMessage() for r in caplog.records
-                if r.name == 'legibility.nightly' and r.levelno == logging.WARNING]
+                if r.name in _TRICKLE_LOGGERS and r.levelno == logging.WARNING]
     assert any('weekly limit' in w.lower() for w in warnings), (
         f"the aggregate journal line must carry the cap text; got {warnings!r}"
     )
@@ -2584,8 +2528,8 @@ def test_run_nightly_capped_leaves_the_codebook_byte_identical(tmp_path):
         target_date=date(2026, 7, 13),
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=_fake_invoke_capped,
-        status_fetcher=None,
-        poster=lambda url, envelope: None,
+        poster=lambda url, arguments: None,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -2652,8 +2596,8 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_unparseable,
-        status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code != 0
@@ -2662,8 +2606,7 @@ def test_run_nightly_fail_loud_on_coder_storm(tmp_path):
     assert result.escalated is True
 
     assert len(escalation_calls) == 1
-    url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    url, arguments = escalation_calls[0]
     assert arguments['category'] == 'infra_issue'
     assert 'storm' in arguments['summary'].lower()
     assert '1/1' in arguments['summary']
@@ -2717,9 +2660,9 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_known_cause,
-        status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
         committer=_failing_committer,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code != 0
@@ -2728,8 +2671,7 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
     assert result.applied == 1  # the merge/dump DID happen before the commit attempt
 
     assert len(escalation_calls) == 1
-    url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    url, arguments = escalation_calls[0]
     assert arguments['category'] == 'infra_issue'
     assert 'commit' in arguments['summary'].lower()
 
@@ -2743,6 +2685,28 @@ def test_run_nightly_fail_loud_on_commit_failure(tmp_path):
     quarantine_dir = _assert_refused_dump_rolled_back(repo, head_bytes, result)
     assert 'cannot lock ref (simulated)' in arguments['detail']
     assert str(quarantine_dir) in arguments['detail']
+
+
+def test_run_nightly_rolls_back_the_dump_when_the_committer_raises(tmp_path):
+    """A committer that raises is a refused commit: the dump never stays in
+    the checkout, and the raise reaches the COMMIT_FAILED alarm's detail."""
+
+    def _raising_committer(repo, paths, message):
+        raise RuntimeError('the committer exploded')
+
+    poster, posted = _capture_poster()
+    result, repo = _run_e2e_nightly(tmp_path, committer=_raising_committer, poster=poster)
+
+    assert result.outcome is _Outcome.FAILED
+    assert [alarm.kind for alarm in result.alarms] == [_Kind.COMMIT_FAILED]
+    head_bytes = subprocess.run(
+        ['git', 'show', 'HEAD:docs/legibility/confusion-codebook.yaml'],
+        cwd=repo, check=True, capture_output=True,
+    ).stdout
+    quarantine_dir = _assert_refused_dump_rolled_back(repo, head_bytes, result)
+    detail = _one_escalation(posted)['detail']
+    assert 'RuntimeError: the committer exploded' in detail
+    assert str(quarantine_dir) in detail
 
 
 def test_run_nightly_lands_through_a_transient_index_lock(tmp_path):
@@ -2836,8 +2800,8 @@ def test_run_nightly_commit_refused_by_pre_commit_hook_restores_the_checkout(tmp
             target_date=target_date,
             now=fixed_now,
             invoke=_fake_invoke_known_cause,
-            status_fetcher=None,
-            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+            poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     result = _run()
@@ -2849,7 +2813,7 @@ def test_run_nightly_commit_refused_by_pre_commit_hook_restores_the_checkout(tmp
     assert after_log == before_log
     quarantine_dir = _assert_refused_dump_rolled_back(repo, head_bytes, result)
     assert len(escalation_calls) == 1
-    detail = escalation_calls[0][1]['params']['arguments']['detail']
+    detail = escalation_calls[0][1]['detail']
     assert 'cited-test-path gate' in detail
     assert str(quarantine_dir) in detail
 
@@ -2918,8 +2882,8 @@ def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path, 
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_deletion_directive,
-        status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -2929,8 +2893,8 @@ def test_run_nightly_skips_deletion_directive_record_without_crashing(tmp_path, 
     assert {'deletion_directive=1', 'matched=0'} <= set(merge_line.split())
 
     assert len(escalation_calls) == 1
-    _url, envelope = escalation_calls[0]
-    assert 'deletion directive' in envelope['params']['arguments']['summary'].lower()
+    _url, arguments = escalation_calls[0]
+    assert 'deletion directive' in arguments['summary'].lower()
 
     # Nothing applied -> the existing no-change-night path holds.
     assert codebook_path.read_bytes() == before_bytes
@@ -2996,8 +2960,8 @@ def test_run_nightly_deletion_directive_does_not_cost_the_rest_of_the_batch(tmp_
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_deletion_then_match,
-        status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert len(invocations) == 2, 'both sessions must reach the coder'
@@ -3020,8 +2984,7 @@ def test_run_nightly_deletion_directive_does_not_cost_the_rest_of_the_batch(tmp_
 
     # ...and the BAD one was still surfaced, naming the OTHER session.
     assert len(escalation_calls) == 1
-    _url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    _url, arguments = escalation_calls[0]
     assert 'deletion directive' in arguments['summary'].lower()
     assert f'session={sighted}' not in arguments['detail']
     assert result.reason is not None
@@ -3059,8 +3022,8 @@ def test_run_nightly_aggregates_deletion_directive_escalations(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_deletion_directive,
-        status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -3069,8 +3032,7 @@ def test_run_nightly_aggregates_deletion_directive_escalations(tmp_path):
     assert result.escalated is True
 
     assert len(escalation_calls) == 1, 'one aggregated POST, never one per record'
-    _url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    _url, arguments = escalation_calls[0]
     assert '2 coding record(s)' in arguments['summary']
     assert 'deletion directive' in arguments['summary'].lower()
     # Both skipped sessions are named, so the aggregate loses no detail.
@@ -3080,7 +3042,7 @@ def test_run_nightly_aggregates_deletion_directive_escalations(tmp_path):
 
 
 def test_run_nightly_records_a_reason_when_the_escalation_post_fails(tmp_path):
-    """With the escalation server down, `post_escalation` returns False --
+    """With the escalation server down, the alarm reports not landed --
     so `escalated` is False and `exit_code` is 0, leaving the returned
     result structurally identical to a clean night. `reason` is what keeps
     a never-delete contract violation from surviving as nothing but a
@@ -3095,7 +3057,7 @@ def test_run_nightly_records_a_reason_when_the_escalation_post_fails(tmp_path):
         session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
     )
 
-    def _dead_poster(url, envelope):
+    def _dead_poster(url, arguments):
         raise OSError('connection refused')
 
     result = nightly.run_nightly(
@@ -3104,8 +3066,8 @@ def test_run_nightly_records_a_reason_when_the_escalation_post_fails(tmp_path):
         target_date=target_date,
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=_fake_invoke_deletion_directive,
-        status_fetcher=None,
         poster=_dead_poster,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -3196,8 +3158,8 @@ def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_rejected_candidate,
-        status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -3227,8 +3189,8 @@ def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
         target_date=target_date,
         now=fixed_now,
         invoke=_fake_invoke_rejected_candidate,
-        status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result_2.exit_code == 0
@@ -3278,8 +3240,8 @@ def test_run_nightly_persists_a_corrections_only_night(tmp_path, monkeypatch):
         target_date=target_date,
         now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
         invoke=_fake_invoke_empty,
-        status_fetcher=None,
-        poster=lambda url, envelope: None,
+        poster=lambda url, arguments: None,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code == 0
@@ -3329,8 +3291,8 @@ def test_run_nightly_no_change_night_commits_nothing(tmp_path, caplog):
             target_date=target_date,
             now=fixed_now,
             invoke=_fake_invoke_empty,
-            status_fetcher=None,
-            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+            poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     assert result.exit_code == 0
@@ -3368,7 +3330,7 @@ def _crashing_build_digests(selected, **kwargs):
     return [ok_digest], [('session-1.jsonl', 'boom: corrupt transcript')]
 
 
-def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
+def test_run_nightly_fail_loud_on_extractor_crash(tmp_path):
     work_cwd = str(tmp_path / 'work')
     repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
 
@@ -3385,8 +3347,6 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
         ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
     ).stdout.splitlines()
 
-    monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
-
     coder_calls = []
 
     def _unexpected_invoke(prompt, model):
@@ -3402,8 +3362,9 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
         target_date=target_date,
         now=fixed_now,
         invoke=_unexpected_invoke,
-        status_fetcher=None,
-        poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        poster=lambda url, arguments: escalation_calls.append((url, arguments)),
+        digest_builder=_crashing_build_digests,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
     assert result.exit_code != 0
@@ -3411,8 +3372,7 @@ def test_run_nightly_fail_loud_on_extractor_crash(tmp_path, monkeypatch):
     assert coder_calls == []  # the coder must never be reached after a crash
 
     assert len(escalation_calls) == 1
-    url, envelope = escalation_calls[0]
-    arguments = envelope['params']['arguments']
+    url, arguments = escalation_calls[0]
     assert arguments['category'] == 'infra_issue'
     assert 'extractor' in arguments['summary'].lower()
     assert '1' in arguments['summary']
@@ -3462,7 +3422,7 @@ def test_main_run_with_config_invokes_run_nightly_and_returns_exit_code(monkeypa
 
     def _fake_run_nightly(**kwargs):
         calls.append(kwargs)
-        return nightly.NightlyResult(exit_code=0)
+        return _result()
 
     monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
 
@@ -3486,7 +3446,7 @@ def test_main_run_with_project_id_resolves_then_runs(monkeypatch):
 
     def _fake_run_nightly(**kwargs):
         calls.append(kwargs)
-        return nightly.NightlyResult(exit_code=0)
+        return _result()
 
     monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
 
@@ -3501,7 +3461,7 @@ def test_main_run_with_project_id_resolves_then_runs(monkeypatch):
 
 def test_main_run_propagates_fail_loud_exit_code(monkeypatch):
     def _fake_run_nightly(**kwargs):
-        return nightly.NightlyResult(exit_code=1, escalated=True, reason='boom')
+        return _result(_Outcome.FAILED, reason='boom')
 
     monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
 
@@ -3558,7 +3518,7 @@ def _main_run_with_stubbed_run_nightly(monkeypatch, tmp_path):
     ``(exit_code, effective_root_level, root_handler_count)`` sampled while
     still inside the isolated-root block."""
     def _fake_run_nightly(**kwargs):
-        return nightly.NightlyResult(exit_code=0)
+        return _result()
 
     monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
 
@@ -3688,15 +3648,42 @@ def test_configure_logging_env_var_still_wins_over_an_unknown_default_level(monk
 
 def _recorder_spy():
     """A ``recorder=`` seam spy that DELEGATES to the real
-    ``trickle_state.record_run``, so the assertions below run against real
+    ``trickle_state.write_night``, so the assertions below run against real
     classifier + streak output rather than a mock that could drift from it.
-    Returns (fn, calls) where each call is (kwargs, returned_doc)."""
+    Returns (fn, calls) where each call is (facts, returned_doc): *facts* is
+    the folded NightRun's fields with ``project_id`` and
+    ``barren_escalated``, and *returned_doc* is the JSON document written."""
+    calls = []
+
+    def _record(night, *, barren_escalated, completion_alarm_landed):
+        state = trickle_state.write_night(
+            night, barren_escalated=barren_escalated,
+            completion_alarm_landed=completion_alarm_landed,
+        )
+        facts = {
+            field.name: getattr(night.run, field.name)
+            for field in dataclasses.fields(night.run)
+        }
+        facts.update(project_id=night.state.project_id, barren_escalated=barren_escalated)
+        calls.append((facts, state.to_json()))
+        return state
+
+    return _record, calls
+
+
+def _retry_recorder_spy():
+    """The ``retry_recorder=`` counterpart of :func:`_recorder_spy`,
+    delegating to the real ``trickle_state.record_retry``; *facts* is its
+    keyword arguments with ``project_id``, and *returned_doc* is ``None``
+    when it wrote nothing."""
     calls = []
 
     def _record(project_id, **kwargs):
-        doc = trickle_state.record_run(project_id, **kwargs)
-        calls.append((dict(kwargs, project_id=project_id), doc))
-        return doc
+        state = trickle_state.record_retry(project_id, **kwargs)
+        calls.append(
+            (dict(kwargs, project_id=project_id), None if state is None else state.to_json())
+        )
+        return state
 
     return _record, calls
 
@@ -3718,22 +3705,34 @@ def _one_recorded(calls):
     return calls[0][1]
 
 
-# Spelled once: two of the four branch drivers patch a module global, so they
-# need the caller's own `monkeypatch` fixture handed in (the previous inline
-# form got it from each test's signature). Asserted per-arm rather than once up
-# front so the failure is loud AND the type checker can see the narrowing.
-_BRANCH_NEEDS_MONKEYPATCH = (
-    'the {!r} branch is driven by monkeypatching a module global; pass '
-    'monkeypatch= to _run_e2e_nightly'
-)
+def _mid_run_explosion(selected, **kwargs):
+    raise RuntimeError('synthetic mid-run explosion')
 
 
-def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
-                     branch=None, recorder=None, budget_bytes=None,
+def _seed_a_structurally_invalid_entry(repo: Path) -> None:
+    """Add an entry with an unknown severity to *repo*'s codebook. Loading
+    does not validate, so the night reaches the merge and fails there."""
+    codebook_path = repo / _CODEBOOK_RELPATH
+    cb = codebook.load(codebook_path)
+    cb['entries'].append({
+        'id': 'mis-severed', 'title': 'Mis Severed', 'severity': 'apocalyptic',
+        'status': 'open', 'origin_phase': 'implement',
+        'manifested_phase': 'implement', 'sightings': [],
+    })
+    codebook.dump(cb, codebook_path)
+
+
+_INVALID_SEVERITY_ERROR = "'apocalyptic' is not one of"
+
+
+def _run_e2e_nightly(tmp_path, *, branch=None, recorder=None, budget_bytes=None,
                      invoke=_fake_invoke_known_cause, committer=None, poster=None,
-                     transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+                     digest_builder=None, census_launcher=_no_census_launch,
+                     completion_runner=_passing_completion_runner,
+                     census_state: dict | None = None, transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
                      invariants_doc: str | None = None,
-                     unreadable_transcripts: bool = False):
+                     unreadable_transcripts: bool = False,
+                     pass_kind=nightly.PassKind.MANUAL):
     """Run ``run_nightly`` end to end on a real temp git repo + transcript and
     return ``(result, repo)``.
 
@@ -3742,32 +3741,40 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
     repo/transcript setup and the ``run_nightly`` kwargs exist exactly once
     and cannot drift when that signature changes.
 
-    *branch*, when given, drives the run down ONE named decision-8 fail-loud
-    branch, and THIS IS THE ONLY PLACE that knowledge lives — a fifth branch
-    added to ``run_nightly`` gets wired here once, not in each suite:
+    *branch*, when given, drives the run down ONE named branch, and THIS IS
+    THE ONLY PLACE that knowledge lives — a new branch added to
+    ``run_nightly`` gets wired here once, not in each suite:
 
-    * ``'extractor'``  — ``build_digests`` raises (needs *monkeypatch*)
+    * ``'extractor'``  — the injected digest builder reports a crashed session
     * ``'storm'``      — every digest's coding output is unparseable
-    * ``'capped'``     — every digest hits a usage cap (task 4736).  Not a
-      fail-loud branch: it returns ``exit_code=0``.  Wired here anyway so
-      the recorder and journaling parametrizations can reach it, since this
-      is the one place branch knowledge lives.
-    * ``'validation'`` — the merged codebook fails ``codebook.validate``
-      (needs *monkeypatch*)
+    * ``'capped'``     — every digest hits a usage cap (task 4736); exit 0
+    * ``'validation'`` — the seeded codebook carries a structurally invalid
+      entry, so the merged codebook fails ``codebook.validate``
     * ``'commit'``     — the committer fails
+    * ``'crash'``      — the injected digest builder raises outright
+    * ``'deletion'``   — the coder emits a deletion directive; exit 0
+    * ``'census'``     — census-state is :data:`_OLD_CENSUS`, so the census
+      trigger FIREs through *census_launcher*
 
     The other knobs shape a run that does NOT fail: *budget_bytes* rewrites
     the config with a digest byte budget small enough to suppress the whole
     night, *transcript=False* makes it a genuinely quiet one, *invariants_doc*
-    is committed as the project's design-invariants doc, and
-    *recorder* / *committer* / *poster* / *invoke* are the injected seams
-    (*poster* defaults to a no-op, so a test that does not care about
-    escalations never has to build one). *unreadable_transcripts* is the
-    exception: it strips every permission bit from the projects root for the
-    run, so enumerating the transcripts raises inside sampling.
+    is committed as the project's design-invariants doc, and *census_state*
+    is written as the repo's census-state.json. *recorder* / *committer* /
+    *poster* / *invoke* / *digest_builder* / *census_launcher* /
+    *completion_runner* are the injected seams; *poster* and
+    *census_launcher* default to no-ops and *completion_runner* to
+    :func:`_passing_completion_runner`, so a test that does not care about
+    escalations never builds a poster, and no night here can spawn census.py
+    or reach fused-memory. *pass_kind* (default ``MANUAL``) is
+    passed through. *unreadable_transcripts* is the exception: it strips
+    every permission bit from the projects root for the run, so enumerating
+    the transcripts raises inside sampling.
     """
     work_cwd = str(tmp_path / 'work')
     repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    if census_state is not None:
+        _write_census_state(repo, census_state)
     if invariants_doc is not None:
         doc_path = repo / invariants.DOC_RELPATH
         doc_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3798,30 +3805,36 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
         target_date=date(2026, 7, 13),
         now=now,
         invoke=invoke,
-        status_fetcher=None,
-        poster=poster if poster is not None else (lambda url, envelope: None),
+        poster=poster if poster is not None else (lambda url, arguments: None),
+        census_launcher=census_launcher,
+        completion_runner=completion_runner,
+        pass_kind=pass_kind,
     )
     if recorder is not None:
         kwargs['recorder'] = recorder
     if committer is not None:
         kwargs['committer'] = committer
+    if digest_builder is not None:
+        kwargs['digest_builder'] = digest_builder
 
     if branch == 'extractor':
-        assert monkeypatch is not None, _BRANCH_NEEDS_MONKEYPATCH.format(branch)
-        monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
+        kwargs['digest_builder'] = _crashing_build_digests
     elif branch == 'storm':
         kwargs['invoke'] = _fake_invoke_unparseable
     elif branch == 'capped':
         kwargs['invoke'] = _fake_invoke_capped
     elif branch == 'validation':
-        assert monkeypatch is not None, _BRANCH_NEEDS_MONKEYPATCH.format(branch)
-        monkeypatch.setattr(
-            codebook, 'validate', lambda cb: ['synthetic validation error'],
-        )
+        _seed_a_structurally_invalid_entry(repo)
     elif branch == 'commit':
         kwargs['committer'] = _failing_committer
+    elif branch == 'crash':
+        kwargs['digest_builder'] = _mid_run_explosion
+    elif branch == 'deletion':
+        kwargs['invoke'] = _fake_invoke_deletion_directive
+    elif branch == 'census':
+        _write_census_state(repo, _OLD_CENSUS)
     elif branch is not None:  # pragma: no cover - guards a typo'd branch id
-        raise AssertionError(f'unknown decision-8 branch {branch!r}')
+        raise AssertionError(f'unknown branch {branch!r}')
 
     try:
         if unreadable_transcripts:
@@ -3848,7 +3861,7 @@ class TestRunNightlyRecordsTrickleState:
         assert result.commit_made is True
 
         doc = _one_recorded(calls)
-        assert doc['outcome'] == 'productive'
+        assert doc['outcome'] == trickle_state.RunOutcome.PRODUCTIVE
         assert doc['consecutive_barren_runs'] == 0
         assert doc['commit_made'] is True
         assert doc['exit_code'] == 0
@@ -3867,7 +3880,7 @@ class TestRunNightlyRecordsTrickleState:
         assert result.budget_suppressed is True
 
         doc = _one_recorded(calls)
-        assert doc['outcome'] == 'barren'
+        assert doc['outcome'] == trickle_state.RunOutcome.BARREN
         assert doc['budget_suppressed'] is True
         assert doc['exit_code'] == 0
         assert doc['consecutive_barren_runs'] == 1
@@ -3882,19 +3895,17 @@ class TestRunNightlyRecordsTrickleState:
         assert result.budget_suppressed is False
 
         doc = _one_recorded(calls)
-        assert doc['outcome'] == 'quiet'
+        assert doc['outcome'] == trickle_state.RunOutcome.QUIET
         assert doc['consecutive_barren_runs'] == 0
         assert doc['exit_code'] == 0
 
-    def test_extractor_crash_still_records(self, tmp_path, monkeypatch):
+    def test_extractor_crash_still_records(self, tmp_path):
         recorder, calls = _recorder_spy()
-        result, _repo = _run_e2e_nightly(
-            tmp_path, monkeypatch=monkeypatch, branch='extractor', recorder=recorder,
-        )
+        result, _repo = _run_e2e_nightly(tmp_path, branch='extractor', recorder=recorder)
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
-        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['outcome'] == trickle_state.RunOutcome.FAILED
         assert doc['exit_code'] == 1
         assert doc['counters']['selected_count'] == 1
 
@@ -3907,19 +3918,17 @@ class TestRunNightlyRecordsTrickleState:
         assert result.exit_code == 1
         assert result.coder_status == 'failure'
         doc = _one_recorded(calls)
-        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['outcome'] == trickle_state.RunOutcome.FAILED
         assert doc['exit_code'] == 1
         assert doc['counters']['selected_count'] == 1
 
-    def test_codebook_validation_failure_still_records(self, tmp_path, monkeypatch):
+    def test_codebook_validation_failure_still_records(self, tmp_path):
         recorder, calls = _recorder_spy()
-        result, _repo = _run_e2e_nightly(
-            tmp_path, monkeypatch=monkeypatch, branch='validation', recorder=recorder,
-        )
+        result, _repo = _run_e2e_nightly(tmp_path, branch='validation', recorder=recorder)
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
-        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['outcome'] == trickle_state.RunOutcome.FAILED
         assert doc['exit_code'] == 1
         assert doc['commit_made'] is False
 
@@ -3931,23 +3940,21 @@ class TestRunNightlyRecordsTrickleState:
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
-        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['outcome'] == trickle_state.RunOutcome.FAILED
         assert doc['exit_code'] == 1
         assert doc['commit_made'] is False
 
-    def test_unexpected_exception_mid_run_still_records(self, tmp_path, monkeypatch):
+    def test_unexpected_exception_mid_run_still_records(self, tmp_path):
         """A crashed night that recorded NOTHING would let the progress
         probe read a stale streak as healthy. The boundary converts the
         exception into a failed, escalated result — recording is not
         swallowing."""
-        def _boom(selected, **kwargs):
-            raise RuntimeError('synthetic mid-run explosion')
-
-        monkeypatch.setattr(nightly, 'build_digests', _boom)
         recorder, calls = _recorder_spy()
         poster, posted = _capture_poster()
 
-        result, _repo = _run_e2e_nightly(tmp_path, recorder=recorder, poster=poster)
+        result, _repo = _run_e2e_nightly(
+            tmp_path, branch='crash', recorder=recorder, poster=poster,
+        )
 
         assert result.exit_code == 1
         assert result.escalated is True
@@ -3957,7 +3964,7 @@ class TestRunNightlyRecordsTrickleState:
         assert 'synthetic mid-run explosion' in arguments['summary']
         assert 'Traceback' in arguments['detail']
         doc = _one_recorded(calls)
-        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['outcome'] == trickle_state.RunOutcome.FAILED
         assert doc['exit_code'] != 0, (
             'a crashed night must record its crash honestly'
         )
@@ -3966,26 +3973,20 @@ class TestRunNightlyRecordsTrickleState:
             'are still recordable'
         )
 
-    def test_a_crash_keeps_what_the_night_had_already_established(
-        self, tmp_path, monkeypatch,
-    ):
+    def test_a_crash_keeps_what_the_night_had_already_established(self, tmp_path):
         """The sampler found a suppressed night and escalated it before the
         crash; neither fact may be lost, even when the crash's own POST
         fails."""
-        def _boom(selected, **kwargs):
-            raise RuntimeError('synthetic mid-run explosion')
-
-        monkeypatch.setattr(nightly, 'build_digests', _boom)
         recorder, calls = _recorder_spy()
         posted = []
 
-        def _server_gone_after_the_first_post(url, envelope):
+        def _server_gone_after_the_first_post(url, arguments):
             if posted:
                 raise ConnectionError('escalation server went away')
-            posted.append(envelope)
+            posted.append(arguments)
 
         result, _repo = _run_e2e_nightly(
-            tmp_path, recorder=recorder, budget_bytes=10,
+            tmp_path, branch='crash', recorder=recorder, budget_bytes=10,
             poster=_server_gone_after_the_first_post,
         )
 
@@ -4013,7 +4014,7 @@ class TestRunNightlyRecordsTrickleState:
         assert result.escalated is True
         assert 'PermissionError' in _one_escalation(posted)['summary']
         doc = _one_recorded(calls)
-        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['outcome'] == trickle_state.RunOutcome.FAILED
         assert doc['exit_code'] == 1
         assert doc['target_date'] == '2026-07-13'
         assert doc['consecutive_failed_runs'] == 1
@@ -4033,11 +4034,12 @@ class TestRunNightlyRecordsTrickleState:
             nightly.run_nightly(
                 project_id='testproj', target_date=date(2026, 7, 13),
                 now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC), recorder=recorder,
+                pass_kind=nightly.PassKind.MANUAL,
             )
 
         doc = _one_recorded(calls)
         assert calls[0][0]['project_id'] == 'testproj'
-        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['outcome'] == trickle_state.RunOutcome.FAILED
         assert doc['exit_code'] == 1
         assert doc['target_date'] == '2026-07-13'
         assert doc['consecutive_failed_runs'] == 1
@@ -4051,6 +4053,7 @@ class TestRunNightlyRecordsTrickleState:
             nightly.run_nightly(
                 config_path=config_path, target_date=date(2026, 7, 13),
                 now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC), recorder=recorder,
+                pass_kind=nightly.PassKind.MANUAL,
             )
 
         assert calls == []
@@ -4084,7 +4087,7 @@ class TestRunNightlyRecordsTrickleState:
         assert result.exit_code == 1
         assert result.escalated is True
         assert 'OSError' in _one_escalation(posted)['summary']
-        assert _one_recorded(calls)['outcome'] == trickle_state.OUTCOME_FAILED
+        assert _one_recorded(calls)['outcome'] == trickle_state.RunOutcome.FAILED
 
     def test_a_crash_after_selecting_digests_records_failed_not_productive(
         self, tmp_path
@@ -4101,7 +4104,7 @@ class TestRunNightlyRecordsTrickleState:
 
         assert result.exit_code == 1
         doc = _one_recorded(calls)
-        assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+        assert doc['outcome'] == trickle_state.RunOutcome.FAILED
         assert doc['exit_code'] == 1
         assert doc['counters']['selected_count'] >= 1, (
             'signal reached the digest stage; the counters must still say so'
@@ -4120,7 +4123,7 @@ class TestRunNightlyRecordsTrickleState:
         recorder, calls = _recorder_spy()
         clean, _repo = _run_e2e_nightly(tmp_path, recorder=recorder)
         assert clean.exit_code == 0
-        assert _one_recorded(calls)['outcome'] == trickle_state.OUTCOME_PRODUCTIVE
+        assert _one_recorded(calls)['outcome'] == trickle_state.RunOutcome.PRODUCTIVE
 
         storm_dir = tmp_path / 'storm'
         storm_dir.mkdir()
@@ -4132,12 +4135,12 @@ class TestRunNightlyRecordsTrickleState:
             'the fail-loud branch owns the exit code; recording must not '
             'move it in either direction'
         )
-        assert _one_recorded(calls)['outcome'] == trickle_state.OUTCOME_FAILED
+        assert _one_recorded(calls)['outcome'] == trickle_state.RunOutcome.FAILED
 
     def test_a_raising_recorder_never_breaks_the_run(self, tmp_path, caplog):
         """Observability must never become a new failure mode — mirroring
-        post_escalation's established best-effort contract."""
-        def _raising_recorder(project_id, **kwargs):
+        the alarm's best-effort contract."""
+        def _raising_recorder(night, *, barren_escalated, completion_alarm_landed):
             raise OSError('synthetic state-write failure')
 
         with caplog.at_level('WARNING', logger='legibility.nightly'):
@@ -4149,42 +4152,623 @@ class TestRunNightlyRecordsTrickleState:
             r.levelname == 'WARNING' for r in caplog.records
         ), 'a swallowed state-write failure must still be announced once'
 
+    def test_the_recorder_receives_the_night_and_the_escalation_fact(self, tmp_path):
+        received = []
+
+        def _record(night, *, barren_escalated, completion_alarm_landed):
+            received.append((night, barren_escalated, completion_alarm_landed))
+            return trickle_state.write_night(
+                night, barren_escalated=barren_escalated,
+                completion_alarm_landed=completion_alarm_landed,
+            )
+
+        _run_e2e_nightly(tmp_path, recorder=_record)
+
+        [(night, barren_escalated, completion_alarm_landed)] = received
+        assert isinstance(night, trickle_state.NightFold)
+        assert night.state.project_id == 'testproj'
+        assert night.run.outcome == trickle_state.RunOutcome.PRODUCTIVE
+        assert night.state.outcome == trickle_state.RunOutcome.PRODUCTIVE
+        assert barren_escalated is False
+        assert completion_alarm_landed is False
+
+    def test_the_state_the_recorder_returns_schedules_the_retries(self, tmp_path):
+        owed = date(2026, 7, 12)
+
+        def _record_owing(night, *, barren_escalated, completion_alarm_landed):
+            state = trickle_state.write_night(
+                night, barren_escalated=barren_escalated,
+                completion_alarm_landed=completion_alarm_landed,
+            )
+            return dataclasses.replace(state, retry_backlog={owed: 1})
+
+        result, _repo = _run_e2e_nightly(tmp_path, recorder=_record_owing)
+
+        assert result.retry_due == (owed,)
+
+    def test_a_capped_night_records_deferred(self, tmp_path):
+        recorder, calls = _recorder_spy()
+
+        result, _repo = _run_e2e_nightly(tmp_path, branch='capped', recorder=recorder)
+
+        assert result.exit_code == 0
+        doc = _one_recorded(calls)
+        assert doc['outcome'] == trickle_state.RunOutcome.DEFERRED
+        assert doc['capped'] is True
+        assert doc['barren_escalated'] is False
+
     def test_wired_for_real_end_to_end(self, tmp_path):
         """No recorder= override: the two modules are wired together for
         real, not just against a spy."""
         result, _repo = _run_e2e_nightly(tmp_path)
         assert result.exit_code == 0
 
-        status, doc = trickle_state.load_state(
-            trickle_state.trickle_state_path('testproj')
-        )
-        assert status == 'ok', f'expected a real state file; got {status!r}'
-        assert doc is not None
+        doc = _testproj_state()
         assert doc['project_id'] == 'testproj'
-        assert doc['outcome'] == 'productive'
+        assert doc['outcome'] == trickle_state.RunOutcome.PRODUCTIVE
         assert doc['target_date'] == '2026-07-13'
+
+
+_CHECK_CENSUS_PROGRESS = (
+    Path(__file__).parent.parent / 'legibility' / 'check_census_progress.py'
+)
+
+
+def _census_state(repo: Path) -> Path:
+    return repo / 'docs' / 'legibility' / 'census-state.json'
+
+
+def _write_census_state(repo: Path, state: dict) -> None:
+    _census_state(repo).write_text(json.dumps(state), encoding='utf-8')
+
+
+def _run_census_progress_probe(project_id: str, threshold: int):
+    """The REAL predicate by subprocess. It inherits this process's
+    environment, so it reads the conftest-isolated state root."""
+    return subprocess.run(
+        [sys.executable, str(_CHECK_CENSUS_PROGRESS), project_id, str(threshold)],
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+class TestRunNightlyRecordsTheCensusObservation:
+    """The nightly records what the census trigger did, so
+    check_census_progress.py can tell a FIRE whose census never advanced
+    census-state from one whose census landed.
+
+    A night reaching a FIRE seeds :data:`_OLD_CENSUS`, and every night here
+    launches through an injected recording launcher.
+    """
+
+    def test_a_no_fire_night_records_census_fired_false(self, tmp_path):
+        """Never censused: the floor anchors on the codebook's earliest
+        date, the night's own 2026-07-13 sighting, one day before now and
+        inside floor_days=5."""
+        launcher, launches = _recording_census_launcher()
+        recorder, calls = _recorder_spy()
+
+        result, _repo = _run_e2e_nightly(
+            tmp_path, recorder=recorder, census_launcher=launcher,
+        )
+
+        assert result.census_fire is False
+        assert launches == []
+        doc = _one_recorded(calls)
+        assert doc['census_fired'] is False
+        assert doc['census_fire_streak'] is None
+
+    def test_a_fire_night_records_the_streak(self, tmp_path):
+        launcher, launches = _recording_census_launcher()
+        runner = _NightRunner(tmp_path, census_launcher=launcher)
+        _write_census_state(runner.repo, _OLD_CENSUS)
+
+        result = runner.night(13, 'quiet')
+
+        assert result.census_fire is True
+        assert len(launches) == 1
+        doc = runner.recorded()
+        assert doc['census_fired'] is True
+        assert doc['census_fire_streak'] == {
+            'fires': 1,
+            'last_census_at': '2026-06-01',
+            'census_state_path': str(_census_state(runner.repo)),
+            'since': '2026-07-13',
+        }
+
+    def test_the_anchor_is_read_before_the_synchronous_launch(self, tmp_path):
+        """A census that lands rewrites census-state INSIDE the launch; an
+        anchor read afterwards would equal the new value and a census that
+        advanced would read as unadvanced."""
+        launcher, _launches = _recording_census_launcher(
+            on_launch=lambda root: _write_census_state(
+                root, {'last_census_at': '2026-07-14'},
+            ),
+        )
+        runner = _NightRunner(tmp_path, census_launcher=launcher)
+        _write_census_state(runner.repo, _OLD_CENSUS)
+
+        runner.night(13, 'quiet')
+
+        assert json.loads(_census_state(runner.repo).read_text())[
+            'last_census_at'] == '2026-07-14'
+        assert runner.recorded()['census_fire_streak'][
+            'last_census_at'] == '2026-06-01'
+
+    def test_a_malformed_census_state_warns_once_per_night(self, tmp_path, caplog):
+        """The trigger's own read owns the malformed WARNING; the anchor
+        read must not repeat it in the journal."""
+        launcher, launches = _recording_census_launcher()
+        runner = _NightRunner(tmp_path, census_launcher=launcher)
+        _census_state(runner.repo).write_text('{not json', encoding='utf-8')
+
+        with caplog.at_level('WARNING'):
+            runner.night(13, 'quiet')
+
+        state_path = str(_census_state(runner.repo))
+        malformed = [
+            r.getMessage() for r in caplog.records
+            if state_path in r.getMessage()
+        ]
+        assert len(malformed) == 1, malformed
+        assert launches == []
+        assert runner.recorded()['census_fired'] is False
+
+    @pytest.mark.parametrize('branch', ['storm', 'capped'])
+    def test_a_night_that_returns_before_the_census_step_records_none(
+        self, tmp_path, branch,
+    ):
+        launcher, launches = _recording_census_launcher()
+        recorder, calls = _recorder_spy()
+
+        _run_e2e_nightly(
+            tmp_path, branch=branch, recorder=recorder, census_state=_OLD_CENSUS,
+            census_launcher=launcher,
+        )
+
+        assert launches == []
+        doc = _one_recorded(calls)
+        assert doc['census_fired'] is None
+        assert doc['census_fire_streak'] is None
+
+    def test_a_project_whose_config_does_not_load_records_none(
+        self, tmp_path, monkeypatch,
+    ):
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+        recorder, calls = _recorder_spy()
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13),
+                now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC), recorder=recorder,
+                pass_kind=nightly.PassKind.MANUAL,
+            )
+
+        doc = _one_recorded(calls)
+        assert doc['census_fired'] is None
+        assert doc['census_fire_streak'] is None
+
+    def test_a_night_without_a_census_step_carries_the_streak(self, tmp_path):
+        launcher, _launches = _recording_census_launcher()
+        runner = _NightRunner(tmp_path, census_launcher=launcher)
+        _write_census_state(runner.repo, _OLD_CENSUS)
+
+        runner.night(13, 'quiet')
+        fired = runner.recorded()['census_fire_streak']
+        stormed = runner.night(14, 'storm')
+
+        assert stormed.exit_code == 1
+        doc = runner.recorded()
+        assert doc['census_fired'] is None
+        assert doc['census_fire_streak'] == fired
+        assert fired['fires'] == 1
+
+    def test_unadvanced_fires_through_the_real_pipeline_are_flagged(self, tmp_path):
+        """ACCEPTANCE: three quiet FIRE nights whose census never advanced."""
+        launcher, launches = _recording_census_launcher()
+        runner = _NightRunner(tmp_path, census_launcher=launcher)
+        _write_census_state(runner.repo, _OLD_CENSUS)
+
+        for day in (13, 14, 15):
+            runner.night(day, 'quiet')
+
+        assert len(launches) == 3
+        assert runner.recorded()['census_fire_streak']['fires'] == 3
+        probe = _run_census_progress_probe('testproj', 3)
+        assert probe.returncode != 0, (
+            f'stdout={probe.stdout!r} stderr={probe.stderr!r}'
+        )
+        assert '2026-06-01' in probe.stderr
+
+    def test_a_census_that_advanced_through_the_real_pipeline_passes(self, tmp_path):
+        """The inverse: night 13's census lands, so nights 14 and 15 are
+        NO-FIRE inside the stock floor_days=5."""
+        launcher, _launches = _recording_census_launcher(
+            on_launch=lambda root: _write_census_state(root, {
+                'last_census_at': '2026-07-14',
+                'session_watermark': '2026-07-14T00:00:00+00:00',
+            }),
+        )
+        runner = _NightRunner(tmp_path, census_launcher=launcher)
+        _write_census_state(runner.repo, _OLD_CENSUS)
+
+        fires = [runner.night(day, 'quiet').census_fire for day in (13, 14, 15)]
+
+        assert fires == [True, False, False]
+        assert runner.recorded()['census_fire_streak'] is None
+        probe = _run_census_progress_probe('testproj', 3)
+        assert probe.returncode == 0, (
+            f'stdout={probe.stdout!r} stderr={probe.stderr!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 6745: a night's outcome is one typed value, and its posted alarms are
+# one list (boundary row 8)
+# ---------------------------------------------------------------------------
+
+_Outcome = trickle_state.RunOutcome
+_Kind = nightly.AlarmKind
+
+
+def _result(outcome=_Outcome.PRODUCTIVE, **fields):
+    """A hand-built :class:`nightly.NightlyResult` for project testproj."""
+    return nightly.NightlyResult(
+        project_id='testproj', target_date=date(2026, 7, 13),
+        pass_kind=nightly.PassKind.MANUAL, outcome=outcome, **fields,
+    )
+
+
+def _alarm(kind, *, landed=True):
+    return nightly.Alarm(kind=kind, summary=f'legibility trickle {kind}', landed=landed)
+
+
+def _refusing_poster(url, arguments):
+    raise ConnectionError('escalation server is down')
+
+
+class TestNightlyResultIsOneTypedOutcome:
+
+    @pytest.mark.parametrize('outcome', list(_Outcome))
+    def test_exit_code_is_one_iff_the_night_failed(self, outcome):
+        assert _result(outcome).exit_code == (1 if outcome is _Outcome.FAILED else 0)
+
+    @pytest.mark.parametrize('outcome', list(_Outcome))
+    def test_capped_iff_the_night_was_deferred(self, outcome):
+        assert _result(outcome).capped is (outcome is _Outcome.DEFERRED)
+
+    @pytest.mark.parametrize(
+        'landed', [(), (False,), (True,), (False, True)], ids=['none', 'refused', 'landed', 'mixed'],
+    )
+    def test_escalated_iff_an_alarm_landed(self, landed):
+        alarms = tuple(_alarm(_Kind.CODER_STORM, landed=flag) for flag in landed)
+
+        result = _result(_Outcome.FAILED, alarms=alarms)
+
+        assert result.escalated is any(landed)
+
+    @pytest.mark.parametrize(
+        ('alarms', 'expected'),
+        [
+            ((_alarm(_Kind.BARREN_STREAK),), True),
+            ((_alarm(_Kind.BARREN_STREAK, landed=False),), False),
+            ((_alarm(_Kind.BUDGET_SUPPRESSED),), False),
+            ((), False),
+        ],
+        ids=['streak-landed', 'streak-refused', 'other-kind-landed', 'none'],
+    )
+    def test_barren_escalated_iff_a_barren_streak_alarm_landed(self, alarms, expected):
+        assert _result(_Outcome.BARREN, alarms=alarms).barren_escalated is expected
+
+    @pytest.mark.parametrize('field', ['outcome', 'alarms', 'retry_due'])
+    def test_the_result_is_frozen(self, field):
+        result = _result()
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(result, field, None)
+
+    @pytest.mark.parametrize(
+        ('kind', 'level'),
+        [
+            (_Kind.EXTRACTOR_CRASH, logging.ERROR),
+            (_Kind.CODER_STORM, logging.ERROR),
+            (_Kind.VALIDATION_FAILED, logging.ERROR),
+            (_Kind.COMMIT_FAILED, logging.ERROR),
+            (_Kind.CRASHED, logging.ERROR),
+            (_Kind.BUDGET_SUPPRESSED, logging.WARNING),
+            (_Kind.CODER_DEFERRED, logging.WARNING),
+            (_Kind.DELETION_DIRECTIVE, logging.WARNING),
+            (_Kind.BARREN_STREAK, logging.WARNING),
+        ],
+    )
+    def test_an_alarm_kind_carries_its_journal_level(self, kind, level):
+        assert kind.level == level
+
+    @pytest.mark.parametrize(
+        ('invariant', 'outcome', 'field', 'value'),
+        [
+            pytest.param(
+                'rollback-implies-failed', _Outcome.PRODUCTIVE, 'rollback',
+                unlanded.Rollback(quarantine_dir=None, paths=('codebook.yaml',)),
+                id='rollback',
+            ),
+            pytest.param(
+                'commit-implies-productive', _Outcome.QUIET, 'commit_made', True, id='commit',
+            ),
+            pytest.param(
+                'retry-due-implies-finished', _Outcome.FAILED, 'retry_due',
+                (date(2026, 7, 12),), id='retry-after-failed',
+            ),
+            pytest.param(
+                'retry-due-implies-finished', _Outcome.DEFERRED, 'retry_due',
+                (date(2026, 7, 12),), id='retry-after-deferred',
+            ),
+            pytest.param(
+                'budget-suppressed-implies-barren-or-failed', _Outcome.PRODUCTIVE,
+                'budget_suppressed', True, id='budget-suppressed',
+            ),
+        ],
+    )
+    def test_an_impossible_combination_is_refused_by_name(
+        self, invariant, outcome, field, value,
+    ):
+        with pytest.raises(ValueError) as refused:
+            _result(outcome, **{field: value})
+
+        message = str(refused.value)
+        assert f'NightlyResult invariant {invariant} violated' in message
+        assert f'outcome={outcome}' in message
+        assert f'{field}={value!r}' in message
+
+    @pytest.mark.parametrize(
+        ('outcome', 'fields'),
+        [
+            (_Outcome.FAILED, dict(rollback=unlanded.Rollback(quarantine_dir=None, paths=()))),
+            (_Outcome.PRODUCTIVE, dict(commit_made=True, retry_due=(date(2026, 7, 12),))),
+            (_Outcome.BARREN, dict(budget_suppressed=True, retry_due=(date(2026, 7, 12),))),
+            (_Outcome.FAILED, dict(budget_suppressed=True)),
+        ],
+        ids=['rollback-failed', 'commit-productive', 'suppressed-barren', 'suppressed-failed'],
+    )
+    def test_a_possible_combination_constructs(self, outcome, fields):
+        assert _result(outcome, **fields).outcome is outcome
+
+
+_BRANCH_MATRIX = [
+    pytest.param(dict(transcript=False), _Outcome.QUIET, [], id='quiet'),
+    pytest.param({}, _Outcome.PRODUCTIVE, [], id='productive'),
+    pytest.param(
+        dict(budget_bytes=10), _Outcome.BARREN, [_Kind.BUDGET_SUPPRESSED], id='budget',
+    ),
+    pytest.param(
+        dict(branch='capped'), _Outcome.DEFERRED, [_Kind.CODER_DEFERRED], id='capped',
+    ),
+    pytest.param(dict(branch='storm'), _Outcome.FAILED, [_Kind.CODER_STORM], id='storm'),
+    pytest.param(
+        dict(branch='extractor'), _Outcome.FAILED, [_Kind.EXTRACTOR_CRASH], id='extractor',
+    ),
+    pytest.param(
+        dict(branch='deletion'), _Outcome.PRODUCTIVE, [_Kind.DELETION_DIRECTIVE],
+        id='deletion',
+    ),
+    pytest.param(
+        dict(branch='validation'), _Outcome.FAILED, [_Kind.VALIDATION_FAILED],
+        id='validation',
+    ),
+    pytest.param(dict(branch='commit'), _Outcome.FAILED, [_Kind.COMMIT_FAILED], id='commit'),
+    pytest.param(dict(branch='crash'), _Outcome.FAILED, [_Kind.CRASHED], id='crash'),
+    pytest.param(dict(branch='census'), _Outcome.PRODUCTIVE, [], id='census'),
+]
+
+
+class TestEveryBranchIsOneOutcomeAndOneAlarmList:
+    """BOUNDARY ROW 8, over injected stages only: every branch ends in one
+    typed outcome, the one the night records, and its posted alarms in one
+    list, whether or not the escalation server takes them."""
+
+    @pytest.mark.parametrize('lands', [True, False], ids=['landing', 'refusing'])
+    @pytest.mark.parametrize(('knobs', 'outcome', 'kinds'), _BRANCH_MATRIX)
+    def test_a_branch(self, tmp_path, knobs, outcome, kinds, lands):
+        poster, posted = _capture_poster()
+        recorder, calls = _recorder_spy()
+        launcher, launches = _recording_census_launcher()
+
+        result, _repo = _run_e2e_nightly(
+            tmp_path, recorder=recorder, census_launcher=launcher,
+            poster=poster if lands else _refusing_poster, **knobs,
+        )
+
+        assert result.outcome is outcome
+        assert result.exit_code == (1 if outcome is _Outcome.FAILED else 0)
+        assert [alarm.kind for alarm in result.alarms] == kinds
+        if lands:
+            assert result.escalated is bool(posted)
+            assert len(posted) == sum(alarm.landed for alarm in result.alarms)
+        else:
+            assert [alarm.landed for alarm in result.alarms] == [False] * len(kinds)
+            assert result.escalated is False
+        assert _one_recorded(calls)['outcome'] == result.outcome
+        assert result.census_fire is (knobs.get('branch') == 'census')
+        assert len(launches) == int(result.census_fire)
+
+    @pytest.mark.parametrize('lands', [True, False], ids=['landing', 'refusing'])
+    def test_the_barren_streak(self, tmp_path, lands):
+        recorder, calls = _recorder_spy()
+        runner = _NightRunner(
+            tmp_path, recorder=recorder,
+            on_post=None if lands else (lambda arguments: _refusing_poster('', arguments)),
+        )
+        for day in (13, 14):
+            runner.night(day, 'barren')
+        posted_before = len(runner.escalations)
+
+        third = runner.night(15, 'barren')
+
+        assert third.outcome is _Outcome.BARREN
+        assert third.exit_code == 0
+        assert [alarm.kind for alarm in third.alarms] == [
+            _Kind.BUDGET_SUPPRESSED, _Kind.BARREN_STREAK,
+        ]
+        assert [alarm.landed for alarm in third.alarms] == [lands, lands]
+        assert third.barren_escalated is lands
+        assert third.escalated is lands
+        assert len(runner.escalations) - posted_before == 2
+        assert calls[-1][1]['outcome'] == third.outcome
+
+
+def test_a_crash_keeps_every_alarm_posted_before_it(tmp_path):
+    """A suppressed night whose digest stage raises: the budget alarm was
+    posted before the crash, so it survives in the one list, and it landed
+    even though the crash's own post did not."""
+    posted = []
+
+    def _server_gone_after_the_first_post(url, arguments):
+        if posted:
+            raise ConnectionError('escalation server went away')
+        posted.append(arguments)
+
+    result, _repo = _run_e2e_nightly(
+        tmp_path, branch='crash', budget_bytes=10, poster=_server_gone_after_the_first_post,
+    )
+
+    assert result.outcome is _Outcome.FAILED
+    assert [(alarm.kind, alarm.landed) for alarm in result.alarms] == [
+        (_Kind.BUDGET_SUPPRESSED, True), (_Kind.CRASHED, False),
+    ]
+    assert result.escalated is True
+    assert 'synthetic mid-run explosion' in (result.reason or '')
+
+
+class TestEveryPassEndsWithOneJournalLine:
+    """The pass's last nightly journal line is its NightlyResult, rendered
+    by the value itself."""
+
+    @staticmethod
+    def _journal_lines(caplog) -> list[str]:
+        return [
+            record.getMessage() for record in caplog.records
+            if record.name == 'legibility.nightly' and ' outcome=' in record.getMessage()
+        ]
+
+    def test_the_value_renders_its_own_line(self):
+        result = _result(
+            applied=1, commit_made=True, alarms=(_alarm(_Kind.DELETION_DIRECTIVE),),
+        )
+
+        assert result.journal_line() == (
+            'legibility trickle: 2026-07-13 outcome=productive alarms=1 landed=1 '
+            'project=testproj pass=manual exit_code=0 applied=1 commit_made=True '
+            'census_fire=False retry_due=0'
+        )
+
+    @pytest.mark.parametrize('branch', [None, 'storm', 'capped'])
+    def test_it_is_the_last_line_a_pass_journals(self, tmp_path, caplog, branch):
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            result, _repo = _run_e2e_nightly(tmp_path, branch=branch)
+
+        nightly_messages = [
+            record.getMessage() for record in caplog.records
+            if record.name == 'legibility.nightly'
+        ]
+        assert nightly_messages[-1] == result.journal_line()
+        assert nightly_messages.count(result.journal_line()) == 1
+
+    def test_a_scheduled_night_and_its_retry_each_journal_their_own(self, tmp_path, caplog):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            results = runner.scheduled_night(14, 'productive')
+
+        assert [result.pass_kind for result in results] == [
+            nightly.PassKind.SCHEDULED, nightly.PassKind.RETRY,
+        ]
+        lines = self._journal_lines(caplog)
+        assert lines == [result.journal_line() for result in results]
+        assert ['pass=scheduled' in lines[0], 'pass=retry' in lines[1]] == [True, True]
+
+    @pytest.mark.usefixtures('unreached_fused_memory')
+    def test_the_systemd_entry_journals_it(self, tmp_path, monkeypatch, caplog):
+        _spy_census_subprocess_and_stub_pool(monkeypatch)
+        config_path = _write_config(tmp_path, project_id='proj_a')
+        projects_root = tmp_path / 'projects'
+        projects_root.mkdir()
+
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            exit_code = nightly.main([
+                'run', '--config', str(config_path),
+                '--projects-root', str(projects_root), '--date', '2026-07-13',
+            ])
+
+        assert exit_code == 0
+        [line] = self._journal_lines(caplog)
+        assert line.startswith('legibility trickle: 2026-07-13 outcome=quiet ')
+        assert ' project=proj_a pass=manual ' in line
 
 
 # ---------------------------------------------------------------------------
 # task 3340 step-11/12: edge-triggered barren-streak escalation
 # ---------------------------------------------------------------------------
 
-def _streak_escalations(calls):
-    """Escalations posted by the STREAK trigger, distinguished from
+def _is_streak_escalation(arguments) -> bool:
+    """Whether *arguments* was posted by the STREAK trigger, as distinct from
     _report_sample_outcome's per-night suppression notice (a different
-    predicate, window and remedy prompt, posted on the same envelope)."""
-    return [
-        (url, env) for url, env in calls
-        if 'consecutive' in env['params']['arguments']['summary'].lower()
-    ]
+    predicate, window and remedy prompt, posted through the same alarm)."""
+    return 'consecutive' in arguments['summary'].lower()
+
+
+def _streak_escalations(calls):
+    return [(url, env) for url, env in calls if _is_streak_escalation(env)]
+
+
+_CHECK_TRICKLE_PROGRESS = (
+    Path(__file__).parent.parent / 'legibility' / 'check_trickle_progress.py'
+)
+
+_FIXTURE_CLOCK_EPOCH = datetime(2026, 7, 1, tzinfo=UTC)
+
+
+def _fixture_clock_window_hours() -> int:
+    """A freshness window reaching back to the fixtures' fixed July 2026
+    clock, so a probe reads the streak's verdict, never the stale one."""
+    return int((datetime.now(UTC) - _FIXTURE_CLOCK_EPOCH).total_seconds() // 3600) + 48
+
+
+def _run_trickle_progress_probe(project_id: str, threshold: int):
+    """The REAL progress probe by subprocess, over the conftest-isolated
+    state root, at :func:`_fixture_clock_window_hours`."""
+    return subprocess.run(
+        [sys.executable, str(_CHECK_TRICKLE_PROGRESS), project_id,
+         str(threshold), str(_fixture_clock_window_hours())],
+        capture_output=True, text=True, timeout=30,
+    )
+
+
+def _testproj_state() -> dict:
+    """The state document the real recorder last wrote for 'testproj'."""
+    read = trickle_state.load_state(trickle_state.trickle_state_path('testproj'))
+    assert isinstance(read, state_docs.Ok), f'no readable state: {read!r}'
+    return read.value.to_json()
 
 
 class _NightRunner:
     """Drive REAL consecutive run_nightly calls against one repo, so the
     streak is built by the actual pipeline + recorder rather than a
-    hand-seeded state file."""
+    hand-seeded state file.
 
-    def __init__(self, tmp_path):
+    Every scheduled or manual night records through *recorder* (default the
+    real one) and escalates at *max_barren_runs*. Every post is collected in
+    ``escalations`` and then handed to *on_post*, which may raise to play a
+    failed post. Every pass launches a census through *census_launcher*
+    (default a no-op) and reads the previous run's completion through
+    *completion_runner* (default :func:`_passing_completion_runner`)."""
+
+    def __init__(
+        self, tmp_path, *, recorder=None,
+        max_barren_runs: int = trickle_state.DEFAULT_MAX_BARREN_RUNS,
+        on_post=None, census_launcher=_no_census_launch,
+        completion_runner=_passing_completion_runner,
+    ):
         self.tmp_path = tmp_path
         self.work_cwd = str(tmp_path / 'work')
         self.repo, self.config_path = _init_e2e_repo(
@@ -4193,19 +4777,46 @@ class _NightRunner:
         self.projects_root = tmp_path / 'projects'
         self.projects_root.mkdir(parents=True, exist_ok=True)
         self.escalations = []
+        self.recorder = recorder
+        self.max_barren_runs = max_barren_runs
+        self.on_post = on_post
+        self.census_launcher = census_launcher
+        self.completion_runner = completion_runner
 
-    def night(self, day, kind):
+    def _post(self, url, arguments):
+        self.escalations.append((url, arguments))
+        if self.on_post is not None:
+            self.on_post(arguments)
+
+    def night(self, day, kind, *, invoke=None):
         """Run one night. *kind* is 'barren' (real signal, squeezed budget),
         'productive' (real signal, stock budget), 'quiet' (no sessions at
-        all for this date) or 'storm' (real signal, every digest's coding
-        output unparseable, so the night exits 1 and records ``failed``)."""
-        target = date(2026, 7, day)
+        all for this date), 'storm' (real signal, every digest's coding
+        output unparseable, so the night exits 1 and records ``failed``) or
+        'capped' (real signal, every digest hits a usage cap, so the night
+        is deferred at exit 0). *invoke* replaces the kind's coder."""
+        self._prepare(day, kind)
+        return nightly.run_nightly(
+            **self._pass_kwargs(day, on_night=day, invoke=invoke or self._coder(kind)),
+            pass_kind=nightly.PassKind.MANUAL, recorder=self.recorder,
+        )
+
+    def scheduled_night(self, day, kind, *, retry_recorder=None):
+        """Run night *day* as main() does for an undated run: through
+        run_scheduled_night, so any retry the backlog owes runs too."""
+        self._prepare(day, kind)
+        return nightly.run_scheduled_night(
+            **self._pass_kwargs(day, on_night=day, invoke=self._coder(kind)),
+            recorder=self.recorder, retry_recorder=retry_recorder,
+        )
+
+    def _prepare(self, day, kind):
         _write_config(
             self.repo, project_id='testproj', escalation_port=8199,
             cwd_prefixes=[self.work_cwd],
             max_daily_digest_bytes=10 if kind == 'barren' else None,
         )
-        if kind in ('barren', 'productive', 'storm'):
+        if kind in ('barren', 'productive', 'storm', 'capped'):
             _write_transcript(
                 self.projects_root / _encode_cwd(self.work_cwd)
                 / f'session-{day}.jsonl',
@@ -4213,27 +4824,41 @@ class _NightRunner:
                 timestamp=f'2026-07-{day:02d}T10:00:00Z',
                 session_id=f'session-{day}',
             )
+
+    @staticmethod
+    def _coder(kind):
+        if kind == 'storm':
+            return _fake_invoke_unparseable
+        if kind == 'capped':
+            return _fake_invoke_capped
+        return _fake_invoke_known_cause
+
+    def retry(self, day, *, on_night, invoke=_fake_invoke_known_cause,
+              recorder=None, retry_recorder=None):
+        """Run night *on_night*'s retry pass of *day*'s date, on that night's
+        clock, over the config and transcripts already on disk."""
         return nightly.run_nightly(
+            **self._pass_kwargs(day, on_night=on_night, invoke=invoke),
+            pass_kind=nightly.PassKind.RETRY,
+            recorder=recorder, retry_recorder=retry_recorder,
+        )
+
+    def _pass_kwargs(self, day, *, on_night, invoke) -> dict[str, Any]:
+        return dict(
             config_path=self.config_path,
             projects_root=self.projects_root,
-            target_date=target,
-            now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=UTC),
-            invoke=(
-                _fake_invoke_unparseable if kind == 'storm'
-                else _fake_invoke_known_cause
-            ),
-            status_fetcher=None,
-            poster=lambda url, env: self.escalations.append((url, env)),
+            target_date=date(2026, 7, day),
+            now=datetime(2026, 7, on_night + 1, 3, 0, 0, tzinfo=UTC),
+            invoke=invoke,
+            poster=self._post,
+            census_launcher=self.census_launcher,
+            completion_runner=self.completion_runner,
+            max_barren_runs=self.max_barren_runs,
         )
 
     def recorded(self):
         """The state document the REAL recorder just wrote for this run."""
-        status, doc = trickle_state.load_state(
-            trickle_state.trickle_state_path('testproj')
-        )
-        assert (status, doc) != ('missing', None), 'no run recorded yet'
-        assert doc is not None
-        return doc
+        return _testproj_state()
 
 
 class TestBarrenStreakEscalation:
@@ -4256,7 +4881,7 @@ class TestBarrenStreakEscalation:
 
         runner.night(13, 'productive')
         first = runner.recorded()
-        assert first['outcome'] == trickle_state.OUTCOME_PRODUCTIVE
+        assert first['outcome'] == trickle_state.RunOutcome.PRODUCTIVE
         stamp = first['last_productive_at']
         assert stamp is not None
 
@@ -4264,7 +4889,7 @@ class TestBarrenStreakEscalation:
             result = runner.night(night, 'storm')
             assert result.exit_code == 1
             doc = runner.recorded()
-            assert doc['outcome'] == trickle_state.OUTCOME_FAILED
+            assert doc['outcome'] == trickle_state.RunOutcome.FAILED
             assert doc['consecutive_failed_runs'] == expected_streak
             assert doc['last_productive_at'] == stamp, (
                 'a night that crashed did nothing productive; restamping '
@@ -4300,7 +4925,7 @@ class TestBarrenStreakEscalation:
 
         runner.night(15, 'storm')
         carried = runner.recorded()
-        assert carried['outcome'] == trickle_state.OUTCOME_FAILED
+        assert carried['outcome'] == trickle_state.RunOutcome.FAILED
         assert carried['consecutive_barren_runs'] == 2, (
             'a crashed run is evidence about the RUN, not about whether '
             'signal is flowing'
@@ -4343,13 +4968,10 @@ class TestBarrenStreakEscalation:
         streak = _streak_escalations(runner.escalations)
         assert len(streak) == 1, (
             f'expected exactly ONE streak escalation; got '
-            f'{[e["params"]["arguments"]["summary"] for _u, e in streak]}'
+            f'{[e["summary"] for _u, e in streak]}'
         )
-        arguments = streak[0][1]['params']['arguments']
+        arguments = streak[0][1]
 
-        # The decision-8 envelope, reused unchanged, so it never gates
-        # anything.
-        assert streak[0][1]['params']['name'] == 'escalate_info'
         assert arguments['category'] == 'infra_issue'
         assert arguments['severity'] == 'info'
 
@@ -4360,6 +4982,11 @@ class TestBarrenStreakEscalation:
         assert 'max_daily_digest_bytes' in detail, (
             'the budget door has its OWN remedy and must be named'
         )
+        recorded = runner.recorded()
+        assert trickle_state.barren_remedy(
+            trickle_state.RunCounters.from_json(recorded['counters'])
+        ) in detail
+        assert recorded['barren_escalated'] is True
 
     def test_night_four_does_not_escalate_again(self, tmp_path):
         """EDGE-triggered, not level-triggered."""
@@ -4386,6 +5013,7 @@ class TestBarrenStreakEscalation:
 
         recovered = runner.night(16, 'productive')
         assert recovered.barren_escalated is False
+        assert runner.recorded()['barren_escalated'] is False
 
         for day in (17, 18):
             assert runner.night(day, 'barren').barren_escalated is False
@@ -4393,6 +5021,7 @@ class TestBarrenStreakEscalation:
 
         refired = runner.night(19, 'barren')
         assert refired.barren_escalated is True
+        assert runner.recorded()['barren_escalated'] is True
         assert len(_streak_escalations(runner.escalations)) == 2
 
     def test_a_quiet_night_also_rearms_the_trigger(self, tmp_path):
@@ -4433,6 +5062,724 @@ class TestBarrenStreakEscalation:
             f'got {runner.escalations!r}'
         )
 
+    def test_the_escalation_is_recorded_as_a_fact(self, tmp_path):
+        recorder, calls = _recorder_spy()
+        runner = _NightRunner(tmp_path, recorder=recorder)
+
+        for day in (13, 14, 15, 16):
+            runner.night(day, 'barren')
+
+        assert [facts['barren_escalated'] for facts, _doc in calls] == [
+            False, False, True, False,
+        ]
+        assert [doc['barren_escalated'] for _facts, doc in calls] == [
+            False, False, True, False,
+        ]
+
+    def test_the_streak_is_posted_before_the_night_is_recorded(self, tmp_path):
+        seen_at_post = []
+
+        def _read_the_record_at_post_time(arguments):
+            if _is_streak_escalation(arguments):
+                seen_at_post.append(_testproj_state())
+
+        runner = _NightRunner(tmp_path, on_post=_read_the_record_at_post_time)
+        for day in (13, 14, 15):
+            runner.night(day, 'barren')
+
+        [seen] = seen_at_post
+        assert seen['target_date'] == '2026-07-14'
+        assert seen['consecutive_barren_runs'] == 2
+        assert runner.recorded()['consecutive_barren_runs'] == 3
+
+    def test_the_night_written_is_the_one_the_escalation_decided_on(self, tmp_path):
+        """The record is lost between the decision and the write: the night
+        written still carries the streak the escalation was posted for."""
+        def _lose_the_record_mid_post(arguments):
+            if _is_streak_escalation(arguments):
+                trickle_state.trickle_state_path('testproj').unlink()
+
+        runner = _NightRunner(tmp_path, on_post=_lose_the_record_mid_post)
+        for day in (13, 14):
+            runner.night(day, 'barren')
+
+        third = runner.night(15, 'barren')
+
+        assert third.barren_escalated is True
+        doc = runner.recorded()
+        assert doc['consecutive_barren_runs'] == 3
+        assert doc['barren_escalated'] is True
+
+    def test_a_streak_post_that_fails_records_not_escalated(self, tmp_path):
+        def _server_down_for_the_streak(arguments):
+            if _is_streak_escalation(arguments):
+                raise ConnectionError('escalation server is down')
+
+        runner = _NightRunner(tmp_path, on_post=_server_down_for_the_streak)
+        for day in (13, 14):
+            runner.night(day, 'barren')
+
+        third = runner.night(15, 'barren')
+
+        assert third.barren_escalated is False
+        doc = runner.recorded()
+        assert doc['consecutive_barren_runs'] == 3
+        assert doc['barren_escalated'] is False
+
+    def test_a_capped_night_carries_the_barren_streak_forward(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'barren')
+        runner.night(14, 'barren')
+
+        capped = runner.night(15, 'capped')
+
+        assert capped.barren_escalated is False
+        assert runner.recorded()['consecutive_barren_runs'] == 2
+
+        fourth = runner.night(16, 'barren')
+
+        assert fourth.barren_escalated is True
+        assert runner.recorded()['consecutive_barren_runs'] == 3
+        assert len(_streak_escalations(runner.escalations)) == 1
+
+    def test_a_non_default_threshold_escalates_on_its_own_night(self, tmp_path):
+        runner = _NightRunner(tmp_path, max_barren_runs=5)
+
+        nights = [runner.night(day, 'barren') for day in (13, 14, 15, 16, 17)]
+
+        assert [night.barren_escalated for night in nights] == [
+            False, False, False, False, True,
+        ]
+        [(_url, arguments)] = _streak_escalations(runner.escalations)
+        assert 'for 5 consecutive runs' in arguments['summary']
+        assert 'consecutive_barren_runs=5' in arguments['detail']
+        assert 'check_trickle_progress.py testproj 5' in arguments['detail']
+        assert runner.recorded()['barren_escalated'] is True
+
+
+class TestANonDefaultThresholdEndToEnd:
+    """BOUNDARY ROW 6: a nightly at ``max_barren_runs=5``, the real progress
+    probe and the health check agree through the recorded fact."""
+
+    @staticmethod
+    def _health_posts(runner) -> list:
+        posted = []
+        check_trickle_health.run_health_check(
+            project_id='testproj',
+            config_path=runner.config_path,
+            max_barren_runs=5,
+            max_age_hours=_fixture_clock_window_hours(),
+            liveness_runner=lambda project_id, **kwargs: (0, 'OK: ran'),
+            census_runner=lambda project_id, **kwargs: (0, 'OK: no fire'),
+            poster=lambda url, arguments: posted.append(arguments),
+        )
+        return posted
+
+    def test_five_barren_nights_escalate_once_and_the_health_check_stays_silent(
+        self, tmp_path,
+    ):
+        runner = _NightRunner(tmp_path, max_barren_runs=5)
+
+        nights = [runner.night(day, 'barren') for day in (13, 14, 15, 16, 17)]
+
+        assert [night.barren_escalated for night in nights] == [
+            False, False, False, False, True,
+        ]
+        assert len(_streak_escalations(runner.escalations)) == 1
+        assert runner.recorded()['barren_escalated'] is True
+        probe = _run_trickle_progress_probe('testproj', 5)
+        assert probe.returncode == 1, (
+            f'stdout={probe.stdout!r} stderr={probe.stderr!r}'
+        )
+        assert 'barren_escalated=True' in probe.stderr
+        assert self._health_posts(runner) == []
+
+        sixth = runner.night(18, 'barren')
+
+        assert sixth.barren_escalated is False
+        assert len(self._health_posts(runner)) == 1
+
+
+class TestADeferredNightIsRecordedAsDeferred:
+    """BOUNDARY ROW 5: a usage-capped night is weather. It exits 0, records
+    ``deferred``, moves neither streak nor ``last_productive_at``, owes its
+    date a retry, and the progress probe reads it as healthy."""
+
+    def test_productive_barren_capped(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'productive')
+        stamp = runner.recorded()['last_productive_at']
+        runner.night(14, 'barren')
+
+        capped = runner.night(15, 'capped')
+
+        assert capped.exit_code == 0
+        assert capped.capped is True
+        assert capped.barren_escalated is False
+        doc = runner.recorded()
+        assert doc['outcome'] == trickle_state.RunOutcome.DEFERRED
+        assert doc['last_productive_at'] == stamp
+        assert doc['consecutive_barren_runs'] == 1
+        assert doc['retry_backlog'] == {'2026-07-15': 1}
+        probe = _run_trickle_progress_probe('testproj', 3)
+        assert probe.returncode == 0, (
+            f'stdout={probe.stdout!r} stderr={probe.stderr!r}'
+        )
+        assert 'deferred' in probe.stdout
+
+
+# ---------------------------------------------------------------------------
+# task 5678: an unfinished night's date enters the retry backlog
+# ---------------------------------------------------------------------------
+
+class TestScheduledPassRetryBacklog:
+    """A scheduled pass that did not finish leaves its date owed; one that
+    finished reports which owed dates to retry next."""
+
+    def test_a_storming_night_enters_the_backlog(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+
+        runner.night(13, 'storm')
+
+        assert runner.recorded()['retry_backlog'] == {'2026-07-13': 1}
+
+    def test_a_capped_night_exits_clean_and_still_enters_the_backlog(self, tmp_path):
+        result, _repo = _run_e2e_nightly(tmp_path, branch='capped')
+
+        assert result.exit_code == 0
+        doc = _testproj_state()
+        assert doc['capped'] is True
+        assert doc['retry_backlog'] == {'2026-07-13': 1}
+
+    def test_a_finished_night_reports_the_owed_date(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        productive = runner.night(14, 'productive')
+
+        assert productive.exit_code == 0
+        assert productive.retry_due == (date(2026, 7, 13),)
+
+    def test_an_unfinished_night_schedules_no_retry(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        stormed = runner.night(14, 'storm')
+
+        assert stormed.retry_due == ()
+        assert runner.recorded()['retry_backlog'] == {'2026-07-13': 1, '2026-07-14': 1}
+
+    def test_a_finished_night_with_nothing_owed_schedules_no_retry(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+
+        productive = runner.night(13, 'productive')
+
+        assert productive.exit_code == 0
+        assert productive.retry_due == ()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores permission bits')
+    def test_a_night_that_raises_enters_the_backlog(self, tmp_path):
+        result, _repo = _run_e2e_nightly(tmp_path, unreadable_transcripts=True)
+
+        assert result.exit_code == 1
+        assert result.retry_due == ()
+        assert _testproj_state()['retry_backlog'] == {'2026-07-13': 1}
+
+    def test_a_project_id_whose_config_does_not_load_enters_the_backlog(
+        self, tmp_path, monkeypatch,
+    ):
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13),
+                now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+                pass_kind=nightly.PassKind.MANUAL,
+            )
+
+        assert _testproj_state()['retry_backlog'] == {'2026-07-13': 1}
+
+    def test_the_recorder_seam_receives_capped(self, tmp_path):
+        recorder, calls = _recorder_spy()
+
+        _run_e2e_nightly(tmp_path, branch='capped', recorder=recorder)
+
+        assert calls[0][0]['capped'] is True
+
+
+def _without_backlog(doc: dict) -> dict:
+    return {key: value for key, value in doc.items() if key != 'retry_backlog'}
+
+
+def _commit_subjects(repo: Path) -> list[str]:
+    return subprocess.run(
+        ['git', 'log', '--format=%s'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+
+def _counting_invoke(calls: list[str]):
+    def _invoke(prompt: str, model: str) -> str:
+        calls.append(prompt)
+        return _fake_invoke_known_cause(prompt, model)
+
+    return _invoke
+
+
+def _seed_state(*, day: int, exit_code: int) -> None:
+    trickle_state.record_run(
+        'testproj',
+        trickle_state.NightRun(
+            target_date=date(2026, 7, day),
+            recorded_at=datetime(2026, 7, day + 1, 3, 0, tzinfo=UTC),
+            exit_code=exit_code,
+            counters=trickle_state.RunCounters(
+                total_records=0, zero_signal_dropped=0, dedupe_collapsed=0,
+                below_sampling_cut=0, budget_skipped=0, selected_count=0,
+            ),
+            census=None,
+        ),
+        barren_escalated=False,
+    )
+
+
+def _owed_after_storm_then_productive(
+    tmp_path, *, census_state: dict | None = None, **runner_kwargs,
+) -> tuple[_NightRunner, dict]:
+    """Night 13 storms and night 14 is productive, so date 13 is owed with
+    one attempt. Returns the runner and the state document night 14 wrote.
+    *census_state* is seeded before night 13; *runner_kwargs* reach the
+    :class:`_NightRunner`."""
+    runner = _NightRunner(tmp_path, **runner_kwargs)
+    if census_state is not None:
+        _write_census_state(runner.repo, census_state)
+    runner.night(13, 'storm')
+    runner.night(14, 'productive')
+    before = runner.recorded()
+    assert before['retry_backlog'] == {'2026-07-13': 1}
+    return runner, before
+
+
+class TestRetryPass:
+    """A ``PassKind.RETRY`` pass re-runs an owed date and touches ONLY the
+    backlog: the recorded health keeps describing the scheduled night."""
+
+    def test_a_recovered_date_lands_its_sightings_and_leaves_the_backlog(self, tmp_path):
+        runner, before = _owed_after_storm_then_productive(tmp_path)
+
+        result = runner.retry(13, on_night=14)
+
+        assert result.exit_code == 0
+        assert _commit_subjects(runner.repo)[0] == (
+            'legibility: nightly trickle sightings for 2026-07-13'
+        )
+        after = runner.recorded()
+        assert after['retry_backlog'] == {}
+        assert _without_backlog(after) == _without_backlog(before)
+        assert after['target_date'] == '2026-07-14'
+
+    def test_a_failed_retry_counts_an_attempt_and_exits_non_zero(self, tmp_path):
+        runner, before = _owed_after_storm_then_productive(tmp_path)
+
+        result = runner.retry(13, on_night=14, invoke=_fake_invoke_unparseable)
+
+        assert result.exit_code == 1
+        after = runner.recorded()
+        assert after['retry_backlog'] == {'2026-07-13': 2}
+        assert _without_backlog(after) == _without_backlog(before)
+        assert after['outcome'] == trickle_state.RunOutcome.PRODUCTIVE
+        assert after['consecutive_failed_runs'] == 0
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root ignores permission bits')
+    def test_a_retry_that_raises_counts_an_attempt_and_keeps_the_health_record(
+        self, tmp_path,
+    ):
+        runner, before = _owed_after_storm_then_productive(tmp_path)
+
+        runner.projects_root.chmod(0)
+        try:
+            result = runner.retry(13, on_night=14)
+        finally:
+            runner.projects_root.chmod(0o755)
+
+        assert result.exit_code == 1
+        after = runner.recorded()
+        assert after['retry_backlog'] == {'2026-07-13': 2}
+        assert _without_backlog(after) == _without_backlog(before)
+
+    def test_a_retry_whose_config_does_not_load_counts_an_attempt_then_raises(
+        self, tmp_path, monkeypatch,
+    ):
+        _seed_state(day=13, exit_code=1)
+        _seed_state(day=14, exit_code=0)
+        before = _testproj_state()
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13),
+                pass_kind=nightly.PassKind.RETRY,
+                now=datetime(2026, 7, 15, 3, 0, tzinfo=UTC),
+            )
+
+        after = _testproj_state()
+        assert after['retry_backlog'] == {'2026-07-13': 2}
+        assert _without_backlog(after) == _without_backlog(before)
+        assert after['target_date'] == '2026-07-14'
+
+    def test_a_retry_records_through_the_retry_recorder_seam(self, tmp_path):
+        runner, _before = _owed_after_storm_then_productive(tmp_path)
+        recorder, recorded = _recorder_spy()
+        retry_recorder, retried = _retry_recorder_spy()
+
+        runner.retry(13, on_night=14, recorder=recorder, retry_recorder=retry_recorder)
+
+        assert recorded == []
+        assert _one_recorded(retried)['retry_backlog'] == {}
+        assert retried[0][0]['target_date'] == date(2026, 7, 13)
+
+    def test_a_retry_whose_config_does_not_load_records_through_the_retry_recorder_seam(
+        self, tmp_path, monkeypatch,
+    ):
+        _seed_state(day=13, exit_code=1)
+        _seed_state(day=14, exit_code=0)
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+        recorder, recorded = _recorder_spy()
+        retry_recorder, retried = _retry_recorder_spy()
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13),
+                pass_kind=nightly.PassKind.RETRY,
+                now=datetime(2026, 7, 15, 3, 0, tzinfo=UTC),
+                recorder=recorder, retry_recorder=retry_recorder,
+            )
+
+        assert recorded == []
+        assert _one_recorded(retried)['retry_backlog'] == {'2026-07-13': 2}
+        assert retried[0][0]['exit_code'] == 1
+
+    def test_a_retry_never_evaluates_the_census_step(self, tmp_path):
+        launcher, launches = _recording_census_launcher()
+        runner, _before = _owed_after_storm_then_productive(
+            tmp_path, census_state=_OLD_CENSUS, census_launcher=launcher,
+        )
+        assert len(launches) == 1, 'night 14 evaluates the census once and FIREs'
+
+        result = runner.retry(13, on_night=14)
+
+        assert len(launches) == 1
+        assert result.census_line is None
+        assert result.census_fire is False
+
+    def test_a_retry_skips_sessions_the_ledger_already_holds(self, tmp_path):
+        runner, _before = _owed_after_storm_then_productive(tmp_path)
+        session_ledger.record_codings(session_ledger.ledger_path('testproj'), [
+            session_ledger.LedgerRow(
+                session='session-13', instrument_version=1,
+                coded_by=session_ledger.CodedBy.CENSUS, run_ref='census-run',
+                outcome=session_ledger.Outcome.MATCHED,
+                coded_at=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+            ),
+        ])
+        retry_prompts: list[str] = []
+
+        result = runner.retry(13, on_night=14, invoke=_counting_invoke(retry_prompts))
+
+        assert retry_prompts == []
+        assert result.exit_code == 0
+        assert runner.recorded()['retry_backlog'] == {}
+
+        scheduled_prompts: list[str] = []
+        runner.night(13, 'productive', invoke=_counting_invoke(scheduled_prompts))
+        assert len(scheduled_prompts) == 1, 'a scheduled pass does not skip ledgered sessions'
+
+    def test_a_retry_never_refires_the_barren_streak_escalation(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+        for day in (14, 15, 16):
+            runner.night(day, 'barren')
+        streak = runner.recorded()
+        assert streak['outcome'] == trickle_state.RunOutcome.BARREN
+        assert streak['consecutive_barren_runs'] == trickle_state.DEFAULT_MAX_BARREN_RUNS
+        assert streak['retry_backlog'] == {'2026-07-13': 1}
+        posted_before = len(_streak_escalations(runner.escalations))
+
+        result = runner.retry(13, on_night=16)
+
+        assert len(_streak_escalations(runner.escalations)) == posted_before
+        assert result.barren_escalated is False
+
+    def test_a_retry_never_schedules_another_retry(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+        runner.night(14, 'storm')
+        assert runner.night(15, 'productive').retry_due == (date(2026, 7, 13),)
+
+        result = runner.retry(13, on_night=15)
+
+        assert result.exit_code == 0
+        assert result.retry_due == ()
+        assert runner.recorded()['retry_backlog'] == {'2026-07-14': 1}
+
+
+def _scripted_run_nightly(*outcomes):
+    """A ``run_nightly`` fake recording each call's kwargs. Call N gets
+    outcome N (the last repeats); an exception outcome is raised."""
+    calls: list[dict[str, Any]] = []
+
+    def _fake(**kwargs):
+        calls.append(kwargs)
+        outcome = outcomes[min(len(calls), len(outcomes)) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    return _fake, calls
+
+
+def _sentinel_seam():
+    """A distinct callable for a typed seam that must be forwarded, never
+    called."""
+    def _seam(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError('a forwarded sentinel seam was called')
+
+    return _seam
+
+
+class TestRunScheduledNight:
+    """An undated run is the scheduled night plus, once that night finished,
+    the retry the backlog owes; a dated run stays a single pass."""
+
+    def test_a_failed_night_is_recovered_by_the_next_healthy_night(self, tmp_path):
+        """The 2026-08-17 scenario: a lost night is now retried, not dropped."""
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        results = runner.scheduled_night(14, 'productive')
+
+        assert [result.exit_code for result in results] == [0, 0]
+        assert _commit_subjects(runner.repo)[:2] == [
+            'legibility: nightly trickle sightings for 2026-07-13',
+            'legibility: nightly trickle sightings for 2026-07-14',
+        ]
+        doc = runner.recorded()
+        assert doc['retry_backlog'] == {}
+        assert doc['target_date'] == '2026-07-14'
+
+    def test_an_unfinished_night_runs_no_retry_and_burns_no_attempt(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        results = runner.scheduled_night(14, 'storm')
+
+        assert len(results) == 1
+        assert runner.recorded()['retry_backlog']['2026-07-13'] == 1
+
+    def test_a_capped_night_runs_no_retry(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'storm')
+
+        results = runner.scheduled_night(14, 'capped')
+
+        assert len(results) == 1
+        assert results[0].capped is True
+        assert runner.recorded()['retry_backlog']['2026-07-13'] == 1
+
+    def test_every_argument_reaches_both_passes(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            _result(retry_due=(date(2026, 7, 13),)),
+            _result(),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+        now = datetime(2026, 7, 15, 3, 0, tzinfo=UTC)
+        invoke, poster = object(), object()
+        committer, recorder, retry_recorder = object(), object(), object()
+        selector, digest_builder, census_launcher, completion_runner = (
+            _sentinel_seam(), _sentinel_seam(), _sentinel_seam(), _sentinel_seam(),
+        )
+
+        nightly.run_scheduled_night(
+            config_path='legibility.yaml', project_id='proj_a', projects_root='projects',
+            target_date=date(2026, 7, 14), now=now, invoke=invoke,
+            completion_runner=completion_runner, poster=poster, committer=committer,
+            recorder=recorder, retry_recorder=retry_recorder, selector=selector,
+            digest_builder=digest_builder, census_launcher=census_launcher,
+            max_barren_runs=5,
+        )
+
+        shared = dict(
+            config_path='legibility.yaml', project_id='proj_a', projects_root='projects',
+            now=now, invoke=invoke, completion_runner=completion_runner, poster=poster,
+            committer=committer, recorder=recorder, retry_recorder=retry_recorder,
+            selector=selector, digest_builder=digest_builder,
+            census_launcher=census_launcher, max_barren_runs=5,
+        )
+        assert calls == [
+            {**shared, 'target_date': date(2026, 7, 14),
+             'pass_kind': nightly.PassKind.SCHEDULED},
+            {**shared, 'target_date': date(2026, 7, 13),
+             'pass_kind': nightly.PassKind.RETRY},
+        ]
+
+    def test_main_retries_the_owed_date_after_an_undated_run(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            _result(retry_due=(date(2026, 7, 13),)),
+            _result(),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        exit_code = nightly.main(['run', '--project-id', 'proj_a'])
+
+        assert exit_code == 0
+        assert len(calls) == 2
+        scheduled, retried = calls
+        assert retried['target_date'] == date(2026, 7, 13)
+        assert scheduled['pass_kind'] is nightly.PassKind.SCHEDULED
+        assert retried['pass_kind'] is nightly.PassKind.RETRY
+        for key in ('project_id', 'config_path', 'projects_root'):
+            assert retried[key] == scheduled[key]
+
+    def test_main_threads_max_barren_runs_to_every_pass(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            _result(retry_due=(date(2026, 7, 13),)),
+            _result(),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        nightly.main(['run', '--project-id', 'proj_a', '--max-barren-runs', '5'])
+
+        assert [call['max_barren_runs'] for call in calls] == [5, 5]
+
+    def test_a_dated_main_run_threads_max_barren_runs(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(_result())
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        nightly.main([
+            'run', '--project-id', 'proj_a', '--date', '2026-07-13',
+            '--max-barren-runs', '5',
+        ])
+
+        assert [call['max_barren_runs'] for call in calls] == [5]
+
+    def test_main_defaults_max_barren_runs_to_the_module_constant(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(_result())
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+        monkeypatch.setattr(trickle_state, 'DEFAULT_MAX_BARREN_RUNS', 7)
+
+        nightly.main(['run', '--project-id', 'proj_a', '--date', '2026-07-13'])
+
+        assert [call['max_barren_runs'] for call in calls] == [7]
+
+    def test_main_fails_when_the_retry_fails(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            _result(retry_due=(date(2026, 7, 13),)),
+            _result(_Outcome.FAILED),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        exit_code = nightly.main(['run', '--project-id', 'proj_a'])
+
+        assert exit_code == 1
+        assert len(calls) == 2
+
+    def test_a_dated_run_is_a_single_pass(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(
+            _result(retry_due=(date(2026, 7, 10),)),
+        )
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        exit_code = nightly.main(['run', '--project-id', 'proj_a', '--date', '2026-07-13'])
+
+        assert exit_code == 0
+        assert len(calls) == 1
+        assert calls[0]['target_date'] == date(2026, 7, 13)
+        assert calls[0]['pass_kind'] is nightly.PassKind.MANUAL
+
+    def test_a_scheduled_pass_that_raises_propagates_and_runs_no_retry(self, monkeypatch):
+        fake, calls = _scripted_run_nightly(FileNotFoundError('no legibility.yaml'))
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        with pytest.raises(FileNotFoundError):
+            nightly.main(['run', '--project-id', 'proj_a'])
+
+        assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# task 6548: a date the timer never ran is owed like an unfinished one
+# ---------------------------------------------------------------------------
+
+class TestNeverRunDates:
+    """A SCHEDULED pass owes, with 0 attempts, every date since the previous
+    scheduled pass; a MANUAL pass never moves that schedule cursor."""
+
+    def test_a_multi_night_outage_is_retried_one_date_per_night(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.scheduled_night(13, 'productive')
+        retry_recorder, retried = _retry_recorder_spy()
+
+        results = runner.scheduled_night(16, 'productive', retry_recorder=retry_recorder)
+
+        assert [result.exit_code for result in results] == [0, 0]
+        assert len(retried) == 1
+        assert retried[0][0]['target_date'] == date(2026, 7, 14)
+        assert retried[0][0]['exit_code'] == 0
+        assert retried[0][0]['capped'] is False
+        doc = runner.recorded()
+        assert doc['retry_backlog'] == {'2026-07-15': 0}
+        assert doc['last_scheduled_target_date'] == '2026-07-16'
+        assert doc['target_date'] == '2026-07-16'
+
+        runner.scheduled_night(17, 'productive')
+
+        assert runner.recorded()['retry_backlog'] == {}
+
+    def test_a_manual_backfill_never_reads_as_a_gap(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.scheduled_night(13, 'productive')
+        runner.night(9, 'productive')
+
+        results = runner.scheduled_night(14, 'productive')
+
+        assert len(results) == 1
+        doc = runner.recorded()
+        assert doc['retry_backlog'] == {}
+        assert doc['last_scheduled_target_date'] == '2026-07-14'
+
+    def test_a_scheduled_pass_tells_the_recorder_seam_it_is_scheduled(self, tmp_path):
+        recorder, calls = _recorder_spy()
+
+        _run_e2e_nightly(
+            tmp_path, recorder=recorder, pass_kind=nightly.PassKind.SCHEDULED,
+        )
+
+        assert calls[0][0]['scheduled'] is True
+
+    def test_a_pass_of_no_stated_kind_is_not_scheduled(self, tmp_path):
+        recorder, calls = _recorder_spy()
+
+        _run_e2e_nightly(tmp_path, recorder=recorder)
+
+        assert calls[0][0]['scheduled'] is False
+
+    def test_a_scheduled_pass_whose_config_does_not_load_still_advances_the_cursor(
+        self, tmp_path, monkeypatch,
+    ):
+        _write_unloadable_config(tmp_path / 'proj', project_id='testproj')
+        monkeypatch.setenv('LEGIBILITY_SEARCH_ROOTS', str(tmp_path))
+
+        with pytest.raises(FileNotFoundError):
+            nightly.run_nightly(
+                project_id='testproj', target_date=date(2026, 7, 13),
+                now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+                pass_kind=nightly.PassKind.SCHEDULED,
+            )
+
+        assert _testproj_state()['last_scheduled_target_date'] == '2026-07-13'
+
 
 # ---------------------------------------------------------------------------
 # task 3340 step-11/12: the sibling barren door gets journal visibility
@@ -4441,10 +5788,10 @@ class TestBarrenStreakEscalation:
 def _sample(*, selected=(), zero_signal_dropped=0, dedupe_collapsed=0,
             below_sampling_cut=0, budget_skipped=0):
     """Hand-build a SampleResult satisfying the conservation identity. The
-    sampling-cut-only barren night is NOT reachable end-to-end (a stratum's
-    cut is max(ceil(top_fraction*n), per_stratum_min) >= 1, so something is
-    always selected unless the BUDGET also cuts), so this mode is exercised
-    at the _report_sample_outcome boundary directly."""
+    sampling-cut-only barren night is NOT reachable from real transcripts (a
+    stratum's cut is max(ceil(top_fraction*n), per_stratum_min) >= 1, so
+    something is always selected unless the BUDGET also cuts), so this mode
+    reaches run_nightly through an injected selector."""
     selected = list(selected)
     return nightly.sampling.SampleResult(
         selected=selected,
@@ -4461,8 +5808,33 @@ def _sample(*, selected=(), zero_signal_dropped=0, dedupe_collapsed=0,
     )
 
 
-def _cfg_for(tmp_path):
-    return load_config(_write_config(tmp_path, project_id='testproj'))
+def _run_sampled_night(tmp_path, sample, **seams):
+    """Run one MANUAL night whose injected selector returns *sample*; its
+    digest builder renders nothing. Returns ``(result, posted arguments)``."""
+    poster, posted = _capture_poster()
+    result = _run_manual_night(
+        tmp_path, selector=lambda *args, **kwargs: sample, poster=poster, **seams,
+    )
+    return result, posted
+
+
+def _run_manual_night(tmp_path, *, selector, poster, **seams):
+    """Run one MANUAL night of project 'testproj' drawing its sample from
+    *selector*; its digest builder renders nothing."""
+    return nightly.run_nightly(
+        config_path=_write_config(tmp_path, project_id='testproj'),
+        projects_root=tmp_path / 'projects',
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+        invoke=lambda prompt, model: pytest.fail('no digest may reach the coder'),
+        completion_runner=_passing_completion_runner,
+        poster=poster,
+        selector=selector,
+        digest_builder=lambda selected, **kwargs: ([], []),
+        census_launcher=_no_census_launch,
+        pass_kind=nightly.PassKind.MANUAL,
+        **seams,
+    )
 
 
 def test_report_sample_outcome_warns_on_a_sampling_cut_only_night(tmp_path, caplog):
@@ -4470,16 +5842,10 @@ def test_report_sample_outcome_warns_on_a_sampling_cut_only_night(tmp_path, capl
     distinct signal held back by the sampling cut, nothing digested. It
     gets journal visibility now, and escalation only via the streak, so
     per-night alarm volume does not rise."""
-    cfg = _cfg_for(tmp_path)
-    posted = []
-
     with caplog.at_level('INFO', logger='legibility.nightly'):
-        escalated = nightly._report_sample_outcome(
-            cfg, _sample(below_sampling_cut=3), date(2026, 7, 13),
-            poster=lambda url, env: posted.append((url, env)),
-        )
+        result, posted = _run_sampled_night(tmp_path, _sample(below_sampling_cut=3))
 
-    assert escalated is False
+    assert result.alarms == ()
     assert posted == [], (
         'the streak owns escalation for this mode; a per-night escalation '
         'here would raise alarm volume for a signal that already repeats'
@@ -4490,7 +5856,10 @@ def test_report_sample_outcome_warns_on_a_sampling_cut_only_night(tmp_path, capl
         f'expected exactly one WARNING; got {[r.getMessage() for r in loud]}'
     )
     message = loud[0].getMessage()
-    assert 'top_fraction' in message or 'per_stratum_min' in message, (
+    assert (
+        trickle_state.BARREN_REMEDIES[trickle_state.BarrenDoor.SAMPLING_CUT]
+        in message
+    ), (
         f'the sampling-cut door has its OWN remedy and must name it; got '
         f'{message!r}'
     )
@@ -4510,211 +5879,103 @@ def test_report_sample_outcome_warns_on_a_sampling_cut_only_night(tmp_path, capl
 def test_report_sample_outcome_budget_door_is_unchanged(tmp_path, caplog):
     """The budget door keeps its per-night escalation exactly as 3270 left
     it — this change adds a sibling branch, it does not alter this one."""
-    cfg = _cfg_for(tmp_path)
-    posted = []
-
     with caplog.at_level('INFO', logger='legibility.nightly'):
-        escalated = nightly._report_sample_outcome(
-            cfg, _sample(budget_skipped=4), date(2026, 7, 13),
-            poster=lambda url, env: posted.append((url, env)),
-        )
+        result, posted = _run_sampled_night(tmp_path, _sample(budget_skipped=4))
 
-    assert escalated is True
-    assert len(posted) == 1
-    assert 'suppress' in posted[0][1]['params']['arguments']['summary'].lower()
+    assert [(alarm.kind, alarm.landed) for alarm in result.alarms] == [
+        (nightly.AlarmKind.BUDGET_SUPPRESSED, True),
+    ]
+    assert 'suppress' in _one_escalation(posted)['summary'].lower()
 
 
 def test_report_sample_outcome_stays_quiet_on_a_quiet_night(tmp_path, caplog):
-    cfg = _cfg_for(tmp_path)
-    posted = []
-
     with caplog.at_level('INFO', logger='legibility.nightly'):
-        escalated = nightly._report_sample_outcome(
-            cfg, _sample(zero_signal_dropped=9, dedupe_collapsed=2),
-            date(2026, 7, 13),
-            poster=lambda url, env: posted.append((url, env)),
+        result, posted = _run_sampled_night(
+            tmp_path, _sample(zero_signal_dropped=9, dedupe_collapsed=2),
         )
 
-    assert escalated is False
+    assert result.alarms == ()
     assert posted == []
     assert _nightly_warnings(caplog) == []
+
+
+def test_a_crashed_night_alarms_as_its_projects_trickle(tmp_path):
+    def _crash(*args, **kwargs):
+        raise RuntimeError('selector-boom')
+
+    poster, posted = _capture_poster()
+    result = _run_manual_night(tmp_path, selector=_crash, poster=poster)
+
+    assert result.exit_code == 1
+    arguments = _one_escalation(posted)
+    assert arguments['task_id'] == 'legibility-trickle-testproj'
+    assert arguments['agent_role'] == 'legibility-trickle'
+    assert 'selector-boom' in arguments['summary']
+
+
+def test_a_raise_after_the_stages_is_alarmed_once_and_reraised(tmp_path, monkeypatch):
+    def _boom(cfg, *, now=None):
+        raise RuntimeError('pdc-boom')
+
+    monkeypatch.setattr(plan_deviation_census, 'run', _boom)
+    poster, posted = _capture_poster()
+
+    with pytest.raises(RuntimeError, match='pdc-boom'):
+        _run_manual_night(tmp_path, selector=lambda *args, **kwargs: _sample(), poster=poster)
+
+    prefix = 'legibility trickle run failed (testproj): RuntimeError: pdc-boom'
+    failed = [arguments for arguments in posted if arguments['summary'].startswith(prefix)]
+    assert len(failed) == 1, posted
 
 
 def test_report_sample_outcome_partial_truncation_stays_at_info(tmp_path, caplog):
     """Selected something AND skipped some on budget: the budget working as
     designed, never an absence."""
-    cfg = _cfg_for(tmp_path)
-    posted = []
-
     with caplog.at_level('INFO', logger='legibility.nightly'):
-        escalated = nightly._report_sample_outcome(
-            cfg, _sample(selected=['digest'], budget_skipped=2),
-            date(2026, 7, 13),
-            poster=lambda url, env: posted.append((url, env)),
+        result, posted = _run_sampled_night(
+            tmp_path, _sample(selected=['digest'], budget_skipped=2),
         )
 
-    assert escalated is False
+    assert result.alarms == ()
     assert posted == []
     assert _nightly_warnings(caplog) == []
 
 
-# ---------------------------------------------------------------------------
-# task 3644: the trickle's fail-loud escalation must survive a STATEFUL server
-# ---------------------------------------------------------------------------
-#
-# `_default_poster` bare-POSTed `tools/call`, which the escalation server
-# (:8103) rejects at the transport layer before the tool ever runs, with
-# `400 Bad Request` / "Missing session ID" (captured live 2026-08-05).
-# `post_escalation` swallows that best-effort and returns False, so EVERY
-# trickle fail-loud escalation -- extractor crash, coder storm, commit
-# failure -- was silently dropped. Identical root cause and identical fix as
-# census.py's poster; the transport lives single-sourced in census_trigger.
+def test_an_injected_selector_s_suppressed_sample_is_a_budget_suppressed_night(tmp_path):
+    selector_calls = []
 
+    def _selector(cfg, projects_root, target_date, *, rendered, skip_sessions):
+        selector_calls.append((rendered, skip_sessions))
+        return _sample(budget_skipped=4)
 
-class _FakeStatefulResponse:
-    """An `httpx.Response` stand-in for the stateful-server handshake."""
+    poster, posted = _capture_poster()
 
-    def __init__(self, *, status_code=200, headers=None, payload=None, text=''):
-        self.status_code = status_code
-        self.headers = headers or {}
-        self.text = text
-        self._payload = payload
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            # A plain RuntimeError, not httpx.HTTPStatusError: the shared
-            # install_fake_httpx stub exposes only `post` and pytest.fails on
-            # any other attribute (task 3376).
-            raise RuntimeError(f'HTTP {self.status_code}')
-
-    def json(self):
-        if self._payload is None:
-            raise ValueError('response has no JSON body')
-        return self._payload
-
-
-def _stateful_escalation_post(recorded, *, session_id='sid-nightly'):
-    """A fake `httpx.post` behaving like the STATEFUL escalation server:
-    session-less `tools/call` -> 400; `initialize` -> 200 + the assigned id
-    as a response header; `notifications/initialized` -> 202; `tools/call`
-    WITH that header -> 200."""
-    def _post(url, **kwargs):
-        recorded.append((url, kwargs))
-        envelope = kwargs.get('json') or {}
-        method = envelope.get('method')
-        if method == 'initialize':
-            return _FakeStatefulResponse(
-                headers={'mcp-session-id': session_id,
-                         'content-type': 'application/json'},
-                payload={'jsonrpc': '2.0', 'id': 1, 'result': {}},
-            )
-        if method == 'notifications/initialized':
-            return _FakeStatefulResponse(status_code=202)
-        if (kwargs.get('headers') or {}).get('mcp-session-id') != session_id:
-            return _FakeStatefulResponse(
-                status_code=400,
-                headers={'content-type': 'application/json'},
-                payload={'jsonrpc': '2.0', 'id': 'server-error',
-                         'error': {'code': -32600,
-                                   'message': 'Bad Request: Missing session ID'}},
-            )
-        return _FakeStatefulResponse(
-            headers={'content-type': 'application/json'},
-            payload={'jsonrpc': '2.0', 'id': 1,
-                     'result': {'structuredContent': {'id': 'esc-9', 'status': 'queued'}}},
-        )
-
-    return _post
-
-
-def _recording_delete(deleted):
-    """A fake `httpx.delete` recording the MCP session-termination call the
-    transport makes after a handshake, so the long-lived escalation server does
-    not leak a session per trickle escalation."""
-    def _delete(url, **kwargs):
-        deleted.append((url, kwargs))
-        return _FakeStatefulResponse(status_code=200)
-
-    return _delete
-
-
-def test_post_escalation_lands_against_a_stateful_server(tmp_path, install_fake_httpx):
-    """The DEFAULT poster (no `poster=` injection) must handshake and land."""
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
-    recorded = []
-    deleted = []
-    install_fake_httpx(
-        _stateful_escalation_post(recorded), delete=_recording_delete(deleted),
+    result = nightly.run_nightly(
+        config_path=_write_config(tmp_path, project_id='testproj'),
+        projects_root=tmp_path / 'projects',
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+        invoke=lambda prompt, model: '{"proposals": []}',
+        completion_runner=_passing_completion_runner,
+        poster=poster,
+        selector=_selector,
+        pass_kind=nightly.PassKind.MANUAL,
     )
 
-    assert nightly.post_escalation(cfg, 'summary text', 'detail text') is True
-
-    methods = [(kwargs.get('json') or {}).get('method') for _url, kwargs in recorded]
-    assert methods == [
-        'tools/call', 'initialize', 'notifications/initialized', 'tools/call',
-    ]
-    # The retried call carries the server-assigned session id...
-    assert (recorded[-1][1].get('headers') or {}).get('mcp-session-id') == 'sid-nightly'
-    # ...and is still the escalate_info the trickle meant to file.
-    params = (recorded[-1][1].get('json') or {})['params']
-    assert params['name'] == 'escalate_info'
-    assert params['arguments']['summary'] == 'summary text'
-    # ...and the session opened to file it is released again.
-    assert [(kw.get('headers') or {}).get('mcp-session-id') for _u, kw in deleted] == [
-        'sid-nightly'
-    ]
-
-
-def test_post_escalation_reports_false_on_a_tool_error_envelope(
-    tmp_path, install_fake_httpx, caplog
-):
-    """HTTP 200 is not success. `post_escalation` discards the response body
-    and reports True on "no exception", so a tool-level failure
-    (`result.isError: true`) would otherwise read as a landed escalation --
-    the same green-on-paper/nothing-filed failure task 3644 exists to close,
-    one layer up from the transport."""
-    cfg = load_config(_write_config(tmp_path, project_id='proj_a'))
-
-    def _post(url, **kwargs):
-        return _FakeStatefulResponse(
-            headers={'content-type': 'application/json'},
-            payload={'jsonrpc': '2.0', 'id': 1, 'result': {
-                'isError': True,
-                'content': [{'type': 'text', 'text': "unknown category 'nope'"}],
-            }},
-        )
-
-    install_fake_httpx(_post)
-
-    with caplog.at_level(logging.WARNING):
-        assert nightly.post_escalation(cfg, 'summary text', 'detail text') is False
-
-    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert any('escalation post failed' in m for m in warned), warned
-    assert any('isError' in m or 'reported an error' in m for m in warned), warned
+    assert result.budget_suppressed is True
+    assert 'suppress' in _one_escalation(posted)['summary']
+    [(rendered, skip_sessions)] = selector_calls
+    assert isinstance(rendered, dict)
+    assert skip_sessions == frozenset()
 
 
 # ---------------------------------------------------------------------------
-# task 4148: the tasks-landed condition, end to end through the PRODUCTION
-# entrypoint.
-#
-# Every other census test in this file enters at run_nightly or below, and
-# run_nightly has ALWAYS accepted a status_fetcher -- so all of them passed
-# throughout the dead period. The defect was specifically that the systemd
-# ExecStart (`nightly.py run --project-id %i` -> main()) wired nothing, which
-# only a test entering at main() can catch. The journal shows the resulting
-# fail-safe line on 2026-08-10, 2026-08-11 and 2026-08-12:
-# "tasks-landed: no status_fetcher configured -- condition (b) fails safe".
-#
-# HAZARD, now that the fetcher default is live (amendment): ANY run_nightly or
-# main() test that writes a valid non-negative `last_census_done_count` into
-# census-state.json and injects no `status_fetcher` will issue a REAL POST to
-# $FUSED_MEMORY_MCP_URL (default localhost:8002) -- and on a dev box where
-# fused-memory is actually up, a stale fixture baseline against the real
-# done-count can produce a genuine FIRE that subprocess-launches
-# scripts/legibility/census.py, i.e. real LLM spend and real git writes.
-# Such a test MUST both fake httpx (conftest's `install_fake_httpx`) AND stub
-# `nightly._default_census_launcher`. The two tests below are the pattern.
+# The completion condition, end to end through the PRODUCTION entrypoint:
+# the systemd ExecStart (`nightly.py run --project-id %i` -> main()) injects
+# nothing, which only a test entering at main() can pin. These run the REAL
+# check_run_completion.py against a StubMcpServer behind
+# FUSED_MEMORY_MCP_URL, and spy the census.py subprocess
+# (`_spy_census_subprocess_and_stub_pool`).
 # ---------------------------------------------------------------------------
 
 class _UnusedRunner:
@@ -4730,227 +5991,108 @@ class _UnusedRunner:
         pass
 
 
-def _stub_census_launcher_and_pool(monkeypatch):
-    """Stub both of a ``main()``-driven run's reaches into the real world, and
-    return the launcher's call list, one ``(args, kwargs)`` pair per call.
+def _spy_census_subprocess_and_stub_pool(monkeypatch):
+    """Keep a ``main()``-driven run off both of its reaches into the real
+    world, and return the argv of every census.py launch.
 
-    MANDATORY, not cosmetic, on both counts. On FIRE the real launcher
-    subprocess-runs scripts/legibility/census.py (real LLM spend + real git
-    writes) and ``_default_entrypoint_exists`` is true in a real checkout --
-    and reaching FIRE is the entire point of the tests that call this. And
-    main() -- which injects no ``invoke`` -- makes run_nightly open a REAL
-    pooled session runner over the operator's own roster and
-    CLAUDE_OAUTH_TOKEN_* vars. A test about the census trigger has no
-    business touching either.
+    The real launcher's census.py subprocess is recorded and answered rc 0,
+    never run (real LLM spend + real git writes); every other subprocess.run
+    is delegated to the real one. And main() -- which injects no ``invoke`` --
+    would open a REAL pooled session runner over the operator's own roster,
+    so the runner factory hands back an :class:`_UnusedRunner`.
     """
-    launcher_calls = []
-    monkeypatch.setattr(
-        nightly, '_default_census_launcher',
-        lambda *args, **kwargs: launcher_calls.append((args, kwargs)),
-    )
+    census_argvs = []
+    real_run = subprocess.run
+
+    def _run(args, *rest, **kwargs):
+        if len(args) > 1 and str(args[1]).endswith('census.py'):
+            census_argvs.append(list(args))
+            return subprocess.CompletedProcess(args, 0)
+        return real_run(args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', _run)
     monkeypatch.setattr(
         session_runner, 'open_pooled_runner', lambda *_args, **_kwargs: _UnusedRunner(),
     )
-    return launcher_calls
+    return census_argvs
 
 
-def test_main_run_fires_the_tasks_landed_condition_end_to_end(
-    tmp_path, monkeypatch, caplog, install_fake_httpx,
-):
-    """Drive `nightly.main(['run', '--config', ...])` -- the systemd-invoked
-    CLI -- against a project whose census baseline is 8 days and 130 done
-    tasks stale, and assert condition (b) fires, that the absolute
-    project_root crossed the MCP wire, and that the decision reaches the
-    journal.
-
-    8 days is chosen against the shipped config.py:66-77 defaults so ONLY
-    condition (b) can fire: clear of (a) max_interval_days=10, at/above (b)'s
-    tasks_landed_min_days=7, and above the floor_days=5 hard floor. main()
-    exposes no `now` seam, so the anchor is relative to real now.
-    """
+def _completion_project(tmp_path):
+    """A project whose previous census run decides the night, with an empty
+    codebook (no novelty spike, no unreadable-codebook warning) and an empty
+    projects root (no digests, so no LLM and no commit). main() exposes no
+    ``now`` seam, so the state is anchored on real now. Returns
+    ``(config_path, projects_root)``."""
     config_path = _write_config(tmp_path, project_id='proj_a')
     legibility_dir = tmp_path / 'docs' / 'legibility'
-
-    # A genuine non-negative int baseline: task 4085's validity arm
-    # (census_trigger.py:724-733) returns None BEFORE the fetcher is reached
-    # for a bool/float/str, which would make this test pass for the wrong
-    # reason -- or rather, fail for one.
-    (legibility_dir / 'census-state.json').write_text(
-        json.dumps({
-            'last_census_at': (datetime.now(UTC) - timedelta(days=8)).isoformat(),
-            'last_census_report': 'docs/legibility/census-2026-08-09.md',
-            'last_census_done_count': 1000,
-        }),
-        encoding='utf-8',
-    )
-    # Present-but-empty, so condition (c) sees 0 candidates AND
-    # decide_for_project logs no unreadable-codebook warning.
+    _write_census_state(tmp_path, _completion_census_state(datetime.now(UTC)))
     codebook.dump(
         {'version': 2, 'entries': [], 'candidates': []},
         legibility_dir / 'confusion-codebook.yaml',
     )
-
-    # 1130 done - 1000 baseline = 130 landed, over the 120 threshold.
-    recorded = []
-
-    def _fake_post(url, **kwargs):
-        recorded.append((url, kwargs))
-        return _FakeStatefulResponse(
-            headers={'content-type': 'application/json'},
-            payload={
-                'jsonrpc': '2.0',
-                'id': 1,
-                'result': {
-                    'structuredContent': {
-                        'statuses': {f't{i}': 'done' for i in range(1130)},
-                    },
-                },
-            },
-        )
-
-    install_fake_httpx(_fake_post)
-
-    launcher_calls = _stub_census_launcher_and_pool(monkeypatch)
-
-    # Empty -> empty sample -> no digests -> `invoke` is never called and
-    # nothing is committed, so no LLM and no git.
     projects_root = tmp_path / 'projects'
     projects_root.mkdir()
+    return config_path, projects_root
+
+
+def _main_run(config_path, projects_root):
+    return nightly.main([
+        'run', '--config', str(config_path),
+        '--projects-root', str(projects_root),
+        '--date', '2026-07-13',
+    ])
+
+
+def test_main_run_fires_the_completion_condition_end_to_end(tmp_path, monkeypatch, caplog):
+    config_path, projects_root = _completion_project(tmp_path)
+    census_argvs = _spy_census_subprocess_and_stub_pool(monkeypatch)
+    call_tool, _lookups = _run_lookup_store(_LANDED_RUN_ROWS)
 
     # caplog rather than `_isolated_root_logging`: that helper empties
-    # root.handlers, which is exactly where pytest's own capture handler
-    # lives, so nothing would be captured. It is also unnecessary here --
-    # `configure_logging` goes through `logging.basicConfig`, a documented
-    # no-op while root has handlers, so main()'s call cannot leak root state
-    # for as long as caplog's handler is installed.
-    with caplog.at_level(logging.INFO, logger='legibility.nightly'):
-        exit_code = nightly.main([
-            'run', '--config', str(config_path),
-            '--projects-root', str(projects_root),
-            '--date', '2026-07-13',
-        ])
+    # root.handlers, which is where pytest's capture handler lives.
+    with (
+        StubMcpServer(stateful=False, tools=call_tool) as fused_memory,
+        caplog.at_level(logging.INFO, logger='legibility.nightly'),
+    ):
+        monkeypatch.setenv('FUSED_MEMORY_MCP_URL', fused_memory.url)
+        exit_code = _main_run(config_path, projects_root)
 
     messages = [r.getMessage() for r in caplog.records]
-
-    # (i) condition (b) fired all the way through the production entrypoint.
     assert exit_code == 0
-    assert len(launcher_calls) == 1, (
-        'the census launcher never fired end-to-end. Read the captured log '
-        'BEFORE suspecting the wiring: task 4085 turns any exception out of '
-        '`decide` into a quiet synthetic NO-FIRE line rather than a '
-        f'traceback. messages={messages}'
-    )
-
-    # (ii) task 3291's wire contract, now exercised from the nightly path:
-    # fused-memory's _normalize_project_root hard-rejects a relative path.
-    cfg = load_config(config_path)
-    get_statuses_calls = [
-        kwargs for _url, kwargs in recorded
-        if (kwargs.get('json') or {}).get('params', {}).get('name') == 'get_statuses'
-    ]
-    assert len(get_statuses_calls) == 1, recorded
-    sent_root = get_statuses_calls[0]['json']['params']['arguments']['project_root']
-    assert sent_root == str(cfg.project_root)
-    assert Path(sent_root).is_absolute()
-
-    # (iii) the decision reaches the journal. Without this, a healthy
-    # condition-(b) evaluation is indistinguishable from the still-dead one
-    # in `journalctl --user -u legibility-trickle@dark_factory` -- the very
-    # channel that diagnosed task 4148.
+    assert len(census_argvs) == 1, messages
+    [argv] = census_argvs
+    assert _adjacent_pair(argv, '--project-root') == ['--project-root', str(tmp_path)]
     assert any(
-        'tasks-landed: 130 landed since last census (threshold 120) -> FIRE' in m
+        m.startswith('legibility trickle: census trigger: FIRE')
+        and f'completion: 0.8571 of {_PREVIOUS_RUN} (threshold 0.70) -> FIRE' in m
         for m in messages
     ), messages
 
-    # (iv) task 3269: the census launched from the systemd entry point is aimed
-    # at THIS project and THIS legibility.yaml, never at the process cwd.
-    launch_args, launch_kwargs = launcher_calls[0]
-    assert launch_args == (str(tmp_path),)
-    assert launch_kwargs['config_path'] == Path(config_path).resolve()
 
-
-def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memory(
-    tmp_path, monkeypatch, caplog, install_fake_httpx,
+def test_main_run_fails_safe_when_the_completion_check_cannot_reach_fused_memory(
+    tmp_path, monkeypatch, caplog,
 ):
-    """The twin of the test above, on the FAILURE path (task 4148 amendment).
-
-    Now that `run_nightly` always BUILDS a real MCP-backed fetcher, "the
-    fused-memory server is down" is reachable on every production night --
-    not only when a caller injects a raising fake. The existing fail-safe
-    coverage injects at the `compute_tasks_landed` level, which is exactly
-    the shape of coverage that let the wiring gap survive three prior
-    repairs; this test instead enters at `main()` and lets the DEFAULTED
-    fetcher be the thing that fails. A transport error must degrade to a
-    NO-FIRE line plus warnings -- never a non-zero exit, and never a census
-    launch off an unobserved done-count.
-    """
-    config_path = _write_config(tmp_path, project_id='proj_a')
-    legibility_dir = tmp_path / 'docs' / 'legibility'
-
-    # The same 8-day, valid-int baseline as the happy-path twin: it clears
-    # task 4085's validity arm and (b)'s tasks_landed_min_days=7, so the fetch
-    # is genuinely REACHED and its failure is the only reason (b) goes N/A.
-    # 8d is also under max_interval_days=10, so no OTHER condition fires and
-    # the launcher assertion below cannot pass for the wrong reason.
-    (legibility_dir / 'census-state.json').write_text(
-        json.dumps({
-            'last_census_at': (datetime.now(UTC) - timedelta(days=8)).isoformat(),
-            'last_census_report': 'docs/legibility/census-2026-08-09.md',
-            'last_census_done_count': 1000,
-        }),
-        encoding='utf-8',
-    )
-    codebook.dump(
-        {'version': 2, 'entries': [], 'candidates': []},
-        legibility_dir / 'confusion-codebook.yaml',
-    )
-
-    # fused-memory down. `post_mcp_envelope` touches only `httpx.post` and
-    # `httpx.delete` (task 3376) and lets transport exceptions escape
-    # verbatim, so this reaches `default_status_fetcher`'s wrapper and comes
-    # out as StatusFetchUnavailable -- the real production shape.
-    posts = []
-
-    def _refusing_post(url, **kwargs):
-        posts.append((url, kwargs))
-        raise ConnectionError('[Errno 111] Connection refused')
-
-    install_fake_httpx(_refusing_post)
-
-    launcher_calls = _stub_census_launcher_and_pool(monkeypatch)
-
-    projects_root = tmp_path / 'projects'
-    projects_root.mkdir()
+    """A dead fused-memory is reachable on every production night now that
+    the real check always runs: it must degrade to a NO-FIRE plus one
+    completion WARNING, never a non-zero exit and never a census launch."""
+    config_path, projects_root = _completion_project(tmp_path)
+    with StubMcpServer(stateful=False) as fused_memory:
+        pass
+    monkeypatch.setenv('FUSED_MEMORY_MCP_URL', fused_memory.url)
+    census_argvs = _spy_census_subprocess_and_stub_pool(monkeypatch)
 
     with caplog.at_level(logging.INFO, logger='legibility.nightly'):
-        exit_code = nightly.main([
-            'run', '--config', str(config_path),
-            '--projects-root', str(projects_root),
-            '--date', '2026-07-13',
-        ])
+        exit_code = _main_run(config_path, projects_root)
 
     messages = [r.getMessage() for r in caplog.records]
-
-    # The nightly run is unaffected by a dead fused-memory...
     assert exit_code == 0
-    assert launcher_calls == [], messages
-
-    # ...but the fetch really was attempted through the DEFAULTED seam, so
-    # this test cannot go green on a fetcher that was never built.
-    get_statuses_calls = [
-        kwargs for _url, kwargs in posts
-        if (kwargs.get('json') or {}).get('params', {}).get('name') == 'get_statuses'
+    assert census_argvs == [], messages
+    completion_warnings = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and r.getMessage().startswith('completion:')
     ]
-    assert len(get_statuses_calls) == 1, posts
-
-    # The failure is legible on both channels an operator has: the specific
-    # WARNING naming the fetch, and the one-line NO-FIRE decision.
-    assert any('tasks-landed: status_fetcher failed' in m for m in messages), messages
-    assert any(
-        m.startswith('legibility trickle: census trigger: NO-FIRE')
-        and 'tasks-landed: delta unavailable (no baseline/fetcher) -> N/A' in m
-        for m in messages
-    ), messages
+    assert len(completion_warnings) == 1, messages
+    assert 'store_unreachable' in completion_warnings[0]
 
 
 # ---------------------------------------------------------------------------
@@ -4964,9 +6106,6 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
 # inherits the guarantee for free -- it cannot reach `escalated=...` without
 # passing through the one log site.
 #
-# Nothing here asserts on the escalation payload: `_build_escalation_arguments`
-# and the envelope are deliberately untouched by this task.
-#
 # Driven through the SHARED `_run_e2e_nightly` helper, which is also what the
 # trickle-state recorder suite runs on -- one e2e fixture and one copy of the
 # branch dispatch, so "the four branches" cannot come to mean different things
@@ -4978,21 +6117,18 @@ def test_main_run_fails_safe_when_the_defaulted_fetcher_cannot_reach_fused_memor
     [
         ('extractor', 'extractor crashed', 'boom: corrupt transcript'),
         ('storm', 'coder storm', 'could not parse a JSON object'),
-        ('validation', 'failed validation', 'synthetic validation error'),
+        ('validation', 'failed validation', _INVALID_SEVERITY_ERROR),
         ('commit', 'commit failed', 'cannot lock ref (simulated)'),
     ],
 )
 def test_every_fail_loud_branch_journals_its_reason_with_the_server_down(
-    tmp_path, monkeypatch, caplog, branch, summary_marker, detail_marker,
+    tmp_path, caplog, branch, summary_marker, detail_marker,
 ):
-    def _raising_poster(url, envelope):
+    def _raising_poster(url, arguments):
         raise RuntimeError('escalation server unreachable')
 
     with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
-        result, _repo = _run_e2e_nightly(
-            tmp_path, monkeypatch=monkeypatch, branch=branch,
-            poster=_raising_poster,
-        )
+        result, _repo = _run_e2e_nightly(tmp_path, branch=branch, poster=_raising_poster)
 
     assert result.exit_code == 1
     assert result.escalated is False, (
@@ -5016,7 +6152,7 @@ def test_every_fail_loud_branch_journals_its_reason_with_the_server_down(
 # task 4511 step-3/4: the three EXIT-0 escalation sites stay at WARNING, and
 # are logged exactly ONCE.
 #
-# `post_escalation` now journals every escalation itself, so the two call
+# The alarm journals every escalation itself, so the two call
 # sites that already logged the pair would double-log, and all three exit-0
 # sites would be promoted to ERROR. Neither is acceptable: the budget door,
 # the barren streak and the deletion-directive aggregate all deliberately
@@ -5035,17 +6171,11 @@ def test_every_fail_loud_branch_journals_its_reason_with_the_server_down(
 def test_budget_suppression_door_journals_once_at_warning(tmp_path, caplog):
     """The budget-suppression door escalates AND exits 0, so its journal
     line stays a WARNING -- and there is exactly one of it, not a call-site
-    WARNING plus a post_escalation ERROR."""
-    cfg = _cfg_for(tmp_path)
-    posted = []
-
+    WARNING plus an alarm ERROR."""
     with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
-        escalated = nightly._report_sample_outcome(
-            cfg, _sample(budget_skipped=4), date(2026, 7, 13),
-            poster=lambda url, env: posted.append((url, env)),
-        )
+        result, posted = _run_sampled_night(tmp_path, _sample(budget_skipped=4))
 
-    assert escalated is True
+    assert [alarm.kind for alarm in result.alarms] == [nightly.AlarmKind.BUDGET_SUPPRESSED]
     assert len(posted) == 1
 
     loud = _nightly_warnings(caplog)
@@ -5068,31 +6198,22 @@ def test_budget_suppression_door_journals_once_at_warning(tmp_path, caplog):
 def test_barren_streak_journals_once_at_warning(tmp_path, caplog):
     """Same rule for the sibling streak escalation: it explicitly refuses to
     touch `result.exit_code`, so it stays out of `journalctl -p err`."""
-    cfg = _cfg_for(tmp_path)
-    result = nightly.NightlyResult(exit_code=0)
-    posted = []
-    doc = {
-        'outcome': trickle_state.OUTCOME_BARREN,
-        'consecutive_barren_runs': trickle_state.DEFAULT_MAX_BARREN_RUNS,
-        'counters': {'budget_skipped': 2},
-        'last_productive_at': '2026-07-12T03:00:00+00:00',
-    }
+    runner = _NightRunner(tmp_path)
+    for day in (13, 14):
+        runner.night(day, 'barren')
 
     with caplog.at_level(logging.DEBUG, logger='legibility.nightly'):
-        nightly._escalate_barren_streak(
-            cfg, doc, date(2026, 7, 15), result,
-            poster=lambda url, env: posted.append((url, env)),
-        )
+        third = runner.night(15, 'barren')
 
-    assert result.barren_escalated is True
-    assert len(posted) == 1
-
+    assert third.barren_escalated is True
     loud = _nightly_warnings(caplog)
-    assert [r.levelname for r in loud] == ['WARNING'], (
+    streak = [r for r in loud if 'consecutive runs' in r.getMessage()]
+    assert [r.levelname for r in streak] == ['WARNING'], (
         f'expected exactly one WARNING; got '
-        f'{[(r.levelname, r.getMessage()) for r in loud]}'
+        f'{[(r.levelname, r.getMessage()) for r in streak]}'
     )
-    message = loud[0].getMessage()
+    assert [r for r in loud if r.levelno >= logging.ERROR] == []
+    message = streak[0].getMessage()
     assert (
         f'produced nothing for {trickle_state.DEFAULT_MAX_BARREN_RUNS} '
         f'consecutive runs'
@@ -5123,8 +6244,8 @@ def test_deletion_directive_aggregate_journals_once_at_warning(tmp_path, caplog)
             target_date=date(2026, 7, 13),
             now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
             invoke=_fake_invoke_deletion_directive,
-            status_fetcher=None,
             poster=lambda url, env: escalations.append((url, env)),
+            pass_kind=nightly.PassKind.MANUAL,
         )
 
     assert result.exit_code == 0
@@ -5185,26 +6306,24 @@ class TestRunNightlyLedgersCodedSessions:
         assert result.ledger_rows_written == 1
         assert result.ledger_rows_failed == 0
 
-    def test_the_row_is_ledgered_before_the_census_step_runs(self, tmp_path, monkeypatch):
-        seen_by_census_step = []
+    def test_the_row_is_ledgered_before_the_census_step_runs(self, tmp_path):
+        seen_by_census = []
+        launcher, _launches = _recording_census_launcher(
+            on_launch=lambda root: seen_by_census.append(_ledger().sessions),
+        )
 
-        def _spy(cfg, **kwargs):
-            seen_by_census_step.append(_ledger().sessions)
-            return 'census: spy', False
+        result, _repo = _run_e2e_nightly(
+            tmp_path, census_state=_OLD_CENSUS, census_launcher=launcher,
+        )
 
-        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy)
-        result, _repo = _run_e2e_nightly(tmp_path)
-
-        assert result.census_line == 'census: spy'
-        assert seen_by_census_step == [frozenset({'session-1'})]
+        assert result.census_fire is True
+        assert seen_by_census == [frozenset({'session-1'})]
 
     @pytest.mark.parametrize(
         'branch', ['extractor', 'storm', 'capped', 'validation', 'commit'],
     )
-    def test_a_night_that_did_not_land_its_coding_ledgers_nothing(
-        self, tmp_path, monkeypatch, branch,
-    ):
-        result, _repo = _run_e2e_nightly(tmp_path, monkeypatch=monkeypatch, branch=branch)
+    def test_a_night_that_did_not_land_its_coding_ledgers_nothing(self, tmp_path, branch):
+        result, _repo = _run_e2e_nightly(tmp_path, branch=branch)
 
         assert result.commit_made is False
         assert _ledger().sessions == frozenset()

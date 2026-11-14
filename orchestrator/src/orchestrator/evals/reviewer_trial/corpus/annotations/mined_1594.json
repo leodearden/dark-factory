@@ -8,6 +8,70 @@
       "severity": "suggestion",
       "description": "The new __init__.py guidance states as a blanket rule that for cross_project findings 'cite_task is the sole dedup anchor there', but the stage2.py section it cross-references defines two sub-cases: only sub-case (1) (a local task is the subject) has a cite_task anchor; in sub-case (2) (work lives entirely in the unknown target project) cite_task returns unknown_project and attaches nothing, so the finding is deduped by its normalised description \u2014 not by cite_task. The summary overgeneralizes and can mislead the recon agent for the target-project-only case.",
       "mutation_type": "other"
+    },
+    {
+      "id": "mined_1594_pool_01",
+      "location": "fused-memory/tests/test_stages.py:10058",
+      "category": "out_of_scope_edit",
+      "severity": "suggestion",
+      "description": "The change's only edit to fused-memory/tests/test_stages.py deletes one trailing blank line at end of file; it is unrelated to the task (a prompt fix) and is pure diff noise. The file still ends with a blank line afterwards.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1594_pool_02",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:118-129",
+      "category": "prompt_names_private_symbols",
+      "severity": "suggestion",
+      "description": "The LLM-facing prompt text now names private Python implementation symbols (_derive_affected_ids, compute_content_fingerprint) in the new unknown-target cross_project sub-case (stage2.py:119-129) and in the shared _RECON_REPORT_TOOL_GUIDANCE used by Stages 1-3 (__init__.py:87-95), restating the fingerprint mechanism a second/third time inside one long run-on bullet. The model cannot act on the names, they cost tokens every run, and a rename of those functions silently makes the prompt stale with no gate catching it; the behavioural rule (cite the local subject task so the finding is recognised across cycles) would suffice.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1594_pool_03",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:119",
+      "category": "missing_test",
+      "severity": "suggestion",
+      "description": "No test pins the new instruction in STAGE2_SYSTEM_PROMPT's unknown-target cross_project branch (cite_task the LOCAL subject task with the local project_id), nor the behaviour it relies on (a task_id=None cross_project finding citing a task in the cycle's own project gets a cited_tasks entry and a description-independent compute_content_fingerprint). A later prompt edit could drop sub-case (1), or reword it to cite the target project, with every test still green; the only test-file change is a whitespace deletion.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1594_pool_04",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/__init__.py:68-76",
+      "category": "duplicated_comment_spot",
+      "severity": "suggestion",
+      "description": "The rewritten '# Dedup anchor' comment block (__init__.py:68-76) restates nearly verbatim the _RECON_REPORT_TOOL_GUIDANCE string directly below it, and the same mechanism is described again in stage2.py's Cross-Project Routing section, so three prose copies must be kept in sync (the prior copy already drifted, which is what this task corrected). It also carries change-history provenance ('corrected task-1594') that belongs in the commit message.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1594_pool_05",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/__init__.py:87-95",
+      "category": "inaccurate_prompt_guidance",
+      "severity": "suggestion",
+      "description": "The rewritten shared report-tool guidance (used in the Stage 1, 2 and 3 system prompts) describes only the escalation-fingerprint dedup path (_derive_affected_ids -> compute_content_fingerprint, which reads cited_* lists and never the top-level task_id) and then calls top-level task_id a 'supplementary stable anchor' for multi-task findings whose cited_tasks signature shifts, implying it stabilises that fingerprint, which it does not. It drops the previously true statement that the flag-dedup path (flag_dedup.compute_flag_signature, used for cross-cycle Stage 1 flag markers and in-run (task_id, flag_type) dedup in recon_report.add_finding) prefers the top-level task_id and uses sorted cited_tasks only as a fallback. The guidance therefore misattributes which anchor feeds which dedup mechanism.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1594_pool_06",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:123",
+      "category": "prompt_payload_mismatch",
+      "severity": "suggestion",
+      "description": "The new sub-case (1) tells the LLM 'The local task's project_id IS in \"Known Projects\" (this cycle is bound to it)', but TaskKnowledgeSync._format_known_projects_section returns '' when fewer than two projects are known, so in a single-project deployment the payload has no Known Projects section, while the same prompt section says cite_task only records citations for project_ids listed in Known Projects. cite_task itself succeeds (ReconReportState.known_projects includes the primary root), but the prompt's stated precondition contradicts what the model sees and may lead it to skip the local citation.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1594_pool_07",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/__init__.py:77-95",
+      "category": "scope_expansion",
+      "severity": "suggestion",
+      "description": "The task asked only for a Stage 2 Cross-Project Routing prompt change, but the diff also rewrites _RECON_REPORT_TOOL_GUIDANCE, which is interpolated into the Stage 1 and Stage 3 system prompts as well, changing the dedup-anchor instructions all three stages receive without the task record or commit stating that cross-stage effect.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1594_pool_08",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:119-131",
+      "category": "missing_ordering_instruction",
+      "severity": "suggestion",
+      "description": "Sub-case (1) instructs Stage 2 to cite_task the local subject task 'even when it is being re-scoped or cancelled', and the next bullet permits deleting such a local task, but nothing says to cite before deleting. ReconReportState.cite_task looks the task up via get_task and returns task_not_found (appending nothing) when it no longer exists, so a delete-then-cite order silently loses the anchor and the finding falls back to description-only dedup.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

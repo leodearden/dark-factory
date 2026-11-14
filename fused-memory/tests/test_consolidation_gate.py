@@ -18,6 +18,7 @@ regex over prose is a worse pin rather than a better one.
 from __future__ import annotations
 
 import dataclasses
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -27,8 +28,12 @@ from _fused_memory_tool_surface import (
     denied_fused_memory_tool_names,
     fused_memory_tool_names_mentioned,
 )
+from shared.task_metadata import HUMAN_CURATOR_ADJUDICATED_AT_KEY, HUMAN_CURATOR_GATE_KEY
 
 from fused_memory import memory_metadata
+from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.middleware.deterministic_task_guard import deterministic_task_error
 from fused_memory.middleware.execution_class_guard import execution_class_error
 from fused_memory.reconciliation import consolidation_gate
@@ -37,8 +42,12 @@ from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
     ClosureVerdict,
     build_consolidation_gate_task,
+    declared_gate_topic,
     evaluate_closure,
     render_end_state_brief,
+)
+from fused_memory.reconciliation.curator_gate_resolution_sweep import (
+    extract_open_gate_task_ids,
 )
 
 
@@ -104,7 +113,12 @@ def _member(mid, *, canonical=None, topic=_TOPIC, supersedes=None, **extra_meta)
 
 
 def _uuid(n):
+    """Digits and dashes only, so `.upper()` is a no-op: a case-folding test
+    must use `_HEX_LETTERED_UUID`."""
     return f'00000000-0000-4000-8000-{n:012d}'
+
+
+_HEX_LETTERED_UUID = 'abcdef00-0000-4000-8000-00000000004a'
 
 
 def _closure(members, gate_block=None, **kwargs):
@@ -286,7 +300,8 @@ class TestClosureSupersedes:
         must not manufacture a false absorbed_member_still_live, nor hide a
         real one: is_full_uuid tolerates case because casing is a rendering
         choice, not a different identifier."""
-        absorbed = _uuid(4)
+        absorbed = _HEX_LETTERED_UUID
+        assert absorbed.upper() != absorbed
         members = [
             _member(_uuid(1), canonical=True, supersedes=[absorbed.upper()]),
             _member(absorbed),
@@ -410,7 +425,7 @@ class TestClosureRoutesProbeConfirmedClaims:
         assert 'absorbed_member_still_live' in codes
 
     def test_routing_is_case_insensitive(self):
-        mixed = 'abcdef00-0000-4000-8000-00000000004a'
+        mixed = _HEX_LETTERED_UUID
         assert mixed.upper() != mixed
         verdict = _closure(
             self._claiming([mixed.upper()]), unstamped_live_ids=[mixed]
@@ -907,7 +922,7 @@ class TestUnstampedCandidates:
         ) == ()
 
     def test_a_claim_and_an_observation_of_one_id_dedupe_case_insensitively(self):
-        mixed = 'abcdef00-0000-4000-8000-00000000004a'
+        mixed = _HEX_LETTERED_UUID
         assert mixed.upper() != mixed
         assert consolidation_gate.unstamped_candidates(
             _prov([mixed]), members=self._claiming([mixed.upper()])
@@ -934,10 +949,11 @@ class TestUnstampedCandidates:
     def test_scroll_matching_is_case_insensitive(self):
         """Mirrors `evaluate_closure`\'s own case-folded `live_ids`, so the two
         cannot disagree about what the scroll saw."""
-        members = [_member(_uuid(1).upper(), canonical=True)]
+        assert _HEX_LETTERED_UUID.upper() != _HEX_LETTERED_UUID
+        members = [_member(_HEX_LETTERED_UUID.upper(), canonical=True)]
         assert (
             consolidation_gate.unstamped_candidates(
-                _prov([_uuid(1)]), members=members
+                _prov([_HEX_LETTERED_UUID]), members=members
             )
             == ()
         )
@@ -951,7 +967,8 @@ class TestUnstampedCandidates:
 
     def test_the_original_id_spelling_is_returned_not_the_folded_one(self):
         """A refusal must name the id exactly as the gate recorded it."""
-        stray = _uuid(42).upper()
+        stray = _HEX_LETTERED_UUID.upper()
+        assert stray.lower() != stray
         assert consolidation_gate.unstamped_candidates(
             _prov([stray]), members=_well_formed_cluster(2)
         ) == (stray,)
@@ -1607,3 +1624,145 @@ class TestImportLeafAndSingleHomes:
 
         assert consolidation_gate.is_valid_topic_slug is ts.is_valid_topic_slug
         assert memory_metadata.is_valid_topic_slug is ts.is_valid_topic_slug
+
+
+
+# --------------------------------------------------------------------------- #
+# PRD C6 — the hazard gate the auto-consolidation executor files (task 5240).
+# --------------------------------------------------------------------------- #
+
+
+def _auto_gate(**overrides):
+    kwargs = {
+        'topic': _TOPIC,
+        'observed_members': [_uuid(1), _uuid(2), _uuid(3)],
+        'report_run': 'run-proposal-1',
+        'detector': 'auto-consolidation',
+        'reason_codes': {
+            'canonical_carries_correction': [_uuid(9)],
+            'member_unreadable': [_uuid(2), _uuid(3)],
+        },
+        'auto_predicate_version': '1',
+        'category': 'procedural_knowledge',
+        'rationale': 'the incumbent canonical carries superseded_by',
+    }
+    kwargs.update(overrides)
+    return build_consolidation_gate_task(**kwargs)
+
+
+class TestAutoRefusalGateShape:
+    def test_metadata_is_a_human_curator_pure_gate(self):
+        meta = _auto_gate().metadata
+        assert meta[HUMAN_CURATOR_GATE_KEY] is True
+        assert meta['task_kind'] == 'deterministic'
+        assert meta['always_escalates'] is True
+        assert meta['execution_class'] == 'operational'
+        assert meta['operational_mode'] == 'gate'
+        assert 'before_done' not in meta
+
+    def test_the_gate_block_carries_topic_members_and_the_refusal(self):
+        block = _auto_gate().metadata[GATE_METADATA_KEY]
+        assert block['topic'] == _TOPIC
+        assert block['provenance']['observed_members'] == [_uuid(1), _uuid(2), _uuid(3)]
+        assert block['provenance']['authoritative'] is False
+        assert block['auto_refusal'] == {
+            'reason_codes': {
+                'canonical_carries_correction': [_uuid(9)],
+                'member_unreadable': [_uuid(2), _uuid(3)],
+            },
+            'predicate_version': '1',
+            'category': 'procedural_knowledge',
+        }
+
+    def test_the_description_names_every_code_with_its_ids(self):
+        description = _auto_gate().description
+        assert 'canonical_carries_correction' in description
+        assert 'member_unreadable' in description
+        for member in (_uuid(9), _uuid(2), _uuid(3)):
+            assert member in description
+
+    def test_the_description_carries_the_stamp_instruction(self):
+        description = _auto_gate().description
+        assert 'update_task(' in description
+        assert HUMAN_CURATOR_ADJUDICATED_AT_KEY in description
+        assert 'metadata_mode' in description
+        assert 'merge' in description
+
+    def test_the_description_embeds_the_end_state_brief(self):
+        assert render_end_state_brief() in _auto_gate().description
+
+    def test_the_default_title_names_topic_and_run(self):
+        title = _auto_gate().title
+        assert _TOPIC in title
+        assert 'run-proposal-1' in title
+
+    def test_two_runs_for_one_topic_get_different_candidate_keys(self):
+        first = _auto_gate(report_run='run-a')
+        second = _auto_gate(report_run='run-b')
+        assert compute_candidate_key(first.title, []) != compute_candidate_key(
+            second.title, []
+        )
+
+    def test_reason_codes_without_a_predicate_version_raise(self):
+        with pytest.raises(ValueError, match='auto_predicate_version'):
+            _auto_gate(auto_predicate_version=None)
+
+    def test_an_empty_reason_code_mapping_raises(self):
+        with pytest.raises(ValueError, match='reason_codes'):
+            _auto_gate(reason_codes={})
+
+    def test_the_submission_satisfies_the_deterministic_guard(self):
+        spec = _auto_gate()
+        assert deterministic_task_error(spec.task_kind, spec.metadata, str(Path.cwd())) is None
+
+
+class TestLegacyGateIsUnchanged:
+    def test_no_curator_marker_and_no_refusal_block(self):
+        spec = build_consolidation_gate_task(
+            topic=_TOPIC, rationale='why', observed_members=[_uuid(1)],
+        )
+        assert HUMAN_CURATOR_GATE_KEY not in spec.metadata
+        assert 'auto_refusal' not in spec.metadata[GATE_METADATA_KEY]
+        assert set(spec.metadata) == {
+            'task_kind',
+            'always_escalates',
+            'execution_class',
+            'operational_mode',
+            GATE_METADATA_KEY,
+        }
+
+    def test_the_legacy_text_names_the_topic_and_no_stamp_instruction(self):
+        spec = build_consolidation_gate_task(topic=_TOPIC, rationale='why')
+        assert _TOPIC in spec.title
+        assert HUMAN_CURATOR_ADJUDICATED_AT_KEY not in spec.description
+        assert 'update_task(' not in spec.description
+
+
+class TestRawFiledAutoGate:
+    """PRD D8: the executor files through the raw backend, skipping the
+    interceptor's guards, so the stored gate must still pass them and be
+    visible to the readers that dedup on it."""
+
+    @pytest.mark.asyncio
+    async def test_a_raw_filed_gate_reads_back_as_a_valid_open_gate(self, tmp_path):
+        project_root = str(tmp_path)
+        backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+        await backend.start()
+        try:
+            spec = _auto_gate()
+            added = await backend.add_task(
+                project_root=project_root,
+                title=spec.title,
+                description=spec.description,
+                priority=spec.priority,
+                metadata=json.dumps(spec.metadata),
+            )
+            task = await backend.get_task(str(added['id']), project_root)
+        finally:
+            await backend.close()
+
+        meta = task['metadata']
+        assert deterministic_task_error(meta['task_kind'], meta, project_root) is None
+        assert declared_gate_topic(meta) == _TOPIC
+        assert extract_open_gate_task_ids([task]) == [str(task['id'])]
+        assert meta[HUMAN_CURATOR_GATE_KEY] is True

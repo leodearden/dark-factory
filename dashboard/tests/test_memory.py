@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -15,8 +16,10 @@ from _dashboard_helpers import (
     cold_session_responses,
     mcp_init_response,
     mcp_notify_response,
+    mcp_sse_tool_response,
     mcp_tool_response,
 )
+from shared.mcp_post import MCP_POST_HEADERS, mcp_endpoint_url
 from shared.testing_virtual_clock import virtual_clock_test
 
 from dashboard.data.datum import Datum, DatumState, unknown_datum, validate_datum
@@ -44,6 +47,11 @@ class _SessionAwareHandler:
       cannot bound, and the one that used to wedge a cached session or park an
       aggregating loop before it reached the remaining urls.
 
+    ``make_raw_tool_response`` is the framing knob: a factory for a finished
+    ``httpx.Response`` (an SSE-framed or malformed reply), called afresh on
+    every ``tools/call`` and returned verbatim in place of wrapping the
+    ``tool_response`` dict in the default JSON envelope.
+
     ``__call__`` is ``async`` for the sake of that last knob:
     ``httpx.MockTransport.handle_async_request`` awaits a handler that returns
     an awaitable, so parking here parks the post exactly as a silent server
@@ -54,8 +62,10 @@ class _SessionAwareHandler:
     def __init__(self, tool_response: dict | None = None, *, error_status: int | None = None,
                  error_on_tool: Exception | None = None, error_on_all: Exception | None = None,
                  fail_port: int | None = None,
-                 hang_port: int | None = None, hang_always: bool = False):
+                 hang_port: int | None = None, hang_always: bool = False,
+                 make_raw_tool_response: Callable[[], httpx.Response] | None = None):
         self.tool_response = tool_response or {}
+        self.make_raw_tool_response = make_raw_tool_response
         self.error_status = error_status
         self.error_on_tool = error_on_tool
         self.error_on_all = error_on_all
@@ -115,6 +125,8 @@ class _SessionAwareHandler:
             # session cache-able — and therefore wedge-able.
             await self._never.wait()
             raise AssertionError('unreachable')  # pragma: no cover
+        if self.make_raw_tool_response is not None:
+            return self.make_raw_tool_response()
         return mcp_tool_response(self.tool_response, request_id)
 
 
@@ -197,6 +209,20 @@ class TestSessionAwareHandler:
         )
         assert response.status_code == 200
         assert handler.tool_calls == 0, 'no tools/call was issued'
+
+
+def _stall_host_before(port, seconds, handler):
+    """Wrap *handler* so a request to *port* first blocks the loop THREAD for *seconds*.
+
+    Models a starved xdist worker: the wall clock moves while the event loop cannot run.
+    """
+
+    async def stalled(request: httpx.Request) -> httpx.Response:
+        if request.url.port == port:
+            time.sleep(seconds)
+        return await handler(request)
+
+    return stalled
 
 
 @pytest.fixture(autouse=True)
@@ -318,19 +344,26 @@ class TestMcpToolCallInvalidatesOnHang:
     TimeoutError from its own wait_for and never invalidated at all).
     """
 
+    @virtual_clock_test
     async def test_cancellation_invalidates_the_cached_session(self):
+        """Runs on shared/src/shared/testing_virtual_clock.py::virtual_clock_test."""
         from dashboard.data.memory import _get_session, _sessions, mcp_tool_call
 
+        deadline_seconds = 0.05
+        host_stall_seconds = 2 * deadline_seconds
         url = 'http://localhost:8000'
         handler = _SessionAwareHandler(hang_always=True)
-        transport = httpx.MockTransport(handler)
+        transport = httpx.MockTransport(
+            _stall_host_before(8000, host_stall_seconds, handler),
+        )
         _get_session(url)
         assert url in _sessions
 
         async with httpx.AsyncClient(transport=transport) as client:
             with pytest.raises(TimeoutError):
                 await asyncio.wait_for(
-                    mcp_tool_call(client, url, 'get_status', {}), timeout=0.05,
+                    mcp_tool_call(client, url, 'get_status', {}),
+                    timeout=deadline_seconds,
                 )
 
         assert handler.tool_calls == 1, 'the hang must be in tools/call'
@@ -353,6 +386,28 @@ class TestMcpToolCallInvalidatesOnHang:
 
         assert url not in _sessions, (
             'an escaping builtin TimeoutError must evict the session too'
+        )
+
+    async def test_httpx_timeout_evicts_the_session_so_the_next_call_reinitialises(self):
+        """An httpx per-request expiry is hang-shaped. An outer ``wait_for``
+        sized by ``memory.py::enclosing_deadline`` lets it arrive un-pre-empted,
+        so the guard must evict on it just as it evicts on a cancellation.
+        """
+        from dashboard.data.memory import mcp_tool_call
+
+        url = 'http://localhost:8000'
+        handler = _SessionAwareHandler(error_on_tool=httpx.ReadTimeout(''))
+        transport = httpx.MockTransport(handler)
+
+        async with httpx.AsyncClient(transport=transport) as client:
+            for _ in range(2):
+                with pytest.raises(httpx.ReadTimeout):
+                    await mcp_tool_call(client, url, 'get_status', {})
+
+        handshakes = [c['method'] for c in handler.calls].count('initialize')
+        assert handshakes == 2, (
+            'a session whose tools/call timed out must be evicted, so the next '
+            f'call re-runs the handshake; saw {handshakes} initialize request(s)'
         )
 
     async def test_http_status_error_propagates_WITHOUT_invalidating(self):
@@ -482,6 +537,13 @@ class TestMcpToolCallTimeoutBudget:
             f'omitting timeout must keep the pre-existing 10s default on every '
             f'post, got {timeouts}'
         )
+
+
+def test_enclosing_deadline_headroom_dwarfs_scheduling_jitter():
+    """Merely positive headroom would still let the outer timer win the race."""
+    from dashboard.data.memory import enclosing_deadline
+
+    assert all(enclosing_deadline(b) - b >= 0.5 for b in (0.05, 5.0))
 
 
 class TestAggregateTimeoutBudget:
@@ -663,21 +725,48 @@ class TestRemainingHelpersThreadTheirBudget:
 # ── SSE response parsing ───────────────────────────────────────
 
 
+def _sse_reply_without_a_data_line() -> httpx.Response:
+    return httpx.Response(
+        200, text='event: message\n\n', headers={'content-type': 'text/event-stream'},
+    )
+
+
 class TestSseResponseParsing:
-    """Tests for SSE response format handling."""
+    """A Streamable-HTTP SSE answer is decoded through the public seam.
 
-    def test_parse_sse_response(self):
-        from dashboard.data.memory import _parse_sse_response
+    The decoder's own contract (both ``data:`` prefixes, last frame wins, the
+    error wording) is owned and pinned by ``shared/tests/test_mcp_post.py``;
+    these pin only that the dashboard's entry points route through it.
+    """
 
-        sse = 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"content":[]}}\n\n'
-        result = _parse_sse_response(sse)
-        assert result['jsonrpc'] == '2.0'
+    async def test_sse_framed_tool_reply_is_decoded(self):
+        from dashboard.data.memory import mcp_tool_call
 
-    def test_parse_sse_no_data_raises(self):
-        from dashboard.data.memory import _parse_sse_response
+        handler = _SessionAwareHandler(
+            make_raw_tool_response=lambda: mcp_sse_tool_response({'ok': True}),
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
 
-        with pytest.raises(ValueError, match='No data line'):
-            _parse_sse_response('event: message\n\n')
+        assert result == {'ok': True}
+
+    async def test_sse_reply_without_a_data_line_raises_value_error(self):
+        from dashboard.data.memory import mcp_tool_call
+
+        handler = _SessionAwareHandler(make_raw_tool_response=_sse_reply_without_a_data_line)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(ValueError):
+                await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
+
+    async def test_undecodable_reply_reports_memory_status_offline(self, dashboard_config):
+        """ValueError is a per-URL soft failure (``FANOUT_FAILURE_EXCEPTIONS``)."""
+        from dashboard.data.memory import get_memory_status
+
+        handler = _SessionAwareHandler(make_raw_tool_response=_sse_reply_without_a_data_line)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await get_memory_status(client, dashboard_config)
+
+        assert result['offline'] is True
 
 
 # ── Headers ─────────────────────────────────────────────────────
@@ -686,32 +775,32 @@ class TestSseResponseParsing:
 class TestMcpHeaders:
     """Tests that the MCP client sends correct HTTP headers."""
 
-    async def test_accept_header_includes_both_types(self):
-        """Requests include Accept: application/json, text/event-stream."""
+    async def test_every_post_sends_the_shared_mcp_post_headers_to_the_shared_endpoint(self):
+        """Initialize, notify and tools/call all carry shared.mcp_post's wire contract.
+
+        The base is given WITH a trailing slash: the endpoint must still be the
+        slash-less ``/mcp`` that ``mcp_endpoint_url`` produces.
+        """
         from dashboard.data.memory import mcp_tool_call
 
-        captured_headers: list[dict] = []
+        base_url = 'http://localhost:8000/'
+        server = _SessionAwareHandler({'ok': True})
+        posts: list[httpx.Request] = []
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured_headers.append(dict(request.headers))
-            body = json.loads(request.content)
-            method = body.get('method', '')
-            rid = body.get('id', 1)
-            if method == 'initialize':
-                return mcp_init_response(rid)
-            if method.startswith('notifications/'):
-                return mcp_notify_response()
-            return mcp_tool_response({'ok': True}, rid)
+        async def recording_server(request: httpx.Request) -> httpx.Response:
+            posts.append(request)
+            return await server(request)
 
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(transport=transport) as client:
-            await mcp_tool_call(client, 'http://localhost:8000', 'get_status', {})
+        async with httpx.AsyncClient(transport=httpx.MockTransport(recording_server)) as client:
+            await mcp_tool_call(client, base_url, 'get_status', {})
 
-        # All requests should have the dual Accept header
-        for headers in captured_headers:
-            accept = headers.get('accept', '')
-            assert 'application/json' in accept, f'Missing application/json in {accept}'
-            assert 'text/event-stream' in accept, f'Missing text/event-stream in {accept}'
+        assert [c['method'] for c in server.calls] == [
+            'initialize', 'notifications/initialized', 'tools/call',
+        ]
+        for request in posts:
+            assert request.headers['content-type'] == MCP_POST_HEADERS['Content-Type']
+            assert request.headers['accept'] == MCP_POST_HEADERS['Accept']
+            assert str(request.url) == mcp_endpoint_url(base_url)
 
     async def test_session_id_sent_after_init(self):
         """After initialize, subsequent requests include Mcp-Session-Id header."""
@@ -995,20 +1084,6 @@ class TestAggregatingLoopsLogFailuresAtWarning:
             f'five poll cycles against one dead server must warn once, got '
             f'{[r.getMessage() for r in warnings]}'
         )
-
-
-def _stall_host_before(port, seconds, handler):
-    """Wrap *handler* so a request to *port* first blocks the loop THREAD for *seconds*.
-
-    Models a starved xdist worker: the wall clock moves while the event loop cannot run.
-    """
-
-    async def stalled(request: httpx.Request) -> httpx.Response:
-        if request.url.port == port:
-            time.sleep(seconds)
-        return await handler(request)
-
-    return stalled
 
 
 # ── one hung url must not starve the hand-rolled per-URL loops ──

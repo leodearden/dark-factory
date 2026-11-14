@@ -49,7 +49,7 @@ def _route(record: Escalation, **kw: Any) -> Disposition:
 _ONE_OF_EACH_VARIANT: list[tuple[Disposition, str]] = [
     (Addressed(), 'resolution_class'),
     (ObservationConsumed(), 'resolution_class'),
-    (StatusInfo('orchestrator-offline-lane'), 'class_key'),
+    (StatusInfo('orchestrator-starvation-watchdog'), 'class_key'),
     (ConvertViaCurator(CuratorCandidate('t', 'd', 'esc-77-3', '77')), 'payload'),
     (PromoteWithHint(PromoteReason.NO_CONVERTIBLE_CONTENT), 'reason'),
     (Defer(DeferReason.REQUEUED_EXIT), 'reason'),
@@ -301,7 +301,7 @@ class TestPurity:
                 {'reviewer_disposition': ReviewerDisposition.ADDRESSED},
                 id='reviewer',
             ),
-            pytest.param(info_l0_note(agent_role='orchestrator-offline-lane'), {}, id='mechanical'),
+            pytest.param(info_l0_note(agent_role='orchestrator-starvation-watchdog'), {}, id='mechanical'),
             pytest.param(
                 info_l0_note(suggested_action='No action required.'), {}, id='observation',
             ),

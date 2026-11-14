@@ -54,10 +54,12 @@ def main_repo(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def worktree(tmp_path: Path, main_repo: Path) -> Path:
-    """A REAL linked worktree off `main_repo`, at `<base>/<name>`."""
+    """A REAL linked worktree off `main_repo`, at `<base>/<task id>` as
+    GitOps.create_worktree names it — never `task-<id>`, which is the
+    task-root shape (`TaskArtifacts.task_root_for`)."""
     base = tmp_path / 'worktrees'
     base.mkdir()
-    wt = base / 'task-2904'
+    wt = base / '2904'
     _git(['worktree', 'add', '-b', 'task/2904', str(wt), 'main'], main_repo)
     return wt
 
@@ -81,19 +83,19 @@ class TestComputeWriteSetHappyPath:
     """
 
     def test_writeset_is_frozen(self, worktree: Path, tmp_home: Path):
-        ws = compute_write_set(worktree, home=tmp_home)
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
         assert isinstance(ws, WriteSet)
         with pytest.raises(dataclasses.FrozenInstanceError):
             ws.worktree = Path('/tmp/other')  # type: ignore[misc]
 
     def test_worktree_field_is_resolved_worktree(self, worktree: Path, tmp_home: Path):
-        ws = compute_write_set(worktree, home=tmp_home)
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
         assert ws.worktree == worktree.resolve()
 
     def test_git_carveouts_resolve_off_main_git(
         self, worktree: Path, main_repo: Path, tmp_home: Path,
     ):
-        ws = compute_write_set(worktree, home=tmp_home)
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
         name = worktree.name
         assert ws.git_objects == (main_repo / '.git' / 'objects').resolve()
         assert ws.git_task_refs == (
@@ -112,16 +114,37 @@ class TestComputeWriteSetHappyPath:
         # git's own admin-dir naming coincidence: the internal worktrees/<name>
         # dir is named after the worktree's own basename — task_id never
         # enters path derivation.
-        ws = compute_write_set(worktree, home=tmp_home)
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
         assert ws.git_worktree_admin.name == worktree.name
 
     def test_task_meta_matches_meta_root_for(self, worktree: Path, tmp_home: Path):
-        ws = compute_write_set(worktree, home=tmp_home)
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
         expected = TaskArtifacts.meta_root_for(worktree.parent, worktree.name).resolve()
         assert ws.task_meta == expected
 
+    def test_task_root_matches_task_root_for(self, worktree: Path, tmp_home: Path):
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
+        assert ws.task_root == TaskArtifacts.task_root_for(worktree.parent, '2904').resolve()
+
+    def test_task_root_is_granted_right_after_task_meta(self, worktree: Path, tmp_home: Path):
+        paths = compute_write_set(worktree, task_id='2904', home=tmp_home).writable_paths()
+        assert paths[paths.index(TaskArtifacts.meta_root_for(
+            worktree.parent, worktree.name).resolve()) + 1] == (
+            TaskArtifacts.task_root_for(worktree.parent, '2904').resolve()
+        )
+
+    def test_a_single_root_dispatch_grants_no_task_root(self, worktree: Path, tmp_home: Path):
+        lane_root = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+        ws = compute_write_set(worktree, task_id='2904', task_root=lane_root, home=tmp_home)
+        assert ws.task_root == lane_root.resolve()
+        assert TaskArtifacts.task_root_for(worktree.parent, '2904').resolve() not in ws.writable_paths()
+
+    def test_invalid_task_id_raises(self, worktree: Path, tmp_home: Path):
+        with pytest.raises(ValueError):
+            compute_write_set(worktree, task_id='a/b', home=tmp_home)
+
     def test_home_derived_static_paths(self, worktree: Path, tmp_home: Path):
-        ws = compute_write_set(worktree, home=tmp_home)
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
         assert ws.uv_cache == (tmp_home / '.cache' / 'uv').resolve()
         assert ws.claude_fleet == (tmp_home / '.claude' / 'fleet').resolve()
         assert ws.tmp == Path('/tmp')
@@ -133,18 +156,19 @@ class TestComputeWriteSetHappyPath:
         # alpha1 FINAL-WRITABLE-LIST: ~/.claude/fleet/ ONLY. Neither the
         # whole ~/.claude dir nor ~/.claude/hooks/state may appear anywhere
         # in the aggregate writable-path list.
-        ws = compute_write_set(worktree, home=tmp_home)
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
         paths = ws.writable_paths()
         assert tmp_home.resolve() / '.claude' not in paths
         assert (tmp_home.resolve() / '.claude' / 'hooks' / 'state') not in paths
 
-    def test_writable_paths_returns_exactly_the_ten_named_fields_in_order(
+    def test_writable_paths_returns_exactly_the_eleven_named_fields_in_order(
         self, worktree: Path, tmp_home: Path,
     ):
-        ws = compute_write_set(worktree, home=tmp_home)
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
         expected = [
             ws.worktree,
             ws.task_meta,
+            ws.task_root,
             ws.git_objects,
             ws.git_task_refs,
             ws.git_task_reflogs,
@@ -156,10 +180,10 @@ class TestComputeWriteSetHappyPath:
         ]
         paths = ws.writable_paths()
         assert paths == expected
-        assert len(paths) == 10
+        assert len(paths) == 11
 
     def test_purity_no_makedirs_side_effect(self, worktree: Path, tmp_home: Path):
-        ws = compute_write_set(worktree, home=tmp_home)
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
         assert not ws.uv_cache.exists()
 
 
@@ -177,7 +201,7 @@ class TestTaskMetaSymlinkResolution:
     naive join: the real meta dir lives at `<tmp>/real-meta/<name>`, and
     `<base>/.task-meta` is a symlink to `<tmp>/real-meta`. Also creates
     `<worktree>/.task/plan.json` as an actual symlink into that real meta
-    dir (via `TaskArtifacts.ensure_lane_plan_symlink`) to mirror production.
+    dir (via `TaskArtifacts.ensure_lane_symlinks`) to mirror production.
     """
 
     def test_task_meta_resolves_through_symlinked_base(
@@ -194,14 +218,28 @@ class TestTaskMetaSymlinkResolution:
         ta = TaskArtifacts(worktree, meta_root)
         ta.init('task-2904', 'Test Task', 'Desc')
         ta.write_plan({'steps': []})
-        ta.ensure_lane_plan_symlink()
+        ta.ensure_lane_symlinks()
 
-        ws = compute_write_set(worktree, home=tmp_home)
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
 
         expected = (real_meta_root / worktree.name).resolve()
         assert ws.task_meta == expected
         # NOT the unresolved symlinked path.
         assert ws.task_meta != base_task_meta / worktree.name
+
+    def test_task_root_resolves_through_symlinked_base(
+        self, tmp_path: Path, worktree: Path, tmp_home: Path,
+    ):
+        real_meta_root = tmp_path / 'real-meta'
+        real_meta_root.mkdir()
+        base_task_meta = worktree.parent / '.task-meta'
+        base_task_meta.symlink_to(real_meta_root, target_is_directory=True)
+        TaskArtifacts.for_task(worktree, '2904').init('2904', 'Test Task', 'Desc')
+
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
+
+        assert ws.task_root == (real_meta_root / 'task-2904').resolve()
+        assert ws.task_root != base_task_meta / 'task-2904'
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +266,7 @@ class TestGitdirParsingRobustness:
         worktree.mkdir()
 
         with pytest.raises(ValueError) as exc_info:
-            compute_write_set(worktree, home=tmp_home)
+            compute_write_set(worktree, task_id='2904', home=tmp_home)
         assert str(worktree / '.git') in str(exc_info.value)
 
     def test_git_is_directory_raises_value_error(self, tmp_path: Path, tmp_home: Path):
@@ -237,7 +275,7 @@ class TestGitdirParsingRobustness:
         (worktree / '.git').mkdir()
 
         with pytest.raises(ValueError) as exc_info:
-            compute_write_set(worktree, home=tmp_home)
+            compute_write_set(worktree, task_id='2904', home=tmp_home)
         assert str(worktree / '.git') in str(exc_info.value)
 
     @pytest.mark.parametrize('content', ['', 'garbage\n'])
@@ -249,7 +287,7 @@ class TestGitdirParsingRobustness:
         (worktree / '.git').write_text(content)
 
         with pytest.raises(ValueError) as exc_info:
-            compute_write_set(worktree, home=tmp_home)
+            compute_write_set(worktree, task_id='2904', home=tmp_home)
         assert str(worktree / '.git') in str(exc_info.value)
 
     def test_relative_gitdir_resolves_relative_to_worktree(
@@ -266,7 +304,7 @@ class TestGitdirParsingRobustness:
         worktree.mkdir()
         (worktree / '.git').write_text('gitdir: ../main-repo/.git/worktrees/my-wt\n')
 
-        ws = compute_write_set(worktree, home=tmp_home)
+        ws = compute_write_set(worktree, task_id='2904', home=tmp_home)
 
         assert ws.git_worktree_admin == admin.resolve()
         assert ws.git_objects == (main_git / 'objects').resolve()
@@ -283,6 +321,7 @@ def _make_write_set(**overrides: Path) -> WriteSet:
     fields: dict[str, Path] = dict(
         worktree=Path('/wt'),
         task_meta=Path('/base/.task-meta/wt'),
+        task_root=Path('/base/.task-meta/task-1'),
         git_objects=Path('/main/.git/objects'),
         git_task_refs=Path('/main/.git/refs/heads/task'),
         git_task_reflogs=Path('/main/.git/logs/refs/heads/task'),

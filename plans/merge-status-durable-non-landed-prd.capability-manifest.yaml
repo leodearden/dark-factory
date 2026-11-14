@@ -210,3 +210,5 @@ tasks:
       kind: manual
       reason: the bound is asserted by boundary row B10 itself against a seeded production-sized
         store
+signal_leaves:
+- ζ

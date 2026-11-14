@@ -1,0 +1,57 @@
+import json,time,collections,bisect,calendar,math,statistics as st
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+rows=[]
+for l in open('/home/leo/src/reify/data/verify-logs/verify-runs.jsonl',errors='replace'):
+    try:r=json.loads(l)
+    except Exception:continue
+    rows.append(r)
+evs=[]
+for r in rows:
+    for s in r.get('steps',[]):
+        if s.get('began_at') and s.get('ended_at'):evs.append((s['began_at'],s['ended_at'],s['phase']))
+phases=collections.Counter()
+for a,b,p in evs:phases[p]+=b-a
+top=[p for p,_ in phases.most_common(10)]
+print('phase share h',[(p,round(phases[p]/3600)) for p in top])
+byp={p:(sorted(a for a,b,q in evs if q==p),sorted(b for a,b,q in evs if q==p)) for p in top}
+def active(p,t):
+    s,e=byp[p];return bisect.bisect_right(s,t)-bisect.bisect_right(e,t)
+S=json.load(open('/tmp/3190s/phases.json'))['seeds']
+C=[s for s in S if 'clone0' in s and 'clone1' in s and s['clone0']>=calendar.timegm((2026,10,15,0,0,0))]
+for en,lo,hi in (('10-15..18',calendar.timegm((2026,10,15,0,0,0)),calendar.timegm((2026,10,19,0,0,0))),('10-22..30',calendar.timegm((2026,10,22,0,0,0)),9e12)):
+    v=[s for s in C if lo<=s['clone0']<hi]
+    print(en,'n',len(v))
+    for p in top:
+        A=[s['clone1']-s['clone0'] for s in v if active(p,(s['clone0']+s['clone1'])/2)>0];Z=[s['clone1']-s['clone0'] for s in v if active(p,(s['clone0']+s['clone1'])/2)==0]
+        if A and Z:print(f"   {p}: active n={len(A)} p50={pct(A,.5):.0f} | inactive n={len(Z)} p50={pct(Z,.5):.0f}")
+    none=[s['clone1']-s['clone0'] for s in v if all(active(p,(s['clone0']+s['clone1'])/2)==0 for p in top)]
+    print('   no top phase active n',len(none),'p50',round(pct(none,.5)) if none else None)
+# OLS on active counts
+X=[];Y=[]
+for s in C:
+    t=(s['clone0']+s['clone1'])/2;X.append([1]+[active(p,t) for p in top]);Y.append(math.log(s['clone1']-s['clone0']))
+n=len(X);q=len(X[0]);A=[[sum(X[i][a]*X[i][b] for i in range(n)) for b in range(q)] for a in range(q)];B=[sum(X[i][a]*Y[i] for i in range(n)) for a in range(q)]
+for i in range(q):
+    pv=A[i][i] or 1e-9
+    for j in range(i,q):A[i][j]/=pv
+    B[i]/=pv
+    for k in range(q):
+        if k!=i:
+            f=A[k][i]
+            for j in range(i,q):A[k][j]-=f*A[i][j]
+            B[k]-=f*B[i]
+print('OLS log(clone) ~ active steps by phase, 10-15..30, n',n,'exp(coef)',[(p,round(math.exp(c),2)) for p,c in zip(['base']+top,B)])
+# quiet per gen
+R=json.load(open('/tmp/3190s/clone_psi.json'))
+gen={}
+for s in S:
+    if 'clone0' in s:gen[round(s['clone0'],3)]=s.get('gen')
+fp=sorted(float(l.split()[0]) for l in open('/tmp/3190s/fp.list'))
+b=collections.defaultdict(list)
+for r in R:
+    if r['psi_cpu_some_avg10']<15 and r['psi_io_some_avg10']<5:b[gen.get(round(r['t'],3))].append(r['c'])
+print('quiet per gen n>=15: gen n p10 p50')
+for g in sorted(k for k in b if k):
+    if len(b[g])>=15:print(g,len(b[g]),f"{pct(b[g],.1):.0f} {pct(b[g],.5):.0f}",end=' ; ')
+print()

@@ -28,8 +28,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _delivered_check_fixtures import install_delivered_check_script, script_check
 
-from orchestrator.landed_outbox import LandedOutbox, LandedRow
-from orchestrator.merge_queue import reconcile_landed_task
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow
+from orchestrator.merge_lane.worker import reconcile_landed_task
 
 # ---------------------------------------------------------------------------
 # Shared helpers (mirrors test_merge_queue_landed_reconciler.py)

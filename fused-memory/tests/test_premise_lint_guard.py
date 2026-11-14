@@ -229,9 +229,10 @@ class TestPremiseLintErrorInvariantMatrix:
     def test_recon_stage_marker_deletion_cross_clause_false_positive_accepts(self):
         """A benign description that mentions "Stage 3" in one clause and a
         correct "GC ... deletes the marker" in a separate clause — split by
-        a semicolon — must NOT be flagged. Regression guard for the
-        tempered-dot gap (`_GAP_NO_NEGATION`) spanning a clause terminator
-        and combining an unrelated "Stage 3" mention with a later, correct
+        a semicolon — must NOT be flagged. Regression guard for a
+        subject/verb/marker match spanning a clause terminator
+        (`recon_self_model._GAP_STOP`) and combining an unrelated "Stage 3"
+        mention with a later, correct
         "GC deletes" clause into a spurious subject/verb/object match; the
         sentence never asserts that Stage 3 deletes the marker."""
         result = premise_lint_error(

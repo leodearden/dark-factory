@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import errno as errno_module
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -39,6 +40,7 @@ def _make(
     verify_infra_retry_backoff_secs: float = 0.01,
     verify_infra_retry_max_backoff_secs: float = 0.1,
     max_consecutive_infra_resumes: int = 3,
+    task_verify=None,
 ) -> TaskWorkflow:
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -87,6 +89,7 @@ def _make(
         briefing=MagicMock(),
         mcp=MagicMock(),
         escalation_queue=queue,
+        task_verify=task_verify,
     )
 
     # Set up a fake worktree and artifacts so the loop doesn't crash on None
@@ -145,6 +148,30 @@ class TestVerifyInfraTransientRetry:
         assert outcome == WorkflowOutcome.DONE
         assert call_count == 2, f'Expected 2 calls to run_scoped_verification, got {call_count}'
         assert len(sleep_calls) >= 1, 'Expected at least one backoff sleep'
+
+    @pytest.mark.asyncio
+    async def test_the_retry_wraps_an_injected_task_verify_port(self):
+        """Task 6670: the bounded infra retry wraps the port, not only the module name."""
+        calls = 0
+
+        async def port(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC)
+            return _passed_result()
+
+        wf = _make(verify_infra_retry_max_attempts=3, task_verify=port)
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification') as module_verify,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            outcome = await wf._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert calls == 2
+        module_verify.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_task_never_set_to_pending_on_transient_retry(self):
@@ -791,6 +818,77 @@ class TestXdistWorkerCrashRetryNoDebugger:
             'DEBUGGER invocation — it must stay 0 when the failure is retried '
             'via the infra path and the debugger is never reached'
         )
+
+
+class TestExhaustedInfraHoldCarriesExceptionMessage:
+    """task 5527: the human resolving an infra_hold receives the VerifyInfraError's message."""
+
+    @staticmethod
+    async def _exhaust_window(wf: TaskWorkflow, exc: VerifyInfraError) -> WorkflowOutcome:
+        async def always_raise(*args, **kwargs):
+            raise exc
+
+        with (
+            patch.object(
+                wf, '_execute_iterations',
+                new=AsyncMock(return_value=WorkflowOutcome.PLANNED),
+            ),
+            patch('orchestrator.workflow.run_scoped_verification', side_effect=always_raise),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            return await wf._execute_verify_review_loop()
+
+    @staticmethod
+    def _infra_hold_block_call(wf: TaskWorkflow):
+        mark_blocked = cast(AsyncMock, wf._mark_blocked)
+        mark_blocked.assert_awaited_once()
+        call = mark_blocked.await_args
+        assert call is not None
+        assert call.kwargs['category'] == 'infra_issue'
+        assert call.kwargs['escalate_to_human'] is True
+        assert call.kwargs['block_status'] == 'infra-hold'
+        return call
+
+    @pytest.mark.asyncio
+    async def test_xdist_crash_message_reaches_the_infra_hold_detail(self):
+        message = (
+            'bare pytest-xdist worker crash reclassified as transient infra; '
+            'crashed: orchestrator/tests/test_x.py::test_y; '
+            'logs archived: /data/verify-logs/1883/attempt-1.test-20261015T000000_000000Z.log'
+        )
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        outcome = await self._exhaust_window(
+            wf, VerifyInfraError(phase='xdist_worker_crash', errno=None, message=message),
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        call = self._infra_hold_block_call(wf)
+        assert message in call.kwargs['detail']
+        assert "phase='xdist_worker_crash' errno=None" in call.kwargs['detail']
+        assert call.args[0] == (
+            "Verify infra failure not resolved after 3 in-process retries "
+            "(phase='xdist_worker_crash' errno=None)"
+        )
+        assert wf._infra_hold_info is not None
+        assert wf._infra_hold_info['phase'] == 'xdist_worker_crash'
+        assert wf._infra_hold_info['errno'] is None
+
+    @pytest.mark.asyncio
+    async def test_default_message_rides_the_detail_and_routing_keys_hold(self):
+        wf = _make(verify_infra_retry_max_attempts=3)
+
+        outcome = await self._exhaust_window(
+            wf, VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC),
+        )
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        call = self._infra_hold_block_call(wf)
+        default_message = str(VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC))
+        assert default_message in call.kwargs['detail']
+        assert wf._infra_hold_info is not None
+        assert wf._infra_hold_info['phase'] == 'warm_marker'
+        assert wf._infra_hold_info['errno'] == errno_module.ENOSPC
 
 
 # ---------------------------------------------------------------------------

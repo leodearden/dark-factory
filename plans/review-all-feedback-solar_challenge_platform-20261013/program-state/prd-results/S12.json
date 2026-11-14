@@ -1,0 +1,31 @@
+{
+ "stream": "S12",
+ "prd_path": "docs/prds/review-all-validation-topology-as-a-value.md",
+ "manifest_path": "docs/prds/review-all-validation-topology-as-a-value.capability-manifest.yaml",
+ "leaves_estimate": 15,
+ "lead_rulings_on_open_questions": [
+  "Q1: S12 finds the golden account by Account.property_id == fleet_shape.home_id(slot) (D5); S25-alpha (1072) keeps runtime/seed.py::golden_fleet_account_id only while a runtime consumer remains — coordination note on 1072: drop it if its only consumer is tests.",
+  "Q2: sandbox-weekly HELD ('no sandbox credentials on this workstation') accepted; Leo may re-open for a weekly NO_SIGNAL reminder.",
+  "Q3: hold per capstone as chosen — smoke-nightly gains --dispatch --grid-charging, a new unheld dispatch-capstone-weekly lane, G1 alone held, G2 gets no lane; the new timer's host install (xi) is an operator act for Leo.",
+  "Q4: the core drill set as drafted (ingest-sigkill-mid-drain + broker-restart-mid-drain, GATING on exact drain count); harness self-test drills and the LATENCY/COMBINATION groups are deleted until a platform drill of that kind exists; 514 and 708 cancelled as subsumed.",
+  "Q5: S5-delta (1170) gains the public IngestSession constructor from Settings that IngestionService.from_settings also calls — coordination note on 1170; S12-theta depends on 1170 (wired, not held).",
+  "Tasks 308 and 437 (complete branches, pending) are re-driven through the merge queue by the lead once its restart drain lifts (admission halted on 2026-10-15); S12-gamma/beta/iota depend on 308/1016/437 regardless."
+ ],
+ "lead_actions_at_decompose": [
+  "amend 809 in place into iota (keep fk-2b47ea2764a9; add fk-2614d330cf39, fk-3fbdfe49527a)",
+  "cancel 514 (-> zeta items 1-2, beta item 4, 1016 item 3) and 708 (-> zeta) with x_acceptance_reason; stamp fk-e507cf236576 on 1016 and fk-8e67094cbf75 on 308 (step 2 matches)",
+  "edges 471 -> zeta and 472 -> zeta with dated coordination notes (P-Alert drills build on OwnTopology + run_through); notes on 411/416, 984, 213, 1072, 1170",
+  "nothing held — upstream filed: delta -> 1137 (S3-alpha) + 1151 (S3-epsilon) + 1093 (S26-iota); gamma -> 1180 (S6-theta) + 1188 (S6-mu) + 1090 (S25-gamma) + 1072 (S25-alpha) + 308 + 1016; eta -> 1186 (S6-lambda) + 1188 (S6-mu); zeta -> 1174 (S5-epsilon); theta -> 1170 (S5-delta); kappa -> 1125 (S14-alpha) + 1132 (S14-gamma); beta -> 1066 (S27-alpha) + 1016; mu -> 1079 (S22-epsilon); iota -> 437",
+  "high leaves alpha, beta, epsilon1, zeta, eta, nu -> gate 1065"
+ ],
+ "cross_reference_lines": [
+  "S18 Q1 realised: S12-delta removes all 7 validation -> runtime sites (the role passes a Compose callable: bill graph + bill operation, fakes bound by the role) and deletes _KNOWN_UPWARD_EDGES[('validation','runtime')]; S2's later bill_account move then changes one import in runtime/roles/validate.py and S2's leaves list no validation files for it.",
+  "S18 D7: the root leaf solar_challenge_platform/container_images.py goes in stratum 0 (S12-iota); the instance -> validation edge disappears.",
+  "S27: INV-2's enforcing node is RecordedVerdict.assess on an empty run dir (S12-alpha; alpha deletes FailureArtifacts) — amend S27's Appendix row; S12-zeta/eta delete the INV-10 allowlist entries for drills/live_burst.py and drills/dropped_readings.py.",
+  "S23-beta1: moot if S12-eta lands first (eta deletes observe_dispatch_wedge and its call); no edge.",
+  "S3 section 12: S12 keeps the validation BillingService( constructions (live_readers / grid_charging); if S3-beta3's required as_of lands first, beta3 passes it at those sites mechanically.",
+  "S6 D13: S12 declines RunGrade (no consumer once survival_ok is removed; D16).",
+  "S14 section 10: .github/dependabot.yml is not S12's (R12 names only the two workflows); its finding fk-5d943ec6029d is task 1031.",
+  "Briefing (interactive on main): drills now fault the live platform; NO_SIGNAL semantics; cadence = LANES only (workflows deleted)."
+ ]
+}

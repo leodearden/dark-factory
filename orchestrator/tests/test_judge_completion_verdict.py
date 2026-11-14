@@ -23,7 +23,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-from _workflow_helpers import _make
+from _merged_in_branch import branch_with_main_merged_in, diffed_paths
+from _workflow_helpers import _make, _make_git_ops, invoke_stub_awaiting_builder
 from shared.cli_invoke import AgentResult
 
 from orchestrator.agents.roles import JUDGE
@@ -220,3 +221,27 @@ class TestRunCompletionJudgeVerdictRouting:
         await f.wf._run_completion_judge([])
 
         assert 'output_schema' not in f.wf._invoke.call_args.kwargs
+
+
+@pytest.mark.asyncio
+class TestRunCompletionJudgeDiffsTheBranchsOwnWork:
+    """The 5695 shape: main merged into the branch after its creation-time base was stored."""
+
+    async def test_the_judge_sees_the_branch_s_own_change_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        merged = branch_with_main_merged_in(tmp_path)
+        f = _make(worktree=merged.worktree, project_root=tmp_path / 'proj')
+        f.artifacts.update_base_commit(merged.creation_sha)
+        f.wf.git_ops.get_diff_from_base = _make_git_ops(merged.repo).get_diff_from_base
+        build_prompt = AsyncMock(return_value='prompt')
+        f.wf.briefing.build_completion_judge_prompt = build_prompt
+        monkeypatch.setattr(
+            f.wf, '_invoke',
+            invoke_stub_awaiting_builder(AgentResult(success=False, output='')),
+        )
+
+        await f.wf._run_completion_judge([])
+
+        assert build_prompt.await_args is not None
+        assert diffed_paths(build_prompt.await_args.kwargs['diff']) == {'a.py'}

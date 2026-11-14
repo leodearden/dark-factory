@@ -1,0 +1,32 @@
+{
+ "stream": "S1",
+ "prd_path": "docs/prds/review-all-billing-engine-evidence-module-and-typed-facts.md",
+ "manifest_path": "docs/prds/review-all-billing-engine-evidence-module-and-typed-facts.capability-manifest.yaml",
+ "leaves_estimate": 14,
+ "lead_rulings_on_open_questions": [
+  "Q1 default accepted: a half-hour with any billed metric Absent or Measured(0) is unobserved like a missing one; it counts against period_coverage, is not under-metered, and makes the period at least ESTIMATED; COMPLETE = every expected half-hour fully observed.",
+  "Q2 accepted: validation and test paths that bill a later first period state the opening as that period's start at the call site (smoke/golden bill_account, grid_charging, the dropped-readings drill, tests/_hermetic_billing.py); the seed constant and the golden's money are unchanged.",
+  "Q3: S1 owns the definition and signature of BillingConfig.from_governed_finance (lands first per C2); S10 owns the optimiser call and retires _DEFAULT_*; task 267's 'delete from_governed_finance' is superseded (267 amended into S1-epsilon).",
+  "Q4: the ingestion half of fk-2426a5a9c9f7 (Subscriber's consent guard required; AllowAllConsentChecker as the named opt-out) is routed to S5 and stamped on S5's pipeline leaf (lead action after S5 decompose).",
+  "Q5 accepted: amend in place 194 -> alpha (item 2 -> theta), 267 -> epsilon, 555 -> delta, 365 -> zeta1, 519 -> zeta2, 422 -> zeta4 (if 422 lands first, zeta4 shrinks to SUPPLY_MOVES + the remainder); cancel 192 naming delta and 329 naming zeta2; 1022 and 1024 keep their keys.",
+  "Q6: the Postgres EXCLUDE constraint for supply overlap is out of scope (two Python enforcement points satisfy h10); optional for S7."
+ ],
+ "lead_actions_at_decompose": [
+  "amend 194, 267, 555, 365, 519, 422 in place; cancel 192, 329",
+  "add_dependency 521 -> S1-delta; notes on 221, 462, 350",
+  "gamma depends on 221 and 1022",
+  "high leaves alpha beta epsilon theta zeta1 zeta2 zeta3 zeta4 delta eta lambda -> gate 1065"
+ ],
+ "cross_reference_lines": [
+  "Program row S1 upstream deps: S26, S22, S21, S9, S17, S13, S3; 14 leaves.",
+  "Seam row billing/config.py governed-finance builder: S1 owns the definition (lands first, C2); S10 consumes.",
+  "S10's finance-as-of leaf depends on S1-epsilon and calls BillingConfig.from_governed_finance(store, at, base=BillingConfig()).",
+  "S16 depends on S1-delta (replaces price_plan's current-pointer fallback with assignment history; PricedSegment.tariff becomes FlatTariff | TouTariff; deletes the no_tariff/tariff_not_found fork).",
+  "S7's supply_dates leaves depend on S1-zeta4 and S17-epsilon (occupancy builds on supply_span, supplied(), window_after, SUPPLY_MOVES).",
+  "S2's statement.py leaves depend on S1-theta, zeta3, kappa; SkipReason folds not_supplied and no_property; S2 makes theta's persist-or-read-the-winner flush-only.",
+  "S12: billing readers call statement_of_record.statements_of / statement_for_period / statements_overlapping; contention only.",
+  "S5: Subscriber's consent guard becomes required (AllowAll as the named opt-out); stamp fk-2426a5a9c9f7.",
+  "S27 Appendix A row billing/statement.py is removed by S1-alpha.",
+  "Task 521 depends on S1-delta; task 221 gets a note (gamma unifies the observed predicate and the expected grid); tasks 462/350 get a note (run_billing decomposed into named steps by S1-theta)."
+ ]
+}

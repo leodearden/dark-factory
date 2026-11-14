@@ -115,7 +115,7 @@ SCRIPT_COVERAGE = {
 #:
 #: ``test_thin_warm_lane.sh``'s Block C df-delta assert is not a deduction: it is
 #: gated on ``REIFY_WARM_LANE_MOUNT``, which ``_sanitized_env`` always strips, so
-#: 45 is both its floor and its measured count under this driver.
+#: 74 is both its floor and its measured count under this driver.
 #:
 #: Any OTHER shortfall — a block short-circuited by a future edit — fails loudly
 #: here instead of passing as a green item that ran less than it claims.  Leaf γ
@@ -152,16 +152,48 @@ SCRIPT_COVERAGE = {
 #: that satisfies ``REQUIRED_HOST_TOOLS`` — it needs only ``git``.  NON-VACUOUS
 #: by construction: against the pre-port inline predicate the same block reports
 #: ``75 passed, 6 failed`` (K1/K5/K6, two asserts each).
+#:
+#: Dark-factory task 7862 then ported reify's seed-failure discard (Block
+#: S-discard, 43 asserts) and per-lane base-generation pin (Block T, 21) into
+#: ``warm-lane-gc.sh``, so that floor moved 280 → 336.  RE-MEASURED against the
+#: suite (``Results: 344 passed, 0 failed``), not raised to absorb a red, less
+#: the 8 asserts of S-discard3's ``id -u != 0`` arm — the only new skip guard,
+#: deducted on the same root-guarded rule as ``test_warm_lane_audit.sh``'s L9.
+#: NON-VACUOUS by construction: against the pre-port script the two blocks
+#: reported ``20`` and ``10`` failures respectively.
+#:
+#: Dark-factory task 7859 then added gc's skip-unchanged gate (Block V, 102
+#: asserts, plus A12's 3 for its new sibling lib) and the sweep's
+#: trash-and-emergency mode (Block Z, 28), so the floors moved 336 → 441 and
+#: 102 → 130.  RE-MEASURED against the suites (``Results: 449 passed, 0
+#: failed`` less S-discard3's 8 root-guarded asserts, and ``Results: 130
+#: passed, 0 failed``), not raised to absorb a red.  Neither block adds a skip
+#: guard.  NON-VACUOUS by construction: against the pre-change scripts they
+#: reported ``29`` and ``9`` failures respectively, and the four V5 arms added
+#: on review (NaN, Infinity, a non-object stamp, no python3; 17 asserts) 5 more.
+#:
+#: Dark-factory task 5307 then ported reify task 5823's live-process-reference
+#: gate into ``thin-warm-lane.sh`` with its coverage — A12, the B3 token pair,
+#: B3b and Block F — so the thin floor moved 45 → 75.  RE-MEASURED against the
+#: suite (``Results: 75 passed, 0 failed``), not raised to absorb a red.  The new
+#: asserts carry no skip guard; they need only ``flock`` and a readable ``/proc``.
+#: NON-VACUOUS by construction: against the pre-port script the same file reports
+#: ``61 passed, 14 failed``.
 ASSERT_FLOORS = {
-    'test_warm_lane_disk_guard.sh': 62,
-    'test_warm_lane_degenerate_ref.sh': 81,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
-    'test_thin_warm_lane.sh': 45,
-    'test_warm_lane_gc.sh': 278,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
-                                 #           + A11 12 + A11-boundary 5)
-    'test_warm_lane_gc_sweep.sh': 90,  # 86 + 4 (Block Y: bridge-cost seam contract)
-    'test_warm_lane_audit.sh': 225,  # 228 measured − 3 (L9, root-guarded)
+    'test_warm_lane_disk_guard.sh': 89,  # 79 + 10 (A10, task 5940)
+    'test_warm_lane_degenerate_ref.sh': 95,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
+                                             # + 3 (U8, task 5940)
+                                             # + 6 (M1-M3: merge arm from shared.merge_subject, task 6716)
+                                             # + 5 (M4-M5: the lib refuses an empty merge arm, task 6716)
+    'test_thin_warm_lane.sh': 74,  # 45 + 29 (A12 3, B3 2, B3b 6, Block F 18)
+    'test_warm_lane_gc.sh': 441,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
+                                 #           + A11 12 + A11-boundary 5) + 2 (A11m/A11n, task 5940)
+                                 # + 43 (S-discard) + 21 (T) − 8 (S-discard3, root-guarded; task 7862)
+                                 # + 105 (V/A12, task 7859)
+    'test_warm_lane_gc_sweep.sh': 130,  # 99 + 3 (G6g, task 5940) + 28 (Z, task 7859)
+    'test_warm_lane_audit.sh': 229,  # 232 measured − 3 (L9, root-guarded)
     'test_warm_lane_sizing_lifecycle.sh': 65,
-    'test_provision_warm_lane_fs.sh': 106,  # 111 measured − 5 (Block I, xfsprogs)
+    'test_provision_warm_lane_fs.sh': 110,  # 115 measured − 5 (Block I, xfsprogs)
 }
 
 #: ``test_helpers.sh::test_summary``'s pass/fail protocol line, verbatim.
@@ -333,6 +365,9 @@ def test_every_invocable_script_has_ported_coverage() -> None:
       invocation;
     * ``lib_lane_state.sh`` by the same audit suite's Block L and by
       ``test_lane_state_lib.py``, which pins it directly;
+    * ``lib_lane_seed.sh`` by ``test_warm_lane_gc.sh`` Block V, which drives
+      its one predicate through gc.sh's Pass 1, and A12, its missing-sibling
+      guard (task 7859);
     * ``lib_task_citation.sh`` — TWO of its three exports, by
       ``test_warm_lane_degenerate_ref.sh``: every classification runs through
       ``task_citation_message_cites``, and the ``--branch-prefix``
@@ -454,7 +489,8 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
             # stale the moment the kernel may recycle that pid.  So dispatch no
             # signal at all once the process has been reaped, mirroring
             # `shared.proc_group.terminate_process_group` step 1 and
-            # `deterministic_runner._terminate_process_tree`.
+            # `shared.proc_group.sigkill_process_group`'s reaped-leader
+            # short-circuit.
             #
             # `Popen.communicate(timeout=...)` deliberately does NOT reap on
             # timeout, so `returncode` is normally None here and the kill still
@@ -467,9 +503,9 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
             # pipe open times out with the leader an unreaped zombie whose pid
             # the kernel cannot recycle — so the frozen pgid is still valid and
             # the group must be killed, or the helper holds a lane flock for
-            # minutes and turns one timeout into a cascade.  This spelling is a
-            # literal mirror of `deterministic_runner._terminate_process_tree`,
-            # so both sites this task closed enforce the same two-part rule the
+            # minutes and turns one timeout into a cascade.  This spelling
+            # mirrors `shared.proc_group.sigkill_process_group`'s reaped-leader
+            # short-circuit, so both sites enforce the same two-part rule the
             # killpg guard's failure message states.
             if proc.returncode is None:
                 try:

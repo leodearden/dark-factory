@@ -33,7 +33,7 @@ green whose tip was likewise recorded empty would manufacture a false skip — s
 an empty tip fails closed exactly like None. ``event_store`` is duck-typed
 (only ``fetch_events_by_type_all_runs`` is used), and this module imports
 nothing beyond ``EventType`` + stdlib logging/typing, keeping it
-dependency-light like ``orchestrator.merge_completion`` / ``orchestrator.b3_gate``.
+dependency-light like ``orchestrator.merge_lane.completion`` / ``orchestrator.b3_gate``.
 """
 
 from __future__ import annotations

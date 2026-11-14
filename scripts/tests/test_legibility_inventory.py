@@ -28,10 +28,12 @@ from functools import lru_cache
 from pathlib import Path
 
 import pytest
-from legibility import digest
 from legibility import inventory as mod
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator import session_registry
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Repo root from scripts/tests/ — the same parents[2] derivation
 # scripts/tests/conftest.py already uses.
@@ -269,7 +271,6 @@ def _mirrors() -> tuple[tuple[str, Callable[[str], str]], ...]:
     nightly_tests = _load_sibling_test_module('test_legibility_nightly')
     return (
         ('legibility.inventory.encode_cwd', mod.encode_cwd),
-        ('legibility.digest._encode_cwd', digest._encode_cwd),
         ('test_legibility_nightly._encode_cwd', nightly_tests._encode_cwd),
         ('skills/spawn/spawn-claude.sh:_encode_cwd', _bash_encode_cwd),
     )
@@ -278,8 +279,9 @@ def _mirrors() -> tuple[tuple[str, Callable[[str], str]], ...]:
 class TestEncoderLockstep:
     """Every in-repo copy of the cwd encoding must agree with the canonical (task 3272).
 
-    The rule is duplicated five times across the repo (four Python, one bash),
-    and EVERY ONE was found to be missing the same character (``_`` -> ``-``)
+    The rule was once duplicated five times across the repo (four Python, one
+    bash; :func:`_mirrors` lists the copies that remain), and EVERY ONE was
+    found to be missing the same character (``_`` -> ``-``)
     at once — the four Python copies in task 3272, the bash copy in task 3464.
     The old ``inventory.encode_cwd`` docstring asserted the mirrors were "kept
     in lockstep with the canonical implementation" — a claim nothing checked,

@@ -24,6 +24,38 @@
       "severity": "suggestion",
       "description": "The multi-id wrapper instructions tell the agent to apply the 'tasks[*].newStatus' and 'no_op' rules to each results[i].result, but the original single-response shape is described as top-level {taskId, oldStatus, newStatus} / no_op \u2014 it is left ambiguous whether each results[i].result nests those fields under a 'tasks' array or carries them directly. This underspecification can cause the agent to look for newStatus/no_op at the wrong nesting level for wrapped multi-id responses and silently skip valid per-id success/no-op counting.",
       "mutation_type": "logic"
+    },
+    {
+      "id": "mined_1098_pool_01",
+      "location": "fused-memory/tests/test_stages.py:991",
+      "category": "missing_tests",
+      "severity": "blocking",
+      "description": "The task's test strategy requires pinning tests for the multi-id and no_op `set_task_status` response-shape rules and for the revised resolve_ticket verification rule, but the change modifies only stage2.py and adds or updates no test; nothing pins the 'Verifying Task Operations' guidance, so a later prompt edit can drop the no_op, multi-id or trust-curator rules undetected.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1098_pool_02",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:119",
+      "category": "spot",
+      "severity": "suggestion",
+      "description": "The prompt hand-copies the interceptor's wire shapes (CSV wrapper `{success, results:[{task_id, result}]}` and the `no_op` key) with no contract test or shared constant tying them to `TaskInterceptor.set_task_status`, so a change to those keys would leave the prompt silently describing a payload that no longer exists.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1098_pool_03",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:108",
+      "category": "prompt_structure",
+      "severity": "suggestion",
+      "description": "The set_task_status guidance is one run-on paragraph covering five response shapes, and it handles a per-id `error` explicitly only for multi-id wrappers; a single-id `error` response (terminal-exit gate, bulk-reset guard) falls under 'missing or ambiguous \u2192 get_task', costing an avoidable round-trip and leaving the two shapes treated asymmetrically.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1098_pool_04",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:102",
+      "category": "ambiguity",
+      "severity": "suggestion",
+      "description": "The rule 'If `task_id` is missing from the `resolve_ticket` response, skip the increment and flag the discrepancy' is not scoped to created/combined, and every `status=\"failed\"` result carries `task_id: None`, so read literally a legitimate failed resolution (timeout, unknown ticket) is reported as a server discrepancy rather than handled as the failed outcome described in Creating Tasks. Impact is limited to report noise/misclassification; the same wording existed before and was rewritten here.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

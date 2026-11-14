@@ -1,4 +1,4 @@
-"""Tests for orchestrator.landing_evidence (task 2678).
+"""Tests for orchestrator.merge_lane.landing_evidence (task 2678).
 
 Unit tests for the shared, module-level ``validate_landing_evidence`` helper
 that both harness.py (x4 sites) and merge_queue.py (x1 site) delegate to for
@@ -22,15 +22,21 @@ idiom keeps exercising the real (now-shared) helper logic.
 from __future__ import annotations
 
 import json
+import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
+from _landing_evidence_helpers import differential_confirms
+from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
+from orchestrator.config import GitConfig
 from orchestrator.delivered_checks import DeliveredCheckResult
-from orchestrator.git_ops import CommitEffectProbe
-from orchestrator.landing_evidence import (
+from orchestrator.git_ops import CommitEffectProbe, GitOps
+from orchestrator.merge_lane.landing_evidence import (
     LANDING_TALLY,
     LandingEvidenceVerdict,
     LandingMethod,
@@ -38,6 +44,7 @@ from orchestrator.landing_evidence import (
     LandingVerdict,
     file_unattributed_landing_escalation,
     format_unattributed_landing_detail,
+    found_on_main_note,
     validate_landing_evidence,
     validate_reported_landing,
 )
@@ -50,10 +57,11 @@ def _git_ops(
     effect_present,
     effect_probe=None,
     main_branch='main',
-    delivered_checks_enabled=True,
     fork_point=None,
     reported_commit_files=None,
     reported_commit_diff_error=None,
+    content_in_main: bool = False,
+    equivalent: str | None = None,
 ) -> MagicMock:
     """Build a bare MagicMock git_ops with the three sub-methods the helper calls.
 
@@ -69,10 +77,11 @@ def _git_ops(
     ``commit_effect_present_in_main`` on a bare MagicMock.
 
     ``config`` is a REAL object, not a MagicMock attribute (amendment pass):
-    the differential now reads ``config.main_branch`` for its third leg and
-    ``config.delivered_checks.enabled`` for the kill switch, and an
-    auto-created MagicMock attribute would sail through both as a truthy
-    non-string.  ``fork_point`` stubs ``merge_base_with_main``; left UNSTUBBED
+    the differential reads ``config.main_branch`` for its third leg, and an
+    auto-created MagicMock attribute would sail through as a truthy
+    non-string.  It carries no kill switch: like a real ``GitOps.config``, the
+    leaf comes from the caller's ``checks_enabled`` (task 6276).
+    ``fork_point`` stubs ``merge_base_with_main``; left UNSTUBBED
     when omitted so the ``^1`` fallback stays exercised on the shape the other
     gate-wiring files construct.
 
@@ -80,12 +89,13 @@ def _git_ops(
     stub ``get_merge_commit_diff_files`` — the reported commit's OWN diff,
     which the reported-claim mode intersects with the task's declared files.
     Stubbed only when either is given, so every earlier test keeps its shape.
+
+    ``content_in_main`` / ``equivalent`` (task 4862) ALWAYS stub
+    ``branch_content_in_main`` and ``find_equivalent_commit``, the citation-miss
+    fallback's gate and anchor, so a default ``no_citation`` miss declines cleanly.
     """
     git_ops = MagicMock()
-    git_ops.config = SimpleNamespace(
-        main_branch=main_branch,
-        delivered_checks=SimpleNamespace(enabled=delivered_checks_enabled),
-    )
+    git_ops.config = SimpleNamespace(main_branch=main_branch)
     if fork_point is not None:
         git_ops.merge_base_with_main = AsyncMock(return_value=fork_point)
     else:
@@ -106,7 +116,28 @@ def _git_ops(
         git_ops.get_merge_commit_diff_files = AsyncMock(
             return_value=(list(reported_commit_files or []), reported_commit_diff_error),
         )
+    git_ops.branch_content_in_main = AsyncMock(return_value=content_in_main)
+    git_ops.find_equivalent_commit = AsyncMock(return_value=equivalent)
+    git_ops.project_root = '/repo'
     return git_ops
+
+
+def _survival_rejecting_git_ops(candidate_sha: str) -> MagicMock:
+    """A git_ops whose survival check REJECTS — the only path the
+    delivered-checks differential is ever consulted on.
+    """
+    return _git_ops(
+        citation=None,
+        is_ancestor_map={},
+        effect_present=False,
+        effect_probe=CommitEffectProbe(
+            present=False,
+            diverged_paths=('shared/manifest.py',),
+            anchor_sha=candidate_sha,
+            failure='effect_not_survived',
+            aggregate_survival=0.42,
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -1093,24 +1124,6 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
     branch — not by care.
     """
 
-    @staticmethod
-    def _rejecting_git_ops(candidate_sha: str) -> MagicMock:
-        """A git_ops whose survival check REJECTS — the only path the
-        differential is ever consulted on.
-        """
-        return _git_ops(
-            citation=None,
-            is_ancestor_map={},
-            effect_present=False,
-            effect_probe=CommitEffectProbe(
-                present=False,
-                diverged_paths=('shared/manifest.py',),
-                anchor_sha=candidate_sha,
-                failure='effect_not_survived',
-                aggregate_survival=0.42,
-            ),
-        )
-
     async def test_differential_upgrades_a_survival_rejection(self) -> None:
         """(a) FAIL at the parent, PASS at the citation, PASS at main ->
         a verdict survival REJECTED is ACCEPTED.
@@ -1119,7 +1132,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         merge made the capability true is the entire signal.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
             sha: DeliveredCheckResult.DELIVERED,
@@ -1129,7 +1142,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -1163,7 +1176,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -1217,7 +1230,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         an exception, always an explicit NO SIGNAL in the probe.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         by_ref = {
             f'{sha}^1': outcomes['parent'],
             sha: outcomes['citation'],
@@ -1228,7 +1241,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is False, f'rot ({rot}) must not flip the verdict'
@@ -1242,7 +1255,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         recorded into the probe that gets rendered into the escalation.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
 
         async def _boom(check, *, project_root, ref='main', runner=None):
             raise RuntimeError('delivered-check runner exploded')
@@ -1250,7 +1263,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', _boom):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is False
@@ -1272,7 +1285,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         invert them a second time.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
             sha: DeliveredCheckResult.DELIVERED,
@@ -1282,7 +1295,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check('cap-removed', expect='absent')],
+                delivered_checks=[_grep_check('cap-removed', expect='absent')], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -1298,7 +1311,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         the precise double-inversion bug this pins against.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, _calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.DELIVERED,
             sha: DeliveredCheckResult.FAILED,
@@ -1308,7 +1321,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check('cap-removed', expect='absent')],
+                delivered_checks=[_grep_check('cap-removed', expect='absent')], checks_enabled=True,
             )
 
         assert verdict.accepted is False
@@ -1321,13 +1334,13 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         that would answer identically each time.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, calls = _check_runner({})
 
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_script_check()],
+                delivered_checks=[_script_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is False
@@ -1343,7 +1356,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         kinds still gets the differential from the greppable one.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
             sha: DeliveredCheckResult.DELIVERED,
@@ -1353,7 +1366,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_script_check(), _grep_check()],
+                delivered_checks=[_script_check(), _grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -1375,18 +1388,18 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         })
 
         unwired = await validate_landing_evidence(
-            self._rejecting_git_ops(sha), '42', 'task/42',
+            _survival_rejecting_git_ops(sha), '42', 'task/42',
             branch_tip_sha=None, candidate_sha=sha,
         )
         none_declared = await validate_landing_evidence(
-            self._rejecting_git_ops(sha), '42', 'task/42',
-            branch_tip_sha=None, candidate_sha=sha, delivered_checks=[],
+            _survival_rejecting_git_ops(sha), '42', 'task/42',
+            branch_tip_sha=None, candidate_sha=sha, delivered_checks=[], checks_enabled=True,
         )
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             evaluated = await validate_landing_evidence(
-                self._rejecting_git_ops(sha), '42', 'task/42',
+                _survival_rejecting_git_ops(sha), '42', 'task/42',
                 branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert unwired.probe['delivered_checks_state'] == 'unwired'
@@ -1444,7 +1457,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', branch, branch_tip_sha=branch_tip_sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -1495,7 +1508,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', branch, branch_tip_sha=branch_tip_sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         git_ops.merge_base_with_main.assert_awaited_once_with(branch_tip_sha)
@@ -1522,7 +1535,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         structurally incapable of ever confirming.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
+        git_ops = _survival_rejecting_git_ops(sha)
         git_ops.merge_base_with_main = AsyncMock(return_value=sha)
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
@@ -1533,7 +1546,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is True
@@ -1552,11 +1565,8 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         silently mis-target.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
-        git_ops.config = SimpleNamespace(
-            main_branch='trunk',
-            delivered_checks=SimpleNamespace(enabled=True),
-        )
+        git_ops = _survival_rejecting_git_ops(sha)
+        git_ops.config = SimpleNamespace(main_branch='trunk')
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
             sha: DeliveredCheckResult.DELIVERED,
@@ -1568,29 +1578,41 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert [ref for _name, ref in calls] == [f'{sha}^1', sha, 'trunk']
         assert verdict.accepted is True
 
-    async def test_the_kill_switch_disables_the_second_accept_path(self) -> None:
-        """``delivered_checks.enabled=False`` switches this consumer off too.
+    @pytest.mark.parametrize('checks_enabled', [True, False])
+    @pytest.mark.parametrize('mode', ['candidate', 'discovery'])
+    async def test_the_caller_supplied_kill_switch_governs_the_rescue(
+        self, mode: str, checks_enabled: bool,
+    ) -> None:
+        """A real ``GitOps.config`` carries no ``delivered_checks``, so the
+        caller holding the project config passes the leaf as ``checks_enabled``.
 
-        The mark-done delivered-check gate honours that flag
-        (``Harness._delivered_checks_withhold``); a second consumer that
-        ignored it would mean disabling the feature did not actually disable
-        it.  The rejection is left exactly as survival found it, no check is
-        executed, and the state is RECORDED rather than looking like ordinary
-        bad luck — an operator must be able to see in the escalation that the
-        path was switched off, not merely unlucky.
+        The git_ops here carries no kill switch, the real-GitOps shape: only
+        the caller's argument can disarm the rescue, in either mode.
         """
         sha = 'c' * 40
-        git_ops = self._rejecting_git_ops(sha)
-        git_ops.config = SimpleNamespace(
-            main_branch='main',
-            delivered_checks=SimpleNamespace(enabled=False),
-        )
+        if mode == 'candidate':
+            git_ops = _survival_rejecting_git_ops(sha)
+            candidate_sha: str | None = sha
+        else:
+            git_ops = _git_ops(
+                citation=sha,
+                is_ancestor_map={(sha, 'task/42'): False},
+                effect_present=False,
+                effect_probe=CommitEffectProbe(
+                    present=False,
+                    diverged_paths=('shared/manifest.py',),
+                    anchor_sha=sha,
+                    failure='effect_not_survived',
+                    aggregate_survival=0.42,
+                ),
+            )
+            candidate_sha = None
         stub, calls = _check_runner({
             f'{sha}^1': DeliveredCheckResult.FAILED,
             sha: DeliveredCheckResult.DELIVERED,
@@ -1599,16 +1621,19 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
 
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
-                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-                delivered_checks=[_grep_check()],
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=candidate_sha,
+                delivered_checks=[_grep_check()], checks_enabled=checks_enabled,
             )
 
-        assert calls == [], 'no declared check may run while the feature is off'
+        if checks_enabled:
+            assert verdict.accepted is True
+            assert verdict.rescued_by_delivered_checks is True
+            return
+        assert calls == [], 'no declared check may run while the caller disarms it'
         assert verdict.accepted is False
         assert verdict.reason == 'effect_absent'
         assert verdict.probe['delivered_checks_outcome'] == 'disabled'
-        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
-        assert 'delivered_checks.enabled is false' in detail
+        assert verdict.rescued_by_delivered_checks is False
 
     async def test_no_citation_reject_never_runs_the_differential(self) -> None:
         """A missing citation is an ATTRIBUTION failure, not a decayed-effect
@@ -1621,7 +1646,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         with patch('orchestrator.delivered_checks.run_delivered_check', stub):
             verdict = await validate_landing_evidence(
                 git_ops, '42', 'task/42', branch_tip_sha=None,
-                delivered_checks=[_grep_check()],
+                delivered_checks=[_grep_check()], checks_enabled=True,
             )
 
         assert verdict.accepted is False
@@ -1643,7 +1668,7 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
                 '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
             )
             rejected = await validate_landing_evidence(
-                self._rejecting_git_ops(sha), '42', 'task/42',
+                _survival_rejecting_git_ops(sha), '42', 'task/42',
                 branch_tip_sha=None, candidate_sha=sha,
             )
 
@@ -1657,6 +1682,106 @@ class TestValidateLandingEvidenceDeliveredChecksDifferential:
         assert calls == [], 'an unwired call site must issue no check subprocesses'
         # The effect_absent diagnostics from Part A are untouched by Part B.
         assert rejected.probe['diverged_paths'] == ['shared/manifest.py']
+
+
+def _accepted(**probe: Any) -> LandingVerdict:
+    return LandingVerdict(
+        accepted=True, evidence_sha='c' * 40, reason=LandingReason.ok, probe=probe,
+    )
+
+
+def _rejected(**probe: Any) -> LandingVerdict:
+    return LandingVerdict(
+        accepted=False, evidence_sha=None, reason=LandingReason.effect_absent,
+        probe=probe,
+    )
+
+
+_RESCUE_LEGS = [
+    {'name': 'cap-x', 'kind': 'grep', 'verdict': 'made_true_by_this_commit'},
+    {'name': 'cap-y', 'kind': 'grep', 'verdict': 'no_signal'},
+]
+
+
+class TestRescuedByDeliveredChecks:
+    """A delivered-checks RESCUE must be distinguishable from a fully-guarded
+    accept (task 4496, advisory esc-4887-6).
+
+    ``accepted`` and ``evidence_sha`` read identically either way, yet a
+    rescued accept's effect is ABSENT at main HEAD — so a stamp site that
+    writes provenance off a rescue must be able to say so.
+    """
+
+    def test_rescue_is_an_accept_with_a_confirmed_differential(self) -> None:
+        verdict = _accepted(delivered_checks_outcome='confirmed')
+        assert verdict.rescued_by_delivered_checks is True
+
+    def test_a_fully_guarded_accept_is_not_a_rescue(self) -> None:
+        assert _accepted().rescued_by_delivered_checks is False
+
+    @pytest.mark.parametrize('outcome', ['no_signal', 'disabled'])
+    def test_a_reject_is_never_a_rescue(self, outcome: str) -> None:
+        verdict = _rejected(delivered_checks_outcome=outcome)
+        assert verdict.rescued_by_delivered_checks is False
+
+    def test_the_outcome_is_compared_by_equality_not_truthiness(self) -> None:
+        verdict = _accepted(delivered_checks_outcome='some_future_outcome')
+        assert verdict.rescued_by_delivered_checks is False
+
+    def test_note_is_unchanged_for_a_fully_guarded_accept(self) -> None:
+        note = 'already-landed gate: citation on main'
+        assert found_on_main_note(note, _accepted()) == note
+
+    def test_note_is_unchanged_for_a_reject(self) -> None:
+        note = 'already-landed gate: citation on main'
+        verdict = _rejected(
+            delivered_checks_outcome='no_signal', delivered_checks_legs=_RESCUE_LEGS,
+        )
+        assert found_on_main_note(note, verdict) == note
+
+    def test_note_discloses_the_confirmed_checks_of_a_rescue(self) -> None:
+        note = 'already-landed gate: citation on main'
+        verdict = _accepted(
+            delivered_checks_outcome='confirmed', delivered_checks_legs=_RESCUE_LEGS,
+        )
+
+        disclosed = found_on_main_note(note, verdict)
+
+        assert disclosed != note
+        assert disclosed.startswith(note)
+        assert 'cap-x' in disclosed
+        assert 'cap-y' not in disclosed
+
+    def test_a_rescue_whose_probe_names_no_confirmed_check_still_reads_complete(
+        self,
+    ) -> None:
+        verdict = _accepted(delivered_checks_outcome='confirmed', delivered_checks_legs=[])
+
+        disclosed = found_on_main_note('note', verdict)
+
+        assert disclosed.startswith('note')
+        assert '<unnamed>' in disclosed
+
+    @pytest.mark.asyncio
+    async def test_a_real_candidate_mode_rescue_reads_as_rescued(self) -> None:
+        sha = 'c' * 40
+        git_ops = _git_ops(
+            citation=None, is_ancestor_map={}, effect_present=False,
+            effect_probe=CommitEffectProbe(
+                present=False, diverged_paths=('src/x.py',), anchor_sha=sha,
+                failure='effect_not_survived', aggregate_survival=0.4,
+            ),
+        )
+        with patch('orchestrator.delivered_checks.run_delivered_check', differential_confirms):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[
+                    {'name': 'cap-x', 'kind': 'grep', 'pattern': 'P', 'expect': 'present'},
+                ], checks_enabled=True,
+            )
+
+        assert verdict.accepted is True
+        assert verdict.rescued_by_delivered_checks is True
 
 
 # ---------------------------------------------------------------------------
@@ -1895,7 +2020,7 @@ class TestValidateLandingEvidenceBehaviourPreservation:
         verdict = await validate_landing_evidence(
             _git_ops(citation=None, is_ancestor_map={}, effect_present=True),
             '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
-            delivered_checks=delivered_checks,
+            delivered_checks=delivered_checks, checks_enabled=True,
         )
         assert verdict.accepted is True, 'seeded on the ACCEPT path too'
         assert verdict.probe['delivered_checks_state'] == expected
@@ -2869,3 +2994,437 @@ class TestReportedClaimEscalation:
 
         (esc,) = queue.get_by_task('42', status='pending')
         assert esc.filing_claimant_run_id is None
+
+
+# ---------------------------------------------------------------------------
+# task 4862 — the content-equivalence fallback on DISCOVERY's citation miss.
+#
+# Upgrade-only: it may turn a `no_citation` reject into an accept anchored on
+# the branch tip's patch-id twin on main, and every way it declines reproduces
+# the pre-task `no_citation` verdict with the reason in probe['content_fallback'].
+# ---------------------------------------------------------------------------
+
+_TIP = 'f' * 40
+_FORK = 'b' * 40
+_TWIN = 'e' * 40
+
+
+def _uncited_git_ops(**kwargs: Any) -> MagicMock:
+    return _git_ops(citation=None, is_ancestor_map={}, effect_present=True, **kwargs)
+
+
+async def _discover(git_ops: MagicMock, *, branch_tip_sha: str | None = _TIP) -> LandingVerdict:
+    return await validate_landing_evidence(
+        git_ops, '42', 'task/42', branch_tip_sha=branch_tip_sha,
+    )
+
+
+@pytest.mark.asyncio
+class TestContentEquivalenceFallbackContract:
+    async def test_content_equivalent_branch_with_patch_id_twin_is_accepted(self) -> None:
+        git_ops = _uncited_git_ops(content_in_main=True, fork_point=_FORK, equivalent=_TWIN)
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.accepted is True
+        assert verdict.reason == 'ok'
+        assert verdict.method is LandingMethod.content_equivalence
+        assert verdict.evidence_sha == _TWIN
+        assert verdict.probe['citation'] is None
+        assert verdict.probe['content_fallback'] == 'attributed'
+        assert verdict.probe['evidence_source'] == 'patch_id_equivalent'
+        assert verdict.probe['method'] == LandingMethod.content_equivalence
+        # Content and anchor are judged on ONE tip (the task-3103 TOCTOU hazard).
+        git_ops.branch_content_in_main.assert_awaited_once_with(_TIP)
+        git_ops.find_equivalent_commit.assert_awaited_once_with(
+            '/repo', _FORK, _TIP, patch_id_only=True,
+        )
+
+    async def test_content_equivalent_branch_without_twin_still_rejects_no_citation(
+        self,
+    ) -> None:
+        git_ops = _uncited_git_ops(content_in_main=True, fork_point=_FORK, equivalent=None)
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.accepted is False
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['content_fallback'] == 'unanchored'
+        assert verdict.probe['citation'] is None
+        assert verdict.method is LandingMethod.citation
+
+    async def test_a_non_sha_anchor_is_never_accepted(self) -> None:
+        """An accepted evidence_sha becomes done_provenance, so it must be 40-hex."""
+        git_ops = _uncited_git_ops(
+            content_in_main=True, fork_point=_FORK, equivalent='not-a-sha',
+        )
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['content_fallback'] == 'unanchored'
+
+    async def test_unresolved_fork_point_declines_unanchored(self) -> None:
+        git_ops = _uncited_git_ops(content_in_main=True)
+        git_ops.merge_base_with_main = AsyncMock(return_value=None)
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['content_fallback'] == 'unanchored'
+        assert verdict.probe['evidence_source'] == 'merge_base_unresolved'
+        git_ops.find_equivalent_commit.assert_not_awaited()
+
+    async def test_content_not_equivalent_rejects_no_citation(self) -> None:
+        git_ops = _uncited_git_ops()
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.probe['content_fallback'] == 'not_content_equivalent'
+        git_ops.find_equivalent_commit.assert_not_awaited()
+
+    async def test_no_branch_tip_declines_without_git_work(self) -> None:
+        git_ops = _uncited_git_ops(content_in_main=True)
+
+        verdict = await _discover(git_ops, branch_tip_sha=None)
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.probe['content_fallback'] == 'no_branch_tip'
+        git_ops.branch_content_in_main.assert_not_awaited()
+
+    async def test_fallback_failure_is_contained_as_no_citation(self, caplog) -> None:
+        git_ops = _uncited_git_ops()
+        git_ops.branch_content_in_main = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with caplog.at_level('WARNING'):
+            verdict = await _discover(git_ops)
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.probe['content_fallback'] == 'error'
+        assert 'boom' in verdict.probe['content_fallback_error']
+        assert any(
+            record.name == 'orchestrator.merge_lane'
+            and record.levelname == 'WARNING'
+            for record in caplog.records
+        )
+
+    async def test_a_cited_landing_never_consults_the_fallback(self) -> None:
+        branch, citation = 'task/42', 'a' * 40
+        git_ops = _git_ops(
+            citation=citation,
+            is_ancestor_map={(citation, branch): True},
+            effect_present=True,
+            content_in_main=True,
+        )
+
+        verdict = await _discover(git_ops)
+
+        assert verdict.accepted is True
+        assert verdict.method is LandingMethod.citation
+        git_ops.branch_content_in_main.assert_not_awaited()
+
+    async def test_candidate_mode_never_consults_the_fallback(self) -> None:
+        git_ops = _uncited_git_ops(content_in_main=True)
+
+        await validate_landing_evidence(
+            git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha='c' * 40,
+        )
+
+        git_ops.branch_content_in_main.assert_not_awaited()
+
+    async def test_declined_fallback_reason_reaches_the_escalation_detail(self) -> None:
+        verdict = await _discover(
+            _uncited_git_ops(content_in_main=True, fork_point=_FORK, equivalent=None),
+        )
+
+        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+
+        assert detail.startswith('validate_landing_evidence')
+        assert "'content_fallback': 'unanchored'" in detail
+
+
+def _numbered(prefix: str, count: int) -> str:
+    """Unique lines: patch-ids are computed over line content."""
+    return ''.join(f'{prefix}_{i:04d} = {i * 7919}\n' for i in range(count))
+
+
+class _Repo:
+    """A synthetic repository whose every git call carries both isolation guards."""
+
+    def __init__(self, root: Path) -> None:
+        assert_isolated_git_repo(root)
+        self.root = root
+
+    def _run(self, *args: str) -> subprocess.CompletedProcess[str]:
+        assert_isolated_git_repo(self.root)
+        return subprocess.run(
+            ['git', *args], cwd=str(self.root), capture_output=True,
+            env=git_env_with_ceiling(self.root), text=True, check=False,
+        )
+
+    def git(self, *args: str) -> str:
+        proc = self._run(*args)
+        assert proc.returncode == 0, f'git {" ".join(args)} failed: {proc.stderr.strip()}'
+        return proc.stdout.strip()
+
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        return self._run('merge-base', '--is-ancestor', ancestor, descendant).returncode == 0
+
+    def commit(self, message: str, files: dict[str, str], body: str | None = None) -> str:
+        for rel, content in files.items():
+            target = self.root / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        self.git('add', '-A')
+        self.git('commit', '-m', message, *(['-m', body] if body is not None else []))
+        return self.sha('HEAD')
+
+    def sha(self, ref: str) -> str:
+        return self.git('rev-parse', ref)
+
+
+@pytest.fixture
+def real_git_repo(tmp_path: Path) -> Path:
+    return seed_repo(tmp_path / 'repo')
+
+
+@pytest.fixture
+def real_git_ops(real_git_repo: Path) -> GitOps:
+    config = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+    return GitOps(config, real_git_repo)
+
+
+_UNCITED_TIP_SUBJECT = 'test(dashboard/tests): RED — pin the client seam'
+
+
+def _build_uncited_branch(repo: _Repo) -> str:
+    """``task/4881`` off main: two commits, no task id in either SUBJECT."""
+    repo.git('checkout', '-b', 'task/4881', 'main')
+    repo.commit(
+        'refactor(dashboard/tests): extract the canned client',
+        {'pkg/a.py': _numbered('client', 30)},
+    )
+    tip = repo.commit(
+        _UNCITED_TIP_SUBJECT,
+        {'pkg/b.py': _numbered('seam', 30)},
+        body='Task 4881 final step.',
+    )
+    repo.git('checkout', 'main')
+    return tip
+
+
+def _build_carried_landing(repo: _Repo) -> tuple[str, str]:
+    """The esc-4881-8 shape: 4881's work lands only as cherry-picks carried by 4775.
+
+    Returns ``(tip, twin)``: 4881's branch tip and its patch-id twin on main.
+    """
+    tip = _build_uncited_branch(repo)
+    repo.commit('chore: unrelated main work', {'CHANGELOG.md': _numbered('log', 5)})
+    repo.git('checkout', '-b', 'task/4775', 'main')
+    repo.commit('feat(4775): carrier work', {'pkg/c.py': _numbered('carrier', 30)})
+    repo.git('cherry-pick', 'task/4881~1')
+    repo.git('cherry-pick', 'task/4881')
+    twin = repo.sha('HEAD')
+    repo.git('checkout', 'main')
+    repo.git('merge', '--no-ff', 'task/4775', '-m', 'Merge task/4775 into main')
+    repo.commit('chore: more unrelated main work', {'NOTES.md': _numbered('note', 5)})
+    return tip, twin
+
+
+@pytest.mark.asyncio
+class TestContentEquivalenceFallbackRealGit:
+    async def test_carried_landing_without_citation_is_accepted(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        repo = _Repo(real_git_repo)
+        tip, twin = _build_carried_landing(repo)
+        assert not repo.is_ancestor('task/4881', 'main')
+        assert await real_git_ops.find_task_citation_commit('4881') is None
+        assert await real_git_ops.branch_content_in_main('task/4881') is True
+
+        verdict = await validate_landing_evidence(
+            real_git_ops, '4881', 'task/4881', branch_tip_sha=tip,
+        )
+
+        assert verdict.accepted is True
+        assert verdict.reason == 'ok'
+        assert verdict.method is LandingMethod.content_equivalence
+        assert verdict.evidence_sha == twin
+        assert repo.is_ancestor(twin, 'main')
+        assert twin not in (tip, repo.sha('main'))
+        assert verdict.probe['citation'] is None
+
+    async def test_content_differs_on_main_still_rejects(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        repo = _Repo(real_git_repo)
+        tip, _twin = _build_carried_landing(repo)
+        repo.commit(
+            'fix: extend the client',
+            {'pkg/a.py': _numbered('client', 30) + 'client_extra = 1\n'},
+        )
+
+        verdict = await validate_landing_evidence(
+            real_git_ops, '4881', 'task/4881', branch_tip_sha=tip,
+        )
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['content_fallback'] == 'not_content_equivalent'
+
+    async def test_ancestor_of_main_tip_declines_before_any_anchor_search(
+        self, real_git_ops: GitOps, real_git_repo: Path,
+    ) -> None:
+        """The is_ancestor-gated DISCOVERY callers rely on this decline."""
+        repo = _Repo(real_git_repo)
+        tip = _build_uncited_branch(repo)
+        repo.git('merge', '--ff-only', 'task/4881')
+        repo.commit('chore: unrelated main work', {'CHANGELOG.md': _numbered('log', 5)})
+        assert repo.is_ancestor(tip, 'main')
+
+        verdict = await validate_landing_evidence(
+            real_git_ops, '4881', 'task/4881', branch_tip_sha=tip,
+        )
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.evidence_sha is None
+        assert verdict.probe['content_fallback'] == 'not_content_equivalent'
+
+    @pytest.mark.parametrize(
+        'squash_subject',
+        [
+            pytest.param('chore: squash import', id='distinct-subject'),
+            pytest.param(_UNCITED_TIP_SUBJECT, id='tip-subject-on-a-different-diff'),
+        ],
+    )
+    async def test_squash_landing_refuses_to_guess_an_anchor(
+        self, real_git_ops: GitOps, real_git_repo: Path, squash_subject: str,
+    ) -> None:
+        """Byte-identical content but no patch-id twin: never anchor on main HEAD or the tip.
+
+        A unique main commit sharing the tip's subject is no twin either: its
+        diff is not the tip's, so it cannot carry the task's provenance.
+        """
+        repo = _Repo(real_git_repo)
+        tip = _build_uncited_branch(repo)
+        repo.git('merge', '--squash', 'task/4881')
+        repo.git('commit', '-m', squash_subject)
+        repo.commit('chore: unrelated main work', {'CHANGELOG.md': _numbered('log', 5)})
+
+        verdict = await validate_landing_evidence(
+            real_git_ops, '4881', 'task/4881', branch_tip_sha=tip,
+        )
+
+        assert verdict.reason == 'no_citation'
+        assert verdict.probe['content_fallback'] == 'unanchored'
+        assert verdict.probe['evidence_source'] == 'no_equivalent_on_main'
+        assert verdict.evidence_sha is None
+
+
+def _build_reverted_capability(repo: _Repo) -> str:
+    """A commit citing task 42 whose added lines a later rewrite removed.
+
+    Returns the cited sha.  Its effect is genuinely ABSENT at main, so the
+    survival check rejects and only the delivered-checks rescue can accept.
+    """
+    cited = repo.commit('feat(42): add the capability', {'pkg/cap.py': _numbered('cap', 30)})
+    repo.commit('refactor: rewrite pkg/cap.py', {'pkg/cap.py': _numbered('gone', 30)})
+    return cited
+
+
+@pytest.mark.asyncio
+class TestDeliveredChecksLeafIsTheCallers:
+    """The rescue's kill switch has ONE source: the caller's
+    ``delivered_checks.enabled`` leaf (task 6276).
+
+    A real ``GitOps.config`` is the ``git`` sub-config, which has no such
+    field, so a caller that supplies checks without the leaf would leave the
+    rescue armed with the feature switched off.  Supplying checks without it
+    is therefore refused outright.
+    """
+
+    @pytest.mark.parametrize('checks_enabled', [True, False])
+    async def test_a_real_gitops_obeys_the_callers_leaf(
+        self, real_git_ops: GitOps, real_git_repo: Path, checks_enabled: bool,
+    ) -> None:
+        assert 'delivered_checks' not in GitConfig.model_fields, (
+            'premise: production GitOps.config cannot carry the kill switch'
+        )
+        cited = _build_reverted_capability(_Repo(real_git_repo))
+        assert await real_git_ops.commit_effect_present_in_main(cited) is False
+        stub, calls = _check_runner({
+            f'{cited}^1': DeliveredCheckResult.FAILED,
+            cited: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await validate_landing_evidence(
+                real_git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=cited,
+                delivered_checks=[_grep_check()], checks_enabled=checks_enabled,
+            )
+
+        if checks_enabled:
+            assert verdict.accepted is True
+            assert verdict.rescued_by_delivered_checks is True
+            return
+        assert calls == [], 'no declared check may run while the feature is off'
+        assert verdict.reason == 'effect_absent'
+        assert verdict.probe['delivered_checks_outcome'] == 'disabled'
+        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+        assert 'delivered_checks.enabled is false' in detail, (
+            'an operator must see the path was switched off, not merely unlucky'
+        )
+
+    @pytest.mark.parametrize('candidate_sha', [
+        pytest.param('c' * 40, id='candidate'),
+        pytest.param(None, id='discovery'),
+    ])
+    @pytest.mark.parametrize('delivered_checks', [
+        pytest.param([], id='none_declared'),
+        pytest.param([_grep_check()], id='declared'),
+    ])
+    async def test_supplying_checks_without_the_leaf_is_refused_before_any_git_call(
+        self, delivered_checks: list[dict[str, object]], candidate_sha: str | None,
+    ) -> None:
+        """``[]`` counts as supplied: a wired site states the leaf even when
+        its task declares nothing.  Each mode's first git probe is pinned
+        unawaited, so the refusal cannot drift behind git work."""
+        git_ops = _survival_rejecting_git_ops('c' * 40)
+
+        with pytest.raises(TypeError, match='require checks_enabled'):
+            await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha='f' * 40,
+                candidate_sha=candidate_sha, delivered_checks=delivered_checks,
+            )
+
+        git_ops.find_task_citation_commit.assert_not_awaited()
+        git_ops.commit_effect_present_in_main.assert_not_awaited()
+
+    async def test_a_stand_in_git_ops_config_is_never_consulted(self) -> None:
+        """A stand-in whose config says DISABLED cannot override a caller
+        that says ENABLED: nothing is read off ``git_ops.config``."""
+        sha = 'c' * 40
+        git_ops = _survival_rejecting_git_ops(sha)
+        git_ops.config = SimpleNamespace(
+            main_branch='main', delivered_checks=SimpleNamespace(enabled=False),
+        )
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', differential_confirms):
+            verdict = await validate_landing_evidence(
+                git_ops, '42', 'task/42', branch_tip_sha=None, candidate_sha=sha,
+                delivered_checks=[_grep_check()], checks_enabled=True,
+            )
+
+        assert verdict.accepted is True
+        assert verdict.rescued_by_delivered_checks is True

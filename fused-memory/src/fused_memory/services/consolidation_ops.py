@@ -47,9 +47,12 @@ and are imported BY the tool rather than the other way round.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
+from fused_memory.memory_metadata import EXPERIMENTAL_KEY_PREFIX, is_canonical
+from fused_memory.models.memory import Mem0WriteState
 from fused_memory.server.consolidation import build_consolidation_result
 from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.services.topic_anchor import select_canonical_payload
@@ -61,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     'TOPIC_MEMBER_LIMIT',
+    'MemoryUpdater',
     'RetainArmApplied',
     'RetainArmRefused',
     'TopicClosure',
@@ -127,8 +131,26 @@ class RetainArmRefused:
     response: dict[str, Any]
 
 
+class MemoryUpdater(Protocol):
+    """The ``update_memory`` member that :func:`patch_memory_metadata` calls."""
+
+    async def update_memory(
+        self,
+        *,
+        memory_id: str,
+        project_id: str,
+        content: str | None,
+        metadata_patch: dict[str, Any] | None,
+        metadata_mode: str,
+        agent_id: str | None,
+        session_id: str | None,
+        causation_id: str | None,
+        _source: str,
+    ) -> object: ...
+
+
 async def patch_memory_metadata(
-    memory_service: MemoryService,
+    memory_service: MemoryUpdater,
     *,
     memory_id: str,
     project_id: str,
@@ -276,6 +298,7 @@ async def execute_retain_consolidation(
     session_id: str | None = None,
     causation_id: str | None = None,
     source: str = 'mcp_tool',
+    extra_peer_meta: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply the retain arm, then list the topic's closure (PRD C3).
 
@@ -297,6 +320,7 @@ async def execute_retain_consolidation(
         session_id=session_id,
         causation_id=causation_id,
         source=source,
+        extra_peer_meta=extra_peer_meta,
     )
     if isinstance(arm, RetainArmRefused):
         return arm.response
@@ -338,6 +362,7 @@ async def apply_retain_arm(
     session_id: str | None = None,
     causation_id: str | None = None,
     source: str = 'mcp_tool',
+    extra_peer_meta: Mapping[str, Any] | None = None,
 ) -> RetainArmApplied | RetainArmRefused:
     """Establish the canonical and tag the retained peers: the arm's writes.
 
@@ -349,7 +374,14 @@ async def apply_retain_arm(
     Every refusal — authorization, ``CanonicalWriteFailed``,
     ``TagOnlyIncumbentNotFound`` — comes back as :class:`RetainArmRefused`
     before any peer is read or patched.
+
+    *extra_peer_meta* rides each peer's topic patch, in the same write. Its
+    keys must carry the ``x_`` experimental prefix, which excludes every
+    reserved key the peer patch must never set; any other key is a
+    programming error and raises ``ValueError`` before anything is read.
     """
+    peer_patch_extra = _experimental_keys_only(extra_peer_meta)
+
     # AUTHORIZE FIRST, above every read and every write: an unauthorized
     # caller is turned away before anything is done on its behalf and
     # before it learns anything about the system.
@@ -412,15 +444,10 @@ async def apply_retain_arm(
             metadata=canonical_meta,
             causation_id=causation_id,
             _source=source,
+            defer_transient_mem0_failure=False,
         )
-        # `AddMemoryResponse` is a pydantic model whose `memory_ids` can come
-        # back EMPTY without raising — a write that landed nothing while
-        # reporting no failure. Indexing it blindly would either raise an
-        # IndexError flattened into an unreadable error, or (worse, had this
-        # been a dict lookup) carry a None canonical id into the delete loop
-        # and reap a live cluster in favour of a record that does not exist.
-        minted_id = written.memory_ids[0] if written.memory_ids else None
-        if not minted_id:
+        # Landed or not is AddMemoryResponse.mem0_write_state's call, never a read of memory_ids.
+        if written.mem0_write_state is not Mem0WriteState.LANDED:
             return RetainArmRefused({
                 'error': (
                     'consolidate_memories: the canonical write returned no memory '
@@ -431,7 +458,7 @@ async def apply_retain_arm(
                 'topic': topic,
                 'supersedes': list(canonical_meta.get('supersedes') or []),
             })
-        canonical_id = minted_id
+        canonical_id = written.memory_ids[0]
     else:
         # TAG-ONLY (PRD D14). NOTHING is written to the incumbent:
         # `content_amend=False` is load-bearing, and an incumbent that
@@ -479,10 +506,11 @@ async def apply_retain_arm(
     # not move either. Metadata is MERGED and nothing is deleted — the
     # peer's own source/run_id/parent are not this op's to discard.
     #
-    # `topic` ONLY. Never `canonical` (exactly one per (project, topic) —
-    # a second claimant would make the next consolidation of this topic
-    # refuse outright) and never `parent_id` (these are PEERS of the
-    # canonical, not children of it).
+    # `topic` plus caller-supplied `x_` provenance keys only. Never
+    # `canonical` (exactly one per (project, topic) — a second claimant
+    # would make the next consolidation of this topic refuse outright) and
+    # never `parent_id` (these are PEERS of the canonical, not children of
+    # it).
     #
     # Task 3523 is the live seam here: `update_memory` does not run
     # `_apply_memory_metadata_validation`, so this slug is not
@@ -540,7 +568,7 @@ async def apply_retain_arm(
         # A peer that does not resolve is NOT refused here: it falls
         # through to `update_memory`, which reports MemoryNotFound in the
         # structured shape below. One vocabulary for one condition.
-        if (peer_record or {}).get('metadata', {}).get('canonical') is True:
+        if is_canonical((peer_record or {}).get('metadata')):
             retain_failures.append({
                 'id': retain_id,
                 'error': (
@@ -552,7 +580,7 @@ async def apply_retain_arm(
                 'error_type': 'RetainedPeerIsCanonical',
             })
             continue
-        # `topic` ONLY, through the shared classifier above: a raise and a
+        # The topic patch, through the shared classifier above: a raise and a
         # returned rejection are THE SAME EVENT here (this peer was not
         # tagged) and are recorded identically. One failure costs one
         # peer, never the arm — the peers that CAN be tagged are, because
@@ -562,7 +590,7 @@ async def apply_retain_arm(
             memory_service,
             memory_id=retain_id,
             project_id=project_id,
-            patch={'topic': topic},
+            patch={**peer_patch_extra, 'topic': topic},
             agent_id=agent_id,
             session_id=session_id,
             causation_id=causation_id,
@@ -579,3 +607,15 @@ async def apply_retain_arm(
         retained=retained,
         retain_failures=retain_failures,
     )
+
+
+def _experimental_keys_only(extra: Mapping[str, Any] | None) -> dict[str, Any]:
+    """*extra* as a dict, refusing any key outside the ``x_`` namespace."""
+    patch = dict(extra or {})
+    offending = sorted(k for k in patch if not k.startswith(EXPERIMENTAL_KEY_PREFIX))
+    if offending:
+        raise ValueError(
+            f'extra_peer_meta keys must start with {EXPERIMENTAL_KEY_PREFIX!r}; '
+            f'got {offending}'
+        )
+    return patch

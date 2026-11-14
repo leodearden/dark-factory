@@ -20,7 +20,7 @@ def _store_with_one_cell(directory: Path):
     store = ResultStore(directory)
     cell = EvalResult(
         task_id='df_task_b1', config_name='claude-sonnet-max', outcome='done',
-        metrics={'composite_score': 0.9, 'tests_pass': True},
+        metrics={'composite_score': 0.9, 'tests_pass': True, 'role_under_test': 'implementer'},
         worktree_path='/fake/wt', wall_clock_ms=1200, run_id='run-b1',
     )
     store.save(cell)

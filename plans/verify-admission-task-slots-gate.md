@@ -1,16 +1,278 @@
 # verify_admission_task_slots — gate history
 
-This file holds the gate history for one operator lever,
-`verify_admission_task_slots` in `dark-factory-orchestrator.yaml` (the
+This file holds the value history and gate measurements for one operator
+lever, `verify_admission_task_slots` in `dark-factory-orchestrator.yaml` (the
 TASK-ROLE VERIFY ADMISSION WIDTH block directly above the key). The code
 default is 1 (`orchestrator/src/orchestrator/config.py::OrchestratorConfig`).
 The knob is green-tier (`config.py::RELOADABLE_FIELDS`), so it applies through
 `reload_config` without a restart.
 
-Value history: 1 -> 3 on 2026-09-03, -> 1 on 2026-09-08, -> 2 on 2026-09-23,
--> 1 on 2026-09-27 (task 5797, §2026-09-27 below).
+**Current setting.** The current value is whatever the key in the yaml reads.
+Its basis, how it was applied and its revert triggers are in the latest entry
+under "Value history" below; nothing else in this file restates it.
+
+A change to the value touches two places besides the key, in the same commit:
+
+1. append a dated entry under "Value history" (plus a dated measurement
+   section when the change rests on a measured gate);
+2. rewrite the yaml comment's current-value rationale, the "N since DATE"
+   sentence directly above the key, which points here.
+
 Each later re-measurement appends a dated section below and reuses the
-Reproduction commands.
+Reproduction commands (§6 of the 2026-09-27 section).
+
+---
+
+## Value history
+
+One entry per change to the value, plus one correction, oldest first; the last
+entry is the current setting. Where a later entry retracts or overrides an
+earlier one, both entries say so.
+
+### 2026-09-03 — 1 -> 3
+
+Commit `731a0bafa9` ("ops(config): pause fleet deploys + widen task-verify
+admission to 3").
+
+The code default is 1 (`config.py::OrchestratorConfig.verify_admission_task_slots`)
+and it had never been set in either yaml, so ONE task-role pytest ran at a time
+host-wide against `max_concurrent_tasks: 48`. That was tolerable while the
+scheduler could only dispatch ~4.26 tasks/h. It stopped being tolerable when
+the marker-index fix (`fe4b34714c`) lifted dispatch to ~24.7/h and mean
+in-flight went 20.6 -> 39.9, because ~40 concurrent tasks then queued behind
+this one flock.
+
+Measured across 34 runs: the correlation between mean in-flight and MEDIAN TASK
+DURATION is r=0.858, at ~+14 min of duration per additional concurrent task.
+Controlling for run length (~8.3h runs only): ~20 in-flight -> ~3.9h duration,
+~40 in-flight -> ~6.8h. Duration then collided with the ~8.3h fleet-restart
+window, so most attempts were killed before finishing: task 3728 needed NINE
+dispatches over six days, and the only one that landed took 5.24h, the sole
+attempt shorter than the window.
+
+REVERSIBLE AND UNDER OBSERVATION: if median task duration did not fall on the
+next run, put this back to 1 rather than raising it further. The box is CPU
+constrained (verify was ~72% of a 99.3%-busy 32-core host on 2026-08-28), and
+more verify concurrency is not free. This clause fired on 2026-09-08.
+
+### 2026-09-08 — 3 -> 1
+
+Operator decision, Leo 2026-09-08, load-tuning session. Commit `35b8916784`
+("config: task-lane verify slots 3 -> 1; pin merge -n auto at 16; cap
+offline-lane/agent -n auto at 8 (Leo, load-tuning 2026-09-08)").
+
+The 09-03 "REVERSIBLE AND UNDER OBSERVATION" clause fired: median task duration
+did not fall, it rose. Measured from the same event store, orchestrator-module
+TASK-LEG verify only:
+
+| Slots | Legs | Median | Share at the 3600s wall |
+|---|---|---|---|
+| 1 | 30, before 2026-09-03 15:58Z | 2300s | 10% |
+| 3 | 49, after | censored at 3600s | 80% |
+
+Merge verify median moved 2572s -> 3199s across the same step, and journal
+timeouts/day went 2,1,3,7,13,9,7 (08-28..09-07). Dose-response against the
+number of OTHER concurrent orchestrator-suite fan-outs: 0-0.5 others -> 1978s
+median, 0/12 timeouts; >=0.5 others -> 3600s censored, 29/52 timeouts. "So 2
+slots is not a middle ground either." That line was later overridden by the
+2026-09-23 raise below.
+
+The host is: 32 threads, 99% busy, runqueue p50 136 / p90 380 (PSI cpu-some
+49-72 and non-discriminating at this load, per task 3590). The main-tip sweep
+(background role) shares this slot and was already live in the 1-slot regime
+the 2300s figure comes from.
+
+As first written, this entry also said slot time was not the constraint: "the
+whole task-lane leg volume (~240 legs/14d) sums to ~5.5h/day, i.e. ~23% of ONE
+slot." The 2026-09-18 correction below retracts that figure.
+
+### 2026-09-18 — correction (value unchanged at 1)
+
+The yaml text of this correction landed in commit `92c22ab510` ("Correct
+verify_admission_task_slots comment: task-leg slot utilisation is ~99%, not
+~23%") on 2026-10-08; its evidence is the 2026-09-18 study.
+
+The 09-08 entry's "~240 legs/14d, ~5.5h/day, ~23% of ONE slot" counted one
+module's legs only (the 09-08 basis figures are orchestrator-module only, and
+orchestrator is 34% of gated arrivals), so it undercounted slot-gated task legs
+by 6.3x: measured arrivals are 107.5 legs/day (n=578 over 5.38d), not
+~17.1/day. Priced at service times from the same period, offered work is
+23.9 h/day, so the ONE slot is ~99% utilised, not ~23%. The orchestrator
+full-suite task leg alone is 22% of arrivals and 86% of slot work, and its mean
+service time rose from 644s (July) to 3,066s (from 2026-09-12).
+
+Sources, in `plans/verify-merge-queue-policy-study-2026-09-18/`:
+`measure-sem.md`, and `critic.md` finding 1 (summary: `SYNTHESIS.md` §1).
+
+With the slot saturated and in-flight tasks pinned at `max_concurrent_tasks`,
+mean task duration is set by WIP and leg service time, not by slot ordering.
+
+### 2026-09-23 — 1 -> 2
+
+Operator decision, Leo 2026-09-23. Commit `c4359d1f2e` ("config:
+verify_admission_task_slots 1 -> 2 (Leo, 2026-09-23), under a dated revert"),
+amended by `ca06d49340`.
+
+This deliberately overrode the 09-08 line "So 2 slots is not a middle ground
+either", which was written from the 09-03 3-slot episode and never tested 2
+directly. What had changed since:
+
+- merge rate 9.71 -> 16.29 /day (first vs second 7d of 09-09..09-22)
+- merge verify duration 64.3 -> 55.2 min mean over the same split (~49 on
+  2026-09-23)
+- 24/24 concurrency slots occupied while only 4 tasks execute; 20 park at
+  `phase_enter verify` behind this one flock
+- backlog +16.6 pending/day (burndown.db 992 -> 1080 over 5.3d), median
+  pending age 14.2d, 225 high-priority waiting
+
+UNDER OBSERVATION, WITH A DATED REVERT: task 5797 fires 48h after this lands
+and re-measures; if median task duration or timeouts/day worsen, put this back
+to 1. That is the same reversibility clause the 09-03 raise carried, which did
+fire and was honoured. It fired again on 2026-09-27.
+
+MEASUREMENT GAP, stated rather than papered over: the "~23% of ONE slot"
+figure (retracted by the 2026-09-18 correction) could NOT be re-verified on
+2026-09-23. `workflow_verify` events carry only {base_sha, branch, passed,
+tip_sha} and NO duration, so task-lane slot-hours are not derivable from the
+event store at all. Only the leg COUNT is: 572 workflow_verify events in 14.4d
+versus the ~240/14d that figure was computed from. Task 5798 closes that gap.
+Until it lands, this knob is being tuned on merge-lane duration plus
+queue-depth observation, not on task-lane slot utilisation.
+
+### 2026-09-27 — 2 -> 1 (task 5797 gate)
+
+Commit `bd9b15b5ef` ("config(5797): verify_admission_task_slots 2 -> 1 — gate
+fired (M1a/M1b task-leg p50 and >=3600s share)").
+
+The 09-23 dated-revert clause fired. Equal 4.3d arms on either side of the
+09-23 reload:
+
+- orchestrator-suite task-leg verify (verify-summary census): median 3233s ->
+  4995s, >=3600s share 27.3% -> 63.3%
+- task-lane verify after a rebase, all modules (runs.db `rebase_verify_cost`):
+  median 222s -> 633s, >=3600s share 11.0% -> 28.1%
+
+Journal timeouts 0 -> 2 (fused-memory, 09-24). Merge verify was flat (p50
+51.5 -> 54.7 min), and landings/day fell 17.1 -> 14.1. The full before/after on
+all five measures, with windows, sources, caveats and reproduction commands, is
+the "2026-09-27 — task 5797" section below.
+
+### 2026-11-09 — 1 -> 2 (load-monitor rule)
+
+Operator decision, Leo. Commit `738ac3ffa1` ("config:
+verify_admission_task_slots 1 -> 2 (load-monitor rule, 2026-11-09 14:13Z)"),
+applied by `reload_config`.
+
+Measured over the 2 h rolling window with the reify, solar-challenge and
+solar-challenge-platform schedulers paused and fully drained:
+
+| Measure | Value | Rule |
+|---|---|---|
+| host PSI cpu some avg10, median | 16.8 | < 35 |
+| root cgroup CPU, three 10 s samples | 18 / 15 / 14 cores of 32 | <= 24 |
+| df merge-lane union-busy | 0.71 | < 0.90 |
+| local merge-verify median | 29.0 min | — |
+| oom_kill | 0 | — |
+
+The rule is seat Q-R's slot recommendation, on a 2 h window per Leo
+2026-11-08. Its source, `plans/portfolio-review-2026-11-01/seats/Q-R.md`, is
+untracked: it exists only in the main checkout (`/home/leo/src/dark-factory`),
+not in git or in task worktrees.
+
+Revert triggers, from the commit: *"Revert to 1 if PSI median > 50, local
+merge median > 46 min, or any oom_kill."*
+
+Unlike 2026-09-27, this change rests on a threshold rule over current host
+load, not on an equal-arm before/after gate, so it has no measurement section
+below.
+
+### 2026-11-10 — 2 -> 3 (progressive-slot rule)
+
+Operator decision, Leo, 2026-11-09: use the host's CPUs to maximise
+throughput. Raise one slot at a time, at most once every 2 h, while the 2 h
+mean task-leg admission wait is at least 5 min and mean idle CPU is at least
+0.5 threads of 32. Ceiling 5. This supersedes Q-R's "never 3" and its PSI > 50
+revert. Applied by `reload_config` at 2026-11-10 ~21:00Z.
+
+Measured at 2026-11-10 20:56Z, reify, solar-challenge and
+solar-challenge-platform schedulers still paused:
+
+| Measure | Value | Rule |
+|---|---|---|
+| task-leg admission wait, 2 h mean | 5.1 min (n 20) | >= 5 |
+| mean idle threads since the previous tick (30 min) | 5.2 of 32 | >= 0.5 |
+| host PSI cpu some avg10, 2 h median | 24.7 | — |
+| local merge-verify median since 10:00Z | 34.3 min (n 18) | baseline |
+| landings since 10:00Z | 18 (about 3.3 per 2 h) | baseline |
+| MemAvailable | 67 GB | — |
+| oom_kill | 0 | — |
+
+Step-down triggers (to 2): local merge-verify median above 41 min (20% over
+the 34.3 baseline) or above 46 min; landings per 2 h below the baseline over
+at least 4 ticks; any oom_kill; MemAvailable below 16 GB; or reify or a solar
+project resuming.
+
+### 2026-11-11 — 3 -> 2 (progressive-slot rule, step-down)
+
+Stepped down at 2026-11-11 13:26Z under the 2026-11-10 entry's trigger: two
+consecutive local merge verifies of different tasks at 3 slots ran over the
+41-min line (20% over the 34.3-min baseline):
+
+| Run end | Task | Runner | Duration | Host PSI during run |
+|---|---|---|---|---|
+| 12:28Z | 6425 | local | 44.8 min, passed | 30.6 |
+| 13:17Z | 9308 | local | 43.6 min, passed | — |
+
+Laptop merge verifies over the same window were 19.7-24.1 min. Context at the
+step: host PSI 2 h median 30.5, mean idle 4.0 threads, task-leg admission
+wait 2.9 min (n 22), 6 landings in 2 h, MemAvailable 65 GB, oom_kill 0. The
+3-slot period ran 2026-11-10 21:00Z to 11-11 13:26Z, but most of it was
+confounded: a fleet-restart drain (21:00-23:48Z) and an account-pool usage
+cap (about 01:00-10:33Z) left little verify demand. Its 3-slot evidence is
+roughly the 3 h after 10:33Z.
+
+Re-raise to 3 under the same rule (2 h mean task wait >= 5 min and idle
+>= 0.5 threads), no earlier than 2 h after this step.
+
+### 2026-11-11 — 2 -> 3 (progressive-slot rule, re-raise)
+
+Re-raised at 2026-11-11 23:27Z, 10 h after the step-down. Two earlier ticks
+met the rule's numbers on a single burst that then cleared (16:11-16:34Z, and
+21:51-22:06Z). The operator held each for one tick and required legs admitted
+after the burst to queue too. That condition was met at 23:26Z:
+
+| Measure | Value | Rule |
+|---|---|---|
+| task-leg admission wait, 2 h mean | 8.6 min (n 12) | >= 5 |
+| task legs admitted after the 21:51 burst | waited 0.3 / 7.7 / 9.9 min | still queueing |
+| mean idle threads, last 30 min | 6.4 of 32 | >= 0.5 |
+| oldest background waiter (23:19Z heartbeat) | 28.5 min | — |
+| local merge-verify median at 2 slots | 33.4 min (n 3) | baseline stays 34.3 |
+| MemAvailable | 73 GB | — |
+| oom_kill | 0 | — |
+
+Same step-down triggers as the 2026-11-10 entry (local merge-verify median
+over 41 min on two consecutive runs of different tasks, or over 46 min;
+landings below baseline over 4 ticks; any oom_kill; MemAvailable under
+16 GB; a paused project resuming).
+
+### 2026-11-12 — 3 -> 2 (progressive-slot rule, step-down)
+
+Stepped down at 2026-11-12 04:27Z. Two consecutive local merge verifies of
+different tasks ran over the 46-min ceiling:
+
+| Run end | Task | Runner | Duration |
+|---|---|---|---|
+| 04:23Z | 8525 | local | 52.3 min, passed |
+| 04:24Z | 7341 | local | 52.9 min, passed |
+
+Context: host PSI 30-min median 53.0 (2 h 28.0), root CPU 32 of 32, mean
+idle 1.7 threads. In the 10 s cgroup sample `orchestrator-reify.service` drew
+15.6 cores: reify's scheduler is still halted, but its unit was re-seeding warm
+lanes (`seed-warm-lane.sh` onto base gen 642) and running cargo-nextest. dark
+factory's task slots do not govern that load. Task-leg admission wait was
+1.0 min, landings 1 in 2 h. The 3-slot period (11-11 23:27Z to 11-12 04:27Z)
+had local merge verifies of 20-28 min until reify's warm-lane work began.
 
 ---
 

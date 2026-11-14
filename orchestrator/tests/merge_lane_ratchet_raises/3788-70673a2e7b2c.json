@@ -1,0 +1,54 @@
+{
+  "task_id": "3788",
+  "reason": "review fix: reverify_member_solo forwards the escalation queue to _run_post_merge_verify so a main-probe flake-suppression storm during train solo re-verify files its INV-4 escalation; one patch target (worker.reverify_member_solo) pins that the workflow passes its queue, since the solo re-verify has no injectable seam at that call",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22295,
+      "current": 22301
+    },
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/test_workflow_train_attribution.py",
+      "baseline": 0,
+      "current": 1
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_workflow_train_attribution.py",
+      "baseline": 68,
+      "current": 69
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12525,
+      "current": 12528
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57425,
+      "current": 57431
+    },
+    {
+      "measure": "total:patch_targets",
+      "key": "<cluster>",
+      "baseline": 55,
+      "current": 56
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6554,
+      "current": 6555
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31642,
+      "current": 31645
+    }
+  ]
+}

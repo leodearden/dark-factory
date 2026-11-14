@@ -21,7 +21,8 @@ from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
 import pytest
-from _xdist_crash_fixtures import XDIST_SESSION_ABORTED_OUTPUT
+from _gate_fixtures import gate_argv, gated_remote_runner
+from _xdist_crash_fixtures import XDIST_IN_FLIGHT_NODEID, XDIST_SESSION_ABORTED_OUTPUT
 
 from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
@@ -34,11 +35,13 @@ from orchestrator.verify import (
 from orchestrator.verify_runner import (
     REMOTE_VERIFY_PROCESS_PATTERN,
     ConcurrentDispatchError,
+    HostAllocator,
     MergeVerifySpec,
     RemoteRunner,
     RunnerUnavailable,
     RunnerUnavailableKind,
     UnscopedTypecheckSpec,
+    remote_verify_process_pattern,
     result_from_json,
     result_to_json,
 )
@@ -118,6 +121,7 @@ class _FakeTransport:
         ssh_rc: int = 0,
         ssh_stderr: str = '',
         push_rc: int = 0,
+        push_stderr: str = 'push rejected',
         push_error: OSError | None = None,
         ssh_error: OSError | None = None,
         hold_ssh: bool = False,
@@ -127,6 +131,7 @@ class _FakeTransport:
         self.ssh_rc = ssh_rc
         self.ssh_stderr = ssh_stderr
         self.push_rc = push_rc
+        self.push_stderr = push_stderr
         self.push_error = push_error
         self.ssh_error = ssh_error
         self.hold_ssh = hold_ssh
@@ -140,7 +145,7 @@ class _FakeTransport:
                 return 0, '', ''
             if self.push_error is not None:
                 raise self.push_error
-            return self.push_rc, '', 'push rejected' if self.push_rc else ''
+            return self.push_rc, '', self.push_stderr if self.push_rc else ''
         if self.ssh_error is not None:
             raise self.ssh_error
         if self.hold_ssh:
@@ -173,7 +178,7 @@ def _remote_runner(
     main_branch: str | None = None,
     config_path: str | None = None,
 ) -> RemoteRunner:
-    return RemoteRunner(
+    return gated_remote_runner(
         name='laptop',
         ssh_host='laptop.local',
         git_remote='origin',
@@ -215,7 +220,7 @@ class TestRunnerUnavailableKind:
     def test_bare_construction_is_transport(self):
         assert RunnerUnavailable().kind == 'transport'
 
-    @pytest.mark.parametrize('kind', ['transport', 'unparseable', 'no_verdict', 'wire_shape'])
+    @pytest.mark.parametrize('kind', ['transport', 'gate', 'unparseable', 'no_verdict', 'wire_shape'])
     def test_every_vocabulary_kind_is_accepted(self, kind: RunnerUnavailableKind):
         assert RunnerUnavailable('x', kind=kind).kind == kind
 
@@ -235,11 +240,22 @@ class TestDispatchFailureKinds:
         return excinfo.value.kind
 
     @pytest.mark.asyncio
-    async def test_push_rejection_is_transport_and_no_ssh_is_issued(self):
+    async def test_push_rejection_is_gate_and_no_verify_ssh_is_issued(self):
+        """A host that refuses the verify ref is reached: 'gate' (task 6565, Q1 ruling)."""
         transport = _FakeTransport(push_rc=1)
 
-        assert await self._kind_of(transport) == 'transport'
+        assert await self._kind_of(transport) == 'gate'
         assert transport.ssh_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_push_connect_failure_is_transport(self):
+        transport = _FakeTransport(
+            push_rc=128,
+            push_stderr='ssh: connect to host laptop.local port 22: Connection timed out\n'
+                        'fatal: Could not read from remote repository.',
+        )
+
+        assert await self._kind_of(transport) == 'transport'
 
     @pytest.mark.asyncio
     async def test_push_spawn_failure_is_transport(self):
@@ -248,6 +264,11 @@ class TestDispatchFailureKinds:
     @pytest.mark.asyncio
     async def test_ssh_exit_255_is_transport(self):
         assert await self._kind_of(_FakeTransport(ssh_rc=255, ssh_stderr='refused')) == 'transport'
+
+    @pytest.mark.asyncio
+    async def test_ssh_exit_other_than_255_is_gate(self):
+        """The host was reached and the verify command failed there (design D5)."""
+        assert await self._kind_of(_FakeTransport(ssh_rc=1, ssh_stderr='Error: x')) == 'gate'
 
     @pytest.mark.asyncio
     async def test_ssh_spawn_failure_is_transport(self):
@@ -374,14 +395,14 @@ class TestRunTaskVerifyTransport:
         )
         [ssh_argv] = transport.ssh_calls()
         assert ssh_argv[-2] == 'laptop.local'
-        parsed = shlex.split(ssh_argv[-1])
+        parsed = gate_argv(ssh_argv[-1])
         assert parsed == [
-            'orchestrator', 'verify-task', '--sha', _TIP,
+            'verify-task', '--sha', _TIP,
+            '--request-id', 'fixed-id',
             '--spec', task_spec_to_json(spec),
             '--config', '/etc/orch.yaml',
-            '--request-id', 'fixed-id',
         ]
-        assert task_spec_from_json(parsed[5]) == spec
+        assert task_spec_from_json(parsed[6]) == spec
         assert transport.deleted_refs() == ['refs/merge-verify/fixed-id']
 
     @pytest.mark.asyncio
@@ -422,11 +443,22 @@ class TestRunTaskVerifyTransport:
         assert await self._kind_of(_FakeTransport(ssh_rc=255, ssh_stderr='refused')) == 'transport'
 
     @pytest.mark.asyncio
-    async def test_push_rejection_is_transport_and_no_ssh_is_issued(self):
+    async def test_push_rejection_is_gate_and_no_verify_ssh_is_issued(self):
+        """A host that refuses the verify ref is reached: 'gate' (task 6565, Q1 ruling)."""
         transport = _FakeTransport(push_rc=1)
 
-        assert await self._kind_of(transport) == 'transport'
+        assert await self._kind_of(transport) == 'gate'
         assert transport.ssh_calls() == []
+
+    @pytest.mark.asyncio
+    async def test_push_connect_failure_is_transport(self):
+        transport = _FakeTransport(
+            push_rc=128,
+            push_stderr='ssh: connect to host laptop.local port 22: Connection timed out\n'
+                        'fatal: Could not read from remote repository.',
+        )
+
+        assert await self._kind_of(transport) == 'transport'
 
     @pytest.mark.asyncio
     async def test_non_json_stdout_is_unparseable(self):
@@ -438,7 +470,7 @@ class TestRunTaskVerifyTransport:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('produce', [_signal_killed_result, _xdist_worker_death_result])
-    async def test_executed_no_verdict_result_is_unavailable_and_unarchived(
+    async def test_executed_no_verdict_result_is_unavailable_and_archived(
         self, tmp_path: Path, produce: Callable[[Path], Awaitable[VerifyResult]],
     ):
         worktree = tmp_path / 'worktree'
@@ -447,7 +479,13 @@ class TestRunTaskVerifyTransport:
         transport = _FakeTransport(ssh_stdout=result_to_json(await produce(worktree)))
 
         assert await self._kind_of(transport, archive_root) == 'no_verdict'
-        assert list(archive_root.rglob('*')) == []
+
+        task_dir = archive_root / '6667'
+        record = json.loads(_one(task_dir, 'attempt-4.remote-laptop.no-verdict-*.json').read_text())
+        assert record['sha'] == _TIP
+        assert record['attempt_id'] == 4
+        assert record['role'] == 'task'
+        assert list(task_dir.glob('*pass-summary*')) == []
 
     @pytest.mark.asyncio
     async def test_task_id_disagreeing_with_the_spec_is_refused_before_any_push(self):
@@ -553,6 +591,87 @@ class TestRunTaskVerifyArchive:
         assert list(task_dir.glob('attempt-4.*')) == []
 
 
+class TestNoVerdictArchive:
+    @pytest.mark.asyncio
+    async def test_merge_no_verdict_archives_the_worker_death_line(self, tmp_path: Path):
+        worktree = tmp_path / 'worktree'
+        worktree.mkdir()
+        executed = await _xdist_worker_death_result(worktree)
+        transport = _FakeTransport(ssh_stdout=result_to_json(executed), ssh_stderr='LAPTOP LOG')
+
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await _remote_runner(transport).run_merge_verify(
+                'abc123', _merge_spec(), task_id='6667', archive_root=tmp_path / 'archive',
+            )
+
+        assert excinfo.value.kind == 'no_verdict'
+        task_dir = tmp_path / 'archive' / '6667'
+        test_log = _one(task_dir, 'attempt-1.remote-laptop.test-*.log').read_text()
+        assert f"crashed while running '{XDIST_IN_FLIGHT_NODEID}'" in test_log
+        assert _one(task_dir, 'attempt-1.remote-laptop-*.stderr.log').read_text() == 'LAPTOP LOG'
+        summary = json.loads(_one(task_dir, 'attempt-1.remote-laptop.summary-*.json').read_text())
+        assert summary['role'] == 'merge'
+        record = json.loads(_one(task_dir, 'attempt-1.remote-laptop.no-verdict-*.json').read_text())
+        assert {key: record[key] for key in (
+            'sha', 'runner', 'ssh_host', 'task_id', 'attempt_id', 'role', 'summary',
+        )} == {
+            'sha': 'abc123',
+            'runner': 'laptop',
+            'ssh_host': 'laptop.local',
+            'task_id': '6667',
+            'attempt_id': 1,
+            'role': 'merge',
+            'summary': executed.summary,
+        }
+        assert list(task_dir.glob('*pass-summary*')) == []
+        assert transport.deleted_refs() == ['refs/merge-verify/fixed-id']
+        message = str(excinfo.value)
+        for path in task_dir.iterdir():
+            assert str(path) in message
+
+    @pytest.mark.asyncio
+    async def test_task_no_verdict_archives_the_worker_death_line(self, tmp_path: Path):
+        worktree = tmp_path / 'worktree'
+        worktree.mkdir()
+        executed = await _xdist_worker_death_result(worktree)
+        transport = _FakeTransport(ssh_stdout=result_to_json(executed), ssh_stderr='LAPTOP LOG')
+
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await _remote_runner(transport).run_task_verify(
+                _task_spec(), task_id='6667', archive_root=tmp_path / 'archive',
+            )
+
+        assert excinfo.value.kind == 'no_verdict'
+        task_dir = tmp_path / 'archive' / '6667'
+        test_log = _one(task_dir, 'attempt-4.remote-laptop.test-*.log').read_text()
+        assert f"crashed while running '{XDIST_IN_FLIGHT_NODEID}'" in test_log
+        assert _one(task_dir, 'attempt-4.remote-laptop-*.stderr.log').read_text() == 'LAPTOP LOG'
+        summary = json.loads(_one(task_dir, 'attempt-4.remote-laptop.summary-*.json').read_text())
+        assert summary['role'] == 'task'
+        message = str(excinfo.value)
+        for path in task_dir.iterdir():
+            assert str(path) in message
+
+    @pytest.mark.asyncio
+    async def test_unwritable_archive_root_still_raises_no_verdict(self, tmp_path: Path):
+        worktree = tmp_path / 'worktree'
+        worktree.mkdir()
+        archive_root = tmp_path / 'archive'
+        archive_root.write_text('a file, so no archive directory can be made under it')
+        executed = await _xdist_worker_death_result(worktree)
+        transport = _FakeTransport(ssh_stdout=result_to_json(executed), ssh_stderr='LAPTOP LOG')
+        runner = _remote_runner(transport)
+
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await runner.run_merge_verify(
+                'abc123', _merge_spec(), task_id='6667', archive_root=archive_root,
+            )
+
+        assert excinfo.value.kind == 'no_verdict'
+        assert 'archived at' not in str(excinfo.value)
+        assert runner.dispatch_in_flight is False
+
+
 class TestExclusiveDispatchAcrossPaths:
     @pytest.mark.asyncio
     async def test_task_dispatch_is_refused_while_a_merge_is_in_flight(self):
@@ -589,46 +708,192 @@ def _sleeper(*argv: str) -> subprocess.Popen:
     return subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', *argv])
 
 
+def _verify_sleeper(subcommand: str, request_id: str) -> subprocess.Popen:
+    """A process whose command line has a dispatch's shape, its spec past 4096 bytes."""
+    return _sleeper(
+        'orchestrator', subcommand, '--sha', 's', '--request-id', request_id,
+        '--spec', 'x' * 9000,
+    )
+
+
+def _stop(*children: subprocess.Popen) -> None:
+    for child in children:
+        child.kill()
+        child.wait()
+
+
+def _pgrep(pattern: str) -> list[str]:
+    return subprocess.run(
+        ['pgrep', '-f', pattern], capture_output=True, text=True, check=False,
+    ).stdout.split()
+
+
+async def _cancelled_runner(transport: _FakeTransport, request_id: str) -> RemoteRunner:
+    """A runner whose dispatch of *request_id* was cancelled after its verify ssh
+    started; the dispatch has unwound (raised) before this returns."""
+    transport.hold_ssh, transport.ssh_rc = True, 137
+    runner = _remote_runner(transport, id_factory=_ids(request_id))
+    dispatch = asyncio.create_task(runner.run_merge_verify('abc123', _merge_spec()))
+    await transport.ssh_entered.wait()
+    cancel = asyncio.create_task(runner.cancel_verify())
+    await asyncio.sleep(0)
+    transport.ssh_release.set()
+    await cancel
+    with pytest.raises(RunnerUnavailable):
+        await dispatch
+    assert dispatch.done() and runner.dispatch_in_flight is False
+    transport.hold_ssh = False
+    transport.calls.clear()
+    return runner
+
+
 class TestRemoteVerifyProcessPattern:
-    def test_pgrep_finds_both_subcommands_and_nothing_else(self):
+    def test_pgrep_finds_one_requests_verify_of_either_subcommand_and_nothing_else(self):
         if shutil.which('pgrep') is None:
             pytest.skip('pgrep is not installed')
-        request_id = f'--request-id={uuid.uuid4().hex}'
-        task = _sleeper('orchestrator', 'verify-task', request_id)
-        merge = _sleeper('orchestrator', 'verify-merge', request_id)
-        other = _sleeper('orchestrator', 'verify-other', request_id)
+        request_id, other_id = uuid.uuid4().hex, uuid.uuid4().hex
+        task = _verify_sleeper('verify-task', request_id)
+        merge = _verify_sleeper('verify-merge', request_id)
+        at_the_end = _sleeper('orchestrator', 'verify-merge', '--request-id', request_id)
+        others = [
+            _verify_sleeper('verify-task', other_id),
+            _verify_sleeper('verify-task', f'{request_id}0'),
+            _verify_sleeper('verify-other', request_id),
+            _sleeper('orchestrator', 'cancel-verify', '--request-id', request_id),
+        ]
         try:
-            listed = subprocess.run(
-                ['pgrep', '-f', REMOTE_VERIFY_PROCESS_PATTERN],
-                capture_output=True, text=True, check=False,
-            ).stdout.split()
+            listed = _pgrep(remote_verify_process_pattern(request_id))
 
-            assert str(task.pid) in listed
-            assert str(merge.pid) in listed
-            assert str(other.pid) not in listed
+            assert {str(task.pid), str(merge.pid), str(at_the_end.pid)} <= set(listed)
+            assert not {str(child.pid) for child in others} & set(listed)
         finally:
-            for child in (task, merge, other):
-                child.kill()
-                child.wait()
+            _stop(task, merge, at_the_end, *others)
+
+    def test_the_pattern_keeps_the_subcommand_alternation(self):
+        assert remote_verify_process_pattern('r1') == (
+            f'({REMOTE_VERIFY_PROCESS_PATTERN}) .*--request-id r1( |$)'
+        )
 
     @pytest.mark.asyncio
-    async def test_probe_issues_one_ssh_running_the_pattern(self):
-        transport = _FakeTransport(ssh_rc=1)
+    async def test_a_runner_that_cancelled_nothing_is_clean_without_any_call(self):
+        transport = _FakeTransport(ssh_rc=0)
 
-        await _remote_runner(transport).probe_clean()
+        assert await _remote_runner(transport).probe_clean() is True
+        assert transport.calls == []
+
+    @pytest.mark.asyncio
+    async def test_the_probe_greps_only_the_cancelled_request(self):
+        transport = _FakeTransport(ssh_stdout=result_to_json(_green()))
+        runner = await _cancelled_runner(transport, 'req-7')
+        transport.ssh_rc = 1
+
+        assert await runner.probe_clean() is True
 
         [ssh_argv] = transport.ssh_calls()
         assert (ssh_argv[0], ssh_argv[-2]) == ('ssh', 'laptop.local')
-        assert shlex.split(ssh_argv[-1]) == ['pgrep', '-f', REMOTE_VERIFY_PROCESS_PATTERN]
+        assert shlex.split(ssh_argv[-1]) == ['pgrep', '-f', remote_verify_process_pattern('req-7')]
         assert len(transport.calls) == 1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(('ssh_rc', 'clean'), [(1, True), (0, False), (2, False)])
-    async def test_probe_is_clean_only_when_pgrep_finds_nothing(self, ssh_rc: int, clean: bool):
-        assert await _remote_runner(_FakeTransport(ssh_rc=ssh_rc)).probe_clean() is clean
+    async def test_the_probe_is_clean_only_when_pgrep_finds_nothing(self, ssh_rc: int, clean: bool):
+        transport = _FakeTransport(ssh_stdout=result_to_json(_green()))
+        runner = await _cancelled_runner(transport, 'req-7')
+        transport.ssh_rc = ssh_rc
+
+        assert await runner.probe_clean() is clean
 
     @pytest.mark.asyncio
-    async def test_probe_transport_failure_is_not_clean(self):
-        transport = _FakeTransport(ssh_error=OSError('no ssh'))
+    async def test_a_probe_transport_failure_is_not_clean(self):
+        transport = _FakeTransport(ssh_stdout=result_to_json(_green()))
+        runner = await _cancelled_runner(transport, 'req-7')
+        transport.ssh_error = OSError('no ssh')
 
-        assert await _remote_runner(transport).probe_clean() is False
+        assert await runner.probe_clean() is False
+
+
+class _LocalHostRun:
+    """A RemoteRunner ``run`` whose host is this machine: the probe's remote
+    command runs through ``bash -c``, a cancel-verify answers rc 1, and the
+    verify ssh is held until released, then dies as a cancelled verify does."""
+
+    def __init__(self) -> None:
+        self.verify_entered = asyncio.Event()
+        self.verify_release = asyncio.Event()
+
+    async def run(self, argv: list[str], *, cwd: object = None) -> tuple[int, str, str]:
+        if argv[0] == 'git':
+            return 0, '', ''
+        remote_cmd = argv[-1]
+        if remote_cmd.startswith('pgrep '):
+            proc = await asyncio.create_subprocess_exec(
+                'bash', '-c', remote_cmd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return await proc.wait(), '', ''
+        if 'cancel-verify' in remote_cmd:
+            return 1, '', 'cancel-verify failed'
+        self.verify_entered.set()
+        await self.verify_release.wait()
+        return 137, '', 'Killed'
+
+
+@pytest.mark.asyncio
+class TestParkedMergeSlotProbesItsOwnRequest:
+    """Row 46: a PARKED merge slot clears while a sibling verify runs on the host."""
+
+    async def _park_and_probe(self, request_id: str) -> tuple[HostAllocator, asyncio.Task]:
+        host = _LocalHostRun()
+        runner = gated_remote_runner(
+            name='laptop', ssh_host='laptop.local', git_remote='origin', cwd='/repo',
+            run=host.run, id_factory=_ids(request_id),
+        )
+        allocator = HostAllocator([runner])
+        lease = allocator.acquire_remote()
+        assert lease is not None
+        dispatch = asyncio.create_task(lease.runner.run_merge_verify('abc123', _merge_spec()))
+        await host.verify_entered.wait()
+
+        async def _no_sleep(_secs: float) -> None:
+            return None
+
+        cleared = await allocator.cancel_and_release(lease, sleep=_no_sleep, max_attempts=2)
+        assert cleared is False
+        host.verify_release.set()
+        return allocator, dispatch
+
+    @staticmethod
+    async def _unwind(dispatch: asyncio.Task) -> None:
+        with pytest.raises(RunnerUnavailable):
+            await dispatch
+
+    async def test_a_parked_slot_clears_while_other_requests_still_run(self):
+        if shutil.which('pgrep') is None:
+            pytest.skip('pgrep is not installed')
+        request_id = uuid.uuid4().hex
+        _stop(_verify_sleeper('verify-merge', request_id))
+        siblings = [
+            _verify_sleeper('verify-task', uuid.uuid4().hex),
+            _verify_sleeper('verify-merge', uuid.uuid4().hex),
+        ]
+        try:
+            allocator, dispatch = await self._park_and_probe(request_id)
+            await self._unwind(dispatch)
+
+            assert allocator.is_parked('laptop') is False
+            assert allocator.is_busy('laptop') is False
+        finally:
+            _stop(*siblings)
+
+    async def test_a_parked_slot_stays_parked_while_its_own_request_runs(self):
+        if shutil.which('pgrep') is None:
+            pytest.skip('pgrep is not installed')
+        request_id = uuid.uuid4().hex
+        own = _verify_sleeper('verify-merge', request_id)
+        try:
+            allocator, dispatch = await self._park_and_probe(request_id)
+            await self._unwind(dispatch)
+
+            assert allocator.is_parked('laptop') is True
+        finally:
+            _stop(own)

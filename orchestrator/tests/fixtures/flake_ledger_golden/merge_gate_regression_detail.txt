@@ -1,0 +1,15 @@
+$test_id flaked again after its de-flake fix landed. The flake ledger closed its debt cycle when the de-flake task was observed done, and a merge-gate suppression has now RE-OPENED it: this is cycle $open_count of the same debt, and the fix below did not hold.
+
+  test:                    $test_id
+  project:                 $project_id
+  prior resolving commit:  $prior_resolving_commit
+  prior resolved_at:       $prior_resolved_at  (when the ledger OBSERVED the task done, not when the fix merged)
+  opened_at:               $opened_at
+  open_count:              $open_count
+  observed at merge_sha:   $head
+  observing task_id:       $observing_task_id
+  observed_at:             $observed_at
+
+The ledger files this cycle's de-flake task itself, straight after this escalation; `orchestrator flake-ledger` shows its owner, `filing pending` while the drain still owes the filing, or the unowned breach if no filing is due.
+
+$never_widen_a_timeout

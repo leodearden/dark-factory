@@ -10,7 +10,7 @@ do not need to be re-keyed.
 Network errors are caught and surfaced as ``{'offline': True, 'error': ...}``;
 the caller turns that into a per-project skip plus a Tasks-tab banner.
 
-Note: the four failover loops below raise ``ValueError`` from within their
+Note: the five failover loops below raise ``ValueError`` from within their
 ``_call`` closures on a "soft failure" (malformed/errored MCP result), which
 ``mcp_fanout.first_success`` treats the same as a transport error — including
 invalidating that URL's cached session. Previously a soft failure here fell
@@ -19,8 +19,9 @@ through with a bare ``continue`` and no session teardown; see
 ``fetch_task_prose`` RETURNS one structured error instead of raising it: a
 missing task is a definitive answer, not a soft failure.
 
-Three of those four loops (``fetch_tasks``, ``fetch_statuses``,
-``fetch_task_prose``) are parameterized by ``project_root``, so they compose
+Four of those five loops (``fetch_tasks``, ``fetch_statuses``,
+``fetch_task_prose``, ``fetch_metadata_projection``) are parameterized by
+``project_root``, so they compose
 their ``log_label`` through ``mcp_fanout.fanout_label`` to keep each root's
 failure streak on its own throttle key — one fused-memory URL serves every
 root, so a fixed literal label would let a healthy root's success clear a
@@ -39,9 +40,10 @@ from __future__ import annotations
 import functools
 import math
 import os
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any, TypeVar
 
 import httpx
@@ -95,7 +97,7 @@ Derivation: ``DEFAULT_PER_CALL_TIMEOUT`` (2.0) * ``len(COLD_SESSION_POSTS)``
 (3) = 6.0 <= 7.0, leaving 1.0 s of slack so the bound is a real backstop for
 non-MCP overhead (JSON decode, row shaping, event-loop scheduling) rather
 than coinciding exactly with the sum of its parts. It deliberately equals
-``active_tasks._TASKS_PER_PROJECT_BUDGET`` because both fall out of the same
+``active_tasks.TASKS_PER_PROJECT_BUDGET`` because both fall out of the same
 arithmetic — the two are not coupled in code, so either may be tightened
 independently.
 
@@ -111,7 +113,7 @@ nevertheless operator-configurable (a comma-separated env var), and for that
 case this budget deliberately CAPS the fan-out rather than accommodating it.
 Capping exactly this residual is why the caller-side ``wait_for`` layer
 exists: the two layers are complementary, not redundant — the same
-disclosure ``active_tasks._TASKS_PER_PROJECT_BUDGET`` carries for its own
+disclosure ``active_tasks.TASKS_PER_PROJECT_BUDGET`` carries for its own
 budget. Without this note, ``6.0 <= 7.0`` reads as a total-worst-case
 guarantee it is not.
 """
@@ -123,12 +125,11 @@ guarantee it is not.
 # ---------------------------------------------------------------------------
 # A read's MCP wire arguments are derived from one record, so no second copy
 # of a window can disagree with the read it stands for.  The only read that
-# HAS an offset is :class:`_OnePage`, and ``wire_arguments`` sends THAT field
-# rather than a window handed to it.
+# HAS an offset is :class:`_OnePage`, and ``wire_arguments`` sends THAT field.
 #
-# The mode is a UNION rather than three flat fields because flat fields would
-# permit `page_size` set with `offset` unset, and a read that is somehow both a
-# page and a walk — invalid states that would then need runtime validation.
+# The mode is a UNION rather than flat fields because flat fields would permit
+# `page_size` set with `offset` unset, and a read that is somehow both a page
+# and a complete read — invalid states that would then need runtime validation.
 # No field carries a DEFAULT, so a future read mode that forgets to enter one
 # is a pyright construction error AND a runtime TypeError.
 
@@ -143,13 +144,7 @@ class _OnePage:
 
 @dataclass(frozen=True, slots=True)
 class _CompleteRead:
-    """The COMPLETE task set. *chunk_size* selects transport, not the contract.
-
-    ``None`` means one unpaginated request; an int means walk the tree that
-    many rows at a time.  Both yield the same set.
-    """
-
-    chunk_size: int | None
+    """The COMPLETE task set: one unpaginated request, no window."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,10 +153,9 @@ class _TasksRead:
 
     The request dict is derived from this record, never assembled beside it,
     so a read and the request it sends cannot disagree about ``offset``.
-    For a PAGE read that is enforced
-    rather than merely intended: :meth:`wire_arguments` reads the window off
-    :attr:`mode` and REFUSES a second one, so no call site can hand the wire a
-    window the read does not name.
+    That is enforced rather than merely intended: :meth:`wire_arguments`
+    takes no window; it reads the one window a read can have off :attr:`mode`,
+    so no call site can hand the wire a window the read does not name.
 
     The RETURN CONTRACT is the *mode*'s TYPE — ``type(read.mode)`` answers
     "one page or the whole set?" without parsing anything out of a string.
@@ -170,40 +164,42 @@ class _TasksRead:
     project_root: str
     statuses: frozenset[str] | None
     mode: _OnePage | _CompleteRead
+    fields: tuple[str, ...] | None
 
-    def wire_arguments(self, window: _OnePage | None) -> dict:
+    def __post_init__(self) -> None:
+        """Refuse a projection :func:`_shape_task` would misread.
+
+        An omitted key reads as absent, so a projection without ``title`` or
+        ``status`` would serve rows titled ``''`` with no status rather than
+        fail. ``None`` asks for whole rows and needs no check.
+        """
+        if self.fields is None:
+            return
+        missing = [key for key in SHAPED_ROW_FIELDS if key not in self.fields]
+        if missing:
+            raise ValueError(
+                f'a projected task read must ask for every key _shape_task reads; missing {missing}',
+            )
+
+    def wire_arguments(self) -> dict:
         """Build the MCP ``get_tasks`` arguments for this read.
-
-        *window* exists for the WALK, which re-uses ONE record across every
-        page and varies only the window — that is the whole reason this is a
-        parameter at all.  A :class:`_OnePage` read has no such freedom: its
-        window IS :attr:`mode`, so it is read from there and a caller-supplied
-        one is a ``TypeError`` rather than a silent override.  Both halves
-        matter.  Deriving it is what makes read/wire OFFSET DRIFT structurally
-        impossible instead of a discipline the one page call site happens to
-        keep; refusing the redundant argument is what stops a future edit
-        (clamping an offset, retrying a short page) from reintroducing the
-        disagreement quietly.
 
         ``statuses`` is guarded on ``is not None``, never truthiness:
         ``frozenset()`` is falsy but means "no tasks at all", the opposite of
         ``None``'s "whole tree", so a truthiness guard would silently widen it.
         It crosses the wire ``sorted()`` — a frozenset has no iteration order,
         and deterministic bytes beat nondeterministic ones for logs and mocks.
+        ``fields`` is already an ordered tuple, so it crosses in the caller's
+        order, guarded on ``is not None`` the same way.
         """
-        if isinstance(self.mode, _OnePage) and window is not None:
-            raise TypeError(
-                f'{self.mode!r} already fixes this read\'s window; passing '
-                f'{window!r} as well is the read/wire disagreement this record '
-                f'exists to make unrepresentable'
-            )
-        page = self.mode if isinstance(self.mode, _OnePage) else window
         arguments: dict = {'project_root': self.project_root}
         if self.statuses is not None:
             arguments['statuses'] = sorted(self.statuses)
-        if page is not None:
-            arguments['page_size'] = page.page_size
-            arguments['offset'] = page.offset
+        if self.fields is not None:
+            arguments['fields'] = list(self.fields)
+        if isinstance(self.mode, _OnePage):
+            arguments['page_size'] = self.mode.page_size
+            arguments['offset'] = self.mode.offset
         return arguments
 
 
@@ -233,6 +229,17 @@ seam that speaks it.
 """
 
 
+SHAPED_ROW_FIELDS: tuple[str, ...] = (
+    'id', 'title', 'status', 'priority', 'dependencies', 'updatedAt',
+    'claimant_run_id', 'heartbeat_at', 'created_at', 'created_at_source',
+)
+"""The top-level wire keys :func:`_shape_task` reads besides ``metadata``.
+
+A projected row read asks for all of them (:class:`_TasksRead` refuses one
+that does not) plus the ``metadata.<key>`` entries its own readers need;
+naming ``metadata`` itself would bring back every metadata key."""
+
+
 def _shape_task(task: dict) -> dict | None:
     """Trim an MCP get_tasks row to the dashboard's persistent shape.
 
@@ -241,10 +248,9 @@ def _shape_task(task: dict) -> dict | None:
     ``updatedAt`` is preserved as ``updated_at`` — it is the recency key for
     ordering done tasks and the ``completed`` display timestamp.
 
-    ``description`` stays because ``redux_api.shape_escalations`` embeds this
-    whole dict as each escalation row's ``task`` and the Escalations drawer
-    renders it; ``details`` is dropped because only the Task Detail pane
-    renders it, and that pane reads it through :func:`fetch_task_prose`.
+    Rows carry no prose: ``description`` and ``details`` are dropped, and the
+    Task Detail pane and the Escalations drawer read them through
+    :func:`fetch_task_prose`.
 
     ``claimant_run_id`` and ``heartbeat_at`` are carried through for the
     STRANDED projection (task 3543 / PRD ι): they are the two columns
@@ -253,6 +259,13 @@ def _shape_task(task: dict) -> dict | None:
     ``.get`` so a pre-migration row (or an older fused-memory that does not
     emit them) surfaces ``None`` rather than raising — the shaped dict always
     carries the keys, so consumers never have to guard for their absence.
+
+    ``created_at`` and ``created_at_source`` are carried through as the
+    task's FILING TIME and the proxy it was learned from (PRD α; vocabulary
+    ``shared/src/shared/task_created_at.py::CreatedAtSource``).  Both are
+    read with ``.get``: a store without the v6 columns omits them and an
+    un-backfilled row serves ``None``, so the shaped dict always carries the
+    keys.
 
     Mutation warning: ``task_snapshot``'s unit cache holds these dicts by
     reference and hands the same objects to every reader within its TTL, so
@@ -282,7 +295,6 @@ def _shape_task(task: dict) -> dict | None:
     return {
         'id': tid,
         'title': task.get('title') or '',
-        'description': task.get('description') or '',
         'status': task.get('status'),
         'priority': task.get('priority'),
         'dependencies': deps,
@@ -290,199 +302,9 @@ def _shape_task(task: dict) -> dict | None:
         'updated_at': task.get('updatedAt'),
         'claimant_run_id': task.get('claimant_run_id'),
         'heartbeat_at': task.get('heartbeat_at'),
+        'created_at': task.get('created_at'),
+        'created_at_source': task.get('created_at_source'),
     }
-
-
-@dataclass(frozen=True, slots=True)
-class _Page:
-    """One page as it came off the wire.
-
-    *rows* are :func:`_shape_task`-shaped and may be SHORTER than *delivered*:
-    ``_shape_task`` drops a row whose id is missing or non-integer. That gap is
-    a NAMED FIELD rather than a comment because the walk's ``returned``
-    cross-check and its offset advance must both use *delivered* — the count
-    the server actually sent. Checking ``len(rows)`` instead would turn ONE
-    unparseable task id into a whole-project offline marker, and would advance
-    the walk short so the next page re-read rows already held.
-    """
-
-    rows: list[dict]
-    delivered: int
-    pagination: dict | None
-
-
-async def _fetch_page(
-    client: httpx.AsyncClient,
-    url: str,
-    read: _TasksRead,
-    window: _OnePage | None,
-    timeout: float,
-) -> _Page:
-    """Issue ONE ``get_tasks`` call against ONE url and shape what comes back.
-
-    The pagination envelope is PRESERVED rather than discarded: the walk needs
-    ``returned``/``total``, and this is the only layer that sees them.
-
-    Raises ``ValueError`` for a structured MCP error — ``first_success``'s
-    documented soft-failure signal, so the fan-out falls through to the next
-    URL. The guard is ``'error' in result and 'tasks' not in result``
-    specifically: an ``error`` alongside ``tasks`` is a partial-warning payload
-    and must still be served.
-    """
-    result = await mcp_tool_call(
-        client, url, 'get_tasks', read.wire_arguments(window), timeout=timeout,
-    )
-    if 'error' in result and 'tasks' not in result:
-        raise ValueError(str(result.get('error')))
-    raw = result.get('tasks') or []
-    rows = [shaped for shaped in (_shape_task(task) for task in raw) if shaped is not None]
-    meta = result.get('pagination')
-    return _Page(rows, len(raw), meta if isinstance(meta, dict) else None)
-
-
-async def _walk_pages(
-    page_fn: Callable[[_OnePage], Awaitable[_Page]],
-    project_root: str,
-    chunk_size: int,
-) -> list[dict]:
-    """Assemble the COMPLETE task set from repeated *page_fn* calls.
-
-    *page_fn* is injected and already bound to ONE url. That binding is
-    load-bearing rather than stylistic: ``first_success`` tries urls in order,
-    so a walk free to fan out mid-walk would assemble pages from DIFFERENT
-    servers and silently invalidate the changed-``total`` coherence check below —
-    pages from two different states of the world, with every counter still
-    self-consistent. Hence no url/config parameter here.
-
-    The walk starts at offset 0. A complete read starting mid-tree is not
-    complete, which is why a :class:`_CompleteRead` carries no offset to
-    honour.
-
-    TRUNCATION IS LOUD. Every failure below raises ``ValueError`` and DISCARDS
-    whatever rows were accumulated. ``fetch_tasks``' contract distinguishes only
-    ``list`` (a complete success) from the ``{'offline': True}`` marker, so a
-    truncated list is indistinguishable from a complete one at EVERY call site:
-    ``collect_snapshot`` triages on ``isinstance(result, list)`` and would write
-    a confident undercount into the APPEND-ONLY ``snapshots`` table. A plausible
-    dip in an append-only chart is unfalsifiable after the fact, whereas a gap
-    is visible. ``ValueError`` is ``first_success``'s soft-failure signal, so it
-    tries the next URL and, on exhaustion, yields the marker
-    ``collect_snapshot`` already skips on.
-    """
-    shaped: list[dict] = []
-    walk_offset = 0
-    pages = 0
-    page_budget: int | None = None
-    first_total: int | None = None
-    while True:
-        # Same record, different window — which is why wire_arguments takes a
-        # window at all.  Only a `_CompleteRead` may supply one; a page read's
-        # window is its own mode, and offering a second raises.
-        # `statuses` therefore reaches EVERY page: the tool applies the status
-        # filter BEFORE its in-memory slice, so `total` is the FILTERED count and
-        # an unfiltered page would both over-read and desynchronise the walk's
-        # terminator.
-        page = await page_fn(_OnePage(chunk_size, walk_offset))
-        shaped.extend(page.rows)
-        pages += 1
-
-        meta = page.pagination
-        if meta is None:
-            # An older fused-memory ignores page_size and answers with the
-            # whole bare list.  There is no `total` to page against, so this
-            # response IS the answer — take it and stop.  Looping blind
-            # would either spin or re-request the same rows forever.
-            break
-        returned = meta.get('returned')
-        total = meta.get('total')
-        if not isinstance(returned, int) or not isinstance(total, int):
-            # No usable counters: completeness is UNVERIFIABLE here, and an
-            # unverifiable read must not be reported as a complete one.
-            raise ValueError(
-                f'get_tasks pagination for {project_root} truncated at '
-                f'{len(shaped)} row(s), total={total!r}'
-            )
-        if returned != page.delivered:
-            # The SELF-REPORTED counter is what the walk advances on, so it
-            # must be cross-checked against what actually arrived — this is
-            # the one remaining way a bounded-but-incomplete read could be
-            # handed back as a plain list.  A server (or a proxy/serialiser
-            # that clips a page) claiming returned=10 while shipping 4 rows
-            # would otherwise skip 6 rows per page silently, terminate
-            # normally at offset >= total, and hand collect_snapshot a
-            # confident undercount to write into an append-only table.  The
-            # mirror case (under-reporting) re-requests rows already held
-            # and inflates the counts instead.  Neither is verifiable after
-            # the fact, so refuse the read.
-            #
-            # `page.delivered`, NOT `len(page.rows)`: _shape_task drops a row
-            # with an unparseable id, so a legitimately-shaped page can be
-            # shorter than what arrived.
-            raise ValueError(
-                f'get_tasks pagination for {project_root} inconsistent '
-                f'at offset {walk_offset}: server claims returned={returned} '
-                f'but sent {page.delivered} row(s)'
-            )
-        if first_total is None:
-            first_total = total
-            # BOUND THE WALK.  `total` is the loop's only terminator, and it
-            # is server-reported: a stale count, a bad merge of tag scopes,
-            # or a tree being written concurrently makes ceil(total/P)
-            # sequential round trips on the SAME httpx client the 2 s render
-            # polls share — the PoolTimeout hazard the burndown size probe
-            # exists to bound.  So derive one budget from the FIRST response
-            # and refuse to exceed it.  The +2 covers the final partial page
-            # plus one page of slack; a server that keeps handing back short
-            # pages is misbehaving in exactly the way that amplifies the
-            # walk, and is caught here rather than paid for.
-            page_budget = math.ceil(total / max(chunk_size, 1)) + 2
-        elif total != first_total:
-            # A `total` that CHANGES mid-walk — in EITHER direction — means the
-            # tree changed underneath the read: the pages in hand are from
-            # different states of the world, so the assembled list is not a
-            # coherent snapshot of either.
-            #
-            # The check is on inequality rather than growth because the
-            # SHRINKING case is the worse of the two.  A growing `total`
-            # un-bounds the budget derived above and so trips something; a
-            # shrinking one terminates the loop EARLY on `walk_offset >= total`
-            # with every counter still self-consistent, and hands the assembled
-            # prefix back as a plain `list` — which `collect_snapshot` triages
-            # on `isinstance(result, list)` and writes into the append-only
-            # `snapshots` table as fact.  The server re-slices from the now
-            # shorter list, so the pages after the change skip rows outright.
-            raise ValueError(
-                f'get_tasks pagination for {project_root} raced a write '
-                f'at offset {walk_offset}: total changed from {first_total} to '
-                f'{total} mid-walk'
-            )
-        if returned <= 0:
-            # Guard the COMPLETE cases first.  An empty page with no rows
-            # still owed (total <= 0, or offset already past total) is a
-            # complete read of an empty or exhausted tree — it must keep
-            # returning [], or every empty project becomes a permanent
-            # burndown hole and loses its legitimate all-zero row.
-            if total <= 0 or walk_offset >= total:
-                break
-            # The server claims rows remain but hands back an empty page, so
-            # it cannot be paged past.  Detail lives in the exception rather
-            # than a second WARNING for the same event.
-            raise ValueError(
-                f'get_tasks pagination for {project_root} truncated at '
-                f'{len(shaped)} row(s) — empty page at offset {walk_offset}, '
-                f'total={total}'
-            )
-        walk_offset += page.delivered
-        if walk_offset >= total:
-            break
-        if page_budget is not None and pages >= page_budget:
-            raise ValueError(
-                f'get_tasks pagination for {project_root} exceeded its '
-                f'{page_budget}-page budget at offset {walk_offset} '
-                f'(total={total}, page_size={chunk_size}); refusing to keep '
-                f'walking'
-            )
-    return shaped
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,9 +316,9 @@ class _StatusPage:
 
     *statuses* may be SHORTER than *delivered*: an entry whose id is not an
     integer is dropped. The walk's ``returned`` cross-check must count
-    *delivered*, what the server actually sent, for the reason
-    :class:`_Page` gives: counting the parsed entries would turn one
-    unparseable id into an offline marker for the whole project.
+    *delivered*, what the server actually sent: counting the parsed entries
+    would turn one unparseable id into an offline marker for the whole
+    project.
     """
 
     statuses: dict[int, str]
@@ -510,10 +332,9 @@ async def _walk_statuses(
 ) -> dict[int, str]:
     """Assemble the COMPLETE status map from repeated *page_fn* calls.
 
-    *page_fn* is injected and already bound to ONE url, for the same reason
-    :func:`_walk_pages` binds its own: ``first_success`` tries urls in order,
-    and a walk free to fan out mid-walk would tile pages from two different
-    states of the world.
+    *page_fn* is injected and already bound to ONE url: ``first_success``
+    tries urls in order, and a walk free to fan out mid-walk would tile pages
+    from two different states of the world.
 
     ADVANCE BY ``returned``, THE COUNT SERVED.  The envelope comes from
     ``fused_memory/server/tools.py::_pagination_meta``.  It passes the
@@ -529,8 +350,7 @@ async def _walk_statuses(
     ``get_statuses``' own docstring says the opposite: "Advance by
     ``pagination['page_size']`` (what was actually served)".  Its
     implementation does not do that.  Do not switch this walk back to
-    ``page_size`` because of that docstring.  :func:`_walk_pages` reads
-    ``returned`` off the same envelope, so both walkers key on one field.
+    ``page_size`` because of that docstring.
 
     ``returned`` is cross-checked against the entries the page actually
     delivered, because it is the counter the walk advances on.  A page
@@ -539,7 +359,7 @@ async def _walk_statuses(
     entries already held.  Neither is detectable afterwards, so the read is
     refused.
 
-    TRUNCATION IS LOUD, as in :func:`_walk_pages`: every failure below raises
+    TRUNCATION IS LOUD: every failure below raises
     ``ValueError`` and discards the pages in hand.  ``fetch_statuses``'
     contract distinguishes only a map (complete) from the offline marker, so a
     short map is indistinguishable from a full one at the call site, and
@@ -548,11 +368,10 @@ async def _walk_statuses(
     is ``first_success``'s soft-failure signal, so the fan-out tries the next
     url and, on exhaustion, yields the marker.
 
-    Unlike ``_walk_pages`` there is no changed-``total`` coherence check,
-    because the terminator is different: this walk stops on the SERVER's
-    ``has_more``, computed against the population at the instant of each page,
-    where ``_walk_pages`` stops on a client-side ``offset >= total`` comparison
-    that a shrinking total silently satisfies early.
+    There is no changed-``total`` coherence check, because this walk stops on
+    the SERVER's ``has_more``, computed against the population at the instant
+    of each page, not on a client-side ``offset >= total`` comparison that a
+    shrinking total would silently satisfy early.
     """
     merged: dict[int, str] = {}
     offset = 0
@@ -621,24 +440,29 @@ async def _walk_statuses(
 
 
 async def _fanout_read(
+    client: httpx.AsyncClient,
     config: DashboardConfig,
     read: _TasksRead,
-    strategy: Callable[[str], Awaitable[list[dict]]],
+    *,
+    timeout: float,
     label: str,
 ) -> list[dict] | dict:
-    """Fan *strategy* out across the configured urls: rows, or the offline marker.
+    """Issue *read* as ONE ``get_tasks`` call per url: rows, or the offline marker.
 
     THE one place the fan-out and offline-marker policy of the two row reads
     lives.  Both public reads route through it and differ only in the *read*
-    record they build and the *strategy* they bind, so there is no second copy
-    of this to drift out of step (INV-5).  Nothing is stored: every call
-    reaches the substrate, and a failure is returned to the caller that met it
-    and remembered nowhere, so the very next call retries.
+    record they build, so there is no second copy of this to drift out of
+    step (INV-5).  Nothing is stored: every call reaches the substrate, and a
+    failure is returned to the caller that met it and remembered nowhere, so
+    the very next call retries.
 
-    *strategy* is invoked with ONE url at a time and is already bound to it, so
-    whatever it does (a single page, or a whole pinned-url walk) is one attempt
-    against one server.  It carries the HTTP client and the per-request timeout
-    budget a read actually costs; this layer neither needs nor receives them.
+    A structured MCP error raises ``ValueError``, ``first_success``'s
+    soft-failure signal, so the fan-out falls through to the next url.  The
+    guard is ``'error' in result and 'tasks' not in result`` specifically: an
+    ``error`` alongside ``tasks`` is a partial-warning payload and is served.
+    A windowed answer's ``pagination`` envelope is not read, because the
+    requested window IS a page read's contract and a short final page is a
+    correct answer.
 
     *label* NAMES THE CALLING READ, and is a parameter rather than a literal
     because :func:`mcp_fanout.first_success` keys its per-url failure streak on
@@ -646,10 +470,20 @@ async def _fanout_read(
     one stream and log either failure under the other's name — the operator
     debugging a page read would be told ``fetch_tasks`` had failed.
     """
+
+    async def _call(url: str) -> list[dict]:
+        result = await mcp_tool_call(
+            client, url, 'get_tasks', read.wire_arguments(), timeout=timeout,
+        )
+        if 'error' in result and 'tasks' not in result:
+            raise ValueError(str(result.get('error')))
+        raw = result.get('tasks') or []
+        return [shaped for shaped in (_shape_task(task) for task in raw) if shaped is not None]
+
     return await first_success(
         config.fused_memory_urls,
-        strategy,
-        log_label=fanout_label(label, read.project_root),
+        _call,
+        log_label=fanout_label(label, read.project_root, config.project_labels),
         offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
 
@@ -695,6 +529,7 @@ async def fetch_task_page(
     page_size: int,
     offset: int,
     statuses: list[str] | None = None,
+    fields: Sequence[str] | None = None,
     timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> list[dict] | dict:
     """Fetch ONE explicit page of *project_root*'s task list via MCP.
@@ -715,18 +550,13 @@ async def fetch_task_page(
     **Ascending id is the only ordering key.**  *page_size*/*offset* are a
     POST-FETCH in-memory slice in ``server/tools.py::get_tasks``, over a list
     already ordered by ascending ``id``.  They cut wire bytes but not backend
-    work.  Two substrate gaps bound what any caller can do here and are
-    recorded as fused-memory-side follow-up rather than faked client-side:
-    ``get_tasks`` offers NO field/column projection (the backend is a
-    hardcoded ``SELECT *`` feeding a fixed 14-key row, so the heavy
-    ``description``/``details``/``testStrategy``/``metadata`` fields cannot be
-    dropped), and NO ``ORDER BY updated_at`` (so "the N most recently updated"
-    is not expressible server-side).  That second gap is why reaching the
-    high-id end takes a COMPUTED *offset* rather than a ``LIMIT``.
+    work.  ``get_tasks`` offers NO ``ORDER BY updated_at``, so "the N most
+    recently updated" is not expressible server-side, which is why reaching
+    the high-id end takes a COMPUTED *offset* rather than a ``LIMIT``.
 
-    *statuses* narrowing, the offline marker, the absence of any cache and the
-    per-request *timeout* budget behave IDENTICALLY here and are documented
-    once on :func:`fetch_tasks`.  Both reads go through the single
+    *statuses* narrowing, the *fields* projection, the offline marker, the
+    absence of any cache and the per-request *timeout* budget behave
+    IDENTICALLY here and are documented once on :func:`fetch_tasks`.  Both reads go through the single
     :func:`_fanout_read` core, so there is deliberately no second copy of that
     policy — or of its description — to drift.
     """
@@ -734,20 +564,11 @@ async def fetch_task_page(
         str(project_root),
         None if statuses is None else frozenset(statuses),
         _OnePage(page_size, offset),
+        None if fields is None else tuple(fields),
     )
-
-    async def _call(url: str) -> list[dict]:
-        """Read the whole answer from ONE url: for a page read, that is a page."""
-        # No window is passed: `read.mode` IS this read's window, so the wire
-        # request is derived from the read record rather than from a second
-        # copy of *page_size*/*offset* that could drift from it.
-        #
-        # The pagination envelope is deliberately DISCARDED. It bounds a WALK;
-        # here the requested window IS the contract, and a short final page is
-        # a correct answer rather than a truncation to detect.
-        return (await _fetch_page(client, url, read, None, timeout)).rows
-
-    return await _fanout_read(config, read, _call, 'fetch_task_page')
+    return await _fanout_read(
+        client, config, read, timeout=timeout, label='fetch_task_page',
+    )
 
 
 async def fetch_tasks(
@@ -756,7 +577,7 @@ async def fetch_tasks(
     project_root: str | bytes | os.PathLike[str],
     *,
     statuses: list[str] | None = None,
-    chunk_size: int | None = None,
+    fields: Sequence[str] | None = None,
     timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> list[dict] | dict:
     """Fetch the COMPLETE dashboard-shaped task set for *project_root* via MCP.
@@ -766,64 +587,15 @@ async def fetch_tasks(
     marker ``{'offline': True, 'error': str}`` if every configured server
     fails.  For one explicit page call :func:`fetch_task_page`.
 
-    **Chunking (``chunk_size``) selects TRANSPORT, never the contract.**
-    ``None`` issues one unpaginated request; an int WALKS the tree that many
-    rows at a time and returns the assembled complete set.  Both yield the
-    same rows.  It was built for the burndown collector, whose whole-tree read
-    on a large project can exceed the MCP transport's response limit (that
-    response is rejected wholesale).  The collector now reads through
-    ``task_snapshot.acquire_snapshot`` instead, and no production caller passes
-    *chunk_size* today.
-
-    It is spelled ``chunk_size`` and not ``page_size`` on purpose.  Since the
-    public split this module holds BOTH meanings side by side — the slice
-    :func:`fetch_task_page` takes, and the chunk this one walks in — and one
-    spelling for two opposite meanings, distinguishable only by which function
-    you are inside, is precisely the ambiguity that produced esc-4360-7.  The
-    MCP WIRE argument is still ``page_size``; only the Python parameter differs.
-
     The RETURN CONTRACT is what discriminates this read from a page read, and
     it does so structurally: this read's record carries a
-    :class:`_CompleteRead` mode, never an :class:`_OnePage`, so a walk at
-    ``chunk_size=10`` and a genuine first-page-of-10 are different reads with
-    different answers rather than one read with two meanings.
+    :class:`_CompleteRead` mode, never an :class:`_OnePage`, and so never
+    sends a window.
 
-    *statuses* and *timeout* are threaded into EVERY page request of a walk.
-    For *statuses* that is required for coherence: ``server/tools.py::get_tasks``
-    applies the status filter BEFORE its in-memory slice, so ``total`` under a
-    filter is the FILTERED count and the walk's termination condition is only
-    meaningful if every page carries the same filter.  For *timeout* it follows
-    the per-request contract below — a walk multiplies that per-request budget
-    by the page count, so a caller wanting a hard bound on the whole walk must
-    size its own ``asyncio.wait_for`` accordingly.
-
-    Chunking bounds the per-RESPONSE size ONLY.  It is not a way to do less
-    work: MCP ``get_tasks`` has no field projection at any layer and the
-    backend query is ``SELECT *``, so the same rows are read either way — they
-    simply arrive in chunks the caller has sized to be likely to cross the
-    wire.  It is a probability reduction, not a guarantee: no chunk size can be
-    unconditionally safe because a SINGLE dense task row can exceed the
-    transport envelope on its own.  Nor is it free — the server materialises
-    the whole list and slices in memory per request, so a chunk size of P on an
-    N-task project costs ``ceil(N/P)`` SEQUENTIAL round trips and O(N**2/P)
-    server-side row builds.
-
-    **A chunked read is all-or-nothing.**  If a page cannot be verified as
-    complete, the partial rows are DISCARDED and the offline marker is returned
-    instead.  Five ways a page fails that check: a non-int ``pagination``
-    envelope; an empty page while the server still claims rows remain; a
-    ``returned`` counter disagreeing with the number of rows actually delivered
-    (the walk advances on that counter, so an unchecked one skips or re-reads
-    rows silently); a ``total`` that CHANGES mid-walk in EITHER direction (the
-    tree changed underneath the read, so the assembled pages are not one
-    coherent snapshot — and a SHRINKING total ends the walk early with the
-    prefix looking complete); and a walk exceeding the page budget derived from
-    the first response's ``total``.  A
-    truncated ``list`` would be indistinguishable from a complete one at every
-    call site, and a caller writing history would record that undercount as
-    fact.  An empty page with no rows still owed
-    (``total <= 0``, or ``offset >= total``) is a complete read of an empty or
-    exhausted tree and still returns ``[]`` — a true zero, not a truncation.
+    This is ONE unpaginated request.  An answer large enough to exceed the MCP
+    tool-response limit is rejected wholesale and surfaces as the offline
+    marker.  Narrow with *statuses*, or read a window with
+    :func:`fetch_task_page`.
 
     **No cache.**  Every call reaches the substrate; staleness is owned by
     ``task_snapshot``'s unit TTL, the one cache a task datum has (PRD decision
@@ -837,19 +609,27 @@ async def fetch_tasks(
     **Server-side narrowing.**  *statuses* is forwarded to the ``get_tasks``
     MCP tool and is added to the arguments dict only when actually requested,
     so a caller that narrows nothing sends a dict byte-identical to the
-    pre-narrowing shape — the one full-tree caller,
-    ``app._fanout_probe_completion``, is unaffected.  It is a REAL server-side
-    row filter — it becomes ``WHERE tag = ? AND status IN (...)`` in SQL, so
-    narrowing with it cuts backend work, not just wire bytes.  ``None`` (the
-    default) means "no filter"; an EMPTY LIST is a valid, distinct "return
-    nothing" request
-    and is therefore SENT rather than dropped — which is why every guard on
+    pre-narrowing shape.  It is a REAL server-side row filter — it becomes
+    ``WHERE tag = ? AND status IN (...)`` in SQL, so narrowing with it cuts
+    backend work, not just wire bytes.  ``None`` (the default) means "no
+    filter"; an EMPTY LIST is a valid, distinct "return nothing" request and
+    is therefore SENT rather than dropped — which is why every guard on
     this path tests ``is not None`` and never truthiness, ``frozenset()``
     being falsy.  A bare string is rejected server-side with a
     ``ValidationError``.  Because the ``IN`` list is order-insensitive,
     *statuses* is held as a ``frozenset`` and crosses the wire ``sorted()``:
     two calls differing only in order are ONE read, and the wire bytes stay
     deterministic.
+
+    **Projection.**  *fields* is forwarded as ``get_tasks``' ``fields``
+    argument, in the caller's order, and only when given: ``None`` (the
+    default) asks for whole rows and sends no key.  The contract is
+    ``fused-memory/src/fused_memory/backends/task_projection.py::parse_task_projection``:
+    top-level keys in ``_row_to_task``'s spelling (``updatedAt``), and
+    ``metadata.<key>`` one level deep, with ``id`` always returned.  A
+    projected row's ``metadata`` holds only the requested keys present on the
+    task. A projection must name every :data:`SHAPED_ROW_FIELDS` key, or the
+    read raises ``ValueError`` before anything is sent.
 
     **Per-request budget.** *timeout* is threaded into
     :func:`dashboard.data.memory.mcp_tool_call`, whose docstring is the
@@ -862,32 +642,20 @@ async def fetch_tasks(
     ``asyncio.wait_for``, and the two layers are complementary rather than
     redundant. ``task_snapshot._bounded`` does so around each of the snapshot
     unit's reads. The one caller deliberately left unbounded is
-    ``app._fanout_probe_completion``: the /healthz probe keeps its read
-    outstanding so a wedge stays observable, and
-    ``app._MCP_PROBE_OUTSTANDING_LIMIT`` turns that read's age into a verdict.
+    ``app.py::_fanout_probe_completion``, whose read is a one-row
+    :func:`fetch_task_page`: the /healthz probe keeps its read outstanding so
+    a wedge stays observable, and ``app.py::_MCP_PROBE_OUTSTANDING_LIMIT``
+    turns that read's age into a verdict.
     """
     read = _TasksRead(
         str(project_root),
         None if statuses is None else frozenset(statuses),
-        _CompleteRead(chunk_size),
+        _CompleteRead(),
+        None if fields is None else tuple(fields),
     )
-
-    async def _call(url: str) -> list[dict]:
-        """Read the whole answer from ONE url, pinned for the duration."""
-        page_fn = functools.partial(_fetch_page, client, url, read, timeout=timeout)
-
-        if chunk_size is not None:
-            # The walk binds a SINGLE url per first_success attempt — the
-            # coherence checks assume one server.  That holds BY CONSTRUCTION:
-            # `_walk_pages` takes no url/config and is reachable only from
-            # inside a bound strategy.
-            return await _walk_pages(page_fn, read.project_root, chunk_size)
-
-        # One unpaginated request: no chunk to walk, and the whole tree is the
-        # answer.  The envelope, if any, is irrelevant — nothing is being paged.
-        return (await page_fn(None)).rows
-
-    return await _fanout_read(config, read, _call, 'fetch_tasks')
+    return await _fanout_read(
+        client, config, read, timeout=timeout, label='fetch_tasks',
+    )
 
 
 async def fetch_external_statuses(
@@ -940,11 +708,6 @@ async def fetch_statuses(
     ``task_snapshot.acquire_snapshot``, which tallies the map into a
     ``TaskCensus`` and hands ``active_tasks`` the raw map as ``_resolve_deps``'
     bounded fallback for a dependency outside the fetched rows.
-
-    NOTE: the burndown collector used to be the headline consumer and is NOT
-    one any more — ``burndown.collect_snapshot`` moved to ``fetch_tasks`` in
-    task 3543 because this compact map carries no claimant columns, so the
-    live/stranded split is physically underivable from it.
 
     Returns ``{'offline': True, 'error': str}`` if every server fails, or if
     any page of the walk does — a partial map is never served as a complete
@@ -1006,14 +769,14 @@ async def fetch_statuses(
     return await first_success(
         config.fused_memory_urls,
         _call,
-        log_label=fanout_label('fetch_statuses', project_root_str),
+        log_label=fanout_label('fetch_statuses', project_root_str, config.project_labels),
         offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
 
 
 @dataclass(frozen=True, slots=True)
 class TaskProse:
-    """One task's description and details, as the Task Detail pane renders them."""
+    """One task's description and details, read on demand because task rows omit both."""
 
     description: str
     details: str
@@ -1084,13 +847,13 @@ async def _read_task(
     return await first_success(
         config.fused_memory_urls,
         _call,
-        log_label=fanout_label(log_name, root),
+        log_label=fanout_label(log_name, root, config.project_labels),
         offline_result=lambda errs: TaskReadOffline('; '.join(errs)),
     )
 
 
 def _prose_of(result: dict) -> TaskProse:
-    """Missing prose normalises to ``''``, as :func:`_shape_task` does for ``description``."""
+    """Missing prose normalises to ``''``."""
     return TaskProse(result.get('description') or '', result.get('details') or '')
 
 
@@ -1110,15 +873,17 @@ async def fetch_task_prose(
     *,
     timeout: float = DEFAULT_PER_CALL_TIMEOUT,
 ) -> TaskProseRead:
-    """Read ONE task's description/details for the Tasks tab's Task Detail pane.
+    """Read ONE task's description/details on demand.
 
-    The ACTIVE_TASKS rows omit both fields; the pane fetches them here for the
-    selected task only. Each outcome is its own type because the route answers
-    each with a different status: :class:`TaskProse`, :class:`TaskNotFound`
-    or :class:`TaskReadOffline`, classified by :func:`_read_task`.
+    The task rows (``TASKS_SNAPSHOT[p].rows``) omit both fields; the Task
+    Detail pane fetches them here for the selected task, and the Escalations
+    drawer for the linked one. Each outcome is its own type
+    because the route answers each with a different status:
+    :class:`TaskProse`, :class:`TaskNotFound` or :class:`TaskReadOffline`,
+    classified by :func:`_read_task`.
 
     *timeout* is per HTTP request; the caller bounds the whole read.
-    Uncached, deliberately: a primary-key lookup fetched only on selection.
+    Uncached, deliberately: a primary-key lookup fetched only when a task is opened.
     """
     return await _read_task(
         client, config, project_root, task_id,
@@ -1145,3 +910,81 @@ async def fetch_task(
         client, config, project_root, task_id,
         timeout=timeout, log_name='fetch_task', project=_row_of,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectedTask:
+    """One task's id and the requested metadata keys present on it."""
+
+    id: int
+    metadata: Mapping[str, Any]
+
+
+async def fetch_metadata_projection(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: str | os.PathLike[str],
+    *,
+    metadata_keys: Sequence[str],
+    timeout: float = DEFAULT_PER_CALL_TIMEOUT,
+) -> tuple[ProjectedTask, ...] | TaskReadOffline:
+    """Read every task's id and *metadata_keys* in ONE unpaged projected ``get_tasks``.
+
+    The wire ``fields`` list is built here from metadata KEYS, so the read
+    cannot ask for a field :class:`ProjectedTask` does not carry. Rows are
+    never passed through :func:`_shape_task`, which would fabricate a title
+    and a status the projection did not fetch. A row whose id is not an
+    integer is skipped; a row without dict metadata carries ``{}``.
+
+    Its one caller is ``dashboard.data.task_lineage`` (the access grant in
+    ``tests/test_datum_access_paths.py``). *timeout* is per HTTP request; the
+    caller bounds the whole read with ``asyncio.wait_for``, as for
+    :func:`fetch_tasks`.
+    """
+    root = str(project_root)
+    fields = ['id', *(f'metadata.{key}' for key in metadata_keys)]
+
+    async def _call(url: str) -> tuple[ProjectedTask, ...]:
+        result = await mcp_tool_call(
+            client, url, 'get_tasks', {'project_root': root, 'fields': fields},
+            timeout=timeout,
+        )
+        if 'error' in result and 'tasks' not in result:
+            raise ValueError(str(result['error']))
+        rows = result.get('tasks')
+        if not isinstance(rows, list):
+            raise ValueError(f'get_tasks answered without a task list: {rows!r:.200}')
+        return tuple(_projected(rows))
+
+    return await first_success(
+        config.fused_memory_urls,
+        _call,
+        log_label=fanout_label('fetch_metadata_projection', root, config.project_labels),
+        offline_result=lambda errs: TaskReadOffline('; '.join(errs)),
+    )
+
+
+def _projected(rows: list[Any]) -> list[ProjectedTask]:
+    projected: list[ProjectedTask] = []
+    for row in rows:
+        task_id = _integer_id(row.get('id')) if isinstance(row, dict) else None
+        if task_id is None:
+            continue
+        metadata = row.get('metadata')
+        projected.append(ProjectedTask(
+            task_id, MappingProxyType(dict(metadata) if isinstance(metadata, dict) else {}),
+        ))
+    return projected
+
+
+def _integer_id(raw_id: object) -> int | None:
+    if isinstance(raw_id, bool):
+        return None
+    if isinstance(raw_id, int):
+        return raw_id
+    if isinstance(raw_id, str):
+        try:
+            return int(raw_id)
+        except ValueError:
+            return None
+    return None

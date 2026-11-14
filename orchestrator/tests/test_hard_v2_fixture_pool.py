@@ -719,6 +719,7 @@ class TestContinuityFixtures:
             assert got['provenance']['baseline_source'] == CONTINUITY_RUNG, \
                 entry['id']
 
+    @pytest.mark.reads_git_history
     def test_source_fixtures_are_byte_unchanged_since_before_beta1(
         self, continuity: list[dict],
     ) -> None:

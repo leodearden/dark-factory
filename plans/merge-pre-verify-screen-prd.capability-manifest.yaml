@@ -1,0 +1,110 @@
+# Machine-readable twin of merge-pre-verify-screen-prd.capability-manifest.md.
+prd: plans/merge-pre-verify-screen-prd.md
+schema_version: 1
+signal_leaves: ["α", "β", "γ1"]
+tasks:
+  - label: "γ0"
+    task_id: 7918
+    title: "Extract a shared node-id runner (verify.run_node_ids) from the isolated-rerun discriminator"
+    capabilities:
+      - name: "run-node-ids-delivered"
+        binding: "built here; verify.py::confirm_isolated_rerun_verdict body extracted"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def run_node_ids\\("
+          paths: ["orchestrator/src/orchestrator/verify.py"]
+          expect: present
+  - label: "α"
+    task_id: 7919
+    title: "Merge pre-verify screen: manifest, warm screen lanes, per-item and declared-train lane screen"
+    capabilities:
+      - name: "screen-manifest-committed"
+        binding: "built here; the single check list (PRD decision 3)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/merge_screen.yaml"]
+          expect: present
+      - name: "screen-module-exists"
+        binding: "built here; merge_lane/screen.py, imports nothing from worker.py"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/merge_lane/screen.py"]
+          expect: present
+      - name: "screen-failed-outcome-kind"
+        binding: "merge_lane/types.py::OutcomeKind gains screen_failed"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "screen_failed = 'screen_failed'"
+          paths: ["orchestrator/src/orchestrator/merge_lane/types.py"]
+          expect: present
+      - name: "median-per-item-screen-at-most-20s"
+        binding: "basis L3/L5 (warm groups run concurrently plus a reset); α re-measures through run_node_ids"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a measured timing recorded in α's commit, not greppable"
+  - label: "β"
+    task_id: 7920
+    title: "Task-role verify runs the merge screen as per-module structured pytest runs"
+    capabilities:
+      - name: "task-plan-reads-screen-manifest"
+        binding: "verify_plan.py::derive_verify_plan(worktree_reader) reads the manifest"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_screen"
+          paths: ["orchestrator/src/orchestrator/verify_plan.py"]
+          expect: present
+  - label: "γ1"
+    task_id: 7921
+    title: "Main-red verdict and F-screen hold: hold doomed merge items in the lane, verify fixers at once"
+    capabilities:
+      - name: "verdict-module-exists"
+        binding: "built here; merge_lane/main_red_verdict.py, one owner (the worker)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/merge_lane/main_red_verdict.py"]
+          expect: present
+      - name: "verdict-book-class"
+        binding: "built here; the single home for the verdict (INV-9)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class VerdictBook"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: present
+  - label: "δ"
+    task_id: 7922
+    title: "Chain-tip merge screen: truncate a deep chain before a defective link"
+    capabilities:
+      - name: "chain-truncated-before-defective-link"
+        binding: "merge_lane/worker.py::SpeculativeMergeWorker._deep_chain_placement after build_chain; producers 7720, 7259"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "no in-batch dependent; the boundary row 'chain link defect' is the signal"
+  - label: "ε"
+    task_id: 7923
+    title: "get_changed_line_ranges: canonical branch ref and loud failure on a git error"
+    capabilities:
+      - name: "canonical-ref-and-typed-raise"
+        binding: "git_ops.py::GitOps.get_changed_line_ranges with merge_lane/types.py::QueuedBranch.parse"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "no in-batch dependent; the boundary row 'S1.3 ref' is the signal"
+  - label: "ζ"
+    task_id: 7924
+    title: "Merge-screen and main-red-hold 14-day readout and tier decisions"
+    capabilities:
+      - name: "readout-committed-with-decisions"
+        binding: "reads the screen_failed / merge_screen / main_red_verdict / merge_held events (producers α, γ1)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "an analysis readout; its decisions are filed or declined as records"

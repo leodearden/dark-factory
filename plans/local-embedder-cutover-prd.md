@@ -171,6 +171,7 @@ scope, §11). No graph carries a VECTOR index. Similarity is brute-force
     | curator zot-duplicate | 0.65 | schema default | live |
     | write-triage `t_high` / `t_low` / procedural | 0.8868 / 0.5230 / 0.8390 | config, calibrated in 1536 space | dormant for triage; LIVE as `audit_duplicate_memories --apply`'s destructive ANN cutoff |
     | `write_triage_project_calibrations.dark_factory` | observations 0.8578 | config | live, also read by the audit |
+    | write-triage `min_parent_cosine` / `hoist_max_cosine_gap` (task 7158) | 0.60 / 0.05 | config (hand-set operator knobs above the calibration fence; schema defaults) | live; chosen in-sample on the 2026-10-11..19 soak in 1536 space; NOT written by `calibrate_write_triage.py`, so η (6807) must re-derive them alongside `t_high`/`t_low` or set them null until re-derived |
     | Graphiti cosine floor (`DEFAULT_MIN_SCORE` 0.6, cosine > 0.2) | — | Graphiti | carried through ι's eval, which admitted granite under it |
 
     The calibration report's provenance already carries `embedder_model` and

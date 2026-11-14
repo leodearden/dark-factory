@@ -1,14 +1,15 @@
 # Ticket Failure Handling — Canonical Reference
 
-This document is the single source of truth for how callers should handle a
-`failed` status returned by the two-phase `submit_task` / `resolve_ticket`
-pattern.  Five skills reference it:
+This document is the single source of truth for how callers should handle the
+status returned by the two-phase `submit_task` / `resolve_ticket` pattern.  Six
+skills reference it:
 
 - [`skills/review/references/phase3-triage.md`](../review/references/phase3-triage.md) — review cycle task creation
 - [`skills/unblock/SKILL.md`](../unblock/SKILL.md) — unblock non-blocker queuing
 - [`skills/escalation-watcher/SKILL.md`](../escalation-watcher/SKILL.md) — escalation suggestion queuing
 - [`skills/orchestrate/SKILL.md`](../orchestrate/SKILL.md) — PRD-decomposition task writing
 - [`skills/recon-escalation-watcher/SKILL.md`](../recon-escalation-watcher/SKILL.md) — recon-queue finding triage
+- [`skills/escalation-watcher-auto/SKILL.md`](../escalation-watcher-auto/SKILL.md) — auto watcher follow-up filing
 
 ---
 
@@ -19,15 +20,17 @@ ticket = submit_task(title=..., description=..., metadata=...)
 resolve = resolve_ticket(ticket=ticket, project_root=..., timeout_seconds=60)
 ```
 
-`timeout_seconds=60` is set below the server default (115 s) so that a timeout failure
-returns before MCP's ~120 s transport window closes — producing an explicit retryable error
-instead of a silently dropped result.  60 s leaves ~55 s headroom below the 120 s MCP
-transport window to absorb network jitter and response-serialization overhead; intermediate
-values like 90 s or 110 s would leave too little margin to reliably surface the failure as a
-retryable timeout.  See the [`timeout`](#timeout) failure section.
+`timeout_seconds=60` is set below the server default (115 s) so that an expired
+wait answers before MCP's ~120 s transport window closes — producing an explicit
+open answer instead of a silently dropped result.  60 s leaves ~55 s headroom
+below the 120 s MCP transport window to absorb network jitter and
+response-serialization overhead; intermediate values like 90 s or 110 s would
+leave too little margin.  See [Open statuses](#open-statuses-pending-awaiting_curation).
 
-`resolve["status"]` is one of `"created"`, `"combined"`, `"refused"`, or `"failed"`.
-When `"failed"`, `resolve["reason"]` names the failure class.
+`resolve["status"]` is one of seven values.  OPEN (not decided yet):
+`"pending"` and `"awaiting_curation"`.  TERMINAL: `"created"`, `"combined"`,
+`"refused"`, `"cancelled"` and `"failed"`.  Only `created` and `combined` carry a
+`task_id`.  When `"failed"`, `resolve["reason"]` names the failure class.
 
 A `refused` ticket is a **success**, not a failure: a deterministic guard
 (the cancelled-premise blocklist or the recon premise registry) rejected the
@@ -39,26 +42,50 @@ record that verbatim wherever you would have recorded the created task id.
 
 ---
 
+## Open statuses (`pending`, `awaiting_curation`)
+
+An open answer is **not a decision** — neither a failure nor a creation.  The
+ticket is still being curated and nothing on it changed.  It carries `ticket`
+(the same ticket id) and a `reason`, and **never a `task_id`**:
+
+| `reason` | Meaning |
+|----------|---------|
+| `wait_timeout` | The wait expired; the row was re-read and is still open |
+| `wait_interrupted` | The waiter was woken while the row was still open (e.g. a server shutdown) |
+| `store_unavailable` | The ticket store was closing; after a restart the row reads `failed` / `server_restart` |
+| the parked row's own reason | `awaiting_curation`: the curator could not judge it yet (e.g. `curation-deferred: all-accounts-capped`); the ticket janitor retries it until it is created, combined or refused |
+
+**Rule:** call `resolve_ticket` again with the **SAME ticket** and never
+re-submit (a second `submit_task` files a duplicate ticket), inside the cap
+below.  If the second resolve is still open, record the ticket id where a task
+id would go and move on: the verdict lands without further action.  Do not
+count an open ticket as created and do not route it through the failure
+policies below.
+
+---
+
 ## Retryable reasons
 
 ### `server_restart`
 
-The task server restarted between the `submit_task` and `resolve_ticket` calls.
-The original ticket is **dead** — it exists only in memory and was lost.
+The task server restarted while the ticket was still `pending` and never
+deferred, so the restart failed it.  Tickets are persisted, but this one is
+**dead**: no curator will decide it.
 
 **Policy:** retry the full `submit_task + resolve_ticket` pair exactly **once**
 with the **same metadata**.  The "once" budget applies to the `submit_task`
-re-issue specifically: if the re-submitted ticket subsequently returns `timeout`,
-follow the `timeout` policy below (retry `resolve_ticket` first) before
-escalating further.  Only declare the submission terminal once the appropriate
-per-reason retry path has been exhausted.
+re-issue specifically: if the re-submitted ticket answers open, follow the open
+rule above (resolve the same ticket again) before escalating further.  Only
+declare the submission terminal once the appropriate retry path has been
+exhausted.
 
 **Total-submission cap:** at most **two** `submit_task` calls per logical work
-item, regardless of which failure reason triggers the retry.  The full allowed
-budget across both reasons is: 1 initial submit + optional 1 `resolve_ticket`
-retry (under `timeout`) + optional 1 re-submit (under `server_restart`, or
-under `timeout` when its retry returns `unknown_ticket` / `expired`).  After
-the second submit, any further failure is terminal — do not submit a third time.
+item, regardless of which outcome triggers the retry.  The full allowed budget
+is: 1 initial submit + optional 1 `resolve_ticket` retry (on an open answer) +
+optional 1 re-submit (on `failed` / `server_restart`, or when the re-resolve of
+an open ticket returns `failed` / `unknown_ticket` or `failed` /
+`server_restart`).  After the second submit, any further failure is terminal —
+do not submit a third time.
 
 | Action | Max per logical work item |
 |--------|--------------------------|
@@ -72,34 +99,21 @@ duplicate into an existing task via `"combined"`, but this is not guaranteed.
 
 ---
 
-### `timeout`
-
-The `resolve_ticket` call hit its configured timeout (60 s by convention;
-115 s is the server default if omitted); the worker may still be processing
-the original ticket.
-
-**Policy:**
-1. First, retry `resolve_ticket(ticket=same_ticket, ...)` with the **original
-   ticket id** — the worker may finish during the retry window.
-2. If that retry returns `"created"` or `"combined"`, the submission succeeded.
-3. If that retry returns `"failed"` with reason `unknown_ticket` or `expired`
-   (the ticket has since been swept), fall through to the `server_restart`
-   policy: re-submit the full pair once with the same metadata.
-4. Apply the same dedup caveat as `server_restart` if re-submit becomes
-   necessary.
-
----
-
 ## Terminal reasons
 
-The following reasons are **not retryable**.  Apply caller-specific handling
-(skip / surface / record) and move on.
+The following `failed` reasons are **not retryable**.  Apply caller-specific
+handling (skip / surface / record) and move on.
 
 | Reason | Meaning |
 |--------|---------|
-| `unknown_ticket` | Ticket id not found — already swept or never existed |
-| `server_closed` | Task server shut down cleanly; no new work accepted |
-| `expired` | Ticket TTL elapsed before the curator processed it |
+| `unknown_ticket` | Ticket id not found — never existed, or mistyped |
+| `ticket_store not configured` | The server has no ticket store; nothing can be filed |
+| `worker_dead` | The project's curator worker died with the ticket still pending |
+| `curator_failed` | The curator worker crashed while handling the ticket's batch |
+| `bad_candidate_json` | The persisted submission could not be parsed |
+
+A `cancelled` ticket (reason `user_cancelled`) is also terminal: it was
+withdrawn by `cancel_ticket`, created nothing and carries no `task_id`.
 
 Each caller file documents what "caller-specific handling" means in its context
 (skip the finding, surface to user, record in report, etc.).

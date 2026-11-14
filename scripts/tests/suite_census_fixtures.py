@@ -8,12 +8,19 @@ from __future__ import annotations
 
 import gzip
 import os
-import sqlite3
 import subprocess
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
+
+from orchestrator.flake_ledger import (
+    FlakeCallSite,
+    FlakeSuppression,
+    FlakeVerdict,
+    read_occurrences,
+    record_flake_occurrence,
+)
 
 _GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "Suite Census Test",
@@ -79,25 +86,44 @@ def write_gz(path: Path, text: str) -> Path:
     return path
 
 
-def flake_db(path: Path, rows: Sequence[tuple[str, str, str]]) -> Path:
-    """A runs.db carrying a production-shaped flake_occurrence table of (observed_at, test_id, verdict)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
-        conn.execute(
-            "CREATE TABLE flake_occurrence ("
-            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-            " observed_at TEXT NOT NULL, test_id TEXT NOT NULL,"
-            " project_id TEXT NOT NULL, verdict TEXT NOT NULL,"
-            " call_site TEXT NOT NULL, runner TEXT, merge_sha TEXT,"
-            " task_id TEXT, psi_cpu_some10 REAL, detail TEXT DEFAULT '{}')"
-        )
-        conn.executemany(
-            "INSERT INTO flake_occurrence (observed_at, test_id, project_id, verdict, call_site)"
-            " VALUES (?, ?, 'fixture', ?, 'merge_gate')",
-            rows,
-        )
-    conn.close()
+def flake_db(
+    path: Path,
+    rows: Sequence[tuple[str, str | None, str]],
+    *,
+    call_site: FlakeCallSite = FlakeCallSite.merge_gate,
+) -> Path:
+    """Append (observed_at, test_id, verdict) rows to the runs.db at *path*.
+
+    Rows are written by the ledger's own writer at *call_site*. A None test_id with the
+    ``unconfirmable`` verdict is an observation that named no test. The writer drops what
+    it refuses or has already recorded without raising, so a row that adds no
+    occurrence raises here.
+    """
+    for row in rows:
+        _record_one(path, row, call_site)
     return path
+
+
+def _record_one(path: Path, row: tuple[str, str | None, str], call_site: FlakeCallSite) -> None:
+    observed_at, test_id, verdict = row
+    recorded = len(read_occurrences(path))
+    record_flake_occurrence(
+        path,
+        "fixture",
+        FlakeSuppression(
+            verdict=FlakeVerdict(verdict),
+            test_ids=() if test_id is None else (test_id,),
+            observed_at=observed_at,
+            call_site=call_site,
+            runner="local",
+            psi_cpu_some10=None,
+            unconfirmable_reason=None,
+        ),
+        merge_sha=None,
+        task_id=None,
+    )
+    if len(read_occurrences(path)) != recorded + 1:
+        raise ValueError(f"flake_db: the ledger recorded no occurrence for {row!r} at {call_site}")
 
 
 def _set_mtime(path: Path, iso_utc: str) -> None:
@@ -107,30 +133,46 @@ def _set_mtime(path: Path, iso_utc: str) -> None:
 
 PYTEST_S1 = "2026-09-30T14:15:43.000000+01:00"
 
+_ORCHESTRATOR_TEST_A = (
+    "class TestX:\n"
+    "    def test_p(self):\n        pass\n\n"
+    "    def test_flaky(self):\n        pass\n"
+    + "".join(
+        f"\n\ndef {name}():\n    pass\n"
+        for name in ("test_q", "test_e", "test_s", "test_r", "test_live")
+    )
+)
+
 
 def pytest_project(root: Path) -> Path:
     """A dark-factory-shaped project whose verify artefacts cover every pytest source.
 
     Modules (dirs holding orchestrator.yaml): orchestrator, fused-memory, tests/scripts.
-    ``tests/test_a.py`` exists under BOTH orchestrator and fused-memory.
+    ``tests/test_a.py`` exists under BOTH orchestrator and fused-memory. Orchestrator's
+    defines class TestX (test_p, test_flaky) and test_q, test_e, test_s, test_r and
+    test_live; fused-memory's defines only test_q.
     The root pyproject.toml declares those two as workspace members, so the
     Part 2 census (``workspace_domain``) can enumerate the tree.
 
     - archived junit, run S1 (orchestrator): TestX::test_p[1]/[2] pass 2.0/3.0,
-      test_q@grp failure 0.5, test_e error 0.2, test_s skipped, and
-      tests.test_gone::test_z pass 1.0 (no such tracked file);
+      test_q@grp failure 0.5, test_e error 0.2, test_s skipped,
+      tests.test_gone::test_z pass 1.0 (no such tracked file), and test_renamed and
+      TestGone::test_p pass (a function and a class the file does not define);
     - archived junit (tests_scripts): tests.scripts.test_b::test_b1 pass 1.5,
       classname relative to the repo root;
     - live junit: w1 repeats run S1 (mtime 2026-10-02T12:00:00Z); w2 is a new run,
       test_live pass 0.7 (mtime 2026-10-03T12:00:00Z);
-    - pytest log (orchestrator): FAILED TestX::test_p[1], ERROR test_r;
-    - runs.db flake_occurrence: the ambiguous tests/test_a.py::test_q, '<unknown>'
-      and the deleted tests/test_deleted.py::test_x.
+    - pytest log (orchestrator): FAILED TestX::test_p[1], ERROR test_r, and FAILED
+      TestX::test_removed (a method the file does not define);
+    - runs.db flake_occurrence: the ambiguous tests/test_a.py::test_q, an observation
+      that named no test (the ledger's sentinel), the deleted
+      tests/test_deleted.py::test_x, and the ambiguous
+      tests/test_a.py::TestX::test_flaky, which only orchestrator's file defines.
     """
     git_tree(root, {
         "pyproject.toml": '[tool.uv.workspace]\nmembers = ["orchestrator", "fused-memory"]\n',
         "orchestrator/orchestrator.yaml": "",
-        "orchestrator/tests/test_a.py": "def test_q():\n    pass\n",
+        "orchestrator/tests/test_a.py": _ORCHESTRATOR_TEST_A,
         "fused-memory/orchestrator.yaml": "",
         "fused-memory/tests/test_a.py": "def test_q():\n    pass\n",
         "tests/scripts/orchestrator.yaml": "",
@@ -143,6 +185,8 @@ def pytest_project(root: Path) -> Path:
         ("tests.test_a", "test_e", 0.2, "error"),
         ("tests.test_a", "test_s", 0.01, "skipped"),
         ("tests.test_gone", "test_z", 1.0, "pass"),
+        ("tests.test_a", "test_renamed", 0.4, "pass"),
+        ("tests.test_a.TestGone", "test_p", 0.1, "pass"),
     ])
     logs = root / "data" / "verify-logs"
     write_gz(logs / "T1" / "attempt-1.orchestrator.junit-20260930T131543_256921Z.xml.gz", s1)
@@ -168,12 +212,14 @@ def pytest_project(root: Path) -> Path:
         "============ short test summary info ============\n"
         "FAILED tests/test_a.py::TestX::test_p[1] - AssertionError: boom\n"
         "ERROR tests/test_a.py::test_r\n"
-        "1 failed, 1 error in 3.21s\n"
+        "FAILED tests/test_a.py::TestX::test_removed - AssertionError: gone\n"
+        "2 failed, 1 error in 3.21s\n"
     )
     flake_db(root / "data" / "orchestrator" / "runs.db", [
         ("2026-09-01T00:00:00+00:00", "tests/test_a.py::test_q", "passes_in_isolation"),
-        ("2026-09-02T00:00:00+00:00", "<unknown>", "unconfirmable"),
+        ("2026-09-02T00:00:00+00:00", None, "unconfirmable"),
         ("2026-09-03T00:00:00+00:00", "tests/test_deleted.py::test_x", "fails_in_isolation"),
+        ("2026-09-04T00:00:00+00:00", "tests/test_a.py::TestX::test_flaky", "passes_in_isolation"),
     ])
     return root
 
@@ -188,7 +234,7 @@ def nextest_project(root: Path) -> Path:
       pytest-style ``PASS:`` line;
     - log 10 (remote-laptop segment): one PASS;
     - flaky-ledger.jsonl: two test_beta.sh entries and one malformed line;
-    - runs.db flake_occurrence: one '<unknown>' row.
+    - runs.db flake_occurrence: one observation that named no test (the ledger's sentinel).
     """
     git_tree(root, {
         "Cargo.toml": '[workspace]\nmembers = ["crates/*"]\n',
@@ -225,6 +271,6 @@ def nextest_project(root: Path) -> Path:
         '"task":"2","branch":"HEAD","run_id":"run-2"}\n'
     )
     flake_db(root / "data" / "orchestrator" / "runs.db", [
-        ("2026-09-07T00:00:00+00:00", "<unknown>", "unconfirmable"),
+        ("2026-09-07T00:00:00+00:00", None, "unconfirmable"),
     ])
     return root

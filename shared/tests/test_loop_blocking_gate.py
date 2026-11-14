@@ -71,6 +71,10 @@ from silent_fallthrough_scan import (
     reconcile_against_allowlist,
 )
 
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 
 def _src(text: str) -> str:
     """Dedent one triple-quoted chunk of a synthetic module source."""
@@ -829,6 +833,9 @@ _PRIMITIVE_CASES = [
     ('os.path.isfile', 'return os.path.isfile(payload)', 'os.path.isfile'),
     ('os.path.isdir', 'return os.path.isdir(payload)', 'os.path.isdir'),
     ('glob.glob', 'return glob.glob(payload)', 'glob.glob'),
+    # -- task 6089: path normalisation, one lstat per component
+    ('Path.resolve', 'return payload.resolve()', 'resolve'),
+    ('os.path.realpath', 'return os.path.realpath(payload)', 'os.path.realpath'),
 ]
 
 _PRIMITIVE_CASE_IMPORTS = (
@@ -876,10 +883,11 @@ class TestPrimitiveTable:
     def test_primitive_is_detected_directly_in_an_async_body(self, body, expected):
         """A primitive written INLINE in a coroutine needs no helper hop to count.
 
-        This is the ``manifest_stamping::_stamp_capability_manifests_impl``
-        shape: ``read_text`` + ``yaml.safe_load`` + ``write_text`` +
-        ``yaml.safe_dump`` all in one coroutine body, with no helper anywhere
-        for a definition-side census to point at.
+        This was the ``manifest_stamping::_stamp_capability_manifests_impl``
+        shape the scanner was built to see: ``read_text`` +
+        ``yaml.safe_load`` + ``write_text`` + ``yaml.safe_dump`` all in one
+        coroutine body, with no helper anywhere for a definition-side census
+        to point at.
         """
         sources = {
             'pkg/mod.py': _module(
@@ -1108,8 +1116,9 @@ class TestPrimitiveTable:
 
         ``await cost_store.open()`` is server/main.py::_setup_curator_usage_gate's
         async CostStore open -- the false positive widening the table exposed.
-        ``aiofiles.open`` and anyio's ``iterdir`` are the canonical INV-8 fix;
-        flagging them would be a false RED on correctly fixed code.
+        ``aiofiles.open`` and anyio's ``iterdir`` and ``resolve`` are the
+        canonical INV-8 fix; flagging them would be a false RED on correctly
+        fixed code.
         """
         async_apis = {
             'awaited store open': """
@@ -1125,6 +1134,10 @@ class TestPrimitiveTable:
                 async def c(apath):
                     async for child in apath.iterdir():
                         return child
+                """,
+            'anyio resolve': """
+                async def e(apath):
+                    return await apath.resolve()
                 """,
         }
         for shape, body in async_apis.items():

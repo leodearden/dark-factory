@@ -1,0 +1,29 @@
+import re,datetime as dt,collections,statistics as st
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+R=re.compile(r'^(\S+) \S+ warm-lane-gc-sweep\.sh\[(\d+)\]: (.*)$')
+start={};durs=[];byday=collections.Counter();byday_s=collections.Counter();lanes=collections.Counter();pids=collections.defaultdict(list);iv=[]
+for l in open('s.log',errors='replace'):
+    m=R.match(l.rstrip())
+    if not m: continue
+    t=dt.datetime.fromisoformat(m.group(1)).astimezone(dt.timezone.utc);pid=m.group(2);msg=m.group(3)
+    pids[pid].append(t)
+    a=re.search(r'resetting lane: (\S+)',msg)
+    if a: start[(pid,a.group(1))]=t;continue
+    b=re.search(r'\[ok\]\s+reset lane: (\S+)',msg) or re.search(r'reset lane: (\S+)',msg)
+    if b and (pid,b.group(1)) in start:
+        s=start.pop((pid,b.group(1)));d=(t-s).total_seconds();durs.append(d);iv.append((s,t));byday[t.date()]+=1;byday_s[t.date()]+=d;lanes[b.group(1)]+=1
+print('resets',len(durs),'p50',round(pct(durs,.5)),'p90',round(pct(durs,.9)),'p99',round(pct(durs,.99)),'max',round(max(durs)),'mean',round(st.mean(durs)))
+for d in sorted(byday): print(d,byday[d],'resets',round(byday_s[d]/3600,1),'lane-hours')
+print('lanes',len(lanes),lanes.most_common(5),lanes.most_common()[-3:])
+# sweep invocations
+ss=sorted((min(v),max(v),k,len(v)) for k,v in pids.items())
+print('sweep pids',len(ss)); gaps=[(ss[i+1][0]-ss[i][0]).total_seconds() for i in range(len(ss)-1)]
+print('start gap p50',round(pct(gaps,.5)) if gaps else None,'dur p50',round(pct([(x[1]-x[0]).total_seconds() for x in ss],.5)))
+for x in ss[-5:]: print(x[0].strftime('%m-%d %H:%M:%S'),x[1].strftime('%H:%M:%S'),x[2],x[3])
+# concurrency
+ev=sorted([(s,1) for s,_ in iv]+[(e,-1) for _,e in iv]);c=0;mx=0;tot=0;prev=None;busy=0
+for t,dl in ev:
+    if prev is not None and c>0: busy+=(t-prev).total_seconds();tot+=(t-prev).total_seconds()*c
+    c+=dl;mx=max(mx,c);prev=t
+print('max concurrent',mx,'busy frac',round(busy/((ev[-1][0]-ev[0][0]).total_seconds()),3),'mean concurrency while busy',round(tot/busy,2))

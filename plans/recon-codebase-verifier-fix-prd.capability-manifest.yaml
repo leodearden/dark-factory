@@ -151,3 +151,5 @@ tasks:
       kind: manual
       reason: operational ruling against the production DB; no success-rate assertion
         (stochastic; 4344's residual unreproduced)
+signal_leaves:
+- ε

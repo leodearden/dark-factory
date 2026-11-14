@@ -123,3 +123,5 @@ tasks:
     delivered_check:
       kind: manual
       reason: the task IS the check suite; its signal is the CI-green boundary matrix
+signal_leaves:
+- ε

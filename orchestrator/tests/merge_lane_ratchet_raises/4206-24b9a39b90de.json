@@ -1,0 +1,42 @@
+{
+  "task_id": "4206",
+  "reason": "Review amendment to the task 4206 defect fix, net-additive: build_chain's lane_base_mismatch arm no longer returns early inside the try, so the lane is released exactly once on every path and the per-build summary line (with elapsed_ms) still records a refused build; the summary escalates to WARNING for every member of the new CHAIN_FAULT_REASONS constant (merge_lane/types.py, the single home of which ChainTruncationReason values are faults), not just merge_error; the lane HEAD read moved into a two-line _lane_head helper (keeping build_chain's cognitive flat). Not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 1886,
+      "current": 1890
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 22115,
+      "current": 22124
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 984,
+      "current": 985
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 12530,
+      "current": 12536
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57568,
+      "current": 57581
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 32026,
+      "current": 32033
+    }
+  ]
+}

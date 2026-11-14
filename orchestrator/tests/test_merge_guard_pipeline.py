@@ -41,6 +41,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _live_merge_worker import running_merge_worker
+from _merge_lane_fakes import lane_scene_config, remerge_on_main
 from _orch_helpers import make_placeholder_future, wait_responsive
 from _resolution_merges import resolution_merge
 
@@ -49,7 +50,9 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_lane.gates import DropGuardResult
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.intake_buffers import MergeIntake
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     Decided,
     DecidedItem,
@@ -59,7 +62,6 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     item_merge_wt,
 )
-from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures (copied from test_merge_queue.py:62-101 — per-file duplication
@@ -105,7 +107,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +215,7 @@ class TestMergedOkDecidedTypes:
     """Value-type tests for MergedOk / Decided (step-0 / step-2, task 1995)."""
 
     def test_merged_ok_exposes_merge_result_wt_and_branch_tip(self):
-        from orchestrator.merge_types import MergedOk
+        from orchestrator.merge_lane.types import MergedOk
 
         mr = MergeResult(success=True, conflicts=False, details='ok')
         ok = MergedOk(merge_result=mr, merge_wt=Path('/x'), branch_tip='abc123')
@@ -223,7 +225,7 @@ class TestMergedOkDecidedTypes:
         assert ok.branch_tip == 'abc123'
 
     def test_decided_exposes_outcome_and_defaults_merge_result_to_none(self):
-        from orchestrator.merge_types import Decided
+        from orchestrator.merge_lane.types import Decided
 
         d = Decided(outcome=MergeOutcome('conflict', conflict_details='x'))
 
@@ -232,7 +234,7 @@ class TestMergedOkDecidedTypes:
         assert d.merge_result is None
 
     def test_decided_carries_merge_result_when_explicitly_set(self):
-        from orchestrator.merge_types import Decided
+        from orchestrator.merge_lane.types import Decided
 
         mr = MergeResult(success=False, conflicts=True, details='c')
         d = Decided(outcome=MergeOutcome('blocked'), merge_result=mr)
@@ -240,14 +242,14 @@ class TestMergedOkDecidedTypes:
         assert d.merge_result is mr
 
     def test_merged_ok_and_decided_reexported_from_merge_queue(self):
-        """`from orchestrator.merge_queue import MergedOk, Decided` must work
+        """`from orchestrator.merge_lane.worker import MergedOk, Decided` must work
         and resolve to the SAME objects defined in merge_types.py (shim, not
         a parallel redefinition) — mirrors the existing MergeOutcome/
         SpeculativeItem re-export pattern."""
-        from orchestrator.merge_queue import Decided as Decided_via_queue
-        from orchestrator.merge_queue import MergedOk as MergedOk_via_queue
-        from orchestrator.merge_types import Decided as Decided_via_types
-        from orchestrator.merge_types import MergedOk as MergedOk_via_types
+        from orchestrator.merge_lane.types import Decided as Decided_via_types
+        from orchestrator.merge_lane.types import MergedOk as MergedOk_via_types
+        from orchestrator.merge_lane.worker import Decided as Decided_via_queue
+        from orchestrator.merge_lane.worker import MergedOk as MergedOk_via_queue
 
         assert MergedOk_via_queue is MergedOk_via_types
         assert Decided_via_queue is Decided_via_types
@@ -271,7 +273,7 @@ class TestClassifyAndMergeSpeculativeWorker:
     async def test_missing_branch_returns_decided_unknown_branch(
         self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path, tmp_path: Path,
     ):
-        from orchestrator.merge_queue import classify_and_merge
+        from orchestrator.merge_lane.worker import classify_and_merge
 
         es = _make_event_store(tmp_path)
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -294,7 +296,7 @@ class TestClassifyAndMergeSpeculativeWorker:
     async def test_already_merged_returns_decided_already_merged(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
-        from orchestrator.merge_queue import classify_and_merge
+        from orchestrator.merge_lane.worker import classify_and_merge
 
         worktree = await _make_branch_with_file(git_ops, 'already-merged-1', 'am.py', 'x = 1\n')
         merge_result = await git_ops.merge_to_main(worktree, 'already-merged-1')
@@ -338,7 +340,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         ejected the task from the queue with its work unmerged.  The guard must
         instead recognise the false positive and proceed to merge.
         """
-        from orchestrator.merge_queue import classify_and_merge
+        from orchestrator.merge_lane.worker import classify_and_merge
 
         # base_m0 = the branch's base = current main tip.
         base_m0 = await git_ops.get_main_sha()
@@ -394,7 +396,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         on main; the branch tip diverges, is_ancestor misses, and a duplicate/
         late resubmission burns a head-of-line verify on a guaranteed no-op.
         """
-        from orchestrator.merge_queue import classify_and_merge, patch_content_contained
+        from orchestrator.merge_lane.worker import classify_and_merge, patch_content_contained
 
         # Branch with one commit adding reb.py.
         worktree = await _make_branch_with_file(git_ops, 'rebased-2945', 'reb.py', 'x = 1\n')
@@ -453,7 +455,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         both pre- and post-impl (pre-impl there is no backstop); it pins the
         safety arm against a future over-trigger.
         """
-        from orchestrator.merge_queue import classify_and_merge, patch_content_contained
+        from orchestrator.merge_lane.worker import classify_and_merge, patch_content_contained
 
         # R1 adds reb.py on the branch.
         worktree = await _make_branch_with_file(git_ops, 'novel-2945', 'reb.py', 'x = 1\n')
@@ -501,7 +503,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         (the production helper's fail-open on a ``git cherry`` error).  The
         guard must trust that answer and merge, never skip.
         """
-        from orchestrator.merge_queue import classify_and_merge, patch_content_contained
+        from orchestrator.merge_lane.worker import classify_and_merge, patch_content_contained
 
         # Rebased-landing contained setup (branch content genuinely on main).
         worktree = await _make_branch_with_file(git_ops, 'failopen-2945', 'reb.py', 'x = 1\n')
@@ -550,7 +552,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         vetoed and the merge proceed.  Locks against a veto-less impl (which
         would skip → already_merged and eject the task).
         """
-        from orchestrator.merge_queue import classify_and_merge, patch_content_contained
+        from orchestrator.merge_lane.worker import classify_and_merge, patch_content_contained
 
         # Rebased-landing contained setup (branch content fully on main).
         worktree = await _make_branch_with_file(git_ops, 'veto-2945', 'reb.py', 'x = 1\n')
@@ -588,7 +590,7 @@ class TestClassifyAndMergeSpeculativeWorker:
     async def test_real_conflict_returns_decided_conflict_and_records_drift_sample(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
-        from orchestrator.merge_queue import classify_and_merge
+        from orchestrator.merge_lane.worker import classify_and_merge
 
         worktree = (await git_ops.create_worktree('conflict-cm-1')).path
         (git_ops.project_root / 'README.md').write_text('# Main version\n')
@@ -629,7 +631,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        from orchestrator.merge_queue import classify_and_merge
+        from orchestrator.merge_lane.worker import classify_and_merge
 
         worktree = await _make_branch_with_file(
             git_ops, 'nonconflict-fail-1', 'f.py', 'x = 1\n',
@@ -674,7 +676,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        from orchestrator.merge_queue import classify_and_merge
+        from orchestrator.merge_lane.worker import classify_and_merge
 
         worktree = (await git_ops.create_worktree('drop-guard-cm-1')).path
         (worktree / 'retained.py').write_text('retained = 1\n')
@@ -726,7 +728,7 @@ class TestClassifyAndMergeSpeculativeWorker:
     async def test_clean_success_returns_merged_ok(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
-        from orchestrator.merge_queue import classify_and_merge
+        from orchestrator.merge_lane.worker import classify_and_merge
 
         worktree = await _make_branch_with_file(git_ops, 'success-cm-1', 'ok.py', 'x = 1\n')
         rc, expected_tip, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
@@ -754,7 +756,7 @@ class TestClassifyAndMergeSpeculativeWorker:
     async def test_speculative_merge_event_emitted_when_speculative_true(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
-        from orchestrator.merge_queue import classify_and_merge
+        from orchestrator.merge_lane.worker import classify_and_merge
 
         worktree = await _make_branch_with_file(git_ops, 'spec-evt-true', 'f.py', 'x = 1\n')
         es = _make_event_store(tmp_path)
@@ -776,7 +778,7 @@ class TestClassifyAndMergeSpeculativeWorker:
     async def test_speculative_merge_event_not_emitted_when_speculative_false(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
-        from orchestrator.merge_queue import classify_and_merge
+        from orchestrator.merge_lane.worker import classify_and_merge
 
         worktree = await _make_branch_with_file(git_ops, 'spec-evt-false', 'f.py', 'x = 1\n')
         es = _make_event_store(tmp_path)
@@ -803,7 +805,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         branch tip SNAP is merged onto main, worktree HEAD is then rewritten
         to a DIVERGENT commit D (non-ancestor of main); req.snapshot_tip=SNAP
         must still resolve to already_merged."""
-        from orchestrator.merge_queue import classify_and_merge
+        from orchestrator.merge_lane.worker import classify_and_merge
 
         wt = (await git_ops.create_worktree('snap-cm-1')).path
         (wt / 'snap_cm.py').write_text('snap = 1\n')
@@ -852,7 +854,7 @@ class TestClassifyAndMergeSpeculativeWorker:
     ):
         """The base_sha parameter — not some internally-recomputed value —
         must reach _check_plan_targets_in_tree as its main_sha argument."""
-        from orchestrator.merge_queue import classify_and_merge
+        from orchestrator.merge_lane.worker import classify_and_merge
 
         worktree = await _make_branch_with_file(
             git_ops, 'dropguard-base-1', 'f.py', 'x = 1\n',
@@ -873,7 +875,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         req = _make_request('dropguard-base-1', 'dropguard-base-1', worktree, config)
 
         with patch(
-            'orchestrator.merge_queue._check_plan_targets_in_tree',
+            'orchestrator.merge_lane.worker._check_plan_targets_in_tree',
             _spy_check_plan_targets,
         ):
             result = await classify_and_merge(
@@ -1035,7 +1037,7 @@ class TestPathEquivalence:
         worker1 = SpeculativeMergeWorker(git_ops, queue, event_store=es_merger)
         # Neutralise the eta/1892 suffix-conflict-graph pre-dequeue bounce
         # (_acquire_next_request -> recompute_suffix_conflict_graph ->
-        # _bounce_conflicting_suffix_items): it dry-run-detects a conflict
+        # bounce_conflicting_suffix_items): it dry-run-detects a conflict
         # against main BEFORE the item is even dequeued and reroutes it to a
         # rebase/escalate outcome, which is an orthogonal, already-shipped
         # feature (task 1892) — not part of classify_and_merge's equivalence
@@ -1043,11 +1045,11 @@ class TestPathEquivalence:
         # merger-path outcome is decided by that pre-flight bounce instead of
         # classify_and_merge's own conflict branch.
         monkeypatch.setattr(
-            worker1, 'recompute_suffix_conflict_graph',
+            MergeIntake, 'recompute_suffix_conflict_graph',
             AsyncMock(return_value=None),
         )
         monkeypatch.setattr(
-            worker1, '_bounce_conflicting_suffix_items',
+            MergeIntake, 'bounce_conflicting_suffix_items',
             AsyncMock(return_value=None),
         )
         async with running_merge_worker(worker1):
@@ -1064,7 +1066,7 @@ class TestPathEquivalence:
         es_remerge = _make_event_store(tmp_path / 'remerge')
         queue2: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker2 = SpeculativeMergeWorker(git_ops, queue2, event_store=es_remerge)
-        item = await worker2._remerge(remerge_req, time.monotonic())
+        item = await remerge_on_main(worker2, remerge_req, time.monotonic())
 
         # A flowing (non-decided) item means _remerge merged successfully
         # without hitting any guard.  None is a deliberately distinct

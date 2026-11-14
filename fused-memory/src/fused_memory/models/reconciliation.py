@@ -18,6 +18,8 @@ class EventType(StrEnum):
     task_created = 'task_created'
     task_modified = 'task_modified'
     task_deleted = 'task_deleted'
+    deferral_restamped = 'deferral_restamped'
+    task_text_amended = 'task_text_amended'
 
 
 class EventSource(StrEnum):
@@ -86,6 +88,15 @@ class ContextItem:
             self.token_estimate = len(self.formatted) // 4
 
 
+@dataclass(frozen=True)
+class ContextFetchFailure:
+    """An event whose related context could not be fetched: absent context for it is unknown, not empty."""
+
+    event_id: str
+    event_type: str
+    error: str
+
+
 @dataclass
 class AssembledPayload:
     """Result of the ContextAssembler — a token-budgeted chunk of events with
@@ -95,23 +106,18 @@ class AssembledPayload:
     context_items: dict[str, ContextItem] = field(default_factory=dict)
     total_tokens: int = 0
     events_remaining: int = 0  # > 0 exactly when token_budget stopped the assembly
-    effective_watermark: datetime | None = None
     token_budget: int = 0
+    context_fetch_failures: tuple[ContextFetchFailure, ...] = ()
 
-
-class JournalEntry(BaseModel):
-    """One per reconciliation operation — full audit trail."""
-
-    id: str
-    run_id: str = ''
-    stage: StageId | None = None
-    timestamp: datetime
-    operation: str
-    target_system: str  # 'graphiti', 'mem0', 'taskmaster'
-    before_state: dict | None = None
-    after_state: dict | None = None
-    reasoning: str = ''
-    evidence: list[dict] = Field(default_factory=list)
+    def budget_report(self) -> dict[str, int]:
+        """How much of token_budget this chunk spent, and on how many events and context items."""
+        return {
+            'estimated_tokens': self.total_tokens,
+            'token_budget': self.token_budget,
+            'events': len(self.events),
+            'context_items': len(self.context_items),
+            'events_deferred': self.events_remaining,
+        }
 
 
 class StageReport(BaseModel):
@@ -145,11 +151,10 @@ class RunStatus(StrEnum):
     failed = 'failed'
     rolled_back = 'rolled_back'
     circuit_breaker = 'circuit_breaker'
-    # A run whose in-flight stage was cancelled by a restart while
-    # config.resume_after_restart was set. Unlike 'failed', an interrupted run
-    # keeps its drained events and per-run transcript so the startup
-    # adopt-and-resume pass (task σ) can --resume the SAME run_id at its
-    # stage_cursor rather than re-running from stage 1.
+    # Legacy, read-only. Task 2717's retired resume path wrote it for a run
+    # cancelled mid-stage; nothing writes it since task 5514, and
+    # harness.py::ReconciliationHarness._recover_legacy_interrupted_runs
+    # converts any such row to 'failed' at startup.
     interrupted = 'interrupted'
 
 
@@ -169,8 +174,7 @@ class ReconciliationRun(BaseModel):
     instance_id: str | None = None  # EventBuffer.instance_id of the harness that started the run
     # CLI session id minted for the in-flight stage subprocess (cleared between
     # stages). Best-effort: reflects the value minted before launch and may be
-    # stale after an internal cap retry regenerates the session — σ's resume
-    # gate must validate the transcript exists before --resume. See
+    # stale after an internal cap retry regenerates the session. See
     # ReconciliationJournal.record_run_session.
     session_id: str | None = None
     stage_cursor: str | None = None  # StageId.value of the in-flight stage (cleared between stages)
@@ -258,7 +262,12 @@ def _normalize_project_id(v: object, *, allow_empty: bool = False) -> object:
 
 
 class Watermark(BaseModel):
-    """Tracks what's been processed per project."""
+    """Tracks what's been processed per project.
+
+    The three ``*_timestamp`` fields are the lower bounds of the next cycle's data
+    windows, anchored at run start (why: tests/reconciliation/test_recon_window_anchor.py);
+    ``last_full_run_completed`` is the completion instant.
+    """
 
     project_id: str
     last_full_run_id: str | None = None

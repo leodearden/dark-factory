@@ -1,0 +1,48 @@
+{
+  "task_id": "5290",
+  "reason": "task 5290: net-additive watchdog/alarm signal-quality work (typed recovery evidence + alarm re-assert, occupancy lease activity, process-tree CPU liveness); new behaviour in small new functions in lower layers, the big lane functions shrank",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/liveness.py",
+      "baseline": 60,
+      "current": 64
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 81,
+      "current": 89
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_host_observability.py",
+      "baseline": 30,
+      "current": 46
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_multihost_wiring.py",
+      "baseline": 358,
+      "current": 368
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_request_liveness.py",
+      "baseline": 188,
+      "current": 196
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5016,
+      "current": 5018
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6603,
+      "current": 6637
+    }
+  ]
+}

@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import sqlite3
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
-from typing import Any, cast
+from types import MappingProxyType
+from typing import Any, cast, overload
 
 import aiosqlite
 from shared.async_sqlite_base import (
@@ -25,33 +27,68 @@ from shared.async_sqlite_base import (
     apply_wal_pragmas,
     connect_daemon,
 )
+from shared.defects import (
+    DEFECT_TEST_RETIREMENTS_METADATA_KEY,
+    DEFECTS_METADATA_KEY,
+    DeclareEvent,
+    OutcomeEvent,
+)
+from shared.elision import elide_at_word
 from shared.project_id import normalize_project_id
 from shared.project_layout import tasks_db
+from shared.sqlite_column_migration import add_column_if_missing
+from shared.task_created_at import CreatedAtSource
 from shared.task_metadata import (
     _WHOLE_METADATA_FIELD,
     SchemaWarning,
     apply_migrations,
     parse_metadata,
 )
+from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL, TaskStatus
+from shared.task_store_schema import TASK_STORE_DDL
+from shared.task_timestamp import format_task_timestamp
 
+from fused_memory.backends.defect_records import (
+    DEFECT_RECORD_KEYS,
+    DefectRecords,
+    DefectTaskTerminal,
+    require_creation_floor,
+)
+from fused_memory.backends.defect_ref_lookup import require_refs_live
+from fused_memory.backends.metadata_lookup import (
+    DEFAULT_LOOKUP_LIMIT,
+    validate_metadata_lookup,
+)
 from fused_memory.backends.task_backend_errors import (
     AppendUnsupportedFieldError,
+    DefectRecordsWriteAuthorityError,
+    DeferralWriteAuthorityError,
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
+    MetadataNotAnObjectError,
+    MetadataTooDeepError,
+    NoFieldsToUpdateError,
     StatusWriteAuthorityError,
     TaskmasterError,
     TaskNotFoundError,
 )
 from fused_memory.backends.task_backend_types import (
     AddTaskResult,
+    DefectWriteResult,
     DependencyResult,
     GetTasksResult,
+    MetadataLookupResult,
+    MetadataLookupRow,
     RemoveTaskResult,
     SetTaskStatusResult,
     StatusWriteNotPersistedResult,
     UpdateTaskResult,
     ValidateDependenciesResult,
+)
+from fused_memory.backends.task_projection import (
+    SCHEMA_OPTIONAL_ROW_KEYS,
+    parse_task_projection,
 )
 from fused_memory.backends.task_text_markup_gate import refuse_leaked_task_text
 from fused_memory.config.schema import TaskmasterConfig
@@ -83,7 +120,11 @@ logger = logging.getLogger(__name__)
 #       plans/scheduler-dispatch-scoring-and-lock-layer-prd.md §C1). No
 #       column or index change — a pure metadata back-fill. See
 #       ``_migrate_v4_to_v5``.
-_SCHEMA_VERSION = 5
+#   v6: + created_at / created_at_source columns (task 8558, PRD
+#       plans/instruments-honesty-prd.md decision 3); stamped by add_task,
+#       backfilled only by scripts/backfill_task_created_at.py. See
+#       ``_migrate_v5_to_v6``.
+_SCHEMA_VERSION = 6
 
 # Per-process dedup set for the malformed-metadata WARNING below.  `_row_to_task`
 # is invoked once per row on every `get_tasks` / `get_task` call, so a project
@@ -106,44 +147,9 @@ _warned_malformed_task_ids: set[tuple[str, str, int]] = set()
 _warned_machine_authored_task_ids: set[tuple[str, str, int]] = set()
 
 
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS tasks (
-    tag             TEXT NOT NULL DEFAULT 'master',
-    id              INTEGER NOT NULL,
-    title           TEXT NOT NULL,
-    description     TEXT,
-    details         TEXT,
-    test_strategy   TEXT,
-    status          TEXT NOT NULL,
-    priority        TEXT,
-    metadata        TEXT,
-    updated_at      TEXT NOT NULL,
-    claimant_run_id TEXT,
-    heartbeat_at    TEXT,
-    candidate_key   TEXT,
-    PRIMARY KEY (tag, id)
-);
-
-CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks (tag, status);
-
-CREATE TABLE IF NOT EXISTS dependencies (
-    tag        TEXT NOT NULL DEFAULT 'master',
-    task_id    INTEGER NOT NULL,
-    depends_on INTEGER NOT NULL,
-    PRIMARY KEY (tag, task_id, depends_on)
-);
-
--- Monotonic id high-water mark per tag sequence.  ``add_task`` allocates
--- ``max(MAX(tasks.id), max_id) + 1`` so a deleted id is NEVER reissued.
--- Applied idempotently via executescript on every connection open.
-CREATE TABLE IF NOT EXISTS id_counters (
-    tag    TEXT NOT NULL DEFAULT 'master',
-    max_id INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (tag)
-);
-"""
-
 DEFAULT_TAG = 'master'
+
+_PROMPT_TITLE_MAX = 200
 
 # Sentinel distinguishing "leave the claimant column untouched" (default) from
 # "clear it to NULL" (explicit None). Module-level and private — never
@@ -209,20 +215,15 @@ class _StatusWriteNotPersisted(Exception):
 
 
 def task_timestamp_now() -> str:
-    """The current UTC instant in the task store's timestamp format.
+    """The current UTC instant in the task store's timestamp form.
 
-    Exactly ``%Y-%m-%dT%H:%M:%S.mmmZ`` — millisecond precision, literal ``Z``
-    suffix — matching the Taskmaster ``updatedAt`` format, which is the shape
-    every timestamp this store writes must carry: ``updated_at``,
-    ``heartbeat_at``, and ``metadata.pending_since``.
+    The form itself lives in ``shared/src/shared/task_timestamp.py::format_task_timestamp``.
 
-    PUBLIC because that format is a CONTRACT, not an implementation detail.
+    PUBLIC because that form is a CONTRACT, not an implementation detail.
     ``TaskInterceptor``'s CSV ``set_task_status`` branch computes one value
     here and threads it through ``pending_since_now`` so a whole batch lands
     on one instant (task 3816, PRD §C1 rule 5); it must not substitute its own
-    ``datetime.now(UTC).isoformat()`` helper, whose offset-suffixed
-    microsecond shape would give the live-stamped and the back-filled
-    populations two incommensurable string shapes for one column.
+    ``datetime.now(UTC).isoformat()`` helper.
 
     ONE clock reading, deliberately: composing the value from two
     ``datetime.now(UTC)`` calls can straddle a second boundary and emit a
@@ -230,8 +231,7 @@ def task_timestamp_now() -> str:
     milliseconds from the next second), which the anchor's
     monotone-non-decreasing invariant cannot tolerate.
     """
-    reading = datetime.now(UTC)
-    return reading.strftime('%Y-%m-%dT%H:%M:%S.') + f'{reading.microsecond // 1000:03d}Z'
+    return format_task_timestamp(datetime.now(UTC))
 
 
 def _parse_task_id(raw: str | int) -> int:
@@ -350,7 +350,7 @@ async def _migrate(
       ``parent_id`` column: rebuild all three tables without it (straggler
       subtask rows with parent_id != 0 are silently dropped — by soak + DF-B
       there are none). If parent_id is already absent (fresh DB opened with
-      the new ``_SCHEMA_SQL``), this step just stamps version 1 — no rebuild
+      the new ``TASK_STORE_DDL``), this step just stamps version 1 — no rebuild
       needed.
     * v1 → v2: see :func:`_migrate_v1_to_v2` — add ``claimant_run_id`` /
       ``heartbeat_at`` (task 2182, PRD plans/task-status-authority-prd.md).
@@ -362,9 +362,14 @@ async def _migrate(
       ``metadata.pending_since`` back-fill (task 3816). Gated on a RE-READ of
       ``PRAGMA user_version``, not on the local ``version``, because the
       preceding step is self-gating (see the dispatch below).
+    * v5 → v6: see :func:`_migrate_v5_to_v6` — add ``created_at`` /
+      ``created_at_source`` (task 8558). Only a store that reached v5 is
+      stamped 6. A store the self-gating v3 → v4 step held below v4 still
+      gains both columns, unstamped, because ``add_task`` names them on every
+      INSERT; its version catches up through this ladder once the index lands.
 
     Each ALTER step is column-presence-guarded, so a fresh DB whose
-    ``_SCHEMA_SQL`` already created every column runs all steps as no-op
+    ``TASK_STORE_DDL`` already created every column runs all steps as no-op
     ALTERs and only advances the ``user_version`` stamps.
     """
     row = await (await conn.execute('PRAGMA user_version')).fetchone()
@@ -467,30 +472,33 @@ async def _migrate(
 
     if version >= 4 and version < 5:
         await _migrate_v4_to_v5(conn)
+        version = 5
+
+    if version == 5:
+        await _migrate_v5_to_v6(conn)
+    else:
+        await _add_created_at_columns(conn)
+        await conn.commit()
 
 
 async def _migrate_v1_to_v2(conn: aiosqlite.Connection) -> None:
     """v1 -> v2 (task 2182, PRD plans/task-status-authority-prd.md C4/D4):
     add the ``claimant_run_id`` / ``heartbeat_at`` columns.
 
-    Feature-detects each column via ``PRAGMA table_info`` and
-    ``ALTER TABLE ADD COLUMN``s whichever is missing (idempotent -- a fresh DB
-    created by ``_SCHEMA_SQL`` already has both, so neither ALTER fires), then
-    stamps ``user_version = 2``. Reached only after the v0->v1 step, so
-    ``parent_id`` is already gone by the time this runs.
+    Adds whichever column is missing via
+    ``shared/src/shared/sqlite_column_migration.py::add_column_if_missing``
+    (idempotent -- a fresh DB created by ``TASK_STORE_DDL`` already has both, so
+    neither ALTER fires), then stamps ``user_version = 2``. Reached only after
+    the v0->v1 step, so ``parent_id`` is already gone by the time this runs.
 
     IMPORTANT: never short-circuit to "parent_id absent -> just stamp the
-    version". ``_SCHEMA_SQL`` uses ``CREATE TABLE IF NOT EXISTS`` and never
+    version". ``TASK_STORE_DDL`` uses ``CREATE TABLE IF NOT EXISTS`` and never
     adds columns to an existing table, so an already-migrated v1 production DB
     (the common case) would silently keep missing columns forever if this step
     only stamped the version without also running the ALTERs.
     """
-    info_rows = await (await conn.execute('PRAGMA table_info(tasks)')).fetchall()
-    col_names = {r[1] for r in info_rows}
-    if 'claimant_run_id' not in col_names:
-        await conn.execute('ALTER TABLE tasks ADD COLUMN claimant_run_id TEXT')
-    if 'heartbeat_at' not in col_names:
-        await conn.execute('ALTER TABLE tasks ADD COLUMN heartbeat_at TEXT')
+    await add_column_if_missing(conn, 'tasks', 'claimant_run_id', 'TEXT')
+    await add_column_if_missing(conn, 'tasks', 'heartbeat_at', 'TEXT')
     await conn.execute('PRAGMA user_version = 2')
     await conn.commit()
 
@@ -499,7 +507,7 @@ async def _migrate_v2_to_v3(conn: aiosqlite.Connection) -> None:
     """v2 -> v3 (fm-task-dedup W8 task A1): add + backfill ``candidate_key``.
 
     Adds the nullable ``candidate_key`` column when ``tasks`` doesn't already
-    have it (fresh DBs get it straight from ``_SCHEMA_SQL``, so this is a
+    have it (fresh DBs get it straight from ``TASK_STORE_DDL``, so this is a
     no-op there), then backfills it for every NON-cancelled row from that
     row's title + metadata files. Cancelled rows are deliberately left NULL:
     a cancelled task's work may be legitimately re-filed later, so a
@@ -511,10 +519,7 @@ async def _migrate_v2_to_v3(conn: aiosqlite.Connection) -> None:
     creates an index: the UNIQUE index is task A2's job, gated on this audit
     coming back clean.
     """
-    info_rows = await (await conn.execute('PRAGMA table_info(tasks)')).fetchall()
-    col_names = {r[1] for r in info_rows}
-    if 'candidate_key' not in col_names:
-        await conn.execute('ALTER TABLE tasks ADD COLUMN candidate_key TEXT')
+    await add_column_if_missing(conn, 'tasks', 'candidate_key', 'TEXT')
 
     cursor = await conn.execute(
         "SELECT tag, id, title, metadata FROM tasks WHERE status != 'cancelled'",
@@ -671,7 +676,7 @@ async def _migrate_v3_to_v4(
     The failure path additionally rolls the connection back, so a
     partially-applied heal can never survive on the cached connection.
 
-    Deliberately NOT added to ``_SCHEMA_SQL``: a fresh-schema ``executescript``
+    Deliberately NOT added to ``TASK_STORE_DDL``: a fresh-schema ``executescript``
     run at every connection-open would raise ``IntegrityError`` building the
     index against a DB that still holds residual duplicates, defeating the
     self-gating fail-safe. Fresh DBs still get the index via the full
@@ -758,6 +763,8 @@ async def _migrate_v3_to_v4(
                     mode='merge',
                     project_root=project_root, tag=group['tag'], task_id=cancel_id,
                 )
+                # Leaving deferred drops its record (plans/deferral-flip-condition-prd.md decision 4).
+                new_metadata = _metadata_without_keys(new_metadata, _CLEARABLE_AUDIT_KEYS)
                 await conn.execute(
                     "UPDATE tasks SET status = 'cancelled', updated_at = ?, "
                     "metadata = ? WHERE tag = ? AND id = ?",
@@ -863,7 +870,7 @@ async def _migrate_v3_to_v4(
         # `_get_write_access`'s cached WRITE connection, opened via
         # `connect_daemon(str(db_path))` WITHOUT `isolation_level=None` --
         # i.e. Python sqlite3's legacy deferred-transaction mode (see
-        # `_get_read_connection`'s docstring). Without this rollback a raise
+        # `_get_read_access`'s docstring). Without this rollback a raise
         # partway through the heal loop leaves the already-executed
         # `UPDATE ... SET status='cancelled'` statements uncommitted on a
         # connection that `_get_write_access` then caches, and the very next
@@ -1061,6 +1068,31 @@ async def _migrate_v4_to_v5(conn: aiosqlite.Connection) -> None:
     await conn.commit()
 
 
+async def _add_created_at_columns(conn: aiosqlite.Connection) -> None:
+    """Add the nullable ``created_at`` / ``created_at_source`` pair; never commits."""
+    await add_column_if_missing(conn, 'tasks', 'created_at', 'TEXT')
+    await add_column_if_missing(conn, 'tasks', 'created_at_source', 'TEXT')
+
+
+async def _migrate_v5_to_v6(conn: aiosqlite.Connection) -> None:
+    """v5 -> v6 (task 8558, PRD plans/instruments-honesty-prd.md decision 3):
+    add the ``created_at`` / ``created_at_source`` columns.
+
+    Adds whichever column is missing, then stamps ``user_version = 6``. No
+    row gains a value here: a pre-existing row reads NULL until
+    ``scripts/backfill_task_created_at.py`` fills it, because this open-time
+    step is lazy per store and must not reach into another store's runs.db.
+
+    IMPORTANT: never short-circuit to just stamping the version.
+    ``TASK_STORE_DDL`` uses ``CREATE TABLE IF NOT EXISTS`` and never adds
+    columns to an existing table, so a v5 production store would silently
+    keep missing columns forever if this step only stamped the version.
+    """
+    await _add_created_at_columns(conn)
+    await conn.execute('PRAGMA user_version = 6')
+    await conn.commit()
+
+
 def _warn_malformed_metadata_once(
     project_root: str,
     tag: str,
@@ -1233,6 +1265,24 @@ def stamp_pending_since(
 _MACHINE_AUTHORED_METADATA_KEYS = frozenset({'pending_since', 'pending_since_backfilled'})
 
 
+@overload
+def strip_machine_authored_metadata(
+    metadata: dict,
+    *,
+    project_root: str | None = ...,
+    tag: str | None = ...,
+    task_id: int | None = ...,
+    task_ref: str | int | None = ...,
+) -> dict: ...
+@overload
+def strip_machine_authored_metadata(
+    metadata: str | dict | None,
+    *,
+    project_root: str | None = ...,
+    tag: str | None = ...,
+    task_id: int | None = ...,
+    task_ref: str | int | None = ...,
+) -> str | dict | None: ...
 def strip_machine_authored_metadata(
     metadata: str | dict | None,
     *,
@@ -1362,6 +1412,10 @@ def _emit_schema_warning(task_id: int, warning: SchemaWarning) -> None:
     )
 
 
+def _wire_priority(raw: str | None) -> str:
+    return raw or 'medium'
+
+
 def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: str) -> dict[str, Any]:
     """Convert a tasks-table row into the get_tasks/get_task wire dict.
 
@@ -1403,7 +1457,7 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
             metadata = {}
 
     row_keys = row.keys()
-    return {
+    task: dict[str, Any] = {
         'id': str(row['id']),
         'title': row['title'],
         'description': row['description'] or '',
@@ -1411,7 +1465,7 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
         'testStrategy': row['test_strategy'] or '',
         'status': row['status'],
         'dependencies': dependencies,
-        'priority': row['priority'] or 'medium',
+        'priority': _wire_priority(row['priority']),
         'subtasks': [],
         'updatedAt': row['updated_at'],
         'metadata': metadata if metadata is not None else {},
@@ -1422,6 +1476,12 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
         'heartbeat_at': row['heartbeat_at'] if 'heartbeat_at' in row_keys else None,
         'candidate_key': row['candidate_key'] if 'candidate_key' in row_keys else None,
     }
+    # Omitted, not None, on a connection whose v6 ALTER never landed: None is
+    # reserved for a migrated row the backfill has not reached yet.
+    for key in SCHEMA_OPTIONAL_ROW_KEYS:
+        if key in row_keys:
+            task[key] = row[key]
+    return task
 
 
 def _updated_task_response(
@@ -1442,6 +1502,180 @@ def _updated_task_response(
             if refreshed is not None else None
         ),
     }
+
+
+# The quoted JSON path of the looked-up key, built in SQL from the bound
+# ``:key`` so the caller's key never becomes SQL text.
+_METADATA_KEY_PATH = """('$."' || :key || '"')"""
+
+
+def _metadata_lookup_sql(status_count: int | None) -> str:
+    """The one statement behind ``find_tasks_by_metadata``: counts and page, one snapshot.
+
+    ``status_count`` is the number of ``:s0, :s1, ...`` status parameters, or
+    ``None`` for every status. ``doc`` is the metadata only when it is a JSON
+    object, so no JSON function ever reads a malformed row.
+    """
+    status_clause = (
+        '' if status_count is None
+        else 'AND status IN (' + ', '.join(f':s{i}' for i in range(status_count)) + ')'
+    )
+    path = _METADATA_KEY_PATH
+    return f"""
+WITH scoped AS (
+    SELECT id, title, status, priority, updated_at,
+           COALESCE(metadata, '') <> '' AS has_metadata,
+           CASE WHEN json_valid(metadata) THEN
+               CASE WHEN json_type(metadata) = 'object' THEN metadata END
+           END AS doc
+    FROM tasks
+    WHERE tag = :tag {status_clause}
+),
+keyed AS MATERIALIZED (
+    SELECT id, title, status, priority, updated_at,
+           has_metadata AND doc IS NULL AS malformed,
+           json_type(doc, {path}) IS NOT NULL AS has_key,
+           CASE
+               WHEN json_type(doc, {path}) IS NULL THEN 0
+               WHEN :vtype IS NULL THEN 1
+               WHEN json_type(doc, {path}) = :vtype THEN doc ->> {path} = :value
+               WHEN json_type(doc, {path}) = 'array' THEN EXISTS (
+                   SELECT 1 FROM json_each(doc, {path}) WHERE type = :vtype AND value = :value
+               )
+               ELSE 0
+           END AS is_match
+    FROM scoped
+),
+stats AS (
+    SELECT COALESCE(SUM(is_match), 0) AS total,
+           COALESCE(SUM(has_key), 0) AS tasks_with_key,
+           (SELECT json_group_array(id) FROM keyed WHERE malformed) AS malformed_ids
+    FROM keyed
+),
+page AS (
+    SELECT id, title, status, priority, updated_at
+    FROM keyed WHERE is_match ORDER BY id LIMIT :limit OFFSET :offset
+)
+SELECT stats.total, stats.tasks_with_key, stats.malformed_ids,
+       page.id, page.title, page.status, page.priority, page.updated_at,
+       CASE WHEN :include_value THEN t.metadata -> {path} END AS value_json
+FROM stats
+LEFT JOIN page ON 1
+LEFT JOIN tasks AS t ON t.tag = :tag AND t.id = page.id
+ORDER BY page.id
+"""
+
+
+def _json_value_type(value: str | int | None) -> str | None:
+    """The ``json_type`` a stored value must have to equal *value*; ``None`` is presence."""
+    if value is None:
+        return None
+    return 'text' if isinstance(value, str) else 'integer'
+
+
+def _metadata_lookup_row(row: aiosqlite.Row, *, include_value: bool) -> MetadataLookupRow:
+    out: MetadataLookupRow = {
+        'task_id': int(row['id']),
+        'title': row['title'],
+        'status': row['status'],
+        'priority': _wire_priority(row['priority']),
+        'updated_at': row['updated_at'],
+    }
+    if include_value:
+        out['matched_value'] = json.loads(row['value_json'])
+    return out
+
+
+_ReadAll = Callable[[str, Iterable[Any]], Awaitable[Iterable[aiosqlite.Row]]]
+"""Run one SELECT and return every row: ``AtomicConnection.read_all`` or ``execute_fetchall``."""
+
+
+async def _read_status_map(
+    read_all: _ReadAll, tag: str, ids: list[str] | None,
+) -> dict[str, str]:
+    """Run the id/status SELECT through *read_all* and coerce to ``{id_str: status_str}``.
+
+    The one home of the ``ids`` filtering and the ``NULL`` → ``'unknown'``
+    rule for both :meth:`SqliteTaskBackend.get_statuses_raw` (cached read
+    access) and :meth:`SqliteTaskBackend.get_statuses_fresh` (its own
+    short-lived connection).
+
+    Args:
+        read_all: Runs one statement in one hop; rows must support
+            ``row['col']`` (``row_factory`` set to :class:`aiosqlite.Row`).
+        tag: Tag context — callers apply the ``tag or DEFAULT_TAG``
+            default before calling this helper.
+        ids: When given, only return entries for these task ids (as strings;
+             cast to int for the SQL IN clause; non-numeric ids silently
+             omitted).  ``None`` returns all tasks.  ``[]`` returns ``{}``.
+
+    Returns:
+        ``{str(id): status}`` mapping.  Unknown ids are silently omitted.
+        A ``NULL`` status (defensive; unreachable via normal writes) maps to
+        ``'unknown'``.
+    """
+    if ids is not None:
+        if not ids:
+            return {}
+        int_ids: list[int] = []
+        for raw_id in ids:
+            with contextlib.suppress(ValueError, TypeError):
+                int_ids.append(int(raw_id))
+        if not int_ids:
+            return {}
+        placeholders = ','.join('?' * len(int_ids))
+        sql = f'SELECT id, status FROM tasks WHERE tag = ? AND id IN ({placeholders})'
+        params: tuple = (tag, *int_ids)
+    else:
+        sql = 'SELECT id, status FROM tasks WHERE tag = ?'
+        params = (tag,)
+    rows = await read_all(sql, params)
+    return {
+        str(row['id']): (row['status'] if row['status'] is not None else 'unknown')
+        for row in rows
+    }
+
+
+async def _fetch_dependencies(read_all: _ReadAll, tag: str) -> dict[int, list[int]]:
+    """Return ``{task_id: [depends_on, ...]}`` for *tag*, each list ascending.
+
+    Intra-call read skew: callers issue the tasks-row SELECT and this
+    dependencies SELECT as two separate reads on the shared read
+    connection, not one joint snapshot. A write committed between the
+    two can leave a task's ``dependencies`` reflecting a different
+    point in time than its own row within the SAME ``get_task``/
+    ``get_tasks`` call. This is the same kind of ordinary read skew
+    :meth:`SqliteTaskBackend.get_statuses_raw`'s "Snapshot consistency"
+    note already treats as benign for cross-call reads; it self-heals on
+    the next call and no in-tree caller depends on stronger atomicity here.
+    """
+    rows = await read_all(
+        'SELECT task_id, depends_on FROM dependencies WHERE tag = ?',
+        (tag,),
+    )
+    out: dict[int, list[int]] = {}
+    for row in rows:
+        out.setdefault(row['task_id'], []).append(row['depends_on'])
+    for deps in out.values():
+        deps.sort()
+    return out
+
+
+async def _fetch_task_dependencies(read_all: _ReadAll, tag: str, tid: int) -> list[int]:
+    """Return task *tid*'s ``depends_on`` ids, ascending, in one hop.
+
+    The single-task counterpart of :func:`_fetch_dependencies`, for
+    ``get_task`` on the shared read access and for a writer re-reading its
+    own row inside its write unit: scanning the whole tag would hold either
+    for every task's deps. The intra-call read skew note there applies to
+    ``get_task`` here too.
+    """
+    rows = await read_all(
+        'SELECT depends_on FROM dependencies WHERE tag = ? AND task_id = ? '
+        'ORDER BY depends_on',
+        (tag, tid),
+    )
+    return [row['depends_on'] for row in rows]
 
 
 class SqliteTaskBackend:
@@ -1483,28 +1717,15 @@ class SqliteTaskBackend:
         # The per-project WRITE connection, behind the primitive that makes
         # every access on it one atomic unit (task 5562). See _write_unit.
         self._write_accesses: dict[str, AtomicConnection] = {}
-        # Cached per-project AUTOCOMMIT (isolation_level=None) read
-        # connections for the hot get_statuses/get_statuses_raw path (task
-        # 2455). Distinct from self._write_accesses (the write connection,
-        # opened in Python sqlite3's legacy deferred-transaction mode): an
-        # autocommit connection never holds a read transaction open across
-        # statements, so it can never be pinned to a stale WAL snapshot the
-        # way the write connection can be. See _get_read_connection.
-        self._read_connections: dict[str, aiosqlite.Connection] = {}
+        # The cached per-project AUTOCOMMIT read connection, behind the same
+        # primitive as the write side. Every read on it is one execute_fetchall
+        # hop, so it cannot be left holding a snapshot. See _get_read_access.
+        self._read_accesses: dict[str, AtomicConnection] = {}
         # Guards the connection map AND each project's first-access bring-up
         # (schema + WAL pragmas). Held briefly during open; released before
         # any user-visible call runs.
         self._connect_locks: dict[str, asyncio.Lock] = {}
         self._connect_locks_lock = asyncio.Lock()
-        # Per-project serialisation for the cached READ connection (task
-        # 2694). Guards ``_fresh_read_conn``'s
-        # logical read unit (freshness-guard rollback + query + cursor
-        # close) on the SHARED cached read connection — required so one
-        # reader's guard rollback can never run between a concurrent peer
-        # reader's execute and fetch and tear its in-flight cursor. See
-        # ``_fresh_read_conn`` and ``_get_read_connection``'s "Serialization
-        # trade-off" note.
-        self._read_locks: dict[str, asyncio.Lock] = {}
         # Cached result of `_claimant_columns_present` per project_root,
         # populated once in `_get_write_access` right after `_migrate` runs.
         # Column presence is immutable for the life of a connection (the only
@@ -1570,8 +1791,8 @@ class SqliteTaskBackend:
         async with self._connect_locks_lock:
             write_access_items = list(self._write_accesses.items())
             self._write_accesses.clear()
-            read_connection_items = list(self._read_connections.items())
-            self._read_connections.clear()
+            read_access_items = list(self._read_accesses.items())
+            self._read_accesses.clear()
         # AtomicConnection.close() truncates the WAL first, so a clean
         # shutdown leaves the main DB up to date and the next open has nothing
         # to replay. It waits for a unit already in flight to commit.
@@ -1580,11 +1801,12 @@ class SqliteTaskBackend:
             with contextlib.suppress(Exception):
                 await access.close()
             logger.debug('SqliteTaskBackend final-checkpointed and closed %s', root)
-        # Read connections (task 2455) are autocommit and never write, so
-        # there's no WAL checkpoint to run — just close them, best-effort.
-        for root, read_conn in read_connection_items:
+        # Read accesses are autocommit and never write, so they skip
+        # AtomicConnection.close()'s checkpoint: a TRUNCATE there only
+        # busy-waits behind another process's snapshot for nothing.
+        for root, access in read_access_items:
             with contextlib.suppress(Exception):
-                await read_conn.close()
+                await access.connection.close()
             logger.debug('SqliteTaskBackend closed read connection for %s', root)
         logger.info('SqliteTaskBackend closed (%d connection(s))', len(write_access_items))
 
@@ -1657,7 +1879,7 @@ class SqliteTaskBackend:
             conn.row_factory = aiosqlite.Row
             await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
             await conn.execute('PRAGMA foreign_keys=OFF')
-            await conn.executescript(_SCHEMA_SQL)
+            await conn.executescript(TASK_STORE_DDL)
             await conn.commit()
             await _migrate(
                 conn,
@@ -1674,86 +1896,24 @@ class SqliteTaskBackend:
             logger.info('SqliteTaskBackend opened %s', db_path)
             return access
 
-    async def _get_read_connection(self, project_root: str) -> aiosqlite.Connection:
-        """Return a cached per-project AUTOCOMMIT connection for hot status reads.
+    async def _get_read_access(self, project_root: str) -> AtomicConnection:
+        """Return the cached per-project AUTOCOMMIT read connection, opened on first use.
 
-        Used by :meth:`get_statuses_raw` (task 2455) and, as of task 2651,
-        :meth:`get_task` and :meth:`_get_tasks_internal` (backing
-        :meth:`get_tasks`) — plus :meth:`list_tags` (task 2603). Unlike
-        :meth:`_get_write_access`'s cached connection — opened in Python
-        sqlite3's legacy deferred-transaction mode, so a read transaction
-        left open on it pins a stale WAL snapshot (task 2388) — this
-        connection is opened with ``isolation_level=None`` (autocommit), so
-        it never holds a transaction open across statements and can never
-        be pinned. It uses the exact same open recipe as
-        :meth:`get_statuses_fresh` (``connect_daemon(..., isolation_level=
-        None)`` + ``apply_wal_pragmas``), but caches the result per
-        ``project_root`` so repeated hot-path calls don't pay a per-call
-        connection-open cost.
+        It is separate from :meth:`_get_write_access`'s connection because that
+        one runs in Python sqlite3's legacy deferred-transaction mode, so a
+        read transaction left open on it pins a stale WAL snapshot (task 2388).
+        This one is opened with ``isolation_level=None`` and is reachable only
+        through ``AtomicConnection.read_all``/``read_one``: every read is one
+        ``execute_fetchall`` hop on an autocommit connection, so no reader can
+        leave a cursor half-stepped or a transaction open, and none can pin it.
 
-        Guardrail (belt): every current caller — :meth:`_statuses_from_conn`,
-        :meth:`get_task`, :meth:`_get_tasks_internal` (including the
-        :meth:`_fetch_dependencies` call it makes), and :meth:`list_tags` —
-        closes its cursor deterministically via ``async with conn.execute(...)
-        as cursor:``, which closes the cursor even if ``fetchall()``/
-        ``fetchone()`` or a row-coercion step raises — so a normal read
-        never itself leaves an implicit WAL read transaction open on *this*
-        connection.
+        Every cached reader shares it, so tree reads and status reads see one
+        snapshot source. The cost is head-of-line blocking: a large
+        ``get_tasks`` statement delays a concurrent ``get_statuses`` statement.
 
-        Guardrail (suspenders, task 2694): the belt above only stops a
-        normal reader from INTRODUCING a new pin — it does not defend
-        against one already left open by some other path (a leaked /
-        partially-stepped cursor, or an abandoned mid-iteration read). That
-        residual gap is exactly what task 2694 found in production (repro:
-        task 2679): task 2651 rerouted get_task/get_tasks onto this
-        connection but did not harden the connection against being pinned
-        itself, so once pinned, every subsequent read — including
-        get_task — would silently keep serving the stale snapshot
-        indefinitely. :meth:`_fresh_read_conn` closes that gap
-        deterministically: before yielding this connection it rolls back
-        any lingering transaction (``if conn.in_transaction: await
-        conn.rollback()``), so a pin can never survive past the next
-        guarded read, and it serializes access through the per-project
-        :meth:`_read_lock` so that rollback can never tear a concurrent
-        peer reader's in-flight cursor (see :meth:`_read_lock`'s
-        docstring). Every current caller of this method —
-        :meth:`get_task`, :meth:`_get_tasks_internal`,
-        :meth:`get_statuses_raw` (via :meth:`_statuses_from_conn`), and
-        :meth:`list_tags` — now reads exclusively through
-        :meth:`_fresh_read_conn` (task 2694 step-4) rather than calling
-        this method directly, so the "never pinned" invariant is enforced
-        for all of them, not just documented-by-convention. A future
-        caller should do the same rather than call this method directly.
-
-        Serialization trade-off (task 2651, reinforced task 2694): this
-        connection is now shared by both the "hot" status reads
-        (:meth:`get_statuses_raw` via :meth:`_statuses_from_conn`) and the
-        heavier full-tree reads (:meth:`get_task`,
-        :meth:`_get_tasks_internal`/:meth:`get_tasks`). aiosqlite serializes
-        every ``execute``/``fetch`` on a connection through that
-        connection's single background worker thread, so a large
-        ``get_tasks`` scan can head-of-line-block a concurrent
-        ``get_statuses`` hot read that would previously have run on the
-        separate write connection's thread instead. Task 2694's
-        :meth:`_read_lock` makes this explicit at the ``asyncio`` level too
-        — a caller now holds the lock for its entire logical read unit
-        (guard reset through cursor close), not just the underlying
-        statements. That IS a small amount of new blocking versus pre-2694:
-        previously the worker thread only serialized individual statements,
-        so a hot ``get_statuses`` execute could interleave between, e.g.,
-        ``get_task``'s tasks-row SELECT and its :meth:`_fetch_dependencies`
-        call; the lock now holds such an interleaving reader off for the
-        caller's entire read unit instead. The added contention is bounded
-        — row coercion and other post-fetch work run outside the lock — but
-        callers reasoning about hot-path latency should account for
-        whole-unit rather than per-statement serialization; see the
-        :meth:`_fresh_read_conn`/:meth:`_read_lock` docstrings. This is an
-        accepted trade-off, not an oversight: the freshness convergence this
-        connection exists for requires get_task/get_tasks and get_statuses
-        to read the SAME connection, so splitting the tree reads back onto
-        a connection of their own would reopen the two-connections-can-
-        disagree gap task 2651 closes. Revisit if tree-read latency is ever
-        observed to starve the hot status path in practice.
+        ``close()`` drains the map under the global lock only, so bring-up
+        re-checks ``_closed`` both before and after the open, and never caches
+        a connection that a finished ``close()`` can no longer see.
         """
         if self._closed:
             raise RuntimeError('SqliteTaskBackend is closed')
@@ -1763,13 +1923,13 @@ class SqliteTaskBackend:
         # immediately and skip the _get_write_access await + write-connection
         # dict lookup entirely — pure overhead on this hot get_statuses/
         # get_statuses_raw path once a project's connection is warm.
-        if project_root in self._read_connections:
-            return self._read_connections[project_root]
+        if project_root in self._read_accesses:
+            return self._read_accesses[project_root]
         # Ensure the DB file + schema + migrations exist before opening our
         # own connection onto the same file. Only reached on a cache miss.
         await self._get_write_access(project_root)
-        if project_root in self._read_connections:
-            return self._read_connections[project_root]
+        if project_root in self._read_accesses:
+            return self._read_accesses[project_root]
 
         # Mirror _get_write_access's locking (see above): hold the global
         # lock only briefly to fetch/create the per-project lock, then do
@@ -1784,11 +1944,11 @@ class SqliteTaskBackend:
         async with lock:
             # Re-check after acquiring the lock — another caller may have
             # raced us to open this project's read connection.
-            conn = self._read_connections.get(project_root)
-            if conn is not None:
-                return conn
+            access = self._read_accesses.get(project_root)
+            if access is not None:
+                return access
             # Re-check _closed too (not just the map): close() drains
-            # _read_connections under the *global* lock, not this
+            # _read_accesses under the *global* lock, not this
             # per-project one, and sets self._closed before that drain even
             # starts — so a close() that runs (and finishes) anywhere up to
             # this point (e.g. during the `await self._get_write_access(...)`
@@ -1806,7 +1966,7 @@ class SqliteTaskBackend:
             # entirely during the connect_daemon/apply_wal_pragmas awaits
             # above (it doesn't hold this per-project lock, only the global
             # one, and only briefly). If so, it already snapshotted-and-
-            # drained self._read_connections — without this conn, since it
+            # drained self._read_accesses — without this conn, since it
             # wasn't cached yet — and closed everything it saw. Caching it
             # now would strand a live connection past shutdown, so close it
             # ourselves and raise instead.
@@ -1814,19 +1974,10 @@ class SqliteTaskBackend:
                 with contextlib.suppress(Exception):
                     await conn.close()
                 raise RuntimeError('SqliteTaskBackend is closed')
-            self._read_connections[project_root] = conn
+            access = AtomicConnection(conn)
+            self._read_accesses[project_root] = access
             logger.info('SqliteTaskBackend opened read connection for %s', project_root)
-            return conn
-
-    def _read_lock(self, project_root: str) -> asyncio.Lock:
-        """Per-project lock serialising access to the cached READ connection.
-
-        See :meth:`_fresh_read_conn` (task
-        2694) for why the cached read connection's logical read unit must
-        be serialised through this lock rather than left to aiosqlite's
-        single-worker-thread ordering alone.
-        """
-        return self._read_locks.setdefault(project_root, asyncio.Lock())
+            return access
 
     @contextlib.asynccontextmanager
     async def _write_unit(self, project_root: str) -> AsyncIterator[aiosqlite.Connection]:
@@ -1844,123 +1995,25 @@ class SqliteTaskBackend:
 
     # ── Read helpers ───────────────────────────────────────────────────
 
-    @contextlib.asynccontextmanager
-    async def _fresh_read_conn(self, project_root: str):
-        """Yield the cached read connection with any lingering pin cleared.
-
-        The read-path counterpart to :meth:`_write_unit`: acquires the per-project
-        :meth:`_read_lock`, fetches :meth:`_get_read_connection`'s cached
-        AUTOCOMMIT connection, and — if a read transaction was somehow left
-        open on it (a leaked / partially-stepped cursor, or an abandoned
-        mid-iteration read; see :meth:`_get_read_connection`'s Guardrail
-        note) — rolls it back *before* yielding, so no caller can ever be
-        served a stale pinned WAL snapshot (task 2694).
-
-        Every reader that shares the cached read connection
-        (:meth:`get_task`, :meth:`_get_tasks_internal`, :meth:`_statuses_from_conn`
-        via :meth:`get_statuses_raw`, and :meth:`list_tags`) must go through
-        this context manager for its ENTIRE logical read unit — guard reset
-        through cursor close — not just call :meth:`_get_read_connection`
-        directly. Two reasons:
-
-        1. **Enforces the "never pinned" invariant.** Before task 2694 this
-           invariant depended on every reader closing its cursor by
-           convention (documented but not enforced); the guard here makes a
-           leaked pin self-heal on the very next read instead of silently
-           serving stale data indefinitely.
-        2. **Correctness under concurrency.** The cached connection
-           genuinely serves concurrent readers (see
-           :meth:`_get_read_connection`'s "Serialization trade-off" note).
-           Without the read lock, one reader's guard rollback could run
-           between a peer reader's ``execute`` and ``fetch`` — both queued
-           on aiosqlite's single connection worker thread — and tear the
-           peer's in-flight cursor. Holding :meth:`_read_lock` across the
-           whole unit prevents that interleaving. Lock ordering is
-           read-lock-only (never combined with :meth:`_write_unit` or the
-           connect locks in the same call), so this cannot deadlock against
-           the write path.
-        """
-        async with self._read_lock(project_root):
-            conn = await self._get_read_connection(project_root)
-            if conn.in_transaction:
-                await conn.rollback()
-            yield conn
-
-    async def _fetch_dependencies(
-        self, conn: aiosqlite.Connection, tag: str,
-    ) -> dict[int, list[int]]:
-        """Return ``{task_id: [depends_on, ...]}`` for *tag*.
-
-        Closes its cursor deterministically via ``async with conn.execute(
-        ...) as cursor:`` — required when *conn* is the cached AUTOCOMMIT
-        read connection from :meth:`_get_read_connection` (as of task 2651,
-        :meth:`get_task`/:meth:`_get_tasks_internal` call this helper with
-        that connection) so the implicit WAL read transaction this SELECT
-        opens is always released; see that method's docstring's Guardrail
-        note. Safe for the write-connection callers too (``fetchall()``
-        already exhausts the cursor there).
-
-        Intra-call read skew: callers issue the tasks-row SELECT and this
-        dependencies SELECT as two separate statements, each opening and
-        closing its own cursor against the (possibly shared) read
-        connection — not one joint snapshot. A write committed between the
-        two can leave a task's ``dependencies`` reflecting a different
-        point in time than its own row within the SAME ``get_task``/
-        ``get_tasks`` call. This is the same kind of ordinary read skew
-        :meth:`get_statuses_raw`'s "Snapshot consistency" note already
-        treats as benign for cross-call reads, just also possible
-        intra-call now; it self-heals on the next call and no in-tree
-        caller depends on stronger atomicity here.
-        """
-        async with conn.execute(
-            'SELECT task_id, depends_on FROM dependencies WHERE tag = ?',
-            (tag,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-        out: dict[int, list[int]] = {}
-        for row in rows:
-            out.setdefault(row['task_id'], []).append(row['depends_on'])
-        for deps in out.values():
-            deps.sort()
-        return out
-
-    async def _fetch_task_dependencies(
-        self, conn: aiosqlite.Connection, tag: str, tid: int,
-    ) -> list[int]:
-        """Return task *tid*'s ``depends_on`` ids, ascending, in one queued hop.
-
-        The single-task counterpart of :meth:`_fetch_dependencies`, for a
-        writer re-reading its own row inside its write unit: scanning the whole
-        tag there would hold the project's write path for every task's deps.
-        """
-        rows = await conn.execute_fetchall(
-            'SELECT depends_on FROM dependencies WHERE tag = ? AND task_id = ? '
-            'ORDER BY depends_on',
-            (tag, tid),
-        )
-        return [row['depends_on'] for row in rows]
-
     async def _get_tasks_internal(
         self, project_root: str, tag: str,
         statuses: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if statuses is not None and not statuses:
             return []
-        async with self._fresh_read_conn(project_root) as conn:
-            if statuses is None:
-                async with conn.execute(
-                    'SELECT * FROM tasks WHERE tag = ? ORDER BY id',
-                    (tag,),
-                ) as cursor:
-                    rows = await cursor.fetchall()
-            else:
-                placeholders = ','.join('?' * len(statuses))
-                async with conn.execute(
-                    f'SELECT * FROM tasks WHERE tag = ? AND status IN ({placeholders}) ORDER BY id',
-                    (tag, *statuses),
-                ) as cursor:
-                    rows = await cursor.fetchall()
-            deps = await self._fetch_dependencies(conn, tag)
+        access = await self._get_read_access(project_root)
+        if statuses is None:
+            rows = await access.read_all(
+                'SELECT * FROM tasks WHERE tag = ? ORDER BY id',
+                (tag,),
+            )
+        else:
+            placeholders = ','.join('?' * len(statuses))
+            rows = await access.read_all(
+                f'SELECT * FROM tasks WHERE tag = ? AND status IN ({placeholders}) ORDER BY id',
+                (tag, *statuses),
+            )
+        deps = await _fetch_dependencies(access.read_all, tag)
         return [
             _row_to_task(row, deps.get(row['id'], []), project_root=project_root)
             for row in rows
@@ -1971,25 +2024,20 @@ class SqliteTaskBackend:
     async def get_tasks(
         self, project_root: str, tag: str | None = None,
         statuses: list[str] | None = None,
+        fields: Sequence[str] | None = None,
     ) -> GetTasksResult:
+        projection = parse_task_projection(fields)
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tasks = await self._get_tasks_internal(project_root, tag, statuses=statuses)
+        if projection is not None:
+            tasks = [projection.apply(task) for task in tasks]
         return {'tasks': tasks}
 
     async def get_task(
         self, task_id: str, project_root: str, tag: str | None = None,
     ) -> dict:
         """Return a single task's full row (plus its dependency ids).
-
-        Reads through :meth:`_fresh_read_conn` (task 2694): the cached read
-        connection's "never pinned" invariant is enforced for this call —
-        any lingering transaction on the connection is rolled back before
-        the read runs, and the whole read unit (guard reset through cursor
-        close, including the :meth:`_fetch_dependencies` call) is
-        serialized against concurrent cached-read-connection callers via
-        the per-project read lock. See :meth:`_fresh_read_conn` and
-        :meth:`_get_read_connection` for the full rationale.
 
         Raises:
             TaskNotFoundError: No task with ``task_id`` exists in ``tag``.
@@ -1998,28 +2046,74 @@ class SqliteTaskBackend:
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
 
-        async with self._fresh_read_conn(project_root) as conn:
-            async with conn.execute(
-                'SELECT * FROM tasks WHERE tag = ? AND id = ?',
-                (tag, tid),
-            ) as cursor:
-                row = await cursor.fetchone()
-            if row is None:
-                # Definitive zero-row absence: the query executed successfully
-                # and found nothing, under this specific (project, tag) scope —
-                # distinct from a connect/execute outage raised above, before
-                # this point, by ensure_connected()/_get_write_access() (task 2521
-                # RC2). TaskNotFoundError keeps this call's code/message
-                # byte-identical; only its type is more specific.
-                raise TaskNotFoundError(task_id, tag=tag)
-            deps = await self._fetch_dependencies(conn, tag)
+        access = await self._get_read_access(project_root)
+        row = await access.read_one(
+            'SELECT * FROM tasks WHERE tag = ? AND id = ?',
+            (tag, tid),
+        )
+        if row is None:
+            # Definitive zero-row absence: the query executed successfully
+            # and found nothing, under this specific (project, tag) scope —
+            # distinct from a connect/execute outage raised above, before
+            # this point, by ensure_connected()/_get_write_access() (task 2521
+            # RC2). TaskNotFoundError keeps this call's code/message
+            # byte-identical; only its type is more specific.
+            raise TaskNotFoundError(task_id, tag=tag)
+        deps = await _fetch_task_dependencies(access.read_all, tag, tid)
 
-        out = _row_to_task(row, deps.get(row['id'], []), project_root=project_root)
+        out = _row_to_task(row, deps, project_root=project_root)
         # get_task surfaces a single task — Taskmaster returns int id here
         # (asymmetric with get_tasks; mirror that quirk to keep wire-compat).
         with contextlib.suppress(TypeError, ValueError):
             out['id'] = int(out['id'])
         return out
+
+    async def find_tasks_by_metadata(
+        self,
+        project_root: str,
+        key: str,
+        value: str | int | None = None,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = DEFAULT_LOOKUP_LIMIT,
+        offset: int = 0,
+        tag: str | None = None,
+        include_value: bool = False,
+    ) -> MetadataLookupResult:
+        """One page of the tasks whose top-level ``metadata[key]`` matches *value*.
+
+        ``value=None`` matches presence; a str or int matches a scalar by
+        equality or a list by membership. The page and its counts come from
+        one statement on the cached read access, and a store
+        error raises rather than reading as no match. Semantics:
+        ``plans/task-metadata-lookup-prd.md`` decisions 5-7.
+        """
+        validate_metadata_lookup(
+            key=key, value=value, statuses=statuses, include_value=include_value,
+            limit=limit, offset=offset,
+        )
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        if statuses is not None and not statuses:
+            return {'results': [], 'total': 0, 'tasks_with_key': 0, 'malformed_metadata_ids': []}
+        params: dict[str, Any] = {
+            'tag': tag, 'key': key, 'value': value, 'vtype': _json_value_type(value),
+            'limit': limit, 'offset': offset, 'include_value': include_value,
+        }
+        params.update({f's{i}': status for i, status in enumerate(statuses or [])})
+        sql = _metadata_lookup_sql(None if statuses is None else len(statuses))
+        access = await self._get_read_access(project_root)
+        rows = await access.read_all(sql, params)
+        counts = rows[0]
+        return {
+            'results': [
+                _metadata_lookup_row(row, include_value=include_value)
+                for row in rows if row['id'] is not None
+            ],
+            'total': counts['total'],
+            'tasks_with_key': counts['tasks_with_key'],
+            'malformed_metadata_ids': sorted(json.loads(counts['malformed_ids'])),
+        }
 
     async def get_dependency_edges(
         self, project_root: str, tag: str | None = None,
@@ -2027,7 +2121,7 @@ class SqliteTaskBackend:
         """Return ``{task_id: [depends_on, ...]}`` for *tag* — the edge set alone.
 
         The compact counterpart of :meth:`get_tasks`, as :meth:`get_statuses`
-        is, and a thin wrapper over :meth:`_fetch_dependencies`:
+        is, and a thin wrapper over :func:`_fetch_dependencies`:
 
         - each dependency list is SORTED ascending;
         - a task with NO dependencies is **absent** from the map, not present
@@ -2042,74 +2136,8 @@ class SqliteTaskBackend:
         """
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
-        async with self._fresh_read_conn(project_root) as conn:
-            return await self._fetch_dependencies(conn, tag)
-
-    async def _statuses_from_conn(
-        self,
-        conn: aiosqlite.Connection,
-        tag: str,
-        ids: list[str] | None,
-    ) -> dict[str, str]:
-        """Run the id/status SELECT on *conn* and coerce to ``{id_str: status_str}``.
-
-        Shared body for :meth:`get_statuses_raw` (cached per-project
-        connection) and :meth:`get_statuses_fresh` (dedicated short-lived
-        connection) — a single source of truth for the ``ids`` filtering
-        and the ``NULL`` → ``'unknown'`` coercion rule, so both read paths
-        stay identical apart from which connection they run on.
-
-        Deterministically closes its cursor via ``async with conn.execute(
-        ...) as cursor:`` below before returning — required to keep
-        :meth:`_get_read_connection`'s cached AUTOCOMMIT connection
-        unpinnable (see its docstring's Guardrail note). Closing the cursor
-        this way, rather than relying on ``fetchall()`` alone to drain it,
-        guarantees the implicit WAL read transaction ends even if
-        ``fetchall()`` or the row-coercion step below raises, so the
-        invariant holds regardless of what happens after the query
-        executes.
-
-        Args:
-            conn: An open connection with ``row_factory`` already set to
-                :class:`aiosqlite.Row` (callers own connection setup).
-            tag: Tag context — callers apply the ``tag or DEFAULT_TAG``
-                default before calling this helper.
-            ids: When given, only return entries for these task ids (as strings;
-                 cast to int for the SQL IN clause; non-numeric ids silently
-                 omitted).  ``None`` returns all tasks.  ``[]`` returns ``{}``.
-
-        Returns:
-            ``{str(id): status}`` mapping.  Unknown ids are silently omitted.
-            A ``NULL`` status (defensive; unreachable via normal writes) maps to
-            ``'unknown'``.
-        """
-        if ids is not None:
-            if not ids:
-                return {}
-            int_ids: list[int] = []
-            for raw_id in ids:
-                with contextlib.suppress(ValueError, TypeError):
-                    int_ids.append(int(raw_id))
-            if not int_ids:
-                return {}
-            placeholders = ','.join('?' * len(int_ids))
-            sql = f'SELECT id, status FROM tasks WHERE tag = ? AND id IN ({placeholders})'
-            params: tuple = (tag, *int_ids)
-        else:
-            sql = 'SELECT id, status FROM tasks WHERE tag = ?'
-            params = (tag,)
-
-        # `async with ... as cursor:` (rather than a bare `await
-        # conn.execute(...)`) guarantees cursor.close() runs even if
-        # fetchall() or the comprehension below raises, so the implicit
-        # WAL read transaction this SELECT opens is always released — see
-        # the Guardrail note on _get_read_connection's docstring.
-        async with conn.execute(sql, params) as cursor:
-            rows = await cursor.fetchall()
-        return {
-            str(row['id']): (row['status'] if row['status'] is not None else 'unknown')
-            for row in rows
-        }
+        access = await self._get_read_access(project_root)
+        return await _fetch_dependencies(access.read_all, tag)
 
     async def get_statuses_raw(
         self,
@@ -2123,40 +2151,20 @@ class SqliteTaskBackend:
         ``_get_tasks_internal``, ``_row_to_task``, or ``json.loads``,
         so metadata columns are never decoded.
 
-        Reads via the cached per-project AUTOCOMMIT connection returned by
-        :meth:`_get_read_connection` (task 2455), through the
-        :meth:`_fresh_read_conn` guard (task 2694): any lingering
-        transaction is rolled back before the read runs, and the read is
-        serialized against concurrent cached-read-connection callers via
-        the per-project read lock — see :meth:`_fresh_read_conn` for the
-        full rationale. As of task 2651, :meth:`get_task`/:meth:`get_tasks`
-        read via this same cached connection too, rather than the cached
-        WRITE connection (:meth:`_get_write_access`) they used before — see
-        :meth:`_get_read_connection` and :meth:`get_statuses_fresh` for why
-        a pinnable connection could otherwise go stale.
+        Reads the cached read access (:meth:`_get_read_access`), the same
+        connection :meth:`get_task`/:meth:`get_tasks` read, so the two can
+        never disagree because one side sat on a pinned snapshot.
 
-        Snapshot consistency: because :meth:`get_task`/:meth:`get_tasks`
-        now read the SAME cached connection as this method (task 2651), the
-        two can no longer disagree due to one side being pinned to a stale
-        WAL snapshot while the other reads fresh — the specific defect this
-        convergence closes, and (task 2694) neither side can be pinned by a
-        lingering transaction in the first place, since every reader routes
-        through the same :meth:`_fresh_read_conn` guard. They remain
-        independent calls, though (each opens and closes its own cursor
-        against the shared connection, serialized by the read lock but not
-        merged into one snapshot), so a status committed between two
-        separate calls can still show up in one and not the other — the
-        ordinary read-skew any two sequential reads have. No in-tree caller
-        currently depends on stronger-than-that consistency: the one caller
-        that compares a ``get_tasks`` tree against a status census
-        (``cross_verify_task_counts`` in ``reconciliation/task_filter.py``)
-        is fed by :meth:`get_statuses_fresh`, not this method — see
-        ``reconciliation/harness.py``'s ``_fetch_task_count_census`` — and
-        that comparison already treats single-cycle divergence as an
-        advisory read-skew artifact rather than an error. The same kind of
-        skew can also occur WITHIN a single :meth:`get_task`/:meth:`get_tasks`
-        call, between a task's own row and its dependency edges — see
-        :meth:`_fetch_dependencies`'s "Intra-call read skew" note.
+        Snapshot consistency: they remain independent calls, not one
+        snapshot, so a status committed between two separate calls can show
+        up in one and not the other — the ordinary read skew any two
+        sequential reads have. The one caller that compares a ``get_tasks``
+        tree against a status census (``cross_verify_task_counts`` in
+        ``reconciliation/task_filter.py``) is fed by
+        :meth:`get_statuses_fresh`, not this method, and already treats
+        single-cycle divergence as advisory. The same skew can occur WITHIN
+        one :meth:`get_task`/:meth:`get_tasks` call — see
+        :func:`_fetch_dependencies`'s "Intra-call read skew" note.
 
         Args:
             project_root: Absolute path to the project root.
@@ -2174,9 +2182,8 @@ class SqliteTaskBackend:
         # _ensure_taskmaster also calls it) is harmless and keeps the backend
         # safely callable in isolation without relying on the caller to connect first.
         await self.ensure_connected()
-        tag = tag or DEFAULT_TAG
-        async with self._fresh_read_conn(project_root) as conn:
-            return await self._statuses_from_conn(conn, tag, ids)
+        access = await self._get_read_access(project_root)
+        return await _read_status_map(access.read_all, tag or DEFAULT_TAG, ids)
 
     async def get_statuses(
         self,
@@ -2202,41 +2209,23 @@ class SqliteTaskBackend:
     ) -> dict[str, str]:
         """Return a snapshot-fresh ``{id_str: status_str}`` census for *project_root*.
 
-        As of task 2455, :meth:`get_statuses`/:meth:`get_statuses_raw` no
-        longer read via :meth:`_get_write_access`'s cached WRITE connection —
-        they read via :meth:`_get_read_connection`, a dedicated per-project
-        CACHED AUTOCOMMIT connection that can never hold a read transaction
-        open across statements, so it can never be pinned to a stale WAL
-        snapshot either. This method goes one step further: it opens its
-        OWN short-lived autocommit connection for every call — no caching
-        at all — so it never shares a connection with any other reader,
-        including other concurrent callers of this same method. It remains
-        the guaranteed-uncached read the reconciliation harness's
-        authoritative census (``_fetch_task_count_census``) uses for
-        ``cross_verify_task_counts`` (``reconciliation/task_filter.py``);
-        the hot compact-status-map callers should keep using
+        Opens its OWN short-lived autocommit connection for every call, so it
+        never shares a connection with any other reader. It is the
+        guaranteed-uncached read the reconciliation harness's authoritative
+        census (``_fetch_task_count_census``) uses for
+        ``cross_verify_task_counts`` (``reconciliation/task_filter.py``); hot
+        compact-status-map callers should keep using
         ``get_statuses``/``get_statuses_raw``, which are equally unpinnable
-        now but reuse a cached connection instead of paying a per-call
-        connection-open cost.
+        but reuse the cached read access.
 
-        Why "cannot be pinned" matters (task 2388): ``_get_write_access``'s
-        cached WRITE connection is opened via ``connect_daemon(str(db_path))``
-        *without* ``isolation_level=None`` — Python sqlite3's legacy
-        deferred transaction mode. If a read transaction is ever left open
-        on that connection, every subsequent read still issued against it —
-        today, the write-path pre-read/verify reads inside ``_write_unit`` — is
-        pinned to that transaction's WAL snapshot and silently returns
-        stale data, even after other connections/processes have committed
-        newer writes. Before task 2455, ``get_statuses``/``get_statuses_raw``
-        also shared that cached write connection, so a pin made the tree
-        read and the census go stale *together* — they still agreed with
-        each other, so ``cross_verify_task_counts`` reported a false
-        ``consistent: true`` instead of surfacing the drift. As of task
-        2651, ``get_task``/``get_tasks`` no longer share the write
-        connection either — see :meth:`_get_read_connection` — but that
-        history is why this method's never-shared, dedicated connection
-        still exists independently of whichever connection ``get_statuses``
-        happens to use.
+        Why a never-shared connection (task 2388): ``_get_write_access``'s
+        connection runs in Python sqlite3's legacy deferred-transaction mode,
+        so a read transaction left open on it pins a stale WAL snapshot. When
+        the tree read and the census both shared that connection, a pin made
+        them go stale *together*, and ``cross_verify_task_counts`` reported a
+        false ``consistent: true``. A census that never shares a connection
+        with the reads it checks cannot fail that way, whichever connection
+        those reads use.
 
         Fails open to ``{}`` on any error (including a not-yet-created DB
         file) — this is a best-effort freshness upgrade for a cross-check,
@@ -2268,7 +2257,7 @@ class SqliteTaskBackend:
             conn = await connect_daemon(str(db_path), isolation_level=None)
             await apply_wal_pragmas(conn, busy_timeout_ms=5000)
             conn.row_factory = aiosqlite.Row
-            return await self._statuses_from_conn(conn, tag or DEFAULT_TAG, ids)
+            return await _read_status_map(conn.execute_fetchall, tag or DEFAULT_TAG, ids)
         except Exception:
             logger.warning(
                 "get_statuses_fresh: failing open to {} for project_root=%r "
@@ -2292,33 +2281,14 @@ class SqliteTaskBackend:
         caller that needs every tag a project has ever used must enumerate
         them first via this method.
 
-        Reads via the cached per-project AUTOCOMMIT connection returned by
-        :meth:`_get_read_connection` (task 2455) — the same lightweight,
-        connection-unpinning read pattern as :meth:`get_statuses_raw` — via
-        the :meth:`_fresh_read_conn` guard (task 2694), which rolls back
-        any lingering transaction before the read runs and serializes
-        access against concurrent cached-read-connection callers via the
-        per-project read lock. Closes its cursor deterministically via
-        ``async with conn.execute(...) as cursor:`` (mirrors
-        :meth:`_statuses_from_conn`) so the implicit WAL read transaction
-        always releases, keeping the cached read connection unpinnable (see
-        :meth:`_get_read_connection`'s Guardrail note) — belt-and-suspenders
-        alongside the guard.
-
-        Snapshot consistency: as of task 2651, :meth:`get_task`/
-        :meth:`get_tasks` also read via :meth:`_get_read_connection`, so
-        this method and they now share the same cached connection — no
-        cross-connection WAL-snapshot divergence between them, and (task
-        2694) neither can be left pinned by a lingering transaction, since
-        every reader now routes through the same :meth:`_fresh_read_conn`
-        guard. They remain independent calls, though: a caller combining
-        them (e.g.
+        Snapshot consistency: it reads the same cached read access as
+        :meth:`get_tasks`, but they remain independent calls. A caller
+        combining them (e.g.
         :class:`~fused_memory.maintenance.backfill_curator_corpus.BackfillManager`'s
         cross-tag prune sweep, which calls this and then ``get_tasks`` once
-        per tag) should still treat a tag created concurrently with the
-        read as a benign, self-healing miss for that cycle rather than
-        assume the two calls agree to the instant — the ordinary read-skew
-        any two sequential reads have, not a pinned-connection artifact.
+        per tag) should treat a tag created concurrently with the read as a
+        benign, self-healing miss for that cycle — the ordinary read skew
+        any two sequential reads have.
 
         Args:
             project_root: Absolute path to the project root.
@@ -2329,11 +2299,8 @@ class SqliteTaskBackend:
             sort). ``[]`` if the project has no tasks yet.
         """
         await self.ensure_connected()
-        async with (
-            self._fresh_read_conn(project_root) as conn,
-            conn.execute('SELECT DISTINCT tag FROM tasks') as cursor,
-        ):
-            rows = await cursor.fetchall()
+        access = await self._get_read_access(project_root)
+        rows = await access.read_all('SELECT DISTINCT tag FROM tasks')
         return [row['tag'] for row in rows]
 
     async def _apply_status_row_update(
@@ -2596,11 +2563,16 @@ class SqliteTaskBackend:
         tag: str | None = None,
         *,
         audit_fields: dict,
+        clear_keys: frozenset[str] = frozenset(),
         claimant_run_id: str | None = _UNSET,  # type: ignore[assignment]
         heartbeat_at: str | None = _UNSET,  # type: ignore[assignment]
         pending_since_now: str | None = None,
     ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Atomically update ``status`` AND merge ``audit_fields`` into metadata.
+
+        ``clear_keys`` (a subset of ``_CLEARABLE_AUDIT_KEYS``) are removed from
+        the resulting blob in the same transaction: leaving ``deferred`` drops
+        its record.
 
         The sole atomic status+audit writer (task 2649). Calling
         ``stamp_audit_metadata`` followed by ``set_task_status`` — the
@@ -2642,6 +2614,11 @@ class SqliteTaskBackend:
         :meth:`stamp_audit_metadata`, kept off the 12-method contract so
         other callers do not treat it as sanctioned public surface.
         """
+        if unclearable := clear_keys - _CLEARABLE_AUDIT_KEYS:
+            raise ValueError(
+                f'set_status_and_stamp_audit cannot clear {sorted(unclearable)}; '
+                f'clearable keys are {sorted(_CLEARABLE_AUDIT_KEYS)}'
+            )
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
@@ -2700,6 +2677,7 @@ class SqliteTaskBackend:
                 )
                 if stamped is not None:
                     new_metadata = stamped
+                new_metadata = _metadata_without_keys(new_metadata, clear_keys)
 
                 set_columns = ['status = ?', 'metadata = ?', 'updated_at = ?']
                 set_values: list[Any] = [status, new_metadata, task_timestamp_now()]
@@ -2975,6 +2953,9 @@ class SqliteTaskBackend:
             description=description, details=details, dependencies=dependencies,
             priority=priority, metadata=metadata, tag=tag, status=status,
         )
+        # The backstop for creators that bypass TaskInterceptor.submit_task;
+        # an unreadable blob is left to _validate_metadata_on_write.
+        require_creation_floor(coerce_task_metadata(metadata))
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         if status not in _VALID_STATUSES:
@@ -2984,14 +2965,11 @@ class SqliteTaskBackend:
                 f'{sorted(s.value for s in _VALID_STATUSES)}.',
             )
 
-        # SqliteTaskBackend has no LLM — derive title/description from prompt
-        # when the caller only supplied a prompt. The first non-empty line is
-        # the title; the full text is the description.
         if not title and prompt:
             for line in prompt.splitlines():
                 stripped = line.strip()
                 if stripped:
-                    title = stripped[:200]
+                    title = elide_at_word(stripped, _PROMPT_TITLE_MAX)
                     break
             description = description or prompt
         if not title:
@@ -3038,12 +3016,13 @@ class SqliteTaskBackend:
                 # BEFORE _validate_metadata_on_write deliberately: that call
                 # must see the blob that is actually persisted, or enforce-mode
                 # validates a different value than the one on disk. One hoisted
-                # `now` is bound to BOTH the anchor and the INSERT's
-                # updated_at, so a freshly inserted pending row satisfies
-                # `pending_since == updated_at` exactly -- the same identity the
-                # one-shot v4->v5 back-fill establishes for the legacy
-                # population, rather than two `task_timestamp_now()` calls a millisecond
-                # apart. `candidate_key` above stays on the pre-stamp value: it
+                # `now` is bound to the anchor and to the INSERT's updated_at
+                # and created_at, so a freshly inserted pending row satisfies
+                # `pending_since == updated_at == created_at` exactly, rather
+                # than three `task_timestamp_now()` calls a millisecond apart;
+                # the first equality is the identity the one-shot v4->v5
+                # back-fill establishes for the legacy population.
+                # `candidate_key` above stays on the pre-stamp value: it
                 # keys off title + metadata['files'] only — neither stripped
                 # key participates, so the strip below cannot move it.
                 #
@@ -3110,14 +3089,15 @@ class SqliteTaskBackend:
                     """
                         INSERT INTO tasks (tag, id, title, description,
                                            details, test_strategy, status, priority,
-                                           metadata, updated_at, candidate_key)
-                        VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+                                           metadata, updated_at, candidate_key,
+                                           created_at, created_at_source)
+                        VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)
                         """,
                     (
                         tag, next_id, title,
                         description or '', details or '',
                         status, priority or 'medium', metadata, now,
-                        candidate_key,
+                        candidate_key, now, CreatedAtSource.STAMPED.value,
                     ),
                 )
                 if self._after_insert_fault_hook is not None:
@@ -3202,40 +3182,31 @@ class SqliteTaskBackend:
         # sanctioned writer for status AND metadata.done_provenance — it
         # enforces the terminal-exit, phantom-done, and done-provenance
         # gates — so update_task may never ADD, CHANGE or REMOVE
-        # metadata.done_provenance. The status floor, and the done_provenance
-        # floor in every mode except 'replace', reject unconditionally before
-        # ensure_connected() and the task SELECT, so a write-authority
-        # rejection takes precedence over any existence or connection error.
+        # metadata.done_provenance. The status floor, the non-object metadata
+        # floor, and the done_provenance floor in every mode except 'replace',
+        # reject unconditionally before ensure_connected() and the task
+        # SELECT, so a write-authority or shape rejection takes precedence
+        # over any existence or connection error. The non-object floor applies
+        # in EVERY mode, replace included: a payload that is not a JSON object
+        # has no keys to merge, and refusing it needs no stored state
+        # (_metadata_object_or_raise, task 6130).
         # Only metadata_mode='replace' defers: a whole-blob replace must
         # carry the STORED done_provenance through verbatim, which can only
-        # be judged against the row, so _assert_done_provenance_passthrough
-        # checks it inside the transaction below. The gate reads the RAW
+        # be judged against the row, so _assert_passthrough_only_keys
+        # checks it inside the transaction below. The same floor, from the
+        # same table (_PASSTHROUGH_ONLY_METADATA_KEYS), covers the two defect
+        # keys, whose only writers are declare_defect / record_defect_outcome. The gate reads the RAW
         # metadata_mode because _resolve_metadata_mode can itself raise, and
         # resolving first would change which error a bad call surfaces.
+        # metadata.deferral has its own floor, _assert_deferral_unchanged,
+        # judged in-transaction against the stored row in every mode.
         if status is not None:
             raise StatusWriteAuthorityError(task_id, status)
         parsed_metadata: dict | None = None
         if metadata is not None:
-            # Accept an already-parsed dict directly before falling back to
-            # json.loads. A caller that bypasses the documented ``str | None``
-            # signature and passes a dict would otherwise hit
-            # ``json.loads(dict)`` -> TypeError -> parsed_metadata=None,
-            # silently permitting a done_provenance write past this floor.
-            if isinstance(metadata, dict):
-                parsed_metadata = metadata
-            else:
-                try:
-                    loaded_metadata = json.loads(metadata)
-                except (ValueError, TypeError):
-                    loaded_metadata = None
-                if isinstance(loaded_metadata, dict):
-                    parsed_metadata = loaded_metadata
-            if (
-                parsed_metadata is not None
-                and 'done_provenance' in parsed_metadata
-                and metadata_mode != 'replace'
-            ):
-                raise DoneProvenanceWriteAuthorityError(task_id)
+            parsed_metadata = _metadata_object_or_raise(metadata, task_id)
+            if metadata_mode != 'replace':
+                _refuse_passthrough_only_keys(parsed_metadata, task_id)
             # Same floor family, different remedy (task 3816 review
             # remediation): the wait-anchor keys are MACHINE-authored, so a
             # caller-supplied value is STRIPPED rather than rejected — see
@@ -3257,10 +3228,13 @@ class SqliteTaskBackend:
             # separate identity axis, so declining the dedup does not also
             # cost the message the task it names: only the PARSED int needs
             # _parse_task_id, and the raw id is in hand right here.
-            metadata = strip_machine_authored_metadata(  # type: ignore[assignment]
-                metadata, project_root=project_root, task_ref=task_id,
+            #
+            # From here on the parsed dict IS the payload: below, the raw
+            # ``metadata`` text is consulted only for whether it was supplied.
+            parsed_metadata = strip_machine_authored_metadata(
+                parsed_metadata, project_root=project_root, task_ref=task_id,
             )
-        # Third pre-connection floor, and the last one: reject an append=True
+        # Third pre-connection floor: reject an append=True
         # write aimed at a REPLACE-ONLY column. Placed here deliberately —
         # after the two write-authority floors and BEFORE _resolve_metadata_mode
         # and ensure_connected() — so the rejection precedes existence and
@@ -3308,6 +3282,13 @@ class SqliteTaskBackend:
             metadata_mode, append, metadata_present=metadata is not None,
         )
 
+        # Last pre-connection floor (task 4867), after every refusal of a
+        # supplied-but-wrong argument: with no mutating argument there is
+        # nothing to be wrong, and a bad ``status`` or ``metadata_mode`` is
+        # the more specific mistake to report. Before ensure_connected() so a
+        # fieldless call never reaches the row, never bumps ``updated_at``.
+        _refuse_update_with_no_mutating_field(task_id, arguments_as_received)
+
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
@@ -3323,9 +3304,9 @@ class SqliteTaskBackend:
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
                 )
-            done_provenance_passed_through = False
-            if metadata_mode == 'replace':
-                done_provenance_passed_through = _assert_done_provenance_passthrough(
+            passed_through: frozenset[str] = frozenset()
+            if metadata_mode == 'replace' and parsed_metadata is not None:
+                passed_through = _assert_passthrough_only_keys(
                     row['metadata'], parsed_metadata, task_id,
                 )
 
@@ -3395,15 +3376,13 @@ class SqliteTaskBackend:
             )
 
             new_metadata: str | None = None
-            if metadata is not None:
+            if parsed_metadata is not None:
                 # Strip reserved update_task call-flag key names (append,
                 # metadata_mode) from the INCOMING payload before merging —
                 # a caller that conflates the call-flag with a metadata field
                 # (task 2682) must not have the literal key persisted.
-                # Fail-safe passthrough for corrupt/non-dict payloads leaves
-                # _merge_metadata's own guards below as the source of truth.
-                metadata = _strip_reserved_control_keys(
-                    metadata, project_root=project_root, tag=tag, task_id=tid,
+                incoming_metadata = _strip_reserved_control_keys(
+                    parsed_metadata, project_root=project_root, tag=tag, task_id=tid,
                 )
                 # Behavior note: on merge/additive, _merge_metadata RAISES
                 # TaskmasterError if the stored blob is corrupt — preventing a
@@ -3412,9 +3391,9 @@ class SqliteTaskBackend:
                 # metadata_mode='replace' (bypasses the guard intentionally);
                 # the repair payload may not carry a done_provenance, since
                 # passthrough identity cannot be established against a blob
-                # that does not parse (_assert_done_provenance_passthrough).
+                # that does not parse (_assert_passthrough_only_keys).
                 new_metadata = _merge_metadata(
-                    row['metadata'], metadata,
+                    row['metadata'], json.dumps(incoming_metadata),
                     mode=resolved_mode,
                     project_root=project_root, tag=tag, task_id=tid,
                 )
@@ -3430,23 +3409,19 @@ class SqliteTaskBackend:
                 # An untouched legacy field (e.g. a pre-existing
                 # done_provenance missing the now-required kind) is tolerated
                 # rather than permanently blocking every future patch to the
-                # row. Falls back to None (enforce-all) when the payload
-                # isn't a JSON object — _merge_metadata already treats a
-                # non-dict incoming blob as last-write-wins, so there is no
-                # narrower "responsibility" to scope to here. Under replace, a
-                # done_provenance the passthrough check admitted is not this
-                # write's responsibility either: the caller had to send it
-                # back unchanged.
-                incoming_keys: set[str] | None = None
-                try:
-                    _loaded_incoming = json.loads(metadata)
-                except (TypeError, ValueError):
-                    pass
-                else:
-                    if isinstance(_loaded_incoming, dict):
-                        incoming_keys = set(_loaded_incoming.keys())
-                if done_provenance_passed_through and incoming_keys is not None:
-                    incoming_keys.discard('done_provenance')
+                # row. Under replace, a done_provenance or defect key the
+                # passthrough check admitted is not this write's responsibility
+                # either: the caller had to send it back unchanged. The same holds for an
+                # admitted echo of metadata.deferral, which
+                # _assert_deferral_unchanged checks against the stored row in
+                # every mode.
+                deferral_echoed = _assert_deferral_unchanged(
+                    row['metadata'], parsed_metadata, new_metadata, task_id,
+                )
+                incoming_keys = set(incoming_metadata)
+                incoming_keys.difference_update(passed_through)
+                if deferral_echoed:
+                    incoming_keys.discard('deferral')
                 await self._validate_metadata_on_write(
                     new_metadata, project_root=project_root, tag=tag, task_id=tid,
                     incoming_keys=incoming_keys,
@@ -3502,8 +3477,9 @@ class SqliteTaskBackend:
                             candidate_key=new_candidate_key,
                         )
 
-            # updated_at always advances, even on a no-op write — matches
-            # the original behaviour and avoids surprising "stale" reads.
+            # updated_at always advances on a write that supplies a mutating
+            # field, even one whose values equal the stored ones; a call that
+            # supplies none never gets here (_refuse_update_with_no_mutating_field).
             set_columns.append('updated_at = ?')
             set_values.append(task_timestamp_now())
 
@@ -3560,11 +3536,64 @@ class SqliteTaskBackend:
                 (tag, tid),
             )
             refreshed = await refreshed_cursor.fetchone()
-            deps = await self._fetch_task_dependencies(conn, tag, tid)
+            deps = await _fetch_task_dependencies(conn.execute_fetchall, tag, tid)
         return _updated_task_response(
             refreshed, deps, task_id=task_id, project_root=project_root,
             message=f'Task {task_id} updated',
         )
+
+    async def apply_defect_events(
+        self,
+        task_id: str,
+        project_root: str,
+        events: Sequence[DeclareEvent | OutcomeEvent],
+        *,
+        tag: str | None = None,
+    ) -> DefectWriteResult:
+        """See :meth:`TaskBackendProtocol.apply_defect_events`; the rules live in defect_records.py.
+
+        The liveness lookup reads committed state on the read access
+        (:meth:`_get_read_access`), a different connection from the write
+        unit's, so it runs before the unit opens instead of holding the write
+        path, and the two are not atomic. That is sound: only removing a ref's last
+        carrier un-lives it, and a removal landing between the read and the
+        write leaves the state a removal just after the write leaves, which
+        ``remove_task`` permits since it checks no referrer.
+        """
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        tid = _parse_task_id(task_id)
+        await require_refs_live(self, project_root, events, tag=tag)
+        async with self._write_unit(project_root) as conn:
+            cursor = await conn.execute(
+                'SELECT status, metadata FROM tasks WHERE tag = ? AND id = ?', (tag, tid),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                raise TaskNotFoundError(task_id, tag=tag)
+            if row['status'] in TERMINAL:
+                raise DefectTaskTerminal(task_id, row['status'])
+            change = DefectRecords.from_stored_blob(row['metadata']).apply(events)
+            changed = change.changed_metadata()
+            new_metadata = _merge_metadata(
+                row['metadata'], json.dumps(changed), mode='merge',
+                project_root=project_root, tag=tag, task_id=tid,
+            )
+            await self._validate_metadata_on_write(
+                new_metadata, project_root=project_root, tag=tag, task_id=tid,
+                incoming_keys=set(changed),
+            )
+            await conn.execute(
+                'UPDATE tasks SET metadata = ?, updated_at = ? WHERE tag = ? AND id = ?',
+                (new_metadata, task_timestamp_now(), tag, tid),
+            )
+        records = change.records.as_metadata()
+        return {
+            'id': task_id,
+            'message': f'Applied {len(events)} defect event(s) to task {task_id}',
+            'defects': records[DEFECTS_METADATA_KEY],
+            'defect_test_retirements': records[DEFECT_TEST_RETIREMENTS_METADATA_KEY],
+        }
 
     async def stamp_audit_metadata(
         self,
@@ -3590,9 +3619,22 @@ class SqliteTaskBackend:
         off the 12-method contract prevents other callers from treating it as
         sanctioned public surface.
         """
-        await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
+        # Same caller -> store metadata boundary as the three above, so the
+        # same sanitizer (task 3816 review remediation). Privileged and
+        # interceptor-only, so the stakes are lower than the public
+        # writers — applied anyway so the authority rule is UNIFORMLY
+        # enforced from one implementation rather than being a per-site
+        # judgement call. Emptiness is judged on the SANITISED dict (task
+        # 4867): fields that are all stripped write nothing, so refuse before
+        # the connection and the row, as update_task does.
+        sanitized_fields = strip_machine_authored_metadata(
+            fields, project_root=project_root, tag=tag, task_id=tid,
+        )
+        if not sanitized_fields:
+            raise NoFieldsToUpdateError('stamp_audit_metadata', task_id)
+        await self.ensure_connected()
         async with self._write_unit(project_root) as conn:
             cursor = await conn.execute(
                 'SELECT metadata FROM tasks WHERE tag = ? AND id = ?',
@@ -3604,15 +3646,6 @@ class SqliteTaskBackend:
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
                 )
-            # Same caller -> store metadata boundary as the three above, so the
-            # same sanitizer (task 3816 review remediation). Privileged and
-            # interceptor-only, so the stakes are lower than the public
-            # writers — applied anyway so the authority rule is UNIFORMLY
-            # enforced from one implementation rather than being a per-site
-            # judgement call.
-            sanitized_fields = strip_machine_authored_metadata(
-                fields, project_root=project_root, tag=tag, task_id=tid,
-            )
             new_metadata = _merge_metadata(
                 row['metadata'], json.dumps(sanitized_fields),
                 mode='merge',
@@ -3643,8 +3676,10 @@ class SqliteTaskBackend:
         replace, and a public ``update_task`` replace drops the machine-authored
         wait anchor; this writer carries the stored anchor across instead.  It
         admits ``done_provenance`` only as a verbatim passthrough (the same
-        :func:`_assert_done_provenance_passthrough` rule update_task applies),
+        :func:`_assert_passthrough_only_keys` rule update_task applies, which
+        carries the defect keys the same way),
         refuses any change to ``files`` (``candidate_key`` derives from them),
+        carries ``deferral`` through unchanged (:func:`_assert_deferral_unchanged`),
         and refuses a corrupt stored blob rather than repairing it.
 
         Deliberately NOT declared on :class:`TaskBackendProtocol`, like
@@ -3688,12 +3723,13 @@ class SqliteTaskBackend:
                 },
                 project_root=project_root, tag=tag, task_id=tid,
             ))
-            _assert_done_provenance_passthrough(row['metadata'], incoming, task_id)
+            _assert_passthrough_only_keys(row['metadata'], incoming, task_id)
             new_blob = {
                 **incoming,
                 **{key: stored[key] for key in _MACHINE_AUTHORED_METADATA_KEYS if key in stored},
             }
             new_metadata = json.dumps(new_blob)
+            _assert_deferral_unchanged(row['metadata'], incoming, new_metadata, task_id)
             stored_files, new_files = _files_for_key(row['metadata']), _files_for_key(new_metadata)
             if stored_files != new_files:
                 raise ValueError(
@@ -3724,7 +3760,7 @@ class SqliteTaskBackend:
                 (tag, tid),
             )
             refreshed = await refreshed_cursor.fetchone()
-            deps = await self._fetch_task_dependencies(conn, tag, tid)
+            deps = await _fetch_task_dependencies(conn.execute_fetchall, tag, tid)
         return _updated_task_response(
             refreshed, deps, task_id=task_id, project_root=project_root,
             message=f'Rotated audit trail of task {task_id}',
@@ -4154,6 +4190,29 @@ def _resolve_metadata_mode(
 
 _REPLACE_ONLY_FIELDS: tuple[str, ...] = ('title', 'description', 'priority')
 
+# The update_task parameters that make a call a write. ``status`` is absent
+# because it is refused unconditionally; ``task_id``, ``project_root``,
+# ``tag``, ``append`` and ``metadata_mode`` only steer how a write is applied.
+_MUTATING_UPDATE_FIELDS: tuple[str, ...] = (
+    'prompt', 'metadata', 'title', 'description', 'details', 'priority',
+    'dependencies',
+)
+
+
+def _refuse_update_with_no_mutating_field(
+    task_id: str, arguments: Mapping[str, object],
+) -> None:
+    """Raise :class:`NoFieldsToUpdateError` when every mutating argument is ``None``.
+
+    Keyed on the supplied arguments, never on which columns the write would
+    set: ``dependencies=[]`` writes outside the column list and
+    ``metadata='{}'`` is a real write, and both are not ``None``. A name in
+    ``_MUTATING_UPDATE_FIELDS`` missing from *arguments* raises ``KeyError``,
+    so the constant and the update_task signature cannot drift apart silently.
+    """
+    if all(arguments[name] is None for name in _MUTATING_UPDATE_FIELDS):
+        raise NoFieldsToUpdateError('update_task', task_id, _MUTATING_UPDATE_FIELDS)
+
 
 def _reject_append_on_replace_only_fields(
     append: bool | None,
@@ -4278,16 +4337,72 @@ def _merge_values(old: object, new: object) -> object:
     return old
 
 
-def _assert_done_provenance_passthrough(
-    stored_raw: str | None, incoming: dict | None, task_id: str,
-) -> bool:
-    """Refuse a whole-blob replace that would move ``metadata.done_provenance``.
+_JSON_TYPE_NAMES: dict[type, str] = {
+    list: 'array',
+    str: 'string',
+    bool: 'boolean',
+    int: 'number',
+    float: 'number',
+    type(None): 'null',
+}
 
-    The contract: update_task may never ADD, CHANGE or REMOVE
-    metadata.done_provenance. Under metadata_mode='replace' the payload must
-    carry the stored value verbatim; under every other mode the key must be
-    absent (update_task's pre-connect floor). set_task_status and the
-    privileged stamp_audit_metadata seam remain the only writers of the key.
+
+def _metadata_object_or_raise(metadata: str | dict, task_id: str | None) -> dict:
+    """Parse an update_task metadata payload, refusing anything but a JSON object.
+
+    A dict is returned as-is, so a caller bypassing the documented ``str``
+    signature cannot slip a payload past the floors that read the result.
+    Anything else is ``json.loads``-ed; text that does not parse, or JSON
+    that decodes to a non-object, raises :class:`MetadataNotAnObjectError`.
+    Such a payload has no keys to merge, and treating it as last-write-wins
+    wiped the whole stored blob, done_provenance included (task 6130).
+    """
+    if isinstance(metadata, dict):
+        return metadata
+    try:
+        loaded = json.loads(metadata)
+    except (ValueError, TypeError):
+        raise MetadataNotAnObjectError(task_id, 'invalid_json') from None
+    if not isinstance(loaded, dict):
+        raise MetadataNotAnObjectError(task_id, _JSON_TYPE_NAMES[type(loaded)])
+    return loaded
+
+
+_PASSTHROUGH_ONLY_METADATA_KEYS: Mapping[str, Callable[[str], TaskmasterError]] = (
+    MappingProxyType(
+        {
+            'done_provenance': DoneProvenanceWriteAuthorityError,
+            **{
+                key: functools.partial(DefectRecordsWriteAuthorityError, key=key)
+                for key in DEFECT_RECORD_KEYS
+            },
+        }
+    )
+)
+"""Metadata keys update_task may only carry verbatim, each with its refusal, in precedence order.
+
+set_task_status (and the privileged stamp_audit_metadata seam) writes
+``done_provenance``; declare_defect / record_defect_outcome write the two
+defect keys (``fused_memory/backends/defect_records.py``).
+"""
+
+
+def _refuse_passthrough_only_keys(incoming: dict, task_id: str) -> None:
+    """update_task's pre-connect floor outside replace: any carried key is refused, echo included."""
+    for key, refusal in _PASSTHROUGH_ONLY_METADATA_KEYS.items():
+        if key in incoming:
+            raise refusal(task_id)
+
+
+def _assert_passthrough_only_keys(
+    stored_raw: str | None, incoming: dict, task_id: str,
+) -> frozenset[str]:
+    """Refuse a whole-blob replace that would move any :data:`_PASSTHROUGH_ONLY_METADATA_KEYS` key.
+
+    The contract: update_task may never ADD, CHANGE or REMOVE one of those
+    keys. Under metadata_mode='replace' the payload must carry the stored
+    value verbatim; under every other mode the key must be absent
+    (update_task's pre-connect floor, :func:`_refuse_passthrough_only_keys`).
     Carrying the whole blob through is the shape the orchestrator's
     read-modify-write callers already use:
     orchestrator/src/orchestrator/workflow.py::_clear_merge_retry_pending,
@@ -4304,33 +4419,83 @@ def _assert_done_provenance_passthrough(
     get_task -> json.dumps round trip, which is exactly how a
     read-modify-write caller builds its payload.
 
-    * ``incoming`` is None (unparseable or non-dict payload): no check, the
-      same fail-open the pre-connect floor applies. Known residual: such a
-      payload still replaces the blob and can destroy done_provenance.
+    ``incoming`` is always a JSON object: update_task's non-object floor
+    (:func:`_metadata_object_or_raise`) guarantees it, and rewrite_audit_trail
+    takes a dict.
+
     * The stored blob is absent or not a JSON object: identity cannot be
-      established, so a payload carrying done_provenance is refused, while
-      one omitting it is the corrupt-row repair replace mode exists for.
-    * Otherwise the key's presence and value must match the stored row
+      established, so a payload carrying any of the keys is refused, while
+      one omitting them is the corrupt-row repair replace mode exists for.
+    * Otherwise each key's presence and value must match the stored row
       exactly: an ADD, a CHANGE and a drop-by-omission are all refused.
 
-    Returns True exactly when the payload carried a done_provenance and it
-    was admitted as a passthrough — the licence update_task needs to exclude
-    that key from enforce-mode responsibility.
+    Returns the keys the payload carried and that were admitted as a
+    passthrough — the licence update_task needs to exclude them from
+    enforce-mode responsibility.
     """
-    if incoming is None:
-        return False
     try:
         stored = json.loads(stored_raw) if stored_raw is not None else None
     except (TypeError, ValueError):
         stored = None
     if not isinstance(stored, dict):
-        if 'done_provenance' in incoming:
-            raise DoneProvenanceWriteAuthorityError(task_id)
-        return False
+        _refuse_passthrough_only_keys(incoming, task_id)
+        return frozenset()
     absent = object()
-    if stored.get('done_provenance', absent) != incoming.get('done_provenance', absent):
-        raise DoneProvenanceWriteAuthorityError(task_id)
-    return 'done_provenance' in incoming
+    for key, refusal in _PASSTHROUGH_ONLY_METADATA_KEYS.items():
+        if stored.get(key, absent) != incoming.get(key, absent):
+            raise refusal(task_id)
+    return frozenset(key for key in _PASSTHROUGH_ONLY_METADATA_KEYS if key in incoming)
+
+
+_CLEARABLE_AUDIT_KEYS: frozenset[str] = frozenset({'deferral'})
+
+
+def _metadata_without_keys(blob_json: str, keys: frozenset[str]) -> str:
+    """*blob_json* with *keys* removed; returned unchanged when it is not a JSON object."""
+    if not keys:
+        return blob_json
+    try:
+        blob = json.loads(blob_json)
+    except (TypeError, ValueError):
+        return blob_json
+    if not isinstance(blob, dict) or not keys & blob.keys():
+        return blob_json
+    return json.dumps({k: v for k, v in blob.items() if k not in keys})
+
+
+def _deferral_slice(blob_json: str | None, absent: object) -> object:
+    try:
+        blob = json.loads(blob_json) if blob_json is not None else None
+    except (TypeError, ValueError):
+        blob = None
+    return blob.get('deferral', absent) if isinstance(blob, dict) else absent
+
+
+def _assert_deferral_unchanged(
+    stored_raw: str | None, incoming: dict | None, new_blob_json: str, task_id: str,
+) -> bool:
+    """Refuse a metadata write that would add, alter or remove ``metadata.deferral``.
+
+    The status choke point is the record's only writer
+    (plans/deferral-flip-condition-prd.md decision 3). Judged inside the
+    caller's transaction against the STORED row, in every metadata mode:
+    a ``deferral`` the payload carries must equal the stored value (additive's
+    OLD-wins merge would otherwise drop an alteration silently), and the blob
+    about to be written must carry exactly the stored record (a replace that
+    omits it would otherwise remove it). Identity is JSON value equality, as in
+    :func:`_assert_passthrough_only_keys`; a corrupt or absent stored
+    blob holds no record.
+
+    Returns True when the payload carried the key as an admitted echo.
+    """
+    absent = object()
+    stored = _deferral_slice(stored_raw, absent)
+    carried = incoming.get('deferral', absent) if incoming is not None else absent
+    if carried is not absent and carried != stored:
+        raise DeferralWriteAuthorityError(task_id)
+    if _deferral_slice(new_blob_json, absent) != stored:
+        raise DeferralWriteAuthorityError(task_id)
+    return carried is not absent
 
 
 def _merge_metadata(
@@ -4352,14 +4517,17 @@ def _merge_metadata(
       applies upstream, in update_task: on a row whose stored blob does not
       parse, the repair payload may not carry a done_provenance, because
       passthrough identity cannot be established. The authority is
-      :func:`_assert_done_provenance_passthrough`.
+      :func:`_assert_passthrough_only_keys`.
     * ``'merge'`` — shallow last-write-wins: ``{**existing, **incoming}``.
       Omitted keys are preserved; every supplied key (scalar **or** list)
-      overwrites wholesale.  Falls back to ``incoming`` when either side is
-      valid JSON but not a dict.
+      overwrites wholesale.  Falls back to ``incoming`` when the existing
+      blob is valid JSON but not a dict.
     * ``'additive'`` — existing recursive ``_merge_values`` semantics: list
       union+dedup, dict-recursive, scalar/type-collision OLD-wins.  Keeps the
       legacy ``memory_hints`` list-shape normalisation before the dict union.
+      A collision nested too deeply for the recursive merge raises
+      :class:`MetadataTooDeepError` (nothing written) rather than falling
+      back to last-write-wins.
 
     For ``'merge'`` and ``'additive'``, a corrupt *existing* blob raises
     :class:`TaskmasterError` (``TASKMASTER_TOOL_ERROR``) — refusing to clobber
@@ -4368,12 +4536,17 @@ def _merge_metadata(
 
     A ``None`` ``existing_raw`` is treated as empty: ``incoming`` is returned
     for all three modes (nothing to preserve or merge into).
+
+    ``incoming`` must be a JSON object in every mode, otherwise
+    :class:`MetadataNotAnObjectError` — the same rule, through the same
+    helper (:func:`_metadata_object_or_raise`), as update_task's floor.
     """
+    task_ref = None if task_id is None else str(task_id)
+    new = _metadata_object_or_raise(incoming, task_ref)
     # replace (or no existing data): return incoming verbatim, no guard.
     if existing_raw is None or mode == 'replace':
         return incoming
-    # merge and additive: parse the existing blob first so a corrupt EXISTING
-    # blob is distinguishable from a corrupt incoming blob.
+    # merge and additive: a corrupt EXISTING blob is refused, not clobbered.
     try:
         old = json.loads(existing_raw)
     except (TypeError, ValueError) as err:
@@ -4390,13 +4563,7 @@ def _merge_metadata(
             f'(original bytes preserved).',
             raw=existing_raw,
         ) from err
-    # Corrupt INCOMING blob: intentionally last-write-wins (pre-existing
-    # Taskmaster fallback behaviour).
-    try:
-        new = json.loads(incoming)
-    except (TypeError, ValueError):
-        return incoming
-    if not isinstance(old, dict) or not isinstance(new, dict):
+    if not isinstance(old, dict):
         return incoming
     if mode == 'merge':
         # Shallow last-write-wins: every supplied key overwrites wholesale.
@@ -4412,8 +4579,7 @@ def _merge_metadata(
     try:
         merged = _merge_values(old, new)
     except RecursionError:
-        # Pathologically deep metadata; fall back to last-write-wins.
-        return incoming
+        raise MetadataTooDeepError(task_ref) from None
     return json.dumps(merged)
 
 
@@ -4445,32 +4611,22 @@ def _drop_reserved_control_keys(meta: dict) -> tuple[dict, set[str]]:
 
 
 def _strip_reserved_control_keys(
-    incoming: str,
+    incoming: dict,
     *,
     project_root: str | None = None,
     tag: str | None = None,
     task_id: int | None = None,
-) -> str:
-    """String wrapper around :func:`_drop_reserved_control_keys`.
+) -> dict:
+    """:func:`_drop_reserved_control_keys`, logging a WARNING naming any key dropped.
 
-    Fail-safe passthrough: a corrupt/non-JSON ``incoming`` string, or valid
-    JSON that is not an object, is returned UNCHANGED — preserving
-    :func:`_merge_metadata`'s own corrupt-incoming last-write-wins and
-    non-dict-incoming fallback behavior. This wrapper never raises.
+    Returns ``incoming`` itself when it carries no reserved key.
     """
-    try:
-        parsed = json.loads(incoming)
-    except (TypeError, ValueError):
-        return incoming
-    if not isinstance(parsed, dict):
-        return incoming
-    cleaned, dropped = _drop_reserved_control_keys(parsed)
-    if not dropped:
-        return incoming
-    logger.warning(
-        'update_task: stripped reserved control-flag key(s) %s from metadata '
-        'payload for task %s (tag=%s project_root=%s) — call-flags are not '
-        'metadata keys',
-        sorted(dropped), task_id, tag, project_root,
-    )
-    return json.dumps(cleaned)
+    cleaned, dropped = _drop_reserved_control_keys(incoming)
+    if dropped:
+        logger.warning(
+            'update_task: stripped reserved control-flag key(s) %s from metadata '
+            'payload for task %s (tag=%s project_root=%s) — call-flags are not '
+            'metadata keys',
+            sorted(dropped), task_id, tag, project_root,
+        )
+    return cleaned

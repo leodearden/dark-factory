@@ -551,11 +551,11 @@ class TestRequeueReuseSitesRouteThroughGuard:
         assert isinstance(info, WorktreeInfo), f'Acquire failed: {info!r}'
         lane = info.path
 
-        # Write .task/plan.json with task_id='WLW' — forces the disk-backstop
-        # route on re-acquire below.
-        task_dir = lane / '.task'
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text(_json.dumps({'task_id': 'WLW'}))
+        # Seed the lane's meta root with task_id='WLW' — forces the
+        # disk-backstop route on re-acquire below.
+        meta_root = TaskArtifacts.meta_root_for(warm_git_ops.worktree_base, lane.name)
+        meta_root.mkdir(parents=True, exist_ok=True)
+        (meta_root / 'metadata.json').write_text(_json.dumps({'task_id': 'WLW'}))
 
         await _commit_unique_work(lane, filename='wlw_feature.txt')
         assert await _commits_over_main(lane) == 1

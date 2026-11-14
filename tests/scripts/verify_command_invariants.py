@@ -51,19 +51,22 @@ degrades to a guard that passes vacuously. If a caller needs behaviour this
 module does not have, add a PARAMETER here rather than a variant there —
 ``path_anchor`` (task 3883) is what that looks like in practice.
 
-THIS MODULE PARSES; IT DOES NOT DECIDE. The five call sites deliberately do not
-agree on semantics, and unifying them would be a behaviour change at four of
-them. So everything that is POLICY stays with its caller and arrives as an
-argument: which flags consume the following token (``_RUFF_FLAGS_TAKING_A_VALUE``
-in the CONTRIBUTING guard, ``_PYTEST_VALUE_FLAGS`` in the skills guard, none in
-the other three), which flag prefixes narrow a target set
-(``_NARROWING_FLAGS``), whether flag scanning covers the whole segment or only
-the checker's own post-anchor arguments, and the skills guard's
-``--directory`` base resolution / ``posixpath.normpath`` / target-EXISTS layer.
-What is shared is only the mechanics of reading a shell command. ``path_anchor``
-is NOT an exception to this: it records how the checker was SPELLED on the
-command line, which is a fact about the text being parsed, not a policy about
-the checker.
+THIS MODULE PARSES; IT DOES NOT DECIDE. This module's callers deliberately do
+not agree on semantics, and unifying them would change behaviour at every
+caller whose choice lost. So everything that is POLICY stays with its caller and
+arrives as an argument: whether to pass a value-flag set, and which one
+(:func:`positional_targets`' census lists every call site's choice), which flag
+prefixes narrow a target set (``_NARROWING_FLAGS``), whether flag scanning
+covers the whole segment or only the checker's own post-anchor arguments, and
+the skills guard's ``--directory`` base resolution / ``posixpath.normpath`` /
+target-EXISTS layer.
+What is shared is only the mechanics of reading a shell command and the facts
+those mechanics need. ``PYTEST_VALUE_FLAGS`` is such a fact — which pytest
+options take a SEPARATE value token is a property of pytest's CLI, so it lives
+here beside the ``PYTEST`` keyword (task 6172) — while PASSING it stays the
+caller's choice. ``path_anchor`` is NOT an exception to this either: it records
+how the checker was SPELLED on the command line, which is a fact about the text
+being parsed, not a policy about the checker.
 
 Importable from ``tests/scripts/test_*.py`` only because
 ``tests/scripts/conftest.py`` puts this directory on ``sys.path`` — pytest's
@@ -101,6 +104,18 @@ from orchestrator import verify_cmd
 RUFF = "ruff check"
 PYRIGHT = "pyright"
 PYTEST = "pytest"
+
+# The pytest options whose value is a SEPARATE token, so a parser handed this set
+# does not read that value as a target. A fact about pytest's CLI, not a policy;
+# callers still choose whether to pass it. The ``--flag=value`` spelling needs no
+# entry. Keep it CLOSED to value-taking flags: a boolean listed here would
+# swallow the real target that follows it.
+PYTEST_VALUE_FLAGS = frozenset({
+    "-c", "-k", "-m", "-n", "-o", "-p", "-r", "-W",
+    "--basetemp", "--color", "--deselect", "--dist", "--durations", "--ignore",
+    "--ignore-glob", "--import-mode", "--junitxml", "--log-level", "--maxfail",
+    "--rootdir", "--tb", "--timeout",
+})
 
 
 def _where(label: str | None, fallback: str) -> str:
@@ -195,9 +210,10 @@ def anchor_split(
 
     The ANCHOR is the last whitespace-separated token of *keyword*: ``check`` for
     ``ruff check``, ``pyright`` for ``pyright``, ``pytest`` for ``pytest``. One
-    rule reproduces every anchor the five callers use, two of which spelled it as
-    a hand-rolled ``tokens.index("check")`` and a third as a ``shlex``-tokenised
-    marker window with a raw ``str.endswith`` fallback (task 3883).
+    rule reproduces every anchor its callers use; of the five hand-maintained
+    copies it replaced, two spelled it as a hand-rolled ``tokens.index("check")``
+    and a third as a ``shlex``-tokenised marker window with a raw
+    ``str.endswith`` fallback (task 3883).
 
     THE ANCHOR BELONGS TO NEITHER HALF, and the split is the whole point.
     Everything BEFORE it is the WRAPPER's: in
@@ -322,7 +338,8 @@ def positional_targets(
       * ``test_hook_ruff_targets_drift.py::_gate_ruff_targets`` — none; the
         list EQUALS the hook's ``RUFF_TARGETS``.
       * ``test_hook_magicmock_test_dirs_drift.py::_gate_magicmock_test_dirs``
-        — none; the list EQUALS the hook's ``MAGICMOCK_TEST_DIRS``.
+        — none, which is that checker's exact set; the list EQUALS the hook's
+        ``MAGICMOCK_TEST_DIRS``.
       * ``test_scripts_module_config.py::_targets`` — none for the ruff and
         pyright legs, which check MEMBERSHIP; its own ``_PYTEST_VALUE_FLAGS``
         for the pytest leg via ``_pytest_targets``, which checks MEMBERSHIP
@@ -330,9 +347,9 @@ def positional_targets(
       * ``test_contributing_lint_command_drift.py::_ruff_targets`` —
         ``_RUFF_FLAGS_TAKING_A_VALUE``; each EXISTS.
       * ``test_skills_module_config_decision.py::_pytest_collected_dirs`` —
-        its own ``_PYTEST_VALUE_FLAGS``; each EXISTS.
-      * ``test_fallback_verify_config.py::_fleet_pytest_suite_names`` — its
-        own ``_PYTEST_VALUE_FLAGS``; the suite keys EQUAL its measured tables.
+        ``PYTEST_VALUE_FLAGS``; each EXISTS.
+      * ``test_fallback_verify_config.py::_fleet_pytest_suite_names`` —
+        ``PYTEST_VALUE_FLAGS``; the suite keys EQUAL its measured tables.
       * ``test_member_scripts_type_gate.py``'s one inline call —
         ``_PYRIGHT_VALUE_FLAGS``; COVERAGE via :func:`covers`.
 
@@ -348,18 +365,21 @@ def positional_targets(
     ``test_fallback_verify_config.py`` passes one at
     ``_fleet_pytest_suite_names``, which asserts no existence, and none at
     ``_lint_leg_targets``, which does. The remaining exposure is therefore
-    every set-less EXISTS or EQUALS row. The two set-less EXISTS rows each
+    every set-less EXISTS or EQUALS row whose checker takes a value flag at
+    all. The two set-less EXISTS rows and the hook's ruff EQUALS row each
     record it on their own extractor rather than papering over it here; the
-    two hook-drift EQUALS rows carry no such record yet.
+    hook's magicmock EQUALS row records on its extractor why that checker has
+    none.
 
     Discarding unrecognised tokens instead is not an option: that would silently
     shrink the target list and re-open the false-pass hazard the parsing exists
     to close. Widening the set is the caller's call, not this module's.
 
-    *path_anchor* is passed straight through to :func:`anchor_split`, for the
-    fifth caller ``test_fallback_verify_config.py::_lint_leg_targets`` (task
-    3883), whose ``check_bare_magicmock_config.py`` leg names the checker by
-    PATH. It is ORTHOGONAL to *value_flags*, and reading it as another policy
+    *path_anchor* is passed straight through to :func:`anchor_split`, for
+    callers reading the ``check_bare_magicmock_config.py`` leg, which names its
+    checker by PATH (first needed by
+    ``test_fallback_verify_config.py::_lint_leg_targets``, task 3883). It is
+    ORTHOGONAL to *value_flags*, and reading it as another policy
     knob would be a category error: *value_flags* is per-checker POLICY (which
     flags eat the following token — a fact about the checker's CLI), while
     *path_anchor* is a fact about how the checker was SPELLED on this particular

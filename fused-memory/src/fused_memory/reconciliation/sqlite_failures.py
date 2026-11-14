@@ -1,5 +1,5 @@
 """The sqlite3 classification a reconciliation failure is recorded and logged
-with, and the best-effort await that logs a bookkeeping write's failure with it
+with, and the best-effort await that logs a bookkeeping operation's failure with it
 instead of raising.
 
 The sqlite3 module sets ``sqlite_errorname``/``sqlite_errorcode`` on the errors
@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Mapping
+from typing import TypeVar
+
+_T = TypeVar('_T')
 
 
 def sqlite_classification(exc: BaseException) -> dict[str, object]:
@@ -33,20 +36,21 @@ def sqlite_log_fields(run_id: str, classified: Mapping[str, object]) -> str:
 
 
 async def await_best_effort(
-    write: Awaitable[object],
+    operation: Awaitable[_T],
     *,
     what: str,
     run_id: str,
     logger: logging.Logger,
     level: int,
-) -> None:
-    """Await *write*; an Exception is logged on *logger* at *level* as
-    ``<what> failed: …`` with its classification, and never raised.
-    Cancellation propagates."""
+) -> _T | None:
+    """Await *operation* and return its value; an Exception is logged on
+    *logger* at *level* as ``<what> failed: …`` with its classification, and
+    None is returned instead. Cancellation propagates."""
     try:
-        await write
+        return await operation
     except Exception as err:
         logger.log(
             level, '%s failed: %r (%s)',
             what, err, sqlite_log_fields(run_id, sqlite_classification(err)),
         )
+    return None

@@ -29,6 +29,9 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 
+from shared.project_id import fold_project_token
+from shared.task_statuses import TERMINAL as TERMINAL_TASK_STATUSES
+
 # Bind scripts/ and orchestrator/ to THIS checkout, never an editable install's (tasks 2881/2882).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 for _path in (_REPO_ROOT / 'orchestrator' / 'src', _REPO_ROOT / 'scripts'):
@@ -83,10 +86,22 @@ CARVEOUT_ACTION = 'resume'
 CARVEOUT_RESOLVED_BY = 'sitting-preparer'
 CARVEOUT_RESOLUTION_TURNS = 1
 """A carve-out close takes one preparer turn and no Leo turn."""
-OWNER_RELEASE_STATUSES: tuple[str, ...] = tuple(sorted(ownership.TERMINAL_TASK_STATUSES))
+OWNER_RELEASE_STATUSES: tuple[str, ...] = tuple(sorted(TERMINAL_TASK_STATUSES))
 PIN_RELEASE = Manual('a human spends the pin (acknowledge_declared_pins) or withdraws it')
 
 DEFAULT_PREPARATION = _REPO_ROOT / preparations.DEFAULT_PREPARATION_PATH
+
+
+@dataclass(frozen=True)
+class HandoverOverride:
+    """`--handover PROJECT=PATH`: read PATH as PROJECT's handover instead of the one under its root."""
+
+    project: str
+    path: Path
+
+    def __post_init__(self) -> None:
+        if not self.project or fold_project_token(self.project) != self.project:
+            raise ValueError(f'HandoverOverride project {self.project!r} is not a folded project token')
 
 
 @dataclass(frozen=True)
@@ -97,7 +112,7 @@ class Sources:
     queues_scanned: tuple[str, ...]
     sessions: SessionIndex
     task_rows: Mapping[str, TaskRows]
-    handover_path: Path | None
+    handovers: Mapping[str, Path]
     preparations: PreparationStore
     shortfalls: tuple[Shortfall, ...]
 
@@ -106,6 +121,9 @@ class Sources:
         if rows is None:
             return TaskRows(MappingProxyType({}), f'no project root is known for {item.project or "an unscoped item"}')
         return rows
+
+    def handover_for(self, item: OpenItem) -> Path | None:
+        return self.handovers.get(item.project)
 
 
 @dataclass(frozen=True)
@@ -143,7 +161,7 @@ def read_sources(
     project_roots: Sequence[str] | None,
     decisions_root: Path,
     sessions_root: Path,
-    handover_path: Path | None,
+    handover_override: HandoverOverride | None,
     preparation_path: Path,
     project: str | None,
     now: datetime,
@@ -157,9 +175,11 @@ def read_sources(
     sessions = ownership.index_sessions(sessions_root)
     if not sessions.available:
         shortfalls.append(Shortfall('session_registry', str(sessions_root), 'no sessions root'))
-    task_rows = _task_rows(queues)
+    queue_roots = inventory.queue_project_roots(queues)
+    task_rows = _task_rows(queue_roots)
     stored, problem = _load_preparations(preparation_path)
     shortfalls += [*found.shortfalls, *sessions.shortfalls, *([problem] if problem else [])]
+    shortfalls += _unread_override(handover_override, found.items)
     shortfalls += [Shortfall('tasks_db', project, rows.unavailable) for project, rows in task_rows.items()
                    if rows.unavailable]
     return Sources(
@@ -167,7 +187,7 @@ def read_sources(
         queues_scanned=queues,
         sessions=sessions,
         task_rows=task_rows,
-        handover_path=handover_path,
+        handovers=_handovers(queue_roots, handover_override),
         preparations=stored,
         shortfalls=tuple(shortfalls),
     )
@@ -200,7 +220,7 @@ def classify(
     for item in sources.inventory.items:
         finding = ownership.sweep(
             item, sessions=sources.sessions, task_rows=sources.rows_for(item),
-            handover_path=sources.handover_path, now=now,
+            handover_path=sources.handover_for(item), now=now,
         )
         prep = sources.preparations.get(item.key)
         facts = gather_facts(item, sources, prep)
@@ -258,6 +278,7 @@ def compose(
     done = tuple(
         brief.DoneEntry(entry.number, parse_key(key), entry.done_at or '')
         for key, entry in numbered_ledger.in_state('done')
+        if parse_key(key)[0] in inventory.QUESTION_KINDS
     )
     closes = tuple(
         brief.CloseRecord(c.item, c.verdict, c.payloads)
@@ -354,9 +375,23 @@ def _queueless(roots: Iterable[str]) -> list[Shortfall]:
     ]
 
 
-def _task_rows(queues: Iterable[str]) -> Mapping[str, TaskRows]:
-    roots = {inventory.queue_project(q): root for q in queues if (root := inventory.queue_project_root(q)) is not None}
+def _task_rows(roots: Mapping[str, Path]) -> Mapping[str, TaskRows]:
     return MappingProxyType({project: ownership.load_task_rows(root) for project, root in roots.items()})
+
+
+def _handovers(roots: Mapping[str, Path], override: HandoverOverride | None) -> Mapping[str, Path]:
+    found = {project: path for project, root in roots.items()
+             if (path := ownership.resolve_handover_path(root)) is not None}
+    if override is not None:
+        found[override.project] = override.path
+    return MappingProxyType(found)
+
+
+def _unread_override(override: HandoverOverride | None, items: Iterable[OpenItem]) -> list[Shortfall]:
+    if override is None or any(item.project == override.project for item in items):
+        return []
+    reason = f'--handover names {override.project!r}, but no item of that project is in this run; never read'
+    return [Shortfall('handover', str(override.path), reason)]
 
 
 def _load_preparations(path: Path) -> tuple[PreparationStore, Shortfall | None]:
@@ -572,18 +607,13 @@ def _now(args: argparse.Namespace) -> datetime:
     return args.now or datetime.now(UTC)
 
 
-def handover_file(explicit: Path | None) -> Path | None:
-    """*explicit*, else this checkout's newest handover; None unless it is a file."""
-    handover = explicit if explicit is not None else ownership.resolve_handover_path(_REPO_ROOT)
-    return handover if handover is not None and handover.is_file() else None
-
-
-def _sources(args: argparse.Namespace) -> Sources:
+def sources_from_args(args: argparse.Namespace) -> Sources:
+    """The stores named by a :func:`stores_arguments` parse, read once."""
     return read_sources(
         project_roots=args.project_roots,
         decisions_root=fleet_root(args.decisions_root),
         sessions_root=args.sessions_root if args.sessions_root is not None else sessions_dir(),
-        handover_path=handover_file(args.handover),
+        handover_override=args.handover,
         preparation_path=args.preparation,
         project=args.project,
         now=_now(args),
@@ -593,7 +623,7 @@ def _sources(args: argparse.Namespace) -> Sources:
 def _cmd_brief(args: argparse.Namespace) -> int:
     now = _now(args)
     base = (ledgers.load(args.ledger) if args.ledger else None) or ledgers.new_sitting(now.isoformat())
-    sitting = compose(_sources(args), base, recommend_only=not args.apply_closes,
+    sitting = compose(sources_from_args(args), base, recommend_only=not args.apply_closes,
                       multi_sitting=args.multi_sitting, now=now)
     if args.ledger:
         ledgers.save(args.ledger, sitting.ledger)
@@ -627,26 +657,42 @@ def _cmd_record(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+@dataclass(frozen=True)
+class AnswerTurn:
+    """One Leo turn resolved: the sitting it was resolved against, the ledger to save, and the echo."""
+
+    sitting: Sitting
+    persisted: ledgers.Ledger
+    resolved: ledgers.ResolvedAnswers
+
+
+def answer_turn(
+    sources: Sources, ledger: ledgers.Ledger, answers: Sequence[ledgers.Answer], *, now: datetime,
+) -> AnswerTurn:
+    """Resolve *answers* against *ledger* renumbered over the open items *sources* found; nothing is saved."""
+    sitting = compose(sources, ledger, recommend_only=True, multi_sitting=False, now=now)
+    working = sitting.ledger
+    for entry in sitting.standing:
+        if working.entries[key_str(entry.item.key)].state != 'standing':
+            working = ledgers.set_standing(working, key_str(entry.item.key), entry.standing)
+    options = {key_str(entry.item.key): brief.options_by_label(entry) for entry in sitting.numbered}
+    answered, resolved = ledgers.resolve_answers(working, answers, options)
+    return AnswerTurn(sitting, _with_answer_rounds(sitting.ledger, answered), resolved)
+
+
 def _cmd_resolve_answers(args: argparse.Namespace) -> int:
     current = ledgers.load(args.ledger)
     if current is None:
         print(f'no sitting at {args.ledger}; run new-sitting first', file=sys.stderr)
         return EXIT_CONFIG
     now = _now(args)
-    sitting = compose(_sources(args), current, recommend_only=True, multi_sitting=False, now=now)
-    working = sitting.ledger
-    for entry in sitting.standing:
-        if working.entries[key_str(entry.item.key)].state != 'standing':
-            working = ledgers.set_standing(working, key_str(entry.item.key), entry.standing)
-    options = {key_str(entry.item.key): brief.options_by_label(entry) for entry in sitting.numbered}
-    answers = [_answer(token, args.source, now.isoformat()) for token in args.answer]
-    answered, resolved = ledgers.resolve_answers(working, answers, options)
-    persisted = _with_answer_rounds(sitting.ledger, answered)
-    ledgers.save(args.ledger, persisted)
-    print(ledgers.render_echo_table(resolved), end='')
-    for row in resolved.rows:
-        print(f'item {row.number} resolution_turns={ledgers.resolution_turns(persisted, row.key)}')
-    return EXIT_ASK_BACK if resolved.unresolved else EXIT_OK
+    answers = [parse_answer_token(token, args.source, now.isoformat()) for token in args.answer]
+    turn = answer_turn(sources_from_args(args), current, answers, now=now)
+    ledgers.save(args.ledger, turn.persisted)
+    print(ledgers.render_echo_table(turn.resolved), end='')
+    for row in turn.resolved.rows:
+        print(f'item {row.number} resolution_turns={ledgers.resolution_turns(turn.persisted, row.key)}')
+    return EXIT_ASK_BACK if turn.resolved.unresolved else EXIT_OK
 
 
 def _cmd_summary(args: argparse.Namespace) -> int:
@@ -658,7 +704,7 @@ def _cmd_summary(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _answer(token: str, source: str, answered_at: str) -> ledgers.Answer:
+def parse_answer_token(token: str, source: str, answered_at: str) -> ledgers.Answer:
     """One ``N=OPTION[:note]`` token; anything else keeps the whole token as its item ref, so it is asked back."""
     item_ref, has_option, rest = token.partition('=')
     if not has_option:
@@ -684,19 +730,41 @@ def parse_instant(text: str) -> datetime:
     return parsed
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog='prepare_sitting.py', description='Prepare a sitting brief Leo answers by number.')
-    commands = parser.add_subparsers(dest='command', required=True)
+def parse_handover_override(text: str) -> HandoverOverride:
+    project, has_path, path = text.partition('=')
+    folded = fold_project_token(project)
+    if not (has_path and folded and path):
+        raise argparse.ArgumentTypeError(f'--handover takes PROJECT=PATH, got {text!r}')
+    return HandoverOverride(folded, Path(path))
+
+
+def clock_arguments() -> argparse.ArgumentParser:
+    """The ``--now`` parent parser."""
     clock = argparse.ArgumentParser(add_help=False)
     clock.add_argument('--now', type=parse_instant, help='ISO-8601 instant to run at (default: now)')
-    stores = argparse.ArgumentParser(add_help=False, parents=[clock])
+    return clock
+
+
+def stores_arguments() -> argparse.ArgumentParser:
+    """The parent parser naming the stores of record a sitting reads; see :func:`sources_from_args`."""
+    stores = argparse.ArgumentParser(add_help=False, parents=[clock_arguments()])
     stores.add_argument('--project-root', action='append', dest='project_roots',
                         help='repeatable; default: _task_db_scan.discover_project_roots()')
     stores.add_argument('--decisions-root', type=Path, help='fleet root holding decisions/ (default: fleet_root())')
     stores.add_argument('--sessions-root', type=Path, help='default: session_registry.sessions_dir()')
-    stores.add_argument('--handover', type=Path, help='default: ownership.resolve_handover_path(<this checkout>)')
+    stores.add_argument('--handover', type=parse_handover_override, metavar='PROJECT=PATH',
+                        help="read PATH as PROJECT's handover; default: each project root's own, "
+                             'via ownership.resolve_handover_path')
     stores.add_argument('--preparation', type=Path, default=DEFAULT_PREPARATION)
-    stores.add_argument('--project', help='keep only this project, folded through normalize_project_token')
+    stores.add_argument('--project', help='keep only this project, folded through shared.project_id.fold_project_token')
+    return stores
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog='prepare_sitting.py', description='Prepare a sitting brief Leo answers by number.')
+    commands = parser.add_subparsers(dest='command', required=True)
+    clock = clock_arguments()
+    stores = stores_arguments()
 
     brief_cmd = commands.add_parser('brief', parents=[stores], help='print the sitting brief')
     brief_cmd.add_argument('--ledger', type=Path, help='session ledger: stable numbers, written back')

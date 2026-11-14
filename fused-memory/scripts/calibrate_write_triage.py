@@ -464,7 +464,7 @@ def _first_match_rank(
     A candidate reaches *match_ids* by its own id, or — when
     *candidate_parents* carries an entry for it — by the id it hoists to.
     ``candidate_parents`` mirrors production's
-    ``write_triage.py::_canonical_id_of``: a sighting/amendment child is
+    ``write_triage.py::canonical_id_of``: a sighting/amendment child is
     counted as reaching whatever its ``metadata.parent_id`` resolves to,
     the same hoist a live triaged write gets credit for. Returns -1 if no
     candidate reaches *match_ids*.
@@ -490,7 +490,7 @@ def compute_recall_at_k(
 
     A candidate REACHES the canonical by its own id or by the parent
     ``candidate_parents`` hoists it to. That is production's attach rule
-    (``write_triage.py::_canonical_id_of``), so it holds whatever the two
+    (``write_triage.py::canonical_id_of``), so it holds whatever the two
     independent choices below are:
 
     - ``aliases`` ({old_canonical: current_id}) also lets a candidate reach an
@@ -1493,7 +1493,7 @@ async def fetch_recall_hit(
     """
     _require_retrieval_mode(retrieval_mode)
     from fused_memory.server.write_triage import (  # noqa: PLC0415
-        _canonical_id_of,
+        canonical_id_of,
         retrieve_candidates,
     )
 
@@ -1510,7 +1510,7 @@ async def fetch_recall_hit(
     return {
         'candidates': [row.id for row in rows],
         'candidate_parents': {
-            row.id: hoisted for row in rows if (hoisted := _canonical_id_of(row)) != row.id
+            row.id: hoisted for row in rows if (hoisted := canonical_id_of(row)) != row.id
         },
         'canonical_present': (
             await memory_service.get_memory_by_id(project_id, record['cluster_id']) is not None

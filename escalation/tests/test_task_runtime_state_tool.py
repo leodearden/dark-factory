@@ -6,10 +6,7 @@ a thin, sync, duck-typed projection of ``Harness.task_runtime_snapshot()``
 model — see that module's docstring for the honest-failure contract this
 test suite exercises.
 
-Uses the sync-tool FastMCP unit-test pattern already established for
-``get_merge_queue``/``get_merge_halt_status`` (test_server.py:2629-2630 /
-82-84): ``tool = await server.get_tool(name); tool.fn()`` — no ``await`` on
-``.fn()`` itself since the tool body is a sync ``def``. The fake harness is
+Drives the tool through ``_tool_calls.py::call_tool``. The fake harness is
 a ``types.SimpleNamespace`` whose ``task_runtime_snapshot`` returns
 ``SimpleNamespace`` stand-ins for ``orchestrator.task_runtime.TaskRuntimeState``
 — no orchestrator import needed, matching the escalation package's
@@ -23,15 +20,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _tool_calls import call_tool
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
 
 async def _call_get_task_runtime_state(server: Any) -> dict[str, Any]:
-    """Invoke the get_task_runtime_state MCP tool directly (sync tool)."""
-    tool = await server.get_tool('get_task_runtime_state')
-    return tool.fn()
+    return await call_tool(server, 'get_task_runtime_state')
 
 
 # A pooled (lane-assigned) success entry — all 9 TaskRuntimeState attributes.

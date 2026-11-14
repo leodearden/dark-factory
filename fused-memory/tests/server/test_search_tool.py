@@ -8,14 +8,17 @@ step-15 (RED) / step-16 (GREEN):
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _graphiti_fake import FakeGraphitiClient
 
+from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.tools import create_mcp_server
-from fused_memory.services.memory_service import SearchResults
+from fused_memory.services.memory_service import MemoryService, SearchResults
 
 _PROJECT_ID = 'dark_factory'
 
@@ -382,11 +385,6 @@ class TestSearchToolBackendReadTimeoutSurfacing:
         Only `_get_instance` is patched — the swallow under test lives in
         `Mem0Backend.search` itself, between that call and the service.
         """
-        from unittest.mock import MagicMock, patch
-
-        from fused_memory.backends.mem0_client import Mem0Backend
-        from fused_memory.services.memory_service import MemoryService
-
         service = MemoryService(mock_config)
         backend = Mem0Backend(mock_config)
         backend._read_timeout = 0.05
@@ -470,4 +468,85 @@ class TestSearchToolBackendReadTimeoutSurfacing:
             assert key not in result, (
                 f"{key!r} must NOT appear on a genuinely-empty (non-degraded) "
                 f'response, got result={result!r}'
+            )
+
+
+class _HangingSearchGraphitiClient(FakeGraphitiClient):
+    """A graphiti_core stand-in whose ``search`` never returns — a slow upstream."""
+
+    async def search(self, **kwargs):
+        await asyncio.Event().wait()
+
+
+class TestSearchToolGraphitiReadTimeoutSurfacing:
+    """A GRAPHITI backend read timeout must reach the `search` MCP caller as a degradation.
+
+    The Graphiti twin of TestSearchToolBackendReadTimeoutSurfacing (task 5699).
+    `GraphitiBackend.search` swallowed its own `TimeoutError` into `[]`, so the
+    real backend has to be in the path: a `TimeoutError` side_effect stubbed
+    onto `service.graphiti.search` would be green before the fix.  The backend
+    read budget is set through the public config seam, below the YAML outer
+    `search_timeout_seconds`, so the inner budget is the one that fires.
+    """
+
+    @staticmethod
+    def _service(mock_config, make_backend_over_fake_graphiti, fake):
+        mock_config.queue.backend_read_timeout_seconds = 0.05
+        service = MemoryService(mock_config)
+        service.graphiti = make_backend_over_fake_graphiti(mock_config, fake)
+        # Mem0 is never selected (stores=['graphiti']), but stub it so a wiring
+        # slip surfaces as a failed assertion rather than a real Qdrant call.
+        service.mem0 = MagicMock()
+        service.mem0.search = AsyncMock(return_value={'results': []})
+        return service
+
+    @staticmethod
+    async def _search_graphiti(service):
+        return await create_mcp_server(service)._tool_manager.call_tool(
+            'search',
+            {'query': 'q', 'project_id': _PROJECT_ID, 'stores': ['graphiti']},
+        )
+
+    @pytest.mark.asyncio
+    async def test_backend_read_timeout_surfaces_as_degraded(
+        self, mock_config, make_backend_over_fake_graphiti,
+    ):
+        """An inner Graphiti read timeout -> degraded=True, failed_stores=['graphiti'],
+        and one diagnostic whose `reason == 'exception'` marks the INNER budget."""
+        service = self._service(
+            mock_config, make_backend_over_fake_graphiti, _HangingSearchGraphitiClient(),
+        )
+
+        result = await self._search_graphiti(service)
+
+        assert result.get('degraded') is True, (
+            f'a swallowed Graphiti read timeout left the response CLEAN; got {result!r}'
+        )
+        assert result.get('failed_stores') == ['graphiti'], f'got {result!r}'
+        diagnostics = result.get('failed_store_diagnostics')
+        assert diagnostics and len(diagnostics) == 1, f'got {diagnostics!r}'
+        diag = diagnostics[0]
+        assert diag.get('store') == 'graphiti', f'got {diag!r}'
+        assert diag.get('error_type') == 'TimeoutError', f'got {diag!r}'
+        assert diag.get('reason') == 'exception', (
+            'the inner backend read timeout must arrive via the per-task exception '
+            f"arm (reason='exception'), not the outer fan-out deadline; got {diag!r}"
+        )
+        assert 'Graphiti search timed out' in (diag.get('error') or ''), f'got {diag!r}'
+
+    @pytest.mark.asyncio
+    async def test_genuinely_empty_store_stays_clean(
+        self, mock_config, make_backend_over_fake_graphiti,
+    ):
+        """CONTRAST: a Graphiti store with no edges answers promptly and stays CLEAN."""
+        service = self._service(
+            mock_config, make_backend_over_fake_graphiti, FakeGraphitiClient(),
+        )
+
+        result = await self._search_graphiti(service)
+
+        assert result.get('results') == [], f'expected no results, got {result!r}'
+        for key in ('degraded', 'failed_stores', 'failed_store_diagnostics'):
+            assert key not in result, (
+                f'{key!r} must NOT appear on a genuinely-empty response, got {result!r}'
             )

@@ -11,7 +11,12 @@ import dataclasses
 import shutil
 from pathlib import Path
 
-from fused_memory.middleware.task_curator import CandidateTask
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+from fused_memory.middleware.curator_types import CandidateTask
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # task-1972 step-03 RED: TestLoadPremiseRegistry

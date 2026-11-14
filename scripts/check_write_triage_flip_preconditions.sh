@@ -42,6 +42,10 @@
 #           2026-08-27: the committed .md and .json disagree on column order, so
 #           the .md the flip operator reads is provably not the render of the
 #           committed .json. Values agree -- what is broken is traceability.
+#           Since task 5845 the outcome order is built in
+#           fused-memory/scripts/eval_write_triage_scoring.py::EVAL_OUTCOMES, so
+#           item 2 greps both that file and the CLI, and fails closed if either
+#           cannot be read.
 #   item 4  report_path.with_suffix('.md') means `--report-path foo.md` writes the
 #           JSON and then OVERWRITES it with the markdown, losing the JSON.
 #
@@ -102,7 +106,11 @@ REF="${WRITE_TRIAGE_GATE_REF:-main}"
 JUDGE='fused-memory/src/fused_memory/server/write_triage_judge.py'
 TRIAGE='fused-memory/src/fused_memory/server/write_triage.py'
 EVAL='fused-memory/scripts/eval_write_triage_judge.py'
+SCORING='fused-memory/scripts/eval_write_triage_scoring.py'
 CONF='fused-memory/config/config.yaml'
+
+# Item 2's defect, a direct iteration of the frozenset; read against $EVAL and $SCORING.
+ITEM2_PATTERN='dict\.fromkeys(TRIAGE_OUTCOMES\|list(TRIAGE_OUTCOMES)'
 
 # The item-1 probe, and the interpreter that runs it. The env seam mirrors
 # scripts/check_sandbox_soak.sh's CHECK_SANDBOX_SOAK_PY: it is what lets the
@@ -420,30 +428,46 @@ fi
 # --- item 2: the committed accuracy artifact must be reproducible -------------
 if read_ref_file "$EVAL"; then
   eval_src="$REF_CONTENT"
-  # Here-string, not a pipe -- same pipefail/SIGPIPE race as item 1 above, and
-  # here it fails the OTHER way: a spurious non-zero takes the else branch and
-  # prints `PASS item 2` for an eval script that still iterates the frozenset.
+  # Here-strings over the ref's eval sources, not pipes -- same pipefail/SIGPIPE
+  # race as item 1 above, and here it fails the OTHER way: a spurious non-zero
+  # takes the else branch and prints `PASS item 2` for an eval script that still
+  # iterates the frozenset.
   # Measured: a 960 KB $eval_src with the pattern first gives PIPESTATUS=(141 0)
   # piped -- grep matched, printf SIGPIPE-killed -- 200/200 spurious PASS piped
   # vs 0/200 here-string. Pinned by
   # scripts/tests/test_check_write_triage_flip_preconditions.py::TestItemsTwoAndFourReadingIsNotRaceProne
   # so the two cannot drift apart silently. Do not "tidy" this back into a pipe.
-  if grep -q 'dict\.fromkeys(TRIAGE_OUTCOMES\|list(TRIAGE_OUTCOMES)' <<<"$eval_src"; then
-    note "FAIL  item 2  $EVAL still iterates the TRIAGE_OUTCOMES frozenset directly"
-    note "              Column/key order is PYTHONHASHSEED-dependent, so the committed"
-    note "              JSON and markdown churn between identical runs. Measured"
-    note "              2026-08-27: the committed .md header order and the committed"
-    note "              .json confusion order DISAGREE, so the report the flip operator"
-    note "              reads is not the render of the committed JSON. Values agree —"
-    note "              it is traceability that is broken, and step 1 of this gate"
-    note "              rests on that artifact."
-    note "              Fix: a module-level EVAL_OUTCOMES = tuple(sorted(TRIAGE_OUTCOMES))"
-    note "              mirroring the existing EVAL_CLASSES tuple, used in both places."
-    note "              Precedent for pinning it (task 4012): assert"
-    note "              MD.read_text() == render_markdown(json.loads(JSON.read_text()))."
-    record_fail 2
+  if read_ref_file "$SCORING"; then
+    scoring_src="$REF_CONTENT"
+    item2_offenders=()
+    if grep -q "$ITEM2_PATTERN" <<<"$eval_src"; then
+      item2_offenders+=("$EVAL")
+    fi
+    if grep -q "$ITEM2_PATTERN" <<<"$scoring_src"; then
+      item2_offenders+=("$SCORING")
+    fi
+    if [ "${#item2_offenders[@]}" -gt 0 ]; then
+      for offender in "${item2_offenders[@]}"; do
+        note "FAIL  item 2  $offender still iterates the TRIAGE_OUTCOMES frozenset directly"
+      done
+      note "              Column/key order is PYTHONHASHSEED-dependent, so the committed"
+      note "              JSON and markdown churn between identical runs. Measured"
+      note "              2026-08-27: the committed .md header order and the committed"
+      note "              .json confusion order DISAGREE, so the report the flip operator"
+      note "              reads is not the render of the committed JSON. Values agree —"
+      note "              it is traceability that is broken, and step 1 of this gate"
+      note "              rests on that artifact."
+      note "              Fix: a module-level EVAL_OUTCOMES = tuple(sorted(TRIAGE_OUTCOMES))"
+      note "              mirroring the existing EVAL_CLASSES tuple, used in both places."
+      note "              Precedent for pinning it (task 4012): assert"
+      note "              MD.read_text() == render_markdown(json.loads(JSON.read_text()))."
+      record_fail 2
+    else
+      note "PASS  item 2  $EVAL and $SCORING no longer iterate the frozenset directly"
+    fi
   else
-    note "PASS  item 2  $EVAL no longer iterates the frozenset directly"
+    note "FAIL  item 2  UNVERIFIABLE: cannot read $SCORING at ref '$REF'. Failing closed."
+    record_fail 2
   fi
 
   # --- item 4: --report-path must not destroy its own JSON --------------------

@@ -1,9 +1,10 @@
 """Tests for the token-budget context assembler."""
 
 import asyncio
+import itertools
 import json
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,6 +14,7 @@ from _clip_assertions import assert_elided
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.memory import MemoryCategory, MemoryResult, SourceStore
 from fused_memory.models.reconciliation import (
+    ContextFetchFailure,
     ContextItem,
     EventSource,
     EventType,
@@ -59,21 +61,12 @@ def _make_memory_result(
     )
 
 
-def _make_watermark(
-    last_run: datetime | None = None,
-) -> Watermark:
-    return Watermark(
-        project_id='test-project',
-        last_full_run_completed=last_run or datetime.now(UTC) - timedelta(hours=1),
-    )
+def _make_watermark() -> Watermark:
+    return Watermark(project_id='test-project')
 
 
 def _make_config(**overrides: int) -> ReconciliationConfig:
-    return ReconciliationConfig(
-        token_budget=overrides.get('token_budget', 65_000),
-        context_search_limit=overrides.get('context_search_limit', 5),
-        context_fetch_batch_size=overrides.get('context_fetch_batch_size', 10),
-    )
+    return ReconciliationConfig.model_validate(overrides)
 
 
 @pytest_asyncio.fixture
@@ -153,7 +146,7 @@ async def test_budget_stops_accumulation(mock_memory):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('token_budget', [1_450, 65_000])
+@pytest.mark.parametrize('token_budget', [1_450, ReconciliationConfig().token_budget])
 async def test_payload_states_the_budget_it_was_assembled_under(mock_memory, token_budget):
     """Both the budget-stopped path and the all-fit path carry the budget value."""
     config = _make_config(token_budget=token_budget)
@@ -169,8 +162,7 @@ async def test_payload_states_the_budget_it_was_assembled_under(mock_memory, tok
 @pytest.mark.asyncio
 async def test_all_events_fit_when_under_budget(mock_memory):
     """When total tokens < budget, all events are included."""
-    config = _make_config(token_budget=65_000)
-    assembler = _make_assembler(memory_service=mock_memory, config=config)
+    assembler = _make_assembler(memory_service=mock_memory, config=_make_config())
 
     events = [_make_event() for _ in range(5)]
     watermark = _make_watermark()
@@ -351,41 +343,6 @@ async def test_context_fetch_failure_includes_event(mock_memory):
     assert len(result.context_items) == 0
 
 
-# ── Effective watermark ──────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_effective_watermark_uses_min_of_run_and_event():
-    """Watermark aligns with the earliest event if it predates last run."""
-    assembler = _make_assembler()
-
-    last_run = datetime(2026, 4, 2, 10, 0, tzinfo=UTC)
-    old_event_time = datetime(2026, 4, 1, 8, 0, tzinfo=UTC)
-
-    events = [_make_event(timestamp=old_event_time)]
-    watermark = _make_watermark(last_run=last_run)
-
-    result = await assembler.assemble(events, watermark, 'test-project')
-
-    assert result.effective_watermark == old_event_time
-
-
-@pytest.mark.asyncio
-async def test_effective_watermark_uses_last_run_when_events_are_recent():
-    """Watermark uses last_run when all events are more recent."""
-    assembler = _make_assembler()
-
-    last_run = datetime(2026, 4, 1, 8, 0, tzinfo=UTC)
-    recent_event = datetime(2026, 4, 2, 10, 0, tzinfo=UTC)
-
-    events = [_make_event(timestamp=recent_event)]
-    watermark = _make_watermark(last_run=last_run)
-
-    result = await assembler.assemble(events, watermark, 'test-project')
-
-    assert result.effective_watermark == last_run
-
-
 # ── Batch processing ────────────────────────────────────────────────
 
 
@@ -510,8 +467,7 @@ class TestContextAssemblerCancellation:
         The production path:
           mock_memory.search raises CancelledError
           → _ctx_memory_added calls self.memory.search → CancelledError propagates
-          → _fetch_context's ``except Exception`` does NOT catch BaseException subclasses
-            that are not Exception (i.e., CancelledError bypasses the except-clause)
+          → _fetch_context does not catch it
           → asyncio.gather(return_exceptions=True) captures it as a value in batch_contexts
           → the buggy ``isinstance(ctx_result, BaseException)`` guard converts it to []
             (current behaviour: assemble() returns normally — test DID NOT RAISE)
@@ -543,8 +499,7 @@ class TestContextAssemblerCancellation:
         cancellation check.
 
         Patches assembler._fetch_context via patch.object to emit a RuntimeError for
-        event_one and a CancelledError for event_two — bypassing _fetch_context's
-        internal ``except Exception`` wrapper and forcing the exact mix into
+        event_one and a CancelledError for event_two, forcing the exact mix into
         batch_contexts (in deterministic slot order, since gather preserves input-order
         in its result list regardless of scheduling) that the propagation pass must
         handle correctly.
@@ -593,8 +548,7 @@ class TestContextAssemblerCancellation:
         BaseException)``), a RuntimeError would be re-raised by Pass 1 instead of
         being swallowed by Pass 2 and degraded to an event-only entry.
 
-        Directly patches assembler._fetch_context — bypassing _fetch_context's own
-        ``except Exception`` wrapper (lines 221-225) — so the RuntimeError lands in
+        Directly patches assembler._fetch_context so the RuntimeError lands in
         batch_contexts exactly as the Pass 1 guard sees it.  assemble() must return
         normally with all events present in degraded event-only mode and no context
         items.
@@ -829,6 +783,97 @@ async def test_assembled_task_context_carries_the_elision_markers(mock_memory, m
     assert_elided(_memory_body(result.context_items[hinted.id].formatted), hinted.content)
 
 
+@pytest.mark.asyncio
+async def test_assembled_context_renders_typical_long_records_whole(mock_memory, mock_taskmaster):
+    """A description just above the measured p90 and a memory body at the dark_factory p90
+    reach the payload whole (plans/recon-evidence-caps-measurement-2026-10.md, M1/M2)."""
+    desc = 'd' * 3_800
+    mock_taskmaster.get_task = AsyncMock(return_value={
+        **_task_with_description(desc),
+        'id': '42',
+        'metadata': {'memory_hints': {'queries': ['q']}},
+    })
+    hinted = _make_memory_result(content='m' * 1_950)
+    mock_memory.search = AsyncMock(return_value=[hinted])
+    assembler = _make_assembler(memory_service=mock_memory, taskmaster=mock_taskmaster)
+    events = [_make_event(
+        event_type=EventType.task_status_changed,
+        payload={'task_id': '42', 'old_status': 'in-progress', 'new_status': 'done'},
+    )]
+
+    result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+    assert _desc_line(result.context_items['task:42'].formatted) == f'  desc: {desc}'
+    assert _memory_body(result.context_items[hinted.id].formatted) == hinted.content
+
+
+# ── token_budget against a measured backlog chunk ───────────────────
+# Inputs measured in plans/recon-evidence-caps-measurement-2026-10.md (M1, M2, M3, M7).
+
+_MEASURED_CHUNK_EVENTS = 268
+_MEAN_RENDERED_DESCRIPTION_CHARS = 2_052
+_MEAN_RENDERED_MEMORY_CHARS = 763
+_CONTENT_PREVIEW_CHARS = 200
+_TASKS_PER_BLOCK = 3
+
+
+def _measured_block(block: int) -> list[ReconciliationEvent]:
+    task_ids = [str(_TASKS_PER_BLOCK * block + n) for n in range(_TASKS_PER_BLOCK)]
+    return [
+        *(_make_event(EventType.task_modified, payload={'task_id': task_ids[n % _TASKS_PER_BLOCK]})
+          for n in range(11)),
+        *(_make_event(EventType.memory_added, payload={'content_preview': 'p' * _CONTENT_PREVIEW_CHARS})
+          for _ in range(7)),
+        *(_make_event(EventType.memory_deleted, payload={'memory_id': str(uuid.uuid4())})
+          for _ in range(2)),
+    ]
+
+
+def _measured_backlog_chunk() -> list[ReconciliationEvent]:
+    blocks = itertools.chain.from_iterable(_measured_block(b) for b in itertools.count())
+    return list(itertools.islice(blocks, _MEASURED_CHUNK_EVENTS))
+
+
+async def _measured_search(*, query: str, **_) -> list[MemoryResult]:
+    hits = 1 if query.startswith('memory ') else 4
+    return [_make_memory_result(content='b' * _MEAN_RENDERED_MEMORY_CHARS) for _ in range(hits)]
+
+
+async def _measured_task(*, task_id: str, project_root: str) -> dict:
+    return {**_task_with_description('d' * _MEAN_RENDERED_DESCRIPTION_CHARS), 'id': task_id}
+
+
+_BUDGET_HOMES = {
+    'shipped_config_yaml': lambda shipped: shipped.reconciliation,
+    'schema_default': lambda _shipped: ReconciliationConfig(),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('budget_home', list(_BUDGET_HOMES.values()), ids=list(_BUDGET_HOMES))
+async def test_shipped_budget_holds_a_measured_backlog_chunk(
+    budget_home, mock_config, mock_memory, mock_taskmaster,
+):
+    """token_budget holds the median budget-bound chunk at the per-item caps.
+
+    Raising a per-item cap without the budget, or cutting the budget, narrows
+    every backlog chunk and fails here.
+    """
+    mock_memory.search = AsyncMock(side_effect=_measured_search)
+    mock_taskmaster.get_task = AsyncMock(side_effect=_measured_task)
+    assembler = _make_assembler(
+        memory_service=mock_memory, taskmaster=mock_taskmaster, config=budget_home(mock_config),
+    )
+
+    result = await assembler.assemble(_measured_backlog_chunk(), _make_watermark(), 'test-project')
+
+    assert len(result.events) == _MEASURED_CHUNK_EVENTS, (
+        f'only {len(result.events)} of {_MEASURED_CHUNK_EVENTS} measured events fit '
+        f'token_budget={result.token_budget}'
+    )
+    assert result.events_remaining == 0
+
+
 # ── _ctx_task_event subtask qualification ────────────────────────────
 
 
@@ -1055,7 +1100,7 @@ def _hint_task(*queries: str, task_id: str = '42') -> dict:
 
 
 async def _search_rows(journal) -> list[dict]:
-    rows = await journal.get_ops_since('1970-01-01T00:00:00+00:00', limit=500, kind='read')
+    rows = await journal.get_stored_ops_since('1970-01-01T00:00:00+00:00', limit=500, kind='read')
     return [r for r in rows if r['operation'] == 'search']
 
 
@@ -1308,3 +1353,117 @@ async def test_hint_journalling_does_not_lift_the_three_query_cap(
     assert [json.loads(r['params'])['query'] for r in rows] == ['q1', 'q2', 'q3'], (
         'Expected the first three hint queries only'
     )
+
+
+# ---------------------------------------------------------------------------
+# task 5370 (S8-24): a failed context fetch is recorded, not just emptied
+# ---------------------------------------------------------------------------
+
+
+class TestAFailedContextFetchIsRecorded:
+    """INV-11: an event whose context could not be fetched is not an event with none.
+
+    The payload still carries the event with empty context (degrade, never
+    drop), and names it in ``context_fetch_failures`` so the consumer can tell
+    "unknown" from "nothing related".
+    """
+
+    @staticmethod
+    def _task_event():
+        return _make_event(event_type=EventType.task_status_changed, payload={'task_id': '42'})
+
+    @pytest.mark.asyncio
+    async def test_a_raising_task_fetch_is_recorded_beside_a_healthy_event(
+        self, mock_memory, mock_taskmaster,
+    ):
+        mock_memory.search = AsyncMock(return_value=[_make_memory_result()])
+        mock_taskmaster.get_task = AsyncMock(side_effect=RuntimeError('taskmaster down'))
+        healthy = _make_event(payload={'content_preview': 'something'})
+        failing = self._task_event()
+        assembler = _make_assembler(memory_service=mock_memory, taskmaster=mock_taskmaster)
+
+        result = await assembler.assemble([healthy, failing], _make_watermark(), 'test-project')
+
+        [failure] = result.context_fetch_failures
+        assert isinstance(failure, ContextFetchFailure)
+        assert (failure.event_id, failure.event_type) == (failing.id, 'task_status_changed')
+        assert 'RuntimeError' in failure.error
+        assert [e.id for e in result.events] == [healthy.id, failing.id]
+        assert len(result.context_items) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_huge_error_body_is_clipped_before_it_reaches_the_prompt(
+        self, mock_memory, mock_taskmaster,
+    ):
+        mock_taskmaster.get_task = AsyncMock(
+            side_effect=RuntimeError('stderr: ' + 'x' * 50_000),
+        )
+        assembler = _make_assembler(memory_service=mock_memory, taskmaster=mock_taskmaster)
+
+        result = await assembler.assemble([self._task_event()], _make_watermark(), 'test-project')
+
+        [failure] = result.context_fetch_failures
+        assert failure.error.startswith('RuntimeError: stderr: ')
+        assert len(failure.error) < 500
+
+    @pytest.mark.asyncio
+    async def test_a_raising_memory_search_is_recorded(self, mock_memory):
+        mock_memory.search = AsyncMock(side_effect=RuntimeError('search failed'))
+        event = _make_event(payload={'content_preview': 'something'})
+        assembler = _make_assembler(memory_service=mock_memory)
+
+        result = await assembler.assemble([event], _make_watermark(), 'test-project')
+
+        [failure] = result.context_fetch_failures
+        assert (failure.event_id, failure.event_type) == (event.id, 'memory_added')
+
+    @pytest.mark.asyncio
+    async def test_every_event_of_an_all_failing_batch_is_recorded(self, mock_memory):
+        async def raising_fetch_context(event, project_id):
+            raise RuntimeError('per-event failure')
+
+        events = [_make_event(payload={'content_preview': f'event {i}'}) for i in range(3)]
+        assembler = _make_assembler(memory_service=mock_memory)
+
+        with patch.object(assembler, '_fetch_context', new=raising_fetch_context):
+            result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+        assert [f.event_id for f in result.context_fetch_failures] == [e.id for e in events]
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_assembly_records_nothing(self, mock_memory, mock_taskmaster):
+        mock_memory.search = AsyncMock(return_value=[_make_memory_result()])
+        events = [_make_event(payload={'content_preview': 'something'}), self._task_event()]
+        assembler = _make_assembler(memory_service=mock_memory, taskmaster=mock_taskmaster)
+
+        result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+        assert result.context_fetch_failures == ()
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_event_is_not_recorded(self, mock_memory, mock_taskmaster):
+        """Only an event in the chunk carries its failure; a deferred one is re-fetched later."""
+        mock_memory.search = AsyncMock(
+            return_value=[_make_memory_result(content='x' * 2000) for _ in range(5)],
+        )
+        mock_taskmaster.get_task = AsyncMock(side_effect=RuntimeError('taskmaster down'))
+        assembler = _make_assembler(
+            memory_service=mock_memory, taskmaster=mock_taskmaster,
+            config=_make_config(token_budget=1_500),
+        )
+        events = [_make_event(payload={'content_preview': 'something'}), self._task_event()]
+
+        result = await assembler.assemble(events, _make_watermark(), 'test-project')
+
+        assert result.events_remaining == 1, 'the failing event must have been deferred'
+        assert result.context_fetch_failures == ()
+
+    @pytest.mark.asyncio
+    async def test_an_event_type_with_no_handler_is_not_a_failure(self, mock_memory):
+        event = _make_event(event_type=EventType.deferral_restamped)
+        assembler = _make_assembler(memory_service=mock_memory)
+
+        result = await assembler.assemble([event], _make_watermark(), 'test-project')
+
+        assert [e.id for e in result.events] == [event.id]
+        assert result.context_fetch_failures == ()

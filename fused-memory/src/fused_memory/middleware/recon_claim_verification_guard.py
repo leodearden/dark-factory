@@ -7,8 +7,8 @@ verified against the live source tree + git history before they are
 embedded in a filed task's description as fact.
 
 Motivated by a Stage 2 reconciliation incident, but wired (via
-``TaskCurator._maybe_flag_unverified_claims``) into the curator's general
-``curate`` / ``curate_batch_prepared`` entry points — when
+``TaskCurator._maybe_flag_unverified_claims``) into the curator's one
+pipeline, ``curate_prepared`` — when
 ``CuratorConfig.recon_claim_verification_enabled`` is set, it runs over
 EVERY candidate the curator sees, not just Stage-2-recon-filed ones; there
 is no candidate-origin field to narrow it further (``CandidateTask``'s
