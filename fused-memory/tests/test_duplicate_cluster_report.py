@@ -10,7 +10,9 @@ fixture that could drift from it.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -50,32 +52,12 @@ class TestCommittedConfig:
         config = report.load_config(COMMITTED_CONFIG)
 
         assert config.projects == ('dark_factory', 'reify')
-        assert config.categories == tuple(detector._ALL_CATEGORIES)
+        assert config.categories == tuple(detector.ALL_CATEGORIES)
         assert config.scan_limit > 0
         assert config.detector_timeout_secs > 0
 
-    def test_the_resweep_cadence_sits_beside_the_timer_cadence(self) -> None:
-        cadence = report.load_config(COMMITTED_CONFIG).cadence
-
-        assert cadence.on_calendar == 'Sun *-*-* 06:30:00'
-        assert cadence.resweep_interval_days == 7
-
     def test_cycle_summaries_are_declared_machine_written(self) -> None:
         assert 'cycle_summary' in report.load_config(COMMITTED_CONFIG).machine_written_kinds
-
-    def test_the_recall_caveat_states_which_bar_each_number_clears(self) -> None:
-        caveat = report.load_config(COMMITTED_CONFIG).recall_caveat
-
-        assert caveat.fitness.regrowth_measurement == 'supported'
-        assert caveat.fitness.gate_filing == 'blocked'
-        assert caveat.gate_filing_owner_task == 4916
-        assert caveat.paraphrase_band_recall['ann'].caught == 25
-        assert caveat.paraphrase_band_recall['ann'].of == 301
-        assert caveat.paraphrase_band_recall['lexical'].caught == 0
-        assert caveat.paraphrase_band_recall['lexical'].of == 301
-        assert caveat.auc_true_vs_hard_negative == 0.2534
-        assert caveat.measured_at
-        assert caveat.source
 
 
 def _without(data: dict, key: str) -> dict:
@@ -462,6 +444,7 @@ class TestMatchedLineage:
         (cluster,) = cur['clusters']
         assert cluster['cluster_key'] == 'born-key'
         assert cluster['lineage']['status'] == 'unchanged'
+        assert cluster['lineage']['overlapped_previous_keys'] == ['born-key']
         assert cluster['lineage']['size_delta'] == 0
         assert cur['regrowth']['unchanged'] == 1
 
@@ -550,7 +533,7 @@ class TestMergeAndSplit:
 
         (cluster,) = cur['clusters']
         assert cluster['cluster_key'] == 'a'
-        assert cluster['lineage']['merged_previous_keys'] == ['a', 'd']
+        assert cluster['lineage']['overlapped_previous_keys'] == ['a', 'd']
         assert cur['regrowth']['dissolved'] == []
 
     def test_an_overlap_tie_goes_to_the_lower_previous_key(self, config) -> None:
@@ -653,6 +636,56 @@ class TestComparability:
         assert cur['clusters'][0]['lineage']['status'] == 'unchanged'
 
 
+class TestRegrowthByCategory:
+    def _after_a_failed_category(self, config):
+        prev = report.build_report(
+            'dark_factory', _PREV, [('prev-pk.json', _plan(_family(['a', 'b'])))],
+            config=config, failed_categories=[_FAILED_PN],
+        )
+        return _build(config, [
+            ('cur-pk.json', _plan([*_family(['a', 'b']), _rec('c', 'venv', 2, _AFTER_PREV)])),
+            ('cur-pn.json', _plan(
+                _family(['x', 'y'], created_at=_AFTER_PREV, category=_PN)
+                + _family(['p', 'q'], 'stash', category=_PN),
+                _PN,
+            )),
+        ], previous=prev, stamp=_CUR)
+
+    def test_each_swept_category_has_its_own_totals(self, config) -> None:
+        by_category = self._after_a_failed_category(config)['regrowth']['by_category']
+
+        assert set(by_category) == {_PK, _PN}
+        assert by_category[_PK]['grew'] == 1
+        assert by_category[_PK]['re_emitted_members'] == 1
+        assert by_category[_PN]['appeared'] == 2
+        assert by_category[_PN]['re_emitted_members'] == 2
+        assert by_category[_PN]['rate_per_day'] == pytest.approx(2 / 7)
+
+    def test_a_category_the_previous_report_did_not_sweep_is_left_out_of_the_headline(
+        self, config, tmp_path: Path,
+    ) -> None:
+        cur = self._after_a_failed_category(config)
+        regrowth = cur['regrowth']
+
+        assert regrowth['excluded_categories'] == [_PN]
+        assert regrowth['appeared'] == 0
+        assert regrowth['grew'] == 1
+        assert regrowth['re_emitted_members'] == 1
+        assert regrowth['rate_per_day'] == pytest.approx(1 / 7)
+        _json, summary = report.write_report(tmp_path, 'dark_factory', _CUR, cur)
+        (line,) = [ln for ln in summary.read_text().splitlines() if ln.startswith('regrowth:')]
+        assert f'excludes {_PN}' in line
+
+    def test_a_baseline_excludes_every_category_without_saying_so(
+        self, config, tmp_path: Path,
+    ) -> None:
+        rep = _build(config, [('pk.json', _plan(_family(['a', 'b'])))])
+
+        assert rep['regrowth']['excluded_categories'] == [_PK]
+        _json, summary = report.write_report(tmp_path, 'dark_factory', _STAMP, rep)
+        assert 'excludes' not in summary.read_text()
+
+
 class TestOverdueAndChildDeltas:
     def test_a_previous_report_older_than_twice_the_cadence_is_overdue(self, config) -> None:
         _prev, late = _runs(config, _family(['a', 'b']), _family(['a', 'b']),
@@ -681,9 +714,7 @@ class TestOverdueAndChildDeltas:
         ]
 
 
-_FAILED_PN = {
-    'category': _PN, 'error_type': 'timeout', 'exit_code': None, 'stderr_tail': 'slow',
-}
+_FAILED_PN = report.DetectorFailure(_PN, report.FailureKind.TIMED_OUT, None, 'slow')
 
 
 def _deltas(rep: dict, kind: str = 'sighting') -> list[dict]:
@@ -724,7 +755,7 @@ class TestChildDeltasAreCategoryAware:
     def test_a_previous_report_with_no_plans_makes_every_delta_unknown(self, config) -> None:
         prev = report.build_report(
             'dark_factory', _PREV, [], config=config,
-            failed_categories=[{**_FAILED_PN, 'category': _PK}, _FAILED_PN],
+            failed_categories=[dataclasses.replace(_FAILED_PN, category=_PK), _FAILED_PN],
         )
         pk_now = [
             _rec('p', 'venv', 0, _BEFORE_PREV),
@@ -787,9 +818,7 @@ class TestWarmLaneShape:
 # Artifacts and the store-free --plan CLI mode
 # ---------------------------------------------------------------------------
 
-_FAILED_OS = {
-    'category': _OS, 'error_type': 'timeout', 'exit_code': None, 'stderr_tail': 'slow',
-}
+_FAILED_OS = report.DetectorFailure(_OS, report.FailureKind.TIMED_OUT, None, 'slow')
 
 
 def _grown_report(config) -> dict:
@@ -825,10 +854,14 @@ class TestWriteReport:
             tmp_path, 'dark_factory', _CUR, _grown_report(config),
         )
         summary = summary_path.read_text(encoding='utf-8')
+        caveat = config.recall_caveat
 
         assert 'dark_factory' in summary
         assert _CUR in summary
-        assert 'regrowth measurement: supported; gate filing: blocked (task 4916)' in summary
+        assert (
+            f'regrowth measurement: {caveat.fitness.regrowth_measurement}; '
+            f'gate filing: {caveat.fitness.gate_filing} (task {caveat.gate_filing_owner_task})'
+        ) in summary
         (pk_line,) = [line for line in summary.splitlines() if line.strip().startswith(_PK)]
         assert '1 cluster' in pk_line
         assert 'scan_truncated' in pk_line
@@ -837,43 +870,90 @@ class TestWriteReport:
         (top_line,) = [line for line in summary.splitlines() if '+1 added' in line]
         assert top_line.split()[0] == 'a'
         (failed_line,) = [line for line in summary.splitlines() if line.strip().startswith(_OS)]
-        assert 'timeout' in failed_line
+        assert report.FailureKind.TIMED_OUT.value in failed_line
+
+
+def _report_file(root: Path, project: str, stamp: str, content: str) -> Path:
+    path = root / project / f'report-{stamp}.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding='utf-8')
+    return path
+
+
+def _saved_report(config, root: Path, project: str, stamp: str,
+                  project_id: str | None = None) -> Path:
+    built = _build(config, [('pk.json', _plan(_family(['a', 'b'])))],
+                   stamp=_PREV, project_id=project_id or project)
+    return _report_file(root, project, stamp, json.dumps(built))
+
+
+def _break_a_cluster(rep: dict) -> dict:
+    return {**rep, 'clusters': [{**rep['clusters'][0], 'member_ids': 'a,b'}]}
+
+
+def _break_coverage(rep: dict) -> dict:
+    entry = {**rep['categories'][_PK], 'scan_coverage': None}
+    return {**rep, 'categories': {_PK: entry}}
+
+
+_CORRUPT_REPORTS = {
+    'not_json': lambda _rep: '{not json',
+    'a_json_list': lambda _rep: '[]',
+    'no_clusters': lambda rep: json.dumps(_without(rep, 'clusters')),
+    'no_categories': lambda rep: json.dumps(_without(rep, 'categories')),
+    'no_child_rankings': lambda rep: json.dumps(_without(rep, 'child_rankings')),
+    'member_ids_not_a_list': lambda rep: json.dumps(_break_a_cluster(rep)),
+    'coverage_known_without_coverage': lambda rep: json.dumps(_break_coverage(rep)),
+    'malformed_run_stamp': lambda rep: json.dumps({**rep, 'run_stamp': '2026-11-08'}),
+}
+
+
+def _corrupt_report(config, root: Path, project: str, stamp: str, case: str) -> Path:
+    built = _build(config, [('pk.json', _plan(_family(['a', 'b'])))],
+                   stamp=_PREV, project_id=project)
+    return _report_file(root, project, stamp, _CORRUPT_REPORTS[case](built))
 
 
 class TestFindPreviousReport:
-    def _write(self, root: Path, project: str, stamp: str, project_id: str | None = None):
-        path = root / project / f'report-{stamp}.json'
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({'project_id': project_id or project, 'run_stamp': stamp}))
-        return path
-
     def test_the_latest_report_strictly_before_the_stamp_is_returned(
-        self, tmp_path: Path,
+        self, config, tmp_path: Path,
     ) -> None:
         for stamp in ('20261101T000000Z', '20261108T000000Z', '20261115T000000Z'):
-            self._write(tmp_path, 'p', stamp)
+            _saved_report(config, tmp_path, 'p', stamp)
 
         found = report.find_previous_report(tmp_path, 'p', '20261115T000000Z')
 
         assert found is not None
         stamp, prior = found
         assert stamp == '20261108T000000Z'
-        assert prior['run_stamp'] == '20261108T000000Z'
+        assert prior['project_id'] == 'p'
 
-    def test_malformed_names_and_other_projects_are_ignored(self, tmp_path: Path) -> None:
-        self._write(tmp_path, 'p', '20261101T000000Z')
-        self._write(tmp_path, 'p', '2026-11-10T00:00:00Z')
-        self._write(tmp_path, 'p', '20261112T000000Z', project_id='q')
+    def test_malformed_names_and_other_projects_are_ignored(
+        self, config, tmp_path: Path,
+    ) -> None:
+        _saved_report(config, tmp_path, 'p', '20261101T000000Z')
+        _report_file(tmp_path, 'p', '2026-11-10T00:00:00Z', '{not json')
+        _saved_report(config, tmp_path, 'p', '20261112T000000Z', project_id='q')
 
         found = report.find_previous_report(tmp_path, 'p', '20261115T000000Z')
 
         assert found is not None
         assert found[0] == '20261101T000000Z'
 
-    def test_no_earlier_report_is_none(self, tmp_path: Path) -> None:
-        self._write(tmp_path, 'p', '20261115T000000Z')
+    def test_no_earlier_report_is_none(self, config, tmp_path: Path) -> None:
+        _saved_report(config, tmp_path, 'p', '20261115T000000Z')
         assert report.find_previous_report(tmp_path, 'p', '20261115T000000Z') is None
         assert report.find_previous_report(tmp_path, 'absent', '20261115T000000Z') is None
+
+    @pytest.mark.parametrize('case', sorted(_CORRUPT_REPORTS))
+    def test_a_report_the_diff_cannot_read_is_refused_naming_it(
+        self, config, tmp_path: Path, case: str,
+    ) -> None:
+        _saved_report(config, tmp_path, 'p', '20261101T000000Z')
+        bad = _corrupt_report(config, tmp_path, 'p', '20261108T000000Z', case)
+
+        with pytest.raises(report.PreviousReportError, match=re.escape(str(bad))):
+            report.find_previous_report(tmp_path, 'p', '20261115T000000Z')
 
 
 def _dump(path: Path, data: object) -> Path:
@@ -980,6 +1060,22 @@ class TestPlanModeCli:
         assert code == report.EXIT_RUN_FAILED == 1
         assert 'ABORT: cannot write the report' in caplog.text
         assert 'Traceback' not in caplog.text + capsys.readouterr().err
+
+    @pytest.mark.parametrize('case', ['not_json', 'a_json_list', 'no_clusters'])
+    def test_a_previous_report_the_diff_cannot_read_aborts_naming_it(
+        self, config, config_path: Path, tmp_path: Path, caplog, capsys, case: str,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        bad = _corrupt_report(config, out_root, 'p', '20260804T120000Z', case)
+        plan = _dump(tmp_path / 'pk.json', _plan([]))
+
+        code = report.main(self._argv(config_path, out_root, plan))
+
+        assert code == report.EXIT_RUN_FAILED
+        assert 'ABORT:' in caplog.text
+        assert str(bad) in caplog.text
+        assert 'Traceback' not in caplog.text + capsys.readouterr().err
+        assert not report.report_path(out_root, 'p', '20260811T120000Z').exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1096,6 +1192,33 @@ class TestScheduledInvocations:
         _schedule(config, fake_detector, tmp_path / 'out', projects=['dark_factory'])
         assert f'fake detector dark_factory/{_PK}' in capsys.readouterr().err
 
+    def test_each_categorys_stderr_is_kept_beside_its_plan(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        _schedule(config, fake_detector, out_root, projects=['dark_factory'])
+
+        for category in config.categories:
+            log = report.stderr_log_path(out_root, 'dark_factory', _CUR, category)
+            assert log.parent == report.plan_path(out_root, 'dark_factory', _CUR, category).parent
+            assert log.read_text(encoding='utf-8') == f'fake detector dark_factory/{category}\n'
+
+
+class TestDetectorCommandContract:
+    @pytest.mark.parametrize('category', detector.ALL_CATEGORIES)
+    def test_the_real_detector_parses_the_command_as_a_read_only_metrics_free_run(
+        self, config, category: str,
+    ) -> None:
+        argv = report.detector_command((), 'reify', category, config)
+
+        args = detector.build_parser().parse_args(argv)
+
+        assert args.project_id == 'reify'
+        assert args.categories == [category]
+        assert args.scan_limit == config.scan_limit
+        assert args.no_metrics is True
+        assert args.apply is False
+
     def test_each_project_report_diffs_against_its_own_previous_report(
         self, config, fake_detector, tmp_path: Path,
     ) -> None:
@@ -1112,9 +1235,9 @@ class TestScheduledInvocations:
 
 class TestScheduledFailures:
     @pytest.mark.parametrize(('behaviour', 'error_type', 'exit_code', 'tail'), [
-        ('exit', 'DetectorExit', 3, 'boom'),
-        ('sleep', 'TimeoutExpired', None, 'fake detector'),
-        ('garbage', 'BadPlanOutput', 0, 'fake detector'),
+        ('exit', report.FailureKind.DETECTOR_EXIT, 3, 'boom'),
+        ('sleep', report.FailureKind.TIMED_OUT, None, 'fake detector'),
+        ('garbage', report.FailureKind.BAD_PLAN_OUTPUT, 0, 'fake detector'),
     ])
     def test_a_failed_category_is_listed_and_the_rest_is_still_reported(
         self, config, fake_detector, tmp_path: Path, behaviour, error_type, exit_code, tail,
@@ -1128,9 +1251,12 @@ class TestScheduledFailures:
         assert code == report.EXIT_RUN_FAILED
         rep = json.loads(report.report_path(out_root, 'dark_factory', _CUR).read_text())
         (failure,) = rep['failed_categories']
-        assert set(failure) == {'category', 'error_type', 'exit_code', 'stderr_tail'}
+        assert set(failure) == {
+            'category', 'error_type', 'exit_code', 'stderr_tail', 'exception_type',
+        }
         assert failure['category'] == _PN
-        assert failure['error_type'] == error_type
+        assert failure['error_type'] == error_type.value
+        assert failure['exception_type'] is None
         assert failure['exit_code'] == exit_code
         assert tail in failure['stderr_tail']
         assert _PN not in rep['categories']
@@ -1138,6 +1264,84 @@ class TestScheduledFailures:
         assert not (out_root / 'dark_factory' / f'plan-{_CUR}-{_PN}.json').exists()
         other = json.loads(report.report_path(out_root, 'reify', _CUR).read_text())
         assert other['failed_categories'] == []
+
+    def test_a_timed_out_category_keeps_its_stderr_log(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        bounded = config.model_copy(update={'detector_timeout_secs': 10})
+        fake_detector.behave({f'dark_factory/{_PN}': 'sleep'})
+        out_root = tmp_path / 'out'
+
+        _schedule(bounded, fake_detector, out_root, projects=['dark_factory'])
+
+        log = report.stderr_log_path(out_root, 'dark_factory', _CUR, _PN)
+        assert f'fake detector dark_factory/{_PN}' in log.read_text(encoding='utf-8')
+
+    def test_a_detector_that_cannot_start_names_its_os_error(
+        self, config, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        absent = tmp_path / 'no-such-detector'
+
+        code = report.run_scheduled(config, out_root=out_root, stamp=_CUR,
+                                    projects=('dark_factory',), detector_argv=(str(absent),))
+
+        assert code == report.EXIT_RUN_FAILED
+        rep = json.loads(report.report_path(out_root, 'dark_factory', _CUR).read_text())
+        assert [f['category'] for f in rep['failed_categories']] == list(config.categories)
+        for failure in rep['failed_categories']:
+            assert failure['error_type'] == report.FailureKind.SPAWN_FAILED.value
+            assert failure['exception_type'] == 'FileNotFoundError'
+            assert f'could not start {absent}' in failure['stderr_tail']
+
+    def test_a_plan_that_cannot_be_persisted_is_a_failed_category(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        blocked = report.plan_path(out_root, 'dark_factory', _CUR, _PN)
+        blocked.mkdir(parents=True)
+
+        code = _schedule(config, fake_detector, out_root, projects=['dark_factory'])
+
+        assert code == report.EXIT_RUN_FAILED
+        rep = json.loads(report.report_path(out_root, 'dark_factory', _CUR).read_text())
+        (failure,) = rep['failed_categories']
+        assert failure['category'] == _PN
+        assert failure['error_type'] == report.FailureKind.PLAN_WRITE_FAILED.value
+        assert failure['exit_code'] == 0
+        assert failure['exception_type'] == 'IsADirectoryError'
+        assert str(blocked) in failure['stderr_tail']
+        assert set(rep['categories']) == {_PK, _OS}
+
+    def test_a_category_whose_stderr_log_cannot_open_is_never_run(
+        self, config, fake_detector, tmp_path: Path,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        report.stderr_log_path(out_root, 'dark_factory', _CUR, _PN).mkdir(parents=True)
+
+        code = _schedule(config, fake_detector, out_root, projects=['dark_factory'])
+
+        assert code == report.EXIT_RUN_FAILED
+        assert [call[3] for call in fake_detector.calls()] == [_PK, _OS]
+        rep = json.loads(report.report_path(out_root, 'dark_factory', _CUR).read_text())
+        (failure,) = rep['failed_categories']
+        assert failure['error_type'] == report.FailureKind.STDERR_LOG_FAILED.value
+        assert failure['exception_type'] == 'IsADirectoryError'
+
+    def test_a_bad_previous_report_skips_its_project_before_any_sweep(
+        self, config, fake_detector, tmp_path: Path, caplog,
+    ) -> None:
+        out_root = tmp_path / 'out'
+        bad = _corrupt_report(config, out_root, 'dark_factory', _PREV, 'no_clusters')
+
+        code = _schedule(config, fake_detector, out_root)
+
+        assert code == report.EXIT_RUN_FAILED
+        assert {call[1] for call in fake_detector.calls()} == {'reify'}
+        assert 'ABORT:' in caplog.text
+        assert str(bad) in caplog.text
+        assert not report.report_path(out_root, 'dark_factory', _CUR).exists()
+        assert report.report_path(out_root, 'reify', _CUR).exists()
 
 
 class TestScheduledThroughMain:

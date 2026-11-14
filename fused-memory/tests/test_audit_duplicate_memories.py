@@ -47,7 +47,7 @@ _MAX_LEXICAL_RATIO_MEMBERS = _mod._MAX_LEXICAL_RATIO_MEMBERS
 partition_topic_carveout = _mod.partition_topic_carveout
 fetch_procedural_memories = _mod.fetch_procedural_memories
 fetch_memories = _mod.fetch_memories
-_ALL_CATEGORIES = _mod._ALL_CATEGORIES
+_ALL_CATEGORIES = _mod.ALL_CATEGORIES
 extract_liveness_snapshot_fact = _mod.extract_liveness_snapshot_fact
 _classify_liveness_snapshot = _mod._classify_liveness_snapshot
 liveness_snapshot_subject_task_ids = _mod.liveness_snapshot_subject_task_ids
@@ -73,7 +73,7 @@ _EVAL_ID = _mod._EVAL_ID
 _GLOBAL_SCOPE = _mod._GLOBAL_SCOPE
 emit_metrics_artifact = _mod.emit_metrics_artifact
 details_artifact_path = _mod.details_artifact_path
-_build_parser = _mod._build_parser
+_build_parser = _mod.build_parser
 _run = _mod._run
 
 

@@ -20,9 +20,10 @@ so a report can also be rebuilt from saved plan files (``--plan``) with no
 store access.
 
 Exit status: 0 when every report was written; 1 when a report could not be
-written or a previous report read, or a detector run failed (the report is
-still written, listing it under ``failed_categories``); 2 for bad input or
-config.
+written, a detector run failed (the report is still written, listing it under
+``failed_categories``), or a project's previous report could not be read as
+one (checked before that project is swept, which is then skipped); 2 for bad
+input or config.
 
 Usage
 -----
@@ -35,22 +36,33 @@ Usage
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import subprocess
 import sys
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from shared.cli_boundary import LoudArgumentParser, run_cli
 from shared.memory_eval_metrics import MetricSchemaError, run_stamp, stamp_datetime, validate_stamp
 from shared.safe_io import atomic_write_text
+
+from fused_memory.utils.created_at import parse_created_at
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / 'fused-memory' / 'config' / 'duplicate-audit.yaml'
@@ -60,9 +72,10 @@ _STDERR_TAIL_CHARS = 2000
 
 EXIT_OK = 0
 EXIT_RUN_FAILED = 1
-"""The run did not finish cleanly: a report could not be written, a previous
-report could not be read, or a detector run failed (that project's report is
-still written and lists it). Agrees with shared.cli_boundary.EXIT_STDOUT_FAILED."""
+"""The run did not finish cleanly: a report could not be written, a detector
+run failed (that project's report is still written and lists it), or a
+previous report could not be read (that project is not swept). Agrees with
+shared.cli_boundary.EXIT_STDOUT_FAILED."""
 EXIT_BAD_INPUT = 2
 """Bad invocation or declaration: a config error, a malformed --run-stamp, an
 unreadable or non-JSON --plan file, two plans for one category, --plan without
@@ -261,6 +274,42 @@ def _summed_retained_carveout(plans: Iterable[Plan]) -> dict[str, int]:
     return totals
 
 
+class FailureKind(Enum):
+    """Why a (project, category) detector run produced no plan."""
+
+    STDERR_LOG_FAILED = 'stderr_log_failed'
+    """Its stderr log could not be opened, so the detector was not run."""
+    SPAWN_FAILED = 'spawn_failed'
+    """The detector could not be started."""
+    TIMED_OUT = 'timed_out'
+    """It ran past ``detector_timeout_secs`` and was killed."""
+    DETECTOR_EXIT = 'detector_exit'
+    """It exited non-zero."""
+    BAD_PLAN_OUTPUT = 'bad_plan_output'
+    """It exited 0, but its stdout was not a JSON object."""
+    PLAN_WRITE_FAILED = 'plan_write_failed'
+    """Its plan could not be persisted."""
+
+
+@dataclass(frozen=True)
+class DetectorFailure:
+    """One (project, category) detector run that produced no plan."""
+
+    category: str
+    error_type: FailureKind
+    exit_code: int | None
+    stderr_tail: str
+    exception_type: str | None = None
+    """The class name of the OSError behind a log, spawn or plan-write failure."""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            'category': self.category, 'error_type': self.error_type.value,
+            'exit_code': self.exit_code, 'stderr_tail': self.stderr_tail,
+            'exception_type': self.exception_type,
+        }
+
+
 def build_report(
     project_id: str,
     stamp: str,
@@ -268,7 +317,7 @@ def build_report(
     *,
     config: DuplicateAuditConfig,
     previous: Mapping[str, Any] | None = None,
-    failed_categories: Sequence[Mapping[str, Any]] = (),
+    failed_categories: Sequence[DetectorFailure] = (),
 ) -> dict[str, Any]:
     """Assemble one project's report from its per-category detector plans.
 
@@ -296,7 +345,7 @@ def build_report(
         ],
         'retained_carveout': _summed_retained_carveout(bare_plans),
         'child_rankings': merge_child_counts(bare_plans),
-        'failed_categories': [dict(f) for f in failed_categories],
+        'failed_categories': [failure.as_dict() for failure in failed_categories],
     }
     return {**inventory, **diff_against_previous(inventory, previous, config=config)}
 
@@ -323,7 +372,8 @@ class MemberAge(Enum):
     RE_EMITTED = 're_emitted'
     """Created after the previous run: regrowth."""
     PREEXISTING = 'preexisting'
-    """Created before the previous run and newly detected: not regrowth."""
+    """Created before the previous run: not regrowth (newly detected, or moved
+    in from another cluster)."""
     UNKNOWN = 'unknown'
 
 
@@ -357,18 +407,23 @@ def _min_member_key(member_ids: Iterable[Any]) -> str:
 def _overlaps(
     current: Sequence[Mapping[str, Any]], previous: Sequence[Mapping[str, Any]],
 ) -> dict[int, list[tuple[int, str]]]:
-    """``{current index: [(overlap, previous key)]}``, within a category only, largest first."""
-    by_category: dict[Any, list[Mapping[str, Any]]] = {}
-    for cluster in previous:
-        by_category.setdefault(cluster['category'], []).append(cluster)
+    """``{current index: [(overlap, previous key)]}``, within a category only, largest first.
+
+    One pass over each side's members, through a (category, member) index of
+    the previous clusters holding it.
+    """
+    holders: dict[tuple[Any, Any], list[str]] = {}
+    for prior in previous:
+        for member in set(prior['member_ids']):
+            holders.setdefault((prior['category'], member), []).append(prior['cluster_key'])
     found: dict[int, list[tuple[int, str]]] = {}
     for index, cluster in enumerate(current):
-        members = set(cluster['member_ids'])
-        hits = [
-            (len(members & set(prior['member_ids'])), prior['cluster_key'])
-            for prior in by_category.get(cluster['category'], ())
-        ]
-        found[index] = sorted(((n, key) for n, key in hits if n), key=lambda t: (-t[0], t[1]))
+        hits = Counter(
+            key
+            for member in set(cluster['member_ids'])
+            for key in holders.get((cluster['category'], member), ())
+        )
+        found[index] = sorted(((n, key) for key, n in hits.items()), key=lambda t: (-t[0], t[1]))
     return found
 
 
@@ -469,16 +524,6 @@ def match_lineage(
     return lineages
 
 
-def _created_moment(created_at: Any) -> datetime | None:
-    if not isinstance(created_at, str) or not created_at:
-        return None
-    try:
-        moment = datetime.fromisoformat(created_at)
-    except ValueError:
-        return None
-    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
-
-
 def classify_added(
     added_ids: Iterable[Any],
     members: Sequence[Mapping[str, Any]] | None,
@@ -488,7 +533,7 @@ def classify_added(
     created = {m.get('id'): m.get('created_at') for m in members or ()}
     counts = dict.fromkeys((age.value for age in MemberAge), 0)
     for member_id in added_ids:
-        moment = _created_moment(created.get(member_id))
+        moment = parse_created_at(created.get(member_id))
         age = (MemberAge.UNKNOWN if moment is None else
                MemberAge.RE_EMITTED if moment > previous_stamp else MemberAge.PREEXISTING)
         counts[age.value] += 1
@@ -509,12 +554,11 @@ def _lineage_dict(
         classify_added(lineage.added_member_ids, cluster.get('members'), previous_stamp)
         if previous_stamp is not None else dict.fromkeys((a.value for a in MemberAge), 0)
     )
-    overlapped = list(lineage.overlapped_previous_keys)
     return {
         'status': lineage.status.value,
         'previous_key': lineage.previous_key,
         'split_from': lineage.split_from,
-        'merged_previous_keys': overlapped if len(overlapped) > 1 else [],
+        'overlapped_previous_keys': list(lineage.overlapped_previous_keys),
         'added_member_ids': list(lineage.added_member_ids),
         'departed_member_ids': list(lineage.departed_member_ids),
         'size_delta': lineage.size_delta,
@@ -622,7 +666,12 @@ def diff_against_previous(
     *,
     config: DuplicateAuditConfig,
 ) -> dict[str, Any]:
-    """The report keys the diff adds or extends: clusters, categories, child_rankings, regrowth."""
+    """The report keys the diff adds or extends: clusters, categories, child_rankings, regrowth.
+
+    ``regrowth`` totals each category under ``by_category``. Its headline
+    totals leave out ``excluded_categories``: those the previous report did
+    not sweep, whose every cluster would otherwise count as new.
+    """
     stamp = inventory['run_stamp']
     previous_stamp = stamp_datetime(previous['run_stamp']) if previous is not None else None
     elapsed_days = (
@@ -637,14 +686,20 @@ def diff_against_previous(
         for cluster, lineage in zip(inventory['clusters'], lineages, strict=True)
     ]
     previous_categories = previous['categories'] if previous is not None else {}
+    categories = {
+        name: {**entry, 'incomparable_reasons': category_comparability(
+            entry, previous_categories.get(name),
+        )}
+        for name, entry in inventory['categories'].items()
+    }
+    unswept_before = sorted(
+        name for name, entry in categories.items()
+        if Incomparable.PREVIOUS_MISSING_CATEGORY.value in entry['incomparable_reasons']
+    )
+    headline_categories = set(categories) - set(unswept_before)
     return {
         'clusters': clusters,
-        'categories': {
-            name: {**entry, 'incomparable_reasons': category_comparability(
-                entry, previous_categories.get(name),
-            )}
-            for name, entry in inventory['categories'].items()
-        },
+        'categories': categories,
         'child_rankings': child_deltas(inventory['child_rankings'], previous),
         'regrowth': {
             'previous_run_stamp': previous['run_stamp'] if previous is not None else None,
@@ -654,7 +709,14 @@ def diff_against_previous(
                 if elapsed_days is not None else None
             ),
             'dissolved': _dissolved(lineages, previous_clusters or (), inventory['categories']),
-            **_regrowth_totals(clusters, elapsed_days),
+            'by_category': {
+                name: _regrowth_totals([c for c in clusters if c['category'] == name], elapsed_days)
+                for name in categories
+            },
+            'excluded_categories': unswept_before,
+            **_regrowth_totals(
+                [c for c in clusters if c['category'] in headline_categories], elapsed_days,
+            ),
         },
     }
 
@@ -680,6 +742,10 @@ def plan_path(out_root: Path, project_id: str, stamp: str, category: str) -> Pat
     return Path(out_root) / project_id / f'plan-{stamp}-{category}.json'
 
 
+def stderr_log_path(out_root: Path, project_id: str, stamp: str, category: str) -> Path:
+    return Path(out_root) / project_id / f'plan-{stamp}-{category}.stderr.log'
+
+
 def _fitness_line(caveat: Mapping[str, Any]) -> str:
     fitness = caveat['fitness']
     return (
@@ -699,11 +765,16 @@ def _previous_line(regrowth: Mapping[str, Any]) -> str:
 def _regrowth_line(regrowth: Mapping[str, Any]) -> str:
     rate = regrowth['rate_per_day']
     per_day = f'{rate:.3f}/day' if rate is not None else 'no rate'
+    excluded = regrowth['excluded_categories']
+    exclusion = (
+        f"; excludes {', '.join(excluded)} (not swept by the previous report)"
+        if excluded and regrowth['previous_run_stamp'] is not None else ''
+    )
     return (
         f"regrowth: appeared {regrowth['appeared']}, grew {regrowth['grew']}, "
         f"shrank {regrowth['shrank']}, unchanged {regrowth['unchanged']}, "
         f"split {regrowth['split']}, dissolved {len(regrowth['dissolved'])}; "
-        f"re-emitted members {regrowth['re_emitted_members']} ({per_day})"
+        f"re-emitted members {regrowth['re_emitted_members']} ({per_day}){exclusion}"
     )
 
 
@@ -773,23 +844,101 @@ def _report_stamp(path: Path) -> str | None:
         return None
 
 
+class PreviousReportError(ValueError):
+    """The project's previous report exists but is not a report the diff can read."""
+
+
+class _PriorShape(BaseModel):
+    model_config = ConfigDict(extra='allow', strict=True)
+
+
+class _PriorCluster(_PriorShape):
+    cluster_key: str
+    category: str | None
+    member_ids: list[str | int]
+
+
+class _PriorCategory(_PriorShape):
+    scan_coverage: dict[str, Any] | None
+    coverage_known: bool
+    lexical_threshold: float | None
+    ann_cutoff: float | None
+    child_counts_known: bool
+
+    @model_validator(mode='after')
+    def _coverage_is_known_exactly_when_recorded(self) -> _PriorCategory:
+        if self.coverage_known != (self.scan_coverage is not None):
+            raise ValueError('coverage_known disagrees with scan_coverage')
+        return self
+
+
+class _PriorChildRow(_PriorShape):
+    parent_id: str | int
+    category: str | None
+    count: int
+
+
+class _PriorReport(_PriorShape):
+    """The part of a previous report that ``diff_against_previous`` reads."""
+
+    project_id: str
+    run_stamp: str
+    clusters: list[_PriorCluster]
+    categories: dict[str, _PriorCategory]
+    child_rankings: dict[str, list[_PriorChildRow]]
+
+    @field_validator('run_stamp')
+    @classmethod
+    def _a_run_stamp(cls, value: str) -> str:
+        return validate_stamp(value, what='run_stamp')
+
+
+def _read_report(path: Path) -> dict[str, Any]:
+    try:
+        prior = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        raise PreviousReportError(f'cannot read {path}: {exc}') from exc
+    if not isinstance(prior, dict):
+        raise PreviousReportError(f'{path} is not a JSON object')
+    return prior
+
+
 def find_previous_report(
     out_root: Path, project_id: str, before_stamp: str,
 ) -> tuple[str, dict[str, Any]] | None:
-    """The project's latest report stamped strictly before *before_stamp*, or None."""
+    """The project's latest report stamped strictly before *before_stamp*, or None.
+
+    Raises PreviousReportError, naming the file, when that report cannot be
+    read or lacks the shape the diff reads, so a bad history stops before a
+    sweep rather than after it.
+    """
     directory = Path(out_root) / project_id
     if not directory.is_dir():
         return None
-    stamped = (
-        (stamp, path)
-        for path in directory.glob(f'{_REPORT_PREFIX}*{_REPORT_SUFFIX}')
-        if (stamp := _report_stamp(path)) is not None and stamp < before_stamp
-    )
-    for stamp, path in sorted(stamped, reverse=True):
-        prior = json.loads(path.read_text(encoding='utf-8'))
+    try:
+        stamped = sorted(
+            ((stamp, path)
+             for path in directory.glob(f'{_REPORT_PREFIX}*{_REPORT_SUFFIX}')
+             if (stamp := _report_stamp(path)) is not None and stamp < before_stamp),
+            reverse=True,
+        )
+    except OSError as exc:
+        raise PreviousReportError(f'cannot list {directory}: {exc}') from exc
+    for stamp, path in stamped:
+        prior = _read_report(path)
         if prior.get('project_id') == project_id:
+            try:
+                _PriorReport.model_validate(prior)
+            except ValidationError as exc:
+                raise PreviousReportError(f'{path} is not a report the diff can read: {exc}') from exc
             return stamp, prior
     return None
+
+
+def _previous_report(out_root: Path, project_id: str, before_stamp: str) -> dict[str, Any] | None:
+    """``find_previous_report``'s report alone."""
+    found = find_previous_report(out_root, project_id, before_stamp)
+    return found[1] if found is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -798,10 +947,6 @@ def find_previous_report(
 
 class PlanInputError(ValueError):
     """A --plan file could not be read as a JSON plan object."""
-
-
-class PreviousReportError(RuntimeError):
-    """The project's previous report exists but could not be read."""
 
 
 def _load_plans(paths: Sequence[str]) -> list[LabelledPlan]:
@@ -815,20 +960,6 @@ def _load_plans(paths: Sequence[str]) -> list[LabelledPlan]:
             raise PlanInputError(f'plan {path} is not a JSON object')
         plans.append((str(path), plan))
     return plans
-
-
-def _report_for(
-    project_id: str, stamp: str, plans: Sequence[LabelledPlan], *, config: DuplicateAuditConfig,
-    out_root: Path, failed: Sequence[Mapping[str, Any]] = (),
-) -> dict[str, Any]:
-    try:
-        previous = find_previous_report(out_root, project_id, stamp)
-    except (OSError, ValueError) as exc:
-        raise PreviousReportError(f'cannot read the previous report for {project_id}: {exc}') from exc
-    return build_report(
-        project_id, stamp, plans, config=config,
-        previous=previous[1] if previous is not None else None, failed_categories=failed,
-    )
 
 
 def _publish(out_root: Path, project_id: str, stamp: str, report: Mapping[str, Any]) -> int:
@@ -845,50 +976,23 @@ def _publish(out_root: Path, project_id: str, stamp: str, report: Mapping[str, A
     return EXIT_OK
 
 
-def _run_plan_mode(args: Any, config: DuplicateAuditConfig, stamp: str) -> int:
+def _run_plan_mode(args: argparse.Namespace, config: DuplicateAuditConfig, stamp: str) -> int:
     if not args.project_id:
         logger.error('--plan needs --project-id: a report belongs to one project')
         return EXIT_BAD_INPUT
     try:
-        plans = _load_plans(args.plan)
-        built = _report_for(args.project_id, stamp, plans, config=config, out_root=args.out_root)
-    except (PlanInputError, DuplicatePlanCategoryError) as exc:
-        logger.error('%s', exc)
-        return EXIT_BAD_INPUT
+        previous = _previous_report(args.out_root, args.project_id, stamp)
     except PreviousReportError as exc:
         logger.error('ABORT: %s', exc)
         return EXIT_RUN_FAILED
+    try:
+        built = build_report(
+            args.project_id, stamp, _load_plans(args.plan), config=config, previous=previous,
+        )
+    except (PlanInputError, DuplicatePlanCategoryError) as exc:
+        logger.error('%s', exc)
+        return EXIT_BAD_INPUT
     return _publish(args.out_root, args.project_id, stamp, built)
-
-
-@dataclass(frozen=True)
-class DetectorFailure:
-    """One (project, category) detector run that produced no plan."""
-
-    category: str
-    error_type: str
-    exit_code: int | None
-    stderr_tail: str
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            'category': self.category, 'error_type': self.error_type,
-            'exit_code': self.exit_code, 'stderr_tail': self.stderr_tail,
-        }
-
-
-def _text(stream: str | bytes | None) -> str:
-    if isinstance(stream, bytes):
-        return stream.decode('utf-8', 'replace')
-    return stream or ''
-
-
-def _relay(stderr: str | bytes | None) -> None:
-    """Pass the detector's stderr through, so it lands in this unit's journal."""
-    text = _text(stderr)
-    if text:
-        sys.stderr.write(text)
-        sys.stderr.flush()
 
 
 def detector_command(
@@ -901,6 +1005,26 @@ def detector_command(
     ]
 
 
+def _relay_log(log_path: Path) -> str:
+    """Pass the finished run's stderr log on to this unit's journal; return its tail."""
+    try:
+        text = log_path.read_text(encoding='utf-8', errors='replace')
+    except OSError as exc:
+        return f'cannot read the stderr log {log_path}: {exc}'
+    if text:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+    return text[-_STDERR_TAIL_CHARS:].strip()
+
+
+def _json_object(text: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def run_detector(
     project_id: str,
     category: str,
@@ -908,41 +1032,49 @@ def run_detector(
     config: DuplicateAuditConfig,
     detector_argv: Sequence[str],
     out_path: Path,
-) -> DetectorFailure | None:
-    """Run the detector for one category and persist its stdout plan at *out_path*.
+    log_path: Path,
+) -> dict[str, Any] | DetectorFailure:
+    """Run the detector for one category: its plan, persisted at *out_path*, or why there is none.
 
-    None when the plan landed. The failure arms follow
-    ``fused-memory/scripts/memory_eval_runner.py::run_producer``.
+    The detector's stderr streams into *log_path* as it is written, so a run
+    stopped mid-category keeps what it had logged; a finished run's log is
+    then relayed to the journal.
     """
-    def failure(error_type: str, stderr: str | bytes | None, exit_code: int | None) -> DetectorFailure:
-        tail = _text(stderr)[-_STDERR_TAIL_CHARS:].strip()
-        return DetectorFailure(category, error_type, exit_code, tail)
+    def failed(kind: FailureKind, tail: str, exit_code: int | None = None,
+               exc: OSError | None = None) -> DetectorFailure:
+        return DetectorFailure(category, kind, exit_code, tail,
+                               type(exc).__name__ if exc is not None else None)
 
     argv = detector_command(detector_argv, project_id, category, config)
     try:
-        completed = subprocess.run(
-            argv, cwd=REPO_ROOT, capture_output=True, text=True,
-            timeout=config.detector_timeout_secs, check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        _relay(exc.stderr)
-        return failure('TimeoutExpired', exc.stderr, None)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log = log_path.open('w', encoding='utf-8')
     except OSError as exc:
-        return failure(type(exc).__name__, f'could not start {argv[0]}: {exc}', None)
-    _relay(completed.stderr)
+        return failed(FailureKind.STDERR_LOG_FAILED, f'cannot open {log_path}: {exc}', exc=exc)
+    with log:
+        try:
+            completed = subprocess.run(
+                argv, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=log, text=True,
+                timeout=config.detector_timeout_secs, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            completed = None
+        except OSError as exc:
+            return failed(FailureKind.SPAWN_FAILED, f'could not start {argv[0]}: {exc}', exc=exc)
+    tail = _relay_log(log_path)
+    if completed is None:
+        return failed(FailureKind.TIMED_OUT, tail)
     if completed.returncode != 0:
-        return failure('DetectorExit', completed.stderr, completed.returncode)
-    try:
-        parsed = json.loads(completed.stdout)
-    except ValueError:
-        parsed = None
-    if not isinstance(parsed, dict):
-        return failure('BadPlanOutput', completed.stderr, completed.returncode)
+        return failed(FailureKind.DETECTOR_EXIT, tail, completed.returncode)
+    plan = _json_object(completed.stdout)
+    if plan is None:
+        return failed(FailureKind.BAD_PLAN_OUTPUT, tail, completed.returncode)
     try:
         atomic_write_text(out_path, completed.stdout, mkdir=True)
     except OSError as exc:
-        return failure('PlanWriteFailed', str(exc), completed.returncode)
-    return None
+        return failed(FailureKind.PLAN_WRITE_FAILED, f'cannot write {out_path}: {exc}',
+                      completed.returncode, exc)
+    return plan
 
 
 def _project_plans(
@@ -953,18 +1085,16 @@ def _project_plans(
     failures: list[DetectorFailure] = []
     for category in config.categories:
         out_path = plan_path(out_root, project_id, stamp, category)
-        failure = run_detector(
-            project_id, category, config=config, detector_argv=detector_argv, out_path=out_path,
+        outcome = run_detector(
+            project_id, category, config=config, detector_argv=detector_argv,
+            out_path=out_path, log_path=stderr_log_path(out_root, project_id, stamp, category),
         )
-        if failure is None:
-            try:
-                plans.extend(_load_plans([str(out_path)]))
-                continue
-            except PlanInputError as exc:
-                failure = DetectorFailure(category, 'PlanReadFailed', 0, str(exc))
-        logger.error('detector run failed for %s/%s: %s (exit %s)',
-                     project_id, category, failure.error_type, failure.exit_code)
-        failures.append(failure)
+        if isinstance(outcome, DetectorFailure):
+            logger.error('detector run failed for %s/%s: %s (exit %s)',
+                         project_id, category, outcome.error_type.value, outcome.exit_code)
+            failures.append(outcome)
+        else:
+            plans.append((str(out_path), outcome))
     return plans, failures
 
 
@@ -979,20 +1109,23 @@ def run_scheduled(
     """Sweep each project category by category, then write its report.
 
     Sequential by design: one detector run is the whole Qdrant load. A failed
-    category is reported, never fatal to the others.
+    category is reported, never fatal to the others. A project whose previous
+    report cannot be read is not swept at all, and never stops the projects
+    after it.
     """
     worst = EXIT_OK
     for project_id in projects:
+        try:
+            previous = _previous_report(out_root, project_id, stamp)
+        except PreviousReportError as exc:
+            logger.error('ABORT: %s; %s was not swept', exc, project_id)
+            worst = EXIT_RUN_FAILED
+            continue
         plans, failures = _project_plans(
             project_id, stamp, config=config, out_root=out_root, detector_argv=detector_argv,
         )
-        try:
-            built = _report_for(project_id, stamp, plans, config=config, out_root=out_root,
-                                failed=[f.as_dict() for f in failures])
-        except PreviousReportError as exc:
-            logger.error('ABORT: %s', exc)
-            worst = EXIT_RUN_FAILED
-            continue
+        built = build_report(project_id, stamp, plans, config=config, previous=previous,
+                             failed_categories=failures)
         published = _publish(out_root, project_id, stamp, built)
         worst = max(worst, published, EXIT_RUN_FAILED if failures else EXIT_OK)
     return worst

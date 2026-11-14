@@ -7,7 +7,7 @@ projects:
   - dark_factory
   - reify
 
-# The detector's own Mem0 categories (audit_duplicate_memories.py::_ALL_CATEGORIES).
+# The detector's own Mem0 categories (audit_duplicate_memories.py::ALL_CATEGORIES).
 categories:
   - procedural_knowledge
   - preferences_and_norms

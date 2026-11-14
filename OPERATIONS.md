@@ -4237,6 +4237,10 @@ checkout that ran the job:
 
 - `plan-<STAMP>-<category>.json`: the detector's stdout plan for one
   category, verbatim;
+- `plan-<STAMP>-<category>.stderr.log`: that category's detector stderr,
+  written as the detector runs and kept for a failed category too. `tail -f`
+  it to follow a run in progress: the journal gets a category's stderr only
+  once that category finishes;
 - `report-<STAMP>.json`: the cluster inventory, child rankings, scan
   coverage, the regrowth diff and `failed_categories`;
 - `summary-<STAMP>.txt`: the readable digest, which is also printed to the
@@ -4255,10 +4259,16 @@ status: `baseline`, `new`, `unchanged`, `grew`, `shrank` or `split`. A key is
 inherited by member overlap within one category. Members a cluster gained
 are split by `created_at` against the previous run stamp. `re_emitted`
 members were written since that run, and that is the regrowth. `preexisting`
-members are older and newly detected, which is not regrowth. `unknown`
-members have no `created_at`. `rate_per_day` is re-emitted members per
-elapsed day. `regrowth.previous_overdue` is true when the previous report is
-more than twice `cadence.resweep_interval_days` old.
+members are older: newly detected, or moved in from another cluster. That is
+not regrowth. `unknown` members have no `created_at`. A naive `created_at` is
+read as UTC. `rate_per_day` is re-emitted members per elapsed day.
+`regrowth.previous_overdue` is true when the previous report is more than
+twice `cadence.resweep_interval_days` old.
+
+`regrowth.by_category` gives each category its own totals. The headline
+totals leave out `regrowth.excluded_categories`, the categories the previous
+report did not sweep. Every cluster there would otherwise count as `new`, for
+example in the week after that category's detector run failed.
 
 Each entry in the report's `categories` carries `incomparable_reasons`. An
 empty list means this run and the previous one compare like with like for
@@ -4286,11 +4296,17 @@ category ties it to that category's `incomparable_reasons`.
 **Exit status.**
 
 - 0: every report was written, and every detector run succeeded.
-- 1: a partial report or a failed write. A detector run exited non-zero,
-  timed out or printed non-JSON: the report is still written, and it lists
-  that category under `failed_categories` with a stderr tail. Exit 1 also
-  covers a report that could not be written and a previous report that could
-  not be read.
+- 1: a partial report or a failed write. A detector run could not start,
+  exited non-zero, timed out, printed non-JSON, or its stderr log or plan
+  could not be written. The report is still written, and it lists that
+  category under `failed_categories` with a stderr tail. Its `error_type` is
+  one of `stderr_log_failed`, `spawn_failed`, `timed_out`, `detector_exit`,
+  `bad_plan_output` or `plan_write_failed`, and `exception_type` names the OS
+  error behind a log, spawn or plan-write failure. Exit 1 also covers a
+  report that could not be written. It also covers a previous report that
+  cannot be read as a report: that is checked before the project's sweep, so
+  that project is skipped with an `ABORT:` line naming the file, and the
+  other projects still run.
 - 2: bad input or config, such as an invalid `duplicate-audit.yaml`, a
   malformed `--run-stamp`, an unconfigured `--project-id`, or a `--plan`
   file that is missing or not JSON.

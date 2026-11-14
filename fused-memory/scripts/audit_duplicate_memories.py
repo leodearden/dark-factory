@@ -197,7 +197,6 @@ import re
 import sys
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -233,6 +232,7 @@ from fused_memory.reconciliation.task_filter import (
     # record's own key — rather than trusting the widened splitter alone.
     WIDE_CLAUSE_BOUNDARY_RE,
 )
+from fused_memory.utils.created_at import parse_created_at
 from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('audit_duplicate_memories')
@@ -859,7 +859,7 @@ def liveness_snapshot_subject_facts(
 # categories (entities_and_relations, temporal_facts, decisions_and_rationale)
 # are deliberately absent: this detector reads the Mem0/Qdrant collection, and
 # a Graphiti edge has no vector here to cluster on.
-_ALL_CATEGORIES: tuple[str, ...] = (
+ALL_CATEGORIES: tuple[str, ...] = (
     'procedural_knowledge',
     'preferences_and_norms',
     'observations_and_summaries',
@@ -894,7 +894,7 @@ _LIVENESS_DISCLOSURE_KEYS: tuple[str, ...] = (
 def find_liveness_snapshot_recurrences(
     memories: list[dict],
     *,
-    categories: Iterable[str] = _ALL_CATEGORIES,
+    categories: Iterable[str] = ALL_CATEGORIES,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Group point-in-time liveness snapshots that re-assert one core FACT.
 
@@ -1285,14 +1285,11 @@ def _created_at_sort_key(created_at: Any) -> tuple[int, float]:
     Returns ``(0, timestamp)`` for a parseable ISO datetime string (so the
     oldest instant sorts first), or ``(1, 0.0)`` for ``None``/unparseable
     values — always after every parseable entry, so a record with no usable
-    timestamp is never mistakenly picked as "the oldest".
+    timestamp is never mistakenly picked as "the oldest". The parse is
+    ``fused_memory.utils.created_at.parse_created_at``'s.
     """
-    if not isinstance(created_at, str) or not created_at:
-        return (1, 0.0)
-    try:
-        return (0, datetime.fromisoformat(created_at).timestamp())
-    except (ValueError, TypeError):
-        return (1, 0.0)
+    moment = parse_created_at(created_at)
+    return (1, 0.0) if moment is None else (0, moment.timestamp())
 
 
 def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
@@ -1710,7 +1707,7 @@ def build_sweep_plan(
     memories: list[dict],
     threshold: float = 0.85,
     *,
-    categories: Iterable[str] = _ALL_CATEGORIES,
+    categories: Iterable[str] = ALL_CATEGORIES,
     ann_pairs: Iterable[tuple[int, int]] | None = None,
     ann_scores: dict[tuple[int, int], float] | None = None,
     ann_disclosure: dict[str, int] | None = None,
@@ -2534,7 +2531,7 @@ async def fetch_memories(
     memory: Any,
     project_id: str,
     *,
-    categories: Iterable[str] = _ALL_CATEGORIES,
+    categories: Iterable[str] = ALL_CATEGORIES,
     scan_limit: int = 5000,
     with_vectors: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
@@ -2759,7 +2756,7 @@ def categories_without_own_cutoff(
 def resolve_ann_threshold(
     memory_service: Any,
     override: float | None = None,
-    categories: Iterable[str] = _ALL_CATEGORIES,
+    categories: Iterable[str] = ALL_CATEGORIES,
     *,
     project_id: str | None = None,
 ) -> tuple[dict[str, float], dict[str, int]]:
@@ -2802,7 +2799,7 @@ def resolve_ann_threshold(
             including over an uncalibrated config.
         categories: The categories actually being swept. Nothing is resolved
             for a category that was not asked for. Defaults to
-            ``_ALL_CATEGORIES``, matching :func:`build_sweep_plan`'s default
+            ``ALL_CATEGORIES``, matching :func:`build_sweep_plan`'s default
             for the same argument — an empty DEFAULT would have silently
             disabled the whole ANN path for an omitting caller, with a
             zero-filled disclosure and no ERROR, which is precisely the
@@ -3400,7 +3397,7 @@ never set here — see :func:`resolve_ann_threshold`.
 """
 
 
-def _build_parser() -> LoudArgumentParser:
+def build_parser() -> LoudArgumentParser:
     """The CLI surface. Every flag added after the first release is optional.
 
     ``--project-id X`` and ``--project-id X --apply`` — the invocation task
@@ -3430,9 +3427,9 @@ def _build_parser() -> LoudArgumentParser:
         help='Path to fused-memory config file (sets CONFIG_PATH env var)',
     )
     parser.add_argument(
-        '--categories', nargs='+', default=list(_ALL_CATEGORIES),
-        choices=list(_ALL_CATEGORIES),
-        help=f'Mem0 categories to sweep (default: {" ".join(_ALL_CATEGORIES)}). '
+        '--categories', nargs='+', default=list(ALL_CATEGORIES),
+        choices=list(ALL_CATEGORIES),
+        help=f'Mem0 categories to sweep (default: {" ".join(ALL_CATEGORIES)}). '
              'Only Mem0-backed categories are accepted; a Graphiti-backed or '
              'unknown name is rejected at parse time rather than silently '
              'scrolling an empty corpus and reporting a clean sweep.',
@@ -3462,8 +3459,12 @@ def _build_parser() -> LoudArgumentParser:
     return parser
 
 
+# fused-memory/tests/test_memory_eval_runner.py::_PRODUCER_CLI names the parser privately.
+_build_parser = build_parser
+
+
 def main() -> int:
-    args = _build_parser().parse_args()
+    args = build_parser().parse_args()
     return asyncio.run(_run(args))
 
 
