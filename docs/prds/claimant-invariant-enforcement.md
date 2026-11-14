@@ -532,6 +532,29 @@ reports every violating row through `--dry-run` / `--json`, so an operator can o
 on demand today. The recurring, unattended alarm is deferred to the detection PRD, which owns the
 invocation model, the discriminator, the closer analysis, and the re-arm control.
 
+*C4-E7 amended 2026-11-14 (task 4897; `docs/prds/claimant-invariant-detection.md` D-4, E-5) — how
+"loudly and structurally" is delivered.*
+
+- **No unattended alarm, deliberately.** The loudness downgrade is a contract decision Leo ratified
+  on 2026-08-24 (detection PRD D-4). It is recorded here as ratified, not re-argued.
+- **Delivery mechanisms.**
+  - (i) The denominated dashboard gauge, `GET /api/v2/dashboard/invariants`
+    (`dashboard/src/dashboard/api/invariants.py::api_invariants`; d1, task 4670). Each per-root
+    record carries `rows_scanned`, `measured_at` and `status` `ok|blind`, and a blind root never
+    reads as zero. Its chip renders in the dashboard's Tasks tab.
+  - (ii) The C4-E2 ledger (d3; see C4-E2's 2026-11-14 amendment), plus the
+    `claimant_stamped_on_terminal` ERROR tripwire in `SqliteTaskBackend.set_task_claimant`
+    (d4, task 4674).
+  - (iii) The ζ census on demand, `scripts/clear_leaked_claimants.py` (task 4625).
+  - (iv) The watcher-rotation consumption step in both watcher skills' Main Loop (d2, landed via
+    task 4894), whose single statement is `skills/_shared/reading-the-invariants-gauge.md`.
+- **Named re-arm trigger.** Any post-ζ observation of a nonzero *unledgered* terminal tier — via
+  gauge, census or watcher rotation — mandates building the escalation-grade alarm ε.2. The
+  observer files it at observation time.
+- **ε.2's shape is pre-chosen** in detection PRD D-7: a deterministic-task record class, a
+  deny-listed category, `root_cause` dedup, and resolution on positive evidence only.
+- **Never alarmable:** hygiene-tier rows and ledgered rows.
+
 ## Boundary-test sketch (B+H)
 
 Facing both the producer (interceptor) and consumer (reader) sides of the seam.
