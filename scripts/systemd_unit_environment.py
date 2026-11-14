@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import enum
+import errno
 import json
 import subprocess
 import sys
@@ -19,6 +20,8 @@ from pathlib import Path
 from typing import Generic, TypeVar
 
 EXIT_OK = 0
+# 3: reserved for "nothing was read" (systemd unanswered).
+EXIT_LIVE_UNREADABLE = 4
 
 _DESTINATION = 'org.freedesktop.systemd1'
 _MANAGER_PATH = '/org/freedesktop/systemd1'
@@ -131,9 +134,13 @@ def parse_assignments(entries: Iterable[str]) -> dict[str, str]:
     return assignments
 
 
+def _environ_path(pid: int, proc_root: Path) -> Path:
+    return proc_root / str(pid) / 'environ'
+
+
 def read_process_environ(pid: int, *, proc_root: Path = _DEFAULT_PROC_ROOT) -> dict[str, str]:
     """The environment process *pid* was exec'd with."""
-    raw = (proc_root / str(pid) / 'environ').read_bytes()
+    raw = _environ_path(pid, proc_root).read_bytes()
     return parse_assignments(
         entry.decode(errors='surrogateescape') for entry in raw.split(b'\0') if entry
     )
@@ -143,6 +150,7 @@ class Verdict(enum.Enum):
     MATCHES = enum.auto()
     DRIFTED = enum.auto()
     NOT_RUNNING = enum.auto()
+    UNREADABLE = enum.auto()
     INDETERMINATE = enum.auto()
 
 
@@ -152,6 +160,7 @@ _VERDICT_MEANINGS: Mapping[Verdict, str] = {
         'the running process predates the current value; restarting the unit picks it up'
     ),
     Verdict.NOT_RUNNING: 'the unit has no running process to compare',
+    Verdict.UNREADABLE: "the running process's environment could not be read",
     Verdict.INDETERMINATE: (
         'inputs systemd does not expose over D-Bus decide the value a restart would give'
     ),
@@ -170,7 +179,15 @@ class NoLiveProcess:
     pass
 
 
-LiveLayer = LiveEnviron | NoLiveProcess
+@dataclass(frozen=True)
+class LiveEnvironUnreadable:
+    pid: int
+    path: Path
+    errno: int
+    strerror: str
+
+
+LiveLayer = LiveEnviron | NoLiveProcess | LiveEnvironUnreadable
 
 
 @dataclass(frozen=True)
@@ -217,6 +234,8 @@ class UnitEnvironment:
     def _verdict(self, restart_value: str | None, live_value: str | None) -> Verdict:
         if isinstance(self.live, NoLiveProcess):
             return Verdict.NOT_RUNNING
+        if isinstance(self.live, LiveEnvironUnreadable):
+            return Verdict.UNREADABLE
         if self.unmodelled:
             return Verdict.INDETERMINATE
         return Verdict.MATCHES if restart_value == live_value else Verdict.DRIFTED
@@ -242,7 +261,16 @@ def _live_layer(manager: _UserManager, path: str, proc_root: Path) -> LiveLayer:
     if pid == 0:
         return NoLiveProcess()
     started = manager.unit_property(path, _SERVICE_INTERFACE, 'ExecMainStartTimestamp', _UINT64)
-    return LiveEnviron(pid, _started_at(started), read_process_environ(pid, proc_root=proc_root))
+    try:
+        values = read_process_environ(pid, proc_root=proc_root)
+    except OSError as exc:
+        return LiveEnvironUnreadable(
+            pid=pid,
+            path=_environ_path(pid, proc_root),
+            errno=exc.errno or 0,
+            strerror=exc.strerror or str(exc),
+        )
+    return LiveEnviron(pid, _started_at(started), values)
 
 
 def inspect_unit(
@@ -264,19 +292,55 @@ def inspect_unit(
     )
 
 
+def exit_status(env: UnitEnvironment) -> int:
+    """EXIT_LIVE_UNREADABLE when the report lacks the live layer, else EXIT_OK."""
+    return EXIT_LIVE_UNREADABLE if isinstance(env.live, LiveEnvironUnreadable) else EXIT_OK
+
+
 def _shown(value: str | None, absent: str = '(not set)') -> str:
     return absent if value is None else value
 
 
-def _live_header(live: LiveLayer) -> str:
+_REFUSED_HINT = (
+    'the kernel refuses to read the environ of a process running as another uid '
+    'or holding capabilities the reader lacks, and a sandbox may deny /proc reads '
+    'outright; "manager now" is the way to see what the manager hands units'
+)
+_EXITED_HINT = 'the process exited between the MainPID query and the read; re-run'
+_UNREADABLE_HINTS: Mapping[int, str] = {
+    errno.EACCES: _REFUSED_HINT,
+    errno.EPERM: _REFUSED_HINT,
+    errno.ENOENT: _EXITED_HINT,
+    errno.ESRCH: _EXITED_HINT,
+}
+
+
+def _unreadable_lines(live: LiveEnvironUnreadable) -> list[str]:
+    code = errno.errorcode.get(live.errno, str(live.errno))
+    lines = [f'live process: pid {live.pid}, {live.path} unreadable: {code} ({live.strerror})']
+    hint = _UNREADABLE_HINTS.get(live.errno)
+    return [*lines, f'  {hint}'] if hint is not None else lines
+
+
+def _live_header(live: LiveLayer) -> list[str]:
     if isinstance(live, NoLiveProcess):
-        return 'live process: not running'
+        return ['live process: not running']
+    if isinstance(live, LiveEnvironUnreadable):
+        return _unreadable_lines(live)
     when = live.started_at.isoformat() if live.started_at is not None else 'start time unknown'
-    return f'live process: pid {live.pid}, started {when}'
+    return [f'live process: pid {live.pid}, started {when}']
+
+
+def _live_shown(live: LiveLayer, value: str | None) -> str:
+    if isinstance(live, NoLiveProcess):
+        return '(not running)'
+    if isinstance(live, LiveEnvironUnreadable):
+        return '(unreadable)'
+    return _shown(value)
 
 
 def _header(env: UnitEnvironment) -> list[str]:
-    lines = [f'unit: {env.unit}', _live_header(env.live)]
+    lines = [f'unit: {env.unit}', *_live_header(env.live)]
     if env.unmodelled:
         lines.append(
             f'not modelled: {", ".join(env.unmodelled)} (effect not visible over D-Bus)'
@@ -286,7 +350,7 @@ def _header(env: UnitEnvironment) -> list[str]:
 
 def _variable_lines(env: UnitEnvironment, report: VariableReport) -> list[str]:
     restart = 'unknown (see "not modelled" above)' if env.unmodelled else _shown(report.restart_value)
-    live = _shown(report.live_value) if isinstance(env.live, LiveEnviron) else '(not running)'
+    live = _live_shown(env.live, report.live_value)
     return [
         report.name,
         f'  manager now:   {_shown(report.manager_value)}',
@@ -325,7 +389,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     env = inspect_unit(args.unit)
     print(render(env, args.names or ['PATH']))
-    return EXIT_OK
+    return exit_status(env)
 
 
 if __name__ == '__main__':
