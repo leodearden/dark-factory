@@ -307,8 +307,9 @@ function snapshotCharts(points) {
 }
 
 // Marks at their point's column: a baseline at each baseline point, and each
-// instrument marker at the first point measured at its ref. A mark with no
-// column (an unserved sha, or a series of one point) is dropped.
+// instrument marker at the point it names, where that point's diff opens
+// 'params differ'. A mark with no column (a marker naming no served point, or
+// a series of one point) is dropped.
 function snapshotMarks(points, markers) {
   const columns = points.map((_, index) => index);
   const at = index => qualityFractionAt(columns, index);
@@ -320,7 +321,7 @@ function snapshotMarks(points, markers) {
     .filter(marker => marker.kind === QUALITY_INSTRUMENT_KIND)
     .map(marker => ({
       key: marker.id, kind: marker.kind, label: marker.label,
-      fraction: at(points.findIndex(point => point.as_of_sha === marker.ref)), ref: marker.ref, verdict: null,
+      fraction: at(points.findIndex(point => point.id === marker.source.point)), ref: marker.ref, verdict: null,
     }));
   return [...baselines, ...instruments].filter(mark => mark.fraction !== null);
 }
