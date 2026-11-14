@@ -343,8 +343,9 @@ The stuck-write record means a fix-task filing has stayed due for
 resolves that record itself once no filing is due. The outage and broken-probe
 records are described under *Outages* below.
 
-**Retention.** Pass directories older than 14 days are pruned, except those an
-episode (live or ended) still counts. Entries in the episode store expire
+**Retention.** Pass directories older than 60 days are pruned, except those an
+episode (live or ended) still counts. At the lane's measured ~3.5 MB a day that
+is about 210 MB. Entries in the episode store expire
 after 14 days without a write.
 
 #### Outages and the flake ledger
