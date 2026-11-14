@@ -641,16 +641,13 @@ def make_graph_driver():
     it as ``make_backend(config, driver=...)`` instead of assigning
     ``backend._driver._get_graph``.
     """
+    from _graph_access_fake import wired_graph
+
     from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
 
     def _factory(graphs: Mapping[str, Any]) -> _MultiTenantFalkorDriver:
-        def _select(name: str) -> Any:
-            if name not in graphs:
-                raise KeyError(f'no graph wired for {name!r}; wired: {sorted(graphs)}')
-            return graphs[name]
-
         falkor = MagicMock()
-        falkor.select_graph.side_effect = _select
+        falkor.select_graph.side_effect = lambda name: wired_graph(graphs, name)
         return _MultiTenantFalkorDriver(falkor_db=falkor)
 
     return _factory

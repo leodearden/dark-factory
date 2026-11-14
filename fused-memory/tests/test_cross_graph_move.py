@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import extract_cypher, extract_params
-from _graph_access_fake import FakeGraphAccess, HangingRawGraph
+from _graph_access_fake import FakeGraphAccess, HangingRawGraph, with_backend_budgets
 from _relates_to_doubles import EdgeFixture, answer_edge_read, written_edge_properties
 
 from fused_memory.backends.graph_access import GraphHandle
@@ -3019,57 +3019,69 @@ class TestRecreateSubgraphRelationships:
 # Every public function's raw Cypher runs under the backend's named budgets.
 # ---------------------------------------------------------------------------
 
-_BUDGETED_TIMEOUT_RE = r'^Graphiti \S+ timed out after 0\.0[58]s$'
+_READ_S = 0.05
+_WRITE_S = 0.08
 
 
 class TestCrossGraphMoveIsBudgeted:
-    """Over graphs that never answer, each public function fails on a named budget."""
+    """Over graphs that never answer, each public function's first call fails on its own named budget."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        'call',
+        ('call', 'op', 'budget'),
         [
-            lambda g: move_entity_across_graphs(
-                g, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            pytest.param(
+                lambda g: move_entity_across_graphs(
+                    g, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+                ),
+                'move_entity_across_graphs', _READ_S, id='move_entity_across_graphs',
             ),
-            lambda g: create_moved_node(
-                g, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            pytest.param(
+                lambda g: create_moved_node(
+                    g, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+                ),
+                'create_moved_node', _READ_S, id='create_moved_node',
             ),
-            lambda g: create_moved_episode(
-                g, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            pytest.param(
+                lambda g: create_moved_episode(
+                    g, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+                ),
+                'create_moved_episode', _READ_S, id='create_moved_episode',
             ),
-            lambda g: delete_source_node(g, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE),
-            lambda g: delete_source_episode(g, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE),
-            lambda g: merge_foreign_duplicate(
-                g, NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE,
+            pytest.param(
+                lambda g: delete_source_node(g, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE),
+                'delete_source_node', _WRITE_S, id='delete_source_node',
             ),
-            lambda g: recreate_subgraph_relationships(
-                g, [_move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE)],
+            pytest.param(
+                lambda g: delete_source_episode(
+                    g, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE,
+                ),
+                'delete_source_episode', _WRITE_S, id='delete_source_episode',
             ),
-        ],
-        ids=[
-            'move_entity_across_graphs',
-            'create_moved_node',
-            'create_moved_episode',
-            'delete_source_node',
-            'delete_source_episode',
-            'merge_foreign_duplicate',
-            'recreate_subgraph_relationships',
+            pytest.param(
+                lambda g: merge_foreign_duplicate(
+                    g, NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE,
+                ),
+                'merge_foreign_duplicate', _READ_S, id='merge_foreign_duplicate',
+            ),
+            pytest.param(
+                lambda g: recreate_subgraph_relationships(
+                    g, [_move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE)],
+                ),
+                'recreate_subgraph_relationships', _READ_S, id='recreate_subgraph_relationships',
+            ),
         ],
     )
-    async def test_a_hanging_graph_fails_on_a_named_budget(
-        self, mock_config, make_backend, make_graph_driver, call,
+    async def test_a_hanging_graph_fails_on_the_functions_budget(
+        self, mock_config, make_backend, make_graph_driver, call, op, budget,
     ):
-        config = mock_config.model_copy(update={
-            'queue': mock_config.queue.model_copy(update={
-                'backend_read_timeout_seconds': 0.05,
-                'backend_write_timeout_seconds': 0.08,
-            }),
-        })
+        config = with_backend_budgets(mock_config, read_s=_READ_S, write_s=_WRITE_S)
         backend = make_backend(config, driver=make_graph_driver({
             SOURCE_GRAPH_FIXTURE: HangingRawGraph(),
             TARGET_GRAPH_FIXTURE: HangingRawGraph(),
         }))
 
-        with pytest.raises(TimeoutError, match=_BUDGETED_TIMEOUT_RE):
+        with pytest.raises(TimeoutError) as raised:
             await asyncio.wait_for(call(backend), timeout=5.0)
+
+        assert str(raised.value) == f'Graphiti {op} timed out after {budget}s'
