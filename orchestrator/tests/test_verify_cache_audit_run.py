@@ -164,10 +164,14 @@ class TestRunAudit:
 
         parsed = {(failure.node_id, failure.kind) for failure in parse_pytest_failures(report)}
         assert parsed == {
-            (_ALPHA_ONE, FailureKind.FAILED),
-            (_ALPHA_TWO, FailureKind.FAILED),
-            (_BETA_FILE, FailureKind.ERROR),
+            (str(audit_run.AuditNode(module, failure.node_id)), failure.kind)
+            for module, output in (('alpha', _ALPHA_RED), ('beta', _BETA_COLLECTION_ERROR))
+            for failure in parse_pytest_failures(output)
         }, report
+        assert {
+            (_ALPHA_ONE, FailureKind.FAILED), (_ALPHA_TWO, FailureKind.FAILED), (_BETA_FILE, FailureKind.ERROR),
+        } <= parsed, report
+        assert all(audit_run.AuditNode.parse(node) for node, _ in parsed), report
 
     async def test_the_lanes_launch_records_the_qualified_nodes(self, tree, capsys, tmp_path):
         tree.module('alpha', output=_ALPHA_RED, rc=1)
@@ -175,7 +179,8 @@ class TestRunAudit:
 
         record = await _lane_record(tmp_path, report)
 
-        assert [failure.node_id for failure in record.failures] == [_ALPHA_ONE, _ALPHA_TWO]
+        assert {_ALPHA_ONE, _ALPHA_TWO} <= {failure.node for failure in record.failures}
+        assert all(audit_run.AuditNode.parse(failure.node) for failure in record.failures)
         assert record.session_complete is True
 
     async def test_a_timed_out_module_is_killed_with_its_group_and_the_next_still_runs(self, tree, capsys):
