@@ -9674,7 +9674,9 @@ class TestEnsureVerifyDiskSpace:
                 gops, tmp_path, 10 * _GIB, 't1',
             )
         assert reason is not None
-        assert reason.startswith(TRANSIENT_INFRA_REASON_PREFIX)
+        assert reason.startswith(f'{TRANSIENT_INFRA_REASON_PREFIX} (disk pressure): '), (
+            f'expected the transient-infra reason naming disk pressure, got: {reason!r}'
+        )
         gops.prune_stale_merge_worktrees.assert_awaited_once()
 
     async def test_oserror_on_first_stat_fails_open(self, tmp_path: Path):
@@ -13384,9 +13386,9 @@ class TestRunPostMergeVerify:
 
         assert result is not None
         assert result.status == 'blocked'
-        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
-            f'expected transient-infra reason, got: {result.reason!r}'
-        )
+        assert result.reason.startswith(
+            f'{TRANSIENT_INFRA_REASON_PREFIX} (disk pressure): ',
+        ), f'expected the transient-infra reason naming disk pressure, got: {result.reason!r}'
         git_ops.prune_stale_merge_worktrees.assert_awaited_once()
         assert enospc_retries.get(req.task_id, 0) == 1, (
             f'expected enospc_retries[task_id]=1, got: {enospc_retries}'
@@ -13437,7 +13439,8 @@ class TestRunPostMergeVerify:
         not the generic branch-blaming block); no timeout-counter bump (no
         merge verify attempt consumed) and no dry-run debugger spawn.
         Parametrized over every INFRA_TRANSIENT_CATEGORIES member (task 2591
-        amendment, reviewer_comprehensive/test_coverage).
+        amendment, reviewer_comprehensive/test_coverage). The reason header
+        names the measured category, never disk pressure (task 3177).
         """
         from orchestrator.merge_lane.worker import (
             _DryRunInvestigationHandles,
@@ -13465,8 +13468,11 @@ class TestRunPostMergeVerify:
 
         assert result is not None
         assert result.status == 'blocked'
-        assert result.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
-            f'expected transient-infra reason, got: {result.reason!r}'
+        assert result.reason.startswith(
+            f'{TRANSIENT_INFRA_REASON_PREFIX} (category={category}): ',
+        ), (
+            f'the generic infra hold must name its measured category, not a '
+            f'disk-pressure cause; got: {result.reason!r}'
         )
         assert len(verifier.verified) == 2, (
             f'expected exactly one bounded infra retry (2 total calls), got {len(verifier.verified)}'

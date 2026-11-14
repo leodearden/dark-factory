@@ -397,16 +397,22 @@ import-order fragility.  Off by default: zero production overhead beyond a
 single module-bool branch at each call site."""
 
 
-TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure (disk pressure)'
-"""Prefix of the ``MergeOutcome.reason`` emitted when a post-merge verify
-fails with a no-space-left/ENOSPC signature that PERSISTS after one
-prune-and-retry.  Disk pressure is frequently a self-healing host condition
-(a concurrent build finishes, a worktree is reaped), so the merge worker
-prunes stale ``_merge-*`` worktrees and retries the verify once before
-surfacing this.  The workflow routes this prefix to
+TRANSIENT_INFRA_REASON_PREFIX = 'Transient infrastructure failure'
+"""Cause-neutral prefix of every transient-infra hold's ``MergeOutcome.reason``:
+the pre-verify disk guard, a persistent ENOSPC verify, and a persistent
+``INFRA_TRANSIENT_CATEGORIES`` verify.  Every producer builds its reason with
+``_transient_infra_reason``, which appends the measured cause in parentheses.
+The workflow routes this prefix to
 ``_mark_blocked(escalate_to_human=True, category='infra_issue')`` — the
 infra_issue category plus the durable ref lets the escalation-watcher
-auto-resolve if the disk has recovered by read-time."""
+auto-resolve if the host has recovered by read-time."""
+
+_DISK_PRESSURE_CAUSE = 'disk pressure'
+
+
+def _transient_infra_reason(cause: str, message: str) -> str:
+    """The ``'<prefix> (<cause>): <message>'`` reason of a transient-infra hold."""
+    return f'{TRANSIENT_INFRA_REASON_PREFIX} ({cause}): {message}'
 
 
 TRAIN_INCOMPLETE_REASON_PREFIX = 'Train merge rejected: not all members are merge-deferred'
@@ -700,11 +706,12 @@ async def _ensure_verify_disk_space(
             task_id, len(pruned), free / gib,
         )
         return None
-    return (
-        f'{TRANSIENT_INFRA_REASON_PREFIX}: pre-verify disk guard found only '
+    return _transient_infra_reason(
+        _DISK_PRESSURE_CAUSE,
+        f'pre-verify disk guard found only '
         f'{free / gib:.2f} GiB free (threshold {min_free_bytes / gib:.2f} GiB) '
         f'after pruning {len(pruned)} stale merge worktree(s); skipping '
-        f'post-merge verify to avoid a doomed build under disk pressure.'
+        f'post-merge verify to avoid a doomed build under disk pressure.',
     )
 
 
@@ -3507,10 +3514,11 @@ async def _run_post_merge_verify(
         # Persistent ENOSPC after the prune-and-retry → transient infra.
         if _verify_hit_enospc(verify):
             detail = verify.failure_report()
-            reason = (
-                f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge verify '
+            reason = _transient_infra_reason(
+                _DISK_PRESSURE_CAUSE,
+                f'post-merge verify '
                 f'still reports no space left on device after pruning '
-                f'stale merge worktrees and retrying. {verify.summary}'
+                f'stale merge worktrees and retrying. {verify.summary}',
             )
             if detail:
                 reason = f'{reason}\n\n{detail}'
@@ -3528,10 +3536,10 @@ async def _run_post_merge_verify(
         # branch-blaming.
         if (verify.category or '') in INFRA_TRANSIENT_CATEGORIES:
             detail = verify.failure_report()
-            reason = (
-                f'{TRANSIENT_INFRA_REASON_PREFIX}: post-merge verify '
-                f'classified infra-transient (category={verify.category!r}) '
-                f'and did not clear after retry. {verify.summary}'
+            reason = _transient_infra_reason(
+                f'category={verify.category}',
+                f'post-merge verify classified infra-transient '
+                f'and did not clear after retry. {verify.summary}',
             )
             if detail:
                 reason = f'{reason}\n\n{detail}'
