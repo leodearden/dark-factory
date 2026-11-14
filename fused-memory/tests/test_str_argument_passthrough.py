@@ -35,8 +35,9 @@ def _recording_server(received: dict[str, Any]) -> FastMCP:
         c: dict | None = None,
         d: str | dict | None = None,
         e: Any = None,
+        schema: str | None = None,
     ) -> str:
-        received.update(a=a, b=b, c=c, d=d, e=e)
+        received.update(a=a, b=b, c=c, d=d, e=e, schema=schema)
         return 'ok'
 
     return server
@@ -55,15 +56,25 @@ async def test_a_str_parameter_receives_a_json_looking_string_verbatim(sent):
 
 
 @pytest.mark.asyncio
-async def test_list_dict_mixed_union_and_any_parameters_keep_the_coercion():
+async def test_in_one_call_str_parameters_stay_verbatim_and_the_others_keep_the_coercion():
     received: dict[str, Any] = {}
     server = _recording_server(received)
     install_str_argument_passthrough(server)
 
     await server._tool_manager.call_tool(
-        'echo', {'b': '["x"]', 'c': '{"k": 1}', 'd': '{"k": 1}', 'e': '[1]'},
+        'echo',
+        {
+            'a': 'null',
+            'schema': '{"a": 1}',
+            'b': '["x"]',
+            'c': '{"k": 1}',
+            'd': '{"k": 1}',
+            'e': '[1]',
+        },
     )
 
+    assert received['a'] == 'null'
+    assert received['schema'] == '{"a": 1}'
     assert received['b'] == ['x']
     assert received['c'] == {'k': 1}
     assert received['d'] == {'k': 1}
