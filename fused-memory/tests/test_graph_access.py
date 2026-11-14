@@ -222,6 +222,126 @@ class TestOpBoundReader:
         assert OpBoundReader(_budgeted(MagicMock()), op='x').name == 'g'
 
 
+_UNPAGED_CYPHER_METHODS = [
+    pytest.param(lambda b: b.retrieve_episodes(['g']), 'retrieve_episodes', _READ_S,
+                 id='retrieve_episodes'),
+    pytest.param(
+        lambda b: b.redact_episode_content('ep', group_id='g', new_content='redacted'),
+        'redact_episode_content.read', _READ_S, id='redact_episode_content',
+    ),
+    pytest.param(
+        lambda b: b.reassign_edge('e', 'n2', which_end='source', group_id='g'),
+        'reassign_edge', _READ_S, id='reassign_edge',
+    ),
+    pytest.param(lambda b: b.get_valid_edges_for_node('n', group_id='g'),
+                 'get_valid_edges_for_node', _READ_S, id='get_valid_edges_for_node'),
+    pytest.param(lambda b: b.count_foreign_relationships('n', group_id='g'),
+                 'count_foreign_relationships', _READ_S, id='count_foreign_relationships'),
+    pytest.param(lambda b: b.get_connected_entity_uuids('n', group_id='g'),
+                 'get_connected_entity_uuids', _READ_S, id='get_connected_entity_uuids'),
+    pytest.param(lambda b: b.bulk_remove_edges(['e'], group_id='g'),
+                 'bulk_remove_edges', _WRITE_S, id='bulk_remove_edges'),
+    pytest.param(lambda b: b.dedup_valid_edges_for_node('n', group_id='g'),
+                 'dedup_valid_edges_for_node', _READ_S, id='dedup_valid_edges_for_node'),
+    pytest.param(lambda b: b.redirect_node_edges('old', 'new', group_id='g'),
+                 'redirect_node_edges', _WRITE_S, id='redirect_node_edges'),
+    pytest.param(lambda b: b.redirect_node_mentions('old', 'new', group_id='g'),
+                 'redirect_node_mentions', _READ_S, id='redirect_node_mentions'),
+    pytest.param(lambda b: b.delete_entity_node('n', group_id='g'),
+                 'delete_entity_node', _READ_S, id='delete_entity_node'),
+    pytest.param(lambda b: b.get_node_text('n', group_id='g'),
+                 'get_node_text', _READ_S, id='get_node_text'),
+    pytest.param(lambda b: b.resolve_entity_by_name('Alice', group_id='g'),
+                 'resolve_entity_by_name', _READ_S, id='resolve_entity_by_name'),
+    pytest.param(lambda b: b.get_nodes_by_exact_name('Alice', group_id='g'),
+                 'get_nodes_by_exact_name', _READ_S, id='get_nodes_by_exact_name'),
+    pytest.param(lambda b: b.find_duplicate_entity_nodes('Alice', group_id='g'),
+                 'find_duplicate_entity_nodes', _READ_S, id='find_duplicate_entity_nodes'),
+    pytest.param(
+        lambda b: b.find_entity_nodes_by_name_substring('Ali', group_id='g'),
+        'find_entity_nodes_by_name_substring', _READ_S,
+        id='find_entity_nodes_by_name_substring',
+    ),
+    pytest.param(lambda b: b.update_node_summary('n', 'summary', group_id='g'),
+                 'update_node_summary', _WRITE_S, id='update_node_summary'),
+    pytest.param(lambda b: b.update_node_name('n', 'Alice', group_id='g'),
+                 'update_node_name', _WRITE_S, id='update_node_name'),
+    pytest.param(lambda b: b.get_edge_text('e', group_id='g'),
+                 'get_edge_text', _READ_S, id='get_edge_text'),
+    pytest.param(lambda b: b.get_edges_by_uuids(['e'], group_id='g'),
+                 'get_edges_by_uuids', _READ_S, id='get_edges_by_uuids'),
+    pytest.param(lambda b: b.get_edge_invalid_at('e', group_id='g'),
+                 'get_edge_invalid_at', _READ_S, id='get_edge_invalid_at'),
+    pytest.param(lambda b: b.update_node_embedding('n', [0.5], group_id='g'),
+                 'update_node_embedding', _WRITE_S, id='update_node_embedding'),
+    pytest.param(lambda b: b.update_edge_embedding('e', [0.5], group_id='g'),
+                 'update_edge_embedding', _WRITE_S, id='update_edge_embedding'),
+    pytest.param(lambda b: b.list_indices(group_id='g'), 'list_indices', _READ_S,
+                 id='list_indices'),
+    pytest.param(lambda b: b.ensure_indices(group_id='g'), 'list_indices', _READ_S,
+                 id='ensure_indices'),
+    pytest.param(lambda b: b.drop_index('Entity', 'name', group_id='g'),
+                 'drop_index', _WRITE_S, id='drop_index'),
+    pytest.param(
+        lambda b: b.drop_vector_index('Entity', 'name_embedding', entity_type='NODE', group_id='g'),
+        'drop_vector_index', _WRITE_S, id='drop_vector_index',
+    ),
+    pytest.param(lambda b: b.node_count('g'), 'node_count', _READ_S, id='node_count'),
+]
+
+
+def _tiny_budget_config(config):
+    return config.model_copy(update={
+        'queue': config.queue.model_copy(update={
+            'backend_read_timeout_seconds': _READ_S,
+            'backend_write_timeout_seconds': _WRITE_S,
+        }),
+    })
+
+
+class ReadsNothingWritesHang:
+    """A raw graph whose reads find nothing and whose writes wait forever."""
+
+    async def ro_query(self, *_args):
+        return MagicMock(result_set=[], header=[])
+
+    def query(self, *args):
+        return wait_forever(*args)
+
+    def execute_command(self, *args):
+        return wait_forever(*args)
+
+
+class TestEveryBackendCypherMethodIsBudgeted:
+    """Through the production provider, every raw Cypher call overruns a named, configured budget."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('call', 'op', 'budget'), _UNPAGED_CYPHER_METHODS)
+    async def test_a_hanging_graph_fails_on_the_methods_budget(
+        self, mock_config, make_backend, make_graph_driver, call, op, budget,
+    ):
+        driver = make_graph_driver({'g': HangingRawGraph()})
+        driver.client.list_graphs = AsyncMock(return_value=['g'])
+        backend = make_backend(_tiny_budget_config(mock_config), driver=driver)
+
+        with pytest.raises(TimeoutError) as raised:
+            await _guarded(call(backend))
+
+        assert str(raised.value) == f'Graphiti {op} timed out after {budget}s'
+
+    @pytest.mark.asyncio
+    async def test_minting_an_entity_fails_on_the_write_budget(
+        self, mock_config, make_backend, make_graph_driver,
+    ):
+        driver = make_graph_driver({'g': ReadsNothingWritesHang()})
+        backend = make_backend(_tiny_budget_config(mock_config), driver=driver)
+
+        with pytest.raises(TimeoutError) as raised:
+            await _guarded(backend.ensure_entity_node('Alice', group_id='g'))
+
+        assert str(raised.value) == f'Graphiti _mint_entity_node timed out after {_WRITE_S}s'
+
+
 def test_the_egress_module_loads_no_graphiti_and_no_falkordb():
     probe = modules_loaded_by_importing(
         'fused_memory.backends.graph_access',
