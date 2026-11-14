@@ -10,10 +10,12 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import aiosqlite
 import pytest
 from _quality_fixture import GitRepo
 from _quality_snapshots import (
@@ -25,6 +27,7 @@ from _quality_snapshots import (
 )
 from shared.quality_series.git_lines import GitObjectMissing
 
+from dashboard.data.datum import DatumState, validate_datum
 from dashboard.data.quality_snapshots import (
     BASELINE_HOME,
     INSTRUMENT_SCRIPT,
@@ -33,13 +36,24 @@ from dashboard.data.quality_snapshots import (
     InstrumentRefused,
     RootScan,
     SnapshotCache,
+    SnapshotSeries,
     SnapshotSummary,
     commit_time,
     diff_text,
     scan_root,
+    snapshot_datum,
     snapshot_files,
     summarise,
 )
+from dashboard.data.quality_store import (
+    read_snapshot_cache,
+    read_snapshot_diff,
+    read_snapshot_identities,
+    read_snapshot_state,
+    record_snapshot_failure,
+    write_snapshot_scan,
+)
+from dashboard.loops import _QualityStore
 
 SHA_1 = '1' * 40
 SHA_2 = '2' * 40
@@ -418,3 +432,200 @@ class TestScanRoot:
         assert second.points[2].diff.pair_key == first.points[2].diff.pair_key
         assert second.points[2].diff.state is DiffState.READY
         assert list(second.new_diffs) == [second.points[3].diff.pair_key]
+
+
+# ---------------------------------------------------------------------------
+# The snapshot store and the datum: a real quality.db, opened with its schema applied.
+
+SCANNED_AT = datetime(2026, 11, 14, 6, 0, tzinfo=UTC)
+BOUND = 1200
+
+
+@pytest.fixture
+async def conn(tmp_path: Path) -> AsyncIterator[aiosqlite.Connection]:
+    async with _QualityStore(tmp_path / 'quality.db') as store:
+        yield store.connection
+
+
+async def _stored(conn: aiosqlite.Connection, scan: RootScan, at: datetime = SCANNED_AT) -> None:
+    await write_snapshot_scan(conn, 'dark_factory', scan, at)
+    await conn.commit()
+
+
+async def _datum(conn: aiosqlite.Connection, now: datetime = SCANNED_AT):
+    stored = await read_snapshot_state(conn, 'dark_factory')
+    return snapshot_datum('dark_factory', stored, now=now, freshness_bound_seconds=BOUND)
+
+
+class TestTheSnapshotDatum:
+    async def test_nothing_stored_is_unknown_until_scanned(self, conn: aiosqlite.Connection) -> None:
+        datum = await _datum(conn)
+
+        assert datum.state is DatumState.UNKNOWN
+        assert datum.reason is not None and 'not been scanned yet' in datum.reason
+        assert 'dark_factory' in datum.reason
+
+    async def test_a_scan_finding_no_file_says_no_snapshot_yet_naming_both_homes(
+        self, conn: aiosqlite.Connection, tmp_path: Path
+    ) -> None:
+        root, nightly = tmp_path / 'empty-root', tmp_path / 'nightly'
+        root.mkdir()
+        scan = scan_root(root, 'dark_factory', nightly, SnapshotCache.empty(), deadline=time.monotonic() + 60)
+        await _stored(conn, scan)
+
+        datum = await _datum(conn)
+
+        assert datum.state is DatumState.UNKNOWN
+        assert datum.reason is not None and datum.reason.startswith('no snapshot yet')
+        assert f'{root / BASELINE_HOME}/' in datum.reason
+        assert f'{nightly / "dark_factory"}/' in datum.reason
+
+    async def test_a_failed_scan_with_no_points_names_the_failure(self, conn: aiosqlite.Connection) -> None:
+        await record_snapshot_failure(conn, 'dark_factory', SCANNED_AT, 'snapshot scan exceeded the 120.0s per-root budget')
+        await conn.commit()
+
+        datum = await _datum(conn)
+
+        assert datum.state is DatumState.UNKNOWN
+        assert datum.reason is not None and 'snapshot scan exceeded the 120.0s per-root budget' in datum.reason
+
+    async def test_a_newer_failed_attempt_serves_the_points_stale(
+        self, conn: aiosqlite.Connection, scene: Scene
+    ) -> None:
+        await _stored(conn, scene.scan())
+        attempted = SCANNED_AT + timedelta(minutes=10)
+        await record_snapshot_failure(conn, 'dark_factory', attempted, 'OSError: boom')
+        await conn.commit()
+
+        datum = await _datum(conn, attempted)
+
+        assert datum.state is DatumState.STALE
+        assert datum.reason is not None and 'OSError: boom' in datum.reason
+        assert attempted.isoformat() in datum.reason
+        assert datum.value is not None and len(datum.value.points) == 3
+
+    async def test_pending_summaries_are_stale(self, conn: aiosqlite.Connection, scene: Scene) -> None:
+        await _stored(conn, scene.scan(deadline=time.monotonic() - 1))
+
+        datum = await _datum(conn)
+
+        assert datum.state is DatumState.STALE
+        assert datum.reason == '3 snapshot files not yet summarised'
+
+    async def test_a_complete_scan_is_fresh_then_ages(self, conn: aiosqlite.Connection, scene: Scene) -> None:
+        await _stored(conn, scene.scan())
+
+        fresh = await _datum(conn, SCANNED_AT + timedelta(seconds=60))
+        aged = await _datum(conn, SCANNED_AT + timedelta(seconds=BOUND + 1))
+
+        assert (fresh.state, fresh.as_of, fresh.reason) == (DatumState.FRESH, SCANNED_AT, None)
+        assert aged.state is DatumState.STALE
+
+    async def test_the_wire_shape(self, conn: aiosqlite.Connection, scene: Scene) -> None:
+        scan = scene.scan()
+        await _stored(conn, scan)
+
+        datum = await _datum(conn)
+        validate_datum(datum, SCANNED_AT)
+        wire = datum.to_wire()['value']
+
+        assert isinstance(wire, dict) and set(wire) == {'points', 'unplaced', 'pending'}
+        assert wire['unplaced'] == [] and wire['pending'] == {'summaries': 0, 'diffs': 0}
+        first, second = wire['points'][:2]
+        assert set(first) == {
+            'id', 'file', 'baseline', 'as_of_sha', 'committed_at', 'run_id', 'params', 'unknown_params',
+            'complete', 'members', 'h14', 'cycles', 'deferred_imports', 'cycle_closing_imports',
+            'private_patch_targets', 'diff',
+        }
+        summary = scan.points[0].summary
+        assert first['members'] == {
+            'columns': [column.header for column in summary.columns],
+            'rows': [
+                {'member': row.member, 'pseudo': row.pseudo, 'cells': [cell.text for cell in row.cells]}
+                for row in summary.members
+            ],
+        }
+        assert first['unknown_params'] == sorted(summary.unknown_params)
+        assert first['h14'] == {
+            'soft_ceiling_lines': 1500, 'alarm_lines': 2000,
+            'at_soft_ceiling': summary.h14.at_soft_ceiling, 'at_alarm': summary.h14.at_alarm,
+        }
+        assert first['cycles'] == {'cycles': 2, 'hidden_cycles': 1, 'typing_cycles': 1}
+        assert first['diff'] == {'previous_id': None, 'state': 'first', 'reason': None}
+        assert second['diff'] == {'previous_id': first['id'], 'state': 'ready', 'reason': None}
+        assert first['committed_at'] == scene.times[0].isoformat()
+        assert first['baseline'] is True and second['baseline'] is False
+
+    def test_unordered_points_are_refused_naming_the_ids(self, scene: Scene) -> None:
+        points = scene.scan().points
+
+        with pytest.raises(ValueError, match='order') as raised:
+            SnapshotSeries(points=(points[1], points[0], points[2]), unplaced=(), pending_summaries=0, pending_diffs=0)
+
+        assert points[0].point_id in str(raised.value) and points[1].point_id in str(raised.value)
+
+
+class TestTheSnapshotStore:
+    async def test_a_second_write_replaces_a_vanished_point(self, conn: aiosqlite.Connection, scene: Scene) -> None:
+        first = scene.scan()
+        await _stored(conn, first)
+        (scene.home / f'{scene.shas[2]}.json').unlink()
+        second = scene.scan(await read_snapshot_cache(conn, 'dark_factory'))
+        await _stored(conn, second, SCANNED_AT + timedelta(minutes=10))
+
+        cache = await read_snapshot_cache(conn, 'dark_factory')
+
+        assert cache == SnapshotCache.from_scan(second)
+        assert set(cache.files) == {point.point_id for point in first.points[:2]}
+
+    async def test_the_cache_round_trips(self, conn: aiosqlite.Connection, scene: Scene) -> None:
+        scan = scene.scan()
+        await _stored(conn, scan)
+
+        assert await read_snapshot_cache(conn, 'dark_factory') == SnapshotCache.from_scan(scan)
+
+    async def test_unplaced_files_round_trip(self, conn: aiosqlite.Connection, scene: Scene) -> None:
+        (scene.home / 'foreign.json').write_text('{"instrument": "other"}', encoding='utf-8')
+        scan = scene.scan()
+        await _stored(conn, scan)
+
+        stored = await read_snapshot_state(conn, 'dark_factory')
+
+        assert stored is not None and stored.scan is not None
+        assert stored.scan.series.unplaced == scan.unplaced
+        assert (await read_snapshot_cache(conn, 'dark_factory')).files.keys() >= {scan.unplaced[0].point_id}
+
+    async def test_the_diff_of_a_point(self, conn: aiosqlite.Connection, scene: Scene) -> None:
+        scan = scene.scan()
+        await _stored(conn, scan)
+        first, second = scan.points[:2]
+
+        ready = await read_snapshot_diff(conn, 'dark_factory', second.point_id)
+        opening = await read_snapshot_diff(conn, 'dark_factory', first.point_id)
+
+        assert ready is not None and (ready.state, ready.previous_id) == (DiffState.READY, first.point_id)
+        assert ready.text == diff_text(second.file, first.file)
+        assert opening is not None and (opening.state, opening.text) == (DiffState.FIRST, None)
+        assert await read_snapshot_diff(conn, 'dark_factory', 'no-such-point') is None
+
+    async def test_the_identities_follow_the_points(self, conn: aiosqlite.Connection, scene: Scene) -> None:
+        scan = scene.scan()
+        await _stored(conn, scan)
+
+        identities = await read_snapshot_identities(conn, 'dark_factory')
+
+        assert identities == [point.identity() for point in scan.points]
+        assert identities[0].unknown_params >= {'instrument', 'python_version'}
+        assert identities[1].unknown_params == frozenset()
+
+    async def test_a_pending_diff_reads_pending(self, conn: aiosqlite.Connection, scene: Scene) -> None:
+        cold = scene.scan()
+        without_diffs = replace(cold, new_diffs={})
+        await _stored(conn, without_diffs)
+
+        stored = await read_snapshot_state(conn, 'dark_factory')
+
+        assert stored is not None and stored.scan is not None
+        assert [point.diff.state for point in stored.scan.series.points] == [
+            DiffState.FIRST, DiffState.PENDING, DiffState.PENDING,
+        ]
