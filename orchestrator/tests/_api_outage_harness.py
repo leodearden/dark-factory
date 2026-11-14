@@ -413,7 +413,7 @@ def _code_default_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Orc
 
 
 def _build_harness(
-    config: OrchestratorConfig, store: _OutageTaskStore, clock: _SimClock, queue_dir: Path,
+    config: OrchestratorConfig, store: _OutageTaskStore, clock: _SimClock, queue: EscalationQueue,
 ) -> tuple[Harness, Scheduler]:
     with (
         patch('orchestrator.harness.McpLifecycle'),
@@ -432,7 +432,7 @@ def _build_harness(
     )
     scheduler.finish_startup()
     harness.scheduler = scheduler
-    harness._escalation_queue = EscalationQueue(queue_dir)
+    harness._escalation_queue = queue
     harness._run_id = _RUN_ID
     harness.briefing.build_implementer_prompt = AsyncMock(return_value='Implement step-1.')
     return harness, scheduler
@@ -455,9 +455,8 @@ class _Simulation:
             self.cast.reify_wedge: lambda _n: reify_4429_wedge_result(),
         })
         self.config = _code_default_config(tmp_path, monkeypatch)
-        self.harness, self.scheduler = _build_harness(
-            self.config, self.store, self.clock, tmp_path / 'escalations',
-        )
+        self.queue = EscalationQueue(tmp_path / 'escalations')
+        self.harness, self.scheduler = _build_harness(self.config, self.store, self.clock, self.queue)
         self.factory = _WorkflowFactory(
             tmp_path / 'dispatches', self.cli, monkeypatch,
             contaminated_first_lane=frozenset({self.cast.genuine}),
@@ -534,18 +533,14 @@ class _Simulation:
         return record
 
     def _snapshot(self) -> PhaseSnapshot:
-        queue = self.harness._escalation_queue
-        assert queue is not None
         return PhaseSnapshot(
-            pending_escalations=tuple(queue.get_pending()),
+            pending_escalations=tuple(self.queue.get_pending()),
             paused=self.scheduler.is_paused,
             parked_live_count=self.scheduler.parked_live_count,
             parked_window_churn_count=self.scheduler.parked_window_churn_count,
         )
 
     def ledger(self) -> BurstLedger:
-        queue = self.harness._escalation_queue
-        assert queue is not None
         assert self.after_phase_a is not None and self.after_phase_b is not None
         assert self.end_of_run is not None
         return BurstLedger(
@@ -557,7 +552,7 @@ class _Simulation:
             end_of_run=self.end_of_run,
             status_writes=self.store.writes(),
             final_status=self.store.statuses(),
-            escalations_by_task={tid: tuple(queue.get_by_task(tid)) for tid in self.cast.all_ids},
+            escalations_by_task={tid: tuple(self.queue.get_by_task(tid)) for tid in self.cast.all_ids},
             park_stop_trip_wired=self.scheduler.callbacks.on_park_stop_trip is not None,
         )
 
