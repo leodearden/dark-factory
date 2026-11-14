@@ -1060,7 +1060,7 @@ class TestConsecutiveDegradedEscalation:
 
     # Recurring runs fold into one pending record per project, mirroring the
     # ZOT fold (task 3995): every run still counts, as the parent's
-    # dedupe_count, and nothing is suppressed.
+    # dedupe_count. A folded run's own evidence lives in the log, not the record.
 
     @pytest.mark.asyncio
     async def test_recurring_alarms_fold_into_one_pending_record(self, tmp_path):
@@ -1075,6 +1075,43 @@ class TestConsecutiveDegradedEscalation:
             assert parent['dedupe_fingerprint']
             assert parent['dedupe_count'] == 4
             assert len(parent['dedupe_children']) == 4
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_a_folded_run_logs_its_own_cause_at_error(self, tmp_path, caplog):
+        """The record keeps the first run's cause; a later, novel cause is only in the log, so it must be as loud."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path))
+            with caplog.at_level(logging.ERROR):
+                await escalator.report_consecutive_degraded(**{
+                    **_streak_alarm(tmp_path),
+                    'last_justification': 'llm-failed: NovelClassError: B',
+                    'candidate_title': 'second run',
+                })
+
+            [parent] = _pending_records(tmp_path)
+            assert 'NovelClassError' not in parent['detail']
+            [folded] = [
+                r for r in caplog.records
+                if r.levelno >= logging.ERROR and 'NovelClassError' in r.getMessage()
+            ]
+            assert f"folded into {parent['id']}" in folded.getMessage()
+            assert 'second run' in folded.getMessage()
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_detail_points_at_the_log_for_later_runs_causes(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_consecutive_degraded(**_streak_alarm(tmp_path))
+
+            detail = _only_escalation_detail(tmp_path)
+            assert 'fused-memory log' in detail
+            assert 'consecutive-degraded run for project' in detail
         finally:
             handle.close()
 

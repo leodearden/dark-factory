@@ -55,8 +55,8 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -160,6 +160,14 @@ def _file_curator_escalation(project_root: str, *, category: str, summary: str, 
     return queue.submit(_curator_escalation(queue, category=category, summary=summary, detail=detail))
 
 
+@dataclass(frozen=True)
+class _FoldingOutcome:
+    """Where one folding filing landed: the live record, and whether it was an already-pending one."""
+
+    escalation_id: str
+    folded: bool
+
+
 def _file_folding_escalation(
     project_root: str,
     *,
@@ -168,14 +176,14 @@ def _file_folding_escalation(
     fold_key: str,
     summary: str,
     detail: str,
-    **extra: Any,
-) -> dict[str, Any]:
+    root_cause: str = '',
+) -> _FoldingOutcome:
     """Open the project's queue and file one record that folds into the project's pending one of its category.
 
     The fold is UNBOUNDED, on the dead_letter_escalator precedent: these recur
     days and weeks apart, and a resolved parent leaves the pending set, so a
-    recurrence after resolution still mints a new record. Returns the
-    ``submit_or_dedupe`` response. Blocking queue I/O, so callers run it off the loop.
+    recurrence after resolution still mints a new record. Blocking queue I/O,
+    so callers run it off the loop.
     """
     queue = EscalationQueue(escalation_queue_dir(project_root))
     escalation = _curator_escalation(
@@ -183,14 +191,15 @@ def _file_folding_escalation(
         category=category,
         summary=summary,
         detail=detail,
+        root_cause=root_cause,
         dedupe_fingerprint=compute_content_fingerprint(  # type: ignore[possibly-unbound]
             category, fold_key, affected_ids=[f'project:{project_id}'],
         ),
-        **extra,
     )
-    return submit_or_dedupe(  # type: ignore[possibly-unbound]
+    response = submit_or_dedupe(  # type: ignore[possibly-unbound]
         queue, escalation, DedupeConfig.for_content_fingerprint(category),  # type: ignore[possibly-unbound]
     )
+    return _FoldingOutcome(escalation_id=response['id'], folded=response['status'] == 'dedup_skipped')
 
 
 async def _filed_or_logged(file: Callable[[], _Filed], *, kind: str, project_id: str) -> _Filed | None:
@@ -213,7 +222,7 @@ async def _file_logged(
 ) -> str | None:
     """File one curator record off the loop; its id, or ``None`` when filing failed."""
     return await _filed_or_logged(
-        partial(_file_curator_escalation, project_root, category=category, summary=summary, detail=detail),
+        lambda: _file_curator_escalation(project_root, category=category, summary=summary, detail=detail),
         kind=kind, project_id=project_id,
     )
 
@@ -227,13 +236,13 @@ async def _file_folding_logged(
     fold_key: str,
     summary: str,
     detail: str,
-    **extra: Any,
-) -> dict[str, Any] | None:
-    """File one folding curator record off the loop; the ``submit_or_dedupe`` response, or ``None`` when filing failed."""
+    root_cause: str = '',
+) -> _FoldingOutcome | None:
+    """File one folding curator record off the loop; where it landed, or ``None`` when filing failed."""
     return await _filed_or_logged(
-        partial(
-            _file_folding_escalation, project_root, project_id=project_id, category=category,
-            fold_key=fold_key, summary=summary, detail=detail, **extra,
+        lambda: _file_folding_escalation(
+            project_root, project_id=project_id, category=category, fold_key=fold_key,
+            summary=summary, detail=detail, root_cause=root_cause,
         ),
         kind=kind, project_id=project_id,
     )
@@ -287,7 +296,7 @@ async def _file_zot_logged(
     project_root: str, *, project_id: str, detail: str, account_name: str | None, duration_ms: int | None,
 ) -> str | None:
     """File one ZOT record off the loop and return its live id, or ``None`` when filing failed."""
-    response = await _file_folding_logged(
+    outcome = await _file_folding_logged(
         project_root,
         kind='zero-output-timeout',
         project_id=project_id,
@@ -301,25 +310,24 @@ async def _file_zot_logged(
         detail=detail,
         root_cause=_ZOT_ROOT_CAUSE,
     )
-    if response is None:
+    if outcome is None:
         # Falling through to action='create' is safer than failing add_task
         # just because queue I/O broke.
         return None
 
-    escalation_id: str = response['id']
-    if response['status'] == 'dedup_skipped':
+    if outcome.folded:
         logger.warning(
             'curator_escalator: zero-output-timeout recurrence for project %s '
             'folded into %s — account=%s duration_ms=%s; dedupe degraded to create',
-            project_id, escalation_id, account_name, duration_ms,
+            project_id, outcome.escalation_id, account_name, duration_ms,
         )
-        return escalation_id
+        return outcome.escalation_id
     logger.error(
         'curator_escalator: queued zero-output-timeout L1 escalation %s for '
         'project %s — account=%s duration_ms=%s; dedupe degraded to create',
-        escalation_id, project_id, account_name, duration_ms,
+        outcome.escalation_id, project_id, account_name, duration_ms,
     )
-    return escalation_id
+    return outcome.escalation_id
 
 
 class CuratorEscalator:
@@ -829,11 +837,12 @@ class CuratorEscalator:
         so raising would escalate a curator that is merely degrading into one
         that fails ``add_task`` outright.
 
-        Never touches ``_failure_log``, and every run counts: a run folds into
-        the project's one pending record as its ``dedupe_count``, and a run after
-        that record is resolved files a new one, mirroring the zero-output-hang
-        fold (task 3995). Nothing is suppressed, and the queue holds one record
-        per project for one outage.
+        Never touches ``_failure_log``, and no run goes uncounted: a run folds
+        into the project's one pending record as its ``dedupe_count``, and a run
+        after that record is resolved files a new one, mirroring the
+        zero-output-hang fold (task 3995). The record keeps only the first run's
+        evidence. A folded run's own cause may be a different class, so it is
+        logged at ERROR, as loudly as the first filing.
         """
         if not HAS_ESCALATION:
             logger.warning(
@@ -876,9 +885,15 @@ class CuratorEscalator:
             'need a sweep. The streak is counted per project; other projects '
             'served by the same curator may be healthy. Later runs for this '
             'project fold into this record, and its dedupe_count counts them.',
+            '',
+            'The fields above are the FIRST run\'s. A later run may have a '
+            'different cause: each one\'s streak, candidate_title and '
+            'last_justification are in the fused-memory log, at ERROR, as '
+            "'consecutive-degraded run for project <project_id> folded into "
+            "<this record's id>'.",
         ])
 
-        response = await _file_folding_logged(
+        outcome = await _file_folding_logged(
             project_root,
             kind='consecutive-degraded',
             project_id=project_id,
@@ -891,20 +906,22 @@ class CuratorEscalator:
             ),
             detail=detail,
         )
-        if response is None:
+        if outcome is None:
             return
 
-        if response['status'] == 'dedup_skipped':
-            logger.warning(
+        if outcome.folded:
+            logger.error(
                 'curator_escalator: consecutive-degraded run for project %s folded '
-                'into %s — streak=%d threshold=%d last_justification=%r',
-                project_id, response['id'], streak, threshold, last_justification,
+                'into %s — streak=%d threshold=%d candidate_title=%r last_justification=%r',
+                project_id, outcome.escalation_id, streak, threshold, candidate_title,
+                last_justification,
             )
             return
         logger.error(
             'curator_escalator: queued consecutive-degraded L1 escalation %s for '
-            'project %s — streak=%d threshold=%d last_justification=%r',
-            response['id'], project_id, streak, threshold, last_justification,
+            'project %s — streak=%d threshold=%d candidate_title=%r last_justification=%r',
+            outcome.escalation_id, project_id, streak, threshold, candidate_title,
+            last_justification,
         )
 
     async def report_backend_binary_unresolvable(

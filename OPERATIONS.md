@@ -919,7 +919,9 @@ That latency is faster than any real model call.
   `create: curator-unavailable: construction-failed: <ExcType>: <first line>`,
   `create: zero-output-breaker-open`, and so on. Then look for task 4448's
   `curator_consecutive_degraded` escalation from `fused-memory/task-curator`,
-  one pending record per project whose `dedupe_count` counts later runs.
+  one pending record per project whose `dedupe_count` counts later runs. The
+  record shows the first run's cause; each later run's is in the fused-memory
+  log at ERROR, as `consecutive-degraded run for project … folded into <id>`.
   If it is absent while this one fires, suspect the `curator-unavailable` path,
   where no curator exists to count its own failures.
 - **Corroborate.** First check whether, and when, the curator last really
