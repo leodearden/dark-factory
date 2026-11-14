@@ -28,6 +28,7 @@ ARMING_CHECK = (
     f"and run {INSTALLER} if it is not listed"
 )
 UNIT_FIELDS = ("LoadState", "Result", "ExecMainStatus", "ExecMainExitTimestamp")
+NOT_INSTALLED_LOAD_STATES = frozenset({"", "not-found"})
 SYSTEMD_UTC_TIMESTAMP = "%a %Y-%m-%d %H:%M:%S UTC"
 NEVER_RAN_TIMESTAMPS = frozenset({"", "n/a"})
 DEFAULT_REPO = "/home/leo/src/dark-factory"
@@ -65,13 +66,28 @@ def read_unit_state() -> dict[str, str]:
     )
 
 
-def require_installed(state: dict[str, str]) -> None:
+def require_loaded(state: dict[str, str]) -> None:
     load_state = state.get("LoadState", "")
-    if load_state != "loaded":
-        raise NotReporting(
+    if load_state == "loaded":
+        return
+    if load_state in NOT_INSTALLED_LOAD_STATES:
+        verdict = (
             f"NOT INSTALLED: {UNIT} has LoadState={load_state!r}; "
             f"arm the 05:00 timer with {INSTALLER}"
         )
+    elif load_state == "masked":
+        verdict = (
+            f"MASKED: {UNIT} has LoadState='masked', so the timer cannot start "
+            f"it; if the mask is not deliberate, remove it with "
+            f"`systemctl --user unmask {UNIT}` and then run {INSTALLER}"
+        )
+    else:
+        verdict = (
+            f"NOT LOADED: {UNIT} has LoadState={load_state!r}; "
+            f"`systemctl --user status {UNIT}` names why systemd rejected the "
+            f"installed unit file, and {INSTALLER} recopies the committed one"
+        )
+    raise NotReporting(verdict)
 
 
 def last_run_time(state: dict[str, str]) -> datetime:
@@ -164,14 +180,17 @@ def parse_row_stamp(stamp: object, path: Path) -> datetime:
     return parsed
 
 
-def history_row_age(window_hours: float) -> float:
+def require_fresh_history_row(
+    window_hours: float, successful_run_age: float
+) -> float:
     path = history_path()
     age = age_hours(newest_stamp(path))
     if age > window_hours:
         raise NotReporting(
             f"STALE HISTORY ROW: the newest reading in {path} is {age:.1f}h old, "
-            f"outside the {window_hours:g}h window, although {UNIT} reports a "
-            f"recent successful run, so the census is aborting before it appends; "
+            f"outside the {window_hours:g}h window, although {UNIT} last ran "
+            f"successfully {successful_run_age:.1f}h ago, so the census is "
+            f"aborting before it appends; "
             f"look for ABORT in journalctl --user -u {UNIT} -n 100"
         )
     return age
@@ -183,11 +202,11 @@ def age_hours(then: datetime) -> float:
 
 def assess(window_hours: float) -> str:
     state = read_unit_state()
-    require_installed(state)
+    require_loaded(state)
     run_age = age_hours(last_run_time(state))
     require_succeeded(state, run_age)
     require_recent_run(run_age, window_hours)
-    row_age = history_row_age(window_hours)
+    row_age = require_fresh_history_row(window_hours, successful_run_age=run_age)
     return (
         f"OK: {UNIT} last ran {run_age:.1f}h ago; "
         f"newest history row {row_age:.1f}h ago (window {window_hours:g}h)"

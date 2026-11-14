@@ -4039,8 +4039,11 @@ scripts/check_memory_metadata_census_reporting.py 72
 
 Exit 0 means the service's last run succeeded inside the window *and* the
 newest history row is inside it too. Non-zero means escalate, with one named
-verdict on stderr: `NOT INSTALLED` (LoadState is not `loaded`; run the
-installer), `NEVER RAN` or `STALE LAST RUN` (both carry the `list-timers`
+verdict on stderr: `NOT INSTALLED` (LoadState `not-found`; run the
+installer), `MASKED` (the timer cannot start a masked service; unmask it if
+the mask is not deliberate, then run the installer), `NOT LOADED` (any other
+LoadState; `systemctl --user status` names why systemd rejected the unit
+file), `NEVER RAN` or `STALE LAST RUN` (both carry the `list-timers`
 check for whether the timer is armed), `FAILED LAST RUN` or
 `UNREADABLE LAST RUN` (read the journal; a run that failed is reported as
 failed even when it is also stale), `STALE HISTORY ROW` or an unreadable

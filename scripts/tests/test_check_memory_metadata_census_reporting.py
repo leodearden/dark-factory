@@ -1,7 +1,7 @@
 """Tests for scripts/check_memory_metadata_census_reporting.py, the predicate
 that tells "the 05:00 census is producing readings" apart from every way it
-can fail to (never installed, never ran, stale or failed last run, history
-row stale behind a healthy unit).
+can fail to (never installed, masked or unloadable, never ran, stale or
+failed last run, history row stale behind a healthy unit).
 
 The probe is driven through its real subprocess boundary. A fake
 `systemctl` on PATH answers `show -p ...` from a JSON state file and
@@ -217,6 +217,29 @@ def _assert_named_failure(result, *fragments):
         assert fragment in result.stderr, (fragment, result.stderr)
 
 
+@pytest.mark.parametrize(
+    ("load_state", "verdict", "remedy"),
+    [
+        ("masked", "MASKED", f"systemctl --user unmask {UNIT}"),
+        ("bad-setting", "NOT LOADED", f"systemctl --user status {UNIT}"),
+        ("error", "NOT LOADED", f"systemctl --user status {UNIT}"),
+    ],
+)
+def test_present_but_unloaded_unit_is_not_called_not_installed(
+    tmp_path, load_state, verdict, remedy
+):
+    result = _run(
+        tmp_path, "48",
+        fields=_healthy_fields(LoadState=load_state),
+        history=_history_with_newest_stamp(_hours_ago(2)),
+    )
+
+    _assert_named_failure(
+        result, f"{verdict}:", f"LoadState={load_state!r}", remedy, INSTALLER
+    )
+    assert "NOT INSTALLED" not in result.stderr, result.stderr
+
+
 def test_not_installed_and_never_ran_are_told_apart(tmp_path):
     fresh_history = _history_with_newest_stamp(_hours_ago(2))
     not_installed_dir = tmp_path / "not_installed"
@@ -329,7 +352,7 @@ def test_unparsable_exit_timestamp_fails_loud(tmp_path):
         history=_history_with_newest_stamp(_hours_ago(2)),
     )
 
-    _assert_named_failure(result, "'garbage'")
+    _assert_named_failure(result, "UNREADABLE LAST RUN", "'garbage'")
     assert "never run" not in result.stderr, result.stderr
 
 
@@ -341,7 +364,7 @@ def test_local_zone_exit_timestamp_fails_loud_rather_than_misdating(tmp_path):
         history=_history_with_newest_stamp(_hours_ago(2)),
     )
 
-    _assert_named_failure(result, "BST")
+    _assert_named_failure(result, "UNREADABLE LAST RUN", "BST")
 
 
 def test_unit_state_is_read_with_timestamps_pinned_to_utc(tmp_path):
@@ -361,7 +384,10 @@ def test_stale_history_row_behind_healthy_unit_fails(tmp_path):
         history=_history_with_newest_stamp(_hours_ago(25 * 24)),
     )
 
-    _assert_named_failure(result, "600.0h", "48h", str(tmp_path / HISTORY_RELPATH))
+    _assert_named_failure(
+        result, "STALE HISTORY ROW", "600.0h", "48h", "2.0h",
+        str(tmp_path / HISTORY_RELPATH),
+    )
 
 
 @pytest.mark.parametrize(
@@ -452,7 +478,7 @@ def test_nonzero_exec_main_status_fails_naming_it(tmp_path):
         history=_history_with_newest_stamp(_hours_ago(2)),
     )
 
-    _assert_named_failure(result, "ExecMainStatus='1'")
+    _assert_named_failure(result, "FAILED LAST RUN", "ExecMainStatus='1'")
 
 
 def test_systemctl_absent_from_path_is_unreadable_unit_state(tmp_path):
@@ -467,7 +493,9 @@ def test_systemctl_absent_from_path_is_unreadable_unit_state(tmp_path):
         path_dirs=[python_only],
     )
 
-    _assert_named_failure(result, "could not read unit state")
+    _assert_named_failure(
+        result, "UNREADABLE UNIT STATE", "could not read unit state"
+    )
 
 
 def test_systemctl_exiting_nonzero_is_unreadable_unit_state(tmp_path):
@@ -478,4 +506,6 @@ def test_systemctl_exiting_nonzero_is_unreadable_unit_state(tmp_path):
         exit_code=1,
     )
 
-    _assert_named_failure(result, "could not read unit state")
+    _assert_named_failure(
+        result, "UNREADABLE UNIT STATE", "could not read unit state"
+    )
