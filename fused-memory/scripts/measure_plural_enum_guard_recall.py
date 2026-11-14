@@ -105,11 +105,11 @@ from fused_memory.backends.graphiti_client import (
     INCOMPLETE_SHORT_READ,
     INCOMPLETE_STRUCTURAL_KINDS,
     INCOMPLETE_STRUCTURAL_REFUSAL,
-    _paged_ro_query,
 )
 from fused_memory.backends.graphiti_client import (
     _census_count as _shipped_census_count,
 )
+from fused_memory.backends.paged_read import paged_ro_query as _paged_ro_query
 
 # The shipped regex and the guard whose recall this probe measures.
 from fused_memory.reconciliation.status_snapshot_extraction import (
@@ -712,7 +712,7 @@ async def enumerate_valid_edge_facts(
 ) -> tuple[dict[str, str], EnumerationOutcome]:
     """Enumerate every valid RELATES_TO edge's fact text, keyed on edge uuid.
 
-    The paging itself is DELEGATED to graphiti_client's ``_paged_ro_query``
+    The paging itself is DELEGATED to paged_read's ``paged_ro_query``
     — the same audited engine ``enumerate_all_valid_edges`` uses — rather
     than re-derived here. This module used to own a second copy: its own
     census helper, its own page loop, its own structural guard, and its own
@@ -1912,7 +1912,7 @@ def render_markdown(report: Report) -> str:
         'and nothing in `graphiti_client.py` is owed a fix on this account.',
         '',
         'The paging is not this probe\'s own. It goes through '
-        '`graphiti_client._paged_ro_query` — the same audited engine the '
+        '`paged_read.paged_ro_query` — the same audited engine the '
         'production enumerator uses — and both of this probe\'s Cypher '
         'strings are COMPOSED from that module\'s `_ALL_VALID_EDGES_MATCH`, '
         'so the population measured here cannot drift from the population '
@@ -2094,7 +2094,7 @@ def _build_live_edge_source(config: Any) -> Any:
         graph = backend._graph_for(project_id)  # noqa: SLF001
 
         async def query_fn(cypher: str):
-            result = await graph.ro_query(cypher)
+            result = await graph.ro_query(cypher, op='edge_source')
             return result.result_set or []
 
         return await enumerate_valid_edge_facts(query_fn, page_size=page_size)
