@@ -3,7 +3,7 @@
 The fused-memory server 307-redirects ``/mcp/`` to ``/mcp``. A bare
 ``httpx.AsyncClient`` does not follow that redirect, so a POST to the slashed
 form is a perfectly successful HTTP exchange that discards the payload. The
-sweep guard in ``test_mcp_post_transport.py`` exists to stop a future call site
+sweep guard in ``test_mcp_url_sweep_guard.py`` exists to stop a future call site
 from reintroducing the slash; this module is how it looks.
 
 WHY PARSING, NOT GREP. The guard originally matched the substring ``}/mcp/'``.
@@ -77,6 +77,7 @@ __all__ = [
     'SLASHED_TAIL',
     'SweepFindings',
     'find_trailing_slash_mcp_urls',
+    'sweep_parsed',
     'sweep_source',
 ]
 
@@ -184,8 +185,12 @@ def _reported_line(lines: list[str], lineno: int) -> tuple[int, str]:
 
 def _slashed_url_spans(source: str, *, filename: str) -> list[tuple[int, int]]:
     """Return ``(first_line, last_line)`` of each outermost slashed-URL expression."""
+    return _slashed_url_spans_in(_parse(source, filename=filename))
+
+
+def _parse(source: str, *, filename: str) -> ast.Module:
     try:
-        tree = ast.parse(source, filename=filename)
+        return ast.parse(source, filename=filename)
     except SyntaxError as exc:
         raise AssertionError(
             f'cannot parse {filename} while sweeping for trailing-slash MCP URLs: '
@@ -195,6 +200,9 @@ def _slashed_url_spans(source: str, *, filename: str) -> list[tuple[int, int]]:
             f'sweep while silently covering one file less.'
         ) from exc
 
+
+def _slashed_url_spans_in(tree: ast.Module) -> list[tuple[int, int]]:
+    """:func:`_slashed_url_spans` over an already-parsed module."""
     # Report each site ONCE, at the outermost expression that owns the tail.
     # A naive walk matches both a JoinedStr and its inner Constant('/mcp/'),
     # and both a BinOp and its right operand. De-duplicating by line does not
@@ -209,8 +217,8 @@ def _slashed_url_spans(source: str, *, filename: str) -> list[tuple[int, int]]:
     # to produce an IDENTICAL ``nested`` set on every one of them: 3.4s here
     # vs 6.2s for the equivalent sub-walk form. (Parsing those files costs
     # ~7s on top of either, so this is a real but not dominant share; the
-    # guard's actual fix for wall clock is caching the walk — see
-    # ``test_mcp_post_transport.py::_sweep_findings``.)
+    # guard's actual fix for wall clock is parsing once, in the suite's shared
+    # tree pass — see ``_tree_scan.py``.)
     nested: set[int] = set()
     for node in ast.walk(tree):
         # A suppressed node's descendants are suppressed too; a tail-owning
@@ -256,7 +264,12 @@ def sweep_source(source: str, *, filename: str) -> SweepFindings:
     mute. Raises ``AssertionError`` naming *filename* if *source* does not
     parse, exactly as :func:`find_trailing_slash_mcp_urls` does.
     """
-    spans = _slashed_url_spans(source, filename=filename)
+    return sweep_parsed(_parse(source, filename=filename), source)
+
+
+def sweep_parsed(tree: ast.Module, source: str) -> SweepFindings:
+    """:func:`sweep_source` over *source* already parsed into *tree*."""
+    spans = _slashed_url_spans_in(tree)
     allowed: list[tuple[int, str]] = []
     malformed: list[tuple[int, str]] = []
     for lineno, comment in _marker_comments(source).items():

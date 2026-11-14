@@ -24,18 +24,14 @@ from _orch_helpers import (
     stamp_stock_routing_config,
 )
 from _recording_event_store import _RecordingEventStore
+from _tree_scan import python_files
 from df_pytest_isolation import git_redirect_env
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.review_checkpoint import ReviewCheckpoint
 from orchestrator.verify import VerifyResult
-
-# Compelled by test_whole_tree_scan_timeout_guard.py, whose detector matches the
-# fake linter's rglob('*.py'); that sweep covers only a few-file scratch repo.
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _LINT_MARKER = 'LINT_BAD'
 _BARE_FAIL_SUMMARY = 'Failures: lint issues'
@@ -79,11 +75,11 @@ def _printed_as(rel: str, module_dirs: Iterable[str]) -> str:
 async def _tree_walking_lint(
     project_root: Path, config: OrchestratorConfig, **_admission: object,
 ) -> VerifyResult:
+    root = project_root.resolve()
     offenders = sorted(
-        _printed_as(path.relative_to(project_root).as_posix(), config.module_configs_or_empty)
-        for path in project_root.rglob('*.py')
-        if '.git' not in path.relative_to(project_root).parts
-        and _LINT_MARKER in path.read_text()
+        _printed_as(path.relative_to(root).as_posix(), config.module_configs_or_empty)
+        for path in python_files(root, exclude_parts=frozenset({'.git'}))
+        if _LINT_MARKER in path.read_text()
     )
     if not offenders:
         return VerifyResult(

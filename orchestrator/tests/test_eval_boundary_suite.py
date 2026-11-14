@@ -87,10 +87,8 @@ from typing import Any
 
 import pytest
 from shared.cli_invoke import AgentResult
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from test_scheduler_dispatch_literal_tripwire import _dispatch_tool_literals
 from test_workflow_factory import (
-    _CONSTRUCT_RE,
     _FACTORY_CALL_RE,
     _orchestrator_src_root,
 )
@@ -110,16 +108,6 @@ from orchestrator.evals.runner import (
 )
 from orchestrator.mcp import verdict_tools as _verdict_tools
 from orchestrator.workflow import TaskWorkflow
-
-# test_b2_factory_single_construction_point reuses test_workflow_factory's
-# _orchestrator_src_root().rglob('*.py') helper (imported above) to scan every
-# *.py under orchestrator/src. Not individually reproduced under load; marked
-# because it is structurally identical to the three members that crashed.
-# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
-# ENFORCES this mark rather than trusting it to be sprinkled: see
-# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, and
-# test_whole_tree_scan_timeout_guard.py (task 4215).
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # The non-routable null sentinel EVAL_PROFILE pins fused_memory.url to, and the
 # production endpoint an un-isolated eval run would otherwise write into.
@@ -396,10 +384,11 @@ def test_b8_quality_from_review_artifact_contract_agnostic() -> None:
 
 # ── B2: factory single construction point (P2) ─────────────────────────────
 
-# The single-construction-point scanner — the ``_CONSTRUCT_RE`` /
-# ``_FACTORY_CALL_RE`` regexes and ``_orchestrator_src_root`` — is IMPORTED from
-# test_workflow_factory (the ONE authoritative scanner for the P2 grep-guard
-# invariant), so a fix there propagates here instead of drifting from a copy.
+# The tree-wide "only workflow.py constructs TaskWorkflow(" sweep is
+# test_taskworkflow_construction_point_guard.py::test_single_taskworkflow_construction_point,
+# the ONE static sweep for P2.  The dispatch-site regex ``_FACTORY_CALL_RE`` and
+# ``_orchestrator_src_root`` are IMPORTED from test_workflow_factory so a fix
+# there propagates here instead of drifting from a copy.
 
 
 def test_b2_factory_single_construction_point(
@@ -416,9 +405,10 @@ def test_b2_factory_single_construction_point(
         a new required ``TaskWorkflow`` param breaks the single construction
         point, hence BOTH dispatch sites (harness.py + evals/runner.py, which
         both route through ``build_workflow``) at once.
-    (2) Static: ``workflow.py`` is the ONLY production-source file constructing
-        ``TaskWorkflow(``, and both dispatch sites contain a ``build_workflow(``
-        call — proving there is no third bypass site.
+    (2) Static: both dispatch sites contain a ``build_workflow(`` call.  That
+        ``workflow.py`` is the ONLY production-source file constructing
+        ``TaskWorkflow(``, so there is no third bypass site, is proven by
+        test_taskworkflow_construction_point_guard.py::test_single_taskworkflow_construction_point.
     """
     from orchestrator import workflow as workflow_mod
     from orchestrator.workflow import build_workflow
@@ -439,21 +429,8 @@ def test_b2_factory_single_construction_point(
             mcp=object(),  # type: ignore[arg-type]
         )
 
-    # (2) Static single-point (compose the existing grep-guard invariant).
+    # (2) Static: both dispatch sites route through the factory.
     src_root = _orchestrator_src_root()
-    offenders: set[str] = set()
-    for path in src_root.rglob('*.py'):
-        text = path.read_text(encoding='utf-8', errors='ignore')
-        for line in text.splitlines():
-            code = line.split('#', 1)[0]  # drop trailing comment
-            if _CONSTRUCT_RE.search(code):
-                offenders.add(path.relative_to(src_root).as_posix())
-                break
-    assert offenders == {'workflow.py'}, (
-        f'Direct TaskWorkflow(...) construction is only permitted in workflow.py; '
-        f'offending files: {sorted(offenders)}'
-    )
-
     for rel in ('harness.py', 'evals/runner.py'):
         source = (src_root / rel).read_text(encoding='utf-8')
         assert _FACTORY_CALL_RE.search(source), (

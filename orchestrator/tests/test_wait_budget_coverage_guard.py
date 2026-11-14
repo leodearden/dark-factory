@@ -28,19 +28,25 @@ import functools
 import importlib
 import math
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from types import MappingProxyType
 
 import pytest
+from _tree_scan import (
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+    orchestrator_test_modules,
+)
 from _wait_budget_audit import ItemWaitAudit, audit_module, is_module_level_item
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
 pytestmark = [
     pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
-    # One tree scan per worker serves every test that reads it, so keep them
-    # on one worker.
-    pytest.mark.xdist_group('wait_budget_coverage_scan'),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
 ]
 
 _TESTS_DIR = Path(__file__).resolve().parent
@@ -130,17 +136,23 @@ def _module_census(audits: list[ItemWaitAudit]) -> _ModuleCensus:
     )
 
 
-@functools.cache
-def _scan_tree(tests_dir: Path) -> _TreeScan:
-    """Audit every billed test module in *tests_dir*, each importable by its
-    stem; retain extracted facts, never ASTs."""
+def _module_audits(module: ParsedModule) -> tuple[ItemWaitAudit, ...] | None:
+    """The billed items of a test module importable by its stem, or None when
+    it has nothing to audit."""
+    audits = audit_module(module.source, functools.partial(_module_namespace, module.path))
+    return None if audits is None else tuple(audits)
+
+
+ANALYSIS = TreeAnalysis(name=Path(__file__).stem, files=orchestrator_test_modules, extract=_module_audits)
+TREE_ANALYSES = (ANALYSIS,)
+
+
+def _scan_tree(audits_by_path: Mapping[Path, tuple[ItemWaitAudit, ...] | None]) -> _TreeScan:
+    """The ledger's view of every module's audits, in path order."""
     offenders: list[tuple[str, ItemWaitAudit]] = []
     exempt_offender_counts: dict[str, int] = {}
     census: dict[str, _ModuleCensus] = {}
-    for path in sorted(tests_dir.glob('test_*.py')):
-        audits = audit_module(
-            path.read_text(encoding='utf-8'), functools.partial(_module_namespace, path)
-        )
+    for path, audits in audits_by_path.items():
         if audits is None:
             continue
         found = [audit for audit in audits if audit.offends]
@@ -148,14 +160,14 @@ def _scan_tree(tests_dir: Path) -> _TreeScan:
             exempt_offender_counts[path.name] = len(found)
         else:
             offenders.extend((path.name, offender) for offender in found)
-        census[path.name] = _module_census(audits)
+        census[path.name] = _module_census(list(audits))
     return _TreeScan(tuple(offenders), exempt_offender_counts, census)
 
 
-def test_no_offender_outside_the_ledger() -> None:
+def test_no_offender_outside_the_ledger(tree_pass: TreePass) -> None:
     unledgered = [
         f'  - {module_file}::{offender.describe()}'
-        for module_file, offender in _scan_tree(_TESTS_DIR).offenders
+        for module_file, offender in _scan_tree(tree_pass.facts(ANALYSIS)).offenders
         if _node_id(module_file, offender) not in _WAIT_BUDGET_DEBT
     ]
 
@@ -175,10 +187,10 @@ def test_no_offender_outside_the_ledger() -> None:
     )
 
 
-def test_debt_ledger_matches_live_bills() -> None:
+def test_debt_ledger_matches_live_bills(tree_pass: TreePass) -> None:
     live = {
         _node_id(module_file, offender): offender
-        for module_file, offender in _scan_tree(_TESTS_DIR).offenders
+        for module_file, offender in _scan_tree(tree_pass.facts(ANALYSIS)).offenders
     }
     problems: list[str] = []
     for node_id, recorded in sorted(_WAIT_BUDGET_DEBT.items()):
@@ -204,8 +216,8 @@ def test_debt_ledger_matches_live_bills() -> None:
     )
 
 
-def test_synthetic_clock_exemptions_are_still_needed() -> None:
-    exempt_offender_counts = _scan_tree(_TESTS_DIR).exempt_offender_counts
+def test_synthetic_clock_exemptions_are_still_needed(tree_pass: TreePass) -> None:
+    exempt_offender_counts = _scan_tree(tree_pass.facts(ANALYSIS)).exempt_offender_counts
     stale = [
         f'  - {module}: no longer exists -- delete the entry.'
         if not (_TESTS_DIR / module).exists()
@@ -220,8 +232,8 @@ def test_synthetic_clock_exemptions_are_still_needed() -> None:
     )
 
 
-def test_the_scan_reaches_sibling_modules() -> None:
-    census = _scan_tree(_TESTS_DIR).census
+def test_the_scan_reaches_sibling_modules(tree_pass: TreePass) -> None:
+    census = _scan_tree(tree_pass.facts(ANALYSIS)).census
     totals = {
         'billed modules': (len(census), _MIN_BILLED_MODULES),
         'billed items': (
@@ -286,6 +298,18 @@ def _probe_tests_dir(directory: Path, modules: Mapping[str, str]) -> Iterator[Pa
             sys.modules.pop(stem, None)
 
 
+def _probe_audits(
+    tests_dir: Path, stems: Iterable[str]
+) -> Mapping[Path, tuple[ItemWaitAudit, ...] | None]:
+    """:data:`ANALYSIS`'s extraction over the probe modules *stems* in *tests_dir*, in a pass of its own."""
+    probe = TreeAnalysis(
+        name='wait_budget_probe',
+        files=lambda: [tests_dir / f'{stem}.py' for stem in stems],
+        extract=_module_audits,
+    )
+    return TreePass.run([probe]).facts(probe)
+
+
 def test_the_scan_drops_a_module_that_skips_at_import(tmp_path: Path) -> None:
     modules = {
         'test_wbcg_probe_audited': _PROBE_WAITING_TEST,
@@ -299,7 +323,7 @@ def test_the_scan_drops_a_module_that_skips_at_import(tmp_path: Path) -> None:
         ),
     }
     with _probe_tests_dir(tmp_path, modules) as tests_dir:
-        scan = _scan_tree(tests_dir)
+        scan = _scan_tree(_probe_audits(tests_dir, modules))
 
     assert list(scan.census) == ['test_wbcg_probe_audited.py'], (
         'only the module that imported and bills is audited; a module that '
@@ -321,4 +345,4 @@ def test_the_scan_fails_on_a_module_that_cannot_be_imported(tmp_path: Path) -> N
         _probe_tests_dir(tmp_path, modules) as tests_dir,
         pytest.raises(AssertionError, match='test_wbcg_probe_broken.py failed to import'),
     ):
-        _scan_tree(tests_dir)
+        _probe_audits(tests_dir, modules)

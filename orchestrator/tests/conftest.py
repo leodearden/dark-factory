@@ -24,6 +24,7 @@ from _live_mcp_guard import (
     assert_no_live_attempts,
     install_live_mcp_guard,
 )
+from _tree_scan import TreePass, analyses_requested_by
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -297,6 +298,20 @@ def pristine_repo_templates(
     """
     with session_templates(tmp_path_factory.mktemp('git-templates')) as templates:
         yield templates
+
+
+@pytest.fixture(scope='session')
+def tree_pass(request: pytest.FixtureRequest) -> TreePass:
+    """The one streaming whole-tree pass every ``TREE_ANALYSES`` consumer shares.
+
+    LAZY: only a worker that runs a consumer pays for it, and that cost is
+    billed to the first consumer item it runs, which is why every consumer
+    carries the whole-tree family mark.  NOT prebuilt at collection time
+    (unlike shared/tests/session_prebuild.py): every xdist worker collects
+    every item, so a prebuild would make every worker parse.  ``_tree_scan``
+    holds the mechanism.
+    """
+    return TreePass.run(analyses_requested_by(request.session.items))
 
 
 @pytest.fixture

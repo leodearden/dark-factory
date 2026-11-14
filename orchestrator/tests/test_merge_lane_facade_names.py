@@ -23,24 +23,33 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from _tree_scan import (
+    REPO_ROOT,
+    TREE_PASS_XDIST_GROUP,
+    ParsedModule,
+    TreeAnalysis,
+    TreePass,
+)
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# Reads every tracked .py that names the façade and ast-parses it, so it carries
-# the whole-tree scan ceiling; WHY lives at
-# shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+# The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
+pytestmark = [
+    pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT),
+    pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
+]
 
 # Same import of the scripts directory as test_merge_lane_ratchet.py:
 # source_measures lists the tracked files.
-_SCRIPTS = Path(__file__).parents[2] / 'scripts'
+_SCRIPTS = REPO_ROOT / 'scripts'
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 import source_measures  # type: ignore[import-not-found]  # noqa: E402
 
-_REPO_ROOT = Path(__file__).parents[2]
-
 _FACADE = 'orchestrator.merge_lane'
+#: Every spelling of a ``from`` import of the façade names this identifier,
+#: however its dotted name is spaced.
+_FACADE_LEAF = _FACADE.rpartition('.')[2]
 
 #: The package's own files import their siblings, never the façade.
 _PACKAGE_DIR = 'orchestrator/src/orchestrator/merge_lane/'
@@ -54,13 +63,41 @@ _FACADE_IMPORTER_FLOOR = 40
 def facade_imports(source: str, *, path: str) -> list[tuple[int, str]]:
     """``(lineno, name)`` for every name a ``from orchestrator.merge_lane import``
     in *source* binds, at any depth."""
+    return facade_imports_in(ast.parse(source, filename=path))
+
+
+def facade_imports_in(tree: ast.Module) -> list[tuple[int, str]]:
+    """:func:`facade_imports` over an already-parsed module."""
     return [
         (node.lineno, imported.name)
-        for node in ast.walk(ast.parse(source, filename=path))
+        for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom) and node.module == _FACADE and not node.level
         for imported in node.names
         if imported.name != '*'
     ]
+
+
+def _tracked_files_outside_the_package() -> tuple[Path, ...]:
+    return tuple(
+        REPO_ROOT / relpath
+        for relpath in source_measures.tracked_python_files(REPO_ROOT)
+        if not relpath.startswith(_PACKAGE_DIR)
+    )
+
+
+def _module_facade_imports(module: ParsedModule) -> tuple[tuple[int, str], ...]:
+    """:func:`facade_imports` over *module*, parsing it only if it can name the façade's last part."""
+    if not module.may_name(_FACADE_LEAF):
+        return ()
+    return tuple(facade_imports_in(module.tree))
+
+
+ANALYSIS = TreeAnalysis(
+    name=Path(__file__).stem,
+    files=_tracked_files_outside_the_package,
+    extract=_module_facade_imports,
+)
+TREE_ANALYSES = (ANALYSIS,)
 
 
 def _is_submodule(name: str) -> bool:
@@ -84,23 +121,37 @@ def facade() -> ModuleType:
     return importlib.import_module(_FACADE)
 
 
-def test_no_tracked_file_imports_a_missing_name_from_the_facade(facade: ModuleType) -> None:
-    importers = 0
-    stale: list[str] = []
-    for relpath in source_measures.tracked_python_files(_REPO_ROOT):
-        if relpath.startswith(_PACKAGE_DIR):
-            continue
-        source = (_REPO_ROOT / relpath).read_text(encoding='utf-8')
-        if _FACADE not in source:
-            continue
-        imports = facade_imports(source, path=relpath)
-        if imports:
-            importers += 1
-        stale.extend(stale_facade_names(imports, path=relpath, facade=facade))
+def test_no_tracked_file_imports_a_missing_name_from_the_facade(
+    tree_pass: TreePass, facade: ModuleType,
+) -> None:
+    facade_importers = {
+        path.relative_to(REPO_ROOT).as_posix(): imports
+        for path, imports in tree_pass.facts(ANALYSIS).items()
+        if imports
+    }
+    importers = len(facade_importers)
+    stale = [
+        entry
+        for relpath, imports in facade_importers.items()
+        for entry in stale_facade_names(list(imports), path=relpath, facade=facade)
+    ]
     assert importers >= _FACADE_IMPORTER_FLOOR, (
         f'only {importers} files import from the façade; the sweep is not reading the tree'
     )
     assert not stale, 'names imported from the façade that it does not have:\n' + '\n'.join(stale)
+
+
+@pytest.mark.parametrize('source', [
+    pytest.param('from orchestrator.ｍerge_lane import NoSuchName\n', id='compatibility-spelling'),
+    pytest.param('from orchestrator . merge_lane import NoSuchName\n', id='spaced-dot'),
+])
+def test_sweep_reads_every_spelling_of_the_facade_the_parser_accepts(
+    tmp_path: Path, source: str,
+) -> None:
+    path = tmp_path / 'importer.py'
+    path.write_text(source, encoding='utf-8')
+
+    assert _module_facade_imports(ParsedModule(path)) == ((1, 'NoSuchName'),)
 
 
 class TestStaleFacadeNames:

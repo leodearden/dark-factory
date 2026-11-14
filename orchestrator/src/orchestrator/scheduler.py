@@ -8982,7 +8982,7 @@ class Scheduler:
         that emitted without feeding would leave the event stream complete —
         so nothing would look broken — while the live history silently drifted
         from what ``seed_from_event_store`` would reconstruct off the same
-        stream.  test_scheduler_hold_history.py enforces the single site
+        stream.  test_lock_event_emit_site_guard.py enforces the single site
         structurally, by AST scan.
 
         The predictor is fed even when ``self.event_store`` is None: the
