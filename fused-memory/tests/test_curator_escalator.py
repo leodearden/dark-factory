@@ -25,6 +25,7 @@ import pytest
 from _escalation_queue_probe import probe_escalation_queue_io
 from _fm_helpers import LOOP_FREEDOM_CEILING_SECONDS, LoopFreedomProbe
 from _swallowed_failure_log import swallowed_causes
+from escalation.dedupe import compute_content_fingerprint
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
 
@@ -596,6 +597,21 @@ class TestZeroOutputTimeoutEscalation:
         finally:
             handle.close()
 
+    @pytest.mark.asyncio
+    async def test_zot_fingerprint_survives_the_shared_folding_filer(self, tmp_path):
+        """Live pending ZOT records keep folding only while their fold key is unchanged."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path, 'proj-fold'))
+
+            [parent] = _pending_records(tmp_path)
+            assert parent['dedupe_fingerprint'] == compute_content_fingerprint(
+                'curator_zero_output_hang', _PINNED_ZOT_ROOT_CAUSE,
+                affected_ids=['project:proj-fold'],
+            )
+        finally:
+            handle.close()
+
 
 
 class TestReportFailureReturnsZotEscalationId:
@@ -865,6 +881,14 @@ def _zot_report(root, project_id: str = 'proj-fold') -> dict[str, Any]:
     )
 
 
+def _streak_alarm(root, project_id: str = 'proj-x') -> dict[str, Any]:
+    return dict(
+        project_root=str(root), project_id=project_id,
+        streak=5, threshold=5,
+        last_justification='llm-failed: RuntimeError: boom', candidate_title='T',
+    )
+
+
 def _pending_records(root) -> list[dict[str, Any]]:
     return [
         json.loads(path.read_text())
@@ -1030,35 +1054,102 @@ class TestConsecutiveDegradedEscalation:
             assert 'threshold=5' in body
             assert 'llm-failed: FileNotFoundError: claude' in body
             assert 'T' in body
+            assert 'dedupe_count' in json.loads(body)['detail']
+        finally:
+            handle.close()
+
+    # Recurring runs fold into one pending record per project, mirroring the
+    # ZOT fold (task 3995): every run still counts, as the parent's
+    # dedupe_count, and nothing is suppressed.
+
+    @pytest.mark.asyncio
+    async def test_recurring_alarms_fold_into_one_pending_record(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            for _ in range(5):
+                await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path))
+
+            [parent] = _pending_records(tmp_path)
+            assert parent['category'] == 'curator_consecutive_degraded'
+            assert parent['dedupe_fingerprint']
+            assert parent['dedupe_count'] == 4
+            assert len(parent['dedupe_children']) == 4
         finally:
             handle.close()
 
     @pytest.mark.asyncio
-    async def test_bypasses_burst_suppression(self, tmp_path):
-        """Five successive alarms produce five escalations and leave the burst
-        window untouched.
+    async def test_alarm_after_resolution_is_a_new_record(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path))
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path))
+            [parent] = _pending_records(tmp_path)
+            EscalationQueue(tmp_path / 'data' / 'escalations').resolve(
+                parent['id'], 'curator recovered', resolved_by='test',
+            )
 
-        Suppression is exactly what would defeat this alarm: a curator degrading
-        steadily for days trips the threshold repeatedly, and each trip must be
-        visible. Not touching ``_failure_log`` also keeps this path from
-        consuming the ordinary window's budget.
-        """
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path))
+
+            [fresh] = _pending_records(tmp_path)
+            assert fresh['id'] != parent['id']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_folding_is_scoped_to_the_project(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path, 'proj-a'))
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path, 'proj-b'))
+
+            records = _pending_records(tmp_path)
+            assert len(records) == 2
+            assert all(r['dedupe_fingerprint'] for r in records)
+            assert records[0]['dedupe_fingerprint'] != records[1]['dedupe_fingerprint']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_folding_never_crosses_the_zot_record(self, tmp_path):
+        """A ZOT outage keeps both records pending: the diagnosis and the backstop."""
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+            escalator = CuratorEscalator()
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path, 'proj-fold'))
+            await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path, 'proj-fold'))
+            await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            records = _pending_records(tmp_path)
+            by_category = {r['category']: r for r in records}
+            assert len(records) == 2
+            assert by_category['curator_zero_output_hang']['dedupe_count'] == 1
+            assert by_category['curator_consecutive_degraded']['dedupe_count'] == 1
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_streak_alarms_leave_the_burst_window_untouched(self, tmp_path):
+        """The ordinary failure budget of three per window survives any number of streak alarms."""
         handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
         try:
             escalator = CuratorEscalator(cooldown_secs=3600.0)
-            for streak in range(5, 10):
-                await escalator.report_consecutive_degraded(
-                    project_root=str(tmp_path),
-                    project_id='proj-x',
-                    streak=streak,
-                    threshold=5,
-                    last_justification='llm-failed: RuntimeError: boom',
-                    candidate_title='T',
+            for _ in range(5):
+                await escalator.report_consecutive_degraded(**_streak_alarm(tmp_path))
+            for _ in range(3):
+                await escalator.report_failure(
+                    project_root=str(tmp_path), project_id='proj-x',
+                    justification='boom', candidate_title='T',
                 )
 
-            files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
-            assert len(files) == 5
-            assert escalator._failure_log == {}
+            categories = sorted(r['category'] for r in _pending_records(tmp_path))
+            assert categories == [
+                'curator_consecutive_degraded',
+                'curator_failure', 'curator_failure', 'curator_failure',
+            ]
         finally:
             handle.close()
 
