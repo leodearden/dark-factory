@@ -95,7 +95,7 @@ class _Recorder(Middleware):
         self.log = log
 
     async def on_call_tool(self, context, call_next):
-        self.log.append((self.label, dict(context.message.arguments)))
+        self.log.append((self.label, dict(context.message.arguments or {})))
         return await call_next(context)
 
 
@@ -104,8 +104,10 @@ class _RaisesBeforeForwarding(Middleware):
         self.exc = exc
 
     async def on_call_tool(self, context, call_next):
-        context.message.arguments['note'] = 'edited by a member that then crashed'
-        context.message.arguments['smuggled'] = True
+        arguments = context.message.arguments
+        assert arguments is not None
+        arguments['note'] = 'edited by a member that then crashed'
+        arguments['smuggled'] = True
         raise self.exc
 
 

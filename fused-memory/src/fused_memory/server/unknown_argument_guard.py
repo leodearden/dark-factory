@@ -56,7 +56,7 @@ class UnknownArgumentMiddleware(Middleware):
 def install_unknown_argument_guard(mcp: Any) -> None:
     install_tool_middleware(
         mcp,
-        UnknownArgumentMiddleware(),
+        (UnknownArgumentMiddleware(),),
         sentinel='_fused_memory_unknown_argument_guarded',
         label='unknown-argument guard',
     )

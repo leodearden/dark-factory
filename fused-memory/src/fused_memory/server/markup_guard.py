@@ -331,7 +331,7 @@ def install_markup_guard(
         fact_sink=None,
     )
     install_tool_middleware(
-        mcp, guard, sentinel=_MARKUP_GUARDED_SENTINEL, label='markup guard'
+        mcp, (guard,), sentinel=_MARKUP_GUARDED_SENTINEL, label='markup guard'
     )
     logger.info(
         'markup boundary guard installed at ToolManager.call_tool '
