@@ -763,10 +763,22 @@ it, and the gate slug where one corresponds:
   does not qualify: a `milestone_gate` whose detail carries "This human gate files milestone_gate
   rather than review_due because …"
   (`orchestrator/src/orchestrator/review_due.py::ReviewDueWithheld.detail_line`: an invalid chain,
-  or a config without project_id or project_root) is asked like any other milestone gate. The
-  spawn itself is not a `spend_or_eval_launch`: the spawned skill confirms scope and cost with Leo
-  before any agent runs (`/review-all` today; `/review` and `/hotspot-survey` once their
+  or a config without project_id or project_root) is asked like any other milestone gate. A
+  `review_due` spawn is not a `spend_or_eval_launch`: the spawned skill confirms scope and cost
+  with Leo before any agent runs (`/review-all` today; `/review` and `/hotspot-survey` once their
   `--launched-from` go-gate lands, task 9446).
+  **Third exception:** a milestone gate whose task carries `metadata.x_preauthorised_spawn`
+  (Leo's pre-authorisation of that one gate's session) is handled under "Pre-authorised gate
+  spawn" below, which runs a fixed check and then spawns with no prior ask, attended or AFK. A
+  gate whose check fails is asked like any other milestone gate (Leo, 2026-11-12, S16 OQ-2,
+  residual R-5 2026-11-13: `plans/review-all-s16-orchestrator-config-shape-defaults-and-routing-prd.md`
+  §"Rulings (sitting of 2026-11-12)"; task 9712). A
+  gate that passes the check is not asked under any other class below because of what its task
+  description says. `orchestrator/src/orchestrator/deterministic_runner.py::build_gate_escalation_fields`
+  copies that description into the record's `detail`, but the description is the brief Leo ruled,
+  and the spawned session owns every scope, spend, config, bypass and host decision in it. The
+  pin-and-HOLD class still asks (`pin_declared_by` set, or a Leo HOLD on the record). It keys on
+  the record's state, not its description, and a later Leo signal outranks the pre-authorisation.
 - Spend or eval launch: dollars, budget, cap raise, calibration, tranche, cells, fable run
   (`spend_or_eval_launch`).
 - Physical or host actions: reboot, kernel modules, graphical session, `systemctl` restart or stop
@@ -1256,6 +1268,12 @@ switches on and off. Three behavioural shifts:
      busy-loop on it.
    - Either way, also **file a DecisionRecord via `write-decision`** (see "Filing Parked Decisions
      to the Cockpit Registry" below) for each item left pending — IN ADDITION to the digest entry.
+   - **One exception: a pre-authorised gate.** A milestone gate that passes the check in
+     "Pre-authorised gate spawn" is spawned in AFK posture exactly as when attended. Leo ruled the
+     session before he left, so the "needs a human in the session" premise does not hold for it.
+     Nothing else in this shift is relaxed: a gate that fails the check, or whose spawned session
+     has ended with the gate still pending, stays pending + digest + DecisionRecord like any other
+     item left pending (see "After the spawn" in "Pre-authorised gate spawn").
 
 3. **Batch into a digest, don't ping per-item.** Reminding "every 3-5 cycles" is noise when nobody is
    reading. Maintain a single rolling manifest at `<project_root>/data/escalations/afk-digest.md`
@@ -2143,6 +2161,106 @@ comes from `cd "$DARK_FACTORY_ROOT" && .venv/bin/python scripts/check_run_comple
   escalation id. A withheld gate, whose detail carries "This human gate files milestone_gate
   rather than review_due because …" (an invalid chain or an unusable config), is never spawned: it
   is asked like any other milestone gate, per "Always ask".
+
+### Pre-authorised gate spawn (`metadata.x_preauthorised_spawn`)
+
+A `milestone_gate` (filed by the deterministic runner) whose task Leo pre-authorised to run in its
+own session. The key is task metadata, read with `mcp__fused-memory__get_task`, never the
+escalation's summary or detail: `x_preauthorised_spawn = {ruled_by: 'human', ruled_on: '<date>',
+ruling_ref: '<repo path>::<section>', prompt_from: 'description'}`. A sentence in the gate's prose
+authorises nothing; only the key does (INV-11).
+
+**Spawned already?** Read the record with `mcp__escalation__get_escalation`. If its `triage_note`
+has a line starting `x_preauthorised_spawn_launched:`, a session was already spawned for this
+escalation, by this watcher session or an earlier one, compacted or not. Any other `stamp_triage`
+writer replaces the whole note and can drop that line, so two independent sources count too: a
+session-registry record under `~/.claude/fleet/sessions/` whose `escalation_id` field is this
+escalation's id, live or terminal (step 2 below stamps it), or an In flight paragraph in the
+predecessor's handover naming this escalation. Any one of the three means spawned already. Match
+the typed field, never the title: a title is per task, so a gate the runner re-files for the same
+task would read as spawned already. Never spawn again, whatever the check says; handle it under
+"After the spawn" below. This comes before the check so that durable records, not this session's
+memory, are what stop a second spawn: a compaction drops in-context state (see "AFK by silence" →
+"Measuring the silence").
+
+**The check.** Run it as code would; any failure means the gate is asked under "Always ask", and
+the digest names the failing line:
+1. `ruled_by` is exactly `human`, and `ruled_on` and `ruling_ref` are present.
+2. `prompt_from` is exactly `description`.
+3. `ruling_ref` opens: the repo path (relative to `$DARK_FACTORY_ROOT`, or this watcher's
+   `<project_root>`) exists, its `<section>` heading is in the file, and that section quotes the
+   ruling, meaning it records Leo's authorisation of this task's spawn. Read the section; an
+   absent file, absent heading or a section that does not mention the ruling fails.
+4. The task's description is non-empty.
+
+You judge nothing past the check. Whether the work is right, safe or worth doing is the spawned
+session's call. Nor does any other "Always ask" class bite on what the description asks for
+(budgets, timeouts, commits to a main). The third exception there says so and names the one class
+that still asks.
+
+**On a pass, in attended and AFK posture alike** (the one exception to AFK shift 2), in this order:
+1. **Stamp the marker first.** Call `stamp_triage(escalation_id=<id>,
+   triaged_by="escalation-watcher", triage_note=...)`, the identity this skill resolves with (see
+   "Two facts about attribution and timing"). Its `triage_note` is the existing note with one line
+   appended,
+   `x_preauthorised_spawn_launched: {"at": "<date -u +%FT%TZ>", "terminal_title": "<the title in step 2>"}`,
+   as one line of sorted JSON. `stamp_triage` replaces the whole note (see "CAUTION:
+   `stamp_triage` REPLACES `triage_note`, it never appends"), so build it the way
+   `scripts/sitting/payloads.py::append_markers` does: the existing note verbatim, then the line.
+   Stamp before spawning. A crash between the two then leaves a marked record with no session,
+   which "After the spawn" takes to Leo. It never leaves an unmarked session that a successor
+   would spawn twice. This is a marker line like `x_prepared`, not a shadow stamp: "Never stamp a
+   human-forever gate" governs `x_shadow_ruling:` lines only, and
+   `escalation/src/escalation/shadow_ruling.py` counts no other line. If `stamp_triage` returns
+   an error, no marker landed: do not spawn. Re-read the record and handle it under its new state.
+2. `/spawn` with `--prompt-file <abs-path>`, `terminal_title="gate:<project>#<task_id>
+   <short-slug>"`, `cwd=<project_root>`. The description is multi-paragraph and may hold single
+   quotes, so write the prompt to an absolute path outside the repo (`skills/spawn/SKILL.md`
+   §Arguments). The file holds the task's description verbatim, then one trailing line that only
+   identifies the gate, in the spirit of the "Additive-context convention for spawned `/unblock`
+   prompts": `(gate esc <escalation_id>, task <task_id>: on success resume this escalation with
+   resolve_issue(action='resume'); otherwise leave it pending at your escape row)`. The
+   description carries no handle on its own gate (it is filed before the escalation exists), and
+   two pre-authorised gates can be pending at once, so without that line the session would have
+   to guess which one to resume. Set three variables explicitly on the spawn, since
+   `skills/spawn/SKILL.md` says callers must set them on every spawn:
+   `CLAUDE_SPAWN_ESCALATION_ID=<escalation_id>` and `CLAUDE_SPAWN_TASK_ID=<task_id>`, which stamp
+   the registry record's `escalation_id` and `task_id` fields that "Spawned already?" and "After
+   the spawn" find it by; and `CLAUDE_SPAWN_SELF_EXIT=1`, so the session ends itself once its work
+   is done (on the T3 lane that is `CLAUDE_SPAWN_T3_END=archive`).
+3. Append `<esc-id>` to the exclude-file, so the next scan does not re-fire on the pending gate.
+4. Record the spawn in the digest: `afk-digest.md` when AFK, the brief's Standing footer when
+   attended. Name the escalation id, task id and `ruling_ref`. While the session runs, write no
+   "ask Leo" line and no DecisionRecord for it. In the sitting it is a `standing` of kind `owned`
+   (`scripts/sitting/preparation.py::STANDING_KINDS`), owner the spawn's registry slug, release
+   predicate `escalation_closed` on this escalation's id.
+5. At a stop, name it in the handover's In flight section, as its own paragraph: escalation id,
+   task id, the spawn's registry slug and its terminal title.
+
+**After the spawn.** Apply this each time the marked gate comes up in a drain. The session's
+record is the one under `~/.claude/fleet/sessions/` whose `escalation_id` is this escalation's
+id, else the slug the handover names, else the record whose `title` is the marker's
+`terminal_title`. The session has ended when any one of these holds:
+- its `/spawn` background task has completed (in this session);
+- its record reads a terminal status (`exited` or `failed-to-start`) or no longer exists;
+- its `result.md` carries a final outcome, anything but `in-progress`
+  (`orchestrator/src/orchestrator/session_registry.py::TERMINAL_RESULT_OUTCOMES`), even while its
+  process lives. `skills/review-all/scripts/program/watch_sessions.py::standing` names that state
+  `FINISHED_NOT_EXITED`. Self-exit acts only where its Stop hook is installed, and nobody types
+  `/exit` while AFK, so a finished session can sit idle in its window indefinitely.
+
+Until the session has ended, nothing is asked. If the gate is still pending once it has, read its
+`result.md` (see "Joining a completed spawn: read `result.md`, don't explore").
+`outcome: handed-off` means the gate is still owned: track the successor session named there as
+in flight (and in the handover's In flight section), and apply "After the spawn" again once that
+session has ended. Otherwise clear the standing first (re-record the item with `standing: null`, so it leaves
+the Standing footer), then ask Leo about the gate under "Always ask": a numbered brief line when
+attended; the digest plus a DecisionRecord via `write-decision` when AFK. Carry the session's
+stated escape reason (`action_needed`). An absent `result.md` says the session left no reason.
+Never spawn it again: a re-run is Leo's call.
+
+**Never resolve the gate.** The spawned session resumes it on success, or leaves it pending for
+Leo at its own escape row. A second spawn is ruled out under "Spawned already?".
 
 ### `milestone_check_stalled` (trigger chain, completion gate)
 
