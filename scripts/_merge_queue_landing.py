@@ -52,6 +52,11 @@ submit whose reply the transport lost may still have been accepted, so the
 queue is then asked about the deploy branch by its unique name, and the
 request it names is waited for like any other.
 
+A caller that lands on a cadence calls `reclaim_retained_deploys` first. A
+deploy an earlier run retained is torn down once it can no longer land, and
+one that still may is returned, so the caller can skip rather than stack a
+second request beside it.
+
 The calling heredoc's side of the contract (argv-only inputs, the script's
 directory on sys.path, the checkout venv's interpreter) is
 scripts/_config_reload_gate.py's.
@@ -205,6 +210,31 @@ def land_file(
         repo, {path: content}, base_sha, port=port, label=label, message=message,
         timeout_secs=timeout_secs, main_branch=main_branch, clock=clock,
     )
+
+
+def reclaim_retained_deploys(repo: str, label: str, *, port: str,
+                             main_branch: str = "main") -> tuple[str, ...]:
+    """The deploy branches of *label* in the checkout *repo* whose request may
+    still land, once every other one is torn down.
+
+    A deploy that can no longer land is torn down: *main_branch* carries its
+    tip, or the queue of the orchestrator whose escalation MCP listens on
+    127.0.0.1:*port* reports its request settled. One the queue reports in
+    flight, or whose poll the transport dropped, is kept.
+    """
+    checkout = Path(repo)
+    queue: _MergeQueue | None = None
+    kept: list[str] = []
+    for branch in _deploy_branches_of(checkout, label):
+        if not _main_carries(checkout, main_branch, branch):
+            queue = queue or _MergeQueue.connect(port)
+            reply = queue.poll(_status_handle(branch))
+            if reply is None or _may_still_land(reply.get("state")):
+                kept.append(branch)
+                continue
+        worktree = _worktree_of(checkout, branch)
+        _tear_down(checkout, branch, worktree=worktree, scratch=_deploy_scratch_of(worktree))
+    return tuple(kept)
 
 
 def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: _Deadline,
@@ -451,12 +481,7 @@ class _Target:
         return proc.stdout if proc.returncode == 0 else None
 
     def carries(self, tip: str) -> bool:
-        """Whether main holds *tip*: as an ancestor, or as an equal patch (the
-        queue may land a rebased copy)."""
-        if _run_git(self.repo, "merge-base", "--is-ancestor", tip, self.main_branch).returncode == 0:
-            return True
-        cherry = _git(self.repo, "cherry", self.main_branch, tip).splitlines()
-        return bool(cherry) and all(line.startswith("-") for line in cherry)
+        return _main_carries(self.repo, self.main_branch, tip)
 
     def unsynced_paths(self) -> list[str]:
         """The landed paths whose copy on disk in the checkout is not main's:
@@ -466,6 +491,15 @@ class _Target:
 
     def main_tip(self) -> str:
         return _git(self.repo, "rev-parse", self.main_branch)
+
+
+def _main_carries(repo: Path, main_branch: str, tip: str) -> bool:
+    """Whether *main_branch* holds *tip*: as an ancestor, or as an equal patch
+    (the queue may land a rebased copy)."""
+    if _run_git(repo, "merge-base", "--is-ancestor", tip, main_branch).returncode == 0:
+        return True
+    cherry = _git(repo, "cherry", main_branch, tip).splitlines()
+    return bool(cherry) and all(line.startswith("-") for line in cherry)
 
 
 def _holds(on_disk: Path, content: bytes | None) -> bool:
@@ -500,6 +534,44 @@ def _crosses_symlink(root: Path, relative: str) -> bool:
     return (resolved_root / relative).resolve() != resolved_root / relative
 
 
+_DEPLOY_BRANCH_PREFIX = "task/deploy-"
+_DEPLOY_STAMP = "%Y%m%dT%H%M%SZ"
+_SCRATCH_PREFIX = "deploy-landing-"
+
+
+def _deploy_branch_name(label: str, at: datetime) -> str:
+    return f"{_DEPLOY_BRANCH_PREFIX}{label}-{at.strftime(_DEPLOY_STAMP)}"
+
+
+def _is_deploy_branch_of(label: str, branch: str) -> bool:
+    """Whether *branch* is a name _deploy_branch_name gives a deploy of
+    *label*: one of a longer label sharing its prefix is not."""
+    stamp = branch.removeprefix(f"{_DEPLOY_BRANCH_PREFIX}{label}-")
+    if stamp == branch:
+        return False
+    try:
+        return datetime.strptime(stamp, _DEPLOY_STAMP).strftime(_DEPLOY_STAMP) == stamp
+    except ValueError:
+        return False
+
+
+def _deploy_branches_of(repo: Path, label: str) -> list[str]:
+    heads = _git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/task/").splitlines()
+    branches = (ref.removeprefix("refs/heads/") for ref in heads)
+    return [branch for branch in branches if _is_deploy_branch_of(label, branch)]
+
+
+def _bare_id(branch: str) -> str:
+    """*branch* without its `task/` prefix: the id the queue knows it by."""
+    return branch.removeprefix("task/")
+
+
+def _status_handle(branch: str) -> dict[str, str]:
+    """The merge_status arguments naming *branch*'s most recent request: a
+    deploy branch is unique, so that request is its deploy's."""
+    return {"branch": _bare_id(branch)}
+
+
 @dataclass(frozen=True)
 class _DeployBranch:
     """The deploy commit, on its own branch, checked out in a worktree under a
@@ -512,8 +584,8 @@ class _DeployBranch:
 
     @classmethod
     def create(cls, target: _Target, base_sha: str, *, label: str, message: str) -> _DeployBranch:
-        scratch = Path(tempfile.mkdtemp(prefix="deploy-landing-"))
-        branch = f"task/deploy-{label}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+        scratch = Path(tempfile.mkdtemp(prefix=_SCRATCH_PREFIX))
+        branch = _deploy_branch_name(label, datetime.now(UTC))
         worktree = _worktree_in(scratch)
         try:
             # Its own step, not `worktree add -b`: that leaves the branch it
@@ -531,7 +603,7 @@ class _DeployBranch:
             _git(worktree, "commit", "-q", "--no-verify", "-m", message, "--", *target.paths)
             tip = _git(worktree, "rev-parse", "HEAD")
         except BaseException:
-            _tear_down(target.repo, scratch, branch)
+            _tear_down(target.repo, branch, worktree=worktree, scratch=scratch)
             raise
         return cls(target.repo, scratch, branch, tip)
 
@@ -541,17 +613,14 @@ class _DeployBranch:
 
     @property
     def bare_id(self) -> str:
-        """The branch without its `task/` prefix: the id the queue knows it by."""
-        return self.branch.removeprefix("task/")
+        return _bare_id(self.branch)
 
     @property
     def status_handle(self) -> dict[str, str]:
-        """The merge_status arguments naming this branch's most recent
-        request: the branch is unique, so that request is this deploy's."""
-        return {"branch": self.bare_id}
+        return _status_handle(self.branch)
 
     def tear_down(self) -> None:
-        _tear_down(self.repo, self.scratch, self.branch)
+        _tear_down(self.repo, self.branch, worktree=self.worktree, scratch=self.scratch)
 
     def retained(self, refusal: LandingNotConfirmed) -> LandingNotConfirmed:
         """*refusal*, naming what was kept for a request that may still land."""
@@ -589,13 +658,35 @@ def _worktree_in(scratch: Path) -> Path:
     return scratch / "worktree"
 
 
-def _tear_down(repo: Path, scratch: Path, branch: str) -> None:
-    """Remove the deploy worktree, its branch and the scratch directory,
-    whichever of them still exist. A step git refuses is reported on stderr,
-    never raised: tidying up must not replace the landing's own outcome."""
-    worktree = _worktree_in(scratch)
+def _worktree_of(repo: Path, branch: str) -> Path | None:
+    """The worktree git records as having *branch* checked out, whether or not
+    its directory still exists; None when there is none."""
+    worktree = None
+    for line in _git(repo, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            worktree = Path(line.removeprefix("worktree "))
+        elif line == f"branch refs/heads/{branch}":
+            return worktree
+    return None
+
+
+def _deploy_scratch_of(worktree: Path | None) -> Path | None:
+    """The scratch directory _DeployBranch.create made to hold *worktree*, or
+    None when *worktree* is not one it placed."""
+    if worktree is None or worktree != _worktree_in(worktree.parent):
+        return None
+    return worktree.parent if worktree.parent.name.startswith(_SCRATCH_PREFIX) else None
+
+
+def _tear_down(repo: Path, branch: str, *, worktree: Path | None, scratch: Path | None) -> None:
+    """Remove the deploy *worktree* (None: no worktree has *branch* checked
+    out), *branch*, and the *scratch* directory holding the worktree (None:
+    none of ours), whichever of them still exist. A step git refuses is
+    reported on stderr, never raised: tidying up must not replace the
+    landing's own outcome."""
     removals: list[tuple[str, ...]] = (
-        [("worktree", "remove", "--force", str(worktree))] if worktree.exists() else []
+        [("worktree", "remove", "--force", str(worktree))]
+        if worktree is not None and worktree.exists() else []
     )
     removals.append(("worktree", "prune"))
     if _run_git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0:
@@ -606,7 +697,8 @@ def _tear_down(repo: Path, scratch: Path, branch: str) -> None:
             print(f"{_LOG_PREFIX} could not tear down {branch} in {repo}: git {' '.join(args)} "
                   f"failed (rc={proc.returncode}): {proc.stderr.decode(errors='replace').strip()}",
                   file=sys.stderr)
-    shutil.rmtree(scratch, ignore_errors=True)
+    if scratch is not None:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
