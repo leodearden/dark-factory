@@ -26,6 +26,7 @@ from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 
 RELATIVE_SCRIPT = 'data/ops/deploy.sh'
+_ABSENT = object()
 WRITE_CWD_TO_MARKER = '#!/bin/sh\npwd -P > "$MARKER"\n'
 
 BASELINE_UNIT_STATE: dict = {
@@ -494,6 +495,8 @@ def _stamped_keys(scheduler) -> set[str]:
 BEFORE_DONE_REFUSALS = [
     pytest.param({'cwd': 5}, ('before_done.cwd', "'int'"), id='cwd-not-a-string'),
     pytest.param({'script_root': 'elsewhere'}, ("'elsewhere'",), id='unknown-script-root'),
+    pytest.param({'script': 5}, ('before_done.script', 'int'), id='script-not-a-string'),
+    pytest.param({'script': _ABSENT}, ('before_done.script',), id='script-missing'),
 ]
 
 
@@ -507,13 +510,14 @@ class TestRefusedBeforeDoneIsANamedInfraIssue:
         request: pytest.FixtureRequest,
     ) -> None:
         task_id = f'9116-{request.node.callspec.id}'
-        task = _task(task_id, {
+        record = {
             'script': RELATIVE_SCRIPT,
             'timeout_secs': 10,
             'env': {'MARKER': str(marker)},
             **leg.fields,
             **refusal_fields,
-        })
+        }
+        task = _task(task_id, {key: value for key, value in record.items() if value is not _ABSENT})
         scheduler = _scheduler(task, project_root)
         runner_kwargs: dict = {}
         if leg.own_unit is not None:

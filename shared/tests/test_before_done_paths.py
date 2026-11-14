@@ -21,6 +21,7 @@ from shared.before_done_paths import (
     BeforeDonePathsRefused,
     CwdRefused,
     FactoryRootUnresolved,
+    ScriptRefused,
     ScriptRoot,
     ScriptRootRefused,
     resolve_before_done_paths,
@@ -177,8 +178,16 @@ class TestRefusalFamily:
                 ScriptRootRefused,
             ),
             (FACTORY_PREDICATE, lambda: None, FactoryRootUnresolved),
+            ({'cwd': 'sub'}, _never_consulted, ScriptRefused),
+            ({'script': 5}, _never_consulted, ScriptRefused),
         ],
-        ids=['non-string-cwd', 'unknown-script-root', 'unresolvable-factory-root'],
+        ids=[
+            'non-string-cwd',
+            'unknown-script-root',
+            'unresolvable-factory-root',
+            'missing-script',
+            'non-string-script',
+        ],
     )
     def test_every_refusal_is_a_before_done_paths_refused_value_error(
         self, before_done: dict, factory_root_resolver, refusal: type[Exception],
@@ -207,6 +216,35 @@ class TestRefusalFamily:
         before_done = {'script': RELATIVE_SCRIPT, 'cwd': 5, 'script_root': 'elsewhere'}
 
         with pytest.raises(CwdRefused):
+            resolve_before_done_paths(before_done, ROOT, _never_consulted)
+
+    @pytest.mark.parametrize(
+        'before_done',
+        [{}, {'script': 5}, {'script': ['x.sh']}, {'script': None}, {'script': ''}, {'script': '   '}],
+        ids=['missing', 'int', 'list', 'none', 'empty', 'blank'],
+    )
+    def test_bad_script_refused_naming_field_and_value(self, before_done: dict) -> None:
+        value = before_done.get('script')
+
+        with pytest.raises(ScriptRefused) as excinfo:
+            resolve_before_done_paths(before_done, ROOT, _never_consulted)
+
+        assert 'before_done.script' in str(excinfo.value)
+        assert repr(value) in str(excinfo.value)
+        assert type(value).__name__ in str(excinfo.value)
+
+    def test_script_is_refused_before_cwd_and_script_root(self) -> None:
+        before_done = {'script': 5, 'cwd': 5, 'script_root': 'elsewhere'}
+
+        with pytest.raises(ScriptRefused):
+            resolve_before_done_paths(before_done, ROOT, _never_consulted)
+
+    def test_bad_script_on_a_factory_predicate_is_refused_before_the_resolver_runs(
+        self,
+    ) -> None:
+        before_done = {'script': 5, 'kind': 'predicate', 'script_root': 'factory'}
+
+        with pytest.raises(ScriptRefused):
             resolve_before_done_paths(before_done, ROOT, _never_consulted)
 
 
