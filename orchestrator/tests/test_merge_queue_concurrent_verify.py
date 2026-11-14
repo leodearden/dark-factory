@@ -3474,9 +3474,17 @@ class TestRunnerUnavailableHeadCascade:
         #   · both N and N+1 are re-dispatched via the redispatch park
         gate_a_release.set()
 
-        # Release N+1's gate so the (possibly still-running) gated task
-        # can unblock even if cancel() arrives slightly late.
-        gate_b_release.set()
+        # N+1's verify stays gated until the cascade cancels it: a verify that
+        # finished first would already have released its lease at its verdict
+        # (task 8526), leaving the cascade no remote verify to cancel.
+        async def _cascade_cancelled_b() -> None:
+            while not gated_remote.cancel_verify.called:
+                await asyncio.sleep(0.01)
+
+        try:
+            await asyncio.wait_for(_cascade_cancelled_b(), timeout=45.0)
+        finally:
+            gate_b_release.set()
 
         # Wait for both to resolve. A real timeout now fails loudly by
         # name (task 3477) instead of leaving outcome_X as a confusing

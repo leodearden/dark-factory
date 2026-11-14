@@ -214,7 +214,7 @@ async def _cascade(
         if b_finishes_first:
             b_release.set()
             await _until(
-                lambda: _lease_activity(lane, f'{prefix}-b') == 'finished',
+                lambda: _lease_activity(lane, f'{prefix}-b') == 'verified_pending_landing',
                 what=f'{prefix}-b verify to finish',
             )
         a_release.set()
