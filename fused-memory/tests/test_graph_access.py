@@ -14,16 +14,19 @@ from typing import TypeVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_falkor_live import FALKOR_HOST, FALKOR_PORT, falkor_skipif
 from _graph_access_fake import HangingRawGraph, wait_forever
 from _import_closure import SRC, modules_loaded_by_importing
 
-from fused_memory.backends import paged_read
+from fused_memory.backends import graphiti_client, paged_read
 from fused_memory.backends.graph_access import (
     BudgetedGraph,
     FalkorGraphAccess,
     OpBoundReader,
     paged_ro_query,
 )
+from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.config.schema import FalkorDBProviderConfig, QueueConfig
 
 _T = TypeVar('_T')
 
@@ -370,6 +373,64 @@ class TestEveryBackendCypherMethodIsBudgeted:
             await _guarded(backend.ensure_entity_node('Alice', group_id='g'))
 
         assert str(raised.value) == f'Graphiti _mint_entity_node timed out after {_WRITE_S}s'
+
+
+class TestTheConnectionHasASocketTimeout:
+    """The FalkorDB connection itself is bounded, beyond every named budget."""
+
+    def test_the_default_socket_timeout_outlasts_the_default_write_budget(self):
+        assert (
+            FalkorDBProviderConfig().socket_timeout_seconds
+            > QueueConfig().backend_write_timeout_seconds
+        )
+
+    def test_the_driver_connects_with_the_socket_timeout_and_its_clones_share_it(
+        self, monkeypatch,
+    ):
+        falkor_db = MagicMock()
+        monkeypatch.setattr(graphiti_client, 'FalkorDB', falkor_db)
+
+        driver = graphiti_client._MultiTenantFalkorDriver(
+            host='h', port=1, password='p', socket_timeout=7.5,
+        )
+
+        falkor_db.assert_called_once_with(host='h', port=1, password='p', socket_timeout=7.5)
+        assert driver.client is falkor_db.return_value
+        assert driver.clone('g').client is driver.client
+
+    @pytest.mark.asyncio
+    async def test_initialize_connects_with_the_configured_socket_timeout(
+        self, mock_config, monkeypatch,
+    ):
+        falkor_db = MagicMock()
+        monkeypatch.setattr(graphiti_client, 'FalkorDB', falkor_db)
+        monkeypatch.setattr(graphiti_client, 'Graphiti', MagicMock(return_value=AsyncMock()))
+        mock_config.llm.providers.openai.api_key = ''
+        mock_config.graphiti.falkordb.uri = 'redis://falkor-host:6390'
+        mock_config.graphiti.falkordb.socket_timeout_seconds = 12.5
+
+        await GraphitiBackend(mock_config, registered_graph_ids=()).initialize(
+            skip_maintenance=True,
+        )
+
+        falkor_db.assert_called_once_with(
+            host='falkor-host',
+            port=6390,
+            password=mock_config.graphiti.falkordb.password,
+            socket_timeout=12.5,
+        )
+
+    @falkor_skipif()
+    @pytest.mark.asyncio
+    async def test_a_live_connection_carries_the_socket_timeout(self):
+        driver = graphiti_client._MultiTenantFalkorDriver(
+            host=FALKOR_HOST, port=FALKOR_PORT, socket_timeout=12.5,
+        )
+        try:
+            pool = driver.client.connection.connection_pool
+            assert pool.connection_kwargs['socket_timeout'] == 12.5
+        finally:
+            await driver.client.aclose()
 
 
 def test_the_egress_module_loads_no_graphiti_and_no_falkordb():
