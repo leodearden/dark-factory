@@ -1099,7 +1099,7 @@ task-status effect:
 |---|---|---|
 | `resume` | → `pending` (resumes in place) | Your fix addresses the concern; let the task continue from here |
 | `restart` | → `pending` (restart from scratch) | The approach needs a redesign, not a patch |
-| `park` | → `blocked`; the L2 stays **open** | You need to leave it blocked but haven't resolved the underlying issue yet |
+| `park` | → `blocked`; the L2 stays **open** | You need to leave it blocked but haven't resolved the underlying issue yet. Refused on an `info` record (code `park_on_info`, nothing changed), because an info record never pins its task |
 | `abandon` | → `cancelled` | The task should not be pursued |
 | `close_only` | no task effect | The escalation itself is stale/moot but the task's own status is already correct — closes the escalation record without touching the task |
 
@@ -1107,6 +1107,76 @@ Always read the returned `resolution_action` back to confirm it matches
 what you intended — the parameter ordering matters (`action` before a long
 free-text `resolution`) and a mis-ordered call can silently record the
 wrong action.
+
+### Info notes, deliberate holds, and the info-L0 router
+
+An `info` record is a note with a consumer, never a hold: only a non-info
+record can keep a task from merging. The design home is
+[plans/info-l0-disposition-router-prd.md](plans/info-l0-disposition-router-prd.md).
+
+- **Holds are explicit.** To hold a task deliberately, `park` a non-info
+  record (the L2 stays open and the row stays `blocked`), or leave an open
+  non-info record on the task. An info record at any level never gates a
+  merge (`orchestrator/src/orchestrator/workflow.py::_is_gating_escalation`,
+  via `escalation/src/escalation/pins.py::needs_human`), never vetoes
+  recovery, never pins, and cannot be parked. For a task whose only records
+  are info, defer the task instead. A green, reviewed branch whose only open
+  records are info merges. A `blocked` row whose reason reads 'Gated by open
+  L2 <ids>; no steward applicable' was held by a non-info record that no
+  steward acted on; 'Steward re-escalated to human' appears only when a
+  steward actually filed the hand-off.
+- **Who consumes an info note.** In order: the reviewer (its verdict's
+  `note_dispositions`), then a steward already running for the task, then
+  the router at the workflow's exit. A requeued exit leaves the note pending
+  for the next incarnation. The orphan reaper and the startup amnesty route
+  whatever is left. The chain is described in ARCHITECTURE.md §3.6 and §6,
+  and the decision table lives in
+  `escalation/src/escalation/disposition.py::route_info_l0`.
+- **Reading a routed note.** A dispositioned note is closed under one of
+  four `resolution_class` values:
+
+  | `resolution_class` | What happened | Task exists? |
+  |---|---|---|
+  | `addressed` | The reviewer verified it fixed on this branch; resolved_by `reviewer-comprehensive/workflow` | No |
+  | `observation-consumed` | A pure observation: the reviewer said `no_action`, or the author's `suggested_action` opened with a no-action declaration | No |
+  | `converted` | The curator created or combined a follow-up task. The resolution text carries `converted:<task id>` and the curator ticket; the submit carried `metadata.escalation_id=<source id>`, so `find_tasks_by_metadata` finds a task it created | Yes |
+  | `status-info` | A mechanical harness notice (filer listed in `escalation/src/escalation/classify.py::INFO_L0_MECHANICAL_ROLES`) or a done-step-commit orphan. It is listed in its class's aggregate L1: sentinel task id `__info_l0_status_info_<class>__`, agent_role `harness-info-l0-router`, suggested_action `acknowledge_status_info`, one per class per sweep, amended rather than re-filed while open | No |
+
+  A pending info note stamped `triaged_by='info-l0-router'`, whose triage
+  note starts 'info-l0-router hold: ', is waiting on a curator ticket. The
+  orphan reaper owns it and finishes it within
+  `info_l0_router_ticket_timeout_secs`, so leave it alone.
+- **The `convert_to_task` fallback L1.** A note the router could not convert
+  is dismissed and promoted to one L1 under agent_role
+  `harness-info-l0-router` with suggested_action `convert_to_task`. Its
+  summary reads 'Info note not converted to a task (<reason>): …' and its
+  `detail` starts with the author's original text. The reason is one of
+  `escalation/src/escalation/disposition.py::PromoteReason`:
+  `ticket_refused`, `ticket_failed`, `ticket_timeout`, `conversion_cap`,
+  `router_error`, `no_convertible_content`. It is never
+  `manual_intervention`. Its consumer is the auto-watcher, which files the
+  task with `metadata.escalation_id=<source id>` or closes it with a
+  rationale. Overflow past the per-sweep conversion cap is listed in one
+  aggregate under `__info_l0_conversion_overflow__`.
+- **The auto-watcher's info-only-cluster rung.** `promote_to_l2` with
+  `severity` omitted over an all-info cluster returns
+  `{'status': 'refused', 'code': 'info_only_cluster', 'members': […], 'unusable': […], 'derived_severity': 'info'}`.
+  Nothing is minted and nothing is folded into a pending L2. The watcher
+  closes `members` at L1 with a digest line, or re-issues with an explicit
+  blocking severity when it judges the cluster collectively blocking; it
+  never re-issues with `severity='info'`. The recipe is
+  `skills/escalation-watcher-auto/SKILL.md`, section "Info-only cluster". So
+  the L2 queue the standing `/escalation-watcher` drains holds no
+  inherited-info records.
+- **Telemetry and knobs.** Every disposition is one `info_l0_dispositioned`
+  event (`escalation_id`, `class`, `by`, `exit_kind`, `ticket`, `task_id`,
+  `decided_at`), and the dashboard's Analytics tab counts the four classes
+  above under `dispositioned`. The four `info_l0_*` config keys
+  (`info_l0_router_enabled`, `info_l0_router_ticket_timeout_secs`,
+  `info_l0_router_max_conversions_per_sweep`, `info_l0_note_detail_chars`)
+  are green-tier hot-reloadable; `info_l0_router_enabled` is the kill switch.
+  Their defaults live in
+  `orchestrator/src/orchestrator/config.py::OrchestratorConfig`.
 
 ### Merge-halt semantics (`wip_conflict` / `unmerged_state` / `stash_failed`)
 
