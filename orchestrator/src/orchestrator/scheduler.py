@@ -120,7 +120,7 @@ from orchestrator.recovery_emission import (
     veto_signature,
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
-from orchestrator.sentinel_l1 import file_sentinel_l1
+from orchestrator.sentinel_l1 import file_sentinel_l1, resolve_sentinel_l1
 from orchestrator.starvation_watchdog import (
     AUTO_PIN_CAP_SENTINEL,
     STARVATION_WATCHDOG_ROLE,
@@ -1678,13 +1678,13 @@ class Scheduler:
         # The I-6 arming gate and its storm-escape state (task 3819, PRD D12).
         self._anchor_gate = AnchorCoverageGate()
         # The continuity work-product probe (task 3820, PRD C3).  The lambdas
-        # and the bound method read self at call time, so a hot TTL retune and
-        # the late attribute-injected escalation_queue are both honoured.
+        # read self at call time, so a hot TTL retune and the late
+        # attribute-injected escalation_queue are both honoured.
         self.work_product = WorkProductProbe(
             ttl_secs=lambda: self.config.scoring.continuity_probe_ttl_secs,
             clock=self._time_source,
             escalate=lambda l1: file_sentinel_l1(self.escalation_queue, l1),
-            resolve=self._resolve_sentinel_l1,
+            resolve=lambda sentinel, resolution: resolve_sentinel_l1(self.escalation_queue, sentinel, resolution),
         )
         # --- Startup gate (task 2235, W10-α) ---
         # False until finish_startup() is called.  acquire_next() asserts
@@ -7208,18 +7208,6 @@ class Scheduler:
         if verdict.escalation is not None:
             file_sentinel_l1(self.escalation_queue, verdict.escalation)
         return verdict.armed
-
-    def _resolve_sentinel_l1(self, sentinel: str, resolution: str) -> None:
-        """Resolve each open L1 the scheduler filed under *sentinel*, its condition cleared; never raises."""
-        queue = self.escalation_queue
-        if queue is None:
-            return
-        try:
-            for esc in queue.get_by_task(sentinel, status='pending', level=1, agent_role='orchestrator-scheduler'):
-                queue.resolve(esc.id, resolution, resolved_by='orchestrator-scheduler')
-                logger.info('Auto-resolved L1 %s escalation %s', sentinel, esc.id)
-        except Exception:
-            logger.warning('Failed to resolve %s escalation', sentinel, exc_info=True)
 
     def _load_work_product(self, store: EventStore) -> WorkProductSnapshot:
         """Git's task branches plus the restart-safe zero-progress gate, on a worker thread (PRD C3).
