@@ -6,13 +6,15 @@ a JSON string).  Every reader here tolerates every known shape and never
 raises: callers sit inside broad ``except Exception`` sweeps where a raise
 would silently skip the whole sweep rather than one malformed row.
 
-Stdlib only, so any package may import it.
+Stdlib and the stdlib-only `shared.task_metadata_wire` wire rule, so any package may
+import it.
 """
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from typing import Any
+
+from shared.task_metadata_wire import coerce_task_metadata
 
 __all__ = ['dependency_ids', 'is_deterministic', 'train_id']
 
@@ -47,24 +49,22 @@ def _dependency_id(entry: Any) -> str:
 
 
 def train_id(task: Mapping[str, Any]) -> str | None:
-    """Return ``metadata.train.id`` when it is a non-blank value, else ``None``."""
-    metadata = task.get('metadata')
-    train = metadata.get('train') if isinstance(metadata, dict) else None
+    """Return ``metadata.train.id`` when it is a non-empty value, else ``None``.
+
+    A falsy id (``0``, ``False``, ``[]``) or blank text is ``None``.
+    """
+    train = _metadata(task).get('train')
     raw = train.get('id') if isinstance(train, dict) else None
-    if raw is None:
+    if not raw:
         return None
     text = str(raw)
     return text if text.strip() else None
 
 
 def is_deterministic(task: Mapping[str, Any]) -> bool:
-    """Return True iff *task*'s metadata (a dict or a JSON string) has ``task_kind == 'deterministic'``."""
-    metadata = task.get('metadata') or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except ValueError:
-            return False
-    if not isinstance(metadata, dict):
-        return False
-    return metadata.get('task_kind') == _DETERMINISTIC_KIND
+    """Return True iff *task*'s metadata has ``task_kind == 'deterministic'``."""
+    return _metadata(task).get('task_kind') == _DETERMINISTIC_KIND
+
+
+def _metadata(task: Mapping[str, Any]) -> dict[str, Any]:
+    return coerce_task_metadata(task.get('metadata')) or {}

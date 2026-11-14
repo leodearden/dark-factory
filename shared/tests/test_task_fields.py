@@ -18,7 +18,10 @@ class TestDependencyIds:
         assert dependency_ids({'dependencies': [1, '2', 3]}) == ['1', '2', '3']
 
     def test_dict_entry_with_id_is_unwrapped(self):
-        assert dependency_ids({'dependencies': [{'id': 7}, 8, '9']}) == ['7', '8', '9']
+        assert dependency_ids({'dependencies': [{'id': 7}, {'id': '6'}, 8, '9']}) == ['7', '6', '8', '9']
+
+    def test_set_takes_the_list_branch(self):
+        assert sorted(dependency_ids({'dependencies': {1, '2', 0}})) == ['1', '2']
 
     def test_dict_entry_without_id_is_stringified_whole(self):
         entry = {'name': 'x'}
@@ -61,6 +64,12 @@ class TestTrainId:
     def test_non_empty_id(self):
         assert train_id({'metadata': {'train': {'id': 'tr-1'}}}) == 'tr-1'
 
+    def test_int_id_is_stringified(self):
+        assert train_id({'metadata': {'train': {'id': 5}}}) == '5'
+
+    def test_json_string_metadata(self):
+        assert train_id({'metadata': '{"train": {"id": "tr-1"}}'}) == 'tr-1'
+
     @pytest.mark.parametrize(
         'task',
         [
@@ -72,6 +81,10 @@ class TestTrainId:
             {'metadata': {'train': {'id': None}}},
             {'metadata': {'train': {'id': ''}}},
             {'metadata': {'train': {'id': '   '}}},
+            {'metadata': {'train': {'id': 0}}},
+            {'metadata': {'train': {'id': False}}},
+            {'metadata': {'train': {'id': []}}},
+            {'metadata': {'train': {'id': {}}}},
             {'metadata': {'train': 'tr-1'}},
             {'metadata': 'not-a-dict'},
         ],
