@@ -15,13 +15,16 @@ the module docstring and ``plans/cross-graph-entity-leak-prd.md`` decision 5.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import extract_cypher, extract_params
+from _graph_access_fake import FakeGraphAccess, HangingRawGraph
 from _relates_to_doubles import EdgeFixture, answer_edge_read, written_edge_properties
 
+from fused_memory.backends.graph_access import GraphHandle
 from fused_memory.backends.graphiti_client import NodeNotFoundError
 from fused_memory.maintenance import cross_graph_move
 from fused_memory.maintenance.cross_graph_move import (
@@ -193,12 +196,15 @@ def _compact_reply(cell) -> list:
 
 
 class TestReadCompactVectorTransport:
-    """_read_compact_vector(falkor_client, *, group_id, cypher) raw-reply parsing."""
+    """_read_compact_vector(graph, *, cypher, op) raw-reply parsing."""
 
-    def _client_returning(self, reply) -> MagicMock:
-        client = MagicMock()
-        client.execute_command = AsyncMock(return_value=reply)
-        return client
+    def _raw_returning(self, reply) -> MagicMock:
+        raw = MagicMock()
+        raw.execute_command = AsyncMock(return_value=reply)
+        return raw
+
+    def _graph_over(self, raw: MagicMock, group_id: str) -> GraphHandle:
+        return FakeGraphAccess({group_id: raw}).graph(group_id)
 
     @pytest.mark.asyncio
     async def test_returns_exact_bracketed_token_string(self):
@@ -207,17 +213,17 @@ class TestReadCompactVectorTransport:
         Uses the full-precision recorded fixture tokens, so a regression that
         (say) round-tripped a token through float() would alter the returned
         string and fail here. Also asserts the raw `--compact` command is
-        issued verbatim against the given group_id/cypher.
+        issued verbatim against the given graph/cypher.
         """
         cypher = 'MATCH (n:Entity {uuid: \'x\'}) RETURN n.name_embedding'
         reply = _compact_reply([
             _VALUE_VECTORF32_TAG,
             [b'0.5', b'0.10000000149011611938', b'-0.987654321098765432'],
         ])
-        client = self._client_returning(reply)
+        raw = self._raw_returning(reply)
 
         out = await cross_graph_move._read_compact_vector(
-            client, group_id=SOURCE_GRAPH_FIXTURE, cypher=cypher,
+            self._graph_over(raw, SOURCE_GRAPH_FIXTURE), cypher=cypher, op='test',
         )
 
         # (a) exact bracketed token string, byte-for-byte the --compact fixture.
@@ -228,7 +234,7 @@ class TestReadCompactVectorTransport:
             == EXPECTED_VECF32_LITERAL_FIXTURE
         )
         # It issued the raw GRAPH.RO_QUERY ... --compact command as given.
-        client.execute_command.assert_awaited_once_with(
+        raw.execute_command.assert_awaited_once_with(
             'GRAPH.RO_QUERY', SOURCE_GRAPH_FIXTURE, cypher, '--compact',
         )
 
@@ -236,30 +242,30 @@ class TestReadCompactVectorTransport:
     async def test_str_tokens_are_materialized_without_float_coercion(self):
         """Non-bytes (str) tokens pass through via str(v), never float()-coerced."""
         reply = _compact_reply([_VALUE_VECTORF32_TAG, ['0.5', '0.10000000149011611938']])
-        client = self._client_returning(reply)
+        raw = self._raw_returning(reply)
 
         out = await cross_graph_move._read_compact_vector(
-            client, group_id=SOURCE_GRAPH_FIXTURE, cypher='RETURN n.name_embedding',
+            self._graph_over(raw, SOURCE_GRAPH_FIXTURE), cypher='RETURN n.name_embedding', op='test',
         )
 
         assert out == '[0.5, 0.10000000149011611938]'
 
     @pytest.mark.asyncio
     async def test_non_vectorf32_scalar_type_raises_naming_group_id_and_cypher(self):
-        """A non-VECTORF32 scalar-type tag raises ValueError citing group_id + cypher.
+        """A non-VECTORF32 scalar-type tag raises ValueError citing the graph + cypher.
 
         Guards the scalar-type constant (_VALUE_VECTORF32): a wrong tag, or a
         genuinely wrong-typed column, must fail loudly with a diagnostic
-        naming both the group_id and the cypher rather than mis-parsing.
+        naming both the graph and the cypher rather than mis-parsing.
         """
         cypher = 'RETURN e.fact_embedding'
         # scalar_type 10 (e.g. VALUE_ARRAY) != VECTORF32 -> type check fires.
         reply = _compact_reply([10, [b'not', b'a', b'vector']])
-        client = self._client_returning(reply)
+        raw = self._raw_returning(reply)
 
         with pytest.raises(ValueError) as excinfo:
             await cross_graph_move._read_compact_vector(
-                client, group_id='know_live', cypher=cypher,
+                self._graph_over(raw, 'know_live'), cypher=cypher, op='test',
             )
 
         msg = str(excinfo.value)
@@ -280,10 +286,10 @@ class TestReadCompactVectorTransport:
         missing vector.
         """
         reply = _compact_reply([_VALUE_NULL_TAG, None])
-        client = self._client_returning(reply)
+        raw = self._raw_returning(reply)
 
         out = await cross_graph_move._read_compact_vector(
-            client, group_id=SOURCE_GRAPH_FIXTURE, cypher='RETURN n.name_embedding',
+            self._graph_over(raw, SOURCE_GRAPH_FIXTURE), cypher='RETURN n.name_embedding', op='test',
         )
 
         assert out is None
@@ -295,17 +301,17 @@ class TestReadCompactVectorTransport:
 
         A transient race (the source row deleted between an earlier
         existence check and this read) or an unexpected reply shape must
-        surface as a hard, diagnosable failure naming group_id/cypher --
+        surface as a hard, diagnosable failure naming the graph/cypher --
         consistent with the non-VECTORF32 path just above -- rather than an
         undiagnosable IndexError from indexing an empty rows list.
         """
         cypher = 'RETURN n.name_embedding'
         reply = ['header', [], 'stats']  # zero rows
-        client = self._client_returning(reply)
+        raw = self._raw_returning(reply)
 
         with pytest.raises(ValueError) as excinfo:
             await cross_graph_move._read_compact_vector(
-                client, group_id=SOURCE_GRAPH_FIXTURE, cypher=cypher,
+                self._graph_over(raw, SOURCE_GRAPH_FIXTURE), cypher=cypher, op='test',
             )
 
         msg = str(excinfo.value)
@@ -387,7 +393,7 @@ class TestMoveEntityAcrossGraphsNodeCore:
         read_params = extract_params(source_mock.ro_query.call_args_list[0])
         assert read_params.get('uuid') == NODE_UUID_FIXTURE
         fake_read_compact.assert_awaited_once()
-        assert fake_read_compact.call_args.kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert fake_read_compact.call_args.args[0].name == SOURCE_GRAPH_FIXTURE
 
         # (b) issues a CREATE against target_graph carrying the byte-exact
         # vecf32 literal plus the node's uuid/name/group_id params.
@@ -470,7 +476,7 @@ class TestMoveEntityAcrossGraphsEdges:
         # fact_embedding is read via the raw transport for the node AND the edge
         assert fake_read_compact.await_count == 2
         edge_embed_call = fake_read_compact.call_args_list[1]
-        assert edge_embed_call.kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert edge_embed_call.args[0].name == SOURCE_GRAPH_FIXTURE
         assert EDGE_UUID_FIXTURE in edge_embed_call.kwargs.get('cypher', '')
 
         # target.query is called twice: (1) node CREATE, (2) edge CREATE
@@ -1134,7 +1140,7 @@ class TestMergeForeignDuplicate:
         assert create_written['fact'] == 'Alice is related to Carol.'
 
         fake_read_compact.assert_awaited_once()
-        assert fake_read_compact.call_args.kwargs.get('group_id') == WRONG_GRAPH_FIXTURE
+        assert fake_read_compact.call_args.args[0].name == WRONG_GRAPH_FIXTURE
         assert UNIQUE_WRONG_EDGE_UUID_FIXTURE in fake_read_compact.call_args.kwargs.get('cypher', '')
 
         # (b) the wrong-graph-copy DETACH DELETE runs strictly AFTER the
@@ -1365,7 +1371,7 @@ class TestCreateMovedNode:
         read_params = extract_params(source_mock.ro_query.call_args_list[0])
         assert read_params.get('uuid') == NODE_UUID_FIXTURE
         fake_read_compact.assert_awaited_once()
-        assert fake_read_compact.call_args.kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert fake_read_compact.call_args.args[0].name == SOURCE_GRAPH_FIXTURE
 
         # CREATEs the node in target with the byte-exact vecf32 literal and
         # the rewritten group_id -- never the source's original group_id.
@@ -2053,7 +2059,7 @@ class TestRecreateSubgraphRelationships:
             if EDGE_UUID_FIXTURE in c.kwargs.get('cypher', '')
         ]
         assert len(embed_calls) == 1
-        assert embed_calls[0].kwargs.get('group_id') == SOURCE_GRAPH_FIXTURE
+        assert embed_calls[0].args[0].name == SOURCE_GRAPH_FIXTURE
 
         # the incident MENTIONS link is also recreated.
         mention_create_calls = [
@@ -2323,7 +2329,7 @@ class TestRecreateSubgraphRelationships:
         assert written['group_id'] == WRONG_GRAPH_FIXTURE
 
         fake_read_compact.assert_awaited_once()
-        assert fake_read_compact.call_args.kwargs.get('group_id') == WRONG_GRAPH_FIXTURE
+        assert fake_read_compact.call_args.args[0].name == WRONG_GRAPH_FIXTURE
         assert UNIQUE_WRONG_EDGE_UUID_FIXTURE in fake_read_compact.call_args.kwargs.get('cypher', '')
 
         # no DETACH DELETE of the wrong copy in this phase.
@@ -3007,3 +3013,63 @@ class TestRecreateSubgraphRelationships:
 
         target_mock.query.assert_not_awaited()
         fake_read_compact.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Every public function's raw Cypher runs under the backend's named budgets.
+# ---------------------------------------------------------------------------
+
+_BUDGETED_TIMEOUT_RE = r'^Graphiti \S+ timed out after 0\.0[58]s$'
+
+
+class TestCrossGraphMoveIsBudgeted:
+    """Over graphs that never answer, each public function fails on a named budget."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'call',
+        [
+            lambda g: move_entity_across_graphs(
+                g, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            ),
+            lambda g: create_moved_node(
+                g, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            ),
+            lambda g: create_moved_episode(
+                g, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE,
+            ),
+            lambda g: delete_source_node(g, NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE),
+            lambda g: delete_source_episode(g, MOVED_EPISODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE),
+            lambda g: merge_foreign_duplicate(
+                g, NODE_UUID_FIXTURE, WRONG_GRAPH_FIXTURE, HOME_GRAPH_FIXTURE,
+            ),
+            lambda g: recreate_subgraph_relationships(
+                g, [_move_spec(NODE_UUID_FIXTURE, SOURCE_GRAPH_FIXTURE, TARGET_GRAPH_FIXTURE)],
+            ),
+        ],
+        ids=[
+            'move_entity_across_graphs',
+            'create_moved_node',
+            'create_moved_episode',
+            'delete_source_node',
+            'delete_source_episode',
+            'merge_foreign_duplicate',
+            'recreate_subgraph_relationships',
+        ],
+    )
+    async def test_a_hanging_graph_fails_on_a_named_budget(
+        self, mock_config, make_backend, make_graph_driver, call,
+    ):
+        config = mock_config.model_copy(update={
+            'queue': mock_config.queue.model_copy(update={
+                'backend_read_timeout_seconds': 0.05,
+                'backend_write_timeout_seconds': 0.08,
+            }),
+        })
+        backend = make_backend(config, driver=make_graph_driver({
+            SOURCE_GRAPH_FIXTURE: HangingRawGraph(),
+            TARGET_GRAPH_FIXTURE: HangingRawGraph(),
+        }))
+
+        with pytest.raises(TimeoutError, match=_BUDGETED_TIMEOUT_RE):
+            await asyncio.wait_for(call(backend), timeout=5.0)
