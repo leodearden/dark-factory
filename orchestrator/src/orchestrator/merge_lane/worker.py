@@ -15614,13 +15614,14 @@ class SpeculativeMergeWorker:
 
     def _holds_lookahead(self, item: RealMergeItem) -> bool:
         """Whether the merger waits for *item*'s dispatch before its look-ahead
-        pop (task 7720): only a speculative item can chain, only while
-        ``merge_deep.chain_cap`` (read live) is on, and only a live verifier
-        loop can decide."""
+        pop (task 7720): any item may chain at its own dispatch (a
+        non-speculative one when it is then alone in the verify frontier,
+        which the merger cannot know yet; PRD D5), so the look-ahead waits for
+        every dispatch's decision while ``merge_deep.chain_cap`` (read live)
+        is on and a live verifier loop can decide."""
         verifier = self._verifier_task
         return (
-            item.speculative
-            and item.request.config.merge_deep.chain_cap > 0
+            item.request.config.merge_deep.chain_cap > 0
             and verifier is not None
             and not verifier.done()
         )
