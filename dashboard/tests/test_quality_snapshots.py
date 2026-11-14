@@ -337,6 +337,7 @@ class TestScanRoot:
         assert [point.diff.state for point in scan.points] == [DiffState.FIRST, DiffState.READY, DiffState.READY]
         for previous, point in zip(scan.points, scan.points[1:], strict=False):
             assert point.diff.previous_id == previous.point_id
+            assert point.diff.pair_key is not None
             assert scan.new_diffs[point.diff.pair_key].text == diff_text(point.file, previous.file)
         assert (scan.unplaced, scan.pending_summaries, scan.pending_diffs) == ((), 0, 0)
         assert sorted(scene.calls()) == ['--current', '--current', '--summary', '--summary', '--summary']

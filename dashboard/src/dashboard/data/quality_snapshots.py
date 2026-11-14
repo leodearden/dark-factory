@@ -10,19 +10,24 @@ the boundary. Nothing re-derives a measure. Design: plans/quality-dashboard-prd.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from shared.project_id import fold_project_token
-from shared.quality_series.git_lines import git_output
+from shared.quality_series.git_lines import GitObjectMissing, GitTimeout, git_output
 
+from dashboard.data.quality_markers import SnapshotIdentity
 from dashboard.data.quality_root_tick import FACTORY_REPO
 
 BASELINE_HOME = Path('plans/quality-metrics')
@@ -332,3 +337,313 @@ def summarise(
     """The instrument's ``--summary PATH --json``, decoded; InstrumentRefused when it refuses *path*."""
     document = _run_instrument(instrument, ['--summary', str(path), '--json'], path, timeout_s)
     return SnapshotSummary.from_document(document)
+
+
+
+# ---------------------------------------------------------------------------
+# One root's scan on a worker thread: cached by file state, then by content digest plus summariser
+# digest; diffs by identity pair plus summariser digest.
+
+
+def summariser_digest(instrument: Path) -> str:
+    """sha256 of the instrument and the source_measures beside it: what a cached figure was computed by."""
+    digest = hashlib.sha256()
+    for path in (instrument, instrument.with_name('source_measures.py')):
+        digest.update(path.read_bytes())
+        digest.update(b'\0')
+    return digest.hexdigest()
+
+
+class DiffState(StrEnum):
+    FIRST = 'first'
+    READY = 'ready'
+    PENDING = 'pending'
+    FAILED = 'failed'
+
+
+@dataclass(frozen=True)
+class FileState:
+    """One snapshot file as last read, and the summariser that read it."""
+
+    point_id: str
+    file: Path
+    baseline: bool
+    size: int
+    mtime_ns: int
+    digest: str
+    summariser: str
+
+
+def _state_fields(state: FileState) -> dict[str, Any]:
+    return {name.name: getattr(state, name.name) for name in fields(FileState)}
+
+
+def cache_identity(summary: SnapshotSummary, digest: str) -> str:
+    """(as_of_sha, canonical params) when every params key is known; else the content digest,
+    because unknown equals no identity."""
+    if summary.unknown_params:
+        return f'digest:{digest}'
+    return f'{summary.as_of_sha} {json.dumps(summary.params, sort_keys=True)}'
+
+
+def pair_key(previous_identity: str, current_identity: str, summariser: str) -> str:
+    """The diff cache key: both cache identities plus the summariser digest."""
+    return hashlib.sha256(json.dumps([previous_identity, current_identity, summariser]).encode()).hexdigest()[:32]
+
+
+@dataclass(frozen=True)
+class PointDiff:
+    """A point's diff against the point before it; no previous point and no pair key for the first."""
+
+    previous_id: str | None
+    pair_key: str | None
+    state: DiffState
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ScannedPoint(FileState):
+    """A placed snapshot: summarised by the instrument, and its as_of_sha's commit time known."""
+
+    summary: SnapshotSummary
+    committed_at: datetime
+    diff: PointDiff
+
+    def identity(self) -> SnapshotIdentity:
+        return SnapshotIdentity(
+            as_of_sha=self.summary.as_of_sha, committed_at=self.committed_at,
+            params=self.summary.params, unknown_params=self.summary.unknown_params,
+        )
+
+
+@dataclass(frozen=True)
+class UnplacedFile(FileState):
+    """A file served with its reason instead of placed: the instrument refused it (no summary), or
+    git cannot resolve its as_of_sha."""
+
+    reason: str
+    summary: SnapshotSummary | None = None
+
+
+@dataclass(frozen=True)
+class SettledDiff:
+    state: DiffState  # READY or FAILED
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ComputedDiff:
+    """A diff this scan ran: READY with the instrument's text, or FAILED with its refusal."""
+
+    state: DiffState
+    text: str | None
+    reason: str | None
+
+
+_SETTLED = frozenset({DiffState.READY, DiffState.FAILED})
+
+
+@dataclass(frozen=True)
+class RootScan:
+    points: tuple[ScannedPoint, ...]
+    unplaced: tuple[UnplacedFile, ...]
+    new_diffs: Mapping[str, ComputedDiff]
+    pending_summaries: int
+    pending_diffs: int
+
+
+@dataclass(frozen=True)
+class SnapshotCache:
+    """A root's stored file readings by point id, and its settled diffs by pair key."""
+
+    files: Mapping[str, ScannedPoint | UnplacedFile]
+    diffs: Mapping[str, SettledDiff]
+
+    @classmethod
+    def empty(cls) -> SnapshotCache:
+        return cls({}, {})
+
+    @classmethod
+    def from_scan(cls, scan: RootScan) -> SnapshotCache:
+        return cls(
+            {reading.point_id: reading for reading in (*scan.points, *scan.unplaced)},
+            {
+                point.diff.pair_key: SettledDiff(point.diff.state, point.diff.reason)
+                for point in scan.points
+                if point.diff.pair_key is not None and point.diff.state in _SETTLED
+            },
+        )
+
+
+@dataclass(frozen=True)
+class _Refusal:
+    stderr: str
+
+
+@dataclass(frozen=True)
+class _Summarised:
+    """A file the instrument has read, and its commit time once known."""
+
+    state: FileState
+    outcome: SnapshotSummary | _Refusal
+    committed_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class _Placed:
+    state: FileState
+    summary: SnapshotSummary
+    committed_at: datetime
+
+    @property
+    def identity(self) -> str:
+        return cache_identity(self.summary, self.state.digest)
+
+    def order(self) -> tuple[datetime, bool, str]:
+        return self.committed_at, not self.state.baseline, self.state.point_id
+
+
+def _past(deadline: float) -> bool:
+    return time.monotonic() >= deadline
+
+
+def _reused(cached: ScannedPoint | UnplacedFile) -> _Summarised:
+    state = FileState(**_state_fields(cached))
+    if isinstance(cached, ScannedPoint):
+        return _Summarised(state, cached.summary, cached.committed_at)
+    return _Summarised(state, cached.summary if cached.summary is not None else _Refusal(cached.reason))
+
+
+def _stats(files: Sequence[SnapshotFile]) -> list[tuple[SnapshotFile, os.stat_result]]:
+    """Each file still present with its stat, newest first."""
+    stats = []
+    for file in files:
+        with contextlib.suppress(FileNotFoundError):
+            stats.append((file, file.path.stat()))
+    return sorted(stats, key=lambda pair: pair[1].st_mtime_ns, reverse=True)
+
+
+class _Summariser:
+    """Summarises a root's files, reusing what the cache or this scan already holds for the same bytes."""
+
+    def __init__(self, cache: SnapshotCache, summariser: str, instrument: Path, deadline: float) -> None:
+        self.cache, self.summariser, self.instrument, self.deadline = cache, summariser, instrument, deadline
+        self.by_digest = {
+            cached.digest: _reused(cached) for cached in cache.files.values() if cached.summariser == summariser
+        }
+        self.pending = 0
+
+    def read(self, file: SnapshotFile, stat: os.stat_result) -> _Summarised | None:
+        """*file*'s summary or refusal; None, counted pending, when the deadline or the instrument ran out."""
+        cached = self.cache.files.get(file.point_id)
+        if cached is not None and (cached.size, cached.mtime_ns, cached.summariser) == (
+            stat.st_size, stat.st_mtime_ns, self.summariser
+        ):
+            return _reused(cached)
+        if _past(self.deadline):
+            self.pending += 1
+            return None
+        data = file.path.read_bytes()
+        state = FileState(file.point_id, file.path, file.baseline, stat.st_size, stat.st_mtime_ns,
+                          hashlib.sha256(data).hexdigest(), self.summariser)
+        twin = self.by_digest.get(state.digest)
+        summarised = _Summarised(state, twin.outcome, twin.committed_at) if twin else self._summarise(state)
+        if summarised is not None:
+            self.by_digest[state.digest] = summarised
+        return summarised
+
+    def _summarise(self, state: FileState) -> _Summarised | None:
+        try:
+            return _Summarised(state, summarise(state.file, instrument=self.instrument))
+        except InstrumentRefused as refused:
+            return _Summarised(state, _Refusal(refused.stderr))
+        except subprocess.TimeoutExpired:
+            self.pending += 1
+            return None
+
+
+def _place(root: Path, summarised: _Summarised, deadline: float) -> _Placed | UnplacedFile | None:
+    """*summarised* with its commit time, unplaced with its reason, or None when time ran out.
+
+    A sha git cannot resolve is asked again every scan: a later fetch may bring it.
+    """
+    state, outcome = summarised.state, summarised.outcome
+    if isinstance(outcome, _Refusal):
+        return UnplacedFile(**_state_fields(state), reason=outcome.stderr)
+    if summarised.committed_at is not None:
+        return _Placed(state, outcome, summarised.committed_at)
+    if _past(deadline):
+        return None
+    try:
+        return _Placed(state, outcome, commit_time(root, outcome.as_of_sha, SNAPSHOT_GIT_TIMEOUT_SECONDS))
+    except GitObjectMissing:
+        reason = f'as_of_sha {outcome.as_of_sha} is not a commit in {root}'
+        return UnplacedFile(**_state_fields(state), reason=reason, summary=outcome)
+    except GitTimeout:
+        return None
+
+
+class _Differ:
+    """Each placed point's diff against the one before it, newest pair first, settled pairs reused."""
+
+    def __init__(self, cache: SnapshotCache, instrument: Path, deadline: float) -> None:
+        self.cache, self.instrument, self.deadline = cache, instrument, deadline
+        self.new_diffs: dict[str, ComputedDiff] = {}
+        self.pending = 0
+
+    def diff(self, previous: _Placed, current: _Placed) -> PointDiff:
+        key = pair_key(previous.identity, current.identity, current.state.summariser)
+        settled = self.cache.diffs.get(key) or self.new_diffs.get(key) or self._compute(key, previous, current)
+        if settled is None:
+            self.pending += 1
+            return PointDiff(previous.state.point_id, key, DiffState.PENDING)
+        return PointDiff(previous.state.point_id, key, settled.state, settled.reason)
+
+    def _compute(self, key: str, previous: _Placed, current: _Placed) -> ComputedDiff | None:
+        if _past(self.deadline):
+            return None
+        try:
+            text = diff_text(current.state.file, previous.state.file, instrument=self.instrument)
+        except InstrumentRefused as refused:
+            self.new_diffs[key] = ComputedDiff(DiffState.FAILED, None, refused.stderr)
+        except subprocess.TimeoutExpired:
+            return None
+        else:
+            self.new_diffs[key] = ComputedDiff(DiffState.READY, text, None)
+        return self.new_diffs[key]
+
+
+def _scanned(placed: _Placed, diff: PointDiff) -> ScannedPoint:
+    return ScannedPoint(
+        **_state_fields(placed.state), summary=placed.summary, committed_at=placed.committed_at, diff=diff
+    )
+
+
+def _diffed(placed: Sequence[_Placed], differ: _Differ) -> tuple[ScannedPoint, ...]:
+    """The points in order, their diffs computed newest pair first."""
+    diffs = {
+        index: differ.diff(placed[index - 1], placed[index]) for index in range(len(placed) - 1, 0, -1)
+    }
+    first = PointDiff(None, None, DiffState.FIRST)
+    return tuple(_scanned(point, diffs.get(index, first)) for index, point in enumerate(placed))
+
+
+def scan_root(
+    root: Path, project_id: str, nightly_dir: Path, cache: SnapshotCache, *,
+    deadline: float, instrument: Path = INSTRUMENT_SCRIPT,
+) -> RootScan:
+    """One root's snapshot scan under a time.monotonic() *deadline*, newest input first: summaries,
+    then commit times, then diffs. What the deadline leaves undone is counted pending, never guessed."""
+    summariser = _Summariser(cache, summariser_digest(instrument), instrument, deadline)
+    read = [summarised for file, stat in _stats(snapshot_files(root, nightly_dir, project_id))
+            if (summarised := summariser.read(file, stat)) is not None]
+    placements = [_place(root, summarised, deadline) for summarised in read]
+    placed = sorted((point for point in placements if isinstance(point, _Placed)), key=_Placed.order)
+    differ = _Differ(cache, instrument, deadline)
+    return RootScan(
+        points=_diffed(placed, differ),
+        unplaced=tuple(point for point in placements if isinstance(point, UnplacedFile)),
+        new_diffs=differ.new_diffs,
+        pending_summaries=summariser.pending + placements.count(None),
+        pending_diffs=differ.pending,
+    )
