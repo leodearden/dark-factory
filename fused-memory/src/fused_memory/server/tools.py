@@ -25,6 +25,7 @@ from shared.delivered_check_polarity import (
     lint_delivered_checks,
     polarity_error,
 )
+from shared.project_id import normalize_project_id
 from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
 from shared.task_metadata import TASK_METADATA_CAPABILITIES
 from shared.task_statuses import ACTIVE
@@ -257,7 +258,6 @@ from fused_memory.services.supersession_mark import mark_superseded
 from fused_memory.utils.clip_disclosure import truncation_fields
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
-    _to_underscore_canonical,
     canonicalize_project_id,
     validate_full_uuid,
     validate_int_ids,
@@ -9088,15 +9088,16 @@ def create_mcp_server(
             if not sep or not project_id or not task_id or not task_id.isdigit():
                 result[dep] = 'malformed'
                 continue
-            # Normalise project_id via the shared raise-free primitive (task 2267
-            # / seam S1) so 'dark-factory' == 'dark_factory', mirroring
-            # models/scope.py:resolve_project_id. Deliberately NOT the raising
+            # Normalise project_id with the raise-free one rule
+            # shared.project_id.normalize_project_id (as
+            # fused_memory/models/scope.py::resolve_project_id does) so
+            # 'dark-factory' == 'dark_factory'. Deliberately NOT the raising
             # canonicalize_project_id: this tool's contract is sentinel-only
             # (never raise on a semantic problem), and a path-shaped project_id
             # must fall through to the 'unknown_project' sentinel below rather
             # than raise PathShapedProjectIdError. Registry lookup uses the
             # normalised form; result is keyed by the original verbatim dep string.
-            norm_project_id = _to_underscore_canonical(project_id)
+            norm_project_id = normalize_project_id(project_id)
             # Look up project_root in registry
             if norm_project_id not in _kp:
                 result[dep] = 'unknown_project'
