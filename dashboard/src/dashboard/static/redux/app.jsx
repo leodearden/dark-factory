@@ -176,9 +176,7 @@ function App() {
     tasks: <DatumReading datum={tasksCensus} format={inFlightCountReading} />,
     // Runs an operator should go and look at: failures, plus any row whose
     // status recon_status.js does not recognise, so vocabulary drift is
-    // visible from the rail and not only from the tab. 'interrupted' is
-    // excluded — this fleet is restarted routinely, so those rows would sit
-    // the badge permanently nonzero on a healthy system. In-flight runs get
+    // visible from the rail and not only from the tab. In-flight runs get
     // their own tile on the tab rather than inflating this number.
     recon: reconAttentionCount(reconRunCounts(DD.RECON_STATE.runs)),
     merge: <DatumReading datum={inQueueOver(DD, null)} />,
