@@ -181,7 +181,16 @@ Phase ε **self-restart** sub-path (`before_done.target_unit` == own unit):
   re-filing the gate — the human-approval gate is NEVER bypassed.
 - If scheduling fails (`rc != 0`): file born-at-L2 infra_issue, block
   (parallel to γ's rc≠0/verify-fail handling); `before_done_ran_at`
-  already stamped (not re-run, I1).
+  already stamped (not re-run, I1).  Scheduling also fails, before any
+  transient unit is registered, when the resolved script is missing or not
+  executable (`shared/src/shared/before_done_paths.py::require_runnable_script`,
+  the same rule `submit_task` applies).  A script removed, renamed or
+  chmod'ed after submit, or a `before_done` edited through `update_task`,
+  therefore blocks the task with the `Self-restart scheduling failed: <unit>`
+  infra_issue instead of a phantom `deterministic-deploy-scheduled` done.
+  Either way no restart is scheduled, and as for any escalation filed after
+  the stamp, resolving with `resume` marks the task done without one; the
+  escalation detail says to restart the unit by hand first.
 
 Phase γ **cross-unit** sub-path (`target_unit` ≠ own unit or `ORCH_UNIT` unset):
 - Capture baseline unit state (`unit_inspector`).
