@@ -537,6 +537,25 @@ def _skip_verdict():
     )
 
 
+def _seed_open_l1(queue, task_id: str, category: str):
+    """Submit one pending level-1 escalation of *category* for *task_id*; return it."""
+    from escalation.models import Escalation
+
+    esc = Escalation(
+        id=queue.make_id(task_id),
+        task_id=task_id,
+        agent_role='orchestrator-scheduler',
+        severity='blocking',
+        category=category,
+        summary='an earlier unrelated L1',
+        detail='',
+        suggested_action='manual_intervention',
+        level=1,
+    )
+    queue.submit(esc)
+    return esc
+
+
 class TestRunSubstrateGate:
     """Unit tests for ``Harness._run_substrate_gate``."""
 
@@ -834,6 +853,24 @@ class TestBlockAndEscalateSubstrateFlip:
         pending = esc_queue.get_pending()
         l1s = [e for e in pending if e.task_id == '55' and e.level == 1]
         assert len(l1s) == 1, f'Expected exactly 1 L1 after dedup; got {l1s!r}'
+
+    @pytest.mark.asyncio
+    async def test_open_l1_of_another_category_does_not_suppress(self, tmp_path: Path):
+        """An open L1 for an unrelated cause must not hide the flip's root cause."""
+        from escalation.queue import EscalationQueue
+
+        h = _make_harness(tmp_path)
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+        seeded = _seed_open_l1(esc_queue, '45', 'scope_violation')
+
+        await h._block_and_escalate_substrate_flip('45', verdict=_flip_verdict())
+
+        pending_l1s = [e for e in esc_queue.get_pending() if e.task_id == '45' and e.level == 1]
+        filed = [e for e in pending_l1s if e.category == 'design_concern']
+        assert len(filed) == 1, f'Expected one design_concern L1 for task 45; got {pending_l1s!r}'
+        assert filed[0].summary.startswith('SUBSTRATE_FLIP'), filed[0].summary
+        assert seeded.id in {e.id for e in pending_l1s}, 'the seeded L1 must stay pending'
 
     @pytest.mark.asyncio
     async def test_noop_when_no_escalation_queue(self, tmp_path: Path):
