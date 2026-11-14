@@ -33,12 +33,26 @@ class TestDependencyIds:
     def test_csv_string_with_empty_pieces_dropped(self):
         assert dependency_ids({'dependencies': '1,,2, ,3'}) == ['1', '2', '3']
 
-    @pytest.mark.parametrize('task', [{}, {'dependencies': None}, {'dependencies': []}, {'dependencies': ''}])
-    def test_missing_or_empty_is_empty(self, task):
+    @pytest.mark.parametrize(
+        'task',
+        [
+            {},
+            {'dependencies': None},
+            {'dependencies': []},
+            {'dependencies': ''},
+            {'dependencies': 0},
+            {'dependencies': {}},
+        ],
+    )
+    def test_missing_or_falsy_is_empty(self, task):
         assert dependency_ids(task) == []
 
     def test_falsy_entries_dropped_from_list(self):
         assert dependency_ids({'dependencies': [1, 0, None, 2]}) == ['1', '2']
+
+    def test_falsy_id_and_whitespace_entries_survive_the_list_branch(self):
+        deps = [{'id': ''}, {'id': None}, {'id': 0}, ' ']
+        assert dependency_ids({'dependencies': deps}) == ['', 'None', '0', ' ']
 
     def test_tuple_takes_the_list_branch(self):
         assert dependency_ids({'dependencies': (1, '2')}) == ['1', '2']
@@ -49,9 +63,6 @@ class TestDependencyIds:
     def test_dict_as_whole_value_is_stringified_not_iterated(self):
         deps = {'a': 1}
         assert dependency_ids({'dependencies': deps}) == [str(deps)]
-
-    def test_empty_dict_value(self):
-        assert dependency_ids({'dependencies': {}}) == []
 
     def test_returns_a_fresh_list(self):
         source = ['1', '2']

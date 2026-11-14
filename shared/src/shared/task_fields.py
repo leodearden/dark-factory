@@ -28,7 +28,10 @@ def dependency_ids(task: Mapping[str, Any]) -> list[str]:
 
     - a list, tuple or set whose entries are ``{'id': x}`` dicts, ints or
       strs, mixed freely — falsy entries are dropped, a dict without an
-      ``id`` key is stringified whole; or
+      ``id`` key is stringified whole.  The drop tests the raw entry, before
+      a dict is unwrapped and without stripping, so a dict whose ``id`` is
+      falsy (``{'id': ''}`` gives ``''``, ``{'id': None}`` gives ``'None'``)
+      and a whitespace-only string both survive; or
     - a CSV string — split on commas, pieces stripped, empty pieces dropped; or
     - any other non-empty shape (a bare int, a dict) — stringified WHOLE into
       one element.  Iterating a dict would silently yield its keys; an id that
@@ -40,7 +43,7 @@ def dependency_ids(task: Mapping[str, Any]) -> list[str]:
     if isinstance(deps, str):
         return [piece.strip() for piece in deps.split(',') if piece.strip()]
     if not isinstance(deps, (list, tuple, set)):
-        return [str(deps)] if deps else []
+        return [str(deps)]
     return [_dependency_id(entry) for entry in deps if entry]
 
 
