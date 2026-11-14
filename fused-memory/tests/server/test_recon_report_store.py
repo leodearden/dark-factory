@@ -1242,7 +1242,9 @@ class TestSupersedeAcrossEviction:
             ]
             assert self._RUN in purge_record.getMessage()
             assert self._S1 in purge_record.getMessage()
-            assert state._resolve_finding(self._RUN, stage1_fid) is None
+            run_index = state.run_index(self._RUN)
+            assert run_index is not None
+            assert run_index.owner_of(stage1_fid) is None
             assert state.violations() == []
 
             restarted_fid = state.add_finding(
@@ -1267,8 +1269,6 @@ class TestSupersedeAcrossEviction:
             )
 
             # ...because exactly one row per (run_id, stage) is emitted at all.
-            run_index = state.run_index(self._RUN)
-            assert run_index is not None
             reachable = run_index.reachable_entries()
             assert len({(e.run_id, e.stage) for e in reachable}) == len(reachable)
 
@@ -1326,10 +1326,13 @@ class TestSupersedeAcrossEviction:
             state.start_report(
                 run_id=self._RUN, stage=self._S2, project_id='dark_factory'
             )
-            assert state._resolve_finding(self._RUN, superseder_fid) is None
-            resolved = state._resolve_finding(self._RUN, target_fid)
-            assert resolved is not None
-            assert resolved[1].superseded_by is None
+            run_index = state.run_index(self._RUN)
+            assert run_index is not None
+            assert run_index.owner_of(superseder_fid) is None
+            target_owner = run_index.owner_of(target_fid)
+            assert target_owner is not None
+            (target,) = [f for f in target_owner.findings if f.finding_id == target_fid]
+            assert target.superseded_by is None
             assert self._persisted_finding(store_a, target_fid)['superseded_by'] is None
             assert state.violations() == []
         finally:

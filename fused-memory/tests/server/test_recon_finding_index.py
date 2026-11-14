@@ -1,7 +1,6 @@
-"""RunFindingIndex: one reconciliation run's stage session and dedup keys.
-
-Driven through the module's public API only. The fixtures are local records
-that satisfy the FindingRecord and EntryRecord Protocols structurally.
+"""RunFindingIndex unit tests, on local records that satisfy its Protocols, plus
+the B9/B10 boundary tests driven through recon_report's MCP tools over a real
+ReconReportStore.
 """
 
 from __future__ import annotations
