@@ -968,6 +968,11 @@ def _children(*children: tuple[bytes, int]):
     return fake_exec
 
 
+@pytest.fixture
+def account_pool_in_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_B', 'pool-b-confirm')
+
+
 def _assert_lane_env(env: dict[str, str]) -> None:
     assert env['DF_VERIFY_ROLE'] == 'offline'
     pool = [k for k in env if k.startswith('CLAUDE_OAUTH_TOKEN_')]
@@ -978,6 +983,7 @@ def _assert_lane_env(env: dict[str, str]) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('account_pool_in_env')
 async def test_a_red_numeric_pass_runs_the_serial_confirm_failed_invocation(tmp_path: Path):
     """The default numeric confirm re-runs reify's script serially with ``--confirm-failed`` in the
     lane worktree, writes the confirm phase of the same pass, and reproduces the ids printed under exit 100.
@@ -1005,6 +1011,7 @@ async def test_a_red_numeric_pass_runs_the_serial_confirm_failed_invocation(tmp_
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('account_pool_in_env')
 async def test_a_red_generic_pass_confirms_the_detected_failures_narrowed_and_serial(tmp_path: Path):
     """A structured pytest command's default confirm re-runs only the detection's failing tests, serially,
     at idle nice/ionice in the command's cwd, and reproduces those that fail again."""
@@ -1045,6 +1052,7 @@ async def test_a_red_generic_pass_confirms_the_detected_failures_narrowed_and_se
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures('account_pool_in_env')
 async def test_a_red_infra_pass_confirms_the_failures_both_runs_name(tmp_path: Path):
     """The default infra confirm re-invokes H9 with the detect seam's argv/env/cwd; a test both runs name
     reproduces and one the confirm passed is cleared."""
