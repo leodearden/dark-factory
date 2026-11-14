@@ -1237,7 +1237,7 @@ task-status effect:
 |---|---|---|
 | `resume` | → `pending` (resumes in place) | Your fix addresses the concern; let the task continue from here |
 | `restart` | → `pending` (restart from scratch) | The approach needs a redesign, not a patch |
-| `park` | → `blocked`; the L2 stays **open** | You need to leave it blocked but haven't resolved the underlying issue yet |
+| `park` | → `blocked`; the L2 stays **open** | You need to leave it blocked but haven't resolved the underlying issue yet. Refused on an `info` record (code `park_on_info`, nothing changed), because an info record never pins its task |
 | `abandon` | → `cancelled` | The task should not be pursued |
 | `close_only` | no task effect | The escalation itself is stale/moot but the task's own status is already correct — closes the escalation record without touching the task |
 
@@ -1245,6 +1245,82 @@ Always read the returned `resolution_action` back to confirm it matches
 what you intended — the parameter ordering matters (`action` before a long
 free-text `resolution`) and a mis-ordered call can silently record the
 wrong action.
+
+### Info notes, deliberate holds, and the info-L0 router
+
+An `info` record is a note with a consumer, never a hold: only a non-info
+record can keep a task from merging. The design home is
+[plans/info-l0-disposition-router-prd.md](plans/info-l0-disposition-router-prd.md).
+
+- **Holds are explicit.** To hold a task deliberately, `park` a non-info
+  record (the L2 stays open and the row stays `blocked`), or leave an open
+  non-info record on the task. An info record at any level never gates a
+  merge (`orchestrator/src/orchestrator/workflow.py::_is_gating_escalation`,
+  via `escalation/src/escalation/pins.py::needs_human`), never vetoes
+  recovery, never pins, and cannot be parked. For a task whose only records
+  are info, defer the task instead. A green, reviewed branch whose only open
+  records are info merges. A `blocked` row whose reason reads 'Gated by open
+  L2 <ids>; no steward applicable' was held by a non-info record that no
+  steward acted on; 'Steward re-escalated to human' appears only when a
+  steward actually filed the hand-off.
+- **Who consumes an info note.** In order: the reviewer (its verdict's
+  `note_dispositions`), then a steward already running for the task, then
+  the router at the workflow's exit. A requeued exit leaves the note pending
+  for the next incarnation. The orphan reaper and the startup amnesty route
+  whatever is left. The chain is described in ARCHITECTURE.md §3.6 and §6,
+  and the decision table lives in
+  `escalation/src/escalation/disposition.py::route_info_l0`.
+- **Reading a routed note.** A dispositioned note is closed under one of
+  four `resolution_class` values:
+
+  | `resolution_class` | What happened | Task exists? |
+  |---|---|---|
+  | `addressed` | The reviewer verified it fixed on this branch; resolved_by `reviewer-comprehensive/workflow` | No |
+  | `observation-consumed` | A pure observation: the reviewer said `no_action`, or the author's `suggested_action` opened with a no-action declaration | No |
+  | `converted` | The curator created or combined a follow-up task. The resolution text carries `converted:<task id>` and the curator ticket; the submit carried `metadata.escalation_id=<source id>`, so `find_tasks_by_metadata` finds a task it created | Yes |
+  | `status-info` | A mechanical harness notice (filer listed in `escalation/src/escalation/classify.py::INFO_L0_MECHANICAL_ROLES`) or a done-step-commit orphan. It is listed in its class's aggregate L1: sentinel task id `__info_l0_status_info_<class>__`, agent_role `harness-info-l0-router`, suggested_action `acknowledge_status_info`, one per class per sweep, amended rather than re-filed while open | No |
+
+  A pending info note stamped `triaged_by='info-l0-router'`, whose triage
+  note starts 'info-l0-router hold: ', is waiting on a curator ticket. The
+  orphan reaper owns it and finishes it within
+  `info_l0_router_ticket_timeout_secs`, so leave it alone.
+- **The `convert_to_task` fallback L1.** A note the router could not convert
+  is dismissed and promoted to one L1 under agent_role
+  `harness-info-l0-router` with suggested_action `convert_to_task`. Its
+  summary reads 'Info note not converted to a task (<reason>): …' and its
+  `detail` starts with the author's original text. The reason is one of
+  `escalation/src/escalation/disposition.py::PromoteReason`:
+  `ticket_refused`, `ticket_failed`, `ticket_timeout`, `conversion_cap`,
+  `router_error`, `no_convertible_content`. It is never
+  `manual_intervention`. The instruction to file the task with
+  `metadata.escalation_id=<source id>` or close the L1 with a rationale
+  lives in the L1's own `detail`
+  (`orchestrator/src/orchestrator/escalation_router.py::_fallback_detail`);
+  `skills/escalation-watcher-auto/SKILL.md` has no rung for
+  `convert_to_task` or `acknowledge_status_info`. The consumer of both L1
+  kinds is owned by task 3726 (router PRD D5). Overflow past the per-sweep
+  conversion cap is listed in one aggregate under
+  `__info_l0_conversion_overflow__`.
+- **The auto-watcher's info-only-cluster rung.** `promote_to_l2` with
+  `severity` omitted over an all-info cluster returns
+  `{'status': 'refused', 'code': 'info_only_cluster', 'members': […], 'unusable': […], 'derived_severity': 'info'}`.
+  Nothing is minted and nothing is folded into a pending L2. The watcher
+  closes `members` at L1 with a digest line, or re-issues with an explicit
+  blocking severity when it judges the cluster collectively blocking; it
+  never re-issues with `severity='info'`. The recipe is
+  `skills/escalation-watcher-auto/SKILL.md`, section "Info-only cluster". So
+  the L2 queue the standing `/escalation-watcher` drains holds no
+  inherited-info records.
+- **Telemetry and knobs.** Every disposition is one `info_l0_dispositioned`
+  event, whose payload fields are defined by
+  `orchestrator/src/orchestrator/escalation_router.py::_emit`, and the
+  dashboard's Analytics tab counts the four classes
+  above under `dispositioned`. The four `info_l0_*` config keys
+  (`info_l0_router_enabled`, `info_l0_router_ticket_timeout_secs`,
+  `info_l0_router_max_conversions_per_sweep`, `info_l0_note_detail_chars`)
+  are green-tier hot-reloadable; `info_l0_router_enabled` is the kill switch.
+  Their defaults live in
+  `orchestrator/src/orchestrator/config.py::OrchestratorConfig`.
 
 ### Merge-halt semantics (`wip_conflict` / `unmerged_state` / `stash_failed`)
 
@@ -3387,6 +3463,7 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | `scripts/setup-host.sh` §11 prints a `Network exposure:` FAIL, or `python3 scripts/check_network_exposure.py` exits 1 | Read the kind on each tagged line. `[exposed]`: a listener is bound to a wildcard address. That is `fused-memory.socket`'s `ListenStream` (`scripts/fused-memory.socket.template`), fused-memory's `server.host`, which binds `:8003` itself (`fused-memory/config/config.yaml`), or a compose `ports` entry without a `127.0.0.1:` prefix (`fused-memory/docker/docker-compose.yml`). `[not-listening]`: the named owner is down, or bound somewhere other than `127.0.0.1`. `[timed-out]`: an off-loopback connect was neither accepted nor refused, typically because a DROP rule hides whatever listens there; a timeout counts as a failure. `[unverified]`: an off-loopback connect failed with the errno the line names, so that address was not checked. `[source-error]`: `systemctl` or `ip` could not be read, usually because there is no user bus for `systemctl --user` or no `ip` binary; every port it could still find was probed | Bind the named owner to `127.0.0.1` in its committed home and restart it. A socket's `ListenStream` change needs the stop-then-start in [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts); for fused-memory that is `scripts/restart-fused-memory.sh --rebind-socket`. `plans/mcp-network-exposure-prd.md` tracks the loopback flip of today's known wildcard binds. Start a not-listening owner. For an unverified address, read the errno (a link going down, say) and rerun once the link has settled. For a source error, run the check as the login user with `XDG_RUNTIME_DIR` set. How to run the check: [§8 Network exposure check](#network-exposure-check) |
 | A `recon_missing_index` escalation appears on the reconciliation queue (port 8103, `task_id` `graph:<group_id>`) | A registered graph lacks indices in the expected set, typically because a provisioning statement failed or the graph was born after the last restart and its first-write provisioning did not complete. `index_health.missing` names the specs | Read the `Index provisioning statement failed on graph` (or `did not complete`) journal line for that graph in `journalctl --user -u fused-memory`, fix what it names, then restart fused-memory (`scripts/restart-fused-memory.sh`, with operator sign-off): startup provisioning creates only what is missing. That restart is how the escalation's `ensure_indices(group_id=...)` suggestion is carried out, since no tool exposes it. The next reconciliation cycle re-checks it. See [§8 FalkorDB index provisioning](#falkordb-index-provisioning-expected-set-drift-the-bm25-canary-the-composite-trap) |
 | A `durable_write_dead_letter` escalation appears (`esc-durable-write-dead-letter-N`, agent_role `fused-memory/dead-letter-guard`) | A durably-queued memory write exhausted its attempts and was **permanently abandoned** — `add_episode`, `add_memory`'s Graphiti leg, or a derived `mem0_classify_and_add` fact. The caller was already told it succeeded: the record's `reported_to_caller=` line says exactly what it was told (`add_episode` returned `status='queued'`; `add_memory` returned `stores_queued` containing graphiti), or says plainly that no synchronous claim was made — an `add_memory_graphiti` death carrying that neutral line came from `replay_from_store`, the operation's second producer, which has no caller and mints no `write_op_id`, so there is nobody to warn. One record folds every death sharing `(project_id, operation, error class)` — deliberately keyed on the error CLASS, not its message, because the esc-3561-3 errors carried a different uuid per write — so `dedupe_count` is the VOLUME, not the record count: 28 lost writes page once | Read **`post_execute` first**; it decides the remedy and the two are opposites. `True` means the backend write LANDED and only the post-write callback kept failing (`durable_queue.py::POST_EXECUTE_DEAD_PREFIX`), so a blind replay **duplicates** it — check `backend_ops` joined on `write_op_id`, never on `backend_ops.operation`, which is the literal `'add_episode'` for both the add_episode and add_memory_graphiti paths, before acting. `False` means the write never landed: `replay_dead_letters` is the safe default once the cause is fixed, `delete_dead_letters` only when the item is known unrecoverable. The escalation is self-sufficient for triage by design — corroborating PULL surfaces exist but are not substitutes: `dead_by_operation` on `get_queue_stats` / `memory_service.py::MemoryService.get_status`, and `reconciliation/queue_health.py::summarize_graphiti_queue_health`'s aggregate `dead_count`, both read the LIVE `write_queue` table and go to zero once `delete_dead_letters` sweeps the rows (that sweep had already erased 26 of the 28 rows in esc-3561-3). `dead_by_operation` is also GROUP-scoped, so a `project_id`-scoped call covers that project's Graphiti group only: a dead `mem0_classify_and_add` for the same project appears under group `mem0_<project_id>` or in the unscoped call, and `{}` from the scoped probe does not contradict the alarm. Anyone holding a `write_op_id` can read the durable per-write record via `write_journal.py::WriteJournal.get_write_op` (`terminal_status`/`terminal_error`, task 3582) |
+| A reviewer verdict carried `note_dispositions` that were not applied: the info note is still pending after the review, or was later closed by the router or promoted instead of carrying the reviewer's class | One of four mechanisms. (i) The workflow rejected the entry: `orchestrator/src/orchestrator/escalation_router.py::reviewer_note_refusal` admits only a pending, router-owned info L0 of the reviewed task that is agent-filed, not mechanical, and not already held on a curator ticket, so an unknown id, another task's record, a non-info or eval-lane record, a harness or mechanical notice, or a router-disabled config is refused; a refusal logs the WARNING `info-l0-router: rejected the reviewer disposition` with the reason and emits `info_l0_dispositioned` with class `rejected_disposition`. (ii) `work` never closes a note, by design: it stamps the reviewer mark (triaged_by `reviewer-comprehensive/workflow`) and the exit router converts the note. (iii) The verdict was lost or errored, so nothing was applied: `TaskWorkflow._salvageable_verdict_payload` drops a malformed payload whole, and an ERROR verdict carries no dispositions (`orchestrator/src/orchestrator/review_payload.py::normalize_review`). (iv) Applying raised, which logs an exception and emits class `router-error` | Read the task's `info_l0_dispositioned` events (`class`, `reason`) and the journal WARNING to see which case applied. Nothing needs repairing, and a pending note must not be hand-closed: the exit finalizer, or the orphan reaper or startup amnesty, routes it, which is the designed backstop (`plans/info-l0-disposition-router-prd.md` boundary row 17). A `convert_to_task` L1 under `harness-info-l0-router` with reason `router_error` means the router already dismissed the note (`orchestrator/src/orchestrator/escalation_router.py::_promote` dismisses before it files the L1), so act on that L1, not the note. If the journal shows the ERROR `could not file its fallback L1`, the note is dismissed and its text survives only in that log line. A recurring (i) for the reviewer's own notes points at a briefing/eligibility mismatch; file it against `reviewer_notes` / `reviewer_note_refusal` |
 
 ---
 
