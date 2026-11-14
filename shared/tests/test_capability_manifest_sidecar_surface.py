@@ -8,9 +8,19 @@ values were pinned from main's
 
 from __future__ import annotations
 
-import pytest
+import shutil
+import subprocess
 
-from shared.capability_manifest import SIDECAR_SUFFIX, sidecar_for, sidecar_path
+import pytest
+from polarity_fixture_repo import init_git_repo
+
+from shared.capability_manifest import (
+    SIDECAR_SUFFIX,
+    ManifestDiscoveryUnavailable,
+    sidecar_for,
+    sidecar_path,
+    tracked_sidecar_paths,
+)
 
 
 class TestSidecarFor:
@@ -56,3 +66,48 @@ class TestSidecarFor:
     def test_the_suffix_is_public_and_is_the_one_sidecar_path_appends(self):
         assert SIDECAR_SUFFIX == '.capability-manifest.yaml'
         assert sidecar_path('plans/x-prd.md').endswith(SIDECAR_SUFFIX)
+
+
+class TestTrackedSidecarPaths:
+    def test_lists_only_the_tracked_sidecars_sorted(self, tmp_path):
+        root = init_git_repo(
+            tmp_path / 'repo',
+            {
+                'plans/b-prd.capability-manifest.yaml': 'schema_version: 1\n',
+                'docs/prds/a-prd.capability-manifest.yaml': 'schema_version: 1\n',
+                'plans/b-prd.md': '# b\n',
+            },
+        )
+        (root / 'plans' / 'c-prd.capability-manifest.yaml').write_text(
+            'schema_version: 1\n', encoding='utf-8'
+        )
+        assert tracked_sidecar_paths(root) == [
+            'docs/prds/a-prd.capability-manifest.yaml',
+            'plans/b-prd.capability-manifest.yaml',
+        ]
+
+    def test_a_non_checkout_raises_naming_the_root(self, tmp_path):
+        with pytest.raises(ManifestDiscoveryUnavailable) as excinfo:
+            tracked_sidecar_paths(tmp_path)
+        assert str(tmp_path) in str(excinfo.value)
+
+    def test_a_missing_git_binary_raises(self, tmp_path, monkeypatch):
+        empty_bin = tmp_path / 'empty-bin'
+        empty_bin.mkdir()
+        monkeypatch.setenv('PATH', str(empty_bin))
+        with pytest.raises(ManifestDiscoveryUnavailable) as excinfo:
+            tracked_sidecar_paths(tmp_path)
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+    def test_a_wedged_git_raises_at_the_timeout(self, tmp_path, monkeypatch):
+        sleep = shutil.which('sleep')
+        assert sleep is not None
+        fake_bin = tmp_path / 'bin'
+        fake_bin.mkdir()
+        fake_git = fake_bin / 'git'
+        fake_git.write_text(f'#!/bin/sh\nexec {sleep} 30\n', encoding='utf-8')
+        fake_git.chmod(0o755)
+        monkeypatch.setenv('PATH', str(fake_bin))
+        with pytest.raises(ManifestDiscoveryUnavailable) as excinfo:
+            tracked_sidecar_paths(tmp_path, timeout=0.5)
+        assert isinstance(excinfo.value.__cause__, subprocess.TimeoutExpired)
