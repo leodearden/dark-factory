@@ -134,12 +134,71 @@ if [ "${#CENSUS_CMD[@]}" -eq 0 ] || [ "${#STAMP_CMD[@]}" -eq 0 ]; then
     [ "${#STAMP_CMD[@]}" -eq 0 ] && STAMP_CMD=("${UV_PYTHON[@]}")
 fi
 
-echo "memory-metadata-coverage-census: censusing $REPO (top-n $CENSUS_TOP_N)"
-"${CENSUS_CMD[@]}" "$FM/scripts/census_memory_metadata.py" --top-n "$CENSUS_TOP_N"
-census_rc=$?
-if [ "$census_rc" -ne 0 ]; then
-    echo "memory-metadata-coverage-census: census exited $census_rc — the" \
-         "artifacts still carry the evidence; rehearsing the retro stamp anyway" >&2
+ARTIFACTS=(
+    plans/memory-metadata-census-report.json
+    plans/memory-metadata-census-report.md
+    plans/memory-metadata-coverage-history.json
+)
+
+# ── WHERE THE CENSUS MEASURES ───────────────────────────────────────────────
+#
+# A git checkout root is measured in a detached GENERATION WORKTREE of main's
+# tip, running that worktree's own copy of the census, so no checkout's working
+# tree is written but the generation worktree's (OPERATIONS.md §12). A $REPO
+# inside no checkout runs in place. A $REPO inside a checkout that is not its
+# root, or whose generation worktree cannot be prepared, is not measured.
+#
+# The EXIT trap removes the generation worktree. TERM and INT exit through it
+# only once the foreground step returns (scripts/lib/deploy_main_copy.sh
+# records why that order is load-bearing).
+gen_scratch=""
+remove_generation_worktree() {
+    [ -n "$gen_scratch" ] || return 0
+    [ -d "$gen_scratch/tree" ] && git -C "$REPO" worktree remove --force "$gen_scratch/tree" >/dev/null 2>&1
+    git -C "$REPO" worktree prune >/dev/null 2>&1
+    rm -rf "$gen_scratch"
+}
+trap remove_generation_worktree EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+census_root=""
+land_refusal=""
+if ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+    census_root="$REPO"
+    land_refusal="skipped:not-a-git-repo"
+elif ! repo_toplevel=$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null) || \
+     [ "$(cd "$REPO" 2>/dev/null && pwd -P)" != "$(cd "$repo_toplevel" 2>/dev/null && pwd -P)" ]; then
+    # FAIL CLOSED. The repository git resolves for $REPO is not $REPO itself:
+    # a git env var a future git release adds, a symlinked or nested checkout,
+    # or $REPO pointed at a subdirectory. Measuring or landing there would act
+    # on something this run was not told about; declining costs one nightly
+    # row, which the next run's append restores.
+    echo "memory-metadata-coverage-census: REFUSING to measure or land — \$REPO ($REPO)" \
+         "is not the root of the repository git resolves for it" \
+         "(${repo_toplevel:-<none>})" >&2
+    land_refusal="refused:repo-not-toplevel"
+elif ! BASE=$(git -C "$REPO" rev-parse --verify --quiet 'main^{commit}') || \
+     ! gen_scratch=$(mktemp -d) || \
+     ! git -C "$REPO" worktree add --detach --quiet "$gen_scratch/tree" "$BASE" >&2; then
+    echo "memory-metadata-coverage-census: could not prepare a generation worktree of" \
+         "$REPO's main (${BASE:-no main branch}); not measuring in place instead" >&2
+    land_refusal="failed:generation-worktree"
+else
+    census_root="$gen_scratch/tree"
+fi
+
+if [ -n "$census_root" ]; then
+    echo "memory-metadata-coverage-census: censusing $census_root (top-n $CENSUS_TOP_N)"
+    "${CENSUS_CMD[@]}" "$census_root/fused-memory/scripts/census_memory_metadata.py" --top-n "$CENSUS_TOP_N"
+    census_rc=$?
+    if [ "$census_rc" -ne 0 ]; then
+        echo "memory-metadata-coverage-census: census exited $census_rc — the" \
+             "artifacts still carry the evidence; rehearsing the retro stamp anyway" >&2
+    fi
+else
+    census_rc=skipped
+    echo "memory-metadata-coverage-census: census skipped ($land_refusal)" >&2
 fi
 
 echo "memory-metadata-coverage-census: rehearsing the retro topic/canonical stamp (DRY RUN)"
@@ -183,12 +242,6 @@ fi
 #
 # CENSUS_COMMIT=0 skips the step entirely, for an operator running the gauge
 # ad-hoc who does not want a commit (pairs with the census's own --no-history).
-ARTIFACTS=(
-    plans/memory-metadata-census-report.json
-    plans/memory-metadata-census-report.md
-    plans/memory-metadata-coverage-history.json
-)
-
 commit_rc=0
 # `commit_step` names, in ONE stable machine-readable token, which of the
 # branches below actually ran -- appended to the `done (...)` line so an
@@ -199,31 +252,23 @@ if [ "${CENSUS_COMMIT:-1}" != "1" ]; then
     commit_step="skipped:disabled"
     echo "memory-metadata-coverage-census: CENSUS_COMMIT=0 — leaving the" \
          "regenerated artifacts uncommitted"
-elif ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
-    commit_step="skipped:not-a-git-repo"
-    echo "memory-metadata-coverage-census: $REPO is not a git repository —" \
-         "skipping the artifact commit" >&2
-elif ! repo_toplevel=$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null) || \
-     [ "$(cd "$REPO" 2>/dev/null && pwd -P)" != "$(cd "$repo_toplevel" 2>/dev/null && pwd -P)" ]; then
-    # FAIL CLOSED. The repository git resolves for $REPO is not $REPO itself,
-    # so this run would commit into something it was not told about. The unset
-    # above removes the known cause; this refuses on ANY residual one (a git
-    # env var added by a future git release, a symlinked or nested checkout,
-    # $REPO pointed at a subdirectory). Committing into the wrong repository is
-    # the defect; declining to commit is merely a missed nightly row, which the
-    # next run's append restores.
-    echo "memory-metadata-coverage-census: REFUSING to commit — \$REPO ($REPO)" \
-         "is not the root of the repository git resolves for it" \
-         "(${repo_toplevel:-<none>}); leaving the artifacts uncommitted" >&2
-    commit_rc=1
-    commit_step="refused:repo-not-toplevel"
-elif [ -z "$(git -C "$REPO" status --porcelain -- "${ARTIFACTS[@]}" 2>/dev/null)" ]; then
+elif [ -n "$land_refusal" ]; then
+    commit_step="$land_refusal"
+    case "$land_refusal" in skipped:*) ;; *) commit_rc=1 ;; esac
+    echo "memory-metadata-coverage-census: not landing the artifacts ($land_refusal)" >&2
+elif [ -z "$(git -C "$census_root" status --porcelain -- "${ARTIFACTS[@]}" 2>/dev/null)" ]; then
     # The ordinary quiet-night outcome. Checked BEFORE committing so that
     # "nothing to commit" -- which git reports with a NON-ZERO code -- is never
     # narrated as a failure.
     commit_step="skipped:no-drift"
     echo "memory-metadata-coverage-census: artifacts unchanged — nothing to commit"
 else
+    # Interim (task 7154): carries the generation worktree's artifacts into
+    # $REPO for the direct commit below, until the merge-queue landing
+    # replaces both.
+    for rel in "${ARTIFACTS[@]}"; do
+        cp -- "$census_root/$rel" "$REPO/$rel"
+    done
     commit_msg="chore(census): nightly canonical/topic coverage census $(date -u +%Y-%m-%d)"
     commit_out=$(git -C "$REPO" commit --only "${ARTIFACTS[@]}" \
         -m "$commit_msg" 2>&1)
