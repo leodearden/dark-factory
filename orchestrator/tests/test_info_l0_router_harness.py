@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -269,12 +268,12 @@ async def _file_warm_base_hard_down(harness: Harness) -> None:
 
 
 async def _file_no_landings_breaker(harness: Harness) -> None:
-    # A stand-in for merge_lane.worker.BreakerTrip: importing it would make this
-    # file lane-importing and count all its private reads in the merge-lane ratchet.
-    harness._file_no_landings_info_escalation(SimpleNamespace(  # type: ignore[arg-type]
-        action='halt', window_samples=3, landings_in_window=0,
-        free_start=200, free_end=100, reason='r',
-    ))
+    breaker = harness._no_landings_breaker
+    breaker.observe(0, 300)
+    breaker.observe(0, 200)
+    trip = breaker.observe(0, 100)
+    assert trip is not None and trip.action == 'halt'
+    harness._file_no_landings_info_escalation(trip)
 
 
 @pytest.mark.asyncio
