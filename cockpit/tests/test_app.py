@@ -3191,7 +3191,7 @@ class TestPrioritiesPathResolution:
         """
         from dataclasses import replace
 
-        from orchestrator.session_registry import fleet_root as resolve_fleet_root
+        from orchestrator.fleet_files import fleet_root as resolve_fleet_root
 
         from cockpit.priority import Priorities, save_priorities
 
