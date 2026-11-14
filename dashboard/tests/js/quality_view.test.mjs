@@ -17,7 +17,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
-import { qualityMarker, qualityMarkers, qualityMetric, qualityPayload } from './wire_fixtures.mjs';
+import {
+  qualityMarker, qualityMarkers, qualityMetric, qualityPayload, qualitySnapshotPoint, qualitySnapshots,
+} from './wire_fixtures.mjs';
 
 const REDUX = '../../src/dashboard/static/redux/';
 const LOAD_CHAIN = ['chart_marks.js', 'quality_view.js'].map(name => REDUX + name);
@@ -44,6 +46,14 @@ const {
   beforeAfterText,
   costModelReadings,
   qualityMarks,
+  snapshotAxis,
+  snapshotCharts,
+  snapshotMarks,
+  snapshotTable,
+  instrumentText,
+  snapshotLabel,
+  snapshotHeading,
+  snapshotDiffText,
 } = view;
 const { markHover } = loadedWindow.DF_CHART_MARKS;
 
@@ -57,7 +67,9 @@ test('quality_view.js assigns window.DF_QUALITY_VIEW to its module surface', () 
   assert.equal(loadedWindow.DF_QUALITY_VIEW, view);
   assert.deepEqual(Object.keys(view).sort(), [
     'QUALITY_LAYOUT', 'alarmVerdict', 'beforeAfterText', 'chartAxis', 'chartSeries', 'costModelReadings',
-    'headlineText', 'indexMarkers', 'metricTitle', 'qualityMarks', 'ruleCaption',
+    'headlineText', 'indexMarkers', 'instrumentText', 'metricTitle', 'qualityMarks', 'ruleCaption',
+    'snapshotAxis', 'snapshotCharts', 'snapshotDiffText', 'snapshotHeading', 'snapshotLabel', 'snapshotMarks',
+    'snapshotTable',
   ]);
 });
 
@@ -387,4 +399,156 @@ test('an unserved marker stream draws the alarms alone', () => {
   const marks = qualityMarks({ axis: GAPPED_AXIS, markers: null, alarms: [{ ...ALARM, explained_by: null }], beforeAfter: [], metricId: 'rejected', kind: 'rate' });
 
   assert.deepEqual(marks.map(mark => [mark.kind, mark.label]), [['alarm', 'unexplained change at landing #14']]);
+});
+
+test('an instrument marker is not drawn on a landing-axis chart: it annotates the snapshot series', () => {
+  const instrument = qualityMarker({ id: 'instrument:abc', ordinal: 13, kind: 'instrument', ref: 'abc', source: { type: 'instrument' } });
+  const marks = qualityMarks({
+    axis: GAPPED_AXIS, markers: [FLIP, instrument], alarms: [], beforeAfter: [], metricId: 'rejected', kind: 'rate',
+  });
+
+  assert.deepEqual(marks.map(mark => mark.key), [FLIP.id]);
+});
+
+// ── The snapshot series ───────────────────────────────────────────────────
+// One column per served point, in served order; every figure is the point's
+// own served count, and nothing is averaged, totalled, ranked or sorted.
+
+const SHA_1 = '1'.repeat(40);
+const SHA_2 = '2'.repeat(40);
+const SHA_3 = '3'.repeat(40);
+
+const SCHEMA_2_PARAMS = { complexipy_version: '6.2.0', h14_soft_ceiling_lines: 1500, h14_alarm_lines: 2000 };
+const BASELINE = qualitySnapshotPoint({
+  id: 'review-all-dark_factory-20261008', baseline: true, asOfSha: SHA_1, committedAt: '2026-10-08T18:30:00+00:00',
+  params: SCHEMA_2_PARAMS, unknownParams: ['instrument', 'python_version'],
+  h14: { atSoftCeiling: 4, atAlarm: 2 }, cycles: { cycles: 5, hidden: 3, typing: null },
+  deferredImports: 30, cycleClosingImports: null, privatePatchTargets: 12,
+});
+const NIGHTLY_2 = qualitySnapshotPoint({
+  id: 'nightly-2', asOfSha: SHA_2, committedAt: '2026-11-01T02:00:00+00:00',
+  h14: { atSoftCeiling: 6, atAlarm: 1 }, cycles: { cycles: 2, hidden: 4, typing: 1 },
+  deferredImports: 18, cycleClosingImports: 7, privatePatchTargets: 3,
+  diff: { previous_id: BASELINE.id, state: 'ready', reason: null },
+});
+const NIGHTLY_3 = qualitySnapshotPoint({
+  id: 'nightly-3', asOfSha: SHA_3, committedAt: '2026-11-02T02:00:00+00:00',
+  h14: { atSoftCeiling: 5, atAlarm: 1 }, cycles: { cycles: 3, hidden: 0, typing: 2 },
+  deferredImports: 21, cycleClosingImports: 2, privatePatchTargets: 8,
+  diff: { previous_id: NIGHTLY_2.id, state: 'pending', reason: null },
+});
+const POINTS = qualitySnapshots([BASELINE, NIGHTLY_2, NIGHTLY_3]).points;
+
+test('the snapshot axis is one column per served point, labelled by its commit date in served order', () => {
+  assert.deepEqual(snapshotAxis(POINTS), ['2026-10-08', '2026-11-01', '2026-11-02']);
+  assert.deepEqual(snapshotAxis([NIGHTLY_3, BASELINE]), ['2026-11-02', '2026-10-08'], 'never re-sorted');
+  assert.deepEqual(snapshotAxis([]), []);
+});
+
+test('the snapshot charts are fixed groups of the served domain counts, each a step series', () => {
+  const charts = snapshotCharts(POINTS);
+
+  assert.deepEqual(
+    charts.map(chart => [chart.group, chart.series.map(series => series.key)]),
+    [
+      ['h14', ['at_soft_ceiling', 'at_alarm']],
+      ['cycles', ['cycles', 'hidden_cycles', 'typing_cycles']],
+      ['imports', ['deferred_imports', 'cycle_closing_imports']],
+      ['private_patch_targets', ['private_patch_targets']],
+    ],
+  );
+  for (const chart of charts) {
+    assert.ok(typeof chart.title === 'string' && chart.title !== '', `${chart.group} is titled`);
+    for (const series of chart.series) {
+      assert.equal(series.step, true, `${series.key} is a step series`);
+      assert.ok(typeof series.label === 'string' && series.label !== '', `${series.key} is labelled`);
+    }
+  }
+});
+
+test('each snapshot series holds the points’ served values verbatim, unknown as null', () => {
+  const values = Object.fromEntries(
+    snapshotCharts(POINTS).flatMap(chart => chart.series).map(series => [series.key, series.values]),
+  );
+
+  assert.deepEqual(values, {
+    at_soft_ceiling: [4, 6, 5],
+    at_alarm: [2, 1, 1],
+    cycles: [5, 2, 3],
+    hidden_cycles: [3, 4, 0],
+    typing_cycles: [null, 1, 2],
+    deferred_imports: [30, 18, 21],
+    cycle_closing_imports: [null, 7, 2],
+    private_patch_targets: [12, 3, 8],
+  });
+});
+
+test('a baseline mark sits at each baseline point’s column, an instrument marker at its point’s', () => {
+  const instrument = qualityMarker({
+    id: `instrument:${SHA_2}`, ordinal: null, kind: 'instrument', label: 'instrument params changed: instrument (unknown)',
+    ref: SHA_2, source: { type: 'instrument' },
+  });
+
+  assert.deepEqual(snapshotMarks(POINTS, [instrument]), [
+    { key: `baseline:${BASELINE.id}`, kind: 'baseline', label: '/review-all baseline 2026-10-08', fraction: 0, ref: SHA_1, verdict: null },
+    { key: instrument.id, kind: 'instrument', label: instrument.label, fraction: 0.5, ref: SHA_2, verdict: null },
+  ]);
+});
+
+test('an instrument marker sits at the first point at its sha, and one at no served sha is dropped', () => {
+  const nightlyAtBaseline = qualitySnapshotPoint({ id: 'nightly-1', asOfSha: SHA_1, committedAt: BASELINE.committed_at });
+  const points = [BASELINE, nightlyAtBaseline, NIGHTLY_2];
+  const atBaseline = qualityMarker({ id: `instrument:${SHA_1}`, ordinal: null, kind: 'instrument', ref: SHA_1 });
+  const unserved = qualityMarker({ id: 'instrument:9999', ordinal: null, kind: 'instrument', ref: '9'.repeat(40) });
+
+  const instrumentMarks = snapshotMarks(points, [atBaseline, unserved]).filter(mark => mark.kind === 'instrument');
+
+  assert.deepEqual(instrumentMarks.map(mark => [mark.key, mark.fraction]), [[atBaseline.id, 0]]);
+});
+
+test('only instrument markers are drawn on the snapshot charts', () => {
+  const effort = qualityMarker({ id: 'routing:reviewer:1', ordinal: 4, kind: 'effort', ref: SHA_2 });
+
+  assert.deepEqual(snapshotMarks([NIGHTLY_2, NIGHTLY_3], [effort]), []);
+  assert.deepEqual(snapshotMarks([NIGHTLY_2, NIGHTLY_3], null), []);
+});
+
+test('a series of one point places no mark: there is no column fraction to place it at', () => {
+  assert.deepEqual(snapshotMarks([BASELINE], []), []);
+});
+
+test('a point’s member table is the instrument’s cell texts, row for row in served order', () => {
+  const table = snapshotTable(NIGHTLY_2);
+
+  assert.deepEqual(table.headers, ['member', 'pseudo', ...NIGHTLY_2.members.columns]);
+  assert.deepEqual(table.rows, NIGHTLY_2.members.rows.map(row => [row.member, String(row.pseudo), ...row.cells]));
+  assert.deepEqual(table.rows.map(row => row[0]), ['dashboard', 'scripts']);
+  assert.deepEqual(table.rows.map(row => row[1]), ['false', 'true'], 'pseudo as the instrument’s markdown prints it');
+});
+
+test('a point whose schema does not record the instrument reads instrument unknown', () => {
+  assert.equal(instrumentText(BASELINE), 'instrument unknown');
+});
+
+test('a point that records its instrument names each blob by its short sha', () => {
+  assert.equal(instrumentText(NIGHTLY_2), 'instrument quality_metrics_snapshot aaaaaaaaaa · source_measures bbbbbbbbbb');
+});
+
+test('a point is labelled by its commit date, its home and its short sha, and headed with its completeness', () => {
+  assert.equal(snapshotLabel(BASELINE), '2026-10-08 · baseline · 1111111111');
+  assert.equal(snapshotLabel(NIGHTLY_2), '2026-11-01 · nightly · 2222222222');
+  assert.equal(snapshotHeading(BASELINE), '2026-10-08 · baseline · 1111111111 · complete · instrument unknown');
+  assert.equal(
+    snapshotHeading(qualitySnapshotPoint({ asOfSha: SHA_3, committedAt: NIGHTLY_3.committed_at, complete: false })),
+    `2026-11-02 · nightly · 3333333333 · incomplete · ${instrumentText(NIGHTLY_3)}`,
+  );
+});
+
+test('a ready diff reads as its text verbatim, every other state as its reason', () => {
+  const text = 'params differ: python_version 3.13.8 -> 3.13.9\n';
+  assert.equal(snapshotDiffText({ point_id: 'n', previous_id: 'p', state: 'ready', text, reason: null }), text);
+  for (const state of ['first', 'pending', 'failed', 'absent']) {
+    const reason = `the ${state} reason`;
+    assert.equal(snapshotDiffText({ point_id: 'n', previous_id: null, state, text: null, reason }), reason, state);
+  }
 });
