@@ -74,7 +74,6 @@ these invariants is violated:
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, assert_never, get_args
@@ -83,8 +82,11 @@ from pydantic import ValidationError
 from shared.before_done_paths import (
     CwdRefused,
     FactoryRootUnresolved,
+    ScriptMissing,
+    ScriptNotExecutable,
     ScriptRefused,
     ScriptRootRefused,
+    require_runnable_script,
     resolve_before_done_paths,
 )
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
@@ -722,14 +724,14 @@ def _validate_script_under(
             hint=f"Use a path relative to {where} without leading '../' segments.",
         )
 
-    # File must exist and be executable
-    if not resolved_script.exists():
+    try:
+        require_runnable_script(resolved_script)
+    except ScriptMissing:
         return _validation_error(
             f"before_done.script {script!r} does not exist under {where}.",
             hint=f"Expected an executable file at: {resolved_script}",
         )
-
-    if not os.access(resolved_script, os.X_OK):
+    except ScriptNotExecutable:
         return _validation_error(
             f"before_done.script {script!r} exists but is not executable "
             "(os.X_OK check failed).",

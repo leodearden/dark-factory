@@ -6,11 +6,13 @@ submit-time check
 (``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``)
 read one definition: each makes one call to ``resolve_before_done_paths`` and
 maps the ``BeforeDonePathsRefused`` subclasses it raises to its own
-diagnostics.
+diagnostics. Both also call ``require_runnable_script`` on the resolved script:
+the guard at submit, the executor before it schedules a detached self-restart.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -67,6 +69,18 @@ class ScriptRefused(BeforeDonePathsRefused):
 
 class CwdRefused(BeforeDonePathsRefused):
     """``before_done.cwd`` is present but not a string path."""
+
+
+class ScriptUnrunnable(BeforeDonePathsRefused):
+    """The resolved before_done script is not an executable file at run time."""
+
+
+class ScriptMissing(ScriptUnrunnable):
+    """Nothing exists at the resolved script path."""
+
+
+class ScriptNotExecutable(ScriptUnrunnable):
+    """The resolved script exists but this process may not execute it."""
 
 
 class FactoryRootUnresolved(BeforeDonePathsRefused):
@@ -158,3 +172,15 @@ def resolve_before_done_paths(
         script_base=base,
         cwd=project_root / cwd if cwd else project_root,
     )
+
+
+def require_runnable_script(script: Path) -> None:
+    """Refuse a resolved *script* this process cannot exec.
+
+    Raises ``ScriptMissing`` when nothing exists at *script*, else
+    ``ScriptNotExecutable`` when ``os.access`` denies ``X_OK``.
+    """
+    if not script.exists():
+        raise ScriptMissing(f'before_done script {script} does not exist.')
+    if not os.access(script, os.X_OK):
+        raise ScriptNotExecutable(f'before_done script {script} exists but is not executable.')
