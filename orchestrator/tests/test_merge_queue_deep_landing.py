@@ -1797,7 +1797,7 @@ async def _head_and_prefix_scene(
         ),
         merge_wt=_ephemeral_merge_wt(git_ops, 'head'),
         base_sha=main_sha,          # slot 1 CASes against REAL main
-        speculative=head_speculative,   # the trust anchor — never chained
+        speculative=head_speculative,   # the trust anchor (chains only when alone, PRD D5)
     )
     spec_item = RealMergeItem(
         request=reqs['101'],
@@ -2157,9 +2157,7 @@ class TestHeadCancelOnAdoption:
         await _deliver_terminal_blocked(s, 'dead/hung verify cap-out x3')
         worker, head = s['worker'], s['head_entry']
 
-        adopted = await worker._adopt_head_on_tip_authority(
-            s['reqs']['101'].request_id, '101',
-        )
+        adopted = await worker._adopt_head_on_tip_authority(s['spec_item'])
 
         assert adopted is None, (
             'a head whose outcome is already delivered must not be adopted; '
@@ -2273,9 +2271,7 @@ class TestHeadCancelOnAdoption:
         assert s['head_task'].done()
         assert not s['reqs']['100'].result.done(), 'future deliberately UNresolved'
 
-        adopted = await s['worker']._adopt_head_on_tip_authority(
-            s['reqs']['101'].request_id, '101',
-        )
+        adopted = await s['worker']._adopt_head_on_tip_authority(s['spec_item'])
 
         assert adopted is s['head_entry']
         assert s['head_entry'].chain_adopted is True
@@ -2290,13 +2286,38 @@ class TestHeadCancelOnAdoption:
         assert not s['head_task'].done()
         assert not s['reqs']['100'].result.done()
 
-        adopted = await s['worker']._adopt_head_on_tip_authority(
-            s['reqs']['101'].request_id, '101',
-        )
+        adopted = await s['worker']._adopt_head_on_tip_authority(s['spec_item'])
 
         assert adopted is s['head_entry']
         assert s['head_entry'].chain_adopted is True
         assert s['head_entry'].verify_task is None, 'torn down, per topology 1'
+
+    async def test_a_non_speculative_tip_adopts_nothing_ahead_of_it(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A non-speculative tip is built on main, so its tree contains no entry ahead of it.
+
+        When the chained item IS the head (PRD D5), the only entry that can sit
+        ahead of it in ``_inflight`` is a vacated one, which must not be marked
+        adopted.
+        """
+        import dataclasses
+
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-non-spec-tip.db',
+        )
+        non_spec_tip = dataclasses.replace(
+            s['spec_item'], speculative=False, permit=None, base_sha=s['main_sha'],
+        )
+
+        adopted = await s['worker']._adopt_head_on_tip_authority(non_spec_tip)
+
+        assert adopted is None
+        assert s['head_entry'].chain_adopted is False
+        head_task = s['head_entry'].verify_task
+        assert head_task is not None and not head_task.cancelled(), (
+            'the decline must leave the head untouched'
+        )
 
 
 @pytest.mark.asyncio
@@ -3353,7 +3374,7 @@ class _DeltaScene:
             ),
             merge_wt=wt,
             base_sha=main_before,   # this round really CASes against main
-            speculative=True,       # slot 2 — the only kind that chains
+            speculative=True,       # slot 2 — chains whatever the frontier holds (PRD D5)
         )
         entry = await worker._dispatch_item(item)
         assert entry is not None, 'dispatch must not decline: a host is free'
