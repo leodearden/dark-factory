@@ -34,6 +34,8 @@ from shared.before_done_paths import (
     BeforeDonePaths,
     BeforeDonePathsRefused,
     FactoryRootUnresolved,
+    ScriptUnrunnable,
+    require_runnable_script,
     resolve_before_done_paths,
 )
 from shared.milestone_rearm import rearmed_milestone
@@ -984,7 +986,13 @@ class DeterministicRunner:
 
         Returns:
             (rc, tail) — rc=0 on successful registration; rc≠0 if registration
-            fails (tail carries the error detail).
+            fails, or if scheduling is refused because the resolved script is
+            missing or not executable (tail carries the error detail).
+
+        That refusal is the run-time half of the rule ``submit_task`` enforces
+        (``shared/src/shared/before_done_paths.py::require_runnable_script``):
+        ``RestartPlan`` deliberately does not stat-check, and a failure at fire
+        time would land after the scheduled-done write.
         """
         target_unit = before_done.get('target_unit', 'unknown')
         args = before_done.get('args') or []
@@ -1080,6 +1088,18 @@ class DeterministicRunner:
             on_active_secs=on_active_secs,
             env=dict(before_done.get('env') or {}),
         )
+        try:
+            require_runnable_script(paths.script)
+        except ScriptUnrunnable as exc:
+            logger.warning(
+                'DeterministicRunner: refusing to register restart transient unit %s '
+                'for task %s: %s',
+                transient_unit, task_id, exc,
+            )
+            return 1, (
+                f'{exc} The transient unit {transient_unit} was NOT registered, '
+                'so no restart will fire.'
+            )
         outcome = await plan.execute()
         if outcome.disposition == RestartDisposition.REGISTRATION_FAILED:
             logger.warning(
@@ -3671,7 +3691,7 @@ class DeterministicRunner:
                         description,
                         f'Target unit: {target_unit}',
                         f'Transient unit: {transient_unit}',
-                        f'systemd-run exit code: rc={rc}',
+                        f'Restart scheduling rc={rc}',
                         f'Output:\n{tail}',
                     ])
                     return await self._file_infra_issue_and_block(
