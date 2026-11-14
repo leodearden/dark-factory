@@ -142,6 +142,16 @@ async def test_a_sibling_ref_already_merged_into_main_is_ignored(tmp_path: Path)
     assert await _diagnose(scene.repo, scene.worktree, ['a.py']) is None
 
 
+async def test_a_sibling_ref_whose_content_landed_by_another_commit_is_ignored(
+    tmp_path: Path,
+) -> None:
+    scene = work_on_sibling_ref(tmp_path)
+    commit(scene.repo, {'c.py': 'c = 1\n'}, 'main advances')
+    git(scene.repo, 'cherry-pick', scene.sibling_tip)
+
+    assert await _diagnose(scene.repo, scene.worktree, ['a.py']) is None
+
+
 def _one_finding_per_cause() -> list[UnmeasuredDelivery]:
     return [
         UnmeasuredDelivery(

@@ -301,7 +301,11 @@ async def _sibling_refs(git_ops: GitOps, branch: str) -> list[_SiblingRef]:
 
 async def _sibling_own_work(sibling: _SiblingRef, git_ops: GitOps) -> list[str]:
     fork = await git_ops.merge_base_with_main(sibling.tip)
-    if fork is None or fork == sibling.tip:
+    if (
+        fork is None
+        or fork == sibling.tip
+        or await git_ops.branch_content_in_main(sibling.tip)
+    ):
         return []
     files, err = await git_ops.get_files_touched_in_branch(fork, sibling.tip)
     return [] if err is not None else files
