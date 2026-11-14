@@ -1518,29 +1518,36 @@ class TestRunInflightVerifyChainRedirect:
         )
 
     @pytest.mark.parametrize(
-        'slot1,cap,expected',
+        'slot1,cap,depth,expected',
         [
-            (False, 6, None),   # positive control: slot 2, cap on -> resets
-            (True, 6, 3),       # slot 1 is a DIFFERENT tree -> no reset
-            (False, 0, 3),      # kill switch: the arm is not even reached
+            (False, 6, None, None),  # positive control: slot 2, cap on -> resets
+            (True, 6, 0, None),      # a head alone in the frontier could have chained
+            (True, 6, 1, 3),         # a head beside another entry could not -> no reset
+            (True, 6, None, 3),      # no dispatch-time depth never licenses a head
+            (False, 0, 0, 3),        # kill switch: the arm is not even reached
         ],
-        ids=['slot2-cap-on-resets', 'slot1-does-not-reset', 'cap-zero-does-not-reset'],
+        ids=[
+            'slot2-cap-on-resets', 'slot1-alone-resets', 'slot1-beside-one-does-not-reset',
+            'slot1-unknown-depth-does-not-reset', 'cap-zero-does-not-reset',
+        ],
     )
     async def test_the_floor_reset_arms_two_guards_are_each_load_bearing(
-        self, git_repo: Path, monkeypatch, slot1: bool, cap: int, expected,
+        self, git_repo: Path, monkeypatch, slot1: bool, cap: int, depth: int | None, expected,
     ):
-        """The d=1 floor's reset arm: ``item.speculative`` and ``chain_cap > 0``.
+        """The d=1 floor's reset arm: :func:`may_chain` and ``chain_cap > 0``.
 
         Both guards previously had no test in which they were the DECIDING
         branch — every scenario that could have exercised them started from
         ``_chain_halving_state is None``, so either guard could have been
         deleted with the suite still green.  Here the state starts at 3 and
-        each row differs in exactly one guard, so a deletion flips a row.
+        each row differs in exactly one guard input, so a deletion flips a row.
 
-        Why each guard matters.  A slot-1 head verify is merged onto REAL main
-        and is never chained by γ, so its green says nothing about whether
-        chaining is safe — letting it reset would climb the bisector back out
-        on evidence about a different tree.  And under the shipped
+        Why each guard matters.  Only a round that could have chained says
+        anything about whether chaining is safe: a slot-2 round, or a head
+        alone in the verify frontier at its dispatch (``depth == 0``, PRD D5).
+        A head beside another entry, or with no dispatch-time depth, verifies
+        a tree no chain could have been built on, and letting it reset would
+        climb the bisector back out on evidence about it.  And under the shipped
         ``chain_cap=0`` kill switch this arm must not merely have no effect: it
         must not be REACHED, so a cap-0 dispatch stays byte-identical down to
         "no method call".
@@ -1565,7 +1572,7 @@ class TestRunInflightVerifyChainRedirect:
         worker._chain_halving_state = 3
         posted = _spy_post_merge_verify(monkeypatch, outcome=None)   # a PASS
 
-        res = await worker._run_inflight_verify(item, _local_lease())
+        res = await worker._run_inflight_verify(item, _local_lease(), depth=depth)
 
         assert len(posted) == 1 and posted[0]['chain_items'] == 1
         assert res.outcome is None, 'the fixture must actually be a PASS'

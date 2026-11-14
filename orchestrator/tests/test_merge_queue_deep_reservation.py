@@ -373,11 +373,12 @@ def _hang_then(release: asyncio.Event, entered: asyncio.Event, then: VerifyScrip
 class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
     """E: a tip that fails, raises or is abandoned only releases the reservation.
 
-    No outcome is rendered for a link by that round: each link later lands on
-    its own, verified on its own, and nothing is blocked.
+    No outcome is rendered for a link by that round, and nothing is blocked.
+    A requeued S goes behind F2. Once H and P have landed, F1 is merged on
+    main and, alone in the verify frontier, re-chains the rest (PRD D5).
     """
 
-    async def _assert_links_go_their_own_way(
+    async def _assert_released_links_land_by_a_later_round(
         self, scene: _Scene, rnd: _Round, *, s_status: str = 'done',
     ) -> None:
         reqs = rnd.reqs
@@ -385,15 +386,16 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         for name in ('F1', 'F2'):
             assert not reqs[name].result.done(), name
         await rnd.land_head_and_p()
-        names = ('F1', 'F2') if s_status != 'done' else ('S', 'F1', 'F2')
+        names = ('F1', 'F2') if s_status != 'done' else ('F1', 'F2', 'S')
         outcomes = await _outcomes(rnd, names)
         assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(names, 'done')
-        assert {n: o.landed_via_chain for n, o in outcomes.items()} == dict.fromkeys(names)
-        for name in ('F1', 'F2'):
-            own = [e for e in _verify_events_for(scene, {name}) if e['data'].get('chain_items') == 1]
-            assert own, f'{name} was never verified on its own'
-        landed = await _landed_task_files(scene)
-        assert (landed[:2], sorted(landed[2:])) == (['H', 'P'], sorted(names))
+        assert {n: o.landed_via_chain for n, o in outcomes.items()} == dict.fromkeys(names, 1)
+        rechain = [
+            (e['data']['chain_items'], e['data']['speculative'])
+            for e in _verify_events_for(scene, {'F1'})
+        ]
+        assert rechain == [(len(names), False)]
+        assert await _landed_task_files(scene) == ['H', 'P', *names]
         assert _reservations(rnd.lane) == []
         assert rnd.lane.speculation_accounting_violations() == []
 
@@ -406,7 +408,7 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         async with _deep_round(scene, ('F1', 'F2'), s_script=red) as rnd:
             await wait_responsive(s_entered.wait(), label="S's tip verify under way")
             release_s.set()
-            await self._assert_links_go_their_own_way(scene, rnd)
+            await self._assert_released_links_land_by_a_later_round(scene, rnd)
 
     async def test_a_raised_tip_releases_the_links(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -417,7 +419,7 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         async with _deep_round(scene, ('F1', 'F2'), s_script=boom) as rnd:
             await wait_responsive(s_entered.wait(), label="S's tip verify under way")
             release_s.set()
-            await self._assert_links_go_their_own_way(scene, rnd)
+            await self._assert_released_links_land_by_a_later_round(scene, rnd)
 
     async def test_an_abandoned_round_releases_the_links(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -429,7 +431,7 @@ class TestEAChainRoundThatDoesNotAdoptReleasesItsLinks:
         ) as rnd:
             await wait_responsive(s_entered.wait(), label="S's tip verify under way")
             rnd.reqs['S'].result.cancel()
-            await self._assert_links_go_their_own_way(scene, rnd, s_status='abandoned')
+            await self._assert_released_links_land_by_a_later_round(scene, rnd, s_status='abandoned')
 
 
 async def _tip_passed_and_landed_its_head(
@@ -458,7 +460,9 @@ class TestEAPassedTipTornDownByTheCascadeReleasesItsLinks:
     own finalize, ends its reservation; the old tip never reaches main.
 
     Once released, a link may be chained again by a later round of its own,
-    so how F1 and F2 land is not pinned; that each lands once is.
+    so how F1 and F2 land is not pinned; that each lands once is. S itself,
+    requeued behind the landed H, dispatches alone in the verify frontier and
+    chains again (PRD D5).
     """
 
     async def test_an_abandoned_p_cascades_over_the_passed_tip(
@@ -480,7 +484,7 @@ class TestEAPassedTipTornDownByTheCascadeReleasesItsLinks:
             rnd.release_p.set()
             outcomes = await _outcomes(rnd, ('S', 'F1', 'F2'))
             assert {n: o.status for n, o in outcomes.items()} == dict.fromkeys(outcomes, 'done')
-            assert outcomes['S'].landed_via_chain is None
+            assert outcomes['S'].landed_via_chain == 1
             landed = await _landed_task_files(scene)
             assert (landed[:1], sorted(landed[1:])) == (['H'], ['F1', 'F2', 'S'])
             assert not await _reaches_main(scene, old_tip)
