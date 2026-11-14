@@ -14,6 +14,7 @@ from _api_outage_harness import (
     KILLS_PER_TASK,
     PROVIDER_529_ERROR,
     BurstLedger,
+    DispatchRecord,
     incident_529_result,
     run_incident_burst,
 )
@@ -31,6 +32,7 @@ async def test_incident_burst_rows_1_to_5_hold_in_one_harness_run(tmp_path, monk
 
     _assert_burst_premises(ledger)
     _assert_row_1(ledger)
+    _assert_row_4(ledger)
     _assert_row_5(ledger)
 
 
@@ -102,11 +104,54 @@ def _assert_row_1(ledger: BurstLedger) -> None:
         )
 
 
+_TRANSIENT_ENVELOPES = (30.0, 60.0, 120.0, 240.0, 480.0)
+
+
+def _assert_row_4(ledger: BurstLedger) -> None:
+    assert len(_TRANSIENT_ENVELOPES) == KILLS_PER_TASK
+    for tid in ledger.cast.burst:
+        for n, record in enumerate(ledger.kills_of(tid), start=1):
+            where = f'row 4: task {tid} kill {n}'
+            cooldown = record.cooldown
+            assert cooldown is not None, f'{where}: no cooldown armed'
+            envelope = _TRANSIENT_ENVELOPES[n - 1]
+            assert cooldown.envelope_secs == envelope, f'{where}: envelope {cooldown.envelope_secs}'
+            assert envelope / 2 <= cooldown.armed_secs <= envelope, (
+                f'{where}: armed {cooldown.armed_secs}s outside [{envelope / 2}, {envelope}]'
+            )
+            assert cooldown.transient is True, f'{where}: cooldown not marked transient'
+            assert cooldown.transient_count == n, f'{where}: transient_count {cooldown.transient_count}'
+    for n in range(1, KILLS_PER_TASK + 1):
+        armed = {_armed_secs(ledger.kills_of(tid)[n - 1]) for tid in ledger.cast.burst}
+        assert len(armed) > 1, f'row 4: no jitter at kill {n} — every burst task armed {armed}'
+
+    genuine = ledger.cast.genuine
+    first = ledger.dispatches_of(genuine)[0]
+    where = f'row 4: genuine control {genuine}'
+    assert first.report.outcome == WorkflowOutcome.REQUEUED, f'{where}: outcome {first.report.outcome!r}'
+    assert first.report.api_error_status is None, f'{where}: api_error_status {first.report.api_error_status}'
+    assert not is_transient_api_requeue(first.report.block_reason, api_error_status=None), (
+        f'{where}: reason reads as a transient requeue: {first.report.block_reason!r}'
+    )
+    assert first.cooldown is not None, f'{where}: no cooldown armed'
+    assert first.cooldown.armed_secs == ledger.config.requeue_cooldown_secs, (
+        f'{where}: armed {first.cooldown.armed_secs}s, expected the flat {ledger.config.requeue_cooldown_secs}s'
+    )
+    assert first.cooldown.transient is False, f'{where}: cooldown marked transient'
+    assert first.transient_requeue_count == 0, f'{where}: transient count {first.transient_requeue_count}'
+    assert first.genuine_requeue_count == 1, f'{where}: genuine count {first.genuine_requeue_count}'
+
+
+def _armed_secs(record: DispatchRecord) -> float:
+    assert record.cooldown is not None, f'row 4: task {record.task_id} has no cooldown armed'
+    return record.cooldown.armed_secs
+
+
 def _assert_row_5(ledger: BurstLedger) -> None:
     assert ledger.park_stop_trip_wired, (
         'row 5: the scheduler has no on_park_stop_trip callback, so an empty deque proves nothing'
     )
-    phase_a = [r for tid in ledger.cast.burst for r in ledger.kills_of(tid)]
+    phase_a = ledger.phase_a()
     assert phase_a, 'row 5: no phase-A dispatches recorded'
     for record in phase_a:
         where = f'row 5: task {record.task_id} at t={record.at:.0f}s'
