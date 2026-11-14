@@ -202,3 +202,62 @@ class TestUnstackRecordsDrops:
         )
         assert await repo.ledger.dropped_of('task/P') == ()
         assert await repo.subjects('task/M') == ['feat(M): own m']
+
+
+# ---------------------------------------------------------------------------
+# GitOps branch renames carry the records with the branch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestBranchRenamesCarryDrops:
+    """A record stays with the work that wrote it, so a branch re-cut under the
+    old name never inherits another incarnation's drops."""
+
+    @staticmethod
+    async def _rebased_with_a_drop(repo: Repo) -> Task7:
+        task = await _shape_3490(repo)
+        assert await repo.git_ops.rebase_onto_main(task.wt) is True
+        assert [c.sha for c in await repo.ledger.dropped_of('task/7')] == [task.bump]
+        return task
+
+    async def test_parking_a_quarantined_incarnation_moves_its_drops(
+        self, repo: Repo,
+    ) -> None:
+        task = await self._rebased_with_a_drop(repo)
+
+        parked = await repo.git_ops.park_prior_incarnation('7', reason='recut')
+
+        assert parked is not None and parked.parked_branch is not None
+        assert parked.quarantined_worktree is not None
+        assert await repo.ledger.dropped_of('task/7') == ()
+        assert await repo.ledger.dropped_of(parked.parked_branch) == (
+            DroppedCommit(sha=task.bump, subject=_BUMP, paths=('index.html',)),
+        )
+
+    async def test_parking_a_branch_without_a_worktree_moves_its_drops(
+        self, repo: Repo,
+    ) -> None:
+        task = await self._rebased_with_a_drop(repo)
+        await _git(repo.root, 'worktree', 'remove', str(task.wt))
+
+        parked = await repo.git_ops.park_prior_incarnation('7', reason='recut')
+
+        assert parked is not None and parked.parked_branch is not None
+        assert parked.quarantined_worktree is None
+        assert await repo.ledger.dropped_of('task/7') == ()
+        assert [c.sha for c in await repo.ledger.dropped_of(parked.parked_branch)] == [
+            task.bump,
+        ]
+
+    async def test_rename_worktree_moves_its_drops(self, repo: Repo) -> None:
+        task = await self._rebased_with_a_drop(repo)
+
+        await repo.git_ops.rename_worktree(
+            task.wt, task.wt.with_name('7-skip-attempt'), '7', '7-skip-attempt',
+        )
+
+        assert await repo.ledger.dropped_of('task/7') == ()
+        assert [c.sha for c in await repo.ledger.dropped_of('task/7-skip-attempt')] == [
+            task.bump,
+        ]

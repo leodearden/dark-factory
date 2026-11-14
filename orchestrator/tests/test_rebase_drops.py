@@ -124,6 +124,64 @@ class TestRebaseDropLedger:
 
         assert await RebaseDropLedger(repo, _run).dropped_of('task/1') == ()
 
+    async def test_dropped_of_lists_a_root_commit_and_both_sides_of_a_rename(
+        self, repo: Path,
+    ) -> None:
+        await _init_repo(repo)
+        await _git(repo, 'config', 'diff.renames', 'true')
+        root = await _commit(repo, 'feat: root', {'old.txt': 'same\n', 'r.txt': 'r\n'})
+        await _git(repo, 'mv', 'old.txt', 'new.txt')
+        await _git(repo, 'commit', '-m', 'refactor: rename old to new')
+        renamed = (await _git(repo, 'rev-parse', 'HEAD')).strip()
+        ledger = RebaseDropLedger(repo, _run)
+
+        await ledger.record('task/1', [root, renamed])
+
+        assert {c.sha: c.paths for c in await ledger.dropped_of('task/1')} == {
+            root: ('old.txt', 'r.txt'),
+            renamed: ('new.txt', 'old.txt'),
+        }
+
+    async def test_dropped_of_reads_every_record_in_a_fixed_number_of_git_calls(
+        self, repo: Path,
+    ) -> None:
+        await _init_repo(repo)
+        shas = [
+            await _commit(repo, f'feat: write {n}', {f'{n}.txt': f'{n}\n'})
+            for n in range(5)
+        ]
+        await RebaseDropLedger(repo, _run).record('task/1', shas)
+        calls: list[list[str]] = []
+
+        async def counting(cmd: list[str], cwd: Path | None = None, **kwargs: object):
+            calls.append(cmd)
+            return await _run(cmd, cwd=cwd)
+
+        dropped = await RebaseDropLedger(repo, counting).dropped_of('task/1')
+
+        assert [c.sha for c in dropped] == sorted(shas)
+        assert len(calls) == 2, calls
+
+    async def test_move_branch_rekeys_only_that_branchs_records(
+        self, repo: Path,
+    ) -> None:
+        await _init_repo(repo)
+        c1 = await _commit(repo, 'feat: one', {'one.txt': '1\n'})
+        c10 = await _commit(repo, 'feat: ten', {'ten.txt': '10\n'})
+        ledger = RebaseDropLedger(repo, _run)
+        await ledger.record('task/1', [c1])
+        await ledger.record('task/10', [c10])
+
+        await ledger.move_branch('task/1', 'task/1-20261114T000000Z')
+
+        assert await ledger.dropped_of('task/1') == ()
+        assert [c.sha for c in await ledger.dropped_of('task/1-20261114T000000Z')] == [c1]
+        assert [c.sha for c in await ledger.dropped_of('task/10')] == [c10]
+        assert sorted(await _dropped_refs(repo)) == sorted([
+            ledger.ref_for('task/1-20261114T000000Z', c1),
+            ledger.ref_for('task/10', c10),
+        ])
+
     async def test_branch_names_sharing_a_prefix_do_not_collide(
         self, repo: Path,
     ) -> None:
@@ -417,13 +475,17 @@ class TestRunRebaseReportingDrops:
             'index.html': 'v=44\n', 'm.txt': 'm\n',
         })
 
-        async def show_fails(cmd: list[str], cwd: Path | None = None, **kwargs: object):
-            if cmd[:2] == ['git', 'show']:
-                return 128, '', 'fatal: simulated show failure'
+        async def subjects_read_fails(
+            cmd: list[str], cwd: Path | None = None, **kwargs: object,
+        ):
+            if cmd[:2] == ['git', 'log'] and '--name-only' in cmd:
+                return 128, '', 'fatal: simulated subjects read failure'
             return await _run(cmd, cwd=cwd)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.rebase_drops'):
-            result = await run_rebase_reporting_drops(show_fails, shape.wt, onto='main')
+            result = await run_rebase_reporting_drops(
+                subjects_read_fails, shape.wt, onto='main',
+            )
 
         assert result.ok
         assert result.dropped == ()

@@ -12,7 +12,9 @@ git ref per dropped commit, ``<namespace><full_branch>/<sha>``, pointing at
 the dropped commit itself.  A ref is atomic, is shared by every worktree,
 survives restarts, and keeps the dropped commit reachable after the reflog
 that once held it expires.  It is the same convention as
-``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``.
+``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``, and the
+two share their record-lifetime mechanics in
+``orchestrator/src/orchestrator/ref_ledger.py``.
 
 :func:`run_rebase_reporting_drops` runs a task-branch rebase and detects its
 drops without reading git's stderr, whose wording varies across versions.  It
@@ -27,8 +29,12 @@ Accepted residuals:
 
 1. A drop on a DETACHED HEAD is logged but not recorded: there is no branch
    to key the record on.
-2. Records of a deleted branch are pruned on the next record anywhere, so a
-   branch deleted and re-created before then inherits them.
+2. Records move with a branch ``GitOps`` renames (``rename_worktree``,
+   ``quarantine_worktree``, and the recut ruling's
+   ``park_prior_incarnation``), so a branch cut afresh under the old name
+   starts with none.  A DELETED branch's records stay until the next record
+   anywhere prunes them, so a branch re-created under that name before then
+   inherits them.
 3. Records of a rebase the caller later reverts (``BranchResetError`` in
    ``GitOps.rebase_preserving_task_commits``) remain.
 4. The replayed range is every commit on the branch past the target, so a
@@ -56,18 +62,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, TypeVar
 
-from orchestrator.rebase_recovery import AbortRunner
+from orchestrator.ref_ledger import (
+    BRANCH_REF_NAMESPACE,
+    GitReadError,
+    GitRunner,
+    git_lines,
+    git_out,
+    move_branch_records,
+    prune_orphaned_records,
+)
 
 logger = logging.getLogger(__name__)
 
 _T = TypeVar('_T')
 
 REBASE_DROP_REF_NAMESPACE = 'refs/dark-factory/rebase-dropped/'
-_BRANCH_REF_NAMESPACE = 'refs/heads/'
-
-#: The injected ``(cmd, cwd=...) -> (rc, stdout, stderr)`` runner, the same
-#: callable :func:`orchestrator.rebase_recovery.guarded_abort` is handed.
-GitRunner = AbortRunner
 
 
 @dataclass(frozen=True)
@@ -85,13 +94,6 @@ class DroppedCommit:
         return f'{self.sha[:12]} "{self.subject}"'
 
 
-class _GitReadError(RuntimeError):
-    """A git read this module needed failed."""
-
-    def __init__(self, command: tuple[str, ...], stderr: str) -> None:
-        super().__init__(f'{" ".join(command)} failed: {stderr.strip()}')
-
-
 @dataclass(frozen=True)
 class RebaseDropLedger:
     """One ref per dropped commit: ``<namespace><full_branch>/<sha>`` -> sha.
@@ -104,10 +106,13 @@ class RebaseDropLedger:
     run: GitRunner
 
     def ref_for(self, full_branch: str, sha: str) -> str:
-        return f'{REBASE_DROP_REF_NAMESPACE}{full_branch}/{sha}'
+        return f'{_records_of(full_branch)}{sha}'
 
     async def record(self, full_branch: str, shas: Iterable[str]) -> None:
-        """Record each of *shas* as dropped from *full_branch*.  Never raises."""
+        """Record each of *shas* as dropped from *full_branch*.
+
+        A failed git command is logged, not raised.
+        """
         for sha in dict.fromkeys(shas):
             rc, _, err = await self.run(
                 ['git', 'update-ref', self.ref_for(full_branch, sha), sha],
@@ -125,13 +130,12 @@ class RebaseDropLedger:
         A failed git read is logged and yields ().
         """
         try:
-            shas = await _git_lines(
+            shas = await git_lines(
                 self.run, self.repo_root,
-                'for-each-ref', '--format=%(objectname)',
-                f'{REBASE_DROP_REF_NAMESPACE}{full_branch}/',
+                'for-each-ref', '--format=%(objectname)', _records_of(full_branch),
             )
             return await _read_dropped_commits(self.run, self.repo_root, sorted(shas))
-        except _GitReadError as exc:
+        except GitReadError as exc:
             logger.warning(
                 'Could not read rebase-dropped commits of %s: %s', full_branch, exc,
             )
@@ -140,39 +144,26 @@ class RebaseDropLedger:
     async def prune_orphans(self) -> tuple[str, ...]:
         """Drop every record whose branch no longer exists; return those branches.
 
-        Never raises: a failed listing prunes nothing.
+        A failed git command is logged, not raised.
         """
-        rc, out, err = await self.run(
-            [
-                'git', 'for-each-ref', '--format=%(refname)',
-                REBASE_DROP_REF_NAMESPACE, _BRANCH_REF_NAMESPACE,
-            ],
-            cwd=self.repo_root,
+        return await prune_orphaned_records(
+            self.run, self.repo_root, REBASE_DROP_REF_NAMESPACE,
+            branch_of=lambda key: key.rpartition('/')[0],
         )
-        if rc != 0:
-            logger.warning('Could not list rebase-drop records: %s', err.strip())
-            return ()
-        orphans = _orphaned_records(set(out.split()))
-        for refname in orphans:
-            await self._forget(refname)
-        return tuple(sorted(set(orphans.values())))
 
-    async def _forget(self, refname: str) -> None:
-        rc, _, err = await self.run(['git', 'update-ref', '-d', refname], cwd=self.repo_root)
-        if rc != 0:
-            logger.debug('Could not clear rebase-drop record %s: %s', refname, err.strip())
+    async def move_branch(self, old_branch: str, new_branch: str) -> None:
+        """Re-key *old_branch*'s records to *new_branch*, which it was renamed to.
+
+        A failed git command is logged, not raised.
+        """
+        await move_branch_records(
+            self.run, self.repo_root, _records_of(old_branch), _records_of(new_branch),
+        )
 
 
-def _orphaned_records(refnames: set[str]) -> dict[str, str]:
-    """Each record ref whose branch is absent from *refnames*, mapped to that branch."""
-    orphans: dict[str, str] = {}
-    for refname in refnames:
-        if not refname.startswith(REBASE_DROP_REF_NAMESPACE):
-            continue
-        full_branch = refname.removeprefix(REBASE_DROP_REF_NAMESPACE).rpartition('/')[0]
-        if f'{_BRANCH_REF_NAMESPACE}{full_branch}' not in refnames:
-            orphans[refname] = full_branch
-    return orphans
+def _records_of(full_branch: str) -> str:
+    """The ref prefix every record of *full_branch* sits beneath."""
+    return f'{REBASE_DROP_REF_NAMESPACE}{full_branch}/'
 
 
 class RebaseRun(NamedTuple):
@@ -239,7 +230,7 @@ async def _measured(
 async def _read_baseline(
     run: GitRunner, worktree: Path, onto: str, upstream: str | None,
 ) -> _Baseline:
-    onto_sha = (await _git_out(
+    onto_sha = (await git_out(
         run, worktree, 'rev-parse', '--verify', f'{onto}^{{commit}}',
     )).strip()
     start = onto_sha if upstream is None else upstream
@@ -249,7 +240,7 @@ async def _read_baseline(
 async def _replayed(
     run: GitRunner, worktree: Path, revision_range: str,
 ) -> tuple[_ReplayedCommit, ...]:
-    out = await _git_out(
+    out = await git_out(
         run, worktree, 'log', '--no-merges', '--reverse', '-z', '--date=raw',
         f'--format={_REPLAYED_FORMAT}', revision_range,
     )
@@ -320,8 +311,8 @@ async def _read_checkout(run: GitRunner, worktree: Path) -> _Checkout:
     if rc == 1:
         return _Checkout(None, 'detached HEAD (not recorded)')
     if rc != 0:
-        raise _GitReadError(command, err)
-    branch = out.strip().removeprefix(_BRANCH_REF_NAMESPACE)
+        raise GitReadError(command, err)
+    branch = out.strip().removeprefix(BRANCH_REF_NAMESPACE)
     return _Checkout(branch, branch)
 
 
@@ -335,36 +326,46 @@ def _warn_dropped(
     )
 
 
+#: Opens each commit's header in :func:`_read_dropped_commits`'s log, so a
+#: header is told apart from the NUL-terminated paths listed after it.  It is
+#: not whitespace to ``str.strip``, unlike ``\x1c``-``\x1f``, so a runner that
+#: strips stdout cannot eat the first header's mark.
+_HEADER_MARK = '\x01'
+
+
 async def _read_dropped_commits(
     run: GitRunner, cwd: Path, shas: Sequence[str],
 ) -> tuple[DroppedCommit, ...]:
-    """Subject and changed paths of each of *shas*, in the order given.
+    """Subject and changed paths of each of *shas*, in the order given, in one read.
 
-    Raises :class:`_GitReadError` when any read fails.
+    ``--no-renames --root`` lists both sides of a rename and every path of a
+    root commit, whatever the repository's diff configuration says.  Raises
+    :class:`orchestrator.ref_ledger.GitReadError` when the read fails.
     """
-    return tuple([await _read_commit(run, cwd, sha) for sha in shas])
-
-
-async def _read_commit(run: GitRunner, cwd: Path, sha: str) -> DroppedCommit:
-    subject = await _git_out(run, cwd, 'show', '-s', '--format=%s', sha)
-    paths = await _git_out(
-        run, cwd, 'diff-tree', '--no-commit-id', '--name-only', '-r', '-z', '--root', sha,
+    if not shas:
+        return ()
+    out = await git_out(
+        run, cwd, 'log', '--no-walk=unsorted', '--no-renames', '--root', '-z',
+        '--name-only', '--format=%x01%H%x1f%s', *shas,
     )
-    return DroppedCommit(
-        sha=sha,
-        subject=subject.strip(),
-        paths=tuple(path for path in paths.split('\x00') if path),
+    return _parse_name_only_log(out)
+
+
+def _parse_name_only_log(out: str) -> tuple[DroppedCommit, ...]:
+    """The commits in ``git log -z --name-only`` output, in order.
+
+    Each commit is a ``<mark><sha>\\x1f<subject>`` header followed by its
+    NUL-terminated paths, the first of which git prefixes with a newline.
+    """
+    commits: list[tuple[str, str, list[str]]] = []
+    for token in out.split('\x00'):
+        if token.startswith(_HEADER_MARK):
+            sha, _, subject = token.removeprefix(_HEADER_MARK).partition('\x1f')
+            commits.append((sha, subject.strip(), []))
+        elif token and commits:
+            paths = commits[-1][2]
+            paths.append(token if paths else token.removeprefix('\n'))
+    return tuple(
+        DroppedCommit(sha=sha, subject=subject, paths=tuple(paths))
+        for sha, subject, paths in commits
     )
-
-
-async def _git_lines(run: GitRunner, cwd: Path, *args: str) -> list[str]:
-    out = await _git_out(run, cwd, *args)
-    return [line.strip() for line in out.splitlines() if line.strip()]
-
-
-async def _git_out(run: GitRunner, cwd: Path, *args: str) -> str:
-    command = ('git', *args)
-    rc, out, err = await run(list(command), cwd=cwd)
-    if rc != 0:
-        raise _GitReadError(command, err)
-    return out

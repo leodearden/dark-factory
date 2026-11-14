@@ -116,7 +116,7 @@ from orchestrator.quarantine_provenance import (
     QuarantineOutcome,
     record_quarantine_provenance,
 )
-from orchestrator.rebase_drops import run_rebase_reporting_drops
+from orchestrator.rebase_drops import RebaseDropLedger, run_rebase_reporting_drops
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
 from orchestrator.script_warnings import log_warnings_despite_success
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
@@ -16242,6 +16242,7 @@ class GitOps:
                 f'rename_worktree: git branch -m {full_old} -> {full_new} '
                 f'failed (rc={rc}): {err}'
             )
+        await self._carry_branch_records(full_old, full_new)
 
         logger.info(
             'Renamed worktree %s -> %s and branch %s -> %s',
@@ -16608,6 +16609,7 @@ class GitOps:
             if not await self._rename_branch_back(full_new, full_old) and isinstance(move_error, Exception):
                 raise _ParkedBranchStranded(full_new, move_error) from move_error
             raise
+        await self._carry_branch_records(full_old, full_new)
         return full_new
 
     async def _rename_branch_back(self, parked: str, original: str) -> bool:
@@ -16748,6 +16750,13 @@ class GitOps:
                 f'park_prior_incarnation: git branch -m {prefix}{branch_name} '
                 f'{prefix}{parked_name} failed (rc={rc}): {err}'
             )
+        await self._carry_branch_records(f'{prefix}{branch_name}', f'{prefix}{parked_name}')
+
+    async def _carry_branch_records(self, full_old: str, full_new: str) -> None:
+        """Re-key the commits a rebase dropped from *full_old*, just renamed to
+        *full_new*, so they stay with the work that wrote them and a branch
+        re-cut under the old name starts with none."""
+        await RebaseDropLedger(self.project_root, _run).move_branch(full_old, full_new)
 
     async def _free_lane_checkout(self, branch_name: str) -> None:
         """Commit WIP on and detach the lane holding ``task/<branch_name>``.

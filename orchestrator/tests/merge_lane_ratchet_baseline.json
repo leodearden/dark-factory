@@ -74,7 +74,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1538, "function_local_imports": 4, "lines": 16916, "prose_lines": 9588, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1538, "function_local_imports": 4, "lines": 16925, "prose_lines": 9591, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 868, "prose_lines": 360, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 1, "function_local_imports": 0, "lines": 205, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/chain_reservation.py": {"cognitive": 24, "function_local_imports": 0, "lines": 167, "prose_lines": 19, "reexport_names": 0},
@@ -131,6 +131,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_branch_has_commits_beyond_main": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_build_merge_marker_index": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_bump_host_verify_attempt_count": 1,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_carry_branch_records": 0,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_clean_lane_retaining_artifacts": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_cleanup_leftover_branch": 9,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_clear_foreign_meta_root": 0,
