@@ -1,0 +1,18 @@
+{
+  "task_id": "6300",
+  "reason": "Net-additive defect fix (task 6300): GitOps.own_delta_upstream lets train failure attribution cut a still-stacked anchor's solo above its unlanded stack base, so a pre-6133 train's anchor can no longer land a never-landed predecessor's commits under its own name. The foreign-cut computation is extracted from _unstack_recorded into GitOps._foreign_cut so both share it. Not a refactor that failed.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1535,
+      "current": 1538
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5226,
+      "current": 5229
+    }
+  ]
+}

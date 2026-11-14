@@ -13666,17 +13666,30 @@ class TaskWorkflow:
             self.task_id, context,
         )
 
+    async def _solo_upstream(self, member_ids: list[str], index: int) -> str | None:
+        """The ref member *index*'s own commits sit on: a successor's
+        predecessor branch, or wherever the anchor's own delta starts, which is
+        above any unlanded stack base an earlier train left under it (task
+        6300), not necessarily main.  None when that cannot be told.
+        """
+        prefix = self.git_ops.config.branch_prefix
+        if index > 0:
+            return f'{prefix}{member_ids[index - 1]}'
+        return await self.git_ops.own_delta_upstream(f'{prefix}{member_ids[0]}')
+
     async def _reverify_one_member(
         self,
         member: dict,
-        predecessor_ref: str,
+        upstream: str | None,
     ) -> SoloVerifyResult:
         """Un-stack a member's own delta onto main and verify it in isolation.
 
-        1. Call ``git_ops.materialize_member_solo(member_id, predecessor_ref)``
+        1. Call ``git_ops.materialize_member_solo(member_id, upstream)``
            to create an isolated worktree carrying only this member's commits.
-        2. If the un-stack fails (returns None — rebase conflict), return a
-           failed result with reason='unstackable'.
+        2. If there is no *upstream* (its own delta cannot be told
+           apart; nothing is materialized) or the un-stack fails (returns
+           None — rebase conflict), return a failed result with
+           reason='unstackable'.
         3. Otherwise call ``merge_queue.reverify_member_solo`` (verify-only;
            never advances main) and return its result.
         """
@@ -13686,8 +13699,8 @@ class TaskWorkflow:
         )
 
         member_id = str(member.get('id', ''))
-        solo_wt_info = await self.git_ops.materialize_member_solo(
-            member_id, predecessor_ref,
+        solo_wt_info = None if upstream is None else (
+            await self.git_ops.materialize_member_solo(member_id, upstream)
         )
         if solo_wt_info is None:
             return SoloVerifyResult(
@@ -13727,7 +13740,11 @@ class TaskWorkflow:
         Design (δ):
         - For each member root→tip, un-stack its own delta onto current main via
           ``_reverify_one_member`` (wraps materialize_member_solo +
-          reverify_member_solo; never advances).  Exactly N solo verifies.
+          reverify_member_solo; never advances).  At most N solo verifies.
+          The anchor's delta starts at ``GitOps.own_delta_upstream`` rather
+          than at main (task 6300), so it never carries an unlanded stack
+          base's commits; when that cannot be told, the anchor is an
+          un-stackable failer.
         - Partition into passers / failers (un-stack conflict → failer).
         - All pass → genuine cross-member INTERACTION: emit train_derailed
           (verdict='interaction'), escalate the train, land nothing.
@@ -13750,7 +13767,7 @@ class TaskWorkflow:
           and neither does a failed revert.
         """
         # Sort members by their metadata train 'order' (root→tip) so that the
-        # predecessor_ref computation is correct regardless of caller-side ordering.
+        # _solo_upstream computation is correct regardless of caller-side ordering.
         # tasks_by_train normally returns them sorted, but attributing the right
         # delta to each member depends on strict stacking order — a silently
         # mis-ordered list would rebase against the wrong predecessor, either
@@ -13762,22 +13779,18 @@ class TaskWorkflow:
         )
 
         member_ids = [str(m.get('id', '')) for m in members]
-        branch_prefix = self.git_ops.config.branch_prefix
-        main_branch = self.git_ops.config.main_branch
 
         logger.info(
             'Task %s: train %r union verify failed — re-verifying %d members as singles',
             self.task_id, train_id, len(members),
         )
 
-        # Collect per-member solo verify results (root→tip; N verifies total).
+        # Collect per-member solo verify results (root→tip; at most N verifies).
         solo_results: list[SoloVerifyResult] = []
         for i, member in enumerate(members):
-            predecessor_ref = (
-                main_branch if i == 0
-                else f'{branch_prefix}{members[i - 1].get("id", "")}'
+            solo = await self._reverify_one_member(
+                member, await self._solo_upstream(member_ids, i),
             )
-            solo = await self._reverify_one_member(member, predecessor_ref)
             solo_results.append(solo)
             logger.debug(
                 'Task %s: member %s solo verify: passed=%s reason=%r',

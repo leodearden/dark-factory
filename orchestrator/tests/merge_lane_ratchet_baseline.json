@@ -74,7 +74,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1535, "function_local_imports": 4, "lines": 16878, "prose_lines": 9573, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1538, "function_local_imports": 4, "lines": 16914, "prose_lines": 9584, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 868, "prose_lines": 360, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 1, "function_local_imports": 0, "lines": 205, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/chain_reservation.py": {"cognitive": 24, "function_local_imports": 0, "lines": 167, "prose_lines": 19, "reexport_names": 0},
@@ -144,6 +144,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_detect_unmerged_paths": 6,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_find_lane_by_plan_task_id": 9,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_find_replay": 12,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_foreign_cut": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_free_lane_checkout": 4,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_freshen_main": 7,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_index_lock_path": 7,
@@ -220,7 +221,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_train_predecessor": 4,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_try_reclaim_lane_for": 10,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_unambiguous_patch_ids": 12,
-    "orchestrator/src/orchestrator/git_ops.py::GitOps::_unstack_recorded": 3,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::_unstack_recorded": 1,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_vacuous_path_survives": 7,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_warm_lane_audit_cached": 2,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::_warm_lane_base_resolvable": 5,
@@ -293,6 +294,7 @@
     "orchestrator/src/orchestrator/git_ops.py::GitOps::merge_tree_conflicts": 11,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::merge_verify_lease": 9,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::net_diff_is_empty": 8,
+    "orchestrator/src/orchestrator/git_ops.py::GitOps::own_delta_upstream": 3,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::park_prior_incarnation": 7,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::persistent_merge_worktree_path": 0,
     "orchestrator/src/orchestrator/git_ops.py::GitOps::persistent_offline_deep_worktree_path": 0,

@@ -8,7 +8,8 @@ stack_train_branches also reports each member's tip from just before
 stacking, and
 GitOps.restore_pre_stack_tip puts a member back on it (task 4953).  A
 requeued member resumed through GitOps._reuse_warm_lane is un-stacked first
-(task 6219).
+(task 6219).  GitOps.own_delta_upstream names where a still-stacked branch's
+own delta starts without moving the branch or its record (task 6300).
 
 Real temp git repositories throughout.  Members live at
 ``git_ops.worktree_base / <id>`` on branch ``task/<id>``, the layout
@@ -424,6 +425,95 @@ class TestUnstackFromUnlandedBase:
 
         assert result.outcome is UnstackOutcome.BLOCKED
         assert await repo.sha('task/M') == tip_before
+
+
+# ---------------------------------------------------------------------------
+# GitOps.own_delta_upstream: a still-stacked anchor's own delta (task 6300)
+# ---------------------------------------------------------------------------
+
+
+async def _stack_x_on_still_stacked_m(repo: Repo) -> None:
+    """A train [M, X] formed before task 6133: X stacked onto task/M while
+    task/M still carries the commits of its never-landed base task/P."""
+    await _stack_p_and_m(repo)
+    await _add_member(repo.git_ops, 'X', 'main', {'x.txt': 'x\n'})
+    await _git(repo.wt('X'), 'rebase', 'task/M')
+    await repo.ledger.record('task/X', await repo.sha('task/M'))
+
+
+@pytest.mark.asyncio
+class TestOwnDeltaUpstream:
+    async def test_a_still_stacked_anchors_solo_carries_only_its_own_delta(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_x_on_still_stacked_m(repo)
+
+        upstream = await repo.git_ops.own_delta_upstream('task/M')
+
+        assert upstream is not None and upstream != 'main'
+        solo = await repo.git_ops.materialize_member_solo('M', upstream)
+        assert solo is not None
+        try:
+            assert await _diff_vs_main(repo.root, '_solo-M') == {'m.txt'}
+        finally:
+            await repo.git_ops.cleanup_merge_worktree(solo.path)
+
+    async def test_reading_it_moves_neither_the_anchor_nor_its_record(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_x_on_still_stacked_m(repo)
+        m_before = await repo.sha('task/M')
+
+        await repo.git_ops.own_delta_upstream('task/M')
+
+        assert await repo.sha('task/M') == m_before
+        assert await repo.ledger.base_of('task/M') == await repo.sha('task/P')
+        solo = await repo.git_ops.materialize_member_solo('X', 'task/M')
+        assert solo is not None
+        try:
+            assert await _diff_vs_main(repo.root, '_solo-X') == {'x.txt'}
+        finally:
+            await repo.git_ops.cleanup_merge_worktree(solo.path)
+
+    async def test_a_branch_with_no_record_starts_at_main(self, repo: Repo) -> None:
+        await _add_p_and_m(repo)
+
+        assert await repo.git_ops.own_delta_upstream('task/M') == 'main'
+
+    async def test_a_branch_whose_base_landed_starts_at_main(self, repo: Repo) -> None:
+        await _stack_p_and_m(repo)
+        await _git(repo.root, 'merge', '--no-ff', '-m', 'land P', 'task/P')
+
+        assert await repo.git_ops.own_delta_upstream('task/M') == 'main'
+
+    async def test_a_stack_replayed_onto_main_starts_above_the_replayed_base(
+        self, repo: Repo,
+    ) -> None:
+        await _stack_p_and_m(repo)
+        await repo.advance_main({'unrelated.txt': 'main moved\n'})
+        await _git(repo.wt('M'), 'rebase', 'main')
+
+        upstream = await repo.git_ops.own_delta_upstream('task/M')
+
+        assert upstream is not None and upstream != 'main'
+        solo = await repo.git_ops.materialize_member_solo('M', upstream)
+        assert solo is not None
+        try:
+            assert await _diff_vs_main(repo.root, '_solo-M') == {'m.txt'}
+        finally:
+            await repo.git_ops.cleanup_merge_worktree(solo.path)
+
+    async def test_a_failed_git_read_answers_none(
+        self, repo: Repo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await _stack_p_and_m(repo)
+        m_before = await repo.sha('task/M')
+        shim = tmp_path / 'shim'
+        _fail_git(monkeypatch, shim, 'cherry')
+
+        assert await repo.git_ops.own_delta_upstream('task/M') is None
+        assert (shim / 'matched').exists()
+        assert await repo.sha('task/M') == m_before
 
 
 # ---------------------------------------------------------------------------
