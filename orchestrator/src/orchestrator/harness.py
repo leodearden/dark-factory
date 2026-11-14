@@ -9396,70 +9396,19 @@ class Harness:
     ) -> None:
         """Block a task and file an L1 for a cross-repo BLOCK verdict (misfile or unverifiable).
 
-        Structurally a sibling of ``_block_and_escalate_substrate_flip`` below —
-        the two dispatch-gate blockers are kept adjacent deliberately:
-        - Sets the task to ``blocked`` via ``scheduler.set_task_status``
-          (unconditional; wrapped in try/except so a transient write failure does
-          not prevent the L1 from being filed).
-        - Submits a level-1 ``Escalation`` with category='scope_violation'.
-        - Deduped by ``has_open_l1`` so repeated dispatch attempts (after the
-          requeue cooldown expires) do not stack duplicate escalations.
-        - No-ops gracefully when ``_escalation_queue`` is None (bare-Harness tests).
-
         ``scope_violation`` rather than the substrate gate's ``design_concern``:
         a misfile's work belongs to ANOTHER project — a scope failure, not a
         premise failure.  A classifier crash fails closed on that same question.
 
         The summary/detail come from
         ``orchestrator/src/orchestrator/cross_repo_gate.py::block_escalation_text``.
+        Blocking and filing go through ``_block_and_file_dispatch_gate_l1``,
+        whose dedupe is category-scoped, so an open L1 for another cause no
+        longer hides this one (task 7170).
         """
-        try:
-            await self.scheduler.set_task_status(task_id, 'blocked')
-        except Exception:
-            logger.warning(
-                'Cross-repo block for task %s — set_task_status raised; '
-                'will still attempt to file escalation',
-                task_id,
-                exc_info=True,
-            )
-
-        if not self._escalation_queue:
-            logger.warning(
-                'Cross-repo block for task %s — no escalation queue, skipping L1 file',
-                task_id,
-            )
-            return
-
-        if self._escalation_queue.has_open_l1(task_id):
-            logger.warning(
-                'Cross-repo block for task %s — open L1 already exists, suppressing '
-                'duplicate; pre-existing L1 may be for an unrelated cause',
-                task_id,
-            )
-            return
-
-        from escalation.models import Escalation  # noqa: PLC0415
-
         text = cross_repo_gate.block_escalation_text(task_id, verdict)
-        esc = Escalation(
-            id=self._escalation_queue.make_id(task_id),
-            task_id=task_id,
-            agent_role='orchestrator-scheduler',
-            severity='blocking',
-            category='scope_violation',
-            summary=text.summary[:200],
-            detail=text.detail,
-            suggested_action='manual_intervention',
-            level=1,
-            filing_claimant_run_id=self._filing_claimant_run_id,
-        )
-        self._escalation_queue.submit(esc)
-        logger.warning(
-            'Filed L1 cross-repo escalation %s for task %s (signals=%r, owner=%s)',
-            esc.id,
-            task_id,
-            verdict.signals,
-            verdict.owner_project or 'unresolved',
+        await self._block_and_file_dispatch_gate_l1(
+            task_id, category='scope_violation', summary=text.summary, detail=text.detail,
         )
 
     async def _block_and_escalate_substrate_flip(
@@ -9595,7 +9544,15 @@ class Harness:
     async def _block_and_file_dispatch_gate_l1(
         self, task_id: str, *, category: str, summary: str, detail: str,
     ) -> None:
-        """Block *task_id* and file one category-scoped L1 for a dispatch gate."""
+        """Block *task_id* and file one category-scoped L1 for a dispatch gate.
+
+        The single home of the dispatch gates' block-and-file policy:
+        - the ``blocked`` status write comes first and is unconditional;
+        - a failed write is logged and the L1 is still filed;
+        - with no escalation queue the filing is a logged no-op;
+        - the dedupe is ``_file_harness_l1``'s: only an open L1 of *category*
+          suppresses this one, so an L1 for another cause cannot hide it.
+        """
         try:
             await self.scheduler.set_task_status(task_id, 'blocked')
         except Exception:
@@ -9657,7 +9614,9 @@ class Harness:
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
-        logger.warning('Filed L1 %s escalation %s for task %s', category, esc.id, task_id)
+        logger.warning(
+            'Filed L1 %s escalation %s for task %s: %s', category, esc.id, task_id, summary,
+        )
 
     async def _run_cross_repo_gate(self, assignment) -> bool:
         """Run the dispatch-time cross-repo admission gate (task 3121).
