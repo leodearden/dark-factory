@@ -290,6 +290,34 @@ _UNPAGED_CYPHER_METHODS = [
 ]
 
 
+_PAGED_CYPHER_METHODS = [
+    pytest.param(lambda b: b.enumerate_entity_nodes(group_id='g'),
+                 'enumerate_entity_nodes', _READ_S, id='enumerate_entity_nodes'),
+    pytest.param(lambda b: b.enumerate_ranked_entity_nodes(group_id='g'),
+                 'enumerate_ranked_entity_nodes', _READ_S, id='enumerate_ranked_entity_nodes'),
+    pytest.param(lambda b: b.enumerate_all_valid_edges(group_id='g'),
+                 'enumerate_all_valid_edges', _READ_S, id='enumerate_all_valid_edges'),
+    pytest.param(
+        lambda b: b.enumerate_valid_edges_mentioning('Alice', group_id='g'),
+        'enumerate_valid_edges_mentioning', _READ_S, id='enumerate_valid_edges_mentioning',
+    ),
+    pytest.param(
+        lambda b: b.query_edges_by_time_range(
+            '2026-01-01T00:00:00+00:00', '2026-02-01T00:00:00+00:00', group_id='g',
+        ),
+        'query_edges_by_time_range', _READ_S, id='query_edges_by_time_range',
+    ),
+    pytest.param(lambda b: b.query_stale_node_embeddings(1536, group_id='g'),
+                 'query_stale_node_embeddings', _READ_S, id='query_stale_node_embeddings'),
+    pytest.param(lambda b: b.query_stale_edge_embeddings(1536, group_id='g'),
+                 'query_stale_edge_embeddings', _READ_S, id='query_stale_edge_embeddings'),
+    pytest.param(lambda b: b.entity_uuids_with_prefix('ab', group_id='g'),
+                 'entity_uuids_with_prefix', _READ_S, id='entity_uuids_with_prefix'),
+    pytest.param(lambda b: b.edge_uuids_with_prefix('ab', group_id='g'),
+                 'edge_uuids_with_prefix', _READ_S, id='edge_uuids_with_prefix'),
+]
+
+
 def _tiny_budget_config(config):
     return config.model_copy(update={
         'queue': config.queue.model_copy(update={
@@ -316,7 +344,9 @@ class TestEveryBackendCypherMethodIsBudgeted:
     """Through the production provider, every raw Cypher call overruns a named, configured budget."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(('call', 'op', 'budget'), _UNPAGED_CYPHER_METHODS)
+    @pytest.mark.parametrize(
+        ('call', 'op', 'budget'), _UNPAGED_CYPHER_METHODS + _PAGED_CYPHER_METHODS,
+    )
     async def test_a_hanging_graph_fails_on_the_methods_budget(
         self, mock_config, make_backend, make_graph_driver, call, op, budget,
     ):
