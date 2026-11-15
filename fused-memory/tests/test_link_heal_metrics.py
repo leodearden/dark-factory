@@ -38,6 +38,7 @@ from shared.memory_eval_metrics import (
     metrics_artifact_path,
     write_metric_series,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.maintenance.link_adjudicator import AdjudicationFailure
 from fused_memory.maintenance.link_heal import HealAction, RunCounts, Verdict
@@ -67,6 +68,8 @@ from fused_memory.maintenance.link_heal_report import (
 from fused_memory.maintenance.link_heal_store import CreatedWindow
 from fused_memory.maintenance.link_heal_sweep import SweepReport, SweepSettings, run_sweep
 from fused_memory.server.grouped_read import SIGHTING_KIND
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 11, 15, 2, 15, tzinfo=UTC)
 DAY = timedelta(days=1)
