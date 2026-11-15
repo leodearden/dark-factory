@@ -3755,6 +3755,20 @@ for the 06:00 one, and
 [Weekly duplicate-cluster report (Sun 06:30)](#weekly-duplicate-cluster-report-sun-0630)
 for the weekly one.
 
+**The 03:30 job is an adjunct, not the collector.** Both Mem0 marker pools
+are already drained in-cycle, unconditionally and per-project, by
+reconciliation itself — task 2853 for the `source`-tagged pool this timer
+targets, task 2966 for the `flag_for_stage2` relay pool. So a night that
+deletes **zero** records is the healthy steady state, not evidence the
+timer is broken. A zero is not self-certifying either: since task 3897 each
+run emits a `cross_check` block whose `blind_spot: true` means "saw
+nothing" rather than "there was nothing", and since task 3923 an observed
+blind spot fails `--check` by default — see the per-job doc's "Reading
+the output" section before reading a clean count as a clean bill.
+`scripts/fused-memory-flag-marker-check.sh` is the read-only ad-hoc census
+counterpart for running that same probe by hand (its `before_done` gate
+role was retired by task 3923; it refuses `--apply` outright).
+
 **04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
 trickle health probe (see below). The nightly reify closure-staleness sweep and
 its `consume_redispatch_requests` drain that used to hold that slot were retired

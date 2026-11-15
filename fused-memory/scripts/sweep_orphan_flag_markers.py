@@ -55,9 +55,17 @@ The pre-2406 Mem0 records remain pure dead weight (nothing reads them — see
 ``find_stale_markers``/``find_terminal_task_markers`` docstrings); they are simply
 no longer *uncollected* dead weight. This script is therefore a manual adjunct to
 that automatic drain, not the only thing standing between the repo and an unbounded
-pool — it remains useful for the targeted predicates the in-cycle drain does not
-implement (``--delete-ids``, ``--terminal-drain``) and for the deterministic
-``--check --max-backlog`` gate. In passing: the in-cycle drain's filter matches on
+pool. Task 3498 ruled this script KEPT, but corrected *why*: its load-bearing
+role is the task-3897 ``cross_check`` census — the only instrument that renders
+``orphan_count: 0`` legible as "saw nothing" rather than "there was nothing" —
+and NOT the drain. Both clauses previously claimed here are stale:
+``--delete-ids``/``--terminal-drain`` are not independent of the enumeration
+(``targeted`` is the intersection of ``delete_ids`` with ``members``, the same
+``source``-filtered scroll every predicate reads), and task 3923 retired the
+``--check --max-backlog`` gate for want of any ``before_done`` consumer. The
+delete-set predicates are retained per task 3897's own MEASURED-ZERO-RETAINED
+ruling; full rationale in ``docs/flag-marker-sweep-recurring.md`` §"Decision
+(task 3498)". In passing: the in-cycle drain's filter matches on
 ``source`` alone and never on ``kind``, so it already collects those task-1659
 missing-``kind`` orphans that are older than 14 days and carry a parseable
 ``created_at``; records with a missing or unparseable ``created_at`` are skipped by
