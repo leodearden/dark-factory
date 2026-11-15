@@ -1458,7 +1458,8 @@ def test_importing_the_snapshot_never_loads_the_ratchet() -> None:
     # the worker already imported.
     code = (
         'import sys, quality_metrics_snapshot\n'
-        "print(sorted({'merge_lane_metrics'} & set(sys.modules)))\n"
+        "instrument = {'merge_lane_metrics', 'merge_lane_cluster', 'merge_lane_ratchet'}\n"
+        'print(sorted(instrument & set(sys.modules)))\n'
     )
     proc = subprocess.run(
         [sys.executable, '-c', code],

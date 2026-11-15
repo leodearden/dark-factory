@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from _merge_lane_ratchet_fixtures import metrics, synthetic_report
+from _merge_lane_ratchet_fixtures import ratchet, synthetic_report
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
@@ -226,9 +226,9 @@ class TestScalars:
 def _image(directory: Path, name: str, report: dict, *, readme: str | None = None) -> Path:
     target = directory / name
     text = (
-        metrics.render_baseline(report)
+        ratchet.render_baseline(report)
         if readme is None
-        else metrics.render_baseline(report, readme=readme)
+        else ratchet.render_baseline(report, readme=readme)
     )
     target.write_text(text, encoding='utf-8')
     return target
@@ -244,7 +244,7 @@ class TestTheMergeVerb:
 
         assert driver.main(['merge', str(base), str(ours), str(theirs)]) == 0
 
-        assert ours.read_text(encoding='utf-8') == metrics.render_baseline(
+        assert ours.read_text(encoding='utf-8') == ratchet.render_baseline(
             _with(_a_py('lines', 1015))
         )
 
@@ -271,7 +271,7 @@ class TestTheMergeVerb:
         text = ours.read_text(encoding='utf-8')
         assert '<<<<<<< ours' in text and '>>>>>>> theirs' in text
         err = capsys.readouterr().err
-        assert 'complexipy_version' in err and metrics.BASELINE_RELPATH in err
+        assert 'complexipy_version' in err and ratchet.BASELINE_RELPATH in err
 
     def test_any_failure_is_a_conflict_with_markers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -306,7 +306,7 @@ _DRIVER_FILES = (
     '.gitattributes',
     'pyproject.toml',
     'scripts/merge_lane_ratchet_merge.py',
-    'scripts/merge_lane_metrics.py',
+    'scripts/merge_lane_ratchet.py',
     'scripts/merge_lane_cluster.py',
     'scripts/source_measures.py',
     'scripts/_checkout.py',
@@ -360,9 +360,9 @@ class _Repo:
         assert proc.returncode == 0, proc.stderr
 
     def write_baseline(self, report: dict) -> None:
-        target = self.root / metrics.BASELINE_RELPATH
+        target = self.root / ratchet.BASELINE_RELPATH
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(metrics.render_baseline(report), encoding='utf-8')
+        target.write_text(ratchet.render_baseline(report), encoding='utf-8')
 
     def commit_all(self, message: str) -> None:
         self.git('add', '-A')
@@ -372,17 +372,17 @@ class _Repo:
         """Branch *name* off main: the baseline at *report*, one entry recorded."""
         self.git('switch', '--quiet', '-c', name, 'main')
         self.write_baseline(report)
-        metrics.append_authorization(self.root / metrics.LEDGER_DIR_RELPATH, entry)
+        ratchet.append_authorization(self.root / ratchet.LEDGER_DIR_RELPATH, entry)
         self.commit_all(f'{name}: raise and record it')
 
     def baseline(self, cwd: Path | None = None) -> str:
-        return ((cwd or self.root) / metrics.BASELINE_RELPATH).read_text(encoding='utf-8')
+        return ((cwd or self.root) / ratchet.BASELINE_RELPATH).read_text(encoding='utf-8')
 
 
 def _entry(task_id: str, was: int, now: int) -> dict:
-    return metrics.authorization_record(
-        metrics.RaiseAuthorization(task_id=task_id, reason=f'net-additive {task_id}'),
-        [metrics.Violation.rose('lines', 'a.py', was, now)],
+    return ratchet.authorization_record(
+        ratchet.RaiseAuthorization(task_id=task_id, reason=f'net-additive {task_id}'),
+        [ratchet.Violation.rose('lines', 'a.py', was, now)],
     )
 
 
@@ -391,7 +391,7 @@ _THEIRS = _with(_a_py('lines', 1007))
 
 
 def _expected() -> str:
-    return metrics.render_baseline(
+    return ratchet.render_baseline(
         driver.merge_baselines(synthetic_report(), _OURS, _THEIRS)
     )
 
@@ -417,8 +417,8 @@ class TestGitMergesThroughTheDriver:
         assert merged.returncode == 0, merged.stdout + merged.stderr
         assert repo.baseline() == _expected()
         assert json.loads(repo.baseline())['files']['a.py']['lines'] == 1012
-        assert {entry['task_id'] for entry in metrics.load_ledger(
-            repo.root / metrics.LEDGER_DIR_RELPATH
+        assert {entry['task_id'] for entry in ratchet.load_ledger(
+            repo.root / ratchet.LEDGER_DIR_RELPATH
         )} == {'1', '2'}
         assert repo.git('status', '--porcelain').stdout == ''
 
@@ -433,7 +433,7 @@ class TestGitMergesThroughTheDriver:
 
         assert probe.returncode == 0, probe.stdout + probe.stderr
         tree = probe.stdout.split()[0]
-        assert repo.git('cat-file', '-p', f'{tree}:{metrics.BASELINE_RELPATH}').stdout == _expected()
+        assert repo.git('cat-file', '-p', f'{tree}:{ratchet.BASELINE_RELPATH}').stdout == _expected()
         assert repo.git('status', '--porcelain', '--ignored').stdout == ''
 
     def test_a_linked_worktree_merges_through_the_shared_config(self, tmp_path: Path) -> None:
@@ -459,7 +459,7 @@ class TestGitMergesThroughTheDriver:
 
         assert merged.returncode == 1, merged.stdout + merged.stderr
         assert '<<<<<<<' in repo.baseline()
-        assert probe.returncode == 1 and metrics.BASELINE_RELPATH in probe.stdout
+        assert probe.returncode == 1 and ratchet.BASELINE_RELPATH in probe.stdout
 
     def test_a_pair_the_driver_refuses_stops_the_merge(self, tmp_path: Path) -> None:
         repo = _Repo(tmp_path)
@@ -483,7 +483,7 @@ class TestTheWiringIsStructurallyPinned:
     def test_gitattributes_routes_the_baseline_to_the_installed_driver(self) -> None:
         lines = (_REPO_ROOT / '.gitattributes').read_text(encoding='utf-8').splitlines()
 
-        assert f'{metrics.BASELINE_RELPATH} merge={driver.DRIVER_NAME}' in lines
+        assert f'{ratchet.BASELINE_RELPATH} merge={driver.DRIVER_NAME}' in lines
 
     def test_the_driver_command_runs_this_file_from_the_checkout_root(self) -> None:
         assert (_REPO_ROOT / driver.DRIVER_RELPATH).resolve() == Path(driver.__file__).resolve()

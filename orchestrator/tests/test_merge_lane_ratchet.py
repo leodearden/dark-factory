@@ -1,16 +1,18 @@
 """The merge-lane quality ratchet, and the unit tests of the instrument behind it.
 
 PRD ``plans/merge-lane-quality-prd.md`` task alpha. The instrument itself lives
-in ``scripts/merge_lane_metrics.py``; this module hosts both its detector unit
-tests and the real tree-scanning gate, in the same single-file shape as the
-guard it supersedes (``test_merge_queue_reachback_patch_guard.py`` carries its
+in ``scripts/merge_lane_cluster.py`` (measurement), ``scripts/merge_lane_ratchet.py``
+(verdict) and ``scripts/merge_lane_metrics.py`` (command line); this module hosts
+both its detector unit tests and the real tree-scanning gate, in the same
+single-file shape as the guard it supersedes
+(``test_merge_queue_reachback_patch_guard.py`` carries its
 ``_find_merge_queue_private_patches`` fixtures and its tree sweep in one file).
 
 Ratchet contract
 ----------------
 ``orchestrator/tests/merge_lane_ratchet_baseline.json`` freezes every measure at
 its value on the commit that introduced it, except the two size measures
-(``metrics.REPORTED_ONLY_MEASURES``), which are reported but never ratcheted.
+(``ratchet.REPORTED_ONLY_MEASURES``), which are reported but never ratcheted.
 The gate FAILS on any other measure that rises above its baseline (ratchet
 semantics). Equality is permitted -- this is a
 ratchet, not a day-one gate, and on the introducing commit 62 lane functions
@@ -31,7 +33,7 @@ Deleting the baseline first would -- there is then nothing to compare against --
 but a staged deletion is refused outright by ``scripts/check_staged_ratchet_raise.py``
 in pre-commit on every branch, and the wholesale reset it would otherwise be is
 read in the diff by a reviewer besides.
-``metrics.RAISE_REMEDY`` is the one copy of that rule, and every failure message
+``ratchet.RAISE_REMEDY`` is the one copy of that rule, and every failure message
 here composes it.
 
 Why the instrument fails HARD where its neighbours fail soft
@@ -62,6 +64,7 @@ from _merge_lane_ratchet_fixtures import (
     blank_file_entry,
     lane_cluster,
     metrics,
+    ratchet,
     source_measures,
     synthetic_report,
 )
@@ -830,7 +833,7 @@ class TestTestFileMeasures:
         # this floors the very number the ratchet compares rather than a
         # second summation of the same per-file entries.
         lane_files = len(live_report['tests'])
-        total_private = metrics.derive_totals(live_report)['private_reads']
+        total_private = ratchet.derive_totals(live_report)['private_reads']
         assert lane_files >= 150, lane_files
         assert total_private > 5000, total_private
 
@@ -841,7 +844,7 @@ class TestTestFileMeasures:
 
 class TestDeriveTotals:
     def test_sums_every_file_measure(self) -> None:
-        totals = metrics.derive_totals(synthetic_report())
+        totals = ratchet.derive_totals(synthetic_report())
         assert totals['lines'] == 1200
         assert totals['prose_lines'] == 450
         assert totals['cognitive'] == 150
@@ -849,12 +852,12 @@ class TestDeriveTotals:
         assert totals['reexport_names'] == 5
 
     def test_private_reads_are_summed_over_tests(self) -> None:
-        assert metrics.derive_totals(synthetic_report())['private_reads'] == 25
+        assert ratchet.derive_totals(synthetic_report())['private_reads'] == 25
 
     def test_patch_targets_total_is_the_union_size_not_the_sum(self) -> None:
         # The PRD's measure is DISTINCT names: foo/bar/baz across two files that
         # both patch `bar` is 3, not 4.
-        assert metrics.derive_totals(synthetic_report())['patch_targets'] == 3
+        assert ratchet.derive_totals(synthetic_report())['patch_targets'] == 3
 
     def test_moving_code_to_a_new_path_leaves_every_total_identical(self) -> None:
         # THE ANTI-RENAME-GAMING PROPERTY. Totals are DERIVED by summing the
@@ -872,12 +875,12 @@ class TestDeriveTotals:
             'function_local_imports': 0,
             'reexport_names': 0,
         }
-        assert metrics.derive_totals(after) == metrics.derive_totals(before)
+        assert ratchet.derive_totals(after) == ratchet.derive_totals(before)
 
     def test_is_a_pure_function_of_the_report(self) -> None:
         report = synthetic_report()
         snapshot = json.dumps(report, sort_keys=True)
-        metrics.derive_totals(report)
+        ratchet.derive_totals(report)
         assert json.dumps(report, sort_keys=True) == snapshot
 
 
@@ -957,7 +960,7 @@ class TestBuildReport:
 
     def test_cluster_cognitive_total_anchor(self, report: dict) -> None:
         # Anti-vacuity: measured 4,607 on this tree.
-        assert metrics.derive_totals(report)['cognitive'] >= 4000
+        assert ratchet.derive_totals(report)['cognitive'] >= 4000
 
     def test_each_cluster_file_is_measured_by_complexipy_once(
         self, live_measurement: LiveMeasurement
@@ -1124,7 +1127,7 @@ class TestTestTreeSweep:
         assert block['complete'] is False
         assert block['unreadable'] == ['orchestrator/tests/test_broken.py']
         with pytest.raises(lane_cluster.RatchetError) as excinfo:
-            metrics._require_complete_enumeration({'enumeration': block})
+            ratchet._require_complete_enumeration({'enumeration': block})
         assert 'orchestrator/tests/test_broken.py' in str(excinfo.value)
 
     def test_a_clean_sweep_composes_a_complete_block(
@@ -1216,7 +1219,7 @@ class TestStoredEnumerationIsChurnFree:
 
     @staticmethod
     def _stored(report: dict) -> dict:
-        return json.loads(metrics.render_baseline(report))['enumeration']
+        return json.loads(ratchet.render_baseline(report))['enumeration']
 
     def test_the_stored_key_set_omits_the_test_tree_counts(self) -> None:
         # No test-tree NUMBER reaches the file, only the cluster half plus
@@ -1267,7 +1270,7 @@ class TestStoredEnumerationIsChurnFree:
         # render_baseline's round-trip contract: regenerating a baseline FROM a
         # baseline must be a no-op, not a second round of deletions.
         once = self._stored(synthetic_report())
-        assert metrics._stored_enumeration(once) == once
+        assert ratchet._stored_enumeration(once) == once
 
     def test_the_rendered_baseline_is_stable_across_an_unrelated_new_test(
         self,
@@ -1279,11 +1282,11 @@ class TestStoredEnumerationIsChurnFree:
         # orchestrator/tests, and `resolved` moves whenever a lane-importing one
         # is added or deleted, which is a shared line every gamma branch rewrites.
         report = synthetic_report()
-        before = metrics.render_baseline(report)
+        before = ratchet.render_baseline(report)
         report['enumeration']['test_tree']['requested'] += 1
-        assert metrics.render_baseline(report) == before
+        assert ratchet.render_baseline(report) == before
         report['enumeration']['test_tree']['resolved'] += 1
-        assert metrics.render_baseline(report) == before
+        assert ratchet.render_baseline(report) == before
 
 
 class TestRenderBaseline:
@@ -1291,8 +1294,8 @@ class TestRenderBaseline:
         # A hand-rolled writer's failure mode is a silently omitted measure, so
         # the round-trip is asserted structurally rather than eyeballed.
         report = synthetic_report()
-        loaded = json.loads(metrics.render_baseline(report))
-        assert loaded.pop('_README') == metrics.BASELINE_README
+        loaded = json.loads(ratchet.render_baseline(report))
+        assert loaded.pop('_README') == ratchet.BASELINE_README
         # The ONE measure deliberately not stored, popped here the same way
         # _README is: the test-tree denominator is reported by --report, never
         # ratcheted, so freezing it would churn the file on every unrelated test
@@ -1307,7 +1310,7 @@ class TestRenderBaseline:
         # indent=2) would spread merge_queue.py's five measures over six lines
         # and put two branches' unrelated edits inside one conflicting hunk.
         report = synthetic_report()
-        rendered = metrics.render_baseline(report)
+        rendered = ratchet.render_baseline(report)
         lines = rendered.splitlines()
         for section in ('files', 'functions', 'tests'):
             for key, value in report[section].items():
@@ -1321,7 +1324,7 @@ class TestRenderBaseline:
 
     def test_per_path_keys_are_emitted_in_sorted_order(self) -> None:
         report = synthetic_report()
-        rendered = metrics.render_baseline(report)
+        rendered = ratchet.render_baseline(report)
         for section in ('files', 'functions', 'tests'):
             positions = [
                 rendered.index(json.dumps(key) + ':') for key in sorted(report[section])
@@ -1329,15 +1332,15 @@ class TestRenderBaseline:
             assert positions == sorted(positions), section
 
     def test_ends_with_exactly_one_trailing_newline(self) -> None:
-        rendered = metrics.render_baseline(synthetic_report())
+        rendered = ratchet.render_baseline(synthetic_report())
         assert rendered.endswith('\n')
         assert not rendered.endswith('\n\n')
 
     def test_rendering_is_idempotent(self) -> None:
         # Regenerating a baseline from a baseline must be a no-op, or every
         # regeneration would churn the file and manufacture conflicts.
-        once = metrics.render_baseline(synthetic_report())
-        twice = metrics.render_baseline(json.loads(once))
+        once = ratchet.render_baseline(synthetic_report())
+        twice = ratchet.render_baseline(json.loads(once))
         assert twice == once
 
     def test_leads_with_a_readme_key(self) -> None:
@@ -1349,27 +1352,27 @@ class TestRenderBaseline:
         # TestRenderBaseline::test_round_trips_without_dropping_a_measure
         # already proves BASELINE_README is exactly what gets emitted. If the
         # README's guidance matters, fix the constant; do not lock its phrasing.
-        rendered = metrics.render_baseline(synthetic_report())
+        rendered = ratchet.render_baseline(synthetic_report())
         first_key_line = rendered.splitlines()[1]
         assert first_key_line.lstrip().startswith('"_README":')
         # Non-vacuity only, in this module's floor idiom: the key must not be
         # emitted empty. No wording is constrained.
-        assert len(metrics.BASELINE_README) >= 100
+        assert len(ratchet.BASELINE_README) >= 100
 
 
 class TestBaselineIO:
     def test_write_then_load_round_trips(self, tmp_path: Path) -> None:
         report = synthetic_report()
         target = tmp_path / 'baseline.json'
-        metrics.write_baseline(target, report)
-        assert target.read_text(encoding='utf-8') == metrics.render_baseline(report)
-        loaded = metrics.load_baseline(target)
+        ratchet.write_baseline(target, report)
+        assert target.read_text(encoding='utf-8') == ratchet.render_baseline(report)
+        loaded = ratchet.load_baseline(target)
         assert loaded['files'] == report['files']
         assert loaded['functions'] == report['functions']
 
     def test_write_is_atomic_leaving_no_debris(self, tmp_path: Path) -> None:
         target = tmp_path / 'baseline.json'
-        metrics.write_baseline(target, synthetic_report())
+        ratchet.write_baseline(target, synthetic_report())
         assert [p.name for p in tmp_path.iterdir()] == ['baseline.json']
 
     def test_missing_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
@@ -1377,21 +1380,21 @@ class TestBaselineIO:
         # would silently disarm the ratchet for every downstream task.
         missing = tmp_path / 'nope.json'
         with pytest.raises(lane_cluster.RatchetError) as excinfo:
-            metrics.load_baseline(missing)
+            ratchet.load_baseline(missing)
         assert 'nope.json' in str(excinfo.value)
 
     def test_malformed_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         target = tmp_path / 'baseline.json'
         target.write_text('{"files": ', encoding='utf-8')
         with pytest.raises(lane_cluster.RatchetError) as excinfo:
-            metrics.load_baseline(target)
+            ratchet.load_baseline(target)
         assert 'baseline.json' in str(excinfo.value)
 
     def test_non_object_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         target = tmp_path / 'baseline.json'
         target.write_text('[]', encoding='utf-8')
         with pytest.raises(lane_cluster.RatchetError) as excinfo:
-            metrics.load_baseline(target)
+            ratchet.load_baseline(target)
         assert 'baseline.json' in str(excinfo.value)
 
 
@@ -1423,7 +1426,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     71-second measurement.
     """
 
-    _AUTHORIZATION = metrics.RaiseAuthorization(
+    _AUTHORIZATION = ratchet.RaiseAuthorization(
         task_id='5406', reason='net-additive: a new guard, not a failed refactor'
     )
 
@@ -1431,7 +1434,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     def _seeded(tmp_path: Path) -> Path:
         """A destination already holding the seed baseline, byte-for-byte."""
         target = tmp_path / 'b.json'
-        metrics.write_baseline(target, _ratchet_baseline())
+        ratchet.write_baseline(target, _ratchet_baseline())
         return target
 
     def test_a_per_file_rise_is_refused_naming_the_measure_and_both_numbers(
@@ -1441,8 +1444,8 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         current = copy.deepcopy(_ratchet_baseline())
         current['files'][_MQ]['cognitive'] += 15
 
-        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
-            metrics.write_baseline(target, current)
+        with pytest.raises(ratchet.UnauthorizedRaise) as excinfo:
+            ratchet.write_baseline(target, current)
 
         message = str(excinfo.value)
         assert 'cognitive' in message
@@ -1458,13 +1461,13 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         current = copy.deepcopy(_ratchet_baseline())
         current['files'][_MQ]['cognitive'] += 15
 
-        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
-            metrics.write_baseline(target, current)
+        with pytest.raises(ratchet.UnauthorizedRaise) as excinfo:
+            ratchet.write_baseline(target, current)
 
         violations = excinfo.value.violations
         assert isinstance(violations, tuple)
         assert violations
-        assert all(isinstance(v, metrics.Violation) for v in violations)
+        assert all(isinstance(v, ratchet.Violation) for v in violations)
         # Every one is a genuine rise: the refusal reports what it measured, so
         # the ledger record derived from it cannot disagree with what landed.
         assert all(v.current > v.baseline for v in violations)
@@ -1477,8 +1480,8 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         current = copy.deepcopy(_ratchet_baseline())
         current['files'][_MQ]['cognitive'] += 15
 
-        with pytest.raises(metrics.UnauthorizedRaise):
-            metrics.write_baseline(target, current)
+        with pytest.raises(ratchet.UnauthorizedRaise):
+            ratchet.write_baseline(target, current)
 
         # A truncated or half-written baseline would be a WIDENED ratchet, the
         # one failure mode this instrument must never produce.
@@ -1520,8 +1523,8 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         current = copy.deepcopy(_ratchet_baseline())
         mutate(current)
 
-        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
-            metrics.write_baseline(target, current)
+        with pytest.raises(ratchet.UnauthorizedRaise) as excinfo:
+            ratchet.write_baseline(target, current)
 
         assert measure in {v.measure for v in excinfo.value.violations}
 
@@ -1531,7 +1534,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # ANTI-VACUITY: a gate that refused everything would pass every test
         # above while making the sanctioned workflow impossible.
         target = self._seeded(tmp_path)
-        written = metrics.write_baseline(target, _ratchet_baseline())
+        written = ratchet.write_baseline(target, _ratchet_baseline())
         assert written.path == target
         assert written.record is None
 
@@ -1541,10 +1544,10 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         current = copy.deepcopy(_ratchet_baseline())
         current['files'][_MQ]['cognitive'] -= 400
 
-        written = metrics.write_baseline(target, current)
+        written = ratchet.write_baseline(target, current)
         assert written.path == target
         assert written.record is None
-        assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
+        assert target.read_text(encoding='utf-8') == ratchet.render_baseline(current)
 
     def test_a_size_only_rise_is_written_without_authorization(
         self, tmp_path: Path
@@ -1555,10 +1558,10 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         _grow_mq_size(current)
         current['files'][self._NEW_PATH] = blank_file_entry(lines=1400, prose_lines=600)
 
-        written = metrics.write_baseline(target, current, ledger=ledger)
+        written = ratchet.write_baseline(target, current, ledger=ledger)
 
         assert written.record is None
-        assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
+        assert target.read_text(encoding='utf-8') == ratchet.render_baseline(current)
         assert not ledger.exists()
 
     def test_a_recorded_raise_authorizes_no_later_one(self, tmp_path: Path) -> None:
@@ -1572,19 +1575,19 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         ledger = tmp_path / 'raises'
         first = copy.deepcopy(_ratchet_baseline())
         first['files'][_MQ]['cognitive'] += 15
-        metrics.write_baseline(
+        ratchet.write_baseline(
             target, first, authorization=self._AUTHORIZATION, ledger=ledger
         )
         recorded = _ledger_files(ledger)
-        assert metrics.load_ledger(ledger)
+        assert ratchet.load_ledger(ledger)
 
         further = copy.deepcopy(first)
         further['files'][_MQ]['cognitive'] += 5
-        with pytest.raises(metrics.UnauthorizedRaise):
-            metrics.write_baseline(target, further, ledger=ledger)
+        with pytest.raises(ratchet.UnauthorizedRaise):
+            ratchet.write_baseline(target, further, ledger=ledger)
 
         assert _ledger_files(ledger) == recorded
-        assert target.read_text(encoding='utf-8') == metrics.render_baseline(first)
+        assert target.read_text(encoding='utf-8') == ratchet.render_baseline(first)
 
     def test_a_plain_regeneration_never_reads_the_ledger(
         self, tmp_path: Path
@@ -1598,20 +1601,20 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         lowered = copy.deepcopy(_ratchet_baseline())
         lowered['files'][_MQ]['cognitive'] -= 400
 
-        assert metrics.write_baseline(target, lowered, ledger=ledger).record is None
+        assert ratchet.write_baseline(target, lowered, ledger=ledger).record is None
         assert _ledger_files(ledger) == {'corrupt.json': '{ not json at all'}
 
     def test_unauthorized_raise_is_not_a_metrics_error(self) -> None:
         # The exit ladder: 1 is "a measure rose", 2 is "the instrument broke".
         # main() maps every MetricsError to 2, so a refusal that subclassed it
         # would report a real regression as a broken tool.
-        assert not issubclass(metrics.UnauthorizedRaise, source_measures.MetricsError)
+        assert not issubclass(ratchet.UnauthorizedRaise, source_measures.MetricsError)
 
     def test_a_ratchet_fault_is_an_instrument_failure(self) -> None:
         # The ratchet names its own faults, but they are still exit 2: every
         # boundary catches the measure layer's MetricsError for both layers.
         assert issubclass(lane_cluster.RatchetError, source_measures.MetricsError)
-        assert issubclass(metrics.AppendOnlyViolation, lane_cluster.RatchetError)
+        assert issubclass(ratchet.AppendOnlyViolation, lane_cluster.RatchetError)
 
     # CEILINGS ARE A HOLE OF THE SAME SHAPE, and the reason is subtle: the two
     # ceilings apply only to keys ABSENT from the baseline. So a blind
@@ -1631,8 +1634,8 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
             lines=lane_cluster.FILE_LINE_CEILING + 1
         )
 
-        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
-            metrics.write_baseline(target, current)
+        with pytest.raises(ratchet.UnauthorizedRaise) as excinfo:
+            ratchet.write_baseline(target, current)
 
         breaches = [
             v for v in excinfo.value.violations
@@ -1649,8 +1652,8 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
             lane_cluster.NEW_FUNCTION_COGNITIVE_CEILING + 1
         )
 
-        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
-            metrics.write_baseline(target, current)
+        with pytest.raises(ratchet.UnauthorizedRaise) as excinfo:
+            ratchet.write_baseline(target, current)
 
         breaches = [
             v for v in excinfo.value.violations
@@ -1669,7 +1672,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
             lines=lane_cluster.FILE_LINE_CEILING
         )
 
-        assert metrics.write_baseline(target, current).record is None
+        assert ratchet.write_baseline(target, current).record is None
 
     def test_the_git_ops_size_exemption_holds_on_the_write_path(
         self, tmp_path: Path
@@ -1681,11 +1684,11 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         seed = _ratchet_baseline()
         current = copy.deepcopy(seed)
         del current['files'][_GIT_OPS]
-        metrics.write_baseline(target, current)  # dropping it only LOWERS
+        ratchet.write_baseline(target, current)  # dropping it only LOWERS
         restored = copy.deepcopy(seed)
 
-        with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
-            metrics.write_baseline(target, restored)
+        with pytest.raises(ratchet.UnauthorizedRaise) as excinfo:
+            ratchet.write_baseline(target, restored)
 
         assert not [
             v for v in excinfo.value.violations
@@ -1701,11 +1704,11 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
             lines=lane_cluster.FILE_LINE_CEILING + 1
         )
 
-        metrics.write_baseline(
+        ratchet.write_baseline(
             target, current, authorization=self._AUTHORIZATION, ledger=ledger
         )
 
-        measures = metrics.load_ledger(ledger)[0]['measures']
+        measures = ratchet.load_ledger(ledger)[0]['measures']
         breach = next(
             row for row in measures if row['measure'] == 'new_file_over_ceiling'
         )
@@ -1728,7 +1731,7 @@ class TestAuthorizedRaise:
     @staticmethod
     def _seeded(tmp_path: Path) -> tuple[Path, Path]:
         target = tmp_path / 'b.json'
-        metrics.write_baseline(target, _ratchet_baseline())
+        ratchet.write_baseline(target, _ratchet_baseline())
         return target, tmp_path / 'raises'
 
     @staticmethod
@@ -1741,8 +1744,8 @@ class TestAuthorizedRaise:
         return current
 
     @staticmethod
-    def _authorization() -> metrics.RaiseAuthorization:
-        return metrics.RaiseAuthorization(
+    def _authorization() -> ratchet.RaiseAuthorization:
+        return ratchet.RaiseAuthorization(
             task_id='5342',
             reason='rename-aware equivalence fix: net-additive bug fix, not a refactor',
         )
@@ -1751,11 +1754,11 @@ class TestAuthorizedRaise:
         target, ledger = self._seeded(tmp_path)
         current = self._raised()
 
-        written = metrics.write_baseline(
+        written = ratchet.write_baseline(
             target, current, authorization=self._authorization(), ledger=ledger
         )
         assert written.path == target
-        assert target.read_text(encoding='utf-8') == metrics.render_baseline(current)
+        assert target.read_text(encoding='utf-8') == ratchet.render_baseline(current)
 
     def test_exactly_one_ledger_entry_is_appended_verbatim(
         self, tmp_path: Path
@@ -1763,11 +1766,11 @@ class TestAuthorizedRaise:
         target, ledger = self._seeded(tmp_path)
         authorization = self._authorization()
 
-        written = metrics.write_baseline(
+        written = ratchet.write_baseline(
             target, self._raised(), authorization=authorization, ledger=ledger
         )
 
-        entries = metrics.load_ledger(ledger)
+        entries = ratchet.load_ledger(ledger)
         assert len(entries) == 1
         assert entries[0]['task_id'] == authorization.task_id
         assert entries[0]['reason'] == authorization.reason
@@ -1791,14 +1794,14 @@ class TestAuthorizedRaise:
                 'baseline': v.baseline,
                 'current': v.current,
             }
-            for v in metrics._measure_raises(current, _ratchet_baseline())
+            for v in ratchet._measure_raises(current, _ratchet_baseline())
         ]
 
-        metrics.write_baseline(
+        ratchet.write_baseline(
             target, current, authorization=self._authorization(), ledger=ledger
         )
 
-        assert metrics.load_ledger(ledger)[0]['measures'] == expected
+        assert ratchet.load_ledger(ledger)[0]['measures'] == expected
 
     def test_the_derived_totals_travel_with_the_per_path_rises(
         self, tmp_path: Path
@@ -1807,16 +1810,16 @@ class TestAuthorizedRaise:
         # a real multi-measure raise carries derived total:* rows, and they are
         # how a reviewer sees that moving mass around did not lower anything.
         target, ledger = self._seeded(tmp_path)
-        metrics.write_baseline(
+        ratchet.write_baseline(
             target, self._raised(), authorization=self._authorization(), ledger=ledger
         )
 
-        measures = metrics.load_ledger(ledger)[0]['measures']
+        measures = ratchet.load_ledger(ledger)[0]['measures']
         totals = [row for row in measures if row['measure'].startswith('total:')]
         assert {row['measure'] for row in totals} == {
             'total:cognitive', 'total:function_local_imports'
         }
-        assert all(row['key'] == metrics.CLUSTER_TOTAL_KEY for row in totals)
+        assert all(row['key'] == ratchet.CLUSTER_TOTAL_KEY for row in totals)
         assert {row['key'] for row in measures} >= {_MQ, _VERIFIER_LOOP}
 
     def test_a_size_rise_riding_with_an_authorized_raise_is_not_recorded(
@@ -1826,11 +1829,11 @@ class TestAuthorizedRaise:
         current = self._raised()
         _grow_mq_size(current)
 
-        metrics.write_baseline(
+        ratchet.write_baseline(
             target, current, authorization=self._authorization(), ledger=ledger
         )
 
-        recorded = {row['measure'] for row in metrics.load_ledger(ledger)[0]['measures']}
+        recorded = {row['measure'] for row in ratchet.load_ledger(ledger)[0]['measures']}
         assert not recorded & {'lines', 'prose_lines', 'total:lines', 'total:prose_lines'}
         assert {'cognitive', 'function_local_imports'} <= recorded
 
@@ -1852,7 +1855,7 @@ class TestAuthorizedRaise:
         # blank --reason over a lowering run would pass unremarked, and the
         # ledger's whole purpose is to answer WHO and WHY (heuristic 10).
         with pytest.raises(lane_cluster.RatchetError) as excinfo:
-            metrics.RaiseAuthorization(task_id=task_id, reason=reason)
+            ratchet.RaiseAuthorization(task_id=task_id, reason=reason)
 
         assert field in str(excinfo.value)
 
@@ -1863,10 +1866,10 @@ class TestAuthorizedRaise:
         before = target.read_text(encoding='utf-8')
 
         with pytest.raises(lane_cluster.RatchetError):
-            metrics.write_baseline(
+            ratchet.write_baseline(
                 target,
                 self._raised(),
-                authorization=metrics.RaiseAuthorization(task_id='5342', reason='  '),
+                authorization=ratchet.RaiseAuthorization(task_id='5342', reason='  '),
                 ledger=ledger,
             )
 
@@ -1886,14 +1889,14 @@ class TestAuthorizedRaise:
         lowered = copy.deepcopy(_ratchet_baseline())
         lowered['files'][_MQ]['cognitive'] -= 400
 
-        written = metrics.write_baseline(
+        written = ratchet.write_baseline(
             target, lowered, authorization=self._authorization(), ledger=ledger
         )
         assert written.path == target
         # The write SAYS it recorded nothing, so the CLI can tell the agent who
         # typed --authorize-raise rather than leaving silence to read as assent.
         assert written.record is None
-        assert target.read_text(encoding='utf-8') == metrics.render_baseline(lowered)
+        assert target.read_text(encoding='utf-8') == ratchet.render_baseline(lowered)
         assert not ledger.exists()
 
     def test_raise_authorization_is_frozen(self) -> None:
@@ -1912,9 +1915,9 @@ class TestAuthorizedRaiseLedger:
 
     @staticmethod
     def _record(task_id: str, rise: int = 103) -> dict:
-        return metrics.authorization_record(
-            metrics.RaiseAuthorization(task_id=task_id, reason=f'reason {task_id}'),
-            [metrics.Violation.rose('lines', _MQ, 21550, 21550 + rise)],
+        return ratchet.authorization_record(
+            ratchet.RaiseAuthorization(task_id=task_id, reason=f'reason {task_id}'),
+            [ratchet.Violation.rose('lines', _MQ, 21550, 21550 + rise)],
         )
 
     def test_absence_is_empty_here_and_fatal_for_the_baseline(
@@ -1927,10 +1930,10 @@ class TestAuthorizedRaiseLedger:
         # authorized, which is the fail-CLOSED state: it permits nothing.
         missing = tmp_path / 'nope.json'
 
-        assert metrics.load_ledger(missing) == []
+        assert ratchet.load_ledger(missing) == []
 
         with pytest.raises(lane_cluster.RatchetError) as excinfo:
-            metrics.load_baseline(missing)
+            ratchet.load_baseline(missing)
         assert 'nope.json' in str(excinfo.value)
 
     @pytest.mark.parametrize(
@@ -1954,7 +1957,7 @@ class TestAuthorizedRaiseLedger:
         ledger.mkdir()
         (ledger / name).write_text(content, encoding='utf-8')
         with pytest.raises(lane_cluster.RatchetError) as excinfo:
-            metrics.load_ledger(ledger)
+            ratchet.load_ledger(ledger)
         assert name in str(excinfo.value), why
 
     def test_a_ledger_path_that_is_a_file_is_a_named_hard_failure(
@@ -1964,24 +1967,24 @@ class TestAuthorizedRaiseLedger:
         target = tmp_path / 'raises'
         target.write_text('{"raises": []}', encoding='utf-8')
         with pytest.raises(lane_cluster.RatchetError) as excinfo:
-            metrics.load_ledger(target)
+            ratchet.load_ledger(target)
         assert 'not a directory' in str(excinfo.value)
 
     def test_an_entry_round_trips_through_its_file(self) -> None:
         record = self._record('5342')
-        text = metrics.render_entry(record)
+        text = ratchet.render_entry(record)
 
-        assert metrics.parse_entry(metrics.entry_filename(record), text) == record
-        assert metrics.render_entry(json.loads(text)) == text
+        assert ratchet.parse_entry(ratchet.entry_filename(record), text) == record
+        assert ratchet.render_entry(json.loads(text)) == text
 
     def test_the_name_leads_with_the_task_and_ends_with_a_content_digest(self) -> None:
-        name = metrics.entry_filename(self._record('5342'))
+        name = ratchet.entry_filename(self._record('5342'))
 
         assert name.startswith('5342-') and name.endswith('.json')
-        assert name != metrics.entry_filename(self._record('5342', rise=104))
+        assert name != ratchet.entry_filename(self._record('5342', rise=104))
 
     def test_a_free_text_task_id_still_makes_a_plain_file_name(self) -> None:
-        name = metrics.entry_filename(self._record('3790 carry/../x'))
+        name = ratchet.entry_filename(self._record('3790 carry/../x'))
 
         assert '/' not in name and ' ' not in name
 
@@ -1990,29 +1993,29 @@ class TestAuthorizedRaiseLedger:
     ) -> None:
         # APPEND-ONLY by construction: recording one entry cannot touch another.
         ledger = tmp_path / 'raises'
-        first = metrics.append_authorization(ledger, self._record('5342'))
+        first = ratchet.append_authorization(ledger, self._record('5342'))
         before = first.read_text(encoding='utf-8')
         for task_id in ('5500', '5600'):
-            metrics.append_authorization(ledger, self._record(task_id))
+            ratchet.append_authorization(ledger, self._record(task_id))
 
         assert first.read_text(encoding='utf-8') == before
-        assert sorted(entry['task_id'] for entry in metrics.load_ledger(ledger)) == [
+        assert sorted(entry['task_id'] for entry in ratchet.load_ledger(ledger)) == [
             '5342', '5500', '5600'
         ]
 
     def test_recording_the_same_entry_twice_is_one_file(self, tmp_path: Path) -> None:
         ledger = tmp_path / 'raises'
-        metrics.append_authorization(ledger, self._record('5342'))
-        metrics.append_authorization(ledger, self._record('5342'))
+        ratchet.append_authorization(ledger, self._record('5342'))
+        ratchet.append_authorization(ledger, self._record('5342'))
 
-        assert len(metrics.load_ledger(ledger)) == 1
+        assert len(ratchet.load_ledger(ledger)) == 1
 
     def test_the_first_append_writes_a_legible_readme(self, tmp_path: Path) -> None:
         ledger = tmp_path / 'raises'
-        metrics.append_authorization(ledger, self._record('5342'))
+        ratchet.append_authorization(ledger, self._record('5342'))
 
-        readme = (ledger / metrics.LEDGER_README_NAME).read_text(encoding='utf-8')
-        assert readme == metrics.render_ledger_readme()
+        readme = (ledger / ratchet.LEDGER_README_NAME).read_text(encoding='utf-8')
+        assert readme == ratchet.render_ledger_readme()
         assert '--authorize-raise' in json.loads(readme)['_README']
 
     def test_the_committed_ledger_is_present_and_legible(self) -> None:
@@ -2021,20 +2024,20 @@ class TestAuthorizedRaiseLedger:
         # the empty ledger by design (the polarity pinned above), so every
         # other assertion here would pass just as happily with nothing
         # committed at all.
-        ledger = _REPO_ROOT / metrics.LEDGER_DIR_RELPATH
+        ledger = _REPO_ROOT / ratchet.LEDGER_DIR_RELPATH
         assert ledger.is_dir(), ledger
-        readme = (ledger / metrics.LEDGER_README_NAME).read_text(encoding='utf-8')
-        assert readme == metrics.render_ledger_readme()
+        readme = (ledger / ratchet.LEDGER_README_NAME).read_text(encoding='utf-8')
+        assert readme == ratchet.render_ledger_readme()
         # Every entry was written by the module's own writer and never edited:
         # its name is derived from its content, and its bytes are a no-op
         # round trip rather than a hand-edited shape.
-        entries = metrics.load_ledger(ledger)
+        entries = ratchet.load_ledger(ledger)
         assert entries
         for entry in entries:
-            path = ledger / metrics.entry_filename(entry)
-            assert path.read_text(encoding='utf-8') == metrics.render_entry(entry), path
+            path = ledger / ratchet.entry_filename(entry)
+            assert path.read_text(encoding='utf-8') == ratchet.render_entry(entry), path
         # The retired single array is gone: one home for one fact.
-        assert not (_REPO_ROOT / metrics.LEGACY_LEDGER_RELPATH).exists()
+        assert not (_REPO_ROOT / ratchet.LEGACY_LEDGER_RELPATH).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -2165,19 +2168,19 @@ _SEEDS = [
         'total.cognitive',
         _add_file('cognitive'),
         'total:cognitive',
-        metrics.CLUSTER_TOTAL_KEY,
+        ratchet.CLUSTER_TOTAL_KEY,
     ),
     (
         'total.function_local_imports',
         _add_file('function_local_imports'),
         'total:function_local_imports',
-        metrics.CLUSTER_TOTAL_KEY,
+        ratchet.CLUSTER_TOTAL_KEY,
     ),
     (
         'total.reexport_names',
         _add_file('reexport_names'),
         'total:reexport_names',
-        metrics.CLUSTER_TOTAL_KEY,
+        ratchet.CLUSTER_TOTAL_KEY,
     ),
     (
         'total.private_reads',
@@ -2186,7 +2189,7 @@ _SEEDS = [
             {'patch_targets': [], 'private_reads': 1},
         ),
         'total:private_reads',
-        metrics.CLUSTER_TOTAL_KEY,
+        ratchet.CLUSTER_TOTAL_KEY,
     ),
     (
         'total.patch_targets',
@@ -2195,7 +2198,7 @@ _SEEDS = [
             {'patch_targets': ['_brand_new_leaf'], 'private_reads': 0},
         ),
         'total:patch_targets',
-        metrics.CLUSTER_TOTAL_KEY,
+        ratchet.CLUSTER_TOTAL_KEY,
     ),
 ]
 
@@ -2223,7 +2226,7 @@ class TestCheckAgainstBaseline:
         current = copy.deepcopy(baseline)
         mutate(current)
 
-        violations = metrics.check_against_baseline(current, baseline)
+        violations = ratchet.check_against_baseline(current, baseline)
 
         matching = [v for v in violations if v.measure == measure and v.key == key]
         assert len(matching) == 1, f'{measure} at {key} not reported once: {violations}'
@@ -2243,7 +2246,7 @@ class TestCheckAgainstBaseline:
         current = copy.deepcopy(baseline)
         mutate(current)
 
-        assert metrics.check_against_baseline(current, baseline) == []
+        assert ratchet.check_against_baseline(current, baseline) == []
 
     def test_a_structural_rise_beside_a_size_rise_is_reported_alone(self) -> None:
         baseline = _ratchet_baseline()
@@ -2251,16 +2254,16 @@ class TestCheckAgainstBaseline:
         _grow_mq_size(current)
         current['files'][_MQ]['function_local_imports'] += 1
 
-        violations = metrics.check_against_baseline(current, baseline)
+        violations = ratchet.check_against_baseline(current, baseline)
 
         assert [(v.measure, v.key, v.baseline, v.current) for v in violations] == [
             ('function_local_imports', _MQ, 12, 13),
-            ('total:function_local_imports', metrics.CLUSTER_TOTAL_KEY, 17, 18),
+            ('total:function_local_imports', ratchet.CLUSTER_TOTAL_KEY, 17, 18),
         ]
 
     def test_an_identical_current_is_clean(self) -> None:
         baseline = _ratchet_baseline()
-        assert metrics.check_against_baseline(copy.deepcopy(baseline), baseline) == []
+        assert ratchet.check_against_baseline(copy.deepcopy(baseline), baseline) == []
 
     def test_equality_is_permitted_this_is_a_ratchet_not_a_gate(self) -> None:
         # 62 lane functions already exceed cognitive 15 on the introducing
@@ -2268,7 +2271,7 @@ class TestCheckAgainstBaseline:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         assert current['functions'][_VERIFIER_LOOP] == 245
-        assert metrics.check_against_baseline(current, baseline) == []
+        assert ratchet.check_against_baseline(current, baseline) == []
 
     def test_lowering_a_measure_is_clean(self) -> None:
         baseline = _ratchet_baseline()
@@ -2277,7 +2280,7 @@ class TestCheckAgainstBaseline:
         current['files'][_MQ]['cognitive'] -= 400
         current['functions'][_VERIFIER_LOOP] = 12
         current['tests'][_TEST_FILE]['private_reads'] = 0
-        assert metrics.check_against_baseline(current, baseline) == []
+        assert ratchet.check_against_baseline(current, baseline) == []
 
 
 class TestCeilingsApplyOnlyToNewKeys:
@@ -2288,7 +2291,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         current['files'][new_path] = blank_file_entry(lines=1501)
         ceilings = [
             v
-            for v in metrics.check_against_baseline(current, baseline)
+            for v in ratchet.check_against_baseline(current, baseline)
             if v.measure == 'new_file_over_ceiling'
         ]
         assert len(ceilings) == 1
@@ -2302,7 +2305,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         )
         assert not [
             v
-            for v in metrics.check_against_baseline(current, baseline)
+            for v in ratchet.check_against_baseline(current, baseline)
             if v.measure == 'new_file_over_ceiling'
         ]
 
@@ -2313,7 +2316,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         assert current['files'][_MQ]['lines'] == 21550
-        assert metrics.check_against_baseline(current, baseline) == []
+        assert ratchet.check_against_baseline(current, baseline) == []
 
     def test_size_ceiling_exemption_covers_git_ops_even_when_new(self) -> None:
         # PRD decision 9. Exercised with git_ops.py ABSENT from the baseline,
@@ -2326,7 +2329,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         current['files'][_GIT_OPS] = blank_file_entry(lines=14721)
         assert not [
             v
-            for v in metrics.check_against_baseline(current, baseline)
+            for v in ratchet.check_against_baseline(current, baseline)
             if v.measure == 'new_file_over_ceiling'
         ]
 
@@ -2341,7 +2344,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         )
         assert [
             v
-            for v in metrics.check_against_baseline(current, baseline)
+            for v in ratchet.check_against_baseline(current, baseline)
             if v.measure == 'new_file_over_ceiling'
         ]
 
@@ -2353,7 +2356,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         current['files'][_GIT_OPS]['cognitive'] += 1
         assert [
             v
-            for v in metrics.check_against_baseline(current, baseline)
+            for v in ratchet.check_against_baseline(current, baseline)
             if v.measure == 'cognitive' and v.key == _GIT_OPS
         ]
 
@@ -2363,7 +2366,7 @@ class TestCeilingsApplyOnlyToNewKeys:
         current['functions'][f'{_MQ}::brand_new'] = 16
         ceilings = [
             v
-            for v in metrics.check_against_baseline(current, baseline)
+            for v in ratchet.check_against_baseline(current, baseline)
             if v.measure == 'new_function_over_ceiling'
         ]
         assert len(ceilings) == 1
@@ -2373,13 +2376,13 @@ class TestCeilingsApplyOnlyToNewKeys:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         current['functions'][f'{_MQ}::brand_new'] = 15
-        assert metrics.check_against_baseline(current, baseline) == []
+        assert ratchet.check_against_baseline(current, baseline) == []
 
     def test_a_grandfathered_function_at_245_is_clean(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         current['functions'][_VERIFIER_LOOP] = 245
-        assert metrics.check_against_baseline(current, baseline) == []
+        assert ratchet.check_against_baseline(current, baseline) == []
 
 
 class TestComparatorPreconditions:
@@ -2392,7 +2395,7 @@ class TestComparatorPreconditions:
         current = copy.deepcopy(baseline)
         current['params']['complexipy_version'] = '7.0.1'
         with pytest.raises(lane_cluster.RatchetError) as excinfo:
-            metrics.check_against_baseline(current, baseline)
+            ratchet.check_against_baseline(current, baseline)
         assert '7.0.1' in str(excinfo.value)
         assert '6.2.0' in str(excinfo.value)
 
@@ -2403,7 +2406,7 @@ class TestComparatorPreconditions:
             p for p in lane_cluster.CLUSTER_PATHS if p != _GIT_OPS
         ] + ['orchestrator/src/orchestrator/ghost.py']
         with pytest.raises(lane_cluster.RatchetError) as excinfo:
-            metrics.check_against_baseline(current, baseline)
+            ratchet.check_against_baseline(current, baseline)
         message = str(excinfo.value)
         assert _GIT_OPS in message
         assert 'ghost.py' in message
@@ -2417,7 +2420,7 @@ class TestComparatorPreconditions:
         current['enumeration']['complete'] = False
         current['enumeration']['unreadable'] = ['orchestrator/tests/test_broken.py']
         with pytest.raises(lane_cluster.RatchetError) as excinfo:
-            metrics.check_against_baseline(current, baseline)
+            ratchet.check_against_baseline(current, baseline)
         assert 'test_broken.py' in str(excinfo.value)
 
     def test_preconditions_are_checked_before_any_comparison(self) -> None:
@@ -2429,7 +2432,7 @@ class TestComparatorPreconditions:
         current['enumeration']['complete'] = False
         current['files'][_MQ]['cognitive'] += 5000
         with pytest.raises(lane_cluster.RatchetError):
-            metrics.check_against_baseline(current, baseline)
+            ratchet.check_against_baseline(current, baseline)
 
 
 class TestViolationShape:
@@ -2438,7 +2441,7 @@ class TestViolationShape:
         current = copy.deepcopy(baseline)
         current['files'][_MQ]['function_local_imports'] += 1
         current['files'][_GIT_OPS]['cognitive'] += 1
-        violations = metrics.check_against_baseline(current, baseline)
+        violations = ratchet.check_against_baseline(current, baseline)
         per_path = [v for v in violations if v.key in (_MQ, _GIT_OPS)]
         assert len(per_path) == 2
         for violation in per_path:
@@ -2453,7 +2456,7 @@ class TestViolationShape:
         current = copy.deepcopy(baseline)
         current['files'][_MQ]['cognitive'] += 1
         before = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
-        metrics.check_against_baseline(current, baseline)
+        ratchet.check_against_baseline(current, baseline)
         after = (json.dumps(current, sort_keys=True), json.dumps(baseline, sort_keys=True))
         assert after == before
 
@@ -2510,7 +2513,7 @@ class TestReportCli:
         metrics.main(['--report'])
         out = capsys.readouterr().out
         assert 'TOTALS' in out
-        totals = metrics.derive_totals(stub_measurement)
+        totals = ratchet.derive_totals(stub_measurement)
         assert str(totals['cognitive']) in out
         assert str(totals['lines']) in out
 
@@ -2521,7 +2524,7 @@ class TestReportCli:
         # still sees how big each file is.
         assert metrics.main(['--report']) == 0
         rows = capsys.readouterr().out.splitlines()
-        totals = metrics.derive_totals(stub_measurement)
+        totals = ratchet.derive_totals(stub_measurement)
 
         header = next(row for row in rows if row.startswith('path ')).split()
         assert header[1:3] == ['lines', 'prose']
@@ -2536,7 +2539,7 @@ class TestReportCli:
     ) -> None:
         metrics.main(['--report'])
         out = capsys.readouterr().out
-        totals = metrics.derive_totals(stub_measurement)
+        totals = ratchet.derive_totals(stub_measurement)
         assert 'private_reads' in out
         assert 'patch_targets' in out
         assert str(totals['private_reads']) in out
@@ -2601,7 +2604,7 @@ class TestCheckCli:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         baseline = tmp_path / 'baseline.json'
-        metrics.write_baseline(baseline, stub_measurement)
+        ratchet.write_baseline(baseline, stub_measurement)
         assert metrics.main(['--check', '--baseline', str(baseline)]) == 0
         assert capsys.readouterr().err == ''
 
@@ -2612,7 +2615,7 @@ class TestCheckCli:
         doctored = copy.deepcopy(stub_measurement)
         doctored['files'][_MQ]['cognitive'] -= 10
         baseline = tmp_path / 'baseline.json'
-        metrics.write_baseline(baseline, doctored)
+        ratchet.write_baseline(baseline, doctored)
         assert metrics.main(['--check', '--baseline', str(baseline)]) == 1
         err = capsys.readouterr().err
         assert _MQ in err
@@ -2626,7 +2629,7 @@ class TestCheckCli:
         doctored['files'][_MQ]['lines'] -= 10
         doctored['files'][_MQ]['prose_lines'] -= 10
         baseline = tmp_path / 'baseline.json'
-        metrics.write_baseline(baseline, doctored)
+        ratchet.write_baseline(baseline, doctored)
 
         assert metrics.main(['--check', '--baseline', str(baseline)]) == 0
         assert capsys.readouterr().err == ''
@@ -2679,7 +2682,7 @@ class TestWriteBaselineCli:
     ) -> None:
         target = tmp_path / 'b.json'
         assert metrics.main(['--write-baseline', str(target)]) == 0
-        assert target.read_text(encoding='utf-8') == metrics.render_baseline(
+        assert target.read_text(encoding='utf-8') == ratchet.render_baseline(
             stub_measurement
         )
 
@@ -2695,7 +2698,7 @@ class TestWriteBaselineCli:
         assert metrics.main([
             '--write-baseline', str(target), '--ledger', str(ledger)
         ]) == 0
-        assert target.read_text(encoding='utf-8') == metrics.render_baseline(
+        assert target.read_text(encoding='utf-8') == ratchet.render_baseline(
             stub_measurement
         )
         assert _ledger_files(ledger) == {'corrupt.json': '{ not json at all'}
@@ -2712,7 +2715,7 @@ class TestAuthorizeRaiseCli:
     def _seeded(stub: dict, tmp_path: Path) -> tuple[Path, Path, dict]:
         """A destination holding the stubbed report, and a report that RAISES."""
         target = tmp_path / 'b.json'
-        metrics.write_baseline(target, stub)
+        ratchet.write_baseline(target, stub)
         raised = copy.deepcopy(stub)
         raised['files'][_MQ]['cognitive'] += 15
         return target, tmp_path / 'raises', raised
@@ -2731,8 +2734,8 @@ class TestAuthorizeRaiseCli:
             '--ledger', str(ledger),
         ]) == 0
 
-        assert target.read_text(encoding='utf-8') == metrics.render_baseline(raised)
-        entries = metrics.load_ledger(ledger)
+        assert target.read_text(encoding='utf-8') == ratchet.render_baseline(raised)
+        entries = ratchet.load_ledger(ledger)
         assert len(entries) == 1
         assert entries[0]['task_id'] == '5342'
         out = capsys.readouterr().out
@@ -2756,7 +2759,7 @@ class TestAuthorizeRaiseCli:
 
         err = capsys.readouterr().err
         assert _MQ in err
-        assert metrics.RAISE_REMEDY in err
+        assert ratchet.RAISE_REMEDY in err
         assert target.read_text(encoding='utf-8') == before
         assert not ledger.exists()
 
@@ -2852,7 +2855,7 @@ class TestAuthorizeRaiseCli:
         # and recorded (INV-11).
         target = tmp_path / 'b.json'
         ledger = tmp_path / 'raises'
-        metrics.write_baseline(target, stub_measurement)
+        ratchet.write_baseline(target, stub_measurement)
         lowered = copy.deepcopy(stub_measurement)
         lowered['files'][_MQ]['cognitive'] -= 10
         monkeypatch.setattr(lane_cluster, 'build_report', lambda root: copy.deepcopy(lowered))
@@ -2936,16 +2939,16 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         for fragment in (
             '--authorize-raise',
             '--reason',
-            metrics.LEDGER_DIR_RELPATH,
-            metrics.BASELINE_RELPATH,
+            ratchet.LEDGER_DIR_RELPATH,
+            ratchet.BASELINE_RELPATH,
             # The MECHANISM NAME an agent greps for after being blocked. Until
             # task 5722 this paragraph told them "what no gate can see is a
             # baseline deleted first" -- which a gate now does see, so the
             # sentence a blocked reader most needs was the one that was false.
-            metrics.COMMIT_GATE_RELPATH,
-            metrics.ADVANCE_GATE_RELPATH,
+            ratchet.COMMIT_GATE_RELPATH,
+            ratchet.ADVANCE_GATE_RELPATH,
         ):
-            assert fragment in metrics.RAISE_REMEDY, fragment
+            assert fragment in ratchet.RAISE_REMEDY, fragment
 
     def test_the_auditor_the_remedy_names_actually_resolves(self) -> None:
         # THE SUBSTRING PIN ABOVE CANNOT CATCH A RENAME. Every other fragment
@@ -2954,8 +2957,8 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         # _README, and the instrument has no git dependency with which to
         # notice it going stale. Renaming or moving the auditor would leave a
         # blocked agent grepping for nothing, with the pin still green.
-        assert (metrics.repo_root() / metrics.COMMIT_GATE_RELPATH).is_file()
-        assert (metrics.repo_root() / metrics.ADVANCE_GATE_RELPATH).is_file()
+        assert (ratchet.repo_root() / ratchet.COMMIT_GATE_RELPATH).is_file()
+        assert (ratchet.repo_root() / ratchet.ADVANCE_GATE_RELPATH).is_file()
 
     def test_the_committed_baseline_bytes_state_the_mechanism(self) -> None:
         # THE SITE THAT MATTERED. Not the docstring, not the CLI -- the file a
@@ -2967,17 +2970,17 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         # their own lines at a terminal) and JSON escapes those, so the verbatim
         # match is against the decoded _README while the flag and the ledger
         # path -- which a reader greps for -- are matched in the raw text.
-        committed = (_REPO_ROOT / metrics.BASELINE_RELPATH).read_text(
+        committed = (_REPO_ROOT / ratchet.BASELINE_RELPATH).read_text(
             encoding='utf-8'
         )
         assert '--authorize-raise' in committed
-        assert metrics.LEDGER_DIR_RELPATH in committed
-        assert json.loads(committed)['_README'].endswith(metrics.RAISE_REMEDY)
+        assert ratchet.LEDGER_DIR_RELPATH in committed
+        assert json.loads(committed)['_README'].endswith(ratchet.RAISE_REMEDY)
 
     def test_the_readme_composes_the_remedy_rather_than_paraphrasing_it(
         self,
     ) -> None:
-        assert metrics.BASELINE_README.endswith(metrics.RAISE_REMEDY)
+        assert ratchet.BASELINE_README.endswith(ratchet.RAISE_REMEDY)
 
     def test_the_check_trailer_is_the_same_constant(
         self, stub_measurement: dict, tmp_path: Path,
@@ -2986,10 +2989,10 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
         doctored = copy.deepcopy(stub_measurement)
         doctored['files'][_MQ]['cognitive'] -= 10
         baseline = tmp_path / 'baseline.json'
-        metrics.write_baseline(baseline, doctored)
+        ratchet.write_baseline(baseline, doctored)
 
         assert metrics.main(['--check', '--baseline', str(baseline)]) == 1
-        assert metrics.RAISE_REMEDY in capsys.readouterr().err
+        assert ratchet.RAISE_REMEDY in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -2998,23 +3001,23 @@ class TestTheBlockMessageNamesTheAuthorizedPath:
 # Everything above pins the instrument. This is the gate: the live tree, the
 # committed baseline, and the comparator the CLI's --check runs verbatim.
 
-_BASELINE_PATH = _REPO_ROOT / metrics.BASELINE_RELPATH
+_BASELINE_PATH = _REPO_ROOT / ratchet.BASELINE_RELPATH
 
 
 @pytest.fixture(scope='module')
 def committed_baseline() -> dict:
-    return metrics.load_baseline(_BASELINE_PATH)
+    return ratchet.load_baseline(_BASELINE_PATH)
 
 
 def test_merge_lane_ratchet_holds(
     live_report: dict, committed_baseline: dict
 ) -> None:
-    violations = metrics.check_against_baseline(live_report, committed_baseline)
+    violations = ratchet.check_against_baseline(live_report, committed_baseline)
     assert not violations, (
         'The merge-lane quality ratchet has been breached by '
         f'{len(violations)} measure(s):\n'
         + '\n'.join(f'  - {v.message}' for v in violations)
-        + f'\n\n{metrics.RAISE_REMEDY}'
+        + f'\n\n{ratchet.RAISE_REMEDY}'
     )
 
 
@@ -3035,11 +3038,11 @@ class TestBaselineIsNotVacuous:
         self, committed_baseline: dict
     ) -> None:
         # Measured 4,607 across 724 lane functions on the introducing commit.
-        assert metrics.derive_totals(committed_baseline)['cognitive'] >= 4000
+        assert ratchet.derive_totals(committed_baseline)['cognitive'] >= 4000
 
     def test_the_baseline_line_total_is_real(self, committed_baseline: dict) -> None:
         # Measured 54,048 lines across the 22-path cluster.
-        assert metrics.derive_totals(committed_baseline)['lines'] >= 50000
+        assert ratchet.derive_totals(committed_baseline)['lines'] >= 50000
 
     def test_the_baseline_represents_the_lane_importing_test_files(
         self, committed_baseline: dict
@@ -3109,11 +3112,11 @@ def test_baseline_matches_a_fresh_measurement(live_report: dict) -> None:
     would be headroom a later task could silently grow into while the ratchet
     stayed green.
     """
-    assert _BASELINE_PATH.read_text(encoding='utf-8') == metrics.render_baseline(
+    assert _BASELINE_PATH.read_text(encoding='utf-8') == ratchet.render_baseline(
         live_report
     ), (
         'The committed baseline is not what measuring this tree produces. '
         'Regenerate it in this commit -- which the instrument itself will '
         'refuse to do if that would absorb a raise you have not authorized:\n'
-        f'\n{metrics.RAISE_REMEDY}'
+        f'\n{ratchet.RAISE_REMEDY}'
     )

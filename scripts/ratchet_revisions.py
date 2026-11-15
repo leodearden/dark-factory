@@ -1,6 +1,6 @@
 """Read the merge-lane ratchet's committed artifacts out of git, at a revision or the index.
 
-``merge_lane_metrics`` deliberately has no git dependency: every comparison
+``merge_lane_ratchet`` deliberately has no git dependency: every comparison
 lives there, pure and testable on dicts. The two gates that enforce it need
 the artifacts as git holds them -- ``scripts/check_staged_ratchet_raise.py`` at
 a commit (HEAD, MERGE_HEAD, the index), ``scripts/check_ratchet_advance.py`` at a
@@ -14,14 +14,14 @@ import subprocess
 from pathlib import Path
 
 import merge_lane_cluster as lane_cluster
-import merge_lane_metrics as metrics
+import merge_lane_ratchet as ratchet
 
 #: The committed artifacts the gates are about, named once: the baseline, the
 #: ledger directory, and the retired ledger whose split and burial they audit.
 ARTIFACTS = (
-    metrics.BASELINE_RELPATH,
-    metrics.LEDGER_DIR_RELPATH,
-    metrics.LEGACY_LEDGER_RELPATH,
+    ratchet.BASELINE_RELPATH,
+    ratchet.LEDGER_DIR_RELPATH,
+    ratchet.LEGACY_LEDGER_RELPATH,
 )
 
 
@@ -119,7 +119,7 @@ def restores_previous_image(root: Path, candidate_oid: str, history_tip: str) ->
     object exists, which is what scopes identity to this path -- a blob that
     happens to sit elsewhere in the tree must not license a baseline.
     """
-    baseline = metrics.BASELINE_RELPATH
+    baseline = ratchet.BASELINE_RELPATH
     commits = git(
         root, 'rev-list', '--full-history', history_tip, '--', baseline
     ).split()
@@ -155,7 +155,7 @@ def entry_listing(root: Path, revision: str | None) -> dict[str, str]:
     HEAD -- holds no entries. An index entry still unmerged is a fault, not an
     answer: the gate never guesses which stage a resolution meant.
     """
-    ledger = metrics.LEDGER_DIR_RELPATH
+    ledger = ratchet.LEDGER_DIR_RELPATH
     if revision is None:
         listing = git(root, 'ls-files', '--stage', '-z', '--', ledger)
     elif object_id(root, revision) is None:
@@ -169,7 +169,7 @@ def entry_listing(root: Path, revision: str | None) -> dict[str, str]:
         if revision is None and fields[2] != '0':
             raise lane_cluster.RatchetError(f'{path} is unmerged in the index')
         name = path.removeprefix(f'{ledger}/')
-        if name != metrics.LEDGER_README_NAME:
+        if name != ratchet.LEDGER_README_NAME:
             entries[name] = fields[1] if revision is None else fields[2]
     return entries
 
@@ -185,11 +185,11 @@ def own_entries(root: Path, parents: list[str], tip: str | None = None) -> list[
     gate puts on its policy rung.
     """
     tip_listing = entry_listing(root, tip)
-    own_names = metrics.own_entry_names(
+    own_names = ratchet.own_entry_names(
         [entry_listing(root, parent) for parent in parents], tip_listing
     )
-    own = [metrics.parse_entry(name, blob_text(root, tip_listing[name])) for name in own_names]
-    return metrics.retire_legacy_ledger(retired_entries(root, parents, tip), tip_listing, own)
+    own = [ratchet.parse_entry(name, blob_text(root, tip_listing[name])) for name in own_names]
+    return ratchet.retire_legacy_ledger(retired_entries(root, parents, tip), tip_listing, own)
 
 
 def retired_entries(root: Path, parents: list[str], tip: str | None = None) -> list[dict]:
@@ -199,13 +199,13 @@ def retired_entries(root: Path, parents: list[str], tip: str | None = None) -> l
     branch's copy of the array -- buries an entry where nothing reads it, so
     that is refused outright rather than retired.
     """
-    legacy = metrics.LEGACY_LEDGER_RELPATH
+    legacy = ratchet.LEGACY_LEDGER_RELPATH
     held = {parent: object_id(root, f'{parent}:{legacy}') for parent in parents}
     if object_id(root, f'{tip or ""}:{legacy}') is not None:
         if None in held.values():
-            raise metrics.AppendOnlyViolation(
+            raise ratchet.AppendOnlyViolation(
                 f'{legacy} was retired: a raise is recorded as one file under '
-                f'{metrics.LEDGER_DIR_RELPATH}/. Delete it from the change (the '
+                f'{ratchet.LEDGER_DIR_RELPATH}/. Delete it from the change (the '
                 'commit, or the branch being landed) and split any entry only it '
                 'carries with '
                 'scripts/split_merge_lane_ratchet_ledger.py.'
@@ -215,5 +215,5 @@ def retired_entries(root: Path, parents: list[str], tip: str | None = None) -> l
         entry
         for oid in held.values()
         if oid is not None
-        for entry in metrics.legacy_ledger_entries(blob_text(root, oid))
+        for entry in ratchet.legacy_ledger_entries(blob_text(root, oid))
     ]

@@ -28,7 +28,7 @@ from pathlib import Path
 
 try:
     import merge_lane_cluster as lane_cluster
-    import merge_lane_metrics as metrics
+    import merge_lane_ratchet as ratchet
     import ratchet_revisions as revisions
     import source_measures
 except ImportError as exc:
@@ -87,26 +87,26 @@ def _changed_artifacts(root: Path, base: str | None, new: str) -> list[str]:
 
 
 def _baseline_oid(root: Path, revision: str) -> str | None:
-    return revisions.object_id(root, f'{revision}:{metrics.BASELINE_RELPATH}')
+    return revisions.object_id(root, f'{revision}:{ratchet.BASELINE_RELPATH}')
 
 
-def _raises(root: Path, base_oid: str, new_oid: str) -> list[metrics.Violation]:
+def _raises(root: Path, base_oid: str, new_oid: str) -> list[ratchet.Violation]:
     """Every raise NEW's baseline image makes over BASE's, read as two blobs."""
     with tempfile.TemporaryDirectory() as scratch_dir:
         scratch = Path(scratch_dir)
-        return metrics.compare_baseline_files(
+        return ratchet.compare_baseline_files(
             revisions.write_blob(root, base_oid, scratch / 'base.json'),
             revisions.write_blob(root, new_oid, scratch / 'new.json'),
         )
 
 
-def _refuse_unrecorded(move: _Move, unrecorded: list[metrics.Violation]) -> int:
-    baseline = metrics.BASELINE_RELPATH
+def _refuse_unrecorded(move: _Move, unrecorded: list[ratchet.Violation]) -> int:
+    baseline = ratchet.BASELINE_RELPATH
     _say(
         f"main's move {move.old[:10]}..{move.new[:10]} RAISES {len(unrecorded)} measure(s) of "
         f'{baseline} that the entry files it adds do not record:',
         *(f'  {violation.message}' for violation in unrecorded),
-        metrics.RAISE_REMEDY,
+        ratchet.RAISE_REMEDY,
         'This raise reached main without passing the commit gate (a rebase, a '
         'clean merge or a hook-less commit). Record it on the branch against '
         f"main's baseline: `git checkout {move.base} -- {baseline}`, then "
@@ -119,7 +119,7 @@ def _refuse_unrecorded(move: _Move, unrecorded: list[metrics.Violation]) -> int:
 
 
 def _restores_mains_previous_image(
-    root: Path, base: str, new_oid: str, raises: list[metrics.Violation]
+    root: Path, base: str, new_oid: str, raises: list[ratchet.Violation]
 ) -> bool:
     """True, and said out loud, when NEW's baseline undoes main's LAST baseline change.
 
@@ -130,7 +130,7 @@ def _restores_mains_previous_image(
     if restored is None:
         return False
     _say(
-        f'{metrics.BASELINE_RELPATH} restores the value this path held before '
+        f'{ratchet.BASELINE_RELPATH} restores the value this path held before '
         f'commit {restored}, reabsorbing {len(raises)} measure(s). Allowed -- this '
         'is the state main was running with one baseline change ago:',
         *(f'  {violation.message}' for violation in raises),
@@ -145,14 +145,14 @@ def _audit_baseline(root: Path, move: _Move, own: list[dict]) -> int:
         return 0
     if move.base is None or base_oid is None:
         _say(
-            f'{metrics.BASELINE_RELPATH} is absent from the merge base, so this is '
+            f'{ratchet.BASELINE_RELPATH} is absent from the merge base, so this is '
             'a first write with nothing to compare against.'
         )
         return 0
     raises = _raises(root, base_oid, new_oid)
     if not raises or _restores_mains_previous_image(root, move.base, new_oid, raises):
         return 0
-    unrecorded = metrics.unrecorded_raises(raises, own)
+    unrecorded = ratchet.unrecorded_raises(raises, own)
     if not unrecorded:
         return 0
     return _refuse_unrecorded(move, unrecorded)
@@ -189,7 +189,7 @@ def _audit(root: Path, old_revision: str, new_revision: str) -> int:
     )
     if move.base_baseline_oid and not move.new_baseline_oid:
         _say(
-            f'{metrics.BASELINE_RELPATH} may not be DELETED. With nothing to '
+            f'{ratchet.BASELINE_RELPATH} may not be DELETED. With nothing to '
             'compare against, every frozen measure resets and every ceiling is '
             're-grandfathered, unrefused and unrecorded.',
             refusal=True,
@@ -197,7 +197,7 @@ def _audit(root: Path, old_revision: str, new_revision: str) -> int:
         return 1
     try:
         own = revisions.own_entries(root, [base] if base else [], tip=new)
-    except metrics.AppendOnlyViolation as exc:
+    except ratchet.AppendOnlyViolation as exc:
         # A VERDICT, so the POLICY rung, uniform with the commit gate.
         _say(str(exc), refusal=True)
         return 1
@@ -213,7 +213,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--root',
-        default=str(metrics.repo_root()),
+        default=str(ratchet.repo_root()),
         help='repository root whose main is moving (default: this checkout)',
     )
     parser.add_argument('old', help="main's current value")
