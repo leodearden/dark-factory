@@ -43,7 +43,9 @@ from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
     closure_exists_probe,
 )
 from fused_memory.server.markup_guard import install_markup_guard  # noqa: E402
-from fused_memory.server.markup_residue_spool import MarkupResidueSpool  # noqa: E402
+from fused_memory.server.markup_residue_spool import (  # noqa: E402  # debt: task 10130
+    MarkupResidueSpool,
+)
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
     create_mcp_server,
