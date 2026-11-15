@@ -519,7 +519,7 @@ def test_main_closes_a_timed_out_restart_as_unconfirmed(
     logged: list[str] = []
     monkeypatch.setattr(wdog, "log", logged.append)
 
-    wdog.main()
+    wdog.main(read_status=_healthy_restart_status)
 
     _assert_restart_closed_unconfirmed(logged, _DF_UNIT)
 
