@@ -53,8 +53,10 @@ from fused_memory.maintenance.link_heal_ledger import LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_metrics import (
     EVAL_ID,
     SUMMED_METRICS,
+    THETA_SUMMARY_KEYS,
     SweepMetrics,
     SweepMetricsTarget,
+    check_summary_contract,
     summarize_series,
     summary_path,
     sweep_metric_series,
@@ -264,6 +266,37 @@ class TestTheSummary:
 
         assert summary['runs_7d'] == 0
         assert_theta_keys(summary)
+
+
+def _complete_summary() -> dict[str, object]:
+    return {key: 0 for key in THETA_KEYS} | {'adjudication_failure_rate_7d': 0.0}
+
+
+class TestTheThetaKeyContract:
+    def test_the_producers_contract_is_thetas_six_keys(self):
+        assert THETA_SUMMARY_KEYS == THETA_KEYS
+
+    def test_a_complete_summary_passes(self, tmp_path):
+        assert check_summary_contract(_complete_summary()) is None
+        assert check_summary_contract(summarize_series(tmp_path, now=NOW)) is None
+
+    @pytest.mark.parametrize('key', THETA_KEYS)
+    def test_a_missing_key_is_named(self, key):
+        summary = _complete_summary()
+        del summary[key]
+
+        with pytest.raises(ValueError, match=key):
+            check_summary_contract(summary)
+
+    @pytest.mark.parametrize('value', [True, '3', None], ids=['bool', 'str', 'none'])
+    def test_a_non_number_is_named_with_its_value(self, value):
+        summary = _complete_summary() | {'would_escape_7d': value}
+
+        with pytest.raises(ValueError) as excinfo:
+            check_summary_contract(summary)
+
+        assert 'would_escape_7d' in str(excinfo.value)
+        assert repr(value) in str(excinfo.value)
 
 
 class TestTheTarget:
