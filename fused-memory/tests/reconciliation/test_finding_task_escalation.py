@@ -517,7 +517,7 @@ class TestRoutedRecordCarriesFinding:
 @dataclass
 class _TerminalRecord:
     resolution_class: str | None
-    resolved_at: str | None
+    resolved_at: object
 
 
 _NOW = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
@@ -553,8 +553,13 @@ class TestRecentConversionSuppressesRefile:
         fresh = (_NOW - timedelta(hours=1)).isoformat()
         assert _suppresses(_TerminalRecord(resolution_class, fresh)) is False
 
-    @pytest.mark.parametrize(
-        'resolved_at', [None, 'garbage', (_NOW - timedelta(hours=1)).replace(tzinfo=None).isoformat()],
-    )
-    def test_unreadable_or_naive_stamp_does_not_suppress(self, resolved_at):
+    @pytest.mark.parametrize('resolved_at', [None, '', 'garbage', 1763208000])
+    def test_unreadable_stamp_does_not_suppress(self, resolved_at):
         assert _suppresses(_TerminalRecord('converted', resolved_at)) is False
+
+    @pytest.mark.parametrize(
+        ('age', 'suppresses'), [(timedelta(hours=1), True), (_WINDOW, False)],
+    )
+    def test_naive_stamp_reads_as_utc(self, age, suppresses):
+        naive = (_NOW - age).replace(tzinfo=None).isoformat()
+        assert _suppresses(_TerminalRecord('converted', naive)) is suppresses

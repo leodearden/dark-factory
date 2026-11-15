@@ -32,6 +32,8 @@ DETECTION. This arm is the plumbing only.
 This module performs NO filesystem or network I/O and imports nothing from the
 ``escalation`` package (which is an optional workspace member — see the guarded
 imports in ``reconciliation/reconciler_escalation.py`` and ``reconciliation/harness.py``).
+Its one side effect is the WARNING ``shared.timestamps.parse_timestamp_or_warn``
+logs for an unreadable stamp.
 That keeps it hermetically testable from plain dicts, mirroring the stated
 purity contract of the sibling module ``reconciliation/predicate_contradiction.py``.
 """
@@ -43,6 +45,8 @@ import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import Any, Protocol
+
+from shared.timestamps import parse_timestamp_or_warn
 
 __all__ = [
     'FINDING_TASK_ESCALATION_CATEGORY',
@@ -492,7 +496,7 @@ class TerminalRoutedRecordView(Protocol):
     def resolution_class(self) -> str | None: ...
 
     @property
-    def resolved_at(self) -> str | None: ...
+    def resolved_at(self) -> object: ...
 
 
 def recent_conversion_suppresses_refile(
@@ -506,17 +510,16 @@ def recent_conversion_suppresses_refile(
 
     Only a conversion to a task, closed less than *window* before *now*, holds
     it: an adjudication is newer information and lets the refile through, and
-    an unreadable or naive ``resolved_at`` files rather than suppresses.
+    an unreadable ``resolved_at`` files rather than suppresses.  The stamp is
+    read by the same rule ``EscalationQueue.newest_terminal_by_task`` picked
+    the record by, so a naive stamp reads as UTC.
 
     *converted_class* is ``escalation.disposition.ConvertViaCurator.resolution_class``,
     passed in because this module imports nothing from ``escalation``.
     """
     if record is None or record.resolution_class != converted_class:
         return False
-    try:
-        resolved_at = datetime.fromisoformat(record.resolved_at or '')
-    except ValueError:
-        return False
-    if resolved_at.tzinfo is None:
-        return False
-    return now - resolved_at < window
+    resolved_at, readable = parse_timestamp_or_warn(
+        record.resolved_at, context='recon.conversion_hold',
+    )
+    return readable and now - resolved_at < window
