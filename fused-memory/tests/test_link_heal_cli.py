@@ -114,6 +114,10 @@ class Workspace:
     def reports_dir(self) -> Path:
         return self.root / 'reports'
 
+    @property
+    def metrics_root(self) -> Path:
+        return self.root / 'memory-evals'
+
     def write_config(
         self, *, max_actions_per_run: int = 25, link_heal: Mapping[str, Any] | None = None,
     ) -> None:
@@ -1110,10 +1114,12 @@ ITEMS = FIXTURES / 'link_heal_calibration_items.json'
 
 
 def sweep_env_for(harness: LinkHealHarness, workspace: Workspace, **kwargs: Any) -> Any:
-    """:func:`env_for`, with the reports under *workspace* and the clock at :data:`SWEEP_NOW`."""
+    """:func:`env_for`, with the reports and metrics under *workspace* and the clock at
+    :data:`SWEEP_NOW`."""
     return dataclasses.replace(
         env_for(harness, workspace, **kwargs),
         reports_dir_for=lambda _config: workspace.reports_dir,
+        metrics_root=workspace.metrics_root,
         now=lambda: SWEEP_NOW,
     )
 
@@ -1155,6 +1161,43 @@ class TestSweep:
         assert Path(report['report_path']).parent == workspace.reports_dir
         assert report['counts']['plan']['examined'] == 0
         assert report['counts']['apply'] is None
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_leaves_its_metrics_and_the_summary(self, harness, workspace, capsys):
+        code, report = await sweep(sweep_env_for(harness, workspace), workspace, capsys, '--dry-run')
+
+        assert code == 0
+        for key in ('metrics_json', 'summary_json'):
+            assert Path(report[key]).is_file()
+            assert Path(report[key]).parent == workspace.metrics_root / 'link-heal'
+        assert report['metrics_unwritten'] is None
+
+    @pytest.mark.asyncio
+    async def test_metrics_it_cannot_write_exit_1_and_say_why(self, harness, workspace, capsys):
+        blocker = workspace.root / 'a-regular-file'
+        blocker.write_text('')
+        env = dataclasses.replace(sweep_env_for(harness, workspace), metrics_root=blocker / 'm')
+
+        code, report = await sweep(env, workspace, capsys, '--dry-run')
+
+        assert code == 1
+        assert report['metrics_unwritten'].startswith('NotADirectoryError')
+        assert Path(report['report_path']).is_file()
+
+    @pytest.mark.asyncio
+    async def test_the_configured_cap_bounds_the_pairs_asked(self, harness, workspace, capsys):
+        workspace.write_config(link_heal={'max_adjudications_per_run': 1})
+        seed_sightings_created(harness, range(100, 102))
+        fake = always(Verdict.EXTENDS)
+
+        code, report = await sweep(
+            sweep_env_for(harness, workspace, adjudicator=fake), workspace, capsys,
+            '--dry-run', '--project', DF,
+        )
+
+        assert code == 0
+        assert len(fake.pairs) == 1
+        assert report['counts']['plan']['adjudication_capped'] == 1
 
     @pytest.mark.asyncio
     async def test_since_and_project_bound_what_is_examined(self, harness, workspace, capsys):
