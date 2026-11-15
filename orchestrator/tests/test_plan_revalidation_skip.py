@@ -36,6 +36,8 @@ from orchestrator.mcp.plan_tools import (
     _create_plan,
     _record_descoped_step,
 )
+from orchestrator.quarantine_provenance import stamp_quarantined_from
+from orchestrator.review_lineage import retire_quarantined_lineages
 from orchestrator.scheduler import BlastRadiusResult, files_to_modules
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -1343,3 +1345,90 @@ async def test_remedy_pass_output_takes_the_same_plan_gates_as_the_first_pass(
     assert outcome == WorkflowOutcome.BLOCKED
     assert _no_plan_counter_writes(f) == [1]
     _assert_restored(f, before)
+
+
+# ── task 3663: review rounds retired by a quarantine reach the architect ────
+
+_CARRIED = {
+    'severity': 'suggestion',
+    'location': 'mod_a/file.py:3',
+    'category': 'naming',
+    'description': 'helper name hides its side effect',
+    'suggested_fix': 'rename helper',
+}
+
+
+def _retire_a_quarantined_lineage(f: _Fixture, *, quarantined_after_confirmation: bool = True) -> None:
+    """Confirm the plan, then park its reviewed branch after one amendment round, and retire that lineage."""
+    confirmed = datetime.now(UTC) - timedelta(minutes=30)
+    quarantined = confirmed + timedelta(minutes=10 if quarantined_after_confirmation else -10)
+    plan_path = f.artifacts.artifact_path('plan.json')
+    plan = json.loads(plan_path.read_text())
+    plan['_finalized_at'] = confirmed.isoformat()
+    plan_path.write_text(json.dumps(plan))
+    f.artifacts.set_review_counters(amendment_rounds_total=1)
+    archive = f.artifacts.review_archive_dir('amend-1')
+    archive.mkdir(parents=True)
+    (archive / 'analyst.json').write_text(json.dumps({'verdict': 'ISSUES_FOUND', 'issues': [_CARRIED]}))
+    assert stamp_quarantined_from(f.artifacts, {
+        'branch': 'refs/heads/task/101-20261112T000000Z',
+        'tip_sha': 'c' * 40,
+        'unique_commit_count': 2,
+        'quarantined_at': quarantined.isoformat(),
+        'reason': 'orphan-reaper',
+        'parking': '/q/101-20261112T000000Z',
+        'stored_title': None,
+    })
+    assert retire_quarantined_lineages(f.artifacts)
+
+
+def _carried(builder: AsyncMock) -> list[str]:
+    _, kwargs = builder.call_args
+    return [s['description'] for review in kwargs.get('retired_reviews', ()) for s in review.suggestions]
+
+
+@pytest.mark.asyncio
+async def test_a_retired_review_round_declines_the_skip_and_reaches_revalidation(tmp_path: Path):
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    _retire_a_quarantined_lineage(f)
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+
+    f.build_revalidation_prompt.assert_awaited_once()
+    assert _carried(f.build_revalidation_prompt) == [_CARRIED['description']]
+
+
+@pytest.mark.asyncio
+async def test_a_retirement_older_than_the_plan_confirmation_still_skips(tmp_path: Path):
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    _retire_a_quarantined_lineage(f, quarantined_after_confirmation=False)
+
+    assert await f.wf._plan() == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_plan_carries_the_retired_review_round(tmp_path: Path):
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    _retire_a_quarantined_lineage(f)
+    f.artifacts.artifact_path('plan.json').unlink()
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+
+    f.build_architect_prompt.assert_awaited_once()
+    assert _carried(f.build_architect_prompt) == [_CARRIED['description']]
+
+
+@pytest.mark.asyncio
+async def test_without_a_retirement_the_skip_fires_and_nothing_is_carried(tmp_path: Path):
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+
+    assert await f.wf._plan() == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+
+    f.artifacts.artifact_path('plan.json').unlink()
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+    assert _carried(f.build_architect_prompt) == []
