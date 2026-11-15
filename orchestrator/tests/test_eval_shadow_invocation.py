@@ -21,8 +21,14 @@ from orchestrator.evals import runner
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.fixture_gate import fixture_task_gate
 from orchestrator.evals.live_fixture import build_live_fixture
-from orchestrator.evals.runner import build_eval_orch_config, run_end_to_end, run_eval
+from orchestrator.evals.runner import (
+    CellProfile,
+    build_eval_orch_config,
+    run_end_to_end,
+    run_eval,
+)
 from orchestrator.evals.shadow_invocation import (
+    SHADOW_PROFILE,
     build_shadow_orch_config,
     run_shadow_end_to_end,
     run_shadow_eval,
@@ -154,7 +160,7 @@ async def test_run_eval_builds_the_cell_config_with_the_injected_builder(
         await run_eval(
             tmp_path / 'task.json', _IMPL, base,
             worktree_path=tmp_path, memory_endpoint='http://127.0.0.1:54321',
-            judge_config=judge, orch_config_builder=recorder,
+            judge_config=judge, profile=CellProfile(recorder, fixture_task_gate),
         )
 
     assert recorder.calls == [{
@@ -180,7 +186,8 @@ async def test_run_end_to_end_builds_the_cell_config_with_the_injected_builder(
     with pytest.raises(_Sentinel):
         await run_end_to_end(
             tmp_path / 'task.json', architect, _IMPL, base,
-            memory_endpoint='http://127.0.0.1:54321', orch_config_builder=recorder,
+            memory_endpoint='http://127.0.0.1:54321',
+            profile=CellProfile(recorder, fixture_task_gate),
         )
 
     assert recorder.calls == [{
@@ -213,18 +220,19 @@ async def _build_workflow_kwargs_from(
 
 
 @pytest.mark.asyncio
-async def test_run_eval_under_the_shadow_builder_runs_its_cell_sandboxed(
+async def test_run_eval_under_the_shadow_profile_runs_its_cell_sandboxed_on_the_scoped_gate(
     tmp_path: Path, monkeypatch,
 ) -> None:
-    config = (await _build_workflow_kwargs_from(
+    kwargs = await _build_workflow_kwargs_from(
         tmp_path, monkeypatch,
         lambda base: run_eval(
             tmp_path / 'task.json', _IMPL, base, worktree_path=tmp_path, usage_gate=None,
-            orch_config_builder=build_shadow_orch_config,
+            profile=SHADOW_PROFILE,
         ),
-    ))['config']
+    )
 
-    assert config.sandbox.enabled is True
+    assert kwargs['config'].sandbox.enabled is True
+    assert kwargs['task_verify'] is run_scoped_verification
 
 
 @pytest.mark.asyncio

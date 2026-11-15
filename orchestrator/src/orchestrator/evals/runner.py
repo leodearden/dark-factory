@@ -9,6 +9,7 @@ import re
 import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Protocol
@@ -371,6 +372,18 @@ class OrchConfigBuilder(Protocol):
     ) -> OrchestratorConfig: ...
 
 
+@dataclass(frozen=True)
+class CellProfile:
+    """The profile a workflow cell runs under: how its config is built, and its task gate."""
+
+    orch_config_builder: OrchConfigBuilder
+    task_gate: TaskVerifyPort
+
+
+def _corpus_profile() -> CellProfile:
+    return CellProfile(build_eval_orch_config, fixture_task_gate)
+
+
 async def run_eval(
     task_path: Path,
     config: EvalConfig,
@@ -383,8 +396,7 @@ async def run_eval(
     *,
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
-    orch_config_builder: OrchConfigBuilder | None = None,
-    task_gate: TaskVerifyPort = fixture_task_gate,
+    profile: CellProfile | None = None,
 ) -> EvalResult:
     """Run one (task, config) pair through PLAN→EXECUTE→VERIFY→REVIEW on its frozen plan.
 
@@ -399,9 +411,9 @@ async def run_eval(
     axis. Without it the cell is an IMPLEMENTER cell labelled by *config*.
 
     A caller running the cell under another profile — the shadow profile —
-    passes its builder as *orch_config_builder* (``None``: ``build_eval_orch_config``)
-    and its *task_gate* (production's ``run_scoped_verification``).
+    passes it as *profile* (``None``: the corpus profile).
     """
+    cell_profile = profile or _corpus_profile()
     task = load_task(task_path)
     if worktree_path is not None:
         initial_plan = _resume_plan_from_worktree(worktree_path, task)
@@ -414,7 +426,7 @@ async def run_eval(
         )
     return await _run_workflow_cell(
         task,
-        lambda: (orch_config_builder or build_eval_orch_config)(
+        lambda: cell_profile.orch_config_builder(
             config, task, base_config, memory_endpoint=memory_endpoint,
             judge_config=judge_config,
         ),
@@ -427,7 +439,7 @@ async def run_eval(
         timeout_override=timeout_override,
         usage_gate=usage_gate,
         store=store or ResultStore.packaged(),
-        task_gate=task_gate,
+        task_gate=cell_profile.task_gate,
     )
 
 
@@ -507,8 +519,7 @@ async def run_end_to_end(
     *,
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
-    orch_config_builder: OrchConfigBuilder | None = None,
-    task_gate: TaskVerifyPort = fixture_task_gate,
+    profile: CellProfile | None = None,
 ) -> EvalResult:
     """Run ONE both-live end-to-end cell: the architect plans live and feeds the live implementer.
 
@@ -518,14 +529,14 @@ async def run_end_to_end(
     ``<architect>+<implementer>``, is an END_TO_END cell, and its architect is
     briefed in the replay frame. It persists into *store* (``None``:
     :meth:`ResultStore.packaged`). A caller running the cell under another
-    profile — the shadow profile — passes its builder as *orch_config_builder*
-    (``None``: ``build_eval_orch_config``) and its *task_gate* (production's
-    ``run_scoped_verification``).
+    profile — the shadow profile — passes it as *profile* (``None``: the
+    corpus profile).
     """
+    cell_profile = profile or _corpus_profile()
     task = load_task(task_path)
     return await _run_workflow_cell(
         task,
-        lambda: (orch_config_builder or build_eval_orch_config)(
+        lambda: cell_profile.orch_config_builder(
             impl_config, task, base_config,
             memory_endpoint=memory_endpoint, architect_config=arch_config,
         ),
@@ -538,7 +549,7 @@ async def run_end_to_end(
         timeout_override=timeout_override,
         usage_gate=usage_gate,
         store=store or ResultStore.packaged(),
-        task_gate=task_gate,
+        task_gate=cell_profile.task_gate,
     )
 
 
