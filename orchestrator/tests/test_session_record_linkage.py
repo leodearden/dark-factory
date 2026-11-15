@@ -9,7 +9,6 @@ import os
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import pytest  # pyright: ignore[reportMissingImports]
 from _process_identity_variants import IdentityVariant, own_identity
@@ -1226,15 +1225,14 @@ class TestLeaseClaimPrintsHolderRecordLast:
 
 
 def _decision(**overrides: object) -> dr.DecisionRecord:
-    fields: dict[str, Any] = {
-        'id': 'esc-4237-1',
-        'project': 'dark_factory',
-        'text': 'Adopt the plan?',
-        'filed_at': '2026-09-25T12:00:00+00:00',
-        'escalations_dir': '/queues/orch',
-        **overrides,
-    }
-    return dr.DecisionRecord(**fields)
+    base = dr.DecisionRecord(
+        id='esc-4237-1',
+        project='dark_factory',
+        text='Adopt the plan?',
+        filed_at='2026-09-25T12:00:00+00:00',
+        escalations_dir='/queues/orch',
+    )
+    return dataclasses.replace(base, **overrides)
 
 
 def _write_decision_raw(root: Path, body: dict[str, object]) -> None:
