@@ -6077,7 +6077,7 @@ class Harness:
         # audit trail plus a zero-pending-escalation task is the honest state:
         # nothing here awaits a human.
         if self._escalation_queue is not None:
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
 
             esc = Escalation(
                 id=self._escalation_queue.make_id(tid),
@@ -6264,7 +6264,7 @@ class Harness:
             )
             return
 
-        from escalation.models import Escalation  # noqa: PLC0415
+        from escalation.models import Escalation
 
         status = getattr(outcome, 'status', 'unknown')
         reason = getattr(outcome, 'reason', '') or ''
@@ -7653,7 +7653,7 @@ class Harness:
                 )
                 return
 
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
 
             error_code = getattr(exc, 'error_code', type(exc).__name__)
             raw = getattr(exc, 'raw', str(exc))
@@ -7859,7 +7859,7 @@ class Harness:
         try:
             if self._escalation_queue.has_open_l1(self._ARCHIVAL_STORM_SENTINEL):
                 return                         # dedup: one open L1 at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             ta = self.config.transcript_archive
             archive_root = Path(self.config.project_root) / ta.root
             labels = list(summary.get('labels') or ())
@@ -7957,7 +7957,7 @@ class Harness:
         try:
             if self._escalation_queue.has_open_l1(self._CONFIG_DIR_AMBIGUOUS_SENTINEL):
                 return                         # dedup: one open L1 at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             shown = found[:20]
             more = len(found) - len(shown)
             candidates = '\n'.join(f'  - {p}' for p in shown)
@@ -8058,7 +8058,7 @@ class Harness:
         try:
             if self._escalation_queue.has_open_l1(self._POOL_STORAGE_ABSENT_SENTINEL):
                 return                         # dedup: one open L1 at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             esc = Escalation(
                 id=self._escalation_queue.make_id(self._POOL_STORAGE_ABSENT_SENTINEL),
                 task_id=self._POOL_STORAGE_ABSENT_SENTINEL,
@@ -8312,7 +8312,7 @@ class Harness:
         try:
             if self._escalation_queue.has_open_l1(self._SESSION_RESUME_STORM_SENTINEL):
                 return                         # dedup: one open L1 at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             threshold = self.config.session_resume.fallback_storm_threshold
             rendered = '\n'.join(
                 self._render_resume_failure(failure)
@@ -8842,7 +8842,7 @@ class Harness:
             ]
             if existing:
                 return  # dedup: one open notice at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             esc = Escalation(
                 id=self._escalation_queue.make_id(self._WARM_BASE_HARD_DOWN_SENTINEL),
                 task_id=self._WARM_BASE_HARD_DOWN_SENTINEL,
@@ -8892,7 +8892,7 @@ class Harness:
             ]
             if existing:
                 return  # dedup: one open L2 at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             esc = Escalation(
                 id=self._escalation_queue.make_id(self._WARM_BASE_HARD_DOWN_SENTINEL),
                 task_id=self._WARM_BASE_HARD_DOWN_SENTINEL,
@@ -8988,7 +8988,7 @@ class Harness:
             ]
             if existing:
                 return  # dedup: one open INFO at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             esc = Escalation(
                 id=self._escalation_queue.make_id(self._NO_LANDINGS_SENTINEL),
                 task_id=self._NO_LANDINGS_SENTINEL,
@@ -9104,7 +9104,7 @@ class Harness:
         The key defaults to 1 (active) when absent, preserving backward
         compatibility with test mocks that omit ``'depth'``.
         """
-        import shutil as _shutil  # noqa: PLC0415
+        import shutil as _shutil
 
         if self._merge_worker is None:
             return
@@ -9342,7 +9342,7 @@ class Harness:
         Called once unconditionally at ``run()`` startup, adjacent to the
         interactive-worktree reaper, before the first dispatch.
         """
-        from orchestrator import verify as verify_mod  # noqa: PLC0415
+        from orchestrator import verify as verify_mod
 
         try:
             reaped = await verify_mod.reap_leftover_verify_scopes(
@@ -9608,9 +9608,9 @@ class Harness:
             False  — FLIP (task blocked + L1 filed; caller must arm requeue cooldown
                      and skip workflow construction).
         """
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
-        from orchestrator import substrate_gate  # noqa: PLC0415
+        from orchestrator import substrate_gate
 
         task_id = assignment.task_id
         gate_path = self.git_ops.worktree_base / f'_substrate-gate-{task_id}'
@@ -10522,7 +10522,7 @@ class Harness:
             # FLIP, so gating dispatch on any other definition (e.g. one that
             # requires a well-formed descriptor) would let a malformed
             # descriptor skip the gate entirely instead of failing closed.
-            from orchestrator import substrate_gate  # noqa: PLC0415
+            from orchestrator import substrate_gate
 
             if substrate_gate.carries_substrate_probe(assignment.task) and not await self._run_substrate_gate(assignment):
                 # FLIP detected: task is already blocked + escalated inside
@@ -10823,7 +10823,7 @@ class Harness:
                 # path. Best-effort — never blocks slot release.
                 try:
                     await self._maybe_auto_eval(assignment, report)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning(
                         'Task %s: auto-eval hook failed (non-fatal): %s',
                         assignment.task_id, exc,
@@ -10940,7 +10940,7 @@ class Harness:
                     continue
                 prior_ids.append(tid)
             return prior_ids
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'Task %s: auto-eval prior-redo lookup failed (%s) — '
                 'skipping supersede',
@@ -10994,7 +10994,7 @@ class Harness:
             status_by_id, err = await self.scheduler.get_statuses(ids=candidate_ids)
             if err is not None:
                 raise err
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'Auto-eval supersede re-check failed (%s) — skipping cancel '
                 'of %d candidate(s) this round: %s',
@@ -11037,7 +11037,7 @@ class Harness:
                 {'routing': _bumped_routing_dump(assignment.task.get('metadata'))},
                 metadata_mode='merge',
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'Task %s: routing-tier bump failed (non-fatal): %s',
                 assignment.task_id, exc,
@@ -11064,7 +11064,7 @@ class Harness:
                 {'routing': _bumped_routing_dump(task.get('metadata'))},
                 metadata_mode='merge',
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'Task %s: escalate_model routing-tier bump failed (non-fatal): %s',
                 task_id, exc,
@@ -11212,7 +11212,7 @@ class Harness:
         # the rename below run with the redo still deferred.
         try:
             await self.scheduler.set_task_status(new_task_id, 'pending')
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # The flip may have landed despite the failure (a timeout), which
             # would leave a live pending redo with no back-link or budget
             # tracking; if it really failed, a deferred orphan would collide
@@ -11246,7 +11246,7 @@ class Harness:
                     new_branch=new_branch,
                 )
                 renamed = True
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'Task %s: auto-eval rename failed (%s) — continuing '
                     'without rename',
@@ -11281,7 +11281,7 @@ class Harness:
                     },
                     timeout=15,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'Task %s: auto-eval supersede cancel of prior redo '
                     '%s failed (%s) — continuing',
@@ -11298,7 +11298,7 @@ class Harness:
                 metadata={'auto_eval_pair': str(new_task_id)},
                 metadata_mode='merge',
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'Task %s: auto-eval back-link update failed (%s)',
                 original_id, exc,
@@ -11345,7 +11345,7 @@ class Harness:
                 frozenset(self._auto_eval_redo_task_ids),
                 since=since,
             )
-        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+        except Exception as exc:  # never block dispatch on this
             logger.warning(
                 '_auto_eval_budget_used_24h: trailing-24h cost query failed (%s) — fail-open',
                 exc,
@@ -11386,7 +11386,7 @@ class Harness:
         cutoff_24h_iso = (now - timedelta(hours=24)).isoformat()
         try:
             total, watcher = await self.cost_store.cost_totals_in_window(cutoff_24h_iso, now_iso)
-        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+        except Exception as exc:  # never block dispatch on this
             logger.warning(
                 '_enforce_cost_ceilings: trailing-24h cost query failed (%s) — fail-open',
                 exc,
@@ -11555,7 +11555,7 @@ class Harness:
                 block_phase=report.block_phase,
                 filed_at=self._zero_progress_filed_at,
             )
-        except Exception as exc:  # noqa: BLE001 — never disturb cap accounting
+        except Exception as exc:  # never disturb cap accounting
             logger.warning(
                 'Task %s: zero-progress requeue check failed (non-fatal): %s',
                 task_id, exc,
@@ -11795,7 +11795,7 @@ class Harness:
                 ),
             )
             return observation
-        except Exception as exc:  # noqa: BLE001 — telemetry never disturbs a sweep
+        except Exception as exc:  # telemetry never disturbs a sweep
             logger.warning(
                 'Task %s: recovery-disposition emission failed (non-fatal): %s',
                 task_id, exc,
@@ -11858,7 +11858,7 @@ class Harness:
         """
         try:
             self._recovery_process_latch().discard(str(site))
-        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a sweep
+        except Exception as exc:  # bookkeeping never aborts a sweep
             logger.warning(
                 'recovery queue-absent notice re-arm failed (non-fatal): %s', exc,
             )
@@ -11883,7 +11883,7 @@ class Harness:
             tracker = getattr(self, '_recovery_veto_tracker', None)
             if tracker is not None:
                 tracker.clear(site, task_id)
-        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a tick
+        except Exception as exc:  # bookkeeping never aborts a tick
             logger.warning(
                 'Task %s: recovery veto-streak clear failed (non-fatal): %s',
                 task_id, exc,
@@ -11971,7 +11971,7 @@ class Harness:
                     threshold=threshold,
                     filed_at=self._recovery_streak_memo(),
                 )
-        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a sweep
+        except Exception as exc:  # bookkeeping never aborts a sweep
             logger.warning(
                 'recovery veto-streak release failed (non-fatal): %s', exc,
             )
@@ -12416,7 +12416,7 @@ class Harness:
             await self._maybe_pipeline_landing_tripwire(
                 task_id, base_sha, head_sha, prefetched_diff,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 '_note_merge_all: pipeline-landing tripwire failed for %s..%s: %s',
                 base_sha[:12],
@@ -12428,7 +12428,7 @@ class Harness:
         for coord in self._service_restart_coordinators:
             try:
                 await coord.note_merge(task_id, base_sha, head_sha, prefetched_diff=prefetched_diff)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     '_note_merge_all: coordinator %s note_merge failed: %s',
                     getattr(coord, '_service_name', repr(coord)),
@@ -12531,7 +12531,7 @@ class Harness:
         )
         try:
             await notifiee(task_id, base_sha, head_sha)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 'offline-lane on_post_merge notifiee raised for task %s; ignoring (fail-open)',
                 task_id,
@@ -14198,7 +14198,7 @@ class Harness:
         # `dead_l0` and `queue_handoff` buckets, so the L0 liveness fork
         # cannot change this site's answer — and this hot per-dispatch-tick
         # path skips claimant resolution entirely for an identical result.
-        from escalation.pins import classify_pins  # noqa: PLC0415
+        from escalation.pins import classify_pins
 
         pinned = classify_pins(task_id, rows, live_claimant=False)
 
@@ -15603,8 +15603,8 @@ class Harness:
         to re-run and the harness files it, failing closed as CATEGORY_POLICY
         does for a timeout; only the tip-advanced arm suppresses it.
         """
-        from orchestrator import critical_gate  # noqa: PLC0415
-        from orchestrator import verify as verify_mod  # noqa: PLC0415
+        from orchestrator import critical_gate
+        from orchestrator import verify as verify_mod
 
         main_sha: str = await self.git_ops.get_main_sha()  # type: ignore[union-attr]
         if not main_sha:
@@ -15660,7 +15660,7 @@ class Harness:
             )
             return
 
-        from escalation.models import Escalation  # noqa: PLC0415
+        from escalation.models import Escalation
 
         task_id = f'main-sweep-{swept_sha[:12]}'
         # Dedup against a surviving L1 from a prior run: _last_swept_main_sha
@@ -15975,7 +15975,7 @@ class Harness:
                 f'before this task can be safely resumed or re-triaged.'
             )
 
-        from escalation.models import Escalation  # noqa: PLC0415
+        from escalation.models import Escalation
 
         description = (task or {}).get('description', '')
         summary = (
@@ -16054,7 +16054,7 @@ class Harness:
         if self._escalation_queue is None:
             return
 
-        from escalation.models import Escalation  # noqa: PLC0415
+        from escalation.models import Escalation
 
         # The stamp is the original fire time, so a recovered review_due
         # carries the runner's fired_at.
@@ -16709,7 +16709,7 @@ class Harness:
         # (server.py:671). This replaces the harness's former independent
         # _ACTION_TARGETS copy and action-string routing, closing the Table B
         # drift (PRD task-status-authority C6, finding 10.0).
-        from escalation.action_effects import (  # noqa: PLC0415
+        from escalation.action_effects import (
             WORKFLOW_NONE,
             WORKFLOW_RESUME,
             effect_for,
@@ -17149,7 +17149,7 @@ class Harness:
             ok = await self.scheduler.update_task(
                 task_id, metadata=cleaned, metadata_mode='replace',
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort: never block the restart
+        except Exception as exc:  # best-effort: never block the restart
             logger.warning(
                 'action-teardown restart: could not clear merge_retry_pending for '
                 'task %s (%s) — proceeding with the restart; the re-dispatch may '
@@ -18346,7 +18346,7 @@ class Harness:
         # Table B (ω3, task 2196): source the target from the same authority
         # _on_escalation_resolved / escalation.server.resolve_issue use, so
         # resume→pending cannot drift into a third independent copy.
-        from escalation.action_effects import effect_for  # noqa: PLC0415
+        from escalation.action_effects import effect_for
 
         _resume_effect = effect_for('resume', escalation.level, escalation.category)
         if _resume_effect is not None and _resume_effect.target_status is not None:

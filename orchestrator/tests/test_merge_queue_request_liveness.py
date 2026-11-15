@@ -2152,7 +2152,7 @@ def _local_lease() -> Any:
     ``lease.is_local``/``lease.runner`` and never releases the lease (that is
     ``_finalize_inflight``'s job), so nothing accumulates on it across attempts.
     """
-    from orchestrator.verify_runner import HostLease  # noqa: PLC0415
+    from orchestrator.verify_runner import HostLease
 
     fake_local = MagicMock()
     fake_local.name = 'local'
@@ -2168,7 +2168,7 @@ def _held_lane_reset(warm_path: Path, holder_pgid: int) -> Any:
     ``wait_secs``), which is what makes the defer's minimum inter-attempt
     period load-bearing.
     """
-    from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
+    from orchestrator.git_ops import MergeVerifyLeaseHeld
 
     async def _reset(*_a: object, **_k: object) -> Path:
         raise MergeVerifyLeaseHeld(warm_path, holder_pgid)
@@ -2261,11 +2261,11 @@ class TestContendedLeaseDefers:
         ``MergeOutcome('blocked', reason='Verification error: Timed out after
         30s ...')`` with ``req.result`` RESOLVED.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
         from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
-        from orchestrator.verify_cancel import lane_lock_path  # noqa: PLC0415
+        from orchestrator.verify_cancel import lane_lock_path
 
         # Shrink the RESET path's own bounded wait so the test doesn't sit for
         # the real 30s.  STRICT setattr (no raising=False) on purpose: the
@@ -2566,7 +2566,7 @@ class TestContendedLeaseDefers:
         Sleeping again on top of that would slow the ALREADY-throttled paths
         for no benefit, so the backoff must be ``max(0, PERIOD - wait_secs)``.
         """
-        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
+        from orchestrator.git_ops import MergeVerifyLeaseContended
         from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
@@ -2955,7 +2955,7 @@ class TestContendedLeaseDefers:
         so standalone digits genuinely survive into the hash — asserted below
         rather than assumed, since the whole argument rests on it.
         """
-        from shared.task_metadata import RetryLedger  # noqa: PLC0415
+        from shared.task_metadata import RetryLedger
 
         # The normalizer keeps standalone digits (its file:line rule needs a
         # source-file extension before the colon), so an integer-seconds
@@ -2966,7 +2966,7 @@ class TestContendedLeaseDefers:
             != RetryLedger.normalize_cause_hint('lane unavailable for 8s')
         ), 'normalize_cause_hint must preserve standalone digits'
 
-        from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
+        from orchestrator.git_ops import MergeVerifyLeaseHeld
 
         foreign_pgid = 2**31 - 1
         warm_path = warm_git_ops.persistent_merge_worktree_path
@@ -3149,11 +3149,11 @@ class TestContendedLeaseDefers:
         30s ...')``, a reason string with no varying component, hence the same
         signature every time.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
         from orchestrator.merge_lane.worker import (
             InflightStatus,
         )
-        from orchestrator.verify_cancel import lane_lock_path  # noqa: PLC0415
+        from orchestrator.verify_cancel import lane_lock_path
 
         monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
 

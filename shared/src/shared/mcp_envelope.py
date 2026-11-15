@@ -276,7 +276,7 @@ def parse_tool_result(
 
         return value, None
 
-    except Exception as exc:  # noqa: BLE001 — catch-all for unexpected exceptions
+    except Exception as exc:  # catch-all for unexpected exceptions
         prefix = repr(exc)[:200]
         logger.warning(
             'MCP envelope parse raised unexpected exception (shape=%s, key=%r): %s',

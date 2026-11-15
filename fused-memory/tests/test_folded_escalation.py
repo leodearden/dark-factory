@@ -1082,7 +1082,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     the property that makes a colliding RENAME fail this test: a copy of the
     values in this file would keep passing while production went silent.
     """
-    from fused_memory.maintenance.link_heal_executor import (  # noqa: PLC0415
+    from fused_memory.maintenance.link_heal_executor import (
         ADJUDICATOR_ANCHOR as LINK_HEAL_ADJUDICATOR_ANCHOR,
     )
     from fused_memory.maintenance.link_heal_executor import (
@@ -1103,22 +1103,22 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.maintenance.link_heal_executor import (
         WRITE_FAILURE_ANCHOR as LINK_HEAL_WRITE_FAILURE_ANCHOR,
     )
-    from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
+    from fused_memory.middleware.candidate_key_escalation import (
         _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
     )
     from fused_memory.middleware.curator_escalator import (
         _ANCHOR_TASK_ID as CURATOR_ANCHOR,
     )
-    from fused_memory.middleware.entity_mint_storm_escalator import (  # noqa: PLC0415
+    from fused_memory.middleware.entity_mint_storm_escalator import (
         _ANCHOR_TASK_ID as ENTITY_MINT_ANCHOR,
     )
-    from fused_memory.middleware.mem0_update_storm_escalator import (  # noqa: PLC0415
+    from fused_memory.middleware.mem0_update_storm_escalator import (
         _ANCHOR_TASK_ID as MEM0_UPDATE_ANCHOR,
     )
-    from fused_memory.middleware.referent_repair_storm_escalator import (  # noqa: PLC0415
+    from fused_memory.middleware.referent_repair_storm_escalator import (
         _ANCHOR_TASK_ID as REFERENT_REPAIR_ANCHOR,
     )
-    from fused_memory.middleware.scope_violation_escalator import (  # noqa: PLC0415
+    from fused_memory.middleware.scope_violation_escalator import (
         _ANCHOR_TASK_ID as SCOPE_VIOLATION_ANCHOR,
     )
     from fused_memory.middleware.scope_violation_escalator import (
@@ -1133,28 +1133,28 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.middleware.ticket_janitor import (
         curation_backlog_anchor,
     )
-    from fused_memory.server.markup_guard import (  # noqa: PLC0415
+    from fused_memory.server.markup_guard import (
         _RESIDUE_ANCHOR_TASK_ID as GUARD_RESIDUE_ANCHOR,
     )
     from fused_memory.server.markup_guard import (
         _STORM_ANCHOR_TASK_ID as GUARD_STORM_ANCHOR,
     )
-    from fused_memory.server.markup_tripwire import (  # noqa: PLC0415
+    from fused_memory.server.markup_tripwire import (
         _ANCHOR_TASK_ID as TRIPWIRE_ANCHOR,
     )
     from fused_memory.server.markup_tripwire import (
         _RESIDUE_ANCHOR_TASK_ID as TRIPWIRE_RESIDUE_ANCHOR,
     )
-    from fused_memory.server.write_triage import (  # noqa: PLC0415
+    from fused_memory.server.write_triage import (
         _ANCHOR_TASK_ID as WRITE_TRIAGE_ANCHOR,
     )
-    from fused_memory.services.classification_fallback_alarm import (  # noqa: PLC0415
+    from fused_memory.services.classification_fallback_alarm import (
         ANCHOR_TASK_ID as CLASSIFICATION_FALLBACK_ANCHOR,
     )
-    from fused_memory.services.completion_claim_gate import (  # noqa: PLC0415
+    from fused_memory.services.completion_claim_gate import (
         _ANCHOR_PREFIX as UNVERIFIED_CLAIM_PREFIX,
     )
-    from fused_memory.services.journal_growth_alarm import (  # noqa: PLC0415
+    from fused_memory.services.journal_growth_alarm import (
         _FILE_SIZE_ANCHOR_TASK_ID as JOURNAL_SIZE_ANCHOR,
     )
     from fused_memory.services.journal_growth_alarm import (
@@ -1163,7 +1163,7 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     from fused_memory.services.mem0_retry_backlog_alarm import (
         ANCHOR_TASK_ID as MEM0_RETRY_BACKLOG_ANCHOR,
     )
-    from fused_memory.services.memory_metadata_census import (  # noqa: PLC0415
+    from fused_memory.services.memory_metadata_census import (
         _ANCHOR_TASK_ID as CENSUS_ANCHOR_BASE,
     )
     from fused_memory.services.memory_metadata_census import (
@@ -1254,7 +1254,7 @@ class TestNoTwoFilersShareAnAnchor:
     """
 
     def test_every_pair_of_anchors_is_distinct(self) -> None:
-        import itertools  # noqa: PLC0415
+        import itertools
 
         anchors = _anchors_read_from_their_own_homes()
         aliased = {frozenset(pair) for pair in _DELIBERATE_ALIASES}

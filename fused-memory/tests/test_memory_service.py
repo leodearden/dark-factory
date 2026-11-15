@@ -11903,7 +11903,7 @@ class TestGetMemoryTimeoutNotCoercedToNotFound:
 
     @pytest.mark.asyncio
     async def test_mem0_read_timeout_propagates(self, service):
-        from fused_memory.services.memory_service import MemoryNotFoundError  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryNotFoundError
 
         uuid = '77a3f6bc-0000-0000-0000-000000000000'
         service.mem0.get = AsyncMock(

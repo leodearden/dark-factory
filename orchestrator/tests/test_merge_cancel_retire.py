@@ -56,7 +56,7 @@ class _RetireSpy:
         self.removed: list[tuple[Path, str]] = []
         self.find_calls = 0
 
-    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:  # noqa: ARG002
+    async def find_inflight_merge_worktree(self, branch: str) -> Path | None:
         self.find_calls += 1
         if self._scratch is not None and self._scratch.exists():
             return self._scratch

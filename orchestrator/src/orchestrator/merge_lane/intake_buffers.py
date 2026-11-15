@@ -391,7 +391,7 @@ class MergeIntake:
         if self._merge_store is not None:
             try:
                 self._merge_store.record(item)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     'merge_queue: _buffer_owned_request: store.record failed for %s',
                     item.request_id,
@@ -435,10 +435,10 @@ class MergeIntake:
                                 and result.reason == MERGE_WORKER_SHUTDOWN_REASON
                             ):
                                 return  # crash / graceful-stop path: keep for recovery
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             pass  # exception-set future: fall through to remove
                         self._merge_store.remove(_rid)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             'merge_queue: _on_terminal: store.remove failed for %s',
                             _rid,

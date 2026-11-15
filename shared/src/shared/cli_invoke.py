@@ -4146,7 +4146,7 @@ def _materialize_stdin(stdin_data: bytes) -> IO[bytes]:
     fallback would instead give up the invariant itself, which is why that one
     raises.
     """
-    # noqa SIM115: a context manager is exactly wrong here — the fd must
+  # SIM115: a context manager is exactly wrong here — the fd must
     # OUTLIVE this call.  It is handed to create_subprocess_exec so the child
     # can dup it, and the caller closes the parent's handle immediately after
     # spawn (that close is what delivers EOF to the child).

@@ -538,7 +538,7 @@ def _reap_leaked_async_httpx_clients_sync():
     if _leaked_async_httpx_clients():
         try:
             asyncio.run(reap_leaked_async_httpx_clients())
-        except Exception as exc:  # noqa: BLE001 — a backstop must not fail the test
+        except Exception as exc:  # a backstop must not fail the test
             warnings.warn(
                 f'async-httpx drain fallback failed: {exc!r}. The sync arm '
                 f'closes clients from a throwaway asyncio.run loop, so an '
@@ -963,7 +963,7 @@ def _integration_collection_lease(request):
         yield
         return
 
-    from _fm_helpers import load_script_module  # noqa: PLC0415
+    from _fm_helpers import load_script_module
 
     reaper = load_script_module(
         Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py',

@@ -6678,7 +6678,7 @@ def load_config(config_path: Path | None = None) -> OrchestratorConfig:
         hard_findings = [
             f for f in audit_census_ignore_entries(config_path) if f.kind in HARD_KINDS
         ]
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         # Deliberately broad but ALWAYS logged at WARNING, never a silent
         # swallow (which is what shared/tests/test_silent_fallthrough_gate.py
         # ratchets against).  Breadth is the point here: load_config runs on

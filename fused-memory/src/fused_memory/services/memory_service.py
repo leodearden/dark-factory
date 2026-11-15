@@ -6217,7 +6217,7 @@ class MemoryService:
         for node_uuid in uuids:
             try:
                 await self.graphiti.refresh_entity_summary(node_uuid, group_id=group_id)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'post-ingest refresh_entity_summary failed for uuid=%s group=%s: %s',
                     node_uuid, group_id, exc,

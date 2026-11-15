@@ -166,8 +166,8 @@ class TestScenario1:
 
     async def test_three_singles_coalesce_end_to_end(
         self,
-        git_ops: GitOps,  # noqa: F811 — pytest injects the re-exported fixture
-        coalesce_config: OrchestratorConfig,  # noqa: F811
+        git_ops: GitOps,  # pytest injects the re-exported fixture
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         from unittest.mock import patch
@@ -402,8 +402,8 @@ class TestScenario2:
 
     async def test_partial_stackability_overlap_keeps_solo(
         self,
-        git_ops: GitOps,  # noqa: F811
-        coalesce_config: OrchestratorConfig,  # noqa: F811
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         from orchestrator.event_store import EventStore
@@ -566,8 +566,8 @@ class TestScenario3:
 
     async def test_confidence_gate_excludes_blocked_member(
         self,
-        git_ops: GitOps,  # noqa: F811
-        coalesce_config: OrchestratorConfig,  # noqa: F811
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         from orchestrator.event_store import EventStore
@@ -735,8 +735,8 @@ class TestScenario4:
 
     async def test_inflight_and_cancelled_excluded(
         self,
-        git_ops: GitOps,  # noqa: F811
-        coalesce_config: OrchestratorConfig,  # noqa: F811
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         from orchestrator.event_store import EventStore
@@ -857,8 +857,8 @@ class TestBookkeeping:
 
     async def test_speculative_caps_return_to_k_after_train(
         self,
-        git_ops: GitOps,  # noqa: F811
-        coalesce_config: OrchestratorConfig,  # noqa: F811
+        git_ops: GitOps,
+        coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
         from unittest.mock import patch

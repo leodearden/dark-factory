@@ -614,7 +614,7 @@ def _lint_grep_check(
                 manifest_path=check.get('manifest_path'),
             )
             message = _vacuous_present_refined_message(code, name, pattern, ref, sites)
-        except Exception:  # noqa: BLE001 - a refinement must never lose the reject
+        except Exception:  # a refinement must never lose the reject
             logger.warning(
                 'delivered_check polarity: refinement failed for check %r '
                 '(pattern=%r, ref=%s, repo_root=%s); reporting the unrefined '
@@ -643,7 +643,7 @@ def _lint_grep_check(
             return _absent_overbroad_finding(
                 name, pattern, paths, files=files, repo_root=repo_root, ref=sha
             )
-    except Exception:  # noqa: BLE001 - these are advisory; never fail the lint
+    except Exception:  # these are advisory; never fail the lint
         # Degrading here loses only a diagnosis, never a rejection: the 2x2
         # has already declared this check healthy. Logged rather than
         # swallowed so the gate's own coverage gaps stay visible.

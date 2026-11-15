@@ -210,13 +210,13 @@ class _FakeEscalationQueue:
         self.submitted: list = []
         self._seq = 0
 
-    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
+    def has_open_l1(self, task_id: str) -> bool:
         return False
 
-    def get_by_task(self, task_id: str, status: str | None = None, level: int | None = None) -> list:  # noqa: ARG002
+    def get_by_task(self, task_id: str, status: str | None = None, level: int | None = None) -> list:
         return []
 
-    def make_id(self, task_id: str) -> str:  # noqa: ARG002
+    def make_id(self, task_id: str) -> str:
         self._seq += 1
         return f'esc-{self._seq}'
 

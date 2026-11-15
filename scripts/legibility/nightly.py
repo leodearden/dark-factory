@@ -43,7 +43,7 @@ from typing import NamedTuple, assert_never
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from legibility import (  # noqa: E402
+from legibility import (
     alarm,
     census_trigger,
     codebook,
@@ -59,7 +59,7 @@ from legibility import (  # noqa: E402
     trickle_state,
     unlanded,
 )
-from legibility.config import (  # noqa: E402
+from legibility.config import (
     LegibilityConfig,
     TrickleCensusCaps,
     _require_absolute,
@@ -316,7 +316,7 @@ def build_digests(
             text = build(
                 record.path, agent_class_override=record.stratum, max_bytes=max_bytes,
             )
-        except Exception as exc:  # noqa: BLE001 - isolate, never propagate/fabricate
+        except Exception as exc:  # isolate, never propagate/fabricate
             extractor_failures.append((record.path.name, str(exc)))
             continue
         cache[key] = text
@@ -500,7 +500,7 @@ def evaluate_census_step(
 
     try:
         decision = decide(cfg, now=now, completion_runner=completion_runner)
-    except Exception as exc:  # noqa: BLE001 - the census trigger must never fail the run
+    except Exception as exc:  # the census trigger must never fail the run
         # The exception text is BOUNDED before it reaches either sink, and both
         # sinks are single-line: the WARNING becomes one nightly journal line,
         # and `census_line` is a one-line field on `NightlyResult`. An escaping
@@ -562,7 +562,7 @@ def evaluate_census_step(
 
     try:
         launcher(cfg.project_root, config_path=config_path, caps=cfg.census.trickle_caps)
-    except Exception as exc:  # noqa: BLE001 - best-effort, never fail the run
+    except Exception as exc:  # best-effort, never fail the run
         logger.warning('legibility trickle: census launcher failed (best-effort): %s', exc)
 
     return CensusEvaluation(line, True, completion)
@@ -1145,7 +1145,7 @@ def _best_effort_recording(project_id: str, target_date: date) -> Iterator[None]
     failure must never mask or replace the run's own outcome."""
     try:
         yield
-    except Exception as exc:  # noqa: BLE001 — deliberately total
+    except Exception as exc:  # deliberately total
         logger.warning(
             'legibility trickle: could not record run state for project=%s '
             'date=%s (%s: %s); the run itself is unaffected, but the '

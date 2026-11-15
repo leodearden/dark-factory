@@ -1079,7 +1079,7 @@ async def triage_write(
             decide_band(results, t_high=t_high, t_low=t_low),
             truncation_facts=_retrieval_cap_facts(results, k, t_low),
         )
-    except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
+    except Exception as exc:  # C1: nothing escapes this path.
         return _fail_open_decision(
             counter, project_id, exc, FailOpenStage.RETRIEVE, t_high=None, t_low=None,
         )
@@ -1133,7 +1133,7 @@ async def _judge_band(
         judged = _apply_judge_verdict(decision, answer, results)
         _log_retarget(decision, judged, project_id)
         return judged
-    except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
+    except Exception as exc:  # C1: nothing escapes this path.
         return _fail_open_decision(
             counter, project_id, exc, FailOpenStage.JUDGE,
             t_high=decision.t_high, t_low=decision.t_low,
@@ -1361,7 +1361,7 @@ def _record_fail_open(
             exc_info=exc,
         )
         return counter.record(project=project_id)
-    except Exception:  # noqa: BLE001 — the alarm must not break the write path.
+    except Exception:  # the alarm must not break the write path.
         logger.exception('write_triage fail-open counter itself failed')
         return None
 

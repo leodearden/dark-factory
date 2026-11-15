@@ -3783,7 +3783,7 @@ def _parse_batch_decisions(
                 latency_ms=latency_ms,
                 cost_usd=cost_per_item,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             decision = CuratorDecision(
                 action='create',
                 justification=f'batch-item-parse-failed: {exc}',

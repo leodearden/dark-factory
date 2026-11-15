@@ -257,7 +257,7 @@ def _make_hanging_proc():
     """
     call_count = [0]
 
-    async def communicate_side_effect(input=None):  # noqa: A002
+    async def communicate_side_effect(input=None):
         call_count[0] += 1
         if call_count[0] == 1:
             # Hang until the watchdog cancels comm_task — CancelledError is raised here.

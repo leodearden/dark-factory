@@ -1960,7 +1960,7 @@ def _known_projects_map() -> dict[str, str]:
         built it; ``{}`` on any failure.
     """
     try:
-        from fused_memory.models import scope  # noqa: PLC0415
+        from fused_memory.models import scope
 
         # PROJECT_ROOT is the var the wrapper already exports; fall back to
         # this checkout (scripts/ -> fused-memory/ -> repo root).
@@ -2038,7 +2038,7 @@ def _known_projects_coverage_issue(known: dict[str, str]) -> str | None:
         diagnostic, and it must never be the thing that breaks the drain.
     """
     try:
-        from fused_memory.models import scope  # noqa: PLC0415
+        from fused_memory.models import scope
 
         named_roots = scope.known_project_roots_from_env()
         if not named_roots:
@@ -2179,11 +2179,11 @@ async def _resolve_terminal_task_ids(project_id: str) -> tuple[set[str], str]:
           ``'resolution-failed'``    the backend raised; see the WARNING.
     """
     try:
-        from shared.task_statuses import TERMINAL as TERMINAL_STATUSES  # noqa: PLC0415
+        from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
-        from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.models import scope  # noqa: PLC0415
+        from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.models import scope
 
         config = FusedMemoryConfig()
         if config.taskmaster is None:
@@ -2322,8 +2322,8 @@ def main() -> int:
         return 0
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.services.memory_service import MemoryService
 
         config = FusedMemoryConfig()
         memory = MemoryService(config)

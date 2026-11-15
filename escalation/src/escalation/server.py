@@ -2946,7 +2946,7 @@ def create_server(
             if callable(bump):
                 try:
                     bump(rec.task_id)
-                except Exception as _e:  # noqa: BLE001 — best-effort telemetry
+                except Exception as _e:  # best-effort telemetry
                     logger.warning(
                         'escalate_model tier bump failed for task %s '
                         '(non-fatal): %s',

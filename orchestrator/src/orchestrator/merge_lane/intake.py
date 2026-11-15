@@ -158,7 +158,7 @@ async def enqueue_merge_request(
     )
     queued_at = time.monotonic()
 
-    def _on_finalized(fut: asyncio.Future) -> None:  # noqa: ANN001
+    def _on_finalized(fut: asyncio.Future) -> None:
         # --- derive terminal state -------------------------------------------
         superseded_by: str | None = None
         reason: str | None = None
@@ -177,7 +177,7 @@ async def enqueue_merge_request(
                 superseded_by = outcome.superseded_by
                 reason = outcome.reason or None
                 landed_via_chain = outcome.landed_via_chain
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 'enqueue_merge_request: _on_finalized could not derive terminal '
                 'state for request_id=%s task_id=%s',
@@ -200,7 +200,7 @@ async def enqueue_merge_request(
                     reason=reason,
                     landed_via_chain=landed_via_chain,
                 ))
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     'enqueue_merge_request: _on_finalized retention.record failed '
                     'for request_id=%s task_id=%s',
@@ -231,7 +231,7 @@ async def enqueue_merge_request(
                         'queue_to_land_secs': round(time.monotonic() - queued_at, 3),
                     },
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     'enqueue_merge_request: _on_finalized event_store.emit failed '
                     'for request_id=%s task_id=%s',

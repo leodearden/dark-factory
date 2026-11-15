@@ -127,7 +127,7 @@ class TestRunSegmentedRunsEverySegment:
         clock = _Clock(cost_per_segment=5.0)
         run_one = _RecordingRunOne(clock)
         segments = _fleet_segments()
-        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+        from orchestrator.verify import _run_segmented
 
         rc, output, timed_out, seg_dicts = await _run_segmented(
             segments,
@@ -157,7 +157,7 @@ class TestRunSegmentedRunsEverySegment:
         clock = _Clock(cost_per_segment=5.0)
         run_one = _RecordingRunOne(clock, results={2: (1, 'boom', False)})
         segments = _fleet_segments()
-        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+        from orchestrator.verify import _run_segmented
 
         _rc, _output, _timed_out, seg_dicts = await _run_segmented(
             segments,
@@ -195,7 +195,7 @@ class TestRunSegmentedRunsEverySegment:
         run_one = _RecordingRunOne(clock, results={2: (1, 'orchestrator tests failed', False)})
         segments = _fleet_segments()
         assert segments[2].cwd_rel == 'orchestrator'
-        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+        from orchestrator.verify import _run_segmented
 
         rc, _output, timed_out, seg_dicts = await _run_segmented(
             segments,
@@ -234,7 +234,7 @@ class TestRunSegmentedRunsEverySegment:
             results={1: (3, 'escalation red', False), 4: (2, 'dashboard red', False)},
         )
         segments = _fleet_segments()
-        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+        from orchestrator.verify import _run_segmented
 
         rc, _output, _timed_out, seg_dicts = await _run_segmented(
             segments,
@@ -263,7 +263,7 @@ class TestRunSegmentedRunsEverySegment:
         clock = _Clock(cost_per_segment=1.0)
         run_one = _RecordingRunOne(clock, results={0: (124, 'timed out', True)})
         segments = _fleet_segments()
-        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+        from orchestrator.verify import _run_segmented
 
         rc, _output, timed_out, seg_dicts = await _run_segmented(
             segments,
@@ -319,7 +319,7 @@ class TestRunSegmentedSharedDeadline:
         clock = _Clock(cost_per_segment=5.0)
         run_one = _RecordingRunOne(clock)
         segments = _fleet_segments()
-        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+        from orchestrator.verify import _run_segmented
 
         rc, output, timed_out, seg_dicts = await _run_segmented(
             segments,
@@ -417,7 +417,7 @@ class TestRunSegmentedSharedDeadline:
         clock = _Clock(cost_per_segment=5.0)
         run_one = _RecordingRunOne(clock, results={1: (7, 'escalation red', False)})
         segments = _fleet_segments()
-        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+        from orchestrator.verify import _run_segmented
 
         rc, _output, timed_out, seg_dicts = await _run_segmented(
             segments,
@@ -449,7 +449,7 @@ class TestRunSegmentedSharedDeadline:
         clock = _Clock(cost_per_segment=5.0)
         run_one = _RecordingRunOne(clock)  # every executed segment passes
         segments = _fleet_segments()
-        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+        from orchestrator.verify import _run_segmented
 
         rc, _output, timed_out, seg_dicts = await _run_segmented(
             segments,
@@ -496,10 +496,10 @@ class TestRunSegmentedSharedDeadline:
             },
         )
         segments = _fleet_segments()
-        from orchestrator.verify import _run_segmented  # noqa: PLC0415
-        from orchestrator.verify_categories import FailureCategory  # noqa: PLC0415
-        from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
-        from orchestrator.verify_cmd import ToolKind  # noqa: PLC0415
+        from orchestrator.verify import _run_segmented
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.verify_classify import classify_failure
+        from orchestrator.verify_cmd import ToolKind
 
         rc, output, timed_out, seg_dicts = await _run_segmented(
             segments,
@@ -534,10 +534,10 @@ class TestRunSegmentedSharedDeadline:
         clock = _Clock(cost_per_segment=2.0)
         run_one = _RecordingRunOne(clock, results={2: (124, 'timed out', True)})
         segments = _fleet_segments()
-        from orchestrator.verify import _run_segmented  # noqa: PLC0415
-        from orchestrator.verify_categories import FailureCategory  # noqa: PLC0415
-        from orchestrator.verify_classify import classify_failure  # noqa: PLC0415
-        from orchestrator.verify_cmd import ToolKind  # noqa: PLC0415
+        from orchestrator.verify import _run_segmented
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.verify_classify import classify_failure
+        from orchestrator.verify_cmd import ToolKind
 
         rc, output, timed_out, _seg_dicts = await _run_segmented(
             segments,
@@ -583,7 +583,7 @@ class TestRunSegmentedRoster:
         clock = _Clock(cost_per_segment=5.0)
         run_one = _RecordingRunOne(clock, results={2: (1, red_output, False)})
         segments = _fleet_segments()
-        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+        from orchestrator.verify import _run_segmented
 
         # 10 segments at 5s each needs 50s; a 45s budget is exhausted exactly as
         # the 10th is reached, leaving it unrun.
@@ -634,7 +634,7 @@ class TestRunSegmentedRoster:
         diagnosis regression.
         """
         _rc, output, _timed_out, seg_dicts = await self._mixed_run(tmp_path, _PYTEST_RED)
-        from orchestrator.verify import _summarize_checks  # noqa: PLC0415
+        from orchestrator.verify import _summarize_checks
 
         roster_lines = len(seg_dicts)
         without_roster = '\n'.join(output.splitlines()[roster_lines:])
@@ -654,7 +654,7 @@ class TestRunSegmentedRoster:
     async def test_the_real_pytest_failure_line_surfaces_not_a_roster_line(self, tmp_path):
         """The hint is the red segment's own output, not the report about it."""
         _rc, output, _timed_out, _seg_dicts = await self._mixed_run(tmp_path, _PYTEST_RED)
-        from orchestrator.verify import _summarize_checks  # noqa: PLC0415
+        from orchestrator.verify import _summarize_checks
 
         _passed, _category, cause_hint, _summary, _leg_categories = _summarize_checks(
             1, output, False, 'uv run pytest tests/',
@@ -681,7 +681,7 @@ class TestRunVerificationSegmentChainedTestWiring:
 
     @staticmethod
     def _fallback_config(test_command: str):
-        from orchestrator.config import ModuleConfig  # noqa: PLC0415
+        from orchestrator.config import ModuleConfig
 
         return ModuleConfig(
             prefix='__fallback__',
@@ -718,10 +718,10 @@ class TestRunVerificationSegmentChainedTestWiring:
         reachable from a first pass that actually goes red with recognisable
         output, which an always-green stub can never produce.
         """
-        from unittest.mock import patch  # noqa: PLC0415
+        from unittest.mock import patch
 
-        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
-        from orchestrator.verify import run_verification  # noqa: PLC0415
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.verify import run_verification
 
         (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
         calls: list[dict] = []
@@ -923,7 +923,7 @@ class TestSegmentsAreDashNCapped:
         first is what keeps those assertions about the command that actually
         runs.
         """
-        import shlex  # noqa: PLC0415
+        import shlex
 
         tokens = shlex.split(cmd)
         if len(tokens) >= 3 and tokens[-3].endswith('bash') and tokens[-2] == '-c':
@@ -964,7 +964,7 @@ class TestSegmentsAreDashNCapped:
         producing a command bash refuses to parse. Assert the flag lands
         INSIDE the subshell and the result is still valid bash.
         """
-        import subprocess  # noqa: PLC0415
+        import subprocess
 
         _result, calls, _runs = await self._run_capped(tmp_path)
 
@@ -1099,7 +1099,7 @@ class TestTheSerialRecoveryRoundTripStaysUncapped:
         keeps asserting "the cap added nothing" rather than freezing one
         rendering of the recovery chain.
         """
-        from orchestrator.verify import _serial_pytest_str  # noqa: PLC0415
+        from orchestrator.verify import _serial_pytest_str
 
         serial = _serial_pytest_str(_FLEET_TEST_COMMAND, invocation_dir=worktree)
         # `_serial_pytest_str` is typed `str | None -> str | None` because it
@@ -1167,7 +1167,7 @@ class TestTheSerialRecoveryRoundTripStaysUncapped:
         flag leaked" rather than as an opaque list diff. Both cap-gated roles
         run it because both reach the segmented path.
         """
-        import shlex  # noqa: PLC0415
+        import shlex
 
         n_segments = len(_fleet_segments())
         _result, calls, _runs = await self._run_recovering(tmp_path, role=role)
@@ -1221,7 +1221,7 @@ class TestPerSegmentJunitIsDeliberatelyUnwired:
         change the guard exists to catch: someone segmenting a merge-role
         verify, where a junit path IS computed.
         """
-        import logging  # noqa: PLC0415
+        import logging
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
             result, calls, runs = await TestRunVerificationSegmentChainedTestWiring._run(
@@ -1369,10 +1369,10 @@ class TestRunVerificationSegmentedAcceptance:
         the real labels rather than a positional index that would silently
         re-target if the committed chain gained a clause.
         """
-        from unittest.mock import patch  # noqa: PLC0415
+        from unittest.mock import patch
 
-        from orchestrator import verify as verify_mod  # noqa: PLC0415
-        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+        from orchestrator import verify as verify_mod
+        from orchestrator.config import OrchestratorConfig
 
         (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
         calls: list[dict] = []
@@ -1607,11 +1607,11 @@ class TestSegmentsReachThePersistedSummaryJson:
         *config_overrides* is merged over the admission-OFF config, as in
         ``TestRunVerificationSegmentChainedTestWiring._run``.
         """
-        import json  # noqa: PLC0415
-        from unittest.mock import patch  # noqa: PLC0415
+        import json
+        from unittest.mock import patch
 
-        from orchestrator import verify as verify_mod  # noqa: PLC0415
-        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+        from orchestrator import verify as verify_mod
+        from orchestrator.config import OrchestratorConfig
 
         (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
         clock = _SegmentedBudgetClock(blow_budget_after)
@@ -1813,7 +1813,7 @@ class TestEachSegmentRecordsItsOwnXdist:
 
 def _segment_junit_target(cmd: str) -> pathlib.Path | None:
     """The report path a rendered segment command was told to write, if any."""
-    import shlex  # noqa: PLC0415
+    import shlex
 
     tokens = shlex.split(cmd)
     for index, token in enumerate(tokens[:-1]):
@@ -1848,10 +1848,10 @@ class TestSegmentedTaskLegsArchivePerSegmentJunit:
 
         Returns ``(result, calls, archive_root)``.
         """
-        from unittest.mock import patch  # noqa: PLC0415
+        from unittest.mock import patch
 
-        from orchestrator import verify as verify_mod  # noqa: PLC0415
-        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+        from orchestrator import verify as verify_mod
+        from orchestrator.config import OrchestratorConfig
 
         (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
         archive_root = tmp_path / 'archive'
@@ -1916,7 +1916,7 @@ class TestSegmentedTaskLegsArchivePerSegmentJunit:
 
     @pytest.mark.asyncio
     async def test_each_segment_that_wrote_a_report_is_archived_as_itself(self, tmp_path):
-        import gzip  # noqa: PLC0415
+        import gzip
 
         _result, calls, archive_root = await self._run_archiving(tmp_path)
 
@@ -1932,7 +1932,7 @@ class TestSegmentedTaskLegsArchivePerSegmentJunit:
 
     @pytest.mark.asyncio
     async def test_a_segment_that_never_ran_archives_no_stale_report(self, tmp_path):
-        from orchestrator.verify import _task_junit_report_path  # noqa: PLC0415
+        from orchestrator.verify import _task_junit_report_path
 
         (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
         stale = _task_junit_report_path(tmp_path, 1, '__fallback__', segment_label='root-9')
@@ -1958,7 +1958,7 @@ class TestSegmentedTaskLegsArchivePerSegmentJunit:
     async def test_a_task_path_segmented_run_does_not_warn_about_junit(
         self, tmp_path, caplog,
     ):
-        import logging  # noqa: PLC0415
+        import logging
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
             await self._run_archiving(tmp_path)
@@ -1981,7 +1981,7 @@ class TestSegmentedTaskLegsArchivePerSegmentJunit:
         fallback verify trains operators to ignore the true ones, such as the
         cockpit subshell segment's, which really does write none.
         """
-        import logging  # noqa: PLC0415
+        import logging
 
         with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
             await self._run_archiving(tmp_path)
@@ -1997,7 +1997,7 @@ class TestSegmentedTaskLegsArchivePerSegmentJunit:
         )
 
     def test_the_archive_name_carries_the_segment_label(self, tmp_path):
-        from orchestrator.verify import _archive_junit_report  # noqa: PLC0415
+        from orchestrator.verify import _archive_junit_report
 
         report = tmp_path / 'report.xml'
         report.write_text(_segment_report('orchestrator-3'), encoding='utf-8')
@@ -2012,9 +2012,9 @@ class TestSegmentedTaskLegsArchivePerSegmentJunit:
         assert dest.name.endswith('.xml.gz')
 
     def test_no_segment_label_keeps_the_5670_name(self, tmp_path):
-        import re  # noqa: PLC0415
+        import re
 
-        from orchestrator.verify import _archive_junit_report  # noqa: PLC0415
+        from orchestrator.verify import _archive_junit_report
 
         report = tmp_path / 'report.xml'
         report.write_text(_segment_report('whole'), encoding='utf-8')
@@ -2050,10 +2050,10 @@ class TestMergeRoleFallbackIsNotSegmented:
     @staticmethod
     async def _run_scoped(tmp_path, *, role):
         """Drive `run_scoped_verification`'s FALLBACK branch with `_run_cmd` stubbed."""
-        from unittest.mock import patch  # noqa: PLC0415
+        from unittest.mock import patch
 
-        from orchestrator import verify as verify_mod  # noqa: PLC0415
-        from orchestrator.config import ModuleConfig, OrchestratorConfig  # noqa: PLC0415
+        from orchestrator import verify as verify_mod
+        from orchestrator.config import ModuleConfig, OrchestratorConfig
 
         (tmp_path / 'shared').mkdir(exist_ok=True)
         (tmp_path / 'shared' / 'thing.py').write_text('x = 1\n', encoding='utf-8')

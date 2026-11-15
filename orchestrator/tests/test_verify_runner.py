@@ -3248,7 +3248,7 @@ class TestRunMergeVerifyOnWorktree:
 
         assert result.passed is False
         assert result.category == UNSCOPED_TYPECHECK_FAILED_CATEGORY
-        assert 'src/a' in result.summary  # noqa: SIM910
+        assert 'src/a' in result.summary
 
     async def test_type_check_command_survives_into_unscoped_module_configs(self):
         """type_check_command on verify_commands survives into module_configs passed to run_unscoped.

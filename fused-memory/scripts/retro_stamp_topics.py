@@ -1868,15 +1868,15 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
 
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> dict:
         # Deferred so importing this module — which the tests do, by path —
         # never constructs a backend.
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.services.memory_service import MemoryService
 
         config = FusedMemoryConfig()
         memory = MemoryService(config)

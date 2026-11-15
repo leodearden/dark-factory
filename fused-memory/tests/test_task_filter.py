@@ -902,7 +902,7 @@ class TestFormatFilteredTaskTree:
         # ignoring budget args.  The four extra fields (header, cancelled_section,
         # summary_line) are empty strings — the test only checks task-line presence,
         # not the surrounding strings.
-        def _stub_with_body(t, max_tasks=50, max_chars=50_000):  # noqa: ARG001
+        def _stub_with_body(t, max_tasks=50, max_chars=50_000):
             first_three = t.active_tasks[:3]
             body = '\n'.join(_render_task_line(task) for task in first_three) + '\n'
             return first_three, body, '', '', ''

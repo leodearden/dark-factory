@@ -143,7 +143,7 @@ def _default_spawn_runner(argv: list[str]) -> None:
     of whether a spawn attempt succeeded.
     """
     try:
-        subprocess.Popen(argv)  # noqa: S603 -- argv is built by build_spawn_argv, not shell text
+        subprocess.Popen(argv)  # argv is built by build_spawn_argv, not shell text
     except OSError:
         _log.exception('spawn_session: failed to launch %r', argv)
 

@@ -2076,7 +2076,7 @@ def _build_live_edge_source(config: Any) -> Any:
     straight to ``ro_query`` is the read-only idiom migrate_cross_graph_leak.py
     and invalidate_fabricated_shipping_edges.py already established.
     """
-    from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
+    from fused_memory.backends.graphiti_client import GraphitiBackend
 
     backend = GraphitiBackend(config)
     initialized = False
@@ -2255,10 +2255,10 @@ async def _main(argv: list[str] | None = None) -> int:
     )
     args = _build_parser().parse_args(argv)
 
-    import os  # noqa: PLC0415
-    from datetime import UTC, datetime  # noqa: PLC0415
+    import os
+    from datetime import UTC, datetime
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)

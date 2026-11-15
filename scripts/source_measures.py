@@ -417,7 +417,7 @@ def require_complexipy() -> str:
     return version
 
 
-def _import_complexipy():  # noqa: ANN202 - third-party module object
+def _import_complexipy():  # third-party module object
     """Import complexipy LAZILY, naming it in the failure.
 
     Lazy so this module stays importable and type-checkable under the
@@ -438,7 +438,7 @@ def _import_complexipy():  # noqa: ANN202 - third-party module object
     return complexipy
 
 
-def _file_complexity(path: Path):  # noqa: ANN202 - complexipy.FileComplexity
+def _file_complexity(path: Path):  # complexipy.FileComplexity
     complexipy = _import_complexipy()
     try:
         return complexipy.file_complexity(str(path))

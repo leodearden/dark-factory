@@ -641,7 +641,7 @@ class TestSiblingAuditImportResolves:
         monkeypatch.delitem(sys.modules, 'audit_found_on_main_provenance', raising=False)
         monkeypatch.syspath_prepend(str(SCRIPT_PATH.parent))
 
-        import importlib  # noqa: PLC0415
+        import importlib
         sibling = importlib.import_module('audit_found_on_main_provenance')
 
         assert callable(sibling.build_audit_report)
@@ -820,7 +820,7 @@ class TestRunCliWiring:
         created: list[int] = []
         monkeypatch.setattr(
             'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend',
-            lambda *a, **kw: created.append(1),  # noqa: ARG005
+            lambda *a, **kw: created.append(1),
         )
 
         project_root = _project_root_with_task_store(tmp_path)

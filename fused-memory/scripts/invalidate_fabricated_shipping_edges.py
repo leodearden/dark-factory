@@ -217,11 +217,11 @@ async def _run(args: argparse.Namespace) -> int:
             ),
         )
 
-    import os  # noqa: PLC0415
+    import os
 
-    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.services.memory_service import MemoryService
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)

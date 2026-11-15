@@ -1236,7 +1236,7 @@ class TestSnapshotWriteThrottle:
         # with a counter that always returns a unique string, making the time-throttle
         # gate the SOLE mechanism bounding writes.
         _dedup_counter = [0]
-        def _unique_payload(state=None):  # noqa: E301
+        def _unique_payload(state=None):
             _dedup_counter[0] += 1
             return str(_dedup_counter[0])
         scheduler._build_snapshot_payload = _unique_payload

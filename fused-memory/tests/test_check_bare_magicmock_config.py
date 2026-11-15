@@ -634,7 +634,7 @@ class TestHooksIntegration:
         only asserts the gate block (selection through invocation, non-comment
         portions) actually expands that array.
         """
-        import re as _re  # noqa: PLC0415 — avoid polluting module namespace
+        import re as _re  # avoid polluting module namespace
 
         hooks_path = Path(__file__).parent.parent.parent / 'hooks' / 'project-checks'
         content = hooks_path.read_text(encoding='utf-8')

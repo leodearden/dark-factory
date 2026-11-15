@@ -157,7 +157,7 @@ def build_verify_fn(
             probes[0] += 1
             try:
                 return headroom_probe()
-            except Exception as exc:  # noqa: BLE001 - a raising probe defers, never crashes the census
+            except Exception as exc:  # a raising probe defers, never crashes the census
                 return census_headroom.HeadroomResult(ok=False, reason=f"headroom probe raised: {exc}")
 
         for index, cluster in enumerate(clusters):
@@ -173,7 +173,7 @@ def build_verify_fn(
             )
             try:
                 raw = invoke(prompt, model)
-            except Exception as exc:  # noqa: BLE001 - an unverifiable claim rejects, never crashes
+            except Exception as exc:  # an unverifiable claim rejects, never crashes
                 # (b) One re-probe, only on a path that has already failed.
                 if headroom_probe is not None:
                     probe = _probe()
@@ -196,7 +196,7 @@ def build_verify_fn(
 
             try:
                 parsed = coder.parse_coder_output(raw)
-            except Exception as exc:  # noqa: BLE001 - an unparseable verdict rejects, never crashes
+            except Exception as exc:  # an unparseable verdict rejects, never crashes
                 # (a) Only a reply that failed to parse as a verdict is
                 # eligible for the banner scan. A parsed verdict is a verdict,
                 # however cap-themed the cluster it adjudicates. And even

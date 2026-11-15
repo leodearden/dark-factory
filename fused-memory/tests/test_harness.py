@@ -12126,7 +12126,7 @@ class TestUnknownProjectError:
         Any existing or future ``except ValueError`` callsite (test code, callers
         of ``_known_project_root_for``) must continue to match after step-20.
         """
-        from fused_memory.reconciliation.harness import UnknownProjectError  # noqa: F401
+        from fused_memory.reconciliation.harness import UnknownProjectError
 
         assert issubclass(UnknownProjectError, ValueError) is True, (
             'UnknownProjectError must subclass ValueError for backward-compat '

@@ -786,7 +786,7 @@ and either confirm it, update it, or recreate it from scratch.
         self,
         task: dict,
         partial_plan: dict,
-        worktree: Path | None = None,  # noqa: ARG002 — interface symmetry
+        worktree: Path | None = None,  # interface symmetry
         context: str | None = None,
         *,
         rulings: Sequence[Ruling] = (),
@@ -861,7 +861,7 @@ to start over from nothing.
         task: dict,
         plan: dict,
         not_touched: list[str],
-        worktree: Path | None = None,  # noqa: ARG002 — interface symmetry
+        worktree: Path | None = None,  # interface symmetry
         context: str | None = None,
     ) -> str:
         """Architect narrowing pass after the pre-merge plan-files gate.

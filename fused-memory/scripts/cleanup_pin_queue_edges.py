@@ -365,7 +365,7 @@ async def apply_cleanup(
 
 def connect_graph(args: argparse.Namespace) -> Any:
     """Open the falkordb graph handle for ``args.project_id``."""
-    from falkordb import FalkorDB  # noqa: PLC0415
+    from falkordb import FalkorDB
 
     return FalkorDB(host=args.falkor_host, port=args.falkor_port).select_graph(args.project_id)
 
@@ -432,8 +432,8 @@ def main() -> int:
     async def _run_live() -> int:
         memory = None
         if args.apply:
-            from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-            from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+            from fused_memory.config.schema import FusedMemoryConfig
+            from fused_memory.services.memory_service import MemoryService
 
             memory = MemoryService(FusedMemoryConfig())
             await memory.initialize()

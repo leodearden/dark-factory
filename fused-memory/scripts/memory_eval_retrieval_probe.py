@@ -466,7 +466,7 @@ def run_derive_registry(
     the Goodhart guard depends on. Print, diff, merge by hand.
     """
     if guard_clusters is None:
-        from fused_memory.config.schema import (  # noqa: PLC0415
+        from fused_memory.config.schema import (
             _default_topic_guard_clusters,
         )
 
@@ -680,7 +680,7 @@ def is_initial_run(root: str | Path, eval_id: str = EVAL_ID) -> bool:
     is not a prior measurement, and treating it as one would silently suppress
     the initial-state snapshot D1 requires.
     """
-    from shared.memory_eval_metrics import eval_dir  # noqa: PLC0415
+    from shared.memory_eval_metrics import eval_dir
 
     directory = eval_dir(root, eval_id)
     return not any(directory.glob('metrics-*.json'))
@@ -1103,7 +1103,7 @@ def probe_report_sections(
     *census_split* is taken already computed, never derived here, so the report
     renders the very split the caller hands back to its own callers.
     """
-    from shared.memory_eval_metrics import render_report  # noqa: PLC0415
+    from shared.memory_eval_metrics import render_report
 
     sections: list[ReportSection] = []
 
@@ -1518,7 +1518,7 @@ def emit_series(series, root: str | Path, *, stamp: str | None = None) -> tuple[
     shared module's, and re-implementing any of them here would be a second
     home for the artifact contract.
     """
-    from shared.memory_eval_metrics import write_metric_series  # noqa: PLC0415
+    from shared.memory_eval_metrics import write_metric_series
 
     return write_metric_series(series, root, stamp=stamp)
 
@@ -1607,7 +1607,7 @@ def graphiti_primary_categories() -> tuple[str, ...]:
     counting scope, not an empty graph. Derived for the same reason
     ``fused_memory/eval/topic_registry.py::corpus_categories`` is.
     """
-    from fused_memory.models.enums import GRAPHITI_PRIMARY  # noqa: PLC0415
+    from fused_memory.models.enums import GRAPHITI_PRIMARY
 
     return tuple(sorted(c.value for c in GRAPHITI_PRIMARY))
 
@@ -1737,7 +1737,7 @@ async def run_probe(
     counts = await count_corpus(memory, selected)
 
     if stamp is None:
-        from shared.memory_eval_metrics import run_stamp  # noqa: PLC0415
+        from shared.memory_eval_metrics import run_stamp
 
         stamp = run_stamp()
 
@@ -1894,8 +1894,8 @@ async def _probe(args: argparse.Namespace, registry: TopicRegistry) -> ProbeOutc
     Only the open is converted to :class:`ProbeRunError`; see
     ``shared/src/shared/cli_boundary.py::run_cli``.
     """
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.services.memory_service import MemoryService
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)

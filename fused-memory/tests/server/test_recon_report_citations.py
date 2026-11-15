@@ -3176,9 +3176,9 @@ class TestCiteMemoryOverRealMemoryService:
         Only the BACKEND is mocked. ``get_memory`` — the function that held the
         defect — runs for real.
         """
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService
 
         service = MemoryService(mock_config)
         service.mem0 = MagicMock()
@@ -3232,7 +3232,7 @@ class TestCiteMemoryExceptionNarrowing:
     @pytest.mark.asyncio
     async def test_memory_not_found_error_caught_as_memory_not_found(self):
         """MemoryNotFoundError → {error:'memory_not_found'} and cited_memories unchanged."""
-        from fused_memory.services.memory_service import MemoryNotFoundError  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryNotFoundError
 
         state, run_id, finding_id = self._state_and_finding(
             memory_raises=MemoryNotFoundError('not-found')

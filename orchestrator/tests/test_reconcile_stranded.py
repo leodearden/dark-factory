@@ -2921,9 +2921,9 @@ async def test_rejection_escalates_immediately_no_counter_threshold(harness: Har
             return f'esc-{task_id}-{len(submissions)}'
         def submit(self, esc):
             submissions.append(esc)
-        def has_open_l1(self, task_id):  # noqa: ARG002
+        def has_open_l1(self, task_id):
             return False
-        def get_by_task(self, task_id, status=None):  # noqa: ARG002
+        def get_by_task(self, task_id, status=None):
             # TaskGroundTruth._resolve_open_escalations (task 2243, W10-θ2)
             # consults this to fold open escalations into the recovery
             # shape — no escalation is open for this test's task.
@@ -3010,7 +3010,7 @@ def _wire_stale_evidence_mark_done(harness: Harness, *, evidence_commit: str = '
     """
     from orchestrator.scheduler import StaleEvidenceRejection
 
-    async def _stale_reject(tid, *, kind, sha, note=None):  # noqa: ARG001
+    async def _stale_reject(tid, *, kind, sha, note=None):
         raise StaleEvidenceRejection(
             task_id=tid,
             evidence_commit=evidence_commit,
@@ -4357,17 +4357,17 @@ class _RecordingScheduler:
         self.marked_done: list[str] = []
         self.clear_requeue_count = MagicMock()
 
-    async def get_statuses(self, ids):  # noqa: ANN001, ANN202
+    async def get_statuses(self, ids):
         return ({i: self.status for i in ids if i == self.mid}, None)
 
-    async def get_task(self, tid):  # noqa: ANN001, ANN202
+    async def get_task(self, tid):
         return {'id': tid, 'metadata': {'delivered_checks': [_WEDGE_CHECK]}}
 
-    async def mark_done(self, tid, **kwargs):  # noqa: ANN001, ANN003, ANN202
+    async def mark_done(self, tid, **kwargs):
         self.marked_done.append(tid)
         self.status = 'done'
 
-    async def set_task_status(self, tid, status, **kwargs):  # noqa: ANN001, ANN003, ANN202
+    async def set_task_status(self, tid, status, **kwargs):
         if tid == self.mid:
             self.status = status
 

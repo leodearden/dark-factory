@@ -599,7 +599,7 @@ def decide_for_project(
         if not isinstance(codebook_data, dict):
             raise ValueError(f"expected a YAML mapping, got {type(codebook_data).__name__}")
         earliest_sighting, candidate_first_seens = codebook_signal(codebook_data)
-    except Exception as exc:  # noqa: BLE001 - a bad codebook must fail safe, not crash
+    except Exception as exc:  # a bad codebook must fail safe, not crash
         logger.warning("codebook at %s is unreadable: %s", codebook_path, exc)
         earliest_sighting, candidate_first_seens = None, []
 

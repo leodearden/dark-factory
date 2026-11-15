@@ -563,7 +563,7 @@ def test_importing_this_module_touches_no_unit_directory(tmp_path: Path) -> None
 
     program = (
         "import importlib.util\n"
-        f"spec = importlib.util.spec_from_file_location('_wrapper_import_probe', {str(Path(__file__).resolve())!r})\n"  # noqa: E501
+        f"spec = importlib.util.spec_from_file_location('_wrapper_import_probe', {str(Path(__file__).resolve())!r})\n"
         "assert spec is not None and spec.loader is not None\n"
         "spec.loader.exec_module(importlib.util.module_from_spec(spec))\n"
     )

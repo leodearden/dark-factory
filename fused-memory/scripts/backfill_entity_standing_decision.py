@@ -999,11 +999,11 @@ def main(argv: list[str] | None = None) -> int:
     async def _run_live() -> dict[str, Any]:
         # Deferred so importing this module — which the tests do, by path —
         # never constructs a backend.
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.reconciliation.recon_ledger import (  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.reconciliation.recon_ledger import (
             ReconLedgerStore,
         )
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService
 
         config = FusedMemoryConfig()
         db_path = resolve_ledger_db_path(config)

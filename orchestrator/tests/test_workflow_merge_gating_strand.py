@@ -275,7 +275,7 @@ def _wire_resolve_callback(queue: EscalationQueue, workflow: TaskWorkflow) -> No
     thing that wakes ``_wait_for_resolution`` in production, so a test that
     omits it does not reproduce the production wake path at all.
     """
-    def _on_resolved(esc) -> None:  # noqa: ARG001 — signature parity with harness
+    def _on_resolved(esc) -> None:  # signature parity with harness
         event = workflow._escalation_event
         if event is not None:
             event.set()
@@ -382,7 +382,7 @@ def _fake_git_run(*, head: str = 'BRANCH-HEAD-SHA'):
     """Async stand-in for ``orchestrator.workflow._run`` (the merge-entry
     ``git rev-parse HEAD``)."""
 
-    async def _stub(cmd, cwd=None, **kwargs):  # noqa: ARG001
+    async def _stub(cmd, cwd=None, **kwargs):
         return 0, head + '\n', ''
 
     return _stub
@@ -488,7 +488,7 @@ def _make_silent_steward() -> type:
     class _FakeSteward:
         instances: list[_FakeSteward] = []
 
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
             self.started = False
@@ -553,7 +553,7 @@ def _make_terminal_decision_steward(
     class _FakeSteward:
         instances: list[_FakeSteward] = []
 
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
             self.started = False
@@ -622,7 +622,7 @@ def _make_chained_gating_steward(queue: EscalationQueue, task_id: str) -> type:
     class _FakeSteward:
         instances: list[_FakeSteward] = []
 
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
             self.started = False
@@ -683,7 +683,7 @@ def _make_journalling_resolving_steward(
     tail rebases and verifies in.
     """
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 
@@ -748,7 +748,7 @@ def _make_chained_l2_steward(
     class _FakeSteward:
         instances: list[_FakeSteward] = []
 
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
             self.started = False

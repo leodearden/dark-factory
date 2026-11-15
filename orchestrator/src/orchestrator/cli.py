@@ -636,7 +636,7 @@ def check_config(config_path: Path | None):
     # findings" rather than taking check-config down with it.
     try:
         findings = audit_census_ignore_entries(config_path)
-    except Exception as exc:  # noqa: BLE001 — reported, never swallowed
+    except Exception as exc:  # reported, never swallowed
         click.echo(f'WARNING: ignore-entry audit failed ({exc}) — skipped.', err=True)
         findings = []
 

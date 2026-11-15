@@ -96,7 +96,7 @@ from fused_memory.backends.mem0_client import (
     DEFAULT_SCROLL_MAX_PAGES,
     ScrollPageBudgetExhausted,
 )
-from fused_memory.maintenance.cross_graph_move import (  # noqa: F401
+from fused_memory.maintenance.cross_graph_move import (
     SubgraphEdgeResult,
     create_moved_episode,
     create_moved_node,
@@ -759,7 +759,7 @@ async def merge_collection(
     idiom). Every branch leaves the source in place; only the budget branch
     advises raising the budget.
     """
-    from qdrant_client.http import models as qmodels  # noqa: PLC0415
+    from qdrant_client.http import models as qmodels
 
     points_upserted = 0
     chunk: list = []
@@ -1239,12 +1239,12 @@ def main() -> int:
     args = _build_parser().parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.services.memory_service import MemoryService
 
         config = FusedMemoryConfig()
         memory = MemoryService(config)

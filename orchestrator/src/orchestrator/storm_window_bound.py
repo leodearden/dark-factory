@@ -351,7 +351,7 @@ def observed_storm_window_inputs(db_path: Path | str) -> StormWindowSample | Non
         return None
 
     from orchestrator.agents.roles import STEWARD
-    from orchestrator.harness import _BY_DESIGN_RESTORE_OUTCOMES  # noqa: PLC0415
+    from orchestrator.harness import _BY_DESIGN_RESTORE_OUTCOMES
 
     carved = sorted(_BY_DESIGN_RESTORE_OUTCOMES)
     threshold = datetime.now(UTC) - timedelta(days=SAMPLE_WINDOW_DAYS)

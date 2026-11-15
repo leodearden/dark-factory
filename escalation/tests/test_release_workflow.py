@@ -468,7 +468,7 @@ async def test_release_workflow_real_slot_exit_parks_blocked(
     - parked='blocked' (scheduler.get_status='in-progress' → parked to blocked)
     - scheduler.set_task_status called once with (tid, 'blocked')
     """
-    from unittest.mock import MagicMock, patch  # noqa: PLC0415
+    from unittest.mock import MagicMock, patch
 
     from orchestrator.harness import Harness  # type: ignore[reportMissingImports]
     from orchestrator.scheduler import TaskAssignment  # type: ignore[reportMissingImports]

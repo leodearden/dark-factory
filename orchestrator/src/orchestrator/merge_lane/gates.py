@@ -1853,7 +1853,7 @@ async def resolve_already_landed_branch(
         )
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             'already-landed: probe raised for task_id=%s branch=%s — failing '
             'closed (the unchanged plan_files_not_touched path runs)',

@@ -1023,7 +1023,7 @@ class TaskInterceptor:
                 exists=self._consolidation_exists,
                 project_id=project_id,
             )
-        except Exception as exc:  # noqa: BLE001 — every failure is a refusal
+        except Exception as exc:  # every failure is a refusal
             logger.warning(
                 'consolidation closure scroll or probe failed for task=%s '
                 'topic=%s: %s; REFUSING the done transition (fail-closed)',

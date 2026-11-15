@@ -258,7 +258,7 @@ class LinkHealStore:
         }
         try:
             reply = await self._call_tool(WRITE_TOOL, arguments)
-        except Exception as exc:  # noqa: BLE001 -- a raised write is a failed write
+        except Exception as exc:  # a raised write is a failed write
             return WriteReply(landed=False, error_type=type(exc).__name__, error=str(exc))
         return _write_reply(reply)
 
@@ -267,7 +267,7 @@ class LinkHealStore:
     ) -> dict[str, Any]:
         try:
             reply = await self._call_tool(tool, arguments)
-        except Exception as exc:  # noqa: BLE001 -- unknown is not absent
+        except Exception as exc:  # unknown is not absent
             raise StoreReadFailed(tool, memory_id, type(exc).__name__, str(exc)) from exc
         if reply is None:
             raise StoreReadFailed(tool, memory_id, 'NoReply', 'the server sent no tool reply')
@@ -367,5 +367,5 @@ class QdrantLinkCensus:
                 async for point in points
                 if created_in is None or created_in.admits(point.payload or {})
             ]
-        except Exception as exc:  # noqa: BLE001 -- a partial census is no census
+        except Exception as exc:  # a partial census is no census
             raise CensusFailed(project_id, type(exc).__name__, str(exc)) from exc

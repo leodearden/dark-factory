@@ -2033,8 +2033,8 @@ async def _setup_curator_usage_gate(
     if config.usage_cap is None or not config.usage_cap.enabled:
         return (None, None)
 
-    from shared.cost_store import CostStore  # noqa: PLC0415
-    from shared.usage_gate import UsageGate  # noqa: PLC0415
+    from shared.cost_store import CostStore
+    from shared.usage_gate import UsageGate
 
     db_path = _resolve_curator_cost_store_path(config)
     curator_cost_store = CostStore(db_path)

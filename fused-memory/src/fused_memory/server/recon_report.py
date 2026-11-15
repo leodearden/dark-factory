@@ -2973,11 +2973,11 @@ class ReconReportState:
         if self._memory_service is None:
             return _ERR_SERVICE_UNAVAILABLE.copy()
 
-        from fused_memory.reconciliation.standing_decision_writer import (  # noqa: PLC0415
+        from fused_memory.reconciliation.standing_decision_writer import (
             EvidenceGateRejected,
             LedgerUnavailable,
         )
-        from fused_memory.reconciliation.standing_decision_writer import (  # noqa: PLC0415
+        from fused_memory.reconciliation.standing_decision_writer import (
             write_entity_standing_decision as _write_helper,
         )
 

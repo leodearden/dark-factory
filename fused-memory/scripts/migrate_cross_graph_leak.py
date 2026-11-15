@@ -969,8 +969,8 @@ async def build_memory_service(args: Any, config: Any) -> Any:
     and initialize the full ``MemoryService``, unskipped, exactly as
     before.
     """
-    from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.backends.graphiti_client import GraphitiBackend
+    from fused_memory.services.memory_service import MemoryService
 
     if not args.apply:
         backend = GraphitiBackend(config)
@@ -1025,11 +1025,11 @@ def main() -> int:
     args = build_arg_parser().parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         config = FusedMemoryConfig()
         built = await build_memory_service(args, config)

@@ -134,7 +134,7 @@ async def _derive_analytics(
     """
     try:
         pins = await fetch_pins_recovery(client, config.escalation_urls)
-    except Exception as exc:  # noqa: BLE001 — the tab must survive this
+    except Exception as exc:  # the tab must survive this
         logger.warning('pins_recovery fan-out failed (analytics served unannotated): %s', exc)
         pins = None
     return await asyncio.to_thread(build_escalation_analytics, corpus, pins_by_project=pins)

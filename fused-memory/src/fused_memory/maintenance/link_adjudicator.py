@@ -273,7 +273,7 @@ async def _judge_chunk(
 async def _ask(ask: ShardAsker, shard: Shard) -> ShardReply:
     try:
         return await ask(shard)
-    except Exception as exc:  # noqa: BLE001 — any asker fault fails its shard, never the run
+    except Exception as exc:  # any asker fault fails its shard, never the run
         return ShardReply(success=False, detail=f'{type(exc).__name__}: {exc}')
 
 
@@ -411,7 +411,7 @@ class ClaudeShardAsker:
                 timeout_seconds=self._timeout_seconds,
                 cap_wait_sanity_secs=_CAP_WAIT_SANITY_SECONDS,
             )
-        except Exception as exc:  # noqa: BLE001 — a failed call is a failed shard
+        except Exception as exc:  # a failed call is a failed shard
             return ShardReply(success=False, detail=f'{type(exc).__name__}: {exc}')
         return _shard_reply(result)
 

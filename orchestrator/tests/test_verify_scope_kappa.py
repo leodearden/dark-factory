@@ -47,7 +47,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _verify_config_corpus import ROOT_LINT_COMMAND, ROOT_TYPE_CHECK_COMMAND
 from test_verify import _canned_passing_result, _real_worktree_reader, _write_guard_script
-from test_verify_plan import (  # noqa: F401 — reused by this module's byte-identical goldens (steps 3/7/9)
+from test_verify_plan import (  # reused by this module's byte-identical goldens (steps 3/7/9)
     DATA_MODULE_DIFF,
     ROOT_CONFTEST_DIFF,
 )

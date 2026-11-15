@@ -164,7 +164,7 @@ def load_vocabulary(*, path: Path = _VOCABULARY_MODULE) -> dict[str, frozenset[s
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-    except Exception as exc:  # noqa: BLE001 — re-raised as a named guard failure
+    except Exception as exc:  # re-raised as a named guard failure
         raise AssertionError(
             f"the merge-state vocabulary module {path} could not be executed (task "
             f"4829): {type(exc).__name__}: {exc}. It is loaded by absolute path under "

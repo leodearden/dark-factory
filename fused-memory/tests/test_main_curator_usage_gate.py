@@ -125,7 +125,7 @@ def test_resolve_curator_escalator_state_path(reconciliation_cfg, expected):
     """Path helper returns correct state-file path based on reconciliation config."""
     # Lazy import so a missing helper produces a test failure, not a module
     # import error that would break ALL tests in this file.
-    from fused_memory.server.main import _resolve_curator_escalator_state_path  # noqa: PLC0415
+    from fused_memory.server.main import _resolve_curator_escalator_state_path
 
     config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
     config.reconciliation = reconciliation_cfg
@@ -153,7 +153,7 @@ class TestCuratorUsageGateLeakGuard:
         """
         # Lazy import — ImportError here until step-2 adds the helper; that is
         # the expected "red" state for this TDD step.
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
         usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
@@ -204,8 +204,8 @@ class TestCuratorUsageGateLeakGuard:
         neither cleanup runs — this test will FAIL until step-2 folds the log
         call into the guarded block.
         """
-        import fused_memory.server.main as main_module  # noqa: PLC0415
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        import fused_memory.server.main as main_module
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
         usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
@@ -264,7 +264,7 @@ class TestCuratorUsageGateLeakGuard:
     @pytest.mark.asyncio
     async def test_setup_returns_store_and_gate_on_success(self, tmp_path):
         """Happy path: helper returns both open store and gate; store stays open."""
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
         usage_cap_cfg = UsageCapConfig(
@@ -293,9 +293,9 @@ class TestCuratorUsageGateLeakGuard:
 
     def test_setup_returns_none_when_usage_cap_is_none(self):
         """Helper returns (None, None) immediately when config.usage_cap is None."""
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.usage_cap = None
@@ -306,9 +306,9 @@ class TestCuratorUsageGateLeakGuard:
 
     def test_setup_returns_none_when_usage_cap_disabled(self):
         """Helper returns (None, None) immediately when usage_cap.enabled is False."""
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.usage_cap = UsageCapConfig(enabled=False)
@@ -328,7 +328,7 @@ class TestCuratorUsageGateLeakGuard:
         WAL background thread after the with block exits (where patches are
         gone and the real close is available again).
         """
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         acct_cfg = AccountConfig(name='acct-a', oauth_token_env='TEST_TOKEN_ACCT_A')
         usage_cap_cfg = UsageCapConfig(accounts=[acct_cfg], wait_for_reset=False)
@@ -412,7 +412,7 @@ class TestCuratorRunId:
 
     @pytest.mark.asyncio
     async def test_minted_run_id_names_the_fused_memory_process(self, tmp_path):
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         with patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}):
             store, gate = await _setup_curator_usage_gate(_enabled_cap_config(tmp_path))
@@ -428,7 +428,7 @@ class TestCuratorRunId:
 
     @pytest.mark.asyncio
     async def test_explicit_run_id_is_carried_by_the_gate(self, tmp_path):
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         opened: list[tuple[CostStore | None, UsageGate | None]] = []
         try:
@@ -447,7 +447,7 @@ class TestCuratorRunId:
 
     @pytest.mark.asyncio
     async def test_gate_account_events_carry_the_run_id(self, tmp_path):
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         with patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}):
             store, gate = await _setup_curator_usage_gate(_enabled_cap_config(tmp_path))
@@ -469,7 +469,7 @@ class TestCuratorRunId:
 
     @pytest.mark.asyncio
     async def test_disabled_cap_with_run_id_allocates_nothing(self):
-        from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
+        from fused_memory.server.main import _setup_curator_usage_gate
 
         config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         config.usage_cap = UsageCapConfig(enabled=False)

@@ -1035,7 +1035,7 @@ def _stub_old_carries_substrate_probe(h) -> None:
     dispatch gate run unconditionally and mask the defect — hence the explicit
     ``side_effect`` rather than a bare mock.
     """
-    from orchestrator.substrate_gate import extract_probe_set  # noqa: PLC0415
+    from orchestrator.substrate_gate import extract_probe_set
     h.scheduler.carries_substrate_probe = MagicMock(
         side_effect=lambda t: extract_probe_set(t) is not None
     )
@@ -1062,7 +1062,7 @@ class TestRunSlotSubstrateFailClosed:
         self, tmp_path: Path, *, task_id: str, metadata: dict,
     ) -> None:
         """Shared body for the two malformed-descriptor cases (a) and (b)."""
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         h = _make_slot_harness(tmp_path)
         _stub_old_carries_substrate_probe(h)
@@ -1119,7 +1119,7 @@ class TestRunSlotSubstrateFailClosed:
     @pytest.mark.asyncio
     async def test_no_probe_key_allows_dispatch(self, tmp_path: Path):
         """(c) companion: no substrate_probe key at all — dispatch proceeds normally."""
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         h = _make_slot_harness(tmp_path)
         _stub_old_carries_substrate_probe(h)

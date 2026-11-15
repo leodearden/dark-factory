@@ -861,7 +861,7 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
 
     def test_iter_leaves_yields_the_map_as_exactly_one_whole_leaf(self):
         """Not one leaf per category — the map reloads all-or-nothing."""
-        from fused_memory.config.reload import _iter_leaves  # noqa: PLC0415
+        from fused_memory.config.reload import _iter_leaves
 
         config = FusedMemoryConfig()
         object.__setattr__(config.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
@@ -900,7 +900,7 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
         calibrated it stopped deriving a cutoff for it — a stale number
         outliving its own evidence.
         """
-        from fused_memory.config.reload import apply_reload  # noqa: PLC0415
+        from fused_memory.config.reload import apply_reload
 
         live = FusedMemoryConfig()
         fresh = FusedMemoryConfig()
