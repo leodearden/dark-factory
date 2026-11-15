@@ -46,7 +46,8 @@ And `fake_recorder` / `fake_systemctl` (task 5285): an executable that records
 each call's argv and environment, replacing the private recorder and fake-`uv`
 copies in the flag-marker and reclaim wrapper suites, and a fake `systemctl`
 modelling the verbs the timer installers call, replacing the installer suites'
-private copies.
+private copies. Its `unit_values` reads a committed systemd unit's directives
+through the production parser, replacing those suites' hand-rolled parsers.
 """
 import json
 import os
@@ -89,6 +90,8 @@ if str(_THIS_DIR) not in sys.path:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
+
+import systemd_unit_parity  # noqa: E402
 
 from df_pytest_isolation import (  # noqa: E402
     _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
@@ -1066,3 +1069,26 @@ def fake_systemctl(tmp_path):
     fake.path.chmod(0o755)
     fake.reset()
     return fake
+
+
+# ---------------------------------------------------------------------------
+# Committed systemd unit reader (task 5285).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def unit_values():
+    """``values(path, section, key)``: every value *key* takes under ``[section]``.
+
+    Installer suites assert on a committed unit's directives through this
+    rather than on raw substrings, which cannot tell a live directive from the
+    comment that explains it. It returns a list, not a scalar, so ``== ['x']``
+    also pins "declared exactly once": a second ``OnCalendar=`` is an extra
+    firing. The parsing rules are the production parser's,
+    ``scripts/systemd_unit_parity.py::parse_unit_directives``.
+    """
+    def values(path: Path, section: str, key: str) -> list[str]:
+        directives = systemd_unit_parity.parse_unit_directives(path.read_text(encoding='utf-8'))
+        return directives.get(section, {}).get(key, [])
+
+    return values
