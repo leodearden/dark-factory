@@ -25,8 +25,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _fake_systemd_run import fake_systemd_run as fake_systemd_run
 from _merge_lane_fakes import FakeVerifier, VerifyScript
+from _real_project_slice import RealProjectSlice
+from _real_project_slice import real_project_slice as real_project_slice
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import FusedMemoryConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.merge_lane.worker import (
     TRANSIENT_INFRA_REASON_PREFIX,
     _DryRunInvestigationHandles,
@@ -186,12 +188,21 @@ class TestRefusalReasonDoesNotMatter:
 
 
 async def _verify_test_leg_only(
-    worktree: Path, test_command: str, **run_kwargs,
+    worktree: Path, test_command: str, *, project_id: str | None = None, **run_kwargs,
 ) -> VerifyResult:
-    """A scoped role='task' verify of module ``pkg`` with no lint or type leg."""
+    """A scoped role='task' verify of module ``pkg`` with no lint or type leg;
+    *project_id*, when given, names the project slice its scope spawns under."""
+    config = (
+        OrchestratorConfig(verify_use_cgroup_scope=True)
+        if project_id is None
+        else OrchestratorConfig(
+            verify_use_cgroup_scope=True,
+            fused_memory=FusedMemoryConfig(project_id=project_id),
+        )
+    )
     return await run_verification(
         worktree,
-        OrchestratorConfig(verify_use_cgroup_scope=True),
+        config,
         module_config=ModuleConfig(
             prefix='pkg', test_command=test_command,
             lint_command=None, type_check_command=None,
@@ -318,8 +329,12 @@ def _systemd_user_available() -> bool:
 class TestRealLauncher:
 
     @pytest.mark.asyncio
-    async def test_started_scope_keeps_its_own_verdict(self, worktree):
-        result = await _verify_test_leg_only(worktree, 'exit 3')
+    async def test_started_scope_keeps_its_own_verdict(
+        self, worktree, real_project_slice: RealProjectSlice,
+    ):
+        result = await _verify_test_leg_only(
+            worktree, 'exit 3', project_id=real_project_slice.project_id,
+        )
         assert result.passed is False
         assert result.category != FailureCategory.ENV_TRANSIENT, result.summary
 

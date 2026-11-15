@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from orchestrator.event_store import EventStore
     from orchestrator.git_ops import GitOps, WorktreeKind
 
+from shared.cgroup_slice import project_slice_name
 from shared.proc_group import terminate_process_group
 from shared.psi import cpu_some10_or_none, read_psi_sample
 from shared.python_env import without_python_env_selection
@@ -5999,6 +6000,7 @@ class _ScopeKw(TypedDict, total=False):
 
     use_cgroup_scope: bool
     scope_tag: str
+    slice_name: str
     cpu_weight: int
     memory_properties: tuple[str, ...]
 
@@ -6154,16 +6156,21 @@ def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: fl
 
 def _scope_launch_argv(
     scope_unit: str,
+    slice_name: str | None,
     cpu_weight: int | None,
     memory_properties: tuple[str, ...] = (),
 ) -> list[str]:
-    """The systemd-run prefix for a verify scope; CPUWeight is the between-cgroup
+    """The systemd-run prefix for a verify scope. *slice_name* is the project's
+    parent cgroup (contract: docs/cgroup-slice-topology.md; None leaves the
+    scope in the user manager's default slice); CPUWeight is the between-cgroup
     share (nice only orders threads inside the scope), and *memory_properties*
     are the scope's memory limits (an empty tuple adds none)."""
     argv = [
         'systemd-run', '--user', '--scope', '--quiet', '--collect',
         f'--unit={scope_unit}',
     ]
+    if slice_name is not None:
+        argv.append(f'--slice={slice_name}')
     if cpu_weight is not None:
         argv += ['-p', f'CPUWeight={cpu_weight}']
     for prop in memory_properties:
@@ -6248,6 +6255,7 @@ async def _run_cmd(
     *,
     use_cgroup_scope: bool = False,
     scope_tag: str = '',
+    slice_name: str | None = None,
     cpu_weight: int | None = None,
     memory_properties: tuple[str, ...] = (),
     clock_stop: ClockStopConfig | None = None,
@@ -6275,7 +6283,8 @@ async def _run_cmd(
     flag is off or ``systemd-run`` is missing, so the default behaviour and the
     existing test suite are unchanged. When *cpu_weight* is not None the scope
     is created with ``-p CPUWeight=<cpu_weight>``; None omits the property
-    (systemd default). Each *memory_properties* entry is added as
+    (systemd default). ``--slice=<slice_name>`` places the scope under the
+    project slice, and None omits it. Each *memory_properties* entry is added as
     ``-p <entry>``; the default ``()`` adds none.
 
     When *log_path* is provided, subprocess output is streamed (read in 4 KiB
@@ -6375,7 +6384,7 @@ async def _run_cmd(
             handshake = ScopeLaunchHandshake()
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    *_scope_launch_argv(scope_unit, cpu_weight, memory_properties),
+                    *_scope_launch_argv(scope_unit, slice_name, cpu_weight, memory_properties),
                     '/bin/bash', '-c', handshake.payload(cmd),
                     cwd=str(cwd),
                     stdout=asyncio.subprocess.PIPE,
@@ -7861,6 +7870,7 @@ async def run_verification(
                 {
                     'use_cgroup_scope': True,
                     'scope_tag': _scope_tag_for(config.project_root),
+                    'slice_name': project_slice_name(config.fused_memory.project_id),
                     'cpu_weight': _resolve_scope_cpu_weight(config, role),
                     'memory_properties': config.verify_cgroup_memory.systemd_properties(),
                 }

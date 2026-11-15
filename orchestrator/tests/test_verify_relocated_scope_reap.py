@@ -27,9 +27,16 @@ from pathlib import Path
 import pytest
 from _fake_systemd_run import fake_systemd_run as fake_systemd_run
 from _fake_systemd_run import recorded_scope_spawns
+from _real_project_slice import RealProjectSlice
+from _real_project_slice import real_project_slice as real_project_slice
 from shared.proc_group import read_stat_fields
 
-from orchestrator.config import CpuGovernConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.config import (
+    CpuGovernConfig,
+    FusedMemoryConfig,
+    ModuleConfig,
+    OrchestratorConfig,
+)
 from orchestrator.verify import run_verification
 
 _PROC = Path('/proc')
@@ -229,6 +236,7 @@ class TestRealGovernedMergeLeg:
     @pytest.mark.asyncio
     async def test_timed_out_governed_merge_leg_leaves_no_survivors(
         self, worktree, governed_slice, marker, tmp_path,
+        real_project_slice: RealProjectSlice,
     ):
         try:
             relocates = _nested_scope_relocates()
@@ -240,6 +248,7 @@ class TestRealGovernedMergeLeg:
         config = OrchestratorConfig(
             verify_use_cgroup_scope=True,
             cpu_governance=CpuGovernConfig(enabled=True, exec_path=str(governed)),
+            fused_memory=FusedMemoryConfig(project_id=real_project_slice.project_id),
         )
         # `& wait` keeps bash as the session leader, so GNU timeout's setpgid
         # really leaves the spawn process group.
