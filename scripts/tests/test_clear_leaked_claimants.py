@@ -679,8 +679,8 @@ class TestHolderPreflight:
     def test_a_selected_row_sharing_a_key_with_another_holder_refuses(self, seed_root, named):
         root = seed_root(TIER_TABLE_ROWS)
         _write_scheduler_state(root, json.dumps({
-            'current_holders': {'OPERATIONS.md': named},
-            'held_by_task': {'4028': ['OPERATIONS.md'], '7777': ['OPERATIONS.md']},
+            'current_holders': {'docs/shared.md': named},
+            'held_by_task': {'4028': ['docs/shared.md'], '7777': ['docs/shared.md']},
             'parks': {},
         }))
         server = _FakeClaimantServer()

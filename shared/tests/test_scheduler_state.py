@@ -228,8 +228,8 @@ class TestRollingRestart:
 class TestHolderTaskIds:
     def test_every_holder_of_a_shared_key_is_named(self) -> None:
         snap = SchedulerStateSnapshot.from_json({
-            'current_holders': {'OPERATIONS.md': 'B'},
-            'held_by_task': {'A': ['OPERATIONS.md'], 'B': ['OPERATIONS.md']},
+            'current_holders': {'docs/shared.md': 'B'},
+            'held_by_task': {'A': ['docs/shared.md'], 'B': ['docs/shared.md']},
         })
         assert snap.holder_task_ids() == frozenset({'A', 'B'})
 
