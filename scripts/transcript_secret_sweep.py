@@ -6,7 +6,9 @@ factory project it walks the agent-transcript archive (``*.jsonl``, including
 archive staging copies a hard kill stranded), the verify logs and the
 offline-lane logs (``LOG_SUFFIXES``: ``*.log``, ``*.json``, junit ``*.xml``
 and gzipped junit ``*.xml.gz``), and it walks ``~/.claude/projects`` for
-transcripts. Gzipped junit is redacted by decompressing, replacing and
+transcripts. A ``*.log`` is matched for the raw value as well as its
+JSON-escaped form; transcripts and ``*.json`` for the JSON-escaped form only.
+Gzipped junit is redacted by decompressing, replacing and
 recompressing it, and XML gets an entity-escaped placeholder so a report still
 parses; a ``.gz`` that does not decompress is reported unreadable and left as
 found. It matches the values its OWN environment holds (the wrapper sources
@@ -76,6 +78,7 @@ LOG_SUFFIXES = ('.log', '.json', '.xml', '.xml.gz')
 _FORMATS: tuple[tuple[str, Markup, Codec], ...] = (
     ('.xml.gz', Markup.XML, Codec.GZIP),
     ('.xml', Markup.XML, Codec.PLAIN),
+    ('.log', Markup.TEXT, Codec.PLAIN),
 )
 
 PostEscalation = Callable[[dict[str, object]], object]
@@ -160,7 +163,7 @@ def run(
 ) -> SweepResult:
     secrets = secret_env_values(environ)
     needles = {markup: redaction_needles(secrets, markup=markup) for markup in Markup}
-    if not needles[Markup.TEXT]:
+    if not needles[Markup.JSON]:
         return SweepResult(ok=False, cause=NO_SECRETS_CAUSE)
     result = _scan(config, needles)
     if not (result.redacted or result.refused):
@@ -222,7 +225,7 @@ def _format_of(name: str) -> tuple[Markup, Codec]:
     for suffix, markup, codec in _FORMATS:
         if name.endswith(suffix):
             return markup, codec
-    return Markup.TEXT, Codec.PLAIN
+    return Markup.JSON, Codec.PLAIN
 
 
 def _sweep_file(path: Path, needles: NeedlesByMarkup, cutoff_ns: int) -> FileRedaction | _Verdict:

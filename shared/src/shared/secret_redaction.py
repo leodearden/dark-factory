@@ -3,7 +3,8 @@
 Callers pass ``{var: value}``; which variables hold secrets is
 ``shared.secret_env``'s question, not this module's. A value is matched in the
 escaped form it takes in the file's ``Markup``: JSON-string-escaped inside a
-JSONL or text line, or XML-escaped inside a report. It is replaced by
+JSONL line, raw or JSON-string-escaped inside a plain text log, or XML-escaped
+in a report's text and attribute values. It is replaced by
 ``<redacted:VAR>`` right-padded with ``x`` to the same byte length, so a file
 keeps its size and line count; in XML the label is entity-escaped
 (``&lt;redacted:VAR&gt;``) and never cut mid-entity, so a report stays
@@ -46,7 +47,6 @@ __all__ = [
     'RedactionError',
     'RedactionWouldCorruptJson',
     'RefusedLine',
-    'copy_redacted',
     'file_stamp',
     'redact_in_place',
     'redaction_needles',
@@ -59,9 +59,11 @@ _DETECT_CHUNK_BYTES = 1 << 20
 StrPath = str | os.PathLike[str]
 
 _XML_QUOTE_ENTITIES = MappingProxyType({'"': '&quot;', "'": '&apos;'})
+_XML_ATTRIBUTE_ENTITIES = MappingProxyType({'"': '&quot;', '\r': '&#13;', '\n': '&#10;', '\t': '&#09;'})
 
 
 class Markup(enum.Enum):
+    JSON = 'json'
     TEXT = 'text'
     XML = 'xml'
 
@@ -134,7 +136,7 @@ class CorruptCompressedFile(RedactionError):
 
 
 def redaction_needles(
-    secrets: Mapping[str, str], *, markup: Markup = Markup.TEXT
+    secrets: Mapping[str, str], *, markup: Markup = Markup.JSON
 ) -> tuple[Needle, ...]:
     rules = _MARKUP_RULES[markup]
     by_pattern: dict[bytes, Needle] = {}
@@ -149,15 +151,6 @@ def redaction_needles(
 
 def file_stamp(path: StrPath) -> FileStamp:
     return _stamp_of(os.stat(path))
-
-
-def copy_redacted(src: StrPath, dest: StrPath, needles: Sequence[Needle]) -> FileRedaction:
-    try:
-        with open(src, 'rb') as reader, open(dest, 'wb') as writer:
-            return _copy_lines(reader, writer, needles)
-    except BaseException:
-        Path(dest).unlink(missing_ok=True)
-        raise
 
 
 def redact_in_place(
@@ -198,8 +191,17 @@ def _json_escaped_forms(value: str) -> tuple[str, ...]:
     return tuple(json.dumps(value, ensure_ascii=ascii_only)[1:-1] for ascii_only in (True, False))
 
 
+def _raw_and_json_escaped_forms(value: str) -> tuple[str, ...]:
+    return (value, *_json_escaped_forms(value))
+
+
 def _xml_escaped_forms(value: str) -> tuple[str, ...]:
-    return (value, xml_escape(value), xml_escape(value, _XML_QUOTE_ENTITIES))
+    return (
+        value,
+        xml_escape(value),
+        xml_escape(value, _XML_QUOTE_ENTITIES),
+        xml_escape(value, _XML_ATTRIBUTE_ENTITIES),
+    )
 
 
 def _text_placeholder(var: str, length: int) -> bytes:
@@ -220,7 +222,8 @@ class _MarkupRules:
 
 
 _MARKUP_RULES: Mapping[Markup, _MarkupRules] = MappingProxyType({
-    Markup.TEXT: _MarkupRules(_json_escaped_forms, _text_placeholder),
+    Markup.JSON: _MarkupRules(_json_escaped_forms, _text_placeholder),
+    Markup.TEXT: _MarkupRules(_raw_and_json_escaped_forms, _text_placeholder),
     Markup.XML: _MarkupRules(_xml_escaped_forms, _xml_placeholder),
 })
 

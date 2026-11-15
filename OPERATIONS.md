@@ -3981,7 +3981,10 @@ everything already on disk.
   full tree list is `scripts/transcript_secret_sweep.py::swept_trees`.
 - **What it matches.** Only the live values the sweep's own environment holds.
   The wrapper sources the repo `.env` for them. It never matches a token-shaped
-  pattern. Each hit is replaced in place, by the 2026-10-11 method: a
+  pattern. A value is matched in the form the file holds it: JSON-escaped in
+  `*.jsonl` and `*.json`, raw or JSON-escaped in a `*.log`, and entity-escaped
+  in junit text and attribute values. Each hit is replaced in place, by the
+  2026-10-11 method: a
   `<redacted:VAR>` placeholder padded with `x` to the same length, mode and
   mtime kept, no backup. In XML the placeholder is entity-escaped
   (`&lt;redacted:VAR&gt;`), so a junit report still parses and reads as

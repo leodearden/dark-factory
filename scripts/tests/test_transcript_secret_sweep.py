@@ -274,6 +274,25 @@ def test_a_corrupt_gzipped_report_is_reported_unreadable_and_its_siblings_are_st
     assert result.record()['unreadable'] == [str(corrupt)]
 
 
+def test_a_plain_log_is_matched_for_the_raw_value_and_a_transcript_only_for_its_json_escape(tmp_path):
+    value = 'ab"cd\\ef' + 'Zz' * 15
+    project = tmp_path / 'proj'
+    log = _write(offline_lane_dir(project) / 'p1' / 'detect.log', [f'E   AssertionError: token={value}'])
+    transcript = _write(agent_transcripts_dir(project) / '7001' / '-enc' / 'sid.jsonl', [_line_with(value)])
+    raw_in_transcript = _write(agent_transcripts_dir(project) / '7002' / '-enc' / 'sid.jsonl', [f'token={value}'])
+    untouched = raw_in_transcript.read_bytes()
+    config = sweep.SweepConfig(trees=sweep.swept_trees([project], tmp_path / 'no-claude'), now=NOW)
+
+    result = sweep.run(config, environ={'CLAUDE_OAUTH_TOKEN_B': value}, post_escalation=Recorder())
+
+    assert {hit.path: dict(hit.counts) for hit in result.redacted} == {
+        log: {'CLAUDE_OAUTH_TOKEN_B': 1},
+        transcript: {'CLAUDE_OAUTH_TOKEN_B': 1},
+    }
+    assert value.encode() not in log.read_bytes()
+    assert raw_in_transcript.read_bytes() == untouched
+
+
 def test_one_sweep_redacts_every_live_value_and_files_one_escalation(tree):
     before = {path: path.stat() for path in tree.files()}
     lines = {path: len(path.read_bytes().splitlines()) for path in tree.files()}
