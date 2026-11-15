@@ -476,6 +476,33 @@ def _converted_from(rows: Sequence[liveness.TaskRow], ids: frozenset[str]) -> tu
     )
 
 
+@dataclass(frozen=True)
+class FindingHomes:
+    """The tasks that answer one finding: those carrying its key, and those converted from its escalations."""
+
+    carrying: tuple[liveness.TaskRow, ...]
+    converted: tuple[liveness.TaskRow, ...]
+
+    def latest_task_id(self) -> int:
+        """The newest home, which a re-raise names.
+
+        A task converted from a re-raise naming N is created after N, so it is
+        the one named once it closes in turn, and no two re-raises share a title.
+        """
+        rows = (*self.carrying, *self.converted)
+        if not rows:
+            raise ValueError('a finding with no home task has no closed home to name')
+        return max(row.id for row in rows)
+
+
+def finding_homes(key: FindingKey, store: _StoreHomes, filed: frozenset[str]) -> FindingHomes:
+    """*key*'s homes in *store*, where *filed* is every escalation id ever filed under *key*."""
+    carrying = tuple(
+        row for row in store.carriers if FindingKey.from_record(row.metadata.get(FINDING_KEY_FIELD)) == key
+    )
+    return FindingHomes(carrying, _converted_from(store.conversions, filed))
+
+
 def _result_strings(answer: Mapping[str, object], tool: str, field: str) -> frozenset[str]:
     """Every record's str *field* in an escalation read's ``{'result': [...]}`` answer."""
     records = answer.get('result')
@@ -548,30 +575,23 @@ def _any_open(rows: Sequence[liveness.TaskRow]) -> bool:
     return any(row.liveness() is OwnerLiveness.OPEN for row in rows)
 
 
-def decide(
-    key: FindingKey,
-    *,
-    carriers: Sequence[liveness.TaskRow],
-    pending: frozenset[str],
-    converted: Sequence[liveness.TaskRow],
-) -> Action:
+def decide(key: FindingKey, *, homes: FindingHomes, pending: frozenset[str]) -> Action:
     """What to do about *key*: nothing where it is already raised, else raise it once.
 
-    A finding is already raised in three places: a live task among *carriers*
-    holding its key; a pending escalation in its ``task_id`` slot; and a live
-    task among *converted*, the tasks converted from any escalation ever filed
-    in that slot (every sweep escalation is an info L0 the router converts).
-    A dead-owner finding whose home of either kind has closed escalates, and
-    is never re-filed.
+    A finding is already raised in three places: a live task among
+    ``homes.carrying``, holding its key; a pending escalation in its
+    ``task_id`` slot; and a live task among ``homes.converted``, the tasks
+    converted from any escalation ever filed in that slot (every sweep
+    escalation is an info L0 the router converts).  A dead-owner finding whose
+    home of either kind has closed escalates, and is never re-filed.
     """
-    mine = [row for row in carriers if FindingKey.from_record(row.metadata.get(FINDING_KEY_FIELD)) == key]
-    if _any_open(mine):
+    if _any_open(homes.carrying):
         return Action.SKIP_LIVE_TASK
     if key.escalation_task_id() in pending:
         return Action.SKIP_PENDING_ESCALATION
-    if _any_open(converted):
+    if _any_open(homes.converted):
         return Action.SKIP_CONVERTED_TASK
-    if (mine or converted) and key.kind.escalates_when_closed:
+    if (homes.carrying or homes.converted) and key.kind.escalates_when_closed:
         return Action.ESCALATE_CLOSED_FINDING
     if key.scope in (None, INLINE_SCOPE):
         return Action.FILE_TASK
@@ -725,6 +745,24 @@ def _unconfirmed_body(body: _Body, filing: FilingOutcome) -> _Body:
     """*body* plus why its filing is not confirmed, for the escalation that replaces it."""
     why = _curating(filing) if filing.still_curating else _unlanded(filing)
     return dataclasses.replace(body, detail=f'{body.detail}\n{why}', observation=f'{body.observation}; {why}')
+
+
+def _reraised_body(body: _Body, home: int) -> _Body:
+    """*body* raised again after its home task *home* closed with the owner still dead.
+
+    The store's (title, files) candidate_key index covers done rows, and the
+    router titles a conversion with the summary and declares no files, so
+    naming the closed home keeps each re-raise distinct from the task it
+    follows (precedent:
+    ``fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title``).
+    """
+    closed = f'task {home}, which answered this finding, closed while the owner is still dead'
+    return dataclasses.replace(
+        body,
+        summary=f'{body.summary}, after task {home} closed',
+        detail=f'{body.detail}\nRaised again: {closed}.',
+        observation=f'{body.observation}; {closed}',
+    )
 
 
 def _escalate(key: FindingKey, body: _Body, ports: Ports, now: datetime.datetime) -> None:
@@ -882,23 +920,18 @@ class _Outputs:
         self.reports: list[Report] = []
         self.tighten: Performed | None = None
         self.rolled_up = False
-        self._homes: _StoreHomes | None = None
+        self._store: _StoreHomes | None = None
         self._filed_under: dict[FindingKey, frozenset[str]] = {}
 
     def tally(self) -> Tally:
         return Tally(tuple(self.reports), self.tighten, self.rolled_up)
 
-    def _decide(self, key: FindingKey, *, reread: bool) -> Action:
-        if reread or self._homes is None:
-            self._homes = _store_homes(self.ports)
+    def _homes_of(self, key: FindingKey, *, reread: bool) -> FindingHomes:
+        if reread or self._store is None:
+            self._store = _store_homes(self.ports)
         if key not in self._filed_under:
             self._filed_under[key] = escalation_ids_filed_under(self.ports.escalation, key)
-        return decide(
-            key,
-            carriers=self._homes.carriers,
-            pending=frozenset(self.pending),
-            converted=_converted_from(self._homes.conversions, self._filed_under[key]),
-        )
+        return finding_homes(key, self._store, self._filed_under[key])
 
     def raise_finding(self, key: FindingKey, body: _Body) -> Performed:
         """Perform at most one budgeted output for *key*, returning the step taken.
@@ -907,17 +940,21 @@ class _Outputs:
         a finding that ends skipped or held back costs no further store scan.
         A key's escalation history is read once per run: the only escalation
         the run can add to it is its own, which ``pending`` already holds.
+        A closed home is named in its re-raise, read from the act-time homes.
         """
-        if self._decide(key, reread=False) in _SKIPS:
+        if decide(key, homes=self._homes_of(key, reread=False), pending=frozenset(self.pending)) in _SKIPS:
             return Performed.SKIPPED_EXISTING
         if self.budget == 0:
             return Performed.OVERFLOW
-        action = self._decide(key, reread=True)
+        homes = self._homes_of(key, reread=True)
+        action = decide(key, homes=homes, pending=frozenset(self.pending))
         if action in _SKIPS:
             return Performed.SKIPPED_EXISTING
         self.budget -= 1
         if action is Action.FILE_TASK:
             return self._file(key, body)
+        if action is Action.ESCALATE_CLOSED_FINDING:
+            body = _reraised_body(body, homes.latest_task_id())
         self._escalate(key, body)
         return Performed.ESCALATED
 
@@ -1046,16 +1083,11 @@ class RunConfig:
 
 def plan(scan: Scan, ports: Ports) -> Tally:
     """Each citation's planned step as of *scan*, ignoring the output bound; reads only."""
-    homes = _store_homes(ports)
+    store = _store_homes(ports)
 
     def planned(key: FindingKey) -> Action:
-        filed = escalation_ids_filed_under(ports.escalation, key)
-        return decide(
-            key,
-            carriers=homes.carriers,
-            pending=scan.pending,
-            converted=_converted_from(homes.conversions, filed),
-        )
+        homes = finding_homes(key, store, escalation_ids_filed_under(ports.escalation, key))
+        return decide(key, homes=homes, pending=scan.pending)
 
     reports = []
     for citation in scan.register.citations:
