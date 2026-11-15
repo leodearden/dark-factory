@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import re
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -1261,7 +1262,7 @@ class TestRunSlotSubstrateFailClosed:
         l1s = [e for e in pending if e.task_id == task_id and e.level == 1]
         assert len(l1s) == 1, f'Expected exactly 1 L1 escalation for task {task_id}; got {l1s!r}'
         assert l1s[0].category == 'design_concern', f'Expected design_concern, got {l1s[0].category!r}'
-        assert l1s[0].summary.startswith('SUBSTRATE_FLIP'), f'Unexpected summary: {l1s[0].summary!r}'
+        assert l1s[0].summary.startswith('SUBSTRATE_UNVERIFIED'), f'Unexpected summary: {l1s[0].summary!r}'
 
         h.scheduler.release.assert_called_once()  # type: ignore[attr-defined]
         release_call = h.scheduler.release.call_args  # type: ignore[attr-defined]
@@ -1604,3 +1605,148 @@ class TestSubstrateGatePruneChokepoint:
             'worktree must still be cleaned up (remove + chokepoint prune) '
             'so `git worktree add` does not fail with "already exists"'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 8372: an unverifiable recheck files an honest L1, end to end
+# ---------------------------------------------------------------------------
+
+
+async def _init_unborn_repo(repo: Path) -> None:
+    from orchestrator.git_ops import _run
+
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+
+
+def _single_l1(esc_queue, task_id: str):
+    l1s = [e for e in esc_queue.get_pending() if e.task_id == task_id and e.level == 1]
+    assert len(l1s) == 1, f'Expected exactly 1 L1 for task {task_id}; got {l1s!r}'
+    esc = l1s[0]
+    assert esc.category == 'design_concern', esc.category
+    assert esc.severity == 'blocking', esc.severity
+    return esc
+
+
+def _assert_unverified_l1(esc) -> None:
+    summary, detail = esc.summary, esc.detail
+    assert summary.startswith('SUBSTRATE_UNVERIFIED'), summary
+    assert 'PASS→FAIL' not in summary, summary
+    assert 'nothing' in summary, summary
+    assert 'established' in summary, summary
+    assert 'not evidence' in detail.lower(), detail
+    assert 'do not re-spec' in detail.lower(), detail
+    assert 'unblock' in detail, detail
+    assert 'no longer holds' not in detail, detail
+    assert 're-spec required' not in detail, detail
+
+
+def _probe_assignment(task_id: str, checker: list[str]):
+    task = make_probe_task(checker=checker)
+    task['id'] = task_id
+    assignment = MagicMock()
+    assignment.task_id = task_id
+    assignment.task = task
+    return assignment
+
+
+class TestUnverifiableRecheckEscalation:
+    """Task 8372: an unverifiable recheck, end to end.
+
+    Each test drives the REAL ``Harness._run_substrate_gate`` into the REAL
+    ``_block_and_escalate_substrate_flip`` and a REAL ``EscalationQueue``,
+    with a REAL ``GitOps`` on a tmp git repo.  The L1 a recheck that could
+    not run files must claim nothing about the probe set; a real probe
+    failure must still file the PASS→FAIL claim.
+    """
+
+    @staticmethod
+    def _wire(h, tmp_path: Path):
+        from escalation.queue import EscalationQueue
+
+        set_status = AsyncMock()
+        h.scheduler.set_task_status = set_status
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+        return set_status, esc_queue
+
+    @pytest.mark.asyncio
+    async def test_worktree_add_failure_files_unverified_l1(self, tmp_path: Path):
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        # An unborn `main`: resolve_branch_sha returns None, the gate falls
+        # back to the symbolic ref, and the real `git worktree add` fails.
+        await _init_unborn_repo(repo)
+        h = _make_real_git_harness(repo)
+        set_status, esc_queue = self._wire(h, tmp_path)
+
+        allowed = await h._run_substrate_gate(_make_assignment('8372'))
+
+        assert allowed is False
+        set_status.assert_awaited_once_with('8372', 'blocked')
+        esc = _single_l1(esc_queue, '8372')
+        _assert_unverified_l1(esc)
+        assert 'git worktree add failed' in esc.detail, esc.detail
+
+    @pytest.mark.asyncio
+    async def test_recheck_crash_files_unverified_l1(self, tmp_path: Path):
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_gate_repo(repo)
+        h = _make_real_git_harness(repo)
+        set_status, esc_queue = self._wire(h, tmp_path)
+
+        # run_substrate_recheck catches its own subprocess errors, so patching
+        # the public function is the honest way to reach the except branch
+        # (the task 4161 precedent).
+        with patch(
+            'orchestrator.substrate_gate.run_substrate_recheck',
+            side_effect=RuntimeError('checker host vanished'),
+        ):
+            allowed = await h._run_substrate_gate(_make_assignment('8372'))
+
+        assert allowed is False
+        set_status.assert_awaited_once_with('8372', 'blocked')
+        esc = _single_l1(esc_queue, '8372')
+        _assert_unverified_l1(esc)
+        assert 'RuntimeError' in esc.detail, esc.detail
+        assert 'checker host vanished' in esc.detail, esc.detail
+
+    @pytest.mark.asyncio
+    async def test_checker_that_cannot_launch_files_unverified_l1(self, tmp_path: Path):
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_gate_repo(repo)
+        h = _make_real_git_harness(repo)
+        set_status, esc_queue = self._wire(h, tmp_path)
+        assignment = _probe_assignment('8372', [str(tmp_path / 'no-such-checker')])
+
+        allowed = await h._run_substrate_gate(assignment)
+
+        assert allowed is False
+        set_status.assert_awaited_once_with('8372', 'blocked')
+        esc = _single_l1(esc_queue, '8372')
+        _assert_unverified_l1(esc)
+        assert 'rc=99' in esc.detail, esc.detail
+        assert 'No such file or directory' in esc.detail, esc.detail
+
+    @pytest.mark.asyncio
+    async def test_real_probe_failure_still_files_substrate_flip(self, tmp_path: Path):
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        await _init_gate_repo(repo)
+        h = _make_real_git_harness(repo)
+        set_status, esc_queue = self._wire(h, tmp_path)
+        # The probe_set path is appended as an argv the -c script ignores.
+        assignment = _probe_assignment(
+            '8372', [sys.executable, '-c', 'import sys; sys.exit(1)'],
+        )
+
+        allowed = await h._run_substrate_gate(assignment)
+
+        assert allowed is False
+        set_status.assert_awaited_once_with('8372', 'blocked')
+        esc = _single_l1(esc_queue, '8372')
+        assert esc.summary == 'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task 8372)'
+        assert 're-spec required' in esc.detail, esc.detail
