@@ -86,7 +86,7 @@ def test_a_dependency_fan_out_skips_a_module_without_a_type_check(tmp_path: Path
 
 @pytest.mark.parametrize(
     'staged',
-    [['conftest.py'], ['scripts/run.sh'], []],
+    [['skills/x/run.py'], ['scripts/run.sh'], []],
     ids=['py-under-no-module', 'non-py-non-screen', 'nothing-staged'],
 )
 def test_nothing_to_check_is_an_empty_listing(tmp_path: Path, staged: list[str]) -> None:
@@ -228,6 +228,40 @@ def test_an_untriggered_screen_never_reads_the_manifest(tmp_path: Path) -> None:
     assert [unit for unit, _ in run.units] == ['module:scripts:lint', 'module:scripts:type']
 
 
+ROOT_TYPE = 'root:type'
+UNIT_KINDS = ('module', 'root', 'screen')
+
+
+def test_a_staged_root_py_lists_root_type_scoped_to_it(tmp_path: Path) -> None:
+    layout = make_layout(tmp_path)
+    write_file(layout, 'conftest.py')
+
+    run = run_helper(layout, ['conftest.py'])
+
+    assert run.rc == 0, run.stderr
+    _assert_units(run.units, {ROOT_TYPE: 'uv run --project shared pyright conftest.py'})
+
+
+def test_root_type_lists_only_staged_root_files_that_exist(tmp_path: Path) -> None:
+    layout = _screen_layout(tmp_path)
+    write_file(layout, 'df_pytest_isolation.py')
+
+    run = run_helper(layout, ['gone.py', 'df_pytest_isolation.py', 'scripts/foo.py', 'plans/x.md'])
+
+    kinds = [unit.split(':', 1)[0] for unit, _ in run.units]
+    assert run.rc == 0, run.stderr
+    assert dict(run.units).get(ROOT_TYPE) == 'uv run --project shared pyright df_pytest_isolation.py', run.units
+    assert 'module:scripts:lint' in dict(run.units)
+    assert set(kinds) == set(UNIT_KINDS), run.units
+    assert kinds == sorted(kinds, key=UNIT_KINDS.index), run.units
+
+
+def test_a_deleted_root_conftest_lists_nothing(tmp_path: Path) -> None:
+    run = run_helper(make_layout(tmp_path), ['conftest.py'])
+
+    assert (run.rc, run.units) == (0, []), run.stderr
+
+
 def test_the_real_tree_screens_exactly_the_committed_manifest() -> None:
     committed = yaml.safe_load((REPO_ROOT / SCREEN_MANIFEST_REL).read_text(encoding='utf-8'))
 
@@ -269,3 +303,26 @@ def test_every_real_screen_unit_collects_its_node_ids(tmp_path: Path) -> None:
 
     failed = {unit: out[-2000:] for unit, (rc, out) in collected.items() if rc != 0}
     assert failed == {}
+
+
+ROOT_TYPE_TIMEOUT_SECS = 300
+
+
+def test_the_real_tree_type_checks_its_root_python(tmp_path: Path) -> None:
+    """The root:type unit is green on this tree, so no direct commit to main inherits its debt."""
+    run = run_helper(REPO_ROOT, ['conftest.py', 'df_pytest_isolation.py'])
+    command = dict(run.units).get(ROOT_TYPE)
+    assert run.rc == 0, run.stderr
+    assert command == 'uv run --project shared pyright conftest.py df_pytest_isolation.py', run.units
+
+    checked = subprocess.run(
+        ['bash', '-c', command],
+        cwd=REPO_ROOT,
+        env=stub_uv_env(tmp_path, tmp_path / 'uv.log'),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=ROOT_TYPE_TIMEOUT_SECS,
+    )
+
+    assert checked.returncode == 0, checked.stdout[-2000:]
