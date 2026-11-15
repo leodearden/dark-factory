@@ -49,7 +49,9 @@ def det_harness(tmp_path: Path, mock_orch_config) -> Harness:
 
 
 def _store(h: Harness) -> _StoreScheduler:
-    return h.scheduler  # type: ignore[return-value]
+    store = h.scheduler
+    assert isinstance(store, _StoreScheduler)
+    return store
 
 
 def _queue(h: Harness) -> EscalationQueue:
