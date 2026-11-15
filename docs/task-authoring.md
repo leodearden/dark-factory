@@ -1583,8 +1583,8 @@ before_done_verified_pid, files_tagged_at, files_tagged_empty,
 source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
-human_curator_adjudicated_at, last_blocked_at, recurrence,
-execution_class, pure_gate_from, merge_lane, pending_since,
+human_curator_adjudicated_at, last_blocked_at, merge_first_enqueued_at,
+merge_phase_liveness, recurrence, execution_class, pure_gate_from, merge_lane, pending_since,
 pending_since_backfilled, claimant_exception, audit_trail_rotation,
 plan_text_fp, plan_authored_at,
 main_health_signature, superseded_by, cancel_dispositions, trigger_chain,
@@ -2161,15 +2161,30 @@ it. Generalising: prefer blessing when validation is context-dependent, when
 the live corpus already contains values a type would reject, or when the
 apparent enum is not the thing writers are actually held to.
 
-### Known gaps (re-measured 2026-10-02 — none open)
+### Known gaps (re-measured 2026-11-15 — one tracked by a follow-up ticket)
 
-No tracked `unknown_key` source is open. All counts are a snapshot of a
-**growing** corpus, not an invariant: 4748 tasks carried dict metadata at
-the latest corpus-wide measurement
-(2026-08-31), up from 4204 on 2026-08-18 and 3553 when this section was
-first written. Across that corpus 1516 tasks emit at least one
-`unknown_key` line, 3130 lines over 1028 distinct spellings; those are
-untracked Tier-C keys, not gaps this section owns.
+All counts are a snapshot of a **growing** corpus, not an invariant: 9950
+tasks carried dict metadata at the latest corpus-wide measurement
+(2026-11-15, submodel registrations imported), up from 4748 on 2026-08-31
+and 3553 when this section was first written. Across that corpus 1614 tasks
+emit at least one `unknown_key` line, 3416 lines over 1055 distinct
+spellings; most are untracked Tier-C keys, not gaps this section owns.
+
+The largest remaining machine-written `unknown_key` source is the flake
+ledger's `flake_debt_*` keys
+(`orchestrator/src/orchestrator/flake_ledger.py::_deflake_metadata`, 128
+carriers each for `test`, `open_count` and `opened_at`), filed as follow-up
+ticket `tkt_0RX0D4E9Y4DDHGVS4J3MSYFDQP`.
+
+**The merge-lane stamps `merge_first_enqueued_at` and
+`merge_phase_liveness` are CLOSED** — task 5281 blessed both into Tier-A.
+Recorded in the same shape as the rows below so a reader arriving from an
+older revision does not re-open them: the fork was **decided, not
+deferred**. Typing was rejected because `merge_phase_liveness` has no
+reader left, and `x_`-renaming because one key has a live writer and the
+other a live reader. See the frozenset entry in
+`shared/src/shared/task_metadata.py` for the census and the writer/reader
+trail; the figures are not restated here.
 
 **The two rows this table last carried are CLOSED**, recorded in the same
 shape as the `execution_class` row below so a reader arriving from an older
