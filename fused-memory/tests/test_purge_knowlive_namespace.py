@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
+from _graph_access_fake import FakeGraphAccess
 from _store_mutation_preflight_contract import (
     SENTINEL,
     deny,
@@ -121,22 +122,20 @@ class TestEnumerateGraphitiNamespace:
     """Tests for async enumerate_graphiti_namespace(graphiti, namespace, *, limit)."""
 
     @pytest.mark.asyncio
-    async def test_calls_graph_for_with_namespace(self):
-        """graphiti._graph_for is called with the namespace argument."""
-        graphiti = MagicMock()
+    async def test_reads_the_graph_named_by_namespace(self, make_backend, mock_config):
+        """The read goes to the graph wired under the namespace; any other key is unwired."""
         graph = _make_graph_mock([])
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'knowlive': graph}))
 
         await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=1000)
 
-        graphiti._graph_for.assert_called_once_with('knowlive')
+        graph.ro_query.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_uses_ro_query_not_query(self):
+    async def test_uses_ro_query_not_query(self, make_backend, mock_config):
         """Enumeration is read-only: ro_query is used, .query is NEVER called."""
-        graphiti = MagicMock()
         graph = _make_graph_mock([])
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'knowlive': graph}))
 
         await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=1000)
 
@@ -144,16 +143,15 @@ class TestEnumerateGraphitiNamespace:
         graph.query.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_normalizes_rows_to_dicts(self):
+    async def test_normalizes_rows_to_dicts(self, make_backend, mock_config):
         """result_set rows [uuid, labels, name] are normalized to
         [{'uuid','labels','name'}, ...]."""
-        graphiti = MagicMock()
         rows = [
             ['uuid-1', ['Entity'], 'Node A'],
             ['uuid-2', ['Entity', 'Episodic'], 'Node B'],
         ]
         graph = _make_graph_mock(rows)
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'knowlive': graph}))
 
         result = await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=1000)
 
@@ -163,24 +161,22 @@ class TestEnumerateGraphitiNamespace:
         ]
 
     @pytest.mark.asyncio
-    async def test_empty_graph_returns_empty_list(self):
+    async def test_empty_graph_returns_empty_list(self, make_backend, mock_config):
         """An empty result_set returns an empty list, not an error."""
-        graphiti = MagicMock()
         graph = _make_graph_mock([])
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'knowlive': graph}))
 
         result = await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=1000)
 
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_warns_when_row_count_hits_limit(self, caplog):
+    async def test_warns_when_row_count_hits_limit(self, make_backend, mock_config, caplog):
         """No-silent-caps: hitting the limit logs a WARNING that enumeration
         may be incomplete."""
-        graphiti = MagicMock()
         rows = [[f'uuid-{i}', ['Entity'], f'Node {i}'] for i in range(3)]
         graph = _make_graph_mock(rows)
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'knowlive': graph}))
 
         with caplog.at_level('WARNING'):
             await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=3)
@@ -190,12 +186,11 @@ class TestEnumerateGraphitiNamespace:
         )
 
     @pytest.mark.asyncio
-    async def test_no_warning_when_under_limit(self, caplog):
+    async def test_no_warning_when_under_limit(self, make_backend, mock_config, caplog):
         """Row count below the limit does not log a WARNING."""
-        graphiti = MagicMock()
         rows = [['uuid-1', ['Entity'], 'Node A']]
         graph = _make_graph_mock(rows)
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'knowlive': graph}))
 
         with caplog.at_level('WARNING'):
             await _mod.enumerate_graphiti_namespace(graphiti, 'knowlive', limit=1000)
@@ -306,23 +301,22 @@ class TestPurgeGraphitiNamespace:
     """Tests for async purge_graphiti_namespace(graphiti, namespace)."""
 
     @pytest.mark.asyncio
-    async def test_calls_graph_for_with_namespace(self):
-        """graphiti._graph_for is called with the namespace argument."""
-        graphiti = MagicMock()
+    async def test_writes_to_the_graph_named_by_namespace(self, make_backend, mock_config):
+        """The purge goes to the graph wired under the namespace; any other key is unwired."""
         graph = _make_graph_mock([])
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'knowlive': graph}))
 
-        await _mod.purge_graphiti_namespace(graphiti, 'knowlive')
+        result = await _mod.purge_graphiti_namespace(graphiti, 'knowlive')
 
-        graphiti._graph_for.assert_called_once_with('knowlive')
+        assert result == {'ok': True, 'error': None}
+        graph.query.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_issues_detach_delete_write_query_not_ro_query(self):
+    async def test_issues_detach_delete_write_query_not_ro_query(self, make_backend, mock_config):
         """Purge is a WRITE: graph.query (NOT ro_query) is called with a
         'MATCH (n) DETACH DELETE n'-shaped Cypher statement."""
-        graphiti = MagicMock()
         graph = _make_graph_mock([])
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'knowlive': graph}))
 
         await _mod.purge_graphiti_namespace(graphiti, 'knowlive')
 
@@ -332,26 +326,24 @@ class TestPurgeGraphitiNamespace:
         graph.ro_query.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_returns_ok_result_dict_on_success(self):
+    async def test_returns_ok_result_dict_on_success(self, make_backend, mock_config):
         """A successful purge returns a result dict with ok=True and no error."""
-        graphiti = MagicMock()
         graph = _make_graph_mock([])
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'knowlive': graph}))
 
         result = await _mod.purge_graphiti_namespace(graphiti, 'knowlive')
 
         assert result == {'ok': True, 'error': None}
 
     @pytest.mark.asyncio
-    async def test_best_effort_raising_query_is_caught_not_raised(self):
+    async def test_best_effort_raising_query_is_caught_not_raised(self, make_backend, mock_config):
         """A raising graph.query is caught (best-effort): the exception does
         NOT propagate, and is instead recorded in the result via ok=False
         plus an error message."""
-        graphiti = MagicMock()
         graph = MagicMock()
         graph.query = AsyncMock(side_effect=RuntimeError('FalkorDB connection lost'))
         graph.ro_query = AsyncMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'knowlive': graph}))
 
         # Must not raise.
         result = await _mod.purge_graphiti_namespace(graphiti, 'knowlive')
@@ -510,35 +502,39 @@ class TestRunDryRun:
         base.update(overrides)
         return _types.SimpleNamespace(**base)
 
-    def _make_memory_service(
-        self, graphiti_rows: list[list] | None = None,
-        mem0_members: list[dict] | None = None,
-        mem0_count: int | None = None,
-    ):
-        """AsyncMock memory_service with a MagicMock .graphiti wired for
-        enumerate_graphiti_namespace / enumerate_mem0_namespace."""
-        memory_service = AsyncMock()
-        graph = _make_graph_mock(graphiti_rows or [])
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
-        memory_service.graphiti = graphiti
-        members = mem0_members or []
-        memory_service.mem0 = MagicMock()
-        memory_service.mem0.count = AsyncMock(
-            return_value=mem0_count if mem0_count is not None else len(members)
-        )
-        memory_service.mem0.get_all = AsyncMock(return_value={'results': members})
-        memory_service.delete_memory = AsyncMock(return_value=None)
-        memory_service.update_edge = AsyncMock(return_value=None)
-        return memory_service, graph
+    @pytest.fixture
+    def make_memory_service(self, make_backend, mock_config):
+        def _factory(
+            graphiti_rows: list[list] | None = None,
+            mem0_members: list[dict] | None = None,
+            mem0_count: int | None = None,
+        ):
+            """AsyncMock memory_service whose .graphiti is a real backend over the
+            'knowlive' graph, for enumerate_graphiti_namespace / enumerate_mem0_namespace."""
+            memory_service = AsyncMock()
+            graph = _make_graph_mock(graphiti_rows or [])
+            memory_service.graphiti = make_backend(
+                mock_config, graph_access=FakeGraphAccess({'knowlive': graph}),
+            )
+            members = mem0_members or []
+            memory_service.mem0 = MagicMock()
+            memory_service.mem0.count = AsyncMock(
+                return_value=mem0_count if mem0_count is not None else len(members)
+            )
+            memory_service.mem0.get_all = AsyncMock(return_value={'results': members})
+            memory_service.delete_memory = AsyncMock(return_value=None)
+            memory_service.update_edge = AsyncMock(return_value=None)
+            return memory_service, graph
+
+        return _factory
 
     @pytest.mark.asyncio
-    async def test_dry_run_does_not_mutate(self):
+    async def test_dry_run_does_not_mutate(self, make_memory_service):
         """Dry-run (args.apply=False): no DETACH DELETE, no delete_memory,
         no update_edge -- nothing is mutated."""
         rows = [['uuid-1', ['Entity'], 'Node A']]
         members = [_mem0_member('m1')]
-        memory_service, graph = self._make_memory_service(
+        memory_service, graph = make_memory_service(
             graphiti_rows=rows, mem0_members=members,
         )
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
@@ -553,12 +549,12 @@ class TestRunDryRun:
         memory_service.update_edge.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_dry_run_report_shape(self):
+    async def test_dry_run_report_shape(self, make_memory_service):
         """Dry-run report has dry_run=True, enumerated graphiti node_uuids +
         mem0 memory_ids, and the stale_flags uuids."""
         rows = [['uuid-1', ['Entity'], 'Node A'], ['uuid-2', ['Entity'], 'Node B']]
         members = [_mem0_member('m1'), _mem0_member('m2')]
-        memory_service, _ = self._make_memory_service(
+        memory_service, _ = make_memory_service(
             graphiti_rows=rows, mem0_members=members,
         )
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
@@ -577,9 +573,9 @@ class TestRunDryRun:
         assert report['stale_flags']['uuids'] == list(_mod.STALE_FLAG_EDGE_UUIDS)
 
     @pytest.mark.asyncio
-    async def test_dry_run_uses_default_namespace_when_unset(self):
+    async def test_dry_run_uses_default_namespace_when_unset(self, make_memory_service):
         """With no args.namespace, LEGACY_NAMESPACE is used to enumerate both stores."""
-        memory_service, _ = self._make_memory_service()
+        memory_service, graph = make_memory_service()
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
 
         await _mod.run(
@@ -587,7 +583,8 @@ class TestRunDryRun:
             invalidation_time=invalidation_time,
         )
 
-        memory_service.graphiti._graph_for.assert_called_once_with(_mod.LEGACY_NAMESPACE)
+        assert _mod.LEGACY_NAMESPACE == 'knowlive'
+        graph.ro_query.assert_awaited_once()
         memory_service.mem0.count.assert_called_once()
         assert (
             memory_service.mem0.count.call_args.args[0].project_id
@@ -595,13 +592,13 @@ class TestRunDryRun:
         )
 
     @pytest.mark.asyncio
-    async def test_reports_enumeration_capped_when_graphiti_limit_hit(self):
+    async def test_reports_enumeration_capped_when_graphiti_limit_hit(self, make_memory_service):
         """The manifest self-documents an incomplete graphiti enumeration:
         report['graphiti']['enumeration_capped'] is True when the row count
         hits --limit, since --apply's DETACH DELETE is unbounded by limit and
         would silently delete nodes absent from this recovery record."""
         rows = [['uuid-1', ['Entity'], 'Node A'], ['uuid-2', ['Entity'], 'Node B']]
-        memory_service, _ = self._make_memory_service(graphiti_rows=rows)
+        memory_service, _ = make_memory_service(graphiti_rows=rows)
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
 
         report = await _mod.run(
@@ -612,10 +609,12 @@ class TestRunDryRun:
         assert report['graphiti']['enumeration_capped'] is True
 
     @pytest.mark.asyncio
-    async def test_reports_enumeration_not_capped_when_under_graphiti_limit(self):
+    async def test_reports_enumeration_not_capped_when_under_graphiti_limit(
+        self, make_memory_service,
+    ):
         """Row count below --limit -> enumeration_capped=False."""
         rows = [['uuid-1', ['Entity'], 'Node A']]
-        memory_service, _ = self._make_memory_service(graphiti_rows=rows)
+        memory_service, _ = make_memory_service(graphiti_rows=rows)
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
 
         report = await _mod.run(
@@ -626,13 +625,15 @@ class TestRunDryRun:
         assert report['graphiti']['enumeration_capped'] is False
 
     @pytest.mark.asyncio
-    async def test_reports_authoritative_mem0_count_distinct_from_enumerated(self):
+    async def test_reports_authoritative_mem0_count_distinct_from_enumerated(
+        self, make_memory_service,
+    ):
         """report['mem0']['count'] is the authoritative count_memories_by_metadata
         total, not len(memory_ids) -- a scroll-capped namespace must not be
         under-reported in the manifest. report['mem0']['enumerated'] carries the
         enumerated/deletable slice size separately."""
         members = [_mem0_member('m1'), _mem0_member('m2')]
-        memory_service, _ = self._make_memory_service(
+        memory_service, _ = make_memory_service(
             mem0_members=members, mem0_count=5,
         )
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
@@ -660,60 +661,64 @@ class TestRunApply:
         base.update(overrides)
         return _types.SimpleNamespace(**base)
 
-    def _make_memory_service(
-        self, graphiti_rows: list[list] | None = None,
-        mem0_members: list[dict] | None = None,
-        mem0_count: int | None = None,
-        delete_side_effect=None,
-    ):
-        """AsyncMock memory_service with a MagicMock .graphiti wired for both
-        enumeration and purge calls (mirrors TestRunDryRun._make_memory_service)."""
-        memory_service = AsyncMock()
-        graph = _make_graph_mock(graphiti_rows or [])
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
-        memory_service.graphiti = graphiti
-        members = mem0_members or []
-        memory_service.mem0 = MagicMock()
-        memory_service.mem0.count = AsyncMock(
-            return_value=mem0_count if mem0_count is not None else len(members)
-        )
-        memory_service.mem0.get_all = AsyncMock(return_value={'results': members})
-        if delete_side_effect is not None:
-            memory_service.delete_memory = AsyncMock(side_effect=delete_side_effect)
-        else:
-            memory_service.delete_memory = AsyncMock(return_value=None)
-        memory_service.update_edge = AsyncMock(return_value=None)
-        return memory_service, graph
+    @pytest.fixture
+    def make_memory_service(self, make_backend, mock_config):
+        def _factory(
+            graphiti_rows: list[list] | None = None,
+            mem0_members: list[dict] | None = None,
+            mem0_count: int | None = None,
+            delete_side_effect=None,
+        ):
+            """AsyncMock memory_service whose .graphiti is a real backend over the
+            'knowlive' graph, for both enumeration and purge calls (mirrors
+            TestRunDryRun.make_memory_service)."""
+            memory_service = AsyncMock()
+            graph = _make_graph_mock(graphiti_rows or [])
+            memory_service.graphiti = make_backend(
+                mock_config, graph_access=FakeGraphAccess({'knowlive': graph}),
+            )
+            members = mem0_members or []
+            memory_service.mem0 = MagicMock()
+            memory_service.mem0.count = AsyncMock(
+                return_value=mem0_count if mem0_count is not None else len(members)
+            )
+            memory_service.mem0.get_all = AsyncMock(return_value={'results': members})
+            if delete_side_effect is not None:
+                memory_service.delete_memory = AsyncMock(side_effect=delete_side_effect)
+            else:
+                memory_service.delete_memory = AsyncMock(return_value=None)
+            memory_service.update_edge = AsyncMock(return_value=None)
+            return memory_service, graph
+
+        return _factory
 
     @pytest.mark.asyncio
-    async def test_apply_purges_graphiti_and_never_targets_another_namespace(self):
-        """purge issues a DETACH DELETE write via _graph_for(namespace); EVERY
-        _graph_for call (enumerate, purge, after-recount) targets 'knowlive'
-        only -- never know_live/dark_factory (safety guard)."""
+    async def test_apply_purges_graphiti_and_never_targets_another_namespace(
+        self, make_memory_service,
+    ):
+        """purge issues a DETACH DELETE write against the namespace graph; the
+        enumerate, the purge and the after-recount all reach 'knowlive', the
+        only graph wired -- never know_live/dark_factory (safety guard)."""
         rows = [['uuid-1', ['Entity'], 'Node A']]
-        memory_service, graph = self._make_memory_service(graphiti_rows=rows)
+        memory_service, graph = make_memory_service(graphiti_rows=rows)
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
 
-        await _mod.run(
+        report = await _mod.run(
             self._args(apply=True), memory_service,
             invalidation_time=invalidation_time,
         )
 
-        assert len(memory_service.graphiti._graph_for.call_args_list) >= 2
-        for call in memory_service.graphiti._graph_for.call_args_list:
-            assert call.args == ('knowlive',), (
-                f'_graph_for called with unexpected namespace: {call}'
-            )
+        assert graph.ro_query.await_count == 2
+        assert report['graphiti']['purge'] == {'ok': True, 'error': None}
         assert graph.query.call_count == 1
         cypher = graph.query.call_args.args[0]
         assert 'DETACH DELETE' in cypher
 
     @pytest.mark.asyncio
-    async def test_apply_deletes_each_enumerated_mem0_member(self):
+    async def test_apply_deletes_each_enumerated_mem0_member(self, make_memory_service):
         """delete_memory is called once per enumerated mem0 member."""
         members = [_mem0_member('m1'), _mem0_member('m2')]
-        memory_service, _ = self._make_memory_service(mem0_members=members)
+        memory_service, _ = make_memory_service(mem0_members=members)
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
 
         await _mod.run(
@@ -728,10 +733,12 @@ class TestRunApply:
         assert called_ids == {'m1', 'm2'}
 
     @pytest.mark.asyncio
-    async def test_apply_invalidates_each_stale_flag_with_host_project_and_time(self):
+    async def test_apply_invalidates_each_stale_flag_with_host_project_and_time(
+        self, make_memory_service,
+    ):
         """update_edge is called once per stale-flag uuid with
         project_id=FLAG_HOST_PROJECT and invalid_at=invalidation_time."""
-        memory_service, _ = self._make_memory_service()
+        memory_service, _ = make_memory_service()
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
 
         await _mod.run(
@@ -749,12 +756,12 @@ class TestRunApply:
             assert c.kwargs.get('invalid_at') == invalidation_time
 
     @pytest.mark.asyncio
-    async def test_apply_report_has_after_recounts_and_tallies(self):
+    async def test_apply_report_has_after_recounts_and_tallies(self, make_memory_service):
         """Apply report has dry_run=False, deleted/invalidated tallies, empty
         failed lists on full success, and an 'after' recount block."""
         rows = [['uuid-1', ['Entity'], 'Node A']]
         members = [_mem0_member('m1'), _mem0_member('m2')]
-        memory_service, _ = self._make_memory_service(
+        memory_service, _ = make_memory_service(
             graphiti_rows=rows, mem0_members=members,
         )
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
@@ -773,12 +780,12 @@ class TestRunApply:
         assert report['after'] == {'graphiti_count': 1, 'mem0_count': 2}
 
     @pytest.mark.asyncio
-    async def test_apply_tolerates_partial_mem0_delete_failure(self):
+    async def test_apply_tolerates_partial_mem0_delete_failure(self, make_memory_service):
         """A single failing mem0 delete does not abort the run or raise;
         report['mem0_failed'] records it and the rest of the report still
         builds normally."""
         members = [_mem0_member('m1'), _mem0_member('m2')]
-        memory_service, _ = self._make_memory_service(
+        memory_service, _ = make_memory_service(
             mem0_members=members,
             delete_side_effect=[RuntimeError('Qdrant error'), None],
         )
@@ -794,7 +801,7 @@ class TestRunApply:
         assert report['mem0_failed'] == ['m1']
 
     @pytest.mark.asyncio
-    async def test_apply_tolerates_graphiti_purge_failure(self):
+    async def test_apply_tolerates_graphiti_purge_failure(self, make_backend, mock_config):
         """A raising graph.query (Graphiti purge failure) does not abort run():
         report['graphiti']['purge'] surfaces ok=False + the error, and the rest
         of the apply path (mem0 deletes, flag invalidation, after-recounts)
@@ -806,8 +813,7 @@ class TestRunApply:
         graph = MagicMock()
         graph.ro_query = AsyncMock(return_value=result)
         graph.query = AsyncMock(side_effect=RuntimeError('FalkorDB connection lost'))
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'knowlive': graph}))
 
         memory_service = AsyncMock()
         memory_service.graphiti = graphiti
@@ -833,12 +839,12 @@ class TestRunApply:
         assert report['after'] == {'graphiti_count': 1, 'mem0_count': 1}
 
     @pytest.mark.asyncio
-    async def test_apply_tolerates_partial_flag_invalidation_failure(self):
+    async def test_apply_tolerates_partial_flag_invalidation_failure(self, make_memory_service):
         """A single failing update_edge does not abort run(): report['flags_failed']
         records the failed uuid and the rest of the report still builds normally
         -- retire_stale_flags's best-effort handling is exercised through run(),
         not just in isolation."""
-        memory_service, _ = self._make_memory_service()
+        memory_service, _ = make_memory_service()
         memory_service.update_edge = AsyncMock(
             side_effect=[RuntimeError('graph unavailable'), None]
         )
@@ -881,28 +887,32 @@ class TestRunApplyStoreMutationPreflight:
         base.update(overrides)
         return _types.SimpleNamespace(**base)
 
-    def _make_memory_service(
-        self, graphiti_rows: list[list] | None = None,
-        mem0_members: list[dict] | None = None,
-    ):
-        """AsyncMock service wired for both enumerations and all three
-        mutations (mirrors TestRunApply._make_memory_service)."""
-        memory_service = AsyncMock()
-        graph = _make_graph_mock(graphiti_rows or [])
-        graphiti = MagicMock()
-        graphiti._graph_for = MagicMock(return_value=graph)
-        memory_service.graphiti = graphiti
-        members = mem0_members or []
-        memory_service.mem0 = MagicMock()
-        memory_service.mem0.count = AsyncMock(return_value=len(members))
-        memory_service.mem0.get_all = AsyncMock(return_value={'results': members})
-        memory_service.delete_memory = AsyncMock(return_value=None)
-        memory_service.update_edge = AsyncMock(return_value=None)
-        return memory_service, graph
+    @pytest.fixture
+    def make_memory_service(self, make_backend, mock_config):
+        def _factory(
+            graphiti_rows: list[list] | None = None,
+            mem0_members: list[dict] | None = None,
+        ):
+            """AsyncMock service wired for both enumerations and all three
+            mutations (mirrors TestRunApply.make_memory_service)."""
+            memory_service = AsyncMock()
+            graph = _make_graph_mock(graphiti_rows or [])
+            memory_service.graphiti = make_backend(
+                mock_config, graph_access=FakeGraphAccess({'knowlive': graph}),
+            )
+            members = mem0_members or []
+            memory_service.mem0 = MagicMock()
+            memory_service.mem0.count = AsyncMock(return_value=len(members))
+            memory_service.mem0.get_all = AsyncMock(return_value={'results': members})
+            memory_service.delete_memory = AsyncMock(return_value=None)
+            memory_service.update_edge = AsyncMock(return_value=None)
+            return memory_service, graph
+
+        return _factory
 
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
-        self, monkeypatch
+        self, make_memory_service, monkeypatch
     ):
         """The whole point: refuse to start rather than half-complete.
 
@@ -911,7 +921,7 @@ class TestRunApplyStoreMutationPreflight:
         vacuous, and the Graphiti DETACH DELETE is the largest of them.
         """
         deny(_mod, monkeypatch)
-        memory_service, graph = self._make_memory_service(
+        memory_service, graph = make_memory_service(
             graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
             mem0_members=[_mem0_member('m1')],
         )
@@ -930,13 +940,13 @@ class TestRunApplyStoreMutationPreflight:
         memory_service.update_edge.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_the_guard_sits_before_both_enumerations(self, monkeypatch):
+    async def test_the_guard_sits_before_both_enumerations(self, make_memory_service, monkeypatch):
         """It aborts without scanning either store -- two full-namespace scans
         (a FalkorDB ro_query plus a mem0 count+get_all, --limit 1000 each) are
         not paid for in an environment that was never going to be allowed to
         purge."""
         deny(_mod, monkeypatch)
-        memory_service, graph = self._make_memory_service(
+        memory_service, graph = make_memory_service(
             graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
             mem0_members=[_mem0_member('m1')],
         )
@@ -953,7 +963,9 @@ class TestRunApplyStoreMutationPreflight:
         memory_service.mem0.get_all.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+    async def test_a_dry_run_is_never_gated_on_write_capability(
+        self, make_memory_service, monkeypatch,
+    ):
         """A read-only run mutates nothing, so it must not require the ability
         to mutate.
 
@@ -962,7 +974,7 @@ class TestRunApplyStoreMutationPreflight:
         is about to be deleted", and it stays obtainable from anywhere.
         """
         deny(_mod, monkeypatch)
-        memory_service, graph = self._make_memory_service(
+        memory_service, graph = make_memory_service(
             graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
             mem0_members=[_mem0_member('m1')],
         )
@@ -983,10 +995,10 @@ class TestRunApplyStoreMutationPreflight:
         memory_service.update_edge.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, make_memory_service):
         """Happy path: a writable environment purges exactly as before -- all
         three mutations fire and the post-purge re-scan still runs."""
-        memory_service, graph = self._make_memory_service(
+        memory_service, graph = make_memory_service(
             graphiti_rows=[['uuid-1', ['Entity'], 'Node A']],
             mem0_members=[_mem0_member('m1')],
         )
@@ -1006,14 +1018,16 @@ class TestRunApplyStoreMutationPreflight:
         assert 'after' in report
 
     @pytest.mark.asyncio
-    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+    async def test_the_probe_names_the_operation_being_gated(
+        self, make_memory_service, monkeypatch,
+    ):
         """The refusal has to be attributable in a log, so the operation string
         identifies this script and its mutating mode."""
         calls: list[dict] = []
         monkeypatch.setattr(
             _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
         )
-        memory_service, _ = self._make_memory_service(
+        memory_service, _ = make_memory_service(
             mem0_members=[_mem0_member('m1'), _mem0_member('m2')],
         )
         invalidation_time = datetime(2026, 6, 30, 21, 0, 0, tzinfo=UTC)
@@ -1028,7 +1042,7 @@ class TestRunApplyStoreMutationPreflight:
         assert '--apply' in calls[0]['operation']
 
     def test_the_refusal_escapes_main_and_is_never_a_zero_exit(
-        self, monkeypatch, caplog
+        self, make_memory_service, monkeypatch, caplog
     ):
         """``main`` calls ``asyncio.run`` bare -- no try/except -- and otherwise
         returns 0 unconditionally, so the refusal must PROPAGATE and exit the
@@ -1043,7 +1057,7 @@ class TestRunApplyStoreMutationPreflight:
         operator and an unexplained traceback.
         """
         deny(_mod, monkeypatch)
-        memory_service, _ = self._make_memory_service(
+        memory_service, _ = make_memory_service(
             mem0_members=[_mem0_member('m1')],
         )
         monkeypatch.setattr(
