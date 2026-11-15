@@ -254,6 +254,62 @@ async def _classify_patch_containment(
     return PatchContainment.contained
 
 
+class Containment(enum.StrEnum):
+    """The D10 answer: is every commit a tip carries beyond the target already on it?
+
+    'git could not answer' is UNKNOWN, never NOT_CONTAINED.
+    """
+
+    CONTAINED = 'contained'
+    NOT_CONTAINED = 'not_contained'
+    UNKNOWN = 'unknown'
+
+
+class _AncestryReading(NamedTuple):
+    on_target: bool | None
+    containment: Containment
+
+
+async def _containment_by_ancestry(
+    git_ops: GitOps, tip: str, target: str,
+) -> _AncestryReading:
+    """Empty ``git cherry`` output is containment only when *tip* is ON *target*.
+
+    There git cherry has nothing to list for a genuine landing.  Elsewhere the
+    branch has no non-merge commit beyond *target*, so nothing of its own is
+    proven present.  An unanswerable ancestry probe is a git error.
+    """
+    on_target = await git_ops.is_ancestor_checked(tip, target)
+    if on_target is None:
+        containment = Containment.UNKNOWN
+    elif on_target:
+        containment = Containment.CONTAINED
+    else:
+        containment = Containment.NOT_CONTAINED
+    return _AncestryReading(on_target, containment)
+
+
+_CONTAINMENT_OF_CHERRY: dict[PatchContainment, Containment] = {
+    PatchContainment.contained: Containment.CONTAINED,
+    PatchContainment.not_contained: Containment.NOT_CONTAINED,
+    PatchContainment.unreadable: Containment.UNKNOWN,
+}
+
+
+async def classify_containment(
+    git_ops: GitOps, *, tip: str, target: str,
+) -> Containment:
+    """Whether every commit *tip* has beyond *target* is on *target* by patch id.
+
+    One ``git cherry`` read; its empty answer is settled by ancestry, because
+    a tip whose only commits beyond *target* are merges proves nothing landed.
+    """
+    cherry = await _classify_patch_containment(tip, target, git_ops)
+    if cherry is PatchContainment.vacuous:
+        return (await _containment_by_ancestry(git_ops, tip, target)).containment
+    return _CONTAINMENT_OF_CHERRY[cherry]
+
+
 async def patch_content_contained(
     head: str,
     upstream: str,
@@ -285,6 +341,7 @@ __all__ = [
     'LANDING_GIT_ERROR_STORM_CATEGORY',
     'LANDING_GIT_ERROR_STORM_SENTINEL',
     'LANDING_TALLY',
+    'Containment',
     'DifferentialOutcome',
     'LandingEvidenceVerdict',
     'LandingMethod',
@@ -294,6 +351,7 @@ __all__ = [
     'PatchContainment',
     'branch_is_degenerate',
     'branch_work_landed',
+    'classify_containment',
     'file_landing_git_error_storm_escalation',
     'file_unattributed_landing_escalation',
     'format_unattributed_landing_detail',
@@ -1402,18 +1460,13 @@ async def _containment_rejection(
 async def _vacuous_containment_rejection(
     git_ops: GitOps, head: str, upstream: str, probe: dict[str, Any],
 ) -> LandingReason | None:
-    """Empty ``git cherry`` output is containment only when *head* is ON *upstream*.
-
-    There git cherry has nothing to list for a genuine landing.  Elsewhere the
-    branch has no non-merge commit beyond *upstream*, so nothing of its own is
-    proven present.
-    """
-    on_upstream = await git_ops.is_ancestor_checked(head, upstream)
-    probe['containment_by_ancestry'] = on_upstream
-    if on_upstream is None:
+    """The vacuous arm of :func:`_containment_rejection`, decided by :func:`_containment_by_ancestry`."""
+    reading = await _containment_by_ancestry(git_ops, head, upstream)
+    probe['containment_by_ancestry'] = reading.on_target
+    if reading.containment is Containment.UNKNOWN:
         probe['git_error_stage'] = 'patch_id_containment'
         return LandingReason.git_error
-    return None if on_upstream else LandingReason.not_landed
+    return None if reading.containment is Containment.CONTAINED else LandingReason.not_landed
 
 
 async def branch_work_landed(
