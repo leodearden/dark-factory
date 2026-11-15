@@ -4830,13 +4830,15 @@ def _check_lease_ownership(
     identical fields a contention message does -- the holder a refused
     caller is told about is the holder a contending claim would report.
 
-    - lease absent -> (ABSENT, None), and QUIET: an idempotent release is
-      not a failure and must not manufacture an ERROR.
-    - body unreadable/corrupt -> not owned by anybody, so REFUSED (fail
-      TOWARD held, mirroring _read_lease_holder_state's own documented rule
-      -- a corrupt lease is not stranded: reap_stale_leases still removes it
-      under the ``corrupt`` rule once past LEASE_HEARTBEAT_TTL, and --force
-      covers immediate operator recovery).
+    - no readable holder and no file -- absent from the start, or removed
+      mid-check by a concurrent --force release or reap -> (ABSENT, None),
+      QUIET: an idempotent release is not a failure and must not
+      manufacture an ERROR.
+    - body still present but unreadable/corrupt -> not owned by anybody, so
+      REFUSED (fail TOWARD held, mirroring _read_lease_holder_state's own
+      documented rule -- a corrupt lease is not stranded: reap_stale_leases
+      still removes it under the ``corrupt`` rule once past
+      LEASE_HEARTBEAT_TTL, and --force covers immediate operator recovery).
     - slug matches -> proceed.
     - slug mismatch -> REFUSED + logger.error naming the verb, the lease,
       the REAL holder (slug + pid), the heartbeat age and the requester, so
@@ -4845,10 +4847,9 @@ def _check_lease_ownership(
     """
     if now is None:
         now = datetime.now(UTC)
-    if not path.exists():
-        return LeaseMutation.ABSENT, None
-
     holder, _holder_alive, age_secs = _read_lease_holder_state(path, now=now)
+    if holder is None and not path.exists():
+        return LeaseMutation.ABSENT, None
     if _is_lease_owner(holder, slug):
         return None, holder
 
