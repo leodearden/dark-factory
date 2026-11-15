@@ -182,7 +182,7 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
     writes under the checkout it measures: the night's drift.
 
     With `default_prefix=True` the two `*_CMD` seams are left UNSET instead, so
-    the wrapper's own `uv run --frozen --project <FM> python` prefix is the
+    the wrapper's own `uv run --no-sync --project <FM> python` prefix is the
     thing under test, with a fake `uv` recorder on PATH. Every other wrapper
     test overrides both seams and therefore never exercises that prefix at all.
     """
@@ -359,7 +359,7 @@ def test_wrapper_runs_both_halves_under_uv_so_fused_memory_imports_resolve(
     """The DEFAULT interpreter prefix, exercised for real.
 
     Every other wrapper test overrides COVERAGE_CENSUS_CMD/RETRO_STAMP_CMD and
-    so never reaches `uv run --frozen --project <FM> python` at all -- while the
+    so never reaches `uv run --no-sync --project <FM> python` at all -- while the
     literal `uv run` appears TWICE in the header comment, leaving a source-text
     check green with both defaults deleted. Here both seams are UNSET and a fake
     `uv` records what it was actually asked to run: without the prefix each
@@ -374,7 +374,7 @@ def test_wrapper_runs_both_halves_under_uv_so_fused_memory_imports_resolve(
     # One fake `uv` for both halves, so `who` cannot disambiguate: the census is
     # the first call and the rehearsal the second (ordering pinned elsewhere).
     assert [c['who'] for c in calls] == ['UV', 'UV'], calls
-    prefix = ['run', '--frozen', '--project', f'{repo}/fused-memory', 'python']
+    prefix = ['run', '--no-sync', '--project', f'{repo}/fused-memory', 'python']
     expected_scripts = (
         f'{repo}/fused-memory/scripts/census_memory_metadata.py',
         f'{repo}/fused-memory/scripts/retro_stamp_topics.py',
@@ -425,7 +425,7 @@ def _halves(calls):
 
 def _uv_run_prefix(tmp_path):
     """The args the fake `uv` receives ahead of the script it is asked to run."""
-    return ['run', '--frozen', '--project',
+    return ['run', '--no-sync', '--project',
             f'{tmp_path / "fake-repo"}/fused-memory', 'python']
 
 

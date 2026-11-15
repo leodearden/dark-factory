@@ -4663,7 +4663,7 @@ the invocation the wrapper makes, on the generation worktree's own copy of
 the script (below), so the report's recorded paths stay repo-relative:
 
 ```bash
-uv run --frozen --project fused-memory python \
+uv run --no-sync --project fused-memory python \
     fused-memory/scripts/census_memory_metadata.py --top-n 400
 ```
 
@@ -4816,7 +4816,7 @@ probe's docstring points here.
 stamps stays an operator decision, run by hand after reading the rehearsal:
 
 ```bash
-uv run --frozen --project fused-memory python \
+uv run --no-sync --project fused-memory python \
     fused-memory/scripts/retro_stamp_topics.py --apply
 ```
 
@@ -4926,8 +4926,8 @@ is no commit seam, unlike the 05:00 census:
 from the repo root:
 
 ```bash
-uv run --frozen --project shared python scripts/sitting/nightly_prepare.py
-uv run --frozen --project shared python scripts/sitting/return_brief.py --output data/return-brief.md
+uv run --no-sync --project shared python scripts/sitting/nightly_prepare.py
+uv run --no-sync --project shared python scripts/sitting/return_brief.py --output data/return-brief.md
 ```
 
 The first spends a Fable budget. For a **no-cost re-render**, skip it:
