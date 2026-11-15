@@ -2103,9 +2103,10 @@ def write_report_text(path: str | Path, text: str) -> None:
 # The read-only run band
 #
 # D8's runner pattern minus every mutation: CONFIG_PATH from --config,
-# FusedMemoryConfig(), MemoryService(), initialize_for_reads(), try/finally
-# close(); the full initialize() starts the durable write queue and runs
-# Graphiti startup maintenance, which repairs edges.
+# FusedMemoryConfig(), then
+# fused_memory/maintenance/_utils.py::maintenance_service(open_as=READS), which
+# opens and always closes the service. The full opening starts the durable
+# write queue and runs Graphiti startup maintenance, which repairs edges.
 #
 # There is no --apply band and no write call anywhere below. The guarantee is
 # asserted as BEHAVIOUR: the tests drive this band against a service double
@@ -2325,16 +2326,17 @@ async def _run(args: argparse.Namespace) -> int:
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
-    # Imported as MODULE ATTRIBUTES, function-locally (D8): that indirection
-    # is the seam the read-only double patches, so the guarantee is testable
-    # end to end without a test-only hook in this script.
+    # Imported function-locally (D8). The config is read as a MODULE
+    # ATTRIBUTE, and the read-only service double is installed on
+    # fused_memory.services.memory_service.MemoryService, which
+    # maintenance_service looks up at call time: those are the seams the tests
+    # patch, so the guarantee is testable end to end without a test-only hook
+    # in this script.
     import fused_memory.config.schema as _schema  # noqa: PLC0415
-    import fused_memory.services.memory_service as _service  # noqa: PLC0415
+    from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
 
     config = _schema.FusedMemoryConfig()
-    memory = _service.MemoryService(config)
-    try:
-        await memory.initialize_for_reads()
+    async with maintenance_service(config=config, open_as=ServiceOpen.READS) as (_, memory):
         outcome = await run_sweep(
             memory,
             project_ids=(args.project_id,),
@@ -2344,8 +2346,6 @@ async def _run(args: argparse.Namespace) -> int:
             eval_id=args.eval_id,
             write_metrics=not args.no_metrics,
         )
-    finally:
-        await memory.close()
 
     print(outcome.report, end='')
     if outcome.metrics_path is not None:
