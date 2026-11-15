@@ -14,9 +14,10 @@ Divergences from the mirrored trickle install test:
   * SCRIPT / unit basenames re-pointed at legibility-transcript-check@.
   * The installed @.service content assertion additionally checks it
     references check_transcript_persistence.py (NOT nightly.py) and does
-    NOT pass --check-preventer (DD2: the 2893 preventer-guard regex
-    false-negatives against the real spawn-claude.sh, so passing it would
-    make the timer exit 1 on every run — a perpetual false alarm).
+    NOT pass --check-preventer (task 5859: the merge gate already pins
+    spawn-claude.sh's persistence export, and a preventer-only failure would
+    be an exit 1 with no escalation behind it; rationale in OPERATIONS.md
+    §"Nightly legibility transcript check (04:00)").
 """
 from __future__ import annotations
 
@@ -214,7 +215,7 @@ def test_install_copies_templates_and_enables_timer(tmp_path):
     assert timer_path.is_file(), f"Expected {timer_path} to exist after install"
     # Byte-equality with the committed templates above already proves the
     # install copied them verbatim; the @.service ExecStart *shape* invariant
-    # (references the detector, passes %i, and — DD2 — never --check-preventer)
+    # (references the detector, passes %i, and — task 5859 — never --check-preventer)
     # is asserted directly against the committed template in
     # test_service_template_execstart_shape, independent of install behavior.
 
@@ -231,19 +232,22 @@ def test_service_template_execstart_shape():
     (systemd expands %i at instantiation — the template is copied verbatim,
     never per-instance edited) and must NOT pass --check-preventer.
 
-    DD2: the 2893 preventer-guard regex false-negatives against the real
-    spawn-claude.sh, so passing --check-preventer would make the timer exit 1
-    on EVERY run (a perpetual false alarm). This pins the ExecStart shape at
-    its source, so a future template edit that reintroduced --check-preventer
-    fails here regardless of the install path.
+    Task 5859 decided to keep --check-preventer off: the merge gate already
+    pins spawn-claude.sh's persistence export, and a preventer-only failure
+    would be an exit 1 with no escalation behind it. The rationale lives in
+    OPERATIONS.md §"Nightly legibility transcript check (04:00)". This pins
+    the decision at its source, so a template edit that adds the flag fails
+    here regardless of the install path.
     """
     service_text = (TEMPLATES_DIR / "legibility-transcript-check@.service").read_text()
     assert "check_transcript_persistence.py" in service_text
     assert "--project-id %i" in service_text
     assert "--check-preventer" not in service_text, (
-        "The transcript-check service template must NOT pass --check-preventer "
-        "(DD2): the 2893 preventer-guard regex false-negatives against the real "
-        "spawn-claude.sh, which would make the timer exit 1 on every run."
+        "The transcript-check service template must NOT pass --check-preventer: "
+        "task 5859 kept it off because the merge gate already pins "
+        "spawn-claude.sh's persistence export and a preventer-only failure "
+        "would be an exit 1 with no escalation. Read OPERATIONS.md "
+        '§"Nightly legibility transcript check (04:00)" before changing this.'
     )
 
 
