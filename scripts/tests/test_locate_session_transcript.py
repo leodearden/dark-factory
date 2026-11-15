@@ -45,6 +45,7 @@ TOOL = REPO_ROOT / 'scripts' / 'locate_session_transcript.py'
 
 TASK_ID = '4242'
 SID = 'b976febe-1c2d-4e3f-8a9b-0c1d2e3f4a5b'
+SID2 = 'c4a7e2d1-5b6c-4d7e-9f80-a1b2c3d4e5f6'
 UNKNOWN_SID = '00000000-1111-4222-8333-444444444444'
 
 _RUN_TIMEOUT_SECS = 60
@@ -169,3 +170,43 @@ def test_outside_any_checkout_exits_no_checkout_unless_project_root_is_given(
 
     assert found.returncode == EXIT_FOUND, _describe(found)
     assert found.stdout.splitlines() == [str(expected)], _describe(found)
+
+
+def _interactive_session(home: Path, session_id: str = SID2) -> Path:
+    """Write *session_id* under *home*'s CLI config, beside a decoy subagent dir."""
+    enc = home / '.claude' / 'projects' / '-home-x-proj'
+    transcript = enc / f'{session_id}.jsonl'
+    decoy = enc / session_id / 'subagents' / 'agent-abc.jsonl'
+    decoy.parent.mkdir(parents=True)
+    transcript.write_text(json.dumps({'sessionId': session_id}) + '\n', encoding='utf-8')
+    decoy.write_text(json.dumps({'sessionId': session_id}) + '\n', encoding='utf-8')
+    return transcript
+
+
+def test_finds_an_interactive_session_under_the_home_cli_config(main, fake_home):
+    expected = _interactive_session(fake_home)
+
+    result = _run(main, fake_home, SID2)
+
+    assert result.returncode == EXIT_FOUND, _describe(result)
+    assert result.stdout.splitlines() == [str(expected)], _describe(result)
+
+
+def test_a_miss_names_the_home_cli_projects_root_too(main, fake_home):
+    _interactive_session(fake_home)
+
+    result = _run(main, fake_home, UNKNOWN_SID)
+
+    assert result.returncode == EXIT_NOT_FOUND, _describe(result)
+    assert str(fake_home / '.claude' / 'projects') in result.stderr, _describe(result)
+    assert str(agent_transcripts_dir(main)) in result.stderr, _describe(result)
+
+
+def test_a_session_in_both_stores_prints_both(main, tmp_path, fake_home):
+    archived = _archive_session(main, tmp_path, SID2)
+    interactive = _interactive_session(fake_home, SID2)
+
+    result = _run(main, fake_home, SID2)
+
+    assert result.returncode == EXIT_FOUND, _describe(result)
+    assert result.stdout.splitlines() == [str(archived), str(interactive)], _describe(result)
