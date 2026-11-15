@@ -825,7 +825,7 @@ def make_fake_maintenance_service():
     """Factory fixture: returns a callable(mock_cfg, mock_service) -> async context manager."""
     def _factory(mock_cfg, mock_service):
         @asynccontextmanager
-        async def fake(config_path):
+        async def fake(config_path=None, *, config=None, open_as=None):
             yield mock_cfg, mock_service
 
         return fake
