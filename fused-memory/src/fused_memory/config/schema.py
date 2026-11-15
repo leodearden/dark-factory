@@ -3164,6 +3164,38 @@ class Mem0UpdateConfig(BaseModel):
             'preserving half. Green-tier hot-reloadable via reload_config.'
         ),
     )
+    agent_prefix_sanctioned_use: dict[str, str] = Field(
+        default_factory=lambda: {
+            'recon-stage-': (
+                'the reconciliation stage agents, which run automatically as '
+                'agent_id recon-stage-<stage>; no interactive or task-dispatched '
+                'session holds this role'
+            ),
+            'curator-': (
+                'an interactive memory-consolidation curation sitting executing '
+                'the procedure in skills/curate-fused-memories/SKILL.md, adopted '
+                'as curator-<sitting-slug>; read that procedure before any write '
+                'under this prefix'
+            ),
+            'link-heal-': (
+                'the link-heal executor (fused-memory/scripts/link_heal.py), which '
+                'writes metadata-only heals as agent_id link-heal-<run>; no '
+                'session adopts it by hand'
+            ),
+        },
+        description=(
+            'Maps each agent_id prefix to the role that prefix DECLARES. The '
+            'Mem0UpdateNotAuthorized refusal renders it per prefix for the '
+            'refusing arm\'s allowlist only; an allowlisted prefix with no entry '
+            'renders as undocumented, telling the caller not to adopt it. '
+            'Documenting a prefix here is part of the same act as widening '
+            'either allowlist. An entry for an ungranted prefix is inert. A YAML '
+            'value REPLACES this map wholesale, so restate every entry. agent_id '
+            'is self-reported: this text makes the norm legible, not the gate '
+            'enforceable. Green-tier hot-reloadable via reload_config as one '
+            'atomic leaf.'
+        ),
+    )
     storm_threshold: int = Field(
         default=20,
         gt=0,
@@ -3188,6 +3220,24 @@ class Mem0UpdateConfig(BaseModel):
             'read-live-per-record() basis as storm_threshold.'
         ),
     )
+
+    @field_validator('agent_prefix_sanctioned_use')
+    @classmethod
+    def _require_non_blank_sanctioned_uses(
+        cls, value: dict[str, str],
+    ) -> dict[str, str]:
+        for prefix, use in value.items():
+            if not prefix.strip():
+                raise ValueError(
+                    'mem0_update.agent_prefix_sanctioned_use has a blank prefix '
+                    f'key {prefix!r}; every key must name an agent_id prefix'
+                )
+            if not use.strip():
+                raise ValueError(
+                    f'mem0_update.agent_prefix_sanctioned_use[{prefix!r}] is '
+                    'blank; state the role the prefix declares, or remove the entry'
+                )
+        return value
 
 
 class EntityMintConfig(BaseModel):
