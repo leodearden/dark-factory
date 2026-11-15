@@ -864,19 +864,35 @@ duplicate-spawn incident. `holder_record=<unlinked|absent|unreadable|active|exit
 axis: the state of the holder's session-registry record, found through the
 `record_slug` the lease body carries. `exited`/`absent` corroborate an
 `orphaned` pid, and `unlinked` (a lease claimed before that field existed) is no
-evidence either way.
+evidence either way. `lease-claim` also prints `slug=<resolved>`: the slug the
+CLI derived for **this caller**, never the holder's. It is a diagnostic to
+compare against `lease-show`'s `holder_slug` when a later heartbeat comes back
+`result=refused`, not a value to carry into a later verb, and it is printed on
+the fail-open `decision=proceed` path too, where `holder_liveness=` is not
+(`orchestrator/src/orchestrator/session_registry.py::_run_lease_claim`).
 
 A holder whose lease body says `holder_pid=0` claimed it on the **degraded**
-pid path (`$CLAUDE_PID` unset — the CLI records 0, a never-alive sentinel, and
-logs a WARNING). Such a lease is protected only by its heartbeat and always
-reads `orphaned`; that is deliberate, because recording some other durable pid
-(the shell) instead would make it unreapable forever.
+pid path: from a shared `claude agents` host, whose pid outlives every session
+it hosts and so cannot vouch for one, or with `$CLAUDE_PID` unset, which since
+4248 also needs an explicit `--slug` to claim at all. The CLI records 0, a
+never-alive sentinel, and logs a WARNING
+(`orchestrator/src/orchestrator/session_registry.py::lease_liveness_pid`).
+Such a lease is protected only by its heartbeat and always reads `orphaned`;
+that is deliberate, because recording some other durable pid (the shell)
+instead would make it unreapable forever.
 
-`lease-heartbeat` and `lease-release` require the `--slug` the lease was
-claimed with and **refuse** on a mismatch (`result=refused`, nothing touched),
-so no session can evict another's lease or keep a stranger's alive. `--force`
-is the deliberate operator-recovery override: it acts anyway and logs at
-WARNING naming both the forcing slug and the displaced holder.
+`lease-heartbeat` and `lease-release` act only for the lease's holder and
+**refuse** anyone else (`result=refused`, nothing touched), so no session can
+evict another's lease or keep a stranger's alive. The holder is identified by a
+slug the CLI derives afresh on every lease verb
+(`orchestrator/src/orchestrator/session_registry.py::default_lease_slug`;
+`watcher-df-1430433` is a typical one, and `lease-claim`'s `slug=` line shows
+yours). Pass `--slug` only as an operator override. When the slug cannot be
+derived and no `--slug` is given, all three lease verbs exit 2 naming the
+unusable variable, rather than invent a token that a second degraded session
+would share. `--force` is the deliberate operator-recovery override: it acts
+anyway and logs at WARNING naming both the forcing slug and the displaced
+holder.
 
 `result=absent` differs by verb: on a **release** it is plain idempotence, but
 on a **heartbeat** it means that session's lease is gone (reaped, or
@@ -885,11 +901,27 @@ can claim the name freely. Both watcher skills tell a heartbeating session to
 re-claim on `absent` rather than continue; if you force-release a live
 watcher's lease, expect it to re-claim on its next cycle.
 
-**Rollout note (task 3994).** Any watcher session already running on the
-pre-3994 prescription must be **restarted** so it re-reads its skill: its
-`lease-heartbeat`/`lease-release` calls pass no `--slug` and now exit 2
-(argparse) instead of mutating. Nothing is stranded — such a lease stops being
-heartbeated and ages out normally within `LEASE_HEARTBEAT_TTL`, then is reaped.
+**Rollout note (tasks 3994, 4248).** Between 3994 and 4248, a
+`lease-heartbeat`/`lease-release` with no `--slug` exited 2 (argparse) instead
+of mutating. Since 4248 such a call derives the slug, so it no longer exits 2
+whenever the session's identity resolves, and exit 2 now means the slug is
+underivable. A derived slug that does not match the holder's is still
+`result=refused`. For the two watcher leases (`watcher-<project>`,
+`recon-watcher-<project>`) the derived slug is byte-identical to the one the
+skills used to build in shell, so an in-flight watcher keeps its lease.
+`/unblock`'s slug changed shape, from `unblock-<project>-<TASK_ID>-<pid>` to
+`unblock-<project>#<TASK_ID>-<pid>`, so a pre-4248 `/unblock` that releases
+without a slug gets `result=refused`: loud and non-destructive. Its recovery is
+the one-time rollout note in
+`skills/unblock/SKILL.md`'s release step (pass the original `--slug`, or wait
+for the lease to go stale). Any watcher session still running on the pre-3994
+prescription must be **restarted** so it re-reads its skill. Nothing is
+stranded — a lease that stops being heartbeated, or whose release is refused,
+becomes reapable by the same rule as any other: once its holder pid is dead
+**and** its heartbeat is past `LEASE_HEARTBEAT_TTL`. A pre-4248 `/unblock`
+lease from a non-hosted session records that session's long-lived
+`$CLAUDE_PID`, so a refused one lingers for as long as that claude process
+lives, and up to the TTL after.
 
 Its priority order when triaging is: infra stability first, software
 quality second, task progress third. Clear-cut issues get acted on
