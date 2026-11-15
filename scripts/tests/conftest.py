@@ -931,6 +931,28 @@ class FakeRecorder:
         return json.loads(self._state_path.read_text())['envs']
 
 
+def _checked_replies(replies) -> dict:
+    """*replies* as a dict, refused unless each is exactly ``{'stdout': str, 'exit_code': int}``.
+
+    Checked here, at install, because the fake reads a reply only inside the
+    child process: a malformed one would surface there as a traceback the
+    wrapper under test reports as its own failure.
+    """
+    checked = dict(replies or {})
+    for token, reply in checked.items():
+        well_formed = (
+            isinstance(reply, dict)
+            and set(reply) == {'stdout', 'exit_code'}
+            and isinstance(reply['stdout'], str)
+            and type(reply['exit_code']) is int
+        )
+        if not well_formed:
+            raise ValueError(
+                f"fake_recorder reply for {token!r} must be "
+                f"{{'stdout': str, 'exit_code': int}}; got {reply!r}")
+    return checked
+
+
 @pytest.fixture
 def fake_recorder(tmp_path):
     """Factory: install a :class:`FakeRecorder` named *name*, return it.
@@ -938,18 +960,20 @@ def fake_recorder(tmp_path):
     *bin_dir* defaults to ``tmp_path / 'bin'`` and is created with its parents.
     The caller puts it on PATH, or passes ``.path``, as the wrapper under test
     needs. Installing a name again in the same *bin_dir* starts a fresh call log.
+    A malformed *replies* entry raises ValueError here, naming its token.
     """
     state_dir = tmp_path / 'fake-recorder-state'
     state_paths: dict[Path, Path] = {}
 
     def _install(name, *, bin_dir=None, exit_code=0, replies=None):
+        replies = _checked_replies(replies)
         bin_dir = Path(bin_dir) if bin_dir is not None else tmp_path / 'bin'
         bin_dir.mkdir(parents=True, exist_ok=True)
         state_dir.mkdir(exist_ok=True)
         path = bin_dir / name
         state_path = state_paths.setdefault(path, state_dir / f'{len(state_paths)}-{name}.json')
         state_path.write_text(json.dumps({
-            'calls': [], 'envs': [], 'exit_code': exit_code, 'replies': dict(replies or {}),
+            'calls': [], 'envs': [], 'exit_code': exit_code, 'replies': replies,
         }))
         path.write_text(f'#!{sys.executable}\n' + _FAKE_RECORDER_SOURCE.format(
             state_path=str(state_path),

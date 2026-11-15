@@ -66,6 +66,21 @@ def test_fake_recorder_answers_a_reply_token_and_records_both_call_kinds(fake_re
     assert fake.calls() == [['--list-known-projects'], ['--apply']]
 
 
+@pytest.mark.parametrize('reply', [
+    {'stdout': 'dark_factory\n'},
+    {'exit_code': 0},
+    {'stdout': 'dark_factory\n', 'exit_code': '0'},
+    {'stdout': b'dark_factory\n', 'exit_code': 0},
+    {'stdout': 'dark_factory\n', 'exit_code': 0, 'stderr': ''},
+    'dark_factory\n',
+])
+def test_fake_recorder_refuses_a_malformed_reply_at_install_naming_the_token(fake_recorder, reply):
+    with pytest.raises(ValueError, match='--list-known-projects') as refused:
+        fake_recorder('fake-sweep-recorder', replies={'--list-known-projects': reply})
+
+    assert repr(reply) in str(refused.value)
+
+
 def test_fake_recorder_runs_under_an_empty_path(fake_recorder, tmp_path):
     empty_dir = tmp_path / 'empty-path'
     empty_dir.mkdir()
