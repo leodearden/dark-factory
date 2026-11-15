@@ -1,4 +1,4 @@
-"""Decision-record builders and assertion helpers shared by the decision test files."""
+"""Decision-record builders, CLI filing drivers and assertion helpers shared by the decision test files."""
 
 from __future__ import annotations
 
@@ -7,7 +7,10 @@ import re
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from orchestrator import decision_registry as dr
+from orchestrator import session_registry as sr
 
 
 def make_decision(**overrides: object) -> dr.DecisionRecord:
@@ -133,3 +136,39 @@ def seed_mixed_spellings(tmp_path: Path) -> dict[str, dict[str, Any]]:
 
 
 EVIDENCE = 'gate 1 ruling_is_leos_own: held\nLeo 2026-09-20: esc-400-1 option A'
+
+
+def file_decision(**kwargs: str | None) -> int:
+    """Invoke the write-decision verb with kwargs as --flags, skipping Nones.
+
+    Keeps the MODE-2 end-to-end cases readable: each is two filings that
+    differ in only a few fields, and spelling both argv lists out in full
+    buries the difference under boilerplate.
+    """
+    argv = ['write-decision']
+    for name, value in kwargs.items():
+        if value is not None:
+            argv += [f'--{name.replace("_", "-")}', value]
+    return sr.main(argv)
+
+
+def file_from_a_linked_session(
+    monkeypatch: pytest.MonkeyPatch, root: Path, pid: int = 7_527_001
+) -> None:
+    """Make the next write-decision file from a session linked to its own registry record.
+
+    write-decision WARNs when it cannot link a filing to its filer's session
+    record (task 7527), so a test pinning an otherwise-quiet filing path files
+    from a linked session, as a spawned watcher does. The pid pointer counts
+    only while the record names that pid as its owner, so that is the one
+    field set beyond the mandatory ones.
+    """
+    record = sr.SessionRecord(
+        session_slug='linked-watcher-record',
+        status=sr.Status.LAUNCHING,
+        start_ts='2026-07-07T00:00:00+00:00',
+        claude_owner_pid=pid,
+    )
+    sr.write_record(record, root=root)
+    sr.write_session_pointer(pid, 'linked-watcher-record', root=root)
+    monkeypatch.setenv('CLAUDE_PID', str(pid))
