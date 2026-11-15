@@ -118,8 +118,9 @@ test('every CHROME_ENDPOINTS entry is a real endpointsFor() path', () => {
 });
 
 test('CHROME_ENDPOINTS is exactly the chrome\'s seven endpoints', () => {
-  // A literal, not a derivation: test_app_poll_scope.py proves the chrome
-  // READS exactly this set; this pins the set itself.
+  // A literal, not a derivation: render_app_shell.test.mjs renders every tab
+  // and proves the chrome READS each of these on every one, and that no tab
+  // reads an endpoint its poll set leaves out; this pins the set itself.
   assert.deepEqual(
     [...CHROME_ENDPOINTS].sort(),
     [
