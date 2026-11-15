@@ -136,6 +136,30 @@ Six ported suites carry further dark-factory-native asserts:
   [`orchestrator/scripts/warm-lane/README.md`](../../scripts/warm-lane/README.md)
   "Delta 12".
 
+`test_thin_warm_lane.sh` has likewise grown DARK-FACTORY-NATIVE coverage, added
+by **task 5307** with the script's live-process-reference gate (see
+[`orchestrator/scripts/warm-lane/README.md`](../../scripts/warm-lane/README.md)
+"Delta 17"); the line count and SHA above still describe the ported baseline.
+It is ported from reify task 5823's coverage of reify's own gate (merged as
+reify `3112547dee`), keeping reify's labels so the two files stay diffable:
+
+- **A12** (3 asserts) — a copy without its sibling `lib_live_refs.sh` exits 2
+  on `--help`, so the guard fires before argv parsing.
+- **B3 token pair** (2 asserts) and **B3b** (6 asserts) — a flock refusal
+  carries `LANE_LOCK_CONTENDED:` and never `LANE_LIVE_REF:`; on a lane that is
+  BOTH flock-held and live-referenced, the flock gate fires first.
+- **Block F** (18 asserts) — with every `<lane>.lock` FREE, a cwd reference
+  (`F-cwd`) and an open-fd reference alone (`F-fd`) each refuse with 75 and
+  `LANE_LIVE_REF:`; an unreferenced lane still thins (`F-free`); the refusal
+  lifts once the reference clears (`F-temp`); and `--reseed` is gated too
+  (`F-reseed`).
+
+reify's **Block E** (its seed-abort discard of an uncertified clone) is
+deliberately absent: dark-factory's thin has no such discard to test. So is
+reify's F-cwd assert of an empty seed-script log: that run passes no
+`--reseed`, so thin never calls the seed script and the assert cannot fail.
+`F-reseed3` pins that the refusal precedes the seed call.
+
 ## Why these eight
 
 The port set was confirmed against **what α actually relocated**, not against a
@@ -367,6 +391,39 @@ The remaining header-block differences belong to other entries. The
 `source` line, the excised block-list entries are Deltas 3, 5 and 6, and the
 K1–K6 index line is Delta 7. Header entries that describe dark-factory-native
 additions travel with those additions.
+
+### Delta 9 — `test_warm_lane_degenerate_ref.sh`: Block M, the merge arm from `shared.merge_subject`
+
+Added by **task 6716**. This is a dark-factory-native block with no reify
+counterpart, and it pins scripts README Delta 19. Its fixture is a
+`git init -b trunk` repo whose subjects are written by
+`shared.merge_subject.format_merge_subject`, for a `feat/` prefix landing into
+`trunk`. `shared/src` is found from `WARM_LANE_SCRIPTS_DIR` three levels up,
+and `python3 -I` renders each subject. The block has eleven asserts:
+
+- **M1:** `feat/6101` is parked on a no-ff merge carrying its own landing
+  subject. It reads `landed <sha>` and exits 4.
+- **M2:** `feat/6102` is parked on `Revert "<its landing subject>"`. It reads
+  `degenerate <sha>` and exits 0.
+- **M3:** the script and its lib are copied to a temp directory with no
+  `shared/src` three levels up. It exits 2, and stderr names
+  `shared.merge_subject`.
+- **M4:** the lib is sourced alone and `task_citation_message_cites` is called
+  in reify's three-argument form on `chore: tidy` with the body line
+  `6101 files touched`. It returns 2 rather than citing, and stderr names
+  `<merge_head_re> and <merge_into_re>`. The control assert makes the
+  five-argument call on the same message, which returns 1.
+- **M5:** `task_citation_peer_ids` in reify's two-argument form returns 2 and
+  prints no id.
+
+The floor moved **84 → 90** for M1–M3, then **90 → 95** for M4–M5. Both counts
+were re-measured, not raised to absorb a red: `Results: 95 passed, 0 failed`.
+The block is NON-VACUOUS by construction. Against the script before Delta 19
+the same file reports `Results: 88 passed, 2 failed`, the two M3 asserts.
+Against the lib before it refused an empty pair, it reports
+`Results: 91 passed, 4 failed`: M4's control passes, and the other four M4/M5
+asserts fail. The block needs `python3`, which `REQUIRED_HOST_TOOLS` already
+lists, so it is not a deduction.
 
 ### Not a delta — α's provision Deltas 1–2 needed no test-side change
 
@@ -641,14 +698,16 @@ to `e1c04cf316`'s. Quote the reachable ones.
 - **No four-point bisect was run.** The endpoint pair does not reproduce, so
   there is no jump to localise, and forcing a guilty commit out of a flat
   bisect would manufacture a finding.
-- **A latent hazard, named but not gated here.** Both gc suites now drive gc.sh
-  through a pin set to `$LANE_PROTECT_GLOB_FALLBACK`, which is behaviour-neutral
-  only because the fallback currently equals the rendered set byte-for-byte
-  (re-verified 2026-08-05). `TestProtectGlobFallbackDrift` enforces only
-  fallback ⊇ rendered. The day a band is added to `PROTECTED_PREFIXES` and the
-  fallback becomes a strict superset, both suites silently begin testing gc.sh
-  with a protect set production never uses, and nothing fails. Closing that
-  means changing the drift gate, which is outside task 3655's file set.
+- **A latent hazard, named here and since closed by task 5307.** Both gc suites
+  drive gc.sh through a pin set to `$LANE_PROTECT_GLOB_FALLBACK`, which is
+  behaviour-neutral only while the fallback equals the rendered set
+  byte-for-byte. `TestProtectGlobFallbackDrift` enforces only fallback ⊇
+  rendered, so a removed band, a covered exact-name band or a fallback-only band
+  would have let both suites test gc.sh with a protect set production never
+  uses. `test_lane_state_lib.py::TestProtectGlobFallbackIsAVerbatimRender` now
+  gates equality and fails with a directional diff in either direction plus the
+  exact replacement; containment remains the separate production-safety
+  contract.
 
 #### Block Y: the seam is now pinned
 

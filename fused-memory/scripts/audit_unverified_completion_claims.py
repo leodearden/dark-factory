@@ -1002,7 +1002,7 @@ def _load_config(config_path: str | None = None) -> Any:
     (config/schema.py:2047) — so this script does not invent a second
     config-resolution path that could drift from the server's.
     """
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
 
     if config_path:
         os.environ['CONFIG_PATH'] = str(config_path)
@@ -1072,11 +1072,11 @@ def _read_task_statuses_readonly(
 ) -> dict[str, str]:
     """Return ``{id: status}`` from *project_root*'s tasks.db, READ-ONLY.
 
-    Mirrors ``SqliteTaskBackend._statuses_from_conn``'s SQL and coercions
-    (backends/sqlite_task_backend.py:1576-1594) — same table, same ``tag``
-    filter, same int cast of the ids, same ``NULL`` -> ``'unknown'`` rule — but
-    over a ``connect_ro`` connection, which CANNOT write and refuses a wrong
-    file with a named reason. Non-numeric ids are dropped exactly as
+    Mirrors the SQL and coercions of
+    ``fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_read_status_map``
+    — same table, same ``tag`` filter, same int cast of the ids, same ``NULL``
+    -> ``'unknown'`` rule — but over a ``connect_ro`` connection, which CANNOT
+    write and refuses a wrong file with a named reason. Non-numeric ids are dropped exactly as
     that helper drops them, and an id with no row is simply absent from the
     result, which the probe reports as unresolvable.
 
@@ -1257,7 +1257,7 @@ def _build_commit_probe(
     miss only when all of them answered. Delegating keeps the sweep and the
     write path on one definition of "this commit does not exist".
     """
-    from fused_memory.services.completion_claim_gate import (  # noqa: PLC0415
+    from fused_memory.services.completion_claim_gate import (
         make_registry_commit_probe,
     )
 
@@ -1275,7 +1275,7 @@ def _default_project_roots() -> dict[str, str]:
     claim against the wrong tree.
     """
     try:
-        from fused_memory.models.scope import (  # noqa: PLC0415
+        from fused_memory.models.scope import (
             build_known_projects_map,
         )
 

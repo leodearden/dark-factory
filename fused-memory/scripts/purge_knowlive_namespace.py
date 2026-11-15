@@ -120,10 +120,11 @@ async def enumerate_graphiti_namespace(
     limit: int = 1000,
 ) -> list[dict]:
     """Read-only enumeration of every node in the *namespace* FalkorDB graph."""
-    graph = graphiti._graph_for(namespace)
+    graph = graphiti.graph_access.graph(namespace)
     result = await graph.ro_query(
         'MATCH (n) RETURN n.uuid, labels(n), n.name LIMIT $limit',
         {'limit': limit},
+        op='enumerate_graphiti_namespace',
     )
     rows = result.result_set or []
     if len(rows) >= limit:
@@ -141,9 +142,9 @@ async def enumerate_graphiti_namespace(
 
 async def purge_graphiti_namespace(graphiti: Any, namespace: str) -> dict:
     """Best-effort ``MATCH (n) DETACH DELETE n`` against the *namespace* graph."""
-    graph = graphiti._graph_for(namespace)
+    graph = graphiti.graph_access.graph(namespace)
     try:
-        await graph.query('MATCH (n) DETACH DELETE n')
+        await graph.query('MATCH (n) DETACH DELETE n', op='purge_graphiti_namespace')
     except Exception as e:
         logger.warning(
             "purge_knowlive_namespace: failed to purge graph '%s': %s",
@@ -423,12 +424,12 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.services.memory_service import MemoryService
 
         config = FusedMemoryConfig()
         memory = MemoryService(config)

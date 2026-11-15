@@ -318,73 +318,6 @@ async def test_get_running_runs_returns_all_running_regardless_of_age(journal):
 
 
 @pytest.mark.asyncio
-async def test_interrupted_status_roundtrips_and_get_interrupted_runs(journal):
-    """complete_run(run_id, 'interrupted') persists RunStatus.interrupted and
-    stamps completed_at (the interrupt instant); get_interrupted_runs() returns
-    exactly the interrupted rows, excluding running/failed/completed."""
-    interrupted = ReconciliationRun(
-        id=str(uuid.uuid4()),
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-        instance_id='instance-interrupted',
-    )
-    still_running = ReconciliationRun(
-        id=str(uuid.uuid4()),
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-        instance_id='instance-running',
-    )
-    failed = ReconciliationRun(
-        id=str(uuid.uuid4()),
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-    )
-    completed = ReconciliationRun(
-        id=str(uuid.uuid4()),
-        project_id='test-project',
-        run_type=RunType.full,
-        trigger_reason='unit-test',
-        started_at=datetime.now(UTC),
-        status=RunStatus.running,
-    )
-    await journal.start_run(interrupted)
-    await journal.start_run(still_running)
-    await journal.start_run(failed)
-    await journal.start_run(completed)
-    await journal.complete_run(interrupted.id, 'interrupted')
-    await journal.complete_run(failed.id, 'failed')
-    await journal.complete_run(completed.id, 'completed')
-
-    # Roundtrip: status persists as interrupted and completed_at (the interrupt
-    # instant, later reused as the resume freshness clock) is stamped.
-    loaded = await journal.get_run(interrupted.id)
-    assert loaded is not None
-    assert loaded.status == RunStatus.interrupted
-    assert loaded.completed_at is not None
-
-    # get_interrupted_runs returns exactly the interrupted row, mapping
-    # instance_id/session snapshot faithfully, and excludes every other status.
-    interrupted_runs = await journal.get_interrupted_runs()
-    interrupted_ids = {r.id for r in interrupted_runs}
-    assert interrupted_ids == {interrupted.id}, (
-        f'Expected exactly the interrupted run; got ids={interrupted_ids!r}'
-    )
-    assert still_running.id not in interrupted_ids
-    assert failed.id not in interrupted_ids
-    assert completed.id not in interrupted_ids
-    assert interrupted_runs[0].instance_id == 'instance-interrupted'
-
-
-@pytest.mark.asyncio
 async def test_runs_table_has_session_columns(journal):
     """A freshly-initialized runs table exposes session_id, stage_cursor, attempt."""
     db = journal._require_access().connection
@@ -422,7 +355,7 @@ async def test_record_run_session_persists_and_increments_attempt(journal):
     assert loaded.stage_cursor == 'memory_consolidator'
     assert loaded.attempt == 1
 
-    # Same snapshot is visible via the _row_to_run recovery read path (σ).
+    # Same snapshot is visible via the _row_to_run recovery read path.
     running = {r.id: r for r in await journal.get_running_runs()}
     assert running[run_id].session_id == 'S1'
     assert running[run_id].stage_cursor == 'memory_consolidator'
@@ -1265,29 +1198,6 @@ class TestCompleteRunIfStatus:
         assert after.completed_at == owners_row.completed_at
 
     @pytest.mark.asyncio
-    async def test_interrupted_expected_status_is_honoured(self, journal):
-        refused_id = await self._seed(journal, RunStatus.interrupted)
-        applied_id = await self._seed(journal, RunStatus.interrupted)
-
-        refused = await journal.complete_run_if_status(
-            refused_id,
-            expected_status=RunStatus.running,
-            status=RunStatus.failed,
-            stage_reports={},
-        )
-        applied = await journal.complete_run_if_status(
-            applied_id,
-            expected_status=RunStatus.interrupted,
-            status=RunStatus.failed,
-            stage_reports={},
-        )
-
-        assert refused is False
-        assert (await journal.get_run(refused_id)).status == RunStatus.interrupted
-        assert applied is True
-        assert (await journal.get_run(applied_id)).status == RunStatus.failed
-
-    @pytest.mark.asyncio
     async def test_unknown_run_id_refuses_without_raising(self, journal):
         assert (
             await journal.complete_run_if_status(
@@ -1340,7 +1250,7 @@ class TestIsRunCompleted:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        'status', [RunStatus.running, RunStatus.failed, RunStatus.interrupted]
+        'status', [RunStatus.running, RunStatus.failed]
     )
     async def test_a_run_in_any_other_status_answers_false(self, journal, status):
         run_id = await TestCompleteRunIfStatus._seed(journal, status)
@@ -1666,14 +1576,15 @@ class TestGetRunStageExecution:
     async def test_resumed_reports_whether_the_run_was_adopted_for_resume(
         self, journal
     ):
-        """``status`` alone cannot tell a settled run from one that is running
-        again: ``harness.py::_resume_interrupted_runs`` adopts an interrupted
-        run and ``run_full_cycle`` marks it running only on the in-memory
-        object, leaving the column ``'interrupted'``. The adopt pass does
-        persist its ``_resume`` bookkeeping first, so that key is the one
-        durable signal that the blob may be a stale mid-flight snapshot, and
-        the projection surfaces it rather than making every caller re-parse
-        ``stage_reports`` to find out."""
+        """``status`` alone cannot tell a settled legacy row from one that was
+        running again: before task 5514 retired resume, the startup
+        adopt-and-resume pass took over an interrupted run and
+        ``run_full_cycle`` marked it running only on the in-memory object,
+        leaving the column ``'interrupted'``. The adopt pass did persist its
+        ``_resume`` bookkeeping first, so that key is the one durable signal
+        that the blob may be a stale mid-flight snapshot, and the projection
+        surfaces it rather than making every caller re-parse ``stage_reports``
+        to find out."""
         settled = str(uuid.uuid4())
         await self._start(journal, settled)
         await journal.update_run_stage_reports(settled, {'_error': {'error': 'boom'}})
@@ -1740,12 +1651,13 @@ class TestGetRunStageExecution:
     async def test_interrupted_settles_only_when_it_was_never_adopted(
         self, journal, adopted, settled
     ):
-        """``interrupted`` is the one terminal status a run can leave: the
-        adopt-and-resume pass persists its ``_resume`` bookkeeping and then
-        re-runs the run behind a status column only ``complete_run`` ever
-        writes. So the SAME terminal status means "finished account" or
-        "executing again" depending on that key, and the projection — not its
-        caller — is what knows the difference."""
+        """``interrupted`` was the one terminal status a run could leave: the
+        adopt-and-resume pass (retired by task 5514) persisted its ``_resume``
+        bookkeeping and then re-ran the run behind a status column only
+        ``complete_run`` ever writes. So on a legacy row the SAME terminal
+        status means "finished account" or "was executing again" depending on
+        that key, and the projection — not its caller — is what knows the
+        difference."""
         run_id = str(uuid.uuid4())
         await self._start(journal, run_id)
         if adopted:

@@ -15,7 +15,11 @@ import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import pytest
 import raw_envelope_literal_guard
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 if TYPE_CHECKING:
     from collections.abc import Callable

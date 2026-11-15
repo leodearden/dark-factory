@@ -13,9 +13,10 @@ Exit-code contract:
   124  — --timeout expired; nothing printed (coreutils convention).
   0    — SIGTERM received (treated as a clean shutdown).
 
-Startup order: inotify watch is armed BEFORE the initial filesystem scan so
-no events are missed in the gap between the two.  If a pending match is found
-during the scan, it is emitted immediately and the event loop is never entered.
+Startup order: `main` arms the inotify watch (`armed_source`) BEFORE handing
+it to `watch`, which runs the initial filesystem scan before polling, so no
+events are missed in the gap between the two.  If a pending match is found during the
+scan, it is emitted immediately and the event loop is never entered.
 
 Load-bearing invariants (callers MUST rely on these):
 
@@ -43,8 +44,8 @@ Load-bearing invariants (callers MUST rely on these):
       `python -m escalation.watcher` run rather than by grace of
       `logging.lastResort` — which anything configuring a root handler
       in-process would take away.
-      That line is also the only way to COUNT an outage: `_emit` runs at most
-      once per process (both call sites `sys.exit(0)` on the next line), so a
+      That line is also the only way to COUNT an outage: `emit` runs at most
+      once per process (its one call site in `main` exits on the next line), so a
       process-local integer could never read more than 1 — the aggregate is
       taken across the re-arm loop's stderr instead.  The marker deliberately
       copies `scripts/watcher-rearm.sh`'s `WATCHER_REARM_OUTCOME` idiom and
@@ -61,10 +62,13 @@ import signal
 import sys
 import time
 import urllib.request
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
-from inotify_simple import INotify, flags
+from inotify_simple import Event, INotify, flags
 from shared.timestamps import parse_timestamp_or_warn
 
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
@@ -188,8 +192,27 @@ def _snapshot_pending_ids(queue_dir: Path) -> frozenset[str]:
     return frozenset(p.stem for p in queue_dir.glob('esc-*.json'))
 
 
-def _send_ntfy(url: str, escalation: Escalation) -> None:
-    """POST an escalation as a push notification to an ntfy.sh endpoint."""
+def exclusions(
+    *,
+    static: frozenset[str],
+    baseline: frozenset[str],
+    exclude_file: Path | None,
+) -> Callable[[], frozenset[str]]:
+    """Return the `current_excludes` callable `watch` polls.
+
+    `static` and `baseline` are fixed for the run, and `exclude_file` is
+    re-read on every call so an appended id is excluded from the next poll on.
+    """
+    fixed = static | baseline
+
+    def current() -> frozenset[str]:
+        return fixed | _read_exclude_file(exclude_file)
+
+    return current
+
+
+def ntfy_request(url: str, escalation: Escalation) -> urllib.request.Request:
+    """Build the ntfy.sh push-notification POST for an escalation."""
     is_urgent = escalation.severity in (BORN_AT_L2_SEVERITIES | {'blocking'})
     title = f'[{escalation.severity.upper()}] Task {escalation.task_id}: {escalation.category}'
     body = escalation.summary
@@ -200,10 +223,20 @@ def _send_ntfy(url: str, escalation: Escalation) -> None:
     req.add_header('Title', title)
     req.add_header('Priority', 'urgent' if is_urgent else 'default')
     req.add_header('Tags', 'rotating_light' if is_urgent else 'information_source')
-    urllib.request.urlopen(req)
+    return req
 
 
-def _emit(esc: Escalation, ntfy_url: str | None) -> None:
+def _send_ntfy(url: str, escalation: Escalation) -> None:
+    """POST an escalation as a push notification to an ntfy.sh endpoint."""
+    urllib.request.urlopen(ntfy_request(url, escalation))
+
+
+def emit(
+    esc: Escalation,
+    ntfy_url: str | None,
+    *,
+    send: Callable[[str, Escalation], None] = _send_ntfy,
+) -> None:
     """Print escalation JSON to stdout and optionally send an ntfy push notification.
 
     The push is best-effort: a failure is reported (invariant (c)) and then
@@ -213,22 +246,97 @@ def _emit(esc: Escalation, ntfy_url: str | None) -> None:
     print(json.dumps(esc.to_dict(), indent=2))
     if ntfy_url:
         try:
-            _send_ntfy(ntfy_url, esc)
+            send(ntfy_url, esc)
         except Exception as e:
             logger.error('WATCHER_NTFY_OUTCOME: FAILED esc=%s url=%s: %s', esc.id, ntfy_url, e)
 
 
-def main() -> None:
-    # Invariant (c)'s marker is an operator-facing STDERR line, so this process
-    # has to own a handler: without one it reaches stderr only by grace of
-    # `logging.lastResort`, which anything configuring a root handler in-process
-    # silently takes away — and which emits the bare message with no level.
-    # basicConfig defaults to stderr, so stdout stays pure escalation JSON, and
-    # it is a no-op when a caller has already configured logging — the same call
-    # every sibling CLI here makes (submit, sweep, archive).
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+class EventSource(Protocol):
+    """The read half of an inotify watch, as `watch` consumes it."""
 
+    def read(self, timeout: int | None = None) -> Iterable[Event]: ...
+
+
+@contextmanager
+def armed_source(queue_dir: Path) -> Iterator[INotify]:
+    """Yield an inotify source armed on `queue_dir` for every arrival.
+
+    An arrival is renamed in (MOVED_TO, as invariant (a)'s writers do) or
+    created in place (CREATE).
+    """
+    with INotify() as inotify:
+        inotify.add_watch(str(queue_dir), flags.CREATE | flags.MOVED_TO)
+        yield inotify
+
+
+def _read_timeout_ms(deadline: float | None, clock: Callable[[], float]) -> int | None:
+    """Milliseconds left before `deadline`, floored at 0; None blocks indefinitely."""
+    if deadline is None:
+        return None
+    return max(0, int((deadline - clock()) * 1000))
+
+
+def _first_matching_escalation(
+    queue_dir: Path,
+    events: Iterable[Event],
+    task_id: str | None,
+    level: int | None,
+    excludes: frozenset[str],
+) -> Escalation | None:
+    """Return the escalation of the first event that names a matching pending record."""
+    for event in events:
+        name = event.name
+        if not name or not (name.startswith('esc-') and name.endswith('.json')):
+            continue
+
+        if name[:-5] in excludes:
+            continue
+
+        esc, _reason = read_escalation_for_scan(
+            queue_dir / name, context='watcher.watch', parse_errors=_WATCHER_PARSE_ERRORS,
+        )
+        if esc is not None and _matches(esc, task_id, level, excludes):
+            return esc
+    return None
+
+
+def watch(
+    queue_dir: Path,
+    source: EventSource,
+    *,
+    task_id: str | None,
+    level: int | None,
+    timeout: float | None,
+    current_excludes: Callable[[], frozenset[str]],
+    clock: Callable[[], float],
+) -> Escalation | None:
+    """Return the first pending escalation matching the filters, or None once `timeout` expires.
+
+    `source` must already be armed on `queue_dir` (see `armed_source`), so
+    nothing filed during the initial scan is missed.  `current_excludes` is called before the scan and
+    once per poll, and the `timeout` deadline is measured from the end of the
+    scan.
+    """
+    match = _initial_scan(queue_dir, task_id, level, current_excludes())
+    if match is not None:
+        return match
+
+    deadline = None if timeout is None else clock() + timeout
+    while True:
+        timeout_ms = _read_timeout_ms(deadline, clock)
+        if timeout_ms == 0:
+            return None
+
+        events = list(source.read(timeout=timeout_ms))
+        if deadline is not None and not events:
+            return None
+
+        match = _first_matching_escalation(queue_dir, events, task_id, level, current_excludes())
+        if match is not None:
+            return match
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Watch for escalation events')
     parser.add_argument('--queue-dir', required=True, help='Escalation queue directory')
     parser.add_argument('--task-id', default=None, help='Filter to a specific task ID')
@@ -256,7 +364,21 @@ def main() -> None:
             'that snapshot, instead of hand-listing every already-pending id'
         ),
     )
-    args = parser.parse_args()
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    # Invariant (c)'s marker is an operator-facing STDERR line, so this process
+    # has to own a handler: without one it reaches stderr only by grace of
+    # `logging.lastResort`, which anything configuring a root handler in-process
+    # silently takes away — and which emits the bare message with no level.
+    # basicConfig defaults to stderr, so stdout stays pure escalation JSON, and
+    # it is a no-op when a caller has already configured logging — the same call
+    # every sibling CLI here makes (submit, sweep, archive).
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    args = _parse_args(argv)
 
     queue_dir = Path(args.queue_dir)
     queue_dir.mkdir(parents=True, exist_ok=True)
@@ -264,73 +386,34 @@ def main() -> None:
     static_exclude = frozenset(_normalize_esc_id(e) for e in (args.exclude_id or []))
     exclude_file_path = Path(args.exclude_file) if args.exclude_file else None
 
-    def current_excludes() -> frozenset[str]:
-        return static_exclude | baseline_ids | _read_exclude_file(exclude_file_path)
-
     # Baseline is frozen ONCE here, BEFORE inotify is armed, so the race
     # window falls on the safe side: an escalation filed between this
-    # snapshot and add_watch() below is absent from the snapshot (so it is
+    # snapshot and armed_source() below is absent from the snapshot (so it is
     # not permanently excluded) and, since no watch is armed yet, generates
     # no inotify event either -- but it is still on disk by the time the
     # initial scan below runs, so the scan's own directory glob picks it up
-    # and fires on it normally. Snapshotting AFTER add_watch() instead would
+    # and fires on it normally. Snapshotting AFTER arming instead would
     # let such an item be captured by the snapshot (permanently excluded)
     # while ALSO queuing an inotify event that gets silently dropped as an
     # excluded id -- i.e. a genuinely new item swallowed for the run's
-    # lifetime. Unlike --exclude-file, the baseline is never re-read.
+    # lifetime. Unlike --exclude-file, the baseline is never re-read (see
+    # `exclusions`).
     baseline_ids = _snapshot_pending_ids(queue_dir) if args.baseline else frozenset()
-
-    # ARM inotify so no events are missed between the scan and the watch.
-    inotify = INotify()
-    watch_flags = flags.CREATE | flags.MOVED_TO
-    inotify.add_watch(str(queue_dir), watch_flags)
-
-    # Initial scan: emit any already-pending escalation and exit immediately.
-    match = _initial_scan(queue_dir, args.task_id, args.level, current_excludes())
-    if match is not None:
-        _emit(match, args.ntfy_url)
-        sys.exit(0)
-
-    # Compute monotonic deadline (None = block indefinitely).
-    deadline: float | None = (
-        None if args.timeout is None else time.monotonic() + args.timeout
+    current_excludes = exclusions(
+        static=static_exclude, baseline=baseline_ids, exclude_file=exclude_file_path,
     )
 
-    # Event loop: wait for new files.
-    while True:
-        if deadline is not None:
-            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-            if remaining_ms == 0:
-                sys.exit(124)
-            events = list(inotify.read(timeout=remaining_ms))
-        else:
-            events = list(inotify.read(timeout=None))
+    # ARM inotify so no events are missed between the scan and the watch.
+    with armed_source(queue_dir) as source:
+        match = watch(
+            queue_dir, source, task_id=args.task_id, level=args.level, timeout=args.timeout,
+            current_excludes=current_excludes, clock=time.monotonic,
+        )
 
-        if deadline is not None and not events:
-            sys.exit(124)
-
-        excludes = current_excludes()  # RE-READ each poll (--exclude-file may have changed)
-
-        for event in events:
-            name = event.name
-            if not name or not (name.startswith('esc-') and name.endswith('.json')):
-                continue
-
-            if name[:-5] in excludes:
-                continue
-
-            path = queue_dir / name
-            esc, _reason = read_escalation_for_scan(
-                path, context='watcher.main', parse_errors=_WATCHER_PARSE_ERRORS,
-            )
-            if esc is None:
-                continue
-
-            if not _matches(esc, args.task_id, args.level, excludes):
-                continue
-
-            _emit(esc, args.ntfy_url)
-            sys.exit(0)
+    if match is None:
+        sys.exit(124)
+    emit(match, args.ntfy_url)
+    sys.exit(0)
 
 
 if __name__ == '__main__':

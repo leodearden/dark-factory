@@ -132,13 +132,15 @@ class VerifyPort(Protocol):
 
 
 class ClockPort(Protocol):
-    """The worker's clocks, its sleep and bounded wait, and its merge-worktree progress probe."""
+    """The worker's clocks, its sleep and bounded wait, and its merge-worktree progress probes."""
 
     def now(self) -> float: ...
 
     def monotonic(self) -> float: ...
 
     def newest_content_mtime(self, root: Path) -> float | None: ...
+
+    def verify_cpu_ticks(self, root: Path) -> int | None: ...
 
     async def sleep(self, secs: float) -> None: ...
 
@@ -222,11 +224,13 @@ class ProductionVerifier:
 class ProductionClock:
     """``ClockPort`` on the real clocks.
 
-    ``content_mtime`` resolves ``merge_liveness.newest_content_mtime`` the
-    way the verify resolvers do, for the same reason.
+    ``content_mtime`` and ``cpu_ticks`` resolve ``liveness.newest_content_mtime``
+    and ``liveness.verify_tree_cpu_ticks`` the way the verify resolvers do,
+    for the same reason.
     """
 
     content_mtime: Resolver[Callable[[Path], float | None]]
+    cpu_ticks: Resolver[Callable[[Path], int | None]]
 
     def now(self) -> float:
         return time.time()
@@ -236,6 +240,9 @@ class ProductionClock:
 
     def newest_content_mtime(self, root: Path) -> float | None:
         return self.content_mtime()(root)
+
+    def verify_cpu_ticks(self, root: Path) -> int | None:
+        return self.cpu_ticks()(root)
 
     async def sleep(self, secs: float) -> None:
         await asyncio.sleep(secs)

@@ -211,6 +211,7 @@ import pathlib
 import shutil
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from systemd_unit_invariants import (
     INSTALLED_UNIT_DIR,
     SYSTEMCTL_SKIP_REASON,
@@ -219,6 +220,8 @@ from systemd_unit_invariants import (
     restart_directive,
     systemctl_user_show,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 UNIT_BASENAME = "dark-factory-dashboard.service"
 INSTALLED_UNIT_PATH = INSTALLED_UNIT_DIR / UNIT_BASENAME

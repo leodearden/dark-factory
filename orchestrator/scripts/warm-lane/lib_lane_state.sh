@@ -272,12 +272,16 @@ lane_state_class() {
 # The difference from the hand-copied glob this lib replaced (warm-lane-gc.sh's
 # old PROTECT_GLOB default, whose comment admitted the coupling and asked future
 # editors to keep it in sync across a repo boundary) is that this backstop is
-# MACHINE CHECKED. The drift gate is
-# orchestrator/tests/test_lane_state_lib.py::TestProtectGlobFallbackDrift: it
-# fails the build if PROTECTED_PREFIXES gains a band no pattern here covers, and
-# it proves it can fail by re-running itself against a monkeypatched registry.
-# So do not sync this by hand — add the band to PROTECTED_PREFIXES in
-# orchestrator/src/orchestrator/git_ops.py and let the gate tell you.
+# MACHINE CHECKED, by two gates in orchestrator/tests/test_lane_state_lib.py.
+# TestProtectGlobFallbackDrift is the production contract: it fails the build if
+# PROTECTED_PREFIXES gains a band no pattern here covers or if this string ever
+# protects an owned pool band, and it proves it can fail by re-running itself
+# against a monkeypatched registry. TestProtectGlobFallbackIsAVerbatimRender is
+# the stricter one the gc suites' REIFY_WARM_LANE_GC_PROTECT_GLOB pins depend
+# on: it fails on ANY byte difference from the render and prints the exact
+# replacement assignment. So do not sync this by hand — add the band to
+# PROTECTED_PREFIXES in orchestrator/src/orchestrator/git_ops.py and let the
+# gate tell you.
 #
 # Authored complete against the current registry MINUS the owned pool bands.
 # `_lane-*` and `_spec-*` must NEVER appear here: protecting them would make

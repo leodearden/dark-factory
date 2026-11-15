@@ -147,6 +147,9 @@ class DatumInvariant(enum.StrEnum):
     the payload declares as a ``Datum`` holds one. A shaper raises it instead
     of inventing an ``unknown`` placeholder, because a field its route never
     filled is a wiring bug, not a measurement.
+
+    ``VALUE_CONTRACT`` is also a payload's rule: the value broke its payload
+    family's own declared invariant, and that family's validator names which.
     """
 
     UNKNOWN_TRIAD = 'unknown_triad'
@@ -154,6 +157,7 @@ class DatumInvariant(enum.StrEnum):
     REASON_REQUIRED = 'reason_required'
     FRESHNESS_BOUND = 'freshness_bound'
     DATUM_REQUIRED = 'datum_required'
+    VALUE_CONTRACT = 'value_contract'
 
 
 class DatumContractError(ValueError):

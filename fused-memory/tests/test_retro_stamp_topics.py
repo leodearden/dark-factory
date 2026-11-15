@@ -25,9 +25,13 @@ from _store_mutation_preflight_contract import (
     fail_closed_records,
     neutralise_fixture,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory import topic_slug as topic_slug_module
+from fused_memory.eval import topic_registry
 from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'retro_stamp_topics.py'
 
@@ -846,20 +850,20 @@ def _entry(
     cluster_id: str,
     *,
     project_id: str = 'reify',
-) -> object:
+) -> topic_registry.RegistryEntry:
     """Build a minimal registry entry keyed to *cluster_id*."""
-    return _mod.RegistryEntry(
+    return topic_registry.RegistryEntry(
         topic=topic,
         project_id=project_id,
         derived_from='curator_gate',
-        canonical=_mod.Canonical(content_hash='0' * 16, last_known_id=cluster_id),
-        phrasings=(_mod.Phrasing(text=f'what about {topic}'),),
+        canonical=topic_registry.Canonical(content_hash='0' * 16, last_known_id=cluster_id),
+        phrasings=(topic_registry.Phrasing(text=f'what about {topic}'),),
         provenance={'cluster_id': cluster_id},
     )
 
 
-def _registry(*entries: object) -> object:
-    return _mod.TopicRegistry(schema_version=1, entries=tuple(entries))
+def _registry(*entries: topic_registry.RegistryEntry) -> topic_registry.TopicRegistry:
+    return topic_registry.TopicRegistry(schema_version=1, entries=tuple(entries))
 
 
 CLUSTER_A = '68f19644-c3f3-49d5-af61-c983de358358'
@@ -1078,18 +1082,6 @@ class TestCalibrationJoinAgainstTheRealCommittedFixtures:
         for plan in plans:
             assert topic_slug_module.is_valid_topic_slug(plan.topic), plan.topic
             assert plan.source == 'calibration_registry_join'
-
-    def test_registry_is_loaded_through_the_probes_strict_loader(self):
-        """Not a hand-rolled ``json.load``.
-
-        That loader is required-strict and additive-tolerant, and
-        ``RegistryEntry.extra`` exists precisely so this consumer can load a
-        richer entry against it without a fixture rewrite — its docstring
-        names task 3201.
-        """
-        probe = _mod._load_probe_module()
-        assert _mod.load_topic_registry is probe.load_topic_registry
-        assert _mod.RegistryEntry is probe.RegistryEntry
 
 
 # ===========================================================================

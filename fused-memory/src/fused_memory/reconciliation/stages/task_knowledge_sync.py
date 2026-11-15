@@ -18,14 +18,15 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.services.memory_service import MemoryService
 
+from shared.elision import elide_at_word
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
+from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 from fused_memory.backends.task_backend_errors import (
     DuplicateCandidateKeyError,
     LeakedEnvelopeMarkupError,
 )
 from fused_memory.middleware.task_creation_journal import read_run_creation_outcomes
-from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageId,
@@ -46,14 +47,16 @@ from fused_memory.reconciliation.cli_stage_runner import (
 from fused_memory.reconciliation.cross_run_citation_scan import scan_cross_run_citations
 from fused_memory.reconciliation.dangling_citation import build_dangling_citation_finding
 from fused_memory.reconciliation.flag_dedup import (
-    _content_fingerprint,
-    _normalize_content_description,
     acknowledge_resolved_flags,
-    compute_flag_signature,
     filter_blocked_snapshot_findings,
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
     filter_snapshot_stat_edge_findings,
+)
+from fused_memory.reconciliation.flag_identity import (
+    compute_flag_signature,
+    content_fingerprint,
+    normalize_description,
 )
 from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_MARKER_KIND
 from fused_memory.reconciliation.known_projects_section import render_known_projects_section
@@ -3514,7 +3517,6 @@ class TaskKnowledgeSync(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
         """Capture run_id, run briefing-refresh hook, delegate to BaseStage.run(), then
         apply the same-run Stage 1 human_operator_required dedup post-processor.
@@ -3550,7 +3552,6 @@ class TaskKnowledgeSync(BaseStage):
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
-            resume_session_id=resume_session_id,
         )
 
         # --- missing-run_id marker stat (task 1257) ---
@@ -4646,7 +4647,6 @@ class IntegrityCheck(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
         """Execute Stage 3 and post-process with task-dump spot-check.
 
@@ -4681,7 +4681,6 @@ class IntegrityCheck(BaseStage):
         """
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
-            resume_session_id=resume_session_id,
         )
 
         # Layer 3 (finding-side) gate for blocked-snapshot false positives.
@@ -4895,16 +4894,12 @@ def _flag_content_fingerprint(item: dict) -> str | None:
     polled recon_report_systemic finding (keyed on ``description``).
 
     Deliberately NOT a call site of
-    :func:`~fused_memory.reconciliation.flag_dedup.compute_content_fingerprint_signature`:
+    :func:`~fused_memory.reconciliation.flag_identity.compute_content_fingerprint_signature`:
     that helper is gated on ``task_id``/``cited_tasks`` being absent and
     returns a ``(fp, flag_type)`` tuple for marker write/match in
     ``dedup_flags``, whereas this helper is ungated (any item with non-blank
     text qualifies, regardless of task_id) and returns the bare ``fp`` for a
-    same-cycle payload-assembly join. Both delegate to the same underlying
-    :func:`~fused_memory.reconciliation.flag_dedup._content_fingerprint` /
-    :func:`~fused_memory.reconciliation.flag_dedup._normalize_content_description`
-    primitives — if that normalization contract ever changes, cross-check
-    both call sites so the two dedup keys don't silently drift apart.
+    same-cycle payload-assembly join.
 
     Text is read as ``item.get('content') or item.get('description') or ''``
     so either field name resolves to the same fingerprint for identical text
@@ -4917,9 +4912,7 @@ def _flag_content_fingerprint(item: dict) -> str | None:
     Pure, sync, no I/O.
     """
     text = str(item.get('content') or item.get('description') or '')
-    if not _normalize_content_description(text):
-        return None
-    return _content_fingerprint(text)
+    return content_fingerprint(text) if normalize_description(text) else None
 
 
 def _format_flagged(
@@ -4940,9 +4933,11 @@ def _format_flagged(
     stage-specific shortfall warning.
 
     Edge case: if the very first item's JSON alone exceeds *budget_chars*, a
-    truncated fragment is always rendered (with a ``… [item truncated]`` marker)
-    so the LLM receives at least some signal rather than an opaque footer-only
-    body.  ``rendered`` stays 0 (the fragment is not a full render) and the
+    truncated fragment is always rendered so the LLM receives at least some
+    signal rather than an opaque footer-only body.  The fragment is cut by
+    ``shared/elision.py::elide_at_word``, whose counted marker keeps the line
+    within *budget_chars*; a budget too small to hold that marker raises its
+    ``ValueError``.  ``rendered`` stays 0 (the fragment is not a full render) and the
     warning's ``extra`` includes ``first_item_fragmented=True`` so
     callers/telemetry can distinguish fragmented-first-item from all-dropped.
     """
@@ -4962,11 +4957,8 @@ def _format_flagged(
                 # First item alone exceeds the budget.  Always show at least a
                 # truncated fragment so the LLM has some signal rather than an
                 # opaque footer-only body.
-                marker = '… [item truncated]'
-                available = budget_chars - len('- ') - len(marker)
-                if available > 0:
-                    lines.append(f'- {json_str[:available]}{marker}')
-                    first_item_fragmented = True
+                lines.append(f'- {elide_at_word(json_str, budget_chars - len("- "))}')
+                first_item_fragmented = True
             dropped = len(items) - idx
             # Footer shows only items that are completely absent (not the
             # fragmented first item, which already appears as a truncated line).
@@ -5211,7 +5203,7 @@ def _select_proactive_sample(tasks: Iterable[dict], n: int) -> list[dict]:
     filter_task_tree already pre-validates to be dict-only.
     """
     # Import from task_filter — the single source of truth for status priority
-    from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY  # noqa: PLC0415
+    from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY
 
     def sort_key(t: dict) -> tuple[int, int]:
         status = t.get('status', 'pending')

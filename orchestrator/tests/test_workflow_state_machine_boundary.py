@@ -105,6 +105,7 @@ from orchestrator.workflow_types import (
     STATE_TO_STATUS,
     BlockDisposition,
     IllegalTransition,
+    PublishedStewardOutcome,
     RequeueKind,
     StewardInterrupted,
     StewardResolved,
@@ -1487,12 +1488,12 @@ class TestStewardOutcomeRouting:
     ):
         wf = _make_workflow(tmp_path=tmp_path)
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed the flaky import'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='fixed the flaky import'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardResolved(resolution_text='fixed the flaky import')
 
@@ -1506,9 +1507,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
         outcome = await wf._mark_blocked('agent hit a transient failure')
@@ -1533,12 +1534,12 @@ class TestStewardOutcomeRouting:
         wf._steward_outcome_channel = asyncio.Queue()
         # An unrelated outcome sits on the channel; the terminal/deferred
         # status read still wins.
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='irrelevant — status overrides'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='irrelevant — status overrides'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value=status)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardTerminalDecision(new_status=TaskStatus(status))
 
@@ -1548,9 +1549,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='irrelevant — status overrides'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='irrelevant — status overrides'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='done')
 
         outcome = await wf._mark_blocked('agent hit a transient failure')
@@ -1569,9 +1570,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='irrelevant — status overrides'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='irrelevant — status overrides'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='cancelled')
         wf._ensure_l1_escalation_for_blocked = AsyncMock()
 
@@ -1590,9 +1591,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardInterrupted('attempt_cap', wip_commits_present=True),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardInterrupted('attempt_cap', wip_commits_present=True),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         pending_l0 = MagicMock(id='esc-orig-0')
         wf.escalation_queue.get_by_task.return_value = [pending_l0]  # type: ignore[union-attr]
@@ -1649,9 +1650,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardInterrupted('timeout', wip_commits_present=True),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardInterrupted('timeout', wip_commits_present=True),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         l0 = _make_escalation(id='esc-42-1', level=0, agent_role='orchestrator')
         l1 = _make_escalation(
@@ -1691,9 +1692,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardInterrupted('timeout', wip_commits_present=True),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardInterrupted('timeout', wip_commits_present=True),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         swept = [
             _make_escalation(id='esc-42-1', level=0, agent_role='orchestrator'),
@@ -1778,8 +1779,10 @@ class TestStewardOutcomeRouting:
 
         mock_invoke.assert_not_called()
         steward.escalation_queue.submit.assert_not_called()  # type: ignore[attr-defined]  # no L1 filed
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='attempt_cap', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='attempt_cap', wip_commits_present=True,
+            ),
         )
 
     # -- Row 9 cancel-safety guard --------------------------------------------

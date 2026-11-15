@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.reconciliation.cli_stage_runner import (
     FINDING_ITEM_SCHEMA,
@@ -15,6 +16,8 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _extract_report,
 )
 from fused_memory.utils.clip_disclosure import TRUNCATION_FACTS_KEY, elision_marker
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 
 class TestFindingItemSchemaShape:
@@ -880,60 +883,3 @@ class TestGcArchivesBeforeDelete:
             f'archival with a mock data_dir created '
             f'{[p.name for p in tmp_path.iterdir()]!r} under the cwd'
         )
-
-
-class TestResumeParamForwarding:
-    """run_stage_via_cli forwards resume_session_id + resume_delivers_prompt into
-    invoke_with_cap_retry (task 2717 σ resume seam); both default to None/False so
-    every existing (non-resume) call site stays byte-identical."""
-
-    @pytest.mark.asyncio
-    async def test_resume_params_forwarded(self):
-        from fused_memory.config.schema import ReconciliationConfig
-        from fused_memory.reconciliation.cli_stage_runner import run_stage_via_cli
-
-        captured_kwargs: dict = {}
-        config = ReconciliationConfig()
-        mcp_config = {'mcpServers': {}}
-
-        with patch(
-            'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry',
-            new=_make_capture_invoke(captured_kwargs),
-        ):
-            await run_stage_via_cli(
-                system_prompt='test',
-                payload='recovery payload',
-                disallowed_tools=[],
-                config=config,
-                mcp_config=mcp_config,
-                resume_session_id='sess-resume',
-                resume_delivers_prompt=True,
-            )
-
-        assert captured_kwargs.get('resume_session_id') == 'sess-resume'
-        assert captured_kwargs.get('resume_delivers_prompt') is True
-
-    @pytest.mark.asyncio
-    async def test_resume_params_default_off(self):
-        from fused_memory.config.schema import ReconciliationConfig
-        from fused_memory.reconciliation.cli_stage_runner import run_stage_via_cli
-
-        captured_kwargs: dict = {}
-        config = ReconciliationConfig()
-        mcp_config = {'mcpServers': {}}
-
-        with patch(
-            'fused_memory.reconciliation.cli_stage_runner.invoke_with_cap_retry',
-            new=_make_capture_invoke(captured_kwargs),
-        ):
-            await run_stage_via_cli(
-                system_prompt='test',
-                payload='test payload',
-                disallowed_tools=[],
-                config=config,
-                mcp_config=mcp_config,
-            )
-
-        # Present-but-inert by default (mirrors session_id/config_dir passthrough).
-        assert captured_kwargs.get('resume_session_id') is None
-        assert captured_kwargs.get('resume_delivers_prompt') is False

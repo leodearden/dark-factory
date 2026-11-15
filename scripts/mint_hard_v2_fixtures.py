@@ -1200,7 +1200,8 @@ def render_curation_md(manifest: dict) -> str:
         'either. Both spellings are in live use (censused over reify\'s '
         '`main`: 2741 of the first, 74 of the second) and both are derived in '
         'one place, `shared.merge_subject.merge_subject_pattern`, '
-        'mirroring `git_ops.py::_merge_subject`.')
+        'which shares its fragments with the writer, '
+        '`shared.merge_subject.format_merge_subject`.')
     add('')
 
     # A POINTER plus DERIVED counts, not a second copy of the prose. The rule

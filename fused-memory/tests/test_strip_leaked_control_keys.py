@@ -18,8 +18,11 @@ from pathlib import Path
 import pytest
 from _fm_helpers import load_script_module
 from shared.testing_mcp_stub import StubAnswer, StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'strip_leaked_control_keys.py'
 

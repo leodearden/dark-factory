@@ -6,10 +6,11 @@ statuses canonicalisation, the page window and the per-request timeout.
 
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _canned_mcp import canned_get_tasks_result
+from _canned_mcp import CannedMCP, _raw_row, canned_get_tasks_result
 
 import dashboard.data.tasks as tasks_mod
 
@@ -35,8 +36,8 @@ class TestTasksReadRecord:
         component, so the mode's TYPE is what says which answer a read
         returns — readable as a named field, not parsed out of a string.
         """
-        page = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(10, 0))
-        whole = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead())
+        page = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(10, 0), None)
+        whole = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead(), None)
 
         assert page != whole
         assert type(page.mode) is not type(whole.mode)
@@ -53,7 +54,7 @@ class TestTasksReadRecord:
 
     def test_wire_arguments_omits_statuses_entirely_when_none(self):
         """statuses=None means "whole tree": the key is absent from the wire."""
-        read = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead())
+        read = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead(), None)
         assert read.wire_arguments() == {'project_root': '/r'}
 
     def test_wire_arguments_sends_an_empty_statuses_list(self):
@@ -64,7 +65,7 @@ class TestTasksReadRecord:
         "whole tree".
         """
         read = tasks_mod._TasksRead(
-            '/r', frozenset(), tasks_mod._CompleteRead()
+            '/r', frozenset(), tasks_mod._CompleteRead(), None,
         )
         assert read.wire_arguments() == {'project_root': '/r', 'statuses': []}
 
@@ -76,7 +77,7 @@ class TestTasksReadRecord:
         """
         read = tasks_mod._TasksRead(
             '/r', frozenset({'pending', 'done', 'blocked'}),
-            tasks_mod._CompleteRead(),
+            tasks_mod._CompleteRead(), None,
         )
         assert read.wire_arguments()['statuses'] == ['blocked', 'done', 'pending']
 
@@ -87,7 +88,7 @@ class TestTasksReadRecord:
         request is derived from `mode` itself and there is no second copy of
         the offset to disagree with.
         """
-        read = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(25, 50))
+        read = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(25, 50), None)
 
         assert read.wire_arguments() == {
             'project_root': '/r', 'page_size': 25, 'offset': 50,
@@ -290,3 +291,85 @@ class TestFetchTasksNarrowing:
             f'strictly tighter than mcp_tool_call default={mcp_default}'
         )
         assert tasks_mod.DEFAULT_PER_CALL_TIMEOUT > 0
+
+
+# ---------------------------------------------------------------------------
+# TestRowReadProjection — the row reads forward a ``fields`` projection
+# (task 9311)
+# ---------------------------------------------------------------------------
+
+_PROJECTION = [*tasks_mod.SHAPED_ROW_FIELDS, 'metadata.files']
+
+
+class TestRowReadProjection:
+    """``fields`` crosses the wire as the caller's list; omitted, it is not sent."""
+
+    @staticmethod
+    def _substrate() -> CannedMCP:
+        return CannedMCP(rows=[
+            _raw_row(1, 'pending', description='prose',
+                     metadata={'files': ['a.py'], 'routing': {'model': 'm'}}),
+            _raw_row(2, 'done', metadata={'files': ['b.py']}),
+        ])
+
+    async def test_fetch_tasks_sends_the_projection_beside_its_statuses(
+        self, dummy_client, dummy_config
+    ):
+        substrate = self._substrate()
+        with patch('dashboard.data.tasks.mcp_tool_call', new=substrate):
+            rows = await tasks_mod.fetch_tasks(
+                dummy_client, dummy_config, '/proj/A',
+                statuses=['pending'], fields=list(_PROJECTION),
+            )
+
+        [call] = substrate.calls_to('get_tasks')
+        assert call['args']['fields'] == _PROJECTION
+        assert type(call['args']['fields']) is list
+        assert call['args']['statuses'] == ['pending']
+        assert isinstance(rows, list)
+        assert [row['metadata'] for row in rows] == [{'files': ['a.py']}]
+
+    async def test_fetch_task_page_sends_the_projection_beside_its_window(
+        self, dummy_client, dummy_config
+    ):
+        substrate = self._substrate()
+        with patch('dashboard.data.tasks.mcp_tool_call', new=substrate):
+            await tasks_mod.fetch_task_page(
+                dummy_client, dummy_config, '/proj/A',
+                page_size=2, offset=0, fields=list(_PROJECTION),
+            )
+
+        [call] = substrate.calls_to('get_tasks')
+        assert call['args'] == {
+            'project_root': '/proj/A', 'page_size': 2, 'offset': 0, 'fields': _PROJECTION,
+        }
+
+    @pytest.mark.parametrize(('reader', 'kwargs', 'expected'), [
+        ('fetch_tasks', {'statuses': ['pending']},
+         {'project_root': '/proj/A', 'statuses': ['pending']}),
+        ('fetch_task_page', {'page_size': 2, 'offset': 0},
+         {'project_root': '/proj/A', 'page_size': 2, 'offset': 0}),
+    ])
+    async def test_an_omitted_projection_sends_no_fields_key(
+        self, dummy_client, dummy_config, reader, kwargs, expected
+    ):
+        substrate = self._substrate()
+        with patch('dashboard.data.tasks.mcp_tool_call', new=substrate):
+            await getattr(tasks_mod, reader)(dummy_client, dummy_config, '/proj/A', **kwargs)
+
+        [call] = substrate.calls_to('get_tasks')
+        assert call['args'] == expected
+
+    @pytest.mark.parametrize('omitted', tasks_mod.SHAPED_ROW_FIELDS)
+    async def test_a_projection_without_a_shaped_key_is_refused_before_sending(
+        self, dummy_client, dummy_config, omitted
+    ):
+        substrate = self._substrate()
+        fields = [key for key in _PROJECTION if key != omitted]
+        with (
+            patch('dashboard.data.tasks.mcp_tool_call', new=substrate),
+            pytest.raises(ValueError, match=re.escape(f'missing {[omitted]!r}')),
+        ):
+            await tasks_mod.fetch_tasks(dummy_client, dummy_config, '/proj/A', fields=fields)
+
+        assert substrate.calls == []

@@ -928,7 +928,7 @@ class TestTheResidueNamesWhoseCallLeaked:
     On THIS server the middleware's ``agent_id``/``project`` axes usually stay
     ``None``: ``MarkupGuardMiddleware._identity`` resolves them from arguments
     named ``agent_id`` / ``project_root`` / ``project_id``; no escalation tool
-    declares ``agent_id`` or ``project_id``, and the five tools that accept an
+    declares ``agent_id`` or ``project_id``, and the tools that accept an
     OPTIONAL ``project_root`` see it omitted by fleet callers. The record's
     own ``task_id`` is the synthetic ``mcp-markup-residue`` anchor — correctly
     so, since a live task id at level 2 would halt the very task that leaked.

@@ -1606,7 +1606,7 @@ class TestDigestByteCostFn:
         assert mod.digest_byte_cost_fn(max_bytes=15360)(record) == expected
         assert expected > 0
 
-    def test_max_bytes_defaults_to_the_module_constant(self):
+    def test_max_bytes_defaults_to_the_digest_cap(self):
         calls = []
 
         def fake_build(path, **kwargs):
@@ -1614,24 +1614,7 @@ class TestDigestByteCostFn:
             return 'z'
 
         mod.digest_byte_cost_fn(build=fake_build)(self._record())
-        assert calls == [mod.DEFAULT_DIGEST_MAX_BYTES]
-
-    def test_module_constant_matches_the_renderers_own_default(self):
-        """The whole point of this change is that the COST basis and the
-        RENDER basis are provably the same number. ``digest.py`` is outside
-        task 3268's locked scope, so its ``max_bytes=15360`` literal stays a
-        third independent definition of the §7.2 cap — this pins it equal to
-        ours so a drift fails here instead of silently mis-charging the
-        budget (reviewer_comprehensive, task 3268 amendment pass).
-        """
-        import inspect
-
-        from legibility import digest as digest_mod
-
-        renderer_default = (
-            inspect.signature(digest_mod.build_digest).parameters['max_bytes'].default
-        )
-        assert renderer_default == mod.DEFAULT_DIGEST_MAX_BYTES
+        assert calls == [digest.DEFAULT_MAX_BYTES]
 
 
 class TestRenderManifest:
@@ -1726,7 +1709,7 @@ class TestMainCLI:
         ``main`` is the diagnostic an operator reads to decide whether the
         budget is the reason a session was skipped, so its ``bytes used``
         line has to be the same quantity ``nightly`` charges: the real
-        rendered digest bytes at ``DEFAULT_DIGEST_MAX_BYTES``.
+        rendered digest bytes at ``digest.DEFAULT_MAX_BYTES``.
         """
         from legibility import digest as digest_mod
 
@@ -1774,7 +1757,7 @@ class TestMainCLI:
                 digest_mod.build_digest(
                     Path(entry['session']),
                     agent_class_override=entry['stratum'],
-                    max_bytes=mod.DEFAULT_DIGEST_MAX_BYTES,
+                    max_bytes=digest_mod.DEFAULT_MAX_BYTES,
                 ).encode('utf-8')
             )
             for entry in selected
@@ -1784,7 +1767,7 @@ class TestMainCLI:
         # The two WRONG bases really are distinguishable on this fixture, so
         # the assertion above cannot pass by coincidence:
         #   - raw transcript size (the original defect): 768 bytes measured
-        #   - the flat DEFAULT_DIGEST_MAX_BYTES estimate (the step-4
+        #   - the flat digest.DEFAULT_MAX_BYTES estimate (the step-4
         #     fallback, and what main reported before this wiring): 30_720
         # against 744 real digest bytes. The flat-estimate margin is 41x;
         # the raw-size margin on a 2-line fixture is only ~24 bytes (the
@@ -1794,7 +1777,7 @@ class TestMainCLI:
         # saturate the 15KB cap and collapse the flat-estimate margin.
         raw_total = sum(entry['size'] for entry in selected)
         assert reported != raw_total
-        assert reported != len(selected) * mod.DEFAULT_DIGEST_MAX_BYTES
+        assert reported != len(selected) * digest_mod.DEFAULT_MAX_BYTES
 
     def test_main_threads_resolved_archive_roots_into_enumerate(self, tmp_path, monkeypatch):
         # Wiring proof (no operator flip): main() resolves the config's

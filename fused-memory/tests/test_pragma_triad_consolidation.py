@@ -32,7 +32,7 @@ from fused_memory.services.write_journal import WriteJournal
 # ---------------------------------------------------------------------------
 
 
-async def _std_lifecycle(store, tmp_path: Path) -> None:  # noqa: ARG001
+async def _std_lifecycle(store, tmp_path: Path) -> None:
     """Standard initialize() lifecycle used by all stores except SqliteTaskBackend."""
     await store.initialize()
 
@@ -74,7 +74,7 @@ _DELEGATION_CASES = [
     ),
     pytest.param(
         'fused_memory.backends.sqlite_task_backend.apply_full_durability_pragmas',
-        lambda tmp: SqliteTaskBackend(),  # noqa: ARG005
+        lambda tmp: SqliteTaskBackend(),
         _backend_lifecycle,
         id='SqliteTaskBackend',
     ),

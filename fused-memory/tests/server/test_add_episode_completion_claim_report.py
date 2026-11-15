@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _task_facts_rows import task_facts_rows
 from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
 from fused_memory.server.tools import create_mcp_server
@@ -33,7 +34,7 @@ _CLAIM_CONTENT = "task 5422's de-flake fix has been applied"
 
 def _server(mock_service, root: Path):
     task_interceptor = MagicMock()
-    task_interceptor.get_statuses = AsyncMock(return_value={'5422': 'in-progress'})
+    task_interceptor.get_task_facts = AsyncMock(return_value=task_facts_rows({'5422': 'in-progress'}))
     task_interceptor.get_ticket_row = AsyncMock(return_value=None)
     return create_mcp_server(
         mock_service,

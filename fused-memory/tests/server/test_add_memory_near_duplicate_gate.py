@@ -16,24 +16,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-# Shared note fixtures, owned by the pure-matcher suite. Imported rather than
-# copied so the two suites cannot drift: an edit to the straddling note (e.g.
-# adding or removing a phrase hit) must move BOTH the matcher assertions there
-# and the whole-tool assertions here, instead of leaving one silently
-# exercising a different scenario (task 3054, reviewer: duplication).
-#
-# The bare import resolves because fused-memory/tests/conftest.py inserts the
-# tests dir onto sys.path (the same mechanism that makes `from _fm_helpers
-# import X` work), and pytest loads a conftest by PATH regardless of import
-# mode. Do NOT reason about this from pytest's rootdir/prepend behaviour: the
-# repo-root pyproject.toml sets `--import-mode=importlib`, under which a test
-# file's own directory is NOT put on sys.path, so a root-bound run would fail
-# at collection without that insert. Verified green under -n0, under xdist,
-# standalone, and root-bound via `pytest -c pyproject.toml` from the repo root.
-from test_config_schema import (
-    MERGE_BASE_NEGATIVE_CONTROL_NOTE,
-    STRADDLING_WRITE_FIXTURE,
-)
+# One shared note drives both this whole-tool suite and the pure-matcher suite
+# in test_config_schema.py, so an edit to it moves both and neither can drift
+# (task 3054). The bare import resolves because fused-memory/tests/conftest.py
+# inserts the tests dir onto sys.path, which the repo-root
+# `--import-mode=importlib` run needs.
+from _fm_helpers import MERGE_BASE_NEGATIVE_CONTROL_NOTE, STRADDLING_WRITE_FIXTURE
 
 from fused_memory.config.schema import (
     Mem0UpdateConfig,

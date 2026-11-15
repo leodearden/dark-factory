@@ -13,13 +13,16 @@ consumers import the shared record contract, they never re-derive it).
 
 A spawned session's hooks key its record on ``CLAUDE_SPAWN_SESSION_ID``, the
 slug of the record spawn-claude.sh created; a session without one (T3-hosted
-or hand-launched) keys on a registry pointer, else on its stdin
+or hand-launched) keys on a registry pointer (its session id, its claude
+pid, then its ``T3CODE_THREAD_ID`` thread), else on its stdin
 ``session_id``. See ``docs/session-hook-ownership.md`` §Record keying.
 
 IMPORT CONTRACT. ``skills/spawn/hooks/*.sh`` run this file by absolute path
 from a plain shell with only ``PYTHONPATH=<repo>/orchestrator/src``: no venv,
-no install. ``from orchestrator import ...`` works; a module-scope ``shared``
-or third-party import makes every hook die quietly. Pinned and mutation-tested
+no install. ``from orchestrator import ...`` works. ``shared`` leaves are
+reachable only below the ``session_registry`` import, whose bootstrap appends
+shared/src; a ``shared`` import above it, or any third-party import, makes
+every hook die quietly. Pinned and mutation-tested
 by the ``session_hooks.py`` row of
 ``orchestrator/tests/test_session_registry.py::TestStdlibOnlySelfContainment``.
 ``session_ownership_probes`` carries the same contract under its own row.
@@ -38,7 +41,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -46,6 +49,11 @@ from typing import Any
 from orchestrator import session_registry
 from orchestrator.session_ownership_probes import EventProbes, ProcessTree
 from orchestrator.session_self_exit import SelfExit
+
+# session_registry's import puts this checkout's shared/src on sys.path for the bare shell.
+# isort: split
+from shared.process_identity import Liveness
+from shared.session_liveness import capture_for_record, judge
 
 logger = logging.getLogger(__name__)
 
@@ -298,11 +306,21 @@ class _HookSlugResolution:
     INVARIANT: ``snapshot is None or snapshot.slug == slug``.
 
     ``session_id_keyed`` -- the slug was reached by this event's own session
-    id, either through its session-id pointer or through the hand-launched
-    keying that embeds it. A record bound to that id is therefore proven this
+    id: through its session-id pointer, through the hand-launched keying that
+    embeds it, or through a T3 thread pointer naming a record already bound
+    to it. A record bound to that id is therefore proven this
     session's, and a dead ``claude_owner_pid`` may be reclaimed;
     ``_bind_claude_session_id`` still requires the binding to equal the
     event's id.
+
+    ``may_rebind`` -- a SessionStart reached the record through its T3 thread
+    pointer while the recorded owner is judged DEAD: a resume in a new
+    process, which may re-bind the record to its fresh session id.
+
+    ``t3_thread_id`` -- this event's ``T3CODE_THREAD_ID``, read only when no
+    ``CLAUDE_SPAWN_SESSION_ID`` keys the event. ``claims_t3_thread`` -- that
+    same thread, set only on the hand-launched fall-through when no record
+    holds its pointer.
     """
 
     slug: str
@@ -310,6 +328,21 @@ class _HookSlugResolution:
     may_bind: bool
     snapshot: _RecordSnapshot | None
     session_id_keyed: bool = False
+    may_rebind: bool = False
+    t3_thread_id: str | None = None
+    claims_t3_thread: str | None = None
+
+
+_T3_THREAD_ID_ENV = 'T3CODE_THREAD_ID'
+"""Env var T3 Code sets in every process a thread starts, naming that thread."""
+
+
+@dataclass(frozen=True)
+class _PointerLookup:
+    """What the registry pointers say about one event: the record adopted, or else the T3 thread no record holds."""
+
+    adopted: _HookSlugResolution | None = None
+    unheld_t3_thread: str | None = None
 
 
 def _adopt_pointer_slug(
@@ -332,23 +365,72 @@ def _adopt_pointer_slug(
     return _HookSlugResolution(slug, None, may_bind, snapshot, session_id_keyed)
 
 
-def _pointer_resolution(
+def _adopt_t3_thread_slug(
+    slug: str,
     hook_input: Mapping[str, Any],
     root: Path | str | None,
     *,
     allow_remint: bool,
     probes: EventProbes,
 ) -> _HookSlugResolution | None:
-    """The record a registry pointer names for this event, adopted; None falls through.
+    """Adopt *slug*, the record this event's T3 thread pointer names, unless the event is not its owner.
+
+    A T3 thread carries no ``CLAUDE_SPAWN_OWNER_PPID``, so the claude pids
+    decide. Unbound: the thread's first claude binds, as does the recorded
+    owner pid or any event once the recorded owner is judged DEAD; an event
+    whose pid is unresolvable adopts without binding. Bound to this event's
+    session id: adopted as ``session_id_keyed``, so a dead owner is
+    reclaimed. Bound to another
+    session id: the owner-only re-mint rule of ``_env_slug_ownership``, or,
+    on SessionStart (*allow_remint*), a recorded owner judged DEAD re-binds.
+    A nested claude always has a live owner, so it forks. See
+    ``docs/session-hook-ownership.md`` §Owner or inheritor.
+    """
+    snapshot = _read_record_snapshot(slug, root)
+    record = snapshot.record
+    if record is None:
+        return None
+    owner_pid, current_pid = record.claude_owner_pid, probes.owning_claude_pid()
+    bound = (record.claude_session_id or '').strip()
+    if not bound:
+        if owner_pid is None or owner_pid == current_pid or _recorded_owner_is_dead(record):
+            return _HookSlugResolution(slug, None, True, snapshot)
+        if current_pid is None:
+            return _HookSlugResolution(slug, None, False, snapshot)
+        return None
+    if bound == _hook_session_id(hook_input):
+        return _HookSlugResolution(slug, None, True, snapshot, session_id_keyed=True)
+    if (
+        allow_remint
+        and _is_owner_only_session_start(hook_input)
+        and (owner_pid is None or current_pid is None or owner_pid == current_pid)
+    ):
+        return _HookSlugResolution(slug, None, True, snapshot)
+    if allow_remint and _recorded_owner_is_dead(record):
+        return _HookSlugResolution(slug, None, True, snapshot, may_rebind=True)
+    return None
+
+
+def _pointer_resolution(
+    hook_input: Mapping[str, Any],
+    root: Path | str | None,
+    t3_thread_id: str | None,
+    *,
+    allow_remint: bool,
+    probes: EventProbes,
+) -> _PointerLookup:
+    """The record a registry pointer names for this event, adopted; an empty lookup falls through.
 
     The stdin ``session_id``'s pointer first, then the owning claude's pid
-    pointer, which survives a re-mint. A pid-pointed record bound to another
-    session id is adopted only as a re-mint (``_env_slug_ownership``). See
-    ``docs/session-hook-ownership.md`` §Record keying.
+    pointer, which survives a re-mint, then *t3_thread_id*'s pointer. A
+    pid-pointed record bound to another session id is adopted only as a
+    re-mint (``_env_slug_ownership``); a thread-pointed one by
+    ``_adopt_t3_thread_slug``. A thread whose pointer no live record holds
+    is reported unheld. See ``docs/session-hook-ownership.md`` §Record keying.
     """
     session_id = _hook_session_id(hook_input)
     if not session_id:
-        return None
+        return _PointerLookup()
     by_session_id = _adopt_pointer_slug(
         session_registry.resolve_session_slug_for_claude_session_id(session_id, root=root),
         hook_input,
@@ -358,17 +440,29 @@ def _pointer_resolution(
         session_id_keyed=True,
     )
     if by_session_id is not None:
-        return by_session_id
+        return _PointerLookup(by_session_id)
     pid = probes.owning_claude_pid()
-    if pid is None:
-        return None
-    return _adopt_pointer_slug(
+    by_pid = None if pid is None else _adopt_pointer_slug(
         session_registry.resolve_session_slug_for_pid(pid, root=root),
         hook_input,
         root,
         allow_remint=allow_remint,
         probes=probes,
         session_id_keyed=False,
+    )
+    if (
+        by_pid is not None
+        or t3_thread_id is None
+        or not session_registry.is_t3_thread_pointer_name(t3_thread_id)
+    ):
+        return _PointerLookup(by_pid)
+    thread_slug = session_registry.resolve_session_slug_for_t3_thread(t3_thread_id, root=root)
+    if thread_slug is None:
+        return _PointerLookup(unheld_t3_thread=t3_thread_id)
+    return _PointerLookup(
+        _adopt_t3_thread_slug(
+            thread_slug, hook_input, root, allow_remint=allow_remint, probes=probes
+        )
     )
 
 
@@ -395,7 +489,9 @@ def _resolve_hook_slug(
 
     With no ``CLAUDE_SPAWN_SESSION_ID``, ``_pointer_resolution`` is tried
     before the hand-launched keying, which is session-id keyed: its slug
-    embeds the stdin ``session_id``.
+    embeds the stdin ``session_id``. Only that branch reads
+    ``T3CODE_THREAD_ID``, and only its hand-launched fall-through may claim
+    an unheld thread.
 
     *allow_remint* (SessionStart only) and *probes* are forwarded to
     ``_env_slug_ownership``. See ``docs/session-hook-ownership.md``
@@ -403,6 +499,8 @@ def _resolve_hook_slug(
     """
     spawn_session_id = (env.get('CLAUDE_SPAWN_SESSION_ID') or '').strip() or None
     rejected: str | None = None
+    t3_thread_id: str | None = None
+    claims_t3_thread: str | None = None
     if spawn_session_id is not None:
         # Sanitize BEFORE probing, so an adversarial token can no more escape
         # sessions_dir when read than when written.
@@ -420,9 +518,13 @@ def _resolve_hook_slug(
             return _HookSlugResolution(candidate, None, may_bind, snapshot)
         rejected = candidate
     else:
-        pointed = _pointer_resolution(hook_input, root, allow_remint=allow_remint, probes=probes)
-        if pointed is not None:
-            return pointed
+        t3_thread_id = (env.get(_T3_THREAD_ID_ENV) or '').strip() or None
+        lookup = _pointer_resolution(
+            hook_input, root, t3_thread_id, allow_remint=allow_remint, probes=probes
+        )
+        if lookup.adopted is not None:
+            return replace(lookup.adopted, t3_thread_id=t3_thread_id)
+        claims_t3_thread = lookup.unheld_t3_thread
 
     # Raw env on the fork branch too: the slug is an opaque key that all three
     # hook events must derive identically. See docs/session-hook-ownership.md
@@ -439,7 +541,15 @@ def _resolve_hook_slug(
     )
     # This slug embeds session_id itself, so binding it is tautological.
     # No snapshot: any read above was of a DIFFERENT record than this slug.
-    return _HookSlugResolution(slug, rejected, True, None, session_id_keyed=True)
+    return _HookSlugResolution(
+        slug,
+        rejected,
+        True,
+        None,
+        session_id_keyed=True,
+        t3_thread_id=t3_thread_id,
+        claims_t3_thread=claims_t3_thread,
+    )
 
 
 def hook_session_slug(
@@ -523,22 +633,46 @@ def _bind_claude_session_id(
     record.claude_session_id = hook_session_id
     # The pid later tells a re-mint inside the owner from a nested claude;
     # None, when unresolvable, reads back as "cannot prove ownership".
-    record.claude_owner_pid = probes.owning_claude_pid()
+    _stamp_owner(record, probes.owning_claude_pid())
     return True
+
+
+def _stamp_owner(record: session_registry.SessionRecord, pid: int | None) -> None:
+    """Write *record*'s owner pid and its identity together, so the pair never diverges."""
+    record.claude_owner_pid = pid
+    record.claude_owner_identity = (
+        None if pid is None else capture_for_record(pid)
+    )
 
 
 def _reclaim_dead_owner_pid(record: session_registry.SessionRecord, probes: EventProbes) -> bool:
-    """Re-stamp *record*'s ``claude_owner_pid`` with this event's claude pid iff no live process holds it.
+    """Re-stamp *record*'s owner with this event's claude pid iff its recorded owner is judged DEAD.
 
     A live recorded owner keeps the record: that is a nested ``claude
-    --resume`` of the same session id. Returns whether *record* was mutated.
+    --resume`` of the same session id. An owner on another host, or one
+    /proc cannot answer for, keeps it too. An owner recorded with this very
+    pid is re-stamped only when its identity is judged DEAD: a reboot or pid
+    reuse handed the pid back, and the stale identity must not outlive it.
+    Returns whether *record* was mutated.
     """
     pid = probes.owning_claude_pid()
     owner = record.claude_owner_pid
-    if pid is None or owner == pid or (owner is not None and session_registry.pid_alive(owner)):
+    if pid is None or (owner == pid and record.claude_owner_identity is None):
         return False
-    record.claude_owner_pid = pid
+    if owner is not None and not _recorded_owner_is_dead(record):
+        return False
+    _stamp_owner(record, pid)
     return True
+
+
+def _recorded_owner_is_dead(record: session_registry.SessionRecord) -> bool:
+    """Whether *record*'s recorded owner claude is judged DEAD; False when it records none."""
+    owner = record.claude_owner_pid
+    return (
+        owner is not None
+        and judge(record.claude_owner_identity, owner, pid_alive=session_registry.pid_alive)
+        is Liveness.DEAD
+    )
 
 
 def _stamp_session_pointers(
@@ -547,20 +681,27 @@ def _stamp_session_pointers(
     root: Path | str | None,
     *,
     newly_bound: bool,
+    t3_thread_id: str | None,
 ) -> None:
-    """Point the session id this event just bound, and its claude pid, at the written *record*.
+    """Point the session id this event just bound, its claude pid and its T3 thread at the written *record*.
 
     Each pointer asserts exactly what the written record already proves: the
     session-id pointer only when this event changed the binding, the
     pid pointer whenever ``claude_owner_pid`` is this event's owning claude
-    pid. The pid rule covers every lane (adopt, fork, a withheld launch
-    window, an unproven adopt, a blank session_id) without branching on them.
-    Fail-soft: both registry writers never raise.
+    pid, and the thread pointer whenever the record is t3 for this event's
+    *t3_thread_id* and no other live record holds that thread
+    (``session_registry.index_t3_record_if_unheld``): a hook never moves a
+    held thread pointer, only the T3 lane's bind does. The pid and thread
+    rules cover every lane (adopt, fork, a withheld launch window, an
+    unproven adopt, a blank session_id) without branching on them.
+    Fail-soft: the registry writers never raise.
     """
     if newly_bound and record.claude_session_id:
         session_registry.write_claude_session_pointer(
             record.claude_session_id, record.session_slug, root=root
         )
+    if t3_thread_id is not None and session_registry.t3_thread_of(record) == t3_thread_id:
+        session_registry.index_t3_record_if_unheld(record, record.session_slug, root=root)
     pid = probes.owning_claude_pid()
     if pid is None or record.claude_owner_pid != pid:
         return
@@ -824,10 +965,11 @@ def run_session_start(
     record is built from the resolved identity with status RUNNING. An
     existing record is refreshed to RUNNING in place, its other fields kept.
     Both then get best-effort enrichment (``parent_session_id`` from
-    ``CLAUDE_SPAWN_PARENT_ID``, display from ``_resolve_display`` unless the
-    record's is T3's), a binding when ``may_bind`` allows
-    (``_bind_claude_session_id``, re-binding on an owner-only ``source``), one
-    ``write_record`` and ``_stamp_session_pointers``.
+    ``CLAUDE_SPAWN_PARENT_ID``; a t3 display claiming ``claims_t3_thread``,
+    else display from ``_resolve_display`` unless the record's is T3's), a
+    binding when ``may_bind`` allows (``_bind_claude_session_id``, re-binding
+    on an owner-only ``source`` or ``may_rebind``), one ``write_record`` and
+    ``_stamp_session_pointers``.
 
     The record is read once per event: on the adopt path the ownership
     probe's snapshot is reused. An UNREADABLE body is re-read so the fault
@@ -885,6 +1027,7 @@ def run_session_start(
             escalation_id=identity.escalation_id,
             cwd=cwd,
             launcher_pid=launcher_pid,
+            launcher_identity=capture_for_record(launcher_pid),
             start_ts=datetime.now(UTC).isoformat(),
             transcript_path=session_registry.transcript_path_for_cwd(cwd),
         )
@@ -898,20 +1041,30 @@ def run_session_start(
         if parent_session_id is not None:
             record.parent_session_id = parent_session_id
     title = record.title or hook_display_title(identity, identity_env, record)
-    display = _resolve_display(env, title, allow_spawn_marker=forked_from is None)
-    if display is not None and not session_registry.is_t3_record(record):
-        record.display = display
+    if resolution.claims_t3_thread is not None:
+        # Wins over _resolve_display: TMUX/WINDOWID leak from the T3 server's env.
+        record.display = session_registry.Display(
+            kind=session_registry.DisplayKind.T3.value,
+            wm_title=title,
+            t3_thread_id=resolution.claims_t3_thread,
+        )
+    else:
+        display = _resolve_display(env, title, allow_spawn_marker=forked_from is None)
+        if display is not None and not session_registry.is_t3_record(record):
+            record.display = display
     # may_bind, not forked_from, guards the bind: an adopted-but-unproven
     # event refreshes the record without claiming it.
     newly_bound = may_bind and _bind_claude_session_id(
         record,
         hook_input,
-        allow_rebind=_is_owner_only_session_start(hook_input),
+        allow_rebind=_is_owner_only_session_start(hook_input) or resolution.may_rebind,
         reclaim_dead_owner=resolution.session_id_keyed,
         probes=probes,
     )
     session_registry.write_record(record, root=root)
-    _stamp_session_pointers(record, probes, root, newly_bound=newly_bound)
+    _stamp_session_pointers(
+        record, probes, root, newly_bound=newly_bound, t3_thread_id=resolution.t3_thread_id
+    )
     return record
 
 
@@ -1069,7 +1222,9 @@ def _run_status_refresh_and_retitle(
         evaluation.stamp(record)
     # Unconditional: the heartbeat is owed on every event, a withheld one too.
     session_registry.write_record(record, root=root)
-    _stamp_session_pointers(record, probes, root, newly_bound=newly_bound)
+    _stamp_session_pointers(
+        record, probes, root, newly_bound=newly_bound, t3_thread_id=resolution.t3_thread_id
+    )
     if self_exit is not None and evaluation is not None:
         self_exit.enact(evaluation, record, root)
     identity_env = _own_identity_env(env, resolution)

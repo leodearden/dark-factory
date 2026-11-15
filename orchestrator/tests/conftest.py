@@ -25,6 +25,7 @@ from _live_mcp_guard import (
     assert_no_live_attempts,
     install_live_mcp_guard,
 )
+from _tree_scan import TreePass, analyses_requested_by
 
 # Insert this worktree's src directories at the front of sys.path so that
 # `import orchestrator` and `import shared` load the local (possibly modified)
@@ -42,6 +43,9 @@ if str(_ESCALATION_SRC) not in sys.path:
 _TESTS_DIR = Path(__file__).parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
+_CROSS_SUITE_HELPERS_DIR = _TESTS_DIR / "cross_suite_helpers"
+if str(_CROSS_SUITE_HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CROSS_SUITE_HELPERS_DIR))
 
 # Repo root of this worktree.  Used by the autouse ``_isolate_orch_config``
 # fixture to pin ``ORCH_CONFIG_PATH`` at the canonical top-level
@@ -295,6 +299,20 @@ def pristine_repo_templates(
     """
     with session_templates(tmp_path_factory.mktemp('git-templates')) as templates:
         yield templates
+
+
+@pytest.fixture(scope='session')
+def tree_pass(request: pytest.FixtureRequest) -> TreePass:
+    """The one streaming whole-tree pass every ``TREE_ANALYSES`` consumer shares.
+
+    LAZY: only a worker that runs a consumer pays for it, and that cost is
+    billed to the first consumer item it runs, which is why every consumer
+    carries the whole-tree family mark.  NOT prebuilt at collection time
+    (unlike shared/tests/session_prebuild.py): every xdist worker collects
+    every item, so a prebuild would make every worker parse.  ``_tree_scan``
+    holds the mechanism.
+    """
+    return TreePass.run(analyses_requested_by(request.session.items))
 
 
 @pytest.fixture
@@ -1254,6 +1272,13 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # asyncio.sleep() argument instead of a MagicMock crash.
     config.warm_lane_gc_enabled = False
     config.warm_lane_gc_interval_secs = 600.0
+    # Gates both the deterministic recon sweep and the scheduled-deploy
+    # settler, which share this interval.
+    config.deterministic_recon_sweep_enabled = False
+    config.deterministic_recon_sweep_interval_secs = 900.0
+    # Always-on services (task 5344): no enable gate, so the interval must be real.
+    config.merge_heartbeat_interval_secs = 15.0
+    config.stale_service_restart_interval_secs = 15.0
     point_harness_stores_at(config, tmp_path)
     # Production default (task 4757). Unassigned, TaskWorkflow._invoke would
     # read a truthy Mock and run every mock-config workflow test strictly scoped.

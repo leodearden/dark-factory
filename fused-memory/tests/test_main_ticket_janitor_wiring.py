@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from escalation.queue import EscalationQueue
 from shared.project_layout import escalation_queue_dir
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TicketJanitorConfig
 from fused_memory.middleware.curation_deferral import DeferReason
@@ -28,6 +29,8 @@ from fused_memory.middleware.ticket_janitor import curation_backlog_anchor
 from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.main import _build_ticket_janitor
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT_ROOT = '/project'
 PROJECT_ID = 'project'
@@ -47,7 +50,7 @@ class _DeferThenHoldCurator:
     ) -> PreparedCandidate:
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
-    async def curate_batch_prepared(
+    async def curate_prepared(
         self, prepared: list[PreparedCandidate], project_id: str, project_root: str,
     ) -> list[CuratorDecision]:
         if self._defer_next:
@@ -59,11 +62,6 @@ class _DeferThenHoldCurator:
 
     async def close(self) -> None:
         return None
-
-
-@pytest.fixture(autouse=True)
-def _combine_audit_in_tmp(monkeypatch, tmp_path):
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
 
 
 @pytest.fixture

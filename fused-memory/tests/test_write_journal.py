@@ -22,7 +22,11 @@ from fused_memory.config.schema import WriteJournalConfig
 from fused_memory.services.write_journal import (
     OPERATOR_TELEMETRY_QUERY,
     Mem0IntentStatus,
+    Mem0RetryBacklog,
+    Mem0WriteMethod,
     WriteJournal,
+    decode_mem0_intent_metadata,
+    decode_mem0_intent_write_method,
 )
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_verification import ReferentFinding
@@ -644,6 +648,7 @@ async def test_log_mem0_intent_roundtrip_pending(journal):
         content=long_content,
         metadata=metadata,
         payload_digest='digest-abc',
+        write_method=Mem0WriteMethod.ADD,
     )
     incomplete = await journal.get_incomplete_mem0_intents()
     assert len(incomplete) == 1
@@ -674,6 +679,7 @@ async def test_resolve_mem0_intent_completed_removes_from_incomplete(journal):
         content='hi',
         metadata={},
         payload_digest='d',
+        write_method=Mem0WriteMethod.ADD,
     )
     await journal.resolve_mem0_intent(intent_id, 'completed')
 
@@ -695,6 +701,7 @@ async def test_resolve_mem0_intent_dead_persists_reason(journal):
         content='hi',
         metadata={},
         payload_digest='d',
+        write_method=Mem0WriteMethod.ADD,
     )
     reason = 'no backend_op: unknown outcome (not auto-re-issued)'
     await journal.resolve_mem0_intent(intent_id, 'dead', reason=reason)
@@ -720,6 +727,7 @@ async def test_get_mem0_intents_status_filter(journal):
             content=f'content-{status}',
             metadata={},
             payload_digest='d',
+            write_method=Mem0WriteMethod.ADD,
         )
         if status != 'pending':
             await journal.resolve_mem0_intent(iid, status)
@@ -744,6 +752,7 @@ async def test_get_incomplete_returns_only_pending(journal):
         content='pending-one',
         metadata={},
         payload_digest='d',
+        write_method=Mem0WriteMethod.ADD,
     )
     for status in ['completed', 'failed', 'dead']:
         iid = str(uuid.uuid4())
@@ -753,6 +762,7 @@ async def test_get_incomplete_returns_only_pending(journal):
             content=f'c-{status}',
             metadata={},
             payload_digest='d',
+            write_method=Mem0WriteMethod.ADD,
         )
         await journal.resolve_mem0_intent(iid, status)
 
@@ -774,6 +784,7 @@ async def test_prune_mem0_intents_ages_out_terminal_rows(journal):
             content=f'c-{status}',
             metadata={},
             payload_digest='d',
+            write_method=Mem0WriteMethod.ADD,
         )
         if status != 'pending':
             await journal.resolve_mem0_intent(iid, status)
@@ -816,6 +827,7 @@ async def test_prune_mem0_intents_can_include_dead_explicitly(journal):
         content='c',
         metadata={},
         payload_digest='d',
+        write_method=Mem0WriteMethod.ADD,
     )
     await journal.resolve_mem0_intent(iid, 'dead', reason='unknown outcome')
     await journal._require_access().connection.execute(
@@ -838,7 +850,9 @@ async def test_prune_mem0_intents_can_include_dead_explicitly(journal):
 async def test_prune_mem0_intents_never_raises(journal):
     """A prune hiccup must not crash startup — returns 0, no raise."""
     await journal.close()
-    assert await journal.prune_mem0_intents() == 0
+    assert await journal.prune_mem0_intents(
+        older_than_days=WriteJournalConfig().mem0_intents_retention_days,
+    ) == 0
 
 
 # The mem0_intents DDL as it stood before task 7397 added attempts and
@@ -885,6 +899,19 @@ class TestMem0IntentRetrySchedule:
         assert row['next_attempt_at'] is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('method', list(Mem0WriteMethod))
+    async def test_an_intent_records_the_method_it_writes_through(self, journal, method):
+        row = await mem0_intent_row(
+            journal, await seed_mem0_intent(journal, write_method=method)
+        )
+        assert row['write_method'] == method.value
+        assert decode_mem0_intent_write_method(row) is method
+
+    def test_an_unknown_write_method_does_not_decode(self):
+        with pytest.raises(ValueError, match='bogus'):
+            decode_mem0_intent_write_method({'write_method': 'bogus'})
+
+    @pytest.mark.asyncio
     async def test_migration_adds_columns_to_a_pre_change_database(self, tmp_path):
         data_dir = tmp_path / 'wj'
         data_dir.mkdir()
@@ -901,6 +928,9 @@ class TestMem0IntentRetrySchedule:
             row = await mem0_intent_row(j, 'old-1')
             assert row['attempts'] == 0
             assert row['next_attempt_at'] is None
+            # Every pre-change intent was journaled by add_memory: add_system_record
+            # journaled none before task 7401.
+            assert row['write_method'] == 'add'
             assert await j.schedule_mem0_retry(
                 'old-1', reason='rate_limited', retry_at=datetime.now(UTC)
             )
@@ -1047,6 +1077,100 @@ class TestMem0IntentRetrySchedule:
         assert row['resolved_at'] is None
 
 
+class TestDecodeMem0IntentMetadata:
+    @pytest.mark.asyncio
+    async def test_round_trips_what_log_mem0_intent_journaled(self, journal):
+        metadata = {
+            'topic': 'x',
+            'supersedes': ['aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'],
+            'nested': {'tags': ['a', 'b']},
+        }
+        intent_id = await seed_mem0_intent(journal, metadata=metadata)
+
+        row = await mem0_intent_row(journal, intent_id)
+
+        assert decode_mem0_intent_metadata(row) == metadata
+
+    @pytest.mark.asyncio
+    async def test_a_row_journaled_without_metadata_decodes_empty(self, journal):
+        intent_id = await seed_mem0_intent(journal, metadata=None)
+
+        row = await mem0_intent_row(journal, intent_id)
+
+        assert row['metadata'] == '{}'
+        assert decode_mem0_intent_metadata(row) == {}
+
+    def test_a_null_metadata_column_decodes_empty(self):
+        assert decode_mem0_intent_metadata({'metadata': None}) == {}
+
+
+class TestMem0RetryBacklog:
+    @pytest.mark.asyncio
+    async def test_no_retrying_rows_is_no_backlog(self, journal):
+        for status in (
+            Mem0IntentStatus.PENDING,
+            Mem0IntentStatus.COMPLETED,
+            Mem0IntentStatus.FAILED,
+            Mem0IntentStatus.DEAD,
+        ):
+            await seed_mem0_intent(journal, status=status, project_id='p')
+
+        assert await journal.get_mem0_retry_backlog() == []
+
+    @pytest.mark.asyncio
+    async def test_one_frozen_summary_per_project_of_its_retrying_rows(self, journal):
+        oldest_a = datetime(2026, 10, 22, 17, 38, tzinfo=UTC)
+        oldest_b = datetime(2026, 10, 22, 18, 0, tzinfo=UTC)
+        await seed_mem0_intent(
+            journal, status=Mem0IntentStatus.RETRYING, project_id='a',
+            created_at=oldest_a,
+        )
+        thrice = await seed_mem0_intent(
+            journal, status=Mem0IntentStatus.RETRYING, project_id='a',
+            created_at=oldest_a + timedelta(minutes=5),
+        )
+        for _ in range(2):
+            assert await journal.schedule_mem0_retry(
+                thrice, reason='rate_limited', retry_at=datetime.now(UTC)
+            )
+        await seed_mem0_intent(
+            journal, status=Mem0IntentStatus.RETRYING, project_id='b',
+            created_at=oldest_b,
+        )
+        for status in (
+            Mem0IntentStatus.PENDING,
+            Mem0IntentStatus.COMPLETED,
+            Mem0IntentStatus.FAILED,
+            Mem0IntentStatus.DEAD,
+        ):
+            await seed_mem0_intent(
+                journal, status=status, project_id='a',
+                created_at=oldest_a - timedelta(days=1),
+            )
+
+        backlog = await journal.get_mem0_retry_backlog()
+
+        assert backlog == [
+            Mem0RetryBacklog(
+                project_id='a', count=2, oldest_created_at=oldest_a, max_attempts=3
+            ),
+            Mem0RetryBacklog(
+                project_id='b', count=1, oldest_created_at=oldest_b, max_attempts=1
+            ),
+        ]
+        assert backlog[0].oldest_created_at.tzinfo is not None
+        assert len(set(backlog)) == 2, 'a frozen summary is hashable'
+
+    def test_age_is_measured_from_the_oldest_retrying_row(self):
+        oldest = datetime(2026, 10, 22, 17, 38, tzinfo=UTC)
+        backlog = Mem0RetryBacklog(
+            project_id='a', count=1, oldest_created_at=oldest, max_attempts=1
+        )
+        now = oldest + timedelta(hours=2)
+
+        assert backlog.age(now) == timedelta(hours=2)
+
+
 # ------------------------------------------------------------------
 # idempotent_ops: client-supplied idempotency keys (task 2712)
 # ------------------------------------------------------------------
@@ -1116,7 +1240,9 @@ async def test_prune_idempotent_ops_ages_out_old_rows(journal):
 async def test_prune_idempotent_ops_never_raises(journal):
     """A prune hiccup must not crash startup — returns 0, no raise."""
     await journal.close()
-    assert await journal.prune_idempotent_ops() == 0
+    assert await journal.prune_idempotent_ops(
+        older_than_days=WriteJournalConfig().idempotent_ops_retention_days,
+    ) == 0
 
 
 # --- write_ops(created_at) seekability (task 3304) -------------------------

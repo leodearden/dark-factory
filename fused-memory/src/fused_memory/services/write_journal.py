@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import aiosqlite
 from shared.async_sqlite_base import (
@@ -236,7 +237,8 @@ CREATE INDEX IF NOT EXISTS idx_bo_created ON backend_ops(created_at);
 -- terminal completed/failed rows are aged out by WriteJournal.prune_mem0_intents
 -- (run at startup after recovery); 'dead' rows are preserved for manual replay.
 -- 'retrying' rows (task 7397: a transient provider failure, re-issued at
--- next_attempt_at) keep resolved_at NULL and so are never pruned.
+-- next_attempt_at) keep resolved_at NULL and so are never pruned. A re-issue
+-- calls the Mem0Backend method write_method names (task 7401).
 CREATE TABLE IF NOT EXISTS mem0_intents (
     id TEXT PRIMARY KEY,
     write_op_id TEXT,
@@ -253,7 +255,8 @@ CREATE TABLE IF NOT EXISTS mem0_intents (
     created_at TEXT NOT NULL,
     resolved_at TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at TEXT
+    next_attempt_at TEXT,
+    write_method TEXT NOT NULL DEFAULT 'add'
 );
 CREATE INDEX IF NOT EXISTS idx_mi_status ON mem0_intents(status);
 CREATE INDEX IF NOT EXISTS idx_mi_write_op ON mem0_intents(write_op_id);
@@ -446,8 +449,41 @@ class Mem0IntentStatus(StrEnum):
     DEAD = 'dead'
 
 
+class Mem0WriteMethod(StrEnum):
+    """Which ``Mem0Backend`` method an intent's write goes through, so a re-issue calls the same one."""
+
+    ADD = 'add'
+    ADD_SYSTEM_RECORD = 'add_system_record'
+
+
 def _schedule_timestamp(moment: datetime) -> str:
     return moment.isoformat(timespec='microseconds')
+
+
+def decode_mem0_intent_metadata(intent: Mapping[str, Any]) -> dict[str, Any]:
+    """The metadata a ``mem0_intents`` row journaled: the one decoder of that column."""
+    return json.loads(intent.get('metadata') or '{}')
+
+
+def decode_mem0_intent_write_method(intent: Mapping[str, Any]) -> Mem0WriteMethod:
+    """The method a ``mem0_intents`` row writes through: the one decoder of that column.
+
+    Raises ``ValueError`` naming an unknown or missing value.
+    """
+    return Mem0WriteMethod(intent.get('write_method'))
+
+
+@dataclass(frozen=True)
+class Mem0RetryBacklog:
+    """One project's ``retrying`` Mem0 intents, as ``WriteJournal.get_mem0_retry_backlog`` reads them."""
+
+    project_id: str | None
+    count: int
+    oldest_created_at: datetime
+    max_attempts: int
+
+    def age(self, now: datetime) -> timedelta:
+        return now - self.oldest_created_at
 
 
 class WriteJournal:
@@ -577,6 +613,11 @@ class WriteJournal:
 
             if await add_column_if_missing(db, 'mem0_intents', 'next_attempt_at', 'TEXT'):
                 logger.info('Migration: added next_attempt_at column to mem0_intents')
+
+            if await add_column_if_missing(
+                db, 'mem0_intents', 'write_method', "TEXT NOT NULL DEFAULT 'add'"
+            ):
+                logger.info('Migration: added write_method column to mem0_intents')
 
             # Indexes on new columns (safe after migration ensures columns exist)
             await db.execute(
@@ -997,7 +1038,7 @@ class WriteJournal:
                 f'Failed to record idempotent_ops for {client_op_id}: {e}'
             )
 
-    async def prune_idempotent_ops(self, *, older_than_days: float = 7.0) -> int:
+    async def prune_idempotent_ops(self, *, older_than_days: float) -> int:
         """Age out old ``idempotent_ops`` rows past a retention window.
 
         One row accrues per mutating task write (update_task / set_task_status /
@@ -1007,7 +1048,8 @@ class WriteJournal:
         (seconds to minutes; a higher-level retry at most hours), so an
         aggressive TTL is safe: rows whose ``created_at`` is older than
         ``older_than_days`` are deleted and the count returned. Intended to run
-        at startup alongside ``prune_mem0_intents``.
+        at startup alongside ``prune_mem0_intents``. The horizon's home is
+        ``config/schema.py::WriteJournalConfig.idempotent_ops_retention_days``.
 
         Fire-and-forget — logs loudly on failure but never raises, so a prune
         hiccup cannot crash startup (mirrors ``prune_mem0_intents``).
@@ -1050,6 +1092,7 @@ class WriteJournal:
         content: str,
         metadata: dict | None = None,
         payload_digest: str | None,
+        write_method: Mem0WriteMethod,
     ) -> None:
         """Write-ahead a Mem0 write intent.
 
@@ -1069,8 +1112,8 @@ class WriteJournal:
                     """INSERT INTO mem0_intents
                        (id, write_op_id, causation_id, project_id, agent_id,
                         session_id, category, payload_digest, content, metadata,
-                        status, reason, created_at, resolved_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)""",
+                        write_method, status, reason, created_at, resolved_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL, ?, NULL)""",
                     (
                         intent_id,
                         write_op_id,
@@ -1082,6 +1125,7 @@ class WriteJournal:
                         payload_digest,
                         content,
                         json.dumps(metadata) if metadata else '{}',
+                        write_method.value,
                         datetime.now(UTC).isoformat(),
                     ),
                 )
@@ -1164,6 +1208,27 @@ class WriteJournal:
             (Mem0IntentStatus.RETRYING, _schedule_timestamp(now), limit),
         )
         return [dict(row) for row in rows]
+
+    async def get_mem0_retry_backlog(self) -> list[Mem0RetryBacklog]:
+        """Summarise the ``retrying`` intents per project, ordered by project.
+
+        Raises on a read error: the caller chooses the fallback.
+        """
+        rows = await self._require_access().read_all(
+            'SELECT project_id, COUNT(*), MIN(created_at), MAX(attempts) '
+            'FROM mem0_intents WHERE status = ? '
+            'GROUP BY project_id ORDER BY project_id',
+            (Mem0IntentStatus.RETRYING,),
+        )
+        return [
+            Mem0RetryBacklog(
+                project_id=row[0],
+                count=row[1],
+                oldest_created_at=datetime.fromisoformat(row[2]),
+                max_attempts=row[3],
+            )
+            for row in rows
+        ]
 
     async def count_mem0_intents_by_status(self, *, since: datetime) -> dict[str, int]:
         """Count intents created at or after ``since``, keyed by status in sorted order.
@@ -1279,7 +1344,7 @@ class WriteJournal:
     async def prune_mem0_intents(
         self,
         *,
-        older_than_days: float = 30.0,
+        older_than_days: float,
         statuses: tuple[str, ...] = ('completed', 'failed'),
     ) -> int:
         """Age out terminal ``mem0_intents`` past a retention window.
@@ -1291,7 +1356,8 @@ class WriteJournal:
         ``resolved_at`` is older than ``older_than_days``, returning the count
         deleted. Intended to run once at startup (after
         ``MemoryService.recover_mem0_intents``) or from a periodic
-        maintenance task.
+        maintenance task. The horizon's home is
+        ``config/schema.py::WriteJournalConfig.mem0_intents_retention_days``.
 
         ``dead`` is deliberately EXCLUDED from the default ``statuses``: a
         dead-lettered intent carries the full content needed for manual replay

@@ -54,7 +54,7 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
     @staticmethod
     @functools.cache
     def _committed():
-        import yaml  # noqa: PLC0415
+        import yaml
 
         cls = TestCommittedJudgeAccuracyReportIsTraceable
         block = yaml.safe_load(cls.CONFIG_PATH.read_text()).get('write_triage') or {}
@@ -195,7 +195,7 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         Still no assertion on any accuracy VALUE — this is about whether a
         run happened, never about whether it scored well.
         """
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+        from fused_memory.server import write_triage_judge
 
         _block, report, _resolved = self._committed()
         assert report is not None
@@ -355,7 +355,7 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         Unlike `judge_candidate_count`, which the sibling test above
         deliberately leaves unbound to the shipped config.
         """
-        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        from fused_memory.server.write_triage_judge import (
             JUDGE_SYSTEM_PROMPT,
         )
 

@@ -3,41 +3,21 @@ session runs under the basetemp its caller names, and never in the host's
 default pytest temp root."""
 from __future__ import annotations
 
-import getpass
-import os
-import time
 from pathlib import Path
 
 import pytest
+from _host_pytest_temp_root import listing, seed_dead_session_dirs
 from _probe_session import run_probe_session
 
 _PROBE = Path(__file__).with_name('_probe_session_probe.py')
-#: Older than pytest's 3-day LOCK_TIMEOUT, so pytest treats the lock as dead.
-_DEAD_LOCK_AGE_SECS = 5 * 24 * 60 * 60
-
-
-def _listing(root: Path) -> list[str]:
-    return sorted(str(p.relative_to(root)) for p in root.rglob('*'))
-
-
-def _seed_a_dead_sessions_dirs(user_root: Path) -> None:
-    """``pytest-0`` holds a dead session's leftovers and lock; ``pytest-1..3``
-    make it a cleanup candidate as soon as a new session adds ``pytest-4``."""
-    (user_root / 'pytest-0' / 'leftover').mkdir(parents=True)
-    lock = user_root / 'pytest-0' / '.lock'
-    lock.write_text('')
-    dead = time.time() - _DEAD_LOCK_AGE_SECS
-    os.utime(lock, (dead, dead))
-    for n in (1, 2, 3):
-        (user_root / f'pytest-{n}').mkdir()
 
 
 def test_a_probe_session_leaves_the_hosts_default_temp_root_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     host = tmp_path / 'host-temp'
-    _seed_a_dead_sessions_dirs(host / f'pytest-of-{getpass.getuser()}')
-    before = _listing(host)
+    seed_dead_session_dirs(host)
+    before = listing(host)
     monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
     basetemp = tmp_path / 'probe-basetemp'
 
@@ -49,14 +29,14 @@ def test_a_probe_session_leaves_the_hosts_default_temp_root_untouched(
     recorded = list(basetemp.rglob('inherited-temproot'))
     assert len(recorded) == 1, (
         f'the probe must run under the basetemp it was given ({basetemp}); '
-        f'found {_listing(basetemp) if basetemp.exists() else "no such dir"}'
+        f'found {listing(basetemp) if basetemp.exists() else "no such dir"}'
     )
     assert recorded[0].read_text() == str(host), (
         'the probe session never inherited PYTEST_DEBUG_TEMPROOT, so it would '
         'use the real host temp root and leave the stand-in untouched with or '
         'without --basetemp: the assertion below would pass vacuously'
     )
-    after = _listing(host)
+    after = listing(host)
     assert after == before, (
         "a nested probe session must not create, lock or clean dirs in the "
         "host's default pytest temp root: its exit-time cleanup of other "

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import IO, Final
 
 from client_feed.contract import Branch
+from client_feed.sources.task_id import task_id_of
 
 MAIN_BRANCH: Final = 'main'
 TASK_BRANCH_PREFIX: Final = 'task/'
@@ -24,7 +25,6 @@ GIT_TIMEOUT_SECS: Final = 300
 _BRANCH_REFS: Final = 'refs/heads/'
 _MAIN_REF: Final = f'{_BRANCH_REFS}{MAIN_BRANCH}'
 _OBJECT_SHA: Final = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
-_DECIMAL: Final = re.compile(r'[0-9]+')
 _COMMIT_MARK: Final = b'\x01'
 _FIRST_PARENT_DIFF: Final = '--diff-merges=first-parent'
 _PARSE_FAILURE: Final = 'output not understood'
@@ -305,13 +305,6 @@ def blob_reader(
     _finish(session)
 
 
-def _task_id(branch: str) -> int | None:
-    suffix = branch.removeprefix(TASK_BRANCH_PREFIX)
-    if _DECIMAL.fullmatch(suffix) is None or int(suffix) < 1:
-        return None
-    return int(suffix)
-
-
 def _branch(record: bytes) -> Branch | None:
     """One for-each-ref record; None for a ref whose name is not UTF-8, which no feed record can carry."""
     raw_refname, unix, ahead_behind = record.split(b'\0')
@@ -322,7 +315,7 @@ def _branch(record: bytes) -> Branch | None:
     name = refname.removeprefix(_BRANCH_REFS)
     return Branch(
         name=name,
-        task_id=_task_id(name),
+        task_id=task_id_of(name.removeprefix(TASK_BRANCH_PREFIX)),
         ahead=int(ahead_behind.split()[0]),
         last_commit_at=datetime.fromtimestamp(int(unix), UTC),
     )

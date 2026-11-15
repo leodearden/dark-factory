@@ -52,9 +52,7 @@ def select_blocked_gate_tasks(active_tasks: Iterable[object]) -> list[dict]:
       absent ``operational_mode`` matches, following each field's declared
       default in ``shared/src/shared/task_metadata.py::TaskMetadata``. This
       arm alone catches deterministic tasks blocked with no stamp (the
-      ScriptTimeout and infra_issue paths in the
-      ``orchestrator/src/orchestrator/deterministic_runner.py`` module
-      docstring).
+      ScriptTimeout and infra_issue paths in ``docs/deterministic-runner.md``).
     * Observed: a non-empty ``gate_escalated_at`` string. This arm alone
       catches the llm-mode coerced pure gates described at
       ``fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py::gate_escalated_age_secs``.

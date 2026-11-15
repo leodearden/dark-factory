@@ -1,0 +1,24 @@
+{
+  "task_id": "8524",
+  "reason": "step-11: adoption-void re-anchor tests drive _finalize_inflight on a bare worker and read the redispatch park; a _remerge recorder pins the claim at the cascade and RUNNER_UNAVAILABLE sites",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_chain_intact.py",
+      "baseline": 74,
+      "current": 80
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_concurrent_verify.py",
+      "baseline": 177,
+      "current": 179
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6428,
+      "current": 6436
+    }
+  ]
+}

@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _jsx_source_helpers import destructure_bindings, extract_function_body, strip_js_comments
 from _lock_chip_matrix import chip_classes_over_the_matrix
 
 
@@ -676,8 +676,6 @@ def test_scheduler_tab_renders_degraded_projects_distinctly(tab_scheduler_jsx_bo
     WIRING assertion rather than a prose pin — a mention in the banner's own
     explanatory comment cannot satisfy it.
     """
-    from _dashboard_helpers import destructure_bindings
-
     body = strip_js_comments(extract_function_body(tab_scheduler_jsx_body, 'SchedulerTab'))
 
     match = re.search(r'const\s*\{(.*?)\}\s*=\s*sched\s*;', body, re.S)

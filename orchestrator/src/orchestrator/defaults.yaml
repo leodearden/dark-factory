@@ -164,12 +164,14 @@ prices:
     input_per_1m: 10.00
     output_per_1m: 50.00
     cached_input_per_1m: 1.00
-  gpt-5.6-sol:
-    input_per_1m: 4.00
-    output_per_1m: 20.00
-  gpt-5.6-terra:
+  gpt-6.1-sol:
     input_per_1m: 2.00
-    output_per_1m: 12.00
+    output_per_1m: 10.00
+    cached_input_per_1m: 0.10
+  gpt-6.1-terra:
+    input_per_1m: 1.00
+    output_per_1m: 5.00
+    cached_input_per_1m: 0.05
   o4-mini:
     input_per_1m: 1.10
     output_per_1m: 4.40
@@ -392,7 +394,8 @@ budgets:
 
 # Turn limits per invocation
 max_turns:
-  architect: 100
+  # Leo 2026-11-04: matches the df/reify value; seat U's 17 mechanical no-plan failures were the 100-turn cap.
+  architect: 180
   implementer: 80
   debugger: 50
   # 30 -> 60 (2026-08-17, task-3543 /unblock investigation; see task 3321).
@@ -421,9 +424,11 @@ max_turns:
 # Reasoning effort per role
 effort:
   # architect: EVAL-GOVERNED -- see the models.architect comment above and
-  # plans/architect-effort-adoption-decision-2026-07-28.md (task iota; MARGINAL
-  # verdict 2026-07-27, held at max rather than flipped to high).
-  architect: "max"
+  # plans/architect-effort-adoption-decision-2026-07-28.md (task iota; its
+  # 2026-07-27 run compared opus-max vs opus-high only, MARGINAL, held at max).
+  # Leo 2026-11-03: xhigh, as max is no longer a good choice since Opus 5.5
+  # (reviewer moved to xhigh 2026-10-31, task 7972).
+  architect: "xhigh"
   implementer: "max"
   debugger: "max"
   # Leo 2026-10-31 (task 7972); evidence and revert: gate task 7973.
@@ -680,6 +685,8 @@ merge_deep:
   chain_cap: 0
   # Chain-build deadline (s); above reify's measured whole-process build p99 (~1230 s).
   chain_build_timeout_secs: 1800
+  # How long a built chain's links stay reserved for its tip verify (s).
+  chain_reservation_timeout_secs: 7200
 
 # Chronic pool-infra flake auto-file detector (task 2358). Gated OFF until
 # reify task 5142's flaky-ledger.jsonl + CHRONIC-FLAKY marker substrate is
@@ -1016,3 +1023,21 @@ verify_host_unreachable_escalate_after_n: 3
 verify_host_unreachable_escalate_after_secs: 600.0
 verify_host_policy: prefer_local
 verify_host_reprobe_interval_s: 120.0
+
+# Remote task-leg verifies (task 6670; plans/remote-task-leg-verify-prd.md
+# §5.7).  All four are green-tier: the dispatcher reads them per dispatch.
+#
+# verify_task_host_policy: local (default) runs every task verify locally and
+#   writes no dispatch sidecar.  remote_modules makes a verify eligible when its
+#   executed modules intersect verify_task_remote_modules (which must then be
+#   non-empty); remote_all makes every verify eligible.  Rollback is one reload
+#   back to local.
+# verify_task_remote_cross_check_every_n: every n-th verify that returns a
+#   remote verdict (green or red, counted per orchestrator process) is re-run
+#   locally, local authoritative (0 = off).
+# verify_task_remote_red_confirms_locally: a remote red is re-run locally and
+#   the local verdict returned.
+verify_task_host_policy: local
+verify_task_remote_modules: []
+verify_task_remote_cross_check_every_n: 0
+verify_task_remote_red_confirms_locally: false

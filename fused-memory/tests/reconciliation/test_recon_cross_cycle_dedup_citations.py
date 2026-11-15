@@ -218,7 +218,7 @@ class TestSignaturePathCrossCycleDedup:
 
     def test_compute_flag_signature_cited_tasks_fallback_returns_cited_task_id(self):
         """Null top-level task_id + cited_tasks → signature derived from cited task id."""
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.flag_identity import compute_flag_signature
 
         flag = {
             'flag_type': 'cross_project',
@@ -241,7 +241,7 @@ class TestSignaturePathCrossCycleDedup:
         'X') while flag B's (top-level None) becomes ('5040,5149', 'X') via
         the existing fallback -- a shape mismatch between A and B.
         """
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.flag_identity import compute_flag_signature
 
         shared_cited_tasks = [
             {'project_id': 'reify', 'task_id': '5040'},
@@ -265,7 +265,7 @@ class TestSignaturePathCrossCycleDedup:
         cited_tasks at all is unaffected by the union change -- still
         returns the plain top-level signature.
         """
-        from fused_memory.reconciliation.flag_dedup import compute_flag_signature
+        from fused_memory.reconciliation.flag_identity import compute_flag_signature
 
         flag = {'task_id': '5040', 'flag_type': 'X'}
         result = compute_flag_signature(flag)

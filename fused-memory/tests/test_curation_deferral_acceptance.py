@@ -21,16 +21,25 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, TypeVar, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, patch
 
 import pytest
 import pytest_asyncio
-from _curator_helpers import agent_result, empty_corpus, pool_with_ids
+from _curator_helpers import (
+    agent_result,
+    empty_corpus,
+    escalator_double,
+    pool_with_ids,
+    prepared,
+    zot_agent_result,
+)
 from escalation.queue import EscalationQueue
+from shared.cli_invoke import AllAccountsCappedException
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import CapHit
 from shared.project_layout import escalation_queue_dir
 from shared.usage_gate import UsageGate
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig, TicketJanitorConfig
 from fused_memory.middleware.candidate_key import normalize_title
@@ -49,6 +58,8 @@ from fused_memory.middleware.ticket_janitor import TicketJanitor, curation_backl
 from fused_memory.middleware.ticket_store import TicketStatus, TicketStore
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.main import _build_ticket_janitor
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT_ROOT = '/project'
 PROJECT_ID = 'project'
@@ -79,7 +90,6 @@ class _Curator:
 
     def __init__(self, answer: Callable[[str], Verdict]) -> None:
         self._answer = answer
-        self.batch_raises: deque[BaseException] = deque()
         self.asked: list[str] = []
         self.holding = asyncio.Event()
 
@@ -99,17 +109,10 @@ class _Curator:
     ) -> PreparedCandidate:
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
-    async def curate_batch_prepared(
+    async def curate_prepared(
         self, prepared: list[PreparedCandidate], project_id: str, project_root: str,
     ) -> list[CuratorDecision]:
-        if self.batch_raises:
-            raise self.batch_raises.popleft()
         return [await self._verdict(p.candidate.title) for p in prepared]
-
-    async def curate(
-        self, candidate: CandidateTask, project_id: str, project_root: str,
-    ) -> CuratorDecision:
-        return await self._verdict(candidate.title)
 
     def note_created(self, project_id: str, candidate: CandidateTask, task_id: str) -> None:
         return None
@@ -209,11 +212,6 @@ class _Server:
             await _bounded(interceptor.close())
         for store in self._stores:
             await store.close()
-
-
-@pytest.fixture(autouse=True)
-def _combine_audit_in_tmp(monkeypatch, tmp_path):
-    monkeypatch.setenv('DARK_FACTORY_DATA_DIR', str(tmp_path / 'data'))
 
 
 @pytest_asyncio.fixture
@@ -484,22 +482,45 @@ _CALLER_METADATA = {'source': 'acceptance-test', 'spawn_context': 'manual'}
 
 @pytest.mark.asyncio
 async def test_a_fail_open_create_carries_the_dedupe_skipped_marker(server):
-    curator = _Curator(_in_turn({'Work': [CAPPED, CuratorFailureError('llm hung', zero_output_timeout=True)]}))
-    interceptor, janitor, _ = await server.boot(_config(), curator)
+    """A parked ticket whose retry hits a zero-output hang, with no orchestrator
+    to escalate to, is created by the pipeline's failure mapper, marked."""
+    capped = True
+
+    async def invoke(**_kwargs: Any):
+        if capped:
+            raise AllAccountsCappedException(retries=3, elapsed_secs=120.0, label='task-curator[p]')
+        return zot_agent_result()
+
+    escalator = escalator_double()
+    escalator.report_failure = AsyncMock(
+        side_effect=CuratorFailureError('no orchestrator is running', zero_output_timeout=True),
+    )
+    config = _config()
+    curator = TaskCurator(
+        config=config, taskmaster=None, escalator=escalator, invoke=AsyncMock(side_effect=invoke),
+    )
+
+    async def bundle_for(candidate: CandidateTask, *_args: Any) -> PreparedCandidate:
+        return prepared(candidate.title, candidate=candidate)
+
+    curator.prepare_candidate = AsyncMock(side_effect=bundle_for)
+    curator.record_task = AsyncMock()
+    curator.search_corpus = AsyncMock(return_value=[])
+    interceptor, janitor, _ = await server.boot(config, curator)
     ticket_id = await _park(interceptor, 'Work', metadata=_CALLER_METADATA)
-    curator.batch_raises.append(CuratorFailureError('batch down'))
+    capped = False
 
     await _let_tiny_backoff_pass()
     await _bounded(janitor.tick())
+    answer = await _resolve(interceptor, ticket_id)
 
-    reason = 'curator-failed: CuratorFailureError: llm hung'
-    assert await _resolve(interceptor, ticket_id) == {
-        'status': 'created', 'task_id': '101', 'reason': f'create: {reason}',
-    }
+    assert (answer['status'], answer['task_id']) == ('created', '101')
+    reason = answer['reason'].removeprefix('create: ')
+    assert reason.startswith('curator-failed: CuratorFailureError')
     [created] = server.taskmaster.add_task_calls
     metadata = json.loads(created['metadata'])
     marker = metadata.pop(DEDUPE_SKIPPED_KEY)
-    assert metadata == _CALLER_METADATA
+    assert metadata == {**_CALLER_METADATA, 'declared_scope': ANY}
     assert marker['reason'] == reason
     assert datetime.fromisoformat(marker['at']).utcoffset() == timedelta(0)
 

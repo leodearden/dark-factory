@@ -185,11 +185,13 @@ a standing exemption for whatever it becomes:
     itself.  No CLI flag reaches the prefix (``--project-suffix`` moves the
     suffix only), so no invocation can point these deletes or writes at a
     ``fused``-prefixed production collection;
-  * it does not write mem0's shared SQLite history: ``seed_arm`` stubs
-    ``instance.db.add_history`` per instance before the first ``add`` (that
-    writer is process-shared, xdist-contended, and read-only in the sandbox —
-    see ``seed_arm``'s own docstring).  So the capability the preflight probes
-    for is not one the seeding path needs.
+  * it does not write mem0's shared SQLite history: ``run_bake_off`` sets
+    ``config.mem0.persist_history = False`` on its own config copy, so every
+    arm's mem0 instance keeps its history in a private in-memory DB and never
+    opens the shared ``$MEM0_DIR/history.db`` (process-shared, xdist-contended,
+    and read-only in the sandbox — see
+    ``fused_memory/config/schema.py::Mem0BackendConfig.persist_history``).  So
+    the capability the preflight probes for is not one the seeding path needs.
 
 THE RESIDUAL, stated rather than papered over — and scoped to the LIVE path
 (i.e. absent ``--replay-fetches``): on that path ``run_bake_off`` builds a
@@ -1528,7 +1530,7 @@ def character_proxy_tokens(text: str) -> int:
     The import is function-local so importing this script costs nothing until
     a token is actually counted.
     """
-    from fused_memory.reconciliation.context_assembler import (  # noqa: PLC0415
+    from fused_memory.reconciliation.context_assembler import (
         estimate_tokens,
     )
 
@@ -1568,7 +1570,7 @@ def resolve_token_estimator() -> tuple[str, Any]:
         import tiktoken  # type: ignore[reportMissingImports]  # noqa: PLC0415
 
         encoding = tiktoken.get_encoding('cl100k_base')
-    except Exception:  # noqa: BLE001 — absent, broken, or offline: same answer
+    except Exception:  # absent, broken, or offline: same answer
         return CHAR_PROXY_ESTIMATOR_NAME, character_proxy_tokens
 
     def _encode(text: str) -> int:
@@ -1694,9 +1696,9 @@ def as_memory_results(hits: list[ScoredHit]) -> list[Any]:
     ``source_store`` is ``mem0`` for every hit: the arms are seeded into
     mem0/Qdrant and production's pre-check searches ``stores=['mem0']``.
     """
-    from fused_memory.models.enums import MemoryCategory, SourceStore  # noqa: PLC0415
-    from fused_memory.models.memory import MemoryResult  # noqa: PLC0415
-    from fused_memory.services.memory_service import RRF_K  # noqa: PLC0415
+    from fused_memory.models.enums import MemoryCategory, SourceStore
+    from fused_memory.models.memory import MemoryResult
+    from fused_memory.services.memory_service import RRF_K
 
     results = []
     for rank, hit in enumerate(hits, start=1):
@@ -1731,7 +1733,7 @@ def resolve_guard_threshold(memory_service: Any = None) -> float:
     already treats every missing hop as "use the default", so no separate
     branch is needed.
     """
-    from fused_memory.server.near_duplicate_guard import (  # noqa: PLC0415
+    from fused_memory.server.near_duplicate_guard import (
         resolve_near_dup_threshold,
     )
 
@@ -1771,7 +1773,7 @@ def guard_adequacy(
     hits must not accidentally measure a more generous guard than production
     runs.
     """
-    from fused_memory.server import near_duplicate_guard  # noqa: PLC0415
+    from fused_memory.server import near_duplicate_guard
 
     if threshold is None:
         threshold = resolve_guard_threshold()
@@ -1867,8 +1869,8 @@ def _load_sibling_script(name: str) -> Any:
     other reflection-based decorators look the defining module up there, so
     a module loaded without registering breaks on the way in.
     """
-    import importlib.util  # noqa: PLC0415
-    import sys  # noqa: PLC0415
+    import importlib.util
+    import sys
 
     if name in sys.modules:
         return sys.modules[name]
@@ -1940,7 +1942,7 @@ def resolve_audit_threshold() -> float:
     a retune.  A stale threshold in the artifact is worse than none: it makes
     the recall look like a fact about a detector nobody is running.
     """
-    import inspect  # noqa: PLC0415
+    import inspect
 
     detector = load_audit_script().find_near_duplicate_memory_groups
     params = inspect.signature(detector).parameters
@@ -2400,7 +2402,7 @@ def _git_stdout(args: list[str], cwd: Path) -> str | None:
     alike.  Provenance that cannot be verified must not look verified, so a
     stamp is either git's own answer or absent — never a guess.
     """
-    import subprocess  # noqa: PLC0415
+    import subprocess
 
     try:
         completed = subprocess.run(
@@ -3556,9 +3558,9 @@ def write_artifacts(
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    import contextlib  # noqa: PLC0415
-    import os  # noqa: PLC0415
-    import tempfile  # noqa: PLC0415
+    import contextlib
+    import os
+    import tempfile
 
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -3832,7 +3834,7 @@ def worker_suffix() -> str:
     Never empty: an unsuffixed project_id would give two concurrent workers
     the same collection, and each would measure the other's arm.
     """
-    import os  # noqa: PLC0415
+    import os
 
     return os.environ.get('PYTEST_XDIST_WORKER') or 'main'
 
@@ -3855,7 +3857,7 @@ def ephemeral_collections(
     hand-built name could differ from the collection mem0 actually writes to
     — and the reap would then miss it.
     """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     resolved_prefix = prefix or ephemeral_collection_prefix()
     return {
@@ -3873,14 +3875,14 @@ def drop_collections(names: Any, *, qdrant_url: str) -> None:
     A failure on one name must not abandon the rest: the whole point of the
     teardown is that nothing survives it.
     """
-    from qdrant_client import QdrantClient  # noqa: PLC0415
+    from qdrant_client import QdrantClient
 
     client = QdrantClient(url=qdrant_url, timeout=10)
     try:
         for name in names:
             try:
                 client.delete_collection(name)
-            except Exception as exc:  # noqa: BLE001 - absence is the normal case
+            except Exception as exc:  # absence is the normal case
                 print(f'could not drop {name}: {exc}', file=sys.stderr)
     finally:
         client.close()
@@ -3987,19 +3989,10 @@ async def seed_arm(
     """Write every record of one arm into its own ephemeral collection.
 
     Populates ``by_stored_id`` in place and returns the same object.
-
-    ``instance.db.add_history`` is stubbed first: mem0's SQLite history
-    writer is process-shared and xdist-contended (and read-only in the
-    sandbox).  It is not the question under test, and its failure would mask
-    the one that is — the same reason ``test_recon_dedup_premise.py:135`` and
-    the E1 probe stub it.
     """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     scope = Scope(project_id=seeded.project_id, agent_id=SEED_AGENT_ID)
-    instance = await backend._get_instance(scope)
-    instance.db.add_history = lambda *args, **kwargs: None
-
     semaphore = asyncio.Semaphore(concurrency)
 
     async def _write(record: ArmRecord) -> None:
@@ -4024,7 +4017,7 @@ async def _search(
     backend: Any, seeded: SeededArm, text: str, *, limit: int,
 ) -> list[ScoredHit]:
     """One ranked list from the arm's collection, joined back to its records."""
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     response = await backend.search(
         query=text, scope=Scope(project_id=seeded.project_id), limit=limit,
@@ -4833,7 +4826,7 @@ def _aggregate_queries(rows: list[dict[str, Any]], limit: int) -> dict[str, Any]
     ``queries: 0`` is a legitimate result and every metric under it is
     ``None`` — an empty subset is "not asked", never a measured zero.
     """
-    import statistics  # noqa: PLC0415
+    import statistics
 
     canonical_ranks = [
         row['canonical_rank'] for row in rows if row['canonical_rank'] is not None
@@ -5566,8 +5559,8 @@ async def run_bake_off(
     them: a probe that leaked one would leave it live on every run while the
     report it returned looked perfect.
     """
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.services.memory_service import MemoryService
 
     clusters = load_calibration_clusters(alpha_fixture)
     topics = load_registry_topics(registry)
@@ -5646,6 +5639,7 @@ async def run_bake_off(
 
     config = (config or FusedMemoryConfig()).model_copy(deep=True)
     config.mem0.collection_prefix = ephemeral_collection_prefix()
+    config.mem0.persist_history = False
     # Clearing the pinned key makes mem0's OpenAIEmbedding fall back to the
     # real OPENAI_API_KEY.  A stub constant vector would make every ranking in
     # this report meaningless.  `providers.openai` is optional in the schema
@@ -6088,7 +6082,7 @@ async def _replay_bake_off(
 
 def build_parser() -> Any:
     """The CLI.  Every flag is a knob on the experiment, none on its verdict."""
-    import argparse  # noqa: PLC0415
+    import argparse
 
     parser = argparse.ArgumentParser(
         description=(

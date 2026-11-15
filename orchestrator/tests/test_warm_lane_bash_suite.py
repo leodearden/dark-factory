@@ -115,7 +115,7 @@ SCRIPT_COVERAGE = {
 #:
 #: ``test_thin_warm_lane.sh``'s Block C df-delta assert is not a deduction: it is
 #: gated on ``REIFY_WARM_LANE_MOUNT``, which ``_sanitized_env`` always strips, so
-#: 45 is both its floor and its measured count under this driver.
+#: 74 is both its floor and its measured count under this driver.
 #:
 #: Any OTHER shortfall — a block short-circuited by a future edit — fails loudly
 #: here instead of passing as a green item that ran less than it claims.  Leaf γ
@@ -171,11 +171,21 @@ SCRIPT_COVERAGE = {
 #: guard.  NON-VACUOUS by construction: against the pre-change scripts they
 #: reported ``29`` and ``9`` failures respectively, and the four V5 arms added
 #: on review (NaN, Infinity, a non-object stamp, no python3; 17 asserts) 5 more.
+#:
+#: Dark-factory task 5307 then ported reify task 5823's live-process-reference
+#: gate into ``thin-warm-lane.sh`` with its coverage — A12, the B3 token pair,
+#: B3b and Block F — so the thin floor moved 45 → 75.  RE-MEASURED against the
+#: suite (``Results: 75 passed, 0 failed``), not raised to absorb a red.  The new
+#: asserts carry no skip guard; they need only ``flock`` and a readable ``/proc``.
+#: NON-VACUOUS by construction: against the pre-port script the same file reports
+#: ``61 passed, 14 failed``.
 ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 89,  # 79 + 10 (A10, task 5940)
-    'test_warm_lane_degenerate_ref.sh': 84,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
+    'test_warm_lane_degenerate_ref.sh': 95,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
                                              # + 3 (U8, task 5940)
-    'test_thin_warm_lane.sh': 45,
+                                             # + 6 (M1-M3: merge arm from shared.merge_subject, task 6716)
+                                             # + 5 (M4-M5: the lib refuses an empty merge arm, task 6716)
+    'test_thin_warm_lane.sh': 74,  # 45 + 29 (A12 3, B3 2, B3b 6, Block F 18)
     'test_warm_lane_gc.sh': 441,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
                                  #           + A11 12 + A11-boundary 5) + 2 (A11m/A11n, task 5940)
                                  # + 43 (S-discard) + 21 (T) − 8 (S-discard3, root-guarded; task 7862)

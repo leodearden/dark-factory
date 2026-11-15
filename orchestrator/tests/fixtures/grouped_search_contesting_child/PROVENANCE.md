@@ -19,20 +19,21 @@ render pass whatever production actually carried.
 | | |
 |---|---|
 | **Grounding** | **Real producer over a stub scenario.** The real `search` MCP tool (`fused-memory/src/fused_memory/server/tools.py::create_mcp_server` → `fused-memory/src/fused_memory/server/grouped_read.py::group_search_results`) ran over a stub memory service; only the service's reads are stubbed. |
-| **Producing code sites** | `fused-memory/src/fused_memory/server/grouped_read.py::_digest_entry` stamps `contested: true` on a digest entry from `grouped_read.py::is_contested_child`, the single definition of contested, and gives that entry `content`: the child's text cut by `fused-memory/src/fused_memory/utils/clip_disclosure.py::elide_text` at `write_triage.judge_field_chars`, which `fused-memory/src/fused_memory/server/tools.py` resolves per call via `fused-memory/src/fused_memory/server/write_triage_judge.py::resolve_judge_field_chars`. |
+| **Producing code sites** | `fused-memory/src/fused_memory/server/grouped_read.py::_amendment_entry` gives every amendment entry `content`: the child's text cut by `grouped_read.py::amendment_text` (over `fused-memory/src/fused_memory/utils/clip_disclosure.py::elide_text`) at `write_triage.judge_field_chars`, which `fused-memory/src/fused_memory/server/tools.py` resolves per call via `fused-memory/src/fused_memory/server/write_triage_judge.py::resolve_judge_field_chars`. It stamps `contested: true` from `grouped_read.py::is_contested_child`, the single definition of contested. |
 | **Pinning test** | `fused-memory/tests/server/test_contesting_child_search_reply.py` re-produces both replies and asserts equality, printing the produced JSON on a mismatch. |
 | **Readers** | `orchestrator/tests/test_memory_recall.py` and `orchestrator/tests/test_briefing_project_scope.py`, through `orchestrator/tests/_briefing_helpers.py::recorded_search_text`. |
 | **Serialisation** | `pydantic_core.to_jsonable_python` of the tool result, then `json.dumps(..., indent=2, ensure_ascii=False)` plus one trailing newline. |
 
 The scenario: parent `11111111-…-111111111111` carries two amendments, an
-ordinary one (`…221`, created first) and a contesting one (`…222`, body over the
-240-character digest cut).
+ordinary one (`…221`, created first) and a contesting one (`…222`, body longer
+than the 240 characters the pre-7518 digest showed).
 
 Load-bearing facts a reader must not re-derive from prose:
 
-* **The contested digest entry carries `content`.** Its `digest` is still cut
-  at 240 characters and ends with `…`; `content` is the child's text, whole
-  here because the body is under the judge's field cap.
+* **Every amendment entry carries `content` and none carries `digest`.** The
+  contested entry differs from the ordinary one only by `contested: true`; its
+  `content` is the child's text, whole here because the body is under the
+  judge's field cap.
 * **In `child-also-matched` the full body is on the wire twice**: as the
   same-id top-level result (uncapped) and as the entry's `content` (capped).
   In `only-parent-matched` the entry's `content` is the only full copy.

@@ -13,8 +13,7 @@ docs session lands its new or edited documents the same way:
 
 lands every path as ONE commit through ONE merge request on the queue of the
 orchestrator whose escalation MCP listens on 127.0.0.1:*port*. `land_file` is
-its single-path form, and `land_or_exit` that form exiting through
-`_config_reload_gate.die` on a refusal.
+its single-path form.
 
 Paths are relative to the checkout *repo*; an absolute path inside it is
 accepted. The content is the caller's, authored outside the target checkout,
@@ -41,9 +40,11 @@ merge gate; nothing is special-cased for docs.
 
 The change is committed on a short-lived `task/deploy-<label>-<UTC stamp>`
 branch, in a worktree outside the target checkout, submitted through
-merge_request, and polled by the request's own handle until it settles. The
-landing is then confirmed by git: the deploy commit is on main, and the
-target checkout's copy of every landed path is main's.
+merge_request, and polled by the request's own handle until it settles. A
+request left to poll is named on stderr as soon as the queue accepts it, so
+a run killed mid-wait still leaves its id in the log. The landing is then
+confirmed by git: the deploy commit is on main, and the target checkout's
+copy of every landed path is main's.
 
 The deploy branch is torn down once its request can no longer land. A request
 still in flight when the deadline passes, or when SIGTERM/SIGINT arrives, is
@@ -52,6 +53,12 @@ are kept, because the merge worker reads the request's source from them. A
 submit whose reply the transport lost may still have been accepted, so the
 queue is then asked about the deploy branch by its unique name, and the
 request it names is waited for like any other.
+
+A caller that lands on a cadence calls `reclaim_retained_deploys` first. A
+deploy an earlier run retained is torn down once it can no longer land, and
+one that still may is returned, so the caller can skip rather than stack a
+second request beside it. A worktree holding such a deploy's branch that
+this module did not place is never force-removed.
 
 The calling heredoc's side of the contract (argv-only inputs, the script's
 directory on sys.path, the checkout venv's interpreter) is
@@ -68,13 +75,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from _config_reload_gate import die, load_transport, transport_not_importable_remedy
+from _config_reload_gate import load_transport, transport_not_importable_remedy
 
 try:
     from shared.merge_state import (
@@ -166,6 +173,7 @@ def land_files(
     repo: str, files: Mapping[str, bytes], base_sha: str, *,
     port: str, label: str, message: str,
     timeout_secs: float | str | None = None, main_branch: str = "main",
+    clock: Callable[[], float] = time.monotonic,
 ) -> Landing:
     """Land each of *files*' content as its path (relative to the checkout
     *repo*) on *main_branch*, as one commit branching from *base_sha*, through
@@ -179,13 +187,14 @@ def land_files(
     timeout (SUBMIT_REPLY_TIMEOUT_SECS for the submit, POLL_REPLY_TIMEOUT_SECS
     for a poll), and a request still unsettled is then cancelled
     (POLL_REPLY_TIMEOUT_SECS more), so land_files can return up to about 190 s,
-    plus its git teardown, after the deadline.
+    plus its git teardown, after the deadline. *clock* is the monotonic clock
+    the deadline is measured on, time.monotonic by default.
     """
     queue = _MergeQueue.connect(port)
     target = _Target.of(Path(repo), files, main_branch)
     target.check_change(base_sha)
     target.check_checkout_clean()
-    deadline = time.monotonic() + float(timeout_secs or DEFAULT_LANDING_TIMEOUT_SECS)
+    deadline = _Deadline.after(float(timeout_secs or DEFAULT_LANDING_TIMEOUT_SECS), clock)
     with (
         _stop_signals_held() as stop,
         _deploy_branch(target, base_sha, label=label, message=message) as deploy,
@@ -197,24 +206,55 @@ def land_file(
     repo: str, path: str, base_sha: str, content: bytes, *,
     port: str, label: str, message: str,
     timeout_secs: float | str | None = None, main_branch: str = "main",
+    clock: Callable[[], float] = time.monotonic,
 ) -> Landing:
     """`land_files` of *content* as the one *path*."""
     return land_files(
         repo, {path: content}, base_sha, port=port, label=label, message=message,
-        timeout_secs=timeout_secs, main_branch=main_branch,
+        timeout_secs=timeout_secs, main_branch=main_branch, clock=clock,
     )
 
 
-def land_or_exit(repo: str, path: str, base_sha: str, content: bytes, *, prog: str,
-                 **kwargs: Any) -> Landing:
-    """`land_file`, exiting through `die` with the refusal's detail."""
-    try:
-        return land_file(repo, path, base_sha, content, **kwargs)
-    except LandingNotConfirmed as exc:
-        die(prog, exc.detail)
+def reclaim_retained_deploys(repo: str, label: str, *, port: str,
+                             main_branch: str = "main") -> tuple[str, ...]:
+    """The deploy branches of *label* in the checkout *repo* whose request may
+    still land, once every other one is torn down.
+
+    A deploy that can no longer land is torn down: *main_branch* carries its
+    tip, or the queue of the orchestrator whose escalation MCP listens on
+    127.0.0.1:*port* reports its request settled. One the queue reports in
+    flight, or whose poll the transport dropped, is kept.
+    """
+    checkout = Path(repo)
+    queue: _MergeQueue | None = None
+    kept: list[str] = []
+    for branch in _deploy_branches_of(checkout, label):
+        if not _main_carries(checkout, main_branch, branch):
+            queue = queue or _MergeQueue.connect(port)
+            reply = queue.poll(_status_handle(branch))
+            if reply is None or _may_still_land(reply.get("state")):
+                kept.append(branch)
+                continue
+        _reclaim(checkout, branch)
+    return tuple(kept)
 
 
-def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: float,
+def _reclaim(repo: Path, branch: str) -> None:
+    """Tear down the deploy *branch*, which can no longer land. A worktree
+    with it checked out that _DeployBranch.create did not place, such as an
+    operator's inspection checkout, may hold work: it is left and named, and
+    git then refuses to delete the branch it holds, which _tear_down
+    reports."""
+    worktree = _worktree_of(repo, branch)
+    scratch = _deploy_scratch_of(worktree)
+    placed = worktree if scratch is not None else None
+    if placed is None and worktree is not None and worktree.exists():
+        print(f"{_LOG_PREFIX} leaving {worktree}, which has {branch} checked out but is not a "
+              f"deploy worktree; remove it to let {branch} be reclaimed", file=sys.stderr)
+    _tear_down(repo, branch, worktree=placed, scratch=scratch)
+
+
+def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: _Deadline,
           stop: _StopSignals, *, description: str) -> Landing:
     stop.check()
     try:
@@ -227,6 +267,9 @@ def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: 
         if not _submit_pending(submitted, target, deploy):
             return _confirmed(target, deploy, submitted)
         pending = _Pending.submitted(submitted, deploy)
+        print(f"{_LOG_PREFIX} merge_request answered {submitted['status']} for {deploy.branch} "
+              f"(request_id={submitted.get('request_id')}); waiting for it to settle",
+              file=sys.stderr)
     return _confirmed(target, deploy,
                       _poll_until_landed(queue, target, deploy, pending, deadline, stop))
 
@@ -234,6 +277,22 @@ def _land(queue: _MergeQueue, target: _Target, deploy: _DeployBranch, deadline: 
 # ---------------------------------------------------------------------------
 # Stopping: the deadline and the stop signals
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _Deadline:
+    """The moment *at* which the landing's ceiling passes, on the monotonic
+    *clock* it was taken from."""
+
+    at: float
+    clock: Callable[[], float]
+
+    @classmethod
+    def after(cls, timeout_secs: float, clock: Callable[[], float]) -> _Deadline:
+        return cls(clock() + timeout_secs, clock)
+
+    def remaining(self) -> float:
+        return self.at - self.clock()
+
 
 class _CeilingReached(Exception):
     """The landing's deadline passed with its request still unsettled."""
@@ -309,8 +368,8 @@ def _stop_signals_held() -> Iterator[_StopSignals]:
         signal.raise_signal(stop.received)
 
 
-def _sleep_before_poll(delay: float, deadline: float, stop: _StopSignals) -> None:
-    remaining = deadline - time.monotonic()
+def _sleep_before_poll(delay: float, deadline: _Deadline, stop: _StopSignals) -> None:
+    remaining = deadline.remaining()
     if remaining <= 0:
         raise _CeilingReached("the landing timed out")
     stop.wait(min(delay, remaining))
@@ -442,12 +501,7 @@ class _Target:
         return proc.stdout if proc.returncode == 0 else None
 
     def carries(self, tip: str) -> bool:
-        """Whether main holds *tip*: as an ancestor, or as an equal patch (the
-        queue may land a rebased copy)."""
-        if _run_git(self.repo, "merge-base", "--is-ancestor", tip, self.main_branch).returncode == 0:
-            return True
-        cherry = _git(self.repo, "cherry", self.main_branch, tip).splitlines()
-        return bool(cherry) and all(line.startswith("-") for line in cherry)
+        return _main_carries(self.repo, self.main_branch, tip)
 
     def unsynced_paths(self) -> list[str]:
         """The landed paths whose copy on disk in the checkout is not main's:
@@ -457,6 +511,15 @@ class _Target:
 
     def main_tip(self) -> str:
         return _git(self.repo, "rev-parse", self.main_branch)
+
+
+def _main_carries(repo: Path, main_branch: str, tip: str) -> bool:
+    """Whether *main_branch* holds *tip*: as an ancestor, or as an equal patch
+    (the queue may land a rebased copy)."""
+    if _run_git(repo, "merge-base", "--is-ancestor", tip, main_branch).returncode == 0:
+        return True
+    cherry = _git(repo, "cherry", main_branch, tip).splitlines()
+    return bool(cherry) and all(line.startswith("-") for line in cherry)
 
 
 def _holds(on_disk: Path, content: bytes | None) -> bool:
@@ -491,6 +554,44 @@ def _crosses_symlink(root: Path, relative: str) -> bool:
     return (resolved_root / relative).resolve() != resolved_root / relative
 
 
+_DEPLOY_BRANCH_PREFIX = "task/deploy-"
+_DEPLOY_STAMP = "%Y%m%dT%H%M%SZ"
+_SCRATCH_PREFIX = "deploy-landing-"
+
+
+def _deploy_branch_name(label: str, at: datetime) -> str:
+    return f"{_DEPLOY_BRANCH_PREFIX}{label}-{at.strftime(_DEPLOY_STAMP)}"
+
+
+def _is_deploy_branch_of(label: str, branch: str) -> bool:
+    """Whether *branch* is a name _deploy_branch_name gives a deploy of
+    *label*: one of a longer label sharing its prefix is not."""
+    stamp = branch.removeprefix(f"{_DEPLOY_BRANCH_PREFIX}{label}-")
+    if stamp == branch:
+        return False
+    try:
+        return datetime.strptime(stamp, _DEPLOY_STAMP).strftime(_DEPLOY_STAMP) == stamp
+    except ValueError:
+        return False
+
+
+def _deploy_branches_of(repo: Path, label: str) -> list[str]:
+    heads = _git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/task/").splitlines()
+    branches = (ref.removeprefix("refs/heads/") for ref in heads)
+    return [branch for branch in branches if _is_deploy_branch_of(label, branch)]
+
+
+def _bare_id(branch: str) -> str:
+    """*branch* without its `task/` prefix: the id the queue knows it by."""
+    return branch.removeprefix("task/")
+
+
+def _status_handle(branch: str) -> dict[str, str]:
+    """The merge_status arguments naming *branch*'s most recent request: a
+    deploy branch is unique, so that request is its deploy's."""
+    return {"branch": _bare_id(branch)}
+
+
 @dataclass(frozen=True)
 class _DeployBranch:
     """The deploy commit, on its own branch, checked out in a worktree under a
@@ -503,8 +604,8 @@ class _DeployBranch:
 
     @classmethod
     def create(cls, target: _Target, base_sha: str, *, label: str, message: str) -> _DeployBranch:
-        scratch = Path(tempfile.mkdtemp(prefix="deploy-landing-"))
-        branch = f"task/deploy-{label}-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
+        scratch = Path(tempfile.mkdtemp(prefix=_SCRATCH_PREFIX))
+        branch = _deploy_branch_name(label, datetime.now(UTC))
         worktree = _worktree_in(scratch)
         try:
             # Its own step, not `worktree add -b`: that leaves the branch it
@@ -522,7 +623,7 @@ class _DeployBranch:
             _git(worktree, "commit", "-q", "--no-verify", "-m", message, "--", *target.paths)
             tip = _git(worktree, "rev-parse", "HEAD")
         except BaseException:
-            _tear_down(target.repo, scratch, branch)
+            _tear_down(target.repo, branch, worktree=worktree, scratch=scratch)
             raise
         return cls(target.repo, scratch, branch, tip)
 
@@ -532,17 +633,14 @@ class _DeployBranch:
 
     @property
     def bare_id(self) -> str:
-        """The branch without its `task/` prefix: the id the queue knows it by."""
-        return self.branch.removeprefix("task/")
+        return _bare_id(self.branch)
 
     @property
     def status_handle(self) -> dict[str, str]:
-        """The merge_status arguments naming this branch's most recent
-        request: the branch is unique, so that request is this deploy's."""
-        return {"branch": self.bare_id}
+        return _status_handle(self.branch)
 
     def tear_down(self) -> None:
-        _tear_down(self.repo, self.scratch, self.branch)
+        _tear_down(self.repo, self.branch, worktree=self.worktree, scratch=self.scratch)
 
     def retained(self, refusal: LandingNotConfirmed) -> LandingNotConfirmed:
         """*refusal*, naming what was kept for a request that may still land."""
@@ -580,13 +678,35 @@ def _worktree_in(scratch: Path) -> Path:
     return scratch / "worktree"
 
 
-def _tear_down(repo: Path, scratch: Path, branch: str) -> None:
-    """Remove the deploy worktree, its branch and the scratch directory,
-    whichever of them still exist. A step git refuses is reported on stderr,
-    never raised: tidying up must not replace the landing's own outcome."""
-    worktree = _worktree_in(scratch)
+def _worktree_of(repo: Path, branch: str) -> Path | None:
+    """The worktree git records as having *branch* checked out, whether or not
+    its directory still exists; None when there is none."""
+    worktree = None
+    for line in _git(repo, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            worktree = Path(line.removeprefix("worktree "))
+        elif line == f"branch refs/heads/{branch}":
+            return worktree
+    return None
+
+
+def _deploy_scratch_of(worktree: Path | None) -> Path | None:
+    """The scratch directory _DeployBranch.create made to hold *worktree*, or
+    None when *worktree* is not one it placed."""
+    if worktree is None or worktree != _worktree_in(worktree.parent):
+        return None
+    return worktree.parent if worktree.parent.name.startswith(_SCRATCH_PREFIX) else None
+
+
+def _tear_down(repo: Path, branch: str, *, worktree: Path | None, scratch: Path | None) -> None:
+    """Remove the deploy *worktree* (None: no worktree has *branch* checked
+    out), *branch*, and the *scratch* directory holding the worktree (None:
+    none of ours), whichever of them still exist. A step git refuses is
+    reported on stderr, never raised: tidying up must not replace the
+    landing's own outcome."""
     removals: list[tuple[str, ...]] = (
-        [("worktree", "remove", "--force", str(worktree))] if worktree.exists() else []
+        [("worktree", "remove", "--force", str(worktree))]
+        if worktree is not None and worktree.exists() else []
     )
     removals.append(("worktree", "prune"))
     if _run_git(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0:
@@ -597,7 +717,8 @@ def _tear_down(repo: Path, scratch: Path, branch: str) -> None:
             print(f"{_LOG_PREFIX} could not tear down {branch} in {repo}: git {' '.join(args)} "
                   f"failed (rc={proc.returncode}): {proc.stderr.decode(errors='replace').strip()}",
                   file=sys.stderr)
-    shutil.rmtree(scratch, ignore_errors=True)
+    if scratch is not None:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +855,7 @@ class _Pending:
 
 
 def _poll_until_landed(queue: _MergeQueue, target: _Target, deploy: _DeployBranch,
-                       pending: _Pending, deadline: float, stop: _StopSignals) -> dict:
+                       pending: _Pending, deadline: _Deadline, stop: _StopSignals) -> dict:
     """The merge_status reply that shows the *pending* request landed,
     cancelling the request if the deadline, a stop signal or a git failure
     comes first."""

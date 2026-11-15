@@ -97,12 +97,12 @@ to each line of the message separately while `%s` joins a wrapped first paragrap
 a full-subject pattern misses a marker whose subject wraps, and a branch name, which has no
 whitespace, survives. `--fixed-strings` keeps the branch name literal, and the search is
 **substring-safe** because of the `awk` equality against the exact subject from
-`orchestrator/src/orchestrator/git_ops.py::_merge_subject` (canonical form
+`shared/src/shared/merge_subject.py::format_merge_subject` (canonical form
 `Merge <full-branch> into <main-branch>`): the `task/1` pre-filter does match inside `task/10`, but
 `Merge task/10 into main` is not equal to `Merge task/1 into main`. Do **not** put the full subject
 back into `--grep`. If a project overrides `git.branch_prefix` (default `task/`) or
 `git.main_branch`, build the branch and the subject from config, the subject from
-`_merge_subject`, rather than hardcoding them.
+`format_merge_subject(branch, main_branch)`, rather than hardcoding them.
 
 **Substring-safety is not subject-scoping, and the `--grep` half gives you neither.**
 `git log --grep` matches the **whole commit message**, not the subject, so the `--grep` half alone
@@ -119,7 +119,7 @@ subject equality rules out the `task/1`-inside-`task/10` collision and a body ma
 else is **not** a marker and may never be treated as one on either of [step 2](#step-2)'s arms —
 [step 2](#step-2)'s *branch GONE* arm otherwise treats the marker as authoritative on its own with
 no further check, so this selection is the only thing standing between a body match and a stamped
-`done_provenance`. Equality is against the `_merge_subject` string bound to `S`; nothing weaker
+`done_provenance`. Equality is against the `format_merge_subject` string bound to `S`; nothing weaker
 (prefix, substring, case-folded) counts.
 
 **Select the newest subject-matching hit — do not take the newest hit and then test it.** These
@@ -162,7 +162,7 @@ substitute for selecting correctly in the first place.
 
 Do **not** instead add `--merges` to the search. It would diverge from the in-repo authority this
 command explicitly mirrors (`GitOps.find_merge_marker`, on both its index and scan paths, selects
-the newest commit on main whose SUBJECT equals `_merge_subject`, and does not restrict to merge
+the newest commit on main whose SUBJECT equals `format_merge_subject(branch, main_branch)`, and does not restrict to merge
 commits — `orchestrator/src/orchestrator/git_ops.py::_merge_markers_by_branch`), whose whole value
 is that writer and reader share one derivation and so cannot silently drift apart; and it is lossy —
 measured in this repo, `ba1bba2611 Merge task/176 into main` is a genuine subject-shaped marker
@@ -249,7 +249,8 @@ rebased path rebases the branch onto main and fast-forwards main to the rebased 
 commit is written, every branch commit is rewritten, and the task ref is retained at its
 pre-rebase tip, because `GitOps._branch_has_commits_beyond_main` counts `main..<branch>` by sha.
 It reaches [step 4](#step-4) at rc=1; its arm is [the rebased-solo-landing
-arm](#rebased-solo-landing).
+arm](#rebased-solo-landing). `merge_status`'s git tier now resolves this shape on a
+`branch`/`task_id` poll, through its patch-id arm.
 
 Aborting on an empty search alone would abandon merged work un-stamped — and at several call
 sites you are already holding a server-issued `done`/`already_merged` verdict, which you must
@@ -450,12 +451,13 @@ ref holding pre-rebase shas none of which is on main. What decides it is whether
 - an in-window `done`/`already_merged` from `merge_request` that carries a `request_id`; its
   `commit`, when present, is the sha.
 
-A polled request_id-arm `done` from the event-store tier carries no top-level `merge_sha`. The
-request's recorded landing sha is `last_outcome.merge_sha`, valid when `last_outcome.state` is
-`done` and `last_outcome.branch` names `task/<TASK_ID>`
-(`escalation/src/escalation/merge_status_answer.py::LastOutcome`); on the rebased path it is the
-rebased tip. **Never** take the sha from a `branch`/`task_id`-arm answer: those resolve to the
-newest record for the branch, which can be a prior round's.
+A polled request_id-arm `done` from the event-store tier (`source: "event_store"`) carries the
+request's recorded landing sha as its top-level `merge_sha`
+(`escalation/src/escalation/server.py::merge_status`, its current-run tier). On the rebased path
+it is the rebased tip. **Never** take the sha from a record-sourced `branch`/`task_id`-arm answer
+(its top-level `merge_sha` beside `source: "event_store"`, or `last_outcome`): those resolve to
+the newest record for the branch, which can be a prior round's. A `source: "git"` `found_on_main` answer is not record-sourced; the
+no-request-scoped-`done` bullet below says how to use it.
 
 Holding that sha as `<MERGE_SHA>`, run all four lines:
 
@@ -483,6 +485,10 @@ with one deliberate difference. That function reads EMPTY output as contained; t
 because `git cherry` skips merges, so a branch whose only commit beyond main is a sync merge
 prints nothing. That is the same rule as [`merge-queue/SKILL.md`](../merge-queue/SKILL.md) rule 2b.
 (`orchestrator/tests/test_rebased_solo_landing_ladder.py` pins each premise against real git.)
+`merge_status`'s patch-id arm
+(`orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed`) applies check
+(c)'s empty-output rule: it classifies containment through the same `git cherry` call and refuses
+empty output from a tip that is not an ancestor of main as `not_landed`.
 
 - **All three pass** → landed. Stamp `{"kind": "merged", "commit": "<M>", "note": "rebased solo
   landing: request <request_id>'s recorded merge_sha; every branch commit patch-equivalent on
@@ -494,19 +500,35 @@ prints nothing. That is the same rule as [`merge-queue/SKILL.md`](../merge-queue
   commit edited near the branch's change gives the rebased image a different patch id. It can
   also be a commit added to the branch after the landing. Only a reader can tell which, and the
   server-issued `done` must not be overridden ([step 3](#step-3)).
-- **You hold no request-scoped `done`** → run `git cherry main task/<TASK_ID>` alone.
-  - Non-empty with every line `-`: the content is on main with no sha you can attribute:
-    **landing-unattributable**.
-  - Any `-` line mixed with `+` lines, or `+` lines that may be context drift (see above): **not
-    confirmed landed**. Report it and do **not** `merge_cancel` or resubmit; a reader decides.
-  - The genuine not-landed outcome is reserved for the branch tip not being an ancestor of main
-    (rc=1 here) **and** no main commit patch-equivalent to any branch commit (`git cherry` prints
-    no `-` line: all `+`, or empty output). What to do with it is the call site's own disposition
-    (`unblock` and `merge-queue` keep polling / resubmit; `unblock-low-risk` aborts). It never
-    licenses `merge_cancel`: a single-commit branch that landed rebased with context drift prints
-    exactly one `+` line, which is this same output, so `git cherry` alone cannot exclude a landing.
-- **No `last_outcome.merge_sha`** (absent or null, e.g. the rebase+fast-forward no-marker shape)
-  is expected to be rare. It routes to **landing-unattributable**: a human derives and stamps it
+- **You hold no request-scoped `done`** → first poll `merge_status(branch="task/<TASK_ID>")`. Its
+  patch-id arm (`escalation/src/escalation/git_authority.py::probe_landing`, deciding through
+  `orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed`) decides
+  containment with its containment classifier, behind the degeneracy and empty-net-diff guards,
+  and attributes a sha WITHOUT a request: the most recent commit on main citing the task by the
+  project's `git.commit_citation_pattern`, else the branch tip's patch-id twin on main.
+  - `state: "done"`, `kind: "found_on_main"`, `source: "git"` → landed. Stamp
+    `{"kind": "found_on_main", "commit": "<merge_sha>", "note": "rebased solo landing confirmed by
+    merge_status's git tier (patch-id arm); branch tip <git rev-parse task/<TASK_ID>>"}`. This
+    `merge_sha` may legitimately differ from a request-scoped M (the citing commit rather than the
+    rebased tip). Both are commits on main carrying this task's rebased work, so neither is
+    "corrected" into the other.
+  - `reason: "landing_unattributable"` → this ladder's **landing-unattributable**.
+  - Any other answer leaves the decision to `git cherry main task/<TASK_ID>` alone. A non-done
+    answer is never a not-landed verdict by itself: a `+` from context drift makes the arm
+    under-report.
+    - Non-empty with every line `-`: the content is on main with no sha you can attribute:
+      **landing-unattributable**.
+    - Any `-` line mixed with `+` lines, or `+` lines that may be context drift (see above): **not
+      confirmed landed**. Report it and do **not** `merge_cancel` or resubmit; a reader decides.
+    - The genuine not-landed outcome is reserved for the branch tip not being an ancestor of main
+      (rc=1 here) **and** no main commit patch-equivalent to any branch commit (`git cherry`
+      prints no `-` line: all `+`, or empty output). What to do with it is the call site's own
+      disposition (`unblock` and `merge-queue` keep polling / resubmit; `unblock-low-risk`
+      aborts). It never licenses `merge_cancel`: a single-commit branch that landed rebased with
+      context drift prints exactly one `+` line, which is this same output, so `git cherry` alone
+      cannot exclude a landing.
+- **No sha on the request-scoped `done`** (no `merge_sha` on a polled one, no `commit` on an
+  in-window one; e.g. the rebase+fast-forward no-marker shape) is expected to be rare. It routes to **landing-unattributable**: a human derives and stamps it
   (`git cherry` all `-` plus a diff check).
 
 <a id="landing-unattributable"></a>

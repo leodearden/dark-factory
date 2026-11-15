@@ -23,6 +23,8 @@ from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.quarantine_provenance import NOT_RELOCATED, QuarantineOutcome
+from orchestrator.startup_steps import EntryFailures
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
     lane_lock_path,
@@ -31,6 +33,7 @@ from orchestrator.verify_cancel import (
     write_lock_holder_pgid,
 )
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool
+from orchestrator.worktree_identity import read_worktree_title
 
 
 @pytest.fixture
@@ -54,6 +57,11 @@ def harness(tmp_path: Path, mock_orch_config):
     # restore" safe path (harness.py:1718-1719); all warm-lane RED tests assert
     # restore/preserve, none assert release.
     h.scheduler.get_status = AsyncMock(return_value=None)
+    # These tests model a task still in-progress at crash time, which the
+    # sidecar reaper must keep (plans/session-resume-eligibility-seam-prd.md D7's second conjunct).
+    h.scheduler.get_statuses = AsyncMock(
+        side_effect=lambda ids=None: ({i: 'in-progress' for i in (ids or [])}, None),
+    )
     h.scheduler._dispatched = set()
     # Substrate gate: _run_slot now calls substrate_gate.carries_substrate_probe
     # (module-level, not a Scheduler method — task 2121) directly on
@@ -75,7 +83,7 @@ def harness(tmp_path: Path, mock_orch_config):
     # explicitly to exercise the guard itself.
     h.git_ops.mark_pool_storage_present()
     h.git_ops.cleanup_worktree = AsyncMock()
-    h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
+    h.git_ops.quarantine_worktree = AsyncMock(return_value=NOT_RELOCATED)
     # W11 delta: GitOps.__init__ built _lane_lifecycle against the ORIGINAL
     # worktree_base (before the reassignment above) — rebind it so the
     # record-driven recovery path reads/writes the same .lane-state dir
@@ -741,6 +749,34 @@ class TestRecoverCrashedTasks:
         assert str(wt_noplan) in cleaned_paths
         assert str(wt_noprog) in cleaned_paths
         assert len(cleanup_calls) == 2
+
+
+@pytest.mark.asyncio
+class TestRecoverCrashedTasksEntryIsolation:
+    async def test_one_failing_entry_does_not_stop_the_sweep(
+        self, harness: Harness, caplog,
+    ):
+        base = harness.git_ops.worktree_base
+        wt41 = _setup_worktree(base, '41')
+        wt42 = _setup_worktree(base, '42')
+
+        async def fail_41(entry: Path, task_id: str) -> None:
+            if entry.name == '41':
+                raise OSError('boom')
+
+        cleanup = AsyncMock(side_effect=fail_41)
+        harness.git_ops.cleanup_worktree = cleanup
+
+        with caplog.at_level(logging.ERROR):
+            failures = await harness._recover_crashed_tasks()
+
+        cleaned = {c.args[0] for c in cleanup.await_args_list}
+        assert cleaned == {wt41, wt42}
+        assert isinstance(failures, EntryFailures)
+        assert [(f.entry, f.exception_type) for f in failures.failures] == [('41', 'OSError')]
+        assert any(
+            r.levelno == logging.ERROR and '41' in r.getMessage() for r in caplog.records
+        )
 
 
 
@@ -1441,7 +1477,7 @@ class TestRecoverIdentityGuard:
     task 3770.
     """
 
-    async def test_quarantines_on_title_mismatch(self, harness: Harness):
+    async def test_quarantines_on_title_mismatch(self, harness: Harness, tmp_path: Path):
         """The 3770 scenario: worktree holds a trajectory plan but the live
         (recycled-id) task is the cycle-breaker → quarantine, do not adopt."""
         plan = _make_plan(steps_done=3, steps_total=5, task_id='3770')
@@ -1452,15 +1488,21 @@ class TestRecoverIdentityGuard:
         harness.scheduler.get_task = AsyncMock(
             return_value={'id': '3770', 'title': 'Cycle-breaker beta: dedup edges'},
         )
+        outcome = _populated_outcome(tmp_path, '3770')
+        quarantine = AsyncMock(return_value=outcome)
+        harness.git_ops.quarantine_worktree = quarantine
+        events = MagicMock()
+        harness.event_store = events
 
         await harness._recover_crashed_tasks()
 
         assert '3770' not in harness._recovered_plans
-        harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            wt, '3770', 'recovery-identity-mismatch',
+        quarantine.assert_called_once_with(
+            wt, '3770', 'recovery-identity-mismatch', stored_title='Trajectory beta: spline solver',
         )
-        emitted = {c.args[0] for c in harness.event_store.emit.call_args_list}  # type: ignore[attr-defined]
-        assert EventType.worktree_quarantined in emitted
+        assert _quarantine_emits(events) == [
+            {'task_id': '3770', 'data': outcome.event_data('recovery-identity-mismatch')},
+        ]
 
     async def test_adopts_on_match_with_autoeval_prefix(self, harness: Harness):
         """A benign ``[auto-eval redo] `` prefix normalises away → adopt."""
@@ -1592,6 +1634,21 @@ def _seed_lane_record(
     lifecycle.transition(
         lane, DurableLaneState.ASSIGNED, task_id=task_id, branch=branch,
     )
+
+
+def _populated_outcome(tmp_path: Path, task_id: str) -> QuarantineOutcome:
+    """A relocated outcome with every field set, so a payload test sees each one."""
+    return QuarantineOutcome(
+        dest=tmp_path / 'q', branch=f'task/{task_id}-T', tip_sha='abc', unique_commit_count=3,
+    )
+
+
+def _quarantine_emits(events: MagicMock) -> list[dict]:
+    """The keyword arguments of each ``worktree_quarantined`` emit, in order."""
+    return [
+        call.kwargs for call in events.emit.call_args_list
+        if call.args[0] == EventType.worktree_quarantined
+    ]
 
 
 def _setup_task_plan(base: Path, task_id: str, plan: dict) -> Path:
@@ -1830,7 +1887,7 @@ class TestRecoverCrashedTasksWarmLane:
         # then the durable transition), never cleaned up (that's the
         # terminal-task release branch, a different cell).
         harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            lane_path, 'task/42', 'recovery-record-divergence',
+            lane_path, '42', 'recovery-record-divergence', stored_title=None,
         )
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
         record = harness.git_ops._lane_lifecycle.read(lane_path)
@@ -2279,7 +2336,7 @@ class TestRecordDrivenRecovery:
         assert pool.assignment_for('42') == lane
 
     async def test_quarantine_on_registration_divergence(
-        self, harness: Harness, caplog,
+        self, harness: Harness, caplog, tmp_path: Path,
     ):
         """B2: durable record ASSIGNED:'42' branch='task/42' but the git
         admin entry is gone (the 2097/2098 orphaned-worktree divergence) ->
@@ -2299,13 +2356,16 @@ class TestRecordDrivenRecovery:
 
         harness.git_ops._is_registered_worktree = AsyncMock(return_value=False)
         harness.scheduler.get_status = AsyncMock(return_value=None)  # non-terminal
+        outcome = _populated_outcome(tmp_path, '42')
+        quarantine = AsyncMock(return_value=outcome)
+        harness.git_ops.quarantine_worktree = quarantine
+        events = MagicMock()
+        harness.event_store = events
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
             await harness._recover_crashed_tasks()
 
-        harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            lane, 'task/42', 'recovery-record-divergence',
-        )
+        quarantine.assert_called_once_with(lane, '42', 'recovery-record-divergence', stored_title=None)
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
         record = lifecycle.read(lane)
@@ -2318,8 +2378,9 @@ class TestRecordDrivenRecovery:
         assert pool.state(lane) == LaneState.FREE
         assert '42' not in harness._recovered_plans
 
-        emitted = {c.args[0] for c in harness.event_store.emit.call_args_list}  # type: ignore[attr-defined]
-        assert EventType.worktree_quarantined in emitted
+        assert _quarantine_emits(events) == [
+            {'task_id': '42', 'data': outcome.event_data('recovery-record-divergence')},
+        ]
 
         assert any(
             rec.levelno == logging.WARNING
@@ -2334,6 +2395,44 @@ class TestRecordDrivenRecovery:
         assert result is not None, (
             'pool must not be stuck exhausted after quarantining a lane'
         )
+
+    async def test_quarantine_on_record_identity_mismatch(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """The record-driven Fix C cell: durable record ASSIGNED:'42' and git
+        reality matches (registered, branch OK), but the lane's stored title
+        is not the live task's -> QUARANTINE with the full outcome payload,
+        never adopt.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        lane = _setup_lane(base, '_lane-0', plan)
+        lifecycle = harness.git_ops._lane_lifecycle
+        _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
+
+        harness.git_ops.lane_branch_checkouts = AsyncMock(return_value={'42': lane})
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'title': 'A different live task'},
+        )
+        outcome = _populated_outcome(tmp_path, '42')
+        quarantine = AsyncMock(return_value=outcome)
+        harness.git_ops.quarantine_worktree = quarantine
+        events = MagicMock()
+        harness.event_store = events
+
+        await harness._recover_crashed_tasks()
+
+        quarantine.assert_awaited_once_with(
+            lane, '42', 'recovery-identity-mismatch', stored_title=read_worktree_title(lane),
+        )
+        assert _quarantine_emits(events) == [
+            {'task_id': '42', 'data': outcome.event_data('recovery-identity-mismatch')},
+        ]
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.QUARANTINED
+        assert pool.assignment_for('42') is None
 
     async def test_terminal_task_releases_lane_not_adopted(self, harness: Harness):
         """Terminal task (T10 amplifier): durable record ASSIGNED:'42'
@@ -2432,7 +2531,7 @@ class TestRecordDrivenRecovery:
         await harness._recover_crashed_tasks()
 
         harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            lane, 'task/42', 'recovery-record-divergence',
+            lane, '42', 'recovery-record-divergence', stored_title=None,
         )
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
@@ -4001,11 +4100,11 @@ class TestSessionResumeStorm:
         — so this one still covers EXACTLY the predicate, which is what makes
         its equality assertion meaningful.
         """
-        import ast  # noqa: PLC0415 — structural read of one method's source
-        import inspect  # noqa: PLC0415
-        import textwrap  # noqa: PLC0415
+        import ast  # structural read of one method's source
+        import inspect
+        import textwrap
 
-        import orchestrator.harness as harness_mod  # noqa: PLC0415
+        import orchestrator.harness as harness_mod
         from orchestrator.harness import _BY_DESIGN_SESSION_RESUME_REASONS
 
         # Strings the method uses that are NOT reasons. Every one is a key read
@@ -4083,13 +4182,13 @@ class TestSessionResumeStorm:
         producible set, nothing could feed the streak and INV-4's escape would
         be inert again — precisely the condition ε exists to end.
         """
-        import ast  # noqa: PLC0415 — structural read of one method's source
-        import inspect  # noqa: PLC0415
-        import textwrap  # noqa: PLC0415
+        import ast  # structural read of one method's source
+        import inspect
+        import textwrap
 
-        import orchestrator.workflow as workflow_mod  # noqa: PLC0415
-        from orchestrator.harness import _BY_DESIGN_RESTORE_OUTCOMES  # noqa: PLC0415
-        from orchestrator.workflow import TaskWorkflow  # noqa: PLC0415
+        import orchestrator.workflow as workflow_mod
+        from orchestrator.harness import _BY_DESIGN_RESTORE_OUTCOMES
+        from orchestrator.workflow import TaskWorkflow
 
         fn = ast.parse(
             textwrap.dedent(inspect.getsource(TaskWorkflow._invoke))
@@ -4591,7 +4690,7 @@ class TestSessionResumeStorm:
         RED phase fails only these rows instead of collection (the idiom
         ``_session_resume_emits`` already uses for EventType members).
         """
-        from orchestrator.workflow import ResumeFailure  # noqa: PLC0415
+        from orchestrator.workflow import ResumeFailure
         fields = {
             'task_id': f'task-{n}',
             'session_id': f'uuid-rf-{n}',
@@ -5004,7 +5103,7 @@ class TestSessionResumeStorm:
         rolling-window decay: the clock is advanced by rewinding the harness's
         own monotonic stamp, β's idiom.
         """
-        from orchestrator.storm_window_bound import (  # noqa: PLC0415
+        from orchestrator.storm_window_bound import (
             MEASURED_MIN_GAP_SECS,
         )
 

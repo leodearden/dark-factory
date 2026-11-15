@@ -8,6 +8,7 @@ one task id under ``<eval_root>/<id>/`` would otherwise share one task root.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -17,6 +18,7 @@ from _workflow_helpers import AgentStub, _build_workflow, _init_repo
 from orchestrator.agents import sandbox_dispatch
 from orchestrator.artifacts import ARTIFACT_ROOTS, ArtifactRoot, TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
+from orchestrator.dry_run_unblock import investigation_task_name
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
@@ -95,6 +97,8 @@ async def test_cold_dispatch_keeps_task_artifacts_in_the_task_root(
             lane_plan_is_symlink=lane_plan.is_symlink(),
             lane_plan_target=lane_plan.resolve(strict=True),
             expected_target=(task_root / 'plan.json').resolve(),
+            lane_iterations_target=(worktree / '.task' / 'iterations.jsonl').resolve(strict=True),
+            expected_iterations=(task_root / 'iterations.jsonl').resolve(),
         )
         lane_names.update(
             p.name for p in TaskArtifacts.meta_root_for(worktree.parent, worktree.name).iterdir()
@@ -109,6 +113,7 @@ async def test_cold_dispatch_keeps_task_artifacts_in_the_task_root(
     assert observed['task_iterations'] is True
     assert observed['lane_plan_is_symlink'] is True
     assert observed['lane_plan_target'] == observed['expected_target']
+    assert observed['lane_iterations_target'] == observed['expected_iterations']
     assert lane_names <= _LANE_KEYED
 
 
@@ -152,3 +157,36 @@ async def test_external_worktree_sandbox_grants_no_task_root(
     assert extras is not None
     assert str(TaskArtifacts.meta_root_for(worktree.parent, worktree.name).resolve()) in extras
     assert str(TaskArtifacts.task_root_for(worktree.parent, '42').resolve()) not in extras
+
+
+@pytest.mark.asyncio
+async def test_external_worktree_investigation_reads_reviews_from_its_lane_root(
+    config, git_ops, task_assignment, stub, tmp_path, monkeypatch,
+):
+    """The dispatch's own root decision, not a re-derived task root, tells the
+    dry-run investigator where this run's reviewers wrote."""
+    investigations: list[dict] = []
+
+    async def record_investigation(**investigation) -> None:
+        investigations.append(investigation)
+
+    monkeypatch.setattr('orchestrator.workflow.run_dry_run_unblock', record_investigation)
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_scoped_verification',
+        AsyncMock(return_value=VerifyResult(
+            passed=False, test_output='FAILED', lint_output='', type_output='',
+            summary='tests failed',
+        )),
+    )
+    config.unblock_auto.enabled = True
+    worktree = await _eval_worktree(config, tmp_path)
+    workflow, _ = _build_workflow(config, git_ops, task_assignment, stub)
+    workflow.worktree = worktree
+
+    await workflow.run()
+    await asyncio.gather(*(
+        t for t in asyncio.all_tasks() if t.get_name() == investigation_task_name('42')
+    ))
+
+    lane = TaskArtifacts.meta_root_for(worktree.parent, worktree.name)
+    assert [i['reviews_dir'] for i in investigations] == [lane / 'reviews']

@@ -15,6 +15,11 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 SCRIPT = Path(__file__).parent.parent / "install-reclaim-orphaned-worktrees-timer.sh"
 TEMPLATES_DIR = Path(__file__).parent.parent  # scripts/tests/../ = scripts/
 

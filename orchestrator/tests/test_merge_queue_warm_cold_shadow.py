@@ -1781,7 +1781,7 @@ class TestRunPostMergeVerifyOnResultCallback:
 
 async def _setup_wcs_repo(repo: Path) -> None:
     """Set up a minimal git repo for integration tests (step-15)."""
-    from orchestrator.git_ops import _run  # noqa: PLC0415
+    from orchestrator.git_ops import _run
 
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
     await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
@@ -1958,7 +1958,7 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         self, tmp_path: Path
     ) -> None:
         """SMW must be constructed with the harness's live escalation_queue."""
-        from orchestrator.harness import Harness  # noqa: PLC0415
+        from orchestrator.harness import Harness
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.max_concurrent_tasks = 2
@@ -2017,7 +2017,7 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         self, tmp_path: Path
     ) -> None:
         """When _escalation_queue is None (bare harness), SMW receives None — no crash."""
-        from orchestrator.harness import Harness  # noqa: PLC0415
+        from orchestrator.harness import Harness
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.max_concurrent_tasks = 2

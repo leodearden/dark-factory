@@ -1,0 +1,30 @@
+{
+  "task_id": "4845",
+  "reason": "review fix: quarantine_worktree parks only the branch the moved worktree holds (one porcelain read decides registration and holder; move-only relocation for a foreign or absent branch), plus its real-git regression tests",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py",
+      "baseline": 1516,
+      "current": 1524
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_relocate_into_quarantine",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_relocate_unregistered",
+      "baseline": 8,
+      "current": 9
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5206,
+      "current": 5214
+    }
+  ]
+}

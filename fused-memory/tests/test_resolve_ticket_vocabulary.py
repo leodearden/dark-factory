@@ -13,8 +13,9 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from _fastmcp_tool_result import tool_result_dict
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 from _fused_memory_tool_surface import FUSED_MEMORY_TOOL_PREFIX, registered_fused_memory_tools
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import CuratorConfig, TaskmasterConfig
@@ -37,6 +38,8 @@ from fused_memory.reconciliation import recon_self_model
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 WAIT_SECONDS = 30.0
 
@@ -96,15 +99,10 @@ class _HeldCurator:
             await self.release.wait()
         return PreparedCandidate(candidate=candidate, pool=[], pool_sizes={}, prompt_tokens=0)
 
-    async def curate_batch_prepared(
+    async def curate_prepared(
         self, prepared: list[PreparedCandidate], project_id: str, project_root: str,
     ) -> list[CuratorDecision]:
         return [self.decision for _ in prepared]
-
-    async def curate(
-        self, candidate: CandidateTask, project_id: str, project_root: str,
-    ) -> CuratorDecision:
-        return self.decision
 
     def note_created(self, project_id: str, candidate: CandidateTask, task_id: str) -> None:
         return None

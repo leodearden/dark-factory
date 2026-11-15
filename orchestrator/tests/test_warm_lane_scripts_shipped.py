@@ -10,9 +10,9 @@ are syntactically valid — independently of the *resolution* half
 (``test_warm_lane_script_resolution.py``), which pins how ``GitOps`` chooses
 between a project override and these copies.
 
-The sibling-wiring class is the load-bearing one.  Four of the seven source a
+The sibling-wiring class is the load-bearing one.  Five of the seven source a
 lib that is not itself one of the seven, so a seven-file-only relocation would
-ship four scripts that cannot execute:
+ship five scripts that cannot execute:
 
 * ``warm-lane-gc.sh`` and ``warm-lane-gc-sweep.sh`` source
   ``$SCRIPT_DIR/lib_live_refs.sh`` and deliberately ``exit 2`` when it is
@@ -41,6 +41,11 @@ ship four scripts that cannot execute:
   silently-absent one cannot degrade gracefully, because a ref whose citation
   cannot be read is reported ``degenerate`` — which dark-factory reads as "zero
   task work" and acts on by reverting and re-dispatching.
+* ``thin-warm-lane.sh`` sources ``$SCRIPT_DIR/lib_live_refs.sh`` since
+  dark-factory task 5307, behind the same ``exit 2`` guard, for the
+  live-process-reference gate in front of its ``rm`` (README "Delta 17").  A
+  silently-absent scanner would let release-thin remove ``target/`` under a
+  live build.
 
 Running each with ``--help`` from the new directory is the executable proof
 that all four libs actually travelled along.
@@ -139,7 +144,7 @@ class TestRelocatedScriptsAreShipped:
 
 
 class TestSiblingLibsTravelledWithTheScripts:
-    """The four lib-sourcing scripts actually run from the new directory.
+    """The five lib-sourcing scripts actually run from the new directory.
 
     Each is invoked with ``--help`` (read-only, no mount, no subprocess side
     effects) from ``orchestrator/scripts/warm-lane/``.  Since task 3370 closed
@@ -187,6 +192,7 @@ class TestSiblingLibsTravelledWithTheScripts:
             'warm-lane-gc-sweep.sh',
             'warm-lane-audit.sh',
             'warm-lane-degenerate-ref-check.sh',
+            'thin-warm-lane.sh',
         ],
     )
     def test_help_does_not_hit_a_sibling_wiring_error(self, name: str) -> None:
@@ -862,8 +868,8 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
     — which is exactly why the filed expectation of ``exit 2`` was wrong.
     """
 
-    #: Positive control for the two absence-only cases below.  All three
-    #: scripts print a ``Usage:`` heredoc on ``--help``, so its presence proves
+    #: Positive control for the two absence-only cases below.  Every script
+    #: they run prints a ``Usage:`` heredoc on ``--help``, so its presence proves
     #: the run actually REACHED the sibling-resolution code.  Without it a
     #: script that died at line 1 for an unrelated reason (a future ``set -u``
     #: on an unset var, a bad shebang, a binary shimmed away that is needed
@@ -912,7 +918,12 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
 
     @pytest.mark.parametrize(
         'name',
-        ['warm-lane-gc.sh', 'warm-lane-gc-sweep.sh', 'warm-lane-audit.sh'],
+        [
+            'warm-lane-gc.sh',
+            'warm-lane-gc-sweep.sh',
+            'warm-lane-audit.sh',
+            'thin-warm-lane.sh',
+        ],
     )
     def test_help_does_not_source_a_lib_from_the_callers_cwd(
         self, name: str, tmp_path: Path,
@@ -977,8 +988,8 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
         base it ran the decoy and reported ``[ok] Re-seeded``.
 
         See README.md "Sibling-seed defaults, and who resolves them" (reached
-        from "Delta 3") for the reachability caveat: ``_script_dir`` is
-        computed only when ``--seed-script`` was not passed, and dark-factory's
+        from "Delta 3") for the reachability caveat: the seed-script default
+        is used only when ``--seed-script`` was not passed, and dark-factory's
         own caller never passes ``--reseed``.  That is what makes this
         low-priority rather than urgent — and the warning recorded there for a
         future caller is what this closes properly.

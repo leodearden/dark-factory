@@ -17,7 +17,12 @@ from __future__ import annotations
 import ast
 from collections.abc import Iterable
 
-from _wait_budget_audit import collect_test_items, is_asyncio_wait_for_call, item_id
+from _wait_budget_audit import (
+    collect_test_items,
+    is_asyncio_wait_for_call,
+    is_responsive_wait_call,
+    item_id,
+)
 
 
 def _is_timeout_error(node: ast.expr) -> bool:
@@ -119,14 +124,6 @@ def suppressed_result_wait_items(source: str) -> list[str]:
     )
 
 
-def _is_wait_responsive_call(node: ast.AST) -> bool:
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == 'wait_responsive'
-    )
-
-
 def _is_worker_stop_call(node: ast.AST) -> bool:
     if not isinstance(node, ast.Call):
         return False
@@ -142,7 +139,7 @@ def _is_worker_stop_call(node: ast.AST) -> bool:
 
 
 def _has_unguarded_worker_stop(function: ast.AST) -> bool:
-    wait_calls = [node for node in ast.walk(function) if _is_wait_responsive_call(node)]
+    wait_calls = [node for node in ast.walk(function) if is_responsive_wait_call(node)]
     if not wait_calls:
         return False
     guarded: set[ast.AST] = set()
@@ -176,16 +173,18 @@ def unguarded_worker_teardown_items(source: str) -> list[str]:
     That leak is why one red test used to cascade into unrelated failures
     (task 4219).
 
-    An item is reported when it calls ``wait_responsive(...)`` and calls a
-    worker stop -- ``worker.stop()`` or the shared ``stop_merge_worker(...)``
-    helper -- anywhere other than inside a ``finally:`` whose ``try:`` body
-    encloses EVERY ``wait_responsive`` call in the item. Crediting any
+    An item is reported when it calls a responsive wait (wait_responsive or
+    poll_responsive, per _wait_budget_audit.py::is_responsive_wait_call) and
+    calls a worker stop -- ``worker.stop()`` or the shared
+    ``stop_merge_worker(...)`` helper -- anywhere other than inside a
+    ``finally:`` whose ``try:`` body encloses EVERY responsive wait in the
+    item. Crediting any
     finally at all would miss a wait that sits before the ``try:``, whose
     give-up skips that finally too (task 4219 amendment). Recognising
     ``stop_merge_worker`` keeps the scan from going vacuous for an item that
     adopts the other blessed teardown shape.
 
-    Deliberately scoped to items that call ``wait_responsive``: unmigrated
+    Deliberately scoped to items that call a responsive wait: unmigrated
     straight-line teardown elsewhere is not this scan's business, which is
     to stop the migrated set regressing. Deliberately narrow to a variable
     literally named ``worker``: a false negative on an oddly named variable

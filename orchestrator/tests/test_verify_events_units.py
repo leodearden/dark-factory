@@ -21,8 +21,8 @@ from orchestrator.git_ops import GitOps
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult, run_scoped_verification, run_verification
 from orchestrator.verify_admission_record import AdmissionLeg
+from orchestrator.verify_cache.modes import CacheMode
 from orchestrator.verify_evidence import (
-    CacheMode,
     UnitOutcome,
     UnitTier,
     VerifyUnit,
@@ -423,11 +423,14 @@ class TestImplementSiteWorkflowVerify:
         assert _workflow_verify_rows(store) == [{
             'passed': True,
             'tip_sha': _git(workflow.worktree, 'rev-parse', 'HEAD'),
+            'tip_sha_unresolved': False,
+            'tip_sha_unresolved_reason': None,
             'base_sha': _git(config.project_root, 'rev-parse', 'main'),
             'branch': f'task/{_TASK_ID}',
             'duration_ms': 12500,
             'slot_wait_secs': 4.5,
             'site': 'implement',
+            'runner': 'local',
             'plan_hash': verify_evidence.plan_hash(plan),
             'cache_mode': 'off',
             'units': [unit.to_dict() for unit in passing.units or ()],
@@ -472,11 +475,14 @@ class TestPreMergeSiteWorkflowVerify:
         assert _workflow_verify_rows(store) == [{
             'passed': passed,
             'tip_sha': tip,
+            'tip_sha_unresolved': False,
+            'tip_sha_unresolved_reason': None,
             'base_sha': main_tip,
             'branch': f'task/{_TASK_ID}',
             'duration_ms': 7000,
             'slot_wait_secs': None,
             'site': 'pre_merge',
+            'runner': 'local',
             'plan_hash': verify_evidence.plan_hash(plan),
             'cache_mode': 'off',
             'units': [unit.to_dict() for unit in verdict.units or ()],

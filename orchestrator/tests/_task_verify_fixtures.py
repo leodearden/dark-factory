@@ -30,6 +30,32 @@ def seed_verify_repo(tmp_path: Path) -> tuple[Path, str]:
     return repo, head_sha
 
 
+def seed_task_branch_repo(
+    tmp_path: Path, *, modules: tuple[str, ...] = (VERIFY_MODULE,),
+) -> tuple[Path, str, str]:
+    """Seed main with ``<module>/test_x.py`` per module and a ``.task/``-ignoring
+    ``.gitignore``, then check out branch ``task`` one commit ahead touching every
+    module file; return the repo, main's sha and the task tip.
+    """
+    files = tuple((f'{module}/test_x.py', '# placeholder\n') for module in modules)
+    repo = seed_repo(
+        tmp_path / 'repo',
+        RepoSeed(files=(*files, ('.gitignore', '.task/\n')), message='initial commit'),
+    )
+    base = _git(repo, 'rev-parse', 'HEAD')
+    _git(repo, 'checkout', '-q', '-b', 'task')
+    for path, _text in files:
+        (repo / path).write_text('# changed on the task branch\n')
+    _git(repo, 'commit', '-q', '-am', 'task change')
+    return repo, base, _git(repo, 'rev-parse', 'HEAD')
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ['git', '-C', str(repo), *args], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
 def task_verify_spec(
     sha: str, test_command: str, *, preprovision: str = '', tip_sha: str | None = None,
 ) -> TaskVerifySpec:

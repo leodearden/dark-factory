@@ -16,7 +16,7 @@ from reconciliation import plural_enum_shapes
 from shared.project_layout import tasks_db
 
 from fused_memory.backends.graphiti_client import INCOMPLETE_SHORT_READ
-from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
+from fused_memory.reconciliation.status_snapshot_extraction import (
     extract_snapshot_edge_task_ids,
 )
 

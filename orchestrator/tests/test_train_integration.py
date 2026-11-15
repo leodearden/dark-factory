@@ -281,7 +281,7 @@ class TestTrainIntegrationB1B7:
 
     async def test_two_member_train_lands_via_one_union_verify(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -427,7 +427,7 @@ class TestTrainIntegrationB2:
     @pytest.mark.exercise_merge_verify
     async def test_lower_member_break_blocks_train(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -682,7 +682,7 @@ class TestTrainIntegrationB8:
 
     async def test_solo_merge_no_train_events(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:

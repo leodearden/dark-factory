@@ -3,7 +3,7 @@
 Pure-function tests over λ's ``build_composite_report``-shaped dict — the same
 hermetic ``_row``/``_report`` style as ``test_eval_driver_report.py``. The pilot
 module is a CONSUME-ONLY analysis surface over the ο judge-OFAT seam (task 2825):
-it imports ``report.build_composite_report`` / ``format_composite_table`` and
+it imports ``composite_report.py::build_composite_report`` / ``format_composite_table`` and
 ``ResultStore.load_all`` / ``run_ofat_stage`` and edits none of them (decision 11).
 
 Every ``decide_judge_adoption`` / ``format_judge_ofat_report`` test is hermetic:
@@ -270,7 +270,7 @@ class TestDecideNonAdopt:
 
 # ---------------------------------------------------------------------------
 # step-5/6 — format_judge_ofat_report: a deterministic markdown report that
-# carries the verdict + deltas, EMBEDS report.format_composite_table verbatim
+# carries the verdict + deltas, EMBEDS composite_report.py::format_composite_table verbatim
 # (so the committed trial report stays consistent with every other eval surface
 # and byte-stable), and renders the decide-and-act footer (the models.judge flip
 # on adopt; keep-sonnet + escalate otherwise).
@@ -296,8 +296,8 @@ class TestFormatReport:
         return decide_judge_adoption(report, margin=0.05), report
 
     def test_adopt_report_has_verdict_deltas_table_and_flip_line(self):
+        from orchestrator.evals.composite_report import format_composite_table
         from orchestrator.evals.judge_pilot import format_judge_ofat_report
-        from orchestrator.evals.report import format_composite_table
 
         decision, report = self._adopt()
         text = format_judge_ofat_report(decision, report)
@@ -320,8 +320,8 @@ class TestFormatReport:
         assert 'models.judge: sonnet -> haiku' in text
 
     def test_reject_report_renders_keep_sonnet_and_no_flip(self):
+        from orchestrator.evals.composite_report import format_composite_table
         from orchestrator.evals.judge_pilot import format_judge_ofat_report
-        from orchestrator.evals.report import format_composite_table
 
         decision, report = self._reject()
         text = format_judge_ofat_report(decision, report)

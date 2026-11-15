@@ -65,7 +65,7 @@ dev = [
     # tests/test_cli_invoke.py need @pytest.mark.xdist_group pins first (task
     # 5408; pinned by tests/scripts/test_merge_gate_parallelism_config.py::
     # RULED_SERIAL_MEMBERS).
-    "pytest-xdist>=3.5.0",
+    "pytest-xdist>=3.6.0",
     "ruff>=0.4",
     "aiohttp>=3.9",
 ]
@@ -135,7 +135,9 @@ timeout_method = "signal"
 include = ["src", "tests"]
 # ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
 # df_pytest_isolation module without letting project dirs shadow their own src/.
-extraPaths = ["src", "tests", ".."]
+# "tests/cross_suite_helpers" mirrors the insertion tests/conftest.py makes for
+# the helpers tests/repo_guards/ shares (task 5654).
+extraPaths = ["src", "tests", "tests/cross_suite_helpers", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own

@@ -1155,7 +1155,7 @@ def read_rated_source(path: Path) -> tuple[frozenset[tuple[str, str]], dict[str,
 # --- CLI -----------------------------------------------------------------------
 
 def _command_run(args: argparse.Namespace) -> int:
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
 
     snapshot, snapshot_sha256 = _freeze.load_snapshot(args.snapshot)
     requested = set(args.arms or [arm.name for arm in ARMS_OF[args.slates]])

@@ -8,7 +8,6 @@ import os
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +15,10 @@ from typing import Any
 import anyio
 import httpx
 from shared.jcodemunch_launch import jcodemunch_server_config
+from shared.mcp_envelope import (  # noqa: F401 — re-exported for agents/memory_recall.py  # debt: task 7688
+    tool_error_text,
+    tool_text_blocks,
+)
 from shared.mcp_session import McpSession
 from shared.proc_group import terminate_process_group
 
@@ -463,35 +466,6 @@ async def verify_plan_tools_startup(
 
     probes = await _run_all()
     return PlanToolsStartupReport(probes=probes)
-
-
-def tool_error_text(reply: Mapping[str, Any]) -> str | None:
-    """The error prose of a tool-level failure, or None if the tool succeeded.
-
-    An MCP tool reports its own failure in the response body, as a
-    well-formed envelope carrying ``isError``, not by breaking the transport.
-    Nothing about that envelope's shape says it failed, so a reader that
-    checks only the shape would take the error prose for a result.
-    """
-    if not reply.get('isError'):
-        return None
-    texts = tool_text_blocks(reply)
-    return texts[0] if texts else ''
-
-
-def tool_text_blocks(reply: Mapping[str, Any]) -> tuple[str, ...]:
-    """The text of each ``text`` content block of a tool result, in order.
-
-    An envelope whose ``content`` is missing, null or not a list carries no text.
-    """
-    content = reply.get('content')
-    if not isinstance(content, list):
-        return ()
-    return tuple(
-        str(block.get('text', ''))
-        for block in content
-        if isinstance(block, dict) and block.get('type') == 'text'
-    )
 
 
 # The orchestrator's one self-identification spelling. clientInfo reaches only

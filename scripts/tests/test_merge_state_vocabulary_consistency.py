@@ -91,6 +91,9 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -161,7 +164,7 @@ def load_vocabulary(*, path: Path = _VOCABULARY_MODULE) -> dict[str, frozenset[s
     module = importlib.util.module_from_spec(spec)
     try:
         spec.loader.exec_module(module)
-    except Exception as exc:  # noqa: BLE001 — re-raised as a named guard failure
+    except Exception as exc:  # re-raised as a named guard failure
         raise AssertionError(
             f"the merge-state vocabulary module {path} could not be executed (task "
             f"4829): {type(exc).__name__}: {exc}. It is loaded by absolute path under "

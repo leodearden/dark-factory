@@ -163,12 +163,12 @@ tasks:
           paths: ["fused-memory/src/fused_memory/middleware/task_curator.py"]
           expect: absent
       - name: "one-curator-wildcard-site"
-        binding: "grep shared/tests/test_wildcard_mcp_scoping_gate.py — _KNOWN_SITES names TaskCurator._call_llm and _call_llm_batch on main"
+        binding: "grep tests/repo_guards/test_wildcard_mcp_scoping_gate.py — _KNOWN_SITES names TaskCurator._call_llm and _call_llm_batch on main"
         verdict: PASS
         delivered_check:
           kind: grep
           pattern: "TaskCurator\\._invoke_curator"
-          paths: ["shared/tests/test_wildcard_mcp_scoping_gate.py"]
+          paths: ["tests/repo_guards/test_wildcard_mcp_scoping_gate.py"]
           expect: present
       - name: "invoker-constructor-seam"
         binding: "invoke_with_cap_retry is the shared CLI invoker task_curator already calls (shared.cli_invoke); δ injects it"

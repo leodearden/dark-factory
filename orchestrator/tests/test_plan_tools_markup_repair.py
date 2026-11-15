@@ -178,9 +178,9 @@ _COLLECTION_SCHEMA_TOOL_NAME = {
 }
 
 #: The ``TaskArtifacts`` plan-mutating methods that plan-tools impls call:
-#: ``artifacts.py::TaskArtifacts.write_plan``, ``::update_step_status``,
-#: ``::mark_step_committed`` and ``::append_step_deviation`` each write
-#: ``artifact_path('plan.json')``, the last two via a call to ``self.write_plan``.
+#: ``artifacts.py::TaskArtifacts.write_plan_model`` is plan.json's only writer;
+#: ``::write_plan`` (its dict adapter), ``::update_step_status``,
+#: ``::mark_step_committed`` and ``::append_step_deviation`` each reach it.
 #: ``_plan_writing_tool_names()`` below keys its live-module walk on this set
 #: to derive the candidate set for "could this plan-tools entry point write a
 #: ``_REPAIRABLE_PLAN_FIELDS`` cell?".
@@ -191,6 +191,7 @@ _COLLECTION_SCHEMA_TOOL_NAME = {
 #: own separate artifact file and never touches plan.json, so admitting one
 #: here would wrongly pull the whole ``report_*`` family into the sweep.
 _PLAN_MUTATING_ARTIFACT_METHODS = frozenset({
+    'write_plan_model',
     'write_plan',
     'update_step_status',
     'mark_step_committed',
@@ -2183,13 +2184,13 @@ class TestReadPlanRepaired:
         before_mtime = plan_path.stat().st_mtime_ns
 
         writes: list = []
-        real_write_plan = TaskArtifacts.write_plan
+        real_write_plan_model = TaskArtifacts.write_plan_model
 
-        def spy(self, plan):
+        def spy(self, plan, **kwargs):
             writes.append(plan)
-            return real_write_plan(self, plan)
+            return real_write_plan_model(self, plan, **kwargs)
 
-        monkeypatch.setattr(TaskArtifacts, 'write_plan', spy)
+        monkeypatch.setattr(TaskArtifacts, 'write_plan_model', spy)
 
         second, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
@@ -2205,7 +2206,7 @@ class TestReadPlanRepaired:
         before_mtime = plan_path.stat().st_mtime_ns
         writes: list = []
         monkeypatch.setattr(
-            TaskArtifacts, 'write_plan', lambda self, plan: writes.append(plan)
+            TaskArtifacts, 'write_plan_model', lambda self, plan, **kwargs: writes.append(plan)
         )
 
         plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2225,7 +2226,7 @@ class TestReadPlanRepaired:
         before_bytes = plan_path.read_bytes()
         writes: list = []
         monkeypatch.setattr(
-            TaskArtifacts, 'write_plan', lambda self, plan: writes.append(plan)
+            TaskArtifacts, 'write_plan_model', lambda self, plan, **kwargs: writes.append(plan)
         )
 
         _, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2388,7 +2389,7 @@ class TestReadPlanRepaired:
         assert plan_artifacts.read_plan() == {}
         writes: list = []
         monkeypatch.setattr(
-            TaskArtifacts, 'write_plan', lambda self, plan: writes.append(plan)
+            TaskArtifacts, 'write_plan_model', lambda self, plan, **kwargs: writes.append(plan)
         )
 
         plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2408,7 +2409,7 @@ class TestReadPlanRepaired:
             plan_artifacts.read_plan()
         writes: list = []
         monkeypatch.setattr(
-            TaskArtifacts, 'write_plan', lambda self, plan: writes.append(plan)
+            TaskArtifacts, 'write_plan_model', lambda self, plan, **kwargs: writes.append(plan)
         )
 
         with pytest.raises(json.JSONDecodeError):
@@ -2429,10 +2430,10 @@ class TestReadPlanRepaired:
 
         # Patched at the writer plan-tools now delegates to, so the contract
         # is still exercised after the module's own writer was retired.
-        def boom(self, plan):
+        def boom(self, plan, **kwargs):
             raise ArtifactWriteError('disk on fire')
 
-        monkeypatch.setattr(TaskArtifacts, 'write_plan', boom)
+        monkeypatch.setattr(TaskArtifacts, 'write_plan_model', boom)
 
         with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
             plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2869,7 +2870,7 @@ class TestCreatePlanIsDeliberatelyNotHooked:
 
 
 class TestRepairWriteBackDelegatesToTaskArtifacts:
-    """`TaskArtifacts.write_plan` is the SINGLE owner of the plan.json write.
+    """`TaskArtifacts.write_plan_model` is the SINGLE owner of the plan.json write.
 
     plan-tools used to carry `_atomic_write_plan` — a parallel implementation
     of the same byte format and the same durability contract, kept only
@@ -2879,7 +2880,7 @@ class TestRepairWriteBackDelegatesToTaskArtifacts:
     """
 
     @staticmethod
-    def _spy_on_write_plan(monkeypatch) -> list[dict]:
+    def _spy_on_write_plan_model(monkeypatch) -> list[dict]:
         """A DELEGATING spy: records the call, then performs the real write.
 
         Delegating rather than stubbing is what keeps the on-disk assertions
@@ -2887,26 +2888,26 @@ class TestRepairWriteBackDelegatesToTaskArtifacts:
         turning every "and the bytes landed" check vacuous.
         """
         calls: list[dict] = []
-        real_write_plan = TaskArtifacts.write_plan
+        real_write_plan_model = TaskArtifacts.write_plan_model
 
-        def spy(self, plan):
-            calls.append(plan)
-            return real_write_plan(self, plan)
+        def spy(self, plan, **kwargs):
+            calls.append(plan.to_json())
+            return real_write_plan_model(self, plan, **kwargs)
 
-        monkeypatch.setattr(TaskArtifacts, 'write_plan', spy)
+        monkeypatch.setattr(TaskArtifacts, 'write_plan_model', spy)
         return calls
 
-    def test_repair_write_back_goes_through_task_artifacts_write_plan(
+    def test_repair_write_back_goes_through_task_artifacts_write_plan_model(
         self, plan_artifacts, monkeypatch
     ):
         _seed_mixed_plan(plan_artifacts)
-        calls = self._spy_on_write_plan(monkeypatch)
+        calls = self._spy_on_write_plan_model(monkeypatch)
 
         repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
         assert any(f['outcome'] == 'repaired' for f in facts)
         assert len(calls) == 1, (
-            f'expected exactly one write_plan call, got {len(calls)} — the '
+            f'expected exactly one write_plan_model call, got {len(calls)} — the '
             'repair write-back must go through TaskArtifacts'
         )
         assert calls[0] == repaired
@@ -2916,7 +2917,7 @@ class TestRepairWriteBackDelegatesToTaskArtifacts:
     def test_a_clean_plan_still_writes_nothing(self, plan_artifacts, monkeypatch):
         """Consolidating the writer must not convert a read into a write."""
         plan_artifacts.write_plan(corrupt_plan())
-        calls = self._spy_on_write_plan(monkeypatch)
+        calls = self._spy_on_write_plan_model(monkeypatch)
 
         _, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
@@ -2931,7 +2932,7 @@ class TestRepairWriteBackDelegatesToTaskArtifacts:
         plan['design_decisions'][0]['decision'] = PROSE_QUOTED
         plan_artifacts.write_plan(plan)
         before_bytes = plan_artifacts.artifact_path('plan.json').read_bytes()
-        calls = self._spy_on_write_plan(monkeypatch)
+        calls = self._spy_on_write_plan_model(monkeypatch)
 
         _, facts = plan_tools._read_plan_repaired(plan_artifacts)
 

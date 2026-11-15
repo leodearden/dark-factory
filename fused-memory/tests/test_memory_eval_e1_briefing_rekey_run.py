@@ -31,6 +31,11 @@ from shared.memory_eval_metrics import (
     parse_metric_series,
     serialize_metric_series,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+from fused_memory.eval import retrieval_probe, topic_registry
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).parents[2]
 RUN_ROOT = REPO_ROOT / 'plans' / 'memory-eval-e1-briefing-rekey-run'
@@ -58,7 +63,7 @@ def _tripwire_items() -> dict[str, bool]:
     """``{item_key: passed}`` of the frozen run's topic-canonical-present metric."""
     series = load_metric_series(_the_run()[0])
     (tripwire,) = [
-        m for m in series.metrics if m.metric_id == _mod().METRIC_TOPIC_CANONICAL_PRESENT
+        m for m in series.metrics if m.metric_id == retrieval_probe.METRIC_TOPIC_CANONICAL_PRESENT
     ]
     return {item.item_key: item.passed for item in tripwire.items or []}
 
@@ -141,7 +146,7 @@ class TestEachBriefingTopicIsAdjudicatedIndividually:
 
     def test_the_census_split_names_every_failing_item(self):
         section = _census_split_lines(_the_run()[1].read_text(encoding='utf-8'))
-        prefix = _mod().TRIPWIRE_ITEM_PREFIX
+        prefix = topic_registry.TRIPWIRE_ITEM_PREFIX
 
         for item_key, passed in _tripwire_items().items():
             if not passed:

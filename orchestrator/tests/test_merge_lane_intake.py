@@ -17,6 +17,7 @@ rebased-twin and force-push arms (``TestC3SubmitGateQueued``).
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -499,3 +500,72 @@ async def test_the_registry_verifying_flag_alone_rejects_a_newer_tip(
     )
     assert not verifying.result.done()
     assert queue.empty()
+
+
+# ---------------------------------------------------------------------------
+# (D) Queue-to-land: each merge_finalized row times its own request
+# ---------------------------------------------------------------------------
+
+# queue_to_land_secs is rounded to the millisecond, so it may sit up to half
+# a millisecond above the span the test measured around it.
+_MS_ROUNDING = 0.0005
+
+
+def queue_to_land_of(events: RecordingEvents, request_id: str) -> float:
+    [row] = [
+        data for data in events.data_of(EventType.merge_finalized)
+        if data['request_id'] == request_id
+    ]
+    value = row['queue_to_land_secs']
+    assert isinstance(value, float)
+    return value
+
+
+@pytest.mark.asyncio
+async def test_a_landed_request_reports_its_queue_to_land_time(
+    config: OrchestratorConfig, events: RecordingEvents,
+) -> None:
+    req = merge_request(config, request_id='mr-landed')
+    before = time.monotonic()
+
+    await intake.enqueue_merge_request(asyncio.Queue(), req, events)
+    await asyncio.sleep(0.02)
+    req.result.set_result(MergeOutcome(status='done', merge_sha='abc123'))
+    await settle()
+    span = time.monotonic() - before
+
+    assert 0 <= queue_to_land_of(events, 'mr-landed') <= span + _MS_ROUNDING
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_request_still_reports_its_queue_time(
+    config: OrchestratorConfig, events: RecordingEvents,
+) -> None:
+    req = merge_request(config, request_id='mr-abandoned')
+
+    await intake.enqueue_merge_request(asyncio.Queue(), req, events)
+    req.result.cancel()
+    await settle()
+
+    assert [data['state'] for data in events.data_of(EventType.merge_finalized)] == ['abandoned']
+    assert queue_to_land_of(events, 'mr-abandoned') >= 0
+
+
+@pytest.mark.asyncio
+async def test_a_re_enqueued_task_times_each_request_from_its_own_enqueue(
+    config: OrchestratorConfig, events: RecordingEvents,
+) -> None:
+    queue: asyncio.Queue = asyncio.Queue()
+    first = merge_request(config, request_id='mr-first')
+    await intake.enqueue_merge_request(queue, first, events)
+    await asyncio.sleep(0.05)
+    first.result.set_result(MergeOutcome(status='blocked', reason='verify failed'))
+    await settle()
+
+    second = merge_request(config, request_id='mr-second')
+    await intake.enqueue_merge_request(queue, second, events)
+    second.result.set_result(MergeOutcome(status='done', merge_sha='def456'))
+    await settle()
+
+    assert first.task_id == second.task_id
+    assert queue_to_land_of(events, 'mr-second') < queue_to_land_of(events, 'mr-first')

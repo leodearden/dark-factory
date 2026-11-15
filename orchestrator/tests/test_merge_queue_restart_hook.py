@@ -32,7 +32,7 @@ from _merge_lane_fakes import (
 )
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, make_placeholder_future, wait_responsive
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.intake import enqueue_merge_request
 from orchestrator.merge_lane.queue_store import MergeQueueStore, recover_pending_merges
@@ -821,6 +821,10 @@ async def test_stop_releases_finalizing_head_worktree_host_slot_and_speculation_
     The head was merged speculatively onto the request ahead of it, so it
     carries a permit, and it verifies at _inflight[0] (task 5303).
     """
+    # Deep chains off (task 8527): under the operational yaml's chain_cap the
+    # first request, alone in the verify frontier, would chain the second into
+    # one tip verify, and this scene needs each verifying on its own.
+    config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
     store = MergeQueueStore(tmp_path / 'data' / 'orchestrator' / 'merge_queue.json')
 
     ahead_wt = await _make_branch_with_file(
@@ -911,6 +915,10 @@ async def test_stop_resolves_deque_head_verifying_before_its_first_await(
     awaits -- here the worktree cleanup of an item awaiting verify -- and the
     verifier loop can finalize it during any of them.
     """
+    # Deep chains off (task 8527): under the operational yaml's chain_cap the
+    # first request, alone in the verify frontier, would chain the second into
+    # one tip verify, and this scene needs each verifying on its own.
+    config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
     head_wt = await _make_branch_with_file(
         git_ops, 'deque-head-shutdown', 'deque_head.py', 'h = 1\n',
     )

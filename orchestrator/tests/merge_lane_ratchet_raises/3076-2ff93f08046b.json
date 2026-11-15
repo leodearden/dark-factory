@@ -1,0 +1,30 @@
+{
+  "task_id": "3076",
+  "reason": "net-additive \u03b4 work \u2014 LEGAL_TRANSITIONS gains the IN_USE -> ASSIGNED return edge so IN_USE can be written as a refcounted liveness marker",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 660,
+      "current": 663
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 299,
+      "current": 301
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57336,
+      "current": 57339
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31946,
+      "current": 31948
+    }
+  ]
+}

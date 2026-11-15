@@ -24,7 +24,6 @@ one the test itself owns, bound to an ephemeral port.
 """
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 import types
@@ -37,16 +36,23 @@ from config_reload_script_fakes import (
     ClosedPort,
     FakeEscalationMcp,
     commit_config,
+    failure_tag,
     git,
     head,
     init_repo,
+    last_verdict,
+    outcome_verdict_lines,
     path_python3_shimmed_to,
     path_python3_that_cannot_run,
     reload_report,
     system_python_without_the_transport,
     venvless_checkout_copy,
+    verdict_lines,
 )
 from merge_queue_fakes import FakeMergeQueue, assert_target_checkout_clean, deploy_tmpdir_env
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / "merge-pytest-n-ab-switch.sh"
 KEY = "PYTEST_XDIST_AUTO_NUM_WORKERS"
@@ -118,21 +124,6 @@ def _run(server, config_path, value, *, script=SCRIPT, env=None, cwd=None, flags
     )
 
 
-def _verdict(proc):
-    """Parse the script's last non-empty stdout line as the JSON verdict."""
-    lines = [line for line in proc.stdout.splitlines() if line.strip()]
-    assert lines, f"no stdout at all; rc={proc.returncode} stderr={proc.stderr}"
-    return json.loads(lines[-1])
-
-
-def _failure(proc):
-    """The failure tag of a run that must have failed, read from its verdict."""
-    assert proc.returncode != 0, f"stdout={proc.stdout} stderr={proc.stderr}"
-    verdict = _verdict(proc)
-    assert "outcome" not in verdict, verdict
-    return verdict["failure"]
-
-
 def _target(queue, report=None, **kwargs):
     """The config checkout's escalation MCP: *queue* answers the merge tools,
     *report* answers reload_config."""
@@ -170,7 +161,7 @@ def test_flip_lands_through_the_queue_and_reports_outcome_applied(tmp_path, scra
         tools = _tool_names(server)
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
-    verdict = _verdict(proc)
+    verdict = last_verdict(proc)
     assert verdict["outcome"] == "applied"
     assert verdict["switched_to"] == "8"
     assert verdict["commit"] == queue.merge_sha == head(repo)
@@ -200,9 +191,9 @@ def test_a_flip_the_queue_does_not_land_fails_without_a_reload(tmp_path, scratch
         proc = _run(server, config, "8")
         tools = _tool_names(server)
 
-    assert _failure(proc) == "not_landed"
+    assert failure_tag(proc) == "not_landed"
     assert "conflict" in proc.stderr, proc.stderr
-    assert not _outcome_verdict_lines(proc)
+    assert not outcome_verdict_lines(proc)
     assert "reload_config" not in tools, tools
     assert head(repo) == before
     _assert_left_nothing_behind(repo, scratch)
@@ -240,7 +231,7 @@ def test_converged_resume_exits_zero_when_reload_reports_no_verify_env_change(tm
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
     assert set(tools) == {"reload_config"}, f"a converged re-run reached the queue: {tools}"
-    verdict = _verdict(proc)
+    verdict = last_verdict(proc)
     assert "failure" not in verdict, verdict
     assert verdict["outcome"] == "already_converged"
     assert verdict["switched_to"] == "8"
@@ -284,7 +275,7 @@ def test_converged_resume_over_the_real_stateful_transport(tmp_path):
         deletes = server.delete_count()
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
-    assert _verdict(proc)["outcome"] == "already_converged"
+    assert last_verdict(proc)["outcome"] == "already_converged"
     assert "initialize" in methods, methods
     assert "tools/call" in methods[methods.index("initialize"):], methods
     assert set(tools) == {"reload_config"}, f"methods={methods}"
@@ -318,7 +309,7 @@ def test_dry_run_neither_lands_nor_reloads(tmp_path, scratch):
         received = list(server.received)
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
-    assert _verdict(proc) == {"dry_run": True, "would_set": "8"}
+    assert last_verdict(proc) == {"dry_run": True, "would_set": "8"}
     assert f'+  {KEY}: "8"' in proc.stdout, (
         f"a rehearsal that shows no diff rehearses nothing: {proc.stdout}"
     )
@@ -345,7 +336,7 @@ def test_a_config_with_no_verify_env_block_is_refused_before_the_landing(tmp_pat
         proc = _run(server, config, "8")
         received = list(server.received)
 
-    assert _failure(proc) == "config_edit_refused"
+    assert failure_tag(proc) == "config_edit_refused"
     assert head(repo) == before_head, "the refusal must precede the landing"
     assert config.read_bytes() == before_bytes
     assert received == [], f"a refused edit must not reach the orchestrator: {received}"
@@ -363,7 +354,7 @@ def test_an_unconnectable_port_is_refused_before_the_landing(tmp_path, scratch, 
 
     proc = _run(types.SimpleNamespace(port=bad_port), config, "8")
 
-    assert _failure(proc) == "invalid_port"
+    assert failure_tag(proc) == "invalid_port"
     assert head(repo) == before_head, "the refusal must precede the landing"
     assert config.read_bytes() == before_bytes
     _assert_left_nothing_behind(repo, scratch)
@@ -387,31 +378,12 @@ def test_an_unconnectable_port_is_refused_before_the_landing(tmp_path, scratch, 
 # let one stand in for all four and pass for the wrong reason.
 # ---------------------------------------------------------------------------
 
-def _verdict_lines(proc):
-    """(line, verdict) for every stdout line that parses as a JSON object."""
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            yield line, parsed
-
-
 def _converged_verdict_lines(proc):
     """Every stdout line that parses as a verdict claiming convergence."""
     return [
-        line for line, verdict in _verdict_lines(proc)
+        line for line, verdict in verdict_lines(proc)
         if verdict.get("outcome") == "already_converged"
     ]
-
-
-def _outcome_verdict_lines(proc):
-    """Every stdout line that parses as a verdict claiming any success outcome."""
-    return [line for line, verdict in _verdict_lines(proc) if "outcome" in verdict]
 
 
 def _other_projects_config(tmp_path):
@@ -501,9 +473,9 @@ def test_uncorroborated_absence_is_not_convergence(tmp_path, scratch, report_fie
         # onto ours and falsely corroborate.
         proc = _run(server, config, "8", cwd=config.parent)
 
-    assert _failure(proc) == failure
+    assert failure_tag(proc) == failure
     assert not _converged_verdict_lines(proc)
-    assert _verdict(proc)["commit"] == queue.merge_sha == head(repo)
+    assert last_verdict(proc)["commit"] == queue.merge_sha == head(repo)
     _assert_left_nothing_behind(repo, scratch)
 
 
@@ -526,9 +498,9 @@ def test_a_flip_reported_by_an_uncorroborated_reload_is_not_applied(
     with _target(queue, reload_report(**report_fields(config, other), applied=FLIP_TO_8)) as server:
         proc = _run(server, config, "8", cwd=config.parent)
 
-    assert _failure(proc) == failure
-    assert not _outcome_verdict_lines(proc)
-    assert _verdict(proc)["commit"] == queue.merge_sha == head(repo)
+    assert failure_tag(proc) == failure
+    assert not outcome_verdict_lines(proc)
+    assert last_verdict(proc)["commit"] == queue.merge_sha == head(repo)
     _assert_left_nothing_behind(repo, scratch)
 
 
@@ -547,9 +519,9 @@ def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path, scr
     )) as server:
         proc = _run(server, config, "8")
 
-    assert _failure(proc) == "value_mismatch"
+    assert failure_tag(proc) == "value_mismatch"
     assert not _converged_verdict_lines(proc)
-    assert _verdict(proc)["commit"] == queue.merge_sha
+    assert last_verdict(proc)["commit"] == queue.merge_sha
     _assert_left_nothing_behind(repo, scratch)
 
 
@@ -570,7 +542,7 @@ def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path, scr
 def _assert_failed_closed_on_the_transport(proc):
     """The one verdict every transport fault must reach: a failure that names
     the TRANSPORT, and never the in-orchestrator rollback it is not."""
-    assert _failure(proc) == "no_reload_report"
+    assert failure_tag(proc) == "no_reload_report"
     assert not _converged_verdict_lines(proc)
 
 
@@ -598,7 +570,7 @@ def test_a_reload_that_never_reached_the_tool_after_a_landing_fails_closed(
 
     _assert_failed_closed_on_the_transport(proc)
     landed_as = head(repo)
-    assert _verdict(proc)["commit"] == queue.merge_sha == landed_as
+    assert last_verdict(proc)["commit"] == queue.merge_sha == landed_as
     assert landed_as in proc.stderr, f"stderr={proc.stderr}"
     _assert_left_nothing_behind(repo, scratch)
 
@@ -608,10 +580,11 @@ def test_a_converged_reload_that_never_reached_the_tool_fails_closed(tmp_path, s
     dead socket can refuse."""
     config = _make_repo(tmp_path, "8", marker=True)
 
-    proc = _run(ClosedPort(), config, "8")
+    with ClosedPort() as closed:
+        proc = _run(closed, config, "8")
 
     _assert_failed_closed_on_the_transport(proc)
-    assert _verdict(proc)["commit"] == "already-at-8"
+    assert last_verdict(proc)["commit"] == "already-at-8"
     _assert_left_nothing_behind(config.parent, scratch)
 
 
@@ -627,10 +600,10 @@ def test_a_reload_that_raised_after_a_landing_fails_closed_as_reload_raised(tmp_
                  faults_armed=queue.has_landed, **TOOL_RAISED) as server:
         proc = _run(server, config, "8")
 
-    assert _failure(proc) == "reload_raised"
+    assert failure_tag(proc) == "reload_raised"
     assert not _converged_verdict_lines(proc)
     landed_as = head(repo)
-    assert _verdict(proc)["commit"] == queue.merge_sha == landed_as
+    assert last_verdict(proc)["commit"] == queue.merge_sha == landed_as
     assert landed_as in proc.stderr, f"stderr={proc.stderr}"
     assert "never reached the tool" not in proc.stderr, f"stderr={proc.stderr}"
     _assert_left_nothing_behind(repo, scratch)
@@ -644,8 +617,8 @@ def test_a_converged_reload_that_raised_fails_closed_as_reload_raised(tmp_path, 
     with FakeEscalationMcp(reload_report(config_path=str(config)), **TOOL_RAISED) as server:
         proc = _run(server, config, "8")
 
-    assert _failure(proc) == "reload_raised"
-    assert _verdict(proc)["commit"] == "already-at-8"
+    assert failure_tag(proc) == "reload_raised"
+    assert last_verdict(proc)["commit"] == "already-at-8"
     assert not _converged_verdict_lines(proc)
     _assert_left_nothing_behind(config.parent, scratch)
 
@@ -657,11 +630,12 @@ def test_a_dead_socket_fails_a_flip_at_the_landing(tmp_path, scratch):
     repo = config.parent
     before = head(repo)
 
-    proc = _run(ClosedPort(), config, "8")
+    with ClosedPort() as closed:
+        proc = _run(closed, config, "8")
 
-    assert _failure(proc) == "transport_failed"
+    assert failure_tag(proc) == "transport_failed"
     assert "merge_request never reached the tool" in proc.stderr, proc.stderr
-    assert _verdict(proc)["commit"] is None
+    assert last_verdict(proc)["commit"] is None
     assert "lands at the next restart" not in proc.stderr, proc.stderr
     assert head(repo) == before
     _assert_left_nothing_behind(repo, scratch)
@@ -682,8 +656,8 @@ def test_a_git_failure_at_the_landing_still_ends_in_a_verdict(tmp_path, scratch)
         tools = _tool_names(server)
     blocker.unlink()
 
-    assert _failure(proc) == "git_failed"
-    assert _verdict(proc)["commit"] is None
+    assert failure_tag(proc) == "git_failed"
+    assert last_verdict(proc)["commit"] is None
     assert "Traceback" not in proc.stderr, proc.stderr
     assert tools == [], tools
     assert head(repo) == before
@@ -724,7 +698,7 @@ def test_no_step_runs_under_path_python3_when_the_checkout_venv_exists(tmp_path,
         proc = _run(server, config, "8", env=env)
 
     assert proc.returncode == 0, f"stdout={proc.stdout} stderr={proc.stderr}"
-    assert _verdict(proc)["outcome"] == "applied"
+    assert last_verdict(proc)["outcome"] == "applied"
     assert head(repo) == queue.merge_sha
     _assert_left_nothing_behind(repo, scratch)
 
@@ -757,8 +731,8 @@ def test_an_interpreter_without_the_transport_fails_loud_before_any_landing(tmp_
         proc = _run(server, config, "8", script=script, env=env)
         received = list(server.received)
 
-    assert _failure(proc) == "transport_not_importable"
-    assert not _outcome_verdict_lines(proc)
+    assert failure_tag(proc) == "transport_not_importable"
+    assert not outcome_verdict_lines(proc)
     assert tried in proc.stderr, f"stderr={proc.stderr}"
     assert "uv run --project shared" in proc.stderr, f"stderr={proc.stderr}"
     assert received == [], f"an interpreter without the transport reached the server: {received}"

@@ -35,10 +35,10 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from _dashboard_helpers import (
+from _dashboard_helpers import node_path
+from _jsx_source_helpers import (
     destructure_bindings,
     extract_function_body,
-    node_path,
     strip_js_comments,
     walk_balanced,
 )
@@ -494,7 +494,7 @@ _DASH = '/api/v2/dashboard'
 _TAB_READ_FLOOR = {
     'orch': {f'{_DASH}/scheduler', f'{_DASH}/tasks'},
     'overview': {f'{_DASH}/merge-queue'},
-    'tasks': {f'{_DASH}/tasks', f'{_DASH}/invariants'},
+    'tasks': {f'{_DASH}/tasks', f'{_DASH}/invariants', f'{_DASH}/prds'},
 }
 """Reads the derivation must see, as literals: a non-vacuity floor, not the contract.
 
