@@ -2093,11 +2093,11 @@ class TestBuildArgParser:
 
 
 # ===========================================================================
-# Tests: build_memory_service (step-23/24)
+# Tests: open_memory_service (step-23/24)
 # ===========================================================================
 
-class TestBuildMemoryService:
-    """Tests for build_memory_service(args, config) -- task 2415 step-23/24.
+class TestOpenMemoryService:
+    """Tests for open_memory_service(args, config) -- task 2415 step-23/24.
 
     The dry-run/census path only needs a driver/client-wired
     GraphitiBackend for reads; building a full MemoryService -- whose
@@ -2108,7 +2108,7 @@ class TestBuildMemoryService:
     it keeps the full MemoryService, unskipped.
 
     GraphitiBackend/MemoryService are lazily imported inside
-    build_memory_service (mirroring main()'s existing _run_live lazy-import
+    open_memory_service (mirroring main()'s existing _run_live lazy-import
     idiom), so the classes are monkeypatched at their ORIGIN modules
     (not on `_mod`, which never binds these names at module scope).
     """
@@ -2119,8 +2119,8 @@ class TestBuildMemoryService:
     ):
         """Dry-run (args.apply=False): construct a lean GraphitiBackend,
         await its initialize(skip_maintenance=True), and never construct a
-        full MemoryService. The returned object exposes .graphiti (the
-        backend) and an awaitable close()."""
+        full MemoryService. The yielded object exposes .graphiti (the
+        backend), which is closed when the block exits."""
         backend_instance = AsyncMock()
         backend_cls = MagicMock(return_value=backend_instance)
         memory_service_cls = MagicMock()
@@ -2134,14 +2134,13 @@ class TestBuildMemoryService:
         args = _args(apply=False)
         config = mock_config
 
-        result = await _mod.build_memory_service(args, config)
+        async with _mod.open_memory_service(args, config) as result:
+            backend_cls.assert_called_once_with(config)
+            backend_instance.initialize.assert_awaited_once_with(skip_maintenance=True)
+            memory_service_cls.assert_not_called()
+            assert result.graphiti is backend_instance
+            backend_instance.close.assert_not_awaited()
 
-        backend_cls.assert_called_once_with(config)
-        backend_instance.initialize.assert_awaited_once_with(skip_maintenance=True)
-        memory_service_cls.assert_not_called()
-        assert result.graphiti is backend_instance
-
-        await result.close()
         backend_instance.close.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -2165,12 +2164,13 @@ class TestBuildMemoryService:
         args = _args(apply=True, manifest='m.json')
         config = mock_config
 
-        result = await _mod.build_memory_service(args, config)
+        async with _mod.open_memory_service(args, config) as result:
+            memory_service_cls.assert_called_once_with(config)
+            memory_instance.initialize.assert_awaited_once_with()
+            backend_cls.assert_not_called()
+            assert result is memory_instance
 
-        memory_service_cls.assert_called_once_with(config)
-        memory_instance.initialize.assert_awaited_once_with()
-        backend_cls.assert_not_called()
-        assert result is memory_instance
+        memory_instance.close.assert_awaited_once()
 
 
 # ===========================================================================

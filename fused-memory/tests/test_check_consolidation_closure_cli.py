@@ -150,6 +150,46 @@ def _run(metadata, memory, *, as_json=False):
     return asyncio.run(mod.run(_args(metadata, as_json=as_json), memory=memory))
 
 
+
+class TestTheLiveServiceOpensNothingAndIsClosed:
+    """With no injected memory, ``run`` builds its own service and opens nothing.
+
+    The lazy Qdrant client is all the scroll needs, so no FalkorDB, embedder or
+    OPENAI_API_KEY is touched, and the shared close still releases that client.
+    """
+
+    def test_a_closed_gate_run_opens_nothing_closes_once_and_agrees_with_the_injected_run(
+        self, monkeypatch,
+    ):
+        calls: list[str] = []
+        configs: list[object] = []
+        stub_config = object()
+
+        class RecordingMemory(FakeMemory):
+            def __init__(self, config):
+                super().__init__()
+                configs.append(config)
+
+            async def initialize(self):
+                calls.append('initialize')
+
+            async def initialize_for_reads(self):
+                calls.append('initialize_for_reads')
+
+            async def close(self):
+                calls.append('close')
+
+        monkeypatch.setattr('fused_memory.config.schema.FusedMemoryConfig', lambda: stub_config)
+        monkeypatch.setattr('fused_memory.services.memory_service.MemoryService', RecordingMemory)
+        blob = _gate_blob([_uuid(1), _uuid(2)])
+
+        live_rc = asyncio.run(mod.run(_args(blob)))
+
+        assert configs == [stub_config]
+        assert calls == ['close']
+        assert live_rc == _run(blob, FakeMemory()) == mod.EXIT_CLOSED
+
+
 class TestCliUnstampedClusterMember:
     def test_a_stray_is_reported_and_named(self, capsys):
         stray = _uuid(42)
