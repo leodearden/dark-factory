@@ -147,13 +147,13 @@ class StartupFailureStreak(BaseModel):
         message: str,
         at: datetime,
     ) -> StartupFailureStreak:
-        extends = prior is not None and prior.step == step
+        extended = prior if prior is not None and prior.step == step else None
         return cls(
             step=step,
             exception_type=exception_type,
             message=message,
-            consecutive=prior.consecutive + 1 if extends else 1,
-            first_seen=prior.first_seen if extends else at,
+            consecutive=1 if extended is None else extended.consecutive + 1,
+            first_seen=at if extended is None else extended.first_seen,
             last_seen=at,
         )
 

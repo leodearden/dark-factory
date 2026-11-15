@@ -206,7 +206,8 @@ class TestCrashOutsideAnyStep:
         assert streak is not None
         assert streak.consecutive == CRASH_LOOP_THRESHOLD
 
-        healthy = await _healthy_dry_run(make_harness)
+        healthy = make_harness()
+        await healthy.run(prd_path=None, dry_run=True)
 
         [page] = _pages(tmp_path)
         assert 'before-first-step' in page.summary
