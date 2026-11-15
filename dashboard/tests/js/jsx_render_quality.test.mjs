@@ -577,6 +577,7 @@ test('tab_quality.jsx::QualityTab renders a QUALITY hole by its reason', async t
 
   assert.ok(container.textContent.includes(reason), container.textContent);
   assert.equal(section(container, 'headlines'), null, 'a hole draws no headline tiles');
+  assert.ok(section(container, 'snapshots').textContent.includes(body.QUALITY_SNAPSHOTS.reason), 'the snapshots still say why they are a hole');
 });
 
 test('tab_quality.jsx::QualityTab renders one StatTile per laid-out metric, its headline through headlineText and its sparkline from rolling.center', async t => {
@@ -977,6 +978,37 @@ test('tab_quality.jsx::QualityTab names each unplaced snapshot file with its rea
 
   assert.ok(snapshots.textContent.includes(SNAPSHOT_UNPLACED.file));
   assert.ok(snapshots.textContent.includes(SNAPSHOT_UNPLACED.reason));
+});
+
+test('tab_quality.jsx::QualityTab draws a served QUALITY_SNAPSHOTS under a QUALITY hole, its instrument marks still placed', async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const reason = 'no landing of dark_factory has been sampled yet';
+  const body = {
+    ...qualityBody({
+      quality: qualityFixture(window).QUALITY.value,
+      markers: qualityMarkers([INSTRUMENT_MARKER]),
+      snapshots: wireDatum(qualitySnapshots(SNAPSHOT_POINTS)),
+    }),
+    QUALITY: { value: null, as_of: null, state: 'unknown', reason, freshness_bound_seconds: 1200 },
+  };
+  const { container } = mountQuality(harness, {
+    answers: {
+      [qualityUrl(window)]: answered(body),
+      [snapshotDiffUrl(window, SNAPSHOT_NEWEST.id)]: servedDiff(SNAPSHOT_NEWEST, 'ready', { text: NEWEST_DIFF_TEXT }),
+    },
+  });
+  await settle(window);
+  await settle(window);
+  const snapshots = section(container, 'snapshots');
+  const charts = window.DF_QUALITY_VIEW.snapshotCharts(SNAPSHOT_POINTS);
+
+  assert.ok(container.textContent.includes(reason), container.textContent);
+  assert.equal(section(container, 'headlines'), null, 'the landing series stays a hole');
+  assert.ok(snapshots, 'the snapshot section is drawn');
+  assert.equal(snapshots.querySelectorAll('[data-quality-snapshot-chart]').length, charts.length);
+  assert.equal(snapshots.querySelectorAll('.chart-mark-rug').length, charts.length, 'each chart carries the instrument mark');
+  assert.equal(snapshots.querySelector('pre[data-quality-snapshot-diff]').textContent, NEWEST_DIFF_TEXT);
 });
 
 test('tab_quality.jsx::QualityTab draws no instrument mark on a landing-axis chart', async t => {

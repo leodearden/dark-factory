@@ -354,13 +354,10 @@ function QualitySnapshots({ datum, project, markers }) {
   );
 }
 
-function QualitySeries({ project, query, quality, onModule }) {
-  const markersDatum = qualityFieldDatum(query, 'QUALITY_MARKERS');
-  const markersReading = datumView(markersDatum);
-  const markers = markersReading.isHole ? [] : markersDatum.value.markers;
+function QualitySeries({ quality, markers, markersHole, onModule }) {
   return (
     <>
-      {markersReading.isHole && <div style={QUALITY_NOTE_STYLE}>Markers unavailable: {markersReading.title}</div>}
+      {markersHole && <div style={QUALITY_NOTE_STYLE}>Markers unavailable: {markersHole}</div>}
       <QualityHeadlines metrics={quality.metrics} />
       <QualityMetricSection name="outcomes" title="Outcomes" entries={QUALITY_TAB_LAYOUT.outcomes} quality={quality} markers={markers} />
       <QualityMetricSection name="change-cost" title="Change cost" entries={QUALITY_TAB_LAYOUT.changeCost} quality={quality} markers={markers}>
@@ -368,19 +365,29 @@ function QualitySeries({ project, query, quality, onModule }) {
       </QualityMetricSection>
       <QualityBeforeAfter quality={quality} markers={markers} />
       <QualityModules rows={quality.modules} onModule={onModule} />
-      <QualitySnapshots datum={qualityFieldDatum(query, 'QUALITY_SNAPSHOTS')} project={project} markers={markers} />
     </>
   );
 }
 
+// QUALITY, QUALITY_MARKERS and QUALITY_SNAPSHOTS are independent datums of one
+// response: a QUALITY hole hides the landing series, never the snapshots.
 function QualityRead({ view, value, project, query, onModule }) {
   if (view === QUALITY_ON_DEMAND_VIEWS.loading) return <div style={QUALITY_NOTE_STYLE}>loading…</div>;
   if (view !== QUALITY_ON_DEMAND_VIEWS.ready) {
     return <div style={{ ...QUALITY_NOTE_STYLE, color: 'var(--warn)' }}>The quality series could not be fetched.</div>;
   }
   const reading = datumView(value);
-  if (reading.isHole) return <div style={QUALITY_NOTE_STYLE}>{reading.title}</div>;
-  return <QualitySeries project={project} query={query} quality={value.value} onModule={onModule} />;
+  const markersDatum = qualityFieldDatum(query, 'QUALITY_MARKERS');
+  const markersReading = datumView(markersDatum);
+  const markers = markersReading.isHole ? [] : markersDatum.value.markers;
+  return (
+    <>
+      {reading.isHole
+        ? <div style={QUALITY_NOTE_STYLE}>{reading.title}</div>
+        : <QualitySeries quality={value.value} markers={markers} markersHole={markersReading.isHole ? markersReading.title : null} onModule={onModule} />}
+      <QualitySnapshots datum={qualityFieldDatum(query, 'QUALITY_SNAPSHOTS')} project={project} markers={markers} />
+    </>
+  );
 }
 
 // The read's own outcome re-renders the header too, so the served-window echo
