@@ -28,6 +28,8 @@ from escalation.queue import EscalationQueue
 from orchestrator.harness import Harness
 
 _TID = '40'
+# Spelled out: importing the lane's constant would make this file lane-importing.
+_LANE_SHUTDOWN_REASON = 'Merge worker shutting down'
 
 
 def _stale_claimed_row() -> dict:
@@ -77,11 +79,19 @@ def _hold_recovery_slot(h: Harness) -> asyncio.Future:
     return future
 
 
-def _pending_writes(scheduler: MagicMock) -> list:
+def _status_writes(scheduler: MagicMock, status: str) -> list:
     return [
         c for c in scheduler.set_task_status.await_args_list
-        if c.args[:2] == (_TID, 'pending')
+        if c.args[:2] == (_TID, status)
     ]
+
+
+def _pending_writes(scheduler: MagicMock) -> list:
+    return _status_writes(scheduler, 'pending')
+
+
+def _blocked_writes(scheduler: MagicMock) -> list:
+    return _status_writes(scheduler, 'blocked')
 
 
 @pytest.mark.asyncio
@@ -208,3 +218,30 @@ class TestRecoveredRequestOutcomeHasAnOwner:
         assert harness._rehydrate_merge_halt() == esc.id
         assert restarted.is_wip_halted
         assert restarted.is_halt_owner(esc.id)
+
+    async def test_shutdown_outcome_leaves_the_task_for_the_next_start(
+        self, harness: Harness, scheduler_double: MagicMock, tmp_path: Path,
+    ) -> None:
+        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        first = _recovered_request()
+        await _recover(harness, first)
+
+        first.result.set_result(SimpleNamespace(
+            status='blocked', reason=_LANE_SHUTDOWN_REASON,
+            block_category=SimpleNamespace(value='merge_error'),
+            failure_category=None, failure_cause_hint=None,
+        ))
+        await _drain(harness)
+
+        assert _blocked_writes(scheduler_double) == []
+        assert harness._escalation_queue.get_by_task(_TID, status='pending', level=1) == []
+
+        second = _recovered_request()
+        await _recover(harness, second)
+        second.result.set_exception(RuntimeError('verify host lost'))
+        await _drain(harness)
+
+        assert len(_blocked_writes(scheduler_double)) == 1
+        [esc] = harness._escalation_queue.get_by_task(_TID, status='pending', level=1)
+        assert esc.category == 'merge_error'
+        assert 'verify host lost' in esc.detail

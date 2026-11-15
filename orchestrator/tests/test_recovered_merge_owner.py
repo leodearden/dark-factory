@@ -18,7 +18,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.event_store import EventType
 from orchestrator.merge_halt_escalation import MERGE_HALT_CATEGORY_BY_STATUS
-from orchestrator.merge_lane import MergeOutcome
+from orchestrator.merge_lane import MERGE_WORKER_SHUTDOWN_REASON, MergeOutcome
 from orchestrator.merge_lane.outcome_facts import MergeBlockCategory
 from orchestrator.recovered_merge_owner import RecoveredMergeOwner, Settled
 
@@ -29,6 +29,7 @@ _VERIFY_RED = MergeOutcome(
     reason='post-merge verify red: test_x',
     block_category=MergeBlockCategory.POST_MERGE_VERIFY,
 )
+_SHUTDOWN = MergeOutcome(status='blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)
 
 
 class FakeTaskStore:
@@ -363,6 +364,85 @@ class TestHaltOutcomeOwnsTheMergeHalt:
 
         assert len(_open_l1s_in(queue, 'stash_failed')) == 1
         assert len(halt.owners) == 1
+
+
+@pytest.mark.asyncio
+class TestWorkerShutdownOutcomeIsLeftForTheNextStart:
+    async def test_shutdown_outcome_writes_and_files_nothing(
+        self, queue: EscalationQueue, reconcile_landed: AsyncMock,
+    ) -> None:
+        store = FakeTaskStore('in-progress')
+        halt = FakeMergeHalt()
+
+        settled = await _owner(store, queue, reconcile_landed, merge_halt=halt).settle(
+            _request(), _SHUTDOWN,
+        )
+
+        assert settled == Settled.WORKER_SHUTDOWN
+        assert store.writes == []
+        assert _open_l1s(queue) == []
+        reconcile_landed.assert_not_awaited()
+        assert halt.owners == []
+
+    async def test_the_restored_requests_real_failure_still_gets_its_owner(
+        self, queue: EscalationQueue, reconcile_landed: AsyncMock,
+    ) -> None:
+        store = FakeTaskStore('in-progress')
+        owner = _owner(store, queue, reconcile_landed, merge_halt=FakeMergeHalt())
+
+        await owner.settle(_request(), _SHUTDOWN)
+        settled = await owner.settle(_request(), _VERIFY_RED)
+
+        assert settled == Settled.BLOCKED
+        assert store.writes == [(_TID, 'blocked')]
+        [esc] = _open_l1s(queue)
+        assert 'post-merge verify red' in esc.summary
+
+    async def test_the_restored_requests_landing_leaves_no_stale_l1(
+        self, queue: EscalationQueue, reconcile_landed: AsyncMock,
+    ) -> None:
+        owner = _owner(
+            FakeTaskStore('in-progress'), queue, reconcile_landed, merge_halt=FakeMergeHalt(),
+        )
+
+        await owner.settle(_request(), _SHUTDOWN)
+        settled = await owner.settle(_request(), MergeOutcome(status='done', merge_sha='a' * 40))
+
+        assert settled == Settled.LANDED
+        reconcile_landed.assert_awaited_once_with(_TID)
+        assert _open_l1s(queue) == []
+
+    async def test_adopt_schedules_a_settle_that_leaves_the_shutdown_alone(
+        self, queue: EscalationQueue, reconcile_landed: AsyncMock,
+    ) -> None:
+        store = FakeTaskStore('in-progress')
+        collector = ScheduleCollector()
+        request = _request()
+        _owner(store, queue, reconcile_landed, merge_halt=FakeMergeHalt()).adopt(
+            [request], schedule=collector,
+        )
+
+        request.result.set_result(_SHUTDOWN)
+        await asyncio.sleep(0)
+
+        [(coro, _label)] = collector.scheduled
+        assert await coro == Settled.WORKER_SHUTDOWN
+        assert store.writes == []
+
+    async def test_only_the_exact_shutdown_reason_is_left_alone(
+        self, queue: EscalationQueue, reconcile_landed: AsyncMock,
+    ) -> None:
+        # The journal removes this record too, so nothing retries it at the next start.
+        aborted = MergeOutcome(
+            status='blocked', reason=f'{MERGE_WORKER_SHUTDOWN_REASON}: verify aborted',
+        )
+
+        settled = await _owner(
+            FakeTaskStore('in-progress'), queue, reconcile_landed, merge_halt=FakeMergeHalt(),
+        ).settle(_request(), aborted)
+
+        assert settled == Settled.BLOCKED
+        assert len(_open_l1s(queue)) == 1
 
 
 @pytest.mark.asyncio
