@@ -147,6 +147,22 @@ def test_an_absent_archive_is_reported_as_absent(main, fake_home):
     assert 'absent' in result.stderr, _describe(result)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason='root lists a mode-000 directory anyway')
+def test_an_unreadable_archive_is_reported_as_unreadable(main, tmp_path, fake_home):
+    _archive_session(main, tmp_path)
+    archive_root = agent_transcripts_dir(main)
+    archive_root.chmod(0)
+    try:
+        result = _run(main, fake_home, SID)
+    finally:
+        archive_root.chmod(0o755)
+
+    assert result.returncode == EXIT_NOT_FOUND, _describe(result)
+    assert result.stdout == '', _describe(result)
+    assert str(archive_root) in result.stderr, _describe(result)
+    assert 'unreadable' in result.stderr, _describe(result)
+
+
 def test_a_partial_session_id_is_refused_rather_than_silently_missed(main, fake_home):
     result = _run(main, fake_home, 'b976febe')
 
