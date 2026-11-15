@@ -145,6 +145,7 @@ class TestStampHelper:
     @pytest.mark.asyncio
     async def test_stamp_persists_entered_at_iso(self):
         f = _make(metadata={'retry_ledger': {'x': 1}})
+        pre_stamp_keys = set(f.wf.task['metadata'])
 
         await f.wf._stamp_merge_phase_entered()
 
@@ -161,11 +162,13 @@ class TestStampHelper:
         assert meta['retry_ledger'] == {'x': 1}
         # (c) in-memory task metadata mirrors the persisted stamp.
         assert f.wf.task['metadata']['merge_phase_liveness'] == stamp
-        # (d) a writer rename cannot slip past the blessed spelling (task 5281).
+        # (d) every key the stamp added is blessed, whatever the writer names
+        # it (task 5281).
+        added_keys = set(meta) - pre_stamp_keys
         _, warnings = parse_metadata(meta, direction='read')
         assert [
-            w for w in warnings
-            if w.code == 'unknown_key' and w.field == 'merge_phase_liveness'
+            w.field for w in warnings
+            if w.code == 'unknown_key' and w.field in added_keys
         ] == []
 
     @pytest.mark.asyncio
