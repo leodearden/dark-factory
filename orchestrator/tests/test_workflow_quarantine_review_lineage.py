@@ -1,179 +1,174 @@
 """A re-dispatch after a branch-swapping quarantine reviews its new branch afresh (task 3663).
 
-The 3404/2432 shape, end to end: a quarantine renamed ``task/<id>`` aside
-after an amendment round, and every review record survived in the task root.
-Dispatch setup must retire that lineage, so the new branch gets its own
-amendment round and the task-2523 adjudicator is not run against suggestions
-settled on the parked branch.
+The 3404/2432 shape, end to end through a real ``TaskWorkflow.run()``: a
+quarantine renamed ``task/<id>`` aside after an amendment round, and every
+review record survived in the task root. Dispatch setup must retire that
+lineage, so the new branch gets its own amendment round, the task-2523
+adjudicator is not run against suggestions settled on the parked branch, and
+the architect is briefed with them.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _info_l0_router_fixtures import TASK_ID
+from _info_l0_router_fixtures import assignment as _assignment
+from _workflow_helpers import PLAN, AgentStub, FakeBriefing, _make_review
+from shared.cli_invoke import AgentResult
+from test_workflow_escalation_rulings import _WorkflowRun
 
 from orchestrator.agents.review_briefing import ReviewBriefing
-from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
-from orchestrator.config import OrchestratorConfig
-from orchestrator.git_ops import WorktreeInfo
+from orchestrator.artifacts import TaskArtifacts
+from orchestrator.escalation_rulings import Ruling
 from orchestrator.quarantine_provenance import stamp_quarantined_from
-from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.review_lineage import RetiredReview
+from orchestrator.review_suggestions.prior_round import load_prior_round_suggestions
+from orchestrator.workflow import WorkflowOutcome
 
-_TASK_ID = '3663'
-_BASE_SHA = 'a' * 40
-_PARKING_NAME = f'{_TASK_ID}-20261112T000000Z'
+_PARKING_NAME = f'{TASK_ID}-20261112T000000Z'
+_ADJUDICATOR = 'resettled_adjudicator'
 _SETTLED = {
     'severity': 'suggestion',
-    'location': 'src/foo/helpers.py:3',
+    'location': 'lib.py:3',
     'category': 'naming',
     'description': 'helper name hides its side effect',
     'suggested_fix': 'rename helper',
 }
-_IN_SCOPE_SUGGESTION = {
-    'reviewer': 'analyst',
+_RAISED_ON_THE_NEW_BRANCH = {
     'severity': 'suggestion',
-    'location': 'src/foo/bar.py:42',
+    'location': 'lib.py:1',
     'category': 'coverage',
-    'description': 'Missing edge case',
-    'suggested_fix': 'Add a test',
+    'description': 'farewell has no empty-name case',
+    'suggested_fix': 'add a test for farewell("")',
 }
 
 
-def _worktree(tmp_path: Path) -> Path:
-    return tmp_path / '.worktrees' / _TASK_ID
+class _LineageRecordingBriefing(FakeBriefing):
+    """Canned prompts that also record what the architect carried and what each amender pass was handed."""
+
+    def __init__(self) -> None:
+        self.carried: list[list[str]] = []
+        self.amended: list[list[str]] = []
+
+    async def build_architect_prompt(
+        self, task: dict, worktree=None, context: str | None = None,
+        *, include_prior_proposals: bool = False,
+        committed_work: list[dict] | None = None,
+        rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
+    ) -> str:
+        self.carried.append([s['description'] for review in retired_reviews for s in review.suggestions])
+        return await super().build_architect_prompt(task, worktree, context)
+
+    async def build_amender_prompt(
+        self, plan: dict, suggestions: list, locked_modules: list,
+        context: str | None = None, task_id: str | None = None,
+        *, rulings: Sequence[Ruling] = (),
+        scope_drift=None,
+    ) -> str:
+        self.amended.append([s['description'] for s in suggestions])
+        return await super().build_amender_prompt(plan, suggestions, locked_modules, context, task_id)
 
 
-def _seed_parked_lineage(tmp_path: Path, *, stamped: bool) -> TaskArtifacts:
-    worktree = _worktree(tmp_path)
-    worktree.mkdir(parents=True)
-    artifacts = TaskArtifacts.for_task(worktree, _TASK_ID)
-    artifacts.init(_TASK_ID, 'T', 'd', base_commit=_BASE_SHA)
-    artifacts.write_plan({
-        'task_id': _TASK_ID,
-        'title': 'T',
-        'steps': [{'id': 'step-1', 'type': 'impl', 'description': 'x', 'status': 'done', 'commit': 'abc'}],
-    })
-    artifacts.set_review_counters(amendment_rounds_total=1)
-    archive = artifacts.review_archive_dir('amend-1')
-    archive.mkdir(parents=True)
-    (archive / 'analyst.json').write_text(json.dumps({'verdict': 'ISSUES_FOUND', 'issues': [_SETTLED]}))
-    if stamped:
-        assert stamp_quarantined_from(artifacts, {
-            'branch': f'refs/heads/task/{_PARKING_NAME}',
-            'tip_sha': 'b' * 40,
-            'unique_commit_count': 3,
-            'quarantined_at': datetime.now(UTC).isoformat(),
-            'reason': 'orphan-reaper',
-            'parking': f'/q/{_PARKING_NAME}',
-            'stored_title': None,
-        })
-    return artifacts
+class _OneSuggestionReviewerStub(AgentStub):
+    """Each reviewer raises one in-scope suggestion on its first review; the task-2523 adjudicator is told apart.
+
+    The adjudicator's system prompt says it is "not a code reviewer", which
+    the base stub would read as a reviewer.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._reviewed: set[str] = set()
+
+    def _detect_role(self, system_prompt: str) -> str:
+        if 'CLASSIFICATION JUDGE' in system_prompt:
+            return _ADJUDICATOR
+        return super()._detect_role(system_prompt)
+
+    def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+        if role in self._reviewed:
+            return super()._reviewer(role, output_schema)
+        self._reviewed.add(role)
+        review = _make_review(role, 'ISSUES_FOUND', [dict(_RAISED_ON_THE_NEW_BRANCH)])
+        return AgentResult(success=True, output=json.dumps(review), structured_output=review, cost_usd=0.10)
 
 
-def _make_workflow(tmp_path: Path) -> TaskWorkflow:
-    assignment = MagicMock()
-    assignment.task_id = _TASK_ID
-    assignment.task = {'id': _TASK_ID, 'title': 'T', 'description': 'd'}
-    assignment.modules = ['src/foo']
+class _RedispatchRun(_WorkflowRun[_LineageRecordingBriefing]):
+    def __init__(self, tmp_path: Path, monkeypatch) -> None:
+        self.stub = _OneSuggestionReviewerStub()
+        super().__init__(
+            tmp_path, monkeypatch, self.stub, _LineageRecordingBriefing(),
+            replace(_assignment(), modules=list(PLAN['files'])),
+            briefing=ReviewBriefing.DIFF_ONLY, router_enabled=True,
+        )
+        worktree = self.workflow.git_ops.worktree_base / TASK_ID
+        self.artifacts = TaskArtifacts.for_task(worktree, TASK_ID)
 
-    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    config.fused_memory.project_id = 'dark_factory'
-    config.fused_memory.url = 'http://localhost:8002'
-    config.lock_depth = 2
-    config.project_root = tmp_path
-    config.max_review_cycles = 2
-    config.max_amendment_rounds = 1
-    config.suppress_resettled_review_suggestions = True
-    config.review.reviewer_briefing = ReviewBriefing.DIFF_ONLY
-    config.models = MagicMock()
-    config.models.reviewer = 'sonnet'
+    def seed_a_parked_lineage(self, *, stamped: bool) -> None:
+        """One amendment round answered on the parked branch, and, when *stamped*, the quarantine that parked it."""
+        self.artifacts.init(TASK_ID, 'X', 'Y')
+        self.artifacts.write_plan({'task_id': TASK_ID, 'title': 'X', 'steps': []})
+        self.artifacts.set_review_counters(amendment_rounds_total=1)
+        archive = self.artifacts.review_archive_dir('amend-1')
+        archive.mkdir(parents=True)
+        (archive / 'analyst.json').write_text(json.dumps({'verdict': 'ISSUES_FOUND', 'issues': [_SETTLED]}))
+        if stamped:
+            assert stamp_quarantined_from(self.artifacts, {
+                'branch': f'refs/heads/task/{_PARKING_NAME}',
+                'tip_sha': 'b' * 40,
+                'unique_commit_count': 3,
+                'quarantined_at': datetime.now(UTC).isoformat(),
+                'reason': 'orphan-reaper',
+                'parking': f'/q/{_PARKING_NAME}',
+                'stored_title': None,
+            })
 
-    scheduler = MagicMock()
-    scheduler.set_task_status = AsyncMock(return_value=None)
-    scheduler.update_task = AsyncMock(return_value=True)
-    scheduler.get_status = AsyncMock(return_value=None)
-
-    git_ops = MagicMock()
-    git_ops.worktree_base = tmp_path / '.worktrees'
-    git_ops.create_worktree = AsyncMock(
-        return_value=WorktreeInfo(path=_worktree(tmp_path), base_commit=_BASE_SHA),
-    )
-    git_ops.branch_tip_if_no_commits_beyond = AsyncMock(return_value=None)
-    git_ops.get_head_tree_hash = AsyncMock(return_value='TREE1')
-    git_ops.get_new_side_changed_line_ranges = AsyncMock(return_value={})
-    git_ops.has_uncommitted_work = AsyncMock(return_value=False)
-
-    wf = TaskWorkflow(
-        assignment=assignment,
-        config=config,
-        git_ops=git_ops,
-        scheduler=scheduler,
-        briefing=MagicMock(),
-        mcp=MagicMock(),
-    )
-    wf._sync_worktree_venvs = AsyncMock()
-    wf._execute_iterations = AsyncMock(return_value=WorkflowOutcome.DONE)
-    wf._verify_debugfix_loop = AsyncMock(return_value=WorkflowOutcome.DONE)
-    wf._review = AsyncMock(return_value=ReviewAggregation(
-        has_blocking_issues=False,
-        blocking_issues=[],
-        suggestions=[_IN_SCOPE_SUGGESTION],
-        reviews={'analyst': {}},
-    ))
-    wf._route_review_suggestions_to_curator = AsyncMock()
-    wf._write_suggestions_to_memory = AsyncMock()
-    wf._amend = AsyncMock(return_value=True)
-    wf._invoke = AsyncMock()
-    return wf
-
-
-async def _setup(wf: TaskWorkflow) -> TaskArtifacts:
-    with patch('orchestrator.workflow._run', new=AsyncMock(return_value=(0, '', ''))):
-        await wf._setup_worktree_and_artifacts(f'task/{_TASK_ID}')
-    assert wf.artifacts is not None
-    return wf.artifacts
+    def current_round_descriptions(self) -> list[str]:
+        return [s['description'] for s in load_prior_round_suggestions(self.artifacts.review_archives_root)]
 
 
 @pytest.mark.asyncio
 class TestRedispatchAfterQuarantine:
-    async def test_setup_retires_the_parked_lineage(self, tmp_path: Path):
-        _seed_parked_lineage(tmp_path, stamped=True)
-        wf = _make_workflow(tmp_path)
+    async def test_the_new_branch_gets_its_own_amendment_round(self, tmp_path: Path, monkeypatch):
+        run = _RedispatchRun(tmp_path, monkeypatch)
+        run.seed_a_parked_lineage(stamped=True)
 
-        artifacts = await _setup(wf)
+        assert await run.run() == WorkflowOutcome.DONE
 
-        assert artifacts.get_amendment_rounds_total() == 0
-        assert artifacts.review_archive_dirs() == ()
-        retired = artifacts.artifact_path(f'retired-reviews/{_PARKING_NAME}/reviews-amend-1/analyst.json')
-        assert retired.is_file()
+        assert run.briefing.amended
+        assert all(handed == [_RAISED_ON_THE_NEW_BRANCH['description']] for handed in run.briefing.amended)
+        assert _ADJUDICATOR not in run.stub.calls
 
-    async def test_the_new_branch_gets_its_own_amendment_round(self, tmp_path: Path):
-        _seed_parked_lineage(tmp_path, stamped=True)
-        wf = _make_workflow(tmp_path)
-        await _setup(wf)
+    async def test_the_architect_is_briefed_with_the_parked_branch_suggestions(self, tmp_path: Path, monkeypatch):
+        run = _RedispatchRun(tmp_path, monkeypatch)
+        run.seed_a_parked_lineage(stamped=True)
 
-        outcome = await wf._execute_verify_review_loop()
+        assert await run.run() == WorkflowOutcome.DONE
 
-        assert outcome == WorkflowOutcome.DONE
-        cast(AsyncMock, wf._amend).assert_awaited_once()
-        cast(AsyncMock, wf._invoke).assert_not_called()
+        assert run.briefing.carried == [[_SETTLED['description']]]
 
-    async def test_without_a_stamp_the_parked_lineage_still_governs_the_review(self, tmp_path: Path):
-        _seed_parked_lineage(tmp_path, stamped=False)
-        wf = _make_workflow(tmp_path)
-        artifacts = await _setup(wf)
+    async def test_the_new_branch_archives_its_own_amendment_round(self, tmp_path: Path, monkeypatch):
+        run = _RedispatchRun(tmp_path, monkeypatch)
+        run.seed_a_parked_lineage(stamped=True)
 
-        assert artifacts.get_amendment_rounds_total() == 1
+        assert await run.run() == WorkflowOutcome.DONE
 
-        outcome = await wf._execute_verify_review_loop()
+        assert set(run.current_round_descriptions()) == {_RAISED_ON_THE_NEW_BRANCH['description']}
 
-        assert outcome == WorkflowOutcome.DONE
-        cast(AsyncMock, wf._amend).assert_not_called()
-        cast(AsyncMock, wf._invoke).assert_awaited()
-        assert artifacts.get_amendment_rounds_total() == 1
+    async def test_without_a_stamp_the_parked_lineage_still_governs_the_review(self, tmp_path: Path, monkeypatch):
+        run = _RedispatchRun(tmp_path, monkeypatch)
+        run.seed_a_parked_lineage(stamped=False)
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        assert run.briefing.amended == []
+        assert _ADJUDICATOR in run.stub.calls
+        assert run.briefing.carried == [[]]
+        assert run.current_round_descriptions() == [_SETTLED['description']]
