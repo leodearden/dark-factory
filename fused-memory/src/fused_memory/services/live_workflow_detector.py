@@ -873,11 +873,9 @@ def _task_in_scheduler_holders_or_parks(
 ) -> bool:
     """Return True when *task_id* is a scheduler park owner or a lock holder.
 
-    The lock holders are those ``SchedulerStateSnapshot.holder_task_ids`` names,
-    which names every holder of a shared key and reads an older snapshot
-    through ``current_holders``. Both are reset by an orchestrator restart, so
-    a stranded post-redeploy task is absent from both. Snapshot task ids are
-    strings.
+    A lock holder per ``shared/src/shared/scheduler_state.py::SchedulerStateSnapshot.holder_task_ids``.
+    Both are reset by an orchestrator restart, so a stranded post-redeploy task
+    is absent from both. Snapshot task ids are strings.
     """
     if scheduler_state is None:
         return False
