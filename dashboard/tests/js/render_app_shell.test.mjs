@@ -198,7 +198,8 @@ function readRecorder() {
 }
 
 // The keys data.js's on-demand rows build. requestOnDemand fetches those, not
-// the poll, so they are no poll set's to serve.
+// the poll, so they are no poll set's to serve. Each row's key builder is
+// wrapped in place, so this relies on ON_DEMAND_KEYS rows staying unfrozen.
 function recordOnDemandKeys(loader) {
   const built = new Set();
   for (const row of Object.values(loader.ON_DEMAND_KEYS)) {
@@ -313,8 +314,16 @@ function measureEveryTab() {
       return { reads, announced: scopeCalls(calls.slice(before)) };
     };
     const measureBody = (tab, rendered) => {
-      assert.equal(rendered.size, 1, `tab ${tab} must render one tab component in its slot, rendered ${rendered.size}`);
+      assert.equal(
+        rendered.size,
+        1,
+        `tab ${tab} must render one tab component in its slot, rendered ${rendered.size}; ` +
+          'a tab bound off a global TAB_MODULES does not list renders none',
+      );
       const [[Component, props]] = rendered;
+      // The page's DEEPER_VIEWS persisted their toggles (Tasks' list view), and
+      // the tab must be measured in its default view.
+      window.localStorage.clear();
       const views = [];
       let mounted;
       views.push(recorder.during(() => {
@@ -426,6 +435,7 @@ test('the measurement sees each tab component read on its own', () => {
   }
   assert.equal(tabs.get('tasks').body.rows, true, "the Tasks tab's component no longer reads task rows");
   assert.equal(tabs.get('overview').body.rows, false, "Overview's component now reads task rows");
+  assert.ok(tabs.get('tasks').body.keys.has('PRD_VIEW'), "the Tasks tab's component was not measured in its default By-PRD view");
 });
 
 test('a tab that reads task rows polls the full /tasks render, not its census form', () => {
