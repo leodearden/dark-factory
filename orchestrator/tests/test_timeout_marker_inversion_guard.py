@@ -20,9 +20,11 @@ A SWEEP WITH NO ALLOWLIST: every in-band marker under this directory fails.
 SCOPE.  The extractor (``timeout_marker_sites``), the band (``inverts``) and
 the judgement with its messages (``judge_inversion_band``) live in
 ``shared.testing_timeout_markers``.  This module instantiates them for
-``orchestrator/tests`` with an empty allowlist and adds the orchestrator-only
-pins: the sanctioned-name mirrors, the deep-gate and deep-landing spellings,
-and the spawn budgets.  fused-memory, shared and escalation instantiate the
+``orchestrator/tests`` with an empty allowlist and adds two orchestrator-only
+pins: the sanctioned-name mirrors, whose map lives in
+``_sanctioned_timeout_names.py``, and the deep-gate spelling ratchet.  The
+spawn-bound sizing model, the spawn budgets and the deep-scene pairing pins
+live in test_spawn_budget_guard.py.  fused-memory, shared and escalation instantiate the
 same guard in their own ``tests/test_timeout_marker_inversion_guard.py``, and
 tests/scripts and scripts/tests do too, in their own directory (task 6338).
 
@@ -232,8 +234,8 @@ class TestVerifyCliBudgetConstant:
     is non-empty; neither needs this constant.  What the pin protects is the
     CONSTANT's honesty, which other checks rest on: the
     ``faulthandler_timeout`` bound in TestTimeoutConstants, the deep-scene
-    ``test_the_timeout_never_inverts_the_verify_budget`` floors, and every
-    marker that spells the name.
+    ``test_the_timeout_never_inverts_the_verify_budget`` floors in
+    test_spawn_budget_guard.py, and every marker that spells the name.
 
     Its red is deliberate.  On an upward retune the sweep goes red anyway, over
     every site spelling this name, and its remedy names the spelling those

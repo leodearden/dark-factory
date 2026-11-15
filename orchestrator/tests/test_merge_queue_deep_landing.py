@@ -157,7 +157,7 @@ def _within_spawn_budget(request, monkeypatch):
     construction.  Nine copies in nine class bodies is the other way to dodge
     that, and a flat SPOT violation in a file already this long.  The opt-in
     is visible on each class, and
-    test_timeout_marker_inversion_guard.py::TestDeepLandingModuleMarkers pins
+    test_spawn_budget_guard.py::TestDeepLandingModuleMarkers pins
     the marker/fixture pairing in BOTH directions.
 
     A WIRE between two shared parts and nothing else: ``count_git_spawns``
