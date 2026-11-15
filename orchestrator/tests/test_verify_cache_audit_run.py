@@ -210,7 +210,7 @@ class TestRunAudit:
         assert record.session_complete is True
 
     async def test_a_timed_out_module_is_killed_with_its_group_and_the_next_still_runs(self, tree, capsys):
-        alpha = tree.module('alpha', output=_GREEN, rc=0, verify_command_timeout_secs=1)
+        alpha = tree.module('alpha', output=_GREEN, rc=0, verify_command_timeout_secs=5)
         (alpha / 'grandchild').touch()
         (alpha / 'sleep').write_text('60')
 
