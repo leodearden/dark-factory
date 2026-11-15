@@ -179,6 +179,11 @@ from orchestrator.resume_resolution import (
     select_carried_resolutions,
 )
 from orchestrator.review_inputs import gather_review_subject
+from orchestrator.review_lineage import (
+    RetiredReview,
+    retire_quarantined_lineages,
+    retired_reviews_since,
+)
 from orchestrator.review_outcome import review_completed_payload
 from orchestrator.review_suggestions.curator_intake import (
     review_suggestion_submit_arguments,
@@ -655,6 +660,7 @@ class _BriefingLike(Protocol):
         *, include_prior_proposals: bool = ...,
         committed_work: list[dict] | None = ...,
         rulings: Sequence[Ruling] = ...,
+        retired_reviews: Sequence[RetiredReview] = ...,
     ) -> str: ...
     async def build_resume_prompt(
         self,
@@ -710,6 +716,7 @@ class _BriefingLike(Protocol):
         *, text_drift: TaskTextDrift | None = ...,
         integrity_refusal: DoneStepIntegrityVerdict | None = ...,
         rulings: Sequence[Ruling] = ...,
+        retired_reviews: Sequence[RetiredReview] = ...,
     ) -> str: ...
     async def build_plan_completion_prompt(
         self, task: dict, partial_plan: dict,
@@ -2968,6 +2975,10 @@ class TaskWorkflow:
                 self.task_id, self._old_plan_base[:8], base_commit[:8],
             )
             self.artifacts.clear_iteration_log()
+
+        # A branch-swapping quarantine stamped since the last dispatch ended
+        # the review record's lineage; retire it before PLAN and the loop seed.
+        retire_quarantined_lineages(self.artifacts)
 
         # ── .task/ contamination guard ────────────────────────────
         # If .task/ slipped into git on main (inherited contamination),
@@ -5640,6 +5651,7 @@ class TaskWorkflow:
                     self.task, self._live_plan() or existing_plan, changed_files,
                     worktree=self.worktree, text_drift=text_drift,
                     rulings=await self._escalation_rulings(ARCHITECT.name, since=confirmed_at),
+                    retired_reviews=self._retired_reviews_since(confirmed_at),
                 )
 
             build_prompt = build_revalidation_prompt
@@ -5691,6 +5703,7 @@ class TaskWorkflow:
                     include_prior_proposals=include_prior_proposals,
                     committed_work=committed_work,
                     rulings=await self._escalation_rulings(ARCHITECT.name, since=None),
+                    retired_reviews=self._retired_reviews_since(None),
                 )
 
             build_prompt = build_fresh_prompt
@@ -6051,6 +6064,7 @@ class TaskWorkflow:
                 worktree=self.worktree, text_drift=text_drift,
                 integrity_refusal=verdict,
                 rulings=await self._escalation_rulings(ARCHITECT.name, since=confirmed_at),
+                retired_reviews=self._retired_reviews_since(confirmed_at),
             )
 
         if outcome := await self._run_architect_for_plan(build_remedy_prompt):
@@ -6232,7 +6246,20 @@ class TaskWorkflow:
                 self.task_id,
             )
             return False
+        if self._retired_reviews_since(plan_confirmed_at(plan)):
+            logger.info(
+                'Task %s: revalidation skip declined — review rounds retired '
+                'by a quarantine await the architect',
+                self.task_id,
+            )
+            return False
         return True
+
+    def _retired_reviews_since(self, since: datetime | None) -> tuple[RetiredReview, ...]:
+        """The review rounds a quarantine retired after *since* (``orchestrator/review_lineage.py``)."""
+        if self.artifacts is None:
+            return ()
+        return retired_reviews_since(self.artifacts, since)
 
     async def _apply_revalidation_skip(
         self, plan: dict, current_main: str,
@@ -8828,6 +8855,8 @@ class TaskWorkflow:
         # action — call TaskArtifacts.clear_review_counters() (the reset
         # hook) on the re-pend to grant one. Auto-wiring that hook into the
         # scheduler/escalation resume path is out of scope for this module.
+        # The one automatic reset: a branch-swapping quarantine, retired at
+        # dispatch setup by orchestrator/review_lineage.py::retire_quarantined_lineages.
         review_cycle = (
             self.artifacts.get_review_cycles_total() if self.artifacts else 0
         )
