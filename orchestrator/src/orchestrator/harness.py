@@ -12029,6 +12029,16 @@ class Harness:
     ) -> None:
         """Append, persist, and feed a finished slot's report to review checkpoints."""
         task_reports.append(report)
+        self._persist_task_result(report)
+        if report.outcome == WorkflowOutcome.DONE and self.review_checkpoint:
+            self.review_checkpoint.record_merge(self._task_modules.pop(report.task_id, []))
+            if (self.review_checkpoint.should_trigger()
+                    and self._review_task is None
+                    and not self._draining):
+                self._trigger_review_checkpoint()
+
+    def _persist_task_result(self, report: TaskReport) -> None:
+        """Save *report* to runs.db ``task_results``; a failure is logged, never raised."""
         if self._run_store and self._run_id:
             try:
                 self._run_store.save_task_result(
@@ -12036,12 +12046,6 @@ class Harness:
                 )
             except Exception as e:
                 logger.warning(f'Failed to persist task result {report.task_id}: {e}')
-        if report.outcome == WorkflowOutcome.DONE and self.review_checkpoint:
-            self.review_checkpoint.record_merge(self._task_modules.pop(report.task_id, []))
-            if (self.review_checkpoint.should_trigger()
-                    and self._review_task is None
-                    and not self._draining):
-                self._trigger_review_checkpoint()
 
     def _compute_tallies(self, task_reports: list[TaskReport]) -> None:
         """Fill ``self.report`` aggregates from the collected task reports.
@@ -18177,40 +18181,8 @@ class Harness:
             'cascade-unblock: pure gate %s ran at resolution of %s — outcome %s',
             task_id, escalation.id, outcome,
         )
-        self._record_inline_gate_report(_deterministic_report(task_id, row, outcome), escalation.id)
+        self._persist_task_result(_deterministic_report(task_id, row, outcome))
         return True
-
-    def _record_inline_gate_report(self, report: TaskReport, escalation_id: str) -> None:
-        """Record an inline pure-gate run in runs.db and events.db as a slot's; never raises."""
-        if self._run_store and self._run_id:
-            try:
-                self._run_store.save_task_result(
-                    self._run_id, report, self.config.fused_memory.project_id,
-                )
-            except Exception:
-                logger.warning(
-                    'cascade-unblock: failed to persist the inline gate result of %s',
-                    report.task_id, exc_info=True,
-                )
-        if self.event_store:
-            self.event_store.emit(
-                EventType.task_completed,
-                task_id=report.task_id,
-                cost_usd=report.cost_usd,
-                duration_ms=report.duration_ms,
-                data={
-                    'outcome': report.outcome.value,
-                    'agent_invocations': report.agent_invocations,
-                    'execute_iterations': report.execute_iterations,
-                    'verify_attempts': report.verify_attempts,
-                    'review_cycles': report.review_cycles,
-                    'steward_cost_usd': report.steward_cost_usd,
-                    'steward_invocations': report.steward_invocations,
-                    'reason': report.block_reason,
-                    'block_phase': report.block_phase,
-                    'escalation_id': escalation_id,
-                },
-            )
 
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: re-pend a resolution-resumed task to Table B's target.

@@ -404,9 +404,9 @@ answer unknown), a milestone that has not fired, or a `deferred_watch`
 whose `trigger_met` is unset. It also falls back when the runner raises,
 so the worst case is the old wait. `close_only` still changes no status.
 The inline run does not wait on a dispatch pause: a paused scheduler holds
-back slots, and this run takes none. Each inline run is recorded as a slot
-run is, in runs.db `task_results` and an events.db `task_completed` row,
-whose `data.escalation_id` names the resolved record.
+back slots, and this run takes none. Each inline run is recorded in runs.db
+`task_results`, as a deterministic slot run is. Neither path emits an
+events.db `task_completed` row.
 
 The two gate stamps end with the episode: fused-memory removes
 `gate_escalated_at` and `gate_escalated_preconditions` on any status write

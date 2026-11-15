@@ -106,7 +106,7 @@ async def test_resume_closes_a_dependency_free_gate_without_a_dispatch(
     assert _pending(det_harness, 'gate-2864') == []
 
 
-async def test_an_inline_close_is_recorded_as_a_slot_run_is(
+async def test_an_inline_close_is_recorded_in_task_results(
     det_harness: Harness, tmp_path: Path,
 ) -> None:
     record = await _blocked_gate(det_harness, 'gate-m')
@@ -123,10 +123,7 @@ async def test_an_inline_close_is_recorded_as_a_slot_run_is(
             'SELECT task_id, outcome FROM task_results WHERE run_id = ?', ('run-3638',),
         ).fetchall()
     assert results == [('gate-m', 'done')]
-    [completed] = events.fetch_events_by_type(EventType.task_completed)
-    assert completed['task_id'] == 'gate-m'
-    assert completed['data']['outcome'] == 'done'
-    assert completed['data']['escalation_id'] == record.id
+    assert events.fetch_events_by_type(EventType.task_completed) == []
 
 
 async def test_resume_after_an_unsatisfied_hold_re_pends(det_harness: Harness) -> None:
