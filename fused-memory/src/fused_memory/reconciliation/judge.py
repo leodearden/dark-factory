@@ -106,6 +106,7 @@ JUDGE_VERDICT_SCHEMA: dict[str, Any] = {
 # path_scope_adjudicator ``ge=3``).  The judge's own prompt/schema shape has not
 # been measured, so 3 is the established value, not a revalidated one: run
 # fused-memory/scripts/probe_schema_max_turns.py --shape judge before retuning.
+# Retune trigger: the first production error_max_turns, recorded per invocation in reconciliation.db's judge_invocations (task 6573); see OPERATIONS.md 'Has the reconciliation judge hit its turn cap?'.
 #
 # Cost/duration exposure stays bounded by ``judge_cli_timeout_seconds``
 # (validated ≤ stage_timeout_seconds) and cli_invoke's ``max_budget_usd`` default.

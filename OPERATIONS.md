@@ -1135,6 +1135,46 @@ if the pipeline is still sick. So a halt you find with an already-expired
 cooldown is about to clear itself on the next ~5s tick — in that one window a
 manual trigger IS consumed, and the tool says so.
 
+### Has the reconciliation judge hit its turn cap?
+
+Any retune of the judge's `max_turns` waits for the first production
+`error_max_turns` (esc-4344-6, option C; task 6573). Every `claude_cli` judge
+invocation records one row in the `judge_invocations` table of
+`data/reconciliation/reconciliation.db`. That path is this deployment's
+`reconciliation.data_dir` in `fused-memory/config/config.yaml`; a relative
+value is anchored at the checkout by
+`fused-memory/src/fused_memory/config/checkout_anchor.py::anchor_at_checkout`.
+
+- **Is the tripwire armed?** Check this first:
+
+      sqlite3 -readonly data/reconciliation/reconciliation.db "SELECT COUNT(*), MAX(completed_at) FROM judge_invocations;"
+
+  Zero rows means no judge invocation has ever been recorded: the judge is
+  disabled, its provider is not `claude_cli`, or fused-memory has not
+  restarted onto this code. The tripwire is then NOT armed, which is a
+  different state from "no hit".
+- **Has it fired?** Any row means the trigger has fired:
+
+      sqlite3 -readonly data/reconciliation/reconciliation.db "SELECT ji.completed_at, ji.run_id, r.project_id, ji.num_turns, ji.rejected_tool_calls FROM judge_invocations ji LEFT JOIN runs r ON r.id = ji.run_id WHERE ji.ended_error_max_turns = 1 ORDER BY ji.completed_at LIMIT 1;"
+
+  A schema-salvaged run counts too: the turn cap ended it, even though its
+  verdict was recovered.
+- **Rejected tool calls.** The judge registers no tool but `StructuredOutput`,
+  so the CLI rejects every other call it makes:
+
+      sqlite3 -readonly data/reconciliation/reconciliation.db "SELECT COUNT(*), SUM(rejected_tool_calls), SUM(rejected_tool_calls IS NULL) FROM judge_invocations;"
+
+  NULL means the transcript was unreadable, not zero.
+- **Live signals.** `journalctl --user -u fused-memory` carries the WARNING
+  `reconciliation.judge_turn_cap_hit` on every hit, logged even when the row
+  write fails, and `reconciliation.judge_invocation_record_failed`, which
+  carries `ended_error_max_turns`, when a row was lost. So the table is a
+  lower bound, and the log is the backstop.
+- **Next action on a hit.** Re-run
+  `fused-memory/scripts/probe_schema_max_turns.py --shape judge` before
+  changing `_JUDGE_CLI_MAX_TURNS`
+  (`fused-memory/src/fused_memory/reconciliation/judge.py`).
+
 ### Is the curator deduping, or just creating?
 
 The ticket janitor files a dedup-outage escalation when a window shows that
