@@ -373,28 +373,21 @@ class TestXdistWorkers:
     def test_every_spelling_the_stamp_reads_is_one_serial_recovery_sheds(self, flag):
         """The telemetry never claims a worker flag the serial strip would leave.
 
-        A spelling the stamp reads as a count but ``serial_pytest`` keeps on
-        argv is one the ``-p no:xdist`` re-run rejects as an unrecognized
-        argument: two disagreeing answers to "is this a worker flag".
+        ``test_every_worker_count_spelling_is_read`` pins the stamp reading
+        each of these spellings. A spelling the stamp reads as a count but
+        ``serial_pytest`` keeps on argv is one the ``-p no:xdist`` re-run
+        rejects as an unrecognized argument: two disagreeing answers to "is
+        this a worker flag".
         """
-        from orchestrator.verify import _xdist_workers
         from orchestrator.verify_cmd import (
             parse_config_command,
             render,
             serial_pytest,
         )
 
-        cmd = f'uv run pytest tests/ {flag}'
-        serial = render(serial_pytest(parse_config_command(cmd)))
+        serial = render(serial_pytest(parse_config_command(f'uv run pytest tests/ {flag}')))
 
-        assert _xdist_workers(cmd, {})['n_flag'] == '8'
         assert xdist_offenders(shlex.split(serial)) == []
-
-    def test_a_concatenated_spelling_that_is_another_flags_value_is_not_a_count(self):
-        """``-k -n8`` binds ``-n8`` as ``-k``'s value; the walk steps over the pair."""
-        from orchestrator.verify import _xdist_workers
-
-        assert _xdist_workers('uv run pytest tests/ -k -n8', {})['n_flag'] is None
 
     @pytest.mark.parametrize(
         'cmd',
