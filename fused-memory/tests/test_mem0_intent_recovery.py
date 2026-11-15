@@ -22,7 +22,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from _mem0_intent_fixtures import rate_limit_error, seed_mem0_intent
+from _mem0_intent_fixtures import (
+    mem0_intent_row,
+    rate_limit_error,
+    seed_mem0_intent,
+    set_mem0_intent_write_method,
+)
 
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import Mem0WriteState
@@ -62,6 +67,7 @@ async def _service_with_mocked_backends(mock_config) -> MemoryService:
     svc.mem0 = MagicMock()
     svc.mem0.search = AsyncMock(return_value={'results': []})
     svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
+    svc.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
     svc.mem0.get_all = AsyncMock(return_value={'results': []})
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
     svc.mem0.close = AsyncMock()
@@ -587,12 +593,18 @@ async def _seed_pending_intent(
 _SUPERSEDED = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
 
 
-async def _seed_failed_only_intent(journal, *, metadata=None) -> str:
+async def _seed_failed_only_intent(
+    journal, *, metadata=None, write_method=Mem0WriteMethod.ADD
+) -> str:
     """A ``pending`` intent whose only mem0 backend_op failed: recovery re-issues it."""
     write_op_id = str(uuid.uuid4())
     intent_id = str(uuid.uuid4())
     await _seed_pending_intent(
-        journal, write_op_id=write_op_id, intent_id=intent_id, metadata=metadata
+        journal,
+        write_op_id=write_op_id,
+        intent_id=intent_id,
+        metadata=metadata,
+        write_method=write_method,
     )
     await journal.log_backend_op(
         write_op_id=write_op_id,
@@ -969,3 +981,108 @@ class TestRecoverMem0Intents:
             'dead_lettered': 0,
         }
         svc.mem0.add.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# A re-issue calls the Mem0Backend method its intent names (task 7401)
+# ---------------------------------------------------------------------------
+
+
+_SYSTEM_RECORD_CONTENT = 'cycle summary: reconciled 12 tasks, superseded 3 entries ' * 5
+
+
+class TestAReissueCallsTheMethodItsIntentNames:
+    @pytest.mark.asyncio
+    async def test_a_retrying_system_record_lands_through_add_system_record(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        metadata = {'kind': 'cycle_summary', 'x_note': 'kept'}
+        retry_at = datetime.datetime(2026, 11, 15, 12, tzinfo=datetime.UTC)
+        intent_id = await seed_mem0_intent(
+            recovery_journal,
+            status=Mem0IntentStatus.RETRYING,
+            retry_at=retry_at,
+            write_method=Mem0WriteMethod.ADD_SYSTEM_RECORD,
+            content=_SYSTEM_RECORD_CONTENT,
+            metadata=metadata,
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            session_id='sess-1',
+        )
+        svc.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-late'}]})
+
+        summary = await svc.retry_due_mem0_intents(
+            now=retry_at + datetime.timedelta(seconds=1)
+        )
+
+        assert summary.landed == 1
+        svc.mem0.add_system_record.assert_awaited_once_with(
+            content=_SYSTEM_RECORD_CONTENT,
+            scope=Scope(
+                project_id='dark_factory',
+                agent_id='recon-stage-task_knowledge_sync',
+                session_id='sess-1',
+            ),
+            metadata=metadata,
+        )
+        svc.mem0.add.assert_not_awaited()
+        assert (await mem0_intent_row(recovery_journal, intent_id))['status'] == 'completed'
+
+    @pytest.mark.asyncio
+    async def test_a_system_record_reissue_names_its_method_on_a_zero_id_return(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        intent_id = await seed_mem0_intent(
+            recovery_journal,
+            status=Mem0IntentStatus.RETRYING,
+            write_method=Mem0WriteMethod.ADD_SYSTEM_RECORD,
+        )
+        svc.mem0.add_system_record = AsyncMock(return_value={'results': []})
+
+        outcome = await svc.reissue_mem0_intent(
+            await mem0_intent_row(recovery_journal, intent_id)
+        )
+
+        assert outcome == Mem0AddOutcome(
+            memory_ids=(),
+            empty_result_error='empty_result: mem0 add_system_record returned zero memory_ids',
+        )
+
+    @pytest.mark.asyncio
+    async def test_recovery_reissues_a_failed_only_system_record_through_its_method(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        await _seed_failed_only_intent(
+            recovery_journal, write_method=Mem0WriteMethod.ADD_SYSTEM_RECORD
+        )
+
+        summary = await svc.recover_mem0_intents()
+
+        assert summary['reissued'] == 1
+        svc.mem0.add_system_record.assert_awaited_once()
+        svc.mem0.add.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_intent_naming_no_known_method_is_dead_lettered_not_reissued(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        retry_at = datetime.datetime(2026, 11, 15, 12, tzinfo=datetime.UTC)
+        intent_id = await seed_mem0_intent(
+            recovery_journal, status=Mem0IntentStatus.RETRYING, retry_at=retry_at
+        )
+        set_mem0_intent_write_method(recovery_journal, intent_id, 'bogus')
+
+        summary = await svc.retry_due_mem0_intents(
+            now=retry_at + datetime.timedelta(seconds=1)
+        )
+
+        assert summary.dead_lettered == 1
+        svc.mem0.add.assert_not_awaited()
+        svc.mem0.add_system_record.assert_not_awaited()
+        row = await mem0_intent_row(recovery_journal, intent_id)
+        assert row['status'] == 'dead'
+        assert 'bogus' in row['reason']
