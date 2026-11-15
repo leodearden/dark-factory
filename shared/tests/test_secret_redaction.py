@@ -25,7 +25,6 @@ from shared.secret_redaction import (
     Markup,
     RedactionWouldCorruptJson,
     RefusedLine,
-    copy_redacted,
     file_stamp,
     redact_in_place,
     redaction_needles,
@@ -183,22 +182,6 @@ class TestRedactInPlace:
         _assert_every_line_is_json(path)
 
 
-def test_copy_redacted_redacts_the_destination_and_leaves_the_source(tmp_path):
-    src = _write(tmp_path / 'src.jsonl', _transcript_lines(VALUE))
-    dest = tmp_path / 'dest.jsonl'
-    src_bytes = src.read_bytes()
-
-    result = copy_redacted(src, dest, redaction_needles({VAR: VALUE}))
-
-    assert dict(result.counts) == {VAR: 2}
-    assert src.read_bytes() == src_bytes
-    data = dest.read_bytes()
-    assert VALUE.encode() not in data
-    assert _placeholder(VAR, len(VALUE)) in data
-    assert len(data) == len(src_bytes)
-    _assert_every_line_is_json(dest)
-
-
 class TestRefusedLine:
     VALUE = '00e9' + 'X' * 40
 
@@ -242,18 +225,6 @@ class TestRefusedLine:
         assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
         assert path.read_bytes() == content
         assert list(path.parent.iterdir()) == [path]
-
-    def test_copy_redacted_keeps_the_refused_line_and_redacts_the_rest(self, tmp_path):
-        src = _write(tmp_path / 'src.jsonl', self._lines())
-        dest = tmp_path / 'dest.jsonl'
-
-        result = copy_redacted(src, dest, self._needles())
-
-        assert result.refused == (RefusedLine(2, VAR),)
-        assert dict(result.counts) == {VAR: 2}
-        copied = _lines(dest)
-        assert copied[1] == _lines(src)[1]
-        assert self.VALUE.encode() not in copied[0] + copied[2]
 
     def test_raise_if_refused_names_the_path_line_and_variable_but_never_the_value(self, tmp_path):
         path = _write(tmp_path / 'held' / 's.jsonl', self._lines())
@@ -353,11 +324,63 @@ class TestXmlMarkup:
         assert value not in failure.get('message', '')
         assert value not in (failure.text or '')
 
-    def test_text_markup_is_the_default_and_keeps_the_raw_label(self):
+    @pytest.mark.parametrize('value', [SPECIALS, 'tok"en' + 'z' * 30, "tok'en" + 'z' * 30])
+    def test_a_value_elementtree_wrote_into_an_attribute_and_text_is_matched_in_both(self, tmp_path, value):
+        path = _write(tmp_path / 'r.xml', _junit_lines(value))
+
+        result = redact_in_place(path, redaction_needles({VAR: value}, markup=Markup.XML))
+
+        assert dict(result.counts) == {VAR: 2}
+        failure = _parsed_failure(path.read_bytes())
+        assert value not in failure.get('message', '')
+        assert value not in (failure.text or '')
+
+    def test_a_value_with_whitespace_elementtree_escapes_in_an_attribute_is_matched_there(self, tmp_path):
+        value = 'tok\ten\nline\r-' + 'z' * 30
+        suite = ET.Element('testsuite', name='orchestrator')
+        ET.SubElement(ET.SubElement(suite, 'testcase', name='t'), 'failure', message=f'leaked {value}')
+        path = _write(tmp_path / 'r.xml', [ET.tostring(suite, encoding='unicode')])
+
+        result = redact_in_place(path, redaction_needles({VAR: value}, markup=Markup.XML))
+
+        assert dict(result.counts) == {VAR: 1}
+        assert value not in _parsed_failure(path.read_bytes()).get('message', '')
+
+
+class TestJsonAndTextMarkup:
+    SPECIALS = 'ab"cd\\ef' + 'z' * 30
+
+    def test_json_markup_is_the_default_and_keeps_the_raw_label(self):
         default = redaction_needles({VAR: VALUE})
 
-        assert default == redaction_needles({VAR: VALUE}, markup=Markup.TEXT)
+        assert default == redaction_needles({VAR: VALUE}, markup=Markup.JSON)
         assert all(needle.placeholder.startswith(b'<redacted:') for needle in default)
+
+    def test_text_markup_matches_the_raw_value_a_plain_log_holds(self, tmp_path):
+        path = _write(tmp_path / 'detect.log', [f'E   AssertionError: token={self.SPECIALS}', '1 failed'])
+
+        result = redact_in_place(path, redaction_needles({VAR: self.SPECIALS}, markup=Markup.TEXT))
+
+        assert dict(result.counts) == {VAR: 1}
+        assert self.SPECIALS.encode() not in path.read_bytes()
+        assert _placeholder(VAR, len(self.SPECIALS)) in path.read_bytes()
+
+    def test_text_markup_still_matches_a_json_escaped_value_a_log_line_embeds(self, tmp_path):
+        path = _write(tmp_path / 'detect.log', [f'payload: {json.dumps({"token": self.SPECIALS})}'])
+
+        result = redact_in_place(path, redaction_needles({VAR: self.SPECIALS}, markup=Markup.TEXT))
+
+        assert dict(result.counts) == {VAR: 1}
+        assert json.dumps(self.SPECIALS)[1:-1].encode() not in path.read_bytes()
+
+    def test_json_markup_does_not_match_the_raw_value(self, tmp_path):
+        path = _write(tmp_path / 'detect.log', [f'token={self.SPECIALS}'])
+
+        assert dict(redact_in_place(path, redaction_needles({VAR: self.SPECIALS})).counts) == {}
+
+    def test_a_value_without_specials_has_one_pattern_in_every_markup(self):
+        for markup in Markup:
+            assert [needle.pattern for needle in redaction_needles({VAR: VALUE}, markup=markup)] == [VALUE.encode()]
 
 
 def _write_gzip(path: Path, lines: list[str], *, mode: int = 0o640) -> Path:
