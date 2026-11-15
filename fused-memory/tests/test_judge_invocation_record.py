@@ -180,6 +180,12 @@ class TestRecordedOutcome:
         assert invocation.schema_salvaged is True
 
     @pytest.mark.asyncio
+    async def test_unreported_turn_count_is_unknown_not_zero(self, journal):
+        await _call(_judge(journal), _success(turns=0))
+
+        assert _recorded(journal).num_turns is None
+
+    @pytest.mark.asyncio
     async def test_rejected_calls_unknown_without_a_transcript(self, journal):
         await _call(_judge(journal), _success(session_id='no-such-session'))
 

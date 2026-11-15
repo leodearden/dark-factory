@@ -335,7 +335,10 @@ class JudgeVerdict(BaseModel):
 
 
 class JudgeInvocation(BaseModel):
-    """One claude_cli judge invocation's turn-cap and rejected-tool-call outcome (task 6573)."""
+    """One claude_cli judge invocation's turn-cap and rejected-tool-call outcome (task 6573).
+
+    Both counts are None when unknown, never a fabricated 0.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -343,5 +346,5 @@ class JudgeInvocation(BaseModel):
     completed_at: datetime
     ended_error_max_turns: bool
     schema_salvaged: bool
-    num_turns: int = Field(ge=0)
+    num_turns: int | None = Field(ge=1)
     rejected_tool_calls: int | None = Field(ge=0)

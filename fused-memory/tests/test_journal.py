@@ -307,7 +307,7 @@ class TestJudgeInvocations:
         ))
         await journal.record_judge_invocation(_invocation(
             run_id='run-ok', completed_at=second_at,
-            ended_error_max_turns=False, num_turns=2, rejected_tool_calls=None,
+            ended_error_max_turns=False, num_turns=None, rejected_tool_calls=None,
         ))
         await journal.close()
 
@@ -317,7 +317,7 @@ class TestJudgeInvocations:
             ' rejected_tool_calls FROM judge_invocations ORDER BY completed_at',
         ) == [
             ('run-hit', first_at.isoformat(), 1, 1, 4, 2),
-            ('run-ok', second_at.isoformat(), 0, 0, 2, None),
+            ('run-ok', second_at.isoformat(), 0, 0, None, None),
         ]
         assert _read_only_rows(db_path, _ARMED_CHECK) == [(2, second_at.isoformat())]
         assert _read_only_rows(db_path, _TRIPWIRE_COUNT) == [(1,)]
@@ -351,6 +351,10 @@ class TestJudgeInvocations:
     def test_model_rejects_negative_counts(self, field):
         with pytest.raises(ValidationError):
             _invocation(**{field: -1})
+
+    def test_model_rejects_a_zero_turn_count(self):
+        with pytest.raises(ValidationError):
+            _invocation(num_turns=0)
 
     def test_model_requires_schema_salvaged(self):
         fields = _invocation().model_dump(exclude={'schema_salvaged'})

@@ -1160,7 +1160,9 @@ value is anchored at the checkout by
   A schema-salvaged run counts too: the turn cap ended it, even though its
   verdict was recovered. The `schema_salvaged` column tells the two apart: 1
   is a run whose verdict was recovered, 0 is a verdict-less one, which also
-  shows up as a `JUDGE_INFRA_FAILURE` no-verdict.
+  shows up as a `JUDGE_INFRA_FAILURE` no-verdict. A NULL `num_turns` means
+  the CLI reported no turn count (a timed-out or killed run), not zero turns,
+  so leave those rows out of any turn distribution.
 - **Rejected tool calls.** The judge registers no tool but `StructuredOutput`,
   so the CLI rejects every other call it makes:
 

@@ -949,13 +949,15 @@ Review this run and provide your verdict as JSON.
         so a failed write loses the row but not the event (task 6573).
         """
         ended = classify_cap_kill(result, budget_usd=None, max_turns=None) is CapReason.TURNS
+        # AgentResult.turns is 0 when the CLI reported no num_turns (a timeout, a killed run).
+        num_turns = result.turns or None
         rejected = await self._rejected_tool_calls(result.session_id)
         if ended:
             _telemetry_logger.warning(
                 'reconciliation.judge_turn_cap_hit',
                 extra={
                     'run_id': run_id,
-                    'num_turns': result.turns,
+                    'num_turns': num_turns,
                     'max_turns': _JUDGE_CLI_MAX_TURNS,
                     'rejected_tool_calls': rejected,
                     'schema_salvaged': result.schema_salvaged,
@@ -967,7 +969,7 @@ Review this run and provide your verdict as JSON.
                 completed_at=datetime.now(UTC),
                 ended_error_max_turns=ended,
                 schema_salvaged=result.schema_salvaged,
-                num_turns=result.turns,
+                num_turns=num_turns,
                 rejected_tool_calls=rejected,
             ))
         except Exception:

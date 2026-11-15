@@ -188,7 +188,7 @@ CREATE TABLE IF NOT EXISTS judge_invocations (
     completed_at TEXT NOT NULL,
     ended_error_max_turns INTEGER NOT NULL,
     schema_salvaged INTEGER NOT NULL,
-    num_turns INTEGER NOT NULL,
+    num_turns INTEGER,
     rejected_tool_calls INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_judge_invocations_completed ON judge_invocations(completed_at);
