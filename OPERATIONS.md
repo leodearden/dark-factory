@@ -1175,11 +1175,12 @@ value is anchored at the checkout by
 
   The user journal is tens of GB, so widen `--since` with care; the table,
   not the journal, is the durable record. Each WARNING's message reads
-  `reconciliation.judge_turn_cap_hit run_id=… num_turns=… max_turns=… rejected_tool_calls=… schema_salvaged=…`,
+  `reconciliation.judge_turn_cap_hit run_id='…' num_turns=… max_turns=… rejected_tool_calls=… schema_salvaged=…`,
   logged on every hit even when the row write fails, or
-  `reconciliation.judge_invocation_record_failed run_id=… ended_error_max_turns=…`,
+  `reconciliation.judge_invocation_record_failed run_id='…' ended_error_max_turns=…`,
   logged when a row was lost. So the table is a lower bound, and the log is
-  the backstop.
+  the backstop. String values print quoted, so no value can split into
+  further `key=value` fields.
 - **Next action on a hit.** Re-run
   `fused-memory/scripts/probe_schema_max_turns.py --shape judge` before
   changing `_JUDGE_CLI_MAX_TURNS`

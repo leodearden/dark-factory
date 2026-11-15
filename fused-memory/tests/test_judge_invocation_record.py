@@ -5,8 +5,10 @@ test_judge.py's claude_cli tests use. The transcript the rejected-call count
 is read from is a real JSONL file under a per-test ``CLAUDE_CONFIG_DIR``.
 """
 
+import ast
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -134,9 +136,15 @@ def _logged(caplog, event: str) -> list[logging.LogRecord]:
     ]
 
 
-def _fields(record: logging.LogRecord) -> dict[str, str]:
-    """The ``key=value`` tokens after the event name, as the service's LOG_FORMAT renders them."""
-    return dict(token.split('=', 1) for token in record.getMessage().split(' ')[1:])
+_FIELD = re.compile(r"""(\w+)=('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|[^\s'"]+)""")
+
+
+def _fields(record: logging.LogRecord) -> dict[str, object]:
+    """The ``key=value`` fields after the event name, each value read back as the literal it renders."""
+    rest = record.getMessage().split(' ', 1)[1]
+    fields = _FIELD.findall(rest)
+    assert ' '.join(f'{k}={v}' for k, v in fields) == rest
+    return {k: ast.literal_eval(v) for k, v in fields}
 
 
 class TestRecordedOutcome:
@@ -212,7 +220,21 @@ class TestRecordedOutcome:
 
         assert _recorded(journal).rejected_tool_calls is None
         (failed,) = _logged(caplog, 'reconciliation.judge_rejected_tool_count_failed')
-        assert _fields(failed)['session_id'] == 's1'
+        assert _fields(failed) == {'session_id': 's1'}
+
+    @pytest.mark.asyncio
+    async def test_a_value_with_a_space_or_equals_stays_one_field(self, journal, caplog):
+        with (
+            patch(
+                'fused_memory.reconciliation.judge.transcript_evidence_for_session',
+                side_effect=OSError('disk gone'),
+            ),
+            caplog.at_level(logging.WARNING, logger=_JUDGE_LOGGER),
+        ):
+            await _call(_judge(journal), _success(session_id='s 1 k=v'))
+
+        (failed,) = _logged(caplog, 'reconciliation.judge_rejected_tool_count_failed')
+        assert _fields(failed) == {'session_id': 's 1 k=v'}
 
 
 class TestTelemetryNeverChangesTheOutcome:
@@ -225,7 +247,7 @@ class TestTelemetryNeverChangesTheOutcome:
 
         assert verdict == _OK_PAYLOAD
         (failed,) = _logged(caplog, _RECORD_FAILED)
-        assert _fields(failed) == {'run_id': 'run-1', 'ended_error_max_turns': 'False'}
+        assert _fields(failed) == {'run_id': 'run-1', 'ended_error_max_turns': False}
 
     @pytest.mark.asyncio
     async def test_write_failure_keeps_the_infra_error_and_the_hit_line(self, journal, caplog):
@@ -238,7 +260,7 @@ class TestTelemetryNeverChangesTheOutcome:
             await _call(_judge(journal), _turn_cap())
 
         (failed,) = _logged(caplog, _RECORD_FAILED)
-        assert _fields(failed) == {'run_id': 'run-1', 'ended_error_max_turns': 'True'}
+        assert _fields(failed) == {'run_id': 'run-1', 'ended_error_max_turns': True}
         assert len(_logged(caplog, _TURN_CAP_HIT)) == 1
 
 
@@ -256,10 +278,10 @@ class TestTurnCapHitLog:
         (hit,) = _logged(caplog, _TURN_CAP_HIT)
         assert _fields(hit) == {
             'run_id': 'run-cap',
-            'num_turns': '4',
-            'max_turns': '3',
-            'rejected_tool_calls': '2',
-            'schema_salvaged': 'False',
+            'num_turns': 4,
+            'max_turns': 3,
+            'rejected_tool_calls': 2,
+            'schema_salvaged': False,
         }
 
     @pytest.mark.asyncio
@@ -273,7 +295,7 @@ class TestTurnCapHitLog:
             await _call(_judge(journal), _turn_cap(session_id='no-such-session'))
 
         (hit,) = _logged(caplog, _TURN_CAP_HIT)
-        assert _fields(hit)['rejected_tool_calls'] == 'None'
+        assert _fields(hit)['rejected_tool_calls'] is None
 
     @pytest.mark.asyncio
     async def test_salvaged_turn_cap_hit_says_it_was_salvaged(self, journal, caplog):
@@ -281,7 +303,7 @@ class TestTurnCapHitLog:
             await _call(_judge(journal), _salvaged_turn_cap())
 
         (hit,) = _logged(caplog, _TURN_CAP_HIT)
-        assert _fields(hit)['schema_salvaged'] == 'True'
+        assert _fields(hit)['schema_salvaged'] is True
 
     @pytest.mark.asyncio
     async def test_ordinary_success_logs_no_hit(self, journal, caplog):

@@ -48,14 +48,16 @@ logger = logging.getLogger(__name__)
 
 
 class _FieldsInMessage(logging.LoggerAdapter[logging.Logger]):
-    """Appends each ``extra`` field to the message as ``k=v``: the service's
-    server/main.py::LOG_FORMAT renders only %(message)s (task 6829 covers the formatter)."""
+    """Appends each ``extra`` field to the message as ``k=v!r``, so a string value is
+    quoted and cannot split into further fields: the service's
+    fused-memory/src/fused_memory/server/main.py::LOG_FORMAT renders only %(message)s
+    (task 6829 covers the formatter)."""
 
     def process(
         self, msg: Any, kwargs: MutableMapping[str, Any],
     ) -> tuple[Any, MutableMapping[str, Any]]:
         fields = kwargs.get('extra') or {}
-        return ' '.join([str(msg), *(f'{k}={v}' for k, v in fields.items())]), kwargs
+        return ' '.join([str(msg), *(f'{k}={v!r}' for k, v in fields.items())]), kwargs
 
 
 _telemetry_logger = _FieldsInMessage(logger)
