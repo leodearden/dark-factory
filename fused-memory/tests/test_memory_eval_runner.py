@@ -87,6 +87,30 @@ class TestRunnerConfig:
         with pytest.raises(ValueError):
             _mod().load_runner_config(_write_config(tmp_path, storm_alarm_limit=0))
 
+    def test_an_override_replaces_the_shared_bound_for_its_eval_only(self, tmp_path):
+        config = _mod().load_runner_config(_write_config(
+            tmp_path, producer_timeout_secs=3600, producer_timeout_secs_by_eval={_E1: 7200},
+        ))
+        assert config.producer_timeout(_E1) == 7200
+        assert config.producer_timeout('e4-staleness-sweep') == 3600
+
+    def test_an_override_for_an_unregistered_eval_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match='e6-corpus-healht'):
+            _mod().load_runner_config(_write_config(
+                tmp_path, producer_timeout_secs_by_eval={'e6-corpus-healht': 7200},
+            ))
+
+    def test_a_non_positive_override_is_refused(self, tmp_path):
+        with pytest.raises(ValueError):
+            _mod().load_runner_config(_write_config(
+                tmp_path, producer_timeout_secs_by_eval={'e6-corpus-health': 0},
+            ))
+
+    def test_the_committed_config_bounds_e6_beyond_the_3600s_it_exceeded(self):
+        """Both scheduled runs, 20261113T031911Z and 20261114T031830Z, killed e6 at 3600 s."""
+        config = _mod().load_runner_config(COMMITTED_CONFIG)
+        assert config.producer_timeout('e6-corpus-health') > 3600
+
 
 class TestQueueDirResolution:
     def test_a_relative_setting_resolves_against_the_repo_root(self, tmp_path):
@@ -125,6 +149,12 @@ class TestPreflightExits:
 
     def test_an_invalid_config_exits_2_without_artifacts(self, tmp_path, capsys):
         config = _write_config(tmp_path, storm_alarm_limit=None)
+        assert self._run(tmp_path, tmp_path / 'queue', config) == 2
+        assert str(config) in capsys.readouterr().err
+        assert self._no_artifacts(tmp_path)
+
+    def test_an_unregistered_timeout_override_exits_2_without_artifacts(self, tmp_path, capsys):
+        config = _write_config(tmp_path, producer_timeout_secs_by_eval={'e6-corpus-healht': 7200})
         assert self._run(tmp_path, tmp_path / 'queue', config) == 2
         assert str(config) in capsys.readouterr().err
         assert self._no_artifacts(tmp_path)
