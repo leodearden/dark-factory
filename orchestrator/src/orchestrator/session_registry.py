@@ -4105,6 +4105,8 @@ def main(argv: list[str] | None = None) -> int:
             _run_lease_show(args.name)
         elif args.verb == 'lease-reap':
             _run_lease_reap()
+        else:
+            logger.error('session_registry %s: the parser accepts this verb but no runner handles it', args.verb)
     except Exception:
         logger.error('session_registry %s failed', args.verb, exc_info=True)
         return 0

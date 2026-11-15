@@ -1765,6 +1765,24 @@ def _decision_verb_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+class TestDecisionVerbTable:
+    """One verb set: the subparsers add_verb_parsers registers are the verbs run_verb dispatches."""
+
+    def test_add_verb_parsers_registers_exactly_the_decision_verbs(self) -> None:
+        sub = argparse.ArgumentParser().add_subparsers(dest='verb', required=True)
+
+        decision_cli.add_verb_parsers(sub)
+
+        assert set(sub.choices) == decision_cli.DECISION_VERBS
+
+    def test_run_verb_refuses_a_session_verb(self) -> None:
+        def never_called(local_id: str, project: str) -> str:
+            raise AssertionError('a refused verb resolved a filing slug')
+
+        with pytest.raises(ValueError, match="'reap' is not a decision verb"):
+            decision_cli.run_verb(argparse.Namespace(verb='reap'), filing_record_slug=never_called)
+
+
 class TestRunVerbFilingRecordSlug:
     """run_verb resolves the filer's record slug through the injected callable, and only for write-decision."""
 
@@ -1794,21 +1812,37 @@ class TestRunVerbFilingRecordSlug:
         assert filed.record_slug == 'injected-record-slug'
 
     @pytest.mark.parametrize(
-        'argv',
+        ('argv', 'printed'),
         [
-            ['reap-decisions', '--project', 'df', '--escalations-dir', '/a/data/escalations'],
-            ['migrate-decision-projects', '--dry-run'],
-            ['close-decision', '--id', 'esc-9-1', '--state', 'answered', '--evidence', EVIDENCE,
-             '--project', 'df', '--escalations-dir', '/a/data/escalations'],
+            (['reap-decisions', '--project', 'df', '--escalations-dir', '{orch}'], 'esc-3036-1 answered'),
+            (['migrate-decision-projects', '--dry-run'], 'esc-3036-1 df -> dark_factory'),
+            (
+                ['close-decision', '--id', 'esc-3036-1', '--state', 'answered', '--evidence', EVIDENCE,
+                 '--project', 'df', '--escalations-dir', '{orch}'],
+                'esc-3036-1',
+            ),
         ],
-        ids=lambda argv: argv[0],
+        ids=['reap-decisions', 'migrate-decision-projects', 'close-decision'],
     )
-    def test_the_other_verbs_never_resolve_a_filing_slug(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, argv: list[str]
+    def test_the_other_verbs_run_without_resolving_a_filing_slug(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        argv: list[str],
+        printed: str,
     ) -> None:
         monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        orch, _recon = two_queues(tmp_path)
+        dr.write_decision(make_decision(
+            id='esc-3036-1', project='df', state=dr.DecisionState.OPEN,
+            escalation_id='esc-3036-1', escalations_dir=str(orch),
+        ))
         calls: list[tuple[str, str]] = []
+        args = _decision_verb_args([str(orch) if arg == '{orch}' else arg for arg in argv])
 
-        decision_cli.run_verb(_decision_verb_args(argv), filing_record_slug=self._recording_resolver(calls))
+        rc = decision_cli.run_verb(args, filing_record_slug=self._recording_resolver(calls))
 
+        assert rc == 0
+        assert printed in capsys.readouterr().out.splitlines()
         assert calls == []

@@ -10,6 +10,7 @@ tests/scripts/test_spawn_claude.py's bash-level harness.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import dataclasses
 import fcntl
@@ -2051,6 +2052,27 @@ def test_main_launching_fail_soft_when_fleet_root_under_a_file(
     assert capsys.readouterr().out.strip() == ''
     assert any(r.levelno >= logging.ERROR for r in caplog.records)
     assert not (blocker / 'fleet').exists()
+
+
+def test_main_logs_a_verb_the_parser_accepts_but_no_runner_handles(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A verb registered on the parser but dispatched nowhere is an ERROR, not a silent rc-0 no-op."""
+
+    def parser_with_an_unrouted_verb() -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser()
+        parser.add_subparsers(dest='verb', required=True).add_parser('unrouted-verb')
+        return parser
+
+    monkeypatch.setattr(sr, '_build_parser', parser_with_an_unrouted_verb)
+
+    with caplog.at_level(logging.ERROR):
+        rc = sr.main(['unrouted-verb'])
+
+    assert rc == 0
+    [record] = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert 'unrouted-verb' in record.getMessage()
+    assert 'no runner handles it' in record.getMessage()
 
 
 def test_main_launching_fail_soft_when_launcher_pid_not_numeric(

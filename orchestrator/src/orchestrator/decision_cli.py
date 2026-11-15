@@ -44,10 +44,6 @@ else:
 
 logger = logging.getLogger(__name__)
 
-DECISION_VERBS: frozenset[str] = frozenset(
-    {'write-decision', 'close-decision', 'reopen-decision', 'reap-decisions', 'migrate-decision-projects'}
-)
-
 
 def _read_decision_or_none(decision_id: str) -> decision_registry.DecisionRecord | None:
     """The record at *decision_id*, or None when it is absent, unreadable or corrupt."""
@@ -739,6 +735,46 @@ def _run_migrate_decision_projects(dry_run: bool) -> None:
         print(f'{migrated.id} {migrated.old_project} -> {migrated.new_project}')
 
 
+# The one table of decision verbs. A refusing runner's exit code is the CLI's;
+# a fail-soft runner's faults are logged and swallowed by run_verb.
+_REFUSING_RUNNERS: dict[str, Callable[[argparse.Namespace], int]] = {
+    'close-decision': lambda args: _run_close_decision(
+        args.id,
+        args.state,
+        args.evidence,
+        args.root,
+        expected_project=args.project,
+        expected_escalations_dir=args.escalations_dir,
+    ),
+    'reopen-decision': lambda args: _run_reopen_decision(
+        args.id,
+        args.root,
+        expected_project=args.project,
+        expected_escalations_dir=args.escalations_dir,
+    ),
+}
+_FAIL_SOFT_RUNNERS: dict[str, Callable[[argparse.Namespace, Callable[[str, str], str]], None]] = {
+    'write-decision': lambda args, filing_record_slug: _run_write_decision(
+        args.id,
+        args.project,
+        args.text,
+        args.task_id,
+        args.escalation_id,
+        args.session_id,
+        args.severity,
+        args.escalations_dir,
+        record_slug=filing_record_slug(args.id, args.project),
+    ),
+    'reap-decisions': lambda args, _filing_record_slug: _run_reap_decisions(
+        args.project, args.escalations_dir, expect_matches=args.expect_matches
+    ),
+    'migrate-decision-projects': lambda args, _filing_record_slug: _run_migrate_decision_projects(
+        args.dry_run
+    ),
+}
+DECISION_VERBS: frozenset[str] = frozenset(_REFUSING_RUNNERS.keys() | _FAIL_SOFT_RUNNERS.keys())
+
+
 def _add_record_identity_args(verb_parser: argparse.ArgumentParser) -> None:
     """The compare-and-swap expectations close-decision and reopen-decision name a record by."""
     verb_parser.add_argument(
@@ -758,7 +794,6 @@ def _add_record_identity_args(verb_parser: argparse.ArgumentParser) -> None:
             'a record at --id whose normalized stamp differs is refused'
         ),
     )
-
 
 
 def add_verb_parsers(sub: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -891,44 +926,14 @@ def run_verb(args: argparse.Namespace, *, filing_record_slug: Callable[[str, str
     they run outside the swallowing try/except: see _run_close_decision and
     _run_reopen_decision for why their refusals exit non-zero.
     """
-    if args.verb not in DECISION_VERBS:
+    refusing = _REFUSING_RUNNERS.get(args.verb)
+    if refusing is not None:
+        return refusing(args)
+    fail_soft = _FAIL_SOFT_RUNNERS.get(args.verb)
+    if fail_soft is None:
         raise ValueError(f'{args.verb!r} is not a decision verb; expected one of {sorted(DECISION_VERBS)}')
-    if args.verb == 'close-decision':
-        return _run_close_decision(
-            args.id,
-            args.state,
-            args.evidence,
-            args.root,
-            expected_project=args.project,
-            expected_escalations_dir=args.escalations_dir,
-        )
-    if args.verb == 'reopen-decision':
-        return _run_reopen_decision(
-            args.id,
-            args.root,
-            expected_project=args.project,
-            expected_escalations_dir=args.escalations_dir,
-        )
-
     try:
-        if args.verb == 'write-decision':
-            _run_write_decision(
-                args.id,
-                args.project,
-                args.text,
-                args.task_id,
-                args.escalation_id,
-                args.session_id,
-                args.severity,
-                args.escalations_dir,
-                record_slug=filing_record_slug(args.id, args.project),
-            )
-        elif args.verb == 'reap-decisions':
-            _run_reap_decisions(
-                args.project, args.escalations_dir, expect_matches=args.expect_matches
-            )
-        elif args.verb == 'migrate-decision-projects':
-            _run_migrate_decision_projects(args.dry_run)
+        fail_soft(args, filing_record_slug)
     except Exception:
         logger.error('session_registry %s failed', args.verb, exc_info=True)
     return 0
