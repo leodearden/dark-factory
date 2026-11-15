@@ -131,13 +131,13 @@ class FleetCensus:
     from live measurements (task 5824, pre-1). The active and terminal counts,
     module pools, dependency densities and merge-cap fill here were re-measured
     live on 2026-11-15 (task 10139): 7,245 active rows across 12 projects
-    (dark-factory 3,635, reify 2,760), 9,883 dependencies and 10,743 scheduler
-    modules. The per-row shapes were measured against the live dashboard on
-    2026-10-21 (5,335 active rows):
+    (dark-factory 3,635, reify 2,760) and 10,743 scheduler modules. The fleet
+    titles 11 dependencies in 12, so the densities seed 9,883 dependencies to
+    match live's titled ones (9,043 of 11,623); the rest are id-only
+    references to finished tasks. The per-row shapes were measured against
+    the live dashboard on 2026-10-21 (5,335 active rows):
 
     * titles average 120 characters, ``meta_files`` 5.5 paths of 43;
-    * 92% of dependencies are on another active row (titled), whose density
-      is set per root;
     * 36% of rows name a PRD of 45 characters; 1.1% carry an external dep;
     * 480 held modules, 9 parked tasks, 8 skipped, 17 pinned, 7 recovery
       events in the last hour;
