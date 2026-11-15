@@ -1125,7 +1125,7 @@ class TestBarrenStreakDue:
         assert trickle_state.barren_streak_due(state, threshold) is due
 
 
-_NIGHT_KINDS = {
+_NIGHT_KINDS: dict[str, dict[str, Any]] = {
     'barren': dict(below_sampling_cut=3),
     'failed': dict(exit_code=1),
     'deferred': dict(capped=True, selected_count=1),
