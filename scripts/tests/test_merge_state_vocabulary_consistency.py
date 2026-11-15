@@ -1458,7 +1458,7 @@ def test_find_unregistered_sites_raises_on_an_empty_scan() -> None:
         find_unregistered_sites(files=[], registry={}, threshold=4)
 
 
-def test_tracked_skill_markdown_fails_loudly_without_the_git_oracle(tmp_path: Path) -> None:
+def test_tracked_scan_markdown_fails_loudly_without_the_git_oracle(tmp_path: Path) -> None:
     """The tracked-file oracle raises when it cannot run, with no filesystem fallback.
 
     The scan's verdict must come from TRACKED files only, so that an untracked
@@ -1469,9 +1469,47 @@ def test_tracked_skill_markdown_fails_loudly_without_the_git_oracle(tmp_path: Pa
     `orchestrator/src/orchestrator/verify.py::_target_subprocess_env`.
     """
     with pytest.raises(RuntimeError) as excinfo:
-        tracked_skill_markdown(root=tmp_path)
+        tracked_scan_markdown(root=tmp_path)
 
     assert str(tmp_path) in str(excinfo.value)
+
+
+def test_tracked_scan_markdown_reads_skills_and_root_docs_only(tmp_path: Path) -> None:
+    """The scan domain is tracked markdown under `skills/` and at the repo root.
+
+    Checked against a real git index, so the domain is pinned as behaviour of git,
+    not as a pathspec string.
+    """
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            timeout=60,
+            env=_scrubbed_git_env(),
+        )
+
+    git("init", "-q")
+    tracked = [
+        "skills/a/SKILL.md",
+        "skills/a/references/ref.md",
+        "ROOT.md",
+        "docs/d.md",
+        "plans/p.md",
+        "skills/notes.txt",
+    ]
+    for relative in [*tracked, "UNTRACKED.md"]:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# fixture\n", encoding="utf-8")
+    git("add", "--", *tracked)
+
+    assert [p.relative_to(tmp_path).as_posix() for p in tracked_scan_markdown(root=tmp_path)] == [
+        "ROOT.md",
+        "skills/a/SKILL.md",
+        "skills/a/references/ref.md",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1622,6 +1660,25 @@ def test_registry_is_complete() -> None:
             "rather than a copy of a vocabulary — add it to _UNPINNED_RULE_SITES "
             "with the reason, as `skills/orchestrate/SKILL.md` is."
         )
+
+
+def test_every_registered_markdown_site_is_inside_the_scan_domain() -> None:
+    """If the scan cannot see a registered markdown site, the completeness check is vacuous for it.
+
+    It means the registry and the scan disagree about the domain. ARCHITECTURE.md
+    and OPERATIONS.md were in exactly that state.
+    """
+    scanned = {_scan_label(path) for path in tracked_scan_markdown()}
+    registered = [
+        label for label in (*PINNED_SITES, *_UNPINNED_RULE_SITES) if label.endswith(".md")
+    ]
+    outside = sorted(label for label in registered if label not in scanned)
+
+    assert not outside, (
+        f"{outside!r} are registered markdown sites outside the registry scan's domain "
+        f"(task 5178). Widen `_SCAN_PATHSPECS` to cover them, or the completeness check "
+        f"never looks at their directory."
+    )
 
 
 @pytest.mark.parametrize("relative_path", sorted(_UNPINNED_RULE_SITES))
