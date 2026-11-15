@@ -23,8 +23,8 @@ therefore denies.
 
 LIVE READ (``config/reload.py``'s reload-safety precondition): every resolver
 re-reads ``memory_service.config.mem0_update.*`` on EVERY call and captures
-nothing at import or construction, which is what makes the five
-``mem0_update.*`` leaves genuinely green-tier hot-reloadable rather than
+nothing at import or construction, which is what makes every
+``mem0_update.*`` leaf genuinely green-tier hot-reloadable rather than
 restart-only in disguise.
 
 Lives in its own module rather than inline in ``server/tools.py`` because that
@@ -114,6 +114,69 @@ def resolve_mem0_update_allowed_prefixes(
     return tuple(p for p in value if isinstance(p, str) and p)
 
 
+def resolve_mem0_update_sanctioned_uses(memory_service: Any) -> dict[str, str]:
+    """Read the prefix-to-role map live off the shared config.
+
+    Returns ``{}`` unless the leaf is a real ``dict``, and otherwise a NEW dict of
+    only the entries whose key is a non-empty ``str`` and whose value is a ``str``
+    non-blank after strip, the same per-item filter as
+    :func:`resolve_mem0_update_allowed_prefixes`.
+
+    The one deliberate difference from its siblings: this resolver is
+    RENDERING-ONLY and never feeds the allow/deny decision. A text lookup has no
+    permit direction to fail into, so its fallback renders a prefix as
+    undocumented rather than denying anything.
+    """
+    value = _mem0_update_attr(memory_service, 'agent_prefix_sanctioned_use')
+    if not isinstance(value, dict):
+        return {}
+    return {
+        prefix: use
+        for prefix, use in value.items()
+        if isinstance(prefix, str) and prefix
+        and isinstance(use, str) and use.strip()
+    }
+
+
+def _render_prefix_roles(
+    prefixes: tuple[str, ...],
+    sanctioned_uses: dict[str, str],
+) -> str:
+    if not prefixes:
+        return 'none (the list is empty, so no caller may use this arm)'
+    return '; '.join(
+        f'{prefix!r}: {sanctioned_uses[prefix]}' if prefix in sanctioned_uses
+        else (
+            f'{prefix!r}: no sanctioned use documented (config '
+            'mem0_update.agent_prefix_sanctioned_use has no entry), so do not '
+            'adopt it'
+        )
+        for prefix in prefixes
+    )
+
+
+def _not_authorized_error(
+    agent_id: Any,
+    arm: str,
+    knob: str,
+    prefixes: tuple[str, ...],
+    sanctioned_uses: dict[str, str],
+) -> str:
+    return (
+        f'agent_id {agent_id!r} is not authorized for the {arm} arm of '
+        f'update_memory (config mem0_update.{knob}). In-place amendment is a '
+        'silent-rewrite primitive, so the bar is deliberately narrow. agent_id '
+        'is self-reported, so this gate is a misuse deterrent rather than an '
+        'access-control boundary, and each prefix on the bar declares a '
+        'sanctioned role rather than granting a credential. The prefixes on '
+        'this bar and the role each declares: '
+        f'{_render_prefix_roles(prefixes, sanctioned_uses)}. Adopt a prefix '
+        'only if you are that role. If this refusal reached you in the middle '
+        'of other work, do not rename yourself to get past it: leave the record '
+        'alone and escalate.'
+    )
+
+
 def _agent_matches(agent_id: Any, prefixes: tuple[str, ...]) -> bool:
     """True iff *agent_id* is a non-empty ``str`` matching one of *prefixes*."""
     if not isinstance(agent_id, str) or not agent_id:
@@ -178,12 +241,9 @@ def resolve_mem0_update_authorization(
             return Mem0UpdateAuthzDecision(
                 allowed=False,
                 error_type='Mem0UpdateNotAuthorized',
-                error=(
-                    f'agent_id {agent_id!r} is not authorized for the '
-                    f'{arm} arm of update_memory. Authorized prefixes: '
-                    f'{list(prefixes)!r} (config mem0_update.{knob}). '
-                    'In-place amendment is a silent-rewrite primitive, so the '
-                    'default bar is deliberately narrow.'
+                error=_not_authorized_error(
+                    agent_id, arm, knob, prefixes,
+                    resolve_mem0_update_sanctioned_uses(memory_service),
                 ),
             )
 
