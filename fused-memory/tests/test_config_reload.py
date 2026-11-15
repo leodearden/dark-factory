@@ -542,6 +542,7 @@ class TestMem0UpdateLeavesAreGreenTier:
         error = resolve_mem0_update_authorization(
             svc, agent_id='rando', content_amend=True, metadata_patch=False,
         ).error
+        assert isinstance(error, str)
         assert "'curator-': RELOADED-CURATOR-ROLE" in error, error
 
     def test_kill_switch_flip_is_observed_live_without_a_restart(self):

@@ -1073,7 +1073,7 @@ class TestMem0UpdateConfig:
 
     def test_non_str_sanctioned_use_value_rejected(self):
         with pytest.raises(ValidationError):
-            Mem0UpdateConfig(agent_prefix_sanctioned_use={'curator-': 42})
+            Mem0UpdateConfig(agent_prefix_sanctioned_use={'curator-': 42})  # type: ignore[arg-type]
 
     def test_every_skill_a_default_sanctioned_use_names_exists(self):
         """A refusal must never point a caller at a skill that is not there."""
