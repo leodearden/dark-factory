@@ -30,6 +30,7 @@ This sweep asserts the effect's precondition instead, by content discovery, so a
 unit added next month is covered the day it lands.  Structurally modelled on
 tests/scripts/test_systemd_restart_backoff.py.
 """
+import dataclasses
 import pathlib
 import subprocess
 
@@ -240,6 +241,25 @@ def uv_run_level_flags(exec_start: str) -> list[str] | None:
     return flags
 
 
+@dataclasses.dataclass(frozen=True)
+class UvRunSite:
+    """One `uv run` a unit's start executes: where it is written, its text, its run-level flags."""
+
+    source: str
+    command: str
+    flags: tuple[str, ...]
+
+
+def shell_uv_run_sites(script: str, source: str) -> list[UvRunSite]:
+    """Placeholder until task 5666 step-2."""
+    raise NotImplementedError("task 5666 step-2")
+
+
+def wrapper_script_of(exec_start: str) -> str | None:
+    """Placeholder until task 5666 step-2."""
+    raise NotImplementedError("task 5666 step-2")
+
+
 def discover_uv_run_units() -> list[str]:
     """Repo-relative paths of every discovered file whose ExecStart is a `uv run`.
 
@@ -403,3 +423,106 @@ def test_uv_run_unit_carries_no_lockfile_flag(rel_path: str) -> None:
         "it would mean dropping `--no-sync`, which reinstates the hazard. Check "
         "the lockfile somewhere that is not a unit start."
     )
+
+
+@pytest.mark.parametrize(
+    ("script", "expected_flags"),
+    [
+        pytest.param(
+            'SWEEP_CMD=("$UV_RESOLVED" run --no-sync --project "$FM" python)\n',
+            [("--no-sync", "--project")],
+            id="resolved-uv-variable",
+        ),
+        pytest.param(
+            'PREPARE_CMD=(${PREPARE_CMD:-uv run --frozen --project "$REPO/shared" python})\n',
+            [("--frozen", "--project")],
+            id="seam-default-array",
+        ),
+        pytest.param(
+            'read -r -a SWEEP_CMD <<<"${X_CMD:-uv run --frozen --project $REPO/shared python}"\n',
+            [("--frozen", "--project")],
+            id="seam-default-read",
+        ),
+        pytest.param(
+            "/home/leo/.local/bin/uv run --no-sync --project=shared python x.py\n",
+            [("--no-sync", "--project")],
+            id="absolute-uv-path",
+        ),
+        pytest.param(
+            '"$UV" run \\\n    --no-sync --project "$FM" python x.py\n',
+            [("--no-sync", "--project")],
+            id="continuation",
+        ),
+        pytest.param(
+            'PREPARE_CMD=(${PREPARE_CMD:-uv run --frozen --project "$REPO/shared" python})\n'
+            'RETURN_BRIEF_CMD=(${RETURN_BRIEF_CMD:-uv run --no-sync --project "$REPO/shared" python})\n',
+            [("--frozen", "--project"), ("--no-sync", "--project")],
+            id="two-commands-in-file-order",
+        ),
+    ],
+)
+def test_shell_uv_run_sites_reads_every_wrapper_spelling(
+    script: str, expected_flags: list[tuple[str, ...]]
+) -> None:
+    """Guard the guard: every way a committed wrapper spells `uv run` yields its site."""
+    sites = shell_uv_run_sites(script, "planted.sh")
+    assert [s.flags for s in sites] == expected_flags
+
+
+@pytest.mark.parametrize(
+    ("script", "expected_flags"),
+    [
+        pytest.param(
+            "# uv run --frozen --project fused-memory python \\\n"
+            "X=(uv run --no-sync python)\n",
+            [("--no-sync",)],
+            id="comment-skipped-and-its-backslash-joins-nothing",
+        ),
+        pytest.param('"$UV" sync --all-packages\n', [], id="uv-sync"),
+        pytest.param("uvx --from foo bar\n", [], id="uvx"),
+        pytest.param('python3 "$REPO/x.py"\n', [], id="python3"),
+    ],
+)
+def test_shell_uv_run_sites_ignores_what_is_not_a_uv_run(
+    script: str, expected_flags: list[tuple[str, ...]]
+) -> None:
+    """Guard the guard: comments, `uv sync`, `uvx` and bare python are not sites."""
+    sites = shell_uv_run_sites(script, "planted.sh")
+    assert [s.flags for s in sites] == expected_flags
+
+
+def test_shell_uv_run_site_names_its_source_and_logical_line() -> None:
+    """A site carries the file it was read from and the JOINED command, for diagnostics."""
+    [site] = shell_uv_run_sites(
+        '"$UV" run \\\n    --no-sync --project "$FM" python x.py\n', "scripts/planted.sh"
+    )
+    assert site.source == "scripts/planted.sh"
+    assert site.command == '"$UV" run --no-sync --project "$FM" python x.py'
+
+
+@pytest.mark.parametrize(
+    ("exec_start", "expected"),
+    [
+        pytest.param(
+            "/home/leo/src/dark-factory/scripts/sync-orchestrator-env.sh --flag",
+            "scripts/sync-orchestrator-env.sh",
+            id="tracked-wrapper-by-suffix",
+        ),
+        pytest.param(
+            "-/home/leo/src/dark-factory/scripts/sync-orchestrator-env.sh",
+            "scripts/sync-orchestrator-env.sh",
+            id="systemd-exec-prefix",
+        ),
+        pytest.param(
+            "/home/leo/src/dark-factory/scripts/orchestrator-watchdog.py",
+            None,
+            id="not-a-shell-script",
+        ),
+        pytest.param("/nonexistent/elsewhere/no-such-wrapper.sh", None, id="untracked"),
+    ],
+)
+def test_wrapper_script_of_resolves_only_a_tracked_shell_script(
+    exec_start: str, expected: str | None
+) -> None:
+    """A unit's wrapper is found by path SUFFIX, so the answer holds in any checkout."""
+    assert wrapper_script_of(exec_start) == expected
