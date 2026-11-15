@@ -802,6 +802,21 @@ class TestResolveOwnCgroup:
 
         assert own.path == '/user.slice/df.slice/df-dark_factory.slice'
 
+    def test_dashed_project_id_resolves_to_the_shared_rule_slice(self, tmp_path):
+        from shared.psi import resolve_own_cgroup
+
+        text = (
+            '0::/user.slice/user-1000.slice/user@1000.service/'
+            'df.slice/df-my_proj.slice/df-verify-x-0123abcd-0123456789ab.scope\n'
+        )
+        own = resolve_own_cgroup(
+            'my-proj',
+            proc_cgroup_path=self._cgroup_file(tmp_path, text),
+            cgroup_root=tmp_path / 'sys',
+        )
+
+        assert own.path.endswith('/df-my_proj.slice')
+
     def test_prefers_the_v2_line_on_a_hybrid_host(self, tmp_path):
         """Tolerance for co-present cgroup-v1 lines. Explicitly NOT a §6.3
         parity fixture — the table's rows are unified-hierarchy only."""
