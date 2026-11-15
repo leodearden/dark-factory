@@ -26,7 +26,7 @@ from orchestrator.merge_halt_escalation import (
     build_merge_halt_escalation_text,
     submit_halt_owning_escalation,
 )
-from orchestrator.merge_lane.types import MergeOutcome
+from orchestrator.merge_lane import MergeOutcome, is_merge_worker_shutdown
 from orchestrator.stranded_verified_green import (
     DURABLE_MERGE_FAILURE_STATUSES,
     SUCCESS_TRANSIENT_MERGE_STATUSES,
@@ -84,6 +84,7 @@ class ScheduleCoro(Protocol):
 class Settled(enum.StrEnum):
     """What :meth:`RecoveredMergeOwner.settle` did with one outcome."""
 
+    WORKER_SHUTDOWN = 'worker_shutdown'
     LANDED = 'landed'
     LANDING_UNRECORDED = 'landing_unrecorded'
     HALTED = 'halted'
@@ -103,6 +104,9 @@ class RecoveredMergeOwner:
       or records the landing for ``done_wip_recovery``.
     - Transient (``superseded``): left to the stranded sweep.
     - Durable or unclassified failure: blocks the task and files one L1 under its block category.
+
+    The merge worker's shutdown outcome is not terminal: the journal keeps the
+    request and the next start restores and re-adopts it, so it is left alone.
     """
 
     tasks: OutcomeTasks
@@ -160,6 +164,8 @@ class RecoveredMergeOwner:
         return settled
 
     async def _settle(self, request: RecoveredRequest, outcome: MergeOutcome) -> Settled:
+        if is_merge_worker_shutdown(outcome):
+            return Settled.WORKER_SHUTDOWN
         tid = request.task_id
         if self.tasks.is_actively_held(tid):
             return Settled.WORKFLOW_HELD
