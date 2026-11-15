@@ -32,6 +32,12 @@ const deps = {
   clearTimeoutImpl: () => {},
 };
 api.refreshDFData(undefined, { state: api.createPollState(), jitterMaxMs: 0, deps });
+// The fetches never settle, so draining only lets every endpoint reach its race.
+await quietly(drain);
+if (fetches.length === 0) {
+  process.stderr.write('data.js polled no endpoint at all: refreshDFData issued no fetch\n');
+  process.exit(2);
+}
 
 // The armed delay of each fetch, by its url.
 const abortDelays = new Map();

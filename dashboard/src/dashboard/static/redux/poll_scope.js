@@ -35,8 +35,10 @@
 // id has an entry — because a map that silently stops matching a renamed
 // endpoint is a check that has quietly stopped checking.
 // dashboard/tests/js/render_app_shell.test.mjs renders each tab the rail opens,
-// plus the views its DEEPER_VIEWS map opens behind a click, and fails when a
-// path read there is missing from the tab's entry; a reader that renders only
+// plus the views its DEEPER_VIEWS map opens behind a click. It fails when a
+// path the tab's own component reads is missing from the tab's entry (/tasks
+// only if it reads task rows), and when anything on the open page reads a path
+// neither the entry nor CHROME_ENDPOINTS polls; a reader that renders only
 // behind a click is covered once DEEPER_VIEWS opens it. `toolbarConfig` in
 // app.jsx is the sibling per-tab map; keep the two tab-id lists in step.
 //

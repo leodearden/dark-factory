@@ -1,5 +1,7 @@
 // The app shell's render tests: app.jsx's poll-scope announcements, the
-// endpoints each tab reads, and the tab slot's error boundary. The real page renders in a jsdom window
+// endpoints each tab reads, the tab slot's error boundary, the shell's Datum
+// components (charts.jsx::StatTile, shell.jsx::Pip and DatumReading), and
+// OrchTab's per-project Locks column. The real page renders in a jsdom window
 // (dom_harness.mjs); every expected value is taken from the shipped helpers'
 // public globals, never from script text.
 import { after, test } from 'node:test';
@@ -235,15 +237,15 @@ function seedReadSetPage(window, recorder) {
 
 // The Tasks detail pane renders only once a task is selected. The project is
 // listed flat through its own toggle, so the rail click before this still
-// measured the default By-PRD render.
-function openTaskDetail(window, root, task) {
-  const listToggle = [...root.querySelectorAll('.body .seg button')].find(button => button.textContent === 'list');
+// measured the default By-PRD render. `body` holds the Tasks tab and nothing else.
+function openTaskDetail(window, body, task) {
+  const listToggle = [...body.querySelectorAll('.seg button')].find(button => button.textContent === 'list');
   assert.ok(listToggle, 'the Tasks tab offers no "list" toggle');
   click(window, listToggle);
-  const node = graphNode(root, task);
+  const node = graphNode(body, task);
   assert.ok(node, 'the seeded task never reached the Tasks graph, so it cannot be selected');
   click(window, node);
-  const sub = root.querySelector('.task-detail')?.querySelector('.sub');
+  const sub = body.querySelector('.task-detail')?.querySelector('.sub');
   assert.ok(
     sub?.textContent.includes(window.DF_SHELL.taskId(task.id)),
     'the Tasks detail pane did not open on the seeded task, so its readers go unmeasured',
@@ -256,10 +258,42 @@ const DEEPER_VIEWS = {
   tasks: openTaskDetail,
 };
 
+// The globals app.jsx binds its tab components off when it loads.
+const TAB_MODULES = ['DF_OVERVIEW', 'DF_TABS', 'DF_TASKS', 'DF_CURATOR', 'DF_SCHEDULER', 'DF_QUALITY'];
+
+// Wraps every *Tab component of TAB_MODULES, before mountPage binds them, so
+// each render the page's tab slot makes is recorded with its props. take()
+// returns the components rendered since the last take().
+function recordTabBodies(window) {
+  let rendered = new Map();
+  for (const name of TAB_MODULES) {
+    const module = window[name];
+    assert.ok(module, `app.jsx binds tabs off window.${name}, which the page does not define`);
+    const wrapped = { ...module };
+    for (const [key, Component] of Object.entries(module)) {
+      if (!key.endsWith('Tab') || typeof Component !== 'function') continue;
+      wrapped[key] = props => {
+        rendered.set(Component, props);
+        return window.React.createElement(Component, props);
+      };
+    }
+    window[name] = wrapped;
+  }
+  return {
+    take() {
+      const taken = rendered;
+      rendered = new Map();
+      return taken;
+    },
+  };
+}
+
 // What each tab the rail opens reads, by tab id, with the window it was
 // announced at. Overview is measured while the page mounts, every other tab
 // while its rail button is clicked, plus whatever DEEPER_VIEWS opens on it.
-// Keys read at load count on every tab.
+// Keys read at load count on every tab. `body` is what the tab's component
+// reads mounted on its own, with the props the page gave it, and its
+// DEEPER_VIEWS opened there: the tab's reads without the chrome's.
 function measureEveryTab() {
   const recorder = readRecorder();
   const harness = buildDashboardWindow({ beforeScripts: recorder.beforeScripts });
@@ -269,6 +303,8 @@ function measureEveryTab() {
     const task = seedReadSetPage(window, recorder);
     const onDemand = recordOnDemandKeys(window.DF_DATA_LOADER);
     const calls = recordPollCalls(window);
+    const bodies = recordTabBodies(window);
+    const readKeys = views => new Set(views.flatMap(view => [...view.keys]).filter(key => !onDemand.has(key)));
     const tabs = new Map();
     let root;
     const readsDuring = action => {
@@ -276,19 +312,41 @@ function measureEveryTab() {
       const reads = recorder.during(action);
       return { reads, announced: scopeCalls(calls.slice(before)) };
     };
+    const measureBody = (tab, rendered) => {
+      assert.equal(rendered.size, 1, `tab ${tab} must render one tab component in its slot, rendered ${rendered.size}`);
+      const [[Component, props]] = rendered;
+      const views = [];
+      let mounted;
+      views.push(recorder.during(() => {
+        mounted = harness.mount(Component, props);
+      }));
+      try {
+        const openDeeperView = DEEPER_VIEWS[tab];
+        if (openDeeperView) views.push(recorder.during(() => openDeeperView(window, mounted.container, task)));
+      } finally {
+        mounted.unmount();
+      }
+      return { keys: readKeys(views), rows: views.some(view => view.rows) };
+    };
     const measure = action => {
+      bodies.take();
       const { reads, announced } = readsDuring(action);
       assert.equal(announced.length, 1, `one rail action must announce one tab: ${JSON.stringify(announced)}`);
       const [{ scope: tab, win }] = announced;
-      const views = [reads];
+      const rendered = bodies.take();
+      const views = [recorder.atLoad, reads];
       const openDeeperView = DEEPER_VIEWS[tab];
       if (openDeeperView) {
-        const deeper = readsDuring(() => openDeeperView(window, root, task));
+        const deeper = readsDuring(() => openDeeperView(window, root.querySelector('.body'), task));
         assert.deepEqual(deeper.announced, [], `opening a view on tab ${tab} announced a tab`);
         views.push(deeper.reads);
       }
-      const keys = [...recorder.atLoad.keys, ...views.flatMap(view => [...view.keys])].filter(key => !onDemand.has(key));
-      tabs.set(tab, { win, keys: new Set(keys), rows: views.some(view => view.rows) });
+      tabs.set(tab, {
+        win,
+        keys: readKeys(views),
+        rows: views.some(view => view.rows),
+        body: measureBody(tab, rendered),
+      });
     };
     measure(() => {
       root = harness.mountPage();
@@ -342,6 +400,32 @@ test('every key a tab reads, at load or while it renders, is served by an endpoi
       );
     }
   }
+});
+
+// The census every tab's chrome reads is polled as /tasks?projection=census,
+// so a tab's entry owes /tasks only when the tab renders task rows.
+test("every endpoint a tab's own component reads is listed in that tab's TAB_ENDPOINTS entry", () => {
+  const { tabs, loader, pollScope } = readsOfEveryTab();
+  for (const [tab, { win, body }] of tabs) {
+    const listed = new Set(pollScope.TAB_ENDPOINTS[tab]);
+    const owed = [...pathsRead(loader, { keys: body.keys, win })].filter(path => path !== TASKS_PATH || body.rows);
+    const missing = owed.filter(path => !listed.has(path)).sort();
+    assert.deepEqual(
+      missing,
+      [],
+      `tab ${tab} reads ${missing}, which TAB_ENDPOINTS.${tab} does not list, so the tab shows no stale or loading ` +
+        'notice for them, and stops polling them if the chrome stops reading them',
+    );
+  }
+});
+
+test('the measurement sees each tab component read on its own', () => {
+  const { tabs } = readsOfEveryTab();
+  for (const [tab, { body }] of tabs) {
+    assert.ok(body.keys.size > 0, `tab ${tab}'s component, mounted on its own, read nothing off DF_DATA`);
+  }
+  assert.equal(tabs.get('tasks').body.rows, true, "the Tasks tab's component no longer reads task rows");
+  assert.equal(tabs.get('overview').body.rows, false, "Overview's component now reads task rows");
 });
 
 test('a tab that reads task rows polls the full /tasks render, not its census form', () => {
@@ -447,6 +531,30 @@ test("app.jsx replaces a tab whose child throws with the tab's notice, and the s
   });
   assert.deepEqual(staleBanners.map(banner => banner.textContent), [staleNotice.text]);
   assert.ok(page.root.querySelectorAll('.rail-nav button').length > 0, 'the rail stopped rendering');
+  assertReportsOnlyContainedThrows(page.consoleErrors);
+});
+
+// A path already stale gets no loading notice (endpoint_staleness.js::
+// loadingNoticeForTab), so the loading half is its own page: nothing has
+// answered Costs yet and nothing has failed.
+test("app.jsx keeps the open tab's loading banner beside the tab's notice when the tab throws", t => {
+  const harness = openContainingWindow(t);
+  const { window } = harness;
+  const { DF_DATUM, DF_POLL_SCOPE, DF_ENDPOINT_STALENESS } = window;
+  window.DF_TABS = { ...window.DF_TABS, CostsTab: () => DF_DATUM.assertDatum(42, PROBE) };
+  const page = { ...harness, root: harness.mountPage() };
+
+  openTab(page, 'Costs');
+
+  assert.deepEqual(failureNotices(page.root).map(notice => notice.dataset.testid), ['tab-render-failure-banner']);
+  const loading = DF_ENDPOINT_STALENESS.loadingNoticeForTab({
+    paths: DF_POLL_SCOPE.TAB_ENDPOINTS.cost,
+    receipt: window.DF_DATA.__receipt || {},
+    stale: window.DF_DATA.__stale || {},
+  });
+  assert.ok(loading, 'the page must start with Costs not yet delivered, or there is no loading banner to keep');
+  const banners = [...page.root.querySelectorAll('.body [data-testid="endpoint-loading-banner"]')];
+  assert.deepEqual(banners.map(banner => banner.textContent), [loading.text]);
   assertReportsOnlyContainedThrows(page.consoleErrors);
 });
 

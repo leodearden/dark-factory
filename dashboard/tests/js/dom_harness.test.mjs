@@ -109,12 +109,14 @@ test('beforeScripts runs once, on the fresh window with its browser gaps, before
   const calls = [];
   const { window } = openWindow(t, {
     beforeScripts(win) {
-      calls.push({ fetch: win.fetch, sawDfData: 'DF_DATA' in win });
+      calls.push({ fetch: win.fetch, sawDfData: 'DF_DATA' in win, sawPollScope: 'DF_POLL_SCOPE' in win, sawReact: 'React' in win });
     },
   });
   assert.equal(calls.length, 1, 'beforeScripts must run exactly once per build');
   const [call] = calls;
   assert.equal(call.fetch, window.fetch, "the hook must see the harness's fetch stub already installed");
+  assert.equal(call.sawReact, false, 'the hook must run before the React builds load');
+  assert.equal(call.sawPollScope, false, 'the hook must run before poll_scope.js, the first local script');
   assert.equal(call.sawDfData, false, 'the hook must run before data.js assigns window.DF_DATA');
 });
 
