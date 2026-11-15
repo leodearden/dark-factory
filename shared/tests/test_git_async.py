@@ -542,13 +542,12 @@ async def test_own_timeout_kills_a_helper_left_by_a_leader_that_already_exited(
         leaked_pid = await asyncio.to_thread(read_leaked_pid, tmp_path / 'leaked.pid')
         leader_pid = await asyncio.to_thread(read_leaked_pid, tmp_path / 'leader.pid')
 
-        reap_deadline = time.monotonic() + run_timeout - 1.0
         while read_stat_fields(Path('/proc') / str(leader_pid), skip_malformed=True) is not None:
-            assert time.monotonic() < reap_deadline, (
-                f'leader pid {leader_pid} was not reaped before the timeout, so a killpg by '
-                'number would still reach its helper and this test would prove nothing'
-            )
             await asyncio.sleep(0.05)
+        assert not task.done() and not wait_pid_gone(leaked_pid, timeout=0), (
+            f'leader pid {leader_pid} was reaped only once run_git had timed out and killed '
+            'its group, so the kill reached a live leader and this test would prove nothing'
+        )
 
         assert await asyncio.to_thread(wait_pid_gone, leaked_pid, timeout=run_timeout + 5.0), (
             f'pid {leaked_pid}, a helper left holding the pipes by a leader that had already '
