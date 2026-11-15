@@ -119,7 +119,7 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
     """
     try:
         reply = invoke(HEADROOM_PROBE_PROMPT, model)
-    except Exception as exc:  # noqa: BLE001 - any probe failure must fail safe
+    except Exception as exc:  # any probe failure must fail safe
         return HeadroomResult(ok=False, reason=f"headroom probe invocation failed: {exc}")
 
     marker = looks_like_blocking_banner(reply or "")

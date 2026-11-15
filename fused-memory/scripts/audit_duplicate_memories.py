@@ -2252,7 +2252,7 @@ def compute_cluster_metrics(
     zero-trial proportion, and emitting 0.0 would assert "0% of this corpus is
     duplicated" about a corpus that contains nothing to measure.
     """
-    from shared.memory_eval_metrics import Metric  # noqa: PLC0415
+    from shared.memory_eval_metrics import Metric
 
     metrics: list[Any] = []
     details: dict[str, Any] = {'categories': {}}
@@ -2435,7 +2435,7 @@ def emit_metrics_artifact(
     Returns:
         ``(metrics_path, report_path, details_path)``.
     """
-    from shared.memory_eval_metrics import (  # noqa: PLC0415
+    from shared.memory_eval_metrics import (
         _atomic_write_text,
         write_metric_series,
     )
@@ -2489,7 +2489,7 @@ def build_metric_series(
     Raises:
         MetricSchemaError: The series is not emittable.
     """
-    from shared.memory_eval_metrics import (  # noqa: PLC0415
+    from shared.memory_eval_metrics import (
         SCHEMA_VERSION,
         Metric,
         MetricSeries,
@@ -2571,7 +2571,7 @@ async def fetch_memories(
             to an empty list (``scroll_by_metadata`` no longer swallows it),
             so a timed-out scan is never mistaken for an empty corpus.
     """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     scope = Scope(project_id=project_id)
     records: list[dict[str, Any]] = []
@@ -2972,9 +2972,9 @@ async def fetch_ann_neighbors(
             for a record that was never asked: the recall lost to missing
             calibration stays a counted number either way.
     """
-    from qdrant_client.http import models as qmodels  # noqa: PLC0415
+    from qdrant_client.http import models as qmodels
 
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     neighbors: dict[Any, list[dict[str, Any]]] = {}
     disclosure = dict.fromkeys(_ANN_QUERY_DISCLOSURE_KEYS, 0)
@@ -3003,7 +3003,7 @@ async def fetch_ann_neighbors(
 
     scope = Scope(project_id=project_id)
     collection_name = scope.mem0_collection_name(memory.config.mem0.collection_prefix)
-    client = await memory.mem0._get_async_qdrant()  # noqa: SLF001
+    client = await memory.mem0._get_async_qdrant()
 
     filter_by_category: dict[Any, Any] = {}
 
@@ -3141,11 +3141,11 @@ async def _run(args: argparse.Namespace) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    import os  # noqa: PLC0415
+    import os
 
-    from shared.memory_eval_metrics import run_stamp  # noqa: PLC0415
+    from shared.memory_eval_metrics import run_stamp
 
-    import fused_memory.config.schema as _schema  # noqa: PLC0415
+    import fused_memory.config.schema as _schema
     from fused_memory.maintenance._utils import maintenance_service
 
     if args.config:

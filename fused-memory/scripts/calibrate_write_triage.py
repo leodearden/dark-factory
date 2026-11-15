@@ -1492,7 +1492,7 @@ async def fetch_recall_hit(
     canonical is live, and whether the search came back degraded.
     """
     _require_retrieval_mode(retrieval_mode)
-    from fused_memory.server.write_triage import (  # noqa: PLC0415
+    from fused_memory.server.write_triage import (
         canonical_id_of,
         retrieve_candidates,
     )
@@ -1526,7 +1526,7 @@ def build_embed_fn(config: Any) -> Any:
     measurement into a different metric space than the guard's
     relevance_score, making the derived thresholds inapplicable.
     """
-    from openai import OpenAI  # noqa: PLC0415
+    from openai import OpenAI
 
     embedder = config.embedder
     openai_provider = embedder.providers.openai
@@ -1628,9 +1628,9 @@ def _write_project_config(
 
 
 async def _run(args: Any) -> int:
-    import os  # noqa: PLC0415
+    import os
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.maintenance._utils import maintenance_service
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -1750,8 +1750,8 @@ async def _run(args: Any) -> int:
 
 
 def main() -> int:
-    import argparse  # noqa: PLC0415
-    import asyncio  # noqa: PLC0415
+    import argparse
+    import asyncio
 
     repo = Path(__file__).parent.parent
     pooled_fixture = repo / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'

@@ -1,6 +1,8 @@
 # One merge request per task (PRD)
 
-Status: authored 2026-11-14, three critic passes folded, not decomposed. Rulings by Leo, 2026-11-14 (§Rulings).
+Status: authored 2026-11-14, three critic passes folded. Partly decomposed 2026-11-15 on Leo's go: leaf A is
+task 10215 and leaf B is task 10216; leaves C to G are filed by the pre-authorised human gate task 10217 once
+the interface tasks have landed (§Decomposition plan, "Decompose record"). Rulings by Leo, 2026-11-14 (§Rulings).
 Approach B+H. Leaves A and B can start when their own prerequisites land; the gate (leaf C onward) waits
 on the pending interface work in §Pre-conditions, whose final shape decompose must re-verify.
 
@@ -389,7 +391,7 @@ one more full merge verify before the workflow's handling sees the failure. R5 a
 
 - Fall-through: when the worktree or `plan.json` is missing, or the loaded plan lists no files, the
   stamp is cleared and the full pipeline runs, as `TaskWorkflow._resume_merge_retry_if_pending` does
-  today.
+  today. The `task_rejoined_merge` event carries the fall-through as a named outcome (INV-11).
 - Precedence: the rejoin stamp is read before `merge_retry_pending` and clears it.
 - Bound: at most two rejoins per task between landings; the third failure takes 7277's block and L1
   (INV-4). The count is cleared when the task goes done.
@@ -406,7 +408,8 @@ lock is never released before its holder's merge lands. Leaf B requires, and dec
 - on a rejoin the hold is kept through the failure; the dispatched workflow's acquire for the same task
   id is a union with the restored keys, not an overwrite (`lock_table.py::ModuleLockTable.try_acquire`
   overwrites today), and the restored hold retires only then;
-- the hold's owner while the task waits for dispatch is the rejoin stamp. When the stamp is older than
+- the hold's owner while the task waits for dispatch is the rejoin stamp. The stamp is task metadata and
+  survives a restart, so the hold is restored from it at startup. When the stamp is older than
   `merge_rejoin.max_wait_secs` (default 6 h) one L1 is filed and the hold stays (INV-7
   `holds-owned-and-bounded`).
 
@@ -428,8 +431,7 @@ from being updated, so the walk's comparison is the second check, not the first.
 **D21. The gate lands after S3 ε2 (task 9193).** ε2 moves `merge_request` into
 `orchestrator/mcp/merge_tools.py` and its gate onto the port. Building after it means one caller module
 per door and no snapshot-dict predicates left to carry. The restart twin is closed meanwhile by 7277,
-and task 10116's event measures what remains. If Leo prefers the gate before ε2, leaf C absorbs ε2's
-gate half and 9193 is trimmed at decompose.
+and task 10116's event measures what remains. Confirmed by Leo, 2026-11-15.
 
 **D22. Two new configuration keys.** `merge_admission.max_resubmits` (default 3) and
 `merge_rejoin.max_wait_secs` (default 21600). Both are added to `config.py::RELOADABLE_FIELDS`. Per the
@@ -701,6 +703,19 @@ each leaf edits them where they live when it is planned.
 
 Order: A and B are independent and can start first. C follows the interface tasks. D, E, F, G follow in
 that order.
+
+**Decompose record (2026-11-15, partial, on Leo's go).**
+
+- Leaf A is task 10215. Tasks 9480, 9201 and 9144 now depend on it (same files; 9480 reworks the callers of
+  the classifier A makes public).
+- Leaf B is task 10216, depending on tasks 7277 and 10093.
+- Leaves C to G are not filed. Human gate task 10217 depends on tasks 9152, 9182, 9201, 9193, 9144 and 8528
+  and carries Leo's pre-authorisation to decompose them when it fires, after re-reading the landed
+  interfaces. It also cancels tasks 6515 and 4163, which are parked behind it until then.
+- Notes were added to tasks 9182 (`resolve_duplicate` for an unregistered request) and 9201 (a shutdown's
+  "blocked" record read as a terminal answer), as §Pre-conditions and §Out of scope require.
+- Manifest: `plans/one-merge-request-per-task-prd.capability-manifest.md` and its `.yaml` sidecar, blocks A
+  and B only.
 
 ## Out of scope
 

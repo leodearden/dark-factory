@@ -275,11 +275,11 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> int:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
         from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()

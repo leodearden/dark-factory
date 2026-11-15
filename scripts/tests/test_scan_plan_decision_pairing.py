@@ -75,7 +75,7 @@ from scan_plan_decision_pairing import (
 # through it rather than re-spelling that path. ``detect`` is imported for ONE
 # purpose — the non-circular control asserting the self-name specimen is
 # invisible to the BLANKET predicate — never as the thing under test.
-from shared.toolcall_markup import detect  # noqa: E402
+from shared.toolcall_markup import detect
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)

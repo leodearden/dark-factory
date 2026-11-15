@@ -3401,7 +3401,7 @@ class GraphitiBackend:
             residual = await self.count_foreign_relationships(
                 deprecated_uuid, group_id=group_id,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             # Deliberately NOT prefixed 'merge_entities: ' — that prefix
             # identifies the one structured JSON record per merge emitted
             # below, and a diagnostic sharing it would break any auditor that
@@ -3505,7 +3505,7 @@ class GraphitiBackend:
             try:
                 await self.refresh_entity_summary(nbr, group_id=group_id)
                 refreshed.append(nbr)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'delete_entity: refresh_entity_summary failed for nbr=%s '
                     '(deleted node uuid=%s): %s',
@@ -5272,7 +5272,7 @@ class GraphitiBackend:
             statements.append(statement)
             try:
                 await graph.query(statement, op='_ensure_indices_locked')
-            except Exception as exc:  # noqa: BLE001 - absorbed by contract, see docstring
+            except Exception as exc:  # absorbed by contract, see docstring
                 failed.extend((spec, str(exc)) for spec in specs)
                 # Emitted HERE rather than reconstructed from `failed` afterwards
                 # because `failed` is keyed by IndexSpec, and a fulltext spec's

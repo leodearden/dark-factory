@@ -973,7 +973,7 @@ async def open_memory_service(args: Any, config: Any) -> AsyncIterator[Any]:
     full ``MemoryService`` is opened, unskipped, by ``maintenance_service``,
     which also closes it.
     """
-    from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
+    from fused_memory.backends.graphiti_client import GraphitiBackend
     from fused_memory.maintenance._utils import maintenance_service
 
     if not args.apply:
@@ -1032,11 +1032,11 @@ def main() -> int:
     args = build_arg_parser().parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         config = FusedMemoryConfig()
         async with open_memory_service(args, config) as built:

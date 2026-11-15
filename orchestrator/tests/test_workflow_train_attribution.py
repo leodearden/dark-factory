@@ -435,7 +435,7 @@ def _solo_fail(member_id: str, reason: str = 'test failed') -> SoloVerifyResult:
 
 def _solo_pass_wt(member_id: str) -> SoloVerifyResult:
     """SoloVerifyResult for a passer with solo_wt/solo_branch populated."""
-    from pathlib import Path as _Path  # noqa: PLC0415
+    from pathlib import Path as _Path
     r = SoloVerifyResult(
         member_id=member_id,
         passed=True,
@@ -1314,7 +1314,7 @@ def _attr_block(reason: str = 'failed') -> DeliveredChecksBlock:
 
 def _attr_guard(blocked_ids: set[str], *, reason: str = 'failed') -> AsyncMock:
     """A patched guard that blocks exactly *blocked_ids* — per member."""
-    async def _gate(task_id, metadata, **kwargs):  # noqa: ANN001, ANN202
+    async def _gate(task_id, metadata, **kwargs):
         return _attr_block(reason) if task_id in blocked_ids else None
 
     return AsyncMock(side_effect=_gate)
@@ -1352,7 +1352,7 @@ def _armed_attr_fixture(
     metas = metadata_by_id or {}
     default = {'delivered_checks': [_ATTR_DC_CHECK]}
 
-    async def _get_task(mid):  # noqa: ANN001, ANN202
+    async def _get_task(mid):
         return {'id': mid, 'metadata': metas.get(mid, default)}
 
     f.scheduler.get_task = get_task or AsyncMock(side_effect=_get_task)
@@ -1515,7 +1515,7 @@ class TestAttributeTrainFailurePasserDeliveredChecksGuard:
         """
         f = _armed_attr_fixture()
 
-        async def _set_status(tid, status, **kwargs):  # noqa: ANN001, ANN202
+        async def _set_status(tid, status, **kwargs):
             if tid == '102':
                 raise RuntimeError('scheduler down')
 

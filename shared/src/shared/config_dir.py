@@ -264,7 +264,7 @@ def sweep_stale_pid_dirs_once(
         if reclaimed and on_reclaimed is not None:
             on_reclaimed(reclaimed)
         return reclaimed
-    except Exception as exc:  # noqa: BLE001  (deliberately broad — see docstring)
+    except Exception as exc:  # (deliberately broad — see docstring)
         if on_failure is not None:
             on_failure(exc)
         return 0

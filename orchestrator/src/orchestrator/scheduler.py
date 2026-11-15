@@ -6134,7 +6134,7 @@ class Scheduler:
                     now=now,
                 ),
             )
-        except Exception as exc:  # noqa: BLE001 — telemetry never disturbs a sweep
+        except Exception as exc:  # telemetry never disturbs a sweep
             logger.warning(
                 'Task %s: recovery-disposition emission failed (non-fatal): %s',
                 task_id, exc,
@@ -6172,7 +6172,7 @@ class Scheduler:
             for tracked_site, tid in tuple(tracker.tracked()):
                 if str(tracked_site) == site and tid not in observed:
                     tracker.clear(tracked_site, tid)
-        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a tick
+        except Exception as exc:  # bookkeeping never aborts a tick
             logger.warning(
                 'recovery veto-streak release failed (non-fatal): %s', exc,
             )

@@ -301,7 +301,7 @@ async def apply_corrections(
                     # correction still gets a chance to apply.
                     summary['reopen_failed'].append(correction.task_id)
                     summary['errors'] += 1
-        except Exception as exc:  # noqa: BLE001 - per-op isolation, mirrors
+        except Exception as exc:  # per-op isolation, mirrors
             # apply_audit_annotations: one correction's backend failure
             # must never abort the batch. Logged loudly, counted as an
             # error, and the loop continues to the next correction.
@@ -480,7 +480,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     assert_task_store_populated(args.project_root, operation='correct_found_on_main_backlog')
 
-    import os  # noqa: PLC0415
+    import os
 
     # Sibling import: audit_found_on_main_provenance.py lives alongside this
     # script in fused-memory/scripts/, which is sys.path[0] when this file
@@ -488,10 +488,10 @@ async def _run(args: argparse.Namespace) -> int:
     # Deferred to runtime (never a module-level import) so the test suite
     # can importlib-load this module in isolation without the scripts/ dir
     # on sys.path — see test_correct_found_on_main_backlog.py's _load_module.
-    from audit_found_on_main_provenance import GitFacts, build_audit_report  # noqa: PLC0415
+    from audit_found_on_main_provenance import GitFacts, build_audit_report
 
-    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import FusedMemoryConfig
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)

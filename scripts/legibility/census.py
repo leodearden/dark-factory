@@ -415,7 +415,7 @@ def main(argv: list[str] | None = None, *, poster: alarm.Poster | None = None) -
 
     try:
         cfg = config.load_config(config_path)
-    except Exception as exc:  # noqa: BLE001 - a broken/missing config fails loud at CLI startup
+    except Exception as exc:  # a broken/missing config fails loud at CLI startup
         print(f"census: failed to load config at {config_path}: {exc}", file=sys.stderr)
         return 1
 

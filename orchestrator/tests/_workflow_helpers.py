@@ -623,7 +623,7 @@ def _make_resolving_steward(queue: EscalationQueue, task_id: str) -> type:
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 
@@ -663,7 +663,7 @@ def _make_status_setting_steward(
     """
 
     class _FakeSteward:
-        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+        def __init__(self, wt_path, cfg_dir):
             self._outcome_channel = None
             self._wip_probe = None
 

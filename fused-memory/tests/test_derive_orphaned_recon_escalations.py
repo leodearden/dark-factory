@@ -601,7 +601,7 @@ class TestUnpopulatedQueueDirRefusal:
         while the operator-facing message stays one line on stderr rather than
         a traceback about a mis-typed path.
         """
-        import sys as _sys  # noqa: PLC0415
+        import sys as _sys
 
         target = tmp_path / 'data' / 'reconciliation' / 'escalations'
         if create_empty_dir:
@@ -638,7 +638,7 @@ class TestMainExitCodes:
     @staticmethod
     def _run_main(monkeypatch, report: dict) -> tuple[int, str]:
         """Drive ``main()`` over a canned report, returning ``(code, stdout)``."""
-        import sys as _sys  # noqa: PLC0415
+        import sys as _sys
 
         async def _fake_run(*_args, **_kwargs):
             return report

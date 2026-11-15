@@ -1284,7 +1284,7 @@ class TestRawRewriteDoesNotSwallowSubshellTerminator:
     @staticmethod
     def _assert_valid_bash(rendered: str) -> None:
         """Fail with the rendered command when bash cannot even PARSE it."""
-        import subprocess  # noqa: PLC0415
+        import subprocess
 
         result = subprocess.run(
             ['bash', '-n', '-c', rendered], capture_output=True, text=True, check=False,

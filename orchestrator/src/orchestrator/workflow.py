@@ -4021,7 +4021,7 @@ class TaskWorkflow:
             return None
         try:
             rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=self.worktree)
-        except Exception as exc:  # noqa: BLE001 — fail-safe: fall through to full pipeline
+        except Exception as exc:  # fail-safe: fall through to full pipeline
             logger.warning(
                 'Task %s: could not read worktree HEAD resolving '
                 'merge_retry_pending (%s) — running full pipeline',
@@ -4053,7 +4053,7 @@ class TaskWorkflow:
         try:
             main_sha = await self.git_ops.get_main_sha()
             probe = await self.git_ops.merge_tree_conflicts(main_sha, current_head)
-        except Exception as exc:  # noqa: BLE001 — fail-safe: fall through to full pipeline
+        except Exception as exc:  # fail-safe: fall through to full pipeline
             # A probe FAILURE is not a conflict VERDICT: it says nothing about
             # whether the branch still merges.  So fall back to the full
             # pipeline for this dispatch but leave the durable stamp intact for
@@ -6360,7 +6360,7 @@ class TaskWorkflow:
 
         try:
             result = await self._invoke(SIMPLE_TASK, build_prompt, self.worktree)
-        except Exception as exc:  # noqa: BLE001 — fall through to architect
+        except Exception as exc:  # fall through to architect
             logger.warning(
                 'Task %s: SIMPLE_TASK invocation failed (%s) — '
                 'falling through to architect path',
@@ -6520,7 +6520,7 @@ class TaskWorkflow:
                 {'optimistic_path': kind},
                 metadata_mode='merge',  # type: ignore[reportCallIssue]
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort
+        except Exception as exc:  # best-effort
             logger.warning(
                 'Task %s: failed to stamp optimistic_path=%s: %s',
                 self.task_id, kind, exc,
@@ -6703,7 +6703,7 @@ class TaskWorkflow:
         """
         try:
             fresh_task = await self.scheduler.get_task(self.task_id)
-        except Exception as exc:  # noqa: BLE001 — best-effort unless require_fresh
+        except Exception as exc:  # best-effort unless require_fresh
             if require_fresh:
                 logger.warning(
                     'Task %s: failed to refresh metadata before %s write; '
@@ -6849,7 +6849,7 @@ class TaskWorkflow:
         """
         try:
             current_main_sha = await self.git_ops.get_main_sha()
-        except Exception as exc:  # noqa: BLE001 — fall through to standard path
+        except Exception as exc:  # fall through to standard path
             logger.warning(
                 'Task %s: could not read main SHA for no-plan cycle counter: %s',
                 self.task_id, exc,
@@ -6871,7 +6871,7 @@ class TaskWorkflow:
         self.task['metadata'] = new_metadata
         try:
             await self.scheduler.update_task(self.task_id, metadata=new_metadata)
-        except Exception as exc:  # noqa: BLE001 — counter can't be trusted; escalate.
+        except Exception as exc:  # counter can't be trusted; escalate.
             logger.warning(
                 'Task %s: failed to persist no-plan cycle counter; '
                 'escalating to human (counter cannot be trusted): %s',
@@ -7076,7 +7076,7 @@ class TaskWorkflow:
             await self.scheduler.update_task(
                 self.task_id, metadata=new_metadata,
             )
-        except Exception as exc:  # noqa: BLE001 — counter can't be trusted; escalate.
+        except Exception as exc:  # counter can't be trusted; escalate.
             logger.warning(
                 'Task %s: failed to persist infra-resume thrash counter; '
                 'escalating to human (counter cannot be trusted): %s',
@@ -7193,7 +7193,7 @@ class TaskWorkflow:
             await self.scheduler.update_task(
                 self.task_id, metadata=new_metadata,
             )
-        except Exception as exc:  # noqa: BLE001 — counter can't be trusted; escalate.
+        except Exception as exc:  # counter can't be trusted; escalate.
             logger.warning(
                 'Task %s: failed to persist merge-thrash counter; '
                 'escalating to human (counter cannot be trusted): %s',
@@ -7318,7 +7318,7 @@ class TaskWorkflow:
             await self.scheduler.update_task(
                 self.task_id, metadata=fresh,
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+        except Exception as exc:  # best-effort, log and proceed
             logger.warning(
                 'Task %s: failed to persist merge_first_enqueued_at: %s',
                 self.task_id, exc,
@@ -7346,7 +7346,7 @@ class TaskWorkflow:
         """
         try:
             rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=self.worktree)
-        except Exception as exc:  # noqa: BLE001 — best-effort, log and skip
+        except Exception as exc:  # best-effort, log and skip
             logger.warning(
                 'Task %s: could not read worktree HEAD for merge_retry_pending '
                 'stamp (skipping durable stamp): %s', self.task_id, exc,
@@ -7362,7 +7362,7 @@ class TaskWorkflow:
             return
         try:
             base_sha = await self.git_ops.get_main_sha()
-        except Exception as exc:  # noqa: BLE001 — base_sha is advisory context only
+        except Exception as exc:  # base_sha is advisory context only
             logger.warning(
                 'Task %s: could not read main SHA for merge_retry_pending stamp: %s',
                 self.task_id, exc,
@@ -7381,7 +7381,7 @@ class TaskWorkflow:
         self.task['metadata'] = fresh
         try:
             await self.scheduler.update_task(self.task_id, metadata=fresh)
-        except Exception as exc:  # noqa: BLE001 — durability best-effort, never fatal
+        except Exception as exc:  # durability best-effort, never fatal
             logger.warning(
                 'Task %s: failed to persist merge_retry_pending stamp '
                 '(retry obligation not durable this cycle): %s',
@@ -7477,7 +7477,7 @@ class TaskWorkflow:
                 # Protocol is outside task 3024's scope — see escalate_info.
                 metadata_mode='replace',  # type: ignore[reportCallIssue]
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
+        except Exception as exc:  # best-effort, never fatal
             logger.warning(
                 'Task %s: could not clear merge_retry_pending (metadata refresh or '
                 'persist failed) — leaving the stamp in place; a later dispatch '
@@ -7552,7 +7552,7 @@ class TaskWorkflow:
         self.task['metadata'] = fresh
         try:
             await self.scheduler.update_task(self.task_id, metadata=fresh)
-        except Exception as exc:  # noqa: BLE001 — durability best-effort, never fatal
+        except Exception as exc:  # durability best-effort, never fatal
             logger.warning(
                 'Task %s: failed to persist merge_phase_liveness stamp '
                 '(merge-phase liveness not durable this cycle): %s',
@@ -7643,7 +7643,7 @@ class TaskWorkflow:
                 metadata=fresh,
                 metadata_mode='replace',  # type: ignore[reportCallIssue]
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
+        except Exception as exc:  # best-effort, never fatal
             logger.warning(
                 'Task %s: failed to persist merge_phase_liveness clear: %s',
                 self.task_id, exc,
@@ -7765,7 +7765,7 @@ class TaskWorkflow:
                 },
                 timeout=15,
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+        except Exception as exc:  # best-effort, log and proceed
             logger.warning(
                 'Task %s: add_dependency(%s -> %s) failed: %s — proceeding '
                 'with requeue anyway',
@@ -8562,7 +8562,7 @@ class TaskWorkflow:
                 )
                 return
 
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
 
             esc = Escalation(
                 id=self.escalation_queue.make_id(self.task_id),
@@ -13892,7 +13892,7 @@ class TaskWorkflow:
                 if sr.solo_wt is not None:
                     try:
                         await self.git_ops.cleanup_merge_worktree(sr.solo_wt)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             'Task %s: all-pass teardown: cleanup_merge_worktree '
                             'failed for member %s', self.task_id, sr.member_id,
@@ -13901,7 +13901,7 @@ class TaskWorkflow:
                 if sr.solo_branch is not None:
                     try:
                         await self.git_ops.delete_solo_branch(sr.solo_branch)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             'Task %s: all-pass teardown: delete_solo_branch '
                             'failed for member %s', self.task_id, sr.member_id,
@@ -13961,7 +13961,7 @@ class TaskWorkflow:
                     reverify_on_rebase=False,
                 )
                 adv = outcome.result
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # advance_main raised (unexpected); leave member parked for
                 # re-dispatch and continue processing the remaining passers.
                 logger.warning(
@@ -13978,7 +13978,7 @@ class TaskWorkflow:
                 if r.solo_wt is not None:
                     try:
                         await self.git_ops.cleanup_merge_worktree(r.solo_wt)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             'Task %s: passer teardown: cleanup_merge_worktree '
                             'failed for member %s', self.task_id, r.member_id,
@@ -13987,7 +13987,7 @@ class TaskWorkflow:
                 if r.solo_branch is not None:
                     try:
                         await self.git_ops.delete_solo_branch(r.solo_branch)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             'Task %s: passer teardown: delete_solo_branch '
                             'failed for member %s', self.task_id, r.member_id,
@@ -15954,7 +15954,7 @@ class TaskWorkflow:
             remaining = deadline - asyncio.get_event_loop().time()
             try:
                 if remaining <= 0:
-                    raise TimeoutError  # noqa: TRY301 — uniform expiry handling
+                    raise TimeoutError  # uniform expiry handling
                 await asyncio.wait_for(self._escalation_event.wait(), remaining)
             except TimeoutError:  # asyncio.TimeoutError is an alias since 3.11
                 # Before giving up: is the steward observably still working?
@@ -16415,7 +16415,7 @@ class TaskWorkflow:
         """
         try:
             await self.scheduler.set_task_status(mid, 'pending')
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 'Task %s: train %r member %s (%s) — delivered-checks withheld '
                 'but the revert to pending FAILED; member remains '
@@ -16484,7 +16484,7 @@ class TaskWorkflow:
             return None
         try:
             member = await self.scheduler.get_task(mid)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 'Task %s: could not read member %s metadata for the '
                 'delivered-checks guard (%s) — withholding the done-stamp',
@@ -16502,7 +16502,7 @@ class TaskWorkflow:
             return await self._delivered_checks_block(
                 mid, (member.get('metadata') or {}), site=site,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 'Task %s: delivered-checks guard errored for member %s (%s) '
                 '— withholding the done-stamp',

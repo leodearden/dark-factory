@@ -1131,7 +1131,7 @@ class TestMalformedDeclarationIsRejectedLoudly:
         """
         try:
             resolve_referents(declared=declared, metadata={}, content='', group_id=GROUP)
-        except Exception as exc:  # noqa: BLE001 — the assertion IS the type check
+        except Exception as exc:  # the assertion IS the type check
             assert isinstance(exc, InputValidationError), (
                 f'{declared!r} left _declared_referents as '
                 f'{type(exc).__name__}, which δ\'s `except InputValidationError` '
@@ -1754,7 +1754,7 @@ class TestStructuralInputsAreRejectedLoudly:
         """
         try:
             resolve_referents(declared=None, metadata={}, **kwargs)
-        except Exception as exc:  # noqa: BLE001 — the assertion IS the type check
+        except Exception as exc:  # the assertion IS the type check
             assert isinstance(exc, InputValidationError), (
                 f'{kwargs!r} left resolve_referents as {type(exc).__name__}, which '
                 f"δ's `except InputValidationError` gate does not catch: {exc}"

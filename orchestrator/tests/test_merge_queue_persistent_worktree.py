@@ -164,7 +164,7 @@ class TestEnforcePersistentWorktreeSerialLane:
     def test_knob_on_bound_1_no_raise(self, tmp_path: Path):
         """persistent_merge_worktree=True + merge_ahead_bound=1 → no raise."""
         from orchestrator.merge_lane.liveness import (
-            enforce_persistent_worktree_serial_lane,  # noqa: PLC0415
+            enforce_persistent_worktree_serial_lane,
         )
 
         cfg = _make_config(tmp_path, persistent=True)
@@ -175,7 +175,7 @@ class TestEnforcePersistentWorktreeSerialLane:
     def test_knob_off_bound_gt1_no_raise(self, tmp_path: Path):
         """persistent_merge_worktree=False + merge_ahead_bound=2 → guard inert."""
         from orchestrator.merge_lane.liveness import (
-            enforce_persistent_worktree_serial_lane,  # noqa: PLC0415
+            enforce_persistent_worktree_serial_lane,
         )
 
         cfg = _make_config(tmp_path, persistent=False)
@@ -429,7 +429,7 @@ class TestPersistentWorktreeVerifyRouting:
 
 def _is_registered_worktree(wt_path: Path, repo: Path) -> bool:
     """Return True if wt_path appears in `git worktree list --porcelain`."""
-    import subprocess  # noqa: PLC0415
+    import subprocess
     result = subprocess.run(
         ['git', 'worktree', 'list', '--porcelain'],
         cwd=str(repo),

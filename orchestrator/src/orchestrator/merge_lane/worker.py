@@ -550,7 +550,7 @@ AUTO_HEAL_MECHANICAL_CATEGORIES: frozenset[str] = frozenset({'compile_error'})
 
 
 def is_auto_heal_eligible(
-    category: str | None, cause_hint: str | None,  # noqa: ARG001
+    category: str | None, cause_hint: str | None,
 ) -> bool:
     """Return True when the failure class is safe for automated fix spawning.
 
@@ -4128,7 +4128,7 @@ async def _maybe_auto_chain_generation(
     # coexist on gen_next.result.  The callback fires whichever path
     # finalizes gen_next.
     _branch = req.branch.bare_id  # close over the bare branch name (dict key)
-    def _cleanup_chain_counter(fut: asyncio.Future) -> None:  # noqa: ANN001
+    def _cleanup_chain_counter(fut: asyncio.Future) -> None:
         try:
             if fut.cancelled():
                 # Cancellation — lineage ends; pop the counter.
@@ -4146,7 +4146,7 @@ async def _maybe_auto_chain_generation(
                     # pop() is idempotent so both callbacks are harmless.
                     counts.pop(_branch, None)
                 # 'superseded': lineage continues; keep the counter.
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 '_maybe_auto_chain_generation: _cleanup_chain_counter failed '
                 'for branch=%s', _branch, exc_info=True,
@@ -4608,14 +4608,14 @@ async def reverify_member_solo(
     # Fail: tear down the solo worktree and branch — failer is never landed.
     try:
         await git_ops.cleanup_merge_worktree(solo_wt)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             'reverify_member_solo: cleanup_merge_worktree failed for member %s',
             member_id, exc_info=True,
         )
     try:
         await git_ops.delete_solo_branch(solo_branch)
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             'reverify_member_solo: delete_solo_branch failed for member %s',
             member_id, exc_info=True,
@@ -12006,7 +12006,7 @@ class SpeculativeMergeWorker:
         for branch in recovered_branches:
             try:
                 wt = await self._git_ops.find_inflight_merge_worktree(branch)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # Fail-open: one branch's oracle miss must never abort the
                 # startup sweep (find_inflight_merge_worktree runs git).
                 logger.warning(
@@ -12060,7 +12060,7 @@ class SpeculativeMergeWorker:
             if age > grace:
                 try:
                     await self._git_ops.cleanup_merge_worktree(path)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     # Fail-open: one worktree's removal failure must never
                     # abort the sweep of the remaining orphans.
                     logger.warning(
@@ -14488,7 +14488,7 @@ class SpeculativeMergeWorker:
         predicate = self._merge_ready_predicate or self._default_coalesce_exclusion_reason
         try:
             return predicate(candidate)
-        except Exception:  # noqa: BLE001
+        except Exception:
             # An injected predicate raised — degrade gracefully: log the
             # error and treat the candidate as eligible so a buggy closure
             # does not kill the merger loop.  The default predicate is

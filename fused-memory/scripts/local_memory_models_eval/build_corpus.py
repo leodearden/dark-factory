@@ -1755,7 +1755,7 @@ def _run_build(args: argparse.Namespace) -> int:
     # Recorded BEFORE the print that can fail on it: everything after this
     # point is reporting, so a stdout failure from here on must not be allowed
     # to read as "no artifact was produced". See :data:`_WRITTEN_MANIFEST`.
-    global _WRITTEN_MANIFEST  # noqa: PLW0603
+    global _WRITTEN_MANIFEST
     _WRITTEN_MANIFEST = str(written)
     print(f'manifest: {written}')
     return 0
@@ -1848,7 +1848,7 @@ def _manifest_detail() -> str | None:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
-    global _WRITTEN_MANIFEST  # noqa: PLW0603
+    global _WRITTEN_MANIFEST
     # FIRST, before parse_args: LoudArgumentParser re-raises a failed help
     # write from inside parse_args, so the reporter must already be armed and
     # carrying this run's detail by then.

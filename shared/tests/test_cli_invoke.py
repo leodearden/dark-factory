@@ -931,7 +931,7 @@ class TestCallerInitiatedResume:
 
     async def test_caller_resume_substitutes_continuation_prompt_and_restores_real_prompt_on_fresh_fallback(self):
         """cli_invoke swaps in CRASH_RECOVERY_RESUME_PROMPT then restores real prompt on fallback."""
-        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT  # noqa: PLC0415
+        from shared.cli_invoke import CRASH_RECOVERY_RESUME_PROMPT
 
         gate = make_gate_mock(
             account_count=1,
@@ -1935,7 +1935,7 @@ class TestRunSubprocessTimedOut:
 
         call_count = 0
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -4122,7 +4122,7 @@ class TestRunSubprocessWatchdog:
         """Return (proc, call_count_ref) where communicate hangs on call 1, raises TimeoutError on call 2."""
         call_count = [0]
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 # Hang until the watchdog cancels comm_task — CancelledError is raised here.
@@ -4417,7 +4417,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
             f'or a valve trip is reported as a kill instead of by the reads witness'
         )
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             await asyncio.sleep(delay_secs)
             deadline = _time.monotonic() + _EXTENSION_READS_VALVE_SECS
             while len(reads_observed) < min_reads and _time.monotonic() < deadline:
@@ -4440,7 +4440,7 @@ class TestRunSubprocessWorkingRegimeProgressExtension:
         """
         call_count = [0]
 
-        async def communicate_side_effect(input=None):  # noqa: A002
+        async def communicate_side_effect(input=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 await asyncio.Event().wait()
@@ -5102,7 +5102,7 @@ class TestUnreadableTranscriptEscapeWiring:
             'session_id': 'sess-escape',
         }).encode()
 
-        async def _communicate(input=None):  # noqa: A002
+        async def _communicate(input=None):
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(release.wait(), timeout=release_timeout_secs)
             return (payload, b'')
@@ -5652,7 +5652,7 @@ class TestMaterializeStdin:
         stated directly, and immune to an unrelated fd opened by pytest between
         the two counts.
         """
-        # noqa SIM115: the whole point is a handle that outlives the `with` —
+  # SIM115: the whole point is a handle that outlives the `with` —
         # it must still be inspectable (`.closed`) after the call under test.
         real = tempfile.TemporaryFile()  # noqa: SIM115
         try:

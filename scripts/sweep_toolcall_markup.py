@@ -909,7 +909,7 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
     tripwire connected to nothing is not a tripwire. Never observed is all it
     is: unreachability was never a guarantee from B5, and that correction is
     written once, at :data:`_MAX_REPAIR_ROUNDS`.
-    """  # noqa: D205
+    """
     # The two outcome classes accumulate DIFFERENTLY across rounds, because
     # they mean different things:
     #

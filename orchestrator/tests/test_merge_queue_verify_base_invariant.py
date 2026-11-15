@@ -75,7 +75,7 @@ from orchestrator.verify_runner import HostLease
 #
 # frozen_prefix() only checks `e.verify_task is not None`, so any non-None
 # object doubles as a verifying-entry marker (mirrors test_merge_queue_frozen_prefix.py).
-_SENTINEL_VERIFY_TASK = object()  # noqa: PD901
+_SENTINEL_VERIFY_TASK = object()
 
 
 # ── Fixtures (mirrored from test_merge_queue_frozen_prefix.py) ───────────────

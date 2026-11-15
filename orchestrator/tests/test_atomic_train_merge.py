@@ -263,7 +263,7 @@ class TestScenario1HappyPath:
 
     async def test_happy_path_3_train_single_merge(
         self,
-        cargo_or_skip,            # noqa: ARG002  (skip guard; value unused)
+        cargo_or_skip,  # (skip guard; value unused)
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -647,7 +647,7 @@ class TestScenario5GroupMergeVerify:
 
     async def test_group_merge_workspace_verify_green(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -731,7 +731,7 @@ class TestScenario5GroupMergeVerify:
     @pytest.mark.exercise_merge_verify
     async def test_group_merge_workspace_verify_red(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -1308,7 +1308,7 @@ class TestScenario8MainAdvances:
 
     async def test_main_advances_then_train_merges_clean(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -1725,7 +1725,7 @@ class TestScenario11NonTrainRegression:
 
     async def test_non_train_regression(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:
@@ -1825,7 +1825,7 @@ class TestScenario12DegenerateTrainOfOne:
 
     async def test_degenerate_train_of_one(
         self,
-        cargo_or_skip,  # noqa: ARG002
+        cargo_or_skip,
         shared_cargo_target: Path,
         tmp_path: Path,
     ) -> None:

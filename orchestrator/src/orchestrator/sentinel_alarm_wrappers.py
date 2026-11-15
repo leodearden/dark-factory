@@ -59,7 +59,7 @@ def discharge_sentinel_wrappers(
     """
     discharged = 0
     try:
-        from escalation.declared_pins import (  # noqa: PLC0415 — optional dep
+        from escalation.declared_pins import (  # optional dep
             blocking_pin_declarations,
         )
 
@@ -73,7 +73,7 @@ def discharge_sentinel_wrappers(
                 continue
             escalation_queue.resolve(wrapper.id, resolution, resolved_by=alarm_role)
             discharged += 1
-    except Exception as exc:  # noqa: BLE001 — fail-open backstop
+    except Exception as exc:  # fail-open backstop
         logger.warning(
             '%s wrappers for %s could not be discharged (non-fatal): %s',
             alarm_role, sentinel, exc,

@@ -1887,7 +1887,7 @@ class TestCensusBudgetFloor:
         silently switch derivations and still evaluate green — which is the
         exact drift that namespace exists to catch.
         """
-        import module_budget_family as family  # noqa: PLC0415
+        import module_budget_family as family
 
         assert family.HELPER_NAME == 'min_budget'
 

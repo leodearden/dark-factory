@@ -203,7 +203,7 @@ class TestCliUnstampedClusterMember:
     def test_json_mode_carries_the_reason_and_discloses_the_derivation(
         self, capsys
     ):
-        import json  # noqa: PLC0415
+        import json
 
         stray = _uuid(42)
         memory = FakeMemory(live_ids=[stray])
@@ -370,7 +370,7 @@ class TestCliAndSeamAgree:
     def test_same_inputs_same_reason_codes(
         self, observed, live_ids, members, tmp_path, capsys
     ):
-        import json  # noqa: PLC0415
+        import json
 
         metadata = _gate_blob(observed)
 

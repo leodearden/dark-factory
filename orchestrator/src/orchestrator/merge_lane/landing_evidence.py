@@ -992,7 +992,7 @@ async def _delivered_checks_differential(
         probe['delivered_checks_outcome'] = DifferentialOutcome.disabled
         return False
 
-    from orchestrator.delivered_checks import (  # noqa: PLC0415
+    from orchestrator.delivered_checks import (
         DeliveredCheckResult,
         run_delivered_check,
     )

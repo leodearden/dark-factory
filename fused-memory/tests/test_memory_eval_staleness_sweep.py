@@ -177,7 +177,7 @@ class TestPointerTargets:
         patch the SCRIPT module's own attribute instead.
         """
         m = _mod()
-        from fused_memory import memory_metadata  # noqa: PLC0415
+        from fused_memory import memory_metadata
 
         real = memory_metadata.normalize_supersedes
         seen: list[Any] = []
@@ -218,7 +218,7 @@ class TestByDesignAttribution:
 
     def test_the_status_correction_writer_is_recognised_by_its_kind(self):
         """Through the WRITER's constant, so a rename cannot split the two."""
-        from fused_memory.reconciliation.harness import (  # noqa: PLC0415
+        from fused_memory.reconciliation.harness import (
             PROJECT_STATUS_CORRECTION_KIND,
         )
 
@@ -870,7 +870,7 @@ class TestTaskTerminalStaleness:
         a regex name it would no longer be spelling.
         """
         m = _mod()
-        from fused_memory.reconciliation import task_filter  # noqa: PLC0415
+        from fused_memory.reconciliation import task_filter
 
         calls: list[str] = []
 
@@ -1037,7 +1037,7 @@ class TestBuildSeries:
     """The artifact this leaf owns — and the metrics it must NOT emit."""
 
     def test_the_series_identifies_this_leaf(self):
-        from shared.memory_eval_metrics import SCHEMA_VERSION  # noqa: PLC0415
+        from shared.memory_eval_metrics import SCHEMA_VERSION
 
         series = _mod().build_series(**_full_inputs())
         assert series.eval_id == 'e4-staleness-sweep'
@@ -1460,9 +1460,9 @@ class TestBuildSeries:
         assert counts['surfacing_edges_predecessor_gone'] == 0
 
     def test_the_series_round_trips_and_passes_the_real_validator(self):
-        import json  # noqa: PLC0415
+        import json
 
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             parse_metric_series,
             serialize_metric_series,
             validate_metric_series,
@@ -1554,9 +1554,9 @@ class TestDanglingMetricSplit:
         )
 
     def test_the_split_series_passes_the_real_validator_and_round_trips(self):
-        import json  # noqa: PLC0415
+        import json
 
-        from shared.memory_eval_metrics import (  # noqa: PLC0415
+        from shared.memory_eval_metrics import (
             parse_metric_series,
             serialize_metric_series,
             validate_metric_series,
@@ -1612,7 +1612,7 @@ class _ConcurrencyProbe:
 
 def _mock_memory(*, scroll_return=None, by_id=None):
     """A MagicMock MemoryService whose two read primitives are AsyncMocks."""
-    from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+    from unittest.mock import AsyncMock, MagicMock
 
     memory = MagicMock()
     memory.mem0 = MagicMock()
@@ -1854,7 +1854,7 @@ class TestResolvePointerTargets:
         target, and a band that quietly went back to awaiting them one at a
         time would still pass every other test in this class.
         """
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         m = _mod()
         targets = [f'{i:08d}-1111-4a2b-8c3d-4e5f60718293' for i in range(20)]
@@ -1887,7 +1887,7 @@ class TestFetchSurfacingRanks:
     """One search per supersedes edge, derived from the successor's own text."""
 
     async def test_the_query_is_the_successors_content(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         m = _mod()
         refs = m.pointer_targets(_record('rec-1', 'the successor text', supersedes=UUID_B))
@@ -1909,7 +1909,7 @@ class TestFetchSurfacingRanks:
         }
 
     async def test_the_search_is_pinned_to_the_swept_population(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         m = _mod()
         # "before" matches ReadRouter's temporal heuristic, which routes to
@@ -1933,7 +1933,7 @@ class TestFetchSurfacingRanks:
         assert obs.still_surfacing == 1
 
     async def test_only_supersedes_edges_are_searched(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         m = _mod()
         refs = [
@@ -1952,7 +1952,7 @@ class TestFetchSurfacingRanks:
         assert obs.pairs_comparable == 0
 
     async def test_an_empty_successor_content_is_not_searched(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         m = _mod()
         refs = m.pointer_targets(_record('rec-1', '   ', supersedes=UUID_B))
@@ -1967,7 +1967,7 @@ class TestFetchSurfacingRanks:
         assert obs.pairs_comparable == 0
 
     async def test_each_edge_is_scored_against_its_own_query_and_folded(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         m = _mod()
         refs = [
@@ -1988,7 +1988,7 @@ class TestFetchSurfacingRanks:
         assert [r.successor_id for r in obs.inversions] == ['rec-1']
 
     async def test_a_half_present_pair_is_neither_counted_nor_exposed(self):
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         m = _mod()
         refs = m.pointer_targets(_record('rec-1', 'successor one', supersedes=UUID_B))
@@ -2020,9 +2020,9 @@ class TestFetchSurfacingRanks:
         "corpus is clean"), and β already excludes degraded observations from
         every denominator while disclosing them.
         """
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
-        from fused_memory.services.memory_service import SearchResults  # noqa: PLC0415
+        from fused_memory.services.memory_service import SearchResults
 
         m = _mod()
         refs = m.pointer_targets(_record('rec-1', 'the successor text', supersedes=UUID_B))
@@ -2057,9 +2057,9 @@ class TestFetchSurfacingRanks:
         guard would disclose nothing precisely when there is something to
         disclose.
         """
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
-        from fused_memory.services.memory_service import SearchResults  # noqa: PLC0415
+        from fused_memory.services.memory_service import SearchResults
 
         m = _mod()
         empty = SearchResults([], degraded=True, failed_stores=['mem0'])
@@ -2075,9 +2075,9 @@ class TestFetchSurfacingRanks:
 
     async def test_a_degraded_search_that_named_no_store_still_discloses(self):
         """``degraded=True`` alone is enough; so is a store name alone."""
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
-        from fused_memory.services.memory_service import SearchResults  # noqa: PLC0415
+        from fused_memory.services.memory_service import SearchResults
 
         m = _mod()
         refs = m.pointer_targets(_record('rec-1', 'the successor text', supersedes=UUID_B))
@@ -2095,9 +2095,9 @@ class TestFetchSurfacingRanks:
 
     async def test_one_degraded_edge_never_suppresses_a_healthy_one(self):
         """The exclusion is PER EDGE, so a blip costs only its own query."""
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
-        from fused_memory.services.memory_service import SearchResults  # noqa: PLC0415
+        from fused_memory.services.memory_service import SearchResults
 
         m = _mod()
         refs = [
@@ -2128,7 +2128,7 @@ class TestFetchSurfacingRanks:
         that was only ever going to be narrower. ``fetch_terminal_task_ids``
         degrades a failing task backend to a NAMED skip for exactly this reason.
         """
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         m = _mod()
         refs = m.pointer_targets(_record('rec-1', 'the successor text', supersedes=UUID_B))
@@ -2151,7 +2151,7 @@ class TestFetchSurfacingRanks:
 
     async def test_one_raising_edge_never_costs_a_healthy_one_its_score(self):
         """Per edge, exactly as the sentinel path is."""
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         m = _mod()
         refs = [
@@ -2178,7 +2178,7 @@ class TestFetchSurfacingRanks:
         Both narrow ``pairs_comparable``, which is why the same predicate that
         skips them is the one that names them.
         """
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         m = _mod()
         refs = [
@@ -2204,7 +2204,7 @@ class TestFetchSurfacingRanks:
         a runner leaf ε schedules beside leaf β. Not a threshold: every edge is
         still searched and the fold is still handed its inputs in ref order.
         """
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
         m = _mod()
         refs = [
@@ -2227,7 +2227,7 @@ class TestFetchSurfacingRanks:
 
     async def test_a_plain_list_search_double_is_never_read_as_degraded(self):
         """The old duck-typed doubles (and any plain list) stay non-degraded."""
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         m = _mod()
         refs = m.pointer_targets(_record('rec-1', 'the successor text', supersedes=UUID_B))
@@ -2270,7 +2270,7 @@ def _taskmaster_config(project_root: str = '/repo'):
 
 def _install_backend_double(monkeypatch, double_holder, **kwargs):
     """Patch the module attribute the sweep's function-local import resolves."""
-    from fused_memory.backends import sqlite_task_backend  # noqa: PLC0415
+    from fused_memory.backends import sqlite_task_backend
 
     def _factory(taskmaster_config):
         double = _BackendDouble(taskmaster_config, **kwargs)
@@ -2294,7 +2294,7 @@ class TestFetchTerminalTaskIds:
         assert doubles[0].calls == ['start', 'get_statuses:/repo', 'close']
 
     async def test_only_the_shared_terminal_statuses_are_selected(self, monkeypatch):
-        from shared.task_statuses import TERMINAL  # noqa: PLC0415
+        from shared.task_statuses import TERMINAL
 
         m = _mod()
         doubles: list[_BackendDouble] = []
@@ -2436,7 +2436,7 @@ class _ServiceDouble:
         # A seeded SearchResults is handed back VERBATIM: its degraded /
         # failed_stores ride on a list SUBCLASS and would not survive the
         # list(...) copy, which is the very metadata the degrade tests seed.
-        from fused_memory.services.memory_service import SearchResults  # noqa: PLC0415
+        from fused_memory.services.memory_service import SearchResults
         if isinstance(seeded, SearchResults):
             return seeded
         return list(seeded)
@@ -2514,9 +2514,9 @@ def _install_run_band(monkeypatch, double, *, taskmaster_statuses=None, project_
     (the D8 pattern), so patching the module attributes is enough to drive the
     real argparse/_run/emit path end to end.
     """
-    import fused_memory.services.memory_service as ms  # noqa: PLC0415
-    from fused_memory.backends import sqlite_task_backend  # noqa: PLC0415
-    from fused_memory.config import schema  # noqa: PLC0415
+    import fused_memory.services.memory_service as ms
+    from fused_memory.backends import sqlite_task_backend
+    from fused_memory.config import schema
 
     taskmaster = (
         None if taskmaster_statuses is None
@@ -2535,7 +2535,7 @@ def _install_run_band(monkeypatch, double, *, taskmaster_statuses=None, project_
 
 def _run_main(monkeypatch, tmp_path, double, *extra_argv, taskmaster_statuses=None):
     """Drive the real ``main()`` with the stamp pinned, returning its exit code."""
-    from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR  # noqa: PLC0415
+    from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR
 
     _install_run_band(monkeypatch, double, taskmaster_statuses=taskmaster_statuses)
     monkeypatch.setenv(RUN_STAMP_ENV_VAR, STAMP)
@@ -2565,7 +2565,7 @@ class TestReadOnlyGuarantee:
 
     def test_the_double_would_have_caught_a_write(self):
         """The tripwire fires — otherwise every assertion above is vacuous."""
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         double = _ServiceDouble()
         for method in (
@@ -2649,7 +2649,7 @@ class TestArtifactEmission:
     def test_both_artifacts_land_under_the_eval_id_and_round_trip(
         self, monkeypatch, tmp_path,
     ):
-        from shared.memory_eval_metrics import load_metric_series  # noqa: PLC0415
+        from shared.memory_eval_metrics import load_metric_series
 
         _run_main(
             monkeypatch, tmp_path, _seeded_double(), taskmaster_statuses={'4802': 'done'},
@@ -2790,9 +2790,9 @@ def _sweep(
     scope, or with the artifacts actually written, rather than re-implementing
     the call.
     """
-    import asyncio  # noqa: PLC0415
+    import asyncio
 
-    from fused_memory.backends import sqlite_task_backend  # noqa: PLC0415
+    from fused_memory.backends import sqlite_task_backend
 
     taskmaster = (
         None if taskmaster_statuses is None
@@ -3043,7 +3043,7 @@ class TestReport:
         outage rendered as a corpus with nothing to compare, in the report an
         operator reads to decide whether to trust the numbers.
         """
-        from fused_memory.services.memory_service import SearchResults  # noqa: PLC0415
+        from fused_memory.services.memory_service import SearchResults
 
         m = _mod()
         outcome = _sweep(monkeypatch, tmp_path, _seeded_double(
@@ -3337,9 +3337,9 @@ def sweep_config(mock_config, sweep_project_id):
 @pytest.fixture
 def clean_sweep_collection(sweep_config, sweep_project_id):
     """Delete the seeded collection before AND after, so a swallowed teardown self-heals."""
-    from qdrant_client import QdrantClient  # noqa: PLC0415
+    from qdrant_client import QdrantClient
 
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     collection = Scope(project_id=sweep_project_id).mem0_collection_name(
         sweep_config.mem0.collection_prefix,
@@ -3365,7 +3365,7 @@ class TestSeededStalenessSweep:
         real QdrantClient, and this assertion is about a NAME. Taking it would
         drag the one pure test in this class onto the network.
         """
-        from fused_memory.models.scope import Scope  # noqa: PLC0415
+        from fused_memory.models.scope import Scope
 
         collection = Scope(project_id=sweep_project_id).mem0_collection_name(
             sweep_config.mem0.collection_prefix,
@@ -3395,9 +3395,9 @@ class TestSeededStalenessSweep:
         self, sweep_config, sweep_project_id, clean_sweep_collection, tmp_path,
     ):
         """Seeded through the full open, swept through the read open the CLI takes."""
-        from shared.memory_eval_metrics import load_metric_series  # noqa: PLC0415
+        from shared.memory_eval_metrics import load_metric_series
 
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService
 
         m = _mod()
         seeder = MemoryService(sweep_config)

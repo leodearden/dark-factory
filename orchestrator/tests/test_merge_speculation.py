@@ -77,15 +77,15 @@ from _verify_result_doubles import (
     fake_verify_result,
     format_fail_open_records,
 )
-from test_merge_queue_concurrent_verify import (  # noqa: F401
+from test_merge_queue_concurrent_verify import (
     _gated_runner,
     _id_liveness_fake_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
 )
 
-from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: F401
-from orchestrator.event_store import EventStore, EventType  # noqa: F401
+from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (  # noqa: F401
     AdvanceOutcome,
     AdvanceResult,
@@ -104,7 +104,7 @@ from orchestrator.merge_lane.worker import (
     MergeRequest,
     _acquire_warm_verify_worktree,
 )
-from orchestrator.verify import VerifyResult  # noqa: F401
+from orchestrator.verify import VerifyResult
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
 
 # Late-arrival integration helpers (task 1862): reuse the scene helpers from

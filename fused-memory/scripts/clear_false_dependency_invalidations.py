@@ -143,9 +143,9 @@ async def _run(args: argparse.Namespace) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    import os  # noqa: PLC0415
+    import os
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.maintenance._utils import maintenance_service
 
     if args.config:

@@ -420,7 +420,7 @@ def _summary(snapshot: Mapping[str, Any], path: Path, sha256: str) -> dict[str, 
 
 
 async def _freeze_live(args: argparse.Namespace) -> dict[str, Any]:
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.maintenance._utils import maintenance_service
 
     frozen_at = datetime.now(UTC)

@@ -915,7 +915,7 @@ def load_production_queries(path: str | Path) -> list[ProductionQuery]:
     this is the symmetric half, so the two corpora cannot silently merge in
     either direction.
     """
-    import json  # noqa: PLC0415
+    import json
 
     target = Path(path)
     if not target.exists():
@@ -1588,7 +1588,7 @@ def build_selection_report(scored: dict[str, Any]) -> dict[str, Any]:
     the live vocabulary set rather than restated as prose constants, so the
     document cannot drift from the code it describes.
     """
-    from dataclasses import asdict  # noqa: PLC0415
+    from dataclasses import asdict
 
     _check_selection_arms(scored)
     arms = {
@@ -1982,7 +1982,7 @@ def write_artifacts(
     if fixture_paths:
         stamped['fixture_provenance'] = bake.fixture_provenance(list(fixture_paths))
     markdown = render_selection_markdown(stamped)
-    import json  # noqa: PLC0415
+    import json
 
     body = json.dumps(stamped, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
     json_target, md_target = Path(json_path), Path(md_path)
@@ -2057,7 +2057,7 @@ def production_query_provenance(
     report is not regenerated, the committed-artifact test says so instead of
     the table quietly describing a corpus that is no longer in the tree.
     """
-    import json  # noqa: PLC0415
+    import json
 
     templates = [
         {
@@ -2183,7 +2183,7 @@ def load_production_fetches(
     and the recorded ``'k'`` is the REQUESTED k, so a 3-deep window scored at
     ``k=5`` is indistinguishable from a full one downstream.
     """
-    import json  # noqa: PLC0415
+    import json
 
     bake = bake_off()
     target = Path(path)
@@ -2277,10 +2277,10 @@ async def fetch_production_rankings(
     * teardown runs in a ``finally``, because the leak that matters is the
       mid-run one.
     """
-    import shutil  # noqa: PLC0415
-    import tempfile  # noqa: PLC0415
+    import shutil
+    import tempfile
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
     from fused_memory.maintenance._utils import maintenance_service
 
     bake = bake_off()
@@ -2359,7 +2359,7 @@ def extend_fetch_cache(path: str | Path, fetched: dict[str, Any]) -> Path:
     for the wrong reason — and would put label-free rows into the block the
     E2 replay treats as its labeled query set.
     """
-    import json  # noqa: PLC0415
+    import json
 
     bake = bake_off()
     target = Path(path)
@@ -2431,7 +2431,7 @@ def score_from_cache(
 
 
 def build_parser() -> Any:
-    import argparse  # noqa: PLC0415
+    import argparse
 
     parser = argparse.ArgumentParser(
         description=(
@@ -2467,8 +2467,8 @@ def build_parser() -> Any:
 
 
 def main(argv: list[str] | None = None) -> int:
-    import asyncio  # noqa: PLC0415
-    import sys  # noqa: PLC0415
+    import asyncio
+    import sys
 
     args = build_parser().parse_args(argv)
 

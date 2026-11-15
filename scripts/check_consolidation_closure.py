@@ -386,7 +386,7 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
             scrolled = await scroll_cluster(
                 memory, project_id, topic, block=block
             )
-        except Exception as exc:  # noqa: BLE001 — any store failure is "could not check"
+        except Exception as exc:
             store_error = f"{type(exc).__name__}: {exc}"
             scrolled = {
                 "members": [],

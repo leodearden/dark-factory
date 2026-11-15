@@ -3609,7 +3609,7 @@ def _archive_junit_report(
         # 0.214s).
         with junit_path.open('rb') as report, gzip.open(dest, 'wb', 6) as archived:
             shutil.copyfileobj(report, archived)
-    except Exception:  # noqa: BLE001 — observability may not fail a verify
+    except Exception:  # observability may not fail a verify
         logger.warning(
             '_archive_junit_report: could not archive %s → %s',
             junit_path, dest, exc_info=True,
@@ -8423,7 +8423,7 @@ async def run_verification(
                     role=role,
                 )
                 archive_log_paths = [str(p) for p in arch_paths]
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'run_verification: merge archival error (non-fatal): %s', exc,
                 )
@@ -8450,7 +8450,7 @@ async def run_verification(
                 infra_reclassified=bare_xdist_crash,
             )
             archive_log_paths = [str(p) for p in arch_paths]
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning('run_verification: persistence error (non-fatal): %s', exc)
 
     if bare_xdist_crash:
@@ -9162,7 +9162,7 @@ def _safe_derive_executed_fallback_plan(
                 plan, executed_fallback, pytest_reason=fallback_pytest_reason,
             )
         return plan
-    except Exception as exc:  # noqa: BLE001 — best-effort; must never fail the verify gate
+    except Exception as exc:  # best-effort; must never fail the verify gate
         logger.warning(
             'derive_verify_plan failed — omitting VerifyResult.plan for this attempt: %s',
             exc, exc_info=True,
@@ -10549,7 +10549,7 @@ async def run_main_tip_sweep(
     guarantee: a broad prune would deregister concurrently-active sibling
     probe/merge worktrees).
     """
-    from orchestrator.git_ops import (  # noqa: PLC0415 — lazy, mirrors verify_failure_is_preexisting_on_main
+    from orchestrator.git_ops import (  # lazy, mirrors verify_failure_is_preexisting_on_main
         EphemeralWorktreeError,
         WorktreeKind,
     )
@@ -11450,7 +11450,7 @@ async def _sweep_failure_reproduces_in_isolation(
         # Discover module configs on the SWEEP worktree (never config's
         # snapshot — that is for a different worktree/SHA). Lazy import
         # mirrors confirm_main_tip_failure_is_real.
-        from orchestrator.config import _discover_module_configs  # noqa: PLC0415
+        from orchestrator.config import _discover_module_configs
 
         module_configs = _discover_module_configs(worktree)
 
@@ -11578,8 +11578,8 @@ async def confirm_main_tip_failure_is_real(
     likelihood, non-fatal ambiguity, not a fail-safe-to-alarm path.
     """
     import uuid  # noqa: PLC0415, I001 — lazy, mirrors run_main_tip_sweep/verify_failure_is_preexisting_on_main
-    from orchestrator.config import _discover_module_configs  # noqa: PLC0415
-    from orchestrator.git_ops import _run  # noqa: PLC0415
+    from orchestrator.config import _discover_module_configs
+    from orchestrator.git_ops import _run
 
     _sha_prefix = main_sha[:12] if main_sha else '?'
 
@@ -12660,7 +12660,7 @@ def _emit_trivial_pass_escalated(
     """
     if event_store is None:
         return
-    from orchestrator.event_store import EventType  # noqa: PLC0415 — lazy, avoid cycle
+    from orchestrator.event_store import EventType  # lazy, avoid cycle
 
     event_store.emit(
         EventType.trivial_pass_escalated,

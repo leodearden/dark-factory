@@ -277,7 +277,7 @@ def test_git_config_rejects_bypass_command_without_clear():
     time.  (The reverse — clear set, bypass unset — is a harmless no-op and
     stays permissive, asserted in test_git_config_accepts_main_gate_bypass_commands.)
     """
-    import pydantic  # noqa: PLC0415
+    import pydantic
 
     with pytest.raises((pydantic.ValidationError, ValueError)) as excinfo:
         GitConfig(main_gate_bypass_command='git config reify.mainGate.bypass true')
@@ -14699,7 +14699,7 @@ class TestRunDelegatesToSharedGitAsync:
             def __init__(self, tag: str) -> None:
                 self._tag = tag
 
-            async def communicate(self, input: bytes | None = None):  # noqa: A002
+            async def communicate(self, input: bytes | None = None):
                 spawned.append(self._tag)
                 await released.wait()
                 return b'', b''

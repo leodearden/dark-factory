@@ -370,9 +370,9 @@ def main() -> int:
 
     async def _run_live() -> int:
         nonlocal outcome
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
         from fused_memory.maintenance._utils import maintenance_service
-        from fused_memory.reconciliation.journal import (  # noqa: PLC0415
+        from fused_memory.reconciliation.journal import (
             ReconciliationJournal,
         )
 

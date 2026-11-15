@@ -341,7 +341,7 @@ async def _mcp_handshake_ready(
         async with asyncio.timeout(timeout_s):
             async with Client(transport) as client:
                 await client.ping()
-    except Exception as exc:  # noqa: BLE001 - any failure just means "not ready yet"
+    except Exception as exc:  # any failure just means "not ready yet"
         if error_box is not None:
             error_box[:] = [exc]
         return False
@@ -445,7 +445,7 @@ def _serve_escalation_mcp_impl():
                     mcp.http_app(), log_level='error', ws='none',
                 ))
                 loop.run_until_complete(server.serve(sockets=[listener]))
-            except BaseException as exc:  # noqa: BLE001 - surfaced on timeout below
+            except BaseException as exc:  # surfaced on timeout below
                 # Two distinct cases, told apart by the `stopping` flag:
                 #
                 # * Teardown stopped the loop mid-serve -- a deliberate,

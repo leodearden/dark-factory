@@ -299,7 +299,7 @@ async def apply_tags(
                     decision['id'], decision['new_content'], scope,
                     metadata=provenance_metadata,
                 )
-            except Exception as exc:  # noqa: BLE001 -- best-effort, mirrors apply_prune
+            except Exception as exc:  # best-effort, mirrors apply_prune
                 logger.warning(
                     'tag_cgl_eta_rehome_scope: failed to update memory %s '
                     '(project %s): %s',
@@ -349,8 +349,8 @@ async def run(
     generated_at = datetime.now(UTC).isoformat()
 
     if known_projects_map is None:
-        from fused_memory.config.schema import FusedMemoryConfig as _FMC  # noqa: PLC0415
-        from fused_memory.models.scope import build_known_projects_map  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig as _FMC
+        from fused_memory.models.scope import build_known_projects_map
         cfg = _FMC()
         known_projects_map = build_known_projects_map(
             cfg.taskmaster.project_root if cfg.taskmaster else '',
@@ -538,11 +538,11 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> int:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
         from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()

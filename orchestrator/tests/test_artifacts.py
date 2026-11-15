@@ -3197,7 +3197,7 @@ class TestWriteJsonIsAtomic:
             for _ in range(reads_per_reader):
                 try:
                     observations.append(read_once())
-                except Exception as exc:  # noqa: BLE001 — recorded, then asserted on
+                except Exception as exc:  # recorded, then asserted on
                     errors.append(repr(exc))
                 if done.is_set():
                     break

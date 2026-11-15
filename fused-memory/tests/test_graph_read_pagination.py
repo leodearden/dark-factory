@@ -1482,7 +1482,7 @@ class TestIncompleteEnumerationErrorType:
         caught = False
         try:
             raise IncompleteEnumerationError('structurally incomplete')
-        except Exception:  # noqa: BLE001 - the sweeps' actual handler shape
+        except Exception:  # the sweeps' actual handler shape
             caught = True
         assert caught, (
             'a bare `except Exception:` must catch it — that is the clause '

@@ -718,8 +718,8 @@ async def run(
         )
 
     if known_projects_map is None:
-        from fused_memory.config.schema import FusedMemoryConfig as _FMC  # noqa: PLC0415
-        from fused_memory.models.scope import build_known_projects_map  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig as _FMC
+        from fused_memory.models.scope import build_known_projects_map
         cfg = _FMC()
         known_projects_map = build_known_projects_map(cfg.taskmaster.project_root if cfg.taskmaster else '')
         if len(known_projects_map) <= 1:
@@ -967,7 +967,7 @@ def main() -> int:
     args = parser.parse_args()
 
     async def _run_live() -> int:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
         from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()

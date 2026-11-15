@@ -205,7 +205,7 @@ class BaseStage:
                     stage=self.stage_id.value,
                     project_id=self.project_id,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # start_report is on the critical path — a transient error
                 # (e.g. duplicate run_id from a crashed prior run, TTL-reaper race)
                 # must not abort the whole reconciliation cycle.  Short-circuit:
@@ -448,7 +448,7 @@ class BaseStage:
             if _corrections:
                 try:
                     _active_rrs.apply_citation_verification(run_id, _corrections)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     # Degrade to "report is correct, durable record is stale" —
                     # never to a failed stage. Loud, not silent (the repo's
                     # loud-over-silent-degradation norm): name the run, stage and

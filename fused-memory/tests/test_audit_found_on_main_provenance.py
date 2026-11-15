@@ -2032,7 +2032,7 @@ class _RecordingBackendFactory:
     def __init__(self):
         self.constructions: list[object] = []
 
-    def __call__(self, taskmaster_config=None, **kwargs):  # noqa: ARG002
+    def __call__(self, taskmaster_config=None, **kwargs):
         self.constructions.append(taskmaster_config)
         return _FakeRunBackend()
 

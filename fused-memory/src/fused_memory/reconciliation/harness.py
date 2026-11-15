@@ -2137,7 +2137,7 @@ class ReconciliationHarness:
                 self.journal.data_dir, run.id,
                 archive_root=recon_archive_root(self.config),
             )
-        except Exception as gc_err:  # noqa: BLE001
+        except Exception as gc_err:
             logger.warning(
                 'gc_run_config_dir failed for recovered run %s: %r', run.id, gc_err
             )
@@ -4163,7 +4163,7 @@ class ReconciliationHarness:
                     self.journal.data_dir, run.id,
                     archive_root=recon_archive_root(self.config),
                 )
-            except Exception as gc_err:  # noqa: BLE001
+            except Exception as gc_err:
                 logger.warning(
                     'gc_run_config_dir failed for %s run %s: %r',
                     run.run_type, run.id, gc_err,

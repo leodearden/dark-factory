@@ -323,7 +323,7 @@ def build_manifest_index(
     for path in _manifest_paths(project_root):
         try:
             doc = load_capability_manifest(path)
-        except Exception as exc:  # noqa: BLE001 — see docstring: recorded, not swallowed
+        except Exception as exc:  # see docstring: recorded, not swallowed
             # Deliberately broad: load_capability_manifest raises OSError,
             # yaml.YAMLError and pydantic.ValidationError, and a future schema
             # change could add more. Every one means the same thing here —

@@ -788,8 +788,8 @@ def run_cli(
     memory_service_factory: Callable[[Any], AbstractAsyncContextManager[Any]] | None = None,
     arms: Sequence[_arms.ArmSpec] | None = None,
 ) -> int:
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.server.write_triage import resolve_candidate_k  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.server.write_triage import resolve_candidate_k
 
     report_path = guard_report_path(args.report_path, limit=args.limit)
     if args.config:
