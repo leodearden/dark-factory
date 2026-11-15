@@ -322,6 +322,16 @@ NOW = datetime.datetime(2026, 10, 17, 6, 0, tzinfo=datetime.UTC)
 FIRST_CREATED_ID = 9001
 
 
+def insert_task(db: Path, task_id: int, metadata: Mapping[str, object], *, title: str | None = None) -> None:
+    """A pending master-tag task, as a server-side writer would create it."""
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO tasks (tag, id, title, status, metadata, updated_at) "
+            "VALUES ('master', ?, ?, 'pending', ?, '2026-10-17T06:00:00+00:00')",
+            (task_id, title or f'task {task_id}', json.dumps(dict(metadata))),
+        )
+
+
 class StubMcp:
     """Both MCP servers, in process, at the sweep's ToolCall port signature.
 
@@ -333,6 +343,11 @@ class StubMcp:
     stopped waiting.  Like the store's ``(tag, candidate_key)`` index, which
     covers done rows, it folds a created submission into any non-cancelled row
     of the same key.  The stub writes; the sweep only reads.
+
+    On the escalation side it keeps the archive: every ``escalate_info`` is a
+    record in ``filed`` with the real ``esc-<task_id>-<seq>`` id, and
+    ``get_task_escalations`` answers from it at every level and status.
+    :meth:`route_info_notes` plays the info-L0 router.
     """
 
     def __init__(
@@ -351,6 +366,7 @@ class StubMcp:
         self.fail_on = fail_on
         self.calls: list[tuple[str, str, dict]] = []
         self.pending: list[dict] = []
+        self.filed: list[dict] = []
         self.submitted: dict[str, dict] = {}
         self.next_task_id = FIRST_CREATED_ID
 
@@ -403,12 +419,7 @@ class StubMcp:
                 return {'status': 'combined', 'task_id': str(colliding), 'reason': 'candidate_key_collision'}
             task_id = self.next_task_id
             self.next_task_id += 1
-            with sqlite3.connect(self.db) as conn:
-                conn.execute(
-                    "INSERT INTO tasks (tag, id, title, status, metadata, updated_at) "
-                    "VALUES ('master', ?, ?, 'pending', ?, '2026-10-17T06:00:00+00:00')",
-                    (task_id, args['title'], json.dumps(args['metadata'])),
-                )
+            insert_task(self.db, task_id, args['metadata'], title=args['title'])
             return {'status': 'created', 'task_id': str(task_id)}
         if self.submit_outcome == 'combined':
             return {'status': 'combined', 'task_id': str(self.combine_into)}
@@ -435,10 +446,48 @@ class StubMcp:
         self._record('escalation', tool, args)
         if tool == 'get_pending_escalations':
             return {'result': [{'task_id': entry['task_id']} for entry in self.pending]}
+        if tool == 'get_task_escalations':
+            fields = ('id', 'task_id', 'status', 'level')
+            return {
+                'result': [
+                    {field: record[field] for field in fields}
+                    for record in self.filed
+                    if record['task_id'] == args['task_id']
+                ]
+            }
         if tool == 'escalate_info':
-            self.pending.append(dict(args))
-            return {'id': f'esc-{len(self.pending)}', 'status': 'queued', 'level': 0}
+            record = self._file_record(dict(args), level=0, status='pending')
+            self.pending.append(record)
+            return {'id': record['id'], 'status': 'queued', 'level': 0}
         raise AssertionError(f'unexpected escalation tool {tool}')
+
+    def _file_record(self, args: dict, *, level: int, status: str) -> dict:
+        seq = 1 + sum(record['task_id'] == args['task_id'] for record in self.filed)
+        record = {**args, 'id': f"esc-{args['task_id']}-{seq}", 'status': status, 'level': level}
+        self.filed.append(record)
+        return record
+
+    def route_info_notes(self, *, convert_to: int | None = None, promote: bool = False) -> None:
+        """Play ``orchestrator/src/orchestrator/escalation_router.py``: dismiss every pending note.
+
+        ``promote`` first files a dismissed L1 under the same ``task_id``, the
+        orphan-reaper / watcher shape that produced task 7693.  ``convert_to``
+        inserts a pending task with that id, carrying the escalation id it was
+        converted from (the L1's when promoted); None dismisses only, as when
+        the curator combined the conversion elsewhere.
+        """
+        for record in self.pending:
+            record['status'] = 'dismissed'
+            converted_from = record['id']
+            if promote:
+                converted_from = self._file_record(
+                    {'task_id': record['task_id']}, level=1, status='dismissed'
+                )['id']
+            if convert_to is not None:
+                insert_task(
+                    self.db, convert_to, {'escalation_id': converted_from, 'source': 'info-l0-router'}
+                )
+        self.pending = []
 
 
 @pytest.fixture
