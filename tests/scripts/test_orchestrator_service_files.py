@@ -327,6 +327,9 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     # After=/Requires= referencing the unit), masking real structural drift.
     expected_df_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-dark-factory.service"
     expected_reify_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-reify.service"
+    # Each unit also runs under its OWN project slice, matched exactly the same way.
+    expected_df_slice_line = f"Slice={project_slice_name('dark_factory')}"
+    expected_reify_slice_line = f"Slice={project_slice_name('reify')}"
 
     # Each unit also Wants=/After= and (in [Install]) Also= its OWN
     # `orchestrator-<project>.socket` (escalation socket activation), so every
@@ -347,6 +350,8 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
             and rl.strip() == expected_reify_orch_unit_line
         ):
             continue
+        if dl.strip() == expected_df_slice_line and rl.strip() == expected_reify_slice_line:
+            continue
         if df_socket in dl and dl.replace(df_socket, reify_socket) == rl:
             continue
         df_ok = any(frag in dl for frag in allowed_df_fragments)
@@ -356,7 +361,7 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
 
     assert not unexpected, (
         "Unexpected differences between df and reify service files "
-        "(only Description, --config path, and ORCH_UNIT should differ):\n"
+        "(only Description, --config path, ORCH_UNIT and Slice should differ):\n"
         + "\n".join(f"  line {n}:\n    df:    {d!r}\n    reify: {r!r}" for n, d, r in unexpected)
     )
 

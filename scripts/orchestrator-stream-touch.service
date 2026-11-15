@@ -21,6 +21,8 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
+# Per-project cgroup slice: docs/cgroup-slice-topology.md
+Slice=df-stream_touch.slice
 # CWD must be dark-factory so `uv run --project orchestrator` resolves the
 # orchestrator package (its pyproject lives only under that repo).
 WorkingDirectory=/home/leo/src/dark-factory
