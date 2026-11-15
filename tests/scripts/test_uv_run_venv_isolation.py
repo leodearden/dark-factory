@@ -1,16 +1,14 @@
 """Starting a unit must not mutate the shared root .venv.
 
 SCOPE, stated precisely because the honest boundary is narrower than the
-invariant one would want.  This module sweeps every committed unit whose
-ExecStart is DIRECTLY a ``uv run`` command.  It does NOT follow a unit whose
-ExecStart is a shell wrapper running ``uv run`` internally, and two committed
-timer-driven units are exactly that shape — scripts/fused-memory-flag-marker-
-sweep.service and scripts/memory-metadata-coverage-census.service, whose
-wrappers still carry the old ``--frozen`` and so still sync into the shared venv
-on every timer elapse.  Those wrappers lie outside task 5553's locks; extending
-discovery through them is filed as a follow-up.  Recording the hole here is the
-point: a guard reporting green while a known instance of its own defect runs
-nightly is worse than one that says what it does not cover.
+invariant one would want.  This module sweeps every committed unit whose start
+runs ``uv run``: in its ExecStart, or one level down, in the repo-tracked shell
+wrapper its ExecStart executes (read as text by shell_uv_run_sites, never run).
+It does NOT follow a wrapper's own callees, a wrapper that is not a shell
+script, or a ``*_CMD`` seam a unit overrides through ``Environment=`` (no
+committed unit does today).  Recording that boundary here is the point: a guard
+reporting green over what it never read is worse than one that says what it
+does not cover.
 
 WHY THE INVARIANT.  Every member of the root pyproject.toml's
 ``[tool.uv.workspace]`` resolves to ONE ``.venv`` at the repo root, so a unit's
@@ -196,10 +194,9 @@ def uv_run_level_flags(exec_start: str) -> list[str] | None:
     scripts/jcodemunch-watcher.service.template runs ``uvx``, an EPHEMERAL
     environment that never touches the shared venv.  The None-vs-raise split
     follows the contract stated once at
-    systemd_unit_invariants.py::config_arg_from_exec_start.  Note what None does
-    NOT cover: a unit whose ExecStart is a shell wrapper running ``uv run``
-    inside it also answers None, which is the scope hole this module's docstring
-    records rather than hides.
+    systemd_unit_invariants.py::config_arg_from_exec_start.  A unit whose
+    ExecStart is a shell wrapper running ``uv run`` inside it also answers None
+    here; uv_run_sites is what follows such a wrapper.
 
     RUN-LEVEL is the load-bearing word, and the reason this walks a prefix
     instead of substring-checking the line.  In
@@ -311,10 +308,27 @@ def wrapper_script_of(exec_start: str) -> str | None:
     return None
 
 
-def discover_uv_run_units() -> list[str]:
-    """Repo-relative paths of every discovered file whose ExecStart is a `uv run`.
+def uv_run_sites(rel_path: str) -> list[UvRunSite]:
+    """Every `uv run` starting the unit at *rel_path* runs, directly or via its wrapper.
 
-    A MalformedExecStart from either parser INCLUDES the path rather than
+    An empty list means the unit's start runs no `uv run` and callers SKIP it.
+    MalformedExecStart propagates from whichever parser raised it.
+    """
+    text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+    exec_start = logical_exec_start(text, rel_path)
+    flags = uv_run_level_flags(exec_start)
+    if flags is not None:
+        return [UvRunSite(rel_path, exec_start, tuple(flags))]
+    wrapper = wrapper_script_of(exec_start)
+    if wrapper is None:
+        return []
+    return shell_uv_run_sites((REPO_ROOT / wrapper).read_text(encoding="utf-8"), wrapper)
+
+
+def discover_uv_run_units() -> list[str]:
+    """Repo-relative paths of every discovered file whose start runs `uv run`.
+
+    A MalformedExecStart from any parser INCLUDES the path rather than
     propagating, for two reasons, the second sharper.  A raise here happens
     inside the ``@pytest.mark.parametrize`` argument, i.e. at COLLECTION time,
     so it takes down the whole module — including the coverage guard that exists
@@ -325,9 +339,8 @@ def discover_uv_run_units() -> list[str]:
     """
     units = []
     for rel_path in discover_exec_start_files():
-        text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
         try:
-            if uv_run_level_flags(logical_exec_start(text, rel_path)) is None:
+            if not uv_run_sites(rel_path):
                 continue
         except MalformedExecStart:
             pass
@@ -340,20 +353,25 @@ def swept_paths() -> list[str]:
     return sorted([*discover_uv_run_units(), FACTORY_INIT_REFERENCE])
 
 
-def _run_level_flags_of(rel_path: str) -> list[str]:
-    """The run-level uv flags of *rel_path*, failing rather than returning None.
+def _uv_run_sites_of(rel_path: str) -> list[UvRunSite]:
+    """The `uv run` sites of *rel_path*, failing rather than returning none.
 
-    swept_paths only yields paths that parsed as a `uv run` command, so a None
-    here means the file changed shape between collection and the test body.
+    swept_paths only yields paths whose start ran a `uv run`, so an empty list
+    here means a file changed shape between collection and the test body.
     """
-    text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
-    flags = uv_run_level_flags(logical_exec_start(text, rel_path))
-    assert flags is not None, (
-        f"{rel_path} was swept as a `uv run` unit but no longer parses as one. "
-        "It was discovered by its ExecStart= and must not leave the sweep "
-        "silently — check whether the command shape changed."
+    sites = uv_run_sites(rel_path)
+    assert sites, (
+        f"{rel_path} was swept as a `uv run` unit but no longer runs `uv run` "
+        "directly or through its wrapper. It was discovered by its ExecStart= "
+        "and must not leave the sweep silently — check whether the command "
+        "shape changed."
     )
-    return flags
+    return sites
+
+
+def _describe(site: UvRunSite) -> str:
+    """One offending site, as a failure message names it."""
+    return f"{site.source}: {site.command!r} (run-level flags: {list(site.flags)})"
 
 
 def test_factory_init_reference_is_swept() -> None:
@@ -361,8 +379,7 @@ def test_factory_init_reference_is_swept() -> None:
 
     Needs its own statement because this path does not come from discovery: a
     rename or a reformat of its fenced ini block would otherwise drop the ONLY
-    copy-source out of both arms silently, turning sixteen cases into fifteen
-    with nothing red.
+    copy-source out of both arms silently, one case fewer with nothing red.
     """
     path = REPO_ROOT / FACTORY_INIT_REFERENCE
     assert path.exists(), (
@@ -405,7 +422,7 @@ def test_discovery_covers_every_known_uv_run_unit() -> None:
     assert discovered, (
         "discovery found no `uv run` units at all. Most likely causes: the git "
         f"grep ran outside a checkout (REPO_ROOT={REPO_ROOT}), or "
-        "uv_run_level_flags stopped recognising every ExecStart. Either way the "
+        "uv_run_sites stopped recognising every unit's start. Either way the "
         "parametrized sweeps below would collect zero cases and report green "
         "while checking nothing."
     )
@@ -415,7 +432,8 @@ def test_discovery_covers_every_known_uv_run_unit() -> None:
         f"these known `uv run` units dropped out of the sweep: {sorted(missing)}. "
         "They were not deleted (discovery reads git-tracked files), so either "
         "the ExecStart= moved/was reformatted past logical_exec_start, or "
-        "uv_run_level_flags stopped recognising it as a uv invocation. A unit "
+        "uv_run_sites stopped recognising its `uv run`, in the ExecStart or "
+        "in the wrapper it names. A unit "
         "that leaves this sweep silently is the failure mode the sweep exists "
         "to prevent."
     )
@@ -432,12 +450,14 @@ def test_discovery_covers_every_known_uv_run_unit() -> None:
 
 @pytest.mark.parametrize("rel_path", swept_paths(), ids=lambda p: p)
 def test_uv_run_unit_passes_no_sync(rel_path: str) -> None:
-    """A unit's `uv run` must carry `--no-sync` among its RUN-LEVEL flags."""
-    flags = _run_level_flags_of(rel_path)
-    assert "--no-sync" in flags, (
-        f"{rel_path} runs `uv run` without a run-level `--no-sync` (run-level "
-        f"flags found: {flags}). Without it, process start INSTALLS the named "
-        "member's missing dependency closure into the ONE shared root .venv "
+    """Every `uv run` a unit's start runs must carry `--no-sync` among its RUN-LEVEL flags."""
+    sites = _uv_run_sites_of(rel_path)
+    missing = [s for s in sites if "--no-sync" not in s.flags]
+    assert not missing, (
+        f"{rel_path} starts `uv run` without a run-level `--no-sync` at: "
+        f"{'; '.join(_describe(s) for s in missing)}. Without it, process "
+        "start INSTALLS the named member's missing dependency closure into the "
+        "ONE shared root .venv "
         "every workspace member, every running orchestrator and every verify "
         "subprocess resolves against. `--frozen` does NOT prevent this — it is "
         "a LOCKFILE option, measured reinstalling into the venv (the full "
@@ -458,11 +478,11 @@ def test_uv_run_unit_carries_no_lockfile_flag(rel_path: str) -> None:
     different reasons, a reader of a failure should see which one fired, and the
     presence arm must stay green independently of this one.
     """
-    flags = _run_level_flags_of(rel_path)
-    lockfile_flags = [f for f in flags if f in ("--frozen", "--locked")]
-    assert not lockfile_flags, (
-        f"{rel_path} carries run-level {lockfile_flags} beside `--no-sync` "
-        f"(run-level flags found: {flags}). `--no-sync` skips the LOCK step "
+    sites = _uv_run_sites_of(rel_path)
+    offending = [s for s in sites if {"--frozen", "--locked"} & set(s.flags)]
+    assert not offending, (
+        f"{rel_path} starts `uv run` with a run-level `--frozen`/`--locked` at: "
+        f"{'; '.join(_describe(s) for s in offending)}. `--no-sync` skips the LOCK step "
         "along with the sync, so both lockfile flags buy literally nothing next "
         "to it — measured, with the exit codes and the unchanged lockfile "
         "digest, in scripts/orchestrator-autopilot-video.service above its "
