@@ -3088,6 +3088,10 @@ class Harness:
             # startup crash (plans/startup-hardening-prd.md §4).
             if startup_completed_at is None:
                 exit_reason = RunExitReason.startup_crash(journal.record_crash(exc))
+                page_crash_loop(
+                    journal, self._escalation_queue,
+                    filing_claimant_run_id=self._filing_claimant_run_id,
+                )
             raise
         finally:
             # Task 3172: set BEFORE the drain loop below (the primary route by
