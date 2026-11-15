@@ -99,17 +99,21 @@ _EMPTY = Mem0AddOutcome(
 
 
 @pytest.mark.parametrize(
-    'leg',
+    ('outcome', 'raised_fields'),
     [
-        Mem0LegResult(_LANDED),
-        Mem0LegResult(_EMPTY),
-        Mem0LegResult(RAISED_MEM0_ADD, error='boom'),
-        Mem0LegResult(RAISED_MEM0_ADD, pending_retry_reason='rate_limited: RateLimitError'),
+        (_LANDED, {}),
+        (_EMPTY, {}),
+        (RAISED_MEM0_ADD, {'error': 'boom'}),
+        (RAISED_MEM0_ADD, {'pending_retry_reason': 'rate_limited: RateLimitError'}),
     ],
     ids=['landed', 'empty-result', 'raised', 'deferred'],
 )
-def test_a_consistent_leg_constructs(leg):
-    assert isinstance(leg, Mem0LegResult)
+def test_a_consistent_leg_constructs(outcome, raised_fields):
+    leg = Mem0LegResult(outcome, **raised_fields)
+
+    assert leg.outcome is outcome
+    assert leg.error == raised_fields.get('error')
+    assert leg.pending_retry_reason == raised_fields.get('pending_retry_reason')
 
 
 def test_a_leg_cannot_both_fail_and_be_deferred():
@@ -133,18 +137,18 @@ def test_a_landed_leg_cannot_carry_a_raise(raised_field):
     'raised_field', [{'error': 'boom'}, {'pending_retry_reason': 'rate_limited'}]
 )
 def test_a_raised_leg_is_exactly_the_raised_outcome(raised_field):
-    with pytest.raises(ValueError, match='empty_result'):
+    with pytest.raises(ValueError, match='zero memory_ids'):
         Mem0LegResult(_EMPTY, **raised_field)
 
 
 @pytest.mark.parametrize(
-    ('leg', 'pending'),
+    ('outcome', 'raised_fields', 'pending'),
     [
-        (Mem0LegResult(_LANDED), False),
-        (Mem0LegResult(RAISED_MEM0_ADD, error='boom'), False),
-        (Mem0LegResult(RAISED_MEM0_ADD, pending_retry_reason='rate_limited'), True),
+        (_LANDED, {}, False),
+        (RAISED_MEM0_ADD, {'error': 'boom'}, False),
+        (RAISED_MEM0_ADD, {'pending_retry_reason': 'rate_limited'}, True),
     ],
     ids=['landed', 'raised', 'deferred'],
 )
-def test_only_a_deferred_leg_is_pending_retry(leg, pending):
-    assert leg.pending_retry is pending
+def test_only_a_deferred_leg_is_pending_retry(outcome, raised_fields, pending):
+    assert Mem0LegResult(outcome, **raised_fields).pending_retry is pending
