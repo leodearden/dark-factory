@@ -344,7 +344,9 @@ negative, so an EWMA chart can never show improvement at these rates.
     - The figures have one definition, the instrument's `--summary SNAPSHOT --json`
       (`scripts/quality_metrics_snapshot.py::summary_json`). It aggregates through the same
       `_SUMMARY_COLUMNS` and `_GRAPH_KINDS` as the markdown `--summary`, and each cell carries its typed
-      value and its exact markdown text. The dashboard runs it as a subprocess of `sys.executable` on the
+      value and its exact markdown text. `h14_marks` names the line mark each heuristic-14 column counted
+      files at (`::_H14_COLUMN_MARKS`), so a point's h14 marks and counts come from one source, not from
+      the snapshot's recorded params. The dashboard runs it as a subprocess of `sys.executable` on the
       factory checkout's script (`dashboard/src/dashboard/data/quality_snapshots.py::INSTRUMENT_SCRIPT`),
       inside the loop, and never imports `scripts/`.
     - `dashboard/src/dashboard/data/quality_snapshots.py` is the one reader of both homes: the project
@@ -356,6 +358,9 @@ negative, so an EWMA chart can never show improvement at these rates.
       before a nightly file at the same commit, then point id (`::point_order`), and diffs each point
       against the one before it with the instrument's `--diff`. A file the instrument refuses, or whose
       sha git cannot resolve, is served in `unplaced` with its reason: never placed, never dropped.
+      Only the instrument's refusal exit (`::INSTRUMENT_REFUSAL_EXIT`, 2) is cached as a refusal or a
+      `failed` diff; any other exit, a signal included (`::InstrumentInterrupted`), and a timeout leave
+      the file or diff pending, retried by the next scan.
     - Cache keys (`::SnapshotCache`). A summary is reused while the file's size and mtime_ns are
       unchanged. Otherwise it is reused while the file's content digest and the summariser digest are
       unchanged (`::summariser_digest`, sha256 of the instrument and `scripts/source_measures.py`). A
@@ -376,12 +381,13 @@ negative, so an EWMA chart can never show improvement at these rates.
       bare list of points. Before any scan it is unknown, "the snapshot homes of <project> have not been
       scanned yet". When every scan failed it is unknown naming the failure. When a scan found neither
       home holding a file it is unknown, starting "no snapshot yet" and naming both homes (INV-13). It is
-      stale when a newer attempt failed (serving the last good scan) or files are not yet summarised;
+      stale when a newer attempt failed (serving the last good scan) or files are not yet summarised or
+      placed;
       otherwise fresh as of the scan, aged against `QUALITY_FRESHNESS_BOUND_SECONDS`. Pending diffs do
       not make it stale: each point's diff state says so.
     - Wire (`::SnapshotSeries.to_wire`, `::ScannedPoint.to_wire`, replacing §Contract's
       `SnapshotPoint` sketch): `{points: [SnapshotPoint], unplaced: [{id, file, baseline, reason}],
-      pending: {summaries, diffs}}`, with `SnapshotPoint = {id, file, baseline, as_of_sha,
+      pending: {files, diffs}}`, with `SnapshotPoint = {id, file, baseline, as_of_sha,
       committed_at, run_id, params, unknown_params, complete, members: {columns: [header], rows:
       [{member, pseudo, cells: [text]}]}, h14: {soft_ceiling_lines, alarm_lines, at_soft_ceiling,
       at_alarm}, cycles: {cycles, hidden_cycles, typing_cycles}, deferred_imports,

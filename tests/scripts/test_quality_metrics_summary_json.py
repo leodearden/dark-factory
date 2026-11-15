@@ -127,7 +127,7 @@ class TestTheSummaryJson:
         assert set(summary) == {
             'run_id', 'as_of_sha', 'since', 'schema_version', 'params', 'unknown_params',
             'complete', 'measured_files', 'domain_files', 'unreadable', 'columns', 'members',
-            'domain', 'import_graph',
+            'domain', 'h14_marks', 'import_graph',
         }
         evidence = taken['evidence']
         assert (summary['run_id'], summary['as_of_sha'], summary['since']) == (
@@ -187,6 +187,22 @@ class TestTheSummaryJson:
         _headers, rows = _table(_markdown(measured, capsys))
         assert rows[-1][0] == '(domain)'
         assert [cell['text'] for cell in summary['domain']['cells']] == rows[-1][2:]
+
+    def test_the_h14_marks_are_the_lines_each_h14_column_counts_at(
+        self, measured: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        recorded = read_json(measured)
+        recorded['params'] = {**recorded['params'], 'h14_soft_ceiling_lines': 1000, 'h14_alarm_lines': 1200}
+        elsewhere = tmp_path / 'other-marks.json'
+        elsewhere.write_text(json.dumps(recorded), encoding='utf-8')
+        summary = _summary_json(elsewhere, capsys)
+        headers = {column['slug']: column['header'] for column in summary['columns']}
+        assert summary['h14_marks'] == {
+            'files_at_soft_ceiling': snapshot.H14_SOFT_CEILING_LINES,
+            'files_at_alarm': snapshot.H14_ALARM_LINES,
+        }
+        for slug, mark in summary['h14_marks'].items():
+            assert headers[slug] == f'files >= {mark} lines'
 
     def test_the_import_graph_counts_are_the_markdown_graph_line(
         self, measured: Path, capsys: pytest.CaptureFixture[str]

@@ -641,6 +641,6 @@ export function qualitySnapshotPoint({
 
 // The QUALITY_SNAPSHOTS Datum's value: `points` as given (in served order),
 // nothing unplaced and nothing pending unless given.
-export function qualitySnapshots(points, { unplaced = [], pendingSummaries = 0, pendingDiffs = 0 } = {}) {
-  return { points, unplaced, pending: { summaries: pendingSummaries, diffs: pendingDiffs } };
+export function qualitySnapshots(points, { unplaced = [], pendingFiles = 0, pendingDiffs = 0 } = {}) {
+  return { points, unplaced, pending: { files: pendingFiles, diffs: pendingDiffs } };
 }

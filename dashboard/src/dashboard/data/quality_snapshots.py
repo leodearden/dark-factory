@@ -13,11 +13,12 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -31,6 +32,8 @@ from shared.quality_series.git_lines import GitObjectMissing, GitTimeout, git_ou
 from dashboard.data.datum import Datum, DatumState, aged_at, unknown_datum
 from dashboard.data.quality_markers import SnapshotIdentity
 from dashboard.data.quality_root_tick import FACTORY_REPO
+
+logger = logging.getLogger(__name__)
 
 BASELINE_HOME = Path('plans/quality-metrics')
 """The committed baselines' home, relative to a project root."""
@@ -96,9 +99,12 @@ def snapshot_files(root: Path, nightly_dir: Path, project_id: str) -> list[Snaps
 # The instrument, run as a subprocess.
 
 
-class InstrumentRefused(Exception):
-    """The instrument exited non-zero over *path*; its exit code and stderr, verbatim."""
+INSTRUMENT_REFUSAL_EXIT: Final = 2
+"""The instrument's one refusal exit, with the cause on stderr (scripts/quality_metrics_snapshot.py's
+docstring). It is settled for the same bytes, so a scan caches it."""
 
+
+class _InstrumentExit(Exception):
     def __init__(self, path: Path, exit_code: int, stderr: str) -> None:
         super().__init__(f'{path}: the instrument exited {exit_code}: {stderr.strip()}')
         self.path = path
@@ -106,13 +112,24 @@ class InstrumentRefused(Exception):
         self.stderr = stderr
 
 
+class InstrumentRefused(_InstrumentExit):
+    """The instrument refused *path* with its refusal exit; its exit code and stderr, verbatim."""
+
+
+class InstrumentInterrupted(_InstrumentExit):
+    """The instrument ended neither done nor refusing: killed by a signal (a negative exit code), or
+    crashed. Nothing is settled, so a scan retries it."""
+
+
 def _run_instrument(instrument: Path, args: Sequence[str], path: Path, timeout_s: float) -> str:
     proc = subprocess.run(
         [sys.executable, str(instrument), *args],
         capture_output=True, text=True, timeout=timeout_s, check=False,
     )
-    if proc.returncode != 0:
+    if proc.returncode == INSTRUMENT_REFUSAL_EXIT:
         raise InstrumentRefused(path, proc.returncode, proc.stderr)
+    if proc.returncode != 0:
+        raise InstrumentInterrupted(path, proc.returncode, proc.stderr)
     return proc.stdout
 
 
@@ -120,7 +137,7 @@ def diff_text(
     current: Path, previous: Path, *,
     instrument: Path = INSTRUMENT_SCRIPT, timeout_s: float = INSTRUMENT_TIMEOUT_SECONDS,
 ) -> str:
-    """The instrument's ``--current CURRENT --diff PREVIOUS`` report, verbatim."""
+    """The instrument's ``--current CURRENT --diff PREVIOUS`` report, verbatim; raises as summarise does."""
     return _run_instrument(
         instrument, ['--current', str(current), '--diff', str(previous)], current, timeout_s
     )
@@ -160,7 +177,7 @@ class MemberRow:
 
 @dataclass(frozen=True)
 class H14Counts:
-    """Heuristic 14's two marks as the snapshot's params record them, and the files at each."""
+    """Heuristic 14's two marks as the instrument counted at them, and the files at each."""
 
     soft_ceiling_lines: int
     alarm_lines: int
@@ -307,6 +324,8 @@ def _decode_summary(summary: Mapping[str, Any], document: str) -> SnapshotSummar
     domain = _cells(_object(summary.get('domain'), f'{top}.domain').get('cells'), f'{top}.domain.cells', len(columns))
     graph_at = f'{top}.import_graph'
     graph = _object(summary.get('import_graph'), graph_at)
+    marks_at = f'{top}.h14_marks'
+    marks = _object(summary.get('h14_marks'), marks_at)
     return SnapshotSummary(
         as_of_sha=_str(summary, 'as_of_sha', top),
         run_id=_str(summary, 'run_id', top),
@@ -316,8 +335,8 @@ def _decode_summary(summary: Mapping[str, Any], document: str) -> SnapshotSummar
         columns=columns,
         members=_rows(summary, 'members', lambda row, where: _member_row(row, where, len(columns))),
         h14=H14Counts(
-            soft_ceiling_lines=_int(params, 'h14_soft_ceiling_lines', f'{top}.params'),
-            alarm_lines=_int(params, 'h14_alarm_lines', f'{top}.params'),
+            soft_ceiling_lines=_int(marks, 'files_at_soft_ceiling', marks_at),
+            alarm_lines=_int(marks, 'files_at_alarm', marks_at),
             at_soft_ceiling=_domain_count(columns, domain, 'files_at_soft_ceiling'),
             at_alarm=_domain_count(columns, domain, 'files_at_alarm'),
         ),
@@ -336,7 +355,8 @@ def _decode_summary(summary: Mapping[str, Any], document: str) -> SnapshotSummar
 def summarise(
     path: Path, *, instrument: Path = INSTRUMENT_SCRIPT, timeout_s: float = INSTRUMENT_TIMEOUT_SECONDS,
 ) -> SnapshotSummary:
-    """The instrument's ``--summary PATH --json``, decoded; InstrumentRefused when it refuses *path*."""
+    """The instrument's ``--summary PATH --json``, decoded; InstrumentRefused when it refuses *path*,
+    InstrumentInterrupted when it neither finished nor refused."""
     document = _run_instrument(instrument, ['--summary', str(path), '--json'], path, timeout_s)
     return SnapshotSummary.from_document(document)
 
@@ -494,7 +514,7 @@ class RootScan:
     points: tuple[ScannedPoint, ...]
     unplaced: tuple[UnplacedFile, ...]
     new_diffs: Mapping[str, ComputedDiff]
-    pending_summaries: int
+    pending_files: int  # not yet summarised, or summarised but not yet placed at a commit time
     pending_diffs: int
     baseline_home: Path
     nightly_home: Path
@@ -512,15 +532,22 @@ class SnapshotCache:
         return cls({}, {})
 
     @classmethod
-    def from_scan(cls, scan: RootScan) -> SnapshotCache:
+    def of(cls, readings: Iterable[ScannedPoint | UnplacedFile]) -> SnapshotCache:
+        """*readings* by point id, and each placed reading's settled diff by its pair key."""
+        readings = tuple(readings)
         return cls(
-            {reading.point_id: reading for reading in (*scan.points, *scan.unplaced)},
+            {reading.point_id: reading for reading in readings},
             {
-                point.diff.pair_key: SettledDiff(point.diff.state, point.diff.reason)
-                for point in scan.points
-                if point.diff.pair_key is not None and point.diff.state in _SETTLED
+                reading.diff.pair_key: SettledDiff(reading.diff.state, reading.diff.reason)
+                for reading in readings
+                if isinstance(reading, ScannedPoint) and reading.diff.pair_key is not None
+                and reading.diff.state in _SETTLED
             },
         )
+
+    @classmethod
+    def from_scan(cls, scan: RootScan) -> SnapshotCache:
+        return cls.of((*scan.points, *scan.unplaced))
 
 
 @dataclass(frozen=True)
@@ -582,7 +609,8 @@ class _Summariser:
         self.pending = 0
 
     def read(self, file: SnapshotFile, stat: os.stat_result) -> _Summarised | None:
-        """*file*'s summary or refusal; None, counted pending, when the deadline or the instrument ran out."""
+        """*file*'s summary or refusal; None, counted pending, when the deadline ran out or the
+        instrument timed out or was interrupted."""
         cached = self.cache.files.get(file.point_id)
         if cached is not None and (cached.size, cached.mtime_ns, cached.summariser) == (
             stat.st_size, stat.st_mtime_ns, self.summariser
@@ -605,9 +633,12 @@ class _Summariser:
             return _Summarised(state, summarise(state.file, instrument=self.instrument))
         except InstrumentRefused as refused:
             return _Summarised(state, _Refusal(refused.stderr))
+        except InstrumentInterrupted as interrupted:
+            logger.warning('snapshot summary not settled, retried next scan: %s', interrupted)
         except subprocess.TimeoutExpired:
-            self.pending += 1
-            return None
+            pass
+        self.pending += 1
+        return None
 
 
 def _place(root: Path, summarised: _Summarised, deadline: float) -> _Placed | UnplacedFile | None:
@@ -654,6 +685,9 @@ class _Differ:
             text = diff_text(current.state.file, previous.state.file, instrument=self.instrument)
         except InstrumentRefused as refused:
             self.new_diffs[key] = ComputedDiff(DiffState.FAILED, None, refused.stderr)
+        except InstrumentInterrupted as interrupted:
+            logger.warning('snapshot diff not settled, retried next scan: %s', interrupted)
+            return None
         except subprocess.TimeoutExpired:
             return None
         else:
@@ -692,7 +726,7 @@ def scan_root(
         points=_diffed(placed, differ),
         unplaced=tuple(point for point in placements if isinstance(point, UnplacedFile)),
         new_diffs=differ.new_diffs,
-        pending_summaries=summariser.pending + placements.count(None),
+        pending_files=summariser.pending + placements.count(None),
         pending_diffs=differ.pending,
         baseline_home=root / BASELINE_HOME,
         nightly_home=nightly_dir / fold_project_token(project_id),
@@ -710,7 +744,7 @@ class SnapshotSeries:
 
     points: tuple[ScannedPoint, ...]
     unplaced: tuple[UnplacedFile, ...]
-    pending_summaries: int
+    pending_files: int
     pending_diffs: int
 
     def __post_init__(self) -> None:
@@ -728,7 +762,7 @@ class SnapshotSeries:
         return {
             'points': [point.to_wire() for point in self.points],
             'unplaced': [file.to_wire() for file in self.unplaced],
-            'pending': {'summaries': self.pending_summaries, 'diffs': self.pending_diffs},
+            'pending': {'files': self.pending_files, 'diffs': self.pending_diffs},
         }
 
 
@@ -821,11 +855,11 @@ def snapshot_datum(
     if scan is None:
         return unknown_datum(f'the snapshot scan of {project_id} failed: {stored.failure}', freshness_bound_seconds)
     series = scan.series
-    if not (series.points or series.unplaced or series.pending_summaries):
+    if not (series.points or series.unplaced or series.pending_files):
         return unknown_datum(_no_snapshot_reason(scan), freshness_bound_seconds)
     stale = _newer_failure(stored, scan)
-    if stale is None and series.pending_summaries:
-        stale = f'{series.pending_summaries} snapshot files not yet summarised'
+    if stale is None and series.pending_files:
+        stale = f'{series.pending_files} snapshot files not yet summarised or placed'
     if stale is not None:
         return Datum(series, scan.scanned_at, DatumState.STALE, stale, freshness_bound_seconds)
     return aged_at(Datum(series, scan.scanned_at, DatumState.FRESH, None, freshness_bound_seconds), now)

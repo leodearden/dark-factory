@@ -1312,8 +1312,21 @@ def _cell_text(value: _CellValue) -> str:
     return str(value)
 
 
+_SummaryColumn = tuple[str, str, Callable[[_Records], _CellValue]]
+
+#: Each heuristic-14 column's slug and the line mark it counts files at.
+_H14_COLUMN_MARKS: Mapping[str, int] = {
+    'files_at_soft_ceiling': H14_SOFT_CEILING_LINES,
+    'files_at_alarm': H14_ALARM_LINES,
+}
+
+
+def _h14_column(slug: str, mark: int) -> _SummaryColumn:
+    return slug, f'files >= {mark} lines', _sum_over(None, lambda record: record['lines'] >= mark)
+
+
 #: Every column after member and pseudo, as (slug, header, aggregator over file records).
-_SUMMARY_COLUMNS: tuple[tuple[str, str, Callable[[_Records], _CellValue]], ...] = (
+_SUMMARY_COLUMNS: tuple[_SummaryColumn, ...] = (
     ('src_files', 'src files', _sum_over(_SRC, lambda record: 1)),
     ('src_lines', 'src lines', _sum_over(_SRC, lambda record: record['lines'])),
     ('src_prose_lines', 'src prose lines', _sum_over(_SRC, lambda record: record['prose_lines'])),
@@ -1321,16 +1334,7 @@ _SUMMARY_COLUMNS: tuple[tuple[str, str, Callable[[_Records], _CellValue]], ...] 
     ('tests_files', 'tests files', _sum_over(_TESTS, lambda record: 1)),
     ('tests_lines', 'tests lines', _sum_over(_TESTS, lambda record: record['lines'])),
     ('tests_cognitive_total', 'tests cognitive total', _sum_over(_TESTS, lambda record: record['cognitive_total'])),
-    (
-        'files_at_soft_ceiling',
-        f'files >= {H14_SOFT_CEILING_LINES} lines',
-        _sum_over(None, lambda record: record['lines'] >= H14_SOFT_CEILING_LINES),
-    ),
-    (
-        'files_at_alarm',
-        f'files >= {H14_ALARM_LINES} lines',
-        _sum_over(None, lambda record: record['lines'] >= H14_ALARM_LINES),
-    ),
+    *(_h14_column(slug, mark) for slug, mark in _H14_COLUMN_MARKS.items()),
     ('function_local_imports', 'function-local imports', _sum_over(_SRC, lambda record: record['function_local_imports'])),
     ('reexport_names', 're-export names', _sum_over(_SRC, lambda record: len(record['reexport_names']))),
     ('reach_back_imports', 'reach-back imports', _sum_over(_SRC, lambda record: record['reach_back_imports'])),
@@ -1433,6 +1437,7 @@ def summary_json(snapshot: Mapping[str, Any]) -> dict[str, Any]:
             for name, pseudo, values in _member_rows(snapshot)
         ],
         'domain': {'cells': _json_cells(_row_values(list(snapshot['files'].values())))},
+        'h14_marks': dict(_H14_COLUMN_MARKS),
         'import_graph': _graph_counts(snapshot),
     }
 

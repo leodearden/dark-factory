@@ -537,7 +537,7 @@ def _same_commit_scan(path: Path) -> RootScan:
             write_snapshot(path / f'{point_id}.json', doc), point_id=point_id, baseline=baseline,
             committed_at=committed_at, previous=points[-1] if points else None,
         ))
-    return RootScan(points=tuple(points), unplaced=(), new_diffs={}, pending_summaries=0,
+    return RootScan(points=tuple(points), unplaced=(), new_diffs={}, pending_files=0,
                     pending_diffs=0, baseline_home=path, nightly_home=path)
 
 

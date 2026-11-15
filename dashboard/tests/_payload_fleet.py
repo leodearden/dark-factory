@@ -910,7 +910,7 @@ def _snapshot_scan(
     diff = ComputedDiff(DiffState.READY, text('params differ:', shape.snapshot_diff_chars), None)
     return RootScan(
         points=(baseline, nightly), unplaced=(), new_diffs={nightly.diff.pair_key: diff},
-        pending_summaries=0, pending_diffs=0, baseline_home=root / BASELINE_HOME, nightly_home=nightly_home,
+        pending_files=0, pending_diffs=0, baseline_home=root / BASELINE_HOME, nightly_home=nightly_home,
     )
 
 

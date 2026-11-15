@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -182,6 +183,19 @@ class TestSummarise:
         assert summary.cycles.cycles == len(DEFAULT_GRAPH['cycles'])
         assert summary.deferred_imports == len(DEFAULT_GRAPH['deferred'])
 
+    def test_the_h14_marks_are_the_ones_the_instrument_counted_at_not_the_recorded_params(
+        self, tmp_path: Path
+    ) -> None:
+        recorded = {**default_params(3), 'h14_soft_ceiling_lines': 1000, 'h14_alarm_lines': 1200}
+        path = write_snapshot(tmp_path / 'p.json', snapshot_doc(3, as_of_sha=SHA_1, run_id='r1', params=recorded))
+        summary = summarise(path)
+        expected = _domain_figures()
+
+        assert (summary.h14.soft_ceiling_lines, summary.h14.alarm_lines) == (1500, 2000)
+        assert (summary.h14.at_soft_ceiling, summary.h14.at_alarm) == (
+            expected['at_soft_ceiling'], expected['at_alarm'],
+        )
+
     @pytest.mark.parametrize('schema', [2, 3])
     def test_the_cycle_sets_a_schema_records(self, tmp_path: Path, schema: int) -> None:
         summary = _summary(tmp_path, schema)
@@ -283,12 +297,21 @@ class TestCommitTime:
 # scan_root: one root's scan on a worker thread, cached by file state, digest and identity pair.
 
 _COUNTING_INSTRUMENT = """\
+import os
 import pathlib
 import subprocess
 import sys
 
-with open(pathlib.Path(__file__).with_name('calls.log'), 'a', encoding='utf-8') as log:
+here = pathlib.Path(__file__)
+with open(here.with_name('calls.log'), 'a', encoding='utf-8') as log:
     log.write(sys.argv[1] + '\\n')
+interrupt = here.with_name('interrupt.next')
+if interrupt.exists() and interrupt.read_text(encoding='utf-8').split()[0] == sys.argv[1]:
+    code = int(interrupt.read_text(encoding='utf-8').split()[1])
+    interrupt.unlink()
+    if code < 0:
+        os.kill(os.getpid(), -code)
+    sys.exit(code)
 sys.exit(subprocess.call([sys.executable, {real!r}, *sys.argv[1:]]))
 """
 
@@ -309,6 +332,11 @@ class Scene:
     @property
     def home(self) -> Path:
         return self.nightly / 'dark_factory'
+
+    def interrupt_next(self, mode: str, exit_code: int) -> None:
+        """End the next run of *mode* (--summary or --current) with *exit_code*; a negative one is
+        that signal, as subprocess reports a signalled child."""
+        self.instrument.with_name('interrupt.next').write_text(f'{mode} {exit_code}', encoding='utf-8')
 
     def calls(self) -> list[str]:
         """The instrument modes run since the last call (--summary or --current)."""
@@ -373,7 +401,7 @@ class TestScanRoot:
             assert point.diff.previous_id == previous.point_id
             assert point.diff.pair_key is not None
             assert scan.new_diffs[point.diff.pair_key].text == diff_text(point.file, previous.file)
-        assert (scan.unplaced, scan.pending_summaries, scan.pending_diffs) == ((), 0, 0)
+        assert (scan.unplaced, scan.pending_files, scan.pending_diffs) == ((), 0, 0)
         assert sorted(scene.calls()) == ['--current', '--current', '--summary', '--summary', '--summary']
 
     def test_a_warm_scan_recomputes_nothing(self, scene: Scene) -> None:
@@ -432,10 +460,45 @@ class TestScanRoot:
         assert unknown_sha in reasons[f'{unknown_sha}.json']
         assert len(scan.points) == 3
 
+    @pytest.mark.parametrize('exit_code', [-signal.SIGKILL, 1], ids=['killed', 'crashed'])
+    def test_an_interrupted_summary_is_pending_and_retried_next_scan(self, scene: Scene, exit_code: int) -> None:
+        scene.interrupt_next('--summary', exit_code)
+        first = scene.scan()
+
+        assert (len(first.points), first.unplaced, first.pending_files) == (2, (), 1)
+
+        second = scene.scan(SnapshotCache.from_scan(first))
+
+        assert [point.summary.as_of_sha for point in second.points] == list(scene.shas)
+        assert (second.unplaced, second.pending_files) == ((), 0)
+
+    @pytest.mark.parametrize('exit_code', [-signal.SIGKILL, 1], ids=['killed', 'crashed'])
+    def test_an_interrupted_diff_is_pending_and_retried_next_scan(self, scene: Scene, exit_code: int) -> None:
+        scene.interrupt_next('--current', exit_code)
+        first = scene.scan()
+
+        assert [point.diff.state for point in first.points] == [DiffState.FIRST, DiffState.READY, DiffState.PENDING]
+        assert (first.pending_diffs, first.points[2].diff.pair_key in first.new_diffs) == (1, False)
+
+        second = scene.scan(SnapshotCache.from_scan(first))
+
+        assert [point.diff.state for point in second.points] == [DiffState.FIRST, DiffState.READY, DiffState.READY]
+        assert second.pending_diffs == 0
+
+    def test_a_refused_file_stays_unplaced_without_rerunning_the_instrument(self, scene: Scene) -> None:
+        (scene.home / 'foreign.json').write_text('{"instrument": "other"}', encoding='utf-8')
+        first = scene.scan()
+        scene.calls()
+
+        second = scene.scan(SnapshotCache.from_scan(first))
+
+        assert [reading.file.name for reading in second.unplaced] == ['foreign.json']
+        assert scene.calls() == []
+
     def test_a_passed_deadline_computes_nothing(self, scene: Scene) -> None:
         scan = scene.scan(deadline=time.monotonic() - 1)
 
-        assert (scan.points, scan.new_diffs, scan.pending_summaries) == ((), {}, 3)
+        assert (scan.points, scan.new_diffs, scan.pending_files) == ((), {}, 3)
         assert scene.calls() == []
 
     def test_a_byte_identical_copy_reuses_the_summary_and_the_pair_key(self, scene: Scene) -> None:
@@ -524,13 +587,13 @@ class TestTheSnapshotDatum:
         assert attempted.isoformat() in datum.reason
         assert datum.value is not None and len(datum.value.points) == 3
 
-    async def test_pending_summaries_are_stale(self, conn: aiosqlite.Connection, scene: Scene) -> None:
+    async def test_pending_files_are_stale(self, conn: aiosqlite.Connection, scene: Scene) -> None:
         await _stored(conn, scene.scan(deadline=time.monotonic() - 1))
 
         datum = await _datum(conn)
 
         assert datum.state is DatumState.STALE
-        assert datum.reason == '3 snapshot files not yet summarised'
+        assert datum.reason == '3 snapshot files not yet summarised or placed'
 
     async def test_a_complete_scan_is_fresh_then_ages(self, conn: aiosqlite.Connection, scene: Scene) -> None:
         await _stored(conn, scene.scan())
@@ -550,7 +613,7 @@ class TestTheSnapshotDatum:
         wire = datum.to_wire()['value']
 
         assert isinstance(wire, dict) and set(wire) == {'points', 'unplaced', 'pending'}
-        assert wire['unplaced'] == [] and wire['pending'] == {'summaries': 0, 'diffs': 0}
+        assert wire['unplaced'] == [] and wire['pending'] == {'files': 0, 'diffs': 0}
         first, second = wire['points'][:2]
         assert set(first) == {
             'id', 'file', 'baseline', 'as_of_sha', 'committed_at', 'run_id', 'params', 'unknown_params',
@@ -580,7 +643,7 @@ class TestTheSnapshotDatum:
         points = scene.scan().points
 
         with pytest.raises(ValueError, match='order') as raised:
-            SnapshotSeries(points=(points[1], points[0], points[2]), unplaced=(), pending_summaries=0, pending_diffs=0)
+            SnapshotSeries(points=(points[1], points[0], points[2]), unplaced=(), pending_files=0, pending_diffs=0)
 
         assert points[0].point_id in str(raised.value) and points[1].point_id in str(raised.value)
 
