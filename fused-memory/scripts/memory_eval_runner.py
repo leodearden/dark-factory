@@ -641,7 +641,7 @@ def _produce_all(
     for producer in producers:
         failure = run_producer(
             producer, root=root, stamp=stamp, project_id=config.project_id,
-            timeout=config.producer_timeout_secs,
+            timeout=config.producer_timeout(producer.eval_id),
         )
         if failure is not None:
             failures.append(failure)
