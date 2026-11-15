@@ -190,8 +190,7 @@ def deps_verdict(
     dep is absent from BOTH, the arm skips it, except that the scheduled-deploy
     arm waits on a dep in *deferred_terminal_deps* (above).
 
-    Dependency ids are read by ``shared.task_fields.dependency_ids``, which
-    accepts dict-shaped entries, ints, strs and a CSV string.
+    Dependency ids are read by ``shared/src/shared/task_fields.py::dependency_ids``.
 
     Emits a DEBUG log when a dependency blocks dispatch, naming the dep ID
     and its current status to aid diagnosis of premature-dispatch issues.
