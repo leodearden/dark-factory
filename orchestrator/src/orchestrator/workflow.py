@@ -158,6 +158,7 @@ from orchestrator.merge_lane.landing_evidence import (
 from orchestrator.merge_lane.train_selection import select_train_members
 from orchestrator.merge_lane.types import QueuedBranch
 from orchestrator.merge_lane.unmeasured_delivery import (
+    UnmeasuredDelivery,
     diagnose_unmeasured_branch,
     find_work_on_sibling_ref,
 )
@@ -170,7 +171,7 @@ from orchestrator.plan_descope import (
     done_step_records,
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
-from orchestrator.recut_ruling import ruling_to_enforce
+from orchestrator.recut_ruling import recut_supersession, ruling_to_enforce
 from orchestrator.resume_resolution import (
     CarriedResolution,
     render_carried_resolutions,
@@ -12344,17 +12345,11 @@ class TaskWorkflow:
         return None
 
     async def _block_if_delivery_unmeasured(
-        self, check: PlanFilesTouchedResult, branch: str, *, merge_phase: bool,
+        self, finding: UnmeasuredDelivery | None, *, merge_phase: bool,
     ) -> WorkflowOutcome | None:
-        """Block with the remedy when *check*'s not-touched entries were never measured."""
+        """Block with *finding*'s remedy; None when there is no finding."""
         from orchestrator.merge_lane.worker import OutcomeKind, _emit_merge_attempt
 
-        assert self.worktree is not None
-        finding = await diagnose_unmeasured_branch(
-            check, self.worktree, task_id=self.task_id,
-        ) or await find_work_on_sibling_ref(
-            check, self.git_ops, branch=branch, task_id=self.task_id, superseded=None,
-        )
         if finding is None:
             return None
         _emit_merge_attempt(
@@ -12365,6 +12360,23 @@ class TaskWorkflow:
             merge_phase=merge_phase,
             category='plan_delivery_unmeasured',
             suggested_action=finding.suggested_action,
+        )
+
+    async def _work_on_sibling_ref(
+        self, check: PlanFilesTouchedResult, branch: str,
+    ) -> UnmeasuredDelivery | None:
+        """*check*'s work on a sibling ref no executed re-cut ruling superseded.
+
+        Reads the metadata fresh: the dispatch gate persists ``recut_executed``
+        after ``self.task`` was read, so the first incarnation after a re-cut
+        would otherwise miss it.
+        """
+        fresh = await self._merge_fresh_metadata(
+            self.task.get('metadata') or {}, log_context='sibling-ref diagnosis',
+        )
+        return await find_work_on_sibling_ref(
+            check, self.git_ops, branch=branch, task_id=self.task_id,
+            superseded=recut_supersession({'id': self.task_id, 'metadata': fresh}),
         )
 
     async def _submit_to_merge_queue(
@@ -12410,10 +12422,12 @@ class TaskWorkflow:
         # steward) is allowed to mediate, and only to drop genuinely
         # unneeded entries.  Adding new files is rejected by the helper's
         # subset check.  The gate's re-check is the source of truth for
-        # pass/fail.  A failing range is diagnosed before any not-delivered
-        # conclusion, and before narrowing, because a range that never
-        # measured the task's own work proves nothing; see
-        # merge_lane/unmeasured_delivery.py.
+        # pass/fail.  A range that never measured the task's own work proves
+        # nothing: its in-branch causes are diagnosed before the already-landed
+        # carve-out, work on a sibling ref only after that carve-out declines,
+        # and both before narrowing; a ref superseded by a re-cut ruling is
+        # never offered.  See merge_lane/unmeasured_delivery.py and
+        # recut_ruling.py::RecutSupersession.
         if (
             self._task_files
             and self._base_commit is not None
@@ -12475,7 +12489,10 @@ class TaskWorkflow:
                 narrowing_succeeded = False
                 if check.not_touched:
                     unmeasured = await self._block_if_delivery_unmeasured(
-                        check, canonical_branch, merge_phase=merge_phase,
+                        await diagnose_unmeasured_branch(
+                            check, self.worktree, task_id=self.task_id,
+                        ),
+                        merge_phase=merge_phase,
                     )
                     if unmeasured is not None:
                         return unmeasured
@@ -12594,6 +12611,12 @@ class TaskWorkflow:
                             category='already_landed',
                             suggested_action='verify_landing_and_close',
                         )
+                    unmeasured = await self._block_if_delivery_unmeasured(
+                        await self._work_on_sibling_ref(check, canonical_branch),
+                        merge_phase=merge_phase,
+                    )
+                    if unmeasured is not None:
+                        return unmeasured
                     narrowed = await self._try_narrow_plan(check.not_touched)
                     exit_outcome = await self._consume_narrowing_exit_report(
                         merge_phase=merge_phase,
@@ -12617,7 +12640,12 @@ class TaskWorkflow:
                                 narrowing_succeeded = True
                             else:
                                 unmeasured = await self._block_if_delivery_unmeasured(
-                                    check, canonical_branch, merge_phase=merge_phase,
+                                    await diagnose_unmeasured_branch(
+                                        check, self.worktree, task_id=self.task_id,
+                                    ) or await self._work_on_sibling_ref(
+                                        check, canonical_branch,
+                                    ),
+                                    merge_phase=merge_phase,
                                 )
                                 if unmeasured is not None:
                                     return unmeasured
