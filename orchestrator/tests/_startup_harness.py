@@ -43,7 +43,7 @@ SYNC_STEPS = frozenset({
     '_inherit_pending_streak_alarms',
 })
 #: Table steps the fixtures run for real against their mocked services.
-UNSTUBBED_STEPS = frozenset({'1b', '2f'})
+UNSTUBBED_STEPS = frozenset({'1b', '1b-crash-loop', '2f'})
 
 _SCENE_GIT = GitConfig(
     main_branch='main', branch_prefix='task/', remote='origin',
