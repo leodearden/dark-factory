@@ -121,7 +121,7 @@ _UNION: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
             TaskStatus.MERGE_DEFERRED,
             TaskStatus.DONE,
         ),  # train workflow.py::TaskWorkflow._maybe_enqueue_group_merge (its _mark_member_done closure) / _attribute_train_failure, harness.py::build_train_callback_factory (mark_member_done / redrive_member)
-        (TaskStatus.BLOCKED, TaskStatus.DONE),  # train attribution workflow.py::TaskWorkflow._attribute_train_failure
+        (TaskStatus.BLOCKED, TaskStatus.DONE),  # train attribution workflow.py::TaskWorkflow._attribute_train_failure; harness.py::Harness._complete_held_pure_gate (DeterministicRunner pure-gate close)
         (
             TaskStatus.PENDING,
             TaskStatus.DONE,

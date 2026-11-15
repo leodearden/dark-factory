@@ -70,7 +70,13 @@ from shared.transcript_archive import (
     set_archival_failure_hook,
 )
 
-from orchestrator import cross_repo_gate, delivered_check_owner, recovery_pins, recut_ruling
+from orchestrator import (
+    cross_repo_gate,
+    delivered_check_owner,
+    pure_gate_resolution,
+    recovery_pins,
+    recut_ruling,
+)
 from orchestrator import digest as digest_mod
 from orchestrator.agent_session_reaper import (
     ReapTally,
@@ -10869,8 +10875,6 @@ class Harness:
         or a plain DONE report when the gate has been resolved (resume path).
         """
         from datetime import UTC, datetime
-        if self._escalation_queue is None:
-            raise RuntimeError('_escalation_queue must be initialised before dispatching deterministic tasks')
         # Task 2983 fix (b): dispatch-time double-dispatch guard.  The scheduler
         # can re-select a deterministic task off a STALE eligibility snapshot
         # (deterministic tasks hold no module locks and arm no requeue cooldown
@@ -10900,18 +10904,23 @@ class Harness:
                 completed_at=datetime.now(UTC).isoformat(),
                 block_reason='',
             )
-        runner = DeterministicRunner(
-            scheduler=self.scheduler,
-            escalation_queue=self._escalation_queue,
-            predicate_recheck_stall_cap=self.config.deterministic.predicate_recheck_stall_cap,
-        )
-        outcome = await runner.run(assignment)
+        outcome = await self._deterministic_runner().run(assignment)
         return TaskReport(
             task_id=assignment.task_id,
             title=assignment.task.get('title', ''),
             outcome=outcome,
             completed_at=datetime.now(UTC).isoformat(),
             block_reason='deterministic_gate' if outcome == WorkflowOutcome.BLOCKED else '',
+        )
+
+    def _deterministic_runner(self) -> DeterministicRunner:
+        """The runner shape both the deterministic slot and the pure-gate resume path use."""
+        if self._escalation_queue is None:
+            raise RuntimeError('_escalation_queue must be initialised before dispatching deterministic tasks')
+        return DeterministicRunner(
+            scheduler=self.scheduler,
+            escalation_queue=self._escalation_queue,
+            predicate_recheck_stall_cap=self.config.deterministic.predicate_recheck_stall_cap,
         )
 
     async def _find_prior_auto_eval_redos(self, original_id: str) -> list[str]:
@@ -18137,6 +18146,32 @@ class Harness:
             task_id, escalation_id, reason,
         )
 
+    async def _complete_held_pure_gate(self, task_id: str, row: dict, escalation) -> bool:
+        """Run a resolved held pure gate now; False leaves the caller to re-pend it.
+
+        Any exception falls back to the re-pend, so the worst case is the old
+        wait for a dispatch slot (task 3638).
+        """
+        try:
+            outcome = await pure_gate_resolution.resume_resolved_pure_gate(
+                self.scheduler, self._deterministic_runner(), task_id, row,
+                now=datetime.now(UTC),
+            )
+        except Exception:
+            logger.warning(
+                'cascade-unblock: inline pure-gate run for task %s via %s raised — '
+                'falling back to the re-pend',
+                task_id, escalation.id, exc_info=True,
+            )
+            return False
+        if outcome is None:
+            return False
+        logger.info(
+            'cascade-unblock: pure gate %s ran at resolution of %s — outcome %s',
+            task_id, escalation.id, outcome,
+        )
+        return True
+
     async def _cascade_unblock_member(self, escalation) -> None:
         """Async helper: re-pend a resolution-resumed task to Table B's target.
 
@@ -18193,6 +18228,9 @@ class Harness:
         Any ``granted_files`` scope grant is delivered BEFORE this method runs,
         by :meth:`_deliver_resume_resolution`, whatever this method then
         decides about the flip — see :meth:`_fold_granted_files`.
+
+        A held deterministic pure gate that passes every gate below is run
+        inline instead of re-pended — see :meth:`_complete_held_pure_gate`.
 
         TOCTOU note: these are separate MCP round-trips with no atomic
         compare-and-set, so the window cannot be closed — only narrowed. It is
@@ -18409,6 +18447,9 @@ class Harness:
                 task_id, _late_status, _late.get('claimant_run_id'), status,
                 _resume_target, escalation.resolved_by,
             )
+            return
+
+        if await self._complete_held_pure_gate(task_id, _late, escalation):
             return
 
         try:
