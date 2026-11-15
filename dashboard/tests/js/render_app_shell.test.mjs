@@ -12,6 +12,7 @@ import {
   assertSiblingRenders,
   click,
   failureNotices,
+  graphNode,
   mountInsideBoundary,
   noticeLines,
   openContainingWindow,
@@ -211,7 +212,7 @@ function recordOnDemandKeys(loader) {
 
 // One running orchestrator and project, holding one in-progress task whose
 // rows Datum records being read, and a receipt for every polled endpoint, so
-// every reader gets past its not-yet-fetched guard.
+// every reader gets past its not-yet-fetched guard. Returns the task.
 function seedReadSetPage(window, recorder) {
   const task = taskRow({ project: PROJECT, agent: 'impl' });
   const entry = tasksSnapshotEntry([task], taskCensus({ [task.status]: 1 }, window.DF_TASK_VOCAB));
@@ -229,31 +230,66 @@ function seedReadSetPage(window, recorder) {
     TASKS_SNAPSHOT: { [PROJECT]: entry },
     __receipt: receiptsFor(window.DF_DATA_LOADER, everyPolledKey(window.DF_DATA_LOADER)),
   });
+  return task;
 }
 
+// The Tasks detail pane renders only once a task is selected. The project is
+// listed flat through its own toggle, so the rail click before this still
+// measured the default By-PRD render.
+function openTaskDetail(window, root, task) {
+  const listToggle = [...root.querySelectorAll('.body .seg button')].find(button => button.textContent === 'list');
+  assert.ok(listToggle, 'the Tasks tab offers no "list" toggle');
+  click(window, listToggle);
+  const node = graphNode(root, task);
+  assert.ok(node, 'the seeded task never reached the Tasks graph, so it cannot be selected');
+  click(window, node);
+  const sub = root.querySelector('.task-detail')?.querySelector('.sub');
+  assert.ok(
+    sub?.textContent.includes(window.DF_SHELL.taskId(task.id)),
+    'the Tasks detail pane did not open on the seeded task, so its readers go unmeasured',
+  );
+}
+
+// Views a tab renders only behind a click, by tab id: each action opens its
+// view on the open tab, and what that view reads counts as the tab's.
+const DEEPER_VIEWS = {
+  tasks: openTaskDetail,
+};
+
 // What each tab the rail opens reads, by tab id, with the window it was
-// announced at: Overview while the page mounts, every other tab while its rail
-// button is clicked. Keys read at load count on every tab.
+// announced at. Overview is measured while the page mounts, every other tab
+// while its rail button is clicked, plus whatever DEEPER_VIEWS opens on it.
+// Keys read at load count on every tab.
 function measureEveryTab() {
   const recorder = readRecorder();
   const harness = buildDashboardWindow({ beforeScripts: recorder.beforeScripts });
   try {
     const { window } = harness;
     recorder.loaded();
-    seedReadSetPage(window, recorder);
+    const task = seedReadSetPage(window, recorder);
     const onDemand = recordOnDemandKeys(window.DF_DATA_LOADER);
     const calls = recordPollCalls(window);
     const tabs = new Map();
-    const measure = action => {
+    let root;
+    const readsDuring = action => {
       const before = calls.length;
       const reads = recorder.during(action);
-      const announced = scopeCalls(calls.slice(before));
+      return { reads, announced: scopeCalls(calls.slice(before)) };
+    };
+    const measure = action => {
+      const { reads, announced } = readsDuring(action);
       assert.equal(announced.length, 1, `one rail action must announce one tab: ${JSON.stringify(announced)}`);
       const [{ scope: tab, win }] = announced;
-      const keys = [...recorder.atLoad.keys, ...reads.keys].filter(key => !onDemand.has(key));
-      tabs.set(tab, { win, keys: new Set(keys), rows: reads.rows });
+      const views = [reads];
+      const openDeeperView = DEEPER_VIEWS[tab];
+      if (openDeeperView) {
+        const deeper = readsDuring(() => openDeeperView(window, root, task));
+        assert.deepEqual(deeper.announced, [], `opening a view on tab ${tab} announced a tab`);
+        views.push(deeper.reads);
+      }
+      const keys = [...recorder.atLoad.keys, ...views.flatMap(view => [...view.keys])].filter(key => !onDemand.has(key));
+      tabs.set(tab, { win, keys: new Set(keys), rows: views.some(view => view.rows) });
     };
-    let root;
     measure(() => {
       root = harness.mountPage();
     });
@@ -332,7 +368,8 @@ test('every CHROME_ENDPOINTS path is read on every tab', () => {
 
 // Reads the measurement must see, as literals: a non-vacuity floor, not the
 // contract. orch's Locks cells read SCHEDULER and overview's live feed reads
-// MERGE_QUEUE; both were missing from TAB_ENDPOINTS until found by hand.
+// MERGE_QUEUE; both were missing from TAB_ENDPOINTS until found by hand. The
+// Tasks detail pane's Module locks read SCHEDULER.
 const CHROME_KEY_FLOOR = [
   'TASKS_SNAPSHOT', 'MERGE_QUEUE', 'MEMORY_STATUS', 'ORCHESTRATORS', 'RECON_STATE', 'ESCALATIONS', 'COSTS', 'PROJECTS', 'AGENTS',
 ];
@@ -340,7 +377,7 @@ const DASH = '/api/v2/dashboard';
 const TAB_READ_FLOOR = {
   orch: { paths: [`${DASH}/scheduler`], rows: true },
   overview: { paths: [`${DASH}/merge-queue`], rows: false },
-  tasks: { paths: [`${DASH}/tasks`, `${DASH}/invariants`, `${DASH}/prds`], rows: true },
+  tasks: { paths: [`${DASH}/tasks`, `${DASH}/invariants`, `${DASH}/prds`, `${DASH}/scheduler`], rows: true },
 };
 
 test('the measured read sets hold what was found by hand', () => {

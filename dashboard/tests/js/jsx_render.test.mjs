@@ -19,6 +19,7 @@ import {
   assertSiblingRenders,
   click,
   failureNotices,
+  graphNode,
   mountInsideBoundary,
   noticeLines,
   openContainingWindow,
@@ -83,10 +84,6 @@ function seedOneTask(window, task) {
 function orchTaskRow(window, container, task) {
   const idText = window.DF_SHELL.taskId(task.id);
   return [...container.querySelectorAll('tbody tr')].find(tr => tr.querySelector('td')?.textContent === idText);
-}
-
-function graphNode(container, task) {
-  return [...container.querySelectorAll('.node')].find(node => node.querySelector('.ttl')?.textContent === task.title);
 }
 
 // By PRD is the Tasks tab's default view, and it draws no graph until a lanes

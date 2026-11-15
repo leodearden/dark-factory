@@ -1,9 +1,9 @@
 // Plumbing shared by the jsdom render suites (jsx_render.test.mjs,
 // jsx_render_quality.test.mjs, render_app_shell.test.mjs): opening a dashboard
 // window that must stay console.error-free, or one whose contained throws the
-// test checks itself; clicking, and switching the page's tab from its rail;
-// mounting a child inside a RenderFailureBoundary and reading render-failure
-// notices; letting React's async act() run; and
+// test checks itself; clicking, switching the page's tab from its rail, and
+// finding a task's graph node; mounting a child inside a RenderFailureBoundary
+// and reading render-failure notices; letting React's async act() run; and
 // answering on-demand fetches by url.
 import assert from 'node:assert/strict';
 
@@ -104,6 +104,11 @@ export function railButton(root, label) {
 // `page` is a harness plus the #root its mountPage() returned, as `root`.
 export function openTab(page, label) {
   click(page.window, railButton(page.root, label));
+}
+
+// The Tasks tab's graph node for `task`, found by its title.
+export function graphNode(container, task) {
+  return [...container.querySelectorAll('.node')].find(node => node.querySelector('.ttl')?.textContent === task.title);
 }
 
 export const UNIT_NOTICE_TESTID = 'unit-render-failure-banner';
