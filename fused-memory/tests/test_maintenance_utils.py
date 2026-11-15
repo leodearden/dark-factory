@@ -282,12 +282,10 @@ class TestServiceOpen:
 
         calls: list[str] = []
         service = _recording_service(calls)
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
 
-        with (
-            patch('fused_memory.maintenance._utils.FusedMemoryConfig', return_value=MagicMock()),
-            patch('fused_memory.services.memory_service.MemoryService', return_value=service),
-        ):
-            async with maintenance_service():
+        with patch('fused_memory.services.memory_service.MemoryService', return_value=service):
+            async with maintenance_service(config=config):
                 assert calls == ['initialize']
 
         service.initialize.assert_awaited_once_with()
@@ -299,12 +297,10 @@ class TestServiceOpen:
 
         calls: list[str] = []
         service = _recording_service(calls)
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
 
-        with (
-            patch('fused_memory.maintenance._utils.FusedMemoryConfig', return_value=MagicMock()),
-            patch('fused_memory.services.memory_service.MemoryService', return_value=service),
-        ):
-            async with maintenance_service(open_as=ServiceOpen.READS):
+        with patch('fused_memory.services.memory_service.MemoryService', return_value=service):
+            async with maintenance_service(config=config, open_as=ServiceOpen.READS):
                 assert calls == ['initialize_for_reads']
 
         service.initialize_for_reads.assert_awaited_once_with()

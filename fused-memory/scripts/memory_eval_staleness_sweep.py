@@ -2326,12 +2326,10 @@ async def _run(args: argparse.Namespace) -> int:
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
-    # Imported function-locally (D8). The config is read as a MODULE
-    # ATTRIBUTE, and the read-only service double is installed on
-    # fused_memory.services.memory_service.MemoryService, which
-    # maintenance_service looks up at call time: those are the seams the tests
-    # patch, so the guarantee is testable end to end without a test-only hook
-    # in this script.
+    # Imported function-locally (D8): the config is read as a MODULE ATTRIBUTE
+    # and the service comes from maintenance_service, the seams the read-only
+    # double patches, so the guarantee is testable end to end without a
+    # test-only hook in this script.
     import fused_memory.config.schema as _schema  # noqa: PLC0415
     from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
 

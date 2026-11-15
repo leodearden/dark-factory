@@ -1,4 +1,16 @@
-"""Private maintenance utilities."""
+"""The service factory every operator entry point opens its store through.
+
+:func:`maintenance_service`, opened as a :class:`ServiceOpen` mode, constructs,
+opens and closes the one MemoryService an operator run uses. Its callers are
+the scripts under ``fused-memory/scripts/`` and the repo-root ``scripts/``,
+which ``tests/test_operator_service_construction_guard.py`` holds to it, and
+the maintenance CLIs beside this module. :func:`override_config_path` scopes the
+CONFIG_PATH a config is built under.
+
+The module name's leading underscore does not make this package-private:
+callers outside the package import from here, so changing a signature here
+changes every operator script.
+"""
 
 from __future__ import annotations
 
@@ -105,12 +117,27 @@ async def maintenance_service(
     The class is looked up on ``fused_memory.services.memory_service`` at call
     time, which is the seam tests replace it on.
 
+    A caller that turns a failed opening into its own error maps the entry
+    alone, never the body. Enter the factory on a ``contextlib.AsyncExitStack``
+    and wrap only ``stack.enter_async_context(...)`` in the ``try``, as the
+    second example shows. A ``try`` around the whole ``async with`` would also
+    map every error the run raises, attributing a body failure to the store
+    (``shared/src/shared/cli_boundary.py::run_cli`` states the same rule at the
+    process boundary).
+
     Yields:
         ``(config, service)``, with the service already opened.
 
-    Example::
+    Examples::
 
         async with maintenance_service(config=config, open_as=ServiceOpen.READS) as (_, memory):
+            report = await run(memory)
+
+        async with contextlib.AsyncExitStack() as stack:
+            try:
+                _, memory = await stack.enter_async_context(maintenance_service(config=config))
+            except OSError as exc:
+                raise StoreUnavailable(f'the memory store could not be opened: {exc}') from exc
             report = await run(memory)
     """
     open_as = ServiceOpen(open_as)
