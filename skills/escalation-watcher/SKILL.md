@@ -2746,15 +2746,31 @@ promoted L2 carries that value, never the `orchestrator-`-prefixed form. Seeing
 **Do not stand down, halt the watch loop, or treat it as an anomaly** — it is the same auto-watcher
 this skill hands L1 items off to, working as designed.
 
-Distinguish it from a **genuinely unknown resolver**: the same connection is capped at
-`X-Escalation-Levels: 0,1`, so the server rejects (`level_forbidden`, no state change) any attempt
-by that identity to `resolve_issue`/`park` a level-2 escalation. If you ever see
-`resolved_by="orchestrator-escalation-watcher-auto"` (or `agent_role="escalation-watcher-auto"`) on
-an L2 record's *own* resolution/park — as opposed to an L1 member cascade-resolved via
-`resolved_by='l2-cascade:<id>'`, or an L1/L0 admin item, or a `promote_to_l2` call — that should not
-be possible under the enforced guard, and is the actual anomaly worth reporting to the human
-(possible guard regression, bypassed connection headers, or a stale pre-guard orchestrator/server
-pair that hasn't been restarted onto the fix yet).
+Distinguish it from a **genuinely unknown resolver**. The same connection is capped at
+`X-Escalation-Levels: 0,1` (`escalation/src/escalation/authority.py::ROLE_LEVEL_ALLOWLIST`), with
+exactly one sanctioned exception above that ceiling: `resolve_issue(action='close_only')` on an L2,
+the task-2630 carve-out whose authority is `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_ACTION`
+and `escalation/src/escalation/authority.py::l2_auto_close_class`. The classes it admits and the
+evidence each must quote are in `skills/escalation-watcher-auto/SKILL.md` §"Auto-closing a
+rubber-stamp L2". So `resolved_by="orchestrator-escalation-watcher-auto"` on an L2's own
+`close_only` (normally `resolution_class=benign`, with the class's evidence quoted in the
+resolution) is expected, rare, and **not** an anomaly: do not report it to the human as a guard
+regression.
+
+The anomaly worth reporting to the human is either of these on an L2 record's *own* resolution,
+as opposed to an L1 member cascade-resolved via `resolved_by='l2-cascade:<id>'`, an L1/L0 admin
+item, or a `promote_to_l2` call:
+
+- **Any other action by that identity** — `resume`, `restart`, `park` or `abandon`. The server
+  still rejects all four at L2 as `level_forbidden` with no state change, so one that landed should
+  not have.
+- **A `close_only` by that identity on a denylisted record** — its category is in
+  `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES`, or its `agent_role` is in
+  `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_ROLES`. Those are the human-judgment
+  gates the denylist exists to protect, and the server checks it before the allowlist.
+
+Possible causes: a guard regression, bypassed connection headers, or a stale pre-guard
+orchestrator/server pair that hasn't been restarted onto the fix yet.
 
 **Capped identity leaking into an interactive session:** if this session's own L2
 `resolve_issue`/`park` fails `level_forbidden`, the capped identity
