@@ -5,59 +5,44 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import shutil
-import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from _workflow_helpers import _init_repo
+from _dispatch_base_scene import (
+    GREET_FILE,
+    FailFirst,
+    commit_file,
+    git_stdout,
+    greeting,
+    has_merge_head,
+    is_ancestor,
+    make_repo,
+)
+from _workflow_helpers import _make_git_ops
 
-from orchestrator.config import GitConfig
 from orchestrator.dispatch_base import (
     BaseConflict,
     IntegrationRefusal,
     MergerDisposition,
     Settlement,
+    WorktreeState,
     find_base_conflict,
     settle_base_conflict,
 )
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence
 
-GREET_FILE = 'lib.py'
-
-
-def _git(cwd: Path, *args: str) -> str:
-    done = subprocess.run(['git', *args], cwd=cwd, check=True, capture_output=True, text=True)
-    return done.stdout.strip()
-
-
-def _commit_file(cwd: Path, name: str, content: str, message: str) -> str:
-    (cwd / name).write_text(content)
-    _git(cwd, 'add', name)
-    _git(cwd, 'commit', '-m', message)
-    return _git(cwd, 'rev-parse', 'HEAD')
-
-
-def _greeting(word: str) -> str:
-    return f'def greet(name: str) -> str:\n    return f"{word}, {{name}}"\n'
-
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    path = tmp_path / 'repo'
-    path.mkdir()
-    _init_repo(path)
-    return path
+    return make_repo(tmp_path)
 
 
 @pytest.fixture
 def git_ops(repo: Path) -> GitOps:
-    return GitOps(
-        GitConfig(main_branch='main', branch_prefix='task/', remote='origin', worktree_dir='.worktrees'),
-        repo,
-    )
+    return _make_git_ops(repo)
 
 
 @pytest_asyncio.fixture
@@ -66,8 +51,8 @@ async def worktree(git_ops: GitOps) -> Path:
 
 
 async def _conflicting_scene(repo: Path, worktree: Path) -> None:
-    _commit_file(worktree, GREET_FILE, _greeting('Hi'), 'task: greet with Hi')
-    _commit_file(repo, GREET_FILE, _greeting('Hey'), 'main: greet with Hey')
+    commit_file(worktree, GREET_FILE, greeting('Hi'), 'task: greet with Hi')
+    commit_file(repo, GREET_FILE, greeting('Hey'), 'main: greet with Hey')
 
 
 @pytest.mark.asyncio
@@ -78,18 +63,18 @@ class TestFindBaseConflict:
         conflict = await find_base_conflict(git_ops, worktree)
 
         assert conflict is not None
-        assert conflict.main_sha == _git(repo, 'rev-parse', 'main')
-        assert conflict.head_sha == _git(worktree, 'rev-parse', 'HEAD')
+        assert conflict.main_sha == git_stdout(repo, 'rev-parse', 'main')
+        assert conflict.head_sha == git_stdout(worktree, 'rev-parse', 'HEAD')
         assert conflict.conflicted_paths == (GREET_FILE,)
 
     async def test_branch_behind_main_on_another_file_is_clean(self, repo, git_ops, worktree):
-        _commit_file(worktree, 'notes.txt', 'task notes\n', 'task: notes')
-        _commit_file(repo, GREET_FILE, _greeting('Hey'), 'main: greet with Hey')
+        commit_file(worktree, 'notes.txt', 'task notes\n', 'task: notes')
+        commit_file(repo, GREET_FILE, greeting('Hey'), 'main: greet with Hey')
 
         assert await find_base_conflict(git_ops, worktree) is None
 
     async def test_branch_without_own_commits_is_clean(self, repo, git_ops, worktree):
-        _commit_file(repo, GREET_FILE, _greeting('Hey'), 'main: greet with Hey')
+        commit_file(repo, GREET_FILE, greeting('Hey'), 'main: greet with Hey')
 
         assert await find_base_conflict(git_ops, worktree) is None
 
@@ -116,7 +101,7 @@ def test_base_conflict_is_frozen(field_name):
 
 
 BRANCH = 'task/42'
-RESOLVED_GREETING = _greeting('Hello there')
+RESOLVED_GREETING = greeting('Hello there')
 
 
 class RecordingMerger:
@@ -136,8 +121,8 @@ class RecordingMerger:
 def _resolve_and_conclude(worktree: Path) -> Callable[[], None]:
     def act() -> None:
         (worktree / GREET_FILE).write_text(RESOLVED_GREETING)
-        _git(worktree, 'add', GREET_FILE)
-        _git(worktree, 'commit', '--no-edit')
+        git_stdout(worktree, 'add', GREET_FILE)
+        git_stdout(worktree, 'commit', '--no-edit')
     return act
 
 
@@ -147,16 +132,30 @@ def _do_nothing() -> None:
 
 def _squash_without_main(worktree: Path) -> Callable[[], None]:
     def act() -> None:
-        _git(worktree, 'merge', '--abort')
-        _commit_file(worktree, GREET_FILE, RESOLVED_GREETING, 'resolve by hand')
+        git_stdout(worktree, 'merge', '--abort')
+        commit_file(worktree, GREET_FILE, RESOLVED_GREETING, 'resolve by hand')
     return act
 
 
 def _rewrite_to_main(worktree: Path) -> Callable[[], None]:
     def act() -> None:
-        _git(worktree, 'merge', '--abort')
-        _git(worktree, 'reset', '--hard', 'main')
+        git_stdout(worktree, 'merge', '--abort')
+        git_stdout(worktree, 'reset', '--hard', 'main')
     return act
+
+
+def _lock_index_then_decline(worktree: Path) -> Callable[[], None]:
+    def act() -> None:
+        (Path(git_stdout(worktree, 'rev-parse', '--absolute-git-dir')) / 'index.lock').touch()
+    return act
+
+
+def _refuse_merge_commits(worktree: Path) -> None:
+    hooks = Path(git_stdout(worktree, 'rev-parse', '--git-path', 'hooks'))
+    hook = (hooks if hooks.is_absolute() else worktree / hooks) / 'pre-merge-commit'
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/bin/sh\necho 'hook says no' >&2\nexit 1\n")
+    hook.chmod(0o755)
 
 
 def _raise_sandbox_unavailable() -> None:
@@ -174,20 +173,8 @@ RESOLVED = MergerDisposition(resolved=True, reason='')
 DECLINED = MergerDisposition(resolved=False, reason='needs judgement')
 
 
-def _has_merge_head(worktree: Path) -> bool:
-    probe = subprocess.run(
-        ['git', 'rev-parse', '-q', '--verify', 'MERGE_HEAD'], cwd=worktree, capture_output=True,
-    )
-    return probe.returncode == 0
-
-
-def _is_ancestor(cwd: Path, ancestor: str, descendant: str) -> bool:
-    probe = subprocess.run(['git', 'merge-base', '--is-ancestor', ancestor, descendant], cwd=cwd)
-    return probe.returncode == 0
-
-
 def _head(worktree: Path) -> str:
-    return _git(worktree, 'rev-parse', 'HEAD')
+    return git_stdout(worktree, 'rev-parse', 'HEAD')
 
 
 async def _conflict(repo: Path, git_ops: GitOps, worktree: Path) -> BaseConflict:
@@ -198,10 +185,10 @@ async def _conflict(repo: Path, git_ops: GitOps, worktree: Path) -> BaseConflict
 
 
 async def _assert_task_side_restored(git_ops: GitOps, worktree: Path, conflict: BaseConflict) -> None:
-    assert not _has_merge_head(worktree)
+    assert not has_merge_head(worktree)
     assert await git_ops.unmerged_paths(worktree) == ()
     assert _head(worktree) == conflict.head_sha
-    assert (worktree / GREET_FILE).read_text() == _greeting('Hi')
+    assert (worktree / GREET_FILE).read_text() == greeting('Hi')
 
 
 @pytest.mark.asyncio
@@ -220,10 +207,10 @@ class TestSettleBaseConflict:
         assert settlement.settled is True
         assert settlement.refusals == ()
         head = _head(worktree)
-        assert _is_ancestor(worktree, conflict.main_sha, head)
-        assert _is_ancestor(worktree, conflict.head_sha, head)
-        assert len(_git(worktree, 'log', '-1', '--format=%P').split()) == 2
-        assert _git(worktree, 'log', '-1', '--format=%s') == f'Merge main into {BRANCH}'
+        assert is_ancestor(worktree, conflict.main_sha, head)
+        assert is_ancestor(worktree, conflict.head_sha, head)
+        assert len(git_stdout(worktree, 'log', '-1', '--format=%P').split()) == 2
+        assert git_stdout(worktree, 'log', '-1', '--format=%s') == f'Merge main into {BRANCH}'
         [brief] = merger.briefs
         assert GREET_FILE in brief
         assert conflict.main_sha in brief
@@ -235,10 +222,52 @@ class TestSettleBaseConflict:
 
         settlement = await self._settle(git_ops, worktree, conflict, merger)
 
-        assert settlement.refusals == (IntegrationRefusal.MERGER_DECLINED,)
+        assert settlement.refusals == (
+            IntegrationRefusal.MERGER_DECLINED, IntegrationRefusal.MAIN_NOT_INTEGRATED,
+        )
+        assert settlement.declined_by_merger is True
         assert _head(worktree) == conflict.head_sha
-        assert not _has_merge_head(worktree)
+        assert not has_merge_head(worktree)
+        assert settlement.left == WorktreeState(head=conflict.head_sha, merge_open=False)
         assert 'needs judgement' in settlement.block_reason()
+
+    async def test_merger_that_concludes_then_declines_is_reported_at_its_new_head(
+        self, repo, git_ops, worktree,
+    ):
+        conflict = await _conflict(repo, git_ops, worktree)
+        merger = RecordingMerger(_resolve_and_conclude(worktree), DECLINED)
+
+        settlement = await self._settle(git_ops, worktree, conflict, merger)
+
+        assert settlement.refusals == (IntegrationRefusal.MERGER_DECLINED,)
+        head = _head(worktree)
+        assert head != conflict.head_sha
+        assert settlement.left == WorktreeState(head=head, merge_open=False)
+        detail = settlement.block_detail()
+        assert head in detail
+        assert 'nothing was reset' not in detail
+
+    async def test_merger_that_rewrites_then_declines_names_the_rewrite(self, repo, git_ops, worktree):
+        conflict = await _conflict(repo, git_ops, worktree)
+        merger = RecordingMerger(_rewrite_to_main(worktree), DECLINED)
+
+        settlement = await self._settle(git_ops, worktree, conflict, merger)
+
+        assert settlement.refusals == (
+            IntegrationRefusal.MERGER_DECLINED, IntegrationRefusal.HISTORY_REWRITTEN,
+        )
+        assert settlement.left.head == conflict.main_sha
+
+    async def test_failed_abort_reports_the_merge_left_open(self, repo, git_ops, worktree):
+        conflict = await _conflict(repo, git_ops, worktree)
+        merger = RecordingMerger(_lock_index_then_decline(worktree), DECLINED)
+
+        settlement = await self._settle(git_ops, worktree, conflict, merger)
+
+        assert has_merge_head(worktree)
+        assert IntegrationRefusal.MERGE_UNCONCLUDED in settlement.refusals
+        assert settlement.left.merge_open is True
+        assert 'git merge --abort' in settlement.block_detail()
 
     async def test_unconcluded_merge_is_refused_and_aborted(self, repo, git_ops, worktree):
         conflict = await _conflict(repo, git_ops, worktree)
@@ -247,7 +276,7 @@ class TestSettleBaseConflict:
         settlement = await self._settle(git_ops, worktree, conflict, merger)
 
         assert IntegrationRefusal.MERGE_UNCONCLUDED in settlement.refusals
-        assert not _has_merge_head(worktree)
+        assert not has_merge_head(worktree)
         assert await git_ops.unmerged_paths(worktree) == ()
         assert _head(worktree) == conflict.head_sha
 
@@ -259,8 +288,8 @@ class TestSettleBaseConflict:
 
         assert IntegrationRefusal.MAIN_NOT_INTEGRATED in settlement.refusals
         head = _head(worktree)
-        assert _git(worktree, 'log', '-1', '--format=%s') == 'resolve by hand'
-        assert _git(worktree, 'rev-parse', 'HEAD~1') == conflict.head_sha
+        assert git_stdout(worktree, 'log', '-1', '--format=%s') == 'resolve by hand'
+        assert git_stdout(worktree, 'rev-parse', 'HEAD~1') == conflict.head_sha
         assert head != conflict.head_sha
 
     async def test_rewritten_history_names_the_lost_tip(self, repo, git_ops, worktree):
@@ -274,7 +303,7 @@ class TestSettleBaseConflict:
 
     async def test_detached_worktree_is_refused_untouched(self, repo, git_ops, worktree):
         conflict = await _conflict(repo, git_ops, worktree)
-        _git(worktree, 'checkout', '--detach')
+        git_stdout(worktree, 'checkout', '--detach')
         merger = RecordingMerger(_resolve_and_conclude(worktree), RESOLVED)
 
         settlement = await self._settle(git_ops, worktree, conflict, merger)
@@ -285,20 +314,55 @@ class TestSettleBaseConflict:
 
     async def test_merge_git_refuses_to_start_keeps_local_edit(self, repo, git_ops, worktree):
         conflict = await _conflict(repo, git_ops, worktree)
-        local_edit = _greeting('Uncommitted')
+        local_edit = greeting('Uncommitted')
         (worktree / GREET_FILE).write_text(local_edit)
         merger = RecordingMerger(_resolve_and_conclude(worktree), RESOLVED)
 
         settlement = await self._settle(git_ops, worktree, conflict, merger)
 
-        assert settlement.refusals == (IntegrationRefusal.MERGE_NOT_STARTED,)
+        assert settlement.refusals == (
+            IntegrationRefusal.MERGE_FAILED_WITHOUT_CONFLICTS, IntegrationRefusal.MAIN_NOT_INTEGRATED,
+        )
+        assert settlement.git_output
         assert merger.briefs == []
         assert (worktree / GREET_FILE).read_text() == local_edit
         assert _head(worktree) == conflict.head_sha
 
+    async def test_hook_refusing_the_clean_merge_commit_is_aborted(self, repo, git_ops, worktree):
+        head_sha = commit_file(worktree, 'notes.txt', 'task notes\n', 'task: notes')
+        main_sha = commit_file(repo, GREET_FILE, greeting('Hey'), 'main: greet with Hey')
+        conflict = BaseConflict(main_sha=main_sha, head_sha=head_sha, conflicted_paths=(GREET_FILE,))
+        _refuse_merge_commits(worktree)
+        merger = RecordingMerger(_resolve_and_conclude(worktree), RESOLVED)
+
+        settlement = await self._settle(git_ops, worktree, conflict, merger)
+
+        assert settlement.refusals[0] == IntegrationRefusal.MERGE_FAILED_WITHOUT_CONFLICTS
+        assert 'hook says no' in settlement.git_output
+        assert merger.briefs == []
+        assert not has_merge_head(worktree)
+        assert settlement.left == WorktreeState(head=head_sha, merge_open=False)
+
+    async def test_unlistable_conflicts_are_not_reported_as_a_failed_merge(
+        self, repo, git_ops, worktree, monkeypatch,
+    ):
+        conflict = await _conflict(repo, git_ops, worktree)
+        monkeypatch.setattr(
+            git_ops, 'unmerged_paths', FailFirst(git_ops.unmerged_paths, RuntimeError('index unreadable')),
+        )
+        merger = RecordingMerger(_resolve_and_conclude(worktree), RESOLVED)
+
+        settlement = await self._settle(git_ops, worktree, conflict, merger)
+
+        assert settlement.refusals[0] == IntegrationRefusal.CONFLICTS_UNLISTABLE
+        assert IntegrationRefusal.MERGE_FAILED_WITHOUT_CONFLICTS not in settlement.refusals
+        assert merger.briefs == []
+        assert not has_merge_head(worktree)
+        assert _head(worktree) == conflict.head_sha
+
     async def test_clean_merge_needs_no_merger(self, repo, git_ops, worktree):
-        head_sha = _commit_file(worktree, 'notes.txt', 'task notes\n', 'task: notes')
-        main_sha = _commit_file(repo, GREET_FILE, _greeting('Hey'), 'main: greet with Hey')
+        head_sha = commit_file(worktree, 'notes.txt', 'task notes\n', 'task: notes')
+        main_sha = commit_file(repo, GREET_FILE, greeting('Hey'), 'main: greet with Hey')
         conflict = BaseConflict(main_sha=main_sha, head_sha=head_sha, conflicted_paths=(GREET_FILE,))
         merger = RecordingMerger(_resolve_and_conclude(worktree), RESOLVED)
 
@@ -306,7 +370,7 @@ class TestSettleBaseConflict:
 
         assert settlement.settled is True
         assert merger.briefs == []
-        assert _is_ancestor(worktree, main_sha, _head(worktree))
+        assert is_ancestor(worktree, main_sha, _head(worktree))
 
     async def test_refusal_is_informative(self, repo, git_ops, worktree):
         conflict = await _conflict(repo, git_ops, worktree)

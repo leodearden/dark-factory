@@ -73,8 +73,11 @@ async def worktree_head(worktree: Path) -> str:
 
 @dataclass(frozen=True)
 class MergerDisposition:
+    """The merger's ruling; *detail*, when given, is the full account an escalation shows instead of *reason*."""
+
     resolved: bool
     reason: str
+    detail: str = ''
 
 
 MergerCall = Callable[[str], Awaitable[MergerDisposition]]
@@ -84,7 +87,8 @@ class IntegrationRefusal(StrEnum):
     """Why a settlement did not leave the branch integrating current main."""
 
     BRANCH_NOT_CHECKED_OUT = 'branch_not_checked_out'
-    MERGE_NOT_STARTED = 'merge_not_started'
+    MERGE_FAILED_WITHOUT_CONFLICTS = 'merge_failed_without_conflicts'
+    CONFLICTS_UNLISTABLE = 'conflicts_unlistable'
     MERGER_DECLINED = 'merger_declined'
     MERGE_UNCONCLUDED = 'merge_unconcluded'
     HISTORY_REWRITTEN = 'history_rewritten'
@@ -92,16 +96,29 @@ class IntegrationRefusal(StrEnum):
 
 
 @dataclass(frozen=True)
+class WorktreeState:
+    """Where a settlement left the worktree, observed after any abort it ran."""
+
+    head: str | None
+    merge_open: bool
+
+
+@dataclass(frozen=True)
 class Settlement:
     conflict: BaseConflict
     branch: str
     refusals: tuple[IntegrationRefusal, ...]
-    merger_reason: str = ''
+    left: WorktreeState
+    merger: MergerDisposition | None = None
     git_output: str = ''
 
     @property
     def settled(self) -> bool:
         return not self.refusals
+
+    @property
+    def declined_by_merger(self) -> bool:
+        return IntegrationRefusal.MERGER_DECLINED in self.refusals
 
     def block_reason(self) -> str:
         """One line for an escalation summary, at most 199 characters."""
@@ -112,8 +129,8 @@ class Settlement:
             f'{self._refusal_values()}: main {self.conflict.main_sha[:8]} into {self.branch} '
             f'at {self.conflict.head_sha[:8]}, conflicts on {shown}{more}'
         )
-        if self.merger_reason:
-            line = f'{line}; merger: {self.merger_reason}'
+        if self.merger is not None and self.merger.reason:
+            line = f'{line}; merger: {self.merger.reason}'
         line = ' '.join(line.split())
         if len(line) <= _BLOCK_REASON_LIMIT:
             return line
@@ -127,12 +144,23 @@ class Settlement:
             'conflicted paths:',
             *(f'  {path}' for path in self.conflict.conflicted_paths),
         ]
-        if self.merger_reason:
-            lines.append(f'merger: {self.merger_reason}')
+        if self.merger is not None and (account := self.merger.detail or self.merger.reason):
+            lines.append(f'merger: {account}')
         if self.git_output:
             lines += ['git output:', self.git_output]
-        lines.append(f'nothing was reset; the pre-settlement tip is {self.conflict.head_sha}')
-        return '\n'.join(lines)
+        return '\n'.join([*lines, *self._left_lines()])
+
+    def _left_lines(self) -> list[str]:
+        head = self.left.head
+        if head is None:
+            lines = ['HEAD could not be resolved after the settlement']
+        elif head == self.conflict.head_sha:
+            lines = [f'HEAD is still the pre-settlement tip {head}; nothing was reset']
+        else:
+            lines = [f'HEAD is now {head}, not the pre-settlement tip {self.conflict.head_sha}']
+        if self.left.merge_open:
+            lines.append('the merge could not be aborted: MERGE_HEAD remains; run `git merge --abort` first')
+        return lines
 
     def _refusal_values(self) -> str:
         return ', '.join(refusal.value for refusal in self.refusals)
@@ -152,7 +180,7 @@ async def settle_base_conflict(
     by ``git merge --abort``; nothing is reset, so a refusal keeps its evidence.
     """
     if await _checked_out_branch(worktree) != branch:
-        return Settlement(conflict, branch, (IntegrationRefusal.BRANCH_NOT_CHECKED_OUT,))
+        return await _settlement(worktree, conflict, branch, (IntegrationRefusal.BRANCH_NOT_CHECKED_OUT,))
     try:
         return await _merge_main_in(git_ops, worktree, conflict, branch, merger)
     except BaseException:
@@ -165,23 +193,25 @@ async def _merge_main_in(
 ) -> Settlement:
     merge = await run_git(
         ['git', 'merge', '--no-ff', '-m', f'Merge main into {branch}', conflict.main_sha],
-        cwd=worktree, timeout=_MERGE_TIMEOUT_SECS,
+        cwd=worktree, timeout=_MERGE_TIMEOUT_SECS, bounded=False,
     )
     if merge.ok:
         return await _checked_settlement(git_ops, worktree, conflict, branch)
-    paths = await _unmerged_paths(git_ops, worktree) or ()
+    paths = await _unmerged_paths(git_ops, worktree)
     if not paths:
-        await _abort_if_merging(git_ops, worktree)
+        cause = (
+            IntegrationRefusal.CONFLICTS_UNLISTABLE if paths is None
+            else IntegrationRefusal.MERGE_FAILED_WITHOUT_CONFLICTS
+        )
         output = '\n'.join(part for part in (merge.stdout, merge.stderr) if part)
-        return Settlement(conflict, branch, (IntegrationRefusal.MERGE_NOT_STARTED,), git_output=output)
+        return await _refused(git_ops, worktree, conflict, branch, cause, git_output=output)
     details = await git_ops.get_conflict_details(worktree, paths)
     disposition = await merger(main_merge_brief(conflict, branch, details))
     if not disposition.resolved:
-        await _abort_if_merging(git_ops, worktree)
-        return Settlement(
-            conflict, branch, (IntegrationRefusal.MERGER_DECLINED,), merger_reason=disposition.reason,
+        return await _refused(
+            git_ops, worktree, conflict, branch, IntegrationRefusal.MERGER_DECLINED, merger=disposition,
         )
-    return await _checked_settlement(git_ops, worktree, conflict, branch, disposition.reason)
+    return await _checked_settlement(git_ops, worktree, conflict, branch, merger=disposition)
 
 
 def main_merge_brief(conflict: BaseConflict, branch: str, details: str) -> str:
@@ -200,12 +230,31 @@ It stopped on the conflicts listed below.
 
 
 async def _checked_settlement(
-    git_ops: GitOps, worktree: Path, conflict: BaseConflict, branch: str, merger_reason: str = '',
+    git_ops: GitOps, worktree: Path, conflict: BaseConflict, branch: str,
+    merger: MergerDisposition | None = None,
 ) -> Settlement:
+    """Hold a merge claimed concluded to the invariant, aborting it if it is still open."""
     refusals = await _integration_refusals(git_ops, worktree, conflict)
-    if IntegrationRefusal.MERGE_UNCONCLUDED in refusals:
-        await _abort_if_merging(git_ops, worktree)
-    return Settlement(conflict, branch, refusals, merger_reason=merger_reason)
+    await _abort_if_merging(git_ops, worktree)
+    return await _settlement(worktree, conflict, branch, refusals, merger=merger)
+
+
+async def _refused(
+    git_ops: GitOps, worktree: Path, conflict: BaseConflict, branch: str, cause: IntegrationRefusal,
+    *, merger: MergerDisposition | None = None, git_output: str = '',
+) -> Settlement:
+    """Close the merge *cause* stopped, then add whatever the invariant still finds broken."""
+    await _abort_if_merging(git_ops, worktree)
+    refusals = (cause, *await _integration_refusals(git_ops, worktree, conflict))
+    return await _settlement(worktree, conflict, branch, refusals, merger=merger, git_output=git_output)
+
+
+async def _settlement(
+    worktree: Path, conflict: BaseConflict, branch: str, refusals: tuple[IntegrationRefusal, ...],
+    *, merger: MergerDisposition | None = None, git_output: str = '',
+) -> Settlement:
+    left = WorktreeState(head=await _head_or_none(worktree), merge_open=await _merge_in_progress(worktree))
+    return Settlement(conflict, branch, refusals, left, merger=merger, git_output=git_output)
 
 
 async def _integration_refusals(
