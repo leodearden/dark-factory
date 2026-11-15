@@ -91,22 +91,27 @@ def _unresolved_reason(token: str | None) -> str:
 _T = TypeVar('_T')
 
 
+def _read_failure(what: str, root: Path, exc: Exception, served_as: str) -> str:
+    """Log why *what* could not be read for *root*, which is served as *served_as*; the reason it
+    is served with."""
+    if isinstance(exc, sqlite3.Error):
+        logger.warning('quality.db unreadable for %s', root, exc_info=exc)
+        return f'quality.db unreadable: {type(exc).__name__}: {exc}'
+    if isinstance(exc, DatumContractError):
+        logger.warning('%s for %s breaks the %s invariant and is served as %s; this is a '
+                       'BUG, not an outage', what, root, exc.invariant.value, served_as, exc_info=exc)
+        return f'{what} broke the {exc.invariant.value} invariant: {exc}'
+    logger.warning('unexpected error while reading %s for %s, which is served as %s for '
+                   'this render; this is a BUG, not an outage', what, root, served_as, exc_info=exc)
+    return f'unexpected error while reading {what}: {type(exc).__name__}: {exc} (see the WARNING and its traceback)'
+
+
 async def _served(what: str, root: Path, read: Callable[[], Awaitable[Datum[_T]]]) -> Datum[_T]:
     """*read*'s datum, or an unknown one naming why *what* could not be read; never raises."""
     try:
         return await read()
-    except sqlite3.Error as exc:
-        logger.warning('quality.db unreadable for %s', root, exc_info=True)
-        return _unknown(f'quality.db unreadable: {type(exc).__name__}: {exc}')
-    except DatumContractError as broken:
-        logger.warning('%s for %s breaks the %s invariant and is served as UNKNOWN; this is a '
-                       'BUG, not an outage', what, root, broken.invariant.value, exc_info=broken)
-        return _unknown(f'{what} broke the {broken.invariant.value} invariant: {broken}')
     except Exception as exc:
-        logger.warning('unexpected error while reading %s for %s, which is served as UNKNOWN for '
-                       'this render; this is a BUG, not an outage', what, root, exc_info=True)
-        return _unknown(f'unexpected error while reading {what}: {type(exc).__name__}: {exc} '
-                        f'(see the WARNING and its traceback)')
+        return _unknown(_read_failure(what, root, exc, 'UNKNOWN'))
 
 
 async def _marker_stream(
@@ -186,14 +191,9 @@ async def _stored_diff(config: DashboardConfig, pool: DbPool, root: Path, point_
     try:
         db = await pool.get(config.quality_db)
         stored = None if db is None else await read_snapshot_diff(db, project_id, point_id)
-    except sqlite3.Error as exc:
-        logger.warning('quality.db unreadable for %s', root, exc_info=True)
-        return ServedDiff.absent(point_id, f'quality.db unreadable: {type(exc).__name__}: {exc}')
     except Exception as exc:
-        logger.warning('unexpected error while reading snapshot point %s for %s, which is served '
-                       'as absent; this is a BUG, not an outage', point_id, root, exc_info=True)
-        return ServedDiff.absent(point_id, f'unexpected error while reading the snapshot diff: '
-                                           f'{type(exc).__name__}: {exc} (see the WARNING and its traceback)')
+        what = f'the diff of snapshot point {point_id!r}'
+        return ServedDiff.absent(point_id, _read_failure(what, root, exc, 'absent'))
     return ServedDiff.of(project_id, point_id, stored)
 
 

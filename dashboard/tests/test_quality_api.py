@@ -777,6 +777,36 @@ def test_a_diff_not_yet_computed_is_pending_saying_so(
     assert isinstance(diff['reason'], str) and diff['reason']
 
 
+def test_a_diff_from_a_quality_db_that_is_not_a_database_is_absent_naming_the_error(
+    quality_client, caplog: pytest.LogCaptureFixture,
+) -> None:
+    quality_client.app.state.config.quality_db.write_bytes(b'not a sqlite database' * 64)
+    with caplog.at_level(logging.WARNING, logger='dashboard.api.quality'):
+        diff = _diff(quality_client, 'project=dark_factory&point=some-point')
+
+    assert (diff['point_id'], diff['state'], diff['text']) == ('some-point', 'absent', None)
+    assert diff['reason'].startswith('quality.db unreadable: DatabaseError')
+    [record] = [r for r in caplog.records if r.name == 'dashboard.api.quality']
+    assert record.exc_info is not None
+
+
+def test_an_unexpected_diff_read_error_is_absent_and_logged_as_a_bug(
+    snapshot_client: SnapshotScene, caplog: pytest.LogCaptureFixture,
+) -> None:
+    point = _point_ids(snapshot_client.client)[1]
+    with closing(sqlite3.connect(snapshot_client.client.app.state.config.quality_db)) as conn:
+        conn.execute("UPDATE snapshot_diffs SET state = 'bogus'")
+        conn.commit()
+    with caplog.at_level(logging.WARNING, logger='dashboard.api.quality'):
+        diff = _diff(snapshot_client.client, f'project=dark_factory&point={point}')
+
+    assert (diff['point_id'], diff['state'], diff['text']) == (point, 'absent', None)
+    assert 'unexpected error' in diff['reason'] and 'ValueError' in diff['reason']
+    [record] = [r for r in caplog.records if r.name == 'dashboard.api.quality']
+    assert record.exc_info is not None
+    assert 'BUG, not an outage' in record.getMessage()
+
+
 @pytest.mark.parametrize(('query', 'point_id', 'named'), [
     ('project=dark_factory&point=no-such-point', 'no-such-point', 'no-such-point'),
     ('project=dark_factory', None, '?point='),
