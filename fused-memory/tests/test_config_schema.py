@@ -7,6 +7,7 @@ import re
 import sys
 import unittest.mock
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -34,6 +35,10 @@ from fused_memory.config.schema import (
     TaskMetadataConfig,
     TaskStatusConfig,
     YamlSettingsSource,
+)
+from fused_memory.server.mem0_update_authz import (
+    resolve_mem0_update_allowed_prefixes,
+    resolve_mem0_update_sanctioned_uses,
 )
 from fused_memory.server.near_duplicate_guard import (
     _TOPIC_CLUSTER_DEFAULT_HINT,
@@ -886,6 +891,18 @@ class TestReconciliationConfigBulkResetGuardFields:
         assert cfg.bulk_reset_guard_write_failure_backoff_seconds == 120.5
 
 
+def _undocumented_prefixes(section: Mem0UpdateConfig) -> list[str]:
+    """Allowlisted prefixes the Mem0UpdateNotAuthorized refusal would render
+    as undocumented, read through the renderer's own resolvers."""
+    svc = SimpleNamespace(config=SimpleNamespace(mem0_update=section))
+    uses = resolve_mem0_update_sanctioned_uses(svc)
+    bar = {
+        *resolve_mem0_update_allowed_prefixes(svc, 'content_amend'),
+        *resolve_mem0_update_allowed_prefixes(svc, 'metadata_patch'),
+    }
+    return sorted(p for p in bar if p not in uses)
+
+
 class TestMem0UpdateConfig:
     """Authorization + storm knobs for the in-place update_memory tool (task 3088).
 
@@ -1018,16 +1035,7 @@ class TestMem0UpdateConfig:
     # --- agent_prefix_sanctioned_use: the role each allowlisted prefix declares ---
 
     def test_default_sanctioned_use_documents_every_default_bar_prefix(self):
-        cfg = Mem0UpdateConfig()
-        uses = cfg.agent_prefix_sanctioned_use
-        bar = {
-            *cfg.content_amend_allowed_agent_prefixes,
-            *cfg.metadata_patch_allowed_agent_prefixes,
-        }
-        undocumented = sorted(
-            p for p in bar
-            if not (isinstance(uses.get(p), str) and uses[p].strip())
-        )
+        undocumented = _undocumented_prefixes(Mem0UpdateConfig())
         assert not undocumented, (
             f'default-allowlisted prefixes with no sanctioned use: {undocumented!r}'
         )
@@ -1106,16 +1114,7 @@ class TestShippedConfigDocumentsEveryAllowlistedPrefix:
         yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
         assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
         monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
-        section = FusedMemoryConfig().mem0_update
-        uses = section.agent_prefix_sanctioned_use
-        bar = {
-            *section.content_amend_allowed_agent_prefixes,
-            *section.metadata_patch_allowed_agent_prefixes,
-        }
-        undocumented = sorted(
-            p for p in bar
-            if not (isinstance(uses.get(p), str) and uses[p].strip())
-        )
+        undocumented = _undocumented_prefixes(FusedMemoryConfig().mem0_update)
         assert not undocumented, (
             f'fused-memory/config/{yaml_name} allowlists {undocumented!r} with no '
             'entry in mem0_update.agent_prefix_sanctioned_use'

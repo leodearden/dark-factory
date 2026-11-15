@@ -33,6 +33,7 @@ from fused_memory.config.schema import (
     FusedMemoryConfig,
 )
 from fused_memory.server.entity_mint_authz import resolve_entity_mint_authorization
+from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
@@ -452,6 +453,15 @@ class TestReloadConfigTool:
         assert svc.config.reconciliation.stale_run_recovery_seconds == flagship_before
 
 
+
+def _refusal(svc: Any) -> str:
+    error = resolve_mem0_update_authorization(
+        svc, agent_id='rando', content_amend=True, metadata_patch=False,
+    ).error
+    assert isinstance(error, str)
+    return error
+
+
 class TestMem0UpdateLeavesAreGreenTier:
     """Every mem0_update.* leaf must hot-apply (task 3088).
 
@@ -517,8 +527,6 @@ class TestMem0UpdateLeavesAreGreenTier:
     async def test_sanctioned_use_yaml_edit_is_rendered_live_via_reload_config(
         self, tmp_path, monkeypatch,
     ):
-        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
-
         config_yaml = tmp_path / 'config.yaml'
         config_yaml.write_text(yaml.safe_dump({'mem0_update': {
             'agent_prefix_sanctioned_use': {
@@ -529,6 +537,10 @@ class TestMem0UpdateLeavesAreGreenTier:
 
         svc = AsyncMock()
         svc.config = FusedMemoryConfig()
+        assert "'curator-': OLD-CURATOR-ROLE" in _refusal(svc), (
+            'the seeded YAML must be rendered before the reload, or the test '
+            'cannot tell a reload from a schema default'
+        )
         _edit_yaml(config_yaml, 'mem0_update.agent_prefix_sanctioned_use', {
             'recon-stage-': 'RECON-ROLE', 'curator-': 'RELOADED-CURATOR-ROLE',
         })
@@ -539,10 +551,7 @@ class TestMem0UpdateLeavesAreGreenTier:
         assert result['reloaded'] is True, result
         assert 'mem0_update.agent_prefix_sanctioned_use' in result['applied'], result
         assert 'mem0_update.agent_prefix_sanctioned_use' not in result['restart_required']
-        error = resolve_mem0_update_authorization(
-            svc, agent_id='rando', content_amend=True, metadata_patch=False,
-        ).error
-        assert isinstance(error, str)
+        error = _refusal(svc)
         assert "'curator-': RELOADED-CURATOR-ROLE" in error, error
 
     def test_kill_switch_flip_is_observed_live_without_a_restart(self):
@@ -550,8 +559,6 @@ class TestMem0UpdateLeavesAreGreenTier:
         object — the precondition config/reload.py's reload-safety rule states
         before a leaf may be registered at all."""
         from types import SimpleNamespace
-
-        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 
         live = FusedMemoryConfig()
         svc = SimpleNamespace(config=live)
@@ -581,8 +588,6 @@ class TestMem0UpdateLeavesAreGreenTier:
         widening to it would be a vacuous no-op diff and the content-amend
         denial below would fail."""
         from types import SimpleNamespace
-
-        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 
         live = FusedMemoryConfig()
         svc = SimpleNamespace(config=live)
