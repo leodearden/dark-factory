@@ -725,7 +725,6 @@ def test_lockfile_enforces_singleton(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('account_pool_in_env')
 async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Path):
     """The default (uninjected) suite_runner seam builds the real script invocation.
 
@@ -763,7 +762,13 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
         'DF_VERIFY_ROLE=offline must be set — the offline role footprint '
         '(nice/ionice) lives inside the script (Part A), not re-implemented here'
     )
-    _assert_lane_env(kwargs['env'])
+    for key, value in os.environ.items():
+        if key == 'DF_VERIFY_ROLE':
+            continue
+        assert kwargs['env'].get(key) == value, (
+            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
+            f'not replace it (missing/altered {key!r})'
+        )
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
@@ -774,14 +779,13 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('account_pool_in_env')
 async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: Path):
     """The default command_runner seam launches `nice -n19 ionice -c3 sh -c <cmd>`.
 
     A bare pytest does not self-nice (unlike the reify scripts), so the
     generic runner applies the idle nice/ionice prefix itself (D4). cwd is
-    <worktree>/<cmd.cwd>; env overlays DF_VERIFY_ROLE=offline onto os.environ
-    minus the account pool; rc + the decoded <=2000-char tail are returned.
+    <worktree>/<cmd.cwd>; env overlays DF_VERIFY_ROLE=offline onto a full
+    os.environ copy; rc + the decoded <=2000-char tail are returned.
 
     Step 11 (RED): _default_run_command / the command_runner seam do not
     exist — must fail before impl.
@@ -817,7 +821,14 @@ async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: P
     assert kwargs['cwd'] == str(wt_path / 'fused-memory'), (
         'cwd must be <worktree>/<cmd.cwd>'
     )
-    _assert_lane_env(kwargs['env'])
+    assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline'
+    for key, value in os.environ.items():
+        if key == 'DF_VERIFY_ROLE':
+            continue
+        assert kwargs['env'].get(key) == value, (
+            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy '
+            f'(missing/altered {key!r})'
+        )
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
@@ -1102,7 +1113,6 @@ def test_infra_seams_injected_or_default(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures('account_pool_in_env')
 async def test_default_infra_runner_builds_run_all_host_infra_command(tmp_path: Path):
     """The default (uninjected) infra_runner seam builds reify's H9 invocation.
 
@@ -1144,7 +1154,13 @@ async def test_default_infra_runner_builds_run_all_host_infra_command(tmp_path: 
     assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline', (
         'DF_VERIFY_ROLE=offline must be set, same as the numeric sub-run'
     )
-    _assert_lane_env(kwargs['env'])
+    for key, value in os.environ.items():
+        if key == 'DF_VERIFY_ROLE':
+            continue
+        assert kwargs['env'].get(key) == value, (
+            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
+            f'not replace it (missing/altered {key!r})'
+        )
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
