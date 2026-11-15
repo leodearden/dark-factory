@@ -890,13 +890,17 @@ class ModuleLockTable:
         Builds a fresh dict from ``_held`` so callers cannot mutate internal state.
         Preferred over direct ``_held`` access in :meth:`Scheduler.get_state_snapshot`.
         It shows ONE holder per key: a key several tasks hold names only the
-        last one iterated, so ask :meth:`held_modules` for what one task holds.
+        last one iterated, so ask :meth:`snapshot_held_by_task` for every holder.
         """
-        result: dict[str, str] = {}
-        for task_id, modules in self._held.items():
-            for m in modules:
-                result[m] = task_id
-        return result
+        return {
+            key: task_id
+            for task_id, keys in self.snapshot_held_by_task().items()
+            for key in keys
+        }
+
+    def snapshot_held_by_task(self) -> dict[str, tuple[str, ...]]:
+        """``{task_id: sorted lock keys}`` for every task holding a lock: every holder of every key."""
+        return {task_id: tuple(sorted(self.held_modules(task_id))) for task_id in self._held}
 
     # --- Limit lookup ---
 

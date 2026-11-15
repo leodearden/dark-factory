@@ -7640,6 +7640,7 @@ class Scheduler:
             pin_queue=tuple(pin_queue),
             overrides=overrides,
             current_holders=self.lock_table.snapshot_holders(),
+            held_by_task=self.lock_table.snapshot_held_by_task(),
             lock_depth=self.config.lock_depth,
             is_paused=self.is_paused,
             pause_reason=self.pause_reason,
