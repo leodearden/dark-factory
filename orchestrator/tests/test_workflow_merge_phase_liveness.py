@@ -161,6 +161,12 @@ class TestStampHelper:
         assert meta['retry_ledger'] == {'x': 1}
         # (c) in-memory task metadata mirrors the persisted stamp.
         assert f.wf.task['metadata']['merge_phase_liveness'] == stamp
+        # (d) a writer rename cannot slip past the blessed spelling (task 5281).
+        _, warnings = parse_metadata(meta, direction='read')
+        assert [
+            w for w in warnings
+            if w.code == 'unknown_key' and w.field == 'merge_phase_liveness'
+        ] == []
 
     @pytest.mark.asyncio
     async def test_stamp_overlays_backend_sibling_keys(self):
@@ -214,19 +220,6 @@ class TestStampHelper:
 
         # (d) In-memory metadata is still updated (persist is the last step).
         assert f.wf.task['metadata']['merge_phase_liveness']['entered_at']
-
-    @pytest.mark.asyncio
-    async def test_stamp_key_is_known_to_the_metadata_vocabulary(self):
-        """A writer rename cannot slip past the blessed spelling (task 5281)."""
-        f = _make()
-
-        await f.wf._stamp_merge_phase_entered()
-
-        _, warnings = parse_metadata(_persisted_metadata(f.update_task), direction='read')
-        assert [
-            w for w in warnings
-            if w.code == 'unknown_key' and w.field == 'merge_phase_liveness'
-        ] == []
 
 
 # ---------------------------------------------------------------------------
