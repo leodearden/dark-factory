@@ -87,3 +87,6 @@ class HangingRawGraph:
 
     async def execute_command(self, *_args: Any) -> None:
         await wait_forever()
+
+    async def delete(self, *_args: Any) -> None:
+        await wait_forever()
