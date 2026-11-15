@@ -26,6 +26,7 @@ import pytest
 from _task_db_scan import decode_metadata, tasks_db_path
 from exception_owner_liveness import Liveness
 from exception_owner_sweep import (
+    DRY_RUN_COMMAND,
     FAILURE_TASK_ID,
     FINDING_KEY_FIELD,
     INLINE_SCOPE,
@@ -920,7 +921,9 @@ def test_scenario_20_outputs_stop_at_the_bound_and_one_roll_up_reports_the_rest(
     (roll_up,) = stub.tool_calls('escalate_info')
     assert roll_up['task_id'] == OVERFLOW_KEY.escalation_task_id()
     assert '4' in roll_up['detail']
-    assert REPORT_COMMAND in roll_up['detail']
+    assert DRY_RUN_COMMAND in roll_up['detail']
+    assert REPORT_COMMAND not in roll_up['detail']
+    assert DRY_RUN_COMMAND in roll_up['suggested_action']
     assert (first.filed, first.overflow, first.findings) == (10, 4, 14)
 
     second = sweep_once(register, ports)
@@ -1285,6 +1288,25 @@ def test_a_dry_runs_lines_label_every_step_as_planned(project_root, seed):
     for line in lines:
         assert line.endswith(Action.FILE_TASK.value)
         assert 'planned' in line
+
+
+def test_a_dead_owner_finding_names_the_dry_run_that_lists_it(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]))
+    document = register_document(
+        declarations=(_declaration(LIST_SCOPE, default=Debt(TaskRef(2733))),),
+        debt=(_site('m.py', 1, TaskRef(2733)),),
+    )
+
+    sweep_once(parse_register(document), ports_for(project_root, stub))
+
+    assert DRY_RUN_COMMAND == 'uv run --project shared python scripts/exception_owner_sweep.py --dry-run'
+    (escalated,) = stub.tool_calls('escalate_info')
+    (submitted,) = stub.tool_calls('submit_task')
+    for body in (escalated['detail'], submitted['description']):
+        assert DRY_RUN_COMMAND in body
+        assert REPORT_COMMAND not in body
+    lines = run_once(project_root, stub, document, dry_run=True).lines()
+    assert any(LIST_SCOPE in line and 'task 2733' in line and 'dead' in line for line in lines)
 
 
 def test_scenario_21_an_unreadable_store_files_nothing_and_says_so_once(project_root):
