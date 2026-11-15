@@ -10,14 +10,16 @@ is the 2026-10-11 one.
 from __future__ import annotations
 
 import datetime
+import gzip
 import json
 import os
 import stat
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 import transcript_secret_sweep as sweep
-from shared.project_layout import agent_transcripts_dir
+from shared.project_layout import agent_transcripts_dir, offline_lane_dir, verify_logs_dir
 from shared.secret_env import is_secret_env_name
 from shared.secret_redaction import FileChangedDuringRedaction
 from shared.testing_mcp_stub import StubMcpServer
@@ -45,6 +47,22 @@ def _write(path: Path, lines: list[str], *, mtime_ns: int = OLD_MTIME_NS) -> Pat
     return path
 
 
+def _write_gzip(path: Path, lines: list[str], *, mtime_ns: int = OLD_MTIME_NS) -> Path:
+    _write(path, lines, mtime_ns=mtime_ns)
+    path.write_bytes(gzip.compress(path.read_bytes()))
+    os.utime(path, ns=(mtime_ns, mtime_ns))
+    return path
+
+
+def _junit_lines(*, message: str, text: str) -> list[str]:
+    suite = ET.Element('testsuite', name='orchestrator', tests='1', failures='1')
+    case = ET.SubElement(suite, 'testcase', classname='tests.test_env', name='test_env_is_scrubbed')
+    failure = ET.SubElement(case, 'failure', message=message)
+    failure.text = text
+    ET.indent(suite)
+    return ET.tostring(suite, encoding='unicode', xml_declaration=True).splitlines()
+
+
 class Recorder:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -63,6 +81,7 @@ class Tree:
     def __init__(self, base: Path) -> None:
         self.project_a = base / 'proj-a'
         self.project_b = base / 'proj-b'
+        self.project_roots = (self.project_a, self.project_b)
         self.claude_projects = base / 'home' / '.claude' / 'projects'
         a_dir = agent_transcripts_dir(self.project_a) / '6000' / '-enc-a'
         b_dir = agent_transcripts_dir(self.project_b) / '6001' / '-enc-b'
@@ -82,8 +101,7 @@ class Tree:
         )
 
     def config(self) -> sweep.SweepConfig:
-        roots = sweep.transcript_roots([self.project_a, self.project_b], self.claude_projects)
-        return sweep.SweepConfig(roots=roots, now=NOW)
+        return sweep.SweepConfig(trees=sweep.swept_trees(self.project_roots, self.claude_projects), now=NOW)
 
     def files(self) -> list[Path]:
         return [self.pool_main, self.pool_subagent, self.openai, self.clean, self.non_live, self.fresh]
@@ -92,6 +110,57 @@ class Tree:
 @pytest.fixture
 def tree(tmp_path: Path) -> Tree:
     return Tree(tmp_path)
+
+
+class LogTree:
+    """One project's verify and offline-lane logs, as failing pytest env assertions leave them."""
+
+    def __init__(self, base: Path) -> None:
+        self.project = base / 'proj'
+        self.project_roots = (self.project,)
+        self.claude_projects = base / 'home' / '.claude' / 'projects'
+        attempt = verify_logs_dir(self.project) / '6828'
+        lane_pass = offline_lane_dir(self.project) / 'qdrant-integration' / '20261020T013000Z'
+        self.verify_log = _write(attempt / 'attempt-1.remote-laptop.test-X.log', [
+            '=================================== FAILURES ===================================',
+            f"E   AssertionError: {{'CLAUDE_OAUTH_TOKEN_A': '{POOL_A}', 'PATH': '/usr/bin'}}",
+            '1 failed in 0.42s',
+        ])
+        self.junit_gz = _write_gzip(
+            attempt / 'attempt-1.orchestrator.junit-X.xml.gz',
+            _junit_lines(message=f'AssertionError: leaked {POOL_A}', text=f'E   CLAUDE_OAUTH_TOKEN_A={POOL_A}'),
+        )
+        self.summary = _write(
+            attempt / 'attempt-1.summary-X.json',
+            [json.dumps({'rc': 1, 'cause_hint': f'env leaked OPENAI_API_KEY={OPENAI}'})],
+        )
+        self.detect_log = _write(lane_pass / 'detect.log', [f'E   OPENAI_API_KEY={OPENAI}', '1 failed'])
+        self.detect_junit = _write(
+            lane_pass / 'detect.junit.xml', _junit_lines(message=f'leaked {POOL_A}', text='E   assert False'),
+        )
+        self.notes = _write(attempt / 'notes.txt', [f'token {POOL_A}'])
+        self.fresh = _write(
+            verify_logs_dir(self.project) / '6829' / 'attempt-1.test-Y.log',
+            [f'E   {POOL_A}'],
+            mtime_ns=FRESH_MTIME_NS,
+        )
+
+    def config(self) -> sweep.SweepConfig:
+        return sweep.SweepConfig(trees=sweep.swept_trees(self.project_roots, self.claude_projects), now=NOW)
+
+    def expected_counts(self) -> dict[Path, dict[str, int]]:
+        return {
+            self.verify_log: {'CLAUDE_OAUTH_TOKEN_A': 1},
+            self.junit_gz: {'CLAUDE_OAUTH_TOKEN_A': 2},
+            self.summary: {'OPENAI_API_KEY': 1},
+            self.detect_log: {'OPENAI_API_KEY': 1},
+            self.detect_junit: {'CLAUDE_OAUTH_TOKEN_A': 1},
+        }
+
+
+@pytest.fixture
+def logs(tmp_path: Path) -> LogTree:
+    return LogTree(tmp_path)
 
 
 def _identity(path: Path) -> tuple[int, int]:
@@ -112,17 +181,97 @@ def _assert_redacted(path: Path, var: str, value: str, before: os.stat_result, l
     assert after.st_mtime_ns == before.st_mtime_ns
 
 
+def _decoded(path: Path) -> bytes:
+    data = path.read_bytes()
+    return gzip.decompress(data) if path.name.endswith('.gz') else data
+
+
+def _readable_xml(content: bytes) -> str:
+    root = ET.fromstring(content)
+    return ' '.join([*(value for element in root.iter() for value in element.attrib.values()), *root.itertext()])
+
+
+def _assert_log_redacted(path: Path, var: str, before: os.stat_result, before_content: bytes) -> None:
+    content = _decoded(path)
+    after = path.stat()
+    assert ENVIRON[var].encode() not in content
+    assert len(content) == len(before_content)
+    assert len(content.splitlines()) == len(before_content.splitlines())
+    if '.xml' in path.name:
+        assert f'<redacted:{var}>' in _readable_xml(content)
+    else:
+        assert f'<redacted:{var}>'.encode() in content
+    if path.suffix == '.json':
+        json.loads(content)
+    assert stat.S_IMODE(after.st_mode) == 0o664
+    assert after.st_mtime_ns == before.st_mtime_ns
+
+
 def _no_value_in(text: str) -> None:
     for value in (POOL_A, OPENAI):
         assert value not in text
 
 
-def test_roots_are_each_projects_transcript_archive_plus_the_claude_projects_dir(tree):
-    assert sweep.transcript_roots([tree.project_a, tree.project_b], tree.claude_projects) == (
-        agent_transcripts_dir(tree.project_a),
-        agent_transcripts_dir(tree.project_b),
-        tree.claude_projects,
+def test_swept_trees_are_each_projects_transcripts_verify_logs_and_offline_lane_plus_the_claude_projects_dir(tree):
+    a, b, claude = tree.project_a, tree.project_b, tree.claude_projects
+
+    assert sweep.swept_trees([a, b], claude) == (
+        sweep.SweptTree(agent_transcripts_dir(a), sweep.TRANSCRIPT_SUFFIXES),
+        sweep.SweptTree(verify_logs_dir(a), sweep.LOG_SUFFIXES),
+        sweep.SweptTree(offline_lane_dir(a), sweep.LOG_SUFFIXES),
+        sweep.SweptTree(agent_transcripts_dir(b), sweep.TRANSCRIPT_SUFFIXES),
+        sweep.SweptTree(verify_logs_dir(b), sweep.LOG_SUFFIXES),
+        sweep.SweptTree(offline_lane_dir(b), sweep.LOG_SUFFIXES),
+        sweep.SweptTree(claude, sweep.TRANSCRIPT_SUFFIXES),
     )
+    assert {'.log', '.json', '.xml', '.xml.gz'} <= set(sweep.LOG_SUFFIXES)
+
+
+def test_one_sweep_redacts_verify_and_offline_lane_logs(logs):
+    expected = logs.expected_counts()
+    before = {path: (path.stat(), _decoded(path)) for path in expected}
+    notes = logs.notes.read_bytes()
+    poster = Recorder()
+
+    result = sweep.run(logs.config(), environ=ENVIRON, post_escalation=poster)
+
+    assert result.ok
+    for path, counts in expected.items():
+        (var,) = counts
+        _assert_log_redacted(path, var, *before[path])
+    assert {hit.path: dict(hit.counts) for hit in result.redacted} == expected
+    assert logs.notes.read_bytes() == notes
+    assert result.deferred == (logs.fresh,)
+    assert result.unreadable == ()
+    (arguments,) = poster.calls
+    for path, counts in expected.items():
+        ((var, n),) = counts.items()
+        assert f'{path}: {var}×{n}' in arguments['detail']
+    _no_value_in(json.dumps(arguments))
+    _no_value_in(json.dumps(result.record()))
+
+
+def test_a_corrupt_gzipped_report_is_reported_unreadable_and_its_siblings_are_still_swept(tmp_path):
+    project = tmp_path / 'proj'
+    attempt = verify_logs_dir(project) / '6830'
+    log = _write(attempt / 'attempt-1.test-Z.log', [f'E   {POOL_A}'])
+    corrupt = _write_gzip(
+        attempt / 'attempt-1.orchestrator.junit-Z.xml.gz',
+        _junit_lines(message=f'leaked {POOL_A}', text=f'E   {POOL_A}'),
+    )
+    whole = corrupt.read_bytes()
+    corrupt.write_bytes(whole[: len(whole) // 2])
+    os.utime(corrupt, ns=(OLD_MTIME_NS, OLD_MTIME_NS))
+    content = corrupt.read_bytes()
+    config = sweep.SweepConfig(trees=sweep.swept_trees([project], tmp_path / 'no-claude'), now=NOW)
+
+    result = sweep.run(config, environ=ENVIRON, post_escalation=Recorder())
+
+    assert result.unreadable == (corrupt,)
+    assert corrupt.read_bytes() == content
+    assert [hit.path for hit in result.redacted] == [log]
+    assert POOL_A.encode() not in log.read_bytes()
+    assert result.record()['unreadable'] == [str(corrupt)]
 
 
 def test_one_sweep_redacts_every_live_value_and_files_one_escalation(tree):
@@ -199,7 +348,7 @@ def test_a_refused_line_is_escalated_and_the_rest_of_its_file_is_redacted(tmp_pa
         [json.dumps({'text': f'plain {value}'}), json.dumps({'text': 'café' + 'X' * 44})],
     )
     safe_line, refused_line = held.read_bytes().splitlines()
-    config = sweep.SweepConfig(roots=sweep.transcript_roots([project], tmp_path / 'no-claude'), now=NOW)
+    config = sweep.SweepConfig(trees=sweep.swept_trees([project], tmp_path / 'no-claude'), now=NOW)
     poster = Recorder()
 
     result = sweep.run(config, environ={'CLAUDE_OAUTH_TOKEN_B': value}, post_escalation=poster)
@@ -227,7 +376,7 @@ def test_archive_staging_debris_is_swept_and_other_names_are_not(tmp_path):
     other = _write(session_dir / 'notes.txt', [_line_with(f'token {POOL_A}')])
     other_content = other.read_bytes()
     before = debris.stat()
-    config = sweep.SweepConfig(roots=sweep.transcript_roots([project], tmp_path / 'no-claude'), now=NOW)
+    config = sweep.SweepConfig(trees=sweep.swept_trees([project], tmp_path / 'no-claude'), now=NOW)
 
     result = sweep.run(config, environ=ENVIRON, post_escalation=Recorder())
 
@@ -243,7 +392,7 @@ def test_a_fifo_named_like_a_transcript_is_passed_over_without_being_opened(tmp_
     leaked = _write(session_dir / 'sid.jsonl', [_line_with(f'token {POOL_A}')])
     fifo = session_dir / 'pipe.jsonl'
     os.mkfifo(fifo)
-    config = sweep.SweepConfig(roots=sweep.transcript_roots([project], tmp_path / 'no-claude'), now=NOW)
+    config = sweep.SweepConfig(trees=sweep.swept_trees([project], tmp_path / 'no-claude'), now=NOW)
 
     result = sweep.run(config, environ=ENVIRON, post_escalation=Recorder())
 
@@ -305,10 +454,11 @@ class TestMain:
             if is_secret_env_name(name):
                 monkeypatch.delenv(name)
 
-    def _argv(self, tree: Tree, tmp_path: Path, *, escalation_url: str = 'http://127.0.0.1:1/mcp') -> list[str]:
+    def _argv(
+        self, tree: Tree | LogTree, tmp_path: Path, *, escalation_url: str = 'http://127.0.0.1:1/mcp'
+    ) -> list[str]:
         return [
-            '--project-root', str(tree.project_a),
-            '--project-root', str(tree.project_b),
+            *(arg for root in tree.project_roots for arg in ('--project-root', str(root))),
             '--units-dir', str(tmp_path / 'no-units'),
             '--claude-projects-dir', str(tree.claude_projects),
             '--escalation-url', escalation_url,
@@ -368,3 +518,13 @@ class TestMain:
         assert record['escalation_error'].startswith('McpCallError')
         assert 'the escalation was not filed' in err
         assert POOL_A not in out + err
+
+    def test_a_verify_log_under_a_project_root_is_swept(self, secretless_environ, monkeypatch, tmp_path, capsys):
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', POOL_A)
+        logs = LogTree(tmp_path)
+
+        with StubMcpServer(stateful=True, payload={'id': 'esc-1', 'status': 'pending'}) as server:
+            assert sweep.main(self._argv(logs, tmp_path, escalation_url=f'{server.url}/mcp')) == 0
+
+        assert POOL_A.encode() not in logs.verify_log.read_bytes()
+        assert str(logs.verify_log) in {hit['path'] for hit in self._record(capsys)['redacted']}
