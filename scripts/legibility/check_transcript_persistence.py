@@ -8,8 +8,9 @@ Cross-checks fleet session-registry records
 spawn-launched interactive session — a record WITH a substantive prompt, a
 terminal status, and a ``start_ts`` inside a lookback window — produced no
 plausibly-matching transcript. This is the detector for the transcript-loss
-regression (a suppressed session-persistence path), NOT the preventer: the
-``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`` fix lands separately. Shipping
+regression (a suppressed session-persistence path), NOT the preventer: that
+is ``skills/spawn/spawn-claude.sh``'s unconditional
+``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`` export. Shipping
 the detector means any future silent transcript-loss regression is caught in
 ~a day of the nightly probe.
 
@@ -66,10 +67,12 @@ DEFAULT_PROJECTS_ROOT = Path.home() / '.claude' / 'projects'
 Injected in tests so the real ``~/.claude`` tree is never touched."""
 
 DEFAULT_SPAWN_SCRIPT = Path(__file__).resolve().parents[2] / 'skills' / 'spawn' / 'spawn-claude.sh'
-"""Default spawn script the ``--check-preventer`` guard reads. Tests always
-pass an explicit ``spawn_script_path`` fixture — never the real committed file
-(which does not carry the ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` token on
-this branch; the preventer lands separately)."""
+"""Spawn script the ``--check-preventer`` guard reads: the dark-factory
+checkout's ``skills/spawn/spawn-claude.sh``, whatever project ``--project-id``
+names. The ``run_check`` tests pass an explicit ``spawn_script_path`` fixture
+so they control the verdict;
+``test_main_check_preventer_passes_on_committed_spawn_script`` pins that the
+guard recognises the committed file."""
 
 PREFIX_LEN = 200
 """Number of leading prompt characters used as the strong-match needle. A
@@ -504,8 +507,8 @@ def payload_exports_force_persistence(script_text: str) -> bool:
     """Return True iff *script_text* sets ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1``.
 
     A PURE function over the script text — the detector's opt-in
-    (``--check-preventer``) guard that the separately-landing preventer is in
-    place. False when the token is absent or explicitly set to ``0``. Never
+    (``--check-preventer``) guard that spawn-claude.sh's preventer export is
+    in place. False when the token is absent or explicitly set to ``0``. Never
     reads the real committed ``spawn-claude.sh``; callers pass its text in.
     """
     return bool(_FORCE_PERSISTENCE_RE.search(script_text))
