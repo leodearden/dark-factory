@@ -12706,11 +12706,14 @@ class TestMemoryMetadataValidationAtSeam:
         journal.log_mem0_intent.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_positive_control_valid_write_does_log_the_intent(self, service):
+    @pytest.mark.parametrize('entry_point', _MM_ADD_ENTRY_POINTS)
+    async def test_positive_control_valid_write_does_log_the_intent(
+        self, service, entry_point
+    ):
         """Without this, `not_called` cannot distinguish "rejected before the
         intent" from "the branch never runs at all"."""
         journal = _mm_install_journal(service)
-        await _mm_write(service, 'add_memory', metadata={'topic': 'a-good-slug'})
+        await _mm_write(service, entry_point, metadata={'topic': 'a-good-slug'})
         journal.log_mem0_intent.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -12724,6 +12727,7 @@ class TestMemoryMetadataValidationAtSeam:
             await _mm_write(service, 'add_system_record', metadata={'topic': 'bad_slug'})
 
         journal.log_backend_op.assert_not_called()
+        journal.log_mem0_intent.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)

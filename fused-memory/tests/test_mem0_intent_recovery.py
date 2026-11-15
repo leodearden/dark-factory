@@ -20,17 +20,20 @@ import uuid
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import openai
 import pytest
 import pytest_asyncio
 from _mem0_intent_fixtures import (
+    EMBEDDINGS_REQUEST,
     mem0_intent_row,
+    openai_status_error,
     rate_limit_error,
     seed_mem0_intent,
     set_mem0_intent_write_method,
 )
 
 from fused_memory.models.enums import SourceStore
-from fused_memory.models.memory import Mem0WriteState
+from fused_memory.models.memory import Mem0WriteState, render_add_memory_message
 from fused_memory.models.scope import Scope
 from fused_memory.services.mem0_add_outcome import Mem0AddOutcome
 from fused_memory.services.mem0_write_retry import (
@@ -1086,3 +1089,174 @@ class TestAReissueCallsTheMethodItsIntentNames:
         row = await mem0_intent_row(recovery_journal, intent_id)
         assert row['status'] == 'dead'
         assert 'bogus' in row['reason']
+
+
+# ---------------------------------------------------------------------------
+# add_system_record writes ahead a mem0 intent and defers a transient failure
+# (task 7401)
+# ---------------------------------------------------------------------------
+
+
+async def _add_system_record(svc: MemoryService):
+    return await svc.add_system_record(
+        content=_SYSTEM_RECORD_CONTENT,
+        project_id='dark_factory',
+        agent_id='recon-stage-task_knowledge_sync',
+        category='observations_and_summaries',
+        metadata={'kind': 'cycle_summary', 'stage': 'task_knowledge_sync', 'run_id': 'r1'},
+        causation_id='c1',
+    )
+
+
+class _RecordingEventBuffer:
+    def __init__(self) -> None:
+        self.events: list = []
+
+    async def push(self, event) -> None:
+        self.events.append(event)
+
+    async def close(self) -> None:
+        return None
+
+
+class TestAddSystemRecordWriteAheadIntent:
+    @pytest.mark.asyncio
+    async def test_the_intent_precedes_the_await_and_completes(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        seen: dict = {}
+
+        async def _capture_pending(**kwargs):
+            seen['pending'] = await recovery_journal.get_incomplete_mem0_intents()
+            return {'results': [{'id': 'sys-1'}]}
+
+        svc.mem0.add_system_record = AsyncMock(side_effect=_capture_pending)
+
+        result = await _add_system_record(svc)
+
+        (pending,) = seen['pending']
+        assert pending['write_method'] == 'add_system_record'
+        assert pending['content'] == _SYSTEM_RECORD_CONTENT
+        assert len(pending['content']) > 200
+        assert pending['category'] == 'observations_and_summaries'
+        assert pending['payload_digest']
+        assert json.loads(pending['metadata'])['category'] == 'observations_and_summaries'
+        assert (await mem0_intent_row(recovery_journal, pending['id']))['status'] == 'completed'
+        assert result.stores_written == [SourceStore.mem0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [
+            RuntimeError('qdrant down'),
+            TimeoutError('Mem0 add_system_record timed out after 30.0s'),
+        ],
+        ids=['runtime-error', 'write-budget-timeout'],
+    )
+    async def test_a_non_transient_failure_marks_the_intent_failed(
+        self, recovery_service, recovery_journal, error
+    ):
+        svc = recovery_service
+        svc.mem0.add_system_record = AsyncMock(side_effect=error)
+
+        result = await _add_system_record(svc)
+
+        (intent,) = await recovery_journal.get_mem0_intents()
+        assert intent['status'] == 'failed'
+        assert str(error) in intent['reason']
+        assert result.stores_pending_retry == []
+        assert '[mem0_error' in result.message
+
+    @pytest.mark.asyncio
+    async def test_a_zero_id_return_marks_the_intent_failed(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        svc.mem0.add_system_record = AsyncMock(return_value={'results': []})
+
+        await _add_system_record(svc)
+
+        (intent,) = await recovery_journal.get_mem0_intents()
+        assert intent['status'] == 'failed'
+        assert 'empty_result' in intent['reason']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'error',
+        [
+            rate_limit_error(),
+            openai_status_error(openai.InternalServerError, 503),
+            openai.APIConnectionError(request=EMBEDDINGS_REQUEST),
+        ],
+        ids=['rate-limited', 'server-error', 'connection-error'],
+    )
+    async def test_a_transient_failure_is_queued_for_retry(
+        self, recovery_service, recovery_journal, error
+    ):
+        svc = recovery_service
+        svc.mem0.add_system_record = AsyncMock(side_effect=error)
+
+        result = await _add_system_record(svc)
+
+        assert result.memory_ids == []
+        assert result.stores_written == []
+        assert result.stores_pending_retry == [SourceStore.mem0]
+        assert result.mem0_write_state is Mem0WriteState.PENDING_RETRY
+        (intent,) = await recovery_journal.get_mem0_intents()
+        assert intent['status'] == 'retrying'
+        assert intent['attempts'] == 1
+        assert result.message == render_add_memory_message(
+            stores_written=[],
+            stores_pending_retry=[SourceStore.mem0],
+            mem0_pending_retry=intent['reason'],
+        )
+        assert 'mem0_error' not in result.message
+        write_op = await recovery_journal.get_write_op(intent['write_op_id'])
+        assert write_op is not None
+        assert write_op['success']
+        assert write_op['error'] is None
+        assert json.loads(write_op['result_summary'])['stores_pending'] == ['mem0']
+
+    @pytest.mark.asyncio
+    async def test_a_deferred_system_record_lands_through_add_system_record_on_the_retry_pass(
+        self, recovery_service, recovery_journal
+    ):
+        svc = recovery_service
+        failing = AsyncMock(side_effect=rate_limit_error())
+        svc.mem0.add_system_record = failing
+        await _add_system_record(svc)
+        original = failing.call_args.kwargs
+        (intent,) = await recovery_journal.get_mem0_intents()
+        landing = AsyncMock(return_value={'results': [{'id': 'sys-late'}]})
+        svc.mem0.add_system_record = landing
+
+        summary = await svc.retry_due_mem0_intents(
+            now=datetime.datetime.fromisoformat(intent['next_attempt_at'])
+            + datetime.timedelta(seconds=1)
+        )
+
+        assert summary.landed == 1
+        landing.assert_awaited_once_with(
+            content=_SYSTEM_RECORD_CONTENT,
+            scope=original['scope'],
+            metadata=original['metadata'],
+        )
+        svc.mem0.add.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_deferred_event_is_tagged_pending_not_empty(self, recovery_service):
+        svc = recovery_service
+        buffer = _RecordingEventBuffer()
+        svc.set_event_buffer(buffer)
+
+        svc.mem0.add_system_record = AsyncMock(side_effect=rate_limit_error())
+        await _add_system_record(svc)
+        svc.mem0.add_system_record = AsyncMock(side_effect=RuntimeError('qdrant down'))
+        await _add_system_record(svc)
+
+        deferred, failed = (event.payload for event in buffer.events)
+        assert deferred['pending_retry'] is True
+        assert 'empty_result' not in deferred
+        assert failed['empty_result'] is True
+        assert failed['error'] == 'qdrant down'
