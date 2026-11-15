@@ -157,11 +157,13 @@ _ROLE_TABLE: Final = TypeAdapter(dict[RoleName, RoleSettings])
 
 def merge_role_table(
     defaults: Mapping[RoleName, RoleSettings],
-    raw: Mapping[str, Mapping[str, object] | RoleSettings],
+    raw: Mapping[str, object],
 ) -> dict[RoleName, RoleSettings]:
     """The one entry-wise, knob-wise merge of a raw role table over its defaults.
 
-    It raises on an unknown role or knob and never drops one.
+    It raises on an unknown role or knob and never drops one. Each raw row is a
+    mapping of knobs or a ``RoleSettings``; anything else raises ``ValueError``
+    naming the role.
     """
     overrides: dict[RoleName, Mapping[str, object]] = {}
     for key, row in raw.items():
@@ -185,7 +187,7 @@ def _table_role(key: str, defaults: Mapping[RoleName, RoleSettings]) -> RoleName
     return role
 
 
-def _named_knobs(role: RoleName, row: Mapping[str, object] | RoleSettings) -> Mapping[str, object]:
+def _named_knobs(role: RoleName, row: object) -> Mapping[str, object]:
     if isinstance(row, RoleSettings):
         return row.model_dump(include=row.model_fields_set)
     if isinstance(row, Mapping):
