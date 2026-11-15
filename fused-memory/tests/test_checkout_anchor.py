@@ -5,13 +5,13 @@ Task 5462.  These tests assert values only: nothing is created under
 """
 
 import builtins
-import importlib.util
 import io
 import os
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+from _fm_helpers import load_script_module
 
 import fused_memory
 from fused_memory.config import checkout_anchor
@@ -29,11 +29,7 @@ def installed_outside_a_checkout(tmp_path) -> ModuleType:
     installed = site_packages / 'fused_memory' / 'config' / 'checkout_anchor.py'
     installed.parent.mkdir(parents=True)
     installed.write_text(Path(checkout_anchor.__file__).read_text())
-    spec = importlib.util.spec_from_file_location('installed_checkout_anchor', installed)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_script_module(installed, mod_name='installed_checkout_anchor')
 
 
 def test_checkout_root_is_the_checkout_holding_the_imported_package():
