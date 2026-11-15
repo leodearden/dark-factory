@@ -490,7 +490,7 @@ def compute_lead_time(
     the last (aborted attempts plus their re-queue waits), and
     ``lead = wait + requeued + verify + residual``.  A dequeue stamped at or
     after the landing (a stale duplicate request later found already_merged)
-    is no landing's wait: taking it as one made wait exceed lead.
+    is no landing's wait.
 
     THE VERIFY SUM IS SCOPED TO THE LANDING ATTEMPT, ``[last dispatch,
     finalized_ts)`` (``[queued_ts, finalized_ts)`` without a dispatch), for
