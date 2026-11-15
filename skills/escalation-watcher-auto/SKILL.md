@@ -1127,8 +1127,8 @@ and names the cause and its remedy (`merge_lane/unmeasured_delivery.py::Unmeasur
 an unreadable history (`retry_merge`), a stopped rebase (`finish_or_abort_rebase`),
 uncommitted declared edits (`commit_worktree_edits`), or the work on a sibling ref
 (`recover_work_from_sibling_ref`). The record's `suggested_action` carries the same
-value. Promote with `category="plan_delivery_unmeasured"` and the reason's remedy
-as option A. Never offer "restart the task" or "narrow the plan": nothing was
+value. [Promote](#promote-to-l2) with `category="plan_delivery_unmeasured"` and the
+reason's remedy as option A. Never offer "restart the task" or "narrow the plan": nothing was
 measured, so neither is supported by evidence.
 
 Before promoting `recover_work_from_sibling_ref` as option A, confirm the named ref
