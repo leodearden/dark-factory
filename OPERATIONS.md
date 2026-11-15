@@ -1000,9 +1000,15 @@ lines and every other overage are usually cut. For the full report, run
 Then resolve the escalation. That re-runs the check, and the chain moves on
 only when it passes.
 
-**The seed link.** Task 5835 files it after this lands on main, because
-`deterministic_task_guard` rejects a `before_done.script` that does not
-exist yet. Task 5835 records the seed id here. The link's metadata:
+**The seed link** is task 10120, filed by task 5835 on 2026-11-14 for a
+first run at 18:15 UTC. It could only be filed once the script was on
+main, because `deterministic_task_guard` rejects a `before_done.script`
+that does not exist yet. The seed is only the first link: every link
+carries the recurrence key `dashboard-payload-budgets`, and the `chains`
+section of `/api/v2/dashboard/invariants` names the chain's current link
+and its state. The hourly re-mint sweep repairs a broken chain, so file a
+new seed only for a chain that has ended (its current link `cancelled`).
+The link's metadata:
 
 ```
 task_kind:   deterministic
