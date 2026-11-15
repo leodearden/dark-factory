@@ -772,6 +772,18 @@ class TestRunProgram:
             assert item in report
         assert _pending(queue) == []
 
+    def test_a_per_eval_override_bounds_that_producer(self, tmp_path, fake_script):
+        root, queue = tmp_path / 'root', EscalationQueue(tmp_path / 'escalations')
+        outcome = _mod().run_program(
+            _config(producer_timeout_secs=60.0, producer_timeout_secs_by_eval={_E1: 0.5}),
+            [_fake(fake_script, extra=['--sleep', '5'])], root, queue, _FIRST,
+        )
+        failures = outcome.artifact.runner_failures
+        assert [(f.scope, f.phase, f.error_type) for f in failures] == [
+            (_E1, 'produce', 'TimeoutExpired'),
+        ]
+        assert 'exceeded 0.5s' in failures[0].message
+
 
 
 class TestMain:
