@@ -3640,6 +3640,7 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | A `recon_missing_index` escalation appears on the reconciliation queue (port 8103, `task_id` `graph:<group_id>`) | A registered graph lacks indices in the expected set, typically because a provisioning statement failed or the graph was born after the last restart and its first-write provisioning did not complete. `index_health.missing` names the specs | Read the `Index provisioning statement failed on graph` (or `did not complete`) journal line for that graph in `journalctl --user -u fused-memory`, fix what it names, then restart fused-memory (`scripts/restart-fused-memory.sh`, with operator sign-off): startup provisioning creates only what is missing. That restart is how the escalation's `ensure_indices(group_id=...)` suggestion is carried out, since no tool exposes it. The next reconciliation cycle re-checks it. See [§8 FalkorDB index provisioning](#falkordb-index-provisioning-expected-set-drift-the-bm25-canary-the-composite-trap) |
 | A `durable_write_dead_letter` escalation appears (`esc-durable-write-dead-letter-N`, agent_role `fused-memory/dead-letter-guard`) | A durably-queued memory write exhausted its attempts and was **permanently abandoned** — `add_episode`, `add_memory`'s Graphiti leg, or a derived `mem0_classify_and_add` fact. The caller was already told it succeeded: the record's `reported_to_caller=` line says exactly what it was told (`add_episode` returned `status='queued'`; `add_memory` returned `stores_queued` containing graphiti), or says plainly that no synchronous claim was made — an `add_memory_graphiti` death carrying that neutral line came from `replay_from_store`, the operation's second producer, which has no caller and mints no `write_op_id`, so there is nobody to warn. One record folds every death sharing `(project_id, operation, error class)` — deliberately keyed on the error CLASS, not its message, because the esc-3561-3 errors carried a different uuid per write — so `dedupe_count` is the VOLUME, not the record count: 28 lost writes page once | Read **`post_execute` first**; it decides the remedy and the two are opposites. `True` means the backend write LANDED and only the post-write callback kept failing (`durable_queue.py::POST_EXECUTE_DEAD_PREFIX`), so a blind replay **duplicates** it — check `backend_ops` joined on `write_op_id`, never on `backend_ops.operation`, which is the literal `'add_episode'` for both the add_episode and add_memory_graphiti paths, before acting. `False` means the write never landed: `replay_dead_letters` is the safe default once the cause is fixed, `delete_dead_letters` only when the item is known unrecoverable. The escalation is self-sufficient for triage by design — corroborating PULL surfaces exist but are not substitutes: `dead_by_operation` on `get_queue_stats` / `memory_service.py::MemoryService.get_status`, and `reconciliation/queue_health.py::summarize_graphiti_queue_health`'s aggregate `dead_count`, both read the LIVE `write_queue` table and go to zero once `delete_dead_letters` sweeps the rows (that sweep had already erased 26 of the 28 rows in esc-3561-3). `dead_by_operation` is also GROUP-scoped, so a `project_id`-scoped call covers that project's Graphiti group only: a dead `mem0_classify_and_add` for the same project appears under group `mem0_<project_id>` or in the unscoped call, and `{}` from the scoped probe does not contradict the alarm. Anyone holding a `write_op_id` can read the durable per-write record via `write_journal.py::WriteJournal.get_write_op` (`terminal_status`/`terminal_error`, task 3582) |
 | A reviewer verdict carried `note_dispositions` that were not applied: the info note is still pending after the review, or was later closed by the router or promoted instead of carrying the reviewer's class | One of four mechanisms. (i) The workflow rejected the entry: `orchestrator/src/orchestrator/escalation_router.py::reviewer_note_refusal` admits only a pending, router-owned info L0 of the reviewed task that is agent-filed, not mechanical, and not already held on a curator ticket, so an unknown id, another task's record, a non-info or eval-lane record, a harness or mechanical notice, or a router-disabled config is refused; a refusal logs the WARNING `info-l0-router: rejected the reviewer disposition` with the reason and emits `info_l0_dispositioned` with class `rejected_disposition`. (ii) `work` never closes a note, by design: it stamps the reviewer mark (triaged_by `reviewer-comprehensive/workflow`) and the exit router converts the note. (iii) The verdict was lost or errored, so nothing was applied: `TaskWorkflow._salvageable_verdict_payload` drops a malformed payload whole, and an ERROR verdict carries no dispositions (`orchestrator/src/orchestrator/review_payload.py::normalize_review`). (iv) Applying raised, which logs an exception and emits class `router-error` | Read the task's `info_l0_dispositioned` events (`class`, `reason`) and the journal WARNING to see which case applied. Nothing needs repairing, and a pending note must not be hand-closed: the exit finalizer, or the orphan reaper or startup amnesty, routes it, which is the designed backstop (`plans/info-l0-disposition-router-prd.md` boundary row 17). A `convert_to_task` L1 under `harness-info-l0-router` with reason `router_error` means the router already dismissed the note (`orchestrator/src/orchestrator/escalation_router.py::_promote` dismisses before it files the L1), so act on that L1, not the note. If the journal shows the ERROR `could not file its fallback L1`, the note is dismissed and its text survives only in that log line. A recurring (i) for the reviewer's own notes points at a briefing/eligibility mismatch; file it against `reviewer_notes` / `reviewer_note_refusal` |
+| A `legibility census commit did not land`, `legibility census refused by its landing gate` or `legibility trickle codebook commit failed` escalation, or one that repeats nightly | The target's pre-commit hook or the census landing gate refused a machine-written legibility write, which was quarantined and rolled back | [§12 Unlanded legibility writes and the quarantine](#unlanded-legibility-writes-and-the-quarantine) |
 | An orchestrator unit restarts every ~100 s | A startup step, or a crash site between steps, raises a process-killing fault on every start (a `BaseException` such as `SystemExit`, or a fatal step's refusal), so systemd's `Restart=` loops the unit. A non-fatal step that raises an ordinary `Exception` is reported on `orchestrator-startup-<step>` and skipped instead, and does not loop | `journalctl --user -u orchestrator-<name>.service` for the traceback. Then `sqlite3 <project_root>/data/orchestrator/runs.db "SELECT run_id, started_at, startup_completed_at, exit_reason FROM runs ORDER BY rowid DESC LIMIT 10"`: `startup_crash:<site>` names the step, or `before-first-step` / `after-<step>` for a crash between steps; `cancelled` is a SIGTERM; a NULL `exit_reason` with `startup_completed_at` set is a start that came up. `cat <project_root>/data/orchestrator/startup_failures.json` shows the current streak. After 3 consecutive crashes at one non-fatal step, the next start skips that step and files the born-at-L2 `orchestrator-startup-crash-loop` (`orchestrator/src/orchestrator/startup_steps.py::page_crash_loop`); a fatal step, or a crash outside any step, still runs and pages the same way. The `finish_startup` of a start that comes up clears the journal, so fix the cause before the next restart. A crash the process cannot record itself (SIGKILL, an import error) is the [§8](#8-fleet-redeploy--watchdog) watchdog's `orchestrator-crash-loop-<unit>` page instead |
 
 ---
@@ -4469,7 +4470,9 @@ is how an operator ends up tuning the sampler for a crashed coder:
   the verdict names `<since>` and the outcome lines to look for. Nights where
   the trigger was not evaluated (a failed or capped trickle) neither break nor
   extend the streak. A census that advances clears the verdict at once,
-  because the probe re-reads census-state live.
+  because the probe re-reads census-state live. For the `census: commit did
+  not land` and landing-gate shapes, see
+  [Unlanded legibility writes and the quarantine](#unlanded-legibility-writes-and-the-quarantine).
 
 **Retried nights** (task 5678). A night that did not finish (a non-zero exit,
 or a usage-cap DEFERRED night) leaves its date in the `retry_backlog` key of
@@ -4553,6 +4556,133 @@ resolution they silently read and wrote different files.
 lever. **No shipped unit sets it** — production always takes the anchored
 branch — and if you do set it, set it for **both** units at once: pinning one
 half is exactly how the writer/reader divergence comes back.
+
+### Unlanded legibility writes and the quarantine
+
+**What happens.** The trickle's codebook dump
+(`scripts/legibility/nightly.py::_commit_stage`) and the census's outputs
+(`scripts/legibility/census_run.py::persist`: the report `.md`, its `.json`
+record, the codebook, `census-state.json`, and the payloads file under
+`--dry-run-filing`) are committed into the target's main checkout by
+`scripts/legibility/unlanded.py::commit_only`, which never skips the hooks. A
+write does not land when the pre-commit hook refuses it, when a lock is still
+contended after `unlanded.py::COMMIT_ATTEMPTS` attempts, when git fails for
+any other reason, or, for the census only, when its `census.landing_gate`
+command does not pass (`scripts/legibility/landing_gate.py`).
+
+Then `unlanded.py::roll_back` copies every written file into a fresh
+quarantine dir FIRST, and only then restores those paths to HEAD in the index
+and the worktree; a path HEAD does not track is deleted. If the copy cannot be
+made, the checkout is left untouched (dirty) instead. `census-state.json`
+rolls back with the rest, so `last_census_at` and the session watermark do not
+move, and the trigger fires again on its next evaluation. Three effects are
+not undone, or were never made:
+
+- Census remediation tickets are filed before the commit; the escalation
+  lists them.
+- Census sessions are ledgered only after a landed commit, so none are
+  ledgered.
+- A trickle night is recorded `failed`, and neither its ledger nor its census
+  stage runs. Its date is re-coded later (see "Retried nights" under
+  [Legibility trickle health probe (04:30)](#legibility-trickle-health-probe-0430)).
+
+**Reading the escalation.** Each is an `escalate_info` with
+`category=infra_issue` and `severity=info`
+(`scripts/legibility/alarm.py::raise_alarm`), under
+`task_id=legibility-census-<project_id>` or
+`legibility-trickle-<project_id>`. Summaries
+(`census_run.py::_unlanded`, `_commit_refusal`, `_gate_refusal`;
+`nightly.py::_commit_stage`):
+
+- `legibility census commit did not land (<project_id>): outputs rolled back, census-state NOT advanced`
+- `legibility census refused by its landing gate (<project_id>): outputs rolled back, census-state NOT advanced`
+- either census headline followed by `(<project_id>): rollback INCOMPLETE, outputs still dirty in the checkout`
+- `legibility trickle codebook commit failed`
+
+The detail opens with git's diagnostic (the trickle's may be the committer's
+traceback instead), or with the gate command's verdict and its output tail. Next
+comes `refused content quarantined at <dir>; restored to HEAD: <paths>`, or
+`rollback INCOMPLETE: <why>`, either one ending with a pointer to this section.
+A census detail then lists the tickets filed before the commit. The census
+child's own stderr line (`census: commit did not land -- ...` or
+`census: landing gate refused the census -- ...`; census.py exits 1) is in
+`journalctl --user -u legibility-trickle@<project_id>`.
+
+**Where the quarantine is.** `<quarantine root>/<label>-<random>/<repo-relative path>`,
+where `<quarantine root>` is `quarantine/` in the directory holding
+`trickle-state.json`; its resolution and the
+`DARK_FACTORY_LEGIBILITY_STATE_ROOT` lever are in "Where the state file lives"
+above. Print it from its one home, `scripts/legibility/unlanded.py::quarantine_root`,
+in a dark-factory checkout root:
+`python3 -c 'import sys; sys.path.insert(0, "scripts"); from legibility import unlanded; print(unlanded.quarantine_root("<project_id>"))'`.
+`<label>` is `trickle-<target date>` or `census-<census date>`. Use the dir the
+escalation names. To list them newest first, `ls -lt <quarantine root>`; to see
+what one holds, `find <dir> -type f`.
+
+**Recovering.**
+
+1. Fix why the write did not land first: the escalation names git's
+   diagnostic or the gate command, which you can re-run by hand in the
+   checkout.
+2. Diff before you copy, for each file:
+   `git diff --no-index <project_root>/<path> <dir>/<path>`. Lines the copy
+   would REMOVE (`-` lines) are content that landed after the refusal, such as
+   a later trickle night's sightings; then do not overwrite. Never re-apply a
+   census's `census-state.json` once a later census has landed.
+3. Decide whether to re-apply at all. For the trickle it is optional: the
+   retry backlog re-codes the date. For the census it is optional too, since
+   the next fire re-mines the window, but that pays for another census and
+   files its tickets again, relying on the curator's dedup. Re-applying keeps
+   the codebook's back-links to the tickets already filed
+   (`census_run.py::_after_filing`). It does not ledger the census's sessions,
+   which only a run whose own commit landed does
+   (`census_run.py::_ledger_census_codings`), so the next census re-mines any
+   of them its window still covers, the same re-mine cost a failed ledger
+   write has.
+4. Re-apply with a normal hooked commit, per
+   [§9](#9-working-in-the-main-checkout): copy the files to their repo paths,
+   then `git -C <project_root> add -- <paths>` and
+   `git -C <project_root> commit --only -m '<msg>' -- <paths>`. **Never
+   `--no-verify`.** If the hook refuses again, the cause is not fixed: put the
+   paths back with
+   `git -C <project_root> restore --source=HEAD --staged --worktree -- <paths HEAD tracks>`
+   and `git -C <project_root> rm -f -- <paths HEAD does not track>`, and
+   return to step 1.
+
+**Cleaning up.** Once the content is on main, or you have decided to drop it,
+`rm -r <dir>`. Nothing else reads a quarantine dir, and nothing expires one.
+
+**Rollback INCOMPLETE.** The paths are still dirty in the main checkout, which
+blocks the target's redeploys and trips the dirty-tree guard
+([§10](#10-troubleshooting)), so fix this first. If a quarantine dir is named,
+confirm it holds every written file by comparing it with the checkout; if none
+is named, copy the files out yourself. Then restore those paths to HEAD as in
+step 4.
+
+**Breaking a repeated-unlanded-census loop.** The signs: the same census
+escalation recurs on every FIRE night, each adding a `census-<date>-*` dir
+(`ls -d <quarantine root>/census-*` counts them), and after
+`trickle_state.DEFAULT_MAX_UNADVANCED_CENSUS_FIRES` fires the 04:30 probe's
+"census fired without advancing" verdict appears. Each repeat pays again for
+mining, verify and synthesis. Two levers:
+
+1. **Fix the cause** in the target repo (its hook, or the gate's failing
+   tests) through a normal task. If the gate refuses the census's OWN output,
+   that is a census defect: file it, and do not loosen the gate.
+2. **Pause.** `legibility.yaml` has no census-only switch, so stop the trickle
+   timer, which pauses the trickle and the census it launches:
+   `systemctl --user stop legibility-trickle@<project_id>.timer`, or
+   `disable --now` to survive a reboot. Do not stop a running
+   `legibility-trickle@<project_id>.service`: that kills a census mid-run.
+   While paused, the 04:30 probe reports the recorder stale, as expected.
+   Resume only after lever 1, with `systemctl --user start` (or
+   `enable --now`) on the timer, or by re-running
+   `scripts/legibility/install-trickle-timer.sh <project_id>`.
+   `Persistent=true` then starts a catch-up run at once, and the missed
+   nights enter the retry backlog ("Retried nights").
+
+Do not edit `legibility.yaml` uncommitted in the main checkout to pause it:
+that trips the same dirty-tree guard.
 
 ### Nightly legibility transcript check (04:00)
 
