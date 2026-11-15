@@ -31,6 +31,7 @@ from shared.project_layout import (
     scheduler_eligibility_db,
     scheduler_overrides_db,
     scheduler_state_json,
+    startup_failures_json,
     tasks_db,
 )
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -43,6 +44,7 @@ _ORCHESTRATOR_STORES = (
     (scheduler_overrides_db, 'scheduler_overrides.db'),
     (park_eviction_requests_db, 'park_eviction_requests.db'),
     (scheduler_eligibility_db, 'scheduler_eligibility.db'),
+    (startup_failures_json, 'startup_failures.json'),
 )
 
 
