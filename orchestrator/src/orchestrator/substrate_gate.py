@@ -12,6 +12,9 @@ Dependency-light: stdlib + logging only.  Mirrors b3_gate.py's structure
 (injectable run_subprocess, frozen verdict dataclass, exit-code→verdict
 mapping).  No CLI — this module runs in-process inside the harness's
 ``_run_slot``, unlike b3_gate which is invoked cross-process by the steward.
+
+The module also renders the L1 text a FLIP verdict is filed with
+(``flip_escalation_text``), mirroring ``cross_repo_gate.block_escalation_text``.
 """
 
 from __future__ import annotations
@@ -359,3 +362,71 @@ def run_substrate_recheck(
             stdout=stdout_trunc,
             stderr=stderr_trunc,
         )
+
+
+# ---------------------------------------------------------------------------
+# L1 escalation text
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FlipEscalationText:
+    """The summary and detail a FLIP verdict's L1 is filed with (untruncated)."""
+
+    summary: str
+    detail: str
+
+
+def flip_escalation_text(task_id: str, verdict: SubstrateVerdict) -> FlipEscalationText:
+    """Render the L1 text for a FLIP *verdict* on *task_id*.
+
+    An unverifiable recheck established nothing about the probe set, so it
+    gets its own rendering; every other FLIP is a checker result about the
+    probe set on current main.
+
+    Raises:
+        ValueError: *verdict* is not a FLIP — there is nothing to file.
+    """
+    if not verdict.flipped:
+        raise ValueError(
+            f'flip_escalation_text requires a FLIP verdict; '
+            f'got verdict={verdict.verdict!r} for task {task_id}'
+        )
+    if verdict.unverifiable:
+        return _unverifiable_text(task_id, verdict)
+    return _probe_flip_text(task_id, verdict)
+
+
+def _probe_flip_text(task_id: str, verdict: SubstrateVerdict) -> FlipEscalationText:
+    summary = f'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task {task_id})'
+    detail = (
+        f'Dispatch-time substrate re-check detected a PASS→FAIL flip.\n'
+        f'Verdict: {verdict.verdict!r} | exit_code={verdict.exit_code} | '
+        f'probe_set={verdict.probe_set!r}\n'
+        f'Reason: {verdict.reason}\n'
+        f'The task premise (probe set authored at investigation time) no longer holds '
+        f'on current main — re-spec required before dispatch.'
+    )
+    return FlipEscalationText(summary=summary, detail=detail)
+
+
+def _unverifiable_text(task_id: str, verdict: SubstrateVerdict) -> FlipEscalationText:
+    summary = (
+        f'SUBSTRATE_UNVERIFIED: task {task_id} could not be re-checked: the probe set '
+        f'never ran on current main, so nothing about it was established'
+    )
+    detail = (
+        'Dispatch-time substrate re-check blocked this task BEFORE any agent spun up, '
+        'because the recheck could not run and the gate fails CLOSED.\n'
+        f'Verdict: {verdict.verdict!r} (unverifiable) | exit_code={verdict.exit_code} | '
+        f'probe_set={verdict.probe_set!r}\n'
+        f'Reason: {verdict.reason}\n'
+        f'Checker stderr: {verdict.stderr or "(none captured)"}\n'
+        'Nothing about the probe set was established: no probe result was read on '
+        'current main. This block is NOT evidence that the task premise changed, so do '
+        'not re-spec or cancel the task on this L1. The fix is to resolve the cause on '
+        'the Reason line (the gate worktree, the checker command, or a malformed '
+        'metadata.substrate_probe descriptor), then unblock the task so the gate can '
+        'run again.'
+    )
+    return FlipEscalationText(summary=summary, detail=detail)
