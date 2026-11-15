@@ -78,19 +78,12 @@ The C2 middleware makes that quoting COUNTABLE rather than silent: it publishes
 the recovered parameter names whose delivered value still trips
 :func:`detect` on the ``markup_detected`` fact and on both policy payloads.
 
-## Staged API — the consumer of :func:`repair` and :func:`detect`
+## The consumer of :func:`repair` and :func:`detect`
 
-This is task ALPHA of a staged PRD: it shipped its API one task ahead of the
-consumer. That consumer has since landed —
-:mod:`shared.mcp_markup_middleware` (``MarkupGuardMiddleware``, task **3689**,
-contract C2) wires :func:`detect` and :func:`repair` at the FastMCP boundary,
-and is a pure boundary layer over them, contributing policy, facts and the
-storm escape but no parsing of its own. Task **3690** registers that middleware
-on the servers.
-
-Until 3690 lands, the middleware is CONSTRUCTED only by its own tests, so a
-dead-code sweep can still misread this chain as unreachable. It is intentional
-staging — check 3690 before concluding otherwise.
+:mod:`shared.mcp_markup_middleware` (``MarkupGuardMiddleware``, contract C2)
+wires :func:`detect` and :func:`repair` at the FastMCP boundary of every server
+that registers it, as a pure boundary layer over them: it adds policy, facts
+and the storm escape, and parses nothing itself.
 
 ## Sentinel-literal hazard — DO NOT "helpfully" un-escape these
 
