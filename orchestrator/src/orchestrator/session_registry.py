@@ -4775,9 +4775,11 @@ def heartbeat_lease(
     holder's lease kept the AND-guard from ever firing -- the lease became
     structurally unreapable and outlived its holder indefinitely.
 
-    Fail-soft is unchanged: an absent lease is ABSENT and an OSError from
-    ``os.utime`` is FAULTED after a logger.error -- never a raise, so a
-    lease-substrate fault cannot interrupt a watcher's main loop.
+    Fail-soft is unchanged: an absent lease is ABSENT -- including one a
+    concurrent --force release or reap removes after the ownership gate but
+    before the touch -- and any other OSError from ``os.utime`` is FAULTED
+    after a logger.error -- never a raise, so a lease-substrate fault cannot
+    interrupt a watcher's main loop.
     """
     path = lease_path_for_name(name, root=root)
     terminal, holder = _check_lease_ownership(path, slug=slug, force=force, verb='heartbeat_lease')
@@ -4785,6 +4787,8 @@ def heartbeat_lease(
         return terminal
     try:
         os.utime(path, None)
+    except FileNotFoundError:
+        return LeaseMutation.ABSENT
     except OSError:
         logger.error('heartbeat_lease: failed to touch %s', path, exc_info=True)
         return LeaseMutation.FAULTED
