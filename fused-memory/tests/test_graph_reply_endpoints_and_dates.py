@@ -16,8 +16,9 @@ reads exactly what the real backend read produced.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import extract_cypher, extract_params
@@ -189,3 +190,105 @@ class TestNodeNamesByUuids:
         assert await backend.get_node_names_by_uuids([], group_id=GROUP) == {}
         graph.ro_query.assert_not_awaited()
         graph.query.assert_not_awaited()
+
+
+_NODE_NAMES = {'n-42': 'Task 42', 'n-r': 'Redis', 'n-q': 'Queue'}
+
+_NAME_READ = 'n.uuid IN $uuids'
+
+
+def _entity_edge(uuid: str, source: str, target: str, *, invalid_at: datetime | None = None):
+    from graphiti_core.edges import EntityEdge
+
+    return EntityEdge(
+        uuid=uuid, group_id=GROUP, source_node_uuid=source, target_node_uuid=target,
+        created_at=datetime(2026, 11, 1, tzinfo=UTC), name='RELATES', fact=f'fact {uuid}',
+        episodes=[], invalid_at=invalid_at,
+    )
+
+
+def _name_graph() -> _RoutingGraph:
+    return _RoutingGraph([
+        (_NAME_READ, lambda params: [
+            [uuid, _NODE_NAMES[uuid]] for uuid in params['uuids'] if uuid in _NODE_NAMES
+        ]),
+    ])
+
+
+async def _graph_search(mock_config, make_backend, graph: _RoutingGraph, hits: list):
+    svc, backend = _service_over(mock_config, make_backend, graph)
+    backend.client.search = AsyncMock(return_value=hits)
+    results = await svc.search(
+        'task 42', project_id=GROUP, stores=['graphiti'], anchor_topics=False,
+    )
+    return {result.id: result.entities for result in results}
+
+
+class TestSearchHitsNameTheirEndpoints:
+    """B2: a graph search hit names the nodes its edge joins, source first."""
+
+    @pytest.mark.asyncio
+    async def test_a_hit_names_its_source_then_target(self, mock_config, make_backend):
+        graph = _name_graph()
+
+        entities = await _graph_search(
+            mock_config, make_backend, graph, [_entity_edge('e1', 'n-42', 'n-r')],
+        )
+
+        assert entities == {'e1': ['Task 42', 'Redis']}
+
+    @pytest.mark.asyncio
+    async def test_hits_sharing_endpoints_are_named_by_one_read(
+        self, mock_config, make_backend,
+    ):
+        graph = _name_graph()
+
+        entities = await _graph_search(mock_config, make_backend, graph, [
+            _entity_edge('e1', 'n-42', 'n-r'),
+            _entity_edge('e2', 'n-42', 'n-q'),
+            _entity_edge('e3', 'n-q', 'n-42'),
+        ])
+
+        assert entities == {
+            'e1': ['Task 42', 'Redis'],
+            'e2': ['Task 42', 'Queue'],
+            'e3': ['Queue', 'Task 42'],
+        }
+        name_reads = graph.reads_matching(_NAME_READ)
+        assert len(name_reads) == 1
+        assert sorted(name_reads[0][1]['uuids']) == ['n-42', 'n-q', 'n-r']
+
+    @pytest.mark.asyncio
+    async def test_a_self_loop_names_its_node_once(self, mock_config, make_backend):
+        graph = _name_graph()
+
+        entities = await _graph_search(
+            mock_config, make_backend, graph, [_entity_edge('e1', 'n-42', 'n-42')],
+        )
+
+        assert entities == {'e1': ['Task 42']}
+
+    @pytest.mark.asyncio
+    async def test_an_unnamed_endpoint_contributes_no_name(self, mock_config, make_backend):
+        graph = _name_graph()
+
+        entities = await _graph_search(
+            mock_config, make_backend, graph, [_entity_edge('e1', 'n-42', 'n-gone')],
+        )
+
+        assert entities == {'e1': ['Task 42']}
+
+    @pytest.mark.asyncio
+    async def test_a_retired_hit_is_dropped_and_its_endpoints_are_not_read(
+        self, mock_config, make_backend,
+    ):
+        graph = _name_graph()
+
+        entities = await _graph_search(mock_config, make_backend, graph, [
+            _entity_edge('e-old', 'n-old-a', 'n-old-b', invalid_at=datetime(2026, 11, 2, tzinfo=UTC)),
+            _entity_edge('e1', 'n-42', 'n-r'),
+        ])
+
+        assert entities == {'e1': ['Task 42', 'Redis']}
+        (name_read,) = graph.reads_matching(_NAME_READ)
+        assert not {'n-old-a', 'n-old-b'} & set(name_read[1]['uuids'])
