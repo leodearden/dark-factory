@@ -2532,7 +2532,7 @@ class TestBeforeDoneTargetUnitlessDeploy:
         [
             pytest.param(
                 _targetless_crash_before_done_write,
-                'resumed after verified deploy (crash before done write)',
+                'resumed after deploy (crash before done write)',
                 id='crash-before-done-write',
             ),
             pytest.param(
@@ -2572,6 +2572,7 @@ class TestBeforeDoneTargetUnitlessDeploy:
         provenance = done_calls[0].kwargs['done_provenance']
         assert provenance['kind'] == 'deterministic-deploy-unverified'
         assert provenance['note'] == note
+        assert 'pid' not in provenance
 
     async def test_targetless_deploy_rc_nonzero_escalates_and_blocks(self, tmp_path: Path):
         """rc != 0 with a falsy target_unit must escalate + block — NOT

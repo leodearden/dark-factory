@@ -407,6 +407,23 @@ def _deploy_done_kind(target_unit: str | None) -> str:
     return 'deterministic-deploy' if target_unit else 'deterministic-deploy-unverified'
 
 
+def _crash_resume_deploy_evidence(
+    target_unit: str | None, verified_pid: object,
+) -> dict[str, object]:
+    """Evidence for a deploy whose writeback stamp landed but whose done write did not.
+
+    A targetless deploy's stamp records only that its script exited 0, so its
+    record claims neither a verified deploy nor a pid.
+    """
+    if not target_unit:
+        return {'note': 'resumed after deploy (crash before done write)'}
+    return {
+        'pid': verified_pid,
+        'note': 'resumed after verified deploy (crash before done write)',
+        'unit': target_unit,
+    }
+
+
 def _cite_gate_escalation_id(own_records: list, gate_category: str) -> str | None:
     """Pick the escalation a `deterministic-gate` close should CITE.
 
@@ -3293,9 +3310,9 @@ class DeterministicRunner:
                         'done',
                         done_provenance=_build_done_provenance(
                             _deploy_done_kind(target_unit),
-                            pid=metadata.get('before_done_verified_pid'),
-                            note='resumed after verified deploy (crash before done write)',
-                            unit=target_unit,
+                            **_crash_resume_deploy_evidence(
+                                target_unit, metadata.get('before_done_verified_pid'),
+                            ),
                         ),
                     )
                     return WorkflowOutcome.DONE
