@@ -28,7 +28,7 @@ from orchestrator.offline_lane_confirm import (
 )
 from orchestrator.verify_cache import audit, audit_hook, keys, policy, registry
 from orchestrator.verify_cache.audit_run import AUDIT_COMMAND, AuditNode
-from orchestrator.verify_cache.modes import VERIFY_CACHE_ENV, CacheMode
+from orchestrator.verify_cache.modes import CacheMode
 from orchestrator.verify_cache.status import render_status
 from orchestrator.verify_evidence import UnitTier
 
@@ -43,12 +43,6 @@ GAMMA_NODE = str(AuditNode('gamma', 'tests/test_g.py::t1'))
 UNQUALIFIED_NODE = 'tests/test_a.py::t1'
 
 _BOTH_ON = VerifyCacheConfig(task_mode=CacheMode.ON, merge_mode=CacheMode.ON)
-
-
-@pytest.fixture(autouse=True)
-def _no_inherited_force_off(monkeypatch):
-    """The audit lane runs this suite under DF_VERIFY_CACHE=off, which forces every mode off."""
-    monkeypatch.delenv(VERIFY_CACHE_ENV, raising=False)
 
 
 def _key(module: str) -> keys.UnitKey:

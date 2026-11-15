@@ -31,12 +31,6 @@ from orchestrator.verify_evidence import Leg, UnitTier
 _FORCE_OFF = VERIFY_CACHE_ENV
 
 
-@pytest.fixture(autouse=True)
-def _no_inherited_force_off(monkeypatch):
-    """The audit lane runs this suite under DF_VERIFY_CACHE=off; these tests own the variable."""
-    monkeypatch.delenv(_FORCE_OFF, raising=False)
-
-
 def _project(tmp_path: Path, top_level: dict) -> Path:
     config_path = tmp_path / 'dark-factory-orchestrator.yaml'
     config_path.write_text(yaml.safe_dump({'project_root': str(tmp_path), **top_level}))

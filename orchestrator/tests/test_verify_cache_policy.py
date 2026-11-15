@@ -11,15 +11,8 @@ import pytest
 
 from orchestrator.config import VerifyCacheConfig
 from orchestrator.verify_cache import keys, policy, registry
-from orchestrator.verify_cache.modes import VERIFY_CACHE_ENV, CacheMode
+from orchestrator.verify_cache.modes import CacheMode
 from orchestrator.verify_evidence import Leg, UnitTier
-
-
-@pytest.fixture(autouse=True)
-def _no_inherited_force_off(monkeypatch):
-    """The audit lane runs this suite under DF_VERIFY_CACHE=off, which forces every mode off."""
-    monkeypatch.delenv(VERIFY_CACHE_ENV, raising=False)
-
 
 _NOW = datetime(2026, 11, 10, 12, 0, tzinfo=UTC)
 _KEY = keys.UnitKey.of('module:alpha:test', UnitTier.MODULE, 's', (('spec', 's'), ('tree:alpha', 'a' * 40)))
