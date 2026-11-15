@@ -266,6 +266,13 @@ def _recording_service(calls: list[str], *, failing: str | None = None) -> Async
     return service
 
 
+def _as_an_unchecked_caller(**kwargs):
+    """Enter maintenance_service the way a caller outside pyright's gate can."""
+    from fused_memory.maintenance._utils import maintenance_service
+
+    return maintenance_service(**kwargs)
+
+
 class TestServiceOpen:
     """maintenance_service opens the service as its open_as mode says, and closes it once."""
 
@@ -399,14 +406,13 @@ class TestServiceOpen:
 
     @pytest.mark.asyncio
     async def test_an_unknown_opening_mode_is_rejected_before_construction(self):
-        from fused_memory.maintenance._utils import maintenance_service
 
         with (
             patch('fused_memory.maintenance._utils.FusedMemoryConfig') as config_cls,
             patch('fused_memory.services.memory_service.MemoryService') as service_cls,
             pytest.raises(ValueError, match='write'),
         ):
-            async with maintenance_service(**{'open_as': 'write'}):
+            async with _as_an_unchecked_caller(open_as='write'):
                 pytest.fail('the body must not run')
 
         config_cls.assert_not_called()
