@@ -186,7 +186,9 @@ The layout's one home is `shared/src/shared/transcript_archive.py::durable_archi
 
 It prints every match, one path per line; on a miss it exits 1, naming each
 root it searched. It takes full ids only. Another project's sessions are in
-that project's own archive (`--project-root <root>`).
+that project's own archive (`--project-root <root>`). It searches only the
+archive and `~/.claude/projects`, so it misses a session still in flight in a
+worktree's `.task/` config or one run under another `CLAUDE_CONFIG_DIR`.
 
 ### Anchoring ad-hoc paths
 
