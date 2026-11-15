@@ -2420,9 +2420,7 @@ class TestStage2CycleSummaryHarnessBackstop:
         # this test keeps reaching the ledger's ON CONFLICT path, which is the
         # idempotency it exists to pin.
         stage2_report.stats.pop('stage2_cycle_summary_write_recovered_backstop', None)
-        await harness._ensure_stage2_cycle_summary(
-            run, run.id, 'test-project', run.started_at,
-        )
+        await harness._ensure_stage2_cycle_summary(run, run.id, 'test-project')
 
         assert await self._count_cycle_summary_rows(ledger_store, run.id) == 1, (
             'the upsert is idempotent on its 5-part identity — a re-attempt '
@@ -2597,9 +2595,7 @@ class TestStage2CycleSummaryHarnessBackstop:
         run = self._run_with_stage2_entry(
             {'items_flagged': []}, _error={'error_type': 'RuntimeError'},
         )
-        await harness._ensure_stage2_cycle_summary(
-            run, run.id, 'test-project', datetime.now(UTC),
-        )
+        await harness._ensure_stage2_cycle_summary(run, run.id, 'test-project')
 
         record = await ledger_store.get_by_identity(
             'test-project', 'cycle_summary',
