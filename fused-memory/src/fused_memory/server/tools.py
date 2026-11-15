@@ -7862,13 +7862,14 @@ def create_mcp_server(
             result['task_metadata_capabilities'] = sorted(TASK_METADATA_CAPABILITIES)
 
         # task 4809 (INV-4): refused payloads the markup guard lost. Top-level
-        # and present-when-wired for the same reasons as `journal_drops`.
+        # and present-when-wired for the same reasons as `journal_drops`. The
+        # status lists the spool dir, so it runs off the loop like event_dead.
         if (
             markup_residue_spool is not None
             and isinstance(result, dict)
             and 'error' not in result
         ):
-            result['markup_residue'] = markup_residue_spool.status()
+            result['markup_residue'] = await asyncio.to_thread(markup_residue_spool.status)
 
         return result
 

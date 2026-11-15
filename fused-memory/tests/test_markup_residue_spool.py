@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from shared.toolcall_markup import CANONICAL_OPENER_PREFIX, closer_for
@@ -50,6 +52,45 @@ def _unwritable_spool(tmp_path) -> MarkupResidueSpool:
 def _stored(locator: str | None) -> dict:
     assert locator is not None
     return json.loads(Path(locator).read_text(encoding='utf-8'))
+
+
+class _Fsync(NamedTuple):
+    """One ``os.fsync``: what it synced, and what the spool dir held right then."""
+
+    inode: int
+    is_dir: bool
+    spool_names: list[str]
+
+
+def _record_fsyncs(monkeypatch, spool_dir: Path) -> list[_Fsync]:
+    """Every ``os.fsync`` from here on, in order, each still really performed.
+
+    The spool's names at each sync are what a crash at that instant leaves.
+    """
+    calls: list[_Fsync] = []
+    real_fsync = os.fsync
+
+    def _recording_fsync(fd: int) -> None:
+        synced = os.fstat(fd)
+        names = sorted(path.name for path in spool_dir.iterdir()) if spool_dir.is_dir() else []
+        calls.append(_Fsync(synced.st_ino, stat.S_ISDIR(synced.st_mode), names))
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, 'fsync', _recording_fsync)
+    return calls
+
+
+def _record_listings(monkeypatch) -> list[Path]:
+    """Every dir ``os.scandir`` lists from here on."""
+    listed: list[Path] = []
+    real_scandir = os.scandir
+
+    def _recording_scandir(path):
+        listed.append(Path(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, 'scandir', _recording_scandir)
+    return listed
 
 
 class TestPreserve:
@@ -133,6 +174,70 @@ class TestPreserve:
         locator = spool.preserve(record)
 
         assert _stored(locator)['tool'] == 'add_memory'
+
+
+class TestAPreservedPayloadSurvivesACrash:
+    """The locator reaches the caller, so what it names must outlive power loss."""
+
+    def test_no_json_name_exists_while_the_payload_is_being_synced(
+        self, tmp_path, monkeypatch
+    ):
+        """A crash mid-write leaves no partial file that ``spooled_files`` counts."""
+        spool_dir = tmp_path / 'spool'
+        spool = MarkupResidueSpool(spool_dir)
+        fsyncs = _record_fsyncs(monkeypatch, spool_dir)
+
+        locator = spool.preserve(_record())
+
+        payload_syncs = [call for call in fsyncs if not call.is_dir]
+        assert payload_syncs, fsyncs
+        for call in payload_syncs:
+            assert [name for name in call.spool_names if name.endswith('.json')] == []
+        assert [path.name for path in spool_dir.iterdir()] == [Path(locator).name]
+
+    def test_the_spool_dir_is_synced_once_the_new_name_is_in_it(
+        self, tmp_path, monkeypatch
+    ):
+        spool_dir = tmp_path / 'spool'
+        spool_dir.mkdir()
+        spool = MarkupResidueSpool(spool_dir)
+        fsyncs = _record_fsyncs(monkeypatch, spool_dir)
+
+        locator = spool.preserve(_record())
+
+        assert locator is not None
+        assert any(
+            call.is_dir
+            and call.inode == spool_dir.stat().st_ino
+            and Path(locator).name in call.spool_names
+            for call in fsyncs
+        ), fsyncs
+
+    def test_each_dir_it_creates_is_synced_into_its_parent(self, tmp_path, monkeypatch):
+        spool_dir = tmp_path / 'data' / 'markup_residue'
+        spool = MarkupResidueSpool(spool_dir)
+        fsyncs = _record_fsyncs(monkeypatch, spool_dir)
+
+        assert spool.preserve(_record()) is not None
+
+        synced_dirs = {call.inode for call in fsyncs if call.is_dir}
+        assert tmp_path.stat().st_ino in synced_dirs
+        assert (tmp_path / 'data').stat().st_ino in synced_dirs
+
+    def test_a_payload_that_cannot_be_synced_is_lost_and_leaves_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        spool_dir = tmp_path / 'spool'
+        spool = MarkupResidueSpool(spool_dir)
+
+        def _refuse_to_sync(fd: int) -> None:
+            raise OSError('disk gone')
+
+        monkeypatch.setattr(os, 'fsync', _refuse_to_sync)
+
+        assert spool.preserve(_record()) is None
+        assert list(spool_dir.iterdir()) == []
+        assert spool.status()['preservation_failures'] == 1
 
 
 class TestAFailedWriteIsALostPayload:
@@ -259,6 +364,18 @@ class TestStatus:
 
         assert sibling.status()['preservation_failures'] == 0
 
+    def test_a_burst_of_writes_lists_the_dir_at_most_once(self, tmp_path, monkeypatch):
+        """Each write is O(1): the count is kept between status reads, not re-listed."""
+        spool_dir = tmp_path / 'spool'
+        spool = MarkupResidueSpool(spool_dir, soft_cap_files=2)
+        listed = _record_listings(monkeypatch)
+
+        for _ in range(5):
+            assert spool.preserve(_record()) is not None
+
+        assert listed.count(spool_dir) <= 1
+        assert spool.status()['spooled_files'] == 5
+
     @pytest.mark.parametrize('calls', [1, 3])
     def test_a_successful_preserve_is_not_counted(self, tmp_path, calls):
         spool = MarkupResidueSpool(tmp_path / 'spool')
@@ -303,6 +420,7 @@ class TestSoftCap:
         assert self._over_cap_lines(caplog) == []
 
     def test_a_drained_spool_logs_again_when_it_next_crosses(self, tmp_path, caplog):
+        """The drain is seen at the next status read, as get_status polls it."""
         spool_dir = tmp_path / 'spool'
         spool = MarkupResidueSpool(spool_dir, soft_cap_files=1)
 
@@ -311,6 +429,7 @@ class TestSoftCap:
             spool.preserve(_record())
             for path in spool_dir.iterdir():
                 path.unlink()
+            spool.status()
             spool.preserve(_record())
             spool.preserve(_record())
 

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -1848,6 +1849,26 @@ class TestPreservationFailuresAreReadable:
         residue = status['markup_residue']
         assert residue['spooled_files'] == 1
         assert residue['last_preserved'] == payload['residue_spool_path']
+
+    @pytest.mark.asyncio
+    async def test_the_spool_is_listed_off_the_event_loop(self, tmp_path, monkeypatch):
+        """get_status is polled, so listing a large spool must not block the loop."""
+        spool = MarkupResidueSpool(tmp_path / 'spool')
+        server, _ = self._server(spool)
+        listing_threads: list[int] = []
+        real_status = spool.status
+
+        def _recording_status() -> dict[str, Any]:
+            listing_threads.append(threading.get_ident())
+            return real_status()
+
+        monkeypatch.setattr(spool, 'status', _recording_status)
+
+        status = await self._status(server)
+
+        assert status['markup_residue']['spooled_files'] == 0
+        assert listing_threads
+        assert threading.get_ident() not in listing_threads
 
     @pytest.mark.asyncio
     async def test_an_unwired_server_omits_the_field(self):
