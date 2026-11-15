@@ -7,7 +7,10 @@ JSONL or text line, or XML-escaped inside a report. It is replaced by
 ``<redacted:VAR>`` right-padded with ``x`` to the same byte length, so a file
 keeps its size and line count; in XML the label is entity-escaped
 (``&lt;redacted:VAR&gt;``) and never cut mid-entity, so a report stays
-well-formed and still parses as ``<redacted:VAR>``. A line whose rewrite would
+well-formed and still parses as ``<redacted:VAR>``. A ``Codec`` says how the
+bytes are stored: a gzip file is decompressed, redacted and recompressed, and
+one that does not decompress whole raises ``CorruptCompressedFile`` and is left
+as found. A line whose rewrite would
 turn it from valid JSON into invalid JSON is left as it was and reported in
 ``FileRedaction.refused``; every other line is still redacted. No message ever
 carries a value.
@@ -15,13 +18,17 @@ carries a value.
 
 from __future__ import annotations
 
+import contextlib
 import enum
+import gzip
+import io
 import json
 import os
 import stat
 import tempfile
+import zlib
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -29,6 +36,8 @@ from xml.sax.saxutils import escape as xml_escape
 
 __all__ = [
     'MIN_REDACTABLE_LEN',
+    'Codec',
+    'CorruptCompressedFile',
     'FileChangedDuringRedaction',
     'FileRedaction',
     'FileStamp',
@@ -55,6 +64,11 @@ _XML_QUOTE_ENTITIES = MappingProxyType({'"': '&quot;', "'": '&apos;'})
 class Markup(enum.Enum):
     TEXT = 'text'
     XML = 'xml'
+
+
+class Codec(enum.Enum):
+    PLAIN = 'plain'
+    GZIP = 'gzip'
 
 
 @dataclass(frozen=True)
@@ -113,6 +127,12 @@ class FileChangedDuringRedaction(RedactionError):
         self.path = path
 
 
+class CorruptCompressedFile(RedactionError):
+    def __init__(self, path: Path) -> None:
+        super().__init__(f'{path} does not decompress as whole gzip data; it was left as found')
+        self.path = path
+
+
 def redaction_needles(
     secrets: Mapping[str, str], *, markup: Markup = Markup.TEXT
 ) -> tuple[Needle, ...]:
@@ -132,35 +152,36 @@ def file_stamp(path: StrPath) -> FileStamp:
 
 
 def copy_redacted(src: StrPath, dest: StrPath, needles: Sequence[Needle]) -> FileRedaction:
-    counts: Counter[str] = Counter()
-    refused: list[RefusedLine] = []
     try:
         with open(src, 'rb') as reader, open(dest, 'wb') as writer:
-            for line_number, line in enumerate(reader, start=1):
-                writer.write(_redact_line(line, needles, counts, refused, line_number))
+            return _copy_lines(reader, writer, needles)
     except BaseException:
         Path(dest).unlink(missing_ok=True)
         raise
-    return FileRedaction(MappingProxyType(dict(counts)), tuple(refused))
 
 
 def redact_in_place(
     path: StrPath,
     needles: Sequence[Needle],
     *,
+    codec: Codec = Codec.PLAIN,
     unchanged_since: FileStamp | None = None,
 ) -> FileRedaction:
     path = Path(path)
     original = os.stat(path)
     stamp = unchanged_since or _stamp_of(original)
-    if not needles or not _contains_any(path, needles):
+    if not needles or not _contains_any(path, needles, codec):
         return FileRedaction(MappingProxyType({}))
 
     fd, temp_name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.redacting', dir=path.parent)
     os.close(fd)
     temp = Path(temp_name)
     try:
-        result = copy_redacted(path, temp, needles)
+        with (
+            _decoded(path, codec) as reader,
+            _encoded(temp, codec, name=path.name, mtime=int(original.st_mtime)) as writer,
+        ):
+            result = _copy_lines(reader, writer, needles)
         if not result.redacted:
             return result
         os.chmod(temp, stat.S_IMODE(original.st_mode))
@@ -208,16 +229,67 @@ def _stamp_of(st: os.stat_result) -> FileStamp:
     return FileStamp(st.st_ino, st.st_size, st.st_mtime_ns)
 
 
-def _contains_any(path: Path, needles: Sequence[Needle]) -> bool:
+@dataclass(frozen=True)
+class _CodecRules:
+    open_reader: Callable[[Path], io.BufferedIOBase]
+    wrap_writer: Callable[[io.BufferedIOBase, str, int], io.BufferedIOBase]
+    decode_errors: tuple[type[Exception], ...]
+
+
+def _gzip_writer(raw: io.BufferedIOBase, name: str, mtime: int) -> io.BufferedIOBase:
+    return gzip.GzipFile(filename=name, mode='wb', fileobj=raw, mtime=mtime)
+
+
+_CODEC_RULES: Mapping[Codec, _CodecRules] = MappingProxyType({
+    Codec.PLAIN: _CodecRules(
+        open_reader=lambda path: path.open('rb'),
+        wrap_writer=lambda raw, _name, _mtime: raw,
+        decode_errors=(),
+    ),
+    Codec.GZIP: _CodecRules(
+        open_reader=lambda path: gzip.GzipFile(path, 'rb'),
+        wrap_writer=_gzip_writer,
+        decode_errors=(EOFError, zlib.error, gzip.BadGzipFile),
+    ),
+})
+
+
+@contextlib.contextmanager
+def _decoded(path: Path, codec: Codec) -> Iterator[io.BufferedIOBase]:
+    rules = _CODEC_RULES[codec]
+    try:
+        with rules.open_reader(path) as reader:
+            yield reader
+    except rules.decode_errors as exc:
+        raise CorruptCompressedFile(path) from exc
+
+
+@contextlib.contextmanager
+def _encoded(temp: Path, codec: Codec, *, name: str, mtime: int) -> Iterator[io.BufferedIOBase]:
+    with open(temp, 'wb') as raw, _CODEC_RULES[codec].wrap_writer(raw, name, mtime) as writer:
+        yield writer
+
+
+def _contains_any(path: Path, needles: Sequence[Needle], codec: Codec) -> bool:
     overlap = max(len(needle.pattern) for needle in needles) - 1
     tail = b''
-    with open(path, 'rb') as reader:
+    with _decoded(path, codec) as reader:
         while chunk := reader.read(_DETECT_CHUNK_BYTES):
             window = tail + chunk
             if any(needle.pattern in window for needle in needles):
                 return True
             tail = window[len(window) - overlap:]
     return False
+
+
+def _copy_lines(
+    reader: io.BufferedIOBase, writer: io.BufferedIOBase, needles: Sequence[Needle]
+) -> FileRedaction:
+    counts: Counter[str] = Counter()
+    refused: list[RefusedLine] = []
+    for line_number, line in enumerate(reader, start=1):
+        writer.write(_redact_line(line, needles, counts, refused, line_number))
+    return FileRedaction(MappingProxyType(dict(counts)), tuple(refused))
 
 
 def _redact_line(
