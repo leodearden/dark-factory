@@ -12,12 +12,15 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from orchestrator import substrate_gate as gate
 
 # ---------------------------------------------------------------------------
 # Shared scaffolding (pre-1)
@@ -445,6 +448,94 @@ class TestRunSubstrateRecheck:
             task=task, worktree='/gate', run_subprocess=fake_checker(rc=0)
         )
         assert verdict.verdict == PASS
+
+
+# ---------------------------------------------------------------------------
+# Task 8372: the structured ``unverifiable`` marker on a fail-closed FLIP
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PROBE_SET = 'probes/my_probes.json'
+_DEFAULT_ARGV = ['python', '-m', 'checker', _DEFAULT_PROBE_SET]
+
+
+def _raising_runner(argv, *, cwd, timeout):
+    raise OSError('spawn failed')
+
+
+class TestUnverifiableVerdict:
+    """``SubstrateVerdict.unverifiable`` marks a FLIP that no probe result backs."""
+
+    @pytest.mark.parametrize(
+        ('task', 'run_subprocess', 'exit_code', 'checker_ran'),
+        [
+            pytest.param(make_probe_task(), fake_checker(rc=127), 127, True, id='rc127'),
+            pytest.param(make_probe_task(), fake_checker(rc=255), 255, True, id='rc255'),
+            pytest.param(make_probe_task(), fake_checker(rc=99), 99, True, id='rc99-sentinel'),
+            pytest.param(make_probe_task(), _raising_runner, None, True, id='runner-raised'),
+            pytest.param(
+                {'id': '42', 'metadata': {'substrate_probe': 'oops'}},
+                fake_checker(rc=0), None, False, id='malformed',
+            ),
+            pytest.param(
+                {'id': '42', 'metadata': {'substrate_probe': {'probe_set': '', 'checker': ['py']}}},
+                fake_checker(rc=0), None, False, id='empty-probe-set',
+            ),
+            pytest.param(
+                {'id': '42', 'metadata': {'substrate_probe': {'probe_set': 'probes/foo.json', 'checker': []}}},
+                fake_checker(rc=0), None, False, id='no-checker',
+            ),
+        ],
+    )
+    def test_recheck_without_probe_result_is_unverifiable_flip(
+        self, task, run_subprocess, exit_code, checker_ran,
+    ):
+        verdict = gate.run_substrate_recheck(
+            task=task, worktree='/gate/wt', run_subprocess=run_subprocess,
+        )
+        assert verdict.verdict == gate.FLIP
+        assert verdict.unverifiable is True
+        assert verdict.exit_code == exit_code
+        if checker_ran:
+            assert verdict.checker_argv == _DEFAULT_ARGV
+            assert verdict.probe_set == _DEFAULT_PROBE_SET
+
+    @pytest.mark.parametrize(
+        ('task', 'rc', 'expected'),
+        [
+            pytest.param(make_probe_task(), 1, gate.FLIP, id='rc1-fail'),
+            pytest.param(make_probe_task(), 2, gate.FLIP, id='rc2-unprovable'),
+            pytest.param(make_probe_task(), 0, gate.PASS, id='rc0-pass'),
+            pytest.param({'id': '42', 'metadata': {}}, 0, gate.SKIP, id='no-descriptor'),
+        ],
+    )
+    def test_checker_result_or_skip_is_not_unverifiable(self, task, rc, expected):
+        verdict = gate.run_substrate_recheck(
+            task=task, worktree='/gate/wt', run_subprocess=fake_checker(rc=rc),
+        )
+        assert verdict.verdict == expected
+        assert verdict.unverifiable is False
+
+    def test_factory_builds_an_unverifiable_flip(self):
+        verdict = gate.unverifiable_verdict('boom', exit_code=7, probe_set='p.json')
+        assert verdict.verdict == gate.FLIP
+        assert verdict.flipped is True
+        assert verdict.unverifiable is True
+        assert verdict.reason == 'boom'
+        assert verdict.exit_code == 7
+        assert verdict.probe_set == 'p.json'
+        assert verdict.checker_argv is None
+        assert verdict.stdout == ''
+        assert verdict.stderr == ''
+
+    @pytest.mark.parametrize(
+        'non_flip', [pytest.param(gate.PASS, id='pass'), pytest.param(gate.SKIP, id='skip')],
+    )
+    def test_unverifiable_requires_flip_at_construction(self, non_flip):
+        with pytest.raises(ValueError, match=rf'unverifiable.*{re.escape(repr(non_flip))}'):
+            gate.SubstrateVerdict(
+                verdict=non_flip, exit_code=0, checker_argv=None, probe_set=None,
+                reason='x', unverifiable=True,
+            )
 
 
 # ---------------------------------------------------------------------------
