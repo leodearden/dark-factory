@@ -6,8 +6,9 @@ Background
 ----------
 Graphiti node f02a32ea-0efd-4865-94b4-97a412d8ffda (name 'orchestrator',
 group_id='reify') has been observed present in three separate FalkorDB
-graphs: 'reify', 'dark_factory', and 'know_live'. ``GraphitiBackend._driver_for``
-/ ``graph_access.graph`` (fused_memory/backends/graphiti_client.py) use ``group_id``
+graphs: 'reify', 'dark_factory', and 'know_live'.
+``fused_memory/backends/graphiti_client.py::GraphitiBackend._driver_for`` and
+``fused_memory/backends/graph_access.py::FalkorGraphAccess.graph`` use ``group_id``
 VERBATIM as the FalkorDB graph name, with NO canonicalization applied. By
 contrast, ``resolve_project_id`` (fused_memory/models/scope.py) -- which
 lowercases a project root's basename and maps hyphens to underscores -- IS

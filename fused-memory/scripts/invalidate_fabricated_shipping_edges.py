@@ -83,7 +83,7 @@ class EdgeCandidate:
         }
 
 
-async def _find_shipping_edges(graphiti, project_id: str, *, op: str) -> list[EdgeCandidate]:
+async def find_shipping_edges(graphiti, project_id: str, *, op: str) -> list[EdgeCandidate]:
     """Cypher query for RELATES_TO edges with 'shipped via' in fact and no invalid_at."""
     graph = graphiti.graph_access.graph(project_id)
     cypher = (
@@ -230,7 +230,7 @@ async def _run(args: argparse.Namespace) -> int:
     memory = MemoryService(config)
     await memory.initialize()
     try:
-        candidates = await _find_shipping_edges(
+        candidates = await find_shipping_edges(
             memory.graphiti, args.project, op='invalidate_fabricated_shipping_edges',
         )
         logger.info('Found %d candidate shipping-edge(s) in %s',

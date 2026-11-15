@@ -5,7 +5,7 @@ on PYTHONPATH) can be tested without sys.path pollution — the same idiom as
 ``test_cleanup_count_snapshots.py`` / ``test_tag_cgl_eta_rehome_scope.py``.
 
 Scope note: this file covers the ``--apply`` store-mutation preflight
-(task 4293) and ``_find_shipping_edges``' graph read. The script has no injectable ``run(args, memory=...)`` seam —
+(task 4293) and ``find_shipping_edges``' graph read. The script has no injectable ``run(args, memory=...)`` seam —
 ``_run`` builds its own ``FusedMemoryConfig``/``MemoryService`` — but that
 costs nothing here, because the guard is placed ABOVE those lazy imports: a
 denied probe must abort while never importing or constructing a backend at
@@ -233,7 +233,7 @@ class TestFindShippingEdges:
         ))
         backend = make_backend(mock_config, graph_access=FakeGraphAccess({'dark_factory': raw}))
 
-        edges = await _mod._find_shipping_edges(backend, 'dark_factory', op='probe')
+        edges = await _mod.find_shipping_edges(backend, 'dark_factory', op='probe')
 
         assert len(edges) == 1
         (edge,) = edges
