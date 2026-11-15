@@ -193,6 +193,13 @@ class TestQueueChokepoint:
     def test_find_terminal_by_citation_registered_unchanged(self, queue: EscalationQueue):
         assert queue.find_terminal_by_citation('t1', 'infra_issue', 'a' * 40) is None
 
+    def test_newest_terminal_by_task_rejects_unregistered(self, queue: EscalationQueue):
+        with pytest.raises(UnregisteredEscalationCategory):
+            queue.newest_terminal_by_task('t1', 'nope', lambda esc: True)
+
+    def test_newest_terminal_by_task_registered_unchanged(self, queue: EscalationQueue):
+        assert queue.newest_terminal_by_task('t1', 'infra_issue', lambda esc: True) is None
+
     def test_legacy_unregistered_record_loads_lists_and_resolves(
         self, queue: EscalationQueue,
     ):
