@@ -1125,6 +1125,60 @@ class TestBarrenStreakDue:
         assert trickle_state.barren_streak_due(state, threshold) is due
 
 
+_NIGHT_KINDS = {
+    'barren': dict(below_sampling_cut=3),
+    'failed': dict(exit_code=1),
+    'deferred': dict(capped=True, selected_count=1),
+    'productive': dict(selected_count=1),
+}
+
+
+def _reached_on(kinds, max_runs) -> list[int]:
+    """The 1-based nights of the *kinds* walk, folded one after another, on
+    which barren_streak_reached is true at *max_runs*."""
+    prior = None
+    reached = []
+    for number, kind in enumerate(kinds, start=1):
+        night = trickle_state.fold_night(
+            prior, 'p', _night(day=number, **_NIGHT_KINDS[kind])
+        )
+        if trickle_state.barren_streak_reached(night, max_runs):
+            reached.append(number)
+        prior = night.state
+    return reached
+
+
+class TestBarrenStreakReached:
+    """The nightly's barren-streak escalation schedule: the threshold, then
+    each later multiple of it in BARREN_ESCALATION_MULTIPLES, then silence
+    until a productive or quiet night resets the streak."""
+
+    def test_a_persistent_streak_reescalates_on_a_doubling_backoff_then_stops(self):
+        assert _reached_on(
+            ['barren'] * 30, trickle_state.DEFAULT_MAX_BARREN_RUNS
+        ) == [3, 6, 12, 24]
+
+    @pytest.mark.parametrize('threshold', [1, 2, 5])
+    def test_the_schedule_is_multiples_of_the_threshold(self, threshold):
+        expected = [
+            threshold * multiple
+            for multiple in trickle_state.BARREN_ESCALATION_MULTIPLES
+            if threshold * multiple <= 30
+        ]
+        assert _reached_on(['barren'] * 30, threshold) == expected
+
+    @pytest.mark.parametrize('kinds', [
+        ['barren'] * 5 + ['failed'] + ['barren'],
+        ['barren'] * 6 + ['deferred', 'barren'],
+    ], ids=['failed', 'deferred'])
+    def test_a_carried_night_neither_fires_nor_shifts_the_schedule(self, kinds):
+        assert _reached_on(kinds, trickle_state.DEFAULT_MAX_BARREN_RUNS) == [3, 6]
+
+    def test_a_reset_rearms_the_schedule_from_its_start(self):
+        kinds = ['barren'] * 6 + ['productive'] + ['barren'] * 3
+        assert _reached_on(kinds, trickle_state.DEFAULT_MAX_BARREN_RUNS) == [3, 6, 10]
+
+
 class TestBarrenRemedy:
     """Each barren door has ONE remedy, spelled once."""
 

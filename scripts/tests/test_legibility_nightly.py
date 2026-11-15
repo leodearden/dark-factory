@@ -5157,23 +5157,25 @@ class TestBarrenStreakEscalation:
         assert runner.recorded()['barren_escalated'] is True
 
 
+def _health_check_posts(runner) -> list:
+    """What the REAL health check posts over *runner*'s recorded night, at
+    the runner's own threshold, with liveness and census probes passing."""
+    posted = []
+    check_trickle_health.run_health_check(
+        project_id='testproj',
+        config_path=runner.config_path,
+        max_barren_runs=runner.max_barren_runs,
+        max_age_hours=_fixture_clock_window_hours(),
+        liveness_runner=lambda project_id, **kwargs: (0, 'OK: ran'),
+        census_runner=lambda project_id, **kwargs: (0, 'OK: no fire'),
+        poster=lambda url, arguments: posted.append(arguments),
+    )
+    return posted
+
+
 class TestANonDefaultThresholdEndToEnd:
     """BOUNDARY ROW 6: a nightly at ``max_barren_runs=5``, the real progress
     probe and the health check agree through the recorded fact."""
-
-    @staticmethod
-    def _health_posts(runner) -> list:
-        posted = []
-        check_trickle_health.run_health_check(
-            project_id='testproj',
-            config_path=runner.config_path,
-            max_barren_runs=5,
-            max_age_hours=_fixture_clock_window_hours(),
-            liveness_runner=lambda project_id, **kwargs: (0, 'OK: ran'),
-            census_runner=lambda project_id, **kwargs: (0, 'OK: no fire'),
-            poster=lambda url, arguments: posted.append(arguments),
-        )
-        return posted
 
     def test_five_barren_nights_escalate_once_and_the_health_check_stays_silent(
         self, tmp_path,
@@ -5192,12 +5194,34 @@ class TestANonDefaultThresholdEndToEnd:
             f'stdout={probe.stdout!r} stderr={probe.stderr!r}'
         )
         assert 'barren_escalated=True' in probe.stderr
-        assert self._health_posts(runner) == []
+        assert _health_check_posts(runner) == []
 
         sixth = runner.night(18, 'barren')
 
         assert sixth.barren_escalated is False
-        assert len(self._health_posts(runner)) == 1
+        assert len(_health_check_posts(runner)) == 1
+
+
+class TestBarrenReescalationBackoff:
+    """A persistent barren streak re-escalates from the nightly at each
+    point of trickle_state.BARREN_ESCALATION_MULTIPLES, and the health
+    check covers the nights between them without double-posting."""
+
+    def test_the_health_check_is_silent_on_a_reescalation_night(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        for day in (13, 14, 15, 16, 17):
+            runner.night(day, 'barren')
+
+        assert len(_health_check_posts(runner)) == 1, (
+            'night five falls between escalations, so the health check posts'
+        )
+
+        sixth = runner.night(18, 'barren')
+
+        assert sixth.barren_escalated is True
+        assert runner.recorded()['barren_escalated'] is True
+        assert _health_check_posts(runner) == []
+        assert len(_streak_escalations(runner.escalations)) == 2
 
 
 class TestADeferredNightIsRecordedAsDeferred:
