@@ -3,8 +3,8 @@
 Drives the public ``TaskWorkflow.run()`` over a real GitOps and repo: task 42's
 worktree is pre-created with a commit that conflicts with a later commit on
 main, so the workflow's own ``create_worktree`` takes the real reuse path,
-whose rebase fails and aborts exactly as in production. The method-level
-checks pin the skips and the fail-open stance of ``_settle_conflicting_base``.
+whose rebase fails and aborts exactly as in production. The same scene pins
+the train and external-worktree skips and the fail-open probe.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _recording_event_store import _RecordingEventStore
-from _workflow_helpers import AgentStub, _build_workflow, _init_repo, _make, agent_side_artifacts
+from _workflow_helpers import AgentStub, _build_workflow, _init_repo, agent_side_artifacts
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
@@ -73,7 +73,7 @@ def _config(repo: Path) -> OrchestratorConfig:
     )
 
 
-def _assignment() -> TaskAssignment:
+def _assignment(extra_metadata: dict[str, Any]) -> TaskAssignment:
     return TaskAssignment(
         task_id='42',
         task={
@@ -81,7 +81,7 @@ def _assignment() -> TaskAssignment:
             'title': 'Add farewell function',
             'description': 'Add a farewell(name) function to lib.py with tests',
             'status': 'pending',
-            'metadata': {'files': ['lib']},
+            'metadata': {'files': ['lib'], **extra_metadata},
             'dependencies': [],
         },
         modules=['lib'],
@@ -151,8 +151,10 @@ def git_ops(repo: Path) -> GitOps:
 
 async def _run(
     repo: Path, git_ops: GitOps, stub: AgentStub, monkeypatch: pytest.MonkeyPatch,
+    *, extra_metadata: dict[str, Any] | None = None, external_worktree: Path | None = None,
 ) -> tuple[TerminalReport, _RecordingEventStore]:
-    workflow, _ = _build_workflow(_config(repo), git_ops, _assignment(), stub)
+    workflow, _ = _build_workflow(_config(repo), git_ops, _assignment(extra_metadata or {}), stub)
+    workflow.worktree = external_worktree
     store = _RecordingEventStore()
     monkeypatch.setattr(workflow, 'event_store', store)
     monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
@@ -210,42 +212,55 @@ class TestResumedConflictingBranch:
         assert _events(store, EVENT) == []
 
 
-def _git_worktree(path: Path) -> Path:
-    path.mkdir(parents=True)
-    _git(path, 'init', '-q', '-b', 'main')
-    _git(path, 'config', 'user.email', 't@example.com')
-    _git(path, 'config', 'user.name', 'T')
-    _commit_file(path, 'README', 'r\n', 'init')
-    return path
+class _FailFirstProbe:
+    """GitOps.merge_tree_conflicts that raises on its first call, then answers for real."""
+
+    def __init__(self, git_ops: GitOps) -> None:
+        self._real = git_ops.merge_tree_conflicts
+        self.calls = 0
+
+    async def __call__(self, base_tip: str, branch_head: str) -> Any:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError('boom')
+        return await self._real(base_tip, branch_head)
 
 
 @pytest.mark.asyncio
-class TestSettleConflictingBaseGuards:
-    async def test_train_member_is_skipped(self, tmp_path, monkeypatch):
-        f = _make(worktree=_git_worktree(tmp_path / 'wt'), project_root=tmp_path / 'proj')
-        f.wf.task['metadata'] = {'train': {'id': 't1', 'order': 0}}
-        probe = AsyncMock()
-        monkeypatch.setattr(f.wf.git_ops, 'merge_tree_conflicts', probe)
+class TestSettlementGuards:
+    """Each guard leaves a conflicting resumed branch to plan unsettled."""
 
-        assert await f.wf._settle_conflicting_base() is None
-        probe.assert_not_awaited()
+    async def test_train_member_is_skipped(self, repo, git_ops, monkeypatch):
+        scene = await _scene(git_ops, main_file=GREET_FILE)
+        stub = _SettlingStub(resolve=False, main_sha=scene.main_sha)
 
-    async def test_external_worktree_is_skipped(self, tmp_path, monkeypatch):
-        f = _make(worktree=_git_worktree(tmp_path / 'wt'), project_root=tmp_path / 'proj')
-        f.wf._worktree_external = True
-        probe = AsyncMock()
-        monkeypatch.setattr(f.wf.git_ops, 'merge_tree_conflicts', probe)
+        _, store = await _run(
+            repo, git_ops, stub, monkeypatch, extra_metadata={'train': {'id': 't1', 'order': 0}},
+        )
 
-        assert await f.wf._settle_conflicting_base() is None
-        probe.assert_not_awaited()
+        assert stub.calls[0] == 'architect'
+        assert stub.architect_saw_main is False
+        assert _events(store, EVENT) == []
 
-    async def test_probe_failure_fails_open_into_planning(self, tmp_path, monkeypatch):
-        f = _make(worktree=_git_worktree(tmp_path / 'wt'), project_root=tmp_path / 'proj')
-        probe = AsyncMock(side_effect=RuntimeError('boom'))
-        invoke = AsyncMock()
-        monkeypatch.setattr(f.wf.git_ops, 'merge_tree_conflicts', probe)
-        monkeypatch.setattr(f.wf, '_invoke', invoke)
+    async def test_external_worktree_is_skipped(self, repo, git_ops, monkeypatch):
+        scene = await _scene(git_ops, main_file=GREET_FILE)
+        stub = _SettlingStub(resolve=False, main_sha=scene.main_sha)
 
-        assert await f.wf._settle_conflicting_base() is None
-        probe.assert_awaited_once()
-        invoke.assert_not_awaited()
+        _, store = await _run(repo, git_ops, stub, monkeypatch, external_worktree=scene.worktree)
+
+        assert stub.calls[0] == 'architect'
+        assert stub.architect_saw_main is False
+        assert _events(store, EVENT) == []
+
+    async def test_probe_failure_fails_open_into_planning(self, repo, git_ops, monkeypatch):
+        scene = await _scene(git_ops, main_file=GREET_FILE)
+        stub = _SettlingStub(resolve=False, main_sha=scene.main_sha)
+        probe = _FailFirstProbe(git_ops)
+        monkeypatch.setattr(git_ops, 'merge_tree_conflicts', probe)
+
+        _, store = await _run(repo, git_ops, stub, monkeypatch)
+
+        assert probe.calls >= 1
+        assert stub.calls[0] == 'architect'
+        assert stub.architect_saw_main is False
+        assert _events(store, EVENT) == []
