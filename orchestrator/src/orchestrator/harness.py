@@ -50,6 +50,7 @@ from shared.project_layout import (
     runs_db,
     startup_failures_json,
 )
+from shared.psi import resolve_own_cgroup
 from shared.repo_paths import (
     rejected_dark_factory_root_override,
     resolve_dark_factory_root,
@@ -173,6 +174,7 @@ from orchestrator.pause_policy import (
     policy_for,
 )
 from orchestrator.proc_supervision import EscalationSpec
+from orchestrator.project_slice_weight import ensure_project_slice_weight
 from orchestrator.provenance_conflict import ProvenanceConflictSink
 from orchestrator.quarantine_provenance import QuarantineOutcome
 from orchestrator.recovery_emission import (
@@ -2825,6 +2827,7 @@ class Harness:
                 StartupStep('1c0b', self._file_restored_pause_escalation),
                 StartupStep('1c1g', self._run_interactive_worktree_reaper_pass),
                 StartupStep('1c1h', self._run_leftover_verify_scope_reaper_pass),
+                StartupStep('1c1i', self._ensure_project_slice_weight),
             )
             task_tree_steps = (
                 StartupStep('2c', self._recover_crashed_tasks),
@@ -9365,6 +9368,13 @@ class Harness:
                 type(exc).__name__,
                 exc,
             )
+
+    async def _ensure_project_slice_weight(self) -> None:
+        """Give this project's slice its CPUWeight when the daemon runs directly
+        under it; the module never raises for that and logs its own outcome."""
+        await ensure_project_slice_weight(
+            self.config.fused_memory.project_id, resolve_own_cgroup(None).path,
+        )
 
     async def _block_and_escalate_cross_repo(
         self,
