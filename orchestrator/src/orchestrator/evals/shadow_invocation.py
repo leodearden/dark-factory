@@ -15,6 +15,7 @@ from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.eval_gate import GATE_UNSET, InjectedGate
 from orchestrator.evals.results import EvalResult, ResultStore
 from orchestrator.evals.runner import build_eval_orch_config, run_end_to_end, run_eval
+from orchestrator.verify import run_scoped_verification
 
 __all__ = ['build_shadow_orch_config', 'run_shadow_end_to_end', 'run_shadow_eval']
 
@@ -67,11 +68,14 @@ async def run_shadow_eval(
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
 ) -> EvalResult:
-    """``run_eval`` with its cell config built by ``build_shadow_orch_config``."""
+    """``run_eval`` with its cell config built by ``build_shadow_orch_config``.
+
+    The cell keeps production's scoped task gate.
+    """
     return await run_eval(
         task_path, config, base_config, trial, timeout_override, worktree_path,
         judge_config=judge_config, usage_gate=usage_gate, store=store,
-        orch_config_builder=build_shadow_orch_config,
+        orch_config_builder=build_shadow_orch_config, task_gate=run_scoped_verification,
     )
 
 
@@ -86,8 +90,12 @@ async def run_shadow_end_to_end(
     usage_gate: InjectedGate = GATE_UNSET,
     store: ResultStore | None = None,
 ) -> EvalResult:
-    """``run_end_to_end`` with its cell config built by ``build_shadow_orch_config``."""
+    """``run_end_to_end`` with its cell config built by ``build_shadow_orch_config``.
+
+    The cell keeps production's scoped task gate.
+    """
     return await run_end_to_end(
         task_path, arch_config, impl_config, base_config, trial, timeout_override,
         usage_gate=usage_gate, store=store, orch_config_builder=build_shadow_orch_config,
+        task_gate=run_scoped_verification,
     )
