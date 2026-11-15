@@ -55,7 +55,9 @@ cannot move the verdict either way.
 
 Those predicates are deliberately **retained, not retired**: they are
 still the script's delete-set contract, still reachable via `--delete-ids`,
-still the only collector for any project not yet probed, and the blind-spot
+still the only collector for dead weight the in-cycle 14-day age GC never
+reaches (orphan, taskless or terminal-task markers that are younger than 14
+days or undated, and any id named in `--delete-ids`), and the blind-spot
 cross-check below is *defined* as the comparison between that `source`
 enumeration and the adjacent population.
 

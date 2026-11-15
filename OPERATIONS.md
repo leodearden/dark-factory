@@ -3762,9 +3762,11 @@ targets, task 2966 for the `flag_for_stage2` relay pool. So a night that
 deletes **zero** records is the healthy steady state, not evidence the
 timer is broken. A zero is not self-certifying either: since task 3897 each
 run emits a `cross_check` block whose `blind_spot: true` means "saw
-nothing" rather than "there was nothing", and since task 3923 an observed
-blind spot fails `--check` by default — see the per-job doc's "Reading
-the output" section before reading a clean count as a clean bill.
+nothing" rather than "there was nothing" — see the per-job doc's "Reading
+the output" section before reading a clean count as a clean bill. The
+nightly run passes no `--check`, so it reports a blind spot in `cross_check` and never
+goes `failed` on one; since task 3923 an observed blind spot fails an
+ad-hoc `--check` run by default.
 `scripts/fused-memory-flag-marker-check.sh` is the read-only ad-hoc census
 counterpart for running that same probe by hand (its `before_done` gate
 role was retired by task 3923; it refuses `--apply` outright).

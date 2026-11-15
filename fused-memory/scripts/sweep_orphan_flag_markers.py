@@ -58,10 +58,9 @@ that automatic drain, not the only thing standing between the repo and an unboun
 pool. Task 3498 ruled this script KEPT, but corrected *why*: its load-bearing
 role is the task-3897 ``cross_check`` census — the only instrument that renders
 ``orphan_count: 0`` legible as "saw nothing" rather than "there was nothing" —
-and NOT the drain. Both clauses previously claimed here are stale:
-``--delete-ids``/``--terminal-drain`` are not independent of the enumeration
-(``targeted`` is the intersection of ``delete_ids`` with ``members``, the same
-``source``-filtered scroll every predicate reads), and task 3923 retired the
+and NOT the drain. ``--delete-ids`` and ``--terminal-drain`` read the same
+``source``-filtered ``members`` scroll every predicate reads (``targeted`` is
+the intersection of ``delete_ids`` with ``members``), and task 3923 retired the
 ``--check --max-backlog`` gate for want of any ``before_done`` consumer. The
 delete-set predicates are retained per task 3897's own MEASURED-ZERO-RETAINED
 ruling; full rationale in ``docs/flag-marker-sweep-recurring.md`` §"Decision
@@ -88,7 +87,8 @@ MEASURED-ZERO, RETAINED (task 3897, work item (c)). Both predicates below —
 (missing ``task_id``) — operate on a population that measures 0 in every project
 probed, and are deliberately KEPT rather than retired: they remain this script's
 delete-set contract, stay reachable through ``--delete-ids``, are the only
-collector for any not-yet-probed project's legacy pool, and the blind-spot
+collector for dead weight the in-cycle 14-day age GC never reaches (markers
+younger than 14 days or undated), and the blind-spot
 cross-check is DEFINED as the comparison between this ``source`` enumeration and
 the adjacent population. Full rationale and the dated census:
 ``docs/flag-marker-sweep-recurring.md``.
