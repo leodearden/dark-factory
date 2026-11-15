@@ -43,6 +43,10 @@ MERGE_STATE_PINNED_SITES_LIST = governed_exceptions(
     sorted(merge_state_vocabulary_consistency.PINNED_SITES),
     default=Debt(TaskRef(7136)),
     default_covers=5,
+    dispositions={
+        'ARCHITECTURE.md': Debt(TaskRef(7136)),
+        'OPERATIONS.md': Debt(TaskRef(7136)),
+    },
 )
 
 INLINE_SUPPRESSION_BASELINE = governed_exceptions(
