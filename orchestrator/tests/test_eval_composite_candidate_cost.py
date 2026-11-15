@@ -20,7 +20,7 @@ from orchestrator.evals.results import EvalResult
 
 def _cell(
     task_id, config, trial, *, role='architect', cost_usd, judge_cost_usd=0.0,
-    quality=0.8, plan_steps=6, duration_ms=1000, tests_pass=None,
+    quality: float | None = 0.8, plan_steps=6, duration_ms=1000, tests_pass=None,
     cap_tainted=False, invocation_errors=None,
 ):
     """An EvalResult with production-shaped metrics.
@@ -33,7 +33,7 @@ def _cell(
         tests_pass=tests_pass,
         cost_usd=cost_usd,
         workflow_duration_ms=duration_ms,
-        composite_score=None if plan_only else quality,
+        composite_score=0.0 if plan_only or quality is None else quality,
         plan_quality=quality if plan_only else None,
         role_under_test=RoleUnderTest(role),
         plan_steps=plan_steps,
