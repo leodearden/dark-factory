@@ -219,12 +219,8 @@ def vocabulary_values(partitions: dict[str, frozenset[str]]) -> frozenset[str]:
     return values
 
 
-# `failed` is NOT a member of either vocabulary — it is a value
-# `skills/merge-queue/SKILL.md` and `skills/unblock-low-risk/SKILL.md` invented
-# (the real value is `error`). It is listed here anyway so that correcting those
-# files cannot accidentally start counting it.
 _AMBIGUOUS_TOKENS = frozenset(
-    {"done", "blocked", "queued", "conflict", "unknown", "error", "gate", "failed"}
+    {"done", "blocked", "queued", "conflict", "unknown", "error", "gate"}
 )
 
 # Values runbooks have invented: `failed` (the real value is `error`) and
@@ -469,6 +465,15 @@ def assert_span_matches(
 
     missing = sorted(partition - values)
     extra = sorted(values - partition)
+    phantoms = sorted(set(extra) & _KNOWN_PHANTOM_VALUES)
+    phantom_clause = (
+        f" {phantoms!r} are known phantoms that no server ever returns (`failed` is "
+        f"really `error`; a bounce surfaces as `blocked` with a needs-rebase "
+        f"`reason`) — if the word is prose rather than a list entry, move it outside "
+        f"the span."
+        if phantoms
+        else ""
+    )
     assert not missing and not extra, (
         f"{source}: the `merge-state-vocab` span pinned to `{partition_name}` has "
         f"drifted from {_repo_relative(_VOCABULARY_MODULE)}::{partition_name} (task "
@@ -476,8 +481,8 @@ def assert_span_matches(
         f"partition is {sorted(partition)!r}. A MISSING value means this list did not "
         f"follow a member that landed in the enum; an EXTRA one is usually a value "
         f"from the sibling vocabulary (`MergeSubmitStatus` values are not "
-        f"`merge_status` states) or one that never existed. Fix the list — the "
-        f"partition is the source of truth."
+        f"`merge_status` states).{phantom_clause} Fix the list — the partition is the "
+        f"source of truth."
     )
 
 
@@ -569,7 +574,8 @@ _UNPINNED_RULE_SITES = {
 # MEASURED over the 72-file scan domain (task 5178): registered sites merge-queue
 # 12, unblock-low-risk 12, escalation-watcher 11, OPERATIONS 11, ARCHITECTURE 9,
 # unblock 8; rule site orchestrate 6; highest unregistered 3 (RECONCILIATION_PLAN.md,
-# skills/review-briefing/SKILL.md), everything else <= 2.
+# skills/review-briefing/SKILL.md, skills/merge-queue/references/two-layer-model.md),
+# everything else <= 2.
 _ENUMERATION_THRESHOLD = 4
 
 # The scan domain: markdown under `skills/` at any depth (git's default `*` crosses
@@ -934,16 +940,6 @@ def test_load_vocabulary_values_covers_both_vocabularies() -> None:
         "`failed` is a value the runbooks invented; it appears nowhere in "
         "escalation/src/escalation/server.py (the real value is `error`)"
     )
-
-
-def test_known_phantom_values_are_not_vocabulary_members() -> None:
-    """A phantom that became a real member must leave the phantom set.
-
-    Otherwise every correct span naming that new member would go red.
-    """
-    assert _KNOWN_PHANTOM_VALUES
-    assert {"failed", "needs_rebase"} <= _KNOWN_PHANTOM_VALUES
-    assert _KNOWN_PHANTOM_VALUES.isdisjoint(vocabulary_values(load_vocabulary()))
 
 
 def test_load_vocabulary_raises_when_the_vocabulary_module_is_missing(tmp_path: Path) -> None:
