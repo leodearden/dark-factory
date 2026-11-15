@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import json
 from collections.abc import Mapping
 
 import pytest
@@ -245,9 +244,8 @@ class TestMergeRoleTable:
         assert '-1' in message
 
     def test_non_mapping_row_is_rejected_naming_role_and_value(self) -> None:
-        raw = json.loads('{"architect": "opus"}')
         with pytest.raises(ValueError) as caught:
-            merge_role_table(DEFAULTS, raw)
+            merge_role_table(DEFAULTS, {'architect': 'opus'})
         message = str(caught.value)
         assert 'architect' in message
         assert 'opus' in message
