@@ -1145,7 +1145,8 @@ class GraphitiBackend:
     TIMEOUT POSTURE.  Every budgeted read and write follows the rule stated in
     ``backends/timeout_budget.py``.  Raw Cypher is budgeted by the
     ``GraphHandle`` that :attr:`graph_access` resolves
-    (``backends/graph_access.py``); graphiti_core calls go through
+    (``backends/graph_access.py``), and graph listings by its
+    ``GraphAccess.list_graphs``; graphiti_core calls go through
     :meth:`_timed_read` / :meth:`_timed_write`.  The one exception is index
     provisioning (``_ensure_indices``, ``provision_registered_graphs``): it
     runs on its own ``_index_provision_timeout`` budget and never raises, per
@@ -1478,7 +1479,7 @@ class GraphitiBackend:
             )
 
     async def _provision_existing_registered_graphs(self) -> None:
-        existing = await self._require_falkor_client().list_graphs()
+        existing = await self.graph_access.list_graphs()
         for graph_name in sorted(set(existing) & self._registered_graph_ids):
             await self._ensure_indices(graph_name)
 
@@ -5130,7 +5131,7 @@ class GraphitiBackend:
           graph that does not exist yet DOES carry zero indices and is provisioned
           from scratch — measured, the CREATE statements auto-create the key, so
           this is self-healing.  Absence is decided STRUCTURALLY
-          (``group_id not in await client.list_graphs()``), never by matching
+          (``group_id not in await self.graph_access.list_graphs()``), never by matching
           FalkorDB's error wording (D2).
         * **Serialized per graph.**  The read-diff-write section runs under a
           per-``group_id`` ``asyncio.Lock`` (``_index_provision_locks``, an
@@ -5255,10 +5256,10 @@ class GraphitiBackend:
             # which would issue every statement against a graph that may already
             # be fully provisioned.
             #
-            # The RAW client's list_graphs() is used, not GraphitiBackend's, which
-            # filters `default_db` / `*_db` and would misclassify those names as
-            # absent.
-            if group_id in await self._require_falkor_client().list_graphs():
+            # The provider's UNFILTERED listing is used, not
+            # GraphitiBackend.list_graphs(), which filters `default_db` / `*_db`
+            # and would misclassify those names as absent.
+            if group_id in await self.graph_access.list_graphs():
                 raise
             records = []
 
@@ -5525,8 +5526,7 @@ class GraphitiBackend:
 
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
-        client = self._require_falkor_client()
-        all_graphs = await client.list_graphs()
+        all_graphs = await self.graph_access.list_graphs()
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
     async def node_count(self, graph_name: str) -> int:
