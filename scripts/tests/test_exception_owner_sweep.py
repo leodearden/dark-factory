@@ -785,6 +785,109 @@ def test_a_submit_error_is_a_fused_memory_failure(project_root, seed):
 
 
 # ---------------------------------------------------------------------------
+# D11 idempotence across the info-L0 router, which dismisses every sweep
+# escalation and converts it into a task carrying metadata.escalation_id.
+
+LIST_2733_DOCUMENT = register_document(declarations=(_declaration(LIST_SCOPE, default=Debt(TaskRef(2733))),))
+LIST_2733 = parse_register(LIST_2733_DOCUMENT)
+
+
+@pytest.mark.parametrize('promote', [False, True], ids=['l0-converted', 'l1-converted'])
+def test_a_dismissed_escalation_whose_conversion_is_live_is_not_raised_again(project_root, seed, promote):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]))
+    ports = ports_for(project_root, stub)
+    sweep_once(LIST_2733, ports)
+    stub.route_info_notes(convert_to=9500, promote=promote)
+
+    tally = act_once(LIST_2733, ports)
+
+    assert len(stub.tool_calls('escalate_info')) == 1
+    assert (tally.counts().skipped_existing, tally.counts().escalated) == (1, 0)
+    assert [report.step for report in tally.reports] == [Performed.SKIPPED_EXISTING]
+
+
+def test_an_inline_finding_whose_closed_task_escalated_is_not_escalated_again(project_root, seed):
+    db = seed(
+        [
+            {'id': 2733, 'status': 'done'},
+            {'id': 5000, 'status': 'done', 'metadata': {FINDING_KEY_FIELD: DEAD_2733.record()}},
+        ]
+    )
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    assert sweep_once(INLINE_2733, ports).escalated == 1
+    stub.route_info_notes(convert_to=9500)
+
+    sweep_once(INLINE_2733, ports)
+
+    assert len(stub.tool_calls('escalate_info')) == 1
+    assert stub.tool_calls('submit_task') == []
+
+
+def test_a_conversion_counts_only_for_an_escalation_its_own_key_filed(project_root, seed):
+    db = seed([{'id': 27, 'status': 'done'}, {'id': 2733, 'status': 'done'}])
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    key_27, key_2733 = (FindingKey(FindingKind.DEAD_OWNER, LIST_SCOPE, TaskRef(n)) for n in (27, 2733))
+    register = view(Citation(LIST_SCOPE, TaskRef(27), ('k1',)), Citation(LIST_SCOPE, TaskRef(2733), ('k2',)))
+    sweep_once(register, ports)
+    assert len(stub.tool_calls('escalate_info')) == 2
+    stub.route_info_notes(convert_to=None)
+    (id_2733,) = [record['id'] for record in stub.filed if record['task_id'] == key_2733.escalation_task_id()]
+    assert id_2733.startswith(f'esc-{key_27.escalation_task_id()}')
+    insert_task(db, 9500, {'escalation_id': id_2733})
+
+    sweep_once(register, ports)
+
+    escalated = stub.tool_calls('escalate_info')
+    assert len(escalated) == 3
+    assert escalated[-1]['task_id'] == key_27.escalation_task_id()
+
+
+def test_a_closed_conversion_with_the_owner_still_dead_escalates_once_more(project_root, seed):
+    db = seed([{'id': 2733, 'status': 'done'}])
+    stub = StubMcp(db)
+    ports = ports_for(project_root, stub)
+    sweep_once(LIST_2733, ports)
+    stub.route_info_notes(convert_to=9500)
+    set_status(db, 9500, 'done')
+
+    planned = run_once(project_root, stub, LIST_2733_DOCUMENT, dry_run=True)
+    second = sweep_once(LIST_2733, ports)
+
+    assert [report.step for report in planned.reports] == [Action.ESCALATE_CLOSED_FINDING]
+    assert second.escalated == 1
+    assert len(stub.tool_calls('escalate_info')) == 2
+
+    stub.route_info_notes(convert_to=9501)
+    third = sweep_once(LIST_2733, ports)
+
+    assert len(stub.tool_calls('escalate_info')) == 2
+    assert third.skipped_existing == 1
+
+
+def test_an_unreadable_escalation_history_is_an_escalation_failure(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]), fail_on=frozenset({'get_task_escalations'}))
+
+    with pytest.raises(SweepFailure) as excinfo:
+        sweep_once(LIST_2733, ports_for(project_root, stub))
+
+    assert excinfo.value.stage is FailureStage.ESCALATION
+    assert stub.tool_calls('escalate_info') == []
+
+
+def test_a_dry_run_plans_a_skip_for_a_live_conversion(project_root, seed):
+    stub = StubMcp(seed([{'id': 2733, 'status': 'done'}]))
+    sweep_once(LIST_2733, ports_for(project_root, stub))
+    stub.route_info_notes(convert_to=9500)
+
+    (report,) = run_once(project_root, stub, LIST_2733_DOCUMENT, dry_run=True).reports
+
+    assert report.step is Action('skip_converted_task')
+    assert report.line().endswith('planned skip_converted_task')
+
+
+# ---------------------------------------------------------------------------
 # INV-4: the storm bound, and the slack tighten task (scenarios 20 and 24).
 
 
@@ -1122,7 +1225,7 @@ def test_scenario_23_a_dry_run_reports_what_it_would_do_and_writes_nothing(proje
     result = run_once(project_root, stub, document, dry_run=True)
 
     assert result.ok
-    assert {tool for _, tool, _ in stub.calls} <= {'get_pending_escalations', 'resolve_ticket'}
+    assert {tool for _, tool, _ in stub.calls} <= {'get_pending_escalations', 'get_task_escalations', 'resolve_ticket'}
     assert not stamp_path(project_root).exists()
     assert [(r.scope, r.owner, r.verdict.liveness, r.step) for r in result.reports] == [
         (INLINE_SCOPE, TaskRef(2733), Liveness.DEAD, Action.FILE_TASK),
