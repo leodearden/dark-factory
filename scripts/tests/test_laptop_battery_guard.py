@@ -1,9 +1,8 @@
 """Tests for scripts/laptop_battery_guard.py, the low-battery clean-shutdown
 guard for leo-laptop (task 9051).
 
-Every fake power_supply tree carries ACAD online=1 and a USB-C source node
-reading online=1, the readings that stayed up while the battery ran flat on
-2026-11-08 and 2026-11-10. So each WARN and POWEROFF case here also proves
+Every fake power_supply tree comes from laptop_battery_guard_fixtures, whose
+trees always read AC online, so each WARN and POWEROFF case here also proves
 that AC presence cannot suppress the guard.
 """
 from __future__ import annotations
@@ -24,6 +23,7 @@ from laptop_battery_guard import (
     decide,
     read_batteries,
 )
+from laptop_battery_guard_fixtures import power_supply, write_shims
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -35,35 +35,13 @@ CLI_TIMEOUT = cli_timeout_from_env("LAPTOP_BATTERY_GUARD_CLI_TIMEOUT")
 
 SHIMS = {
     "systemctl": 'echo "systemctl $*" >>"$FAKE_STATE/calls.log"\nexit "${FAKE_SYSTEMCTL_RC:-0}"\n',
-    "systemd-run": 'echo "systemd-run $*" >>"$FAKE_STATE/calls.log"\nexit 0\n',
+    "systemd-run": (
+        'echo "systemd-run $*" >>"$FAKE_STATE/calls.log"\nexit "${FAKE_SYSTEMD_RUN_RC:-0}"\n'
+    ),
     "fake-poweroff": 'echo "poweroff $*" >>"$FAKE_STATE/calls.log"\nexit "${FAKE_POWEROFF_RC:-0}"\n',
 }
 KILL_SCOPES = "systemctl --user --machine=leo@.host kill --signal=SIGKILL df-verify-*.scope"
 STOP_SCOPES = "systemctl --user --machine=leo@.host stop df-verify-*.scope"
-
-
-def _write_node(node: Path, files: dict[str, str]) -> None:
-    node.mkdir(parents=True)
-    for name, value in files.items():
-        (node / name).write_text(f"{value}\n")
-
-
-def power_supply(tmp_path, batteries, extra=()):
-    """A fake /sys/class/power_supply: AC always online, plus *batteries*.
-
-    *batteries* maps a BAT* name to (status, capacity). *extra* is a sequence
-    of (node name, files) pairs for further non-BAT* nodes.
-    """
-    root = tmp_path / "power_supply"
-    _write_node(root / "ACAD", {"type": "Mains", "online": "1"})
-    _write_node(root / "ucsi-source-psy-USBC000:003", {"type": "USB", "online": "1"})
-    for name, files in extra:
-        _write_node(root / name, files)
-    for name, (status, capacity) in batteries.items():
-        _write_node(
-            root / name, {"type": "Battery", "status": status, "capacity": str(capacity)},
-        )
-    return root
 
 
 def readings(*pairs):
@@ -97,6 +75,11 @@ class TestReadBatteries:
         (root / "BAT1" / "capacity").unlink()
         with pytest.raises(BatteryReadError, match=re.escape(str(root / "BAT1" / "capacity"))):
             read_batteries(root)
+
+    def test_missing_power_supply_dir_names_the_path(self, tmp_path):
+        missing = tmp_path / "no-such-power-supply"
+        with pytest.raises(BatteryReadError, match=re.escape(str(missing))):
+            read_batteries(missing)
 
 
 class TestDecide:
@@ -152,11 +135,7 @@ def world(tmp_path):
     """Shims for systemctl, systemd-run and the poweroff command, all logging
     to one calls file so the order of the guard's actions can be asserted."""
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    for name, body in SHIMS.items():
-        shim = bin_dir / name
-        shim.write_text("#!/usr/bin/env bash\n" + body)
-        shim.chmod(0o755)
+    write_shims(bin_dir, SHIMS)
     state = tmp_path / "state"
     state.mkdir()
     return {"tmp": tmp_path, "bin": bin_dir, "state": state}
@@ -232,9 +211,26 @@ class TestCliPoweroff:
         assert "stop df-verify-*.scope" in output
         assert "failed" in output
 
+    def test_notify_failure_never_blocks_the_poweroff(self, world):
+        result = run(world, {"BAT1": ("Discharging", 10)}, FAKE_SYSTEMD_RUN_RC="1")
+        assert result.returncode == 0, result.stderr
+        made = calls(world)
+        assert made.index(KILL_SCOPES) < made.index(STOP_SCOPES) < made.index("poweroff --now")
+        assert made[-1] == "poweroff --now"
+        assert "notify-send" in result.stderr
+
     def test_poweroff_failure_exits_1(self, world):
         result = run(world, {"BAT1": ("Discharging", 10)}, FAKE_POWEROFF_RC="1")
         assert result.returncode == 1
+        assert "poweroff request failed" in result.stderr
+
+    def test_missing_poweroff_command_exits_1(self, world):
+        missing = world["tmp"] / "no-such-poweroff"
+        result = run(
+            world, {"BAT1": ("Discharging", 10)}, BATTERY_GUARD_POWEROFF_CMD=str(missing),
+        )
+        assert result.returncode == 1
+        assert str(missing) in result.stderr
         assert "poweroff request failed" in result.stderr
 
     def test_floor_is_configurable(self, world):
@@ -259,11 +255,34 @@ class TestCliDryRun:
 
 
 class TestCliRefusals:
-    def test_malformed_env_value_exits_2(self, world):
-        result = run(world, {"BAT1": ("Discharging", 5)}, BATTERY_GUARD_FLOOR_PERCENT="ten")
+    @pytest.mark.parametrize(
+        ("var", "raw"),
+        [
+            ("BATTERY_GUARD_FLOOR_PERCENT", "ten"),
+            ("BATTERY_GUARD_FLOOR_PERCENT", "101"),
+            ("BATTERY_GUARD_WARN_MARGIN_PERCENT", "-1"),
+        ],
+    )
+    def test_bad_threshold_exits_2_naming_the_var(self, world, var, raw):
+        result = run(world, {"BAT1": ("Discharging", 5)}, **{var: raw})
         assert result.returncode == 2
-        assert "BATTERY_GUARD_FLOOR_PERCENT" in result.stderr
-        assert "ten" in result.stderr
+        assert f"{var}={raw}" in result.stderr
+        assert calls(world) == []
+
+    @pytest.mark.parametrize("raw", ["", '"unterminated'])
+    def test_bad_poweroff_command_exits_2(self, world, raw):
+        result = run(world, {"BAT1": ("Discharging", 5)}, BATTERY_GUARD_POWEROFF_CMD=raw)
+        assert result.returncode == 2
+        assert "BATTERY_GUARD_POWEROFF_CMD" in result.stderr
+        assert calls(world) == []
+
+    def test_missing_power_supply_dir_exits_1(self, world):
+        missing = world["tmp"] / "typo"
+        result = run(
+            world, {"BAT1": ("Discharging", 5)}, BATTERY_GUARD_POWER_SUPPLY_DIR=str(missing),
+        )
+        assert result.returncode == 1
+        assert str(missing) in result.stderr
         assert calls(world) == []
 
     def test_unreadable_battery_exits_1_without_acting(self, world):

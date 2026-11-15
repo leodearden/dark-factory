@@ -22,8 +22,8 @@ import shlex
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from enum import Enum
+from dataclasses import dataclass, fields
+from enum import Enum, auto
 from pathlib import Path
 
 DEFAULT_POWER_SUPPLY_DIR = Path("/sys/class/power_supply")
@@ -38,6 +38,8 @@ SYSTEMCTL_TIMEOUT_SECS = 30
 POWEROFF_TIMEOUT_SECS = 60
 
 DISCHARGING = "Discharging"
+PERCENT_RANGE = range(101)
+_PERCENT_RANGE_TEXT = f"within {PERCENT_RANGE[0]}..{PERCENT_RANGE[-1]}"
 
 
 @dataclass(frozen=True)
@@ -48,10 +50,10 @@ class BatteryReading:
 
 
 class Verdict(Enum):
-    NO_BATTERY = "no battery"
-    OK = "ok"
-    WARN = "warn"
-    POWEROFF = "poweroff"
+    NO_BATTERY = auto()
+    OK = auto()
+    WARN = auto()
+    POWEROFF = auto()
 
 
 @dataclass(frozen=True)
@@ -60,16 +62,10 @@ class Thresholds:
     warn_margin_percent: int
 
     def __post_init__(self) -> None:
-        for name in ("floor_percent", "warn_margin_percent"):
-            value = getattr(self, name)
-            if not 0 <= value <= 100:
-                raise ThresholdError(name, value)
-
-
-class ThresholdError(ValueError):
-    def __init__(self, field: str, value: int) -> None:
-        super().__init__(f"{field} must be within 0..100, got {value}")
-        self.field = field
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if value not in PERCENT_RANGE:
+                raise ValueError(f"{field.name} must be {_PERCENT_RANGE_TEXT}, got {value}")
 
 
 class BatteryReadError(Exception):
@@ -107,6 +103,8 @@ def _read_battery(node: Path) -> BatteryReading:
 
 
 def read_batteries(power_supply_dir: Path) -> tuple[BatteryReading, ...]:
+    if not power_supply_dir.is_dir():
+        raise BatteryReadError(f"{power_supply_dir}: not a directory")
     return tuple(_read_battery(node) for node in sorted(power_supply_dir.glob("BAT*")))
 
 
@@ -127,29 +125,30 @@ def describe(readings: Sequence[BatteryReading]) -> str:
     return ", ".join(f"{r.name} {r.status} {r.capacity}%" for r in readings)
 
 
-_THRESHOLD_ENV = (
-    ("floor_percent", "BATTERY_GUARD_FLOOR_PERCENT", DEFAULT_FLOOR_PERCENT),
-    ("warn_margin_percent", "BATTERY_GUARD_WARN_MARGIN_PERCENT", DEFAULT_WARN_MARGIN_PERCENT),
-)
+_THRESHOLD_ENV = {
+    "floor_percent": ("BATTERY_GUARD_FLOOR_PERCENT", DEFAULT_FLOOR_PERCENT),
+    "warn_margin_percent": ("BATTERY_GUARD_WARN_MARGIN_PERCENT", DEFAULT_WARN_MARGIN_PERCENT),
+}
 
 
-def _env_int(environ: Mapping[str, str], var: str, default: int) -> int:
+def _env_percent(environ: Mapping[str, str], var: str, default: int) -> int:
     raw = environ.get(var)
     if raw is None:
         return default
     try:
-        return int(raw)
+        value = int(raw)
     except ValueError:
         raise ConfigError(f"{var}={raw}: not an integer") from None
+    if value not in PERCENT_RANGE:
+        raise ConfigError(f"{var}={raw}: must be {_PERCENT_RANGE_TEXT}")
+    return value
 
 
 def _thresholds_from_env(environ: Mapping[str, str]) -> Thresholds:
-    values = {field: _env_int(environ, var, default) for field, var, default in _THRESHOLD_ENV}
-    try:
-        return Thresholds(**values)
-    except ThresholdError as exc:
-        var = next(var for field, var, _ in _THRESHOLD_ENV if field == exc.field)
-        raise ConfigError(f"{var}={environ[var]}: {exc}") from None
+    return Thresholds(**{
+        field: _env_percent(environ, var, default)
+        for field, (var, default) in _THRESHOLD_ENV.items()
+    })
 
 
 def _command_from_env(environ: Mapping[str, str], var: str, default: str) -> tuple[str, ...]:
