@@ -50,10 +50,11 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
-# Every committed unit or template whose ExecStart is a `uv run` against a
-# workspace member.  Asserted by EQUALITY below, unlike the one-sided coverage
-# guard in the restart-backoff sweep, because discovery here ends in a PARSER
-# and a parser can silently answer None for a unit it stopped understanding.
+# Every committed unit or template whose start runs `uv run` against a workspace
+# member, in its ExecStart or in the tracked shell wrapper its ExecStart names.
+# Asserted by EQUALITY below, unlike the one-sided coverage guard in the
+# restart-backoff sweep, because discovery here ends in a PARSER and a parser
+# can silently answer None for a unit it stopped understanding.
 _EXPECTED_UV_RUN_UNITS = frozenset(
     {
         "dashboard/dark-factory-dashboard.service",
@@ -61,11 +62,17 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "fused-memory/fused-memory.service.example-systemd-config",
         "scripts/client-feed.service.template",
         "scripts/dashboard.service.template",
+        "scripts/exception-owner-sweep.service",
+        "scripts/fused-memory-duplicate-audit.service",
+        "scripts/fused-memory-flag-marker-sweep.service",
+        "scripts/fused-memory-link-heal.service",
+        "scripts/fused-memory-memory-eval.service",
         "scripts/fused-memory.service.template",
         "scripts/legibility-transcript-check@.service",
         "scripts/legibility-trickle-health@.service",
         "scripts/legibility-trickle@.service",
         "scripts/local-model-serving/lms-arm@.service",
+        "scripts/memory-metadata-coverage-census.service",
         "scripts/orchestrator-autopilot-video.service",
         "scripts/orchestrator-dark-factory.service",
         "scripts/orchestrator-know-live.service",
@@ -74,6 +81,8 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "scripts/orchestrator-reify.service",
         "scripts/orchestrator-solar-challenge-platform.service",
         "scripts/orchestrator-stream-touch.service",
+        "scripts/return-brief.service",
+        "scripts/transcript-secret-sweep.service",
     }
 )
 
