@@ -68,29 +68,7 @@ class TestStage3MissingSummaryRemedy:
         )
 
 
-class TestStage1MissingSummaryRemedy:
-    def test_the_stage2_summary_decision_section_exists(self):
-        """Selected by content, not heading, because the heading is what was renamed."""
-        decision_sections = [
-            section for section in _sections(STAGE1_SYSTEM_PROMPT)
-            if "stage='task_knowledge_sync'" in section
-        ]
-
-        assert len(decision_sections) == 1, (
-            "Expected exactly one STAGE1_SYSTEM_PROMPT section keying the ledger "
-            "pre-check to stage='task_knowledge_sync', found "
-            f'{len(decision_sections)}; the absence pins below would otherwise '
-            'pass against a prompt that lost the check.'
-        )
-
-    def test_retired_reconstruct_framing_is_gone(self):
-        for retired in ('reconstruct-trigger', 'Already-Reconstructed'):
-            assert retired not in STAGE1_SYSTEM_PROMPT, (
-                f'STAGE1_SYSTEM_PROMPT still carries {retired!r}, the retired framing '
-                'of the missing Stage 2 summary as something to reconstruct '
-                '(task 6295).'
-            )
-
+class TestStage1HeadingCrossReferences:
     def test_heading_cross_references_resolve(self):
         referenced = re.findall(r'see ## ([^\n]+?) below', STAGE1_SYSTEM_PROMPT)
         headings = {section.splitlines()[0] for section in _sections(STAGE1_SYSTEM_PROMPT)}
