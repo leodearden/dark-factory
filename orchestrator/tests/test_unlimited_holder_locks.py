@@ -214,6 +214,14 @@ class TestSnapshotsNameEveryHolder:
 
         assert 'A' not in table.snapshot_held_by_task()
 
+    def test_a_task_admitted_with_no_keys_is_in_neither_snapshot(self):
+        table = _table(DOCS_AND_ROOT_MARKDOWN)
+        assert table.try_acquire('G', [])
+        assert table.is_held('G'), 'a gate task is admitted, holding no key'
+
+        assert table.snapshot_held_by_task() == {}
+        assert table.snapshot_holders() == {}
+
 
 class TestPrefixValidation:
     @pytest.mark.parametrize('prefix', [

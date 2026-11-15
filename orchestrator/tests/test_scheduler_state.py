@@ -18,7 +18,7 @@ from shared.scheduler_state import PinQueueEntry, SchedulerStateSnapshot
 
 from orchestrator.config import OrchestratorConfig, UnlimitedHolderLocksConfig
 from orchestrator.event_store import EventType
-from orchestrator.lock_table import ModuleLockTable
+from orchestrator.lock_table import ModuleLockTable, one_holder_per_key
 from orchestrator.overrides import OverrideStore
 from orchestrator.pin_reservation import PinOrder
 from orchestrator.scheduler import Scheduler
@@ -679,10 +679,6 @@ class TestGetStateSnapshotShape:
             snap.is_paused = True
 
 
-# ===========================================================================
-# Step-13: get_state_snapshot() with populated state after real ticks
-# ===========================================================================
-
 @pytest.mark.usefixtures('code_default_config')
 class TestGetStateSnapshotNamesEveryHolder:
     @pytest.mark.parametrize('order', [('A', 'B'), ('B', 'A')])
@@ -702,10 +698,15 @@ class TestGetStateSnapshotNamesEveryHolder:
             first: ('OPERATIONS.md',),
             second: ('OPERATIONS.md',),
         }
+        assert snap.current_holders == one_holder_per_key(snap.held_by_task)
         assert snap.holder_task_ids() == {first, second}
         round_tripped = SchedulerStateSnapshot.from_json(json.loads(json.dumps(snap.to_json())))
         assert round_tripped.holder_task_ids() == {first, second}
 
+
+# ===========================================================================
+# Step-13: get_state_snapshot() with populated state after real ticks
+# ===========================================================================
 
 class TestGetStateSnapshotPopulated:
     """get_state_snapshot() reflects real scheduler state after ticks."""

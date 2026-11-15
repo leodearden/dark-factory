@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import sys
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import NamedTuple
@@ -60,6 +60,11 @@ class UncontestedAcquisition:
         both = sorted(set(self.acquired) & {blocker.module for blocker in self.contested})
         if both:
             raise ValueError(f'lock keys {both} cannot be both acquired and contested')
+
+
+def one_holder_per_key(held_by_task: Mapping[str, Iterable[str]]) -> dict[str, str]:
+    """``{key: task_id}`` from ``{task_id: keys}``: a key several tasks hold names only the last one iterated."""
+    return {key: task_id for task_id, keys in held_by_task.items() for key in keys}
 
 
 class ModuleLockTable:
@@ -885,22 +890,16 @@ class ModuleLockTable:
         return result
 
     def snapshot_holders(self) -> dict[str, str]:
-        """Return a snapshot of current lock holders: ``{module: task_id}``.
-
-        Builds a fresh dict from ``_held`` so callers cannot mutate internal state.
-        Preferred over direct ``_held`` access in :meth:`Scheduler.get_state_snapshot`.
-        It shows ONE holder per key: a key several tasks hold names only the
-        last one iterated, so ask :meth:`snapshot_held_by_task` for every holder.
-        """
-        return {
-            key: task_id
-            for task_id, keys in self.snapshot_held_by_task().items()
-            for key in keys
-        }
+        """``{module: task_id}``, ONE holder per key: :func:`one_holder_per_key` of :meth:`snapshot_held_by_task`."""
+        return one_holder_per_key(self.snapshot_held_by_task())
 
     def snapshot_held_by_task(self) -> dict[str, tuple[str, ...]]:
-        """``{task_id: sorted lock keys}`` for every task holding a lock: every holder of every key."""
-        return {task_id: tuple(sorted(self.held_modules(task_id))) for task_id in self._held}
+        """``{task_id: sorted lock keys}`` for every task holding a key: every holder of every key.
+
+        A task admitted with no keys (a gate task) holds none, so it is absent
+        here though :meth:`is_held` is true for it.
+        """
+        return {task_id: tuple(sorted(keys)) for task_id, keys in self._held.items() if keys}
 
     # --- Limit lookup ---
 
