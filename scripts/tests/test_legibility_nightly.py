@@ -4918,7 +4918,8 @@ class TestBarrenStreakEscalation:
         """barren, barren, FAILED, barren — the FOURTH night is the one
         that reaches the threshold. Asserting exactly one streak
         escalation across all four proves the carry-forward cannot
-        double-fire the exact-equality edge trigger."""
+        double-fire the streak escalation: a carried night never lands the
+        streak on a schedule point twice."""
         runner = _NightRunner(tmp_path)
 
         runner.night(13, 'barren')

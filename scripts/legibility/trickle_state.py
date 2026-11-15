@@ -754,7 +754,7 @@ def barren_streak_due(state: TrickleState, max_runs: int) -> bool:
     """Whether *state*'s barren streak has reached *max_runs*: the one
     threshold predicate the progress probe's verdict is built from, and the
     first point of the nightly's escalation schedule
-    (:func:`barren_streak_reached`)."""
+    (:func:`barren_escalation_due`)."""
     return state.consecutive_barren_runs >= max_runs
 
 
@@ -988,12 +988,14 @@ escalates: 3, 6, 12 and 24 at :data:`DEFAULT_MAX_BARREN_RUNS`.
 
 A bounded doubling: posting every night would revive task 3270's alarm
 fatigue, and posting once leaves whoever missed that post in silence
-(task 5513). Between and after these points the level-triggered
-``check_trickle_health.py`` posts on each night whose record does not show
-``barren_escalated: true``."""
+(task 5513). The nightly is silent between these points and after the
+last one. Its only level-triggered follow-up is ``check_trickle_health.py``,
+an opt-in per-project timer: where it is installed it posts on each night
+whose record does not show ``barren_escalated: true``. Where it is not,
+nothing escalates a streak past the last point."""
 
 
-def barren_streak_reached(night: NightFold, max_runs: int) -> bool:
+def barren_escalation_due(night: NightFold, max_runs: int) -> bool:
     """Whether *night* is a barren night whose streak stands on an escalation
     point: *max_runs* times an entry of :data:`BARREN_ESCALATION_MULTIPLES`.
     A productive or quiet night resets the streak and so re-arms the

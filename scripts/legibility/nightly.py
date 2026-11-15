@@ -1084,7 +1084,7 @@ def _record_trickle_progress(
         night = trickle_state.fold_night(
             trickle_state.read_prior(cfg.project_id), cfg.project_id, run
         )
-        streak_landed = trickle_state.barren_streak_reached(night, max_barren_runs) and (
+        streak_landed = trickle_state.barren_escalation_due(night, max_barren_runs) and (
             _escalate_barren_streak(
                 cfg, night.state, target_date,
                 max_barren_runs=max_barren_runs, raise_alarm=raise_alarm,
