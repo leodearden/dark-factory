@@ -51,6 +51,19 @@ class ParkedIncarnation:
 _NOTHING_PARKED = ParkedIncarnation(None, None, None, ())
 
 
+@dataclass(frozen=True)
+class RecutSupersession:
+    """What an executed re-cut ruling puts out of bounds: the parked branch and every ref whose tip predates the execution."""
+
+    parked_branch: str | None
+    executed_at: datetime | None
+
+    def supersedes(self, ref: str, tip_committed_at: datetime) -> bool:
+        return ref == self.parked_branch or (
+            self.executed_at is not None and tip_committed_at <= self.executed_at
+        )
+
+
 class RecutState(Enum):
     ABSENT = 'absent'
     SKIP = 'skip'
@@ -176,6 +189,28 @@ def execution_record(
         'quarantined_worktree': parked.quarantined_worktree,
         'relocated_meta_roots': list(parked.relocated_meta_roots),
     }
+
+
+def recut_supersession(task: dict[str, Any]) -> RecutSupersession | None:
+    """What *task*'s ``recut_executed`` record supersedes, or None without one."""
+    metadata = coerce_task_metadata(task.get('metadata'))
+    record = metadata.get(RECUT_EXECUTED_KEY) if metadata is not None else None
+    if not isinstance(record, dict):
+        return None
+    parked_branch = record.get('parked_branch')
+    executed_at = _parse_ruled_at(record.get('executed_at'))
+    if executed_at is None:
+        logger.warning(
+            'recut_ruling: task %s %s.executed_at is unreadable (%r); only the '
+            'parked branch is treated as superseded',
+            task.get('id'), RECUT_EXECUTED_KEY, record.get('executed_at'),
+        )
+    return RecutSupersession(
+        parked_branch=(
+            parked_branch if isinstance(parked_branch, str) and parked_branch.strip() else None
+        ),
+        executed_at=executed_at,
+    )
 
 
 def ruling_on_record(ruling_id: str, resolved_at: object, *, now: datetime) -> RecutRuling:
