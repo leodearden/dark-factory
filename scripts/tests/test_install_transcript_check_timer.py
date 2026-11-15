@@ -12,12 +12,9 @@ fixture project). Real systemd is never touched.
 
 Divergences from the mirrored trickle install test:
   * SCRIPT / unit basenames re-pointed at legibility-transcript-check@.
-  * The installed @.service content assertion additionally checks it
-    references check_transcript_persistence.py (NOT nightly.py) and does
-    NOT pass --check-preventer (task 5859: the merge gate already pins
-    spawn-claude.sh's persistence export, and a preventer-only failure would
-    be an exit 1 with no escalation behind it; rationale in OPERATIONS.md
-    §"Nightly legibility transcript check (04:00)").
+  * The @.service ExecStart assertion additionally checks it references
+    check_transcript_persistence.py (NOT nightly.py) and does NOT pass
+    --check-preventer (kept off by task 5859).
 """
 from __future__ import annotations
 
@@ -227,26 +224,27 @@ def test_install_copies_templates_and_enables_timer(tmp_path):
 
 def test_service_template_execstart_shape():
     """Template-content invariant (NOT install behavior): the committed
-    @.service's ExecStart must target the DETECTOR
+    @.service's ExecStart line must target the DETECTOR
     (check_transcript_persistence.py) with the %i instance placeholder
     (systemd expands %i at instantiation — the template is copied verbatim,
-    never per-instance edited) and must NOT pass --check-preventer.
-
-    Task 5859 decided to keep --check-preventer off: the merge gate already
-    pins spawn-claude.sh's persistence export, and a preventer-only failure
-    would be an exit 1 with no escalation behind it. The rationale lives in
-    OPERATIONS.md §"Nightly legibility transcript check (04:00)". This pins
-    the decision at its source, so a template edit that adds the flag fails
-    here regardless of the install path.
+    never per-instance edited) and must NOT pass --check-preventer, which
+    task 5859 keeps off; rationale in OPERATIONS.md §"Nightly legibility
+    transcript check (04:00)".
     """
     service_text = (TEMPLATES_DIR / "legibility-transcript-check@.service").read_text()
-    assert "check_transcript_persistence.py" in service_text
-    assert "--project-id %i" in service_text
-    assert "--check-preventer" not in service_text, (
-        "The transcript-check service template must NOT pass --check-preventer: "
-        "task 5859 kept it off because the merge gate already pins "
-        "spawn-claude.sh's persistence export and a preventer-only failure "
-        "would be an exit 1 with no escalation. Read OPERATIONS.md "
+    execstart_lines = [
+        line for line in service_text.splitlines() if line.startswith("ExecStart=")
+    ]
+    assert len(execstart_lines) == 1, f"ExecStart lines: {execstart_lines!r}"
+    (execstart,) = execstart_lines
+    assert not execstart.endswith("\\"), (
+        "ExecStart continues onto another line; this test reads only its first"
+    )
+    assert "check_transcript_persistence.py" in execstart
+    assert "--project-id %i" in execstart
+    assert "--check-preventer" not in execstart, (
+        "The transcript-check service's ExecStart must NOT pass "
+        "--check-preventer (kept off by task 5859). Read OPERATIONS.md "
         '§"Nightly legibility transcript check (04:00)" before changing this.'
     )
 

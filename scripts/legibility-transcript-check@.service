@@ -12,11 +12,9 @@ WorkingDirectory=/home/leo/src/dark-factory
 # so that import resolves even if the module's self-bootstrap ever changes.
 Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
 # The DETECTOR from task 2893 only: NO `run` subcommand (unlike nightly.py's
-# ExecStart), and deliberately WITHOUT the optional preventer-guard flag
-# (task 5859): the merge gate already pins spawn-claude.sh's persistence
-# export, and a preventer-only failure here would be an exit 1 with no
-# escalation behind it. Rationale: OPERATIONS.md §"Nightly legibility
-# transcript check (04:00)".
+# ExecStart), and deliberately WITHOUT --check-preventer (kept off by task
+# 5859). Rationale: OPERATIONS.md §"Nightly legibility transcript check
+# (04:00)".
 ExecStart=/home/leo/.local/bin/uv run --no-sync --project shared python scripts/legibility/check_transcript_persistence.py --project-id %i
 StandardOutput=journal
 StandardError=journal

@@ -4548,10 +4548,7 @@ down escalation server is swallowed. So a night with a finding leaves the
 unit `failed`. That is the alarm, not a broken unit, and the liveness probe
 below tells the two apart.
 
-**Why no `--check-preventer`.** This paragraph is the single home for that
-decision; the unit's comment and
-`scripts/tests/test_install_transcript_check_timer.py` cite it. With the
-flag, the detector also exits 1 when `skills/spawn/spawn-claude.sh` stops
+**Why no `--check-preventer`.** With the flag, the detector also exits 1 when `skills/spawn/spawn-claude.sh` stops
 exporting `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`. Task 5859 decided to
 leave it off. The reason task 2901 gave (DD2: the guard regex missed the
 script's mid-line export, so the timer would exit 1 every night) has been
