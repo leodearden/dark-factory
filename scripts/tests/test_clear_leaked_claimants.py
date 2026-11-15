@@ -872,6 +872,25 @@ class TestLedgeredRows:
         assert 'tier=ledgered' in _violation_line(text, 111).split()
         assert 'ledgered=1' in text.split()
 
+    def test_apply_repairs_refuses_to_select_the_ledgered_tier(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        before = _store_rows(root)
+        server = _FakeClaimantServer()
+
+        with pytest.raises(ValueError, match='ledgered'):
+            _apply(census, server, tiers=frozenset({Tier.TERMINAL, Tier.LEDGERED}))
+
+        assert server.calls == []
+        assert _store_rows(root) == before
+
+    def test_sweep_refuses_to_select_the_ledgered_tier_before_reading(self, tmp_path):
+        with pytest.raises(ValueError, match='ledgered'):
+            _sweep(
+                [str(tmp_path / 'missing')], None, apply=False,
+                tiers=frozenset({Tier.TERMINAL, Tier.LEDGERED}),
+            )
+
 
 class TestExitCode:
     def test_a_clean_apply_is_ok(self, seed_root):
