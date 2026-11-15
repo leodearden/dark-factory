@@ -764,13 +764,7 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
         'DF_VERIFY_ROLE=offline must be set — the offline role footprint '
         '(nice/ionice) lives inside the script (Part A), not re-implemented here'
     )
-    for key, value in os.environ.items():
-        if key == 'DF_VERIFY_ROLE':
-            continue
-        assert kwargs['env'].get(key) == value, (
-            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
-            f'not replace it (missing/altered {key!r})'
-        )
+    _assert_lane_env(kwargs['env'])
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
@@ -824,13 +818,7 @@ async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: P
         'cwd must be <worktree>/<cmd.cwd>'
     )
     assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline'
-    for key, value in os.environ.items():
-        if key == 'DF_VERIFY_ROLE':
-            continue
-        assert kwargs['env'].get(key) == value, (
-            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy '
-            f'(missing/altered {key!r})'
-        )
+    _assert_lane_env(kwargs['env'])
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
@@ -1156,13 +1144,7 @@ async def test_default_infra_runner_builds_run_all_host_infra_command(tmp_path: 
     assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline', (
         'DF_VERIFY_ROLE=offline must be set, same as the numeric sub-run'
     )
-    for key, value in os.environ.items():
-        if key == 'DF_VERIFY_ROLE':
-            continue
-        assert kwargs['env'].get(key) == value, (
-            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
-            f'not replace it (missing/altered {key!r})'
-        )
+    _assert_lane_env(kwargs['env'])
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
