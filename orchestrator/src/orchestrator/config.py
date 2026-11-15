@@ -4424,9 +4424,9 @@ class OrchestratorConfig(BaseSettings):
     # Per-role cgroup v2 cpu.weight each verify scope is spawned with
     # (`systemd-run -p CPUWeight=`), only when verify_use_cgroup_scope is on.
     # nice orders threads only INSIDE one cgroup, so without a weight the role
-    # tiers are inert across sibling scopes. task/background are lowered rather than merge raised, so the
-    # merge scope stays at parity (100) with each orchestrator unit and the
-    # operator's terminals under app.slice; 33/10 keep the 3:1 merge:task intent.
+    # tiers are inert across sibling scopes. The weights split the project's
+    # df-<project_id>.slice among its verify scopes and its daemon (contract:
+    # docs/cgroup-slice-topology.md); 33/10 keep the 3:1 merge:task intent.
     verify_cgroup_cpu_weight_merge: int = Field(default=100, ge=1, le=10000)
     verify_cgroup_cpu_weight_task: int = Field(default=33, ge=1, le=10000)
     verify_cgroup_cpu_weight_background: int = Field(default=10, ge=1, le=10000)
