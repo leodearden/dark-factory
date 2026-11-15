@@ -4348,10 +4348,11 @@ check.
   the newest ruling stands. Only the heals in `link_heal.sweep_actions` (default `detach`,
   `relabel`) are staged; every other heal is recorded as `not_enabled`.
   A run asks the adjudicator about at most `link_heal.max_adjudications_per_run`
-  (200) pairs it has no verdict for; verdicts it reuses do not count. The rest
-  are recorded `unexamined`, the run is partial (`adjudication_capped`, exit 0)
-  and does not move the window, so later runs drain a backlog a batch at a time
-  (task 6188).
+  (200) pairs it has no verdict for; verdicts it reuses do not count. The pairs
+  are taken from each project in turn, so one project's backlog cannot starve
+  the others. The rest are recorded `unexamined`, the run is partial
+  (`adjudication_capped`, exit 0) and does not move the window, so later runs
+  drain a backlog a batch at a time (task 6188).
 - **When it writes.** It writes only when `link_heal.writes: true` is set, no
   `--dry-run` is given, and the latest calibration of the adjudicator's exact
   model and prompt version passed. The prompt version is the sha256 of the
@@ -4443,13 +4444,17 @@ check.
     summary holds six top-level numbers over the runs stamped in the last 7
     days: `runs_7d`, `writing_runs_7d`, `would_escape_7d`,
     `adjudication_failure_rate_7d`, `actions_planned_7d` and `skipped_cap_7d`,
-    plus `adjudications_asked_7d`, `adjudication_failed_7d` and
+    plus `run_days_7d`, `adjudications_asked_7d`, `adjudication_failed_7d` and
     `adjudication_capped_7d`. Gate θ (task 6191) reads `runs_7d`,
     `would_escape_7d` and `adjudication_failure_rate_7d`. Every sweep run counts,
-    `--dry-run` and `--since` runs included. `skipped_cap_7d` stays 0 while
-    writes are off. The rate is 0.0 when nothing was asked, and
-    `adjudications_asked_7d` shows the denominator. The run-report escalation
-    names `summary.json`, or `metrics_unwritten` when it could not be written.
+    `--dry-run` and `--since` runs included, so a burst of hand runs raises
+    `runs_7d`; `run_days_7d`, the distinct UTC days with a run, does not.
+    `skipped_cap_7d` stays 0 while writes are off. The rate is 0.0 when nothing
+    was asked, and `adjudications_asked_7d` shows the denominator. The run-report
+    escalation names `summary.json`, and its summary line also names the failure
+    when the metrics could not be written (`metrics_unwritten`). Such a run
+    removes the previous `summary.json`, so gate θ fails closed on its absence
+    rather than reading a stale week.
 - **Exit codes.** 0 when the run is complete, or partial only by the write or
   adjudication cap or stale skips. 1 on a read, adjudication or write failure,
   a stopped run, or a report or metrics it could not write.

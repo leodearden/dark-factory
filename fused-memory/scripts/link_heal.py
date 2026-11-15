@@ -50,10 +50,10 @@ Usage:
         adjudications.jsonl and items_all.json), record the result for its
         model and prompt, and write a report. A failed calibration is escalated.
 
-Exit codes: 0 when the run is complete, or partial only by the cap or stale
-skips; 1 when a heal, read or adjudication failed, the run stopped, a
-calibration failed, or a sweep could not write its report or metrics; 2 when the
-command was refused before any run started.
+Exit codes: 0 when the run is complete, or partial only by the write or
+adjudication cap or stale skips; 1 when a heal, read or adjudication failed, the
+run stopped, a calibration failed, or a sweep could not write its report or
+metrics; 2 when the command was refused before any run started.
 """
 
 from __future__ import annotations
@@ -327,7 +327,6 @@ def sweep_document(report: SweepReport) -> dict[str, Any]:
         'report_json': str(report.json_path),
         'escalation_id': report.escalation_id,
         'report_unwritten': report.report_unwritten,
-        'metrics_unwritten': None,
         **report.metrics.as_detail(),
         'counts': {
             'plan': view.plan.counts.as_json(),

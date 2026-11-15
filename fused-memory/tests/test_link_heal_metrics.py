@@ -4,19 +4,18 @@ Section 1 drives ``link_heal_metrics`` at its own seam: a :class:`SweepRunView`
 built by hand becomes one M1 metric series, and the series on disk roll up into
 ``summary.json``. Section 2 drives :func:`run_sweep` over the in-process server
 in ``_link_heal_harness``, so what is under test there is what a real sweep
-leaves for θ.
+leaves for θ. θ's own reading of the summary is ``test_link_heal_theta_seam``.
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from _link_heal_calibrations import record_calibration
 from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
     DF,
@@ -38,7 +37,6 @@ from shared.memory_eval_metrics import (
     metrics_artifact_path,
     write_metric_series,
 )
-from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.maintenance.link_adjudicator import AdjudicationFailure
 from fused_memory.maintenance.link_heal import HealAction, RunCounts, Verdict
@@ -51,6 +49,7 @@ from fused_memory.maintenance.link_heal_executor import (
 )
 from fused_memory.maintenance.link_heal_ledger import LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_metrics import (
+    CONTRACT_METRICS,
     EVAL_ID,
     SUMMED_METRICS,
     THETA_SUMMARY_KEYS,
@@ -71,8 +70,6 @@ from fused_memory.maintenance.link_heal_store import CreatedWindow
 from fused_memory.maintenance.link_heal_sweep import SweepReport, SweepSettings, run_sweep
 from fused_memory.server.grouped_read import SIGHTING_KIND
 
-pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
 NOW = datetime(2026, 11, 15, 2, 15, tzinfo=UTC)
 DAY = timedelta(days=1)
 STAMP = format_stamp(NOW)
@@ -83,13 +80,6 @@ THETA_KEYS = (
 LIMITS = RunLimits(
     max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3,
     misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
-)
-GATE_SCRIPT = Path(__file__).resolve().parents[2] / 'scripts' / 'check_write_triage_readiness_gate.py'
-#: Gate θ's three summary bounds, copied verbatim from task 6191's metadata.before_done.args.
-THETA_SUMMARY_REQUIRES = (
-    ('s', 'runs_7d', '>=', '6'),
-    ('s', 'would_escape_7d', '<=', '0'),
-    ('s', 'adjudication_failure_rate_7d', '<=', '0.05'),
 )
 
 
@@ -117,8 +107,8 @@ def _values(series: MetricSeries) -> dict[str, float]:
     return {metric.metric_id: metric.value for metric in series.metrics}
 
 
-def _series(stamp: str, **values: int) -> MetricSeries:
-    """A link-heal series stamped *stamp*: every summed metric 0 unless named."""
+def _series(stamp: str, *, without: str | None = None, **values: int) -> MetricSeries:
+    """A link-heal series stamped *stamp*: every summed metric but *without*, 0 unless named."""
     return MetricSeries(
         schema_version=1,
         eval_id=EVAL_ID,
@@ -127,6 +117,7 @@ def _series(stamp: str, **values: int) -> MetricSeries:
         metrics=[
             Metric(metric_id=metric_id, kind='scalar', value=values.get(metric_id, 0), n=1)
             for metric_id in SUMMED_METRICS
+            if metric_id != without
         ],
     )
 
@@ -265,7 +256,51 @@ class TestTheSummary:
         summary = summarize_series(tmp_path, now=NOW)
 
         assert summary['runs_7d'] == 0
+        assert summary['run_days_7d'] == 0
         assert_theta_keys(summary)
+
+    def test_run_days_counts_the_utc_days_with_a_run(self, tmp_path):
+        for moment in (NOW, NOW + timedelta(minutes=-5), NOW - DAY, NOW - 3 * DAY):
+            write_metric_series(_series(format_stamp(moment)), tmp_path)
+
+        summary = summarize_series(tmp_path, now=NOW)
+
+        assert summary['runs_7d'] == 4
+        assert summary['run_days_7d'] == 3
+
+
+#: The per-run metrics behind θ's keys: each _7d sum in THETA_KEYS, and the rate's two terms.
+CONTRACT_METRIC_IDS = (
+    'writing_runs', 'would_escape', 'actions_planned', 'skipped_cap',
+    'adjudication_failed', 'adjudications_asked',
+)
+
+
+class TestAMetricAnEarlierSeriesLacks:
+    def test_the_contract_metrics_are_those_behind_thetas_keys(self):
+        assert frozenset(CONTRACT_METRIC_IDS) == CONTRACT_METRICS
+
+    def test_one_outside_the_contract_sums_over_the_series_that_carry_it(self, tmp_path):
+        write_metric_series(
+            _series(format_stamp(NOW - DAY), without='adjudication_capped', actions_planned=2),
+            tmp_path,
+        )
+        write_metric_series(_series(STAMP, adjudication_capped=3, actions_planned=1), tmp_path)
+
+        summary = summarize_series(tmp_path, now=NOW)
+
+        assert summary['runs_7d'] == 2
+        assert summary['adjudication_capped_7d'] == 3
+        assert summary['actions_planned_7d'] == 3
+        assert_theta_keys(summary)
+
+    @pytest.mark.parametrize('metric_id', CONTRACT_METRIC_IDS)
+    def test_one_in_the_contract_fails_the_summary_naming_it(self, tmp_path, metric_id):
+        write_metric_series(_series(format_stamp(NOW - DAY), without=metric_id), tmp_path)
+        write_metric_series(_series(STAMP), tmp_path)
+
+        with pytest.raises(ValueError, match=metric_id):
+            summarize_series(tmp_path, now=NOW)
 
 
 def _complete_summary() -> dict[str, object]:
@@ -315,7 +350,9 @@ class TestTheTarget:
         assert load_metric_series(emitted.metrics_path).eval_id == EVAL_ID
         assert emitted.unwritten is None
         assert emitted.as_detail() == {
-            'metrics_json': str(emitted.metrics_path), 'summary_json': str(emitted.summary_path),
+            'metrics_json': str(emitted.metrics_path),
+            'summary_json': str(emitted.summary_path),
+            'metrics_unwritten': None,
         }
 
     def test_a_root_under_a_regular_file_is_reported_not_raised(self, tmp_path):
@@ -339,6 +376,31 @@ class TestTheTarget:
 
         assert emitted.unwritten is not None
         assert emitted.unwritten.startswith('JSONDecodeError')
+        assert not summary_path(root).exists()
+
+    def test_a_failed_summary_removes_the_one_an_earlier_run_left(self, tmp_path):
+        root = tmp_path / 'memory-evals'
+        target = SweepMetricsTarget(root, DF)
+        assert target.write(_view(_run(1)), NOW - DAY).unwritten is None
+        assert summary_path(root).exists()
+        broken = metrics_artifact_path(root, EVAL_ID, format_stamp(NOW - 2 * DAY))
+        broken.write_text('{not json')
+
+        emitted = target.write(_view(_run(2)), NOW)
+
+        assert emitted.unwritten is not None
+        assert emitted.unwritten.startswith('JSONDecodeError')
+        assert not summary_path(root).exists()
+
+    def test_a_series_that_cannot_be_written_removes_the_earlier_summary(self, tmp_path):
+        root = tmp_path / 'memory-evals'
+        target = SweepMetricsTarget(root, DF)
+        assert target.write(_view(_run(1)), NOW - DAY).unwritten is None
+        metrics_artifact_path(root, EVAL_ID, STAMP).mkdir()
+
+        emitted = target.write(_view(_run(2)), NOW)
+
+        assert emitted.unwritten is not None
         assert not summary_path(root).exists()
 
 
@@ -405,14 +467,6 @@ def _seed_in_window(harness: LinkHealHarness, texts: list[str]) -> None:
             kind=SIGHTING_KIND, child=_id('cccccccc', n), parent=_id('dddddddd', n),
             child_text=text, parent_text=f'the parent of {text}', meta={'created_at': INSIDE},
         )
-
-
-def _calibrate(ledger: LinkHealLedger) -> None:
-    run_id = ledger.start_run(RunSource.CALIBRATION, writes=False)
-    ledger.add_calibration(
-        run_id, model=FAKE_ADJUDICATOR_MODEL, prompt_sha256=FAKE_PROMPT_SHA256,
-        population_sha256='0' * 64, passed=True, report={'passed': True},
-    )
 
 
 async def _sweep(
@@ -552,7 +606,7 @@ class TestWritingRunsAndNights:
     @pytest.mark.asyncio
     async def test_a_writing_sweep_counts_as_a_writing_run(self, harness, ledger, tmp_path):
         _seed_in_window(harness, ['an extending sighting'])
-        _calibrate(ledger)
+        record_calibration(ledger)
 
         report = await _sweep(
             harness, ledger, tmp_path, FakeAdjudicator(lambda _text: Verdict.EXTENDS),
@@ -588,30 +642,20 @@ class TestMetricsThatCannotBeWritten:
         assert report.metrics.unwritten is not None
         assert report.metrics.unwritten.startswith('NotADirectoryError')
         assert _run_report_detail(filer)['metrics_unwritten'] == report.metrics.unwritten
+        (escape,) = [escape for escape in filer.escapes if escape.anchor == RUN_REPORT_ANCHOR]
+        assert str(report.report_path) in escape.summary
+        assert report.metrics.unwritten in escape.summary
 
-
-class TestThetaReadsTheSummary:
     @pytest.mark.asyncio
-    async def test_every_theta_summary_bound_resolves_to_a_number(
+    async def test_written_metrics_leave_the_escalation_naming_only_the_report(
         self, harness, ledger, tmp_path,
     ):
-        _seed_in_window(harness, ['a sighting'])
-        await _sweep(harness, ledger, tmp_path, FakeAdjudicator(lambda _text: Verdict.SAME))
-        argv = [
-            sys.executable, str(GATE_SCRIPT), '--gate', 'theta',
-            '--report', 's', str(summary_path(tmp_path / 'memory-evals')),
-        ]
-        for require in THETA_SUMMARY_REQUIRES:
-            argv += ['--require', *require]
+        filer = RecordingFiler()
 
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        report = await _sweep(
+            harness, ledger, tmp_path, FakeAdjudicator(lambda _text: Verdict.SAME), filer=filer,
+        )
 
-        verdict = json.loads(completed.stdout.strip().splitlines()[-2])
-        assert len(verdict['checks']) == 3
-        for check in verdict['checks']:
-            assert check['note'] is None, check
-            assert isinstance(check['actual'], int | float), check
-            assert not isinstance(check['actual'], bool), check
-        assert [check['check'] for check in verdict['checks'] if not check['ok']] == [
-            's:runs_7d >= 6',
-        ]
+        (escape,) = [escape for escape in filer.escapes if escape.anchor == RUN_REPORT_ANCHOR]
+        assert escape.summary == f'link-heal sweep report: {report.report_path}'
+        assert escape.detail['metrics_unwritten'] is None

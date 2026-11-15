@@ -661,14 +661,14 @@ class RunCounts:
     texts a link shows; ``adjudication_failed`` the links the adjudicator was asked
     about and gave no verdict. ``adjudications_asked`` counts the pairs put to the
     adjudicator this run, failed ones included; ``adjudication_capped`` the
-    candidates the run did not ask because it reached its adjudication cap. They
-    are also counted in ``unexamined``, and they leave the run partial so a sweep
-    holds its window until they have been asked. ``withheld_uncalibrated`` counts the heals a writing
-    sweep's plan run or an apply run withheld because the adjudicator behind their
-    verdict has no passing calibration: a policy refusal, not a failure, so it
-    leaves a run complete. ``superseded`` counts the pending heals a plan run
-    retired because its own ruling on their link, at the texts they rest on, no
-    longer plans them.
+    candidates the run did not ask because it reached its adjudication cap.
+    Capped candidates are also counted in ``unexamined`` and leave the run partial,
+    so a sweep holds its window until they have been asked.
+    ``withheld_uncalibrated`` counts the heals a writing sweep's plan run or an
+    apply run withheld because the adjudicator behind their verdict has no passing
+    calibration: a policy refusal, not a failure, so it leaves a run complete.
+    ``superseded`` counts the pending heals a plan run retired because its own
+    ruling on their link, at the texts they rest on, no longer plans them.
     """
 
     links_total: int = 0

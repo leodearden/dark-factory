@@ -277,6 +277,7 @@ async def run_sweep(
         {**run_headline(view), 'report_json': str(json_path), **emitted.as_detail()},
         report_path,
         unwritten=unwritten,
+        metrics_unwritten=emitted.unwritten,
     ))
     return SweepReport(
         view=view, json_path=json_path, report_path=report_path, escalation_id=escalation_id,

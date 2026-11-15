@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from _link_heal_calibrations import record_calibration
 from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
     DF,
@@ -299,15 +300,6 @@ def _settings(
     )
 
 
-def _calibrate(ledger: LinkHealLedger, *, passed: bool, prompt_sha256: str = FAKE_PROMPT_SHA256) -> str:
-    run_id = ledger.start_run(RunSource.CALIBRATION, writes=False)
-    ledger.add_calibration(
-        run_id, model=FAKE_ADJUDICATOR_MODEL, prompt_sha256=prompt_sha256,
-        population_sha256='0' * 64, passed=passed, report={'passed': passed},
-    )
-    return run_id
-
-
 async def _sweep(
     harness: LinkHealHarness,
     ledger: LinkHealLedger,
@@ -435,9 +427,9 @@ class TestWithheldWrites:
     ):
         _seed(harness)
         if calibration == 'failed':
-            _calibrate(ledger, passed=False)
+            record_calibration(ledger, passed=False)
         elif calibration == 'another prompt':
-            _calibrate(ledger, passed=True, prompt_sha256='f' * 64)
+            record_calibration(ledger, passed=True, prompt_sha256='f' * 64)
 
         report = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
@@ -455,7 +447,7 @@ class TestWithheldWrites:
         self, harness, ledger, tmp_path,
     ):
         _seed(harness)
-        _calibrate(ledger, passed=True)
+        record_calibration(ledger, passed=True)
 
         report = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True, dry_run=True),
@@ -474,7 +466,7 @@ class TestAllowedWrites:
     @pytest.mark.asyncio
     async def test_one_apply_run_applies_the_staged_heals(self, harness, ledger, tmp_path):
         _seed(harness)
-        calibration_run = _calibrate(ledger, passed=True)
+        calibration_run = record_calibration(ledger, passed=True)
 
         report = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
@@ -498,7 +490,7 @@ class TestAllowedWrites:
     @pytest.mark.asyncio
     async def test_the_records_show_each_heal_and_its_after_state(self, harness, ledger, tmp_path):
         _seed(harness)
-        _calibrate(ledger, passed=True)
+        record_calibration(ledger, passed=True)
 
         report = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
@@ -524,7 +516,7 @@ class TestAllowedWrites:
         self, harness, ledger, tmp_path,
     ):
         _seed(harness)
-        _calibrate(ledger, passed=True)
+        record_calibration(ledger, passed=True)
         report = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
         )
@@ -544,7 +536,7 @@ class TestAllowedWrites:
         self, harness, ledger, tmp_path,
     ):
         _seed(harness)
-        _calibrate(ledger, passed=True)
+        record_calibration(ledger, passed=True)
         report = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
         )
@@ -577,7 +569,7 @@ class TestAllowedWrites:
     @pytest.mark.asyncio
     async def test_a_writing_sweep_files_its_storm(self, harness, ledger, tmp_path):
         _seed(harness)
-        _calibrate(ledger, passed=True)
+        record_calibration(ledger, passed=True)
         filer = RecordingFiler()
 
         await _sweep(
@@ -606,7 +598,7 @@ class TestAWritingSweepAfterDryRunNights:
     ):
         _seed(harness)
         await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
-        _calibrate(ledger, passed=True)
+        record_calibration(ledger, passed=True)
 
         report = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
@@ -630,7 +622,7 @@ class TestAWriteThatLandedButFailedVerification:
         self, harness, ledger, tmp_path,
     ):
         _seed(harness)
-        _calibrate(ledger, passed=True)
+        record_calibration(ledger, passed=True)
         _tamper_every_write(harness)
 
         report = await _sweep(
@@ -677,7 +669,7 @@ class TestAParentHostedInAProjectTheSweepDoesNotExamine:
             kind=SIGHTING_KIND, child=child, parent=parent, project=DF, parent_text=None,
             child_text='a cross-project sighting', meta={'created_at': INSIDE},
         )
-        _calibrate(ledger, passed=True)
+        record_calibration(ledger, passed=True)
         settings = SweepSettings(
             projects=(DF,), presence_projects=(REIFY,), writes=True, dry_run=False,
             actions=SWEEP_ACTIONS, window_hours=24, max_adjudications=200,
@@ -701,13 +693,13 @@ class TestTheWriteTimeCalibrationGate:
         self, harness, ledger, tmp_path,
     ):
         _seed(harness)
-        failed = _calibrate(ledger, passed=False)
+        failed = record_calibration(ledger, passed=False)
         first = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
         )
         assert first.apply_run_id is None
         assert _report_json(first)['writes']['withheld'] == WritesWithheld.CALIBRATION_FAILED.value
-        _calibrate(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
+        record_calibration(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
 
         second = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
@@ -737,12 +729,12 @@ class TestTheWriteTimeCalibrationGate:
         self, harness, ledger, tmp_path,
     ):
         _seed(harness)
-        _calibrate(ledger, passed=False)
+        record_calibration(ledger, passed=False)
         first = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
         )
         assert first.apply_run_id is None
-        _calibrate(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
+        record_calibration(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
 
         second = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
@@ -775,7 +767,7 @@ class TestTheWriteTimeCalibrationGate:
         )
         assert first.apply_run_id is None
         assert _report_json(first)['writes']['withheld'] == WritesWithheld.UNCALIBRATED.value
-        _calibrate(ledger, passed=True)
+        record_calibration(ledger, passed=True)
 
         second = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
@@ -833,7 +825,7 @@ class TestThePlanTimeCalibrationGate:
     ):
         _seed(harness)
         first = await _sweep_plan(harness, ledger, _answering(), tmp_path)
-        _calibrate(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
+        record_calibration(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
 
         second = await _sweep_plan(
             harness, ledger,
@@ -886,9 +878,9 @@ class TestANewerRulingAtTheSameTexts:
         self, harness, ledger, tmp_path, misfiled: Answer,
     ) -> tuple[SweepReport, SweepReport]:
         _seed(harness)
-        _calibrate(ledger, passed=True)
+        record_calibration(ledger, passed=True)
         first = await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
-        _calibrate(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
+        record_calibration(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
         second = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
             adjudicate=_second_prompt_answering(misfiled), now=NOW + DAY, since=WINDOW.since,
@@ -959,7 +951,7 @@ class TestASweepWhosePlanStopped:
         self, harness, ledger, tmp_path,
     ):
         _seed(harness)
-        _calibrate(ledger, passed=True)
+        record_calibration(ledger, passed=True)
         await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
         assert ledger.pending_actions(RunSource.SWEEP)
 
@@ -1005,9 +997,9 @@ class TestTheReportNamesEveryHealTheRunActedOn:
         self, harness, ledger, tmp_path,
     ):
         _seed(harness)
-        _calibrate(ledger, passed=False)
+        record_calibration(ledger, passed=False)
         await _sweep(harness, ledger, tmp_path, settings=_settings(), filer=RecordingFiler())
-        _calibrate(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
+        record_calibration(ledger, passed=True, prompt_sha256=SECOND_PROMPT_SHA256)
 
         report = await _sweep(
             harness, ledger, tmp_path, settings=_settings(writes=True), filer=RecordingFiler(),
@@ -1056,7 +1048,7 @@ class TestTheShareEscape:
         self, harness, ledger, tmp_path,
     ):
         _seed_misfile_heavy(harness)
-        _calibrate(ledger, passed=True)
+        record_calibration(ledger, passed=True)
         filer = RecordingFiler()
         adjudicate = FakeAdjudicator(
             lambda text: Verdict.RELATED if text.startswith('misfiled') else Verdict.SAME,

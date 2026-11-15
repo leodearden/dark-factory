@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -449,6 +450,28 @@ class TestTheAdjudicationCap:
         assert report.counts.adjudications_asked == 2
         assert report.counts.adjudication_failed == 1
         assert report.counts.adjudication_capped == 3
+
+    @pytest.mark.asyncio
+    async def test_the_cap_is_shared_in_turn_by_project(self, harness, ledger, tmp_path):
+        seed_sightings(harness, 5)
+        for n in range(2):
+            harness.seed_link(
+                kind=SIGHTING_KIND, child=_id('cccccccc', n), parent=_id('dddddddd', n),
+                child_text=f'reify sighting {n}', project=REIFY,
+            )
+        fake = always(Verdict.EXTENDS)
+
+        report = await adjudicated_plan(
+            harness, ledger, fake, tmp_path / 'p.json', max_adjudications=4,
+        )
+
+        assert len(fake.pairs) == 4
+        assert report.counts.adjudication_capped == 3
+        unasked = Counter(
+            record.project_id for record in ledger.run_records(report.run_id)
+            if record.decision is Report.UNEXAMINED
+        )
+        assert unasked == {DF: 3}
 
     @pytest.mark.asyncio
     async def test_an_uncapped_plan_asks_every_unjudged_pair(self, harness, ledger, tmp_path):

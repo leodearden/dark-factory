@@ -3,11 +3,17 @@
 Each sweep run becomes one M1 metric series (``shared.memory_eval_metrics``)
 under ``<root>/link-heal/``. ``summary.json`` beside the series is rebuilt from
 the series stamped in the last seven days, never from the ledger, so it cannot
-disagree with what it summarises. The keys gate θ reads are
-:data:`THETA_SUMMARY_KEYS`, and no summary that lacks one, or holds a
-non-number under one, is returned. The summary counts the series, gives each
-per-run metric's 7-day sum under its id with the ``_7d`` suffix, and gives the
-failure rate as the failed sum over the asked sum, 0.0 when nothing was asked.
+disagree with what it summarises. The summary's contract with gate θ is
+:data:`THETA_SUMMARY_KEYS` (θ requires ``runs_7d``, ``would_escape_7d`` and
+``adjudication_failure_rate_7d``), and no summary that lacks one, or holds a
+non-number under one, is returned. The summary counts the series and the UTC
+days they were stamped on, gives each per-run metric's 7-day sum under its id
+with the ``_7d`` suffix, and gives the failure rate as the failed sum over the
+asked sum, 0.0 when nothing was asked.
+
+A per-run metric added later needs no reset of the window: a series that
+predates it adds nothing to its sum. Only the metrics in
+:data:`CONTRACT_METRICS` must be carried by every series in the window.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from shared.memory_eval_metrics import (
     format_stamp,
     load_metric_series,
     metrics_artifact_path,
+    stamp_datetime,
     write_metric_series,
 )
 from shared.safe_io import atomic_write_text
@@ -59,6 +66,8 @@ class _RunMetric:
     alarmed: bool
 
 
+_FAILED, _ASKED = 'adjudication_failed', 'adjudications_asked'
+
 _RUN_METRICS: tuple[_RunMetric, ...] = (
     _RunMetric('writing_runs', lambda view: int(view.apply is not None), alarmed=False),
     _RunMetric(
@@ -70,12 +79,8 @@ _RUN_METRICS: tuple[_RunMetric, ...] = (
         'skipped_cap', lambda view: sum(run.counts.skipped_cap for run in view.runs),
         alarmed=True,
     ),
-    _RunMetric(
-        'adjudications_asked', lambda view: view.plan.counts.adjudications_asked, alarmed=False,
-    ),
-    _RunMetric(
-        'adjudication_failed', lambda view: view.plan.counts.adjudication_failed, alarmed=True,
-    ),
+    _RunMetric(_ASKED, lambda view: view.plan.counts.adjudications_asked, alarmed=False),
+    _RunMetric(_FAILED, lambda view: view.plan.counts.adjudication_failed, alarmed=True),
     _RunMetric(
         'adjudication_capped', lambda view: view.plan.counts.adjudication_capped, alarmed=True,
     ),
@@ -83,6 +88,17 @@ _RUN_METRICS: tuple[_RunMetric, ...] = (
 
 #: The per-run metric ids; each one's 7-day sum is a summary key.
 SUMMED_METRICS: tuple[str, ...] = tuple(metric.metric_id for metric in _RUN_METRICS)
+
+#: The per-run metrics :data:`THETA_SUMMARY_KEYS` rest on: those whose sum is a
+#: contract key, and the failure rate's two terms.
+CONTRACT_METRICS: frozenset[str] = frozenset({
+    *(
+        metric_id for metric_id in SUMMED_METRICS
+        if f'{metric_id}{SUMMARY_SUFFIX}' in THETA_SUMMARY_KEYS
+    ),
+    _FAILED,
+    _ASKED,
+})
 
 
 def sweep_metric_series(view: SweepRunView, *, project_id: str, stamp: str) -> MetricSeries:
@@ -121,22 +137,22 @@ def summarize_series(root: Path, *, now: datetime) -> dict[str, Any]:
     """The summary of the series under *root* stamped in ``[now - 7 days, now]``.
 
     Every key is present whatever the window holds. A series that does not parse
-    raises, as :func:`load_metric_series` does, and so does a summary that breaks
+    raises, as :func:`load_metric_series` does, and so do a series that lacks one
+    of :data:`CONTRACT_METRICS` and a summary that breaks
     :func:`check_summary_contract`.
     """
     since, until = format_stamp(now - SUMMARY_WINDOW), format_stamp(now)
     series = [load_metric_series(path) for path in _window_paths(root, since, until)]
     sums = {metric_id: _sum(series, metric_id) for metric_id in SUMMED_METRICS}
-    asked = sums['adjudications_asked']
+    asked = sums[_ASKED]
     summary = {
         'format': SUMMARY_FORMAT,
         'eval_id': EVAL_ID,
         'window': {'since': since, 'until': until},
         f'runs{SUMMARY_SUFFIX}': len(series),
+        f'run_days{SUMMARY_SUFFIX}': len({stamp_datetime(run.run_stamp).date() for run in series}),
         **{f'{metric_id}{SUMMARY_SUFFIX}': total for metric_id, total in sums.items()},
-        f'adjudication_failure_rate{SUMMARY_SUFFIX}': (
-            sums['adjudication_failed'] / asked if asked else 0.0
-        ),
+        f'adjudication_failure_rate{SUMMARY_SUFFIX}': sums[_FAILED] / asked if asked else 0.0,
     }
     check_summary_contract(summary)
     return summary
@@ -165,12 +181,16 @@ def _window_paths(root: Path, since: str, until: str) -> list[Path]:
 
 
 def _sum(series: Sequence[MetricSeries], metric_id: str) -> int:
+    """*metric_id*'s total over *series*. A series without it raises when the
+    metric is one of :data:`CONTRACT_METRICS`, and otherwise predates it and adds
+    nothing."""
     total = 0
     for run in series:
         found = [metric for metric in run.metrics if metric.metric_id == metric_id]
-        if not found:
+        if found:
+            total += int(found[0].value)
+        elif metric_id in CONTRACT_METRICS:
             raise ValueError(f'{EVAL_ID} series {run.run_stamp} has no metric {metric_id!r}')
-        total += int(found[0].value)
     return total
 
 
@@ -183,11 +203,12 @@ class SweepMetrics:
     summary_path: Path
     unwritten: str | None = None
 
-    def as_detail(self) -> dict[str, str]:
-        detail = {'metrics_json': str(self.metrics_path), 'summary_json': str(self.summary_path)}
-        if self.unwritten is not None:
-            detail['metrics_unwritten'] = self.unwritten
-        return detail
+    def as_detail(self) -> dict[str, str | None]:
+        return {
+            'metrics_json': str(self.metrics_path),
+            'summary_json': str(self.summary_path),
+            'metrics_unwritten': self.unwritten,
+        }
 
 
 @dataclass(frozen=True)
@@ -201,7 +222,9 @@ class SweepMetricsTarget:
         """Write *view*'s series stamped *now*, then rebuild the summary.
 
         A series that cannot be built raises. A failure to write, or to re-read an
-        earlier artifact, is logged and returned as ``unwritten``.
+        earlier artifact, is logged and returned as ``unwritten``, and the summary an
+        earlier run left is removed: it no longer counts tonight, and gate θ fails
+        closed on a missing summary rather than reading a stale one.
         """
         stamp = format_stamp(now)
         series = sweep_metric_series(view, project_id=self.project_id, stamp=stamp)
@@ -217,5 +240,19 @@ class SweepMetricsTarget:
             logger.error(
                 'link-heal sweep %s: cannot write its metrics: %s', view.plan.run_id[:8], failure,
             )
-            return replace(emitted, unwritten=f'{type(failure).__name__}: {failure}')
+            unwritten = f'{type(failure).__name__}: {failure}'
+            return replace(emitted, unwritten=unwritten + _retire(emitted.summary_path))
         return emitted
+
+
+def _retire(stale: Path) -> str:
+    """Remove the summary *stale*; what to add to the run's ``unwritten`` when it
+    could not be removed, else nothing."""
+    try:
+        stale.unlink()
+    except (FileNotFoundError, NotADirectoryError):
+        return ''
+    except OSError as failure:
+        logger.error('link-heal sweep: cannot remove the stale summary %s: %s', stale, failure)
+        return f'; the stale summary stays ({type(failure).__name__}: {failure})'
+    return ''
