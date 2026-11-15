@@ -11,7 +11,8 @@ _PROBE = Path(__file__).parent / 'js' / '_abort_delay_probe.mjs'
 
 
 def browser_abort_ms(endpoint_path: str) -> int:
-    """The delay, in ms, after which data.js aborts its fetch of *endpoint_path*."""
+    """The delay, in ms, after which data.js aborts its fetch of *endpoint_path*
+    on a healthy endpoint's first attempt."""
     result = subprocess.run(
         [node_path(), str(_PROBE), endpoint_path],
         capture_output=True,

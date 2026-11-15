@@ -1,5 +1,6 @@
-// Prints the delay, in ms, after which data.js's poll aborts the fetch of one
-// endpoint: `node _abort_delay_probe.mjs <endpoint path>`. The server-side
+// Prints the delay, in ms, after which data.js's poll aborts one endpoint's
+// fetch on a healthy endpoint's first attempt:
+// `node _abort_delay_probe.mjs <endpoint path>`. The server-side
 // budget tests read their ceiling through it (dashboard/tests/_browser_abort.py).
 //
 // It drives refreshDFData, the DEFAULT_POLL_DEPS merge production takes, not
