@@ -96,10 +96,21 @@ def test_cost_per_plan_sums_candidate_spend_including_the_no_plan_cell():
     assert rows['CFG']['cost_per_plan'] == pytest.approx(1.5)
 
 
-def test_the_judge_spend_stays_visible_on_the_row():
-    row = _rows([_cell('f1', 'CFG', 0, cost_usd=1.4, judge_cost_usd=0.4)])['CFG']
-    assert row['judge']['cost_usd'] == pytest.approx(0.4)
-    assert row['cost_usd'] + row['judge']['cost_usd'] == pytest.approx(1.4)
+def test_the_row_pairs_a_per_trial_mean_candidate_cost_with_a_summed_judge_spend():
+    persisted = [(1.4, 0.4), (2.0, 0.5), (1.1, 0.3)]
+    row = _rows([
+        _cell('f1', 'CFG', trial, cost_usd=cost, judge_cost_usd=judge)
+        for trial, (cost, judge) in enumerate(persisted)
+    ])['CFG']
+    mean_candidate_cost = sum(cost - judge for cost, judge in persisted) / len(persisted)
+    judge_sum = sum(judge for _, judge in persisted)
+    total_spend = sum(cost for cost, _ in persisted)
+
+    assert row['cost_usd'] == pytest.approx(mean_candidate_cost)
+    assert row['judge']['cost_usd'] == pytest.approx(judge_sum)
+    assert row['cost_usd'] * row['ci95']['cost']['n'] + row['judge']['cost_usd'] == (
+        pytest.approx(total_spend)
+    )
 
 
 def test_a_workflow_cell_keeps_its_completion_judge_spend():
