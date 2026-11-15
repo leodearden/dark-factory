@@ -170,6 +170,7 @@ from fused_memory.services.topic_anchor import (
 )
 from fused_memory.services.write_journal import (
     Mem0IntentStatus,
+    Mem0WriteMethod,
     decode_mem0_intent_metadata,
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
@@ -6766,6 +6767,7 @@ class MemoryService:
                     content=content,
                     metadata=meta,
                     payload_digest=payload_digest,
+                    write_method=Mem0WriteMethod.ADD,
                 )
             try:
                 mem0_result = await self._journaled_backend_call(

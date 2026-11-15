@@ -648,6 +648,7 @@ async def test_log_mem0_intent_roundtrip_pending(journal):
         content=long_content,
         metadata=metadata,
         payload_digest='digest-abc',
+        write_method=Mem0WriteMethod.ADD,
     )
     incomplete = await journal.get_incomplete_mem0_intents()
     assert len(incomplete) == 1
@@ -678,6 +679,7 @@ async def test_resolve_mem0_intent_completed_removes_from_incomplete(journal):
         content='hi',
         metadata={},
         payload_digest='d',
+        write_method=Mem0WriteMethod.ADD,
     )
     await journal.resolve_mem0_intent(intent_id, 'completed')
 
@@ -699,6 +701,7 @@ async def test_resolve_mem0_intent_dead_persists_reason(journal):
         content='hi',
         metadata={},
         payload_digest='d',
+        write_method=Mem0WriteMethod.ADD,
     )
     reason = 'no backend_op: unknown outcome (not auto-re-issued)'
     await journal.resolve_mem0_intent(intent_id, 'dead', reason=reason)
@@ -724,6 +727,7 @@ async def test_get_mem0_intents_status_filter(journal):
             content=f'content-{status}',
             metadata={},
             payload_digest='d',
+            write_method=Mem0WriteMethod.ADD,
         )
         if status != 'pending':
             await journal.resolve_mem0_intent(iid, status)
@@ -748,6 +752,7 @@ async def test_get_incomplete_returns_only_pending(journal):
         content='pending-one',
         metadata={},
         payload_digest='d',
+        write_method=Mem0WriteMethod.ADD,
     )
     for status in ['completed', 'failed', 'dead']:
         iid = str(uuid.uuid4())
@@ -757,6 +762,7 @@ async def test_get_incomplete_returns_only_pending(journal):
             content=f'c-{status}',
             metadata={},
             payload_digest='d',
+            write_method=Mem0WriteMethod.ADD,
         )
         await journal.resolve_mem0_intent(iid, status)
 
@@ -778,6 +784,7 @@ async def test_prune_mem0_intents_ages_out_terminal_rows(journal):
             content=f'c-{status}',
             metadata={},
             payload_digest='d',
+            write_method=Mem0WriteMethod.ADD,
         )
         if status != 'pending':
             await journal.resolve_mem0_intent(iid, status)
@@ -820,6 +827,7 @@ async def test_prune_mem0_intents_can_include_dead_explicitly(journal):
         content='c',
         metadata={},
         payload_digest='d',
+        write_method=Mem0WriteMethod.ADD,
     )
     await journal.resolve_mem0_intent(iid, 'dead', reason='unknown outcome')
     await journal._require_access().connection.execute(

@@ -33,7 +33,11 @@ from fused_memory.services.mem0_write_retry import (
     Mem0RetryPolicy,
 )
 from fused_memory.services.memory_service import MemoryService
-from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
+from fused_memory.services.write_journal import (
+    Mem0IntentStatus,
+    Mem0WriteMethod,
+    WriteJournal,
+)
 
 
 @pytest_asyncio.fixture
@@ -563,6 +567,7 @@ async def _seed_pending_intent(
     agent_id='agent-a',
     session_id='sess-1',
     causation_id=None,
+    write_method=Mem0WriteMethod.ADD,
 ):
     await journal.log_mem0_intent(
         intent_id=intent_id,
@@ -575,6 +580,7 @@ async def _seed_pending_intent(
         content=content,
         metadata=metadata if metadata is not None else {'category': 'preferences_and_norms'},
         payload_digest=payload_digest,
+        write_method=write_method,
     )
 
 
