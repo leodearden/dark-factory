@@ -1355,8 +1355,12 @@ later cells pay the judge against. Those older cells persisted
 measures the same thing on both vintages without a vintage marker. The latency
 axis already excluded the judge, so the two efficiency axes now agree.
 
-- The judge's spend stays on the row's `judge.cost_usd`, so total spend is
-  still `cost_usd + judge.cost_usd`.
+- The judge's spend stays on the row's `judge.cost_usd`, a SUM over every
+  trial (unmeasurable ones included); `cost_usd` is a per-trial MEAN over the
+  measured trials, so the two do not add. A plan-only row's measured spend is
+  `cost_usd × ci95.cost.n + judge.cost_usd` when no unmeasurable trial carries
+  judge spend. Compose a judge-inclusive figure, such as D11's $/usable-plan
+  (`plans/fable-architect-trial-v2-prd.md`), that way or from the cells.
 - A workflow cell keeps its completion-judge spend: that judge's verdict
   changes the run's own course, and that path has no vintage split.
 - A plan-only `cost_source` of `mixed` still names the persisted
