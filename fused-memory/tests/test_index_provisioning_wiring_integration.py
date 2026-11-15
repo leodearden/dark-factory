@@ -87,7 +87,7 @@ class TestStartupSweepLive:
         await backend.provision_registered_graphs()
         await await_index_operational(registered_graph)
 
-        assert probe_name in await backend._require_falkor_client().list_graphs(), (
+        assert probe_name in await backend.graph_access.list_graphs(), (
             'the probe graph must exist, or "untouched" would be vacuous'
         )
         assert await listed_index_specs(backend, probe_name) == before
@@ -117,7 +117,7 @@ class TestFirstWriteLive:
         """PRD boundary test 7: a newly registered project needs no service restart."""
         name, graph = scratch('first_write')
         backend = live_backend_factory({name})
-        assert name not in await backend._require_falkor_client().list_graphs(), (
+        assert name not in await backend.graph_access.list_graphs(), (
             'the graph must not exist before its first write'
         )
         fake = self._with_fake_upstream(backend)

@@ -60,8 +60,9 @@ class TestBudgetedGraphBudgets:
             (lambda graph: graph.ro_query('MATCH (n) RETURN n', op='probe'), _READ_S),
             (lambda graph: graph.query('CREATE (n)', op='probe'), _WRITE_S),
             (lambda graph: graph.ro_query_compact('MATCH (n) RETURN n', op='probe'), _READ_S),
+            (lambda graph: graph.delete(op='probe'), _WRITE_S),
         ],
-        ids=['ro_query-reads', 'query-writes', 'ro_query_compact-reads'],
+        ids=['ro_query-reads', 'query-writes', 'ro_query_compact-reads', 'delete-writes'],
     )
     async def test_an_overrun_names_the_op_and_the_budget_applied(self, call, budget):
         graph = _budgeted(HangingRawGraph())
@@ -115,6 +116,23 @@ class TestBudgetedGraphForwardsTheRawCallShape:
 
         raw.execute_command.assert_awaited_once_with('GRAPH.RO_QUERY', 'g', cypher, '--compact')
         assert result is reply
+
+    @pytest.mark.asyncio
+    async def test_delete_reaches_the_raw_graph_with_no_arguments(self):
+        raw = MagicMock()
+        raw.delete = AsyncMock()
+
+        await _budgeted(raw).delete(op='x')
+
+        raw.delete.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_a_raw_delete_failure_propagates_untouched(self):
+        raw = MagicMock()
+        raw.delete = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with pytest.raises(RuntimeError, match='^boom$'):
+            await _budgeted(raw).delete(op='x')
 
 
 class TestFalkorGraphAccess:

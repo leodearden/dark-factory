@@ -1,12 +1,13 @@
 """Tests for reindex maintenance: GraphitiBackend stale-embedding queries and ReindexManager."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import assert_ro_query_only, extract_cypher, extract_params
-from _graph_access_fake import FakeGraphAccess
+from _graph_access_fake import FakeGraphAccess, wait_forever, with_backend_budgets
 
 from fused_memory.backends.falkor_indices import vector_drop_statement
 from fused_memory.backends.graphiti_client import (
@@ -1461,38 +1462,35 @@ class TestNodeCount:
         assert result == 42
 
 
-class TestRequireFalkorClient:
-    """GraphitiBackend._require_falkor_client() returns the FalkorDB client or raises."""
-
-    def test_returns_driver_client(self, mock_config, make_backend):
-        """Returns the .client attribute of the underlying FalkorDriver."""
-        backend = make_backend(mock_config)
-        sentinel = object()
-        backend._driver.client = sentinel
-        result = backend._require_falkor_client()
-        assert result is sentinel
-
-    def test_raises_when_not_initialized(self, mock_config):
-        """Raises RuntimeError when backend is not initialized (_driver is None)."""
-        backend = GraphitiBackend(mock_config)
-        with pytest.raises(RuntimeError, match='not initialized'):
-            backend._require_falkor_client()
-
-
 class TestListGraphs:
     """GraphitiBackend.list_graphs() returns non-system FalkorDB graph names."""
 
     @pytest.mark.asyncio
-    async def test_returns_filtered(self, mock_config, make_backend):
-        """Filters out 'default_db' and names ending in '_db'; delegates to _require_falkor_client."""
-        backend = make_backend(mock_config)
-        with patch.object(backend, '_require_falkor_client') as mock_client_accessor:
-            mock_client_accessor.return_value.list_graphs = AsyncMock(
-                return_value=['proj_a', 'default_db', 'proj_b', 'internal_db']
-            )
-            result = await backend.list_graphs()
-        assert result == ['proj_a', 'proj_b']
-        mock_client_accessor.assert_called_once_with()
+    async def test_filters_system_graphs_from_the_providers_listing(self, mock_config, make_backend):
+        """Filters out 'default_db' and names ending in '_db' from the provider's listing."""
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({
+            'proj_a': MagicMock(),
+            'default_db': MagicMock(),
+            'proj_b': MagicMock(),
+            'internal_db': MagicMock(),
+        }))
+
+        assert await backend.list_graphs() == ['proj_a', 'proj_b']
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_listing_fails_on_the_read_budget(
+        self, mock_config, make_backend, make_graph_driver,
+    ):
+        driver = make_graph_driver({})
+        driver.client.list_graphs = AsyncMock(side_effect=wait_forever)
+        backend = make_backend(
+            with_backend_budgets(mock_config, read_s=0.05, write_s=0.08), driver=driver,
+        )
+
+        with pytest.raises(TimeoutError) as raised:
+            await asyncio.wait_for(backend.list_graphs(), 5.0)
+
+        assert str(raised.value) == 'Graphiti list_graphs timed out after 0.05s'
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):

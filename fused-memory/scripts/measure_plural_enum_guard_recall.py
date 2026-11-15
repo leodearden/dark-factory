@@ -2091,7 +2091,7 @@ def _build_live_edge_source(config: Any) -> Any:
         project_id: str, *, page_size: int,
     ) -> tuple[dict[str, str], EnumerationOutcome]:
         await _ensure_initialized()
-        graph = backend._graph_for(project_id)  # noqa: SLF001
+        graph = backend.graph_access.graph(project_id)
 
         async def query_fn(cypher: str):
             result = await graph.ro_query(cypher, op='edge_source')
