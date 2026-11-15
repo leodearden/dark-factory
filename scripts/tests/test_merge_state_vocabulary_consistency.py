@@ -509,6 +509,16 @@ def assert_span_matches(
 # threshold is the wrong instrument here; a reviewer reading the diff is the
 # right one.
 PINNED_SITES: dict[str, tuple[tuple[str, ...], str]] = {
+    "ARCHITECTURE.md": (
+        ("LIVE_STATES", "TERMINAL_STATES", "EPISTEMIC_STATES"),
+        "§5.1 Submit/poll protocol — merge_status's live, terminal and epistemic "
+        "state lists",
+    ),
+    "OPERATIONS.md": (
+        ("SUBMIT_TERMINAL", "SUBMIT_NON_TERMINAL"),
+        "the merge-queue section's step 3 — merge_request's terminal and "
+        "non-terminal status lists",
+    ),
     "escalation/src/escalation/server.py": (
         ("CANCEL_STATES",),
         "the `merge_cancel` docstring's CANCEL_STATES span (bare markers — an HTML "
