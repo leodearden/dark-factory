@@ -22,6 +22,11 @@ from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane.content_relation import (
+    ContentRelation,
+    ContentUnclassifiable,
+    classify_content,
+)
 from orchestrator.merge_lane.landing_evidence import (
     Containment,
     GitReadFailed,
@@ -227,3 +232,161 @@ class TestIsAncestorOrRaise:
             await is_ancestor_or_raise(git_ops, ancestor=MISSING_SHA, descendant='main')
 
         assert 'fatal' in caught.value.stderr
+
+
+def two_commit_branch(repo: GuardedRepo, branch: str) -> tuple[str, str]:
+    """Create *branch* off main with two content-bearing commits; return both shas."""
+    repo.git('checkout', '-b', branch, 'main')
+    first = repo.commit(f'feat: {branch} first', {f'work/{branch}-1.py': numbered_lines(f'{branch}1', 8)})
+    second = repo.commit(f'feat: {branch} second', {f'work/{branch}-2.py': numbered_lines(f'{branch}2', 8)})
+    repo.git('checkout', 'main')
+    return first, second
+
+
+def with_line(lines: list[str], index: int, text: str) -> str:
+    """*lines* joined as a file, with line *index* replaced by *text*."""
+    edited = list(lines)
+    edited[index] = text
+    return ''.join(f'{line}\n' for line in edited)
+
+
+def rebase_onto_main(repo: GuardedRepo, branch: str) -> str:
+    """Rebase *branch* onto main, asserting no conflict; return the rewritten tip."""
+    repo.git('checkout', branch)
+    repo.git('rebase', 'main')
+    tip = repo.sha('HEAD')
+    repo.git('checkout', 'main')
+    return tip
+
+
+@pytest.mark.asyncio
+class TestClassifyContent:
+    async def test_equal_tips_are_same(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        tip = branch_with_commit(repo, 'task/same')
+
+        relation = await classify_content(git_ops, target='main', old_tip=tip, new_tip=tip)
+
+        assert relation is ContentRelation.SAME
+
+    async def test_clean_rebase_is_rebased(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        _, old_tip = two_commit_branch(repo, 'task/clean')
+        advance_main(repo, 'unrelated')
+        new_tip = rebase_onto_main(repo, 'task/clean')
+
+        relation = await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=new_tip)
+
+        assert relation is ContentRelation.REBASED
+
+    async def test_conflict_resolution_is_different(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        lines = numbered_lines('shared', 12).splitlines()
+        repo.commit('chore: shared file', {'shared.txt': numbered_lines('shared', 12)})
+        repo.git('checkout', '-b', 'task/conflict')
+        old_tip = repo.commit('feat: branch side', {'shared.txt': with_line(lines, 5, 'branch')})
+        repo.git('checkout', 'main')
+        repo.commit('chore: main side', {'shared.txt': with_line(lines, 5, 'main')})
+        repo.git('checkout', '-b', 'task/conflict-resolved')
+        new_tip = repo.commit('feat: branch side, resolved', {'shared.txt': with_line(lines, 5, 'branch')})
+
+        relation = await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=new_tip)
+
+        assert relation is ContentRelation.DIFFERENT
+
+    async def test_shifted_context_is_different(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        lines = numbered_lines('context', 12).splitlines()
+        repo.commit('chore: context file', {'context.txt': numbered_lines('context', 12)})
+        repo.git('checkout', '-b', 'task/shifted')
+        old_tip = repo.commit('feat: edit line 6', {'context.txt': with_line(lines, 5, 'branch line 6')})
+        repo.git('checkout', 'main')
+        repo.commit('chore: edit line 3', {'context.txt': with_line(lines, 2, 'main line 3')})
+        new_tip = rebase_onto_main(repo, 'task/shifted')
+
+        relation = await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=new_tip)
+
+        assert relation is ContentRelation.DIFFERENT
+
+    async def test_added_commit_is_different(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        old_tip = branch_with_commit(repo, 'task/added')
+        repo.git('checkout', 'task/added')
+        new_tip = repo.commit('feat: one more', {'work/more.py': numbered_lines('more', 6)})
+
+        relation = await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=new_tip)
+
+        assert relation is ContentRelation.DIFFERENT
+
+    async def test_dropped_commit_is_different(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        kept, old_tip = two_commit_branch(repo, 'task/dropped')
+        advance_main(repo, 'moved')
+        repo.git('checkout', '-b', 'task/dropped-new', 'main')
+        repo.git('cherry-pick', kept)
+        new_tip = repo.sha('HEAD')
+
+        relation = await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=new_tip)
+
+        assert relation is ContentRelation.DIFFERENT
+
+    async def test_reset_to_an_ancestor_is_older(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        first, old_tip = two_commit_branch(repo, 'task/reset')
+
+        relation = await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=first)
+
+        assert relation is ContentRelation.OLDER
+
+    async def test_merge_commit_in_range_is_different(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        old_tip = branch_with_commit(repo, 'task/merging')
+        advance_main(repo, 'merged-in')
+        repo.git('checkout', 'task/merging')
+        repo.git('merge', '--no-ff', 'main', '-m', 'Merge main into task/merging')
+        new_tip = repo.sha('HEAD')
+
+        relation = await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=new_tip)
+
+        assert relation is ContentRelation.DIFFERENT
+
+    async def test_reapplied_diff_is_different(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        repo.git('checkout', '-b', 'task/multiset')
+        repo.commit('feat: add f', {'work/f.py': numbered_lines('f', 10)})
+        repo.git('rm', '-q', 'work/f.py')
+        repo.git('commit', '-m', 'feat: drop f')
+        old_tip = repo.sha('HEAD')
+        new_tip = repo.commit('feat: add f again', {'work/f.py': numbered_lines('f', 10)})
+
+        relation = await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=new_tip)
+
+        assert relation is ContentRelation.DIFFERENT
+
+    async def test_both_ranges_empty_is_rebased(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        old_tip = branch_with_commit(repo, 'task/landed')
+        advance_main(repo, 'before-merge')
+        repo.git('merge', '--no-ff', 'task/landed', '-m', 'Merge task/landed into main')
+        new_tip = repo.sha('main')
+
+        relation = await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=new_tip)
+
+        assert relation is ContentRelation.REBASED
+
+    async def test_unreadable_new_tip_is_unclassifiable(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        old_tip = branch_with_commit(repo, 'task/bad-new')
+
+        with pytest.raises(ContentUnclassifiable) as caught:
+            await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=MISSING_SHA)
+
+        assert (caught.value.old_tip, caught.value.new_tip, caught.value.target) == (
+            old_tip, MISSING_SHA, 'main',
+        )
+        assert caught.value.stderr.strip()
+
+    async def test_unreadable_target_is_unclassifiable(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        old_tip = branch_with_commit(repo, 'task/old-side')
+        new_tip = branch_with_commit(repo, 'task/new-side')
+
+        with pytest.raises(ContentUnclassifiable) as caught:
+            await classify_content(git_ops, target=MISSING_SHA, old_tip=old_tip, new_tip=new_tip)
+
+        assert (caught.value.old_tip, caught.value.new_tip, caught.value.target) == (
+            old_tip, new_tip, MISSING_SHA,
+        )
+        assert caught.value.stderr.strip()
+
+
+def test_unclassifiable_is_a_runtime_error() -> None:
+    assert issubclass(ContentUnclassifiable, RuntimeError)
