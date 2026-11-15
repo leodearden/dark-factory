@@ -3697,7 +3697,9 @@ Recurring maintenance runs as systemd **user** timers, not as orchestrator
 work. Each job is the same four files — a committed wrapper `.sh` (all the
 logic, so it is testable and runnable by hand), a thin `Type=oneshot`
 `.service` whose `ExecStart` is that wrapper, a `.timer` carrying the
-cadence, and an idempotent self-verifying `install-*-timer.sh`.
+cadence, and an idempotent self-verifying `install-*-timer.sh`. On-demand
+sweeps that have no timer, and so none of those four files, are grouped after
+the timer jobs at the end of this section.
 
 The cadence lives in the unit's `OnCalendar` — **not** in
 `dark-factory-orchestrator.yaml`. The orchestrator process is not the thing
@@ -5067,6 +5069,25 @@ The ladder row above is a host claim. An agent cannot run the installer (see
 "The nightly ladder"), so the job is installed only once
 `systemctl --user list-timers --all` lists
 `fused-memory-duplicate-audit.timer`.
+
+### Plan-decision cross-pairing scan (on demand, no timer)
+
+To look for plans whose `design_decisions` entries pair a decision with the
+wrong rationale, re-run the read-only scanner rather than quote the dated
+figures: `python scripts/scan_plan_decision_pairing.py`. It sees only the
+mis-pairings someone noticed and documented in a later correction entry, so
+every count it reports, zero included, is a strict lower bound and never
+evidence that plans are clean. Unattended, use
+`python scripts/scan_plan_decision_pairing.py --fail-on-hit --require-scanned 1`;
+plain `--fail-on-hit` exits 0 when the sweep read nothing (exit 3 is the
+coverage floor). That gate is red from day one and stays red: on 2026-11-15,
+against the default root, it exited 1 on 27 historical mis-pairings in 24
+plans, and those cannot be repaired. For a gate that starts green, pass
+`--require-scanned 1` without `--fail-on-hit`, or compare the `--json` hit
+count against a recorded baseline. The findings, why repair is impossible, and
+why no write-time containment exists are in
+[docs/plan-decision-cross-pairing.md](docs/plan-decision-cross-pairing.md); see
+the CHANGELOG entry for task 3967.
 
 ---
 
