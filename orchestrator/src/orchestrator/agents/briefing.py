@@ -206,10 +206,13 @@ def _retired_review_section(retired: Sequence[RetiredReview]) -> str:
     return (
         '## Review Rounds Answered On A Quarantined Branch — Re-Derive The Responses\n\n'
         'A quarantine renamed this task\'s reviewed branch aside, and this dispatch '
-        'cut a fresh branch from main. The review suggestions below were answered by '
-        'commits on the parked branch. None of those commits are on this branch. '
-        'This branch\'s review allowance was reset, and its reviewer may not '
-        're-raise them, so plan for them here.\n\n'
+        'cut a fresh branch from main. The review suggestions below fell inside this '
+        'task\'s modules and were handed to an amendment pass on the parked branch. '
+        'None of that branch\'s commits are on this branch. Suggestions from those '
+        'rounds that fall outside this task\'s modules were filed as follow-up tasks '
+        'and are left out here, so do not plan them. This branch\'s review allowance '
+        'was reset, and its reviewer may not re-raise the ones below, so plan for '
+        'them here.\n\n'
         f'{lineages}\n'
         'Protocol:\n\n'
         '1. Check each suggestion against the current code; main may already carry an '
@@ -230,7 +233,7 @@ def _retired_lineage_block(review: RetiredReview) -> str:
         f'{review.review_cycles_total} review cycle(s)\n'
         f'- Retired review archive: `{review.archive}`\n'
         f'- How it was answered: `git log --oneline main..{answered_by}`\n\n'
-        + format_issue_section('#### Suggestions answered on that branch\n', review.suggestions)
+        + format_issue_section('#### In-scope suggestions amended on that branch\n', review.suggestions)
     )
 
 
@@ -650,7 +653,7 @@ class BriefingAssembler:
                 byte-identical to the pre-γ baseline, so nothing is added on
                 the common path.
             rulings: rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
-            retired_reviews: from ``orchestrator/review_lineage.py::retired_reviews_since``.
+            retired_reviews: the lock-scoped view, ``orchestrator/workflow.py::TaskWorkflow._retired_reviews_since``.
         """
         preamble = await self._task_preamble(
             task, 'architect', context, include_files=False,
@@ -739,7 +742,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         and either confirms, updates, or recreates it.
 
         *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience;
-        *retired_reviews* come from ``orchestrator/review_lineage.py::retired_reviews_since``.
+        *retired_reviews* are the lock-scoped view, ``orchestrator/workflow.py::TaskWorkflow._retired_reviews_since``.
         """
         preamble = await self._task_preamble(task, 'architect', context)
         prior_proposal_section = self._format_prior_proposal(task)

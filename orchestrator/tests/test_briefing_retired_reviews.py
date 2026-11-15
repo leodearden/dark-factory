@@ -2,8 +2,8 @@
 
 A quarantine renamed the reviewed branch aside, so the amend-round responses
 committed on it are not on the new branch. The plan and revalidation
-briefings name the parked branch and list each suggestion it answered, so the
-architect can plan their re-derivation.
+briefings name the parked branch and list each in-scope suggestion it
+amended, so the architect can plan their re-derivation.
 """
 
 from __future__ import annotations

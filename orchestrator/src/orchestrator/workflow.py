@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, TypeVar, cast
 
 # escalation.pins is pure and imports only escalation.models, so it is
 # cycle-safe at module top (harness.py imports it the same way);
@@ -745,6 +745,8 @@ class _BriefingLike(Protocol):
     ) -> str: ...
 
 logger = logging.getLogger(__name__)
+
+_SuggestionT = TypeVar('_SuggestionT', bound=Mapping[str, Any])
 
 # Reason string used when the fresh-invocation zero-output circuit breaker trips.
 # Mirrors the _inherited_break_info pattern: set by _execute_iterations, consumed
@@ -6256,10 +6258,14 @@ class TaskWorkflow:
         return True
 
     def _retired_reviews_since(self, since: datetime | None) -> tuple[RetiredReview, ...]:
-        """The review rounds a quarantine retired after *since* (``orchestrator/review_lineage.py``)."""
+        """The quarantine-retired review rounds after *since*, narrowed to this task's lock set; the out-of-scope rest was already filed as follow-up tasks (task 2640)."""
         if self.artifacts is None:
             return ()
-        return retired_reviews_since(self.artifacts, since)
+        scoped = (
+            replace(review, suggestions=tuple(self._suggestions_in_scope(review.suggestions)))
+            for review in retired_reviews_since(self.artifacts, since)
+        )
+        return tuple(review for review in scoped if review.suggestions)
 
     async def _apply_revalidation_skip(
         self, plan: dict, current_main: str,
@@ -12031,7 +12037,7 @@ class TaskWorkflow:
             )
         return payload
 
-    def _suggestions_in_scope(self, suggestions: list[dict]) -> list[dict]:
+    def _suggestions_in_scope(self, suggestions: Sequence[_SuggestionT]) -> list[_SuggestionT]:
         """Filter suggestions to those whose location falls within a module
         this task already holds a lock for.
 
@@ -12046,13 +12052,13 @@ class TaskWorkflow:
         locked = set(self.modules)
         if not locked:
             logger.warning(
-                'Task %s: empty lock set at amendment filter time; '
+                'Task %s: empty lock set at suggestion scope filter time; '
                 'returning zero in-scope suggestions',
                 self.task_id,
             )
             return []
         depth = self.config.lock_depth
-        in_scope: list[dict] = []
+        in_scope: list[_SuggestionT] = []
         for s in suggestions:
             location = (s.get('location') or '').strip()
             if not location:
