@@ -14,7 +14,7 @@ from escalation.models import Escalation
 from orchestrator.offline_lane_confirm import Confirmed, PassOutcome
 from orchestrator.offline_lane_filing import EvidenceNote
 from orchestrator.offline_lane_records import RunRecord
-from orchestrator.verify_cache.audit import LeakRecord, LeakResponse, apply, attribute
+from orchestrator.verify_cache.audit import LeakIdentity, LeakRecord, LeakResponse, apply, attribute
 from orchestrator.verify_cache.audit_run import AUDIT_COMMAND
 from orchestrator.verify_cache.registry import PolicyState, Registry
 
@@ -85,7 +85,7 @@ class VerifyCacheAuditHook:
 
 def _blocker(escalation_id: str, response: LeakResponse) -> Escalation:
     records = [LeakRecord.parse(text) for text in response.policy.leaks]
-    units = ', '.join(dict.fromkeys(record.unit_id for record in records if record.counts))
+    units = ', '.join(dict.fromkeys(leak.unit_id for leak in response.streak_leaks)) or 'none counting toward the streak'
     summary = f'Verify cache DISABLED until {_until(response.policy)}: attributable leaks on {units}'
     return Escalation(
         id=escalation_id,
@@ -105,20 +105,21 @@ def _blocker(escalation_id: str, response: LeakResponse) -> Escalation:
 
 
 def _blocker_detail(records: Sequence[LeakRecord], response: LeakResponse) -> str:
+    streak = frozenset(leak.identity for leak in response.streak_leaks)
     lines = [
         'The verify-cache audit ran the merge-role command set uncached on the offline lane and reproduced '
         'reds on units whose greens the named landings had replayed from the cache.',
         f'Kill switch: disabled until {_until(response.policy)} - {response.policy.reason}',
         'Leak records:',
-        *(f'- {_leak_line(record)}' for record in records),
+        *(f'- {_leak_line(record, streak)}' for record in records),
         'Evicted by this pass:',
         *(f'- key {key}: {count} entries' for key, count in response.evicted.items()),
     ]
     return '\n'.join(lines)
 
 
-def _leak_line(record: LeakRecord) -> str:
-    counted = '' if record.counts else ' (not counting: recorded before an operator re-enable)'
+def _leak_line(record: LeakRecord, streak: frozenset[LeakIdentity]) -> str:
+    counted = '' if record.identity in streak else ' (not counting toward the streak)'
     return (
         f'{record.unit_id} key {record.key} entry {record.entry_id} at landing {record.landing_sha}, '
         f'evidence event {record.evidence_event_id}, detected {record.detected_at.isoformat()}, '

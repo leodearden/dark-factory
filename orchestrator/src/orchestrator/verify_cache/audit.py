@@ -124,6 +124,7 @@ class LeakResponse:
     leaks: tuple[LeakRecord, ...]
     evicted: Mapping[str, int]
     counted: tuple[LeakIdentity, ...]
+    streak_leaks: tuple[LeakRecord, ...]
     policy: PolicyState
     newly_disabled: bool
     l2_required: bool
@@ -132,16 +133,20 @@ class LeakResponse:
 async def apply(verdict: AuditVerdict, registry: Registry, now: datetime) -> LeakResponse:
     """Evict every leaked key, then record the leaks and trip or hold the kill switch; idempotent per leak."""
     if not verdict.attributions:
-        return LeakResponse((), {}, (), await registry.policy_state(), False, False)
+        current = await registry.policy_state()
+        return LeakResponse((), {}, (), _counting(_records(current), now), current, False, False)
     leaks = tuple(attribution.record(now) for attribution in verdict.attributions)
     evicted = await _evict(registry, leaks)
     current = await registry.policy_state()
-    step = _next_state(current, leaks, now)
+    replayable = await _replayable(registry, _records(current), now)
+    step = _next_state(current, leaks, now, replayable)
     written = current
     if step.state != current:
         written = replace(step.state, updated_at=now)
         await registry.write_policy_state(written)
-    return LeakResponse(leaks, evicted, step.counted, written, step.newly_disabled, written.is_disabled(now))
+    return LeakResponse(
+        leaks, evicted, step.counted, step.streak_leaks, written, step.newly_disabled, written.is_disabled(now),
+    )
 
 
 async def _evict(registry: Registry, leaks: Iterable[LeakRecord]) -> dict[str, int]:
@@ -154,29 +159,51 @@ async def _evict(registry: Registry, leaks: Iterable[LeakRecord]) -> dict[str, i
     return evicted
 
 
+async def _replayable(registry: Registry, stored: Sequence[LeakRecord], now: datetime) -> frozenset[LeakIdentity]:
+    """The aged *stored* records whose landing still hands their entry back to attribute(), so could be redelivered."""
+    aged = [record for record in stored if not _within(record, now)]
+    replayable: set[LeakIdentity] = set()
+    for landing_sha in dict.fromkeys(record.landing_sha for record in aged):
+        still_consumed = {entry.entry_id for entry in await registry.consumed_for(landing_sha)}
+        replayable.update(
+            record.identity for record in aged
+            if record.landing_sha == landing_sha and record.entry_id in still_consumed
+        )
+    return frozenset(replayable)
+
+
 @dataclass(frozen=True)
 class _Step:
     state: PolicyState
     counted: tuple[LeakIdentity, ...]
+    streak_leaks: tuple[LeakRecord, ...]
     newly_disabled: bool
 
 
-def _next_state(current: PolicyState, leaks: Iterable[LeakRecord], now: datetime) -> _Step:
-    """The policy row after *leaks*, with *current*'s updated_at so an unchanged row compares equal."""
+def _next_state(
+    current: PolicyState, leaks: Iterable[LeakRecord], now: datetime, replayable: frozenset[LeakIdentity],
+) -> _Step:
+    """The policy row after *leaks*, with *current*'s updated_at so an unchanged row compares equal.
+
+    A leak already stored, at any age, is never new. A record is dropped only once it is outside the
+    window and its landing can no longer replay its entry, so no identity is forgotten while it can
+    still be redelivered; a live disable keeps every record.
+    """
     disabled = current.is_disabled(now)
-    kept = _records(current) if disabled else _within_window(_records(current), now)
-    new = _new_leaks(kept, leaks)
+    stored = _records(current)
+    new = _new_leaks(stored, leaks)
+    kept = stored if disabled else tuple(r for r in stored if _within(r, now) or r.identity in replayable)
     records = (*kept, *new)
-    streak = len(_counting(records, now))
-    trips = not disabled and bool(new) and streak >= MIN_DISABLING_LEAKS
+    streak_leaks = _counting(records, now)
+    trips = not disabled and bool(new) and len(streak_leaks) >= MIN_DISABLING_LEAKS
     state = PolicyState(
         disabled_until=_disabled_until(current, now, trips=trips),
-        reason=_disable_reason(_counting(records, now)) if trips else current.reason,
-        streak=streak,
+        reason=_disable_reason(streak_leaks) if trips else current.reason,
+        streak=len(streak_leaks),
         leaks=tuple(record.to_text() for record in records),
         updated_at=current.updated_at,
     )
-    return _Step(state, tuple(leak.identity for leak in new), trips)
+    return _Step(state, tuple(leak.identity for leak in new), streak_leaks, trips)
 
 
 def _disabled_until(current: PolicyState, now: datetime, *, trips: bool) -> datetime | None:
@@ -190,8 +217,8 @@ def _records(state: PolicyState) -> tuple[LeakRecord, ...]:
     return tuple(LeakRecord.parse(text) for text in state.leaks)
 
 
-def _within_window(records: Iterable[LeakRecord], now: datetime) -> tuple[LeakRecord, ...]:
-    return tuple(record for record in records if now - record.detected_at <= LEAK_WINDOW)
+def _within(record: LeakRecord, now: datetime) -> bool:
+    return now - record.detected_at <= LEAK_WINDOW
 
 
 def _new_leaks(known: Iterable[LeakRecord], leaks: Iterable[LeakRecord]) -> tuple[LeakRecord, ...]:
@@ -205,7 +232,8 @@ def _new_leaks(known: Iterable[LeakRecord], leaks: Iterable[LeakRecord]) -> tupl
 
 
 def _counting(records: Iterable[LeakRecord], now: datetime) -> tuple[LeakRecord, ...]:
-    return tuple(record for record in _within_window(records, now) if record.counts)
+    """The records the streak counts: inside the window, and not recorded before an operator re-enable."""
+    return tuple(record for record in records if _within(record, now) and record.counts)
 
 
 def _disable_reason(counting: Sequence[LeakRecord]) -> str:
@@ -216,7 +244,7 @@ def _disable_reason(counting: Sequence[LeakRecord]) -> str:
 
 
 async def enable(registry: Registry, reason: str, now: datetime) -> PolicyState:
-    """The operator's re-enable: clear the kill switch, keeping the leaks recorded so none counts again."""
+    """The operator's re-enable: clear the kill switch, keeping every recorded leak so none counts again while retained."""
     if not reason or not reason.strip():
         raise ValueError(f'enable: reason must be a non-blank explanation, got {reason!r}')
     current = await registry.policy_state()
