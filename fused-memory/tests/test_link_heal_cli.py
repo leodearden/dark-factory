@@ -662,6 +662,7 @@ class TestExitCodes:
         (RunCounts(), 0),
         (RunCounts(skipped_cap=3, caps_bit=('max_actions_per_run',)), 0),
         (RunCounts(skipped_stale=2), 0),
+        (RunCounts(adjudication_capped=3), 0),
         (RunCounts(failed=1), 1),
         (RunCounts(read_failed=1), 1),
         (RunCounts(failed=3, not_attempted=4, stopped_by='write_failure_streak'), 1),

@@ -286,10 +286,15 @@ DAY = timedelta(hours=24)
 
 
 def _settings(
-    *, writes: bool = False, dry_run: bool = False, projects: tuple[str, ...] = PROJECTS,
+    *,
+    writes: bool = False,
+    dry_run: bool = False,
+    projects: tuple[str, ...] = PROJECTS,
+    max_adjudications: int = 200,
 ) -> SweepSettings:
     return SweepSettings(
         projects=projects, writes=writes, dry_run=dry_run, actions=SWEEP_ACTIONS, window_hours=24,
+        max_adjudications=max_adjudications,
     )
 
 
@@ -673,7 +678,7 @@ class TestAParentHostedInAProjectTheSweepDoesNotExamine:
         _calibrate(ledger, passed=True)
         settings = SweepSettings(
             projects=(DF,), presence_projects=(REIFY,), writes=True, dry_run=False,
-            actions=SWEEP_ACTIONS, window_hours=24,
+            actions=SWEEP_ACTIONS, window_hours=24, max_adjudications=200,
         )
 
         report = await _sweep(
@@ -1229,15 +1234,86 @@ class TestTheWindow:
         assert report.complete
 
 
+def _same() -> FakeAdjudicator:
+    return FakeAdjudicator(lambda _text: Verdict.SAME)
+
+
+class TestTheAdjudicationCap:
+    @staticmethod
+    def _seed_five(harness: LinkHealHarness) -> None:
+        for n in range(5):
+            _seed_one(harness, n, f'a capped sighting {n}', INSIDE)
+
+    @pytest.mark.asyncio
+    async def test_a_capped_sweep_is_partial_and_its_report_says_how_many_waited(
+        self, harness, ledger, tmp_path,
+    ):
+        self._seed_five(harness)
+        fake = _same()
+
+        report = await _sweep(
+            harness, ledger, tmp_path, settings=_settings(max_adjudications=2),
+            filer=RecordingFiler(), adjudicate=fake,
+        )
+
+        assert len(fake.pairs) == 2
+        assert report.view.plan.counts.adjudication_capped == 3
+        assert report.complete is False
+        assert 'adjudication capped 3' in report.report_path.read_text()
+
+    @pytest.mark.asyncio
+    async def test_the_window_holds_until_every_link_has_been_asked(
+        self, harness, ledger, tmp_path,
+    ):
+        self._seed_five(harness)
+        settings = _settings(max_adjudications=2)
+        first = await _sweep(
+            harness, ledger, tmp_path, settings=settings, filer=RecordingFiler(), adjudicate=_same(),
+        )
+        second_fake = _same()
+
+        second = await _sweep(
+            harness, ledger, tmp_path, settings=settings, filer=RecordingFiler(),
+            adjudicate=second_fake, now=NOW + DAY,
+        )
+
+        assert _window(second)[0] == _window(first)[0]
+        assert second.view.plan.counts.adjudications_reused == 2
+        assert len(second_fake.pairs) == 2
+        assert second.complete is False
+        third_fake = _same()
+
+        third = await _sweep(
+            harness, ledger, tmp_path, settings=settings, filer=RecordingFiler(),
+            adjudicate=third_fake, now=NOW + 2 * DAY,
+        )
+
+        assert len(third_fake.pairs) == 1
+        assert third.complete is True
+        assert _window(third)[0] == _window(first)[0]
+        fourth = await _sweep(
+            harness, ledger, tmp_path, settings=settings, filer=RecordingFiler(),
+            adjudicate=_same(), now=NOW + 3 * DAY,
+        )
+        assert _window(fourth)[0] == _window(third)[1]
+
+
 class TestSweepSettings:
     def test_it_reads_the_config_leaves(self):
-        config = LinkHealConfig(projects=[DF], writes=True, sweep_window_hours=6)
+        config = LinkHealConfig(
+            projects=[DF], writes=True, sweep_window_hours=6, max_adjudications_per_run=7,
+        )
 
         settings = SweepSettings.from_config(config, dry_run=True)
 
         assert settings == SweepSettings(
             projects=(DF,), writes=True, dry_run=True, actions=SWEEP_ACTIONS, window_hours=6,
+            max_adjudications=7,
         )
+
+    def test_a_cap_below_one_is_refused_by_its_leaf_name(self):
+        with pytest.raises(ValueError, match='link_heal.max_adjudications_per_run'):
+            _settings(max_adjudications=0)
 
     def test_a_projects_override_replaces_the_configured_projects(self):
         config = LinkHealConfig(projects=[DF])
