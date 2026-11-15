@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
-from _filing_tools import call_blocker, call_info
+from _external_submit_producers import EXTERNAL_SUBMIT_PRODUCERS
+from _filing_tools import call_blocker, call_info, call_promote
 
 from escalation.categories import (
     EscalationCategory,
@@ -28,7 +28,6 @@ from escalation.server import create_server
 
 _REGISTERED_AHEAD_OF_ANY_PRODUCER = (
     'milestone_check_stalled',
-    'review_due',
 )
 
 _AGENT_INSTRUCTED = (
@@ -47,12 +46,20 @@ _AGENT_INSTRUCTED = (
 )
 
 
-# Categories filed through ``escalation submit`` by producers in other
-# repositories, which the census cannot walk. Each entry names its producer.
-_EXTERNAL_PRODUCERS = (
+# Categories that producers in other repositories file through ``escalation
+# submit``, which the census cannot walk. Derived from those producers' whole
+# calls in _external_submit_producers.py, which test_submit_cli.py runs.
+_EXTERNAL_PRODUCERS = tuple(
+    pytest.param(p.category, id=p.locator) for p in EXTERNAL_SUBMIT_PRODUCERS
+)
+
+
+# Categories an in-tree producer files through a value the census cannot
+# resolve, such as a route table's dataclass field. Each entry names its producer.
+_UNRESOLVED_IN_TREE_PRODUCERS = (
     pytest.param(
-        'validation_lane_red',
-        id='solar-challenge-platform:src/solar_challenge_platform/ci/cadence_alert.py::CATEGORY',
+        'link_heal_run_report',
+        id='fused-memory/src/fused_memory/maintenance/link_heal_executor.py::_ESCAPE_ROUTES',
     ),
 )
 
@@ -60,6 +67,10 @@ _EXTERNAL_PRODUCERS = (
 class TestRegistry:
     @pytest.mark.parametrize('value', _EXTERNAL_PRODUCERS)
     def test_external_producer_categories_stay_registered(self, value: str):
+        assert value in EscalationCategory
+
+    @pytest.mark.parametrize('value', _UNRESOLVED_IN_TREE_PRODUCERS)
+    def test_unresolved_in_tree_producer_categories_stay_registered(self, value: str):
         assert value in EscalationCategory
 
     @pytest.mark.parametrize('value', _REGISTERED_AHEAD_OF_ANY_PRODUCER)
@@ -215,11 +226,6 @@ class TestQueueChokepoint:
 _FILING = {'task_id': 't1', 'agent_role': 'implementer', 'summary': 's'}
 
 
-async def _promote(server, **kwargs: Any) -> dict[str, Any]:
-    tool = await server.get_tool('promote_to_l2')
-    return await tool.fn(**kwargs)
-
-
 @pytest.mark.asyncio
 class TestMcpToolGate:
     @pytest.fixture
@@ -253,7 +259,7 @@ class TestMcpToolGate:
         )
         queue.submit(member)
 
-        result = await _promote(
+        result = await call_promote(
             create_server(queue),
             task_id='t1',
             agent_role='escalation-watcher-auto',

@@ -16,10 +16,14 @@ from pathlib import Path
 
 import analyze_speculation_depth
 import merge_lane_throughput
+import pytest
 from canary_predicate_summary import metric, n_deep_verifies, population
 from cli_subprocess_timeout import cli_timeout_from_env
 from orchestrator.chain_telemetry import ChainBucket, summarize_chain_telemetry
 from orchestrator.event_store import EventStore
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PREDICATE = Path(__file__).resolve().parents[1] / 'merge-deep-canary-predicate.sh'
 _PREDICATE_TIMEOUT = cli_timeout_from_env('CHAIN_TELEMETRY_AGREEMENT_CLI_TIMEOUT_SECS')

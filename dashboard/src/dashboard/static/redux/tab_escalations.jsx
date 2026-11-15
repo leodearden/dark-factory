@@ -12,6 +12,8 @@
 const { useState: uS, useEffect: uE } = React;
 const { ProjectGroup, Pip, DatumReading, taskId } = window.DF_SHELL;
 const DF = window.DF_DATA;
+const DF_LOADER_ESC = window.DF_DATA_LOADER;
+const { useOnDemand } = DF_LOADER_ESC.createOnDemandHook(React);
 const C = window.DF_CHARTS;
 const { pinningSummary } = window.DF_PINS_RECOVERY;
 // The Datum wrappers. Module scope, no fallback — see the CANONICAL note in
@@ -684,6 +686,26 @@ function CheckOwnerSection({ panel }) {
   );
 }
 
+// ── LinkedTaskProse — the linked task's description, read on demand ──
+// Task rows carry no prose; this is the Task Detail pane's taskProse read
+// (tab_tasks.jsx::TaskProse), addressed by the same task uid.
+
+function LinkedTaskProse({ uid }) {
+  const { view, value: prose } = useOnDemand('taskProse', uid);
+  switch (view) {
+    case DF_LOADER_ESC.ON_DEMAND_VIEWS.ready:
+      return prose.description ? (
+        <div style={{ fontSize: 11, color: 'var(--fg-2)', whiteSpace: 'pre-wrap', maxHeight: 120, overflow: 'auto' }}>
+          {prose.description}
+        </div>
+      ) : null;
+    case DF_LOADER_ESC.ON_DEMAND_VIEWS.loading:
+      return <div style={{ fontSize: 11, color: 'var(--fg-3)' }}>loading…</div>;
+    default:
+      return <div style={{ fontSize: 11, color: 'var(--warn)' }}>The description of this task could not be fetched.</div>;
+  }
+}
+
 // ── EscalationSidebar — read-only detail panel ──
 
 function EscalationSidebar({ row, onClose }) {
@@ -778,11 +800,7 @@ function EscalationSidebar({ row, onClose }) {
                 {card.age && <span style={{ fontSize: 10, color: 'var(--fg-3)' }}>{card.age}</span>}
               </div>
               <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--fg-0)', marginBottom: 4 }}>{task.title || '—'}</div>
-              {task.description && (
-                <div style={{ fontSize: 11, color: 'var(--fg-2)', whiteSpace: 'pre-wrap', maxHeight: 120, overflow: 'auto' }}>
-                  {task.description}
-                </div>
-              )}
+              <LinkedTaskProse uid={DF_LOADER_ESC.taskUid(row.project, task.id)} />
             </div>
           )}
         </div>

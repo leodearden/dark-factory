@@ -35,6 +35,7 @@ from _shadow_coordinator_doubles import (
 from shared.cost_store import CostStore
 
 from orchestrator.config import PsiAdmissionConfig
+from orchestrator.evals.configs import get_config_by_name
 from orchestrator.evals.live_fixture import live_stratum
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.run_store import CellChange, RunStore, ShadowCell, ShadowCellQuery
@@ -201,6 +202,67 @@ async def test_a_subscription_candidate_records_its_basis_and_credits(tmp_path, 
     assert cell.state is _S.AWAITING_REFERENCE
 
 
+@pytest.mark.parametrize(
+    ('candidate', 'configured_model'),
+    [('minimax-m3.1-flash-endpoint', 'MiniMax-M3.1-Flash'), ('claude-sonnet-max', 'sonnet')],
+)
+@pytest.mark.asyncio
+async def test_an_opened_cell_records_its_candidates_configured_model(
+    tmp_path, costs, candidate, configured_model,
+):
+    rig = build_coordinator(tmp_path, costs, config=shadow_config(candidates=[candidate]))
+
+    await _plan_exit(rig, make_task('8086'))
+    await rig.coordinator.join()
+
+    assert _only_cell(rig).configured_model == configured_model
+
+
+@pytest.mark.asyncio
+async def test_a_completed_run_records_the_served_model(tmp_path, costs):
+    rig = build_coordinator(
+        tmp_path, costs, config=shadow_config(candidates=['minimax-m3.1-flash-endpoint']),
+    )
+    rig.runner.default = completed(served_model='MiniMax-M3.1-Flash-20261019')
+
+    await _plan_exit(rig, make_task('8086'))
+    await rig.coordinator.join()
+
+    cell = _only_cell(rig)
+    assert cell.state is _S.AWAITING_REFERENCE
+    assert (cell.configured_model, cell.served_model) == (
+        'MiniMax-M3.1-Flash', 'MiniMax-M3.1-Flash-20261019',
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_cannot_observe_its_model_leaves_served_model_unset(tmp_path, costs):
+    rig = build_coordinator(tmp_path, costs)
+
+    await _plan_exit(rig, make_task('8086'))
+    await rig.coordinator.join()
+
+    cell = _only_cell(rig)
+    assert cell.state is _S.AWAITING_REFERENCE
+    assert cell.served_model is None
+
+
+@pytest.mark.asyncio
+async def test_a_capped_run_still_records_its_served_model(tmp_path, costs):
+    rig = build_coordinator(tmp_path, costs, config=shadow_config(candidates=['glm-5.3-endpoint']))
+    rig.runner.script(
+        ShadowShape.IMPLEMENTER, 'glm-5.3-endpoint',
+        outcome=CellRunOutcome(end=RunEnd.USAGE_CAP, served_model='glm-5.3'),
+    )
+
+    await _plan_exit(rig, make_task('8086'))
+    await rig.coordinator.join()
+
+    cell = _only_cell(rig)
+    assert cell.state is _S.CAP_EXCLUDED
+    assert cell.served_model == 'glm-5.3'
+
+
 @pytest.mark.asyncio
 async def test_an_unresolvable_candidate_is_a_named_skip(tmp_path, costs):
     rig = build_coordinator(tmp_path, costs, config=shadow_config(candidates=['no-such-candidate']))
@@ -231,6 +293,29 @@ async def test_a_blank_credential_is_a_named_skip(tmp_path, costs):
     )
 
     assert await _plan_exit(rig, make_task('5387')) == []
+    assert _skip_reasons(rig) == ['no_credentials']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('base_url', 'api_key'), [
+    ('https://token-plan-sgp.xiaomimimo.com/anthropic', ''),
+    (None, 'tp-test'),
+], ids=['blank-key', 'unset-base-url'])
+async def test_an_unprovisioned_mimo_candidate_is_a_named_skip(
+    tmp_path, costs, monkeypatch, base_url, api_key,
+):
+    if base_url is None:
+        monkeypatch.delenv('MIMO_ANTHROPIC_BASE_URL', raising=False)
+    else:
+        monkeypatch.setenv('MIMO_ANTHROPIC_BASE_URL', base_url)
+    monkeypatch.setenv('MIMO_API_KEY', api_key)
+    rig = build_coordinator(
+        tmp_path, costs,
+        config=shadow_config(candidates=['mimo-v2.6-pro-endpoint']),
+        resolve_candidate=get_config_by_name,
+    )
+
+    assert await _plan_exit(rig, make_task('7991')) == []
     assert _skip_reasons(rig) == ['no_credentials']
 
 

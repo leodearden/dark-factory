@@ -738,26 +738,6 @@ _VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r'^=== INTERRUPTED \(worktree removed\) ===', re.MULTILINE),
 ]
 
-# verify.py::_run_cmd's `systemd-run --user --scope` could not start the leg's
-# scope (task 7258). Grounded samples, each the leg's ENTIRE output at rc=1:
-#   'Failed to start transient scope unit: Transport endpoint is not connected'
-#     (task 7217's cockpit test/lint/type legs, 2026-10-20)
-#   'Failed to connect to bus: No such file or directory'
-#     (systemd 255.4, user bus unreachable, measured 2026-10-22)
-# Matched against the WHOLE output, never per line: systemd-run fails before
-# exec'ing the leg, so its refusal is all the leg can print, and any other
-# output means the command ran and its own verdict stands. Only systemd-run
-# prints the scope-unit line, so any reason after it means the scope never
-# started. `systemctl --user` and `busctl --user` print the bus-connect line
-# verbatim too (measured), so only its observed reasons match; a leg whose own
-# systemctl prints exactly that line still reads as infra until task 7339 tags
-# the spawn path structurally. Add a reason only on a newly observed sample
-# (the _CARGO_CLI_ERROR_RE discipline).
-_SCOPE_SPAWN_FAILURE_RE = re.compile(
-    r'Failed to start transient scope unit: [^\n]+'
-    r'|Failed to connect to bus: No such file or directory'
-)
-
 
 def _reports_fatal_slot_timeout(
     scoped: str, event_channel: VerifyEventChannel | None,
@@ -772,8 +752,7 @@ def _classify_environmental(
 ) -> FailureCategory | None:
     """Tool-blind host-infrastructure guard: DISK_FULL / ENV_TRANSIENT (broken
     ``_merge-verify`` worktree, incl. restart collateral; mis-resolved pyright
-    interpreter; a verify scope systemd-run could not start) /
-    SEMAPHORE_TIMEOUT.
+    interpreter) / SEMAPHORE_TIMEOUT.
 
     Checked in ``classify_failure`` immediately after the ``timed_out`` ->
     ``INFRA_TIMEOUT`` guard and before any per-tool dispatch — these
@@ -1017,13 +996,6 @@ def _classify_environmental(
     per-tool table duplication (Invariant C1 intact — C1 forbids duplicating
     the same pattern across per-tool tables, not a category being reachable
     from more than one guard).
-
-    ENV_TRANSIENT — verify scope never started (task 7258): when
-    ``verify.py::_run_cmd``'s ``systemd-run --user --scope`` cannot reach the
-    user bus it exits before exec'ing the leg, so the leg's entire output is
-    systemd-run's one-line refusal (``_SCOPE_SPAWN_FAILURE_RE``). It is matched
-    only as the WHOLE scoped output, so it cannot tie with any other arm and
-    its position among them is not load-bearing.
     """
     # task 4492 — every POSITIVE detector below reads `scoped`, the output
     # with each PASSED suite's interior blanked; the one NEGATIVE/veto
@@ -1065,8 +1037,6 @@ def _classify_environmental(
         return FailureCategory.ENV_TRANSIENT
     if is_interpreter_missing_workspace_packages(scoped):
         return FailureCategory.ENV_TRANSIENT
-    if _SCOPE_SPAWN_FAILURE_RE.fullmatch(scoped.rstrip('\n')):
-        return FailureCategory.ENV_TRANSIENT
     # task 4212: sentinel half is gated on disposition
     # (`_has_fatal_slot_timeout_sentinel` above has the full grounding);
     # basename half stays ungated — its emitters carry no `disposition` field.
@@ -1103,7 +1073,7 @@ def classify_failure(
        ``FailureCategory.SEMAPHORE_TIMEOUT``, or ``FailureCategory.ENV_TRANSIENT``
        (broken ``_merge-verify`` worktree; a mis-resolved pyright
        interpreter holding none of the workspace's third-party packages —
-       task 3367; or a verify scope systemd-run could not start — task 7258)
+       task 3367)
        when grounded in *output* (wins over any per-tool output
        pattern for the same "root cause is the environment, not the command
        output" reason as guard 2 — a host condition like a full disk, a
@@ -1442,8 +1412,9 @@ def _classify_npx(output: str) -> FailureCategory:
 
 # ---------------------------------------------------------------------------
 # ToolKind.PYRIGHT — structured JSON only (Invariant C2). An error
-# diagnostic is TYPE_ERROR (task 4843). There is still NO text table, so
-# non-JSON PYRIGHT output deliberately falls through to the OPAQUE ladder
+# diagnostic is TYPE_ERROR (task 4843). There is still NO classification
+# text table, so non-JSON PYRIGHT output deliberately falls through to the
+# OPAQUE ladder
 # (Invariants C1/C2; see classify_failure's docstring).
 # ---------------------------------------------------------------------------
 
@@ -1482,9 +1453,9 @@ def _parse_pyright_json(output: str) -> FailureCategory | None:
 
 # ---------------------------------------------------------------------------
 # ToolKind.RUFF — structured JSON only (Invariant C2). A violations array is
-# LINT_ERROR (task 4843). There is still NO text table, so non-JSON RUFF
-# output deliberately falls through to the OPAQUE ladder (Invariants C1/C2;
-# see classify_failure's docstring).
+# LINT_ERROR (task 4843). There is still NO classification text table, so
+# non-JSON RUFF output deliberately falls through to the OPAQUE ladder
+# (Invariants C1/C2; see classify_failure's docstring).
 # ---------------------------------------------------------------------------
 
 
@@ -1512,6 +1483,51 @@ def _parse_ruff_json(output: str) -> FailureCategory | None:
     if not any(isinstance(item, dict) for item in payload):
         return None
     return FailureCategory.LINT_ERROR
+
+
+# ---------------------------------------------------------------------------
+# ToolKind.RUFF / ToolKind.PYRIGHT — the no-finding witness of a killed leg
+# (task 6461): the lines each tool prints without having found anything.
+# verify.classify_leg consults it; classify_failure never does, so it is not
+# a classification table.
+# ---------------------------------------------------------------------------
+
+# bash's report that its child died of SIGTERM or SIGHUP. The bare word
+# 'Terminated' was measured 2026-11-12; the job-report long form was measured
+# on bash 5.2.21 by task 4843.
+_SHELL_KILL_REPORT = r'(?:\S+: line \d+: +\d+ +)?(?:Terminated|Hangup)(?: .*)?'
+
+_NO_FINDING_LINE_BY_TOOL: dict[ToolKind, re.Pattern[str]] = {
+    # ruff's `warning:` lines are its own notices, printed during the run;
+    # no ruff finding starts that way, in any output format.
+    ToolKind.RUFF: re.compile(rf'(?:All checks passed!|warning: .+|{_SHELL_KILL_REPORT})'),
+    # The zero-error summary only: a diagnostic line of ANY severity is a
+    # finding, so none is admitted.
+    ToolKind.PYRIGHT: re.compile(
+        rf'(?:0 errors, \d+ warnings?, \d+ informations?|{_SHELL_KILL_REPORT})',
+    ),
+}
+
+
+def output_proves_no_finding(tool: ToolKind, output: str) -> bool:
+    """Return True when *output* proves that *tool*, a lint or type checker
+    with a known no-finding vocabulary, reached no finding.
+
+    Every non-blank line must be one *tool* prints without having found
+    anything, or bash's report of its kill. An unrecognised line counts as a
+    finding, so any real diagnostic wins. Empty output qualifies, because
+    these tools print a summary only on completion. A tool with no known
+    vocabulary never qualifies: False means unproven, not a finding.
+
+    Output only: whether the leg was killed is the caller's to decode
+    (``is_shell_reported_external_kill``). Pure and total.
+    """
+    pattern = _NO_FINDING_LINE_BY_TOOL.get(tool)
+    if pattern is None:
+        return False
+    return all(
+        pattern.fullmatch(line.rstrip()) for line in output.splitlines() if line.strip()
+    )
 
 
 # ---------------------------------------------------------------------------

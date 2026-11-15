@@ -626,6 +626,17 @@ async def test_run_probe_runs_with_the_lane_role_and_at_normal_priority(tmp_path
     assert (result.result, result.returncode) == (ProbeKind.UP, 0)
 
 
+@pytest.mark.asyncio
+async def test_run_probe_runs_without_the_account_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_B', 'pool-b-probe')
+    monkeypatch.setenv('OPENAI_API_KEY', 'openai-probe')
+    probe = 'test -z "${CLAUDE_OAUTH_TOKEN_B+set}" && test "$OPENAI_API_KEY" = openai-probe'
+
+    result = await run_probe(_probe_command(tmp_path, probe), tmp_path)
+
+    assert (result.result, result.returncode) == (ProbeKind.UP, 0)
+
+
 async def _wait_until_gone(child: int) -> bool:
     for _ in range(100):
         if not pid_running(child):

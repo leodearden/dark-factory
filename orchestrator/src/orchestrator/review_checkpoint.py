@@ -6,7 +6,8 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -21,6 +22,11 @@ from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
 from orchestrator.config import OrchestratorConfig
 from orchestrator.relocated_venv import retire_relocated_venvs
+from orchestrator.review_pre_test import (
+    PreTestCommandResult,
+    render_pre_test_section,
+    run_pre_test_commands,
+)
 from orchestrator.review_working_tree import (
     Phase1WorkingTree,
     attribute_phase1,
@@ -75,6 +81,11 @@ NO_BRIEFING_NOTICE = (
 )
 
 
+def review_escalation_task_id(review_id: str) -> str:
+    """The task_id the deep reviewer files escalations under, and the one ReviewCheckpoint._promote_reviewer_escalations promotes from."""
+    return f'review-{review_id}'
+
+
 class ReviewOutcome(StrEnum):
     RAN = 'ran'
     SKIPPED_CAPPED = 'skipped_capped'
@@ -116,6 +127,7 @@ class ReviewReport:
     duration_ms: int = 0
     parse_failed: bool = False
     phase1_working_tree: Phase1WorkingTree | None = None
+    pre_test: tuple[PreTestCommandResult, ...] = ()
 
     @property
     def ran(self) -> bool:
@@ -241,6 +253,13 @@ class ReviewCheckpoint:
             review_id, mode, modules or 'all',
         )
 
+        pre_test = await run_pre_test_commands(
+            self.config.review.pre_test_commands,
+            cwd=self.config.project_root,
+            timeout_secs=self.config.review.pre_test_timeout_secs,
+            env=self.config.verify_env,
+        )
+
         phase1, working_tree = await self._run_phase1(review_id)
 
         briefing_content = self._load_briefing()
@@ -250,6 +269,7 @@ class ReviewCheckpoint:
         prompt = self._build_prompt(
             mode, phase1, modules, briefing_content, review_id,
             working_tree=working_tree,
+            pre_test=pre_test,
         )
 
         # Build MCP config for fused-memory + escalation access
@@ -329,6 +349,7 @@ class ReviewCheckpoint:
                 cost_usd=0.0,
                 duration_ms=int((time.monotonic() - start) * 1000),
                 phase1_working_tree=working_tree,
+                pre_test=pre_test,
             )
         completed_at = datetime.now(UTC).isoformat()
 
@@ -392,11 +413,9 @@ class ReviewCheckpoint:
                 review_id, result.success, (result.output or '')[:200],
             )
 
-        # Promote any L0 escalations emitted by the reviewer to L1.  The
-        # reviewer runs outside a task workflow, so the synthetic
-        # ``review-<id>`` task_id it uses has no steward that could pick
-        # these up; left alone they sit pending until the next orchestrator
-        # restart auto-dismisses them unread.
+        # Promote any L0 escalations the reviewer filed to L1.  The reviewer
+        # runs outside a task workflow, so no steward reads what it files
+        # under review_escalation_task_id(review_id).
         self._promote_reviewer_escalations(review_id)
 
         report = ReviewReport(
@@ -413,6 +432,7 @@ class ReviewCheckpoint:
             duration_ms=elapsed_ms,
             parse_failed=parse_failed,
             phase1_working_tree=working_tree,
+            pre_test=pre_test,
         )
 
         self._save_report(report, result.output)
@@ -455,8 +475,8 @@ class ReviewCheckpoint:
         """Promote pending L0 escalations from this review run to level 1.
 
         The deep reviewer runs outside a task workflow, so any escalations
-        it emits land against the synthetic ``review-<review_id>`` task_id
-        which has no steward.  Post-hoc, we promote them directly to L1
+        it emits land against review_escalation_task_id(review_id), which
+        has no steward.  Post-hoc, we promote them directly to L1
         (human-visible) and dismiss the L0.  Returns the number promoted.
         """
         if self.escalation_queue is None:
@@ -464,7 +484,7 @@ class ReviewCheckpoint:
 
         from escalation.models import Escalation
 
-        synthetic_task_id = f'review-{review_id}'
+        synthetic_task_id = review_escalation_task_id(review_id)
         pending = self.escalation_queue.get_by_task(
             synthetic_task_id, status='pending', level=0,
         )
@@ -529,10 +549,12 @@ class ReviewCheckpoint:
         review_id: str,
         *,
         working_tree: Phase1WorkingTree | None = None,
+        pre_test: Sequence[PreTestCommandResult] = (),
     ) -> str:
         """Assemble the user prompt for the deep review agent."""
         project_root = str(self.config.project_root)
         project_id = self.config.fused_memory.project_id
+        escalation_task_id = review_escalation_task_id(review_id)
 
         reflection_block = render_reflection_instructions(
             project_id=project_id, review_id=review_id
@@ -577,6 +599,7 @@ do NOT re-run these checks yourself.
 **Summary:** {qualified_phase1_summary(phase1, working_tree)}
 """
         phase1_block += render_working_tree_section(phase1, working_tree)
+        phase1_block += render_pre_test_section(pre_test)
         if not phase1.passed:
             if phase1.test_output:
                 phase1_block += f"""
@@ -604,6 +627,7 @@ do NOT re-run these checks yourself.
 ## Agent Identity
 
 - **agent_id:** `claude-review-{review_id}`
+- **task_id:** `{escalation_task_id}`
 - **project_id:** `{project_id}`
 - **project_root:** `{project_root}`
 
@@ -622,7 +646,7 @@ do NOT re-run these checks yourself.
 3. **Triage each finding** and act:
    - Clear-cut issues — submit a candidate (single step, no resolve_ticket):
 {submit_resolve_block}
-   - Ambiguous/architectural → `escalate_info(category=..., summary=...)`
+   - Ambiguous/architectural → `escalate_info(task_id="{escalation_task_id}", category=..., summary=...)`
    - Known/accepted → dismiss (don't report)
 
 {reflection_block}
@@ -671,6 +695,8 @@ do NOT re-run these checks yourself.
         }
         if report.phase1_working_tree is not None:
             data['phase1_working_tree'] = report.phase1_working_tree.to_dict()
+        if report.pre_test:
+            data['pre_test_commands'] = [asdict(r) for r in report.pre_test]
 
         path = reports_dir / f'review-{report.review_id}.json'
         path.write_text(json.dumps(data, indent=2))

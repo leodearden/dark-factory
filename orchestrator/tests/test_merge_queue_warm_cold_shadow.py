@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript
+from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     make_placeholder_future,
@@ -948,10 +948,7 @@ def _make_mock_req(tmp_path: Path) -> MagicMock:
     """Build a minimal MergeRequest stub."""
     req = MagicMock()
     req.task_id = 'task-1710'
-    req.config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(warm_verify_shadow_compare=True),
-    )
+    req.config = lane_scene_config(tmp_path, GitConfig(warm_verify_shadow_compare=True))
     return req
 
 
@@ -1445,7 +1442,7 @@ def _make_shadow_config(
         warm_verify_shadow_compare_every_n_merges=every_n,
         warm_verify_shadow_compare_nightly_interval_secs=nightly_interval,
     )
-    return OrchestratorConfig(project_root=tmp_path, git=git)
+    return lane_scene_config(tmp_path, git)
 
 
 class TestMaybeScheduleShadowCompare:
@@ -1688,7 +1685,7 @@ def _make_warm_cold_config(
         warm_verify_shadow_compare=shadow_compare,
         warm_verify_shadow_compare_every_n_merges=1,  # always due in tests
     )
-    return OrchestratorConfig(project_root=project_root, git=git)
+    return lane_scene_config(project_root, git)
 
 
 #: A warm verify output that PARSES into a per-test map.  The map is what
@@ -1746,7 +1743,7 @@ class TestRunPostMergeVerifyOnResultCallback:
         merge_wt = tmp_path / 'wt'
         merge_wt.mkdir()
         req = MagicMock()
-        req.config = OrchestratorConfig(project_root=tmp_path, git=GitConfig())
+        req.config = lane_scene_config(tmp_path, GitConfig())
         req.task_files = None
         req.module_configs = []
         req.task_id = 'task-15'
@@ -1783,7 +1780,7 @@ class TestRunPostMergeVerifyOnResultCallback:
 
 async def _setup_wcs_repo(repo: Path) -> None:
     """Set up a minimal git repo for integration tests (step-15)."""
-    from orchestrator.git_ops import _run  # noqa: PLC0415
+    from orchestrator.git_ops import _run
 
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
     await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
@@ -1960,7 +1957,7 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         self, tmp_path: Path
     ) -> None:
         """SMW must be constructed with the harness's live escalation_queue."""
-        from orchestrator.harness import Harness  # noqa: PLC0415
+        from orchestrator.harness import Harness
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.max_concurrent_tasks = 2
@@ -2018,7 +2015,7 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         self, tmp_path: Path
     ) -> None:
         """When _escalation_queue is None (bare harness), SMW receives None — no crash."""
-        from orchestrator.harness import Harness  # noqa: PLC0415
+        from orchestrator.harness import Harness
 
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.max_concurrent_tasks = 2

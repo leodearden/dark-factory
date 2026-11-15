@@ -37,20 +37,18 @@ logger = logging.getLogger(__name__)
 # Twin of orchestrator.mcp_lifecycle's use of shared.mcp_idempotency (task
 # 2712; hoisted into the shared module by task 2766 so the two McpSession
 # twins share one frozenset + injection helper instead of drifting copies):
-# mutating task tools get a client-supplied idempotency key so a retried
-# write dedupes server-side instead of double-applying. Inert today (the
-# dashboard issues only reads).
+# the tools in shared.mcp_idempotency.MUTATING_TASK_TOOLS get a
+# client-supplied idempotency key so a retried write dedupes server-side.
+# This dashboard never calls any of them, so the injection is inert here.
 #
-# CAVEAT (not yet write-safe by construction on this path): unlike the
-# orchestrator twin, this _raw_call has NO transport retry loop, so the
-# injection generates a FRESH key per invocation. The orchestrator's
-# inject-once-before-the-retry-loop invariant — the property that makes
-# transport retries reuse one key and dedupe — does NOT hold here. If the
-# dashboard ever gains a mutating call that a higher layer retries by
-# re-invoking _raw_call, that caller must thread one stable client_op_id
-# across attempts (or a retry loop must be added here); a fresh per-attempt
-# uuid4 would NOT trigger server-side dedup. Safe today only because reads
-# never dedup and a caller-supplied key is preserved.
+# The dashboard's own writes, the tools behind app.py::_mcp_write_proxy, carry
+# no key, because the server has no dedupe for them. They are kept from
+# double-applying by never being repeated after a failure that may have
+# reached the server (mcp_fanout.py::first_success's ambiguous_result).
+#
+# CAVEAT: this _raw_call has no retry loop, so the injection mints a FRESH key
+# per invocation. A future caller that retries a MUTATING_TASK_TOOLS call by
+# re-invoking _raw_call must thread one stable client_op_id across attempts.
 
 
 _exchanges: set[asyncio.Task[httpx.Response]] = set()
@@ -279,9 +277,9 @@ async def mcp_tool_call(
     *cold* session performs three posts (``initialize``,
     ``notifications/initialized``, then ``tools/call``), so the worst case is
     roughly ``3 * timeout`` plus the server's own think time. Callers needing
-    a hard whole-operation bound must still wrap this in
-    ``asyncio.wait_for`` — every existing probe caller does, deliberately, and
-    the two layers are complementary rather than redundant.
+    a hard whole-operation bound must still wrap this in ``asyncio.wait_for``
+    at ``enclosing_deadline(timeout)``, never at *timeout* itself — the two
+    layers are complementary rather than redundant.
 
     **A session that hangs is self-evicting** (task 4958). When that enclosing
     ``wait_for`` fires — or the caller is cancelled for any other reason — the
@@ -293,8 +291,13 @@ async def mcp_tool_call(
     covered too, notably ``task_runtime.py::_probe_one``, whose own ``wait_for``
     cancels this call and which previously did not invalidate at all.
 
-    The guard catches ONLY the two hang-shaped exits (``asyncio.CancelledError``
-    and the builtin ``TimeoutError``) and always re-raises. It deliberately does
+    The guard catches ONLY the three hang-shaped exits and always re-raises:
+    ``asyncio.CancelledError``, the builtin ``TimeoutError``, and
+    ``httpx.TimeoutException`` — a per-request budget expiring. An equal outer
+    ``wait_for`` used to convert that expiry into a cancellation; one sized by
+    ``enclosing_deadline`` lets it arrive as itself, and evicting on it keeps
+    the task-4958 guarantee for ``task_runtime.py::_probe_one`` and the other
+    escalation-URL probes. It deliberately does
     not catch ``httpx.HTTPStatusError`` / ``ValueError``: teardown policy for
     those already belongs to the callers (``first_success``,
     ``get_queue_stats``, ``get_wal_status`` each invalidate themselves), and a
@@ -304,9 +307,27 @@ async def mcp_tool_call(
     session = _get_session(base_url)
     try:
         return await session.call_tool(client, tool_name, arguments, timeout=timeout)
-    except (asyncio.CancelledError, TimeoutError):
+    except (asyncio.CancelledError, TimeoutError, httpx.TimeoutException):
         invalidate_session(base_url)
         raise
+
+
+_ENCLOSING_DEADLINE_HEADROOM_SECONDS = 1.0
+
+
+def enclosing_deadline(per_request_timeout: float) -> float:
+    """The ``asyncio.wait_for`` bound to pair with :func:`mcp_tool_call`'s *timeout*.
+
+    Strictly greater, because an equal bound is armed first and fires at the
+    same deadline, pre-empting the transport's own exception —
+    ``httpx.PoolTimeout`` above all. With the exchange shielded by ``_post``,
+    that exception is then absorbed unseen by ``_settle`` and the caller sees
+    only a bare ``TimeoutError``. A saturated pool fails the FIRST post's
+    acquisition, so one budget plus headroom is enough for that failure to
+    reach the caller's OWN except clause (``mcp_fanout.py::first_success``, or
+    a probe's) so ``mcp_fanout.py::describe_exc`` can name it.
+    """
+    return per_request_timeout + _ENCLOSING_DEADLINE_HEADROOM_SECONDS
 
 
 async def _first_success(
@@ -347,7 +368,8 @@ async def get_memory_status(
     *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
     bound on this call: the failover walks up to N URLs, each of which may
     perform a three-post cold-session handshake. Callers needing a hard bound
-    must still wrap this in ``asyncio.wait_for`` — ``metrics.py`` does.
+    must still wrap this in ``asyncio.wait_for`` at ``enclosing_deadline(timeout)``
+    — ``metrics.py`` does.
     """
     return await _first_success(
         client, config, 'get_status', {}, 'get_status', timeout=timeout,
@@ -366,8 +388,8 @@ async def get_queue_stats(
     *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
     bound on this call: unlike a first-success failover this visits ALL N
     configured URLs, so the aggregate cost scales with N. Callers needing a
-    hard bound must still wrap this in ``asyncio.wait_for`` — ``metrics.py``
-    does.
+    hard bound must still wrap this in ``asyncio.wait_for`` at
+    ``enclosing_deadline(timeout)`` — ``metrics.py`` does.
 
     Each URL's attempt additionally carries ``mcp_fanout.call_with_deadline``'s
     default whole-operation deadline (resolved inside that helper at call time,
@@ -473,7 +495,7 @@ async def get_wal_status(
     *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
     bound on this call: like ``get_queue_stats`` this visits ALL N configured
     URLs, so the aggregate cost scales with N. Callers needing a hard bound
-    must still wrap this in ``asyncio.wait_for``.
+    must still wrap this in ``asyncio.wait_for`` at ``enclosing_deadline(timeout)``.
 
     Each URL's attempt additionally carries ``mcp_fanout.call_with_deadline``'s
     default whole-operation deadline (resolved inside that helper at call time,
@@ -525,7 +547,7 @@ async def get_curator_state(
     *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
     bound on this call: the failover walks up to N URLs, each of which may
     perform a three-post cold-session handshake. ``api_curator`` wraps it in
-    ``asyncio.wait_for`` for the whole-operation bound.
+    ``asyncio.wait_for`` at ``enclosing_deadline(timeout)``.
     """
     return await _first_success(
         client, config, 'get_curator_state', {}, 'get_curator_state',

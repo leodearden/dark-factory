@@ -27,6 +27,7 @@ from typing import Any
 from shared import safe_io
 from shared.project_layout import escalation_queue_dir, tasks_db
 from shared.safe_io import load_json_or_warn
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 
 from orchestrator.stop_instruction import detect_stop_instruction
 from orchestrator.unblock_types import BlockClass
@@ -595,6 +596,26 @@ _warned_description_read_failures: set[tuple[str, str, str]] = set()
 
 
 # ---------------------------------------------------------------------------
+# _open_tasks_db
+# ---------------------------------------------------------------------------
+
+def _open_tasks_db(project_root: str | Path) -> sqlite3.Connection | None:
+    """Open *project_root*'s tasks.db through ``connect_ro``, or None if ABSENT.
+
+    An absent store is the benign first-run case, so it answers None. Every
+    other ``TaskDbUnreadable`` refusal propagates, carrying its remedy into
+    the caller's own handler, and so does the ``sqlite3.Error`` of a store
+    that exists but cannot be opened (permissions, a lock).
+    """
+    try:
+        return connect_ro(tasks_db(project_root))
+    except TaskDbUnreadable as refusal:
+        if refusal.reason is TaskDbProblem.ABSENT:
+            return None
+        raise
+
+
+# ---------------------------------------------------------------------------
 # _read_latest_proposal
 # ---------------------------------------------------------------------------
 
@@ -608,7 +629,9 @@ def _read_latest_proposal(
     """Read the latest dry_run_proposals entry from tasks.db for the given task.
 
     Returns None on any error (missing db, missing row, empty proposals list).
-    Uses stdlib sqlite3 only — no fused_memory dependency. Unlike the sibling
+    Opens through _open_tasks_db
+    (shared/src/shared/tasks_db_readonly.py::connect_ro) — no fused_memory
+    dependency. Unlike the sibling
     _read_task_description below, a genuine read failure here (as opposed to
     the benign "no data yet" branches) does NOT emit a WARNING — see the
     comment in the except clause for why (task 2509 review amendment, scope
@@ -624,14 +647,8 @@ def _read_latest_proposal(
     try:
         owns_conn = conn is None
         if owns_conn:
-            db_path = tasks_db(project_root)
-            if not db_path.exists():
-                return None
-            # Open read-only via URI
-            uri = f'file:{db_path}?mode=ro'
-            try:
-                conn = sqlite3.connect(uri, uri=True)
-            except sqlite3.OperationalError:
+            conn = _open_tasks_db(project_root)
+            if conn is None:
                 return None
         try:
             cursor = conn.execute(
@@ -679,8 +696,9 @@ def _read_task_description(
     Returns None on any error (missing db, missing row, missing/empty
     description) — an empty string is treated as "no description" so callers
     can pass the result straight through to check_proposal's extra_texts
-    without a separate truthiness check. Read-only (mode=ro), stdlib sqlite3
-    only — sibling pattern to _read_latest_proposal above. A genuine read
+    without a separate truthiness check. Opens through _open_tasks_db
+    (shared/src/shared/tasks_db_readonly.py::connect_ro) — sibling pattern to
+    _read_latest_proposal above. A genuine read
     failure (e.g. tasks.db lacks a description column — an older/foreign
     schema) emits a deduped WARNING (task 2509 review amendment) rather than
     silently suppressing the description's contribution to the
@@ -694,13 +712,8 @@ def _read_task_description(
     try:
         owns_conn = conn is None
         if owns_conn:
-            db_path = tasks_db(project_root)
-            if not db_path.exists():
-                return None
-            uri = f'file:{db_path}?mode=ro'
-            try:
-                conn = sqlite3.connect(uri, uri=True)
-            except sqlite3.OperationalError:
+            conn = _open_tasks_db(project_root)
+            if conn is None:
                 return None
         try:
             cursor = conn.execute(
@@ -792,13 +805,10 @@ def run_check(args: argparse.Namespace) -> None:
     # tasks.db twice per invocation, once per reader). Falls back to each
     # reader's own independent open (and its existing fail-closed-to-None
     # behavior) when this shared connection can't be established.
-    db_path = tasks_db(args.project_root)
-    shared_conn: sqlite3.Connection | None = None
-    if db_path.exists():
-        try:
-            shared_conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
-        except sqlite3.OperationalError:
-            shared_conn = None
+    try:
+        shared_conn = _open_tasks_db(args.project_root)
+    except (TaskDbUnreadable, sqlite3.Error):
+        shared_conn = None
     try:
         entry = _read_latest_proposal(args.task_id, args.project_root, tag=tag, conn=shared_conn)
         description = _read_task_description(args.task_id, args.project_root, tag=tag, conn=shared_conn)

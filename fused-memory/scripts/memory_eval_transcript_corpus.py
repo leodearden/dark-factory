@@ -1085,7 +1085,7 @@ def default_archive_root() -> Path:
     test, say); the repo's established fallback still canonicalizes. Called
     lazily so merely importing this module never spawns ``git``.
     """
-    from fused_memory.models.scope import resolve_main_checkout  # noqa: PLC0415
+    from fused_memory.models.scope import resolve_main_checkout
 
     try:
         checkout = Path(resolve_main_checkout(_PACKAGE_ROOT))

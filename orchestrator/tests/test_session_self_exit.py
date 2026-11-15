@@ -16,13 +16,15 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _process_identity_variants import own_identity
 from _process_tree_fakes import claude_process_tree, counting_walks
+from shared.process_identity import ProcessIdentity
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -35,6 +37,7 @@ LAUNCHER = 7_193_050
 _SLUG = 'prd-df-7193-7193050'
 _TITLE = 'prd:df#7193 self-exit'
 _TERMINAL_RESULT = 'outcome: done\nchanged: x\naction_needed: none\n'
+_OWNER_ON_ANOTHER_HOST = ProcessIdentity(OWNER, 1, 'boot-x', 'other-host.invalid')
 
 
 @pytest.fixture(autouse=True)
@@ -199,6 +202,14 @@ _BREAKS = {
     'no-claude-ancestor': _Break(SelfExitRefusal.OWNER_PID_UNRESOLVED, claude=None),
     'no-bound-pid': _Break(SelfExitRefusal.OWNER_PID_UNRESOLVED, armed={'claude_owner_pid': None}),
     'other-claude': _Break(SelfExitRefusal.OWNER_PID_MISMATCH, claude=7_193_009),
+    'other-host': _Break(
+        SelfExitRefusal.OTHER_HOST, armed={'claude_owner_identity': _OWNER_ON_ANOTHER_HOST}
+    ),
+    'other-host-before-pid': _Break(
+        SelfExitRefusal.OTHER_HOST,
+        armed={'claude_owner_identity': _OWNER_ON_ANOTHER_HOST},
+        claude=7_193_009,
+    ),
     'background-absent': _Break(SelfExitRefusal.BACKGROUND_TASKS_UNREPORTED, drop=('background_tasks',)),
     'background-null': _Break(SelfExitRefusal.BACKGROUND_TASKS_UNREPORTED, hook={'background_tasks': None}),
     'background-running': _Break(SelfExitRefusal.BACKGROUND_TASKS_RUNNING, hook={'background_tasks': [{'id': 'b1'}]}),
@@ -229,6 +240,19 @@ class TestRefusals:
         assert record.exit_requested_at is None
         assert record.status is sr.Status.IDLE
         assert _marker(tmp_path).exists()
+
+    def test_an_owner_identity_on_this_host_passes_the_host_check(self, tmp_path):
+        on_this_host = replace(own_identity(), pid=OWNER)
+        armed = _armed(tmp_path, claude_owner_identity=on_this_host)
+        kill = _KillRecorder(tmp_path)
+
+        _stop(tmp_path, armed, kill)
+
+        record = _read(tmp_path)
+        assert kill.calls == [(OWNER, signal.SIGINT)]
+        assert record.exit_request is not None
+        assert record.exit_request.state is sr.ExitRequestState.ATTEMPTED
+        assert record.claude_owner_identity == on_this_host
 
     def test_a_refusal_is_not_a_deadlock(self, tmp_path):
         armed = _armed(tmp_path)

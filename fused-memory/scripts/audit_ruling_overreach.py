@@ -53,7 +53,7 @@ from types import MappingProxyType
 from typing import Any
 
 from fused_memory.backends.falkor_read_only import PagedQuery, ReadOnlyGraphReader
-from fused_memory.backends.graphiti_client import PagedRead
+from fused_memory.backends.paged_read import PagedRead
 from fused_memory.reconciliation.task_filter import (
     is_batch_plan_framing,
     is_proposed_resolution_framing,
@@ -1121,7 +1121,7 @@ def _resolve_uri(args: argparse.Namespace) -> str | None:
     if env_uri := os.environ.get('FALKORDB_URI'):
         return env_uri
     try:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         return getattr(getattr(FusedMemoryConfig().graphiti, 'falkordb', None), 'uri', None)
     except Exception:

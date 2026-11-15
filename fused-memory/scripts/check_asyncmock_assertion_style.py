@@ -46,7 +46,7 @@ class _AssertionCallCollector(ast.NodeVisitor):
         self.not_called: list[ast.Call] = []
         self.not_awaited: list[ast.Call] = []
 
-    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+    def visit_Call(self, node: ast.Call) -> None:
         """Record assert_not_called and assert_not_awaited attribute calls."""
         if isinstance(node.func, ast.Attribute):
             if node.func.attr == 'assert_not_called':
@@ -55,10 +55,10 @@ class _AssertionCallCollector(ast.NodeVisitor):
                 self.not_awaited.append(node)
         self.generic_visit(node)
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Stop at nested function boundary — do not descend into inner functions."""
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         """Stop at nested async function boundary — do not descend into inner functions."""
 
 

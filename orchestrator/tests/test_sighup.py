@@ -23,12 +23,15 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from shared.config_dir import CONFIG_DIR_PREFIX
 
 # Every test in this module spawns a python child.
 pytestmark = pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
@@ -98,6 +101,15 @@ SIGHUP_SCRIPT = textwrap.dedent('''
 READY_WITHIN_SECS = 60.0
 EXIT_WITHIN_SECS = 60.0
 
+_PROBE_PREFIX = f'{CONFIG_DIR_PREFIX}usage-gate-probe-'
+
+
+def _child_tempdir(tmp_path: Path) -> Path:
+    """The private tempdir the spawned child's gate sweeps and writes its probe dirs under."""
+    child_tmp = tmp_path / 'child-tmp'
+    child_tmp.mkdir(exist_ok=True)
+    return child_tmp
+
 
 def _await_ready(proc: subprocess.Popen[bytes], *, within_secs: float) -> bytes:
     """Return the child's stdout through its READY line.
@@ -131,7 +143,10 @@ def _exit_after_hup_then_term(
 
     SIGHUP is sent first and is fatal at send time under SIG_DFL, so the exit
     status alone says whether SIGHUP terminated the child. The empty PATH
-    keeps the gate's SIGHUP re-probe from spawning a real `claude`.
+    keeps the gate's SIGHUP re-probe from spawning a real `claude`. The
+    private TMPDIR confines the child gate's dead-PID probe-dir sweep (task
+    3086), which the in-process confinement plugin
+    (df_pytest_isolation.py::arm_usage_gate_sweep_confinement) cannot reach.
     """
     script = tmp_path / 'sighup_shape.py'
     script.write_text(SIGHUP_SCRIPT)
@@ -145,7 +160,11 @@ def _exit_after_hup_then_term(
         argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env={**os.environ, 'PATH': str(no_claude_on_path)},
+        env={
+            **os.environ,
+            'PATH': str(no_claude_on_path),
+            'TMPDIR': str(_child_tempdir(tmp_path)),
+        },
         start_new_session=True,
     )
     pgid = proc.pid
@@ -231,4 +250,33 @@ def test_without_in_loop_registration_sighup_kills_the_process(tmp_path: Path):
     assert result.returncode == -signal.SIGHUP, (
         f'expected death by SIGHUP without in-loop registration, '
         f'got rc={result.returncode}; stderr={result.stderr!r}'
+    )
+
+
+def test_the_child_gate_sweeps_only_the_tempdir_its_spawner_passes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    plant_dead_pid_dir: Callable[[Path, str], Path],
+):
+    inherited = tmp_path / 'inherited-tmp'
+    inherited.mkdir()
+    # Pin this process's tempdir cache first, so only the spawned child sees
+    # the stand-in TMPDIR and no later test can cache it.
+    monkeypatch.setattr(tempfile, 'tempdir', tempfile.gettempdir())
+    monkeypatch.setenv('TMPDIR', str(inherited))
+    inherited_ghost = plant_dead_pid_dir(inherited, _PROBE_PREFIX)
+    child_ghost = plant_dead_pid_dir(_child_tempdir(tmp_path), _PROBE_PREFIX)
+
+    result = _exit_after_hup_then_term(tmp_path, register_in_loop=True)
+
+    assert inherited_ghost.exists(), (
+        f"the child's UsageGate swept the tempdir it inherited and reclaimed "
+        f'{inherited_ghost.name}; outside this test that is the real /tmp. The '
+        f'spawner must pass a private TMPDIR, because the in-process '
+        f'confinement plugin cannot reach a child'
+    )
+    assert not child_ghost.exists(), (
+        f"{child_ghost.name} survived in the TMPDIR the spawner passed; the child's "
+        f'sweep must land there (re-base, not suppress). '
+        f'rc={result.returncode}; stderr={result.stderr!r}'
     )

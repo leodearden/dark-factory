@@ -3,12 +3,14 @@
 
 import asyncio
 import dataclasses
+import json
 import logging
 import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _orch_helpers import HermeticMcpSession
 from _recording_event_store import _RecordingEventStore
 from shared.locking import directory_locks
 from shared.task_metadata_wire import coerce_task_metadata
@@ -24,6 +26,7 @@ from orchestrator.config import (
 from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import fm_retry_backoffs
+from orchestrator.lock_table import ModuleLockTable
 from orchestrator.pause_policy import (
     HaltNotPermittedError,
     PauseClass,
@@ -33,7 +36,6 @@ from orchestrator.pause_policy import (
 from orchestrator.scheduler import (
     BlastRadiusResult,
     ExternalResolverError,
-    ModuleLockTable,
     Scheduler,
     SchedulerCallbacks,
     TickContext,
@@ -2949,6 +2951,15 @@ class TestFairness:
         config.fairness.skip_threshold = 3
         return config
 
+    @pytest.fixture
+    def per_tier_config(self) -> OrchestratorConfig:
+        """OrchestratorConfig with per-tier thresholds; high parks on its first skip."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.skip_threshold = {
+            'critical': 0, 'high': 1, 'medium': 2, 'low': 4, 'polish': 9999,
+        }
+        return config
+
     @staticmethod
     def _broad_task():
         return {
@@ -3102,15 +3113,13 @@ class TestFairness:
     # ---- skip-threshold / unconditional park tests ----
 
     @pytest.mark.asyncio
-    async def test_parks_install_unconditionally_without_v2_flag(self):
-        """Parks install after the per-tier threshold with default config.
+    async def test_parks_install_unconditionally_without_v2_flag(self, per_tier_config):
+        """Parks install after the per-tier threshold with no flag set.
 
-        Regression guard: no flag is needed.  Default high-tier threshold=1,
+        Regression guard: no flag is needed.  High-tier threshold=1,
         so one skip is enough.
         """
-        # Default config — no flag assignment needed.
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        scheduler = Scheduler(config)
+        scheduler = Scheduler(per_tier_config)
         scheduler.finish_startup()
 
         # Seed compiler/src so A (high priority) is forced to skip.
@@ -3129,16 +3138,14 @@ class TestFairness:
         assert scheduler.lock_table.has_parks('A')
 
     @pytest.mark.asyncio
-    async def test_eager_park_full_module_set(self):
+    async def test_eager_park_full_module_set(self, per_tier_config):
         """Parks install on ALL of A's modules at once (eager, full coverage).
 
         Even modules not currently held by another task are covered — this
         prevents racing lower-priority tasks from grabbing a free module
         while A waits for a blocked one.
         """
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        # Per-tier defaults: high -> threshold=1.
-        scheduler = Scheduler(config)
+        scheduler = Scheduler(per_tier_config)
         scheduler.finish_startup()
 
         # B holds compiler/src; C holds eval/src; tools/src is FREE.
@@ -3166,7 +3173,7 @@ class TestFairness:
         assert not scheduler.lock_table.try_acquire('D', ['tools/src'])
 
     @pytest.mark.asyncio
-    async def test_cross_tier_preemption(self):
+    async def test_cross_tier_preemption(self, per_tier_config):
         """A high-tier skip-bump SHADOWS (not destroys) an overlapping low-tier park.
 
         Setup: low-priority L is already parked on m1+m2 with skip_count=3.
@@ -3178,7 +3185,7 @@ class TestFairness:
         (L shadowed on m1).  ZERO reservation_evicted events — the old destructive
         eviction is no longer emitted on preemption.
         """
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config = per_tier_config
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
         scheduler.finish_startup()
@@ -3198,9 +3205,10 @@ class TestFairness:
         # H's park on m1 blocks ALL other tasks (including shadowed L).
         assert not scheduler.lock_table.try_acquire('X', ['m1'])   # stranger blocked
         assert not scheduler.lock_table.try_acquire('L', ['m1'])   # shadowed L blocked (INV-2)
-        # L's park on m2 remains active — H cannot acquire m2.
+        # L's park on m2 remains active: it blocks a parkless task, and H,
+        # which outranks it, passes it (task 7799, INV-8).
         assert not scheduler.lock_table.try_acquire('Y', ['m2'])   # L's active park
-        assert not scheduler.lock_table.try_acquire('H', ['m2'])   # H cannot acquire L's m2
+        assert scheduler.lock_table.park_owners_blocking('H', ['m2']) == []
 
         # L's skip_count was NOT cleared by preemption.
         assert scheduler._skip_count['L'] == 3
@@ -4625,51 +4633,6 @@ class TestScoreFunction:
         assert huge < TIER_BASE['medium']
 
 
-class TestAgeAnchor:
-    """Age anchor resets on cancellation → pending resurrection."""
-
-    def test_cancelled_resurrection_no_age_jump(self):
-        """A previously-cancelled task re-pended scores no higher than brand-new medium."""
-        filed, reopened = '2026-10-01T00:00:00+00:00', '2026-10-05T00:00:00+00:00'
-
-        def stamped(task_id: str, status: str, pending_since: str) -> dict:
-            task = _pending_task(task_id, status=status)
-            task['metadata']['pending_since'] = pending_since
-            return task
-
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
-        scheduler.finish_startup()
-        # Tick 1: task 1 and task 100 are pending.
-        scheduler._update_age_anchors(
-            [stamped('1', 'pending', filed), stamped('100', 'pending', filed)], max_id=100,
-        )
-        age_100_t1 = scheduler._compute_age('100', max_id=100)
-        # Tick 2: task 1 is cancelled; its stamp is unchanged.
-        scheduler._update_age_anchors(
-            [stamped('1', 'cancelled', filed), stamped('100', 'pending', filed)], max_id=100,
-        )
-        # Tick 3: task 1 is reinstated, which D3 marks with a new stamp.
-        tasks_tick3 = [stamped('1', 'pending', reopened), stamped('100', 'pending', filed)]
-        scheduler._update_age_anchors(tasks_tick3, max_id=100)
-        age_1 = scheduler._compute_age('1', max_id=100)
-        age_100 = scheduler._compute_age('100', max_id=100)
-        # Resurrected 1 must not leapfrog brand-new 100.
-        assert age_1 <= age_100
-        # Brand-new-pending baseline is 0.
-        assert age_100_t1 == 0
-        assert age_100 == 0
-        assert age_1 == 0
-
-    def test_old_pending_accumulates_age(self):
-        """Continuously-pending old tasks accumulate age from their creation id."""
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
-        scheduler.finish_startup()
-        # First-ever tick sees task 5 as pending — anchor to task_id.
-        scheduler._update_age_anchors([_pending_task('5')], max_id=100)
-        age = scheduler._compute_age('5', max_id=100)
-        assert age == 95
-
-
 class TestPerTierSkipThreshold:
     """Fix 2: skip_threshold dict unlocks per-tier parking behaviour."""
 
@@ -4972,15 +4935,18 @@ class TestBlastRadiusRefinement:
         assert lt.try_acquire(
             'other', ['crates/reify-compiler/src/conformance.rs']
         )
-        # 936 can't expand; since update_task → set_task_status hit MCP,
-        # patch scheduler methods to no-ops for this assertion scope.
-        scheduler.update_task = AsyncMock(return_value=True)  # type: ignore[method-assign]
-        scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
-        ok = await scheduler.handle_blast_radius_expansion(
-            '936',
-            current=['crates/reify-compiler/src/lib.rs'],
-            needed=['crates/reify-compiler/src/conformance.rs'],
-        )
+        # 936 can't expand; since get_task, update_task and set_task_status
+        # hit MCP, stub all three for this assertion scope.
+        with (
+            patch.object(scheduler, 'get_task', AsyncMock(return_value={'id': '936'})),
+            patch.object(scheduler, 'update_task', AsyncMock(return_value=True)),
+            patch.object(scheduler, 'set_task_status', AsyncMock(return_value=None)),
+        ):
+            ok = await scheduler.handle_blast_radius_expansion(
+                '936',
+                current=['crates/reify-compiler/src/lib.rs'],
+                needed=['crates/reify-compiler/src/conformance.rs'],
+            )
         assert ok.applied is False
         # Full release ran: 936 should no longer hold anything
         assert '936' not in lt._held
@@ -7560,6 +7526,13 @@ class TestDeferredWatchDispatchGate:
 # Milestone time-gate (task 2335 β — docs/prds/milestone-tasks.md §6.2)
 # ---------------------------------------------------------------------------
 
+def _delayed_milestone_metadata(after_secs: object, anchor: object) -> dict:
+    return {
+        'milestone': {'mode': 'delayed', 'after_secs': after_secs},
+        'milestone_deps_satisfied_at': anchor,
+    }
+
+
 class TestMilestoneTimeGate:
     """Unit tests for the pure predicate Scheduler._milestone_time_gated.
 
@@ -7680,6 +7653,71 @@ class TestMilestoneTimeGate:
             task, datetime(2026, 9, 1, tzinfo=UTC)
         ) is False
 
+    def test_tz_naive_anchor_is_treated_as_utc(self):
+        naive_anchor = datetime(2026, 7, 25, 9, 0, 0)  # no tzinfo
+        task = self._task_with({
+            'milestone': {'mode': 'delayed', 'after_secs': 3600},
+            'milestone_deps_satisfied_at': naive_anchor.isoformat(),
+        })
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 7, 25, 9, 59, tzinfo=UTC)
+        ) is True
+        assert scheduler._milestone_time_gated(
+            task, datetime(2026, 7, 25, 10, 0, tzinfo=UTC)
+        ) is False
+
+    def test_delayed_without_anchor_withholds_silently(self, caplog):
+        """An unset anchor means 'not due yet', not 'malformed': no WARNING."""
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = self._task_with({'milestone': {'mode': 'delayed', 'after_secs': 60}})
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            assert scheduler._milestone_time_gated(task, datetime.now(UTC)) is True
+
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    @pytest.mark.parametrize('metadata', [
+        pytest.param(_delayed_milestone_metadata(60, 12345), id='non_str_anchor'),
+        pytest.param(_delayed_milestone_metadata(60, 0), id='falsy_non_str_anchor'),
+        pytest.param(
+            _delayed_milestone_metadata(60, 'not-a-timestamp'), id='unparseable_anchor'
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(10**12, '2026-11-01T00:00:00+00:00'),
+            id='deadline_overflow_1e12',
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(10**15, '2026-11-01T00:00:00+00:00'),
+            id='deadline_overflow_1e15',
+        ),
+        pytest.param(
+            _delayed_milestone_metadata(0, '2026-11-01T00:00:00+00:00'),
+            id='milestone_rejects_zero_after_secs',
+        ),
+        pytest.param(
+            {'milestone': {
+                'mode': 'dated', 'at': '2026-11-01T00:00:00+00:00', 'after_secs': 60,
+            }},
+            id='milestone_rejects_dated_with_after_secs',
+        ),
+    ])
+    def test_malformed_input_fails_safe_and_warns_once(self, metadata, caplog):
+        """``now`` is after every anchor and ``at``, so a lenient read would dispatch."""
+        now = datetime(2026, 11, 13, tzinfo=UTC)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        task = self._task_with(metadata)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert scheduler._milestone_time_gated(task, now) is True
+
+        warnings = [
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
+        ]
+        assert len(warnings) == 1
+
     def test_malformed_milestone_warning_deduped_per_task_and_cause(self, caplog):
         """reviewer_comprehensive observability finding (task 2335 β
         amendment): _milestone_time_gated is invoked once per candidate loop
@@ -7713,7 +7751,7 @@ class TestMilestoneTimeGate:
             assert scheduler._milestone_time_gated(task_changed, datetime.now(UTC)) is True
 
         unknown_mode_warnings = [
-            r for r in caplog.records if 'unknown mode' in r.getMessage()
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
         ]
         assert len(unknown_mode_warnings) == 1, (
             f'Expected a fresh WARNING when the malformed cause changes; '
@@ -7862,6 +7900,45 @@ class TestMilestoneEligibilityGate:
         assert result_after is not None and result_after.task_id == '4005', (
             'Milestone must dispatch once now_wall >= at'
         )
+
+    @pytest.mark.asyncio
+    async def test_acquire_next_withholds_milestone_rejected_spec_and_warns_once(
+        self, monkeypatch, caplog
+    ):
+        """A delayed spec Milestone rejects (after_secs=0) whose anchor is long
+        past is withheld tick after tick, with exactly one WARNING."""
+        now = datetime(2026, 8, 1, tzinfo=UTC)
+        task = {
+            'id': '4008',
+            'title': 'Milestone-rejected delayed task',
+            'status': 'pending',
+            'dependencies': [],
+            'metadata': _delayed_milestone_metadata(
+                0, (now - timedelta(days=1)).isoformat()
+            ),
+        }
+        task_response = {
+            'result': {
+                'content': [{'type': 'text', 'text': json.dumps({'tasks': [task]})}]
+            }
+        }
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1), wall_time_source=lambda: now
+        )
+        scheduler.finish_startup()
+        monkeypatch.setattr(
+            'orchestrator.scheduler.mcp_call', AsyncMock(return_value=task_response)
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.scheduler'):
+            for _ in range(3):
+                assert await scheduler.acquire_next() is None
+
+        warnings = [
+            r for r in caplog.records if 'malformed metadata.milestone' in r.getMessage()
+        ]
+        assert len(warnings) == 1
 
 
 class TestClaimantLivenessDispatchGate:
@@ -11161,7 +11238,7 @@ class TestAcquireNextDepBackfillFromGetStatuses:
     @pytest.fixture
     def scheduler(self) -> Scheduler:
         config = OrchestratorConfig(max_per_module=1)
-        scheduler = Scheduler(config)
+        scheduler = Scheduler(config, mcp_session=HermeticMcpSession())
         scheduler.finish_startup()
         return scheduler
 
@@ -11462,17 +11539,17 @@ class TestAcquireNextBookkeepingPurgesAbsentTasks:
     async def test_bookkeeping_purged_for_absent_task(self, scheduler: Scheduler):
         """Bookkeeping entries for a task absent from the active fetch must be purged.
 
-        Includes _pending_anchor: a task that went pending → terminal without
-        ever being dispatched would leak its anchor entry permanently under
-        active-only filtering because _update_age_anchors only iterates the
+        Includes the age anchors: a task that went pending → terminal without
+        ever being dispatched would leak its held anchor permanently under
+        active-only filtering because AgeAnchors.observe only iterates the
         fetched tasks list (and terminal tasks are absent from it).
         """
         # Seed bookkeeping for task 'X' that is now completed/absent.
         scheduler._skip_count['X'] = 3
         scheduler._last_dispatch_at['X'] = 123.0
         scheduler._module_cache['X'] = ['backend/module_x']
-        # Seed _pending_anchor as if X was pending once and assigned an anchor.
-        scheduler._pending_anchor['X'] = 5
+        # X was pending once: a non-numeric id anchors at max_id 5.
+        scheduler.age_anchors.observe([_pending_task('X')], max_id=5)
 
         # Unrelated pending task (not X); X is terminal → excluded from active fetch.
         other_task = {
@@ -11497,13 +11574,11 @@ class TestAcquireNextBookkeepingPurgesAbsentTasks:
         assert 'X' not in scheduler._module_cache, (
             f"Expected 'X' purged from _module_cache but it's still there: {scheduler._module_cache}"
         )
-        # _pending_anchor must also be purged so the dict stays bounded.
-        assert 'X' not in scheduler._pending_anchor, (
-            f"Expected 'X' purged from _pending_anchor but it's still there: {scheduler._pending_anchor}"
-        )
+        # The held age anchor must also be purged so the holding stays bounded.
+        assert 'X' not in scheduler.age_anchors.tracked_ids()
         # Absence is not a cancellation (D3): X returns with the anchor it left with.
-        scheduler._update_age_anchors([_pending_task('X')], max_id=100)
-        assert scheduler._compute_age('X', 100) == 95
+        scheduler.age_anchors.observe([_pending_task('X')], max_id=100)
+        assert scheduler.age_anchors.age('X', 100) == 95
 
 
 class TestOrchestratorStatusSetsMatchShared:
@@ -12718,10 +12793,10 @@ class TestStreakRegistryMigration:
         never touch 'probe').
 
         NOTE: the spine entry uses ``_skip_count`` rather than
-        ``_pending_anchor`` — ``_update_age_anchors`` (called earlier in the
-        same tick, before the stale-id sweep) never anchors a tid observed
-        with a terminal status, so a task reported as already-'done' in its
-        very first observed tick never enters ``_pending_anchor`` and so
+        ``age_anchors.tracked_ids()`` — ``AgeAnchors.observe`` (called earlier
+        in the same tick, before the stale-id sweep) never anchors a tid
+        observed with a terminal status, so a task reported as already-'done'
+        in its very first observed tick never enters ``tracked_ids()`` and so
         never reaches the stale-id sweep through it.  ``_skip_count`` has no such early-pop and is one of
         the four ``_all_tracked`` spine dicts, so it reliably lands 'T' in
         ``_stale_ids`` for this single-tick repro.
@@ -12989,6 +13064,83 @@ class TestConsultAlreadyLanded:
         assert all(call.kwargs['tick_view'] is None for call in gate.await_args_list)
         assert any(record.levelname == 'WARNING' for record in caplog.records)
 
+    async def test_the_pending_escalations_are_read_once_after_the_view_and_threaded(self):
+        """Task 8073: one store read per consult, whatever the candidate count."""
+        reads: list[str] = []
+        snapshot = {'B': []}
+
+        async def read_view() -> AlreadyLandedTickView:
+            reads.append('view')
+            return AlreadyLandedTickView(local_branches=frozenset())
+
+        async def read_escalations() -> dict:
+            reads.append('escalations')
+            return snapshot
+
+        async def gate(task_id: str, **kwargs) -> bool:
+            reads.append(f'gate:{task_id}')
+            return False
+
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(
+                read_already_landed_tick_view=read_view,
+                read_pending_escalations_by_task=read_escalations,
+            ),
+        )
+        scheduler.finish_startup()
+        spy = AsyncMock(side_effect=gate)
+        scheduler._already_landed_gate = spy
+        candidates = [_pending_task(tid) for tid in ('A', 'B', 'C')]
+
+        await scheduler._consult_already_landed(candidates)
+
+        assert reads == ['view', 'escalations', 'gate:A', 'gate:B', 'gate:C']
+        assert all(
+            call.kwargs['pending_escalations'] is snapshot for call in spy.await_args_list
+        )
+
+    async def test_without_an_escalation_reader_the_gate_reads_per_candidate(self):
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        gate = AsyncMock(return_value=False)
+        scheduler._already_landed_gate = gate
+
+        await scheduler._consult_already_landed([_pending_task('Z')])
+
+        (call,) = gate.await_args_list
+        assert call.kwargs['pending_escalations'] is None
+
+    async def test_a_raising_escalation_reader_fails_open_to_per_candidate_reads(
+        self, caplog,
+    ):
+        caplog.set_level('WARNING')
+        view = AlreadyLandedTickView(local_branches=frozenset())
+        scheduler = Scheduler(
+            OrchestratorConfig(max_per_module=1),
+            callbacks=SchedulerCallbacks(
+                read_already_landed_tick_view=AsyncMock(return_value=view),
+                read_pending_escalations_by_task=AsyncMock(
+                    side_effect=OSError('escalation queue dir unreadable'),
+                ),
+            ),
+        )
+        scheduler.finish_startup()
+        gate = AsyncMock(side_effect=lambda task_id, **_: task_id == 'Z')
+        scheduler._already_landed_gate = gate
+
+        result = await scheduler._consult_already_landed(
+            [_pending_task('Z'), _pending_task('Y')]
+        )
+
+        assert result == {'Z'}
+        assert all(call.kwargs['pending_escalations'] is None for call in gate.await_args_list)
+        assert all(call.kwargs['tick_view'] is view for call in gate.await_args_list)
+        assert any(
+            record.levelname == 'WARNING' and 'pending escalation snapshot' in record.getMessage()
+            for record in caplog.records
+        )
+
     async def test_without_a_gate_the_tick_view_is_not_read(self):
         reader = AsyncMock(return_value=AlreadyLandedTickView(local_branches=frozenset()))
         scheduler = Scheduler(
@@ -13158,11 +13310,11 @@ class TestExternalDepEscalationSurvivesTransientAbsence:
 
         async def _tick(*, present: bool) -> None:
             if present:
-                # Model the real tick's _update_age_anchors: the pending-age
+                # Model the real tick's AgeAnchors.observe: the pending-age
                 # anchor is stamped every tick the dependent appears in the
                 # fetch, so the ONE absent tick exercises the stale_sweep
                 # absence-GC path under test.
-                scheduler._pending_anchor['10'] = 10
+                scheduler.age_anchors.observe([task], max_id=10)
                 ctx = TickContext(
                     tasks=[task],
                     status_map={'10': 'pending'},
@@ -13212,7 +13364,7 @@ class TestExternalDepEscalationSurvivesTransientAbsence:
 
         async def _tick(*, present: bool) -> None:
             if present:
-                scheduler._pending_anchor['10'] = 10
+                scheduler.age_anchors.observe([task], max_id=10)
                 ctx = TickContext(
                     tasks=[task],
                     status_map={'10': 'pending'},

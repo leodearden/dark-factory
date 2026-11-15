@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from graphiti_core.search import search_utils
 from pydantic import ValidationError
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.arm_harness.probe_set import (
     FULLTEXT_TERM_CUTOFF,
@@ -26,6 +27,8 @@ from fused_memory.arm_harness.probe_set import (
     serialize_probe_set,
 )
 from fused_memory.backends.falkor_fulltext import build_query
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 CORPUS_SHA = 'b' * 64
 REFERENCE = FrozenReference(

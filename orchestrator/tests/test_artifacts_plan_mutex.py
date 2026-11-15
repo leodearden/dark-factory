@@ -117,7 +117,7 @@ def test_a_bare_overwrite_is_ordered_after_an_in_flight_rmw(artifacts: TaskArtif
 def test_an_rmw_write_without_the_mutex_is_refused_and_lands_nothing(
     artifacts: TaskArtifacts,
 ) -> None:
-    plan_path = artifacts.root / 'plan.json'
+    plan_path = artifacts.artifact_path('plan.json')
     before = plan_path.read_bytes()
     plan = artifacts.read_plan()
     plan['title'] = 'written outside the mutex'
@@ -158,7 +158,7 @@ def test_another_threads_hold_does_not_license_an_rmw_write(artifacts: TaskArtif
 def test_a_normalizing_read_rereads_under_the_mutex(artifacts: TaskArtifacts) -> None:
     malformed = _seed_plan()
     malformed['tdd_steps'] = malformed.pop('steps')
-    (artifacts.root / 'plan.json').write_text(json.dumps(malformed))
+    artifacts.artifact_path('plan.json').write_text(json.dumps(malformed))
     served: list[dict] = []
 
     def canonicalize(plan: dict) -> None:
@@ -183,9 +183,9 @@ def test_the_lane_symlink_view_and_the_meta_root_view_share_one_mutex(tmp_path: 
     meta_view = TaskArtifacts(worktree, TaskArtifacts.meta_root_for(worktree_base, 'lane'))
     meta_view.init('task-1', 'Test Task', 'A test task description')
     meta_view.write_plan(_seed_plan())
-    meta_view.ensure_lane_plan_symlink()
+    meta_view.ensure_lane_symlinks()
     lane_view = TaskArtifacts(worktree)
-    assert (lane_view.root / 'plan.json').is_symlink()
+    assert lane_view.artifact_path('plan.json').is_symlink()
     entered = threading.Event()
 
     def enter_through_the_lane_view() -> None:
@@ -208,7 +208,7 @@ def test_a_vanished_root_is_not_rematerialized(artifacts: TaskArtifacts) -> None
         pass
     artifacts.update_step_status('step-1', 'done')
 
-    assert not artifacts.root.exists()
+    assert not artifacts.task_root.exists()
 
 
 def test_the_mutex_is_not_the_plan_ownership_lock(artifacts: TaskArtifacts) -> None:

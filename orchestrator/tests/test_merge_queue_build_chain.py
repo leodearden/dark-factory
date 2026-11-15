@@ -54,6 +54,7 @@ from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane.intake import MERGE_LANES
 from orchestrator.merge_lane.liveness import release_chain_build_lane
 from orchestrator.merge_lane.types import GroupMergeRequest, QueuedBranch
 from orchestrator.merge_lane.worker import (
@@ -252,7 +253,7 @@ class TestMergeBranchIntoWorktree:
         assert (wt / 'disjoint.txt').read_text() == 'edit-101\n'
 
     async def test_merge_subject_is_canonical(self, git_repo: Path):
-        """Subject comes from _merge_subject — find_merge_marker depends on it."""
+        """Subject comes from shared.merge_subject.format_merge_subject — find_merge_marker depends on it."""
         git_ops = _make_git_ops(git_repo)
         await _create_branch_editing(git_repo, 'task/101', 'disjoint.txt', 'edit-101\n')
         main_sha = await _rev_parse(git_repo)
@@ -642,7 +643,7 @@ class TestChainSnapshot:
         config = _make_config(git_repo)
         worker = _make_worker(git_ops)
         reqs = [_make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)]
-        worker._lane_buffers['normal'].extend(reqs)
+        worker._intake.replace_lane('normal', reqs)
 
         snap = worker.chain_snapshot()
 
@@ -658,11 +659,11 @@ class TestChainSnapshot:
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo)
         worker = _make_worker(git_ops)
-        worker._lane_buffers['high'].extend([
+        worker._intake.replace_lane('high', [
             _make_req('201', '201', config, git_repo, lane='high'),
             _make_req('202', '202', config, git_repo, lane='high'),
         ])
-        worker._lane_buffers['normal'].extend([
+        worker._intake.replace_lane('normal', [
             _make_req('101', '101', config, git_repo),
             _make_req('102', '102', config, git_repo),
         ])
@@ -679,8 +680,8 @@ class TestChainSnapshot:
         hi = _make_req('201', '201', config, git_repo, lane='high')
         lo = _make_req('101', '101', config, git_repo)
         # Append the normal-lane item FIRST to prove lane order, not insert order.
-        worker._lane_buffers['normal'].append(lo)
-        worker._lane_buffers['high'].append(hi)
+        worker._intake.buffer_owned_request(lo)
+        worker._intake.buffer_owned_request(hi)
 
         assert [r.task_id for r in worker.chain_snapshot()] == ['201', '101']
 
@@ -690,7 +691,7 @@ class TestChainSnapshot:
         `_note_requeue` re-appends at the deque TAIL while retaining an old
         `merge_first_enqueued_at`, so aging order genuinely diverges from FIFO.
         Sorting by `_aging_key` here would disagree with BOTH order authorities
-        (unfrozen_suffix iterates the deque directly; _pop_next_pickable scans
+        (unfrozen_suffix iterates the deque directly; pop_next_pickable scans
         FIFO and degrades to buf[0] on an empty conflict graph) and would break
         the contiguous-prefix property δ's in-order CAS walk depends on.
         """
@@ -702,7 +703,7 @@ class TestChainSnapshot:
         # Opposite order to the append order: `second` looks OLDER by aging key.
         first.merge_first_enqueued_at = 2000.0
         second.merge_first_enqueued_at = 1000.0
-        worker._lane_buffers['normal'].extend([first, second])
+        worker._intake.replace_lane('normal', [first, second])
 
         assert [r.task_id for r in worker.chain_snapshot()] == ['101', '102']
 
@@ -711,23 +712,23 @@ class TestChainSnapshot:
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo)
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
-        )
-        before = [list(b) for b in worker._lane_buffers.values()]
+        ])
+        before = [worker._intake.buffered(lane) for lane in MERGE_LANES]
 
         worker.chain_snapshot()
 
-        assert [list(b) for b in worker._lane_buffers.values()] == before
+        assert [worker._intake.buffered(lane) for lane in MERGE_LANES] == before
 
     async def test_fires_no_lifecycle_transition(self, git_repo: Path):
-        """Contrast with _pop_next_pickable, which fires LANE_BUFFERED→MERGING."""
+        """Contrast with pop_next_pickable, which fires LANE_BUFFERED→MERGING."""
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo)
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(str(i), str(i), config, git_repo) for i in (101, 102)
-        )
+        ])
         before = _registry_states(worker)
 
         worker.chain_snapshot()
@@ -739,9 +740,9 @@ class TestChainSnapshot:
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo)
         worker = _make_worker(git_ops)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(str(i), str(i), config, git_repo) for i in (101, 102)
-        )
+        ])
 
         assert worker.chain_snapshot() == worker.chain_snapshot()
 
@@ -754,7 +755,7 @@ class TestChainSnapshot:
     async def test_halted_lanes_are_excluded(self, git_repo: Path):
         """A halted lane's items are not dispatchable, so they cannot chain.
 
-        Matches _pop_next_pickable's is_lane_halted skip.  This is the one
+        Matches pop_next_pickable's is_lane_halted skip.  This is the one
         deliberate divergence from unfrozen_suffix(), which reports the whole
         buffer region regardless of halt state — chaining an item the pipeline
         cannot land would build an unlandable tip.
@@ -762,10 +763,10 @@ class TestChainSnapshot:
         git_ops = _make_git_ops(git_repo)
         config = _make_config(git_repo)
         worker = _make_worker(git_ops)
-        worker._lane_buffers['high'].append(
+        worker._intake.buffer_owned_request(
             _make_req('201', '201', config, git_repo, lane='high'),
         )
-        worker._lane_buffers['normal'].append(_make_req('101', '101', config, git_repo))
+        worker._intake.buffer_owned_request(_make_req('101', '101', config, git_repo))
         worker.halt_lane('high', 'test halt')
         assert worker.is_lane_halted('high')
 
@@ -794,7 +795,7 @@ class TestChainSnapshotIsSync:
         """An empty-buffer call returns () outside any event loop.
 
         Same contract as frozen_prefix / unfrozen_suffix / frozen_prefix_tip /
-        _pop_next_pickable, so chain_snapshot stays callable from snapshot().
+        pop_next_pickable, so chain_snapshot stays callable from snapshot().
         """
         import asyncio as _asyncio
 
@@ -1284,9 +1285,9 @@ class TestBuildChainTruncation:
         emitted = _spy_merge_attempt_events(monkeypatch)
         await self._conflicting_trio(git_repo)
         head = await _rev_parse(git_repo)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
-        )
+        ])
 
         res = await build_chain(
             git_ops, worker.chain_snapshot(), head, cap=6, target_depth=3,
@@ -1307,10 +1308,10 @@ class TestBuildChainTruncation:
         noted = _spy_note_conflict_detected(monkeypatch)
         await self._conflicting_trio(git_repo)
         head = await _rev_parse(git_repo)
-        worker._lane_buffers['normal'].extend(
+        worker._intake.replace_lane('normal', [
             _make_req(str(i), str(i), config, git_repo) for i in (101, 102, 103)
-        )
-        buffers_before = {k: list(v) for k, v in worker._lane_buffers.items()}
+        ])
+        buffers_before = {lane: worker._intake.buffered(lane) for lane in MERGE_LANES}
         lifecycle_before = _registry_states(worker)
 
         res = await build_chain(
@@ -1319,7 +1320,7 @@ class TestBuildChainTruncation:
 
         assert res.truncated_at == '102'
         # Object identity AND order, not just equality.
-        after = {k: list(v) for k, v in worker._lane_buffers.items()}
+        after = {lane: worker._intake.buffered(lane) for lane in MERGE_LANES}
         assert after.keys() == buffers_before.keys()
         for lane_name, items in buffers_before.items():
             assert len(after[lane_name]) == len(items)

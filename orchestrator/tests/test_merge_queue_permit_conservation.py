@@ -28,17 +28,20 @@ from unittest.mock import MagicMock
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, lane_scene_config, main_health_probe_spawned
+from _merge_worker_drive import make_merge_request, stop_merge_worker
 from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
 from _verify_result_doubles import fake_verify_result
 from test_merge_queue_concurrent_verify import (
     _gated_runner,
     _inject_two_host_allocator,
     _make_branch_with_file,
-    _make_request,
-    _stop_worker,
+    _one_remerge,
+    _record_remerges,
 )
+from test_merge_speculation import _LateArrivalFakeEventStore
 
 from orchestrator.config import GitConfig
+from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
 
@@ -319,8 +322,8 @@ class TestPrefetchLookaheadAndAttachConservation:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('pc-attach-a', 'task/pc-attach-a', wt_a, config)
-        req_b = _make_request('pc-attach-b', 'task/pc-attach-b', wt_b, config)
+        req_a = make_merge_request('pc-attach-a', 'task/pc-attach-a', wt_a, config)
+        req_b = make_merge_request('pc-attach-b', 'task/pc-attach-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -361,7 +364,7 @@ class TestPrefetchLookaheadAndAttachConservation:
 
             _assert_conservation(worker, where='post-landing quiescence')
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -403,8 +406,8 @@ class TestFallbackConservation:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('pc-fallback-a', 'task/pc-fallback-a', wt_a, config)
-        req_b = _make_request('pc-fallback-b', 'task/pc-fallback-b', wt_b, config)
+        req_a = make_merge_request('pc-fallback-a', 'task/pc-fallback-a', wt_a, config)
+        req_b = make_merge_request('pc-fallback-b', 'task/pc-fallback-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -428,7 +431,7 @@ class TestFallbackConservation:
 
             _assert_conservation(worker, where='after FALLBACK, B lands')
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -443,15 +446,21 @@ class TestCascadeRemergeConservation:
     existing head-failure cascade cancels B's remote verify, re-merges B
     against actual main, and re-dispatches it — the permit must remain
     conserved throughout the cancel + remerge + redispatch sequence.
+
+    Boundary row 1's B half (plans/merge-lane-policy-prd.md §7): with the
+    head dead there is no live tip, so B's replacement falls to main and no
+    adoption-time void ever names B.
     """
 
     async def test_cascade_remerge_conserves_permits(
-        self, git_ops: GitOps, git_config: GitConfig,
+        self, git_ops: GitOps, git_config: GitConfig, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
 
         K = 2
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
+        gate_b2_release = asyncio.Event()
+        gate_b2_entered = asyncio.Event()
         _local_calls = [0]
 
         async def _gated_failing_local(*args: Any, **kwargs: Any) -> MagicMock:
@@ -463,7 +472,10 @@ class TestCascadeRemergeConservation:
                 return fake_verify_result(
                     passed=False, summary='tests failed', test_output='FAIL', category='',
                 )
-            # B's re-verify after the cascade remerges it: passes.
+            # B's re-verify after the cascade remerges it: held until the
+            # post-cascade state is read, then passes.
+            gate_b2_entered.set()
+            await gate_b2_release.wait()
             return fake_verify_result(passed=True)
 
         gate_b_release = asyncio.Event()
@@ -480,15 +492,18 @@ class TestCascadeRemergeConservation:
             git_ops, 'task/pc-cascade-b', 'pc_cascade_b.py', 'b = 2\n',
         )
 
+        main_before = await git_ops.get_main_sha()
+        store = _LateArrivalFakeEventStore()
         queue: asyncio.Queue = asyncio.Queue()
         worker = MergeLane(
             git_ops, queue, speculation_depth=K,
-            verifier=_InjectedVerifier(_gated_failing_local),
+            verifier=_InjectedVerifier(_gated_failing_local), event_store=store,
         )
         _inject_two_host_allocator(worker, fake_remote)
+        remerges = _record_remerges(worker, monkeypatch)
 
-        req_a = _make_request('pc-cascade-a', 'task/pc-cascade-a', wt_a, config)
-        req_b = _make_request('pc-cascade-b', 'task/pc-cascade-b', wt_b, config)
+        req_a = make_merge_request('pc-cascade-a', 'task/pc-cascade-a', wt_a, config)
+        req_b = make_merge_request('pc-cascade-b', 'task/pc-cascade-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -518,6 +533,19 @@ class TestCascadeRemergeConservation:
             # cascade cancels B's remote verify, re-merges B against actual
             # main, and re-dispatches it (local re-verify, passes).
             gate_a_release.set()
+            await wait_responsive(
+                gate_b2_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label="pc-cascade-b: the replacement's re-verify entered",
+            )
+
+            assert worker.speculation_accounting_violations() == []
+            _assert_conservation(worker, where='after cascade, before B lands')
+            claim, replacement = _one_remerge(remerges, 'pc-cascade-b')
+            assert claim.anchor.tip is None, claim
+            assert replacement.base_sha == main_before
+            assert replacement.speculative is False
+            gate_b2_release.set()
 
             outcome_b = await wait_responsive(
                 req_b.result,
@@ -535,8 +563,14 @@ class TestCascadeRemergeConservation:
             )
 
             _assert_conservation(worker, where='after cascade + remerge + B lands')
+            adoption_voids = [
+                e['task_id'] for e in store.speculative_events(EventType.verdict_voided)
+                if e['data']['point'] == 'adoption'
+            ]
+            assert 'pc-cascade-b' not in adoption_voids, adoption_voids
         finally:
-            await _stop_worker(worker, worker_task)
+            gate_b2_release.set()
+            await stop_merge_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -586,7 +620,7 @@ class TestShutdownRetainedPermitConservation:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('pc-shutdown-a', 'task/pc-shutdown-a', wt_a, config)
+        req_a = make_merge_request('pc-shutdown-a', 'task/pc-shutdown-a', wt_a, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -604,7 +638,7 @@ class TestShutdownRetainedPermitConservation:
         finally:
             # Shut down while the merger is blocked in _acquire_next_request()
             # (queue empty) — possibly still holding the retained permit.
-            await _stop_worker(worker, worker_task, join_timeout=10.0)
+            await stop_merge_worker(worker, worker_task, join_timeout=10.0)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -671,8 +705,8 @@ class TestLedgerLiveEmptiesAfterTransferRelease:
         )
         _inject_two_host_allocator(worker, fake_remote)
 
-        req_a = _make_request('pc-live-a', 'task/pc-live-a', wt_a, config)
-        req_b = _make_request('pc-live-b', 'task/pc-live-b', wt_b, config)
+        req_a = make_merge_request('pc-live-a', 'task/pc-live-a', wt_a, config)
+        req_b = make_merge_request('pc-live-b', 'task/pc-live-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -726,7 +760,7 @@ class TestLedgerLiveEmptiesAfterTransferRelease:
             assert outcome_a.status == 'done', f'A must land; got {outcome_a!r}'
             assert outcome_b.status == 'done', f'B must land; got {outcome_b!r}'
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)
 
@@ -803,8 +837,8 @@ class TestEarlyContinueTerminalTransferClearsSpecBase:
             verifier=_InjectedVerifier(_gated_local),
         )
 
-        req_a = _make_request('pc-term-a', 'task/pc-term-a', wt_a, config)
-        req_b = _make_request('pc-term-b', 'task/pc-term-b', wt_b, config)
+        req_a = make_merge_request('pc-term-a', 'task/pc-term-a', wt_a, config)
+        req_b = make_merge_request('pc-term-b', 'task/pc-term-b', wt_b, config)
 
         worker_task = asyncio.create_task(worker.run())
         try:
@@ -873,6 +907,6 @@ class TestEarlyContinueTerminalTransferClearsSpecBase:
 
             _assert_conservation(worker, where='post-landing quiescence')
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         _assert_shutdown_quiescent(worker, where='post-shutdown', depth=K)

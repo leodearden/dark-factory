@@ -6,7 +6,6 @@ Each payload is built inside SQLite from its model's field names, so the `data` 
 from __future__ import annotations
 
 import math
-import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,7 +17,6 @@ from typing import Any, Final, Self, TypeVar
 from pydantic import (
     BaseModel,
     ConfigDict,
-    JsonValue,
     StrictBool,
     ValidationError,
     model_validator,
@@ -36,6 +34,7 @@ from client_feed.contract import (
     VerifyKind,
 )
 from client_feed.sources.store import read_only
+from client_feed.sources.task_id import task_id_of
 
 
 class StoreEventType(StrEnum):
@@ -50,8 +49,6 @@ class StoreEventType(StrEnum):
     SCHEDULER_PAUSED = 'scheduler_paused'
     SCHEDULER_RESUMED = 'scheduler_resumed'
     SCHEDULER_PAUSE_RESTORED = 'scheduler_pause_restored'
-    ESCALATION_CREATED = 'escalation_created'
-    ESCALATION_RESOLVED = 'escalation_resolved'
     REVIEW_COMPLETED = 'review_completed'
 
 
@@ -152,17 +149,6 @@ def _payload_sql(model: type[_Payload]) -> str:
     return f'CASE WHEN json_valid(data) THEN json_object({pairs}) END'
 
 
-_TASK_ID: Final = re.compile(r'[0-9]+')
-
-
-def _task_id(text: str | None) -> int | None:
-    """The positive integer a TEXT task_id spells in decimal digits, else None."""
-    if text is None or not _TASK_ID.fullmatch(text):
-        return None
-    value = int(text)
-    return value if value >= 1 else None
-
-
 def _instant(text: str) -> datetime | None:
     """The UTC instant an ISO timestamp names, or None when it is unparseable or carries no offset."""
     try:
@@ -188,7 +174,7 @@ def _merge_finalized(row: _Row, payload: _MergeFinalized) -> LandedCommit | None
 
 
 def _train_merged(row: _Row, payload: _TrainMerged) -> LandedCommit:
-    members = (_task_id(member) for member in payload.member_task_ids)
+    members = (task_id_of(member) for member in payload.member_task_ids)
     return LandedCommit(
         event_id=row.event_id,
         at=row.at,
@@ -303,7 +289,7 @@ def _projected(raw: tuple[Any, ...]) -> StreamEvent | SkippedRow | None:
         parsed = _validated(spec.payload, payload)
         if parsed is None:
             return SkippedRow(event_id=event_id, event_type=kind, reason=SkipReason.MALFORMED_PAYLOAD)
-    return spec.read(_Row(event_id=event_id, at=at, task_id=_task_id(task_id), phase=phase), parsed)
+    return spec.read(_Row(event_id=event_id, at=at, task_id=task_id_of(task_id), phase=phase), parsed)
 
 
 _STREAM_PAYLOADS: Final[_Payloads] = MappingProxyType(
@@ -391,80 +377,6 @@ def read_factory_status(root: Path, *, now: datetime) -> FactoryStatus:
     return FactoryStatus(
         scheduler=scheduler, since=since, last_event_at=last_event_at, idle_seconds=idle_seconds
     )
-
-
-@dataclass(frozen=True)
-class OpenEscalation:
-    escalation_id: str
-    level: int | None
-
-
-@dataclass(frozen=True)
-class OpenEscalations:
-    """Every escalation runs.db records as created and not yet resolved, by task."""
-
-    by_task: Mapping[int, tuple[OpenEscalation, ...]]
-
-    def levels(self, task_id: int) -> tuple[int | None, ...]:
-        """The recorded level of each of the task's open escalations, None where none is recorded."""
-        return tuple(escalation.level for escalation in self.by_task.get(task_id, ()))
-
-
-class _EscalationCreated(_Payload):
-    escalation_id: str | None
-    level: JsonValue
-
-
-class _EscalationResolved(_Payload):
-    escalation_id: str | None
-    escalation_ids: tuple[str, ...] | None
-
-
-_ESCALATION_PAYLOADS: Final[_Payloads] = MappingProxyType({
-    StoreEventType.ESCALATION_CREATED: _EscalationCreated,
-    StoreEventType.ESCALATION_RESOLVED: _EscalationResolved,
-})
-
-
-def _recorded_level(value: JsonValue) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-_Opened = dict[str, tuple[int, OpenEscalation]]
-
-
-def _closed_ids(resolved: _EscalationResolved, task_id: int | None, opened: _Opened) -> tuple[str, ...]:
-    """By id, else by the listed ids, else every open escalation of the resolving task."""
-    if resolved.escalation_id is not None:
-        return (resolved.escalation_id,)
-    if resolved.escalation_ids is not None:
-        return resolved.escalation_ids
-    return tuple(key for key, (owner, _) in opened.items() if task_id is not None and owner == task_id)
-
-
-def _apply_escalation(opened: _Opened, event_type: str, task_id: int | None, payload: str | None) -> None:
-    if event_type == StoreEventType.ESCALATION_CREATED:
-        created = _validated(_EscalationCreated, payload)
-        if created is not None and created.escalation_id is not None and task_id is not None:
-            level = _recorded_level(created.level)
-            opened[created.escalation_id] = (task_id, OpenEscalation(created.escalation_id, level))
-        return
-    resolved = _validated(_EscalationResolved, payload)
-    if resolved is not None:
-        for escalation_id in _closed_ids(resolved, task_id, opened):
-            opened.pop(escalation_id, None)
-
-
-def read_open_escalations(root: Path) -> OpenEscalations:
-    """The open escalations left by replaying every created and resolved row in id order."""
-    (rows,) = _read(root, _rows_of_types('event_type, task_id', _ESCALATION_PAYLOADS))
-    opened: _Opened = {}
-    for event_type, task_id, payload in rows:
-        _apply_escalation(opened, event_type, _task_id(task_id), payload)
-    by_task: dict[int, tuple[OpenEscalation, ...]] = {}
-    for owner, escalation in opened.values():
-        by_task[owner] = (*by_task.get(owner, ()), escalation)
-    return OpenEscalations(by_task=MappingProxyType(by_task))
 
 
 class _ReviewCompleted(_Payload):

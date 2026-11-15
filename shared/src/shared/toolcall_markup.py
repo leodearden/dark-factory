@@ -104,10 +104,10 @@ file and silently dropping the sibling arguments of that same call. ``\\x3c`` is
 byte-identical at runtime and never appears verbatim in the file text, so it is
 immune. Leave it escaped.
 Runtime text quoting them gets the same spelling via :func:`escape_envelope_literals`.
+``tests/scripts/raw_envelope_literal_guard.py`` enforces the rule, repo-wide via
 ``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``
-enforces the rule on every ``.py`` source that already spells the bracket as
-``chr(60)`` or ``\\x3c``, or imports this module; a source spelling envelope
-literals only raw is outside that population.
+and per module in each ``lint_command``. Which files it covers is stated once,
+in that guard's POPULATION paragraph.
 
 This module is pure and stdlib-only (``re``, ``json``). It deliberately imports
 nothing from ``fused_memory``, ``orchestrator`` or ``escalation`` so that every
@@ -430,7 +430,7 @@ _ANY_OPENER_RE = re.compile(
 )
 
 # Structural bounds. repair() must be total for adversarial input WITHOUT a
-# blanket try/except (that is signature (b) of shared/tests/silent_fallthrough_scan.py
+# blanket try/except (that is signature (b) of tests/repo_guards/silent_fallthrough_scan.py
 # and would demand an allowlist entry), so the two unbounded loops are bounded
 # by construction instead. Both ceilings are far above any real call: no MCP
 # tool has 64 parameters, and a value carrying 64 qualifying closers is prose

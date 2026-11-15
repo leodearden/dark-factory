@@ -1539,7 +1539,7 @@ class TestExpressionDefinitelyDeselects:
 
 _WARM_LANE_PYPROJECT = _pyproject(f'"{_REAL_ADDOPTS}"')
 
-_MARKED_SOURCE = 'import pytest\npytestmark = pytest.mark.warm_lane_bash\n\n\ndef test_x():\n    pass\n'  # noqa: E501
+_MARKED_SOURCE = 'import pytest\npytestmark = pytest.mark.warm_lane_bash\n\n\ndef test_x():\n    pass\n'
 _UNMARKED_SOURCE = 'import pytest\n\n\ndef test_y():\n    pass\n'
 
 #: The repo ROOT's real addopts, verbatim from pyproject.toml:66 — the config

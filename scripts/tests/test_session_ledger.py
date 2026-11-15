@@ -23,6 +23,9 @@ from legibility.session_ledger import (
     LedgerState,
     Outcome,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _NOW = datetime(2026, 10, 5, 12, 0, 0, tzinfo=UTC)
 _GARBAGE = b'this is not an sqlite database, just bytes\n' * 8

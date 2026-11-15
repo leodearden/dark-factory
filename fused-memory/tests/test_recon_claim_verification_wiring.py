@@ -11,8 +11,10 @@ docstring for the motivating task-2433 incident.
 from __future__ import annotations
 
 import logging
+from unittest.mock import AsyncMock
 
 import pytest
+from _curator_helpers import batch_create_result
 
 # ──────────────────────────────────────────────────────────────────────────────
 # task-2438 step-07 RED: TestCuratorReconClaimVerificationConfig
@@ -235,14 +237,14 @@ class TestMaybeFlagUnverifiedClaims:
         """RED counterpart to test_probe_runs_off_event_loop, but for probe
         CONSTRUCTION rather than probe INVOCATION.
 
-        This is the single-candidate counterpart to curate_batch_prepared's
-        already-offloaded claim_probe construction (its claim-verification
-        block's ``claim_probe = await
-        asyncio.to_thread(make_source_and_history_probe, self._cwd)`` line).
+        This is the single-candidate counterpart to the pipeline's
+        already-offloaded probe construction (``_flag_unverified_claims_of``'s
+        ``probe = await asyncio.to_thread(make_source_and_history_probe,
+        self._cwd)`` line).
         make_source_and_history_probe resolves the git top
         level via _resolve_git_toplevel, a blocking `git rev-parse
         --show-toplevel` subprocess bounded only by a 10s timeout — a
-        fork/exec that must not run on the event-loop thread curate() shares
+        fork/exec that must not run on the event-loop thread the curator shares
         with every other coroutine.
 
         Asserts thread identity rather than wall-clock timing: identity is
@@ -283,9 +285,9 @@ class TestMaybeFlagUnverifiedClaims:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Amendment: TestCurateBatchPreparedClaimVerificationPerformance
+# Amendment: TestCuratePreparedClaimVerificationPerformance
 #
-# Regression tests for the reviewer's performance finding: curate_batch_prepared
+# Regression tests for the reviewer's performance finding: curate_prepared
 # previously awaited _maybe_flag_unverified_claims SERIALLY per candidate, and
 # each call built its own probe (git-rooted, resolving the git top level) from
 # scratch. A batch with several attributed tokens — each a git-grep-then-pickaxe
@@ -299,8 +301,8 @@ _EMPTY_POOL_SIZES = {"anchor": 0, "module": 0, "embedding": 0, "dependency": 0}
 
 
 @pytest.mark.asyncio
-class TestCurateBatchPreparedClaimVerificationPerformance:
-    """Tests for curate_batch_prepared's claim-verification backstop block."""
+class TestCuratePreparedClaimVerificationPerformance:
+    """Tests for curate_prepared's claim-verification backstop block."""
 
     async def test_probe_built_once_per_batch_not_per_candidate(self, tmp_path):
         """The claim-verification probe is constructed ONCE for the whole
@@ -311,13 +313,15 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
 
         from fused_memory.middleware.curator_types import (
             CandidateTask,
-            CuratorDecision,
             PreparedCandidate,
         )
         from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=True)
-        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        curator = TaskCurator(
+            config=config, taskmaster=None, cwd=tmp_path,
+            invoke=AsyncMock(return_value=batch_create_result(3)),
+        )
 
         def _desc(n):
             return (
@@ -339,26 +343,14 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
             build_calls.append(repo_root)
             return lambda token: False
 
-        llm_decisions = [
-            CuratorDecision(
-                action="create", justification=f"c{n}",
-                pool_sizes=_EMPTY_POOL_SIZES, latency_ms=0,
-            )
-            for n in range(3)
-        ]
-
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
-            return llm_decisions
-
         with (
             patch(
                 "fused_memory.middleware.task_curator."
                 "make_source_and_history_probe",
                 side_effect=fake_make_probe,
             ),
-            patch.object(curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch),
         ):
-            await curator.curate_batch_prepared(
+            await curator.curate_prepared(
                 prepared, project_id="p", project_root=str(tmp_path),
             )
 
@@ -382,13 +374,15 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
 
         from fused_memory.middleware.curator_types import (
             CandidateTask,
-            CuratorDecision,
             PreparedCandidate,
         )
         from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=True)
-        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        curator = TaskCurator(
+            config=config, taskmaster=None, cwd=tmp_path,
+            invoke=AsyncMock(return_value=batch_create_result(4)),
+        )
 
         n = 4
         candidates = [
@@ -417,22 +411,10 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
             await asyncio.wait_for(all_started.wait(), timeout=1.0)
             return []
 
-        llm_decisions = [
-            CuratorDecision(
-                action="create", justification=f"c{i}",
-                pool_sizes=_EMPTY_POOL_SIZES, latency_ms=0,
-            )
-            for i in range(n)
-        ]
-
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
-            return llm_decisions
-
         with (
             patch.object(curator, "_maybe_flag_unverified_claims", side_effect=concurrent_flag),
-            patch.object(curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch),
         ):
-            await curator.curate_batch_prepared(
+            await curator.curate_prepared(
                 prepared, project_id="p", project_root=str(tmp_path),
             )
 
@@ -452,7 +434,7 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
 # single-candidate path) a `git rev-parse --show-toplevel` fork/exec that was
 # then discarded unused. Claim extraction (pure/sync/cheap — a regex scan, no
 # I/O) now runs FIRST and short-circuits before any probe is built, on both
-# the single-candidate path and curate_batch_prepared's batch-level
+# the single-candidate path and curate_prepared's batch-level
 # "does any candidate carry a claim" precheck.
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -484,22 +466,23 @@ class TestClaimExtractionSkipsUnneededProbeWork:
         assert result == []
 
     async def test_batch_probe_not_built_when_no_candidate_has_claims(self, tmp_path):
-        """Batch path: curate_batch_prepared's claim_probe precheck builds no
+        """Batch path: curate_prepared's claim_probe precheck builds no
         probe at all when NO candidate in the batch carries an attributed
-        claim — mirrors the single-candidate fix above (task_curator.py's
-        ``any_claims`` precheck in curate_batch_prepared's claim-verification
-        block)."""
+        claim — mirrors the single-candidate fix above (the ``any(...)``
+        precheck in task_curator.py::TaskCurator._flag_unverified_claims_of)."""
         from unittest.mock import patch
 
         from fused_memory.middleware.curator_types import (
             CandidateTask,
-            CuratorDecision,
             PreparedCandidate,
         )
         from fused_memory.middleware.task_curator import TaskCurator
 
         config = _make_config(recon_claim_verification_enabled=True)
-        curator = TaskCurator(config=config, taskmaster=None, cwd=tmp_path)
+        curator = TaskCurator(
+            config=config, taskmaster=None, cwd=tmp_path,
+            invoke=AsyncMock(return_value=batch_create_result(3)),
+        )
 
         candidates = [
             CandidateTask(title=f"T{i}", description=f"plain description {i}")
@@ -512,25 +495,13 @@ class TestClaimExtractionSkipsUnneededProbeWork:
             for c in candidates
         ]
 
-        llm_decisions = [
-            CuratorDecision(
-                action="create", justification=f"c{n}",
-                pool_sizes=_EMPTY_POOL_SIZES, latency_ms=0,
-            )
-            for n in range(3)
-        ]
-
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
-            return llm_decisions
-
         with (
             patch(
                 "fused_memory.middleware.task_curator."
                 "make_source_and_history_probe",
             ) as mock_make_probe,
-            patch.object(curator, "_call_llm_batch_with_fallback", side_effect=fake_llm_batch),
         ):
-            await curator.curate_batch_prepared(
+            await curator.curate_prepared(
                 prepared, project_id="p", project_root=str(tmp_path),
             )
 
@@ -587,7 +558,7 @@ class TestClaimVerificationGuardFailsOpen:
 
     async def test_probe_verification_failure_fails_open(self, tmp_path, caplog):
         """Probe VERIFICATION raising (the injected-probe branch — e.g.
-        curate_batch_prepared's shared batch probe, or a test double) is
+        curate_prepared's shared batch probe, or a test double) is
         caught, logged at WARNING, and returns [] rather than propagating."""
         from fused_memory.middleware.curator_types import CandidateTask
         from fused_memory.middleware.task_curator import TaskCurator

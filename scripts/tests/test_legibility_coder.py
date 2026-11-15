@@ -41,6 +41,9 @@ from quality_doc_texts import code_quality, definition_body, heuristic_headlines
 # census preflight (task 3645), and deriving from the one home means a CLI
 # rewording the markers stop covering turns THIS suite red too.
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, REAL_CLI_CAP_MESSAGES
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LIVE_CODEBOOK_PATH = _REPO_ROOT / "docs" / "legibility" / "confusion-codebook.yaml"
@@ -1450,8 +1453,12 @@ def test_code_digests_passes_the_slugs_to_every_prompt():
 
 @pytest.mark.parametrize(
     "definition_section",
-    ["## Definition\n\n", "## Renamed definition\n\nSome text.\n\n"],
-    ids=["emptied", "renamed"],
+    [
+        "## Definition\n\n",
+        "## Renamed definition\n\nSome text.\n\n",
+        "## Definition\n\nA literal { brace in the definition.\n\n",
+    ],
+    ids=["emptied", "renamed", "braced"],
 )
 def test_a_broken_quality_definition_fails_every_digest(
     tmp_path, monkeypatch, definition_section
@@ -1494,7 +1501,7 @@ def test_main_reads_the_slugs_from_the_project_root(tmp_path, pooled_main):
 
 def test_coder_runs_standalone_and_takes_a_project_root():
     """Outside pytest nothing else puts orchestrator/src on sys.path, so this
-    proves coder.py's own bootstrap resolves the code-quality slicer."""
+    proves coder.py's own bootstrap resolves the code-quality Definition accessor."""
     completed = subprocess.run(
         [sys.executable, str(_REPO_ROOT / "scripts" / "legibility" / "coder.py"), "--help"],
         cwd=_REPO_ROOT, capture_output=True, text=True,

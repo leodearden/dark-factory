@@ -370,11 +370,11 @@ def main() -> int:
 
     async def _run_live() -> int:
         nonlocal outcome
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.reconciliation.journal import (  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.reconciliation.journal import (
             ReconciliationJournal,
         )
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService
 
         # Backend construction is INSIDE the cleanup scope: a Qdrant/OpenAI
         # connect failure used to leave the already-opened journal unclosed and

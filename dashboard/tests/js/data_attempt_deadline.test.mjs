@@ -346,7 +346,7 @@ async function assertRecoversAfter(staleAnswer) {
   const { api, window: win } = loadDataJs();
   const state = api.createPollState();
   const failures = () => win.DF_DATA.__stale[TASKS_PATH].failures;
-  const notices = () => staleNoticesForTab({ tab: 'tasks', stale: win.DF_DATA.__stale, now: endpoint.now() });
+  const notices = () => staleNoticesForTab({ paths: [TASKS_PATH], stale: win.DF_DATA.__stale, now: endpoint.now() });
 
   Object.assign(endpoint.answer, staleAnswer);
   await attemptsQuietly(endpoint, api, state, STALE_FAILURE_THRESHOLD);

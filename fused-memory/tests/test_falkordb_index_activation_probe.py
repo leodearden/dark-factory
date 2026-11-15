@@ -19,7 +19,7 @@ from _falkor_index_doubles import LIVE_HEADER, rows_for
 from _fm_helpers import load_script_module
 
 from fused_memory.backends import falkor_indices
-from fused_memory.backends.falkor_indices import IndexHeaderShapeError, expected_index_set
+from fused_memory.backends.falkor_indices import expected_index_set
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'falkordb_index_activation_probe.py'
 
@@ -233,35 +233,7 @@ class TestBriefingVerdict:
 
 
 def _records(specs, *, header=LIVE_HEADER):
-    return _mod().index_records(header, rows_for(specs))
-
-
-class TestIndexRecords:
-    def test_maps_a_live_header_result_by_name(self):
-        expected = expected_index_set()
-
-        records = _records(expected)
-
-        assert records
-        for record in records:
-            assert set(record) == {'label', 'field', 'type', 'entity_type', 'status'}
-            assert record['entity_type'] in {'NODE', 'RELATIONSHIP'}
-            assert record['status'] == 'OPERATIONAL'
-        assert falkor_indices.normalize_index_records(records) == expected
-
-    def test_a_reordered_header_yields_the_same_records(self):
-        rows = rows_for(expected_index_set())
-        order = list(reversed(range(len(LIVE_HEADER))))
-        header = [LIVE_HEADER[i] for i in order]
-        reordered_rows = [[row[i] for i in order] for row in rows]
-
-        assert _mod().index_records(header, reordered_rows) == _mod().index_records(LIVE_HEADER, rows)
-
-    def test_a_header_without_status_raises(self):
-        header = [column for column in LIVE_HEADER if column[1] != 'status']
-
-        with pytest.raises(IndexHeaderShapeError):
-            _mod().index_records(header, [])
+    return falkor_indices.index_records_from_rows(header, rows_for(specs))
 
 
 class TestGraphIndexStatus:
@@ -403,7 +375,7 @@ class FakeReader:
     def ro_query(self, graph, cypher, params=None):
         self.calls.append((graph, cypher, params))
         mod = _mod()
-        if cypher == mod.INDEXES:
+        if cypher == falkor_indices.INDEX_CATALOG_QUERY:
             return mod.QueryRows(header=LIVE_HEADER, rows=rows_for(self.indexes[graph]))
         if cypher == mod.FULLTEXT:
             assert graph == 'dark_factory' and params is not None

@@ -1,0 +1,45 @@
+import os,re,time,collections,sys,bisect
+B='/home/leo/src/warm-lanes/base/target.gen.602'
+H=re.compile(r'-([0-9a-f]{16})$')
+for prof in ('debug','release'):
+    fp=f'{B}/{prof}/.fingerprint';deps=f'{B}/{prof}/deps'
+    units={}
+    for n in os.listdir(fp):
+        m=H.search(n)
+        if not m:continue
+        d=f'{fp}/{n}';lu=0;nf=0
+        try:
+            for e in os.scandir(d):
+                st=e.stat(follow_symlinks=False);lu=max(lu,st.st_atime,st.st_mtime);nf+=1
+        except OSError:pass
+        units[m[1]]=dict(name=n,lu=lu,nf=nf+1,ctime=os.stat(d).st_mtime,deps=0,dwo=0,bytes=0)
+    anchor=max(u['lu'] for u in units.values())
+    unowned=0;dwo_unowned=0;other=collections.Counter()
+    for e in os.scandir(deps):
+        if e.is_dir(follow_symlinks=False):other['dir']+=1;continue
+        st=e.stat(follow_symlinks=False)
+        nm=e.name
+        stem=nm.rsplit('.',1)[0] if '.' in nm else nm
+        m=H.search(stem)
+        isdwo=nm.endswith('.dwo')
+        if m and m[1] in units:
+            units[m[1]]['deps']+=1;units[m[1]]['bytes']+=st.st_size
+        else:
+            m2=re.search(r'-([0-9a-f]{16})\.',nm)
+            if m2 and m2[1] in units:
+                u=units[m2[1]];u['dwo' if isdwo else 'deps']+=1;u['bytes']+=st.st_size
+            else:
+                unowned+=1
+                if isdwo:dwo_unowned+=1
+    print(f'== {prof}: units={len(units)} anchor={time.strftime("%m-%d %H:%M",time.gmtime(anchor))} deps-files-unowned={unowned} (dwo {dwo_unowned}) dirs={other["dir"]}')
+    print('band(last_use, days before anchor): units fp_entries deps_files dwo bytes_GB  zero-deps-units')
+    for a,b in ((0,1),(1,3),(3,7),(7,14),(14,30),(30,60),(60,999)):
+        U=[u for u in units.values() if a*86400<=anchor-u['lu']<b*86400]
+        print(f'  [{a},{b}) {len(U)} {sum(u["nf"] for u in U)} {sum(u["deps"] for u in U)} {sum(u["dwo"] for u in U)} {sum(u["bytes"] for u in U)/1e9:.1f} {sum(1 for u in U if u["deps"]+u["dwo"]==0)}')
+    dead=[u for u in units.values() if anchor-u['lu']>=7*86400]
+    print('  dead>=7d entries',sum(u['nf']+u['deps']+u['dwo'] for u in dead),'of',sum(u['nf']+u['deps']+u['dwo'] for u in units.values()))
+    # reify-eval
+    c=collections.Counter()
+    for u in units.values():
+        c[(u['name'].rsplit('-',1)[0], anchor-u['lu']<7*86400)]+=1
+    print('  top live/dead',[(k,c[(k,True)],c[(k,False)]) for k,_ in collections.Counter({k[0]:v for k,v in c.items()}).most_common(8)])

@@ -26,7 +26,7 @@ plan), tickets would otherwise sit or terminalise silently in
 
 Routing parallels :mod:`curator_escalator`:
 
-* Per-project :class:`EscalationQueue` instances built lazily.
+* Each filing opens the project's :class:`EscalationQueue` inside its off-loop hop.
 * Orchestrator liveness via
   ``fused_memory/services/orchestrator_detector.py::is_orchestrator_lock_held``.
   No live orchestrator → log + retry on the next tick (failures stay flagged
@@ -142,6 +142,22 @@ def is_dedup_outage(health: DedupHealth, cfg: DedupOutageDetectorConfig) -> bool
     )
 
 
+def _file_janitor_escalation(
+    project_root: str, *, task_id: str, severity: str, category: str, summary: str, detail: str,
+) -> str:
+    """Open the project's queue, mint and durably submit one janitor record; blocking queue I/O, so callers run it off the loop."""
+    queue = EscalationQueue(escalation_queue_dir(project_root))
+    return queue.submit(Escalation(
+        id=queue.make_id('ticket-janitor'),
+        task_id=task_id,
+        agent_role='fused-memory/ticket-janitor',
+        severity=severity,
+        category=category,
+        summary=summary,
+        detail=detail,
+        level=1,
+    ))
+
 
 class TicketJanitor:
     """Periodic worker that escalates failed tickets to the orchestrator.
@@ -225,7 +241,6 @@ class TicketJanitor:
         # rolling-window cooldown. group_key is (project_id, task_id,
         # escalation_id). Reset on process restart by design.
         self._escalation_log: dict[tuple[str, str, str], list[float]] = defaultdict(list)
-        self._queues: dict[str, EscalationQueue] = {}
         if not TicketJanitor._registry_log_emitted:
             TicketJanitor._registry_log_emitted = True
             logger.info(
@@ -233,13 +248,6 @@ class TicketJanitor:
                 'restart to pick up DASHBOARD_KNOWN_PROJECT_ROOTS changes (task 1164)',
                 len(self._known_projects),
             )
-
-    def _queue_for(self, project_root: str) -> EscalationQueue:
-        q = self._queues.get(project_root)
-        if q is None:
-            q = EscalationQueue(escalation_queue_dir(project_root))
-            self._queues[project_root] = q
-        return q
 
     def _parse_candidate(self, row: dict) -> dict:
         """Extract the candidate metadata block, gracefully handling bad JSON.
@@ -319,28 +327,25 @@ class TicketJanitor:
             )
             return False
 
-        queue = self._queue_for(project_root)
-        escalation = Escalation(
-            id=queue.make_id('ticket-janitor'),
-            task_id=_ANCHOR_TASK_ID,
-            agent_role='fused-memory/ticket-janitor',
-            severity=severity,
-            category='infra_issue',
-            level=1,
-            summary=summary,
-            detail=detail,
-        )
         try:
-            queue.submit(escalation)
+            escalation_id = await asyncio.to_thread(
+                _file_janitor_escalation,
+                project_root,
+                task_id=_ANCHOR_TASK_ID,
+                severity=severity,
+                category='infra_issue',
+                summary=summary,
+                detail=detail,
+            )
         except Exception:
-            logger.warning(
+            logger.exception(
                 'ticket_janitor: failed to submit infra escalation for %s; '
                 'will retry next tick: %s', pid, summary,
             )
             return False
         logger.warning(
             'ticket_janitor: surfaced infra escalation %s for %s: %s',
-            escalation.id, pid, summary,
+            escalation_id, pid, summary,
         )
         return True
 
@@ -681,8 +686,6 @@ class TicketJanitor:
                     )
                 continue
 
-            # Build the escalation
-            queue = self._queue_for(project_root)
             detail_payload = []
             for row, cand in items:
                 detail_payload.append({
@@ -693,21 +696,19 @@ class TicketJanitor:
                     'created_at': row.get('created_at'),
                     'resolved_at': row.get('resolved_at'),
                 })
-            escalation = Escalation(
-                id=queue.make_id('ticket-janitor'),
-                task_id=task_id if task_id and task_id != '_unparseable_' else _ANCHOR_TASK_ID,
-                agent_role='fused-memory/ticket-janitor',
-                severity='info',
-                category='ticket_failure',
-                summary=(
-                    f'{len(items)} ticket(s) failed for task {task_id} '
-                    f'escalation {escalation_id}'
-                ),
-                detail=json.dumps(detail_payload, indent=2),
-                level=1,
-            )
             try:
-                queue.submit(escalation)
+                filed_id = await asyncio.to_thread(
+                    _file_janitor_escalation,
+                    project_root,
+                    task_id=task_id if task_id and task_id != '_unparseable_' else _ANCHOR_TASK_ID,
+                    severity='info',
+                    category='ticket_failure',
+                    summary=(
+                        f'{len(items)} ticket(s) failed for task {task_id} '
+                        f'escalation {escalation_id}'
+                    ),
+                    detail=json.dumps(detail_payload, indent=2),
+                )
             except Exception:
                 logger.exception(
                     'ticket_janitor: failed to submit escalation for group %s; '
@@ -730,7 +731,7 @@ class TicketJanitor:
             logger.info(
                 'ticket_janitor: queued escalation %s for project %s '
                 '(task=%s escalation=%s, %d ticket(s))',
-                escalation.id, project_id, task_id, escalation_id, len(items),
+                filed_id, project_id, task_id, escalation_id, len(items),
             )
 
     async def run_loop(self, interval_seconds: float) -> None:

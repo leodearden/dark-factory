@@ -33,16 +33,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _merge_lane_fakes import lane_scene_config, main_health_probe_spawned
 from _merge_lane_verifier_doubles import ScriptedVerifier
+from _merge_worker_drive import HEAVY_BARRIER_TEST_TIMEOUT, stop_merge_worker
 from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, wait_responsive
 from _verify_result_doubles import fake_verify_result
 
 # Reuse the γ harness two-host fakes (established cross-test-module import
 # pattern — see test_concurrent_verify_boundary.py / test_merge_speculation.py).
 from test_merge_queue_concurrent_verify import (
-    HEAVY_BARRIER_TEST_TIMEOUT,
     _gated_runner,
     _inject_two_host_allocator,
-    _stop_worker,
 )
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -944,13 +943,13 @@ class TestCascadeErrorChokepoint:
         # ── Inject killer: _remerge raises RuntimeError for req_b's task_id ─
         _original_remerge = worker._remerge
 
-        async def _killer_remerge(req: Any, started_mono: Any) -> Any:
+        async def _killer_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             if req.task_id == 'rrcas-b':
                 raise RuntimeError(
                     'Failed to create merge worktree: '
                     '/repo/.worktrees/rrcas-b No space left on device'
                 )
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _killer_remerge  # type: ignore[method-assign]
 
@@ -1023,7 +1022,7 @@ class TestCascadeErrorChokepoint:
                 label='rrcas-c: MergeOutcome (loop-survival signal)',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # ── Loop survives + offending req blocked (pre-existing 1856 guard) ──
         assert outcome_c.status == 'done', (
@@ -1159,13 +1158,13 @@ class TestCascadeErrorChokepoint:
         # ── Inject killer: _remerge raises RuntimeError for req_b's task_id ─
         _original_remerge = worker._remerge
 
-        async def _killer_remerge(req: Any, started_mono: Any) -> Any:
+        async def _killer_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             if req.task_id == 'rrcdc-b':
                 raise RuntimeError(
                     'Failed to create merge worktree: '
                     '/repo/.worktrees/rrcdc-b No space left on device'
                 )
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _killer_remerge  # type: ignore[method-assign]
 
@@ -1244,7 +1243,7 @@ class TestCascadeErrorChokepoint:
                 label='rrcdc-c: MergeOutcome (loop-survival signal)',
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         # ── Loop survives + offending req blocked (pre-existing 1856 guard) ──
         assert outcome_c.status == 'done', (
@@ -1406,7 +1405,7 @@ class TestCascadeErrorChokepoint:
                 f'got {slot_now!r}.'
             )
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert outcome_c.status == 'done', (
             f'Expected req_c to resolve "done" (loop survived cascade error), '
@@ -1511,9 +1510,9 @@ class TestCascadeErrorChokepoint:
         _original_remerge = worker._remerge
         remerge_task_ids: list[str] = []
 
-        async def _spy_remerge(req: Any, started_mono: Any) -> Any:
+        async def _spy_remerge(req: Any, started_mono: Any, claim: Any = None) -> Any:
             remerge_task_ids.append(req.task_id)
-            return await _original_remerge(req, started_mono)
+            return await _original_remerge(req, started_mono, claim=claim)
 
         worker._remerge = _spy_remerge  # type: ignore[method-assign]
 
@@ -1543,7 +1542,7 @@ class TestCascadeErrorChokepoint:
             gate_a_release.set()
             gate_b_release.set()
         finally:
-            await _stop_worker(worker, worker_task)
+            await stop_merge_worker(worker, worker_task)
 
         assert req_a.result.done(), 'req_a.result should be resolved by stop()'
         assert req_b.result.done(), 'req_b.result should be resolved by stop()'

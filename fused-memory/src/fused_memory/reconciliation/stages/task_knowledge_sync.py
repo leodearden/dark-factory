@@ -18,14 +18,15 @@ if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.services.memory_service import MemoryService
 
+from shared.elision import elide_at_word
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
+from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 
 from fused_memory.backends.task_backend_errors import (
     DuplicateCandidateKeyError,
     LeakedEnvelopeMarkupError,
 )
 from fused_memory.middleware.task_creation_journal import read_run_creation_outcomes
-from fused_memory.middleware.task_interceptor import TERMINAL_STATUSES
 from fused_memory.models.reconciliation import (
     ReconciliationEvent,
     StageId,
@@ -46,14 +47,16 @@ from fused_memory.reconciliation.cli_stage_runner import (
 from fused_memory.reconciliation.cross_run_citation_scan import scan_cross_run_citations
 from fused_memory.reconciliation.dangling_citation import build_dangling_citation_finding
 from fused_memory.reconciliation.flag_dedup import (
-    _content_fingerprint,
-    _normalize_content_description,
     acknowledge_resolved_flags,
-    compute_flag_signature,
     filter_blocked_snapshot_findings,
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
     filter_snapshot_stat_edge_findings,
+)
+from fused_memory.reconciliation.flag_identity import (
+    compute_flag_signature,
+    content_fingerprint,
+    normalize_description,
 )
 from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_MARKER_KIND
 from fused_memory.reconciliation.known_projects_section import render_known_projects_section
@@ -61,6 +64,7 @@ from fused_memory.reconciliation.live_workflow_section import (
     render_live_workflow_section,
 )
 from fused_memory.reconciliation.mem0_tombstone import (
+    is_foreign_kind_record,
     is_protected_audit_record,
     is_protected_mirror_record,
     record_mem0_deletion_tombstones,
@@ -1198,13 +1202,7 @@ class _TasklessRetirement(NamedTuple):
     marker_kind: str
 
     def permits(self, metadata, created_at: datetime, now: datetime) -> bool:
-        # The kind arm mirrors
-        # fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason (task 5286);
-        # == rather than set membership, so an unhashable kind cannot raise.
-        if not isinstance(metadata, dict):
-            return False
-        kind = metadata.get('kind')
-        if kind is not None and kind != self.marker_kind:
+        if not isinstance(metadata, dict) or is_foreign_kind_record(metadata, self.marker_kind):
             return False
         return created_at < now - timedelta(days=self.max_age_days)
 
@@ -1243,6 +1241,41 @@ def _closure_permits_retirement(
     )
 
 
+def _warn_retained_by_kind(
+    log_name: str,
+    source: str,
+    *,
+    cohort: str,
+    count: int,
+    kinds: set[str],
+    disposition: str,
+    project_id: str,
+    run_id: str,
+) -> None:
+    """Emit one aggregate WARNING for a *cohort* of records a sweep kept.
+
+    Carries the distinct *kinds* because they are the actionable part: they
+    name the vocabulary the pool filter collided with. Fail-safe: it never
+    raises into the sweep and never alters the sweep's count.
+    """
+    try:
+        logger.warning(
+            'reconciliation.%s: RETAINED %d %s (kinds=%s) matched by this %s pool '
+            'filter — %s Per-record ids are logged at DEBUG.',
+            log_name, count, cohort, ','.join(sorted(kinds)) or '<none>', source,
+            disposition,
+            extra={'project_id': project_id, 'run_id': run_id, 'log_name': log_name},
+        )
+    except Exception:
+        logger.warning(
+            'reconciliation.%s: %s diagnostic raised; skipping (fail-safe, does '
+            'not affect the sweep count).',
+            log_name, cohort,
+            exc_info=True,
+            extra={'project_id': project_id, 'run_id': run_id},
+        )
+
+
 async def _sweep_stale_mem0_pool(
     memory_service,
     project_id: str,
@@ -1258,6 +1291,7 @@ async def _sweep_stale_mem0_pool(
     enum_filters: dict | Sequence[dict] | None = None,
     terminal_task_ids: Collection[str] | None = None,
     taskless_retirement: _TasklessRetirement | None = None,
+    pool_kind: str | None = None,
 ) -> int:
     """Shared age-GC skeleton for a single-source Mem0 marker pool.
 
@@ -1335,9 +1369,10 @@ async def _sweep_stale_mem0_pool(
     The ``None``-vs-``[]`` sentinel is load-bearing:
 
     - ``None`` (the default) means "NO gate requested" and leaves this
-      skeleton byte-for-byte as it was for the two age-only callers
-      (:func:`_sweep_stale_persistence_markers`,
-      :func:`_sweep_stale_mem0_flag_markers`), which are age-only by design.
+      skeleton byte-for-byte as it was for the two age-based callers with no
+      closure gate (:func:`_sweep_stale_persistence_markers`,
+      :func:`_sweep_stale_mem0_flag_markers`; the latter also withholds
+      foreign kinds through *pool_kind*).
     - An EMPTY collection means "gate active, nothing is terminal" and
       therefore retires no task-citing member this cycle.
       :func:`_resolve_terminal_task_ids` is explicitly fail-safe to ``[]`` on
@@ -1472,6 +1507,13 @@ async def _sweep_stale_mem0_pool(
             (default) keeps every such member. Has no effect when
             *terminal_task_ids* is ``None``, because then every age-stale
             member is already eligible.
+        pool_kind: Opt-in pool-membership arm (task 6241). When given, a
+            member for which
+            :func:`~fused_memory.reconciliation.mem0_tombstone.is_foreign_kind_record`
+            holds is kept at any age, checked after the two protected-record
+            guards and before the age test, and reported in one aggregate
+            WARNING per sweep. ``None`` (default) skips the arm, for a pool
+            whose filter is wide by design.
 
     Returns:
         Number of memories successfully deleted (0 if nothing is stale, on
@@ -1658,6 +1700,8 @@ async def _sweep_stale_mem0_pool(
     # to avoid. The per-member detail is not lost, only demoted to DEBUG.
     protected_audit = 0
     protected_audit_kinds: set[str] = set()
+    foreign_kind = 0
+    foreign_kinds: set[str] = set()
     for member in members:
         mid = member.get('id')
         if not mid:
@@ -1721,6 +1765,23 @@ async def _sweep_stale_mem0_pool(
             )
             continue
 
+        if pool_kind is not None and is_foreign_kind_record(member_metadata, pool_kind):
+            kind = member_metadata.get('kind')
+            foreign_kind += 1
+            foreign_kinds.add(kind if isinstance(kind, str) else repr(kind))
+            logger.debug(
+                'reconciliation.%s: SKIPPING foreign-kind record memory_id=%s '
+                '(kind=%r) — not a member of this pool (task 6241).',
+                log_name, mid, kind,
+                extra={
+                    'project_id': project_id,
+                    'memory_id': mid,
+                    'run_id': run_id,
+                    'log_name': log_name,
+                },
+            )
+            continue
+
         raw = member.get('created_at')
         if raw is None:
             continue
@@ -1758,37 +1819,36 @@ async def _sweep_stale_mem0_pool(
             stale_members.append(member)
 
     if protected_audit > 0:
-        # Protected-audit-record diagnostic (task 4375 amendment pass). Same
-        # shape and same fail-safe wrapper as the two other aggregate
-        # diagnostics in this function: emitted ONCE per sweep, purely
-        # informational, and it must never alter `members` or the returned
-        # count. The distinct kinds are carried because they are the actionable
-        # part — they say WHICH audit vocabulary this pool's filter is
-        # colliding with, which is what a filter fix would have to target.
-        try:
-            logger.warning(
-                'reconciliation.%s: RETAINED %d protected audit record(s) '
-                '(kinds=%s) matched by this %s pool filter — deliberately-'
-                'permanent audit-log records, kept regardless of age (task '
-                '4375). Expected and recurring: this pool filter is wide by '
-                'design, so a steady count here is healthy, not a failure. '
-                'Per-record ids are logged at DEBUG.',
-                log_name, protected_audit,
-                ','.join(sorted(protected_audit_kinds)) or '<none>', source,
-                extra={
-                    'project_id': project_id,
-                    'run_id': run_id,
-                    'log_name': log_name,
-                },
-            )
-        except Exception:
-            logger.warning(
-                'reconciliation.%s: protected-audit-record diagnostic raised; '
-                'skipping (fail-safe, does not affect the sweep count).',
-                log_name,
-                exc_info=True,
-                extra={'project_id': project_id, 'run_id': run_id},
-            )
+        _warn_retained_by_kind(
+            log_name, source,
+            cohort='protected audit record(s)',
+            count=protected_audit,
+            kinds=protected_audit_kinds,
+            disposition=(
+                'deliberately-permanent audit-log records, kept regardless of '
+                'age (task 4375). Expected and recurring: this pool filter is '
+                'wide by design, so a steady count here is healthy, not a '
+                'failure.'
+            ),
+            project_id=project_id,
+            run_id=run_id,
+        )
+
+    if foreign_kind > 0:
+        _warn_retained_by_kind(
+            log_name, source,
+            cohort='record(s) declaring a foreign kind',
+            count=foreign_kind,
+            kinds=foreign_kinds,
+            disposition=(
+                'not members of this pool, never deleted by this sweep (task '
+                '6241). Each stays until removed by hand: delete a dead record '
+                'with the fused-memory MCP delete_memory tool, or register a '
+                'permanent audit kind in mem0_tombstone.PROTECTED_AUDIT_KINDS.'
+            ),
+            project_id=project_id,
+            run_id=run_id,
+        )
 
     if retained_unclosed > 0:
         # Retained-unclosed diagnostic (task 4375). The gate's KEEP direction
@@ -2019,6 +2079,13 @@ async def _sweep_stale_mem0_flag_markers(
     :func:`_sweep_stale_mem0_pool`'s docstring for the full all-variants-zero
     rule and why this is safe to fail open.
 
+    Withholds foreign-kind records (task 6241): a member declaring a ``kind``
+    other than ``stage1_flag_marker`` belongs to another pool and is kept at
+    any age, with one WARNING per sweep, so this collector and
+    ``fused-memory/scripts/sweep_orphan_flag_markers.py`` agree on what the
+    pool is. The decision and its accepted cost are recorded in
+    ``docs/flag-marker-sweep-recurring.md``.
+
     Args:
         memory_service: Service with ``get_memories_by_metadata``,
             ``delete_memory``, and ``count_memories_by_metadata``.
@@ -2047,6 +2114,7 @@ async def _sweep_stale_mem0_flag_markers(
         scroll_limit=scroll_limit,
         count_short_circuit=True,
         enum_filters=_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS,
+        pool_kind=_STAGE1_FLAG_MARKER_MEM0_SOURCE,
     )
 
 
@@ -3449,7 +3517,6 @@ class TaskKnowledgeSync(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
         """Capture run_id, run briefing-refresh hook, delegate to BaseStage.run(), then
         apply the same-run Stage 1 human_operator_required dedup post-processor.
@@ -3485,7 +3552,6 @@ class TaskKnowledgeSync(BaseStage):
         await self._maybe_queue_briefing_refresh_tasks(run_id=run_id)
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
-            resume_session_id=resume_session_id,
         )
 
         # --- missing-run_id marker stat (task 1257) ---
@@ -3765,7 +3831,7 @@ class TaskKnowledgeSync(BaseStage):
         # cycle, per-project, alongside the three sibling GC passes; explicit
         # value so downstream consumers never need a .get(..., 0) fallback.
         #
-        # Unlike the two age-only sibling sweeps above, retirement here is
+        # Unlike the two age-based sibling sweeps above, retirement here is
         # composite and gated on the terminal ids hoisted above (tasks 4375,
         # 4995); _sweep_stale_mem0_flag_for_stage2_markers' docstring owns the rule.
         report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] = (
@@ -4581,7 +4647,6 @@ class IntegrityCheck(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
         """Execute Stage 3 and post-process with task-dump spot-check.
 
@@ -4616,7 +4681,6 @@ class IntegrityCheck(BaseStage):
         """
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
-            resume_session_id=resume_session_id,
         )
 
         # Layer 3 (finding-side) gate for blocked-snapshot false positives.
@@ -4830,16 +4894,12 @@ def _flag_content_fingerprint(item: dict) -> str | None:
     polled recon_report_systemic finding (keyed on ``description``).
 
     Deliberately NOT a call site of
-    :func:`~fused_memory.reconciliation.flag_dedup.compute_content_fingerprint_signature`:
+    :func:`~fused_memory.reconciliation.flag_identity.compute_content_fingerprint_signature`:
     that helper is gated on ``task_id``/``cited_tasks`` being absent and
     returns a ``(fp, flag_type)`` tuple for marker write/match in
     ``dedup_flags``, whereas this helper is ungated (any item with non-blank
     text qualifies, regardless of task_id) and returns the bare ``fp`` for a
-    same-cycle payload-assembly join. Both delegate to the same underlying
-    :func:`~fused_memory.reconciliation.flag_dedup._content_fingerprint` /
-    :func:`~fused_memory.reconciliation.flag_dedup._normalize_content_description`
-    primitives — if that normalization contract ever changes, cross-check
-    both call sites so the two dedup keys don't silently drift apart.
+    same-cycle payload-assembly join.
 
     Text is read as ``item.get('content') or item.get('description') or ''``
     so either field name resolves to the same fingerprint for identical text
@@ -4852,9 +4912,7 @@ def _flag_content_fingerprint(item: dict) -> str | None:
     Pure, sync, no I/O.
     """
     text = str(item.get('content') or item.get('description') or '')
-    if not _normalize_content_description(text):
-        return None
-    return _content_fingerprint(text)
+    return content_fingerprint(text) if normalize_description(text) else None
 
 
 def _format_flagged(
@@ -4875,9 +4933,11 @@ def _format_flagged(
     stage-specific shortfall warning.
 
     Edge case: if the very first item's JSON alone exceeds *budget_chars*, a
-    truncated fragment is always rendered (with a ``… [item truncated]`` marker)
-    so the LLM receives at least some signal rather than an opaque footer-only
-    body.  ``rendered`` stays 0 (the fragment is not a full render) and the
+    truncated fragment is always rendered so the LLM receives at least some
+    signal rather than an opaque footer-only body.  The fragment is cut by
+    ``shared/elision.py::elide_at_word``, whose counted marker keeps the line
+    within *budget_chars*; a budget too small to hold that marker raises its
+    ``ValueError``.  ``rendered`` stays 0 (the fragment is not a full render) and the
     warning's ``extra`` includes ``first_item_fragmented=True`` so
     callers/telemetry can distinguish fragmented-first-item from all-dropped.
     """
@@ -4897,11 +4957,8 @@ def _format_flagged(
                 # First item alone exceeds the budget.  Always show at least a
                 # truncated fragment so the LLM has some signal rather than an
                 # opaque footer-only body.
-                marker = '… [item truncated]'
-                available = budget_chars - len('- ') - len(marker)
-                if available > 0:
-                    lines.append(f'- {json_str[:available]}{marker}')
-                    first_item_fragmented = True
+                lines.append(f'- {elide_at_word(json_str, budget_chars - len("- "))}')
+                first_item_fragmented = True
             dropped = len(items) - idx
             # Footer shows only items that are completely absent (not the
             # fragmented first item, which already appears as a truncated line).
@@ -5146,7 +5203,7 @@ def _select_proactive_sample(tasks: Iterable[dict], n: int) -> list[dict]:
     filter_task_tree already pre-validates to be dict-only.
     """
     # Import from task_filter — the single source of truth for status priority
-    from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY  # noqa: PLC0415
+    from fused_memory.reconciliation.task_filter import _STATUS_PRIORITY
 
     def sort_key(t: dict) -> tuple[int, int]:
         status = t.get('status', 'pending')

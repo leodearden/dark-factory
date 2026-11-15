@@ -20,10 +20,12 @@ helper that does nothing.
 Everything under test here is driven by SYNTHETIC fixtures — string literals
 and synthetic ``AgentRole`` mappings — never by a real prompt constant, except
 ``GREP_LOOKAROUND_GUIDANCE`` from ``harness_guidance.py``, imported only as the
-opaque landmark the preamble-tail order check anchors on and never asserted on. This
-file tests the HELPER; whether the real prompts satisfy the contract is the
-consumer modules' job, and duplicating that here would recreate the very clone
-this task is closing.
+opaque landmark the preamble-tail order check anchors on and never asserted on. One
+test also reads the real ``ROLES``, through ``UNPINNED_ROLES``: that derived set is
+the helper's own export, so it is pinned non-empty once here and no consumer
+re-asserts it. This file tests the HELPER; whether the real prompts satisfy the
+contract is the consumer modules' job, and duplicating that here would recreate
+the very clone this task is closing.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ import pytest
 from _role_splice_contract import (
     BASH_CAPABLE_UNPINNED_ROLES,
     MARKDOWN_HEADING,
+    UNPINNED_ROLES,
     PreambleTailBlock,
     PreambleTailContractTests,
     SpliceContract,
@@ -357,6 +360,20 @@ def test_bash_capable_unpinned_contract_fires_when_a_role_gains_bash() -> None:
     assert "gained=['gamma']" in message
     assert 'BASH_CAPABLE_UNPINNED_ROLES' in message
     assert _REMEDY in message
+
+
+def test_unpinned_role_set_is_nonempty() -> None:
+    """No consumer splice test over `UNPINNED_ROLES` can pass vacuously over an emptied derivation.
+
+    `READ_ONLY_UNPINNED_ROLES` is deliberately not required non-empty: it
+    empties legitimately if `judge` ever gains unqualified `Bash`, and
+    test_roles_grep_lookaround.py's own tripwire fires for that change.
+    """
+    assert UNPINNED_ROLES, (
+        'No role has a literal system_prompt, so every consumer splice test over '
+        'UNPINNED_ROLES passes over an empty set. Check the `prompt_spec is None` '
+        'derivation in _role_splice_contract.py.'
+    )
 
 
 def test_every_role_carries_passes_when_the_whole_set_carries_the_constant() -> None:

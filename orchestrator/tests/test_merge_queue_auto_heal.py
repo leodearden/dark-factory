@@ -20,7 +20,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeClock, FakeVerifier
+from _merge_lane_fakes import FakeClock, FakeVerifier, lane_scene_config
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
@@ -78,15 +78,15 @@ def _make_mock_git_ops(project_root: Path | None = None) -> MagicMock:
 
 
 def _make_config(tmp_path: Path) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        project_root=tmp_path,
-        max_concurrent_tasks=1,
-        git=GitConfig(
+    return lane_scene_config(
+        tmp_path,
+        GitConfig(
             main_branch='main',
             branch_prefix='task/',
             remote='origin',
             worktree_dir='.worktrees',
         ),
+        max_concurrent_tasks=1,
     )
 
 
@@ -368,7 +368,7 @@ class TestMergeRequestLaneWiring:
 
         workflow._write_merge_failure_review = MagicMock()
 
-        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
+        with patch('orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue):
             asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=False)
             )
@@ -531,7 +531,7 @@ class TestSubmitToMergeQueueRoutesAutoHeal:
         async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
             request.result.set_result(outcome)
 
-        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
+        with patch('orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
             )
@@ -566,7 +566,7 @@ class TestSubmitToMergeQueueRoutesAutoHeal:
         async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
             request.result.set_result(generic_outcome)
 
-        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
+        with patch('orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=False)
             )
@@ -769,7 +769,7 @@ class TestAutoHealOwnerTiedResume:
         workflow = _make_workflow(config, worktree)
         workflow.merge_queue = asyncio.Queue()
 
-        # Use a REAL lane so _WipHaltMixin state is exercised, with the ports
+        # Use a REAL lane so its real halt state is exercised, with the ports
         # faked: nothing in this scene may reach a real verify or a real clock.
         git_ops = _make_mock_git_ops(tmp_path)
         real_worker = MergeLane(
@@ -982,7 +982,7 @@ class TestAutoHealHaltOwnerIsDedupeParent:
         workflow = _make_workflow(config, worktree)
         workflow.merge_queue = asyncio.Queue()
 
-        # Use a REAL lane so _WipHaltMixin lane-owner state is exercised, with
+        # Use a REAL lane so its real lane-owner state is exercised, with
         # the ports faked: nothing here may reach a real verify or a real clock.
         git_ops = _make_mock_git_ops(tmp_path)
         real_worker = MergeLane(
@@ -1248,7 +1248,7 @@ class TestAutoHealHaltOwnerSurvivesOwnBlock:
         async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
             request.result.set_result(outcome)
 
-        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
+        with patch('orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue):
             asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
             )

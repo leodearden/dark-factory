@@ -82,7 +82,6 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -90,6 +89,7 @@ from typing import TYPE_CHECKING
 from escalation.pins import classify_pins
 from pydantic import ValidationError
 from shared.deploy_state import DeployPhase, DeployState
+from shared.proc_liveness import pid_alive
 from shared.task_claimant import (
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     compose_claimant_run_id,
@@ -333,33 +333,6 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def _pid_alive(pid: int) -> bool:
-    """Return True if the process identified by *pid* is alive.
-
-    Duplicates ``orchestrator.harness._pid_alive`` (itself mirroring
-    fused-memory's ``orchestrator_detector.py:58-72``) rather than importing
-    it, to avoid a harness->task_ground_truth->harness circular import once
-    θ2 migrates the harness's reconcile sweeps to call derive_truth/
-    recovery_for.
-
-    - Returns False for pid <= 0 (invalid).
-    - Uses os.kill(pid, 0): success → alive; ProcessLookupError → dead;
-      PermissionError → alive (we can see it but lack permission to signal it);
-      other OSError → treat as dead.
-    """
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
 def _known_str(value: object) -> str | None:
     """Return *value* VERBATIM if it is a non-blank ``str``, else ``None``.
 
@@ -374,6 +347,26 @@ def _known_str(value: object) -> str | None:
     stamp built from those same components.
     """
     return value if isinstance(value, str) and value.strip() else None
+
+
+def _parse_owner_pid(raw: object) -> int | None:
+    """Parse a plan.lock ``owner_pid`` into an int, or ``None`` when malformed.
+
+    A bool is rejected before any int() conversion: ``int(True) == 1`` would
+    turn a JSON ``true`` into pid 1 (init), a phantom live claimant.  A str is
+    accepted, so a zero-padded ``'00123'`` parses to the int the composed
+    identity must embed.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+    return None
 
 
 def _lock_fresh(locked_at: object, now: datetime, ttl: timedelta) -> bool:
@@ -617,9 +610,9 @@ class TaskGroundTruth:
         *worktree_path* is :meth:`derive_truth`'s single
         ``worktree_resolver(tid)`` resolution (also shared with
         ``worktree_present``, review finding #2) — this method makes no I/O
-        of its own beyond the plan.lock read, which is addressed at
-        *worktree_path*'s ``.task-meta`` SIBLING, not inside it (task 4028;
-        see the comment on that leg below).
+        of its own beyond the plan.lock read, which is addressed at *tid*'s
+        own ``.task-meta/task-<tid>`` root beside *worktree_path* (see the
+        comment on that leg below).
         """
         if self.scheduler.is_actively_held(tid):
             return Claimant(run_id=None, heartbeat_at=None, source=ClaimantSource.IN_MEMORY)
@@ -634,42 +627,36 @@ class TaskGroundTruth:
                 source=ClaimantSource.DB,
             )
 
-        # Addressed at the ``.task-meta`` SIBLING — where the lock's sole
-        # writer puts it (``TaskWorkflow`` builds its ``TaskArtifacts`` with
-        # ``_meta_root_for_worktree(self.worktree)``, workflow.py) — via
-        # ``meta_root_for``, the single owner of that path shape, so neither
-        # side hand-joins ``.task-meta`` (task 4028).
+        # Addressed at the task's own root, ``.task-meta/task-<tid>`` — where
+        # the lock's sole writer puts it (plan.lock is task-scoped in
+        # ``ARTIFACT_ROOTS``, and ``TaskWorkflow._artifact_roots`` hands every
+        # dispatch that root) — via ``TaskArtifacts.for_task``, so neither side
+        # hand-joins ``.task-meta`` (tasks 4028, 3155).
         #
-        # Deliberately NO legacy fallback: nothing has written
-        # ``<worktree>/.task/plan.lock`` since the meta-root migration, so a
-        # new-then-old read (as in ``Harness._resolve_recovery_artifact``)
-        # would be dead code on arrival, and any legacy lock still on disk
-        # necessarily predates that migration and so fails ``_lock_fresh``
-        # below anyway. Pinned by
-        # ``TestPlanLockIsReadFromTheMetaRoot::test_lock_at_the_legacy_root_is_ignored``.
+        # Deliberately NO fallback to the lane root ``.task-meta/<name>`` or
+        # the legacy ``<worktree>/.task``: nothing writes a lock there any
+        # more, so a new-then-old read would be dead code on arrival (PRD
+        # ``plans/task-meta-task-keying-prd.md`` decision 7), and a lock still
+        # sitting at either address predates the move and so fails
+        # ``_lock_fresh`` below anyway. Pinned by
+        # ``test_task_ground_truth.py::TestPlanLockIsReadFromTheTaskRoot``.
         #
         # ATTRIBUTION IS BY ADDRESS, NOT BY SESSION IDENTITY: any fresh,
-        # live-pid lock at this task's resolved meta root is taken to be
-        # *tid*'s, WITHOUT checking that ``session_id`` carries the
-        # ``'{tid}-'`` prefix ``clear_stale_plan_lock`` keys on.  Deliberate,
-        # and deliberately not symmetric with that method:
+        # live-pid lock at this task's root is taken to be *tid*'s, WITHOUT
+        # checking that ``session_id`` carries the ``'{tid}-'`` prefix
+        # ``clear_stale_plan_lock`` keys on.  Deliberate, and deliberately not
+        # symmetric with that method:
         #   * The dominant stale-lock case is a crashed PRIOR incarnation of
-        #     the SAME task (a same-task lane reuse preserves the meta root
-        #     precisely because those artifacts are the task's own), and it
-        #     carries a MATCHING prefix — so a prefix gate would not catch
-        #     the case that actually happens.
-        #   * The cross-task case a gate WOULD catch — a warm lane's meta
-        #     root outliving its previous occupant, since it is a sibling of
-        #     the worktree and survives cleanup — is already cleared on every
-        #     different-task acquisition route by
-        #     ``GitOps._clear_foreign_meta_root`` (RECYCLE /
-        #     RESET_IN_PLACE_REATTACH / CREATE_ONCE_FRESH /
-        #     CREATE_ONCE_REATTACH).
+        #     the SAME task, and it carries a MATCHING prefix — so a prefix
+        #     gate would not catch the case that actually happens.
+        #   * The root is keyed by task id, so no lane lifecycle can leave
+        #     another task's lock there; a gate would guard only against a
+        #     writer bug.
         #   * A gate would fail DANGEROUS. Rejecting a lock this resolver
         #     cannot positively attribute makes a LIVE task read as
         #     unclaimed, which is the task-2588 un-claim incident class.
         #     Mis-attributing the other way only DELAYS recovery.
-        # What bounds that delay is ``_lock_fresh`` alone, not ``_pid_alive``:
+        # What bounds that delay is ``_lock_fresh`` alone, not ``pid_alive``:
         # ``owner_pid`` is the ORCHESTRATOR's pid, which outlives any single
         # task, so the liveness half is nearly always true. Freshness caps the
         # exposure at ``heartbeat_ttl`` — a window in which the harness's R3
@@ -677,12 +664,17 @@ class TaskGroundTruth:
         # recovery mid-run. Pinned (both the attribution and its freshness
         # bound) by test_task_ground_truth.py::TestPlanLockAttributionIsByAddress.
         #
-        # Derived OUTSIDE the try: this is pure path algebra with no I/O, and
-        # must not be swallowed by the degradation arm below, which exists for
-        # a corrupt lock FILE — not for a mis-derived root.
-        meta_root = TaskArtifacts.meta_root_for(worktree_path.parent, worktree_path.name)
+        # Derived OUTSIDE the corrupt-file try below: an id ``task_root_for``
+        # refuses is an unaddressable task, not a corrupt lock FILE. It has no
+        # lock to read, so it degrades to "no plan-lock claimant" on its own
+        # arm rather than aborting the sweep.
         try:
-            lock_data = TaskArtifacts(worktree_path, meta_root).read_plan_lock()
+            artifacts = TaskArtifacts.for_task(worktree_path, tid)
+        except ValueError:
+            logger.warning('No plan-lock claimant for unaddressable task id %r', tid)
+            return None
+        try:
+            lock_data = artifacts.read_plan_lock()
         except (ValueError, OSError):
             # A truncated/corrupt plan.lock is a realistic outcome of the
             # very crash this resolver recovers from — degrade to "no
@@ -712,18 +704,12 @@ class TaskGroundTruth:
         # test_vestigial_worktree_lock_is_inert_and_unlinked, which is what it
         # always actually pinned, task 4028).
         if isinstance(lock_data, dict):
-            owner_pid = lock_data.get('owner_pid')
             # Retain the PARSED pid: the composed identity below must embed the
             # same int this liveness check validated, not a re-parse of the raw
             # value (which could be e.g. the string '123', composing a
             # different byte sequence than the DB stamp's int).
-            parsed_pid: int | None = None
-            try:
-                parsed_pid = None if owner_pid is None else int(owner_pid)
-                owner_alive = parsed_pid is not None and _pid_alive(parsed_pid)
-            except (TypeError, ValueError):
-                parsed_pid = None
-                owner_alive = False
+            parsed_pid = _parse_owner_pid(lock_data.get('owner_pid'))
+            owner_alive = pid_alive(parsed_pid)
             lock_fresh = _lock_fresh(lock_data.get('locked_at'), self.now_fn(), self.heartbeat_ttl)
             if owner_alive and lock_fresh:
                 # Compose ONLY when every component is known and well-formed;

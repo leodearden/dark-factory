@@ -13,9 +13,11 @@ always loses to an existing ``config.prices`` entry).
 
 import logging
 import os
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 
 from orchestrator.config import default_price_table
+from orchestrator.implementer_brief_variant import ImplementerBriefVariant
 from orchestrator.shadow_types import CostBasis
 
 from .metrics import CANDIDATE_ROLES, RoleUnderTest
@@ -28,7 +30,7 @@ class EvalConfig:
     """One model/backend configuration for evaluation."""
 
     name: str
-    backend: str          # 'claude' | 'codex' | 'gemini'
+    backend: str          # 'claude' | 'codex' | 'gemini' | 'pi' | 'zcode' | 'mimo'
     model: str            # model name for that backend
     effort: str | None    # backend-specific effort/reasoning level
     # Which ROLE this candidate puts under test (eval-revival θ / C4 OFAT
@@ -40,6 +42,9 @@ class EvalConfig:
     role: RoleUnderTest = RoleUnderTest.IMPLEMENTER
     max_budget_usd: float = 20.0
     env_overrides: dict[str, str] = field(default_factory=dict)
+    # The implementer brief variant this candidate runs under; becomes the
+    # cell's OrchestratorConfig.implementer_brief_variant (task 5385).
+    harness_variant: ImplementerBriefVariant = ImplementerBriefVariant.WHOLE_PLAN
     # vLLM-only pod fields (None / 0 for non-vllm or workstation configs)
     image: str | None = None              # Docker image tag
     gpu_type: str | None = None           # RunPod GPU type id
@@ -52,6 +57,10 @@ class EvalConfig:
                 f'EvalConfig {self.name!r}: role {self.role.value!r} is not a candidate '
                 f'role; expected one of {sorted(r.value for r in CANDIDATE_ROLES)}',
             )
+
+
+class UnknownHarnessVariant(ValueError):
+    """A ``<name>@<variant>`` lookup named a variant outside ImplementerBriefVariant."""
 
 
 def _vllm_config(
@@ -469,10 +478,11 @@ ARCHITECT_EVAL_CONFIGS = [
 def get_config_by_name(name: str) -> EvalConfig | None:
     """Look up an eval config by name (implementer, architect, OR ν/ξ candidates).
 
-    ν's ``claude_endpoint_candidates()`` and ξ's ``codex_pi_candidates()``
-    bundles are searched LAST since they are function calls (built fresh per
-    call) rather than a static list — cheap at CLI/driver lookup frequency,
-    and keeps this the single by-name resolver for every eval config family
+    ν's ``claude_endpoint_candidates()``, ξ's ``codex_pi_candidates()``,
+    ω's ``zcode_candidates()`` and ``mimo_code_candidates()`` bundles are searched LAST, and built only when no static config matched:
+    they are built fresh per call, and building a ν bundle logs a WARNING for
+    each missing credential or base URL, which a static lookup must not emit.
+    This stays the single by-name resolver for every eval config family
     (avoids a second, per-selector lookup path).
 
     ``JUDGE_EVAL_CONFIGS`` (ο) is DELIBERATELY absent from the search list —
@@ -485,13 +495,47 @@ def get_config_by_name(name: str) -> EvalConfig | None:
     judge candidate is intentionally unsupported: a lookup returns ``None``
     ("Unknown config") — a graceful, no-silent-misbehavior failure — rather
     than mis-running. See ``JUDGE_EVAL_CONFIGS`` below and design decision 4.
+
+    A name may carry a harness variant, ``<name>@<variant>`` (task 5385): it
+    resolves to a copy of the registered ``<name>`` relabelled with the full
+    requested name and carrying that ``harness_variant``. Two refusals keep a
+    variant from silently not applying: an unknown or empty variant raises
+    ``UnknownHarnessVariant`` before any scan, and a non-whole-plan variant on
+    a non-implementer candidate raises ``ValueError`` naming its role.
     """
-    for cfg in [
-        *EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS,
-        *claude_endpoint_candidates(), *codex_pi_candidates(),
-    ]:
-        if cfg.name == name:
-            return cfg
+    base_name, separator, raw_variant = name.partition('@')
+    if not separator:
+        return _find_registered(name)
+    try:
+        variant = ImplementerBriefVariant(raw_variant)
+    except ValueError:
+        known = ', '.join(repr(member.value) for member in ImplementerBriefVariant)
+        raise UnknownHarnessVariant(
+            f'{name!r}: unknown harness variant {raw_variant!r}; known: {known}',
+        ) from None
+    base = _find_registered(base_name)
+    if base is None:
+        return None
+    if variant is not ImplementerBriefVariant.WHOLE_PLAN and base.role is not RoleUnderTest.IMPLEMENTER:
+        raise ValueError(
+            f'{name!r}: harness variant {variant.value!r} changes only the '
+            f'implementer brief, but {base_name!r} is a {base.role.value!r}-role candidate',
+        )
+    return replace(base, name=name, harness_variant=variant)
+
+
+def _find_registered(name: str) -> EvalConfig | None:
+    families: tuple[Callable[[], list[EvalConfig]], ...] = (
+        lambda: [*EVAL_CONFIGS, *FINAL_RUN_CONFIGS, *ARCHITECT_EVAL_CONFIGS],
+        claude_endpoint_candidates,
+        codex_pi_candidates,
+        zcode_candidates,
+        mimo_code_candidates,
+    )
+    for build_family in families:
+        for cfg in build_family():
+            if cfg.name == name:
+                return cfg
     return None
 
 
@@ -623,13 +667,22 @@ KIMI_BASE_URL = 'https://api.moonshot.ai/anthropic'
 
 # Z.ai GLM access is a GLM Coding Plan (Leo, 2026-09-11), and a Coding Plan key
 # answers ONLY on the Plan's two coding endpoints: GLM_BASE_URL, the Anthropic
-# protocol the claude-harness bundles drive, and ZAI_CODING_BASE_URL, the
-# OpenAI protocol asserted at startup by
-# orchestrator/src/orchestrator/evals/zai_probe.py::require_zai_coding_endpoint
-# and used by the ZCode arm (task 5399). The general /api/paas/v4 errors with
-# a Coding Plan key, so it is deliberately not a constant.
+# protocol that both the claude-harness bundles and the ZCode arm drive (ZCode's
+# own Coding Plan template uses it; plans/zcode-harness-probe-2026-11.md), and
+# ZAI_CODING_BASE_URL, the OpenAI protocol asserted at startup by
+# orchestrator/src/orchestrator/evals/zai_probe.py::require_zai_coding_endpoint.
+# The general /api/paas/v4 errors with a Coding Plan key, so it is deliberately
+# not a constant.
 GLM_BASE_URL = 'https://api.z.ai/api/anthropic'
 ZAI_CODING_BASE_URL = 'https://api.z.ai/api/coding/paas/v4'
+
+# MiMo's Anthropic-protocol base URL is an env var, not a literal: a Token Plan
+# (tp-) key answers only on its account region's cluster,
+# https://token-plan-{cn|sgp|ams}.xiaomimimo.com/anthropic, unknown until the
+# plan is bought, and a pay-as-you-go (sk-) key's
+# https://api.xiaomimimo.com/anthropic does not accept it. See
+# plans/live-shadow-eval-prd.md decision 12.
+MIMO_BASE_URL_ENV = 'MIMO_ANTHROPIC_BASE_URL'
 
 # Per-provider ANTHROPIC_AUTH_TOKEN source env var name. Never a secret
 # literal in source — the value itself is read from the operator's
@@ -638,15 +691,22 @@ GLM_AUTH_TOKEN_ENV = 'ZAI_API_KEY'
 DEEPSEEK_AUTH_TOKEN_ENV = 'DEEPSEEK_API_KEY'
 MINIMAX_AUTH_TOKEN_ENV = 'MINIMAX_API_KEY'
 KIMI_AUTH_TOKEN_ENV = 'MOONSHOT_API_KEY'
+MIMO_AUTH_TOKEN_ENV = 'MIMO_API_KEY'
 
 # Provider model ids, used verbatim as the Claude Code ``model`` value AND
 # (see CANDIDATE_ENDPOINT_PRICES below) as the price-table key — the two MUST
 # stay in lockstep or resolve_cost_usd falls back to 'unpriced_proxy'.
-MINIMAX_MODEL = 'MiniMax-M3'
+MINIMAX_MODEL = 'MiniMax-M3.1-Flash'
 GLM_MODEL = 'glm-5.3'
 GLM_FLASH_MODEL = 'glm-5.3-flash'
 DEEPSEEK_MODEL = 'deepseek-v4'
 KIMI_MODEL = 'kimi-latest'
+MIMO_PRO_MODEL = 'mimo-v2.6-pro'
+MIMO_FLASH_MODEL = 'mimo-v2.6-flash'
+
+
+def _mimo_base_url() -> str:
+    return os.environ.get(MIMO_BASE_URL_ENV, '').strip()
 
 
 def _claude_endpoint_config(
@@ -655,7 +715,7 @@ def _claude_endpoint_config(
     """Build one non-incumbent Claude-format-endpoint candidate bundle.
 
     Mirrors ``_vllm_config``'s env-dict builder pattern: ``ANTHROPIC_BASE_URL``
-    is the public literal *base_url*; ``ANTHROPIC_AUTH_TOKEN`` is read from
+    is *base_url*; ``ANTHROPIC_AUTH_TOKEN`` is read from
     *auth_token_env* via ``os.environ.get`` at CALL time (never baked into
     source as a secret), so an operator supplies it via the environment and a
     test can monkeypatch it and observe the value flow through.
@@ -665,9 +725,20 @@ def _claude_endpoint_config(
     it), a missing token HERE means the run cannot authenticate against the
     provider at all, so a WARNING is logged at build time rather than only
     surfacing later as an opaque 401/auth error mid-run.
+
+    A blank *base_url* means the endpoint is unknown, so the bundle carries no
+    credential: the key is never read, let alone sent to an unknown endpoint.
     """
-    auth_token = os.environ.get(auth_token_env, '')
-    if not auth_token:
+    auth_token = os.environ.get(auth_token_env, '') if base_url else ''
+    if not base_url:
+        logger.warning(
+            "ν candidate %r has no base URL — ANTHROPIC_AUTH_TOKEN is left "
+            "blank, so the shadow credential gate "
+            "(shadow_eval.py::candidate_has_credentials) skips it as "
+            "no_credentials and no key goes to an unknown endpoint.",
+            name,
+        )
+    elif not auth_token:
         logger.warning(
             "ν candidate %r: %s is not set in the environment — "
             "ANTHROPIC_AUTH_TOKEN will be empty and the %s endpoint will "
@@ -683,12 +754,26 @@ def _claude_endpoint_config(
     )
 
 
+def _glm_endpoint_config() -> EvalConfig:
+    return _claude_endpoint_config(
+        'glm-5.3-endpoint', GLM_MODEL,
+        base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
+    )
+
+
+def _mimo_endpoint_config(name: str, model: str) -> EvalConfig:
+    return _claude_endpoint_config(
+        name, model, base_url=_mimo_base_url(), auth_token_env=MIMO_AUTH_TOKEN_ENV,
+    )
+
+
 def claude_endpoint_candidates() -> list[EvalConfig]:
-    """Incumbents (native cloud Opus/Sonnet) + the five non-incumbent bundles.
+    """Incumbents (native cloud Opus/Sonnet) + the non-incumbent endpoint bundles.
 
     Each non-incumbent bundle is a (harness, model) candidate — Claude Code
-    driving MiniMax M3 / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4 / Kimi via
-    their official Anthropic-format endpoint (PRD C5). ADDITIVE to
+    driving MiniMax M3.1 Flash / GLM-5.3 / GLM-5.3-Flash / DeepSeek V4 / Kimi /
+    MiMo V2.6 Pro / MiMo V2.6 Flash via their official Anthropic-format
+    endpoint (PRD C5). ADDITIVE to
     :func:`ofat_candidates`:
     the non-incumbent bundles are NOT added there, since its implementer
     subset asserts every cloud incumbent carries no proxy ``env_overrides``
@@ -703,13 +788,10 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
     return [
         *_cloud_implementer_incumbents(),
         _claude_endpoint_config(
-            'minimax-m3-endpoint', MINIMAX_MODEL,
+            'minimax-m3.1-flash-endpoint', MINIMAX_MODEL,
             base_url=MINIMAX_BASE_URL, auth_token_env=MINIMAX_AUTH_TOKEN_ENV,
         ),
-        _claude_endpoint_config(
-            'glm-5.3-endpoint', GLM_MODEL,
-            base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
-        ),
+        _glm_endpoint_config(),
         _claude_endpoint_config(
             'glm-5.3-flash-endpoint', GLM_FLASH_MODEL,
             base_url=GLM_BASE_URL, auth_token_env=GLM_AUTH_TOKEN_ENV,
@@ -722,6 +804,8 @@ def claude_endpoint_candidates() -> list[EvalConfig]:
             'kimi-endpoint', KIMI_MODEL,
             base_url=KIMI_BASE_URL, auth_token_env=KIMI_AUTH_TOKEN_ENV,
         ),
+        _mimo_endpoint_config('mimo-v2.6-pro-endpoint', MIMO_PRO_MODEL),
+        _mimo_endpoint_config('mimo-v2.6-flash-endpoint', MIMO_FLASH_MODEL),
     ]
 
 
@@ -745,15 +829,19 @@ class CandidateEndpointPrice:
 # 'price_table' for a ν candidate rather than falling back to 'unpriced_proxy'.
 # GLM access is a GLM Coding Plan, so both GLM rows are SUBSCRIPTION: imputed.
 CANDIDATE_ENDPOINT_PRICES: dict[str, CandidateEndpointPrice] = {
-    # MiniMax's NATIVE list price; resellers (OpenRouter: 0.23/0.96) are
-    # deliberately not used.
-    MINIMAX_MODEL: CandidateEndpointPrice(0.30, 1.20, CostBasis.METERED),
+    # MiniMax's native list rate from the 2026-11-01 frontier check (task
+    # 8086), no long-context surcharge.
+    MINIMAX_MODEL: CandidateEndpointPrice(0.15, 0.60, CostBasis.METERED),
     GLM_MODEL: CandidateEndpointPrice(1.40, 4.40, CostBasis.SUBSCRIPTION),
     # LIST price. The 50% promo (0.075/0.25) expired 2026-09-09 24:00 UTC+8;
     # aggregator pages still quote it.
     GLM_FLASH_MODEL: CandidateEndpointPrice(0.15, 0.50, CostBasis.SUBSCRIPTION),
     DEEPSEEK_MODEL: CandidateEndpointPrice(0.28, 0.42, CostBasis.METERED),
     KIMI_MODEL: CandidateEndpointPrice(0.60, 2.50, CostBasis.METERED),
+    # Imputed list prices from https://mimo.mi.com/docs/en-US/pricing, retrieved
+    # 2026-10-31; the Token Plan bills credits (PRD decision 16).
+    MIMO_PRO_MODEL: CandidateEndpointPrice(0.435, 0.87, CostBasis.SUBSCRIPTION),
+    MIMO_FLASH_MODEL: CandidateEndpointPrice(0.14, 0.28, CostBasis.SUBSCRIPTION),
 }
 
 
@@ -794,17 +882,19 @@ def claude_endpoint_price_table() -> dict[str, dict[str, float]]:
 #     claude-sonnet-max incumbent, only the backend varies, isolating
 #     harness effect from model effect.
 
-# Codex model ids from the 2026-09-10 live market check (task 5384); list
-# prices live in config.py::_DEFAULT_PRICES.
+# Codex model ids from the 2026-11-01 frontier check (task 8086); list prices
+# live in config.py::_DEFAULT_PRICES.
 #   - Astra needs Codex CLI 0.153.0 or newer; reasoning effort high/xhigh/max.
 #   - Sol is the Rust implementer, evaluate-only (RUST CAUTION, PRD decision
 #     14 — Claude leads the only Rust-bearing public benchmarks and open-model
 #     Rust evidence is thin, so no architect-role variant and no production
-#     wiring). Its rate is promotional through at least 2026-11-21.
+#     wiring).
 #   - Terra is the mid-price control.
+# A candidate name embeds its model id and is never re-pointed:
+# plans/live-shadow-eval-prd.md decision 12.
 CODEX_ASTRA_MODEL = 'gpt-6-astra'
-CODEX_SOL_MODEL = 'gpt-5.6-sol'
-CODEX_TERRA_MODEL = 'gpt-5.6-terra'
+CODEX_SOL_MODEL = 'gpt-6.1-sol'
+CODEX_TERRA_MODEL = 'gpt-6.1-terra'
 
 # Mirrors the claude-sonnet-max incumbent's model literal EXACTLY so the pi
 # vs claude delta attributes cleanly to harness effect rather than a model
@@ -825,10 +915,10 @@ def codex_pi_candidates() -> list[EvalConfig]:
             'codex-gpt6-astra', 'codex', CODEX_ASTRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
         ),
         EvalConfig(
-            'codex-gpt5.6-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            'codex-gpt6.1-sol', 'codex', CODEX_SOL_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
         ),
         EvalConfig(
-            'codex-gpt5.6-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
+            'codex-gpt6.1-terra', 'codex', CODEX_TERRA_MODEL, 'xhigh', role=RoleUnderTest.IMPLEMENTER,
         ),
         # effort 'max' matches the claude-sonnet-max incumbent exactly (and is
         # a valid _pi_thinking level) — model+effort held constant, backend
@@ -836,4 +926,17 @@ def codex_pi_candidates() -> list[EvalConfig]:
         EvalConfig(
             'pi-sonnet-control', 'pi', PI_CONTROL_MODEL, 'max', role=RoleUnderTest.IMPLEMENTER,
         ),
+    ]
+
+
+def zcode_candidates() -> list[EvalConfig]:
+    """GLM-5.3 on ZCode, its official harness; glm-5.3-endpoint is its mandatory paired control."""
+    return [replace(_glm_endpoint_config(), name='glm-5.3-zcode', backend='zcode')]
+
+
+def mimo_code_candidates() -> list[EvalConfig]:
+    """MiMo V2.6 Pro and Flash on MiMo Code, their official harness; each '-endpoint' bundle is its mandatory paired control."""
+    return [
+        replace(_mimo_endpoint_config(f'{stem}-endpoint', model), name=f'{stem}-mimocode', backend='mimo')
+        for stem, model in (('mimo-v2.6-pro', MIMO_PRO_MODEL), ('mimo-v2.6-flash', MIMO_FLASH_MODEL))
     ]

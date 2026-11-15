@@ -25,6 +25,9 @@ from pathlib import Path
 
 import pytest
 from git_checkout_root import checkout_root_or_skip
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LIB_RELPATH = "scripts/lib/resolve_uv.sh"
@@ -36,6 +39,7 @@ CALLERS = (
     "fused-memory/scripts/cgl_eta_auto_apply.sh",
     "scripts/sync-orchestrator-env.sh",
     "scripts/memory-metadata-coverage-census.sh",
+    "scripts/fused-memory-link-heal.sh",
 )
 
 STUB_MARKER = "STUB-RESOLVER-CALLED"
@@ -283,9 +287,9 @@ def _caller_env(tmp_path: Path) -> dict[str, str]:
     - systemctl, pgrep and sleep are fakes FIRST on PATH: systemctl only logs,
       and pgrep always reports "still alive", which makes the sync script
       abort before any `uv sync`.
-    - The census wrapper's two command seams are popped, so it reaches
-      require_uv_bin rather than an ambient seam, and CENSUS_COMMIT=0 keeps a
-      mis-wired copy of it away from git.
+    - The census wrapper's two command seams, and the link-heal wrapper's,
+      are popped, so each reaches require_uv_bin rather than an ambient seam,
+      and CENSUS_COMMIT=0 keeps a mis-wired copy of the census away from git.
     """
     fake_bin = tmp_path / "fake-bin"
     _write_fake_tool(fake_bin / "systemctl", 'echo "$*" >> "$FAKE_SYSTEMCTL_LOG"\nexit 0')
@@ -305,6 +309,7 @@ def _caller_env(tmp_path: Path) -> dict[str, str]:
     env.pop("FLAG_MARKER_SWEEP_CMD", None)
     env.pop("COVERAGE_CENSUS_CMD", None)
     env.pop("RETRO_STAMP_CMD", None)
+    env.pop("LINK_HEAL_SWEEP_CMD", None)
     env["CENSUS_COMMIT"] = "0"
     env.pop("DASHBOARD_KNOWN_PROJECT_ROOTS", None)
     return env

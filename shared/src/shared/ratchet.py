@@ -22,7 +22,7 @@ every comparison, one entry per line in sorted order, and rendering the whole
 text before touching the destination.  Converging the two renderers is a later
 task's to make; reading this as an oversight would be wrong.
 
-``shared/tests/silent_fallthrough_scan.py::reconcile_against_allowlist`` and
+``tests/repo_guards/silent_fallthrough_scan.py::reconcile_against_allowlist`` and
 the loop-blocking ledger are the natural future adopters of this kernel.  The
 PRD names them and deliberately does not schedule them: their unblessed half
 returns site OBJECTS in original order, which is not Counter subtraction and

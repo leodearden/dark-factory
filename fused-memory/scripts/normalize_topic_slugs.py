@@ -132,7 +132,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import functools
 import json
 import logging
 import sys
@@ -144,8 +143,10 @@ from fused_memory.backends.mem0_client import (
     DEFAULT_SCROLL_MAX_PAGES,
     ScrollPageBudgetExhausted,
 )
+from fused_memory.canonical_marker import is_canonical
 from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
 from fused_memory.topic_slug import derive_topic_slug, is_valid_topic_slug
+from fused_memory.utils.script_loader import load_script
 from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 # This script reports through ``print``; stdout carries its machine-read
@@ -289,38 +290,9 @@ DEFAULT_MAX_PAGES = DEFAULT_SCROLL_MAX_PAGES
 # The corpus partition — borrowed, never restated
 # ---------------------------------------------------------------------------
 
-@functools.cache
 def load_census_module() -> Any:
-    """Load ``census_memory_metadata`` by path.
-
-    ``scripts/`` is not a package, so a plain import cannot reach it.  Same
-    importlib idiom — including the ``sys.modules``-first lookup — that
-    ``census_memory_metadata.py::_load_probe_module`` and
-    ``retro_stamp_topics.py::_load_probe_module`` already established for
-    exactly this cross-script reuse: that slot may already hold a module
-    another by-path loader executed, and re-executing would hand back
-    DIFFERENT class objects, silently breaking identity across the seam.
-
-    Memoized because the load is not free and because the identity above is
-    only stable if it happens once.
-    """
-    import importlib.util  # noqa: PLC0415
-
-    mod_name = 'census_memory_metadata'
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, _CENSUS_SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {_CENSUS_SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    """Load ``census_memory_metadata`` by path via ``load_script``, sharing its key's module."""
+    return load_script(_CENSUS_SCRIPT_PATH, 'census_memory_metadata')
 
 
 def census_categories() -> tuple[str, ...]:
@@ -404,7 +376,7 @@ async def enumerate_topic_bearing(
         *coverage* maps category -> the expected/scrolled/recount/delta/
         complete cell, and *complete* is the conjunction over all cells.
     """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     backend = memory_service.mem0
     category_values = (
@@ -440,11 +412,7 @@ async def enumerate_topic_bearing(
                 topic = metadata.get('topic')
                 if isinstance(topic, str):
                     occupied_topics.add(topic)
-                    # ``is True``, not truthiness: metadata off a live store is
-                    # not schema-enforced here, and ``canonical: 'false'`` would
-                    # otherwise read as a canonical claim and escalate a mild
-                    # collision into the severe bucket.
-                    if metadata.get('canonical') is True:
+                    if is_canonical(metadata):
                         memory_id = record.get('id')
                         if isinstance(memory_id, str) and memory_id:
                             canonical_ids_by_topic.setdefault(topic, []).append(memory_id)
@@ -460,7 +428,7 @@ async def enumerate_topic_bearing(
                         'topic': topic,
                         **(
                             {'canonical': True}
-                            if metadata.get('canonical') is True else {}
+                            if is_canonical(metadata) else {}
                         ),
                     },
                 })
@@ -664,11 +632,7 @@ def plan_renames(
         if not isinstance(topic, str):
             continue
         observed_topics.add(topic)
-        # ``is True``, not truthiness: metadata comes off a live store and is
-        # not schema-enforced at this seam, so ``canonical: 'false'`` — a
-        # non-empty string — would otherwise read as a canonical claim and
-        # escalate a mild refusal into the severe bucket.
-        if metadata.get('canonical') is True:
+        if is_canonical(metadata):
             memory_id = record.get('id')
             if isinstance(memory_id, str) and memory_id and memory_id not in (
                 canonical_ids_by_topic.get(topic) or ()
@@ -1469,7 +1433,7 @@ def load_mcp_client_module() -> Any:
     Exposed so :func:`open_mcp_client` reads that module's ``DEFAULT_SERVER``
     beside its client class, rather than restating the URL a third time.
     """
-    import importlib.util  # noqa: PLC0415
+    import importlib.util
 
     sibling = Path(__file__).parent / 'strip_leaked_control_keys.py'
     mod_name = 'strip_leaked_control_keys'
@@ -2287,8 +2251,8 @@ async def open_live_memory_service():
     Imports deferred so importing this module — which the tests do, by path —
     never constructs a backend.
     """
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.services.memory_service import MemoryService
 
     memory = MemoryService(FusedMemoryConfig())
     try:
@@ -2358,7 +2322,7 @@ def main(
     args = _build_parser().parse_args(argv)
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
 
         os.environ['CONFIG_PATH'] = str(args.config)
 

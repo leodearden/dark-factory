@@ -100,6 +100,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.middleware import recon_write_policy
 from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -114,6 +115,8 @@ from fused_memory.reconciliation.summary_pool import write_cycle_summary
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.write_journal import WriteJournal
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Recon-stage agent_id used throughout this suite's interceptor/journal
 # scenarios — matches test_recon_write_policy.py's AGENT_ID so the

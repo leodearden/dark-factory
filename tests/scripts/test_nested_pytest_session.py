@@ -19,6 +19,9 @@ from nested_pytest_session import (
     binding_conftest,
     run_nested_pytest,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PROBE_SETUP = (
     'import df_pytest_isolation\n'

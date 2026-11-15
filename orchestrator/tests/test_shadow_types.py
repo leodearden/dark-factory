@@ -211,8 +211,11 @@ def test_every_member_is_a_bare_str_that_round_trips(member: StrEnum):
 class TestSingleCopy:
     """The sibling modules consume these exact enums, never a second copy."""
 
-    def test_candidate_prices_use_the_shadow_types_cost_basis(self):
-        assert CANDIDATE_ENDPOINT_PRICES['glm-5.3'].cost_basis is CostBasis.SUBSCRIPTION
+    @pytest.mark.parametrize(
+        'model', ['glm-5.3', 'glm-5.3-flash', 'mimo-v2.6-pro', 'mimo-v2.6-flash'],
+    )
+    def test_candidate_prices_use_the_shadow_types_cost_basis(self, model):
+        assert CANDIDATE_ENDPOINT_PRICES[model].cost_basis is CostBasis.SUBSCRIPTION
 
     @pytest.mark.parametrize('model', sorted(CANDIDATE_ENDPOINT_PRICES))
     def test_a_price_entry_and_its_basis_agree_on_imputed_dollars(self, model):

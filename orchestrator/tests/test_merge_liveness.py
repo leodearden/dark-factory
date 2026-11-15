@@ -17,16 +17,23 @@ mirroring task β's test_merge_gates.py:
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Generic, TypeVar
 from unittest.mock import patch
 
 import pytest
+from shared.proc_group import cpu_ticks_under_path
+
+from orchestrator.merge_lane.liveness import VerifyProgressWatch, verify_tree_cpu_ticks
 
 
 def test_merge_liveness_exports_moved_public_symbols() -> None:
     from orchestrator.merge_lane.liveness import (
         _MERGE_WORKER_LOOP_DIED_SENTINEL,
-        _VERIFY_HOST_RECOVERED_SENTINEL_PREFIX,
         _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX,
         MergeLivenessAssessment,
         MergeLivenessConfigError,
@@ -49,7 +56,6 @@ def test_merge_liveness_exports_moved_public_symbols() -> None:
         'PersistentWorktreeConfigError': PersistentWorktreeConfigError,
         '_safety_valve_due': _safety_valve_due,
         '_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX': _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX,
-        '_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX': _VERIFY_HOST_RECOVERED_SENTINEL_PREFIX,
         '_MERGE_WORKER_LOOP_DIED_SENTINEL': _MERGE_WORKER_LOOP_DIED_SENTINEL,
         '_verify_host_unreachable_sentinel': _verify_host_unreachable_sentinel,
         '_alarm_verify_host_unreachable': _alarm_verify_host_unreachable,
@@ -248,3 +254,165 @@ class TestEngineConstantsAreReadAtCallTime:
             pytest.raises(PersistentWorktreeConfigError),
         ):
             enforce_persistent_worktree_serial_lane(cfg)
+
+
+_T = TypeVar('_T')
+_PROBE_SECS = 30.0
+
+
+class _Probe(Generic[_T]):
+    """A zero-argument progress probe returning a fixed reading, counting its calls."""
+
+    def __init__(self, reading: _T) -> None:
+        self.reading = reading
+        self.calls = 0
+
+    def __call__(self) -> _T:
+        self.calls += 1
+        return self.reading
+
+
+def _observe(
+    watch: VerifyProgressWatch,
+    now: float,
+    *,
+    cpu: _Probe[int | None],
+    mtime: _Probe[float | None],
+    dispatch_live: bool = False,
+) -> VerifyProgressWatch:
+    return watch.observe(
+        now, dispatch_live=dispatch_live, probe_every_secs=_PROBE_SECS,
+        cpu_ticks=cpu, content_mtime=mtime,
+    )
+
+
+class TestVerifyProgressWatch:
+    """The in-flight verify's progress evidence, unioned (task 5290).
+
+    A live remote dispatch short-circuits; otherwise each throttled probe
+    asks the verify tree's CPU fingerprint first and walks merge_wt's mtime
+    only when that is silent.
+    """
+
+    def test_a_live_dispatch_is_progress_and_probes_nothing(self) -> None:
+        cpu, mtime = _Probe[int | None](100), _Probe[float | None](50.0)
+        watch = VerifyProgressWatch.start(0.0, cpu_ticks=100, content_mtime=50.0)
+
+        watch = _observe(watch, 1000.0, cpu=cpu, mtime=mtime, dispatch_live=True)
+
+        assert watch.no_progress_secs(1000.0) == 0.0
+        assert watch.dispatch_seen_in_flight is True
+        assert (cpu.calls, mtime.calls) == (0, 0)
+
+    def test_the_throttle_probes_nothing_inside_the_interval(self) -> None:
+        cpu, mtime = _Probe[int | None](100), _Probe[float | None](50.0)
+        start = VerifyProgressWatch.start(0.0, cpu_ticks=100, content_mtime=50.0)
+
+        early = _observe(start, _PROBE_SECS - 1.0, cpu=cpu, mtime=mtime)
+        assert early == start
+        assert (cpu.calls, mtime.calls) == (0, 0)
+
+        probed = _observe(start, _PROBE_SECS, cpu=cpu, mtime=mtime)
+        assert (cpu.calls, mtime.calls) == (1, 1)
+        _observe(probed, 2 * _PROBE_SECS - 1.0, cpu=cpu, mtime=mtime)
+        assert (cpu.calls, mtime.calls) == (1, 1)
+
+    @pytest.mark.parametrize('ticks', [107, 93], ids=['increase', 'decrease-a-process-exited'])
+    def test_a_cpu_change_is_progress_without_the_mtime_walk(self, ticks: int) -> None:
+        cpu, mtime = _Probe[int | None](ticks), _Probe[float | None](50.0)
+        watch = VerifyProgressWatch.start(0.0, cpu_ticks=100, content_mtime=50.0)
+
+        watch = _observe(watch, _PROBE_SECS, cpu=cpu, mtime=mtime)
+
+        assert watch.no_progress_secs(_PROBE_SECS) == 0.0
+        assert (cpu.calls, mtime.calls) == (1, 0)
+
+    @pytest.mark.parametrize('ticks', [100, None], ids=['unchanged', 'none-both-times'])
+    def test_silent_cpu_falls_through_to_a_newer_mtime(self, ticks: int | None) -> None:
+        cpu, mtime = _Probe[int | None](ticks), _Probe[float | None](60.0)
+        watch = VerifyProgressWatch.start(0.0, cpu_ticks=ticks, content_mtime=50.0)
+
+        watch = _observe(watch, _PROBE_SECS, cpu=cpu, mtime=mtime)
+
+        assert watch.no_progress_secs(_PROBE_SECS) == 0.0
+        assert (cpu.calls, mtime.calls) == (1, 1)
+
+    @pytest.mark.parametrize('reading', [50.0, None], ids=['equal-mtime', 'no-mtime'])
+    def test_a_wedged_tree_accrues_no_progress(self, reading: float | None) -> None:
+        """Alive, zero CPU delta, nothing written: no_progress_secs keeps growing."""
+        cpu, mtime = _Probe[int | None](100), _Probe[float | None](reading)
+        watch = VerifyProgressWatch.start(0.0, cpu_ticks=100, content_mtime=50.0)
+
+        for sweep in range(1, 5):
+            watch = _observe(watch, sweep * _PROBE_SECS, cpu=cpu, mtime=mtime)
+
+        assert watch.no_progress_secs(4 * _PROBE_SECS) == 4 * _PROBE_SECS
+        assert (cpu.calls, mtime.calls) == (4, 4)
+
+    def test_a_process_appearing_is_progress(self) -> None:
+        cpu, mtime = _Probe[int | None](5), _Probe[float | None](None)
+        watch = VerifyProgressWatch.start(0.0, cpu_ticks=None, content_mtime=None)
+
+        watch = _observe(watch, _PROBE_SECS, cpu=cpu, mtime=mtime)
+
+        assert watch.no_progress_secs(_PROBE_SECS) == 0.0
+        assert mtime.calls == 0
+
+    def test_observe_returns_a_new_value_and_leaves_the_original(self) -> None:
+        cpu, mtime = _Probe[int | None](100), _Probe[float | None](50.0)
+        start = VerifyProgressWatch.start(0.0, cpu_ticks=100, content_mtime=50.0)
+
+        after = _observe(start, 1000.0, cpu=cpu, mtime=mtime, dispatch_live=True)
+
+        assert after is not start
+        assert start.dispatch_seen_in_flight is False
+        assert start.no_progress_secs(1000.0) == 1000.0
+
+
+def _ticks_rise(read: Callable[[], int | None], *, within_secs: float) -> bool:
+    """Whether *read* returns an int that later strictly increases, within the deadline."""
+    first: int | None = None
+    deadline = time.monotonic() + within_secs
+    while time.monotonic() < deadline:
+        ticks = read()
+        if ticks is not None and first is None:
+            first = ticks
+        elif ticks is not None and first is not None and ticks > first:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _busy_child(cwd: Path, *, own_session: bool) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        [sys.executable, '-c', 'while True: pass'], cwd=cwd, start_new_session=own_session,
+    )
+
+
+class TestVerifyTreeCpuTicks:
+    """The verify tree's CPU fingerprint on the real /proc, bounded."""
+
+    @pytest.mark.timeout(60)
+    def test_a_busy_verify_subprocess_in_its_own_session_is_counted(self, tmp_path: Path) -> None:
+        """Any child in its own session counts, a verify's or not: only the caller's pgrp is excluded."""
+        root = tmp_path.resolve()
+        child = _busy_child(root, own_session=True)
+        try:
+            assert _ticks_rise(lambda: verify_tree_cpu_ticks(root), within_secs=30.0)
+        finally:
+            child.kill()
+            child.wait()
+
+    @pytest.mark.timeout(60)
+    def test_the_orchestrators_own_process_group_is_never_counted(self, tmp_path: Path) -> None:
+        """Anti-masking (#1728): work in the caller's own process group cannot refresh it."""
+        root = tmp_path.resolve()
+        child = _busy_child(root, own_session=False)
+        try:
+            assert _ticks_rise(lambda: cpu_ticks_under_path(root), within_secs=30.0), (
+                'precondition: the unfiltered fingerprint sees the busy child'
+            )
+            assert verify_tree_cpu_ticks(root) is None
+        finally:
+            child.kill()
+            child.wait()

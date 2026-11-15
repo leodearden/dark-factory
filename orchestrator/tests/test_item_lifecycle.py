@@ -178,7 +178,7 @@ class TestItemLifecycleTransitionHappyPath:
     def test_redispatch_bounce_is_a_legal_in_place_retry(self) -> None:
         """A representative in-place retry branch: DISPATCHING ->
         REDISPATCH_PARKED -> DISPATCHING (the redispatch bounce evidenced
-        by ``_redispatch``)."""
+        by the redispatch park)."""
         from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 
         registry = ItemLifecycle()
@@ -198,7 +198,7 @@ class TestItemLifecycleTransitionHappyPath:
     def test_cascade_remerge_from_gate_reverify_is_a_legal_in_place_retry(self) -> None:
         """The documented cascade remerge: a downstream entry parked at
         GATE_REVERIFY when a head verify fails is remerged (-> MERGING) and
-        then appended to ``_redispatch`` (-> REDISPATCH_PARKED). Mirrors
+        then appended to the redispatch park (-> REDISPATCH_PARKED). Mirrors
         ``test_redispatch_bounce_is_a_legal_in_place_retry`` (task 2164
         step-9; fixes the GATE_REVERIFY out-set asymmetry with VERIFYING/
         FINALIZING, both of which already legally reach MERGING)."""
@@ -332,7 +332,7 @@ class TestItemLifecycleTransitionRedispatchParkedEntryEdges:
     """
 
     def test_awaiting_verify_to_redispatch_parked_is_legal(self) -> None:
-        """An item parked back onto ``_redispatch`` before a verify runner
+        """An item parked back onto the redispatch park before a verify runner
         ever picks it up from ``_verifier_queue``."""
         from orchestrator.merge_lane.worker import ItemLifecycle, ItemLifecycleState
 

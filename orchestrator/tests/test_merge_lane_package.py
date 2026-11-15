@@ -1,7 +1,8 @@
 """The merge lane's façade and ports (PRD ``plans/merge-lane-quality-prd.md`` tasks ζ1, β, ζ2 and η).
 
-The façade is pinned by what it exports, and by the fourteen pre-package
-module names being gone: task η migrated their importers and deleted the
+The façade is pinned by what it exports, at runtime and to pyright, by no
+submodule but the worker loading the worker, and by
+the fourteen pre-package module names being gone: task η migrated their importers and deleted the
 aliases, so each old name must now fail to import. The ports are
 pinned by driving a real ``MergeLane`` over a real git repository with the
 fakes from ``_merge_lane_fakes`` injected: the injected verifier decides
@@ -11,7 +12,9 @@ its worktrees by. Every observation is a public one -- a ``MergeOutcome``,
 """
 from __future__ import annotations
 
+import ast
 import asyncio
+import importlib
 import subprocess
 import sys
 import time
@@ -40,6 +43,7 @@ from orchestrator.merge_lane import (
     ProductionEscalations,
     QueuedBranch,
 )
+from orchestrator.merge_lane import ports as lane_ports
 from orchestrator.merge_lane.ports import escalation_port
 from orchestrator.merge_lane.worker import (
     PRODUCTION_CLOCK,
@@ -73,13 +77,76 @@ def test_every_export_resolves_and_the_reason_constants_are_strings() -> None:
     ]
     assert len(reasons) == REASON_CONSTANTS, reasons
     assert all(isinstance(resolved[name], str) for name in reasons)
-    assert set(merge_lane.__all__) <= set(dir(merge_lane))
 
 
 def test_a_name_outside_the_facade_is_an_attribute_error() -> None:
     assert not hasattr(merge_lane, 'not_an_export')
     with pytest.raises(AttributeError, match='not_an_export'):
         _ = merge_lane.not_an_export
+
+
+def _type_checking_imports(source: str) -> dict[str, tuple[str, str]]:
+    """Each name a module-level ``if TYPE_CHECKING:`` block binds → (module, attribute)."""
+    blocks = [
+        node for node in ast.parse(source).body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name) and node.test.id == 'TYPE_CHECKING'
+    ]
+    imports = [
+        statement for block in blocks for statement in block.body
+        if isinstance(statement, ast.ImportFrom)
+    ]
+    return {
+        alias.asname or alias.name: (statement.module, alias.name)
+        for statement in imports if statement.module is not None
+        for alias in statement.names
+    }
+
+
+def test_the_type_checking_block_declares_exactly_the_runtime_exports() -> None:
+    static = _type_checking_imports(Path(merge_lane.__file__).read_text())
+    assert sorted(static) == sorted(merge_lane.__all__)
+    for bound, (module, attribute) in static.items():
+        runtime = getattr(importlib.import_module(module), attribute)
+        assert getattr(merge_lane, bound) is runtime, bound
+
+
+def test_the_facade_serves_lazily_exactly_its_all() -> None:
+    assert set(dir(merge_lane)) - set(vars(merge_lane)) == set(merge_lane.__all__), (
+        'names served lazily (dir minus module globals) must equal __all__; '
+        'this assumes __getattr__ does not cache into globals()'
+    )
+
+
+def test_the_facade_types_its_worker_and_ports_statically() -> None:
+    assert_type(MergeLane, type[SpeculativeMergeWorker])
+    assert_type(merge_lane.ClockPort, type[lane_ports.ClockPort])
+    assert_type(merge_lane.VerifyPort, type[lane_ports.VerifyPort])
+
+
+_FIRST_SUBMODULE_TO_LOAD_THE_WORKER = """
+import importlib, pkgutil, sys
+import orchestrator.merge_lane as lane
+modules = ['orchestrator.merge_lane'] + sorted(
+    f'orchestrator.merge_lane.{found.name}'
+    for found in pkgutil.iter_modules(lane.__path__) if found.name != 'worker'
+)
+for module in modules:
+    importlib.import_module(module)
+    if 'orchestrator.merge_lane.worker' in sys.modules:
+        print(module)
+        break
+"""
+
+
+def test_no_submodule_but_the_worker_loads_the_worker() -> None:
+    """Why the façade resolves lazily; a fresh interpreter, since this suite loads the worker."""
+    completed = subprocess.run(
+        [sys.executable, '-c', _FIRST_SUBMODULE_TO_LOAD_THE_WORKER],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == '', f'importing {completed.stdout.strip()} loaded the worker'
 
 
 #: The pre-package module names task 5037 deleted. Nothing aliases them, so a

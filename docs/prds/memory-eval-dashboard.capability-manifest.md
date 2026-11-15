@@ -15,7 +15,7 @@ gate.
 
 | Leaf | Task | Load-bearing capabilities | Verdict |
 |---|---|---|---|
-| α backend reader + endpoint | (stamped) | M1/M2 exemplar fixtures from **3207 upstream**; verdicts read + escalation join reusing `load_queue_escalations` (INV-5, wired at `escalations.py:207-215`); TTL single-flight + config-property idioms verified; **no dashboard-side statistics** (mechanical `math.comb/lgamma` absent-check) | PASS |
+| α backend reader + endpoint | (stamped) | M1/M2 exemplar fixtures from **3207 upstream**; verdicts read + escalation join reusing the one escalation reader, `dashboard.data.escalation_corpus` (INV-5; the Escalations route reads through the same `acquire_corpus`, and task 6224 moved `memory_evals.py` onto it from the retired `load_queue_escalations`); TTL single-flight + config-property idioms verified; **no dashboard-side statistics** (mechanical `math.comb/lgamma` absent-check) | PASS |
 | β frontend section | (stamped) | chart primitives wired via `index.html` load order; `data.js`/`index.html` registration checks; MemoryTab wiring + `—`-empty-state pinned by structural tests (manual) | PASS |
 | γ parity integration gate | (stamped) | verdicts exemplar + `dedupe_fingerprint` stamping from **3211 upstream (amended)**; `dedupe_fingerprint` field verified on the model on main; both-directions parity + storm rendering pinned by integration tests | PASS |
 

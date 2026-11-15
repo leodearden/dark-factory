@@ -236,7 +236,7 @@ def _assertion_holds(assertion: SourceAssertion, source_root: Path) -> bool:
             _LOG_LABEL, target, exc,
         )
         return False
-    except Exception:  # noqa: BLE001 - never raise out of the guard
+    except Exception:  # never raise out of the guard
         logger.warning(
             "%s: unexpected error reading %s — assertion fails open",
             _LOG_LABEL,

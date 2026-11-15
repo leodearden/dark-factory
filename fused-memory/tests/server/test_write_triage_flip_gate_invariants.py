@@ -30,12 +30,15 @@ from pathlib import Path
 
 import pytest
 from shared.capability_manifest import DeliveredCheckMeta
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.grouped_read import PARENT_ID_KEY
 from fused_memory.server.write_triage_judge import select_judge_candidates
 from fused_memory.services.memory_service import RRF_K
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # A post-RRF rank-1 relevance score. Spelled out for the same reason
 # ``test_write_triage_judge.py`` spells it out: `relevance_score` is NOT the

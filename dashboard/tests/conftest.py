@@ -55,6 +55,7 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 from _dashboard_helpers import RECONCILIATION_SCHEMA, apply_isolated_env  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
+    _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
@@ -120,6 +121,21 @@ def dashboard_config(tmp_path):
 async def dummy_client():
     async with httpx.AsyncClient() as c:
         yield c
+
+
+@pytest.fixture()
+def fresh_task_snapshot_state():
+    """A test using this starts and leaves the task-snapshot collectors' state empty.
+
+    That per-process state is the snapshot unit cache, the last-good store
+    and the root rotation. Modules opt in with
+    ``pytestmark = pytest.mark.usefixtures('fresh_task_snapshot_state')``.
+    """
+    from dashboard.data.active_tasks import reset_task_snapshot_state
+
+    reset_task_snapshot_state()
+    yield
+    reset_task_snapshot_state()
 
 
 @pytest.fixture()

@@ -20,6 +20,9 @@ from typing import Any
 import pytest
 from migrate_metadata_modules_to_files import FusedMemoryClient
 from review_all_program_fixture import FIXTURE_DIR, FakeStore, load_state, running_fake_store
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 state = load_state()
 
@@ -176,8 +179,8 @@ def test_a_truncated_row_is_re_read_in_full_and_reported() -> None:
 
 
 @pytest.mark.parametrize('method', sorted(FIND_READS))
-def test_a_server_without_the_widening_is_refused(method: str) -> None:
-    with running_fake_store('--no-include-rows') as running:
+def test_a_server_without_the_widening_or_the_guard_is_refused(method: str) -> None:
+    with running_fake_store('--no-include-rows', '--drop-unknown-args') as running:
         reader = _reader(running)
         with pytest.raises(state.StoreReaderUnsupported) as caught:
             FIND_READS[method](reader)
@@ -188,7 +191,7 @@ def test_a_server_without_the_widening_is_refused(method: str) -> None:
 
 def test_a_server_that_rejects_the_argument_is_refused_the_same_way() -> None:
     with (
-        running_fake_store('--no-include-rows', '--reject-unknown-args') as running,
+        running_fake_store('--no-include-rows') as running,
         pytest.raises(state.StoreReaderUnsupported) as caught,
     ):
         _reader(running).program_tasks(RUN_ID, PRD_PATHS)

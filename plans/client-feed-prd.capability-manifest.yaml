@@ -262,6 +262,18 @@ tasks:
           pattern: "filer_grace_seconds"
           paths: ["client-feed/src/client_feed/policy.py"]
           expect: present
+  - label: "σ1c"
+    task_id: 8351
+    title: "client-feed σ1c: DefectRuled in the inbox contract (decision 14; added 2026-11-03)"
+    capabilities:
+      - name: "defect-ruled-inbox-model"
+        binding: "capability→producer σ1c — absent on main 06aea7ac01: contract.py's inbox union is RevealRequested | DefectReported; the portal's δ (scoping_intake 602) writes against this member and σ2 (7404) consumes it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class DefectRuled"
+          paths: ["client-feed/src/client_feed/contract.py"]
+          expect: present
   - label: "σ1b"
     task_id: 7403
     title: "client-feed σ1b: the acknowledgement — defect_filed, defects_filed, Source.filer, the ref reader and the unfiled check (feed 1.1)"

@@ -6,7 +6,9 @@ const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, Esca
 const { TasksTab } = window.DF_TASKS;
 const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
+const { QualityTab } = window.DF_QUALITY;
 const { staleNoticesForTab, loadingNoticeForTab } = window.DF_ENDPOINT_STALENESS;
+const { TAB_ENDPOINTS: TAB_POLL_PATHS } = window.DF_POLL_SCOPE;
 const { scopePollingToTab } = window.DF_DATA_LOADER;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
 const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
@@ -150,6 +152,7 @@ function App() {
     { id: 'burn',     label: 'Burndown' },
     { id: 'esc',      label: 'Escalations' },
     { id: 'esc-analytics', label: 'Analytics' },
+    { id: 'quality',  label: 'Quality' },
   ];
   const tabLabel = tabs.find(t => t.id === tab)?.label || 'Overview';
 
@@ -173,9 +176,7 @@ function App() {
     tasks: <DatumReading datum={tasksCensus} format={inFlightCountReading} />,
     // Runs an operator should go and look at: failures, plus any row whose
     // status recon_status.js does not recognise, so vocabulary drift is
-    // visible from the rail and not only from the tab. 'interrupted' is
-    // excluded — this fleet is restarted routinely, so those rows would sit
-    // the badge permanently nonzero on a healthy system. In-flight runs get
+    // visible from the rail and not only from the tab. In-flight runs get
     // their own tile on the tab rather than inflating this number.
     recon: reconAttentionCount(reconRunCounts(DD.RECON_STATE.runs)),
     merge: <DatumReading datum={inQueueOver(DD, null)} />,
@@ -184,9 +185,9 @@ function App() {
 
   // Per-endpoint staleness for the ACTIVE tab (task 4884, #4791).
   //
-  // ONE render site, not thirteen: the tab -> endpoint mapping lives in
-  // endpoint_staleness.js::TAB_ENDPOINTS, so adding a tab is a one-line edit
-  // there, and endpoint_staleness.test.mjs fails loudly if a mapped endpoint
+  // ONE render site, not one per tab: the tab -> endpoint mapping lives in
+  // poll_scope.js::TAB_ENDPOINTS, so adding a tab is a one-line edit
+  // there, and poll_scope.test.mjs fails loudly if a mapped endpoint
   // stops existing or a tab id goes unmapped. The per-tab toolbar config map
   // further down this function is the sibling per-tab map; keep the two
   // tab-id lists in step. (Spelled out rather than naming that binding,
@@ -201,8 +202,8 @@ function App() {
   // TAB_ENDPOINTS plus CHROME_ENDPOINTS now also decide what is POLLED, so a
   // tab opened for the first time may show its pre-fetch seed until its
   // endpoints answer: the one loading notice names every path with no receipt yet.
-  const staleNotices = staleNoticesForTab({ tab, stale: DD.__stale || {}, now: Date.now() });
-  const loadingNotice = loadingNoticeForTab({ tab, receipt: DD.__receipt || {}, stale: DD.__stale || {} });
+  const staleNotices = staleNoticesForTab({ paths: TAB_POLL_PATHS[tab], stale: DD.__stale || {}, now: Date.now() });
+  const loadingNotice = loadingNoticeForTab({ paths: TAB_POLL_PATHS[tab], receipt: DD.__receipt || {}, stale: DD.__stale || {} });
 
   function renderTab() {
     switch (tab) {
@@ -219,6 +220,7 @@ function App() {
       case 'burn':     return <BurnTab projectFilter={projects} displayWindow={win} />;
       case 'esc':      return <EscalationsTab projectFilter={projects} focus={escFocus} onFocusConsumed={() => setEscFocus(null)} />;
       case 'esc-analytics': return <EscalationAnalyticsTab projectFilter={projects} />;
+      case 'quality':  return <QualityTab />;
       default: return null;
     }
   }
@@ -239,6 +241,7 @@ function App() {
     burn:      { showAgents: false, search: false },
     esc:       { showAgents: false, search: false },
     'esc-analytics': { showAgents: false, search: false },
+    quality:   { showProjects: false, showAgents: false, search: false },
   }[tab] || {};
   const chip = CHIP_TAB_WINDOWS[tab];
   const chipEcho = chip ? windowEcho(DD.__receipt, chip.endpoint) : null;

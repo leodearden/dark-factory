@@ -1,0 +1,60 @@
+{
+  "task_id": "7720",
+  "reason": "net-additive: chain-link reservation, look-ahead hold, chain-tip successor base (deep merge-ahead 2A/5A)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/remerge_base.py",
+      "baseline": 37,
+      "current": 41
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/remerge_base.py::_breaks_chain",
+      "baseline": 4,
+      "current": 5
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1965,
+      "current": 1983
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_cascade_doomed_commits",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_run_inflight_verify",
+      "baseline": 93,
+      "current": 95
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::chain_snapshot",
+      "baseline": 3,
+      "current": 7
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_deep_dispatch.py",
+      "baseline": 137,
+      "current": 138
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5142,
+      "current": 5192
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6473,
+      "current": 6474
+    }
+  ]
+}

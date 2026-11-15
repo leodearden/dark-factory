@@ -12,7 +12,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 from shared.cli_invoke import no_mcp_servers_config
 
@@ -21,11 +21,11 @@ from orchestrator.evals.measurement import (
     MeasurementStage,
     Scored,
     Unmeasured,
+    UnmeasuredCause,
     json_answer,
     measured_call,
 )
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, GroundTruthIssue
-from orchestrator.evals.reviewer_trial.runner import PanelRunResult
 from orchestrator.review_payload import ReviewPayload, normalize_review
 
 if TYPE_CHECKING:
@@ -33,6 +33,25 @@ if TYPE_CHECKING:
     from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
+
+
+class PanelRun(Protocol):
+    """What scoring reads off one panel run; runner.PanelRunResult is one."""
+
+    @property
+    def variant_name(self) -> str: ...
+
+    @property
+    def diff_id(self) -> str: ...
+
+    @property
+    def reviews(self) -> Mapping[str, dict]: ...
+
+    @property
+    def total_cost_usd(self) -> float: ...
+
+    @property
+    def wall_clock_ms(self) -> int: ...
 
 
 @dataclass
@@ -95,6 +114,31 @@ class ScoringResult:
     def total_cost_usd(self) -> float:
         """Combined panel + matcher cost for this (variant, diff) pair."""
         return self.cost_usd + self.match_cost_usd
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ScoringResult:
+        """The inverse of ``asdict``. A record cached before task 6736 has no ``unmeasured`` and loads as measured."""
+        unmeasured = data.get('unmeasured')
+        return cls(
+            variant_name=data['variant_name'],
+            diff_id=data['diff_id'],
+            matches=[IssueMatch(**m) for m in data.get('matches', [])],
+            unmatched_gt=list(data.get('unmatched_gt', [])),
+            false_positives=list(data.get('false_positives', [])),
+            recall=data.get('recall', 0.0),
+            precision=data.get('precision', 0.0),
+            f1=data.get('f1', 0.0),
+            blocking_recall=data.get('blocking_recall', 0.0),
+            cost_usd=data.get('cost_usd', 0.0),
+            match_cost_usd=data.get('match_cost_usd', 0.0),
+            wall_clock_ms=data.get('wall_clock_ms', 0),
+            unmeasured=None if unmeasured is None else Unmeasured(
+                MeasurementStage(unmeasured['stage']),
+                UnmeasuredCause(unmeasured['cause']),
+                unmeasured['reason'],
+                unmeasured['cost_usd'],
+            ),
+        )
 
 
 # Schema for the LLM matcher output
@@ -326,7 +370,7 @@ def _parse_matches(
 
 
 async def score_panel_run(
-    run: PanelRunResult,
+    run: PanelRun,
     corpus_diff: CorpusDiff,
     *,
     usage_gate: UsageGate | None = None,

@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Literal, TypedDict
 
 import pytest
+from _merge_lane_fakes import lane_scene_config
 
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
@@ -152,17 +153,11 @@ def _make_config(
 
     ``chain_cap`` defaults to 0 — α's shipped kill switch — so a test that wants
     the deep path must opt in explicitly, exactly as an operator would.
-
-    The main-health probe is switched off through its own operator flag: a red
-    verdict here would otherwise spawn a DETACHED project-wide verify of the
-    tmp repo that outlives the test (task 5811; conftest's leaked-task drain
-    is the net under every scene that does not).
     """
-    return OrchestratorConfig(
-        project_root=repo,
-        git=git_config or _make_spec_git_config(),
+    return lane_scene_config(
+        repo,
+        git_config or _make_spec_git_config(),
         merge_deep=MergeDeepConfig(chain_cap=chain_cap),
-        escalate_preexisting_main_break=False,
     )
 
 
@@ -207,10 +202,11 @@ def _make_item(
     """Build a RealMergeItem around *req* sitting at *merge_commit*.
 
     ``speculative=True`` is SLOT 2 (the merge-ahead item, stacked on the
-    predecessor's merge commit) — the ONLY kind ``_deep_chain_placement`` gates
-    on, and therefore the only kind the chain walk ever sees;
-    ``speculative=False`` is SLOT 1, the head trust-anchor verify against real
-    main, which δ CANCELS and lands on the tip's authority (PRD decision #3).
+    predecessor's merge commit), which ``_deep_chain_placement`` chains at any
+    verify frontier; ``speculative=False`` is SLOT 1, the head trust-anchor
+    verify against real main, which chains only when alone in the verify
+    frontier (``plans/merge-lane-policy-prd.md`` D5) and which δ otherwise
+    CANCELS and lands on a slot-2 tip's authority (PRD decision #3).
     """
     return RealMergeItem(
         request=req,
@@ -666,14 +662,11 @@ def _drain_residue(worker: SpeculativeMergeWorker) -> set[str]:
     quietly drained away.
     """
     drained: set[str] = set()
-    for lane in ('high', 'normal'):
-        buf = worker._lane_buffers[lane]
-        while buf:
-            req = buf.popleft()  # a deque, not a list — `pop(0)` is a TypeError
-            drained.add(req.task_id)
-            if not req.result.done():
-                req.result.cancel()
-            worker._retire_item(req.request_id)
+    for req in worker._intake.drain_lanes_for_shutdown():
+        drained.add(req.task_id)
+        if not req.result.done():
+            req.result.cancel()
+        worker._retire_item(req.request_id)
     return drained
 
 

@@ -216,9 +216,10 @@ mined ones:
 ### Human spot-check subset
 
 A deterministic, evenly-spread ~10% sample of the **mined** diffs (floor 5,
-`__main__._select_spot_check_subset`) is flagged `in_spot_check_subset: true`
+`adjudication.py::select_spot_check_subset`) is flagged `in_spot_check_subset: true`
 for a documented human spot-check, with `spot_check_status` starting at
-`"pending"`. Membership is **sticky** across re-runs of `mine`: once an entry
+`"pending"`. Membership is **sticky** across re-runs of `mine`
+(`adjudication.py::AdjudicationLog.grow_spot_check_subset`): once an entry
 is flagged (or its `spot_check_status` moves past `"pending"`), it stays
 flagged even as later runs grow the mined set and recompute the sample --
 new ids are only ever added on top, so an operator's sign-off is never

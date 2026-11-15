@@ -26,10 +26,10 @@
 # WHY THE TWO HALVES USE DIFFERENT MECHANISMS
 # -------------------------------------------
 # The lane-state half is pure bash: NO jq, NO python3. It is called once per
-# lane from warm-lane-audit.sh, which runs from a systemd timer and from the
-# disk-pressure paths and is forbidden from ever aborting — a hard jq/python3
-# requirement there would be a new environmental failure mode for an
-# advisory-only read of two flat top-level string scalars.
+# lane from warm-lane-audit.sh, which runs from the disk-pressure paths and is
+# forbidden from ever aborting — a hard jq/python3 requirement there would be a
+# new environmental failure mode for an advisory-only read of flat top-level
+# string scalars.
 #
 # The protected-prefix half DOES shell out to python3, because
 # PROTECTED_PREFIXES cannot be faithfully text-scraped: five of its keys are
@@ -101,14 +101,14 @@ _lane_state_record() {
 #                          unreformatted; '' when the record is absent,
 #                          unparseable, or carries no such key. That EMPTY
 #                          reading means "this record's age is unjudgeable" —
-#                          it is not a claim that the lane is new. The consumer
-#                          is warm-lane-gc.sh's Pass-1 record gate, whose
-#                          staleness bound preserves (fails SAFE) on it: a
-#                          readable `assigned` state is a trustworthy claim
-#                          about STATE, so an unreadable timestamp leaves only
-#                          the AGE unknown, and reclaiming on that would let a
-#                          malformed field delete a genuinely live lane's
-#                          build.
+#                          it is not a claim that the lane is new. Both
+#                          consumers turn it into an age via lane_state_epoch
+#                          and handle an unjudgeable stamp in opposite ways.
+#                          warm-lane-gc.sh's Pass-1 record gate fails SAFE: it
+#                          preserves the lane and warns, because it deletes.
+#                          warm-lane-audit.sh falls back to the lane dir mtime
+#                          and labels the row `age_source=dir-mtime`, because
+#                          it only reports.
 #   stdout                 '<raw>' or '<raw> <task_id>'
 #
 # stdout carries only the headline pair, NOT the timestamp: warm-lane-audit.sh
@@ -126,8 +126,9 @@ _lane_state_record() {
 # release, so a second read is a DIFFERENT INSTANT and can report a pair of
 # values that never coexisted.
 #
-# FAILS OPEN to 'unknown', always — callers include a systemd-timer audit and
-# the disk-pressure paths, which must never abort on one bad lane. The two
+# FAILS OPEN to 'unknown', always — callers include the timer-driven gc sweep
+# (warm-lane-gc-sweep.sh, which execs warm-lane-gc.sh) and the audit's
+# disk-pressure path, which must never abort on one bad lane. The two
 # causes are kept DISTINCT because they send an operator to two different
 # places:
 #   no-readable-record   no state dir, or no readable <lane>.json there. The
@@ -184,7 +185,7 @@ lane_state_read() {
     # read, no second parser. `updated_at` is a flat top-level quoted string,
     # the exact shape _lane_state_scalar documents itself as handling, and its
     # miss behaviour (absent key or non-string value yields empty) is already
-    # the unjudgeable-age reading the gc consumer wants.
+    # the unjudgeable-age reading both consumers want.
     LANE_STATE_UPDATED_AT="$(_lane_state_scalar "$text" updated_at)"
     local raw
     raw="$(_lane_state_scalar "$text" state)"
@@ -199,6 +200,25 @@ lane_state_read() {
     else
         printf '%s\n' "$LANE_STATE_RAW"
     fi
+    return 0
+}
+
+# lane_state_epoch <updated-at>
+# THE ONE parse of a record's `updated_at` into epoch seconds. Prints the epoch
+# and returns 0, or prints NOTHING and returns 1 when the stamp is unjudgeable:
+# empty, or anything `date -d` cannot turn into an integer (including on a
+# non-GNU date that cannot parse ISO-8601). Call it in an `if` condition so a
+# `set -euo pipefail` caller never aborts on it.
+#
+# The empty case is tested FIRST, before `date` runs, because GNU `date -d ''`
+# does not fail: it exits 0 and answers today's midnight, which would read an
+# unstamped record as stamped today.
+lane_state_epoch() {
+    local stamp="${1:-}" epoch
+    [ -n "$stamp" ] || return 1
+    epoch="$(date -d "$stamp" +%s 2>/dev/null)" || return 1
+    [[ "$epoch" =~ ^-?[0-9]+$ ]] || return 1
+    printf '%s\n' "$epoch"
     return 0
 }
 
@@ -252,12 +272,16 @@ lane_state_class() {
 # The difference from the hand-copied glob this lib replaced (warm-lane-gc.sh's
 # old PROTECT_GLOB default, whose comment admitted the coupling and asked future
 # editors to keep it in sync across a repo boundary) is that this backstop is
-# MACHINE CHECKED. The drift gate is
-# orchestrator/tests/test_lane_state_lib.py::TestProtectGlobFallbackDrift: it
-# fails the build if PROTECTED_PREFIXES gains a band no pattern here covers, and
-# it proves it can fail by re-running itself against a monkeypatched registry.
-# So do not sync this by hand — add the band to PROTECTED_PREFIXES in
-# orchestrator/src/orchestrator/git_ops.py and let the gate tell you.
+# MACHINE CHECKED, by two gates in orchestrator/tests/test_lane_state_lib.py.
+# TestProtectGlobFallbackDrift is the production contract: it fails the build if
+# PROTECTED_PREFIXES gains a band no pattern here covers or if this string ever
+# protects an owned pool band, and it proves it can fail by re-running itself
+# against a monkeypatched registry. TestProtectGlobFallbackIsAVerbatimRender is
+# the stricter one the gc suites' REIFY_WARM_LANE_GC_PROTECT_GLOB pins depend
+# on: it fails on ANY byte difference from the render and prints the exact
+# replacement assignment. So do not sync this by hand — add the band to
+# PROTECTED_PREFIXES in orchestrator/src/orchestrator/git_ops.py and let the
+# gate tell you.
 #
 # Authored complete against the current registry MINUS the owned pool bands.
 # `_lane-*` and `_spec-*` must NEVER appear here: protecting them would make

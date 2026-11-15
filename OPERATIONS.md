@@ -172,6 +172,78 @@ the task tree directly. For status of a *running* orchestrator's live
 state, prefer the fused-memory/escalation MCP reads in [§4](#4-watching-a-run)
 or the dashboard.
 
+### Inspecting a unit's live environment
+
+Do not read `/proc/<pid>/environ` of the `systemd --user` manager, the pid
+`systemctl show -p MainPID --value user@$(id -u).service` names. It is the
+wrong place to look, twice over:
+
+- Whether the read is permitted at all depends on the manager's capability
+  state. Measured: `Permission denied` on 2026-09-27, while the manager's
+  `CapPrm` held `CAP_WAKE_ALARM`, which a normal shell lacks; readable on
+  2026-11-14, after a re-exec had dropped it.
+- When it is readable, it holds the manager's own exec-time environment, not
+  the block the manager hands units. On 2026-11-14 its `PATH` lacked
+  `~/.local/bin`, while the unit block's `PATH` began with it.
+
+Inside an agent sandbox any `/proc/<pid>/environ` read may also be denied: on
+2026-11-14 a dispatched agent got `EACCES` on the orchestrator unit's own
+MainPID.
+
+A unit's environment has three layers. `Environment=` overrides the manager
+block, and an `EnvironmentFile=` overrides `Environment=`. To eyeball them:
+
+- the manager's block now, which a restart inherits:
+  `systemctl --user show-environment`;
+- the unit's overlay:
+  `systemctl --user show <unit> -p Environment -p EnvironmentFiles`. It
+  space-joins the assignments, so a value containing a space cannot be split
+  back out;
+- the running process:
+  `tr '\0' '\n' < /proc/$(systemctl --user show <unit> -p MainPID --value)/environ`.
+  It is readable at the same uid for a service holding no capabilities.
+
+One command reads all three and compares them:
+
+<!-- unit-environment-recipe:begin
+     EXECUTED verbatim by tests/scripts/test_systemd_unit_environment.py against a fake busctl; edit the command and that guard runs the new one. -->
+- **Unit environment, layer by layer**: `cd "$(git rev-parse --show-toplevel)" && python3 scripts/systemd_unit_environment.py orchestrator-dark-factory.service`
+<!-- unit-environment-recipe:end -->
+
+Substitute any `--user` service unit, and add `--var NAME` (repeatable;
+default `PATH`). It asks systemd over `busctl --user --json=short`, so no value
+is split back out of space-joined text, and it needs only the system
+`python3`. Per variable it prints the manager value, the unit's value, the
+value a restart would give, the live value, and a verdict:
+
+| Verdict | Meaning | Action |
+|---|---|---|
+| `MATCHES` | The running process has the value a restart would give | None; the environment is not the problem |
+| `DRIFTED` | The running process predates the current value | Restart the unit |
+| `NOT_RUNNING` | `MainPID` is 0: stopped, or an idle oneshot | None; the next start gets the restart value |
+| `UNREADABLE` | The process's environ could not be read, or read empty; the report names the path, and the errno for a failed read | `EACCES`: re-run outside the sandbox, as the unit's uid. `ENOENT`: the process exited mid-read, so re-run. Read empty: the process was mid-exec, just (re)started, so re-run |
+| `INDETERMINATE` | The unit has `EnvironmentFile=`, `PassEnvironment=` or `UnsetEnvironment=`, whose effect is not visible over D-Bus; the report names them | Read the named inputs by hand; the live value is still reported |
+| `SET_AT_SPAWN` | systemd sets the variable anew each time it spawns the process, as it does `INVOCATION_ID`, `JOURNAL_STREAM`, `NOTIFY_SOCKET` and `LISTEN_FDS` (systemd.exec(5), "Environment Variables in Spawned Processes"), and the unit's `Environment=` does not set it | None; it is not configuration, and a restart replaces it |
+
+Exit codes: `0`, report printed; `3`, nothing read (busctl missing, failing,
+timed out or malformed, or the unit not loaded), with the reason on stderr and
+nothing on stdout; `4`, report printed but the live layer unreadable.
+
+A later `show-environment`, or an interactive `which`, cannot refute a unit's
+`ENOENT`: a running unit keeps its exec-time environment until it restarts.
+That is how `fused-memory.service` stayed degraded from 08:59 to 18:22 on
+2026-08-18. `DRIFTED` is that condition, and restarting the unit is the fix.
+
+The live layer is an exec-time snapshot. A change a process makes to its own
+environment afterwards, such as a `load_dotenv()`, never appears in
+`/proc/<pid>/environ`.
+
+The orchestrator units are immune to the manager's `PATH`: they pin
+`Environment=PATH=` (`scripts/orchestrator-dark-factory.service`). The
+host-side fix for every other unit is the untracked
+`~/.config/environment.d/995-user-path.conf`, whose own header gives the
+`995-` ordering rationale.
+
 ### Reading the flake ledger
 
 ```bash
@@ -271,8 +343,9 @@ The stuck-write record means a fix-task filing has stayed due for
 resolves that record itself once no filing is due. The outage and broken-probe
 records are described under *Outages* below.
 
-**Retention.** Pass directories older than 14 days are pruned, except those an
-episode (live or ended) still counts. Entries in the episode store expire
+**Retention.** Pass directories older than 60 days are pruned, except those an
+episode (live or ended) still counts. At the lane's measured ~3.5 MB a day that
+is about 210 MB. Entries in the episode store expire
 after 14 days without a write.
 
 #### Outages and the flake ledger
@@ -616,7 +689,8 @@ run as `client-feed@<name>.service`. Every pass writes that project's
 client-safe evidence to its `out/` (`feed.jsonl`, `state.json`,
 `cursor.json`) and reads its `in/` (`inbox.jsonl`, `engagement.json`), which
 the client portal writes. `scripts/setup-host.sh` renders the unit from
-`scripts/client-feed.service.template` and never enables it. The design is
+`scripts/client-feed.service.template` and never enables it. To install or
+refresh only this unit, use the targeted render under "Enabling an instance". The design is
 `plans/client-feed-prd.md`; what the publisher may open and write is its
 isolation invariant, §8.
 
@@ -667,10 +741,20 @@ loginctl enable-linger leo
 
 #### Enabling an instance
 
-From the checkout root:
+From inside the main checkout (`/home/leo/src/dark-factory`), never a task
+worktree: the render writes the checkout it runs in into the unit's
+`WorkingDirectory`, and the unit runs that tree's `.venv`.
 
 ```bash
-bash scripts/setup-host.sh       # renders client-feed@.service; enables nothing
+# render client-feed@.service with the arguments setup-host.sh §7a passes; enables nothing.
+# Writes nothing if uv is not on PATH (an empty --uv-path renders an ExecStart systemd rejects):
+command -v uv >/dev/null || { echo 'uv is not on PATH' >&2; false; } \
+  && repo="$(git rev-parse --show-toplevel)" \
+  && python3 "$repo/scripts/render_systemd_unit.py" --unit client-feed \
+       --template "$repo/scripts/client-feed.service.template" \
+       --repo-root "$repo" --uv-path "$(command -v uv)" \
+       --output ~/.config/systemd/user/client-feed@.service \
+  && systemctl --user daemon-reload
 # install the policy (above), then publish one pass; a refusal prints on stderr and exits 1:
 uv run --no-sync --project client-feed client-feed snapshot --config ~/.config/client-feed/<name>.yaml
 systemctl --user enable --now client-feed@<name>.service
@@ -681,8 +765,12 @@ journalctl --user -u client-feed@<name>.service
 
 The unit runs `uv run --no-sync`, so the shared `.venv` must already hold
 `client-feed`. setup-host's sync installs it, and so does
-`scripts/sync-orchestrator-env.sh`. After a template change, re-run setup-host
-and restart the instance. A clean stop exits 0. A refusal exits 1, and systemd
+`scripts/sync-orchestrator-env.sh`. After a template change, re-run the render
+command above and restart the instance. Do not use a full
+`scripts/setup-host.sh` run just for this: it restarts fused-memory
+(`systemctl --user stop fused-memory`, then start) whenever `fused-memory/.env`
+exists, which bounces the server behind every orchestrator, the dashboard and
+MCP sessions. A clean stop exits 0. A refusal exits 1, and systemd
 retries it with a 5s→60s backoff until the cause is fixed.
 
 #### Reading the heartbeat's degraded list
@@ -864,6 +952,150 @@ Queue**, **Costs**, **Burndown**, **Escalations**, and **Analytics**
 whole fleet at a glance — reach for direct MCP reads (below) when you need
 a specific answer right now.
 
+#### Payload budgets
+
+Every dashboard API request has a byte budget, so payload growth fails a
+check instead of a browser tab. The budgets live in one table,
+`dashboard/src/dashboard/payload_budgets.json`. Each entry is one REQUEST
+(a path plus its query), and its budget is the last entry of its `history`.
+
+- **The history is append-only.** To raise OR lower a budget, append
+  `{budget_bytes, task, reason}`. Never edit, reorder or delete a recorded
+  entry: the verify lane compares the table against the merge base and
+  refuses that. The table's `_README` states the headroom convention.
+- **Exemptions are for templated routes only**, each with a reason. Today
+  that is one route, the per-task prose route. Every literal GET route
+  under `/api/v2/dashboard/` must carry an entry.
+
+There are two enforcement points:
+
+1. **Pre-merge**: `dashboard/tests/test_payload_budget_sweep.py` serves
+   every entry through the real app over a synthetic fleet sized to the live
+   census. It fails on an overage, and on a budget that is slack against the
+   fleet.
+2. **Live**: `scripts/check_dashboard_payload_budgets.sh`, a launcher for
+   `dashboard/src/dashboard/payload_check.py`, measures the running
+   dashboard. Exit codes: 0 means within budget; 1 means over budget; 2
+   means the instrument failed (unreachable, timeout, non-200, a request not
+   reached before the run deadline, unreadable table, or the checker itself
+   raised). It runs daily as the `dashboard-payload-budgets` recurrence
+   chain. The fixture sweep cannot see organic growth from more tasks
+   existing; this check is what sees it.
+
+**Reading a failed link.** A link that exits non-zero files a born-at-L2
+`milestone_check_failed`. The checker prints one line per request, then each
+overage with its largest leaf fields and the task and reason behind the
+current budget, worst overage last, then a JSON summary. The detail keeps
+only the last 2,000 characters of that output. So what reliably survives is
+the summary and usually the worst overage just above it. The summary names
+the worst ratio and the over-budget requests, as many as fit its
+`dashboard/src/dashboard/payload_check.py::SUMMARY_MAX_CHARS` cap, then
+`+N more`. One overage runs to 1,100-1,400 characters, so the per-request
+lines and every other overage are usually cut. For the full report, run
+`scripts/check_dashboard_payload_budgets.sh` by hand. The remedy is one of:
+
+- shrink the payload; or
+- merge a raise appended to that request's history, naming your task and
+  why the larger size is right.
+
+Then resolve the escalation. That re-runs the check, and the chain moves on
+only when it passes.
+
+**The seed link** is task 10120, filed by task 5835 on 2026-11-14 for a
+first run at 18:15 UTC. It could only be filed once the script was on
+main, because `deterministic_task_guard` rejects a `before_done.script`
+that does not exist yet. The seed is only the first link: every link
+carries the recurrence key `dashboard-payload-budgets`, and the `chains`
+section of `/api/v2/dashboard/invariants` names the chain's current link
+and its state. The hourly re-mint sweep repairs a broken chain, so file a
+new seed only for a chain that has ended (its current link `cancelled`).
+The link's metadata:
+
+```
+task_kind:   deterministic
+milestone:   {mode: dated, at: <first run>}
+before_done: {kind: predicate, script: scripts/check_dashboard_payload_budgets.sh, timeout_secs: <payload_check.py::PREDICATE_TIMEOUT_SECS>}
+recurrence:  {key: dashboard-payload-budgets, interval_secs: 86400}
+```
+
+The checker bounds itself. Each request is bounded end to end, connect to
+last byte, by `--timeout` (60 s by default). The whole run is bounded by
+`--run-deadline`, whose default,
+`dashboard/src/dashboard/payload_check.py::RUN_DEADLINE_SECONDS`, is
+`PREDICATE_TIMEOUT_SECS` less a margin for start-up and one overage
+breakdown. A request not reached before the run deadline is NOT MEASURED,
+exit 2. So a stalled dashboard ends in the checker's own exit 2, never a
+no-verdict `ScriptTimeout`, however many requests the table holds. Seed the
+link with exactly
+`dashboard/src/dashboard/payload_check.py::PREDICATE_TIMEOUT_SECS` as
+merged: a smaller `timeout_secs` re-opens the no-verdict case. Minting renews
+the chain every interval. See
+`docs/task-authoring.md` §6 for the predicate contract and §6.1 for
+recurring chains.
+
+### Claimant-invariant gauge
+
+`GET http://127.0.0.1:8080/api/v2/dashboard/invariants` returns one record
+per root on the dashboard's roster, read directly and read-only from that
+root's `tasks.db`. The record shape is
+`dashboard/src/dashboard/data/root_invariants.py::RootInvariants.to_wire`,
+with `terminal_tier`, `hygiene_tier` and `chains` sections, and the
+per-project chip in the **Tasks** tab renders it. The contract is E-1 of
+`docs/prds/claimant-invariant-detection.md`.
+
+**Blind is never clean.** A `status: blind` root makes no count claim (its
+tier sections are `null`), and its `error` names the cause: `tasks.db` not
+found, could not be opened read-only, a scan error, or `scanned 0 rows`. A
+curl or HTTP failure means there is no reading at all. Neither is ever a
+zero (detection PRD D-2).
+
+**What to act on.** A nonzero `terminal_tier.unledgered_count`, or a blind
+root. Ledgered rows are sanctioned C4-E2 exceptions and need nothing;
+neither does the hygiene tier. The digest to read, what counts as a
+finding, and how to triage and file one are stated once, in
+`skills/_shared/reading-the-invariants-gauge.md` — read them there.
+
+To look at the rows behind a finding, run the ζ census from the main
+checkout:
+
+```bash
+cd /home/leo/src/dark-factory
+uv run --project fused-memory python scripts/clear_leaked_claimants.py --project-root <root> --json
+```
+
+The default dry run is read-only and never dials MCP. `--apply` clears the
+terminal tier's claimants through `set_task_claimant` (`--repair-hygiene`
+adds the hygiene tier). Exit 3 means nothing was read. Run the script
+directly, never via `python -m`.
+
+The census reports the raw terminal tier, ledgered rows included: unlike
+the gauge, it does not separate sanctioned C4-E2 exceptions (task 6777
+owns adding that). Before you
+treat a census terminal row as unledgered, or run `--apply`, check it
+against the gauge's `ledgered` flag or the row's
+`metadata.claimant_exception`.
+
+**The mint-time tripwire.** A `set_task_claimant` write that stamps a
+claimant onto a terminal row logs an ERROR whose discriminator is
+`claimant_stamped_on_terminal`. Find it in the fused-memory journal with a
+bounded window (`--grep` reads every line the unit logged in it, so a wide
+window is slow):
+
+```bash
+journalctl --user -u fused-memory --since -1h --no-pager -o cat --grep claimant_stamped_on_terminal
+```
+
+Exit 1 means no matching line, which is an answer, not a failure. The stamp
+is journal-only and retention is short; the gauge and the census stay
+authoritative.
+
+**The re-arm trigger.** There is deliberately no unattended alarm. Any
+observation, after ζ's repair has cleared the pre-existing residue, of a
+nonzero unledgered terminal tier mandates that the observer file ε.2, the
+escalation-grade alarm, at observation time. Its shape is pre-chosen in
+detection PRD D-7. The recorded downgrade is C4-E7 of
+`docs/prds/claimant-invariant-enforcement.md`.
+
 ### Useful MCP reads
 
 These are read-only and safe to call at any time from an interactive
@@ -918,7 +1150,10 @@ That latency is faster than any real model call.
   directly: `create: llm-failed: …`,
   `create: curator-unavailable: construction-failed: <ExcType>: <first line>`,
   `create: zero-output-breaker-open`, and so on. Then look for task 4448's
-  `curator_consecutive_degraded` escalation from `fused-memory/task-curator`.
+  `curator_consecutive_degraded` escalation from `fused-memory/task-curator`,
+  one pending record per project whose `dedupe_count` counts later runs. The
+  record shows the first run's cause; each later run's is in the fused-memory
+  log at ERROR, as `consecutive-degraded run for project … folded into <id>`.
   If it is absent while this one fires, suspect the `curator-unavailable` path,
   where no curator exists to count its own failures.
 - **Corroborate.** First check whether, and when, the curator last really
@@ -1064,6 +1299,29 @@ truncate-at-conflict semantics, and the stale-CAS abort — is
 `plans/deep-merge-ahead-prd.md`; this section is the operator's summary of
 it, not a second copy.
 
+**Deploying a knob flip.** `scripts/merge-deep-set-cap.sh`, like its sibling
+`scripts/merge-pytest-n-ab-switch.sh`, lands its yaml edit through the
+**target project's own merge queue** (`scripts/_merge_queue_landing.py`) and
+hot-reloads only once that landing is confirmed on main. It never commits to
+the target's main directly. Such a commit is drift that queue never verified,
+so every merge in flight there re-verifies in full
+(`orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers`).
+The landing pays one full merge verify of its own, so it can take hours.
+`MERGE_QUEUE_LANDING_TIMEOUT_SECS` (default 10800) bounds the wait. A
+request still in flight at that ceiling, or when the script is stopped, is
+cancelled. Every outcome short of a confirmed landing exits non-zero, naming
+the request's merge state.
+
+Set a calling deploy task's `before_done.timeout_secs` to at least the
+ceiling plus 300 s, not merely above it. The ceiling is checked only between
+polls, so a queue call in flight when it passes runs to its own reply
+timeout (130 s for the submit, 30 s for a poll), and the cancel after it can
+take 30 s more. The landing step can therefore end about 190 s past the
+ceiling (`scripts/_merge_queue_landing.py::land_file`), and the reload comes
+after a landing. A `before_done` timeout SIGKILLs the process group, so too
+tight a margin kills the script mid-cancel and leaves a live request that
+nothing reports.
+
 ### `resolve_issue` actions
 
 Resolving an L2 escalation takes an `action`, which maps to a specific
@@ -1073,7 +1331,7 @@ task-status effect:
 |---|---|---|
 | `resume` | → `pending` (resumes in place) | Your fix addresses the concern; let the task continue from here |
 | `restart` | → `pending` (restart from scratch) | The approach needs a redesign, not a patch |
-| `park` | → `blocked`; the L2 stays **open** | You need to leave it blocked but haven't resolved the underlying issue yet |
+| `park` | → `blocked`; the L2 stays **open** | You need to leave it blocked but haven't resolved the underlying issue yet. Refused on an `info` record (code `park_on_info`, nothing changed), because an info record never pins its task |
 | `abandon` | → `cancelled` | The task should not be pursued |
 | `close_only` | no task effect | The escalation itself is stale/moot but the task's own status is already correct — closes the escalation record without touching the task |
 
@@ -1081,6 +1339,82 @@ Always read the returned `resolution_action` back to confirm it matches
 what you intended — the parameter ordering matters (`action` before a long
 free-text `resolution`) and a mis-ordered call can silently record the
 wrong action.
+
+### Info notes, deliberate holds, and the info-L0 router
+
+An `info` record is a note with a consumer, never a hold: only a non-info
+record can keep a task from merging. The design home is
+[plans/info-l0-disposition-router-prd.md](plans/info-l0-disposition-router-prd.md).
+
+- **Holds are explicit.** To hold a task deliberately, `park` a non-info
+  record (the L2 stays open and the row stays `blocked`), or leave an open
+  non-info record on the task. An info record at any level never gates a
+  merge (`orchestrator/src/orchestrator/workflow.py::_is_gating_escalation`,
+  via `escalation/src/escalation/pins.py::needs_human`), never vetoes
+  recovery, never pins, and cannot be parked. For a task whose only records
+  are info, defer the task instead. A green, reviewed branch whose only open
+  records are info merges. A `blocked` row whose reason reads 'Gated by open
+  L2 <ids>; no steward applicable' was held by a non-info record that no
+  steward acted on; 'Steward re-escalated to human' appears only when a
+  steward actually filed the hand-off.
+- **Who consumes an info note.** In order: the reviewer (its verdict's
+  `note_dispositions`), then a steward already running for the task, then
+  the router at the workflow's exit. A requeued exit leaves the note pending
+  for the next incarnation. The orphan reaper and the startup amnesty route
+  whatever is left. The chain is described in ARCHITECTURE.md §3.6 and §6,
+  and the decision table lives in
+  `escalation/src/escalation/disposition.py::route_info_l0`.
+- **Reading a routed note.** A dispositioned note is closed under one of
+  four `resolution_class` values:
+
+  | `resolution_class` | What happened | Task exists? |
+  |---|---|---|
+  | `addressed` | The reviewer verified it fixed on this branch; resolved_by `reviewer-comprehensive/workflow` | No |
+  | `observation-consumed` | A pure observation: the reviewer said `no_action`, or the author's `suggested_action` opened with a no-action declaration | No |
+  | `converted` | The curator created or combined a follow-up task. The resolution text carries `converted:<task id>` and the curator ticket; the submit carried `metadata.escalation_id=<source id>`, so `find_tasks_by_metadata` finds a task it created | Yes |
+  | `status-info` | A mechanical harness notice (filer listed in `escalation/src/escalation/classify.py::INFO_L0_MECHANICAL_ROLES`) or a done-step-commit orphan. It is listed in its class's aggregate L1: sentinel task id `__info_l0_status_info_<class>__`, agent_role `harness-info-l0-router`, suggested_action `acknowledge_status_info`, one per class per sweep, amended rather than re-filed while open | No |
+
+  A pending info note stamped `triaged_by='info-l0-router'`, whose triage
+  note starts 'info-l0-router hold: ', is waiting on a curator ticket. The
+  orphan reaper owns it and finishes it within
+  `info_l0_router_ticket_timeout_secs`, so leave it alone.
+- **The `convert_to_task` fallback L1.** A note the router could not convert
+  is dismissed and promoted to one L1 under agent_role
+  `harness-info-l0-router` with suggested_action `convert_to_task`. Its
+  summary reads 'Info note not converted to a task (<reason>): …' and its
+  `detail` starts with the author's original text. The reason is one of
+  `escalation/src/escalation/disposition.py::PromoteReason`:
+  `ticket_refused`, `ticket_failed`, `ticket_timeout`, `conversion_cap`,
+  `router_error`, `no_convertible_content`. It is never
+  `manual_intervention`. The instruction to file the task with
+  `metadata.escalation_id=<source id>` or close the L1 with a rationale
+  lives in the L1's own `detail`
+  (`orchestrator/src/orchestrator/escalation_router.py::_fallback_detail`);
+  `skills/escalation-watcher-auto/SKILL.md` has no rung for
+  `convert_to_task` or `acknowledge_status_info`. The consumer of both L1
+  kinds is owned by task 3726 (router PRD D5). Overflow past the per-sweep
+  conversion cap is listed in one aggregate under
+  `__info_l0_conversion_overflow__`.
+- **The auto-watcher's info-only-cluster rung.** `promote_to_l2` with
+  `severity` omitted over an all-info cluster returns
+  `{'status': 'refused', 'code': 'info_only_cluster', 'members': […], 'unusable': […], 'derived_severity': 'info'}`.
+  Nothing is minted and nothing is folded into a pending L2. The watcher
+  closes `members` at L1 with a digest line, or re-issues with an explicit
+  blocking severity when it judges the cluster collectively blocking; it
+  never re-issues with `severity='info'`. The recipe is
+  `skills/escalation-watcher-auto/SKILL.md`, section "Info-only cluster". So
+  the L2 queue the standing `/escalation-watcher` drains holds no
+  inherited-info records.
+- **Telemetry and knobs.** Every disposition is one `info_l0_dispositioned`
+  event, whose payload fields are defined by
+  `orchestrator/src/orchestrator/escalation_router.py::_emit`, and the
+  dashboard's Analytics tab counts the four classes
+  above under `dispositioned`. The four `info_l0_*` config keys
+  (`info_l0_router_enabled`, `info_l0_router_ticket_timeout_secs`,
+  `info_l0_router_max_conversions_per_sweep`, `info_l0_note_detail_chars`)
+  are green-tier hot-reloadable; `info_l0_router_enabled` is the kill switch.
+  Their defaults live in
+  `orchestrator/src/orchestrator/config.py::OrchestratorConfig`.
 
 ### Merge-halt semantics (`wip_conflict` / `unmerged_state` / `stash_failed`)
 
@@ -1331,10 +1665,60 @@ then clear the bench. Other skew reasons name the failing step (uv, disk, the
 gate root, the remote config): fix it on the host and let the reprobe re-admit
 it.
 
+**Low-battery guard on leo-laptop** (task 9051):
+`scripts/deploy/install_laptop_battery_guard.sh` installs a root
+`laptop-battery-guard.timer` (add `--check` to only print the current reading),
+then runs the service once and requires `Result=success`, so a broken drop-in
+fails the install rather than the guard. Every 30 s it reads BAT* and ignores AC online, which stays 1 on a weak USB-C
+supply. At Discharging <= 10 % it stops `df-verify-*.scope` and powers off; at
+11–15 % it warns in the journal and on the desktop. Tune with `systemctl edit`
+drop-ins (`BATTERY_GUARD_FLOOR_PERCENT`, `BATTERY_GUARD_WARN_MARGIN_PERCENT`,
+or the timer's `OnUnitActiveSec`), which the installer never overwrites. After
+an unexpected poweroff, `journalctl -b -1 -u laptop-battery-guard.service`
+shows the reading that triggered it.
+
 `scripts/orchestrator-watchdog.py --report` shows a `CODE-SHA` column per
 unit: the commit each unit's verify wire path was imported from, read from
 its fleet heartbeat. Units at different commits build different gate
 directories; they never share or overwrite one.
+
+### Remote task verifies (`verify_task_*`, task 6670)
+
+An implement-phase task verify can run on a `verify_runners` host instead of
+locally. The orchestrator keeps one quarantine set and one queue per remote
+host for its whole process life. A host either lane benches is benched for
+both, as the same `ru`/`skew`/`divergence` bench above. A readmission on the
+merge lane (reprobe or operator clear) re-offers the host to its waiting
+task verifies at once, in `verify_admission_order`. While a task holds a host, that host's
+`get_merge_queue()` row carries `task_held_by: 'task:<id>'`. A task hold
+takes no merge slot. Four keys, all green tier, read per dispatch and at each
+remote grant (contract: `plans/remote-task-leg-verify-prd.md` §5.7):
+
+- `verify_task_host_policy` (default `local`): `local` runs every task
+  verify locally, byte-identical to before, and writes no dispatch record.
+  `data/verify-logs` is unchanged. `remote_modules` makes a verify eligible
+  when its executed module set intersects `verify_task_remote_modules`.
+  `remote_all` makes every verify eligible.
+- `verify_task_remote_modules` (default `[]`): the module prefixes eligible
+  under `remote_modules`. An empty list there is rejected at load and at
+  reload, naming both keys.
+- `verify_task_remote_red_confirms_locally` (default `false`): a remote red
+  re-runs the ordinary local verify, and the local verdict is returned.
+- `verify_task_remote_cross_check_every_n` (default `0`, off): every n-th
+  verify that returns a remote verdict, green or red, is re-run locally, with
+  the local verdict authoritative. The count is per orchestrator process and
+  covers exactly the verifies whose dispatch record has `reason` `remote`,
+  `cross_check` or `red_confirm`. A verify that ran local for any other
+  reason does not advance it.
+
+Off `local`, each verify the dispatcher considers leaves
+`data/verify-logs/<task>/attempt-N.dispatch-<stamp>.json`. Its `decision`
+(`remote`/`local`), `runner` and `reason` say where the verdict came from,
+and a remote run's streams sit beside it as `attempt-N.remote-<host>.*`.
+The workflow's `workflow_verify` row records the same `runner`. **Rollback**
+is one edit, `verify_task_host_policy: local`, then
+`mcp__escalation__reload_config`. The next dispatch runs locally, and a leg
+already running finishes where it is.
 
 ---
 
@@ -1369,12 +1753,25 @@ takes no arguments: it always re-reads that process's own
   `orchestrator/src/orchestrator/config.py::ScoringConfig` and
   `plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §C2. The legacy
   formula's `age_alpha` / `cpm_beta` stay restart-only.
+- `deterministic.predicate_recheck_stall_cap` (default 30, `>= 1`): how many
+  consecutive exit-75 "not yet" verdicts a re-arming predicate may return
+  before the runner files `milestone_check_stalled`. Read whenever a
+  deterministic slot builds its runner, so a reload applies from the next
+  dispatch. Calibrate it from `predicate_recheck_stalled` events. Normative
+  homes: `orchestrator/src/orchestrator/config.py::DeterministicConfig` and
+  `plans/completion-driven-triggers-prd.md` C1.
 - `verify_env`
 - `verify_cgroup_cpu_weight_merge` / `_task` / `_background` (the per-role
   cgroup `CPUWeight` a verify scope is spawned with when
   `verify_use_cgroup_scope` is on; read at each scope spawn, so a reload
   applies from the next verify leg — a scope already running keeps the weight
   it started with)
+- `verify_cgroup_memory.high_gib` / `.max_gib` / `.swap_max_gib` (the
+  integer-GiB `MemoryHigh` / `MemoryMax` / `MemorySwapMax` every verify scope
+  is spawned with when `verify_use_cgroup_scope` is on, one value for every
+  role; an unset leaf adds no property, and high may not exceed max; read at
+  each scope spawn, so a reload applies from the next verify leg). Normative
+  home: `orchestrator/src/orchestrator/config.py::VerifyCgroupMemoryConfig`.
 - `git.merge_park_lock_grace_seconds` (the `advance_main` index-lock
   stand-off budget — re-read per advance, see
   [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state))
@@ -1433,11 +1830,26 @@ takes no arguments: it always re-reads that process's own
   kill all land on the next dispatch round.
 - `plan_text_fp_gate_enabled` (task 4031 amendment gate; OFF = pre-4031
   Lever-B skip).
+- `verify_task_host_policy`, `verify_task_remote_modules`,
+  `verify_task_remote_red_confirms_locally` and
+  `verify_task_remote_cross_check_every_n` (task 6670; default `local`, which
+  keeps every task verify local and writes nothing new). Read per dispatch and
+  at each remote grant, so rollback is one reload to `local`. See
+  [§"Remote task verifies"](#remote-task-verifies-verify_task_-task-6670).
 - `pre_merge_reverify` (default `false`; task 6580, Leo ruling 2026-10-09).
   The workflow merge phase rebases the task branch onto main and submits it
   with no task-role verify: the merge gate verifies every landing (task 1724),
   so that verdict had no reader. `true` restores the advisory post-rebase
   re-verify — a rollback switch only, read at each merge attempt.
+- `implementer_brief_variant` (default `whole-plan`; task 5385). `one-step`
+  makes each EXECUTE iteration's implementer complete exactly one plan step:
+  the iteration cap becomes the plan's item count + 3, and the implementer's
+  `max_turns`/`budget_usd` are a third of its resolved route — on every
+  implementer-role pass, so the amender and post-escalation resume passes are
+  cut too, and per-iteration eval metrics must count EXECUTE iterations
+  apart from them. An eval axis
+  (`<candidate>@one-step`, `plans/live-shadow-eval-prd.md` decision 14); no
+  production config sets it. Read at each brief, cap check and route.
 
 **Red tier (restart-only — the edit is accepted into the file but has no
 effect until a full restart):**
@@ -1467,7 +1879,12 @@ other's list. Its green tier currently covers several `reconciliation.*`
 leaves (the near-dup/topic-guard knobs and `stale_run_recovery_seconds`),
 `write_triage.*`, and the five in-place-update leaves below — read
 `RELOADABLE_FIELDS` in `fused-memory/src/fused_memory/config/reload.py` as
-the authoritative list rather than treating this enumeration as exhaustive:
+the authoritative list rather than treating this enumeration as exhaustive.
+`server.*` (the bind host, the port and `recon_report_port`) is not in it, so
+a bind change is restart-only in both processes (the orchestrator's
+`escalation` bind host/port is red tier above), and a port held by
+`fused-memory.socket` needs `scripts/restart-fused-memory.sh --rebind-socket`
+([§8 Socket activation](#socket-activation-mcp-ports-survive-restarts)):
 
 - `mem0_update.enabled` — **the kill switch for `update_memory`**, the
   in-place Mem0 amend tool. Green-tier on purpose: this is what you flip
@@ -1876,9 +2293,11 @@ deliberately kept orthogonal — don't conflate them when debugging a
 restart:
 
 - **Liveness = brokenness.** `main()`'s pass over the **`WATCHED`
-  orchestrator units** revives a dead unit immediately on either of two
-  signals — per-unit, uncapped, not gated by any fleet-wide clock, and it
-  never stamps that clock. The port-probe signal (wedged or port-down) is
+  orchestrator units** revives a dead unit on either of two signals. It is
+  capped to one revive per unit per `ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS`
+  (900s), on per-unit clocks under `data/orchestrator/liveness-restart/`, and
+  the one cap covers both signals. It is not gated by any fleet-wide clock and
+  never stamps one. The port-probe signal (wedged or port-down) is
   unchanged. Under systemd socket activation each unit's escalation port is
   held by its own `.socket` unit, so it can keep reading LISTEN across a
   dead service; `main()` therefore also asks systemd's ActiveState
@@ -1890,9 +2309,14 @@ restart:
   `reset-failed` (targeting the unit AND its `.socket` sibling) then
   `restart --no-block`, so a revive never closes a socket-activated unit's
   listening socket out from under an open MCP connection. A single
-  wedged-unit revive is not a fleet deploy. Read "uncapped" as scoped to
-  those units: it does **not** describe `fused-memory.service`, which is
-  deliberately kept out of `WATCHED` and has had its own streak-gated,
+  wedged-unit revive is not a fleet deploy. A unit in
+  `Result=start-limit-hit` is **not** revived: no `reset-failed`, no restart.
+  It stays down with its crash-loop page open (see "Crash loop" below). The
+  cap is sized so a unit that dies again straight after each revive is revived
+  at most four times an hour, not once per 60s tick, while a genuinely wedged
+  unit still waits at most 15 minutes after an earlier revive. This cap and
+  the start-limit-hit hold are scoped to those units: `fused-memory.service`
+  is deliberately kept out of `WATCHED` and has had its own streak-gated,
   rate-capped liveness pass since task 3764 — see
   [fused-memory liveness revive](#fused-memory-liveness-revive) below.
 - **Staleness = a scheduled fleet deploy.** The watchdog's staleness pass
@@ -1925,6 +2349,51 @@ restart:
   eligibility — bypassing the idle/debounce gates — but honors the same
   shared 8-hour clock. Since task 5371 it passes `--drain` too (it is still
   disabled by config until task 5020).
+
+**Crash loop (task 8270).** On every tick `main()` reads
+`systemctl --user show -p NRestarts,Result` for every `WATCHED` unit before
+the enabled and startup-grace gates, because the grace window is what hid the
+2026-10-26 loop. Disabled units are sampled too. The samples are kept in
+`data/orchestrator/watchdog-restart-rate.json`. The watchdog files one
+born-at-L2 `critical` escalation, task `orchestrator-crash-loop-<unit>`
+(agent role `orchestrator-watchdog`, category `infra_issue`), into
+dark-factory's `data/escalations` via `escalation submit` when either holds:
+
+- NRestarts grew by at least `ORCH_RESTART_RATE_ALARM_COUNT` (5) within
+  `ORCH_RESTART_RATE_ALARM_WINDOW_SECS` (1800s);
+- systemd reports `Result=start-limit-hit`.
+
+NRestarts counts only `Restart=` restarts, and any manual start (a watchdog
+revive, a sweep) resets it to 0. The growth count therefore adds the new value
+whenever the counter drops, rather than taking a plain difference. At most one
+page attempt is made per window per unit, whichever kind. A start-limit-hit
+episode counts as paged only once `escalation submit` has succeeded, so a
+failed submit of either kind retries at window cadence until it lands. This
+matters because one fault can do both at once: an import error under
+`escalation/` or a broken workspace venv can crash-loop the orchestrators and
+break the submit. The unit stays down meanwhile, so the retry is the only
+path to a page. Once a start-limit-hit page has landed, no further one is
+filed until the unit leaves start-limit-hit. To find the cause, read
+`journalctl --user -u <unit>`, then the project's runs.db `exit_reason` /
+`startup_completed_at` columns (startup-hardening task γ). Once the cause is fixed, restore the unit with
+`systemctl --user reset-failed <unit> && systemctl --user start <unit>`.
+`WATCHED` is the detector's unit set; the `--report` RESTARTS column covers
+every running orchestrator unit. Code:
+`scripts/_watchdog_crash_loop.py::crash_loop_pass`; the reader is
+`scripts/orchestrator-watchdog.py::_unit_restart_status`.
+
+Env knobs for the crash-loop detector and the orchestrator revive cap. All
+are read with a fallback, so a typo'd value cannot crash the oneshot watchdog:
+
+| var | default | meaning of `<=0` |
+|---|---|---|
+| `ORCH_RESTART_RATE_ALARM_COUNT` | `5` | **Clamped to >=1.** `0` would page every unit on zero growth. |
+| `ORCH_RESTART_RATE_ALARM_WINDOW_SECS` | `1800` | **Clamped to >=1.** Also the one-page-per-unit dedup window. |
+| `ORCH_LIVENESS_RESTART_MIN_INTERVAL_SECS` | `900` | Disables the per-unit revive cap, without even reading the clock. |
+| `ORCH_RESTART_RATE_STATE` | `data/orchestrator/watchdog-restart-rate.json` | Path override for the detector's samples (not a duration). |
+| `ORCH_CRASH_LOOP_QUEUE_DIR` | `data/escalations` | Path override for the queue pages are filed into (not a duration). |
+| `ORCH_LIVENESS_RESTART_CLOCK_DIR` | `data/orchestrator/liveness-restart` | Path override for the per-unit revive clocks (not a duration). |
+| `ORCH_WATCHDOG_UV_BIN` | `/home/leo/.local/bin/uv` | The uv that runs `escalation submit`. Absolute, because the watchdog unit sets no PATH. |
 
 **Module-removal fast path (task 7198).** A watched commit that deletes or
 renames a `.py` module under `orchestrator/src`, `escalation/src` or
@@ -2138,8 +2607,11 @@ mid-restart wait in the kernel backlog and are served by the new process.
 
 | Socket unit | Ports | Service |
 |---|---|---|
-| `fused-memory.socket` | `0.0.0.0:8002` (MCP), `127.0.0.1:8103` (recon escalation queue) | `fused-memory.service` |
+| `fused-memory.socket` | `127.0.0.1:8002` (MCP), `127.0.0.1:8103` (recon escalation queue) | `fused-memory.service` |
 | `orchestrator-<project>.socket` | that project's `escalation.port` (8100–8108) | `orchestrator-<project>.service` |
+
+fused-memory binds its third port, the recon-report port 8003
+(`server.recon_report_port`), itself, on `server.host`, which is loopback too.
 
 The servers adopt the socket via
 `shared/src/shared/systemd_listeners.py::take_systemd_listeners`; without
@@ -2193,6 +2665,45 @@ connected sessions may drop once. Before restarting fused-memory by hand,
 check `systemctl --user is-active fm-staleness-redeploy.service`: the
 fused-memory tier has no restart lease, so a staleness redeploy in flight
 restarts it again underneath you (seen 2026-09-29).
+
+For fused-memory, `scripts/restart-fused-memory.sh --rebind-socket` is the
+procedure: it installs the committed `scripts/fused-memory.socket.template`
+and runs that stop then start. It refuses with exit 3 while
+`fm-staleness-redeploy.service` is active, exits 1 if `/health` never
+answers, and otherwise exits with `scripts/check_network_exposure.py`'s
+status. The script's header gives the exact sequence and how the mode
+composes with `--now` and `--drain`.
+
+### Network exposure check
+
+`scripts/check_network_exposure.py` checks that every factory port is
+reachable on loopback only, by real TCP connects; it reads no firewall rules
+(contract: `plans/mcp-network-exposure-prd.md` §3). It probes the ports of the
+active `fused-memory.socket` and `orchestrator-*.socket` units, the compose
+publishes and the recon-report port, on every address `ip -j addr` lists
+outside scope `host` and on `127.0.0.1`. `scripts/setup-host.sh` §11 runs it.
+
+One loopback refusal is not a failure. fused-memory starts without the compose
+services in the script's `OPTIONAL_COMPOSE_SERVICES` (today `embedder`, whose
+`ExecStartPre` in `scripts/fused-memory.service.template` is `-`-prefixed), so
+on a host that has never created such a service's container nothing is meant
+to serve its port. When a port refuses on `127.0.0.1` and every owner of it is
+such a service, the check asks docker, read-only, whether the service has a
+container in any state: `docker container ls --all --quiet`, filtered on the
+labels `com.docker.compose.project=docker` (compose's default project name,
+the compose file's directory) and `com.docker.compose.service=<service>`. With
+no container, the port gets an informational `[no-container]` line instead of
+a failure. Once the container exists, a refusal fails again, even while the
+container is stopped. Off-loopback findings and a loopback timeout are never
+excused, and if docker cannot be read the refusal stays a failure.
+
+To run it by hand (no sudo; the connects are read-only):
+`python3 scripts/check_network_exposure.py [--connect-timeout SECS]`. Exit 0
+means loopback only, and may carry informational `[no-container]` lines; 1
+means a finding. Every line carries the `[network_exposure]` tag, and each
+finding line names its kind in brackets, then the port, its owners and the
+address. What each kind means and how to clear it is in the
+[§10 Troubleshooting](#10-troubleshooting) row for a `Network exposure:` FAIL.
 
 ### fused-memory liveness revive
 
@@ -2357,6 +2868,51 @@ python3 /home/leo/src/dark-factory/scripts/falkordb_aof_gate.py \
   --compose-file /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml --check-only
 ```
 
+#### Experiments never touch production FalkorDB
+
+Production has segfaulted three times, and two of the crashes were ad-hoc
+probes. Both probes crash it again every time they run:
+
+- 2026-08-05: an `EVAL` that `RESTORE`d a `DUMP` of `dark_factory` on the
+  same server. This is fixed upstream in 4.22.1, but production runs 4.18.0.
+- 2026-10-04: an Entity read with `uuid IN ['a','b']` (FalkorDB#3348).
+
+So:
+
+1. **Experiments, clones and index work go to "The scratch FalkorDB" below.**
+   Scratch is shared by every test session, so a probe that you expect to
+   crash the server goes somewhere else. Run it in a private throwaway
+   container of the image production runs, with no `-p`:
+
+   ```bash
+   docker run -d --name <unique> "$(docker inspect -f '{{.Config.Image}}' docker-falkordb-1)"
+   docker exec <unique> redis-cli GRAPH.QUERY <graph> '<query>'
+   docker rm -f <unique>
+   ```
+
+2. **On production, ad-hoc access is reads through
+   `docker exec docker-falkordb-1 redis-cli`, and nothing else.** This rule
+   covers hand-run access. It does not cover this section's own remedy and
+   recovery procedures, or committed tooling, whose access to production is
+   settled when it is reviewed. The eval harness and
+   `seed_scratch_reference_graph.py` in "The scratch FalkorDB" below are
+   committed tooling of that kind.
+3. **Never clone a graph on production.** That means no `RESTORE` onto it and
+   no `EVAL`. The one sanctioned `DUMP` is
+   `fused-memory/scripts/seed_scratch_reference_graph.py`, and its `RESTORE`
+   goes to scratch.
+4. **No IN-list, and no OR of equalities, on an indexed property of Entity,
+   Episodic or Community,** unless every value has first been checked
+   against `graphiti_core.driver.falkordb.STOPWORDS`. The check ignores case.
+   This applies to reads too, because `GRAPH.RO_QUERY` crashes the same way.
+   A single `=` and a property map are safe. The measured shape matrix, the
+   other safe forms and the code-site audit are in
+   `plans/falkordb-stopword-in-list-audit.md`.
+5. **Never construct a graphiti driver for a probe.** graphiti_core's
+   `FalkorDriver.__init__` schedules `build_indices_and_constraints()`, which
+   writes `CREATE INDEX` to the graph the driver names. This was seen on
+   2026-10-29 on `default_db`.
+
 #### Deciding which FalkorDB copy is newest
 
 A data dir can hold two copies of the graph: the AOF (`appendonlydir/`, base
@@ -2435,6 +2991,324 @@ gate refuses to create one. Here the AOF was written moments ago from the
 loaded data, so it is current. Delete the `.pre-bootstrap` copies once the
 counts match.
 
+### The scratch FalkorDB
+
+Integration tests, the offline lane and the local-memory-models eval harness
+write to a second FalkorDB, never to production (task 7792). It is the compose
+service `falkordb-scratch` in `fused-memory/docker/docker-compose.yml`, on
+`127.0.0.1:6380`. It runs the same pinned image and `FALKORDB_ARGS` as
+`falkordb`, and a test pins the two equal. Its data lives in the named volume
+`falkordb-scratch-data`, not a bind mount, and it persists by RDB only
+(`--appendonly no --save 3600 1`). Everything on it is disposable except the
+seeded reference graph below.
+
+**Who starts it.** `scripts/setup-host.sh` starts it on a fresh host. On an
+existing host, start it once by hand:
+
+```bash
+docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d --no-deps falkordb-scratch
+```
+
+`--no-deps` leaves every other service alone. Because the volume is named,
+every checkout's compose file reaches the same container and data (compose
+project `docker`, volume `docker_falkordb-scratch-data`). Use the main
+checkout's anyway, as for `falkordb`.
+
+**Who keeps it running.** Docker does, through `restart: unless-stopped`,
+across crashes, daemon restarts and reboots. A `docker stop` keeps it down
+until someone starts it again. The fused-memory unit does not start it. Its
+gate brings up `falkordb` and `qdrant` and a second hook brings up `embedder`.
+Another hook would break the unit's start budget (280 s + 15 s = 295 s <
+`TimeoutStartSec=300`, `scripts/fused-memory.service.template`), and a scratch
+outage must never hold up production's start.
+
+**How tests reach it.** Through `FALKOR_HOST`/`FALKOR_PORT`, default
+`localhost:6380`, resolved by
+`fused-memory/src/fused_memory/config/falkordb_endpoints.py::scratch_falkordb_from_env`.
+At session start a fused-memory test session sets `FALKORDB_URI` to the same
+address
+(`fused-memory/tests/_fm_falkor_live.py::prepare_scratch_falkordb_session`),
+so config-built backends follow it too.
+
+**What fails loudly.**
+
+- A test session whose `FALKOR_HOST`/`FALKOR_PORT` aim at production (`:6379`
+  on a loopback host) exits 4 at session start, inside the lane or out of it.
+- Under the offline lane (`DF_VERIFY_ROLE=offline`), an unreachable scratch
+  server ends the session at start, so a pass cannot go green by skipping
+  every FalkorDB test. The lane's outage probe
+  (`fused-memory/scripts/lane_dependency_probe.py`) checks FalkorDB on the
+  scratch server too, so the pass is recorded as an outage whose line starts
+  `falkordb: `. Outside the lane, an unreachable server still skips the
+  FalkorDB tests.
+
+**The reference graph.** The eval harness's embedding runs and `probe-set`
+copy and read `evalmem_lme_ref_incumbent_a`, so it must exist on scratch. Seed
+it from `fused-memory/`, and seed it again after a `docker compose down -v` or
+a rebuilt reference:
+
+```bash
+uv run python scripts/seed_scratch_reference_graph.py
+```
+
+The script reads the graph from the FalkorDB the config names (`FALKORDB_URI`,
+production) with `DUMP` and read-only queries. It `RESTORE`s the graph on
+scratch under the same name, checks the copy's topology hash and index
+definitions against the source, and saves. A graph's name travels inside its
+`DUMP` payload, so a restore under any other name is not a faithful copy.
+The script refuses a graph the scratch server already holds: remove that one
+first with `GRAPH.DELETE`. Exit 3 is a refusal. Exit 4 is a copy that did not
+match its source; the copy has been deleted again. Exit 1 is a run that could
+not complete: an unreachable server, a bad `FALKORDB_URI`, a copy that failed
+verification and could not be deleted (the message names it), or a failed
+`SAVE` (the verified copy is live but unsaved; run `SAVE` on scratch).
+
+**The harness reads production and writes scratch.** `harness.py` reads its
+corpus (`dark_factory`, over `GRAPH.RO_QUERY`) from the FalkorDB the config
+names, the only store that holds it. Every write, copy, index build and
+teardown goes to scratch (`fused-memory/scripts/local_memory_models_eval/README.md`).
+
+Check it:
+
+```bash
+docker exec docker-falkordb-scratch-1 redis-cli ping              # PONG
+docker exec docker-falkordb-scratch-1 redis-cli CONFIG GET save    # save / 3600 1
+docker exec docker-falkordb-scratch-1 redis-cli GRAPH.LIST         # lists evalmem_lme_ref_incumbent_a
+```
+
+### FalkorDB index provisioning: expected set, drift, the BM25 canary, the composite trap
+
+fused-memory builds the range and fulltext indices on every registered project
+graph itself (`docs/prds/falkordb-index-provisioning.md`). Until it did, no
+graph had them, and BM25 returned nothing without anyone noticing. Nothing
+here asks you to create or drop an index by hand.
+
+**Who provisions, and when.** At startup `GraphitiBackend.initialize` calls
+`GraphitiBackend.provision_registered_graphs`, which provisions every
+registered graph that already exists
+(`fused-memory/src/fused_memory/backends/graphiti_client.py`). A registered
+graph's first write in a process goes through `GraphitiBackend._ensure_indices`,
+so a registered project with no graph key yet is provisioned on its first
+write, with no restart. Each run reads `list_indices()`, diffs it against the
+expected set and creates only what is missing
+(`fused-memory/src/fused_memory/backends/falkor_indices.py::plan_index_statements`).
+A provisioning failure fails neither the write nor the rest of the sweep. A
+failed statement is logged at WARNING and the graph is still cached, so only a
+restart retries it. A provisioning run that raises or times out is left
+uncached, so the next write or a restart retries it.
+
+The scope is the project registry, `taskmaster.project_root` plus
+`DASHBOARD_KNOWN_PROJECT_ROOTS`, not a graph name. Probe, test and scratch
+graphs are never provisioned. A live graph that should carry indices but is not
+registered gets REGISTERED, never special-cased (PRD D5).
+
+The `pass` override on `_MultiTenantFalkorDriver.build_indices_and_constraints`
+stays, deliberately. It suppresses the implicit build every `clone()` would
+otherwise fire, which caused the `723ec915c3` storm (PRD D4). Do not delete it.
+
+**Repair** is a fused-memory restart:
+`/home/leo/src/dark-factory/scripts/restart-fused-memory.sh`, whose default
+path runs `systemctl --user restart fused-memory` between reconciliation
+cycles. It is one shared process, so a manual restart needs operator sign-off.
+Provisioning is cached per process, so an index that disappears while
+fused-memory runs is not rebuilt until the next restart. A
+`recon_missing_index` escalation's `suggested_action` says to provision with
+`ensure_indices(group_id=...)`. No MCP tool or script exposes that method to an
+operator; a restart is how you reach it.
+
+**The expected set.** Its single home is
+`fused-memory/src/fused_memory/backends/falkor_indices.py::expected_index_set`,
+parsed from graphiti's own `get_range_indices` / `get_fulltext_indices` output
+for `GraphProvider.FALKORDB`. It holds RANGE and FULLTEXT specs in the normal
+form `(label, entity_type, field, index_type)`, one tuple per property. Its
+members move with a graphiti-core bump (`fused-memory/pyproject.toml` pins it
+open-ended), so they are not listed here. Print them; the command imports no
+driver and touches no graph:
+
+```bash
+cd /home/leo/src/dark-factory/fused-memory && uv run python -c 'from fused_memory.backends.falkor_indices import expected_index_set as e; print(*("\t".join(s) for s in sorted(e())), sep="\n")'
+```
+
+An upstream statement the parser does not recognise raises
+`UnparsedIndexStatementError` rather than shortening the set. That failure is
+loud in the journal only: provisioning logs `did not complete` and the drift
+detector logs `_detect_index_drift failed`, and no escalation is filed. After a
+graphiti-core bump, read the journal, not the queue.
+
+**Checking for drift.** One detector,
+`fused-memory/src/fused_memory/reconciliation/harness.py::_detect_index_drift`,
+runs at startup over the registered projects and on every reconciliation
+cycle. For each drifted graph it files one L1 `recon_missing_index` escalation
+on the reconciliation queue (port 8103, see
+[§4](#recon-escalation-watcher-for-the-reconciliation-queue)). Its `task_id` is
+`graph:<group_id>`, an opaque dedup key and NOT a task. The structured payload
+is `index_health.group_id`, `index_health.missing` and
+`index_health.unexpected`, and the exit owner is `/recon-escalation-watcher`.
+An open one is the standing signal, which is why it files once rather than
+once per cycle. No open one means either every registered graph was healthy as
+of its last cycle, or its health could not be determined: a failed read, a
+detector that raised, or a failed dedup read files nothing. A registered
+graph with no key yet is also not checked, by design. Read the journal lines
+below before taking an empty queue as healthy.
+
+In `journalctl --user -u fused-memory`:
+
+| Line | Level | Means |
+|---|---|---|
+| `reconciliation.index_drift_detected` | WARNING | a graph's missing set changed; logged on change only |
+| `reconciliation.index_unexpected_present` | INFO | indices outside the expected set, such as operator-added ones; reported, never acted on |
+| `Provisioned indices on graph` | INFO | provisioning created or failed to create something; read the `created=` and `failed=` counts. Logged only when something changed, so silence means nothing was missing |
+| `Index provisioning statement failed on graph` | WARNING | one statement failed; the line names it. The graph stays cached, so only a restart retries it |
+| `Index provisioning on graph ... did not complete` | WARNING | that graph's provisioning raised or timed out; it stays uncached, so the next write or restart retries it |
+| `_detect_index_drift failed for project_id=`, `_check_index_health_at_startup ... failed` | WARNING | the detector raised, so health is UNKNOWN and no escalation is filed. An `UnparsedIndexStatementError` lands here |
+| `_check_index_health failed for group_id=`, `_check_index_health could not determine whether graph` | WARNING | the index read failed, so health is UNKNOWN and no escalation is filed |
+| `index_drift_detector: dedup read failed`, `index_drift_detector: failed to escalate` | WARNING | drift was found but not filed this cycle; the next cycle re-observes it |
+
+To check on demand, call the fused-memory MCP tool
+`trigger_reconciliation(project_id=...)`. It runs a FULL reconciliation cycle
+for that project, which includes this detector; the harness picks it up within
+about 5 s, and a halted project answers `status='halted'` and runs nothing.
+
+A raw, read-only glance:
+
+```bash
+docker exec docker-falkordb-1 redis-cli GRAPH.RO_QUERY <graph> 'CALL db.indexes()'
+```
+
+FalkorDB merges every index on a label into ONE record with a list-valued
+`properties`, so comparing it by eye with the per-property expected set
+misreads composites. The `status` column is the part worth reading by eye.
+
+**What the BM25 canary means.** Present in `db.indexes()` is not serving.
+CREATE returns in milliseconds, but the index builds in the background and
+reads `UNDER CONSTRUCTION` until `OPERATIONAL`, measured up to 594.5 ms after
+creation (PRD §"Measured cost and benefit"). A fulltext query against a missing
+or still-building index returns 0 rows WITH NO ERROR, so `rrf([[], cosine])`
+degenerates to pure cosine. That is how BM25 returned nothing, unnoticed, until
+this PRD. `fused-memory/tests/test_bm25_serving_integration.py::bm25_canary`
+judges service, not metadata: its tests seed a known token on an ephemeral
+scratch graph and assert that graphiti's own fulltext query returns at least
+one row once the index is `OPERATIONAL`. They are `integration`-marked, so the
+default addopts deselect them, and they run against the scratch FalkorDB
+([§8 The scratch FalkorDB](#the-scratch-falkordb)), never production:
+
+```bash
+cd /home/leo/src/dark-factory/fused-memory && uv run pytest tests/test_bm25_serving_integration.py -m integration
+```
+
+Never treat a successful CREATE as serving.
+
+**The composite trap**, so nobody re-introduces it. FalkorDB rejects a
+composite `CREATE INDEX FOR (n:L) ON (n.a, n.b, …)` WHOLESALE when any listed
+property is already indexed, with `Attribute 'uuid' is already indexed`.
+graphiti swallows that error:
+`graphiti_core/driver/falkordb_driver.py::FalkorDriver.execute_query` ignores
+any error containing `already indexed`. Every property in the statement is lost
+silently while the logs read as success. Measured on a replica of the trap
+graphs' starting state, Entity's composite would lose all 4 of its range
+properties and RELATES_TO's all 7 (PRD §"The crux"). The fix is one range statement per property
+(`fused-memory/src/fused_memory/backends/falkor_indices.py::range_create_statement`),
+with fulltext statements issued as upstream emits them. Per-property
+statements converge to the same index state the composite builds on a virgin
+graph (PRD D1). So:
+
+- Never "simplify" provisioning back to upstream's statements or to
+  `build_indices_and_constraints()`.
+- `CREATE INDEX IF NOT EXISTS` is a FalkorDB syntax error. Idempotence comes
+  from the diff, not the statement.
+- Experiment on the scratch FalkorDB, never by hand on production graphs.
+
+### The local embedder (`embedder` compose service)
+
+`embedder` is a service in `fused-memory/docker/docker-compose.yml`, beside
+`falkordb`, `qdrant` and `fused-mcp`: vLLM serving
+`ibm-granite/granite-embedding-english-r2` (768 dims) as a pooling runner under
+the served name `granite-embedding-english-r2`. The image is pinned by the digest
+that `scripts/local-model-serving/arms.yaml` carries for the granite arm, the GPU
+share is the literal `--gpu-memory-utilization 0.062`, and Hugging Face runs
+offline from the host cache (`~/.cache/huggingface`). It publishes on
+`127.0.0.1:8420` only. Compose restarts it `on-failure:5`, so a crash-looping
+container stops instead of churning the shared GPU. `lms-arm@` units stay
+eval-only; nothing here calls `lms_serve.py`.
+
+Unlike the stores (`unless-stopped`), the embedder does not come back by itself
+after a docker daemon restart, a host reboot included, or after its fifth
+crash: Docker's `on-failure` policy skips both. It stays down until the next
+fused-memory start runs its `up`, or until you bring it back by hand:
+
+```bash
+docker compose -f fused-memory/docker/docker-compose.yml up -d --pull=never --no-deps embedder
+```
+
+Check it:
+
+```bash
+curl -s http://127.0.0.1:8420/v1/models      # readiness: lists granite-embedding-english-r2
+ss -ltn 'sport = :8420'                      # bound on 127.0.0.1, not 0.0.0.0
+docker compose -f fused-memory/docker/docker-compose.yml ps embedder
+```
+
+The `curl` is the readiness check. `ss -ltn` only shows the loopback bind, and
+the port is bound before the model serves.
+
+**Start and wait.** `fused-memory.service` carries two `-`-prefixed `ExecStartPre`
+lines for it. `up -d --pull=never --no-deps embedder` runs before the store wait,
+so the 107-123 s cold model load starts as early as possible. `--pull=never`
+makes a missing image fail fast instead of starting a multi-GB pull that would
+outlive `TimeoutStartSec`. `--no-deps` keeps that `up` from starting any other
+service, so falkordb still comes up only through the AOF gate. The `up` runs
+under `timeout 10`, which turns a hang (a stalled GPU hook, a wedged dockerd)
+into a failed exit. A 5 s `wait-for-port` on `127.0.0.1:8420` runs after the
+store wait; it shows the docker-published port is up, not that the model is
+loaded. Both lines carry `-`, so any embedder failure, including a hang the
+`timeout` cut short, leaves fused-memory starting degraded rather than failing
+its start.
+
+Worst case, the embedder hooks add 15 s to a start (10 s + 5 s). That fits
+inside the 20 s the 280 s store wait leaves under `TimeoutStartSec=300`, as
+`fused-memory/tests/test_systemd_unit_config.py::TestEmbedderStartHooks` pins.
+The sum leaves out the gate and the init path, so it bounds what the embedder
+adds, not the whole start. No wait inside that budget covers the cold load, so
+on a cold boot fused-memory starts before granite finishes loading, and β1's
+startup probe (task 6798) reports the gap. A restart of fused-memory alone finds
+the embedder already serving.
+
+`scripts/check_fused_memory_unit_parity.py` accepts an `ExecStartPre` compose `up`
+that names only `embedder` (its `UNGATED_COMPOSE_SERVICES`) and still flags any
+other compose `up` beside the FalkorDB AOF gate. The `[drift]` report prints
+each flagged line and the tokens it read as services. An option's separate value
+is read as a service too, so write options as one token (`--pull=never`).
+
+**The cutover hold.** `scripts/fused-memory-cutover-hold.conf` is a drop-in whose
+one `ConditionPathExists=!` directive names the cutover lock file. That file is
+the lock path's only definition: read the path there, never from a copy. `%h` in
+it is systemd's home specifier, which δ's `live` profile (task 6805) must expand
+when it reads the path. The drop-in is installed on both `fused-memory.service`
+and `fused-memory.socket`. While the lock file exists, systemd refuses to start
+either; with no lock it does nothing. The embedder cutover writes the lock at
+quiesce and removes it at release. The path is under the state directory rather
+than `$XDG_RUNTIME_DIR` or `/tmp` so it survives a reboot: the installed
+`orchestrator-*.service` units carry `Wants=fused-memory.service` and would start
+a held unit at boot if the lock vanished.
+
+Once α2 installs the drop-in, it stays installed; only the lock comes and goes.
+So from then on, every run of `scripts/check_fused_memory_unit_parity.py`
+reports an `[override]` naming it and exits 1, and exit 1 alone no longer
+separates real drift from this drop-in. Read the report. If its only finding is
+the `[override]` for the cutover hold, with no `[drift]` line and no other
+drop-in, the unit is at parity. A follow-up filed from task 6797 (ticket
+`tkt_0RWV3564630WNF15APKKRXVZMJ`) is to teach the checker to recognise this
+drop-in.
+
+Installing the compose service, the template lines and the drop-in on the host is
+a separate attended step (α2, task 6801); the tracked files alone change nothing
+on the host. Until α2 (task 6801) creates the embedder's container,
+`scripts/check_network_exposure.py` (whose `COMPOSE_PUBLISHED_PORTS` mirrors
+every compose publish, 8420 included) reports 8420 as an informational
+`[no-container]` line and does not fail on it, because `embedder` is in its
+`OPTIONAL_COMPOSE_SERVICES`. Once the container exists, a refusing 8420 is a
+`[not-listening]` failure again, even while the container is stopped.
+
 ### Dashboard unit-parity check
 
 Each orchestrator-watchdog tick also runs
@@ -2507,6 +3381,10 @@ newest-watched-commit / verdict columns, per unit:
 - **DEPLOY-AGE** — time since the last *verified* fleet deploy (the shared
   clock), fleet-wide, in hours; `unknown` if the clock has never been
   stamped.
+- **RESTARTS** — the unit's systemd `NRestarts/Result` as one token, `?`
+  where a field could not be read, placed just left of VERDICT. NRestarts
+  counts only `Restart=` restarts and resets on any manual start; see "Crash
+  loop" above for what the watchdog does with it.
 - **MERGE-IDLE** — the unit's current heartbeat classification
   (`idle` / `busy` / `stale` / `absent`) — the same classification the
   drain gate itself uses.
@@ -2597,33 +3475,42 @@ directly, not just interactive sessions. Treat it accordingly:
 - For a direct-to-main commit under contention, use
   `git commit --only <path>` (not a bare `git commit`) so you don't sweep
   up unrelated staged or dirty state from a concurrent process.
-- `pre-commit` path-filters its pyright stage (since task 2551 — see
-  `hooks/project-checks` for the authoritative logic), so what a commit
+- On main, `pre-commit` runs the merge gate's own checks for what the
+  commit stages, plus the hook's own `root:type` unit for repo-root Python
+  that no module owns (task 8531; `scripts/hook_module_checks.py` derives
+  the list, `hooks/project-checks` runs it in parallel), so what a commit
   costs depends on what it stages:
-  - **No staged `.py` files** — pyright is skipped entirely; the hook
-    prints `pre-commit: pyright skipped (no Python changes)` and the
-    commit completes in seconds. A docs/plans-only commit needs no
-    bumped timeout: reach for a plain gated `git commit --only <paths>`
-    first.
-  - **Staged `.py` under `shared/` or `escalation/`** — every dependent
-    package imports them, so the hook runs a full sweep across all seven
-    `PYRIGHT_PACKAGES` (`fused-memory`, `orchestrator`, `dashboard`,
-    `shared`, `escalation`, `sampler`, `cockpit` — the members of
-    `type_check_command`). This is the 7x worst case and can comfortably
-    exceed two minutes.
-  - **Staged `.py` under exactly one of the other `PYRIGHT_PACKAGES`
-    (`fused-memory`, `orchestrator`, `dashboard`, `sampler`, `cockpit`)** — pyright runs once, for that package only.
-  - **Staged `.py` outside every prefix above** (e.g. `scripts/`, a
-    root-level `conftest.py`) — pyright is skipped for the whole commit,
-    and unlike the no-Python case the hook prints *nothing*, so there is
-    no signal that it was skipped. This over-narrowing is deliberate
-    (root-level Python is itself unconfigured for pyright); if the changed
-    file is imported by a package, run `uv run pyright` there by hand.
+  - **Staged `.py` under a registered module** — that module's
+    `lint_command` and `type_check_command` run verbatim, exactly as the
+    merge gate would run them, so a staged `scripts/*.py` now runs
+    `module:scripts:type`.
+  - **Staged `.py` under `shared/` or `escalation/`** — every module
+    imports them, so the type check of EVERY registered module runs. This
+    is the worst case.
+  - **Staged `.py` at the repo root** (`conftest.py`,
+    `df_pytest_isolation.py`) — no module can own a repo-root path, so
+    `root:type` runs pyright over those files
+    (`scripts/hook_module_checks.py::root_units`). A root module other than
+    `conftest.py` also runs the type check of every registered module, as
+    `shared/` and `escalation/` do.
+  - **A staged file under `plans/`, `docs/` or `review/`, or a
+    `*.yaml`/`*.json`/`*.md` outside a workspace package** — the
+    whole-tree screen runs the `scripts/merge_screen.yaml` checks: about
+    10 s warm and 45 s cold, as measured in
+    `plans/merge-pre-verify-screen-prd.md` §3, decision 4.
+  - **Nothing above** — the hook prints `pre-commit: merge-gate checks
+    skipped (no staged file maps to a module or the screen) in Ns`. A
+    commit like that needs no bumped timeout: reach for a plain gated
+    `git commit --only <paths>` first.
 
-  In the two middle cases — the only ones that actually invoke pyright —
-  pass a generous timeout (five minutes or more) to whatever you use to
-  run commit commands, or run it detached and poll, rather than letting a
-  default timeout kill it mid-hook.
+  The hook prints each unit it runs and the elapsed time. A module type
+  check can take minutes: the measurements are recorded at
+  `scripts/orchestrator.yaml::type_check_command` and
+  `shared/orchestrator.yaml::type_check_command` (orchestrator's pyright).
+  For any commit that runs a module check, pass a generous timeout (five
+  minutes or more) to whatever runs the commit, or run it detached and
+  poll, so a default timeout does not kill it mid-hook. `--no-verify` still
+  bypasses the hook, as it does for any git hook.
 - **Never run `git stash`** in the main checkout: the stash stack is
   consumed by the merge worker's own advance path, so a stash you push can
   be popped out from under you by an unrelated process. Park work-in-progress
@@ -2631,10 +3518,13 @@ directly, not just interactive sessions. Treat it accordingly:
 - A pure docs-only commit landing under contention (index lock held by a
   concurrent process) may use `--no-verify` — docs changes don't need the
   code-quality hooks, and retrying past a lock contest is safe for a
-  no-code change. Reach for `--only` first regardless. Since task 2551 a
-  docs-only commit passes the hook cheaply anyway (pyright is skipped),
-  so this is a last resort for genuine index-lock contention — not a way
-  to dodge a slow hook.
+  no-code change. Reach for `--only` first regardless. A docs-only commit
+  pays for the screen (about 10 s warm) when it stages anything under
+  `plans/`, `docs/` or `review/`, or a `*.yaml`/`*.json`/`*.md` outside a
+  workspace package, root-level docs such as this file included. Other
+  docs-only commits skip the merge-gate checks. Either way, `--no-verify`
+  is a last resort for genuine index-lock contention, not a way to dodge
+  a slow hook.
 
 ---
 
@@ -2738,13 +3628,19 @@ critical path — so a cold cache degrades to the previous behaviour exactly.
 | Reconciliation escalation queue looks permanently poisoned for a project | The project's `project_id` was never registered on fused-memory's `DASHBOARD_KNOWN_PROJECT_ROOTS` before its first task was queued | This must be prevented, not fixed after the fact — always complete project registration (factory-init Stage 6) before queuing any task. If it's already happened, this needs an operator-level fused-memory intervention, not a task-level fix |
 | A task blocks at VERIFY with failures unrelated to its own changes | Verification currently runs test/lint/typecheck **repo-wide** by default, not scoped to the task's own modules | Check whether the failures are pre-existing on main outside the task's scope; if so, fix main's cleanliness first (module-scoped verification is planned but not yet implemented) |
 | An agent reports `AttributeError` / assertion mismatches **in its own shell** for code it just wrote in a worktree | An interactive session inherits its launching shell's environment, often the MAIN checkout's `VIRTUAL_ENV`, so a first-party `import` resolves main's editable source rather than the worktree's edits. Dispatched agents are scrubbed of Python-env selection (`shared/src/shared/python_env.py::without_python_env_selection`, which Claude spawns reach via `shared/src/shared/secret_env.py::agent_subprocess_env`; task 7399), so they hit this only by naming main's `.venv/bin/python` in a worktree without its own `.venv`; a bare `python` there is the system interpreter, which fails the import instead. A worktree gets its own `.venv` only once it has been cold-verified (`verify_cold_preprovision_command`, `uv sync --all-packages && npm ci …`, runs inside it). **Verify itself is insulated and this cannot cause a VERIFY-stage failure**: every verify command is spawned through `orchestrator/src/orchestrator/verify.py::_target_subprocess_env`, which strips `VIRTUAL_ENV` and drops the venv's `bin` from `PATH` so the target resolves its OWN `.venv` (the 2026-05-29 ghost-venv fix) | Trust verify's result over a hand-run import — verify is the one reading the worktree. In a dispatched agent, name the worktree's own `.venv/bin/python`. Use the one-line provenance check in `### Locating installed code` in `CLAUDE.md` to see which tree a shell import actually came from. A genuine verify-stage interpreter fault looks nothing like this (hundreds of `could not be resolved` imports, `pytest` among them); it is detected by `orchestrator/src/orchestrator/verify_classify.py::is_interpreter_missing_workspace_packages` and held as an infra issue rather than blamed on the branch |
+| A fused-memory offline-lane pass is recorded as an outage on a line starting `falkordb: ` (with the container stopped, measured: `falkordb: connect: ConnectionError`), or a fused-memory test session under the lane exits 4 at start with `the scratch FalkorDB at redis://localhost:6380 is not reachable` | The scratch FalkorDB (compose service `falkordb-scratch`, `127.0.0.1:6380`) is not running. Docker restarts it on its own unless someone stopped it, and nothing else starts it; see [§8 The scratch FalkorDB](#the-scratch-falkordb) | `docker compose -f /home/leo/src/dark-factory/fused-memory/docker/docker-compose.yml up -d --no-deps falkordb-scratch`, then `docker exec docker-falkordb-scratch-1 redis-cli ping`. If `GRAPH.LIST` there lacks `evalmem_lme_ref_incumbent_a`, seed it with `scripts/seed_scratch_reference_graph.py`. The next lane pass runs normally |
 | All work across the fleet stalls; every account shows capped | The multi-account usage gate is **all-or-nothing per scope**: capacity in a scope only frees up once at least one account is uncapped for it | Check account-level cap/reset times; this self-heals once any single account resets — it is not a per-request failure to retry individually |
-| A burst of zero-output invocations across many tasks at once | Usually a transient upstream 529 (overloaded), not a real failure | Check host health via PSI (`full` pressure), not load average; these typically clear on their own — avoid treating them as a code regression |
+| A burst of zero-output invocations across many tasks at once | Usually a transient upstream 5xx (529 overloaded), not a real failure. Since task 3316 an execute-phase zero-output result carrying a 5xx requeues through the scheduler's transient lane instead of blocking | Read the task's `zero_output_evidence-iter<N>.json` under its TASK root, `<worktree base>/.task-meta/task-<id>/` (for this repo `.worktrees/.task-meta/task-<id>/`; path owner `orchestrator/src/orchestrator/artifacts.py::TaskArtifacts.zero_output_evidence_path`). A `ZERO_OUTPUT_HANG_REASON` block's detail names the exact glob. `api_error_status` in 500-599, with the provider's error in `output_tail`, is a provider outage: wait it out, and do not switch accounts or treat it as a code regression. `api_error_status: null` with `transcript_turns: 0` is a local wedge: read `proc_tree` and `stderr_tail`. Check host health via PSI (`full` pressure), not load average |
 | Every open Claude session's fused-memory MCP calls fail at once, each within a second, with the harness's `Unable to connect. Is the computer able to access the url?`; on Claude Code ≥2.1.280 the server's tools can then be withdrawn from the session until a manual `/mcp` | Port 8002 is **closed**: the request never reaches the server, so no backing store is involved, and nothing is worktree-specific (8002 is host-global). Under socket activation a `restart`, a watchdog revive (`scripts/orchestrator-watchdog.py::restart_unit`) or a crash keeps 8002 bound, and a client waits rather than being refused. The port closes only on a deliberate `systemctl --user stop`/`disable` of `fused-memory.service` (its `ExecStopPost` stops the socket), on the port-change stop-then-start, or on a host where `fused-memory.socket` is not installed — see [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts) and [§8 fused-memory liveness revive](#fused-memory-liveness-revive). Before 2026-09-29 every restart closed it for the whole restart; the 2026-09-19 sighting (codebook `entry-cand-20260919-3`) was two calls refused during a watchdog revive's 40s start | Check that `systemctl --user show fused-memory.service -p TriggeredBy` prints `TriggeredBy=fused-memory.socket`; if it does not, install the socket per [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts). Prefer `restart` over `stop` then `start`. Run `/mcp` in any session whose fused-memory tools were withdrawn, then retry the failed call: its payload never left the client. A **manual** stop or restart of fused-memory still needs explicit operator sign-off, because it is one shared process and affects the whole fleet, not one project |
+| `Permission denied` reading `/proc/<pid>/environ` while diagnosing a systemd --user unit's `PATH` or environment, or a unit failing `ENOENT` on a binary that `which` finds | That pid is the user manager, whose environ is readable or not depending on its capabilities, and is the wrong layer anyway. Or the unit is `DRIFTED`: it still has the environment of its last start | [§3 Inspecting a unit's live environment](#inspecting-a-units-live-environment) |
 | `escalation-watcher-auto` rotations respawn continuously while the L1 queue shows only `esc-task-path-guard*` records, and each rotation resolves nothing | The path-scope guard files its rejection / advisory audit records at `level=1` under a **synthetic anchor** `task_id` — no such task exists. Until the record reaches a terminal state it stays `pending`, and the supervisor's pre-boot precheck (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) counts any pending un-promoted L1 as actionable, so it keeps spawning rotations. A `stamp_triage` does **not** clear it: that precheck reads `status`/`level` only, never `triaged_at` | Expected, and clears on the first rotation that actually reaches the record — the watcher's `scope_violation` recipe has an audit-only branch that closes these `close_only`/`benign` (see `skills/escalation-watcher-auto/SKILL.md`). **Do not `stamp_triage` these records**: a stamp reaches no terminal state, so it cannot clear the precheck, but its fresh `triaged_at` makes the next rotation drop the record at the drain filter before the auto-close branch is consulted — the loop then persists for as long as the stamp stays fresh (~6h). The recipe carves these out of that skip; a rotation running an older copy will not. If they persist beyond that, check the drain-filter carve-out is present, then compare the branch's tokens against `_ANCHOR_TASK_ID` / `_AGENT_ROLE` in `fused-memory/src/fused_memory/middleware/scope_violation_escalator.py` for producer drift. Do **not** "fix" this by re-gating the producer — the guard is the census, and the one deliberate bypass (`routing_override_reason`) already returns before any verdict or escalation fires (`fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._path_guard_or_skip`), so there is nothing left to gate |
 | Two branches that each moved `orchestrator/tests/merge_lane_ratchet_baseline.json` conflict on it (a probe bounce or a stopped merge), although they moved different code | The structured merge driver `.gitattributes` names (`merge=ratchet-baseline`) is not installed in this host's `.git/config`, so git falls back to its line merge, which conflicts whenever two branches touch one baseline row; or the driver REFUSED this pair (it says why on stderr: two different changes to one scalar, a row deleted on one side and changed on the other, two insertions at one place in a path list) and wrote git's own text merge with markers. The probe (`git merge-tree` at `project_root`) reads attributes from `project_root`'s working tree, so it composes only once `.gitattributes` is on main and `project_root` has re-synced | `git config --get merge.ratchet-baseline.driver` on the host: empty means run `python3 scripts/merge_lane_ratchet_merge.py install` from the main checkout (it writes the shared `.git/config`, so it covers every linked worktree; `scripts/setup-host.sh` step 9 does the same on a new host). A merge or probe that instead DIES with `fatal: custom merge driver ratchet-baseline lacks command line` (exit 128) means a `merge.ratchet-baseline` section without its `driver` key: `git config --remove-section merge.ratchet-baseline`, then install. A refusal is an ordinary conflict: resolve the code, then regenerate the baseline with `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json`. While a driver merge runs under the probe, git leaves transient `.merge_file_*` files in `project_root`; they are untracked and gone when the probe returns. A raise is never authorized in the baseline file itself: it is one new file under `orchestrator/tests/merge_lane_ratchet_raises/`, which never conflicts |
 | `git commit` finishing a merge (one stopped on another file) is refused by the ratchet commit gate for a baseline raise over its 3-way bound, and `--write-baseline --authorize-raise` then prints `no measure rose; nothing recorded` | The staged baseline holds more than merging both parents can (`scripts/merge_lane_metrics.py::_both_moved_bound`; two raises of one measure compose, so the ratchet-baseline merge driver's own `ours + theirs - base` passes), and the excess is the merge's own raise; but the file on disk already holds that value, so the write gate sees nothing rising | `git checkout HEAD -- orchestrator/tests/merge_lane_ratchet_baseline.json` (ours; `--ours` does nothing once the driver resolved the file), then `python scripts/merge_lane_metrics.py --write-baseline orchestrator/tests/merge_lane_ratchet_baseline.json --authorize-raise <task-id> --reason "<why>"`: it measures from ours, records the merge's own entry file, and the commit passes. The gate's refusal prints the same recipe |
-| A `durable_write_dead_letter` escalation appears (`esc-durable-write-dead-letter-N`, agent_role `fused-memory/dead-letter-guard`) | A durably-queued memory write exhausted its attempts and was **permanently abandoned** — `add_episode`, `add_memory`'s Graphiti leg, or a derived `mem0_classify_and_add` fact. The caller was already told it succeeded: the record's `reported_to_caller=` line says exactly what it was told (`add_episode` returned `status='queued'`; `add_memory` returned `stores_written` containing graphiti), or says plainly that no synchronous claim was made — an `add_memory_graphiti` death carrying that neutral line came from `replay_from_store`, the operation's second producer, which has no caller and mints no `write_op_id`, so there is nobody to warn. One record folds every death sharing `(project_id, operation, error class)` — deliberately keyed on the error CLASS, not its message, because the esc-3561-3 errors carried a different uuid per write — so `dedupe_count` is the VOLUME, not the record count: 28 lost writes page once | Read **`post_execute` first**; it decides the remedy and the two are opposites. `True` means the backend write LANDED and only the post-write callback kept failing (`durable_queue.py::POST_EXECUTE_DEAD_PREFIX`), so a blind replay **duplicates** it — check `backend_ops` joined on `write_op_id`, never on `backend_ops.operation`, which is the literal `'add_episode'` for both the add_episode and add_memory_graphiti paths, before acting. `False` means the write never landed: `replay_dead_letters` is the safe default once the cause is fixed, `delete_dead_letters` only when the item is known unrecoverable. The escalation is self-sufficient for triage by design — corroborating PULL surfaces exist but are not substitutes: `dead_by_operation` on `get_queue_stats` / `memory_service.py::MemoryService.get_status`, and `reconciliation/queue_health.py::summarize_graphiti_queue_health`'s aggregate `dead_count`, both read the LIVE `write_queue` table and go to zero once `delete_dead_letters` sweeps the rows (that sweep had already erased 26 of the 28 rows in esc-3561-3). `dead_by_operation` is also GROUP-scoped, so a `project_id`-scoped call covers that project's Graphiti group only: a dead `mem0_classify_and_add` for the same project appears under group `mem0_<project_id>` or in the unscoped call, and `{}` from the scoped probe does not contradict the alarm. Anyone holding a `write_op_id` can read the durable per-write record via `write_journal.py::WriteJournal.get_write_op` (`terminal_status`/`terminal_error`, task 3582) |
+| `scripts/setup-host.sh` §11 prints a `Network exposure:` FAIL, or `python3 scripts/check_network_exposure.py` exits 1 | Read the kind on each tagged line. `[exposed]`: a listener is bound to a wildcard address. That is `fused-memory.socket`'s `ListenStream` (`scripts/fused-memory.socket.template`), fused-memory's `server.host`, which binds `:8003` itself (`fused-memory/config/config.yaml`), or a compose `ports` entry without a `127.0.0.1:` prefix (`fused-memory/docker/docker-compose.yml`). `[not-listening]`: the named owner is down, or bound somewhere other than `127.0.0.1`. `[timed-out]`: an off-loopback connect was neither accepted nor refused, typically because a DROP rule hides whatever listens there; a timeout counts as a failure. `[unverified]`: an off-loopback connect failed with the errno the line names, so that address was not checked. `[source-error]`: `systemctl`, `ip` or the `docker container ls` query could not be read, usually because there is no user bus for `systemctl --user`, no `ip` binary, or no reachable docker daemon; every port it could still find was probed, and when the docker query failed, the port it asked about stays a `[not-listening]` failure. `[no-container]` is informational and never the cause of exit 1: an optional compose service has no container on this host, so nothing is expected on its port yet ([§8 Network exposure check](#network-exposure-check)) | Bind the named owner to `127.0.0.1` in its committed home and restart it. A socket's `ListenStream` change needs the stop-then-start in [§8 Socket activation](#socket-activation-mcp-ports-survive-restarts); for fused-memory that is `scripts/restart-fused-memory.sh --rebind-socket`. `plans/mcp-network-exposure-prd.md` tracks the loopback flip of today's known wildcard binds. Start a not-listening owner. For an unverified address, read the errno (a link going down, say) and rerun once the link has settled. For a source error, run the check as the login user with `XDG_RUNTIME_DIR` set; for the docker query, also check that this user can run `docker ps`. How to run the check: [§8 Network exposure check](#network-exposure-check) |
+| A `recon_missing_index` escalation appears on the reconciliation queue (port 8103, `task_id` `graph:<group_id>`) | A registered graph lacks indices in the expected set, typically because a provisioning statement failed or the graph was born after the last restart and its first-write provisioning did not complete. `index_health.missing` names the specs | Read the `Index provisioning statement failed on graph` (or `did not complete`) journal line for that graph in `journalctl --user -u fused-memory`, fix what it names, then restart fused-memory (`scripts/restart-fused-memory.sh`, with operator sign-off): startup provisioning creates only what is missing. That restart is how the escalation's `ensure_indices(group_id=...)` suggestion is carried out, since no tool exposes it. The next reconciliation cycle re-checks it. See [§8 FalkorDB index provisioning](#falkordb-index-provisioning-expected-set-drift-the-bm25-canary-the-composite-trap) |
+| A `durable_write_dead_letter` escalation appears (`esc-durable-write-dead-letter-N`, agent_role `fused-memory/dead-letter-guard`) | A durably-queued memory write exhausted its attempts and was **permanently abandoned** — `add_episode`, `add_memory`'s Graphiti leg, or a derived `mem0_classify_and_add` fact. The caller was already told it succeeded: the record's `reported_to_caller=` line says exactly what it was told (`add_episode` returned `status='queued'`; `add_memory` returned `stores_queued` containing graphiti), or says plainly that no synchronous claim was made — an `add_memory_graphiti` death carrying that neutral line came from `replay_from_store`, the operation's second producer, which has no caller and mints no `write_op_id`, so there is nobody to warn. One record folds every death sharing `(project_id, operation, error class)` — deliberately keyed on the error CLASS, not its message, because the esc-3561-3 errors carried a different uuid per write — so `dedupe_count` is the VOLUME, not the record count: 28 lost writes page once | Read **`post_execute` first**; it decides the remedy and the two are opposites. `True` means the backend write LANDED and only the post-write callback kept failing (`durable_queue.py::POST_EXECUTE_DEAD_PREFIX`), so a blind replay **duplicates** it — check `backend_ops` joined on `write_op_id`, never on `backend_ops.operation`, which is the literal `'add_episode'` for both the add_episode and add_memory_graphiti paths, before acting. `False` means the write never landed: `replay_dead_letters` is the safe default once the cause is fixed, `delete_dead_letters` only when the item is known unrecoverable. The escalation is self-sufficient for triage by design — corroborating PULL surfaces exist but are not substitutes: `dead_by_operation` on `get_queue_stats` / `memory_service.py::MemoryService.get_status`, and `reconciliation/queue_health.py::summarize_graphiti_queue_health`'s aggregate `dead_count`, both read the LIVE `write_queue` table and go to zero once `delete_dead_letters` sweeps the rows (that sweep had already erased 26 of the 28 rows in esc-3561-3). `dead_by_operation` is also GROUP-scoped, so a `project_id`-scoped call covers that project's Graphiti group only: a dead `mem0_classify_and_add` for the same project appears under group `mem0_<project_id>` or in the unscoped call, and `{}` from the scoped probe does not contradict the alarm. Anyone holding a `write_op_id` can read the durable per-write record via `write_journal.py::WriteJournal.get_write_op` (`terminal_status`/`terminal_error`, task 3582) |
+| A reviewer verdict carried `note_dispositions` that were not applied: the info note is still pending after the review, or was later closed by the router or promoted instead of carrying the reviewer's class | One of four mechanisms. (i) The workflow rejected the entry: `orchestrator/src/orchestrator/escalation_router.py::reviewer_note_refusal` admits only a pending, router-owned info L0 of the reviewed task that is agent-filed, not mechanical, and not already held on a curator ticket, so an unknown id, another task's record, a non-info or eval-lane record, a harness or mechanical notice, or a router-disabled config is refused; a refusal logs the WARNING `info-l0-router: rejected the reviewer disposition` with the reason and emits `info_l0_dispositioned` with class `rejected_disposition`. (ii) `work` never closes a note, by design: it stamps the reviewer mark (triaged_by `reviewer-comprehensive/workflow`) and the exit router converts the note. (iii) The verdict was lost or errored, so nothing was applied: `TaskWorkflow._salvageable_verdict_payload` drops a malformed payload whole, and an ERROR verdict carries no dispositions (`orchestrator/src/orchestrator/review_payload.py::normalize_review`). (iv) Applying raised, which logs an exception and emits class `router-error` | Read the task's `info_l0_dispositioned` events (`class`, `reason`) and the journal WARNING to see which case applied. Nothing needs repairing, and a pending note must not be hand-closed: the exit finalizer, or the orphan reaper or startup amnesty, routes it, which is the designed backstop (`plans/info-l0-disposition-router-prd.md` boundary row 17). A `convert_to_task` L1 under `harness-info-l0-router` with reason `router_error` means the router already dismissed the note (`orchestrator/src/orchestrator/escalation_router.py::_promote` dismisses before it files the L1), so act on that L1, not the note. If the journal shows the ERROR `could not file its fallback L1`, the note is dismissed and its text survives only in that log line. A recurring (i) for the reviewer's own notes points at a briefing/eligibility mismatch; file it against `reviewer_notes` / `reviewer_note_refusal` |
+| An orchestrator unit restarts every ~100 s | A startup step, or a crash site between steps, raises a process-killing fault on every start (a `BaseException` such as `SystemExit`, or a fatal step's refusal), so systemd's `Restart=` loops the unit. A non-fatal step that raises an ordinary `Exception` is reported on `orchestrator-startup-<step>` and skipped instead, and does not loop | `journalctl --user -u orchestrator-<name>.service` for the traceback. Then `sqlite3 <project_root>/data/orchestrator/runs.db "SELECT run_id, started_at, startup_completed_at, exit_reason FROM runs ORDER BY rowid DESC LIMIT 10"`: `startup_crash:<site>` names the step, or `before-first-step` / `after-<step>` for a crash between steps; `cancelled` is a SIGTERM; a NULL `exit_reason` with `startup_completed_at` set is a start that came up. `cat <project_root>/data/orchestrator/startup_failures.json` shows the current streak. After 3 consecutive crashes at one non-fatal step, the next start skips that step and files the born-at-L2 `orchestrator-startup-crash-loop` (`orchestrator/src/orchestrator/startup_steps.py::page_crash_loop`); a fatal step, or a crash outside any step, still runs and pages the same way. The `finish_startup` of a start that comes up clears the journal, so fix the cause before the next restart. A crash the process cannot record itself (SIGKILL, an import error) is the [§8](#8-fleet-redeploy--watchdog) watchdog's `orchestrator-crash-loop-<unit>` page instead |
 
 ---
 
@@ -2762,11 +3658,15 @@ check `applied`/`restart_required` on your reload call, per
 | `watcher_daily_cost_ceiling_usd` | `50.0` | All `escalation-watcher` (L1 auto-triage) invocations for the day |
 | `orch_daily_cost_ceiling_usd` | `200.0` | All orchestrator invocations (every role) for the day |
 
-**Multi-account failover (`usage_cap.*`)** is entirely optional — a
-single-user setup works fine on plain CLI OAuth login with no accounts
-file configured. If you do configure a pool
+**Multi-account failover (`usage_cap.*`)** is on in every shipped config. A
+pool whose roster resolves no token is EMPTY, and every invocation then raises
+in `UsageGate.before_invoke`: the gate never adopts the operator's `~/.claude`
+login unless told to (ruling 2026-11-01, task 8161). A single-user setup has two
+supported routes: `usage_cap.enabled: false`, or
+`usage_cap.fallback_to_default_credential: true` (interactive or single-user
+only: the whole fleet then rides that login). The pool
 (`usage_cap.accounts_file` → an external YAML of `oauth_token_env` entries
-resolved from `.env`), it gives the orchestrator per-account failover when
+resolved from `.env`) gives the orchestrator per-account failover when
 one account gets capped, plus the per-(account, model) scoped-cap
 dimension described in [§7](#7-model-routing). This whole block is
 restart-tier, not hot-reloadable.
@@ -2834,7 +3734,9 @@ Recurring maintenance runs as systemd **user** timers, not as orchestrator
 work. Each job is the same four files — a committed wrapper `.sh` (all the
 logic, so it is testable and runnable by hand), a thin `Type=oneshot`
 `.service` whose `ExecStart` is that wrapper, a `.timer` carrying the
-cadence, and an idempotent self-verifying `install-*-timer.sh`.
+cadence, and an idempotent self-verifying `install-*-timer.sh`. On-demand
+sweeps that have no timer, and so none of those four files, are grouped after
+the timer jobs at the end of this section.
 
 The cadence lives in the unit's `OnCalendar` — **not** in
 `dark-factory-orchestrator.yaml`. The orchestrator process is not the thing
@@ -2863,22 +3765,50 @@ missing `LoadState` detector).
 
 | Slot | Job | Units |
 |---|---|---|
+| 02:00 | Shared-repo incremental repack + commit-graph (every orchestrator root, one at a time) | `shared-repo-git-maintenance.timer` |
+| 02:15 | link-heal sweep (adjudicate new triage children; records + report; writes gated) | `fused-memory-link-heal.timer` |
 | 02:30 | Transcript secret sweep | `transcript-secret-sweep.timer` |
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
+| 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`); runs for hours because of e6, see its section | `fused-memory-memory-eval.timer` |
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
+| 03:45 | Quality-metrics snapshot of main, one instance per Python project (no LLM, never commits) | `quality-snapshot@.timer` |
 | 04:00 | Orphaned-worktree reclaim | `reclaim-orphaned-worktrees.timer` |
 | 04:00 | Legibility transcript check | `legibility-transcript-check@.timer` |
 | 04:30 | Legibility trickle health probe | `legibility-trickle-health@.timer` |
 | 05:00 | Canonical/topic coverage census + retro-stamp rehearsal | `memory-metadata-coverage-census.timer` |
 | 05:30 | Cross-project return brief (Fable prepare + render) | `return-brief.timer` |
+| 06:00 | INV-12 owner sweep | `exception-owner-sweep.timer` |
+| Sun 06:30 (weekly) | Duplicate-cluster report (detector per category, report + regrowth diff; files nothing) | `fused-memory-duplicate-audit.timer` |
 
 All timers carry `Persistent=true` (a night missed to a sleeping laptop is
 caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
-Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the sections below for the 02:30, 03:00, 04:00 and 05:00 ones, and
-[Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one.
+Per-job docs: [docs/shared-repo-git-maintenance.md](docs/shared-repo-git-maintenance.md)
+for the 02:00 job; [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
+for the 03:30 job; [Nightly link-heal sweep (02:15)](#nightly-link-heal-sweep-0215) for the
+02:15 one; the sections below for the 02:30, 03:00, 03:15, 03:45, 04:00 and 05:00 ones,
+[Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one, and
+[The owner sweep timer (06:00) and its age](#the-owner-sweep-timer-0600-and-its-age) in §12a
+for the 06:00 one, and
+[Weekly duplicate-cluster report (Sun 06:30)](#weekly-duplicate-cluster-report-sun-0630)
+for the weekly one.
+
+**The 03:30 job is an adjunct, not the collector.** Both Mem0 marker pools
+are already drained in-cycle, unconditionally and per-project, by
+reconciliation itself — task 2853 for the `source`-tagged pool this timer
+targets, task 2966 for the `flag_for_stage2` relay pool. So a night that
+deletes **zero** records is the healthy steady state, not evidence the
+timer is broken. A zero is not self-certifying either: since task 3897 each
+run emits a `cross_check` block whose `blind_spot: true` means "saw
+nothing" rather than "there was nothing" — see the per-job doc's "Reading
+the output" section before reading a clean count as a clean bill. The
+nightly run passes no `--check`, so it reports a blind spot in `cross_check` and never
+goes `failed` on one; since task 3923 an observed blind spot fails an
+ad-hoc `--check` run by default.
+`scripts/fused-memory-flag-marker-check.sh` is the read-only ad-hoc census
+counterpart for running that same probe by hand (its `before_done` gate
+role was retired by task 3923; it refuses `--apply` outright).
 
 **04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
 trickle health probe (see below). The nightly reify closure-staleness sweep and
@@ -2901,11 +3831,138 @@ reconciliation. Those residual units do **not** collide with the new 04:30 job:
 they carry a different unit name, and a re-armed sweep would merely fail
 `203/EXEC` alongside it rather than contend for anything.
 
+### Nightly link-heal sweep (02:15)
+
+The sweep asks the link adjudicator about the write-triage links made since
+the last complete sweep, and heals the misfiled ones. The contract is
+`plans/write-triage-link-healing-prd.md` H1 and H2 (task 7159). Its four files are
+`scripts/fused-memory-link-heal.{sh,service,timer}` and
+`scripts/install-link-heal-timer.sh`, which kicks no immediate run. Installing
+it is the post-merge deterministic deploy described above. This section does
+not claim the timer is installed: `systemctl --user list-timers --all` is the
+check.
+
+- **What one run examines.** `fused-memory/scripts/link_heal.py sweep` plans
+  over every link in each project of `link_heal.projects` (else the home
+  project) whose child was created inside the run window. The window runs up
+  to now from the earliest start over the run's projects. A project's start is
+  the end of its unbroken run of complete sweeps, or
+  `link_heal.sweep_window_hours` back for a project no sweep has completed. A
+  run with a read or adjudication failure does not move the window, so the
+  next run examines those links again; when a project's first run was the
+  failed one, the next run starts from that run's start. A writing run's
+  report also counts the heals it wrote that earlier runs staged. A run over fewer projects leaves the
+  other projects' windows for the next run. A run starting after a project's
+  start (`--since`) leaves the gap before it, so the next run covers that gap.
+  A parent missing from its child's project is looked for in every project of
+  `link_heal.projects` as well as the ones examined, and one found there is
+  reported cross-project, never detached. A parent hosted in a project outside
+  `link_heal.projects` reads as absent, so list every project that hosts
+  parents there.
+  Examining a link again is harmless: verdicts are reused and pending heals are
+  deduped. A pending heal that a later run's verdict on the same link, at the
+  same texts, no longer supports is recorded `superseded` and never written:
+  the newest ruling stands. Only the heals in `link_heal.sweep_actions` (default `detach`,
+  `relabel`) are staged; every other heal is recorded as `not_enabled`.
+- **When it writes.** It writes only when `link_heal.writes: true` is set, no
+  `--dry-run` is given, and the latest calibration of the adjudicator's exact
+  model and prompt version passed. The prompt version is the sha256 of the
+  rendered system prompt together with `link_heal.field_chars`, the cap the
+  pair texts are cut to. The model is keyed as `link_heal.adjudicator_model`
+  spells it: an alias such as the default `opus` stays the same key when the
+  Claude CLI moves the alias to a newer model, so the old calibration and old
+  verdicts keep counting. Re-run `calibrate` after a CLI upgrade moves the
+  alias, or set `link_heal.adjudicator_model` to an exact model id.
+  Otherwise the report's Writes line says `dry-run` or
+  `withheld (uncalibrated)` / `withheld (calibration_failed)`, or
+  `withheld (plan_stopped)` when the run's own plan document could not be
+  written: nothing is written after that, older pending heals included. A writing run
+  keeps the per-run cap and the backlog, share-ceiling and write-failure
+  escapes, and also files the adjudicator failure storm. A verdict is reused
+  only by the same model and prompt version, so a model or brief change asks
+  again. At write time
+  (`fused-memory/src/fused_memory/maintenance/link_heal_executor.py::run_apply`)
+  every sweep heal whose verdict came from an adjudicator without a passing
+  calibration is withheld, not written. That includes a heal staged before a
+  model or brief change. Each one is recorded as `withheld_uncalibrated`, and the
+  report's Writes line counts them. A writing sweep withholds them before it
+  stages its own heals, so a link its window re-examines under a newly
+  calibrated adjudicator is staged afresh and written in the same run. A link
+  outside the window is not re-examined: after a recalibration, run
+  `link_heal.py sweep --since <the oldest withheld child's created_at>`. The
+  report's Writes line and its `withheld_heals.oldest_child_created_at` give
+  that time, and its tables count every heal the run withheld or superseded.
+- **Calibrate first, and again after any change of model, alias target, brief
+  or `link_heal.field_chars`.** From the
+  main checkout (the soak data is gitignored there), in the same environment
+  as `scripts/fused-memory-link-heal.sh`:
+
+  ```bash
+  CONFIG_PATH=fused-memory/config/config.yaml \
+  uv run --no-sync --project fused-memory python fused-memory/scripts/link_heal.py calibrate \
+      --ratings data/write-triage-soak-2026-10-19/correctness/adjudications.jsonl \
+      --items data/write-triage-soak-2026-10-19/correctness/items_all.json
+  ```
+
+  A bare `python` is the system interpreter, which has no `fused_memory`. Without
+  `CONFIG_PATH`, calibrate reads the default config, so a `config.yaml` override of
+  `link_heal.adjudicator_model`, `link_heal.field_chars` or
+  `reconciliation.data_dir` would record the calibration under a key or ledger
+  that the sweep never checks, and nothing would report the mismatch.
+
+  It asks the adjudicator about every rated pair and scores the misfile and
+  CORRECTS binaries against the final rater verdict. A binary passes when its
+  kappa is at least the raters' own kappa, minus
+  `link_heal.calibration_kappa_margin` (0.10). The raters' kappa is the second
+  rater against the primary, recomputed from the file. That floor applies
+  pooled, and to each project with at least
+  `link_heal.calibration_min_project_items` (60) rated pairs. At most 5% of
+  pairs may go unanswered. Exit 0 is a pass. Exit 1 is a fail, and files a
+  blocking `link-heal-calibration` escalation naming the report.
+- **Run it by hand.** `link_heal.py sweep [--dry-run] [--project P ...]`. The
+  one-off backlog run, covering everything since triage went live, is
+  `link_heal.py sweep --since 2026-10-11T00:00:00+00:00`. `--since` needs a UTC
+  offset. The cap drains a large backlog over several nights. To drain it at
+  once, review the latest sweep plan document that `status` lists, then run
+  `link_heal.py apply --sweep --approved-plan-sha <its sha>`. `apply --sweep`
+  is refused (exit 2) while `link_heal.writes` is off, and applies the same
+  write-time calibration gate.
+- **Undo.** A report whose run applied anything names that apply run as
+  `undo_run_id`, with the literal command
+  `fused-memory/scripts/link_heal.py undo --run <apply run id>`. The run-report
+  escalation prints the same command, from
+  `fused-memory/src/fused_memory/maintenance/link_heal_executor.py::undo_command`.
+- **What it leaves.**
+  - A JSON and a Markdown report,
+    `<reconciliation.data_dir>/link-heal-reports/link-heal-sweep-<date>-<run8>.{json,md}`.
+    They give counts by project × decision × verdict × action, the escapes
+    filed and would-escape, the window, the calibration status and the undo
+    run.
+  - One info escalation per run naming the report, or naming why the report
+    could not be written (the run then exits 1): category
+    `link_heal_run_report`, anchor `link-heal-run-report`, never folded.
+    Filing it dismisses the previous run's record if that is still pending, so
+    only the newest report is open work; every report stays on disk.
+  - The records, in `<reconciliation.data_dir>/link_heal.db`. Each examined
+    link has its child and parent exactly as read, the verdict with its
+    model, prompt version and reason, the decision and its disposition, and
+    each write's before and after snapshots. An undone heal keeps its action
+    and after-state and names the undo run that took it back. The records are
+    append-only and never pruned.
+- **Exit codes.** 0 when the run is complete, or partial only by the cap or
+  stale skips. 1 on a read, adjudication or write failure, a stopped run, or a
+  report it could not write.
+  2 when the run was refused before it started.
+
 ### Transcript secret sweep (02:30)
 
 Agent subprocesses inherit no secret-bearing variable except their own
-`CLAUDE_CODE_OAUTH_TOKEN` (`shared/src/shared/secret_env.py`), and transcripts
-are redacted as they are archived (task 6820). This sweep is the backstop for
+`CLAUDE_CODE_OAUTH_TOKEN` (`shared/src/shared/secret_env.py`). Verify and
+offline-lane children, a target project's build and test runs, inherit every
+credential except the `CLAUDE_OAUTH_TOKEN_*` account pool
+(`shared/src/shared/secret_env.py::without_account_pool`, task 6828); that
+governs what they inherit, not what a test later loads into its own process.
+Transcripts are redacted as they are archived (task 6820). This sweep is the backstop for
 everything already on disk.
 
 - **What it scans.** Every regular `*.jsonl` file under each orchestrator
@@ -3087,6 +4144,187 @@ One failure is not an exhaustion. `<label>: claude CLI could not be started
 unit's PATH. Every digest fails with it, so the night is a storm that exits
 1. Check the unit's `Environment=PATH=` pin.
 
+### Scheduled memory evals (03:15)
+
+**What it does.** Measures the memory subsystem once a day and files
+regressions where the recon-escalation-watcher sees them. The runner
+(`fused-memory/scripts/memory_eval_runner.py`, contract in
+`docs/prds/memory-eval-program.md` M2/M3) runs each registered producer
+read-only, judges each new series against its trailing window, writes the
+verdicts and a run report, then files `eval_regression` escalations on the
+reconciliation queue (port 8103, `data/reconciliation/escalations`). It never
+resolves one: the watcher is the sole closer.
+
+| File | Role |
+|---|---|
+| `scripts/fused-memory-memory-eval.sh` | Wrapper: service env, then `uv run --no-sync` of the runner |
+| `scripts/fused-memory-memory-eval.service` | `Type=oneshot` around the wrapper |
+| `scripts/fused-memory-memory-eval.timer` | `OnCalendar=*-*-* 03:15:00` |
+| `scripts/install-memory-eval-timer.sh` | Installer |
+| `fused-memory/scripts/memory_eval_runner.py` | The runner and its producer registry |
+| `fused-memory/config/memory-eval.yaml` | Every threshold, including the storm limit K; `runs_per_quarter` must count the timer's cadence (a test pins it). Also each producer's wall-clock bound: `producer_timeout_secs`, which `producer_timeout_secs_by_eval` overrides per eval |
+
+**Artifacts** live under `fused-memory/data/memory-evals/`: one directory per
+eval (its M1 series, reports and `limits-current.json`), plus
+`verdicts-<STAMP>.json`, `verdicts-current.json` (what the dashboard reads)
+and `run-report-<STAMP>.txt` at the root.
+
+**A run takes hours, because of e6.** `e6-corpus-health` has its own bound in
+`producer_timeout_secs_by_eval`: its lexical sweep of all three Mem0
+categories runs for hours (task 9961). The runner writes the verdicts and the
+run report only after the last producer finishes, so a run's verdicts land
+hours after 03:15. e6 finishes its Qdrant reads in its first few minutes. The
+rest is single-core CPU, so it overlaps the later ladder slots on CPU only.
+To check e6 against its bound in the scheduled context, look in
+`journalctl --user -u fused-memory-memory-eval.service` under
+`--- producer e6-corpus-health output ---`. Read the timestamps inside its
+log lines, not the journal's own, because the runner relays a producer's
+output only after the producer exits, and relays its stdout (e6's JSON plan,
+which has no timestamps) before its stderr log. The first timestamped line
+starts the sweep, and its `Wrote metrics artifact` line marks the end. A
+`TimeoutExpired` for e6 in the run report means its sweep ran past the bound.
+That run never logs `Wrote metrics artifact`, so it gives only a lower bound,
+the bound itself. Size the new bound from the last run that completed, or
+raise it and re-measure.
+
+**The first run is the grandfather snapshot.** An eval with no
+`limits-current.json` records today's failures as known-bad and alarms on
+nothing; its run report lists them under "Initial-state baseline". Deleting an
+eval's `limits-current.json` re-snapshots it on the next run. The installer
+therefore starts nothing: the first run happens on schedule.
+
+**Exit status and what a failed run means.** 0 means the run completed, even
+if it alarmed. 1 means something failed to run: a producer, an evaluation or
+the runner itself. Every such failure in one run collapses into one
+`eval_regression` (task id `memory-eval-program`) on the 8103 queue, and the
+unit is left `failed`. 2 means preflight refused: a bad config, a recon queue
+directory that is missing or empty, a malformed `MEMORY_EVAL_RUN_STAMP`, or
+another run holding the artifact root's `.runner.lock`. The refusal names
+that run's pid and stamp. Two runs at once could file the same fingerprint
+twice or interleave a `limits-current.json` update, so the second run writes
+nothing.
+Nothing is filed then, so the unit state and the journal are the only signal.
+A relative `--artifact-root` is resolved against the caller's directory.
+Unlike the 05:00 and 05:30 wrappers, this one does not mask a failure with
+exit 0: the escalation is the alarm. A failed
+unit does not stop its timer. `fused-memory-flag-marker-sweep.service`
+failed with status 127 on 2026-08-18, and its timer ran it again on
+2026-08-19 (journal excerpt in that unit file).
+
+```bash
+journalctl --user -u fused-memory-memory-eval.service -n 100
+systemctl --user list-timers fused-memory-memory-eval.timer
+```
+
+The run's last stdout line is a JSON summary:
+`{"alarms": …, "failures": …, "filed": …, "run_stamp": …, "suppressed": …}`.
+
+**Re-filing.** While a record is pending, the runner files nothing for its
+`dedupe_fingerprint`. A regression's fingerprint and the runner-failure
+fingerprint carry no stamp, so each stays one record across runs. The storm
+aggregate's fingerprint is scoped to its run
+(`shared/src/shared/memory_eval_verdicts.py::storm_fingerprint`). So a storm
+that persists, such as a corpus migration that trips more than K metrics for
+several days, files one new aggregate per run. The watcher folds those into
+the oldest one.
+
+**Install.**
+
+```bash
+scripts/install-memory-eval-timer.sh
+```
+
+**Deploy is a separate task.** An agent cannot run that installer, because
+`~/.config/systemd/user/` is outside the sandbox write-set (see "The nightly
+ladder" above). The host install is a `task_kind='deterministic'`
+`before_done` task of kind `deploy` that runs
+`scripts/install-memory-eval-timer.sh`. It can be filed only once the
+installer is on main, because
+`fused-memory/src/fused_memory/middleware/deterministic_task_guard.py` rejects
+a `before_done` script that main does not have yet. The job is done when
+`systemctl --user list-timers --all` lists `fused-memory-memory-eval.timer`.
+
+That deploy task must depend on task 3217. The runner writes one verdict
+entry per tripwire item. The dashboard reader
+(`dashboard/src/dashboard/data/memory_evals.py::_read_verdicts`) still keys
+verdicts by `(eval_id, metric_id)` and keeps the first, so it would show an
+alarming tripwire as clear whenever its first item passes. Task 3217 re-keys
+that reader. Until it lands, the first scheduled run would publish a verdicts
+file the Memory tab misreads.
+
+### Nightly quality snapshot (03:45)
+
+**What it does.** Measures each Python project's `main` once a night with the
+factory's quality-metrics instrument, through
+`scripts/quality_snapshot_cadence.py` (its module docstring and `--help`). The
+skip of a sha already measured at the same identity, and the pinned tree the
+measurement runs in, are `plans/quality-dashboard-prd.md` decisions 18-19. It
+is pure CPU: no LLM, and it never commits. It is deliberately not coupled to
+the legibility trickle.
+
+| File | Role |
+|---|---|
+| `scripts/quality-snapshot@.timer` | the 03:45 cadence, one instance per project |
+| `scripts/quality-snapshot@.service` | runs the wrapper; `OnFailure=` starts the alarm |
+| `scripts/quality-snapshot-alarm@.service` | runs the alarm in a unit of its own |
+| `scripts/quality_snapshot_alarm.py` | files the failure escalation |
+| `scripts/install-quality-snapshot-timer.sh` | installs one project's instance |
+
+**Instances.** `dark_factory`, `solar_challenge`, `solar_challenge_platform`
+and `scoping_intake`. reify is out of scope until the Rust snapshot variant's
+gaps are owned.
+
+**Where snapshots land.**
+`/home/leo/src/dark-factory/data/quality-metrics/<project_id>/<as_of_sha>.json`,
+which is gitignored. The pinned trees live under
+`~/.local/state/dark-factory/quality-snapshot/<project_id>/` and are removed
+after each run, but a run killed by `TimeoutStartSec` can leave one there:
+remove the directory, then run `git -C <project_root> worktree prune`. Nothing
+is committed by machine. `/review-all` copies its own baseline to
+`plans/quality-metrics/` in its Phase 5, and its Phase 1 reads both homes
+(`skills/review-all/SKILL.md`).
+
+**Deploy.** From the main checkout after landing, once per project:
+`scripts/install-quality-snapshot-timer.sh <project_root>`. The project id
+derives from the root, and the instance's root lives in
+`~/.config/dark-factory/quality-snapshot/<project_id>.env`. An agent cannot
+run it (see "The nightly ladder" above); this landing's deploy is task 9986.
+It is done when `systemctl --user list-timers --all` lists
+`quality-snapshot@<project_id>.timer`.
+
+**When it fails.** The wrapper's `quality_snapshot_cadence:` line is in
+`journalctl --user -u quality-snapshot@<project_id>.service`, and the
+`OnFailure=` handler files one `infra_issue` info escalation, task id
+`quality-snapshot-<project_id>`, on the dark_factory escalation server. A
+handler that could not post shows as a failed
+`quality-snapshot-alarm@<project_id>.service`.
+
+**What is not watched.** A timer that stops firing pages no one: the alarm
+covers only a run that fires and fails. No liveness predicate watches this
+timer yet, which departs from the ladder rule above. Its deploy, task 9986, is
+an operational human gate rather than a deterministic `before_done` task,
+because `submit_task` refuses a `before_done` script that is not yet on main,
+and 9986's morning-after check runs once. The predicate is a follow-up filed
+from task 8464, modelled on `scripts/legibility/check_trickle_liveness.sh`.
+Until it lands, check `systemctl --user list-timers 'quality-snapshot@*'`.
+
+**Run now.** `systemctl --user start quality-snapshot@<project_id>.service`.
+
+**Backfill.** Measure given shas through the same wrapper, at the unit's
+priority:
+
+```bash
+systemd-run --user --wait --collect -p Nice=19 -p CPUWeight=10 \
+  /home/leo/src/dark-factory/.venv/bin/python \
+  /home/leo/src/dark-factory/scripts/quality_snapshot_cadence.py \
+  --root <project_root> --project-id <project_id> --sha <sha> ...
+```
+
+A point costs about 200 CPU-s for dark_factory. The weekly point for a date is
+main's first-parent sha as of 03:45 that day:
+`git -C <project_root> log -1 --first-parent --before='<date> 03:45' --format=%H main`.
+dark_factory's one-off backfill since 2026-10-08 is task 9986.
+
 ### Legibility trickle health probe (04:30)
 
 **What it does.** Runs the three trickle probes once a night and files one
@@ -3113,7 +4351,7 @@ Once the timer below is installed for a project, the "nothing runs the
 probes" claim becomes historical **for that project only** — a second project
 without the timer is back to the pre-4514 state.
 
-**Four artefacts, four different questions.** Do not merge them again:
+**Five artefacts, five different questions.** Do not merge them again:
 
 | Artefact | Answers |
 |---|---|
@@ -3121,8 +4359,9 @@ without the timer is back to the pre-4514 state.
 | `scripts/legibility/check_trickle_progress.py` | Did SIGNAL flow? (reads the recorded run state) |
 | `scripts/legibility/check_census_progress.py` | Did a FIRED census advance census-state? (reads the recorded census-fire streak plus the project's `docs/legibility/census-state.json`) |
 | `scripts/legibility/check_trickle_health.py` | Runs the three on a timer and escalates |
+| `scripts/legibility/check_trickle_health_liveness.sh` | Did the HEALTH unit run and reach a verdict? (reads `legibility-trickle-health@<project>.service`'s `Result` and `ExecMainStatus`) |
 
-`check_trickle_health.py` **executes** the other three as subprocesses rather
+`check_trickle_health.py` **executes** the first three as subprocesses rather
 than re-deriving any verdict, so there is no lockstep duplication to keep
 in sync and `check_trickle_liveness.sh` stays byte-identical as its own
 header comment requires.
@@ -3157,6 +4396,25 @@ dark_factory's is task 6205; reify's is task 6312. A project's deploy is
 done when `systemctl --user list-timers --all` lists
 `legibility-trickle-health@<project_id>.timer`, not when the installer lands
 on main.
+
+**Liveness.** `check_trickle_health.py` exits 0 when healthy, 3
+(`scripts/legibility/check_trickle_health.py::EXIT_DEGRADED`) when every probe
+ran and at least one failed, and 1 when it reached no verdict: an unresolved
+project id, or any uncaught exception including an `ImportError`, since 1 is
+Python's own crash status. So a DEGRADED night leaves the unit `failed` with
+status 3. That is the alarm, not a broken unit.
+`check_trickle_health_liveness.sh <project_id> <hours>` counts
+`Result=success`/`ExecMainStatus=0` and `Result=exit-code`/`ExecMainStatus=3`
+as ALIVE. Never-ran, staleness, an abnormal `Result`, or any other status (1,
+2 = a usage error or uv, 203 = exec failure) all FAIL. DEGRADED is not exit 1
+because a crash would then read as a finding. The probe does not accept 0
+alone because it would then fail a health unit that is correctly reporting a
+broken trickle, as happened nightly from 2026-09-29 (task 6205). Binding: task
+6902 filed one delayed-milestone predicate per project, each running
+`check_trickle_health_liveness.sh <project_id> 72` with `after_secs=604800`:
+task 10103 for dark_factory (after deploy 6205) and task 10104 for reify (after
+deploy 6312). These milestones are one-shot: a `done` predicate never runs
+again.
 
 **Reading the verdict.** Each door has its own remedy, and conflating them
 is how an operator ends up tuning the sampler for a crashed coder:
@@ -3335,7 +4593,8 @@ recurring probe here.
 the `topic` / `canonical` metadata the vocabulary contract specifies, trends
 that against the previous runs, and then **rehearses** the sweep that would
 close the gap — one job, in that order, so an operator reads the shortfall
-and the proposed stamping in the same journal entry.
+and the proposed stamping in the same journal entry. None of it runs until
+the timer is armed on the host — see **First run: arm the timer.** below.
 
 The measurement is a deterministic paginated Qdrant `count` + `scroll`, not
 a semantic search: a coverage number derived from ranked retrieval could not
@@ -3354,7 +4613,7 @@ and retiring this timer is the cheaper shape and is the preferred follow-up.
 
 | File | Role |
 |---|---|
-| `scripts/memory-metadata-coverage-census.sh` | Wrapper: census, rehearse, then commit |
+| `scripts/memory-metadata-coverage-census.sh` | Wrapper: census, rehearse, then land through the merge queue |
 | `scripts/memory-metadata-coverage-census.service` | `Type=oneshot` around the wrapper |
 | `scripts/memory-metadata-coverage-census.timer` | `OnCalendar=*-*-* 05:00:00` |
 | `scripts/install-memory-metadata-coverage-census-timer.sh` | Installer |
@@ -3378,7 +4637,7 @@ run, so ~470 KiB once the retention window is full** — the bound the cap
 buys, worth knowing before reading the per-night figure below, because the
 file is rewritten whole every night rather than appended to in place.
 
-**What committing all three nightly costs, stated rather than assumed.** The
+**What landing all three nightly costs, stated rather than assumed.** The
 two report artifacts are full rewrites every run (measured: JSON 1.04 MiB /
 markdown 223 KiB raw; 90 KiB / 47 KiB zlib-compressed, which is what git
 stores loose), against 5.2 KiB for the history *today* — the history is
@@ -3392,18 +4651,20 @@ not an oversight: the JSON is a **cited, read** artifact —
 `fused-memory/scripts/memory_eval_retrieval_probe.py`
 (`DEFAULT_CENSUS_PATH`) reads it from the repo, so a snapshot that is
 only regenerated on demand would be silently stale for whoever reads it
-next. Not committing them is worse still: the wrapper regenerates them in
-the machine-operated `project_root` checkout regardless, so skipping the
-commit leaves that checkout carrying an uncommitted diff every morning. If
-the growth ever needs bounding, the `ARTIFACTS` array in the wrapper is the
-single place that decides which paths are committed — change it there, and
-update this paragraph.
+next. Each drift night also costs **one full-gate merge**: the landing takes
+the normal lane unverified, so it pays the project's whole merge gate (no
+docs gate exists until task 5411 lands; `land_files` special-cases nothing,
+so the census inherits one through that module when it does). If the growth
+or the gate cost ever needs bounding, the `ARTIFACTS` array in the wrapper
+is the single place that decides which paths are landed — change it there,
+and update this paragraph.
 
 **The regen command** — what the report's own `regen` line reproduces, and
-the exact invocation the wrapper makes:
+the invocation the wrapper makes, on the generation worktree's own copy of
+the script (below), so the report's recorded paths stay repo-relative:
 
 ```bash
-uv run --frozen --project fused-memory python \
+uv run --no-sync --project fused-memory python \
     fused-memory/scripts/census_memory_metadata.py --top-n 400
 ```
 
@@ -3412,31 +4673,73 @@ regeneration diffs as content drift and never as a rendering-width change.
 For an **ad-hoc look that must not enter the trend**, add `--no-history`:
 the committed series belongs to the nightly run.
 
-**The job commits its own artifacts.** All three land in the `project_root`
-checkout — the census resolves them from its own `__file__`, so they go
-there regardless of cwd — and that checkout is machine-operated (the merge
-worker, the startup reconciler and git hooks act on it directly). Leaving
-them dirty every morning would not be untidiness but **data loss**: the
-history file is append-only and *is* the trend, so an uncommitted append
-that the merge worker's advance path resets away takes that night's row with
-it, permanently and with no error anywhere. The wrapper therefore closes
-with a scoped `git commit --only <the three paths>` — never a bare `git
-commit` (it would sweep up a concurrent process's staged work), never `git
-add -A`, never `git stash`. Same seam the 03:00 legibility job already uses
-for `docs/legibility/census-state.json`.
+**The job lands its artifacts through the merge queue.** The history file
+is append-only and *is* the trend, so a night's row has to reach main. It
+must get there without writing the machine-operated `project_root`
+checkout: uncommitted state at a landed path there makes the lane refuse to
+advance main, which halts the whole queue (`wip_overlap`).
 
-Like both other steps it is **best-effort**: a failed commit is narrated and
-never propagated, and a night whose corpus did not drift is a no-op rather
-than a failure. For an ad-hoc run that must leave the checkout alone, set
-`CENSUS_COMMIT=0` (pairs with the census's own `--no-history`).
+- The census measures a **generation worktree**, a detached `git worktree
+  add` of main's tip under a scratch directory, running that worktree's own
+  copy of the script under `project_root`'s uv project. The census writes
+  its artifacts beside its own file, so `project_root`'s working tree is
+  never written. The worktree is removed on exit.
+- The artifacts that changed there are landed by
+  `scripts/_merge_queue_landing.py::land_files` as one commit,
+  `chore(census): nightly canonical/topic coverage census <UTC date>`, on a
+  unique `task/deploy-memory-metadata-census-<UTC stamp>` branch, through
+  one **normal-lane**, unverified merge request. There is no carrier task:
+  the deploy branch is both the request's task id and its branch.
+- The run **waits** for its landing to settle, confirmed by git, before it
+  exits. The request is named on stderr as soon as the queue accepts it.
+  `CENSUS_LANDING_TIMEOUT_SECS` (72000 in the unit) bounds the wait, and
+  `TimeoutStartSec=82800` bounds the run, measuring included, so the next
+  05:00 finds the oneshot inactive. A stop (a unit stop, or that timeout)
+  cancels the request first and ends the run 143.
+- **One census request at a time.** Before main's tip is taken, the wrapper
+  calls `scripts/_merge_queue_landing.py::reclaim_retained_deploys`. A
+  census deploy an earlier run *retained* (its cancel refused, or the
+  orchestrator down at a stop) is torn down once main carries it or the
+  queue reports it settled, so a row that lands just then is under
+  tonight's rather than in conflict with it. One that may still land makes
+  the night `skipped:landing-in-flight`: it measures and lands nothing, so
+  two requests never conflict on the append. A worktree of such a branch
+  that the landing did not make is never force-removed; stderr names it.
+
+Like both other steps it is **best-effort**: a refused or failed landing is
+narrated and never propagated. A night that cannot land, because the queue
+cannot be asked or an earlier landing may still land, measures nothing
+(`census=skipped`). A night with no retained deploy whose corpus did not
+drift asks the queue nothing. `CENSUS_COMMIT=0` skips the reclaim, measures
+and rehearses in the generation worktree but lands nothing, and its
+artifacts are discarded with the worktree. For an **ad-hoc look**, run the
+regen command above directly, with `--no-history`.
 
 **Reading the output.** Every line is prefixed
 `memory-metadata-coverage-census:` and the run ends with one summary line
 carrying all three steps' exit codes:
 
 ```
-memory-metadata-coverage-census: done (census=0 stamp=0 commit=0)
+memory-metadata-coverage-census: done (census=0 stamp=0 commit=0 commit-step=landed:mr-…)
 ```
+
+| `commit-step=` | Meaning |
+|---|---|
+| `landed:<request id>` | Landed on main; the deploy branch when the queue named no request id |
+| `skipped:no-drift` | Nothing changed; no queue call was made |
+| `skipped:disabled` | `CENSUS_COMMIT=0` |
+| `skipped:landing-in-flight` | An earlier night's census deploy may still land (stderr names it); `census=skipped` |
+| `skipped:not-a-git-repo` | `$REPO` is inside no checkout; measured in place |
+| `refused:repo-not-toplevel` | `$REPO` is not its checkout's root; `census=skipped` |
+| `refused:no-escalation-port` | `$REPO/dark-factory-orchestrator.yaml` names no `escalation.port`; `census=skipped` |
+| `failed:generation-worktree` | No main, or the worktree could not be added; `census=skipped` |
+| `failed:<tag>` | `land_files` refused, or the reclaim before measuring failed (then `census=skipped`); `<tag>` is a `scripts/_merge_queue_landing.py::LandingFailure` value (`not_landed`, `timed_out`, `checkout_dirty`, …) |
+| `failed:no-verdict` | A landing step printed no token |
+
+A landing is confirmed by its request: `merge_status` on the id answers
+`done` and its `merge_finalized` event carries `state: done`, while
+`git log --first-parent main` shows a `Merge
+task/deploy-memory-metadata-census-… into main` commit.
 
 ```bash
 journalctl --user -u memory-metadata-coverage-census.service -n 100
@@ -3450,15 +4753,71 @@ artifacts are written anyway and carry the evidence of exactly which cell
 fell short. The wrapper always exits 0 for the reason the whole §12 family
 shares: a recurring `oneshot` that can fail enters systemd `failed` state
 and stays there, silently ending the trend. A red run is found by reading
-the summary line, not the unit state — and a `commit=` other than 0 is the
-one worth acting on, since it means the regenerated artifacts are sitting
-uncommitted in a checkout other processes operate on.
+the summary line, not the unit state — and a `commit=` other than 0, narrated
+as `commit-step=refused:*` or `commit-step=failed:*`, is the one worth acting
+on. Almost always that night's row did not reach main; two tags differ.
+`failed:checkout_not_synced` means the row DID land, and only
+`project_root`'s copy of the artifacts lags main's. `failed:timed_out` or
+`failed:interrupted` whose stderr says the deploy was kept may still land;
+the next night's reclaim reports it in flight, or tears it down.
+`scripts/memory-metadata-coverage-census.sh` is the source of the full
+`commit-step=` token vocabulary.
+
+**A census deploy reported in flight for several nights** is one the queue
+still answers live, or one it cannot be reached about. Ask the queue with
+`merge_status(branch="deploy-memory-metadata-census-<stamp>")` (the branch
+stderr names, without `task/`). If it is not going to land, cancel it with
+`merge_cancel(request_id=…)`. The next night's reclaim then tears the
+branch and worktree down and lands.
+
+**Is it producing readings?** One command answers it, and it is the runbook
+predicate of verify gate task **5864**:
+
+```bash
+scripts/check_memory_metadata_census_reporting.py 72
+```
+
+Exit 0 means the service's last run succeeded inside the window *and* the
+newest history row is inside it too. Non-zero means escalate, with one named
+verdict on stderr: `NOT INSTALLED` (LoadState `not-found`; run the
+installer), `MASKED` (the timer cannot start a masked service; unmask it if
+the mask is not deliberate, then run the installer), `NOT LOADED` (any other
+LoadState; `systemctl --user status` names why systemd rejected the unit
+file), `NEVER RAN` or `STALE LAST RUN` (both carry the `list-timers`
+check for whether the timer is armed), `FAILED LAST RUN` or
+`UNREADABLE LAST RUN` (read the journal; a run that failed is reported as
+failed even when it is also stale), `STALE HISTORY ROW` or an unreadable
+history artifact, and `UNREADABLE UNIT STATE` (`systemctl` itself failed).
+The probe reads only the service's state, so a timer that is not armed
+surfaces as `NEVER RAN` or `STALE LAST RUN` rather than as a verdict of its
+own.
+
+It reads `$REPO/plans/memory-metadata-coverage-history.json` with the
+wrapper's own `REPO` default, so **run it with `REPO` unset**. The service
+sets no `REPO`, so every nightly landing reaches the main checkout's file;
+pointed at a task worktree, the probe reads that worktree's older committed
+copy and reports a false `STALE HISTORY ROW`.
+
+**Why it reads the history row, not just the unit state.** The wrapper
+always exits 0, so systemd reports `Result=success` for every night that
+ran, whatever the census did — and `census=1` is ambiguous: it is the
+routine incomplete-coverage exit above, where the row *is* appended, and
+also the exit of a census that aborted before appending anything
+(`CensusScanIncomplete`, an unreadable history file, a backend fault). Only
+the newest row's age tells those apart, so a stale row behind a healthy unit
+means the census is aborting; look for `ABORT` in the journal. The probe
+now sees landing health too: the row reaches `project_root`'s file only
+through the landing (the census writes the generation worktree's copy), so
+a landing that fails or is skipped night after night also surfaces as
+`STALE HISTORY ROW` once the window passes. `commit-step=` on the summary
+line names which. This paragraph is the single home of the argument; the
+probe's docstring points here.
 
 **The rehearsal is never `--apply`.** Committing bulk `canonical: true`
 stamps stays an operator decision, run by hand after reading the rehearsal:
 
 ```bash
-uv run --frozen --project fused-memory python \
+uv run --no-sync --project fused-memory python \
     fused-memory/scripts/retro_stamp_topics.py --apply
 ```
 
@@ -3467,13 +4826,21 @@ per-(project, topic) uniqueness check censuses a violation and lets the
 write through, so an unattended bulk stamp could manufacture exactly the
 violations this census counts.
 
-**First run: arm the timer.** The installer kicks no immediate run — that
-would put an unreviewed, off-cadence row into the trend the nightly job
-owns.
+**First run: arm the timer.** On this host the timer is armed by
+deterministic deploy task **5863**, not from an agent session: an agent
+cannot write `~/.config/systemd/user/`, which is outside the sandbox
+write-set (`orchestrator/src/orchestrator/agents/write_set.py`). An operator
+can still run the installer by hand; it is idempotent and exits non-zero if
+the timer is missing from `list-timers --all` afterwards:
 
 ```bash
 scripts/install-memory-metadata-coverage-census-timer.sh
 ```
+
+The installer kicks no immediate run — that would put an unreviewed,
+off-cadence row into the trend the nightly job owns — so the first reading
+lands at the next 05:00, and until then the reporting probe above says
+`NEVER RAN`.
 
 **Reading the uniqueness-violation count.** A non-zero
 `topics_with_multiple_canonical` is **partly backlog, not purely a live
@@ -3506,16 +4873,22 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
 
 1. **Prepare.** A headless `claude --print` run on Fable follows the
    prepare-sitting mode's nightly form and records its judgement (options,
-   ramifications, a recommendation or an explicit no-lean). Its one write
-   channel is a per-run inbox, `data/sitting/inbox/<run>/`: it writes JSON
-   batch files there and runs `prepare_sitting.py record --from <file>`.
-   It is read-only otherwise, by construction: it runs
-   under `--permission-mode dontAsk`, with an allowlist and an explicit
-   denylist of every apply verb, both in `nightly_prepare.py`, reading no
-   settings file (`--setting-sources ''`), and its
-   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox. The CLI
-   allow rule plus the absence of settings files confine the agent's own
-   file writes to that inbox. `prepare_sitting.py` confines in code what
+   ramifications, a recommendation or an explicit no-lean). It writes JSON
+   batch files to a per-run inbox, `data/sitting/inbox/<run>/`, and runs
+   `prepare_sitting.py record --from <file>`. Three layers confine it, all
+   in `nightly_prepare.py`. The write boundary is Landlock: the CLI runs
+   under it with the tree read-only except `data/sitting/`, `~/.cache/uv`,
+   `/tmp` and `.task/` (Landlock always grants its cwd's `.task/`, and the
+   run's cwd is the repo root because its prepare command is
+   repo-relative). Without Landlock the run is refused (`prepare=2`), never
+   launched unconfined; bwrap is not a fallback, since its mount order
+   leaves the host `/tmp` read-only. The CLI rules are the first gate, not the boundary: it runs
+   under `--permission-mode dontAsk` with an allowlist and an explicit
+   denylist of every apply verb, reading no settings file
+   (`--setting-sources ''`); the CLI matches those rules against raw
+   command text, so a shell-quoted spelling can pass a deny. Its
+   environment sets `SITTING_NIGHTLY_CONFINED` to the run's inbox, under
+   which `prepare_sitting.py` confines in code what
    `record` reads (a `.json` file directly in that inbox, never stdin or
    another path, so never an earlier night's batch) and where it writes
    (the default store in `data/sitting/`), and refuses everything but `brief`
@@ -3523,10 +4896,17 @@ supersedes `data/afk-digest.md`, which was last written 2026-08-19.
    servers are the `escalation` and `fused-memory` blocks of the checkout's
    `.mcp.json`, passed with `--strict-mcp-config`, so its reads never depend
    on the project config being approved for a headless run, and playwright
-   never starts. Its account comes from the shared pool, as a
-   lease that is read and handed straight back, so the night's Fable spend
-   is invisible to the gate. With nothing leasable, it inherits the unit's
-   environment. It stops itself after 2700s.
+   never starts. Its account comes from the shared pool, through the same
+   runner as every other session (`shared.cli_invoke.invoke_with_cap_retry`),
+   in roster order. A seat at its usage limit, or one whose credentials are
+   rejected (401/403), hands the run to the next seat, and a capped session
+   that had made progress resumes there. It never parks: after one pass
+   over the pool it gives up. Its `CLAUDE_CONFIG_DIR` is a per-run directory
+   under `data/sitting/config/` holding the current seat's token, which is
+   removed on every exit short of a SIGKILL. With no pool account resolved
+   the night is skipped (`prepare=1`, `no pool account resolved; skipping`):
+   the run never uses the host's own login. It stops itself after 2700s,
+   failovers and the cooldowns between them included.
 2. **Render.** This step is deterministic and runs whatever prepare
    returned. Every figure on the page comes from its own fresh measurement
    and carries a stamp, and a store it cannot read is a stated shortfall in
@@ -3541,13 +4921,14 @@ is no commit seam, unlike the 05:00 census:
 | `data/sitting/ledger-nightly.json` | The night's item numbering, carried over from the night before so an item keeps its number; a watcher seeds its sitting from it |
 | `data/sitting/preparation.json` | The prepared judgement, per open item |
 | `data/sitting/inbox/<run>/` | The night's batch files, kept for forensics |
+| `data/sitting/config/claude-config-nightly-prepare-<run>/` | The night's CLI config dir and session transcript, kept for forensics |
 
 **The regen commands**, which are the two invocations the wrapper makes, run
 from the repo root:
 
 ```bash
-uv run --frozen --project shared python scripts/sitting/nightly_prepare.py
-uv run --frozen --project shared python scripts/sitting/return_brief.py --output data/return-brief.md
+uv run --no-sync --project shared python scripts/sitting/nightly_prepare.py
+uv run --no-sync --project shared python scripts/sitting/return_brief.py --output data/return-brief.md
 ```
 
 The first spends a Fable budget. For a **no-cost re-render**, skip it:
@@ -3565,17 +4946,28 @@ journalctl --user -u return-brief.service -n 100
 systemctl --user list-timers return-brief.timer
 ```
 
-- `prepare=1` means the Fable run failed, timed out, hit a usage limit or
-  recorded nothing; its log line carries both stream tails, or, for a run
-  that recorded nothing, the counts of what the inbox offered and could not decode. That is
-  routine, not an incident:
+- `prepare=1` means the Fable run was skipped (no pool account resolved),
+  failed, timed out, found no seat that could take it, or recorded nothing.
+  A failed run's log line carries the tail of the CLI's `result` text and
+  of its stderr. A run no seat could take logs `no pool account could take
+  the run: capped [<seats>], auth-failed [<seats>]; earliest reset <ts>`.
+  A run that recorded nothing logs the counts of what the inbox offered and
+  could not decode. That is routine, not an incident:
   the page is still written, and items the run did not reach show as
   `awaiting preparation`. The page's header says how fresh the preparation
-  is. A run that finished well logs `nightly_prepare: done (... recorded=<n>
-  of <m>, undecodable=<u>, permission_denials=<d>)`; a high `undecodable`
-  means the agent's entries failed validation even though some were recorded.
+  is. Two exceptions. A line listing every seat as auth-failed means those
+  tokens need operator action, and no reset clears them. A line whose
+  earliest reset is `unknown` while seats are listed as capped may be a
+  local fault rather than a quota: the shared runner reads a failure that
+  cost nothing, took at most one turn and exited within 5s as a cap, so a
+  broken sandbox wrapper or a CLI rejecting a flag caps every seat in turn.
+  Read the runner's `suspicious zero-cost instant exit` lines above it,
+  which quote the CLI's output. A run that finished
+  well logs `nightly_prepare: done (... account=<seat>, ... recorded=<n> of
+  <m>, undecodable=<u>)`; a high `undecodable` means the agent's entries
+  failed validation even though some were recorded.
 - `prepare=2` is a configuration error, such as no `claude` on the unit's
-  PATH.
+  PATH, or no Landlock (`refusing to run unconfined`).
 - `brief=` other than 0 means the page was not written. That is the one
   worth acting on.
 
@@ -3584,8 +4976,10 @@ failing recurring `oneshot` stays in `failed` state and silently ends the job.
 
 **API key.** The unit carries `UnsetEnvironment=ANTHROPIC_API_KEY` under the
 policy stated in "Legibility trickle accounts (03:00)" above.
-`nightly_prepare.py` also strips the key from the child's env, whether the
-account came from a lease or was inherited.
+`nightly_prepare.py` runs the CLI through the shared runner, which builds
+the child's env as `shared.secret_env.agent_subprocess_env` of its own (no
+API keys or other secrets, no endpoint selection, no Python-env selection),
+with the current seat's `CLAUDE_CODE_OAUTH_TOKEN` on top.
 
 **First run: arm the timer.** The installer kicks no immediate run, because
 an off-cadence run would spend a Fable budget nobody scheduled.
@@ -3604,6 +4998,303 @@ so list dark-factory too.
 **The apply half is agent work, not timer work.** Leo's answers are applied
 by a watcher session, following `skills/escalation-watcher/SKILL.md`,
 "Sitting preparer (`prepare-sitting` mode)".
+
+### Weekly duplicate-cluster report (Sun 06:30)
+
+**What it does.** Measures, once a week, how fast duplicate Mem0 clusters
+regrow. It files nothing. For each project in
+`fused-memory/config/duplicate-audit.yaml`, the report script runs the
+detector (`fused-memory/scripts/audit_duplicate_memories.py`) once per
+category as a read-only subprocess, with `--no-metrics` and never `--apply`.
+It saves each stdout plan, builds one report from them, and diffs that report
+against the project's previous one. Because of `--no-metrics`, the e6 metric
+series keeps the memory-eval runner's `e6-corpus-health` producer as its only
+writer. Runs are long. In the 2026-08-11 T0 runs one project took about 75 to
+90 minutes, so `detector_timeout_secs` bounds one category run, not the job.
+
+| File | Role |
+|---|---|
+| `scripts/fused-memory-duplicate-audit.sh` | Wrapper: service env, then `uv run --no-sync` of the report script |
+| `scripts/fused-memory-duplicate-audit.service` | `Type=oneshot` around the wrapper |
+| `scripts/fused-memory-duplicate-audit.timer` | `OnCalendar=Sun *-*-* 06:30:00` |
+| `scripts/install-duplicate-audit-timer.sh` | Installer |
+| `fused-memory/scripts/duplicate_cluster_report.py` | The report: detector runs, cluster inventory, regrowth diff |
+| `fused-memory/config/duplicate-audit.yaml` | Projects, categories, `scan_limit`, timeouts, cadence and the recall caveat. `cadence.on_calendar` must equal the timer's `OnCalendar`, and a test pins that |
+
+**Artifacts** live under
+`fused-memory/data/duplicate-cluster-reports/<project>/`. That directory is
+gitignored, like the rest of `fused-memory/data/`, so it exists only in the
+checkout that ran the job:
+
+- `plan-<STAMP>-<category>.json`: the detector's stdout plan for one
+  category, verbatim;
+- `plan-<STAMP>-<category>.stderr.log`: that category's detector stderr,
+  written as the detector runs and kept for a failed category too. `tail -f`
+  it to follow a run in progress: the journal gets a category's stderr only
+  once that category finishes;
+- `report-<STAMP>.json`: the cluster inventory, child rankings, scan
+  coverage, the regrowth diff and `failed_categories`;
+- `summary-<STAMP>.txt`: the readable digest, which is also printed to the
+  journal.
+
+**What the report is for.** It measures regrowth. Re-emissions are
+near-verbatim, and the detector catches those. The report is
+`authoritative: false`. **Gate filing from it is blocked**: the detector's
+paraphrase recall is far below what enumerating a gate's members needs.
+Task 4916 owns that wiring and the precondition it waits on. The measured
+numbers are `recall_caveat` in `duplicate-audit.yaml`, and every report
+carries a copy. Read them there.
+
+**Reading the diff.** Each cluster carries a `cluster_key` and a `lineage`
+status: `baseline`, `new`, `unchanged`, `grew`, `shrank` or `split`. A key is
+inherited by member overlap within one category. Members a cluster gained
+are split by `created_at` against the previous run stamp. `re_emitted`
+members were written since that run, and that is the regrowth. `preexisting`
+members are older: newly detected, or moved in from another cluster. That is
+not regrowth. `unknown` members have no `created_at`. A naive `created_at` is
+read as UTC. `rate_per_day` is re-emitted members per elapsed day.
+`regrowth.previous_overdue` is true when the previous report is more than
+twice `cadence.resweep_interval_days` old.
+
+`regrowth.by_category` gives each category its own totals. The headline
+totals leave out `regrowth.excluded_categories`, the categories the previous
+report did not sweep. Every cluster there would otherwise count as `new`, for
+example in the week after that category's detector run failed.
+
+Each entry in the report's `categories` carries `incomparable_reasons`. An
+empty list means this run and the previous one compare like with like for
+that category. A reason discloses a difference; the diff is still computed.
+
+| Reason | Meaning |
+|---|---|
+| `previous_missing_category` | The previous report did not sweep this category. Every category of a project's first report has it |
+| `coverage_unknown` | One of the two runs recorded no scan coverage. This holds for every category of the first diff against the T0 seed, whose plans predate scan coverage |
+| `scan_truncated` | A run hit `scan_limit`, so its counts are floors |
+| `scan_limit_changed` | The two runs scanned at different limits |
+| `lexical_threshold_changed` / `ann_cutoff_changed` | The detector clustered at a different cutoff |
+
+`observations_and_summaries` held more than 5000 records in both projects at
+the 2026-08-11 T0 run, so at `scan_limit: 5000` its cluster counts are floors
+and it reports `scan_truncated`. Compare its deltas only between runs at the same limit.
+
+Each `child_rankings` row names its `category`. Its `previous_count` and
+`delta` are null unless the previous report counted children in that
+category, that is, unless its `categories` entry has `child_counts_known:
+true`. A category that failed or was absent last run is excluded, and so is
+one swept from a T0 legacy plan. A null means unknown, not zero. A row's
+category ties it to that category's `incomparable_reasons`.
+
+**Exit status.**
+
+- 0: every report was written, and every detector run succeeded.
+- 1: a partial report or a failed write. A detector run could not start,
+  exited non-zero, timed out, printed non-JSON, or its stderr log or plan
+  could not be written. The report is still written, and it lists that
+  category under `failed_categories` with a stderr tail. Its `error_type` is
+  one of `stderr_log_failed`, `spawn_failed`, `timed_out`, `detector_exit`,
+  `bad_plan_output` or `plan_write_failed`, and `exception_type` names the OS
+  error behind a log, spawn or plan-write failure. Exit 1 also covers a
+  report that could not be written. It also covers a previous report that
+  cannot be read as a report: that is checked before the project's sweep, so
+  that project is skipped with an `ABORT:` line naming the file, and the
+  other projects still run.
+- 2: bad input or config, such as an invalid `duplicate-audit.yaml`, a
+  malformed `--run-stamp`, an unconfigured `--project-id`, or a `--plan`
+  file that is missing or not JSON.
+
+Nothing is filed on any status, so the unit state and the journal are the
+only signal.
+
+```bash
+journalctl --user -u fused-memory-duplicate-audit.service -n 100
+systemctl --user list-timers fused-memory-duplicate-audit.timer
+```
+
+**One-time T0 seeding.** Seed each project's history with the 2026-08-11
+baseline before the first scheduled run, so that first weekly report diffs
+against it. `--plan` mode builds a report from saved plans with no store
+access. The baseline plans exist only in the main checkout (gitignored):
+
+```bash
+B=/home/leo/src/dark-factory/fused-memory/data/memory-evals/duplicate-cluster-baseline-20260811
+for p in dark_factory reify; do
+  /home/leo/src/dark-factory/scripts/fused-memory-duplicate-audit.sh \
+    --project-id "$p" --run-stamp 20260811T120000Z \
+    --plan "$B/audit_${p}_procedural_knowledge_20260811.stdout.json" \
+    --plan "$B/audit_${p}_preferences_and_norms_20260811.stdout.json" \
+    --plan "$B/audit_${p}_observations_and_summaries_20260811.stdout.json"
+done
+```
+
+Each project then has one `report-20260811T120000Z.json`. The dark_factory
+one lists 145 clusters, the count measured on 2026-08-11.
+
+**Install.** The installer starts nothing, so the first run happens on
+schedule, after the seed:
+
+```bash
+scripts/install-duplicate-audit-timer.sh
+```
+
+The ladder row above is a host claim. An agent cannot run the installer (see
+"The nightly ladder"), so the job is installed only once
+`systemctl --user list-timers --all` lists
+`fused-memory-duplicate-audit.timer`.
+
+### Plan-decision cross-pairing scan (on demand, no timer)
+
+To look for plans whose `design_decisions` entries pair a decision with the
+wrong rationale, re-run the read-only scanner rather than quote the dated
+figures: `python scripts/scan_plan_decision_pairing.py`. It sees only the
+mis-pairings someone noticed and documented in a later correction entry, so
+every count it reports, zero included, is a strict lower bound and never
+evidence that plans are clean. Unattended, use
+`python scripts/scan_plan_decision_pairing.py --fail-on-hit --require-scanned 1`;
+plain `--fail-on-hit` exits 0 when the sweep read nothing (exit 3 is the
+coverage floor). That gate is red from day one and stays red: on 2026-11-15,
+against the default root, it exited 1 on 27 historical mis-pairings in 24
+plans, and those cannot be repaired. For a gate that starts green, pass
+`--require-scanned 1` without `--fail-on-hit`, or compare the `--json` hit
+count against a recorded baseline. The findings, why repair is impossible, and
+why no write-time containment exists are in
+[docs/plan-decision-cross-pairing.md](docs/plan-decision-cross-pairing.md); see
+the CHANGELOG entry for task 3967.
+
+---
+
+## 12a. INV-12 `exceptions-owned-or-ratified`: the exception register and owner sweep
+
+Every allow-list entry and inline suppression that silences a detector carries
+a disposition: a live owner (`Debt`) or an operator ruling (`Policy`). The rule
+itself is in [docs/legibility/design-invariants.md](docs/legibility/design-invariants.md).
+The accepted spellings are `shared.governed_exceptions.INLINE_MARKER_FORMS` and
+`DECLARATION_FORMS`. The `x_inv12_*` task keys are described in the Tier-C
+paragraph of [docs/task-authoring.md](docs/task-authoring.md). This section
+covers only what an operator runs and reads.
+
+### Reading exception_register.py --report
+
+```bash
+cd /home/leo/src/dark-factory
+uv run --project shared python scripts/exception_register.py --report
+# from a task worktree, read the host's stamp, not the worktree's absent one:
+uv run --project shared python scripts/exception_register.py --report \
+    --sweep-state /home/leo/src/dark-factory/data/exception-owner-sweep/state.json
+```
+
+Without `--sweep-state`, a worktree run reads its own absent
+`data/exception-owner-sweep/state.json` and prints `last sweep: never run`.
+
+| Block, in report order | Meaning |
+|---|---|
+| `grandfathered (unowned): N` | Inline suppressions the baseline holds with no disposition. The baseline only shrinks, so this number may only fall, except when a new bare marker re-uses a `baseline slack` key; `--tighten` closes that. |
+| `ratification table: …, N rows` | Rows of `docs/legibility/exception-ratifications.yaml`, the only ids a `Policy` may cite. |
+| `governed lists: N declarations` | One block per declaration: `list_id` and `path:line`, its `rule`, its `default` disposition with how many keys it `covers`, and each per-key override. |
+| `unregistered candidates (report-only)` | Allow-list-shaped symbols that no declaration governs. This is a review docket, not a failure. |
+| `inline suppressions: …` | Sites and files, `kinds`, `ownership` (class, debt, policy, unowned), the inline gate's violations, then counts by kind and code and by file. |
+| `baseline excess` | Keys the tree holds beyond the baseline. Non-zero is the merge gate's red. |
+| `baseline slack` | Keys the baseline holds that the tree no longer uses. `--tighten` removes them. |
+| `violations: N` | A `Policy` naming no table row, or a malformed disposition. Each is also printed on stderr. |
+| `last sweep: …` | The owner sweep stamp's age with `(ok)` or `(FAILED)`, and `STALE` past 48 h; or `unreadable stamp`; or `never run`. A `FAILED` stamp under 48 h old still exits 0, so read `journalctl` and the sweep's `infra_issue` escalation. |
+
+Exit codes: 0 clean; 1 violations; 2 an instrument failure, or a sweep stamp
+that is stale past 48 h or unreadable. A sweep that has never run is not a
+failure. `--json` publishes the same register as a document, and is what the
+sweep reads.
+
+The report does not check owner liveness. To list dead owners now, run
+`uv run --project shared python scripts/exception_owner_sweep.py --dry-run`. It
+reads the main checkout's task store from any checkout, but measures the
+citations in the checkout it runs from: pass `--root /home/leo/src/dark-factory`
+to measure main's. It prints one verdict and planned action per (scope, owner),
+and writes, files and escalates nothing.
+
+### The seed cutover, and what a red branch sees
+
+The merge gate is `scripts/tests/test_inline_suppression_ratchet.py`. It
+enforces only if `scripts/inline_suppression_baseline.json` exists. Task 5607
+seeded that baseline once, on main, with the merge queue halted, and committed
+it alone (2026-10-10). `inline_suppressions.py --seed` now refuses, because a
+baseline exists. `--tighten` only ever shrinks it.
+
+A branch that adds an undisposed marker goes red at verify. The failure names
+`file:line`, the kind and code, the reason and the accepted forms. A marker
+that no tool reads gets `delete this marker` instead, and no disposition
+answers for it. The fix is a disposition in the same comment, or fixing the
+code so the suppression can go. For early feedback, run
+`uv run --project shared python scripts/inline_suppressions.py --check PATH...`.
+It scans only those paths, and labels its green `partial`. A governed-list
+entry with no disposition fails test collection with `UndisposedException`.
+Rows of the ratification table are the operator's edit.
+
+### The owner sweep timer (06:00) and its age
+
+The units are `scripts/exception-owner-sweep.{sh,service,timer}`, installed by
+`scripts/install-exception-owner-sweep-timer.sh`. The service runs from the
+main checkout. It sweeps that checkout's tree against its task store, and
+writes the stamp `data/exception-owner-sweep/state.json` there.
+
+Check its age with any of:
+
+```bash
+uv run --project shared python scripts/exception_register.py --report   # the `last sweep:` line
+systemctl --user list-timers exception-owner-sweep.timer
+journalctl --user -u exception-owner-sweep.service
+cat /home/leo/src/dark-factory/data/exception-owner-sweep/state.json
+```
+
+The stamp holds `last_run`, `ok`, `failure` and the last run's counts. The
+wrapper always exits 0, for the reason every §12 job shares. A failed sweep
+sends one `infra_issue` escalation, rewrites the stamp with `ok` false, and
+leaves `last_run` unadvanced, so the stamp's age keeps growing.
+
+### The residual: a dead timer pages no one
+
+PRD D11 accepts this. If the timer stops firing, only someone who runs
+`--report` sees it: the `last sweep:` age grows, and past 48 h the report exits
+2. No watchdog and no predicate task watches the stamp.
+
+### What the sweep files
+
+Each finding has a key. A run skips a finding whose key a live task or a
+pending escalation carries, or that a live task converted from one of the
+key's escalations answers. That is an exact `metadata.escalation_id` match
+against every escalation ever filed in the key's `task_id` slot, read
+archive-inclusive, so the info-L0 router dismissing a note no longer makes the
+next night file it again. The ladder is `scripts/exception_owner_sweep.py::decide`.
+
+- **Dead owner, inline scope:** a task carrying `x_inv12_finding`. Its remedy
+  is `scripts/exception_owner_sweep.py::_DEAD_OWNER_REMEDY`: re-own each site
+  or fix the suppression, and never cite your own task.
+- **Dead owner, named list:** a `design_concern` info escalation whose
+  `task_id` is `inv12-finding:dead_owner:<list_id>:<owner>`. The decision is
+  the operator's: re-own the declaration, or rule a `Policy` row.
+- **Non-zero baseline slack:** a tighten task (run `--tighten`, then commit the
+  baseline). It recurs by design.
+- **More than `scripts/exception_owner_sweep.py::MAX_OUTPUTS_PER_RUN` outputs
+  in one run:** one roll-up escalation. The rest wait for the next run.
+- **A dead-owner task no longer open (closed or deferred) whose owner is still
+  dead:** an escalation, never a re-file, whose summary names that task and its
+  status. A task converted from one of the finding's escalations counts the
+  same.
+- **A live cited owner:** an `x_inv12_owns` note merged into its metadata.
+
+The dead-owner and roll-up bodies name
+`uv run --project shared python scripts/exception_owner_sweep.py --dry-run`,
+which lists each cited owner's verdict and planned step now. `--report` lists
+no findings.
+
+**Residual.** A conversion the curator combined onto a task whose
+`metadata.escalation_id` names none of the key's escalations is invisible to
+the sweep. That finding is escalated again each night until a task carrying
+one of its escalation ids appears, or the entry is re-owned. A home task that
+closes or is deferred while the owner is still dead is escalated once per such
+change. That escalation's summary names the home and its status, so the router
+converts it into a new task instead of folding it onto the old one under the
+store's candidate-key index, and the new task then answers the finding. The
+curator's semantic drop is a second fold, and it excludes only cancelled tasks:
+a re-raise the curator drops onto the home it names recurs nightly until the
+entry is re-owned.
 
 ---
 
@@ -3929,13 +5620,21 @@ cap or outcome row ever recorded the loss. `data.stage` splits it:
 | `stage` | Meaning | `data` |
 |---|---|---|
 | `pre_flight` | We corroborated, found nothing (and could not rehydrate), and dispatched fresh. | `{stage, session_id, role, restore}` — `restore` is the rehydration **outcome**: `disabled` \| `miss` \| `fault` \| `published` (see below) |
-| `cli` | The resume WAS armed and the CLI rejected it; `invoke_with_cap_retry` retried fresh and returned a **success**, so nothing else records the loss. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
+| `cli` | The resume WAS armed and the CLI rejected it before any model turn; `invoke_with_cap_retry` retried fresh (a retry that can itself fail), so nothing else records the loss. A resumed run that did work and *then* ended non-success (the `ended_awaiting_background` downgrade, a budget kill) is **not** reported here: it is a surviving resume, returned to the caller. | `{stage, session_id, session_ids, role, fallbacks}` — `fallbacks` is the count of fresh retries this one invocation had to make, `session_ids` the ids they dropped (oldest first; `session_id` is the first, i.e. the resume the orchestrator adopted) |
 
 ```sql
 SELECT json_extract(data, '$.stage') AS stage, COUNT(*)
   FROM events WHERE event_type = 'session_resume_failed'
  GROUP BY stage;
 ```
+
+The steward emits `cli` rows too, carrying `role = 'steward'`. Those are
+live-continuation resumes the `_run_slot` guard never adopted, so filter them
+out of any ratio reading with
+`AND json_extract(data, '$.role') != 'steward'`. Rows written before task 5579
+also include completed-but-downgraded runs: the old branch counted every
+resumed non-success, and 0 of 25 such rows measured on dark_factory and reify
+were rejections.
 
 `data.restore` on the `pre_flight` rows is what tells you *which* thing is
 broken, so split on it before concluding anything:
@@ -3964,7 +5663,8 @@ silently inflates the attempt count. Read it against `session_resume` alone:
 
 That reading holds because BOTH stages are subsets of the adopted-resume
 population by construction: `pre_flight` fires only where a recovered session
-was about to be armed, and `cli` fires only when `_invoke` actually armed one.
+was about to be armed, and a non-steward `cli` row fires only when `_invoke`
+actually armed one.
 The underlying `AgentResult.resume_fallbacks` counter is *wider* than that — it
 also counts a resume `invoke_with_cap_retry` re-armed internally after a cap
 hit, which a plain fresh dispatch can reach — so the emit is gated on the

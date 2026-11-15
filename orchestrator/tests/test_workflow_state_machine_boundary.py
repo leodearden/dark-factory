@@ -79,6 +79,7 @@ from _workflow_helpers import (
     _make,
     _make_review,
     _make_warmlane_workflow,
+    agent_side_artifacts,
     fixed_prompt,
 )
 from escalation.models import Escalation
@@ -104,6 +105,7 @@ from orchestrator.workflow_types import (
     STATE_TO_STATUS,
     BlockDisposition,
     IllegalTransition,
+    PublishedStewardOutcome,
     RequeueKind,
     StewardInterrupted,
     StewardResolved,
@@ -475,9 +477,9 @@ class _WideningArchitectStub(AgentStub):
         plan = dict(PLAN)
         plan['files'] = ['lib.py', 'locked_module.py']
         plan['_schema_version'] = 1
-        task_dir = TaskArtifacts(cwd).root
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+        plan_path = agent_side_artifacts(cwd).artifact_path('plan.json')
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(json.dumps(plan, indent=2) + '\n')
         return AgentResult(success=True, output='Plan created', cost_usd=0.50)
 
 
@@ -508,7 +510,7 @@ class _WideningReplanStub(AgentStub):
         )
 
     async def _architect(self, cwd: Path) -> AgentResult:
-        plan_path = TaskArtifacts(cwd).root / 'plan.json'
+        plan_path = agent_side_artifacts(cwd).artifact_path('plan.json')
         if plan_path.exists():
             plan = json.loads(plan_path.read_text())
             plan['files'] = [*plan['files'], 'locked_module.py']
@@ -602,8 +604,8 @@ def _wire_simple_task_run(
         stub.calls.append('simple_task')
         if simple_widens:
             cwd: Path = kwargs['cwd']
-            root = TaskArtifacts(cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name)).root
-            root.mkdir(parents=True, exist_ok=True)
+            plan_path = agent_side_artifacts(cwd).artifact_path('plan.json')
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
             plan = {
                 **PLAN, '_schema_version': 1,
                 'files': ['lib.py', 'locked_module.py'],
@@ -612,7 +614,7 @@ def _wire_simple_task_run(
                     for step in PLAN['steps']
                 ],
             }
-            (root / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+            plan_path.write_text(json.dumps(plan, indent=2) + '\n')
         return AgentResult(success=True, output='Simple task done', cost_usd=0.30)
 
     monkeypatch.setattr('orchestrator.workflow.invoke_agent', _invoke)
@@ -1166,9 +1168,9 @@ class TestStateMachineLegalityAndConsistency:
 
         async def _agent_reports_unactionable(*, cwd: Path, **kwargs) -> AgentResult:
             dispatched.append(cwd)
-            TaskArtifacts(
-                cwd, TaskArtifacts.meta_root_for(cwd.parent, cwd.name),
-            ).write_unactionable_task(reason='the spec contradicts itself', evidence='ev')
+            agent_side_artifacts(cwd).write_unactionable_task(
+                reason='the spec contradicts itself', evidence='ev',
+            )
             return AgentResult(success=True, output='', cost_usd=0.5)
 
         monkeypatch.setattr(scheduler, 'set_task_status', _cancelled_row_refuses_the_park)
@@ -1486,12 +1488,12 @@ class TestStewardOutcomeRouting:
     ):
         wf = _make_workflow(tmp_path=tmp_path)
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed the flaky import'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='fixed the flaky import'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardResolved(resolution_text='fixed the flaky import')
 
@@ -1505,9 +1507,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
         outcome = await wf._mark_blocked('agent hit a transient failure')
@@ -1532,12 +1534,12 @@ class TestStewardOutcomeRouting:
         wf._steward_outcome_channel = asyncio.Queue()
         # An unrelated outcome sits on the channel; the terminal/deferred
         # status read still wins.
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='irrelevant — status overrides'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='irrelevant — status overrides'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value=status)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardTerminalDecision(new_status=TaskStatus(status))
 
@@ -1547,9 +1549,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='irrelevant — status overrides'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='irrelevant — status overrides'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='done')
 
         outcome = await wf._mark_blocked('agent hit a transient failure')
@@ -1568,9 +1570,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='irrelevant — status overrides'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='irrelevant — status overrides'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='cancelled')
         wf._ensure_l1_escalation_for_blocked = AsyncMock()
 
@@ -1589,9 +1591,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardInterrupted('attempt_cap', wip_commits_present=True),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardInterrupted('attempt_cap', wip_commits_present=True),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         pending_l0 = MagicMock(id='esc-orig-0')
         wf.escalation_queue.get_by_task.return_value = [pending_l0]  # type: ignore[union-attr]
@@ -1648,9 +1650,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardInterrupted('timeout', wip_commits_present=True),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardInterrupted('timeout', wip_commits_present=True),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         l0 = _make_escalation(id='esc-42-1', level=0, agent_role='orchestrator')
         l1 = _make_escalation(
@@ -1690,9 +1692,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardInterrupted('timeout', wip_commits_present=True),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardInterrupted('timeout', wip_commits_present=True),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         swept = [
             _make_escalation(id='esc-42-1', level=0, agent_role='orchestrator'),
@@ -1777,8 +1779,10 @@ class TestStewardOutcomeRouting:
 
         mock_invoke.assert_not_called()
         steward.escalation_queue.submit.assert_not_called()  # type: ignore[attr-defined]  # no L1 filed
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='attempt_cap', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='attempt_cap', wip_commits_present=True,
+            ),
         )
 
     # -- Row 9 cancel-safety guard --------------------------------------------

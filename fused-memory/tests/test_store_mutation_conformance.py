@@ -119,8 +119,11 @@ import re
 
 import pytest
 from _ast_guard import calls_named, imported_names_from, parse_python_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.utils.store_mutation_preflight import PREFLIGHT_EXEMPT_SCRIPTS
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # The classifier (task 4280 / 4848)
@@ -934,11 +937,15 @@ _MIN_SUBSTANTIVE_REASON_LENGTH = 40
 #: any WIDENING of PREFLIGHT_EXEMPT_SCRIPTS requires a deliberate edit in
 #: BOTH this file and fused_memory/utils/store_mutation_preflight.py. The
 #: list is expected to SHRINK as scripts are migrated onto the guard
-#: directly, never to grow -- a newly-written mutating script should call
-#: assert_store_mutation_allowed, not earn an entry here.
+#: directly -- a newly-written mutating script should call
+#: assert_store_mutation_allowed. An entry is justified only when the
+#: script's mutations are statically bounded to scratch substrate and it
+#: writes no shared mem0 SQLite history; each entry's reason states the
+#: bound it was measured against.
 EXPECTED_EXEMPT_SCRIPTS = frozenset({
     'bake_off_storage_shape.py',
     'cleanup_test_collections.py',
+    'seed_scratch_reference_graph.py',
 })
 
 

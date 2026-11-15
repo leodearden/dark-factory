@@ -2,21 +2,28 @@
 
 import http.client
 import json
+import signal
 import socket
 import threading
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, closing
 from datetime import UTC, datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
 from urllib.parse import urlsplit
 
+import pytest
 from _mock_openai_server import chat_completion_body, mock_openai_server
 
+from arm_harness._loopback_http import (
+    HELD_PROMPT_TOKENS,
+    held_upstream,
+    post_json,
+    unused_port,
+    usage_body,
+)
 from fused_memory.arm_harness.usage_tap import (
     ERROR_EXCERPT_CHARS,
     CallRecord,
+    StatusOrigin,
     call_record,
     load_call_records,
     usage_tap,
@@ -32,49 +39,19 @@ REQUEST = {
 }
 
 
-def _post(base_url: str, path: str, body: bytes, headers: dict[str, str] | None = None):
-    parts = urlsplit(base_url)
-    connection = http.client.HTTPConnection(parts.hostname or '', parts.port, timeout=30)
-    try:
-        connection.request(
-            'POST', path, body=body, headers={'Content-Type': 'application/json', **(headers or {})}
-        )
-        response = connection.getresponse()
-        return response.status, response.read()
-    finally:
-        connection.close()
-
-
 def _origin(mock) -> str:
     return f'http://{mock.host}:{mock.port}'
 
 
-def _closed_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(('127.0.0.1', 0))
-        return probe.getsockname()[1]
-
-
-def _usage_body(prompt_tokens: int, completion_tokens: int, finish_reason: str) -> dict:
-    body = chat_completion_body('{"entities": []}')
-    body['usage'] = {
-        'prompt_tokens': prompt_tokens,
-        'completion_tokens': completion_tokens,
-        'total_tokens': prompt_tokens + completion_tokens,
-    }
-    body['choices'][0]['finish_reason'] = finish_reason
-    return body
-
-
 def test_forwards_a_chat_completion_unchanged_and_records_the_server_usage(tmp_path):
     log = tmp_path / 'calls.jsonl'
-    upstream_body = _usage_body(1234, 56, 'length')
+    upstream_body = usage_body(1234, 56, 'length')
     raw = json.dumps(REQUEST).encode()
     before = datetime.now(UTC)
     with mock_openai_server() as mock:
         mock.set_response('/chat/completions', upstream_body)
         with usage_tap(_origin(mock), log_path=log) as tap_url:
-            status, body = _post(tap_url, CHAT_PATH, raw, {'Authorization': 'Bearer sk-test'})
+            status, body = post_json(tap_url, CHAT_PATH, raw, {'Authorization': 'Bearer sk-test'})
         upstream = mock.requests_to('/chat/completions')
 
     assert status == 200
@@ -101,6 +78,7 @@ def test_forwards_a_chat_completion_unchanged_and_records_the_server_usage(tmp_p
     assert record.finish_reason == 'length'
     assert record.error_excerpt is None
     assert record.outlived_session is False
+    assert record.status_origin is StatusOrigin.UPSTREAM
 
 
 def test_a_rejected_call_passes_through_and_records_an_excerpt_without_usage(tmp_path):
@@ -109,7 +87,7 @@ def test_a_rejected_call_passes_through_and_records_an_excerpt_without_usage(tmp
     with mock_openai_server() as mock:
         mock.set_response_sequence('/chat/completions', [(400, error_body)])
         with usage_tap(_origin(mock), log_path=log) as tap_url:
-            status, body = _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
+            status, body = post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
 
     assert status == 400
     assert body == json.dumps(error_body).encode()
@@ -120,6 +98,7 @@ def test_a_rejected_call_passes_through_and_records_an_excerpt_without_usage(tmp
     assert record.request_model == 'qwen3.5-9b'
     assert record.error_excerpt == body.decode()[:ERROR_EXCERPT_CHARS]
     assert len(body.decode()) > ERROR_EXCERPT_CHARS
+    assert record.status_origin is StatusOrigin.UPSTREAM
 
 
 def test_a_success_without_usage_passes_through_with_no_token_counts(tmp_path):
@@ -129,7 +108,7 @@ def test_a_success_without_usage_passes_through_with_no_token_counts(tmp_path):
     with mock_openai_server() as mock:
         mock.set_response('/chat/completions', upstream_body)
         with usage_tap(_origin(mock), log_path=log) as tap_url:
-            status, body = _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
+            status, body = post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
 
     assert (status, body) == (200, json.dumps(upstream_body).encode())
     (record,) = load_call_records(log)
@@ -147,6 +126,7 @@ def test_call_record_tolerates_bodies_that_are_not_json():
         request_body=b'not json either',
         status=200,
         response_body=b'<html>gateway says hi</html>',
+        status_origin=StatusOrigin.UPSTREAM,
     )
 
     assert record.status == 200
@@ -156,6 +136,7 @@ def test_call_record_tolerates_bodies_that_are_not_json():
     assert record.prompt_tokens is None
     assert record.finish_reason is None
     assert record.error_excerpt is None
+    assert record.status_origin is StatusOrigin.UPSTREAM
 
 
 def test_call_record_tolerates_json_of_the_wrong_shape():
@@ -167,18 +148,20 @@ def test_call_record_tolerates_json_of_the_wrong_shape():
         request_body=json.dumps(['a', 'list']).encode(),
         status=200,
         response_body=json.dumps({'usage': 'none', 'choices': []}).encode(),
+        status_origin=StatusOrigin.UPSTREAM,
     )
 
     assert record.request_model is None
     assert record.prompt_tokens is None
     assert record.finish_reason is None
+    assert record.status_origin is StatusOrigin.UPSTREAM
 
 
 def test_an_unreachable_upstream_answers_502_promptly_and_names_the_error(tmp_path):
     log = tmp_path / 'calls.jsonl'
-    with usage_tap(f'http://127.0.0.1:{_closed_port()}', log_path=log) as tap_url:
+    with usage_tap(f'http://127.0.0.1:{unused_port()}', log_path=log) as tap_url:
         started = time.monotonic()
-        status, _ = _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
+        status, _ = post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
         elapsed = time.monotonic() - started
 
     assert status == 502
@@ -187,13 +170,15 @@ def test_an_unreachable_upstream_answers_502_promptly_and_names_the_error(tmp_pa
     assert record.status == 502
     assert record.prompt_tokens is None
     assert 'ConnectionRefusedError' in (record.error_excerpt or '')
+    assert record.status_origin is StatusOrigin.TAP
 
 
 def test_a_streamed_request_is_refused_rather_than_mismeasured(tmp_path):
     log = tmp_path / 'calls.jsonl'
     with mock_openai_server() as mock:
         with usage_tap(_origin(mock), log_path=log) as tap_url:
-            status, _ = _post(tap_url, CHAT_PATH, json.dumps(REQUEST | {'stream': True}).encode())
+            streamed = json.dumps(REQUEST | {'stream': True}).encode()
+            status, _ = post_json(tap_url, CHAT_PATH, streamed)
         upstream = mock.requests
 
     assert status == 501
@@ -201,16 +186,17 @@ def test_a_streamed_request_is_refused_rather_than_mismeasured(tmp_path):
     (record,) = load_call_records(log)
     assert record.status == 501
     assert record.prompt_tokens is None
+    assert record.status_origin is StatusOrigin.TAP
 
 
 def test_concurrent_requests_each_append_one_whole_line(tmp_path):
     log = tmp_path / 'calls.jsonl'
     statuses: list[int] = []
     with mock_openai_server() as mock:
-        mock.set_response('/chat/completions', _usage_body(10, 2, 'stop'))
+        mock.set_response('/chat/completions', usage_body(10, 2, 'stop'))
         with usage_tap(_origin(mock), log_path=log) as tap_url:
             def call() -> None:
-                statuses.append(_post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())[0])
+                statuses.append(post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())[0])
 
             threads = [threading.Thread(target=call) for _ in range(3)]
             for thread in threads:
@@ -230,11 +216,11 @@ def test_records_load_in_file_order_and_the_port_closes_on_exit(tmp_path):
     with mock_openai_server() as mock:
         mock.set_response_sequence(
             '/chat/completions',
-            [(200, _usage_body(100, 1, 'stop')), (200, _usage_body(200, 2, 'stop'))],
+            [(200, usage_body(100, 1, 'stop')), (200, usage_body(200, 2, 'stop'))],
         )
         with usage_tap(_origin(mock), log_path=log) as tap_url:
-            _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
-            _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
+            post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
+            post_json(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())
     port = urlsplit(tap_url).port
 
     records = load_call_records(log)
@@ -248,75 +234,153 @@ def test_records_load_in_file_order_and_the_port_closes_on_exit(tmp_path):
         assert probe.connect_ex(('127.0.0.1', port)) != 0
 
 
-def test_a_session_with_no_calls_still_leaves_its_empty_log(tmp_path):
+def test_a_session_with_no_calls_still_leaves_its_empty_log(tmp_path, capsys):
     log = tmp_path / 'calls.jsonl'
     with mock_openai_server() as mock, usage_tap(_origin(mock), log_path=log):
         pass
 
     assert log.read_text() == ''
     assert load_call_records(log) == ()
+    assert capsys.readouterr().out == ''
 
 
-@contextmanager
-def _held_upstream(received: threading.Event, release: threading.Event) -> Iterator[str]:
-    """An upstream that answers each call only once ``release`` is set."""
-    body = json.dumps(_usage_body(321, 5, 'stop')).encode()
-
-    class HeldHandler(BaseHTTPRequestHandler):
-        protocol_version = 'HTTP/1.1'
-
-        def log_message(self, *args: Any) -> None:  # noqa: A002 - stdlib signature
-            """Silent."""
-
-        def do_POST(self) -> None:  # noqa: N802 - stdlib naming
-            self.rfile.read(int(self.headers.get('Content-Length') or 0))
-            received.set()
-            release.wait(timeout=30)
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-    server = ThreadingHTTPServer(('127.0.0.1', 0), HeldHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f'http://127.0.0.1:{server.server_address[1]}'
-    finally:
-        release.set()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
+def _post_in_background(tap_url: str, statuses: list[int]) -> threading.Thread:
+    raw = json.dumps(REQUEST).encode()
+    client = threading.Thread(
+        target=lambda: statuses.append(post_json(tap_url, CHAT_PATH, raw)[0]), daemon=True
+    )
+    client.start()
+    return client
 
 
-def test_a_call_still_in_flight_when_the_session_closes_is_marked_as_outliving_it(tmp_path):
+def test_closing_a_session_waits_for_a_call_still_in_flight_and_records_it_inside_the_session(
+    tmp_path, capsys
+):
     log = tmp_path / 'calls.jsonl'
     received, release = threading.Event(), threading.Event()
     statuses: list[int] = []
-    with _held_upstream(received, release) as upstream:
+    with held_upstream(received, release) as upstream:
         with usage_tap(upstream, log_path=log) as tap_url:
-            client = threading.Thread(
-                target=lambda: statuses.append(
-                    _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())[0]
-                ),
-                daemon=True,
-            )
-            client.start()
+            client = _post_in_background(tap_url, statuses)
             assert received.wait(timeout=10)
+            threading.Timer(1.0, release.set).start()
+        recorded_at_session_exit = load_call_records(log)
+        client.join(timeout=10)
+
+    (record,) = recorded_at_session_exit
+    assert record.status == 200
+    assert record.prompt_tokens == HELD_PROMPT_TOKENS
+    assert record.outlived_session is False
+    assert statuses == [200]
+    (waiting,) = capsys.readouterr().out.splitlines()
+    assert waiting.startswith('usage tap: waiting')
+    assert '1 in-flight call' in waiting
+
+
+def test_a_call_still_in_flight_when_the_drain_bound_expires_is_marked_as_outliving_the_session(
+    tmp_path, capsys
+):
+    log = tmp_path / 'calls.jsonl'
+    received, release = threading.Event(), threading.Event()
+    statuses: list[int] = []
+    with held_upstream(received, release) as upstream:
+        with usage_tap(upstream, log_path=log, drain_timeout_s=0.2) as tap_url:
+            client = _post_in_background(tap_url, statuses)
+            assert received.wait(timeout=10)
+            exiting = time.monotonic()
+        exit_s = time.monotonic() - exiting
         recorded_at_session_exit = log.read_text()
         release.set()
         client.join(timeout=10)
 
+    assert exit_s < 5
     assert recorded_at_session_exit == ''
     assert statuses == [200]
     (record,) = load_call_records(log)
     assert record.outlived_session is True
     assert record.status == 200
-    assert record.prompt_tokens == 321
+    assert record.prompt_tokens == HELD_PROMPT_TOKENS
+    waiting, expired = capsys.readouterr().out.splitlines()
+    assert waiting.startswith('usage tap: waiting')
+    assert expired.startswith('usage tap: drain bound')
+    assert '1 call(s) still in flight' in expired
 
 
-def test_a_record_written_without_the_session_marker_loads_as_inside_its_session(tmp_path):
+class _InterruptedWhileDraining(Exception):
+    """Stands in for a KeyboardInterrupt that lands while a closing session drains."""
+
+
+def _raise_interrupted(signum, frame) -> None:
+    raise _InterruptedWhileDraining
+
+
+def _interrupt_main_thread_once_closed(tap_url: str) -> threading.Thread:
+    """Signal the main thread once the tap refuses connections: it is then draining."""
+    port = urlsplit(tap_url).port
+
+    def interrupt() -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with socket.socket() as probe:
+                probe.settimeout(1)
+                if probe.connect_ex(('127.0.0.1', port)) != 0:
+                    break
+            time.sleep(0.05)
+        time.sleep(0.3)
+        signal.pthread_kill(threading.main_thread().ident or 0, signal.SIGUSR1)
+
+    interrupter = threading.Thread(target=interrupt, daemon=True)
+    interrupter.start()
+    return interrupter
+
+
+def test_an_interrupted_drain_still_marks_the_abandoned_call_as_outliving_the_session(tmp_path):
+    log = tmp_path / 'calls.jsonl'
+    received, release = threading.Event(), threading.Event()
+    statuses: list[int] = []
+    previous = signal.signal(signal.SIGUSR1, _raise_interrupted)
+    try:
+        with held_upstream(received, release) as upstream:
+            with pytest.raises(_InterruptedWhileDraining), usage_tap(
+                upstream, log_path=log
+            ) as tap_url:
+                client = _post_in_background(tap_url, statuses)
+                assert received.wait(timeout=10)
+                interrupter = _interrupt_main_thread_once_closed(tap_url)
+            interrupter.join(timeout=10)
+            release.set()
+            client.join(timeout=10)
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+
+    assert statuses == [200]
+    (record,) = load_call_records(log)
+    assert record.outlived_session is True
+
+
+def test_an_idle_keep_alive_connection_does_not_hold_a_closing_session_open(tmp_path):
+    log = tmp_path / 'calls.jsonl'
+    with mock_openai_server() as mock, ExitStack() as connections:
+        mock.set_response('/chat/completions', usage_body(10, 2, 'stop'))
+        with usage_tap(_origin(mock), log_path=log) as tap_url:
+            parts = urlsplit(tap_url)
+            connection = connections.enter_context(
+                closing(http.client.HTTPConnection(parts.hostname or '', parts.port, timeout=30))
+            )
+            connection.request(
+                'POST', CHAT_PATH, body=json.dumps(REQUEST).encode(),
+                headers={'Content-Type': 'application/json'},
+            )
+            response = connection.getresponse()
+            response.read()
+            exiting = time.monotonic()
+        exit_s = time.monotonic() - exiting
+
+    assert response.status == 200
+    assert exit_s < 5
+
+
+def test_a_record_predating_the_session_and_origin_fields_loads_in_session_with_no_origin(tmp_path):
     log = tmp_path / 'calls.jsonl'
     record = call_record(
         started_at=datetime(2026, 10, 7, tzinfo=UTC),
@@ -325,11 +389,15 @@ def test_a_record_written_without_the_session_marker_loads_as_inside_its_session
         path=CHAT_PATH,
         request_body=json.dumps(REQUEST).encode(),
         status=200,
-        response_body=json.dumps(_usage_body(10, 1, 'stop')).encode(),
+        response_body=json.dumps(usage_body(10, 1, 'stop')).encode(),
+        status_origin=StatusOrigin.UPSTREAM,
     )
     payload = record.model_dump(mode='json')
     del payload['outlived_session']
+    del payload['status_origin']
     log.write_text(json.dumps(payload) + '\n')
 
-    assert load_call_records(log) == (record,)
-    assert record.outlived_session is False
+    (loaded,) = load_call_records(log)
+    assert loaded.outlived_session is False
+    assert loaded.status_origin is None
+    assert loaded == record.model_copy(update={'status_origin': None})

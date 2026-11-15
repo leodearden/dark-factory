@@ -50,7 +50,7 @@ if __name__ == '__main__':
 
 from legibility import alarm, config, detectors, inventory  # noqa: E402  # debt: task 6760
 
-from orchestrator import session_registry  # noqa: E402
+from orchestrator import session_registry
 
 logger = logging.getLogger('legibility.check_transcript_persistence')
 

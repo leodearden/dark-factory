@@ -11,12 +11,11 @@ Lane discipline: file reads plus ``git`` subprocesses only, and NO ``integration
 marker, so the merge lane's default selection runs them.
 """
 
-import shutil
-import subprocess
-from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from arm_harness._lme_artifacts import REPO_ROOT, git
 from fused_memory.arm_harness.arm_spec import LlmArmSpec, load_arm_spec
 from fused_memory.arm_harness.incumbent_cost import (
     INCUMBENT_COST_FILENAME,
@@ -34,7 +33,8 @@ from fused_memory.arm_harness.screening import (
     load_screening_verdict,
 )
 
-REPO_ROOT = Path(__file__).parents[3]
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 LLM_AXIS_RELATIVE = 'plans/local-memory-models-eval-llm'
 LLM_AXIS = REPO_ROOT / LLM_AXIS_RELATIVE
 CONTROLS = REPO_ROOT / 'plans' / 'local-memory-models-eval-controls'
@@ -54,20 +54,6 @@ COMMITTED_FILES = frozenset({
 })
 
 
-def _git(*args: str) -> subprocess.CompletedProcess[str]:
-    if shutil.which('git') is None:
-        pytest.skip('git is not available; cannot check the committed index')
-    inside = subprocess.run(
-        ['git', 'rev-parse', '--is-inside-work-tree'],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
-    )
-    if inside.returncode != 0:
-        pytest.skip('not a git working tree; cannot check the committed index')
-    return subprocess.run(
-        ['git', *args], cwd=REPO_ROOT, capture_output=True, text=True, check=False
-    )
-
-
 def _pricing_spec() -> LlmArmSpec:
     spec = load_arm_spec(CONTROLS / 'specs' / f'{PRICING_ARM_ID}.json')
     assert isinstance(spec, LlmArmSpec)
@@ -75,7 +61,7 @@ def _pricing_spec() -> LlmArmSpec:
 
 
 def test_the_evidence_directory_commits_exactly_the_derived_artifacts_and_no_run():
-    tracked = _git('ls-files', '--', LLM_AXIS_RELATIVE).stdout.splitlines()
+    tracked = git('ls-files', '--', LLM_AXIS_RELATIVE).stdout.splitlines()
 
     assert {path.removeprefix(f'{LLM_AXIS_RELATIVE}/') for path in tracked} == COMMITTED_FILES
     assert len(tracked) == len(COMMITTED_FILES)

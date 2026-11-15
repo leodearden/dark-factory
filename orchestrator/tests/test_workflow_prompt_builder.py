@@ -63,6 +63,7 @@ def _make_workflow(tmp_path: Path, *, event_store: _RecordingEventStore | None =
     cfg.max_turns.implementer = 50
     cfg.backends.implementer = 'claude'
     cfg.sandbox.enabled = False
+    cfg.git.main_branch = 'main'
 
     git_ops = MagicMock()
     git_ops.has_uncommitted_work = AsyncMock(return_value=False)
@@ -70,7 +71,10 @@ def _make_workflow(tmp_path: Path, *, event_store: _RecordingEventStore | None =
 
     briefing = MagicMock()
 
-    async def render_implementer(plan, *, rebase_notice=None, task_id=None, wip_notice=None):
+    async def render_implementer(
+        plan, *, rebase_notice=None, task_id=None, wip_notice=None, scope_drift=None,
+        rulings=(),
+    ):
         return f"analysis={plan['analysis']} wip={[c['sha'] for c in wip_notice or []]}"
 
     briefing.build_implementer_prompt = AsyncMock(side_effect=render_implementer)
@@ -290,7 +294,7 @@ def _rewrite_analysis(artifacts: TaskArtifacts) -> None:
 
 
 def _remove_plan(artifacts: TaskArtifacts) -> None:
-    (artifacts.root / 'plan.json').unlink()
+    artifacts.artifact_path('plan.json').unlink()
 
 
 def _stamp_prior_session(wf: TaskWorkflow) -> None:
@@ -378,20 +382,34 @@ _PLAN_RENDERING_SITES = {
 }
 
 
-async def _rendered_plans(
-    tmp_path: Path, site: _PlanRenderingSite, between_builds: Callable[[TaskArtifacts], None],
-) -> list[dict]:
+async def _render_calls(
+    tmp_path: Path, *,
+    briefing_method: str,
+    arrange: Callable[[TaskWorkflow], None],
+    drive: Callable[[TaskWorkflow], Awaitable[object]],
+    between_builds: Callable[[TaskArtifacts], None],
+) -> list[Any]:
     wf = _make_workflow(tmp_path)
     _write_two_step_plan(wf)
-    site.arrange(wf)
+    arrange(wf)
     render = AsyncMock(return_value='PROMPT')
-    setattr(wf.briefing, site.briefing_method, render)
+    setattr(wf.briefing, briefing_method, render)
     wf._invoke = _invoke_building_twice(wf, between_builds)  # type: ignore[method-assign]
 
     with contextlib.suppress(_BuiltTwice):
-        await site.drive(wf)
+        await drive(wf)
 
-    return [site.rendered_plan(call) for call in render.call_args_list]
+    return render.call_args_list
+
+
+async def _rendered_plans(
+    tmp_path: Path, site: _PlanRenderingSite, between_builds: Callable[[TaskArtifacts], None],
+) -> list[dict]:
+    calls = await _render_calls(
+        tmp_path, briefing_method=site.briefing_method, arrange=site.arrange,
+        drive=site.drive, between_builds=between_builds,
+    )
+    return [site.rendered_plan(call) for call in calls]
 
 
 @pytest.mark.asyncio

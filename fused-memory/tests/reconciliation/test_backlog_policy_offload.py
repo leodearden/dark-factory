@@ -108,3 +108,28 @@ class TestFilingRunsOffTheEventLoop:
         assert verdict.escalation_path is not None
         record = json.loads(Path(verdict.escalation_path).read_text(encoding='utf-8'))
         assert record['error_type'] == 'ReconciliationJudgeHalted'
+
+
+class TestOrchestratorProbeRunsOffTheEventLoop:
+    @pytest.mark.asyncio
+    async def test_the_orchestrator_probe_leaves_the_event_loop_free(
+        self, event_buffer, tmp_path,
+    ):
+        project_root = tmp_path / 'proj_root'
+        probe = LoopFreedomProbe()
+        seen: list[str] = []
+
+        def _blocking_lock_probe(project_root):
+            seen.append(project_root)
+            probe.block()
+            return True
+
+        policy = BacklogPolicy(event_buffer, None, _blocking_lock_probe)
+        policy.register_project_root('proj', str(project_root))
+
+        verdict = await policy.on_judge_halt('proj', reason='probe')
+
+        probe.assert_loop_stayed_free()
+        assert seen == [str(project_root)]
+        assert verdict.outcome == 'escalated'
+        assert verdict.escalation_path is not None

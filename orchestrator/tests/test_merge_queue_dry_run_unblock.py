@@ -27,7 +27,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript, make_lane
+from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config, make_lane
 from _orch_helpers import wait_responsive
 from test_dry_run_unblock import _init_git_repo, _make_agent_result, _RecordingScheduler
 from test_merge_queue_main_health import (
@@ -459,9 +459,9 @@ class TestUnscopedTypecheckFailedSpawns:
             # The ONE patch this file still needs (PRD γ9 residual). Every
             # sibling arm produces its condition for real -- the RED verify
             # through the injected port, "not pre-existing" through
-            # `escalate_preexisting_main_break=False`, the disk skip through
-            # the port's disk guard -- but a genuinely RED main has no such
-            # seam: `verify_failure_is_preexisting_on_main` lives in
+            # `_make_config(tmp_path, escalate_preexisting=False)`, the disk
+            # skip through the port's disk guard -- but a genuinely RED main
+            # has no such seam: `verify_failure_is_preexisting_on_main` lives in
             # `orchestrator.verify`, takes no port, and probes by running a
             # real scoped verification in a real `_mainprobe-` worktree.
             with (
@@ -619,14 +619,7 @@ async def _lane_repo(tmp_path: Path) -> tuple[GitOps, OrchestratorConfig]:
         worktree_dir='.worktrees', push_after_advance=False,
     )
     git_ops = GitOps(git_config, repo)
-    config = OrchestratorConfig(
-        project_root=repo,
-        git=git_config,
-        # The main-health probe is out of scope here and would run a REAL
-        # scoped verification against a probe worktree; the production guard
-        # that skips it is this flag (_classify_main_health_red).
-        escalate_preexisting_main_break=False,
-    )
+    config = lane_scene_config(repo, git_config)
     return git_ops, config
 
 

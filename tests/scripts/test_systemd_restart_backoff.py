@@ -12,20 +12,24 @@ The assertion itself is NOT defined here.  It was written for task 3333
 tests/scripts/test_dashboard_service_template.py, and task 3408 lifted it
 into the importable tests/scripts/systemd_unit_invariants.py so that this
 fleet-wide sweep and the dashboard suite share ONE implementation rather
-than two copies that can drift apart.  test_restart_backoff_guard_rejects_
-ineffective_units in the dashboard module remains the helper's negative-case
-guard; this module supplies its fleet-wide application.
+than two copies that can drift apart.
+tests/scripts/test_dashboard_unit_restart_policy.py::
+test_restart_backoff_guard_rejects_ineffective_units is the helper's
+negative-case guard; this module supplies its fleet-wide application.
 """
 import pathlib
 import subprocess
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from systemd_unit_invariants import (
     FACTORY_INIT_REFERENCE,
     NON_UNIT_PATHSPECS,
     assert_restart_backoff_effective,
     restart_directive,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 

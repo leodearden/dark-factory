@@ -5,8 +5,9 @@ TABLE half of finding 1.2). This module is the pure, shared companion to
 ``shared.task_statuses`` (the vocabulary, shipped by task 2163): it adds the
 actor taxonomy (``ActorClass``, ``derive_actor_class``), the enumerated
 (from, to, actor) -> allowed legality table (``TRANSITIONS``,
-``is_legal_transition``), and the WorkflowOutcome -> TaskStatus consistency
-map (``outcome_allows_status``).
+``is_legal_transition``), the WorkflowOutcome -> TaskStatus consistency
+map (``outcome_allows_status``), and the outcome vocabulary that map is keyed
+by (``WORKFLOW_OUTCOMES``).
 
 This module is intentionally PURE: it imports only ``shared.task_statuses``
 and defines no I/O, no enforcement wiring, and no orchestrator/fused-memory
@@ -33,6 +34,7 @@ __all__ = [
     'TRANSITIONS',
     'is_legal_transition',
     'outcome_allows_status',
+    'WORKFLOW_OUTCOMES',
 ]
 
 
@@ -358,6 +360,10 @@ _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
         }
     ),
 }
+
+# The WorkflowOutcome string vocabulary the exit contract is keyed by,
+# mirrored here because shared/ cannot import orchestrator.
+WORKFLOW_OUTCOMES: frozenset[str] = frozenset(_OUTCOME_ALLOWED)
 
 
 def outcome_allows_status(outcome: object, status: TaskStatus | str) -> bool:

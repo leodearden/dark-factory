@@ -32,7 +32,7 @@ destroying data:
      and the source collection deleted ONLY once fully drained.
   3. GUARDED JUNK-KEY DELETION -- known-junk FalkorDB graph keys (and any
      family sibling emptied by step 1) are removed via ``GRAPH.DELETE``
-     (``graphiti._graph_for(key).delete()``) -- NOT the ``MATCH (n) DETACH
+     (``graphiti.graph_access.graph(key).delete(op=...)``) -- NOT the ``MATCH (n) DETACH
      DELETE n`` pattern in ``purge_knowlive_namespace.py``, which empties a
      graph but leaves its key in ``GRAPH.LIST``. Guarded on a live node
      count of exactly 0; a non-empty key is reported UNRESOLVED and its
@@ -96,7 +96,7 @@ from fused_memory.backends.mem0_client import (
     DEFAULT_SCROLL_MAX_PAGES,
     ScrollPageBudgetExhausted,
 )
-from fused_memory.maintenance.cross_graph_move import (  # noqa: F401
+from fused_memory.maintenance.cross_graph_move import (
     SubgraphEdgeResult,
     create_moved_episode,
     create_moved_node,
@@ -258,10 +258,11 @@ async def enumerate_graph_entity_nodes(
     every graph they intend to migrate in this run; the full result set is
     held in memory, so raising *limit* trades completeness for peak memory.
     """
-    graph = graphiti._graph_for(key)
+    graph = graphiti.graph_access.graph(key)
     result = await graph.ro_query(
         'MATCH (n:Entity) RETURN n.uuid, n.name LIMIT $limit',
         {'limit': limit},
+        op='enumerate_graph_entity_nodes',
     )
     rows = result.result_set or []
     if len(rows) >= limit:
@@ -298,10 +299,11 @@ async def enumerate_graph_episodic_nodes(
     Callers must pass a *limit* larger than the true Episodic-node count of
     every graph they intend to migrate in this run.
     """
-    graph = graphiti._graph_for(key)
+    graph = graphiti.graph_access.graph(key)
     result = await graph.ro_query(
         'MATCH (n:Episodic) RETURN n.uuid LIMIT $limit',
         {'limit': limit},
+        op='enumerate_graph_episodic_nodes',
     )
     rows = result.result_set or []
     if len(rows) >= limit:
@@ -325,8 +327,8 @@ async def count_graph_nodes(graphiti: Any, key: str) -> int:
     auto-create) as a count of 0 rather than raising, mirroring
     ``enumerate_graph_entity_nodes``'s ``result.result_set or []`` guard.
     """
-    graph = graphiti._graph_for(key)
-    result = await graph.ro_query('MATCH (n) RETURN count(n)')
+    graph = graphiti.graph_access.graph(key)
+    result = await graph.ro_query('MATCH (n) RETURN count(n)', op='count_graph_nodes')
     rows = result.result_set or []
     return int(rows[0][0]) if rows else 0
 
@@ -529,9 +531,10 @@ async def merge_graph_family(
     # or no Phase-A failures) path issues no extra read.
     if phase_b_error is None and episode_rows and create_failed:
         for failed_uuid in create_failed:
-            topology_result = await graphiti._graph_for(sibling).ro_query(
+            topology_result = await graphiti.graph_access.graph(sibling).ro_query(
                 'MATCH (ep:Episodic)-[:MENTIONS]->(n:Entity {uuid: $uuid}) RETURN ep.uuid',
                 {'uuid': failed_uuid},
+                op='merge_graph_family',
             )
             for topology_row in topology_result.result_set or []:
                 blocked_episode_uuids.add(topology_row[0])
@@ -553,9 +556,10 @@ async def merge_graph_family(
     # episode failures) path issues no extra read.
     if phase_b_error is None and entity_rows and episode_create_failed:
         for failed_episode_uuid in episode_create_failed:
-            topology_result = await graphiti._graph_for(sibling).ro_query(
+            topology_result = await graphiti.graph_access.graph(sibling).ro_query(
                 'MATCH (ep:Episodic {uuid: $uuid})-[:MENTIONS]->(n:Entity) RETURN n.uuid',
                 {'uuid': failed_episode_uuid},
+                op='merge_graph_family',
             )
             for topology_row in topology_result.result_set or []:
                 blocked_node_uuids.add(topology_row[0])
@@ -755,7 +759,7 @@ async def merge_collection(
     idiom). Every branch leaves the source in place; only the budget branch
     advises raising the budget.
     """
-    from qdrant_client.http import models as qmodels  # noqa: PLC0415
+    from qdrant_client.http import models as qmodels
 
     points_upserted = 0
     chunk: list = []
@@ -868,9 +872,9 @@ async def delete_junk_key(graphiti: Any, key: str, node_count: int) -> str:
     """
     if node_count > 0:
         return 'UNRESOLVED'
-    graph = graphiti._graph_for(key)
+    graph = graphiti.graph_access.graph(key)
     try:
-        await graph.delete()
+        await graph.delete(op='delete_junk_key')
     except Exception as e:
         logger.warning(
             "consolidate_namespace_families: failed to GRAPH.DELETE junk key '%s': %s",
@@ -1235,12 +1239,12 @@ def main() -> int:
     args = _build_parser().parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> dict:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.services.memory_service import MemoryService
 
         config = FusedMemoryConfig()
         memory = MemoryService(config)

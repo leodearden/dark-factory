@@ -73,11 +73,10 @@ docstring explains why both are correct for their own constant.
 
 from __future__ import annotations
 
-import importlib.resources as pkg_resources
 from unittest.mock import patch
 
 import pytest
-import yaml
+from _packaged_defaults import load_packaged_defaults
 from _role_splice_contract import (
     BASH_CAPABLE_UNPINNED_ROLES,
     SpliceContract,
@@ -203,9 +202,7 @@ def test_session_idle_bound_config_drift_tripwire() -> None:
     accepted — the prose is sized to the SHIPPED bound.
     """
     field_timeouts = OrchestratorConfig.model_fields['timeouts'].default_factory()  # type: ignore[misc]
-    shipped_timeouts = yaml.safe_load(
-        (pkg_resources.files('orchestrator') / 'defaults.yaml').read_text()
-    )['timeouts']
+    shipped_timeouts = load_packaged_defaults()['timeouts']
 
     field_default = field_timeouts.working_idle_secs
     shipped = shipped_timeouts['working_idle_secs']

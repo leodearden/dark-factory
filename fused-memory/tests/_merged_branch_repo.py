@@ -4,7 +4,7 @@ The fixtures are real git, never a canned ``run_git`` fake, for the reason
 ``tests/test_landed_on_main.py`` gives: the verdict IS git semantics, so a
 canned fake would only pin our assumptions about git.
 
-Start every repo with ``_fm_helpers._init_git_repo`` (``main`` branch, one seed
+Start every repo with ``_fm_git_repos._init_git_repo`` (``main`` branch, one seed
 commit). Lives beside ``_fm_helpers.py`` under the convention documented in
 tests/conftest.py, which puts this directory on ``sys.path`` for ``tests/`` and
 ``tests/reconciliation/`` alike.

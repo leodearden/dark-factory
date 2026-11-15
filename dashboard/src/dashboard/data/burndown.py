@@ -24,7 +24,7 @@ import enum
 import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from types import MappingProxyType
 from typing import Any
 
@@ -35,7 +35,7 @@ from shared.sqlite_column_migration import add_column_if_missing
 from dashboard.config import DashboardConfig
 from dashboard.data.census import SERIES_KEYS, TaskCensus
 from dashboard.data.datum import DatumState
-from dashboard.data.mcp_fanout import _LOCK_ACQUIRE_TIMEOUT_SECONDS
+from dashboard.data.mcp_fanout import LOCK_ACQUIRE_TIMEOUT_SECONDS
 from dashboard.data.orchestrator import (
     _read_project_root_from_config,
     _resolve_project_root,
@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 # run concurrently, each under wait_for(PER_CALL_TIMEOUT). The terminal-window
 # slot of task_snapshot.PER_PROJECT_MCP_CALLS is not counted, because
 # acquire_snapshot never spends it.
-_SNAPSHOT_UNIT_WORST_CASE_SECONDS = _LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIMEOUT
+_SNAPSHOT_UNIT_WORST_CASE_SECONDS = LOCK_ACQUIRE_TIMEOUT_SECONDS + PER_CALL_TIMEOUT
 
 # Wall-clock-aligned sampling tick for the burndown (and metrics) collectors.
 SAMPLE_INTERVAL_SECONDS = 600
@@ -337,10 +337,12 @@ async def collect_snapshot(
     conn: aiosqlite.Connection,
     config: DashboardConfig,
     client: httpx.AsyncClient,
+    *,
+    now: datetime | None = None,
 ) -> None:
     """Discover projects and insert exactly one snapshot row per project per cycle.
 
-    Each root is read through the task snapshot unit
+    *now* is the cycle's instant, the live clock when omitted. Each root is read through the task snapshot unit
     (``task_snapshot.acquire_snapshot``), and the unit is judged as served at
     this cycle's instant. A root whose census and rows are BOTH fresh gets a
     value row: the census gives the nine member columns, the rows give the
@@ -376,7 +378,7 @@ async def collect_snapshot(
       regressions.
     """
     try:
-        now_dt = datetime.now(UTC)  # clock-exempt: single-capture writer
+        now_dt = resolve_now(now)
         # One instant for the whole cycle: the ``ts`` written to every row, the
         # instant a unit is measured at, and the one it is served at must be
         # the SAME capture, or a row could claim a measurement its own

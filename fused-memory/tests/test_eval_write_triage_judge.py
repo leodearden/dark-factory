@@ -459,14 +459,14 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
 
     @staticmethod
     def _service():
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         return types.SimpleNamespace(config=FusedMemoryConfig())
 
     def test_provenance_records_the_effective_candidate_cap(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+        from fused_memory.server import write_triage_judge
 
         captured = self._captured(tmp_path, monkeypatch)
         expected = write_triage_judge.resolve_judge_candidate_count(self._service())
@@ -476,7 +476,7 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
     def test_provenance_records_the_effective_field_width(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+        from fused_memory.server import write_triage_judge
 
         captured = self._captured(tmp_path, monkeypatch)
         expected = write_triage_judge.resolve_judge_field_chars(self._service())
@@ -492,7 +492,7 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
     def test_provenance_records_whether_the_judge_arm_was_live(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+        from fused_memory.server import write_triage_judge
 
         captured = self._captured(tmp_path, monkeypatch)
         expected = write_triage_judge.resolve_judge_enabled(self._service())
@@ -508,7 +508,7 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
         off, so every case is answered without a provider call and the report
         still looks like a measurement.
         """
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+        from fused_memory.server import write_triage_judge
 
         monkeypatch.setattr(
             write_triage_judge, 'resolve_judge_enabled', lambda service: False,
@@ -573,7 +573,7 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
     def test_provenance_records_the_system_prompt_it_measured(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        from fused_memory.server.write_triage_judge import (
             JUDGE_SYSTEM_PROMPT,
         )
 
@@ -789,8 +789,8 @@ class TestABareDryRunCannotReachTheCommittedArtifact:
     def test_a_bare_dry_run_leaves_both_committed_artifacts_byte_identical(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
-        import sys  # noqa: PLC0415
-        import tempfile  # noqa: PLC0415
+        import sys
+        import tempfile
 
         fixture = tmp_path / 'synthetic_corpus.jsonl'
         fixture.write_text(
@@ -843,7 +843,7 @@ class TestABareDryRunCannotReachTheCommittedArtifact:
         Given a fixture that does not exist, so a refusal ordered after the
         fixture load would surface as `FileNotFoundError` instead.
         """
-        import sys  # noqa: PLC0415
+        import sys
 
         monkeypatch.setattr(sys, 'argv', [
             'eval_write_triage_judge.py', '--fixture', str(tmp_path / 'absent.jsonl'),
@@ -1254,7 +1254,7 @@ class TestApplyFieldChars:
 
     @staticmethod
     def _resolved(config) -> int:
-        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        from fused_memory.server.write_triage_judge import (
             resolve_judge_field_chars,
         )
 
@@ -1262,7 +1262,7 @@ class TestApplyFieldChars:
 
     @staticmethod
     def _config():
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
 
         return FusedMemoryConfig()
 

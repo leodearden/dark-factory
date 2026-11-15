@@ -40,6 +40,10 @@ from shared.governed_exceptions import (
     TaskRef,
     TicketRef,
 )
+from shared.testing_xdist_groups import single_xdist_group
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -1439,31 +1443,72 @@ def test_json_names_the_default_state_path_under_the_root(tmp_path: Path, capsys
     assert sweep['state_path'] == str(tmp_path / exception_register.SWEEP_STATE_PATH)
 
 
+@pytest.mark.parametrize(
+    ('files', 'stamp', 'expected'),
+    [
+        pytest.param({'m.py': 'x = 1\n'}, None, 0, id='clean-and-never-run'),
+        pytest.param(_UNRATIFIED_TREES['inline-marker'], None, 1, id='a-closed-world-violation'),
+        pytest.param(
+            _UNRATIFIED_TREES['inline-marker'],
+            _stamp('2020-01-01T00:00:00+00:00'),
+            2,
+            id='a-stale-sweep-outranks-the-violation',
+        ),
+    ],
+)
+def test_report_exit_code_is_the_report_verbs_exit_code(
+    tmp_path: Path, files: dict[str, str], stamp: dict | None, expected: int
+):
+    _register_tree(tmp_path, files)
+    state = tmp_path / 'state.json'
+    if stamp is not None:
+        _write_state(state, stamp)
+
+    register = exception_register.measure(tmp_path, sweep_state=state, now=_NOW)
+
+    assert exception_register.report_exit_code(register) == expected
+    assert _main_reading(tmp_path, state, '--report') == expected
+
+
 # ---------------------------------------------------------------------------
 # The live tree — the merge-time guard that the real register is clean.
 #
 # Invariants only, never populations: declarations, candidates, the seed and
 # NOT_EXCEPTION_LISTS all change legitimately as the batch's later tasks land.
 
+# One loadgroup worker runs every consumer of `live_register`, so the real tree
+# is measured (corpus read, inline-scanner subprocess) once per run.
+_LIVE_TREE_GROUP_NAME = 'exception_register_live_tree'
 
-def test_the_live_register_is_clean(tmp_path: Path, capsys):
+
+@pytest.fixture(scope='module')
+def live_register(tmp_path_factory: pytest.TempPathFactory) -> exception_register.Register:
+    return exception_register.measure(
+        REPO_ROOT,
+        sweep_state=tmp_path_factory.mktemp('sweep') / 'absent.json',
+        now=datetime.datetime.now(datetime.UTC),
+    )
+
+
+@pytest.mark.xdist_group(_LIVE_TREE_GROUP_NAME)
+def test_the_live_register_is_clean(live_register: exception_register.Register):
     """Every Policy in every declaration, inline marker and class-table row
     names a row of the real ratification table, and nothing is malformed."""
-    code = exception_register.main(
-        ['--report', '--root', str(REPO_ROOT), '--sweep-state', str(tmp_path / 'absent.json')]
+    report = exception_register.render_report(live_register)
+
+    assert report.startswith('grandfathered (unowned): ')
+    assert exception_register.report_exit_code(live_register) == 0, '\n'.join(
+        violation.render() for violation in live_register.violations
     )
 
-    assert code == 0, capsys.readouterr().err
 
-
-def test_the_live_register_document_reads_the_real_tree(tmp_path: Path, capsys):
-    capsys.readouterr()
-    code = exception_register.main(
-        ['--json', '--root', str(REPO_ROOT), '--sweep-state', str(tmp_path / 'absent.json')]
+@pytest.mark.xdist_group(_LIVE_TREE_GROUP_NAME)
+def test_the_live_register_document_reads_the_real_tree(
+    live_register: exception_register.Register,
+):
+    document = json.loads(
+        json.dumps(exception_register.register_document(live_register), sort_keys=True)
     )
-    captured = capsys.readouterr()
-    assert code == 0, captured.err
-    document = json.loads(captured.out)
 
     assert document['inline']['sites'] >= 1000
     assert document['discovery']['files_parsed'] >= 1
@@ -1511,7 +1556,10 @@ def test_every_not_exception_row_names_a_live_container():
 _CLOSED_RULINGS_TASK = TaskRef(5603)
 
 
-def test_no_live_declaration_cites_the_closed_rulings_task():
+@pytest.mark.xdist_group(_LIVE_TREE_GROUP_NAME)
+def test_no_live_declaration_cites_the_closed_rulings_task(
+    live_register: exception_register.Register,
+):
     """No declaration's default or override is a Debt owned by task 5603.
 
     5603 is δ, the operator decision gate whose sitting produced the day-one
@@ -1519,11 +1567,10 @@ def test_no_live_declaration_cites_the_closed_rulings_task():
     owner sweep (κ2) activates only once nothing cites it, so a copy of the old
     placeholder literal must fail here rather than wait for the sweep.
     """
-    discovery = exception_register.discover_declarations(REPO_ROOT)
     placeholder = Debt(_CLOSED_RULINGS_TASK)
     citing = sorted(
         f'{d.path}:{d.line} {d.list_id}'
-        for d in discovery.declarations
+        for d in live_register.discovery.declarations
         if placeholder in (d.default, *d.overrides.values())
     )
 
@@ -1532,3 +1579,18 @@ def test_no_live_declaration_cites_the_closed_rulings_task():
         'list the disposition docs/legibility/inv12-day-one-rulings.md rules for it:\n  '
         + '\n  '.join(citing)
     )
+
+
+def test_the_live_register_consumers_share_one_xdist_worker(request):
+    consumers = {
+        test_the_live_register_is_clean,
+        test_the_live_register_document_reads_the_real_tree,
+        test_no_live_declaration_cites_the_closed_rulings_task,
+    }
+    selected = [
+        item for item in request.session.items if getattr(item, 'function', None) in consumers
+    ]
+    if not selected:
+        pytest.skip('no live-register consumer is selected in this session')
+
+    assert single_xdist_group(selected) == _LIVE_TREE_GROUP_NAME

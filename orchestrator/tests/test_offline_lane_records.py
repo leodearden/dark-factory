@@ -34,6 +34,7 @@ from orchestrator.offline_lane_records import (
     ProbeResult,
     RunRecord,
     RunRecordStore,
+    StoredPass,
     classify_exit,
     command_key,
     is_well_formed,
@@ -517,31 +518,152 @@ class TestPassesSince:
         assert [p.pass_id for p in store.passes_since('Unit Tests', T0)] == [spaced]
 
 
+class TestStoredPassesSince:
+    SINCE = T0 + timedelta(hours=1)
+
+    def _written_at(self, store: RunRecordStore, clock: _Clock, when: datetime, command: str) -> str:
+        clock.current = when
+        lane_pass = store.allocate_pass(command, Leg.GENERIC, HEAD)
+        store.write_run(lane_pass, _record(command))
+        store.set_pass_blocks(lane_pass, outcome=None, effect={'tests_counted': []})
+        return lane_pass.pass_id
+
+    def _seeded(self, store: RunRecordStore, clock: _Clock) -> dict[str, list[str]]:
+        """Two well-formed passes per command in the window, three bad ones, and what must not be yielded."""
+        self._written_at(store, clock, T0, 'unit')
+        good = {
+            command: [
+                self._written_at(store, clock, self.SINCE + timedelta(minutes=offset, microseconds=250), command)
+                for offset in (10, 20)
+            ]
+            for command in ('unit', 'lint')
+        }
+        not_json = self._written_at(store, clock, self.SINCE + timedelta(minutes=30), 'unit')
+        store.pass_directory('unit', not_json).joinpath('record.json').write_text('{truncated')
+        no_effect = self._written_at(store, clock, self.SINCE + timedelta(minutes=40), 'unit')
+        record_path = store.pass_directory('unit', no_effect) / 'record.json'
+        payload = json.loads(record_path.read_text())
+        del payload['effect']
+        record_path.write_text(json.dumps(payload))
+        deleted = self._written_at(store, clock, self.SINCE + timedelta(minutes=50), 'lint')
+        store.pass_directory('lint', deleted).joinpath('record.json').unlink()
+        (store.root / 'unit' / 'scratch').mkdir()
+        return {'good_unit': good['unit'], 'good_lint': good['lint'], 'bad': [not_json, no_effect, deleted]}
+
+    def test_every_pass_directory_in_the_window_is_yielded_once_in_order(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        seeded = self._seeded(store, clock)
+
+        stored = list(store.stored_passes_since(self.SINCE))
+
+        assert [(item.command_key, item.pass_id) for item in stored] == [
+            *[('lint', pass_id) for pass_id in (*seeded['good_lint'], seeded['bad'][2])],
+            *[('unit', pass_id) for pass_id in (*seeded['good_unit'], *seeded['bad'][:2])],
+        ]
+
+    def test_a_well_formed_pass_carries_its_record_and_no_problem(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        seeded = self._seeded(store, clock)
+
+        stored = {(item.command_key, item.pass_id): item for item in store.stored_passes_since(self.SINCE)}
+
+        for command in ('unit', 'lint'):
+            for offset, pass_id in zip((10, 20), seeded[f'good_{command}'], strict=True):
+                item = stored[(command_key(command), pass_id)]
+                assert item.problem is None
+                assert item.record == store.load_pass(command, pass_id)
+                assert item.directory == store.pass_directory(command, pass_id)
+                assert item.started_at == self.SINCE + timedelta(minutes=offset)
+                assert item.command_key == command_key(command)
+
+    def test_a_malformed_or_unreadable_record_is_reported_not_skipped(
+        self, store: RunRecordStore, clock: _Clock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        seeded = self._seeded(store, clock)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.offline_lane_records'):
+            stored = {(item.command_key, item.pass_id): item for item in store.stored_passes_since(self.SINCE)}
+
+        for key in zip(('unit', 'unit', 'lint'), seeded['bad'], strict=True):
+            item = stored[key]
+            assert item.record is None
+            assert item.problem
+            assert str(item.directory / 'record.json') in item.problem
+        assert caplog.records == []
+
+    def test_a_pass_before_the_cut_and_a_stray_directory_are_not_yielded(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        self._seeded(store, clock)
+
+        stored = list(store.stored_passes_since(self.SINCE))
+
+        assert all(item.started_at >= self.SINCE for item in stored)
+        assert 'scratch' not in {item.pass_id for item in stored}
+        assert len(stored) == 7
+
+    @pytest.mark.parametrize('with_record', [True, False])
+    def test_a_stored_pass_holds_exactly_one_of_record_or_problem_and_names_what_it_got(
+        self, store: RunRecordStore, clock: _Clock, with_record: bool
+    ) -> None:
+        pass_id = self._written_at(store, clock, self.SINCE, 'unit')
+        record = store.load_pass('unit', pass_id) if with_record else None
+        problem = 'record.json: unreadable' if with_record else None
+
+        with pytest.raises(ValueError, match='exactly one of record or problem') as raised:
+            StoredPass('unit', pass_id, self.SINCE, store.pass_directory('unit', pass_id), record, problem)
+
+        assert f'record is None={not with_record}, problem={problem!r}' in str(raised.value)
+
+    def test_a_store_whose_root_does_not_exist_yields_nothing_and_creates_nothing(
+        self, tmp_path: Path, clock: _Clock
+    ) -> None:
+        absent = tmp_path / 'absent'
+        store = RunRecordStore(absent, clock=clock)
+
+        assert list(store.stored_passes_since(T0)) == []
+        assert not absent.exists()
+
+
 class TestRetention:
-    def _allocate_aged(self, store: RunRecordStore, clock: _Clock, now: datetime, days: int) -> str:
-        clock.current = now - timedelta(days=days)
+    def _allocate_aged(
+        self, store: RunRecordStore, clock: _Clock, now: datetime, age: timedelta
+    ) -> str:
+        clock.current = now - age
         lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
         store.write_run(lane_pass, _record())
         return lane_pass.pass_id
-
-    def test_retention_is_fourteen_days(self) -> None:
-        assert timedelta(days=14) == RECORD_RETENTION
 
     def test_a_pass_older_than_retention_is_removed_and_a_newer_one_kept(
         self, store: RunRecordStore, clock: _Clock
     ) -> None:
         now = T0 + timedelta(days=30)
-        old = self._allocate_aged(store, clock, now, 15)
-        recent = self._allocate_aged(store, clock, now, 13)
+        old = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=1))
+        recent = self._allocate_aged(store, clock, now, RECORD_RETENTION - timedelta(days=1))
 
         assert store.prune(now) == [old]
 
         assert not (store.root / 'unit' / old).exists()
         assert (store.root / 'unit' / recent / 'record.json').is_file()
 
+    def test_a_pass_older_than_fourteen_days_and_younger_than_sixty_survives_a_prune(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        now = T0 + timedelta(days=30)
+        fifteen = self._allocate_aged(store, clock, now, timedelta(days=15))
+        fifty_nine = self._allocate_aged(store, clock, now, timedelta(days=59))
+        sixty_one = self._allocate_aged(store, clock, now, timedelta(days=61))
+
+        assert store.prune(now) == [sixty_one]
+
+        assert (store.root / 'unit' / fifteen / 'record.json').is_file()
+        assert (store.root / 'unit' / fifty_nine / 'record.json').is_file()
+
     def test_a_pinned_pass_survives(self, store: RunRecordStore, clock: _Clock) -> None:
         now = T0 + timedelta(days=30)
-        old = self._allocate_aged(store, clock, now, 15)
+        old = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=1))
 
         assert store.prune(now, pinned_pass_ids={old}) == []
 
@@ -549,7 +671,7 @@ class TestRetention:
 
     def test_pruning_covers_every_command(self, store: RunRecordStore, clock: _Clock) -> None:
         now = T0 + timedelta(days=30)
-        clock.current = now - timedelta(days=20)
+        clock.current = now - RECORD_RETENTION - timedelta(days=6)
         first = store.allocate_pass('one', Leg.GENERIC, HEAD).pass_id
         second = store.allocate_pass(LEGACY_INFRA_COMMAND, Leg.INFRA, 'fedcba9876').pass_id
 
@@ -566,7 +688,7 @@ class TestRetention:
         self, store: RunRecordStore, clock: _Clock
     ) -> None:
         now = T0 + timedelta(days=30)
-        old = self._allocate_aged(store, clock, now, 15)
+        old = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=1))
         (store.root / 'unit' / old / 'record.json').write_text('garbage')
 
         assert store.prune(now) == [old]
@@ -580,8 +702,8 @@ class TestRetention:
         self, store: RunRecordStore, clock: _Clock, caplog: pytest.LogCaptureFixture
     ) -> None:
         now = T0 + timedelta(days=30)
-        stuck = self._allocate_aged(store, clock, now, 15)
-        removable = self._allocate_aged(store, clock, now, 16)
+        stuck = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=1))
+        removable = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=2))
 
         with _locked_subdirectory(store.root / 'unit' / stuck), caplog.at_level(logging.WARNING):
             assert store.prune(now) == [removable]
@@ -1029,11 +1151,13 @@ class TestLaneRetention:
     ) -> None:
         expired = _seed_pass(tmp_path, RECORD_RETENTION + timedelta(days=6))
         recent = _seed_pass(tmp_path, timedelta(days=1))
+        month_old = _seed_pass(tmp_path, timedelta(days=30))
 
         await _run_one_pass(tmp_path, 'exit 0', until_phase=Phase.DETECT)
 
         assert not expired.exists()
         assert (recent / 'record.json').is_file()
+        assert (month_old / 'record.json').is_file()
 
     @_needs_file_permissions
     @pytest.mark.asyncio

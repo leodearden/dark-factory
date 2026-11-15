@@ -46,6 +46,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'plainDatum',
   'derivedDatum',
   'servedDatum',
+  'undeliveredDatum',
   'combinedDatum',
 ];
 const EXPECTED_EXPORT_NAMES = [
@@ -80,7 +81,7 @@ const { isDatum, unknownDatum, assertDatum, DATUM_STATES } = datum;
 const { withReceipt, displayedAgeMs } = datum;
 const { datumView, EM_DASH, LOWER_BOUND_PREFIX } = datum;
 const { plainDatum, derivedDatum, PLAIN_DATUM_BOUND_SECONDS } = datum;
-const { servedDatum } = datum;
+const { servedDatum, undeliveredDatum } = datum;
 const { combinedDatum } = datum;
 
 // The five-key wire envelope datum.py::Datum.to_wire() emits, verbatim: `as_of`
@@ -757,6 +758,89 @@ test('plainDatum: the BASE bound is four poll intervals — an unpaced endpoint,
   // banner the later per-ENDPOINT explanation — deliberately ordered
   // fine-then-coarse, one authority each.
   assert.equal(PLAIN_DATUM_BOUND_SECONDS, 12);
+});
+
+// ---------------------------------------------------------------------------
+// undeliveredDatum — the ONE answer to "has this endpoint delivered yet?", for
+// a caller that needs the hole rather than a value: the 'not yet fetched' hole
+// before the endpoint's first receipt, null once it has one.
+// ---------------------------------------------------------------------------
+
+const OTHER_PATH = '/api/v2/dashboard/orchestrators';
+
+function assertNeverFetchedHole(hole, label) {
+  assert.equal(isDatum(hole), true, `${label}: not a Datum`);
+  assert.equal(hole.state, 'unknown', label);
+  assert.equal(hole.value, null, label);
+  assert.equal(hole.as_of, null, label);
+  assert.equal(hole.reason, 'not yet fetched', label);
+  assert.equal(datumView(hole, { now: NOW }).text, EM_DASH, label);
+}
+
+test('undeliveredDatum: before the endpoint\'s first receipt it is the never-fetched hole', () => {
+  assertNeverFetchedHole(undeliveredDatum(TASKS_PATH, {}), 'an empty receipts map');
+  assertNeverFetchedHole(
+    undeliveredDatum(TASKS_PATH, { [OTHER_PATH]: RECEIPT }),
+    'a map keyed only by another endpoint',
+  );
+});
+
+test('undeliveredDatum: once the endpoint has delivered there is no hole — null', () => {
+  assert.equal(undeliveredDatum(TASKS_PATH, receiptsFor(RECEIPT)), null);
+  assert.equal(
+    undeliveredDatum(TASKS_PATH, receiptsFor({ servedAt: null, receivedAt: RECEIVED_AT })),
+    null,
+  );
+});
+
+test('undeliveredDatum: a receipt with no finite receivedAt has not delivered', () => {
+  for (const [label, entry] of [
+    ['no receivedAt', { servedAt: SERVED_AT }],
+    ['receivedAt NaN', { servedAt: SERVED_AT, receivedAt: NaN }],
+    ['receivedAt not a number', { servedAt: SERVED_AT, receivedAt: 'not a number' }],
+  ]) {
+    assertNeverFetchedHole(undeliveredDatum(TASKS_PATH, receiptsFor(entry)), label);
+  }
+});
+
+test('undeliveredDatum: agrees with plainDatum\'s no-receipt arm for every receipt shape', () => {
+  // ONE answer to the question, not two: whatever plainDatum calls
+  // never-fetched, this calls never-fetched, with the identical hole.
+  const shapes = [
+    ['empty', {}],
+    ['other endpoint only', { [OTHER_PATH]: RECEIPT }],
+    ['delivered', receiptsFor(RECEIPT)],
+    ['delivered without served_at', receiptsFor({ servedAt: null, receivedAt: RECEIVED_AT })],
+    ['non-finite receivedAt', receiptsFor({ servedAt: SERVED_AT, receivedAt: NaN })],
+  ];
+  for (const [label, receipts] of shapes) {
+    const hole = undeliveredDatum(TASKS_PATH, receipts);
+    const plain = plainDatum(7, TASKS_PATH, receipts);
+
+    assert.equal(hole === null, plain.state !== 'unknown', label);
+    if (hole !== null) assert.deepEqual(hole, plain, label);
+  }
+});
+
+test('undeliveredDatum: reads window.DF_DATA.__receipt when no map is passed', () => {
+  globalThis.window.DF_DATA = { __receipt: receiptsFor(RECEIPT) };
+  try {
+    assert.equal(undeliveredDatum(TASKS_PATH), null);
+    assert.equal(undeliveredDatum(TASKS_PATH, null), null);
+  } finally {
+    delete globalThis.window.DF_DATA;
+  }
+  assertNeverFetchedHole(undeliveredDatum(TASKS_PATH), 'no DF_DATA published yet');
+});
+
+test('undeliveredDatum: returns a fresh hole each call', () => {
+  // Callers stamp receipts onto datums, so a shared hole would carry one call
+  // site's stamp onto every other site's placeholder.
+  const a = undeliveredDatum(TASKS_PATH, {});
+  const b = undeliveredDatum(TASKS_PATH, {});
+
+  assert.deepEqual(a, b);
+  assert.notEqual(a, b);
 });
 
 // ---------------------------------------------------------------------------

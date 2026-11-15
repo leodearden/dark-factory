@@ -27,10 +27,10 @@ import pytest
 from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
-    _parse_claude_output,
-    _SubprocessResult,
+    SubprocessResult,
     build_failure_message,
     classify_agent_failure,
+    parse_claude_output,
 )
 from shared.invocation_outcome import CapHit, Failure, NearCap, classify_invocation
 
@@ -72,8 +72,8 @@ def _refused_cli_json(refusal_text: str, **overrides: object) -> str:
 
 
 def _parsed(stdout: str, returncode: int = 1) -> AgentResult:
-    return _parse_claude_output(
-        _SubprocessResult(stdout=stdout, stderr='', returncode=returncode, duration_ms=4288)
+    return parse_claude_output(
+        SubprocessResult(stdout=stdout, stderr='', returncode=returncode, duration_ms=4288)
     )
 
 

@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -24,20 +25,22 @@ from _scan_race_helpers import (
     unreadable_read_text,
 )
 
-from escalation.classify import effective_benign
+from escalation.amendments import (
+    MAX_AMENDMENT_DETAIL_CHARS,
+    MAX_AMENDMENT_LINE_CHARS,
+    MAX_AMENDMENT_OPTIONS,
+    MAX_AMENDMENTS,
+    amendment_room,
+)
+from escalation.classify import default_resolution_class_for_resolver, effective_benign
 from escalation.models import Escalation
 from escalation.queue import (
-    _MAX_AMENDMENT_DETAIL_CHARS,
-    _MAX_AMENDMENT_LINE_CHARS,
-    _MAX_AMENDMENT_OPTIONS,
-    _MAX_AMENDMENTS,
     _MAX_LATE_RESOLUTION_CHARS,
     _MAX_LATE_RESOLUTIONS,
     _MAX_ROOT_CAUSE_VARIANTS,
     AmendmentOutcome,
     EscalationQueue,
     ResolveOutcome,
-    amendment_room,
     iter_all_escalation_paths,
 )
 
@@ -395,6 +398,89 @@ class TestDismissAllPendingKeep:
         assert level_1.status == 'pending'
 
 
+def _peer_resolves(
+    peer: EscalationQueue, esc_id: str, peer_wrote: list[Escalation],
+) -> Callable[[Escalation], bool]:
+    """A ``keep`` predicate through which *peer* resolves *esc_id* first, keeping nothing.
+
+    The record as the peer left it on disk is appended to *peer_wrote*.
+    """
+
+    def keep(esc: Escalation) -> bool:
+        if esc.id == esc_id:
+            peer.resolve(esc_id, 'Fixed by a peer process', resolved_by='steward')
+            written = peer.get(esc_id)
+            assert written is not None
+            peer_wrote.append(written)
+        return False
+
+    return keep
+
+
+class TestDismissAllPendingCountsOnlyAppliedDismissals:
+    """A record a concurrent writer resolves between get_pending() and resolve() is not counted.
+
+    ``keep`` is the injection point: it runs on each snapshot record before that
+    record's resolve(), so a real peer queue resolving there lands in the window.
+    """
+
+    def test_record_resolved_by_a_peer_mid_sweep_is_not_counted(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        peer = EscalationQueue(tmp_path / 'queue')
+        for task_id in ('1', '2', '3'):
+            queue.submit(_make_escalation(f'esc-{task_id}-1', task_id=task_id))
+
+        peer_wrote: list[Escalation] = []
+
+        count = queue.dismiss_all_pending(
+            'Stale from prior run', keep=_peer_resolves(peer, 'esc-2-1', peer_wrote),
+        )
+
+        assert count == 2, f'only the two records this sweep dismissed count: {count}'
+        assert [(e.status, e.resolved_by, e.resolution) for e in peer_wrote] == [
+            ('resolved', 'steward', 'Fixed by a peer process'),
+        ], peer_wrote
+        assert queue.get('esc-2-1') == peer_wrote[0], (
+            'the late sweep resolve left the peer-resolved record untouched'
+        )
+        for esc_id in ('esc-1-1', 'esc-3-1'):
+            swept = queue.get(esc_id)
+            assert swept is not None
+            assert (swept.status, swept.resolved_by) == ('dismissed', 'auto-dismissed'), (
+                f'{esc_id} was dismissed by this sweep: {swept}'
+            )
+
+    def test_peer_resolved_strand_is_not_tallied_as_a_stale_strand(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        peer = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_aged_escalation('esc-1-1', age_secs=75480.0, task_id='1'))
+        queue.submit(_aged_escalation('esc-2-1', age_secs=75480.0, task_id='2'))
+        queue.submit(_aged_escalation('esc-3-1', age_secs=90.0, task_id='3'))
+
+        peer_wrote: list[Escalation] = []
+
+        with caplog.at_level(logging.INFO, logger='escalation.queue'):
+            count = queue.dismiss_all_pending(
+                'Stale from prior run',
+                strand_age_secs=600.0,
+                keep=_peer_resolves(peer, 'esc-2-1', peer_wrote),
+            )
+
+        assert count == 2, f'only the two records this sweep dismissed count: {count}'
+        assert [(e.resolved_by, e.resolution_class) for e in peer_wrote] == [
+            ('steward', default_resolution_class_for_resolver('steward')),
+        ], peer_wrote
+        assert queue.get('esc-2-1') == peer_wrote[0], (
+            'the late sweep resolve neither re-stamped nor otherwise touched the peer-resolved strand'
+        )
+        sweep_lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith('Dismissed ')]
+        assert len(sweep_lines) == 1, f'one sweep INFO line expected: {sweep_lines}'
+        assert 'Dismissed 2 stale L0 escalation(s)' in sweep_lines[0], sweep_lines
+        assert '(1 stale-strand)' in sweep_lines[0], sweep_lines
+
+
 class TestAmendmentRoom:
     """``amendment_room`` is zero exactly when the next amend would shed the oldest."""
 
@@ -409,11 +495,11 @@ class TestAmendmentRoom:
         queue.submit(_make_escalation('esc-1-1', task_id='1', level=1))
 
         rooms = []
-        for i in range(_MAX_AMENDMENTS):
+        for i in range(MAX_AMENDMENTS):
             rooms.append(self._room(queue))
             assert queue.amend('esc-1-1', summary=f'pass {i}', agent_role='test')['dropped'] == 0
 
-        assert rooms == list(range(_MAX_AMENDMENTS, 0, -1))
+        assert rooms == list(range(MAX_AMENDMENTS, 0, -1))
         assert self._room(queue) == 0
         assert queue.amend('esc-1-1', summary='one more', agent_role='test')['dropped'] == 1
         assert self._room(queue) == 0
@@ -4290,7 +4376,7 @@ class TestAddMembersToL2:
         A rotation re-promoting the same cluster with UNCHANGED text has
         contributed nothing.  Re-recording it would manufacture a spurious
         updated_at bump (re-triggering the watcher's re-assess on a no-op — the
-        contract task 3976 pinned) and burn cap budget, so _MAX_AMENDMENTS worth
+        contract task 3976 pinned) and burn cap budget, so MAX_AMENDMENTS worth
         of identical rows would push genuinely-distinct earlier framings out via
         the drop-oldest policy.
         """
@@ -4434,7 +4520,7 @@ class TestAddMembersToL2:
         The entry cap alone bounds nothing: an amendment's `detail` is the
         promote's unbounded free-text `evidence` argument — the same field the
         compact projection exists to keep off the wire — so a hot-folding L2
-        could sit "inside `_MAX_AMENDMENTS`" while growing by hundreds of KB,
+        could sit "inside `MAX_AMENDMENTS`" while growing by hundreds of KB,
         and every reader of a FULL record pays that (`get_escalation`,
         `get_pending_escalations(compact=False)`, every sweep's JSON parse).
 
@@ -4444,15 +4530,15 @@ class TestAddMembersToL2:
         l2 = self._framed_l2(queue)
         over = 50  # comfortably past every cap, whatever they are retuned to
 
-        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
+        with caplog.at_level(logging.WARNING, logger='escalation.amendments'):
             result = queue.add_members_to_l2(
                 l2.id, [],
-                root_cause='R' * (_MAX_AMENDMENT_LINE_CHARS + over),
-                summary='S' * (_MAX_AMENDMENT_LINE_CHARS + over),
-                evidence='D' * (_MAX_AMENDMENT_DETAIL_CHARS + over),
+                root_cause='R' * (MAX_AMENDMENT_LINE_CHARS + over),
+                summary='S' * (MAX_AMENDMENT_LINE_CHARS + over),
+                evidence='D' * (MAX_AMENDMENT_DETAIL_CHARS + over),
                 options=(
-                    ['O' * (_MAX_AMENDMENT_LINE_CHARS + over)]
-                    * (_MAX_AMENDMENT_OPTIONS + 2)
+                    ['O' * (MAX_AMENDMENT_LINE_CHARS + over)]
+                    * (MAX_AMENDMENT_OPTIONS + 2)
                 ),
                 agent_role='escalation-watcher-auto',
             )
@@ -4463,16 +4549,16 @@ class TestAddMembersToL2:
 
         # (a) the KEPT text of each field is capped — the marker is allowed to
         # push the stored string past the cap, but the payload is not.
-        assert amendment['root_cause'].count('R') == _MAX_AMENDMENT_LINE_CHARS
-        assert amendment['summary'].count('S') == _MAX_AMENDMENT_LINE_CHARS
-        assert amendment['detail'].count('D') == _MAX_AMENDMENT_DETAIL_CHARS
+        assert amendment['root_cause'].count('R') == MAX_AMENDMENT_LINE_CHARS
+        assert amendment['summary'].count('S') == MAX_AMENDMENT_LINE_CHARS
+        assert amendment['detail'].count('D') == MAX_AMENDMENT_DETAIL_CHARS
         # (b) the options LIST is capped in length, and each option in width.
-        assert len(amendment['options']) == _MAX_AMENDMENT_OPTIONS, (
+        assert len(amendment['options']) == MAX_AMENDMENT_OPTIONS, (
             f'the options list must be length-capped, got '
             f'{len(amendment["options"])}'
         )
         assert all(
-            o.count('O') == _MAX_AMENDMENT_LINE_CHARS for o in amendment['options']
+            o.count('O') == MAX_AMENDMENT_LINE_CHARS for o in amendment['options']
         )
         # (c) the elision is MARKED IN-BAND, so a reader can tell the head of a
         # framing from the whole of one without cross-referencing anything.
@@ -4484,14 +4570,16 @@ class TestAddMembersToL2:
         )
         # (d) the loss is DURABLY COUNTED on the record (INV-8) — the byte-side
         # counterpart of amendments_truncated.
-        shed_options = 2 * (_MAX_AMENDMENT_LINE_CHARS + over)
-        expected = over * (3 + _MAX_AMENDMENT_OPTIONS) + shed_options
+        shed_options = 2 * (MAX_AMENDMENT_LINE_CHARS + over)
+        expected = over * (3 + MAX_AMENDMENT_OPTIONS) + shed_options
         assert result.amendments_chars_elided == expected, (
             f'expected {expected} elided chars, got {result.amendments_chars_elided}'
         )
         assert self._on_disk(queue, l2.id).amendments_chars_elided == expected
         assert any(
-            'elided' in r.getMessage() for r in caplog.records
+            'elided' in r.getMessage()
+            for r in caplog.records
+            if r.name == 'escalation.amendments'
         ), 'elision must also be loud in the log'
 
         # (e) elision does not defeat repeat detection: the SAME oversized
@@ -4500,12 +4588,12 @@ class TestAddMembersToL2:
         bumped_at = result.updated_at
         again = queue.add_members_to_l2(
             l2.id, [],
-            root_cause='R' * (_MAX_AMENDMENT_LINE_CHARS + over),
-            summary='S' * (_MAX_AMENDMENT_LINE_CHARS + over),
-            evidence='D' * (_MAX_AMENDMENT_DETAIL_CHARS + over),
+            root_cause='R' * (MAX_AMENDMENT_LINE_CHARS + over),
+            summary='S' * (MAX_AMENDMENT_LINE_CHARS + over),
+            evidence='D' * (MAX_AMENDMENT_DETAIL_CHARS + over),
             options=(
-                ['O' * (_MAX_AMENDMENT_LINE_CHARS + over)]
-                * (_MAX_AMENDMENT_OPTIONS + 2)
+                ['O' * (MAX_AMENDMENT_LINE_CHARS + over)]
+                * (MAX_AMENDMENT_OPTIONS + 2)
             ),
         )
         assert again is not None
@@ -4518,7 +4606,7 @@ class TestAddMembersToL2:
         """The whole list's SIZE — not just its length — is bounded by the caps.
 
         The property the caps exist for, asserted end-to-end: feed folds far
-        larger than any cap, fill past `_MAX_AMENDMENTS`, and the stored framing
+        larger than any cap, fill past `MAX_AMENDMENTS`, and the stored framing
         still fits an envelope computed FROM the constants.  Without per-field
         elision this is ~5 MB of durable record.
         """
@@ -4526,7 +4614,7 @@ class TestAddMembersToL2:
         l2 = self._framed_l2(queue)
         huge = 50_000
 
-        for i in range(_MAX_AMENDMENTS + 3):
+        for i in range(MAX_AMENDMENTS + 3):
             queue.add_members_to_l2(
                 l2.id, [],
                 root_cause=f'{i}' + 'R' * huge,
@@ -4537,7 +4625,7 @@ class TestAddMembersToL2:
             )
 
         record = self._on_disk(queue, l2.id)
-        assert len(record.amendments) == _MAX_AMENDMENTS
+        assert len(record.amendments) == MAX_AMENDMENTS
         stored = sum(
             len(a['root_cause']) + len(a['summary']) + len(a['detail'])
             + sum(len(o) for o in a['options'])
@@ -4546,11 +4634,11 @@ class TestAddMembersToL2:
         # Per-entry payload, derived from the constants; the marker allowance
         # covers the in-band elision notes (one per elided field).
         marker_allowance = 120
-        fields_per_entry = 3 + _MAX_AMENDMENT_OPTIONS
-        envelope = _MAX_AMENDMENTS * (
-            2 * _MAX_AMENDMENT_LINE_CHARS
-            + _MAX_AMENDMENT_DETAIL_CHARS
-            + _MAX_AMENDMENT_OPTIONS * _MAX_AMENDMENT_LINE_CHARS
+        fields_per_entry = 3 + MAX_AMENDMENT_OPTIONS
+        envelope = MAX_AMENDMENTS * (
+            2 * MAX_AMENDMENT_LINE_CHARS
+            + MAX_AMENDMENT_DETAIL_CHARS
+            + MAX_AMENDMENT_OPTIONS * MAX_AMENDMENT_LINE_CHARS
             + fields_per_entry * marker_allowance
         )
         assert stored <= envelope, (
@@ -4634,7 +4722,7 @@ class TestAddMembersToL2:
 
         # (f) at the cap, an append SHEDS — and the count is this call's own,
         # not a difference inferred from a racy pre-read.
-        for i in range(_MAX_AMENDMENTS):
+        for i in range(MAX_AMENDMENTS):
             queue.add_members_to_l2(
                 l2.id, [], root_cause=f'fill {i}', evidence=f'fill evidence {i}',
             )
@@ -4647,14 +4735,14 @@ class TestAddMembersToL2:
             f'a truncating append must report both facts, got {truncating}'
         )
         capped = queue.get(l2.id)
-        assert capped is not None and len(capped.amendments) == _MAX_AMENDMENTS
+        assert capped is not None and len(capped.amendments) == MAX_AMENDMENTS
 
     def test_amendment_list_is_capped_and_truncation_is_loud(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """Amendment growth is bounded, sheds the OLDEST, and counts what it shed.
 
-        INV-7: the cap has a NAME (`_MAX_AMENDMENTS`), a direction (drop oldest)
+        INV-7: the cap has a NAME (`MAX_AMENDMENTS`), a direction (drop oldest)
         and an owner (this method, at write time).  The loop bound is derived
         FROM the constant, never hardcoded — a literal here would encode the
         constant's VALUE instead of its NAME and go stale the moment it is
@@ -4670,8 +4758,8 @@ class TestAddMembersToL2:
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = self._framed_l2(queue)
 
-        with caplog.at_level(logging.WARNING, logger='escalation.queue'):
-            for i in range(_MAX_AMENDMENTS + overflow):
+        with caplog.at_level(logging.WARNING, logger='escalation.amendments'):
+            for i in range(MAX_AMENDMENTS + overflow):
                 result = queue.add_members_to_l2(
                     l2.id, [],
                     root_cause=f'root cause pass {i}',
@@ -4681,8 +4769,8 @@ class TestAddMembersToL2:
 
         assert result is not None
         # (a) growth is BOUNDED.
-        assert len(result.amendments) == _MAX_AMENDMENTS, (
-            f'Expected the list capped at {_MAX_AMENDMENTS}, '
+        assert len(result.amendments) == MAX_AMENDMENTS, (
+            f'Expected the list capped at {MAX_AMENDMENTS}, '
             f'got {len(result.amendments)}'
         )
         # (b) the RETAINED entries are the most RECENT ones — identified by
@@ -4690,10 +4778,10 @@ class TestAddMembersToL2:
         retained = {a['root_cause'] for a in result.amendments}
         assert retained == {
             f'root cause pass {i}'
-            for i in range(overflow, _MAX_AMENDMENTS + overflow)
-        }, f'Expected the newest {_MAX_AMENDMENTS} passes to survive, got {sorted(retained)}'
+            for i in range(overflow, MAX_AMENDMENTS + overflow)
+        }, f'Expected the newest {MAX_AMENDMENTS} passes to survive, got {sorted(retained)}'
         assert result.amendments[-1]['detail'] == (
-            f'evidence pass {_MAX_AMENDMENTS + overflow - 1}'
+            f'evidence pass {MAX_AMENDMENTS + overflow - 1}'
         ), 'the most recent framing must be the LAST entry'
         # (c) the loss is DURABLY COUNTED on the record — assertable without
         # scraping logs (INV-8).
@@ -4704,10 +4792,10 @@ class TestAddMembersToL2:
         # (d) and it is LOUD.
         warning_records = [
             r for r in caplog.records
-            if r.levelno >= logging.WARNING and r.name == 'escalation.queue'
+            if r.levelno >= logging.WARNING and r.name == 'escalation.amendments'
         ]
         assert warning_records, (
-            f"Expected a WARNING at logger 'escalation.queue'; got records: {caplog.records}"
+            f"Expected a WARNING at logger 'escalation.amendments'; got records: {caplog.records}"
         )
         assert any(l2.id in r.getMessage() for r in warning_records), (
             f'Expected a truncation WARNING naming {l2.id}; '
@@ -4717,7 +4805,7 @@ class TestAddMembersToL2:
         # The cap is enforced on DISK too, not just on the returned object —
         # the trim rides the same single _rewrite as the append.
         reloaded = self._on_disk(queue, l2.id)
-        assert len(reloaded.amendments) == _MAX_AMENDMENTS
+        assert len(reloaded.amendments) == MAX_AMENDMENTS
         assert reloaded.amendments_truncated == overflow
         assert {a['root_cause'] for a in reloaded.amendments} == retained
 
@@ -6859,6 +6947,7 @@ def _make_esc_with_category(
     *,
     status: str = 'pending',
     level: int = 1,
+    dedupe_fingerprint: str | None = None,
 ) -> Escalation:
     """An Escalation with a caller-chosen category (the top-level _make_escalation
     hardcodes category='task_failure', so has_open_l1 signature tests need this)."""
@@ -6870,6 +6959,7 @@ def _make_esc_with_category(
         category=category,
         summary='merge blocked',
         level=level,
+        dedupe_fingerprint=dedupe_fingerprint,
     )
     esc.status = status
     return esc
@@ -6914,6 +7004,86 @@ class TestHasOpenL1CategoryFilter:
             _make_esc_with_category('esc-T-1', 'T', 'merge_error', status='resolved')
         )
         assert queue.has_open_l1('T', category='merge_error') is False
+
+
+class TestHasOpenL1FingerprintFilter:
+    """has_open_l1 gains an optional keyword-only `dedupe_fingerprint` filter.
+
+    The scheduled memory-eval runner files every metric of one eval under the
+    same synthetic task id, so without this filter one open alarm would
+    suppress every OTHER metric's alarm.  Default None keeps prior behaviour.
+    """
+
+    def _queue_with(self, tmp_path: Path, esc: Escalation) -> EscalationQueue:
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(esc)
+        return queue
+
+    def test_matching_fingerprint_is_open(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-a',
+        ) is True
+
+    def test_new_fingerprint_not_suppressed_by_unrelated_open_one(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-b',
+        ) is False
+
+    def test_resolved_matching_fingerprint_is_not_open(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            status='resolved', dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-a',
+        ) is False
+
+    def test_level0_matching_fingerprint_is_not_open(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            level=0, dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-a',
+        ) is False
+
+    def test_matching_fingerprint_other_category_is_not_open(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'merge_error',
+            dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint='fp-a',
+        ) is False
+
+    def test_default_none_keeps_prior_behaviour(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+        ))
+        assert queue.has_open_l1('memory-eval-e1', category='eval_regression') is True
+        assert queue.has_open_l1(
+            'memory-eval-e1', category='eval_regression', dedupe_fingerprint=None,
+        ) is True
+
+    def test_fingerprint_applies_without_category(self, tmp_path: Path) -> None:
+        queue = self._queue_with(tmp_path, _make_esc_with_category(
+            'esc-memory-eval-e1-1', 'memory-eval-e1', 'eval_regression',
+            dedupe_fingerprint='fp-a',
+        ))
+        assert queue.has_open_l1('memory-eval-e1', dedupe_fingerprint='fp-a') is True
+        assert queue.has_open_l1('memory-eval-e1', dedupe_fingerprint='fp-b') is False
 
 
 class TestDismissIfCovered:
@@ -7490,10 +7660,10 @@ class TestAddMembersToL2RootCauseVariants:
         )
 
     def test_long_spelling_is_elided_with_the_in_band_marker(self, tmp_path: Path):
-        """(e cont.) Each stored spelling is capped by the existing `_elide` helper."""
+        """(e cont.) Each stored spelling is capped by the existing `elide` helper."""
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = self._make_l2(queue)
-        long_cause = 'x' * (_MAX_AMENDMENT_LINE_CHARS + 250)
+        long_cause = 'x' * (MAX_AMENDMENT_LINE_CHARS + 250)
 
         queue.add_members_to_l2(l2.id, ['esc-l1-1'], root_cause=long_cause)
 
@@ -7501,7 +7671,7 @@ class TestAddMembersToL2RootCauseVariants:
         assert record is not None
         stored = record.root_cause_variants[-1]
         assert stored != long_cause, 'an over-long spelling must be elided'
-        assert stored.startswith('x' * _MAX_AMENDMENT_LINE_CHARS)
+        assert stored.startswith('x' * MAX_AMENDMENT_LINE_CHARS)
         assert 'elided' in stored, (
             f'elision must be MARKED IN-BAND, not silent: {stored[-120:]!r}'
         )
@@ -8136,8 +8306,8 @@ class TestResolveOutcomeOutParam:
         """(d) The out-param changed nothing for the callers that ignore it.
 
         `resolve()` has callers that pass positionally (`resolve(id, text,
-        dismiss)`), plus its own member cascade and `dismiss_all_pending` — none
-        of which want the out-param.  Keyword-only with a None default is what
+        dismiss)`), plus its own member cascade — none of which want the
+        out-param.  Keyword-only with a None default is what
         keeps them untouched, asserted the way those callers experience it: a
         third POSITIONAL argument still means `dismiss` (it would have meant
         `outcome` had the new parameter been added positionally), and a call
@@ -8965,7 +9135,7 @@ class TestLateResolutionCorrectsResolutionClass:
 class TestLateResolutionBounds:
     """`late_resolutions` is SIZE-bounded, and every loss is a durable fact.
 
-    The same no-silent-cap policy `_MAX_AMENDMENTS` already models: the oldest
+    The same no-silent-cap policy `MAX_AMENDMENTS` already models: the oldest
     entries are shed, each drop is counted ON THE RECORD (not merely logged), an
     over-long entry is elided with an in-band marker naming what was dropped, and
     the dropped character total is likewise durable — so `len(list) + truncated`
@@ -9104,3 +9274,58 @@ class TestTripFactsPersistence:
         stored = queue.get(esc_id)
         assert stored is not None
         assert stored.ewa_rate_trip == esc.ewa_rate_trip
+
+
+class TestGetPendingByTask:
+    """``get_pending_by_task`` groups ONE root listing by task id (task 8073).
+
+    For every task id it must yield exactly what
+    ``get_by_task(task_id, status='pending')`` yields over the same files.
+    """
+
+    def _seed(self, queue: EscalationQueue) -> None:
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+        queue.submit(_make_escalation('esc-1-2', task_id='1', level=2))
+        queue.submit(_make_escalation('esc-2-1', task_id='2'))
+        queue.submit(_make_escalation('esc-2-2', task_id='2'))
+        queue.resolve('esc-2-2', 'archived, no longer pending')
+        resolved_in_root = _make_escalation('esc-3-1', task_id='3', status='resolved')
+        (queue.queue_dir / 'esc-3-1.json').write_text(resolved_in_root.to_json())
+        (queue.queue_dir / 'esc-4-1.json').write_text('{not json')
+        (queue.queue_dir / 'esc-5-1.json.lock').write_text('')
+        (queue.queue_dir / 'esc-5.seq').write_text('7')
+
+    def test_each_group_matches_the_per_task_pending_read(self, tmp_path: Path):
+        queue = EscalationQueue(tmp_path / 'queue')
+        self._seed(queue)
+
+        grouped = queue.get_pending_by_task()
+
+        for task_id in ('1', '2', '3', '4', '5', 'absent'):
+            expected = queue.get_by_task(task_id, status='pending')
+            assert [e.to_json() for e in grouped.get(task_id, [])] == [
+                e.to_json() for e in expected
+            ], task_id
+        assert set(grouped) == {'1', '2'}
+
+    def test_a_duplicated_id_dedups_within_a_task_but_not_across_tasks(
+        self, tmp_path: Path,
+    ):
+        """``get_by_task``'s ``seen`` set lives for one task's call, so a
+        second file carrying the same id counts once for its own task and
+        still counts for a different task."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-1-1', task_id='1'))
+        (queue.queue_dir / 'esc-1-1-copy.json').write_text(
+            _make_escalation('esc-1-1', task_id='1').to_json(),
+        )
+        (queue.queue_dir / 'esc-1-1-elsewhere.json').write_text(
+            _make_escalation('esc-1-1', task_id='2').to_json(),
+        )
+
+        grouped = queue.get_pending_by_task()
+
+        for task_id in ('1', '2'):
+            assert [e.id for e in grouped[task_id]] == [
+                e.id for e in queue.get_by_task(task_id, status='pending')
+            ] == ['esc-1-1']

@@ -124,7 +124,7 @@ def _render_batch(records: Sequence[sampling.ScoredRecord]) -> list[str]:
     for record in records:
         try:
             digests.append(digest.build_digest(record.path, agent_class_override=record.stratum))
-        except Exception as exc:  # noqa: BLE001 - isolate one bad transcript, keep mining
+        except Exception as exc:  # isolate one bad transcript, keep mining
             logger.warning('census: failed to build digest for %s: %s', record.path, exc)
     return digests
 

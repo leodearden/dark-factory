@@ -3,7 +3,7 @@
 An ``AsyncOpenAI`` / ``AsyncAnthropic`` that is dropped without ``close()`` is
 finalised at an arbitrary later point, where it can resurrect an ``aclose()``
 task onto an unrelated event loop (the mechanism is documented once, at
-tests/_fm_helpers.py::reap_leaked_async_httpx_clients). These tests drive each
+tests/_fm_httpx_leaks.py::reap_leaked_async_httpx_clients). These tests drive each
 owner through its public ``close()`` and assert that nothing it built is left
 open.
 """
@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_helpers import (
+from _fm_httpx_leaks import (
     _leaked_async_httpx_clients,
     reap_leaked_async_httpx_clients,
     track_async_httpx_clients,
@@ -307,10 +307,11 @@ class TestRoutingClientsClose:
         assert async_httpx_clients_built == []
 
     @pytest.mark.asyncio
-    async def test_an_injected_classifier_client_is_owned_and_released(self, mock_config):
+    @pytest.mark.parametrize('owner_cls', [ReadRouter, WriteClassifier])
+    async def test_an_injected_client_is_owned_and_released(self, mock_config, owner_cls):
         client = completion_client('{}')
 
-        await WriteClassifier(mock_config, openai_client=client).close()
+        await owner_cls(mock_config, openai_client=client).close()
 
         client.close.assert_awaited_once()
 

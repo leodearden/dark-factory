@@ -1,5 +1,7 @@
-"""The single-branch gate re-verify runs on the head's own leased host, with
-the lane's own verify handles (task 6278, folding 6344).
+"""The single-branch gate's full re-verify is a dispatch of the rebased head
+(task 8525): it runs with the lane's own verify handles (task 6278, folding
+6344), on whichever host the configured policy picks, while a declared
+history leg still runs on local.
 
 Every scene drives one request through the lane's own queue over a real tmp
 git repo. Main moves from inside the request's first verify, so
@@ -26,15 +28,13 @@ from _merge_lane_fakes import (
     FakeVerifier,
     VerifyScript,
     fails,
-    hangs_until,
     healthy_verify_clock,
     lane_scene_config,
     make_lane,
     merge_through_lane,
     passes,
-    running_lane,
 )
-from _orch_helpers import git_env_with_ceiling, wait_responsive
+from _orch_helpers import git_env_with_ceiling
 from _recording_event_store import _RecordingEventStore
 from df_pytest_isolation import git_redirect_env
 
@@ -42,7 +42,6 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeRequest, QueuedBranch
 from orchestrator.verify import VerifyResult
-from orchestrator.verify_runner import RunnerUnavailable
 
 pytestmark = pytest.mark.asyncio
 
@@ -201,82 +200,36 @@ async def _host_fails(host: _HeadHost) -> VerifyResult:
     )
 
 
-async def _host_unreachable(host: _HeadHost) -> VerifyResult:
-    host.healthy = False
-    raise RunnerUnavailable(f'ssh {host.name} exited 255: connection reset')
-
-
-def _host_unreachable_once(released: asyncio.Event) -> _HostScript:
-    async def script(host: _HeadHost) -> VerifyResult:
-        host.gate_entered.set()
-        await released.wait()
-        return await _host_unreachable(host)
-
-    return script
-
-
-async def _host_hangs(host: _HeadHost) -> VerifyResult:
-    host.gate_entered.set()
-    never: asyncio.Future[VerifyResult] = asyncio.get_running_loop().create_future()
-    return await never
-
-
 class _HeadHost:
     """The remote verify host a head leases, duck-typed to
     ``verify_runner.py::VerifyRunner`` as test_train_verify_host.py::_FakeRemote is.
 
     Not a ``RemoteRunner``, so ``VerifyRunnerPool.dispatch`` calls it with
     ``(merge_sha, spec)`` alone and skips the INV-2 code sync. Each
-    ``run_merge_verify`` call keeps its merge SHA in ``calls``, plays the next
-    of *scripts* (passing once they run out) and records how it ended in
-    ``endings``. ``live`` is set while a call runs, as ``RemoteRunner``'s
-    in-flight id is; ``cancel_verify`` answers *cancel_rc*, and ``cancels``
-    records whether each remote cancel found a call still live to abort.
-    ``clean_probes`` counts clean-probes. An unhealthy host never probes
-    healthy or clean, so the reprobe sweep cannot re-admit it during a test.
+    ``run_merge_verify`` call keeps its merge SHA in ``calls`` and plays the
+    next of *scripts*, passing once they run out.
     """
 
     is_local: ClassVar[bool] = False
 
-    def __init__(self, *scripts: _HostScript, name: str = 'laptop', cancel_rc: int = 0) -> None:
+    def __init__(self, *scripts: _HostScript, name: str = 'laptop') -> None:
         self.name = name
-        self.healthy = True
-        self.cancel_rc = cancel_rc
         self._scripts = collections.deque(scripts)
         self.calls: list[str] = []
-        self.endings: list[str] = []
-        self.cancels: list[bool] = []
-        self.clean_probes = 0
-        self.live = False
-        self.gate_entered = asyncio.Event()
 
     async def health(self) -> bool:
-        return self.healthy
+        return True
 
     async def probe_clean(self) -> bool:
-        self.clean_probes += 1
-        return self.healthy
+        return True
 
     async def cancel_verify(self) -> int:
-        self.cancels.append(self.live)
-        return self.cancel_rc
+        return 0
 
     async def run_merge_verify(self, merge_sha: str, spec: Any) -> VerifyResult:
         self.calls.append(merge_sha)
         script = self._scripts.popleft() if self._scripts else _host_passes
-        self.live = True
-        try:
-            result = await script(self)
-        except asyncio.CancelledError:
-            self.endings.append('cancelled')
-            raise
-        except BaseException:
-            self.endings.append('raised')
-            raise
-        finally:
-            self.live = False
-        self.endings.append('returned')
-        return result
+        return await script(self)
 
 
 def _rows(store: _RecordingEventStore, kind: str, merge_sha: str) -> list[dict[str, Any]]:
@@ -326,7 +279,7 @@ async def test_a_red_gate_reverify_spawns_a_dry_run_investigation(scene: _Scene)
     assert len(verifier.investigations) == 1, verifier.investigations
 
 
-# ─── A remote-lease head gates on the host it already holds ─────────────────
+# ─── A remote-lease head's rebased commit is dispatched by the policy ───────
 
 
 def _moves_main_then_gates(scene: _Scene) -> _HeadHost:
@@ -335,7 +288,9 @@ def _moves_main_then_gates(scene: _Scene) -> _HeadHost:
     )
 
 
-async def test_a_remote_lease_head_gates_on_the_host_it_holds(remote_scene: _Scene) -> None:
+async def test_a_remote_lease_heads_rebased_commit_is_dispatched_by_the_host_policy(
+    remote_scene: _Scene,
+) -> None:
     request = await _single(remote_scene, 'gate')
     host = _moves_main_then_gates(remote_scene)
     verifier = FakeVerifier()
@@ -354,10 +309,13 @@ async def test_a_remote_lease_head_gates_on_the_host_it_holds(remote_scene: _Sce
     assert len(host.calls) == 2, host.calls
     assert host.calls[1] == landed != host.calls[0]
     assert verifier.verify_calls == []
-    assert [row['runner'] for row in _rows(store, 'merge_verify', landed)] == ['laptop']
+    assert [
+        (row['runner'], row['runner_reason'], row['base_relation'])
+        for row in _rows(store, 'merge_verify', landed)
+    ] == [('laptop', 'prefer_remote_free', 'main')]
 
 
-async def test_a_red_gate_on_the_head_host_blocks_without_a_local_rerun(
+async def test_a_red_rebased_head_dispatch_blocks_without_a_local_rerun(
     remote_scene: _Scene,
 ) -> None:
     request = await _single(remote_scene, 'gate')
@@ -384,7 +342,9 @@ async def test_a_red_gate_on_the_head_host_blocks_without_a_local_rerun(
     assert [row['runner'] for row in _rows(store, 'merge_verify', rebased)] == ['laptop']
 
 
-async def test_a_remote_gate_keeps_the_local_cross_check(tmp_path: Path) -> None:
+async def test_a_remote_rebased_head_dispatch_keeps_the_local_cross_check(
+    tmp_path: Path,
+) -> None:
     scene = _remote_scene(tmp_path, verify_cross_check_remote_green=True)
     request = await _single(scene, 'gate')
     host = _moves_main_then_gates(scene)
@@ -455,121 +415,7 @@ async def test_a_same_tree_history_leg_stays_local_on_a_remote_lease_head(
     assert gate['reason'] == 'same_tree_history_leg', gate
     assert host.calls == [gate['verified_merge_sha']]
     assert leg_head.read_text().strip() == landed
-    assert [row['runner'] for row in _rows(store, 'merge_verify', landed)] == ['history-leg']
-
-
-# ─── An unreachable head host moves the gate to local ───────────────────────
-
-
-async def test_the_gate_falls_back_to_local_when_the_head_host_is_unreachable(
-    remote_scene: _Scene,
-) -> None:
-    """A transport fault at gate time never strands or blocks the item: the
-    host is benched for reprobe and the same gate re-verify re-runs on local,
-    its restart-drain deadline measured from the local re-run's start."""
-    request = await _single(remote_scene, 'gate')
-    unreachable_now = asyncio.Event()
-    host = _HeadHost(
-        _host_moves_main_then_passes(functools.partial(_land_drift, remote_scene.repo)),
-        _host_unreachable_once(unreachable_now),
-    )
-    release_local = asyncio.Event()
-    verifier = _SamplesHeads(sequence=[hangs_until(release_local)])
-    clock = healthy_verify_clock()
-    store = _RecordingEventStore()
-    queue: asyncio.Queue[Any] = asyncio.Queue()
-    lane = make_lane(
-        remote_scene.git_ops, queue,
-        verifier=verifier, clock=clock, event_store=store, remote_runners=[host],
-    )
-
-    async with running_lane(lane) as run:
-        await queue.put(request)
-        await wait_responsive(host.gate_entered.wait(), label='gate re-verify under way on the head host')
-        (remote_gate,) = lane.snapshot()['restart_drain']['verifies_in_flight']
-        clock.time += 5_000.0
-        unreachable_now.set()
-        await wait_responsive(verifier.await_entry(1), label='gate re-verify re-run on local')
-        (local_gate,) = lane.snapshot()['restart_drain']['verifies_in_flight']
-        release_local.set()
-        outcome = await run.outcome(request)
-
-    assert (remote_gate['kind'], local_gate['kind']) == ('gate_reverify', 'gate_reverify')
-    assert local_gate['started_ts'] >= remote_gate['started_ts'] + 5_000.0
-    assert outcome.status == 'done', outcome
-    landed = remote_scene.main_sha()
-    on_main = _git(remote_scene.repo, 'ls-tree', '--name-only', 'main').splitlines()
-    assert {'drift.txt', 'gate.txt'} <= set(on_main), on_main
-    assert verifier.heads == [landed]
-    assert [row['runner'] for row in _rows(store, 'merge_verify', landed)] == ['local']
-    (laptop,) = [row for row in lane.snapshot()['hosts'] if row['name'] == host.name]
-    assert laptop['quarantined'] is True, laptop
-    assert 'exited 255' in laptop['reason'], laptop
-
-
-# ─── A lane cancelled mid remote gate aborts the remote verify ──────────────
-
-
-@dataclasses.dataclass(frozen=True)
-class _Unwound:
-    """The head host's census row, and whether its verify was still live,
-    read the moment a cancelled lane's ``run()`` finished."""
-
-    host: dict[str, Any]
-    verify_live: bool
-
-
-async def _abort_a_gate_verifying_on(scene: _Scene, *, cancel_rc: int = 0) -> tuple[_HeadHost, _Unwound]:
-    """Cancel the lane's ``run()`` while a head's gate re-verify runs on the
-    remote it holds, as a lane crash or a hard shutdown does."""
-    request = await _single(scene, 'gate')
-    host = _HeadHost(
-        _host_moves_main_then_passes(functools.partial(_land_drift, scene.repo)),
-        _host_hangs,
-        cancel_rc=cancel_rc,
-    )
-    queue: asyncio.Queue[Any] = asyncio.Queue()
-    lane = make_lane(
-        scene.git_ops, queue,
-        verifier=FakeVerifier(), clock=healthy_verify_clock(), remote_runners=[host],
-    )
-
-    with pytest.raises(asyncio.CancelledError):
-        async with running_lane(lane) as run:
-            await queue.put(request)
-            await wait_responsive(host.gate_entered.wait(), label='gate re-verify under way on the head host')
-            run.task.cancel()
-            await wait_responsive(asyncio.wait({run.task}), label='lane run() unwound')
-            (row,) = [census for census in lane.snapshot()['hosts'] if census['name'] == host.name]
-            unwound = _Unwound(host=row, verify_live=host.live)
-
-    return host, unwound
-
-
-async def test_cancelling_the_lane_mid_remote_gate_aborts_the_remote_verify_while_live(
-    remote_scene: _Scene,
-) -> None:
-    """The cancelled verifier loop pre-empts the parked gate, so it must abort
-    the remote verify through the worker's teardown chokepoint while it is still
-    live; otherwise the verify-merge is orphaned on the host (task 1757)."""
-    host, unwound = await _abort_a_gate_verifying_on(remote_scene)
-
-    assert host.cancels[:1] == [True], (
-        'the abort must precede the local cancel, or the remote verify-merge '
-        f'process is orphaned; cancels found live: {host.cancels}'
-    )
-    assert unwound.verify_live is False
-    assert host.endings[1] == 'cancelled', host.endings
-    assert (unwound.host['slot_state'], unwound.host['quarantined']) == ('free', False)
-
-
-async def test_a_refused_cancel_parks_the_aborted_gates_remote_until_it_probes_clean(
-    remote_scene: _Scene,
-) -> None:
-    """As for an aborted train: a remote that refuses the cancel may still be
-    running the verify, so its slot is parked and freed only once the host
-    probes clean."""
-    host, unwound = await _abort_a_gate_verifying_on(remote_scene, cancel_rc=1)
-
-    assert host.clean_probes == 1
-    assert (unwound.host['slot_state'], unwound.host['quarantined']) == ('free', False)
+    assert [
+        (row['runner'], row['runner_reason'])
+        for row in _rows(store, 'merge_verify', landed)
+    ] == [('history-leg', 'local_only_rule')]

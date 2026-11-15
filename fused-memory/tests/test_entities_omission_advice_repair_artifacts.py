@@ -30,9 +30,12 @@ import uuid
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_resolution import resolve_referents
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ARTIFACT_DIR = REPO_ROOT / 'docs' / 'entities-omission-advice-repair'

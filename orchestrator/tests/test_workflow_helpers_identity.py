@@ -28,8 +28,8 @@ from __future__ import annotations
 
 def test_merge_provenance_factories_identity() -> None:
     """Anti-duplication guard: the producer re-exports the SAME objects as the shared module."""
-    import test_workflow_merge_provenance as mp  # noqa: PLC0415
-    from _workflow_helpers import _bind_landed_row, _Fixture, _make  # noqa: PLC0415
+    import test_workflow_merge_provenance as mp
+    from _workflow_helpers import _bind_landed_row, _Fixture, _make
 
     assert mp._make is _make
     assert mp._bind_landed_row is _bind_landed_row
@@ -38,16 +38,16 @@ def test_merge_provenance_factories_identity() -> None:
 
 def test_warmlane_workflow_factory_identity() -> None:
     """Anti-duplication guard: the producer re-imports the SAME object under its old local name."""
-    import test_workflow_warm_lane_requeue as wr  # noqa: PLC0415
-    from _workflow_helpers import _make_warmlane_workflow  # noqa: PLC0415
+    import test_workflow_warm_lane_requeue as wr
+    from _workflow_helpers import _make_warmlane_workflow
 
     assert wr._make_workflow is _make_warmlane_workflow
 
 
 def test_harness_factories_identity() -> None:
     """Anti-duplication guard: the producer re-exports the SAME objects as the shared module."""
-    import test_harness_warm_lane_wiring as hw  # noqa: PLC0415
-    from _workflow_helpers import _build_harness, _init_git_repo  # noqa: PLC0415
+    import test_harness_warm_lane_wiring as hw
+    from _workflow_helpers import _build_harness, _init_git_repo
 
     assert hw._build_harness is _build_harness
     assert hw._init_git_repo is _init_git_repo
@@ -62,9 +62,9 @@ def test_e2e_factories_identity() -> None:
     module-attribute access (`_workflow_helpers._derive_meta_root_like_production`),
     which is inert.
     """
-    import _workflow_helpers  # noqa: PLC0415
-    import test_workflow_e2e as e2e  # noqa: PLC0415
-    from _workflow_helpers import (  # noqa: PLC0415
+    import _workflow_helpers
+    import test_workflow_e2e as e2e
+    from _workflow_helpers import (
         PLAN,
         AgentStub,
         _build_workflow,
@@ -89,10 +89,10 @@ def test_e2e_factories_identity() -> None:
 
 def test_transcript_archival_factories_identity() -> None:
     """Anti-duplication guard: the producers re-export the SAME objects as the shared module."""
-    import test_transcript_archival_boundary_gate as bg  # noqa: PLC0415
-    import test_transcript_archive_backstop as bs  # noqa: PLC0415
-    import test_transcript_archive_producer_hook as ph  # noqa: PLC0415
-    from _workflow_helpers import (  # noqa: PLC0415
+    import test_transcript_archival_boundary_gate as bg
+    import test_transcript_archive_backstop as bs
+    import test_transcript_archive_producer_hook as ph
+    from _workflow_helpers import (
         ENC,
         _archive_root,
         _archived,

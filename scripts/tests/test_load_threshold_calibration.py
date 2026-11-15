@@ -33,6 +33,9 @@ import _checkout as _checkout
 import pytest
 from sampler.metrics import ARM_METRICS, TICK_CLOCK, MetricSpec, SampleKey
 from sampler.store import SCHEMA, LoadSampleStore
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'load-threshold-calibration.py'

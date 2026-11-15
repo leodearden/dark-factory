@@ -191,7 +191,7 @@ async def test_commit_not_on_main_blocks_without_l1(tmp_path: Path):
 async def test_missing_commit_blocks(tmp_path: Path):
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
     # Write artifact directly without commit field.
-    (f.artifacts.root / 'already_done.json').write_text(
+    f.artifacts.artifact_path('already_done.json').write_text(
         '{"evidence": "I forgot the commit"}\n'
     )
     mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
@@ -868,7 +868,7 @@ class _Refusal:
 
 def _refusal_malformed_report(tmp_path: Path, _mp: pytest.MonkeyPatch) -> _Fixture:
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
-    (f.artifacts.root / 'already_done.json').write_text('{"evidence": "no commit"}\n')
+    f.artifacts.artifact_path('already_done.json').write_text('{"evidence": "no commit"}\n')
     return f
 
 
@@ -876,7 +876,7 @@ def _refusal_malformed_unactionable_task(
     tmp_path: Path, _mp: pytest.MonkeyPatch,
 ) -> _Fixture:
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
-    (f.artifacts.root / 'unactionable_task.json').write_text('{"evidence": "no reason"}\n')
+    f.artifacts.artifact_path('unactionable_task.json').write_text('{"evidence": "no reason"}\n')
     return f
 
 
@@ -884,7 +884,7 @@ def _refusal_malformed_false_premise(
     tmp_path: Path, _mp: pytest.MonkeyPatch,
 ) -> _Fixture:
     f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
-    (f.artifacts.root / 'false_premise.json').write_text('{"evidence": "no premise"}\n')
+    f.artifacts.artifact_path('false_premise.json').write_text('{"evidence": "no premise"}\n')
     return f
 
 

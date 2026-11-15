@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _curator_helpers import (
     agent_result,
-    empty_corpus,
     escalator_double,
     make_config,
     pool_with_ids,
@@ -64,10 +63,10 @@ def _combine_into_42() -> AgentResult:
 async def _curate(
     curator: TaskCurator, bundle: PreparedCandidate, project_id: str = 'p',
 ) -> CuratorDecision:
-    return await asyncio.wait_for(
-        curator.curate(bundle.candidate, project_id, '/x', prepared=bundle),
-        DEADLINE_SECS,
+    [decision] = await asyncio.wait_for(
+        curator.curate_prepared([bundle], project_id, '/x'), DEADLINE_SECS,
     )
+    return decision
 
 
 async def _curate_unprepared(curator: TaskCurator, bundle: PreparedCandidate) -> CuratorDecision:
@@ -200,7 +199,7 @@ async def _curate_batch(
     curator: TaskCurator, bundles: list[PreparedCandidate], project_id: str = 'p',
 ) -> list[CuratorDecision]:
     return await asyncio.wait_for(
-        curator.curate_batch_prepared(bundles, project_id, '/x'), DEADLINE_SECS,
+        curator.curate_prepared(bundles, project_id, '/x'), DEADLINE_SECS,
     )
 
 
@@ -278,10 +277,11 @@ class TestBatchDefersOnCuratorOutage:
         invoke = AsyncMock(side_effect=[batch_failed, _max_turns(), _max_turns()])
         curator = _curator(invoke, escalator_double())
 
-        with patch.object(curator, '_build_corpus', side_effect=empty_corpus):
-            decisions = await _curate_batch(curator, [prepared('Alpha'), prepared('Beta')])
+        decisions = await _curate_batch(curator, [prepared('Alpha'), prepared('Beta')])
 
         assert [(d.action, d.defer_reason) for d in decisions] == [
             ('defer', DeferReason.LLM_FAILED), ('defer', DeferReason.LLM_FAILED),
         ]
-        assert invoke.await_count == 3
+        assert [call.kwargs['role'] for call in invoke.await_args_list] == [
+            'task_curator_batch', 'task_curator', 'task_curator',
+        ]

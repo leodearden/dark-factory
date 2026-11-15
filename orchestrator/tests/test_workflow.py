@@ -58,6 +58,7 @@ from orchestrator.workflow import (
     WorkflowState,
     _meta_root_for_worktree,
 )
+from orchestrator.workflow_types import PublishedStewardOutcome
 
 
 def _make_workflow(*, tmp_path: Path, task_id: str = '2656') -> TaskWorkflow:
@@ -162,7 +163,7 @@ def _stub_architect(
     """
     invocations: list[object] = []
 
-    async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
+    async def fake_invoke(role, prompt, cwd, **_kw):
         invocations.append(role)
         assert wf.artifacts is not None
         wf.artifacts.write_plan({'files': list(files)})
@@ -274,7 +275,7 @@ async def _drive_merge_submission(
         check_seq,
     )
 
-    async def fake_run(cmd, **kwargs):  # noqa: ARG001
+    async def fake_run(cmd, **kwargs):
         return 0, 'fake_head_sha\n', ''
     monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -504,7 +505,7 @@ class TestSubmitToMergeQueuePlanTightening:
             check_seq,
         )
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -546,7 +547,7 @@ class TestSubmitToMergeQueuePlanTightening:
             check_seq,
         )
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -610,11 +611,11 @@ class TestSubmitToMergeQueueCrossRepo:
         ``plan_files_not_touched`` escalation (the RED behaviour), giving a
         clean assertion failure rather than an ``await MagicMock`` crash.
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        async def fake_check(*a, **k):  # noqa: ARG001
+        async def fake_check(*a, **k):
             return PlanFilesTouchedResult(not_touched=['__unreached__'])
         monkeypatch.setattr(
             'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
@@ -709,7 +710,7 @@ class TestSubmitToMergeQueueStalePathMessage:
             check_seq,
         )
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -1009,7 +1010,7 @@ class TestRunMergeDeferredGuard:
         submitting to the merge queue.  The execute/verify/review pipeline
         still runs (stubbed via _execute_verify_review_loop).
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -1033,7 +1034,7 @@ class TestRunMergeDeferredGuard:
         """A task without metadata.train must NOT call _enter_merge_deferred and
         must proceed to _submit_to_merge_queue — the pre-γ₁ merge path unchanged.
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -1244,7 +1245,7 @@ class TestMergePhaseGraceStampLifecycle:
         window the self-redeploy must not cancel)."""
         wf = _make_workflow(tmp_path=tmp_path, task_id='2656')
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -2189,7 +2190,7 @@ class TestHandleSoftCancelOutcome:
         assignment.task = {'id': '99', 'title': 'T', 'description': 'd'}
         assignment.modules = []
 
-        from _orch_helpers import pydantic_spec  # noqa: PLC0415
+        from _orch_helpers import pydantic_spec
 
         _spec = pydantic_spec(OrchestratorConfig)
         config = MagicMock(spec_set=_spec)
@@ -2614,7 +2615,7 @@ class _RecordingFakeSteward:
 
     instances: list[_RecordingFakeSteward] = []
 
-    def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+    def __init__(self, wt_path, cfg_dir):
         self.outcome_channel = None
         self.wip_probe = None
         type(self).instances.append(self)
@@ -2674,12 +2675,12 @@ class TestAwaitStewardCompletionReturnsOutcome:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardResolved(resolution_text='fixed it')
 
@@ -2693,12 +2694,12 @@ class TestAwaitStewardCompletionReturnsOutcome:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value=status)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardTerminalDecision(new_status=TaskStatus(status))
 
@@ -2715,7 +2716,7 @@ class TestAwaitStewardCompletionReturnsOutcome:
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf._worktree_has_wip_commits = AsyncMock(return_value=wip)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardInterrupted('timeout', wip_commits_present=wip)
 
@@ -2752,17 +2753,17 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
-        wf._steward_outcome_channel.put_nowait(
-            StewardReescalatedL1(esc_id='L1'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardResolved(resolution_text='fixed it'),
+        ))
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2', StewardReescalatedL1(esc_id='L1'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=False)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
         assert wf._steward_outcome_channel.empty(), (
@@ -2777,9 +2778,9 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
@@ -2787,7 +2788,7 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
             return_value=[MagicMock(id='L1')],
         )
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
         wf.escalation_queue.get_by_task.assert_called_once_with(
@@ -2802,14 +2803,14 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=False)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardResolved(resolution_text='fixed it')
 
@@ -2822,9 +2823,9 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardInterrupted('attempt_cap', wip_commits_present=True),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardInterrupted('attempt_cap', wip_commits_present=True),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
@@ -2832,7 +2833,7 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
             return_value=[MagicMock(id='L1')],
         )
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardReescalatedL1(esc_id='L1')
 
@@ -2844,14 +2845,14 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf = _make_workflow(tmp_path=tmp_path)
         wf.config.steward_completion_timeout = 5.0
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='done')
         wf.escalation_queue = MagicMock()
         wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardTerminalDecision(new_status=TaskStatus.DONE)
 

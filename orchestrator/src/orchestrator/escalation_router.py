@@ -5,7 +5,9 @@ pure and lives in escalation/src/escalation/disposition.py::route_info_l0; this
 module performs what a decision means: queue writes, curator tickets, the D9
 hold a ticket leaves on its record, and the per-sweep aggregates.  Its three
 callers (the workflow exit finalizer, the orphan reaper and the startup
-amnesty) only wire it.
+amnesty) only wire it.  A fourth consumer, the reviewer leg (D2), is applied
+here too: the reviewer's verdict dispositions its own task's notes mid-run,
+at no exit, through ``apply_reviewer_disposition``.
 """
 
 from __future__ import annotations
@@ -14,13 +16,15 @@ import hashlib
 import json
 import logging
 from collections import Counter
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal, Protocol, assert_never
+from typing import Literal, Protocol, TypeVar, assert_never
 
+from escalation.amendments import amendment_room
 from escalation.categories import EscalationCategory
-from escalation.classify import INFO_L0_MECHANICAL_ROLES
+from escalation.classify import INFO_L0_MECHANICAL_ROLES, info_l0_mechanical_class, is_harness_filed
 from escalation.disposition import (
     Addressed,
     ConvertViaCurator,
@@ -31,11 +35,12 @@ from escalation.disposition import (
     ObservationConsumed,
     PromoteReason,
     PromoteWithHint,
+    ReviewerDisposition,
     StatusInfo,
     route_info_l0,
 )
 from escalation.models import Escalation, normalised_severity
-from escalation.queue import EscalationQueue, ResolveOutcome, amendment_room
+from escalation.queue import EscalationQueue, ResolveOutcome
 from shared.eval_lane import eval_lane_provenance
 from shared.mcp_envelope import parse_tool_result
 from shared.task_submit import (
@@ -46,11 +51,13 @@ from shared.task_submit import (
 )
 
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.review_payload import NoteDisposition
 from orchestrator.workflow_types import WorkflowOutcome
 
 logger = logging.getLogger(__name__)
 
 ROUTER_ID = 'info-l0-router'
+REVIEWER_LEG_ID = 'reviewer-comprehensive/workflow'
 AGGREGATE_ROLE = 'harness-info-l0-router'
 FALLBACK_ACTION = 'convert_to_task'
 AGGREGATE_CATEGORY = 'risk_identified'
@@ -90,6 +97,48 @@ def exit_kind_for(
     return _EXIT_KIND_BY_OUTCOME[outcome]
 
 
+_Stamped = TypeVar('_Stamped')
+
+
+def _stamp_note(prefix: str, fields: Mapping[str, str]) -> str:
+    return prefix + json.dumps(dict(fields))
+
+
+def _read_stamp(
+    record: Escalation, *, owner: str, prefix: str, kind: str,
+    parse: Callable[[Mapping[str, object]], _Stamped],
+) -> _Stamped | None:
+    """What *owner* stamped into *record*'s triage note under *prefix*, or None.
+
+    The one parser of ``_stamp_note``: a note *owner* stamped that does not
+    parse logs a WARNING and reads as unstamped.
+    """
+    if record.triaged_by != owner:
+        return None
+    note = record.triage_note or ''
+    try:
+        if not note.startswith(prefix):
+            raise ValueError(f'note does not carry the {kind} prefix')
+        fields = json.loads(note.removeprefix(prefix))
+        if not isinstance(fields, dict):
+            raise ValueError(f'{kind} fields are not an object')
+        return parse(fields)
+    except (ValueError, TypeError, KeyError) as exc:
+        logger.warning(
+            'info-l0-router: %s is stamped by %s but its triage note is not a %s (%s); '
+            'it is routed as if unstamped. note=%r',
+            record.id, owner, kind, exc, note[:200],
+        )
+        return None
+
+
+def _string_field(fields: Mapping[str, object], name: str) -> str:
+    value = fields[name]
+    if not isinstance(value, str):
+        raise ValueError(f'{name} is not a string')
+    return value
+
+
 @dataclass(frozen=True)
 class RouterHold:
     """A curator ticket filed for a record that stays pending until the ticket resolves (D9)."""
@@ -102,32 +151,64 @@ _HOLD_PREFIX = 'info-l0-router hold: '
 
 
 def hold_note(ticket: str, filed_at: datetime) -> str:
-    return _HOLD_PREFIX + json.dumps({'ticket': ticket, 'filed_at': filed_at.isoformat()})
+    return _stamp_note(_HOLD_PREFIX, {'ticket': ticket, 'filed_at': filed_at.isoformat()})
 
 
 def read_hold(record: Escalation) -> RouterHold | None:
-    """The router's hold on *record*, or None; the only parser of ``hold_note``."""
-    if record.triaged_by != ROUTER_ID:
-        return None
-    note = record.triage_note or ''
-    try:
-        if not note.startswith(_HOLD_PREFIX):
-            raise ValueError('note does not carry the hold prefix')
-        fields = json.loads(note.removeprefix(_HOLD_PREFIX))
-        ticket, filed_at = fields['ticket'], fields['filed_at']
-        if not isinstance(ticket, str) or not isinstance(filed_at, str):
-            raise ValueError('hold fields are not strings')
-        filed = datetime.fromisoformat(filed_at)
-        if filed.tzinfo is None:
-            raise ValueError('hold filed_at carries no timezone')
-        return RouterHold(ticket, filed)
-    except (ValueError, TypeError, KeyError) as exc:
-        logger.warning(
-            'info-l0-router: %s is stamped by the router but its triage note is not a '
-            'router hold (%s); it will be routed afresh. note=%r',
-            record.id, exc, note[:200],
-        )
-        return None
+    """The router's hold on *record*, or None; the only reader of ``hold_note``."""
+    return _read_stamp(
+        record, owner=ROUTER_ID, prefix=_HOLD_PREFIX, kind='router hold', parse=_hold_from,
+    )
+
+
+def _hold_from(fields: Mapping[str, object]) -> RouterHold:
+    filed = datetime.fromisoformat(_string_field(fields, 'filed_at'))
+    if filed.tzinfo is None:
+        raise ValueError('hold filed_at carries no timezone')
+    return RouterHold(_string_field(fields, 'ticket'), filed)
+
+
+@dataclass(frozen=True)
+class ReviewerMark:
+    """The reviewer's standing verdict on a note it left pending, and its reason (D2)."""
+
+    disposition: ReviewerDisposition
+    rationale: str
+
+
+_REVIEWER_MARK_PREFIX = 'reviewer verdict: '
+
+
+def reviewer_mark_note(mark: ReviewerMark) -> str:
+    return _stamp_note(
+        _REVIEWER_MARK_PREFIX, {'disposition': str(mark.disposition), 'rationale': mark.rationale},
+    )
+
+
+def read_reviewer_mark(record: Escalation) -> ReviewerMark | None:
+    """The reviewer's mark on *record*, or None; the only reader of ``reviewer_mark_note``."""
+    return _read_stamp(
+        record, owner=REVIEWER_LEG_ID, prefix=_REVIEWER_MARK_PREFIX, kind='reviewer mark',
+        parse=_reviewer_mark_from,
+    )
+
+
+def _reviewer_mark_from(fields: Mapping[str, object]) -> ReviewerMark:
+    return ReviewerMark(
+        ReviewerDisposition(_string_field(fields, 'disposition')),
+        _string_field(fields, 'rationale'),
+    )
+
+
+def _carrying_rationale(decided: Disposition, mark: ReviewerMark | None) -> Disposition:
+    """*decided*, with the reviewer's reason for a marked note handed to the curator too."""
+    if mark is None or not isinstance(decided, ConvertViaCurator):
+        return decided
+    candidate = decided.payload
+    return ConvertViaCurator(replace(
+        candidate,
+        description=f'{candidate.description}\n\nReviewer rationale ({REVIEWER_LEG_ID}): {mark.rationale}',
+    ))
 
 
 @dataclass(frozen=True)
@@ -207,7 +288,7 @@ class RouteContext:
 
 
 class Outcome(StrEnum):
-    """What ``apply`` did to one record."""
+    """What ``apply`` or ``apply_reviewer_disposition`` did to one record."""
 
     CLOSED = 'closed'
     ALREADY_TERMINAL = 'already-terminal'
@@ -215,6 +296,7 @@ class Outcome(StrEnum):
     PROMOTED = 'promoted'
     DEFERRED = 'defer'
     ROUTER_ERROR = 'router-error'
+    REJECTED = 'rejected_disposition'
 
 
 DISPATCH_TIMEOUT_SECS = 15.0
@@ -287,7 +369,7 @@ async def _apply(
             },
         )
         applied = _recover(action, record, ports, context)
-    _emit(applied, record, ports, context)
+    _emit(applied, record.task_id, ports, by=context.by, exit_kind=context.exit_kind)
     return applied
 
 
@@ -320,13 +402,37 @@ def _close(
     record: Escalation, resolution_class: str, note: str, ports: RouterPorts,
     context: RouteContext,
 ) -> Applied:
-    ports.queue.resolve(
-        record.id,
-        f'{resolution_class} — closed by the info-L0 router ({context.by}, exit '
-        f'{context.exit_kind}){note}',
-        dismiss=True, resolved_by=ROUTER_ID, resolution_class=resolution_class,
+    return _write_close(
+        ports, record.id, resolution_class,
+        resolution=(
+            f'{resolution_class} — closed by the info-L0 router ({context.by}, exit '
+            f'{context.exit_kind}){note}'
+        ),
+        resolved_by=ROUTER_ID,
     )
-    return Applied(record.id, Outcome.CLOSED, resolution_class=resolution_class)
+
+
+def _write_close(
+    ports: RouterPorts, record_id: str, resolution_class: str, *, resolution: str,
+    resolved_by: str,
+) -> Applied:
+    """Dismiss *record_id*; ALREADY_TERMINAL when another writer closed it first."""
+    closure = _resolve_outcome()
+    ports.queue.resolve(
+        record_id, resolution,
+        dismiss=True, resolved_by=resolved_by, resolution_class=resolution_class,
+        outcome=closure,
+    )
+    if not closure['applied']:
+        return Applied(record_id, Outcome.ALREADY_TERMINAL)
+    return Applied(record_id, Outcome.CLOSED, resolution_class=resolution_class)
+
+
+def _resolve_outcome() -> ResolveOutcome:
+    return {
+        'applied': False, 'prior_status': None, 'prior_resolved_by': None,
+        'late_resolution_captured': False, 'resolution_class_corrected': None,
+    }
 
 
 async def _convert(
@@ -430,10 +536,7 @@ def _promote(
         level=1,
         filing_claimant_run_id=ports.filing_claimant_run_id,
     )
-    dismissal: ResolveOutcome = {
-        'applied': False, 'prior_status': None, 'prior_resolved_by': None,
-        'late_resolution_captured': False, 'resolution_class_corrected': None,
-    }
+    dismissal = _resolve_outcome()
     ports.queue.resolve(
         record.id,
         f'Promoted by the info-L0 router ({context.by}) to {l1.id}: {reason}',
@@ -499,27 +602,136 @@ def _recover(
         return Applied(record.id, Outcome.ROUTER_ERROR, reason=str(PromoteReason.ROUTER_ERROR))
 
 
-def _emit(applied: Applied, record: Escalation, ports: RouterPorts, context: RouteContext) -> None:
+def _emit(
+    applied: Applied, task_id: str, ports: RouterPorts, *, by: str, exit_kind: ExitKind | None,
+) -> None:
     if ports.event_store is None:
         return
     try:
         ports.event_store.emit(
             EventType.info_l0_dispositioned,
-            task_id=record.task_id,
+            task_id=task_id,
             data={
-                'escalation_id': record.id,
+                'escalation_id': applied.escalation_id,
                 'class': applied.event_class,
-                'by': context.by,
-                'exit_kind': str(context.exit_kind),
+                'by': by,
+                'exit_kind': None if exit_kind is None else str(exit_kind),
                 'ticket': applied.ticket,
-                'task_id': record.task_id,
+                'task_id': task_id,
                 'decided_at': datetime.now(UTC).isoformat(),
                 'reason': applied.reason,
                 'promoted_to': applied.promoted_to,
             },
         )
     except Exception:
-        logger.warning('info-l0-router: event emit failed for %s', record.id, exc_info=True)
+        logger.warning(
+            'info-l0-router: event emit failed for %s', applied.escalation_id, exc_info=True,
+        )
+
+
+def reviewer_note_refusal(record: Escalation | None, *, task_id: str, enabled: bool) -> str | None:
+    """Why the reviewer of *task_id* may not see or disposition *record*, or None when it may.
+
+    The one eligibility rule for the reviewer leg (D2): the briefing lists
+    exactly the notes it admits, and a disposition of any other is rejected.
+    D2 admits agent-filed notes only, so the harness namespace
+    (escalation/classify.py::is_harness_filed) is refused.
+    """
+    if record is None:
+        return 'no such escalation'
+    if record.task_id != task_id:
+        return f'filed for task {record.task_id!r}, not the reviewed task {task_id!r}'
+    if record.status != 'pending':
+        return f'status is {record.status!r}, not pending'
+    if not router_owns(record, enabled=enabled):
+        return (
+            f'not an info L0 the router owns (severity {record.severity!r}, level '
+            f'{record.level}, router {"enabled" if enabled else "disabled"}, eval lane '
+            f'{eval_lane_provenance(record.task_id, record.worktree)!r})'
+        )
+    mechanical_class = info_l0_mechanical_class(record)
+    if mechanical_class is not None:
+        return f'a mechanical {mechanical_class!r} notice, which the exit router closes'
+    if is_harness_filed(record):
+        return f'filed by the harness under role {record.agent_role!r}, not by an agent'
+    hold = read_hold(record)
+    if hold is not None:
+        return f'held by the router on curator ticket {hold.ticket}'
+    return None
+
+
+def reviewer_notes(queue: EscalationQueue, *, task_id: str, enabled: bool) -> list[Escalation]:
+    """The open info notes the reviewer of *task_id* is shown and may disposition."""
+    return [
+        record for record in queue.get_by_task(task_id, status='pending', level=0)
+        if reviewer_note_refusal(record, task_id=task_id, enabled=enabled) is None
+    ]
+
+
+def apply_reviewer_disposition(
+    note: NoteDisposition, ports: RouterPorts, *, task_id: str, enabled: bool,
+) -> Applied:
+    """Perform the reviewer's verdict on one of its task's notes (D2).  Never raises.
+
+    A close dismisses the note; ``work`` leaves it pending and stamps the
+    reviewer mark (``read_reviewer_mark``) that the exit router honours; every
+    other path writes nothing, and the exit router remains the backstop.
+    """
+    try:
+        applied = _apply_reviewer(note, ports, task_id=task_id, enabled=enabled)
+    except Exception as exc:
+        logger.exception(
+            'info-l0-router: applying the reviewer disposition %s to %s failed (task %s); '
+            'it stays pending for the exit router',
+            note.disposition, note.escalation_id, task_id,
+            extra={
+                'escalation_id': note.escalation_id, 'disposition': str(note.disposition),
+                'by': REVIEWER_LEG_ID,
+            },
+        )
+        applied = Applied(
+            note.escalation_id, Outcome.ROUTER_ERROR, reason=f'{type(exc).__name__}: {exc}',
+        )
+    _emit(applied, task_id, ports, by=REVIEWER_LEG_ID, exit_kind=None)
+    return applied
+
+
+def _apply_reviewer(
+    note: NoteDisposition, ports: RouterPorts, *, task_id: str, enabled: bool,
+) -> Applied:
+    refusal = reviewer_note_refusal(
+        ports.queue.get(note.escalation_id), task_id=task_id, enabled=enabled,
+    )
+    if refusal is not None:
+        logger.warning(
+            'info-l0-router: rejected the reviewer disposition %s of %s (task %s): %s',
+            note.disposition, note.escalation_id, task_id, refusal,
+            extra={
+                'escalation_id': note.escalation_id, 'disposition': str(note.disposition),
+                'by': REVIEWER_LEG_ID, 'reason': refusal,
+            },
+        )
+        return Applied(note.escalation_id, Outcome.REJECTED, reason=refusal)
+    match note.disposition:
+        case ReviewerDisposition.ADDRESSED:
+            resolution_class = Addressed.resolution_class
+        case ReviewerDisposition.NO_ACTION:
+            resolution_class = ObservationConsumed.resolution_class
+        case ReviewerDisposition.WORK:
+            marked = ports.queue.stamp_triage(
+                note.escalation_id, triaged_by=REVIEWER_LEG_ID,
+                triage_note=reviewer_mark_note(ReviewerMark(note.disposition, note.rationale)),
+            )
+            if marked is None:
+                return Applied(note.escalation_id, Outcome.ALREADY_TERMINAL)
+            return Applied(note.escalation_id, Outcome.DEFERRED, reason=str(note.disposition))
+        case _:
+            assert_never(note.disposition)
+    return _write_close(
+        ports, note.escalation_id, resolution_class,
+        resolution=f'{resolution_class} — dispositioned by the reviewer: {note.rationale}',
+        resolved_by=REVIEWER_LEG_ID,
+    )
 
 
 class InfoL0Sweep:
@@ -547,11 +759,13 @@ class InfoL0Sweep:
         current = self._ports.queue.get(record.id)
         if current is None or current.status != 'pending' or read_hold(current) is not None:
             return None
+        mark = read_reviewer_mark(current)
         try:
-            decided = route_info_l0(
+            decided = _carrying_rationale(route_info_l0(
                 current, task_status=task_status, exit_kind=exit_kind,
                 mechanical_roles=INFO_L0_MECHANICAL_ROLES,
-            )
+                reviewer_disposition=None if mark is None else mark.disposition,
+            ), mark)
         except Exception:
             logger.exception('info-l0-router: deciding %s failed (by=%s)', current.id, self._by)
             decided = PromoteWithHint(PromoteReason.ROUTER_ERROR)

@@ -22,6 +22,9 @@ from legibility import codebook as mod
 from legibility import coder, disposition, invariants, verdict
 from legibility_task_store_fake import FakeTaskStore
 from shared.finding_key import finding_key
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -604,7 +607,7 @@ def test_merge_different_candidate_same_day_increments_id():
 
 def _codebook_with_adjudicated_candidate(disposition: str) -> dict:
     """A v2 codebook carrying exactly one already-adjudicated candidate —
-    the shape `census.reject_candidate`/`promote_candidate` leave behind."""
+    the shape `codebook_lifecycle.reject_candidate`/`promote_candidate` leave behind."""
     codebook = _codebook_with_entry_a()
     codebook["candidates"] = [
         {
@@ -665,12 +668,12 @@ def test_merge_does_not_duplicate_promoted_candidate():
     assert candidate["sightings"][1]["session"] == "sess-new"
     assert merge.counts.candidate_disposition_conflicts == 1
     assert merge.counts.candidates_applied == 0
-    assert mod.validate(merge.codebook) == []
+    assert mod.validate(merge.codebook) == mod.validate(codebook) != []
 
 
 def test_merge_routes_promoted_recurrence_to_its_entry():
     """A promoted candidate's `sightings` list is a DEAD field for new
-    signal: `census.promote_candidate` deep-copies it into the new entry
+    signal: `codebook_lifecycle.promote_candidate` deep-copies it into the new entry
     once, at promotion time, and nothing re-reads it afterwards (the matrix
     path and the codebook index both read ENTRY sightings). So a recurrence
     of a promoted title must land on the entry named by `promoted_to` and
@@ -735,7 +738,7 @@ def test_merge_promoted_with_dangling_promoted_to_falls_back():
     assert candidate["sightings"][1]["session"] == "sess-new"
     assert merge.counts.matched == 0
     assert merge.counts.candidate_disposition_conflicts == 1
-    assert mod.validate(merge.codebook) == []
+    assert mod.validate(merge.codebook) == mod.validate(codebook) != []
 
 
 def test_merge_adjudicated_conflict_is_idempotent():
@@ -1397,6 +1400,7 @@ def test_assert_no_deletion_allows_candidate_promotion_via_disposition_change():
     before = _codebook_with_candidate()
     after = copy.deepcopy(before)
     after["candidates"][0]["disposition"] = "promoted"
+    after["candidates"][0]["promoted_to"] = "entry-a"
 
     mod.assert_no_deletion(before, after)  # must not raise
 
@@ -1543,6 +1547,55 @@ def test_the_unknown_slug_warning_stays_one_bounded_line(caplog):
     assert "free-text-049-" not in message
     assert "more" in message
     assert len(message) < 2000
+
+
+def test_a_slug_tallys_rejections_record_counts_every_value_and_lists_each_distinct_one_once():
+    record = mod.SlugTally(
+        valid=2, rejected=("unknown-y", "unknown-x", "unknown-y")
+    ).rejections_record()
+
+    assert record == {"count": 3, "values": ["unknown-x", "unknown-y"], "values_omitted": 0}
+    assert json.loads(json.dumps(record)) == record
+
+
+def test_a_tally_without_rejections_records_zero_not_absent():
+    assert mod.SlugTally(valid=2).rejections_record() == {
+        "count": 0, "values": [], "values_omitted": 0,
+    }
+
+
+def test_the_rejections_record_is_bounded_as_the_warning_is(caplog):
+    caplog.set_level(logging.DEBUG, logger="legibility.codebook")
+    tally = mod.SlugTally(
+        rejected=tuple(f"free-text-{n:03d}-" + "z" * 1000 for n in range(50))
+    )
+
+    record = tally.rejections_record()
+
+    assert record["count"] == 50
+    assert len(record["values"]) == 10
+    assert record["values_omitted"] == 40
+    assert record["values"][0].startswith("free-text-000-")
+    assert not any(value.startswith("free-text-049-") for value in record["values"])
+    assert all(len(value) <= 83 and value.endswith("...") for value in record["values"])
+
+    mod.warn_unknown_invariant_slugs(tally, ("a",), run="run-1")
+
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert str(record["values"]) in warning.getMessage()
+
+
+def test_values_that_truncate_alike_are_listed_once_and_the_rest_counted_omitted(caplog):
+    caplog.set_level(logging.DEBUG, logger="legibility.codebook")
+    prefix = "p" * 80
+    tally = mod.SlugTally(rejected=(prefix + "-one", prefix + "-two", "short"))
+
+    record = tally.rejections_record()
+    mod.warn_unknown_invariant_slugs(tally, ("a",), run="run-1")
+
+    assert record == {"count": 3, "values": [prefix + "...", "short"], "values_omitted": 1}
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert str(record["values"]) + " +1 more" in warning.getMessage()
 
 
 def test_no_unknown_slugs_means_no_warning(caplog):
@@ -1735,6 +1788,172 @@ def test_the_summary_is_one_line_naming_every_report_field():
         "candidate_disposition_conflicts=0",
         "invariant_slugs_rejected=1",
     } <= set(summary.split())
+
+
+# ---------------------------------------------------------------------------
+# task 6750: the merge names the candidate each candidate payload resolved to
+# ---------------------------------------------------------------------------
+
+def _ref(record: int, candidate: int = 0):
+    return mod.PayloadRef(record=record, candidate=candidate)
+
+
+def _two_payload_record(session: str = "sess-1") -> dict:
+    record = _candidate_record(title="novel shape", session=session)
+    record["candidates"].append({**record["candidates"][0], "title": "a different shape"})
+    return record
+
+
+def _codebook_with_pending_candidate() -> dict:
+    codebook = _codebook_with_adjudicated_candidate("pending")
+    codebook["candidates"][0]["id"] = "cand-20260701-3"
+    return codebook
+
+
+def _codebook_with_promoted_then_rejected_twin(*, promoted_to: str) -> dict:
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    codebook["candidates"][0]["promoted_to"] = promoted_to
+    codebook["candidates"].append({
+        "id": "cand-20260724-2",
+        "title": "novel shape",
+        "first_seen": "2026-07-24",
+        "disposition": "rejected",
+        "sightings": [],
+    })
+    return codebook
+
+
+def test_an_unseen_title_resolves_to_the_candidate_the_merge_mints():
+    merge = _merge_one(_codebook_with_entry_a(), _candidate_record())
+
+    assert merge.resolutions == (mod.NewPending(payload=_ref(0), candidate_id="cand-20260714-1"),)
+    assert merge.resolution_at(_ref(0)) == merge.resolutions[0]
+
+
+def test_resolutions_follow_batch_order_one_per_candidate_payload():
+    batch = [_two_payload_record("sess-1"), _match_record(session="sess-2"), _candidate_record(session="sess-3")]
+
+    merge = mod.apply_coding_records(_codebook_with_entry_a(), batch, invariant_slugs=_NO_SLUGS)
+
+    assert merge.resolutions == (
+        mod.NewPending(payload=_ref(0, 0), candidate_id="cand-20260714-1"),
+        mod.NewPending(payload=_ref(0, 1), candidate_id="cand-20260714-2"),
+        mod.PendingAbsorbed(payload=_ref(2, 0), candidate_id="cand-20260714-1"),
+    )
+    assert merge.resolution_at(_ref(0, 1)) == merge.resolutions[1]
+    assert merge.resolution_at(_ref(0, 2)) is None
+    assert merge.resolution_at(_ref(1)) is None
+
+
+def test_a_title_a_pending_candidate_carries_resolves_to_that_candidate():
+    merge = _merge_one(_codebook_with_pending_candidate(), _candidate_record(session="sess-new"))
+
+    assert merge.resolutions == (mod.PendingAbsorbed(payload=_ref(0), candidate_id="cand-20260701-3"),)
+
+
+def test_a_promoted_candidate_with_a_live_entry_outranks_a_later_rejected_twin():
+    """The task-4144 shape, in the order the live codebook carries it: the
+    recurrence goes to the promoted candidate's entry, not to the list-order
+    last same-title record."""
+    codebook = _codebook_with_promoted_then_rejected_twin(promoted_to="entry-a")
+
+    merge = _merge_one(codebook, _candidate_record(session="sess-new", date="2026-07-25"))
+
+    assert merge.resolutions == (
+        mod.RoutedToEntry(payload=_ref(0), candidate_id="cand-20260722-28", entry_id="entry-a"),
+    )
+    entry = next(e for e in merge.codebook["entries"] if e["id"] == "entry-a")
+    assert [s["session"] for s in entry["sightings"]] == ["sess-new"]
+
+
+def test_a_rejected_only_title_resolves_to_the_rejected_candidate():
+    codebook = _codebook_with_adjudicated_candidate("rejected")
+
+    merge = _merge_one(codebook, _candidate_record(session="sess-new", date="2026-07-24"))
+
+    assert merge.resolutions == (
+        mod.RoutedToCandidate(payload=_ref(0), candidate_id="cand-20260722-28", disposition="rejected"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("build_codebook", "expected"),
+    [
+        pytest.param(
+            lambda: _codebook_with_adjudicated_candidate("promoted"),
+            ("cand-20260722-28", "promoted"),
+            id="lone-promoted",
+        ),
+        pytest.param(
+            lambda: _codebook_with_promoted_then_rejected_twin(promoted_to="entry-never-created"),
+            ("cand-20260724-2", "rejected"),
+            id="promoted-then-rejected",
+        ),
+    ],
+)
+def test_a_promoted_candidate_whose_entry_dangles_falls_back_to_the_last_same_title_record(
+    build_codebook, expected
+):
+    merge = _merge_one(build_codebook(), _candidate_record(session="sess-new", date="2026-07-25"))
+
+    candidate_id, disposition = expected
+    assert merge.resolutions == (
+        mod.RoutedToCandidate(payload=_ref(0), candidate_id=candidate_id, disposition=disposition),
+    )
+
+
+@pytest.mark.parametrize(
+    "build_codebook",
+    [
+        pytest.param(_codebook_with_pending_candidate, id="pending-absorbed"),
+        pytest.param(
+            lambda: _codebook_with_promoted_then_rejected_twin(promoted_to="entry-a"),
+            id="routed-to-entry",
+        ),
+        pytest.param(lambda: _codebook_with_adjudicated_candidate("rejected"), id="routed-to-candidate"),
+    ],
+)
+def test_re_applying_a_merged_record_resolves_it_again_and_writes_nothing(build_codebook):
+    record = _candidate_record(session="sess-new", date="2026-07-25")
+    first = _merge_one(build_codebook(), record)
+
+    again = _merge_one(first.codebook, record)
+
+    assert again.resolutions == first.resolutions
+    assert again.codebook == first.codebook
+    assert again.mutated is False
+
+
+def test_re_applying_a_minting_record_names_the_candidate_it_minted():
+    record = _candidate_record()
+    first = _merge_one(_codebook_with_entry_a(), record)
+
+    again = _merge_one(first.codebook, record)
+
+    assert again.resolutions == (mod.PendingAbsorbed(payload=_ref(0), candidate_id="cand-20260714-1"),)
+    assert again.codebook == first.codebook
+
+
+def test_a_skipped_record_resolves_no_payload():
+    deletion = _candidate_record(session="sess-del")
+    deletion["drop"] = True
+    invalid = _candidate_record(session="sess-bad")
+    del invalid["agent_class"]
+    batch = [deletion, _candidate_record(session="sess-good"), invalid]
+
+    merge = mod.apply_coding_records(_codebook_with_entry_a(), batch, invariant_slugs=_NO_SLUGS)
+
+    assert merge.resolutions == (mod.NewPending(payload=_ref(1), candidate_id="cand-20260714-1"),)
+    assert merge.resolution_at(_ref(0)) is None
+    assert merge.resolution_at(_ref(2)) is None
+
+
+def test_a_record_without_candidate_payloads_resolves_nothing():
+    merge = mod.apply_coding_records(
+        _codebook_with_entry_a(), [_match_record(), _correction_record()], invariant_slugs=_NO_SLUGS
+    )
+
+    assert merge.resolutions == ()
 
 
 # ---------------------------------------------------------------------------
@@ -3242,3 +3461,66 @@ def test_validate_coding_record_rejects_a_malformed_payload_attach(op, attached_
 def test_validate_coding_record_accepts_a_well_formed_payload_attach(op):
     record = _match_record() if op == "matches" else _candidate_record()
     assert mod.validate_coding_record(_attached(record, op)) == []
+
+
+# ---------------------------------------------------------------------------
+# task 6750: validate cross-references a promoted candidate's entry and holds
+# an entry's filing marker to its vocabulary
+# ---------------------------------------------------------------------------
+
+def _codebook_with_promoted_candidate(**promotion: Any) -> dict:
+    codebook = _codebook_with_adjudicated_candidate("promoted")
+    codebook["candidates"][0].update(promotion)
+    return codebook
+
+
+def _errors_naming(codebook: dict, *fragments: str) -> list[str]:
+    return [error for error in mod.validate(codebook) if all(fragment in error for fragment in fragments)]
+
+
+@pytest.mark.parametrize(
+    ("promotion", "offending"),
+    [
+        pytest.param({}, None, id="missing"),
+        pytest.param({"promoted_to": "entry-never-created"}, "entry-never-created", id="dangling"),
+    ],
+)
+def test_validate_rejects_a_promoted_candidate_whose_entry_does_not_resolve(promotion, offending):
+    codebook = _codebook_with_promoted_candidate(**promotion)
+
+    assert _errors_naming(codebook, "cand-20260722-28", repr(offending))
+
+
+def test_validate_accepts_a_promoted_candidate_whose_entry_resolves():
+    assert mod.validate(_codebook_with_promoted_candidate(promoted_to="entry-a")) == []
+
+
+@pytest.mark.parametrize("filing", ["withheld", "filed"])
+def test_validate_accepts_an_entry_filing_marker_of_the_vocabulary(filing):
+    codebook = _minimal_v2()
+    codebook["entries"][0]["filing"] = filing
+
+    assert mod.validate(codebook) == []
+
+
+@pytest.mark.parametrize("filing", ["held", True])
+def test_validate_rejects_an_entry_filing_marker_outside_the_vocabulary(filing):
+    codebook = _minimal_v2()
+    codebook["entries"][0][mod.ENTRY_FILING_KEY] = filing
+
+    assert _errors_naming(codebook, "entries/0/filing", repr(filing))
+
+
+def test_validate_accepts_an_entry_without_a_filing_marker():
+    codebook = _minimal_v2()
+
+    assert mod.ENTRY_FILING_KEY not in codebook["entries"][0]
+    assert mod.validate(codebook) == []
+
+
+def test_validate_cli_fails_on_a_dangling_promoted_to(tmp_path, capsys):
+    path = tmp_path / "codebook.yaml"
+    mod.dump(_codebook_with_promoted_candidate(promoted_to="entry-never-created"), path)
+
+    assert mod.main(["validate", str(path)]) != 0
+    assert "entry-never-created" in capsys.readouterr().err

@@ -31,12 +31,10 @@ from types import MappingProxyType
 from typing import Generic, Literal, TypeVar
 
 from _task_db_scan import (
-    TaskDbProblem,
-    TaskDbUnreadable,
-    connect_ro,
     runs_db_path,
     tasks_db_path,
 )
+from escalation.authority import HOST_FILER_ROLES
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 from escalation.shadow_ruling import AgreementReport, ClassAgreement, agreement_report
@@ -48,6 +46,7 @@ from orchestrator.session_registry import (
     normalize_escalations_dir,
 )
 from shared.project_id import fold_project_token
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 from sitting import inventory, payloads
 from sitting.inventory import QUEUE_SUBDIRS, PendingRecords, Shortfall
 from sitting.payloads import RejectedMarker
@@ -132,6 +131,20 @@ class OpenEscalation:
         root = inventory.queue_project_root(self.queue_dir)
         queue = self.queue_dir if root is None else str(Path(self.queue_dir).relative_to(root))
         return f'{self.escalation_id} ({self.category}, L{self.level}, {age}, {queue})'
+
+
+@dataclass(frozen=True)
+class HostAlarm:
+    """A pending record a host filer raised (``authority.HOST_FILER_ROLES``): the host needs a human at any level."""
+
+    escalation_id: str
+    queue_dir: str
+    project: str
+    level: int
+    severity: str
+    agent_role: str
+    age_days: float | None
+    summary: str
 
 
 @dataclass(frozen=True)
@@ -305,6 +318,40 @@ def autonomous_closes(decisions_root: Path | str, window: Window, *, now: dateti
     )
     closes = AutonomousCloses(tuple(in_window), tuple(undated), len(closed))
     return Measurement(closes, stamp, str(registry), 'ok', tuple(shortfalls))
+
+
+def host_alarms(pending: Mapping[str, PendingRecords], *, now: datetime) -> Measurement[tuple[HostAlarm, ...]]:
+    """Every pending host-filer record of any level in the inventory's own root-tier parse, oldest first.
+
+    A root record that could not be read is a shortfall: it may be an alarm.
+    """
+    stamp = _stamp(now)
+    if not pending:
+        missing = Shortfall('escalation_queue', 'none', 'no escalation queue was scanned')
+        return Measurement((), stamp, 'escalation queues', 'source_missing', (missing,))
+    alarms = sorted(
+        (_host_alarm(queue_dir, esc, now)
+         for queue_dir, records in pending.items()
+         for escs in records.by_task.values()
+         for esc in escs
+         if esc.agent_role in HOST_FILER_ROLES),
+        key=lambda alarm: (alarm.age_days is None, -(alarm.age_days or 0.0), alarm.queue_dir, alarm.escalation_id),
+    )
+    unreadable = tuple(shortfall for records in pending.values() for shortfall in records.unreadable)
+    return Measurement(tuple(alarms), stamp, ', '.join(pending), 'ok', unreadable)
+
+
+def _host_alarm(queue_dir: str, esc: Escalation, now: datetime) -> HostAlarm:
+    return HostAlarm(
+        escalation_id=esc.id,
+        queue_dir=queue_dir,
+        project=inventory.queue_project(queue_dir),
+        level=esc.level,
+        severity=esc.severity,
+        agent_role=esc.agent_role,
+        age_days=inventory.age_days(esc.timestamp, now),
+        summary=' '.join(esc.summary.split()),
+    )
 
 
 def standing_policy_rulings(
