@@ -34,9 +34,11 @@
 // directions — every path is a real endpointsFor() key, and every app.jsx tab
 // id has an entry — because a map that silently stops matching a renamed
 // endpoint is a check that has quietly stopped checking.
-// dashboard/tests/js/render_app_shell.test.mjs renders each tab and fails when
-// a path the tab reads is missing from its entry. `toolbarConfig` in app.jsx
-// is the sibling per-tab map; keep the two tab-id lists in step.
+// dashboard/tests/js/render_app_shell.test.mjs renders each tab the rail opens,
+// plus the views its DEEPER_VIEWS map opens behind a click, and fails when a
+// path read there is missing from the tab's entry; a reader that renders only
+// behind a click is covered once DEEPER_VIEWS opens it. `toolbarConfig` in
+// app.jsx is the sibling per-tab map; keep the two tab-id lists in step.
 //
 // LIST /tasks FOR A TAB ONLY IF IT RENDERS TASK ROWS. Listing it polls the full
 // multi-MB render on that tab; the census every tab's chrome reads is already
