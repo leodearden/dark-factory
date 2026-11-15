@@ -3,7 +3,7 @@
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, MutableMapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -45,6 +45,20 @@ from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+class _FieldsInMessage(logging.LoggerAdapter[logging.Logger]):
+    """Appends each ``extra`` field to the message as ``k=v``: the service's
+    server/main.py::LOG_FORMAT renders only %(message)s (task 6829 covers the formatter)."""
+
+    def process(
+        self, msg: Any, kwargs: MutableMapping[str, Any],
+    ) -> tuple[Any, MutableMapping[str, Any]]:
+        fields = kwargs.get('extra') or {}
+        return ' '.join([str(msg), *(f'{k}={v}' for k, v in fields.items())]), kwargs
+
+
+_telemetry_logger = _FieldsInMessage(logger)
 
 
 # The judge's verdict contract, carried as ``--json-schema`` rather than as prose
@@ -937,7 +951,7 @@ Review this run and provide your verdict as JSON.
         ended = classify_cap_kill(result, budget_usd=None, max_turns=None) is CapReason.TURNS
         rejected = await self._rejected_tool_calls(result.session_id)
         if ended:
-            logger.warning(
+            _telemetry_logger.warning(
                 'reconciliation.judge_turn_cap_hit',
                 extra={
                     'run_id': run_id,
@@ -956,7 +970,7 @@ Review this run and provide your verdict as JSON.
                 rejected_tool_calls=rejected,
             ))
         except Exception:
-            logger.warning(
+            _telemetry_logger.warning(
                 'reconciliation.judge_invocation_record_failed',
                 extra={'run_id': run_id, 'ended_error_max_turns': ended},
                 exc_info=True,
@@ -972,7 +986,7 @@ Review this run and provide your verdict as JSON.
                 transcript_evidence_for_session, ambient_config_dir(), session_id,
             )
         except Exception:
-            logger.warning(
+            _telemetry_logger.warning(
                 'reconciliation.judge_rejected_tool_count_failed',
                 extra={'session_id': session_id},
                 exc_info=True,
