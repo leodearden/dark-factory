@@ -157,7 +157,10 @@ from orchestrator.merge_lane.landing_evidence import (
 )
 from orchestrator.merge_lane.train_selection import select_train_members
 from orchestrator.merge_lane.types import QueuedBranch
-from orchestrator.merge_lane.unmeasured_delivery import diagnose_unmeasured_delivery
+from orchestrator.merge_lane.unmeasured_delivery import (
+    diagnose_unmeasured_branch,
+    find_work_on_sibling_ref,
+)
 from orchestrator.merger_failure import merger_failure_report
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.plan_descope import (
@@ -12347,8 +12350,10 @@ class TaskWorkflow:
         from orchestrator.merge_lane.worker import OutcomeKind, _emit_merge_attempt
 
         assert self.worktree is not None
-        finding = await diagnose_unmeasured_delivery(
-            check, self.worktree, self.git_ops, branch=branch, task_id=self.task_id,
+        finding = await diagnose_unmeasured_branch(
+            check, self.worktree, task_id=self.task_id,
+        ) or await find_work_on_sibling_ref(
+            check, self.git_ops, branch=branch, task_id=self.task_id, superseded=None,
         )
         if finding is None:
             return None

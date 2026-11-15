@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from shared.git_async import GitResult, run_git
 
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.gates import PlanFilesTouchedResult, declaration_coverage
+from orchestrator.recut_ruling import RecutSupersession
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +114,7 @@ class RebaseProgress:
 class _SiblingRef:
     ref: str
     tip: str
+    committed_at: datetime
 
 
 @dataclass(frozen=True)
@@ -121,37 +124,63 @@ class _SiblingWork:
     covered: int
 
 
-async def diagnose_unmeasured_delivery(
+async def diagnose_unmeasured_branch(
+    check: PlanFilesTouchedResult, worktree: Path, *, task_id: str,
+) -> UnmeasuredDelivery | None:
+    """Why *check*'s not-touched entries were never measured, from the task's own worktree alone.
+
+    Covers an unreadable touched set, a rebase in progress and uncommitted
+    declared edits; reads no other ref. Never raises: a probe failure
+    returns None, so the caller reports the not-touched verdict unchanged.
+    """
+    if not check.not_touched:
+        return None
+    return await _never_raising(
+        'in-branch diagnosis', task_id, _diagnose_branch(check, Path(worktree)),
+    )
+
+
+async def find_work_on_sibling_ref(
     check: PlanFilesTouchedResult,
-    worktree: Path,
     git_ops: GitOps,
     *,
     branch: str,
     task_id: str,
+    superseded: RecutSupersession | None,
 ) -> UnmeasuredDelivery | None:
-    """Why *check*'s not-touched entries were never measured, or None when they were.
+    """The sibling ref ``<branch>-*`` holding *check*'s not-touched work, or None.
 
-    *branch* is the prefixed task branch (``task/<id>``) whose sibling refs
-    ``<branch>-*`` may hold the work. Never raises: a probe failure returns
-    None, so the caller reports the not-touched verdict unchanged.
+    *branch* is the prefixed task branch (``task/<id>``). A ref *superseded*
+    by an executed re-cut ruling is never offered. Never raises: a probe
+    failure returns None, so the caller reports the not-touched verdict
+    unchanged.
     """
     if not check.not_touched:
         return None
+    return await _never_raising(
+        'sibling-ref probe', task_id,
+        _sibling_ref_finding(tuple(check.not_touched), git_ops, branch, superseded),
+    )
+
+
+async def _never_raising(
+    probe: str, task_id: str, diagnosis: Awaitable[UnmeasuredDelivery | None],
+) -> UnmeasuredDelivery | None:
     try:
-        return await _diagnose(check, Path(worktree), git_ops, branch)
+        return await diagnosis
     except asyncio.CancelledError:
         raise
     except Exception:
         logger.warning(
-            'unmeasured-delivery: diagnosis raised for task_id=%s branch=%s — '
+            'unmeasured-delivery: %s raised for task_id=%s — '
             'the not-touched verdict is reported unchanged',
-            task_id, branch, exc_info=True,
+            probe, task_id, exc_info=True,
         )
         return None
 
 
-async def _diagnose(
-    check: PlanFilesTouchedResult, worktree: Path, git_ops: GitOps, branch: str,
+async def _diagnose_branch(
+    check: PlanFilesTouchedResult, worktree: Path,
 ) -> UnmeasuredDelivery | None:
     not_touched = tuple(check.not_touched)
     if check.touched_set_error is not None:
@@ -170,7 +199,7 @@ async def _diagnose(
             UnmeasuredCause.UNCOMMITTED_EDITS, not_touched, dirty,
             f'staged, unstaged or untracked changes in the worktree {worktree}',
         )
-    return await _sibling_ref_finding(not_touched, git_ops, branch)
+    return None
 
 
 def _covered(not_touched: tuple[str, ...], paths: Iterable[str]) -> set[str]:
@@ -263,10 +292,13 @@ async def _uncommitted_paths(not_touched: tuple[str, ...], worktree: Path) -> li
 
 
 async def _sibling_ref_finding(
-    not_touched: tuple[str, ...], git_ops: GitOps, branch: str,
+    not_touched: tuple[str, ...],
+    git_ops: GitOps,
+    branch: str,
+    superseded: RecutSupersession | None,
 ) -> UnmeasuredDelivery | None:
     works = []
-    for sibling in await _sibling_refs(git_ops, branch):
+    for sibling in await _sibling_refs(git_ops, branch, superseded):
         files = tuple(await _sibling_own_work(sibling, git_ops))
         works.append(_SiblingWork(sibling, files, len(_covered(not_touched, files))))
     best = max(works, key=lambda work: work.covered, default=None)
@@ -279,10 +311,12 @@ async def _sibling_ref_finding(
     )
 
 
-async def _sibling_refs(git_ops: GitOps, branch: str) -> list[_SiblingRef]:
+async def _sibling_refs(
+    git_ops: GitOps, branch: str, superseded: RecutSupersession | None,
+) -> list[_SiblingRef]:
     listed = await _git(
         Path(git_ops.project_root), 'for-each-ref', '--sort=-committerdate',
-        f'--count={_MAX_SIBLING_REFS}', '--format=%(objectname)%00%(refname)',
+        '--format=%(objectname)%00%(committerdate:unix)%00%(refname)',
         f'refs/heads/{branch}-*',
     )
     if not listed.ok:
@@ -292,11 +326,30 @@ async def _sibling_refs(git_ops: GitOps, branch: str) -> list[_SiblingRef]:
             branch, listed.returncode, listed.stderr,
         )
         return []
-    siblings = []
-    for line in _lines(listed):
-        tip, _, refname = line.partition('\0')
-        siblings.append(_SiblingRef(ref=refname.removeprefix('refs/heads/'), tip=tip))
-    return siblings
+    siblings = (_parse_sibling(line) for line in _lines(listed))
+    live = [
+        sibling for sibling in siblings
+        if sibling is not None
+        and not (
+            superseded is not None
+            and superseded.supersedes(sibling.ref, sibling.committed_at)
+        )
+    ]
+    return live[:_MAX_SIBLING_REFS]
+
+
+def _parse_sibling(line: str) -> _SiblingRef | None:
+    try:
+        tip, committed_unix, refname = line.split('\0')
+        committed_at = datetime.fromtimestamp(int(committed_unix), UTC)
+    except (ValueError, OverflowError, OSError):
+        logger.warning(
+            'unmeasured-delivery: unparseable for-each-ref line %r dropped', line,
+        )
+        return None
+    return _SiblingRef(
+        ref=refname.removeprefix('refs/heads/'), tip=tip, committed_at=committed_at,
+    )
 
 
 async def _sibling_own_work(sibling: _SiblingRef, git_ops: GitOps) -> list[str]:
