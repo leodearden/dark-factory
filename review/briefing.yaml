@@ -268,19 +268,23 @@ subprojects:
 
   dashboard:
     purpose: >
-      Read-only monitoring web UI. The user-facing surface is a JSX SPA in
-      static/redux/ (tabs: overview, tasks, curator, scheduler), served by a FastAPI
-      backend that reads directly from the same SQLite databases fused-memory and the
-      sampler write, and proxies a narrow set of MCP calls. Gives a human operator a live
-      view of memory health, write-queue status, reconciliation activity, orchestrator
-      progress, scheduler parks, curator queue/latency, merge-queue/halt state, host load,
-      and historical cost/performance metrics.
+      Operator web UI: a live monitoring view of the factory plus a small set of
+      operator controls. The user-facing surface is a JSX SPA in static/redux/, served
+      by a FastAPI backend. The backend reads directly from the SQLite databases
+      fused-memory and the sampler write. It writes only the history stores its own
+      background samplers own (dashboard/src/dashboard/loops.py). It calls fused-memory
+      MCP tools for live reads and for every operator control (see key_decisions).
+      Gives a human operator a live view of memory health, write-queue status,
+      reconciliation activity, orchestrator progress, scheduler parks, curator
+      queue/latency, merge-queue/halt state, escalations, code-quality trends, host
+      load, and historical cost/performance metrics.
 
     key_scenarios:
       - "Watching an orchestrator run in real time with per-task progress and details panes"
       - "Inspecting the curator queue — outstanding tickets, latency, cancel button per ticket"
       - "Observing merge-queue state — queued merges, halt status, who/why halted"
-      - "Inspecting scheduler park state — which modules are parked and by whom"
+      - "Inspecting scheduler park state across each module's whole park stack, not only its active top — buried owners, and stranded parks whose owner is no longer live, which the operator can request eviction of"
+      - "Steering dispatch from the scheduler tab — setting or clearing a task's priority override and reordering the pin queue"
       - "Reviewing host load (PSI + verify concurrency/RSS + OCCT queue depth) from the sampler's load-samples.db"
       - "Reviewing costs by account / project / role / run, plus burndown and cap history"
       - "Checking memory subsystem health — Graphiti, Mem0, queue status"
@@ -292,6 +296,7 @@ subprojects:
       - "Graceful degradation when fused-memory or SQLite DBs are unavailable (offline banner, empty state — never synthetic data)"
       - "Tests pass covering routes, data layer, and template/JSX behaviour"
       - "After a backend (Python) change, `systemctl --user restart dark-factory-dashboard.service` is required for the API to pick it up — uvicorn does not auto-reload"
+      - "With fused-memory unreachable, an operator control answers 502 fused_memory_unreachable instead of reporting success; an ambiguous failure answers 502 fused_memory_outcome_unknown and is not retried on another URL"
 
     key_decisions:
       - decision: "JSX SPA ('redux') is the only UI; htmx + Jinja partials were fully removed"
@@ -301,7 +306,10 @@ subprojects:
         why: "Operators distrust dashboards that lie. Empty state is '—' or empty spark; never fake sparklines or hardcoded literals."
 
       - decision: "Direct SQLite reads for reconciliation/performance/curator/load data"
-        why: "Read-only URI mode (mode=ro) on the same DBs fused-memory and the sampler write; avoids adding API endpoints for monitoring. The load schema (LOAD_SAMPLES_SCHEMA) is a hand-maintained copy of sampler.store._SCHEMA — a manual sync contract, not an import."
+        why: "Read-only URI mode (mode=ro) on the same DBs fused-memory and the sampler write; avoids adding API endpoints for monitoring. The load-samples schema and metric vocabulary are imported from the sampler, never copied (see sampler key_decisions)."
+
+      - decision: "Every operator control is a POST route that writes through one fused-memory MCP proxy, never a direct write to a store the dashboard does not own"
+        why: "dashboard/src/dashboard/app.py::_mcp_write_proxy is the single proxy behind the curator-cancel and scheduler write routes, so the fused-memory server that owns the state validates and records every change. It fails over to the next DASHBOARD_FUSED_MEMORY_URLS entry only when the failure proves the request never reached a server. Any other failure answers 502 without trying another URL, because every URL reaches the same store and none of these tools is idempotent (DESIGN.md 'Curator Tickets & Routing Invariant'). The missing retry is deliberate, not a defect."
 
       - decision: "Fan-out across DASHBOARD_FUSED_MEMORY_URLS is failover-only, with first-success-per-root semantics"
         why: "Curator tickets live on a single instance (singleton-lock invariant), so a not_found from URL[0] short-circuits — no need to try other URLs. Avoids double-counting across failover URLs."
@@ -312,10 +320,7 @@ subprojects:
       - decision: "DF_DATA reference-capture loader pattern"
         why: "shell.jsx captures PROJECTS/AGENTS arrays at module load; the loader mutates them in place via STABLE_ARRAY_KEYS so live refresh keeps the references stable for child components"
 
-    known_gaps:
-      - what: "The scheduler view shows only ACTIVE-TOP parks (INV-7); buried/shadowed park owners and orphaned parks are invisible"
-        why: "snapshot_parks() is intentionally top-only, so a preempted-but-shadowed owner or a stranded orphan park does not render. The park-stack-visibility batch (PRD plans/dashboard-park-stack-visibility-prd.md, tasks 1868-1874) adds a full-stack snapshot, stranded/orphan surfacing, and an evict control."
-        tracking: "1868"
+    known_gaps: []
 
     exclude:
       - "static/ — vendored CSS/JS assets (favicon, tailwind, third-party libs)"
