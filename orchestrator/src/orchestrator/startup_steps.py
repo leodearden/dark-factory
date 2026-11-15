@@ -29,9 +29,18 @@ logger = logging.getLogger(__name__)
 
 STARTUP_STEP_SENTINEL_PREFIX = 'orchestrator-startup-'
 _STEP_NAME_PATTERN = re.compile(r'[0-9a-z][0-9a-z-]*')
-_L1_AGENT_ROLE = 'orchestrator-startup'
+_AGENT_ROLE = 'orchestrator-startup'
 _SUMMARY_LIMIT = 200
 CRASH_LOOP_THRESHOLD = 3
+CRASH_LOOP_SENTINEL = 'orchestrator-startup-crash-loop'
+_CRASH_LOOP_ALARM = RefreshableAlarm(
+    task_id=CRASH_LOOP_SENTINEL,
+    level=2,
+    agent_role=_AGENT_ROLE,
+    severity='critical',
+    category=EscalationCategory.INFRA_ISSUE,
+    suggested_action='investigate_startup_crash_loop',
+)
 
 
 def sentinel_task_id(step_name: str) -> str:
@@ -161,10 +170,15 @@ class StartupJournal:
         self._inherited = inherited
         self._in_flight: StepInFlight | None = None
         self._last_returned: str | None = None
+        self._crash_loop_paged = False
 
     @classmethod
     def load(cls, path: Path) -> StartupJournal:
         return cls(path, _read_streak(path))
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     @property
     def inherited(self) -> StartupFailureStreak | None:
@@ -215,6 +229,13 @@ class StartupJournal:
         self.record_failure(site, type(exc).__name__, str(exc))
         return site
 
+    @property
+    def crash_loop_paged(self) -> bool:
+        return self._crash_loop_paged
+
+    def mark_crash_loop_paged(self) -> None:
+        self._crash_loop_paged = True
+
     def clear(self) -> None:
         try:
             self._path.unlink(missing_ok=True)
@@ -223,6 +244,58 @@ class StartupJournal:
                 'startup failure journal %s: clearing failed: %s: %s',
                 self._path, type(exc).__name__, exc,
             )
+
+
+def page_crash_loop(
+    journal: StartupJournal,
+    escalation_queue: EscalationQueue | None,
+    *,
+    filing_claimant_run_id: str | None,
+) -> None:
+    """File or refresh the born-at-L2 crash-loop page once per start, if the inherited streak reached K."""
+    streak = journal.inherited
+    if escalation_queue is None or journal.crash_loop_paged:
+        return
+    if streak is None or not streak.reached_threshold:
+        return
+    try:
+        file_or_refresh(
+            escalation_queue,
+            _CRASH_LOOP_ALARM,
+            summary=_crash_loop_summary(streak)[:_SUMMARY_LIMIT],
+            detail=_crash_loop_detail(streak, journal.path),
+            filing_claimant_run_id=filing_claimant_run_id,
+        )
+    except Exception:
+        logger.warning(
+            'startup crash loop at %s: filing its L2 escalation failed', streak.step, exc_info=True,
+        )
+        return
+    journal.mark_crash_loop_paged()
+
+
+def _crash_loop_summary(streak: StartupFailureStreak) -> str:
+    return (
+        f'orchestrator startup crash loop: {streak.step} failed on {streak.consecutive} '
+        f'consecutive starts ({streak.exception_type}: {streak.message})'
+    )
+
+
+def _crash_loop_detail(streak: StartupFailureStreak, journal_path: Path) -> str:
+    return '\n'.join((
+        streak.model_dump_json(indent=2),
+        '',
+        'On this start a non-fatal step named here is skipped; a fatal step, or a crash '
+        'site outside any step (before-first-step, after-<step>), still runs. The '
+        'finish_startup of a start that comes up clears the journal; this record stays '
+        'until resolved.',
+        '',
+        'Investigate:',
+        '- journalctl --user -u orchestrator-<project>.service (the traceback)',
+        '- runs.db: SELECT run_id, started_at, startup_completed_at, exit_reason FROM runs '
+        'ORDER BY rowid DESC LIMIT 10',
+        f'- the streak journal: {journal_path}',
+    ))
 
 
 def _read_streak(path: Path) -> StartupFailureStreak | None:
@@ -345,7 +418,7 @@ def _step_alarm(step: str) -> RefreshableAlarm:
     return RefreshableAlarm(
         task_id=sentinel_task_id(step),
         level=1,
-        agent_role=_L1_AGENT_ROLE,
+        agent_role=_AGENT_ROLE,
         severity='blocking',
         category=EscalationCategory.INFRA_ISSUE,
         suggested_action='investigate_startup_step',
