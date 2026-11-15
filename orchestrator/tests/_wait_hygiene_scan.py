@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from _wait_budget_audit import (
     collect_test_items,
@@ -135,18 +136,21 @@ class WorkerTeardownScan:
     unguarded_items: tuple[str, ...]
 
 
-def _calls_create_task(call: ast.Call) -> bool:
+_TASK_SPAWNERS = frozenset({'create_task', 'ensure_future'})
+
+
+def _spawns_a_task(call: ast.Call) -> bool:
     func = call.func
-    return (isinstance(func, ast.Attribute) and func.attr == 'create_task') or (
-        isinstance(func, ast.Name) and func.id == 'create_task'
+    return (isinstance(func, ast.Attribute) and func.attr in _TASK_SPAWNERS) or (
+        isinstance(func, ast.Name) and func.id in _TASK_SPAWNERS
     )
 
 
 def _run_task_receivers(function: ast.AST) -> frozenset[str]:
-    """Every Name ``R`` that *function* runs as a task: ``create_task(R.run(...))``."""
+    """Every Name ``R`` that *function* runs as a task: ``create_task(R.run(...))`` or ``ensure_future(R.run(...))``."""
     receivers: set[str] = set()
     for node in ast.walk(function):
-        if not (isinstance(node, ast.Call) and _calls_create_task(node) and node.args):
+        if not (isinstance(node, ast.Call) and _spawns_a_task(node) and node.args):
             continue
         task = node.args[0]
         if (
@@ -187,15 +191,27 @@ def _guarded_nodes(function: ast.AST, wait_calls: list[ast.AST]) -> set[int]:
     return guarded
 
 
-def _classify_teardown(function: ast.AST) -> tuple[bool, bool, bool]:
-    """Whether *function* (waits, stops a worker, stops one unguarded)."""
+class _TeardownRoles(NamedTuple):
+    waits: bool
+    stops_a_worker: bool
+    stops_one_unguarded: bool
+
+
+_NO_TEARDOWN_ROLE = _TeardownRoles(waits=False, stops_a_worker=False, stops_one_unguarded=False)
+
+
+def _classify_teardown(function: ast.AST) -> _TeardownRoles:
     wait_calls = [node for node in ast.walk(function) if is_responsive_wait_call(node)]
     if not wait_calls:
-        return False, False, False
+        return _NO_TEARDOWN_ROLE
     receivers = frozenset({'worker'}) | _run_task_receivers(function)
     stop_calls = [node for node in ast.walk(function) if _is_worker_stop_call(node, receivers)]
     guarded = _guarded_nodes(function, wait_calls)
-    return True, bool(stop_calls), any(id(stop) not in guarded for stop in stop_calls)
+    return _TeardownRoles(
+        waits=True,
+        stops_a_worker=bool(stop_calls),
+        stops_one_unguarded=any(id(stop) not in guarded for stop in stop_calls),
+    )
 
 
 def scan_worker_teardown(source: str) -> WorkerTeardownScan:
@@ -206,13 +222,13 @@ def scan_worker_teardown(source: str) -> WorkerTeardownScan:
     stopping: set[str] = set()
     unguarded: set[str] = set()
     for owner, function in collect_test_items(source):
-        waits, stops, unguarded_stop = _classify_teardown(function)
+        roles = _classify_teardown(function)
         item = item_id(owner, function.name)
-        if waits:
+        if roles.waits:
             waiting.add(item)
-        if stops:
+        if roles.stops_a_worker:
             stopping.add(item)
-        if unguarded_stop:
+        if roles.stops_one_unguarded:
             unguarded.add(item)
     return WorkerTeardownScan(
         waiting_items=tuple(sorted(waiting)),
@@ -248,7 +264,8 @@ def unguarded_worker_teardown_items(source: str) -> list[str]:
     straight-line teardown elsewhere is not this scan's business, which is
     to stop the migrated set regressing. A receiver is a worker by
     structure, not by a list of names: a variable named ``worker``, or any
-    Name whose ``.run()`` the item hands to ``create_task(...)``. A stop on
+    Name whose ``.run()`` the item hands to ``create_task(...)`` or
+    ``ensure_future(...)``, attribute or bare spelling. A stop on
     any other receiver is not a worker stop, the safe direction for a
     regression guard.
     """

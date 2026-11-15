@@ -566,6 +566,44 @@ class TestRunReceiver:
             f'be reported, got {result!r}.'
         )
 
+    def test_stop_on_a_receiver_run_through_ensure_future_is_reported(self) -> None:
+        """`ensure_future(<receiver>.run())` runs the receiver as a task just
+        as `create_task(...)` does, so its straight-line stop IS reported.
+        """
+        source = """
+class TestEnsureFutureReceiver:
+    async def test_it(self):
+        lane = make_lane()
+        lane_task = asyncio.ensure_future(lane.run())
+        await wait_responsive(fut, timeout=5.0, label='x')
+        await lane.stop()
+"""
+        result = unguarded_worker_teardown_items(source)
+
+        assert result == ['TestEnsureFutureReceiver::test_it'], (
+            f'Expected the straight-line stop of a receiver run through '
+            f'ensure_future to be reported, got {result!r}.'
+        )
+
+    def test_stop_on_a_receiver_run_through_a_bare_create_task_is_reported(self) -> None:
+        """The `from asyncio import create_task` spelling runs the receiver
+        as a task too, so its straight-line stop IS reported.
+        """
+        source = """
+class TestBareCreateTaskReceiver:
+    async def test_it(self):
+        lane = make_lane()
+        lane_task = create_task(lane.run())
+        await wait_responsive(fut, timeout=5.0, label='x')
+        await lane.stop()
+"""
+        result = unguarded_worker_teardown_items(source)
+
+        assert result == ['TestBareCreateTaskReceiver::test_it'], (
+            f'Expected the straight-line stop of a receiver run through a '
+            f'bare create_task to be reported, got {result!r}.'
+        )
+
     def test_stop_on_a_run_receiver_inside_a_guarding_finally_is_not_reported(self) -> None:
         """The same run-as-a-task receiver, stopped from a `finally:` whose
         `try:` encloses the wait, is NOT reported.
@@ -589,7 +627,7 @@ class TestGuardedRunReceiver:
 
     def test_stop_on_a_receiver_never_run_as_a_task_is_not_reported(self) -> None:
         """A `.stop()` on a receiver that is neither named `worker` nor run
-        through `create_task(<receiver>.run())` is NOT a worker stop: the
+        as a task through `create_task`/`ensure_future` is NOT a worker stop: the
         widening is structural, not "any `.stop()`".
         """
         source = """
