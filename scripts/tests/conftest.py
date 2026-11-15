@@ -41,6 +41,10 @@ account roster, and a decoy operator login, for the legibility suites that
 drive the shared session runner end to end. The real UsageGate those fixtures
 drive has its dead-PID probe-dir sweep confined by the plugin
 ``pytest_configure`` arms (task 6275).
+
+And `fake_recorder` (task 5285): an executable that records each call's argv
+and environment, replacing the private recorder and fake-`uv` copies in the
+flag-marker and reclaim wrapper suites.
 """
 import json
 import os
@@ -869,3 +873,85 @@ def sentinel_login(tmp_path, monkeypatch):
     monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-api-SENTINEL')
     monkeypatch.setattr(usage_gate, 'CREDENTIALS_PATH', credentials)
     return home
+
+
+# ---------------------------------------------------------------------------
+# Shared fake command recorder (task 5285).
+#
+# A wrapper suite points the wrapper's command seam (FLAG_MARKER_SWEEP_CMD,
+# RECLAIM_ORPHANED_WT_CMD, a `uv` on PATH, ...) at one of these and then asserts
+# on the argv and environment each call received. The state path is formatted
+# into the source, so a wrapper that rewrites its child's environment cannot
+# lose it, and the absolute shebang lets a fake start under an EMPTY PATH.
+# ---------------------------------------------------------------------------
+
+_FAKE_RECORDER_SOURCE = """\
+import json
+import os
+import sys
+
+state_path = {state_path!r}
+with open(state_path) as f:
+    state = json.load(f)
+argv = sys.argv[1:]
+state['calls'].append(argv)
+state['envs'].append(dict(os.environ))
+with open(state_path, 'w') as f:
+    json.dump(state, f)
+
+for token, reply in state['replies'].items():
+    if token in argv:
+        sys.stdout.write(reply['stdout'])
+        sys.exit(reply['exit_code'])
+sys.exit(state['exit_code'])
+"""
+
+
+class FakeRecorder:
+    """An executable at ``path`` that records every call, then exits.
+
+    ``calls()`` is each invocation's argv[1:] in call order and ``envs()`` the
+    matching ``os.environ`` snapshots. A call whose argv carries a ``replies``
+    token prints that reply's ``stdout`` and exits its ``exit_code``; any other
+    call prints nothing and exits the install-time ``exit_code``.
+    """
+
+    def __init__(self, path: Path, state_path: Path):
+        self.path = path
+        self.bin_dir = path.parent
+        self._state_path = state_path
+
+    def calls(self) -> list[list[str]]:
+        return json.loads(self._state_path.read_text())['calls']
+
+    def envs(self) -> list[dict[str, str]]:
+        return json.loads(self._state_path.read_text())['envs']
+
+
+@pytest.fixture
+def fake_recorder(tmp_path):
+    """Factory: install a :class:`FakeRecorder` named *name*, return it.
+
+    *bin_dir* defaults to ``tmp_path / 'bin'`` and is created with its parents.
+    The caller puts it on PATH, or passes ``.path``, as the wrapper under test
+    needs. Installing a name again in the same *bin_dir* starts a fresh call log.
+    """
+    state_dir = tmp_path / 'fake-recorder-state'
+    state_paths: dict[Path, Path] = {}
+
+    def _install(name, *, bin_dir=None, exit_code=0, replies=None):
+        bin_dir = Path(bin_dir) if bin_dir is not None else tmp_path / 'bin'
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        state_dir.mkdir(exist_ok=True)
+        path = bin_dir / name
+        state_path = state_paths.setdefault(path, state_dir / f'{len(state_paths)}-{name}.json')
+        state_path.write_text(json.dumps({
+            'calls': [], 'envs': [], 'exit_code': exit_code, 'replies': dict(replies or {}),
+        }))
+        path.write_text(f'#!{sys.executable}\n' + _FAKE_RECORDER_SOURCE.format(
+            state_path=str(state_path),
+        ))
+        path.chmod(0o755)
+        return FakeRecorder(path, state_path)
+
+    return _install
