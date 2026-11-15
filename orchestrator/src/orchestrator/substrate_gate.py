@@ -58,6 +58,10 @@ class SubstrateVerdict:
         reason: Human-readable explanation of the verdict.
         stdout: Truncated checker stdout (first 2000 chars).
         stderr: Truncated checker stderr (first 2000 chars).
+        unverifiable: True when the recheck never produced a probe result
+            (gate worktree, checker launch/crash/unknown rc, or a
+            malformed/checkerless descriptor), so this fail-closed FLIP
+            establishes nothing about the probe set.
     """
 
     verdict: str
@@ -67,11 +71,41 @@ class SubstrateVerdict:
     reason: str
     stdout: str = ''
     stderr: str = ''
+    unverifiable: bool = False
+
+    def __post_init__(self) -> None:
+        if self.unverifiable and self.verdict != FLIP:
+            raise ValueError(
+                f'SubstrateVerdict invariant: unverifiable=True requires verdict={FLIP!r}; '
+                f'got verdict={self.verdict!r}'
+            )
 
     @property
     def flipped(self) -> bool:
         """True when the verdict is FLIP (gate should block dispatch)."""
         return self.verdict == FLIP
+
+
+def unverifiable_verdict(
+    reason: str,
+    *,
+    exit_code: int | None = None,
+    checker_argv: list[str] | None = None,
+    probe_set: str | None = None,
+    stdout: str = '',
+    stderr: str = '',
+) -> SubstrateVerdict:
+    """The fail-CLOSED verdict for a recheck that could not run."""
+    return SubstrateVerdict(
+        verdict=FLIP,
+        exit_code=exit_code,
+        checker_argv=checker_argv,
+        probe_set=probe_set,
+        reason=reason,
+        stdout=stdout,
+        stderr=stderr,
+        unverifiable=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +253,8 @@ def run_substrate_recheck(
     - rc=0  → PASS  (all probes still pass; dispatch allowed)
     - rc=1  → FLIP  (≥1 FAIL; PASS→FAIL drift detected)
     - rc=2  → FLIP  (≥1 UNPROVABLE; treated as blocked premise)
-    - other non-zero / timeout / missing checker → FLIP ("substrate unverifiable")
+    - other non-zero / timeout / missing checker / malformed descriptor →
+      FLIP (unverifiable=True: "substrate unverifiable")
     - no descriptor → SKIP (gate is a no-op; non-probe task)
 
     Args:
@@ -244,12 +279,8 @@ def run_substrate_recheck(
                 'malformed — failing closed (verdict=FLIP)',
                 task.get('id'),
             )
-            return SubstrateVerdict(
-                verdict=FLIP,
-                exit_code=None,
-                checker_argv=None,
-                probe_set=None,
-                reason='substrate_probe declared but malformed — failing closed',
+            return unverifiable_verdict(
+                'substrate_probe declared but malformed — failing closed',
             )
         return SubstrateVerdict(
             verdict=SKIP,
@@ -264,12 +295,9 @@ def run_substrate_recheck(
 
     # --- No resolvable checker → FLIP ---
     if not argv:
-        return SubstrateVerdict(
-            verdict=FLIP,
-            exit_code=None,
-            checker_argv=None,
+        return unverifiable_verdict(
+            'probe set declared but no checker command resolvable',
             probe_set=probe_set,
-            reason='probe set declared but no checker command resolvable',
         )
 
     # --- Run the checker ---
@@ -282,12 +310,10 @@ def run_substrate_recheck(
     try:
         rc, stdout, stderr = run_subprocess(argv, cwd=worktree, timeout=timeout)
     except Exception as exc:
-        return SubstrateVerdict(
-            verdict=FLIP,
-            exit_code=None,
+        return unverifiable_verdict(
+            f'substrate unverifiable / run_subprocess raised: {exc}',
             checker_argv=argv,
             probe_set=probe_set,
-            reason=f'substrate unverifiable / run_subprocess raised: {exc}',
         )
 
     stdout_trunc = (stdout or '')[:_MAX_OUTPUT]
@@ -325,12 +351,11 @@ def run_substrate_recheck(
             stderr=stderr_trunc,
         )
     else:
-        return SubstrateVerdict(
-            verdict=FLIP,
+        return unverifiable_verdict(
+            f'substrate unverifiable / checker error rc={rc}',
             exit_code=rc,
             checker_argv=argv,
             probe_set=probe_set,
-            reason=f'substrate unverifiable / checker error rc={rc}',
             stdout=stdout_trunc,
             stderr=stderr_trunc,
         )
