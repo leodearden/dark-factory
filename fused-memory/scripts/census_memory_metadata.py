@@ -1911,11 +1911,12 @@ def _regen_command(params: dict[str, Any]) -> str:
     # relative to `fused-memory/` while `--registry` / `--history-out` carry
     # `_repo_relative` values -- relative to the repo ROOT -- so a run using
     # either non-default path emitted a command whose script and whose flags
-    # could not both resolve from any single directory. `--frozen` is not
-    # decoration: regenerating a committed artifact under a resolved-fresh
-    # dependency set is not a reproduction of the run that wrote it.
+    # could not both resolve from any single directory. `--no-sync` is not
+    # decoration: with no resolve and no sync, the regen reproduces the run
+    # under the environment that run used, and never installs into the shared
+    # root .venv (measured in scripts/orchestrator-autopilot-video.service).
     parts = [
-        'uv run --frozen --project fused-memory python '
+        'uv run --no-sync --project fused-memory python '
         'fused-memory/scripts/census_memory_metadata.py',
     ]
     projects = params.get('projects') or []

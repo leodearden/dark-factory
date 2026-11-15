@@ -4591,7 +4591,7 @@ the invocation the wrapper makes, on the generation worktree's own copy of
 the script (below), so the report's recorded paths stay repo-relative:
 
 ```bash
-uv run --frozen --project fused-memory python \
+uv run --no-sync --project fused-memory python \
     fused-memory/scripts/census_memory_metadata.py --top-n 400
 ```
 
@@ -4744,7 +4744,7 @@ probe's docstring points here.
 stamps stays an operator decision, run by hand after reading the rehearsal:
 
 ```bash
-uv run --frozen --project fused-memory python \
+uv run --no-sync --project fused-memory python \
     fused-memory/scripts/retro_stamp_topics.py --apply
 ```
 
