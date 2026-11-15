@@ -22,7 +22,12 @@
 # full in 80% of those minutes and an agent allowance that was capped for 24% of
 # them, so watch the merge-phase share of slot time after the redeploy.
 # Red tier: takes effect at the next redeploy.
-max_concurrent_tasks: 24
+# 24 -> 36 (Leo, 2026-11-15): the merge queue drained to depth 0, and every task
+# verify module now goes to leo-laptop (verify_task_host_policy: remote_all),
+# whose task slots went 1 -> 3, all in the same ruling. Applied at the gate-8273
+# drained fleet restart. Watch task-verify admission wait and local merge-verify
+# time after the redeploy.
+max_concurrent_tasks: 36
 
 # lock_depth 4→12 (Leo 2026-08-07): make module locks effectively file-granular.
 # Until now dark-factory never set this key at all — it silently inherited the
@@ -1631,8 +1636,10 @@ verify_cross_check_remote_green: false
 # laptop a pinned reify checkout; until then three reify-dependent guards can skip
 # there silently. The cross-check then goes to 0. Measurements:
 # plans/merge-lane-throughput-prd.measurements/2026-11-10-task-6673-remote-task-leg-window.md.
-verify_task_host_policy: remote_modules        # local | remote_modules | remote_all
-verify_task_remote_modules: [orchestrator]     # must be non-empty under remote_modules
+# 2026-11-15, Leo: remote_modules [orchestrator] -> remote_all. Every task verify is
+# eligible for leo-laptop, whose dark-factory-laptop.yaml went to 3 task slots.
+verify_task_host_policy: remote_all            # local | remote_modules | remote_all
+verify_task_remote_modules: [orchestrator]     # read only under remote_modules
 verify_task_remote_red_confirms_locally: false # off after the window (2 raw / 0 adjudicated splits)
 verify_task_remote_cross_check_every_n: 5      # kept until task 7030 lands, then 0
 # ROLLBACK: verify_task_host_policy: local (or delete the keys) + mcp__escalation__reload_config.
