@@ -455,9 +455,11 @@ def extract_statuses(payload) -> Mapping[str, Any]:
     (`census_run.py::_read_statuses`).
 
     `{"statuses": {}}` is a valid, empty answer; only a non-dict payload, a
-    missing or non-mapping `statuses`, or the tool-error envelope is
-    unusable. fused-memory's `@mcp_tool_errors` returns its
-    `{"error", "error_type"}` dict on an `isError: false` response, so it
+    missing or non-mapping `statuses`, the tool-error envelope, or a
+    `pagination` that does not prove the page is the whole population
+    (`_require_whole_population`) is unusable. fused-memory's
+    `@mcp_tool_errors` returns its `{"error", "error_type"}` dict on an
+    `isError: false` response, so it
     reaches the caller looking like a genuine reply, and reading it as an
     empty snapshot once fabricated a census baseline (task 3291).
     """
@@ -491,15 +493,38 @@ def extract_statuses(payload) -> Mapping[str, Any]:
             f"(got {type(statuses).__name__}{sized}): {bounded_repr(statuses)}"
         )
 
-    pagination = payload.get("pagination")
-    if isinstance(pagination, Mapping) and pagination.get("has_more"):
-        raise StatusFetchUnavailable(
-            f"get_statuses returned a partial page, not the full census "
-            f"(returned={pagination.get('returned')!r}, "
-            f"total={pagination.get('total')!r})"
-        )
+    if "pagination" in payload:
+        _require_whole_population(payload["pagination"])
 
     return statuses
+
+
+def _require_whole_population(pagination) -> None:
+    """Raise `StatusFetchUnavailable` unless a get_statuses `pagination`
+    envelope proves its page is the whole population: the first page
+    (`offset` 0) with nothing left to fetch (`has_more` exactly `False`).
+
+    The server omits `pagination` from a complete response
+    (`fused-memory/src/fused_memory/server/tools.py::get_statuses`), so a
+    present one must prove completeness, not merely fail to disprove it. A
+    last page at a non-zero offset is a partial census, and a malformed
+    envelope proves nothing."""
+    if not isinstance(pagination, Mapping):
+        raise StatusFetchUnavailable(
+            f"get_statuses 'pagination' is not a mapping "
+            f"(got {type(pagination).__name__}): {bounded_repr(pagination)}"
+        )
+
+    offset = pagination.get("offset", 0)
+    has_more = pagination.get("has_more")
+    is_first_page = type(offset) is int and offset == 0
+    if has_more is not False or not is_first_page:
+        raise StatusFetchUnavailable(
+            f"get_statuses returned a partial page, not the full census "
+            f"(offset={bounded_repr(offset)}, has_more={bounded_repr(has_more)}, "
+            f"returned={bounded_repr(pagination.get('returned'))}, "
+            f"total={bounded_repr(pagination.get('total'))})"
+        )
 
 
 _FUSED_MEMORY_URL_ENV_VAR = "FUSED_MEMORY_MCP_URL"

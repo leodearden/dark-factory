@@ -399,10 +399,58 @@ def test_extract_statuses_raises_on_a_partial_page():
     with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
         ct.extract_statuses(payload)
 
+    message = str(excinfo.value)
+    assert "partial page" in message
+    assert "returned=1" in message
+    assert "total=5" in message
+
+
+def test_extract_statuses_raises_on_a_last_page_at_a_nonzero_offset():
+    payload = {
+        "statuses": {"3": "done"},
+        "pagination": {
+            "total": 3, "offset": 2, "page_size": 2, "returned": 1, "has_more": False,
+        },
+    }
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_statuses(payload)
+
+    message = str(excinfo.value)
+    assert "partial page" in message
+    assert "offset=2" in message
+    assert "total=3" in message
+
+
+@pytest.mark.parametrize("pagination", [None, ["has_more", False], "complete"])
+def test_extract_statuses_raises_on_a_non_mapping_pagination(pagination):
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_statuses({"statuses": {"1": "done"}, "pagination": pagination})
+
+    message = str(excinfo.value)
+    assert "'pagination' is not a mapping" in message
+    assert type(pagination).__name__ in message
+
+
+@pytest.mark.parametrize(
+    "pagination",
+    [
+        {"total": 1, "offset": 0, "returned": 1},
+        {"total": 1, "offset": 0, "returned": 1, "has_more": 0},
+        {"total": 1, "offset": 0, "returned": 1, "has_more": "false"},
+        {"total": 1, "offset": False, "returned": 1, "has_more": False},
+        {"total": 1, "offset": "0", "returned": 1, "has_more": False},
+    ],
+)
+def test_extract_statuses_raises_on_a_pagination_that_does_not_prove_completeness(
+    pagination,
+):
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_statuses({"statuses": {"1": "done"}, "pagination": pagination})
+
     assert "partial page" in str(excinfo.value)
 
 
-def test_extract_statuses_accepts_a_final_page_with_no_more_to_fetch():
+def test_extract_statuses_accepts_a_single_complete_page():
     payload = {
         "statuses": {"1": "done"},
         "pagination": {
