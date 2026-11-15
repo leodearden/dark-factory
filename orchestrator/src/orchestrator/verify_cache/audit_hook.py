@@ -78,9 +78,16 @@ class VerifyCacheAuditHook:
                 response.policy.disabled_until,
             )
             return
-        if self._queue.get_by_task(AUDIT_ESCALATION_SENTINEL, status='pending', level=2):
+        episode = _disable_episode(response.policy)
+        pending = self._queue.get_by_task(AUDIT_ESCALATION_SENTINEL, status='pending', level=2)
+        if any(blocker.root_cause == episode for blocker in pending):
             return
         self._queue.submit(_blocker(self._queue.make_id(AUDIT_ESCALATION_SENTINEL), response))
+
+
+def _disable_episode(policy: PolicyState) -> str:
+    """The blocker's dedup key: one blocker per disable, so a re-trip after an enable-only re-enable files again."""
+    return f'verify-cache kill switch disabled until {_until(policy)}'
 
 
 def _blocker(escalation_id: str, response: LeakResponse) -> Escalation:
@@ -95,6 +102,7 @@ def _blocker(escalation_id: str, response: LeakResponse) -> Escalation:
         level=2,
         category=EscalationCategory.RISK_IDENTIFIED,
         summary=summary[:_SUMMARY_MAX_CHARS],
+        root_cause=_disable_episode(response.policy),
         detail=_blocker_detail(records, response),
         suggested_action=(
             "Find the input the leaked units' cache keys missed, using the leak records in the detail. "

@@ -277,6 +277,18 @@ def _config(project: Path) -> Path:
     return cfg
 
 
+class TestLeakRecordParse:
+    @pytest.mark.parametrize('text', [
+        'not json',
+        '[]',
+        '{"unit_id": "module:alpha:test"}',
+    ])
+    def test_a_malformed_record_is_rejected_naming_it(self, text):
+        with pytest.raises(ValueError, match='malformed verify-cache leak record') as raised:
+            audit.LeakRecord.parse(text)
+        assert repr(text) in str(raised.value)
+
+
 class TestEnableCli:
     def test_enable_clears_a_disabled_registry_and_status_shows_it(self, tmp_path):
         seeded = _Seeded(registry.registry_db_path(tmp_path), t0=datetime.now(UTC))
@@ -398,6 +410,23 @@ class TestAuditHook:
         hooked.call(_reproduced(ALPHA_NODE, BETA_NODE), head='c3' * 20)
         assert [esc.id for esc in hooked.pending()] != [blocker.id]
         assert len(hooked.pending()) == 1
+
+    def test_a_re_trip_after_an_enable_only_re_enable_files_a_new_blocker(self, hooked):
+        hooked.call(_reproduced(ALPHA_NODE, BETA_NODE))
+        [first] = hooked.pending()
+        asyncio.run(audit.enable(hooked.seeded.registry, 'root cause fixed', hooked.seeded.now))
+        hooked.seeded.advance(timedelta(days=3))
+        retrip_head = 'c4' * 20
+        hooked.seeded.fresh_leak_source(KA, retrip_head)
+        hooked.seeded.fresh_leak_source(KB, retrip_head)
+
+        hooked.call(_reproduced(ALPHA_NODE, BETA_NODE), head=retrip_head)
+
+        until = hooked.seeded.policy().disabled_until
+        assert until is not None
+        [second] = [esc for esc in hooked.pending() if esc.id != first.id]
+        assert until.isoformat() in second.summary, second.summary
+        assert retrip_head in second.detail, second.detail
 
     def test_row_14_a_red_on_a_unit_that_ran_takes_the_ordinary_path(self, hooked):
         assert hooked.call(_reproduced(GAMMA_NODE)) == ()

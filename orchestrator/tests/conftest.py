@@ -102,7 +102,6 @@ from orchestrator.config import (  # noqa: E402
     SandboxConfig,
 )
 from orchestrator.merge_lane import worker  # noqa: E402
-from orchestrator.verify_cache.modes import VERIFY_CACHE_ENV  # noqa: E402
 
 # Belt-and-braces direct assignment: defeats any import-order race where
 # orchestrator.merge_lane.worker was imported (by another conftest/plugin) before
@@ -376,6 +375,8 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
     monkeypatch.setenv("ORCH_VERIFY_USE_CGROUP_SCOPE", "false")
     monkeypatch.setenv("ORCH_VERIFY_COLD_PREPROVISION_COMMAND", "")
+    from orchestrator.verify_cache.modes import VERIFY_CACHE_ENV
+
     monkeypatch.delenv(VERIFY_CACHE_ENV, raising=False)
 
 
