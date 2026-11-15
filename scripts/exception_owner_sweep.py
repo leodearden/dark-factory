@@ -457,60 +457,22 @@ def _carriers(ports: Ports, field: str) -> tuple[liveness.TaskRow, ...]:
     return _from_store(ports.db, lambda: liveness.read_tasks_carrying(ports.db, field))
 
 
-@dataclass(frozen=True)
-class _StoreHomes:
-    """The store rows that can answer a finding: key carriers, and tasks converted from an escalation."""
-
-    carriers: tuple[liveness.TaskRow, ...]
-    conversions: tuple[liveness.TaskRow, ...]
-
-
-def _store_homes(ports: Ports) -> _StoreHomes:
-    return _StoreHomes(_carriers(ports, FINDING_KEY_FIELD), _carriers(ports, CONVERTED_FROM_FIELD))
-
-
-def _converted_from(rows: Sequence[liveness.TaskRow], ids: frozenset[str]) -> tuple[liveness.TaskRow, ...]:
-    """The *rows* converted from an escalation *ids* names, matched exactly."""
-    return tuple(
-        row for row in rows if isinstance(source := row.metadata.get(CONVERTED_FROM_FIELD), str) and source in ids
-    )
-
-
-@dataclass(frozen=True)
-class FindingHomes:
-    """The tasks that answer one finding: those carrying its key, and those converted from its escalations."""
-
-    carrying: tuple[liveness.TaskRow, ...]
-    converted: tuple[liveness.TaskRow, ...]
-
-    def latest_task_id(self) -> int:
-        """The newest home, which a re-raise names.
-
-        A task converted from a re-raise naming N is created after N, so it is
-        the one named once it closes in turn, and no two re-raises share a title.
-        """
-        rows = (*self.carrying, *self.converted)
-        if not rows:
-            raise ValueError('a finding with no home task has no closed home to name')
-        return max(row.id for row in rows)
-
-
-def finding_homes(key: FindingKey, store: _StoreHomes, filed: frozenset[str]) -> FindingHomes:
-    """*key*'s homes in *store*, where *filed* is every escalation id ever filed under *key*."""
-    carrying = tuple(
-        row for row in store.carriers if FindingKey.from_record(row.metadata.get(FINDING_KEY_FIELD)) == key
-    )
-    return FindingHomes(carrying, _converted_from(store.conversions, filed))
-
-
 def _result_strings(answer: Mapping[str, object], tool: str, field: str) -> frozenset[str]:
-    """Every record's str *field* in an escalation read's ``{'result': [...]}`` answer."""
+    """Every record's str *field* in an escalation read's ``{'result': [...]}`` answer.
+
+    A record without one means the server's compact projection changed shape;
+    dropping it would read as an empty queue or history, so it is a failure.
+    """
     records = answer.get('result')
     if not isinstance(records, list):
         raise SweepFailure(FailureStage.ESCALATION, f'{tool} answered {answer!r}, not a result list')
-    return frozenset(
-        record[field] for record in records if isinstance(record, dict) and isinstance(record.get(field), str)
-    )
+    values = []
+    for record in records:
+        value = record.get(field) if isinstance(record, dict) else None
+        if not isinstance(value, str):
+            raise SweepFailure(FailureStage.ESCALATION, f'{tool} answered a record with no str `{field}`: {record!r}')
+        values.append(value)
+    return frozenset(values)
 
 
 def pending_escalation_ids(escalation: ToolCall) -> frozenset[str]:
@@ -575,6 +537,35 @@ def _any_open(rows: Sequence[liveness.TaskRow]) -> bool:
     return any(row.liveness() is OwnerLiveness.OPEN for row in rows)
 
 
+@dataclass(frozen=True)
+class FindingHomes:
+    """The tasks that answer one finding: those carrying its key, and those converted from its escalations.
+
+    ``converted`` is read only once neither of the key's own rungs
+    (:func:`_skip_by_key`) answers, because :func:`decide` reads it no sooner.
+    """
+
+    carrying: tuple[liveness.TaskRow, ...]
+    converted: tuple[liveness.TaskRow, ...] = ()
+
+    def latest(self) -> liveness.TaskRow | None:
+        """The newest home, which a re-raise names; None when there is none.
+
+        A task converted from a re-raise naming N is created after N, so it is
+        the one named once it stops being open in turn.
+        """
+        return max((*self.carrying, *self.converted), key=lambda row: row.id, default=None)
+
+
+def _skip_by_key(key: FindingKey, carrying: Sequence[liveness.TaskRow], pending: frozenset[str]) -> Action | None:
+    """The skip *key* earns itself: a live task holding it, or a pending escalation in its slot."""
+    if _any_open(carrying):
+        return Action.SKIP_LIVE_TASK
+    if key.escalation_task_id() in pending:
+        return Action.SKIP_PENDING_ESCALATION
+    return None
+
+
 def decide(key: FindingKey, *, homes: FindingHomes, pending: frozenset[str]) -> Action:
     """What to do about *key*: nothing where it is already raised, else raise it once.
 
@@ -583,12 +574,11 @@ def decide(key: FindingKey, *, homes: FindingHomes, pending: frozenset[str]) -> 
     ``task_id`` slot; and a live task among ``homes.converted``, the tasks
     converted from any escalation ever filed in that slot (every sweep
     escalation is an info L0 the router converts).  A dead-owner finding whose
-    home of either kind has closed escalates, and is never re-filed.
+    home of either kind is no longer open escalates, and is never re-filed.
     """
-    if _any_open(homes.carrying):
-        return Action.SKIP_LIVE_TASK
-    if key.escalation_task_id() in pending:
-        return Action.SKIP_PENDING_ESCALATION
+    skip = _skip_by_key(key, homes.carrying, pending)
+    if skip is not None:
+        return skip
     if _any_open(homes.converted):
         return Action.SKIP_CONVERTED_TASK
     if (homes.carrying or homes.converted) and key.kind.escalates_when_closed:
@@ -596,6 +586,50 @@ def decide(key: FindingKey, *, homes: FindingHomes, pending: frozenset[str]) -> 
     if key.scope in (None, INLINE_SCOPE):
         return Action.FILE_TASK
     return Action.FILE_ESCALATION
+
+
+class _HomeReader:
+    """One run's reads of finding homes, in :func:`decide`'s rung order.
+
+    The escalation history and the converted tasks are read only for a key
+    its own rungs leave unanswered, and the converted tasks only when that
+    history is non-empty.  Store rows are kept until a ``fresh`` read.  A
+    key's history is read once per run: the only escalation the run can add
+    under it is its own, which ``pending`` already holds.
+    """
+
+    def __init__(self, ports: Ports) -> None:
+        self._ports = ports
+        self._rows: dict[str, tuple[liveness.TaskRow, ...]] = {}
+        self._filed_under: dict[FindingKey, frozenset[str]] = {}
+
+    def _rows_carrying(self, field: str, *, fresh: bool) -> tuple[liveness.TaskRow, ...]:
+        if fresh or field not in self._rows:
+            self._rows[field] = _carriers(self._ports, field)
+        return self._rows[field]
+
+    def _filed(self, key: FindingKey) -> frozenset[str]:
+        if key not in self._filed_under:
+            self._filed_under[key] = escalation_ids_filed_under(self._ports.escalation, key)
+        return self._filed_under[key]
+
+    def homes(self, key: FindingKey, pending: frozenset[str], *, fresh: bool) -> FindingHomes:
+        carrying = tuple(
+            row
+            for row in self._rows_carrying(FINDING_KEY_FIELD, fresh=fresh)
+            if FindingKey.from_record(row.metadata.get(FINDING_KEY_FIELD)) == key
+        )
+        if _skip_by_key(key, carrying, pending) is not None:
+            return FindingHomes(carrying)
+        filed = self._filed(key)
+        if not filed:
+            return FindingHomes(carrying)
+        converted = tuple(
+            row
+            for row in self._rows_carrying(CONVERTED_FROM_FIELD, fresh=fresh)
+            if isinstance(source := row.metadata.get(CONVERTED_FROM_FIELD), str) and source in filed
+        )
+        return FindingHomes(carrying, converted)
 
 
 @dataclass(frozen=True)
@@ -747,22 +781,36 @@ def _unconfirmed_body(body: _Body, filing: FilingOutcome) -> _Body:
     return dataclasses.replace(body, detail=f'{body.detail}\n{why}', observation=f'{body.observation}; {why}')
 
 
-def _reraised_body(body: _Body, home: int) -> _Body:
-    """*body* raised again after its home task *home* closed with the owner still dead.
+def _reraised_body(body: _Body, home: liveness.TaskRow) -> _Body:
+    """*body* raised again after its home task *home* stopped being open, with the owner still dead.
 
     The store's (title, files) candidate_key index covers done rows, and the
     router titles a conversion with the summary and declares no files, so
-    naming the closed home keeps each re-raise distinct from the task it
-    follows (precedent:
+    naming the home and its status keeps each re-raise distinct from the task
+    it follows (precedent:
     ``fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title``).
     """
-    closed = f'task {home}, which answered this finding, closed while the owner is still dead'
+    left = (
+        f'task {home.id}, which answered this finding, is no longer open '
+        f'(status {home.status!r}) while the owner is still dead'
+    )
     return dataclasses.replace(
         body,
-        summary=f'{body.summary}, after task {home} closed',
-        detail=f'{body.detail}\nRaised again: {closed}.',
-        observation=f'{body.observation}; {closed}',
+        summary=f'{body.summary}, after task {home.id} became {home.status!r}',
+        detail=f'{body.detail}\nRaised again: {left}.',
+        observation=f'{body.observation}; {left}',
     )
+
+
+def _home_to_name(key: FindingKey, homes: FindingHomes) -> liveness.TaskRow:
+    """The home a re-raise of *key* names: :func:`decide` plans one only when a home exists."""
+    home = homes.latest()
+    if home is None:
+        raise ValueError(
+            f'{key.escalation_task_id()}: planned {Action.ESCALATE_CLOSED_FINDING.value} '
+            'but the finding has no home task to name'
+        )
+    return home
 
 
 def _escalate(key: FindingKey, body: _Body, ports: Ports, now: datetime.datetime) -> None:
@@ -920,41 +968,35 @@ class _Outputs:
         self.reports: list[Report] = []
         self.tighten: Performed | None = None
         self.rolled_up = False
-        self._store: _StoreHomes | None = None
-        self._filed_under: dict[FindingKey, frozenset[str]] = {}
+        self._homes = _HomeReader(ports)
 
     def tally(self) -> Tally:
         return Tally(tuple(self.reports), self.tighten, self.rolled_up)
 
-    def _homes_of(self, key: FindingKey, *, reread: bool) -> FindingHomes:
-        if reread or self._store is None:
-            self._store = _store_homes(self.ports)
-        if key not in self._filed_under:
-            self._filed_under[key] = escalation_ids_filed_under(self.ports.escalation, key)
-        return finding_homes(key, self._store, self._filed_under[key])
+    def _decide(self, key: FindingKey, *, fresh: bool) -> tuple[Action, FindingHomes]:
+        pending = frozenset(self.pending)
+        homes = self._homes.homes(key, pending, fresh=fresh)
+        return decide(key, homes=homes, pending=pending), homes
 
     def raise_finding(self, key: FindingKey, body: _Body) -> Performed:
         """Perform at most one budgeted output for *key*, returning the step taken.
 
-        The store homes are re-read only where an output can follow (INV-3), so
-        a finding that ends skipped or held back costs no further store scan.
-        A key's escalation history is read once per run: the only escalation
-        the run can add to it is its own, which ``pending`` already holds.
-        A closed home is named in its re-raise, read from the act-time homes.
+        The homes are re-read only where an output can follow (INV-3), so a
+        finding that ends skipped or held back costs no further store scan.
+        A home no longer open is named in its re-raise, read from the act-time homes.
         """
-        if decide(key, homes=self._homes_of(key, reread=False), pending=frozenset(self.pending)) in _SKIPS:
+        if self._decide(key, fresh=False)[0] in _SKIPS:
             return Performed.SKIPPED_EXISTING
         if self.budget == 0:
             return Performed.OVERFLOW
-        homes = self._homes_of(key, reread=True)
-        action = decide(key, homes=homes, pending=frozenset(self.pending))
+        action, homes = self._decide(key, fresh=True)
         if action in _SKIPS:
             return Performed.SKIPPED_EXISTING
         self.budget -= 1
         if action is Action.FILE_TASK:
             return self._file(key, body)
         if action is Action.ESCALATE_CLOSED_FINDING:
-            body = _reraised_body(body, homes.latest_task_id())
+            body = _reraised_body(body, _home_to_name(key, homes))
         self._escalate(key, body)
         return Performed.ESCALATED
 
@@ -1083,11 +1125,10 @@ class RunConfig:
 
 def plan(scan: Scan, ports: Ports) -> Tally:
     """Each citation's planned step as of *scan*, ignoring the output bound; reads only."""
-    store = _store_homes(ports)
+    reader = _HomeReader(ports)
 
     def planned(key: FindingKey) -> Action:
-        homes = finding_homes(key, store, escalation_ids_filed_under(ports.escalation, key))
-        return decide(key, homes=homes, pending=scan.pending)
+        return decide(key, homes=reader.homes(key, scan.pending, fresh=False), pending=scan.pending)
 
     reports = []
     for citation in scan.register.citations:
