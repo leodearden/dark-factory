@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import sys
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +25,7 @@ EXIT_NOT_FOUND = 1
 EXIT_NO_CHECKOUT = 3
 
 ARCHIVE_STORE = 'agent-transcript archive'
+INTERACTIVE_STORE = 'interactive sessions'
 
 
 @dataclass(frozen=True)
@@ -51,20 +52,34 @@ def resolve_project_root(explicit: Path | None, cwd: Path) -> Path:
     return main_checkout_of(cwd)
 
 
-def search_archive(archive_root: Path, session_id: str) -> RootSearch:
-    if not archive_root.exists():
-        return RootSearch(archive_root, ARCHIVE_STORE, (), 'absent')
+def _search_entries(
+    root: Path, store: str, locate: Callable[[Path], Path | None]
+) -> RootSearch:
+    if not root.exists():
+        return RootSearch(root, store, (), 'absent')
     try:
-        keys = [entry.name for entry in archive_root.iterdir()]
+        located = [locate(entry) for entry in root.iterdir()]
     except OSError as exc:
-        return RootSearch(archive_root, ARCHIVE_STORE, (), f'unreadable: {exc}')
-    located = (durable_archive_path(archive_root, key, session_id) for key in keys)
-    matches = tuple(sorted(path for path in located if path is not None))
-    return RootSearch(archive_root, ARCHIVE_STORE, matches, None)
+        return RootSearch(root, store, (), f'unreadable: {exc}')
+    return RootSearch(root, store, tuple(sorted(p for p in located if p is not None)), None)
+
+
+def search_archive(archive_root: Path, session_id: str) -> RootSearch:
+    return _search_entries(
+        archive_root,
+        ARCHIVE_STORE,
+        lambda key_dir: durable_archive_path(archive_root, key_dir.name, session_id),
+    )
 
 
 def search_cli_projects(projects_dir: Path, session_id: str) -> RootSearch:
-    return RootSearch(projects_dir, 'interactive sessions', (), None)
+    # The Claude CLI's own <config>/projects/<enc>/<sid>.jsonl layout; its other
+    # home is shared/src/shared/cli_invoke.py::_resolve_transcript_path.
+    def locate(encoded_dir: Path) -> Path | None:
+        transcript = encoded_dir / f'{session_id}.jsonl'
+        return transcript if transcript.is_file() else None
+
+    return _search_entries(projects_dir, INTERACTIVE_STORE, locate)
 
 
 def _miss_report(session_id: str, searches: Sequence[RootSearch]) -> str:
@@ -100,7 +115,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return EXIT_NO_CHECKOUT
-    searches = (search_archive(agent_transcripts_dir(project_root), session_id),)
+    searches = (
+        search_archive(agent_transcripts_dir(project_root), session_id),
+        search_cli_projects(Path.home() / '.claude' / 'projects', session_id),
+    )
     matches = [path for search in searches for path in search.matches]
     for path in matches:
         print(path)
