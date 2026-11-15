@@ -16,9 +16,9 @@ from pydantic import ValidationError
 from shared.project_layout import scheduler_state_json
 from shared.scheduler_state import PinQueueEntry, SchedulerStateSnapshot
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, UnlimitedHolderLocksConfig
 from orchestrator.event_store import EventType
-from orchestrator.lock_table import ModuleLockTable
+from orchestrator.lock_table import ModuleLockTable, one_holder_per_key
 from orchestrator.overrides import OverrideStore
 from orchestrator.pin_reservation import PinOrder
 from orchestrator.scheduler import Scheduler
@@ -552,7 +552,7 @@ _SNAPSHOT_KEYS = frozenset({
     'skip_counts', 'parks', 'park_stacks', 'effective_priorities',
     'pin_queue', 'overrides', 'current_holders', 'lock_depth', 'snapshot_at',
     'is_paused', 'pause_reason', 'pause_class', 'requeue_cooldowns',
-    'pin_reservations',
+    'pin_reservations', 'held_by_task',
 })
 
 
@@ -585,6 +585,7 @@ class TestGetStateSnapshotShape:
         assert snap.pin_queue == ()
         assert snap.overrides == {}
         assert snap.current_holders == {}
+        assert snap.held_by_task == {}
         assert snap.requeue_cooldowns == {}
         assert snap.pin_reservations == {}
         assert snap.snapshot_at is not None
@@ -676,6 +677,31 @@ class TestGetStateSnapshotShape:
         snap = scheduler.get_state_snapshot()
         with pytest.raises(ValidationError):
             snap.is_paused = True
+
+
+@pytest.mark.usefixtures('code_default_config')
+class TestGetStateSnapshotNamesEveryHolder:
+    @pytest.mark.parametrize('order', [('A', 'B'), ('B', 'A')])
+    def test_both_holders_of_an_unlimited_key_are_published(self, order):
+        first, second = order
+        scheduler = Scheduler(OrchestratorConfig(
+            max_per_module=1,
+            unlimited_holder_locks=UnlimitedHolderLocksConfig(root_markdown=True),
+        ))
+        scheduler.finish_startup()
+        assert scheduler.lock_table.try_acquire(first, ['OPERATIONS.md'])
+        assert scheduler.lock_table.try_acquire(second, ['OPERATIONS.md'])
+
+        snap = scheduler.get_state_snapshot()
+
+        assert snap.held_by_task == {
+            first: ('OPERATIONS.md',),
+            second: ('OPERATIONS.md',),
+        }
+        assert snap.current_holders == one_holder_per_key(snap.held_by_task)
+        assert snap.holder_task_ids() == {first, second}
+        round_tripped = SchedulerStateSnapshot.from_json(json.loads(json.dumps(snap.to_json())))
+        assert round_tripped.holder_task_ids() == {first, second}
 
 
 # ===========================================================================

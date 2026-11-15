@@ -90,7 +90,11 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.hold_history import HoldHistory
 from orchestrator.id_tie_break import id_tie_break
-from orchestrator.lock_table import ModuleLockTable, UncontestedAcquisition
+from orchestrator.lock_table import (
+    ModuleLockTable,
+    UncontestedAcquisition,
+    one_holder_per_key,
+)
 from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideSource, OverrideStore
@@ -7628,6 +7632,7 @@ class Scheduler:
                         exc_info=True,
                     )
 
+        held_by_task = self.lock_table.snapshot_held_by_task()
         return SchedulerStateSnapshot(
             skip_counts=dict(self._skip_count),
             parks=_park_records(self.lock_table.snapshot_parks()),
@@ -7639,7 +7644,8 @@ class Scheduler:
             effective_priorities=dict(self._last_effective_priorities),
             pin_queue=tuple(pin_queue),
             overrides=overrides,
-            current_holders=self.lock_table.snapshot_holders(),
+            current_holders=one_holder_per_key(held_by_task),
+            held_by_task=held_by_task,
             lock_depth=self.config.lock_depth,
             is_paused=self.is_paused,
             pause_reason=self.pause_reason,
