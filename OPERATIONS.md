@@ -5067,6 +5067,17 @@ The ladder row above is a host claim. An agent cannot run the installer (see
 `systemctl --user list-timers --all` lists
 `fused-memory-duplicate-audit.timer`.
 
+### Plan-decision cross-pairing scan (on demand, no timer)
+
+To check whether plans carry `design_decisions` entries whose decision and
+rationale are wrongly paired, re-run the read-only scanner rather than quote
+the dated figures: `python scripts/scan_plan_decision_pairing.py`. Unattended,
+use `python scripts/scan_plan_decision_pairing.py --fail-on-hit --require-scanned 1`;
+plain `--fail-on-hit` exits 0 when the sweep read nothing (exit 3 is the
+coverage floor). The findings, and why no write-time containment exists, are in
+[docs/plan-decision-cross-pairing.md](docs/plan-decision-cross-pairing.md); see
+the CHANGELOG entry for task 3967.
+
 ---
 
 ## 12a. INV-12 `exceptions-owned-or-ratified`: the exception register and owner sweep
