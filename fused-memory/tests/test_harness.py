@@ -21220,6 +21220,41 @@ def _promote_like_orphan_reaper(queue, esc_id) -> str:
     return promoted_id
 
 
+def _promote_like_info_l0_router(queue, esc_id) -> str:
+    """Simulate `orchestrator/escalation_router.py::_promote`, the curator-refusal fallback.
+
+    orchestrator is not a fused-memory dependency, so its close is reproduced
+    here: the L0 dismissed by the router with no resolution class, and a NEW L1
+    whose detail is the L0's followed by the router's `[info-l0-router]` block.
+    """
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+
+    esc = queue.get(esc_id)
+    promoted_id = queue.make_id(esc.task_id)
+    queue.resolve(
+        esc_id,
+        f'Promoted by the info-L0 router (orphan-reaper) to {promoted_id}: ticket_refused',
+        dismiss=True,
+        resolved_by='info-l0-router',
+    )
+    queue.submit(Escalation(
+        id=promoted_id,
+        task_id=esc.task_id,
+        agent_role='harness-info-l0-router',
+        severity=esc.severity,
+        category=esc.category,
+        summary=f'Info note not converted to a task (ticket_refused): {esc.summary}'[:200],
+        detail=(
+            (esc.detail or esc.summary)
+            + '\n\n[info-l0-router] This info note was not converted to a task: '
+            'ticket_refused (curator ticket tkt_1: duplicate).'
+        ),
+        suggested_action='convert_to_task',
+        level=1,
+    ))
+    return promoted_id
+
+
 def _convert_like_info_l0_router(queue, esc_id, converted_task_id='9001') -> None:
     """Simulate `orchestrator/escalation_router.py::_close_converted`.
 
@@ -21682,6 +21717,10 @@ def test_router_converted_prior_record_holds_back_the_refile(
 
     assert second is None, f'a freshly converted finding must not refile, got {second!r}'
     assert _routed_records(queue_dir) == []
+    converted = EscalationQueue(queue_dir).get(first)
+    assert converted is not None and converted.refiles_suppressed == 1, (
+        'the held-back refile must leave the INV-4 storm counter on the converted record'
+    )
 
 
 def test_conversion_of_one_finding_does_not_hold_back_a_distinct_one(
@@ -21731,13 +21770,21 @@ def test_conversion_older_than_the_recurrence_window_does_not_hold_back_the_refi
     )
 
 
-def test_router_promotion_is_not_a_conversion(
-    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+@pytest.mark.parametrize(
+    'promote',
+    [_promote_like_orphan_reaper, _promote_like_info_l0_router],
+    ids=['orphan-reaper', 'info-l0-router-refusal'],
+)
+def test_promotion_is_not_a_conversion(
+    promote, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
 ):
     """A promoted and then adjudicated finding refiles: promotion never stamps 'converted'.
 
     The dismissed L0 carries no 'converted' class, and the promoted L1's
     suffixed detail carries no readable fingerprint, so neither holds it back.
+    Both promoters a routed L0 can meet are run: the orphan reaper (router
+    off) and the info-L0 router's fallback after a curator refusal (router on,
+    the default).
     """
     from escalation.queue import EscalationQueue
 
@@ -21747,7 +21794,7 @@ def test_router_promotion_is_not_a_conversion(
 
     first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
     assert first
-    promoted = _promote_like_orphan_reaper(queue, first)
+    promoted = promote(queue, first)
     queue.resolve(promoted, 'adjudicated by operator')
 
     after = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)

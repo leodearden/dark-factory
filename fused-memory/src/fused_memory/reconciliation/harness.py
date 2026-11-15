@@ -2717,6 +2717,9 @@ class ReconciliationHarness:
         - a routed record of this finding that the info-L0 router converted to
           a task within the recurrence window
           (:func:`~fused_memory.reconciliation.finding_task_escalation.recent_conversion_suppresses_refile`).
+          Each refile it holds back bumps that record's ``refiles_suppressed``
+          counter (``EscalationQueue.note_suppressed_refile``, the INV-4 storm
+          counter the citation path keeps too).
 
         LEVEL 0, deliberately: `EscalationQueue.has_open_l1` is level-1-only
         and is what a spread of orchestrator guards read as "a human is already
@@ -2852,6 +2855,7 @@ class ReconciliationHarness:
                         'converted_at': converted.resolved_at,
                     },
                 )
+                queue.note_suppressed_refile(converted.id)
                 return None
             esc = Escalation(  # type: ignore[possibly-undefined]
                 id=queue.make_id(task_id),
