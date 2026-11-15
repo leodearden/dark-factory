@@ -538,6 +538,83 @@ class TestUnverifiableVerdict:
             )
 
 
+def _recheck_with_rc(rc: int):
+    return gate.run_substrate_recheck(
+        task=make_probe_task(), worktree='/gate/wt', run_subprocess=fake_checker(rc=rc),
+    )
+
+
+_PROBE_FLIP_SUMMARY = 'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task 9)'
+
+
+class TestFlipEscalationText:
+    """``flip_escalation_text`` renders what each FLIP verdict actually established."""
+
+    @pytest.mark.parametrize(
+        'make_verdict',
+        [
+            pytest.param(lambda: _recheck_with_rc(1), id='rc1-fail'),
+            pytest.param(lambda: _recheck_with_rc(2), id='rc2-unprovable'),
+            pytest.param(lambda: _flip_verdict(), id='flip-fixture'),
+        ],
+    )
+    def test_probe_flip_keeps_the_pass_to_fail_text(self, make_verdict):
+        verdict = make_verdict()
+        text = gate.flip_escalation_text('9', verdict)
+        assert text.summary == _PROBE_FLIP_SUMMARY
+        assert f'Reason: {verdict.reason}' in text.detail
+        assert 're-spec required' in text.detail
+
+    def test_unverifiable_flip_claims_nothing_was_established(self):
+        reason = (
+            'substrate unverifiable / git worktree add failed (rc=128): '
+            'fatal: invalid reference: main'
+        )
+        verdict = gate.unverifiable_verdict(
+            reason, exit_code=128, stderr='fatal: invalid reference: main',
+        )
+        text = gate.flip_escalation_text('9', verdict)
+
+        assert text.summary.startswith('SUBSTRATE_UNVERIFIED: task 9 '), text.summary
+        assert 'nothing' in text.summary, text.summary
+        assert 'established' in text.summary, text.summary
+        assert 'PASS→FAIL' not in text.summary, text.summary
+        assert 'FLIP' not in text.summary, text.summary
+
+        assert reason in text.detail, text.detail
+        assert 'fatal: invalid reference: main' in text.detail, text.detail
+        assert 'not evidence' in text.detail.lower(), text.detail
+        assert 'do not re-spec' in text.detail.lower(), text.detail
+        assert 'unblock' in text.detail, text.detail
+        for probe_claim in ('PASS→FAIL', 'no longer holds', 're-spec required'):
+            assert probe_claim not in text.detail, text.detail
+
+    def test_routes_on_the_field_not_the_reason_string(self):
+        scary_reason = gate.SubstrateVerdict(
+            verdict=gate.FLIP, exit_code=1, checker_argv=None, probe_set='p.json',
+            reason='substrate unverifiable / looks scary',
+        )
+        assert gate.flip_escalation_text('9', scary_reason).summary == _PROBE_FLIP_SUMMARY
+
+        malformed = gate.run_substrate_recheck(
+            task={'id': '9', 'metadata': {'substrate_probe': 'oops'}},
+            worktree='/gate/wt', run_subprocess=fake_checker(rc=0),
+        )
+        assert 'unverifiable' not in malformed.reason
+        assert gate.flip_escalation_text('9', malformed).summary.startswith('SUBSTRATE_UNVERIFIED')
+
+    @pytest.mark.parametrize(
+        'make_verdict',
+        [
+            pytest.param(lambda: _pass_verdict(), id='pass'),
+            pytest.param(lambda: _skip_verdict(), id='skip'),
+        ],
+    )
+    def test_refuses_a_non_flip_verdict(self, make_verdict):
+        with pytest.raises(ValueError, match='requires a FLIP verdict'):
+            gate.flip_escalation_text('9', make_verdict())
+
+
 # ---------------------------------------------------------------------------
 # Step-7 RED: harness _run_substrate_gate + _block_and_escalate_substrate_flip
 # ---------------------------------------------------------------------------
