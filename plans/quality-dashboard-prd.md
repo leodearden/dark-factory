@@ -403,7 +403,13 @@ negative, so an EWMA chart can never show improvement at these rates.
       marker wherever a params key differs or is unknown on either side, labelling an unknown key
       ` (unknown)` (`::_changed_params`). The marker therefore sits where the point's diff opens "params
       differ", including at a schema-2 → 3 change. `quality_marker_sampler.py::refresh_markers` reads
-      the identities from the stored scan.
+      the identities from the stored scan. `SnapshotIdentity` also carries the point's `point_id` and
+      the `previous_id` its diff is against (`quality_snapshots.py::PointDiff`).
+      `quality_markers.py::instrument_markers` pairs each point with that predecessor, ids the marker
+      `instrument:<point_id>` and names the point in `source.point`, so two points at one commit never
+      share an id. `quality_view.js::snapshotMarks` places the mark by `source.point`, so the mark
+      sits on the point whose diff opens "params differ", also when a baseline and a nightly file
+      share a commit.
     - Instrument markers are drawn on the snapshot charts and not on the landing charts:
       `dashboard/src/dashboard/static/redux/quality_view.js::qualityMarks` drops them, since
       `quality_markers.py::REGIME_ROLE` gives them no landing-axis role. The snapshot axis is one column
@@ -420,7 +426,11 @@ negative, so an EWMA chart can never show improvement at these rates.
       `dashboard/tests/test_boundary_js.py::test_quality_sketch_20_snapshot_step_series`, over
       `dashboard/tests/_boundary_payloads.py::_quality_snapshot_family`, which runs the real snapshot
       and marker ticks. Its client half is the `quality #20:` cases of
-      `dashboard/tests/js/boundary_quality.test.mjs`.
+      `dashboard/tests/js/boundary_quality.test.mjs`. The same family's same-commit scenario, a
+      baseline and a nightly file at one commit, is asserted by
+      `dashboard/tests/test_boundary_js.py::test_quality_same_commit_instrument_marker_names_the_nightly_point`
+      and by the matching `quality #20:` client case, which places the instrument mark at the
+      nightly's column.
 21. **Where statistics live**: in the shared producer, not the dashboard module (Leo, 11-04:
     recommended (ii)). `shared/src/shared/memory_eval_limits.py` is left untouched; the quality
     statistics need Wilson, Newcombe, bootstrap, EWMA, CUSUM and Theil–Sen, none of which it has, and
@@ -618,7 +628,7 @@ that γ and δ build on; `shared/src/shared/quality_series/stats.py` is the sing
  modules: [{module, landings, metrics: {...}}],
  before_after: [{marker_id, n_before, n_after, effect, lo, hi, state, eta_days, min_detectable}]}
 Marker = {id, at, ordinal|null, kind, scope: project|'fleet', series: [..]|null, until|null, label,
-          source: {type, role?, path?, file?}, ref}
+          source: {type, role?, path?, file?, point?}, ref}
 SnapshotPoint = {as_of_sha, committed_at, params, complete, baseline: bool, members: {...}, h14: {...},
                  cycles: {...}, deferred_imports, cycle_closing_imports, private_patch_targets}
 ```
