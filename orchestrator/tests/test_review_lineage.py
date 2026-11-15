@@ -8,11 +8,13 @@ only, with no git and no mocks.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+import shutil
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from orchestrator import review_lineage
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.quarantine_provenance import stamp_quarantined_from
 from orchestrator.review_lineage import retire_quarantined_lineages
@@ -197,3 +199,51 @@ class TestAcknowledgement:
         assert (second.parking, second.amendment_rounds_total) == (second_parking, 0)
         assert artifacts.get_amendment_rounds_total() == 0
         assert retire_quarantined_lineages(artifacts) == ()
+
+
+class TestRetiredReviewsSince:
+    @pytest.fixture()
+    def retired(self, artifacts: TaskArtifacts, parked) -> dict[str, object]:
+        assert retire_quarantined_lineages(artifacts)
+        return parked
+
+    def test_no_since_returns_the_retired_lineage_with_its_suggestions(self, artifacts: TaskArtifacts, retired):
+        (review,) = review_lineage.retired_reviews_since(artifacts, None)
+
+        assert review.branch == retired['branch']
+        assert review.archive == artifacts.artifact_path(f'retired-reviews/{_PARKING_NAME}')
+        (suggestion,) = review.suggestions
+        assert suggestion['description'] == _SUGGESTION['description']
+        assert suggestion['suggested_fix'] == _SUGGESTION['suggested_fix']
+
+    def test_a_plan_confirmed_after_the_quarantine_has_nothing_pending(self, artifacts: TaskArtifacts, retired):
+        after = datetime.fromisoformat(str(retired['quarantined_at'])) + timedelta(minutes=1)
+
+        assert review_lineage.retired_reviews_since(artifacts, after) == ()
+
+    def test_a_plan_confirmed_before_the_quarantine_still_has_it_pending(self, artifacts: TaskArtifacts, retired):
+        before = datetime.fromisoformat(str(retired['quarantined_at'])) - timedelta(minutes=1)
+
+        (review,) = review_lineage.retired_reviews_since(artifacts, before)
+
+        assert review.parking == retired['parking']
+
+    def test_an_amend_round_of_only_blocking_issues_carries_nothing(self, artifacts: TaskArtifacts):
+        artifacts.set_review_counters(amendment_rounds_total=1)
+        _write_amend_round(artifacts, issues=[_BLOCKING])
+        assert stamp_quarantined_from(artifacts, _stamp())
+        assert retire_quarantined_lineages(artifacts)
+
+        assert review_lineage.retired_reviews_since(artifacts, None) == ()
+
+    def test_a_stamp_without_a_branch_carries_nothing(self, artifacts: TaskArtifacts):
+        _seed_parked_lineage(artifacts)
+        assert stamp_quarantined_from(artifacts, _stamp(branch=None, tip_sha=None, unique_commit_count=None))
+        assert retire_quarantined_lineages(artifacts)
+
+        assert review_lineage.retired_reviews_since(artifacts, None) == ()
+
+    def test_a_deleted_retired_archive_carries_nothing(self, artifacts: TaskArtifacts, retired):
+        shutil.rmtree(artifacts.artifact_path('retired-reviews'))
+
+        assert review_lineage.retired_reviews_since(artifacts, None) == ()
