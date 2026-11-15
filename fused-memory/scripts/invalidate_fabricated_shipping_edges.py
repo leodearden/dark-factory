@@ -221,15 +221,13 @@ async def _run(args: argparse.Namespace) -> int:
 
     from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.maintenance._utils import maintenance_service
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
     config = FusedMemoryConfig()
-    memory = MemoryService(config)
-    await memory.initialize()
-    try:
+    async with maintenance_service(config=config) as (_, memory):
         candidates = await find_shipping_edges(
             memory.graphiti, args.project, op='invalidate_fabricated_shipping_edges',
         )
@@ -278,9 +276,6 @@ async def _run(args: argparse.Namespace) -> int:
             except Exception as e:
                 logger.error('Failed to invalidate %s: %s', c.edge_uuid, e)
         return 0
-    finally:
-        if hasattr(memory, 'close'):
-            await memory.close()
 
 
 def main() -> int:

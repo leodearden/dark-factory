@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -430,18 +431,16 @@ def main() -> int:
     args = parser.parse_args()
 
     async def _run_live() -> int:
-        memory = None
-        if args.apply:
-            from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-            from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        async with contextlib.AsyncExitStack() as stack:
+            memory = None
+            if args.apply:
+                from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+                from fused_memory.maintenance._utils import maintenance_service
 
-            memory = MemoryService(FusedMemoryConfig())
-            await memory.initialize()
-        try:
+                _, memory = await stack.enter_async_context(
+                    maintenance_service(config=FusedMemoryConfig()),
+                )
             report = await run(args, memory=memory)
-        finally:
-            if memory is not None and hasattr(memory, 'close'):
-                await memory.close()
         print(json.dumps(report, indent=2, default=str))
         print(
             f'\n{"[DRY RUN] " if report["dry_run"] else ""}'

@@ -429,16 +429,11 @@ def main() -> int:
 
     async def _run_live() -> dict:
         from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
-        try:
-            await memory.initialize()
+        async with maintenance_service(config=config) as (_, memory):
             return await run(args, memory, invalidation_time=datetime.now(UTC))
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
 
     report = asyncio.run(_run_live())
     print(json.dumps(report, indent=2, default=str))
