@@ -68,10 +68,12 @@ def atomic_write_text(path: Path, text: str) -> None:
     requires JSON on disk to be UTF-8 — under a non-UTF-8 locale this wrote
     bytes that the registries' OWN READERS then reject. Name them precisely, so
     the next investigator does not go looking in the wrong module:
-    ``session_registry.read_record`` raises ``CorruptSessionRecord`` (the decode error is a
-    ``UnicodeDecodeError``, a ``ValueError`` subclass, so it lands in that
-    function's ``except`` clause), ``list_decisions`` and ``reap_stale_leases``
-    log and SKIP the file, and ``_mutate_decision`` returns ``None``. (An
+    ``session_registry.py::read_record`` raises ``CorruptSessionRecord`` (the
+    decode error is a ``UnicodeDecodeError``, a ``ValueError`` subclass, so it
+    lands in that function's ``except`` clause),
+    ``decision_registry.py::list_decisions`` and
+    ``session_registry.py::reap_stale_leases`` log and SKIP the file, and
+    ``decision_registry.py::_mutate_decision`` returns ``None``. (An
     earlier version of this paragraph cited
     ``shared.safe_io.load_json_or_warn``. That helper never reads session,
     decision or lease records — its callers are ``b3_gate``, ``chronic_flake``,
@@ -84,9 +86,10 @@ def atomic_write_text(path: Path, text: str) -> None:
     which is the entire point; ``locale`` is stdlib and importing it would not
     have violated this module's stdlib-only constraint above.
 
-    Error policy stays with the callers: write_record lets a failure propagate
-    (its sole caller, the CLI main(), provides the outer fail-soft boundary);
-    write_decision swallows a failure itself (it is called directly by
+    Error policy stays with the callers: session_registry.py::write_record lets
+    a failure propagate (its sole caller, the CLI main(), provides the outer
+    fail-soft boundary); decision_registry.py::write_decision swallows a
+    failure itself (it is called directly by
     watchers/cockpit code with no such boundary).
     """
     path.parent.mkdir(parents=True, exist_ok=True)

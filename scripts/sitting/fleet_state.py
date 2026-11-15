@@ -39,7 +39,7 @@ from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 from escalation.shadow_ruling import AgreementReport, ClassAgreement, agreement_report
 from orchestrator.digest import ModelRoleRow, query_count_done_in_window, query_model_role_rollup
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     DecisionRecord,
     DecisionState,
     decisions_dir,

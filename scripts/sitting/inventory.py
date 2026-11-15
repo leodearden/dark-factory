@@ -31,7 +31,7 @@ from types import MappingProxyType
 from _task_db_scan import discover_project_roots, tasks_db_path
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     UNKNOWN_QUEUE,
     DecisionRecord,
     DecisionState,

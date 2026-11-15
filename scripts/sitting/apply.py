@@ -67,7 +67,7 @@ from escalation.authority import (
 )
 from escalation.models import Escalation
 from orchestrator.fleet_files import fleet_root
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     AuditVerdict,
     DecisionAuditRefused,
     DecisionRecord,

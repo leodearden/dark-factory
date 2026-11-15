@@ -16,7 +16,7 @@ from pathlib import Path
 
 from dashboard.config import discover_root_escalation_url
 from escalation.store_identity import QueueKind
-from orchestrator.session_registry import normalize_escalations_dir
+from orchestrator.decision_registry import normalize_escalations_dir
 from shared.mcp_post import mcp_server_base
 from shared.project_layout import ESCALATION_QUEUE_RELPATH
 from sitting.inventory import QUEUE_TAGS, RECON_QUEUE_TAG, queue_project_root, queue_tag

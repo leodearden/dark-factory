@@ -22,7 +22,8 @@ from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
-from orchestrator.session_registry import DecisionRecord, SessionRecord
+from orchestrator.decision_registry import DecisionRecord
+from orchestrator.session_registry import SessionRecord
 from textual.widgets import Static
 
 from cockpit.panes.placeholders import ABSENT_PLACEHOLDER
