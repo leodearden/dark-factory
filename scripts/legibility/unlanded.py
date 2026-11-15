@@ -49,7 +49,9 @@ COMMIT_BACKOFF_SECONDS = 0.2
 QUARANTINE_DIRNAME = 'quarantine'
 
 RUNBOOK_SECTION = 'Unlanded legibility writes and the quarantine'
-"""The OPERATIONS.md heading of the runbook for recovering a quarantine."""
+"""The heading, in dark-factory's OPERATIONS.md, of the runbook for recovering
+a quarantine. The escalations go to the TARGET project, so the pointer names
+the repo the runbook lives in."""
 
 GIT_TIMEOUT_SECONDS = 60.0
 """Bound on each git call :func:`roll_back` makes: a hung git becomes a
@@ -170,7 +172,7 @@ class Rollback:
     def describe(self) -> str:
         """One sentence for an escalation detail or a journal line, ending
         with where to read how to recover."""
-        return f'{self._outcome()}; recovery runbook: OPERATIONS.md §"{RUNBOOK_SECTION}"'
+        return f'{self._outcome()}; recovery runbook: dark-factory:OPERATIONS.md §"{RUNBOOK_SECTION}"'
 
     def _outcome(self) -> str:
         if self.restored:
