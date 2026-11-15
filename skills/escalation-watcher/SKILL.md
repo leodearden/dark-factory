@@ -2753,9 +2753,9 @@ the task-2630 carve-out whose authority is `escalation/src/escalation/authority.
 and `escalation/src/escalation/authority.py::l2_auto_close_class`. The classes it admits and the
 evidence each must quote are in `skills/escalation-watcher-auto/SKILL.md` §"Auto-closing a
 rubber-stamp L2". So `resolved_by="orchestrator-escalation-watcher-auto"` on an L2's own
-`close_only` (normally `resolution_class=benign`, with the class's evidence quoted in the
-resolution) is expected, rare, and **not** an anomaly: do not report it to the human as a guard
-regression.
+`close_only` that the carve-out admits (normally `resolution_class=benign`, with the class's
+evidence quoted in the resolution) is expected, rare, and **not** an anomaly: do not report it to
+the human as a guard regression.
 
 The anomaly worth reporting to the human is either of these on an L2 record's *own* resolution,
 as opposed to an L1 member cascade-resolved via `resolved_by='l2-cascade:<id>'`, an L1/L0 admin
@@ -2764,10 +2764,14 @@ item, or a `promote_to_l2` call:
 - **Any other action by that identity** — `resume`, `restart`, `park` or `abandon`. The server
   still rejects all four at L2 as `level_forbidden` with no state change, so one that landed should
   not have.
-- **A `close_only` by that identity on a denylisted record** — its category is in
-  `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES`, or its `agent_role` is in
-  `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_ROLES`. Those are the human-judgment
-  gates the denylist exists to protect, and the server checks it before the allowlist.
+- **A `close_only` by that identity that
+  `escalation/src/escalation/authority.py::l2_auto_close_class` would not admit** — the server
+  answers that `level_forbidden` too, so one that landed should not have. Either the record is
+  denylisted (its category is in `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES`,
+  or its `agent_role` is in `escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_ROLES`: the
+  human-judgment gates the denylist exists to protect, checked before the allowlist), or it matches
+  none of the allowlisted classes, or its `resolution` does not quote the matched class's required
+  evidence, per `skills/escalation-watcher-auto/SKILL.md` §"Auto-closing a rubber-stamp L2".
 
 Possible causes: a guard regression, bypassed connection headers, or a stale pre-guard
 orchestrator/server pair that hasn't been restarted onto the fix yet.
