@@ -5,7 +5,7 @@ invocation into a shared JSON state file so tests can assert the recon-busy
 defer gate, the --drain SIGUSR1 signal + drained-marker wait, and the
 post-start /health verification — never touching a live systemd or
 fused-memory. One test runs the committed scripts/check_network_exposure.py
-with systemctl and ip faked; it makes loopback-only TCP connects to the
+with systemctl, ip and docker faked; it makes loopback-only TCP connects to the
 host's factory ports. Template: test_deploy_w5_recon_reliability.py.
 
 The test owns BOTH sides of the /health-body contract (the fake curl serves
@@ -833,6 +833,9 @@ def test_rebind_runs_the_committed_exposure_check_by_default(tmp_path):
     fake_ip = bin_dir / "ip"
     fake_ip.write_text("#!/bin/sh\necho '[]'\n")
     fake_ip.chmod(0o755)
+    fake_docker = bin_dir / "docker"
+    fake_docker.write_text("#!/bin/sh\nexit 0\n")
+    fake_docker.chmod(0o755)
     result = _run_script(
         tmp_path, "--rebind-socket", "--now",
         env={"NETWORK_EXPOSURE_CHECK": ""},

@@ -293,7 +293,7 @@ FINDING_TOKENS = (
 
 
 class FakeHost:
-    """Fake `systemctl` / `ip` on PATH, each printing a JSON payload the test chose."""
+    """Fake `systemctl` / `ip` / `docker` on PATH, each printing a payload the test chose."""
 
     def __init__(self, root: pathlib.Path) -> None:
         self.root = root
@@ -314,6 +314,9 @@ class FakeHost:
     def argv(self, command: str) -> list[str]:
         return (self.root / f"{command}.argv").read_text(encoding="utf-8").splitlines()
 
+    def ran(self, command: str) -> bool:
+        return (self.root / f"{command}.argv").exists()
+
 
 def _fake_links(*extra: dict[str, object]) -> list[dict[str, object]]:
     return [
@@ -331,6 +334,7 @@ def fake_host(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> FakeHo
     host = FakeHost(tmp_path)
     host.serve("systemctl", [])
     host.serve("ip", _fake_links())
+    host.serve_bytes("docker", b"")
     monkeypatch.setenv("PATH", f"{host.bin_dir}:{os.environ['PATH']}")
     return host
 
@@ -553,19 +557,119 @@ def test_run_reports_findings_in_ascending_port_order(fake_host: FakeHost, held)
     assert _line_index(lines, "[exposed]", f"port {low}") < _line_index(lines, "[exposed]", f"port {high}")
 
 
+def _optional_owner(port: int) -> exposure.OwnedPort:
+    return exposure.OwnedPort(port, "compose service embedder", optional_service="embedder")
+
+
+def _no_container_lines(lines: list[str]) -> list[str]:
+    return [line for line in lines if "[no-container]" in line]
+
+
+def test_run_notes_a_never_created_optional_service_without_failing(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),))
+
+    assert verdict == exposure.ExposureExit.LOOPBACK_ONLY, lines
+    assert _findings(lines) == []
+    _line_index(lines, "[no-container]", f"port {port}", "compose service embedder", "127.0.0.1")
+    _line_index(lines, "[ok]")
+    assert fake_host.argv("docker") == [
+        "container ls --all --quiet"
+        " --filter label=com.docker.compose.project=docker"
+        " --filter label=com.docker.compose.service=embedder"
+    ]
+
+
+def test_run_fails_an_optional_service_whose_container_exists(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+    fake_host.serve_bytes("docker", b"a735737e7533\n")
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[not-listening]", f"port {port}", "127.0.0.1")
+    assert _no_container_lines(lines) == []
+
+
+def test_run_fails_a_required_compose_service_with_no_container(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+
+    verdict, lines = _run(static_ports=(exposure.OwnedPort(port, "compose service falkordb"),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[not-listening]", f"port {port}", "compose service falkordb")
+    assert not fake_host.ran("docker")
+
+
+def test_run_fails_an_optional_port_another_owner_shares(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+    fake_host.serve("systemctl", [_row(port, "orchestrator-x.socket")])
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[not-listening]", f"port {port}", "orchestrator-x.socket, compose service embedder")
+    assert not fake_host.ran("docker")
+
+
+def test_run_fails_an_exposed_port_of_a_never_created_optional_service(fake_host: FakeHost, held):
+    port = _listen(held, "0.0.0.0")
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[exposed]", f"port {port}", "127.0.0.2", "compose service embedder")
+
+
+def test_run_excuses_only_a_loopback_refusal(fake_host: FakeHost, held):
+    port = _full_backlog(held)
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),), connect_timeout=0.3)
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[timed-out]", f"port {port}", "127.0.0.2")
+    _line_index(lines, "[not-listening]", f"port {port}", "127.0.0.1", "timed out")
+    assert _no_container_lines(lines) == []
+
+
+def test_run_still_fails_an_unverified_address_beside_a_noted_port(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+    fake_host.serve("ip", [_link(99999, "ghost0", _addr("inet6", "fe80::1", "link"))])
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[unverified]", f"port {port}", "fe80::1%ghost0")
+    _line_index(lines, "[no-container]", f"port {port}", "127.0.0.1")
+
+
+def test_run_keeps_the_failure_when_docker_cannot_be_read(fake_host: FakeHost, held):
+    port = _bound_not_listening(held)
+    fake_host.stub("docker", 'echo "Cannot connect to the Docker daemon" >&2\nexit 1\n')
+
+    verdict, lines = _run(static_ports=(_optional_owner(port),))
+
+    assert verdict == exposure.ExposureExit.FINDING
+    _line_index(lines, "[source-error]", "docker container ls", "Cannot connect")
+    _line_index(lines, "[not-listening]", f"port {port}", "127.0.0.1")
+    assert _no_container_lines(lines) == []
+
+
 # ---------------------------------------------------------------------------
 # The CLI's exit contract: 0/1 always tagged, 2 never tagged
 # ---------------------------------------------------------------------------
 
 
 def _cli(tmp_path: pathlib.Path, *args: str, script: pathlib.Path = SCRIPT_PATH) -> tuple[int, str]:
-    """Run the real script with systemctl printing no rows and ip printing garbage.
+    """Run the real script with systemctl printing no rows, ip printing garbage and docker no container.
 
     The unreadable `ip` source makes the exit 1 whatever this host's ports are.
     """
     host = FakeHost(tmp_path)
     host.serve("systemctl", [])
     host.stub("ip", "echo 'not json'\n")
+    host.serve_bytes("docker", b"")
     env = {**os.environ, "PATH": f"{host.bin_dir}:{os.environ['PATH']}"}
     result = subprocess.run(
         [sys.executable, str(script), *args], capture_output=True, text=True, env=env, timeout=120
