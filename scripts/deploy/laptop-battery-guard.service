@@ -1,0 +1,11 @@
+[Unit]
+Description=Low-battery clean-shutdown guard for a verify host whose AC reading lies (task 9051)
+Documentation=file:///home/leo/src/dark-factory/scripts/laptop_battery_guard.py
+
+[Service]
+# Tune with `systemctl edit laptop-battery-guard.service` (Environment=BATTERY_GUARD_* lines); see `laptop_battery_guard.py --help`.
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/laptop-battery-guard/laptop_battery_guard.py
+TimeoutStartSec=3min
+SyslogLevel=warning
+LogLevelMax=notice
