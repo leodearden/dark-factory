@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -18,6 +18,7 @@ from orchestrator.recut_ruling import (
     RecutRulingUnreadable,
     RecutRulingViolation,
     RecutState,
+    RecutSupersession,
     carries_recut_ruling,
     enforce_recut_ruling,
     execution_record,
@@ -25,6 +26,7 @@ from orchestrator.recut_ruling import (
     issued_ruling_was_dropped,
     read_recut_ruling,
     reassert_ruling,
+    recut_supersession,
     ruling_patch,
     ruling_to_enforce,
 )
@@ -473,3 +475,78 @@ class TestReassertRuling:
         task = {'id': '5516', 'metadata': {}}
         failure = await reassert_ruling(task, ISSUED, persist=persist)
         assert isinstance(failure, str) and failure
+
+
+class TestRecutSupersession:
+    @pytest.mark.parametrize('task', [
+        {'id': '2896'},
+        {'id': '2896', 'metadata': None},
+        {'id': '2896', 'metadata': _ruled()},
+    ], ids=['no-metadata', 'metadata-none', 'no-execution-record'])
+    def test_no_execution_record_reads_as_none(self, task: dict[str, Any]):
+        assert recut_supersession(task) is None
+
+    def test_reads_back_what_execution_record_writes(self):
+        task = _task({RECUT_EXECUTED_KEY: execution_record(RULING, PARKED, EXECUTED_AT)})
+        assert recut_supersession(task) == RecutSupersession(
+            parked_branch=PARKED.parked_branch, executed_at=EXECUTED_AT,
+        )
+
+    def test_nothing_parked_still_carries_the_execution_time(self):
+        task = _task({RECUT_EXECUTED_KEY: execution_record(RULING, None, EXECUTED_AT)})
+        assert recut_supersession(task) == RecutSupersession(
+            parked_branch=None, executed_at=EXECUTED_AT,
+        )
+
+    @pytest.mark.parametrize('executed_at', [None, 'not-a-date'], ids=['missing', 'unparseable'])
+    def test_unreadable_execution_time_keeps_the_parked_branch_and_warns(
+        self, executed_at: object, caplog: pytest.LogCaptureFixture,
+    ):
+        record = execution_record(RULING, PARKED, EXECUTED_AT)
+        if executed_at is None:
+            del record['executed_at']
+        else:
+            record['executed_at'] = executed_at
+        with caplog.at_level(logging.WARNING, logger='orchestrator.recut_ruling'):
+            supersession = recut_supersession(_task({RECUT_EXECUTED_KEY: record}))
+        assert supersession == RecutSupersession(
+            parked_branch=PARKED.parked_branch, executed_at=None,
+        )
+        assert any(
+            rec.levelno == logging.WARNING and '2896' in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    @pytest.mark.parametrize('record', ['garbage', 7, ['a']], ids=['str', 'int', 'list'])
+    def test_a_record_that_is_not_an_object_reads_as_none(self, record: object):
+        assert recut_supersession(_task({RECUT_EXECUTED_KEY: record})) is None
+
+
+class TestRecutSupersessionSupersedes:
+    PARKED_REF = 'task/2896-20260901T123000Z'
+    OTHER_REF = 'task/2896-skip-attempt'
+
+    def _executed(self) -> RecutSupersession:
+        return RecutSupersession(parked_branch=self.PARKED_REF, executed_at=EXECUTED_AT)
+
+    def test_the_parked_ref_is_superseded_even_when_committed_later(self):
+        later = EXECUTED_AT + timedelta(days=1)
+        assert self._executed().supersedes(self.PARKED_REF, later)
+
+    @pytest.mark.parametrize('tip_committed_at', [
+        EXECUTED_AT - timedelta(seconds=1), EXECUTED_AT,
+    ], ids=['before', 'at'])
+    def test_another_ref_committed_by_the_execution_is_superseded(
+        self, tip_committed_at: datetime,
+    ):
+        assert self._executed().supersedes(self.OTHER_REF, tip_committed_at)
+
+    def test_another_ref_committed_after_the_execution_is_not(self):
+        later = EXECUTED_AT + timedelta(seconds=1)
+        assert not self._executed().supersedes(self.OTHER_REF, later)
+
+    def test_without_an_execution_time_only_the_parked_ref_is_superseded(self):
+        supersession = RecutSupersession(parked_branch=self.PARKED_REF, executed_at=None)
+        earlier = EXECUTED_AT - timedelta(days=1)
+        assert supersession.supersedes(self.PARKED_REF, earlier)
+        assert not supersession.supersedes(self.OTHER_REF, earlier)
