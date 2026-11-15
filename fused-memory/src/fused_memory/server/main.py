@@ -26,7 +26,9 @@ from functools import partial  # noqa: E402
 from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
 from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 
-from fused_memory.config.checkout_anchor import anchor_at_checkout  # noqa: E402
+from fused_memory.config.checkout_anchor import (  # noqa: E402  # debt: task 10130
+    anchor_at_checkout,
+)
 from fused_memory.config.schema import (  # noqa: E402
     DedupOutageDetectorConfig,
     FusedMemoryConfig,
