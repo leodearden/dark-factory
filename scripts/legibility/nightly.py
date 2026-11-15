@@ -1084,7 +1084,7 @@ def _record_trickle_progress(
         night = trickle_state.fold_night(
             trickle_state.read_prior(cfg.project_id), cfg.project_id, run
         )
-        streak_landed = trickle_state.barren_streak_reached(night, max_barren_runs) and (
+        streak_landed = trickle_state.barren_escalation_due(night, max_barren_runs) and (
             _escalate_barren_streak(
                 cfg, night.state, target_date,
                 max_barren_runs=max_barren_runs, raise_alarm=raise_alarm,
@@ -1212,8 +1212,8 @@ def _escalate_barren_streak(
     that is running."""
     counters = night.counters
     summary = (
-        f'legibility trickle has produced nothing for {max_barren_runs} '
-        f'consecutive runs'
+        f'legibility trickle has produced nothing for '
+        f'{night.consecutive_barren_runs} consecutive runs'
     )
     detail = (
         f'project={cfg.project_id} date={target_date.isoformat()} '
@@ -1223,7 +1223,7 @@ def _escalate_barren_streak(
         f'budget_skipped={counters.budget_skipped} '
         f'last_productive_at={trickle_state.isoformat_or_none(night.last_productive_at)}. '
         f'Real confusion signal reached the sampling/budget stage on each of '
-        f'those runs and NOTHING was digested -- {max_barren_runs} '
+        f'those runs and NOTHING was digested -- {max_barren_runs} or more '
         f'consecutive means persistent config state, not a run of bad luck. '
         f'Remedy: {trickle_state.barren_remedy(counters)}. '
         f'Probe on demand with: check_trickle_progress.py '
@@ -1322,8 +1322,9 @@ def run_nightly(
     distinction ``check_trickle_liveness.sh`` cannot make.
     *retry_recorder* (default :func:`trickle_state.record_retry`, which
     rewrites only the backlog) is the same seam for a retry pass.
-    *max_barren_runs* is the barren streak on which the pass posts its one
-    streak escalation.
+    *max_barren_runs* is the barren streak on which the pass first posts its
+    streak escalation; it re-posts at the multiples in
+    :data:`trickle_state.BARREN_ESCALATION_MULTIPLES`.
 
     *pass_kind* (:class:`PassKind`) has no default: it decides whether the
     pass moves the schedule cursor. A ``RETRY`` pass, run by
@@ -1790,6 +1791,18 @@ def _parse_date(value: str) -> date:
     return date.fromisoformat(value)
 
 
+def _parse_barren_threshold(value: str) -> int:
+    """``--max-barren-runs`` as an int >= 1. Below 1, no barren streak lands
+    on the escalation schedule, so the nightly's alarm would be silently off."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'expected an integer, got {value!r}') from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f'must be 1 or greater, got {value!r}')
+    return parsed
+
+
 def run_scheduled_night(
     *,
     config_path: Path | str | None = None,
@@ -1849,7 +1862,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     undated run is the scheduled night (yesterday UTC) plus any retry the
     backlog owes (:func:`run_scheduled_night`); a ``--date`` run is a single
     pass. ``--max-barren-runs`` is every pass's barren-streak escalation
-    threshold. ``--dry-run`` is accepted for forward operator visibility but not
+    threshold (first escalation; see
+    ``trickle_state.BARREN_ESCALATION_MULTIPLES``). ``--dry-run`` is accepted for forward operator visibility but not
     yet wired to any behavior change. Returns the first non-zero
     :attr:`NightlyResult.exit_code` among the passes, else 0.
 
@@ -1889,8 +1903,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     run_parser.add_argument(
-        '--max-barren-runs', type=int, default=trickle_state.DEFAULT_MAX_BARREN_RUNS,
-        help='Consecutive barren runs on which the nightly escalates (default: %(default)s).',
+        '--max-barren-runs', type=_parse_barren_threshold,
+        default=trickle_state.DEFAULT_MAX_BARREN_RUNS,
+        help=(
+            'Barren-streak threshold: the nightly escalates when the streak '
+            'reaches it and again at the multiples in '
+            'trickle_state.BARREN_ESCALATION_MULTIPLES (default: %(default)s).'
+        ),
     )
     run_parser.add_argument(
         '--dry-run', action='store_true',

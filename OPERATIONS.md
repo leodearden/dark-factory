@@ -4508,9 +4508,17 @@ census-probe failure **always** posts, because nothing else escalates an
 unadvanced-fire streak. A non-zero exit is the authoritative signal whether or
 not the POST landed.
 
-The nightly escalates once per streak, on the night the barren streak reaches
-its threshold: `trickle_state.DEFAULT_MAX_BARREN_RUNS` (3), or
-`nightly.py run --max-barren-runs N`. To read whether it did, run
+The nightly escalates when the barren streak reaches its threshold
+(`trickle_state.DEFAULT_MAX_BARREN_RUNS` (3), or
+`nightly.py run --max-barren-runs N`), again on a bounded doubling of it (the
+threshold times each entry of
+`scripts/legibility/trickle_state.py::BARREN_ESCALATION_MULTIPLES`), and then
+not again for that streak. The schedule counts streak values, not nights: a
+failed or deferred night carries the streak without advancing it. A productive
+or quiet night resets the schedule. On
+every other night of a streak at or past the threshold this health probe posts,
+because that night's record says `barren_escalated: false`. To read whether the
+nightly escalated, run
 `python3 scripts/legibility/check_trickle_progress.py <project> <N>`: every
 verdict on a readable record, and its OK line, prints `barren_escalated=` as
 `True`, `False`, or `unrecorded`.
