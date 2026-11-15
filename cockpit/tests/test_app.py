@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from orchestrator import decision_registry as dr
 from orchestrator import session_registry as sr
 from textual.coordinate import Coordinate
 
@@ -260,7 +261,7 @@ class _HoldingDecisionsReader:
     def __init__(self) -> None:
         self.held = threading.Event()
         self._release = threading.Event()
-        self.held_result: list[sr.DecisionRecord] = []
+        self.held_result: list[dr.DecisionRecord] = []
 
     def __call__(self, root):
         from cockpit.registry_reader import scan_decisions
@@ -657,13 +658,13 @@ class TestWriteDiscipline:
         record = _make_record(session_slug='write-disc-1', status=sr.Status.RUNNING)
         sr.write_record(record, root=tmp_path)
 
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-1',
             project='df',
             text='Which port?',
             filed_at='2026-07-07T00:00:00+00:00',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         before = _snapshot_tree(tmp_path)
         # sanity: prove the snapshot actually captured the seeded files, so a
@@ -1233,14 +1234,14 @@ class TestDecisionQueueRender:
         for r in (running, awaiting):
             sr.write_record(r, root=tmp_path)
 
-        low = sr.DecisionRecord(
+        low = dr.DecisionRecord(
             id='dec-low',
             project='df',
             text='Low priority question?',
             filed_at='2026-07-07T00:00:00+00:00',
             manual_boost=0,
         )
-        high = sr.DecisionRecord(
+        high = dr.DecisionRecord(
             id='dec-high',
             project='df',
             text='High priority question?',
@@ -1248,7 +1249,7 @@ class TestDecisionQueueRender:
             manual_boost=5,
         )
         for d in (low, high):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
         async with app.run_test() as pilot:
@@ -1294,13 +1295,13 @@ class TestDecisionQueueRender:
         long_question = 'Which port should the worker bind to, and why that one? ' * 6
         assert len(long_question) > 300
 
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-wide',
             project='df',
             text=long_question,
             filed_at=(datetime.now(UTC) - timedelta(days=3)).isoformat(),
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
         async with app.run_test(size=(200, 40)) as pilot:
@@ -1338,8 +1339,8 @@ class TestDecisionQueueRender:
         long_question = 'Which port should the worker bind to, and why that one? ' * 6
         filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
         for decision_id, boost in (('dec-high', 5), ('dec-low', 0)):
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id=decision_id,
                     project='df',
                     text=long_question,
@@ -1410,8 +1411,8 @@ class TestDecisionQueueRender:
         filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
 
         def write(index):
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id=f'dec-{index:02d}',
                     project='df',
                     text=long_question,
@@ -1460,8 +1461,8 @@ class TestDecisionQueueRender:
         long_question = 'Which port should the worker bind to, and why that one? ' * 6
         filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
         for index in range(60):
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id=f'dec-{index:02d}',
                     project='df',
                     text=long_question,
@@ -1565,14 +1566,14 @@ class TestSharedTargetAttentionNotClearedPrematurely:
             question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
         )
         sr.write_record(awaiting, root=tmp_path)
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-shared',
             project='df',
             text='Proceed?',
             filed_at='2026-07-07T00:00:00+00:00',
             session_id='shared-1',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -1584,7 +1585,7 @@ class TestSharedTargetAttentionNotClearedPrematurely:
 
             # The decision resolves elsewhere (e.g. a C8 watcher answers it)
             # while the session it's linked to is STILL awaiting input.
-            sr.update_decision_state('dec-shared', sr.DecisionState.ANSWERED, root=tmp_path)
+            dr.update_decision_state('dec-shared', dr.DecisionState.ANSWERED, root=tmp_path)
 
             calls_before = len(backend.set_urgency_calls)
             app.refresh_registry()
@@ -1658,13 +1659,13 @@ class TestEnterFocus:
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        orphan = sr.DecisionRecord(
+        orphan = dr.DecisionRecord(
             id='dec-orphan',
             project='df',
             text='Orphaned decision?',
             filed_at='2026-07-07T00:00:00+00:00',
         )
-        assert sr.write_decision(orphan, root=tmp_path)
+        assert dr.write_decision(orphan, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -1690,7 +1691,7 @@ class TestEnterFocus:
             display=sr.Display(kind='wm', wm_title='escalation-watcher df'),
         )
         sr.write_record(watcher, root=root)
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='esc-4237-1',
             project='df',
             text='Adopt the plan?',
@@ -1698,7 +1699,7 @@ class TestEnterFocus:
             session_id='watcher-df-1348600',
             record_slug=record_slug,
         )
-        assert sr.write_decision(decision, root=root)
+        assert dr.write_decision(decision, root=root)
         return watcher, decision
 
     @pytest.mark.timeout(10)
@@ -1742,7 +1743,7 @@ class TestEnterFocus:
         async with app.run_test() as pilot:
             await pilot.pause()
             linked = replace(unlinked, record_slug='session-dark-factory-sess-watcher')
-            assert sr.write_decision(linked, root=tmp_path)
+            assert dr.write_decision(linked, root=tmp_path)
             app.refresh_registry()
             await pilot.pause()
             queue = app.query_one(DecisionQueue)
@@ -1778,14 +1779,14 @@ class TestBoostReordersAndPersists:
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
 
-        older = sr.DecisionRecord(
+        older = dr.DecisionRecord(
             id='dec-a',
             project='df',
             text='A?',
             filed_at='2026-06-01T00:00:00+00:00',  # far enough back to saturate the age bonus
             manual_boost=0,
         )
-        newer = sr.DecisionRecord(
+        newer = dr.DecisionRecord(
             id='dec-b',
             project='df',
             text='B?',
@@ -1793,7 +1794,7 @@ class TestBoostReordersAndPersists:
             manual_boost=0,
         )
         for d in (older, newer):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(
@@ -1824,7 +1825,7 @@ class TestBoostReordersAndPersists:
             assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a')
 
             # (b) persisted via C1 -- disk reflects the raised boost.
-            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            persisted = {d.id: d for d in dr.list_decisions(root=tmp_path)}
             assert persisted['dec-b'].manual_boost == 3
             assert persisted['dec-a'].manual_boost == 0  # untouched
 
@@ -1833,7 +1834,7 @@ class TestBoostReordersAndPersists:
             await pilot.press('7')
             await pilot.pause()
 
-            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            persisted = {d.id: d for d in dr.list_decisions(root=tmp_path)}
             assert persisted['dec-b'].manual_boost == 7
 
 
@@ -1851,14 +1852,14 @@ class TestDropRemovesAndPersists:
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        first = sr.DecisionRecord(
+        first = dr.DecisionRecord(
             id='dec-1', project='df', text='First?', filed_at='2026-07-07T00:00:00+00:00'
         )
-        second = sr.DecisionRecord(
+        second = dr.DecisionRecord(
             id='dec-2', project='df', text='Second?', filed_at='2026-07-07T00:00:00+00:00'
         )
         for d in (first, second):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -1881,9 +1882,9 @@ class TestDropRemovesAndPersists:
             assert queue.get_row('decision:dec-2')
 
             # (b) persisted via C1.
-            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
-            assert persisted['dec-1'].state == sr.DecisionState.DROPPED
-            assert persisted['dec-2'].state == sr.DecisionState.OPEN  # untouched
+            persisted = {d.id: d for d in dr.list_decisions(root=tmp_path)}
+            assert persisted['dec-1'].state == dr.DecisionState.DROPPED
+            assert persisted['dec-2'].state == dr.DecisionState.OPEN  # untouched
 
     @pytest.mark.timeout(10)
     async def test_drop_session_row_removes_live_without_writing_the_session(self, tmp_path):
@@ -1938,18 +1939,18 @@ class TestDecisionProjectIsCanonicalAtEveryReadSite:
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-1',
             project='df',
             text='Which port?',
             filed_at='2026-07-07T00:00:00+00:00',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
         # Baseline: the raw spelling is what is actually on disk, so each
         # re-read below really does read 'df' back and really does have to
         # fold it. (These are the legacy rows migrate_decision_project_tokens
         # has not been run over.)
-        assert [d.project for d in sr.list_decisions(root=tmp_path)] == ['df']
+        assert [d.project for d in dr.list_decisions(root=tmp_path)] == ['df']
 
         app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
         async with app.run_test() as pilot:
@@ -1965,7 +1966,7 @@ class TestDecisionProjectIsCanonicalAtEveryReadSite:
             # (2) the post-boost re-read (action_boost -> _apply_boost).
             await pilot.press('b')
             await pilot.pause()
-            persisted = sr.list_decisions(root=tmp_path)
+            persisted = dr.list_decisions(root=tmp_path)
             assert persisted[0].manual_boost != 0  # the write really happened
             assert persisted[0].project == 'df'  # ...and left the disk raw
             assert [d.project for d in app._decisions] == ['dark_factory']
@@ -1973,8 +1974,8 @@ class TestDecisionProjectIsCanonicalAtEveryReadSite:
             # (3) the post-drop re-read (action_drop).
             await pilot.press('x')
             await pilot.pause()
-            persisted = sr.list_decisions(root=tmp_path)
-            assert persisted[0].state == sr.DecisionState.DROPPED  # the write happened
+            persisted = dr.list_decisions(root=tmp_path)
+            assert persisted[0].state == dr.DecisionState.DROPPED  # the write happened
             assert persisted[0].project == 'df'  # ...and left the disk raw
             assert [d.project for d in app._decisions] == ['dark_factory']
 
@@ -1994,8 +1995,8 @@ class TestInjectedDecisionsReaderIsEveryDecisionRead:
         from cockpit.registry_reader import scan_decisions
 
         for decision_id in ('dec-shown', 'dec-hidden'):
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id=decision_id,
                     project='df',
                     text=f'{decision_id}?',
@@ -2022,7 +2023,7 @@ class TestInjectedDecisionsReaderIsEveryDecisionRead:
             await pilot.press('b')
             await pilot.pause()
 
-            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            persisted = {d.id: d for d in dr.list_decisions(root=tmp_path)}
             assert persisted['dec-shown'].manual_boost == 1
             assert queue.row_count == 1
             with pytest.raises(RowDoesNotExist):
@@ -2401,13 +2402,13 @@ class TestBoostAndDeferOverlaysExpireWithTheAsk:
         """
         from cockpit.backends import FakeBackend
 
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-defer',
             project='df',
             text='Proceed?',
             filed_at='2026-07-07T00:00:00+00:00',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -2419,7 +2420,7 @@ class TestBoostAndDeferOverlaysExpireWithTheAsk:
             assert 'decision:dec-defer' in app._deferred
 
             # Answered elsewhere (e.g. a C8 watcher) -- no longer OPEN.
-            sr.update_decision_state('dec-defer', sr.DecisionState.ANSWERED, root=tmp_path)
+            dr.update_decision_state('dec-defer', dr.DecisionState.ANSWERED, root=tmp_path)
             app.refresh_registry()
             await pilot.pause()
 
@@ -2459,14 +2460,14 @@ class TestReorderTargetsAreDeduped:
             question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
         )
         sr.write_record(awaiting, root=tmp_path)
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-shared',
             project='df',
             text='Proceed?',
             filed_at='2026-07-07T00:00:00+00:00',
             session_id='shared-1',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -2530,7 +2531,7 @@ class TestReorderTargetsAreDeduped:
             question=sr.Question(text='Older ask?', asked_at='2026-07-01T00:00:00+00:00'),
         )
         sr.write_record(sess_b, root=tmp_path)
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-a',
             project='df',
             text='Proceed?',
@@ -2538,7 +2539,7 @@ class TestReorderTargetsAreDeduped:
             session_id='sess-a',
             severity='urgent',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05, now_fn=lambda: now)
@@ -2600,7 +2601,7 @@ class TestCopyAction:
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-1',
             project='df',
             text='Which port do we bind?',
@@ -2608,7 +2609,7 @@ class TestCopyAction:
             task_id='2517',
             escalation_id='esc-42',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         awaiting = _make_record(
             session_slug='awaiting-1',
@@ -2775,7 +2776,7 @@ class ExplodingCopyRunner:
 
 def _write_copyable_decision(tmp_path):
     """One highlightable decision row, mirroring TestCopyAction's fixture."""
-    decision = sr.DecisionRecord(
+    decision = dr.DecisionRecord(
         id='dec-1',
         project='df',
         text='Which port do we bind?',
@@ -2783,7 +2784,7 @@ def _write_copyable_decision(tmp_path):
         task_id='2517',
         escalation_id='esc-42',
     )
-    assert sr.write_decision(decision, root=tmp_path)
+    assert dr.write_decision(decision, root=tmp_path)
 
 
 def _spy_on_clipboard_surface(monkeypatch, app):
@@ -2968,14 +2969,14 @@ class TestDeferResetsAge:
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
 
-        older = sr.DecisionRecord(
+        older = dr.DecisionRecord(
             id='dec-old',
             project='df',
             text='Old?',
             filed_at='2026-06-01T00:00:00+00:00',  # far enough back to saturate the age bonus
             manual_boost=0,
         )
-        newer = sr.DecisionRecord(
+        newer = dr.DecisionRecord(
             id='dec-new',
             project='df',
             text='New?',
@@ -2983,7 +2984,7 @@ class TestDeferResetsAge:
             manual_boost=0,
         )
         for d in (older, newer):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         before = _snapshot_tree(tmp_path)
         assert any(path.startswith('decisions/') for path in before)
@@ -3056,14 +3057,14 @@ class TestWeightEditorReordersAndPersists:
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
 
-        alpha = sr.DecisionRecord(
+        alpha = dr.DecisionRecord(
             id='alpha',
             project='alpha',
             text='Alpha?',
             filed_at='2026-07-07T00:00:00+00:00',
             manual_boost=0,
         )
-        beta = sr.DecisionRecord(
+        beta = dr.DecisionRecord(
             id='beta',
             project='beta',
             text='Beta?',
@@ -3071,7 +3072,7 @@ class TestWeightEditorReordersAndPersists:
             manual_boost=0,
         )
         for d in (alpha, beta):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(
@@ -3127,14 +3128,14 @@ class TestWeightEditorReordersAndPersists:
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
 
-        alpha = sr.DecisionRecord(
+        alpha = dr.DecisionRecord(
             id='alpha',
             project='alpha',
             text='Alpha?',
             filed_at='2026-07-07T00:00:00+00:00',
             manual_boost=0,
         )
-        beta = sr.DecisionRecord(
+        beta = dr.DecisionRecord(
             id='beta',
             project='beta',
             text='Beta?',
@@ -3142,7 +3143,7 @@ class TestWeightEditorReordersAndPersists:
             manual_boost=0,
         )
         for d in (alpha, beta):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         monkeypatch.setattr('cockpit.app.save_priorities', lambda *args, **kwargs: None)
 
@@ -4092,13 +4093,13 @@ class TestRefreshWriteDiscipline:
         )
         sr.write_record(running, root=tmp_path)
 
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-refresh-wd-1',
             project='df',
             text='Which port?',
             filed_at='2026-07-07T00:00:00+00:00',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -4432,14 +4433,14 @@ class TestInFlightScanCannotUndoAKeypressWrite:
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.priority import Priorities
 
-        older = sr.DecisionRecord(
+        older = dr.DecisionRecord(
             id='dec-a',
             project='df',
             text='A?',
             filed_at='2026-06-01T00:00:00+00:00',
             manual_boost=0,
         )
-        newer = sr.DecisionRecord(
+        newer = dr.DecisionRecord(
             id='dec-b',
             project='df',
             text='B?',
@@ -4447,7 +4448,7 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             manual_boost=0,
         )
         for d in (older, newer):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
         reader = _HoldingDecisionsReader()
@@ -4479,7 +4480,7 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             for _ in range(2):
                 await pilot.press('b')
                 await pilot.pause()
-            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            persisted = {d.id: d for d in dr.list_decisions(root=tmp_path)}
             assert persisted['dec-b'].manual_boost == 3, (
                 'a press built on the reverted boost and was lost'
             )
@@ -4491,14 +4492,14 @@ class TestInFlightScanCannotUndoAKeypressWrite:
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        first = sr.DecisionRecord(
+        first = dr.DecisionRecord(
             id='dec-1', project='df', text='First?', filed_at='2026-07-07T00:00:00+00:00'
         )
-        second = sr.DecisionRecord(
+        second = dr.DecisionRecord(
             id='dec-2', project='df', text='Second?', filed_at='2026-07-07T00:00:00+00:00'
         )
         for d in (first, second):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         reader = _HoldingDecisionsReader()
         app = CockpitApp(
@@ -4512,8 +4513,8 @@ class TestInFlightScanCannotUndoAKeypressWrite:
 
             async with _poll_held_after_its_read(app, reader):
                 assert {d.id: d.state for d in reader.held_result} == {
-                    'dec-1': sr.DecisionState.OPEN,
-                    'dec-2': sr.DecisionState.OPEN,
+                    'dec-1': dr.DecisionState.OPEN,
+                    'dec-2': dr.DecisionState.OPEN,
                 }
                 await pilot.press('x')
                 await pilot.pause()
@@ -4537,14 +4538,14 @@ class TestInFlightScanCannotUndoAKeypressWrite:
         from cockpit.panes.session_table import SessionTable
         from cockpit.priority import Priorities
 
-        older = sr.DecisionRecord(
+        older = dr.DecisionRecord(
             id='dec-a',
             project='df',
             text='A?',
             filed_at='2026-06-01T00:00:00+00:00',
             manual_boost=0,
         )
-        newer = sr.DecisionRecord(
+        newer = dr.DecisionRecord(
             id='dec-b',
             project='df',
             text='B?',
@@ -4552,7 +4553,7 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             manual_boost=0,
         )
         for d in (older, newer):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
         reader = _HoldingDecisionsReader()
@@ -4623,17 +4624,17 @@ class TestDecisionQueueDetail:
             'queue, or leave it open for the watcher to re-file it?'
         )
         assert len(long_question) > 60
-        first = sr.DecisionRecord(
+        first = dr.DecisionRecord(
             id='dec-first', project='df', text='Short one?',
             filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
         )
-        target = sr.DecisionRecord(
+        target = dr.DecisionRecord(
             id='dec-second', project='df', text=long_question,
             filed_at='2026-07-07T00:00:00+00:00',
             task_id='5449', escalation_id='esc-5449-2', severity='blocking',
         )
         for decision in (first, target):
-            assert sr.write_decision(decision, root=tmp_path)
+            assert dr.write_decision(decision, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
         async with app.run_test() as pilot:
@@ -4707,11 +4708,11 @@ class TestDecisionQueueDetail:
             sr.write_record(record, root=tmp_path)
 
         # outscores the session row, so the session row is not highlighted at mount
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-first', project='df', text='Short one?',
             filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
         async with app.run_test() as pilot:
@@ -4759,16 +4760,16 @@ class TestDecisionQueueDetail:
             'Should the reaper close this decision against the other escalation '
             'queue, or leave it open for the watcher to re-file it?'
         )
-        first = sr.DecisionRecord(
+        first = dr.DecisionRecord(
             id='dec-first', project='df', text='Short one?',
             filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
         )
-        target = sr.DecisionRecord(
+        target = dr.DecisionRecord(
             id='dec-second', project='df', text=long_question,
             filed_at='2026-07-07T00:00:00+00:00',
         )
         for decision in (first, target):
-            assert sr.write_decision(decision, root=tmp_path)
+            assert dr.write_decision(decision, root=tmp_path)
 
         # a large poll_interval keeps on_mount's own timer from racing the
         # direct refresh_registry() below -- TestPollRefresh's convention
@@ -4840,8 +4841,8 @@ class TestDecisionQueueDetail:
             _make_record(session_slug='session-other', start_ts='2026-07-07T00:01:00+00:00'),
             root=tmp_path,
         )
-        assert sr.write_decision(
-            sr.DecisionRecord(
+        assert dr.write_decision(
+            dr.DecisionRecord(
                 id='dec-low', project='df', text='ZZZ decision question?',
                 filed_at='2026-07-07T00:00:00+00:00',
             ),
@@ -4884,8 +4885,8 @@ class TestDecisionQueueDetail:
             ),
             root=tmp_path,
         )
-        assert sr.write_decision(
-            sr.DecisionRecord(
+        assert dr.write_decision(
+            dr.DecisionRecord(
                 id='dec-existing', project='df', text='Short one?',
                 filed_at='2026-07-07T00:00:00+00:00',
             ),
@@ -4911,8 +4912,8 @@ class TestDecisionQueueDetail:
             # a newly-filed, boosted decision lands ABOVE the existing one, so the
             # queue's highlighted row index genuinely shifts on the rebuild
             assert queue.get_row_index('decision:dec-existing') == 0
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id='dec-new', project='df', text='ZZZ brand new decision?',
                     filed_at='2026-07-07T00:02:00+00:00', manual_boost=9,
                 ),
@@ -4961,8 +4962,8 @@ class TestDecisionQueueDetail:
         long_question = 'ZZZ decision question? ' + ('padded out to overflow the column. ' * 8)
         filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
         for decision_id, boost in (('dec-high', 5), ('dec-low', 0)):
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id=decision_id,
                     project='df',
                     text=long_question,
@@ -5041,8 +5042,8 @@ class TestDecisionQueueDetail:
             root=tmp_path,
         )
         # outscores the session row, so the queue's session row is not row 0
-        assert sr.write_decision(
-            sr.DecisionRecord(
+        assert dr.write_decision(
+            dr.DecisionRecord(
                 id='dec-first', project='df', text='Short one?',
                 filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
             ),
@@ -5114,16 +5115,16 @@ class TestDecisionQueueDetail:
             'queue, or leave it open for the watcher to re-file it?'
         )
         for decision in (
-            sr.DecisionRecord(
+            dr.DecisionRecord(
                 id='dec-first', project='df', text='Short one?',
                 filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
             ),
-            sr.DecisionRecord(
+            dr.DecisionRecord(
                 id='dec-second', project='df', text=long_question,
                 filed_at='2026-07-07T00:00:00+00:00',
             ),
         ):
-            assert sr.write_decision(decision, root=tmp_path)
+            assert dr.write_decision(decision, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
         async with app.run_test() as pilot:
@@ -5150,8 +5151,8 @@ class TestDecisionQueueDetail:
             # (_DECISION_SNAPSHOT_FIELDS), so this alone would trigger the
             # rebuild even without the session above
             revised_question = long_question.replace('re-file it?', 're-file it, REVISED?')
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id='dec-second', project='df', text=revised_question,
                     filed_at='2026-07-07T00:00:00+00:00',
                 ),
@@ -5205,16 +5206,16 @@ class TestDecisionQueueDetail:
         # no RowHighlighted at all -- with one queue row the queue could never
         # take ownership and this test would pass vacuously.
         for decision in (
-            sr.DecisionRecord(
+            dr.DecisionRecord(
                 id='dec-top', project='df', text='Short one?',
                 filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
             ),
-            sr.DecisionRecord(
+            dr.DecisionRecord(
                 id='dec-read', project='df', text='ZZZ the decision being read?',
                 filed_at='2026-07-07T00:00:00+00:00',
             ),
         ):
-            assert sr.write_decision(decision, root=tmp_path)
+            assert dr.write_decision(decision, root=tmp_path)
 
         # a large poll_interval keeps on_mount's own timer from racing the
         # direct refresh_registry() below -- TestPollRefresh's convention
@@ -5236,8 +5237,8 @@ class TestDecisionQueueDetail:
             # a watcher answers every open decision -- the queue empties under
             # the operator's cursor
             for decision_id in ('dec-top', 'dec-read'):
-                assert sr.update_decision_state(
-                    decision_id, sr.DecisionState.ANSWERED, root=tmp_path
+                assert dr.update_decision_state(
+                    decision_id, dr.DecisionState.ANSWERED, root=tmp_path
                 )
             app.refresh_registry()
             await pilot.pause()

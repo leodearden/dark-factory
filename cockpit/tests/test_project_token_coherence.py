@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from orchestrator import decision_registry as dr
 from orchestrator import session_registry as sr
 
 _NOW = datetime(2026, 7, 7, tzinfo=UTC)
@@ -50,8 +51,8 @@ def _seed_fleet(tmp_path):
         ),
         root=tmp_path,
     )
-    assert sr.write_decision(
-        sr.DecisionRecord(
+    assert dr.write_decision(
+        dr.DecisionRecord(
             id='dec-1',
             project=_DECISION_SPELLING,
             text='Which port?',
