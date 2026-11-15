@@ -21227,7 +21227,7 @@ def _promote_like_info_l0_router(queue, esc_id) -> str:
     here: the L0 dismissed by the router with no resolution class, and a NEW L1
     whose detail is the L0's followed by the router's `[info-l0-router]` block.
     """
-    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.models import Escalation
 
     esc = queue.get(esc_id)
     promoted_id = queue.make_id(esc.task_id)
