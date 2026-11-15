@@ -1,32 +1,38 @@
-"""Replace known secret values in JSONL files with same-length placeholders.
+"""Replace known secret values in log files with same-length placeholders.
 
 Callers pass ``{var: value}``; which variables hold secrets is
 ``shared.secret_env``'s question, not this module's. A value is matched in the
-JSON-string-escaped form it takes inside a JSONL line, and is replaced by
+escaped form it takes in the file's ``Markup``: JSON-string-escaped inside a
+JSONL or text line, or XML-escaped inside a report. It is replaced by
 ``<redacted:VAR>`` right-padded with ``x`` to the same byte length, so a file
-keeps its size and line count. A line whose rewrite would turn it from valid
-JSON into invalid JSON is left as it was and reported in
+keeps its size and line count; in XML the label is entity-escaped
+(``&lt;redacted:VAR&gt;``) and never cut mid-entity, so a report stays
+well-formed and still parses as ``<redacted:VAR>``. A line whose rewrite would
+turn it from valid JSON into invalid JSON is left as it was and reported in
 ``FileRedaction.refused``; every other line is still redacted. No message ever
 carries a value.
 """
 
 from __future__ import annotations
 
+import enum
 import json
 import os
 import stat
 import tempfile
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
+from xml.sax.saxutils import escape as xml_escape
 
 __all__ = [
     'MIN_REDACTABLE_LEN',
     'FileChangedDuringRedaction',
     'FileRedaction',
     'FileStamp',
+    'Markup',
     'Needle',
     'RedactionError',
     'RedactionWouldCorruptJson',
@@ -42,6 +48,13 @@ MIN_REDACTABLE_LEN = 20
 _DETECT_CHUNK_BYTES = 1 << 20
 
 StrPath = str | os.PathLike[str]
+
+_XML_QUOTE_ENTITIES = MappingProxyType({'"': '&quot;', "'": '&apos;'})
+
+
+class Markup(enum.Enum):
+    TEXT = 'text'
+    XML = 'xml'
 
 
 @dataclass(frozen=True)
@@ -100,14 +113,17 @@ class FileChangedDuringRedaction(RedactionError):
         self.path = path
 
 
-def redaction_needles(secrets: Mapping[str, str]) -> tuple[Needle, ...]:
+def redaction_needles(
+    secrets: Mapping[str, str], *, markup: Markup = Markup.TEXT
+) -> tuple[Needle, ...]:
+    rules = _MARKUP_RULES[markup]
     by_pattern: dict[bytes, Needle] = {}
     for var, value in sorted(secrets.items()):
         if len(value) < MIN_REDACTABLE_LEN:
             continue
-        for ensure_ascii in (True, False):
-            pattern = json.dumps(value, ensure_ascii=ensure_ascii)[1:-1].encode()
-            by_pattern.setdefault(pattern, Needle(var, pattern, _placeholder(var, len(pattern))))
+        for form in rules.forms(value):
+            pattern = form.encode()
+            by_pattern.setdefault(pattern, Needle(var, pattern, rules.placeholder(var, len(pattern))))
     return tuple(sorted(by_pattern.values(), key=lambda needle: -len(needle.pattern)))
 
 
@@ -157,8 +173,35 @@ def redact_in_place(
     return result
 
 
-def _placeholder(var: str, length: int) -> bytes:
+def _json_escaped_forms(value: str) -> tuple[str, ...]:
+    return tuple(json.dumps(value, ensure_ascii=ascii_only)[1:-1] for ascii_only in (True, False))
+
+
+def _xml_escaped_forms(value: str) -> tuple[str, ...]:
+    return (value, xml_escape(value), xml_escape(value, _XML_QUOTE_ENTITIES))
+
+
+def _text_placeholder(var: str, length: int) -> bytes:
     return (f'<redacted:{var}>' + 'x' * length)[:length].encode()
+
+
+def _xml_placeholder(var: str, length: int) -> bytes:
+    label = f'&lt;redacted:{var}&gt;'
+    if len(label) > length:
+        label = f'&lt;redacted:{var}'
+    return (label + 'x' * length)[:length].encode()
+
+
+@dataclass(frozen=True)
+class _MarkupRules:
+    forms: Callable[[str], tuple[str, ...]]
+    placeholder: Callable[[str, int], bytes]
+
+
+_MARKUP_RULES: Mapping[Markup, _MarkupRules] = MappingProxyType({
+    Markup.TEXT: _MarkupRules(_json_escaped_forms, _text_placeholder),
+    Markup.XML: _MarkupRules(_xml_escaped_forms, _xml_placeholder),
+})
 
 
 def _stamp_of(st: os.stat_result) -> FileStamp:
