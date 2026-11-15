@@ -1661,8 +1661,9 @@ def _format_lead_time(
         '    segment           p50      p90      min      max      n  (minutes)'
     )
     for label, key in (
-        ('lead', 'lead'), ('queue wait', 'wait'),
+        ('lead', 'lead'), ('queue wait', 'wait'), ('re-queued', 'requeued'),
         ('verify', 'verify'), ('finalize+CAS', 'residual'),
+        ('verify->land', 'last_verify_to_land'),
     ):
         series = section[key]
         lines.append(
@@ -1673,7 +1674,7 @@ def _format_lead_time(
     if section['n_negative_residual']:
         lines.append(
             f"  WARNING {section['n_negative_residual']} landing(s) have a "
-            'NEGATIVE finalize+CAS residual — the three segments did not '
+            'NEGATIVE finalize+CAS residual — the segments did not '
             'decompose the lead for those, so the residual row is not '
             'finalize+CAS time'
         )
