@@ -32,13 +32,22 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from types import MappingProxyType
+from typing import Annotated, TextIO
 
 import yaml
 from escalation.categories import EscalationCategory
 from escalation.models import Escalation, EvidenceEntry
 from escalation.queue import EscalationQueue
-from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, ValidationError, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    ValidationError,
+    model_validator,
+)
 from shared import safe_io
 from shared.memory_eval_limits import (
     Alarm,
@@ -95,6 +104,15 @@ class RunnerConfigError(ValueError):
     """The runner config file is missing, unparseable or not a valid declaration."""
 
 
+_WallClockBoundSecs = Annotated[float, Field(gt=0)]
+"""How long one producer may run before the runner kills it."""
+
+_ReadOnlyBoundsByEval = Annotated[
+    Mapping[str, _WallClockBoundSecs], AfterValidator(MappingProxyType), PlainSerializer(dict),
+]
+"""Read-only once validated, like every other field of a frozen model; dumps as a plain dict."""
+
+
 class RunnerConfig(BaseModel):
     """Operator declarations; every field is required because none has a defensible default (G6)."""
 
@@ -107,8 +125,8 @@ class RunnerConfig(BaseModel):
     min_samples: int
     baseline_window: int
     storm_alarm_limit: int = Field(gt=0)
-    producer_timeout_secs: float = Field(gt=0)
-    producer_timeout_secs_by_eval: Mapping[str, PositiveFloat]
+    producer_timeout_secs: _WallClockBoundSecs
+    producer_timeout_secs_by_eval: _ReadOnlyBoundsByEval
     """Per-eval bounds that replace ``producer_timeout_secs``; ``{}`` declares none."""
 
     @model_validator(mode='after')
