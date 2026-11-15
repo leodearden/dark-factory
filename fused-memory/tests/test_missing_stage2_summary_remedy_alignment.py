@@ -11,6 +11,9 @@ sentences, per the house norm stated in
 
 from __future__ import annotations
 
+import re
+
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 
 
@@ -63,3 +66,38 @@ class TestStage3MissingSummaryRemedy:
             'remediation-pass agent can re-run write_cycle_summary for a prior run, '
             'so the value names a repair nobody can perform (task 6295).'
         )
+
+
+class TestStage1MissingSummaryRemedy:
+    def test_the_stage2_summary_decision_section_exists(self):
+        """Selected by content, not heading, because the heading is what was renamed."""
+        decision_sections = [
+            section for section in _sections(STAGE1_SYSTEM_PROMPT)
+            if "stage='task_knowledge_sync'" in section
+        ]
+
+        assert len(decision_sections) == 1, (
+            "Expected exactly one STAGE1_SYSTEM_PROMPT section keying the ledger "
+            "pre-check to stage='task_knowledge_sync', found "
+            f'{len(decision_sections)}; the absence pins below would otherwise '
+            'pass against a prompt that lost the check.'
+        )
+
+    def test_retired_reconstruct_framing_is_gone(self):
+        for retired in ('reconstruct-trigger', 'Already-Reconstructed'):
+            assert retired not in STAGE1_SYSTEM_PROMPT, (
+                f'STAGE1_SYSTEM_PROMPT still carries {retired!r}, the retired framing '
+                'of the missing Stage 2 summary as something to reconstruct '
+                '(task 6295).'
+            )
+
+    def test_heading_cross_references_resolve(self):
+        referenced = re.findall(r'see ## ([^\n]+?) below', STAGE1_SYSTEM_PROMPT)
+        headings = {section.splitlines()[0] for section in _sections(STAGE1_SYSTEM_PROMPT)}
+
+        assert referenced, 'STAGE1_SYSTEM_PROMPT has no "see ## <heading> below" pointer.'
+        for heading in referenced:
+            assert heading in headings, (
+                f'STAGE1_SYSTEM_PROMPT points the agent at "## {heading}", '
+                'which no section carries.'
+            )
