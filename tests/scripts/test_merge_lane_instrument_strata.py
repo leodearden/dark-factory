@@ -6,7 +6,9 @@ its module body. No module rebinds an object a lower module, or
 ``scripts/source_measures.py`` beneath them all, defines; consumers reach each
 name through its defining module. :data:`PLACEMENT_CASES` drives the placement
 rule over small synthetic sources, so each placement it accepts or refuses is
-shown to be accepted or refused.
+shown to be accepted or refused. The layers the command line imports before
+``_checkout`` binds the checkout, :data:`UNBOUND_LAYERS`, import no workspace
+member at all.
 """
 
 import ast
@@ -15,6 +17,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 
+import _checkout
 import pytest
 import source_measures
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
@@ -97,6 +100,61 @@ def test_no_scripts_module_imports_the_cli() -> None:
     )
 
 
+#: What ``scripts/merge_lane_metrics.py`` imports before ``merge_lane_ratchet``
+#: binds this checkout's workspace members through ``_checkout``: the
+#: measurement stratum, and ``source_measures`` beneath it.
+UNBOUND_LAYERS = ('source_measures', 'merge_lane_cluster')
+
+
+def _workspace_packages() -> frozenset[str]:
+    return frozenset(
+        package.name
+        for src in _checkout.MEMBER_SRC
+        for package in src.iterdir()
+        if (package / '__init__.py').is_file()
+    )
+
+
+def _workspace_imports(source: str, packages: frozenset[str]) -> list[tuple[int, str]]:
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names = [node.module]
+        else:
+            continue
+        found.extend(
+            (node.lineno, name) for name in names if name.partition('.')[0] in packages
+        )
+    return sorted(found)
+
+
+def test_the_workspace_packages_are_found() -> None:
+    assert {'shared', 'orchestrator'} <= _workspace_packages()
+
+
+@pytest.mark.parametrize('stem', UNBOUND_LAYERS)
+def test_no_layer_imported_before_the_checkout_binds_imports_a_workspace_member(
+    stem: str,
+) -> None:
+    found = _workspace_imports(_source_of(stem), _workspace_packages())
+
+    assert found == [], (
+        f'scripts/{stem}.py imports a workspace member, (line, module) {found}. '
+        'The CLI imports it before merge_lane_ratchet imports _checkout, so that '
+        "import would bind the environment's copy of the member, not this checkout's"
+    )
+
+
+def test_a_workspace_import_is_found_at_any_depth() -> None:
+    source = 'import ast\ndef f():\n    from shared.safe_io import x\nimport orchestrator.git_ops\n'
+    assert _workspace_imports(source, frozenset({'shared', 'orchestrator'})) == [
+        (3, 'shared.safe_io'),
+        (4, 'orchestrator.git_ops'),
+    ]
+
+
 #: ``(importer stem, source, whether the rule accepts it)``.  A new placement
 #: the rule should accept or refuse is covered by adding a ROW.
 PLACEMENT_CASES = [
@@ -136,6 +194,26 @@ PLACEMENT_CASES = [
         'import merge_lane_unplaced\n',
         True,
         id='module-not-in-strata-ignored',
+    ),
+    pytest.param(
+        'merge_lane_ratchet',
+        'from merge_lane_metrics import main\n',
+        False,
+        id='from-import-upward',
+    ),
+    pytest.param(
+        'merge_lane_metrics',
+        'from merge_lane_ratchet import RAISE_REMEDY\n',
+        True,
+        id='from-import-downward',
+    ),
+    pytest.param(
+        'merge_lane_metrics',
+        'from typing import TYPE_CHECKING\n'
+        'if TYPE_CHECKING:\n'
+        '    import merge_lane_ratchet as ratchet\n',
+        False,
+        id='type-checking-guarded',
     ),
 ]
 
