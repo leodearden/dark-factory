@@ -2139,7 +2139,7 @@ class TestOpenMemoryService:
             backend_instance.initialize.assert_awaited_once_with(skip_maintenance=True)
             memory_service_cls.assert_not_called()
             assert result.graphiti is backend_instance
-            backend_instance.close.assert_not_awaited()
+            assert backend_instance.close.await_count == 0
 
         backend_instance.close.assert_awaited_once()
 

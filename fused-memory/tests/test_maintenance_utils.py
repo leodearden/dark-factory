@@ -316,7 +316,7 @@ class TestServiceOpen:
 
         calls: list[str] = []
         service = _recording_service(calls)
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
 
         with patch(
             'fused_memory.services.memory_service.MemoryService', return_value=service,
@@ -371,7 +371,7 @@ class TestServiceOpen:
         from fused_memory.maintenance._utils import maintenance_service
 
         monkeypatch.setenv('CONFIG_PATH', '/existing/config.yaml')
-        config = MagicMock()
+        config = MagicMock(spec_set=pydantic_spec(FusedMemoryConfig))
         service = _recording_service([])
 
         with (
