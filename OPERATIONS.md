@@ -1242,7 +1242,8 @@ worker for the same ref. Always go through `/merge-queue`:
      `stash_failed`, `wip_halted`, `wip_recovery_no_advance`, `error`,
      `superseded`) needs no further polling (except `superseded` — see below).
    <!-- merge-state-vocab:end -->
-     The worker-internal outcomes among them are rare; handle them as
+     The worker-internal outcomes among them are rare; handle all of them
+     but `done_wip_recovery` (which landed — treat it as `done`) as
      `blocked`, per `/merge-queue` step 3.
    <!-- merge-state-vocab:begin partition=SUBMIT_NON_TERMINAL
         Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by

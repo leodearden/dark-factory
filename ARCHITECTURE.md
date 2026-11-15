@@ -846,7 +846,7 @@ marking the new request `attached` rather than double-queuing it.
 
 `merge_request`'s own `status` is a separate vocabulary
 (`shared/src/shared/merge_state.py::MergeSubmitStatus`), and `merge_status`
-collapses its submit-only values onto the poll terminal states
+collapses its submit-only terminal values onto the poll terminal states
 (`escalation/src/escalation/merge_status_answer.py::map_terminal_state`).
 `merge_cancel` is the only way to actually
 cancel a request — a disconnected client does **not** implicitly cancel; the

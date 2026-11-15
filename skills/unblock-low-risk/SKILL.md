@@ -202,7 +202,8 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare;
      `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when
      observed by polling (`escalation/src/escalation/merge_status_answer.py::map_terminal_state`) —
-     handle them as `blocked`. (`failed`, which this list named until task 4829, is not a
+     handle all of them but `done_wip_recovery` (which landed — treat it as `done`) as
+     `blocked`. (`failed`, which this list named until task 4829, is not a
      value the server ever returns; the real one is `error`.)
      The call returns a `request_id` in all
      cases except the `already_merged` ancestor fast-path, which short-circuits before entry
