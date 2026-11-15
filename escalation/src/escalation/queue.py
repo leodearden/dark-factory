@@ -614,7 +614,8 @@ def read_escalation_for_scan(
     ``queue.py::EscalationQueue.get_by_task``,
     ``queue.py::EscalationQueue.get_pending`` (which also backs
     ``dismiss_all_pending``, so the startup L0 sweep inherits the fix),
-    ``queue.py::EscalationQueue.find_terminal_by_citation``,
+    ``queue.py::EscalationQueue.newest_terminal_by_task`` (which also backs
+    ``find_terminal_by_citation``),
     ``sweep.py::reap_loose_archive_files``, and BOTH of ``sweep.py::sweep``'s
     reads -- the root file, and the ARCHIVE copy its reconciliation branch
     compares that file against.  The second one is not a glob-then-read but an
@@ -675,7 +676,7 @@ def read_escalation_for_scan(
     reproduces each module's pre-existing behaviour exactly: queue.py's
     ``(JSONDecodeError, KeyError, TypeError)`` does not match it, so it still
     propagates at ``get_by_task`` / ``get_pending`` /
-    ``find_terminal_by_citation``; sweep.py's tuple carries a bare
+    ``newest_terminal_by_task``; sweep.py's tuple carries a bare
     ``ValueError`` and does match it, so both sweep sites count it as
     unparsable, warn once, and continue the pass.  Hard-coding
     ``except UnicodeDecodeError`` instead would silently overturn the queue-side
