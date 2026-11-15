@@ -1631,7 +1631,7 @@ async def _run(args: Any) -> int:
     import os  # noqa: PLC0415
 
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.maintenance._utils import maintenance_service
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     if args.config:
@@ -1658,9 +1658,7 @@ async def _run(args: Any) -> int:
         if conflict:
             logger.error('ABORT: %s — refusing to calibrate; nothing was written.', conflict)
             return 1
-    memory = MemoryService(config)
-    await memory.initialize()
-    try:
+    async with maintenance_service(config=config) as (_, memory):
         records = load_fixture(args.fixture)
         logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
 
@@ -1749,8 +1747,6 @@ async def _run(args: Any) -> int:
             config_path, ', '.join(sorted(derived_by_category)) or 'none',
         )
         return 0
-    finally:
-        await memory.close()
 
 
 def main() -> int:
