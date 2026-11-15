@@ -5181,9 +5181,10 @@ next night file it again. The ladder is `scripts/exception_owner_sweep.py::decid
   baseline). It recurs by design.
 - **More than `scripts/exception_owner_sweep.py::MAX_OUTPUTS_PER_RUN` outputs
   in one run:** one roll-up escalation. The rest wait for the next run.
-- **A closed dead-owner task whose owner is still dead:** an escalation, never
-  a re-file, whose summary names the closed task. A closed task converted from
-  one of the finding's escalations counts the same.
+- **A dead-owner task no longer open (closed or deferred) whose owner is still
+  dead:** an escalation, never a re-file, whose summary names that task and its
+  status. A task converted from one of the finding's escalations counts the
+  same.
 - **A live cited owner:** an `x_inv12_owns` note merged into its metadata.
 
 The dead-owner and roll-up bodies name
@@ -5195,10 +5196,13 @@ no findings.
 `metadata.escalation_id` names none of the key's escalations is invisible to
 the sweep. That finding is escalated again each night until a task carrying
 one of its escalation ids appears, or the entry is re-owned. A home task that
-closes while the owner is still dead is escalated once per closure. That
-escalation's summary names the closed task, so the router converts it into a
-new task instead of folding it onto the closed one under the store's
-candidate-key index, and the new task then answers the finding.
+closes or is deferred while the owner is still dead is escalated once per such
+change. That escalation's summary names the home and its status, so the router
+converts it into a new task instead of folding it onto the old one under the
+store's candidate-key index, and the new task then answers the finding. The
+curator's semantic drop is a second fold, and it excludes only cancelled tasks:
+a re-raise the curator drops onto the home it names recurs nightly until the
+entry is re-owned.
 
 ---
 

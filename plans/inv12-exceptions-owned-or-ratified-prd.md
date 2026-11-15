@@ -285,12 +285,14 @@ successor, and re-reads status immediately before acting (INV-3).
   carrying `metadata.escalation_id` within minutes. So a live task whose
   `escalation_id` names any escalation ever filed in the key's `task_id` slot
   (archive-inclusive `get_task_escalations`, exact id) also counts as carrying
-  the key, and a closed one is a terminal finding whose escalation names the
-  closed task in its summary. The store's `ux_tasks_candidate_key` index covers
-  `done` rows and the router titles a conversion by its summary, so without a
-  distinct summary each re-raise would fold onto the closed task and the
-  finding would recur nightly. Named lists still escalate: the
-  decision-not-edit reading of this decision stands.
+  the key, and one no longer open (closed or deferred) is a terminal finding
+  whose escalation names that task and its status in its summary. The store's
+  `ux_tasks_candidate_key` index covers `done` rows and the router titles a
+  conversion by its summary, so without a distinct summary each re-raise would
+  fold onto that task and the finding would recur nightly. The curator's
+  semantic drop excludes only `cancelled` too, so a re-raise it drops onto the
+  home it names still recurs nightly until the entry is re-owned. Named lists
+  still escalate: the decision-not-edit reading of this decision stands.
 - *A terminal finding with the condition unchanged escalates; it is never
   re-filed.* That ends the loop where a finding task re-owns to itself.
 - *Output by scope.* Inline → a task through
