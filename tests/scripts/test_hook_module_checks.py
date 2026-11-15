@@ -1,4 +1,4 @@
-"""scripts/hook_module_checks.py lists the merge gate's checks for a staged file set.
+"""scripts/hook_module_checks.py lists the hook's checks for a staged file set: the gate's units plus root:type.
 
 Driven through its CLI only (staged paths on stdin, ``unit<TAB>command`` lines
 on stdout, exit 0 or 2) over throwaway layouts from ``hook_checks_fixture``.
@@ -246,15 +246,24 @@ def test_a_staged_root_py_lists_root_type_scoped_to_it(tmp_path: Path) -> None:
 
 
 def test_root_type_lists_only_staged_root_files_that_exist(tmp_path: Path) -> None:
-    layout = _screen_layout(tmp_path)
+    layout = make_layout(tmp_path)
     write_file(layout, 'df_pytest_isolation.py')
 
-    run = run_helper(layout, ['gone.py', 'df_pytest_isolation.py', 'scripts/foo.py', 'plans/x.md'])
+    run = run_helper(layout, ['gone.py', 'df_pytest_isolation.py', 'scripts/foo.py'])
 
-    kinds = [unit.split(':', 1)[0] for unit, _ in run.units]
     assert run.rc == 0, run.stderr
     assert dict(run.units).get(ROOT_TYPE) == 'uv run --project shared pyright df_pytest_isolation.py', run.units
     assert 'module:scripts:lint' in dict(run.units)
+
+
+def test_units_list_module_then_root_then_screen(tmp_path: Path) -> None:
+    layout = _screen_layout(tmp_path)
+    write_file(layout, 'df_pytest_isolation.py')
+
+    run = run_helper(layout, ['df_pytest_isolation.py', 'scripts/foo.py', 'plans/x.md'])
+
+    kinds = [unit.split(':', 1)[0] for unit, _ in run.units]
+    assert run.rc == 0, run.stderr
     assert set(kinds) == set(UNIT_KINDS), run.units
     assert kinds == sorted(kinds, key=UNIT_KINDS.index), run.units
 
