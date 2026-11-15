@@ -9,6 +9,7 @@ amended, so the architect can plan their re-derivation.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -103,9 +104,34 @@ async def test_the_section_lists_every_suggestion_and_its_fix(briefing, build):
 async def test_the_section_asks_for_a_step_or_a_design_decision(briefing, build):
     prompt = await build(briefing, retired_reviews=(_RETIRED,))
 
-    assert 'Review Rounds Answered On A Quarantined Branch' in prompt
     assert 'add_design_decision' in prompt
     assert f'git log --oneline main..{_TIP}' in prompt
+
+
+def _headings(prompt: str) -> list[tuple[int, str]]:
+    return [(len(line) - len(line.lstrip('#')), line) for line in prompt.splitlines() if line.startswith('#')]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('build', _BUILDERS)
+async def test_each_suggestion_nests_under_its_own_lineage(briefing, build):
+    second = replace(_RETIRED, branch='refs/heads/task/9-20261113T000000Z', suggestions=_SUGGESTIONS[:1])
+    baseline = set(_headings(await build(briefing)))
+
+    prompt = await build(briefing, retired_reviews=(_RETIRED, second))
+
+    added = [level for level, line in _headings(prompt) if (level, line) not in baseline]
+    assert added == [2, 3, 4, 5, 5, 3, 4, 5]
+    assert prompt.index('add_design_decision') < prompt.index(_BRANCH)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('build', _BUILDERS)
+async def test_a_lineage_without_a_tip_names_its_branch_instead(briefing, build):
+    prompt = await build(briefing, retired_reviews=(replace(_RETIRED, tip_sha=None),))
+
+    assert '`None`' not in prompt
+    assert f'git log --oneline main..{_BRANCH}' in prompt
 
 
 @pytest.mark.asyncio

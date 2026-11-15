@@ -209,11 +209,9 @@ def _retired_review_section(retired: Sequence[RetiredReview]) -> str:
         'cut a fresh branch from main. The review suggestions below fell inside this '
         'task\'s modules and were handed to an amendment pass on the parked branch. '
         'None of that branch\'s commits are on this branch. Suggestions from those '
-        'rounds that fall outside this task\'s modules were filed as follow-up tasks '
-        'and are left out here, so do not plan them. This branch\'s review allowance '
-        'was reset, and its reviewer may not re-raise the ones below, so plan for '
-        'them here.\n\n'
-        f'{lineages}\n'
+        'rounds that fall outside this task\'s modules are left out here, so do not '
+        'plan them. This branch\'s review allowance was reset, and its reviewer may '
+        'not re-raise the ones below, so plan for them here.\n\n'
         'Protocol:\n\n'
         '1. Check each suggestion against the current code; main may already carry an '
         'equivalent change.\n'
@@ -221,19 +219,21 @@ def _retired_review_section(retired: Sequence[RetiredReview]) -> str:
         'see how the parked branch answered it.\n'
         '3. Plan a step for each suggestion still open, or call `add_design_decision` '
         'recording why it is moot.\n\n'
+        f'{lineages}\n'
     )
 
 
 def _retired_lineage_block(review: RetiredReview) -> str:
     answered_by = review.tip_sha or review.branch
+    tip = f' (tip `{review.tip_sha}`)' if review.tip_sha else ''
     return (
-        f'### `{review.branch}` (tip `{review.tip_sha}`)\n\n'
+        f'### `{review.branch}`{tip}\n\n'
         f'- Parked at: `{review.parking}`\n'
         f'- Answered there: {review.amendment_rounds_total} amendment round(s), '
         f'{review.review_cycles_total} review cycle(s)\n'
         f'- Retired review archive: `{review.archive}`\n'
         f'- How it was answered: `git log --oneline main..{answered_by}`\n\n'
-        + format_issue_section('#### In-scope suggestions amended on that branch\n', review.suggestions)
+        + format_issue_section('#### In-scope suggestions amended on that branch\n', review.suggestions, issue_level=5)
     )
 
 

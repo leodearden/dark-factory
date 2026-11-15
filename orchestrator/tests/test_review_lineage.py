@@ -117,7 +117,7 @@ class TestRetirement:
         retire_quarantined_lineages(artifacts)
 
         assert _top_level_archives(artifacts) == []
-        retired = artifacts.artifact_path(f'retired-reviews/{_PARKING_NAME}')
+        retired = artifacts.retired_review_dir(_PARKING_NAME)
         assert (retired / 'reviews-amend-1' / 'reviewer_comprehensive.json').is_file()
         assert (retired / 'reviews-cycle-1' / 'x.json').is_file()
 
@@ -137,7 +137,7 @@ class TestRetirement:
         assert retired.quarantined_at == parked['quarantined_at']
         assert retired.amendment_rounds_total == 1
         assert retired.review_cycles_total == 1
-        assert retired.archive == artifacts.artifact_path(f'retired-reviews/{_PARKING_NAME}')
+        assert retired.archive == artifacts.retired_review_dir(_PARKING_NAME)
         descriptions = [s['description'] for s in retired.suggestions]
         assert descriptions == [_SUGGESTION['description']]
         assert _BLOCKING['description'] not in descriptions
@@ -150,6 +150,24 @@ class TestRetirement:
         cached = artifacts.get_cached_verdict('tree-abc')
         assert cached is not None
         assert cached['verdict'] == 'PASS'
+
+    def test_an_archive_already_retired_under_that_name_is_left_in_place(self, artifacts: TaskArtifacts, parked):
+        (artifacts.retired_review_dir(_PARKING_NAME) / 'reviews-amend-1').mkdir(parents=True)
+
+        retire_quarantined_lineages(artifacts)
+
+        assert _top_level_archives(artifacts) == ['reviews-amend-1']
+        assert (artifacts.review_archive_dir('amend-1') / 'reviewer_comprehensive.json').is_file()
+        assert (artifacts.retired_review_dir(_PARKING_NAME) / 'reviews-cycle-1' / 'x.json').is_file()
+
+    def test_an_unreadable_plan_retires_nothing_and_does_not_raise(self, artifacts: TaskArtifacts, parked):
+        artifacts.artifact_path('plan.json').write_text('{not json')
+
+        assert retire_quarantined_lineages(artifacts) == ()
+
+        assert artifacts.get_amendment_rounds_total() == 1
+        assert artifacts.get_review_cycles_total() == 1
+        assert _top_level_archives(artifacts) == ['reviews-amend-1', 'reviews-cycle-1']
 
 
 class TestAcknowledgement:
@@ -167,9 +185,12 @@ class TestAcknowledgement:
         _seed_parked_lineage(artifacts)
         assert stamp_quarantined_from(artifacts, _stamp(branch=None, tip_sha=None, unique_commit_count=None))
 
-        first = retire_quarantined_lineages(artifacts)
+        (only,) = retire_quarantined_lineages(artifacts)
 
-        assert all(r.archive is None and r.amendment_rounds_total == 0 for r in first)
+        assert only.branch is None
+        assert only.archive is None
+        assert only.amendment_rounds_total == 0
+        assert len(artifacts.retired_review_records()) == 1
         assert artifacts.get_amendment_rounds_total() == 1
         assert artifacts.get_review_cycles_total() == 1
         assert _top_level_archives(artifacts) == ['reviews-amend-1', 'reviews-cycle-1']
@@ -211,7 +232,7 @@ class TestRetiredReviewsSince:
         (review,) = review_lineage.retired_reviews_since(artifacts, None)
 
         assert review.branch == retired['branch']
-        assert review.archive == artifacts.artifact_path(f'retired-reviews/{_PARKING_NAME}')
+        assert review.archive == artifacts.retired_review_dir(_PARKING_NAME)
         (suggestion,) = review.suggestions
         assert suggestion['description'] == _SUGGESTION['description']
         assert suggestion['suggested_fix'] == _SUGGESTION['suggested_fix']
@@ -244,6 +265,17 @@ class TestRetiredReviewsSince:
         assert review_lineage.retired_reviews_since(artifacts, None) == ()
 
     def test_a_deleted_retired_archive_carries_nothing(self, artifacts: TaskArtifacts, retired):
-        shutil.rmtree(artifacts.artifact_path('retired-reviews'))
+        shutil.rmtree(artifacts.retired_review_dir(_PARKING_NAME))
 
         assert review_lineage.retired_reviews_since(artifacts, None) == ()
+
+    def test_a_moved_task_root_still_carries_its_retired_lineage(self, lane: Path, artifacts: TaskArtifacts, retired):
+        moved_root = lane.parent / 'relocated' / 'task-42'
+        moved_root.parent.mkdir()
+        shutil.move(artifacts.task_root, moved_root)
+        moved = TaskArtifacts(lane, artifacts.lane_root, moved_root)
+
+        (review,) = review_lineage.retired_reviews_since(moved, None)
+
+        assert review.archive == moved.retired_review_dir(_PARKING_NAME)
+        assert [s['description'] for s in review.suggestions] == [_SUGGESTION['description']]

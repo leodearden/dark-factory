@@ -23,18 +23,18 @@ import logging
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from types import NoneType
 from typing import Any
+
+from shared.task_deferral import parse_utc_timestamp
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.quarantine_provenance import QUARANTINED_FROM_KEY, quarantined_from_of
 from orchestrator.review_suggestions.prior_round import load_prior_round_suggestions
 
 logger = logging.getLogger(__name__)
-
-RETIRED_REVIEWS_DIR = 'retired-reviews'
 
 _RECORD_FIELDS: Mapping[str, tuple[type, ...]] = {
     'branch': (str, NoneType),
@@ -43,7 +43,7 @@ _RECORD_FIELDS: Mapping[str, tuple[type, ...]] = {
     'quarantined_at': (str,),
     'amendment_rounds_total': (int,),
     'review_cycles_total': (int,),
-    'archive': (str, NoneType),
+    'archived': (bool,),
 }
 
 
@@ -52,9 +52,10 @@ class RetiredReview:
     """One review lineage a quarantine ended, as retired at the next dispatch.
 
     ``branch`` is None when the quarantine renamed no branch aside, so nothing
-    was retired. ``archive`` is the ``retired-reviews/<parking-basename>/``
-    directory the round archives moved into; None when none moved.
-    ``suggestions`` are the archived amend rounds' non-blocking issues.
+    was retired. ``archive`` is the directory the round archives moved into,
+    ``TaskArtifacts.retired_review_dir`` of the parking's basename; None when
+    none moved. ``suggestions`` are the archived amend rounds' non-blocking
+    issues.
     """
 
     branch: str | None
@@ -67,7 +68,7 @@ class RetiredReview:
     suggestions: tuple[Mapping[str, Any], ...] = ()
 
     def to_record(self) -> dict[str, Any]:
-        """The ``retired_lineages`` entry; the suggestions stay on disk in ``archive``."""
+        """The ``retired_lineages`` entry; ``archive`` is kept as whether one exists, and re-derived on read."""
         return {
             'branch': self.branch,
             'tip_sha': self.tip_sha,
@@ -75,17 +76,18 @@ class RetiredReview:
             'quarantined_at': self.quarantined_at,
             'amendment_rounds_total': self.amendment_rounds_total,
             'review_cycles_total': self.review_cycles_total,
-            'archive': str(self.archive) if self.archive is not None else None,
+            'archived': self.archive is not None,
         }
 
 
-def _from_record(record: Mapping[str, Any]) -> RetiredReview | None:
+def _archive_dir(artifacts: TaskArtifacts, parking: str) -> Path:
+    return artifacts.retired_review_dir(Path(parking).name)
+
+
+def _from_record(artifacts: TaskArtifacts, record: Mapping[str, Any]) -> RetiredReview | None:
     """The record as a :class:`RetiredReview`; None when it does not match ``_RECORD_FIELDS``."""
-    for key, accepted in _RECORD_FIELDS.items():
-        value = record.get(key)
-        if key not in record or not isinstance(value, accepted) or isinstance(value, bool):
-            return None
-    archive = record['archive']
+    if any(key not in record or type(record[key]) not in accepted for key, accepted in _RECORD_FIELDS.items()):
+        return None
     return RetiredReview(
         branch=record['branch'],
         tip_sha=record['tip_sha'],
@@ -93,12 +95,12 @@ def _from_record(record: Mapping[str, Any]) -> RetiredReview | None:
         quarantined_at=record['quarantined_at'],
         amendment_rounds_total=record['amendment_rounds_total'],
         review_cycles_total=record['review_cycles_total'],
-        archive=Path(archive) if archive is not None else None,
+        archive=_archive_dir(artifacts, record['parking']) if record['archived'] else None,
     )
 
 
 def _retired_reviews(artifacts: TaskArtifacts) -> tuple[RetiredReview, ...]:
-    parsed = (_from_record(record) for record in artifacts.retired_review_records())
+    parsed = (_from_record(artifacts, record) for record in artifacts.retired_review_records())
     return tuple(review for review in parsed if review is not None)
 
 
@@ -150,11 +152,12 @@ def _retire(artifacts: TaskArtifacts, stamp: Mapping[str, Any]) -> RetiredReview
     if review.branch is None:
         artifacts.record_retired_lineage(review.to_record(), zero_counters=False)
         return review
+    archive = _archive_dir(artifacts, review.parking)
     review = replace(
         review,
         amendment_rounds_total=artifacts.get_amendment_rounds_total(),
         review_cycles_total=artifacts.get_review_cycles_total(),
-        archive=_move_round_archives(artifacts, Path(review.parking).name),
+        archive=archive if _move_round_archives(artifacts, archive) else None,
     )
     artifacts.record_retired_lineage(review.to_record(), zero_counters=True)
     if review.amendment_rounds_total or review.review_cycles_total:
@@ -166,9 +169,8 @@ def _retire(artifacts: TaskArtifacts, stamp: Mapping[str, Any]) -> RetiredReview
     return _with_suggestions(review)
 
 
-def _move_round_archives(artifacts: TaskArtifacts, parking_name: str) -> Path | None:
-    """Move every ``reviews-<label>`` archive under ``retired-reviews/<parking_name>/``; None when that holds none."""
-    destination_root = artifacts.artifact_path(f'{RETIRED_REVIEWS_DIR}/{parking_name}')
+def _move_round_archives(artifacts: TaskArtifacts, destination_root: Path) -> bool:
+    """Move every ``reviews-<label>`` archive under *destination_root*; whether that then exists."""
     for archive in artifacts.review_archive_dirs():
         destination = destination_root / archive.name
         if destination.exists():
@@ -176,7 +178,7 @@ def _move_round_archives(artifacts: TaskArtifacts, parking_name: str) -> Path | 
             continue
         destination_root.mkdir(parents=True, exist_ok=True)
         shutil.move(archive, destination)
-    return destination_root if destination_root.is_dir() else None
+    return destination_root.is_dir()
 
 
 def retired_reviews_since(artifacts: TaskArtifacts, since: datetime | None) -> tuple[RetiredReview, ...]:
@@ -201,11 +203,6 @@ def _quarantined_after(quarantined_at: str, since: datetime | None) -> bool:
     if since is None:
         return True
     try:
-        parsed = datetime.fromisoformat(quarantined_at)
+        return parse_utc_timestamp(quarantined_at) > parse_utc_timestamp(since)
     except ValueError:
         return True
-    return _as_utc(parsed) > _as_utc(since)
-
-
-def _as_utc(moment: datetime) -> datetime:
-    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)

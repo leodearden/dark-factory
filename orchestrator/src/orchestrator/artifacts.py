@@ -669,6 +669,7 @@ class ArtifactRoot(Enum):
 _REVIEW_ARCHIVE_PREFIX = 'reviews-'
 _REVIEW_ARCHIVE_FAMILY = f'{_REVIEW_ARCHIVE_PREFIX}<label>/'
 _RETIRED_LINEAGES_KEY = 'retired_lineages'
+_RETIRED_REVIEWS_DIR = 'retired-reviews'
 _ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE = 'zero_output_evidence-iter{}.json'
 _ZERO_OUTPUT_EVIDENCE_FAMILY = _ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE.format('<n>')
 
@@ -691,7 +692,7 @@ ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
     'review_state.json': ArtifactRoot.TASK,
     'reconcile_state.json': ArtifactRoot.TASK,
     _REVIEW_ARCHIVE_FAMILY: ArtifactRoot.TASK,
-    'retired-reviews': ArtifactRoot.TASK,
+    _RETIRED_REVIEWS_DIR: ArtifactRoot.TASK,
     _ZERO_OUTPUT_EVIDENCE_FAMILY: ArtifactRoot.TASK,
 })
 """The single routing table: artifact name (or family key) -> owning root.
@@ -749,8 +750,9 @@ def _warn_off_contract_issues(reviewer_name: str, issues: tuple[dict, ...]) -> N
         )
 
 
-def format_issue_section(heading: str, issues: Iterable[Mapping[str, Any]]) -> str:
-    """*heading*, then each review issue as reviewer, category, location, issue and suggested fix."""
+def format_issue_section(heading: str, issues: Iterable[Mapping[str, Any]], *, issue_level: int = 2) -> str:
+    """*heading*, then each review issue under a level-*issue_level* heading: reviewer, category, location, issue and suggested fix."""
+    issue_heading = '#' * issue_level
     lines = [heading]
     for issue in issues:
         reviewer = issue.get('reviewer', 'unknown')
@@ -758,7 +760,7 @@ def format_issue_section(heading: str, issues: Iterable[Mapping[str, Any]]) -> s
         category = issue.get('category', '')
         description = issue.get('description', '')
         fix = issue.get('suggested_fix', '')
-        lines.append(f'## [{reviewer}] {category}')
+        lines.append(f'{issue_heading} [{reviewer}] {category}')
         if location:
             lines.append(f'**Location:** {location}')
         lines.append(f'**Issue:** {description}')
@@ -849,6 +851,10 @@ class TaskArtifacts:
         if not root.is_dir():
             return ()
         return tuple(sorted(p for p in root.glob(f'{_REVIEW_ARCHIVE_PREFIX}*') if p.is_dir()))
+
+    def retired_review_dir(self, parking_name: str) -> Path:
+        """Where the round archives of the lineage parked as *parking_name* were retired to."""
+        return self._root_for(_RETIRED_REVIEWS_DIR) / _RETIRED_REVIEWS_DIR / parking_name
 
     def zero_output_evidence_path(self, iteration: int) -> Path:
         return self._root_for(_ZERO_OUTPUT_EVIDENCE_FAMILY) / _ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE.format(iteration)
