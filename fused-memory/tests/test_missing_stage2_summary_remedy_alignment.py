@@ -68,14 +68,37 @@ class TestStage3MissingSummaryRemedy:
         )
 
 
-class TestStage1HeadingCrossReferences:
-    def test_heading_cross_references_resolve(self):
-        referenced = re.findall(r'see ## ([^\n]+?) below', STAGE1_SYSTEM_PROMPT)
-        headings = {section.splitlines()[0] for section in _sections(STAGE1_SYSTEM_PROMPT)}
+_HEADING = re.compile(r'^(#{2,}) (.+)$', re.MULTILINE)
 
-        assert referenced, 'STAGE1_SYSTEM_PROMPT has no "see ## <heading> below" pointer.'
-        for heading in referenced:
-            assert heading in headings, (
-                f'STAGE1_SYSTEM_PROMPT points the agent at "## {heading}", '
-                'which no section carries.'
+#: "see ## Title below" and "`### Title` above": pointers that promise a heading
+#: in the prompt itself, as opposed to "`## Title` section" mentions of a
+#: payload section the harness appends.
+_ABOVE_OR_BELOW_POINTER = re.compile(r'(?:see |`)(#{2,}) ([^`\n]+?)`? (below|above)\b')
+
+
+def _points_at(pointer: re.Match[str], heading: re.Match[str]) -> bool:
+    level, title, direction = pointer.groups()
+    heading_level, heading_title = heading.groups()
+    if direction == 'below':
+        in_direction = heading.start() > pointer.start()
+    else:
+        in_direction = heading.start() < pointer.start()
+    return (
+        heading_level == level
+        and (heading_title == title or heading_title.startswith(f'{title} '))
+        and in_direction
+    )
+
+
+class TestStage1HeadingPointers:
+    def test_above_and_below_heading_pointers_resolve(self):
+        pointers = list(_ABOVE_OR_BELOW_POINTER.finditer(STAGE1_SYSTEM_PROMPT))
+        headings = list(_HEADING.finditer(STAGE1_SYSTEM_PROMPT))
+
+        assert pointers, 'STAGE1_SYSTEM_PROMPT has no above/below heading pointer.'
+        for pointer in pointers:
+            assert any(_points_at(pointer, heading) for heading in headings), (
+                f'STAGE1_SYSTEM_PROMPT says "{pointer.group(0)}", but no '
+                f'{pointer.group(1)} heading starting "{pointer.group(2)}" sits '
+                f'{pointer.group(3)} it.'
             )
