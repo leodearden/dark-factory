@@ -11,6 +11,7 @@ store says afterwards is what the resolution alone delivered.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -24,7 +25,9 @@ from orchestrator.deterministic_runner import (
     DETERMINISTIC_AGENT_ROLE,
     MILESTONE_GATE_CATEGORY,
 )
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
+from orchestrator.run_store import RunStore
 from orchestrator.scheduler import ProvenanceValidationRejection
 
 pytestmark = pytest.mark.asyncio
@@ -101,6 +104,29 @@ async def test_resume_closes_a_dependency_free_gate_without_a_dispatch(
     history = store._status_history['gate-2864']
     assert 'pending' not in history[history.index('blocked'):], history
     assert _pending(det_harness, 'gate-2864') == []
+
+
+async def test_an_inline_close_is_recorded_as_a_slot_run_is(
+    det_harness: Harness, tmp_path: Path,
+) -> None:
+    record = await _blocked_gate(det_harness, 'gate-m')
+    det_harness.config.fused_memory.project_id = 'dark_factory'
+    det_harness._run_id = 'run-3638'
+    det_harness._run_store = RunStore(tmp_path / 'runs.db')
+    events = EventStore(tmp_path / 'events.db', run_id='run-3638')
+    det_harness.event_store = events
+
+    await _resolve(det_harness, record.id)
+
+    with sqlite3.connect(tmp_path / 'runs.db') as conn:
+        results = conn.execute(
+            'SELECT task_id, outcome FROM task_results WHERE run_id = ?', ('run-3638',),
+        ).fetchall()
+    assert results == [('gate-m', 'done')]
+    [completed] = events.fetch_events_by_type(EventType.task_completed)
+    assert completed['task_id'] == 'gate-m'
+    assert completed['data']['outcome'] == 'done'
+    assert completed['data']['escalation_id'] == record.id
 
 
 async def test_resume_after_an_unsatisfied_hold_re_pends(det_harness: Harness) -> None:
