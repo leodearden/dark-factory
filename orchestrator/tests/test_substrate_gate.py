@@ -1387,14 +1387,14 @@ async def _init_unborn_repo(repo: Path) -> None:
     from orchestrator.git_ops import _run
 
     await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
 
 
 async def _init_gate_repo(repo: Path) -> None:
     from orchestrator.git_ops import _run
 
-    await _init_unborn_repo(repo)
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
     (repo / 'README.md').write_text('# Test\n')
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
