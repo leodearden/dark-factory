@@ -676,8 +676,9 @@ async def is_workflow_live_for_task(
 #
 # Three corroborating signals, ANY sufficient:
 #   1. Fresh claimant/heartbeat — ``has_live_claimant(task, now, ttl)``.
-#   2. Scheduler holder/park — task_id in ``parks`` keys OR ``current_holders``
-#      values (both reset by an orchestrator restart).
+#   2. Scheduler holder/park — task_id in ``parks`` keys OR
+#      ``SchedulerStateSnapshot.holder_task_ids()`` (both reset by an
+#      orchestrator restart).
 #   3. routing.latest.decided_at newer than the orchestrator's start time (a
 #      dispatch predating the last restart cannot have a live workflow).
 
@@ -870,16 +871,18 @@ def is_unclaimed_awaiting_dependency(task: object, dependency_statuses: object) 
 def _task_in_scheduler_holders_or_parks(
     task_id: str | int, scheduler_state: SchedulerStateSnapshot | None
 ) -> bool:
-    """Return True when *task_id* is a scheduler park owner or a current holder.
+    """Return True when *task_id* is a scheduler park owner or a lock holder.
 
-    ``current_holders`` maps module to task_id, so the task appears as a VALUE
-    there. Both are reset by an orchestrator restart, so a stranded
-    post-redeploy task is absent from both. Snapshot task ids are strings.
+    The lock holders are those ``SchedulerStateSnapshot.holder_task_ids`` names,
+    which names every holder of a shared key and reads an older snapshot
+    through ``current_holders``. Both are reset by an orchestrator restart, so
+    a stranded post-redeploy task is absent from both. Snapshot task ids are
+    strings.
     """
     if scheduler_state is None:
         return False
     tid = str(task_id)
-    return tid in scheduler_state.parks or tid in scheduler_state.current_holders.values()
+    return tid in scheduler_state.parks or tid in scheduler_state.holder_task_ids()
 
 
 def _routing_decided_after_restart(
