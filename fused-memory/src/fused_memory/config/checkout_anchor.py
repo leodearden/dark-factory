@@ -3,10 +3,15 @@
 import os
 from pathlib import Path
 
+
+def holds_fused_memory_checkout(root: Path) -> bool:
+    return (root / 'fused-memory' / 'pyproject.toml').is_file()
+
+
 #: config -> fused_memory -> src -> fused-memory -> checkout; holds only for an editable install.
 CHECKOUT_ROOT: Path = Path(__file__).resolve().parents[4]
-#: Whether CHECKOUT_ROOT holds the fused-memory checkout; read once at import, so anchoring a path does no filesystem I/O (INV-8).
-ANCHOR_HOLDS_CHECKOUT: bool = (CHECKOUT_ROOT / 'fused-memory' / 'pyproject.toml').is_file()
+#: Read once at import, so anchoring a path does no filesystem I/O (INV-8).
+ANCHOR_HOLDS_CHECKOUT: bool = holds_fused_memory_checkout(CHECKOUT_ROOT)
 
 
 def anchor_at_checkout(path: str) -> str:
