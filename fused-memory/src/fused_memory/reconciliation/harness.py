@@ -65,9 +65,12 @@ from fused_memory.reconciliation.escalation_archive import (
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.finding_task_escalation import (
+    FINDING_TASK_ESCALATION_CATEGORY,
     build_finding_task_escalation_kwargs,
     is_routable_task_id,
+    recent_conversion_suppresses_refile,
     resolve_finding_task_target,
+    routed_record_carries_finding,
     routed_record_covers_finding,
 )
 from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
@@ -142,6 +145,7 @@ try:
         compute_content_fingerprint,
         submit_or_dedupe,
     )
+    from escalation.disposition import ConvertViaCurator
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
     from escalation.server import (  # type: ignore[import-untyped]
@@ -309,7 +313,8 @@ _MAX_BACKLOG_REMEDIATION_DEFERRALS = _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 3
 # resolved within this window.  Beyond it, a recurrence re-escalates so a
 # re-emerging problem is not hidden forever.  Value is a policy threshold —
 # the exact constant is not load-bearing for tests (60s vs 8d test points sit
-# robustly inside/outside any reasonable 24h window).
+# robustly inside/outside any reasonable 24h window).  Its second consumer is
+# the routed filer's conversion hold (task 7894, `_file_finding_task_escalation`).
 _RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
 
 # Task 1970 amendment (reviewer_comprehensive): coarse safety net for a
@@ -2708,7 +2713,10 @@ class ReconciliationHarness:
         - a pending record already covers this finding: a level-0 record with
           the same finding fingerprint, or a routed record a human already
           holds at a higher level
-          (:func:`~fused_memory.reconciliation.finding_task_escalation.routed_record_covers_finding`).
+          (:func:`~fused_memory.reconciliation.finding_task_escalation.routed_record_covers_finding`);
+        - a routed record of this finding that the info-L0 router converted to
+          a task within the recurrence window
+          (:func:`~fused_memory.reconciliation.finding_task_escalation.recent_conversion_suppresses_refile`).
 
         LEVEL 0, deliberately: `EscalationQueue.has_open_l1` is level-1-only
         and is what a spread of orchestrator guards read as "a human is already
@@ -2799,8 +2807,9 @@ class ReconciliationHarness:
             fingerprint = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, finding)
             # Cross-cycle dedupe: the fold policy is
             # `finding_task_escalation.py::routed_record_covers_finding`. The
-            # scan reads PENDING records only, so a finding re-files once its
-            # record is adjudicated.
+            # scan reads PENDING records only.  Once the record is closed, an
+            # adjudication lets the finding re-file; a router conversion holds
+            # it back for the recurrence window (the terminal scan below).
             covering = next(
                 (
                     e for e in queue.get_by_task(task_id, status='pending')
@@ -2818,6 +2827,29 @@ class ReconciliationHarness:
                         'finding_category': finding.get('category', ''),
                         'covering_escalation_id': covering.id,
                         'covering_level': covering.level,
+                    },
+                )
+                return None
+            converted = queue.newest_terminal_by_task(
+                task_id,
+                FINDING_TASK_ESCALATION_CATEGORY,
+                lambda e: routed_record_carries_finding(e, fingerprint),
+            )
+            if converted is not None and recent_conversion_suppresses_refile(
+                converted,
+                converted_class=ConvertViaCurator.resolution_class,
+                now=datetime.now(UTC),
+                window=timedelta(seconds=_RESOLVED_RECURRENCE_WINDOW_SECONDS),
+            ):
+                logger.info(
+                    'reconciliation.finding_task_escalation_suppressed_converted',
+                    extra={
+                        'project_id': project_id,
+                        'run_id': run_id,
+                        'task_id': task_id,
+                        'finding_category': finding.get('category', ''),
+                        'converted_escalation_id': converted.id,
+                        'converted_at': converted.resolved_at,
                     },
                 )
                 return None
