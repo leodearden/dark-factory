@@ -7,10 +7,11 @@ the one mapping from a dispatch identity to the role whose settings it uses.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Annotated, Final
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, TypeAdapter
 
 from shared.backends import Backend, parse_backend
 
@@ -24,6 +25,7 @@ __all__ = [
     'RoleSettings',
     'UnknownRole',
     'config_role',
+    'merge_role_table',
 ]
 
 
@@ -148,3 +150,44 @@ class RoleSettings(BaseModel):
     budget_usd: float | None = Field(default=None, gt=0)
     max_turns: int | None = Field(default=None, gt=0)
     timeout_secs: float | None = Field(default=None, gt=0)
+
+
+_ROLE_TABLE: Final = TypeAdapter(dict[RoleName, RoleSettings])
+
+
+def merge_role_table(
+    defaults: Mapping[RoleName, RoleSettings],
+    raw: Mapping[str, Mapping[str, object] | RoleSettings],
+) -> dict[RoleName, RoleSettings]:
+    """The one entry-wise, knob-wise merge of a raw role table over its defaults.
+
+    It raises on an unknown role or knob and never drops one.
+    """
+    overrides: dict[RoleName, Mapping[str, object]] = {}
+    for key, row in raw.items():
+        role = _table_role(key, defaults)
+        overrides[role] = _named_knobs(role, row)
+    merged = {
+        role: {**defaults[role].model_dump(), **overrides.get(role, {})}
+        for role in RoleName
+        if role in defaults
+    }
+    return _ROLE_TABLE.validate_python(merged)
+
+
+def _table_role(key: str, defaults: Mapping[RoleName, RoleSettings]) -> RoleName:
+    try:
+        role = RoleName(key)
+    except ValueError:
+        role = None
+    if role is None or role not in defaults:
+        raise UnknownRole(key, allowed=tuple(r.value for r in RoleName if r in defaults))
+    return role
+
+
+def _named_knobs(role: RoleName, row: Mapping[str, object] | RoleSettings) -> Mapping[str, object]:
+    if isinstance(row, RoleSettings):
+        return row.model_dump(include=row.model_fields_set)
+    if isinstance(row, Mapping):
+        return row
+    raise ValueError(f'role {role.value!r}: a row must be a mapping of knobs, got {row!r}')
