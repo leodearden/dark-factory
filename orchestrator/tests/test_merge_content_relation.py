@@ -344,6 +344,41 @@ class TestClassifyContent:
 
         assert relation is ContentRelation.DIFFERENT
 
+    async def test_merge_commit_only_in_the_old_range_is_different(
+        self, repo: GuardedRepo, git_ops: GitOps,
+    ) -> None:
+        own = branch_with_commit(repo, 'task/synced-then-linear')
+        advance_main(repo, 'synced-in')
+        repo.git('checkout', 'task/synced-then-linear')
+        repo.git('merge', '--no-ff', 'main', '-m', 'Merge main into task/synced-then-linear')
+        old_tip = repo.sha('HEAD')
+        repo.git('checkout', '-b', 'task/linear', 'main')
+        repo.git('cherry-pick', own)
+        new_tip = repo.sha('HEAD')
+        old_range = await range_patch_ids(git_ops, target='main', tip=old_tip)
+        new_range = await range_patch_ids(git_ops, target='main', tip=new_tip)
+        assert old_range.patch_ids == new_range.patch_ids
+        assert (old_range.has_merge_commit, new_range.has_merge_commit) == (True, False)
+
+        relation = await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=new_tip)
+
+        assert relation is ContentRelation.DIFFERENT
+
+    async def test_an_added_empty_commit_reads_rebased_an_accepted_limit(
+        self, repo: GuardedRepo, git_ops: GitOps,
+    ) -> None:
+        """An empty commit has no patch id, so adding one changes no range's content."""
+        old_tip = branch_with_commit(repo, 'task/empty-added')
+        advance_main(repo, 'moved')
+        repo.git('checkout', '-b', 'task/empty-added-new', 'main')
+        repo.git('cherry-pick', old_tip)
+        repo.git('commit', '--allow-empty', '-m', 'chore: empty')
+        new_tip = repo.sha('HEAD')
+
+        relation = await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=new_tip)
+
+        assert relation is ContentRelation.REBASED
+
     async def test_reapplied_diff_is_different(self, repo: GuardedRepo, git_ops: GitOps) -> None:
         repo.git('checkout', '-b', 'task/multiset')
         repo.commit('feat: add f', {'work/f.py': numbered_lines('f', 10)})
