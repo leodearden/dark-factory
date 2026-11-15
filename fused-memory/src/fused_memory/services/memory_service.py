@@ -125,6 +125,7 @@ from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQue
 from fused_memory.services.mem0_add_outcome import (
     RAISED_MEM0_ADD,
     Mem0AddOutcome,
+    Mem0LegResult,
     read_mem0_add_result,
 )
 from fused_memory.services.mem0_write_retry import (
@@ -6740,92 +6741,42 @@ class MemoryService:
         # QueueOperation.MEM0_ADD rows still decode and execute for backward
         # compat — any in-flight queue items from before this fix still drain correctly.
         if write_mem0:
-            # Write-ahead intent (task 2710): durably journal the intended
-            # mem0 write BEFORE the risky await, so a crash mid-mem0-write
-            # leaves a 'pending' trace instead of a silently orphaned Graphiti
-            # twin. recover_mem0_intents reconciles any pending intent at
-            # startup. Keyed to the existing write_op_id so the reconciler can
-            # correlate with the per-call mem0 backend_op as evidence.
-            intent_id: str | None = None
-            if self._write_journal:
-                intent_id = str(uuid_mod.uuid4())
-                payload_digest = self._mem0_payload_digest(
-                    content,
-                    project_id,
-                    agent_id,
-                    session_id,
-                    resolved_category.value,
-                    meta,
+            leg = await self._write_mem0_leg(
+                Mem0WriteMethod.ADD,
+                content=content,
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                category=resolved_category.value,
+                metadata=meta,
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                defer_transient=defer_transient_mem0_failure,
+            )
+            memory_ids.extend(leg.outcome.memory_ids)
+            stores_written.extend(leg.outcome.stores_written)
+            _mem0_empty_result = leg.outcome.empty_result_error
+            _mem0_pending = leg.pending_retry_reason
+            if leg.pending_retry:
+                stores_pending_retry.append(SourceStore.mem0)
+            if leg.error is not None:
+                logger.error(f'Mem0 write failed: {leg.error}')
+                _mem0_error = leg.error
+            if _mem0_empty_result:
+                # mem0.add() did not raise but returned no results — a silent
+                # dedup/infer no-op drop (task 1974). Under the pinned
+                # infer=False, a successful write always returns exactly one
+                # result with an id, so this is always anomalous.
+                logger.warning(
+                    'MemoryService.add_memory: mem0 add returned zero memory_ids '
+                    '(silent empty-result drop; possible dedup/infer no-op)',
+                    extra={
+                        'project_id': project_id,
+                        'category': resolved_category.value,
+                        'causation_id': causation_id,
+                        'kind': meta.get('kind'),
+                    },
                 )
-                await self._write_journal.log_mem0_intent(
-                    intent_id=intent_id,
-                    write_op_id=write_op_id,
-                    causation_id=causation_id,
-                    project_id=project_id,
-                    agent_id=agent_id,
-                    session_id=session_id,
-                    category=resolved_category.value,
-                    content=content,
-                    metadata=meta,
-                    payload_digest=payload_digest,
-                    write_method=Mem0WriteMethod.ADD,
-                )
-            try:
-                mem0_outcome = await self._call_mem0_write(
-                    Mem0WriteMethod.ADD,
-                    content=content,
-                    scope=scope,
-                    metadata=meta,
-                    write_op_id=write_op_id,
-                    causation_id=causation_id,
-                )
-                memory_ids.extend(mem0_outcome.memory_ids)
-                stores_written.extend(mem0_outcome.stores_written)
-                _mem0_empty_result = mem0_outcome.empty_result_error
-                if self._write_journal and intent_id:
-                    if _mem0_empty_result:
-                        await self._write_journal.resolve_mem0_intent(
-                            intent_id, Mem0IntentStatus.FAILED, reason=_mem0_empty_result
-                        )
-                    else:
-                        await self._write_journal.resolve_mem0_intent(
-                            intent_id, Mem0IntentStatus.COMPLETED
-                        )
-                if _mem0_empty_result:
-                    # mem0.add() did not raise but returned no results — a silent
-                    # dedup/infer no-op drop (task 1974). Under the pinned
-                    # infer=False, a successful write always returns exactly one
-                    # result with an id, so this is always anomalous.
-                    logger.warning(
-                        'MemoryService.add_memory: mem0 add returned zero memory_ids '
-                        '(silent empty-result drop; possible dedup/infer no-op)',
-                        extra={
-                            'project_id': project_id,
-                            'category': resolved_category.value,
-                            'causation_id': causation_id,
-                            'kind': meta.get('kind'),
-                        },
-                    )
-            except Exception as e:
-                _mem0_pending = (
-                    await self._defer_mem0_write_for_retry(
-                        e, intent_id=intent_id, write_op_id=write_op_id
-                    )
-                    if defer_transient_mem0_failure
-                    else None
-                )
-                if _mem0_pending is not None:
-                    stores_pending_retry.append(SourceStore.mem0)
-                else:
-                    logger.error(f'Mem0 write failed: {e}')
-                    _mem0_error = str(e)
-                    # add() provably raised → mem0 did NOT persist. Stamp the
-                    # intent 'failed' (the reconciler treats a failed-only
-                    # backend_op as safe to re-issue).
-                    if self._write_journal and intent_id:
-                        await self._write_journal.resolve_mem0_intent(
-                            intent_id, Mem0IntentStatus.FAILED, reason=str(e)
-                        )
 
         # Layer 1 journal entry
         if self._write_journal:
@@ -6884,6 +6835,84 @@ class MemoryService:
             ),
             classification_fallback=classification_fallback,
         )
+
+    async def _write_mem0_leg(
+        self,
+        write_method: Mem0WriteMethod,
+        *,
+        content: str,
+        project_id: str,
+        agent_id: str | None,
+        session_id: str | None,
+        category: str,
+        metadata: dict,
+        write_op_id: str,
+        causation_id: str | None,
+        defer_transient: bool,
+    ) -> Mem0LegResult:
+        """Write one Mem0 leg behind a write-ahead intent; defer a transient failure when asked.
+
+        The intent (task 2710) is committed BEFORE the await, so a crash
+        mid-write leaves a ``pending`` row that ``recover_mem0_intents``
+        reconciles against the mem0 backend_op journaled under the same
+        ``write_op_id``. It journals the caller's raw ``project_id``.
+        """
+        scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
+        intent_id: str | None = None
+        if self._write_journal:
+            intent_id = str(uuid_mod.uuid4())
+            await self._write_journal.log_mem0_intent(
+                intent_id=intent_id,
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                category=category,
+                content=content,
+                metadata=metadata,
+                payload_digest=self._mem0_payload_digest(
+                    content, project_id, agent_id, session_id, category, metadata
+                ),
+                write_method=write_method,
+            )
+        try:
+            outcome = await self._call_mem0_write(
+                write_method,
+                content=content,
+                scope=scope,
+                metadata=metadata,
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+            )
+        except Exception as e:
+            reason = (
+                await self._defer_mem0_write_for_retry(
+                    e, intent_id=intent_id, write_op_id=write_op_id
+                )
+                if defer_transient
+                else None
+            )
+            if reason is not None:
+                return Mem0LegResult(RAISED_MEM0_ADD, pending_retry_reason=reason)
+            # The add provably raised, so mem0 did NOT persist: the reconciler
+            # treats a failed intent with a failed-only backend_op as safe to
+            # re-issue.
+            if self._write_journal and intent_id:
+                await self._write_journal.resolve_mem0_intent(
+                    intent_id, Mem0IntentStatus.FAILED, reason=str(e)
+                )
+            return Mem0LegResult(RAISED_MEM0_ADD, error=str(e))
+        if self._write_journal and intent_id:
+            if outcome.empty_result_error:
+                await self._write_journal.resolve_mem0_intent(
+                    intent_id, Mem0IntentStatus.FAILED, reason=outcome.empty_result_error
+                )
+            else:
+                await self._write_journal.resolve_mem0_intent(
+                    intent_id, Mem0IntentStatus.COMPLETED
+                )
+        return Mem0LegResult(outcome)
 
     async def _defer_mem0_write_for_retry(
         self, error: Exception, *, intent_id: str | None, write_op_id: str
@@ -7174,8 +7203,10 @@ class MemoryService:
         category is stamped into the metadata as a tag only, not used for
         store routing. Models the Mem0 branch of :meth:`add_memory` minus
         the Graphiti half and minus the general-add dedup-dependent path.
+        It writes ahead a mem0 intent naming ``add_system_record``, so a
+        transient provider failure is acked ``stores_pending_retry`` and
+        re-issued through the same dedup-exempt method.
         """
-        scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         write_op_id = str(uuid_mod.uuid4())
 
         # Stage-1 flag-record write contract: flag_record_contract.py.
@@ -7208,8 +7239,8 @@ class MemoryService:
         # PRD D8/§2 name add_system_record as the second unguarded write path
         # that a tools-layer validator would leak past, so it shares the very
         # same helper rather than getting a parallel implementation that could
-        # drift. Placed after the tagging helpers and before the
-        # _journaled_backend_call below, for the reasons spelled out at
+        # drift. Placed after the tagging helpers and before the write-ahead
+        # intent and backend call below, for the reasons spelled out at
         # add_memory's call site.
         #
         # `reaches_mem0=True` unconditionally (task 3508): this path never
@@ -7232,26 +7263,23 @@ class MemoryService:
             find_canonical=self.get_memories_by_metadata,
         )
 
-        mem0_outcome = RAISED_MEM0_ADD
-        _mem0_error: str | None = None
-        try:
-            mem0_outcome = await self._call_mem0_write(
-                Mem0WriteMethod.ADD_SYSTEM_RECORD,
-                content=content,
-                scope=scope,
-                metadata=meta,
-                write_op_id=write_op_id,
-                causation_id=causation_id,
-            )
-        except Exception as e:
-            # Mirrors add_memory's try/except around its Mem0 branch (task
-            # 2222 amendment): without this, a raised exception would skip
-            # BOTH the Layer-1 write-journal entry and the memory_added
-            # event below, and propagate a bare error to the tool boundary
-            # with no audit trail — exactly what this guaranteed-persistence
-            # system-write path exists to rule out.
-            logger.error(f'Mem0 system-record write failed: {e}')
-            _mem0_error = str(e)
+        leg = await self._write_mem0_leg(
+            Mem0WriteMethod.ADD_SYSTEM_RECORD,
+            content=content,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            category=resolved_category.value,
+            metadata=meta,
+            write_op_id=write_op_id,
+            causation_id=causation_id,
+            defer_transient=True,
+        )
+        mem0_outcome = leg.outcome
+        if leg.error is not None:
+            # Without this the raise would leave no audit trail on the
+            # guaranteed-persistence system-write path (task 2222 amendment).
+            logger.error(f'Mem0 system-record write failed: {leg.error}')
 
         # Mem0Backend.add_system_record pins infer=False LOCALLY and
         # unconditionally (never inherited from the general add() pin — see
@@ -7263,6 +7291,7 @@ class MemoryService:
         # must not be journaled as an unconditional success.
         mem0_ids = list(mem0_outcome.memory_ids)
         stores_written = mem0_outcome.stores_written
+        stores_pending_retry = [SourceStore.mem0] if leg.pending_retry else []
         if mem0_outcome.empty_result_error:
             logger.warning(
                 'MemoryService.add_system_record: mem0 add_system_record '
@@ -7289,25 +7318,28 @@ class MemoryService:
                 result_summary={
                     'memory_ids': mem0_ids,
                     'stores': [s.value for s in stores_written],
+                    'stores_pending': [s.value for s in stores_pending_retry],
                 },
-                success=mem0_outcome.landed,
-                error=_mem0_error or mem0_outcome.empty_result_error,
+                # A write durably queued for retry was accepted, as on add_memory.
+                success=mem0_outcome.landed or leg.pending_retry,
+                error=leg.error or mem0_outcome.empty_result_error,
             )
 
-        # An empty result (whether from a caught exception above or a
-        # silent zero-id return) is tagged directly on the event payload —
-        # not just the Layer-1 journal — so a reconciliation consumer
-        # keying off memory_added alone can still distinguish a real write
-        # from a drop (task 2222 amendment).
+        # A write that did not land is tagged on the event payload itself, not
+        # just the Layer-1 journal, so a reconciliation consumer keying off
+        # memory_added alone can tell a real write from a drop (task 2222
+        # amendment) and from one queued for retry.
         _event_payload = {
             'memory_ids': mem0_ids,
             'category': resolved_category.value,
             'content_preview': content[:200],
         }
-        if not mem0_outcome.landed:
+        if leg.pending_retry:
+            _event_payload['pending_retry'] = True
+        elif not mem0_outcome.landed:
             _event_payload['empty_result'] = True
-            if _mem0_error:
-                _event_payload['error'] = _mem0_error
+            if leg.error:
+                _event_payload['error'] = leg.error
 
         await self._emit_event(ReconciliationEvent(
             id=str(uuid_mod.uuid4()),
@@ -7322,11 +7354,14 @@ class MemoryService:
         return AddMemoryResponse(
             memory_ids=mem0_ids,
             stores_written=stores_written,
+            stores_pending_retry=stores_pending_retry,
             category=resolved_category,
             message=render_add_memory_message(
                 stores_written=stores_written,
-                mem0_error=_mem0_error,
+                stores_pending_retry=stores_pending_retry,
+                mem0_error=leg.error,
                 mem0_empty_result=mem0_outcome.empty_result_error,
+                mem0_pending_retry=leg.pending_retry_reason,
             ),
         )
 

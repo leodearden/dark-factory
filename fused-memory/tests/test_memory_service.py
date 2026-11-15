@@ -158,7 +158,7 @@ def _mocked_service(config) -> MemoryService:
 
 
 def _mem0_add_journal() -> MagicMock:
-    """A write-journal double covering every call add_memory's Mem0 leg makes."""
+    """A write-journal double covering every call a Mem0 write leg makes."""
     journal = MagicMock()
     journal.log_write_op = AsyncMock()
     journal.log_backend_op = AsyncMock()
@@ -838,10 +838,8 @@ class TestAddSystemRecord:
         both logged as a WARNING and journaled as success=False — never a silent,
         unconditional success on the guaranteed-persistence system-write path."""
         service.mem0.add_system_record = AsyncMock(return_value={'results': []})
-        mock_journal = MagicMock()
-        mock_journal.log_write_op = AsyncMock()
-        mock_journal.log_backend_op = AsyncMock()
-        service._write_journal = mock_journal
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             result = await service.add_system_record(
@@ -875,10 +873,8 @@ class TestAddSystemRecord:
     async def test_nonempty_result_journals_success_no_warning(self, service, caplog):
         """The happy path (non-empty mem0 result) must journal success=True with no warning."""
         service.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
-        mock_journal = MagicMock()
-        mock_journal.log_write_op = AsyncMock()
-        mock_journal.log_backend_op = AsyncMock()
-        service._write_journal = mock_journal
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
             await service.add_system_record(
@@ -936,10 +932,8 @@ class TestAddSystemRecord:
         actually returned an id, and every failure is named in the message
         itself (task 4045)."""
         service.mem0.add_system_record = AsyncMock(**backend_mock_kwargs)
-        mock_journal = MagicMock()
-        mock_journal.log_write_op = AsyncMock()
-        mock_journal.log_backend_op = AsyncMock()
-        service._write_journal = mock_journal
+        mock_journal = _mem0_add_journal()
+        service.set_write_journal(mock_journal)
 
         result = await service.add_system_record(
             content='cycle summary',
@@ -12691,9 +12685,9 @@ class TestMemoryMetadataValidationAtSeam:
         rejection raised after the intent was journalled would convert a
         clean structured rejection into permanent store-reconciliation debt.
 
-        add_memory only: ``add_system_record`` has no write-ahead intent — it
-        goes straight to ``_journaled_backend_call`` — so its equivalent
-        "no persistence side effect" observable is asserted separately below.
+        add_memory here; ``add_system_record``'s write-ahead intent (task
+        7401), together with its other "no persistence side effect"
+        observables, is asserted separately below.
         """
         from fused_memory.memory_metadata import MemoryMetadataValidationError
 
