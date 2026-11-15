@@ -25,6 +25,7 @@ import yaml
 from setup_host_sections import checker_repo, run_section, slice_section, usage_error_checker
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shell_sections import stub_bin_dir, write_stub
+from systemd_unit_parity import parse_unit_directives
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -33,6 +34,7 @@ COMPOSE_PATH = REPO_ROOT / "fused-memory" / "docker" / "docker-compose.yml"
 SCHEMA_PATH = REPO_ROOT / "fused-memory" / "src" / "fused_memory" / "config" / "schema.py"
 FM_CONFIG_PATH = REPO_ROOT / "fused-memory" / "config" / "config.yaml"
 SCRIPT_PATH = REPO_ROOT / "scripts" / "check_network_exposure.py"
+FM_SERVICE_TEMPLATE_PATH = REPO_ROOT / "scripts" / "fused-memory.service.template"
 REPORT_TAG = "[network_exposure]"
 
 # ---------------------------------------------------------------------------
@@ -250,6 +252,28 @@ def test_static_ports_owns_one_port_per_table_entry():
 def test_optional_compose_services_are_published_compose_services():
     assert exposure.OPTIONAL_COMPOSE_SERVICES
     assert exposure.OPTIONAL_COMPOSE_SERVICES.issubset(exposure.COMPOSE_PUBLISHED_PORTS.values())
+
+
+def _compose_up_services(argv: list[str]) -> set[str]:
+    """The services a `docker compose ... up ...` argv names; empty for any other command."""
+    if "compose" not in argv or "up" not in argv[argv.index("compose") :]:
+        return set()
+    after_up = argv[argv.index("up", argv.index("compose")) + 1 :]
+    return {token for token in after_up if not token.startswith("-")}
+
+
+def test_optional_compose_services_are_the_compose_ups_fused_memory_may_fail():
+    unit = parse_unit_directives(FM_SERVICE_TEMPLATE_PATH.read_text(encoding="utf-8"))
+    may_fail: set[str] = set()
+    for command in unit["Service"]["ExecStartPre"]:
+        if command.startswith("-"):
+            may_fail |= _compose_up_services(shlex.split(command.removeprefix("-")))
+    assert may_fail == exposure.OPTIONAL_COMPOSE_SERVICES
+
+
+def test_an_optional_service_must_be_the_owner_it_excuses():
+    with pytest.raises(ValueError, match="'embedder'"):
+        exposure.OwnedPort(8420, exposure.compose_owner("falkordb"), optional_service="embedder")
 
 
 def test_static_ports_mark_exactly_the_optional_services():
@@ -620,6 +644,7 @@ def test_run_fails_an_exposed_port_of_a_never_created_optional_service(fake_host
 
     assert verdict == exposure.ExposureExit.FINDING
     _line_index(lines, "[exposed]", f"port {port}", "127.0.0.2", "compose service embedder")
+    assert not fake_host.ran("docker")
 
 
 def test_run_excuses_only_a_loopback_refusal(fake_host: FakeHost, held):
@@ -631,6 +656,7 @@ def test_run_excuses_only_a_loopback_refusal(fake_host: FakeHost, held):
     _line_index(lines, "[timed-out]", f"port {port}", "127.0.0.2")
     _line_index(lines, "[not-listening]", f"port {port}", "127.0.0.1", "timed out")
     assert _no_container_lines(lines) == []
+    assert not fake_host.ran("docker")
 
 
 def test_run_still_fails_an_unverified_address_beside_a_noted_port(fake_host: FakeHost, held):

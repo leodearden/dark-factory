@@ -47,11 +47,19 @@ class SourceUnreadable(Exception):
         self.reason = reason
 
 
+def compose_owner(service: str) -> str:
+    return f"compose service {service}"
+
+
 @dataclasses.dataclass(frozen=True)
 class OwnedPort:
     port: int
     owner: str
     optional_service: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.optional_service is not None and self.owner != compose_owner(self.optional_service):
+            raise ValueError(f"owner {self.owner!r} is not optional service {self.optional_service!r}")
 
 
 Sockaddr: TypeAlias = tuple[str, int] | tuple[str, int, int, int]
@@ -85,8 +93,9 @@ LOOPBACK: Final = HostAddress(ip="127.0.0.1", family=socket.AF_INET, scope_id=0,
 COMPOSE_PUBLISHED_PORTS: Final[Mapping[int, str]] = types.MappingProxyType(
     {6379: "falkordb", 6380: "falkordb-scratch", 6333: "qdrant", 6334: "qdrant", 8002: "fused-mcp", 8420: "embedder"}
 )
-# Services fused-memory starts without (`-` ExecStartPre in scripts/fused-memory.service.template); while one has
-# no container its loopback refusal is noted, not failed. Why: OPERATIONS.md §8 "Network exposure check".
+# Services fused-memory starts without (a `-` ExecStartPre `docker compose up` in
+# scripts/fused-memory.service.template, pinned there by the tests); while one has no container its
+# loopback refusal is noted, not failed. Why: OPERATIONS.md §8 "Network exposure check".
 OPTIONAL_COMPOSE_SERVICES: Final[frozenset[str]] = frozenset({"embedder"})
 # Compose's default project name, the compose file's directory; pinned by the tests.
 COMPOSE_PROJECT: Final = "docker"
@@ -96,7 +105,7 @@ STATIC_PORTS: Final[tuple[OwnedPort, ...]] = (
     *(
         OwnedPort(
             port=port,
-            owner=f"compose service {service}",
+            owner=compose_owner(service),
             optional_service=service if service in OPTIONAL_COMPOSE_SERVICES else None,
         )
         for port, service in COMPOSE_PUBLISHED_PORTS.items()
