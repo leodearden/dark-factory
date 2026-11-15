@@ -73,6 +73,7 @@ from escalation.models import Escalation
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import (
+    MARKUP_BOUNDARY_STORM_CATEGORY,
     MARKUP_RECURRENCE_ROUTING,
     MarkupGuardMiddleware,
     RepairPolicy,
@@ -1466,7 +1467,7 @@ class TestTheStormEscape:
 
         assert len(rig.queue.submitted) == 1
         filed = rig.queue.submitted[0]
-        assert filed.category == plan_tools._MARKUP_STORM_CATEGORY
+        assert filed.category == MARKUP_BOUNDARY_STORM_CATEGORY
         assert filed.task_id == plan_tools._MARKUP_STORM_ANCHOR_TASK_ID, (
             'the burst is a property of the SERVER window, not of one task '
             "payload — pinning the anchor is what makes the dedup lookup stable"
@@ -1547,7 +1548,7 @@ class TestTheStormEscape:
         assert markup_sink._recorded_subject(
             Escalation(
                 id='esc-x', task_id='t', agent_role='r', severity='blocking',
-                category=markup_sink.MARKUP_STORM_CATEGORY,
+                category=MARKUP_BOUNDARY_STORM_CATEGORY,
                 summary='s', detail='some other producer squatted the anchor',
                 worktree='/tmp/wt', level=1,
             )
@@ -1642,7 +1643,7 @@ class TestTheStormEscape:
             await rig.refuse('add_design_decision', {'decision': ABSORBED_RATIONALE})
 
         assert len(rig.queue.submitted) == 1
-        assert rig.queue.submitted[0].category == plan_tools._MARKUP_STORM_CATEGORY
+        assert rig.queue.submitted[0].category == MARKUP_BOUNDARY_STORM_CATEGORY
 
     @pytest.mark.asyncio
     async def test_a_storm_filing_failure_never_changes_the_refusal(
@@ -1875,7 +1876,7 @@ class TestTheStormEscape:
 
         assert len(rig.queue.submitted) == 1
         filed = rig.queue.submitted[0]
-        assert filed.category == plan_tools._MARKUP_STORM_CATEGORY
+        assert filed.category == MARKUP_BOUNDARY_STORM_CATEGORY
         assert filed.summary.startswith(f'[{artifacts.worktree.name}] ')
 
 
