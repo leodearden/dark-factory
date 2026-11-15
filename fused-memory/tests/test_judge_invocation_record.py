@@ -125,11 +125,18 @@ def _recorded(journal) -> JudgeInvocation:
     return invocation
 
 
-def _logged(caplog, message: str) -> list[logging.LogRecord]:
+def _logged(caplog, event: str) -> list[logging.LogRecord]:
     return [
         r for r in caplog.records
-        if r.name == _JUDGE_LOGGER and r.levelno == logging.WARNING and r.getMessage() == message
+        if r.name == _JUDGE_LOGGER
+        and r.levelno == logging.WARNING
+        and r.getMessage().split(' ', 1)[0] == event
     ]
+
+
+def _fields(record: logging.LogRecord) -> dict[str, str]:
+    """The ``key=value`` tokens after the event name, as the service's LOG_FORMAT renders them."""
+    return dict(token.split('=', 1) for token in record.getMessage().split(' ')[1:])
 
 
 class TestRecordedOutcome:
@@ -194,7 +201,8 @@ class TestRecordedOutcome:
             await _call(_judge(journal), _success())
 
         assert _recorded(journal).rejected_tool_calls is None
-        assert _logged(caplog, 'reconciliation.judge_rejected_tool_count_failed')
+        (failed,) = _logged(caplog, 'reconciliation.judge_rejected_tool_count_failed')
+        assert _fields(failed)['session_id'] == 's1'
 
 
 class TestTelemetryNeverChangesTheOutcome:
@@ -207,7 +215,7 @@ class TestTelemetryNeverChangesTheOutcome:
 
         assert verdict == _OK_PAYLOAD
         (failed,) = _logged(caplog, _RECORD_FAILED)
-        assert getattr(failed, 'ended_error_max_turns', None) is False
+        assert _fields(failed) == {'run_id': 'run-1', 'ended_error_max_turns': 'False'}
 
     @pytest.mark.asyncio
     async def test_write_failure_keeps_the_infra_error_and_the_hit_line(self, journal, caplog):
@@ -220,7 +228,7 @@ class TestTelemetryNeverChangesTheOutcome:
             await _call(_judge(journal), _turn_cap())
 
         (failed,) = _logged(caplog, _RECORD_FAILED)
-        assert getattr(failed, 'ended_error_max_turns', None) is True
+        assert _fields(failed) == {'run_id': 'run-1', 'ended_error_max_turns': 'True'}
         assert len(_logged(caplog, _TURN_CAP_HIT)) == 1
 
 
@@ -236,11 +244,26 @@ class TestTurnCapHitLog:
             await _call(_judge(journal), _turn_cap(), run_id='run-cap')
 
         (hit,) = _logged(caplog, _TURN_CAP_HIT)
-        assert getattr(hit, 'run_id', None) == 'run-cap'
-        assert getattr(hit, 'num_turns', None) == 4
-        assert getattr(hit, 'max_turns', None) == 3
-        assert getattr(hit, 'rejected_tool_calls', None) == 2
-        assert getattr(hit, 'schema_salvaged', None) is False
+        assert _fields(hit) == {
+            'run_id': 'run-cap',
+            'num_turns': '4',
+            'max_turns': '3',
+            'rejected_tool_calls': '2',
+            'schema_salvaged': 'False',
+        }
+
+    @pytest.mark.asyncio
+    async def test_turn_cap_without_a_transcript_logs_rejected_calls_unknown(
+        self, journal, caplog,
+    ):
+        with (
+            caplog.at_level(logging.WARNING, logger=_JUDGE_LOGGER),
+            pytest.raises(JudgeInfraError),
+        ):
+            await _call(_judge(journal), _turn_cap(session_id='no-such-session'))
+
+        (hit,) = _logged(caplog, _TURN_CAP_HIT)
+        assert _fields(hit)['rejected_tool_calls'] == 'None'
 
     @pytest.mark.asyncio
     async def test_salvaged_turn_cap_hit_says_it_was_salvaged(self, journal, caplog):
@@ -248,7 +271,7 @@ class TestTurnCapHitLog:
             await _call(_judge(journal), _salvaged_turn_cap())
 
         (hit,) = _logged(caplog, _TURN_CAP_HIT)
-        assert getattr(hit, 'schema_salvaged', None) is True
+        assert _fields(hit)['schema_salvaged'] == 'True'
 
     @pytest.mark.asyncio
     async def test_ordinary_success_logs_no_hit(self, journal, caplog):
