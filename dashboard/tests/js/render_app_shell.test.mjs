@@ -258,7 +258,7 @@ function measureEveryTab() {
       root = harness.mountPage();
     });
     const [overviewButton, ...otherButtons] = root.querySelectorAll('.rail-nav button');
-    assert.equal(overviewButton, railButton(root, 'Overview'), "the rail's first button must be the page's first tab");
+    assert.ok(overviewButton === railButton(root, 'Overview'), "the rail's first button must be the page's first tab");
     for (const button of otherButtons) measure(() => click(window, button));
     return { harness, loader: window.DF_DATA_LOADER, pollScope: window.DF_POLL_SCOPE, tabs };
   } catch (err) {
@@ -451,9 +451,8 @@ for (const { arm, datum } of DRAWN_DATUMS) {
     assert.ok(val.textContent.startsWith(view.text), `"${val.textContent}" does not start with datumView's ${view.text}`);
     if (view.title === null) assert.equal(val.hasAttribute('title'), false);
     else assert.equal(val.title, view.title);
-    const age = [...container.querySelectorAll('.kpi span')].find(span => span.textContent === view.age);
-    if (view.age) assert.ok(age, `the tile shows no age ${view.age}`);
-    else assert.equal(age, undefined);
+    const showsAge = [...container.querySelectorAll('.kpi span')].some(span => span.textContent === view.age);
+    assert.equal(showsAge, !!view.age, view.age ? `the tile shows no age ${view.age}` : 'the tile shows an age datumView gives none');
   });
 }
 
@@ -565,27 +564,36 @@ test("tabs.jsx::OrchTab draws one project's offline Locks em-dash without blanki
 
   assert.equal(expectedFor(measuredTask).placeholder, null, 'locksCellState reads the measured project as unknown');
   const measuredCell = locksCell(window, container, measuredTask);
-  assert.equal(measuredCell.querySelector('.chip-empty'), null, "the offline project blanked the measured project's locks");
-  assert.deepEqual([...measuredCell.querySelectorAll('.chip[title]')].map(chip => chip.title).sort(), [...lockSet].sort());
+  assert.ok(!measuredCell.querySelector('.chip-empty'), "the offline project blanked the measured project's locks");
+  const lockInfo = window.DF_SCHED_UTILS.buildSchedLockInfo(measuredTask, D.SCHEDULER);
+  const classes = lockSet.map(path => window.DF_SCHED_UTILS.lockChipStateFor(lockInfo.moduleByPath.get(path), measuredTask.id, MEASURED_PROJECT).cls);
+  assert.equal(new Set(classes).size, lockSet.length, 'each lock must take its own class, or the check below cannot tell the chips apart');
+  const chips = [...measuredCell.querySelectorAll('.chip')];
+  assert.equal(chips.length, lockSet.length, `the measured project draws ${chips.length} lock chips for ${lockSet.length} locks`);
+  for (const cls of classes) assert.ok(chips.some(chip => chip.classList.contains(cls)), `no lock chip is ${cls}`);
 });
 
 // ── Every tab renders its Datum sites from Datums, and keys them off real receipts ──
 
+// What each rail tab shows while it is open: its render-failure banners and
+// its not-yet-fetched readings.
 function openEveryRailTab(page) {
-  const opened = [];
-  for (const button of page.root.querySelectorAll('.rail-nav button')) {
+  return [...page.root.querySelectorAll('.rail-nav button')].map(button => {
     click(page.window, button);
-    opened.push({ tab: page.root.querySelector('.crumbs .here')?.textContent, root: page.root });
-    // Each tab's readings, captured while it is open.
-    opened[opened.length - 1].notYetFetched = notYetFetchedReadings(page);
-    opened[opened.length - 1].failures = failureNotices(page.root).map(notice => notice.dataset.testid);
-  }
-  return opened;
+    return {
+      tab: page.root.querySelector('.crumbs .here')?.textContent,
+      failures: failureNotices(page.root).map(notice => notice.dataset.testid),
+      notYetFetched: notYetFetchedReadings(page),
+    };
+  });
 }
 
+// The reason every reader gives a reading whose endpoint has no receipt yet
+// (datum.js, task_snapshot.js, merge_queue.js, escalation_views.js).
+const NOT_YET_FETCHED = 'not yet fetched';
+
 function notYetFetchedReadings(page) {
-  const { DATUM_NOT_YET_FETCHED } = page.window.DF_DATUM;
-  return [...page.root.querySelectorAll('[title]')].filter(element => element.title === DATUM_NOT_YET_FETCHED);
+  return [...page.root.querySelectorAll('[title]')].filter(element => element.title === NOT_YET_FETCHED);
 }
 
 test('on the pre-fetch page no tab renders a render-failure banner, and its readings say not yet fetched', t => {

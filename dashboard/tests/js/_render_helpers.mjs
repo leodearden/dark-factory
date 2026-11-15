@@ -12,8 +12,8 @@ import { buildDashboardWindow } from './dom_harness.mjs';
 // React reports a broken render (a missing key, an update outside act(), a bad
 // prop) on console.error and renders on, so every test also asserts that
 // nothing reached it, through the unmount.
-export function openWindow(t) {
-  const harness = buildDashboardWindow();
+export function openWindow(t, options) {
+  const harness = buildDashboardWindow(options);
   t.after(() => {
     harness.close();
     assert.deepEqual(harness.consoleErrors, [], 'the window wrote to console.error');
