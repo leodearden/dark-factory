@@ -15,9 +15,19 @@ unit or before_done predicate wired to it today (the watch gate is retired,
 task 3923), so the defect was LATENT rather than observed here directly --
 these tests pin the same absolute-uv-resolution fix so a future re-wiring
 doesn't reinherit it.
+
+Task 3498 ratified this wrapper's surviving role (an ad-hoc census
+instrument) and made its read-only claim a property rather than prose: the
+exec line passes caller args straight through and the sweep accepts
+``--check --apply`` together, so the wrapper now refuses every spelling the
+sweep's own parser reads as ``apply=True``. The refusal tests at the end pin
+that, with the refusal set derived from the sweep's parser rather than
+restated. Task 3498 also pins argument ORDER and verbatim exit-code relay,
+which the baseline tests above check only loosely.
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shutil
@@ -558,3 +568,295 @@ def test_wrapper_resolves_uv_after_sourcing_dotenv_so_env_can_supply_uv_bin(tmp_
         f"Expected the uv named by .env to actually be invoked; "
         f"stderr={result.stderr!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 3498: strict argument order and verbatim exit-code relay
+# ---------------------------------------------------------------------------
+
+def test_check_wrapper_injects_check_before_caller_args(tmp_path):
+    """--check is injected by the wrapper itself and must PRECEDE the
+    caller's pass-through args, whose relative order must be preserved."""
+    result, state_path = _run_wrapper(
+        tmp_path, args=["--project-id", "reify", "--max-backlog", "0"],
+    )
+
+    assert result.returncode == 0, (
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    calls = _recorded_calls(state_path)
+    assert len(calls) == 1, f"calls={calls!r}"
+    argv = calls[0]
+    assert argv[0].endswith(
+        "fused-memory/scripts/sweep_orphan_flag_markers.py"
+    ), f"Expected the sweep script path first in argv={argv!r}"
+    assert argv[1:] == [
+        "--check", "--project-id", "reify", "--max-backlog", "0",
+    ], (
+        f"Expected --check injected ahead of the caller's args, with their "
+        f"relative order preserved; argv={argv!r}"
+    )
+
+
+def test_check_wrapper_propagates_verdict_exit_code(tmp_path):
+    """The wrapper must relay the sweep's OWN exit code verbatim, not merely
+    some non-zero code. Since task 3923 armed the blind-spot veto, rc=1
+    carries two distinct causes (backlog over the ceiling, or an OBSERVED
+    enumeration blind spot); a wrapper that normalised the code would
+    destroy the consumer's ability to distinguish a verdict from a crash."""
+    result, state_path = _run_wrapper(tmp_path, exit_code=1)
+
+    assert result.returncode == 1, (
+        f"Expected the sweep's own rc=1 verdict relayed verbatim, got "
+        f"{result.returncode}; stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    assert len(_recorded_calls(state_path)) == 1, (
+        f"calls={_recorded_calls(state_path)!r}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Task 3498: the advertised read-only contract, enforced.
+# --------------------------------------------------------------------------
+
+def test_check_wrapper_refuses_apply(tmp_path):
+    """The header promises this wrapper 'performs NO deletions ... so
+    resolve/resume re-runs are harmless'. That was prose, not a property:
+    the exec line is `... --check "$@"` and _parse_args(['--check','--apply'])
+    is ACCEPTED (apply=True check=True), so `--apply --terminal-drain`
+    through this "read-only" wrapper ran a destructive drain. The refusal
+    must happen BEFORE the sweep is invoked at all."""
+    result, state_path = _run_wrapper(tmp_path, args=["--apply", "--terminal-drain"])
+
+    assert result.returncode != 0, (
+        f"Expected a non-zero refusal for --apply through the read-only "
+        f"check wrapper; stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert _recorded_calls(state_path) == [], (
+        f"Expected the sweep to NOT be invoked at all when --apply is "
+        f"refused; calls={_recorded_calls(state_path)!r}"
+    )
+    assert "--apply" in result.stderr, (
+        f"Expected a stderr diagnostic naming the offending --apply "
+        f"argument; stderr={result.stderr!r}"
+    )
+    assert "fused-memory-flag-marker-sweep.sh" in result.stderr, (
+        f"Expected the stderr diagnostic to point the operator at the "
+        f"destructive counterpart wrapper; stderr={result.stderr!r}"
+    )
+
+
+@pytest.mark.parametrize("abbrev", ["--a", "--ap", "--app", "--appl"])
+def test_check_wrapper_refuses_abbreviated_apply(tmp_path, abbrev):
+    """argparse `allow_abbrev` defaults True, and all four of --a/--ap/--app/
+    --appl were verified during task 3498's planning to reach apply=True on
+    sweep_orphan_flag_markers.py. A guard matching only the literal --apply
+    would therefore be bypassed by a single dropped character. This is what
+    forces the guard to reject every PREFIX of --apply."""
+    result, state_path = _run_wrapper(tmp_path, args=[abbrev])
+
+    assert result.returncode != 0, (
+        f"Expected {abbrev!r} (an argparse abbreviation of --apply that "
+        f"reaches apply=True) to be refused; stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
+    assert _recorded_calls(state_path) == [], (
+        f"Expected the sweep to NOT be invoked at all when {abbrev!r} is "
+        f"refused; calls={_recorded_calls(state_path)!r}"
+    )
+    assert abbrev in result.stderr, (
+        f"Expected a stderr diagnostic naming the offending {abbrev!r} "
+        f"argument; stderr={result.stderr!r}"
+    )
+
+
+def test_check_wrapper_allows_non_apply_args(tmp_path):
+    """Regression guard in the opposite direction: the refusal must match
+    WHOLE arguments, never a substring. --no-fail-on-blind-spot (census-only
+    relaxation of task 3923's veto) and a value that merely contains the
+    text 'apply' must both pass through untouched."""
+    result, state_path = _run_wrapper(
+        tmp_path,
+        args=[
+            "--project-id", "apply-test",
+            "--max-backlog", "0",
+            "--no-fail-on-blind-spot",
+            "--limit", "5000",
+        ],
+    )
+
+    assert result.returncode == 0, (
+        f"Expected non---apply arguments to pass through untouched; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+    calls = _recorded_calls(state_path)
+    assert len(calls) == 1, f"calls={calls!r}"
+    assert calls[0][1:] == [
+        "--check",
+        "--project-id", "apply-test",
+        "--max-backlog", "0",
+        "--no-fail-on-blind-spot",
+        "--limit", "5000",
+    ], (
+        f"Expected every non---apply argument forwarded verbatim after the "
+        f"injected --check; argv={calls[0]!r}"
+    )
+
+    # The converse of the parser-derived test's property, on the arguments actually
+    # forwarded: nothing the wrapper is willing to pass through may be a
+    # spelling the sweep's own parser reads as apply=True. (Derivation
+    # helper defined with that test, below.)
+    reaches_apply = set(calls[0][1:]) & _derived_apply_spellings()
+    assert not reaches_apply, (
+        f"The wrapper forwarded {sorted(reaches_apply)!r}, which "
+        f"sweep_orphan_flag_markers.py's own parser accepts as apply=True; "
+        f"argv={calls[0]!r}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Parser-derived completeness: the refusal set is CHECKED against the
+# sweep's own parser, not restated from it.
+# --------------------------------------------------------------------------
+
+SWEEP_SCRIPT = (
+    Path(__file__).parents[2]
+    / "fused-memory" / "scripts" / "sweep_orphan_flag_markers.py"
+)
+_PARSER_BUILDER = "_build_parser"
+
+# argparse actions that consume no value, so `--opt=VALUE` is rejected for
+# them. Anything outside this set takes a value, which makes `--opt=VALUE` a
+# further accepted spelling -- see _derived_apply_spellings.
+_ZERO_ARG_ACTIONS = frozenset({"store_true", "store_false", "store_const", "count"})
+
+
+def _sweep_parser_options():
+    """Extract ``(long_option_strings, apply_actions)`` from the sweep's own
+    argparse definition by AST-parsing sweep_orphan_flag_markers.py.
+
+    Read STATICALLY rather than imported. scripts/tests/ runs under
+    ``uv run --project shared`` (dark-factory-orchestrator.yaml's
+    test_command), where ``fused_memory`` -- which the sweep imports at
+    module scope -- is not installed; that config's own comment records
+    "scripts/tests/ imports no first-party package" as a property of the
+    lane. Shelling out to the real sweep instead would need the fused-memory
+    env AND would mean handing a destructive argv to a script pointed at
+    live stores. ``ast.parse`` reaches the same declaration with neither
+    cost, and the model it implements is validated against real argparse:
+    an exhaustive sweep of every prefix and ``=VALUE`` form of every long
+    option found nothing this derivation misses.
+    """
+    tree = ast.parse(SWEEP_SCRIPT.read_text(encoding="utf-8"))
+    builder = next(
+        (
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == _PARSER_BUILDER
+        ),
+        None,
+    )
+    assert builder is not None, (
+        f"Expected a {_PARSER_BUILDER}() function in {SWEEP_SCRIPT}; the sweep "
+        f"appears to have renamed or moved its parser builder, so this test "
+        f"can no longer derive the refusal set from it. Re-point "
+        f"_PARSER_BUILDER."
+    )
+
+    longs, apply_actions = [], []
+    for node in ast.walk(builder):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+        ):
+            continue
+        opts = [
+            a.value for a in node.args
+            if isinstance(a, ast.Constant) and isinstance(a.value, str)
+        ]
+        kwargs = {k.arg: k.value for k in node.keywords}
+        dest = kwargs.get("dest")
+        dest = dest.value if isinstance(dest, ast.Constant) else None
+        action = kwargs.get("action")
+        action = action.value if isinstance(action, ast.Constant) else None
+
+        longs.extend(o for o in opts if o.startswith("--"))
+        implied_dests = [
+            o.lstrip("-").replace("-", "_") for o in opts if o.startswith("--")
+        ]
+        if dest == "apply" or "apply" in implied_dests:
+            apply_actions.append((opts, action))
+
+    return longs, apply_actions
+
+
+def _derived_apply_spellings():
+    """Every argv spelling sweep_orphan_flag_markers.py's parser accepts as
+    ``apply=True``, derived from that parser rather than restated.
+
+    Models argparse's ``allow_abbrev`` (default True): a ``--`` prefix of at
+    least one character is accepted iff it is a prefix of exactly ONE long
+    option. Today that yields --a/--ap/--app/--appl/--apply -- the five the
+    wrapper's guard lists. If the sweep ever grew another ``--a...`` flag,
+    the shorter prefixes would become ambiguous and drop out of this set on
+    their own; if ``--apply`` were ever redefined to take a VALUE, the
+    ``--apply=1`` spellings it would then accept appear here and the
+    wrapper's whole-argument guard fails this test loudly instead of
+    silently regressing to the deletion vector task 3498 exists to close.
+    """
+    longs, apply_actions = _sweep_parser_options()
+    assert apply_actions, (
+        f"Derived NO apply-setting action from {SWEEP_SCRIPT}'s "
+        f"{_PARSER_BUILDER}(); either --apply was removed (in which case the "
+        f"wrapper's guard is dead code to delete) or this derivation no "
+        f"longer recognises it. Long options seen: {sorted(set(longs))!r}"
+    )
+
+    spellings = set()
+    for opts, action in apply_actions:
+        takes_value = action not in _ZERO_ARG_ACTIONS
+        for opt in opts:
+            if not opt.startswith("--"):
+                spellings.add(opt)  # a short alias is never abbreviated
+                continue
+            for length in range(3, len(opt) + 1):  # "--" + >=1 char
+                prefix = opt[:length]
+                if sum(1 for o in longs if o.startswith(prefix)) == 1:
+                    spellings.add(prefix)
+                    if takes_value:
+                        spellings.add(f"{prefix}=1")
+    return spellings
+
+
+def test_check_wrapper_refuses_every_apply_spelling_the_sweep_accepts(tmp_path):
+    """The guard is a hand-maintained list of five literals, but its
+    COMPLETENESS is a property of sweep_orphan_flag_markers.py's parser, not
+    of this wrapper -- and the two refusal tests above pin only the five spellings the guard
+    already names, so they can never catch drift in the thing that defines
+    the set. This test derives the refusal set FROM that parser and asserts
+    the wrapper refuses every member, so adding a destructive spelling to
+    the sweep fails here instead of silently reopening the deletion vector.
+    """
+    spellings = _derived_apply_spellings()
+    assert "--apply" in spellings, (
+        f"Sanity: expected the literal --apply among the derived spellings, "
+        f"got {sorted(spellings)!r}"
+    )
+
+    for spelling in sorted(spellings):
+        result, state_path = _run_wrapper(tmp_path, args=[spelling])
+
+        assert result.returncode != 0, (
+            f"{spelling!r} is accepted by the sweep's own parser as "
+            f"apply=True (derived from {_PARSER_BUILDER}() in "
+            f"{SWEEP_SCRIPT.name}), but the wrapper did not refuse it. "
+            f"Derived set: {sorted(spellings)!r}; stdout={result.stdout!r} "
+            f"stderr={result.stderr!r}"
+        )
+        assert _recorded_calls(state_path) == [], (
+            f"Expected the sweep NOT to be invoked for the apply-setting "
+            f"spelling {spelling!r}; calls={_recorded_calls(state_path)!r}"
+        )
