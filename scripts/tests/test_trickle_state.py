@@ -35,7 +35,7 @@ import pwd
 import shutil
 import subprocess
 import tempfile
-from collections.abc import MutableMapping
+from collections.abc import Callable, MutableMapping
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -1125,11 +1125,11 @@ class TestBarrenStreakDue:
         assert trickle_state.barren_streak_due(state, threshold) is due
 
 
-_NIGHT_KINDS: dict[str, dict[str, Any]] = {
-    'barren': dict(below_sampling_cut=3),
-    'failed': dict(exit_code=1),
-    'deferred': dict(capped=True, selected_count=1),
-    'productive': dict(selected_count=1),
+_NIGHT_KINDS: dict[str, Callable[[int], trickle_state.NightRun]] = {
+    'barren': lambda day: _night(day=day, below_sampling_cut=3),
+    'failed': lambda day: _night(day=day, exit_code=1),
+    'deferred': lambda day: _night(day=day, capped=True, selected_count=1),
+    'productive': lambda day: _night(day=day, selected_count=1),
 }
 
 
@@ -1139,9 +1139,7 @@ def _reached_on(kinds, max_runs) -> list[int]:
     prior = None
     reached = []
     for number, kind in enumerate(kinds, start=1):
-        night = trickle_state.fold_night(
-            prior, 'p', _night(day=number, **_NIGHT_KINDS[kind])
-        )
+        night = trickle_state.fold_night(prior, 'p', _NIGHT_KINDS[kind](number))
         if trickle_state.barren_streak_reached(night, max_runs):
             reached.append(number)
         prior = night.state
