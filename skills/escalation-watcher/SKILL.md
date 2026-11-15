@@ -445,7 +445,7 @@ Never process L0 or L1 from this skill, even if explicitly asked — doing so wo
 
 ```bash
 cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
-  --queue-dir <project_root>/data/escalations --level 2 --timeout 3600 [--baseline] 2>&1
+  --queue-dir <project_root>/data/escalations --level 2 --timeout 3600 [--baseline]
 ```
 
 Run as a **background task** (Bash with `run_in_background`). `scripts/watcher-rearm.sh` is the
