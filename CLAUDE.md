@@ -161,6 +161,33 @@ printing every copy. `Glob` passes `--no-ignore` and fails the same way;
 `git ls-files -- '*<name>'`, adding `--others --exclude-standard` for untracked
 files. Inside a task worktree both walks are fine.
 
+### Locating a session transcript
+
+A session id is enough to find its transcript, so **never `find /` for one**:
+two census-verifier sessions on 2026-08-16 scanned the whole filesystem for a
+session id and outran the Bash tool's 2-minute default `timeout`, though both
+transcripts were in the archive. Dispatched agents' sessions are archived at
+the MAIN checkout (`data/` is untracked, so no worktree has one) as
+`data/orchestrator/agent-transcripts/<task_id>/<encoded-cwd>/<session-id>.jsonl`,
+subagents under `<session-id>/subagents/`; the first component can be a run key
+such as `recon-<run_id>`. The files are plain `.jsonl` since task 3618, so the
+`.jsonl.gz` in `plans/agent-transcript-archival-prd.md` is historical. A
+session is archived when its invocation ends; until then it is in its
+worktree's `.task/claude-config-<task_id>/projects/`. Interactive sessions are
+never archived and stay at `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
+The layout's one home is `shared/src/shared/transcript_archive.py::durable_archive_path`.
+
+<!-- session-transcript-lookup:begin
+     EXECUTED by tests/scripts/test_session_transcript_lookup_convention.py from a
+     linked worktree, against an archive the real writer built. Turn it into a
+     hand-written glob or `find` and that guard goes red. -->
+- **Session transcript**: `python3 scripts/locate_session_transcript.py <session-id>`
+<!-- session-transcript-lookup:end -->
+
+It prints every match, one path per line; on a miss it exits 1, naming each
+root it searched. It takes full ids only. Another project's sessions are in
+that project's own archive (`--project-root <root>`).
+
 ### Anchoring ad-hoc paths
 
 In an interactive session the Bash working directory PERSISTS across calls, and
