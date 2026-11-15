@@ -1,4 +1,6 @@
-"""config_role is total over the orchestrator's dispatch identities.
+"""config_role is total over the orchestrator's registered role objects.
+
+Those are ROLES, TRIAGE and the reviewers build_reviewer_role makes.
 
 shared may not import orchestrator, so this invariant is checked here, against
 the live role objects rather than a hand-kept list of names.

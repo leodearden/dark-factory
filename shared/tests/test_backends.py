@@ -73,7 +73,7 @@ def test_unknown_backend_is_a_value_error() -> None:
         parse_backend('nope')
 
 
-def test_agent_cli_backends_are_the_six_dispatch_arms() -> None:
+def test_agent_cli_backends_are_the_six_cli_members() -> None:
     assert {b.value for b in AGENT_CLI_BACKENDS} == {
         'claude',
         'codex',
