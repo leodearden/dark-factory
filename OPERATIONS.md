@@ -5232,8 +5232,12 @@ PRD D11 accepts this. If the timer stops firing, only someone who runs
 
 ### What the sweep files
 
-Each finding has a key, and a run skips a finding whose key a live task or a
-pending escalation already carries.
+Each finding has a key. A run skips a finding whose key a live task or a
+pending escalation carries, or that a live task converted from one of the
+key's escalations answers. That is an exact `metadata.escalation_id` match
+against every escalation ever filed in the key's `task_id` slot, read
+archive-inclusive, so the info-L0 router dismissing a note no longer makes the
+next night file it again. The ladder is `scripts/exception_owner_sweep.py::decide`.
 
 - **Dead owner, inline scope:** a task carrying `x_inv12_finding`. Its remedy
   is `scripts/exception_owner_sweep.py::_DEAD_OWNER_REMEDY`: re-own each site
@@ -5245,18 +5249,28 @@ pending escalation already carries.
   baseline). It recurs by design.
 - **More than `scripts/exception_owner_sweep.py::MAX_OUTPUTS_PER_RUN` outputs
   in one run:** one roll-up escalation. The rest wait for the next run.
-- **A closed dead-owner task whose owner is still dead:** an escalation, never
-  a re-file.
+- **A dead-owner task no longer open (closed or deferred) whose owner is still
+  dead:** an escalation, never a re-file, whose summary names that task and its
+  status. A task converted from one of the finding's escalations counts the
+  same.
 - **A live cited owner:** an `x_inv12_owns` note merged into its metadata.
 
-**Known gap.** The sweep treats a named-list finding as already raised only
-while its escalation is pending (`scripts/exception_owner_sweep.py::decide`).
-The info-L0 router dismisses info notes within about ten minutes, so the same
-note is filed again every night until the entry is re-owned. The dead task-6201
-citation in `_WALL_CLOCK_DEADLINE_DEBT` has been escalated nightly since
-2026-10-29; task 7693 owns re-owning it. Separately, the finding bodies say to
-run `--report` to see the findings, but `--report` lists none: use `--dry-run`.
-Task 9468 owns both fixes, and updates this paragraph when either lands.
+The dead-owner and roll-up bodies name
+`uv run --project shared python scripts/exception_owner_sweep.py --dry-run`,
+which lists each cited owner's verdict and planned step now. `--report` lists
+no findings.
+
+**Residual.** A conversion the curator combined onto a task whose
+`metadata.escalation_id` names none of the key's escalations is invisible to
+the sweep. That finding is escalated again each night until a task carrying
+one of its escalation ids appears, or the entry is re-owned. A home task that
+closes or is deferred while the owner is still dead is escalated once per such
+change. That escalation's summary names the home and its status, so the router
+converts it into a new task instead of folding it onto the old one under the
+store's candidate-key index, and the new task then answers the finding. The
+curator's semantic drop is a second fold, and it excludes only cancelled tasks:
+a re-raise the curator drops onto the home it names recurs nightly until the
+entry is re-owned.
 
 ---
 

@@ -2018,8 +2018,8 @@ other top-level key through `find_tasks_by_metadata` (§9).
 sweep (exceptions are owned or ratified; PRD
 `plans/inv12-exceptions-owned-or-ratified-prd.md`, D11).
 `x_inv12_finding` is the sweep's idempotence key, one per
-`(scope, dead owner)` where scope is a governed `list_id` or `inline`; the
-sweep skips filing while a live task or pending escalation carries it.
+`(scope, dead owner)` where scope is a governed `list_id` or `inline`; what
+counts as already raised is `scripts/exception_owner_sweep.py::decide`.
 `x_inv12_owns` is a note the sweep merges into a live owner task, saying
 which exception entries cite it. A sweep-filed task asks the implementer to
 re-dispose each entry whose owner is dead: fix the underlying type or code so
