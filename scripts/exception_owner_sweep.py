@@ -14,9 +14,12 @@ Three of the PRD's open questions, as decided:
   idempotence settles the next.
 * Where a finding's key lives (2): a filed task carries it in
   ``metadata.x_inv12_finding``; an escalation carries it in the caller-chosen
-  ``task_id`` slot, checked against one ``get_pending_escalations`` per run.
-  The stamp keeps no ledger of escalated keys, which would be a second home
-  of what is pending.
+  ``task_id`` slot, checked against one ``get_pending_escalations`` per run;
+  and the router converts each such escalation into a task whose
+  ``metadata.escalation_id`` names it, matched against the slot's whole
+  history, read archive-inclusive (PRD D11 as amended by task 9468; the
+  ladder is :func:`decide`).  The stamp keeps no ledger of escalated keys,
+  which would be a second home of what is pending.
 * Self-citation (4): not detected.  Every dead-owner finding states both
   remedies: re-own the site, or fix the suppression the owner's work introduced.
 
@@ -24,7 +27,7 @@ The stamp, ``exception_register.SWEEP_STATE_PATH`` under ``--project-root``, is
 written after every completed run.  A failed run rewrites a prior stamp with
 ``ok`` false and that stamp's ``last_run``, so the stamp's age is the liveness
 signal ``exception_register.py --report`` reads.  ``--dry-run`` writes,
-files and escalates nothing.
+files and escalates nothing, and is the command that lists dead owners.
 """
 
 from __future__ import annotations
@@ -380,6 +383,10 @@ ToolCall = Callable[[str, dict[str, object]], Mapping[str, object]]
 AGENT_ROLE = 'exception-owner-sweep'
 
 REPORT_COMMAND = 'uv run --project shared python scripts/exception_register.py --report'
+"""The register: citations, slack and the sweep's age, never findings."""
+
+DRY_RUN_COMMAND = 'uv run --project shared python scripts/exception_owner_sweep.py --dry-run'
+"""The one command that lists every cited owner's verdict now."""
 
 SUBMIT_RESOLVE_WAIT_SECS = 115
 """How long a filing waits for the curator: under the server's 120 s MCP call limit."""
@@ -633,7 +640,7 @@ def _dead_owner_body(citation: Citation, verdict: liveness.OwnerVerdict) -> _Bod
                 f'{owner} no longer owns the debt it is cited for ({facts}).',
                 f'Scope: {citation.scope}. Sites: {_bounded(citation.sites)}.',
                 f'Remedy: {_DEAD_OWNER_REMEDY}',
-                f'Report: {REPORT_COMMAND}',
+                f'Dead owners, and whether this one is gone once re-owned: {DRY_RUN_COMMAND}',
             ]
         ),
         remedy=_DEAD_OWNER_REMEDY,
@@ -764,7 +771,7 @@ def _tighten_body(slack: int, measured_at: datetime.datetime) -> _Body:
 
 
 def _overflow_body(count: int) -> _Body:
-    remedy = f'Run `{REPORT_COMMAND}` to see every finding now; the sweep retries them next run.'
+    remedy = f'Run `{DRY_RUN_COMMAND}` to see every finding now; the sweep retries them next run.'
     return _Body(
         summary=f'INV-12 owner sweep: {count} finding(s) over the per-run output bound',
         detail='\n'.join(
