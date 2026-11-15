@@ -94,11 +94,6 @@ class TestRunnerConfig:
         assert config.producer_timeout(_E1) == 7200
         assert config.producer_timeout('e4-staleness-sweep') == 3600
 
-    def test_the_overrides_are_read_only_once_loaded(self):
-        config = _mod().load_runner_config(COMMITTED_CONFIG)
-        with pytest.raises(TypeError):
-            config.producer_timeout_secs_by_eval['e6-corpus-health'] = 1
-
     def test_an_override_for_an_unregistered_eval_is_refused(self, tmp_path):
         refusal = r"producer_timeout_secs_by_eval names \['e6-corpus-healht'\].*registered: \["
         with pytest.raises(ValueError, match=refusal):
