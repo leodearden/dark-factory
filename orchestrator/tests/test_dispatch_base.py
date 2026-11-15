@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 from _workflow_helpers import _init_repo
 
 from orchestrator.config import GitConfig
@@ -49,7 +50,7 @@ def git_ops(repo: Path) -> GitOps:
     )
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def worktree(git_ops: GitOps) -> Path:
     return (await git_ops.create_worktree('42')).path
 
