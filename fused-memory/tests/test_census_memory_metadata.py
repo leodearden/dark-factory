@@ -2752,14 +2752,14 @@ def _both_default_projects_report(*, top_n: int = 50, page_size: int = 1000) -> 
 
 
 #: The bare regen command every artifact header starts from: repo-root
-#: relative, `--frozen`, and identical to what the nightly wrapper runs and
+#: relative, `--no-sync`, and identical to what the nightly wrapper runs and
 #: what OPERATIONS.md §12 documents. Single-homed here so the flag-
 #: reconstruction tests below assert what they are about -- which FLAGS are
 #: emitted -- while the spelling itself is pinned exactly once, by
 #: TestRegenCommandCoversTheNewFlags::
 #: test_the_command_is_the_invocation_the_nightly_wrapper_makes.
 _BARE_REGEN = (
-    'uv run --frozen --project fused-memory python '
+    'uv run --no-sync --project fused-memory python '
     'fused-memory/scripts/census_memory_metadata.py'
 )
 
@@ -3977,7 +3977,7 @@ class TestRegenCommandCoversTheNewFlags:
     def test_the_command_is_the_invocation_the_nightly_wrapper_makes(self):
         """One spelling, shared by the wrapper, OPERATIONS.md and this header.
 
-        The wrapper runs `uv run --frozen --project "$FM" python
+        The wrapper runs `uv run --no-sync --project "$FM" python
         "$FM/scripts/census_memory_metadata.py"`; OPERATIONS.md §12 documents
         that same form and claims it is "what the report's own regen line
         reproduces". That claim was false while this function emitted a
@@ -3987,13 +3987,14 @@ class TestRegenCommandCoversTheNewFlags:
         """
         command = _mod._regen_command({'projects': ['dark_factory', 'reify']})
         assert command == (
-            'uv run --frozen --project fused-memory python '
+            'uv run --no-sync --project fused-memory python '
             'fused-memory/scripts/census_memory_metadata.py'
         )
-        # --frozen matters on its own: an unpinned resolve could regenerate a
-        # committed artifact under a different dependency set than the run
-        # that produced it.
-        assert '--frozen' in command
+        # --no-sync matters on its own: it does no lock and no sync, so the
+        # regen runs the environment the nightly run ran rather than installing
+        # into the shared venv (measured in
+        # scripts/orchestrator-autopilot-video.service above its ExecStart).
+        assert '--no-sync' in command
 
     def test_non_default_registry_is_named(self):
         params = {'projects': ['dark_factory', 'reify'], 'registry': '/tmp/r.json'}
