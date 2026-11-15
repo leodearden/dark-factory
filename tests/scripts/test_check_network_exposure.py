@@ -247,20 +247,34 @@ def test_static_ports_owns_one_port_per_table_entry():
     assert "ServerConfig.recon_report_port" in owner_of[exposure.RECON_REPORT_PORT]
 
 
+def test_optional_compose_services_are_published_compose_services():
+    assert exposure.OPTIONAL_COMPOSE_SERVICES
+    assert exposure.OPTIONAL_COMPOSE_SERVICES <= set(exposure.COMPOSE_PUBLISHED_PORTS.values())
+
+
+def test_static_ports_mark_exactly_the_optional_services():
+    by_port = {owned.port: owned for owned in exposure.STATIC_PORTS}
+    for port, service in exposure.COMPOSE_PUBLISHED_PORTS.items():
+        expected = service if service in exposure.OPTIONAL_COMPOSE_SERVICES else None
+        assert by_port[port].optional_service == expected, by_port[port]
+    assert by_port[exposure.RECON_REPORT_PORT].optional_service is None
+
+
+def test_compose_project_is_the_compose_files_directory():
+    compose = yaml.safe_load(COMPOSE_PATH.read_text(encoding="utf-8"))
+    assert "name" not in compose, "a top-level name: would replace the directory as the compose project"
+    assert COMPOSE_PATH.parent.name == exposure.COMPOSE_PROJECT
+
+
 def test_merge_owners_names_every_owner_of_a_port_once_in_source_order():
-    sockets = [
-        exposure.OwnedPort(port=8002, owner="fused-memory.socket"),
-        exposure.OwnedPort(port=8002, owner="fused-memory.socket"),
-        exposure.OwnedPort(port=8103, owner="fused-memory.socket"),
-    ]
-    static = [
-        exposure.OwnedPort(port=6379, owner="compose service falkordb"),
-        exposure.OwnedPort(port=8002, owner="compose service fused-mcp"),
-    ]
-    assert exposure.merge_owners(sockets, static) == {
-        6379: ("compose service falkordb",),
-        8002: ("fused-memory.socket", "compose service fused-mcp"),
-        8103: ("fused-memory.socket",),
+    socket_8002 = exposure.OwnedPort(port=8002, owner="fused-memory.socket")
+    socket_8103 = exposure.OwnedPort(port=8103, owner="fused-memory.socket")
+    falkordb = exposure.OwnedPort(port=6379, owner="compose service falkordb")
+    fused_mcp = exposure.OwnedPort(port=8002, owner="compose service fused-mcp")
+    assert exposure.merge_owners([socket_8002, socket_8002, socket_8103], [falkordb, fused_mcp]) == {
+        6379: (falkordb,),
+        8002: (socket_8002, fused_mcp),
+        8103: (socket_8103,),
     }
 
 
