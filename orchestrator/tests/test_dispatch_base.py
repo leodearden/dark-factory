@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -157,6 +159,17 @@ def _rewrite_to_main(worktree: Path) -> Callable[[], None]:
     return act
 
 
+def _raise_sandbox_unavailable() -> None:
+    raise RuntimeError('sandbox unavailable')
+
+
+def _remove_worktree_then_raise(worktree: Path) -> Callable[[], None]:
+    def act() -> None:
+        shutil.rmtree(worktree)
+        _raise_sandbox_unavailable()
+    return act
+
+
 RESOLVED = MergerDisposition(resolved=True, reason='')
 DECLINED = MergerDisposition(resolved=False, reason='needs judgement')
 
@@ -182,6 +195,13 @@ async def _conflict(repo: Path, git_ops: GitOps, worktree: Path) -> BaseConflict
     conflict = await find_base_conflict(git_ops, worktree)
     assert conflict is not None
     return conflict
+
+
+async def _assert_task_side_restored(git_ops: GitOps, worktree: Path, conflict: BaseConflict) -> None:
+    assert not _has_merge_head(worktree)
+    assert await git_ops.unmerged_paths(worktree) == ()
+    assert _head(worktree) == conflict.head_sha
+    assert (worktree / GREET_FILE).read_text() == _greeting('Hi')
 
 
 @pytest.mark.asyncio
@@ -304,3 +324,42 @@ class TestSettleBaseConflict:
         detail = settlement.block_detail()
         assert all(path in detail for path in conflict.conflicted_paths)
         assert conflict.head_sha in detail
+
+    async def test_merger_exception_aborts_the_open_merge(self, repo, git_ops, worktree):
+        conflict = await _conflict(repo, git_ops, worktree)
+        merger = RecordingMerger(_raise_sandbox_unavailable, RESOLVED)
+
+        with pytest.raises(RuntimeError, match='sandbox unavailable'):
+            await self._settle(git_ops, worktree, conflict, merger)
+
+        assert len(merger.briefs) == 1
+        await _assert_task_side_restored(git_ops, worktree, conflict)
+
+    async def test_cancelled_merger_aborts_the_open_merge(self, repo, git_ops, worktree):
+        conflict = await _conflict(repo, git_ops, worktree)
+        started = asyncio.Event()
+        briefs: list[str] = []
+
+        async def merger(brief: str) -> MergerDisposition:
+            briefs.append(brief)
+            started.set()
+            await asyncio.Event().wait()
+            return RESOLVED
+
+        task = asyncio.create_task(
+            settle_base_conflict(git_ops, worktree, conflict, branch=BRANCH, merger=merger),
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(briefs) == 1
+        await _assert_task_side_restored(git_ops, worktree, conflict)
+
+    async def test_failed_cleanup_does_not_replace_the_merger_exception(self, repo, git_ops, worktree):
+        conflict = await _conflict(repo, git_ops, worktree)
+        merger = RecordingMerger(_remove_worktree_then_raise(worktree), RESOLVED)
+
+        with pytest.raises(RuntimeError, match='sandbox unavailable'):
+            await self._settle(git_ops, worktree, conflict, merger)
