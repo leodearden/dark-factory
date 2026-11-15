@@ -219,8 +219,8 @@ class DecisionRecord:
     any of the mutations -- each write remains individually atomic AND the
     read+mutate+write span is serialized against other callers on the same
     id. See update_decision_state/set_manual_boost/
-    set_decision_escalations_dir/decision_cli.py::_run_write_decision/
-    close_decision_with_evidence/reopen_decision/record_audit_outcome for the
+    set_decision_escalations_dir/close_decision_with_evidence/reopen_decision/
+    record_audit_outcome, and the ``write-decision`` verb, for the
     caller-facing note.
     """
 
@@ -597,7 +597,7 @@ def close_decision_with_evidence(
     per project, so the caller names the record it means by the project and
     queue stamp it READ (compared folded, through fold_project_token and
     normalize_escalations_dir), and any other record at that id is refused.
-    That is the close-side twin of decision_cli.py::_run_write_decision's collision rule.
+    That is the close-side twin of the ``write-decision`` verb's collision rule.
 
     Raises DecisionCloseRefused for a target state other than answered or
     dropped, empty evidence, a record whose project or queue stamp is not the
@@ -762,17 +762,17 @@ def _merge_queue_and_escalation_id(
     Merging the two fields by independent rules is what makes that possible
     to get wrong -- adopt the incoming queue while keeping the existing id
     and the survivor carries a pair that existed on neither record.
-    ``decision_cli.py::_run_reap_decisions._status`` is a JOIN on exactly that pair: axis 2
+    The ``reap-decisions`` verb's status lookup is a JOIN on exactly that pair: axis 2
     compares the stamp, then ``read_escalation_status(escalations_dir,
     escalation_id)`` resolves the id INSIDE that queue. Since
     ``esc-<taskid>-<n>`` ids are unique only WITHIN a queue (task 3528), a
     synthesized pair resolves against an UNRELATED escalation that merely
     shares the id -- and if that one has resolved, the decision closes.
 
-    That is the fail-CLOSED direction, which decision_cli.py::_run_reap_decisions' own
-    docstring rules out: "an over-held decision is a human-triageable row,
+    That is the fail-CLOSED direction, which the ``reap-decisions`` verb's own
+    policy rules out: "an over-held decision is a human-triageable row,
     while a falsely closed one is invisible". It is also not hypothetical --
-    it is the incident that docstring records, a RESOLVED orchestrator
+    it is the incident behind that policy, a RESOLVED orchestrator
     escalation closing a still-PENDING recon blocking gate that then sat
     invisible in the cockpit for ~7 days. Holding a record we cannot place
     is always the cheaper mistake.
@@ -950,7 +950,7 @@ def merge_same_queue_refile(
 
     Deliberate SIBLING of merge_decision_enrichment above -- read the two
     together. Same custody set, opposite treatment of the watcher-owned half.
-    This is the other axis of decision_cli.py::_run_write_decision's upsert: not two watchers
+    This is the other axis of the ``write-decision`` verb's upsert: not two watchers
     seeing one gate through two queues (that is enrichment), but ONE watcher
     re-filing its own stable id across a restart, which both watcher SKILL.md
     files promise is idempotent.
@@ -978,7 +978,7 @@ def merge_same_queue_refile(
     - ``id`` / ``project`` -- not forced here, unlike enrichment (which
       rebuilds from *existing*): this helper rebuilds from *incoming*, and
       its caller has already established both are equal -- the id is the
-      on-disk file key, and decision_cli.py::_run_write_decision reaches this arm only after
+      on-disk file key, and the ``write-decision`` verb reaches this arm only after
       ``existing.project == project``. Do not widen those preconditions
       without revisiting this line.
 
@@ -991,7 +991,7 @@ def merge_same_queue_refile(
     id namespaces genuinely collide (dark_factory runs ``data/escalations``
     and ``data/reconciliation/escalations`` over one namespace), so a
     non-open cross-queue filing may be an unrelated NEW ask;
-    decision_cli.py::_run_write_decision deliberately keeps today's full overwrite there.
+    the ``write-decision`` verb deliberately keeps today's full overwrite there.
 
     THAT UNIQUENESS IS STRONG BUT NOT ABSOLUTE, and the hole is named here
     once rather than rounded off, because every other statement of this
@@ -1005,7 +1005,7 @@ def merge_same_queue_refile(
     genuinely NEW gate on a closed row that this helper then holds closed --
     invisible in C5b, which filters to state=='open', i.e. the fail-CLOSED
     direction. The residual needs a counter loss to reach and is far narrower
-    than the unbounded harm below, and decision_cli.py::_run_write_decision's divergence
+    than the unbounded harm below, and the ``write-decision`` verb's divergence
     WARNING is its backstop: the hold is ANNOUNCED for a human or agent to
     adjudicate rather than applied silently, which is exactly the case that
     reads it.
@@ -1025,7 +1025,7 @@ def merge_same_queue_refile(
     and C5b's drop action is inert for exactly the class of row it exists
     for. When the SAME gate genuinely needs a human again, the row is
     re-opened in place with the ``reopen-decision`` verb (reopen_decision),
-    which decision_cli.py::_run_write_decision's divergence WARNING names; a genuinely
+    which the ``write-decision`` verb's divergence WARNING names; a genuinely
     DIFFERENT ask is filed under a new id.
 
     ADDITIVE-SAFE: ``state`` is copied as an opaque ``str``, never coerced

@@ -189,9 +189,11 @@ class TestAtomicWriteSemantics:
 
     # -- task 3387: the payload is JSON, and RFC 8259 requires JSON on disk to
     # be UTF-8.  Under a non-UTF-8 locale the old bare ``os.fdopen(fd, 'w')``
-    # wrote bytes that this module's OWN readers then reject — ``read_record``
-    # raises ``CorruptSessionRecord``, ``list_decisions``/``reap_stale_leases``
-    # log and skip the file — i.e. silent data loss.  (NOT
+    # wrote bytes that the registries' own readers then reject —
+    # ``session_registry.py::read_record`` raises ``CorruptSessionRecord``,
+    # ``decision_registry.py::list_decisions`` and
+    # ``session_registry.py::reap_stale_leases`` log and skip the file — i.e.
+    # silent data loss.  (NOT
     # ``shared.safe_io.load_json_or_warn``, which an earlier version of this
     # comment named: that helper never reads session, decision or lease
     # records.)  Two pins, deliberately different in KIND, because neither is
