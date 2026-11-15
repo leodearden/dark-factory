@@ -11,9 +11,13 @@ import check_dashboard_unit_parity
 import governed_list_agreement
 import inline_suppressions
 import merge_lane_metrics
+import pytest
 import sweep_toolcall_markup
 import test_merge_state_vocabulary_consistency as merge_state_vocabulary_consistency
 from shared.governed_exceptions import Debt, Policy, TaskRef, governed_exceptions
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SIZE_CEILING_EXEMPT_LIST = governed_exceptions(
     'scripts.merge_lane_metrics.SIZE_CEILING_EXEMPT',
