@@ -491,6 +491,14 @@ def extract_statuses(payload) -> Mapping[str, Any]:
             f"(got {type(statuses).__name__}{sized}): {bounded_repr(statuses)}"
         )
 
+    pagination = payload.get("pagination")
+    if isinstance(pagination, Mapping) and pagination.get("has_more"):
+        raise StatusFetchUnavailable(
+            f"get_statuses returned a partial page, not the full census "
+            f"(returned={pagination.get('returned')!r}, "
+            f"total={pagination.get('total')!r})"
+        )
+
     return statuses
 
 

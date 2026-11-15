@@ -389,6 +389,29 @@ def test_extract_statuses_raises_when_statuses_is_not_a_mapping():
     assert "list" in str(excinfo.value)
 
 
+def test_extract_statuses_raises_on_a_partial_page():
+    payload = {
+        "statuses": {"1": "done"},
+        "pagination": {
+            "total": 5, "offset": 0, "page_size": 1, "returned": 1, "has_more": True,
+        },
+    }
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_statuses(payload)
+
+    assert "partial page" in str(excinfo.value)
+
+
+def test_extract_statuses_accepts_a_final_page_with_no_more_to_fetch():
+    payload = {
+        "statuses": {"1": "done"},
+        "pagination": {
+            "total": 1, "offset": 0, "page_size": 1, "returned": 1, "has_more": False,
+        },
+    }
+    assert dict(ct.extract_statuses(payload)) == {"1": "done"}
+
+
 @pytest.mark.parametrize("payload", [None, [], "oops", 0])
 def test_extract_statuses_raises_on_non_dict_payload(payload):
     with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
