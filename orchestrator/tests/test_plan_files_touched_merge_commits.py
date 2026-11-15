@@ -1,7 +1,7 @@
 """What the plan-files touched set counts, measured on real git history.
 
-Every range starts at ``git merge-base HEAD main`` in the worktree: the
-own-work base ``branch_base.py::own_work_base`` hands the gate.
+Every range starts at the own-work base ``branch_base.py::own_work_base``
+derives in the worktree, the base the workflow hands the gate.
 
 Scene A is a back-merge carrying an evil hunk. The merge commit's own change
 is the task's work; the main-side file it merely brought in is not. Scene B
@@ -20,6 +20,7 @@ import pytest
 from _git_fixtures import RepoSeed, seed_repo
 from _merged_in_branch import git
 
+from orchestrator.branch_base import own_work_base
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.gates import _check_plan_files_touched_in_branch
@@ -57,15 +58,15 @@ def _commit(cwd: Path, files: Mapping[str, str], message: str) -> None:
     git(cwd, 'commit', '-q', '-m', message)
 
 
-def _own_work_range(repo: Path, worktree: Path) -> Range:
+async def _own_work_range(repo: Path, worktree: Path) -> Range:
     return Range(
         git_ops=_git_ops(repo),
-        base=git(worktree, 'merge-base', 'HEAD', 'main'),
+        base=await own_work_base(worktree, 'main', stored_base=None),
         head=git(worktree, 'rev-parse', 'HEAD'),
     )
 
 
-def _back_merge_with_evil_hunk(tmp_path: Path) -> Range:
+async def _back_merge_with_evil_hunk(tmp_path: Path) -> Range:
     repo = _seed(tmp_path, {'a.py': 'a = 1\n', 'm.py': 'm = 1\n', 'evil.py': 'e = 1\n'})
     worktree = tmp_path / 'wt'
     git(repo, 'worktree', 'add', '-q', '-b', 'task/50', str(worktree))
@@ -75,10 +76,10 @@ def _back_merge_with_evil_hunk(tmp_path: Path) -> Range:
     (worktree / 'evil.py').write_text('e = 2\n')
     git(worktree, 'add', 'evil.py')
     git(worktree, 'commit', '-q', '--no-edit')
-    return _own_work_range(repo, worktree)
+    return await _own_work_range(repo, worktree)
 
 
-def _mixed_stack(tmp_path: Path) -> Range:
+async def _mixed_stack(tmp_path: Path) -> Range:
     repo = _seed(tmp_path, {'README.md': '# r\n'})
     foreign = tmp_path / 'wt40'
     git(repo, 'worktree', 'add', '-q', '-b', 'task/40', str(foreign))
@@ -87,7 +88,7 @@ def _mixed_stack(tmp_path: Path) -> Range:
     worktree = tmp_path / 'wt50'
     git(repo, 'worktree', 'add', '-q', '-b', 'task/50', str(worktree), 'task/40')
     _commit(worktree, {'own.py': 'o = 1\n'}, 'own work')
-    return _own_work_range(repo, worktree)
+    return await _own_work_range(repo, worktree)
 
 
 async def _not_touched(scene: Range, plan_files: list[str]) -> list[str]:
@@ -101,7 +102,7 @@ class TestBackMergeWithEvilHunk:
     async def test_the_touched_set_lists_the_merge_commits_own_change_only(
         self, tmp_path: Path,
     ) -> None:
-        scene = _back_merge_with_evil_hunk(tmp_path)
+        scene = await _back_merge_with_evil_hunk(tmp_path)
 
         touched = await scene.git_ops.get_files_touched_in_branch(scene.base, scene.head)
 
@@ -110,14 +111,14 @@ class TestBackMergeWithEvilHunk:
     async def test_a_file_changed_only_inside_the_merge_commit_is_touched(
         self, tmp_path: Path,
     ) -> None:
-        scene = _back_merge_with_evil_hunk(tmp_path)
+        scene = await _back_merge_with_evil_hunk(tmp_path)
 
         assert await _not_touched(scene, ['a.py', 'evil.py']) == []
 
     async def test_a_main_file_the_back_merge_only_brought_in_is_not_touched(
         self, tmp_path: Path,
     ) -> None:
-        scene = _back_merge_with_evil_hunk(tmp_path)
+        scene = await _back_merge_with_evil_hunk(tmp_path)
 
         assert await _not_touched(scene, ['a.py', 'm.py']) == ['m.py']
 
@@ -152,13 +153,13 @@ class TestUnreadableRange:
 
 class TestMixedStack:
     async def test_the_tasks_own_commit_is_measured(self, tmp_path: Path) -> None:
-        scene = _mixed_stack(tmp_path)
+        scene = await _mixed_stack(tmp_path)
 
         assert await _not_touched(scene, ['own.py']) == []
 
     async def test_the_landed_foreign_workstream_is_not_credited(
         self, tmp_path: Path,
     ) -> None:
-        scene = _mixed_stack(tmp_path)
+        scene = await _mixed_stack(tmp_path)
 
         assert await _not_touched(scene, ['own.py', 'foreign.py']) == ['foreign.py']
