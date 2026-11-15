@@ -170,6 +170,20 @@ def test_a_local_dependency_without_a_status_is_unsatisfied():
     assert deps_verdict(_dependent('D'), {}) == DepsVerdict.unsatisfied(DepKind.LOCAL)
 
 
+@pytest.mark.parametrize(
+    'dependencies',
+    ['12,13', '12, 13', [{'id': 12}, {'id': '13'}]],
+    ids=['csv-string', 'csv-string-with-spaces', 'dict-shaped-list'],
+)
+def test_the_local_arm_reads_dependency_ids_in_every_wire_shape(dependencies):
+    task = {'id': 'T', 'dependencies': dependencies}
+    assert deps_verdict(task, {'12': 'done', '13': 'done'}) == SATISFIED
+    assert deps_verdict(task, {'12': 'done', '13': 'pending'}) == DepsVerdict.unsatisfied(
+        DepKind.LOCAL
+    )
+    assert deps_verdict(task, {'12': 'done'}) == DepsVerdict.unsatisfied(DepKind.LOCAL)
+
+
 def test_a_blocked_local_dependency_wins_over_an_unknown_external_one():
     verdict = deps_verdict(
         _dependent('D', external_deps=(EXTERNAL_DEP,)),

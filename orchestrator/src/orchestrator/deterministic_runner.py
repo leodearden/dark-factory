@@ -40,6 +40,7 @@ from shared.before_done_paths import (
 )
 from shared.milestone_rearm import rearmed_milestone
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
+from shared.task_fields import dependency_ids
 from shared.task_metadata import (
     HUMAN_CURATOR_ADJUDICATED_AT_KEY,
     HUMAN_CURATOR_GATE_KEY,
@@ -56,7 +57,6 @@ from orchestrator.before_done_script import (
     run_script,
 )
 from orchestrator.config import PREDICATE_RECHECK_STALL_CAP
-from orchestrator.dependency_verdict import task_dependency_ids
 from orchestrator.deploy_state import (
     SCHEDULED_DEPLOY_PROVENANCE_KIND,
     DeployPhase,
@@ -713,7 +713,7 @@ def build_gate_escalation_fields(
     The operational-LLM token prefix applies to either.
     """
     task = task or {}
-    dep_ids = task_dependency_ids(task)
+    dep_ids = dependency_ids(task)
     detail_parts = [task.get('description', '')]
     if dep_ids:
         detail_parts.append(f'\nLanded dependencies: {", ".join(dep_ids)}')
@@ -783,7 +783,7 @@ async def read_human_gate_facts(
 
 async def _read_completion_gate(scheduler, task: dict) -> CompletionGateReading:
     """Every dependency, read concurrently, then :func:`first_completion_gate` in dependency order."""
-    dep_ids = task_dependency_ids(task)
+    dep_ids = dependency_ids(task)
     reads = await asyncio.gather(
         *(_read_dependency(scheduler, task.get('id'), dep_id) for dep_id in dep_ids),
     )
