@@ -318,6 +318,10 @@ def test_a_failed_kick_stops_the_install_naming_the_service(fake_timer_systemctl
     though the tick failed -- and the row check below it must not run, because
     a kick that never happened cannot have written a row and the DB message
     would misdirect an operator onto the sampler's writes.
+
+    The sentence is read from the script's own `ERROR:` line: the fake's
+    `Job for <unit> failed.` line names the service too, so a bare
+    `SERVICE_NAME in stderr` passes even when the script prints nothing.
     """
     root = tmp_path / 'root'
     _seed_db(root)
@@ -328,7 +332,10 @@ def test_a_failed_kick_stops_the_install_naming_the_service(fake_timer_systemctl
     })
 
     assert result.returncode != 0, result.stdout
-    assert SERVICE_NAME in result.stderr, result.stderr
+    own_error_lines = [line for line in result.stderr.splitlines() if line.startswith('ERROR:')]
+    assert own_error_lines, f'the installer printed no ERROR: line of its own: {result.stderr}'
+    kick_error = own_error_lines[0]
+    assert SERVICE_NAME in kick_error and 'IS installed and enabled' in kick_error, kick_error
     assert 'load-samples.db' not in result.stderr, (
         'the row check ran after a kick that never happened: '
         f'{result.stderr}'
