@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.startup_steps import (
+    CRASH_LOOP_THRESHOLD,
     EntryFailure,
     EntryFailures,
     StartupFailureStreak,
@@ -116,7 +117,7 @@ class TestStartupStepName:
 class TestHealthyStep:
     @pytest.mark.asyncio
     async def test_none_result_is_ok_and_files_nothing(
-        self, journal, event_store, queue,
+        self, journal, journal_path, event_store, queue,
     ) -> None:
         seen_in_flight = []
 
@@ -133,8 +134,8 @@ class TestHealthyStep:
         assert seen_in_flight[0] is not None
         assert seen_in_flight[0].step == '2c'
         assert seen_in_flight[0].started_at is not None
-        assert journal.in_flight is not None
-        assert journal.in_flight.step == '2c'
+        assert journal.in_flight is None
+        assert not journal_path.exists()
 
     @pytest.mark.asyncio
     async def test_sync_callable_is_supported(self, journal, event_store, queue) -> None:
@@ -199,6 +200,16 @@ class TestFailedStep:
         assert esc.suggested_action == 'investigate_startup_step'
         assert '2c' in esc.summary
         assert 'RuntimeError' in esc.summary
+
+    @pytest.mark.asyncio
+    async def test_a_failed_step_is_journaled(self, journal, journal_path, event_store, queue) -> None:
+        await _run(StartupStep('2c', _raiser(RuntimeError('injected'))), journal, event_store, queue)
+
+        streak = StartupJournal.load(journal_path).inherited
+        assert streak is not None
+        assert (streak.step, streak.exception_type, streak.message, streak.consecutive) == (
+            '2c', 'RuntimeError', 'injected', 1,
+        )
 
     @pytest.mark.asyncio
     async def test_repeat_failure_refreshes_the_same_l1(
@@ -266,6 +277,19 @@ class TestPartialStep:
         assert '41' in esc.summary or '41' in esc.detail
 
     @pytest.mark.asyncio
+    async def test_a_partial_step_is_not_journaled(
+        self, journal, journal_path, event_store, queue,
+    ) -> None:
+        async def body() -> EntryFailures:
+            failures = EntryFailures('Recovery')
+            failures.record('41', OSError('boom'))
+            return failures
+
+        await _run(StartupStep('2c', body), journal, event_store, queue)
+
+        assert not journal_path.exists()
+
+    @pytest.mark.asyncio
     async def test_empty_entry_failures_is_ok(self, journal, event_store, queue) -> None:
         async def body() -> EntryFailures:
             return EntryFailures('Recovery')
@@ -303,6 +327,19 @@ class TestFatalStep:
         assert event['data']['step'] == '1b'
         assert len(_pending_l1s(queue, '1b')) == 1
 
+    @pytest.mark.asyncio
+    async def test_a_fatal_failure_is_journaled_and_still_reraised(
+        self, journal, journal_path, event_store, queue,
+    ) -> None:
+        exc = RuntimeError('liveness over budget')
+        with pytest.raises(RuntimeError) as raised:
+            await _run(StartupStep('1b', _raiser(exc), fatal=True), journal, event_store, queue)
+
+        assert raised.value is exc
+        streak = StartupJournal.load(journal_path).inherited
+        assert streak is not None
+        assert (streak.step, streak.exception_type) == ('1b', 'RuntimeError')
+
 
 class TestBaseExceptionPassthrough:
     @pytest.mark.asyncio
@@ -311,7 +348,7 @@ class TestBaseExceptionPassthrough:
         ids=['cancelled', 'system-exit', 'keyboard-interrupt'],
     )
     async def test_base_exception_propagates_untouched(
-        self, exc, journal, event_store, queue,
+        self, exc, journal, journal_path, event_store, queue,
     ) -> None:
         with pytest.raises(type(exc)) as raised:
             await _run(StartupStep('2d', _raiser(exc)), journal, event_store, queue)
@@ -321,6 +358,7 @@ class TestBaseExceptionPassthrough:
         assert queue.get_pending() == []
         assert journal.in_flight is not None
         assert journal.in_flight.step == '2d'
+        assert not journal_path.exists()
 
 
 class TestNoneSafety:
@@ -515,3 +553,68 @@ class TestStartupFailureStreakInvariants:
                 step=step, exception_type='E', message='m', consecutive=consecutive,
                 first_seen=_LONG_AGO, last_seen=_LONG_AGO,
             )
+
+
+class TestQuarantine:
+    @staticmethod
+    def _journal_over(path: Path, step: str, consecutive: int) -> StartupJournal:
+        _seed_streak(path, step, consecutive)
+        return StartupJournal.load(path)
+
+    @staticmethod
+    def _recording_body(calls: list[str]):
+        return lambda: calls.append('ran')
+
+    @pytest.mark.asyncio
+    async def test_a_step_at_the_threshold_is_skipped_and_reported_only_in_the_log(
+        self, journal_path, event_store, queue, caplog,
+    ) -> None:
+        journal = self._journal_over(journal_path, '2e', CRASH_LOOP_THRESHOLD)
+        calls: list[str] = []
+
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            outcome = await _run(
+                StartupStep('2e', self._recording_body(calls)), journal, event_store, queue,
+            )
+
+        assert calls == []
+        assert outcome == StepOutcome.quarantined('2e')
+        assert outcome.status is StepStatus.QUARANTINED
+        [warning] = _warnings_naming(caplog, '2e')
+        assert f'{CRASH_LOOP_THRESHOLD} consecutive' in warning.getMessage()
+        assert _failed_events(event_store) == []
+        assert queue.get_pending() == []
+
+    @pytest.mark.asyncio
+    async def test_a_fatal_step_is_never_skipped(self, journal_path, event_store, queue) -> None:
+        journal = self._journal_over(journal_path, '2e', CRASH_LOOP_THRESHOLD)
+        calls: list[str] = []
+
+        outcome = await _run(
+            StartupStep('2e', self._recording_body(calls), fatal=True), journal, event_store, queue,
+        )
+
+        assert calls == ['ran']
+        assert outcome.status is StepStatus.OK
+
+    @pytest.mark.asyncio
+    async def test_a_streak_below_the_threshold_still_runs(
+        self, journal_path, event_store, queue,
+    ) -> None:
+        journal = self._journal_over(journal_path, '2e', CRASH_LOOP_THRESHOLD - 1)
+        calls: list[str] = []
+
+        await _run(StartupStep('2e', self._recording_body(calls)), journal, event_store, queue)
+
+        assert calls == ['ran']
+
+    @pytest.mark.asyncio
+    async def test_a_streak_on_another_step_leaves_this_one_running(
+        self, journal_path, event_store, queue,
+    ) -> None:
+        journal = self._journal_over(journal_path, '2c', CRASH_LOOP_THRESHOLD)
+        calls: list[str] = []
+
+        await _run(StartupStep('2e', self._recording_body(calls)), journal, event_store, queue)
+
+        assert calls == ['ran']
