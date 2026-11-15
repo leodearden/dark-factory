@@ -4127,8 +4127,10 @@ log lines, not the journal's own, because the runner relays a producer's
 output only after the producer exits, and relays its stdout (e6's JSON plan,
 which has no timestamps) before its stderr log. The first timestamped line
 starts the sweep, and its `Wrote metrics artifact` line marks the end. A
-`TimeoutExpired` for e6 in the run report means the bound needs re-sizing from
-that measurement.
+`TimeoutExpired` for e6 in the run report means its sweep ran past the bound.
+That run never logs `Wrote metrics artifact`, so it gives only a lower bound,
+the bound itself. Size the new bound from the last run that completed, or
+raise it and re-measure.
 
 **The first run is the grandfather snapshot.** An eval with no
 `limits-current.json` records today's failures as known-bad and alarms on
