@@ -3495,13 +3495,15 @@ class SqliteTaskBackend:
                 # findings this write is responsible for. An untouched or
                 # echoed-verbatim legacy field (e.g. a JSON-bool milestone,
                 # esc-4528-2) is tolerated rather than locking the row.
+                stored_blob = coerce_task_metadata(row['metadata'])
+                written_blob = coerce_task_metadata(new_metadata)
                 _assert_deferral_unchanged(
-                    row['metadata'], parsed_metadata, new_metadata, task_id,
+                    stored_blob, parsed_metadata, written_blob, task_id,
                 )
                 await self._validate_metadata_on_write(
                     new_metadata, project_root=project_root, tag=tag, task_id=tid,
                     incoming_keys=_keys_changed_by_write(
-                        row['metadata'], incoming_metadata, new_metadata,
+                        stored_blob, incoming_metadata, written_blob,
                     ),
                 )
                 set_columns.append('metadata = ?')
@@ -3807,7 +3809,7 @@ class SqliteTaskBackend:
                 **{key: stored[key] for key in _MACHINE_AUTHORED_METADATA_KEYS if key in stored},
             }
             new_metadata = json.dumps(new_blob)
-            _assert_deferral_unchanged(row['metadata'], incoming, new_metadata, task_id)
+            _assert_deferral_unchanged(stored, incoming, new_blob, task_id)
             stored_files, new_files = _files_for_key(row['metadata']), _files_for_key(new_metadata)
             if stored_files != new_files:
                 raise ValueError(
@@ -3820,7 +3822,7 @@ class SqliteTaskBackend:
             )
             await self._validate_metadata_on_write(
                 new_metadata, project_root=project_root, tag=tag, task_id=tid,
-                incoming_keys=_keys_changed_by_write(row['metadata'], new_blob, new_metadata),
+                incoming_keys=_keys_changed_by_write(stored, new_blob, new_blob),
             )
             set_columns = ['metadata = ?', 'updated_at = ?']
             set_values: list[Any] = [new_metadata, task_timestamp_now()]
@@ -4487,21 +4489,18 @@ def _json_identical(a: object, b: object) -> bool:
 
 
 def _keys_changed_by_write(
-    stored_raw: str | None, incoming: dict, new_blob_json: str,
+    stored: dict | None, incoming: dict, new: dict | None,
 ) -> set[str]:
     """The keys *incoming* carried whose value in the written blob differs from the stored row's.
 
-    Identity is :func:`_json_identical`. A stored blob that is absent or not a
-    JSON object makes every carried key changed. Only carried keys count, so
-    the result is never wider than the payload: a key a merge normalised but
-    the caller did not send is not this write's responsibility.
+    *stored* and *new* are the decoded blobs, ``None`` when unreadable
+    (:func:`shared.task_metadata_wire.coerce_task_metadata`). Identity is
+    :func:`_json_identical`. An unreadable blob makes every carried key
+    changed. Only carried keys count, so the result is never wider than the
+    payload: a key a merge normalised but the caller did not send is not this
+    write's responsibility.
     """
-    try:
-        stored = json.loads(stored_raw) if stored_raw is not None else None
-    except (TypeError, ValueError):
-        stored = None
-    new = json.loads(new_blob_json)
-    if not isinstance(stored, dict) or not isinstance(new, dict):
+    if stored is None or new is None:
         return set(incoming)
     return {
         key for key in incoming
@@ -4572,16 +4571,12 @@ def _metadata_without_keys(blob_json: str, keys: frozenset[str]) -> str:
     return json.dumps({k: v for k, v in blob.items() if k not in keys})
 
 
-def _deferral_slice(blob_json: str | None) -> object:
-    try:
-        blob = json.loads(blob_json) if blob_json is not None else None
-    except (TypeError, ValueError):
-        blob = None
-    return blob.get('deferral', _ABSENT) if isinstance(blob, dict) else _ABSENT
+def _deferral_slice(blob: dict | None) -> object:
+    return blob.get('deferral', _ABSENT) if blob is not None else _ABSENT
 
 
 def _assert_deferral_unchanged(
-    stored_raw: str | None, incoming: dict | None, new_blob_json: str, task_id: str,
+    stored: dict | None, incoming: dict | None, new: dict | None, task_id: str,
 ) -> None:
     """Refuse a metadata write that would add, alter or remove ``metadata.deferral``.
 
@@ -4591,14 +4586,16 @@ def _assert_deferral_unchanged(
     a ``deferral`` the payload carries must equal the stored value (additive's
     OLD-wins merge would otherwise drop an alteration silently), and the blob
     about to be written must carry exactly the stored record (a replace that
-    omits it would otherwise remove it). Identity is :func:`_json_identical`;
-    a corrupt or absent stored blob holds no record.
+    omits it would otherwise remove it). *stored* and *new* are the decoded
+    blobs, as for :func:`_keys_changed_by_write`. Identity is
+    :func:`_json_identical`; an unreadable or absent stored blob holds no
+    record.
     """
-    stored = _deferral_slice(stored_raw)
+    stored_deferral = _deferral_slice(stored)
     carried = incoming.get('deferral', _ABSENT) if incoming is not None else _ABSENT
-    if carried is not _ABSENT and not _json_identical(carried, stored):
+    if carried is not _ABSENT and not _json_identical(carried, stored_deferral):
         raise DeferralWriteAuthorityError(task_id)
-    if not _json_identical(_deferral_slice(new_blob_json), stored):
+    if not _json_identical(_deferral_slice(new), stored_deferral):
         raise DeferralWriteAuthorityError(task_id)
 
 
