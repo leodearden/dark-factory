@@ -152,6 +152,7 @@ marked `done` on the strength of an unverified claim.
 | `found_on_main` | Discovered already on `main` (e.g. stranded-task recovery) | `commit` **and** `note` required; `stamped_at` written server-side (see below) |
 | `deterministic-deploy` | `DeterministicRunner` cross-unit deploy completed | — |
 | `deterministic-deploy-scheduled` | `DeterministicRunner` self-restart scheduled via detached `systemd-run`; dependents wait until the restart is verified (see `docs/deterministic-runner.md` §2) | — |
+| `deterministic-deploy-unverified` | `DeterministicRunner` cross-unit deploy with no `before_done.target_unit`: the script exited 0 (or a human resolved its gate or failure); no unit was inspected or verified | — |
 | `deterministic-gate` | A pure deterministic gate (no `before_done`) resolved | `escalation_id` **required on write** — cites the resolving gate escalation, recorded verbatim (no cross-service lookup) |
 | `deterministic-milestone` | A `kind='predicate'` milestone check exited `0` | — |
 | `operational-verified` | A `normal`-task no-code operational ask closed via a resolved escalation, not a merge | `escalation_id` **and** `note` required |
@@ -186,7 +187,7 @@ callers, on both the fresh `done` transition and the same-status
 `done`→`done` repair path — a recon stage may never self-authorize an
 operational close.
 
-The four `deterministic-*` kinds carry a caller bar of the same shape, with
+The five `deterministic-*` kinds carry a caller bar of the same shape, with
 two factors (PRD `plans/memory-auto-consolidation-prd.md` C5/D11, where the
 rationale lives). They are accepted only from a caller whose resolved
 identity matches a prefix in
@@ -1005,14 +1006,22 @@ open (quiescence guard — no re-dispatch, no churn).
   existence and the executable bit before the unit is registered; an
   unrunnable script blocks the task instead of marking it `scheduled`
   (`docs/deterministic-runner.md` §2).
-- `before_done.target_unit` differs from own unit (or is `None`) →
-  blocking subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify
-  against a pre-run baseline (done = `deployed-and-verified`).
+- `before_done.target_unit` names a unit other than own → blocking
+  subprocess + fresh `MainPID`/`ActiveEnterTimestamp` verify against a
+  pre-run baseline (done = deployed-and-verified, kind
+  `deterministic-deploy`).
+- `before_done.target_unit` is `None` or omitted → blocking subprocess
+  driven on the script's exit code ALONE, with no baseline inspect and no
+  fresh-PID verify, because there is no unit to inspect (task 2632 /
+  esc-2585-1). Done means the script exited 0. Every done write for such a
+  deploy, the crash, human-resolution and gate resumes included, records
+  kind `deterministic-deploy-unverified`; the rule's home is
+  `orchestrator/src/orchestrator/deterministic_runner.py::_deploy_done_kind`.
 
 **Runner stamps** (written by `DeterministicRunner`, never
 author-supplied): `before_done_ran_at`, `before_done_verified_at`,
 `gate_escalated_at`, `gate_escalated_preconditions` (pure gates only), and
-`done_provenance` (stamped for all four
+`done_provenance` (stamped for all five
 `deterministic-*` kinds — see the requirement table in §2 for
 per-kind semantics; `deterministic-milestone` is stamped on both the
 first-pass check and the post-escalation re-check described in §6).
