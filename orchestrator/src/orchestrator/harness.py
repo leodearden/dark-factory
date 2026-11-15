@@ -18146,10 +18146,12 @@ class Harness:
             task_id, escalation_id, reason,
         )
 
-    async def _complete_held_pure_gate(self, task_id: str, row: dict, escalation) -> bool:
-        """Run a resolved held pure gate now; False leaves the caller to re-pend it.
+    async def _run_held_pure_gate_inline(self, task_id: str, row: dict, escalation) -> bool:
+        """Run a resolved held pure gate's DeterministicRunner inline.
 
-        Any exception falls back to the re-pend, so the worst case is the old
+        True means the runner owned this resolution's outcome (closed it,
+        re-held it, or asked again), so the caller must not re-pend; False
+        leaves the caller to re-pend it. Any exception falls back to the re-pend, so the worst case is the old
         wait for a dispatch slot (task 3638).
         """
         try:
@@ -18230,7 +18232,8 @@ class Harness:
         decides about the flip — see :meth:`_fold_granted_files`.
 
         A held deterministic pure gate that passes every gate below is run
-        inline instead of re-pended — see :meth:`_complete_held_pure_gate`.
+        inline, which closes or re-holds it, instead of being re-pended — see
+        :meth:`_run_held_pure_gate_inline`.
 
         TOCTOU note: these are separate MCP round-trips with no atomic
         compare-and-set, so the window cannot be closed — only narrowed. It is
@@ -18449,7 +18452,7 @@ class Harness:
             )
             return
 
-        if await self._complete_held_pure_gate(task_id, _late, escalation):
+        if await self._run_held_pure_gate_inline(task_id, _late, escalation):
             return
 
         try:

@@ -981,7 +981,7 @@ action); task goes `blocked` until resolved.
 |---|---|---|---|
 | present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
 | present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask (incompatible with `human_curator_gate`) |
-| absent | `true` | escalate born-at-L2 immediately; `done` on `resume` (immediately, unless it still waits on a dependency or milestone); re-fires instead if resumed behind a new dependency, external dependency or milestone | **pure gate** |
+| absent | `true` | escalate born-at-L2 immediately; `done` on `resume` (immediately, unless it waits on a dependency, milestone or `deferred_watch`, or carries any `external_deps` or delivered-check dependency — see `docs/deterministic-runner.md` §"Resuming a pure gate"); re-fires instead if resumed behind a new dependency, external dependency or milestone | **pure gate** |
 | absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
 
 **Validation (enforced at `submit_task`):** `task_kind='deterministic'`

@@ -2687,9 +2687,9 @@ def create_server(
         only the escalation record. The orchestrator harness applies the
         ``target_status`` values above. Table B's consumers are listed in the
         ``escalation/src/escalation/action_effects.py`` module docstring. A
-        ``resume`` of a held deterministic pure gate is completed by the harness
-        instead of re-pended, see
-        ``orchestrator/src/orchestrator/harness.py::Harness._complete_held_pure_gate``.
+        ``resume`` of a held deterministic pure gate is run by the harness
+        inline, which closes it or re-holds it, instead of being re-pended, see
+        ``orchestrator/src/orchestrator/harness.py::Harness._run_held_pure_gate_inline``.
         """
         if terminate is not None:
             return {

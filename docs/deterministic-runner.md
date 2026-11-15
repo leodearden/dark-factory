@@ -394,7 +394,7 @@ it, so a resolved gate could sit `pending` for days.
 `orchestrator/src/orchestrator/harness.py::Harness._cascade_unblock_member`
 runs its usual gates first (infra-hold, status, claimant liveness, the
 re-block guard, the corroborating read), then hands the row to
-`Harness._complete_held_pure_gate`, which runs this same runner through
+`Harness._run_held_pure_gate_inline`, which runs this same runner through
 `orchestrator/src/orchestrator/pure_gate_resolution.py`: the same proof
 ladder, the same re-hold check, and the runner makes every status write.
 It falls back to the re-pend whenever dispatch would still make the gate
