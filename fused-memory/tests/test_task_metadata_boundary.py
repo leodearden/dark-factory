@@ -1075,7 +1075,8 @@ class TestLegacyMalformedSliceStaysWritable:
     ``milestone`` that predates the enforce gate (esc-4528-2,
     plans/metadata-modules-migration-run.md §5). A write is responsible only for
     the keys it changes, so echoing the stored bad slice back verbatim, which
-    every read-modify-write caller does, is not a write of bad data.
+    every read-modify-write caller does, is not a write of bad data. A change
+    of JSON type is a change, so 86400 -> 86400.0 or 1 -> true is enforced.
     """
 
     _LEGACY = {'milestone': True, 'files': []}
@@ -1201,6 +1202,45 @@ class TestLegacyMalformedSliceStaysWritable:
         task = await backend.get_task(task_id, project_root=project_root)
         assert 'milestone' not in task['metadata']
         assert task['metadata']['files'] == self._FILES
+
+    @pytest.mark.parametrize(
+        ('seed_secs', 'retyped_secs', 'mode'),
+        [
+            pytest.param(86400, 86400.0, 'merge', id='merge-int-to-float'),
+            pytest.param(1, True, 'merge', id='merge-int-to-bool'),
+            pytest.param(86400, 86400.0, 'replace', id='replace-int-to-float'),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_json_type_change_in_the_delta_is_still_rejected(
+        self, make_backend, tmp_path, seed_secs, retyped_secs, mode,
+    ):
+        """(f) Python == calls 86400 and 86400.0 equal; the strict field does not."""
+        project_root = str(tmp_path / 'retype')
+        backend = await make_backend(enforce=True)
+        dto = await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps(
+                {'recurrence': {'key': 'daily', 'interval_secs': seed_secs}}
+            ),
+        )
+        retyped = {'key': 'daily', 'interval_secs': retyped_secs}
+        if mode == 'replace':
+            stored = (await backend.get_task(dto['id'], project_root=project_root))['metadata']
+            payload = {**stored, 'recurrence': {**stored['recurrence'], **retyped}}
+        else:
+            payload = {'recurrence': retyped}
+
+        with pytest.raises(ValidationError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps(payload), metadata_mode=mode,
+            )
+
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        interval_secs = task['metadata']['recurrence']['interval_secs']
+        assert interval_secs == seed_secs
+        assert type(interval_secs) is int
 
 
 class TestFollowupItemsAtWriteBoundary:
