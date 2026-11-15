@@ -967,11 +967,7 @@ class TestWorktreeLifecycle:
         assert 'task/orig-task ' not in branches  # exact-match exclusion
 
         # New worktree is registered with git
-        rc, listing, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert str(new_path.resolve()) in listing
+        assert str(new_path.resolve()) in registered_worktree_paths(git_ops.project_root)
 
     async def test_rename_worktree_unregistered_path_raises(
         self, git_ops: GitOps,
@@ -7396,9 +7392,7 @@ async def _drop_admin_entry(git_ops: GitOps, worktree: Path) -> None:
     rc, admin_dir, err = await _run(['git', 'rev-parse', '--absolute-git-dir'], cwd=worktree)
     assert rc == 0, err
     shutil.rmtree(admin_dir.strip())
-    rc, listing, err = await _run(['git', 'worktree', 'list', '--porcelain'], cwd=git_ops.project_root)
-    assert rc == 0, err
-    assert f'worktree {worktree}' not in listing.splitlines()
+    assert str(worktree.resolve()) not in registered_worktree_paths(git_ops.project_root)
 
 
 async def _branches_matching(git_ops: GitOps, pattern: str) -> str:
@@ -7762,11 +7756,7 @@ class TestOrphanWorktreeHelpers:
         assert outcome.dest is not None
         assert not other.path.exists()
         assert outcome.branch is None
-        rc, listing, err = await _run(
-            ['git', 'worktree', 'list', '--porcelain'], cwd=git_ops.project_root,
-        )
-        assert rc == 0, err
-        assert f'worktree {outcome.dest}' in listing.splitlines()
+        assert str(outcome.dest.resolve()) in registered_worktree_paths(git_ops.project_root)
 
     async def test_quarantine_unregistered_dir_leaves_a_branch_checked_out_elsewhere(
         self, git_ops: GitOps, tmp_path: Path,
@@ -8389,18 +8379,9 @@ class TestPersistentMergeWorktree:
         assert warm_path.exists()
 
         # Path is a registered git worktree
-        rc, out, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0
-        registered_paths = [
-            line[len('worktree '):].strip()
-            for line in out.splitlines()
-            if line.startswith('worktree ')
-        ]
-        assert str(warm_path) in registered_paths, (
-            f'_merge-verify not in registered worktrees: {registered_paths}'
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(warm_path.resolve()) in registered, (
+            f'_merge-verify not in registered worktrees: {registered}'
         )
 
         # HEAD of warm worktree == merge_commit
@@ -8572,17 +8553,16 @@ class TestPersistentMergeWorktree:
         # lane's .git pointer names — registration is gone while the on-disk
         # tree survives, exactly the interrupted-teardown on-disk shape.
         shutil.rmtree(lane_admin_dir(merge_wt))
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(merge_wt.resolve()) not in registered, (
+            f'shape-1 leak must be unregistered once its admin dir is gone (setup check): {registered}'
+        )
 
         await git_ops.cleanup_merge_worktree(merge_wt)
 
         # The on-disk tree is gone...
         assert not merge_wt.exists(), (
             'shape-1 leak tree must be removed by crash-safe cleanup'
-        )
-        # ...absent from git worktree list...
-        registered = registered_worktree_paths(git_ops.project_root)
-        assert str(merge_wt.resolve()) not in registered, (
-            f'shape-1 leak must be gone from git worktree list: {registered}'
         )
         # ...and NO _merge-* directory OR sibling .lock orphan survives under
         # worktree_base (task 2924's strict no-leak glob).
@@ -8797,18 +8777,9 @@ class TestPersistentOfflineDeepWorktree:
         assert warm_path.exists()
 
         # Path is a registered git worktree
-        rc, out, _ = await _run(
-            ['git', 'worktree', 'list', '--porcelain'],
-            cwd=git_ops.project_root,
-        )
-        assert rc == 0
-        registered_paths = [
-            line[len('worktree '):].strip()
-            for line in out.splitlines()
-            if line.startswith('worktree ')
-        ]
-        assert str(warm_path) in registered_paths, (
-            f'_offline-deep not in registered worktrees: {registered_paths}'
+        registered = registered_worktree_paths(git_ops.project_root)
+        assert str(warm_path.resolve()) in registered, (
+            f'_offline-deep not in registered worktrees: {registered}'
         )
 
         # HEAD of warm worktree == merge_commit
