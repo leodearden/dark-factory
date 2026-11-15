@@ -9,16 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from pydantic import ValidationError
 
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.startup_steps import (
     EntryFailure,
     EntryFailures,
+    StartupFailureStreak,
     StartupJournal,
     StartupStep,
     StepOutcome,
@@ -43,8 +46,28 @@ def event_store(tmp_path: Path) -> EventStore:
 
 
 @pytest.fixture
-def journal() -> StartupJournal:
-    return StartupJournal()
+def journal_path(tmp_path: Path) -> Path:
+    return tmp_path / 'startup_failures.json'
+
+
+@pytest.fixture
+def journal(journal_path: Path) -> StartupJournal:
+    return StartupJournal.load(journal_path)
+
+
+_LONG_AGO = datetime(2026, 11, 1, tzinfo=UTC)
+
+
+def _seed_streak(
+    path: Path, step: str, consecutive: int, *,
+    exception_type: str = 'RuntimeError', message: str = 'earlier',
+) -> StartupFailureStreak:
+    streak = StartupFailureStreak(
+        step=step, exception_type=exception_type, message=message,
+        consecutive=consecutive, first_seen=_LONG_AGO, last_seen=_LONG_AGO,
+    )
+    path.write_text(streak.model_dump_json())
+    return streak
 
 
 async def _run(
@@ -342,3 +365,153 @@ class TestFilingIsBestEffort:
         with pytest.raises(RuntimeError) as raised:
             await _run(StartupStep('1b', _raiser(exc), fatal=True), journal, event_store, queue)
         assert raised.value is exc
+
+
+def _warnings_naming(caplog: pytest.LogCaptureFixture, fragment: str) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records
+        if r.name == LOGGER_NAME and r.levelno == logging.WARNING and fragment in r.getMessage()
+    ]
+
+
+class TestStartupJournalLoad:
+    def test_missing_file_inherits_nothing(self, journal_path) -> None:
+        assert StartupJournal.load(journal_path).inherited is None
+
+    def test_a_recorded_streak_is_inherited_by_the_next_start(self, journal_path) -> None:
+        recorded = StartupJournal.load(journal_path).record_failure('2e', 'SystemExit', 'boom')
+
+        inherited = StartupJournal.load(journal_path).inherited
+
+        assert inherited is not None
+        assert inherited.step == '2e'
+        assert inherited.exception_type == 'SystemExit'
+        assert inherited.message == 'boom'
+        assert inherited.consecutive == 1
+        assert inherited.first_seen == recorded.first_seen
+        assert inherited.last_seen == recorded.last_seen
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'not json {',
+            '{"step": "2e", "exception_type": "E", "message": "m", "consecutive": 0, '
+            '"first_seen": "2026-11-01T00:00:00Z", "last_seen": "2026-11-01T00:00:00Z"}',
+        ],
+        ids=['non-json', 'invalid-streak'],
+    )
+    def test_a_corrupt_file_inherits_nothing_and_warns_naming_the_path(
+        self, journal_path, content, caplog,
+    ) -> None:
+        journal_path.write_text(content)
+
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            loaded = StartupJournal.load(journal_path)
+
+        assert loaded.inherited is None
+        assert len(_warnings_naming(caplog, str(journal_path))) == 1
+
+
+class TestRecordFailure:
+    def test_a_first_failure_starts_a_streak_of_one(self, journal) -> None:
+        streak = journal.record_failure('2e', 'SystemExit', 'boom')
+
+        assert streak.consecutive == 1
+        assert streak.first_seen == streak.last_seen
+
+    def test_the_same_step_extends_the_inherited_streak(self, journal_path) -> None:
+        _seed_streak(journal_path, '2e', 2)
+
+        streak = StartupJournal.load(journal_path).record_failure('2e', 'SystemExit', 'boom')
+
+        assert streak.consecutive == 3
+        assert streak.first_seen == _LONG_AGO
+        assert streak.last_seen > _LONG_AGO
+        assert streak.exception_type == 'SystemExit'
+        assert streak.message == 'boom'
+
+    def test_a_different_step_resets_the_streak(self, journal_path) -> None:
+        _seed_streak(journal_path, '2e', 2)
+
+        streak = StartupJournal.load(journal_path).record_failure('2c', 'RuntimeError', 'x')
+
+        assert streak.step == '2c'
+        assert streak.consecutive == 1
+
+    def test_recording_twice_in_one_start_counts_the_start_once(self, journal_path) -> None:
+        _seed_streak(journal_path, '2e', 1)
+        journal = StartupJournal.load(journal_path)
+
+        first = journal.record_failure('2e', 'SystemExit', 'boom')
+        second = journal.record_failure('2e', 'SystemExit', 'boom')
+
+        assert first.consecutive == second.consecutive == 2
+        assert StartupJournal.load(journal_path).inherited == second
+
+    def test_an_unwritable_journal_warns_and_still_returns_the_streak(
+        self, tmp_path, caplog,
+    ) -> None:
+        blocker = tmp_path / 'a-regular-file'
+        blocker.write_text('')
+        journal = StartupJournal(blocker / 'startup_failures.json')
+
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            streak = journal.record_failure('2e', 'SystemExit', 'boom')
+
+        assert streak.consecutive == 1
+        assert _warnings_naming(caplog, str(blocker / 'startup_failures.json'))
+
+
+class TestCrashSite:
+    def test_a_fresh_journal_crashes_before_the_first_step(self, journal) -> None:
+        assert journal.crash_site == 'before-first-step'
+
+    def test_a_step_in_flight_is_the_crash_site(self, journal) -> None:
+        journal.record_in_flight('2c', datetime.now(UTC))
+
+        assert journal.crash_site == '2c'
+
+    def test_between_steps_the_site_follows_the_last_returned_step(self, journal) -> None:
+        journal.record_in_flight('2c', datetime.now(UTC))
+        journal.record_returned('2c')
+
+        assert journal.in_flight is None
+        assert journal.crash_site == 'after-2c'
+
+    def test_record_crash_journals_the_crash_site(self, journal, journal_path) -> None:
+        journal.record_in_flight('2d', datetime.now(UTC))
+
+        site = journal.record_crash(SystemExit('x'))
+
+        assert site == '2d'
+        inherited = StartupJournal.load(journal_path).inherited
+        assert inherited is not None
+        assert (inherited.step, inherited.exception_type, inherited.message) == (
+            '2d', 'SystemExit', 'x',
+        )
+
+
+class TestClear:
+    def test_clear_removes_the_journal(self, journal, journal_path) -> None:
+        journal.record_failure('2e', 'SystemExit', 'boom')
+
+        journal.clear()
+
+        assert not journal_path.exists()
+
+    def test_clear_without_a_journal_is_a_no_op(self, journal, journal_path) -> None:
+        journal.clear()
+
+        assert not journal_path.exists()
+
+
+class TestStartupFailureStreakInvariants:
+    @pytest.mark.parametrize(
+        ('step', 'consecutive'), [('2e', 0), ('Diff 7', 1)], ids=['zero-count', 'non-slug-step'],
+    )
+    def test_refuses_an_invalid_streak(self, step: str, consecutive: int) -> None:
+        with pytest.raises(ValidationError):
+            StartupFailureStreak(
+                step=step, exception_type='E', message='m', consecutive=consecutive,
+                first_seen=_LONG_AGO, last_seen=_LONG_AGO,
+            )
