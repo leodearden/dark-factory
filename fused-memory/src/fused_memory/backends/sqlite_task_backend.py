@@ -2984,7 +2984,7 @@ class SqliteTaskBackend:
 
         In enforce-mode, a second, authoritative pass decides whether to
         raise. ``incoming_keys`` — the top-level keys the CURRENT write
-        actually supplied (``None`` means "unknown/whole-blob", e.g.
+        changes (``None`` means "unknown/whole-blob", e.g.
         ``add_task``, which enforces every field) — scopes the raise to
         findings the write is responsible for (task 2401): a warning whose
         ``field`` is in ``incoming_keys``, or the whole-blob sentinel
@@ -3394,11 +3394,8 @@ class SqliteTaskBackend:
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
                 )
-            passed_through: frozenset[str] = frozenset()
             if metadata_mode == 'replace' and parsed_metadata is not None:
-                passed_through = _assert_passthrough_only_keys(
-                    row['metadata'], parsed_metadata, task_id,
-                )
+                _assert_passthrough_only_keys(row['metadata'], parsed_metadata, task_id)
 
             # Build the SET clause from non-None structured fields plus
             # the prompt-derived details path.
@@ -3493,28 +3490,19 @@ class SqliteTaskBackend:
                 # enforce-mode's raise propagates out of this `async with
                 # self._write_unit(...)`, rolling back the UPDATE below.
                 #
-                # incoming_keys (task 2401, fix b): the top-level keys of THIS
-                # write's own payload — not the post-merge blob — so enforce
-                # mode only blocks on findings this write is responsible for.
-                # An untouched legacy field (e.g. a pre-existing
-                # done_provenance missing the now-required kind) is tolerated
-                # rather than permanently blocking every future patch to the
-                # row. Under replace, a done_provenance or defect key the
-                # passthrough check admitted is not this write's responsibility
-                # either: the caller had to send it back unchanged. The same holds for an
-                # admitted echo of metadata.deferral, which
-                # _assert_deferral_unchanged checks against the stored row in
-                # every mode.
-                deferral_echoed = _assert_deferral_unchanged(
+                # incoming_keys (tasks 2401 and 5281): only the payload keys
+                # whose value this write CHANGES, so enforce mode blocks on
+                # findings this write is responsible for. An untouched or
+                # echoed-verbatim legacy field (e.g. a JSON-bool milestone,
+                # esc-4528-2) is tolerated rather than locking the row.
+                _assert_deferral_unchanged(
                     row['metadata'], parsed_metadata, new_metadata, task_id,
                 )
-                incoming_keys = set(incoming_metadata)
-                incoming_keys.difference_update(passed_through)
-                if deferral_echoed:
-                    incoming_keys.discard('deferral')
                 await self._validate_metadata_on_write(
                     new_metadata, project_root=project_root, tag=tag, task_id=tid,
-                    incoming_keys=incoming_keys,
+                    incoming_keys=_keys_changed_by_write(
+                        row['metadata'], incoming_metadata, new_metadata,
+                    ),
                 )
                 set_columns.append('metadata = ?')
                 set_values.append(new_metadata)
@@ -4484,9 +4472,31 @@ def _refuse_passthrough_only_keys(incoming: dict, task_id: str) -> None:
             raise refusal(task_id)
 
 
+def _keys_changed_by_write(
+    stored_raw: str | None, incoming: dict, new_blob_json: str,
+) -> set[str]:
+    """The keys *incoming* carried whose value in the written blob differs from the stored row's.
+
+    Identity is JSON value equality, as in :func:`_assert_passthrough_only_keys`.
+    A stored blob that is absent or not a JSON object makes every carried key
+    changed. Only carried keys count, so the result is never wider than the
+    payload: a key a merge normalised but the caller did not send is not this
+    write's responsibility.
+    """
+    try:
+        stored = json.loads(stored_raw) if stored_raw is not None else None
+    except (TypeError, ValueError):
+        stored = None
+    new = json.loads(new_blob_json)
+    if not isinstance(stored, dict) or not isinstance(new, dict):
+        return set(incoming)
+    absent = object()
+    return {key for key in incoming if stored.get(key, absent) != new.get(key, absent)}
+
+
 def _assert_passthrough_only_keys(
     stored_raw: str | None, incoming: dict, task_id: str,
-) -> frozenset[str]:
+) -> None:
     """Refuse a whole-blob replace that would move any :data:`_PASSTHROUGH_ONLY_METADATA_KEYS` key.
 
     The contract: update_task may never ADD, CHANGE or REMOVE one of those
@@ -4518,10 +4528,6 @@ def _assert_passthrough_only_keys(
       one omitting them is the corrupt-row repair replace mode exists for.
     * Otherwise each key's presence and value must match the stored row
       exactly: an ADD, a CHANGE and a drop-by-omission are all refused.
-
-    Returns the keys the payload carried and that were admitted as a
-    passthrough — the licence update_task needs to exclude them from
-    enforce-mode responsibility.
     """
     try:
         stored = json.loads(stored_raw) if stored_raw is not None else None
@@ -4529,12 +4535,11 @@ def _assert_passthrough_only_keys(
         stored = None
     if not isinstance(stored, dict):
         _refuse_passthrough_only_keys(incoming, task_id)
-        return frozenset()
+        return
     absent = object()
     for key, refusal in _PASSTHROUGH_ONLY_METADATA_KEYS.items():
         if stored.get(key, absent) != incoming.get(key, absent):
             raise refusal(task_id)
-    return frozenset(key for key in _PASSTHROUGH_ONLY_METADATA_KEYS if key in incoming)
 
 
 _STATUS_CLEARABLE_KEYS: frozenset[str] = frozenset({'deferral'}) | GATE_EPISODE_STAMP_KEYS
@@ -4563,7 +4568,7 @@ def _deferral_slice(blob_json: str | None, absent: object) -> object:
 
 def _assert_deferral_unchanged(
     stored_raw: str | None, incoming: dict | None, new_blob_json: str, task_id: str,
-) -> bool:
+) -> None:
     """Refuse a metadata write that would add, alter or remove ``metadata.deferral``.
 
     The status choke point is the record's only writer
@@ -4575,8 +4580,6 @@ def _assert_deferral_unchanged(
     omits it would otherwise remove it). Identity is JSON value equality, as in
     :func:`_assert_passthrough_only_keys`; a corrupt or absent stored
     blob holds no record.
-
-    Returns True when the payload carried the key as an admitted echo.
     """
     absent = object()
     stored = _deferral_slice(stored_raw, absent)
@@ -4585,7 +4588,6 @@ def _assert_deferral_unchanged(
         raise DeferralWriteAuthorityError(task_id)
     if _deferral_slice(new_blob_json, absent) != stored:
         raise DeferralWriteAuthorityError(task_id)
-    return carried is not absent
 
 
 def _merge_metadata(
