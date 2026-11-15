@@ -2,8 +2,8 @@
 reclaim action for .worktrees-orphaned/ parkings (task 2980).
 
 Drives the wrapper via subprocess with the RECLAIM_ORPHANED_WT_CMD test seam
-pointed at a fake recorder executable (records its argv to a JSON state file)
-and REPO pointed at a tmp dir -- mirrors test_flag_marker_sweep_wrapper.py,
+pointed at a `scripts/tests/conftest.py::fake_recorder` executable and REPO
+pointed at a tmp dir -- mirrors test_flag_marker_sweep_wrapper.py,
 SIMPLIFIED: the reclaim script is stdlib-only so the wrapper runs
 `python3 <script> --repo "$REPO"` directly (no `uv run`, no `.env` sourcing /
 service-env exports that the flag-marker wrapper needs for its fused_memory
@@ -11,7 +11,6 @@ imports).
 """
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 from pathlib import Path
@@ -20,64 +19,20 @@ WRAPPER = Path(__file__).parent.parent / "reclaim-orphaned-worktrees.sh"
 
 
 # ---------------------------------------------------------------------------
-# Fake reclaim-command recorder (marker-file + configurable exit code)
-# ---------------------------------------------------------------------------
-
-_FAKE_RECORDER_SRC = '''#!/usr/bin/env python3
-"""Fake reclaim-invocation recorder for testing
-reclaim-orphaned-worktrees.sh. Records argv[1:] (the reclaim script path and
-its flags) into a JSON state file at $FAKE_RECLAIM_STATE, then exits with
-$FAKE_RECLAIM_EXIT_CODE (default 0)."""
-import json
-import os
-import sys
-
-state_path = os.environ["FAKE_RECLAIM_STATE"]
-with open(state_path) as f:
-    state = json.load(f)
-state.setdefault("calls", []).append(sys.argv[1:])
-with open(state_path, "w") as f:
-    json.dump(state, f)
-
-sys.exit(int(os.environ.get("FAKE_RECLAIM_EXIT_CODE", "0")))
-'''
-
-
-def _fake_recorder(tmp_path):
-    """Write an executable fake reclaim-command recorder into <tmp_path>/bin/
-    and its backing JSON state file. Returns (bin_dir, state_path)."""
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    fake = bin_dir / "fake-reclaim-recorder"
-    fake.write_text(_FAKE_RECORDER_SRC)
-    fake.chmod(0o755)
-
-    state_path = tmp_path / "reclaim_state.json"
-    state_path.write_text(json.dumps({"calls": []}))
-    return bin_dir, state_path
-
-
-def _recorded_calls(state_path):
-    return json.loads(state_path.read_text())["calls"]
-
-
-# ---------------------------------------------------------------------------
 # Script driver
 # ---------------------------------------------------------------------------
 
-def _run_wrapper(tmp_path, *, exit_code=0, extra_env=None):
+def _run_wrapper(fake_recorder, tmp_path, *, exit_code=0, extra_env=None):
     """Run reclaim-orphaned-worktrees.sh with RECLAIM_ORPHANED_WT_CMD pointed at
-    the fake recorder and REPO pointed at a tmp dir."""
-    bin_dir, state_path = _fake_recorder(tmp_path)
+    a fake recorder and REPO pointed at a tmp dir."""
+    recorder = fake_recorder("fake-reclaim-recorder", exit_code=exit_code)
 
     fake_repo = tmp_path / "fake-repo"
     fake_repo.mkdir(exist_ok=True)
 
     env = dict(os.environ)
-    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    env["PATH"] = f"{recorder.bin_dir}{os.pathsep}{env['PATH']}"
     env["RECLAIM_ORPHANED_WT_CMD"] = "fake-reclaim-recorder"
-    env["FAKE_RECLAIM_STATE"] = str(state_path)
-    env["FAKE_RECLAIM_EXIT_CODE"] = str(exit_code)
     env["REPO"] = str(fake_repo)
     if extra_env:
         env.update(extra_env)
@@ -86,7 +41,7 @@ def _run_wrapper(tmp_path, *, exit_code=0, extra_env=None):
         ["bash", str(WRAPPER)],
         env=env, capture_output=True, text=True, timeout=30,
     )
-    return result, state_path, fake_repo
+    return result, recorder, fake_repo
 
 
 # ---------------------------------------------------------------------------
@@ -100,14 +55,14 @@ def test_wrapper_is_executable():
     )
 
 
-def test_wrapper_invokes_reclaim_script_with_repo(tmp_path):
-    result, state_path, fake_repo = _run_wrapper(tmp_path)
+def test_wrapper_invokes_reclaim_script_with_repo(fake_recorder, tmp_path):
+    result, recorder, fake_repo = _run_wrapper(fake_recorder, tmp_path)
 
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
 
-    calls = _recorded_calls(state_path)
+    calls = recorder.calls()
     assert len(calls) == 1, f"calls={calls!r}"
     argv = calls[0]
     assert any(
@@ -119,8 +74,8 @@ def test_wrapper_invokes_reclaim_script_with_repo(tmp_path):
     )
 
 
-def test_wrapper_propagates_nonzero_exit(tmp_path):
-    result, _state_path, _fake_repo = _run_wrapper(tmp_path, exit_code=9)
+def test_wrapper_propagates_nonzero_exit(fake_recorder, tmp_path):
+    result, _recorder, _fake_repo = _run_wrapper(fake_recorder, tmp_path, exit_code=9)
 
     assert result.returncode != 0, (
         f"Expected a non-zero wrapper exit when the reclaim command fails; "
