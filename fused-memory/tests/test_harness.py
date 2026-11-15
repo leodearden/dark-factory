@@ -21220,6 +21220,24 @@ def _promote_like_orphan_reaper(queue, esc_id) -> str:
     return promoted_id
 
 
+def _convert_like_info_l0_router(queue, esc_id, converted_task_id='9001') -> None:
+    """Simulate `orchestrator/escalation_router.py::_close_converted`.
+
+    orchestrator is not a fused-memory dependency, so the close it makes once
+    the curator converts an info L0 to a task is reproduced here.
+    """
+    from escalation.disposition import ConvertViaCurator
+
+    queue.resolve(
+        esc_id,
+        'converted — closed by the info-L0 router (orphan-reaper, exit orphan): '
+        f'converted:{converted_task_id}',
+        dismiss=True,
+        resolved_by='info-l0-router',
+        resolution_class=ConvertViaCurator.resolution_class,
+    )
+
+
 def test_file_finding_task_escalation_lands_a_record_on_the_real_task(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
 ):
@@ -21643,6 +21661,102 @@ def test_resolved_prior_record_does_not_suppress_a_refile(
     assert [e.id for e in EscalationQueue(queue_dir).get_pending()] == [second]
 
 
+def test_router_converted_prior_record_holds_back_the_refile(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Dedupe matrix (e): a router conversion is not an adjudication.
+
+    The curator already turned the finding into a task, so refiling it every
+    cycle would only mint one L0 plus one curator ticket per cycle (task 7894).
+    """
+    from escalation.queue import EscalationQueue
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first
+    _convert_like_info_l0_router(EscalationQueue(queue_dir), first)
+
+    second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+
+    assert second is None, f'a freshly converted finding must not refile, got {second!r}'
+    assert _routed_records(queue_dir) == []
+
+
+def test_conversion_of_one_finding_does_not_hold_back_a_distinct_one(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """The conversion hold is keyed on the finding fingerprint, not on the task."""
+    from escalation.queue import EscalationQueue
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first
+    _convert_like_info_l0_router(EscalationQueue(queue_dir), first)
+
+    distinct = harness._file_finding_task_escalation(
+        'test-project', 'run-2', _orch_finding_b(), 4,
+    )
+
+    assert distinct and distinct != first, (
+        f'a conversion of another finding must not hold this one back, got {distinct!r}'
+    )
+
+
+def test_conversion_older_than_the_recurrence_window_does_not_hold_back_the_refile(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Past the window a persisting finding refiles, and the curator judges it again."""
+    from escalation.queue import EscalationQueue
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first
+    _convert_like_info_l0_router(EscalationQueue(queue_dir), first)
+    archived = next(queue_dir.rglob(f'{first}.json'))
+    data = json.loads(archived.read_text())
+    data['resolved_at'] = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+    archived.write_text(json.dumps(data, indent=2))
+
+    second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+
+    assert second and second != first, (
+        f'a conversion older than the recurrence window must not hold back a refile, '
+        f'got {second!r}'
+    )
+
+
+def test_router_promotion_is_not_a_conversion(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """A promoted and then adjudicated finding refiles: promotion never stamps 'converted'.
+
+    The dismissed L0 carries no 'converted' class, and the promoted L1's
+    suffixed detail carries no readable fingerprint, so neither holds it back.
+    """
+    from escalation.queue import EscalationQueue
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    queue = EscalationQueue(queue_dir)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first
+    promoted = _promote_like_orphan_reaper(queue, first)
+    queue.resolve(promoted, 'adjudicated by operator')
+
+    after = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
+
+    assert after and after not in (first, promoted), (
+        f'an adjudicated promotion must let the refile through, got {after!r}'
+    )
+
+
 def test_dead_orchestrator_files_nothing_and_creates_no_queue_directory(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
 ):
@@ -21938,6 +22052,53 @@ async def test_two_persistent_findings_on_one_task_in_one_cycle_yield_two_record
         and e.summary.startswith('Persistently unresolved after remediation')
     }
     assert routed_fps == recon_fps, (routed_fps, recon_fps)
+
+
+@pytest.mark.asyncio
+async def test_converted_routed_record_is_not_refiled_by_the_next_cycle(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """The task-7894 loop, end to end: no refile once the router has converted.
+
+    After the port-8103 watcher closes the recon-queue twin, `_escalate` is
+    quiet for the recurrence window but the routed filer is called again on
+    every cycle. Without the conversion hold each such cycle files one more
+    routed L0, which the info-L0 router hands to the curator again.
+    """
+    from escalation.queue import EscalationQueue
+
+    from fused_memory.reconciliation.harness import (
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+    )
+
+    harness, recon_queue = _make_queued_test_harness(
+        journal, event_buffer, mock_memory_service, tmp_path, subdir='recon-esc',
+    )
+    orch_queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    _wire_remediation_tree(harness, ['4458'])
+    finding = _orch_finding()
+
+    await _drive_cycle(
+        harness, journal, event_buffer, finding,
+        n_seed=max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2),
+    )
+
+    routed = _routed_records(orch_queue_dir)
+    twins = [e for e in recon_queue.get_pending() if e.category == 'recon_integrity_issue']
+    assert len(routed) == 1, [e.id for e in routed]
+    assert len(twins) == 1, [e.id for e in twins]
+
+    recon_queue.resolve(
+        twins[0].id, 'closed by the watcher', dismiss=True, resolved_by='escalation-watcher',
+    )
+    _convert_like_info_l0_router(EscalationQueue(orch_queue_dir), routed[0].id)
+
+    await _drive_cycle(harness, journal, event_buffer, finding, n_seed=0)
+
+    assert _routed_records(orch_queue_dir) == [], (
+        'the next cycle refiled a finding the info-L0 router had just converted: '
+        f'{[e.id for e in _routed_records(orch_queue_dir)]}'
+    )
 
 
 # The four tests below are the VOLUME-PARITY guarantee made executable. Each
