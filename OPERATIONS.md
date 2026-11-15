@@ -1665,6 +1665,18 @@ then clear the bench. Other skew reasons name the failing step (uv, disk, the
 gate root, the remote config): fix it on the host and let the reprobe re-admit
 it.
 
+**Low-battery guard on leo-laptop** (task 9051):
+`scripts/deploy/install_laptop_battery_guard.sh` installs a root
+`laptop-battery-guard.timer` (add `--check` to only print the current reading),
+then runs the service once and requires `Result=success`, so a broken drop-in
+fails the install rather than the guard. Every 30 s it reads BAT* and ignores AC online, which stays 1 on a weak USB-C
+supply. At Discharging <= 10 % it stops `df-verify-*.scope` and powers off; at
+11–15 % it warns in the journal and on the desktop. Tune with `systemctl edit`
+drop-ins (`BATTERY_GUARD_FLOOR_PERCENT`, `BATTERY_GUARD_WARN_MARGIN_PERCENT`,
+or the timer's `OnUnitActiveSec`), which the installer never overwrites. After
+an unexpected poweroff, `journalctl -b -1 -u laptop-battery-guard.service`
+shows the reading that triggered it.
+
 `scripts/orchestrator-watchdog.py --report` shows a `CODE-SHA` column per
 unit: the commit each unit's verify wire path was imported from, read from
 its fleet heartbeat. Units at different commits build different gate
