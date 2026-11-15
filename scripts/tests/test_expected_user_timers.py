@@ -7,6 +7,9 @@ from pathlib import Path
 
 import pytest
 from expected_user_timers import ARMED_ELSEWHERE, EXPECTED_TIMERS, ExpectedTimer, InstallerArg
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 CHECKOUT = Path(__file__).resolve().parents[2]
 GIT_TIMEOUT_SECS = 60

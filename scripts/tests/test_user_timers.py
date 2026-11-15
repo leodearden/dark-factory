@@ -13,6 +13,9 @@ from pathlib import Path
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 from expected_user_timers import EXPECTED_TIMERS
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'user_timers.py'
 CLI_TIMEOUT_SECS = cli_timeout_from_env('USER_TIMERS_CLI_TIMEOUT_SECS')
