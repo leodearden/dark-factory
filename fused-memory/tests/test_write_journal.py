@@ -23,8 +23,10 @@ from fused_memory.services.write_journal import (
     OPERATOR_TELEMETRY_QUERY,
     Mem0IntentStatus,
     Mem0RetryBacklog,
+    Mem0WriteMethod,
     WriteJournal,
     decode_mem0_intent_metadata,
+    decode_mem0_intent_write_method,
 )
 from fused_memory.utils.canonical_labels import Referent
 from fused_memory.utils.referent_verification import ReferentFinding
@@ -889,6 +891,19 @@ class TestMem0IntentRetrySchedule:
         assert row['next_attempt_at'] is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize('method', list(Mem0WriteMethod))
+    async def test_an_intent_records_the_method_it_writes_through(self, journal, method):
+        row = await mem0_intent_row(
+            journal, await seed_mem0_intent(journal, write_method=method)
+        )
+        assert row['write_method'] == method.value
+        assert decode_mem0_intent_write_method(row) is method
+
+    def test_an_unknown_write_method_does_not_decode(self):
+        with pytest.raises(ValueError, match='bogus'):
+            decode_mem0_intent_write_method({'write_method': 'bogus'})
+
+    @pytest.mark.asyncio
     async def test_migration_adds_columns_to_a_pre_change_database(self, tmp_path):
         data_dir = tmp_path / 'wj'
         data_dir.mkdir()
@@ -905,6 +920,9 @@ class TestMem0IntentRetrySchedule:
             row = await mem0_intent_row(j, 'old-1')
             assert row['attempts'] == 0
             assert row['next_attempt_at'] is None
+            # Every pre-change intent was journaled by add_memory: add_system_record
+            # journaled none before task 7401.
+            assert row['write_method'] == 'add'
             assert await j.schedule_mem0_retry(
                 'old-1', reason='rate_limited', retry_at=datetime.now(UTC)
             )
