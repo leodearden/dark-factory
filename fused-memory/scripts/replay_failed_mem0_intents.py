@@ -221,7 +221,10 @@ async def replay(
 
 def _not_replayable(intent: Mapping[str, Any]) -> ReplayOutcome | None:
     """A row add_memory did not journal: replaying it through add_memory would change its write."""
-    method = decode_mem0_intent_write_method(intent)
+    try:
+        method = decode_mem0_intent_write_method(intent)
+    except ValueError as exc:
+        return _outcome(intent, ReplayResult.NOT_REPLAYABLE, f'unknown write_method: {exc}')
     if method is Mem0WriteMethod.ADD:
         return None
     return _outcome(

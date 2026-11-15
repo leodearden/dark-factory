@@ -19,7 +19,11 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from _fm_helpers import load_script_module
-from _mem0_intent_fixtures import mem0_intent_row, seed_mem0_intent
+from _mem0_intent_fixtures import (
+    mem0_intent_row,
+    seed_mem0_intent,
+    set_mem0_intent_write_method,
+)
 from _store_mutation_preflight_contract import (
     deny,
     fail_closed_records,
@@ -430,6 +434,30 @@ class TestASystemRecordIsNeverReplayedThroughAddMemory:
         )
 
         assert outcome.outcome is ReplayResult.NOT_REPLAYABLE
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_write_method_is_reported_without_aborting_the_run(
+        self, journal
+    ):
+        ordinary = await _seed(journal, created_at=_T)
+        unknown = await _seed(journal, created_at=_T + timedelta(seconds=1))
+        set_mem0_intent_write_method(journal, unknown, 'bogus')
+        add_memory = _AddMemory()
+
+        outcomes = _by_id(
+            await _script.replay(
+                journal,
+                add_memory,
+                selection=Selection(intent_ids=(ordinary, unknown)),
+                apply=True,
+            )
+        )
+
+        assert outcomes[ordinary].outcome is ReplayResult.LANDED
+        assert outcomes[unknown].outcome is ReplayResult.NOT_REPLAYABLE
+        assert 'bogus' in outcomes[unknown].detail
+        assert len(add_memory.calls) == 1
+        assert (await mem0_intent_row(journal, unknown))['status'] == 'failed'
 
 
 def _tool_result(
