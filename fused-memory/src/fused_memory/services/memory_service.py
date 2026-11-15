@@ -7998,6 +7998,10 @@ class MemoryService:
 
         ``relevance_score`` is the ordinal ``_rrf_score(store_rank)``, not a
         similarity.
+
+        ``entities`` names each hit's endpoints, source first, from one
+        ``get_node_names_by_uuids`` read over the survivors; that read is not
+        caught, so its failure fails this leg.
         """
         edges = await self.graphiti.search(
             query=query,

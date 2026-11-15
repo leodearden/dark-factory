@@ -62,10 +62,14 @@ class _RoutingGraph:
         return [read for read in self.reads if needle in read[0]]
 
 
+def _backend_over(mock_config, make_backend, graph):
+    return make_backend(mock_config, graph_access=FakeGraphAccess({GROUP: graph}))
+
+
 def _service_over(mock_config, make_backend, graph: _RoutingGraph):
     from fused_memory.services.memory_service import MemoryService
 
-    backend = make_backend(mock_config, graph_access=FakeGraphAccess({GROUP: graph}))
+    backend = _backend_over(mock_config, make_backend, graph)
     svc = MemoryService(mock_config)
     svc.graphiti = backend
     return svc, backend
@@ -78,12 +82,11 @@ class TestValidEdgesCarryTheirDates:
     async def test_rows_carry_their_stored_dates(
         self, mock_config, make_backend, make_graph_mock,
     ):
-        backend = make_backend(mock_config)
         graph = make_graph_mock(ro_rows=[
             ['e1', 'Task 42 blocks Task 43', 'BLOCKS', '2026-11-01T09:00:00+00:00', None],
             ['e2', 'Task 42 uses Redis', 'USES', None, None],
         ])
-        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend = _backend_over(mock_config, make_backend, graph)
 
         edges = await backend.get_valid_edges_for_node('n', group_id=GROUP)
 
@@ -102,9 +105,8 @@ class TestValidEdgesCarryTheirDates:
     async def test_cypher_returns_the_validity_window(
         self, mock_config, make_backend, make_graph_mock,
     ):
-        backend = make_backend(mock_config)
         graph = make_graph_mock(ro_rows=[])
-        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend = _backend_over(mock_config, make_backend, graph)
 
         await backend.get_valid_edges_for_node('n', group_id=GROUP)
 
@@ -151,9 +153,8 @@ class TestNodeNamesByUuids:
     async def test_names_each_distinct_node_in_one_read(
         self, mock_config, make_backend, make_graph_mock,
     ):
-        backend = make_backend(mock_config)
         graph = make_graph_mock(ro_rows=[['n-42', 'Task 42'], ['n-r', 'Redis']])
-        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend = _backend_over(mock_config, make_backend, graph)
 
         names = await backend.get_node_names_by_uuids(['n-42', 'n-r', 'n-42'], group_id=GROUP)
 
@@ -169,9 +170,8 @@ class TestNodeNamesByUuids:
     async def test_unnamed_and_absent_nodes_are_left_out(
         self, mock_config, make_backend, make_graph_mock,
     ):
-        backend = make_backend(mock_config)
         graph = make_graph_mock(ro_rows=[['n-42', 'Task 42'], ['n-null', None], ['n-empty', '']])
-        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend = _backend_over(mock_config, make_backend, graph)
 
         names = await backend.get_node_names_by_uuids(
             ['n-42', 'n-null', 'n-empty', 'n-absent'], group_id=GROUP,
@@ -183,9 +183,8 @@ class TestNodeNamesByUuids:
     async def test_empty_input_issues_no_read(
         self, mock_config, make_backend, make_graph_mock,
     ):
-        backend = make_backend(mock_config)
         graph = make_graph_mock(ro_rows=[['n-42', 'Task 42']])
-        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend = _backend_over(mock_config, make_backend, graph)
 
         assert await backend.get_node_names_by_uuids([], group_id=GROUP) == {}
         graph.ro_query.assert_not_awaited()
@@ -215,13 +214,28 @@ def _name_graph() -> _RoutingGraph:
     ])
 
 
-async def _graph_search(mock_config, make_backend, graph: _RoutingGraph, hits: list):
+async def _graph_search_results(mock_config, make_backend, graph: _RoutingGraph, hits: list):
     svc, backend = _service_over(mock_config, make_backend, graph)
     backend.client.search = AsyncMock(return_value=hits)
-    results = await svc.search(
+    return await svc.search(
         'task 42', project_id=GROUP, stores=['graphiti'], anchor_topics=False,
     )
+
+
+async def _graph_search(mock_config, make_backend, graph: _RoutingGraph, hits: list):
+    results = await _graph_search_results(mock_config, make_backend, graph, hits)
     return {result.id: result.entities for result in results}
+
+
+class _NameReadDown(ConnectionError):
+    pass
+
+
+def _failing_name_graph() -> _RoutingGraph:
+    def refuse(_params: dict[str, Any]) -> Rows:
+        raise _NameReadDown('node-name read refused')
+
+    return _RoutingGraph([(_NAME_READ, refuse)])
 
 
 class TestSearchHitsNameTheirEndpoints:
@@ -292,3 +306,34 @@ class TestSearchHitsNameTheirEndpoints:
         assert entities == {'e1': ['Task 42', 'Redis']}
         (name_read,) = graph.reads_matching(_NAME_READ)
         assert not {'n-old-a', 'n-old-b'} & set(name_read[1]['uuids'])
+
+    @pytest.mark.asyncio
+    async def test_a_hit_without_endpoint_uuids_issues_no_name_read(
+        self, mock_config, make_backend,
+    ):
+        graph = _name_graph()
+
+        entities = await _graph_search(
+            mock_config, make_backend, graph, [_entity_edge('e1', '', '')],
+        )
+
+        assert entities == {'e1': []}
+        assert graph.reads_matching(_NAME_READ) == []
+
+    @pytest.mark.asyncio
+    async def test_a_failing_name_read_fails_the_graph_leg(self, mock_config, make_backend):
+        from fused_memory.services.memory_service import SearchResults
+
+        graph = _failing_name_graph()
+
+        results = await _graph_search_results(
+            mock_config, make_backend, graph, [_entity_edge('e1', 'n-42', 'n-r')],
+        )
+
+        assert isinstance(results, SearchResults)
+        assert list(results) == []
+        assert results.degraded is True
+        assert results.failed_stores == ['graphiti']
+        (diagnostic,) = results.failure_diagnostics
+        assert diagnostic['reason'] == 'exception'
+        assert diagnostic['error_type'] == '_NameReadDown'
