@@ -1212,8 +1212,8 @@ def _escalate_barren_streak(
     that is running."""
     counters = night.counters
     summary = (
-        f'legibility trickle has produced nothing for {max_barren_runs} '
-        f'consecutive runs'
+        f'legibility trickle has produced nothing for '
+        f'{night.consecutive_barren_runs} consecutive runs'
     )
     detail = (
         f'project={cfg.project_id} date={target_date.isoformat()} '
@@ -1223,7 +1223,7 @@ def _escalate_barren_streak(
         f'budget_skipped={counters.budget_skipped} '
         f'last_productive_at={trickle_state.isoformat_or_none(night.last_productive_at)}. '
         f'Real confusion signal reached the sampling/budget stage on each of '
-        f'those runs and NOTHING was digested -- {max_barren_runs} '
+        f'those runs and NOTHING was digested -- {max_barren_runs} or more '
         f'consecutive means persistent config state, not a run of bad luck. '
         f'Remedy: {trickle_state.barren_remedy(counters)}. '
         f'Probe on demand with: check_trickle_progress.py '
