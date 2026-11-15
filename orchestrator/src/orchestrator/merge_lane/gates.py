@@ -2673,6 +2673,12 @@ async def _resolve_renamed_plan_path(
     return candidates
 
 
+def _with_git_stderr(err: Exception) -> str:
+    """*err* as text, carrying git's own message when *err* has a ``stderr``."""
+    stderr = (getattr(err, 'stderr', None) or '').strip()
+    return f'{err}: {stderr[:200]}' if stderr else str(err)
+
+
 async def _check_plan_files_touched_in_branch(
     plan_files: list[str],
     base_sha: str,
@@ -2726,7 +2732,7 @@ async def _check_plan_files_touched_in_branch(
         )
         return PlanFilesTouchedResult(
             not_touched=[entry for entry in plan_files if entry],
-            touched_set_error=str(touched_err),
+            touched_set_error=_with_git_stderr(touched_err),
         )
     touched_set = set(touched)
 

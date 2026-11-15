@@ -156,7 +156,7 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_reported_landing,
 )
 from orchestrator.merge_lane.train_selection import select_train_members
-from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.types import OutcomeKind, QueuedBranch
 from orchestrator.merge_lane.unmeasured_delivery import (
     UnmeasuredDelivery,
     diagnose_unmeasured_branch,
@@ -12348,7 +12348,7 @@ class TaskWorkflow:
         self, finding: UnmeasuredDelivery | None, *, merge_phase: bool,
     ) -> WorkflowOutcome | None:
         """Block with *finding*'s remedy; None when there is no finding."""
-        from orchestrator.merge_lane.worker import OutcomeKind, _emit_merge_attempt
+        from orchestrator.merge_lane.worker import _emit_merge_attempt
 
         if finding is None:
             return None
@@ -12363,7 +12363,7 @@ class TaskWorkflow:
         )
 
     async def _work_on_sibling_ref(
-        self, check: PlanFilesTouchedResult, branch: str,
+        self, check: PlanFilesTouchedResult, branch: str, head: str,
     ) -> UnmeasuredDelivery | None:
         """*check*'s work on a sibling ref no executed re-cut ruling superseded.
 
@@ -12375,7 +12375,7 @@ class TaskWorkflow:
             self.task.get('metadata') or {}, log_context='sibling-ref diagnosis',
         )
         return await find_work_on_sibling_ref(
-            check, self.git_ops, branch=branch, task_id=self.task_id,
+            check, self.git_ops, branch=branch, head=head, task_id=self.task_id,
             superseded=recut_supersession({'id': self.task_id, 'metadata': fresh}),
         )
 
@@ -12408,7 +12408,6 @@ class TaskWorkflow:
         from orchestrator.merge_lane.tip_relation import AttachAction, resolve_attach_action
         from orchestrator.merge_lane.worker import (
             MergeRequest,
-            OutcomeKind,
             _emit_merge_attempt,
         )
 
@@ -12424,9 +12423,11 @@ class TaskWorkflow:
         # subset check.  The gate's re-check is the source of truth for
         # pass/fail.  A range that never measured the task's own work proves
         # nothing: its in-branch causes are diagnosed before the already-landed
-        # carve-out, work on a sibling ref only after that carve-out declines,
-        # and both before narrowing; a ref superseded by a re-cut ruling is
-        # never offered.  See merge_lane/unmeasured_delivery.py and
+        # carve-out, work on a sibling ref only after that carve-out declines
+        # and only for a HEAD with no own commits, and both before narrowing;
+        # a ref superseded by a re-cut ruling is never offered.  The re-check
+        # after narrowing repeats only the in-branch diagnosis: narrowing
+        # creates no ref.  See merge_lane/unmeasured_delivery.py and
         # recut_ruling.py::RecutSupersession.
         if (
             self._task_files
@@ -12612,7 +12613,9 @@ class TaskWorkflow:
                             suggested_action='verify_landing_and_close',
                         )
                     unmeasured = await self._block_if_delivery_unmeasured(
-                        await self._work_on_sibling_ref(check, canonical_branch),
+                        await self._work_on_sibling_ref(
+                            check, canonical_branch, branch_head.strip(),
+                        ),
                         merge_phase=merge_phase,
                     )
                     if unmeasured is not None:
@@ -12642,8 +12645,6 @@ class TaskWorkflow:
                                 unmeasured = await self._block_if_delivery_unmeasured(
                                     await diagnose_unmeasured_branch(
                                         check, self.worktree, task_id=self.task_id,
-                                    ) or await self._work_on_sibling_ref(
-                                        check, canonical_branch,
                                     ),
                                     merge_phase=merge_phase,
                                 )

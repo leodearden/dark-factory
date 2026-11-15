@@ -27,7 +27,7 @@ _SHORT_SHA = 10
 
 class UnmeasuredCause(StrEnum):
     TOUCHED_SET_UNREADABLE = 'touched_set_unreadable'
-    MID_REBASE = 'mid_rebase'
+    OPERATION_IN_PROGRESS = 'operation_in_progress'
     UNCOMMITTED_EDITS = 'uncommitted_edits'
     WORK_ON_SIBLING_REF = 'work_on_sibling_ref'
 
@@ -43,10 +43,10 @@ _POLICY: Mapping[UnmeasuredCause, _CausePolicy] = {
         'retry_merge',
         'Re-run the merge so the gate can read the branch history again.',
     ),
-    UnmeasuredCause.MID_REBASE: _CausePolicy(
-        'finish_or_abort_rebase',
-        'Finish (git rebase --continue) or abort (git rebase --abort) the '
-        'rebase in the worktree, then re-submit.',
+    UnmeasuredCause.OPERATION_IN_PROGRESS: _CausePolicy(
+        'finish_or_abort_operation',
+        'Finish (git <operation> --continue) or abort (git <operation> --abort) '
+        'the stopped operation in the worktree, then re-submit.',
     ),
     UnmeasuredCause.UNCOMMITTED_EDITS: _CausePolicy(
         'commit_worktree_edits',
@@ -95,7 +95,6 @@ class RebaseProgress:
     total: int | None
     head_name: str | None
     onto: str | None
-    unmerged: tuple[str, ...]
 
     def describe(self) -> str:
         at = (
@@ -105,9 +104,16 @@ class RebaseProgress:
         )
         return (
             f'a rebase of {self.head_name or "a detached HEAD"} onto '
-            f'{self.onto or "an unknown commit"} stopped at {at}; '
-            f'unmerged paths: {", ".join(self.unmerged) or "none"}'
+            f'{self.onto or "an unknown commit"} stopped at {at}'
         )
+
+
+_REBASE_STATE_DIRS = ('rebase-merge', 'rebase-apply')
+_STOPPED_PICK_HEADS: Mapping[str, str] = {
+    'MERGE_HEAD': 'merge',
+    'CHERRY_PICK_HEAD': 'cherry-pick',
+    'REVERT_HEAD': 'revert',
+}
 
 
 @dataclass(frozen=True)
@@ -120,8 +126,7 @@ class _SiblingRef:
 @dataclass(frozen=True)
 class _SiblingWork:
     sibling: _SiblingRef
-    files: tuple[str, ...]
-    covered: int
+    covered: frozenset[str]
 
 
 async def diagnose_unmeasured_branch(
@@ -145,21 +150,24 @@ async def find_work_on_sibling_ref(
     git_ops: GitOps,
     *,
     branch: str,
+    head: str,
     task_id: str,
     superseded: RecutSupersession | None,
 ) -> UnmeasuredDelivery | None:
     """The sibling ref ``<branch>-*`` holding *check*'s not-touched work, or None.
 
-    *branch* is the prefixed task branch (``task/<id>``). A ref *superseded*
-    by an executed re-cut ruling is never offered. Never raises: a probe
-    failure returns None, so the caller reports the not-touched verdict
-    unchanged.
+    *branch* is the prefixed task branch (``task/<id>``) and *head* the commit
+    the gate measured. Only a *head* with no commit beyond main is explained
+    by a sibling: a *head* carrying work of its own was measured, so its
+    verdict stands. A ref *superseded* by an executed re-cut ruling is never
+    offered. Never raises: a probe failure returns None, so the caller
+    reports the not-touched verdict unchanged.
     """
     if not check.not_touched:
         return None
     return await _never_raising(
         'sibling-ref probe', task_id,
-        _sibling_ref_finding(tuple(check.not_touched), git_ops, branch, superseded),
+        _sibling_ref_finding(tuple(check.not_touched), git_ops, branch, head, superseded),
     )
 
 
@@ -188,29 +196,28 @@ async def _diagnose_branch(
             UnmeasuredCause.TOUCHED_SET_UNREADABLE, not_touched, (),
             f'the branch history could not be read: {check.touched_set_error}',
         )
-    rebase = await _rebase_in_progress(worktree)
-    if rebase is not None:
+    stopped = await _operation_in_progress(worktree)
+    if stopped is not None:
         return UnmeasuredDelivery(
-            UnmeasuredCause.MID_REBASE, not_touched, (), rebase.describe(),
+            UnmeasuredCause.OPERATION_IN_PROGRESS, not_touched, (), stopped,
         )
-    dirty = await _uncommitted_paths(not_touched, worktree)
-    if _covered(not_touched, dirty):
+    covered = _covered(not_touched, await _uncommitted_paths(not_touched, worktree))
+    if covered:
         return _partial_finding(
-            UnmeasuredCause.UNCOMMITTED_EDITS, not_touched, dirty,
+            UnmeasuredCause.UNCOMMITTED_EDITS, not_touched, covered,
             f'staged, unstaged or untracked changes in the worktree {worktree}',
         )
     return None
 
 
-def _covered(not_touched: tuple[str, ...], paths: Iterable[str]) -> set[str]:
+def _covered(not_touched: tuple[str, ...], paths: Iterable[str]) -> frozenset[str]:
     undelivered = declaration_coverage(not_touched, paths).undelivered
-    return set(not_touched) - set(undelivered)
+    return frozenset(not_touched) - frozenset(undelivered)
 
 
 def _partial_finding(
-    cause: UnmeasuredCause, not_touched: tuple[str, ...], paths: Iterable[str], detail: str,
+    cause: UnmeasuredCause, not_touched: tuple[str, ...], covered: frozenset[str], detail: str,
 ) -> UnmeasuredDelivery:
-    covered = _covered(not_touched, paths)
     return UnmeasuredDelivery(
         cause,
         tuple(entry for entry in not_touched if entry in covered),
@@ -227,46 +234,60 @@ def _lines(result: GitResult) -> list[str]:
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
-async def _rebase_in_progress(worktree: Path) -> RebaseProgress | None:
+async def _operation_in_progress(worktree: Path) -> str | None:
+    """Describes the rebase, merge, cherry-pick or revert git stopped in *worktree*, if any."""
+    names = (*_REBASE_STATE_DIRS, *_STOPPED_PICK_HEADS)
     paths = await _git(
-        worktree, 'rev-parse', '--git-path', 'rebase-merge', '--git-path', 'rebase-apply',
+        worktree, 'rev-parse', *(arg for name in names for arg in ('--git-path', name)),
     )
     if not paths.ok:
         logger.warning(
             'unmeasured-delivery: git rev-parse --git-path failed in %s '
-            '(returncode=%d, stderr=%r); no rebase state read',
+            '(returncode=%d, stderr=%r); no in-progress operation read',
             worktree, paths.returncode, paths.stderr,
         )
         return None
-    for state_dir in (worktree / line for line in _lines(paths)):
-        if state_dir.is_dir():
-            unmerged = await _git(worktree, 'diff', '--name-only', '--diff-filter=U')
-            return _read_rebase_progress(state_dir, tuple(_lines(unmerged)))
+    state = dict(zip(names, (worktree / line for line in _lines(paths)), strict=True))
+    stopped = _describe_stopped(state)
+    if stopped is None:
+        return None
+    unmerged = await _git(worktree, 'diff', '--name-only', '--diff-filter=U')
+    return f'{stopped}; unmerged paths: {", ".join(_lines(unmerged)) or "none"}'
+
+
+def _describe_stopped(state: Mapping[str, Path]) -> str | None:
+    for name in _REBASE_STATE_DIRS:
+        if state[name].is_dir():
+            return _read_rebase_progress(state[name]).describe()
+    for name, operation in _STOPPED_PICK_HEADS.items():
+        if state[name].is_file():
+            picked = _read_state(state[name])
+            commit = picked.split()[0][:_SHORT_SHA] if picked else 'an unknown commit'
+            return f'a {operation} of {commit} stopped'
     return None
 
 
-def _read_rebase_progress(state_dir: Path, unmerged: tuple[str, ...]) -> RebaseProgress:
+def _read_rebase_progress(state_dir: Path) -> RebaseProgress:
     merge_backend = state_dir.name == 'rebase-merge'
-    head_name = _state_field(state_dir, 'head-name')
-    onto = _state_field(state_dir, 'onto')
+    head_name = _read_state(state_dir / 'head-name')
+    onto = _read_state(state_dir / 'onto')
     return RebaseProgress(
-        step=_int_field(state_dir, 'msgnum' if merge_backend else 'next'),
-        total=_int_field(state_dir, 'end' if merge_backend else 'last'),
+        step=_int_state(state_dir / ('msgnum' if merge_backend else 'next')),
+        total=_int_state(state_dir / ('end' if merge_backend else 'last')),
         head_name=head_name.removeprefix('refs/heads/') if head_name else None,
         onto=onto[:_SHORT_SHA] if onto else None,
-        unmerged=unmerged,
     )
 
 
-def _state_field(state_dir: Path, name: str) -> str | None:
+def _read_state(path: Path) -> str | None:
     try:
-        return (state_dir / name).read_text().strip() or None
+        return path.read_text().strip() or None
     except OSError:
         return None
 
 
-def _int_field(state_dir: Path, name: str) -> int | None:
-    text = _state_field(state_dir, name)
+def _int_state(path: Path) -> int | None:
+    text = _read_state(path)
     return int(text) if text and text.isdigit() else None
 
 
@@ -295,17 +316,20 @@ async def _sibling_ref_finding(
     not_touched: tuple[str, ...],
     git_ops: GitOps,
     branch: str,
+    head: str,
     superseded: RecutSupersession | None,
 ) -> UnmeasuredDelivery | None:
-    works = []
-    for sibling in await _sibling_refs(git_ops, branch, superseded):
-        files = tuple(await _sibling_own_work(sibling, git_ops))
-        works.append(_SiblingWork(sibling, files, len(_covered(not_touched, files))))
-    best = max(works, key=lambda work: work.covered, default=None)
+    if await git_ops.commits_beyond_main(head) != 0:
+        return None
+    works = [
+        _SiblingWork(sibling, _covered(not_touched, await _sibling_own_work(sibling, git_ops)))
+        for sibling in await _sibling_refs(git_ops, branch, superseded)
+    ]
+    best = max(works, key=lambda work: len(work.covered), default=None)
     if best is None or not best.covered:
         return None
     return _partial_finding(
-        UnmeasuredCause.WORK_ON_SIBLING_REF, not_touched, best.files,
+        UnmeasuredCause.WORK_ON_SIBLING_REF, not_touched, best.covered,
         f'the declared work is on {best.sibling.ref} at '
         f'{best.sibling.tip[:_SHORT_SHA]}, not on the branch being merged',
     )

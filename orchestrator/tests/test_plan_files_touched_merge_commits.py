@@ -12,16 +12,15 @@ already landed on main sits below the task's own commit.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from _git_fixtures import RepoSeed, seed_repo
 from _merged_in_branch import git
+from _unmeasured_delivery_scenes import commit, seeded_repo
+from _workflow_helpers import _make_git_ops
 
 from orchestrator.branch_base import own_work_base
-from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.gates import _check_plan_files_touched_in_branch
 
@@ -37,41 +36,20 @@ class Range:
     head: str
 
 
-def _git_ops(repo: Path) -> GitOps:
-    config = GitConfig(
-        main_branch='main', branch_prefix='task/', remote='origin',
-        worktree_dir='.worktrees', push_after_advance=False,
-    )
-    return GitOps(config, repo)
-
-
-def _seed(tmp_path: Path, files: Mapping[str, str]) -> Path:
-    return seed_repo(
-        tmp_path / 'repo', RepoSeed(files=tuple(files.items()), message='base'),
-    )
-
-
-def _commit(cwd: Path, files: Mapping[str, str], message: str) -> None:
-    for rel, content in files.items():
-        (cwd / rel).write_text(content)
-    git(cwd, 'add', *files)
-    git(cwd, 'commit', '-q', '-m', message)
-
-
 async def _own_work_range(repo: Path, worktree: Path) -> Range:
     return Range(
-        git_ops=_git_ops(repo),
+        git_ops=_make_git_ops(repo),
         base=await own_work_base(worktree, 'main', stored_base=None),
         head=git(worktree, 'rev-parse', 'HEAD'),
     )
 
 
 async def _back_merge_with_evil_hunk(tmp_path: Path) -> Range:
-    repo = _seed(tmp_path, {'a.py': 'a = 1\n', 'm.py': 'm = 1\n', 'evil.py': 'e = 1\n'})
+    repo = seeded_repo(tmp_path, {'a.py': 'a = 1\n', 'm.py': 'm = 1\n', 'evil.py': 'e = 1\n'})
     worktree = tmp_path / 'wt'
     git(repo, 'worktree', 'add', '-q', '-b', 'task/50', str(worktree))
-    _commit(worktree, {'a.py': 'a = 2\n'}, 'task work')
-    _commit(repo, {'m.py': 'm = 2\n'}, 'main advances')
+    commit(worktree, {'a.py': 'a = 2\n'}, 'task work')
+    commit(repo, {'m.py': 'm = 2\n'}, 'main advances')
     git(worktree, 'merge', '-q', '--no-commit', '--no-ff', 'main')
     (worktree / 'evil.py').write_text('e = 2\n')
     git(worktree, 'add', 'evil.py')
@@ -80,14 +58,14 @@ async def _back_merge_with_evil_hunk(tmp_path: Path) -> Range:
 
 
 async def _mixed_stack(tmp_path: Path) -> Range:
-    repo = _seed(tmp_path, {'README.md': '# r\n'})
+    repo = seeded_repo(tmp_path, {'README.md': '# r\n'})
     foreign = tmp_path / 'wt40'
     git(repo, 'worktree', 'add', '-q', '-b', 'task/40', str(foreign))
-    _commit(foreign, {'foreign.py': 'f = 1\n'}, 'foreign workstream')
+    commit(foreign, {'foreign.py': 'f = 1\n'}, 'foreign workstream')
     git(repo, 'merge', '-q', '--no-ff', '--no-edit', 'task/40')
     worktree = tmp_path / 'wt50'
     git(repo, 'worktree', 'add', '-q', '-b', 'task/50', str(worktree), 'task/40')
-    _commit(worktree, {'own.py': 'o = 1\n'}, 'own work')
+    commit(worktree, {'own.py': 'o = 1\n'}, 'own work')
     return await _own_work_range(repo, worktree)
 
 
@@ -127,9 +105,9 @@ class TestUnreadableRange:
     async def test_the_touched_set_returns_the_error_instead_of_an_empty_list(
         self, tmp_path: Path,
     ) -> None:
-        repo = _seed(tmp_path, {'README.md': '# r\n'})
+        repo = seeded_repo(tmp_path, {'README.md': '# r\n'})
 
-        files, err = await _git_ops(repo).get_files_touched_in_branch(
+        files, err = await _make_git_ops(repo).get_files_touched_in_branch(
             _UNRESOLVABLE, 'HEAD',
         )
 
@@ -139,14 +117,15 @@ class TestUnreadableRange:
     async def test_the_gate_marks_every_declared_entry_unmeasured(
         self, tmp_path: Path,
     ) -> None:
-        repo = _seed(tmp_path, {'README.md': '# r\n'})
+        repo = seeded_repo(tmp_path, {'README.md': '# r\n'})
         head = git(repo, 'rev-parse', 'HEAD')
 
         check = await _check_plan_files_touched_in_branch(
-            ['README.md', '', 'gone.py', 'pkg'], _UNRESOLVABLE, head, _git_ops(repo),
+            ['README.md', '', 'gone.py', 'pkg'], _UNRESOLVABLE, head, _make_git_ops(repo),
         )
 
         assert check.touched_set_error is not None
+        assert f'fatal: Invalid revision range {_UNRESOLVABLE}..' in check.touched_set_error
         assert check.not_touched == ['README.md', 'gone.py', 'pkg']
         assert check.missing_from_tree == []
 

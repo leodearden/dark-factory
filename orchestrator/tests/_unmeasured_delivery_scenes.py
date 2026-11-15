@@ -1,8 +1,9 @@
 """Real-git worktree states in which a not-touched verdict measured nothing.
 
 Each builder seeds a repo under *tmp_path* with ``main`` checked out and a
-task worktree beside it: a rebase stopped on a conflict (tasks 5030/5033),
-declared files edited but not committed (task 5027), a task branch re-cut
+task worktree beside it: a rebase stopped on a conflict (tasks 5030/5033), a
+back-merge or cherry-pick of main stopped on a conflict, declared files
+edited but not committed (task 5027), a task branch re-cut
 empty while its work lives on a sibling ref (task 3560), and a task whose
 work already landed while a stale pre-rebase copy lingers on a sibling ref.
 """
@@ -56,6 +57,20 @@ def stopped_rebase(tmp_path: Path, branch: str) -> Scene:
     commit(repo, {'x.py': 'x = 3\n'}, 'main edits x')
     stopped = subprocess.run(
         ['git', 'rebase', 'main'], cwd=worktree, capture_output=True, text=True,
+    )
+    assert stopped.returncode != 0, stopped.stdout
+    return Scene(repo=repo, worktree=worktree, creation_sha=creation_sha)
+
+
+def stopped_on_main_conflict(tmp_path: Path, operation: str) -> Scene:
+    """task/50 and main both edit x.py, so ``git <operation> main`` in the worktree stops on the conflict."""
+    repo = seeded_repo(tmp_path, {'x.py': 'x = 1\n', 'y.py': 'y = 1\n'})
+    creation_sha = git(repo, 'rev-parse', 'HEAD')
+    worktree = add_worktree(repo, tmp_path / 'wt', 'task/50')
+    commit(worktree, {'x.py': 'x = 2\n'}, 'task edits x')
+    commit(repo, {'x.py': 'x = 3\n'}, 'main edits x')
+    stopped = subprocess.run(
+        ['git', operation, 'main'], cwd=worktree, capture_output=True, text=True,
     )
     assert stopped.returncode != 0, stopped.stdout
     return Scene(repo=repo, worktree=worktree, creation_sha=creation_sha)

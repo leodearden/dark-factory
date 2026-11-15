@@ -1122,11 +1122,12 @@ blocks the task when the pre-merge plan-files gate failed on a range that never
 measured the task's own work, as found by
 `merge_lane/unmeasured_delivery.py::diagnose_unmeasured_branch` (causes inside the
 worktree) or `merge_lane/unmeasured_delivery.py::find_work_on_sibling_ref` (work on
-a sibling ref). The reason starts `Plan-file delivery not measured`
-and names the cause and its remedy (`merge_lane/unmeasured_delivery.py::UnmeasuredCause`):
-an unreadable history (`retry_merge`), a stopped rebase (`finish_or_abort_rebase`),
-uncommitted declared edits (`commit_worktree_edits`), or the work on a sibling ref
-(`recover_work_from_sibling_ref`). The record's `suggested_action` carries the same
+a sibling ref, for a task branch with no commit of its own). The reason starts
+`Plan-file delivery not measured` and names the cause and its remedy
+(`merge_lane/unmeasured_delivery.py::UnmeasuredCause`): an unreadable history
+(`retry_merge`), a stopped rebase, merge, cherry-pick or revert
+(`finish_or_abort_operation`), uncommitted declared edits (`commit_worktree_edits`),
+or the work on a sibling ref (`recover_work_from_sibling_ref`). The record's `suggested_action` carries the same
 value. [Promote](#promote-to-l2) with `category="plan_delivery_unmeasured"` and the
 reason's remedy as option A. Never offer "restart the task" or "narrow the plan": nothing was
 measured, so neither is supported by evidence.
