@@ -76,10 +76,11 @@ exists, is covered too: the spawn is shielded, then its group is killed (task
 its group SIGKILLed, through a pidfd held from spawn
 (``shared/src/shared/proc_group.py::open_leader_pidfd``), which names the group
 itself and not its recyclable pgid number (task 6251). The accepted residual:
-(i) a leader that exits and is reaped before ``create_subprocess_exec``
-returns, since asyncio's child watcher can reap it inside the spawn's own pipe
-handshake, and (ii) kernels older than Linux 6.9 or without pidfd support. In
-both cases no signal is sent, since the pid may have been recycled
+(i) a leader that exits and is reaped before the spawn hands control back
+(``shared/src/shared/git_async.py::_spawn_session_leader``), since asyncio's
+child watcher can reap it while the shielded spawn is still in flight, and
+(ii) kernels older than Linux 6.9 or without pidfd support. In both cases no
+signal is sent, since the pid may have been recycled
 (``shared/src/shared/proc_group.py::sigkill_process_group``'s house trade-off).
 
 Each child leads a new session, so it has no controlling terminal: a git
@@ -104,7 +105,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from weakref import WeakKeyDictionary
 
-from shared.proc_group import open_leader_pidfd, sigkill_process_group
+from shared.proc_group import LeaderPidfd, open_leader_pidfd, sigkill_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +163,7 @@ def _semaphore_for_running_loop() -> asyncio.Semaphore:
 
 
 async def _kill_and_reap(
-    proc: asyncio.subprocess.Process, pgid: int, *, leader_pidfd: int | None = None,
+    proc: asyncio.subprocess.Process, pgid: int, *, leader_pidfd: LeaderPidfd | None = None,
 ) -> None:
     """Best-effort group kill + reap of an interrupted child. Never raises."""
     sigkill_process_group(proc, pgid, leader_pidfd=leader_pidfd)
@@ -283,7 +284,7 @@ async def _spawn_and_communicate(
 async def _communicate_or_kill(
     proc: asyncio.subprocess.Process,
     pgid: int,
-    leader_pidfd: int | None,
+    leader_pidfd: LeaderPidfd | None,
     cmd: Sequence[str],
     cwd: Path | str | None,
     input_text: str | None,

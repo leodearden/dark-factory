@@ -30,6 +30,7 @@ from typing import Any
 from unittest import mock
 
 import pytest
+from _pidfd_kernel import needs_group_pidfd_signals
 from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid, wait_pid_gone
 
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult, run_git
@@ -524,6 +525,7 @@ _EXITING_LEADER_SRC = (
 )
 
 
+@needs_group_pidfd_signals
 async def test_own_timeout_kills_a_helper_left_by_a_leader_that_already_exited(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

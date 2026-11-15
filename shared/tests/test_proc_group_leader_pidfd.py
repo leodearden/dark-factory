@@ -9,18 +9,22 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import logging
 import os
 import signal
 import sys
-import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
+from _pidfd_kernel import needs_group_pidfd_signals
+from df_pytest_isolation import wait_pid_gone
 
-from shared.pidfd import PIDFD_SIGNAL_PROCESS_GROUP, pidfd_open, pidfd_send_signal
 from shared.proc_group import (
+    LeaderPidfd,
     SigkillDispatch,
     open_leader_pidfd,
     pid_running,
@@ -30,27 +34,12 @@ from shared.proc_group import (
 pytestmark = pytest.mark.skipif(sys.platform != 'linux', reason='pidfds are Linux-only')
 
 
-def _kernel_signals_groups_through_pidfds() -> bool:
-    """Signal 0 to our own pidfd's group: EINVAL before Linux 6.9, success or ESRCH after."""
-    try:
-        fd = pidfd_open(os.getpid())
-    except OSError:
-        return False
-    try:
-        pidfd_send_signal(fd, 0, flags=PIDFD_SIGNAL_PROCESS_GROUP)
-    except ProcessLookupError:
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
-    return True
+@dataclass(frozen=True)
+class _ChildView:
+    """A child as :func:`open_leader_pidfd` sees it, for a pid no real Process handle names."""
 
-
-_needs_group_pidfd_signals = pytest.mark.skipif(
-    sys.platform != 'linux' or not _kernel_signals_groups_through_pidfds(),
-    reason='the kernel predates PIDFD_SIGNAL_PROCESS_GROUP (Linux 6.9)',
-)
+    pid: int
+    returncode: int | None
 
 
 @contextlib.asynccontextmanager
@@ -72,17 +61,7 @@ async def _session_leader(script: str) -> AsyncIterator[asyncio.subprocess.Proce
             await proc.wait()
 
 
-def _wait_not_running(pid: int, timeout: float = 5.0) -> bool:
-    """Poll until *pid* is gone or a zombie awaiting its subreaper; False at *timeout*."""
-    deadline = time.monotonic() + timeout
-    while pid_running(pid):
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
-    return True
-
-
-@_needs_group_pidfd_signals
+@needs_group_pidfd_signals
 async def test_a_held_leader_pidfd_sigkills_the_group_after_the_leader_is_reaped() -> None:
     helper = None
     try:
@@ -98,7 +77,7 @@ async def test_a_held_leader_pidfd_sigkills_the_group_after_the_leader_is_reaped
                 dispatch = sigkill_process_group(proc, pgid, leader_pidfd=fd)
 
             assert dispatch is SigkillDispatch.GROUP_KILLED
-            assert await asyncio.to_thread(_wait_not_running, helper), (
+            assert await asyncio.to_thread(wait_pid_gone, helper, timeout=5.0), (
                 f'helper pid {helper} survived a group SIGKILL through the pidfd of its reaped leader'
             )
     finally:
@@ -106,16 +85,35 @@ async def test_a_held_leader_pidfd_sigkills_the_group_after_the_leader_is_reaped
             os.kill(helper, signal.SIGKILL)
 
 
-@_needs_group_pidfd_signals
+@needs_group_pidfd_signals
 async def test_a_held_leader_pidfd_on_an_emptied_group_dispatches_nothing() -> None:
+    """The stand-in's returncode still reads None, as between the watcher's reap and
+    asyncio's exit callback, so only the pidfd stops a killpg of the freed number."""
     async with _session_leader('read _') as proc:
         pgid = proc.pid
         with open_leader_pidfd(proc) as fd:
             await proc.communicate(b'go\n')
+            kill = Mock()
+            not_yet_marked_reaped = cast(
+                asyncio.subprocess.Process,
+                SimpleNamespace(pid=proc.pid, returncode=None, kill=kill),
+            )
 
-            dispatch = sigkill_process_group(proc, pgid, leader_pidfd=fd)
+            dispatch = sigkill_process_group(not_yet_marked_reaped, pgid, leader_pidfd=fd)
 
     assert dispatch is SigkillDispatch.NOT_SIGNALLED
+    kill.assert_not_called()
+
+
+async def test_a_held_leader_pidfd_does_not_bypass_the_pgid_sanity_check() -> None:
+    async with _session_leader('read _') as proc:
+        with open_leader_pidfd(proc) as fd:
+            assert fd is not None
+
+            dispatch = sigkill_process_group(proc, os.getpgrp(), leader_pidfd=fd)
+
+        assert dispatch is SigkillDispatch.DIRECT_KILLED
+        assert await proc.wait() == -signal.SIGKILL
 
 
 async def test_a_leader_pidfd_the_kernel_cannot_signal_through_falls_back_to_killpg() -> None:
@@ -123,7 +121,7 @@ async def test_a_leader_pidfd_the_kernel_cannot_signal_through_falls_back_to_kil
     not_a_pidfd = os.open(os.devnull, os.O_RDONLY)
     try:
         async with _session_leader('read _') as proc:
-            dispatch = sigkill_process_group(proc, proc.pid, leader_pidfd=not_a_pidfd)
+            dispatch = sigkill_process_group(proc, proc.pid, leader_pidfd=LeaderPidfd(not_a_pidfd))
 
             assert dispatch is SigkillDispatch.GROUP_KILLED
             assert await proc.wait() == -signal.SIGKILL
@@ -160,10 +158,22 @@ async def test_no_pidfd_is_opened_for_an_already_reaped_leader() -> None:
 
 
 def test_no_pidfd_is_handed_out_for_a_pid_that_is_not_this_process_s_child() -> None:
-    stranger = cast(asyncio.subprocess.Process, SimpleNamespace(pid=os.getppid(), returncode=None))
-
-    with open_leader_pidfd(stranger) as fd:
+    with open_leader_pidfd(_ChildView(pid=os.getppid(), returncode=None)) as fd:
         assert fd is None
+
+
+async def test_a_pidfd_open_failure_leaves_the_same_debug_line_as_every_refusal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A reaped pid whose handle has not yet seen its returncode: pidfd_open answers ESRCH."""
+    async with _session_leader('exit 0') as proc:
+        await proc.wait()
+        caplog.set_level(logging.DEBUG, logger='shared.proc_group')
+
+        with open_leader_pidfd(_ChildView(pid=proc.pid, returncode=None)) as fd:
+            assert fd is None
+
+    assert f'open_leader_pidfd: no pidfd for pid {proc.pid} (' in caplog.text
 
 
 async def test_the_pidfd_is_closed_when_the_context_exits() -> None:

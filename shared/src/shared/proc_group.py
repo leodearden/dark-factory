@@ -78,7 +78,7 @@ import time
 from collections.abc import Iterable, Iterator
 from enum import Enum, auto
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, NewType, Protocol
 
 from shared.pidfd import P_PIDFD, PIDFD_SIGNAL_PROCESS_GROUP, pidfd_open, pidfd_send_signal
 
@@ -497,16 +497,32 @@ class SigkillDispatch(Enum):
     NOT_SIGNALLED = auto()
 
 
+#: A pidfd :func:`open_leader_pidfd` verified names this process's unreaped
+#: child, the leader of its own process group: the only fd
+#: :func:`sigkill_process_group` will send a group SIGKILL through.
+LeaderPidfd = NewType('LeaderPidfd', int)
+
+
+class SpawnedChild(Protocol):
+    """What :func:`open_leader_pidfd` reads of a child: its pid, and whether it is reaped."""
+
+    @property
+    def pid(self) -> int: ...
+
+    @property
+    def returncode(self) -> int | None: ...
+
+
 @contextlib.contextmanager
-def open_leader_pidfd(proc: asyncio.subprocess.Process) -> Iterator[int | None]:
+def open_leader_pidfd(proc: SpawnedChild) -> Iterator[LeaderPidfd | None]:
     """Hold a pidfd naming *proc*, this process's unreaped child, for the block.
 
     Yields None instead when *proc* is already reaped, when its pid now names
     a process that is not this process's child, when *proc* does not lead its
     own process group (a group send through its pidfd would reach nobody), or
     when the kernel lacks pidfds; a leader reaped before the caller regains
-    control from its spawn therefore yields None.  The pidfd is closed when
-    the block exits.
+    control from its spawn therefore yields None.  Each None leaves one debug
+    log line naming its cause.  The pidfd is closed when the block exits.
     """
     fd = _child_leader_pidfd(proc)
     try:
@@ -516,20 +532,23 @@ def open_leader_pidfd(proc: asyncio.subprocess.Process) -> Iterator[int | None]:
             os.close(fd)
 
 
-def _child_leader_pidfd(proc: asyncio.subprocess.Process) -> int | None:
+def _child_leader_pidfd(proc: SpawnedChild) -> LeaderPidfd | None:
     """A pidfd for *proc* once confirmed our unreaped child and the leader of its own group."""
     if proc.returncode is not None:
-        return None
+        return _no_leader_pidfd(proc.pid, f'already reaped, returncode {proc.returncode}')
     try:
         fd = pidfd_open(proc.pid)
-    except OSError:
-        return None
+    except OSError as exc:
+        return _no_leader_pidfd(proc.pid, f'pidfd_open: {type(exc).__name__}: {exc}')
     refusal = _leader_pidfd_refusal(fd, proc.pid)
     if refusal is not None:
-        logger.debug('open_leader_pidfd: no pidfd for pid %s (%s)', proc.pid, refusal)
         os.close(fd)
-        return None
-    return fd
+        return _no_leader_pidfd(proc.pid, refusal)
+    return LeaderPidfd(fd)
+
+
+def _no_leader_pidfd(pid: int, reason: str) -> None:
+    logger.debug('open_leader_pidfd: no pidfd for pid %s (%s)', pid, reason)
 
 
 def _leader_pidfd_refusal(fd: int, pid: int) -> str | None:
@@ -548,7 +567,7 @@ def _leader_pidfd_refusal(fd: int, pid: int) -> str | None:
     return None
 
 
-def _sigkill_group_through_pidfd(leader_pidfd: int, pgid: int) -> SigkillDispatch | None:
+def _sigkill_group_through_pidfd(leader_pidfd: LeaderPidfd, pgid: int) -> SigkillDispatch | None:
     """SIGKILL the group *leader_pidfd* names; None if this kernel cannot signal a group so."""
     try:
         pidfd_send_signal(leader_pidfd, signal.SIGKILL, flags=PIDFD_SIGNAL_PROCESS_GROUP)
@@ -568,7 +587,7 @@ def _sigkill_group_through_pidfd(leader_pidfd: int, pgid: int) -> SigkillDispatc
 
 
 def sigkill_process_group(
-    proc: asyncio.subprocess.Process, pgid: int, *, leader_pidfd: int | None = None
+    proc: asyncio.subprocess.Process, pgid: int, *, leader_pidfd: LeaderPidfd | None = None
 ) -> SigkillDispatch:
     """SIGKILL group *pgid* at once; signal-only, never raises, never reaps.
 
@@ -579,11 +598,12 @@ def sigkill_process_group(
     No SIGTERM grace, unlike :func:`terminate_process_group`: for a caller
     that wants the group dead now and reaps it itself.
 
-    A held *leader_pidfd*, from :func:`open_leader_pidfd`, is tried first and
-    reaches the group even after *proc* is reaped, because it names the
-    group itself rather than its recyclable number.  Only a kernel that cannot
-    signal a group through a pidfd (before Linux 6.9) falls back to the path
-    below.
+    A held *leader_pidfd*, from :func:`open_leader_pidfd`, is tried first,
+    once *pgid* passes the same :func:`unsafe_pgid_reason` check as the path
+    below, and reaches the group even after *proc* is reaped, because it names
+    the group itself rather than its recyclable number.  Only a refused *pgid*
+    or a kernel that cannot signal a group through a pidfd (before Linux 6.9)
+    falls back to the path below.
 
     Without one, an already-reaped *proc* gets no signal (its pid may be
     recycled), so any grandchildren still running are deliberately forgone:
@@ -593,7 +613,8 @@ def sigkill_process_group(
 
     Returns the :class:`SigkillDispatch` naming which of those it dispatched.
     """
-    if leader_pidfd is not None:
+    reason = unsafe_pgid_reason(pgid, proc.pid)
+    if leader_pidfd is not None and reason is None:
         dispatch = _sigkill_group_through_pidfd(leader_pidfd, pgid)
         if dispatch is not None:
             return dispatch
@@ -605,7 +626,6 @@ def sigkill_process_group(
         )
         return SigkillDispatch.NOT_SIGNALLED
 
-    reason = unsafe_pgid_reason(pgid, proc.pid)
     if reason is not None:
         logger.error(
             'sigkill_process_group: refusing to killpg — %s. '
