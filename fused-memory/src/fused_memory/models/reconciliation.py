@@ -342,5 +342,6 @@ class JudgeInvocation(BaseModel):
     run_id: str
     completed_at: datetime
     ended_error_max_turns: bool
+    schema_salvaged: bool
     num_turns: int = Field(ge=0)
     rejected_tool_calls: int | None = Field(ge=0)

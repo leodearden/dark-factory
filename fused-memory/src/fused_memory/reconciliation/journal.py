@@ -187,6 +187,7 @@ CREATE TABLE IF NOT EXISTS judge_invocations (
     run_id TEXT NOT NULL,
     completed_at TEXT NOT NULL,
     ended_error_max_turns INTEGER NOT NULL,
+    schema_salvaged INTEGER NOT NULL,
     num_turns INTEGER NOT NULL,
     rejected_tool_calls INTEGER
 );
@@ -833,13 +834,14 @@ class ReconciliationJournal:
         async with self._require_access().write() as db:
             await db.execute(
                 """INSERT INTO judge_invocations
-                   (run_id, completed_at, ended_error_max_turns, num_turns,
-                    rejected_tool_calls)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   (run_id, completed_at, ended_error_max_turns, schema_salvaged,
+                    num_turns, rejected_tool_calls)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 (
                     invocation.run_id,
                     invocation.completed_at.isoformat(),
                     int(invocation.ended_error_max_turns),
+                    int(invocation.schema_salvaged),
                     invocation.num_turns,
                     invocation.rejected_tool_calls,
                 ),

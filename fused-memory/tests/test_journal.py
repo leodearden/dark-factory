@@ -353,14 +353,9 @@ class TestJudgeInvocations:
             _invocation(**{field: -1})
 
     def test_model_requires_schema_salvaged(self):
+        fields = _invocation().model_dump(exclude={'schema_salvaged'})
         with pytest.raises(ValidationError):
-            JudgeInvocation(
-                run_id='run-1',
-                completed_at=datetime.now(UTC),
-                ended_error_max_turns=False,
-                num_turns=2,
-                rejected_tool_calls=0,
-            )
+            JudgeInvocation.model_validate(fields)
 
     def test_model_is_frozen(self):
         invocation = _invocation()

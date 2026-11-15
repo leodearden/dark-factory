@@ -966,6 +966,7 @@ Review this run and provide your verdict as JSON.
                 run_id=run_id,
                 completed_at=datetime.now(UTC),
                 ended_error_max_turns=ended,
+                schema_salvaged=result.schema_salvaged,
                 num_turns=result.turns,
                 rejected_tool_calls=rejected,
             ))
