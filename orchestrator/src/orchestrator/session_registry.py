@@ -4814,7 +4814,6 @@ def _check_lease_ownership(
     slug: str,
     force: bool,
     verb: str,
-    now: datetime | None = None,
 ) -> tuple[LeaseMutation | None, LeaseHolder | None]:
     """Gate a lease mutation on ownership (task 3994).
 
@@ -4845,9 +4844,7 @@ def _check_lease_ownership(
       the refusal is greppable and both parties are attributable (INV-2).
     - *force* overrides either refusal, at WARNING, naming both parties.
     """
-    if now is None:
-        now = datetime.now(UTC)
-    holder, _holder_alive, age_secs = _read_lease_holder_state(path, now=now)
+    holder, _holder_alive, age_secs = _read_lease_holder_state(path, now=datetime.now(UTC))
     if holder is None and not path.exists():
         return LeaseMutation.ABSENT, None
     if _is_lease_owner(holder, slug):
