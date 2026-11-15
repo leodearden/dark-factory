@@ -150,6 +150,7 @@ class TestRecordedOutcome:
         invocation = _recorded(journal)
         assert invocation.run_id == 'run-7'
         assert invocation.ended_error_max_turns is False
+        assert invocation.schema_salvaged is False
         assert invocation.num_turns == 3
         assert invocation.rejected_tool_calls == 2
         assert invocation.completed_at.tzinfo is not None
@@ -165,6 +166,7 @@ class TestRecordedOutcome:
 
         invocation = _recorded(journal)
         assert invocation.ended_error_max_turns is True
+        assert invocation.schema_salvaged is False
         assert invocation.num_turns == 4
         assert invocation.rejected_tool_calls == 2
 
@@ -173,7 +175,9 @@ class TestRecordedOutcome:
         verdict = await _call(_judge(journal), _salvaged_turn_cap())
 
         assert verdict == _OK_PAYLOAD
-        assert _recorded(journal).ended_error_max_turns is True
+        invocation = _recorded(journal)
+        assert invocation.ended_error_max_turns is True
+        assert invocation.schema_salvaged is True
 
     @pytest.mark.asyncio
     async def test_rejected_calls_unknown_without_a_transcript(self, journal):

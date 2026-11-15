@@ -259,6 +259,11 @@ async def test_add_verdict_atomically_clears_pending_marker(journal):
 
 _ARMED_CHECK = 'SELECT COUNT(*), MAX(completed_at) FROM judge_invocations'
 _TRIPWIRE_COUNT = 'SELECT COUNT(*) FROM judge_invocations WHERE ended_error_max_turns = 1'
+_TRIPWIRE_FIRST = (
+    'SELECT ji.completed_at, ji.run_id, r.project_id, ji.schema_salvaged, ji.num_turns,'
+    ' ji.rejected_tool_calls FROM judge_invocations ji LEFT JOIN runs r ON r.id = ji.run_id'
+    ' WHERE ji.ended_error_max_turns = 1 ORDER BY ji.completed_at LIMIT 1'
+)
 
 
 def _read_only_rows(db_path: Path, query: str) -> list[tuple]:
@@ -274,6 +279,7 @@ def _invocation(**overrides) -> JudgeInvocation:
         'run_id': 'run-1',
         'completed_at': datetime.now(UTC),
         'ended_error_max_turns': False,
+        'schema_salvaged': False,
         'num_turns': 2,
         'rejected_tool_calls': 0,
     }
@@ -297,7 +303,7 @@ class TestJudgeInvocations:
         second_at = first_at + timedelta(minutes=5)
         await journal.record_judge_invocation(_invocation(
             run_id='run-hit', completed_at=first_at,
-            ended_error_max_turns=True, num_turns=4, rejected_tool_calls=2,
+            ended_error_max_turns=True, schema_salvaged=True, num_turns=4, rejected_tool_calls=2,
         ))
         await journal.record_judge_invocation(_invocation(
             run_id='run-ok', completed_at=second_at,
@@ -307,14 +313,17 @@ class TestJudgeInvocations:
 
         assert _read_only_rows(
             db_path,
-            'SELECT run_id, completed_at, ended_error_max_turns, num_turns,'
+            'SELECT run_id, completed_at, ended_error_max_turns, schema_salvaged, num_turns,'
             ' rejected_tool_calls FROM judge_invocations ORDER BY completed_at',
         ) == [
-            ('run-hit', first_at.isoformat(), 1, 4, 2),
-            ('run-ok', second_at.isoformat(), 0, 2, None),
+            ('run-hit', first_at.isoformat(), 1, 1, 4, 2),
+            ('run-ok', second_at.isoformat(), 0, 0, 2, None),
         ]
         assert _read_only_rows(db_path, _ARMED_CHECK) == [(2, second_at.isoformat())]
         assert _read_only_rows(db_path, _TRIPWIRE_COUNT) == [(1,)]
+        assert _read_only_rows(db_path, _TRIPWIRE_FIRST) == [
+            (first_at.isoformat(), 'run-hit', None, 1, 4, 2),
+        ]
 
     @pytest.mark.asyncio
     async def test_initialize_adds_the_table_to_an_existing_db(self, tmp_path):
@@ -342,6 +351,16 @@ class TestJudgeInvocations:
     def test_model_rejects_negative_counts(self, field):
         with pytest.raises(ValidationError):
             _invocation(**{field: -1})
+
+    def test_model_requires_schema_salvaged(self):
+        with pytest.raises(ValidationError):
+            JudgeInvocation(
+                run_id='run-1',
+                completed_at=datetime.now(UTC),
+                ended_error_max_turns=False,
+                num_turns=2,
+                rejected_tool_calls=0,
+            )
 
     def test_model_is_frozen(self):
         invocation = _invocation()
