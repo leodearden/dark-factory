@@ -23,6 +23,7 @@ import logging
 import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import NoneType
 from typing import Any
@@ -176,3 +177,35 @@ def _move_round_archives(artifacts: TaskArtifacts, parking_name: str) -> Path | 
         destination_root.mkdir(parents=True, exist_ok=True)
         shutil.move(archive, destination)
     return destination_root if destination_root.is_dir() else None
+
+
+def retired_reviews_since(artifacts: TaskArtifacts, since: datetime | None) -> tuple[RetiredReview, ...]:
+    """The retired lineages that still carry suggestions and were quarantined after *since*. Never raises.
+
+    *since* is when an architect last confirmed the plan; None, for a fresh
+    plan, keeps every retirement. A record whose ``quarantined_at`` does not
+    parse is kept, failing toward briefing the architect.
+    """
+    try:
+        pending = (
+            _with_suggestions(review) for review in _retired_reviews(artifacts)
+            if review.archive is not None and _quarantined_after(review.quarantined_at, since)
+        )
+        return tuple(review for review in pending if review.suggestions)
+    except (OSError, ValueError):
+        logger.warning('review lineage: could not read the retired review record under %s', artifacts.task_root, exc_info=True)
+        return ()
+
+
+def _quarantined_after(quarantined_at: str, since: datetime | None) -> bool:
+    if since is None:
+        return True
+    try:
+        parsed = datetime.fromisoformat(quarantined_at)
+    except ValueError:
+        return True
+    return _as_utc(parsed) > _as_utc(since)
+
+
+def _as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
