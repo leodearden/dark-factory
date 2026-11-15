@@ -15,6 +15,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -198,7 +199,7 @@ class TestRecoveredRequestOutcomeHasAnOwner:
     ) -> None:
         harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
         worker = FakeMergeWorker(halted=True)
-        harness._merge_worker = worker
+        harness._merge_worker = cast(Any, worker)
         request = _recovered_request()
         await _recover(harness, request)
 
@@ -214,7 +215,7 @@ class TestRecoveredRequestOutcomeHasAnOwner:
         scheduler_double.set_task_status.assert_any_await(_TID, 'blocked')
 
         restarted = FakeMergeWorker(halted=False)
-        harness._merge_worker = restarted
+        harness._merge_worker = cast(Any, restarted)
         assert harness._rehydrate_merge_halt() == esc.id
         assert restarted.is_wip_halted
         assert restarted.is_halt_owner(esc.id)
