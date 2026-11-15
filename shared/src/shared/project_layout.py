@@ -25,6 +25,7 @@ __all__ = [
     'scheduler_eligibility_db',
     'scheduler_overrides_db',
     'scheduler_state_json',
+    'startup_failures_json',
     'tasks_db',
 ]
 
@@ -52,6 +53,10 @@ def runs_db(root: StrPath) -> Path:
 
 def scheduler_state_json(root: StrPath) -> Path:
     return orchestrator_data_dir(root) / 'scheduler_state.json'
+
+
+def startup_failures_json(root: StrPath) -> Path:
+    return orchestrator_data_dir(root) / 'startup_failures.json'
 
 
 def scheduler_overrides_db(root: StrPath) -> Path:
