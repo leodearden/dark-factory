@@ -1357,8 +1357,26 @@ _CARRIED = {
     'suggested_fix': 'rename helper',
 }
 
+_OUT_OF_SCOPE = {
+    'severity': 'suggestion',
+    'location': 'mod_z/elsewhere.py:9',
+    'category': 'design',
+    'description': 'shared helper belongs in mod_z',
+    'suggested_fix': 'move it',
+}
 
-def _retire_a_quarantined_lineage(f: _Fixture, *, quarantined_after_confirmation: bool = True) -> None:
+
+def _make_3663(tmp_path: Path) -> _Fixture:
+    """A fixture holding the lock set of the plan's own files, so _CARRIED's location is in scope."""
+    return _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+        modules=files_to_modules(['mod_a/file.py'], 2),
+    )
+
+
+def _retire_a_quarantined_lineage(
+    f: _Fixture, *, quarantined_after_confirmation: bool = True, issues: list[dict] | None = None,
+) -> None:
     """Confirm the plan, then park its reviewed branch after one amendment round, and retire that lineage."""
     confirmed = datetime.now(UTC) - timedelta(minutes=30)
     quarantined = confirmed + timedelta(minutes=10 if quarantined_after_confirmation else -10)
@@ -1369,7 +1387,8 @@ def _retire_a_quarantined_lineage(f: _Fixture, *, quarantined_after_confirmation
     f.artifacts.set_review_counters(amendment_rounds_total=1)
     archive = f.artifacts.review_archive_dir('amend-1')
     archive.mkdir(parents=True)
-    (archive / 'analyst.json').write_text(json.dumps({'verdict': 'ISSUES_FOUND', 'issues': [_CARRIED]}))
+    issues = [_CARRIED] if issues is None else issues
+    (archive / 'analyst.json').write_text(json.dumps({'verdict': 'ISSUES_FOUND', 'issues': issues}))
     assert stamp_quarantined_from(f.artifacts, {
         'branch': 'refs/heads/task/101-20261112T000000Z',
         'tip_sha': 'c' * 40,
@@ -1389,7 +1408,7 @@ def _carried(builder: AsyncMock) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_a_retired_review_round_declines_the_skip_and_reaches_revalidation(tmp_path: Path):
-    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f = _make_3663(tmp_path)
     _retire_a_quarantined_lineage(f)
 
     with pytest.raises(AssertionError, match='architect must NOT'):
@@ -1401,7 +1420,7 @@ async def test_a_retired_review_round_declines_the_skip_and_reaches_revalidation
 
 @pytest.mark.asyncio
 async def test_a_retirement_older_than_the_plan_confirmation_still_skips(tmp_path: Path):
-    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f = _make_3663(tmp_path)
     _retire_a_quarantined_lineage(f, quarantined_after_confirmation=False)
 
     assert await f.wf._plan() == WorkflowOutcome.PLANNED
@@ -1410,7 +1429,7 @@ async def test_a_retirement_older_than_the_plan_confirmation_still_skips(tmp_pat
 
 @pytest.mark.asyncio
 async def test_a_fresh_plan_carries_the_retired_review_round(tmp_path: Path):
-    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f = _make_3663(tmp_path)
     _retire_a_quarantined_lineage(f)
     f.artifacts.artifact_path('plan.json').unlink()
 
@@ -1423,7 +1442,7 @@ async def test_a_fresh_plan_carries_the_retired_review_round(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_without_a_retirement_the_skip_fires_and_nothing_is_carried(tmp_path: Path):
-    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f = _make_3663(tmp_path)
 
     assert await f.wf._plan() == WorkflowOutcome.PLANNED
     assert f.invoke_called == []
@@ -1432,3 +1451,29 @@ async def test_without_a_retirement_the_skip_fires_and_nothing_is_carried(tmp_pa
     with pytest.raises(AssertionError, match='architect must NOT'):
         await f.wf._plan()
     assert _carried(f.build_architect_prompt) == []
+
+
+@pytest.mark.asyncio
+async def test_an_out_of_scope_retired_suggestion_does_not_decline_the_skip(tmp_path: Path):
+    f = _make_3663(tmp_path)
+    _retire_a_quarantined_lineage(f, issues=[_OUT_OF_SCOPE])
+
+    assert await f.wf._plan() == WorkflowOutcome.PLANNED
+    assert f.invoke_called == []
+
+    f.artifacts.artifact_path('plan.json').unlink()
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+    assert _carried(f.build_architect_prompt) == []
+
+
+@pytest.mark.asyncio
+async def test_only_in_scope_retired_suggestions_reach_revalidation(tmp_path: Path):
+    f = _make_3663(tmp_path)
+    _retire_a_quarantined_lineage(f, issues=[_CARRIED, _OUT_OF_SCOPE])
+
+    with pytest.raises(AssertionError, match='architect must NOT'):
+        await f.wf._plan()
+
+    f.build_revalidation_prompt.assert_awaited_once()
+    assert _carried(f.build_revalidation_prompt) == [_CARRIED['description']]
