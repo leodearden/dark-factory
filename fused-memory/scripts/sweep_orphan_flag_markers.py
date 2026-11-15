@@ -1688,6 +1688,10 @@ def _build_parser() -> argparse.ArgumentParser:
     the new ``--max-age-days``, ``--delete-ids``, ``--terminal-drain``,
     ``--check``, and ``--max-backlog`` flags — is testable without any live
     I/O.
+
+    ``allow_abbrev=False`` makes ``--apply`` the only spelling of a
+    deletion, which is what lets ``scripts/fused-memory-flag-marker-check.sh``
+    keep its read-only promise by refusing that one literal (task 3498).
     """
     parser = argparse.ArgumentParser(
         description=(
@@ -1695,6 +1699,7 @@ def _build_parser() -> argparse.ArgumentParser:
             'records: missing kind/task_id, stale by age, referencing only '
             'terminal tasks, or explicitly targeted for correction.'
         ),
+        allow_abbrev=False,
     )
     parser.add_argument(
         '--apply', action='store_true', default=False,

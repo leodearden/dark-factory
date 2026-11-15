@@ -519,11 +519,12 @@ through and `--check --apply` parses fine (verified: `apply=True
 check=True`), so the "read-only" wrapper was a live deletion vector into a
 `delete_orphan_markers` path that, at the time, lacked the
 `is_protected_mirror_record` guard and the tombstone write the in-cycle
-collector applies. The wrapper now refuses `--apply` and every argparse
-abbreviation of it (`--a`, `--ap`, `--app`, `--appl`, all four verified to
-reach `apply=True` because `allow_abbrev` defaults True), and
-`scripts/tests/test_flag_marker_check_wrapper.py` pins that refusal, with
-the refusal set derived from the sweep's own parser. This follows the
+collector applies. The wrapper now refuses `--apply` with its own exit code
+3, and the sweep's parser sets `allow_abbrev=False`, so no shorter spelling
+reaches `apply=True` (under argparse's default, `--a`, `--ap`, `--app` and
+`--appl` all did). `scripts/tests/test_flag_marker_check_wrapper.py` pins
+the refusal and `fused-memory/tests/test_sweep_orphan_flag_markers_cli.py`
+pins the parser. This follows the
 standing norm from the RCA's §3
 (`plans/reify-flag-marker-backlog-rca-2026-07-22.md`): in this subsystem 8
 prompt-level fixes failed while every fix that held was deterministic.

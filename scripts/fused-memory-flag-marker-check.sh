@@ -70,14 +70,15 @@
 #
 # Unlike the nightly sweep wrapper this performs NO deletions, and since
 # task 3498 that is ENFORCED rather than merely documented: the guard below
-# REFUSES --apply and every argparse abbreviation of it (--a, --ap, --app,
-# --appl -- allow_abbrev defaults True, so all four reach apply=True),
-# exiting 3 before the sweep is invoked at all. It had to become a property
-# of the script rather than a promise about it: this wrapper passes caller
-# args straight through and --check --apply parses fine, so the
-# no-deletions claim was previously false and a destructive drain could be
-# run through the "read-only" path. Because the refusal precedes the sweep,
-# resolve/resume re-runs of THIS wrapper are harmless.
+# REFUSES --apply, exiting 3 before the sweep is invoked at all. This
+# wrapper passes caller args straight through and the sweep accepts
+# --check --apply together, so the guard is what makes the no-deletions
+# claim true. Refusing the one literal is complete because
+# fused-memory/scripts/sweep_orphan_flag_markers.py::_build_parser sets
+# allow_abbrev=False, so a prefix such as --appl reaches the sweep only to
+# be rejected there with rc=2. Because no
+# argv this wrapper forwards can delete, resolve/resume re-runs of THIS
+# wrapper are harmless.
 #
 # Use scripts/fused-memory-flag-marker-sweep.sh for the deletion path. The
 # guard closes THIS entry point only: the nightly wrapper still execs the
@@ -119,25 +120,17 @@ export CONFIG_PATH="${CONFIG_PATH:-$FM/config/config.yaml}"
 export PROJECT_ROOT="${PROJECT_ROOT:-$REPO}"
 export FALKORDB_URI="${FALKORDB_URI:-redis://localhost:6379}"
 
-# Enforce the read-only contract this wrapper advertises (task 3498). The
-# exec line below passes "$@" straight through and the sweep accepts
-# --check --apply together, so without this guard the "read-only" census
-# path is a deletion vector. Match WHOLE arguments against each abbreviation
-# explicitly rather than a --a* glob, so --no-fail-on-blind-spot, a value
-# like `--project-id apply-test`, and any future --a... flag the sweep grows
-# all pass through untouched.
+# Enforce the read-only contract this wrapper advertises (task 3498; see the
+# header for why the one literal suffices). Match WHOLE arguments, so a
+# value like `--project-id apply-test` passes through untouched.
 for arg in "$@"; do
-    case "$arg" in
-        --a|--ap|--app|--appl|--apply)
-            echo "ERROR: $(basename "$0") refuses '$arg': this is the" \
-                 "read-only census wrapper and performs no deletions." >&2
-            echo "       ('--a', '--ap', '--app' and '--appl' are argparse" \
-                 "abbreviations that also reach --apply.)" >&2
-            echo "       Use scripts/fused-memory-flag-marker-sweep.sh for" \
-                 "the destructive drain path." >&2
-            exit 3
-            ;;
-    esac
+    if [ "$arg" = "--apply" ]; then
+        echo "ERROR: ${0##*/} refuses '--apply': this is the read-only" \
+             "census wrapper and performs no deletions." >&2
+        echo "       Use scripts/fused-memory-flag-marker-sweep.sh for the" \
+             "destructive drain path." >&2
+        exit 3
+    fi
 done
 
 if [ -n "${FLAG_MARKER_SWEEP_CMD:-}" ]; then
