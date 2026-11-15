@@ -114,6 +114,8 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'orchestrator/tests/test_merge_speculation.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_plan_tools_server.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebase_branch_reset_guard.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_rebase_drops.py': _SEEDS_ITS_OWN_REPO,
+    'orchestrator/tests/test_rebase_drops_wiring.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_rebased_solo_landing_ladder.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_reconcile_done_step_commits.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_recut_ruling_gitops.py': _SEEDS_ITS_OWN_REPO,
