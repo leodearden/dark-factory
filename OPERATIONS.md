@@ -1877,7 +1877,7 @@ allowlist over `fused-memory/config/config.yaml`, applied by
 process, different file. Do not look for one config's leaves in the
 other's list. Its green tier currently covers several `reconciliation.*`
 leaves (the near-dup/topic-guard knobs and `stale_run_recovery_seconds`),
-`write_triage.*`, and the five in-place-update leaves below — read
+`write_triage.*`, and the in-place-update leaves below — read
 `RELOADABLE_FIELDS` in `fused-memory/src/fused_memory/config/reload.py` as
 the authoritative list rather than treating this enumeration as exhaustive.
 `server.*` (the bind host, the port and `recon_report_port`) is not in it, so
@@ -1907,6 +1907,18 @@ a bind change is restart-only in both processes (the orchestrator's
   to correct; a silent content rewrite is neither. (`agent_id` is
   self-reported, so this is a misuse deterrent for cooperating callers,
   not a security boundary.)
+- `mem0_update.agent_prefix_sanctioned_use` — the prefix-to-role map. A
+  `Mem0UpdateNotAuthorized` refusal renders, for each prefix on the
+  refusing arm's list, the role that prefix declares, together with the
+  norm: adopt a prefix only if you are that role, and a caller refused in
+  the middle of other work escalates rather than renaming itself. A listed
+  prefix with no entry renders as undocumented ("do not adopt it").
+  Documenting a prefix here is part of widening either list. The shipped
+  schema default documents `recon-stage-`, `curator-` and `link-heal-`; a
+  YAML value replaces that map wholesale, so restate every entry. Green-tier,
+  reloaded as one atomic leaf. This makes the norm legible, not the gate
+  enforceable: `agent_id` stays self-reported, and the storm alarm below
+  remains the backstop.
 - `mem0_update.storm_threshold` and `mem0_update.storm_window_seconds` —
   the content-amend burst alarm (escalates, never blocks; metadata-only
   calls do not count toward it). Genuinely reload-safe because the shared
