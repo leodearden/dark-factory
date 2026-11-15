@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -25,6 +26,7 @@ SHOW_FIELDS = ('Id', 'LoadState', 'UnitFileState', 'ActiveState')
 SYSTEMCTL_ERROR = 'Failed to connect to user scope bus via local transport: No such file or directory'
 
 CENSUS = 'memory-metadata-coverage-census.timer'
+QUALITY = f'quality-snapshot@{PROJECT}.timer'
 TRICKLE = f'legibility-trickle@{PROJECT}.timer'
 RETURN_BRIEF = 'return-brief.timer'
 
@@ -85,6 +87,35 @@ def main(argv):
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
 '''
+
+
+_STUB_BEHAVIOURS = {
+    'enables': 'systemctl --user enable --now {unit}\nexit 0',
+    'fails': 'echo "cannot install {unit}"\nexit 3',
+    'skips-enable': 'exit 0',
+    'enables-then-fails': 'systemctl --user enable --now {unit}\nexit 1',
+}
+
+
+def install_stub_installers(root: Path, log: Path, stubs: Mapping[str, str]) -> Path:
+    """An executable stub at root/<installer> for every registry entry, logging its argv to *log*.
+
+    *stubs* maps a resolved unit to a _STUB_BEHAVIOURS key; every other stub 'enables'.
+    """
+    for timer in EXPECTED_TIMERS:
+        unit = timer.unit_name(PROJECT)
+        stub = root / timer.installer
+        stub.parent.mkdir(parents=True, exist_ok=True)
+        behaviour = _STUB_BEHAVIOURS[stubs.get(unit, 'enables')].format(unit=shlex.quote(unit))
+        stub.write_text(
+            '#!/usr/bin/env bash\n'
+            f"{{ printf '%s' {shlex.quote(timer.installer)}; if [ $# -gt 0 ]; then printf ' %s' \"$@\"; fi; echo; }}"
+            f' >> {shlex.quote(str(log))}\n'
+            f'echo "installing {unit}"\n'
+            f'{behaviour}\n'
+        )
+        stub.chmod(0o755)
+    return log
 
 
 @dataclass(frozen=True)
@@ -157,6 +188,22 @@ def check(
     root.mkdir(exist_ok=True)
     env = install_fake_systemctl(tmp_path, host_units(overrides, project_id), show_exit)
     return run_timers(tmp_path, env, 'check', '--repo-root', str(root))
+
+
+def arm(
+    tmp_path: Path,
+    overrides: Mapping[str, Mapping[str, str] | None] | None = None,
+    *,
+    stubs: Mapping[str, str] | None = None,
+    show_exit: int = 0,
+) -> tuple[TimersRun, list[str]]:
+    """Run `arm` over stub installers; return the run and each installer call it made."""
+    root = tmp_path / 'dark-factory'
+    root.mkdir(exist_ok=True)
+    log = install_stub_installers(root, tmp_path / 'installer-calls.log', stubs or {})
+    env = install_fake_systemctl(tmp_path, host_units(overrides), show_exit)
+    run = run_timers(tmp_path, env, 'arm', '--repo-root', str(root))
+    return run, log.read_text().splitlines() if log.exists() else []
 
 
 def untagged_lines(output: str) -> list[str]:
@@ -285,3 +332,77 @@ def test_a_usage_error_exits_two_untagged(tmp_path: Path, args: tuple[str, ...])
 def test_the_script_is_executable() -> None:
     assert os.access(SCRIPT, os.X_OK)
 
+
+
+def test_arm_with_every_timer_armed_runs_no_installer(tmp_path: Path) -> None:
+    run, calls = arm(tmp_path)
+    assert run.result.returncode == 0, run.output
+    assert calls == []
+    assert_others_armed(run.output)
+
+
+def test_arm_runs_the_one_unarmed_timers_installer_and_rereads_it_armed(tmp_path: Path) -> None:
+    run, calls = arm(tmp_path, {CENSUS: None})
+    assert run.result.returncode == 0, run.output
+    assert calls == ['scripts/install-memory-metadata-coverage-census-timer.sh']
+    lines = untagged_lines(run.output)
+    arming = next(i for i, line in enumerate(lines) if line.startswith(f'[arming] {CENSUS}'))
+    installing = next(i for i, line in enumerate(lines) if f'installing {CENSUS}' in line)
+    assert arming < installing
+    assert_others_armed(run.output)
+
+
+def test_arm_passes_each_template_installer_its_project_argument(tmp_path: Path) -> None:
+    disabled = {'LoadState': 'loaded', 'UnitFileState': 'disabled', 'ActiveState': 'inactive'}
+    run, calls = arm(tmp_path, {QUALITY: disabled, TRICKLE: None})
+    assert run.result.returncode == 0, run.output
+    root = (tmp_path / 'dark-factory').resolve()
+    assert calls == [
+        f'scripts/legibility/install-trickle-timer.sh {PROJECT}',
+        f'scripts/install-quality-snapshot-timer.sh {root}',
+    ]
+    assert_others_armed(run.output)
+
+
+def test_arm_leaves_a_masked_timer_alone(tmp_path: Path) -> None:
+    run, calls = arm(tmp_path, {CENSUS: {'LoadState': 'masked', 'UnitFileState': 'masked', 'ActiveState': 'inactive'}})
+    assert run.result.returncode == 1, run.output
+    assert calls == []
+    assert_verdict(run.output, CENSUS, 'masked')
+    assert_others_armed(run.output, CENSUS)
+
+
+def test_a_failing_installer_is_named_and_the_next_one_still_runs(tmp_path: Path) -> None:
+    run, calls = arm(tmp_path, {CENSUS: None, RETURN_BRIEF: None}, stubs={CENSUS: 'fails'})
+    assert run.result.returncode == 1, run.output
+    assert calls == ['scripts/install-memory-metadata-coverage-census-timer.sh', 'scripts/install-return-brief-timer.sh']
+    failed = [line for line in untagged_lines(run.output) if line.startswith(f'[arm-failed] {CENSUS}')]
+    assert len(failed) == 1, run.output
+    assert 'exited 3' in failed[0]
+    assert f'cannot install {CENSUS}' in run.output
+    assert_verdict(run.output, CENSUS, 'not-installed')
+    assert_others_armed(run.output, CENSUS)
+
+
+def test_an_installer_that_succeeds_without_arming_still_reads_unarmed(tmp_path: Path) -> None:
+    run, calls = arm(tmp_path, {CENSUS: None}, stubs={CENSUS: 'skips-enable'})
+    assert run.result.returncode == 1, run.output
+    assert calls == ['scripts/install-memory-metadata-coverage-census-timer.sh']
+    assert_verdict(run.output, CENSUS, 'not-installed')
+    assert_others_armed(run.output, CENSUS)
+
+
+def test_arm_runs_no_installer_when_the_state_is_unreadable(tmp_path: Path) -> None:
+    run, calls = arm(tmp_path, show_exit=1)
+    assert run.result.returncode == 1, run.output
+    assert calls == []
+    for unit in resolved_units():
+        assert_verdict(run.output, unit, 'unreadable')
+
+
+def test_an_installer_failure_is_never_folded_into_a_green_exit(tmp_path: Path) -> None:
+    run, calls = arm(tmp_path, {CENSUS: None}, stubs={CENSUS: 'enables-then-fails'})
+    assert calls == ['scripts/install-memory-metadata-coverage-census-timer.sh']
+    assert_others_armed(run.output)
+    assert any(line.startswith(f'[arm-failed] {CENSUS}') for line in untagged_lines(run.output)), run.output
+    assert run.result.returncode == 1, run.output
