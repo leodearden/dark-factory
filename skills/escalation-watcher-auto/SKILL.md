@@ -1083,8 +1083,12 @@ measured range: check that the range measured this task before promoting.** Run
 `git merge-base <branch> main`. A PARTIAL not-touched list is a suspected
 mis-measurement, not evidence of partial delivery. Also check for sibling refs
 `task/<id>-*` that carry the declared work, a rebase in progress in the worktree,
-and uncommitted edits to the declared files. While any of those holds, never
-offer "restart the task" as an option.
+and uncommitted edits to the declared files. One exception for sibling refs: a
+ref is NOT where the work lives when the task's `metadata.recut_executed` names
+it as `parked_branch`, or when its tip predates `recut_executed.executed_at`.
+Such a ref is the prior incarnation a human re-cut ruling forbids resuming, and
+does not count. While any of those conditions holds, never offer "restart the
+task" as an option.
 
 1. Fetch the current proposal (if any):
    ```python
@@ -1115,7 +1119,10 @@ offer "restart the task" as an option.
 
 **Producer.** `orchestrator/src/orchestrator/workflow.py::TaskWorkflow._block_if_delivery_unmeasured`
 blocks the task when the pre-merge plan-files gate failed on a range that never
-measured the task's own work. The reason starts `Plan-file delivery not measured`
+measured the task's own work, as found by
+`merge_lane/unmeasured_delivery.py::diagnose_unmeasured_branch` (causes inside the
+worktree) or `merge_lane/unmeasured_delivery.py::find_work_on_sibling_ref` (work on
+a sibling ref). The reason starts `Plan-file delivery not measured`
 and names the cause and its remedy (`merge_lane/unmeasured_delivery.py::UnmeasuredCause`):
 an unreadable history (`retry_merge`), a stopped rebase (`finish_or_abort_rebase`),
 uncommitted declared edits (`commit_worktree_edits`), or the work on a sibling ref
@@ -1123,6 +1130,13 @@ uncommitted declared edits (`commit_worktree_edits`), or the work on a sibling r
 value. Promote with `category="plan_delivery_unmeasured"` and the reason's remedy
 as option A. Never offer "restart the task" or "narrow the plan": nothing was
 measured, so neither is supported by evidence.
+
+Before promoting `recover_work_from_sibling_ref` as option A, confirm the named ref
+is not superseded by an executed re-cut ruling (the rule's home is
+`orchestrator/src/orchestrator/recut_ruling.py::RecutSupersession`; read the task's
+`metadata.recut_executed`). If it is superseded, the finding is a defect: promote
+WITHOUT the recover option and let the ruling decide. A restart may then be the
+right option.
 
 #### `workflow_exit_contract`
 
