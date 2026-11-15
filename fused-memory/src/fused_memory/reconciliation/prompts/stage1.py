@@ -76,6 +76,11 @@ LIVE_STATE_FRESHNESS_HEADING = f'## {LIVE_STATE_FRESHNESS_TITLE}'
 PRESERVED_SPECIMEN_CORROBORATION_TITLE = 'Preserved-Specimen Corroboration'
 PRESERVED_SPECIMEN_CORROBORATION_HEADING = f'## {PRESERVED_SPECIMEN_CORROBORATION_TITLE}'
 
+#: The Stage 2 summary pre-check section's heading (task 6295), shared with the
+#: Available Tools pointer to it so a rename cannot leave that pointer dangling.
+STAGE2_SUMMARY_PRECHECK_TITLE = 'Pre-Check: Already-Present Stage 2 Summaries'
+STAGE2_SUMMARY_PRECHECK_HEADING = f'## {STAGE2_SUMMARY_PRECHECK_TITLE}'
+
 _CHILD_KIND_NAMES = ' or '.join(f'`{kind}`' for kind in sorted(CHILD_KINDS))
 
 #: The Authority-Model carve-out for child memories (task 6193), exported so
@@ -144,7 +149,7 @@ INCONCLUSIVE, never a definitive absence — `expired` means the run is past the
 retention window, so the row would have been reaped whether or not it was ever written. \
 `run_status` is DIAGNOSTIC context for a finding's evidence line and must NEVER itself \
 decide whether to flag. Use this as the PRIMARY cycle-summary \
-presence check (see ## Pre-Check: Already-Present Stage 2 Summaries below).
+presence check (see ## {STAGE2_SUMMARY_PRECHECK_TITLE} below).
 
 You do not have access to task *write* tools — task reconciliation is Stage 2's job. \
 `mcp__fused-memory__get_task` is permitted as a read-only verification call (see \
@@ -691,7 +696,7 @@ one cycle of the very suppression you are trying to earn. That relocation cost i
 exactly why the deterministic discovery above, not your citation, is the load-bearing \
 path here.
 
-## Pre-Check: Already-Present Stage 2 Summaries
+{STAGE2_SUMMARY_PRECHECK_HEADING}
 Before emitting a "missing Stage 2 summary" finding for a run, and before noting the \
 presence of your own prior-run summary in your cycle report, consult the AUTHORITATIVE \
 ledger FIRST for each summary; fall back to the existing Mem0 two-path check ONLY when \
@@ -701,8 +706,8 @@ the ledger read is inconclusive. Each check below verifies a DIFFERENT per-cycle
 ### PRIMARY — Ledger presence check (authoritative)
 
 **A. Stage-2-summary presence decision** (the actionable "missing Stage 2 summary" \
-finding, which Stage 2 carries forward against this same ledger — nothing reconstructs \
-it): \
+finding, which Stage 2 decides against this same ledger, carrying it forward only while \
+the row is still missing — nothing reconstructs it): \
 `mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<run_id>, \
 stage='task_knowledge_sync')`
 - `ledger_available: true` and `present: true` → the Stage 2 summary is present. Do NOT \
@@ -779,9 +784,9 @@ unavailable), treat as inconclusive and do NOT emit the missing-summary finding 
 documented harm is a false-positive finding (a wasted remediation pass), so bias toward \
 not emitting it on uncertainty. Note the tool error in your cycle report instead.
 
-Rationale: back-to-back remediation passes otherwise re-raise the same missing-summary \
-finding for a summary that exists, each burning a remediation pass. The two-path approach eliminates the false-negative risk from semantic-search \
-ranking/limit cutoff. Legacy summaries (written before task 1588) lack \
+Rationale: without this check a summary that exists gets re-flagged as missing, and each \
+such finding burns a remediation pass. The two-path approach eliminates the \
+false-negative risk from semantic-search ranking/limit cutoff. Legacy summaries (written before task 1588) lack \
 `metadata.run_id`, and Stage 2 summaries written before task 9af436fe lack \
 `metadata.stage`, so the Path 2 triple filter returns 0 for them — Path 1 remains their \
 fallback. The ledger PRIMARY check above is the authoritative source of truth going \
