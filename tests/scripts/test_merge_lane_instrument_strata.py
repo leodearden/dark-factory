@@ -24,7 +24,7 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 SCRIPTS_DIR = Path(__file__).resolve().parents[2] / 'scripts'
 
 #: The instrument's files, lowest stratum first.
-STRATA = ('merge_lane_cluster', 'merge_lane_metrics')
+STRATA = ('merge_lane_cluster', 'merge_lane_ratchet', 'merge_lane_metrics')
 
 
 def _source_of(stem: str) -> str:
@@ -81,6 +81,22 @@ def test_each_stratum_imports_only_earlier_strata_at_module_top_level() -> None:
     assert violations == [], '\n'.join(violations)
 
 
+def test_no_scripts_module_imports_the_cli() -> None:
+    cli = STRATA[-1]
+    importers = [
+        f'{path.relative_to(SCRIPTS_DIR.parent).as_posix()}:{node.lineno}'
+        for path in sorted(SCRIPTS_DIR.glob('*.py'))
+        if path.stem != cli and cli in (text := path.read_text(encoding='utf-8'))
+        for node, imported in _strata_imports(ast.parse(text, filename=str(path)))
+        if imported == cli
+    ]
+
+    assert importers == [], (
+        f'{cli} is the command line, the top stratum; gates and helpers reach the '
+        f'verdict through merge_lane_ratchet instead: {importers}'
+    )
+
+
 #: ``(importer stem, source, whether the rule accepts it)``.  A new placement
 #: the rule should accept or refuse is covered by adding a ROW.
 PLACEMENT_CASES = [
@@ -91,10 +107,22 @@ PLACEMENT_CASES = [
         id='module-body-downward',
     ),
     pytest.param(
+        'merge_lane_metrics',
+        'import merge_lane_ratchet as ratchet\n',
+        True,
+        id='cli-imports-the-verdict',
+    ),
+    pytest.param(
         'merge_lane_cluster',
         'import merge_lane_metrics as metrics\n',
         False,
         id='module-body-upward',
+    ),
+    pytest.param(
+        'merge_lane_ratchet',
+        'import merge_lane_metrics as metrics\n',
+        False,
+        id='verdict-imports-the-cli',
     ),
     pytest.param(
         'merge_lane_metrics',
