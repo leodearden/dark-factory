@@ -3752,16 +3752,25 @@ cases, the same backing stores. **Check this table before adding a job** —
 
 **A row here is a claim about the host, not about `scripts/`.** An installer
 committed to main installs nothing; only running it does. So a timer job is
-done when its timer is listed, not when its installer lands. The check is one
-command: `systemctl --user list-timers --all` must list an instance for every
-row, which for a templated `@` unit means one `@<project_id>` instance per
-project. An agent cannot run the installer, because `~/.config/systemd/user/`
-is outside the sandbox write-set
+done when its timer is armed, not when its installer lands.
+`scripts/user_timers.py check` reads every timer declared in
+`scripts/expected_user_timers.py` (each row here, plus the load sampler) and
+exits non-zero naming each one that is not loaded, enabled and active, with
+the installer that arms it. `scripts/user_timers.py arm` runs the installer of
+each unarmed one and leaves a masked one alone; `scripts/setup-host.sh` §7b
+runs it, and a deterministic `before_done` deploy can run it too. Adding a row
+here means adding a `scripts/expected_user_timers.py::EXPECTED_TIMERS` entry,
+which `scripts/tests/test_expected_user_timers.py` enforces for every
+committed `.timer`. Both commands bind a templated `@` unit to the main
+checkout's own `@<project_id>` instance; an instance for any other project
+remains that project's own deploy task. `systemctl --user list-timers --all`
+stays the manual cross-check. An agent cannot run an installer, because
+`~/.config/systemd/user/` is outside the sandbox write-set
 (`orchestrator/src/orchestrator/agents/write_set.py`). The deploy is therefore
 a `task_kind='deterministic'` `before_done` task, one per project, paired with
 a liveness predicate so that a timer which stops firing is loud. History:
 tasks 2901, 4557 and 5351 (rows that were never installed); task 5400 (the
-missing `LoadState` detector).
+declared registry and its `LoadState`-aware detector).
 
 | Slot | Job | Units |
 |---|---|---|
