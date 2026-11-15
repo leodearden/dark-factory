@@ -80,6 +80,7 @@ from fused_memory.reconciliation.overreach_flags import (
     fetch_overreach_flags,
 )
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
+from fused_memory.reconciliation.predecessor_drain_recovery import recover_predecessor_drains
 from fused_memory.reconciliation.queue_health import summarize_graphiti_queue_health
 from fused_memory.reconciliation.scope_freshness import (
     ScopeFreshnessResult,
@@ -2239,6 +2240,13 @@ class ReconciliationHarness:
                 },
             )
 
+    async def _recover_predecessor_drains(self) -> None:
+        """One-shot startup pass (task 9655): re-buffer a dead predecessor's
+        run-less drains, replaying deferred writes wherever its lock was released."""
+        for recovered in await recover_predecessor_drains(self.journal, self.buffer):
+            if recovered.lock_released:
+                await self._replay_deferred_writes(ProjectId(recovered.drained.project_id))
+
     # ── Dead-owner suppression storm counter ─────────────────────────
 
     def _record_dead_owner_suppression(
@@ -2928,6 +2936,11 @@ class ReconciliationHarness:
         except Exception as e:
             logger.warning(f'_recover_predecessor_runs at startup failed: {e}')
 
+        try:
+            await self._recover_predecessor_drains()
+        except Exception as e:
+            logger.warning(f'_recover_predecessor_drains at startup failed: {e}')
+
         # One-shot: re-fire the judge for any run whose verdict a restart dropped
         # in the cycle-end→verdict-commit window (task 2708). The durable
         # judge_pending marker (written before the fire-and-forget judge task) is
@@ -3378,10 +3391,11 @@ class ReconciliationHarness:
         ``recon_busy`` field (task 2703 δ) so a cycle-aware restart can defer
         while a cycle is running — machine-readable, no journal scraping.
 
-        Scope — the stage pipeline only (decision, task 2703 δ): an entry is
-        live only for the duration of the ``with self._active_runs.track(...)``
-        block in ``run_full_cycle``, i.e. the three-stage pipeline
-        (memory_consolidator → task_knowledge_sync → integrity_check) plus the
+        Scope (decision, task 2703 δ; widened by task 9655): an entry is live
+        only for the duration of the ``with self._active_runs.track(...)``
+        block in ``run_full_cycle``, i.e. the run's pre-stage reads (reported
+        with stage None), the three-stage pipeline
+        (memory_consolidator → task_knowledge_sync → integrity_check) and the
         inline remediation pass. It is deliberately NOT held for the
         fire-and-forget judge task (``asyncio.create_task(self._run_judge(...))``),
         which outlives the cycle: stage reports are already durably persisted
@@ -3464,79 +3478,77 @@ class ReconciliationHarness:
         # project_root is already hard-bound via _known_project_scope_for at the top
         # of this function (task 1143); no _resolve_project_root call needed here.
 
-        # Load prior S3 findings from last completed run (backstop for normal pass)
-        prior_s3_findings = await self._get_prior_s3_findings(project_id)
-
-        # Fetch filtered task tree once for the whole cycle (ref: task 455)
-        filtered_task_tree = await self._fetch_filtered_task_tree(project_root)
-        # Task 4115: the instant every heartbeat_at in filtered_task_tree was
-        # read. Stamped HERE, immediately after the fetch returns — not later,
-        # e.g. at the _maybe_remediate call below — because the S1->S3 stage
-        # loop that follows is minutes of LLM work and the claimant heartbeat
-        # TTL is only 10 minutes (task 2964). Threaded to Stage 2's
-        # hint-attention selector (task 5093), to both stages' Live-Workflow
-        # Signals sections (task 6027), and through _maybe_remediate ->
-        # _run_remediation_pass to the live-workflow gate, so each ages a task's
-        # heartbeat against the actual read, not a fresh clock taken well after it.
-        filtered_task_tree_fetched_at = datetime.now(UTC)
-
-        # Fetch authoritative task-count census and cross-verify against tree (task 1785)
-        statuses = await self._fetch_task_count_census(project_root)
-        task_count_verification = cross_verify_task_counts(filtered_task_tree, statuses)
-
-        # Diff the cached project_status_correction memory against the same live
-        # census and supersede it on divergence (task 1938).
-        status_correction_reconciliation = await self._reconcile_status_correction(
-            project_id, statuses
-        )
-
-        # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
-        graphiti_queue_health = await self._check_graphiti_queue_health(scope.project_id)
-
-        # Check FalkorDB index provisioning and escalate on drift (task 3709 / PRD δ).
-        # This is the recon-cadence half of Q3; the startup sweep calls the SAME
-        # detector.  Kept here, outside the _active_runs.track block below, so a
-        # slow `CALL db.indexes()` read cannot be misattributed to a stage —
-        # exactly where the sibling diagnostics reads sit.
-        #
-        # WHY THE GUARD: `_check_index_health` deliberately lets α's fail-closed
-        # errors propagate rather than fabricate a health record —
-        # `IndexRecordShapeError` (a surprising `CALL db.indexes()` record) and
-        # `UnparsedIndexStatementError` (any graphiti-core statement-syntax
-        # change; graphiti-core is pinned open-ended `>=0.28.1`, so that is a
-        # live upgrade hazard, not a hypothetical).  Unguarded HERE, either one
-        # would escape `run_full_cycle` AFTER `journal.start_run` has persisted
-        # the run as `running` and the caller has drained the event buffer,
-        # wedging every full cycle for every project — permanently, in the
-        # graphiti-upgrade case — while the project loop's generic handler only
-        # logs and never calls `restore_drained`.  A read-only diagnostic must
-        # never be able to fail the cycle it diagnoses.  The fail-closed intent
-        # is preserved by logging loudly and yielding UNKNOWN (None), never a
-        # synthesised healthy record.  The guard belongs at THIS call site, not
-        # inside `_check_index_health` (normalisation must stay outside its try)
-        # and not inside `_detect_index_drift` (which would make the startup
-        # sweep's own per-project guard redundant and hide programming errors
-        # from the detector's unit tests).  `except Exception` lets
-        # `asyncio.CancelledError` — a `BaseException` since 3.8 — propagate on
-        # shutdown, exactly as the sibling guards rely on.
-        try:
-            index_health = await self._detect_index_drift(
-                scope.project_id, run_id=run_id
-            )
-        except Exception as e:
-            logger.warning(
-                f'_detect_index_drift failed for project_id={scope.project_id!r}: {e}'
-            )
-            index_health = None
-
         current_stage_name: str | None = None
         stage_1_overreach_flags: OverreachFlagPage | None = None
-        cycle_start_time = datetime.now(UTC)
-        stages = self._make_stages(scope)
+        cycle_start_time: datetime | None = None
         with self._active_runs.track(
             run_id, project_id, run.started_at.isoformat()
         ) as _active:
             try:
+                # Load prior S3 findings from last completed run (backstop for normal pass)
+                prior_s3_findings = await self._get_prior_s3_findings(project_id)
+
+                # Fetch filtered task tree once for the whole cycle (ref: task 455)
+                filtered_task_tree = await self._fetch_filtered_task_tree(project_root)
+                # Task 4115: the instant every heartbeat_at in filtered_task_tree was
+                # read. Stamped HERE, immediately after the fetch returns — not later,
+                # e.g. at the _maybe_remediate call below — because the S1->S3 stage
+                # loop that follows is minutes of LLM work and the claimant heartbeat
+                # TTL is only 10 minutes (task 2964). Threaded to Stage 2's
+                # hint-attention selector (task 5093), to both stages' Live-Workflow
+                # Signals sections (task 6027), and through _maybe_remediate ->
+                # _run_remediation_pass to the live-workflow gate, so each ages a task's
+                # heartbeat against the actual read, not a fresh clock taken well after it.
+                filtered_task_tree_fetched_at = datetime.now(UTC)
+
+                # Fetch authoritative task-count census and cross-verify against tree (task 1785)
+                statuses = await self._fetch_task_count_census(project_root)
+                task_count_verification = cross_verify_task_counts(filtered_task_tree, statuses)
+
+                # Diff the cached project_status_correction memory against the same live
+                # census and supersede it on divergence (task 1938).
+                status_correction_reconciliation = await self._reconcile_status_correction(
+                    project_id, statuses
+                )
+
+                # Read Graphiti async-queue dead-letter count — surfaces silent-drop tail (task 1785)
+                graphiti_queue_health = await self._check_graphiti_queue_health(scope.project_id)
+
+                # Check FalkorDB index provisioning and escalate on drift (task 3709 / PRD δ).
+                # This is the recon-cadence half of Q3; the startup sweep calls the SAME
+                # detector.  It runs beside the sibling diagnostics reads, inside the
+                # _active_runs.track block but before its entry names any stage, so a
+                # slow `CALL db.indexes()` read cannot be misattributed to a stage.
+                #
+                # WHY THE GUARD: `_check_index_health` deliberately lets α's fail-closed
+                # errors propagate rather than fabricate a health record —
+                # `IndexRecordShapeError` (a surprising `CALL db.indexes()` record) and
+                # `UnparsedIndexStatementError` (any graphiti-core statement-syntax
+                # change; graphiti-core is pinned open-ended `>=0.28.1`, so that is a
+                # live upgrade hazard, not a hypothetical).  Unguarded HERE, either one
+                # would fail every full cycle for every project — permanently, in the
+                # graphiti-upgrade case.  A read-only diagnostic must never be able to
+                # fail the cycle it diagnoses.  The fail-closed intent
+                # is preserved by logging loudly and yielding UNKNOWN (None), never a
+                # synthesised healthy record.  The guard belongs at THIS call site, not
+                # inside `_check_index_health` (normalisation must stay outside its try)
+                # and not inside `_detect_index_drift` (which would make the startup
+                # sweep's own per-project guard redundant and hide programming errors
+                # from the detector's unit tests).  `except Exception` lets
+                # `asyncio.CancelledError` — a `BaseException` since 3.8 — propagate on
+                # shutdown, exactly as the sibling guards rely on.
+                try:
+                    index_health = await self._detect_index_drift(
+                        scope.project_id, run_id=run_id
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f'_detect_index_drift failed for project_id={scope.project_id!r}: {e}'
+                    )
+                    index_health = None
+
+                cycle_start_time = datetime.now(UTC)
+                stages = self._make_stages(scope)
                 reports = []
                 for stage in stages:
                     stage_key = stage.stage_id.value
@@ -3695,9 +3707,10 @@ class ReconciliationHarness:
                 # stage_reports copy captures whatever markers either arm
                 # stamped; the Stage-1-strictly-before-Stage-2 order the pair
                 # fires in is single-sourced on the helper (task 3732).
-                await self._flush_cycle_summaries(
-                    run, run_id, project_id, current_stage_name, cycle_start_time,
-                )
+                if cycle_start_time is not None:
+                    await self._flush_cycle_summaries(
+                        run, run_id, project_id, current_stage_name, cycle_start_time,
+                    )
                 await self._persist_stage_reports_then_gc_config_dir(run)
 
     async def _record_cancelled_run(
@@ -3904,8 +3917,8 @@ class ReconciliationHarness:
             await self._maybe_escalate_stale_task_count_snapshot(project_id, run_id, run)
 
             # Async judge review. Fire-and-forget: it outlives this cycle and
-            # is intentionally NOT tracked by _active_runs / recon_busy (which
-            # scopes to the stage pipeline only — see recon_busy_snapshot).
+            # is intentionally NOT tracked by _active_runs / recon_busy (whose
+            # scope is defined at recon_busy_snapshot).
             # Stage reports are already persisted above, so a cycle-aware
             # restart cancelling an in-flight judge here is an accepted
             # trade-off (task 2703 δ) — made non-lossy by the durable
