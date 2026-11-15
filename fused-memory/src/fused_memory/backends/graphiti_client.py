@@ -3594,6 +3594,31 @@ class GraphitiBackend:
         return (row[0], row[1] or '')
 
     @_canonicalize_group_args
+    async def get_node_names_by_uuids(
+        self, uuids: Sequence[str], *, group_id: str,
+    ) -> dict[str, str]:
+        """Name the Entity nodes among *uuids* in one indexed read (``Entity(uuid)`` range index).
+
+        It names the endpoints of a batch of graph hits. A node that is absent
+        or has no name is omitted: it has no name to give. Like
+        get_edges_by_uuids, it applies no ``n.group_id`` predicate, so an
+        edge's endpoint is named as stored.
+        """
+        wanted = list(dict.fromkeys(uuids))
+        if not wanted:
+            return {}
+        result = await self.graph_access.graph(group_id).ro_query(
+            'MATCH (n:Entity) WHERE n.uuid IN $uuids RETURN n.uuid, n.name',
+            {'uuids': wanted},
+            op='get_node_names_by_uuids',
+        )
+        names: dict[str, str] = {}
+        for node_uuid, name in result.result_set or []:
+            if isinstance(name, str) and name:
+                names.setdefault(node_uuid, name)
+        return names
+
+    @_canonicalize_group_args
     async def resolve_entity_by_name(self, name: str, *, group_id: str) -> str:
         """Resolve an entity name to its UUID via an exact Cypher lookup.
 
