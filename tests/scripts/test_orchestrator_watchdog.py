@@ -425,12 +425,13 @@ def test_restart_unit_handles_reset_failed_timeout(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     # Must not raise
-    wdog.restart_unit("orchestrator-dark-factory.service")
+    timed_out = wdog.restart_unit("orchestrator-dark-factory.service")
 
     systemctl_cmds = [c for c in calls if c[0] == "systemctl"]
     verbs = [c[2] for c in systemctl_cmds]
     assert "restart" in verbs, "restart must be called even after reset-failed timeout"
     assert len(log_messages) >= 1, "reset-failed timeout must be logged via log()"
+    assert timed_out == ("reset-failed",)
 
 
 def test_restart_unit_handles_restart_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -448,9 +449,120 @@ def test_restart_unit_handles_restart_timeout(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     # Must not raise
-    wdog.restart_unit("orchestrator-dark-factory.service")
+    timed_out = wdog.restart_unit("orchestrator-dark-factory.service")
 
     assert len(log_messages) >= 1, "restart timeout must be logged via log()"
+    assert timed_out == ("restart",)
+
+
+def test_restart_unit_reports_no_timed_out_phases_when_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wdog = _load_watchdog()
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "", "")
+    )
+    assert wdog.restart_unit("fused-memory.service") == ()
+
+
+def test_restart_unit_reports_every_timed_out_phase(monkeypatch: pytest.MonkeyPatch) -> None:
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "systemctl":
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert wdog.restart_unit("fused-memory.service") == ("reset-failed", "restart")
+
+
+_TIMED_OUT_PHASES = ("reset-failed", "restart")
+
+
+def _restart_closing_lines(logged: list[str], unit: str) -> list[str]:
+    return [m for m in logged if m.startswith(f"{unit} restart issued")]
+
+
+def _assert_restart_closed_unconfirmed(logged: list[str], unit: str) -> None:
+    """A timed-out restart closes with a qualified line, never a bare 'issued'."""
+    closing = _restart_closing_lines(logged, unit)
+    assert len(closing) == 1, f"expected one closing line for {unit}: {logged}"
+    assert closing[0] != f"{unit} restart issued", (
+        f"a timed-out restart must not close with the unqualified line: {logged}"
+    )
+    assert ", ".join(_TIMED_OUT_PHASES) in closing[0]
+    assert "timed out" in closing[0]
+    assert "unconfirmed" in closing[0]
+
+
+def _drive_main_restart_of_df(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> list[str]:
+    _wire_liveness_probe(wdog, monkeypatch, down_port=_DF_PORT)
+    monkeypatch.setattr(wdog, "FLEET_LEASE_PATH", str(tmp_path / "absent-lease.json"))
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", logged.append)
+    return logged
+
+
+def test_main_closes_a_clean_restart_as_issued(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    logged = _drive_main_restart_of_df(wdog, monkeypatch, tmp_path)
+
+    wdog.main(read_status=_healthy_restart_status)
+
+    assert _restart_closing_lines(logged, _DF_UNIT) == [f"{_DF_UNIT} restart issued"]
+
+
+def test_main_closes_a_timed_out_restart_as_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    logged = _drive_main_restart_of_df(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "restart_unit", lambda _u: _TIMED_OUT_PHASES)
+
+    wdog.main(read_status=_healthy_restart_status)
+
+    _assert_restart_closed_unconfirmed(logged, _DF_UNIT)
+
+
+def _drive_liveness_pass_to_restart(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> list[str]:
+    threshold = wdog.FM_LIVENESS_STREAK_THRESHOLD
+    _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"] * threshold)
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", logged.append)
+    return logged
+
+
+def test_liveness_pass_closes_a_clean_restart_as_issued(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    logged = _drive_liveness_pass_to_restart(wdog, monkeypatch, tmp_path)
+
+    for _ in range(wdog.FM_LIVENESS_STREAK_THRESHOLD):
+        wdog.fused_memory_liveness_pass()
+
+    unit = wdog.FUSED_MEMORY_UNIT
+    assert _restart_closing_lines(logged, unit) == [f"{unit} restart issued"]
+
+
+def test_liveness_pass_closes_a_timed_out_restart_as_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    wdog = _load_watchdog()
+    logged = _drive_liveness_pass_to_restart(wdog, monkeypatch, tmp_path)
+    monkeypatch.setattr(wdog, "restart_unit", lambda _u: _TIMED_OUT_PHASES)
+
+    for _ in range(wdog.FM_LIVENESS_STREAK_THRESHOLD):
+        wdog.fused_memory_liveness_pass()
+
+    _assert_restart_closed_unconfirmed(logged, wdog.FUSED_MEMORY_UNIT)
 
 
 # ---------------------------------------------------------------------------
@@ -10624,9 +10736,14 @@ def _wire_liveness_pass(
     function pops from it left-to-right, one per pass() call.
     """
     restarted: list[str] = []
+
+    def record_clean_restart(unit: str) -> tuple[str, ...]:
+        restarted.append(unit)
+        return ()
+
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
-    monkeypatch.setattr(wdog, "restart_unit", lambda unit: restarted.append(unit))
+    monkeypatch.setattr(wdog, "restart_unit", record_clean_restart)
     monkeypatch.setattr(wdog, "log", lambda _m: None)
     monkeypatch.setattr(wdog, "FM_LIVENESS_STREAK_PATH", str(tmp_path / "streak.json"))
     monkeypatch.setattr(
@@ -12103,11 +12220,16 @@ def _wire_liveness_probe(
     is needed" module docstring above).
     """
     restarted: list[str] = []
+
+    def record_clean_restart(unit: str) -> tuple[str, ...]:
+        restarted.append(unit)
+        return ()
+
     monkeypatch.setattr(wdog, "_unit_start_elapsed_secs", lambda _u: None)
     monkeypatch.setattr(wdog, "is_unit_enabled", lambda _u: True)
     monkeypatch.setattr(wdog, "probe_port", lambda port: port != down_port)
     monkeypatch.setattr(wdog, "_unit_active_state", lambda _u: "active")
-    monkeypatch.setattr(wdog, "restart_unit", lambda u: restarted.append(u))
+    monkeypatch.setattr(wdog, "restart_unit", record_clean_restart)
     return restarted
 
 
