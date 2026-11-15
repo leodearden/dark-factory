@@ -207,7 +207,7 @@ class TestTelemetryNeverChangesTheOutcome:
 
         assert verdict == _OK_PAYLOAD
         (failed,) = _logged(caplog, _RECORD_FAILED)
-        assert failed.ended_error_max_turns is False
+        assert getattr(failed, 'ended_error_max_turns', None) is False
 
     @pytest.mark.asyncio
     async def test_write_failure_keeps_the_infra_error_and_the_hit_line(self, journal, caplog):
@@ -220,7 +220,7 @@ class TestTelemetryNeverChangesTheOutcome:
             await _call(_judge(journal), _turn_cap())
 
         (failed,) = _logged(caplog, _RECORD_FAILED)
-        assert failed.ended_error_max_turns is True
+        assert getattr(failed, 'ended_error_max_turns', None) is True
         assert len(_logged(caplog, _TURN_CAP_HIT)) == 1
 
 
@@ -236,11 +236,11 @@ class TestTurnCapHitLog:
             await _call(_judge(journal), _turn_cap(), run_id='run-cap')
 
         (hit,) = _logged(caplog, _TURN_CAP_HIT)
-        assert hit.run_id == 'run-cap'
-        assert hit.num_turns == 4
-        assert hit.max_turns == 3
-        assert hit.rejected_tool_calls == 2
-        assert hit.schema_salvaged is False
+        assert getattr(hit, 'run_id', None) == 'run-cap'
+        assert getattr(hit, 'num_turns', None) == 4
+        assert getattr(hit, 'max_turns', None) == 3
+        assert getattr(hit, 'rejected_tool_calls', None) == 2
+        assert getattr(hit, 'schema_salvaged', None) is False
 
     @pytest.mark.asyncio
     async def test_salvaged_turn_cap_hit_says_it_was_salvaged(self, journal, caplog):
@@ -248,7 +248,7 @@ class TestTurnCapHitLog:
             await _call(_judge(journal), _salvaged_turn_cap())
 
         (hit,) = _logged(caplog, _TURN_CAP_HIT)
-        assert hit.schema_salvaged is True
+        assert getattr(hit, 'schema_salvaged', None) is True
 
     @pytest.mark.asyncio
     async def test_ordinary_success_logs_no_hit(self, journal, caplog):
