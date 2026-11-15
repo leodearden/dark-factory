@@ -17,6 +17,7 @@ import pytest
 from escalation.queue import EscalationQueue
 
 from orchestrator.event_store import EventType
+from orchestrator.merge_halt_escalation import MERGE_HALT_CATEGORY_BY_STATUS
 from orchestrator.merge_lane import MergeOutcome
 from orchestrator.merge_lane.outcome_facts import MergeBlockCategory
 from orchestrator.recovered_merge_owner import RecoveredMergeOwner, Settled
@@ -47,6 +48,29 @@ class FakeTaskStore:
         self.status = status
 
 
+class FakeMergeHalt:
+    def __init__(
+        self, *, is_wip_halted: bool = True, halt_owner_esc_id: str | None = None,
+    ) -> None:
+        self.is_wip_halted = is_wip_halted
+        self.halt_owner_esc_id = halt_owner_esc_id
+        self.owners: list[str] = []
+        self.unhalt_reasons: list[str | None] = []
+
+    def set_halt_owner(self, esc_id: str) -> None:
+        assert self.is_wip_halted
+        assert self.halt_owner_esc_id is None
+        self.halt_owner_esc_id = esc_id
+        self.owners.append(esc_id)
+
+    def is_halt_owner(self, esc_id: str) -> bool:
+        return self.halt_owner_esc_id == esc_id
+
+    def unhalt_wip(self, reason: str | None = None) -> None:
+        self.is_wip_halted = False
+        self.unhalt_reasons.append(reason)
+
+
 @dataclass(frozen=True)
 class Request:
     result: asyncio.Future
@@ -74,11 +98,11 @@ def reconcile_landed() -> AsyncMock:
 
 def _owner(
     store: FakeTaskStore, queue: EscalationQueue, reconcile_landed: AsyncMock,
-    event_store: MagicMock | None = None,
+    event_store: MagicMock | None = None, *, merge_halt: FakeMergeHalt | None = None,
 ) -> RecoveredMergeOwner:
     return RecoveredMergeOwner(
         tasks=store, escalations=queue, reconcile_landed=reconcile_landed,
-        event_store=event_store,
+        merge_halt=merge_halt, event_store=event_store,
     )
 
 
@@ -176,7 +200,6 @@ class TestLandingDrivesTheLandedOutboxDoneWrite:
     @pytest.mark.parametrize('outcome', [
         MergeOutcome(status='done', merge_sha='a' * 40),
         MergeOutcome(status='already_merged', merge_sha='a' * 40),
-        MergeOutcome(status='done_wip_recovery', merge_sha='a' * 40),
     ], ids=lambda outcome: outcome.status)
     async def test_landing_calls_reconcile_landed(
         self, queue: EscalationQueue, reconcile_landed: AsyncMock, outcome: MergeOutcome,
@@ -208,7 +231,6 @@ class TestLandingDrivesTheLandedOutboxDoneWrite:
 class TestTransientOutcomeIsLeftToTheSweep:
     @pytest.mark.parametrize('outcome', [
         MergeOutcome(status='superseded'),
-        MergeOutcome(status='wip_halted'),
     ], ids=lambda outcome: outcome.status)
     async def test_nothing_happens(
         self, queue: EscalationQueue, reconcile_landed: AsyncMock, outcome: MergeOutcome,
@@ -221,6 +243,126 @@ class TestTransientOutcomeIsLeftToTheSweep:
         reconcile_landed.assert_not_awaited()
         assert store.writes == []
         assert _open_l1s(queue) == []
+
+
+_HALT_OUTCOMES = {
+    'wip_halted': MergeOutcome(status='wip_halted', overlap_files=['x.py']),
+    'done_wip_recovery': MergeOutcome(
+        status='done_wip_recovery', recovery_branch='wip/r', merge_sha='a' * 40,
+    ),
+    'wip_recovery_no_advance': MergeOutcome(
+        status='wip_recovery_no_advance', recovery_branch='wip/r',
+    ),
+    'unmerged_state': MergeOutcome(status='unmerged_state'),
+    'stash_failed': MergeOutcome(status='stash_failed', dirty_files=['README.md']),
+}
+_STASH_FAILED = _HALT_OUTCOMES['stash_failed']
+
+
+def _open_l1s_in(queue: EscalationQueue, category: str) -> list:
+    return [esc for esc in _open_l1s(queue) if esc.category == category]
+
+
+@pytest.mark.asyncio
+class TestHaltOutcomeOwnsTheMergeHalt:
+    @pytest.mark.parametrize('status', sorted(_HALT_OUTCOMES))
+    async def test_halt_outcome_files_the_halt_owning_l1(
+        self, queue: EscalationQueue, reconcile_landed: AsyncMock, status: str,
+    ) -> None:
+        store = FakeTaskStore('in-progress')
+        halt = FakeMergeHalt()
+
+        settled = await _owner(store, queue, reconcile_landed, merge_halt=halt).settle(
+            _request(), _HALT_OUTCOMES[status],
+        )
+
+        assert settled == Settled.HALTED
+        [esc] = _open_l1s(queue)
+        assert esc.category == MERGE_HALT_CATEGORY_BY_STATUS[status]
+        assert esc.suggested_action == 'manual_intervention'
+        assert _REQUEST_ID in esc.detail
+        assert halt.owners == [esc.id]
+        if status == 'done_wip_recovery':
+            reconcile_landed.assert_awaited_once_with(_TID)
+            assert (_TID, 'blocked') not in store.writes
+        else:
+            assert store.writes == [(_TID, 'blocked')]
+            reconcile_landed.assert_not_awaited()
+
+    async def test_an_already_owned_halt_gets_a_non_owning_record(
+        self, queue: EscalationQueue, reconcile_landed: AsyncMock,
+    ) -> None:
+        store = FakeTaskStore('in-progress')
+        halt = FakeMergeHalt(halt_owner_esc_id='esc-other')
+
+        await _owner(store, queue, reconcile_landed, merge_halt=halt).settle(
+            _request(), _STASH_FAILED,
+        )
+
+        assert _open_l1s_in(queue, 'stash_failed') == []
+        [esc] = _open_l1s(queue)
+        assert esc.category == 'task_failure'
+        assert 'esc-other' in esc.detail
+        assert halt.owners == []
+        assert store.writes == [(_TID, 'blocked')]
+
+    @pytest.mark.parametrize('halt', [None, FakeMergeHalt(is_wip_halted=False)],
+                             ids=['no_merge_worker', 'force_unhalted'])
+    async def test_no_ownable_halt_files_no_halt_category_record(
+        self, queue: EscalationQueue, reconcile_landed: AsyncMock,
+        halt: FakeMergeHalt | None,
+    ) -> None:
+        store = FakeTaskStore('in-progress')
+
+        await _owner(store, queue, reconcile_landed, merge_halt=halt).settle(
+            _request(), _STASH_FAILED,
+        )
+
+        assert _open_l1s_in(queue, 'stash_failed') == []
+        [esc] = _open_l1s(queue)
+        assert esc.category == 'task_failure'
+        assert store.writes == [(_TID, 'blocked')]
+
+    async def test_a_moved_task_status_still_files_the_halt_owner(
+        self, queue: EscalationQueue, reconcile_landed: AsyncMock,
+    ) -> None:
+        store = FakeTaskStore('blocked')
+        halt = FakeMergeHalt()
+
+        await _owner(store, queue, reconcile_landed, merge_halt=halt).settle(
+            _request(), _STASH_FAILED,
+        )
+
+        [esc] = _open_l1s_in(queue, 'stash_failed')
+        assert halt.owners == [esc.id]
+        assert store.writes == []
+
+    async def test_a_task_a_workflow_holds_is_left_to_its_handler(
+        self, queue: EscalationQueue, reconcile_landed: AsyncMock,
+    ) -> None:
+        store = FakeTaskStore('in-progress', held=True)
+        halt = FakeMergeHalt()
+
+        settled = await _owner(store, queue, reconcile_landed, merge_halt=halt).settle(
+            _request(), _STASH_FAILED,
+        )
+
+        assert settled == Settled.WORKFLOW_HELD
+        assert _open_l1s(queue) == []
+        assert halt.owners == []
+
+    async def test_a_second_settle_files_no_second_halt_record(
+        self, queue: EscalationQueue, reconcile_landed: AsyncMock,
+    ) -> None:
+        store = FakeTaskStore('in-progress')
+        halt = FakeMergeHalt()
+        owner = _owner(store, queue, reconcile_landed, merge_halt=halt)
+
+        await owner.settle(_request(), _STASH_FAILED)
+        await owner.settle(_request(), _STASH_FAILED)
+
+        assert len(_open_l1s_in(queue, 'stash_failed')) == 1
+        assert len(halt.owners) == 1
 
 
 @pytest.mark.asyncio

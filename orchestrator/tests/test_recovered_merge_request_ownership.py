@@ -129,6 +129,27 @@ async def _drain(h: Harness) -> None:
     await asyncio.gather(*h._background_tasks)
 
 
+class FakeMergeWorker:
+    def __init__(self, *, halted: bool) -> None:
+        self.is_wip_halted = halted
+        self.halt_owner_esc_id: str | None = None
+
+    def halt_for_wip(self, reason: str) -> None:
+        self.is_wip_halted = True
+        self.halt_owner_esc_id = None
+
+    def set_halt_owner(self, esc_id: str) -> None:
+        assert self.is_wip_halted
+        assert self.halt_owner_esc_id is None
+        self.halt_owner_esc_id = esc_id
+
+    def is_halt_owner(self, esc_id: str) -> bool:
+        return self.halt_owner_esc_id == esc_id
+
+    def unhalt_wip(self, reason: str | None = None) -> None:
+        self.is_wip_halted = False
+
+
 @pytest.mark.asyncio
 class TestRecoveredRequestOutcomeHasAnOwner:
     async def test_failed_recovered_request_blocks_the_task_with_an_l1(
@@ -161,3 +182,29 @@ class TestRecoveredRequestOutcomeHasAnOwner:
 
         landed_gate.assert_awaited_once_with(_TID)
         assert harness._escalation_queue.get_by_task(_TID, status='pending', level=1) == []
+
+    async def test_halting_recovered_request_owns_the_merge_halt(
+        self, harness: Harness, scheduler_double: MagicMock, tmp_path: Path,
+    ) -> None:
+        harness._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        worker = FakeMergeWorker(halted=True)
+        harness._merge_worker = worker
+        request = _recovered_request()
+        await _recover(harness, request)
+
+        request.result.set_result(SimpleNamespace(
+            status='stash_failed', reason='park failed', dirty_files=['README.md'],
+            recovery_branch=None, overlap_files=None, merge_sha=None,
+        ))
+        await _drain(harness)
+
+        [esc] = harness._escalation_queue.get_by_task(_TID, status='pending', level=1)
+        assert esc.category == 'stash_failed'
+        assert worker.is_halt_owner(esc.id)
+        scheduler_double.set_task_status.assert_any_await(_TID, 'blocked')
+
+        restarted = FakeMergeWorker(halted=False)
+        harness._merge_worker = restarted
+        assert harness._rehydrate_merge_halt() == esc.id
+        assert restarted.is_wip_halted
+        assert restarted.is_halt_owner(esc.id)
