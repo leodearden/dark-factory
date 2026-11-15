@@ -4,6 +4,7 @@ Task 5462.  These tests assert values only: nothing is created under
 ``CHECKOUT_ROOT``.
 """
 
+import os
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ def test_checkout_root_is_the_checkout_holding_the_imported_package():
     assert CHECKOUT_ROOT.is_absolute()
     assert Path(fused_memory.__file__).resolve().is_relative_to(CHECKOUT_ROOT / 'fused-memory')
     assert (CHECKOUT_ROOT / 'fused-memory' / 'config' / 'config.yaml').is_file()
+    assert checkout_anchor.ANCHOR_HOLDS_CHECKOUT is True
 
 
 def test_a_relative_path_is_joined_onto_the_checkout_whatever_the_cwd(
@@ -30,6 +32,22 @@ def test_a_relative_path_is_joined_onto_the_checkout_whatever_the_cwd(
 
     assert from_tmp == str(CHECKOUT_ROOT / 'data' / 'reconciliation')
     assert from_elsewhere == from_tmp
+
+
+def test_anchoring_a_relative_path_reads_nothing_from_disk(monkeypatch):
+    """Coroutines reach anchor_at_checkout through server/main.py::resolve_data_dir, so a call must not touch the filesystem (INV-8)."""
+
+    def no_io(*_a, **_k):
+        raise AssertionError('anchor_at_checkout touched the filesystem at call time')
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Path, 'is_file', no_io)
+        patched.setattr(Path, 'exists', no_io)
+        patched.setattr(Path, 'stat', no_io)
+        patched.setattr(os, 'stat', no_io)
+        anchored = anchor_at_checkout('./data/reconciliation')
+
+    assert anchored == str(CHECKOUT_ROOT / 'data' / 'reconciliation')
 
 
 def test_an_absolute_path_is_returned_byte_identical(tmp_path):
@@ -47,6 +65,7 @@ def test_a_relative_path_is_refused_when_the_anchor_holds_no_checkout(monkeypatc
     anchor and the offending path instead.
     """
     monkeypatch.setattr(checkout_anchor, 'CHECKOUT_ROOT', tmp_path)
+    monkeypatch.setattr(checkout_anchor, 'ANCHOR_HOLDS_CHECKOUT', False)
 
     with pytest.raises(RuntimeError) as refusal:
         anchor_at_checkout('./data/reconciliation')
@@ -58,6 +77,7 @@ def test_a_relative_path_is_refused_when_the_anchor_holds_no_checkout(monkeypatc
 
 def test_an_absolute_path_needs_no_checkout(monkeypatch, tmp_path):
     monkeypatch.setattr(checkout_anchor, 'CHECKOUT_ROOT', tmp_path)
+    monkeypatch.setattr(checkout_anchor, 'ANCHOR_HOLDS_CHECKOUT', False)
     absolute = str(tmp_path / 'abs')
 
     assert anchor_at_checkout(absolute) == absolute
