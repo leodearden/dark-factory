@@ -348,7 +348,9 @@ class StubMcp:
     On the escalation side it keeps the archive: every ``escalate_info`` is a
     record in ``filed`` with the real ``esc-<task_id>-<seq>`` id, and
     ``get_task_escalations`` answers from it at every level and status.
-    :meth:`route_info_notes` plays the info-L0 router.
+    :meth:`route_info_notes` plays the info-L0 router: it converts a note into
+    a task titled by the note's summary, which folds onto any non-cancelled
+    row of the same candidate key, as a submission does.
     """
 
     def __init__(
@@ -471,23 +473,29 @@ class StubMcp:
     def route_info_notes(self, *, convert_to: int | None = None, promote: bool = False) -> None:
         """Play ``orchestrator/src/orchestrator/escalation_router.py``: dismiss every pending note.
 
-        ``promote`` first files a dismissed L1 under the same ``task_id``, the
-        orphan-reaper / watcher shape that produced task 7693.  ``convert_to``
-        inserts a pending task with that id, carrying the escalation id it was
-        converted from (the L1's when promoted); None dismisses only, as when
-        the curator combined the conversion elsewhere.
+        ``promote`` first files a dismissed L1 under the same ``task_id`` and
+        summary, the orphan-reaper / watcher shape that produced task 7693.
+        ``convert_to`` converts the note into a pending task with that id,
+        titled by its summary and declaring no files
+        (``escalation/src/escalation/disposition.py::_curator_candidate``), and
+        carrying the escalation id it was converted from (the L1's when
+        promoted).  Like the curator, the conversion folds onto any
+        non-cancelled row of the same candidate key and then inserts nothing.
+        None dismisses only, as when the curator combined the conversion
+        elsewhere.
         """
         for record in self.pending:
             record['status'] = 'dismissed'
             converted_from = record['id']
             if promote:
                 converted_from = self._file_record(
-                    {'task_id': record['task_id']}, level=1, status='dismissed'
+                    {'task_id': record['task_id'], 'summary': record['summary']}, level=1, status='dismissed'
                 )['id']
             if convert_to is not None:
-                insert_task(
-                    self.db, convert_to, {'escalation_id': converted_from, 'source': 'info-l0-router'}
-                )
+                title = record['summary'].strip()
+                metadata = {'escalation_id': converted_from, 'source': 'info-l0-router'}
+                if self._colliding_row({'title': title, 'metadata': metadata}) is None:
+                    insert_task(self.db, convert_to, metadata, title=title)
         self.pending = []
 
 
@@ -845,7 +853,7 @@ def test_a_conversion_counts_only_for_an_escalation_its_own_key_filed(project_ro
     assert escalated[-1]['task_id'] == key_27.escalation_task_id()
 
 
-def test_a_closed_conversion_with_the_owner_still_dead_escalates_once_more(project_root, seed):
+def test_a_closed_home_is_escalated_once_per_closure(project_root, seed):
     db = seed([{'id': 2733, 'status': 'done'}])
     stub = StubMcp(db)
     ports = ports_for(project_root, stub)
@@ -858,13 +866,29 @@ def test_a_closed_conversion_with_the_owner_still_dead_escalates_once_more(proje
 
     assert [report.step for report in planned.reports] == [Action.ESCALATE_CLOSED_FINDING]
     assert second.escalated == 1
-    assert len(stub.tool_calls('escalate_info')) == 2
+    first_raise, second_raise = stub.tool_calls('escalate_info')
+    assert second_raise['summary'] != first_raise['summary']
+    assert 'task 9500' in second_raise['summary']
 
     stub.route_info_notes(convert_to=9501)
-    third = sweep_once(LIST_2733, ports)
 
+    assert stored_metadata(db, 9501)['escalation_id'] == stub.filed[1]['id']
+    third = sweep_once(LIST_2733, ports)
     assert len(stub.tool_calls('escalate_info')) == 2
     assert third.skipped_existing == 1
+
+    set_status(db, 9501, 'done')
+    sweep_once(LIST_2733, ports)
+
+    escalated = stub.tool_calls('escalate_info')
+    assert len(escalated) == 3
+    assert 'task 9501' in escalated[-1]['summary']
+
+    stub.route_info_notes(convert_to=9502)
+
+    assert stored_metadata(db, 9502)['escalation_id'] == stub.filed[2]['id']
+    sweep_once(LIST_2733, ports)
+    assert len(stub.tool_calls('escalate_info')) == 3
 
 
 def test_an_unreadable_escalation_history_is_an_escalation_failure(project_root, seed):
