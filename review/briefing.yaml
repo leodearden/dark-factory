@@ -379,39 +379,45 @@ subprojects:
 
   sampler:
     purpose: >
-      Host-load sampler. A timer-fired ONE-SHOT (Type=oneshot, every 5s — NOT a daemon)
-      that collects 9 load metrics — PSI cpu/memory/io avg10 from /proc/pressure, plus
-      occt_queue_depth, verify_concurrency, verify_rss_total_bytes from the process table —
-      and appends them to data/load-samples.db, which the dashboard reads to render live
-      system-health panels. Gives the factory an always-on load signal without a long-lived
-      process that could hang or leak.
+      Host-load sampler. It is a timer-fired ONE-SHOT (Type=oneshot, every 5s — NOT a
+      daemon). It collects host load (PSI pressure, run-queue load, the factory's own
+      cgroup pressure per cgroup leaf, and verify/OCCT process saturation) and appends
+      one tick of samples to data/load-samples.db. The dashboard reads that file to
+      render live system-health panels, and scripts/load-threshold-calibration.py reads
+      it to recommend the shared.psi admission thresholds. Gives the factory an
+      always-on load signal without a long-lived process that could hang or leak. The
+      metric vocabulary (names, groups, which metrics are per-leaf, gate arms) has one
+      home, sampler/src/sampler/metrics.py::METRIC_GROUPS: read counts there, not here.
 
     key_scenarios:
-      - "Every 5s systemd fires the unit; PSI rows + process-level rows are written to data/load-samples.db; the dashboard /api/load endpoint reads them into sparklines"
+      - "Every 5s systemd fires the unit; each admitted collection group's rows land in data/load-samples.db in ONE transaction, so the corpus never holds half a tick; the dashboard /api/load endpoint reads them into sparklines"
       - "occt_queue_depth shows how many cargo-test-occt-gated bash processes are blocked on the OCCT semaphore; verify_concurrency/RSS show verify.sh saturation"
-      - "24-hour rolling window retained (per-tick prune + daily VACUUM) so the DB stays small regardless of uptime"
-      - "Degrade-and-continue: a PSI-collection failure still writes process metrics and vice versa; only a store-construction failure exits non-zero"
+      - "Rows are kept for a bounded retention window and pruned at most once a day, and VACUUM runs only when enough of the file is reclaimable; the window, cadences and reclaim threshold live in sampler/src/sampler/store.py (module docstring 'Retention', LoadSampleStore.cleanup_old, LoadSampleStore.maybe_vacuum). The window is sized for threshold calibration, not just the dashboard sparklines"
+      - "Degrade-and-continue per collection group: a group whose collector fails, or that emits a key its MetricGroup does not admit (logged at ERROR naming the keys), writes nothing that tick while the other groups are still written; only a store-construction failure, a failed leaf-column migration included, exits non-zero"
 
     what_working_means:
       - "systemctl --user is-active dark-factory-load-sampler.timer returns active"
       - "data/load-samples.db exists at repo root within ~15s of enabling"
-      - "9 distinct metrics appear in the last 30s; journal shows `tick ts=… psi={…} process={…}` lines every 5s with no exception entries"
-      - "The dashboard load panel shows non-null sparklines for all 9 metrics"
+      - "Rows for every group's host-level metrics appear in the last 30s; assert presence, not a count, because the per-tick row count depends on the host's cgroup leaves (sampler/src/sampler/metrics.py::METRIC_GROUPS). The journal shows `tick ts=… psi={…} process={…} load={…}` lines every 5s, with no exception entries and no group rendered `dropped`"
+      - "/api/load returns populated values for every metric it serves (dashboard/src/dashboard/data/load.py::KNOWN_METRICS, a projection of METRIC_GROUPS)"
 
     key_decisions:
       - decision: "Timer-fired oneshot, not a daemon — no in-memory state survives between ticks"
-        why: "Avoids a long-lived process that could hang/leak; trailing-window process metrics are computed by querying the last ~59 DB rows each tick, not from an in-process ring buffer"
+        why: "Avoids a long-lived process that could hang/leak; a windowed metric's trailing window is read back from the DB each tick, per (metric, leaf), rather than kept in an in-process ring buffer (sampler/src/sampler/store.py module docstring, 'Trailing window')"
 
       - decision: "occt_queue_depth uses an FD-9 jobserver heuristic (a gated bash proc whose /proc/<pid>/fd/9 is absent is 'waiting')"
         why: "FD 9 is the jobserver semaphore read-end; this is an implementation-detail heuristic (metrics.py docstring flags it) that may break if the gate script changes FD numbers. Matching is substring on the cmdline, so path-form invocations (…/cargo-test-occt-gated.sh) are counted."
 
-      - decision: "VACUUM opened with isolation_level=None (autocommit), timestamp recorded only after success"
-        why: "Avoids 'cannot VACUUM from within a transaction'; recording the time only on success avoids suppressing retries on transient failure"
+      - decision: "VACUUM runs on its own autocommit connection, only when the reclaimable free-page fraction clears a threshold, and stamps its clock only on success"
+        why: "SQLite refuses VACUUM inside a transaction; a whole-file rewrite pays only after a bulk prune frees pages that steady-state inserts will not reuse; a skip (nothing to reclaim) counts as a successful evaluation, while a failed VACUUM is retried on the next eligible tick. Threshold and cadence: sampler/src/sampler/store.py::LoadSampleStore.maybe_vacuum"
 
-    known_gaps:
-      - what: "The load-samples schema is duplicated between sampler.store._SCHEMA and dashboard's LOAD_SAMPLES_SCHEMA with no automated sync check"
-        why: "A manual contract; a sampler schema change without a matching dashboard update would surface only as a dashboard query failure at read time. Documented in both files, but unenforced."
-        tracking: null
+      - decision: "A cgroup leaf is a column, never part of the metric name"
+        why: "Per-leaf metrics are keyed SampleKey(metric, leaf) and stored in samples.leaf (task 6772). Files written before the column existed are migrated at store construction, additively and feature-detected, in one transaction. Nothing parses ':' out of a metric name: MetricSpec rejects a name containing ':', and SampleKey.label() is display-only"
+
+      - decision: "The sampler owns the load-samples schema and the metric vocabulary; consumers import them, never copy them"
+        why: "sampler/src/sampler/store.py::SCHEMA and sampler/src/sampler/metrics.py::METRIC_GROUPS are the one home (task 6772). The dashboard declares dark-factory-load-sampler as a workspace dependency and projects METRIC_GROUPS; scripts/load-threshold-calibration.py imports sampler.metrics but never sampler.store, because it runs under /usr/bin/python3 with no venv (that script's module docstring). A reintroduced local copy of the schema or the metric list is a regression"
+
+    known_gaps: []
 
     exclude: []
 
