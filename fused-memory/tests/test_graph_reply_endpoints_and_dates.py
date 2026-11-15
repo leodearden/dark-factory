@@ -20,7 +20,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from _fm_helpers import extract_cypher
+from _fm_helpers import extract_cypher, extract_params
 from _graph_access_fake import FakeGraphAccess
 
 GROUP = 'test'
@@ -141,3 +141,51 @@ class TestExactNameEntityEdgesCarryDates:
             uuid: {'valid_at': valid_at, 'invalid_at': None}
             for uuid, valid_at in _STORED_DATES.items()
         }
+
+
+class TestNodeNamesByUuids:
+    """get_node_names_by_uuids names a batch of Entity nodes in one read."""
+
+    @pytest.mark.asyncio
+    async def test_names_each_distinct_node_in_one_read(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[['n-42', 'Task 42'], ['n-r', 'Redis']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        names = await backend.get_node_names_by_uuids(['n-42', 'n-r', 'n-42'], group_id=GROUP)
+
+        assert names == {'n-42': 'Task 42', 'n-r': 'Redis'}
+        graph.ro_query.assert_awaited_once()
+        graph.query.assert_not_awaited()
+        cypher = extract_cypher(graph.ro_query.call_args)
+        assert 'Entity' in cypher
+        assert 'n.uuid IN $uuids' in cypher
+        assert extract_params(graph.ro_query.call_args)['uuids'] == ['n-42', 'n-r']
+
+    @pytest.mark.asyncio
+    async def test_unnamed_and_absent_nodes_are_left_out(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[['n-42', 'Task 42'], ['n-null', None], ['n-empty', '']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        names = await backend.get_node_names_by_uuids(
+            ['n-42', 'n-null', 'n-empty', 'n-absent'], group_id=GROUP,
+        )
+
+        assert names == {'n-42': 'Task 42'}
+
+    @pytest.mark.asyncio
+    async def test_empty_input_issues_no_read(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        backend = make_backend(mock_config)
+        graph = make_graph_mock(ro_rows=[['n-42', 'Task 42']])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+
+        assert await backend.get_node_names_by_uuids([], group_id=GROUP) == {}
+        graph.ro_query.assert_not_awaited()
+        graph.query.assert_not_awaited()
