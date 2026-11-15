@@ -29,7 +29,11 @@ from mcp.types import CallToolResult, TextContent
 
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import render_add_memory_message
-from fused_memory.services.write_journal import Mem0IntentStatus, WriteJournal
+from fused_memory.services.write_journal import (
+    Mem0IntentStatus,
+    Mem0WriteMethod,
+    WriteJournal,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'replay_failed_mem0_intents.py'
 
@@ -356,6 +360,78 @@ class TestReplay:
         assert await mem0_intent_row(journal, intent_id) == before
 
 
+async def _seed_system_record(
+    journal: WriteJournal, *, created_at: datetime | None = None
+) -> str:
+    return await seed_mem0_intent(
+        journal,
+        status=Mem0IntentStatus.FAILED,
+        reason='qdrant down',
+        created_at=created_at,
+        content='cycle summary: reconciled 12 tasks',
+        metadata={'category': 'observations_and_summaries', 'kind': 'cycle_summary'},
+        project_id='dark_factory',
+        agent_id='recon-stage-task_knowledge_sync',
+        category='observations_and_summaries',
+        write_method=Mem0WriteMethod.ADD_SYSTEM_RECORD,
+    )
+
+
+class TestASystemRecordIsNeverReplayedThroughAddMemory:
+    @pytest.mark.asyncio
+    async def test_a_system_record_intent_is_reported_not_replayable(self, journal):
+        system_record = await _seed_system_record(journal, created_at=_T)
+        ordinary = await _seed(journal, created_at=_T + timedelta(seconds=1))
+        add_memory = _AddMemory()
+
+        outcomes = _by_id(
+            await _script.replay(
+                journal,
+                add_memory,
+                selection=Selection(intent_ids=(system_record, ordinary)),
+                apply=True,
+            )
+        )
+
+        assert outcomes[system_record].outcome is ReplayResult.NOT_REPLAYABLE
+        assert 'add_system_record' in outcomes[system_record].detail
+        assert [call['content'] for call in add_memory.calls] == [
+            'always pin dependencies exactly'
+        ]
+        assert (await mem0_intent_row(journal, system_record))['status'] == 'failed'
+        assert outcomes[ordinary].outcome is ReplayResult.LANDED
+
+    @pytest.mark.asyncio
+    async def test_a_window_reports_a_system_record_rather_than_skipping_it(self, journal):
+        system_record = await _seed_system_record(journal, created_at=_T)
+        add_memory = _AddMemory()
+
+        (outcome,) = await _script.replay(
+            journal,
+            add_memory,
+            selection=Selection(created_from=_T, created_before=_T + timedelta(minutes=1)),
+            apply=True,
+        )
+
+        assert outcome.intent_id == system_record
+        assert outcome.outcome is ReplayResult.NOT_REPLAYABLE
+        assert add_memory.calls == []
+        assert (await mem0_intent_row(journal, system_record))['status'] == 'failed'
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_reports_a_system_record_not_replayable(self, journal):
+        system_record = await _seed_system_record(journal)
+
+        (outcome,) = await _script.replay(
+            journal,
+            _AddMemory(),
+            selection=Selection(intent_ids=(system_record,)),
+            apply=False,
+        )
+
+        assert outcome.outcome is ReplayResult.NOT_REPLAYABLE
+
+
 def _tool_result(
     structured: dict[str, Any] | None, *, text: str = '', is_error: bool = False
 ) -> CallToolResult:
@@ -416,6 +492,18 @@ def _seed_journal_dir(data_dir: Path, count: int) -> list[str]:
     return asyncio.run(_seed_all())
 
 
+def _seed_system_record_dir(data_dir: Path) -> str:
+    async def _seed_one() -> str:
+        j = WriteJournal(data_dir)
+        await j.initialize()
+        try:
+            return await _seed_system_record(j)
+        finally:
+            await j.close()
+
+    return asyncio.run(_seed_one())
+
+
 def _statuses(data_dir: Path) -> dict[str, str]:
     with closing(sqlite3.connect(data_dir / 'write_journal.db')) as conn:
         return dict(conn.execute('SELECT id, status FROM mem0_intents').fetchall())
@@ -466,6 +554,29 @@ class TestMain:
         row_lines = [line for line in out.splitlines() if line.split('\t')[0] in before]
         assert sorted(line.split('\t')[0] for line in row_lines) == sorted([first, second])
         assert _statuses(data_dir) == before
+
+    def test_a_dry_run_selecting_a_system_record_fails_and_names_its_row(
+        self, tmp_path, capsys
+    ):
+        data_dir = tmp_path / 'wj'
+        (ordinary,) = _seed_journal_dir(data_dir, 1)
+        system_record = _seed_system_record_dir(data_dir)
+        argv = [
+            '--journal-dir', str(data_dir),
+            '--intent-id', ordinary,
+            '--intent-id', system_record,
+            '--mcp-url', 'http://127.0.0.1:1/mcp',
+        ]
+
+        code = _script.main(argv)
+
+        assert code == _script.EXIT_RUN_FAILED
+        (line,) = [
+            line for line in capsys.readouterr().out.splitlines()
+            if line.startswith(system_record)
+        ]
+        assert line.split('\t')[2] == ReplayResult.NOT_REPLAYABLE.value
+        assert _script.main([*argv, '--skip', system_record]) == 0
 
     def test_no_selection_is_a_usage_error(self, tmp_path):
         data_dir = tmp_path / 'wj'
