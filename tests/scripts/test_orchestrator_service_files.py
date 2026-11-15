@@ -53,6 +53,9 @@ import pathlib
 import re
 
 import pytest
+from orchestrator_projects import scan_units
+from shared.cgroup_slice import project_slice_name
+from shared.project_id import project_id_for_root
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # Shared with tests/scripts/test_know_live_installed_unit_parity.py, which had
@@ -629,6 +632,39 @@ def test_orchestrator_service_sets_own_orch_unit(
         f"{service_path.name} must set `{expected_line}` in its [Service] section "
         "(systemd only honours Environment= under [Service])"
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-project cgroup slice (task 3394; contract docs/cgroup-slice-topology.md)
+#
+# Each project unit runs under the slice the shared name rule gives the project
+# its --config names. The project roots come from scan_units, the same
+# ExecStart --config reader the restart tooling uses.
+# ---------------------------------------------------------------------------
+
+_PROJECT_UNIT_SCAN = scan_units(REPO_ROOT / "scripts")
+_PROJECT_UNIT_ROOTS = {
+    unit: root for root, units in _PROJECT_UNIT_SCAN.roots.items() for unit in units
+}
+
+
+def test_slice_scan_covers_every_project_unit() -> None:
+    """Every non-watchdog unit has a scanned project root, so none passes vacuously."""
+    assert _PROJECT_UNIT_SCAN.problems == ()
+    project_units = {
+        p.name for p in ALL_ORCHESTRATOR_SERVICE_FILES if p != WATCHDOG_SERVICE
+    }
+    assert set(_PROJECT_UNIT_ROOTS) == project_units
+
+
+@pytest.mark.parametrize("unit_name", sorted(_PROJECT_UNIT_ROOTS))
+def test_project_unit_runs_under_its_project_slice(unit_name: str) -> None:
+    service = parse_sections(
+        (REPO_ROOT / "scripts" / unit_name).read_text(encoding="utf-8")
+    )["Service"]
+    slices = [line.removeprefix("Slice=") for line in service if line.startswith("Slice=")]
+    expected = project_slice_name(project_id_for_root(_PROJECT_UNIT_ROOTS[unit_name]))
+    assert slices == [expected]
 
 
 # ---------------------------------------------------------------------------
