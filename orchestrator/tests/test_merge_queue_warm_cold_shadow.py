@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _harness_store_paths import point_harness_stores_at
 from _merge_lane_fakes import FakeVerifier, VerifyScript, lane_scene_config
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
@@ -1962,8 +1963,7 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.max_concurrent_tasks = 2
         config.project_root = tmp_path
-        config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
-        config.eligibility_clock_db_path = tmp_path / 'scheduler_eligibility.db'
+        point_harness_stores_at(config, tmp_path)
         config.git = GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
             worktree_dir='.worktrees',
@@ -2022,8 +2022,7 @@ class TestHarnessStartMergeWorkerPassesEscalationQueue:
         config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
         config.max_concurrent_tasks = 2
         config.project_root = tmp_path
-        config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
-        config.eligibility_clock_db_path = tmp_path / 'scheduler_eligibility.db'
+        point_harness_stores_at(config, tmp_path)
         config.git = GitConfig(
             main_branch='main', branch_prefix='task/', remote='origin',
             worktree_dir='.worktrees',
