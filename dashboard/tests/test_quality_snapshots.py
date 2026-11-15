@@ -800,7 +800,7 @@ async def test_the_quality_loop_scans_snapshots_before_it_derives_markers_on_its
     project = build_quality_project(tmp_path / 'dark_factory',
                                     first_landed_at=datetime(2026, 11, 2, 9, 0, tzinfo=UTC))
     config = DashboardConfig(project_root=project.root)
-    initial = GitRepo(project.root).git('rev-list', '--max-parents=0', 'HEAD')
+    initial = GitRepo(project.root).git('rev-parse', f'{project.plain_sha}^1')
     write_snapshot(project.root / BASELINE_HOME / 'review-all-dark_factory-20261008.json',
                    snapshot_doc(2, as_of_sha=initial, run_id='r1'))
     write_snapshot(config.quality_metrics_dir / 'dark_factory' / f'{project.plain_sha}.json',
