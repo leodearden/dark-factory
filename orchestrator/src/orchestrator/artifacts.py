@@ -666,7 +666,9 @@ class ArtifactRoot(Enum):
     TASK = 'task'
 
 
-_REVIEW_ARCHIVE_FAMILY = 'reviews-<label>/'
+_REVIEW_ARCHIVE_PREFIX = 'reviews-'
+_REVIEW_ARCHIVE_FAMILY = f'{_REVIEW_ARCHIVE_PREFIX}<label>/'
+_RETIRED_LINEAGES_KEY = 'retired_lineages'
 _ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE = 'zero_output_evidence-iter{}.json'
 _ZERO_OUTPUT_EVIDENCE_FAMILY = _ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE.format('<n>')
 
@@ -689,6 +691,7 @@ ARTIFACT_ROOTS: Mapping[str, ArtifactRoot] = MappingProxyType({
     'review_state.json': ArtifactRoot.TASK,
     'reconcile_state.json': ArtifactRoot.TASK,
     _REVIEW_ARCHIVE_FAMILY: ArtifactRoot.TASK,
+    'retired-reviews': ArtifactRoot.TASK,
     _ZERO_OUTPUT_EVIDENCE_FAMILY: ArtifactRoot.TASK,
 })
 """The single routing table: artifact name (or family key) -> owning root.
@@ -837,7 +840,14 @@ class TaskArtifacts:
 
     def review_archive_dir(self, label: str) -> Path:
         """The archive of one review round, e.g. ``label='amend-1'``."""
-        return self.review_archives_root / f'reviews-{label}'
+        return self.review_archives_root / f'{_REVIEW_ARCHIVE_PREFIX}{label}'
+
+    def review_archive_dirs(self) -> tuple[Path, ...]:
+        """Every ``reviews-<label>`` archive directly under ``review_archives_root``, sorted."""
+        root = self.review_archives_root
+        if not root.is_dir():
+            return ()
+        return tuple(sorted(p for p in root.glob(f'{_REVIEW_ARCHIVE_PREFIX}*') if p.is_dir()))
 
     def zero_output_evidence_path(self, iteration: int) -> Path:
         return self._root_for(_ZERO_OUTPUT_EVIDENCE_FAMILY) / _ZERO_OUTPUT_EVIDENCE_NAME_TEMPLATE.format(iteration)
@@ -1415,10 +1425,14 @@ class TaskArtifacts:
         re-pend: on the next blocking review the seeded local is already at
         the cap, so the loop re-escalates WITHOUT attempting a replan.
 
-        Deliberately NOT auto-cleared on re-dispatch — the loop cannot tell
-        churn (must keep the counters) from a legitimate operator re-pend
-        (should reset them) without an out-of-band signal, so granting a
-        fresh allowance is an EXPLICIT operator action, never inferred.
+        Deliberately NOT auto-cleared on an ordinary re-dispatch — the loop
+        cannot tell churn (must keep the counters) from a legitimate operator
+        re-pend (should reset them) without an out-of-band signal, so granting
+        a fresh allowance is an EXPLICIT operator action, never inferred. The
+        one such signal is a branch-swapping quarantine, which ends the
+        reviewed branch's lineage:
+        ``orchestrator/src/orchestrator/review_lineage.py::retire_quarantined_lineages``
+        retires the counters through :meth:`record_retired_lineage`.
         When an operator resolves the review escalation and re-pends the
         task to make replan progress, call this hook (e.g. from the
         resume/re-pend path, or manually against the ``.task-meta/<name>/``
@@ -1431,6 +1445,27 @@ class TaskArtifacts:
         state['amendment_rounds_total'] = 0
         state['review_cycles_total'] = 0
         self._write_json('review_state.json', state)
+
+    def record_retired_lineage(self, record: Mapping[str, Any], *, zero_counters: bool) -> None:
+        """Append *record* to ``retired_lineages`` and, when *zero_counters*, zero both lifetime counters, in one write.
+
+        The verdict cache is preserved. A non-list ``retired_lineages`` is
+        replaced.
+        """
+        state = self.read_review_state()
+        if zero_counters:
+            state['amendment_rounds_total'] = 0
+            state['review_cycles_total'] = 0
+        existing = state.get(_RETIRED_LINEAGES_KEY)
+        state[_RETIRED_LINEAGES_KEY] = [*(existing if isinstance(existing, list) else []), dict(record)]
+        self._write_json('review_state.json', state)
+
+    def retired_review_records(self) -> tuple[dict, ...]:
+        """The ``retired_lineages`` entries that are dicts; () when absent or malformed."""
+        records = self.read_review_state().get(_RETIRED_LINEAGES_KEY)
+        if not isinstance(records, list):
+            return ()
+        return tuple(record for record in records if isinstance(record, dict))
 
     def _read_json_object(self, name: str) -> dict | None:
         """The single fail-safe read seam for the whole-file JSON-object
