@@ -98,7 +98,7 @@ def unverifiable_verdict(
     stdout: str = '',
     stderr: str = '',
 ) -> SubstrateVerdict:
-    """The fail-CLOSED verdict for a recheck that could not run."""
+    """The fail-CLOSED verdict for a recheck that produced no probe result."""
     return SubstrateVerdict(
         verdict=FLIP,
         exit_code=exit_code,
@@ -371,10 +371,15 @@ def run_substrate_recheck(
 
 @dataclass(frozen=True)
 class FlipEscalationText:
-    """The summary and detail a FLIP verdict's L1 is filed with (untruncated)."""
+    """The summary, detail and dedupe root cause a FLIP verdict's L1 is filed with.
+
+    The summary is untruncated.  The root cause is task-scoped and differs per
+    rendering, so an open L1 of one kind never covers the other.
+    """
 
     summary: str
     detail: str
+    root_cause: str
 
 
 def flip_escalation_text(task_id: str, verdict: SubstrateVerdict) -> FlipEscalationText:
@@ -407,17 +412,20 @@ def _probe_flip_text(task_id: str, verdict: SubstrateVerdict) -> FlipEscalationT
         f'The task premise (probe set authored at investigation time) no longer holds '
         f'on current main — re-spec required before dispatch.'
     )
-    return FlipEscalationText(summary=summary, detail=detail)
+    return FlipEscalationText(
+        summary=summary, detail=detail, root_cause=f'substrate-flip:{task_id}',
+    )
 
 
 def _unverifiable_text(task_id: str, verdict: SubstrateVerdict) -> FlipEscalationText:
     summary = (
-        f'SUBSTRATE_UNVERIFIED: task {task_id} could not be re-checked: the probe set '
-        f'never ran on current main, so nothing about it was established'
+        f'SUBSTRATE_UNVERIFIED: task {task_id} could not be re-checked: the recheck '
+        f'produced no probe result on current main, so nothing about the probe set '
+        f'was established'
     )
     detail = (
         'Dispatch-time substrate re-check blocked this task BEFORE any agent spun up, '
-        'because the recheck could not run and the gate fails CLOSED.\n'
+        'because the recheck produced no probe result and the gate fails CLOSED.\n'
         f'Verdict: {verdict.verdict!r} (unverifiable) | exit_code={verdict.exit_code} | '
         f'probe_set={verdict.probe_set!r}\n'
         f'Reason: {verdict.reason}\n'
@@ -429,4 +437,6 @@ def _unverifiable_text(task_id: str, verdict: SubstrateVerdict) -> FlipEscalatio
         'metadata.substrate_probe descriptor), then unblock the task so the gate can '
         'run again.'
     )
-    return FlipEscalationText(summary=summary, detail=detail)
+    return FlipEscalationText(
+        summary=summary, detail=detail, root_cause=f'substrate-unverified:{task_id}',
+    )

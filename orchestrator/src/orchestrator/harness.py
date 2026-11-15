@@ -9376,7 +9376,7 @@ class Harness:
         self,
         task_id: str,
         *,
-        verdict,
+        verdict: cross_repo_gate.CrossRepoVerdict,
     ) -> None:
         """Block a task and file an L1 for a cross-repo BLOCK verdict (misfile or unverifiable).
 
@@ -9402,17 +9402,19 @@ class Harness:
         self,
         task_id: str,
         *,
-        verdict,
+        verdict: substrate_gate.SubstrateVerdict,
     ) -> None:
         """Block a task and file an L1 for a substrate FLIP verdict (probe-set flip or unverifiable).
 
         ``design_concern`` routes it to human/curator judgment (same class as
         report_false_premise).
 
-        The summary/detail come from
+        The summary/detail/root cause come from
         ``orchestrator/src/orchestrator/substrate_gate.py::flip_escalation_text``.
-        Blocking, filing and the category-scoped dedupe live in
-        ``_block_and_file_dispatch_gate_l1``.
+        Blocking, filing and the dedupe live in
+        ``_block_and_file_dispatch_gate_l1``; the root cause scopes that dedupe,
+        so an open unverified L1 cannot hide a later probe-set flip, nor the
+        reverse.
         """
         text = substrate_gate.flip_escalation_text(task_id, verdict)
         await self._block_and_file_dispatch_gate_l1(
@@ -9420,6 +9422,7 @@ class Harness:
             category=EscalationCategory.DESIGN_CONCERN,
             summary=text.summary,
             detail=text.detail,
+            root_cause=text.root_cause,
         )
 
     async def _run_recut_ruling_gate(self, assignment) -> recut_ruling.RecutGateResult:
@@ -9478,6 +9481,7 @@ class Harness:
 
     async def _block_and_file_dispatch_gate_l1(
         self, task_id: str, *, category: str, summary: str, detail: str,
+        root_cause: str = '',
     ) -> None:
         """Block *task_id* and file one category-scoped L1 for a dispatch gate.
 
@@ -9486,7 +9490,8 @@ class Harness:
         - a failed write is logged and the L1 is still filed;
         - with no escalation queue the filing is a logged no-op;
         - the dedupe is ``_file_harness_l1``'s: only an open L1 of *category*
-          suppresses this one, so an L1 for another cause cannot hide it.
+          (carrying *root_cause*, when one is given) suppresses this one, so
+          an L1 for another cause cannot hide it.
         """
         try:
             await self.scheduler.set_task_status(task_id, 'blocked')
@@ -9498,6 +9503,7 @@ class Harness:
             )
         self._file_harness_l1(
             task_id, category=category, summary=summary, detail=detail,
+            root_cause=root_cause,
         )
 
     def _file_harness_l1(
@@ -9681,7 +9687,7 @@ class Harness:
             )
             await self._block_and_escalate_substrate_flip(
                 task_id,
-                verdict=substrate_gate.unverifiable_verdict(reason, exit_code=proc.returncode),
+                verdict=substrate_gate.unverifiable_verdict(reason),
             )
             return False
 
