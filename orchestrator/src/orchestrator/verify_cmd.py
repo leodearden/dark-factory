@@ -1860,7 +1860,7 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
     return ''.join(out)
 
 
-def split_xdist_option(token: str) -> tuple[str, str | None] | None:
+def _split_xdist_option(token: str) -> tuple[str, str | None] | None:
     """The xdist option *token* names and the value attached in it, or ``None``.
 
     THE one grammar of an xdist token's spellings, read by the structured
@@ -1892,8 +1892,8 @@ def split_xdist_option(token: str) -> tuple[str, str | None] | None:
 
 
 def _is_xdist_option(token: str) -> bool:
-    """``split_xdist_option`` as a predicate, for the strip and the raw refusal screen."""
-    return split_xdist_option(token) is not None
+    """``_split_xdist_option`` as a predicate, for the strip and the raw refusal screen."""
+    return _split_xdist_option(token) is not None
 
 
 def _strip_xdist_options(base_flags: tuple[str, ...]) -> tuple[str, ...]:
@@ -2107,7 +2107,7 @@ def applied_worker_count(tokens: Sequence[str]) -> str | None:
 
 def _attached_worker_count(token: str) -> str:
     """The count a one-token spelling (``-nV``, ``-n=V``, ``--numprocesses=V``) attaches, else ``''``."""
-    match split_xdist_option(token):
+    match _split_xdist_option(token):
         case (option, str(value)) if option in _XDIST_N_FLAGS:
             return value
     return ''
