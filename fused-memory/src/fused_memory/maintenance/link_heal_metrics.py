@@ -3,19 +3,18 @@
 Each sweep run becomes one M1 metric series (``shared.memory_eval_metrics``)
 under ``<root>/link-heal/``. ``summary.json`` beside the series is rebuilt from
 the series stamped in the last seven days, never from the ledger, so it cannot
-disagree with what it summarises. Its keys are the contract
-``plans/write-triage-link-healing-prd.capability-manifest.md`` states under
-"Summary key contract (ε → θ)": ``runs_7d`` counts the series, each per-run
-metric's 7-day sum is its id with the ``_7d`` suffix, and
-``adjudication_failure_rate_7d`` is the failed sum over the asked sum, 0.0 when
-nothing was asked.
+disagree with what it summarises. The keys gate θ reads are
+:data:`THETA_SUMMARY_KEYS`, and no summary that lacks one, or holds a
+non-number under one, is returned. The summary counts the series, gives each
+per-run metric's 7-day sum under its id with the ``_7d`` suffix, and gives the
+failure rate as the failed sum over the asked sum, 0.0 when nothing was asked.
 """
 
 from __future__ import annotations
 
 import logging
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -43,6 +42,11 @@ SUMMARY_FILENAME = 'summary.json'
 SUMMARY_FORMAT = 'link-heal-summary/1'
 SUMMARY_WINDOW = timedelta(days=7)
 SUMMARY_SUFFIX = '_7d'
+#: plans/write-triage-link-healing-prd.capability-manifest.md, "Summary key contract (ε → θ)".
+THETA_SUMMARY_KEYS: tuple[str, ...] = (
+    'runs_7d', 'writing_runs_7d', 'would_escape_7d', 'adjudication_failure_rate_7d',
+    'actions_planned_7d', 'skipped_cap_7d',
+)
 
 
 @dataclass(frozen=True)
@@ -117,13 +121,14 @@ def summarize_series(root: Path, *, now: datetime) -> dict[str, Any]:
     """The summary of the series under *root* stamped in ``[now - 7 days, now]``.
 
     Every key is present whatever the window holds. A series that does not parse
-    raises, as :func:`load_metric_series` does.
+    raises, as :func:`load_metric_series` does, and so does a summary that breaks
+    :func:`check_summary_contract`.
     """
     since, until = format_stamp(now - SUMMARY_WINDOW), format_stamp(now)
     series = [load_metric_series(path) for path in _window_paths(root, since, until)]
     sums = {metric_id: _sum(series, metric_id) for metric_id in SUMMED_METRICS}
     asked = sums['adjudications_asked']
-    return {
+    summary = {
         'format': SUMMARY_FORMAT,
         'eval_id': EVAL_ID,
         'window': {'since': since, 'until': until},
@@ -133,6 +138,19 @@ def summarize_series(root: Path, *, now: datetime) -> dict[str, Any]:
             sums['adjudication_failed'] / asked if asked else 0.0
         ),
     }
+    check_summary_contract(summary)
+    return summary
+
+
+def check_summary_contract(summary: Mapping[str, object]) -> None:
+    """Raise :class:`ValueError` naming the first gate θ key *summary* lacks, or
+    holds a non-number under. A bool is not a number, as θ's ``--require`` holds."""
+    for key in THETA_SUMMARY_KEYS:
+        if key not in summary:
+            raise ValueError(f'{EVAL_ID} summary is missing gate θ key {key!r}')
+        value = summary[key]
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(f'{EVAL_ID} summary gate θ key {key!r} is not a number: {value!r}')
 
 
 def _window_paths(root: Path, since: str, until: str) -> list[Path]:

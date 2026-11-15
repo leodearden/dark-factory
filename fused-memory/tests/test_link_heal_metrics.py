@@ -269,7 +269,9 @@ class TestTheSummary:
 
 
 def _complete_summary() -> dict[str, object]:
-    return {key: 0 for key in THETA_KEYS} | {'adjudication_failure_rate_7d': 0.0}
+    summary: dict[str, object] = {key: 0 for key in THETA_KEYS}
+    summary['adjudication_failure_rate_7d'] = 0.0
+    return summary
 
 
 class TestTheThetaKeyContract:
