@@ -211,8 +211,9 @@ UNDER_LOAD_HEADROOM_FACTOR = 8
 # runs tighter than a bare local `pytest` -- and a slow test's marker must
 # clear the one that gates its merge.
 #
-# A LITERAL: marks read it at import, and the guard's _SANCTIONED_TIMEOUT_NAMES
-# and TestSanctionedNameMirrors resolve it only through literal arithmetic.
+# A LITERAL: marks read it at import, and
+# _sanctioned_timeout_names.py::SANCTIONED_TIMEOUT_NAMES and
+# TestSanctionedNameMirrors resolve it only through literal arithmetic.
 # Held to the yaml by
 # test_timeout_marker_inversion_guard.py::TestVerifyCliBudgetConstant, whose
 # docstring records why that pin is deliberately loud on a retune.
@@ -311,7 +312,7 @@ class SpawnBudget(NamedTuple):
 
     A BUNDLE, never a second definition: every number here is read from the
     module-level scalar that defines it.  Those scalars stay the single home
-    of each value, so a marker, ``_SANCTIONED_TIMEOUT_NAMES`` and this
+    of each value, so a marker, ``_sanctioned_timeout_names.py::SANCTIONED_TIMEOUT_NAMES`` and this
     descriptor cannot drift into three readings of one figure.  The constant
     names are spelled as strings because a name cannot refer to itself.
 
@@ -2144,6 +2145,10 @@ def git_env_with_ceiling(cwd: Path) -> dict[str, str]:
 #: pinned against either path must hold identically under both.
 ORCH_DIR = Path(__file__).resolve().parents[1]
 ORCH_PYPROJECT = ORCH_DIR / 'pyproject.toml'
+#: The per-module merge-verify config whose ``test_command`` and
+#: ``verify_command_timeout_secs`` the timeout guards read, resolved like its
+#: siblings from this file and never from the CWD.
+ORCH_YAML = ORCH_DIR / 'orchestrator.yaml'
 
 #: Environment keys stripped from a pytest/git subprocess probe by
 #: :func:`sanitized_probe_env`. Each one can silently turn a probe's result

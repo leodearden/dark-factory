@@ -48,11 +48,13 @@ import _orch_helpers
 import pytest
 import yaml
 from _orch_helpers import (
-    DEEP_GATE_SCENE_TEST_TIMEOUT,
-    DEEP_LANDING_SCENE_TEST_TIMEOUT,
-    ORCH_DIR,
+    ORCH_YAML,
     PYPROJECT_DEFAULT_TIMEOUT,
     VERIFY_CLI_PER_TEST_TIMEOUT,
+)
+from _sanctioned_timeout_names import (
+    SANCTIONED_NAMES_DEFINED_ELSEWHERE,
+    SANCTIONED_TIMEOUT_NAMES,
 )
 from _tree_scan import (
     ORCHESTRATOR_TESTS,
@@ -72,10 +74,7 @@ from shared.testing_timeout_markers import (
     timeout_marker_sites,
     verify_cli_timeout,
 )
-from shared.whole_tree_guard_family import (
-    WHOLE_TREE_SCAN_TEST_TIMEOUT,
-    WHOLE_TREE_SCAN_TIMEOUT_NAME,
-)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # The family mark and shared group: shared/src/shared/whole_tree_guard_family.py::WHOLE_TREE_SCAN_TEST_TIMEOUT, _tree_scan.py.
 # WHOLE_TREE_SCAN_TEST_TIMEOUT sits at or above the inversion band's OPEN upper
@@ -85,18 +84,10 @@ pytestmark = [
     pytest.mark.xdist_group(TREE_PASS_XDIST_GROUP),
 ]
 
-#: The per-module merge-verify config whose ``test_command`` carries the
-#: ``--timeout=N`` that verify actually passes to pytest.  Resolved from
-#: ``ORCH_DIR`` (itself resolved from ``_orch_helpers.__file__``) and never
-#: from the process CWD: merge-verify runs pytest from the ``orchestrator/``
-#: cwd while a plain ``pytest orchestrator/tests`` runs from the repo root,
-#: and this pin must read identically under both.
-_ORCH_YAML = ORCH_DIR / 'orchestrator.yaml'
-
 
 def _verify_test_command() -> str:
-    """The ``test_command`` merge-verify runs for this package, from :data:`_ORCH_YAML`."""
-    return yaml.safe_load(_ORCH_YAML.read_text(encoding='utf-8'))['test_command']
+    """The ``test_command`` merge-verify runs for this package, from :data:`ORCH_YAML`."""
+    return yaml.safe_load(ORCH_YAML.read_text(encoding='utf-8'))['test_command']
 
 #: The module task 5333 sizes and ratchets: eight real-git classes that all
 #: carried an identical bare ``300`` regardless of weight, which is what made
@@ -117,54 +108,14 @@ _DEEP_GATE_SPELLINGS = frozenset({
 #: pass by finding nothing rather than by finding nothing wrong.
 _MIN_DEEP_GATE_MARKER_SITES = 8
 
-#: Names a ``pytest.mark.timeout(...)`` argument may resolve to, and the
-#: seconds each one carries.  A literal MAP rather than an import, because none
-#: of the three is importable from ``_orch_helpers``: two are defined
-#: outside it -- ``HEAVY_BARRIER_TEST_TIMEOUT = 540`` in the shared support
-#: module orchestrator/tests/_merge_worker_drive.py, and, FILE-LOCALLY,
-#: ``PYTEST_TIMEOUT = 960``
-#: (test_warm_lane_bash_suite.py -- test_pytest_marker_deselection.py's
-#: identical line is inside a string FIXTURE, so it is not a binding, which
-#: :class:`TestSanctionedNameMirrors` measures rather than assumes).
-#: This is where the shape departs from its template:
-#: ``_SANCTIONED_CEILING_NAMES`` in test_whole_tree_scan_timeout_guard.py is a
-#: one-element frozenset paired with a single hard-coded
-#: ``float(WHOLE_TREE_SCAN_TEST_TIMEOUT)``, which does not generalise to three
-#: names at two distinct values.
-#:
-#: These are cross-module MIRRORS, and a stale one is NOT self-announcing.  A
-#: mirror that reads too HIGH fails SILENTLY, which is the dangerous
-#: direction: lower ``HEAVY_BARRIER_TEST_TIMEOUT`` by hand to 225 and every
-#: ``timeout(HEAVY_BARRIER_TEST_TIMEOUT)`` site really pins 225s -- squarely
-#: inside the band -- while this map still answers 540 and the sweep stays
-#: green.  Matching on the TRAILING name only widens that hole: a new
-#: file-local ``PYTEST_TIMEOUT = 120`` would be waved through at 960.
-#:
-#: So every entry carries the same EXECUTABLE link the YAML pin above
-#: demonstrates -- :class:`TestSanctionedNameMirrors` re-reads each name's REAL
-#: definition out of the tree and fails if the two disagree.  This map is a
-#: cache of those definitions, never a claim about them.
-_SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
-    WHOLE_TREE_SCAN_TIMEOUT_NAME: float(WHOLE_TREE_SCAN_TEST_TIMEOUT),
-    'HEAVY_BARRIER_TEST_TIMEOUT': 540.0,
-    'PYTEST_TIMEOUT': 960.0,
-    'VERIFY_CLI_PER_TEST_TIMEOUT': float(VERIFY_CLI_PER_TEST_TIMEOUT),
-    'DEEP_GATE_SCENE_TEST_TIMEOUT': float(DEEP_GATE_SCENE_TEST_TIMEOUT),
-    'DEEP_LANDING_SCENE_TEST_TIMEOUT': float(DEEP_LANDING_SCENE_TEST_TIMEOUT),
-}
-
-#: The sanctioned names defined OUTSIDE this directory.  Each entry above is
-#: imported from its one home, so it cannot drift from it, and no binding
-#: under :data:`_TESTS_DIR` exists for :class:`TestSanctionedNameMirrors` to find.
-_SANCTIONED_NAMES_DEFINED_ELSEWHERE = frozenset({WHOLE_TREE_SCAN_TIMEOUT_NAME})
-
 
 # ---------------------------------------------------------------------------
-# The REAL definitions behind _SANCTIONED_TIMEOUT_NAMES.
+# The REAL definitions behind SANCTIONED_TIMEOUT_NAMES.
 #
 # The map is a mirror; these read the originals, so the mirror can be checked
-# rather than trusted.  See _SANCTIONED_TIMEOUT_NAMES' comment for the two
-# silent failures this closes.
+# rather than trusted.  See the comment on
+# _sanctioned_timeout_names.py::SANCTIONED_TIMEOUT_NAMES for the two silent
+# failures this closes.
 # ---------------------------------------------------------------------------
 
 #: Numbers a sanctioned constant's definition may be written in terms of.  All
@@ -188,7 +139,7 @@ _MIRROR_NAMESPACE: Mapping[str, float] = {
 
 
 class _Binding(NamedTuple):
-    """One assignment of a :data:`_SANCTIONED_TIMEOUT_NAMES` name found in the tree.
+    """One assignment of a :data:`SANCTIONED_TIMEOUT_NAMES` name found in the tree.
 
     ``seconds`` is None when the right-hand side is outside
     :func:`_binding_value`'s grammar -- "no longer statically verifiable",
@@ -237,7 +188,7 @@ def _binding_value(node: ast.expr, namespace: Mapping[str, float]) -> float | No
 
 
 def _sanctioned_bindings_in(tree: ast.Module, module: str) -> list[_Binding]:
-    """Every assignment in *tree* that binds a :data:`_SANCTIONED_TIMEOUT_NAMES` name.
+    """Every assignment in *tree* that binds a :data:`SANCTIONED_TIMEOUT_NAMES` name.
 
     ``ast.walk`` rather than module-level only, so the rule stays one sentence:
     ANY binding of a sanctioned ceiling name under this tree must carry the
@@ -268,7 +219,7 @@ def _sanctioned_bindings_in(tree: ast.Module, module: str) -> list[_Binding]:
                 seconds=_binding_value(value, _MIRROR_NAMESPACE),
             )
             for target in targets
-            if target in _SANCTIONED_TIMEOUT_NAMES
+            if target in SANCTIONED_TIMEOUT_NAMES
         )
     return bindings
 
@@ -329,7 +280,7 @@ class TestVerifyCliBudgetConstant:
 
         configured = verify_cli_timeout(test_command)
         assert configured is not None, (
-            f'{_ORCH_YAML} test_command carries no --timeout override '
+            f'{ORCH_YAML} test_command carries no --timeout override '
             f'(got: {test_command!r}). VERIFY_CLI_PER_TEST_TIMEOUT models that '
             'flag, so without it the constant models nothing -- and every test '
             f'here silently falls back to the {PYPROJECT_DEFAULT_TIMEOUT}s '
@@ -339,7 +290,7 @@ class TestVerifyCliBudgetConstant:
         )
         assert configured == VERIFY_CLI_PER_TEST_TIMEOUT, (
             f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}) no '
-            f'longer mirrors --timeout={configured} in {_ORCH_YAML}. Update the '
+            f'longer mirrors --timeout={configured} in {ORCH_YAML}. Update the '
             'constant in orchestrator/tests/_orch_helpers.py. Until then every '
             'marker spelled VERIFY_CLI_PER_TEST_TIMEOUT is judged at the stale '
             "value against the yaml's budget, so a raise reports them all as "
@@ -350,7 +301,7 @@ class TestVerifyCliBudgetConstant:
 
 
 class TestSanctionedNameMirrors:
-    """Every :data:`_SANCTIONED_TIMEOUT_NAMES` value must match its REAL definition.
+    """Every :data:`SANCTIONED_TIMEOUT_NAMES` value must match its REAL definition.
 
     THE EXECUTABLE LINK the mirror map would otherwise lack -- the same shape
     :class:`TestVerifyCliBudgetConstant` applies to the YAML, one anchor over.
@@ -379,13 +330,13 @@ class TestSanctionedNameMirrors:
         wrong = [
             binding
             for binding in _marker_census(tree_pass).bindings
-            if binding.seconds != _SANCTIONED_TIMEOUT_NAMES[binding.name]
+            if binding.seconds != SANCTIONED_TIMEOUT_NAMES[binding.name]
         ]
 
         assert not wrong, (
             f'{len(wrong)} binding(s) of a sanctioned timeout name disagree '
-            'with _SANCTIONED_TIMEOUT_NAMES in '
-            'test_timeout_marker_inversion_guard.py.\n\n'
+            'with SANCTIONED_TIMEOUT_NAMES in '
+            '_sanctioned_timeout_names.py.\n\n'
             'That map is how a `@pytest.mark.timeout(NAME)` site is resolved, '
             'and it matches on the TRAILING name only. An entry reading HIGHER '
             'than the real constant fails SILENTLY: the site is waved through '
@@ -400,7 +351,7 @@ class TestSanctionedNameMirrors:
             + '\n'.join(
                 f'  {b.module}:{b.lineno} {b.name} = {b.expression} -> '
                 f'{b.seconds} (mirror says '
-                f'{_SANCTIONED_TIMEOUT_NAMES[b.name]})'
+                f'{SANCTIONED_TIMEOUT_NAMES[b.name]})'
                 for b in sorted(wrong, key=lambda b: (b.module, b.lineno))
             )
         )
@@ -416,11 +367,11 @@ class TestSanctionedNameMirrors:
         """
         defined = {binding.name for binding in _marker_census(tree_pass).bindings}
         undefined = sorted(
-            set(_SANCTIONED_TIMEOUT_NAMES) - _SANCTIONED_NAMES_DEFINED_ELSEWHERE - defined
+            set(SANCTIONED_TIMEOUT_NAMES) - SANCTIONED_NAMES_DEFINED_ELSEWHERE - defined
         )
 
         assert not undefined, (
-            f'_SANCTIONED_TIMEOUT_NAMES mirrors {undefined}, which no longer '
+            f'SANCTIONED_TIMEOUT_NAMES mirrors {undefined}, which no longer '
             f'name a constant defined anywhere under {TESTS_DIR}. Drop the '
             'entr(y/ies) -- a mirror for a deleted constant sanctions the bare '
             'NAME, so reintroducing it at any value at all would be resolved '
@@ -458,7 +409,7 @@ class _ModuleMarkers:
 def _module_markers(module: ParsedModule) -> _ModuleMarkers:
     """A module naming neither the ``timeout`` marker nor a sanctioned constant has neither, unwalked."""
     try:
-        if not module.may_name('timeout', *_SANCTIONED_TIMEOUT_NAMES):
+        if not module.may_name('timeout', *SANCTIONED_TIMEOUT_NAMES):
             return _ModuleMarkers(readable=True)
         tree = module.tree
     except (UnicodeDecodeError, OSError):
@@ -467,7 +418,7 @@ def _module_markers(module: ParsedModule) -> _ModuleMarkers:
         return _ModuleMarkers(readable=True)
     return _ModuleMarkers(
         readable=True,
-        sites=timeout_marker_sites(tree, _SANCTIONED_TIMEOUT_NAMES),
+        sites=timeout_marker_sites(tree, SANCTIONED_TIMEOUT_NAMES),
         bindings=tuple(_sanctioned_bindings_in(tree, module.path.relative_to(TESTS_DIR).as_posix())),
     )
 
@@ -484,7 +435,7 @@ class _MarkerCensus(NamedTuple):
     ``sites`` is the timeout-marker census, each site paired with its module --
     the path relative to :data:`TESTS_DIR` -- and carrying the sweep-health
     counters.  ``bindings`` is every assignment of a
-    :data:`_SANCTIONED_TIMEOUT_NAMES` name, for :class:`TestSanctionedNameMirrors`.
+    :data:`SANCTIONED_TIMEOUT_NAMES` name, for :class:`TestSanctionedNameMirrors`.
     """
 
     sites: TreeScan[tuple[str, TimeoutSite]]
