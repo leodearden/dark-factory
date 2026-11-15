@@ -5182,8 +5182,8 @@ next night file it again. The ladder is `scripts/exception_owner_sweep.py::decid
 - **More than `scripts/exception_owner_sweep.py::MAX_OUTPUTS_PER_RUN` outputs
   in one run:** one roll-up escalation. The rest wait for the next run.
 - **A closed dead-owner task whose owner is still dead:** an escalation, never
-  a re-file. A closed task converted from one of the finding's escalations
-  counts the same.
+  a re-file, whose summary names the closed task. A closed task converted from
+  one of the finding's escalations counts the same.
 - **A live cited owner:** an `x_inv12_owns` note merged into its metadata.
 
 The dead-owner and roll-up bodies name
@@ -5194,9 +5194,11 @@ no findings.
 **Residual.** A conversion the curator combined onto a task whose
 `metadata.escalation_id` names none of the key's escalations is invisible to
 the sweep. That finding is escalated again each night until a task carrying
-one of its escalation ids appears, or the entry is re-owned. A converted task
-that closes while the owner is still dead is escalated once more, by design;
-the conversion of that escalation then answers it.
+one of its escalation ids appears, or the entry is re-owned. A home task that
+closes while the owner is still dead is escalated once per closure. That
+escalation's summary names the closed task, so the router converts it into a
+new task instead of folding it onto the closed one under the store's
+candidate-key index, and the new task then answers the finding.
 
 ---
 
