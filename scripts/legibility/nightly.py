@@ -1322,8 +1322,9 @@ def run_nightly(
     distinction ``check_trickle_liveness.sh`` cannot make.
     *retry_recorder* (default :func:`trickle_state.record_retry`, which
     rewrites only the backlog) is the same seam for a retry pass.
-    *max_barren_runs* is the barren streak on which the pass posts its one
-    streak escalation.
+    *max_barren_runs* is the barren streak on which the pass first posts its
+    streak escalation; it re-posts at the multiples in
+    :data:`trickle_state.BARREN_ESCALATION_MULTIPLES`.
 
     *pass_kind* (:class:`PassKind`) has no default: it decides whether the
     pass moves the schedule cursor. A ``RETRY`` pass, run by
@@ -1849,7 +1850,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     undated run is the scheduled night (yesterday UTC) plus any retry the
     backlog owes (:func:`run_scheduled_night`); a ``--date`` run is a single
     pass. ``--max-barren-runs`` is every pass's barren-streak escalation
-    threshold. ``--dry-run`` is accepted for forward operator visibility but not
+    threshold (first escalation; see
+    ``trickle_state.BARREN_ESCALATION_MULTIPLES``). ``--dry-run`` is accepted for forward operator visibility but not
     yet wired to any behavior change. Returns the first non-zero
     :attr:`NightlyResult.exit_code` among the passes, else 0.
 
@@ -1890,7 +1892,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     run_parser.add_argument(
         '--max-barren-runs', type=int, default=trickle_state.DEFAULT_MAX_BARREN_RUNS,
-        help='Consecutive barren runs on which the nightly escalates (default: %(default)s).',
+        help=(
+            'Barren-streak threshold: the nightly escalates when the streak '
+            'reaches it and again at the multiples in '
+            'trickle_state.BARREN_ESCALATION_MULTIPLES (default: %(default)s).'
+        ),
     )
     run_parser.add_argument(
         '--dry-run', action='store_true',

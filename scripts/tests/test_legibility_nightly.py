@@ -4707,7 +4707,8 @@ class TestEveryPassEndsWithOneJournalLine:
 
 
 # ---------------------------------------------------------------------------
-# task 3340 step-11/12: edge-triggered barren-streak escalation
+# task 3340 step-11/12, task 5513: edge-triggered barren-streak escalation on
+# a bounded doubling backoff
 # ---------------------------------------------------------------------------
 
 def _is_streak_escalation(arguments) -> bool:
@@ -4865,8 +4866,9 @@ class TestBarrenStreakEscalation:
     """The LIVE CALLER, so the new probe is not "a probe nobody runs".
 
     nightly.py owns this because it is the only thing that already runs
-    every night. EDGE-triggered (fires on the run where the streak first
-    REACHES the threshold, re-arms only after a productive/quiet run
+    every night. EDGE-triggered (fires on the run where the streak REACHES
+    the threshold and at each later point in
+    trickle_state.BARREN_ESCALATION_MULTIPLES; a productive or quiet run
     resets it) — which sidesteps task 3270's alarm-fatigue debate rather
     than re-opening it, and avoids the one-shot latch's worse failure mode
     that 3270 explicitly rejected.
