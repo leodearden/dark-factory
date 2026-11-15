@@ -23,6 +23,7 @@ from shared.project_layout import runs_db, startup_failures_json
 
 from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
+from orchestrator.merge_lane.liveness import MergeLivenessConfigError
 from orchestrator.startup_steps import CRASH_LOOP_THRESHOLD, StartupFailureStreak
 
 SENTINEL = 'orchestrator-startup-crash-loop'
@@ -125,6 +126,53 @@ class TestThreeCrashesThenQuarantine:
         [page] = _every_record_on_the_sentinel(tmp_path)
         assert page.status == 'pending'
         assert page.dedupe_count == 0
+
+
+async def _refused_at_1b(make: Callable[[], Harness]) -> Harness:
+    """A start the ratified fatal refusal stops inside 1b, after the escalation server came up."""
+    h = make()
+    h._start_merge_worker = AsyncMock(side_effect=MergeLivenessConfigError('over budget'))
+    with pytest.raises(MergeLivenessConfigError):
+        await h.run(prd_path=None)
+    return h
+
+
+@pytest.mark.asyncio
+class TestFatalStepAtThreshold:
+    async def test_each_refused_start_counts_once(self, make_harness, tmp_path) -> None:
+        for _ in range(CRASH_LOOP_THRESHOLD):
+            h = await _refused_at_1b(make_harness)
+
+        streak = _streak(h)
+        assert streak is not None
+        assert (streak.step, streak.consecutive) == ('1b', CRASH_LOOP_THRESHOLD)
+        assert _pages(tmp_path) == []
+
+    async def test_a_fatal_step_at_the_threshold_still_refuses_and_pages(
+        self, make_harness, tmp_path,
+    ) -> None:
+        for _ in range(CRASH_LOOP_THRESHOLD):
+            await _refused_at_1b(make_harness)
+
+        h = await _refused_at_1b(make_harness)
+
+        [page] = _pages(tmp_path)
+        assert '1b' in page.summary
+        assert 'MergeLivenessConfigError' in page.summary
+        assert _runs(h)[-1] == (None, 'startup_crash:1b')
+
+    async def test_a_further_refused_start_refreshes_the_one_page(
+        self, make_harness, tmp_path,
+    ) -> None:
+        for _ in range(CRASH_LOOP_THRESHOLD + 1):
+            await _refused_at_1b(make_harness)
+        [filed] = _pages(tmp_path)
+
+        await _refused_at_1b(make_harness)
+
+        [refreshed] = _pages(tmp_path)
+        assert refreshed.id == filed.id
+        assert refreshed.dedupe_count == 1
 
 
 @pytest.mark.asyncio
