@@ -9,6 +9,9 @@ leaves for θ.
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -23,6 +26,7 @@ from _link_heal_harness import (
     REIFY,
     FakeAdjudicator,
     LinkHealHarness,
+    RecordingFiler,
     build_harness,
 )
 from shared.memory_eval_metrics import (
@@ -35,10 +39,12 @@ from shared.memory_eval_metrics import (
     write_metric_series,
 )
 
-from fused_memory.maintenance.link_heal import RunCounts, Verdict
+from fused_memory.maintenance.link_adjudicator import AdjudicationFailure
+from fused_memory.maintenance.link_heal import HealAction, RunCounts, Verdict
 from fused_memory.maintenance.link_heal_executor import (
     BACKLOG_ANCHOR,
     MISFILE_SHARE_ANCHOR,
+    RUN_REPORT_ANCHOR,
     RunLimits,
     run_adjudicator_plan,
 )
@@ -59,6 +65,7 @@ from fused_memory.maintenance.link_heal_report import (
     WritesWithheld,
 )
 from fused_memory.maintenance.link_heal_store import CreatedWindow
+from fused_memory.maintenance.link_heal_sweep import SweepReport, SweepSettings, run_sweep
 from fused_memory.server.grouped_read import SIGHTING_KIND
 
 NOW = datetime(2026, 11, 15, 2, 15, tzinfo=UTC)
@@ -71,6 +78,13 @@ THETA_KEYS = (
 LIMITS = RunLimits(
     max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3,
     misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+)
+GATE_SCRIPT = Path(__file__).resolve().parents[2] / 'scripts' / 'check_write_triage_readiness_gate.py'
+#: Gate θ's three summary bounds, copied verbatim from task 6191's metadata.before_done.args.
+THETA_SUMMARY_REQUIRES = (
+    ('s', 'runs_7d', '>=', '6'),
+    ('s', 'would_escape_7d', '<=', '0'),
+    ('s', 'adjudication_failure_rate_7d', '<=', '0.05'),
 )
 
 
@@ -334,3 +348,232 @@ class TestTheCorpusCountsExaminedLinksPerProject:
         series = sweep_metric_series(view, project_id=DF, stamp=STAMP)
 
         assert series.corpus.counts == {DF: 3, REIFY: 2}
+
+
+INSIDE = (NOW - timedelta(hours=12)).isoformat()
+
+
+def _sweep_settings(*, writes: bool = False, max_adjudications: int = 200) -> SweepSettings:
+    return SweepSettings(
+        projects=(DF,), writes=writes, dry_run=False,
+        actions=frozenset({HealAction.DETACH, HealAction.RELABEL}), window_hours=24,
+        max_adjudications=max_adjudications,
+    )
+
+
+def _seed_in_window(harness: LinkHealHarness, texts: list[str]) -> None:
+    for n, text in enumerate(texts):
+        harness.seed_link(
+            kind=SIGHTING_KIND, child=_id('cccccccc', n), parent=_id('dddddddd', n),
+            child_text=text, parent_text=f'the parent of {text}', meta={'created_at': INSIDE},
+        )
+
+
+def _calibrate(ledger: LinkHealLedger) -> None:
+    run_id = ledger.start_run(RunSource.CALIBRATION, writes=False)
+    ledger.add_calibration(
+        run_id, model=FAKE_ADJUDICATOR_MODEL, prompt_sha256=FAKE_PROMPT_SHA256,
+        population_sha256='0' * 64, passed=True, report={'passed': True},
+    )
+
+
+async def _sweep(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    tmp_path: Path,
+    adjudicate: FakeAdjudicator,
+    *,
+    settings: SweepSettings | None = None,
+    filer: RecordingFiler | None = None,
+    limits: RunLimits = LIMITS,
+    now: datetime = NOW,
+    metrics_root: Path | None = None,
+) -> SweepReport:
+    return await run_sweep(
+        adjudicate=adjudicate,
+        store=harness.store(),
+        census=harness.mem0,
+        ledger=ledger,
+        limits=limits,
+        settings=settings or _sweep_settings(),
+        filer=filer or RecordingFiler(),
+        reports_dir=tmp_path / 'reports',
+        now=now,
+        metrics=SweepMetricsTarget(metrics_root or tmp_path / 'memory-evals', DF),
+    )
+
+
+def _summary(tmp_path: Path) -> dict:
+    return json.loads(summary_path(tmp_path / 'memory-evals').read_text())
+
+
+def _run_report_detail(filer: RecordingFiler) -> dict:
+    (escape,) = [escape for escape in filer.escapes if escape.anchor == RUN_REPORT_ANCHOR]
+    return dict(escape.detail)
+
+
+class TestAReportModeSweepLeavesItsSeriesAndTheSummary:
+    @pytest.mark.asyncio
+    async def test_one_non_writing_run_leaves_a_series_and_a_summary_theta_can_read(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed_in_window(harness, ['an extending sighting', 'another extending sighting'])
+        filer = RecordingFiler()
+
+        report = await _sweep(
+            harness, ledger, tmp_path, FakeAdjudicator(lambda _text: Verdict.EXTENDS), filer=filer,
+        )
+
+        (run,) = ledger.recent_runs(50)
+        assert (run.source, run.writes) == (RunSource.SWEEP, False)
+        root = tmp_path / 'memory-evals'
+        series = load_metric_series(metrics_artifact_path(root, EVAL_ID, STAMP))
+        assert series.eval_id == 'link-heal'
+        summary = _summary(tmp_path)
+        assert_theta_keys(summary)
+        assert (summary['runs_7d'], summary['writing_runs_7d']) == (1, 0)
+        assert report.metrics == SweepMetrics(
+            metrics_path=metrics_artifact_path(root, EVAL_ID, STAMP),
+            summary_path=summary_path(root),
+        )
+        assert _run_report_detail(filer)['summary_json'] == str(summary_path(root))
+
+    @pytest.mark.asyncio
+    async def test_a_backlog_the_plan_forecasts_is_counted_and_never_filed(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed_in_window(harness, [f'an extending sighting {n}' for n in range(3)])
+        filer = RecordingFiler()
+        limits = RunLimits(
+            max_actions_per_run=1, backlog_multiplier=1, write_failure_streak=3,
+            misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+        )
+
+        report = await _sweep(
+            harness, ledger, tmp_path, FakeAdjudicator(lambda _text: Verdict.EXTENDS),
+            filer=filer, limits=limits,
+        )
+
+        assert BACKLOG_ANCHOR in report.view.plan.counts.would_escape
+        assert BACKLOG_ANCHOR not in {escape.anchor for escape in filer.escapes}
+        assert _summary(tmp_path)['would_escape_7d'] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_misfile_share_the_plan_forecasts_is_counted_and_writes_nothing(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed_in_window(
+            harness,
+            [f'misfiled sighting {n}' if n < 8 else f'belonging sighting {n}' for n in range(20)],
+        )
+        filer = RecordingFiler()
+
+        report = await _sweep(
+            harness, ledger, tmp_path,
+            FakeAdjudicator(
+                lambda text: Verdict.RELATED if text.startswith('misfiled') else Verdict.SAME,
+            ),
+            filer=filer,
+        )
+
+        assert MISFILE_SHARE_ANCHOR in report.view.plan.counts.would_escape
+        assert MISFILE_SHARE_ANCHOR not in {escape.anchor for escape in filer.escapes}
+        assert harness.mem0.write_count == 0
+        assert _summary(tmp_path)['would_escape_7d'] == 1
+
+
+class TestTheAdjudicationFiguresReachTheSummary:
+    @pytest.mark.asyncio
+    async def test_the_failure_rate_is_over_the_pairs_asked(self, harness, ledger, tmp_path):
+        _seed_in_window(harness, [f'a sighting {n}' for n in range(4)])
+        answers = iter([AdjudicationFailure.PARSE_FAILURE])
+
+        await _sweep(
+            harness, ledger, tmp_path, FakeAdjudicator(lambda _text: next(answers, Verdict.SAME)),
+        )
+
+        summary = _summary(tmp_path)
+        assert summary['adjudications_asked_7d'] == 4
+        assert summary['adjudication_failure_rate_7d'] == pytest.approx(0.25)
+
+    @pytest.mark.asyncio
+    async def test_the_cap_is_counted(self, harness, ledger, tmp_path):
+        _seed_in_window(harness, [f'a sighting {n}' for n in range(5)])
+
+        await _sweep(
+            harness, ledger, tmp_path, FakeAdjudicator(lambda _text: Verdict.SAME),
+            settings=_sweep_settings(max_adjudications=2),
+        )
+
+        summary = _summary(tmp_path)
+        assert summary['adjudication_capped_7d'] == 3
+        assert summary['adjudications_asked_7d'] == 2
+
+
+class TestWritingRunsAndNights:
+    @pytest.mark.asyncio
+    async def test_a_writing_sweep_counts_as_a_writing_run(self, harness, ledger, tmp_path):
+        _seed_in_window(harness, ['an extending sighting'])
+        _calibrate(ledger)
+
+        report = await _sweep(
+            harness, ledger, tmp_path, FakeAdjudicator(lambda _text: Verdict.EXTENDS),
+            settings=_sweep_settings(writes=True),
+        )
+
+        assert report.apply_run_id is not None
+        assert _summary(tmp_path)['writing_runs_7d'] == 1
+
+    @pytest.mark.asyncio
+    async def test_two_nights_are_two_runs(self, harness, ledger, tmp_path):
+        _seed_in_window(harness, ['a sighting'])
+        same = FakeAdjudicator(lambda _text: Verdict.SAME)
+
+        await _sweep(harness, ledger, tmp_path, same)
+        await _sweep(harness, ledger, tmp_path, same, now=NOW + DAY)
+
+        assert _summary(tmp_path)['runs_7d'] == 2
+
+
+class TestMetricsThatCannotBeWritten:
+    @pytest.mark.asyncio
+    async def test_are_escalated_and_the_report_is_still_written(self, harness, ledger, tmp_path):
+        (tmp_path / 'a-file').write_text('not a directory')
+        filer = RecordingFiler()
+
+        report = await _sweep(
+            harness, ledger, tmp_path, FakeAdjudicator(lambda _text: Verdict.SAME),
+            filer=filer, metrics_root=tmp_path / 'a-file' / 'memory-evals',
+        )
+
+        assert report.report_path.exists()
+        assert report.metrics.unwritten is not None
+        assert report.metrics.unwritten.startswith('NotADirectoryError')
+        assert _run_report_detail(filer)['metrics_unwritten'] == report.metrics.unwritten
+
+
+class TestThetaReadsTheSummary:
+    @pytest.mark.asyncio
+    async def test_every_theta_summary_bound_resolves_to_a_number(
+        self, harness, ledger, tmp_path,
+    ):
+        _seed_in_window(harness, ['a sighting'])
+        await _sweep(harness, ledger, tmp_path, FakeAdjudicator(lambda _text: Verdict.SAME))
+        argv = [
+            sys.executable, str(GATE_SCRIPT), '--gate', 'theta',
+            '--report', 's', str(summary_path(tmp_path / 'memory-evals')),
+        ]
+        for require in THETA_SUMMARY_REQUIRES:
+            argv += ['--require', *require]
+
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+
+        verdict = json.loads(completed.stdout.strip().splitlines()[-2])
+        assert len(verdict['checks']) == 3
+        for check in verdict['checks']:
+            assert check['note'] is None, check
+            assert isinstance(check['actual'], int | float), check
+            assert not isinstance(check['actual'], bool), check
+        assert [check['check'] for check in verdict['checks'] if not check['ok']] == [
+            's:runs_7d >= 6',
+        ]

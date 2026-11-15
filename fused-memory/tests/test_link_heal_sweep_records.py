@@ -56,6 +56,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     LinkHealLedger,
     RunSource,
 )
+from fused_memory.maintenance.link_heal_metrics import SweepMetricsTarget
 from fused_memory.maintenance.link_heal_report import WritesWithheld
 from fused_memory.maintenance.link_heal_store import CreatedWindow
 from fused_memory.maintenance.link_heal_sweep import SweepReport, SweepSettings, run_sweep
@@ -333,6 +334,7 @@ async def _sweep(
         now=now,
         since=since,
         plan_path_for=plan_path_for,
+        metrics=SweepMetricsTarget(tmp_path / 'memory-evals', DF),
     )
 
 
