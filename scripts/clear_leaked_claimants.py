@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Census and repair of task-store claimants that own nothing (task 4625).
 
-Two tiers, per docs/prds/claimant-invariant-enforcement.md D3: TERMINAL rows
-carrying any claimant, and HYGIENE rows (an allowlisted non-terminal status)
-carrying a stale one. A dry run is the default: it reports both tiers and never
-dials the MCP server. --apply clears the terminal tier, plus the hygiene tier
-with --repair-hygiene, through set_task_claimant only. The PRD's D6 and its
-task zeta give the rationale for each gate.
+Three tiers. TERMINAL is the alarm tier: a terminal row carrying a claimant
+that no metadata.claimant_exception covers (docs/prds/claimant-invariant-detection.md
+D-5/E-2). LEDGERED is a terminal row whose claimant the C4-E2 ledger covers, a
+sanctioned exception that is reported and never written (task 6777). HYGIENE is
+an allowlisted non-terminal row carrying a stale claimant, per
+docs/prds/claimant-invariant-enforcement.md D3. A dry run is the default: it
+reports every tier and never dials the MCP server. --apply clears the terminal
+tier, plus the hygiene tier with --repair-hygiene, through set_task_claimant
+only. The enforcement PRD's D6 and its task zeta give the rationale for each gate.
 
 Usage:
     python scripts/clear_leaked_claimants.py --project-root ROOT [--project-root ROOT ...]
@@ -50,6 +53,7 @@ from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
 from shared.task_claimant import (
     DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     is_stale_hygiene_tier_claimant,
+    ledger_covers_claimant,
     violates_terminal_claimant_invariant,
 )
 
@@ -57,6 +61,7 @@ from shared.task_claimant import (
 class Tier(StrEnum):
     TERMINAL = 'terminal'
     HYGIENE = 'hygiene'
+    LEDGERED = 'ledgered'
 
 
 def classify_tier(task: Mapping, now: datetime) -> Tier | None:
@@ -64,7 +69,7 @@ def classify_tier(task: Mapping, now: datetime) -> Tier | None:
     # terminal predicate takes no TTL, and a missing heartbeat is stranded per
     # shared/src/shared/task_claimant.py::_claimant_liveness_stranded, so it never fails closed.
     if violates_terminal_claimant_invariant(task):
-        return Tier.TERMINAL
+        return Tier.LEDGERED if ledger_covers_claimant(task) else Tier.TERMINAL
     if is_stale_hygiene_tier_claimant(task, now, DEFAULT_CLAIMANT_HEARTBEAT_TTL):
         return Tier.HYGIENE
     return None
