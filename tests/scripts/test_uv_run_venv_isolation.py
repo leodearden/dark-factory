@@ -32,10 +32,12 @@ tests/scripts/test_systemd_restart_backoff.py.
 """
 import dataclasses
 import pathlib
+import re
 import subprocess
 
 import pytest
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shell_logical_lines import logical_lines
 from systemd_unit_invariants import (
     EXEC_START_PREFIX,
     FACTORY_INIT_REFERENCE,
@@ -119,6 +121,14 @@ _BOOLEAN_RUN_FLAGS = frozenset(
         "--verbose",
     }
 )
+
+# The uv executable as a wrapper's shell spells it, followed by `run`: a bare
+# `uv` (also a `${X:-uv run ...}` seam default, or a path ending /uv), or a
+# parameter expansion naming a variable containing UV, e.g. "$UV_RESOLVED".
+_SHELL_UV_RUN_RE = re.compile(r'(?:\buv|\$\{?\w*UV\w*\}?)["\']?\s+run(?=\s|$)')
+
+# The prefixes systemd allows before an ExecStart executable (systemd.service(5)).
+_SYSTEMD_EXEC_PREFIXES = "-@:+!"
 
 
 def discover_exec_start_files() -> list[str]:
@@ -210,18 +220,22 @@ def uv_run_level_flags(exec_start: str) -> list[str] | None:
     is_uv = executable.rsplit("/", 1)[-1] == "uv" or executable == _UV_PATH_SENTINEL
     if not is_uv or second != "run":
         return None
+    return run_level_flags(tokens[2:], exec_start)
 
+
+def run_level_flags(args: list[str], command: str) -> list[str]:
+    """The run-level flag names leading *args*, the tokens after `run` (see uv_run_level_flags)."""
     flags: list[str] = []
-    i = 2
-    while i < len(tokens):
-        token = tokens[i]
+    i = 0
+    while i < len(args):
+        token = args[i]
         if not token.startswith("--"):
             break
         name = token.partition("=")[0]
         if name not in _VALUE_TAKING_RUN_FLAGS and name not in _BOOLEAN_RUN_FLAGS:
             raise MalformedExecStart(
                 f"this walker does not know the run-level flag {name!r} in "
-                f"{exec_start!r}, so it cannot tell where uv's flags end and "
+                f"{command!r}, so it cannot tell where uv's flags end and "
                 "the command begins. Guessing is what makes this raise rather "
                 "than continue. Assumed boolean, the flag's VALUE is mistaken "
                 "for the command token and the walk stops early, reporting a "
@@ -251,13 +265,41 @@ class UvRunSite:
 
 
 def shell_uv_run_sites(script: str, source: str) -> list[UvRunSite]:
-    """Placeholder until task 5666 step-2."""
-    raise NotImplementedError("task 5666 step-2")
+    """Every `uv run` in shell *script*, read from the TEXT and never by running it.
+
+    Running a wrapper is not safe from a test: the census wrapper creates git
+    worktrees and lands through the merge queue.  Every non-comment occurrence
+    counts, one inside a string included, since the flag walk stops at the
+    first token that is not a flag anyway.
+    """
+    sites: list[UvRunSite] = []
+    for line in logical_lines(script):
+        if line.startswith("#"):
+            continue
+        for match in _SHELL_UV_RUN_RE.finditer(line):
+            args = [t.rstrip(")}\"';") for t in line[match.end() :].split()]
+            sites.append(UvRunSite(source, line, tuple(run_level_flags(args, line))))
+    return sites
 
 
 def wrapper_script_of(exec_start: str) -> str | None:
-    """Placeholder until task 5666 step-2."""
-    raise NotImplementedError("task 5666 step-2")
+    """The repo-relative path of the checkout's shell script *exec_start* executes, else None.
+
+    Matched by the LONGEST suffix of the absolute path that is a file in this
+    checkout, so a same-named file nearer the repo root never shadows it.
+    """
+    tokens = exec_start.split()
+    if not tokens:
+        return None
+    executable = tokens[0].lstrip(_SYSTEMD_EXEC_PREFIXES)
+    if not executable.endswith(".sh"):
+        return None
+    parts = pathlib.PurePosixPath(executable).parts
+    for i in range(1, len(parts)):
+        candidate = "/".join(parts[i:])
+        if (REPO_ROOT / candidate).is_file():
+            return candidate
+    return None
 
 
 def discover_uv_run_units() -> list[str]:
