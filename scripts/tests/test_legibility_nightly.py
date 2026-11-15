@@ -5223,6 +5223,39 @@ class TestBarrenReescalationBackoff:
         assert _health_check_posts(runner) == []
         assert len(_streak_escalations(runner.escalations)) == 2
 
+    def test_a_24_night_sampling_cut_streak_escalates_four_times(self, tmp_path):
+        """The task's own scenario: a streak only the sampling cut causes,
+        which no per-night alarm reports, is re-escalated by the nightly
+        at each point of the backoff, each post naming its own streak."""
+        poster, posted = _capture_poster()
+        results = []
+        for offset in range(24):
+            target_date = date(2026, 7, 1) + timedelta(days=offset)
+            results.append(_run_manual_night(
+                tmp_path,
+                selector=lambda *args, **kwargs: _sample(below_sampling_cut=3),
+                poster=poster,
+                target_date=target_date,
+                now=datetime(2026, 7, 2, 3, 0, tzinfo=UTC) + timedelta(days=offset),
+            ))
+
+        assert [
+            night for night, result in enumerate(results, start=1)
+            if result.barren_escalated
+        ] == [3, 6, 12, 24]
+        assert all(result.exit_code == 0 for result in results)
+        assert _testproj_state()['consecutive_barren_runs'] == 24
+        streak = [arguments for arguments in posted if _is_streak_escalation(arguments)]
+        assert len(streak) == 4
+        assert len(posted) == 4, (
+            'the sampling-cut door has no per-night alarm; only the streak posts'
+        )
+        remedy = trickle_state.BARREN_REMEDIES[trickle_state.BarrenDoor.SAMPLING_CUT]
+        for runs, arguments in zip((3, 6, 12, 24), streak, strict=True):
+            assert f'for {runs} consecutive runs' in arguments['summary']
+            assert f'consecutive_barren_runs={runs}' in arguments['detail']
+            assert remedy in arguments['detail']
+
 
 class TestADeferredNightIsRecordedAsDeferred:
     """BOUNDARY ROW 5: a usage-capped night is weather. It exits 0, records
@@ -5842,14 +5875,20 @@ def _run_sampled_night(tmp_path, sample, **seams):
     return result, posted
 
 
-def _run_manual_night(tmp_path, *, selector, poster, **seams):
-    """Run one MANUAL night of project 'testproj' drawing its sample from
-    *selector*; its digest builder renders nothing."""
+def _run_manual_night(
+    tmp_path, *, selector, poster,
+    target_date=date(2026, 7, 13),
+    now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+    **seams,
+):
+    """Run one MANUAL night of project 'testproj' for *target_date* on the
+    *now* clock, drawing its sample from *selector*; its digest builder
+    renders nothing."""
     return nightly.run_nightly(
         config_path=_write_config(tmp_path, project_id='testproj'),
         projects_root=tmp_path / 'projects',
-        target_date=date(2026, 7, 13),
-        now=datetime(2026, 7, 14, 3, 0, tzinfo=UTC),
+        target_date=target_date,
+        now=now,
         invoke=lambda prompt, model: pytest.fail('no digest may reach the coder'),
         completion_runner=_passing_completion_runner,
         poster=poster,
