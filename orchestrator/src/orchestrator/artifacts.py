@@ -725,13 +725,13 @@ class ReviewAggregation:
 
     def format_for_replan(self) -> str:
         """Blocking issues only — the architect's input (TaskWorkflow._replan)."""
-        return _format_issue_section('# Review Feedback — Blocking Issues\n', self.blocking_issues)
+        return format_issue_section('# Review Feedback — Blocking Issues\n', self.blocking_issues)
 
     def format_for_escalation(self) -> str:
         """Blocking issues then suggestions — the steward's review_issues detail (TaskWorkflow._escalate_review_issues)."""
         text = self.format_for_replan()
         if self.suggestions:
-            text += '\n' + _format_issue_section('# Review Feedback — Suggestions\n', self.suggestions)
+            text += '\n' + format_issue_section('# Review Feedback — Suggestions\n', self.suggestions)
         return text
 
 
@@ -749,7 +749,8 @@ def _warn_off_contract_issues(reviewer_name: str, issues: tuple[dict, ...]) -> N
         )
 
 
-def _format_issue_section(heading: str, issues: list[dict]) -> str:
+def format_issue_section(heading: str, issues: Iterable[Mapping[str, Any]]) -> str:
+    """*heading*, then each review issue as reviewer, category, location, issue and suggested fix."""
     lines = [heading]
     for issue in issues:
         reviewer = issue.get('reviewer', 'unknown')

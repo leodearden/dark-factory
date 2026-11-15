@@ -25,6 +25,7 @@ from orchestrator.agents.review_briefing import (
     render_context_complete_review,
     review_action_section,
 )
+from orchestrator.artifacts import format_issue_section
 from orchestrator.config import OrchestratorConfig
 from orchestrator.escalation_rulings import (
     Ruling,
@@ -34,6 +35,7 @@ from orchestrator.escalation_rulings import (
 )
 from orchestrator.implementer_brief_variant import ImplementerBriefVariant, is_one_step
 from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, DoneStepIntegrityVerdict
+from orchestrator.review_lineage import RetiredReview
 from orchestrator.scope_drift import ScopeDriftReport
 
 logger = logging.getLogger(__name__)
@@ -194,6 +196,42 @@ _TEXT_DRIFT_NOTICES = {
     ),
 }
 
+
+
+def _retired_review_section(retired: Sequence[RetiredReview]) -> str:
+    """The review rounds a quarantine retired with their branch, for the architect to re-derive; '' for none."""
+    if not retired:
+        return ''
+    lineages = '\n'.join(_retired_lineage_block(review) for review in retired)
+    return (
+        '## Review Rounds Answered On A Quarantined Branch — Re-Derive The Responses\n\n'
+        'A quarantine renamed this task\'s reviewed branch aside, and this dispatch '
+        'cut a fresh branch from main. The review suggestions below were answered by '
+        'commits on the parked branch. None of those commits are on this branch. '
+        'This branch\'s review allowance was reset, and its reviewer may not '
+        're-raise them, so plan for them here.\n\n'
+        f'{lineages}\n'
+        'Protocol:\n\n'
+        '1. Check each suggestion against the current code; main may already carry an '
+        'equivalent change.\n'
+        '2. Run the `git log` command named for its branch, then `git show <sha>`, to '
+        'see how the parked branch answered it.\n'
+        '3. Plan a step for each suggestion still open, or call `add_design_decision` '
+        'recording why it is moot.\n\n'
+    )
+
+
+def _retired_lineage_block(review: RetiredReview) -> str:
+    answered_by = review.tip_sha or review.branch
+    return (
+        f'### `{review.branch}` (tip `{review.tip_sha}`)\n\n'
+        f'- Parked at: `{review.parking}`\n'
+        f'- Answered there: {review.amendment_rounds_total} amendment round(s), '
+        f'{review.review_cycles_total} review cycle(s)\n'
+        f'- Retired review archive: `{review.archive}`\n'
+        f'- How it was answered: `git log --oneline main..{answered_by}`\n\n'
+        + format_issue_section('#### Suggestions answered on that branch\n', review.suggestions)
+    )
 
 
 def _integrity_refusal_section(verdict: DoneStepIntegrityVerdict | None) -> str:
@@ -590,6 +628,7 @@ class BriefingAssembler:
         include_prior_proposals: bool = False,
         committed_work: list[dict] | None = None,
         rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
     ) -> str:
         """Build prompt for the architect agent.
 
@@ -611,6 +650,7 @@ class BriefingAssembler:
                 byte-identical to the pre-γ baseline, so nothing is added on
                 the common path.
             rulings: rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
+            retired_reviews: from ``orchestrator/review_lineage.py::retired_reviews_since``.
         """
         preamble = await self._task_preamble(
             task, 'architect', context, include_files=False,
@@ -665,7 +705,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
 {preamble}
 
 {prior_proposal_section}{committed_section}
-{render_rulings_section(rulings, RulingAudience.PLAN)}# Action
+{_retired_review_section(retired_reviews)}{render_rulings_section(rulings, RulingAudience.PLAN)}# Action
 
 1. Explore the codebase thoroughly — read relevant files, understand existing patterns and utilities.
 2. Produce a TDD implementation plan using the plan-tools MCP tools:
@@ -689,6 +729,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         text_drift: TaskTextDrift | None = None,
         integrity_refusal: DoneStepIntegrityVerdict | None = None,
         rulings: Sequence[Ruling] = (),
+        retired_reviews: Sequence[RetiredReview] = (),
     ) -> str:
         """Build prompt for the architect to revalidate a plan after blast-radius requeue.
 
@@ -697,7 +738,8 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         merged).  The architect reviews the existing plan against the changes
         and either confirms, updates, or recreates it.
 
-        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience.
+        *rulings* are rendered by ``orchestrator/escalation_rulings.py`` for the PLAN audience;
+        *retired_reviews* come from ``orchestrator/review_lineage.py::retired_reviews_since``.
         """
         preamble = await self._task_preamble(task, 'architect', context)
         prior_proposal_section = self._format_prior_proposal(task)
@@ -758,7 +800,7 @@ and either confirm it, update it, or recreate it from scratch.
 
 {files_section}
 
-{refusal_section}{rulings_section}## Action
+{refusal_section}{_retired_review_section(retired_reviews)}{rulings_section}## Action
 
 1. Read the overlapping files (if any) to understand what changed.
 2. Decide whether your plan is still valid.
