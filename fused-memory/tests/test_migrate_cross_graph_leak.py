@@ -2144,6 +2144,25 @@ class TestOpenMemoryService:
         backend_instance.close.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_dry_run_closes_a_backend_whose_initialize_failed(
+        self, mock_config, monkeypatch,
+    ):
+        """The lean backend can connect its driver and then fail to initialize;
+        it is closed all the same, and the initialize error is what propagates."""
+        backend_instance = AsyncMock()
+        backend_instance.initialize.side_effect = ConnectionError('falkordb went away')
+        monkeypatch.setattr(
+            'fused_memory.backends.graphiti_client.GraphitiBackend',
+            MagicMock(return_value=backend_instance),
+        )
+
+        with pytest.raises(ConnectionError, match='falkordb went away'):
+            async with _mod.open_memory_service(_args(apply=False), mock_config):
+                pytest.fail('the body must not run')
+
+        backend_instance.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_apply_builds_full_memory_service_without_skip(
         self, mock_config, monkeypatch,
     ):

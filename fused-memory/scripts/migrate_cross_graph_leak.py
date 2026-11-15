@@ -966,7 +966,8 @@ async def open_memory_service(args: Any, config: Any) -> AsyncIterator[Any]:
     longer mutates on startup or contends with a running service's own
     maintenance sweep. Yielded as a tiny namespace exposing ``.graphiti``
     (the backend itself), the one attribute ``run()`` reads from a full
-    ``MemoryService``; the backend is closed when the block exits.
+    ``MemoryService``; the backend is closed when the block exits, and after
+    a failed ``initialize`` too.
 
     Apply (``args.apply`` True): ``--apply`` legitimately mutates, so the
     full ``MemoryService`` is opened, unskipped, by ``maintenance_service``,
@@ -977,8 +978,8 @@ async def open_memory_service(args: Any, config: Any) -> AsyncIterator[Any]:
 
     if not args.apply:
         backend = GraphitiBackend(config)
-        await backend.initialize(skip_maintenance=True)
         try:
+            await backend.initialize(skip_maintenance=True)
             yield types.SimpleNamespace(graphiti=backend)
         finally:
             await backend.close()
