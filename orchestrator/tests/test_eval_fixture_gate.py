@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import subprocess
+from collections import Counter
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -88,6 +89,6 @@ async def test_a_corpus_cell_gates_on_its_fixture_verify_commands_not_the_live_m
     )
 
     assert result.outcome == 'done'
-    assert set(marker.read_text().split()) == {
-        'fixture-test', 'fixture-lint', 'fixture-typecheck',
-    }
+    assert Counter(marker.read_text().split()) == Counter({
+        'fixture-test': 2, 'fixture-lint': 2, 'fixture-typecheck': 2,
+    }), 'each fixture command runs once in the task gate and once in the scoring verify'
