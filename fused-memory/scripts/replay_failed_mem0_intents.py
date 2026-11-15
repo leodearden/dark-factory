@@ -6,7 +6,9 @@ script replays such rows through the LIVE add_memory tool rather than calling
 Mem0 directly, so write triage and the write guards catch anything restated or
 rewritten since the original write. Each row that lands (or that the server
 itself queues for retry) is resolved failed -> completed through a
-compare-and-set, so a second run never replays it again.
+compare-and-set, so a second run never replays it again. Only rows that
+add_memory itself journaled are replayed; any other row is reported
+not_replayable and left 'failed'.
 
 Dry run by default: it prints the rows it would replay and opens no MCP
 client, but it still passes the store-mutation preflight first, because opening
@@ -37,8 +39,10 @@ from shared.cli_boundary import LoudArgumentParser, run_cli
 from fused_memory.models.memory import AddMemoryResponse, Mem0WriteState
 from fused_memory.services.write_journal import (
     Mem0IntentStatus,
+    Mem0WriteMethod,
     WriteJournal,
     decode_mem0_intent_metadata,
+    decode_mem0_intent_write_method,
 )
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
@@ -69,6 +73,7 @@ class ReplayResult(StrEnum):
     NOT_LANDED = 'not_landed'
     ERROR = 'error'
     NOT_FAILED = 'not_failed'
+    NOT_REPLAYABLE = 'not_replayable'
     DRY_RUN = 'dry_run'
 
 
@@ -205,11 +210,27 @@ async def replay(
         if intent_id not in selected_ids and intent_id not in selection.skip_ids
     ]
     for intent in selected:
-        if apply:
+        if (refusal := _not_replayable(intent)) is not None:
+            outcomes.append(refusal)
+        elif apply:
             outcomes.append(await _replay_one(journal, add_memory, intent))
         else:
             outcomes.append(_outcome(intent, ReplayResult.DRY_RUN, _preview(intent)))
     return outcomes
+
+
+def _not_replayable(intent: Mapping[str, Any]) -> ReplayOutcome | None:
+    """A row add_memory did not journal: replaying it through add_memory would change its write."""
+    method = decode_mem0_intent_write_method(intent)
+    if method is Mem0WriteMethod.ADD:
+        return None
+    return _outcome(
+        intent,
+        ReplayResult.NOT_REPLAYABLE,
+        f'written through Mem0Backend.{method.value}; add_memory would re-run it '
+        'through the deduplicating general path and the write guards, so it is '
+        "left 'failed'",
+    )
 
 
 async def _replay_one(
