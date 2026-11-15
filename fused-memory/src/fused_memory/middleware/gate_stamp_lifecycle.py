@@ -1,9 +1,11 @@
 """Which gate-episode stamps a status write removes (task 3638).
 
-``gate_escalated_at`` and ``gate_escalated_preconditions`` describe a pure
-gate's OPEN episode, and a terminal crossing ends it. Entering done or
-cancelled covers every close, runner or manual; leaving it neutralises a
-legacy stale stamp before
+``gate_escalated_at`` and ``gate_escalated_preconditions`` describe a
+deterministic task's OPEN gate episode, filed by a pure gate, an act-then-ask
+deploy or a predicate; only a pure gate's filing writes the preconditions
+stamp. A terminal crossing ends the episode whatever the task's kind.
+Entering done or cancelled covers every close, runner or manual; leaving it
+neutralises a legacy stale stamp before
 ``fused_memory/reconciliation/stage1_stall_detector.py::extract_stalled_gate_backlog_task_ids``
 can select the reopened row.
 """

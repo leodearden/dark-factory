@@ -153,10 +153,12 @@ HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
 # CPython interns identifier-shaped literals, so it passes either way.
 HUMAN_CURATOR_ADJUDICATED_AT_KEY: str = 'human_curator_adjudicated_at'
 
-# The stamps a pure gate's filing writes, in one write, for its OPEN gate
-# episode (orchestrator/src/orchestrator/deterministic_runner.py and
-# orchestrator/src/orchestrator/gate_preconditions.py). fused-memory removes
-# both on any terminal status crossing
+# The stamps of a deterministic task's OPEN gate episode
+# (orchestrator/src/orchestrator/deterministic_runner.py). A pure gate, an
+# act-then-ask deploy and a predicate all stamp gate_escalated_at when they
+# file; a pure gate writes gate_escalated_preconditions in the same write
+# (orchestrator/src/orchestrator/gate_preconditions.py). fused-memory removes
+# both from any row on a terminal status crossing
 # (fused-memory/src/fused_memory/middleware/gate_stamp_lifecycle.py, task 3638).
 GATE_ESCALATED_AT_KEY: str = 'gate_escalated_at'
 GATE_ESCALATED_PRECONDITIONS_KEY: str = 'gate_escalated_preconditions'
