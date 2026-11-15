@@ -703,7 +703,9 @@ def durable_archive_path(
         archive_root = Path(archive_root)
         task_id = str(task_id)
         session_id = str(session_id)
-        # Two load-bearing details in this one line:
+        # Three load-bearing details in this one line:
+        #   * the task_id is joined, not globbed, so it matches literally and
+        #     only that key's own subtree is walked;
         #   * the trailing `*` on `.jsonl*` spans task 3618's gzip drop — it
         #     matches today's `.jsonl.gz` AND tomorrow's plain `.jsonl`, so the
         #     cutover needs no flag day and this locator no dependency on it;
@@ -713,7 +715,7 @@ def durable_archive_path(
         #     luck today; the filter makes returning a directory as "the
         #     transcript" structurally impossible, not incidentally avoided.
         matches = [
-            p for p in archive_root.glob(f'{task_id}/*/{session_id}.jsonl*') if p.is_file()
+            p for p in (archive_root / task_id).glob(f'*/{session_id}.jsonl*') if p.is_file()
         ]
         if not matches:
             return None
