@@ -28,10 +28,12 @@ from shared.project_layout import CheckoutRootError, default_project_root
 TOOL: Final = 'user_timers'
 SHOW_FIELDS: Final = ('Id', 'LoadState', 'UnitFileState', 'ActiveState')
 SHOW_TIMEOUT_SECS: Final = 30
+INSTALLER_TIMEOUT_SECS: Final = 600
 NOT_INSTALLED_LOAD_STATES: Final = frozenset({'', 'not-found'})
 ARM_HINT: Final = (
     'scripts/user_timers.py arm runs the installer of each one not armed, except masked or unreadable ones'
 )
+UNARMED_AFTER_ARM_HINT: Final = 'the line for each one not armed names what it still needs'
 
 
 class Arming(enum.Enum):
@@ -42,6 +44,9 @@ class Arming(enum.Enum):
     MASKED = 'masked'
     NOT_LOADED = 'not-loaded'
     UNREADABLE = 'unreadable'
+
+
+ARMABLE: Final = frozenset({Arming.NOT_INSTALLED, Arming.NOT_ENABLED, Arming.NOT_ACTIVE, Arming.NOT_LOADED})
 
 
 class TimersExit(enum.IntEnum):
@@ -162,6 +167,56 @@ def check(targets: Sequence[Target], *, out: TextIO) -> TimersExit:
     return TimersExit.ALL_ARMED if all_armed else TimersExit.NEEDS_OPERATOR
 
 
+def run_installer(target: Target, arming: Arming, *, out: TextIO) -> bool:
+    """Run *target*'s installer, re-emitting its output under the tag; True when it exited 0."""
+    emit(TOOL, f'[arming] {target.unit} ({arming.value}): running {target.install_command}', out=out)
+    installer = target.timer.installer
+    try:
+        completed = subprocess.run(
+            target.installer_argv,
+            cwd=target.repo_root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=INSTALLER_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired:
+        emit(TOOL, f'[arm-failed] {target.unit}: {installer} timed out after {INSTALLER_TIMEOUT_SECS}s', out=out)
+        return False
+    except OSError as exc:
+        emit(TOOL, f'[arm-failed] {target.unit}: {installer} could not start: {exc}', out=out)
+        return False
+    for line in completed.stdout.splitlines():
+        emit(TOOL, f'  | {line}', out=out)
+    if completed.returncode != 0:
+        emit(TOOL, f'[arm-failed] {target.unit}: {installer} exited {completed.returncode}', out=out)
+        return False
+    return True
+
+
+def arm_unarmed(targets: Sequence[Target], states: Mapping[str, Arming], *, out: TextIO) -> tuple[int, int]:
+    """Run the installer of every armable target in registry order; (installers run, installers failed)."""
+    armable = [target for target in targets if states[target.unit] in ARMABLE]
+    failed = sum(1 for target in armable if not run_installer(target, states[target.unit], out=out))
+    return len(armable), failed
+
+
+def arm(targets: Sequence[Target], *, out: TextIO) -> TimersExit:
+    units = [target.unit for target in targets]
+    states, diagnostic = read_states(units)
+    ran, failed = arm_unarmed(targets, states, out=out)
+    if ran:
+        states, diagnostic = read_states(units)
+    all_armed = render_report(targets, states, diagnostic, hint=UNARMED_AFTER_ARM_HINT, out=out)
+    if failed:
+        emit(TOOL, f'{failed} of {ran} installer(s) failed; see the [arm-failed] line(s) above', out=out)
+    return TimersExit.ALL_ARMED if all_armed and not failed else TimersExit.NEEDS_OPERATOR
+
+
+_COMMANDS: Final = {'check': check, 'arm': arm}
+
+
 def _parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
@@ -179,6 +234,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('check', parents=[common], help='report each expected timer; never changes the host')
+    commands.add_parser(
+        'arm',
+        parents=[common],
+        help='run the installer of each expected timer not armed, except masked or unreadable ones, then report',
+    )
     return parser
 
 
@@ -192,7 +252,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         targets = bind_targets(repo_root)
     except (CheckoutRootError, ValueError) as exc:
         parser.error(str(exc))
-    return int(check(targets, out=sys.stdout))
+    return int(_COMMANDS[args.command](targets, out=sys.stdout))
 
 
 if __name__ == '__main__':
