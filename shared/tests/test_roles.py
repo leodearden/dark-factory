@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import copy
+import json
+from collections.abc import Mapping
+
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError, model_validator
 
 from shared.backends import Backend
 from shared.roles import (
@@ -16,6 +20,7 @@ from shared.roles import (
     RoleSettings,
     UnknownRole,
     config_role,
+    merge_role_table,
 )
 from shared.task_metadata import KNOWN_ROLE_NAMES
 
@@ -158,3 +163,113 @@ class TestRoleSettings:
         row = RoleSettings(model='x')
         with pytest.raises(ValidationError):
             row.model = 'y'
+
+
+DEFAULTS: dict[RoleName, RoleSettings] = {
+    RoleName.ARCHITECT: RoleSettings(
+        model='opus', effort=Effort.XHIGH, budget_usd=10.0, max_turns=60, timeout_secs=2400.0
+    ),
+    RoleName.REVIEWER: RoleSettings(
+        model='sonnet', effort=Effort.MEDIUM, budget_usd=2.0, max_turns=30, timeout_secs=600.0
+    ),
+}
+
+
+class _ServiceConfig(BaseModel):
+    roles: dict[RoleName, RoleSettings]
+
+    @model_validator(mode='before')
+    @classmethod
+    def _merge_roles(cls, data: object) -> object:
+        if not isinstance(data, Mapping):
+            return data
+        return {**data, 'roles': merge_role_table(DEFAULTS, data.get('roles', {}))}
+
+
+class TestMergeRoleTable:
+    def test_empty_raw_table_is_the_defaults(self) -> None:
+        merged = merge_role_table(DEFAULTS, {})
+        assert merged == DEFAULTS
+        assert list(merged) == list(DEFAULTS)
+
+    def test_entry_overrides_only_the_knobs_it_names(self) -> None:
+        merged = merge_role_table(DEFAULTS, {'architect': {'model': 'sonnet'}})
+        architect = merged[RoleName.ARCHITECT]
+        assert architect.model == 'sonnet'
+        default = DEFAULTS[RoleName.ARCHITECT]
+        assert architect.effort == default.effort
+        assert architect.budget_usd == default.budget_usd
+        assert architect.max_turns == default.max_turns
+        assert architect.timeout_secs == default.timeout_secs
+        assert architect.backend == default.backend
+        assert merged[RoleName.REVIEWER] == DEFAULTS[RoleName.REVIEWER]
+
+    def test_role_name_members_are_accepted_as_keys(self) -> None:
+        merged = merge_role_table(DEFAULTS, {RoleName.ARCHITECT: {'max_turns': 90}})
+        assert merged[RoleName.ARCHITECT].max_turns == 90
+
+    def test_knob_values_are_decoded_like_a_fresh_row(self) -> None:
+        merged = merge_role_table(DEFAULTS, {'architect': {'backend': 'claude_cli', 'effort': 'max'}})
+        assert merged[RoleName.ARCHITECT].backend is Backend.CLAUDE
+        assert merged[RoleName.ARCHITECT].effort is Effort.MAX
+
+    def test_explicit_null_unsets_a_knob(self) -> None:
+        merged = merge_role_table(DEFAULTS, {'architect': {'budget_usd': None}})
+        assert merged[RoleName.ARCHITECT].budget_usd is None
+
+    def test_row_instance_contributes_only_its_explicitly_set_knobs(self) -> None:
+        merged = merge_role_table(DEFAULTS, {'architect': RoleSettings(model='haiku')})
+        assert merged[RoleName.ARCHITECT].model == 'haiku'
+        assert merged[RoleName.ARCHITECT].budget_usd == 10.0
+
+    @pytest.mark.parametrize('key', ['nope', 'watcher', 'reviewer_comprehensive'])
+    def test_keys_outside_the_table_are_rejected(self, key: str) -> None:
+        with pytest.raises(UnknownRole) as caught:
+            merge_role_table(DEFAULTS, {key: {}})
+        assert caught.value.value == key
+        assert caught.value.allowed == ('architect', 'reviewer')
+
+    def test_unknown_knob_is_rejected_naming_role_and_knob(self) -> None:
+        with pytest.raises(ValidationError) as caught:
+            merge_role_table(DEFAULTS, {'architect': {'nope': 1}})
+        message = str(caught.value)
+        assert 'architect' in message
+        assert 'nope' in message
+
+    def test_bad_knob_value_is_rejected_naming_role_knob_and_input(self) -> None:
+        with pytest.raises(ValidationError) as caught:
+            merge_role_table(DEFAULTS, {'architect': {'budget_usd': -1}})
+        message = str(caught.value)
+        assert 'architect' in message
+        assert 'budget_usd' in message
+        assert '-1' in message
+
+    def test_non_mapping_row_is_rejected_naming_role_and_value(self) -> None:
+        raw = json.loads('{"architect": "opus"}')
+        with pytest.raises(ValueError) as caught:
+            merge_role_table(DEFAULTS, raw)
+        message = str(caught.value)
+        assert 'architect' in message
+        assert 'opus' in message
+
+    def test_result_follows_role_name_declaration_order(self) -> None:
+        reversed_defaults = dict(reversed(list(DEFAULTS.items())))
+        assert list(merge_role_table(reversed_defaults, {})) == [RoleName.ARCHITECT, RoleName.REVIEWER]
+
+    def test_inputs_are_not_mutated(self) -> None:
+        raw = {'architect': {'model': 'sonnet', 'budget_usd': None}}
+        defaults_before = copy.deepcopy(DEFAULTS)
+        raw_before = copy.deepcopy(raw)
+        merge_role_table(DEFAULTS, raw)
+        assert defaults_before == DEFAULTS
+        assert raw_before == raw
+
+    def test_consumer_keeps_default_knobs_at_load(self) -> None:
+        config = _ServiceConfig.model_validate({'roles': {'architect': {'model': 'sonnet'}}})
+        assert config.roles[RoleName.ARCHITECT].model == 'sonnet'
+        assert config.roles[RoleName.ARCHITECT].budget_usd == 10.0
+
+    def test_consumer_rejects_an_unknown_role_at_load(self) -> None:
+        with pytest.raises(ValidationError) as caught:
+            _ServiceConfig.model_validate({'roles': {'nope': {}}})
+        assert 'nope' in str(caught.value)
