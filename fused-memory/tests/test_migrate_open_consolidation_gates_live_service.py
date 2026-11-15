@@ -22,8 +22,11 @@ from typing import Any
 
 import pytest
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import ConsolidationAutoConfig
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS = _ROOT / 'scripts'
