@@ -342,15 +342,22 @@ class TestNotAuthorizedRendersSanctionedUse:
         error = _refuse(svc)
         assert f"'recon-stage-': {_UNDOCUMENTED}" in error, error
 
-    def test_non_str_entries_are_dropped_individually(self):
-        svc = _service()
+    @pytest.mark.parametrize(
+        ('bad_prefix', 'bad_use'),
+        [('curator-', 42), ('curator-', '  '), ('  ', 'BLANK-KEY-ROLE')],
+        ids=['non-str-value', 'blank-value', 'blank-key'],
+    )
+    def test_invalid_entries_are_dropped_individually(self, bad_prefix, bad_use):
+        svc = _service(
+            content_amend_allowed_agent_prefixes=['recon-stage-', bad_prefix],
+        )
         object.__setattr__(
             svc.config.mem0_update, 'agent_prefix_sanctioned_use',
-            {'recon-stage-': 'RECON-ROLE', 'curator-': 42, 'x-': '  '},
+            {'recon-stage-': 'RECON-ROLE', bad_prefix: bad_use},
         )
         error = _refuse(svc)
         assert "'recon-stage-': RECON-ROLE" in error, error
-        assert f"'curator-': {_UNDOCUMENTED}" in error, error
+        assert f'{bad_prefix!r}: {_UNDOCUMENTED}' in error, error
 
     def test_rendering_never_changes_the_decision(self):
         svc = _service()

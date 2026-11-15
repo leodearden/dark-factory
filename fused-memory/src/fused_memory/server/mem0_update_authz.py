@@ -118,9 +118,8 @@ def resolve_mem0_update_sanctioned_uses(memory_service: Any) -> dict[str, str]:
     """Read the prefix-to-role map live off the shared config.
 
     Returns ``{}`` unless the leaf is a real ``dict``, and otherwise a NEW dict of
-    only the entries whose key is a non-empty ``str`` and whose value is a ``str``
-    non-blank after strip, the same per-item filter as
-    :func:`resolve_mem0_update_allowed_prefixes`.
+    only the entries whose key and value are both ``str`` non-blank after strip,
+    the same definition of blank that ``Mem0UpdateConfig``'s validator applies.
 
     The one deliberate difference from its siblings: this resolver is
     RENDERING-ONLY and never feeds the allow/deny decision. A text lookup has no
@@ -133,7 +132,7 @@ def resolve_mem0_update_sanctioned_uses(memory_service: Any) -> dict[str, str]:
     return {
         prefix: use
         for prefix, use in value.items()
-        if isinstance(prefix, str) and prefix
+        if isinstance(prefix, str) and prefix.strip()
         and isinstance(use, str) and use.strip()
     }
 
