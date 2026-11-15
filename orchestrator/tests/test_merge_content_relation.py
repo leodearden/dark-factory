@@ -1,7 +1,8 @@
 """Real-git boundary suite for the merge content relation (task 10215).
 
 PRD ``plans/one-merge-request-per-task-prd.md`` leaf A: the D10 containment
-classifier, the range patch-id reader, and the D6 content relation.  Every case
+classifier, the range patch-id reader, the stderr-keeping git reads beneath
+them, and the D6 content relation.  Every case
 runs against a genuine temporary repository, because the answers are defined by
 what ``git cherry``, ``git patch-id`` and ``git merge-base`` do to real
 histories; a mock would only restate this file's assumptions about them.
@@ -22,18 +23,21 @@ from _git_fixtures import RepoSeed, seed_repo
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import GitOps
+from orchestrator.git_ops import GitOps, GitQueryFailed
 from orchestrator.merge_lane.content_relation import (
     ContentRelation,
     ContentUnclassifiable,
     classify_content,
 )
+from orchestrator.merge_lane.git_read import (
+    GitReadFailed,
+    is_ancestor_or_raise,
+    resolve_commit,
+)
 from orchestrator.merge_lane.landing_evidence import (
     Containment,
-    GitReadFailed,
     RangePatchIds,
     classify_containment,
-    is_ancestor_or_raise,
     range_patch_ids,
 )
 from orchestrator.merge_lane.types import MergeContent, QueuedBranch
@@ -236,6 +240,30 @@ class TestIsAncestorOrRaise:
         assert 'fatal' in caught.value.stderr
 
 
+@pytest.mark.asyncio
+class TestResolveCommit:
+    async def test_a_ref_name_resolves_to_its_commit(self, repo: GuardedRepo, git_ops: GitOps) -> None:
+        advance_main(repo, 'resolved')
+
+        assert await resolve_commit(git_ops, 'main') == repo.sha('main')
+
+    async def test_a_tree_is_not_a_commit(self, git_ops: GitOps) -> None:
+        with pytest.raises(GitReadFailed) as caught:
+            await resolve_commit(git_ops, 'main^{tree}')
+
+        assert 'fatal' in caught.value.stderr
+
+    async def test_a_missing_sha_raises_with_stderr(self, git_ops: GitOps) -> None:
+        with pytest.raises(GitReadFailed) as caught:
+            await resolve_commit(git_ops, MISSING_SHA)
+
+        assert 'fatal' in caught.value.stderr
+
+
+def test_a_failed_read_is_a_failed_git_query() -> None:
+    assert issubclass(GitReadFailed, GitQueryFailed)
+
+
 def two_commit_branch(repo: GuardedRepo, branch: str) -> tuple[str, str]:
     """Create *branch* off main with two content-bearing commits; return both shas."""
     repo.git('checkout', '-b', branch, 'main')
@@ -400,6 +428,20 @@ class TestClassifyContent:
         relation = await classify_content(git_ops, target='main', old_tip=old_tip, new_tip=new_tip)
 
         assert relation is ContentRelation.REBASED
+
+    @pytest.mark.parametrize('side', ['old_tip', 'new_tip'])
+    @pytest.mark.parametrize('spelling', ['abbreviated sha', 'ref name'])
+    async def test_a_tip_not_spelled_as_a_full_sha_is_refused(
+        self, repo: GuardedRepo, git_ops: GitOps, side: str, spelling: str,
+    ) -> None:
+        tip = branch_with_commit(repo, 'task/spelled')
+        other_spelling = {'abbreviated sha': tip[:12], 'ref name': 'task/spelled'}[spelling]
+        tips = {'old_tip': tip, 'new_tip': tip, side: other_spelling}
+
+        with pytest.raises(ValueError, match=side) as caught:
+            await classify_content(git_ops, target='main', **tips)
+
+        assert repr(other_spelling) in str(caught.value)
 
     async def test_unreadable_new_tip_is_unclassifiable(self, repo: GuardedRepo, git_ops: GitOps) -> None:
         old_tip = branch_with_commit(repo, 'task/bad-new')

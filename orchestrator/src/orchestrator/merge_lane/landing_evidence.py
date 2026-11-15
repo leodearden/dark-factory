@@ -212,6 +212,7 @@ from shared.storm_counter import StormCounter
 
 from orchestrator.config import RecoveryEmissionConfig
 from orchestrator.git_ops import _run
+from orchestrator.merge_lane.git_read import git_read
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -310,24 +311,6 @@ async def classify_containment(
     return _CONTAINMENT_OF_CHERRY[cherry]
 
 
-class GitReadFailed(RuntimeError):
-    """A read-only git command exited non-zero; its command and stderr are attributes."""
-
-    def __init__(self, command: Sequence[str], stderr: str) -> None:
-        super().__init__(f'{" ".join(command)} failed: {stderr.strip()}')
-        self.command = tuple(command)
-        self.stderr = stderr
-
-
-async def _git_read(
-    git_ops: GitOps, command: list[str], *, input_text: str | None = None,
-) -> str:
-    rc, out, err = await _run(command, cwd=git_ops.project_root, input_text=input_text)
-    if rc != 0:
-        raise GitReadFailed(command, err)
-    return out
-
-
 @dataclass(frozen=True)
 class RangePatchIds:
     """What a commit range carries, by content.
@@ -349,9 +332,10 @@ async def range_patch_ids(
     The range is the set ``target..tip``, the one ``git cherry target tip``
     reads, and the D6 ``merge-base(target, tip)..tip`` whenever that merge base
     is unique.  A merge shows no diff, so it contributes no id; the parent list
-    on its ``commit`` line is what flags it.
+    on its ``commit`` line is what flags it.  A git error raises
+    :class:`~orchestrator.merge_lane.git_read.GitReadFailed`.
     """
-    log = await _git_read(git_ops, [
+    log = await git_read(git_ops, [
         'git', 'log', '-p', '--no-color', '--format=commit %H %P', f'{target}..{tip}',
     ])
     if not log.strip():
@@ -359,27 +343,11 @@ async def range_patch_ids(
     has_merge_commit = any(
         len(line.split()) > 3 for line in log.splitlines() if line.startswith('commit ')
     )
-    ids = await _git_read(git_ops, ['git', 'patch-id', '--stable'], input_text=log)
+    ids = await git_read(git_ops, ['git', 'patch-id', '--stable'], input_text=log)
     return RangePatchIds(
         patch_ids=tuple(sorted(line.split()[0] for line in ids.splitlines() if line.strip())),
         has_merge_commit=has_merge_commit,
     )
-
-
-async def is_ancestor_or_raise(
-    git_ops: GitOps, *, ancestor: str, descendant: str,
-) -> bool:
-    """Whether *ancestor* is an ancestor of *descendant*; a git error raises :class:`GitReadFailed`.
-
-    The stderr-keeping twin of
-    ``orchestrator/src/orchestrator/git_ops.py::GitOps.is_ancestor_checked``,
-    for callers that must report why git could not answer.
-    """
-    command = ['git', 'merge-base', '--is-ancestor', ancestor, descendant]
-    rc, _, err = await _run(command, cwd=git_ops.project_root)
-    if rc in (0, 1):
-        return rc == 0
-    raise GitReadFailed(command, err)
 
 
 async def patch_content_contained(
@@ -415,7 +383,6 @@ __all__ = [
     'LANDING_TALLY',
     'Containment',
     'DifferentialOutcome',
-    'GitReadFailed',
     'LandingEvidenceVerdict',
     'LandingMethod',
     'LandingReason',
@@ -430,7 +397,6 @@ __all__ = [
     'file_unattributed_landing_escalation',
     'format_unattributed_landing_detail',
     'found_on_main_note',
-    'is_ancestor_or_raise',
     'is_valid_sha_40',
     'range_patch_ids',
     'validate_landing_evidence',
