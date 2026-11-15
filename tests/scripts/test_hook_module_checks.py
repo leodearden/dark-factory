@@ -42,6 +42,14 @@ def _legs(module: ModuleSpec) -> dict[str, str]:
     return {f'module:{module.prefix}:{leg}': cmd for leg, cmd in legs.items() if cmd is not None}
 
 
+def _every_type_leg() -> dict[str, str]:
+    return {
+        f'module:{m.prefix}:type': m.type_check_command
+        for m in DEFAULT_MODULES
+        if m.type_check_command is not None
+    }
+
+
 def _assert_units(units: list[tuple[str, str]], expected: dict[str, str]) -> None:
     assert len(units) == len(dict(units)), f'a unit is listed twice: {units!r}'
     assert dict(units) == expected
@@ -65,14 +73,9 @@ def test_source_and_test_files_of_one_module_list_only_that_module(tmp_path: Pat
 def test_a_dependency_module_type_checks_every_module(tmp_path: Path, dependency: ModuleSpec) -> None:
     run = run_helper(make_layout(tmp_path), [f'{dependency.prefix}/src/x.py'])
 
-    every_type_leg = {
-        f'module:{m.prefix}:type': m.type_check_command
-        for m in DEFAULT_MODULES
-        if m.type_check_command is not None
-    }
     assert run.rc == 0, run.stderr
     lint_leg = {unit: cmd for unit, cmd in _legs(dependency).items() if unit.endswith(':lint')}
-    _assert_units(run.units, {**lint_leg, **every_type_leg})
+    _assert_units(run.units, {**lint_leg, **_every_type_leg()})
 
 
 def test_a_dependency_fan_out_skips_a_module_without_a_type_check(tmp_path: Path) -> None:
@@ -260,6 +263,26 @@ def test_a_deleted_root_conftest_lists_nothing(tmp_path: Path) -> None:
     run = run_helper(make_layout(tmp_path), ['conftest.py'])
 
     assert (run.rc, run.units) == (0, []), run.stderr
+
+
+def test_a_root_module_type_checks_every_module(tmp_path: Path) -> None:
+    layout = make_layout(tmp_path)
+    write_file(layout, 'df_pytest_isolation.py')
+
+    run = run_helper(layout, ['df_pytest_isolation.py'])
+
+    assert run.rc == 0, run.stderr
+    _assert_units(
+        run.units,
+        {**_every_type_leg(), ROOT_TYPE: 'uv run --project shared pyright df_pytest_isolation.py'},
+    )
+
+
+def test_a_deleted_root_module_still_type_checks_every_module(tmp_path: Path) -> None:
+    run = run_helper(make_layout(tmp_path), ['df_pytest_isolation.py'])
+
+    assert run.rc == 0, run.stderr
+    _assert_units(run.units, _every_type_leg())
 
 
 def test_the_real_tree_screens_exactly_the_committed_manifest() -> None:
