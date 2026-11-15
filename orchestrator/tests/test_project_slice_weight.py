@@ -14,6 +14,7 @@ import stat
 from pathlib import Path
 
 import pytest
+
 from orchestrator.project_slice_weight import SliceWeightOutcome, ensure_project_slice_weight
 
 _USER_MANAGER = '/user.slice/user-1000.slice/user@1000.service'
