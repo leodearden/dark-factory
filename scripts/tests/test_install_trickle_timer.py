@@ -136,6 +136,27 @@ def test_install_copies_templates_and_enables_timer(fake_timer_systemctl, tmp_pa
     assert any(c[0] == "list-timers" for c in calls), f"calls={calls!r}"
 
 
+def test_install_does_not_kick_an_immediate_run(fake_timer_systemctl, tmp_path):
+    """No surprise run at install time.
+
+    A `start` of `legibility-trickle@<project>.service` is a whole nightly
+    digest pass: it spends LLM budget off-cadence, at whatever hour the
+    operator happened to install. The installer arms the timer and leaves the
+    run to it.
+    """
+    search_root = _write_project_config(tmp_path, project_id="proj_a")
+
+    result = _run_script(
+        fake_timer_systemctl, "proj_a",
+        env={"XDG_CONFIG_HOME": str(tmp_path / "xdg-config"),
+             "LEGIBILITY_SEARCH_ROOTS": str(search_root)},
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    for call in fake_timer_systemctl.calls():
+        assert call[:1] != ["start"], f"unexpected immediate run: {call!r}"
+
+
 def _service_environment(service_text):
     """Parse the [Service] section's `Environment=` assignments into a dict.
 

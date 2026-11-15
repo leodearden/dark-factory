@@ -127,6 +127,27 @@ def test_install_copies_templates_and_enables_timer(fake_timer_systemctl, tmp_pa
     assert any(c[0] == "list-timers" for c in calls), f"calls={calls!r}"
 
 
+def test_install_does_not_kick_an_immediate_run(fake_timer_systemctl, tmp_path):
+    """No surprise run at install time.
+
+    Any run of the detector can escalate: a completed session in its lookback
+    that left no transcript is a finding. Kicked at install, those alarms
+    fire off the 04:00 cadence, at whatever hour the operator installed. The
+    installer arms the timer and leaves the run to it.
+    """
+    search_root = _write_project_config(tmp_path, project_id="proj_a")
+
+    result = _run_script(
+        fake_timer_systemctl, "proj_a",
+        env={"XDG_CONFIG_HOME": str(tmp_path / "xdg-config"),
+             "LEGIBILITY_SEARCH_ROOTS": str(search_root)},
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    for call in fake_timer_systemctl.calls():
+        assert call[:1] != ["start"], f"unexpected immediate run: {call!r}"
+
+
 def test_service_template_execstart_shape():
     """Template-content invariant (NOT install behavior): the committed
     @.service's ExecStart must target the DETECTOR

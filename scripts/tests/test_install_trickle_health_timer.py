@@ -407,6 +407,27 @@ def test_install_copies_templates_and_enables_timer(fake_timer_systemctl, tmp_pa
     assert any(c[0] == 'list-timers' for c in calls), f'calls={calls!r}'
 
 
+def test_install_does_not_kick_an_immediate_run(fake_timer_systemctl, tmp_path):
+    """No surprise run at install time.
+
+    The probe judges the state the night's trickle wrote, and escalates what
+    it finds. Kicked at install, on a host whose first 03:00 trickle has not
+    run yet, it would judge a night that has not happened. The installer arms
+    the timer and leaves the run to it.
+    """
+    search_root = _write_project_config(tmp_path, project_id='proj_a')
+
+    result = _run_script(
+        fake_timer_systemctl, 'proj_a',
+        env={'XDG_CONFIG_HOME': str(tmp_path / 'xdg-config'),
+             'LEGIBILITY_SEARCH_ROOTS': str(search_root)},
+    )
+
+    assert result.returncode == 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
+    for call in fake_timer_systemctl.calls():
+        assert call[:1] != ['start'], f'unexpected immediate run: {call!r}'
+
+
 def test_install_is_idempotent(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id='proj_a')
     xdg_config = tmp_path / 'xdg-config'
