@@ -263,15 +263,8 @@ function stepPaths(values, width, height) {
       drawn = [run[0], [endX, y]];
       lineCommands = `M${x},${y} L${endX},${y}`;
     } else {
-      const parts = [`M${run[0][0]},${run[0][1]}`];
-      for (let i = 1; i < run.length; i++) {
-        // Horizontal segment to the new x, keeping the old y...
-        parts.push(`L${run[i][0]},${run[i - 1][1]}`);
-        // ...then the vertical segment to the new y. Sharp step edges.
-        parts.push(`L${run[i][0]},${run[i][1]}`);
-      }
       drawn = run;
-      lineCommands = parts.join(' ');
+      lineCommands = stepLineCommands(run);
     }
 
     lines.push(lineCommands);
@@ -280,6 +273,18 @@ function stepPaths(values, width, height) {
   }
 
   return { line: lines.join(' '), area: areas.join(' ') };
+}
+
+// One run of two or more points as step edges: a horizontal segment to each
+// new x at the old y, then the vertical segment to the new y. Shared by
+// stepPaths and axisStepPaths. Module-private.
+function stepLineCommands(run) {
+  const parts = [`M${run[0][0]},${run[0][1]}`];
+  for (let i = 1; i < run.length; i++) {
+    parts.push(`L${run[i][0]},${run[i - 1][1]}`);
+    parts.push(`L${run[i][0]},${run[i][1]}`);
+  }
+  return parts.join(' ');
 }
 
 // ── Axis maximum over real samples only ────────────────────────────────────
@@ -389,16 +394,9 @@ function axisMax(dataMax, ticks, countAxis) {
 // requested window, not measurements, so they keep rendering and only the
 // series paths are skipped.
 function axisPaths(values, geom) {
-  const series = values || [];
   const stepX = columnStepX(geom);
   const baselineY = geom.y0 + geom.height;
-
-  // x comes from the ORIGINAL index, exactly as sparkScale does — compacting
-  // would silently redate every surviving sample.
-  const points = series.map((v, i) => {
-    const y = axisY(v, geom);
-    return y === null ? null : [geom.x0 + i * stepX, y];
-  });
+  const points = axisColumnPoints(values, geom, stepX);
 
   const lines = [];
   const areas = [];
@@ -419,11 +417,46 @@ function axisPaths(values, geom) {
   return { line: lines.join(' '), area: areas.join(' '), stepX };
 }
 
-// The one x-mapping of the padded charts, shared by axisPaths, bandPaths and
-// stackedAreaPaths so a band or stack can never drift from the line it sits
-// under. Module-private.
+// ── Step series for a PADDED chart (charts.jsx's `LineChart` `step` flag) ──
+// Same `geom`, column x's and `stepX` as axisPaths; only the within-run edges
+// differ, built as stepPaths builds them, so a value holds until the next
+// column (the Quality tab's snapshot series, task 8465). A hole ends the run:
+// no edge is held across a slot that holds no measurement. A run of one is a
+// zero-length segment at its own x, never widened to a full-width tick, since
+// a lone column of a padded chart is still one column.
+function axisStepPaths(values, geom) {
+  const stepX = columnStepX(geom);
+  const baselineY = geom.y0 + geom.height;
+  const lines = [];
+  const areas = [];
+
+  for (const run of plottableRuns(axisColumnPoints(values, geom, stepX))) {
+    const drawn = run.length === 1 ? [run[0], run[0]] : run;
+    const lineCommands = run.length === 1 ? `M${run[0][0]},${run[0][1]} L${run[0][0]},${run[0][1]}` : stepLineCommands(run);
+
+    lines.push(lineCommands);
+    const areaCommands = closeRunArea(drawn, lineCommands, baselineY);
+    if (areaCommands !== null) areas.push(areaCommands);
+  }
+
+  return { line: lines.join(' '), area: areas.join(' '), stepX };
+}
+
+// The one x-mapping of the padded charts, shared by axisPaths, axisStepPaths,
+// bandPaths and stackedAreaPaths so a band or stack can never drift from the
+// line it sits under. Module-private.
 function columnStepX(geom) {
   return geom.width / Math.max(geom.count - 1, 1);
+}
+
+// Each sample at its column: x from the ORIGINAL index, exactly as sparkScale
+// does (compacting would silently redate every surviving sample), and null at
+// a hole. Module-private.
+function axisColumnPoints(values, geom, stepX) {
+  return (values || []).map((v, i) => {
+    const y = axisY(v, geom);
+    return y === null ? null : [geom.x0 + i * stepX, y];
+  });
 }
 
 // One run of [x, yTop, yBase] points as a closed polygon: forward along the
@@ -621,6 +654,7 @@ const SPARK_PATH_API = {
   axisY,
   axisMax,
   axisPaths,
+  axisStepPaths,
   bandPaths,
   barFractions,
   stackedAreaPaths,

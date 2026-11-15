@@ -343,6 +343,12 @@ class DashboardConfig:
         return self.project_root / 'data' / 'burndown' / 'quality.db'
 
     @property
+    def quality_metrics_dir(self) -> Path:
+        """The nightly snapshot home, one subdirectory per project id; its writer's default is
+        scripts/quality_snapshot_cadence.py::DEFAULT_DATA_DIR."""
+        return self.project_root / 'data' / 'quality-metrics'
+
+    @property
     def load_samples_db(self) -> Path:
         return self.project_root / 'data' / 'load-samples.db'
 

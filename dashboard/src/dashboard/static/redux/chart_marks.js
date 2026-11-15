@@ -30,12 +30,14 @@ const CHART_MARKS_STYLE_BY_KIND = Object.freeze({
   instrument: 'rug',
   artefact: 'range',
   alarm: 'alarm',
+  baseline: 'baseline',
 });
 
 const CHART_MARKS_LEGEND = Object.freeze([
   Object.freeze({ style: 'line', label: 'change' }),
   Object.freeze({ style: 'tick', label: 'budget / turns' }),
   Object.freeze({ style: 'rug', label: 'deploy / instrument' }),
+  Object.freeze({ style: 'baseline', label: '/review-all baseline' }),
   Object.freeze({ style: 'range', label: 'artefact (excluded)' }),
   Object.freeze({ style: 'alarm', label: 'alarm' }),
 ]);

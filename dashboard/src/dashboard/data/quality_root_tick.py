@@ -2,8 +2,9 @@
 thread of its own under a per-root budget, say why a root produced nothing, and commit each root's
 write on its own.
 
-The landing-sample tick (dashboard/src/dashboard/data/quality_sampler.py) and the marker tick
-(dashboard/src/dashboard/data/quality_marker_sampler.py) are both built on it.
+The landing-sample tick (dashboard/src/dashboard/data/quality_sampler.py), the marker tick
+(dashboard/src/dashboard/data/quality_marker_sampler.py) and the snapshot tick
+(dashboard/src/dashboard/data/quality_snapshot_sampler.py) are built on it.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import aiosqlite
 from shared.tasks_db_readonly import TaskDbUnreadable
 
 __all__ = [
+    'FACTORY_REPO',
     'describe_root_failure',
     'describe_unreadable',
     'git_checkouts',
@@ -28,6 +30,10 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+FACTORY_REPO = Path(__file__).resolve().parents[4]
+"""This module's own checkout: the factory whose roles.py every project's orchestrator runs, and
+whose scripts/quality_metrics_snapshot.py measures every project's snapshots."""
 
 
 def git_checkouts(roots: Iterable[Path]) -> list[Path]:

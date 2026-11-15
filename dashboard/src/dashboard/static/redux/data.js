@@ -98,14 +98,15 @@ const NARROWED_POLL_URLS = Object.freeze({
 });
 
 // Keys fetched on a USER ACTION rather than by the poll loop, each parameterised
-// by the one value its caller already holds. Three declared rows today:
+// by the one value its caller already holds. Four declared rows today:
 // `terminal`, through which tab_tasks.jsx and, via
 // task_snapshot.js::createTerminalWindowHooks, tabs.jsx::OrchTab fetch
 // `?terminal=<project>`; `taskProse`, a task's description/details
 // addressed by its row's own uid (`<project>/T-<id>`), which the Task Detail
 // pane reads for the selected task and the Escalations drawer for the linked
-// one; and `quality`, the Quality tab's one read, addressed by the canonical
-// query qualityQuery builds.
+// one; `quality`, the Quality tab's one read, addressed by the canonical
+// query qualityQuery builds; and `qualitySnapshotDiff`, one snapshot point's
+// instrument --diff text, addressed by the query snapshotDiffQuery builds.
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
 // one at a call site — a caller holds the parameter and asks for the row, so
@@ -157,6 +158,15 @@ const ON_DEMAND_KEYS = {
     fields: Object.freeze(['QUALITY', 'QUALITY_MARKERS', 'QUALITY_SNAPSHOTS']),
     retain: 4,
   },
+  // The point the Quality tab's snapshot selector shows. PLAIN: the diff is
+  // the instrument's report text, not a measurement.
+  qualitySnapshotDiff: {
+    url: query => `/api/v2/dashboard/quality/snapshot-diff?${query}`,
+    key: (query, field = 'QUALITY_SNAPSHOT_DIFF') => `${field}:${query}`,
+    spec: PLAIN,
+    fields: Object.freeze(['QUALITY_SNAPSHOT_DIFF']),
+    retain: 8,
+  },
 };
 
 // A task row's uid, `<project>/T-<id>`: the taskProse param. It restates
@@ -170,6 +180,15 @@ function taskUid(project, id) {
 function qualityQuery({ project, window: landingWindow, module: moduleName }) {
   const parts = [['project', project], ['window', landingWindow]];
   if (moduleName !== null && moduleName !== undefined && moduleName !== '') parts.push(['module', moduleName]);
+  return encodedQuery(parts);
+}
+
+// The qualitySnapshotDiff param, in one fixed key order as qualityQuery's is.
+function snapshotDiffQuery({ project, point }) {
+  return encodedQuery([['project', project], ['point', point]]);
+}
+
+function encodedQuery(parts) {
   return parts.map(([name, value]) => `${name}=${encodeURIComponent(value)}`).join('&');
 }
 
@@ -1182,6 +1201,7 @@ const DF_DATA_LOADER_API = {
   ON_DEMAND_KEYS,
   taskUid,
   qualityQuery,
+  snapshotDiffQuery,
   requestOnDemand,
   onDemandReceipt,
   REFRESH_OUTCOMES,
