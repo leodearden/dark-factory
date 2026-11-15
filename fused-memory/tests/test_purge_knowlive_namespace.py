@@ -510,11 +510,12 @@ class TestRunDryRun:
             mem0_count: int | None = None,
         ):
             """AsyncMock memory_service whose .graphiti is a real backend over the
-            'knowlive' graph, for enumerate_graphiti_namespace / enumerate_mem0_namespace."""
+            LEGACY_NAMESPACE graph alone, for enumerate_graphiti_namespace /
+            enumerate_mem0_namespace; any other key raises KeyError."""
             memory_service = AsyncMock()
             graph = _make_graph_mock(graphiti_rows or [])
             memory_service.graphiti = make_backend(
-                mock_config, graph_access=FakeGraphAccess({'knowlive': graph}),
+                mock_config, graph_access=FakeGraphAccess({_mod.LEGACY_NAMESPACE: graph}),
             )
             members = mem0_members or []
             memory_service.mem0 = MagicMock()
@@ -564,7 +565,7 @@ class TestRunDryRun:
             invalidation_time=invalidation_time,
         )
 
-        assert report['namespace'] == 'knowlive'
+        assert report['namespace'] == _mod.LEGACY_NAMESPACE
         assert report['dry_run'] is True
         assert report['graphiti']['count'] == 2
         assert report['graphiti']['node_uuids'] == ['uuid-1', 'uuid-2']
@@ -583,7 +584,6 @@ class TestRunDryRun:
             invalidation_time=invalidation_time,
         )
 
-        assert _mod.LEGACY_NAMESPACE == 'knowlive'
         graph.ro_query.assert_awaited_once()
         memory_service.mem0.count.assert_called_once()
         assert (
@@ -670,12 +670,12 @@ class TestRunApply:
             delete_side_effect=None,
         ):
             """AsyncMock memory_service whose .graphiti is a real backend over the
-            'knowlive' graph, for both enumeration and purge calls (mirrors
+            LEGACY_NAMESPACE graph, for both enumeration and purge calls (mirrors
             TestRunDryRun.make_memory_service)."""
             memory_service = AsyncMock()
             graph = _make_graph_mock(graphiti_rows or [])
             memory_service.graphiti = make_backend(
-                mock_config, graph_access=FakeGraphAccess({'knowlive': graph}),
+                mock_config, graph_access=FakeGraphAccess({_mod.LEGACY_NAMESPACE: graph}),
             )
             members = mem0_members or []
             memory_service.mem0 = MagicMock()
@@ -697,7 +697,7 @@ class TestRunApply:
         self, make_memory_service,
     ):
         """purge issues a DETACH DELETE write against the namespace graph; the
-        enumerate, the purge and the after-recount all reach 'knowlive', the
+        enumerate, the purge and the after-recount all reach LEGACY_NAMESPACE, the
         only graph wired -- never know_live/dark_factory (safety guard)."""
         rows = [['uuid-1', ['Entity'], 'Node A']]
         memory_service, graph = make_memory_service(graphiti_rows=rows)
@@ -813,7 +813,7 @@ class TestRunApply:
         graph = MagicMock()
         graph.ro_query = AsyncMock(return_value=result)
         graph.query = AsyncMock(side_effect=RuntimeError('FalkorDB connection lost'))
-        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({'knowlive': graph}))
+        graphiti = make_backend(mock_config, graph_access=FakeGraphAccess({_mod.LEGACY_NAMESPACE: graph}))
 
         memory_service = AsyncMock()
         memory_service.graphiti = graphiti
@@ -898,7 +898,7 @@ class TestRunApplyStoreMutationPreflight:
             memory_service = AsyncMock()
             graph = _make_graph_mock(graphiti_rows or [])
             memory_service.graphiti = make_backend(
-                mock_config, graph_access=FakeGraphAccess({'knowlive': graph}),
+                mock_config, graph_access=FakeGraphAccess({_mod.LEGACY_NAMESPACE: graph}),
             )
             members = mem0_members or []
             memory_service.mem0 = MagicMock()

@@ -2198,7 +2198,10 @@ class TestRunDryRun:
         mocks['delete_episode'].assert_not_called()
         qdrant_client.upsert.assert_not_called()
         qdrant_client.delete_collection.assert_not_called()
-        assert wired.graphs, 'expected at least one graph to have been touched'
+        assert wired.graphs, 'expected the scenario to wire at least one graph'
+        assert any(graph.ro_query.await_count for graph in wired.graphs.values()), (
+            'expected the dry run to read at least one graph'
+        )
         for graph in wired.graphs.values():
             graph.delete.assert_not_called()
             graph.query.assert_not_called()
