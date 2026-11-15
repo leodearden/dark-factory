@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import _async_mock_orphans
 import pytest
 import pytest_asyncio
+from _harness_store_paths import point_harness_stores_at
 from _live_mcp_guard import (
     REAL_MCP_SESSION_MARKER,
     assert_no_live_attempts,
@@ -65,7 +66,6 @@ if str(REPO_ROOT) not in sys.path:
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
 from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
-from _harness_store_paths import point_harness_stores_at  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
     ExitContractViolationCollector,
