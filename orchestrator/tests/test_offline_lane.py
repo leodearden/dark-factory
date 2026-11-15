@@ -22,10 +22,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import shlex
 from collections.abc import Awaitable, Callable, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -46,12 +47,13 @@ from orchestrator.offline_lane_confirm import (
     outcome_to_json,
     serial_confirm_command,
 )
-from orchestrator.offline_lane_episode_state import PassEffect, PassObservation
+from orchestrator.offline_lane_episode_state import EPISODE_RETENTION, PassEffect, PassObservation
 from orchestrator.offline_lane_episodes import TickResult
 from orchestrator.offline_lane_pass import ConfirmSeam
 from orchestrator.offline_lane_records import (
     LEGACY_INFRA_COMMAND,
     LEGACY_NUMERIC_COMMAND,
+    RECORD_RETENTION,
     Leg,
     PassRecord,
     Phase,
@@ -762,13 +764,7 @@ async def test_default_suite_runner_builds_run_offline_deep_command(tmp_path: Pa
         'DF_VERIFY_ROLE=offline must be set — the offline role footprint '
         '(nice/ionice) lives inside the script (Part A), not re-implemented here'
     )
-    for key, value in os.environ.items():
-        if key == 'DF_VERIFY_ROLE':
-            continue
-        assert kwargs['env'].get(key) == value, (
-            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
-            f'not replace it (missing/altered {key!r})'
-        )
+    _assert_lane_env(kwargs['env'])
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
@@ -822,13 +818,7 @@ async def test_default_run_command_builds_idle_niced_sh_c_invocation(tmp_path: P
         'cwd must be <worktree>/<cmd.cwd>'
     )
     assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline'
-    for key, value in os.environ.items():
-        if key == 'DF_VERIFY_ROLE':
-            continue
-        assert kwargs['env'].get(key) == value, (
-            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy '
-            f'(missing/altered {key!r})'
-        )
+    _assert_lane_env(kwargs['env'])
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
@@ -1154,13 +1144,7 @@ async def test_default_infra_runner_builds_run_all_host_infra_command(tmp_path: 
     assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline', (
         'DF_VERIFY_ROLE=offline must be set, same as the numeric sub-run'
     )
-    for key, value in os.environ.items():
-        if key == 'DF_VERIFY_ROLE':
-            continue
-        assert kwargs['env'].get(key) == value, (
-            f'env must overlay DF_VERIFY_ROLE onto a full os.environ copy, '
-            f'not replace it (missing/altered {key!r})'
-        )
+    _assert_lane_env(kwargs['env'])
     assert Path(kwargs['stdout'].name) == lane_pass.output_path(Phase.DETECT)
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
 
@@ -1503,10 +1487,16 @@ async def test_a_pass_record_older_than_the_retention_survives_while_a_held_epis
     cmd = LaneCommand(name='q', command='pytest -m integration')
     clock = Clock()
     client = FakeLedgerClient([])
+    config = _make_config(
+        tmp_path,
+        offline_lane_legacy_numeric_enabled=False,
+        offline_lane_commands=[cmd],
+        offline_lane_red_unlanded_hours=240,
+    )
     worker = _make_worker(
         tmp_path,
         git_ops=_make_git_ops(head='HEAD1', worktree_path=tmp_path / '_offline-deep'),
-        config=_make_config(tmp_path, offline_lane_legacy_numeric_enabled=False, offline_lane_commands=[cmd]),
+        config=config,
         command_runner=AsyncMock(return_value=(1, 'tail')),
         confirm=_RecordingConfirm(_HELD),
         task_client=client,
@@ -1521,8 +1511,10 @@ async def test_a_pass_record_older_than_the_retention_survives_while_a_held_epis
     (task_id,) = client.tasks
     client.set_status(task_id, 'in-progress')
 
-    for _ in range(15):
-        clock.advance(hours=23)
+    cadence_hours = config.git.offline_lane_red_unlanded_hours - 1
+    assert timedelta(hours=cadence_hours) < EPISODE_RETENTION
+    for _ in range(math.ceil(RECORD_RETENTION / timedelta(hours=cadence_hours))):
+        clock.advance(hours=cadence_hours)
         await _drive_one_pass(worker, 'q')
 
     assert worker.records.load_pass('q', counted_pass_id) is not None
