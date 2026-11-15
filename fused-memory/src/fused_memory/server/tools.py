@@ -4276,6 +4276,14 @@ def create_mcp_server(
         still reach this path; the gate's purpose is to prevent accidental
         use by ordinary callers, not to defend against a malicious one.
 
+        If the embedding provider fails transiently (429, 5xx, connection), the
+        write is NOT dropped: the ack carries stores_pending_retry=['mem0'] and
+        empty memory_ids, the message says mem0_pending_retry, and the server
+        re-issues it through the same dedup-exempt backend method. A later
+        non-transient failure dead-letters it (status 'dead' in the write
+        journal's mem0_intents). Do NOT re-submit the same content. The write
+        has landed only when memory_ids is non-empty.
+
         Args:
             content: The system record content (e.g. a deterministic cycle summary).
             project_id: Project scope (required)
