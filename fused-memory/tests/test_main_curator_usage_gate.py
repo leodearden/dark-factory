@@ -15,6 +15,7 @@ from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
 from shared.usage_gate import UsageGate
 
+from fused_memory.config.checkout_anchor import CHECKOUT_ROOT
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.server.main import _resolve_curator_cost_store_path
 
@@ -95,7 +96,7 @@ class TestCuratorCapEventPersisted:
 @pytest.mark.parametrize(
     ('reconciliation_cfg', 'expected'),
     [
-        (None, Path('./data/curator_events.db')),
+        (None, CHECKOUT_ROOT / 'data' / 'curator_events.db'),
         (MagicMock(data_dir='/tmp/recon'), Path('/tmp/recon/curator_events.db')),
     ],
     ids=['fallback', 'with_data_dir'],
@@ -115,7 +116,7 @@ def test_resolve_curator_cost_store_path(reconciliation_cfg, expected):
 @pytest.mark.parametrize(
     ('reconciliation_cfg', 'expected'),
     [
-        (None, Path('./data/curator_escalator_state.json')),
+        (None, CHECKOUT_ROOT / 'data' / 'curator_escalator_state.json'),
         (MagicMock(data_dir='/tmp/recon'), Path('/tmp/recon/curator_escalator_state.json')),
     ],
     ids=['fallback', 'with_data_dir'],
