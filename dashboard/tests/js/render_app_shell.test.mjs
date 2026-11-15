@@ -1,11 +1,20 @@
-// The app shell's render tests: app.jsx's poll-scope announcements and the
-// endpoints each tab reads. The real page renders in a jsdom window
+// The app shell's render tests: app.jsx's poll-scope announcements, the
+// endpoints each tab reads, and the tab slot's error boundary. The real page renders in a jsdom window
 // (dom_harness.mjs); every expected value is taken from the shipped helpers'
 // public globals, never from script text.
 import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { click, openContainingWindow, openTab, railButton } from './_render_helpers.mjs';
+import { caughtFrom } from './_caught.mjs';
+import {
+  assertReportsOnlyContainedThrows,
+  click,
+  failureNotices,
+  noticeLines,
+  openContainingWindow,
+  openTab,
+  railButton,
+} from './_render_helpers.mjs';
 import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
 import {
   everyPolledKey,
@@ -338,4 +347,60 @@ test('the measured read sets hold what was found by hand', () => {
     assert.deepEqual(floor.paths.filter(path => !read.has(path)), [], `tab ${tab} lost reads it is known to make`);
     assert.equal(reads.rows, floor.rows, `tab ${tab} ${floor.rows ? 'no longer reads' : 'now reads'} task rows`);
   }
+});
+
+// ── A tab's render throw is contained to the tab slot ─────────────────────
+// app.jsx binds window.DF_TABS when it loads inside mountPage(), so a probe
+// substituted there renders in the real tab slot. The probe hands the real
+// assertDatum a bare number, as a tab handed one by its caller would.
+
+const PROBE = 'CostsTab probe';
+const HOUR_MS = 3_600_000;
+
+// Fails one of `paths`' endpoints through data.js's own refreshOne until its
+// streak reaches the staleness threshold, which publishes the genuine
+// DF_DATA.__stale record. Returns that endpoint's path.
+async function makeStale(window, paths) {
+  const loader = window.DF_DATA_LOADER;
+  const [path] = paths;
+  const [url, keySpecs] = Object.entries(loader.endpointsFor('24h')).find(([candidate]) => loader.pollKey(candidate) === path);
+  const state = loader.createPollState();
+  let now = Date.now();
+  const deps = {
+    fetchImpl: () => Promise.reject(new Error('down')),
+    now: () => now,
+    setTimeoutImpl: () => 0,
+    clearTimeoutImpl: () => {},
+  };
+  for (let attempt = 0; attempt < window.DF_ENDPOINT_STALENESS.STALE_FAILURE_THRESHOLD; attempt++) {
+    await loader.refreshOne(url, keySpecs, state, deps);
+    now += HOUR_MS;
+  }
+  return path;
+}
+
+test("app.jsx replaces a tab whose child throws with the tab's notice, and the stale banner and rail render on", async t => {
+  const harness = openContainingWindow(t);
+  const { window } = harness;
+  const { DF_DATUM, DF_POLL_SCOPE, DF_ENDPOINT_STALENESS, DF_RENDER_FAILURE } = window;
+  window.DF_TABS = { ...window.DF_TABS, CostsTab: () => DF_DATUM.assertDatum(42, PROBE) };
+  const stalePath = await makeStale(window, DF_POLL_SCOPE.TAB_ENDPOINTS.cost);
+  const page = { ...harness, root: harness.mountPage() };
+
+  openTab(page, 'Costs');
+
+  const notices = failureNotices(page.root);
+  assert.deepEqual(notices.map(notice => notice.dataset.testid), ['tab-render-failure-banner']);
+  const expected = DF_RENDER_FAILURE.tabRenderFailureNotice('Costs', caughtFrom(() => DF_DATUM.assertDatum(42, PROBE)));
+  assert.deepEqual(noticeLines(notices[0]), [expected.text, expected.detail]);
+
+  const staleBanners = [...page.root.querySelectorAll('.body [data-testid="endpoint-stale-banner"]')];
+  const [staleNotice] = DF_ENDPOINT_STALENESS.staleNoticesForTab({
+    paths: [stalePath],
+    stale: window.DF_DATA.__stale,
+    now: Date.now(),
+  });
+  assert.deepEqual(staleBanners.map(banner => banner.textContent), [staleNotice.text]);
+  assert.ok(page.root.querySelectorAll('.rail-nav button').length > 0, 'the rail stopped rendering');
+  assertReportsOnlyContainedThrows(page.consoleErrors);
 });
