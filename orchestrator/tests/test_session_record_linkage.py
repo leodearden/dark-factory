@@ -636,17 +636,6 @@ def _forked_inheritor_env(root: Path) -> dict[str, str]:
     return {'CLAUDE_SPAWN_SESSION_ID': _DISOWNED_SPAWNER, 'CLAUDE_SPAWN_ROLE': 'watcher'}
 
 
-_REMINT_OWNER = 5_918_001
-_REMINT_OWNER_PARENT = 5_918_000
-_REMINT_SPAWN_SLUG = 'session-cockpit-5918000'
-
-
-def _spawned_session_env(root: Path) -> dict[str, str]:
-    """Seed the spawn-claude.sh LAUNCHING record that a claude parented by ``_REMINT_OWNER_PARENT`` binds."""
-    launching_record(_REMINT_SPAWN_SLUG, root, pid=_REMINT_OWNER_PARENT)
-    return owner_ppid_env(_REMINT_SPAWN_SLUG, _REMINT_OWNER_PARENT)
-
-
 class TestResumedSessionIdKeyedRecordIsRelinked:
     _RESUMED = 7_614_102
 
@@ -1081,10 +1070,21 @@ class TestLeaseClaimCliRecordSlug:
         assert _lease_body(tmp_path).pid == expected_body_pid
 
 
+_REMINT_OWNER = 5_918_001
+_REMINT_OWNER_PARENT = 5_918_000
+_REMINT_SPAWN_SLUG = 'session-cockpit-5918000'
+
+
+def _spawned_by_remint_owner_parent_env(root: Path) -> dict[str, str]:
+    """Seed the spawn-claude.sh LAUNCHING record that a claude parented by ``_REMINT_OWNER_PARENT`` binds."""
+    launching_record(_REMINT_SPAWN_SLUG, root, pid=_REMINT_OWNER_PARENT)
+    return owner_ppid_env(_REMINT_SPAWN_SLUG, _REMINT_OWNER_PARENT)
+
+
 class TestALeaseFollowsItsHoldersRecordAcrossARemint:
     @pytest.mark.parametrize(
         'lane',
-        [_hand_launched_env, _spawned_session_env],
+        [_hand_launched_env, _spawned_by_remint_owner_parent_env],
         ids=['hand-launched', 'spawned'],
     )
     @pytest.mark.parametrize('source', ['clear', 'compact'])
