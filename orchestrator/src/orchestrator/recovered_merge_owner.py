@@ -19,6 +19,13 @@ from escalation.models import Escalation
 from shared.task_statuses import TaskStatus
 
 from orchestrator.event_store import EventType
+from orchestrator.merge_halt_escalation import (
+    MERGE_HALT_STATUSES,
+    MergeHaltControl,
+    MergeHaltEscalationText,
+    build_merge_halt_escalation_text,
+    submit_halt_owning_escalation,
+)
 from orchestrator.merge_lane.types import MergeOutcome
 from orchestrator.stranded_verified_green import (
     DURABLE_MERGE_FAILURE_STATUSES,
@@ -44,9 +51,7 @@ __all__ = [
 
 AGENT_ROLE = 'harness-recovered-merge-owner'
 
-LANDED_MERGE_STATUSES: frozenset[str] = frozenset({
-    'done', 'already_merged', 'done_wip_recovery',
-})
+LANDED_MERGE_STATUSES: frozenset[str] = frozenset({'done', 'already_merged'})
 
 _BLOCKABLE_STATUSES: frozenset[str] = frozenset({
     TaskStatus.IN_PROGRESS, TaskStatus.PENDING,
@@ -81,6 +86,7 @@ class Settled(enum.StrEnum):
 
     LANDED = 'landed'
     LANDING_UNRECORDED = 'landing_unrecorded'
+    HALTED = 'halted'
     BLOCKED = 'blocked'
     WORKFLOW_HELD = 'workflow_held'
     STATUS_MOVED = 'status_moved'
@@ -92,15 +98,17 @@ class Settled(enum.StrEnum):
 class RecoveredMergeOwner:
     """Settles each adopted request's outcome once its future finalizes.
 
-    A landing drives *reconcile_landed* (the landed-outbox done-write). A
-    durable failure, or any status the lane's partition does not classify,
-    blocks the task and files one L1 under the lane's stated block category.
-    A transient outcome is left to the stranded sweep.
+    - Landing: *reconcile_landed* makes the landed-outbox done-write.
+    - Halt: files the halt-owning L1 and registers it with *merge_halt*; then blocks the task,
+      or records the landing for ``done_wip_recovery``.
+    - Transient (``superseded``): left to the stranded sweep.
+    - Durable or unclassified failure: blocks the task and files one L1 under its block category.
     """
 
     tasks: OutcomeTasks
     escalations: EscalationQueue | None
     reconcile_landed: Callable[[str], Awaitable[bool]]
+    merge_halt: MergeHaltControl | None
     event_store: EventStore | None = None
 
     def adopt(self, requests: Iterable[RecoveredRequest], *, schedule: ScheduleCoro) -> None:
@@ -155,6 +163,9 @@ class RecoveredMergeOwner:
         tid = request.task_id
         if self.tasks.is_actively_held(tid):
             return Settled.WORKFLOW_HELD
+        if outcome.status in MERGE_HALT_STATUSES:
+            await self._own_halt(request, outcome)
+            return Settled.HALTED
         if outcome.status in LANDED_MERGE_STATUSES:
             if await self.reconcile_landed(tid):
                 return Settled.LANDED
@@ -176,33 +187,95 @@ class RecoveredMergeOwner:
     async def _block_and_escalate(
         self, request: RecoveredRequest, outcome: MergeOutcome,
     ) -> Settled:
+        moved_from = await self._block_task(request)
+        if moved_from is None:
+            return Settled.STATUS_MOVED
+        self._file_l1(
+            request, outcome, extra_lines=(f'The task was moved {moved_from} -> blocked.',),
+        )
+        return Settled.BLOCKED
+
+    async def _block_task(self, request: RecoveredRequest) -> str | None:
+        """Block the task unless another owner moved or holds it; returns the status it left."""
         tid = request.task_id
         live = await self.tasks.get_status(tid)
-        if live not in _BLOCKABLE_STATUSES:
-            return Settled.STATUS_MOVED
-        if self.tasks.is_actively_held(tid):
-            return Settled.WORKFLOW_HELD
+        if live not in _BLOCKABLE_STATUSES or self.tasks.is_actively_held(tid):
+            return None
         try:
             await self.tasks.clear_claim_then_set_status(tid, TaskStatus.BLOCKED)
         except Exception:
             logger.warning(
-                'Task %s: blocking after recovered merge request %s failed did '
-                'not reach the store; filing the escalation anyway',
-                tid, request.request_id, exc_info=True,
+                'Task %s: blocking after recovered merge request %s finished did '
+                'not reach the store', tid, request.request_id, exc_info=True,
             )
-        self._file_l1(request, outcome, moved_from=live)
-        return Settled.BLOCKED
+        return live
 
-    def _file_l1(
-        self, request: RecoveredRequest, outcome: MergeOutcome, *, moved_from: str | None,
+    async def _own_halt(self, request: RecoveredRequest, outcome: MergeOutcome) -> None:
+        tid = request.task_id
+        self._file_halt_record(
+            request, outcome, build_merge_halt_escalation_text(outcome.status, outcome, task_id=tid),
+        )
+        if outcome.status != 'done_wip_recovery':
+            await self._block_task(request)
+        elif not await self.reconcile_landed(tid):
+            logger.info(
+                'Task %s landed with WIP recovery but no outbox row; the stranded '
+                'sweep marks it done from main once the request is out of flight', tid,
+            )
+
+    def _file_halt_record(
+        self, request: RecoveredRequest, outcome: MergeOutcome, text: MergeHaltEscalationText,
     ) -> None:
         tid = request.task_id
-        category = outcome.block_category.value
+        if self.escalations is None:
+            logger.warning(
+                'Task %s: recovered merge request %s halted the merge queue (%s) '
+                'with no escalation queue to file on — orphan halt; release it '
+                'with unhalt_merge_queue', tid, request.request_id, outcome.status,
+            )
+            return
+        if self.escalations.has_open_l1(tid, category=text.category):
+            return
+        halt = self.merge_halt
+        if halt is not None and halt.is_wip_halted and halt.halt_owner_esc_id is None:
+            esc = Escalation(
+                id=self.escalations.make_id(tid),
+                task_id=tid,
+                agent_role=AGENT_ROLE,
+                severity='blocking',
+                category=text.category,
+                summary=text.summary[:200],
+                detail=f'{text.detail}\n\n{_recovered_line(request)}',
+                suggested_action='manual_intervention',
+                level=1,
+            )
+            submit_halt_owning_escalation(self.escalations, halt, esc)
+            self._emit_created(esc, outcome)
+            return
+        owner = halt.halt_owner_esc_id if halt is not None else None
+        holder = (
+            f'the halt is already owned by escalation {owner}' if owner is not None
+            else 'no merge halt is engaged'
+        )
+        self._file_l1(
+            request, outcome, category='task_failure',
+            extra_lines=(
+                f'This outcome halts the merge queue ({text.category}), but {holder}, '
+                'so no halt-category record was filed.',
+                text.detail,
+            ),
+        )
+
+    def _file_l1(
+        self, request: RecoveredRequest, outcome: MergeOutcome, *,
+        category: str | None = None, extra_lines: Iterable[str] = (),
+    ) -> None:
+        tid = request.task_id
+        category = category or outcome.block_category.value
         if self.escalations is None or self.escalations.has_open_l1(tid, category=category):
             return
         detail_lines = [
-            f'Merge request {request.request_id} for task {tid} was recovered from '
-            'the merge journal at startup, so no workflow awaited it.',
+            _recovered_line(request),
             f'status: {outcome.status}',
             f'reason: {outcome.reason}',
         ]
@@ -210,7 +283,7 @@ class RecoveredMergeOwner:
             detail_lines.append(f'failure_category: {outcome.failure_category}')
         if outcome.failure_cause_hint:
             detail_lines.append(f'failure_cause_hint: {outcome.failure_cause_hint}')
-        detail_lines.append(f'The task was moved {moved_from} -> blocked.')
+        detail_lines.extend(extra_lines)
         esc = Escalation(
             id=self.escalations.make_id(tid),
             task_id=tid,
@@ -226,19 +299,29 @@ class RecoveredMergeOwner:
             level=1,
         )
         self.escalations.submit(esc)
+        self._emit_created(esc, outcome)
+
+    def _emit_created(self, esc: Escalation, outcome: MergeOutcome) -> None:
         if self.event_store is not None:
             self.event_store.emit(
                 EventType.escalation_created,
-                task_id=tid,
+                task_id=esc.task_id,
                 data={
                     'escalation_id': esc.id,
-                    'category': category,
+                    'category': esc.category,
                     'severity': 'blocking',
                     'level': 1,
                     'reason': f'recovered-merge-{outcome.status}',
                 },
             )
         logger.warning(
-            'Filed L1 %s (%s) for task %s: recovered merge request %s finished %s',
-            esc.id, category, tid, request.request_id, outcome.status,
+            'Filed L1 %s (%s) for task %s: recovered merge request finished %s',
+            esc.id, esc.category, esc.task_id, outcome.status,
         )
+
+
+def _recovered_line(request: RecoveredRequest) -> str:
+    return (
+        f'Merge request {request.request_id} for task {request.task_id} was recovered '
+        'from the merge journal at startup, so no workflow awaited it.'
+    )

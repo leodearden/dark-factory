@@ -13607,8 +13607,9 @@ class Harness:
         No workflow awaits a recovered request, so each one's outcome is
         adopted by
         ``orchestrator/src/orchestrator/recovered_merge_owner.py::RecoveredMergeOwner``
-        (task 7277): a landing drives the landed-outbox done-write, and a
-        durable failure blocks the task and files an L1.
+        (task 7277): a landing drives the landed-outbox done-write, a
+        durable failure blocks the task and files an L1, and an outcome that
+        halted the merge queue files the halt-owning L1.
         """
         report = await recover_pending_merges(
             self._merge_store,
@@ -13626,6 +13627,7 @@ class Harness:
             tasks=self.scheduler,
             escalations=self._escalation_queue,
             reconcile_landed=self._landed_dispatch_gate,
+            merge_halt=self._merge_worker,
             event_store=self.event_store,
         ).adopt(report.get('requests', []), schedule=self._schedule_coro_threadsafe)
         logger.info(
