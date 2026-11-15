@@ -63,7 +63,7 @@ from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
 
 
 def _wire(backend, graph) -> None:
-    """Point the backend's driver at *graph* — the seam ``_graph_for`` resolves through."""
+    """Point the backend's driver at *graph* — the seam ``graph_access.graph`` resolves through."""
     backend._driver._get_graph = MagicMock(return_value=graph)
 
 
@@ -325,7 +325,7 @@ class TestGroupArgCanonicalization:
     """The ``@_canonicalize_group_args`` seam (PRD seam S4), POSITIVE form.
 
     Correctness, not hygiene: the CREATE statements resolve a FalkorDB graph KEY
-    through ``_graph_for(group_id)``.  The inner ``list_indices`` call being
+    through ``graph_access.graph(group_id)``.  The inner ``list_indices`` call being
     decorated does not cover it — the diff read and the writes resolve the key
     independently.
 

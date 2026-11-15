@@ -1348,10 +1348,6 @@ class GraphitiBackend:
         self._group_clients[group_id] = client
         return client
 
-    def _graph_for(self, group_id: str) -> GraphHandle:
-        """Shim for the operator scripts until task 9183 moves them onto graph_access."""
-        return self.graph_access.graph(group_id)
-
     @_canonicalize_group_args
     def _identity_lock_for(self, group_id: str) -> asyncio.Lock:
         """Return the per-group_id write-time-identity lock, creating it lazily.
@@ -1396,11 +1392,6 @@ class GraphitiBackend:
         if self._driver is None:
             raise RuntimeError('GraphitiBackend not initialized — call initialize() first')
         return self._driver
-
-    def _require_falkor_client(self) -> Any:
-        """Return the FalkorDB client from the underlying driver."""
-        driver = self._require_driver()
-        return cast(Any, driver).client
 
     async def read_server_settings(self) -> FalkorServerSettings:
         """Read the live TIMEOUT and appendonly settings; read-only, and a failed read is reported, not raised."""
