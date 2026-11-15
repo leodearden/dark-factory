@@ -66,7 +66,7 @@ class TestGetValidEdgesForNodeUuidDedup:
     async def test_self_loop_collapsed_by_uuid(self, mock_config, make_backend, make_graph_mock):
         """A self-loop's duplicate rows (same e.uuid) collapse to exactly one edge."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[['e1', 'f', 'n'], ['e1', 'f', 'n']])
+        graph = make_graph_mock(ro_rows=[['e1', 'f', 'n', None, None], ['e1', 'f', 'n', None, None]])
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_valid_edges_for_node('u', group_id='test')
         assert len(result) == 1
@@ -76,7 +76,7 @@ class TestGetValidEdgesForNodeUuidDedup:
     async def test_distinct_uuid_edges_all_returned(self, mock_config, make_backend, make_graph_mock):
         """Rows with distinct e.uuid values are not over-collapsed."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[['e1', 'f1', 'n1'], ['e2', 'f2', 'n2']])
+        graph = make_graph_mock(ro_rows=[['e1', 'f1', 'n1', None, None], ['e2', 'f2', 'n2', None, None]])
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_valid_edges_for_node('u', group_id='test')
         assert len(result) == 2
@@ -86,7 +86,7 @@ class TestGetValidEdgesForNodeUuidDedup:
     async def test_null_fact_name_coerced(self, mock_config, make_backend, make_graph_mock):
         """NULL fact/name properties coerce to empty string via _edge_dict."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[['e1', None, None]])
+        graph = make_graph_mock(ro_rows=[['e1', None, None, None, None]])
         backend._driver._get_graph = MagicMock(return_value=graph)
         result = await backend.get_valid_edges_for_node('u', group_id='test')
         assert result[0]['fact'] == ''
@@ -105,11 +105,17 @@ class TestGetValidEdgesForNodeUuidDedup:
         out in review: dedup must not silently undercount without a trace.
         """
         backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[['e1', 'first-fact', 'first-name'], ['e1', 'second-fact', 'second-name']])
+        graph = make_graph_mock(ro_rows=[
+            ['e1', 'first-fact', 'first-name', None, None],
+            ['e1', 'second-fact', 'second-name', None, None],
+        ])
         backend._driver._get_graph = MagicMock(return_value=graph)
         with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
             result = await backend.get_valid_edges_for_node('u', group_id='test')
-        assert result == [{'uuid': 'e1', 'fact': 'first-fact', 'name': 'first-name'}]
+        assert result == [{
+            'uuid': 'e1', 'fact': 'first-fact', 'name': 'first-name',
+            'valid_at': None, 'invalid_at': None,
+        }]
         assert any('e1' in record.getMessage() for record in caplog.records)
 
     @pytest.mark.asyncio
@@ -118,7 +124,7 @@ class TestGetValidEdgesForNodeUuidDedup:
     ):
         """The ordinary self-loop double-match (identical rows) stays silent — no false-positive diagnostic."""
         backend = make_backend(mock_config)
-        graph = make_graph_mock(ro_rows=[['e1', 'f', 'n'], ['e1', 'f', 'n']])
+        graph = make_graph_mock(ro_rows=[['e1', 'f', 'n', None, None], ['e1', 'f', 'n', None, None]])
         backend._driver._get_graph = MagicMock(return_value=graph)
         with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
             await backend.get_valid_edges_for_node('u', group_id='test')

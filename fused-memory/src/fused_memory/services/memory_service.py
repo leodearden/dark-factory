@@ -1504,11 +1504,10 @@ def _edge_to_dict(e: Any) -> dict:
     """Normalize a Graphiti edge into get_entity's edge dict shape.
 
     Accepts either a dict (exact-match path, from graphiti.get_valid_edges_for_node —
-    an EdgeDict {uuid, fact, name} with no temporal fields) or an object with
-    attributes (fuzzy-match path, from graphiti.search — a fact-search result
-    that may carry valid_at/invalid_at). Dict inputs yield temporal=None today
-    since EdgeDict has no valid_at/invalid_at keys; _serialize_temporal is used
-    regardless so this stays forward-compatible if EdgeDict is later enriched.
+    a DatedEdgeDict {uuid, fact, name, valid_at, invalid_at} carrying the stored
+    ISO-8601 validity window) or an object with attributes (fuzzy-match path, from
+    graphiti.search — a graphiti_core EntityEdge with valid_at/invalid_at). Both
+    shapes map their window through _serialize_temporal.
     """
     if isinstance(e, dict):
         return {
