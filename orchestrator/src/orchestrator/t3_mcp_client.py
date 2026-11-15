@@ -8,7 +8,7 @@ a refusal, an outage or a malformed reply.
 
 It is imported at module scope by ``spawn_t3_lane.py``, which the spawn shell
 runs with no venv, so it is stdlib-only plus ``shared`` leaves reached through
-``session_registry``'s bootstrap: the tier-2 contract pinned by
+its own ``shared/src`` bootstrap: the tier-2 contract pinned by
 ``orchestrator/tests/test_session_registry.py::TestStdlibOnlySelfContainment``.
 
 Contracts: ``plans/spawn-t3-lane-mcp-and-host-registry-prd.md`` §6.2 (the
@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
@@ -37,10 +38,15 @@ from pathlib import Path
 from typing import Any, Protocol, TypeVar
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from orchestrator import session_registry
+from orchestrator import fleet_files
 
-# session_registry's import puts this checkout's shared/src on sys.path for the bare shell.
-# isort: split
+# Reach this checkout's stdlib-only shared leaves from a bare shell; rationale in
+# test_session_registry.py::TestStdlibOnlySelfContainment.
+if (
+    _CHECKOUT_SHARED_SRC := str(Path(__file__).resolve().parents[3] / 'shared' / 'src')
+) not in sys.path and Path(_CHECKOUT_SHARED_SRC).is_dir():
+    sys.path.append(_CHECKOUT_SHARED_SRC)
+
 from shared.safe_io import atomic_write_text
 
 PROTOCOL_VERSION = '2025-06-18'
@@ -187,7 +193,7 @@ class CredentialStatus:
 def credential_path(environment_id: str, *, root: Path | str | None = None) -> Path:
     if not _ENVIRONMENT_ID.fullmatch(environment_id):
         raise ValueError(f'environment id {environment_id!r} cannot name a credential file')
-    return session_registry.fleet_root(root) / 't3-mcp' / f'{environment_id}.json'
+    return fleet_files.fleet_root(root) / 't3-mcp' / f'{environment_id}.json'
 
 
 def write_credential(credential: Credential, *, root: Path | str | None = None) -> None:

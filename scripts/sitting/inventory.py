@@ -247,7 +247,7 @@ def collect_open_items(
     """Pending L2 escalations plus open decisions, deduped on (queue, escalation id).
 
     *decisions_root* is the fleet root holding ``decisions/`` (see
-    ``session_registry.fleet_root``). *project*, when given, is folded through
+    ``fleet_files.fleet_root``). *project*, when given, is folded through
     ``fold_project_token`` and keeps only that project's items.
     """
     if now.tzinfo is None:

@@ -57,6 +57,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
+from orchestrator.fleet_files import (
+    fleet_root as resolve_fleet_root,
+)
 from orchestrator.session_registry import (
     DecisionRecord,
     DecisionState,
@@ -64,9 +67,6 @@ from orchestrator.session_registry import (
     Status,
     set_manual_boost,
     update_decision_state,
-)
-from orchestrator.session_registry import (
-    fleet_root as resolve_fleet_root,
 )
 from textual import work
 from textual.app import App, ComposeResult

@@ -4,8 +4,9 @@ PRD: plans/session-attention-rail-prd.md T3 (spine root; §4.1-4.2, §4.8, §6 G
 
 This module is the shared, versioned contract for the global, cross-project
 session registry at ``~/.claude/fleet/sessions/<slug>/record.json``. It
-imports only the stdlib plus this checkout's stdlib-only ``shared`` leaves,
-and nothing from the rest of the orchestrator, so it can be:
+imports only the stdlib, this checkout's stdlib-only ``shared`` leaves and
+its stdlib-only sibling ``fleet_files``, and nothing else from the
+orchestrator, so it can be:
 
 - invoked directly by ``skills/spawn/spawn-claude.sh`` and the SKILL.md verb
   lines via an absolute path (no venv/PYTHONPATH/install required: the
@@ -22,7 +23,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
-import fcntl
 import json
 import logging
 import os
@@ -30,7 +30,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sized
@@ -39,17 +38,18 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 # NOTE: this module is executed by absolute path from
 # skills/spawn/spawn-claude.sh and the SKILL.md verb lines with no venv,
 # install or PYTHONPATH, so the only non-stdlib imports allowed at module
 # scope are this checkout's stdlib-only `shared` leaves, reached through the
 # bootstrap below. It APPENDS, so an installed or PYTHONPATH `shared` wins.
-# No third-party import, and no `from orchestrator import <sibling>`: running
-# a script by path puts only the script's OWN directory on sys.path, so
-# intra-orchestrator imports fail there even though they work for consumers
-# that import this module with PYTHONPATH set.
+# No third-party import, and no unguarded `from orchestrator import <sibling>`:
+# running a script by path puts only the script's OWN directory on sys.path,
+# so intra-orchestrator imports fail there even though they work for
+# consumers that import this module with PYTHONPATH set. Stdlib-only
+# siblings are imported through the load-mode block below the shared imports.
 # Pinned by the tier-1 (bare shell, NO PYTHONPATH) row of
 # _BARE_SHELL_ENTRYPOINTS in
 # test_session_registry.py::TestStdlibOnlySelfContainment, and mutation-tested
@@ -63,6 +63,33 @@ from shared.proc_liveness import pid_alive
 from shared.process_identity import Liveness, ProcessIdentity
 from shared.project_id import fold_project_token
 from shared.session_liveness import capture_for_record, judge
+
+# Loaded three ways, so siblings resolve three ways: as orchestrator.session_registry
+# (relative), by absolute path in tier-1 (its own directory is sys.path[0]), and by
+# path under a foreign dotless name (its directory is not on sys.path). Each mode is
+# pinned in test_session_registry.py::TestStdlibOnlySelfContainment. TYPE_CHECKING
+# points the type checker at the package arm, the only one it can resolve.
+if TYPE_CHECKING or __package__:
+    from .fleet_files import (
+        ATOMIC_WRITE_TEMP_SUFFIX,
+        atomic_write_text,
+        exclusive_sidecar_lock,
+        fleet_root,
+    )
+elif __spec__ is None:
+    from fleet_files import (
+        ATOMIC_WRITE_TEMP_SUFFIX,
+        atomic_write_text,
+        exclusive_sidecar_lock,
+        fleet_root,
+    )
+else:
+    from orchestrator.fleet_files import (
+        ATOMIC_WRITE_TEMP_SUFFIX,
+        atomic_write_text,
+        exclusive_sidecar_lock,
+        fleet_root,
+    )
 
 # ---------------------------------------------------------------------------
 # Schema / contract (PRD §6 G5): consumers import this; they never re-derive
@@ -946,20 +973,6 @@ def build_session_slug(
     return sanitize_slug(raw)
 
 
-def fleet_root(root: Path | str | None = None) -> Path:
-    """Resolve the fleet root: explicit *root* > $CLAUDE_FLEET_ROOT > ~/.claude/fleet.
-
-    Every registry function takes this same *root* parameter (or derives it
-    via this function) so tests never touch the real ``~/.claude`` tree.
-    """
-    if root is not None:
-        return Path(root)
-    env_root = os.environ.get('CLAUDE_FLEET_ROOT')
-    if env_root:
-        return Path(env_root)
-    return Path.home() / '.claude' / 'fleet'
-
-
 def sessions_dir(root: Path | str | None = None) -> Path:
     return fleet_root(root) / 'sessions'
 
@@ -1012,7 +1025,7 @@ def _write_pointer_file(path: Path, slug: str) -> bool:
     if _read_session_pointer(path) == slug:
         return True
     try:
-        _atomic_write_text(path, slug)
+        atomic_write_text(path, slug)
     except OSError as exc:
         logger.warning('session pointer write failed: slug=%s path=%s: %s', slug, path, exc)
         return False
@@ -1271,75 +1284,6 @@ class CorruptSessionRecord(Exception):
     """Raised by read_record when a record.json exists but fails to parse."""
 
 
-_ATOMIC_WRITE_TEMP_SUFFIX = '.tmp'
-"""Suffix of ``_atomic_write_text``'s in-flight temp file. A sweep that visits
-every entry of a dir this module writes into (``reap_stale_session_pointers``)
-keys on it to leave a concurrent writer's temp file alone."""
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    """Atomically write *text* to *path* (tmp file in the same dir, then os.replace).
-
-    THIS IS THE DELIBERATE EXCEPTION to task 3223's consolidation, which moved
-    this repo's copies of the tmp+rename writer onto
-    :func:`shared.safe_io.atomic_write_text`. This module does NOT delegate.
-
-    Why it was kept: this module is invoked by absolute path from
-    ``skills/spawn/spawn-claude.sh`` under an interpreter with no venv, no
-    install and no workspace packages on ``sys.path``. Before the module-scope
-    ``shared/src`` bootstrap existed, a ``from shared import safe_io`` made the
-    whole module unimportable there — measured as ``ModuleNotFoundError: No
-    module named 'shared'`` — and the only visible symptom was a hook
-    subprocess that silently never wrote ``record.json``. The bootstrap now
-    reaches ``shared``'s stdlib-only leaves, ``safe_io`` among them, so whether
-    to delegate is open again (ticket tkt_0RW29CREM5XVXNE710FGF4W5MA). Until
-    that is decided, this function stays recorded in ``_ALLOWED_RENAMERS`` in
-    ``tests/scripts/test_atomic_write_regrowth.py`` so the anti-regrowth guard
-    reads it as a documented exception rather than a fresh copy.
-
-    ``os.fdopen(fd, 'w')`` with no explicit encoding defaults to the ambient
-    locale's encoding, which is host-dependent. Task 3387 fixed the resulting
-    latent bug: the payload is always JSON (``record.to_json()``), and RFC 8259
-    requires JSON on disk to be UTF-8 — under a non-UTF-8 locale this wrote
-    bytes that THIS MODULE'S OWN READERS then reject. Name them precisely, so
-    the next investigator does not go looking in the wrong module:
-    ``read_record`` raises ``CorruptSessionRecord`` (the decode error is a
-    ``UnicodeDecodeError``, a ``ValueError`` subclass, so it lands in that
-    function's ``except`` clause), ``list_decisions`` and ``reap_stale_leases``
-    log and SKIP the file, and ``_mutate_decision`` returns ``None``. (An
-    earlier version of this paragraph cited
-    ``shared.safe_io.load_json_or_warn``. That helper never reads session,
-    decision or lease records — its callers are ``b3_gate``, ``chronic_flake``,
-    ``landed_outbox`` and ``merge_queue_store``.)
-
-    The encoding is now pinned ``'utf-8'`` explicitly at both halves of the
-    round-trip — here on write, and on every ``read_text()`` in this module —
-    so neither half follows the ambient locale. The literal is preferred over
-    ``locale.getpreferredencoding(False)`` because it is locale-INDEPENDENT,
-    which is the entire point; ``locale`` is stdlib and importing it would not
-    have violated this module's stdlib-only constraint above.
-
-    Error policy stays with the callers: write_record lets a failure propagate
-    (its sole caller, the CLI main(), provides the outer fail-soft boundary);
-    write_decision swallows a failure itself (it is called directly by
-    watchers/cockpit code with no such boundary).
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path_str = tempfile.mkstemp(
-        suffix=_ATOMIC_WRITE_TEMP_SUFFIX,
-        prefix=path.stem,
-        dir=str(path.parent),
-    )
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(text)
-        os.replace(tmp_path_str, str(path))
-    except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path_str)
-        raise
-
-
 def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
     """Atomically write *record* (tmp file in the same dir, then os.replace).
 
@@ -1347,7 +1291,7 @@ def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
     reap_stale_records() reads as this record's heartbeat.
     """
     path = record_path_for_slug(record.session_slug, root=root)
-    _atomic_write_text(path, record.to_json())
+    atomic_write_text(path, record.to_json())
 
 
 def read_record(slug: str, root: Path | str | None = None) -> SessionRecord:
@@ -1525,7 +1469,7 @@ def write_decision(record: DecisionRecord, root: Path | str | None = None) -> bo
     """
     path = decision_path_for_id(record.id, root=root)
     try:
-        _atomic_write_text(path, record.to_json())
+        atomic_write_text(path, record.to_json())
     except Exception:
         logger.error('write_decision: failed to write %s', path, exc_info=True)
         return False
@@ -2218,7 +2162,7 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
     task 1609) near-verbatim, retargeted to the decisions dir.
 
     WHY A SIDECAR (PRD-D3 rationale, same as 1609): write_decision's writer
-    is atomic tmp+os.replace (``_atomic_write_text`` above). After a replace,
+    is atomic tmp+os.replace (``fleet_files.py::atomic_write_text``). After a replace,
     the data file
     ``<decisions_dir>/<id>.json`` is a NEW inode. A second writer that
     flock()s the (new) data-file path binds to a different inode and races
@@ -2247,23 +2191,8 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
             record.some_field = new_value
             write_decision(record, root=root)
     """
-    with _exclusive_sidecar_lock(Path(str(decision_path_for_id(decision_id, root=root)) + '.lock')):
+    with exclusive_sidecar_lock(Path(str(decision_path_for_id(decision_id, root=root)) + '.lock')):
         yield
-
-
-@contextlib.contextmanager
-def _exclusive_sidecar_lock(lock_path: Path) -> Iterator[None]:
-    """Blocking exclusive flock on the stable sidecar *lock_path*, creating it and its parent."""
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
 
 
 ESCALATION_ARCHIVE_SUBDIR = 'archive'
@@ -3022,7 +2951,7 @@ def _is_abandoned_temp_file(path: Path) -> bool:
 
 
 def _is_stale_session_pointer(path: Path, root: Path | str | None) -> bool:
-    if path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX):
+    if path.name.endswith(ATOMIC_WRITE_TEMP_SUFFIX):
         return _is_abandoned_temp_file(path)
     try:
         pid = int(path.name)
@@ -3057,7 +2986,7 @@ def _pointed_owner_identity(
 
 
 def _is_stale_claude_session_pointer(path: Path, root: Path | str | None) -> bool:
-    if path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX):
+    if path.name.endswith(ATOMIC_WRITE_TEMP_SUFFIX):
         return _is_abandoned_temp_file(path)
     if not _is_claude_session_pointer_name(path.name):
         return True
@@ -3065,7 +2994,7 @@ def _is_stale_claude_session_pointer(path: Path, root: Path | str | None) -> boo
 
 
 def _is_stale_t3_thread_pointer(path: Path, root: Path | str | None) -> bool:
-    if path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX):
+    if path.name.endswith(ATOMIC_WRITE_TEMP_SUFFIX):
         return _is_abandoned_temp_file(path)
     if not is_t3_thread_pointer_name(path.name):
         return True
@@ -3136,7 +3065,7 @@ def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
     or ``resolve_session_slug_for_t3_thread`` finds no live t3 record of that
     thread behind it, so each such entry costs one record read.
 
-    In every dir a temp file of ``_atomic_write_text`` is left to its writer
+    In every dir a temp file of ``fleet_files.py::atomic_write_text`` is left to its writer
     until ``_POINTER_TEMP_FILE_GRACE`` has passed, so a sweep never unlinks it
     out from under a concurrent ``os.replace``.
 
@@ -3446,7 +3375,7 @@ def mark_t3_sessions_exited(
     """
     base = t3_thread_pointers_dir(root)
     entries = sorted(base.iterdir()) if base.is_dir() else []
-    thread_ids = [path.name for path in entries if not path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX)]
+    thread_ids = [path.name for path in entries if not path.name.endswith(ATOMIC_WRITE_TEMP_SUFFIX)]
     marked: list[str] = []
     for thread_id in thread_ids:
         if thread_id in listed_threads:
@@ -3841,7 +3770,7 @@ def reap_lock(root: Path | str | None = None) -> Iterator[None]:
     The sidecar is a stable lock target, created once and never renamed or
     deleted, for the same reason as ``decision_id_lock``'s.
     """
-    with _exclusive_sidecar_lock(reap_lock_path(root)):
+    with exclusive_sidecar_lock(reap_lock_path(root)):
         yield
 
 
@@ -3959,7 +3888,7 @@ def run_reap(root: Path | str | None = None) -> ReapReport | None:
             remaining_record_dirs=_count_record_dirs(root),
         )
         try:
-            _atomic_write_text(reap_report_path(root), report.to_json())
+            atomic_write_text(reap_report_path(root), report.to_json())
         except OSError:
             logger.error('run_reap: failed to write %s', reap_report_path(root), exc_info=True)
     return report

@@ -66,13 +66,13 @@ from escalation.authority import (
     coordinator_denied,
 )
 from escalation.models import Escalation
+from orchestrator.fleet_files import fleet_root
 from orchestrator.session_registry import (
     AuditVerdict,
     DecisionAuditRefused,
     DecisionRecord,
     DecisionState,
     decision_path_for_id,
-    fleet_root,
     normalize_escalations_dir,
     record_audit_outcome,
 )

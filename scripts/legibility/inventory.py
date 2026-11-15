@@ -3,7 +3,7 @@
 
 Walks ``~/.claude/projects/<enc>`` (or an injected ``projects_root``, so
 tests never touch the real ``~/.claude`` tree — mirrors
-``session_registry.fleet_root(root=)``) for a project whose agents span
+``fleet_files.fleet_root(root=)``) for a project whose agents span
 many encoded cwd directories: a project's config lists **cwd prefixes**
 (``docs/legibility/legibility.yaml``'s ``cwd_prefixes``), and membership is
 resolved from each session's REAL ``cwd`` (read from a transcript line) via

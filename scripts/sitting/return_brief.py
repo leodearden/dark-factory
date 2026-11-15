@@ -53,7 +53,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 
 from _task_db_scan import discover_project_roots
 from orchestrator.digest import ModelRoleRow
-from orchestrator.session_registry import decisions_dir, fleet_root, sessions_dir
+from orchestrator.fleet_files import fleet_root
+from orchestrator.session_registry import decisions_dir, sessions_dir
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots
 from shared.safe_io import atomic_write_text
 from sitting import audits, brief, fleet_state, prepare_sitting, trigger_state
