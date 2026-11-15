@@ -18,7 +18,8 @@ advance census-state.
 :func:`roll_back` does that in the one order that cannot lose mined signal:
 quarantine first, and restore only once the copy is safe. Quarantine layout:
 ``<quarantine_root(project_id)>/<label>-<random>/<repo-relative path>``.
-Nothing expires a quarantine; the operator removes one after recovering it.
+Nothing expires a quarantine; recovering and removing one is the OPERATIONS.md
+runbook that :data:`RUNBOOK_SECTION` names.
 """
 from __future__ import annotations
 
@@ -46,6 +47,9 @@ COMMIT_ATTEMPTS = 5
 COMMIT_BACKOFF_SECONDS = 0.2
 
 QUARANTINE_DIRNAME = 'quarantine'
+
+RUNBOOK_SECTION = 'Unlanded legibility writes and the quarantine'
+"""The OPERATIONS.md heading of the runbook for recovering a quarantine."""
 
 GIT_TIMEOUT_SECONDS = 60.0
 """Bound on each git call :func:`roll_back` makes: a hung git becomes a
@@ -164,7 +168,11 @@ class Rollback:
         return self.failure is None
 
     def describe(self) -> str:
-        """One sentence for an escalation detail or a journal line."""
+        """One sentence for an escalation detail or a journal line, ending
+        with where to read how to recover."""
+        return f'{self._outcome()}; recovery runbook: OPERATIONS.md §"{RUNBOOK_SECTION}"'
+
+    def _outcome(self) -> str:
         if self.restored:
             return (
                 f'refused content quarantined at {self.quarantine_dir}; '
