@@ -3770,7 +3770,6 @@ class SqliteTaskBackend:
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         tid = _parse_task_id(task_id)
-        absent = object()
         async with self._write_unit(project_root) as conn:
             cursor = await conn.execute(
                 'SELECT * FROM tasks WHERE tag = ? AND id = ?',
@@ -3797,7 +3796,8 @@ class SqliteTaskBackend:
             incoming = cast(dict[str, Any], strip_machine_authored_metadata(
                 {
                     key: value for key, value in metadata.items()
-                    if stored.get(key, absent) != value or key not in _MACHINE_AUTHORED_METADATA_KEYS
+                    if not _json_identical(stored.get(key, _ABSENT), value)
+                    or key not in _MACHINE_AUTHORED_METADATA_KEYS
                 },
                 project_root=project_root, tag=tag, task_id=tid,
             ))
@@ -3820,9 +3820,7 @@ class SqliteTaskBackend:
             )
             await self._validate_metadata_on_write(
                 new_metadata, project_root=project_root, tag=tag, task_id=tid,
-                incoming_keys={
-                    key for key, value in new_blob.items() if stored.get(key, absent) != value
-                },
+                incoming_keys=_keys_changed_by_write(row['metadata'], new_blob, new_metadata),
             )
             set_columns = ['metadata = ?', 'updated_at = ?']
             set_values: list[Any] = [new_metadata, task_timestamp_now()]
@@ -4472,16 +4470,31 @@ def _refuse_passthrough_only_keys(incoming: dict, task_id: str) -> None:
             raise refusal(task_id)
 
 
+_ABSENT = object()
+
+
+def _json_identical(a: object, b: object) -> bool:
+    """Whether two metadata values are the same JSON, the one identity rule for stored vs written.
+
+    Key order and whitespace do not count, so a get_task -> json.dumps echo stays
+    identical. JSON type DOES count (86400 vs 86400.0, 1 vs true): Python ``==``
+    conflates them, and strict fields such as Recurrence.interval_secs exist to
+    tell them apart. :data:`_ABSENT` is identical only to itself.
+    """
+    if a is _ABSENT or b is _ABSENT:
+        return a is b
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
 def _keys_changed_by_write(
     stored_raw: str | None, incoming: dict, new_blob_json: str,
 ) -> set[str]:
     """The keys *incoming* carried whose value in the written blob differs from the stored row's.
 
-    Identity is JSON value equality, as in :func:`_assert_passthrough_only_keys`.
-    A stored blob that is absent or not a JSON object makes every carried key
-    changed. Only carried keys count, so the result is never wider than the
-    payload: a key a merge normalised but the caller did not send is not this
-    write's responsibility.
+    Identity is :func:`_json_identical`. A stored blob that is absent or not a
+    JSON object makes every carried key changed. Only carried keys count, so
+    the result is never wider than the payload: a key a merge normalised but
+    the caller did not send is not this write's responsibility.
     """
     try:
         stored = json.loads(stored_raw) if stored_raw is not None else None
@@ -4490,8 +4503,10 @@ def _keys_changed_by_write(
     new = json.loads(new_blob_json)
     if not isinstance(stored, dict) or not isinstance(new, dict):
         return set(incoming)
-    absent = object()
-    return {key for key in incoming if stored.get(key, absent) != new.get(key, absent)}
+    return {
+        key for key in incoming
+        if not _json_identical(stored.get(key, _ABSENT), new.get(key, _ABSENT))
+    }
 
 
 def _assert_passthrough_only_keys(
@@ -4514,10 +4529,10 @@ def _assert_passthrough_only_keys(
     rolls back with nothing written. The caller's own copy of the stored
     value is never trusted.
 
-    Identity is JSON VALUE equality (deep ``==`` on the parsed values), not
-    byte identity: inner key order and whitespace do not survive a
-    get_task -> json.dumps round trip, which is exactly how a
-    read-modify-write caller builds its payload.
+    Identity is :func:`_json_identical`, not byte identity: inner key order
+    and whitespace do not survive a get_task -> json.dumps round trip, which
+    is exactly how a read-modify-write caller builds its payload, while a
+    change of JSON type is a change.
 
     ``incoming`` is always a JSON object: update_task's non-object floor
     (:func:`_metadata_object_or_raise`) guarantees it, and rewrite_audit_trail
@@ -4536,9 +4551,8 @@ def _assert_passthrough_only_keys(
     if not isinstance(stored, dict):
         _refuse_passthrough_only_keys(incoming, task_id)
         return
-    absent = object()
     for key, refusal in _PASSTHROUGH_ONLY_METADATA_KEYS.items():
-        if stored.get(key, absent) != incoming.get(key, absent):
+        if not _json_identical(stored.get(key, _ABSENT), incoming.get(key, _ABSENT)):
             raise refusal(task_id)
 
 
@@ -4558,12 +4572,12 @@ def _metadata_without_keys(blob_json: str, keys: frozenset[str]) -> str:
     return json.dumps({k: v for k, v in blob.items() if k not in keys})
 
 
-def _deferral_slice(blob_json: str | None, absent: object) -> object:
+def _deferral_slice(blob_json: str | None) -> object:
     try:
         blob = json.loads(blob_json) if blob_json is not None else None
     except (TypeError, ValueError):
         blob = None
-    return blob.get('deferral', absent) if isinstance(blob, dict) else absent
+    return blob.get('deferral', _ABSENT) if isinstance(blob, dict) else _ABSENT
 
 
 def _assert_deferral_unchanged(
@@ -4577,16 +4591,14 @@ def _assert_deferral_unchanged(
     a ``deferral`` the payload carries must equal the stored value (additive's
     OLD-wins merge would otherwise drop an alteration silently), and the blob
     about to be written must carry exactly the stored record (a replace that
-    omits it would otherwise remove it). Identity is JSON value equality, as in
-    :func:`_assert_passthrough_only_keys`; a corrupt or absent stored
-    blob holds no record.
+    omits it would otherwise remove it). Identity is :func:`_json_identical`;
+    a corrupt or absent stored blob holds no record.
     """
-    absent = object()
-    stored = _deferral_slice(stored_raw, absent)
-    carried = incoming.get('deferral', absent) if incoming is not None else absent
-    if carried is not absent and carried != stored:
+    stored = _deferral_slice(stored_raw)
+    carried = incoming.get('deferral', _ABSENT) if incoming is not None else _ABSENT
+    if carried is not _ABSENT and not _json_identical(carried, stored):
         raise DeferralWriteAuthorityError(task_id)
-    if _deferral_slice(new_blob_json, absent) != stored:
+    if not _json_identical(_deferral_slice(new_blob_json), stored):
         raise DeferralWriteAuthorityError(task_id)
 
 
