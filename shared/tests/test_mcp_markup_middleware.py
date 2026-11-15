@@ -1268,6 +1268,28 @@ class TestRejectRepairedCallValidates:
         assert retry.facts == [], 'the resubmission re-entered the guard'
 
 
+#: What ``escalate_info_typed`` requires besides ``detail``, in the coercion rows.
+_COERCION_REQUIRED_ARGS = {
+    'task_id': '3690',
+    'agent_role': 'implementer',
+    'category': 'risk_identified',
+    'summary': 'A coercion that guesses is worse than one that refuses.',
+}
+
+
+def _detail_that_swallowed(absorbed: str, recovered_param: str, recovered_value: str) -> str:
+    """A ``detail`` that mis-closed and swallowed exactly one parameter."""
+    return (
+        absorbed
+        + _closer('detail')
+        + '\n'
+        + _opener(recovered_param)
+        + recovered_value
+        + _closer(recovered_param)
+        + INVOKE_CLOSER
+    )
+
+
 class TestCoercionNeverGuesses:
     """The three ways a NAIVE decode of a recovered value is wrong.
 
@@ -1280,29 +1302,10 @@ class TestCoercionNeverGuesses:
     declared-type error, never a fabricated one.
     """
 
-    REQUIRED = {
-        'task_id': '3690',
-        'agent_role': 'implementer',
-        'category': 'risk_identified',
-        'summary': 'A coercion that guesses is worse than one that refuses.',
-    }
-
-    def _payload(self, absorbed: str, recovered_param: str, recovered_value: str) -> str:
-        """A ``detail`` that mis-closed and swallowed exactly one parameter."""
-        return (
-            absorbed
-            + _closer('detail')
-            + '\n'
-            + _opener(recovered_param)
-            + recovered_value
-            + _closer(recovered_param)
-            + INVOKE_CLOSER
-        )
-
     async def _call(self, detail: str):
         h = build_harness(RepairPolicy.FORWARD_REPAIR)
         result = await h.call(
-            'escalate_info_typed', {**self.REQUIRED, 'detail': detail}
+            'escalate_info_typed', {**_COERCION_REQUIRED_ARGS, 'detail': detail}
         )
         return h, result
 
@@ -1329,7 +1332,7 @@ class TestCoercionNeverGuesses:
 
     async def test_a_union_typed_recovery_still_lands_as_a_list(self):
         h, _ = await self._call(
-            self._payload('A union.', 'evidence', '[{"observation": "measured"}]')
+            _detail_that_swallowed('A union.', 'evidence', '[{"observation": "measured"}]')
         )
 
         evidence = h.recorder.args['evidence']
@@ -1347,7 +1350,7 @@ class TestCoercionNeverGuesses:
         """
         looks_like_json = '[consolidate, then re-measure]'
         h, _ = await self._call(
-            self._payload('A list-ish string.', 'suggested_action', looks_like_json)
+            _detail_that_swallowed('A list-ish string.', 'suggested_action', looks_like_json)
         )
 
         landed = h.recorder.args['suggested_action']
@@ -1358,7 +1361,7 @@ class TestCoercionNeverGuesses:
         """The same defect in its most decodable form: ``json.loads('3690')``
         succeeds and yields an ``int``."""
         h, _ = await self._call(
-            self._payload('A numeric string.', 'suggested_action', '3690')
+            _detail_that_swallowed('A numeric string.', 'suggested_action', '3690')
         )
 
         landed = h.recorder.args['suggested_action']
@@ -1382,8 +1385,8 @@ class TestCoercionNeverGuesses:
         await h.call(
             'escalate_info_typed',
             {
-                **self.REQUIRED,
-                'detail': self._payload('Ill-formed.', 'evidence', truncated),
+                **_COERCION_REQUIRED_ARGS,
+                'detail': _detail_that_swallowed('Ill-formed.', 'evidence', truncated),
             },
         )
 
@@ -1410,8 +1413,8 @@ class TestCoercionNeverGuesses:
         result = await h.call(
             'escalate_info_typed',
             {
-                **self.REQUIRED,
-                'detail': self._payload('Ill-formed.', 'evidence', truncated),
+                **_COERCION_REQUIRED_ARGS,
+                'detail': _detail_that_swallowed('Ill-formed.', 'evidence', truncated),
             },
         )
 
@@ -1445,8 +1448,8 @@ class TestCoercionNeverGuesses:
         result = await h.call(
             'escalate_info_typed',
             {
-                **self.REQUIRED,
-                'detail': self._payload('Ill-formed.', 'evidence', truncated),
+                **_COERCION_REQUIRED_ARGS,
+                'detail': _detail_that_swallowed('Ill-formed.', 'evidence', truncated),
             },
         )
 
@@ -1481,8 +1484,8 @@ class TestCoercionNeverGuesses:
             await h.call(
                 'escalate_info_typed',
                 {
-                    **self.REQUIRED,
-                    'detail': self._payload('Ill-formed.', 'evidence', truncated),
+                    **_COERCION_REQUIRED_ARGS,
+                    'detail': _detail_that_swallowed('Ill-formed.', 'evidence', truncated),
                 },
             )
 
@@ -1507,13 +1510,13 @@ class TestCoercionNeverGuesses:
         h = build_harness(RepairPolicy.FORWARD_REPAIR)
         tool = await h.mcp.get_tool('escalate_info_typed')
         assert tool is not None
-        detail = self._payload('A union.', 'evidence', '[{"observation": "measured"}]')
+        detail = _detail_that_swallowed('A union.', 'evidence', '[{"observation": "measured"}]')
 
         fix = repair(
             detail,
             'detail',
             tuple(tool.parameters['properties']),
-            tuple({**self.REQUIRED, 'detail': detail}),
+            tuple({**_COERCION_REQUIRED_ARGS, 'detail': detail}),
         )
 
         assert fix is not None
@@ -1733,10 +1736,27 @@ class TestB5UnrepairableIsNeverGuessed:
         assert h.recorder.calls == []
 
 
+async def _refuse_unrepairable_reuse_item(policy, **guard_kwargs) -> tuple[Any, dict[str, Any]]:
+    """The harness and refusal payload of an ``add_reuse_item`` whose ``how`` is
+    B5's unrepairable specimen. *guard_kwargs* reach :func:`build_harness`, so
+    a row picks the escalation sink it is about."""
+    h = build_harness(policy, **guard_kwargs)
+    with pytest.raises(ToolError) as excinfo:
+        await h.call(
+            'add_reuse_item',
+            {
+                'what': 'the sampler',
+                'how': TestB5UnrepairableIsNeverGuessed._value(),
+                'where': 'shared/',
+            },
+        )
+    return h, _reject_payload(excinfo)
+
+
 class TestTheHintNeverOverclaimsPreservation:
     """The refusal's PROSE must agree with its own ``escalation_id`` field.
 
-    ``_file_residue_escalation`` returns ``None`` on THREE distinct paths — no
+    ``_preserve_residue`` returns ``None`` on THREE distinct paths — no
     sink wired, a sink that RAISED (``_call_sink``'s never-raises contract), and
     a sink that returned a non-str. On every one of them the payload carries
     ``escalation_id: null``, so a hint that unconditionally asserts "your full
@@ -1763,25 +1783,12 @@ class TestTheHintNeverOverclaimsPreservation:
     #: surrounding prose is reworded.
     PRESERVED_CLAIM = 'preserved verbatim'
 
-    @staticmethod
-    def _value() -> str:
-        return TestB5UnrepairableIsNeverGuessed._value()
-
-    async def _refuse(self, policy, **guard_kwargs):
-        h = build_harness(policy, **guard_kwargs)
-        with pytest.raises(ToolError) as excinfo:
-            await h.call(
-                'add_reuse_item',
-                {'what': 'the sampler', 'how': self._value(), 'where': 'shared/'},
-            )
-        return h, _reject_payload(excinfo)
-
     # -- (a) preserved --------------------------------------------------
 
     @BOTH_POLICIES
     async def test_a_preserved_payload_is_told_it_is_preserved(self, policy):
         """The harness sink returns a real id, so the claim is TRUE here."""
-        _, payload = await self._refuse(policy)
+        _, payload = await _refuse_unrepairable_reuse_item(policy)
 
         assert payload['escalation_id'] == ESCALATION_ID
         assert self.PRESERVED_CLAIM in payload['hint'], (
@@ -1794,7 +1801,7 @@ class TestTheHintNeverOverclaimsPreservation:
     @BOTH_POLICIES
     async def test_no_sink_wired_does_not_claim_preservation(self, policy):
         """Nothing was written anywhere, so nothing may be promised."""
-        _, payload = await self._refuse(policy, escalation_sink=None)
+        _, payload = await _refuse_unrepairable_reuse_item(policy, escalation_sink=None)
 
         assert payload['escalation_id'] is None
         assert self.PRESERVED_CLAIM not in payload['hint'], (
@@ -1814,7 +1821,7 @@ class TestTheHintNeverOverclaimsPreservation:
         def boom(record):
             raise RuntimeError('queue unavailable')
 
-        _, payload = await self._refuse(policy, escalation_sink=boom)
+        _, payload = await _refuse_unrepairable_reuse_item(policy, escalation_sink=boom)
 
         assert payload['escalation_id'] is None
         assert self.PRESERVED_CLAIM not in payload['hint']
@@ -1830,7 +1837,7 @@ class TestTheHintNeverOverclaimsPreservation:
         intent — keying off ``self._escalation_sink is not None`` would get
         this row exactly backwards.
         """
-        _, payload = await self._refuse(policy, escalation_sink=lambda record: 12)
+        _, payload = await _refuse_unrepairable_reuse_item(policy, escalation_sink=lambda record: 12)
 
         assert payload['escalation_id'] is None
         assert self.PRESERVED_CLAIM not in payload['hint']
@@ -1850,7 +1857,7 @@ class TestTheHintNeverOverclaimsPreservation:
             {'escalation_sink': lambda record: 12},
         ]
         for kwargs in sinks:
-            _, payload = await self._refuse(policy, **kwargs)
+            _, payload = await _refuse_unrepairable_reuse_item(policy, **kwargs)
             assert MARKUP_OVERRIDE_KEY in payload['hint'], (
                 f'the override escape vanished for {kwargs!r}'
             )
@@ -1859,7 +1866,7 @@ class TestTheHintNeverOverclaimsPreservation:
     async def test_every_variant_still_says_unrepairable_and_no_repair(self, policy):
         """The split changes ONLY the preservation clause."""
         for kwargs in ({}, {'escalation_sink': None}):
-            _, payload = await self._refuse(policy, **kwargs)
+            _, payload = await _refuse_unrepairable_reuse_item(policy, **kwargs)
             hint = payload['hint']
             assert 'UNREPAIRABLE' in hint
             assert 'no repair was attempted' in hint
@@ -1869,8 +1876,8 @@ class TestTheHintNeverOverclaimsPreservation:
     async def test_the_two_variants_are_genuinely_different(self):
         """A copy-paste that left both branches identical would otherwise pass
         every substring check above."""
-        _, preserved = await self._refuse(RepairPolicy.FORWARD_REPAIR)
-        _, unpreserved = await self._refuse(
+        _, preserved = await _refuse_unrepairable_reuse_item(RepairPolicy.FORWARD_REPAIR)
+        _, unpreserved = await _refuse_unrepairable_reuse_item(
             RepairPolicy.FORWARD_REPAIR, escalation_sink=None
         )
 
@@ -1901,32 +1908,29 @@ class TestASpooledResidueIsNotAnEscalation:
     by which of the two held the payload, or neither.
     """
 
-    @staticmethod
-    async def _refuse(policy, **guard_kwargs) -> dict[str, Any]:
-        _, payload = await TestTheHintNeverOverclaimsPreservation()._refuse(
-            policy, **guard_kwargs
-        )
-        return payload
-
     @BOTH_POLICIES
     async def test_the_refusal_names_the_file_apart_from_any_escalation(self, policy):
-        payload = await self._refuse(policy, escalation_sink=_spooling_sink)
+        _, payload = await _refuse_unrepairable_reuse_item(
+            policy, escalation_sink=_spooling_sink
+        )
 
         assert payload['escalation_id'] is None
         assert payload['residue_spool_path'] == SPOOL_PATH
 
     @BOTH_POLICIES
     async def test_an_escalation_id_carries_no_spool_field(self, policy):
-        payload = await self._refuse(policy)
+        _, payload = await _refuse_unrepairable_reuse_item(policy)
 
         assert payload['escalation_id'] == ESCALATION_ID
         assert 'residue_spool_path' not in payload
 
     @BOTH_POLICIES
     async def test_each_holder_selects_its_own_hint(self, policy):
-        escalated = await self._refuse(policy)
-        spooled = await self._refuse(policy, escalation_sink=_spooling_sink)
-        unpreserved = await self._refuse(policy, escalation_sink=None)
+        _, escalated = await _refuse_unrepairable_reuse_item(policy)
+        _, spooled = await _refuse_unrepairable_reuse_item(
+            policy, escalation_sink=_spooling_sink
+        )
+        _, unpreserved = await _refuse_unrepairable_reuse_item(policy, escalation_sink=None)
 
         hints = {escalated['hint'], spooled['hint'], unpreserved['hint']}
         assert len(hints) == 3
@@ -1939,8 +1943,8 @@ class TestASpooledResidueIsNotAnEscalation:
         result = await h.call(
             'escalate_info_typed',
             {
-                **TestCoercionNeverGuesses.REQUIRED,
-                'detail': TestCoercionNeverGuesses()._payload(
+                **_COERCION_REQUIRED_ARGS,
+                'detail': _detail_that_swallowed(
                     'Ill-formed.', 'evidence', '[{"observation": "the tail was cut off'
                 ),
             },

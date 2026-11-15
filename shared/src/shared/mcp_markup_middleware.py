@@ -513,7 +513,7 @@ class SpooledResidue:
     path: str
 
 
-#: Where a residue sink said the record went: an escalation id, a spool file,
+#: Where a residue sink preserved the record: an escalation id, a spool file,
 #: or nowhere.
 ResiduePreservation = str | SpooledResidue | None
 
@@ -731,7 +731,9 @@ class MarkupGuardMiddleware(Middleware):
     machinery a registration site will wire them to is largely async in this
     repo — and both are invoked DEFENSIVELY: the call's outcome is already
     decided by the time either runs, so a sink that raises is logged and never
-    changes what the caller sees. See :meth:`_call_sink`.
+    changes what the caller sees. See :meth:`_call_sink`. *escalation_sink*
+    answers a residue record with where it preserved it, a
+    :data:`ResiduePreservation`.
 
     Bursts are counted by a per-instance
     :class:`~shared.boundary_storm_escape.BoundaryStormEscape`
@@ -1429,7 +1431,7 @@ class MarkupGuardMiddleware(Middleware):
         # otherwise be chasing two different callers.
         agent_id, project = identity
         subject_task_id, subject_agent_role = subject
-        preserved = await self._file_residue_escalation({
+        preserved = await self._preserve_residue({
             'error_type': MARKUP_UNREPAIRABLE_ERROR_TYPE,
             'category': _ESCALATION_CATEGORY,
             # INV-7: a machine-readable owner plus a bound. This hold is a
@@ -1496,19 +1498,19 @@ class MarkupGuardMiddleware(Middleware):
             'hint': _unrepairable_hint(preserved),
         }, storm)))
 
-    async def _file_residue_escalation(
+    async def _preserve_residue(
         self, record: dict[str, Any]
     ) -> ResiduePreservation:
-        """Hand the residue to the injected sink; never change the outcome.
+        """Hand the residue to the injected sink, and return where it was preserved.
 
-        The refusal is already decided by the time this runs, so escalation is
+        The refusal is already decided by the time this runs, so preserving is
         purely ADDITIVE — see :meth:`_call_sink` for the never-raises contract
         and for why an ``async def`` emitter is awaited rather than left as an
         unawaited coroutine, which on THIS path would destroy the only surviving
         copy of the caller's payload.
 
-        Returns what the sink reports, so the refusal payload can name the
-        record holding the caller's data: an escalation id (``str``) or a
+        The sink answers where it preserved the record, so the refusal payload
+        can name what holds the caller's data: an escalation id (``str``) or a
         :class:`SpooledResidue`. Anything else reports ``None`` — the caller is
         better told nothing than pointed at a value it cannot look up. A sink
         that FAILED reports ``None`` for the same reason.
@@ -1550,14 +1552,14 @@ class MarkupGuardMiddleware(Middleware):
         not dedup for exactly that reason. Returns where the LAST one went,
         which is the one the forwarded call's warning names.
 
-        Never raises — ``_file_residue_escalation`` owns that contract, and this
+        Never raises — ``_preserve_residue`` owns that contract, and this
         runs on a path whose outcome (forward) is already decided.
         """
         agent_id, project = identity
         subject_task_id, subject_agent_role = subject
         preserved: ResiduePreservation = None
         for field, raw in sorted(unrecovered.items()):
-            preserved = await self._file_residue_escalation({
+            preserved = await self._preserve_residue({
                 # A DISTINCT error_type from the refusal's, because the two
                 # differ in the one way that matters to whoever reads the queue:
                 # this call SUCCEEDED, lossily, and no caller was bounced — so
