@@ -13,7 +13,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-import merge_lane_cluster as lane_cluster
 import merge_lane_ratchet as ratchet
 
 #: The committed artifacts the gates are about, named once: the baseline, the
@@ -167,7 +166,7 @@ def entry_listing(root: Path, revision: str | None) -> dict[str, str]:
         meta, path = record.split('\t', 1)
         fields = meta.split()
         if revision is None and fields[2] != '0':
-            raise lane_cluster.RatchetError(f'{path} is unmerged in the index')
+            raise ratchet.RatchetError(f'{path} is unmerged in the index')
         name = path.removeprefix(f'{ledger}/')
         if name != ratchet.LEDGER_README_NAME:
             entries[name] = fields[1] if revision is None else fields[2]

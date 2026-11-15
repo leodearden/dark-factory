@@ -13,10 +13,11 @@ Exit codes
    file/function exceeded a ceiling. Violations are printed to stderr. This
    covers BOTH faces of the gate: ``--check`` finding a raise, and
    ``--write-baseline`` REFUSING to absorb one for want of an
-   ``--authorize-raise`` (``UnauthorizedRaise``, which deliberately does not
-   subclass ``MetricsError`` so it cannot be reclassified as a broken tool).
-2  instrument failure (``source_measures.MetricsError``, or its ``RatchetError``
-   subclass for the ratchet's own faults) -- an unparseable cluster file,
+   ``--authorize-raise`` (``ratchet.UnauthorizedRaise``, which deliberately does
+   not subclass ``MetricsError`` so it cannot be reclassified as a broken tool).
+2  instrument failure (``source_measures.MetricsError``, or its subclasses
+   ``lane_cluster.ClusterSpecError`` for a cluster path it cannot read and
+   ``ratchet.RatchetError`` for the ratchet's own faults) -- an unparseable cluster file,
    complexipy missing or out of range, a missing/malformed baseline, or a
    baseline whose recorded parameters no longer match this tree. Deliberately
    distinct from 1 so a broken instrument is never mistaken either for a clean
@@ -209,7 +210,7 @@ def _resolve_authorization(
         )
     try:
         return ratchet.RaiseAuthorization(task_id=args.authorize_raise, reason=args.reason)
-    except lane_cluster.RatchetError as exc:
+    except ratchet.RatchetError as exc:
         parser.error(str(exc))
 
 

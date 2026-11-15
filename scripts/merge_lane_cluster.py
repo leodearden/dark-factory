@@ -19,7 +19,7 @@ neighbours. Those guards measure OTHER people's files; this one measures a
 fixed, named cluster where a path it cannot read IS the finding. Concretely:
 
 * a ``CLUSTER_PATHS`` LITERAL that is missing, unreadable or unparseable ->
-  ``RatchetError`` (missing, unreadable) or ``source_measures.MetricsError``
+  ``ClusterSpecError`` (missing, unreadable) or ``source_measures.MetricsError``
   (unparseable) naming the path and the cause;
 * a ``CLUSTER_PATHS`` GLOB expanding to zero -> fine (that is
   ``merge_lane/**`` until PRD task zeta1 lands);
@@ -28,7 +28,8 @@ fixed, named cluster where a path it cannot read IS the finding. Concretely:
 * the whole-of-``orchestrator/tests`` sweep keeps the siblings' per-file
   fail-soft polarity, but records every skipped file in
   ``Enumeration.unreadable`` and marks the enumeration incomplete, and
-  ``check_against_baseline`` REFUSES to compare an incomplete enumeration.
+  ``scripts/merge_lane_ratchet.py::check_against_baseline`` REFUSES to
+  compare an incomplete enumeration.
 
 That last clause is what makes "a partial enumeration is distinguishable from a
 complete one in the RESULT, not only in a log line" true rather than aspirational.
@@ -40,9 +41,10 @@ cannot read IS the finding. The test tree's breadth travels as ``test_tree``'s
 two counts in the report ONLY: both reach ``--json`` verbatim and both are
 legible under ``--report`` -- the numerator under its own ``test suite --``
 label, since it is ``len(tests)`` and one number gets one place -- but neither
-is ever ratcheted, because ``check_against_baseline`` reads completeness from
-the CURRENT report and freezing a number nothing enforces would only churn the
-file on every unrelated test file the repo gains (esc-5021-7).
+is ever ratcheted, because ``scripts/merge_lane_ratchet.py::check_against_baseline``
+reads completeness from the CURRENT report and freezing a number nothing
+enforces would only churn the file on every unrelated test file the repo gains
+(esc-5021-7).
 """
 from __future__ import annotations
 
@@ -54,15 +56,11 @@ from pathlib import Path
 import source_measures
 
 
-class RatchetError(source_measures.MetricsError):
-    """The ratchet could not do its job: its cluster spec, baseline, ledger,
-    an authorization, or the params a comparison rests on is missing,
-    malformed or inconsistent.
+class ClusterSpecError(source_measures.MetricsError):
+    """A ``CLUSTER_PATHS`` literal is missing, not a regular file, or unreadable.
 
-    A ``source_measures.MetricsError`` subclass because both are instrument
-    failures (exit 2) and every boundary catches them together; a type of its
-    own so the ratchet's faults are named by the ratchet, not by the layer it
-    measures with.
+    A ``source_measures.MetricsError`` subclass because it is an instrument
+    failure (exit 2) like every other, and every boundary catches that base.
     """
 
 
@@ -79,8 +77,9 @@ LANE_PACKAGE_GLOB = f'orchestrator/src/{LANE_PACKAGE.replace(".", "/")}/**/*.py'
 
 #: Repo-relative literal paths and glob patterns naming the merge-lane cluster.
 #: This tuple IS Appendix A; editing it forces a deliberate baseline
-#: regeneration, because ``check_against_baseline`` compares the baseline's
-#: recorded ``params.cluster_paths`` against it and raises on a mismatch.
+#: regeneration, because ``scripts/merge_lane_ratchet.py::check_against_baseline``
+#: compares the baseline's recorded ``params.cluster_paths`` against it and
+#: raises on a mismatch.
 CLUSTER_PATHS: tuple[str, ...] = (
     'orchestrator/src/orchestrator/lane_lifecycle.py',
     'orchestrator/src/orchestrator/offline_lane.py',
@@ -120,9 +119,10 @@ class Enumeration:
     """Which paths were asked for, which were measured, and which were skipped.
 
     ``complete`` is the single signal every consumer checks. It is False
-    whenever anything landed in ``unreadable``, and ``check_against_baseline``
-    raises rather than compares when it is False -- so a degraded sweep can
-    never masquerade as a clean tree.
+    whenever anything landed in ``unreadable``, and
+    ``scripts/merge_lane_ratchet.py::check_against_baseline`` raises rather
+    than compares when it is False -- so a degraded sweep can never masquerade
+    as a clean tree.
     """
 
     requested: tuple[str, ...]
@@ -161,7 +161,7 @@ class TestTreeCoverage:
 def resolve_cluster_paths(root: Path) -> Enumeration:
     """Resolve ``CLUSTER_PATHS`` against *root* into a complete Enumeration.
 
-    Raises ``RatchetError`` naming the path when a LITERAL entry is missing, is
+    Raises ``ClusterSpecError`` naming the path when a LITERAL entry is missing, is
     not a regular file, or cannot be read. A GLOB entry expanding to zero paths
     is accepted (that is ``merge_lane/**`` until PRD task zeta1).
     """
@@ -174,20 +174,20 @@ def resolve_cluster_paths(root: Path) -> Enumeration:
             continue
         candidate = root / entry
         if not candidate.exists():
-            raise RatchetError(
+            raise ClusterSpecError(
                 f'cluster path {entry!r} does not exist under {root} -- '
                 'CLUSTER_PATHS is the SPOT source of PRD Appendix A; if the '
                 'file was renamed or removed, update CLUSTER_PATHS and '
                 'regenerate the baseline in the same commit'
             )
         if not candidate.is_file():
-            raise RatchetError(
+            raise ClusterSpecError(
                 f'cluster path {entry!r} is not a regular file under {root}'
             )
         try:
             candidate.read_text(encoding='utf-8')
         except (OSError, UnicodeDecodeError) as exc:
-            raise RatchetError(
+            raise ClusterSpecError(
                 f'cluster path {entry!r} could not be read: {exc.__class__.__name__}: {exc}'
             ) from exc
         resolved.append(entry)
@@ -324,17 +324,17 @@ def build_report(root: Path) -> dict[str, object]:
     """Measure the whole cluster plus the test suite under *root*.
 
     Note there is NO ``totals`` key: cluster-wide totals are DERIVED at check
-    time by ``derive_totals`` from the stored per-path maps. PRD gamma1..gamma10
-    run in parallel and each lowers only its own group's contribution, so a
-    shared totals line would conflict on every one of ten rebases -- while
-    deriving preserves the anti-rename-gaming property in full (see
-    ``derive_totals``) and keeps one number in one place.
+    time by ``scripts/merge_lane_ratchet.py::derive_totals`` from the stored
+    per-path maps. PRD gamma1..gamma10 run in parallel and each lowers only its
+    own group's contribution, so a shared totals line would conflict on every
+    one of ten rebases -- while deriving preserves the anti-rename-gaming
+    property in full (see that function) and keeps one number in one place.
 
     The ``enumeration`` block obeys that same constraint, which it did not when
     the argument above was first written: the cluster half is a fixed manifest
     that moves only when ``CLUSTER_PATHS`` does, and the test tree's size is
     reported rather than stored, so nothing here is a shared line ten branches
-    would each rewrite (see ``_stored_enumeration``).
+    would each rewrite (see ``scripts/merge_lane_ratchet.py::_stored_enumeration``).
     """
     # Up front, before any measurement: a wrong-version engine must fail
     # immediately with a named cause rather than after a 250-second run whose
@@ -409,7 +409,8 @@ def sweep_repo(root: Path) -> RepoSweep:
     unrelated mid-edit file must not redden the ratchet, which is the
     misattribution every neighbouring guard exists to avoid. What is NOT soft is
     the record: each skipped file lands in ``Enumeration.unreadable``, the
-    enumeration goes incomplete, and ``check_against_baseline`` then refuses to
+    enumeration goes incomplete, and
+    ``scripts/merge_lane_ratchet.py::check_against_baseline`` then refuses to
     compare at all. That split is the INV-11 seam between "this cluster file is
     unmeasurable, which IS the finding" and "some unrelated file is mid-edit".
     """
@@ -450,9 +451,9 @@ def _report_enumeration(
     ``merge_lane/**`` file once PRD task zeta1 makes that glob expand -- a
     silent completeness hole in the instrument whose whole job is completeness.
 
-    Key order is fixed here, not incidental: ``render_baseline`` emits this block
-    with ``json.dumps(..., indent=2)``, so insertion order IS the committed
-    bytes.
+    Key order is fixed here, not incidental:
+    ``scripts/merge_lane_ratchet.py::render_baseline`` emits this block with
+    ``json.dumps(..., indent=2)``, so insertion order IS the committed bytes.
     """
     return {
         'requested': list(cluster.requested),

@@ -38,7 +38,19 @@ import source_measures
 from shared import safe_io
 
 
-class AppendOnlyViolation(lane_cluster.RatchetError):
+class RatchetError(source_measures.MetricsError):
+    """The ratchet could not do its job: its baseline, ledger, an
+    authorization, or the params a comparison rests on is missing, malformed
+    or inconsistent.
+
+    A ``source_measures.MetricsError`` subclass because both are instrument
+    failures (exit 2) and every boundary catches them together; a type of its
+    own so the ratchet's faults are named by the ratchet, not by the layer it
+    measures with.
+    """
+
+
+class AppendOnlyViolation(RatchetError):
     """The ledger's recorded history was REWRITTEN, or the one commit that splits
     the retired array into files broke its rule -- a verdict, not a fault.
 
@@ -159,7 +171,8 @@ ADVANCE_GATE_RELPATH = 'scripts/check_ratchet_advance.py'
 
 #: THE ONE COPY of what to do when a measure rose. Composed into every site
 #: that tells an agent it may not raise -- ``BASELINE_README`` (and so the
-#: committed bytes a blocked reader opens), ``main()``'s ``--check`` trailer,
+#: committed bytes a blocked reader opens),
+#: ``scripts/merge_lane_metrics.py::main``'s ``--check`` trailer,
 #: and the pytest gate's assertion message. Three near-copies used to say only
 #: that raising was forbidden, and the copy that mattered sent an implementer to
 #: escalation rather than to a sanctioned path (task 5342, esc-5342-1).
@@ -237,7 +250,7 @@ def _stored_enumeration(enumeration: dict) -> dict:
     """Strip the live-only test-tree counts; the baseline stores the cluster half.
 
     WHY THE TEST TREE IS NOT STORED AT ALL, in paths OR in counts (esc-5021-7).
-    ``sweep_repo`` walks every ``*.py`` under ``orchestrator/tests`` -- 568
+    ``lane_cluster.sweep_repo`` walks every ``*.py`` under ``orchestrator/tests`` -- 568
     paths, of which only the lane-importing ones are ever measured. Freezing that
     manifest in the committed baseline made this gate a hair trigger: any task
     ANYWHERE in the repo that added, removed or renamed a single test file
@@ -326,14 +339,14 @@ def render_baseline(report: dict, *, readme: str = BASELINE_README) -> str:
 class UnauthorizedRaise(Exception):
     """``write_baseline`` refused to absorb a raise nobody authorized.
 
-    NOT a ``MetricsError``, deliberately. ``main()`` maps every MetricsError to
-    exit 2 ("the instrument is broken"), and a refused regeneration is not a
-    broken instrument -- it is a measure that rose, discovered at write time
-    instead of at check time, which is squarely exit 1. Subclassing would
-    silently reclassify a real regression as a broken tool, collapsing the one
-    distinction the exit ladder exists to keep.
+    NOT a ``MetricsError``, deliberately. ``scripts/merge_lane_metrics.py::main``
+    maps every MetricsError to exit 2 ("the instrument is broken"), and a
+    refused regeneration is not a broken instrument -- it is a measure that
+    rose, discovered at write time instead of at check time, which is squarely
+    exit 1. Subclassing would silently reclassify a real regression as a broken
+    tool, collapsing the one distinction the exit ladder exists to keep.
 
-    Carries the measured ``violations`` so ``main()`` can print the same
+    Carries the measured ``violations`` so the CLI can print the same
     per-violation lines ``--check`` prints, and so the ledger record for an
     AUTHORIZED raise is derived from the same comparison that would have
     refused it.
@@ -390,11 +403,12 @@ def write_baseline(
     with ``UnauthorizedRaise`` -- the destination untouched, exit 1 at the CLI.
 
     DELIBERATELY NOT APPLIED here: ``_require_matching_params``. Both it and
-    ``resolve_cluster_paths`` instruct the reader to edit ``CLUSTER_PATHS`` and
-    regenerate the baseline in one commit, so routing regeneration through that
-    precondition would break the one workflow those messages prescribe. Widening
-    the cluster still raises the derived totals, so it still needs an
-    authorization -- which is honest, the totals really did rise.
+    ``lane_cluster.resolve_cluster_paths`` instruct the reader to edit
+    ``lane_cluster.CLUSTER_PATHS`` and regenerate the baseline in one commit,
+    so routing regeneration through that precondition would break the one
+    workflow those messages prescribe. Widening the cluster still raises the
+    derived totals, so it still needs an authorization -- which is honest, the
+    totals really did rise.
 
     THE OTHER ARM OF THAT PRECONDITION, complexipy version drift, reaches this
     gate the same way and is easy to misread. A new version re-reads every
@@ -474,24 +488,24 @@ def load_baseline(path: Path) -> dict:
     try:
         text = target.read_text(encoding='utf-8')
     except FileNotFoundError as exc:
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'ratchet baseline {target} does not exist -- a missing baseline is '
             'a hard failure, never an empty-baseline pass; regenerate it with '
             '--write-baseline if this is the commit that introduces it'
         ) from exc
     except (OSError, UnicodeDecodeError) as exc:
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'ratchet baseline {target} could not be read: '
             f'{exc.__class__.__name__}: {exc}'
         ) from exc
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'ratchet baseline {target} is not valid JSON: {exc}'
         ) from exc
     if not isinstance(loaded, dict):
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'ratchet baseline {target} holds a '
             f'{type(loaded).__name__} at top level, expected a JSON object'
         )
@@ -511,7 +525,7 @@ def load_baseline(path: Path) -> dict:
 def _require_non_blank(authorization: RaiseAuthorization, field: str) -> None:
     value = getattr(authorization, field)
     if not isinstance(value, str) or not value.strip():
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'authorized raise is missing {field}: {value!r}. An authorization '
             f'with no {field} is not an authorization -- the ledger entry exists '
             'to tell a reviewer WHO raised a measure and WHY, and an entry that '
@@ -651,17 +665,17 @@ def parse_entry(name: str, text: str) -> dict:
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'authorized-raise entry {name} is not valid JSON: {exc}'
         ) from exc
     if not isinstance(loaded, dict):
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'authorized-raise entry {name} holds a {type(loaded).__name__} at '
             'top level, expected a JSON object'
         )
     expected = entry_filename(loaded)
     if name != expected:
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'authorized-raise entry {name} is not named for its content '
             f'(its content is named {expected}). Entries are written by '
             '--authorize-raise and never edited afterwards; record a new one '
@@ -686,7 +700,7 @@ def load_ledger(directory: Path) -> list[dict]:
     if not target.exists():
         return []
     if not target.is_dir():
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'authorized-raise ledger {target} is not a directory -- the ledger '
             'holds one file per authorization'
         )
@@ -697,7 +711,7 @@ def load_ledger(directory: Path) -> list[dict]:
         try:
             text = path.read_text(encoding='utf-8')
         except (OSError, UnicodeDecodeError) as exc:
-            raise lane_cluster.RatchetError(
+            raise RatchetError(
                 f'authorized-raise entry {path} could not be read: '
                 f'{exc.__class__.__name__}: {exc}'
             ) from exc
@@ -759,12 +773,12 @@ def legacy_ledger_entries(text: str) -> list[dict]:
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'retired ledger {LEGACY_LEDGER_RELPATH} is not valid JSON: {exc}'
         ) from exc
     raises = loaded.get('raises') if isinstance(loaded, dict) else None
     if not isinstance(raises, list) or not all(isinstance(entry, dict) for entry in raises):
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'retired ledger {LEGACY_LEDGER_RELPATH} has no "raises" list of '
             'entries, so the history it carries cannot be checked into files'
         )
@@ -918,10 +932,10 @@ class Violation:
         only constructor of a type this module hands out, which made every
         test of the auditor reach past the module's public face.
 
-        A CLASSMETHOD rather than a module-level ``violation()``: ``main`` and
-        several siblings bind ``violation`` as a loop variable over a list of
-        them, so a module-level factory of that name would be shadowed inside
-        exactly the scopes most likely to want it.
+        A CLASSMETHOD rather than a module-level ``violation()``: functions
+        here and in this module's consumers bind ``violation`` as a loop
+        variable over a list of them, so a module-level factory of that name
+        would be shadowed inside exactly the scopes most likely to want it.
         """
         return cls(
             measure=measure,
@@ -959,7 +973,7 @@ def _section(report: dict, name: str) -> dict:
 def _params(report: dict, which: str) -> dict:
     params = report.get('params')
     if not isinstance(params, dict):
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'{which} report has no "params" block -- it was not produced by '
             'build_report, so there is nothing to state how it was measured'
         )
@@ -969,14 +983,14 @@ def _params(report: dict, which: str) -> dict:
 def _require_complete_enumeration(current: dict) -> None:
     enumeration = current.get('enumeration')
     if not isinstance(enumeration, dict):
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             'current report has no "enumeration" block -- completeness must be '
             'legible in the RESULT, not only in a log line (INV-11)'
         )
     if enumeration.get('complete') is True:
         return
     unreadable = list(enumeration.get('unreadable', ()))
-    raise lane_cluster.RatchetError(
+    raise RatchetError(
         'refusing to compare a PARTIAL measurement against the baseline: '
         f'{len(unreadable)} path(s) were skipped -- {unreadable}. A sweep that '
         'skipped files measures LOWER than the truth, so comparing it would '
@@ -989,7 +1003,7 @@ def _require_matching_params(current: dict, baseline: dict) -> None:
     current_version = _params(current, 'current').get('complexipy_version')
     baseline_version = _params(baseline, 'baseline').get('complexipy_version')
     if current_version != baseline_version:
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             f'complexipy version drift: the baseline was measured with '
             f'{baseline_version!r}, this run used {current_version!r}. Cognitive '
             'numbers are version-dependent -- the same merge_queue.py measures '
@@ -1010,7 +1024,7 @@ def _require_matching_params(current: dict, baseline: dict) -> None:
     if recorded != live:
         added = [p for p in recorded if p not in live]
         removed = [p for p in live if p not in recorded]
-        raise lane_cluster.RatchetError(
+        raise RatchetError(
             'the baseline\'s recorded cluster_paths no longer match '
             f'CLUSTER_PATHS. Recorded but no longer in the cluster: {added}. '
             f'In the cluster but not recorded: {removed}. Editing PRD Appendix A '
@@ -1134,8 +1148,8 @@ def _measure_raises(current: dict, previous: dict) -> list[Violation]:
 
     A "raise" is any state the baseline may not silently acquire. That is the
     four rise arms, and it is also a CEILING BREACH -- a new path over
-    ``FILE_LINE_CEILING`` or a new function over
-    ``NEW_FUNCTION_COGNITIVE_CEILING``. The two belong together because
+    ``lane_cluster.FILE_LINE_CEILING`` or a new function over
+    ``lane_cluster.NEW_FUNCTION_COGNITIVE_CEILING``. The two belong together because
     regeneration is *how* a ceiling breach would be acquired: ceilings apply
     only to keys ABSENT from the baseline, so writing an oversized new file into
     the baseline exempts it from that moment on. Absorbed by a blind
@@ -1192,8 +1206,8 @@ def compare_baseline_files(previous: Path, current: Path) -> list[Violation]:
 
     DELIBERATELY NOT APPLIED here, as in ``write_baseline`` and for the same
     stated reason: ``_require_matching_params``. A commit that widens
-    ``CLUSTER_PATHS`` legitimately changes the recorded params, and that is the
-    one workflow ``resolve_cluster_paths`` prescribes.
+    ``lane_cluster.CLUSTER_PATHS`` legitimately changes the recorded params, and
+    that is the one workflow ``lane_cluster.resolve_cluster_paths`` prescribes.
     """
     return _measure_raises(load_baseline(Path(current)), load_baseline(Path(previous)))
 

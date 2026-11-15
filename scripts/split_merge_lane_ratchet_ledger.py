@@ -21,7 +21,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import merge_lane_cluster as lane_cluster
 import merge_lane_ratchet as ratchet
 import source_measures
 
@@ -38,7 +37,7 @@ def split(root: Path) -> str:
     recorded = {ratchet.entry_filename(entry) for entry in ratchet.load_ledger(directory)}
     missing = {ratchet.entry_filename(entry) for entry in entries} - recorded
     if missing:
-        raise lane_cluster.RatchetError(f'entries not recorded as files: {sorted(missing)}')
+        raise ratchet.RatchetError(f'entries not recorded as files: {sorted(missing)}')
     legacy.unlink()
     return (
         f'split {len(entries)} entr(ies) of {ratchet.LEGACY_LEDGER_RELPATH} into '

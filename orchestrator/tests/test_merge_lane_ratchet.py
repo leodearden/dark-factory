@@ -337,7 +337,7 @@ class TestResolveClusterPaths:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(lane_cluster, 'CLUSTER_PATHS', ('gone/missing.py',))
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.ClusterSpecError) as excinfo:
             lane_cluster.resolve_cluster_paths(tmp_path)
         assert 'gone/missing.py' in str(excinfo.value)
 
@@ -348,7 +348,7 @@ class TestResolveClusterPaths:
         # silently dropped from an otherwise plausible-looking result.
         (tmp_path / 'a.py').write_text('x = 1\n', encoding='utf-8')
         monkeypatch.setattr(lane_cluster, 'CLUSTER_PATHS', ('a.py', 'gone/missing.py'))
-        with pytest.raises(lane_cluster.RatchetError):
+        with pytest.raises(lane_cluster.ClusterSpecError):
             lane_cluster.resolve_cluster_paths(tmp_path)
 
     def test_literal_path_that_is_a_directory_raises(
@@ -356,7 +356,7 @@ class TestResolveClusterPaths:
     ) -> None:
         (tmp_path / 'adir.py').mkdir()
         monkeypatch.setattr(lane_cluster, 'CLUSTER_PATHS', ('adir.py',))
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.ClusterSpecError) as excinfo:
             lane_cluster.resolve_cluster_paths(tmp_path)
         assert 'adir.py' in str(excinfo.value)
 
@@ -1126,7 +1126,7 @@ class TestTestTreeSweep:
         block = lane_cluster._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
         assert block['complete'] is False
         assert block['unreadable'] == ['orchestrator/tests/test_broken.py']
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet._require_complete_enumeration({'enumeration': block})
         assert 'orchestrator/tests/test_broken.py' in str(excinfo.value)
 
@@ -1379,21 +1379,21 @@ class TestBaselineIO:
         # INV-11: a missing baseline is never an empty-baseline PASS, which
         # would silently disarm the ratchet for every downstream task.
         missing = tmp_path / 'nope.json'
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.load_baseline(missing)
         assert 'nope.json' in str(excinfo.value)
 
     def test_malformed_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         target = tmp_path / 'baseline.json'
         target.write_text('{"files": ', encoding='utf-8')
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.load_baseline(target)
         assert 'baseline.json' in str(excinfo.value)
 
     def test_non_object_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         target = tmp_path / 'baseline.json'
         target.write_text('[]', encoding='utf-8')
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.load_baseline(target)
         assert 'baseline.json' in str(excinfo.value)
 
@@ -1611,10 +1611,11 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         assert not issubclass(ratchet.UnauthorizedRaise, source_measures.MetricsError)
 
     def test_a_ratchet_fault_is_an_instrument_failure(self) -> None:
-        # The ratchet names its own faults, but they are still exit 2: every
-        # boundary catches the measure layer's MetricsError for both layers.
-        assert issubclass(lane_cluster.RatchetError, source_measures.MetricsError)
-        assert issubclass(ratchet.AppendOnlyViolation, lane_cluster.RatchetError)
+        # Each stratum names its own faults, but they are still exit 2: every
+        # boundary catches the measure layer's MetricsError for all of them.
+        assert issubclass(lane_cluster.ClusterSpecError, source_measures.MetricsError)
+        assert issubclass(ratchet.RatchetError, source_measures.MetricsError)
+        assert issubclass(ratchet.AppendOnlyViolation, ratchet.RatchetError)
 
     # CEILINGS ARE A HOLE OF THE SAME SHAPE, and the reason is subtle: the two
     # ceilings apply only to keys ABSENT from the baseline. So a blind
@@ -1854,7 +1855,7 @@ class TestAuthorizedRaise:
         # whether the report it accompanied happened to raise anything -- a
         # blank --reason over a lowering run would pass unremarked, and the
         # ledger's whole purpose is to answer WHO and WHY (heuristic 10).
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.RaiseAuthorization(task_id=task_id, reason=reason)
 
         assert field in str(excinfo.value)
@@ -1865,7 +1866,7 @@ class TestAuthorizedRaise:
         target, ledger = self._seeded(tmp_path)
         before = target.read_text(encoding='utf-8')
 
-        with pytest.raises(lane_cluster.RatchetError):
+        with pytest.raises(ratchet.RatchetError):
             ratchet.write_baseline(
                 target,
                 self._raised(),
@@ -1932,7 +1933,7 @@ class TestAuthorizedRaiseLedger:
 
         assert ratchet.load_ledger(missing) == []
 
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.load_baseline(missing)
         assert 'nope.json' in str(excinfo.value)
 
@@ -1956,7 +1957,7 @@ class TestAuthorizedRaiseLedger:
         ledger = tmp_path / 'raises'
         ledger.mkdir()
         (ledger / name).write_text(content, encoding='utf-8')
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.load_ledger(ledger)
         assert name in str(excinfo.value), why
 
@@ -1966,7 +1967,7 @@ class TestAuthorizedRaiseLedger:
         # The retired shape at the new path: a single file is not a ledger.
         target = tmp_path / 'raises'
         target.write_text('{"raises": []}', encoding='utf-8')
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.load_ledger(target)
         assert 'not a directory' in str(excinfo.value)
 
@@ -2394,7 +2395,7 @@ class TestComparatorPreconditions:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         current['params']['complexipy_version'] = '7.0.1'
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.check_against_baseline(current, baseline)
         assert '7.0.1' in str(excinfo.value)
         assert '6.2.0' in str(excinfo.value)
@@ -2405,7 +2406,7 @@ class TestComparatorPreconditions:
         baseline['params']['cluster_paths'] = [
             p for p in lane_cluster.CLUSTER_PATHS if p != _GIT_OPS
         ] + ['orchestrator/src/orchestrator/ghost.py']
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.check_against_baseline(current, baseline)
         message = str(excinfo.value)
         assert _GIT_OPS in message
@@ -2419,7 +2420,7 @@ class TestComparatorPreconditions:
         current = copy.deepcopy(baseline)
         current['enumeration']['complete'] = False
         current['enumeration']['unreadable'] = ['orchestrator/tests/test_broken.py']
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.check_against_baseline(current, baseline)
         assert 'test_broken.py' in str(excinfo.value)
 
@@ -2431,7 +2432,7 @@ class TestComparatorPreconditions:
         current = copy.deepcopy(baseline)
         current['enumeration']['complete'] = False
         current['files'][_MQ]['cognitive'] += 5000
-        with pytest.raises(lane_cluster.RatchetError):
+        with pytest.raises(ratchet.RatchetError):
             ratchet.check_against_baseline(current, baseline)
 
 

@@ -174,7 +174,7 @@ class TestCompareBaselineFiles:
         previous = _baseline_image(tmp_path, 'previous.json', synthetic_report())
         absent = tmp_path / 'gone.json'
 
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.compare_baseline_files(previous, absent)
 
         assert str(absent) in str(excinfo.value)
@@ -184,7 +184,7 @@ class TestCompareBaselineFiles:
         broken = tmp_path / 'broken.json'
         broken.write_text('{"files": {', encoding='utf-8')
 
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.compare_baseline_files(previous, broken)
 
         message = str(excinfo.value)
@@ -640,7 +640,7 @@ class TestLegacyLedgerEntries:
     def test_a_malformed_retired_array_is_a_named_hard_failure(self, text: str) -> None:
         # Its entries are history being moved: one that cannot be read cannot be
         # checked into a file, and must never read as "nothing to move".
-        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+        with pytest.raises(ratchet.RatchetError) as excinfo:
             ratchet.legacy_ledger_entries(text)
 
         assert ratchet.LEGACY_LEDGER_RELPATH in str(excinfo.value)
