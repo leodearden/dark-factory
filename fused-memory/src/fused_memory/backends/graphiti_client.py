@@ -14,7 +14,7 @@ from collections import Counter
 from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, TypedDict, TypeVar, cast
+from typing import Any, TypedDict, TypeVar
 from urllib.parse import urlparse
 
 from falkordb.asyncio import FalkorDB
@@ -62,7 +62,6 @@ from fused_memory.backends.graph_access import (
     STORE,
     FalkorGraphAccess,
     GraphAccess,
-    GraphHandle,
     OpBoundReader,
     paged_ro_query,
 )
