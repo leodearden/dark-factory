@@ -17,8 +17,10 @@
 #
 # DELIBERATELY NOT scripts/setup-host.sh. That script re-renders EVERY unit on
 # the host and is the known clobber hazard; this one touches exactly the two
-# units it owns. Task δ-prime is the deterministic deploy that runs this
-# script; ε1/ε2 are the calibration gates that follow it.
+# units it owns. setup-host.sh §7b does invoke this installer, but only when
+# scripts/user_timers.py reports the sampler unarmed. Task δ-prime is the
+# deterministic deploy that runs this script; ε1/ε2 are the calibration gates
+# that follow it.
 #
 # The self-verify runs BEFORE the one-time kick, not after -- the ordering
 # scripts/install-flag-marker-sweep-timer.sh's header documents as the
