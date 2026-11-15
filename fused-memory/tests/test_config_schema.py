@@ -1015,6 +1015,112 @@ class TestMem0UpdateConfig:
         a, b = FusedMemoryConfig(), FusedMemoryConfig()
         assert a.mem0_update is not b.mem0_update
 
+    # --- agent_prefix_sanctioned_use: the role each allowlisted prefix declares ---
+
+    def test_default_sanctioned_use_documents_every_default_bar_prefix(self):
+        cfg = Mem0UpdateConfig()
+        uses = cfg.agent_prefix_sanctioned_use
+        bar = {
+            *cfg.content_amend_allowed_agent_prefixes,
+            *cfg.metadata_patch_allowed_agent_prefixes,
+        }
+        undocumented = sorted(
+            p for p in bar
+            if not (isinstance(uses.get(p), str) and uses[p].strip())
+        )
+        assert not undocumented, (
+            f'default-allowlisted prefixes with no sanctioned use: {undocumented!r}'
+        )
+
+    def test_default_sanctioned_use_documents_link_heal(self):
+        """config.yaml grants link-heal- on the metadata arm without overriding
+        the map, so its role text has to ship in the schema default."""
+        uses = Mem0UpdateConfig().agent_prefix_sanctioned_use
+        assert isinstance(uses.get('link-heal-'), str)
+        assert uses['link-heal-'].strip()
+
+    def test_sanctioned_use_maps_are_separate_objects(self):
+        a = Mem0UpdateConfig()
+        a.agent_prefix_sanctioned_use['curator-'] = 'MUTATED'
+        a.agent_prefix_sanctioned_use['x-'] = 'ADDED'
+        b = Mem0UpdateConfig()
+        assert b.agent_prefix_sanctioned_use['curator-'] != 'MUTATED'
+        assert 'x-' not in b.agent_prefix_sanctioned_use
+
+    def test_sanctioned_use_override_accepted(self):
+        cfg = Mem0UpdateConfig(
+            agent_prefix_sanctioned_use={'auditor-': 'an audit sitting'},
+        )
+        assert cfg.agent_prefix_sanctioned_use == {'auditor-': 'an audit sitting'}
+
+    @pytest.mark.parametrize('blank', ['', '   '])
+    def test_blank_sanctioned_use_value_rejected_naming_the_prefix(self, blank):
+        with pytest.raises(ValidationError) as exc:
+            Mem0UpdateConfig(
+                agent_prefix_sanctioned_use={
+                    'recon-stage-': 'the reconciliation stages',
+                    'curator-': blank,
+                },
+            )
+        message = str(exc.value)
+        assert 'curator-' in message, message
+        assert 'agent_prefix_sanctioned_use' in message, message
+
+    @pytest.mark.parametrize('blank_key', ['', '  '])
+    def test_blank_sanctioned_use_key_rejected(self, blank_key):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(agent_prefix_sanctioned_use={blank_key: 'x'})
+
+    def test_non_str_sanctioned_use_value_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(agent_prefix_sanctioned_use={'curator-': 42})
+
+    def test_every_skill_a_default_sanctioned_use_names_exists(self):
+        """A refusal must never point a caller at a skill that is not there."""
+        repo_root = Path(__file__).resolve().parents[2]
+        uses = Mem0UpdateConfig().agent_prefix_sanctioned_use
+        missing = sorted(
+            (prefix, token)
+            for prefix, use in uses.items()
+            for token in re.findall(r'skills/[a-z0-9-]+', use)
+            if not (repo_root / token / 'SKILL.md').is_file()
+        )
+        assert not missing, f'sanctioned uses naming a missing skill: {missing!r}'
+        assert re.search(r'skills/[a-z0-9-]+', uses['curator-']), (
+            'the curator- entry must name the curation skill it executes, '
+            f'got {uses["curator-"]!r}'
+        )
+
+
+@pytest.mark.parametrize('yaml_name', ['config.yaml', 'config-docker.yaml'])
+class TestShippedConfigDocumentsEveryAllowlistedPrefix:
+    """Documenting a prefix is part of widening either allowlist.
+
+    The shipped configs are where a grant is widened, so each must leave every
+    granted prefix with a sanctioned use the refusal can render.
+    """
+
+    def test_every_allowlisted_prefix_has_a_sanctioned_use(
+        self, monkeypatch, yaml_name,
+    ):
+        yaml_path = Path(__file__).resolve().parent.parent / 'config' / yaml_name
+        assert yaml_path.is_file(), f'expected {yaml_name} at {yaml_path}'
+        monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+        section = FusedMemoryConfig().mem0_update
+        uses = section.agent_prefix_sanctioned_use
+        bar = {
+            *section.content_amend_allowed_agent_prefixes,
+            *section.metadata_patch_allowed_agent_prefixes,
+        }
+        undocumented = sorted(
+            p for p in bar
+            if not (isinstance(uses.get(p), str) and uses[p].strip())
+        )
+        assert not undocumented, (
+            f'fused-memory/config/{yaml_name} allowlists {undocumented!r} with no '
+            'entry in mem0_update.agent_prefix_sanctioned_use'
+        )
+
 
 class TestEntityMintConfig:
     """Authorization + storm knobs for the ensure_entity_node MCP tool (task 4932).
