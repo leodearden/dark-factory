@@ -550,7 +550,7 @@ async def test_own_timeout_kills_a_helper_left_by_a_leader_that_already_exited(
             )
             await asyncio.sleep(0.05)
 
-        assert await asyncio.to_thread(_wait_pid_exited, leaked_pid, run_timeout + 5.0), (
+        assert await asyncio.to_thread(wait_pid_gone, leaked_pid, timeout=run_timeout + 5.0), (
             f'pid {leaked_pid}, a helper left holding the pipes by a leader that had already '
             'exited and been reaped, survived a timed-out run_git'
         )
