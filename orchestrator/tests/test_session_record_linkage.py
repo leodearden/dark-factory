@@ -14,6 +14,7 @@ import pytest  # pyright: ignore[reportMissingImports]
 from _process_identity_variants import IdentityVariant, own_identity
 from _process_tree_fakes import claude_process_tree
 from _reap_report_wait import await_reap_report
+from _session_hook_fixtures import launching_record, owner_ppid_env
 from shared.process_identity import ProcessIdentity
 
 from orchestrator import session_hooks as sh
@@ -635,6 +636,17 @@ def _forked_inheritor_env(root: Path) -> dict[str, str]:
     return {'CLAUDE_SPAWN_SESSION_ID': _DISOWNED_SPAWNER, 'CLAUDE_SPAWN_ROLE': 'watcher'}
 
 
+_REMINT_OWNER = 5_918_001
+_REMINT_OWNER_PARENT = 5_918_000
+_REMINT_SPAWN_SLUG = 'session-cockpit-5918000'
+
+
+def _spawned_session_env(root: Path) -> dict[str, str]:
+    """Seed the spawn-claude.sh LAUNCHING record that a claude parented by ``_REMINT_OWNER_PARENT`` binds."""
+    launching_record(_REMINT_SPAWN_SLUG, root, pid=_REMINT_OWNER_PARENT)
+    return owner_ppid_env(_REMINT_SPAWN_SLUG, _REMINT_OWNER_PARENT)
+
+
 class TestResumedSessionIdKeyedRecordIsRelinked:
     _RESUMED = 7_614_102
 
@@ -1067,6 +1079,52 @@ class TestLeaseClaimCliRecordSlug:
 
         assert len(calls) == expected_calls
         assert _lease_body(tmp_path).pid == expected_body_pid
+
+
+class TestALeaseFollowsItsHoldersRecordAcrossARemint:
+    @pytest.mark.parametrize(
+        'lane',
+        [_hand_launched_env, _spawned_session_env],
+        ids=['hand-launched', 'spawned'],
+    )
+    @pytest.mark.parametrize('source', ['clear', 'compact'])
+    def test_a_lease_claimed_before_a_remint_names_the_live_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        source: str,
+        lane: Callable[[Path], Mapping[str, str]],
+    ) -> None:
+        tree = claude_process_tree(_REMINT_OWNER, _REMINT_OWNER_PARENT)
+        env = lane(tmp_path)
+        first = sh.run_session_start(
+            {'session_id': 'sid-before', 'cwd': _CWD, 'source': 'startup'},
+            env,
+            root=tmp_path,
+            process_tree=tree,
+        )
+        monkeypatch.setenv('CLAUDE_PID', str(_REMINT_OWNER))
+        assert sr.main(['lease-claim', '--name', _LEASE]) == 0
+        assert _lease_body(tmp_path).record_slug == first.session_slug
+
+        sh.run_session_start(
+            {'session_id': 'sid-after', 'cwd': _CWD, 'source': source},
+            env,
+            root=tmp_path,
+            process_tree=tree,
+        )
+        sh.run_stop({'session_id': 'sid-after', 'cwd': _CWD}, env, root=tmp_path, process_tree=tree)
+
+        live = sr.resolve_session_slug_for_claude_session_id('sid-after', root=tmp_path)
+        assert live is not None
+        status = sr.lease_status(_LEASE, root=tmp_path)
+        assert (status.holder_record_slug, status.holder_record_state) == (
+            live,
+            sr.HolderRecordState.ACTIVE,
+        )
+        assert sr.resolve_session_slug_for_pid(_REMINT_OWNER, root=tmp_path) == live
+        record = sr.read_record(live, root=tmp_path)
+        assert (record.claude_session_id, record.status) == ('sid-after', sr.Status.IDLE)
 
 
 def _claim_lines(capsys: pytest.CaptureFixture[str], *extra: str) -> list[str]:
