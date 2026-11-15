@@ -26,6 +26,10 @@ from pathlib import Path
 
 import pytest
 from legibility import check_trickle_health, trickle_state
+from shared.testing_mcp_stub import StubMcpServer
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / 'legibility' / 'check_trickle_health.py'
 
@@ -52,7 +56,7 @@ def _check(**kwargs):
     kwargs.setdefault('progress_runner', _ok)
     kwargs.setdefault('liveness_runner', _ok)
     kwargs.setdefault('census_runner', _ok)
-    kwargs.setdefault('poster', lambda url, envelope: None)
+    kwargs.setdefault('poster', lambda url, arguments: None)
     return check_trickle_health.run_health_check(**kwargs)
 
 
@@ -71,7 +75,7 @@ class TestAggregateVerdict:
     def test_both_probes_passing_is_healthy(self):
         result = _check()
 
-        assert result.exit_code == 0
+        assert result.exit_code == check_trickle_health.EXIT_HEALTHY
         assert result.progress_ok is True
         assert result.liveness_ok is True
         assert 'progress' in result.reason.lower()
@@ -80,7 +84,7 @@ class TestAggregateVerdict:
     def test_a_failing_progress_probe_fails_the_aggregate(self):
         result = _check(progress_runner=_fails('ERROR: barren streak'))
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.progress_ok is False
         assert result.liveness_ok is True
 
@@ -88,7 +92,7 @@ class TestAggregateVerdict:
         """A unit that ran and failed fails the aggregate on its own."""
         result = _check(liveness_runner=_fails('ERROR: Result=failed'))
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.progress_ok is True
         assert result.liveness_ok is False
 
@@ -101,7 +105,7 @@ class TestAggregateVerdict:
             liveness_runner=_fails('ERROR: liveness detail here'),
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.progress_ok is False
         assert result.liveness_ok is False
         assert 'progress detail here' in result.progress_output
@@ -119,7 +123,7 @@ class TestAggregateVerdict:
         never an uncaught traceback."""
         result = _check(progress_runner=_raises(exc))
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.progress_ok is False
         assert type(exc).__name__ in result.progress_output, (
             'the reason a probe could not run must be named, not swallowed'
@@ -129,7 +133,7 @@ class TestAggregateVerdict:
     def test_a_failing_census_probe_fails_the_aggregate(self):
         result = _check(census_runner=_fails('ERROR: census fired unadvanced'))
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.census_ok is False
         assert result.progress_ok is True
         assert result.liveness_ok is True
@@ -142,7 +146,7 @@ class TestAggregateVerdict:
             census_runner=_fails('ERROR: census detail here'),
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert (result.progress_ok, result.liveness_ok, result.census_ok) == (
             False, False, False,
         )
@@ -151,7 +155,7 @@ class TestAggregateVerdict:
     def test_a_raising_census_runner_is_a_failed_probe(self):
         result = _check(census_runner=_raises(FileNotFoundError('no probe')))
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.census_ok is False
         assert 'FileNotFoundError' in result.census_output
 
@@ -228,7 +232,8 @@ class TestCli:
         monkeypatch.setattr(
             check_trickle_health, 'run_health_check',
             lambda **kw: seen.update(kw) or check_trickle_health.HealthResult(
-                exit_code=0, progress_ok=True, liveness_ok=True,
+                exit_code=check_trickle_health.EXIT_HEALTHY,
+                progress_ok=True, liveness_ok=True,
                 progress_output='', liveness_output='',
                 census_ok=True, census_output='', escalated=False,
                 reason='synthetic healthy reason',
@@ -249,7 +254,8 @@ class TestCli:
         monkeypatch.setattr(
             check_trickle_health, 'run_health_check',
             lambda **kw: seen.update(kw) or check_trickle_health.HealthResult(
-                exit_code=0, progress_ok=True, liveness_ok=True,
+                exit_code=check_trickle_health.EXIT_HEALTHY,
+                progress_ok=True, liveness_ok=True,
                 progress_output='', liveness_output='',
                 census_ok=True, census_output='', escalated=False,
                 reason='synthetic healthy reason',
@@ -257,7 +263,9 @@ class TestCli:
         )
         config_path = _write_project_config(tmp_path, project_id='proj_a')
 
-        assert check_trickle_health.main(['--config', str(config_path)]) == 0
+        assert check_trickle_health.main(['--config', str(config_path)]) == (
+            check_trickle_health.EXIT_HEALTHY
+        )
 
         assert seen['project_id'] is None
         assert seen['config_path'] == str(config_path)
@@ -268,14 +276,17 @@ class TestCli:
         monkeypatch.setattr(
             check_trickle_health, 'run_health_check',
             lambda **kw: check_trickle_health.HealthResult(
-                exit_code=1, progress_ok=False, liveness_ok=True,
+                exit_code=check_trickle_health.EXIT_DEGRADED,
+                progress_ok=False, liveness_ok=True,
                 progress_output='', liveness_output='',
                 census_ok=True, census_output='', escalated=False,
                 reason='synthetic failure reason',
             ),
         )
 
-        assert check_trickle_health.main(['--project-id', 'dark_factory']) == 1
+        assert check_trickle_health.main(['--project-id', 'dark_factory']) == (
+            check_trickle_health.EXIT_DEGRADED
+        )
 
         captured = capsys.readouterr()
         assert 'synthetic failure reason' in captured.err
@@ -285,14 +296,17 @@ class TestCli:
         monkeypatch.setattr(
             check_trickle_health, 'run_health_check',
             lambda **kw: check_trickle_health.HealthResult(
-                exit_code=0, progress_ok=True, liveness_ok=True,
+                exit_code=check_trickle_health.EXIT_HEALTHY,
+                progress_ok=True, liveness_ok=True,
                 progress_output='', liveness_output='',
                 census_ok=True, census_output='', escalated=False,
                 reason='synthetic healthy reason',
             ),
         )
 
-        assert check_trickle_health.main(['--project-id', 'dark_factory']) == 0
+        assert check_trickle_health.main(['--project-id', 'dark_factory']) == (
+            check_trickle_health.EXIT_HEALTHY
+        )
 
         captured = capsys.readouterr()
         assert 'synthetic healthy reason' in captured.out
@@ -377,7 +391,7 @@ class TestEscalation:
     """
 
     def _posted(self, tmp_path, **kwargs):
-        envelopes = []
+        posted = []
         config_path = _write_project_config(tmp_path, project_id='dark_factory')
         kwargs.setdefault('progress_runner', _ok)
         kwargs.setdefault('liveness_runner', _ok)
@@ -385,23 +399,21 @@ class TestEscalation:
         result = check_trickle_health.run_health_check(
             project_id='dark_factory',
             config_path=config_path,
-            poster=lambda url, envelope: envelopes.append((url, envelope)),
+            poster=lambda url, arguments: posted.append((url, arguments)),
             **kwargs,
         )
-        return result, envelopes
+        return result, posted
 
-    def test_a_failing_progress_probe_posts_exactly_one_envelope(self, tmp_path):
-        result, envelopes = self._posted(
+    def test_a_failing_progress_probe_posts_exactly_one_escalation(self, tmp_path):
+        result, posted = self._posted(
             tmp_path, progress_runner=_fails('ERROR: barren streak'),
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.escalated is True
-        assert len(envelopes) == 1, 'ONE envelope for the whole invocation'
+        assert len(posted) == 1, 'ONE escalation for the whole invocation'
 
-        _url, envelope = envelopes[0]
-        assert envelope['params']['name'] == 'escalate_info'
-        arguments = envelope['params']['arguments']
+        _url, arguments = posted[0]
         assert arguments['category'] == 'infra_issue'
         assert arguments['severity'] == 'info'
         assert arguments['agent_role'] == 'legibility-trickle-health'
@@ -411,13 +423,13 @@ class TestEscalation:
         )
 
     def test_the_detail_carries_both_probes_output(self, tmp_path):
-        _result, envelopes = self._posted(
+        _result, posted = self._posted(
             tmp_path,
             progress_runner=_fails('PROGRESS-MARKER barren streak'),
             liveness_runner=_fails('LIVENESS-MARKER Result=failed'),
         )
 
-        detail = envelopes[0][1]['params']['arguments']['detail']
+        detail = posted[0][1]['detail']
         assert 'PROGRESS-MARKER' in detail
         assert 'LIVENESS-MARKER' in detail
         assert 'check_trickle_progress.py' in detail, 'name the re-run command'
@@ -435,25 +447,25 @@ class TestEscalation:
         that stopped firing leaves ``recorded_at`` stale; one that fails
         repeatedly becomes a ``consecutive_failed_runs`` streak — all three
         fail the PROGRESS probe and do post."""
-        result, envelopes = self._posted(
+        result, posted = self._posted(
             tmp_path, liveness_runner=_fails('ERROR: Result=failed'),
         )
 
-        assert result.exit_code == 1, 'still loud'
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED, 'still loud'
         assert result.escalated is False
-        assert envelopes == []
+        assert posted == []
 
-    def test_a_census_only_failure_posts_exactly_one_envelope(self, tmp_path):
+    def test_a_census_only_failure_posts_exactly_one_escalation(self, tmp_path):
         """Nothing else escalates an unadvanced-fire streak, so the
         progress probe's suppression rules do not apply to this one."""
-        result, envelopes = self._posted(
+        result, posted = self._posted(
             tmp_path, census_runner=_fails('CENSUS-MARKER fired unadvanced'),
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.escalated is True
-        assert len(envelopes) == 1
-        arguments = envelopes[0][1]['params']['arguments']
+        assert len(posted) == 1
+        arguments = posted[0][1]
         assert 'census' in arguments['summary']
         assert 'progress' not in arguments['summary']
         detail = arguments['detail']
@@ -470,37 +482,37 @@ class TestEscalation:
     ):
         _seed_state('dark_factory', outcomes=['barren'] * 3, escalated_on=(2,))
 
-        result, envelopes = self._posted(
+        result, posted = self._posted(
             tmp_path,
             progress_runner=_fails('ERROR: barren streak'),
             census_runner=_fails('ERROR: census fired unadvanced'),
             max_barren_runs=3,
         )
 
-        assert result.exit_code == 1
-        assert len(envelopes) == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
+        assert len(posted) == 1
 
     def test_two_green_probes_post_nothing(self, tmp_path):
-        result, envelopes = self._posted(tmp_path)
+        result, posted = self._posted(tmp_path)
 
-        assert result.exit_code == 0
+        assert result.exit_code == check_trickle_health.EXIT_HEALTHY
         assert result.escalated is False
-        assert envelopes == []
+        assert posted == []
 
     def test_silent_when_the_record_says_the_nightly_escalated(self, tmp_path):
         """The nightly posted the streak escalation for this very night and
         recorded that it did; posting here duplicates it."""
         _seed_state('dark_factory', outcomes=['barren'] * 3, escalated_on=(2,))
 
-        result, envelopes = self._posted(
+        result, posted = self._posted(
             tmp_path,
             progress_runner=_fails('ERROR: barren streak'),
             max_barren_runs=3,
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.escalated is False
-        assert envelopes == []
+        assert posted == []
 
     def test_posts_when_the_record_says_the_nightly_did_not_escalate(
         self, tmp_path
@@ -509,14 +521,14 @@ class TestEscalation:
         threshold never reached its edge: nothing has interrupted anyone."""
         _seed_state('dark_factory', outcomes=['barren'] * 3)
 
-        result, envelopes = self._posted(
+        result, posted = self._posted(
             tmp_path,
             progress_runner=_fails('ERROR: barren streak'),
             max_barren_runs=3,
         )
 
-        assert result.exit_code == 1
-        assert len(envelopes) == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
+        assert len(posted) == 1
 
     def test_a_frozen_threshold_document_does_not_suppress_forever(
         self, tmp_path
@@ -526,7 +538,7 @@ class TestEscalation:
         The suppression used to be a predicate over the recorded document
         ALONE, with no freshness condition. Measured in this worktree: a
         ``['barren'] * 3`` document stamped 30 days ago gives
-        ``exit_code=1, escalated=False, 0 envelopes`` — and since the
+        ``exit_code=1, escalated=False, 0 posted`` — and since the
         document is frozen, that repeats EVERY NIGHT indefinitely. A
         recorder that dies on a night landing exactly on the threshold
         (timer disabled, unit 203/EXEC, recorder crash) then fails the
@@ -538,21 +550,21 @@ class TestEscalation:
             last_recorded_at=datetime.now(UTC) - timedelta(days=30),
         )
 
-        result, envelopes = self._posted(
+        result, posted = self._posted(
             tmp_path,
             progress_runner=_fails('ERROR: stale recorder'),
             max_barren_runs=3,
         )
 
-        assert result.exit_code == 1
-        assert len(envelopes) == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
+        assert len(posted) == 1
 
-    @pytest.mark.parametrize('offset_hours, expected_envelopes', [
+    @pytest.mark.parametrize('offset_hours, expected_escalations', [
         pytest.param(71, 0, id='inside-the-window-suppressed'),
         pytest.param(73, 1, id='outside-the-window-posts'),
     ])
     def test_the_suppression_window_is_the_freshness_window(
-        self, tmp_path, offset_hours, expected_envelopes
+        self, tmp_path, offset_hours, expected_escalations
     ):
         """The boundary, asserted as a RELATION to ``max_age_hours`` rather
         than as a literal.
@@ -565,14 +577,14 @@ class TestEscalation:
             last_recorded_at=datetime.now(UTC) - timedelta(hours=offset_hours),
         )
 
-        _result, envelopes = self._posted(
+        _result, posted = self._posted(
             tmp_path,
             progress_runner=_fails('ERROR: barren streak'),
             max_barren_runs=3,
             max_age_hours=72,
         )
 
-        assert len(envelopes) == expected_envelopes
+        assert len(posted) == expected_escalations
 
     def test_an_unparseable_recorded_at_is_post_worthy_not_suppression_grounds(
         self, tmp_path
@@ -587,27 +599,27 @@ class TestEscalation:
         doc['recorded_at'] = 'not-a-timestamp'
         path.write_text(json.dumps(doc), encoding='utf-8')
 
-        _result, envelopes = self._posted(
+        _result, posted = self._posted(
             tmp_path,
             progress_runner=_fails('ERROR: unparseable recorded_at'),
             max_barren_runs=3,
         )
 
-        assert len(envelopes) == 1
+        assert len(posted) == 1
 
     def test_posts_once_the_nightly_has_gone_silent(self, tmp_path):
         """The nightly escalates once per streak; night four records that it
         did not, so this probe takes over."""
         _seed_state('dark_factory', outcomes=['barren'] * 4, escalated_on=(2,))
 
-        result, envelopes = self._posted(
+        result, posted = self._posted(
             tmp_path,
             progress_runner=_fails('ERROR: barren streak'),
             max_barren_runs=3,
         )
 
-        assert result.exit_code == 1
-        assert len(envelopes) == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
+        assert len(posted) == 1
 
     def test_the_barren_edge_suppression_does_not_apply_to_a_failed_streak(
         self, tmp_path
@@ -616,37 +628,37 @@ class TestEscalation:
         the nightly never fires for it at all."""
         _seed_state('dark_factory', outcomes=['failed', 'failed'])
 
-        result, envelopes = self._posted(
+        result, posted = self._posted(
             tmp_path,
             progress_runner=_fails('ERROR: failed streak'),
             max_barren_runs=3,
         )
 
-        assert result.exit_code == 1
-        assert len(envelopes) == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
+        assert len(posted) == 1
 
     @pytest.mark.parametrize(
-        ('escalated_on', 'expected_envelopes'),
+        ('escalated_on', 'expected_escalations'),
         [
             pytest.param((4,), 0, id='nightly-at-5-escalated-tonight'),
             pytest.param((2,), 1, id='nightly-at-3-escalated-two-nights-ago'),
         ],
     )
     def test_a_non_default_threshold_reads_the_recorded_fact(
-        self, tmp_path, escalated_on, expected_envelopes
+        self, tmp_path, escalated_on, expected_escalations
     ):
         """BOUNDARY ROW 6, probe half. The probe's threshold never decides
         the suppression: re-deriving it from the CLI value stayed silent
         on a night (streak == threshold) on which no nightly had posted."""
         _seed_state('dark_factory', outcomes=['barren'] * 5, escalated_on=escalated_on)
 
-        _result, envelopes = self._posted(
+        _result, posted = self._posted(
             tmp_path,
             progress_runner=_fails('ERROR: barren streak'),
             max_barren_runs=5,
         )
 
-        assert len(envelopes) == expected_envelopes
+        assert len(posted) == expected_escalations
 
     def test_a_document_from_before_the_field_posts_and_says_so(self, tmp_path):
         """BOUNDARY ROW 7. A fresh barren-at-threshold document written
@@ -658,28 +670,28 @@ class TestEscalation:
         del doc['barren_escalated']
         path.write_text(json.dumps(doc), encoding='utf-8')
 
-        _result, envelopes = self._posted(
+        _result, posted = self._posted(
             tmp_path,
             progress_runner=_fails('ERROR: barren streak'),
             max_barren_runs=3,
         )
 
-        [(_url, envelope)] = envelopes
-        assert 'barren_escalated unrecorded' in envelope['params']['arguments']['detail']
+        [(_url, arguments)] = posted
+        assert 'barren_escalated unrecorded' in arguments['detail']
 
     def test_a_missing_state_file_is_post_worthy_not_suppression_grounds(
         self, tmp_path
     ):
-        result, envelopes = self._posted(
+        result, posted = self._posted(
             tmp_path, progress_runner=_fails('ERROR: never recorded a run'),
         )
 
-        assert len(envelopes) == 1
+        assert len(posted) == 1
 
     def test_a_raising_poster_is_swallowed_best_effort(self, tmp_path, caplog):
-        """Mirrors ``nightly::post_escalation``'s contract: a down
-        escalation server must never mask the verdict."""
-        def _boom(url, envelope):
+        """A down escalation server must never mask the verdict, and the
+        finding reaches the journal before the post is tried."""
+        def _boom(url, arguments):
             raise RuntimeError('escalation server is down')
 
         config_path = _write_project_config(tmp_path, project_id='dark_factory')
@@ -694,9 +706,13 @@ class TestEscalation:
                 poster=_boom,
             )
 
-        assert result.exit_code == 1, 'the verdict is unchanged'
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED, 'the verdict is unchanged'
         assert result.escalated is False
         assert len([r for r in caplog.records if r.levelname == 'WARNING']) == 1
+        [journaled] = [r.getMessage() for r in caplog.records if r.levelname == 'ERROR']
+        assert journaled.startswith(
+            'legibility trickle health: progress probe(s) FAILED for project dark_factory -- '
+        )
 
     def test_an_absent_config_degrades_to_a_loud_verdict_not_a_traceback(
         self, tmp_path
@@ -707,27 +723,30 @@ class TestEscalation:
             progress_runner=_fails('ERROR: barren streak'),
             liveness_runner=_ok,
             census_runner=_ok,
-            poster=lambda url, envelope: None,
+            poster=lambda url, arguments: None,
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
         assert result.escalated is False
 
-    def test_the_default_poster_is_not_reached_when_one_is_injected(
-        self, tmp_path, install_fake_httpx
-    ):
-        """Belt to the injection braces: no real POST to localhost may
-        escape even if the default poster is somehow reached."""
-        posts = []
-        install_fake_httpx(lambda *a, **kw: posts.append((a, kw)))
+    def test_under_pytest_the_default_poster_refuses_a_real_post(self, tmp_path):
+        with StubMcpServer(stateful=True) as server:
+            port = int(server.url.rsplit(':', 1)[1])
+            config_path = _write_project_config(
+                tmp_path, project_id='dark_factory', escalation_port=port,
+            )
+            result = check_trickle_health.run_health_check(
+                project_id='dark_factory',
+                config_path=config_path,
+                progress_runner=_fails('ERROR: barren streak'),
+                liveness_runner=_ok,
+                census_runner=_ok,
+            )
+            requests = server.requests
 
-        result, envelopes = self._posted(
-            tmp_path, progress_runner=_fails('ERROR: barren streak'),
-        )
-
-        assert len(envelopes) == 1
-        assert posts == [], 'the injected poster must be the only one used'
-        assert result.escalated is True
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
+        assert result.escalated is False
+        assert requests == ()
 
 
 class TestProjectIdResolution:
@@ -742,7 +761,7 @@ class TestProjectIdResolution:
     progress probe resolving ``.../legibility//trickle-state.json`` and
     reporting ``missing``, the liveness probe interrogating the literal
     TEMPLATE unit ``legibility-trickle@.service``. With a reachable server
-    it also POSTS one envelope stamped
+    it also POSTS one escalation stamped
     ``task_id=legibility-trickle-health-<project>``: a fabricated alarm
     attributed to a healthy project.
 
@@ -771,7 +790,7 @@ class TestProjectIdResolution:
             progress_runner=self._recorder(progress_calls),
             liveness_runner=self._recorder(liveness_calls),
             census_runner=self._recorder(census_calls),
-            poster=lambda url, envelope: None,
+            poster=lambda url, arguments: None,
         )
 
         assert progress_calls == ['proj_a']
@@ -786,7 +805,7 @@ class TestProjectIdResolution:
 
     def test_config_only_on_a_healthy_project_is_quiet(self, tmp_path):
         """The operator-visible consequence, end to end."""
-        envelopes = []
+        posted = []
         config_path = _write_project_config(tmp_path, project_id='proj_a')
 
         result = check_trickle_health.run_health_check(
@@ -795,12 +814,12 @@ class TestProjectIdResolution:
             progress_runner=_ok,
             liveness_runner=_ok,
             census_runner=_ok,
-            poster=lambda url, envelope: envelopes.append(envelope),
+            poster=lambda url, arguments: posted.append(arguments),
         )
 
-        assert result.exit_code == 0
+        assert result.exit_code == check_trickle_health.EXIT_HEALTHY
         assert result.escalated is False
-        assert envelopes == []
+        assert posted == []
         assert 'proj_a' in result.reason
         assert 'for :' not in result.reason, (
             'the exact legibility artefact the empty project id produced'
@@ -822,21 +841,21 @@ class TestProjectIdResolution:
             progress_runner=self._recorder(progress_calls),
             liveness_runner=self._recorder(liveness_calls),
             census_runner=self._recorder(census_calls),
-            poster=lambda url, envelope: None,
+            poster=lambda url, arguments: None,
         )
 
         assert progress_calls == ['dark_factory']
         assert liveness_calls == ['dark_factory']
         assert census_calls == ['dark_factory']
 
-    def test_the_envelope_names_the_project_that_was_actually_probed(
+    def test_the_escalation_names_the_project_that_was_actually_probed(
         self, tmp_path
     ):
         """The precedence rule must hold for the ESCALATION too, not only
         for the probes.
 
         MEASURED before this test was written:
-        ``_build_escalation_arguments`` derived its project id from
+        the escalation builder derived its project id from
         ``cfg.project_id`` while both probes ran with the RESOLVED one, so
         ``--project-id dark_factory --config <reify yaml>`` probed
         dark_factory and filed
@@ -845,7 +864,7 @@ class TestProjectIdResolution:
         identity-divergence class GAP 3 closed at the path layer, one
         layer up: the id that names the finding must be the id that
         produced it."""
-        envelopes = []
+        posted = []
         config_path = _write_project_config(tmp_path, project_id='proj_a')
 
         result = check_trickle_health.run_health_check(
@@ -854,13 +873,14 @@ class TestProjectIdResolution:
             progress_runner=_fails('ERROR: never recorded a run'),
             liveness_runner=_ok,
             census_runner=_ok,
-            poster=lambda url, envelope: envelopes.append(envelope),
+            poster=lambda url, arguments: posted.append(arguments),
         )
 
-        assert result.exit_code == 1
-        assert len(envelopes) == 1
-        arguments = envelopes[0]['params']['arguments']
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
+        assert len(posted) == 1
+        arguments = posted[0]
         assert arguments['task_id'] == 'legibility-trickle-health-dark_factory'
+        assert arguments['agent_role'] == 'legibility-trickle-health'
         assert 'proj_a' not in arguments['task_id']
         assert 'proj_a' not in arguments['summary'], (
             'the summary must name the project that was probed, not the '
@@ -881,7 +901,7 @@ class TestProjectIdResolution:
         Non-zero rather than 0 because ``_invoke``'s own rule — a probe
         that cannot run is not evidence of health — applies a fortiori to a
         probe that was never invoked."""
-        envelopes = []
+        posted = []
         progress_calls, liveness_calls, census_calls = [], [], []
         config_path = tmp_path / 'nope' / 'legibility.yaml'
 
@@ -891,12 +911,12 @@ class TestProjectIdResolution:
             progress_runner=self._recorder(progress_calls),
             liveness_runner=self._recorder(liveness_calls),
             census_runner=self._recorder(census_calls),
-            poster=lambda url, envelope: envelopes.append(envelope),
+            poster=lambda url, arguments: posted.append(arguments),
         )
 
-        assert result.exit_code == 1
+        assert result.exit_code == check_trickle_health.EXIT_UNRESOLVED
         assert result.escalated is False
-        assert envelopes == []
+        assert posted == []
         assert progress_calls == [], 'the progress probe must never be invoked'
         assert liveness_calls == [], 'the liveness probe must never be invoked'
         assert census_calls == [], 'the census probe must never be invoked'
@@ -908,7 +928,7 @@ class TestProjectIdResolution:
     def test_the_escalation_path_never_sees_an_empty_project_id(self, tmp_path):
         """The half of the defect that reaches an operator's inbox rather
         than a journal."""
-        envelopes = []
+        posted = []
         config_path = _write_project_config(tmp_path, project_id='proj_a')
 
         result = check_trickle_health.run_health_check(
@@ -917,12 +937,12 @@ class TestProjectIdResolution:
             progress_runner=_fails('ERROR: never recorded a run'),
             liveness_runner=_ok,
             census_runner=_ok,
-            poster=lambda url, envelope: envelopes.append(envelope),
+            poster=lambda url, arguments: posted.append(arguments),
         )
 
-        assert result.exit_code == 1
-        assert len(envelopes) == 1
-        arguments = envelopes[0]['params']['arguments']
+        assert result.exit_code == check_trickle_health.EXIT_DEGRADED
+        assert len(posted) == 1
+        arguments = posted[0]
         assert arguments['task_id'] == 'legibility-trickle-health-proj_a'
         assert 'for :' not in arguments['summary']
         assert 'for :' not in arguments['detail']
@@ -1030,10 +1050,10 @@ class TestTheDefaultRunnersReallyExecute:
             config_path=tmp_path / 'absent' / 'legibility.yaml',
             liveness_runner=_ok,
             census_runner=_ok,
-            poster=lambda url, envelope: None,
+            poster=lambda url, arguments: None,
         )
 
-        assert result.exit_code == 0
+        assert result.exit_code == check_trickle_health.EXIT_HEALTHY
         assert result.progress_ok is True
         assert 'OK:' in result.progress_output
         assert 'proj_defaults_e2e' in result.progress_output
@@ -1073,3 +1093,39 @@ class TestTheDefaultRunnersReallyExecute:
         assert returncode == 1
         assert 'no-such-binary' in output
         assert 'not evidence of health' in output
+
+
+class TestNoVerdictIsNeverAVerdictCode:
+    """A crash and a verdict are distinguishable by exit status alone —
+    the property ``check_trickle_health_liveness.sh`` relies on. Runs the
+    REAL script, because Python's own uncaught-exception status is what a
+    top-level import failure produces, and no in-process call reaches it."""
+
+    @pytest.mark.parametrize('argv, stderr_marker', [
+        pytest.param(
+            [
+                sys.executable, '-c',
+                "import runpy, sys; sys.modules['legibility.alarm'] = None; "
+                f"sys.argv = [{str(SCRIPT)!r}, '--project-id', 'proj_a']; "
+                f"runpy.run_path({str(SCRIPT)!r}, run_name='__main__')",
+            ],
+            'ModuleNotFoundError',
+            id='import-failure',
+        ),
+        pytest.param([sys.executable, str(SCRIPT)], 'usage', id='usage-error'),
+    ])
+    def test_a_run_that_reaches_no_verdict_exits_with_neither_verdict_code(
+        self, argv, stderr_marker
+    ):
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=60, check=False,
+        )
+
+        assert completed.returncode not in (
+            check_trickle_health.EXIT_HEALTHY, check_trickle_health.EXIT_DEGRADED,
+        ), (
+            f'exit {completed.returncode} is a verdict code, so a liveness '
+            f'probe would read this crash as a verdict.\n'
+            f'stdout: {completed.stdout}\nstderr: {completed.stderr}'
+        )
+        assert stderr_marker in completed.stderr, completed.stderr

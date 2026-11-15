@@ -4,9 +4,22 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from shared.cancel_dispositions import (
+    ChildRelation,
+    ChildRow,
+    DispositionSource,
+    RepointDisposition,
+    children_to_json,
+    parse_children,
+    qualified_task_ref,
+    rows_to_json,
+    stamp_entry,
+)
+from shared.task_statuses import TaskStatus
 
 from escalation.models import (
     BORN_AT_L2_SEVERITIES,
@@ -14,10 +27,14 @@ from escalation.models import (
     RESOLUTION_CLASSES,
     SEVERITY_RANK,
     Amendment,
+    DeliveredCheckOwner,
     Escalation,
     EvidenceEntry,
+    EwaRateTripFacts,
     IndexHealthState,
     LateResolution,
+    ParkStopTripFacts,
+    ReviewDueState,
     TrainState,
     max_severity,
     normalised_severity,
@@ -485,6 +502,309 @@ class TestEscalationIndexHealthField:
         )
 
 
+class TestEscalationDeliveredCheckOwnerField:
+    """Escalation carries the failing delivered check's owner as data (task 7514).
+
+    A `dependency_capability` record's task is the blocked DEPENDENT; the
+    check belongs to the dependency named here. Same additive zero-migration
+    contract as `index_health`.
+    """
+
+    _OWNER: DeliveredCheckOwner = {
+        'task_id': '5405',
+        'check_name': 'pattern-module-substrate',
+        'sidecar': {
+            'path': 'docs/prds/v0_6/eradicate-silent-undef.capability-manifest.yaml',
+            'on_main': 'declares',
+        },
+    }
+    _OWNER_WITHOUT_SIDECAR: DeliveredCheckOwner = {
+        'task_id': '6371',
+        'check_name': 'x-cap',
+        'sidecar': None,
+    }
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-5542-0001',
+            'task_id': '5542',
+            'agent_role': 'orchestrator-scheduler',
+            'severity': 'critical',
+            'category': 'dependency_capability',
+            'summary': 'DEP_CAPABILITY_NOT_DELIVERED: task 5542 - dep 5405 done',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_default_is_none_and_surfaces_in_to_dict(self):
+        esc = self._make_base_esc()
+        assert esc.delivered_check_owner is None
+        assert esc.to_dict()['delivered_check_owner'] is None
+
+    @pytest.mark.parametrize('owner', [_OWNER, _OWNER_WITHOUT_SIDECAR])
+    def test_round_trip_via_to_dict_from_dict(self, owner):
+        esc = self._make_base_esc(delivered_check_owner=owner)
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.delivered_check_owner == owner
+
+    @pytest.mark.parametrize('owner', [_OWNER, _OWNER_WITHOUT_SIDECAR])
+    def test_round_trip_via_to_json_from_json(self, owner):
+        esc = self._make_base_esc(delivered_check_owner=owner)
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.delivered_check_owner == owner
+        assert restored.to_json() == esc.to_json()
+
+    def test_legacy_json_without_the_key_deserialises_to_none(self):
+        payload = self._make_base_esc().to_dict()
+        del payload['delivered_check_owner']
+        restored = Escalation.from_json(json.dumps(payload))
+        assert restored.delivered_check_owner is None
+
+
+
+class TestReviewDueField:
+    """Escalation carries the human gate's review_due payload (PRD
+    completion-driven-triggers C4). Same additive zero-migration contract as
+    `index_health`."""
+
+    _FINAL: ReviewDueState = {
+        'skill': 'review',
+        'project_id': 'dark_factory',
+        'project_root': '/home/leo/src/dark-factory',
+        'run_id': 'review-dark_factory-20261004',
+        'human_gate_task_id': '42',
+        'completion_gate_task_id': '41',
+        'verdict': {'verdict': 'pass', 'share': 0.75, 'by_priority': {'high': [3, 1, 0]}},
+        'fired_at': '2026-10-05T00:00:00+00:00',
+        'launched_from': 'esc-42-1',
+    }
+    _INTERIM: ReviewDueState = {
+        **_FINAL,
+        'completion_gate_task_id': None,
+        'verdict': None,
+    }
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-42-1',
+            'task_id': '42',
+            'agent_role': 'orchestrator-deterministic',
+            'severity': 'critical',
+            'category': 'review_due',
+            'summary': 'Run /review on dark_factory (review-dark_factory-20261004 landed)',
+            'level': 2,
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_default_is_none_and_surfaces_in_to_dict(self):
+        esc = self._make_base_esc()
+        assert esc.review_due is None
+        d = esc.to_dict()
+        assert 'review_due' in d
+        assert d['review_due'] is None
+
+    @pytest.mark.parametrize('payload', [_FINAL, _INTERIM], ids=['final', 'interim'])
+    def test_round_trip_via_to_dict_from_dict(self, payload):
+        esc = self._make_base_esc(review_due=payload)
+        restored = Escalation.from_dict(esc.to_dict())
+        assert restored.review_due == payload
+
+    @pytest.mark.parametrize('payload', [_FINAL, _INTERIM], ids=['final', 'interim'])
+    def test_round_trip_via_to_json_from_json(self, payload):
+        esc = self._make_base_esc(review_due=payload)
+        restored = Escalation.from_json(esc.to_json())
+        assert restored.review_due == payload
+        assert restored.to_json() == esc.to_json()
+
+    def test_legacy_json_without_the_key_deserialises_to_none(self):
+        payload = self._make_base_esc().to_dict()
+        del payload['review_due']
+        restored = Escalation.from_json(json.dumps(payload))
+        assert restored.review_due is None
+
+_EWA_RATE_TRIP: EwaRateTripFacts = {
+    'ewa': 73.59,
+    'threshold': 24.6,
+    'ratio': 82.0,
+    'window_secs': 3600.0,
+    'dones_in_window': 1,
+    'submissions_in_step': 82,
+}
+
+_PARK_STOP_TRIP: ParkStopTripFacts = {
+    'blocked_in_window': 15,
+    'window_secs': 3600.0,
+    'threshold': 15,
+}
+
+
+class TestEscalationTripFactsFields:
+    """A non-halting pause detector's escalation carries its trip facts as fields.
+
+    PRD scheduler-pause-halt-retirement §6 invariant 5 (INV-2): no consumer
+    scrapes prose for a number the detector held in a variable.
+    """
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-orchestrator-0001',
+            'task_id': 'orchestrator',
+            'agent_role': 'orchestrator',
+            'severity': 'blocking',
+            'category': 'task_failure',
+            'summary': 'pause detector tripped',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_both_default_to_none_and_serialise_as_none(self):
+        esc = self._make_base_esc()
+
+        assert esc.ewa_rate_trip is None
+        assert esc.park_stop_trip is None
+        d = esc.to_dict()
+        assert d['ewa_rate_trip'] is None
+        assert d['park_stop_trip'] is None
+
+    def test_ewa_rate_trip_round_trips_with_numeric_types(self):
+        esc = self._make_base_esc(ewa_rate_trip=_EWA_RATE_TRIP)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.ewa_rate_trip == _EWA_RATE_TRIP
+        assert restored.ewa_rate_trip is not None
+        assert type(restored.ewa_rate_trip['dones_in_window']) is int
+        assert type(restored.ewa_rate_trip['submissions_in_step']) is int
+        assert type(restored.ewa_rate_trip['window_secs']) is float
+        assert type(restored.ewa_rate_trip['ewa']) is float
+
+    def test_park_stop_trip_round_trips_with_numeric_types(self):
+        esc = self._make_base_esc(park_stop_trip=_PARK_STOP_TRIP)
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.park_stop_trip == _PARK_STOP_TRIP
+        assert restored.park_stop_trip is not None
+        assert type(restored.park_stop_trip['blocked_in_window']) is int
+        assert type(restored.park_stop_trip['threshold']) is int
+        assert type(restored.park_stop_trip['window_secs']) is float
+
+    def test_legacy_json_without_either_key_reads_none(self):
+        legacy = self._make_base_esc().to_dict()
+        del legacy['ewa_rate_trip']
+        del legacy['park_stop_trip']
+
+        restored = Escalation.from_json(json.dumps(legacy))
+
+        assert restored.ewa_rate_trip is None
+        assert restored.park_stop_trip is None
+
+
+_CANCEL_PARENT = 5869
+_CANCEL_PROJECT = 'dark_factory'
+
+
+def _cancel_child_row() -> ChildRow:
+    return ChildRow(
+        id=6905,
+        project_id=_CANCEL_PROJECT,
+        title='repoint me',
+        status=TaskStatus.PENDING,
+        relation=ChildRelation.DEPENDENT,
+        declared_files_total=2,
+        declared_files_missing_from_main=('a.py',),
+        declared_files_missing_from_main_total=1,
+        depends_on_superseder=False,
+        named_superseder=False,
+        has_live_children=False,
+        existing_disposition=stamp_entry(
+            RepointDisposition(onto=(8032,)),
+            parent=qualified_task_ref(_CANCEL_PROJECT, _CANCEL_PARENT),
+            stamped_at=datetime(2026, 11, 3, 12, 0, tzinfo=UTC),
+            stamped_by='claude-x',
+            source=DispositionSource.CANCELLER,
+        ),
+    )
+
+
+def _parse_cancel_children(raw: object):
+    return parse_children(raw, parent_id=_CANCEL_PARENT, parent_project_id=_CANCEL_PROJECT)
+
+
+class TestEscalationCancelChildrenFields:
+    """A cancel-with-children residue or abandon record carries the contract as plain JSON.
+
+    plans/cancel-with-children-prd.md §4.11-§4.12: the rows and the map cross this record's
+    JSON boundary through shared.cancel_dispositions' one serializer each, and re-validate.
+    """
+
+    def _make_base_esc(self, **kwargs) -> Escalation:
+        base: dict[str, Any] = {
+            'id': 'esc-5869-1',
+            'task_id': str(_CANCEL_PARENT),
+            'agent_role': 'reconciliation',
+            'severity': 'blocking',
+            'category': 'scope_violation',
+            'summary': 'cancelled parent left live children',
+        }
+        base.update(kwargs)
+        return Escalation(**base)
+
+    def test_all_three_default_to_none_and_serialise_as_none(self):
+        esc = self._make_base_esc()
+
+        assert (esc.cancel_children, esc.children, esc.superseded_by) == (None, None, None)
+        d = esc.to_dict()
+        assert (d['cancel_children'], d['children'], d['superseded_by']) == (None, None, None)
+
+    def test_cancel_children_rows_round_trip_and_revalidate(self):
+        row = _cancel_child_row()
+        esc = self._make_base_esc(cancel_children=rows_to_json([row]))
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.cancel_children == rows_to_json([row])
+        assert restored.cancel_children is not None
+        assert ChildRow.model_validate(restored.cancel_children[0]) == row
+
+    def test_children_map_round_trips_and_reparses(self):
+        parsed = _parse_cancel_children(
+            {
+                '6905': {'action': 'repoint', 'onto': [8032]},
+                'reify:44': {'action': 'repoint', 'onto': [8033]},
+            }
+        )
+        esc = self._make_base_esc(children=children_to_json(parsed))
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.children is not None
+        assert _parse_cancel_children(restored.children) == parsed
+
+    def test_superseded_by_round_trips_as_ints(self):
+        esc = self._make_base_esc(superseded_by=[8032, 8033])
+
+        restored = Escalation.from_json(esc.to_json())
+
+        assert restored.superseded_by == [8032, 8033]
+        assert restored.superseded_by is not None
+        assert all(type(task_id) is int for task_id in restored.superseded_by)
+
+    def test_legacy_json_without_the_three_keys_reads_none(self):
+        legacy = self._make_base_esc().to_dict()
+        for key in ('cancel_children', 'children', 'superseded_by'):
+            del legacy[key]
+
+        restored = Escalation.from_json(json.dumps(legacy))
+
+        assert (restored.cancel_children, restored.children, restored.superseded_by) == (
+            None,
+            None,
+            None,
+        )
+
+
 class TestEscalationResolutionAction:
     """Escalation dataclass has a resolution_action field (C1 § action enum for resolve_issue)."""
 
@@ -621,7 +941,7 @@ class TestEscalationResolutionClass:
     def test_resolution_classes_contains_exactly_the_legal_values(self):
         """RESOLUTION_CLASSES contains exactly {'benign', 'actionable',
         'moot-terminal-subject', 'stale-strand', 'addressed', 'observation-consumed',
-        'converted', 'status-info'} — no extras.
+        'converted', 'status-info', 'note-to-file'} — no extras.
 
         'moot-terminal-subject' is the distinct, non-benign stamp the task-2724
         revalidation sweep writes.
@@ -635,11 +955,15 @@ class TestEscalationResolutionClass:
 
         'addressed', 'observation-consumed', 'converted' and 'status-info' are
         the info-L0 disposition classes of plans/info-l0-disposition-router-prd.md D14.
+
+        'note-to-file' is the filer-declared note-to-file class of
+        plans/plan-deviation-recording-prd.md D2.
         """
         assert (
             frozenset({
                 'benign', 'actionable', 'moot-terminal-subject', 'stale-strand',
                 'addressed', 'observation-consumed', 'converted', 'status-info',
+                'note-to-file',
             })
             == RESOLUTION_CLASSES
         )
@@ -2108,3 +2432,39 @@ class TestEscalationProjectId:
         assert restored.project_id is None, (
             f'Expected project_id=None for legacy JSON, got {restored.project_id!r}'
         )
+
+
+class TestNoteToFileField:
+    """`note_to_file` — a filer-declared record that requests nothing
+    (plans/plan-deviation-recording-prd.md D2).
+
+    These tests pin the FIELD's default and round-trip only; the never-pending
+    invariant is pinned at its enforcement points in test_note_to_file.py.
+    """
+
+    def _make_base_esc(self, **overrides) -> Escalation:
+        return Escalation(
+            id='esc-5751-1',
+            task_id='5751',
+            agent_role='implementer',
+            severity='info',
+            category='design_concern',
+            summary='test escalation for note_to_file',
+            **overrides,
+        )
+
+    def test_note_to_file_default_is_false(self):
+        """Escalation constructed without note_to_file has note_to_file=False."""
+        assert self._make_base_esc().note_to_file is False
+
+    def test_from_dict_legacy_dict_omits_note_to_file(self):
+        """from_dict() on a dict without the note_to_file key yields False — zero migration."""
+        legacy = self._make_base_esc().to_dict()
+        del legacy['note_to_file']
+        assert Escalation.from_dict(legacy).note_to_file is False
+
+    def test_note_to_file_round_trips(self):
+        """note_to_file=True survives to_dict/from_dict and to_json/from_json."""
+        esc = self._make_base_esc(note_to_file=True)
+        assert Escalation.from_dict(esc.to_dict()).note_to_file is True
+        assert Escalation.from_json(esc.to_json()).note_to_file is True

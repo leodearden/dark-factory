@@ -4,7 +4,7 @@
    consumers can destructure from the global.
 
    Exports: window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo,
-             disambiguateLabels, labelFor, lockChipState, lockChipStateFor }
+             disambiguateLabels, labelFor, lockChipStateFor }
    (Canonical list: the window.DF_SCHED_UTILS assignment at the bottom of this file.)
 */
 
@@ -111,13 +111,12 @@ function labelFor(paths) {
   return disambiguateLabels(paths || []);
 }
 
-// The single lock classifier: the holder > parked > free precedence, read by
-// LockChip (tabs.jsx), the Task-detail chips (tab_tasks.jsx) and the Scheduler
-// heatmap's cellStateFor (scheduler_heatmap.jsx), so one lock reads the same in
-// all three.
+// The holder > parked > free precedence. Its callers, LockChip (tabs.jsx), the
+// Task-detail ModuleLocksSection (tab_tasks.jsx) and the Scheduler heatmap's
+// cellStateFor (scheduler_heatmap.jsx), all reach it through lockChipStateFor,
+// the module's only classifier export, so one lock reads the same in all three.
 // Returns { cls, hint, ownerLabel } where ownerLabel is null when the chip has
 // no owner to display (lock-free or lock-mine without a counterpart label).
-// Callers holding a SCHEDULER.modules entry go through lockChipStateFor.
 function lockChipState({ holder, isMine, parkedBy, parkedOwnerLive }) {
   if (holder) {
     if (isMine) return { cls: 'lock-mine', hint: 'held by this task', ownerLabel: null };
@@ -143,4 +142,4 @@ function lockChipStateFor(module, taskId, project) {
   });
 }
 
-window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels, labelFor, lockChipState, lockChipStateFor };
+window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels, labelFor, lockChipStateFor };

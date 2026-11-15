@@ -13,6 +13,7 @@ terminal-status watcher does.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -30,6 +31,7 @@ from _workflow_helpers import (
 from orchestrator.config import GitConfig, OrchestratorConfig, SandboxConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
+from orchestrator.harness import TaskReport
 from orchestrator.scheduler import Scheduler, TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import WorkflowState
@@ -40,6 +42,10 @@ pytestmark = pytest.mark.usefixtures(_derive_meta_root_like_production.__name__)
 TID = '42'
 GRACE = 0.5
 BARRIER = 45.0
+WEDGE_ALONE_OR_WITH_THE_GIT_CLEANUP = (
+    ['stop_claimant_heartbeat'],
+    ['stop_claimant_heartbeat', 'cleanup_done_worktree'],
+)
 
 
 class _HeartbeatSurvivesOneCancel(FakeScheduler):
@@ -70,7 +76,7 @@ class _HeartbeatSurvivesOneCancel(FakeScheduler):
 def config(tmp_path: Path) -> OrchestratorConfig:
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return OrchestratorConfig(
         project_root=repo,
         max_concurrent_tasks=1,
@@ -81,11 +87,24 @@ def config(tmp_path: Path) -> OrchestratorConfig:
     )
 
 
-@pytest.mark.asyncio
-@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
-async def test_real_workflow_blocking_after_done_releases_slot_and_locks_at_hard_cancel(
-    config: OrchestratorConfig, monkeypatch: pytest.MonkeyPatch,
-):
+@dataclass(frozen=True)
+class _Unwound:
+    slot: asyncio.Task[TaskReport | None]
+    sem: asyncio.Semaphore
+    scheduler: Scheduler
+    events: MagicMock
+
+
+class _WorktreeCleanupNeverReturns(GitOps):
+    """A worktree removal that ends only when cancelled, so the entry after the wedge overruns its grace."""
+
+    async def cleanup_worktree(self, worktree: Path, branch: str) -> None:
+        await asyncio.Event().wait()
+
+
+async def _hard_cancel_a_slot_wedged_after_done(
+    config: OrchestratorConfig, monkeypatch: pytest.MonkeyPatch, git_ops: GitOps,
+) -> _Unwound:
     assignment = TaskAssignment(
         task_id=TID,
         task={
@@ -106,7 +125,7 @@ async def test_real_workflow_blocking_after_done_releases_slot_and_locks_at_hard
             passed=True, test_output='OK', lint_output='', type_output='', summary='All checks passed',
         )),
     )
-    workflow, fake_scheduler = _build_workflow(config, GitOps(config.git, config.project_root), assignment, stub)
+    workflow, fake_scheduler = _build_workflow(config, git_ops, assignment, stub)
     wedging_scheduler = _HeartbeatSurvivesOneCancel()
     monkeypatch.setattr(workflow, 'scheduler', wedging_scheduler)
 
@@ -135,14 +154,46 @@ async def test_real_workflow_blocking_after_done_releases_slot_and_locks_at_hard
             harness.hard_cancel_workflow(TID, reason='terminal_status_cancel')
             await asyncio.wait({slot}, timeout=GRACE / 5)
 
-    assert slot.done(), 'the hard-cancelled slot never unwound'
-    assert not slot.cancelled()
-    assert not sem.locked(), 'the slot semaphore was not released'
-    assert not scheduler.lock_table.is_held(TID), 'the module locks were not released'
-    emitted = [c.args[0] for c in events.emit.call_args_list if c.args]
+    return _Unwound(slot=slot, sem=sem, scheduler=scheduler, events=events)
+
+
+def _assert_released_with_the_wedge_abandoned(unwound: _Unwound) -> list[str]:
+    """The wedge is always abandoned; cleanup_done_worktree, the only later entry here that waits on real git, may legitimately overrun the test's short grace too.
+
+    The other entries are instant in this harness: no steward, no escalation queue, no warm-lane pool so release_lane returns at once, and a synchronous cleanup_config_dir.
+    """
+    assert unwound.slot.done(), 'the hard-cancelled slot never unwound'
+    assert not unwound.slot.cancelled()
+    assert not unwound.sem.locked(), 'the slot semaphore was not released'
+    assert not unwound.scheduler.lock_table.is_held(TID), 'the module locks were not released'
+    emitted = [c.args[0] for c in unwound.events.emit.call_args_list if c.args]
     assert EventType.task_completed in emitted
     abandoned = [
-        c.kwargs['data']['entries'] for c in events.emit.call_args_list
+        c.kwargs['data']['entries'] for c in unwound.events.emit.call_args_list
         if c.args and c.args[0] is EventType.workflow_cleanup_abandoned
     ]
-    assert abandoned == [['stop_claimant_heartbeat']]
+    assert len(abandoned) == 1
+    assert abandoned[0] in WEDGE_ALONE_OR_WITH_THE_GIT_CLEANUP
+    return abandoned[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+async def test_real_workflow_blocking_after_done_releases_slot_and_locks_at_hard_cancel(
+    config: OrchestratorConfig, monkeypatch: pytest.MonkeyPatch,
+):
+    unwound = await _hard_cancel_a_slot_wedged_after_done(
+        config, monkeypatch, GitOps(config.git, config.project_root),
+    )
+    _assert_released_with_the_wedge_abandoned(unwound)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+async def test_a_cleanup_entry_that_also_overruns_its_grace_is_abandoned_with_the_wedge(
+    config: OrchestratorConfig, monkeypatch: pytest.MonkeyPatch,
+):
+    unwound = await _hard_cancel_a_slot_wedged_after_done(
+        config, monkeypatch, _WorktreeCleanupNeverReturns(config.git, config.project_root),
+    )
+    assert _assert_released_with_the_wedge_abandoned(unwound) == ['stop_claimant_heartbeat', 'cleanup_done_worktree']

@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.audit_trail_rotation import ARCHIVE_AGENT_ID
 
@@ -38,8 +39,9 @@ class _RecordingMemoryService:
     transposition in the adapter would read the wrong scope as a miss.
     """
 
-    def __init__(self, *, memory_ids=('mem-1',), record=None):
+    def __init__(self, *, memory_ids=('mem-1',), stores_pending_retry=(), record=None):
         self.memory_ids = list(memory_ids)
+        self.stores_pending_retry = list(stores_pending_retry)
         self.record = record
         self.calls = []
 
@@ -48,7 +50,9 @@ class _RecordingMemoryService:
             ('add_memory', (), {'content': content, 'category': category,
                                 'project_id': project_id, **kwargs})
         )
-        return AddMemoryResponse(memory_ids=self.memory_ids)
+        return AddMemoryResponse(
+            memory_ids=self.memory_ids, stores_pending_retry=self.stores_pending_retry
+        )
 
     async def get_memory_by_id(self, project_id, memory_id):
         self.calls.append(('get_memory_by_id', (project_id, memory_id), {}))
@@ -91,6 +95,27 @@ class TestAuditTrailArchiveWiring:
         assert kwargs['project_id'] == 'dark_factory'
         assert kwargs['agent_id'] == ARCHIVE_AGENT_ID
         assert kwargs['metadata'] == _ARCHIVE_METADATA
+
+    @pytest.mark.asyncio
+    async def test_write_opts_out_of_mem0_retry_deferral(self):
+        """A deferred archive record would land after the rotation gave up on
+        it, as an orphan nothing points at."""
+        svc = _RecordingMemoryService()
+        archive = _wire(svc).archive
+        await archive.write(
+            project_id='dark_factory', content='X', metadata=dict(_ARCHIVE_METADATA)
+        )
+        [(_, _, kwargs)] = svc.calls
+        assert kwargs['defer_transient_mem0_failure'] is False
+
+    @pytest.mark.asyncio
+    async def test_write_reports_a_write_pending_retry_as_none(self):
+        svc = _RecordingMemoryService(memory_ids=(), stores_pending_retry=(SourceStore.mem0,))
+        archive = _wire(svc).archive
+        got = await archive.write(
+            project_id='dark_factory', content='X', metadata=dict(_ARCHIVE_METADATA)
+        )
+        assert got is None
 
     @pytest.mark.asyncio
     async def test_write_reports_a_swallowed_mem0_failure_as_none(self):

@@ -25,13 +25,14 @@ from unittest.mock import MagicMock
 import pytest
 from _gate_fixtures import TEST_DEPLOYED_SHA, gated_remote_runner
 from _merge_lane_fakes import FakeClock
+from _xdist_crash_fixtures import XDIST_SESSION_ABORTED_OUTPUT
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 from orchestrator.remote_gate import GateIdentity, GateIdentityPair, RunnerUnavailableKind
-from orchestrator.verify import VerifyResult
+from orchestrator.verify import WORKER_DEATH_SUMMARY_MARKER, VerifyResult
 from orchestrator.verify_runner import (
     MergeVerifySpec,
     RunnerUnavailable,
@@ -213,6 +214,43 @@ async def test_a_passing_ensure_readmits_and_the_second_failure_goes_sticky(scen
     assert scene.remote.probes == ['ensure'], 'a sticky bench is not probed at all'
 
 
+@pytest.mark.asyncio
+async def test_a_no_verdict_bench_record_names_the_archived_output(
+    scene: _Scene, tmp_path: Path,
+):
+    """A real no-verdict RunnerUnavailable leads the operator to its archived test log."""
+    wire = result_to_json(VerifyResult(
+        passed=False, test_output=XDIST_SESSION_ABORTED_OUTPUT, lint_output='', type_output='',
+        summary=f'Failures: test leg {WORKER_DEATH_SUMMARY_MARKER}', category='test_failure',
+    ))
+
+    async def run(argv: list[str], *, cwd: object = None) -> tuple[int, str, str]:
+        return (0, wire, 'LAPTOP LOG') if argv[0] == 'ssh' else (0, '', '')
+
+    runner = gated_remote_runner(_HOST, 'leo-laptop', 'leo-laptop', '/project', run=run)
+    archive_root = tmp_path / 'verify-logs'
+
+    async def dispatch_and_bench(task_id: str) -> Path:
+        with pytest.raises(RunnerUnavailable) as excinfo:
+            await runner.run_merge_verify(
+                'mergesha', _spec(), task_id=task_id, archive_root=archive_root,
+            )
+        assert excinfo.value.kind == 'no_verdict'
+        scene.worker.bench_unavailable_runner(_HOST, excinfo.value)
+        return next((archive_root / task_id).glob('attempt-1.remote-laptop.test-*.log'))
+
+    first_test_log = await dispatch_and_bench('3821')
+    assert str(first_test_log) in scene.host()['reason']
+    assert str(first_test_log) in scene.events.of(EventType.verify_host_skew)[0]['reason']
+
+    await scene.tick()
+    assert scene.in_pool()
+
+    second_test_log = await dispatch_and_bench('6215')
+    [l1] = scene.open_l1s()
+    assert str(second_test_log) in l1.detail
+
+
 # ---------------------------------------------------------------------------
 # The D6 table, kind by kind
 # ---------------------------------------------------------------------------
@@ -351,7 +389,26 @@ async def test_readmit_resolves_the_skew_l1(scene: _Scene):
     await scene.tick()
 
     assert scene.open_l1s() == []
-    assert scene.events.of(EventType.verify_host_recovered)[-1]['quarantine_class'] == 'skew'
+    recovered = scene.events.of(EventType.verify_host_recovered)[-1]
+    assert (recovered['quarantine_class'], recovered['evidence']) == ('skew', 'ensure_gate')
+
+
+@pytest.mark.asyncio
+async def test_a_sticky_skew_alarm_resolved_while_benched_reopens_on_the_next_tick(scene: _Scene):
+    """The same re-assert rule as the 'ru' class (task 5290): benched means alarmed."""
+    scene.bench('gate')
+    await scene.tick()
+    scene.bench('gate')
+    [l1] = scene.open_l1s()
+    scene.escalations.resolve(
+        l1.id, 'Self-resolved — occupancy.by_host shows laptop verifying',
+        resolved_by='escalation-watcher',
+    )
+
+    await scene.tick()
+
+    [reopened] = scene.open_l1s()
+    assert (reopened.id != l1.id, reopened.task_id) == (True, l1.task_id)
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +432,22 @@ async def test_the_operator_clear_lifts_a_sticky_bench(scene: _Scene):
     assert scene.open_l1s() == []
     scene.bench('gate')
     assert scene.host()['sticky'] is False, 'a clear resets the count, as a restart does'
+
+
+@pytest.mark.asyncio
+async def test_an_operator_clear_names_itself_as_the_recovery_evidence(scene: _Scene):
+    """Health is not probed on a clear, so the alarm must not say it was (task 5290)."""
+    for _ in range(3):
+        scene.bench('transport')
+    [l1] = scene.open_l1s()
+
+    await scene.worker.clear_host_quarantine(_HOST)
+
+    [resolved] = [esc for esc in scene.escalations.get_by_task(l1.task_id) if esc.id == l1.id]
+    assert resolved.status == 'resolved'
+    assert 'operator_clear' in (resolved.resolution or '')
+    assert 'automatically via SSH' not in (resolved.resolution or '')
+    assert scene.events.of(EventType.verify_host_recovered)[-1]['evidence'] == 'operator_clear'
 
 
 @pytest.mark.asyncio

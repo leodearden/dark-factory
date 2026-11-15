@@ -1,8 +1,8 @@
-"""Transcript reads inside ``_run_subprocess`` must never run on the event loop (task 3925).
+"""Transcript reads inside ``run_cli_subprocess`` must never run on the event loop (task 3925).
 
 THE INVARIANT UNDER TEST
 ────────────────────────
-Every on-disk transcript read reachable from ``_run_subprocess`` —
+Every on-disk transcript read reachable from ``run_cli_subprocess`` —
 ``count_transcript_turns`` in the startup-regime poll and in the working-regime
 progress-extension poll, plus ``read_transcript_records`` in the post-kill
 ``except TimeoutError:`` re-read and on the normal-exit path — must execute on a
@@ -16,7 +16,7 @@ agent session.  Executed inline on the loop by up to ``max_concurrent_tasks``
 agents, that blocking work starves every other coroutine in the process.  The
 sibling rationale is stated at ``run_substrate_recheck`` in
 ``orchestrator/src/orchestrator/harness.py``, and the invariant itself is stated
-once in the source, in the INVARIANT block above ``_run_subprocess``'s watchdog
+once in the source, in the INVARIANT block above ``run_cli_subprocess``'s watchdog
 poll loop.
 
 HOW IT IS TESTED — thread identity, not wall clock
@@ -58,7 +58,7 @@ import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from shared.cli_invoke import _run_subprocess
+from shared.cli_invoke import TranscriptWatch, run_cli_subprocess
 
 # ── Fake process builders ───────────────────────────────────────────────────
 # Copied in spirit from TestRunSubprocessWatchdog._make_hanging_proc
@@ -179,7 +179,7 @@ def _ident_recorder(recorded: list[int], return_value):
     Same closure shape as the existing ``_always_growing_turns`` side-effect
     idiom in ``test_cli_invoke.py``.  Under
     ``asyncio.to_thread`` these list mutations happen on a worker thread; that
-    stays correct because at most one read is in flight per ``_run_subprocess``
+    stays correct because at most one read is in flight per ``run_cli_subprocess``
     and the ``await`` establishes happens-before on both sides.  A future test
     firing CONCURRENT reads would need real synchronisation.
     """
@@ -192,7 +192,7 @@ def _ident_recorder(recorded: list[int], return_value):
 
 
 class TestStartupRegimePollOffLoop:
-    """The startup-regime watchdog poll in ``_run_subprocess`` — the read inside
+    """The startup-regime watchdog poll in ``run_cli_subprocess`` — the read inside
     ``if not seen_turn and config_dir and session_id:`` — must run off the loop."""
 
     async def test_startup_poll_reads_transcript_off_the_loop_thread(self, tmp_path):
@@ -232,17 +232,17 @@ class TestStartupRegimePollOffLoop:
             ),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
         ):
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=5.0, startup_grace_secs=0.05,
-                session_id=sid, config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=5.0,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
 
         assert result.timed_out is False, 'Expected a normal exit, not a kill'
         assert recorded, 'Expected the startup-regime poll to read the transcript at least once'
         assert loop_ident not in recorded, (
             f'count_transcript_turns ran on the event-loop thread ({loop_ident}) — '
-            f'the startup-regime poll in _run_subprocess blocks the shared loop. '
+            f'the startup-regime poll in run_cli_subprocess blocks the shared loop. '
             f'Recorded idents: {sorted(set(recorded))}'
         )
 
@@ -299,10 +299,10 @@ class TestStartupRegimePollOffLoop:
                 patch('shared.cli_invoke.count_transcript_turns', side_effect=blocking_read),
                 patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
             ):
-                await _run_subprocess(
-                    ['fake'], cwd=tmp_path, env={}, model='opus',
-                    timeout_seconds=1.0, startup_grace_secs=0.05,
-                    session_id=sid, config_dir=cfg_dir,
+                await run_cli_subprocess(
+                    ['fake'], cwd=tmp_path, env={},
+                    backend='claude', model='opus', timeout_seconds=1.0,
+                    transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
                 )
         finally:
             ticker_task.cancel()
@@ -318,7 +318,7 @@ class TestStartupRegimePollOffLoop:
 
 
 class TestWorkingRegimeExtensionPollOffLoop:
-    """The working-regime progress-extension poll in ``_run_subprocess`` — the read
+    """The working-regime progress-extension poll in ``run_cli_subprocess`` — the read
     inside ``elif extension_engaged and config_dir and session_id:`` — must run off
     the loop.
 
@@ -377,11 +377,10 @@ class TestWorkingRegimeExtensionPollOffLoop:
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
             patch('shared.cli_invoke._WATCHDOG_WORKING_POLL_SECS', 0.02),
         ):
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.1, startup_grace_secs=0.02,
-                session_id=sid, config_dir=cfg_dir,
-                working_idle_secs=10.0, absolute_cap_secs=5.0,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.1,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.02, working_idle_secs=10.0, absolute_cap_secs=5.0),
             )
 
         assert result.timed_out is False, (
@@ -400,19 +399,19 @@ class TestWorkingRegimeExtensionPollOffLoop:
         )
         assert loop_ident not in recorded, (
             f'count_transcript_turns ran on the event-loop thread ({loop_ident}) — '
-            f'the working-regime progress-extension poll in _run_subprocess blocks '
+            f'the working-regime progress-extension poll in run_cli_subprocess blocks '
             f'the shared loop for every agent, for its entire working lifetime. '
             f'Recorded idents: {sorted(set(recorded))}'
         )
 
 
 class TestTimeoutPathRereadOffLoop:
-    """The one-shot post-kill re-read inside ``_run_subprocess``'s
+    """The one-shot post-kill re-read inside ``run_cli_subprocess``'s
     ``except TimeoutError:`` handler must run off the loop.
 
     This read stamps ``transcript_turns`` (surfaced in
     ``classify_agent_failure``'s ``diagnostic_detail``) and ``model_id`` onto the
-    returned ``_SubprocessResult`` — so both values must still arrive intact
+    returned ``SubprocessResult`` — so both values must still arrive intact
     across the thread hop, not just off-loop.
 
     NOTE ON ISOLATION.  The watchdog polls read through ``count_transcript_turns``,
@@ -447,10 +446,10 @@ class TestTimeoutPathRereadOffLoop:
             ),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
         ):
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.4, startup_grace_secs=0.05,
-                session_id=sid, config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.4,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
 
         assert result.timed_out is True, 'Expected the ceiling kill to fire'
@@ -503,10 +502,10 @@ class TestTimeoutPathRereadOffLoop:
             ),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.05),
         ):
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=0.4, startup_grace_secs=0.05,
-                session_id=None, config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=0.4,
+                transcript=TranscriptWatch(session_id=None, config_dir=cfg_dir, startup_grace_secs=0.05),
             )
 
         assert result.timed_out is True, 'Expected the ceiling kill to fire'
@@ -549,7 +548,7 @@ _ABANDONED_LAUNCH_RECORDS = [
 
 
 class TestNormalExitReadOffLoop:
-    """The normal-exit ``read_transcript_records`` call in ``_run_subprocess`` —
+    """The normal-exit ``read_transcript_records`` call in ``run_cli_subprocess`` —
     after the watchdog loop, outside both try blocks — must run off the loop.
 
     This site had NO direct assertion anywhere in the repo before task 3925 — no
@@ -595,10 +594,10 @@ class TestNormalExitReadOffLoop:
             patch('shared.cli_invoke.count_transcript_turns', return_value=None),
             patch('shared.cli_invoke.read_transcript_records', side_effect=read_recorder),
         ):
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=5.0,
-                session_id=sid, config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=5.0,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir),
             )
 
         assert result.timed_out is False, 'Expected a normal exit, not a kill'
@@ -608,7 +607,7 @@ class TestNormalExitReadOffLoop:
         )
         assert loop_ident not in recorded, (
             f'read_transcript_records ran on the event-loop thread ({loop_ident}) — the '
-            f'normal-exit read in _run_subprocess blocks the shared loop. '
+            f'normal-exit read in run_cli_subprocess blocks the shared loop. '
             f'Recorded idents: {sorted(set(recorded))}'
         )
         assert result.transcript_turns == 2, (
@@ -644,10 +643,10 @@ class TestNormalExitReadOffLoop:
             patch('shared.cli_invoke.count_transcript_turns', return_value=None),
             patch('shared.cli_invoke.read_transcript_records', side_effect=read_recorder),
         ):
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=5.0,
-                session_id=sid, config_dir=None,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=5.0,
+                transcript=TranscriptWatch(session_id=sid, config_dir=None),
             )
 
         assert result.timed_out is False, 'Expected a normal exit, not a kill'
@@ -748,10 +747,10 @@ class TestCompletionRecheckAfterOffLoopRead:
             patch('shared.cli_invoke.read_transcript_records', return_value=[]),
             patch('shared.cli_invoke._WATCHDOG_POLL_SECS', 0.02),
         ):
-            result = await _run_subprocess(
-                ['fake'], cwd=tmp_path, env={}, model='opus',
-                timeout_seconds=5.0, startup_grace_secs=0.0,
-                session_id=sid, config_dir=cfg_dir,
+            result = await run_cli_subprocess(
+                ['fake'], cwd=tmp_path, env={},
+                backend='claude', model='opus', timeout_seconds=5.0,
+                transcript=TranscriptWatch(session_id=sid, config_dir=cfg_dir, startup_grace_secs=0.0),
             )
 
         # Ordered so the property under test fails FIRST: the handshake check is a

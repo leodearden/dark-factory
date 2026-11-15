@@ -266,7 +266,7 @@ class _JournalLog:
 
     Intentionally exposes ONLY ``.warning()`` — the minimal attribute-call
     surface required by the silent-fallthrough gate's WARN_METHODS check
-    (shared/tests/silent_fallthrough_scan.py::_handler_has_warn_log, whose
+    (tests/repo_guards/silent_fallthrough_scan.py::_handler_has_warn_log, whose
     SCOPE_ROOTS includes ``scripts``). This is not a general-purpose logging
     facade; non-handler call sites in this module keep calling bare ``log()``.
     Copied deliberately from scripts/orchestrator-watchdog.py so the two

@@ -60,16 +60,21 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from shared.storm_counter import StormCounter
 
+from fused_memory.memory_metadata import (
+    is_orchestrator_completion_record,
+    normalize_supersedes,
+)
 from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.models.enums import MEM0_PRIMARY
+from fused_memory.models.memory import AddMemoryResponse, Mem0WriteState
 from fused_memory.server.grouped_read import (
-    CHILD_KINDS,
     CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
+    child_parent_id,
 )
 
 # The per-store-cosine reader, IMPORTED rather than re-implemented (INV-5) —
-# the same treatment PARENT_ID_KEY and CHILD_KINDS get above. This module
+# the same treatment PARENT_ID_KEY and child_parent_id get above. This module
 # retires ``near_duplicate_guard``, so a copy here would have been the obvious
 # shortcut; it is also exactly how task 3658's field move (relevance_score →
 # metadata['store_score']) would go wrong a second time. One copy updated and
@@ -117,6 +122,24 @@ CANONICAL_ID_KEY = 'canonical_id'
 #: rare by construction, and additive like the other two.
 FAIL_OPEN_ESCALATION_ID_KEY = 'triage_fail_open_escalation_id'
 
+#: Key on the add_memory ack naming the :class:`FailOpenStage` at which THIS
+#: write failed open. Present only when it did, absent like ``canonical_id``.
+TRIAGE_FAIL_OPEN_KEY = 'triage_fail_open'
+
+
+class FailOpenStage(StrEnum):
+    """Where triage gave up on a write and stored it untriaged (INV-11)."""
+
+    RETRIEVE = 'retrieve'
+    JUDGE = 'judge'
+    ATTACH_GUARD = 'attach_guard'
+    #: The attach's child write raised; the tool stored the write standalone.
+    ATTACH_WRITE = 'attach_write'
+    #: The attach's child write returned no memory_ids.
+    ATTACH_NOT_DURABLE = 'attach_not_durable'
+    #: A verdict the tool has no attach kind wired for.
+    UNWIRED_VERDICT = 'unwired_verdict'
+
 #: The metadata keys an ATTACH outcome OVERWRITES when it reroutes a write
 #: into a child record. This is the definition the force-store predicate
 #: below is derived from, so the two cannot drift: every key the attach
@@ -147,8 +170,11 @@ ATTACH_OWNED_KEYS: frozenset[str] = frozenset({
 })
 
 #: The write was stored as a new standalone memory. Also the fail-open
-#: outcome and the deliberate-stub outcome — from the caller's side those are
-#: indistinguishable from a genuine "nothing matched", which is the point.
+#: outcome and the deliberate-stub outcome: C1 keeps ``routed`` at ``stored``
+#: so the write stays unblocked. A fail-open is still told apart from a
+#: genuine "nothing matched": its decision names the stage in
+#: ``BandDecision.fail_open_stage`` and its ack carries
+#: :data:`TRIAGE_FAIL_OPEN_KEY`.
 OUTCOME_STORED = 'stored'
 
 #: The write restates an existing memory and was attached to it as a sighting.
@@ -240,6 +266,20 @@ def attach_write_landed(result: Any) -> bool:
     """
     memory_ids = getattr(result, 'memory_ids', None)
     return not (isinstance(memory_ids, list | tuple) and not memory_ids)
+
+
+def attach_write_durable(result: Any) -> bool:
+    """Did the ATTACH child write persist, or is its Mem0 leg durably queued for retry?
+
+    :func:`attach_write_landed`, plus a Mem0 leg ``MemoryService.add_memory``
+    deferred for server-side retry: the queued intent already carries the
+    triage-stamped parent link, so the retry creates exactly the child the ack
+    names. A real response is read through ``AddMemoryResponse.mem0_write_state``;
+    anything else keeps :func:`attach_write_landed`'s lenient reading.
+    """
+    if isinstance(result, AddMemoryResponse):
+        return result.mem0_write_state is not Mem0WriteState.NOT_LANDED
+    return attach_write_landed(result)
 
 
 # --- config defaults --------------------------------------------------------
@@ -404,6 +444,8 @@ class BandDecision:
     winner_id: str | None = None
     #: Why the attach guard refused this write's attach; empty when it did not.
     attach_refusals: frozenset[AttachRefusal] = frozenset()
+    #: Non-``None`` means the write is stored WITHOUT triage, having failed open here.
+    fail_open_stage: FailOpenStage | None = None
 
     @property
     def attach_source_id(self) -> str | None:
@@ -501,13 +543,51 @@ def declares_attach_keys(metadata: Any) -> bool:
     Likewise ANY ``parent_id``, well-formed or not: a malformed link is a
     caller bug for ``memory_metadata`` validation to report, and quietly
     converting it into a triage attach would hide it. Contrast
-    ``grouped_read._parent_id_in_meta``, which requires both keys well-formed
+    ``grouped_read.child_parent_id``, which requires both keys well-formed
     because it answers a different question — "does this record group?" rather
     than "did the caller set something an attach would overwrite?".
     """
     if not isinstance(metadata, dict):
         return False
     return any(key in metadata for key in ATTACH_OWNED_KEYS)
+
+
+def declares_supersession(metadata: Any) -> bool:
+    """True when the CALLER's own *metadata* declares a non-empty ``supersedes``.
+
+    A supersession is a new standalone record plus a mark on each record it
+    replaces (``services/supersession_mark.py::mark_superseded``), never an
+    attach under one (ruling 5c). The replaced record is the likeliest
+    candidate a correction restates, so attaching would make the retired
+    record the parent of its own replacement and invert the supersession.
+
+    Presence of a non-empty declaration is the test, well-formed or not, for
+    the reason :func:`declares_attach_keys` gives about a malformed
+    ``parent_id``: a caller bug is for ``memory_metadata`` validation to
+    report, not for triage to quietly convert into an attach.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    return bool(normalize_supersedes(metadata.get('supersedes')))
+
+
+def is_orchestrator_completion_write(metadata: Any) -> bool:
+    """True when *metadata* is an orchestrator task-completion record's.
+
+    The LEGACY fallback for the completion record's declared
+    ``kind='task_completion'``, which :func:`declares_attach_keys` already
+    force-stores. It covers orchestrators not yet redeployed and any other
+    writer that emits the completion source without the kind.
+
+    It matches the one source constant ``memory_metadata`` owns, by equality
+    and never by parsing, and deliberately not by ``task_id``: an agent
+    memory's ``task_id`` is provenance, not its subject (task 6956).
+
+    Retire it once no writer emits the completion source without the kind:
+    each write it decides logs one ``legacy completion record`` INFO line, so
+    the condition is that those lines stop.
+    """
+    return isinstance(metadata, dict) and is_orchestrator_completion_record(metadata)
 
 
 def canonical_id_of(result: MemoryResult) -> str:
@@ -535,19 +615,12 @@ def canonical_id_of(result: MemoryResult) -> str:
     (deleted) parent now refuses to ``stored`` instead
     (:attr:`AttachRefusal.TARGET_COSINE_UNAVAILABLE`).
 
-    The child rule mirrors ``grouped_read._parent_id_in_meta`` rule-for-rule —
-    a child ``kind`` AND a non-empty ``str`` ``parent_id``, with a malformed
-    parent link falling back to the record's own id — and both the kind set
-    and the metadata key are IMPORTED from that module rather than spelled as
-    literals (INV-5), because a drift between the write side and the read side
-    is exactly what produces an unfoldable child.
+    The child rule IS ``grouped_read.child_parent_id``, called rather than
+    restated (INV-5), because a drift between the write side and the read side
+    is exactly what produces an unfoldable child. A malformed parent link is
+    not a child link, so it falls back to the record's own id.
     """
-    meta = result.metadata or {}
-    if meta.get('kind') in CHILD_KINDS:
-        parent_id = meta.get(PARENT_ID_KEY)
-        if isinstance(parent_id, str) and parent_id:
-            return parent_id
-    return result.id
+    return child_parent_id(result.metadata) or result.id
 
 
 def decide_band(
@@ -745,9 +818,11 @@ _FAIL_OPEN_STORM_WINDOW_SECONDS = 3600.0
 
 _FAIL_OPEN_HINT = (
     'add_memory write triage failed open repeatedly: every write in this '
-    'window was stored WITHOUT triage, i.e. with the pre-triage behaviour. No '
-    'write was lost or blocked (contract C1), but no restatement was detected '
-    'either. Check candidate retrieval (MemoryService.search / mem0 '
+    'window proceeded WITHOUT triage, i.e. with the pre-triage behaviour. No '
+    'write was blocked (contract C1), but no restatement was detected either, '
+    "and whether each write's Mem0 leg landed is recorded in the mem0 intent "
+    "journal (write_journal.db's mem0_intents table), not by this alarm. "
+    'Check candidate retrieval (MemoryService.search / mem0 '
     'reachability) and the judge. To stop triage deliberately rather than '
     'letting it degrade silently, set write_triage.enabled: false — it is '
     'green-tier hot-reloadable via reload_config.'
@@ -882,6 +957,8 @@ async def triage_write(
     judge: Any = None,
     allow_near_duplicate: bool = False,
     caller_owns_attach_keys: bool = False,
+    caller_declares_supersession: bool = False,
+    caller_is_completion_record: bool = False,
 ) -> BandDecision:
     """Route one ``add_memory`` write. NEVER raises, NEVER blocks, NEVER errors.
 
@@ -889,9 +966,10 @@ async def triage_write(
     stage is wrapped after the force-store checks: any
     exception whatsoever yields :data:`OUTCOME_STORED` plus exactly one
     counted fail-open and a logged warning with ``exc_info``. Nothing escapes,
-    because C1 is absolute — from the caller's side a fail-open is
-    indistinguishable from "nothing matched", which is what keeps the write
-    unblocked.
+    because C1 is absolute: a fail-open keeps ``routed`` at ``stored`` and
+    the write unblocked. The decision still names where triage gave up, in
+    ``fail_open_stage``, which ``add_memory`` surfaces on the ack as
+    :data:`TRIAGE_FAIL_OPEN_KEY`.
 
     This is where the module deliberately DIVERGES from the retired guard's
     call site, which re-raises ``TypeError``/``AttributeError``/``NameError``
@@ -902,11 +980,13 @@ async def triage_write(
     fail-open — so a changed ``MemoryService.search`` signature surfaces as a
     storm escalation rather than as a stream of errored writes.
 
-    *allow_near_duplicate* and *caller_owns_attach_keys* are passed IN rather
-    than recomputed: ``add_memory`` already derives both from the metadata it
-    holds, and a second derivation here is a second place for them to disagree
-    about who is exempt. :func:`declares_attach_keys` is the one spelling of
-    the *caller_owns_attach_keys* predicate.
+    *allow_near_duplicate*, *caller_owns_attach_keys*,
+    *caller_declares_supersession* and *caller_is_completion_record* are
+    passed IN rather than recomputed: ``add_memory`` already derives them from
+    the metadata it holds, and a second derivation here is a second place for
+    them to disagree about who is exempt. :func:`declares_attach_keys`,
+    :func:`declares_supersession` and :func:`is_orchestrator_completion_write`
+    are the one spellings of the last three predicates.
 
     There is deliberately no recon-stage arm. It was retired by task 3134
     (leaf iota) once Stage-1 consolidation moved onto ``consolidate_memories``,
@@ -947,6 +1027,20 @@ async def triage_write(
         # candidate can change the answer, so no round-trip is spent asking.
         return BandDecision(OUTCOME_STORED, None, None, None, None)
 
+    if caller_is_completion_record:
+        # A legacy completion record with no kind; see is_orchestrator_completion_write.
+        logger.info(
+            'write_triage legacy completion record force-stored: project=%s; '
+            'its writer declared no kind',
+            project_id,
+        )
+        return BandDecision(OUTCOME_STORED, None, None, None, None)
+
+    if caller_declares_supersession:
+        # A correction is never filed under the record it retires; see
+        # declares_supersession.
+        return BandDecision(OUTCOME_STORED, None, None, None, None)
+
     try:
         k = resolve_candidate_k(memory_service)
         t_high, t_low = resolve_bands(memory_service)
@@ -976,19 +1070,19 @@ async def triage_write(
         # the candidate slate is empty-or-unusable, never merely thinner.
         if getattr(results, 'degraded', False):
             failed = getattr(results, 'failed_stores', None)
-            _record_fail_open(
+            return _fail_open_decision(
                 counter, project_id,
                 RuntimeError(f'search degraded: failed_stores={failed!r}'),
-                stage='retrieve',
+                FailOpenStage.RETRIEVE, t_high=t_high, t_low=t_low,
             )
-            return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)
         decision = replace(
             decide_band(results, t_high=t_high, t_low=t_low),
             truncation_facts=_retrieval_cap_facts(results, k, t_low),
         )
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
-        _record_fail_open(counter, project_id, exc, stage='retrieve')
-        return BandDecision(OUTCOME_STORED, None, None, None, None)
+        return _fail_open_decision(
+            counter, project_id, exc, FailOpenStage.RETRIEVE, t_high=None, t_low=None,
+        )
 
     judged = decision.outcome == OUTCOME_JUDGE
     if judged:
@@ -1003,8 +1097,10 @@ async def triage_write(
             content=content, project_id=project_id, judged=judged,
         )
     except Exception as exc:  # C1: nothing escapes this path.
-        _record_fail_open(counter, project_id, exc, stage='attach_guard')
-        return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
+        return _fail_open_decision(
+            counter, project_id, exc, FailOpenStage.ATTACH_GUARD,
+            t_high=decision.t_high, t_low=decision.t_low,
+        )
 
 
 async def _judge_band(
@@ -1038,8 +1134,10 @@ async def _judge_band(
         _log_retarget(decision, judged, project_id)
         return judged
     except Exception as exc:  # noqa: BLE001 — C1: nothing escapes this path.
-        _record_fail_open(counter, project_id, exc, stage='judge')
-        return BandDecision(OUTCOME_STORED, None, None, decision.t_high, decision.t_low)
+        return _fail_open_decision(
+            counter, project_id, exc, FailOpenStage.JUDGE,
+            t_high=decision.t_high, t_low=decision.t_low,
+        )
 
 
 async def _guard_attach(
@@ -1227,12 +1325,26 @@ def _log_retarget(band: BandDecision, judged: BandDecision, project_id: str) -> 
 _WIRING_BUG_CLASSES = (TypeError, AttributeError, NameError)
 
 
+def _fail_open_decision(
+    counter: TriageFailOpenCounter,
+    project_id: str,
+    exc: BaseException,
+    stage: FailOpenStage,
+    *,
+    t_high: float | None,
+    t_low: float | None,
+) -> BandDecision:
+    """Record one fail-open at *stage* and return the untriaged ``stored`` that names it."""
+    _record_fail_open(counter, project_id, exc, stage=stage)
+    return BandDecision(OUTCOME_STORED, None, None, t_high, t_low, fail_open_stage=stage)
+
+
 def _record_fail_open(
     counter: TriageFailOpenCounter,
     project_id: str | None,
     exc: BaseException,
     *,
-    stage: str,
+    stage: FailOpenStage,
 ) -> dict[str, Any] | None:
     """Log and count one fail-open; return a storm summary iff a burst fired.
 
@@ -1304,14 +1416,23 @@ def emit_triage_fail_open_storm_escalation(
         # honest and points at the co-affected queues, rather than blaming
         # whichever write happened to cross the threshold.
         f'projects_in_window={storm.get("projects")!r}',
+        f'mem0_intents_in_window={storm.get("mem0_intents_in_window")!r}',
         '',
         'add_memory write triage (PRD leaf beta, task 3127) FAILED OPEN '
-        'repeatedly inside one rolling window. This is a DEGRADATION, not a '
-        'data-loss incident, and the distinction decides the remediation:',
+        'repeatedly inside one rolling window. This is a DEGRADATION; data loss '
+        'is ruled out only when the counts above show no failed or dead Mem0 '
+        'intents, and the distinction decides the remediation:',
         '',
-        '  * Every write in the window still LANDED — stored WITHOUT triage, '
-        'i.e. with the pre-triage behaviour. No write was lost and no write '
-        'was blocked (contract C1 holds on every fail-open path).',
+        '  * Triage blocked no write (contract C1 holds on every fail-open '
+        'path): each one proceeded WITHOUT triage, i.e. with the pre-triage '
+        'behaviour. This alarm does not by itself prove each write LANDED: a '
+        "write's Mem0 leg can fail independently of triage, and the outage that "
+        'breaks candidate retrieval (embeddings) usually breaks the Mem0 write '
+        'too. mem0_intents_in_window counts every Mem0-primary write created in '
+        'the window by status, not only the fail-opens: completed = landed; '
+        'retrying = queued for server-side retry; pending = in flight; '
+        'failed/dead = did NOT land. None means the count was unavailable: '
+        "query write_journal.db's mem0_intents table by status and created_at.",
         '  * What was lost is DETECTION: no restatement was recognised, so '
         'writes that should have been attached as sightings of an existing '
         'memory were stored as new standalone entries instead. Nothing is '

@@ -18,8 +18,11 @@ from _fm_helpers import (
     make_populated_task_store,
     make_zero_byte_task_store,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreUnpopulated
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_found_on_main_provenance.py'
 
@@ -2107,7 +2110,7 @@ class TestRunTargetStorePreflight:
     async def test_refuses_a_missing_task_store(self, tmp_path, monkeypatch, apply):
         factory = self._patch(monkeypatch)
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_run_args(tmp_path, apply=apply))
 
         assert factory.constructions == []
@@ -2115,7 +2118,7 @@ class TestRunTargetStorePreflight:
     async def test_refusal_leaves_the_db_absent(self, tmp_path, monkeypatch):
         self._patch(monkeypatch)
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_run_args(tmp_path))
 
         assert not (tmp_path / '.taskmaster').exists()
@@ -2128,7 +2131,7 @@ class TestRunTargetStorePreflight:
         make_zero_byte_task_store(tmp_path)
         factory = self._patch(monkeypatch)
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_run_args(tmp_path))
 
         assert factory.constructions == []
@@ -2148,7 +2151,7 @@ class TestRunTargetStorePreflight:
         """
         self._patch(monkeypatch)
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(
                 _run_args(tmp_path, fail_on_findings=fail_on_findings),
             )

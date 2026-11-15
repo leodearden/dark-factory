@@ -13,10 +13,10 @@ re-derivable. It does four things:
 * validate a hand-adjudicated verdict file and report rates with Wilson CIs.
 
 Read-only by construction: the graph is read over GRAPH.RO_QUERY only, through
-fused_memory.backends.graphiti_client._paged_ro_query, never through
+fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader, never through
 MemoryService, GraphitiBackend or graphiti_core's FalkorDriver (see
-scripts/audit_wrong_binding_edges.py::RO_COMMAND for why each is excluded).
-There is no mutation flag.
+fused_memory/backends/falkor_read_only.py::RO_COMMAND for why each is
+excluded). There is no mutation flag.
 
 Usage (from fused-memory/)::
 
@@ -52,20 +52,18 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from fused_memory.backends.graphiti_client import (
-    _DEFAULT_READ_PAGE_SIZE,
-    _RESULTSET_SIZE,
-    PagedRead,
-    _paged_ro_query,
-)
+from fused_memory.backends.falkor_read_only import PagedQuery, ReadOnlyGraphReader
+from fused_memory.backends.paged_read import PagedRead
 from fused_memory.reconciliation.task_filter import (
     is_batch_plan_framing,
     is_proposed_resolution_framing,
 )
+from fused_memory.services import overreach_guard
 from fused_memory.services.completion_claim_gate import (
     UNVERIFIED_CLAIM_TAG,
     extract_completion_claims,
 )
+from fused_memory.services.overreach_guard import EPISODE_CLASSIFIERS, LABELS
 
 # --------------------------------------------------------------------------- #
 # Records
@@ -189,48 +187,19 @@ def attribute_edges(edges: Iterable[Edge]) -> Attribution:
 # --------------------------------------------------------------------------- #
 # Candidate ruling-shape classifiers, under evaluation
 # --------------------------------------------------------------------------- #
-# They live here, not in fused_memory src, until design.md picks one; the
-# build promotes the winner and this script imports it (one copy, SPOT).
-
-HEAD_CHARS = 200
-DECISIONS_CATEGORY = 'decisions_and_rationale'
-_RULING_LEXEME = re.compile(r'\b(ruling|ruled)\b', re.IGNORECASE)
-_DECISION_LEXEME = re.compile(r'\b(ruling|ruled|decision|decisions|decided)\b', re.IGNORECASE)
-_DECISION_ANCHOR = re.compile(r'\besc-\d+-\d+\b|\([^)]*\b\d{4}-\d{2}-\d{2}')
-_RULING_HEADER = re.compile(r'\s*RULING\b', re.IGNORECASE)
+# The vocabulary lives in fused_memory.services.overreach_guard (one copy,
+# SPOT); this script evaluates it over Episode records.
 
 
-def _head(episode: Episode) -> str:
-    return (episode.content or '')[:HEAD_CHARS]
-
-
-def _category_decisions(episode: Episode) -> bool:
-    return episode.source.category == DECISIONS_CATEGORY
-
-
-def _header_ruling_paren(episode: Episode) -> bool:
-    return (episode.content or '').lstrip().startswith('RULING (')
-
-
-def _header_ruling(episode: Episode) -> bool:
-    return _RULING_HEADER.match(episode.content or '') is not None
-
-
-def _ruling_lexeme_head(episode: Episode) -> bool:
-    return _RULING_LEXEME.search(_head(episode)) is not None
-
-
-def _decision_anchor_head(episode: Episode) -> bool:
-    head = _head(episode)
-    return bool(_DECISION_LEXEME.search(head) and _DECISION_ANCHOR.search(head))
+def _episode_adapter(name: str) -> Callable[[Episode], bool]:
+    holds = EPISODE_CLASSIFIERS[name]
+    return lambda episode: holds(
+        overreach_guard.category_of(episode.source.category), episode.content or '',
+    )
 
 
 CLASSIFIERS: Mapping[str, Callable[[Episode], bool]] = MappingProxyType({
-    'category_decisions': _category_decisions,
-    'header_ruling_paren': _header_ruling_paren,
-    'header_ruling': _header_ruling,
-    'ruling_lexeme_head': _ruling_lexeme_head,
-    'decision_anchor_head': _decision_anchor_head,
+    name: _episode_adapter(name) for name in EPISODE_CLASSIFIERS
 })
 
 STRATA: tuple[str, ...] = ('ruling_lexeme', 'decision_anchor', 'other_decisions')
@@ -238,17 +207,19 @@ STRATA: tuple[str, ...] = ('ruling_lexeme', 'decision_anchor', 'other_decisions'
 
 def stratum_of(episode: Episode) -> str | None:
     """The first stratum in ``STRATA`` order whose classifiers hold."""
-    if _header_ruling(episode) or _ruling_lexeme_head(episode):
+    if CLASSIFIERS['header_ruling'](episode) or CLASSIFIERS['ruling_lexeme_head'](episode):
         return 'ruling_lexeme'
-    if _decision_anchor_head(episode):
+    if CLASSIFIERS['decision_anchor_head'](episode):
         return 'decision_anchor'
-    if _category_decisions(episode):
+    if CLASSIFIERS['category_decisions'](episode):
         return 'other_decisions'
     return None
 
 
 def matching_classifiers(episode: Episode) -> tuple[str, ...]:
-    return tuple(name for name, holds in CLASSIFIERS.items() if holds(episode))
+    return overreach_guard.matching_classifiers(
+        overreach_guard.category_of(episode.source.category), episode.content or '',
+    )
 
 
 @dataclass(frozen=True)
@@ -474,11 +445,6 @@ def worksheet_rows(
 # --------------------------------------------------------------------------- #
 # The adjudicated verdict file, validated fail-closed
 # --------------------------------------------------------------------------- #
-
-LABELS: tuple[str, ...] = (
-    'holding', 'bookkeeping', 'context', 'overreach', 'misbound', 'unjudgeable',
-)
-"""The pre-registered vocabulary; definitions in design.md §2."""
 
 EdgeKey = tuple[str, str]
 """``(graph, edge_uuid)``."""
@@ -810,30 +776,25 @@ def detector_catch(
 
 
 # --------------------------------------------------------------------------- #
-# The read seam: GRAPH.RO_QUERY through the shared paged primitive
+# The read seam: GRAPH.RO_QUERY through the shared read-only reader
 # --------------------------------------------------------------------------- #
 
 DEFAULT_GRAPHS: tuple[str, ...] = ('dark_factory', 'reify')
 
-_EPISODE_MATCH = 'MATCH (e:Episodic) '
-EPISODE_PAGE_CYPHER = (
-    _EPISODE_MATCH + 'RETURN e.uuid, e.source_description, e.created_at, e.content '
-    'ORDER BY e.uuid SKIP {skip} LIMIT {limit}'
+EPISODE_READ = PagedQuery(
+    match='MATCH (e:Episodic)',
+    row='e',
+    returns=('e.uuid', 'e.source_description', 'e.created_at', 'e.content'),
 )
-EPISODE_CENSUS_CYPHER = _EPISODE_MATCH + 'RETURN count(*)'
 
-_EDGE_MATCH = 'MATCH (a)-[r:RELATES_TO]->(b) '
-EDGE_PAGE_CYPHER = (
-    _EDGE_MATCH + 'RETURN r.uuid, r.fact, a.name, b.name, r.episodes, r.invalid_at, '
-    'r.expired_at ORDER BY r.uuid SKIP {skip} LIMIT {limit}'
+EDGE_READ = PagedQuery(
+    match='MATCH (a)-[r:RELATES_TO]->(b)',
+    row='r',
+    returns=('r.uuid', 'r.fact', 'a.name', 'b.name', 'r.episodes', 'r.invalid_at', 'r.expired_at'),
 )
 """ALL edges, live or not: durability is a measured output. No embedding projected.
-The directed pattern yields one row per edge, so ``r.uuid`` is a total order (see
-graphiti_client.py::_paged_ro_query on why that is load-bearing)."""
-EDGE_CENSUS_CYPHER = _EDGE_MATCH + 'RETURN count(r)'
-"""``count(r)``, not ``count(*)``: with ``r`` unreferenced FalkorDB counts connected
-(a, b) PAIRS, so multi-edges vanish (2026-10-01, dark_factory: 19,409 vs 20,491
-edges) and a census that low would pass a read truncated by the difference."""
+The columns are in ``_edge_from_row``'s unpacking order. The census is ``count(r)``;
+see fused_memory/backends/falkor_read_only.py::PagedQuery for why."""
 
 
 def _text(value: Any) -> str | None:
@@ -860,44 +821,28 @@ def _edge_from_row(graph: str, row: list) -> Edge:
 class GraphReader:
     """One graph's episodes and edges, each with its completeness proof.
 
-    Read-only rests on ``_paged_ro_query`` issuing ``ro_query`` (GRAPH.RO_QUERY is
-    server-enforced read-only); the tests' double raises on ``query``. The
-    RO-proxy seam copied into three other scripts is deliberately not copied a
-    fourth time: consolidating it is a filed follow-up.
+    Reads go through the shared guarded seam,
+    fused_memory/backends/falkor_read_only.py::ReadOnlyGraphReader. None paging
+    knobs mean that seam's defaults.
     """
 
     def __init__(
         self, *, graph: Any | None = None, graph_name: str = DEFAULT_GRAPHS[0],
-        uri: str | None = None, page_size: int = _DEFAULT_READ_PAGE_SIZE,
-        resultset_size: int = _RESULTSET_SIZE,
+        uri: str | None = None, page_size: int | None = None,
+        resultset_size: int | None = None,
     ) -> None:
-        self._graph = graph
         self.graph_name = graph_name
-        self.uri = uri
-        self.page_size = page_size
-        self.resultset_size = resultset_size
-
-    def _resolve_graph(self) -> Any:
-        """Open a ``falkordb.asyncio`` client lazily, never graphiti's FalkorDriver."""
-        if self._graph is None:
-            from falkordb.asyncio import FalkorDB  # noqa: PLC0415
-
-            client = FalkorDB.from_url(self.uri) if self.uri else FalkorDB()
-            self._graph = client.select_graph(self.graph_name)
-        return self._graph
-
-    async def _read(self, page: str, census: str) -> PagedRead:
-        return await _paged_ro_query(
-            self._resolve_graph(), page, census,
-            page_size=self.page_size, resultset_size=self.resultset_size,
+        self._reader = ReadOnlyGraphReader(
+            graph_name=graph_name, graph=graph, uri=uri,
+            page_size=page_size, resultset_size=resultset_size,
         )
 
     async def fetch_episodes(self) -> tuple[list[Episode], PagedRead]:
-        read = await self._read(EPISODE_PAGE_CYPHER, EPISODE_CENSUS_CYPHER)
+        read = await self._reader.read_paged(EPISODE_READ)
         return [_episode_from_row(self.graph_name, row) for row in read.rows], read
 
     async def fetch_edges(self) -> tuple[list[Edge], PagedRead]:
-        read = await self._read(EDGE_PAGE_CYPHER, EDGE_CENSUS_CYPHER)
+        read = await self._reader.read_paged(EDGE_READ)
         return [_edge_from_row(self.graph_name, row) for row in read.rows], read
 
 

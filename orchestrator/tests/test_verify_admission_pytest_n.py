@@ -27,6 +27,7 @@ from unittest.mock import patch
 
 import pytest
 from _orch_helpers import ADMISSION_TEST_CMD, admission_leg_for_cmd, admission_module_config
+from _serial_recovery_helpers import ORCH_SHAPED_ADDOPTS, effective_worker_count
 from pydantic import ValidationError
 
 from orchestrator.config import (
@@ -41,19 +42,19 @@ from orchestrator.verify_cmd import (
     apply_pytest_numprocesses,
     parse_config_command,
     render,
+    serial_confirm_pytest,
     serial_pytest,
 )
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestVerifyAdmissionPytestNConfigDefault:
     """Behavior-preserving default: 'auto' means no `-n` rewrite is injected
     (see the wiring tests below), so an untuned install keeps today's
     `-n auto` pyproject addopts byte-for-byte.
     """
 
-    def test_default_is_str_auto(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    def test_default_is_str_auto(self):
         cfg = OrchestratorConfig()
         assert isinstance(cfg.verify_admission_pytest_n, str)
         assert cfg.verify_admission_pytest_n == 'auto'
@@ -90,18 +91,16 @@ class TestVerifyAdmissionPytestNReloadDisposition:
             'reloadable but is missing from RELOADABLE_FIELDS'
         )
 
-    def test_edit_lands_in_applied_candidates_not_restart_required(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_edit_lands_in_applied_candidates_not_restart_required(self):
         live = OrchestratorConfig(verify_admission_pytest_n='auto')
         fresh = OrchestratorConfig(verify_admission_pytest_n='16')
         diff = diff_config(live, fresh)
         assert 'verify_admission_pytest_n' in diff.applied_candidates
         assert 'verify_admission_pytest_n' not in diff.restart_required
 
-    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+    @pytest.mark.usefixtures("code_default_config")
+    def test_apply_reload_applies_in_place(self):
         live = OrchestratorConfig(verify_admission_pytest_n='auto')
         fresh = OrchestratorConfig(verify_admission_pytest_n='16')
         report = apply_reload(live, fresh)
@@ -520,3 +519,47 @@ class TestPytestNWiring:
             f'forced-serial recovery re-run must not carry -n 16 (xdist '
             f'disabled → unregistered option); got {recovered!r}'
         )
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('role', ['task', 'background'])
+    async def test_a_confirm_form_command_is_not_dash_n_injected(self, tmp_path, role):
+        """A confirm re-run reaches the injection site at a gated role, and
+        ``-n 16`` appended after its ``-n 0`` would re-parallelise it."""
+        captured_cmds: list[str] = []
+
+        async def spy_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            captured_cmds.append(cmd)
+            return 0, '', False
+
+        config = armed_admission_config(tmp_path, '16')
+        worktree = tmp_path / 'wt'
+        worktree.mkdir()
+        confirm_command = render(
+            serial_confirm_pytest(parse_config_command(ADMISSION_TEST_CMD), ORCH_SHAPED_ADDOPTS)
+        )
+
+        async def run_and_capture_test_leg(test_command: str) -> list[str]:
+            captured_cmds.clear()
+            await run_verification(
+                worktree=worktree,
+                config=config,
+                module_config=admission_module_config(test_command=test_command),
+                role=role,
+                attempt_id=None,
+            )
+            test_cmd = next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
+            return shlex.split(shlex.split(test_cmd)[-1])
+
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            plain_tokens = await run_and_capture_test_leg(ADMISSION_TEST_CMD)
+            confirm_tokens = await run_and_capture_test_leg(confirm_command)
+
+        assert effective_worker_count(plain_tokens) == '16', (
+            f'control: the plain test leg at role={role!r} must be -n-capped, '
+            f'else the injection site was never armed; got {plain_tokens!r}'
+        )
+        assert effective_worker_count(confirm_tokens) == '0', (
+            f'a confirm-form command must stay at zero workers; got {confirm_tokens!r}'
+        )
+        assert '16' not in confirm_tokens

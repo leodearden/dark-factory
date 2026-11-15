@@ -31,6 +31,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from dashboard.api.clock import app_clock
 from dashboard.config import DashboardConfig
 from dashboard.data import escalation_corpus, redux_api
 from dashboard.data.datum import Datum
@@ -51,7 +52,6 @@ from dashboard.data.escalations import (
 from dashboard.data.mcp_fanout import TTLCache
 from dashboard.data.task_lookup import lookup_tasks
 from dashboard.data.task_snapshot import acquire_snapshot
-from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,8 @@ async def api_escalations(request: Request) -> JSONResponse:
     """ESCALATIONS — the live queues, their views over the corpus, and each row's task card."""
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    render_at = resolve_now(None)
+    clock = app_clock(request.app)
+    render_at = clock()
 
     queues = corpus_queues(config)
     corpus = await acquire_corpus(queues, now=render_at)
@@ -95,7 +96,7 @@ async def api_escalations(request: Request) -> JSONResponse:
 
     # Resolved AFTER the fan-out, as api/merge_queue.py::api_merge_queue does:
     # every as_of above was stamped at or before this instant, never after it.
-    served_at = resolve_now(None)
+    served_at = clock()
     return JSONResponse(
         redux_api.shape_escalations(built, card_datums(built, lookup), served_at=served_at)
     )
@@ -144,14 +145,15 @@ async def api_escalation_analytics(request: Request) -> JSONResponse:
     """ESCALATION_ANALYTICS — origin/lifespan/workflow aggregates over the corpus' history."""
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
+    clock = app_clock(request.app)
 
     queues = corpus_queues(config)
-    corpus = await acquire_corpus(queues, now=resolve_now(None))
+    corpus = await acquire_corpus(queues, now=clock())
 
     async def _refresh() -> dict:
         return await _derive_analytics(http_client, config, corpus)
 
     payload = await _analytics_memo.get_or_refresh((queues, corpus.as_of), _refresh)
     return JSONResponse(
-        redux_api.shape_escalation_analytics(payload, served_at=resolve_now(None))
+        redux_api.shape_escalation_analytics(payload, served_at=clock())
     )

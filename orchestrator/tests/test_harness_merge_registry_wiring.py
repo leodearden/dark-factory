@@ -135,6 +135,7 @@ def harness_for_registry_run_slot() -> Harness:
     h._merge_worker = None
     # The shared registry — this is the object we assert is forwarded.
     h._merge_inflight_registry = InFlightMergeRegistry()
+    h._task_verify_dispatcher = MagicMock()
     h.cost_store = None
     h._run_store = None
     h._run_id = None
@@ -189,9 +190,7 @@ class TestStartMergeWorkerCallsLivenessGuard:
              patch('asyncio.create_task') as mock_create_task, \
              patch('orchestrator.merge_lane.liveness.enforce_merge_liveness_margin') as mock_guard:
 
-            # SpeculativeMergeWorker.run() must be awaitable to satisfy create_task
             mock_smw = MagicMock()
-            mock_smw.run = AsyncMock(return_value=None)
             mock_smw_cls.return_value = mock_smw
 
             # Coordinator mock — note_merge is the on_merge_landed callback

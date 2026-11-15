@@ -368,10 +368,14 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
-    # Produced ONLY by ``verify.classify_leg``, never by ``classify_failure``:
-    # a PYTEST leg with no failure evidence whose session was torn down from
-    # outside the tests (a shell-reported SIGTERM/SIGINT/SIGHUP, or xdist's
-    # controller-only teardown signature).
+    # Produced ONLY by ``verify.classify_leg``, never by ``classify_failure``,
+    # for a leg torn down from outside before it reached any verdict:
+    # - a PYTEST leg with no failure evidence whose session was torn down from
+    #   outside the tests (a shell-reported SIGTERM/SIGINT/SIGHUP, or xdist's
+    #   controller-only teardown signature);
+    # - a RUFF or PYRIGHT leg with a shell-reported SIGTERM/SIGINT/SIGHUP whose
+    #   output proves no finding was reached
+    #   (``verify_classify.py::output_proves_no_finding``).
     # is_infra_transient=True, so it gets the bounded retry instead of a
     # debugger dispatch on a clean tree. archive=True, which
     # ``_assert_infra_transient_rows_archive`` requires and which keeps the log
@@ -379,7 +383,9 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     # there are no failing ids to probe (mirrors INFRA_KILL).
     # verdict_indeterminate=False: predicates (2) and (3) fail, because a
     # branch can SIGTERM its own pytest, ``exit 143``, or print the signature
-    # text. So the leg keeps its veto over another host's PASS. Fail CLOSED.
+    # text, and it controls the lint chain's own second link, which can
+    # ``exit 143`` too. So the leg keeps its veto over another host's PASS.
+    # Fail CLOSED.
     FailureCategory.INFRA_ABORT: CategoryPolicy(
         severity_rank=15, archive=True, preexisting_probe=False,
         is_infra_transient=True, verdict_indeterminate=False,

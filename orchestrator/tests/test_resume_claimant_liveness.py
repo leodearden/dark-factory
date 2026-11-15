@@ -29,6 +29,7 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -42,12 +43,19 @@ from _orch_helpers import (
 from _orch_helpers import (
     claimant_row as _row,
 )
+from escalation.grant_delivery import (
+    GRANT_NOT_DELIVERED_MARKER,
+    GrantDelivery,
+    shortfall_reason,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import OrchestratorConfig, UnlimitedHolderLocksConfig
 from orchestrator.harness import _REBLOCK_GUARD_THRESHOLD, Harness
-from orchestrator.module_charter import sanitize_files_for_persist
+from orchestrator.lock_table import ModuleLockTable
+from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 
 # ``_row`` / ``LIVE_CLAIMANT`` / ``TTL_SECS`` are the SHARED definitions in
 # ``_orch_helpers`` (task 3540 review amendment).  They were cloned here and in
@@ -244,6 +252,11 @@ def _guard_charges(harness: Harness) -> list:
     ]
 
 
+def _status_writes(harness: Harness) -> AsyncMock:
+    """The scheduler's status-write mock, typed so its ``assert_*`` API needs no suppression."""
+    return cast(AsyncMock, harness.scheduler.set_task_status)
+
+
 @pytest.mark.asyncio
 class TestCascadeMemberLivenessFork:
     """``_cascade_unblock_member`` gates on claimant liveness, not ``status ==
@@ -264,9 +277,7 @@ class TestCascadeMemberLivenessFork:
         with caplog.at_level(logging.INFO):
             await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
 
     async def test_in_progress_with_stale_heartbeat_is_repended(
         self, harness: Harness
@@ -278,9 +289,7 @@ class TestCascadeMemberLivenessFork:
 
         await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
 
     async def test_in_progress_with_fresh_heartbeat_is_not_flipped(
         self, harness: Harness, caplog
@@ -293,7 +302,7 @@ class TestCascadeMemberLivenessFork:
         with caplog.at_level(logging.DEBUG):
             await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
         assert any(
             r.levelno == logging.DEBUG and 'live claimant' in r.getMessage()
             for r in caplog.records
@@ -320,7 +329,7 @@ class TestCascadeMemberLivenessFork:
         with caplog.at_level(logging.DEBUG):
             await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
         assert any(
             r.levelno == logging.DEBUG and 'live claimant' in r.getMessage()
             for r in caplog.records
@@ -334,9 +343,7 @@ class TestCascadeMemberLivenessFork:
 
         await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
 
     async def test_blocked_with_fresh_heartbeat_is_not_flipped(
         self, harness: Harness, caplog
@@ -355,7 +362,7 @@ class TestCascadeMemberLivenessFork:
         with caplog.at_level(logging.DEBUG):
             await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
         assert any(
             r.levelno == logging.DEBUG and 'live claimant' in r.getMessage()
             for r in caplog.records
@@ -381,7 +388,7 @@ class TestCascadeMemberLivenessFork:
         with caplog.at_level(logging.DEBUG):
             await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
         assert any(
             r.levelno == logging.DEBUG and status in r.getMessage()
             for r in caplog.records
@@ -404,7 +411,7 @@ class TestLivenessForkReblockGuardSemantics:
         charges = _guard_charges(harness)
         assert len(charges) == 1, f'expected exactly one guard charge, got {charges}'
         assert charges[0].kwargs.get('metadata_mode') == 'merge'
-        harness.scheduler.set_task_status.assert_awaited_once()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_awaited_once()
 
     async def test_live_claimant_skip_does_not_charge_the_guard(
         self, harness: Harness
@@ -417,7 +424,7 @@ class TestLivenessForkReblockGuardSemantics:
         await _drive(harness, esc)
 
         assert _guard_charges(harness) == []
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
 
     async def test_guard_at_threshold_withholds_the_in_progress_flip_too(
         self, harness: Harness
@@ -445,7 +452,7 @@ class TestLivenessForkReblockGuardSemantics:
 
         await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
         assert _guard_charges(harness) == []
 
 
@@ -458,6 +465,10 @@ def _wire_two_snapshots(
 ) -> list[str]:
     """``get_task`` returns *early* until the re-block guard's ``update_task``
     lands, then *late* — and every scheduler call is appended to one ordered log.
+
+    Only the guard's own charge (a ``reblock_guard`` payload) switches the
+    snapshot: the granted-files fold's ``files`` write precedes the whole
+    re-pend (task 5650), and must not stand in for the guard.
 
     Modelling the skew this way, rather than as a positional ``side_effect``
     list, keeps the fixture independent of HOW MANY ``get_task`` round-trips the
@@ -480,7 +491,9 @@ def _wire_two_snapshots(
     async def _update_task(*args, **kwargs):
         nonlocal guard_written
         order.append('update_task')
-        guard_written = True
+        updates = args[1] if len(args) > 1 else kwargs.get('updates', {})
+        if 'reblock_guard' in updates:
+            guard_written = True
         return True
 
     async def _set_task_status(*args, **kwargs):
@@ -527,7 +540,7 @@ class TestCorroboratingReadBeforeTheWrite:
         with caplog.at_level(logging.DEBUG):
             await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
         assert any(
             'changed under the resume' in r.getMessage() and 'done' in r.getMessage()
             for r in caplog.records
@@ -550,7 +563,7 @@ class TestCorroboratingReadBeforeTheWrite:
 
         await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
 
     async def test_late_fresh_claimant_aborts_the_write(
         self, harness: Harness, caplog
@@ -572,7 +585,7 @@ class TestCorroboratingReadBeforeTheWrite:
         with caplog.at_level(logging.DEBUG):
             await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
         assert any(
             'changed under the resume' in r.getMessage()
             and LIVE_CLAIMANT in r.getMessage()
@@ -604,7 +617,7 @@ class TestCorroboratingReadBeforeTheWrite:
         with caplog.at_level(logging.DEBUG):
             await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
         assert any(
             r.levelno == logging.WARNING and 'could not re-read' in r.getMessage()
             for r in caplog.records
@@ -631,9 +644,7 @@ class TestCorroboratingReadBeforeTheWrite:
 
         await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
         assert order[-2:] == ['get_task', 'set_task_status'], (
             f'The corroborating read must be the LAST read before the write; '
             f'observed call order {order}'
@@ -707,9 +718,7 @@ class TestResumeLevelGateRemoved:
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
         assert any('orphan-unblock task 3438' in label for label in labels), (
             f'Expected the orphan-unblock coro to be scheduled; got {labels}'
         )
@@ -734,7 +743,7 @@ class TestResumeLevelGateRemoved:
         await asyncio.gather(*list(harness._background_tasks))
 
         assert event.is_set(), 'The synchronous wake path must still fire'
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
 
     async def test_level0_with_a_cross_host_claimant_is_scheduled_then_skipped(
         self, harness: Harness, caplog
@@ -760,7 +769,7 @@ class TestResumeLevelGateRemoved:
             f'The routing must still schedule it — the local half sees no '
             f'live workflow; got {labels}'
         )
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
         assert any(
             r.levelno == logging.DEBUG and 'live claimant' in r.getMessage()
             for r in caplog.records
@@ -790,9 +799,7 @@ class TestResumeLevelGateRemoved:
         assert any(expected_label in label for label in labels), (
             f'Expected {expected_label!r} to be scheduled; got {labels}'
         )
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
 
     async def test_dismissed_level0_is_close_only(self, harness: Harness):
         """[regression] The gate removal must widen only the ``resume`` effect.
@@ -811,7 +818,7 @@ class TestResumeLevelGateRemoved:
         assert labels == [], f'close_only must schedule nothing; got {labels}'
         await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
 
     async def test_scheduler_pause_sentinel_returns_before_dispatch(
         self, harness: Harness
@@ -836,7 +843,7 @@ class TestResumeLevelGateRemoved:
         harness._on_escalation_resolved(esc)
         await asyncio.gather(*list(harness._background_tasks))
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -846,18 +853,17 @@ class TestResumeLevelGateRemoved:
 def _plan_root(harness: Harness, task_id: str, *, legacy: bool = False) -> Path:
     """The directory the fold must resolve for *task_id*'s plan.json.
 
-    Mirrors the harness's own new-then-old artifact resolution
-    (``Harness._resolve_recovery_artifact``): the W11 ``.task-meta`` SIBLING of
-    the worktree first, the legacy ``<worktree>/.task`` second.  Derived
-    through ``TaskArtifacts.meta_root_for`` / ``Harness._resolve_task_worktree``
-    rather than by joining the path shape by hand, so a relocation moves the
-    fixture with the production resolver instead of silently pointing the test
-    at a directory nothing writes.
+    plan.json is task-scoped, so the fold reads *task_id*'s
+    ``.task-meta/task-<id>`` root first and the legacy ``<worktree>/.task``
+    second.  Derived through ``TaskArtifacts.task_root_for`` /
+    ``Harness._resolve_task_worktree`` rather than by joining the path shape
+    by hand, so a relocation moves the fixture with the production resolver
+    instead of silently pointing the test at a directory nothing writes.
     """
     wt = harness._resolve_task_worktree(task_id)
     if legacy:
         return wt / '.task'
-    return TaskArtifacts.meta_root_for(harness.git_ops.worktree_base, wt.name)
+    return TaskArtifacts.task_root_for(wt.parent, task_id)
 
 
 def _seed_plan(
@@ -917,6 +923,15 @@ def _wire_queue(
         queue.submit(esc)
     harness._escalation_queue = queue
     return queue
+
+
+def _resolution_of(queue: EscalationQueue, esc: Escalation) -> str:
+    """The resolving record's stored resolution text, as a steward re-reads it."""
+    stored = queue.get(esc.id)
+    assert stored is not None and stored.resolution is not None, (
+        f'expected a resolution note on {esc.id}; got {stored!r}'
+    )
+    return stored.resolution
 
 
 def _files_updates(harness: Harness) -> list:
@@ -993,9 +1008,7 @@ class TestGrantedFilesFoldOnRepend:
             "metadata_mode='merge' is required — 'additive' resolves scalar "
             'conflicts OLD-wins and would not replace the files list'
         )
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
 
     async def test_a_directory_grant_is_stripped_from_the_metadata_half(
         self, harness: Harness, tmp_path: Path
@@ -1047,9 +1060,7 @@ class TestGrantedFilesFoldOnRepend:
         # leaving this test asserting a stale hand-written list.
         assert writes[0].args[1] == {'files': ['pkg/a.py', 'pkg/b.py']}
         assert writes[0].args[1]['files'] == sanitize_files_for_persist(union)
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
 
     async def test_an_all_directory_grant_widens_the_plan_and_writes_no_metadata(
         self, harness: Harness, tmp_path: Path
@@ -1100,9 +1111,7 @@ class TestGrantedFilesFoldOnRepend:
             'nothing new to persist: the sanitized union equals the sanitized '
             'current scope, so the update_task round-trip is skipped entirely'
         )
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
 
     async def test_legacy_task_dir_plan_is_folded(
         self, harness: Harness, tmp_path: Path
@@ -1127,7 +1136,29 @@ class TestGrantedFilesFoldOnRepend:
         assert json.loads(plan_path.read_text())['files'] == [
             'pkg/a.py', 'pkg/b.py',
         ]
-        harness.scheduler.set_task_status.assert_awaited_once()  # type: ignore[attr-defined]
+        _status_writes(harness).assert_awaited_once()
+
+    async def test_the_w11_sibling_plan_is_widened_over_a_legacy_one(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """With both plans on disk, the W11 ``.task-meta`` sibling is the one
+        widened and the legacy ``<worktree>/.task`` plan is left untouched:
+        the resolution is new-then-old, so the new location wins."""
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=['pkg/b.py'], resolved_by='steward',
+        )
+        _wire_queue(harness, tmp_path, esc)
+        sibling_path = _seed_plan(harness, files=['pkg/a.py'])
+        legacy_path = _seed_plan(harness, files=['pkg/a.py'], legacy=True)
+        legacy_before = legacy_path.read_text()
+        _wire(harness, _row('blocked', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        assert json.loads(sibling_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert legacy_path.read_text() == legacy_before
 
     async def test_the_fold_lands_before_the_status_write(
         self, harness: Harness, tmp_path: Path
@@ -1292,42 +1323,64 @@ class TestGrantedFilesFoldOnRepend:
 
         assert plan_path.read_text() == before, f'plan.json rewritten for {why}'
         assert _files_updates(harness) == [], f'metadata.files written for {why}'
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
 
-    async def test_missing_plan_does_not_block_the_flip(
+    async def test_missing_plan_is_loud_and_does_not_block_the_flip(
         self, harness: Harness, tmp_path: Path, caplog
     ):
-        """No plan.json in EITHER location → skip the fold, still re-pend.
+        """No plan.json in EITHER location → no widen, still re-pend, and the
+        shortfall is operator-visible (task 5650).
 
         A task can legitimately have no plan (it never reached the architect,
-        or its worktree was reclaimed).  There is no scope to widen, and the
-        re-pend is still the right outcome — the grant is not a precondition
-        of the resume.
+        or its worktree was reclaimed), and the grant is not a precondition of
+        the resume (INV-4). But this branch is reached only when a grant
+        exists, so a grant with nowhere to land is a WARNING and a marker note
+        on the resolving record, which is what a steward or watcher re-reads.
         """
         esc = _esc(
             task_id='3438', category='scope_violation',
             granted_files=['pkg/b.py'], resolved_by='steward',
         )
-        _wire_queue(harness, tmp_path, esc)
+        queue = _wire_queue(harness, tmp_path, esc)
         _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
         harness._escalation_events.pop('3438', None)
 
-        with caplog.at_level(logging.DEBUG):
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
             await _drive(harness, esc)
 
         assert _files_updates(harness) == [], (
             'metadata.files must not be widened when plan.files could not be — '
             'the two would diverge and trip _check_scope_invariant at merge'
         )
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
         assert any(
-            'plan' in r.getMessage() and '3438' in r.getMessage()
+            r.levelno == logging.WARNING
+            and 'granted-files fold' in r.getMessage()
+            and '3438' in r.getMessage()
             for r in caplog.records
-        ), 'the skipped fold must leave a trace naming the task and the plan'
+        ), 'the undelivered grant must leave a WARNING naming the task'
+        resolution = _resolution_of(queue, esc)
+        assert GRANT_NOT_DELIVERED_MARKER in resolution
+        assert 'pkg/b.py' in resolution
+
+    async def test_a_delivered_grant_leaves_the_resolution_untouched(
+        self, harness: Harness, tmp_path: Path
+    ):
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=['pkg/b.py'], resolved_by='steward',
+        )
+        queue = _wire_queue(harness, tmp_path, esc)
+        _seed_plan(harness, files=['pkg/a.py'])
+        _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        assert len(_files_updates(harness)) == 1, 'fixture premise: the grant landed'
+        stored = queue.get(esc.id)
+        assert stored is not None, f'fixture premise: {esc.id} is still in the queue'
+        assert GRANT_NOT_DELIVERED_MARKER not in (stored.resolution or '')
 
     async def test_plan_write_failure_does_not_block_the_flip(
         self, harness: Harness, tmp_path: Path, caplog
@@ -1346,7 +1399,7 @@ class TestGrantedFilesFoldOnRepend:
             task_id='3438', category='scope_violation',
             granted_files=['pkg/b.py'], resolved_by='steward',
         )
-        _wire_queue(harness, tmp_path, esc)
+        queue = _wire_queue(harness, tmp_path, esc)
         _seed_plan(harness, files=['pkg/a.py'])
         _wire(harness, _row('in-progress', claimant=None, heartbeat=None))
         harness._escalation_events.pop('3438', None)
@@ -1359,9 +1412,7 @@ class TestGrantedFilesFoldOnRepend:
         ):
             await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
         assert _files_updates(harness) == [], (
             'metadata.files must not be widened once the plan write failed — '
             'a metadata-only widen is silently narrowed back on the next '
@@ -1376,6 +1427,11 @@ class TestGrantedFilesFoldOnRepend:
             "a dropped grant must be operator-visible — the FOLD's own WARNING, "
             'not merely some WARNING mentioning the task id'
         )
+        resolution = _resolution_of(queue, esc)
+        assert GRANT_NOT_DELIVERED_MARKER in resolution, (
+            'the WRITE_FAILED shortfall must be noted on the resolving record'
+        )
+        assert 'pkg/b.py' in resolution
 
     async def test_metadata_write_failure_does_not_block_the_flip(
         self, harness: Harness, tmp_path: Path, caplog
@@ -1409,9 +1465,7 @@ class TestGrantedFilesFoldOnRepend:
         assert json.loads(plan_path.read_text())['files'] == [
             'pkg/a.py', 'pkg/b.py',
         ], 'the durable half must survive the failed metadata write'
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
         assert any(
             r.levelno == logging.WARNING
             and 'granted-files fold' in r.getMessage()
@@ -1422,16 +1476,16 @@ class TestGrantedFilesFoldOnRepend:
             '3438" would be satisfied by an unrelated warning from the drive'
         )
 
-    async def test_a_withheld_flip_performs_no_fold(
+    async def test_a_withheld_flip_still_delivers_the_grant(
         self, harness: Harness, tmp_path: Path
     ):
-        """Nothing was re-pended, so nothing may be widened.
+        """The re-block guard withholds the re-pend, not the grant (task 5650).
 
-        The re-block guard withholding the flip means this task is NOT going
-        back to dispatch on this resolution.  Widening its scope anyway would
-        persist a grant against a task parked for human attention, and the
-        widened ``metadata.files`` would change the locks it competes for the
-        moment an operator does resume it.
+        This used to assert the opposite — "nothing was re-pended, so nothing
+        may be widened". But a grant is additive and durable: a widen without a
+        re-pend is complete, and the widened scope is exactly what the task
+        needs when an operator does resume it. Withholding the grant because
+        the re-pend was withheld is the silent no-op task 5650 closes.
         """
         esc = _esc(
             task_id='3438', category='scope_violation',
@@ -1439,10 +1493,8 @@ class TestGrantedFilesFoldOnRepend:
         )
         _wire_queue(harness, tmp_path, esc)
         plan_path = _seed_plan(harness, files=['pkg/a.py'])
-        before = plan_path.read_text()
         # Drive the guard to its threshold end-to-end (same signature, count
-        # already at the limit) rather than stubbing _check_reblock_guard —
-        # the ordering contract is "fold AFTER the guard returns True".
+        # already at the limit) rather than stubbing _check_reblock_guard.
         _wire(harness, _row(
             'in-progress', claimant=None, heartbeat=None,
             metadata={'reblock_guard': {
@@ -1454,22 +1506,21 @@ class TestGrantedFilesFoldOnRepend:
 
         await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
-        assert plan_path.read_text() == before, 'a withheld flip must not widen'
-        assert _files_updates(harness) == []
+        _status_writes(harness).assert_not_awaited()
+        assert json.loads(plan_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert len(_files_updates(harness)) == 1
 
-    async def test_a_late_aborted_flip_performs_no_fold(
+    async def test_a_late_aborted_flip_still_delivers_the_grant(
         self, harness: Harness, tmp_path: Path
     ):
-        """A resume the corroborating read aborts must leave NO partial widen.
+        """A resume the corroborating read aborts still delivers the grant (task 5650).
 
-        The fold is a read-modify-write of two DURABLE artifacts (plan.json and
-        ``metadata.files``), so it has to be gated by the same authorisation as
-        the status write — otherwise the abort path advertises "skipping the
-        write" while having already mutated both. It matters most in exactly
-        the case this test drives: a claimant appeared, which means a freshly
-        dispatched ``TaskWorkflow`` now owns that plan in memory, and a fold
-        landing underneath it is two writers racing over one file.
+        This used to assert that an aborted resume leaves NO widen behind. The
+        grant does not depend on the flip: it is additive and durable, and the
+        claimant that appeared needs the widened scope as much as a re-pended
+        task would. Gating it on the flip is the silent no-op task 5650 closes.
+        The fold now precedes the whole re-pend and holds ``plan_mutex`` across
+        its read-modify-write, so it does not race a workflow's plan writes.
         """
         esc = _esc(
             task_id='3438', category='scope_violation',
@@ -1477,7 +1528,6 @@ class TestGrantedFilesFoldOnRepend:
         )
         _wire_queue(harness, tmp_path, esc)
         plan_path = _seed_plan(harness, files=['pkg/a.py'])
-        before = plan_path.read_text()
         # Early snapshot authorises the flip; the late one shows a workflow
         # claimed the row between the gate and the write.
         _wire_two_snapshots(
@@ -1489,14 +1539,73 @@ class TestGrantedFilesFoldOnRepend:
 
         await _drive(harness, esc)
 
-        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
-        assert plan_path.read_text() == before, (
-            'an aborted resume must not have widened plan.json — the write it '
-            'declined to make is the same write the widen was FOR'
+        assert _guard_charges(harness), (
+            'the gate must have authorised the flip, so the abort is the '
+            "corroborating read's, not the liveness fork's"
         )
-        assert _files_updates(harness) == [], (
-            'an aborted resume must not have widened metadata.files either'
+        _status_writes(harness).assert_not_awaited()
+        assert json.loads(plan_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert len(_files_updates(harness)) == 1
+
+    async def test_a_live_claimant_skip_still_delivers_the_grant(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The falsified worktree=null hypothesis's shape: an orphan-routed
+        resolution whose row has a heartbeating claimant (task 5650)."""
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=['pkg/b.py'], resolved_by='steward',
         )
+        _wire_queue(harness, tmp_path, esc)
+        plan_path = _seed_plan(harness, files=['pkg/a.py'])
+        _wire(harness, _row('in-progress', claimant=LIVE_CLAIMANT, heartbeat='fresh'))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        _status_writes(harness).assert_not_awaited()
+        assert json.loads(plan_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert len(_files_updates(harness)) == 1
+
+    async def test_a_non_rependable_status_still_delivers_the_grant(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """A status outside ``_RESUME_REPEND_STATUSES`` skips the flip, not the
+        grant (task 5650)."""
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=['pkg/b.py'], resolved_by='steward',
+        )
+        _wire_queue(harness, tmp_path, esc)
+        plan_path = _seed_plan(harness, files=['pkg/a.py'])
+        _wire(harness, _row('review', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        _status_writes(harness).assert_not_awaited()
+        assert json.loads(plan_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert len(_files_updates(harness)) == 1
+
+    async def test_an_infra_held_resume_delivers_the_grant(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The infra-hold A1 arm re-pends without ever reaching the old fold
+        site; the grant must land on it too (task 5650)."""
+        esc = _esc(
+            task_id='3438', category='scope_violation',
+            granted_files=['pkg/b.py'], resolved_by='steward',
+        )
+        _wire_queue(harness, tmp_path, esc)
+        plan_path = _seed_plan(harness, files=['pkg/a.py'])
+        _wire(harness, _row('infra-hold', claimant=None, heartbeat=None))
+        harness._escalation_events.pop('3438', None)
+
+        await _drive(harness, esc)
+
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
+        assert json.loads(plan_path.read_text())['files'] == ['pkg/a.py', 'pkg/b.py']
+        assert len(_files_updates(harness)) == 1
 
     async def test_a_resolution_granting_nothing_never_scans_the_queue(
         self, harness: Harness, tmp_path: Path
@@ -1526,9 +1635,7 @@ class TestGrantedFilesFoldOnRepend:
         queue.get_by_task.assert_not_called()  # type: ignore[attr-defined]
         assert plan_path.read_text() == before
         assert _files_updates(harness) == []
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
-        )
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
 
     async def test_no_escalation_queue_is_a_no_op(self, harness: Harness):
         """Bare-harness path (``_escalation_queue is None``): no fold, no crash.
@@ -1551,6 +1658,210 @@ class TestGrantedFilesFoldOnRepend:
 
         assert plan_path.read_text() == before
         assert _files_updates(harness) == []
-        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
-            '3438', _resume_target(esc)
+        _status_writes(harness).assert_awaited_once_with('3438', _resume_target(esc))
+
+
+class TestGrantedFilesDeliveryProbe:
+    """Where a grant would land, asked synchronously (task 5650).
+
+    ``Harness.granted_files_delivery_blocker`` is what
+    ``escalation/server.py::resolve_issue`` consults to report
+    ``NO_PLAN_TO_WIDEN`` at the API instead of only in a log. It resolves the
+    plan new-then-old, as the fold does; which plan the fold then widens is
+    pinned end-to-end by
+    ``TestGrantedFilesFoldOnRepend.test_the_w11_sibling_plan_is_widened_over_a_legacy_one``.
+    """
+
+    def test_a_w11_sibling_plan_is_unblocked(self, harness: Harness):
+        _seed_plan(harness, files=['pkg/a.py'])
+
+        assert harness.granted_files_delivery_blocker('3438') is None
+
+    def test_a_legacy_plan_is_unblocked(self, harness: Harness):
+        _seed_plan(harness, files=['pkg/a.py'], legacy=True)
+
+        assert harness.granted_files_delivery_blocker('3438') is None
+
+    def test_no_plan_anywhere_is_no_plan_to_widen(self, harness: Harness):
+        assert (
+            harness.granted_files_delivery_blocker('3438')
+            is GrantDelivery.NO_PLAN_TO_WIDEN
         )
+
+
+_LOCK_DEPTH = 2
+_LIVE_PLAN = ['pkg/core/a.py']
+_SAME_MODULE_GRANT = ['pkg/core/b.py']
+_OTHER_MODULE_GRANT = ['pkg/other/c.py']
+
+
+def _live_slot_grant(
+    harness: Harness, tmp_path: Path, granted: list[str], *, level: int = 2,
+) -> tuple[Escalation, asyncio.Event, EscalationQueue]:
+    """The reported repro's wiring: an L2 grant resolved against a LIVE task.
+
+    The ``_escalation_events`` entry stays PRESENT, the inverse of every
+    re-pend fold test above, which pop it to take the orphan arm. The slot
+    holds the module lock its plan derives, in a real ``ModuleLockTable``, as
+    a dispatched slot does; the plan itself is seeded by each test.
+    """
+    esc = _esc(
+        task_id='3438', level=level, category='scope_violation',
+        granted_files=granted, resolved_by='escalation-watcher-auto',
+    )
+    queue = _wire_queue(harness, tmp_path, esc)
+    _wire(harness, _row('in-progress', claimant=LIVE_CLAIMANT, heartbeat='fresh'))
+    harness.config.lock_depth = _LOCK_DEPTH
+    lock_table = ModuleLockTable(
+        OrchestratorConfig(max_per_module=1, lock_depth=_LOCK_DEPTH),
+    )
+    assert lock_table.try_acquire('3438', derive_modules(_LIVE_PLAN, _LOCK_DEPTH))
+    harness.scheduler.lock_table = lock_table
+    event = asyncio.Event()
+    harness._escalation_events['3438'] = event
+    return esc, event, queue
+
+
+@pytest.mark.asyncio
+class TestGrantDeliveryOnALiveWorkflow:
+    """A grant resolved against a task whose workflow is LIVE is delivered (task 5650).
+
+    ``_escalation_events`` is registered at dispatch, so membership means "a
+    slot is open", not "a workflow is paused on THIS record". The live
+    workflow waits only on its own level-0 records, so an L2 resolved against
+    it wakes the event and goes back to sleep without ever reaching
+    ``workflow.py::TaskWorkflow._collect_granted_files``: the grant was
+    recorded and dropped, and the implementer looped (reify task 4263,
+    measured 2026-09-19). The harness widens a live slot only within the
+    module locks it holds, and leaves a level-0 grant to the workflow paused
+    on it.
+    """
+
+    async def test_a_grant_on_a_live_workflow_is_delivered(
+        self, harness: Harness, tmp_path: Path
+    ):
+        esc, event, queue = _live_slot_grant(harness, tmp_path, _SAME_MODULE_GRANT)
+        plan_path = _seed_plan(harness, files=_LIVE_PLAN)
+
+        await _drive(harness, esc)
+
+        assert json.loads(plan_path.read_text())['files'] == _LIVE_PLAN + _SAME_MODULE_GRANT
+        assert len(_files_updates(harness)) == 1
+        _status_writes(harness).assert_not_awaited()
+        assert event.is_set(), 'The synchronous wake path must still fire'
+        stored = queue.get(esc.id)
+        assert stored is not None
+        assert GRANT_NOT_DELIVERED_MARKER not in (stored.resolution or '')
+
+    async def test_a_grant_needing_an_unheld_lock_is_not_widened_into_a_live_plan(
+        self, harness: Harness, tmp_path: Path, caplog
+    ):
+        """A running implementer re-reads plan.json for its next prompt
+        (``workflow.py::TaskWorkflow._live_plan``), so widening it with a file
+        in a module the slot does not lock would let two tasks edit one
+        module. The grant stays recorded, the plan and ``metadata.files`` stay
+        as they were, and the record says why."""
+        esc, _event, queue = _live_slot_grant(harness, tmp_path, _OTHER_MODULE_GRANT)
+        plan_path = _seed_plan(harness, files=_LIVE_PLAN)
+        before = plan_path.read_text()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await _drive(harness, esc)
+
+        assert plan_path.read_text() == before
+        assert _files_updates(harness) == []
+        resolution = _resolution_of(queue, esc)
+        assert GRANT_NOT_DELIVERED_MARKER in resolution
+        reason = shortfall_reason(
+            GrantDelivery.NEEDS_UNHELD_LOCK,
+            task_id='3438', granted_files=_OTHER_MODULE_GRANT,
+        )
+        assert reason is not None and reason in resolution
+        assert any(
+            r.levelno == logging.WARNING and 'pkg/other' in r.getMessage()
+            for r in caplog.records
+        ), 'Expected a WARNING naming the module the slot does not lock'
+        _status_writes(harness).assert_not_awaited()
+
+    async def test_a_grant_on_the_live_workflows_own_level0_is_left_to_it(
+        self, harness: Harness, tmp_path: Path
+    ):
+        """The live workflow paused on its own level-0 record delivers that
+        grant itself: its resume branch unions every resolved grant
+        (``workflow.py::TaskWorkflow._collect_granted_files``) and widens
+        through ``TaskWorkflow._set_task_scope``, which also acquires the
+        locks. The harness writes nothing there, so that branch still finds
+        the delta whether it compares against its in-memory plan or re-reads
+        plan.json."""
+        esc, event, _queue = _live_slot_grant(
+            harness, tmp_path, _OTHER_MODULE_GRANT, level=0,
+        )
+        plan_path = _seed_plan(harness, files=_LIVE_PLAN)
+        before = plan_path.read_text()
+
+        labels = _record_scheduling(harness)
+        await _drive(harness, esc)
+
+        assert labels == [], f'the live L0 grant belongs to its workflow; got {labels}'
+        assert plan_path.read_text() == before
+        assert _files_updates(harness) == []
+        assert event.is_set(), 'The synchronous wake path must still fire'
+
+    @pytest.mark.parametrize('order', [('3438', '9999'), ('9999', '3438')])
+    async def test_a_grant_in_a_key_another_task_also_holds_is_delivered(
+        self, harness: Harness, tmp_path: Path, order: tuple[str, str]
+    ):
+        """A key with room for many holders is still the slot's own lock (task 5467).
+
+        Whichever of the two holders took it last, the live slot counts as
+        holding it, so a grant inside it widens the plan."""
+        esc, _event, _queue = _live_slot_grant(harness, tmp_path, ['docs/guide/b.md'])
+        lock_table = ModuleLockTable(OrchestratorConfig(
+            max_per_module=1, lock_depth=_LOCK_DEPTH,
+            unlimited_holder_locks=UnlimitedHolderLocksConfig(prefixes=('docs/',)),
+        ))
+        for holder in order:
+            assert lock_table.try_acquire(holder, ['docs/guide/a.md'])
+        harness.scheduler.lock_table = lock_table
+        plan_path = _seed_plan(harness, files=['docs/guide/a.md'])
+
+        await _drive(harness, esc)
+
+        assert json.loads(plan_path.read_text())['files'] == ['docs/guide/a.md', 'docs/guide/b.md']
+
+    async def test_a_grantless_resolve_on_a_live_workflow_schedules_nothing(
+        self, harness: Harness, tmp_path: Path
+    ):
+        esc, _event, _queue = _live_slot_grant(harness, tmp_path, [])
+        _seed_plan(harness, files=_LIVE_PLAN)
+
+        labels = _record_scheduling(harness)
+        await _drive(harness, esc)
+
+        assert labels == [], f'a grant-less live resolve must schedule nothing; got {labels}'
+
+    async def test_live_delivery_is_scheduled_under_its_own_label(
+        self, harness: Harness, tmp_path: Path
+    ):
+        esc, _event, _queue = _live_slot_grant(harness, tmp_path, _SAME_MODULE_GRANT)
+        _seed_plan(harness, files=_LIVE_PLAN)
+
+        labels = _record_scheduling(harness)
+        await _drive(harness, esc)
+
+        assert len(labels) == 1, f'expected exactly one scheduled coroutine; got {labels}'
+        assert 'grant-delivery task 3438' in labels[0]
+        assert 'cascade-unblock' not in labels[0]
+        assert 'orphan-unblock' not in labels[0]
+
+    async def test_a_live_slot_grant_with_no_plan_is_noted(
+        self, harness: Harness, tmp_path: Path
+    ):
+        esc, _event, queue = _live_slot_grant(harness, tmp_path, _SAME_MODULE_GRANT)
+
+        await _drive(harness, esc)
+
+        resolution = _resolution_of(queue, esc)
+        assert GRANT_NOT_DELIVERED_MARKER in resolution
+        assert _SAME_MODULE_GRANT[0] in resolution
+        _status_writes(harness).assert_not_awaited()

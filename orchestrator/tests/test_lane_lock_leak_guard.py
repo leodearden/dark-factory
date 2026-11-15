@@ -838,13 +838,13 @@ class TestRequireLaneLockHolders:
 # Pinned here in isolation against an INJECTED reader — the same convention as
 # the two classes above — so every case is deterministic, and touches no real
 # lock and no real /proc/locks.  No case asserts on ELAPSED wall clock (this
-# repo's 1335/1836/2819/3451/3491 load-sensitive flake class); the one case
-# that must observe the helper polling at all bounds the loop through the
-# explicit `timeout=`/`interval=0` parameters instead of shrinking the module
-# global, which leaves its read count robust by orders of magnitude rather than
-# by two sleeps (task 3783 review amendment — see that case's docstring).  The
-# end-to-end behaviour at both real call sites is pinned separately, further
-# below, by `TestContendedRaiseSurvivesALossyHolderRead`.
+# repo's 1335/1836/2819/3451/3491 load-sensitive flake class); the cases that
+# must observe the helper polling bound the loop through the explicit
+# `timeout=`/`interval=0` parameters instead of the module globals, which
+# leaves their read counts robust by orders of magnitude rather than by two
+# sleeps (task 3783 review amendment, task 6117 — see those cases'
+# docstrings).  The end-to-end behaviour at both real call sites is pinned
+# separately, further below, by `TestContendedRaiseSurvivesALossyHolderRead`.
 # ---------------------------------------------------------------------------
 
 
@@ -858,7 +858,7 @@ class TestSettledLaneLockHolderRead:
         """THE headline case: a lossy empty snapshot must not be the answer.
 
         Mechanism absorbed, measured on this host and recorded in full at
-        ``test_live_in_process_span_is_not_a_leak`` below (:1723-1731):
+        ``test_live_in_process_span_is_not_a_leak`` below:
         ``/proc/locks`` is a seq_file the kernel serves one PAGE per read(2)
         regardless of the caller's buffer (a 13062-byte table took 4 reads
         even for a 1 MiB request), and each read restarts the per-CPU
@@ -875,6 +875,11 @@ class TestSettledLaneLockHolderRead:
         have released in between, which is exactly what today's degraded
         message says — so it is RE-READ, not disbelieved (see
         ``test_a_permanently_empty_read_degrades_and_never_raises``).
+
+        The poll is bounded through the explicit ``timeout=``/``interval=0``
+        parameters rather than the 0.5s/0.02s globals, so the read count does
+        not depend on the wall clock (see
+        ``test_a_permanently_empty_read_degrades_and_never_raises``).
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
 
@@ -890,13 +895,20 @@ class TestSettledLaneLockHolderRead:
 
         monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _lossy_reader)
 
-        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+        result = await git_ops_mod._settled_lane_lock_holder_pids(
+            lock_path, timeout=10.0, interval=0,
+        )
 
         assert result == [4242], (
             f'a lossy empty read must be polled past, not returned as the '
             f'holder set — returning it drops the holder pid+pgid from the '
             f'operator message and fails layer (1) of the leak predicate; '
             f'got {result!r} after {len(calls)} read(s)'
+        )
+        assert len(calls) == 3, (
+            f'the helper must return on the FIRST non-empty poll rather than '
+            f'keep reading the kernel lock table to the deadline; the reader '
+            f'was called {len(calls)} time(s)'
         )
 
     async def test_a_non_empty_first_read_is_returned_without_a_second_read(
@@ -958,8 +970,11 @@ class TestSettledLaneLockHolderRead:
         Call-time resolution of the module globals is pinned separately and
         deterministically by
         ``test_the_settle_bound_is_read_from_the_module_globals_at_call_time``;
-        the shipped default pair is exercised by
-        ``test_polls_past_a_lossy_empty_read`` above.
+        the shipped default pair is exercised end to end at both production
+        call sites by ``TestContendedRaiseSurvivesALossyHolderRead``, through
+        ``test_a_lossy_first_read_still_names_the_foreign_holder`` (reset site)
+        and ``test_the_lease_contended_raise_also_names_the_foreign_holder``
+        (lease site).
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
 

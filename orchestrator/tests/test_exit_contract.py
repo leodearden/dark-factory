@@ -423,5 +423,6 @@ def test_a_violation_logged_while_a_leaked_task_is_drained_fails_the_test_that_l
     assert '2 passed, 1 error' in run.stdout, output
 
 
-def test_enforce_flag_ships_dark():
+@pytest.mark.usefixtures("code_default_config")
+def test_the_code_default_is_log_mode():
     assert OrchestratorConfig().workflow_exit_contract_enforce is False

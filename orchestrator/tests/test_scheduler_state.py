@@ -16,11 +16,12 @@ from pydantic import ValidationError
 from shared.project_layout import scheduler_state_json
 from shared.scheduler_state import PinQueueEntry, SchedulerStateSnapshot
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, UnlimitedHolderLocksConfig
 from orchestrator.event_store import EventType
+from orchestrator.lock_table import ModuleLockTable, one_holder_per_key
 from orchestrator.overrides import OverrideStore
 from orchestrator.pin_reservation import PinOrder
-from orchestrator.scheduler import ModuleLockTable, Scheduler
+from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
 # Reuse the _RecordingEventStore test double from test_scheduler.py
@@ -550,7 +551,8 @@ class TestEffectivePrioritiesCache:
 _SNAPSHOT_KEYS = frozenset({
     'skip_counts', 'parks', 'park_stacks', 'effective_priorities',
     'pin_queue', 'overrides', 'current_holders', 'lock_depth', 'snapshot_at',
-    'is_paused', 'pause_reason', 'requeue_cooldowns', 'pin_reservations',
+    'is_paused', 'pause_reason', 'pause_class', 'requeue_cooldowns',
+    'pin_reservations', 'held_by_task',
 })
 
 
@@ -563,9 +565,9 @@ def _arm_transient_cooldown(scheduler: Scheduler, task_id: str) -> None:
 
 
 class TestGetStateSnapshotShape:
-    """get_state_snapshot() returns a SchedulerStateSnapshot with the thirteen wire keys."""
+    """get_state_snapshot() returns a SchedulerStateSnapshot with every wire key."""
 
-    def test_snapshot_returns_thirteen_top_level_keys(self):
+    def test_snapshot_returns_every_top_level_key(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         snap = scheduler.get_state_snapshot()
@@ -583,6 +585,7 @@ class TestGetStateSnapshotShape:
         assert snap.pin_queue == ()
         assert snap.overrides == {}
         assert snap.current_holders == {}
+        assert snap.held_by_task == {}
         assert snap.requeue_cooldowns == {}
         assert snap.pin_reservations == {}
         assert snap.snapshot_at is not None
@@ -676,6 +679,31 @@ class TestGetStateSnapshotShape:
             snap.is_paused = True
 
 
+@pytest.mark.usefixtures('code_default_config')
+class TestGetStateSnapshotNamesEveryHolder:
+    @pytest.mark.parametrize('order', [('A', 'B'), ('B', 'A')])
+    def test_both_holders_of_an_unlimited_key_are_published(self, order):
+        first, second = order
+        scheduler = Scheduler(OrchestratorConfig(
+            max_per_module=1,
+            unlimited_holder_locks=UnlimitedHolderLocksConfig(root_markdown=True),
+        ))
+        scheduler.finish_startup()
+        assert scheduler.lock_table.try_acquire(first, ['OPERATIONS.md'])
+        assert scheduler.lock_table.try_acquire(second, ['OPERATIONS.md'])
+
+        snap = scheduler.get_state_snapshot()
+
+        assert snap.held_by_task == {
+            first: ('OPERATIONS.md',),
+            second: ('OPERATIONS.md',),
+        }
+        assert snap.current_holders == one_holder_per_key(snap.held_by_task)
+        assert snap.holder_task_ids() == {first, second}
+        round_tripped = SchedulerStateSnapshot.from_json(json.loads(json.dumps(snap.to_json())))
+        assert round_tripped.holder_task_ids() == {first, second}
+
+
 # ===========================================================================
 # Step-13: get_state_snapshot() with populated state after real ticks
 # ===========================================================================
@@ -703,6 +731,9 @@ class TestGetStateSnapshotPopulated:
         Assertions mirror the step-13 spec exactly.
         """
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.skip_threshold = {
+            'critical': 0, 'high': 1, 'medium': 2, 'low': 4, 'polish': 9999,
+        }
         store = OverrideStore(tmp_path / 'o.db')
 
         # T1 gets a boost override (medium → high).

@@ -31,6 +31,7 @@ from test_workflow import (
     _CheckSequence,
     _make_workflow,
     _merge_attempt_outcomes,
+    _wire_scope_backend,
 )
 
 from orchestrator.agents.invoke import AgentResult
@@ -94,6 +95,10 @@ def _arm_gate(
         return AgentResult(success=True, output='', cost_usd=0.0, turns=1)
     monkeypatch.setattr(wf, '_invoke', fake_invoke)
     wf.briefing.build_plan_tightening_prompt = AsyncMock(return_value='PROMPT')
+
+    # The narrowing pass reconciles scope through the scheduler, so held
+    # modules and metadata.files must be consistent with the plan it narrows.
+    _wire_scope_backend(wf, ['a.py', 'b.py', 'c.py'])
 
     merge_queue: asyncio.Queue = asyncio.Queue()
     wf.merge_queue = merge_queue
@@ -304,6 +309,11 @@ async def test_merge_phase_returns_a_terminal_done_without_running_the_merge_suc
     wf.config.max_merge_retries = 1
     wf.config.max_pre_merge_retries = 1
     wf.git_ops.rebase_onto_main = AsyncMock(return_value=True)
+    # A branch still beyond main at merge entry, so the merge attempt runs.
+    wf.git_ops.is_ancestor = AsyncMock(return_value=False)
+    wf.git_ops.is_ancestor_checked = AsyncMock(return_value=False)
+    wf.git_ops.resolve_branch_sha = AsyncMock(return_value=None)
+    wf.git_ops.has_uncommitted_work = AsyncMock(return_value=False)
     finalise_merged_done = AsyncMock(return_value=WorkflowOutcome.DONE)
     write_completion = AsyncMock()
     clear_retry_pending = AsyncMock()

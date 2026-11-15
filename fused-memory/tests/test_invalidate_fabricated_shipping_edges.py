@@ -4,8 +4,8 @@ Loaded via importlib so the script (``scripts/`` is not a package and is not
 on PYTHONPATH) can be tested without sys.path pollution — the same idiom as
 ``test_cleanup_count_snapshots.py`` / ``test_tag_cgl_eta_rehome_scope.py``.
 
-Scope note: this file covers the ``--apply`` store-mutation preflight only
-(task 4293). The script has no injectable ``run(args, memory=...)`` seam —
+Scope note: this file covers the ``--apply`` store-mutation preflight
+(task 4293) and ``find_shipping_edges``' graph read. The script has no injectable ``run(args, memory=...)`` seam —
 ``_run`` builds its own ``FusedMemoryConfig``/``MemoryService`` — but that
 costs nothing here, because the guard is placed ABOVE those lazy imports: a
 denied probe must abort while never importing or constructing a backend at
@@ -16,15 +16,19 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
+from _graph_access_fake import FakeGraphAccess
 from _store_mutation_preflight_contract import (
     SENTINEL,
     deny,
     fail_closed_records,
     neutralise_fixture,
 )
+
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent
@@ -111,7 +115,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod._run(self._args(apply=True))
 
@@ -129,7 +133,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         _install_backend_sentinel(monkeypatch)
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod._run(self._args(apply=True))
 
     @pytest.mark.asyncio
@@ -204,14 +208,42 @@ class TestRunApplyStoreMutationPreflight:
 
         with (
             caplog.at_level(logging.ERROR),
-            pytest.raises(_mod.StoreMutationUnavailable),
+            pytest.raises(StoreMutationUnavailable),
         ):
             await _mod._run(self._args(apply=True))
 
         # The logger is ``invalidate_shipping_edges``, NOT the module name --
         # filtering on the module name would match nothing and be vacuous.
-        assert fail_closed_records(caplog, 'invalidate_shipping_edges'), (
+        (record,) = fail_closed_records(caplog, 'invalidate_shipping_edges')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'
         )
+
+
+class TestFindShippingEdges:
+    @pytest.mark.asyncio
+    async def test_reads_unexpired_shipping_edges_from_the_project_graph(
+        self, make_backend, mock_config,
+    ):
+        raw = MagicMock()
+        raw.ro_query = AsyncMock(return_value=MagicMock(
+            result_set=[['e1', 'Task 123 shipped via fused-memory/src/x.py']],
+        ))
+        backend = make_backend(mock_config, graph_access=FakeGraphAccess({'dark_factory': raw}))
+
+        edges = await _mod.find_shipping_edges(backend, 'dark_factory', op='probe')
+
+        assert len(edges) == 1
+        (edge,) = edges
+        assert isinstance(edge, _mod.EdgeCandidate)
+        assert edge.edge_uuid == 'e1'
+        assert edge.project_id == 'dark_factory'
+        assert edge.task_id == '123'
+        assert edge.file_path == 'fused-memory/src/x.py'
+        raw.ro_query.assert_awaited_once()
+        (cypher,) = raw.ro_query.await_args.args
+        assert raw.ro_query.await_args.kwargs == {}
+        assert 'shipped via' in cypher
+        assert 'invalid_at IS NULL' in cypher

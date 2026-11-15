@@ -1,16 +1,25 @@
-"""Test doubles shared by the orchestrator.proc_supervision test files.
+"""Test doubles and helpers shared by the orchestrator.proc_supervision test files.
 
 Imported by bare module name (``from _proc_supervision_doubles import ...``),
 like ``_orch_helpers`` -- ``orchestrator/tests/`` has no ``__init__.py``.
 
-One copy of the subprocess runner double and of the canonical detached RP-4
-restart plan, so every proc_supervision test file pins the same plan shape.
+One copy each of the subprocess-runner and unit-inspector doubles, the
+canonical detached RP-4 restart plan, the ``tmp_queue_dir`` escalation
+queue_dir fixture and the ``read_escalations`` EscalationQueue read helper,
+so every proc_supervision test file pins the same shapes. A module using the
+fixture re-exports it by redundant alias
+(``from _proc_supervision_doubles import tmp_queue_dir as tmp_queue_dir``):
+the import binding is what registers it with pytest, and the alias form
+needs no lint suppression.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from escalation.queue import EscalationQueue
 
 from orchestrator.proc_supervision import EscalationSpec, RestartPlan
 
@@ -43,6 +52,59 @@ class FakeRunner:
         proc.returncode = self.returncode
         self.procs.append(proc)
         return proc
+
+
+def make_fake_inspector(state: dict):
+    """Build an async inspector callable: ``(unit, *, timeout_secs, reap_grace_secs=5.0) -> dict``.
+
+    Returns a shallow copy of *state* on every call regardless of args, and
+    records each call's kwargs on the returned callable's ``.calls`` list
+    (each entry: ``{'unit', 'timeout_secs', 'reap_grace_secs'}``) so tests can
+    assert the exact unit/timeout the RP-5 verify leg was invoked with.
+    Mirrors the injected-inspector pattern in test_deterministic_runner.py
+    (AsyncMock ``unit_inspector``).
+    """
+    calls: list[dict] = []
+
+    async def _inspector(unit: str, *, timeout_secs: float, reap_grace_secs: float = 5.0) -> dict:
+        calls.append({
+            'unit': unit,
+            'timeout_secs': timeout_secs,
+            'reap_grace_secs': reap_grace_secs,
+        })
+        return dict(state)
+
+    _inspector.calls = calls  # type: ignore[attr-defined]
+    return _inspector
+
+
+@pytest.fixture
+def tmp_queue_dir(tmp_path: Path) -> Path:
+    """A ``tmp_path`` subdirectory usable as an ``EscalationQueue`` queue_dir.
+
+    Not pre-created — ``EscalationQueue.__init__`` mkdir(parents=True,
+    exist_ok=True)'s it, matching production (the queue dir may not yet exist
+    when the first escalation is filed).
+    """
+    return tmp_path / 'escalations'
+
+
+def read_escalations(
+    queue_dir: str | Path,
+    task_id: str,
+    *,
+    status: str | None = None,
+    level: int | None = None,
+    agent_role: str | None = None,
+) -> list:
+    """Construct ``EscalationQueue(queue_dir)`` and return ``get_by_task(task_id, ...)``.
+
+    Product read path (PRD Sec 7): tests assert filed escalations through
+    this helper rather than inspecting on-disk JSON directly.
+    """
+    return EscalationQueue(Path(queue_dir)).get_by_task(
+        task_id, status=status, level=level, agent_role=agent_role,
+    )
 
 
 def detached_rp4_plan(queue_dir: Path, *, with_spec: bool) -> RestartPlan:

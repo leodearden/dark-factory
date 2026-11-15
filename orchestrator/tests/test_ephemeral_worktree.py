@@ -28,6 +28,7 @@ Test coverage:
            LOCK_NB-denied acquire raises EphemeralWorktreeError BEFORE any
            `git worktree add`, the CM body never runs, and a pre-existing
            foreign-held lock file is never unlinked)
+  task 6794: TestEphemeralWorktreeCancellationSafeCleanup, TestEphemeralWorktreeRemoveFailureIsReported, TestEphemeralWorktreeResidueKeepsLock
 """
 from __future__ import annotations
 
@@ -35,22 +36,28 @@ import asyncio
 import fcntl
 import logging
 import os
+import subprocess
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, call, patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _worktree_add_fakes import make_fake_run
+from _worktree_registrations import registered_worktree_paths
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import (
     PROTECTED_PREFIXES,
+    EphemeralWorktreeError,
     GitOps,
     SeedLaneLock,
     WarmBaseHealth,
     WorktreeKind,
 )
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_cancel import lane_lock_path
 
 # ---------------------------------------------------------------------------
 # step-1: WorktreeKind enum + E2 registration
@@ -1387,3 +1394,318 @@ class TestEphemeralWorktreeSharedRetryDriver:
         assert not [c for c in calls if 'worktree' in c and 'prune' in c], (
             'git worktree prune is categorically forbidden (DD5)'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 6794: teardown survives cancellation, and a failed remove is reported
+# ---------------------------------------------------------------------------
+
+
+def _head_sha(repo: Path) -> str:
+    return subprocess.run(
+        ['git', 'rev-parse', 'HEAD'], cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _assert_no_residue(repo: Path, path: Path) -> None:
+    lock_path = lane_lock_path(path)
+    assert not path.exists(), f'expected the minted tree {path} to be removed'
+    assert not lock_path.exists(), f'expected the sibling lock {lock_path} to be unlinked'
+    assert str(path) not in registered_worktree_paths(repo), (
+        f'expected {path} to be deregistered from git'
+    )
+
+
+def _cancel_current_task() -> None:
+    current = asyncio.current_task()
+    assert current is not None
+    current.cancel()
+
+
+class TestEphemeralWorktreeCancellationSafeCleanup:
+    """task 6794: a cancellation at body exit, during the warm seed, or
+    repeatedly through the teardown itself still removes the tree, its git
+    registration and its lock. Real git, no ``_run`` patch."""
+
+    @pytest.mark.parametrize('kind', [WorktreeKind.MAIN_PROBE, WorktreeKind.MAIN_SWEEP])
+    def test_pending_cancellation_at_body_exit_still_removes_tree_and_lock(
+        self, tmp_path: Path, kind: WorktreeKind,
+    ) -> None:
+        repo = seed_repo(tmp_path / 'repo')
+        git_ops = GitOps(GitConfig(), repo)
+        minted: list[Path] = []
+
+        async def consumer() -> None:
+            async with git_ops.ephemeral_worktree(kind, _head_sha(repo)) as p:
+                minted.append(p)
+                (p / 'target').mkdir(parents=True)
+                (p / 'target' / 'artifact').write_text('built')
+                _cancel_current_task()
+
+        async def scenario() -> None:
+            task = asyncio.create_task(consumer())
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
+
+        asyncio.run(scenario())
+
+        assert len(minted) == 1
+        _assert_no_residue(repo, minted[0])
+
+    def test_repeated_cancellation_through_body_and_teardown_still_removes_everything(
+        self, tmp_path: Path,
+    ) -> None:
+        repo = seed_repo(tmp_path / 'repo')
+        git_ops = GitOps(GitConfig(), repo)
+        minted: list[Path] = []
+
+        async def scenario() -> None:
+            entered = asyncio.Event()
+
+            async def consumer() -> None:
+                async with git_ops.ephemeral_worktree(
+                    WorktreeKind.MAIN_SWEEP, _head_sha(repo),
+                ) as p:
+                    minted.append(p)
+                    entered.set()
+                    await asyncio.sleep(3600)
+
+            consumer_task = asyncio.create_task(consumer())
+
+            async def canceller() -> None:
+                await entered.wait()
+                while not consumer_task.done():
+                    consumer_task.cancel()
+                    await asyncio.sleep(0.005)
+
+            canceller_task = asyncio.create_task(canceller())
+            with pytest.raises(asyncio.CancelledError):
+                await consumer_task
+            await canceller_task
+            assert consumer_task.cancelled()
+
+        asyncio.run(scenario())
+
+        assert len(minted) == 1
+        _assert_no_residue(repo, minted[0])
+
+    def test_cancellation_during_warm_seed_still_tears_down(self, tmp_path: Path) -> None:
+        repo = seed_repo(tmp_path / 'repo')
+        git_ops = GitOps(GitConfig(), repo)
+        minted: list[Path] = []
+        entered = False
+
+        async def _cancel_self(path: Path, *args: object, **kwargs: object) -> int:
+            minted.append(path)
+            _cancel_current_task()
+            await asyncio.sleep(0)
+            return 0
+
+        async def consumer() -> None:
+            nonlocal entered
+            async with git_ops.ephemeral_worktree(
+                WorktreeKind.MAIN_PROBE, _head_sha(repo), warm_seed=True,
+            ):
+                entered = True  # must never run
+
+        async def scenario() -> None:
+            task = asyncio.create_task(consumer())
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelled()
+
+        with (
+            patch.object(git_ops, '_warm_lane_base_resolvable', return_value=WarmBaseHealth.OK),
+            patch.object(git_ops, '_seed_warm_lane', new=_cancel_self),
+        ):
+            asyncio.run(scenario())
+
+        assert not entered, 'expected the CM body to never run after a cancelled seed'
+        assert len(minted) == 1
+        _assert_no_residue(repo, minted[0])
+
+
+def _fake_run_with_remove(
+    calls: list[list[str]], remove_outcome: Callable[[], tuple[int, str, str]],
+):
+    """Fake ``_run``: a ``worktree add`` succeeds and mkdirs its target; a
+    ``worktree remove`` answers *remove_outcome* (which may raise)."""
+
+    async def _fake_run(cmd, **kwargs) -> tuple[int, str, str]:
+        calls.append(list(cmd))
+        if 'worktree' in cmd and 'add' in cmd:
+            Path(cmd[-2]).mkdir(parents=True, exist_ok=True)
+            return (0, '', '')
+        if 'worktree' in cmd and 'remove' in cmd:
+            return remove_outcome()
+        return (0, '', '')
+
+    return _fake_run
+
+
+def _git_ops_warnings_naming(caplog: pytest.LogCaptureFixture, path: Path) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records
+        if r.name == 'orchestrator.git_ops'
+        and r.levelno >= logging.WARNING
+        and str(path) in r.getMessage()
+    ]
+
+
+class TestEphemeralWorktreeRemoveFailureIsReported:
+    """task 6794: a ``git worktree remove`` that fails or cannot run is a
+    WARNING naming the path, never a silent DEBUG. The ``rm`` half is pinned
+    in test_tree_removal.py."""
+
+    def test_nonzero_worktree_remove_is_a_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        minted: list[Path] = []
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_SWEEP, MAIN_SHA) as p:
+                minted.append(p)
+
+        fake = _fake_run_with_remove(calls, lambda: (128, '', 'fatal: simulated remove failure'))
+        with (
+            patch('orchestrator.git_ops._run', side_effect=fake),
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+        ):
+            asyncio.run(_body())
+
+        (p,) = minted
+        records = _git_ops_warnings_naming(caplog, p)
+        assert len(records) == 1, f'expected one WARNING naming {p}; got {records}'
+        message = records[0].getMessage()
+        assert 'rc=128' in message, message
+        assert 'simulated remove failure' in message, message
+        assert not p.exists(), 'expected remove_tree to still delete the tree'
+
+    def test_worktree_remove_that_raises_is_a_warning_and_does_not_escape(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        minted: list[Path] = []
+
+        def _raise() -> tuple[int, str, str]:
+            raise OSError('simulated spawn failure')
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA) as p:
+                minted.append(p)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_fake_run_with_remove(calls, _raise)),
+            caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+        ):
+            asyncio.run(_body())  # must not raise
+
+        (p,) = minted
+        records = _git_ops_warnings_naming(caplog, p)
+        assert records, f'expected a WARNING naming {p}'
+        assert all(r.exc_info for r in records), 'expected the WARNING to carry exc_info'
+        assert not p.exists(), 'expected remove_tree to still delete the tree'
+
+
+def _assert_lock_unheld(lock_path: Path) -> None:
+    """A second open-file-description takes LOCK_NB, as gc.sh's ``flock -n`` would."""
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _make_undeletable(tree: Path) -> Path:
+    """Give *tree* a subdirectory whose file an unprivileged rm cannot delete."""
+    ro = tree / 'ro'
+    ro.mkdir(parents=True)
+    (ro / 'f').write_text('pinned')
+    ro.chmod(0o500)
+    return ro
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root bypasses permission bits')
+class TestEphemeralWorktreeResidueKeepsLock:
+    """task 6794: a tree that survives teardown keeps its ``<name>.lock``,
+    unheld, so the residue stays visible to gc.sh's ``flock -n`` reclaim and
+    the #5584 sweep instead of becoming an unregistered, lock-less orphan."""
+
+    def test_residue_surviving_teardown_keeps_an_unheld_lock_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        repo = seed_repo(tmp_path / 'repo')
+        git_ops = GitOps(GitConfig(), repo)
+        minted: list[Path] = []
+        pinned: list[Path] = []
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_SWEEP, _head_sha(repo)) as p:
+                minted.append(p)
+                pinned.append(_make_undeletable(p / 'target'))
+
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+                asyncio.run(_body())  # must not raise
+
+            (p,) = minted
+            lock_path = lane_lock_path(p)
+            assert p.exists(), 'expected the undeletable tree to survive as residue'
+            assert str(p) not in registered_worktree_paths(repo)
+            assert lock_path.exists(), f'expected {lock_path} to outlive the residue'
+            _assert_lock_unheld(lock_path)
+            assert [
+                r for r in _git_ops_warnings_naming(caplog, p)
+                if str(lock_path) in r.getMessage()
+            ], 'expected a WARNING naming the residue and its retained lock'
+        finally:
+            for ro in pinned:
+                ro.chmod(0o700)
+
+    def test_failed_add_with_unremovable_residue_keeps_lock_and_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        git_ops = GitOps(GitConfig(), tmp_path)
+        calls: list[list[str]] = []
+        targets: list[Path] = []
+        pinned: list[Path] = []
+
+        async def _fake_run(cmd, **kwargs) -> tuple[int, str, str]:
+            calls.append(list(cmd))
+            if 'worktree' in cmd and 'add' in cmd:
+                target = Path(cmd[-2])
+                targets.append(target)
+                pinned.append(_make_undeletable(target))
+                return (1, '', 'No space left on device')
+            return (0, '', '')
+
+        async def _body() -> None:
+            async with git_ops.ephemeral_worktree(WorktreeKind.MAIN_PROBE, MAIN_SHA):
+                pass  # must never run
+
+        try:
+            with (
+                patch('orchestrator.git_ops._run', side_effect=_fake_run),
+                caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'),
+                pytest.raises(EphemeralWorktreeError),
+            ):
+                asyncio.run(_body())
+
+            (target,) = targets
+            lock_path = lane_lock_path(target)
+            assert target.exists(), 'expected the undeletable add residue to survive'
+            assert lock_path.exists(), f'expected {lock_path} to outlive the residue'
+            _assert_lock_unheld(lock_path)
+            assert [
+                r for r in _git_ops_warnings_naming(caplog, target)
+                if str(lock_path) in r.getMessage()
+            ], 'expected a WARNING naming the residue and its retained lock'
+            assert not [c for c in calls if 'worktree' in c and 'remove' in c]
+        finally:
+            for ro in pinned:
+                ro.chmod(0o700)

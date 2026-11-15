@@ -50,7 +50,7 @@ Both halves are green-tier hot-tunable, so a noisy detector can be retuned live.
 
 SHAPE
 -----
-Three deliberately separate pieces, following ``merge_skew_tripwire.py`` for
+Deliberately separate pieces, following ``merge_skew_tripwire.py`` for
 the pure/injectable split and ``merge_liveness.py`` for the alarm/recovery pair:
 
 * :class:`ZeroProgressRequeueTracker` — pure per-task streak + span tracking.
@@ -61,6 +61,11 @@ the pure/injectable split and ``merge_liveness.py`` for the alarm/recovery pair:
   worse — the ``has_open_l1`` dedup would then permanently suppress the alarm
   for a genuine LATER recurrence on the same task, silencing the detector after
   one incident per task for the whole life of the queue.
+* :func:`inherit_zero_progress_alarms` — the restart-surviving half of the
+  caller's filed-at memo: it seeds a fresh process's memo from the alarms a
+  prior process left pending, so the recovery half can still reach them.
+* ``sentinel_alarm_wrappers.discharge_sentinel_wrappers`` — the membership rule
+  the recovery half shares with ``recovery_emission``'s veto-streak alarm.
 
 Every collaborator is passed as an explicit keyword argument.
 
@@ -71,6 +76,14 @@ while a consecutive streak is exactly the incident's measured shape and is
 deterministic.  Any non-zero-progress outcome — DONE, BLOCKED, or a requeue
 that DID invoke an agent — resets it, so genuine slow progress never
 accumulates a false alarm.
+
+WRAPPERS
+--------
+The auto-watcher may promote these alarms into human-facing L2 wrappers.  A
+wrapper is minted under the sentinel — the server enforces that through
+``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES`` — and the recovery half
+discharges it by MEMBERSHIP, never by its category or task_id; the rule is
+``sentinel_alarm_wrappers.py``'s module docstring.
 """
 
 from __future__ import annotations
@@ -81,6 +94,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from orchestrator.sentinel_alarm_wrappers import discharge_sentinel_wrappers
 from orchestrator.workflow_types import WorkflowOutcome
 
 logger = logging.getLogger(__name__)
@@ -88,7 +102,9 @@ logger = logging.getLogger(__name__)
 #: Sentinel task_id prefix for the alert.  A synthetic id is required because
 #: no per-task steward can be dispatched for this alarm — it is a monitor
 #: signal ABOUT a task, not work ON one.  Same shape as
-#: merge_liveness's ``_verify_host_unreachable_sentinel``.
+#: merge_liveness's ``_verify_host_unreachable_sentinel``.  An L2 wrapping
+#: these alarms must be minted under the sentinel too; the server enforces
+#: that through ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES``.
 ZERO_PROGRESS_SENTINEL_PREFIX = '__zero_progress_requeue__'
 
 #: Category used for both the filed escalation and the has_open_l1 signature
@@ -97,7 +113,31 @@ ZERO_PROGRESS_SENTINEL_PREFIX = '__zero_progress_requeue__'
 _CATEGORY = 'risk_identified'
 
 #: agent_role stamped on both the alarm and its resolution.
-_ROLE = 'orchestrator-zero-progress-requeue'
+#:
+#: A CROSS-LAYER contract: ``escalation.authority.PROMOTE_SENTINEL_BOUND_ROLES``
+#: duplicates this string (lockstep-tested in
+#: ``escalation/tests/test_authority.py``) so ``promote_to_l2`` can refuse to
+#: mint a wrapper of these alarms under the real task id.  Rename both sides
+#: together.
+ZERO_PROGRESS_REQUEUE_ROLE = 'orchestrator-zero-progress-requeue'
+
+
+def _sentinel(task_id: str) -> str:
+    """Return the synthetic task id this detector files *task_id*'s alarm under."""
+    return f'{ZERO_PROGRESS_SENTINEL_PREFIX}{task_id}'
+
+
+def _alarm_subject(esc_task_id: str | None) -> str | None:
+    """Return the real task id behind a :func:`_sentinel` id, else ``None``.
+
+    Also ``None`` for a record with no task_id.
+    """
+    if esc_task_id is None:
+        return None
+    subject = esc_task_id.removeprefix(ZERO_PROGRESS_SENTINEL_PREFIX)
+    if subject == esc_task_id or not subject:
+        return None
+    return subject
 
 
 @dataclass
@@ -269,7 +309,7 @@ def emit_zero_progress_requeue_alert(
         return False
 
     try:
-        sentinel = f'{ZERO_PROGRESS_SENTINEL_PREFIX}{task_id}'
+        sentinel = _sentinel(task_id)
 
         # Dedup: one alert per unresolved incident.  ``has_open_l1`` globs and
         # JSON-parses every pending escalation in the queue, and this runs on
@@ -325,7 +365,7 @@ def emit_zero_progress_requeue_alert(
         esc = Escalation(
             id=escalation_queue.make_id(sentinel),
             task_id=sentinel,
-            agent_role=_ROLE,
+            agent_role=ZERO_PROGRESS_REQUEUE_ROLE,
             severity='blocking',
             level=1,
             category=_CATEGORY,
@@ -422,8 +462,8 @@ def resolve_zero_progress_requeue_alert(
     same task — the detector would silence itself after one incident per task,
     for the life of the queue.
 
-    Called on the streak-reset transition, i.e. whenever
-    ``ZeroProgressRequeueTracker.record`` returns 0 after a non-zero streak.
+    Called whenever ``ZeroProgressRequeueTracker.record`` returns 0; the cheap
+    gate below, not the caller, decides whether that warrants a disk check.
     Deliberately NOT gated on ``config.zero_progress_requeue.enabled``:
     disabling the detector must not strand an already-filed blocking alarm.
 
@@ -435,23 +475,28 @@ def resolve_zero_progress_requeue_alert(
         escalation_queue: The :class:`EscalationQueue`, or ``None`` (no-op).
         event_store: Optional event store for the recovery event.
         task_id: The REAL task id that just made progress.
-        recovered_streak: The streak immediately BEFORE the reset.
+        recovered_streak: The streak immediately BEFORE the reset, as this
+            process observed it.
         threshold: ``config.zero_progress_requeue.threshold``.
         filed_at: The same caller-owned memo passed to the emitter.  Its entry
             for ``task_id`` is dropped here, so the next incident on this task
             re-files rather than short-circuiting on a stale memo.
 
+    Its L2 wrappers are discharged too, by membership; see the module
+    docstring's WRAPPERS paragraph.
+
     Returns:
-        ``True`` when at least one pending L1 was resolved.
+        ``True`` when at least one record — an own alarm or a wrapper — was
+        resolved.
     """
     if escalation_queue is None:
         return False
 
     # Cheap gate FIRST — a healthy fleet calls this on every DONE, and touching
     # the filesystem there would be a per-dispatch pending-queue scan.  We only
-    # look at disk when this process actually filed (memo hit), or when the
-    # streak that just broke was long enough that a PRIOR process could have
-    # filed for it before a restart.
+    # look at disk when the memo names the task (this process filed, or
+    # inherit_zero_progress_alarms found a prior process's alarm at startup),
+    # or when the streak that just broke was long enough to have filed one.
     was_filed = filed_at is not None and task_id in filed_at
     if not was_filed and recovered_streak < threshold:
         return False
@@ -459,26 +504,21 @@ def resolve_zero_progress_requeue_alert(
     if filed_at is not None:
         filed_at.pop(task_id, None)
 
+    sentinel = _sentinel(task_id)
+    observed = (
+        f' after {recovered_streak} such requeue(s) observed by this process'
+        if recovered_streak else ''
+    )
+    resolution = (
+        f'Task {task_id} resumed making progress — its zero-agent-invocation '
+        f'requeue streak broke{observed} (the task reached a terminal '
+        'outcome, or requeued having actually invoked an agent).  '
+        'Auto-resolved by the zero-progress requeue detector; it will '
+        're-file if the loop recurs.'
+    )
     try:
-        sentinel = f'{ZERO_PROGRESS_SENTINEL_PREFIX}{task_id}'
-        pending = escalation_queue.get_by_task(sentinel, status='pending')
-        resolved = 0
-        for esc in pending:
-            if getattr(esc, 'category', None) != _CATEGORY:
-                continue
-            escalation_queue.resolve(
-                esc.id,
-                (
-                    f'Task {task_id} resumed making progress — the '
-                    f'{recovered_streak}-requeue zero-agent-invocation streak '
-                    'broke (the task reached a terminal outcome, or requeued '
-                    'having actually invoked an agent).  Auto-resolved by the '
-                    'zero-progress requeue detector; it will re-file if the '
-                    'loop recurs.'
-                ),
-                resolved_by=_ROLE,
-            )
-            resolved += 1
+        pending = escalation_queue.get_pending()
+        alarms = _resolve_own_alarms(escalation_queue, pending, sentinel, resolution)
     except Exception as exc:  # noqa: BLE001 — fail-open backstop
         logger.warning(
             'zero-progress-requeue alert for task %s could not be resolved '
@@ -486,12 +526,18 @@ def resolve_zero_progress_requeue_alert(
         )
         return False
 
-    if not resolved:
+    wrappers = discharge_sentinel_wrappers(
+        escalation_queue, pending, alarm_role=ZERO_PROGRESS_REQUEUE_ROLE,
+        sentinel=sentinel, resolution=resolution,
+    )
+    if not (alarms or wrappers):
         return False
 
     logger.info(
-        'Zero-progress requeue alert resolved for task %s after a %d-requeue '
-        'streak broke', task_id, recovered_streak,
+        'Zero-progress requeue alert resolved for task %s: streak broke after '
+        '%d zero-progress requeue(s) observed by this process '
+        '(%d alarm(s), %d wrapper(s))',
+        task_id, recovered_streak, alarms, wrappers,
     )
 
     if event_store is not None:
@@ -501,7 +547,7 @@ def resolve_zero_progress_requeue_alert(
             event_store.emit(
                 EventType.zero_progress_requeue_recovered,
                 task_id=task_id,
-                data={'streak': recovered_streak, 'resolved': resolved},
+                data={'streak': recovered_streak, 'resolved': alarms, 'wrappers': wrappers},
             )
         except Exception as exc:  # noqa: BLE001 — telemetry is best-effort
             logger.warning(
@@ -510,3 +556,51 @@ def resolve_zero_progress_requeue_alert(
             )
 
     return True
+
+
+def inherit_zero_progress_alarms(
+    pending: Iterable[Any], *, filed_at: dict[str, int],
+) -> frozenset[str]:
+    """Seed a fresh process's *filed_at* memo from alarms a prior process filed.
+
+    The tracker and the memo live in memory, so after a restart neither names
+    a task whose alarm is still ``pending`` — and the resolver's cheap gate
+    then never opens for it.  The pending queue is the durable record of what
+    was filed; every record under this detector's sentinel (any level, so a
+    sentinel-bound L2 wrapper counts) seeds its task at ``0``.  That is exact
+    under the memo's contract, "streak at the last disk check": a fresh
+    tracker reads 0.  A live entry keeps its value.
+
+    Args:
+        pending: The escalation queue's pending records, read once by the caller.
+        filed_at: The memo later passed to the emitter and the resolver.
+
+    Returns:
+        The real task ids the pending records name.
+    """
+    subjects = frozenset(
+        subject for esc in pending
+        if (subject := _alarm_subject(esc.task_id)) is not None
+    )
+    for task_id in subjects:
+        filed_at.setdefault(task_id, 0)
+    return subjects
+
+
+def _resolve_own_alarms(
+    escalation_queue: Any, pending: Iterable[Any], sentinel: str, resolution: str,
+) -> int:
+    """Resolve this task's L1 alarms in *pending*; wrappers are left to their membership pass.
+
+    "Own" must cover the emitter's ``has_open_l1(sentinel, category=_CATEGORY)``
+    dedup set, which ignores ``agent_role``, so this ignores it too: an L1 that
+    suppresses the next filing but survives the recovery would silence the
+    detector for this task until someone closes it by hand.
+    """
+    resolved = 0
+    for esc in pending:
+        if esc.task_id != sentinel or esc.level >= 2 or esc.category != _CATEGORY:
+            continue
+        escalation_queue.resolve(esc.id, resolution, resolved_by=ZERO_PROGRESS_REQUEUE_ROLE)
+        resolved += 1
+    return resolved

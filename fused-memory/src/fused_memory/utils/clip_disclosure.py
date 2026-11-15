@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from shared.elision import elision_marker, word_boundary_head
+
 # Not 'truncated': that response key already carries a bool elsewhere in fused-memory.
 TRUNCATION_FACTS_KEY = 'truncation_facts'
 
@@ -31,10 +33,6 @@ class TruncationFact:
 class TextClip:
     text: str
     fact: TruncationFact | None
-
-
-def elision_marker(elided: int) -> str:
-    return f'…[+{elided} chars elided]'
 
 
 def _clip(value: object, cap: int, *, field: str, marked: bool) -> TextClip:
@@ -65,14 +63,7 @@ def fit_at_word(text: str, limit: int) -> str:
         raise ValueError(f'fit_at_word limit must be positive, got {limit!r}')
     if len(text) <= limit:
         return text
-    budget = limit - 1
-    window = text[:budget]
-    last_ws = next(
-        (i for i in range(len(window) - 1, -1, -1) if window[i].isspace()),
-        -1,
-    )
-    head = text[:last_ws] if last_ws > budget // 2 else text[:budget]
-    return head.rstrip() + '…'
+    return word_boundary_head(text, limit - 1) + '…'
 
 
 def truncation_fields(*facts: TruncationFact | None) -> dict[str, list[dict[str, Any]]]:

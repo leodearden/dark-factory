@@ -21,14 +21,18 @@ named item_keys and exact counts on seeded fixtures.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import functools
+import os
+import sqlite3
 import types
 from pathlib import Path
 from typing import Any
 
 import pytest
 from _fm_helpers import load_script_module
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_staleness_sweep.py'
 
@@ -2412,7 +2416,7 @@ class _ServiceDouble:
         # Recorded separately from search_calls so the depth a run actually
         # searched at can be asserted against the depth it DISCLOSED.
         self.search_limits: list[int] = []
-        self.initialized = False
+        self.opened_for_reads = False
         self.closed = False
         self.mem0 = self
 
@@ -2438,13 +2442,19 @@ class _ServiceDouble:
         return list(seeded)
 
     # -- lifecycle ---------------------------------------------------------
-    async def initialize(self):
-        self.initialized = True
+    async def initialize_for_reads(self):
+        self.opened_for_reads = True
 
     async def close(self):
         self.closed = True
 
     # -- every write path is a tripwire ------------------------------------
+    async def initialize(self):
+        raise _ReadOnlyViolation(
+            'the sweep took the full open, which starts the durable write queue '
+            'and runs Graphiti startup maintenance'
+        )
+
     async def add_memory(self, *a, **kw):
         raise _ReadOnlyViolation('the sweep called add_memory')
 
@@ -2547,7 +2557,7 @@ class TestReadOnlyGuarantee:
         )
 
         assert code == 0
-        assert double.initialized and double.closed
+        assert double.opened_for_reads and double.closed
         # And it did real work rather than completing by doing nothing.
         assert double.scroll_calls
         assert double.id_reads
@@ -2559,8 +2569,9 @@ class TestReadOnlyGuarantee:
 
         double = _ServiceDouble()
         for method in (
-            'add_memory', 'add_episode', 'add_system_record', 'delete_memory',
-            'delete_episode', 'update_edge', 'merge_entities', 'delete_entity',
+            'initialize', 'add_memory', 'add_episode', 'add_system_record',
+            'delete_memory', 'delete_episode', 'update_edge', 'merge_entities',
+            'delete_entity',
         ):
             with pytest.raises(_ReadOnlyViolation):
                 asyncio.run(getattr(double, method)())
@@ -2573,6 +2584,18 @@ class TestReadOnlyGuarantee:
         )
 
         with pytest.raises(TimeoutError):
+            _run_main(monkeypatch, tmp_path, double)
+
+        assert double.closed
+
+    def test_the_store_is_closed_even_when_the_open_raises(self, monkeypatch, tmp_path):
+        double = _seeded_double()
+        monkeypatch.setattr(
+            double, 'initialize_for_reads',
+            _raising(sqlite3.Error('the planned registry db is locked')),
+        )
+
+        with pytest.raises(sqlite3.Error):
             _run_main(monkeypatch, tmp_path, double)
 
         assert double.closed
@@ -3269,11 +3292,6 @@ class TestAttributionInReport:
 # test above and the guards they carry would guard nothing.
 # ---------------------------------------------------------------------------
 
-import contextlib  # noqa: E402
-import os  # noqa: E402
-
-from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
-
 EPHEMERAL_COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
 """The ONLY prefix scripts/cleanup_test_collections.py reaps.
 
@@ -3376,38 +3394,38 @@ class TestSeededStalenessSweep:
     async def test_a_superseded_pair_and_a_dangling_pointer_are_both_reported(
         self, sweep_config, sweep_project_id, clean_sweep_collection, tmp_path,
     ):
+        """Seeded through the full open, swept through the read open the CLI takes."""
         from shared.memory_eval_metrics import load_metric_series  # noqa: PLC0415
 
-        from fused_memory.models.scope import Scope  # noqa: PLC0415
         from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
         m = _mod()
-        memory = MemoryService(sweep_config)
-        await memory.initialize()
+        seeder = MemoryService(sweep_config)
+        await seeder.initialize()
         try:
-            # mem0's SQLite history writer is process-shared and xdist-
-            # contended; it is not the question under test, and its failure
-            # would mask the one that is.
-            instance = await memory.mem0._get_instance(Scope(project_id=sweep_project_id))
-            instance.db.add_history = lambda *a, **kw: None
-
-            predecessor = await memory.add_memory(
+            predecessor = await seeder.add_memory(
                 SEED_PREDECESSOR, category='procedural_knowledge',
                 project_id=sweep_project_id, agent_id='e4-sweep-seed',
             )
             predecessor_id = predecessor.memory_ids[0]
-            successor = await memory.add_memory(
+            successor = await seeder.add_memory(
                 SEED_SUCCESSOR, category='procedural_knowledge',
                 project_id=sweep_project_id, agent_id='e4-sweep-seed',
                 metadata={'supersedes': [predecessor_id]},
             )
             successor_id = successor.memory_ids[0]
-            await memory.add_memory(
+            dangling = await seeder.add_memory(
                 SEED_DANGLING_SOURCE, category='procedural_knowledge',
                 project_id=sweep_project_id, agent_id='e4-sweep-seed',
                 metadata={'corrects': [NEVER_WRITTEN_UUID]},
             )
+            assert dangling.memory_ids
+        finally:
+            await seeder.close()
 
+        memory = MemoryService(sweep_config)
+        try:
+            await memory.initialize_for_reads()
             outcome = await m.run_sweep(
                 memory,
                 project_ids=(sweep_project_id,),

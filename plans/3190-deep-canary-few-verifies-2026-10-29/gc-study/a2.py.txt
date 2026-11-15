@@ -1,0 +1,26 @@
+import re,datetime as dt,collections,statistics as st,json
+U=dt.timezone.utc
+def T(s): return dt.datetime.fromisoformat(s).astimezone(U)
+pids={'772976','1956851','2830202'}
+# find all reify orchestrator pids: lane lines
+ev=[]
+for l in open('w.log',errors='replace'):
+    m=re.match(r'^(\S+) \S+ uv\[(\d+)\]: (.*)',l)
+    if not m: continue
+    t,pid,msg=m.groups()
+    if pid not in pids: continue
+    if '_run_warm_lane_gc_reclaim' in msg or 'Warm-lane GC reclaim pass' in msg:
+        ev.append((T(t),pid,msg[:170].split('] ',1)[-1]))
+c=collections.Counter(re.sub(r'\d+','9',e[2])[:80] for e in ev);print(c.most_common(10))
+# pass durations: resolved -> next Warm-lane GC reclaim pass
+st_=None;durs=[]
+for t,pid,msg in ev:
+    if 'resolved warm-lane-gc.sh' in msg: st_=(t,pid)
+    elif 'Warm-lane GC reclaim pass' in msg and st_ and st_[1]==pid:
+        durs.append((st_[0],t,msg[:40],(t-st_[0]).total_seconds()/3600));st_=None
+print('passes',len(durs),'median h',round(st.median(d[3] for d in durs),2),'max',round(max(d[3] for d in durs),2),'sum',round(sum(d[3] for d in durs),1))
+for d in durs[-8:]: print(d[0].strftime('%m-%d %H:%M'),d[1].strftime('%H:%M'),round(d[3],2),d[2])
+defer=[e for e in ev if 'merge-verify in flight' in e[2]];print('deferred',len(defer))
+start=[e for e in ev if 'resolved warm-lane-gc.sh' in e[2]];print('starts',len(start),start[0][0],start[-1][0])
+# restarts
+print('pid spans',{p:(min(e[0] for e in ev if e[1]==p).strftime('%m-%d %H:%M'),max(e[0] for e in ev if e[1]==p).strftime('%m-%d %H:%M')) for p in pids})

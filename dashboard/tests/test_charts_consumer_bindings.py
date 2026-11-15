@@ -24,12 +24,12 @@ the way a destructure list is.  The defect this file exists to catch — an
 imported-but-never-rendered component — can only exist in the destructure shape
 anyway.
 
-The parser is the shared one in ``_dashboard_helpers`` (``DF_CHARTS_DESTRUCTURE_RE``
+The parser is the shared one in ``_jsx_source_helpers`` (``DF_CHARTS_DESTRUCTURE_RE``
 and ``destructure_bindings``), so this is not a second dialect of the same line.
 That helper returns ``(canonical, local)`` PAIRS and this module projects the
 LOCAL half, because the alias is what the file renders by and therefore what
-must be referenced; test_charts_axis_labels.py projects the CANONICAL half off
-the same pairs.
+must be referenced; test_tab_burndown.py projects the CANONICAL half off the
+same pairs.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from __future__ import annotations
 import pathlib
 import re
 
-from _dashboard_helpers import DF_CHARTS_DESTRUCTURE_RE, destructure_bindings
+from _jsx_source_helpers import DF_CHARTS_DESTRUCTURE_RE, destructure_bindings
 
 _REDUX_DIR = pathlib.Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
 
@@ -64,8 +64,8 @@ def _local_names(destructured: str) -> list[str]:
     ``{ StackedAreaChart, HistBar: HB }`` binds ``StackedAreaChart`` and ``HB``
     — the alias is what the file actually renders by, so the alias is what must
     be referenced.  A projection over the shared `destructure_bindings`; the
-    canonical half is what test_charts_axis_labels.py projects off the same
-    pairs, so the two must never be confused (see the negative control below).
+    canonical half is what test_tab_burndown.py projects off the same pairs,
+    so the two must never be confused (see the negative control below).
     """
     return [local for _canonical, local in destructure_bindings(destructured)]
 

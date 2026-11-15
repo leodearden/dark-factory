@@ -17,6 +17,9 @@ import sys
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 WRAPPER = Path(__file__).parent.parent / "fused-memory-flag-marker-sweep.sh"
 
@@ -231,7 +234,7 @@ def test_wrapper_sources_dotenv_and_propagates_to_sweep(tmp_path):
 # ---------------------------------------------------------------------------
 
 _FAKE_UV_SRC = '''"""Fake `uv` shim for pinning fused-memory-flag-marker-sweep.sh's default
-FLAG_MARKER_SWEEP_CMD prefix (`uv run --frozen --project "$FM" python`).
+FLAG_MARKER_SWEEP_CMD prefix (`uv run --no-sync --project "$FM" python`).
 Records argv[1:] into a JSON state file at $FAKE_SWEEP_STATE and exits 0.
 Never invokes real uv / fused_memory / live stores.
 """
@@ -269,8 +272,8 @@ def _fake_uv(tmp_path):
     return bin_dir, state_path
 
 
-def test_wrapper_default_prefix_invokes_uv_run_frozen_project(tmp_path):
-    """Pins the default FLAG_MARKER_SWEEP_CMD prefix -- `uv run --frozen
+def test_wrapper_default_prefix_invokes_uv_run_no_sync_project(tmp_path):
+    """Pins the default FLAG_MARKER_SWEEP_CMD prefix -- `uv run --no-sync
     --project "$FM" python`, an unquoted array expansion with an embedded
     quoted "$FM" -- which every other test in this file bypasses by
     overriding FLAG_MARKER_SWEEP_CMD with a bare recorder. A future edit
@@ -309,7 +312,7 @@ def test_wrapper_default_prefix_invokes_uv_run_frozen_project(tmp_path):
     calls = _recorded_calls(state_path)
     assert len(calls) == 1, f"calls={calls!r}"
     assert calls[0] == [
-        "run", "--frozen", "--project", str(fake_fm), "python",
+        "run", "--no-sync", "--project", str(fake_fm), "python",
         str(fake_fm / "scripts" / "sweep_orphan_flag_markers.py"),
         "--apply", "--terminal-drain", "--project-id", "dark_factory",
     ], f"argv={calls[0]!r}"

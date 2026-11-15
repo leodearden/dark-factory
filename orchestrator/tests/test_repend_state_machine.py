@@ -107,7 +107,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit (mirrors test_workflow_e2e.py)."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -315,7 +315,7 @@ class TestWorkflowGatesB1B2:
         workflow.artifacts.stamp_plan_provenance(workflow.session_id)
 
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
-        await _init_repo(wt)
+        _init_repo(wt)
         workflow.config.inter_iteration_rebase = False
 
         outcome = await workflow._execute_iterations()

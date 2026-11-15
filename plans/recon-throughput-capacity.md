@@ -210,13 +210,74 @@ regimes) and conservative in another (marginal cost taken at its upper bound). T
 constants' docstrings say so, and both the config comment and the report tell an operator
 to **re-derive them from live data** rather than trust them indefinitely.
 
-### Lever 3 — coalesce redundant events *(deliberately deferred)*
+### Lever 3 — coalesce redundant events *(landed, task 4278)*
 
-Filed as a follow-up, not done here. The per-event_type composition the report now emits
-is precisely the evidence needed to size it: on the live DB, `task_modified` is
-1157/1741 (66%) of dark_factory's recent inflow and `task_status_changed` + `task_modified`
-together are 92/117 (79%) of reify's. Coalescing is a **behavioural change to the buffer**
-and should not ride along with a measurement + scheduling change.
+Deferred here and landed as task 4278. The per-event_type composition this task added
+sized it: `task_modified` was 1157/1741 (66%) of dark_factory's inflow and
+`task_status_changed` + `task_modified` were 92/117 (79%) of reify's.
+
+**The fold rule** (`reconciliation/coalescing.py`, applied in `EventBuffer.push`):
+
+- It runs at push time. The INSERT is the write unit's first statement, so the unit is a
+  write transaction from the start and serialises against the other MCP processes'
+  connections. A read-first unit could raise `SQLITE_BUSY_SNAPSHOT`
+  (`AtomicConnection.write`).
+- A `task_status_changed` event folds by task id. A `task_modified` event folds only when
+  its `operation` is `update_task`.
+- A `task_status_changed` into `done` is a fold barrier: it never folds and never becomes a
+  fold target, because its row stores no `coalesce_key`.
+- `add_dependency` / `remove_dependency` never fold: each `depends_on` is a distinct fact.
+  On 2026-10-19, 113 live dependency events covered 111 distinct edges. Task creation and
+  deletion, `deferral_restamped` and every memory event never fold either.
+- The event folds into the OLDEST `status='buffered'` row with the same
+  `(project_id, coalesce_key)`. The just-inserted row is deleted inside the same
+  uncommitted unit, so no reader ever sees it.
+
+**How each constraint is discharged:**
+
+- **(a) The stage still sees what happened.** The merged payload describes itself.
+  `old_status` comes from the earliest constituent. `new_status` and every producer key
+  (`reopen_*`, `deferral`, `deferral_cleared`, `_project_root`) come from the newest,
+  replaced rather than unioned, so no stale per-transition key survives.
+  `_coalesced_status_path` (capped at 20 and flagged when truncated) and
+  `_coalesced_count` record the chain; the path bridges a status event held in another
+  row, such as a `done` barrier. Pushes can arrive out of timestamp order (several
+  processes, an async queue), and the merge classifies each arrival as older, newer or
+  middle so the result does not depend on arrival order.
+  `unlanded_path_check` reads each `done` transition's own `done_provenance`, and every
+  other drained-event reader uses `task_id` or live task state. A new reader of a
+  per-transition key adds its transition to `coalescing._FOLD_BARRIER_STATUSES`.
+- **(b) Drain ids stay stable.** The target row keeps its id, so an id `peek_buffered`
+  handed out still drains through `drain_by_ids`. Scoping to `status='buffered'` means a
+  drained or dead-lettered row is never mutated; a later push starts a fresh row.
+- **(c) Ordering and latency hold.** The row timestamp never moves later (only earlier,
+  when an older event arrives late). Every `ORDER BY timestamp` position and the
+  `MIN(timestamp)` staleness trigger therefore hold, and a task edited every minute
+  cannot walk its event past `max_staleness_seconds`.
+
+A fold landing between `peek_buffered` and `drain_by_ids` reaches the stage as the
+pre-fold payload. That is benign: the task is already in that batch, `_ctx_task_event`
+reads its live state, and no `done` event can have folded into it.
+
+**Fold ratios, 2026-10-19** (live `event_buffer`, rows per distinct task id, `update_task`):
+2.28x dark_factory, 2.69x solar_challenge, 2.62x solar_challenge_platform, 1.31x reify.
+`task_status_changed` ran 1.0x–1.36x.
+
+**Reading the report now.** Every folded event is counted in `event_coalesced_hourly` in
+the fold's own write unit. Each pushed event is therefore a live row, in
+`event_arrival_hourly`, or in `event_coalesced_hourly`, exactly once, with one bound.
+A fold recognises a redelivery only when the redelivered event is its row's newest
+constituent. At-least-once journal redelivery of an older or middle constituent
+therefore folds again, and over-counts that event by one.
+
+- `inflow.total_events` still counts every event producers emitted.
+- `inflow.coalesced` (same shape) is the folded share, and `total − coalesced` is the drain
+  demand: the rows that actually reached the buffer.
+- The concentration section weighs each live row by its fold count, and reports events
+  on `live_rows` rows.
+
+**Switch.** `reconciliation.coalesce_task_events` (default `true`) is restart-only.
+`false` restores pre-4278 behaviour. `coalesce_key` is stored either way.
 
 ### Lever 4 — `backlog_hard_limit_overrides.reify` *(deliberately UNCHANGED)*
 
@@ -430,6 +491,12 @@ esc-7076-1.
 does, the alarm firing is correct. Re-run the concentration section before touching the
 threshold.
 
+**After lever 3 (task 4278).** A loop of this shape now folds into about one buffered row
+per task, so it no longer builds backlog: the 500 `reconciliation_backlog` alarm would not
+have flagged it. The remaining signals are the `reconciliation.coalesce_hot_task` WARNING,
+logged each time a row's fold count reaches a multiple of 100, and the fold-weighted
+concentration section. An escalation-grade alarm is the filed follow-up, DF **7148**.
+
 ---
 
 ## Where things live
@@ -439,6 +506,9 @@ threshold.
 | Report + capacity arithmetic | `fused-memory/src/fused_memory/reconciliation/throughput.py` |
 | Per-task inflow attribution | `throughput.py` — `inflow_concentration` (live `event_buffer` rows only) |
 | Inflow rollup | `event_buffer.py` — `event_arrival_hourly`, written in `cleanup_drained` |
+| Fold rule (lever 3) | `fused-memory/src/fused_memory/reconciliation/coalescing.py` — `coalesce_key`, `merge_coalesced_payload` |
+| Fold count | `event_buffer.py` — `event_coalesced_hourly`, written in `push`'s fold |
+| Fold switch | `reconciliation.coalesce_task_events: true` in `fused-memory/config/config.yaml` (restart-only) |
 | Deferral gate | `harness.py` — `_maybe_remediate`, `_backlog_state`, `is_backlog_size` |
 | Deferral bound | `ReconciliationConfig.max_backlog_remediation_deferrals` (default 1, `le=1`) |
 | Batch size | `reconciliation.conditional_trigger_ratio: 0.6` in `fused-memory/config/config.yaml` |

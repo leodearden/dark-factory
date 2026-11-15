@@ -22,8 +22,12 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 from shared.testing_streams import StdoutWithAFailingFlush
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.config.schema import WriteTriageProjectCalibration
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 
@@ -43,7 +47,7 @@ _MAX_LEXICAL_RATIO_MEMBERS = _mod._MAX_LEXICAL_RATIO_MEMBERS
 partition_topic_carveout = _mod.partition_topic_carveout
 fetch_procedural_memories = _mod.fetch_procedural_memories
 fetch_memories = _mod.fetch_memories
-_ALL_CATEGORIES = _mod._ALL_CATEGORIES
+_ALL_CATEGORIES = _mod.ALL_CATEGORIES
 extract_liveness_snapshot_fact = _mod.extract_liveness_snapshot_fact
 _classify_liveness_snapshot = _mod._classify_liveness_snapshot
 liveness_snapshot_subject_task_ids = _mod.liveness_snapshot_subject_task_ids
@@ -69,7 +73,7 @@ _EVAL_ID = _mod._EVAL_ID
 _GLOBAL_SCOPE = _mod._GLOBAL_SCOPE
 emit_metrics_artifact = _mod.emit_metrics_artifact
 details_artifact_path = _mod.details_artifact_path
-_build_parser = _mod._build_parser
+_build_parser = _mod.build_parser
 _run = _mod._run
 
 
@@ -448,6 +452,39 @@ class TestPickSurvivorCanonicalFlag:
         survivor, losers = pick_survivor(group)
         assert survivor['id'] == 'm2'
         assert [m['id'] for m in losers] == ['m1']
+
+
+class TestPickSurvivorStrictCanonicalMarker:
+    """Only the bool True claims canonical (canonical_marker.py::is_canonical)."""
+
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_bool_true_canonical_beats_older_malformed_marker(self, malformed):
+        group = [
+            _memory(
+                'm1', _VENV_GOTCHA_A, created_at='2026-07-01T00:00:00+00:00',
+                metadata={'canonical': malformed},
+            ),
+            _memory(
+                'm2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00',
+                metadata={'canonical': True},
+            ),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm2'
+        assert [m['id'] for m in losers] == ['m1']
+
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_malformed_marker_alone_does_not_outrank_age(self, malformed):
+        group = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-01T00:00:00+00:00'),
+            _memory(
+                'm2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00',
+                metadata={'canonical': malformed},
+            ),
+        ]
+        survivor, losers = pick_survivor(group)
+        assert survivor['id'] == 'm1'
+        assert [m['id'] for m in losers] == ['m2']
 
 
 class TestPickSurvivorOldestByCreatedAt:
@@ -1977,23 +2014,27 @@ class TestBuildSweepPlanTopicCarveout:
         assert set(carved['member_ids']) == {'m1', 'm2'}
         assert carved['topic'] == 'venv'
 
-    def test_differing_topics_still_yield_delete_candidates(self):
+    def test_differing_topics_are_reported_but_no_member_is_deletable(self):
         memories = [
             _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
             _topic_memory('m2', _VENV_GOTCHA_B, 'rustfmt'),
         ]
         plan = build_sweep_plan(memories, threshold=_THRESHOLD)
         assert plan['clusters_total'] == 1
-        assert len(plan['delete_candidates']) == 1
+        (group,) = plan['near_duplicate_groups']
+        assert set(group['member_ids']) == {'m1', 'm2'}
+        assert plan['delete_candidates'] == []
+        assert group['survivor_id'] == 'm1'
+        assert group['retained_members'] == [{'id': 'm2', 'reason': 'topic_stamped'}]
         assert plan['topic_carveout_clusters'] == 0
 
-    def test_partially_missing_topic_still_yields_delete_candidates(self):
+    def test_partially_missing_topic_makes_only_the_unstamped_member_deletable(self):
         memories = [
             _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
             _topic_memory('m2', _VENV_GOTCHA_B, None),
         ]
         plan = build_sweep_plan(memories, threshold=_THRESHOLD)
-        assert len(plan['delete_candidates']) == 1
+        assert plan['delete_candidates'] == ['m2']
         assert plan['topic_carveout_clusters'] == 0
 
     def test_carveout_applies_to_all_three_categories(self):
@@ -3422,6 +3463,20 @@ class TestComputeClusterMetricsConsolidationNetDelta:
         _metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
         assert details['categories'][_PK]['consolidation_events'][0]['absorbed'] == 0
 
+    @pytest.mark.parametrize('malformed', ['true', 1])
+    def test_malformed_canonical_marker_is_not_a_consolidation_event(self, malformed):
+        records = {
+            _PK: [
+                _dated('c', 'x', '2026-01-01T00:00:00+00:00',
+                       metadata={'topic': 'venv', 'canonical': malformed}),
+                _dated('after', 'y', '2026-01-02T00:00:00+00:00', metadata={'topic': 'venv'}),
+            ],
+        }
+        metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+
+        assert details['categories'][_PK]['consolidation_events'] == []
+        assert _by_id(metrics)[f'consolidation_net_delta.{_PK}'].n == 0
+
     def test_untopiced_event_uses_its_cluster_as_the_peer_set(self):
         records = {
             _PK: [
@@ -4767,6 +4822,22 @@ class TestRunWiring:
         await _run(await self._parse(tmp_path))
         assert _FakeMemoryService.instances[-1].closed is True
 
+    async def test_the_printed_plan_carries_each_categorys_scan_coverage(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Task 3136's report reads coverage off stdout, not off the metrics."""
+        _install_run_doubles(
+            monkeypatch, {_PK: [_raw('m1', _VENV_GOTCHA_A), _raw('m2', _DISTRACTOR)]},
+        )
+        await _run(await self._parse(
+            tmp_path, '--categories', _PK, '--scan-limit', '2',
+        ))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert plan['scan_coverage'] == {
+            _PK: {'scanned': 2, 'truncated': 1, 'scan_limit': 2},
+        }
+
 
 # ---------------------------------------------------------------------------
 # Liveness-snapshot recurrence fixtures (task 3098)
@@ -5300,11 +5371,12 @@ class TestLivenessSnapshotSubjectFacts:
     The task's own acceptance bar: the rescope is only worth shipping if the
     detector still fires on the corpus that motivated it. The clause technique
     returned the EMPTY SET on all four of these records before task 3403
-    narrowed `_CLAUSE_SPLIT_RE`'s dot and widened `TASK_REF_RE`'s separator, so
-    "it works now" is a measurement, not an inference -- and this class is
-    where that measurement lives. If a later edit to either shared regex
-    re-breaks the association, this fails before the group-level tests do,
-    naming the subject and the fact rather than an absent group.
+    narrowed the clause splitter's dot (now `task_filter.WIDE_CLAUSE_BOUNDARY_RE`)
+    and widened `TASK_REF_RE`'s separator, so "it works now" is a measurement,
+    not an inference -- and this class is where that measurement lives. If a
+    later edit to either shared regex re-breaks the association, this fails
+    before the group-level tests do, naming the subject and the fact rather
+    than an absent group.
 
     That last guarantee is only REAL because these tests seed
     `_SENTINEL_CORE_FACT` rather than `_CORE_FACT_STRANDED`. Asserting against
@@ -5320,7 +5392,7 @@ class TestLivenessSnapshotSubjectFacts:
 
     The guarantee is the CLASS's, not each test's, and the two mutants divide
     unevenly -- also measured. An inert `TASK_REF_RE` is killed by both tests.
-    An inert `_CLAUSE_SPLIT_RE` (one that never splits) is killed only by the
+    An inert `WIDE_CLAUSE_BOUNDARY_RE` (one that never splits) is killed only by the
     multi-task test: with a single-subject record the whole content IS that
     subject's clause, so not splitting is indistinguishable from splitting
     correctly and nothing is there to detect. That is why the multi-task
@@ -5455,7 +5527,7 @@ class TestLivenessSubjectFactsFallback:
     def test_a_clause_split_inside_a_quoted_value_falls_back(self):
         """`status="done. now"` -- the boundary lands mid-value.
 
-        `_CLAUSE_SPLIT_RE` is a regex over prose, not a parser, so a `.` inside
+        `WIDE_CLAUSE_BOUNDARY_RE` is a regex over prose, not a parser, so a `.` inside
         a quoted value splits the clause and leaves task 94's half holding an
         unterminated `status="done` that `_readable_field_pairs` declines to
         read. The RECORD-level classifier sees the value whole and keys fine,
@@ -5794,15 +5866,15 @@ class TestFindLivenessSnapshotRecurrences:
 
         The core fact is no longer built once per record and attributed to
         every subject it names. `find_liveness_snapshot_recurrences` splits the
-        content into clauses with `task_filter._CLAUSE_SPLIT_RE`, reads the
+        content into clauses with `task_filter.WIDE_CLAUSE_BOUNDARY_RE`, reads the
         task refs and the `<field>=<value>` assignments of each clause
         separately, and keys every subject on the union of the clauses that
         NAME it -- the same idiom `task_filter.find_conflicting_task_status_ids`
         uses. A multi-task re-verification reporting DIVERGENT values per task
         therefore joins each subject's own group instead of matching neither.
 
-        This was genuinely inert when the detector was written: `_CLAUSE_SPLIT_RE`
-        split on EVERY `.`, shattering filenames mid-sentence, and the real
+        This was genuinely inert when the detector was written: the clause
+        splitter split on EVERY `.`, shattering filenames mid-sentence, and the real
         content writes `task/94`, which `TASK_REF_RE` did not match -- together
         they yielded the EMPTY SET on all four real records. Task 3403 fixed
         both regexes at the source, and this task re-MEASURED the technique
@@ -6156,6 +6228,10 @@ _LIVENESS_PLAN_KEYS = frozenset({
 # stays attributable to the task that caused it.
 _PER_CATEGORY_PLAN_KEYS = frozenset({'ann_threshold_by_category'})
 
+# Task 3136: the retention counts, child counts and scan coverage the weekly
+# duplicate-cluster report reads beside the clusters.
+_REPORT_FEED_PLAN_KEYS = frozenset({'retained_carveout', 'child_counts', 'scan_coverage'})
+
 
 class TestBuildSweepPlanLivenessRecurrences:
     """The third class reaches the plan -- and never reaches a delete."""
@@ -6224,6 +6300,7 @@ class TestBuildSweepPlanLivenessRecurrences:
 
         assert set(plan) == (
             _PRE_3098_PLAN_KEYS | _LIVENESS_PLAN_KEYS | _PER_CATEGORY_PLAN_KEYS
+            | _REPORT_FEED_PLAN_KEYS
         )
         assert plan['ann_threshold_by_category'] == {}, (
             'a caller that ran no ANN path reports an empty map, not a null'
@@ -6842,7 +6919,7 @@ class TestApplyStoreMutationPreflight:
         ])
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             await _run(args)
 
@@ -6872,7 +6949,7 @@ class TestApplyStoreMutationPreflight:
             '--metrics-root', str(tmp_path),
         ])
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _run(args)
 
         assert called == [], 'the scan must not run once the preflight has refused'
@@ -6898,7 +6975,6 @@ class TestApplyStoreMutationPreflight:
         self, monkeypatch, tmp_path,
     ):
         """Happy path: a writable environment deletes exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         _install_run_doubles(monkeypatch, self._raw())
         args = _build_parser().parse_args([
             '--project-id', 'p', '--apply', '--threshold', '0.75',
@@ -6958,7 +7034,7 @@ class TestApplyStoreMutationPreflight:
             '--metrics-root', str(tmp_path),
         ])
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _run(args)
 
         assert _FakeMemoryService.instances == []
@@ -7004,11 +7080,12 @@ class TestApplyStoreMutationPreflightThroughMain:
         )
 
         with caplog.at_level('ERROR'), pytest.raises(
-            _mod.StoreMutationUnavailable, match=SENTINEL
+            StoreMutationUnavailable, match=SENTINEL
         ):
             _mod.main()
 
-        assert fail_closed_records(caplog, 'audit_duplicate_memories'), (
+        (record,) = fail_closed_records(caplog, 'audit_duplicate_memories')
+        assert SENTINEL in record.getMessage(), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'

@@ -47,6 +47,7 @@ __all__ = [
     'read_pressure',
     'PsiSample',
     'read_psi_sample',
+    'cpu_some10_or_none',
     'RunqueueReading',
     'read_runqueue_ratio',
     'OwnCgroup',
@@ -534,3 +535,8 @@ def read_psi_sample(
         own_read_ok=own.read_ok,
         cpu_some60=host.cpu_some60,
     )
+
+
+def cpu_some10_or_none(sample: PsiSample) -> float | None:
+    """Host CPU pressure as a ledger records it: ``None`` means the host read failed; ``0.0`` is a real reading."""
+    return sample.cpu_some10 if sample.read_ok else None

@@ -30,9 +30,10 @@ two things, fail-soft and fast:
   `orchestrator/tests/test_session_ownership_probes.py`). The ownership model
   both implement is explained in `docs/session-hook-ownership.md`. The bash
   files here stay thin by design (PRD §4 decision 9) — assert behavior
-  against the Python module in `orchestrator/tests/test_session_hooks.py`,
-  not against these scripts directly (except for the one bash-level
-  integration test that exercises the PYTHONPATH + stdin-passthrough wiring).
+  against the Python module in `orchestrator/tests/test_session_hooks*.py`,
+  not against these scripts directly (except for the bash-level integration
+  tests in `orchestrator/tests/test_session_hooks_bash.py`, which exercise
+  the PYTHONPATH + stdin-passthrough wiring).
 
 ## Absolute paths, not `~/.claude/hooks/`
 

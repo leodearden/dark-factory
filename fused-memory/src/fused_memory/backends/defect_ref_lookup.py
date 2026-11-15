@@ -3,15 +3,15 @@
 ``plans/defect-tests-prd.md`` decision 13 lets a closure or retirement name
 another ref only when that ref is live, meaning some task, of any status,
 declares it in ``metadata.defects``. The read pages any
-:class:`MetadataLookupSource`, the one-method surface both the task backend
-and the interceptor expose.
+``fused_memory.backends.metadata_lookup_pages::MetadataLookupSource``, the
+one-method surface both the task backend and the interceptor expose.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 from pydantic import ValidationError
 from shared.defects import (
@@ -24,33 +24,19 @@ from shared.defects import (
 )
 
 from fused_memory.backends.defect_records import DefectRefNotLive, refs_required_live
-from fused_memory.backends.metadata_lookup import DEFAULT_LOOKUP_LIMIT
-from fused_memory.backends.task_backend_types import MetadataLookupResult, MetadataLookupRow
+from fused_memory.backends.metadata_lookup_pages import (
+    LOOKUP_PAGE_SIZE,
+    MetadataLookupSource,
+    metadata_lookup_pages,
+)
+from fused_memory.backends.task_backend_types import MetadataLookupRow
 
 __all__ = [
     'DefectRefCarrier',
     'DefectRefLookup',
-    'MetadataLookupSource',
     'lookup_defect_ref',
     'require_refs_live',
 ]
-
-_PAGE_SIZE = 100
-
-
-class MetadataLookupSource(Protocol):
-    async def find_tasks_by_metadata(
-        self,
-        project_root: str,
-        key: str,
-        value: str | int | None = None,
-        *,
-        statuses: list[str] | None = None,
-        limit: int = DEFAULT_LOOKUP_LIMIT,
-        offset: int = 0,
-        tag: str | None = None,
-        include_value: bool = False,
-    ) -> MetadataLookupResult: ...
 
 
 @dataclass(frozen=True)
@@ -101,33 +87,13 @@ def _declarations(row: MetadataLookupRow) -> tuple[DefectDeclaration, ...] | Non
         return None
 
 
-async def _pages(
-    source: MetadataLookupSource, project_root: str, *, tag: str | None, page_size: int
-) -> AsyncIterator[MetadataLookupResult]:
-    offset = 0
-    while True:
-        page = await source.find_tasks_by_metadata(
-            project_root,
-            DEFECTS_METADATA_KEY,
-            None,
-            include_value=True,
-            limit=page_size,
-            offset=offset,
-            tag=tag,
-        )
-        yield page
-        offset += len(page['results'])
-        if not page['results'] or offset >= page['total']:
-            return
-
-
 async def lookup_defect_ref(
     source: MetadataLookupSource,
     project_root: str,
     ref: str,
     *,
     tag: str | None = None,
-    page_size: int = _PAGE_SIZE,
+    page_size: int = LOOKUP_PAGE_SIZE,
 ) -> DefectRefLookup:
     """Every task, of any status, whose ``metadata.defects`` declares *ref*.
 
@@ -137,7 +103,14 @@ async def lookup_defect_ref(
     parse_ref(ref)
     carriers: list[DefectRefCarrier] = []
     unreadable: set[int] = set()
-    async for page in _pages(source, project_root, tag=tag, page_size=page_size):
+    async for page in metadata_lookup_pages(
+        source,
+        project_root,
+        DEFECTS_METADATA_KEY,
+        include_value=True,
+        tag=tag,
+        page_size=page_size,
+    ):
         unreadable.update(page['malformed_metadata_ids'])
         for row in page['results']:
             declarations = _declarations(row)

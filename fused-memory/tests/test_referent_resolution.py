@@ -835,7 +835,7 @@ class TestMalformedDeclarationIsRejectedLoudly:
         """``declared`` is caller-supplied JSON off an MCP tool argument, so a
         confused agent can reach every one of these. An UNHASHABLE kind is the
         sharp case: ``Referent.__post_init__``'s ``self.kind not in
-        _KIND_LABELS`` membership test raises ``TypeError``, which is not a
+        KIND_LABELS`` membership test raises ``TypeError``, which is not a
         ``ValueError``, so the existing ``except ValueError`` around the
         construction structurally cannot convert it — and δ's ``except
         InputValidationError`` gate would take an unhandled exception instead of
@@ -1922,8 +1922,8 @@ class TestKnownProjectIdsNarrowing:
         self, registry_kwargs, declared, metadata, content, expected_source
     ):
         """Omitted, None and ``{}`` are byte-identical to HEAD. The
-        empty-registry permissiveness belongs to ``_canonical_allowlist`` and
-        needs no second emptiness check here."""
+        empty-registry permissiveness belongs to ``scan_content``'s
+        ``known_project_ids`` and needs no second emptiness check here."""
         baseline = resolve_referents(
             declared=declared, metadata=metadata, content=content, group_id=GROUP
         )

@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Measure the merge-lane cluster, and ratchet every measure against a committed baseline.
+"""Measure the merge-lane cluster, and ratchet its structure against a committed baseline.
 
 PRD ``plans/merge-lane-quality-prd.md`` task alpha. The measures are the ones
 the PRD's Background table quotes -- file lines and prose lines, per-function
 cognitive complexity, function-local (reach-back) imports, re-export shim names,
 distinct test patch targets into lane internals, and private-attribute reads
-from tests. The committed baseline lives at
-``orchestrator/tests/merge_lane_ratchet_baseline.json`` and the gate that
-enforces it is ``orchestrator/tests/test_merge_lane_ratchet.py``.
+from tests. The two size measures are measured and reported but never
+ratcheted (``REPORTED_ONLY_MEASURES``); every other one is. The committed
+baseline lives at ``orchestrator/tests/merge_lane_ratchet_baseline.json`` and
+the gate that enforces it is ``orchestrator/tests/test_merge_lane_ratchet.py``.
 
 Ratchet contract, and it has two sides. An UNAUTHORIZED raise is refused: by
 ``--check``, and decisively by ``--write-baseline`` itself, so a raise cannot be
@@ -111,9 +112,10 @@ class AppendOnlyViolation(RatchetError):
 
     A ``RatchetError`` subclass, so nothing that already catches one changes
     behaviour; a DISTINCT type, because the two are read differently at a
-    boundary. ``scripts/check_staged_ratchet_raise.py`` exits 1 for this (the
-    committer did something the ratchet forbids and can fix) and 2 for its
-    siblings (the gate could not do its job). Collapsing them would leave a
+    boundary. ``scripts/check_staged_ratchet_raise.py`` and
+    ``scripts/check_ratchet_advance.py`` exit 1 for this (the change did
+    something the ratchet forbids and can fix) and 2 for its siblings (the gate
+    could not do its job). Collapsing them would leave a
     caller that reasonably treats 2 as "instrument down, retry or ignore"
     waving a rewritten ledger through.
     """
@@ -121,6 +123,14 @@ class AppendOnlyViolation(RatchetError):
 
 # ---------------------------------------------------------------------------
 # The cluster spec -- SPOT for PRD Appendix A.
+
+#: The merge-lane package. Every module under it is a lane module, and a patched
+#: name's leaf is its dotted path below it: ``<attr>`` on the package itself,
+#: ``<sub>.<attr>`` on a submodule.
+LANE_PACKAGE = 'orchestrator.merge_lane'
+
+#: Where ``LANE_PACKAGE``'s modules live on disk, derived so the two cannot disagree.
+LANE_PACKAGE_GLOB = f'orchestrator/src/{LANE_PACKAGE.replace(".", "/")}/**/*.py'
 
 #: Repo-relative literal paths and glob patterns naming the merge-lane cluster.
 #: This tuple IS Appendix A; editing it forces a deliberate baseline
@@ -136,7 +146,7 @@ CLUSTER_PATHS: tuple[str, ...] = (
     'orchestrator/src/orchestrator/git_ops.py',
     # The package, holding the fourteen modules PRD task zeta2 moved into it. A
     # glob matching nothing is NOT a failure; a literal matching nothing is.
-    'orchestrator/src/orchestrator/merge_lane/**/*.py',
+    LANE_PACKAGE_GLOB,
     'orchestrator/tests/_merge_queue_harness.py',
     'orchestrator/tests/conftest.py',
 )
@@ -145,7 +155,7 @@ CLUSTER_PATHS: tuple[str, ...] = (
 #: PRD decision 9: ``git_ops.py`` is the git engine for warm lanes, the
 #: scheduler and recovery -- not only the merge lane -- and its split is a
 #: follow-up PRD. The exemption is scoped to the CEILING alone: git_ops.py's
-#: 14,721 lines are still frozen by the ratchet, so they cannot grow unwatched.
+#: structural measures are still ratcheted, so they cannot grow unwatched.
 SIZE_CEILING_EXEMPT: frozenset[str] = frozenset(
     {'orchestrator/src/orchestrator/git_ops.py'}
 )
@@ -255,14 +265,21 @@ def resolve_cluster_paths(root: Path) -> Enumeration:
 # ---------------------------------------------------------------------------
 # Test-suite patch targets into lane internals.
 #
-# The measure is ``source_measures.patch_targets_in_tree`` over
-# ``LANE_PATCH_MODULES``, keeping the distinct leaves. It subsumes the retired
-# reachback guard's allowlist as a COUNT, which is what lets PRD task delta
-# delete the guard once the count reaches zero.
+# The measure is ``source_measures.patch_targets_in_tree`` over the package
+# plus the patch modules the caller passes, keeping the distinct leaves. It
+# subsumes the retired reachback guard's allowlist as a COUNT, which is what
+# lets PRD task delta delete the guard once the count reaches zero.
 
-#: Dotted module paths whose attributes count as lane internals when patched:
-#: the package, and through it every submodule (a leaf reads ``<sub>.<attr>``).
-LANE_PATCH_MODULES: tuple[str, ...] = ('orchestrator.merge_lane',)
+
+def lane_patch_modules(root: Path) -> frozenset[str]:
+    """``LANE_PACKAGE`` plus the dotted name of every module under it on disk in
+    *root*, so a patch receiver bound to a submodule is resolved and a class
+    imported from the package is not."""
+    on_disk = (
+        source_measures.src_module_name(match.relative_to(root).as_posix())
+        for match in root.glob(LANE_PACKAGE_GLOB)
+    )
+    return frozenset({LANE_PACKAGE, *(name for name in on_disk if name is not None)})
 
 
 # ---------------------------------------------------------------------------
@@ -290,19 +307,16 @@ def lane_module_names() -> frozenset[str]:
 
 def imports_lane_module(source: str, *, path: str) -> bool:
     """True when *source* imports any cluster module, or anything under
-    ``orchestrator.merge_lane``."""
+    ``LANE_PACKAGE``."""
     return imports_lane_module_in_tree(source_measures.parse_source(source, path=path))
 
 
 def imports_lane_module_in_tree(tree: ast.Module) -> bool:
     """``imports_lane_module`` over an already-parsed tree."""
     lane_names = lane_module_names()
-    lane_leaves = {name.rsplit('.', 1)[-1] for name in lane_names}
 
     def _is_lane(dotted: str) -> bool:
-        return dotted in lane_names or dotted == 'orchestrator.merge_lane' or dotted.startswith(
-            'orchestrator.merge_lane.'
-        )
+        return dotted in lane_names or _is_in_lane_package(dotted)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -311,35 +325,53 @@ def imports_lane_module_in_tree(tree: ast.Module) -> bool:
         elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
             if _is_lane(node.module):
                 return True
-            # `from orchestrator import merge_gates` binds the module itself.
-            if node.module == 'orchestrator' and any(
-                alias.name in lane_leaves or alias.name == 'merge_lane'
-                for alias in node.names
-            ):
+            # `from orchestrator import git_ops` binds the module itself.
+            if any(_is_lane(f'{node.module}.{alias.name}') for alias in node.names):
                 return True
     return False
 
 
-def test_file_measures(source: str, *, path: str) -> dict[str, object] | None:
+def _is_in_lane_package(module: str) -> bool:
+    return module == LANE_PACKAGE or module.startswith(LANE_PACKAGE + '.')
+
+
+def test_file_measures(
+    source: str, *, path: str, patch_modules: Collection[str]
+) -> dict[str, object] | None:
     """The two test-suite measures for *source*, or None when it is not
     lane-importing.
 
     Returning None rather than a zeroed dict makes the exclusion a property of
     the MEASURE rather than of the caller, so a non-lane-importing file can
     never be summed into the report by accident.
+
+    *patch_modules* names the modules under ``LANE_PACKAGE`` that a patch
+    receiver may be bound to, as ``lane_patch_modules`` derives them; with the
+    package alone, ``from orchestrator.merge_lane import gates`` would patch
+    ``gates`` unseen.
     """
-    return test_file_measures_in_tree(source_measures.parse_source(source, path=path))
+    return test_file_measures_in_tree(
+        source_measures.parse_source(source, path=path), patch_modules
+    )
 
 
-def test_file_measures_in_tree(tree: ast.Module) -> dict[str, object] | None:
+def test_file_measures_in_tree(
+    tree: ast.Module, patch_modules: Collection[str]
+) -> dict[str, object] | None:
     """``test_file_measures`` over an already-parsed tree."""
     if not imports_lane_module_in_tree(tree):
         return None
-    lane_targets = source_measures.patch_targets_in_tree(tree, LANE_PATCH_MODULES)
+    lane_targets = source_measures.patch_targets_in_tree(
+        tree, {LANE_PACKAGE, *patch_modules}
+    )
     return {
-        'patch_targets': sorted({target.leaf for target in lane_targets}),
+        'patch_targets': sorted({_lane_leaf(target) for target in lane_targets}),
         'private_reads': source_measures.private_reads_in_tree(tree),
     }
+
+
+def _lane_leaf(target: source_measures.PatchTarget) -> str:
+    return f'{target.module}.{target.leaf}'.removeprefix(LANE_PACKAGE + '.')
 
 
 # ---------------------------------------------------------------------------
@@ -444,13 +476,14 @@ def sweep_repo(root: Path) -> RepoSweep:
     compare at all. That split is the INV-11 seam between "this cluster file is
     unmeasurable, which IS the finding" and "some unrelated file is mid-edit".
     """
+    patch_modules = lane_patch_modules(root)
     test_tree = _test_tree_files(root)
     tests: dict[str, object] = {}
     unreadable: list[str] = []
     for relpath in test_tree:
         try:
             source = (root / relpath).read_text(encoding='utf-8')
-            measures = test_file_measures(source, path=relpath)
+            measures = test_file_measures(source, path=relpath, patch_modules=patch_modules)
         except (OSError, UnicodeDecodeError, source_measures.MetricsError):
             unreadable.append(relpath)
             continue
@@ -502,6 +535,16 @@ _SUMMED_FILE_MEASURES = (
     'reexport_names',
 )
 
+#: Measured, stored and printed by --report, never ratcheted: raw size steers
+#: toward deleting prose instead of rehoming it (docs/code-quality.md "Do not
+#: steer by"; PRD plans/review-all-s25-scripts-instruments-prd.md D10). `lines`
+#: stays stored because the new-file ceiling reads it.
+REPORTED_ONLY_MEASURES: frozenset[str] = frozenset({'lines', 'prose_lines'})
+
+_RATCHETED_FILE_MEASURES = tuple(
+    measure for measure in _SUMMED_FILE_MEASURES if measure not in REPORTED_ONLY_MEASURES
+)
+
 
 def derive_totals(report: dict) -> dict[str, int]:
     """Cluster-wide totals, DERIVED by summing *report*'s per-path maps.
@@ -510,10 +553,10 @@ def derive_totals(report: dict) -> dict[str, int]:
 
     Deriving rather than storing is what makes the ten parallel gamma branches
     rebase cleanly, AND it preserves the anti-rename-gaming property exactly. A
-    total computed by summing stored per-path baselines is unchanged when 500
-    lines move from ``merge_queue.py`` to a brand-new path, so the ratchet still
-    catches the move -- which a per-path-only comparison would not, since the
-    new path is simply absent from the baseline.
+    total computed by summing stored per-path baselines is unchanged when code
+    carrying 500 cognitive moves from ``merge_queue.py`` to a brand-new path, so
+    the ratchet still catches the move -- which a per-path-only comparison would
+    not, since the new path is simply absent from the baseline.
 
     ``patch_targets`` is the size of the UNION across files, matching the PRD's
     "distinct names" measure rather than a sum of per-file counts.
@@ -568,6 +611,12 @@ LEGACY_LEDGER_RELPATH = 'orchestrator/tests/merge_lane_ratchet_authorized_raises
 #: RESOLVES, which a bare string literal in the prose left unchecked.
 COMMIT_GATE_RELPATH = 'scripts/check_staged_ratchet_raise.py'
 
+#: The landing-time auditor ``hooks/reference-transaction`` runs on every move of
+#: main, named here for the same reasons as ``COMMIT_GATE_RELPATH``: the remedy
+#: sends a blocked reader to it, and a constant is what lets a test assert the
+#: path RESOLVES.
+ADVANCE_GATE_RELPATH = 'scripts/check_ratchet_advance.py'
+
 #: THE ONE COPY of what to do when a measure rose. Composed into every site
 #: that tells an agent it may not raise -- ``BASELINE_README`` (and so the
 #: committed bytes a blocked reader opens), ``main()``'s ``--check`` trailer,
@@ -606,25 +655,31 @@ RAISE_REMEDY = (
     'honest move the expensive one. Reaching FURTHER back is refused, because '
     'every image in between is a value the ratchet moved through and returning '
     'behind them re-absorbs every measure they lowered.\n'
-    'RESIDUAL, so you do not trust more than is true: `git rebase` and a CLEAN '
-    'merge -- including one the ratchet-baseline merge driver resolved -- do '
-    'not run pre-commit at all, and the merge worker advances main with `git '
-    'update-ref`, which runs no hooks. A raise introduced before this guard '
-    'existed and replayed across its introduction still reaches main '
-    'unexamined. Closing that needs a merge-lane or reference-transaction gate, '
-    'not this one. --authorize-raise is the way past.'
+    'WHERE A RAISE LANDS: `git rebase` and a CLEAN merge -- including one the '
+    'ratchet-baseline merge driver resolved -- skip pre-commit, so a raise they '
+    'carry is caught where it LANDS instead. hooks/reference-transaction runs '
+    f'{ADVANCE_GATE_RELPATH} on every move of main, the merge worker\'s `git '
+    'update-ref` included, and refuses a move whose baseline rises over the '
+    "merge base's beyond what the entry files the move adds cover. The remedy "
+    "is to record the raise on the branch, against main's baseline, with the "
+    'flags above.\n'
+    'RESIDUAL, so you do not trust more than is true: creating main afresh, git '
+    'run with core.hooksPath pointed elsewhere, a git older than 2.28, and a '
+    'move made from a checkout whose hooks/ lacks the file all reach main '
+    'unaudited. --authorize-raise is the way past.'
 )
 
 #: Emitted as the baseline's leading key, so the rule is in the file a reader
 #: is about to "fix" rather than only in a docstring they will not open.
 BASELINE_README = (
     'This is a committed RATCHET BASELINE for the merge-lane cluster '
-    '(PRD plans/merge-lane-quality-prd.md, task alpha). Every measure here is '
-    'frozen at its value on the commit that recorded it: the gate '
-    'orchestrator/tests/test_merge_lane_ratchet.py FAILS on any measure that '
-    'RISES above these numbers. Equality is fine, lowering is the point. The '
-    'enumeration block below is the CLUSTER half only: the instrument also '
-    'sweeps every .py under '
+    '(PRD plans/merge-lane-quality-prd.md, task alpha). Every measure here '
+    f'except {" and ".join(sorted(REPORTED_ONLY_MEASURES))}, which are reported '
+    'but never ratcheted, is frozen at its value on the commit that recorded it: '
+    'the gate orchestrator/tests/test_merge_lane_ratchet.py FAILS on any such '
+    'measure that RISES above these numbers. Equality is fine, lowering is the '
+    'point. The enumeration block below is the CLUSTER half only: the '
+    'instrument also sweeps every .py under '
     'orchestrator/tests for the measures in the tests section, and that sweep '
     'is sized by --report rather than ratcheted here, so an unrelated test file '
     'arriving never touches these bytes.\n'
@@ -833,16 +888,17 @@ def write_baseline(
     can see it.
 
     THAT HOLE IS NOW CLOSED ELSEWHERE, and deliberately elsewhere. Closing it
-    means comparing against the copy in git HEAD, which is a dependency on git
-    this instrument does not have:
-    ``scripts/check_staged_ratchet_raise.py`` holds every git invocation that
-    reads history or the index, runs in pre-commit on every branch, and calls
-    ``compare_baseline_files`` here for the comparison itself, so there is one
-    definition of "did a measure rise" and only one file that knows what a
-    commit is. The boundary is still drawn rather than overclaimed -- the write
-    gate stops a raise being ABSORBED, the commit gate stops one being STAGED,
-    and neither sees a raise replayed by a rebase or landed by the merge
-    worker's hook-free ``update-ref``.
+    means comparing against the copy git holds, which is a dependency on git
+    this instrument does not have: ``scripts/ratchet_revisions.py`` holds every
+    git invocation that reads history or the index, and the two gates built on
+    it call ``compare_baseline_files`` here for the comparison itself, so there
+    is one definition of "did a measure rise".
+    ``scripts/check_staged_ratchet_raise.py`` runs in pre-commit on every
+    branch; ``scripts/check_ratchet_advance.py`` runs from
+    ``hooks/reference-transaction`` on every move of main, which is where a
+    raise replayed by a rebase or landed by the merge worker's ``update-ref``
+    is seen. The write gate stops a raise being ABSORBED, the commit gate one
+    being STAGED, the advance gate one LANDING.
 
     A MALFORMED destination propagates ``load_baseline``'s ``RatchetError``
     rather than being overwritten: a previous baseline you cannot read is one
@@ -1433,7 +1489,7 @@ def _check_files(current: dict, baseline: dict) -> list[Violation]:
             # Not a per-path violation -- lowering is the point -- and the
             # derived totals are what catch a move that only relocated the mass.
             continue
-        for measure in _SUMMED_FILE_MEASURES:
+        for measure in _RATCHETED_FILE_MEASURES:
             was, now = int(base_entry.get(measure, 0)), int(entry.get(measure, 0))
             if now > was:
                 violations.append(Violation.rose(measure, path, was, now))
@@ -1477,7 +1533,7 @@ def _check_totals(current: dict, baseline: dict) -> list[Violation]:
     return [
         _total_violation(measure, was, current_totals[measure])
         for measure, was in sorted(baseline_totals.items())
-        if current_totals.get(measure, 0) > was
+        if measure not in REPORTED_ONLY_MEASURES and current_totals.get(measure, 0) > was
     ]
 
 
@@ -1587,8 +1643,9 @@ def compare_baseline_files(previous: Path, current: Path) -> list[Violation]:
     nothing to compare and resets every frozen measure. This face compares two
     committed IMAGES instead, which is the shape a raise actually arrives in:
     a diff. It is what ``scripts/check_staged_ratchet_raise.py`` audits a staged
-    commit with -- and being two images rather than a measurement, it runs no
-    complexipy, reads no tree, and still consults no git.
+    commit with, and ``scripts/check_ratchet_advance.py`` a move of main -- and
+    being two images rather than a measurement, it runs no complexipy, reads no
+    tree, and still consults no git.
 
     Both images load through ``load_baseline``, so a missing or malformed one is
     that function's named hard failure rather than a silent empty-baseline pass.
@@ -1611,7 +1668,7 @@ def _merged_value(base: Any, ours: Any, theirs: Any) -> Any:
 
     Each side's own move stands, up or down, and a deletion stands unless the
     other side moved the entry (a modify/delete keeps the modification). Where
-    both sides moved one measure, the higher side bounds it.
+    both sides moved one measure, :func:`_both_moved_bound` bounds it.
     """
     if ours == base:
         return theirs
@@ -1621,7 +1678,25 @@ def _merged_value(base: Any, ours: Any, theirs: Any) -> Any:
         return theirs if ours is None else ours
     if isinstance(ours, dict) and isinstance(theirs, dict):
         return _merged_mapping(base if isinstance(base, dict) else {}, ours, theirs)
-    return max(ours, theirs, key=_magnitude)
+    return _both_moved_bound(base, ours, theirs)
+
+
+def _both_moved_bound(base: Any, ours: Any, theirs: Any) -> Any:
+    """The most a measure both sides moved can honestly hold.
+
+    That is the higher side, or both sides' moves composed over *base* where
+    that is higher: ``ours + theirs - base``, or for a name list the 3-way set
+    merge, whose absent *base* is the empty list. A count with no *base* has
+    nothing to compose over.
+    """
+    if isinstance(ours, list):
+        before, mine, other = set(base or ()), set(ours), set(theirs)
+        composed = sorted((mine & other) | (mine - before) | (other - before))
+    elif base is None:
+        return max(ours, theirs, key=_magnitude)
+    else:
+        composed = ours + theirs - base
+    return max(ours, theirs, composed, key=_magnitude)
 
 
 def _merged_mapping(base: dict, ours: dict, theirs: dict) -> dict:
@@ -1650,9 +1725,9 @@ def compare_merged_baseline_files(
 
     The bound is what git does to the file text, applied per measure against the
     merge *base*: a measure only one side moved stands at that side's value, up
-    or down, and one both sides moved is bounded by the higher side. An absent
-    *base* is the empty image git merges unrelated histories against, and an
-    absent parent moved nothing, so it stands in as the base.
+    or down, and one both sides moved is bounded by :func:`_both_moved_bound`.
+    An absent *base* is the empty image git merges unrelated histories against,
+    and an absent parent moved nothing, so it stands in as the base.
 
     NOT "clean against either parent": that admits keeping one side's stale
     value over the other side's lowering, which is an unrecorded widening on
@@ -1758,8 +1833,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             'Measure the merge-lane cluster (PRD plans/merge-lane-quality-prd.md '
-            'task alpha) and ratchet every measure against the committed '
-            'baseline. READ-ONLY except under --write-baseline.'
+            'task alpha) and ratchet its structural measures against the '
+            'committed baseline. READ-ONLY except under --write-baseline.'
         ),
         epilog=(
             'Exit codes: 0 clean; 1 ratchet violations (a measure rose above '

@@ -26,6 +26,7 @@ from client_feed.contract import (
     NotRecorded,
     VerifyLeg,
 )
+from client_feed.redact import redact_paths
 
 ARCHIVE_RELPATH: Final = Path('data', 'verify-logs')
 
@@ -167,8 +168,8 @@ _RED: Final = frozenset({CaseOutcome.FAILED, CaseOutcome.ERRORED})
 
 
 def _case_id(classname: str, name: str) -> str:
-    """The one spelling of a junit case id: `classname::name`."""
-    return f'{classname}::{name}' if classname else name
+    """The one spelling of a junit case id as the feed carries it: `classname::name`, paths redacted."""
+    return redact_paths(f'{classname}::{name}' if classname else name)
 
 
 def _seconds(value: str | None) -> float | None:

@@ -40,6 +40,7 @@ def _make(
     verify_infra_retry_backoff_secs: float = 0.01,
     verify_infra_retry_max_backoff_secs: float = 0.1,
     max_consecutive_infra_resumes: int = 3,
+    task_verify=None,
 ) -> TaskWorkflow:
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -88,6 +89,7 @@ def _make(
         briefing=MagicMock(),
         mcp=MagicMock(),
         escalation_queue=queue,
+        task_verify=task_verify,
     )
 
     # Set up a fake worktree and artifacts so the loop doesn't crash on None
@@ -146,6 +148,30 @@ class TestVerifyInfraTransientRetry:
         assert outcome == WorkflowOutcome.DONE
         assert call_count == 2, f'Expected 2 calls to run_scoped_verification, got {call_count}'
         assert len(sleep_calls) >= 1, 'Expected at least one backoff sleep'
+
+    @pytest.mark.asyncio
+    async def test_the_retry_wraps_an_injected_task_verify_port(self):
+        """Task 6670: the bounded infra retry wraps the port, not only the module name."""
+        calls = 0
+
+        async def port(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise VerifyInfraError(phase='warm_marker', errno=errno_module.ENOSPC)
+            return _passed_result()
+
+        wf = _make(verify_infra_retry_max_attempts=3, task_verify=port)
+
+        with (
+            patch('orchestrator.workflow.run_scoped_verification') as module_verify,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            outcome = await wf._verify_debugfix_loop()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert calls == 2
+        module_verify.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_task_never_set_to_pending_on_transient_retry(self):

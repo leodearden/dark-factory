@@ -35,6 +35,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # shared/src bootstrap, same idiom and same precedence argument as
 # scripts/scan_task_toolcall_leaks.py:113-115. Needed HERE, independently of
@@ -57,6 +58,8 @@ from shared.toolcall_markup import (  # noqa: E402
     detect_for,
 )
 from shared.toolcall_markup import INVOKE_CLOSER as SHARED_INVOKE_CLOSER  # noqa: E402
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Sentinel spellings. THE ONLY PLACE this file writes an envelope literal.
@@ -679,7 +682,7 @@ def test_refusals_are_returned_not_raised(sweep_root):
     """Refusals are structured VALUES carrying (path, lane, reason).
 
     Never raised-and-swallowed: `scripts` is inside
-    shared/tests/silent_fallthrough_scan.py's SCOPE_ROOTS, so a broad
+    tests/repo_guards/silent_fallthrough_scan.py's SCOPE_ROOTS, so a broad
     `except Exception` funnelling into a default would trip the ratchet — and
     would also lose the reason a human needs to adjudicate the refusal.
     """

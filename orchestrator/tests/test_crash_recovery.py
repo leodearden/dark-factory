@@ -23,6 +23,8 @@ from orchestrator.event_store import EventType
 from orchestrator.harness import Harness
 from orchestrator.lane_lifecycle import LaneLifecycle
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.quarantine_provenance import NOT_RELOCATED, QuarantineOutcome
+from orchestrator.startup_steps import EntryFailures
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
     lane_lock_path,
@@ -31,6 +33,7 @@ from orchestrator.verify_cancel import (
     write_lock_holder_pgid,
 )
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool
+from orchestrator.worktree_identity import read_worktree_title
 
 
 @pytest.fixture
@@ -54,6 +57,11 @@ def harness(tmp_path: Path, mock_orch_config):
     # restore" safe path (harness.py:1718-1719); all warm-lane RED tests assert
     # restore/preserve, none assert release.
     h.scheduler.get_status = AsyncMock(return_value=None)
+    # These tests model a task still in-progress at crash time, which the
+    # sidecar reaper must keep (plans/session-resume-eligibility-seam-prd.md D7's second conjunct).
+    h.scheduler.get_statuses = AsyncMock(
+        side_effect=lambda ids=None: ({i: 'in-progress' for i in (ids or [])}, None),
+    )
     h.scheduler._dispatched = set()
     # Substrate gate: _run_slot now calls substrate_gate.carries_substrate_probe
     # (module-level, not a Scheduler method — task 2121) directly on
@@ -75,7 +83,7 @@ def harness(tmp_path: Path, mock_orch_config):
     # explicitly to exercise the guard itself.
     h.git_ops.mark_pool_storage_present()
     h.git_ops.cleanup_worktree = AsyncMock()
-    h.git_ops.quarantine_worktree = AsyncMock(return_value=None)
+    h.git_ops.quarantine_worktree = AsyncMock(return_value=NOT_RELOCATED)
     # W11 delta: GitOps.__init__ built _lane_lifecycle against the ORIGINAL
     # worktree_base (before the reassignment above) — rebind it so the
     # record-driven recovery path reads/writes the same .lane-state dir
@@ -741,6 +749,34 @@ class TestRecoverCrashedTasks:
         assert str(wt_noplan) in cleaned_paths
         assert str(wt_noprog) in cleaned_paths
         assert len(cleanup_calls) == 2
+
+
+@pytest.mark.asyncio
+class TestRecoverCrashedTasksEntryIsolation:
+    async def test_one_failing_entry_does_not_stop_the_sweep(
+        self, harness: Harness, caplog,
+    ):
+        base = harness.git_ops.worktree_base
+        wt41 = _setup_worktree(base, '41')
+        wt42 = _setup_worktree(base, '42')
+
+        async def fail_41(entry: Path, task_id: str) -> None:
+            if entry.name == '41':
+                raise OSError('boom')
+
+        cleanup = AsyncMock(side_effect=fail_41)
+        harness.git_ops.cleanup_worktree = cleanup
+
+        with caplog.at_level(logging.ERROR):
+            failures = await harness._recover_crashed_tasks()
+
+        cleaned = {c.args[0] for c in cleanup.await_args_list}
+        assert cleaned == {wt41, wt42}
+        assert isinstance(failures, EntryFailures)
+        assert [(f.entry, f.exception_type) for f in failures.failures] == [('41', 'OSError')]
+        assert any(
+            r.levelno == logging.ERROR and '41' in r.getMessage() for r in caplog.records
+        )
 
 
 
@@ -1441,7 +1477,7 @@ class TestRecoverIdentityGuard:
     task 3770.
     """
 
-    async def test_quarantines_on_title_mismatch(self, harness: Harness):
+    async def test_quarantines_on_title_mismatch(self, harness: Harness, tmp_path: Path):
         """The 3770 scenario: worktree holds a trajectory plan but the live
         (recycled-id) task is the cycle-breaker → quarantine, do not adopt."""
         plan = _make_plan(steps_done=3, steps_total=5, task_id='3770')
@@ -1452,15 +1488,21 @@ class TestRecoverIdentityGuard:
         harness.scheduler.get_task = AsyncMock(
             return_value={'id': '3770', 'title': 'Cycle-breaker beta: dedup edges'},
         )
+        outcome = _populated_outcome(tmp_path, '3770')
+        quarantine = AsyncMock(return_value=outcome)
+        harness.git_ops.quarantine_worktree = quarantine
+        events = MagicMock()
+        harness.event_store = events
 
         await harness._recover_crashed_tasks()
 
         assert '3770' not in harness._recovered_plans
-        harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            wt, '3770', 'recovery-identity-mismatch',
+        quarantine.assert_called_once_with(
+            wt, '3770', 'recovery-identity-mismatch', stored_title='Trajectory beta: spline solver',
         )
-        emitted = {c.args[0] for c in harness.event_store.emit.call_args_list}  # type: ignore[attr-defined]
-        assert EventType.worktree_quarantined in emitted
+        assert _quarantine_emits(events) == [
+            {'task_id': '3770', 'data': outcome.event_data('recovery-identity-mismatch')},
+        ]
 
     async def test_adopts_on_match_with_autoeval_prefix(self, harness: Harness):
         """A benign ``[auto-eval redo] `` prefix normalises away → adopt."""
@@ -1545,12 +1587,36 @@ def _attach_pool(harness: Harness, size: int = 2) -> WarmLanePool:
 
 
 def _setup_lane(base: Path, lane_name: str, plan: dict) -> Path:
-    """Create a lane dir (e.g. '_lane-0') with the given plan.json."""
+    """Create lane dir *lane_name* as a dispatch of ``plan['task_id']`` leaves it.
+
+    The lane root's metadata.json names the task (and carries the plan's
+    title); plan.json sits in that task's root.  Returns the lane dir.
+    """
+    lane = base / lane_name
+    lane.mkdir(parents=True, exist_ok=True)
+    _write_lane_root_file(base, lane_name, 'metadata.json', {
+        'task_id': plan['task_id'], 'title': plan.get('title'),
+    })
+    _setup_task_plan(base, plan['task_id'], plan)
+    return lane
+
+
+def _setup_lane_legacy(base: Path, lane_name: str, plan: dict) -> Path:
+    """Create a lane dir whose plan.json exists ONLY at the legacy ``<lane>/.task``."""
     lane = base / lane_name
     task_dir = lane / '.task'
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / 'plan.json').write_text(json.dumps(plan))
     return lane
+
+
+def _write_lane_root_file(base: Path, lane_name: str, name: str, payload: dict) -> Path:
+    """Write a lane-keyed artifact (metadata.json, agent_session.json, …) to the lane root."""
+    lane_root = TaskArtifacts.meta_root_for(base, lane_name)
+    lane_root.mkdir(parents=True, exist_ok=True)
+    path = lane_root / name
+    path.write_text(json.dumps(payload))
+    return path
 
 
 def _seed_lane_record(
@@ -1570,15 +1636,27 @@ def _seed_lane_record(
     )
 
 
-def _setup_lane_meta_plan(base: Path, lane_name: str, plan: dict) -> Path:
-    """Write plan.json under the NEW `.task-meta` root (W11 beta relocation),
-    a SIBLING of the lane dir rather than nested inside it.  Returns the
-    `.task-meta/<lane_name>` dir.
-    """
-    meta_dir = TaskArtifacts.meta_root_for(base, lane_name)
-    meta_dir.mkdir(parents=True, exist_ok=True)
-    (meta_dir / 'plan.json').write_text(json.dumps(plan))
-    return meta_dir
+def _populated_outcome(tmp_path: Path, task_id: str) -> QuarantineOutcome:
+    """A relocated outcome with every field set, so a payload test sees each one."""
+    return QuarantineOutcome(
+        dest=tmp_path / 'q', branch=f'task/{task_id}-T', tip_sha='abc', unique_commit_count=3,
+    )
+
+
+def _quarantine_emits(events: MagicMock) -> list[dict]:
+    """The keyword arguments of each ``worktree_quarantined`` emit, in order."""
+    return [
+        call.kwargs for call in events.emit.call_args_list
+        if call.args[0] == EventType.worktree_quarantined
+    ]
+
+
+def _setup_task_plan(base: Path, task_id: str, plan: dict) -> Path:
+    """Write plan.json into *task_id*'s ``.task-meta/task-<id>`` root; return that root."""
+    task_root = TaskArtifacts.task_root_for(base, task_id)
+    task_root.mkdir(parents=True, exist_ok=True)
+    (task_root / 'plan.json').write_text(json.dumps(plan))
+    return task_root
 
 
 @pytest.mark.asyncio
@@ -1586,10 +1664,10 @@ def _setup_lane_meta_plan(base: Path, lane_name: str, plan: dict) -> Path:
 class TestRecoverCrashedTasksWarmLane:
     """_recover_crashed_tasks must correctly recover warm-lane worktrees.
 
-    A lane dir is named '_lane-0' but plan.json['task_id'] holds the real
+    A lane dir is named '_lane-0' but its lane metadata.json holds the real
     task id ('42').  The cold numeric-mismatch branch would clean it up
     (plan_task_id='42' != dir_name='_lane-0' → cleanup) and lose the work.
-    With the warm-lane path, recovery uses plan.json's task_id as the key.
+    With the warm-lane path, recovery keys on the lane metadata's task id.
     """
 
     async def test_warm_lane_plan_keyed_under_real_task_id(
@@ -1618,7 +1696,7 @@ class TestRecoverCrashedTasksWarmLane:
         _pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
         plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
-        lane = _setup_lane(base, '_lane-0', plan)
+        _setup_lane(base, '_lane-0', plan)
         sidecar = {
             'session_id': 'uuid-warm-heuristic',
             'role': 'implementer',
@@ -1628,7 +1706,7 @@ class TestRecoverCrashedTasksWarmLane:
             'resume_count': 0,
             'schema_version': 2,
         }
-        (lane / '.task' / 'agent_session.json').write_text(json.dumps(sidecar))
+        _write_lane_root_file(base, '_lane-0', 'agent_session.json', sidecar)
 
         await harness._recover_crashed_tasks()
 
@@ -1643,19 +1721,19 @@ class TestRecoverCrashedTasksWarmLane:
         self, harness: Harness,
     ):
         """Task 2772 (B11): a v1 sidecar (no task_id key) on a record-less
-        warm lane is still adopted, keyed via plan.json's task_id rather
-        than the sidecar itself (which has no id to key by)."""
+        warm lane is still adopted, keyed via the lane metadata's task id
+        rather than the sidecar itself (which has no id to key by)."""
         _pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
         plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
-        lane = _setup_lane(base, '_lane-0', plan)
+        _setup_lane(base, '_lane-0', plan)
         sidecar = {
             'session_id': 'uuid-warm-v1',
             'role': 'implementer',
             'started_at': '2026-07-19T09:00:00+00:00',
             'owner_pid': 4242,
         }
-        (lane / '.task' / 'agent_session.json').write_text(json.dumps(sidecar))
+        _write_lane_root_file(base, '_lane-0', 'agent_session.json', sidecar)
 
         await harness._recover_crashed_tasks()
 
@@ -1809,7 +1887,7 @@ class TestRecoverCrashedTasksWarmLane:
         # then the durable transition), never cleaned up (that's the
         # terminal-task release branch, a different cell).
         harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            lane_path, 'task/42', 'recovery-record-divergence',
+            lane_path, '42', 'recovery-record-divergence', stored_title=None,
         )
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
         record = harness.git_ops._lane_lifecycle.read(lane_path)
@@ -1900,7 +1978,7 @@ class TestRecoverCrashedTasksWarmLaneEdgeCases:
             session_id='77-aabbccddeeff',
         )
         lane_path = _setup_lane(base, '_lane-1', plan)
-        lock_path = lane_path / '.task' / 'plan.lock'
+        lock_path = TaskArtifacts.task_root_for(base, '77') / 'plan.lock'
         lock_path.write_text(json.dumps({'session_id': 'old', 'owner_pid': 1}))
 
         await harness._recover_crashed_tasks()
@@ -2175,7 +2253,7 @@ class TestRecordDrivenRecovery:
         """B1: durable record ASSIGNED:'42' branch='task/42', git reality
         matches (still registered + checked-out branch matches the record)
         and the task is non-terminal -> ADOPT: pool rebound to the lane,
-        plan recovered from .task-meta, durable record left ASSIGNED:'42',
+        plan recovered from .task-meta/task-42, durable record left ASSIGNED:'42',
         and neither quarantine nor cleanup is invoked.
         """
         pool = _attach_pool(harness, size=2)
@@ -2186,7 +2264,7 @@ class TestRecordDrivenRecovery:
         _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
 
         plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
-        _setup_lane_meta_plan(base, '_lane-0', plan)
+        _setup_task_plan(base, '42', plan)
 
         harness.git_ops._is_registered_worktree = AsyncMock(return_value=True)
         # lane_branch_checkouts returns {bare_id: lane} (branch_prefix
@@ -2218,8 +2296,8 @@ class TestRecordDrivenRecovery:
     ):
         """Task 2772 (B1): same ADOPT shape as
         test_adopt_on_exact_record_git_match, but with a v2
-        agent_session.json sidecar co-located under the SAME
-        .task-meta/_lane-0 new path -- the record-driven completed-steps
+        agent_session.json sidecar in the lane root .task-meta/_lane-0
+        -- the record-driven completed-steps
         branch (~2635) must ALSO populate _recovered_sessions, not just
         _recovered_plans, without disturbing the pool pin.
         """
@@ -2231,7 +2309,7 @@ class TestRecordDrivenRecovery:
         _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
 
         plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
-        meta_dir = _setup_lane_meta_plan(base, '_lane-0', plan)
+        _setup_task_plan(base, '42', plan)
         sidecar = {
             'session_id': 'uuid-warm-b1',
             'role': 'implementer',
@@ -2241,7 +2319,7 @@ class TestRecordDrivenRecovery:
             'resume_count': 0,
             'schema_version': 2,
         }
-        (meta_dir / 'agent_session.json').write_text(json.dumps(sidecar))
+        _write_lane_root_file(base, '_lane-0', 'agent_session.json', sidecar)
 
         harness.git_ops._is_registered_worktree = AsyncMock(return_value=True)
         harness.git_ops.lane_branch_checkouts = AsyncMock(
@@ -2258,7 +2336,7 @@ class TestRecordDrivenRecovery:
         assert pool.assignment_for('42') == lane
 
     async def test_quarantine_on_registration_divergence(
-        self, harness: Harness, caplog,
+        self, harness: Harness, caplog, tmp_path: Path,
     ):
         """B2: durable record ASSIGNED:'42' branch='task/42' but the git
         admin entry is gone (the 2097/2098 orphaned-worktree divergence) ->
@@ -2278,13 +2356,16 @@ class TestRecordDrivenRecovery:
 
         harness.git_ops._is_registered_worktree = AsyncMock(return_value=False)
         harness.scheduler.get_status = AsyncMock(return_value=None)  # non-terminal
+        outcome = _populated_outcome(tmp_path, '42')
+        quarantine = AsyncMock(return_value=outcome)
+        harness.git_ops.quarantine_worktree = quarantine
+        events = MagicMock()
+        harness.event_store = events
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
             await harness._recover_crashed_tasks()
 
-        harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            lane, 'task/42', 'recovery-record-divergence',
-        )
+        quarantine.assert_called_once_with(lane, '42', 'recovery-record-divergence', stored_title=None)
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
         record = lifecycle.read(lane)
@@ -2297,8 +2378,9 @@ class TestRecordDrivenRecovery:
         assert pool.state(lane) == LaneState.FREE
         assert '42' not in harness._recovered_plans
 
-        emitted = {c.args[0] for c in harness.event_store.emit.call_args_list}  # type: ignore[attr-defined]
-        assert EventType.worktree_quarantined in emitted
+        assert _quarantine_emits(events) == [
+            {'task_id': '42', 'data': outcome.event_data('recovery-record-divergence')},
+        ]
 
         assert any(
             rec.levelno == logging.WARNING
@@ -2313,6 +2395,44 @@ class TestRecordDrivenRecovery:
         assert result is not None, (
             'pool must not be stuck exhausted after quarantining a lane'
         )
+
+    async def test_quarantine_on_record_identity_mismatch(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        """The record-driven Fix C cell: durable record ASSIGNED:'42' and git
+        reality matches (registered, branch OK), but the lane's stored title
+        is not the live task's -> QUARANTINE with the full outcome payload,
+        never adopt.
+        """
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
+        lane = _setup_lane(base, '_lane-0', plan)
+        lifecycle = harness.git_ops._lane_lifecycle
+        _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
+
+        harness.git_ops.lane_branch_checkouts = AsyncMock(return_value={'42': lane})
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': '42', 'title': 'A different live task'},
+        )
+        outcome = _populated_outcome(tmp_path, '42')
+        quarantine = AsyncMock(return_value=outcome)
+        harness.git_ops.quarantine_worktree = quarantine
+        events = MagicMock()
+        harness.event_store = events
+
+        await harness._recover_crashed_tasks()
+
+        quarantine.assert_awaited_once_with(
+            lane, '42', 'recovery-identity-mismatch', stored_title=read_worktree_title(lane),
+        )
+        assert _quarantine_emits(events) == [
+            {'task_id': '42', 'data': outcome.event_data('recovery-identity-mismatch')},
+        ]
+        record = lifecycle.read(lane)
+        assert record is not None
+        assert record.state == DurableLaneState.QUARANTINED
+        assert pool.assignment_for('42') is None
 
     async def test_terminal_task_releases_lane_not_adopted(self, harness: Harness):
         """Terminal task (T10 amplifier): durable record ASSIGNED:'42'
@@ -2411,7 +2531,7 @@ class TestRecordDrivenRecovery:
         await harness._recover_crashed_tasks()
 
         harness.git_ops.quarantine_worktree.assert_called_once_with(  # type: ignore[attr-defined]
-            lane, 'task/42', 'recovery-record-divergence',
+            lane, '42', 'recovery-record-divergence', stored_title=None,
         )
         harness.git_ops.cleanup_worktree.assert_not_called()  # type: ignore[attr-defined]
 
@@ -2513,22 +2633,22 @@ class TestRecordDrivenRecovery:
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 2376: heavy class
 class TestRecordDrivenRecoveryCompatAndRelocation:
     """(a) compat: a record-less lane recovers its plan but is never pinned.
-    (b) .task-meta-only artifacts are read/cleared on the ADOPT path.
+    (b) task-root-only artifacts are read/cleared on the ADOPT path.
     (c) legacy-only artifacts (<wt>/.task, no .task-meta) still recover.
     """
 
     async def test_compat_no_record_lane_recovers_plan_without_pinning(
         self, harness: Harness,
     ):
-        """(a) COMPAT: a pool lane with plan.json (task_id='42', 3/5 steps
-        done) but NO .lane-state record -> the plan IS recovered but the
+        """(a) COMPAT: a pool lane dispatched for '42' (3/5 steps done) but
+        with NO .lane-state record -> the plan IS recovered but the
         lane is NOT pinned (PRD dec.5: never silently re-pin a record-less
         lane) and NOT quarantined/cleaned up.
         """
         pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
         plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
-        lane = _setup_lane(base, '_lane-0', plan)  # legacy path, no record
+        lane = _setup_lane(base, '_lane-0', plan)  # no record
 
         await harness._recover_crashed_tasks()
 
@@ -2556,14 +2676,14 @@ class TestRecordDrivenRecoveryCompatAndRelocation:
         )
         assert pool.assignment_for('42') is None
 
-    async def test_adopt_reads_and_clears_task_meta_new_path_only(
+    async def test_adopt_reads_and_clears_the_task_root_only(
         self, harness: Harness,
     ):
         """(b) A lane whose ASSIGNED record matches git and whose
         plan.json/plan.lock live ONLY under
-        TaskArtifacts.meta_root_for(base, name) (new path, not <wt>/.task)
-        is adopted, its plan recovered from the new path, and plan.lock at
-        the new path is cleared.
+        TaskArtifacts.task_root_for(base, '42') (not <wt>/.task)
+        is adopted, its plan recovered from the task root, and plan.lock
+        there is cleared.
         """
         pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
@@ -2573,7 +2693,7 @@ class TestRecordDrivenRecoveryCompatAndRelocation:
         _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
 
         plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
-        meta_dir = _setup_lane_meta_plan(base, '_lane-0', plan)
+        meta_dir = _setup_task_plan(base, '42', plan)
         (meta_dir / 'plan.lock').write_text(
             json.dumps({'session_id': 'x', 'owner_pid': 1})
         )
@@ -2600,7 +2720,7 @@ class TestRecordDrivenRecoveryCompatAndRelocation:
         pool = _attach_pool(harness, size=2)
         base = harness.git_ops.worktree_base
         plan = _make_plan(steps_done=3, steps_total=5, task_id='42')
-        lane = _setup_lane(base, '_lane-0', plan)  # legacy .task/plan.json only
+        lane = _setup_lane_legacy(base, '_lane-0', plan)
         lifecycle = harness.git_ops._lane_lifecycle
         _seed_lane_record(lifecycle, lane, task_id='42', branch='task/42')
 
@@ -2614,6 +2734,114 @@ class TestRecordDrivenRecoveryCompatAndRelocation:
 
         assert pool.assignment_for('42') == lane
         assert '42' in harness._recovered_plans
+
+
+# ===========================================================================
+# Task 3155: plan.json and plan.lock are task-scoped, so recovery reads them
+# from .task-meta/task-<id>, and a lane's task id comes from its LANE
+# metadata.json — never from a plan.json sitting in the lane root.
+# ===========================================================================
+
+
+def _stale_lock(root: Path) -> Path:
+    lock_path = root / 'plan.lock'
+    lock_path.write_text(json.dumps({'session_id': 'old', 'owner_pid': 1}))
+    return lock_path
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 2376: heavy class
+class TestRecoveryReadsTheTaskRoot:
+
+    async def test_cold_worktree_recovers_its_task_root_plan_and_clears_the_lock(
+        self, harness: Harness,
+    ):
+        cleanup = AsyncMock()
+        harness.git_ops.cleanup_worktree = cleanup
+        base = harness.git_ops.worktree_base
+        wt = _setup_worktree(base, '35')
+        task_root = _setup_task_plan(base, '35', _make_plan(steps_done=3, steps_total=5, task_id='35'))
+        lock_path = _stale_lock(task_root)
+
+        await harness._recover_crashed_tasks()
+
+        assert len(harness._recovered_plans['35']['steps']) == 5
+        assert not lock_path.exists()
+        assert wt.exists()
+        cleanup.assert_not_called()
+
+    async def test_cold_worktree_stamped_zero_completed_task_root_plan_is_preserved(
+        self, harness: Harness,
+    ):
+        cleanup = AsyncMock()
+        harness.git_ops.cleanup_worktree = cleanup
+        base = harness.git_ops.worktree_base
+        _setup_worktree(base, '38')
+        task_root = _setup_task_plan(base, '38', _make_plan(
+            steps_done=0, steps_total=4, task_id='38', session_id='38-deadbeefcafe',
+        ))
+        lock_path = _stale_lock(task_root)
+
+        await harness._recover_crashed_tasks()
+
+        assert '38' in harness._preserved_worktrees
+        assert '38' not in harness._recovered_plans
+        assert not lock_path.exists()
+        cleanup.assert_not_called()
+
+    async def test_recordless_lane_takes_its_task_id_from_lane_metadata(
+        self, harness: Harness,
+    ):
+        cleanup = AsyncMock()
+        harness.git_ops.cleanup_worktree = cleanup
+        _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        (base / '_lane-0').mkdir(parents=True)
+        _write_lane_root_file(base, '_lane-0', 'metadata.json', {'task_id': '42'})
+        _setup_task_plan(base, '42', _make_plan(steps_done=3, steps_total=5, task_id='42'))
+
+        await harness._recover_crashed_tasks()
+
+        assert '42' in harness._recovered_plans
+        assert '_lane-0' not in harness._recovered_plans
+        cleanup.assert_not_called()
+
+    async def test_record_adopted_lane_reads_its_plan_from_the_task_root(
+        self, harness: Harness,
+    ):
+        pool = _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        lane = base / '_lane-0'
+        lane.mkdir(parents=True)
+        _seed_lane_record(harness.git_ops._lane_lifecycle, lane, task_id='42', branch='task/42')
+        task_root = _setup_task_plan(base, '42', _make_plan(steps_done=3, steps_total=5, task_id='42'))
+        lock_path = _stale_lock(task_root)
+        harness.git_ops.lane_branch_checkouts = AsyncMock(return_value={'42': lane})
+
+        await harness._recover_crashed_tasks()
+
+        assert pool.assignment_for('42') == lane
+        assert '42' in harness._recovered_plans
+        assert not lock_path.exists()
+
+    async def test_lane_root_plan_without_a_metadata_task_id_takes_the_no_plan_branch(
+        self, harness: Harness,
+    ):
+        """plan.json is task-scoped; a copy in the lane root names no task."""
+        cleanup = AsyncMock()
+        harness.git_ops.cleanup_worktree = cleanup
+        _attach_pool(harness, size=2)
+        base = harness.git_ops.worktree_base
+        lane = base / '_lane-0'
+        lane.mkdir(parents=True)
+        _write_lane_root_file(
+            base, '_lane-0', 'plan.json', _make_plan(steps_done=3, steps_total=5, task_id='42'),
+        )
+
+        await harness._recover_crashed_tasks()
+
+        assert harness._recovered_plans == {}
+        cleanup.assert_called_once_with(lane, '_lane-0')
 
 
 class TestSessionResumeReasons:

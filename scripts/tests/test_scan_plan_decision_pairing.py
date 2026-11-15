@@ -76,6 +76,9 @@ from scan_plan_decision_pairing import (
 # purpose — the non-circular control asserting the self-name specimen is
 # invisible to the BLANKET predicate — never as the thing under test.
 from shared.toolcall_markup import detect  # noqa: E402
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Specimens, paraphrased from live victim plans (task ids named per specimen).

@@ -51,9 +51,9 @@ from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
     closer_for,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
-from fused_memory.server.main import _install_safe_tool_wrapper, server_data_dir
+from fused_memory.server.main import _install_safe_tool_wrapper
 from fused_memory.server.markup_guard import (
     ResidueTier,
     _resolve_project_root,
@@ -61,6 +61,8 @@ from fused_memory.server.markup_guard import (
 )
 from fused_memory.server.markup_residue_spool import MarkupResidueSpool
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PROJECT_ID = 'dark_factory'
 _PROJECT_ROOT = '/project'
@@ -987,20 +989,6 @@ class TestInstalledOnTheRealServer:
         # ``==`` compares a bound method's (func, self): this spool's preserve.
         assert recorded['residue_floor'] == spool.preserve
 
-    @pytest.mark.usefixtures('code_default_config')
-    def test_the_server_data_dir_is_the_configured_reconciliation_dir(self):
-        """Where the spool lives."""
-        config = FusedMemoryConfig(
-            reconciliation=ReconciliationConfig(data_dir='/var/lib/fused-memory')
-        )
-
-        assert server_data_dir(config) == Path('/var/lib/fused-memory')
-
-    @pytest.mark.usefixtures('code_default_config')
-    def test_a_config_without_a_reconciliation_section_still_yields_a_dir(self):
-        """That shape is legal, so it must not disable preservation."""
-        assert server_data_dir(FusedMemoryConfig()) == Path(ReconciliationConfig().data_dir)
-
     def test_an_undeliverable_policy_is_refused_at_WIRING_time(self):
         """The declared ValueError, which is a fail-LOUD wiring guard.
 
@@ -1121,11 +1109,12 @@ class TestInstallationOrder:
 
 
 class TestReconReportServerIsNotGuarded:
-    """(c) The second ``_install_safe_tool_wrapper`` call site stays bare.
+    """(c) The recon-report server gets no MARKUP guard.
 
-    The recon-report server hosts the cite_* / report tools and no write tools,
-    so it has no write boundary to guard. Asserting that keeps it from being
-    wired by accident when the two call sites are next edited together.
+    It hosts the cite_* / report tools and no write tools, so it has no write
+    boundary to guard. Asserting that keeps it from being wired by accident
+    when the two call sites are next edited together. (It does get the
+    unknown-argument guard: tests/test_unknown_argument_guard_fused_memory.py.)
     """
 
     def _make_config(self) -> Any:

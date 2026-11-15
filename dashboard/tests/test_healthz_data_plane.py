@@ -17,8 +17,8 @@ inside ``_HEALTHZ_TOTAL_BUDGET``. Only "could a caller get THROUGH to the
 substrate, inside a bound" separates the two, and that is the property the
 incident actually violated.
 
-So the probe keys on TRAVERSAL, through the raw uncached read (PRD decision
-17). A completed fan-out is ``'ok'`` whatever it returned, the offline marker
+So the probe keys on TRAVERSAL, through a raw uncached read of one row of the
+snapshot unit's row query (PRD decision 17, task 6321). A completed fan-out is ``'ok'`` whatever it returned, the offline marker
 included.
 
 Every test calls ``dashboard.app.healthz(request)`` directly through
@@ -42,13 +42,17 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from _canned_mcp import CannedMCP, _raw_row
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
 import dashboard.app as app_module
+import dashboard.data.task_snapshot as task_snapshot
 import dashboard.data.tasks as tasks_module
 from dashboard.app import healthz
 from dashboard.config import DashboardConfig
+from dashboard.data.datum import DatumState
+from dashboard.data.utils import resolve_now
 
 # asyncio_mode = "auto" (dashboard/pyproject.toml) collects the async tests
 # below without a per-test marker, so no module-level pytestmark is needed --
@@ -140,40 +144,32 @@ def wedge_reported_at_once(monkeypatch):
     monkeypatch.setattr(app_module, '_MCP_PROBE_OUTSTANDING_LIMIT', 0.0)
 
 
-def _hanging_fetch(entered: list[str] | None = None, gate: asyncio.Event | None = None):
-    """A ``fetch_tasks`` stub that never returns until *gate* is set.
+def _hanging_network_leg(
+    entered: list[str] | None = None, gate: asyncio.Event | None = None,
+):
+    """A ``tasks.first_success`` stub — the NETWORK leg, below every task read.
 
-    ``await asyncio.Event().wait()`` with nothing to set it is the task-4788
-    hang idiom: it has NO duration at all, so no choice of budget value can
-    make a pre-fix implementation pass a test built on it.
-    """
-    ev = gate if gate is not None else asyncio.Event()
-
-    async def _hang(_client, _config, _root, **_kwargs):
-        if entered is not None:
-            entered.append('enter')
-        await ev.wait()
-        return []
-
-    return _hang
-
-
-def _hanging_network_leg(entered: list[str] | None = None):
-    """A ``tasks.first_success`` stub — the NETWORK leg, below ``fetch_tasks``.
-
-    Patching here rather than at ``fetch_tasks`` is what lets a test exercise
-    the REAL ``fetch_tasks`` while still performing no I/O: everything above
-    the fan-out is the shipped code, and only the leg that would touch the
-    network is replaced.
+    Patching here rather than at the read app.py imports is what lets a test
+    exercise the REAL read the probe issues while still performing no I/O:
+    everything above the fan-out is the shipped code, and only the leg that
+    would touch the network is replaced. It also leaves the tests indifferent
+    to WHICH task read the probe uses, which is the probe's business.
 
     *entered* records each arrival, so a test can assert the probe actually
     reached the network rather than being answered above it.
+
+    It never returns until *gate* is set. ``await asyncio.Event().wait()`` with
+    nothing to set it is the task-4788 hang idiom: it has NO duration at all,
+    so no choice of budget value can make a pre-fix implementation pass a test
+    built on it.
     """
+    ev = gate if gate is not None else asyncio.Event()
 
     async def _hang(*_args, **_kwargs):
         if entered is not None:
             entered.append('enter')
-        await asyncio.Event().wait()
+        await ev.wait()
+        return []
 
     return _hang
 
@@ -186,14 +182,14 @@ def _hanging_network_leg(entered: list[str] | None = None):
 async def test_a_hung_raw_read_is_reported_degraded(
     config, clean_probe_state, wedge_reported_at_once, monkeypatch,
 ):
-    """ACCEPTANCE 1a — the incident shape, through the REAL ``fetch_tasks``.
+    """ACCEPTANCE 1 — the incident shape: the probe's own read never returns.
 
-    ``fetch_tasks`` is deliberately NOT stubbed here — that is the whole
-    difference between this test and the stubbed one below. Only the NETWORK
-    leg is replaced, so the shipped read runs and the hang the probe meets is
-    the substrate's. A caller that cannot get through inside the budget is
-    wedged from its own point of view, and reporting otherwise is what made the
-    incident invisible.
+    Only the NETWORK leg is replaced, so the shipped read runs and the hang the
+    probe meets is the substrate's. A caller that cannot get through inside the
+    budget is wedged from its own point of view, and reporting otherwise is
+    what made the incident invisible. A fan-out that never completes never
+    stamps the grace, so no later probe is answered for free and the wedge
+    stays reported for as long as it lasts.
     """
     entered_network: list[str] = []
     monkeypatch.setattr(
@@ -216,43 +212,70 @@ async def test_a_hung_raw_read_is_reported_degraded(
     assert body['checks']['deadline_exceeded'] is True
 
 
-async def test_hung_refresh_is_reported_degraded(
-    config, clean_probe_state, wedge_reported_at_once, monkeypatch,
+@pytest.mark.usefixtures('clean_probe_state', 'fresh_task_snapshot_state')
+async def test_the_probe_asks_the_unit_row_question_for_one_row(
+    config, dummy_client, monkeypatch,
 ):
-    """ACCEPTANCE 1b — the probe's own ``fetch_tasks`` never returns.
+    """The probe crosses the request path's own row query, and ships ONE row of it.
 
-    A fan-out that never completes never stamps the grace, so no later probe
-    is answered for free and the wedge stays reported for as long as it lasts.
+    Rationale: ``plans/dashboard-one-datum-one-path-prd.md``, the note "The
+    ``/healthz`` probe reads one row of the unit's row query (task 6321)".
     """
-    monkeypatch.setattr(app_module, 'fetch_tasks', _hanging_fetch())
+    canned = CannedMCP(
+        rows=[_raw_row(1, 'pending'), _raw_row(2, 'in-progress'), _raw_row(3, 'done')],
+        status_map={1: 'pending', 2: 'in-progress', 3: 'done'},
+    )
+    monkeypatch.setattr(tasks_module, 'mcp_tool_call', canned)
 
-    body, status, _elapsed = await _call_healthz(_make_request(config))
+    await task_snapshot.acquire_snapshot(
+        dummy_client, config, config.project_root, now=resolve_now(None),
+    )
+    unit_args = canned.calls_to('get_tasks')[0]['args']
+    canned.calls = []
 
-    assert status == 503, body
-    assert body['status'] == 'degraded'
-    assert body['checks']['mcp_fanout'] == 'timeout'
-    assert body['checks']['deadline_exceeded'] is True
+    body, _status, _elapsed = await _call_healthz(_make_request(config))
+
+    assert unit_args.get('statuses') and 'page_size' not in unit_args, (
+        f'the unit row read sent {unit_args!r}; this test needs it to be the '
+        'unpaged, status-narrowed read the request path issues. A '
+        '`statuses=[]` never reaches SQL, so a probe copying one would '
+        'traverse nothing'
+    )
+    probe_reads = canned.calls_to('get_tasks')
+    assert len(probe_reads) == 1, (
+        f'/healthz issued {len(probe_reads)} get_tasks reads; the probe is '
+        'ONE raw read per launch'
+    )
+    probe_args = probe_reads[0]['args']
+    assert probe_args == {**unit_args, 'page_size': 1, 'offset': 0}, (
+        f'the probe sent {probe_args!r} against the unit row read '
+        f'{unit_args!r}. It must be the SAME query apart from a one-row window: '
+        'only the unit\'s own statuses narrow the SERVER READ onto the SQL the '
+        'request path runs, and only page_size=1, offset=0 narrows the '
+        'TRANSFER, since the verdict needs a completed traversal, not its rows'
+    )
+    assert body['checks']['mcp_fanout'] == 'ok', body
 
 
+@pytest.mark.usefixtures('fresh_task_snapshot_state')
 async def test_a_stored_route_read_never_answers_the_probe(
-    config, clean_probe_state, wedge_reported_at_once, monkeypatch,
+    config, dummy_client, clean_probe_state, wedge_reported_at_once, monkeypatch,
 ):
-    """A task read some OTHER caller completed is not evidence the path is open.
+    """A snapshot unit stored within its TTL never answers for the probe.
 
-    PRD decision 17: the probe is the one raw, uncached traversal, and a stored
-    value must never answer for a traversal.  So an earlier successful read of
-    the very whole tree the probe reads proves nothing about whether a caller
-    can get through NOW, and /healthz must still go to the network leg.
+    PRD decision 17, pinned against the one store left on the task-read path,
+    the snapshot unit's cache: the probe is the one raw, uncached traversal,
+    and a stored value must never answer for a traversal.  A unit some route
+    acquired moments ago proves nothing about whether a caller can get through
+    NOW, so /healthz must still go to the network leg.
     """
-    reads: list[str] = []
-
-    async def _fast_network_leg(*_args, **_kwargs):
-        reads.append('read')
-        return []
-
-    monkeypatch.setattr(tasks_module, 'first_success', _fast_network_leg)
-    assert await tasks_module.fetch_tasks(None, config, config.project_root) == []  # type: ignore[arg-type]
-    assert reads == ['read']
+    monkeypatch.setattr(tasks_module, 'mcp_tool_call', CannedMCP(
+        rows=[_raw_row(1, 'pending')], status_map={1: 'pending'},
+    ))
+    unit = await task_snapshot.acquire_snapshot(
+        dummy_client, config, config.project_root, now=resolve_now(None),
+    )
+    assert unit.rows.state is DatumState.FRESH
 
     entered: list[str] = []
     monkeypatch.setattr(tasks_module, 'first_success', _hanging_network_leg(entered))
@@ -260,8 +283,8 @@ async def test_a_stored_route_read_never_answers_the_probe(
     body, status, _elapsed = await _call_healthz(_make_request(config))
 
     assert entered == ['enter'], (
-        'the probe never reached the network leg: a read another caller '
-        'completed earlier answered for it, so a wedge that began since would '
+        'the probe never reached the network leg: a unit another caller '
+        'stored earlier answered for it, so a wedge that began since would '
         'be reported healthy'
     )
     assert body['checks']['mcp_fanout'] == 'timeout', body
@@ -284,11 +307,11 @@ async def test_offline_marker_is_still_a_completed_fanout(config, clean_probe_st
     the 19.8h wedge, since fused-memory was reachable the whole time.
     """
 
-    async def _offline(_client, _config, _root, **_kwargs):
+    async def _offline(*_args, **_kwargs):
         await asyncio.sleep(0.01)
         return {'offline': True, 'error': 'ReadTimeout'}
 
-    monkeypatch.setattr(app_module, 'fetch_tasks', _offline)
+    monkeypatch.setattr(tasks_module, 'first_success', _offline)
 
     body, status, _elapsed = await _call_healthz(_make_request(config))
 
@@ -312,16 +335,16 @@ async def test_grace_absorbs_a_blip_and_is_bounded(
     would report healthy forever.
     """
 
-    async def _fast(_client, _config, _root, **_kwargs):
+    async def _fast(*_args, **_kwargs):
         await asyncio.sleep(0.01)
         return []
 
-    monkeypatch.setattr(app_module, 'fetch_tasks', _fast)
+    monkeypatch.setattr(tasks_module, 'first_success', _fast)
     body, status, _ = await _call_healthz(_make_request(config))
     assert status == 200 and body['checks']['mcp_fanout'] == 'ok'
 
     # The stub now hangs — only the grace stamp can carry this call.
-    monkeypatch.setattr(app_module, 'fetch_tasks', _hanging_fetch())
+    monkeypatch.setattr(tasks_module, 'first_success', _hanging_network_leg())
     body, status, _ = await _call_healthz(_make_request(config))
     assert status == 200, body
     assert body['checks']['mcp_fanout'] == 'ok', (
@@ -356,7 +379,7 @@ async def test_an_unattended_dashboard_is_never_reported_wedged(
     ``_MCP_PROBE_OUTSTANDING_LIMIT`` is what is under test.
     """
     entered: list[str] = []
-    monkeypatch.setattr(app_module, 'fetch_tasks', _hanging_fetch(entered=entered))
+    monkeypatch.setattr(tasks_module, 'first_success', _hanging_network_leg(entered=entered))
 
     body, status, _ = await _call_healthz(_make_request(config))
 
@@ -378,7 +401,7 @@ async def test_an_unattended_dashboard_is_never_reported_wedged(
     assert body['checks']['mcp_fanout'] == 'timeout'
     assert body['checks']['deadline_exceeded'] is True
     assert len(entered) == 1, (
-        f'fetch_tasks was entered {len(entered)} times; both verdicts above '
+        f'the probe reached the network leg {len(entered)} times; both verdicts above '
         'must describe the SAME single-flight probe, not two'
     )
 
@@ -397,7 +420,7 @@ async def test_worst_case_stays_inside_the_total_budget(
     EXISTING envelope: ``_DB_PROBE_TIMEOUT * 3 + _MCP_PROBE_TIMEOUT =
     0.9*3 + 0.2 = 2.9 <= 3.0``. Nothing was widened to make room.
     """
-    monkeypatch.setattr(app_module, 'fetch_tasks', _hanging_fetch())
+    monkeypatch.setattr(tasks_module, 'first_success', _hanging_network_leg())
     threads_before = threading.active_count()
 
     body, status, elapsed = await _call_healthz(_make_request(config))
@@ -424,14 +447,14 @@ async def test_worst_case_stays_inside_the_total_budget(
 async def test_probe_is_single_flight(
     config, clean_probe_state, wedge_reported_at_once, monkeypatch,
 ):
-    """Three /healthz calls against a wedged fan-out cost ONE fetch_tasks entry.
+    """Three /healthz calls against a wedged fan-out cost ONE network-leg entry.
 
     The watchdog timer fires every 30s. A probe that launched a fresh doomed
     task per call would leak one task per tick for as long as the wedge lasted
     — 19.8 hours of them, in the incident that motivated this check.
     """
     entered: list[str] = []
-    monkeypatch.setattr(app_module, 'fetch_tasks', _hanging_fetch(entered=entered))
+    monkeypatch.setattr(tasks_module, 'first_success', _hanging_network_leg(entered=entered))
 
     for _ in range(3):
         body, status, _ = await _call_healthz(_make_request(config))
@@ -439,7 +462,7 @@ async def test_probe_is_single_flight(
         assert body['checks']['mcp_fanout'] == 'timeout'
 
     assert len(entered) == 1, (
-        f'fetch_tasks was entered {len(entered)} times across three /healthz '
+        f'the probe reached the network leg {len(entered)} times across three /healthz '
         'calls; EXACTLY one is the claim, and both directions are failures: 0 '
         'means the probe never launched a fetch at all (so the three 503s '
         'above were reported without probing anything, and this test would '
@@ -462,7 +485,7 @@ async def test_probe_task_is_not_cancelled_at_expiry(
     """
     entered: list[str] = []
     gate = asyncio.Event()
-    monkeypatch.setattr(app_module, 'fetch_tasks', _hanging_fetch(entered=entered, gate=gate))
+    monkeypatch.setattr(tasks_module, 'first_success', _hanging_network_leg(entered=entered, gate=gate))
 
     body, status, _ = await _call_healthz(_make_request(config))
     assert status == 503
@@ -488,7 +511,7 @@ async def test_probe_task_is_not_cancelled_at_expiry(
     assert status == 200, body
     assert body['checks']['mcp_fanout'] == 'ok'
     assert len(entered) == 1, (
-        f'fetch_tasks was entered {len(entered)} times; the completion the '
+        f'the probe reached the network leg {len(entered)} times; the completion the '
         'second call observed must be the FIRST call\'s abandoned task, not a '
         'relaunch — that is what makes a cold start self-heal in one cycle '
         'instead of costing an MCP call per watchdog tick forever'
@@ -512,10 +535,10 @@ async def test_a_raising_fetch_is_error_and_not_a_missed_deadline(
     would go looking for a slow fan-out instead of a raising one.
     """
 
-    async def _boom(_client, _config, _root, **_kwargs):
+    async def _boom(*_args, **_kwargs):
         raise RuntimeError('fused-memory transport exploded')
 
-    monkeypatch.setattr(app_module, 'fetch_tasks', _boom)
+    monkeypatch.setattr(tasks_module, 'first_success', _boom)
 
     with caplog.at_level(logging.WARNING):
         body, status, _ = await _call_healthz(_make_request(config))
@@ -550,7 +573,7 @@ async def test_a_spent_budget_reports_deadline_exceeded_without_probing(
             'cannot wait for'
         )
 
-    monkeypatch.setattr(app_module, 'fetch_tasks', _must_not_be_called)
+    monkeypatch.setattr(tasks_module, 'first_success', _must_not_be_called)
     monkeypatch.setattr(app_module, '_HEALTHZ_TOTAL_BUDGET', 0.0)
 
     body, status, _ = await _call_healthz(_make_request(config))
@@ -571,7 +594,7 @@ async def test_a_cancelled_probe_is_reported_error_not_laundered(
     verdict about the data plane, which is exactly the confusion the
     'timeout' vs 'error' split exists to prevent.
     """
-    monkeypatch.setattr(app_module, 'fetch_tasks', _hanging_fetch())
+    monkeypatch.setattr(tasks_module, 'first_success', _hanging_network_leg())
 
     body, _status, _ = await _call_healthz(_make_request(config))
     assert body['checks']['mcp_fanout'] == 'timeout'
@@ -610,15 +633,15 @@ async def test_the_grace_window_constant_is_read_not_merely_declared(
 ):
     """Zeroing _MCP_FANOUT_OK_GRACE_SECONDS must make a graced probe re-probe."""
 
-    async def _fast(_client, _config, _root, **_kwargs):
+    async def _fast(*_args, **_kwargs):
         return []
 
-    monkeypatch.setattr(app_module, 'fetch_tasks', _fast)
+    monkeypatch.setattr(tasks_module, 'first_success', _fast)
     body, status, _ = await _call_healthz(_make_request(config))
     assert status == 200 and body['checks']['mcp_fanout'] == 'ok'
 
     # A hanging fan-out: only the grace stamp can answer now.
-    monkeypatch.setattr(app_module, 'fetch_tasks', _hanging_fetch())
+    monkeypatch.setattr(tasks_module, 'first_success', _hanging_network_leg())
     body, status, _ = await _call_healthz(_make_request(config))
     assert body['checks']['mcp_fanout'] == 'ok', body
 
@@ -639,7 +662,7 @@ async def test_the_probe_budget_constant_is_read_not_merely_declared(
     config, clean_probe_state, wedge_reported_at_once, monkeypatch,
 ):
     """Widening _MCP_PROBE_TIMEOUT must widen the observed wait."""
-    monkeypatch.setattr(app_module, 'fetch_tasks', _hanging_fetch())
+    monkeypatch.setattr(tasks_module, 'first_success', _hanging_network_leg())
 
     monkeypatch.setattr(app_module, '_MCP_PROBE_TIMEOUT', 0.0)
     body, _status, instant = await _call_healthz(_make_request(config))

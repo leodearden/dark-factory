@@ -316,13 +316,11 @@ class TestCompletenessSweepAllMemoryTools:
 
 
 class TestGetExternalStatusesCharacterization:
-    """get_external_statuses (step-8 refactor target): characterizes its
-    CURRENT project_id normalization behavior so replacing the inline
-    ``project_id.lower().replace('-', '_')`` with the shared, raise-free
-    ``_to_underscore_canonical`` primitive (task 2267/S1) is a verified
-    no-op refactor rather than a behavior change (see plan design decisions —
+    """get_external_statuses: characterizes its project_id normalization
+    contract. The site normalizes with the raise-free one rule
+    ``shared.project_id.normalize_project_id`` (tasks 2267/S1, 6815), so
     get_external_statuses must keep its sentinel-only contract and must
-    never raise PathShapedProjectIdError).
+    never raise PathShapedProjectIdError.
     """
 
     @pytest.fixture(autouse=True)
@@ -357,8 +355,31 @@ class TestGetExternalStatusesCharacterization:
         )
 
     @pytest.mark.asyncio
+    async def test_mixed_case_hyphen_dep_resolves_against_canonical_registry_key(self):
+        """'Dark-Factory:5' is lower-cased AND hyphen-folded to registry key 'dark_factory'."""
+        mock_task_interceptor = AsyncMock()
+        mock_task_interceptor.get_statuses = AsyncMock(return_value={'5': 'pending'})
+        server = create_mcp_server(
+            AsyncMock(),
+            task_interceptor=mock_task_interceptor,
+            known_projects=_KNOWN_PROJECTS,
+        )
+
+        result = await server._tool_manager.call_tool(
+            'get_external_statuses', {'deps': ['Dark-Factory:5']}
+        )
+
+        assert result == {'Dark-Factory:5': 'pending'}, (
+            'Expected the mixed-case hyphen dep to resolve via the canonical '
+            f'registry key, keyed verbatim; got: {result!r}'
+        )
+        mock_task_interceptor.get_statuses.assert_awaited_once_with(
+            project_root='/home/leo/src/dark-factory', ids=['5']
+        )
+
+    @pytest.mark.asyncio
     async def test_path_shaped_dep_returns_sentinel_without_raising(self):
-        """A path-shaped dep project_id returns a sentinel — no raise, no backend call."""
+        """A path-shaped dep project_id is 'unknown_project' — no raise, no backend call."""
         mock_task_interceptor = AsyncMock()
         server = create_mcp_server(
             AsyncMock(),
@@ -369,7 +390,8 @@ class TestGetExternalStatusesCharacterization:
 
         result = await server._tool_manager.call_tool('get_external_statuses', {'deps': [dep]})
 
-        assert result.get(dep) in {'unknown_project', 'malformed'}, (
-            f'Expected a sentinel value (no raise) for a path-shaped dep; got: {result!r}'
+        assert result == {dep: 'unknown_project'}, (
+            "Expected exactly the 'unknown_project' sentinel (no raise) for a "
+            f'path-shaped dep; got: {result!r}'
         )
         mock_task_interceptor.get_statuses.assert_not_called()

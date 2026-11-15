@@ -148,7 +148,7 @@ def test_importing_the_harness_loads_every_wire_module():
 
 
 def test_build_remote_runners_hands_every_runner_the_deployed_sha():
-    from orchestrator.merge_lane.drift import _build_remote_runners
+    from orchestrator.verify_hosts import build_remote_runners
 
     deployed = DeployedSha(sha='c' * 40, indeterminate=False, dirty_wire_path=False)
     config = OrchestratorConfig(
@@ -162,7 +162,7 @@ def test_build_remote_runners_hands_every_runner_the_deployed_sha():
         ],
     )
 
-    runners = _build_remote_runners(config, '/repo', deployed_sha=deployed)
+    runners = build_remote_runners(config, '/repo', deployed_sha=deployed)
 
     assert [r.deployed_sha for r in runners] == [deployed, deployed]
 

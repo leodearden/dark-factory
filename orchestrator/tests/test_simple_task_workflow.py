@@ -140,7 +140,7 @@ def _make(
         invocation_count[0] += 1
         # Side-effects to simulate the agent: write plan + mark done.
         if plan_to_write is not None:
-            (artifacts.root / 'plan.json').write_text(json.dumps(plan_to_write))
+            artifacts.artifact_path('plan.json').write_text(json.dumps(plan_to_write))
         if write_unactionable:
             artifacts.write_unactionable_task(reason='spec broken', evidence='nope')
         if invoke_outcome is not None:

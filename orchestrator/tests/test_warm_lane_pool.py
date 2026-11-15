@@ -3331,10 +3331,9 @@ class TestRestoreAssignment:
         assert pool.assignment_for('42') == lane
 
     def test_restore_unknown_lane_is_noop(self, tmp_path: Path):
-        """Unknown lane path is silently ignored (never raises)."""
+        """A path outside the pool namespace is silently ignored (never raises)."""
         pool = _make_pool(tmp_path, size=2)
-        base = tmp_path / 'worktrees'
-        unknown = base / '_lane-99'
+        unknown = tmp_path / 'elsewhere' / '_lane-99'
 
         # Must not raise
         pool.restore_assignment('42', unknown)

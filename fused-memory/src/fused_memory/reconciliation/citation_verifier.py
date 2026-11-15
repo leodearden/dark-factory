@@ -24,9 +24,10 @@ dangling pointers behind it. These run from the ``delete_memory`` MCP tool
 handler's citation-repoint gate, NOT from ``MemoryConsolidator.run()``: the
 consolidator never deletes from Python, so a sweep inside ``run()`` would
 execute AFTER the delete and could only report damage. Their stats therefore
-ride back on the ``delete_memory`` response under ``citation_repoint`` and
-deliberately carry NO ``stage1_`` prefix — they are tool-response stats, not
-stage-report stats.
+ride back on the ``delete_memory`` response under ``citation_repoint``: they
+are tool-response stats, never merged into any stage report. The ``stage1_``
+prefix on their scalar counters is that response's key spelling, kept for
+compatibility with its consumers.
 
 Half 3 — PROSE citations (task 4818), and the one half that only WARNS.
 Halves 1 and 2 act on STRUCTURED citations: a finding's ``cited_memories``
@@ -111,7 +112,8 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from typing import Any
+from enum import StrEnum
+from typing import Any, NamedTuple
 
 from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
 from fused_memory.models.reconciliation import StageId
@@ -336,6 +338,43 @@ def _tombstone_wiring_gap(memory_service: Any) -> str | None:
     return None
 
 
+class MemoryLiveness(StrEnum):
+    """What one ``get_memory_by_id`` point read says about a memory id."""
+
+    LIVE = 'live'
+    ABSENT = 'absent'
+    INCONCLUSIVE = 'inconclusive'
+
+
+class LivenessVerdict(NamedTuple):
+    outcome: MemoryLiveness
+    error_type: str | None
+
+
+async def resolve_memory_liveness(
+    memory_service: Any,
+    project_id: str,
+    memory_id: Any,
+) -> LivenessVerdict:
+    """Resolve one Mem0 id to LIVE / ABSENT / INCONCLUSIVE. Never raises.
+
+    The single home of the verdict over ``MemoryService.get_memory_by_id``'s
+    three documented outcomes: a truthy record is LIVE, ``None`` is ABSENT, and
+    a RAISED lookup is INCONCLUSIVE carrying the exception's type name. A raised
+    backend error is 'unknown', not 'absent' — reading it as absence would drop
+    a live citation on a sick store, which is itself the silent-fail every
+    caller exists to prevent. Every caller asking "does this cited memory id
+    still resolve?" goes through here, so none can disagree about a timeout.
+    """
+    try:
+        record = await memory_service.get_memory_by_id(project_id, memory_id)
+    except Exception as exc:  # unknown is a verdict, not a crash
+        return LivenessVerdict(MemoryLiveness.INCONCLUSIVE, type(exc).__name__)
+    if record:
+        return LivenessVerdict(MemoryLiveness.LIVE, None)
+    return LivenessVerdict(MemoryLiveness.ABSENT, None)
+
+
 def _memo_key(memory_id: Any) -> Any:
     """Lowercase for an ``is_full_uuid`` id, *memory_id* verbatim otherwise."""
     return memory_id.lower() if is_full_uuid(memory_id) else memory_id
@@ -344,13 +383,14 @@ def _memo_key(memory_id: Any) -> Any:
 def make_memory_resolver(
     memory_service: Any,
     project_id: str,
-) -> Callable[[Any], Awaitable[tuple[str, str | None]]]:
+) -> Callable[[Any], Awaitable[LivenessVerdict]]:
     """Build a per-RUN memoised three-way resolver for a Mem0 point id.
 
-    Returns an async callable answering ``('found', None) | ('missing', None) |
-    ('error', '<ExcTypeName>')`` for a ``memory_id``, resolved through
-    ``memory_service.get_memory_by_id(project_id, memory_id)`` — the
-    no-silent-fail raw Qdrant point read.
+    Returns an async callable answering a :class:`LivenessVerdict` for a
+    ``memory_id`` — LIVE / ABSENT / INCONCLUSIVE, read through
+    :func:`resolve_memory_liveness`, the single home of that verdict over
+    ``memory_service.get_memory_by_id(project_id, memory_id)`` (the
+    no-silent-fail raw Qdrant point read). This factory adds only the memo.
 
     **Why a shared factory rather than a closure per caller.**
     ``citation_repair.py``'s header already states it reuses this module's
@@ -390,26 +430,21 @@ def make_memory_resolver(
 
     The memo is scoped to the RUN, never module-level: a longer-lived cache
     would reintroduce exactly the stale-read TOCTOU these passes exist to
-    close. Caching the ``'error'`` outcome too is deliberate — a backend that
+    close. Caching the INCONCLUSIVE verdict too is deliberate — a backend that
     just failed for this id will almost certainly fail again within the same
     assembly, and re-raising it per citation only hammers a sick store while
     producing the identical marker.
     """
-    resolution_cache: dict[Any, tuple[str, str | None]] = {}
+    resolution_cache: dict[Any, LivenessVerdict] = {}
 
-    async def _resolve(memory_id: Any) -> tuple[str, str | None]:
+    async def _resolve(memory_id: Any) -> LivenessVerdict:
         key = _memo_key(memory_id)
         cached = resolution_cache.get(key)
         if cached is not None:
             return cached
-        try:
-            record = await memory_service.get_memory_by_id(project_id, memory_id)
-        except Exception as exc:  # noqa: BLE001
-            outcome: tuple[str, str | None] = ('error', type(exc).__name__)
-        else:
-            outcome = ('found', None) if record else ('missing', None)
-        resolution_cache[key] = outcome
-        return outcome
+        verdict = await resolve_memory_liveness(memory_service, project_id, memory_id)
+        resolution_cache[key] = verdict
+        return verdict
 
     return _resolve
 
@@ -526,12 +561,9 @@ async def verify_cited_memories(
             memory_id = entry.get('memory_id')
             store = entry.get('store')
             outcome, error_type = await _resolve(memory_id)
-            if outcome == 'error':
-                # A backend error is 'unknown', not 'absent': dropping the
-                # citation here would itself be a silent-fail (the exact
-                # anti-pattern this fix forbids). KEEP it, surface the
-                # uncertainty via a marker, and never propagate — the stage must
-                # not crash on a check error.
+            if outcome is MemoryLiveness.INCONCLUSIVE:
+                # Unknown is not absent (resolve_memory_liveness): KEEP the
+                # citation and surface the uncertainty via a marker.
                 kept.append(entry)
                 finding.setdefault('citation_failures', []).append(
                     {
@@ -543,7 +575,7 @@ async def verify_cited_memories(
                 )
                 stats[errors_key] += 1
                 continue
-            if outcome == 'found':
+            if outcome is MemoryLiveness.LIVE:
                 kept.append(entry)
                 stats[verified_key] += 1
             else:
@@ -770,7 +802,7 @@ async def scan_prose_citations(
                     continue
                 scanned_ids.add(memory_id)
             outcome, _error_type = await _resolve(memory_id)
-            if outcome == 'error':
+            if outcome is MemoryLiveness.INCONCLUSIVE:
                 # "Unknown", not "absent". Reporting this as a fabrication
                 # would be a silent-fail in the loud direction: it asserts
                 # something the read never established.
@@ -801,7 +833,7 @@ async def scan_prose_citations(
                     },
                 )
                 continue
-            if outcome == 'found':
+            if outcome is MemoryLiveness.LIVE:
                 stats[verified_key] += 1
                 continue
 
@@ -1268,14 +1300,16 @@ async def repoint_task_citations(
     project would need ``list_tags()`` aggregation. Out of scope here.
 
     Returns a stats dict whose keys are ALWAYS present, on every path. Scalar
-    counters carry a HARD-CODED ``stage1_*`` prefix, because they are merged
-    into the flat Stage-1 stats block where an unprefixed name would collide.
-    Unlike :func:`verify_cited_memories` — which is now per-stage and takes a
-    ``stat_prefix`` — this sweep is genuinely Stage-1-only: it runs from the
-    ``delete_memory`` MCP tool handler's citation-repoint gate, never from any
-    stage's ``run()``, so there is no second stage for it to serve. The detail
-    LISTS (``terminal_citations``, ``unrepointed``) are consumed structurally
-    by the delete gate and stay unprefixed.
+    counters carry a HARD-CODED ``stage1_*`` prefix: that is the key spelling
+    of the ``citation_repoint`` tool-response payload, kept for compatibility
+    (``server/tools.py::_citation_repoint_gate`` reads
+    ``stage1_citation_repoint_failures``). These stats are never merged into
+    any stage's ``report.stats``. Unlike :func:`verify_cited_memories`, which
+    takes a ``stat_prefix`` because ``BaseStage.run()`` merges its stats per
+    stage, this sweep runs only from the ``delete_memory`` citation-repoint
+    gate, so its prefix is fixed rather than parameterised. The detail LISTS
+    (``terminal_citations``, ``unrepointed``) are consumed structurally by the
+    delete gate and stay unprefixed.
     """
     log = log or logger
     stats: dict[str, Any] = {

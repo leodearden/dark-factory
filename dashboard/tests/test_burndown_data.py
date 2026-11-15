@@ -173,9 +173,9 @@ def _isolate_caches():
     """The snapshot unit cache may not cross a test."""
     import dashboard.data.task_snapshot as snapshot_mod
 
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
     yield
-    snapshot_mod._snapshot_cache_clear()
+    snapshot_mod.clear_snapshot_cache()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2979,8 +2979,8 @@ class TestCollectSnapshotExplicitRollback:
         """An unexpected exception inside collect_snapshot must trigger conn.rollback()
         and re-raise the original exception.
 
-        Injection point: patch `dashboard.data.burndown.datetime` so that
-        `datetime.now(UTC).isoformat()` raises RuntimeError('clock failure').
+        Injection point: patch `dashboard.data.burndown.resolve_now` so that
+        the cycle's clock read raises RuntimeError('clock failure').
         This fires before any per-project try/except, so the outer except
         must catch it, call rollback, then re-raise.
 
@@ -3002,16 +3002,13 @@ class TestCollectSnapshotExplicitRollback:
 
         conn.rollback = rollback_spy
 
-        # Patch datetime.now to raise RuntimeError — fires before any per-project try/except
-        class _FakeDatetime:
-            @staticmethod
-            def now(tz=None):
-                raise RuntimeError('clock failure')
-
         try:
             with (
                 _patch('dashboard.data.burndown.find_running_orchestrators', return_value=[]),
-                _patch('dashboard.data.burndown.datetime', _FakeDatetime),
+                _patch(
+                    'dashboard.data.burndown.resolve_now',
+                    side_effect=RuntimeError('clock failure'),
+                ),
                 pytest.raises(RuntimeError, match='clock failure'),
             ):
                 await collect_snapshot(conn, config, client=dummy_client)
@@ -3044,11 +3041,9 @@ class TestCollectSnapshotPerRootBudget:
         pre-empts a unit still inside its own bounds. Ceiling: half one
         collector cycle, so cycle N is done before cycle N+1 starts even when a
         root spends its whole budget."""
-        import dashboard.loops as loops_module
-
         budget = burndown_module._SNAPSHOT_PER_ROOT_BUDGET
         floor = burndown_module._SNAPSHOT_UNIT_WORST_CASE_SECONDS
-        ceiling = loops_module._SAMPLE_INTERVAL_SECONDS / 2
+        ceiling = burndown_module.SAMPLE_INTERVAL_SECONDS / 2
 
         assert budget >= floor, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is below the snapshot unit\'s own '
@@ -3057,8 +3052,8 @@ class TestCollectSnapshotPerRootBudget:
         )
         assert budget <= ceiling, (
             f'_SNAPSHOT_PER_ROOT_BUDGET ({budget}) is above HALF one collector '
-            f'cycle ({ceiling} s = _SAMPLE_INTERVAL_SECONDS / 2 = '
-            f'{loops_module._SAMPLE_INTERVAL_SECONDS} / 2).'
+            f'cycle ({ceiling} s = SAMPLE_INTERVAL_SECONDS / 2 = '
+            f'{burndown_module.SAMPLE_INTERVAL_SECONDS} / 2).'
         )
 
 

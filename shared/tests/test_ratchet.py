@@ -51,6 +51,9 @@ from shared.ratchet import (
     tighten,
     tighten_into,
 )
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Same src-root expression as shared/tests/conftest.py and
 # test_pure_stdlib_leaves.py — read the LOCAL tree, never an installed copy.
@@ -303,7 +306,7 @@ class TestTighten:
 class TestTheKernelIsAMultisetNotASet:
     """Repeated multiplicities survive every operation.
 
-    Mirrors ``shared/tests/test_loop_blocking_gate.py::
+    Mirrors ``tests/repo_guards/test_loop_blocking_gate.py::
     test_ratchet_is_a_multiset_not_a_set``, and for the same reason: under set
     semantics a SECOND site sharing a key with an already-blessed one slips in
     silently.  D7 accepts that 67% of sites share a key with another site, so

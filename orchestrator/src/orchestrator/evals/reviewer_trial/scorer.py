@@ -9,9 +9,10 @@ from __future__ import annotations
 import functools
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 from shared.cli_invoke import no_mcp_servers_config
 
@@ -20,17 +21,37 @@ from orchestrator.evals.measurement import (
     MeasurementStage,
     Scored,
     Unmeasured,
+    UnmeasuredCause,
     json_answer,
     measured_call,
 )
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, GroundTruthIssue
-from orchestrator.evals.reviewer_trial.runner import PanelRunResult
+from orchestrator.review_payload import ReviewPayload, normalize_review
 
 if TYPE_CHECKING:
     from shared.cli_invoke import AgentResult
     from shared.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
+
+
+class PanelRun(Protocol):
+    """What scoring reads off one panel run; runner.PanelRunResult is one."""
+
+    @property
+    def variant_name(self) -> str: ...
+
+    @property
+    def diff_id(self) -> str: ...
+
+    @property
+    def reviews(self) -> Mapping[str, dict]: ...
+
+    @property
+    def total_cost_usd(self) -> float: ...
+
+    @property
+    def wall_clock_ms(self) -> int: ...
 
 
 @dataclass
@@ -94,6 +115,31 @@ class ScoringResult:
         """Combined panel + matcher cost for this (variant, diff) pair."""
         return self.cost_usd + self.match_cost_usd
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ScoringResult:
+        """The inverse of ``asdict``. A record cached before task 6736 has no ``unmeasured`` and loads as measured."""
+        unmeasured = data.get('unmeasured')
+        return cls(
+            variant_name=data['variant_name'],
+            diff_id=data['diff_id'],
+            matches=[IssueMatch(**m) for m in data.get('matches', [])],
+            unmatched_gt=list(data.get('unmatched_gt', [])),
+            false_positives=list(data.get('false_positives', [])),
+            recall=data.get('recall', 0.0),
+            precision=data.get('precision', 0.0),
+            f1=data.get('f1', 0.0),
+            blocking_recall=data.get('blocking_recall', 0.0),
+            cost_usd=data.get('cost_usd', 0.0),
+            match_cost_usd=data.get('match_cost_usd', 0.0),
+            wall_clock_ms=data.get('wall_clock_ms', 0),
+            unmeasured=None if unmeasured is None else Unmeasured(
+                MeasurementStage(unmeasured['stage']),
+                UnmeasuredCause(unmeasured['cause']),
+                unmeasured['reason'],
+                unmeasured['cost_usd'],
+            ),
+        )
+
 
 # Schema for the LLM matcher output
 _MATCH_SCHEMA = {
@@ -129,7 +175,7 @@ def _normalize_location(loc: str) -> str:
     return normalized.replace('\\', '/')
 
 
-def _deduplicate_issues(reviews: dict[str, dict]) -> list[dict]:
+def _deduplicate_issues(reviews: Mapping[str, ReviewPayload]) -> list[dict]:
     """Deduplicate issues across reviewers within a panel.
 
     Groups by (normalized_location, category). When multiple reviewers
@@ -139,7 +185,7 @@ def _deduplicate_issues(reviews: dict[str, dict]) -> list[dict]:
     seen: dict[tuple[str, str], dict] = {}
 
     for reviewer_name, review in reviews.items():
-        for issue in review.get('issues', []):
+        for issue in review.issues:
             loc = _normalize_location(issue.get('location', ''))
             cat = issue.get('category', '').lower().strip()
             key = (loc, cat)
@@ -324,28 +370,26 @@ def _parse_matches(
 
 
 async def score_panel_run(
-    run: PanelRunResult,
+    run: PanelRun,
     corpus_diff: CorpusDiff,
     *,
     usage_gate: UsageGate | None = None,
 ) -> ScoringResult:
     """Score one (variant, diff) pair.
 
-    1. Collect all issues from all reviewers in the panel
+    1. Collect every reviewer's issues, each review normalised by
+       ``orchestrator/review_payload.py::normalize_review`` (an ERROR review
+       carries none; an off-contract one raises ``ReviewPayloadError``)
     2. Deduplicate by (normalized_location, category)
     3. Match against ground truth via match_issues() (through *usage_gate*
        when given); an unmeasured match makes the whole result unmeasured,
        with no metric computed
     4. Compute recall, precision, F1, blocking_recall
     """
-    # Filter out ERROR reviews
-    clean_reviews = {
-        name: rev for name, rev in run.reviews.items()
-        if rev.get('verdict') != 'ERROR'
-    }
+    reviews = {name: normalize_review(rev) for name, rev in run.reviews.items()}
 
     # Deduplicate across panel
-    deduped = _deduplicate_issues(clean_reviews)
+    deduped = _deduplicate_issues(reviews)
 
     # Match against ground truth
     outcome = await match_issues(

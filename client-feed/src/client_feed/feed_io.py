@@ -16,6 +16,7 @@ from typing import Final
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from client_feed.budget import AddedLineCounts
 from client_feed.contract import (
     FEED_FILENAME,
     FEED_MAJOR,
@@ -62,6 +63,8 @@ class Cursor(BaseModel):
     head: CommitSha | None = None
     inbox_offset: NonNegativeInt = 0
     line_counts: LineCounts | None = None
+    reveals_head: CommitSha | None = None
+    added_line_counts: AddedLineCounts | None = None
 
 
 class FeedIoProblem(StrEnum):
@@ -70,6 +73,7 @@ class FeedIoProblem(StrEnum):
     CURSOR_AHEAD = 'cursor_ahead'
     ROTATION_TARGET_EXISTS = 'rotation_target_exists'
     INBOX_REWOUND = 'inbox_rewound'
+    UNREADABLE = 'unreadable'
 
 
 class FeedIoError(Exception):

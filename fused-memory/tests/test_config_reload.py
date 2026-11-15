@@ -1228,3 +1228,33 @@ class TestConsolidationAutoLeavesAreGreenTier:
 
         assert d.applied_candidates[path] == {'old': ['orchestrator'], 'new': []}
         assert path not in d.restart_required
+
+
+@pytest.mark.parametrize(
+    ('leaf', 'new', 'expected_root'),
+    [
+        ('transcript_archive_enabled', False, None),
+        ('transcript_archive_root', 'elsewhere/archive', Path('elsewhere/archive')),
+    ],
+)
+def test_transcript_archive_reload_reaches_the_live_resolver(leaf, new, expected_root):
+    """The recon archive kill switch must reach a running server; a
+    restart-only kill switch is no kill switch (task 3972). The harness and
+    every stage resolve through the live reconciliation submodel, so the
+    reload must land on that same object."""
+    from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
+
+    live = FusedMemoryConfig()
+    reconciliation = live.reconciliation
+    fresh = FusedMemoryConfig()
+    object.__setattr__(fresh.reconciliation, leaf, new)
+    assert recon_archive_root(reconciliation) is not None
+
+    report = apply_reload(live, fresh)
+
+    path = f'reconciliation.{leaf}'
+    assert report['reloaded'] is True, report['error']
+    assert path in report['applied']
+    assert path not in report['restart_required']
+    assert live.reconciliation is reconciliation
+    assert recon_archive_root(reconciliation) == expected_root

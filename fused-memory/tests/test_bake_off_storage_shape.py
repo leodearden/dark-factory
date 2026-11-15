@@ -29,13 +29,23 @@ tests assert exact values with no tolerances.
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
+import os
 import re
+import subprocess
+import tempfile
 import types
+import uuid
 from collections.abc import Container
 from pathlib import Path
 
-from _fm_helpers import load_script_module
+import pytest
+from _fm_helpers import lease_isolated_monkeypatch, load_script_module
+from _fm_qdrant_live import QDRANT_URL, qdrant_skipif
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'bake_off_storage_shape.py'
 
@@ -61,8 +71,6 @@ def _mod() -> types.ModuleType:
 # synthetic fixtures in tmp_path.  No network, no Qdrant.
 
 import json  # noqa: E402
-
-import pytest  # noqa: E402
 
 # Lease-dir isolation (task 4775), autouse for every test in this module:
 # see _fm_helpers.py::lease_dir_fixture.
@@ -3286,6 +3294,106 @@ class TestAuditRecallOverTheCommittedFixture:
         assert first == second
 
 
+import copy  # noqa: E402
+
+
+def _count_detector_calls(monkeypatch, mod) -> list:
+    """Every call the real audit detector receives, appended as it happens.
+
+    ``functools.wraps`` is load-bearing: ``resolve_audit_threshold`` reads the
+    detector's default through ``inspect.signature``, which follows
+    ``__wrapped__``.  The counter is a new detector, so ``memoized_audit_recall``
+    holds nothing for it yet and its first audit always reaches it.
+    """
+    audit = mod.load_audit_script()
+    detector = audit.find_near_duplicate_memory_groups
+    calls: list = []
+
+    @functools.wraps(detector)
+    def _counted(*args, **kwargs):
+        calls.append(args)
+        return detector(*args, **kwargs)
+
+    monkeypatch.setattr(audit, 'find_near_duplicate_memory_groups', _counted)
+    return calls
+
+
+def _corpus_no_other_test_has_audited() -> list[dict]:
+    """The memo is process-wide and shared by every test on an xdist worker,
+    so each test audits content of its own."""
+    corpus = copy.deepcopy(_SYNTHETIC_CORPUS)
+    corpus[-1]['content'] += f' {uuid.uuid4().hex}'
+    return corpus
+
+
+class TestAuditRecallIsComputedOncePerContent:
+    """`memoized_audit_recall` pays the O(n^2) sweep once per distinct input."""
+
+    def test_equal_records_run_the_detector_once(self, monkeypatch):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        calls = _count_detector_calls(monkeypatch, mod)
+
+        first = mod.memoized_audit_recall(records, 0.85)
+        second = mod.memoized_audit_recall(copy.deepcopy(records), 0.85)
+
+        assert len(calls) == 1
+        assert first == second == mod.audit_recall_over_labeled_fixture(
+            records, 0.85,
+        )
+
+    def test_a_changed_record_is_audited_afresh(self, monkeypatch):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        calls = _count_detector_calls(monkeypatch, mod)
+        changed = copy.deepcopy(records)
+        changed[0]['content'] += ' (edited)'
+
+        mod.memoized_audit_recall(records, 0.85)
+        mod.memoized_audit_recall(changed, 0.85)
+
+        assert len(calls) == 2
+
+    def test_a_different_threshold_is_audited_afresh(self, monkeypatch):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        calls = _count_detector_calls(monkeypatch, mod)
+
+        mod.memoized_audit_recall(records, 0.85)
+        mod.memoized_audit_recall(records, 0.5)
+
+        assert len(calls) == 2
+
+    def test_mutating_a_result_does_not_reach_the_next_caller(self):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        first = mod.memoized_audit_recall(records, 0.85)
+        pristine = copy.deepcopy(first)
+
+        first['true_dup']['pairs'] = -1
+
+        assert mod.memoized_audit_recall(records, 0.85) == pristine
+
+    def test_a_swapped_detector_neither_reads_nor_leaves_a_remembered_result(
+        self, monkeypatch,
+    ):
+        mod = _mod()
+        records = _corpus_no_other_test_has_audited()
+        audit = mod.load_audit_script()
+        real = mod.memoized_audit_recall(records, 0.85)
+
+        with monkeypatch.context() as swapped:
+            swapped.setattr(
+                audit, 'find_near_duplicate_memory_groups',
+                lambda memories, threshold: [],
+            )
+            stubbed = mod.memoized_audit_recall(records, 0.85)
+
+        assert real['groups_found'] == 1
+        assert stubbed['groups_found'] == 0
+        assert mod.memoized_audit_recall(records, 0.85) == real
+
+
 # ===========================================================================
 # step-17 — the report: build_report + render_markdown
 # ===========================================================================
@@ -4153,6 +4261,49 @@ class TestTheTwoArtifactsAreWrittenAsAPair:
         )
 
 
+
+
+@dataclasses.dataclass(frozen=True)
+class _GitShim:
+    """A real ``git`` first on PATH that logs every argv before running it.
+
+    While ``failing_walks`` exists, every ``git log`` exits 1 instead.
+    """
+
+    log: Path
+    failing_walks: Path
+
+    @classmethod
+    def install(cls, tmp_path: Path, monkeypatch) -> _GitShim:
+        import os
+        import shutil
+
+        real = shutil.which('git')
+        if real is None:
+            pytest.skip('no git on PATH')
+        shim = cls(log=tmp_path / 'git.log', failing_walks=tmp_path / 'fail-walks')
+        executable = tmp_path / 'bin' / 'git'
+        executable.parent.mkdir()
+        executable.write_text(
+            '#!/bin/sh\n'
+            f'printf \'%s\\n\' "$*" >> "{shim.log}"\n'
+            f'if [ "$1" = log ] && [ -e "{shim.failing_walks}" ]; then exit 1; fi\n'
+            f'exec "{real}" "$@"\n'
+        )
+        executable.chmod(0o755)
+        monkeypatch.setenv(
+            'PATH', f'{executable.parent}{os.pathsep}{os.environ["PATH"]}',
+        )
+        return shim
+
+    def calls(self, subcommand: str) -> list[str]:
+        logged = self.log.read_text() if self.log.exists() else ''
+        return [
+            line for line in logged.splitlines()
+            if line.startswith(f'{subcommand} ')
+        ]
+
+
 class TestFixtureProvenance:
     """The blind-authoring audit trail is git history; the report cites it."""
 
@@ -4179,6 +4330,75 @@ class TestFixtureProvenance:
 
         assert not provenance[0]['path'].startswith('/')
 
+    def test_a_committed_fixtures_blob_is_the_one_heads_tree_holds(self):
+        entry = _mod().fixture_provenance([ARM_CLAIMS_PATH])[0]
+
+        held = subprocess.run(
+            ['git', 'rev-parse', '--verify', '--quiet', f'HEAD:{entry["path"]}'],
+            cwd=ARM_CLAIMS_PATH.parent, capture_output=True, text=True,
+            check=True,
+        )
+
+        assert entry['blob'] == held.stdout.strip()
+
+    def test_the_blob_identifies_content_not_path(self, tmp_path):
+        first, twin, other = (tmp_path / name for name in (
+            'first.jsonl', 'twin.jsonl', 'other.jsonl'))
+        first.write_text('{"same": true}\n')
+        twin.write_text('{"same": true}\n')
+        other.write_text('{"same": false}\n')
+
+        provenance = _mod().fixture_provenance([first, twin, other])
+
+        assert provenance[0]['blob']
+        assert provenance[0]['blob'] == provenance[1]['blob']
+        assert provenance[2]['blob'] != provenance[0]['blob']
+        assert [entry['commit'] for entry in provenance] == [None, None, None]
+
+    def test_a_path_git_cannot_read_reports_no_blob_rather_than_a_wrong_one(
+        self, tmp_path,
+    ):
+        provenance = _mod().fixture_provenance([tmp_path / 'missing.jsonl'])
+
+        assert provenance[0]['blob'] is None
+
+    def test_a_second_stamp_of_the_same_paths_does_not_walk_history_again(
+        self, tmp_path, monkeypatch,
+    ):
+        """Observed through a real git shim on PATH.  At most one walk per
+        path, because an earlier test on this worker may already have
+        stamped these paths."""
+        shim = _GitShim.install(tmp_path, monkeypatch)
+        paths = [ARM_CLAIMS_PATH, QUERY_SET_PATH]
+
+        first = _mod().fixture_provenance(paths)
+        second = _mod().fixture_provenance(paths)
+
+        assert first == second
+        assert all(len(entry['commit']) == 40 for entry in second)
+        # Every stamp hashes every path, so the shim saw all four blobs.
+        assert len(shim.calls('hash-object')) == 4
+        assert len(shim.calls('log')) <= 2, shim.calls('log')
+
+    def test_a_walk_that_failed_is_asked_again_rather_than_remembered(
+        self, tmp_path, monkeypatch,
+    ):
+        """A walk can fail transiently, e.g. the 30s timeout under load.  Its
+        None must not stand in for the commit for the rest of the process.
+        Stamps this test module, which no other test stamps, so no earlier
+        test can have filled the memo for it."""
+        shim = _GitShim.install(tmp_path, monkeypatch)
+        this_module = Path(__file__)
+
+        shim.failing_walks.touch()
+        failed = _mod().fixture_provenance([this_module])
+        shim.failing_walks.unlink()
+        answered = _mod().fixture_provenance([this_module])
+
+        assert failed[0]['commit'] is None
+        assert len(answered[0]['commit']) == 40
+        assert len(shim.calls('log')) == 2, shim.calls('log')
+
 
 # ===========================================================================
 # step-19 — the live driver's wiring, exercised WITHOUT a network
@@ -4199,7 +4419,6 @@ class TestFixtureProvenance:
 # markers PER-TEST.  Everything here runs in the merge lane.
 
 import asyncio  # noqa: E402
-import copy  # noqa: E402
 
 
 class _FakeConfig(types.SimpleNamespace):
@@ -4220,6 +4439,7 @@ def _driver_config() -> _FakeConfig:
         mem0=types.SimpleNamespace(
             collection_prefix='fused',  # the DEFAULT — nothing under it is reapable
             qdrant_url='http://localhost:6333',
+            persist_history=True,  # the DEFAULT — mem0 writes the shared history DB
         ),
         embedder=types.SimpleNamespace(
             model='text-embedding-3-small',
@@ -4235,30 +4455,26 @@ def _driver_config() -> _FakeConfig:
     )
 
 
-class _FakeInstance:
-    """What ``Mem0Backend._get_instance`` returns; only ``db`` is touched."""
-
-    def __init__(self):
-        # A sentinel, not None: the driver must REPLACE it with its no-op, and
-        # `is not sentinel` is how the test proves the stub actually landed.
-        self.db = types.SimpleNamespace(add_history=_FakeInstance._SENTINEL)
-
-    _SENTINEL = object()
-
-
 class _FakeMem0:
     """The Mem0Backend surface the driver touches, and nothing else."""
 
     def __init__(
         self,
         *,
+        config,
         search_raises_on: int | None = None,
         add_returns_no_id_on: int | None = None,
         add_ticks: int = 1,
     ):
+        self._config = config
         self.added: list[tuple[str, str]] = []            # (project_id, content)
         self.searches: list[tuple[str, str, int]] = []    # (project_id, query, limit)
-        self.instances: dict[str, _FakeInstance] = {}
+        #: (project_id, config.mem0.persist_history) at every `add`, the moment
+        #: a real Mem0Backend builds a project's instance from the config.
+        #: Snapshotted for the reason `queue_data_dir_at_initialize` is: the
+        #: config is held by REFERENCE, so a post-run read cannot tell "turned
+        #: off before seeding" from "turned off too late".
+        self.persist_history_at_add: list[tuple[str, bool]] = []
         self.inflight = 0
         self.max_inflight = 0
         self.search_inflight = 0
@@ -4275,10 +4491,10 @@ class _FakeMem0:
         self._add_calls = 0
         self._stored: dict[str, list[dict]] = {}
 
-    async def _get_instance(self, scope):
-        return self.instances.setdefault(scope.project_id, _FakeInstance())
-
     async def add(self, content, scope, metadata=None):
+        self.persist_history_at_add.append(
+            (scope.project_id, self._config.mem0.persist_history),
+        )
         self._add_calls += 1
         ordinal = self._add_calls
         self.inflight += 1
@@ -4338,6 +4554,7 @@ class _FakeMemoryService:
     def __init__(self, config):
         self.config = config
         self.mem0 = _FakeMem0(
+            config=config,
             search_raises_on=type(self).search_raises_on,
             add_returns_no_id_on=type(self).add_returns_no_id_on,
             add_ticks=type(self).add_ticks,
@@ -4419,6 +4636,165 @@ _SMALL_RUN = {'cluster_limit': 2, 'distractor_limit': 12, 'project_suffix': 'ute
 #: the api-key clear, the seeding bound, the serial fetch) deliberately keep
 #: the probe on, so they cover its passes too.
 _SIX_ARM_RUN = {**_SMALL_RUN, 'regrowth': False}
+
+#: Every class that reads a recorded run shares one xdist worker, so the
+#: recording — and the per-process warm-up its first `run_bake_off` pays — is
+#: paid once rather than once per worker `--dist loadgroup` scatters them to.
+_ON_THE_RECORDING_WORKER = pytest.mark.xdist_group('bake_off_storage_shape_recorded_runs')
+
+
+@dataclasses.dataclass(frozen=True)
+class _DriverRun:
+    """What one doubled `run_bake_off` showed its doubles, captured as it returned."""
+
+    report: dict
+    services: tuple[_FakeMemoryService, ...]
+    drop_calls: tuple[tuple[str, ...], ...]
+    leases_at_drop: tuple[list[dict], ...]
+    leases_at_seed: tuple[list[dict], ...]
+    leases_after: list[dict]
+    lease_dirs: tuple[Path, ...]
+    acquisitions: tuple[str, ...]
+    probe_hits: tuple[dict[str, list[str]], ...]
+    injection_loads: tuple[tuple, ...]
+    caller_config: _FakeConfig
+
+    @property
+    def service(self) -> _FakeMemoryService:
+        return self.services[-1]
+
+    @property
+    def dropped(self) -> set[str]:
+        return {name for call in self.drop_calls for name in call}
+
+
+def _record_driver_run(run_kwargs: dict, directory: Path) -> _DriverRun:
+    """Run `run_bake_off(**run_kwargs)` once, through every observation double.
+
+    Each double delegates to the real callable exactly once, so installing
+    them together changes nothing any one of them observes.
+    """
+    mod = _mod()
+    leases_at_drop: list[list[dict]] = []
+    leases_at_seed: list[list[dict]] = []
+    acquisitions: list[str] = []
+    probe_hits: list[dict[str, list[str]]] = []
+    injection_loads: list[tuple] = []
+    # Resolved before `_record_resolve` is installed, so the observers' own
+    # reaper reads never enter `acquisitions`.
+    reaper = mod.load_cleanup_script()
+    with lease_isolated_monkeypatch(reaper, directory / 'leases') as (mp, lease_dirs):
+        drops = _install_driver_doubles(mp)
+        resolve, seed_arm, fetch_arm = mod.load_cleanup_script, mod.seed_arm, mod.fetch_arm
+        mkdtemp, load_injections = tempfile.mkdtemp, mod.load_regrowth_injections
+
+        def _drop_and_look(*args, **kwargs):
+            leases_at_drop.append(reaper.live_leases())
+            return drops(*args, **kwargs)
+
+        async def _seed_and_look(*args, **kwargs):
+            leases_at_seed.append(reaper.live_leases())
+            return await seed_arm(*args, **kwargs)
+
+        def _record_resolve():
+            acquisitions.append('reaper')
+            return resolve()
+
+        def _record_mkdtemp(*args, **kwargs):
+            acquisitions.append('queue_dir')
+            return mkdtemp(*args, **kwargs)
+
+        async def _capture_probe_hits(backend, seeded, queries, probes, **kwargs):
+            fetched = await fetch_arm(backend, seeded, queries, probes, **kwargs)
+            probe_hits.append({
+                cluster_id: [hit.record.record_id for hit in hits]
+                for cluster_id, hits in fetched['probes'].items()
+            })
+            return fetched
+
+        def _record_injection_load(*args, **kwargs):
+            injection_loads.append(args)
+            return load_injections(*args, **kwargs)
+
+        mp.setattr(mod, 'drop_collections', _drop_and_look)
+        mp.setattr(mod, 'seed_arm', _seed_and_look)
+        mp.setattr(mod, 'load_cleanup_script', _record_resolve)
+        mp.setattr(tempfile, 'mkdtemp', _record_mkdtemp)
+        mp.setattr(mod, 'fetch_arm', _capture_probe_hits)
+        mp.setattr(mod, 'load_regrowth_injections', _record_injection_load)
+        caller_config = _driver_config()
+
+        report = asyncio.run(mod.run_bake_off(config=caller_config, **run_kwargs))
+
+        return _DriverRun(
+            report=report,
+            services=tuple(_FakeMemoryService.instances),
+            drop_calls=tuple(tuple(call) for call in drops.calls),
+            leases_at_drop=tuple(leases_at_drop),
+            leases_at_seed=tuple(leases_at_seed),
+            leases_after=reaper.live_leases(),
+            lease_dirs=tuple(lease_dirs),
+            acquisitions=tuple(acquisitions),
+            probe_hits=tuple(probe_hits),
+            injection_loads=tuple(injection_loads),
+            caller_config=caller_config,
+        )
+
+
+@pytest.fixture(scope='module')
+def _small_run_record(tmp_path_factory) -> _DriverRun:
+    return _record_driver_run(_SMALL_RUN, tmp_path_factory.mktemp('small-run'))
+
+
+@pytest.fixture(scope='module')
+def _six_arm_run_record(tmp_path_factory) -> _DriverRun:
+    return _record_driver_run(_SIX_ARM_RUN, tmp_path_factory.mktemp('six-arm-run'))
+
+
+@pytest.fixture
+def small_run(_small_run_record) -> _DriverRun:
+    """`run_bake_off(**_SMALL_RUN)`, recorded once per module; a private copy."""
+    return copy.deepcopy(_small_run_record)
+
+
+@pytest.fixture
+def six_arm_run(_six_arm_run_record) -> _DriverRun:
+    """`run_bake_off(**_SIX_ARM_RUN)`, recorded once per module; a private copy."""
+    return copy.deepcopy(_six_arm_run_record)
+
+
+@_ON_THE_RECORDING_WORKER
+class TestTheRecordedDriverRun:
+    """The recorded runs the wiring tests read are safe to share."""
+
+    def test_it_held_its_lease_in_a_private_directory_never_the_machine_global_one(
+        self, small_run, six_arm_run, main_legs, tmp_path_factory,
+    ):
+        """Module fixtures are set up BEFORE the autouse, function-scoped
+        `lease_dir` fixture, so a recording that did not isolate its own lease
+        would hold it in the directory the live 6-hourly cron reads.  Every
+        recording in this module is checked, `TestMain`'s legs included."""
+        reaper = _mod().load_cleanup_script()
+        basetemp = tmp_path_factory.getbasetemp()
+        recordings = {
+            'small_run': small_run, 'six_arm_run': six_arm_run,
+            **{f'main_legs[{argv}]': leg for argv, leg in main_legs.items()},
+        }
+
+        for name, recording in recordings.items():
+            assert recording.lease_dirs, f'{name} took no lease to locate'
+            for lease_dir in recording.lease_dirs:
+                assert lease_dir != reaper.DEFAULT_LEASE_DIR, name
+                assert lease_dir.is_relative_to(basetemp), (name, lease_dir)
+
+    def test_a_handed_out_run_is_a_private_copy(self, small_run, _small_run_record):
+        """Every wiring test reads the same run, so a test that mutated what
+        it was handed would change what the next one reads."""
+        small_run.report['arms'].clear()
+        small_run.service.mem0.searches.clear()
+
+        assert _small_run_record.report['arms']
+        assert _small_run_record.service.mem0.searches
 
 
 class TestEphemeralCollectionIdentity:
@@ -4545,12 +4921,12 @@ class TestGuardProbeSelfDrop:
         ), 'no arm splits a probing write across several records'
 
 
-@pytest.mark.asyncio
+@_ON_THE_RECORDING_WORKER
 class TestRunBakeOffWiring:
     """What the driver does to the world, measured through doubles."""
 
 
-    async def test_it_holds_a_live_lease_at_the_moment_it_seeds(self, monkeypatch):
+    def test_it_holds_a_live_lease_at_the_moment_it_seeds(self, small_run):
         """The bake-off seeds under a prefix the 6-hourly cron deletes, so a
         sweep landing between its seed and measure phases empties the corpus
         out from under it.
@@ -4562,24 +4938,7 @@ class TestRunBakeOffWiring:
         before the seeding began, which is the failure this has to exclude.
         """
         mod = _mod()
-        drops = _install_driver_doubles(monkeypatch)
-        reaper = mod.load_cleanup_script()
-        at_drop: list[list[dict]] = []
-        at_seed: list[list[dict]] = []
-        seed_arm = mod.seed_arm
-
-        def _drop_and_look(*args, **kwargs):
-            at_drop.append(reaper.live_leases())
-            return drops(*args, **kwargs)
-
-        async def _seed_and_look(*args, **kwargs):
-            at_seed.append(reaper.live_leases())
-            return await seed_arm(*args, **kwargs)
-
-        monkeypatch.setattr(mod, 'drop_collections', _drop_and_look)
-        monkeypatch.setattr(mod, 'seed_arm', _seed_and_look)
-
-        await mod.run_bake_off(**_SMALL_RUN)
+        at_drop, at_seed = small_run.leases_at_drop, small_run.leases_at_seed
 
         assert at_drop and at_seed, 'the observation seams never fired'
         for live in (at_drop[0], at_seed[0]):
@@ -4588,17 +4947,12 @@ class TestRunBakeOffWiring:
             assert mod.__name__ in owner, owner
             assert mod.worker_suffix() in owner, owner
 
-    async def test_the_lease_is_released_once_the_run_returns(self, monkeypatch):
+    def test_the_lease_is_released_once_the_run_returns(self, small_run):
         """Held for the run, not for the process.  A lease that outlived the
         run would wedge the cron until the pytest session ended."""
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-        reaper = mod.load_cleanup_script()
+        assert small_run.leases_after == []
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        assert reaper.live_leases() == []
-
+    @pytest.mark.asyncio
     async def test_the_lease_is_released_when_the_run_raises(self, monkeypatch):
         """A failed bake-off must not hold the cron off — the case a TTL
         would exist to bound, and the reason none is needed."""
@@ -4616,8 +4970,8 @@ class TestRunBakeOffWiring:
 
         assert reaper.live_leases() == []
 
-    async def test_the_reaper_is_resolved_before_any_resource_is_acquired(
-        self, monkeypatch,
+    def test_the_reaper_is_resolved_before_any_resource_is_acquired(
+        self, small_run,
     ):
         """Nothing that can raise may sit between an acquisition and the
         `try` whose `finally` releases it.
@@ -4637,72 +4991,42 @@ class TestRunBakeOffWiring:
         resolves the reaper three times before `mkdtemp` either way, so an
         index comparison would pass on the unfixed driver.
         """
-        import tempfile  # noqa: PLC0415
-
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-        order: list[str] = []
-        resolve = mod.load_cleanup_script
-        mkdtemp = tempfile.mkdtemp
-
-        def _record_resolve():
-            order.append('reaper')
-            return resolve()
-
-        def _record_mkdtemp(*args, **kwargs):
-            order.append('queue_dir')
-            return mkdtemp(*args, **kwargs)
-
-        monkeypatch.setattr(mod, 'load_cleanup_script', _record_resolve)
-        monkeypatch.setattr(tempfile, 'mkdtemp', _record_mkdtemp)
-
-        await mod.run_bake_off(**_SMALL_RUN)
+        order = list(small_run.acquisitions)
 
         assert 'queue_dir' in order, order
         assert 'reaper' in order, order
         assert 'reaper' not in order[order.index('queue_dir'):], order
 
-    async def test_it_seeds_exactly_three_collections_for_six_arms(self, monkeypatch):
+    def test_it_seeds_exactly_three_collections_for_six_arms(self, six_arm_run):
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        report = await mod.run_bake_off(**_SIX_ARM_RUN)
-
-        service = _FakeMemoryService.instances[-1]
-        assert len(_FakeMemoryService.instances) == 1
+        service = six_arm_run.service
+        assert len(six_arm_run.services) == 1
         assert sorted(service.mem0._stored) == sorted(
             mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
         )
-        assert list(report['arms']) == list(mod.ARM_VARIANTS)
+        assert list(six_arm_run.report['arms']) == list(mod.ARM_VARIANTS)
 
-    async def test_the_ephemeral_prefix_is_set_on_the_config_not_just_the_project_id(
-        self, monkeypatch,
+    def test_the_ephemeral_prefix_is_set_on_the_config_not_just_the_project_id(
+        self, small_run,
     ):
         """Collections are f'{collection_prefix}_{project_id}'.  A driver that
         scoped only the project_id would write under the default 'fused'
         prefix, which the reaper does not match — a permanent leak."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        config = _FakeMemoryService.instances[-1].config
+        config = small_run.service.config
         assert config.mem0.collection_prefix == mod.ephemeral_collection_prefix()
 
-    async def test_it_clears_the_api_key_so_a_real_embedder_is_used(self, monkeypatch):
+    def test_it_clears_the_api_key_so_a_real_embedder_is_used(self, small_run):
         """A stub constant vector would make every ranking in the report
         meaningless; nulling the config key makes mem0 fall back to the real
         OPENAI_API_KEY (the probe_config recipe)."""
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        config = _FakeMemoryService.instances[-1].config
+        config = small_run.service.config
         assert config.embedder.providers.openai.api_key is None
 
-    async def test_it_never_attaches_to_the_shared_durable_write_queue(
-        self, monkeypatch,
+    def test_it_never_attaches_to_the_shared_durable_write_queue(
+        self, small_run, six_arm_run,
     ):
         """The data-loss guard at bake_off_storage_shape.py:2947-2967.
 
@@ -4720,24 +5044,16 @@ class TestRunBakeOffWiring:
         one existed, which is what `_driver_config`'s `./data/queue` was put
         there for.
         """
-        import tempfile  # noqa: PLC0415
-
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
         shared = _driver_config().queue.data_dir
-
-        await mod.run_bake_off(**_SMALL_RUN)
-        await mod.run_bake_off(**_SMALL_RUN)
+        runs = (small_run, six_arm_run)
 
         # Read at `initialize()`, not after the run: the repoint has to have
         # happened BEFORE the queue is built to be worth anything, and the
         # config is held by reference so an after-the-fact read cannot tell
         # the two apart.
-        attached = [
-            service.queue_data_dir_at_initialize
-            for service in _FakeMemoryService.instances
-        ]
-        assert len(attached) == 2 and all(a is not None for a in attached)
+        attached = [run.service.queue_data_dir_at_initialize for run in runs]
+        assert [len(run.services) for run in runs] == [1, 1]
+        assert all(a is not None for a in attached)
 
         for a in attached:
             assert a != shared, (
@@ -4762,6 +5078,7 @@ class TestRunBakeOffWiring:
         # either — which a fixed path outside the checkout would still allow.
         assert attached[0] != attached[1]
 
+    @pytest.mark.asyncio
     async def test_a_failed_initialize_still_tears_the_run_down(self, monkeypatch):
         """The queue temp dir and the service were acquired OUTSIDE the
         `try:`/`finally:` that cleans them up, so the one failure mode the
@@ -4780,8 +5097,6 @@ class TestRunBakeOffWiring:
         call it unguarded rather than swallowing close failures on the happy
         path too.
         """
-        import tempfile  # noqa: PLC0415
-
         mod = _mod()
         drops = _install_driver_doubles(monkeypatch)
 
@@ -4814,48 +5129,40 @@ class TestRunBakeOffWiring:
         # the next run to measure.
         assert drops.calls, 'nothing was dropped on the failure path'
 
-    async def test_it_copies_the_config_rather_than_mutating_the_callers(
-        self, monkeypatch,
+    def test_it_copies_the_config_rather_than_mutating_the_callers(
+        self, small_run,
     ):
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-        caller_config = _driver_config()
-
-        await mod.run_bake_off(config=caller_config, **_SMALL_RUN)
+        caller_config = small_run.caller_config
 
         assert caller_config.mem0.collection_prefix == 'fused'
         assert caller_config.embedder.providers.openai.api_key == 'sk-fake-must-be-cleared'
+        assert caller_config.mem0.persist_history is True
 
-    async def test_it_stubs_the_xdist_contended_history_writer(self, monkeypatch):
-        """mem0's SQLite history writer is process-shared and contended (and
+    def test_every_seeded_arm_keeps_mem0_history_off_the_shared_db(
+        self, small_run,
+    ):
+        """mem0's shared SQLite history DB is process-shared and contended (and
         read-only in the sandbox).  It is not the question under test, and its
         failure would mask the one that is."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        instances = _FakeMemoryService.instances[-1].mem0.instances
+        snapshots = small_run.service.mem0.persist_history_at_add
         # Every seeded project, the two INJECTED passes included: they go
-        # through the same `seed_arm`, so an unstubbed instance there is the
+        # through the same `seed_arm`, so a persisting instance there is the
         # same contended write, in a collection nobody was watching.
-        assert len(instances) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
-        for instance in instances.values():
-            assert instance.db.add_history is not _FakeInstance._SENTINEL
-            assert instance.db.add_history('anything', keyword=1) is None
+        seeded_projects = {project_id for project_id, _ in snapshots}
+        assert len(seeded_projects) == len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
+        assert all(persist is False for _, persist in snapshots), snapshots
 
-    async def test_the_distractor_slab_is_seeded_into_every_arm(self, monkeypatch):
+    def test_the_distractor_slab_is_seeded_into_every_arm(self, small_run):
         """The contamination floor is a controlled variable: an arm that got a
         smaller slab would be ranking against a thinner field and would win for
         a reason the decision table does not name."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
         slab = mod.load_distractor_slab()[:_SMALL_RUN['distractor_limit']]
         slab_contents = {d.content for d in slab}
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        added = _FakeMemoryService.instances[-1].mem0.added
+        added = small_run.service.mem0.added
         by_project: dict[str, set[str]] = {}
         for project_id, content in added:
             by_project.setdefault(project_id, set()).add(content)
@@ -4869,26 +5176,23 @@ class TestRunBakeOffWiring:
         for contents in by_project.values():
             assert slab_contents <= contents
 
-    async def test_seeding_is_bounded_rather_than_one_unbounded_gather(
-        self, monkeypatch,
+    def test_seeding_is_bounded_rather_than_one_unbounded_gather(
+        self, small_run,
     ):
         """A gather over the whole slab opens hundreds of concurrent embedding
         requests at once — rate-limited into retries at best, and a run whose
         wall clock is set by the throttler rather than the experiment."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        mem0 = _FakeMemoryService.instances[-1].mem0
+        mem0 = small_run.service.mem0
         smallest_arm = min(
             len(bucket) for bucket in mem0._stored.values()
         )
         assert smallest_arm > mod.SEED_CONCURRENCY  # the bound has to actually bite
         assert mem0.max_inflight <= mod.SEED_CONCURRENCY
 
-    async def test_fetching_stays_serial_because_concurrent_reads_aborted_the_live_run(
-        self, monkeypatch,
+    def test_fetching_stays_serial_because_concurrent_reads_aborted_the_live_run(
+        self, small_run,
     ):
         """The read side stays serial until someone re-measures it.
 
@@ -4908,15 +5212,13 @@ class TestRunBakeOffWiring:
         confront this test rather than route around it.
         """
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        mem0 = _FakeMemoryService.instances[-1].mem0
+        mem0 = small_run.service.mem0
         per_arm = len(mem0.searches) / len(mod.ARM_SHAPES)
         assert per_arm > 1  # there is something to overlap, so this can fail
         assert mem0.max_search_inflight == 1
 
+    @pytest.mark.asyncio
     async def test_a_failed_seed_leaves_no_write_in_flight_past_teardown(
         self, monkeypatch,
     ):
@@ -4955,18 +5257,15 @@ class TestRunBakeOffWiring:
         # Teardown really did run underneath the raise.
         assert len(drops.calls) == 2
 
-    async def test_the_pin_variants_reuse_their_shapes_hits_instead_of_requerying(
-        self, monkeypatch,
+    def test_the_pin_variants_reuse_their_shapes_hits_instead_of_requerying(
+        self, small_run,
     ):
         """Pin-on and pin-off must run over the SAME ranked list, or the
         comparison is two ANN draws rather than a controlled A/B — and the run
         pays for six arms' worth of embeddings to answer a four-arm question."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        searches = _FakeMemoryService.instances[-1].mem0.searches
+        searches = small_run.service.mem0.searches
         issued = [(project_id, query) for project_id, query, _ in searches]
         assert len(issued) == len(set(issued))          # no query issued twice
         # One project per seeded corpus, the two injected passes included:
@@ -4977,8 +5276,8 @@ class TestRunBakeOffWiring:
             len(mod.ARM_SHAPES) + len(mod.REGROWTH_MODES)
         )
 
-    async def test_the_guard_probe_over_fetches_to_cover_its_own_removal(
-        self, monkeypatch,
+    def test_the_guard_probe_over_fetches_to_cover_its_own_removal(
+        self, small_run,
     ):
         """The probing write's own record has to leave its own guard window:
         in the real timeline that write had not landed when the guard ran, and
@@ -4992,11 +5291,8 @@ class TestRunBakeOffWiring:
         still happens at GUARD_TOP_K, which `guard_adequacy` enforces on its
         own (server/tools.py:1556 runs production's pre-check at limit=5)."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        limits = {limit for _, _, limit in _FakeMemoryService.instances[-1].mem0.searches}
+        limits = {limit for _, _, limit in small_run.service.mem0.searches}
         assert mod.GUARD_FETCH_LIMIT == mod.GUARD_TOP_K + 1     # the FLOOR
         assert mod.guard_fetch_limit(set()) == mod.GUARD_TOP_K
         assert mod.guard_fetch_limit({'a', 'b', 'c'}) == mod.GUARD_TOP_K + 3
@@ -5007,13 +5303,12 @@ class TestRunBakeOffWiring:
         assert min(probe_limits) >= mod.GUARD_FETCH_LIMIT
         assert max(probe_limits) > mod.GUARD_FETCH_LIMIT
 
-    async def test_the_probing_write_is_never_its_own_guard_match(
-        self, monkeypatch,
+    def test_the_probing_write_is_never_its_own_guard_match(
+        self, small_run,
     ):
         """The over-fetched slot is worthless unless the self-hit is actually
         dropped, so assert the drop and not merely the fetch depth."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
         clusters = mod.load_calibration_clusters()
         probe_by_cluster = {}
         for cluster_id in sorted(clusters)[:_SMALL_RUN['cluster_limit']]:
@@ -5022,19 +5317,7 @@ class TestRunBakeOffWiring:
                 probe_by_cluster[cluster_id] = probe['memory_id']
         assert probe_by_cluster  # the subset really does contain a probeable cluster
 
-        captured: list[dict[str, list[str]]] = []
-        real_fetch = mod.fetch_arm
-
-        async def _capture(backend, seeded, queries, probes, **kwargs):
-            fetched = await real_fetch(backend, seeded, queries, probes, **kwargs)
-            captured.append({
-                cluster_id: [hit.record.record_id for hit in hits]
-                for cluster_id, hits in fetched['probes'].items()
-            })
-            return fetched
-
-        monkeypatch.setattr(mod, 'fetch_arm', _capture)
-        await mod.run_bake_off(**_SMALL_RUN)
+        captured = small_run.probe_hits
 
         # Per seeded corpus, injected passes included: those carry the same
         # `status_quo`-free flat peers, but the drop is provenance-based and
@@ -5047,21 +5330,20 @@ class TestRunBakeOffWiring:
             for cluster_id, probe_id in probe_by_cluster.items():
                 assert probe_id not in arm[cluster_id]
 
-    async def test_every_collection_is_dropped_before_and_after_the_run(
-        self, monkeypatch,
+    def test_every_collection_is_dropped_before_and_after_the_run(
+        self, six_arm_run,
     ):
         """Before AND after: a swallowed teardown then self-heals on the next
         run instead of poisoning it with a half-seeded arm."""
         mod = _mod()
-        drops = _install_driver_doubles(monkeypatch)
+        drop_calls = six_arm_run.drop_calls
         expected = set(mod.ephemeral_collections(suffix='utest').values())
 
-        await mod.run_bake_off(**_SIX_ARM_RUN)
+        assert len(drop_calls) == 2
+        assert set(drop_calls[0]) == expected
+        assert set(drop_calls[-1]) == expected
 
-        assert len(drops.calls) == 2
-        assert set(drops.calls[0]) == expected
-        assert set(drops.calls[-1]) == expected
-
+    @pytest.mark.asyncio
     async def test_the_collections_are_dropped_even_when_a_query_raises(
         self, monkeypatch,
     ):
@@ -5077,15 +5359,13 @@ class TestRunBakeOffWiring:
         assert set(drops.calls[-1]) == expected
         assert _FakeMemoryService.instances[-1].closed is True
 
-    async def test_the_report_it_returns_is_the_one_build_report_validated(
-        self, monkeypatch,
+    def test_the_report_it_returns_is_the_one_build_report_validated(
+        self, small_run,
     ):
         """Not a second, looser assembly path: the completeness check that
         refuses to publish a partial decision table has to be on THIS road."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
-
-        report = await mod.run_bake_off(**_SMALL_RUN)
+        report = small_run.report
 
         assert report['schema_version'] == mod.REPORT_SCHEMA_VERSION
         assert set(report) == {
@@ -5098,6 +5378,22 @@ class TestRunBakeOffWiring:
                 assert metric in report['arms'][arm]
         assert report['protocol']['distractor_slab_size'] == 12
         assert report['protocol']['embedder_model'] == 'text-embedding-3-small'
+
+    @pytest.mark.asyncio
+    async def test_a_second_run_does_not_re_audit_the_same_alpha_fixture(
+        self, monkeypatch,
+    ):
+        """cluster_limit does not shrink the audit: it sweeps the whole alpha
+        fixture, so every run of the same fixture would otherwise repay it."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        calls = _count_detector_calls(monkeypatch, mod)
+
+        first = await mod.run_bake_off(**_SIX_ARM_RUN)
+        second = await mod.run_bake_off(**_SIX_ARM_RUN)
+
+        assert len(calls) == 1
+        assert first['audit_recall'] == second['audit_recall']
 
 
 # ===========================================================================
@@ -5175,17 +5471,14 @@ class TestRegrowthPassKey:
             assert name.startswith(prefix)
 
 
-@pytest.mark.asyncio
+@_ON_THE_RECORDING_WORKER
 class TestRunBakeOffRegrowthWiring:
     """The probe's effect on the world, measured through the same doubles."""
 
-    async def test_the_default_run_seeds_both_injected_passes(self, monkeypatch):
+    def test_the_default_run_seeds_both_injected_passes(self, small_run):
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        await mod.run_bake_off(**_SMALL_RUN)
-
-        seeded_projects = set(_FakeMemoryService.instances[-1].mem0._stored)
+        seeded_projects = set(small_run.service.mem0._stored)
         assert seeded_projects == {
             mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
         } | {
@@ -5193,17 +5486,14 @@ class TestRunBakeOffRegrowthWiring:
             for mode in mod.REGROWTH_MODES
         }
 
-    async def test_the_default_run_returns_a_complete_regrowth_block(
-        self, monkeypatch,
+    def test_the_default_run_returns_a_complete_regrowth_block(
+        self, small_run,
     ):
         """Complete, not merely present: `_check_regrowth` is the gate, and
         this asserts the DRIVER hands it something that passes."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
 
-        report = await mod.run_bake_off(**_SMALL_RUN)
-
-        regrowth = report['regrowth']
+        regrowth = small_run.report['regrowth']
         assert regrowth is not None
         assert regrowth['shape'] == mod.REGROWTH_SHAPE
         assert list(regrowth['modes']) == list(mod.REGROWTH_MODES)
@@ -5217,49 +5507,42 @@ class TestRunBakeOffRegrowthWiring:
                     mod._regrowth_metric_keys()
                 )
 
-    async def test_the_probe_respects_the_cluster_subset(self, monkeypatch):
+    def test_the_probe_respects_the_cluster_subset(self, small_run):
         """`--clusters N` has to filter the injections too, or a smoke run
         injects re-emissions for topics whose claims it never seeded — and
         cross-validation, which runs over the SUBSET, would reject them."""
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-
-        report = await mod.run_bake_off(**_SMALL_RUN)
+        report = small_run.report
 
         assert report['regrowth']['topics_injected'] == 2
         assert report['protocol']['regrowth_injections_measured'] == 2
 
-    async def test_the_probe_records_that_it_ran_in_the_protocol_block(
-        self, monkeypatch,
+    def test_the_probe_records_that_it_ran_in_the_protocol_block(
+        self, small_run,
     ):
         """Same reason `clusters_measured` is there: a reader holding the
         artifact must not have to infer the probe's coverage from whether a
         table looks populated."""
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-
-        report = await mod.run_bake_off(**_SMALL_RUN)
+        report = small_run.report
 
         assert report['protocol']['regrowth_probed'] is True
         assert report['protocol']['regrowth_injections_measured'] > 0
 
-    async def test_the_injected_collections_are_dropped_before_and_after(
-        self, monkeypatch,
+    def test_the_injected_collections_are_dropped_before_and_after(
+        self, small_run,
     ):
         """THE LEAK.  A probe that seeds into a collection the `finally` does
         not name leaves it live on every run, and the report looks perfect."""
         mod = _mod()
-        drops = _install_driver_doubles(monkeypatch)
+        drop_calls = small_run.drop_calls
         expected = set(
             mod.ephemeral_collections(suffix='utest').values()
         ) | _regrowth_collection_names(mod, suffix='utest')
 
-        await mod.run_bake_off(**_SMALL_RUN)
+        assert len(drop_calls) == 2
+        assert set(drop_calls[0]) == expected
+        assert set(drop_calls[-1]) == expected
 
-        assert len(drops.calls) == 2
-        assert set(drops.calls[0]) == expected
-        assert set(drops.calls[-1]) == expected
-
+    @pytest.mark.asyncio
     async def test_the_injected_collections_are_dropped_when_a_query_raises(
         self, monkeypatch,
     ):
@@ -5274,31 +5557,26 @@ class TestRunBakeOffRegrowthWiring:
 
         assert set(drops.calls[-1]) == expected
 
-    async def test_disabling_the_probe_creates_no_collection_and_reads_no_fixture(
-        self, monkeypatch,
+    def test_disabling_the_probe_creates_no_collection_and_reads_no_fixture(
+        self, six_arm_run,
     ):
         """`regrowth=False` is a real skip, not a measured-then-discarded
         pass: it must cost no seeding, name no extra collection, and open no
         injection fixture."""
         mod = _mod()
-        drops = _install_driver_doubles(monkeypatch)
-        opened: list = []
-        real_loader = mod.load_regrowth_injections
-        monkeypatch.setattr(mod, 'load_regrowth_injections', lambda *a, **k: (
-            opened.append(a), real_loader(*a, **k))[1])
         passes = _regrowth_collection_names(mod, suffix='utest')
+        report = six_arm_run.report
 
-        report = await mod.run_bake_off(regrowth=False, **_SMALL_RUN)
-
-        assert opened == []
-        assert drops.dropped.isdisjoint(passes)
-        assert set(_FakeMemoryService.instances[-1].mem0._stored) == {
+        assert six_arm_run.injection_loads == ()
+        assert six_arm_run.dropped.isdisjoint(passes)
+        assert set(six_arm_run.service.mem0._stored) == {
             mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
         }
         assert report['regrowth'] is None
         assert report['protocol']['regrowth_probed'] is False
         assert report['protocol']['regrowth_injections_measured'] == 0
 
+    @pytest.mark.asyncio
     async def test_a_subset_that_retains_no_injection_is_not_published_as_probed(
         self, monkeypatch,
     ):
@@ -5338,16 +5616,13 @@ class TestRunBakeOffRegrowthWiring:
             mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
         }
 
-    async def test_a_probe_less_run_claims_no_provenance_for_the_injection_fixture(
-        self, monkeypatch,
+    def test_a_probe_less_run_claims_no_provenance_for_the_injection_fixture(
+        self, small_run, six_arm_run,
     ):
         """Provenance for a file the run never opened is a false audit trail."""
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
         relative = mod._repo_relative(mod.DEFAULT_REGROWTH_INJECTION_PATH)
-
-        skipped = await mod.run_bake_off(regrowth=False, **_SMALL_RUN)
-        probed = await mod.run_bake_off(**_SMALL_RUN)
+        skipped, probed = six_arm_run.report, small_run.report
 
         assert relative not in [
             row['path'] for row in skipped['protocol']['fixtures']
@@ -5356,16 +5631,10 @@ class TestRunBakeOffRegrowthWiring:
             row['path'] for row in probed['protocol']['fixtures']
         ]
 
-    async def test_the_probe_does_not_disturb_the_six_arm_rows(self, monkeypatch):
+    def test_the_probe_does_not_disturb_the_six_arm_rows(self, small_run, six_arm_run):
         """The decision table is the ratified artifact; the probe rides
         alongside it and must not move a single one of its cells."""
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-
-        without = await mod.run_bake_off(regrowth=False, **_SMALL_RUN)
-        with_probe = await mod.run_bake_off(**_SMALL_RUN)
-
-        assert with_probe['arms'] == without['arms']
+        assert small_run.report['arms'] == six_arm_run.report['arms']
 
 
 class TestRegrowthFetchCache:
@@ -8745,23 +9014,71 @@ class TestBuildParser:
         assert '--dump-fetches' in capsys.readouterr().err
 
 
+#: Each extra argv `main` is recorded with, and the `regrowth` it must hand
+#: `run_bake_off`.
+_REGROWTH_SWITCH_CASES = (((), True), (('--no-regrowth',), False))
+
+
+@dataclasses.dataclass(frozen=True)
+class _MainLeg:
+    """What one doubled `main(argv)` returned, handed `run_bake_off`, and wrote."""
+
+    code: int
+    regrowth_seen: tuple
+    report_json: str
+    lease_dirs: tuple[Path, ...]
+
+
+def _record_main_leg(extra_argv: tuple[str, ...], directory: Path) -> _MainLeg:
+    mod = _mod()
+    regrowth_seen: list = []
+    json_out = directory / 'report.json'
+    reaper = mod.load_cleanup_script()
+    with lease_isolated_monkeypatch(reaper, directory / 'leases') as (mp, lease_dirs):
+        _install_driver_doubles(mp)
+        real = mod.run_bake_off
+
+        async def _spy(**kwargs):
+            regrowth_seen.append(kwargs.get('regrowth'))
+            return await real(**kwargs)
+
+        mp.setattr(mod, 'run_bake_off', _spy)
+
+        code = mod.main([
+            *extra_argv, '--clusters', '2', '--distractors', '12',
+            '--project-suffix', 'utest',
+            '--json-out', str(json_out), '--md-out', str(directory / 'report.md'),
+        ])
+
+    return _MainLeg(
+        code=code,
+        regrowth_seen=tuple(regrowth_seen),
+        # Empty when no artifact was written, so the reading test's own
+        # assertion is what reports the failed leg.
+        report_json=json_out.read_text() if json_out.exists() else '',
+        lease_dirs=tuple(lease_dirs),
+    )
+
+
+@pytest.fixture(scope='module')
+def main_legs(tmp_path_factory) -> types.MappingProxyType[tuple[str, ...], _MainLeg]:
+    """One recorded `main()` leg per `_REGROWTH_SWITCH_CASES` argv; every field is immutable."""
+    return types.MappingProxyType({
+        argv: _record_main_leg(argv, tmp_path_factory.mktemp('main-leg'))
+        for argv, _ in _REGROWTH_SWITCH_CASES
+    })
+
+
+@_ON_THE_RECORDING_WORKER
 class TestMain:
     """`main(argv)` driven directly — no subprocess."""
 
-    def test_a_successful_run_writes_both_artifacts_and_returns_zero(
-        self, monkeypatch, tmp_path,
-    ):
+    def test_a_successful_run_writes_both_artifacts_and_returns_zero(self, main_legs):
         mod = _mod()
-        _install_driver_doubles(monkeypatch)
-        json_out, md_out = tmp_path / 'report.json', tmp_path / 'report.md'
+        leg = main_legs[()]
 
-        code = mod.main([
-            '--clusters', '2', '--distractors', '12', '--project-suffix', 'utest',
-            '--json-out', str(json_out), '--md-out', str(md_out),
-        ])
-
-        assert code == 0
-        assert list(json.loads(json_out.read_text())['arms']) == list(mod.ARM_VARIANTS)
+        assert leg.code == 0
+        assert list(json.loads(leg.report_json)['arms']) == list(mod.ARM_VARIANTS)
 
     def test_a_missing_fixture_exits_2_before_a_single_collection_exists(
         self, monkeypatch, tmp_path,
@@ -8828,35 +9145,17 @@ class TestMain:
         # artifact gets published as if it were a fresh measurement.
         assert code == 2
 
-    @pytest.mark.parametrize(
-        ('argv', 'expected'), [([], True), (['--no-regrowth'], False)],
-    )
+    @pytest.mark.parametrize(('argv', 'expected'), _REGROWTH_SWITCH_CASES)
     def test_the_switch_reaches_run_bake_off_rather_than_stopping_at_the_parser(
-        self, monkeypatch, tmp_path, argv, expected,
+        self, main_legs, argv, expected,
     ):
         """A flag the driver never receives is a flag that silently does
         nothing — and the artifact would then say `regrowth_probed: true`
         for a run the operator asked to skip."""
-        mod = _mod()
-        _install_driver_doubles(monkeypatch)
-        seen: list = []
-        real = mod.run_bake_off
+        leg = main_legs[argv]
 
-        async def _spy(**kwargs):
-            seen.append(kwargs.get('regrowth'))
-            return await real(**kwargs)
-
-        monkeypatch.setattr(mod, 'run_bake_off', _spy)
-
-        code = mod.main([
-            *argv, '--clusters', '2', '--distractors', '12',
-            '--project-suffix', 'utest',
-            '--json-out', str(tmp_path / 'r.json'),
-            '--md-out', str(tmp_path / 'r.md'),
-        ])
-
-        assert code == 0
-        assert seen == [expected]
+        assert leg.code == 0
+        assert list(leg.regrowth_seen) == [expected]
 
 
 # ===========================================================================
@@ -8877,10 +9176,6 @@ class TestMain:
 # Marked PER-TEST, never via a module `pytestmark`: fused-memory's
 # `addopts = -m 'not integration'` would otherwise deselect the ~200 pure
 # tests above from the merge lane along with this one.
-
-import os  # noqa: E402
-
-from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
 
 
 @pytest.mark.integration

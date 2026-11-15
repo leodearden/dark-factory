@@ -35,7 +35,7 @@ from fused_memory.reconciliation.prompts import (
     render_finding_provenance_section,
 )
 from fused_memory.reconciliation.recon_self_model import (
-    MEM0_TOMBSTONE_DELETERS,
+    format_mem0_tombstone_deleters,
     render_entity_standing_decision_schema_section,
     render_marker_lifecycle_section,
     render_source_completion_section,
@@ -44,6 +44,7 @@ from fused_memory.reconciliation.recon_self_model import (
 from fused_memory.reconciliation.stage1_stall_detector import (
     STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
 )
+from fused_memory.reconciliation.task_filter import ACTIVE_TASK_TREE_HEADER
 from fused_memory.server.grouped_read import CHILD_KINDS, PARENT_ID_KEY
 
 _STAGE1_GATE_STALL_THRESHOLD_HOURS = int(
@@ -88,8 +89,6 @@ CHILD_MEMORY_AUTHORITY_RULE = (
     f"what the parent's sighting count counts, and an amendment holds the only copy of its "
     f'newer text.'
 )
-
-_DOCUMENTED_SWEEP_DELETERS = ', '.join(f'`{d}`' for d in MEM0_TOMBSTONE_DELETERS)
 
 STAGE1_SYSTEM_PROMPT = f"""\
 You are a Memory Consolidator agent operating in sleep mode. Your role is to review and \
@@ -988,14 +987,17 @@ Either remediation is acceptable; what is NOT acceptable is emitting the flag at
 `severity='{FindingSeverity.moderate}'` with `actionable=true` as though the task were genuinely stranded.
 
 **Only treat a stranded / blocked-escalation flag as fully actionable when NO live signal \
-is present** — i.e., the task has no live row in `### Live-Workflow Signals`, or \
-`get_task` shows no live claimant for it (the tie-breaker above), and its work has not \
-landed. That is the genuinely stranded case that legitimately needs operator attention.
+is present** — i.e., the `{ACTIVE_TASK_TREE_HEADER}` lists the task and it has no live \
+row in `### Live-Workflow Signals`, or `get_task` shows no live claimant for it (the \
+tie-breaker above), and its work has not landed. That is the genuinely stranded case \
+that legitimately needs operator attention.
 
-If `### Live-Workflow Signals` is absent from the payload, no task is live this cycle — \
-neither through a per-task signal nor through the project-wide lock — and none has \
-landing evidence; no live-workflow suppression applies, and stranded/blocked-escalation \
-flags may be emitted normally.
+If `### Live-Workflow Signals` is absent from the payload, no task the \
+`{ACTIVE_TASK_TREE_HEADER}` lists is live this cycle — neither through a per-task signal \
+nor through the project-wide lock — and none of them has landing evidence; no \
+live-workflow suppression applies to them, and stranded/blocked-escalation flags may be \
+emitted normally. The section says nothing about a task that tree does not list; for \
+such a task, follow the rule above on which tasks the section probes.
 
 {PRESERVED_SPECIMEN_CORROBORATION_HEADING}
 Absence of a live-workflow signal is necessary for the stranded claim but it is NOT \
@@ -1043,7 +1045,7 @@ metadata records every cited memory id, and keeps it whenever the lookup is inco
 The buffered-event deletion log shows THAT a Mem0 record was deleted, never WHY. Before \
 counting a swept id as a `mem0_evidentiary_anchor_deletion_pattern` occurrence, call \
 `get_memory_by_id` on it. A miss carrying a `tombstone` whose `deleter` is one of \
-{_DOCUMENTED_SWEEP_DELETERS} is a designed recon sweep — expected, not an anomaly — and \
+{format_mem0_tombstone_deleters()} is a designed recon sweep — expected, not an anomaly — and \
 must not be flagged. Only an id with no tombstone, or with an undocumented deleter, \
 supports the flag. Name every swept id's full UUID in the description, and do not bundle \
 unrelated deletions into this flag type. The code gate \

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from orchestrator.session_registry import UNKNOWN_QUEUE, DecisionState
+from shared.project_id import fold_project_token
 from sitting.inventory import OpenItem, queue_tag
 
 from orchestrator import session_registry
@@ -34,6 +35,8 @@ RESOLVE_ACTIONS: tuple[str, ...] = ('resume', 'restart', 'park', 'abandon', 'clo
 SESSION_REGISTRY_TOOL = 'cli:session_registry'
 FOLLOWUP_SOURCE = 'sitting-preparer'
 CLOSING_STATES = frozenset({DecisionState.ANSWERED, DecisionState.DROPPED})
+MEMORY_DECISION_CATEGORY = 'decisions_and_rationale'
+MEMORY_RATIONALE_CATEGORY = 'observations_and_summaries'
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,8 @@ class AgreedMarker:
 def resolve_issue_payload(
     escalation_id: str, resolution: str, action: str, *, resolved_by: str, resolution_turns: int,
 ) -> ApplyPayload:
+    """The call's arguments only; the server may still refuse a legal action
+    (``escalation/src/escalation/server.py::resolve_issue`` "Gate precedence")."""
     if action not in RESOLVE_ACTIONS:
         raise ValueError(f'unknown resolve action {action!r}; expected one of {list(RESOLVE_ACTIONS)}')
     _require_positive_int('resolution_turns', resolution_turns)
@@ -125,6 +130,55 @@ def resolve_issue_payload(
         'resolved_by': resolved_by,
         'resolution_turns': resolution_turns,
     })
+
+
+def stamp_markers_payload(
+    escalation_id: str, existing_note: str, prepared: PreparedMarker | None, agreed: AgreedMarker,
+) -> ApplyPayload:
+    """``stamp_triage`` replacing the note with *existing_note* plus the preparation (if any) and the answer."""
+    lines = [render_prepared_marker(prepared)] if prepared is not None else []
+    lines.append(render_agreed_marker(agreed))
+    return ApplyPayload('stamp_triage', {
+        'escalation_id': escalation_id,
+        'triage_note': append_markers(existing_note, *lines),
+    })
+
+
+def ruling_resolution(option_label: str, option_text: str, note: str) -> str:
+    text = f'Sitting ruling: option {option_label}: {option_text}'
+    return f'{text}\nNote: {note.strip()}' if note.strip() else text
+
+
+def memory_payloads(
+    item: OpenItem,
+    *,
+    option_label: str,
+    option_text: str,
+    note: str,
+    rationale: str,
+    agent_id: str,
+) -> tuple[ApplyPayload, ApplyPayload]:
+    """The ruling as a decision memory, then its rationale as an observation, on the item's project."""
+    cited = item.escalation_id or item.decision_id or '-'.join(item.key)
+    task_id = item.store_task_id
+    subject = f'{cited} (task {task_id})' if task_id else cited
+    entities = [{'kind': 'task', 'id': int(task_id)}] if task_id else []
+    ruled = f'Sitting ruled {subject}: option {option_label}: {option_text}'
+    contents = (
+        (MEMORY_DECISION_CATEGORY, f'{ruled}. Note: {note.strip()}' if note.strip() else ruled),
+        (MEMORY_RATIONALE_CATEGORY, f'Why the sitting ruled {subject} option {option_label}: {rationale}'),
+    )
+    decision, why = (
+        ApplyPayload('add_memory', {
+            'content': content,
+            'category': category,
+            'project_id': fold_project_token(item.project),
+            'agent_id': agent_id,
+            'entities': entities,
+        })
+        for category, content in contents
+    )
+    return decision, why
 
 
 def update_task_payload(task_id: str, project_root: str, ruling: Ruling, *, existing: object) -> ApplyPayload:

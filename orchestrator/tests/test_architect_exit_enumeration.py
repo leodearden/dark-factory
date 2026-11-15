@@ -8,7 +8,9 @@ by ``agents/invoke.py:979-985``, which builds the backend allowlist from
 ``allowed_tools`` — an ungranted tool is unreachable regardless of prompt
 text); the dead-grant check; and bare tool-name-presence anchors for
 ``report_ready_to_merge`` / ``mark_step_committed`` on the two roles.py
-system prompts and the two ``BriefingAssembler`` dispatch prompts.
+system prompts and the plan-completion ``BriefingAssembler`` dispatch prompt.
+The SIMPLE_TASK briefing points at its system prompt for the exits instead
+(``orchestrator/tests/test_briefing_simple_task_spot.py``, task 6564).
 
 Prose-window/keyword assertions were deliberately removed in review (design
 decision 4) — do not reintroduce them.
@@ -190,13 +192,3 @@ class TestBriefingPromptsEnumerateNewExits:
             task, _partial_plan_with_pending_steps(), worktree=None, context='',
         )
         assert 'mark_step_committed' in prompt
-
-    async def test_simple_task_prompt_names_report_ready_to_merge(self, briefing):
-        """The SIMPLE_TASK dispatch briefing's only exit sentence currently
-        names just report_unactionable_task; it must also teach
-        report_ready_to_merge for the branch-complete-but-unmerged case."""
-        task = {'id': '77', 'title': 'Small fix', 'description': 'Demo'}
-        prompt = await briefing.build_simple_task_prompt(
-            task, worktree=None, context='',
-        )
-        assert 'report_ready_to_merge' in prompt

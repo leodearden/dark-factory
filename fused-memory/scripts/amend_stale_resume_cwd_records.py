@@ -742,17 +742,13 @@ async def _apply_amendments(
     try:
         assert_store_mutation_allowed(
             operation='amend_stale_resume_cwd_records --apply',
+            logger=logger,
+            extra_detail=(
+                'an amendment would rewrite a record and then fail to journal the '
+                'change. Nothing was written.'
+            ),
         )
     except StoreMutationUnavailable as exc:
-        logger.error(
-            'amend_stale_resume_cwd_records: --apply NOT started (fail-closed) '
-            "-- this process cannot write mem0's history directory, so an "
-            'amendment would rewrite a record and then fail to journal the '
-            'change. Nothing was written. Re-run from the fused-memory MCP '
-            "server's environment or an unsandboxed operator shell; to obtain "
-            'the report safely from anywhere, re-run without --apply. (%r)',
-            exc,
-        )
         return [
             {**d, 'action': 'refuse:store_unavailable', 'error': str(exc)}
             if d['action'] == 'amend' else d

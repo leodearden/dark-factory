@@ -1,10 +1,11 @@
 """The link-heal config surface (plans/write-triage-link-healing-prd.md H1/H2, tasks 6181, 6184).
 
-The ``link_heal.*`` knobs: the executor's caps and storm escapes (H1) and the
+The ``link_heal.*`` knobs: the executor's caps and storm escapes (H1), the
 link adjudicator's model, sharding, text cap, share ceilings and failure streak
-(H2). All are green-tier because their only consumers are scripts
-(``scripts/link_heal.py``, ``scripts/eval_link_adjudicator.py``) that load
-config at each run start; and
+(H2), and the scheduled sweep's projects, write switch, action set, window and
+calibration gate (task 7159). All are green-tier because their only consumers
+are scripts (``scripts/link_heal.py``, ``scripts/eval_link_adjudicator.py``)
+that load config at each run start; and
 the ``link-heal-`` prefix on the metadata arm of ``mem0_update``, which the
 executor's ``update_memory`` writes need and which must not widen the
 content-amend arm.
@@ -49,6 +50,15 @@ class TestLinkHealConfigDefaults:
         assert cfg.corrects_share_ceiling == 0.60
         assert cfg.shard_failure_streak == 3
 
+    def test_sweep_and_calibration_defaults(self):
+        cfg = LinkHealConfig()
+        assert cfg.projects == []
+        assert cfg.writes is False
+        assert cfg.sweep_actions == ['detach', 'relabel']
+        assert cfg.sweep_window_hours == 24
+        assert cfg.calibration_kappa_margin == 0.10
+        assert cfg.calibration_min_project_items == 60
+
     @pytest.mark.parametrize(
         ('field', 'value'),
         [
@@ -63,6 +73,10 @@ class TestLinkHealConfigDefaults:
             ('corrects_share_ceiling', -0.01),
             ('corrects_share_ceiling', 1.01),
             ('adjudicator_model', ''),
+            ('sweep_window_hours', 0),
+            ('calibration_kappa_margin', -0.01),
+            ('calibration_kappa_margin', 1.01),
+            ('calibration_min_project_items', 0),
         ],
     )
     def test_out_of_range_values_are_rejected(self, field, value):
@@ -94,10 +108,16 @@ class TestLinkHealLeavesAreGreenTier:
         'misfile_share_ceiling': 0.5,
         'corrects_share_ceiling': 0.9,
         'shard_failure_streak': 5,
+        'projects': ['dark_factory'],
+        'writes': True,
+        'sweep_actions': ['detach'],
+        'sweep_window_hours': 48,
+        'calibration_kappa_margin': 0.05,
+        'calibration_min_project_items': 30,
     }
 
-    def test_the_schema_declares_nine_leaves(self):
-        assert len(LEAVES) == 9, LEAVES
+    def test_the_schema_declares_fifteen_leaves(self):
+        assert len(LEAVES) == 15, LEAVES
 
     def test_every_leaf_is_allowlisted(self):
         missing = {f'link_heal.{name}' for name in LEAVES} - RELOADABLE_FIELDS
@@ -122,13 +142,27 @@ class TestLinkHealLeavesAreGreenTier:
         assert path not in d.restart_required
 
 
-class TestTrackedConfigAdmitsTheLinkHealPrefixOnTheMetadataArmOnly:
-    @pytest.fixture
-    def tracked_config(self, monkeypatch) -> FusedMemoryConfig:
-        assert TRACKED_CONFIG_YAML.is_file(), TRACKED_CONFIG_YAML
-        monkeypatch.setenv('CONFIG_PATH', str(TRACKED_CONFIG_YAML))
-        return FusedMemoryConfig()
+@pytest.fixture
+def tracked_config(monkeypatch) -> FusedMemoryConfig:
+    assert TRACKED_CONFIG_YAML.is_file(), TRACKED_CONFIG_YAML
+    monkeypatch.setenv('CONFIG_PATH', str(TRACKED_CONFIG_YAML))
+    return FusedMemoryConfig()
 
+
+class TestTrackedConfigShipsTheSweepWithWritesOff:
+    def test_the_sweep_ships_with_writes_off(self, tracked_config):
+        assert tracked_config.link_heal.writes is False
+
+    def test_the_sweep_covers_the_projects_with_triage_children_in_the_soak(self, tracked_config):
+        projects = tracked_config.link_heal.projects
+        assert len(projects) == len(set(projects))
+        assert set(projects) == {
+            'dark_factory', 'reify', 'solar_challenge', 'solar_challenge_platform',
+            'scoping_intake',
+        }
+
+
+class TestTrackedConfigAdmitsTheLinkHealPrefixOnTheMetadataArmOnly:
     def test_metadata_arm_lists_recon_curator_and_link_heal(self, tracked_config):
         prefixes = tracked_config.mem0_update.metadata_patch_allowed_agent_prefixes
         for prefix in ('recon-stage-', 'curator-', 'link-heal-'):

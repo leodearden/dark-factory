@@ -7,6 +7,7 @@ Step 3 (RED → step-4 GREEN): inject_execution_class normalization.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -130,3 +131,41 @@ class TestInjectExecutionClass:
 
         result = inject_execution_class('not json!!!')
         assert isinstance(result, dict)
+
+
+# ---------------------------------------------------------------------------
+# Unreadable metadata is discarded loudly, under the shared wire rule
+# ---------------------------------------------------------------------------
+
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+_SOURCE = 'source=execution_class_guard'
+
+
+def _discard_lines(caplog) -> list[str]:
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+
+
+class TestUnreadableMetadataIsDiscardedLoudly:
+    def test_malformed_string_still_fails_validation_and_logs_one_census_line(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            error = execution_class_error('{not json', 'recon-stage-task_knowledge_sync', '/proj')
+        assert error is not None
+        assert error['error_type'] == 'ValidationError'
+        assert len(_discard_lines(caplog)) == 1
+
+    def test_malformed_string_injects_an_empty_dict_and_logs_one_census_line(self, caplog):
+        from fused_memory.middleware.execution_class_guard import inject_execution_class
+
+        with caplog.at_level(logging.WARNING):
+            assert inject_execution_class('{not json') == {}
+        assert len(_discard_lines(caplog)) == 1
+
+    @pytest.mark.parametrize('metadata', [None, ''])
+    def test_absent_metadata_logs_no_census_line(self, metadata, caplog):
+        from fused_memory.middleware.execution_class_guard import inject_execution_class
+
+        with caplog.at_level(logging.WARNING):
+            execution_class_error(metadata, 'recon-stage-task_knowledge_sync', '/proj')
+            inject_execution_class(metadata)
+        assert _discard_lines(caplog) == []

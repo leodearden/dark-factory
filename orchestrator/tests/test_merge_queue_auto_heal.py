@@ -20,7 +20,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeClock, FakeVerifier
+from _merge_lane_fakes import FakeClock, FakeVerifier, lane_scene_config
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
@@ -78,15 +78,15 @@ def _make_mock_git_ops(project_root: Path | None = None) -> MagicMock:
 
 
 def _make_config(tmp_path: Path) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        project_root=tmp_path,
-        max_concurrent_tasks=1,
-        git=GitConfig(
+    return lane_scene_config(
+        tmp_path,
+        GitConfig(
             main_branch='main',
             branch_prefix='task/',
             remote='origin',
             worktree_dir='.worktrees',
         ),
+        max_concurrent_tasks=1,
     )
 
 
@@ -222,16 +222,12 @@ class TestComposeFixMainBrief:
 
     def test_title_starts_with_fix_main(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        title, _ = compose_fix_main_brief(
-            'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
-        )
+        title, _ = compose_fix_main_brief('compile_error', 'error TS2322: StatusBar.tsx')
         assert title.startswith('fix main:'), f'Title must start with "fix main:"; got {title!r}'
 
     def test_title_contains_relevant_identifier(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        title, _ = compose_fix_main_brief(
-            'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
-        )
+        title, _ = compose_fix_main_brief('compile_error', 'error TS2322: StatusBar.tsx')
         # Either the cause_hint or the category must appear somewhere in the title
         assert ('StatusBar.tsx' in title or 'compile_error' in title or 'TS2322' in title), (
             f'Expected identifier in title; got {title!r}'
@@ -239,46 +235,31 @@ class TestComposeFixMainBrief:
 
     def test_title_bounded_length(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        title, _ = compose_fix_main_brief(
-            'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
-        )
+        title, _ = compose_fix_main_brief('compile_error', 'error TS2322: StatusBar.tsx')
         assert len(title) <= 120, f'Title must be ≤120 chars; got {len(title)}: {title!r}'
 
     def test_title_non_empty(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        title, _ = compose_fix_main_brief('compile_error', 'hint', 'detail')
+        title, _ = compose_fix_main_brief('compile_error', 'hint')
         assert title, 'Title must be non-empty'
 
     def test_description_contains_category(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        _, description = compose_fix_main_brief(
-            'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
-        )
+        _, description = compose_fix_main_brief('compile_error', 'error TS2322: StatusBar.tsx')
         assert 'compile_error' in description, (
             f'Description must contain category; got {description!r}'
         )
 
     def test_description_contains_cause_hint(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        _, description = compose_fix_main_brief(
-            'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
-        )
+        _, description = compose_fix_main_brief('compile_error', 'error TS2322: StatusBar.tsx')
         assert 'error TS2322' in description or 'StatusBar.tsx' in description, (
             f'Description must contain cause_hint; got {description!r}'
         )
 
-    def test_description_contains_detail(self) -> None:
-        from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        _, description = compose_fix_main_brief(
-            'compile_error', 'error TS2322: StatusBar.tsx', 'tsc failed\n<report>',
-        )
-        assert 'tsc failed' in description or 'report' in description, (
-            f'Description must contain (truncated) detail; got {description!r}'
-        )
-
     def test_description_non_empty(self) -> None:
         from orchestrator.main_health_fix_owner import compose_fix_main_brief
-        _, description = compose_fix_main_brief('compile_error', 'hint', 'detail')
+        _, description = compose_fix_main_brief('compile_error', 'hint')
         assert description, 'Description must be non-empty'
 
 
@@ -387,7 +368,7 @@ class TestMergeRequestLaneWiring:
 
         workflow._write_merge_failure_review = MagicMock()
 
-        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
+        with patch('orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue):
             asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=False)
             )
@@ -550,7 +531,7 @@ class TestSubmitToMergeQueueRoutesAutoHeal:
         async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
             request.result.set_result(outcome)
 
-        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
+        with patch('orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
             )
@@ -585,7 +566,7 @@ class TestSubmitToMergeQueueRoutesAutoHeal:
         async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
             request.result.set_result(generic_outcome)
 
-        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
+        with patch('orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue):
             result = asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=False)
             )
@@ -788,7 +769,7 @@ class TestAutoHealOwnerTiedResume:
         workflow = _make_workflow(config, worktree)
         workflow.merge_queue = asyncio.Queue()
 
-        # Use a REAL lane so _WipHaltMixin state is exercised, with the ports
+        # Use a REAL lane so its real halt state is exercised, with the ports
         # faked: nothing in this scene may reach a real verify or a real clock.
         git_ops = _make_mock_git_ops(tmp_path)
         real_worker = MergeLane(
@@ -1001,7 +982,7 @@ class TestAutoHealHaltOwnerIsDedupeParent:
         workflow = _make_workflow(config, worktree)
         workflow.merge_queue = asyncio.Queue()
 
-        # Use a REAL lane so _WipHaltMixin lane-owner state is exercised, with
+        # Use a REAL lane so its real lane-owner state is exercised, with
         # the ports faked: nothing here may reach a real verify or a real clock.
         git_ops = _make_mock_git_ops(tmp_path)
         real_worker = MergeLane(
@@ -1267,7 +1248,7 @@ class TestAutoHealHaltOwnerSurvivesOwnBlock:
         async def _fake_enqueue(_queue, request, _event_store, **_kwargs):
             request.result.set_result(outcome)
 
-        with patch('orchestrator.merge_lane.worker.enqueue_merge_request', _fake_enqueue):
+        with patch('orchestrator.merge_lane.intake.enqueue_merge_request', _fake_enqueue):
             asyncio.run(
                 workflow._submit_to_merge_queue('task/42', pre_rebased=False, merge_phase=True)
             )

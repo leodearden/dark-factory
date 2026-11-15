@@ -15,17 +15,15 @@ from client_feed.contract import (
     FactoryState,
     FeedEvent,
     FeedState,
-    FileKind,
     PrdUpserted,
     RevealBudget,
     TaskStatus,
     TaskUpserted,
-    TreeFile,
     TreeSnapshot,
 )
 from client_feed.envelope import Stamp, payload
-from client_feed.policy import Policy, matches_any
-from client_feed.sources.events import FactoryStatus, OpenEscalations
+from client_feed.sources.escalations import OpenEscalations
+from client_feed.sources.events import FactoryStatus
 from client_feed.sources.prds import PrdText, summarize_prd
 from client_feed.sources.tasks import TaskRow, waiting_on
 from client_feed.sources.tree import VisibleTree
@@ -81,7 +79,7 @@ def task_events(
     """Each read row the state does not already say; then, given the open escalations, each unread task whose waiting_on they change.
 
     With the escalations unknown (None), a read row whose status the state already records keeps the
-    recorded waiting_on, so an unreadable runs.db holds who a task waits on rather than clearing it.
+    recorded waiting_on, so an unreadable escalation queue holds who a task waits on rather than clearing it.
     """
     rows = tuple(rows)
     events = _read_task_events(rows, state, stamp, escalations_known=escalations is not None)
@@ -162,29 +160,19 @@ def branch_event(
     return BranchSnapshot(**stamp(now), branches=branches)
 
 
-def _budget(policy: Policy, files: Sequence[TreeFile]) -> RevealBudget:
-    """PRD §4.12 with no delivered commit and no reveal granted: the proportion of every counted line."""
-    uncounted = (*policy.free_globs, *policy.never_reveal_globs)
-    counted = sum(
-        file.lines
-        for file in files
-        if file.kind is FileKind.PRODUCTION and not matches_any(uncounted, file.path)
-    )
-    return RevealBudget(
-        proportion=policy.reveal_proportion,
-        counted_lines=counted,
-        budget_lines=math.floor(policy.reveal_proportion * counted),
-        spent_lines=0,
-        floor_lines=policy.reveal_floor_lines,
-    )
-
-
-def tree_event(tree: VisibleTree, *, policy: Policy, stamp: Stamp, now: datetime) -> TreeSnapshot:
+def tree_event(
+    tree: VisibleTree, *, budget: RevealBudget, stamp: Stamp, now: datetime
+) -> TreeSnapshot:
     """The visible tree at a new main head, with its reveal budget."""
     return TreeSnapshot(
-        **stamp(now),
-        commit=tree.commit,
-        totals=tree.totals,
-        files=tree.files,
-        budget=_budget(policy, tree.files),
+        **stamp(now), commit=tree.commit, totals=tree.totals, files=tree.files, budget=budget
     )
+
+
+def budget_event(
+    budget: RevealBudget, *, state: FeedState, stamp: Stamp, now: datetime
+) -> TreeSnapshot | None:
+    """The state's tree again with a changed reveal budget: a budget is only ever said inside a tree snapshot."""
+    if state.tree is None or state.tree.budget == budget:
+        return None
+    return TreeSnapshot(**stamp(now), **{**payload(state.tree), 'budget': budget})

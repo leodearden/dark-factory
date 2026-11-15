@@ -90,7 +90,7 @@ resolve = resolve_ticket(ticket=submit_result["ticket"], project_root=project_ro
 | `created` | `filed:<task_id>` |
 | `combined` | `filed:<task_id>`, `dedup_step: "3"` |
 | `refused` | stays `open`; record `resolve["reason"]`; do not retry |
-| `awaiting_curation` | `filed:<ticket>` (parked; no task id yet); do not re-submit |
+| `pending`, `awaiting_curation` | open, no task id yet: resolve the same ticket once more, never re-submit; still open → `filed:<ticket>` |
 | `failed` | stays `open`; record the reason; retry only per the shared doc's retryable matrix |
 
 Every filed task has a concrete title, the evidence, the expected fix and the finding metadata. When one fix must land before another (wiring before the test of the wiring), add the edge with `add_dependency` after both resolve.
@@ -146,11 +146,11 @@ Record the form (`final`, `interim` or `none`), the chain task ids, any supersed
 
 ```
 add_memory(
-  content="Review {run_id} ({scope}, as_of {as_of_sha:10}, since {since:10|none}): {n} findings — {high} high/{medium} medium/{low} low; filed {filed}; {already} already owned; {structural} structural for deliberation; {fixed} fixed since last run. Next run: {chain form, task ids}.",
+  content="Review {run_id} ({scope}, as_of {as_of_sha:10}, since {since:10|none}): {n} findings — {high} high/{medium} medium/{low} low; filed {filed}; {already} already owned; {structural} structural for deliberation; {fixed} fixed since last run. Next run: {chain form}, human gate task 3127.",
   category="observations_and_summaries",
   project_id="<project_id>",
   agent_id="claude-review",
-  entities=[]
+  entities=[{'kind': 'task', 'id': 3127}]  # replace 3127 with the human gate Step 7 filed, here and in content; if Step 7 filed no chain, use [] and drop the human gate clause from content
 )
 ```
 

@@ -20,6 +20,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import load_script_module
+from _judge_wording_reload import wording_imported_under
+from _sdk_client_stubs import sdk_client_double
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import SourceStore
@@ -334,10 +336,8 @@ class _Provider:
         return _response()
 
     def client(self) -> MagicMock:
-        """A fake ``AsyncOpenAI`` that is its own async context manager, as the SDK is."""
-        client = MagicMock()
-        client.__aenter__ = AsyncMock(return_value=client)
-        client.__aexit__ = AsyncMock(return_value=False)
+        """A fake ``AsyncOpenAI`` served by this endpoint."""
+        client = sdk_client_double()
         client.responses.create = AsyncMock(side_effect=self._create)
         return client
 
@@ -986,6 +986,13 @@ def _committed_pairs() -> tuple[bytes, tuple[dict, ...]]:
     return body, tuple(json.loads(line) for line in body.decode('utf-8').splitlines())
 
 
+def _assert_each_arm_names_the_prompt_it_measured(wording: types.ModuleType) -> None:
+    measured = wording.PROMPTS_WHILE_PSI_SHIPPED  # π2 ran while ψ shipped (task 6530)
+    for row in _committed()['arms']:
+        assert row['wording'] in measured, (row['arm'], row['wording'], sorted(measured))
+        assert row['system_prompt_sha256'] == _sha(measured[row['wording']]), row['arm']
+
+
 class TestCommittedWriteTimePopulationIsTraceable:
     """The committed π2 artifacts say which arms ran, on which slates, over what.
 
@@ -1001,10 +1008,15 @@ class TestCommittedWriteTimePopulationIsTraceable:
             assert (row['model'], row['reasoning_effort'], row['width'], row['wording']) == (
                 arm.model, arm.reasoning_effort, arm.width, arm.wording,
             )
-            assert row['system_prompt_sha256'] == _sha(_wording().system_prompt(arm.wording))
             assert row['field_chars'] == 4_000
             assert '/arms-write-time/' in row['cases_path'], row['arm']
             assert '/arms/' not in row['cases_path'], row['arm']
+        _assert_each_arm_names_the_prompt_it_measured(_wording())
+
+    def test_each_arm_still_names_its_prompt_when_the_shipped_prompt_moves_on(self) -> None:
+        with wording_imported_under('a shipped prompt other than psi') as wording:
+            assert wording.system_prompt('shipped') == 'a shipped prompt other than psi'
+            _assert_each_arm_names_the_prompt_it_measured(wording)
 
     def test_every_arm_judged_every_write_still_in_the_band(self) -> None:
         population = _committed()['population']
@@ -1067,3 +1079,99 @@ class TestCommittedWriteTimePopulationIsTraceable:
             assert _sha(b''.join(prefix)) == source['sha256'], source['path']
             rated = {(v['entry_id'], v['target_id']) for v in map(json.loads, prefix)}
             assert not asked & rated, source['path']
+
+
+def _scoreless(candidate: dict) -> dict:
+    """*candidate* as a topic-anchored pin: no ``store_score`` anywhere."""
+    metadata = {key: value for key, value in candidate['metadata'].items() if key != 'store_score'}
+    return {**candidate, 'store_score': None, 'metadata': metadata}
+
+
+_RANKED = [('a', 0.80), ('b', 0.75), ('c', 0.70), ('d', 0.65), ('e', 0.60)]
+
+
+def _ranked(*extra: dict) -> list[dict]:
+    return [*(_candidate(memory_id, cosine, BEFORE) for memory_id, cosine in _RANKED), *extra]
+
+
+class TestTopTargets:
+    """top_targets is the canonical id of each candidate the judge is shown, once, in rank order."""
+
+    def test_are_the_canonicals_of_the_candidates_shown_in_rank_order(self) -> None:
+        write = _write(_ranked(_candidate('f', 0.58, BEFORE)))
+        assert _mod().top_targets(write, 5) == ['a', 'b', 'c', 'd', 'e']
+        assert _mod().top_targets(write, 3) == ['a', 'b', 'c']
+
+    def test_the_band_winners_canonical_is_always_present(self) -> None:
+        write = _write(_ranked(_candidate('weak', 0.55, BEFORE)), band_winner_id='weak')
+        assert _mod().top_targets(write, 5) == ['a', 'b', 'c', 'd', 'weak']
+
+    def test_a_hoisted_winner_off_the_slate_is_reached_through_its_child(self) -> None:
+        kid = _candidate('kid', 0.55, BEFORE, kind='sighting', parent_id='P')
+        write = _write(_ranked(kid), band_winner_id='P')
+        assert _mod().top_targets(write, 5) == ['a', 'b', 'c', 'd', 'P']
+
+    def test_two_children_of_one_parent_collapse_to_that_parent_once(self) -> None:
+        write = _write([
+            _candidate('kid1', 0.80, BEFORE, kind='sighting', parent_id='P'),
+            _candidate('a', 0.75, BEFORE),
+            _candidate('kid2', 0.70, BEFORE, kind='amendment', parent_id='P'),
+            _candidate('b', 0.65, BEFORE),
+            _candidate('c', 0.60, BEFORE),
+            _candidate('d', 0.55, BEFORE),
+        ])
+        assert _mod().top_targets(write, 5) == ['P', 'a', 'b', 'c']
+
+    def test_a_candidate_with_no_store_score_is_never_a_target(self) -> None:
+        write = _write([_candidate('a', 0.70, BEFORE), _candidate('b', 0.60, BEFORE)])
+        write['candidates'].insert(0, _scoreless(_candidate('pin', 0.99, BEFORE)))
+        assert _mod().top_targets(write, 5) == ['a', 'b']
+
+    def test_an_empty_slate_has_no_targets(self) -> None:
+        assert _mod().top_targets(_write([], band='stored'), 5) == []
+
+
+class TestTargetText:
+    def test_is_the_slate_candidates_content_when_the_target_is_on_the_slate(self) -> None:
+        write = _write([_candidate('a', 0.70, BEFORE)])
+        assert _mod().target_text({'a': {'content': 'elsewhere'}}, write, 'a') == 'content of a'
+
+    def test_is_the_snapshot_targets_content_when_it_is_not(self) -> None:
+        write = _write([_candidate('kid', 0.70, BEFORE, kind='sighting', parent_id='P')])
+        assert _mod().target_text({'P': {'content': 'the parent'}}, write, 'P') == 'the parent'
+
+    def test_is_none_when_neither_holds_it(self) -> None:
+        write = _write([_candidate('a', 0.70, BEFORE)])
+        assert _mod().target_text({'Q': {'content': 'other'}}, write, 'P') is None
+
+
+def _naming(candidate_id: str) -> MagicMock:
+    """A fake ``AsyncOpenAI`` whose judge restates onto *candidate_id*."""
+    async def _create(**_: Any) -> types.SimpleNamespace:
+        reply = _response()
+        reply.output_text = json.dumps({'verdict': 'restates', 'candidate_id': candidate_id})
+        return reply
+
+    client = sdk_client_double()
+    client.responses.create = AsyncMock(side_effect=_create)
+    return client
+
+
+class TestOneCanonicalRule:
+    def test_the_judged_candidate_is_one_of_the_top_targets(self) -> None:
+        write = _write_time(_write([
+            _candidate('kid', 0.80, BEFORE, kind='sighting', parent_id='P'),
+            _candidate('a', 0.70, BEFORE),
+        ]))
+        arm = _arm('gpt-4o-mini@5')
+
+        async def _go() -> dict:
+            with _wording().judge_wording(arm.wording):
+                return await _mod().judge_for_arm(
+                    write, arm, service=_service(), snapshot_sha256='s' * 64,
+                )
+
+        with patch('openai.AsyncOpenAI', return_value=_naming('kid')):
+            row = asyncio.run(_go())
+        assert row['judged_candidate_id'] == 'P'
+        assert row['judged_candidate_id'] in _mod().top_targets(write, arm.width)

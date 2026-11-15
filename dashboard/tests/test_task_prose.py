@@ -1,7 +1,7 @@
 """The per-task prose read behind the Tasks tab's Task Detail pane (task 5815).
 
-The ACTIVE_TASKS list no longer carries a task's description/details; the pane
-fetches them for the ONE selected task. That read is addressed by the row's own
+The task rows (``TASKS_SNAPSHOT[p].rows``) carry no description/details; the
+pane fetches them for the ONE selected task. That read is addressed by the row's own
 uid, so the label resolution and the uid format below are the seam the list
 rows and the prose route share.
 """
@@ -113,6 +113,14 @@ def _same_basename_config(tmp_path: Path) -> DashboardConfig:
 async def _read(fused_memory: _FusedMemory, config: DashboardConfig, root: Path, task_id: int):
     async with httpx.AsyncClient(transport=httpx.MockTransport(fused_memory)) as client:
         return await fetch_task_prose(client, config, root, task_id)
+
+
+async def _open_session(config: DashboardConfig, root: Path) -> None:
+    """Open the MCP session for config's FIRST fused-memory URL, reused by later reads of it."""
+    port = httpx.URL(config.fused_memory_urls[0]).port
+    assert port is not None, 'the mock keys its answers by explicit port'
+    answered = _FusedMemory({port: {'id': '19', 'description': 'd', 'details': 't'}})
+    assert await _read(answered, config, root, 19) == TaskProse(description='d', details='t')
 
 
 def _prose_path(uid: str) -> str:
@@ -274,7 +282,6 @@ class TestFetchTask:
         assert row == {
             'id': 19,
             'title': 'merge attempts as one datum',
-            'description': 'd',
             'status': 'done',
             'priority': 'high',
             'dependencies': [3, 4],
@@ -282,6 +289,8 @@ class TestFetchTask:
             'updated_at': '2026-09-30T12:00:00+00:00',
             'claimant_run_id': 'run-7',
             'heartbeat_at': '2026-09-30T11:59:00+00:00',
+            'created_at': None,
+            'created_at_source': None,
         }
 
     async def test_one_get_task_call_names_the_id_and_root(self, tmp_path):
@@ -430,9 +439,15 @@ class TestTaskProseRoute:
         assert _URL_1 in body['detail']
 
     async def test_a_hung_read_is_cut_at_the_budget_as_504(self, tmp_path, monkeypatch, caplog):
-        """Bounded: neither a hang nor a 500, and the expiry leaves a journal line."""
+        """Bounded: neither a hang nor a 500, and the expiry leaves a journal line.
+
+        The session is opened first so the budgeted read is the single get_task post:
+        on a cold session the budget can expire mid-handshake under load, before
+        get_task is sent (task 8370).
+        """
         monkeypatch.setattr('dashboard.api.task_prose._TASK_PROSE_BUDGET', 0.05)
-        _root, config = _project(tmp_path, _URL_1)
+        root, config = _project(tmp_path, _URL_1)
+        await _open_session(config, root)
         fused_memory = _FusedMemory({9101: asyncio.Event()})
 
         with caplog.at_level(logging.WARNING, logger='dashboard.api.task_prose'):
@@ -443,7 +458,12 @@ class TestTaskProseRoute:
         body = response.json()
         assert body['error'] == 'budget_exceeded'
         assert body['detail']
-        assert fused_memory.tool_calls(), 'the read must have reached get_task before hanging'
+        assert [
+            (post.method, (post.params or {}).get('name')) for post in fused_memory.posts
+        ] == [('tools/call', 'get_task')], (
+            'the budgeted read must be the single get_task post, sent on an already-open '
+            'session, before it hangs'
+        )
         [record] = [r for r in caplog.records if r.name == 'dashboard.api.task_prose']
         assert 'proj' in record.getMessage()
         assert '19' in record.getMessage()

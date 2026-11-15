@@ -132,12 +132,12 @@ additionally carries ``liveness_snapshot_recurrence_groups``,
 alongside the pre-existing keys, which keep their exact meaning and shape.
 Suppress the artifacts with ``--no-metrics``.
 
-ORDERING NOTE -- scheduling and gate-filing belong to task 3136, not here.
-This script is a detector with a stable CLI and a stable stdout contract;
-3136 owns when it runs and what is done with the report. 3136's timer may
-subsume the eval program's leaf-epsilon invocation, so NEITHER owns the only
-schedule: adding a second trigger here would create a duplicate, and
-assuming 3136 always fires would leave the eval series with holes.
+ORDERING NOTE -- scheduling belongs to the callers, not here. This script
+is a detector with a stable CLI and a stable stdout contract. Task 3136's
+weekly timer drives it through ``scripts/duplicate_cluster_report.py``, once
+per category and with ``--no-metrics``, so the e6 metric series keeps
+``memory_eval_runner`` as its single producer. Do not add a trigger here:
+it would duplicate one of those two schedules.
 
 Structural parallel to ``scripts/audit_duplicate_tasks.py`` (union-find
 near-duplicate clustering + pick_survivor + dry-run/apply split) and the Mem0
@@ -162,6 +162,11 @@ Safety carve-outs:
     (see "Only chain-free evidence may DELETE" above).
   - A cluster whose members all share one ``metadata.topic`` is task 3136's
     Option-C carve-out: an expected shape, never a delete candidate.
+  - In any other cluster, a member carrying a non-empty ``metadata.topic``
+    (a retained Option-C peer) or ``metadata.parent_id`` (an amendment or
+    sighting child) is never a delete candidate either: it is reported in
+    ``retained_members`` and counted in ``retained_carveout`` (see
+    ``split_retained``).
   - Liveness-snapshot recurrence groups are report-only BY CONSTRUCTION --
     they are never added to the delete lists, rather than filtered out of
     them downstream where a later refactor could drop the filter.
@@ -192,15 +197,18 @@ import re
 import sys
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from shared.cli_boundary import LoudArgumentParser, run_cli
 
+from fused_memory.canonical_marker import is_canonical
 from fused_memory.reconciliation.task_filter import (
-    # `_CLAUSE_SPLIT_RE` is module-private BY CONTRACT — an AST scan over
-    # `src/` and `scripts/` (tests/test_task_filter.py
+    LIVE_TASK_STATUS_RE,
+    POINT_IN_TIME_CHECK_RE,
+    TASK_REF_RE,
+    # `WIDE_CLAUSE_BOUNDARY_RE` is for ALLOWLISTED consumers only — an AST
+    # scan over `src/` and `scripts/` (tests/test_task_filter.py
     # ::test_clause_split_re_has_no_out_of_module_consumers) enforces an
     # explicit allowlist, because the WIDENED splitter is only defensible for
     # callers that fail toward something self-healing. This module qualifies:
@@ -222,15 +230,10 @@ from fused_memory.reconciliation.task_filter import (
     # `liveness_snapshot_subject_facts` gates a clause-scoped key on TWO
     # conditions — divergence, and field-vocabulary equality with the
     # record's own key — rather than trusting the widened splitter alone.
-    _CLAUSE_SPLIT_RE,
-    LIVE_TASK_STATUS_RE,
-    POINT_IN_TIME_CHECK_RE,
-    TASK_REF_RE,
+    WIDE_CLAUSE_BOUNDARY_RE,
 )
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.created_at import parse_created_at
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('audit_duplicate_memories')
 
@@ -776,7 +779,7 @@ def liveness_snapshot_subject_facts(
     unconditional *core_fact* bucket.
 
     The clause-scoped key comes from splitting the content with
-    ``task_filter._CLAUSE_SPLIT_RE`` and reading each clause's task refs
+    ``task_filter.WIDE_CLAUSE_BOUNDARY_RE`` and reading each clause's task refs
     (``TASK_REF_RE``) and ``<field>=<value>`` assignments separately — the
     technique ``task_filter.find_conflicting_task_status_ids`` uses — unioned
     over the clauses that NAME the subject. A clause ``_readable_field_pairs``
@@ -812,7 +815,7 @@ def liveness_snapshot_subject_facts(
 
     scoped: dict[str, set[str]] = {}
     if _asserts_one_field_twice(core_fact):
-        for clause in _CLAUSE_SPLIT_RE.split(record.get('content') or ''):
+        for clause in WIDE_CLAUSE_BOUNDARY_RE.split(record.get('content') or ''):
             if not clause.strip():
                 continue
             refs = {str(ref) for ref in TASK_REF_RE.findall(clause)}
@@ -856,7 +859,7 @@ def liveness_snapshot_subject_facts(
 # categories (entities_and_relations, temporal_facts, decisions_and_rationale)
 # are deliberately absent: this detector reads the Mem0/Qdrant collection, and
 # a Graphiti edge has no vector here to cluster on.
-_ALL_CATEGORIES: tuple[str, ...] = (
+ALL_CATEGORIES: tuple[str, ...] = (
     'procedural_knowledge',
     'preferences_and_norms',
     'observations_and_summaries',
@@ -891,7 +894,7 @@ _LIVENESS_DISCLOSURE_KEYS: tuple[str, ...] = (
 def find_liveness_snapshot_recurrences(
     memories: list[dict],
     *,
-    categories: Iterable[str] = _ALL_CATEGORIES,
+    categories: Iterable[str] = ALL_CATEGORIES,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Group point-in-time liveness snapshots that re-assert one core FACT.
 
@@ -926,9 +929,10 @@ def find_liveness_snapshot_recurrences(
     whole-record bucket either.
 
     The core fact is keyed PER SUBJECT by ``liveness_snapshot_subject_facts``,
-    which splits the content into clauses with ``task_filter._CLAUSE_SPLIT_RE``
-    and adds each subject's own clause-scoped key beside the whole-record one
-    — but only when BOTH of that function's gates hold: the DIVERGENCE gate
+    which splits the content into clauses with
+    ``task_filter.WIDE_CLAUSE_BOUNDARY_RE`` and adds each subject's own
+    clause-scoped key beside the whole-record one — but only when BOTH of
+    that function's gates hold: the DIVERGENCE gate
     (the record's union key names one field twice) and the FIELD-VOCABULARY
     gate (the clause names every field that union names, not a strict subset
     of them — a fragment). A multi-task re-verification reporting DIVERGENT
@@ -948,7 +952,7 @@ def find_liveness_snapshot_recurrences(
     (``TestLivenessSubjectFactsIsAdditive``).
 
     Clause scoping was INERT when the detector was first written:
-    ``_CLAUSE_SPLIT_RE`` split on EVERY ``.``, shattering
+    ``task_filter``'s clause splitter split on EVERY ``.``, shattering
     ``dark-factory-orchestrator.yaml`` mid-sentence, and the real content
     writes ``task/94``, which ``TASK_REF_RE``'s separator did not match —
     together the EMPTY SET on all four real records. Task 3403 fixed both at
@@ -1281,22 +1285,20 @@ def _created_at_sort_key(created_at: Any) -> tuple[int, float]:
     Returns ``(0, timestamp)`` for a parseable ISO datetime string (so the
     oldest instant sorts first), or ``(1, 0.0)`` for ``None``/unparseable
     values — always after every parseable entry, so a record with no usable
-    timestamp is never mistakenly picked as "the oldest".
+    timestamp is never mistakenly picked as "the oldest". The parse is
+    ``fused_memory.utils.created_at.parse_created_at``'s.
     """
-    if not isinstance(created_at, str) or not created_at:
-        return (1, 0.0)
-    try:
-        return (0, datetime.fromisoformat(created_at).timestamp())
-    except (ValueError, TypeError):
-        return (1, 0.0)
+    moment = parse_created_at(created_at)
+    return (1, 0.0) if moment is None else (0, moment.timestamp())
 
 
 def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
     """Pick the survivor from a near-duplicate memory group.
 
     Survivor selection (in order):
-      1. A member explicitly flagged canonical (``metadata.get('canonical')``
-         truthy) wins, regardless of age.
+      1. A member whose metadata claims canonical per
+         ``canonical_marker.py::is_canonical`` (bool ``True`` only; ``'true'``
+         or ``1`` is not a claim) wins, regardless of age.
       2. Otherwise, the oldest member by ``created_at`` (ISO string) wins.
          Records with a missing/unparseable ``created_at`` sort last (see
          ``_created_at_sort_key``) so they are never chosen as "oldest"
@@ -1312,7 +1314,7 @@ def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
         raise ValueError(f'pick_survivor requires a group of >= 2 memories, got {len(group)}')
 
     def _sort_key(m: dict) -> tuple[bool, int, float, str]:
-        canonical = bool((m.get('metadata') or {}).get('canonical'))
+        canonical = is_canonical(m.get('metadata'))
         bucket, ts = _created_at_sort_key(m.get('created_at'))
         # `not canonical` so canonical=True sorts first (False < True);
         # bucket/ts ascending so the oldest parseable timestamp sorts first;
@@ -1348,10 +1350,11 @@ def partition_topic_carveout(
     survivor selection, so carved-out clusters never reach ``pick_survivor``,
     whose contract is untouched. Do NOT re-derive this rule elsewhere.
 
-    The boundary is deliberately narrow: only a FULLY shared, non-empty topic
-    carves out. Differing topics, a partially-missing topic, or an
-    empty-string topic all stay actionable — a cluster is only exempt when
-    every member was deliberately tagged the same way.
+    This is the CLUSTER half of the carve-out: only a FULLY shared, non-empty
+    topic removes a whole cluster from the report. A cluster with differing
+    or partially-missing topics stays actionable and reported, and
+    ``split_retained`` is the per-member half that still keeps each of its
+    stamped (and child) members out of the delete lists.
 
     Note ``metadata.topic`` has zero corpus footprint until 3195/3201 land,
     so this is inert-but-correct today by design: implemented now so it is
@@ -1362,6 +1365,97 @@ def partition_topic_carveout(
     for group in groups:
         (carved_out if _shared_topic(group) else actionable).append(group)
     return actionable, carved_out
+
+
+_RETAINED_CHILD_RECORD = 'child_record'
+_RETAINED_TOPIC_STAMPED = 'topic_stamped'
+_RETENTION_REASONS = (_RETAINED_TOPIC_STAMPED, _RETAINED_CHILD_RECORD)
+
+
+def _retention_reason(record: dict) -> str | None:
+    """Why ``--apply`` may never delete *record*, or None when it may.
+
+    The ONE definition. A record attached to a parent (``metadata.parent_id``,
+    an amendment or sighting child) would be orphaned from its parent's
+    lineage, and a topic-stamped record is a deliberately retained Option-C
+    peer whose siblings need not sit in the same cluster. ``child_record`` is
+    checked first, so a stamped child is reported once.
+    """
+    metadata = record.get('metadata') or {}
+    if metadata.get('parent_id'):
+        return _RETAINED_CHILD_RECORD
+    if metadata.get('topic'):
+        return _RETAINED_TOPIC_STAMPED
+    return None
+
+
+def split_retained(losers: list[dict]) -> tuple[list[dict], list[dict[str, Any]]]:
+    """Split a cluster's *losers* into ``(deletable, retained)``.
+
+    The per-member half of task 3136's carve-out (``partition_topic_carveout``
+    is the whole-cluster half). Retained entries are ``{'id', 'reason'}``
+    with the reason from ``_retention_reason``, in *losers* order.
+    """
+    deletable: list[dict] = []
+    retained: list[dict[str, Any]] = []
+    for loser in losers:
+        reason = _retention_reason(loser)
+        if reason is None:
+            deletable.append(loser)
+        else:
+            retained.append({'id': loser.get('id'), 'reason': reason})
+    return deletable, retained
+
+
+def member_facts(record: dict) -> dict[str, Any]:
+    """The per-member projection the duplicate-cluster report diffs on.
+
+    ``canonical`` is the same strict reading ``pick_survivor`` uses, so the
+    word means one thing across the survivor choice and the report.
+    """
+    metadata = record.get('metadata') or {}
+    return {
+        'id': record.get('id'),
+        'created_at': record.get('created_at'),
+        'topic': metadata.get('topic'),
+        'canonical': is_canonical(metadata),
+        'parent_id': metadata.get('parent_id'),
+        'kind': metadata.get('kind'),
+    }
+
+
+def count_children(
+    memories: Iterable[dict], categories: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Count the records in *categories* per ``(parent_id, kind, category)``.
+
+    Every scanned record counts, clustered or not: after the write-triage
+    flip a re-emission attaches as a sighting child, so its recurrence shows
+    up here rather than as cluster growth. Kind-agnostic by design: the
+    recorded ``metadata.kind`` is the key, so no kind vocabulary is imported.
+    A row ``{parent_id, kind, category, count}`` names the child record's own
+    ``category``, so a consumer can tell which category's sweep counted it.
+    Rows are sorted by ``(-count, str(parent_id), str(kind), str(category))``.
+    """
+    swept = frozenset(categories)
+    counts: dict[tuple[Any, Any, Any], int] = {}
+    for record in memories:
+        category = record.get('category')
+        if category not in swept:
+            continue
+        metadata = record.get('metadata') or {}
+        parent_id = metadata.get('parent_id')
+        if parent_id:
+            key = (parent_id, metadata.get('kind'), category)
+            counts[key] = counts.get(key, 0) + 1
+    rows = [
+        {'parent_id': parent_id, 'kind': kind, 'category': category, 'count': count}
+        for (parent_id, kind, category), count in counts.items()
+    ]
+    rows.sort(key=lambda r: (
+        -r['count'], str(r['parent_id']), str(r['kind']), str(r['category']),
+    ))
+    return rows
 
 
 _MAX_LEXICAL_RATIO_MEMBERS = 40
@@ -1613,13 +1707,14 @@ def build_sweep_plan(
     memories: list[dict],
     threshold: float = 0.85,
     *,
-    categories: Iterable[str] = _ALL_CATEGORIES,
+    categories: Iterable[str] = ALL_CATEGORIES,
     ann_pairs: Iterable[tuple[int, int]] | None = None,
     ann_scores: dict[tuple[int, int], float] | None = None,
     ann_disclosure: dict[str, int] | None = None,
     ann_threshold: float | None = None,
     ann_threshold_by_category: Mapping[str, float] | None = None,
     unevidenced_categories: Iterable[str] = (),
+    scan_coverage: Mapping[str, Mapping[str, int]] | None = None,
 ) -> dict[str, Any]:
     """Orchestrate filtering -> dual-path clustering -> survivor selection -> report.
 
@@ -1662,6 +1757,9 @@ def build_sweep_plan(
             tell which number gated which category. An EMPTY mapping says no
             category was calibrated; ``None`` means the caller ran without
             the ANN path at all.
+        scan_coverage: The caller's per-category scan counts, echoed so a
+            consumer of the stdout plan can tell a truncated scan from a
+            clean one. ``None`` when the caller has none (a pure-core call).
 
     Returns:
         JSON-serialisable plan dict. Pre-existing keys keep their exact
@@ -1672,10 +1770,13 @@ def build_sweep_plan(
         ``found_by`` (``['ann']``, ``['lexical']`` or both),
         ``lexical_clustered``, ``lexical_spanning``, ``ann_clique``,
         ``ann_max_score``, ``lexical_max_ratio``,
-        ``lexical_max_ratio_sampled`` and ``delete_candidate_ids``; the plan
-        additionally carries ``threshold``, ``ann_threshold``,
-        ``ann_disclosure``, ``topic_carveout_clusters`` /
-        ``topic_carveout_groups`` (see ``partition_topic_carveout``),
+        ``lexical_max_ratio_sampled``, ``delete_candidate_ids`` and
+        ``retained_members`` (losers ``split_retained`` keeps out of every
+        delete list, as ``{'id', 'reason'}``); the plan additionally carries
+        ``threshold``, ``ann_threshold``, ``ann_disclosure``,
+        ``topic_carveout_clusters`` / ``topic_carveout_groups`` (see
+        ``partition_topic_carveout``), ``retained_carveout`` (retained losers
+        counted per reason, every reason always present),
         ``apply_delete_candidates`` / ``apply_withheld_clusters`` /
         ``apply_withheld_groups`` (see
         ``restrict_delete_candidates_for_apply``) and ``path_verdicts``
@@ -1691,6 +1792,11 @@ def build_sweep_plan(
         apply gate — it is surfaced for human review and consolidation only.
         Task 3098 authorizes detection of the pattern, not disposition of the
         records that exhibit it.
+
+        Three keys feed task 3136's duplicate-cluster report: each group's
+        ``members`` (one ``member_facts`` row per ``member_ids`` entry, same
+        order), the plan's ``child_counts`` (see ``count_children``) and
+        ``scan_coverage`` (the *scan_coverage* argument echoed, or ``None``).
     """
     near_duplicate_groups: list[dict[str, Any]] = []
     # Mem0/Qdrant point ids can be int or str (ExtendedPointId), so this is
@@ -1699,6 +1805,7 @@ def build_sweep_plan(
     lexical_only = ann_only = both_paths = 0
     clusters_total = 0
     topic_carveout_groups: list[dict[str, Any]] = []
+    retained_carveout = dict.fromkeys(_RETENTION_REASONS, 0)
 
     # Cluster PER CATEGORY. Widening the filter must not merge the corpus: a
     # preference and a procedure that happen to read alike are different
@@ -1804,11 +1911,15 @@ def build_sweep_plan(
             )
 
             survivor, losers = pick_survivor(group)
-            loser_ids = [m.get('id') for m in losers]
+            deletable, retained = split_retained(losers)
+            deletable_ids = [m.get('id') for m in deletable]
+            for entry in retained:
+                retained_carveout[entry['reason']] += 1
             near_duplicate_groups.append({
                 'survivor_id': survivor.get('id'),
                 'survivor_content': survivor.get('content'),
                 'member_ids': [m.get('id') for m in group],
+                'members': [member_facts(m) for m in group],
                 'category': category,
                 'found_by': found_by,
                 'lexical_clustered': bool(group_lexical),
@@ -1820,9 +1931,10 @@ def build_sweep_plan(
                 'ann_max_score': max(scores) if scores else None,
                 'lexical_max_ratio': max_ratio,
                 'lexical_max_ratio_sampled': ratio_sampled,
-                'delete_candidate_ids': loser_ids,
+                'delete_candidate_ids': deletable_ids,
+                'retained_members': retained,
             })
-            delete_candidates.extend(loser_ids)
+            delete_candidates.extend(deletable_ids)
 
     # The THIRD candidate class, run ONCE over the whole list rather than
     # inside the per-category loop above: it does its own
@@ -1859,6 +1971,13 @@ def build_sweep_plan(
         'ann_disclosure': echoed_disclosure,
         'topic_carveout_clusters': len(topic_carveout_groups),
         'topic_carveout_groups': topic_carveout_groups,
+        'retained_carveout': retained_carveout,
+        'child_counts': count_children(memories, categories),
+        'scan_coverage': (
+            {c: dict(stats) for c, stats in scan_coverage.items()}
+            if scan_coverage is not None
+            else None
+        ),
         'liveness_snapshot_recurrence_clusters': len(liveness_groups),
         'liveness_snapshot_recurrence_groups': liveness_groups,
         'liveness_snapshot_disclosure': liveness_disclosure,
@@ -2012,8 +2131,9 @@ def _consolidation_events(
 ) -> list[dict[str, Any]]:
     """Per-consolidation net delta: what accreted after it minus what it absorbed.
 
-    A consolidation event is a record carrying ``canonical: true`` and/or a
-    non-empty ``supersedes``. Its peer set — the population that can accrete
+    A consolidation event is a record whose metadata claims canonical
+    (``canonical_marker.py::is_canonical``) and/or carries a non-empty
+    ``supersedes``. Its peer set — the population that can accrete
     "after" it — is its shared ``metadata.topic`` when it has one, else the
     near-duplicate cluster it belongs to. An event with neither has no
     identifiable peers, so nothing is attributed to it (0), rather than
@@ -2048,7 +2168,7 @@ def _consolidation_events(
     events: list[dict[str, Any]] = []
     for index, record in enumerate(records):
         metadata = record.get('metadata') or {}
-        if not (metadata.get('canonical') or metadata.get('supersedes')):
+        if not (is_canonical(metadata) or metadata.get('supersedes')):
             continue
         topic = topic_by_index[index]
         event_ts = ts_by_index[index]
@@ -2411,7 +2531,7 @@ async def fetch_memories(
     memory: Any,
     project_id: str,
     *,
-    categories: Iterable[str] = _ALL_CATEGORIES,
+    categories: Iterable[str] = ALL_CATEGORIES,
     scan_limit: int = 5000,
     with_vectors: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
@@ -2636,7 +2756,7 @@ def categories_without_own_cutoff(
 def resolve_ann_threshold(
     memory_service: Any,
     override: float | None = None,
-    categories: Iterable[str] = _ALL_CATEGORIES,
+    categories: Iterable[str] = ALL_CATEGORIES,
     *,
     project_id: str | None = None,
 ) -> tuple[dict[str, float], dict[str, int]]:
@@ -2679,7 +2799,7 @@ def resolve_ann_threshold(
             including over an uncalibrated config.
         categories: The categories actually being swept. Nothing is resolved
             for a category that was not asked for. Defaults to
-            ``_ALL_CATEGORIES``, matching :func:`build_sweep_plan`'s default
+            ``ALL_CATEGORIES``, matching :func:`build_sweep_plan`'s default
             for the same argument — an empty DEFAULT would have silently
             disabled the whole ANN path for an omitting caller, with a
             zero-filled disclosure and no ERROR, which is precisely the
@@ -3059,23 +3179,19 @@ async def _run(args: argparse.Namespace) -> int:
     # half-completed, unrecoverable store mutation. Raising keeps it
     # un-maskable by, and un-confusable with, that report-shaped refusal.
     #
-    # ``logging.basicConfig`` already ran above, so this error is emitted.
+    # ``logging.basicConfig`` already ran above, so the guard's refusal record
+    # is emitted.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(operation='audit_duplicate_memories --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'audit_duplicate_memories: --apply NOT started (fail-closed) -- this '
-                "process cannot write mem0's history directory, so each deletion "
-                'would remove a Qdrant point and then fail to write its history, '
-                'irreversibly destroying the non-survivors of every cluster. '
-                'Nothing was scanned and nothing was mutated, and no client was '
-                'opened. Route the deletions through the fused-memory MCP server '
-                '(the unsandboxed owner of the store), or re-run from an '
-                'unsandboxed operator shell. To obtain the audit report safely from '
-                'anywhere, re-run without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='audit_duplicate_memories --apply',
+            logger=logger,
+            extra_detail=(
+                'each deletion would remove a Qdrant point and then fail to write '
+                'its history, irreversibly destroying the non-survivors of every '
+                'cluster. Nothing was scanned and nothing was mutated, and no '
+                'client was opened.'
+            ),
+        )
 
     # De-duplicate while preserving the caller's order. A repeated
     # --categories value would otherwise ingest the same Qdrant points twice
@@ -3156,6 +3272,9 @@ async def _run(args: argparse.Namespace) -> int:
             unevidenced_categories=categories_without_own_cutoff(
                 memory, categories, args.ann_threshold, project_id=args.project_id,
             ),
+            scan_coverage={
+                c: {**scan_stats[c], 'scan_limit': args.scan_limit} for c in categories
+            },
         )
         # stdout is task 3136's report contract — unchanged shape, one JSON doc.
         # A failed stdout stops the run before any side effect.
@@ -3278,7 +3397,7 @@ never set here — see :func:`resolve_ann_threshold`.
 """
 
 
-def _build_parser() -> LoudArgumentParser:
+def build_parser() -> LoudArgumentParser:
     """The CLI surface. Every flag added after the first release is optional.
 
     ``--project-id X`` and ``--project-id X --apply`` — the invocation task
@@ -3308,9 +3427,9 @@ def _build_parser() -> LoudArgumentParser:
         help='Path to fused-memory config file (sets CONFIG_PATH env var)',
     )
     parser.add_argument(
-        '--categories', nargs='+', default=list(_ALL_CATEGORIES),
-        choices=list(_ALL_CATEGORIES),
-        help=f'Mem0 categories to sweep (default: {" ".join(_ALL_CATEGORIES)}). '
+        '--categories', nargs='+', default=list(ALL_CATEGORIES),
+        choices=list(ALL_CATEGORIES),
+        help=f'Mem0 categories to sweep (default: {" ".join(ALL_CATEGORIES)}). '
              'Only Mem0-backed categories are accepted; a Graphiti-backed or '
              'unknown name is rejected at parse time rather than silently '
              'scrolling an empty corpus and reporting a clean sweep.',
@@ -3340,8 +3459,12 @@ def _build_parser() -> LoudArgumentParser:
     return parser
 
 
+# fused-memory/tests/test_memory_eval_runner.py::_PRODUCER_CLI names the parser privately.
+_build_parser = build_parser
+
+
 def main() -> int:
-    args = _build_parser().parse_args()
+    args = build_parser().parse_args()
     return asyncio.run(_run(args))
 
 

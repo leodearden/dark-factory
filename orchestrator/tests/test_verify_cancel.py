@@ -445,7 +445,7 @@ class TestCancelRequestReportsWhatItKilled:
 # ---------------------------------------------------------------------------
 # Task 5301: kill_process_tree — the snapshot -> walk -> SIGKILL -> killpg
 # algorithm shared by cancel_request and the boundary suite's kill_holder_tree
-# (orchestrator/tests/test_laptop_warm_verify_boundary.py::kill_holder_tree).
+# (orchestrator/tests/_verify_boundary_harness.py::kill_holder_tree).
 # Every seam appends to ONE ordered event log, so ordering is asserted, not
 # merely membership.
 # ---------------------------------------------------------------------------

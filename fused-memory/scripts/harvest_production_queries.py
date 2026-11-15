@@ -89,11 +89,12 @@ USAGE
 -----
     uv run --project fused-memory python \
         fused-memory/scripts/harvest_production_queries.py \
-        --journal /home/leo/src/dark-factory/data/reconciliation/write_journal.db \
         --out fused-memory/tests/fixtures/production_query_sample.jsonl
 
-A run from a ``.worktrees/<id>`` lane records the same repo-relative
-journal path as one from the main checkout.
+``--journal`` defaults to the main checkout's
+``data/reconciliation/write_journal.db``, so a run from a
+``.worktrees/<id>`` lane reads, and records repo-relative, the same journal
+as a run from the main checkout.
 """
 from __future__ import annotations
 
@@ -326,8 +327,6 @@ BRIEFING_SEARCH_LIMIT = 5
 
 #: Histogram key used when a search op recorded no usable integer ``limit``.
 UNSPECIFIED_LIMIT = 'unspecified'
-
-DEFAULT_JOURNAL = Path('/home/leo/src/dark-factory/data/reconciliation/write_journal.db')
 
 #: sqlite's busy timeout for the journal connection, in SECONDS.
 #: NAMED after sqlite3's ``connect(timeout=)`` kwarg, which despite that
@@ -769,6 +768,14 @@ def _main_checkout_root() -> Path:
         return here.parents[2]
 
 
+def _default_journal() -> Path:
+    """The live write journal under the main checkout's `/data/`.
+
+    Resolved on call, so importing this module never runs git.
+    """
+    return _main_checkout_root() / 'data' / 'reconciliation' / 'write_journal.db'
+
+
 def _repo_relative(path: Path | str) -> str:
     """`data/reconciliation/write_journal.db`, not somebody's home dir.
 
@@ -1024,7 +1031,10 @@ def read_fixture(path: Path | str) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--journal', default=str(DEFAULT_JOURNAL))
+    parser.add_argument(
+        '--journal', default=str(_default_journal()),
+        help="The write journal to read (default: %(default)s, the main checkout's).",
+    )
     parser.add_argument('--out', required=True)
     parser.add_argument('--tail-sample', type=int, default=DEFAULT_TAIL_SAMPLE)
     parser.add_argument('--tail-top', type=int, default=None)

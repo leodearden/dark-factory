@@ -39,10 +39,7 @@ import logging
 import sys
 from typing import Any
 
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('clear_false_dep_invalidations')
 
@@ -92,23 +89,15 @@ async def repair(
     # a run-wide environment denial into a run-wide refusal instead of six
     # irreversible half-writes plus six log lines.
     if apply:
-        try:
-            assert_store_mutation_allowed(
-                operation='clear_false_dependency_invalidations --apply'
-            )
-        except StoreMutationUnavailable:
-            logger.error(
-                'clear_false_dependency_invalidations: --apply NOT started '
-                "(fail-closed) -- this process cannot write mem0's history "
-                'directory, so each clearing would save the edge and then fail '
-                'to record it, leaving the repair half-applied and untracked. '
-                'No edge was updated and nothing was mutated. Route the '
-                'invalidations through the fused-memory MCP server (the '
-                'unsandboxed owner of the store), or re-run from an '
-                'unsandboxed operator shell. To obtain the repair report '
-                'safely from anywhere, re-run without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='clear_false_dependency_invalidations --apply',
+            logger=logger,
+            extra_detail=(
+                'each clearing would save the edge and then fail to record it, '
+                'leaving the repair half-applied and untracked. No edge was '
+                'updated and nothing was mutated.'
+            ),
+        )
 
     edges_report: list[dict[str, Any]] = []
     cleared = 0

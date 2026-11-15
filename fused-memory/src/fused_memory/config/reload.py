@@ -82,6 +82,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # to stop. _iter_leaves yields the list WHOLE, so it reloads atomically: a
     # half-applied prefix list would admit a caller no operator ever wrote.
     'reconciliation.deterministic_provenance_allowed_agent_prefixes',
+    # Recon transcript archival (task 3972); why green: the schema descriptions.
+    'reconciliation.transcript_archive_enabled',
+    'reconciliation.transcript_archive_root',
     # Write-triage band thresholds (task 3130). Written by
     # scripts/calibrate_write_triage.py --write-config, which derives them from
     # measured similarity distributions -- so hot-reload is what lets a
@@ -178,14 +181,19 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # flow on a running server WITHOUT granting content-amend authority.
     'mem0_update.content_amend_allowed_agent_prefixes',
     'mem0_update.metadata_patch_allowed_agent_prefixes',
+    # Read live per shadow job by services/overreach_shadow.py::OverreachShadow,
+    # whose settings() re-reads memory_service.config.overreach_guard on every
+    # submit and judge call. shadow_enabled is the shadow's kill switch.
+    'overreach_guard.shadow_enabled',
+    'overreach_guard.judge_timeout_seconds',
     # Storm-alarm knobs, read live off the shared config by
     # MemoryService.update_memory and passed INTO StormCounter.record() on every
     # call. That per-call argument is the non-obvious part: the shared
-    # StormCounter (server/storm_counter.py) deliberately does NOT capture
-    # threshold/window in __init__, because a value captured at construction
-    # cannot observe an in-place mutation (see this module's reload-safety
-    # rule) -- which would make these two leaves restart-only while sitting in
-    # this allowlist as if they were green-tier.
+    # StormCounter (shared/src/shared/storm_counter.py) deliberately does NOT
+    # capture threshold/window in __init__, because a value captured at
+    # construction cannot observe an in-place mutation (see this module's
+    # reload-safety rule) -- which would make these two leaves restart-only
+    # while sitting in this allowlist as if they were green-tier.
     'mem0_update.storm_threshold',
     'mem0_update.storm_window_seconds',
     # ensure_entity_node authorization (task 4932). Read live per tool call by
@@ -212,8 +220,9 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Mint-path storm-alarm knobs, read live off the shared config by
     # MemoryService.ensure_entity_node and passed INTO StormCounter.record() on
     # every call, for exactly the reason spelled out for the mem0_update storm
-    # leaves above: the shared StormCounter (server/storm_counter.py)
-    # deliberately does NOT capture threshold/window in __init__.
+    # leaves above: the shared StormCounter
+    # (shared/src/shared/storm_counter.py) deliberately does NOT capture
+    # threshold/window in __init__.
     'entity_mint.storm_threshold',
     'entity_mint.storm_window_seconds',
     # ---- Deterministic auto-consolidation (task 5237, PRD Section 7/11) ----
@@ -279,6 +288,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'link_heal.misfile_share_ceiling',
     'link_heal.corrects_share_ceiling',
     'link_heal.shard_failure_streak',
+    # The scheduled sweep and its calibration gate (task 7159): same consumers.
+    'link_heal.projects',
+    'link_heal.writes',
+    'link_heal.sweep_actions',
+    'link_heal.sweep_window_hours',
+    'link_heal.calibration_kappa_margin',
+    'link_heal.calibration_min_project_items',
 })
 
 

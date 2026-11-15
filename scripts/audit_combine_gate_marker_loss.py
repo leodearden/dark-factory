@@ -3,11 +3,11 @@
 
 READ-ONLY / REPORT-ONLY: this module and its CLI never mutate a task record,
 a ticket record, or a manifest file. Every database connection it opens is
-read-only: the task store goes through ``_task_db_scan.py::connect_ro``, and
-tickets.db through a read-only SQLite URI
-(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
-structurally incapable of writing to the live WAL databases the running
-orchestrator holds open. Manifest YAML on disk is only ever read.
+read-only: the task store goes through
+``shared/src/shared/tasks_db_readonly.py::connect_ro``, and tickets.db through
+a read-only SQLite URI (``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``),
+so the sweep is structurally incapable of writing to the live WAL databases the
+running orchestrator holds open. Manifest YAML on disk is only ever read.
 There is no ``--apply`` flag and no MCP client is ever constructed.
 REMEDIATION IS A SEPARATE, REVIEWED FOLLOW-UP — backfilling a lost key from
 this report is never done by this script (the audit/repair split of tasks
@@ -84,7 +84,6 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
-    connect_ro,
     decode_metadata,
     format_coverage_block,
     format_kv_line,
@@ -96,6 +95,7 @@ from shared.capability_manifest import (
     load_capability_manifest,
 )
 from shared.project_id import project_id_for_root
+from shared.tasks_db_readonly import connect_ro
 
 # The curator verdict this audit is about. The sibling verdict is 'create',
 # which files a NEW task and wipes nothing.
@@ -132,9 +132,9 @@ def load_combine_targets(tasks_db_path: str) -> dict[tuple[str, int], CombineTar
     ``master`` tag, but the schema permits the same numeric id under two tags
     and collapsing them would silently merge two distinct tasks.
 
-    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
-    refusals). Closed in a ``try/finally`` and never a ``with`` block — a
-    sqlite3 ``with`` is a TRANSACTION, not a close.
+    Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro``
+    (read-only; see there for refusals). Closed in a ``try/finally`` and never
+    a ``with`` block — a sqlite3 ``with`` is a TRANSACTION, not a close.
     """
     targets: dict[tuple[str, int], CombineTarget] = {}
     conn = connect_ro(tasks_db_path)

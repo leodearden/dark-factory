@@ -20,8 +20,11 @@ from typing import Any
 
 import pytest
 from review_all_program_fixture import FIXTURE_DIR, FakeStore, running_fake_store
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from shared import task_statuses
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 RUN_ID = 'review-all-fixture-20261019'
 PROJECT_ROOT = '/review-all-fixture/project'
@@ -112,8 +115,30 @@ def test_the_initialized_notification_is_accepted_without_a_body(store: FakeStor
     assert (status, body) == (202, b'')
 
 
-def test_an_undeclared_argument_is_dropped_and_the_call_succeeds(store: FakeStore) -> None:
-    reply = _find(store.url, key='x_finding_run', value=RUN_ID, bogus_arg=1)
+def _refusal(result: dict[str, Any]) -> dict[str, Any]:
+    assert result['isError'] is True
+    return json.loads(result['content'][0]['text'])
+
+
+def test_an_undeclared_argument_is_refused_naming_it(store: FakeStore) -> None:
+    result = _result(
+        store.url, 'find_tasks_by_metadata',
+        project_root=PROJECT_ROOT, key='x_finding_run', value=RUN_ID, bogus_arg=1,
+    )
+    refusal = _refusal(result)
+    assert refusal['code'] == 'unknown_argument'
+    assert [entry['name'] for entry in refusal['unknown']] == ['bogus_arg']
+
+
+def test_an_undeclared_argument_is_refused_before_a_missing_one() -> None:
+    with running_fake_store() as running:
+        refusal = _refusal(_result(running.url, 'get_task', id='101', bogus_arg=1))
+    assert [entry['name'] for entry in refusal['unknown']] == ['bogus_arg']
+
+
+def test_the_pre_guard_server_drops_an_undeclared_argument() -> None:
+    with running_fake_store('--drop-unknown-args') as running:
+        reply = _find(running.url, key='x_finding_run', value=RUN_ID, bogus_arg=1)
     assert _ids(reply) == PROGRAM_IDS
 
 
@@ -177,21 +202,22 @@ def test_pagination_is_honest_and_the_limit_is_clamped(store: FakeStore) -> None
     assert first['tasks_with_key'] == 9
 
 
-def test_without_the_widening_include_rows_is_dropped_unechoed() -> None:
-    with running_fake_store('--no-include-rows') as running:
+def test_without_the_widening_or_the_guard_include_rows_is_dropped_unechoed() -> None:
+    with running_fake_store('--no-include-rows', '--drop-unknown-args') as running:
         reply = _find(running.url, key='x_finding_run', value=RUN_ID, include_rows=True)
     assert 'include_rows' not in reply
     assert all(set(row) == ROW_FIELDS for row in reply['results'])
 
 
-def test_a_rejecting_server_answers_is_error_naming_include_rows() -> None:
-    with running_fake_store('--no-include-rows', '--reject-unknown-args') as running:
+def test_without_the_widening_include_rows_is_refused_as_undeclared() -> None:
+    with running_fake_store('--no-include-rows') as running:
         result = _result(
             running.url, 'find_tasks_by_metadata',
             project_root=PROJECT_ROOT, key='x_finding_run', value=RUN_ID, include_rows=True,
         )
-    assert result['isError'] is True
-    assert 'include_rows' in result['content'][0]['text']
+    refusal = _refusal(result)
+    assert refusal['code'] == 'unknown_argument'
+    assert [entry['name'] for entry in refusal['unknown']] == ['include_rows']
 
 
 def test_the_byte_budget_stops_a_page_and_elides_a_lone_big_row() -> None:

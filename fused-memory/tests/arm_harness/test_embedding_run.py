@@ -413,7 +413,7 @@ async def test_a_refused_reference_copy_is_retried_through_the_runs_sleep(make_w
 
     assert (world.run_dir / 'run.json').exists()
     assert world.log.count('copy') == 3
-    assert world.sleeps.count(graph_copy.COPY_RETRY_INTERVAL_S) == 2
+    assert world.sleeps.count(graph_copy.FORK_POLL_INTERVAL_S) == 2
 
 
 # --- failures that are measurements, not errors -----------------------------------------

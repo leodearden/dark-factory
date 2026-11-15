@@ -73,7 +73,7 @@
 # here, so the A/B knob has one place to be re-argued rather than five.
 # MEASURED on the 5408 tree at `-n 8 --dist loadgroup`: 5333 passed / 2 skipped
 # in 117.71s, exit 0, against the 394-490s serial runs recorded below.
-# shared — the --project this command selects — gains "pytest-xdist>=3.5.0" in
+# shared — the --project this command selects — gains pytest-xdist in
 # its dev group for this, since that is the environment uv resolves the plugin
 # from. shared's OWN addopts stays serial deliberately (it measured FASTER
 # serial); see tests/scripts/test_merge_gate_parallelism_config.py::
@@ -276,7 +276,7 @@ test_command: "uv run --project shared pytest tests/scripts/ scripts/tests/ --tb
 # pyproject.toml, and held there by tests/scripts/test_nonmember_ruff_config.py.
 # Read them there; do not restate them here, or the two will drift and only one
 # copy is guarded.
-lint_command: "uv run --project shared ruff check scripts/"
+lint_command: "uv run --project shared ruff check scripts/ && python3 tests/scripts/raw_envelope_literal_guard.py scripts"
 
 # TYPE IS NOW DECLARED — task 3456 closed the gap task 3445 recorded here.
 #

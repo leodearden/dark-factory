@@ -15,20 +15,28 @@ from legibility import coder, reingestion
 from legibility_carrier_fixtures import (
     CENSUS_MEMORY_CONTEXT_TURN,
     CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD,
+    HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT,
     NON_HUMAN_ORIGIN_IDS,
     NON_HUMAN_ORIGIN_TURNS,
     TRICKLE_CODER_PREAMBLE,
     UNKNOWN_PROVENANCE_TEXT,
+    WATCHER_ROTATION_PROMPT,
     briefing_text,
     coder_judgment,
     json_fenced,
     merger_prompt,
+    pre_5356_replan_prompt,
+    prior_round_adjudicator_prompt,
     recon_run_review_text,
     steward_continuation_prompt,
     user_record,
     with_origin,
 )
-from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT
+from shared.cli_invoke import (
+    CAP_HIT_RESUME_PROMPT,
+    CRASH_RECOVERY_RESUME_PROMPT,
+    PROGRESS_TIMEOUT_RESUME_PROMPT,
+)
 
 # ---------------------------------------------------------------------------
 # is_coder_judgment_payload -- the re-ingestion content classifier's
@@ -129,8 +137,9 @@ class TestReingestedContentClassifier:
         assert reingestion.is_reingested_content(text) is True
 
     @pytest.mark.parametrize(
-        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
-        ids=['usage_limit', 'crash_recovery'],
+        'resume_prompt',
+        [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT, PROGRESS_TIMEOUT_RESUME_PROMPT],
+        ids=['usage_limit', 'crash_recovery', 'progress_timeout'],
     )
     def test_resume_prompt_is_reingested_lockstep(self, resume_prompt):
         # LOCKSTEP, as in test_resume_prompt_is_excluded_lockstep: asserted
@@ -201,8 +210,9 @@ class TestHarnessInjectedTurnFilter:
         )
 
     @pytest.mark.parametrize(
-        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
-        ids=['usage_limit', 'crash_recovery'],
+        'resume_prompt',
+        [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT, PROGRESS_TIMEOUT_RESUME_PROMPT],
+        ids=['usage_limit', 'crash_recovery', 'progress_timeout'],
     )
     def test_resume_prompt_is_excluded_lockstep(self, resume_prompt):
         # LOCKSTEP: asserted against each canonical constant, not a
@@ -233,6 +243,22 @@ class TestHarnessInjectedTurnFilter:
         # origin and no isMeta, so provenance cannot exclude them; only this
         # text rule can.
         assert reingestion.is_harness_injected_turn(steward_continuation_prompt(tmp_path)) is True
+
+    def test_prior_round_adjudicator_prompt_is_excluded_lockstep(self):
+        # LOCKSTEP via the REAL builder. Like the steward's, the sighted
+        # records carry no origin and no isMeta, so only this text rule sees them.
+        assert reingestion.is_harness_injected_turn(prior_round_adjudicator_prompt()) is True
+
+    def test_pre_5356_replan_prompt_is_excluded(self):
+        # A RETIRED shape held for the archived corpus, so it is restated, not built.
+        assert reingestion.is_harness_injected_turn(pre_5356_replan_prompt()) is True
+
+    def test_watcher_rotation_prompt_is_excluded(self):
+        assert reingestion.is_harness_injected_turn(WATCHER_ROTATION_PROMPT) is True
+
+    @pytest.mark.parametrize('text', HUMAN_TURNS_NAMING_AN_INJECTED_PROMPT)
+    def test_human_turn_naming_an_injected_prompt_is_retained(self, text):
+        assert reingestion.is_harness_injected_turn(text) is False
 
     def test_human_turn_quoting_the_census_sighting_is_retained(self):
         assert reingestion.is_harness_injected_turn(CENSUS_QUOTE_OF_THE_ESCALATION_PAYLOAD) is False

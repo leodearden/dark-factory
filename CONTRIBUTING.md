@@ -107,38 +107,46 @@ Other top-level dirs:
 - **`dashboard/`** — web UI for task/escalation state.
 - **`scripts/`** — operator and CI helper scripts (systemd unit templates,
   watchdog, host setup).
-- **`hooks/`** — git hooks (`pre-commit`, `pre-merge-commit`, see §4-§5),
-  install via `hooks/setup.sh`.
+- **`hooks/`** — git hooks (`pre-commit`, `pre-merge-commit`,
+  `reference-transaction`, see §4-§5), install via `hooks/setup.sh`.
 
 **Where repo-wide gates live.** There are two homes, chosen by what the gate
-reads. `shared/tests/` hosts the whole-first-party-tree *source* gates: every
-gate that walks the Python tree through the session-scoped `first_party_tree`
-fixture (`shared/tests/conftest.py`), which parses
-`shared/tests/silent_fallthrough_scan.py::SCOPE_ROOTS` once per session, at
-collection time (`shared/tests/session_prebuild.py`). A new gate over that
-tree takes the fixture instead of growing a private parse;
-`shared/tests/test_tree_scan_sharing.py::TestNoRegrownWholeTreeParse`
-ratchets this. They do not live in `tests/scripts/` because two module
-configs collect that directory, `scripts/orchestrator.yaml` under `-n auto`:
-every xdist worker would pay the parse, whose CPU and resident-memory cost
-`silent_fallthrough_scan.py::parse_first_party_tree`'s docstring measures,
-and a full-breadth merge verify would pay it twice. `tests/scripts/` hosts the
-repo-level sweeps that bring their own reader — config, doc, systemd-unit and
-toolchain parity, and `tests/scripts/test_atomic_write_regrowth.py`, whose
-`_SRC_TREES` is not `SCOPE_ROOTS`.
+reads. `tests/repo_guards/` hosts every guard whose subject is the committed
+tree outside its own module: the whole-first-party-tree *source* gates, and the
+drift checks and parity pins that read a sibling tree. A workspace member's
+verify-cache key covers only that member, its closure and root-level blobs
+(`orchestrator/src/orchestrator/verify_cache/keys.py::unit_input_paths`), so
+such a guard inside a member suite could pass on a stale cached result. The
+module config declares `verify_cache: never` instead, so every merge gate runs
+it in full; `tests/scripts/test_repo_guards_module_placement.py` pins this
+placement from outside the module. At task role a leg runs only its own
+family, so a diff confined to one member does not run these gates
+(`docs/task-role-pytest-floor.md`).
 
-The consequence is accepted deliberately: `shared/tests/` is not a
-self-contained package suite. It presumes a full dark-factory checkout, and
-nothing runs it any other way, because `dark-factory-shared` is consumed only
-as a `{ workspace = true }` member. So these gates **hard-fail, never skip**,
-when a tree they scan is absent: `iter_first_party_files` raises
-`ScopeRootsMissingError` naming every missing root (pinned by
-`shared/tests/test_tree_scan_sharing.py::TestEveryScopeRootIsRequired`), and
-in the other direction
-`shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership::test_shared_tree_spans_every_production_src_root`
+Every gate there that walks the Python tree takes the session-scoped
+`first_party_tree` fixture (`tests/repo_guards/conftest.py`), which parses
+`tests/repo_guards/silent_fallthrough_scan.py::SCOPE_ROOTS` once per session,
+at collection time (`tests/repo_guards/session_prebuild.py`). A new gate over
+that tree takes the fixture instead of growing a private parse;
+`tests/repo_guards/test_tree_scan_sharing.py::TestNoRegrownWholeTreeParse`
+ratchets this. The module's `test_command` is serial, with no `-n auto`: every
+xdist worker collects every item and would pay the parse, whose CPU and
+resident-memory cost `silent_fallthrough_scan.py::parse_first_party_tree`'s
+docstring measures. `tests/scripts/` hosts the repo-level sweeps that bring
+their own reader — config, doc, systemd-unit and toolchain parity, and
+`tests/scripts/test_atomic_write_regrowth.py`, whose `_SRC_TREES` is not
+`SCOPE_ROOTS`. Like `tests/repo_guards/`, it belongs to no workspace member.
+
+These gates presume a full dark-factory checkout, and nothing runs them any
+other way. So they **hard-fail, never skip**, when a tree they scan is absent:
+`iter_first_party_files` raises `ScopeRootsMissingError` naming every missing
+root (pinned by
+`tests/repo_guards/test_tree_scan_sharing.py::TestEveryScopeRootIsRequired`),
+and in the other direction
+`tests/repo_guards/test_auth_failed_parser_ownership.py::TestSingleResetsParserOwnership::test_shared_tree_spans_every_production_src_root`
 reds when a new `<pkg>/src` is missing from `SCOPE_ROOTS`. A skip is a green
 run over less code — the silent fallthrough the flagship gate exists to catch
-— so do not add one to make the suite standalone.
+— so do not add one.
 
 An allowlist keyed on a sibling's `(path, qualname)` goes red when you rename
 an allowlisted function in `orchestrator/` or `fused-memory/`. That follows
@@ -201,7 +209,7 @@ one prior attempt at a class-level citation guard (task 4240) burned
 $35.97 over 18 `recovery_vetoed` events without landing. Where a line
 number *is* load-bearing — a gate key, or guard prose an assertion pins —
 it gets fixed structurally instead; see task 1910's re-key of
-`shared/tests/silent_fallthrough_allowlist.py` to
+`tests/repo_guards/silent_fallthrough_allowlist.py` to
 `(relpath, qualname, content_hash)`, which notes that keys "omit `lineno`
 entirely".
 
@@ -284,7 +292,9 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   - `bare-dataclass-double` — an unspecced `MagicMock` shaped like a
     registered stdlib dataclass (`VerifyResult` today), flagged in **any**
     syntactic position including `return MagicMock(...)`. Remedy:
-    `_fake_verify_result(...)` or `MagicMock(spec=VerifyResult)`.
+    `fake_verify_result(...)` (from
+    `orchestrator/tests/_verify_result_doubles.py`) or
+    `MagicMock(spec=VerifyResult)`.
     This rule has **no baseline** and is hot for every scanned file — the
     transitional debt list was retired once its 95 grandfathered sites were
     migrated (task 4354), so the per-site `# noqa: bare-dataclass-double —
@@ -294,22 +304,33 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     zero-argument `.wait()` barrier on any receiver, reached either through a
     bare `asyncio.wait_for(...)` or carrying a raw numeric literal bound
     (`timeout=`, `max_wall_s=`, or `asyncio.wait_for`'s positional timeout).
-    Remedy: `wait_responsive(...)` with a descriptive `label=`, and a bound
+    The same deadline written two more ways is flagged too: an
+    `asyncio.timeout(...)`/`asyncio.timeout_at(...)` block wrapping a poll or
+    a load-bearing await, and an async poll loop whose comparison reads a
+    wall clock directly (`loop.time() < deadline`,
+    `deadline - time.monotonic() > 0` and the like); a clock read held in a
+    variable and compared later is not seen yet.
+    Remedy: `wait_responsive(...)` with a descriptive `label=` — or, for a
+    poll, `poll_responsive(predicate, ...)` from
+    `orchestrator/tests/_poll_responsive.py` — and a bound
     derived from `MERGE_RESULT_TIMEOUT` rather than a written number — a
     deadline expiry on such a wait fails a test whose awaited event did
     happen. Both legs are pure **shape**: no receiver name, no class list
     and no budget threshold decides which sites are scanned, and the teardown
-    join in `_stop_worker` is exempt structurally (a bare `ast.Name` target).
+    join in `stop_merge_worker` (`orchestrator/tests/_merge_worker_drive.py`)
+    is exempt structurally (a bare `ast.Name` target).
     `wait_responsive` and `MERGE_RESULT_TIMEOUT` live in
-    `orchestrator/tests/_orch_helpers.py` and are importable only under
-    `orchestrator/tests`, so in any other package the
+    `orchestrator/tests/_orch_helpers.py`, and like `poll_responsive` are
+    importable only under `orchestrator/tests`, so in any other package the
     per-site `# noqa: wall-clock-deadline — <reason>` is the remedy. See the
-    script's Rule C docstring. Pre-existing debt, across four packages, is
+    script's Rule C docstring. Pre-existing debt, across five packages, is
     grandfathered in the script's `_WALL_CLOCK_DEADLINE_DEBT` baseline — the
     last surviving baseline, and **shrink-only** and opt-out, so a new
-    offending file fails the gate by default. It is a **budget** rather than a bare list: a listed file is
-    silent at or under its recorded count and reports its overrun above it, so
-    a number may only be lowered, never raised.
+    offending file fails the gate by default. It is an **exact budget** rather than a bare list: a listed file is
+    silent only at EXACTLY its recorded count. Above it the checker reports the
+    overrun; below it the checker reports the slack, naming the one-line edit,
+    in the owning package's own `lint_command`. So a number must be lowered in
+    the same change that removes a site, and is never raised.
 - **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
   of the toolchain** and is not enforced anywhere — not in `hooks/pre-commit`,
   not in any `orchestrator.yaml` `lint_command`, not in verify. There is no CI.
@@ -395,7 +416,14 @@ name (`task/<id>`, `carry/<id>`, or a name ending `-<id>`) or one an earlier com
 on the branch cites (`fix(<id>): ...` or `task <id>`) -- and its reason may not
 be blank; the commit being made cannot cite itself. The baseline itself merges through a structured 3-way driver (installed
 by `scripts/setup-host.sh` step 9), so two branches moving different code no
-longer conflict on it.
+longer conflict on it. A rebase or a clean merge skips pre-commit, so
+`hooks/reference-transaction` runs `scripts/check_ratchet_advance.py` on every
+move of `main`, the merge worker's `git update-ref` included: it refuses a move
+whose baseline rises over the merge base's beyond what the entry files the move
+adds cover. The merge lane reports that refusal as "CAS retry limit
+exhausted", with the `ratchet advance gate:` lines in the orchestrator log
+(task 6892 tracks classifying it); the remedy is to record the raise on the
+branch, against main's baseline, with the flags above.
 
 Do this **before** `merge_request`/`/merge-queue`, not after — a red
 post-merge verify blocks or reverts the merge, which is more expensive than
@@ -405,17 +433,22 @@ catching it locally.
 (installed via `hooks/setup.sh`, which points `core.hooksPath` at `hooks/`):
 it strips any staged `.task/` files (see §8), then on `main` runs `ruff
 check`, the asyncmock/bare-MagicMock style checks on staged test files, and
-**pyright up to 8×** (once per touched package under `PYRIGHT_PACKAGES` —
-the same eight members the merge gate type-checks — or across all of them if
-the change touches a shared dependency like `shared` or `escalation`). That stage is path-filtered since task 2551: a commit
-staging no `.py` files skips pyright entirely and finishes in seconds
-(`pre-commit: pyright skipped (no Python changes)`), and a staged `.py`
-outside every one of those prefixes (e.g. `scripts/`, a root-level
-`conftest.py`) skips it too — silently, with no such line printed. A
-commit that does stage Python under a configured package can comfortably
-exceed two minutes — give those a timeout of at least `300000`ms (or run
-detached via `setsid` and poll) rather than letting a default 2-minute
-timeout kill it mid-hook; the two skip cases above need no bumped timeout.
+**the merge gate's own checks for what the commit stages** (task 8531, via
+`scripts/hook_module_checks.py`). Each registered module that a staged `.py`
+maps to runs its `lint_command` and `type_check_command` verbatim. A staged
+`.py` under `shared` or `escalation` runs the type check of every module. A
+staged repo-root `.py` (`conftest.py`, `df_pytest_isolation.py`), which no
+module can own, runs the hook's own `root:type` unit, pyright over those files
+(`scripts/hook_module_checks.py::root_units`); a root module other than
+`conftest.py` also runs every module's type check, like `shared`/`escalation`. A
+staged file under `plans/`, `docs/` or `review/`, or a `*.yaml`/`*.json`/`*.md`
+outside a workspace package, runs the `scripts/merge_screen.yaml` screen. A
+commit that maps to none of these prints `pre-commit: merge-gate checks
+skipped (no staged file maps to a module or the screen) in Ns` and finishes
+in seconds. A commit that runs a module type check can take minutes. Give it
+a timeout of at least `300000`ms, or run it detached via `setsid` and poll,
+rather than letting a default 2-minute timeout kill it mid-hook; the skip
+case needs no bumped timeout.
 Never `--no-verify` this hook to skip pyright/ruff on a code change; the
 two narrow documented exceptions are the *pre-merge-commit* emergency
 bypass (§5) and a **docs-only** commit landing under index-lock contention
@@ -495,7 +528,7 @@ Every PRD authored or decomposed through `/prd` runs a fixed gate sequence
 `design-invariants.md` also gates `/review` phase 2's cross-module audit —
 it's the single normative copy; don't restate them elsewhere (a restatement
 here went stale once already — task 3802, and
-`scripts/tests/test_design_invariants_consistency.py` now fails if a copy
+`tests/repo_guards/test_design_invariants_consistency.py` now fails if a copy
 comes back; citing one invariant by name is still fine). If you're hand-writing a task (not going through
 `/prd`) for a nontrivial design change, walk it against the same checklist
 yourself before filing.

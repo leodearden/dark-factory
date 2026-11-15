@@ -601,7 +601,7 @@ class TestDriftCheckEnvDivergenceWiring:
         fake_remote.name = 'laptop'
         fake_remote.is_local = False
         fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
-        fake_remote.env_probe_run = MagicMock(return_value=remote_seam)
+        fake_remote.env_probe_run = AsyncMock(return_value=remote_seam)
         allocator = HostAllocator([fake_remote], quarantine=set())
 
         local_seam = _make_env_probe_seam(_LOCAL_PROBE_OUTPUT)
@@ -722,7 +722,7 @@ class TestDriftCheckEnvDivergenceWiring:
         fake_remote.name = 'laptop'
         fake_remote.is_local = False
         fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
-        fake_remote.env_probe_run = MagicMock(
+        fake_remote.env_probe_run = AsyncMock(
             return_value=_make_env_probe_seam(_REMOTE_PROBE_OUTPUT_SKEWED)
         )
         allocator = HostAllocator([fake_remote], quarantine=set())
@@ -912,7 +912,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         fake_remote.name = 'laptop'
         fake_remote.is_local = False
         fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
-        fake_remote.env_probe_run = MagicMock(
+        fake_remote.env_probe_run = AsyncMock(
             return_value=_make_env_probe_seam(_REMOTE_PROBE_OUTPUT_MATCHING)
         )
         allocator = HostAllocator([fake_remote], quarantine=set())
@@ -970,7 +970,7 @@ class TestEnvCheckCannotBreakVerdictDriftCheck:
         fake_remote.name = 'laptop'
         fake_remote.is_local = False
         fake_remote.run_merge_verify = AsyncMock(return_value=pass_result)
-        fake_remote.env_probe_run = MagicMock(
+        fake_remote.env_probe_run = AsyncMock(
             return_value=_make_env_probe_seam(_REMOTE_PROBE_OUTPUT_MATCHING)
         )
         allocator = HostAllocator([fake_remote], quarantine=set())

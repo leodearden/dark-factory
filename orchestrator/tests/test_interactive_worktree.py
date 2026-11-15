@@ -19,8 +19,8 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from _packaged_defaults import load_packaged_defaults
 
-from orchestrator import config as orchestrator_config
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import (
@@ -124,8 +124,8 @@ class TestInteractiveWorktreeConfigDefaults:
         )
 
     def test_packaged_defaults_carry_knobs(self) -> None:
-        """orchestrator.config._load_defaults()['git'] carries the same three knobs."""
-        defaults = orchestrator_config._load_defaults()
+        """load_packaged_defaults()['git'] carries the same three knobs."""
+        defaults = load_packaged_defaults()
         git_defaults = defaults['git']
         assert git_defaults['iact_prefix'] == '_iact-', (
             f"expected packaged defaults.yaml git.iact_prefix == '_iact-', "

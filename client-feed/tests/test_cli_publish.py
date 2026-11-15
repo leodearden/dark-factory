@@ -17,7 +17,8 @@ from typing import Any
 import pytest
 import yaml
 from _git_repo import Repo, make_repo
-from _stores import RunsDb, TasksDb
+from _in_dir import write_engagement
+from _stores import EscalationQueueDir, RunsDb, TasksDb
 
 from client_feed.cli import main
 from client_feed.contract import (
@@ -77,6 +78,7 @@ def root(tmp_path: Path) -> Path:
     TasksDb.create(repo.root).add(
         7, title='Ship /home/leo/x', status='done', updated_at='2026-10-21T09:00:00.000Z'
     )
+    EscalationQueueDir.create(repo.root)
     runs = RunsDb.create(repo.root)
     runs.emit('phase_enter', at=at(-25), task_id=7, phase='merge')
     runs.emit(
@@ -94,6 +96,7 @@ def out_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def config(tmp_path: Path, root: Path, out_dir: Path) -> Path:
+    write_engagement(tmp_path / 'in', project_id='acme')
     return write_config(tmp_path, root)
 
 
@@ -124,6 +127,19 @@ def test_snapshot_publishes_one_pass_and_prints_its_report(
     assert report.degraded == ()
     assert (out_dir / FEED_FILENAME).is_file() and (out_dir / STATE_FILENAME).is_file()
     assert validates(capsys, out_dir)
+
+
+def test_snapshot_of_an_engagement_for_another_project_exits_1_naming_both_ids(
+    tmp_path: Path, config: Path, out_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    write_engagement(tmp_path / 'in', project_id='other')
+
+    code, out, err = cli(capsys, 'snapshot', '--config', str(config))
+
+    assert (code, out) == (1, '')
+    assert "'other'" in err
+    assert "'acme'" in err
+    assert not (out_dir / FEED_FILENAME).exists()
 
 
 def test_every_out_file_is_group_readable_under_any_umask_and_takes_the_setgid_group(
@@ -323,6 +339,7 @@ def test_a_snapshot_of_this_checkout_is_a_valid_feed_that_leaks_nothing(
         updated_at='2026-10-21T09:30:00.000Z', metadata={'prd_path': CLIENT_FEED_PRD},
     )
     RunsDb.create(repo.root).emit('phase_enter', at=at(0), task_id=2, phase='implement')
+    EscalationQueueDir.create(repo.root)
     visible = ['*/src/**', '*/tests/**']
     (tmp_path / 'out').mkdir()
     config = write_config(tmp_path, repo.root, visible_globs=visible)

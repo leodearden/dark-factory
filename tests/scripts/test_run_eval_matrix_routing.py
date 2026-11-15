@@ -15,6 +15,8 @@ script lives in test_quiet_grep_sweep.py.
 
 from __future__ import annotations
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shell_sections import (
     REPO_ROOT,
     run_with_preamble,
@@ -22,6 +24,8 @@ from shell_sections import (
     stub_bin_dir,
     write_stub,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 RUN_EVAL_MATRIX_PATH = REPO_ROOT / "scripts" / "run_eval_matrix.sh"
 

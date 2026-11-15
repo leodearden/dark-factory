@@ -8,7 +8,9 @@ Both redirect ``/mcp/`` to ``/mcp`` with a 307 and refuse a POST whose Accept
 lacks the needed media types with a 406. ``tools/call`` can be scripted to fail
 in each way a client must not mistake for success (:class:`StubAnswer`), and
 its first *unavailable_tool_calls* requests can be answered 503, as a gateway
-answers while the server behind it restarts.
+answers while the server behind it restarts. A *tools* handler can answer each
+OK ``tools/call`` by tool name and arguments, so a fake backend is served over
+the socket.
 
 Real sockets rather than patching a client's modules: the session header, path
 and Accept a client sends are wire facts the server observes in
@@ -29,7 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import MappingProxyType, TracebackType
 from typing import Any
 
-__all__ = ['RecordedRequest', 'StubAnswer', 'StubMcpServer']
+__all__ = ['RecordedRequest', 'StubAnswer', 'StubMcpServer', 'ToolHandler']
 
 _ENDPOINT = '/mcp'
 _INVALID_REQUEST = -32600
@@ -74,6 +76,22 @@ def _rpc_error(status: int, message: str, code: int = _INVALID_REQUEST) -> _Repl
     return _Reply(status, json.dumps(body).encode(), 'application/json')
 
 
+def _tool_ok(payload_text: str) -> dict:
+    return {
+        'content': [{'type': 'text', 'text': payload_text}],
+        'structuredContent': json.loads(payload_text),
+        'isError': False,
+    }
+
+
+def _tool_error(text: str) -> dict:
+    return {'content': [{'type': 'text', 'text': text}], 'isError': True}
+
+
+ToolHandler = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
+"""``handler(name, arguments)`` answers one ``tools/call`` with its payload."""
+
+
 def _accepted_media(accept: str) -> tuple[bool, bool]:
     types = [part.split(';')[0].strip().lower() for part in accept.split(',')]
     return 'application/json' in types, 'text/event-stream' in types
@@ -89,11 +107,13 @@ class StubMcpServer:
         answer: StubAnswer = StubAnswer.OK,
         payload: Mapping[str, Any] = _DEFAULT_PAYLOAD,
         unavailable_tool_calls: int = 0,
+        tools: ToolHandler | None = None,
     ) -> None:
         self._stateful = stateful
         self._answer = answer
         self._unavailable_left = unavailable_tool_calls
         self._payload_text = json.dumps(dict(payload))
+        self._tools = tools
         self._lock = threading.Lock()
         self._requests: list[RecordedRequest] = []
         self._minted: list[str] = []
@@ -236,7 +256,7 @@ class StubMcpServer:
         if method == 'initialize':
             return self._frame(message, self._initialize_result(message), session_id)
         if method == 'tools/call':
-            return self._frame(message, self._tool_result(), session_id)
+            return self._frame(message, self._tool_result(message.get('params', {})), session_id)
         if method == 'tools/list':
             return self._frame(message, {'tools': []}, session_id)
         error = {'code': _METHOD_NOT_FOUND, 'message': 'Method not found'}
@@ -246,8 +266,7 @@ class StubMcpServer:
         match self._answer:
             case StubAnswer.IS_ERROR:
                 name = message.get('params', {}).get('name')
-                text = f'Error calling tool {name!r}: scripted stub failure'
-                result = {'content': [{'type': 'text', 'text': text}], 'isError': True}
+                result = _tool_error(f'Error calling tool {name!r}: scripted stub failure')
                 return self._frame(message, result, session_id)
             case StubAnswer.NON_JSON_TEXT:
                 result = {'content': [{'type': 'text', 'text': 'done, but not JSON'}], 'isError': False}
@@ -271,12 +290,15 @@ class StubMcpServer:
             'serverInfo': {'name': 'shared-testing-mcp-stub', 'version': '0'},
         }
 
-    def _tool_result(self) -> dict:
-        return {
-            'content': [{'type': 'text', 'text': self._payload_text}],
-            'structuredContent': json.loads(self._payload_text),
-            'isError': False,
-        }
+    def _tool_result(self, params: Mapping[str, Any]) -> dict:
+        if self._tools is None:
+            return _tool_ok(self._payload_text)
+        name = params.get('name', '')
+        try:
+            answer = self._tools(name, params.get('arguments', {}))
+            return _tool_ok(json.dumps(dict(answer)))
+        except Exception as exc:
+            return _tool_error(f'Error calling tool {name!r}: {type(exc).__name__}: {exc}')
 
     def _frame(
         self,

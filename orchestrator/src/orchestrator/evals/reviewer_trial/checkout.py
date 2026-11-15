@@ -9,7 +9,6 @@ parallel panels share no mutable git state.
 
 from __future__ import annotations
 
-import shutil
 import tempfile
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -19,6 +18,7 @@ from pathlib import Path
 from shared.git_async import GitResult, run_git
 
 from orchestrator.evals.reviewer_trial.corpus import DEFAULT_FIXTURE_CWD, CorpusDiff
+from orchestrator.tree_removal import remove_tree
 
 _SCRATCH_COMMITTER = (
     '-c', 'user.name=reviewer-trial',
@@ -88,7 +88,7 @@ async def fixture_checkout(
     try:
         yield await _materialise(diff, scratch / 'clone', git_timeout_secs)
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+        await remove_tree(scratch, ignore_errors=True)
 
 
 async def _materialise(diff: CorpusDiff, clone: Path, timeout: float) -> FixtureCheckout:

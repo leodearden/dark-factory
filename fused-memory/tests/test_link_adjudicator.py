@@ -19,6 +19,7 @@ from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers
 from shared.neutral_cwd import neutral_cli_cwd
 
 from fused_memory.config.schema import LinkHealConfig
+from fused_memory.maintenance import link_adjudicator
 from fused_memory.maintenance.link_adjudicator import (
     RATER_BRIEF_PATH,
     TRUNCATION_MARKER,
@@ -34,6 +35,8 @@ from fused_memory.maintenance.link_adjudicator import (
     adjudicate_links,
     cap_text,
     configured_adjudicator,
+    prompt_sha256,
+    render_system_prompt,
 )
 from fused_memory.maintenance.link_heal import (
     AGREEING_VERDICTS,
@@ -378,8 +381,41 @@ class TestShardFailureStorm:
         assert storm['model'] == 'opus'
         assert storm['shards_total'] == 4
         assert storm['shards_failed'] == 2
+        assert set(storm) == {
+            'count', 'threshold', 'labels', 'shards_failed', 'model', 'shards_total',
+        }
         assert _failures(verdicts)[4:] == [AdjudicationFailure.NOT_ATTEMPTED] * 4
         assert all(verdict.verdict is None for verdict in verdicts)
+
+    @pytest.mark.asyncio
+    async def test_the_storm_names_only_the_current_runs_failures(self):
+        """cli-fail, success, parse-fail, parse-fail: the success ended the first
+        run, so the storm's labels are the second run's alone, while
+        shards_failed counts every failed shard of the call."""
+        def mixed(call: int, shard: Shard) -> ShardReply:
+            if call == 0:
+                return ShardReply(success=False, detail='down')
+            if call == 1:
+                return _valid(call, shard)
+            return ShardReply(success=True, structured_output=[])
+
+        storms: list[Mapping[str, Any]] = []
+        ask = FakeAsker(mixed)
+
+        verdicts = await _adjudicate(
+            _pairs(10), ask, failure_streak=2, on_failure_storm=storms.append,
+        )
+
+        assert len(ask.shards) == 4
+        (storm,) = storms
+        assert storm['labels'] == ['parse_failure']
+        assert storm['count'] == 2
+        assert storm['shards_failed'] == 3
+        not_attempted = verdicts[8:]
+        assert _failures(not_attempted) == [AdjudicationFailure.NOT_ATTEMPTED] * 2
+        assert {verdict.detail for verdict in not_attempted} == {
+            'adjudication stopped after 3 failed shards',
+        }
 
     @pytest.mark.asyncio
     async def test_a_success_between_failures_resets_the_streak(self):
@@ -497,6 +533,19 @@ class TestClaudeShardAsker:
         assert reply.cost_usd == 0.1
 
     @pytest.mark.asyncio
+    async def test_a_given_brief_text_is_used_and_the_path_never_read(self, tmp_path):
+        invoke = FakeInvoke(_ok())
+        ask = ClaudeShardAsker(
+            brief_text=FIXED_BRIEF, brief_path=tmp_path / 'missing.md', invoke=invoke,
+        )
+
+        reply = await ask(_SHARD)
+
+        assert reply.success is True
+        (call,) = invoke.calls
+        assert call['system_prompt'] == render_system_prompt(FIXED_BRIEF)
+
+    @pytest.mark.asyncio
     async def test_an_invoke_that_raises_is_a_failed_reply(self, brief):
         invoke = FakeInvoke(RuntimeError('all accounts capped'))
 
@@ -506,7 +555,80 @@ class TestClaudeShardAsker:
         assert reply.detail == 'RuntimeError: all accounts capped'
 
 
+FIXED_BRIEF = '# A fixed brief\n\nJudge each pair, once.\n'
+
+
+class TestPromptVersion:
+    """The prompt version names everything besides the model that decides what the
+    model is asked: the rendered system prompt, and the cap its pair texts are cut to."""
+
+    def test_it_is_a_sha256(self):
+        assert re.fullmatch(r'[0-9a-f]{64}', prompt_sha256(FIXED_BRIEF, 4000))
+
+    def test_it_is_stable_for_a_brief_and_moves_with_it(self):
+        assert prompt_sha256(FIXED_BRIEF, 4000) == prompt_sha256(FIXED_BRIEF, 4000)
+        assert prompt_sha256(FIXED_BRIEF, 4000) != prompt_sha256(
+            FIXED_BRIEF + 'One more rule.\n', 4000,
+        )
+
+    def test_it_moves_with_the_field_cap(self):
+        assert prompt_sha256(FIXED_BRIEF, 4000) != prompt_sha256(FIXED_BRIEF, 2000)
+
+    def test_a_configured_adjudicator_names_the_version_of_its_own_field_cap(self):
+        config = LinkHealConfig(field_chars=1234)
+
+        adjudicate = configured_adjudicator(config, ask=FakeAsker(), brief_text=FIXED_BRIEF)
+
+        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF, 1234)
+
+
 class TestConfiguredAdjudicator:
+    @pytest.mark.asyncio
+    async def test_a_given_brief_names_the_model_and_prompt_every_shard_carries(self, tmp_path):
+        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+        invoke = FakeInvoke(_ok(structured_output=answer))
+        ask = ClaudeShardAsker(
+            brief_text=FIXED_BRIEF, brief_path=tmp_path / 'missing.md', invoke=invoke,
+        )
+        adjudicate = configured_adjudicator(
+            LinkHealConfig(adjudicator_model='haiku', shard_size=1),
+            ask=ask, brief_text=FIXED_BRIEF,
+        )
+
+        verdicts = await adjudicate(_pairs(2))
+
+        assert adjudicate.model == 'haiku'
+        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF, LinkHealConfig().field_chars)
+        assert [verdict.verdict for verdict in verdicts] == [Verdict.SAME, Verdict.SAME]
+        assert [call['system_prompt'] for call in invoke.calls] == [
+            render_system_prompt(FIXED_BRIEF),
+        ] * 2
+
+    @pytest.mark.asyncio
+    async def test_without_a_brief_text_the_brief_is_read_once_at_construction(self, tmp_path):
+        brief = tmp_path / 'brief.md'
+        brief.write_text(FIXED_BRIEF, encoding='utf-8')
+        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+        invoke = FakeInvoke(_ok(structured_output=answer))
+        config = LinkHealConfig(shard_size=1)
+        adjudicate = configured_adjudicator(config, brief_path=brief, invoke=invoke)
+        brief.unlink()
+
+        verdicts = await adjudicate(_pairs(2))
+
+        assert [verdict.verdict for verdict in verdicts] == [Verdict.SAME, Verdict.SAME]
+        assert [call['system_prompt'] for call in invoke.calls] == [
+            render_system_prompt(FIXED_BRIEF),
+        ] * 2
+        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF, config.field_chars)
+        assert adjudicate.model == config.adjudicator_model
+
+    def test_by_default_the_brief_is_the_rater_brief(self):
+        adjudicate = configured_adjudicator(LinkHealConfig(), ask=FakeAsker())
+
+        brief = link_adjudicator.RATER_BRIEF_PATH.read_text(encoding='utf-8')
+        assert adjudicate.prompt_sha256 == prompt_sha256(brief, LinkHealConfig().field_chars)
+
     @pytest.mark.asyncio
     async def test_the_config_leaves_bind_model_sharding_cap_and_streak(self):
         ask = FakeAsker()

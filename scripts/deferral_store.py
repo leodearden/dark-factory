@@ -16,7 +16,7 @@ from types import MappingProxyType
 from typing import Any, Final, TypeVar
 
 from dashboard.config import DEFAULT_FUSED_MEMORY_URLS
-from legibility import census_trigger
+from shared.mcp_session import SyncMcpSession
 from shared.project_layout import tasks_db
 from shared.task_deferral import (
     Deferral,
@@ -247,8 +247,8 @@ def _root_argument(root: Path) -> str:
 
 @dataclass(frozen=True)
 class DeferralStore:
-    """The deferral reads over a fused-memory MCP endpoint at *url*, posting through
-    ``post(url, tool_name, arguments, *, timeout)``."""
+    """The deferral reads over the fused-memory MCP server at the base *url*, posting
+    through ``post(url, tool_name, arguments, *, timeout)``."""
 
     url: str
     post: Callable[..., Any]
@@ -328,6 +328,11 @@ def add_store_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _call_tool(base_url: str, tool: str, arguments: dict[str, Any], *, timeout: float) -> dict:
+    with SyncMcpSession(base_url, client_name='deferral-store', timeout=timeout) as session:
+        return session.call_tool(tool, arguments)
+
+
 def store_from_args(args: argparse.Namespace) -> DeferralStore:
     base = args.fused_memory_url or os.environ.get(FUSED_MEMORY_URL_ENV, DEFAULT_FUSED_MEMORY_URLS[0])
-    return DeferralStore(url=f'{base.rstrip("/")}/mcp', post=census_trigger.post_mcp_tool_call)
+    return DeferralStore(url=base.rstrip('/'), post=_call_tool)

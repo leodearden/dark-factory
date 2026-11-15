@@ -17,11 +17,12 @@ from dataclasses import dataclass, replace
 from enum import Enum, StrEnum
 from typing import Literal
 
+from shared.whole_tree_guard_family import is_whole_tree_guard_module
+
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.pytest_markers import (
     addopts_tokens,
     deselecting_expression_for_targets,
-    is_whole_tree_guard_module,
     locate_pytest_config,
 )
 from orchestrator.verify_cmd import (
@@ -37,6 +38,7 @@ from orchestrator.verify_cmd import (
     split_chain_tail,
     strip_cwd,
 )
+from orchestrator.verify_evidence import Leg
 
 logger = logging.getLogger(__name__)
 
@@ -1469,6 +1471,50 @@ def derive_verify_plan(
                 ))
         return VerifyPlan(runs=tuple(runs))
     return VerifyPlan(runs=tuple(_derive_fallback_runs(existing_files, config, worktree_reader)))
+
+
+def executed_module_prefixes(plan: VerifyPlan) -> frozenset[str]:
+    """The module prefixes *plan* executes: none for a TRIVIAL plan, and never a
+    module whose only run is the cmd-None 'no files under prefix' SKIPPED.
+
+    This is the which-modules-execute rule: ``run_scoped_verification``'s executor
+    (``verify.py::_executed_module_configs_from_plan``) and the task-verify
+    dispatcher's eligibility both call it.
+    """
+    if len(plan.runs) == 1 and plan.runs[0].scope_kind is ScopeKind.TRIVIAL:
+        return frozenset()
+    runs_by_prefix: dict[str, list[PlannedRun]] = {}
+    for run in plan.runs:
+        runs_by_prefix.setdefault(run.module_prefix, []).append(run)
+    return frozenset(
+        prefix for prefix, runs in runs_by_prefix.items()
+        if not (len(runs) == 1 and runs[0].cmd is None and runs[0].scope_kind is ScopeKind.SKIPPED)
+    )
+
+
+# The tool prefix this module writes onto every per-tool run's reason; the only
+# record of a run's leg, since PlannedRun carries no leg field.
+_LEG_BY_REASON_PREFIX: tuple[tuple[str, Leg], ...] = (
+    ('lint:', Leg.LINT),
+    ('pyright:', Leg.TYPE),
+    ('pytest:', Leg.TEST),
+)
+
+
+def planned_run_leg(run: PlannedRun) -> Leg | None:
+    """The check *run* plans, from its reason prefix; None for a run keyed to no
+    check, such as the fallback's single 'no .py files touched' SKIPPED run."""
+    for prefix, leg in _LEG_BY_REASON_PREFIX:
+        if run.reason.startswith(prefix):
+            return leg
+    return None
+
+
+def module_of(run: PlannedRun) -> str | None:
+    """The registered module *run* belongs to; None for the fallback and TRIVIAL sentinels."""
+    if run.module_prefix in (_FALLBACK_PREFIX, ''):
+        return None
+    return run.module_prefix
 
 
 # ---------------------------------------------------------------------------

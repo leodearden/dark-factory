@@ -13,7 +13,7 @@ import dataclasses
 import functools
 import logging
 import subprocess
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -24,20 +24,27 @@ from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import git_env_with_ceiling
 from df_pytest_isolation import git_redirect_env
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeOutcome, MergeRequest, QueuedBranch
+from orchestrator.merge_lane.disposition import MergeFailureDisposition
 from orchestrator.merge_lane.gates import _reverify_rebased_tree, note_queue_verified_main_tip
 from orchestrator.merge_lane.reverify_gate_decision import (
     MAX_RECORDED_OVERLAP_PATHS,
     GateClearance,
+    ReverifyDispatch,
     ReverifyGateDecision,
     ReverifyGateReason,
     emit_reverify_gate_decision,
 )
-from orchestrator.merge_lane.worker import _run_post_merge_verify
+from orchestrator.merge_lane.worker import (
+    MAIN_HEALTH_RED_REASON_PREFIX,
+    TRANSIENT_INFRA_REASON_PREFIX,
+    _run_post_merge_verify,
+)
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_categories import FailureCategory
 
 _SHAS = {
     'merge_sha': 'a' * 40,
@@ -47,11 +54,15 @@ _SHAS = {
 }
 
 
+_LEG = 'pytest tests/ -m reads_git_history'
+
+
 def _decision(
     reason: ReverifyGateReason,
     *,
     overlap: tuple[str, ...] = (),
     blockers: tuple[str, ...] = (),
+    history_leg_command: str | None = None,
     task_id: str = 't-5064',
 ) -> ReverifyGateDecision:
     return ReverifyGateDecision(
@@ -60,7 +71,7 @@ def _decision(
         verified_merge_sha=_SHAS['verified_merge_sha'],
         rebased_from=_SHAS['rebased_from'],
         rebased_onto=_SHAS['rebased_onto'],
-        overlap=overlap, blockers=blockers,
+        overlap=overlap, blockers=blockers, history_leg_command=history_leg_command,
     )
 
 
@@ -73,9 +84,17 @@ _CONSISTENT_DECISIONS = {
     ),
     ReverifyGateReason.overlap: _decision(ReverifyGateReason.overlap, overlap=('x.txt',)),
     ReverifyGateReason.overlap_unknown: _decision(ReverifyGateReason.overlap_unknown),
+    ReverifyGateReason.same_tree_history_leg: _decision(
+        ReverifyGateReason.same_tree_history_leg, history_leg_command=_LEG,
+    ),
 }
 
 _SKIPS = {ReverifyGateReason.same_tree, ReverifyGateReason.disjoint}
+_DISPATCHES = {
+    ReverifyGateReason.overlap,
+    ReverifyGateReason.overlap_unknown,
+    ReverifyGateReason.disjoint_untrusted,
+}
 
 
 class TestReverifyGateDecisionRecord:
@@ -128,6 +147,29 @@ class TestReverifyGateDecisionRecord:
         for fact in ('t-refused', str(reason), repr(overlap), repr(blockers)):
             assert fact in message, message
 
+    @pytest.mark.parametrize(
+        ('reason', 'history_leg_command'),
+        [
+            pytest.param(
+                ReverifyGateReason.same_tree_history_leg, None, id='history-leg-without-a-command',
+            ),
+            pytest.param(
+                ReverifyGateReason.same_tree_history_leg, '  ', id='history-leg-with-a-blank-command',
+            ),
+            pytest.param(ReverifyGateReason.same_tree, _LEG, id='same-tree-skip-with-a-command'),
+            pytest.param(ReverifyGateReason.overlap_unknown, _LEG, id='re-verify-with-a-command'),
+        ],
+    )
+    def test_only_a_history_leg_decision_carries_the_leg_it_runs(
+        self, reason: ReverifyGateReason, history_leg_command: str | None,
+    ) -> None:
+        with pytest.raises(ValueError) as refused:
+            _decision(reason, history_leg_command=history_leg_command, task_id='t-refused')
+
+        message = str(refused.value)
+        for fact in ('t-refused', str(reason), repr(history_leg_command)):
+            assert fact in message, message
+
     @pytest.mark.parametrize('reason', list(ReverifyGateReason), ids=str)
     def test_only_a_skip_yields_a_clearance(self, reason: ReverifyGateReason) -> None:
         expected = {
@@ -138,6 +180,45 @@ class TestReverifyGateDecisionRecord:
         assert reason.skip_clearance is expected
         assert reason.reverifies is (expected is None)
         assert _CONSISTENT_DECISIONS[reason].reverifies is reason.reverifies
+
+    @pytest.mark.parametrize('reason', list(ReverifyGateReason), ids=str)
+    def test_a_decision_dispatches_exactly_when_it_reverifies_with_no_history_leg(
+        self, reason: ReverifyGateReason,
+    ) -> None:
+        decision = _CONSISTENT_DECISIONS[reason]
+
+        assert decision.dispatches is (reason in _DISPATCHES)
+        assert decision.dispatches is (
+            decision.reverifies and decision.history_leg_command is None
+        )
+
+    @pytest.mark.parametrize('reason', sorted(set(ReverifyGateReason) - _DISPATCHES), ids=str)
+    def test_a_dispatch_refuses_a_decision_that_does_not_dispatch_by_name(
+        self, reason: ReverifyGateReason,
+    ) -> None:
+        with pytest.raises(ValueError) as refused:
+            ReverifyDispatch(_CONSISTENT_DECISIONS[reason])
+
+        message = str(refused.value)
+        for fact in (_CONSISTENT_DECISIONS[reason].task_id, str(reason)):
+            assert fact in message, message
+
+    @pytest.mark.parametrize('reason', sorted(_DISPATCHES), ids=str)
+    def test_a_dispatch_carries_the_decision_it_was_made_on(
+        self, reason: ReverifyGateReason,
+    ) -> None:
+        decision = _CONSISTENT_DECISIONS[reason]
+
+        assert ReverifyDispatch(decision).decision is decision
+
+    def test_the_history_leg_clearance_is_earned_by_running_the_leg_never_by_a_skip(
+        self,
+    ) -> None:
+        assert GateClearance.history_leg.value == 'history_leg'
+        assert all(
+            reason.skip_clearance is not GateClearance.history_leg
+            for reason in ReverifyGateReason
+        )
 
     def test_emit_writes_one_runs_db_row(self, tmp_path: Path) -> None:
         store = EventStore(tmp_path / 'runs.db', 'run-5064')
@@ -204,10 +285,20 @@ def _drift_elsewhere(repo: Path) -> str:
     return _git(repo, 'rev-parse', 'HEAD')
 
 
+_MAIN_SOURCE_FILE = 'app.py'
+
+
+def _drift_adding_a_source_file(repo: Path) -> str:
+    (repo / _MAIN_SOURCE_FILE).write_text('VALUE = 1\n')
+    _git(repo, 'add', '--', _MAIN_SOURCE_FILE)
+    _git(repo, 'commit', '-m', 'drift: a source file lands on main')
+    return _git(repo, 'rev-parse', 'HEAD')
+
+
 def _queue_landed(drift: Drift) -> Drift:
     def landed(repo: Path) -> str:
         sha = drift(repo)
-        note_queue_verified_main_tip(sha)
+        note_queue_verified_main_tip(repo, sha)
         return sha
     return landed
 
@@ -295,6 +386,52 @@ async def _rebased_merge(
             await scene.git_ops.cleanup_merge_worktree(merge_wt)
 
 
+@dataclasses.dataclass
+class _CountedVerify:
+    """``_run_post_merge_verify`` on *verifier* and the scene's store, noting each call's leg."""
+
+    store: EventStore
+    verifier: FakeVerifier
+    history_legs: list[str | None] = dataclasses.field(default_factory=list)
+
+    async def __call__(self, *args: Any, **kwargs: Any) -> MergeOutcome | None:
+        self.history_legs.append(kwargs.get('history_leg_command'))
+        return await _run_post_merge_verify(
+            *args, verifier=self.verifier, event_store=self.store, **kwargs,
+        )
+
+
+async def _gate_result(
+    scene: _Scene,
+    rebased: _Rebased,
+    run_post_merge_verify: Callable[..., Awaitable[MergeOutcome | None]],
+    *,
+    merge_sha: str | None = None,
+    rebased_from: str | None = None,
+    timeouts: dict[str, int] | None = None,
+    max_enospc: int = 1,
+    dispatch_reverify: bool = False,
+) -> MergeOutcome | GateClearance | ReverifyDispatch:
+    """Run the gate; *dispatch_reverify* False leaves the keyword out entirely."""
+    gate = functools.partial(
+        _reverify_rebased_tree,
+        scene.git_ops, rebased.request, rebased.merge_wt,
+        verified_merge_sha=rebased.verified,
+        rebased_from=rebased.rebased_from if rebased_from is None else rebased_from,
+        rebased_onto=rebased.rebased_onto,
+        timeouts={} if timeouts is None else timeouts,
+        enospc_retries={},
+        max_timeouts=3,
+        max_enospc=max_enospc,
+        merge_sha=rebased.rebased_sha if merge_sha is None else merge_sha,
+        run_post_merge_verify=run_post_merge_verify,
+        event_store=scene.store,
+    )
+    if dispatch_reverify:
+        return await gate(dispatch_reverify=True)
+    return await gate()
+
+
 async def _gate(
     scene: _Scene,
     rebased: _Rebased,
@@ -302,20 +439,43 @@ async def _gate(
     *,
     merge_sha: str | None = None,
     rebased_from: str | None = None,
+    timeouts: dict[str, int] | None = None,
+    max_enospc: int = 1,
 ) -> MergeOutcome | GateClearance:
-    return await _reverify_rebased_tree(
-        scene.git_ops, rebased.request, rebased.merge_wt,
-        verified_merge_sha=rebased.verified,
-        rebased_from=rebased.rebased_from if rebased_from is None else rebased_from,
-        rebased_onto=rebased.rebased_onto,
-        timeouts={},
-        enospc_retries={},
-        max_timeouts=3,
-        max_enospc=1,
-        merge_sha=rebased.rebased_sha if merge_sha is None else merge_sha,
-        run_post_merge_verify=functools.partial(_run_post_merge_verify, verifier=verifier),
-        event_store=scene.store,
+    result = await _gate_result(
+        scene, rebased, _CountedVerify(scene.store, verifier),
+        merge_sha=merge_sha, rebased_from=rebased_from,
+        timeouts=timeouts, max_enospc=max_enospc,
     )
+    assert not isinstance(result, ReverifyDispatch), result
+    return result
+
+
+def _check_out_the_verified_tree(scene: _Scene, rebased: _Rebased) -> str:
+    """Put *rebased*'s merge worktree on a new commit over the drift carrying the verified tree."""
+    same_tree_sha = _git(
+        scene.repo, 'commit-tree', f'{rebased.verified}^{{tree}}',
+        '-p', rebased.rebased_onto, '-m', 'same tree',
+    )
+    _git(rebased.merge_wt, 'reset', '--hard', same_tree_sha)
+    return same_tree_sha
+
+
+def _history_leg_config(
+    scene: _Scene, command: str, *, history_pure: bool = True, **overrides: Any,
+) -> OrchestratorConfig:
+    return scene.config(
+        merge_verify_breadth='full', merge_gate_history_pure=history_pure,
+        merge_gate_history_test_command=command, **overrides,
+    )
+
+
+def _scoped_to(rebased: _Rebased, module: ModuleConfig, task_files: list[str]) -> _Rebased:
+    """*rebased* with its request scoped to *module* and *task_files*."""
+    request = dataclasses.replace(
+        rebased.request, module_configs=[module], task_files=task_files,
+    )
+    return dataclasses.replace(rebased, request=request)
 
 
 @pytest.mark.asyncio
@@ -390,6 +550,34 @@ class TestReverifyGateRecordsItsDecision:
         assert 'unverified drift' in blocker
         assert len(scene.verify_rows(rebased.rebased_sha)) == 1
 
+    async def test_a_tip_another_repositorys_queue_landed_does_not_vouch_for_this_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        for clock in ('GIT_AUTHOR_DATE', 'GIT_COMMITTER_DATE'):
+            monkeypatch.setenv(clock, '1700000000 +0000')
+        landed = _scene(tmp_path / 'landed')
+        async with _rebased_merge(
+            landed, landed.config(merge_verify_breadth='scoped'), _queue_landed(_drift_elsewhere),
+        ) as landed_rebased:
+            assert await _gate(landed, landed_rebased, FakeVerifier()) is GateClearance.disjoint
+
+        fresh = _scene(tmp_path / 'fresh')
+        async with _rebased_merge(
+            fresh, fresh.config(merge_verify_breadth='scoped'), _drift_elsewhere,
+        ) as fresh_rebased:
+            assert fresh_rebased.rebased_onto == landed_rebased.rebased_onto, (
+                'vacuous without the collision: both repositories must hold one '
+                'byte-identical drift commit'
+            )
+            clearance = await _gate(fresh, fresh_rebased, FakeVerifier())
+
+        assert clearance is GateClearance.reverified, clearance
+        [row] = fresh.gate_rows()
+        assert row['reason'] == 'disjoint_untrusted'
+        [blocker] = row['blockers']
+        assert 'unverified drift' in blocker
+        assert len(fresh.verify_rows(fresh_rebased.rebased_sha)) == 1
+
     async def test_a_failed_overlap_probe_fires_with_no_paths_recorded(
         self, tmp_path: Path,
     ) -> None:
@@ -429,7 +617,10 @@ class TestReverifyGateRecordsItsDecision:
         verifier = FakeVerifier()
         async with _rebased_merge(
             scene,
-            scene.config(merge_verify_breadth='full', merge_gate_history_pure=True),
+            scene.config(
+                merge_verify_breadth='full', merge_gate_history_pure=True,
+                merge_gate_history_test_command=None,
+            ),
             _drift_elsewhere,
         ) as rebased:
             same_tree_sha = _git(
@@ -465,6 +656,337 @@ class TestReverifyGateRecordsItsDecision:
         [row] = scene.gate_rows()
         assert row['reason'] == 'disjoint_untrusted', row
         assert len(scene.verify_rows(same_tree_sha)) == 1
+
+    async def test_a_same_tree_under_a_declared_history_leg_runs_only_the_leg(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        verifier = FakeVerifier()
+        leg_head = tmp_path / 'leg-head'
+        async with _rebased_merge(
+            scene, _history_leg_config(scene, f'git rev-parse HEAD > {leg_head}'),
+            _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            clearance = await _gate(scene, rebased, verifier, merge_sha=same_tree_sha)
+
+        assert clearance is GateClearance.history_leg, clearance
+        assert verifier.entered_count == 0
+        assert leg_head.read_text().strip() == same_tree_sha
+        [row] = scene.gate_rows()
+        assert (row['reason'], row['reverify'], row['merge_sha'], row['verified_merge_sha']) == (
+            'same_tree_history_leg', True, same_tree_sha, rebased.verified,
+        )
+        [verify_row] = scene.verify_rows(same_tree_sha)
+        assert (verify_row['passed'], verify_row['runner']) == (True, 'history-leg'), verify_row
+
+    async def test_a_red_history_leg_blocks_and_cleans_up_the_merge_worktree(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        verifier = FakeVerifier()
+        async with _rebased_merge(
+            scene, _history_leg_config(scene, 'exit 3'), _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            outcome = await _gate(scene, rebased, verifier, merge_sha=same_tree_sha)
+            merge_wt_survived = rebased.merge_wt.exists()
+
+        assert not isinstance(outcome, GateClearance), outcome
+        assert outcome.status == 'blocked', outcome
+        assert outcome.reason.startswith('Post-merge verification failed'), outcome.reason
+        assert 'history leg' in outcome.reason, outcome.reason
+        assert not merge_wt_survived
+        assert verifier.entered_count == 0
+
+    async def test_the_disk_guard_runs_before_a_history_leg(self, tmp_path: Path) -> None:
+        scene = _scene(tmp_path)
+        disk_reason = f'{TRANSIENT_INFRA_REASON_PREFIX}: pre-verify disk guard (test)'
+        leg_head = tmp_path / 'leg-head'
+        async with _rebased_merge(
+            scene, _history_leg_config(scene, f'git rev-parse HEAD > {leg_head}'),
+            _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            outcome = await _gate(
+                scene, rebased, FakeVerifier(disk_reason=disk_reason), merge_sha=same_tree_sha,
+            )
+            merge_wt_survived = rebased.merge_wt.exists()
+
+        assert not isinstance(outcome, GateClearance), outcome
+        assert (outcome.status, outcome.reason, outcome.verify_skipped) == (
+            'blocked', disk_reason, True,
+        )
+        assert not leg_head.exists()
+        assert not merge_wt_survived
+
+    async def test_a_persistent_enospc_history_leg_is_retried_once_then_held_as_infra(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        runs = tmp_path / 'runs'
+        leg = (
+            f"echo run >> {runs}; "
+            f"echo 'OSError: [Errno 28] No space left on device' >&2; exit 1"
+        )
+        async with _rebased_merge(
+            scene, _history_leg_config(scene, leg), _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            outcome = await _gate(
+                scene, rebased, FakeVerifier(), merge_sha=same_tree_sha, max_enospc=1,
+            )
+            merge_wt_survived = rebased.merge_wt.exists()
+
+        assert not isinstance(outcome, GateClearance), outcome
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), outcome.reason
+        assert runs.read_text().splitlines() == ['run', 'run']
+        assert not merge_wt_survived
+
+    async def test_a_persistent_infra_transient_history_leg_is_retried_then_held(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        runs = tmp_path / 'runs'
+        leg = f"echo run >> {runs}; echo 'INTERNALERROR> boom'; exit 3"
+        async with _rebased_merge(
+            scene, _history_leg_config(scene, leg), _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            outcome = await _gate(
+                scene, rebased, FakeVerifier(), merge_sha=same_tree_sha, max_enospc=1,
+            )
+
+        assert not isinstance(outcome, GateClearance), outcome
+        assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), outcome.reason
+        assert FailureCategory.PYTEST_INTERNALERROR.value in outcome.reason, outcome.reason
+        assert runs.read_text().splitlines() == ['run', 'run']
+
+    async def test_a_timed_out_history_leg_feeds_the_timeout_loop_breaker(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        timeouts: dict[str, int] = {}
+        async with _rebased_merge(
+            scene,
+            _history_leg_config(scene, 'sleep 60', merge_verify_cold_command_timeout_secs=2),
+            _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            outcome = await _gate(
+                scene, rebased, FakeVerifier(), merge_sha=same_tree_sha, timeouts=timeouts,
+            )
+
+        assert not isinstance(outcome, GateClearance), outcome
+        assert outcome.status == 'blocked', outcome
+        assert '[category: ' in outcome.reason, outcome.reason
+        assert timeouts == {rebased.request.task_id: 1}
+
+    async def test_a_red_history_leg_is_main_red_when_the_tasks_own_commands_reproduce_it(
+        self, tmp_path: Path,
+    ) -> None:
+        """The probe re-runs the task's scoped module_configs on main, not the leg; here they agree."""
+        scene = _scene(tmp_path)
+        red_on_main = 'echo red-on-main; exit 3'
+        config = _history_leg_config(scene, red_on_main).model_copy(
+            update={'escalate_preexisting_main_break': True},
+        )
+        async with _rebased_merge(scene, config, _drift_adding_a_source_file) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            scoped = _scoped_to(
+                rebased, ModuleConfig(prefix='', test_command=red_on_main), [_MAIN_SOURCE_FILE],
+            )
+            outcome = await _gate(scene, scoped, FakeVerifier(), merge_sha=same_tree_sha)
+
+        assert not isinstance(outcome, GateClearance), outcome
+        assert outcome.reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX), outcome.reason
+        assert outcome.disposition is MergeFailureDisposition.MAIN_RED, outcome
+
+    async def test_a_declared_history_leg_does_not_run_when_the_tree_moved(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        verifier = FakeVerifier()
+        leg_head = tmp_path / 'leg-head'
+        async with _rebased_merge(
+            scene, _history_leg_config(scene, f'git rev-parse HEAD > {leg_head}'),
+            _drift_elsewhere,
+        ) as rebased:
+            clearance = await _gate(scene, rebased, verifier)
+
+        assert clearance is GateClearance.reverified, clearance
+        assert verifier.entered_count == 1
+        assert not leg_head.exists()
+
+    async def test_a_declared_history_leg_does_not_run_unless_the_gate_is_history_pure(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        leg_head = tmp_path / 'leg-head'
+        async with _rebased_merge(
+            scene,
+            _history_leg_config(scene, f'git rev-parse HEAD > {leg_head}', history_pure=False),
+            _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            clearance = await _gate(scene, rebased, FakeVerifier(), merge_sha=same_tree_sha)
+
+        assert clearance is GateClearance.reverified, clearance
+        [row] = scene.gate_rows()
+        assert row['reason'] == 'disjoint_untrusted', row
+        assert not leg_head.exists()
+
+
+_SCOPED = {'merge_verify_breadth': 'scoped'}
+
+
+@pytest.mark.asyncio
+class TestTheReverifyArmCanBeHandedBackAsADispatch:
+    """``dispatch_reverify=True`` returns a full re-verify as data and runs only skips and legs."""
+
+    @pytest.mark.parametrize(
+        ('drift', 'rebased_from_override', 'reason'),
+        [
+            pytest.param(
+                _drift_on_the_branchs_file, None, ReverifyGateReason.overlap, id='overlap',
+            ),
+            pytest.param(
+                _drift_on_the_branchs_file, '', ReverifyGateReason.overlap_unknown,
+                id='overlap-unknown',
+            ),
+            pytest.param(
+                _drift_elsewhere, None, ReverifyGateReason.disjoint_untrusted,
+                id='disjoint-untrusted',
+            ),
+        ],
+    )
+    async def test_a_full_reverify_is_returned_as_a_dispatch_with_no_verify_run(
+        self,
+        tmp_path: Path,
+        drift: Drift,
+        rebased_from_override: str | None,
+        reason: ReverifyGateReason,
+    ) -> None:
+        scene = _scene(tmp_path)
+        verifier = FakeVerifier()
+        verify = _CountedVerify(scene.store, verifier)
+        async with _rebased_merge(scene, scene.config(**_SCOPED), drift) as rebased:
+            result = await _gate_result(
+                scene, rebased, verify,
+                rebased_from=rebased_from_override, dispatch_reverify=True,
+            )
+
+        assert isinstance(result, ReverifyDispatch), result
+        decision = result.decision
+        assert decision.reason is reason
+        assert (
+            decision.task_id, decision.merge_sha, decision.verified_merge_sha,
+            decision.rebased_from, decision.rebased_onto,
+        ) == (
+            rebased.request.task_id, rebased.rebased_sha, rebased.verified,
+            rebased.rebased_from if rebased_from_override is None else rebased_from_override,
+            rebased.rebased_onto,
+        )
+        [row] = scene.gate_rows()
+        assert row == {'task_id': decision.task_id, **decision.event_data()}
+        assert row['reverify'] is True
+        assert verify.history_legs == []
+        assert verifier.entered_count == 0
+        assert scene.verify_rows(rebased.rebased_sha) == []
+
+    async def test_a_same_tree_skip_still_clears_with_no_verify(self, tmp_path: Path) -> None:
+        scene = _scene(tmp_path)
+        verifier = FakeVerifier()
+        verify = _CountedVerify(scene.store, verifier)
+        config = scene.config(
+            merge_verify_breadth='full', merge_gate_history_pure=True,
+            merge_gate_history_test_command=None,
+        )
+        async with _rebased_merge(scene, config, _drift_elsewhere) as rebased:
+            same_tree_sha = _git(
+                scene.repo, 'commit-tree', f'{rebased.verified}^{{tree}}',
+                '-p', rebased.rebased_onto, '-m', 'same tree',
+            )
+            result = await _gate_result(
+                scene, rebased, verify, merge_sha=same_tree_sha, dispatch_reverify=True,
+            )
+
+        assert result is GateClearance.same_tree, result
+        assert (verify.history_legs, verifier.entered_count) == ([], 0)
+        [row] = scene.gate_rows()
+        assert (row['reason'], row['reverify']) == ('same_tree', False)
+
+    async def test_a_trusted_disjoint_skip_still_clears_with_no_verify(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        verifier = FakeVerifier()
+        verify = _CountedVerify(scene.store, verifier)
+        async with _rebased_merge(
+            scene, scene.config(**_SCOPED), _queue_landed(_drift_elsewhere),
+        ) as rebased:
+            result = await _gate_result(scene, rebased, verify, dispatch_reverify=True)
+
+        assert result is GateClearance.disjoint, result
+        assert (verify.history_legs, verifier.entered_count) == ([], 0)
+        [row] = scene.gate_rows()
+        assert (row['reason'], row['reverify']) == ('disjoint', False)
+
+    async def test_a_history_leg_still_runs_only_the_leg_and_clears_on_it(
+        self, tmp_path: Path,
+    ) -> None:
+        scene = _scene(tmp_path)
+        verifier = FakeVerifier()
+        verify = _CountedVerify(scene.store, verifier)
+        leg_head = tmp_path / 'leg-head'
+        leg = f'git rev-parse HEAD > {leg_head}'
+        async with _rebased_merge(
+            scene, _history_leg_config(scene, leg), _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            result = await _gate_result(
+                scene, rebased, verify, merge_sha=same_tree_sha, dispatch_reverify=True,
+            )
+
+        assert result is GateClearance.history_leg, result
+        assert verify.history_legs == [leg]
+        assert verifier.entered_count == 0
+        assert leg_head.read_text().strip() == same_tree_sha
+
+    async def test_a_red_history_leg_still_ends_the_attempt(self, tmp_path: Path) -> None:
+        scene = _scene(tmp_path)
+        verifier = FakeVerifier()
+        verify = _CountedVerify(scene.store, verifier)
+        async with _rebased_merge(
+            scene, _history_leg_config(scene, 'exit 3'), _drift_elsewhere,
+        ) as rebased:
+            same_tree_sha = _check_out_the_verified_tree(scene, rebased)
+            result = await _gate_result(
+                scene, rebased, verify, merge_sha=same_tree_sha, dispatch_reverify=True,
+            )
+
+        assert isinstance(result, MergeOutcome), result
+        assert result.status == 'blocked', result
+        assert verify.history_legs == ['exit 3']
+        assert verifier.entered_count == 0
+
+    async def test_without_the_opt_in_an_overlap_fire_still_reverifies_inline(
+        self, tmp_path: Path,
+    ) -> None:
+        """The train contract: ``worker.py::_advance_train`` never passes the keyword."""
+        scene = _scene(tmp_path)
+        verifier = FakeVerifier()
+        verify = _CountedVerify(scene.store, verifier)
+        async with _rebased_merge(
+            scene, scene.config(**_SCOPED), _drift_on_the_branchs_file,
+        ) as rebased:
+            result = await _gate_result(scene, rebased, verify)
+
+        assert result is GateClearance.reverified, result
+        assert verify.history_legs == [None]
+        assert verifier.entered_count == 1
+        [verify_row] = scene.verify_rows(rebased.rebased_sha)
+        assert verify_row['passed'] is True
 
 
 # ─── Both production call sites hand the worker's store to the gate ─────────
@@ -524,7 +1046,10 @@ class TestSingleBranchGateIsRecorded:
 
     async def test_a_same_tree_skip_through_the_lane_is_recorded(self, tmp_path: Path) -> None:
         scene = _scene(tmp_path)
-        config = scene.config(merge_verify_breadth='full', merge_gate_history_pure=True)
+        config = scene.config(
+            merge_verify_breadth='full', merge_gate_history_pure=True,
+            merge_gate_history_test_command=None,
+        )
         head_wt = (await scene.git_ops.create_worktree('head')).path
         head_commit = _edit_shared_line(head_wt, 2, 'shared line 2, edited by the head')
         follower_wt = (await scene.git_ops.create_worktree('follower')).path

@@ -1,76 +1,29 @@
-"""THE canonical task-label vocabulary — one normative site, no second copy.
+"""The canonical task-label grammar: named fragments composed into five rules.
 
-This module owns the single description of what a canonical task label looks
-like: the anchored node-name form ('Task 132'), the unanchored prose mention
-('blocked on task 132'), the project-qualified cross-project form
-('dark_factory:2500'), and the narrowings that keep colon-bearing noise out.
+- _TASK_NODE_NAME_PATTERN: a whole own-project node name, 'task #1153'.
+- _QUALIFIED_NODE_NAME_PATTERN: a whole foreign node name, 'reify:132'.
+- _TASK_VOCABULARY_QUALIFIER: a lowercased qualifier that is task vocabulary,
+  'sub_task'. It is deliberately not built from _TASK_WORD, so 'Task' counts
+  only once its caller has lowercased it.
+- _LOCAL_MENTION_PATTERN: a bare mention in prose, 'blocked on task-173'.
+- _QUALIFIED_REF_PATTERN: a project-qualified mention, 'see dark_factory: 2500'.
 
-INV-5 (no lockstep duplication) / PRD resolved decision 5. Before task 3667
-the vocabulary existed as separate compiled copies in utils/task_naming.py
-and utils/cross_project_refs.py, which had already drifted: task_naming's
-``^\\s*tasks?\\s+(\\d+)\\s*$`` requires whitespace between the word and the
-digits and is therefore STRUCTURALLY unable to see 'task #1153' — one of the
-PRD's 53 measured task-node variant splits — while cross_project_refs had
-grown a second, colon-spelled mention pattern task_naming never got. Both of
-those modules now call this one and carry NO compiled pattern of their own;
-their test suites assert that structurally. Do not re-introduce a second copy
-of the label pattern anywhere: a vocabulary that exists twice drifts, and the
-drift is invisible until a destructive consumer acts on the stale half.
-
-The same rule governs the vocabulary's CAPTURE classes, which is why the digit
-captures are ASCII-explicit ('[0-9]', never '\\d') at this one normative site
-rather than re-narrowed per caller. Task 4850 extended the same rule to the
-literal task-vocabulary WORD (the _TASK_WORD constant,
-'[Tt][Aa][Ss][Kk][Ss]?', never 'tasks?' plus re.IGNORECASE — see the comment on
-_TASK_NODE_NAME_PATTERN), which decides whether the word 'task' was written at
-all rather than handing a character onward as data, so the rule is no longer
-scoped to captures alone. Still not every class: the '\\s' padding and the
-'\\w' lookbehinds stay Unicode-broad (see the comment on
-_TASK_NODE_NAME_PATTERN, whose padding is the one that actually still is —
-_QUALIFIED_NODE_NAME_PATTERN has no '\\s' padding LEFT since task 4850, so it
-cannot illustrate the rule it used to be cited for). The vocabulary is
-ASCII-explicit wherever a character reaches a consumer as DATA or decides that
-the task-vocabulary word was written, and broad only where it merely decides
-whether to refuse.
-
-That rule is SPELLED at two sites and GUARANTEED at a third — scoping a reader
-needs BEFORE "closing" the third. _TASK_VOCABULARY_QUALIFIER also decides
-whether the task-vocabulary word was written, and it is NOT ASCII-explicit: it
-fullmatches a qualifier its CALLER canonicalized with str.lower(), which does
-not fold U+017F, so is_task_vocabulary_qualifier('ta\u017fk') is False. MEASURED
-twice: that is unreachable on every live path, not a hole. The two in-module
-callers get a qualifier captured by '[A-Za-z][A-Za-z0-9_-]{2,}', so a non-ASCII
-letter can never be in the string; the third,
-referent_resolution._declared_referents, runs validate_project_id's ASCII-only
-allowlist on the line ABOVE its vocabulary guard, so
-{'id': 2500, 'project_id': 'ta\u017fk'} raises InputValidationError naming the
-CHARSET rather than minting a 'ta\u017fk:2500' node. Casefolding the predicate
-would add a branch no live input can reach AND fork validation.py's charset
-rule into a second site, the lockstep duplication INV-5 forbids. If a future
-caller ever hands this predicate an unvalidated qualifier, narrow it THERE or
-at canonicalize_project_id — not here.
-
-Before the digit and word narrowings above,
-utils/referent_resolution._is_task_number was the only guard enforcing "a
-Unicode digit is not a task id" — it does so with ``isascii() and isdigit()``
-(task 3668) — so the DECLARED path refused what this DERIVED path happily
-minted. That guard STAYS: it covers a STRUCTURED, caller-supplied number that
-never passes through these patterns, so it is a different input channel, not a
-duplicate to delete.
-
-This module is a dependency-free leaf — it imports only stdlib and
-utils/validation (itself a leaf) — so it can be imported from both the
-services write path and any future reconciliation sweep without import
-cycles. Mirrors utils/task_naming.py and utils/cross_project_refs.py, whose
-shape it copies.
+Precision over recall: the pads around '#' and ':' are space or tab, never a
+line break; the task word and the digits are ASCII; and the right edge refuses
+any Unicode digit, so a mixed digit run yields nothing. The measured cases live
+in tests/test_canonical_labels.py, and the reasons in
+plans/review-all-s26-memory-service-write-path-and-graph-client-prd.md
+§Rationale rehomed.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Collection, Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Self
 
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
@@ -79,336 +32,68 @@ from fused_memory.utils.validation import (
 
 logger = logging.getLogger(__name__)
 
-# Module-level flag for warn-once behaviour when a SUPPLIED registry
-# canonicalizes to nothing — see _canonical_allowlist. Copies the shape of
-# utils/validation.py's _empty_registry_warned rather than inventing a variant,
-# which keeps this module a stdlib-plus-utils/validation leaf. (The name keeps
-# the dominant case; a BLANK registry key trips it too, since that also yields
-# no usable project id — see _canonical_allowlist.)
-#
-# The flag is per-PROCESS, NOT per-registry, and here those are not the same
-# thing they are at the precedent site: validation's flag tracks a
-# process-STATIC fact — no registry is configured at all — so one line genuinely
-# describes that process for its lifetime, whereas THIS condition depends on a
-# per-call argument. So the FIRST unusable registry permanently silences every
-# later one, including a structurally different misconfiguration supplied by a
-# different caller, and the count in the message describes only that first one.
-# ABSENCE OF THE WARNING THEREFORE DOES NOT MEAN ABSENCE OF THE CONDITION: an
-# operator debugging a filter that is unexpectedly permissive must re-check the
-# registry itself rather than read a silent log as an all-clear. Accepted
-# deliberately — this scanner runs on a memory write path, where per-call
-# fidelity would cost a log storm. Keying the flag on the offending registry (a
-# bounded set of already-warned frozenset(known_project_ids) values) is the
-# alternative if a second distinct misconfiguration ever needs to be visible.
+# Per process, not per registry: once set, a differently broken registry is silent.
 _all_path_shaped_warned: bool = False
 
-#: The registry of referent kinds and the bare node-name label each renders.
-#: Deliberately holds only 'task' today; 'escalation' is the PRD's next entry
-#: and is NOT added speculatively. Extending the vocabulary means adding an
-#: entry here, which is the whole point of routing every caller through one
-#: module.
-#:
-#: NOTE for a reader hunting the caller that emits a non-'task' kind: there
-#: isn't one. Both public entry points hardcode ``kind='task'``, and both
-#: compiled patterns hardcode the literal word 'task', so ``__post_init__``'s
-#: rejection is reachable only from a direct ``Referent(kind=...)`` call.
-#: Adding 'escalation' will need new patterns and new parse/scan branches too —
-#: this registry is where the LABEL lives, not a one-line extension point.
-_KIND_LABELS: dict[str, str] = {'task': 'Task'}
+#: Each referent kind and the label its own-project node name renders; a new kind
+#: also needs its own rules before anything parses or scans it.
+KIND_LABELS: Mapping[str, str] = MappingProxyType({'task': 'Task'})
 
-#: The literal task-vocabulary WORD, as explicit ASCII case classes rather than
-#: 'tasks?' plus re.IGNORECASE. ONE spelling, interpolated into both patterns
-#: that need it (_TASK_NODE_NAME_PATTERN and _LOCAL_MENTION_PATTERN), because a
-#: case-class form does NOT read as the word at a glance: a transposed or
-#: dropped letter in one of two hand-written copies would be near-invisible in
-#: review while silently changing what parses, and the standing ASCII
-#: regression guards could not catch it — TestParseNodeNameMatchesLocalForms
-#: and TestScanContentFindsOwnProjectReferents reach the two patterns through
-#: DIFFERENT entry points, so a typo confined to one copy would leave the other
-#: suite green. Hoisted for exactly that reason (INV-5 / SPOT); WHY the spelling
-#: is case classes and not a flag is recorded on _TASK_NODE_NAME_PATTERN below.
-_TASK_WORD = r'[Tt][Aa][Ss][Kk][Ss]?'
 
-# ANCHORED (whole-string) task-node name: a bare 'task(s) N', optionally padded
-# with whitespace, case-insensitive. Anchoring means names that merely mention a
-# task ('Task 42 orchestrator', 'reify task 12') or resemble but aren't a
-# task-node name ('subtask 5', 'multitask 3', 'taskforce 9') never match, so
-# they are never renamed.
-#
-# The separator alternation REQUIRES at least one of whitespace, '#' or ':'.
-# That is load-bearing: 'task #1153' and 'Task: 132' — two of the PRD's 53
-# measured variant splits, structurally invisible to this pattern's ancestor
-# '^\s*tasks?\s+(\d+)\s*$' — now match, while 'task132' still does NOT. The
-# obvious spelling 'tasks?\s*#?\s*(\d+)' would have matched 'task132' too,
-# silently widening what _normalize_task_node_names renames.
-#
-# The '#'/':' branch is padded with '[ \t]', NOT '\s', so it cannot span a line
-# break. '\s' matches '\n', which would let 'task\n#132' parse as a task label —
-# a widening this task never intended and never measured (see
-# _LOCAL_MENTION_PATTERN, where the same widening had a live consequence). The
-# whitespace branch keeps '\s+' VERBATIM from the ancestor pattern: narrowing it
-# would be an equally undeclared change in the opposite direction.
-#
-# The digit class is '[0-9]', NOT '\d'. Measured, not stylistic: Python's re
-# matches every Unicode DECIMAL digit with '\d' on a str pattern, so
-# 'task \u0663' (ARABIC-INDIC DIGIT THREE) parsed as a task whose number was that
-# character and rendered a 'Task \u0663' node name. That is a false POSITIVE
-# against this module's precision-over-recall contract — the opposite direction
-# from the blind spots scan_content enumerates, every one of which is a recall
-# loss — and it is the DERIVED path minting exactly what the DECLARED path
-# already refuses: referent_resolution._is_task_number guards its bare-digit
-# branch with 'text.isascii() and text.isdigit()' (task 3668), saying "a Unicode
-# digit is not a task id". Narrowing it HERE means no consumer has to re-narrow
-# it per caller. An explicit class rather than re.ASCII, which would silently
-# re-scope this pattern's '\s' too.
-#
-# The word 'tasks?' is interpolated from _TASK_WORD above — explicit ASCII case
-# classes, NOT 'tasks?' plus re.IGNORECASE. MEASURED, not
-# stylistic: Python's re performs FULL Unicode case folding under
-# re.IGNORECASE on str patterns, so U+017F LATIN SMALL LETTER LONG S folds
-# onto 's' and U+212A KELVIN SIGN folds onto 'k' — 'Ta\u017fk 5' and
-# 'Tas\u212a 5' (and any mixture of the two) matched and minted a
-# referent carrying a REAL ASCII number, worse than the digit case above
-# because the number names a task that actually exists, rather than obvious
-# junk. Dropping the flag changes nothing else: 'tasks?' was the only cased
-# literal in this pattern, so '\s', '[ \t]', '[#:]' and '[0-9]' are
-# unaffected, and every ASCII spelling ('task', 'TASK', 'Tasks', 'TaSkS',
-# 'task#1153', ...) is unchanged by construction — proven by the standing
-# regression guards in TestParseNodeNameMatchesLocalForms. This matches the
-# in-module precedent on _QUALIFIED_NODE_NAME_PATTERN below, whose comment
-# already spells case as an explicit class rather than a flag
-# ("Case-SENSITIVE start class with no IGNORECASE flag needed, since
-# [A-Za-z] already spans both cases") — this finishes that half-committed
-# convention. Not re.ASCII: it would silently re-scope this pattern's '\s'
-# padding too, an axis this task never measured.
-_TASK_NODE_NAME_PATTERN = re.compile(
-    r'^\s*' + _TASK_WORD + r'(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)\s*$'
+class _Fragment(str):
+    """A named grammar fragment that keeps the parts it was joined from, so a
+    rule's use of a shared fragment is checkable by identity at any depth."""
+
+    parts: tuple[str, ...]
+
+    def __new__(cls, *parts: str) -> Self:
+        fragment = super().__new__(cls, ''.join(parts))
+        fragment.parts = parts
+        return fragment
+
+
+@dataclass(frozen=True)
+class _Rule:
+    """A compiled rule and the fragments it was composed from."""
+
+    parts: tuple[str, ...]
+    regex: re.Pattern[str]
+
+
+def _compile(*parts: str, anchored: bool) -> _Rule:
+    body = ''.join(parts)
+    return _Rule(parts=parts, regex=re.compile(rf'^{body}\Z' if anchored else body))
+
+
+def _either(*branches: str) -> _Fragment:
+    alternation = [part for branch in branches for part in ('|', branch)][1:]
+    return _Fragment('(?:', *alternation, ')')
+
+
+_TASK_WORD = _Fragment(r'[Tt][Aa][Ss][Kk][Ss]?')
+_PAD = _Fragment(r'[ \t]*')
+_WIDE_PAD = _Fragment(r'\s*')
+_GAP = _Fragment(r'\s+')
+_COLON = _Fragment(_PAD, ':', _PAD)
+_MARK = _Fragment(_PAD, '[#:]', _PAD)
+_SEPARATOR = _either(_MARK, _GAP)
+_MENTION_SEPARATOR = _either(_MARK, _GAP, r'[-/]')
+_NUMBER = _Fragment(r'([0-9]+)')
+_NUMBER_END = _Fragment(r'(?!\d)')
+_QUALIFIER = _Fragment(r'([A-Za-z][A-Za-z0-9_-]{2,})')
+_MENTION_LEFT_EDGE = _Fragment(r'(?<![\w:-])')
+_REF_LEFT_EDGE = _Fragment(r'(?<![\w:/.-])')
+
+_TASK_NODE_NAME_PATTERN = _compile(
+    _WIDE_PAD, _TASK_WORD, _SEPARATOR, _NUMBER, _WIDE_PAD, anchored=True
 )
-
-# The ANCHORED twin of _QUALIFIED_REF_PATTERN: a whole-string cross-project node
-# name, '<project_id>:<task_number>'. Shares that pattern's letter-start and
-# >=3-character qualifier rules, so clock times ('12:30') and short non-project
-# tokens ('w6:2', 'py:3') never parse as a project. Case-SENSITIVE start class
-# with no IGNORECASE flag needed, since [A-Za-z] already spans both cases.
-#
-# The digit class is '[0-9]', NOT '\d', for the reason recorded on
-# _TASK_NODE_NAME_PATTERN above. Measured: 'reify:٣' parsed to
-# Referent(project_id='reify', number='٣'). The qualifier class was already
-# ASCII-explicit, so the digit capture was the last Unicode-permissive CAPTURE
-# class in the vocabulary — captures only, and deliberately so. General
-# whitespace padding elsewhere in the vocabulary stays Unicode-broad by
-# design — measured on this branch, 'task 132' (NBSP) still parses via
-# _TASK_NODE_NAME_PATTERN's '\s+' branch — because a pad only ever costs an
-# exotic SPELLING of a number that is itself ASCII, never a recall loss. Only
-# a CAPTURE hands the character onward as data, which is why the digit fix is
-# an explicit class and not re.ASCII: re.ASCII would re-scope '\d', '\s' and
-# '\w' at once, three separately-reasoned axes for the price of one.
-#
-# This pattern's OWN padding is the deliberate exception to that breadth, for
-# a different reason entirely — not Unicode safety but LINE-BREAK safety
-# (task 4850). Line breaks are the MOTIVE; read the next-to-last paragraph for
-# what the narrowing actually does, which is broader. The colon is padded
-# '[ \t]', NOT '\s', on BOTH sides: MEASURED,
-# before this narrowing, parse_node_name('reify:\n132') and
-# parse_node_name('reify\n:132') each parsed to Referent(project_id='reify',
-# number='132') — an entity NAME containing a hard line break is not a
-# project-qualified node name. This was the LAST '\s'-padded colon in the
-# module: _TASK_NODE_NAME_PATTERN, _LOCAL_MENTION_PATTERN and
-# _QUALIFIED_REF_PATTERN already padded '#'/':' with '[ \t]' (task 4123); all
-# four patterns now agree, closing a vocabulary that would otherwise exist
-# twice and drift (INV-5).
-#
-# The ANCHORING padding narrows the same way, for the same reason: '^\s*'
-# becomes '^[ \t]*', and the terminator is '\Z', NOT '$'. '$' (without
-# re.MULTILINE) also matches just before a single trailing newline, so a
-# naive '[ \t]*$' would still accept 'reify:132\n' while rejecting
-# 'reify:132\n\n' — an incoherent half-fix. Do not simplify '\Z' back to '$'.
-#
-# _TASK_NODE_NAME_PATTERN's own anchoring ('^\s*...\s*$') is DELIBERATELY left
-# unnarrowed, and the resulting asymmetry is declared rather than converged:
-# this pattern mints ONLY foreign referents (parse_node_name tries the local
-# pattern first, so every local spelling is already claimed), and for a
-# consumer performing destructive edge surgery a narrowing that REMOVES a
-# foreign ref is the safe direction — a missed ref is recoverable, a
-# misattributed one is not. Narrowing the LOCAL pattern instead would remove
-# bare mentions, and so remove CONTESTS, the dangerous direction — the same
-# reasoning already recorded for _QUALIFIED_REF_PATTERN's colon versus
-# _LOCAL_MENTION_PATTERN's whitespace branch below.
-#
-# SECOND AXIS, declared because it is broader than the line-break motive above
-# and the tests for that motive cannot see it: '[ \t]' drops EVERY non-space,
-# non-tab whitespace character, not just '\n'. MEASURED at HEAD before the
-# narrowing, each returning Referent(project_id='reify', number='132'):
-# '\xa0reify:132', 'reify\xa0:\xa0132' and '\x0creify:132'. All return None
-# now. ACCEPTED rather than repaired, on the same direction-of-safety argument
-# as the line-break half — this pattern mints only foreign referents, so a
-# removal is recoverable and a misattribution is not — and because NBSP or
-# form-feed padding around a project-qualified node NAME is not a spelling any
-# human or extraction path writes on purpose. Note the asymmetry with the
-# '\s+' padding two paragraphs up: there the breadth costs only an exotic
-# SPELLING of an ASCII number and the character reaches a consumer as data,
-# which is why it stays. Pinned by
-# TestQualifiedNodeNamePaddingIsAsciiSpaceAndTabOnly, whose sibling case also
-# guards that _TASK_NODE_NAME_PATTERN's padding stayed broad.
-#
-# Live impact is NIL today: task_naming.canonicalize_task_node_name returns
-# None for any qualified referent and would equally return None if the name
-# stopped parsing. The value of closing this gap is coherence and protection
-# for a future direct consumer of qualified node names.
-_QUALIFIED_NODE_NAME_PATTERN = re.compile(
-    r'^[ \t]*([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*([0-9]+)[ \t]*\Z'
+_QUALIFIED_NODE_NAME_PATTERN = _compile(_PAD, _QUALIFIER, _COLON, _NUMBER, _PAD, anchored=True)
+_TASK_VOCABULARY_QUALIFIER = _compile(r'(sub_?)?tasks?', anchored=True)
+_LOCAL_MENTION_PATTERN = _compile(
+    _MENTION_LEFT_EDGE, _TASK_WORD, _MENTION_SEPARATOR, _NUMBER, _NUMBER_END, anchored=False
 )
-
-# Task-vocabulary words are never project ids. Matched with fullmatch() against
-# the CANONICALIZED qualifier, so every spelling ('Task', 'TASK', 'sub-task',
-# 'Sub-Tasks') collapses onto this one check, while a real project id that
-# merely starts with 'task' ('taskmaster') is not rejected.
-#
-# This is the THIRD site that decides whether the task-vocabulary word was
-# written, and the only one not spelled ASCII-explicitly — deliberately, and
-# measurably safe because every caller's qualifier is ASCII before it arrives.
-# Do not casefold it without reading the module docstring's scoping paragraph
-# first: the branch that would add is unreachable, and it forks validation.py's
-# charset rule.
-#
-# Moved verbatim from cross_project_refs, where it guards the ONE rejection the
-# split consumer's decisive 'episode touched a node named Task N' guard cannot
-# make: for 'Task: 2500' that node is exactly what extraction produces, so the
-# guard is guaranteed to CO-OCCUR rather than to filter, and the split would
-# move a LOCAL task's facts onto a bogus 'task:2500' entity.
-_TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
-
-# An UNANCHORED mention of a task number in prose — the scan-side twin of
-# _TASK_NODE_NAME_PATTERN. Its separator alternation is a strict SUPERSET of
-# the anchored parser's, so every spelling that parser accepts ('task 5',
-# 'task #5', 'Task: 5') is still seen here. The glued '-'/'/' separators are
-# deliberately NOT added to the anchored parser: it drives node RENAMING, and an
-# entity named 'task-173' was never measured as a task node.
-# This ONE pattern replaces BOTH of cross_project_refs' pre-3667
-# _BARE_TASK_MENTION_PATTERN and _BARE_TASK_COLON_PATTERN, which differed only
-# in their separator; keeping them apart would leave two vocabulary copies
-# inside the very module that exists to eliminate copies (INV-5).
-#
-# - The '(?<![\w:-])' lookbehind refuses word-glued lookalikes ('subtask 5',
-#   'multitask 3', 'reify-task 12') and — decisively for the colon form — the
-#   'task: N' substring INSIDE 'subtask: N', which would otherwise suppress a
-#   real foreign ref.
-# - The digit class is '[0-9]', NOT '\d', for the reason recorded on
-#   _TASK_NODE_NAME_PATTERN above: '\d' matches Unicode decimal digits on a str
-#   pattern, so 'blocked on task \u0663 for now' yielded a referent numbered with
-#   that character — a false positive against this module's
-#   precision-over-recall contract, and the derived-path twin of the
-#   isascii()-guarded refusal at referent_resolution._is_task_number (task 3668).
-# - '(?!\d)' anchors the number's right edge so a truncated prefix is never
-#   captured. It is deliberately left BROAD — '\d', not '[0-9]' — even though the
-#   capture class narrowed. Measured: with '(?![0-9])' a MIXED run like
-#   'task 12\u0663' still matches and captures '12', which is precisely the
-#   truncated prefix this clause exists to prevent, and it is strictly worse than
-#   the bug being narrowed away — 'Task \u0663' is obvious junk, while 'Task 12'
-#   names a REAL node a destructive consumer will act on. Left broad, a mixed run
-#   yields nothing at all. A lookaround only ever REFUSES a match, so its Unicode
-#   breadth is precision, never recall loss.
-# - The '#'/':' branch is padded with '[ \t]', NOT '\s', so a mention can never
-#   span a line break. This is measured, not stylistic: '\s' matches '\n', so
-#   '\s*[#:]\s*' read a markdown heading across a paragraph break as a mention —
-#   'Completed the task\n\n# 1153 retrospective' yielded a bare Task 1153, and
-#   'The following tasks:\n\n1. fix the parser' yielded a bare Task 1. A phantom
-#   bare mention lands in bare_numbers and pushes a genuine foreign ref into
-#   .ambiguous, silently suppressing a real cross-project repair. Neither
-#   spelling was reachable before task 3667 added this branch, so trimming it
-#   restores the pre-3667 answer rather than inventing a new narrowing.
-# - The whitespace branch deliberately keeps '\s+' VERBATIM from the pre-3667
-#   _BARE_TASK_MENTION_PATTERN, newline-spanning and all. Tightening it to
-#   '[ \t]+' would be an UNDECLARED narrowing of behaviour this task never
-#   touched, and it narrows in the dangerous direction: fewer bare mentions
-#   means fewer contests, which means MORE confident splits on prose that
-#   pre-3667 refused. A false positive here only ever adds ambiguity, which the
-#   consumer refuses; a false negative lets destructive surgery proceed.
-# - The '[-/]' branch sees the hyphen-slug ('task-173-fillet-fix') and
-#   branch-name ('task/173') spellings. It is UNPADDED, exactly one character,
-#   so it can never span whitespace or a line break, and the shared lookbehind
-#   still refuses the sub-task forms 'sub-task-5' and 'reify-task-12'.
-# - The word 'tasks?' is interpolated from the SAME _TASK_WORD constant this
-#   pattern shares with _TASK_NODE_NAME_PATTERN — explicit ASCII case classes,
-#   NOT 'tasks?' plus re.IGNORECASE, for the reason recorded there:
-#   re.IGNORECASE performs FULL Unicode case folding on str patterns, so
-#   'ta\u017fk 5' and 'tas\u212a 5' matched and minted a referent from a word
-#   that was never actually 'task'. Every other class in this pattern is
-#   untouched by dropping the flag — 'tasks?' was its only cased literal.
-#   BUT the EMITTED PARTITION is not untouched, and unlike the '\s+' branch two
-#   bullets above this narrowing DOES remove bare mentions, and so removes
-#   CONTESTS — declared here rather than left for a reader to discover, because
-#   the bullet above calls that the dangerous direction. MEASURED, group_id
-#   'dark_factory': 'reify:5 blocks ta\u017fk 5' yielded refs=() and
-#   ambiguous=('reify:5', 'Task 5') before this change and yields
-#   refs=('reify:5',), ambiguous=() after, so a foreign referent the permissive
-#   scan refused to hand to destructive edge surgery is now handed over. That is
-#   acceptable HERE and not there because the removed mention was never the word
-#   'task': the contest it created was SPURIOUS, and a contest is protection
-#   only when it reflects a genuine competing reading. The '\s+' branch's
-#   mentions, by contrast, are real mentions of the real word, merely wrapped —
-#   so narrowing THERE would suppress genuine contests. Pinned by
-#   TestTaskWordIsAsciiOnly so a future revert cannot silently restore the
-#   phantom contest.
-_LOCAL_MENTION_PATTERN = re.compile(
-    r'(?<![\w:-])' + _TASK_WORD + r'(?:[ \t]*[#:][ \t]*|\s+|[-/])([0-9]+)(?!\d)'
-)
-
-# A project-qualified task reference: '<qualifier>:<digits>'. Moved VERBATIM
-# from cross_project_refs with its rationale — each clause encodes a specific
-# measured false positive, so do NOT re-derive them.
-#
-# - The lookbehind rejects a qualifier glued to a preceding word character or
-#   path/URL punctuation, which is what keeps source locations
-#   ('graphiti_client.py:2091' — '.py' is preceded by '.'), URL authorities
-#   ('example.com:8080'), colon-chained tokens ('a:b:3') and digit-prefixed
-#   junk ('2500dark_factory:2500') out.
-# - The qualifier must start with a letter, so clock times ('12:30') never
-#   match, and must be at least 3 characters, so short non-project tokens
-#   ('w6:2', 'py:3', 'a:1') never match.
-# - The colon is padded with '[ \t]', NOT '\s', on BOTH sides. It still
-#   tolerates the spaces and tabs humans actually write around a colon
-#   ('dark_factory: 2500', 'dark_factory\t:\t2500'), but it can never span a
-#   line break. This is measured, not stylistic: '\s' matches '\n', so
-#   '\s*:\s*' read a 'key:' line lead-in followed by a number on the NEXT line
-#   as a project-qualified reference — 'Notes:\n2500 items' yielded notes:2500,
-#   and 'Notes\n: 2500' likewise, since the padding BEFORE the colon spans a
-#   newline just as the trailing one does. Episode bodies routinely carry
-#   YAML/'key: value' blocks and hard-wrapped prose, and no real
-#   project-qualified reference is written across a line break.
-#   Direction of safety: this narrowing REMOVES foreign refs, and the consumer
-#   performs destructive edge surgery where a false positive MISATTRIBUTES
-#   facts — so narrowing is the safe direction here, unlike the
-#   _LOCAL_MENTION_PATTERN whitespace branch two blocks above, deliberately
-#   left as '\s+' because narrowing THERE removes bare mentions and so removes
-#   contests, which is the dangerous direction.
-#   This also brought the last '\s'-padded colon in the module into line with
-#   _TASK_NODE_NAME_PATTERN and _LOCAL_MENTION_PATTERN, which already padded
-#   '#'/':' with '[ \t]' for exactly this reason. _QUALIFIED_NODE_NAME_PATTERN
-#   above was NOT changed by task 4123 — it was out of that task's scope. Its
-#   own colon AND anchoring padding were closed separately by task 4850 (task
-#   4235 coalesced into it; task 4239 was cancelled as a duplicate filing),
-#   which brought the fourth and last pattern into line — see the comment on
-#   that pattern for the measurement. Behaviour is identical for every LIVE
-#   consumer either way, because the only production chain
-#   (task_naming.canonicalize_task_node_name) returns None for any qualified
-#   referent and would equally return None if the name stopped parsing; the
-#   value of closing it was coherence, ahead of a consumer that acts on
-#   qualified node names.
-# - The digit class is '[0-9]', NOT '\d', for the reason recorded on
-#   _TASK_NODE_NAME_PATTERN above: '\d' matches Unicode decimal digits on a str
-#   pattern, so 'see reify:\u0663 now' scanned from another group yielded a
-#   FOREIGN referent numbered with that character.
-# - '(?!\d)' anchors the number's right edge so a truncated prefix is never
-#   captured, and is deliberately left BROAD for the reason recorded on
-#   _LOCAL_MENTION_PATTERN — but the stakes are higher here. Measured: with
-#   '(?![0-9])' the mixed run 'reify:12\u0663' matches and captures
-#   ('reify', '12'), which is not mangled junk but a fully well-formed foreign
-#   referent naming the WRONG task — exactly the misattribution the consumer's
-#   destructive edge surgery exists to prevent, and one it would instead
-#   perform. Left broad, a mixed run yields nothing at all.
-_QUALIFIED_REF_PATTERN = re.compile(
-    r'(?<![\w:/.-])([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*([0-9]+)(?!\d)'
+_QUALIFIED_REF_PATTERN = _compile(
+    _REF_LEFT_EDGE, _QUALIFIER, _COLON, _NUMBER, _NUMBER_END, anchored=False
 )
 
 
@@ -416,342 +101,126 @@ _QUALIFIED_REF_PATTERN = re.compile(
 class Referent:
     """One thing a canonical label refers to: a kind, a project, a number.
 
-    Frozen because a referent is evidence for destructive graph surgery — a
-    consumer must not be able to rewrite which node it names.
-
-    Keyword-only so ``number`` can be the one REQUIRED field while ``kind``
-    and ``project_id`` carry defaults, making the overwhelmingly common
-    own-project task referent spell as ``Referent(number='132')``.
+    ``number`` keeps its digits verbatim, so '0132' and '132' are different
+    referents. An empty ``project_id`` means the own project; otherwise it is a
+    canonical id naming a different project.
     """
 
-    #: The number's digits VERBATIM — never int-normalized, so a referent
-    #: never invents or reformats a task number ('0132' stays '0132', and is
-    #: a DIFFERENT referent from '132').
     number: str
-    #: Which registry entry this referent belongs to; see :data:`_KIND_LABELS`.
     kind: str = 'task'
-    #: EMPTY means own-project / unqualified. A non-empty value is always
-    #: ``canonicalize_project_id``-canonical and denotes a DIFFERENT project.
-    #: Encoding local-ness in the referent itself is what lets
-    #: :attr:`node_name` discriminate 'Task 132' from 'reify:132' from the
-    #: referent alone, with no ambient group_id.
     project_id: str = ''
 
     def __post_init__(self) -> None:
-        if self.kind not in _KIND_LABELS:
+        if self.kind not in KIND_LABELS:
             raise ValueError(
                 f'unregistered referent kind {self.kind!r}; registered kinds are '
-                f'{sorted(_KIND_LABELS)}. Add it to canonical_labels._KIND_LABELS '
-                'rather than rendering an unlabelled referent.'
+                f'{sorted(KIND_LABELS)}. Add it to the KIND_LABELS literal in canonical_labels.py.'
             )
 
-    # Derived name is a property rather than a field so it cannot drift out of
-    # sync with the source-of-truth fields above (the CrossProjectRef.entity_name
-    # precedent).
     @property
     def node_name(self) -> str:
-        """The graph node name this referent denotes.
-
-        ``'<project_id>:<number>'`` when the referent names a foreign project
-        — the qualifier is a different-project signal and is NEVER normalized
-        away to the bare form, because that collapse is precisely the bug
-        utils/cross_project_refs.py exists to detect. Otherwise the canonical
-        bare label for the kind, e.g. ``'Task 132'``.
-        """
+        """'<project_id>:<number>' for a foreign referent, else e.g. 'Task 132'."""
         if self.project_id:
             return f'{self.project_id}:{self.number}'
-        return f'{_KIND_LABELS[self.kind]} {self.number}'
-
-
-def is_task_vocabulary_qualifier(project_id: str) -> bool:
-    """Is *project_id* a task-VOCABULARY word rather than a real project key?
-
-    ``'task'``, ``'tasks'``, ``'subtask'``, ``'sub_task'`` and their spellings
-    are local task vocabulary; none of them names a project. ``'taskmaster'``
-    — a real project that merely starts with 'task' — is not one, which is why
-    this is a ``fullmatch`` and not a prefix test.
-
-    THE single public predicate for that question, so the rule lives at exactly
-    one site (INV-5). Three callers now need it and they must agree: the two
-    inside this module (:func:`parse_node_name`, :func:`scan_content`), and
-    :func:`~fused_memory.utils.referent_resolution._declared_referents`, whose
-    ``project_id`` arrives as a STRUCTURED caller-supplied field rather than as
-    a spelling to be parsed. A second copy in the policy layer is the lockstep
-    duplication this module exists to prevent — and the declared path skipping
-    the rule outright is exactly how ``{'id': 2500, 'project_id': 'task'}``
-    came to mint a foreign ``'task:2500'`` node that cannot exist, while the
-    same spelling resolved to the LOCAL ``'Task 2500'`` through both other
-    paths.
-
-    Args:
-        project_id: A CANONICALIZED project id (``canonicalize_project_id``
-            output). Passing a raw qualifier is a caller bug: ``'Sub-Task'``
-            only collapses onto the pattern once canonicalized to
-            ``'sub_task'``.
-    """
-    return _TASK_VOCABULARY_QUALIFIER.fullmatch(project_id) is not None
-
-
-def parse_node_name(name: str) -> Referent | None:
-    """Parse an entity *name* as a whole task label, or return None.
-
-    ANCHORED by design: this answers "is this entity NAME a task label?", not
-    "does this text mention a task" (:func:`scan_content` answers that). So a
-    name that merely contains a task reference — 'Task 42 orchestrator',
-    'reify task 12' — returns None and its node is left untouched.
-
-    Two forms parse:
-
-    - The bare local form 'task(s) N', separated by whitespace, '#' or ':',
-      in any case and tolerant of padding, yielding an OWN-project referent
-      ('task #1153' -> ``Task 1153``).
-    - The project-qualified form '<project_id>:N', yielding a FOREIGN referent
-      whose qualifier is canonicalized but never normalized AWAY ('reify:132'
-      stays ``reify:132``; flattening it to ``Task 132`` is precisely the
-      cross-project collapse utils/cross_project_refs.py exists to detect).
-
-    Digits are preserved VERBATIM, never int-normalized, so a referent never
-    invents or reformats a task number ('task 0132' -> ``Task 0132``, and
-    ``Referent(number='0132') != Referent(number='132')``).
-
-    Returns None for a path-shaped qualifier rather than canonicalizing it: a
-    mangled path must never be silently mapped into a new, wrong project key
-    (RCA §4). Also None for a task-VOCABULARY qualifier ('subtask: 2500'),
-    which is local task vocabulary, not a project id.
-    """
-    local = _TASK_NODE_NAME_PATTERN.match(name)
-    if local is not None:
-        # Ordering matters: the local pattern is tried FIRST, which is what
-        # makes a vocabulary-qualified name like 'Task: 132' resolve to the
-        # local referent it is, rather than to a project named 'task'.
-        return Referent(kind='task', number=local.group(1))
-
-    qualified = _QUALIFIED_NODE_NAME_PATTERN.match(name)
-    if qualified is None:
-        return None
-    qualifier, number = qualified.group(1), qualified.group(2)
-    try:
-        project_id = canonicalize_project_id(qualifier)
-    except PathShapedProjectIdError:
-        # Defensive: the pattern cannot capture a '/' or a leading '-', so this
-        # is unreachable today. Kept so a future pattern relaxation refuses the
-        # name instead of raising into a caller's write path.
-        return None
-    if is_task_vocabulary_qualifier(project_id):
-        # 'subtask: 2500' / 'sub-task: 2500'. The local pattern already claimed
-        # every spelling that IS a local label ('Task: 132'), so anything
-        # reaching here is a word-glued lookalike, not a task label at all.
-        return None
-    return Referent(kind='task', project_id=project_id, number=number)
+        return f'{KIND_LABELS[self.kind]} {self.number}'
 
 
 @dataclass(frozen=True)
 class LabelScan:
-    """The referents found in one body of content.
+    """The referents one body of content names, in first-seen order, de-duplicated.
 
-    Frozen for the same reason :class:`Referent` is: a scan is evidence for
-    destructive graph surgery, not a mutable accumulator.
-
-    The two fields are TUPLES rather than lists, which is what makes that claim
-    true. ``frozen=True`` only blocks attribute REBINDING, so list fields would
-    leave ``scan.refs.append(...)`` wide open — a consumer could quietly add a
-    referent the scanner refused to infer and the frozen-ness would not notice.
-    Tuples also make the scan hashable, which a frozen dataclass holding lists
-    silently is not.
+    Frozen with tuple fields, so no consumer can add a referent the scan refused.
+    ``refs`` are safe to act on. ``ambiguous`` holds every referent whose number
+    the content claims both bare and foreign-qualified; a consumer must not act
+    on those.
     """
 
-    #: Referents safe to act on, in first-seen positional order,
-    #: de-duplicated on (kind, project_id, number).
     refs: tuple[Referent, ...] = ()
-    #: Referents whose number is claimed by BOTH a BARE, unqualified
-    #: own-project mention ('task 2500') and a foreign-qualified reference in
-    #: the same content. Such content is genuinely ambiguous about which task
-    #: the facts belong to, so a consumer must refuse to act on it and say so
-    #: loudly rather than guess. An explicitly qualified reference — including
-    #: a SELF-qualified one — already names its project and so never creates
-    #: ambiguity; see :func:`scan_content`.
     ambiguous: tuple[Referent, ...] = ()
 
 
+def is_task_vocabulary_qualifier(project_id: str) -> bool:
+    """Is the canonicalized *project_id* task vocabulary ('task', 'sub_tasks')
+    rather than a project ('taskmaster')?"""
+    return _TASK_VOCABULARY_QUALIFIER.regex.match(project_id) is not None
+
+
+def _project_of(qualifier: str) -> str | None:
+    try:
+        project_id = canonicalize_project_id(qualifier)
+    except PathShapedProjectIdError:
+        return None
+    return None if is_task_vocabulary_qualifier(project_id) else project_id
+
+
+def parse_node_name(name: str) -> Referent | None:
+    """Parse a whole entity *name* as a task label, or return None.
+
+    'task #1153' parses to the own-project ``Task 1153`` and 'Reify:132' to the
+    foreign ``reify:132``. A name that only mentions a task, or whose qualifier
+    is path-shaped or task vocabulary, returns None.
+    """
+    local = _TASK_NODE_NAME_PATTERN.regex.match(name)
+    if local is not None:
+        return Referent(number=local.group(1))
+    qualified = _QUALIFIED_NODE_NAME_PATTERN.regex.match(name)
+    if qualified is None:
+        return None
+    project_id = _project_of(qualified.group(1))
+    if project_id is None:
+        return None
+    return Referent(project_id=project_id, number=qualified.group(2))
+
+
 def _canonical_allowlist(known_project_ids: Iterable[str] | None) -> frozenset[str] | None:
-    """Canonicalize *known_project_ids*, or return None for permissive mode.
+    """The usable canonical registry ids, or None (permissive) when there are none.
 
-    Returns None — PERMISSIVE — in THREE cases: a missing registry, an empty
-    registry, and a non-empty registry in which NO entry yielded a usable
-    project id (every entry was either path-shaped or blank). The first two
-    mirror ``validate_known_project_id``'s documented empty-registry mode:
-    failing closed would silently disable this protection entirely on any
-    deployment that never wires the registry, which is the exact
-    silent-degradation failure mode this scanner exists to eliminate.
-
-    A path-shaped registry key is skipped rather than normalized (normalizing a
-    mangled path would mint a new, wrong canonical key — RCA §4) and rather
-    than raised, so one bad entry never disables the whole allowlist. A key
-    that canonicalizes to the EMPTY string is skipped for a different reason:
-    ``canonicalize_project_id('')`` does not raise, it returns ``''``, and ''
-    can never match a foreign referent (the qualified-ref pattern requires a
-    >=3-character qualifier). Keeping it would contribute nothing to the
-    allowlist while making it non-empty — which is exactly the failure the next
-    paragraph describes, reached through a blank key instead of a path-shaped
-    one. Both skips therefore feed the SAME ``if not canonical`` branch.
-
-    The third case returns None rather than the (empty) surviving frozenset
-    because an EMPTY frozenset ``is not None``, so the caller's
-    ``allowlist is not None`` guard in :func:`scan_content` would read "an
-    allowlist of nothing" as "allow nothing" and drop every foreign ref — the
-    whole-allowlist disablement the paragraph above forbids, arrived at by
-    skipping every entry instead of one.
-
-    That third case is LOUD: unlike the first two it is an operator
-    misconfiguration (a registry was deliberately supplied and none of it was
-    usable), so it logs a WARNING — warn-once per process, using the
-    module-level ``_all_path_shaped_warned`` flag, so a scanner on a write path
-    cannot turn one misconfiguration into a per-call log storm. Read the
-    comment on that flag before trusting its silence: it is per-PROCESS, not
-    per-registry. The missing/empty cases stay SILENT deliberately: they are
-    expected on every deployment that never wires a registry, and
-    ``validate_known_project_id`` already owns the warning for them. A registry
-    object that is truthy but yields no entries at all (an exhausted iterator)
-    is the empty case in disguise and stays silent too — there is nothing for
-    an operator to act on.
+    Path-shaped and blank entries are skipped. A supplied registry with no
+    usable entry warns once per process, because the filter then stops narrowing.
     """
     global _all_path_shaped_warned
     if not known_project_ids:
         return None
-    # Counted DURING iteration rather than with len() afterwards, which is why
-    # this parameter is typed Iterable and not Collection like the public
-    # callers' is: the public docstrings advertise "any collection", and a
-    # caller reading that loosely may well hand a generator to a helper that
-    # only ever iterates it once. A generator is truthy (so it passes the guard
-    # above) but not Sized, so a trailing len() would raise TypeError on a
-    # memory write path — in the one branch whose entire purpose is to degrade
-    # gracefully. Iterable also states the real contract: consumed ONCE, here.
     supplied = 0
-    canonical = set()
+    canonical: set[str] = set()
     for raw in known_project_ids:
         supplied += 1
         try:
-            cid = canonicalize_project_id(raw)
+            canonical.add(canonicalize_project_id(raw))
         except PathShapedProjectIdError:
             continue
-        if cid:
-            canonical.add(cid)
-    if not canonical:
-        if supplied and not _all_path_shaped_warned:
-            _all_path_shaped_warned = True
-            # Deliberately NOT interpolating the entries themselves: they are
-            # filesystem paths. The count is the actionable part.
-            logger.warning(
-                'cross-project ref allowlist disabled: none of the %d supplied '
-                'known_project_ids yielded a usable project id (each was path-shaped or '
-                'blank), so nothing survived canonicalization. The cross-project '
-                'reference filter is running in PERMISSIVE mode — foreign refs are no '
-                'longer narrowed by the registry. Likely cause: the registry was wired '
-                'with project ROOTS where project IDs were expected. Logged once per '
-                'PROCESS, not once per registry: a later, differently-broken registry '
-                'will NOT log, so re-check the registry rather than reading a silent '
-                'log as an all-clear.',
-                supplied,
-            )
-        return None
-    return frozenset(canonical)
+    canonical.discard('')
+    if canonical:
+        return frozenset(canonical)
+    if supplied and not _all_path_shaped_warned:
+        _all_path_shaped_warned = True
+        logger.warning(
+            'cross-project ref allowlist disabled: none of the %d supplied '
+            'known_project_ids is a usable project id (each was path-shaped or blank), '
+            'so the filter runs in PERMISSIVE mode. Likely cause: the registry was wired '
+            'with project ROOTS where project IDs were expected. Logged once per process: '
+            're-check the registry rather than reading a silent log as an all-clear.',
+            supplied,
+        )
+    return None
 
 
 def scan_content(
     content: str,
     *,
     group_id: str,
-    known_project_ids: Collection[str] | None = None,
+    known_project_ids: Iterable[str] | None = None,
 ) -> LabelScan:
-    """Scan *content* for every task referent it mentions.
+    """Scan the verbatim *content* for every task referent it mentions.
 
-    The UNANCHORED counterpart to :func:`parse_node_name`: this answers "what
-    does this prose refer to", reading the VERBATIM body rather than extracted
-    node names or LLM-restated facts, because a project qualifier is exactly
-    what entity extraction discards.
-
-    PRECISION OVER RECALL. Consumers perform destructive edge surgery, so a
-    false positive misattributes a fact — the same bug in the opposite
-    direction. The narrowings that make that safe live in the compiled
-    patterns above and are deliberately conservative.
-
-    KNOWN BLIND SPOTS, so no reader assumes completeness: a node named with
-    bare digits ('1251'), a reference made by task TITLE rather than number,
-    and Greek-letter or codename aliases are all invisible here by design. So
-    are list continuations ('tasks 3659 and 3500' and 'Tasks 5949/5849' see
-    only the first number), non-task vocabulary ('gate 184', 'carrier 6033')
-    and the bare hash '#4262'. Recall widening for list forms is deliberately
-    NOT done: no precision measurement backs it. The declared-referent gate
-    does not reject over these blind spots, because a declared number the
-    content writes as a digit run is exempt from its typo axis (see
-    ``referent_resolution._conflicting_referents``, choice 5).
-    A task number written in NON-ASCII digits ('task \u0663', 'reify:\u0663') is
-    likewise invisible, and so is a MIXED run ('task 12\u0663', which yields
-    nothing rather than a truncated 'Task 12') — the deliberate, negligible
-    recall loss that is the price of the ``[0-9]`` capture classes above, which
-    exist because '\\d' matched those spellings and minted referents naming no
-    task at all. A mention whose WORD is spelled with a Unicode lookalike that
-    case-folds onto ASCII under re.IGNORECASE — U+017F LATIN SMALL LETTER LONG
-    S ('ta\u017fk 5') or U+212A KELVIN SIGN ('tas\u212a 5') — is likewise
-    invisible now that the word is matched with explicit ASCII case classes
-    instead of a flag (task 4850): the negligible recall loss that is the
-    price of refusing referents IGNORECASE would otherwise have minted with a
-    REAL ASCII task number. Recall is the consumer's problem; precision is
-    this module's.
-
-    One blind spot was MEASURED and accepted rather than merely designed
-    around: a genuine qualified ref split across lines by HARD WRAPPING is
-    missed. Wrapping breaks at the space after the colon, so
-    ``textwrap.fill('...the reference dark_factory: 2500 for more detail', 40)``
-    produces 'dark_factory:\\n2500 for more detail', which
-    :data:`_QUALIFIED_REF_PATTERN`'s '[ \\t]' padding cannot span. That is a
-    real recall loss on wrapped episode bodies, not only a true-negative on
-    YAML-ish noise, and it is the price of the same narrowing that stops
-    'Notes:\\n2500 items' minting a 'notes' project — see the direction-of-safety
-    note on that pattern: for a consumer doing destructive edge surgery, a
-    missed ref is recoverable and a misattributed one is not.
-
-    Args:
-        content: The verbatim body. Falsy content yields an empty scan.
-        group_id: The group the content belongs to (= the local
-            ``project_id``). A reference qualified with this project is not
-            cross-project: it is RECLASSIFIED to an own-project referent, since
-            extraction collapsing 'reify:5181' onto 'Task 5181' inside the
-            reify graph is correct, not a bug. Both sides are canonicalized
-            before the comparison, so case and hyphen/underscore spelling
-            differences still count as local.
-        known_project_ids: Optional registry of known project ids (any
-            collection; a ``{project_id: project_root}`` mapping works, since
-            iterating it yields its keys). When non-empty, FOREIGN referents
-            naming a project outside it are dropped — own-project referents
-            are never dropped by it. When None, empty, or made up entirely of
-            unusable entries — path-shaped or blank, so that nothing survives
-            canonicalization — the filter is PERMISSIVE; see
-            :func:`_canonical_allowlist`.
-
-            Narrowing is STRICTLY SUBTRACTIVE: it can only ever remove a
-            referent from the result, never add one. Dropping a foreign
-            candidate removes it from both partitions but PRESERVES the
-            ambiguity contest it created, because the contest is decided
-            against the permissive candidate set. Without that, dropping the
-            junk qualifier in 'Restarted redis at localhost:6379 while
-            finishing task 6379.' would promote the bare 'task 6379' out of
-            ``ambiguous`` and into ``refs`` — turning an episode that produces
-            NO referent set today, which every consumer no-ops on, into one
-            that produces a set a repair path will act on. A narrowing that
-            mints referents is a net regression, not a precision win.
-
-    Returns:
-        A :class:`LabelScan`. ``refs`` is safe to act on; ``ambiguous`` must
-        not be acted on silently. A number goes to ``ambiguous`` only when the
-        content claims it BOTH bare ('task 2500', which never says which
-        project) and foreign-qualified. Two QUALIFIED references — even when
-        one of them is self-qualified — each already name their project and are
-        never mutually ambiguous.
-
-    A path-shaped *group_id* yields an empty scan: without a trustworthy local
-    project id, local and foreign references cannot be told apart, and the
-    conservative answer is to report nothing.
+    A ref qualified with *group_id*'s own project is reclassified as an
+    own-project referent. When *known_project_ids* (any iterable, consumed
+    once; a mapping's keys work) has a usable entry, foreign refs outside it
+    are dropped, but a dropped ref still contests a bare mention of its number,
+    so narrowing only ever removes referents. A path-shaped *group_id* yields
+    an empty scan. Accepted blind spots: bare digits, task titles, list
+    continuations, non-ASCII digits or lookalike letters, and a qualified ref
+    hard-wrapped across a line break.
     """
     if not content:
         return LabelScan()
@@ -759,119 +228,31 @@ def scan_content(
         local_project = canonicalize_project_id(group_id)
     except PathShapedProjectIdError:
         return LabelScan()
-
     allowlist = _canonical_allowlist(known_project_ids)
-    # (offset, referent, arrived_bare). The third element records whether the
-    # referent came from an UNQUALIFIED mention, which is what the ambiguity
-    # partition below is decided on.
-    found: list[tuple[int, Referent, bool]] = []
-    # (kind, number) of every foreign candidate the allowlist DROPS. The
-    # candidate itself never reaches `found`, but the ambiguity CONTEST it
-    # created against a bare mention of the same number must survive it — see
-    # the subtractive guarantee below. Empty whenever `allowlist is None`,
-    # which is what makes the narrowing a provable no-op for permissive
-    # callers.
-    dropped_foreign_keys: set[tuple[str, str]] = set()
+    found: list[tuple[int, Referent]] = []
+    bare: set[tuple[str, str]] = set()
+    foreign: set[tuple[str, str]] = set()
 
-    for match in _LOCAL_MENTION_PATTERN.finditer(content):
-        found.append((match.start(), Referent(kind='task', number=match.group(1)), True))
+    for match in _LOCAL_MENTION_PATTERN.regex.finditer(content):
+        referent = Referent(number=match.group(1))
+        found.append((match.start(), referent))
+        bare.add((referent.kind, referent.number))
 
-    for match in _QUALIFIED_REF_PATTERN.finditer(content):
-        qualifier, number = match.group(1), match.group(2)
-        try:
-            project_id = canonicalize_project_id(qualifier)
-        except PathShapedProjectIdError:
-            # Defensive: the pattern cannot capture a '/' or a leading '-', so
-            # this is unreachable today. Kept so a future pattern relaxation
-            # skips the candidate instead of raising into the write path.
-            continue
-        if is_task_vocabulary_qualifier(project_id):
-            # 'Task: 2500' / 'subtask: 2500'. The local pass above already
-            # claimed every spelling that IS a local mention, so dropping this
-            # candidate loses nothing and stops 'task' becoming a project id.
+    for match in _QUALIFIED_REF_PATTERN.regex.finditer(content):
+        project_id = _project_of(match.group(1))
+        if project_id is None:
             continue
         if project_id == local_project:
-            # Self-qualified: a genuine LOCAL referent, not a foreign one.
-            # Reclassifying rather than dropping keeps the local referent set
-            # complete for consumers that need it; the foreign-only filter in
-            # cross_project_refs.find_cross_project_task_refs reproduces the
-            # drop that module wants.
-            found.append((match.start(), Referent(kind='task', number=number), False))
+            found.append((match.start(), Referent(number=match.group(2))))
             continue
-        foreign = Referent(kind='task', project_id=project_id, number=number)
-        if allowlist is not None and project_id not in allowlist:
-            # Keyed off the candidate itself rather than a literal, so the key
-            # cannot drift from the kind the referent actually carries.
-            dropped_foreign_keys.add((foreign.kind, foreign.number))
-            continue
-        found.append((match.start(), foreign, False))
+        referent = Referent(project_id=project_id, number=match.group(2))
+        foreign.add((referent.kind, referent.number))
+        if allowlist is None or project_id in allowlist:
+            found.append((match.start(), referent))
 
-    # Merge the two passes by OFFSET rather than concatenating them, so the
-    # result reads in the order a human reads the content. Sorting is stable,
-    # so the rare same-offset pair keeps its discovery order.
     found.sort(key=lambda item: item[0])
-
-    deduped: list[Referent] = []
-    seen: set[tuple[str, str, str]] = set()
-    for _offset, referent, _arrived_bare in found:
-        key = (referent.kind, referent.project_id, referent.number)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(referent)
-
-    # A number claimed BOTH by a BARE, unqualified mention and by a
-    # foreign-qualified reference cannot say which task the facts belong to.
-    #
-    # Only an UNQUALIFIED mention creates a contest. Ambiguity is a property of
-    # what the prose FAILED to say: an explicitly project-qualified reference
-    # already names its project, so two qualified references — even when one of
-    # them is SELF-qualified and was reclassified into an own-project referent
-    # above — are never mutually ambiguous. Contesting on own-project-ness
-    # instead would make 'reify:2500 relates to dark_factory:2500' ambiguous in
-    # group reify, suppressing a real cross-project repair that nothing in the
-    # content actually cast doubt on.
-    #
-    # The partition is SYMMETRIC: when a contest IS real, both referents are
-    # derived from the same ambiguous prose, so handing a consumer the local one
-    # as clean evidence would be a confidently-wrong answer, not a safe
-    # fallback. Refuse both rather than pick either.
-    #
-    # It is per-NUMBER, not per-content, so one contested number never
-    # suppresses an unrelated clean ref elsewhere in the same body.
-    #
-    # The contest is keyed on (kind, number) — the same tuple dedup uses, minus
-    # project_id, which is exactly the axis being contested. Keying on the bare
-    # number alone happens to agree today only because _KIND_LABELS holds one
-    # entry; the moment 'escalation' joins the registry, a bare 'escalation
-    # 2500' mention would contest an unrelated foreign TASK ref
-    # 'dark_factory:2500' and suppress a real repair. That failure could not be
-    # caught by any test, since no test can construct a second kind, so the
-    # guard has to be structural.
-    #
-    # bare_keys is computed over the PRE-dedup `found` list, NOT over
-    # `deduped`, because bare-ness must be STICKY per number. Dedup is
-    # first-seen-wins on (kind, project_id, number), so in
-    # 'reify:2500 and task 2500 and dark_factory:2500' the self-qualified
-    # spelling arrives first and the surviving own-project referent is the one
-    # that arrived QUALIFIED — reading bare-ness off `deduped` would silently
-    # lose a genuine contest the content does contain. (Dedup still collapses
-    # 'reify:5181 and task 5181' to one own-project referent; that pair simply
-    # has no foreign side to contest.)
-    # The contest is decided against the PERMISSIVE candidate set while the
-    # emitted refs stay NARROWED, which is what makes narrowing STRICTLY
-    # SUBTRACTIVE. A dropped foreign candidate is gone from both partitions,
-    # but it was also the thing CONTESTING a bare mention of its number;
-    # letting the drop take the contest with it would PROMOTE that bare
-    # mention out of `.ambiguous` and into `.refs` — narrowing minting a
-    # referent the permissive scan refused to mint. Only the contest survives
-    # the drop, never the candidate.
-    bare_keys = {(r.kind, r.number) for _offset, r, arrived_bare in found if arrived_bare}
-    foreign_keys = {(r.kind, r.number) for r in deduped if r.project_id} | dropped_foreign_keys
-    contested = bare_keys & foreign_keys
-
-    # Digits are compared as literals, never int-normalized, so '0250' and
-    # '250' are different numbers and create no false contest.
+    deduped = list(dict.fromkeys(referent for _offset, referent in found))
+    contested = bare & foreign
     return LabelScan(
         refs=tuple(r for r in deduped if (r.kind, r.number) not in contested),
         ambiguous=tuple(r for r in deduped if (r.kind, r.number) in contested),

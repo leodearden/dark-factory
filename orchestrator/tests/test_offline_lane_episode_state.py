@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
@@ -38,6 +39,7 @@ from _lane_episode_fakes import (
 )
 from shared.lane_probe import OUTAGE_EXIT_STATUS
 
+from orchestrator.flake_ledger import DebtTrigger
 from orchestrator.guard_state import PersistentMap
 from orchestrator.offline_lane_confirm import (
     Outage,
@@ -47,12 +49,17 @@ from orchestrator.offline_lane_confirm import (
 from orchestrator.offline_lane_episode_state import (
     EPISODE_RETENTION,
     CommandRecord,
+    CoveringStatuses,
     CoveringVerdict,
+    EndedEpisode,
     Episode,
     EpisodeStore,
     LanePolicy,
+    OfferedDebt,
+    PassEffect,
     PassObservation,
     apply_outage,
+    is_live_owner,
     recheck_due,
     unconfirmable_node,
     with_recorded_history,
@@ -180,6 +187,53 @@ def test_a_record_stored_under_another_command_loads_empty(tmp_path: Path, caplo
     assert any(r.levelno == logging.ERROR and repr(COMMAND) in r.getMessage() for r in caplog.records)
 
 
+def test_strict_records_are_every_live_record_and_leave_out_an_expired_one(tmp_path: Path):
+    clock = Clock()
+    store = EpisodeStore(tmp_path, clock=clock)
+    store.save(replace(CommandRecord.empty('expired'), episodes={C: _episode(C)}))
+    clock.at = T0 + SPACED
+    store.save(_full_record())
+    clock.at = T0 + EPISODE_RETENTION
+
+    assert set(json.loads(_episodes_path(tmp_path).read_text())) == {'expired', COMMAND}
+    assert EpisodeStore(tmp_path, clock=clock).strict_records() == {COMMAND: _full_record()}
+
+
+def test_strict_records_of_a_project_with_no_episode_file_are_none(tmp_path: Path):
+    assert EpisodeStore(tmp_path, clock=Clock()).strict_records() == {}
+
+
+@pytest.mark.parametrize(('contents', 'named'), [
+    ('{"integration": {"value": ', 'Expecting value'),
+    ('[]', 'JSON list'),
+    ('{"integration": {"value": {}}}', "['integration']"),
+])
+def test_strict_records_refuse_a_file_or_row_the_map_reads_as_absent(tmp_path: Path, contents: str, named: str):
+    _episodes_path(tmp_path).parent.mkdir(parents=True)
+    _episodes_path(tmp_path).write_text(contents)
+    store = EpisodeStore(tmp_path, clock=Clock())
+    assert store.commands() == []
+
+    with pytest.raises(ValueError, match=re.escape(named)):
+        store.strict_records()
+
+
+def test_strict_records_refuse_a_record_that_loads_empty(tmp_path: Path):
+    payload = _full_record().to_json()
+    payload['episodes'][0]['counted_passes'] = 'p0'
+    _stored_raw(tmp_path, COMMAND, payload)
+
+    with pytest.raises(ValueError, match=f'{COMMAND!r}.*counted_passes'):
+        EpisodeStore(tmp_path, clock=Clock()).strict_records()
+
+
+def test_strict_records_refuse_a_record_stored_under_another_command(tmp_path: Path):
+    _stored_raw(tmp_path, 'other', _full_record().to_json())
+
+    with pytest.raises(ValueError, match=f"'other' names {COMMAND!r}"):
+        EpisodeStore(tmp_path, clock=Clock()).strict_records()
+
+
 def test_one_save_is_one_file_write(tmp_path: Path):
     clock = Clock()
     writes = StoreWrites(tmp_path, clock)
@@ -207,6 +261,122 @@ def test_the_pass_effect_is_json(tmp_path: Path):
     assert json.loads(json.dumps(applied.effect.to_json()))['episodes_ended'] == [
         {'node': A, 'reason': 'cleared', 'counted_passes': 1, 'reproduced_heads': [HEAD0]},
     ]
+
+
+def test_covering_statuses_name_the_done_and_closed_tasks_terminal():
+    covering = CoveringStatuses(
+        {'1': 'pending', '2': 'in-progress', '3': 'blocked', '4': 'deferred', '5': 'done', '6': 'cancelled'},
+    )
+
+    assert covering.terminal_task_ids == frozenset({'5', '6'})
+
+
+def test_unreadable_covering_statuses_name_no_task_terminal():
+    assert CoveringStatuses({'5': 'done'}, 'task store unreachable').terminal_task_ids == frozenset()
+
+
+@pytest.mark.parametrize(
+    ('status', 'live'),
+    [
+        ('pending', True), ('in-progress', True), ('blocked', True), ('deferred', True),
+        ('done', False), ('cancelled', False), ('', False), (None, False),
+    ],
+)
+def test_an_owner_is_live_while_open_or_deferred(status: str | None, live: bool):
+    assert is_live_owner(status) is live
+
+
+def _effect(**debts) -> PassEffect:
+    return PassEffect(
+        tests_counted=(), episodes_started=(), episodes_extended=(), episodes_ended=(), threshold_reached=(),
+        stale_heads=(), no_decision=(), tasks_filed=(), escalations_raised=(), **debts,
+    )
+
+
+def test_a_pass_effect_built_without_debts_offers_none():
+    payload = _effect().to_json()
+
+    assert (payload['debts_offered'], payload['debts_undecided']) == ([], [])
+
+
+def test_the_pass_effect_names_the_debts_it_offered_and_left_undecided():
+    effect = _effect(
+        debts_offered=(OfferedDebt(node=A, trigger=DebtTrigger.cleared, head=HEAD1), OfferedDebt(B, DebtTrigger.recovered, HEAD0)),
+        debts_undecided=(C,),
+    )
+
+    payload = json.loads(json.dumps(effect.to_json()))
+
+    assert payload['debts_offered'] == [
+        {'node': A, 'trigger': 'cleared', 'head': HEAD1},
+        {'node': B, 'trigger': 'recovered', 'head': HEAD0},
+    ]
+    assert payload['debts_undecided'] == [C]
+
+
+def _full_effect() -> PassEffect:
+    return PassEffect(
+        tests_counted=(A, B),
+        episodes_started=(B,),
+        episodes_extended=(A,),
+        episodes_ended=(
+            EndedEpisode(node=C, reason='cleared', counted_passes=1, reproduced_heads=(HEAD0,)),
+            EndedEpisode(node='d', reason='passed', counted_passes=3, reproduced_heads=(HEAD0, HEAD1)),
+        ),
+        threshold_reached=(A,),
+        stale_heads=('e',),
+        no_decision=('f',),
+        tasks_filed=('9001',),
+        escalations_raised=('esc-1', 'esc-2'),
+        debts_offered=(OfferedDebt(C, DebtTrigger.cleared, HEAD1), OfferedDebt('d', DebtTrigger.recovered, HEAD2)),
+        debts_undecided=('g',),
+    )
+
+
+def test_a_pass_effect_reads_back_from_its_json():
+    effect = _full_effect()
+
+    assert PassEffect.from_json(effect.to_json()) == effect
+    assert PassEffect.from_json(json.loads(json.dumps(effect.to_json()))) == effect
+
+
+def test_an_effect_written_before_the_debt_fields_reads_with_none_offered_or_undecided():
+    payload = _full_effect().to_json()
+    del payload['debts_offered'], payload['debts_undecided']
+
+    effect = PassEffect.from_json(payload)
+
+    assert (effect.debts_offered, effect.debts_undecided) == ((), ())
+    assert effect.tasks_filed == ('9001',)
+
+
+def _without_tasks_filed(payload: dict) -> object:
+    del payload['tasks_filed']
+    return payload
+
+
+def _threshold_not_strings(payload: dict) -> object:
+    return {**payload, 'threshold_reached': [A, 7]}
+
+
+def _bool_counted_passes(payload: dict) -> object:
+    return {**payload, 'episodes_ended': [{**payload['episodes_ended'][0], 'counted_passes': True}]}
+
+
+def _unknown_trigger(payload: dict) -> object:
+    return {**payload, 'debts_offered': [{**payload['debts_offered'][0], 'trigger': 'vanished'}]}
+
+
+def _not_an_object(payload: dict) -> object:
+    return [payload]
+
+
+@pytest.mark.parametrize(
+    'malform', [_without_tasks_filed, _threshold_not_strings, _bool_counted_passes, _unknown_trigger, _not_an_object],
+)
+def test_a_malformed_effect_is_refused(malform):
+    with pytest.raises(ValueError):
+        PassEffect.from_json(malform(_full_effect().to_json()))
 
 
 # --- D5: what one pass does to a held test's episode -------------------------------

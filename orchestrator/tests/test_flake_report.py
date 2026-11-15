@@ -718,19 +718,19 @@ class TestBuildReport:
     def test_all_three_counters_are_populated(self, tmp_path):
         report = build_report(self._seeded(tmp_path), now=_NOW)
         # 3 unconfirmable + 7 confirmed == 10 observations, rate 0.3, over the floor of 8.
-        assert report.gate_blind.unconfirmable == 3
-        assert report.gate_blind.confirmed == 7
-        assert report.gate_blind.rate == pytest.approx(0.3)
-        assert report.gate_blind.sufficient is True
-        assert report.gate_blind.exceeds_threshold is True
+        assert report.gate_blind_by_call_site['merge_gate'].unconfirmable == 3
+        assert report.gate_blind_by_call_site['merge_gate'].confirmed == 7
+        assert report.gate_blind_by_call_site['merge_gate'].rate == pytest.approx(0.3)
+        assert report.gate_blind_by_call_site['merge_gate'].sufficient is True
+        assert report.gate_blind_by_call_site['merge_gate'].exceeds_threshold is True
         # Class 2: one recurrent (open_count 3), one over the 3d age bound.
         assert report.non_convergence.open_tests == 2
         assert report.non_convergence.recurrent_tests == 1
         assert report.non_convergence.over_age_tests == 1
         assert report.non_convergence.unowned_tests == 0
         # Class 3: one test suppressed six times is NOT systemic.
-        assert report.systemic.peak_distinct_tests == 1
-        assert report.systemic.exceeds_threshold is False
+        assert report.systemic_by_call_site['merge_gate'].peak_distinct_tests == 1
+        assert report.systemic_by_call_site['merge_gate'].exceeds_threshold is False
 
     def test_window_since_is_derived_from_now_and_window_hours(self, tmp_path):
         report = build_report(self._seeded(tmp_path), now=_NOW, window_hours=24)
@@ -746,7 +746,7 @@ class TestBuildReport:
         _seed_occurrence(db_path, test_id='tests/test_old.py::test_x',
                          observed_at='2025-01-01T00:00:00+00:00')
         report = build_report(db_path, now=_NOW, window_hours=168)
-        assert report.gate_blind.total == 0, 'a pre-window occurrence must not be counted'
+        assert report.gate_blind_by_call_site['merge_gate'].total == 0, 'a pre-window occurrence must not be counted'
         # ...but its test still resolves a debt row, so the chain remains visible.
         assert [c.test_id for c in report.chains] == ['tests/test_old.py::test_x']
         assert report.chains[0].debt is not None
@@ -844,12 +844,12 @@ class TestThresholdPlumbing:
         )
 
     def _assert_forwarded(self, report: FlakeLedgerReport) -> None:
-        assert report.gate_blind.window_hours == 23
-        assert report.gate_blind.threshold == 0.77
-        assert report.gate_blind.min_observations == 13
+        assert report.gate_blind_by_call_site['merge_gate'].window_hours == 23
+        assert report.gate_blind_by_call_site['merge_gate'].threshold == 0.77
+        assert report.gate_blind_by_call_site['merge_gate'].min_observations == 13
         assert report.non_convergence.age_threshold_days == 11
-        assert report.systemic.threshold == 17
-        assert report.systemic.window_minutes == 19
+        assert report.systemic_by_call_site['merge_gate'].threshold == 17
+        assert report.systemic_by_call_site['merge_gate'].window_minutes == 19
 
     def test_build_report_forwards_every_threshold(self, tmp_path):
         self._assert_forwarded(self._custom_report(self._seeded(tmp_path)))
@@ -1086,8 +1086,8 @@ class TestReadOnlyContract:
         assert report.chains == []
         # Absence must not render as a healthy 0.0 rate — that is exactly the silent
         # degradation the PRD exists to end.
-        assert report.gate_blind.rate is None
-        assert report.gate_blind.sufficient is False
+        assert report.gate_blind_by_call_site['merge_gate'].rate is None
+        assert report.gate_blind_by_call_site['merge_gate'].sufficient is False
 
     def test_the_report_module_binds_no_write_entry_point(self):
         # A direct structural check on the read-only contract, and the one that survives
@@ -1121,7 +1121,7 @@ class TestReadOnlyContract:
         report = build_report(db_path, now=_NOW)
         assert report.db_present is True
         assert len(report.open_debt) == 1
-        assert report.gate_blind.total == 1
+        assert report.gate_blind_by_call_site['merge_gate'].total == 1
 
 
 class TestUnreadableLedger:
@@ -1254,12 +1254,12 @@ class TestTruncationHonesty:
     def test_a_filled_limit_marks_the_counter_truncated(self, tmp_path):
         db_path = self._seed_n(tmp_path, 10)
         report = build_report(db_path, now=_NOW, occurrence_limit=5)
-        assert report.gate_blind.truncated is True
+        assert report.gate_blind_by_call_site['merge_gate'].truncated is True
 
     def test_a_limit_above_the_row_count_is_not_truncated(self, tmp_path):
         db_path = self._seed_n(tmp_path, 10)
         report = build_report(db_path, now=_NOW, occurrence_limit=500)
-        assert report.gate_blind.truncated is False
+        assert report.gate_blind_by_call_site['merge_gate'].truncated is False
 
     def test_the_render_caveats_a_truncated_window(self, tmp_path):
         # α's read_occurrences docstring: "a count over a limit-capped read is a count
@@ -1286,9 +1286,9 @@ def _report(
     db_present: bool = True,
     open_debt: list[DebtReportRow] | None = None,
     chains: list | None = None,
-    gate_blind: GateBlindCounter | None = None,
+    gate_blind_by_call_site: dict[str, GateBlindCounter] | None = None,
     non_convergence: NonConvergenceCounter | None = None,
-    systemic: SystemicCounter | None = None,
+    systemic_by_call_site: dict[str, SystemicCounter] | None = None,
 ) -> FlakeLedgerReport:
     """A hand-built report object — the render tests need no DB."""
     return FlakeLedgerReport(
@@ -1298,10 +1298,174 @@ def _report(
         window_since='2026-08-03T12:00:00+00:00' if db_present else None,
         open_debt=open_debt or [],
         chains=chains or [],
-        gate_blind=gate_blind or compute_gate_blind([]),
+        gate_blind_by_call_site=gate_blind_by_call_site or {'merge_gate': compute_gate_blind([])},
         non_convergence=non_convergence or compute_non_convergence([], _NOW),
-        systemic=systemic or compute_systemic([]),
+        systemic_by_call_site=systemic_by_call_site or {'merge_gate': compute_systemic([])},
     )
+
+
+_ALL_CALL_SITES = {m.value for m in FlakeCallSite}
+
+
+def _seed_merge_gate(db_path: Path) -> None:
+    """Ten merge-gate observations: 3 unconfirmable, 5 passes of one test, 2 fails."""
+    for i in range(3):
+        _seed_occurrence(db_path, test_id=UNKNOWN_TEST_ID,
+                         observed_at=f'2026-08-09T0{i}:00:00+00:00',
+                         verdict=FlakeVerdict.unconfirmable)
+    for i in range(5):
+        _seed_occurrence(db_path, test_id='tests/test_a.py::test_one',
+                         observed_at=f'2026-08-09T1{i}:00:00+00:00')
+    for i in range(2):
+        _seed_occurrence(db_path, test_id='tests/test_b.py::test_two',
+                         observed_at=f'2026-08-09T2{i}:00:00+00:00',
+                         verdict=FlakeVerdict.fails_in_isolation)
+
+
+def _seed_offline_lane(db_path: Path) -> None:
+    """Ten lane observations: 6 unconfirmable, and 4 distinct tests cleared in one hour."""
+    for i in range(6):
+        _seed_occurrence(db_path, test_id=UNKNOWN_TEST_ID,
+                         observed_at=f'2026-08-09T0{i}:30:00+00:00',
+                         verdict=FlakeVerdict.unconfirmable,
+                         call_site=FlakeCallSite.offline_lane)
+    for i in range(4):
+        _seed_occurrence(db_path, test_id=f'tests/test_lane.py::test_{i}',
+                         observed_at=f'2026-08-09T15:0{i}:00+00:00',
+                         call_site=FlakeCallSite.offline_lane)
+
+
+def _ledger(tmp_path: Path, name: str, *seeders) -> Path:
+    db_path = tmp_path / name / 'runs.db'
+    db_path.parent.mkdir(parents=True)
+    ensure_schema(db_path)
+    for seed in seeders:
+        seed(db_path)
+    return db_path
+
+
+def _blocks(rendered: str) -> dict[str, list[str]]:
+    """The HEALTH COUNTERS section's per-call-site blocks, keyed by call site, in order."""
+    blocks: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for line in rendered.splitlines():
+        if line.startswith('  call site ') and line.endswith(':'):
+            current = blocks.setdefault(line.removeprefix('  call site ').removesuffix(':'), [])
+        elif not line.startswith('    '):
+            current = None
+        elif current is not None:
+            current.append(line.strip())
+    return blocks
+
+
+class TestPerCallSiteCounters:
+    """Gate-blind and systemic are counted per stored call site (offline-lane PRD D6):
+    lane rows must not move the merge gate's numbers, and a call site that has never
+    written is a different fact from one with nothing in the window."""
+
+    def test_lane_rows_leave_the_merge_gates_counters_as_they_were(self, tmp_path):
+        merge_only = build_report(_ledger(tmp_path, 'm', _seed_merge_gate), now=_NOW)
+        both = build_report(
+            _ledger(tmp_path, 'b', _seed_merge_gate, _seed_offline_lane), now=_NOW,
+        )
+
+        assert both.gate_blind_by_call_site['merge_gate'] == (
+            merge_only.gate_blind_by_call_site['merge_gate']
+        )
+        assert both.systemic_by_call_site['merge_gate'] == (
+            merge_only.systemic_by_call_site['merge_gate']
+        )
+        lane = both.gate_blind_by_call_site['offline_lane']
+        assert (lane.unconfirmable, lane.confirmed, lane.total) == (6, 4, 10)
+        assert lane.exceeds_threshold is True
+        lane_systemic = both.systemic_by_call_site['offline_lane']
+        assert (lane_systemic.peak_distinct_tests, lane_systemic.exceeds_threshold) == (4, True)
+        for report in (merge_only, both):
+            assert set(report.gate_blind_by_call_site) >= _ALL_CALL_SITES
+            assert set(report.gate_blind_by_call_site) == set(report.systemic_by_call_site)
+
+    def test_an_off_vocabulary_call_site_keeps_its_own_key(self, tmp_path):
+        def _misspelled(db_path: Path) -> None:
+            _seed_occurrence(db_path, test_id='t', observed_at='2026-08-09T12:00:00+00:00',
+                             call_site='merge-gate')
+
+        report = build_report(_ledger(tmp_path, 'x', _misspelled), now=_NOW)
+
+        assert report.gate_blind_by_call_site['merge-gate'].total == 1
+        assert report.gate_blind_by_call_site['merge_gate'].total == 0
+        assert report.systemic_by_call_site['merge-gate'].peak_distinct_tests == 1
+
+    def test_an_empty_ledger_still_reports_the_merge_gate(self, tmp_path):
+        report = build_report(_ledger(tmp_path, 'e'), now=_NOW)
+
+        assert 'merge_gate' in report.gate_blind_by_call_site
+        assert set(report.systemic_by_call_site) == _ALL_CALL_SITES
+
+    def test_non_convergence_is_not_partitioned(self, tmp_path):
+        report = build_report(_ledger(tmp_path, 'n', _seed_merge_gate), now=_NOW)
+
+        assert isinstance(report.non_convergence, NonConvergenceCounter)
+
+    def test_one_block_per_call_site_in_sorted_order(self, tmp_path):
+        rendered = render_report(
+            build_report(_ledger(tmp_path, 'b', _seed_merge_gate, _seed_offline_lane), now=_NOW),
+        )
+
+        headers = [ln for ln in rendered.splitlines() if ln.startswith('  call site ')]
+        assert headers == [f'  call site {key}:' for key in sorted(_ALL_CALL_SITES)]
+
+    def test_a_never_written_call_site_says_so(self, tmp_path):
+        blocks = _blocks(render_report(
+            build_report(_ledger(tmp_path, 'm', _seed_merge_gate), now=_NOW),
+        ))
+
+        assert blocks['offline_lane'] == ['no rows ever written from this call site']
+        assert 'no rows ever written from this call site' not in blocks['merge_gate']
+
+    def test_a_call_site_with_only_old_rows_is_not_never_written(self, tmp_path):
+        def _old_lane_row(db_path: Path) -> None:
+            _seed_occurrence(db_path, test_id='t', observed_at='2025-01-01T00:00:00+00:00',
+                             call_site=FlakeCallSite.offline_lane)
+
+        blocks = _blocks(render_report(build_report(_ledger(tmp_path, 'o', _old_lane_row), now=_NOW)))
+
+        assert 'no occurrences in window' in blocks['offline_lane']
+        assert 'no rows ever written from this call site' not in blocks['offline_lane']
+
+    def test_an_unmeasured_report_claims_nothing_about_history(self, tmp_path):
+        rendered = render_report(build_report(tmp_path / 'nope' / 'runs.db', now=_NOW))
+        blocks = _blocks(rendered)
+
+        assert set(blocks) == _ALL_CALL_SITES
+        for lines in blocks.values():
+            assert 'status: not measured (no ledger reading)' in lines, lines
+        assert 'no rows ever written' not in rendered
+
+    def test_a_truncated_read_warns_once(self, tmp_path):
+        def _many(db_path: Path) -> None:
+            for i in range(10):
+                _seed_occurrence(db_path, test_id=f't{i}', observed_at=f'2026-08-09T12:00:{i:02d}+00:00',
+                                 call_site=FlakeCallSite.offline_lane if i % 2 else FlakeCallSite.merge_gate)
+
+        rendered = render_report(
+            build_report(_ledger(tmp_path, 't', _many), now=_NOW, occurrence_limit=5),
+        )
+
+        assert len([ln for ln in rendered.splitlines() if 'TRUNCATED' in ln]) == 1, rendered
+
+    @pytest.mark.parametrize(
+        ('gate_blind_keys', 'systemic_keys'),
+        [({'offline_lane'}, {'offline_lane'}), ({'merge_gate'}, {'merge_gate', 'offline_lane'})],
+        ids=['no-merge-gate', 'differing-keys'],
+    )
+    def test_the_report_refuses_maps_that_break_the_partition(
+        self, gate_blind_keys, systemic_keys,
+    ):
+        with pytest.raises(ValueError, match='merge_gate|offline_lane'):
+            _report(
+                gate_blind_by_call_site={k: compute_gate_blind([]) for k in gate_blind_keys},
+                systemic_by_call_site={k: compute_systemic([]) for k in systemic_keys},
+            )
 
 
 class TestRenderReport:
@@ -1405,11 +1569,11 @@ class TestRenderReport:
 
     def test_insufficient_observations_is_said_not_a_rate(self):
         two = [_occ(verdict=FlakeVerdict.unconfirmable, row_id=1), _occ(row_id=2)]
-        rendered = render_report(_report(gate_blind=compute_gate_blind(two)))
+        rendered = render_report(_report(gate_blind_by_call_site={'merge_gate': compute_gate_blind(two)}))
         assert 'insufficient observations' in rendered.lower(), rendered
 
     def test_a_none_rate_renders_as_n_a_never_zero(self):
-        rendered = render_report(_report(gate_blind=compute_gate_blind([])))
+        rendered = render_report(_report(gate_blind_by_call_site={'merge_gate': compute_gate_blind([])}))
         # Matched on the full phrase, not a bare 'rate': the header's "generated_at"
         # contains that substring and would otherwise be picked as the rate line.
         rate_lines = [ln for ln in rendered.splitlines() if 'unconfirmable rate' in ln.lower()]

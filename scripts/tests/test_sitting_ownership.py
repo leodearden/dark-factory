@@ -8,8 +8,12 @@ from pathlib import Path
 import pytest
 from orchestrator.session_registry import SessionRecord, Status
 from shared.task_deferral import CarriedByDeferral, UntilConditionDeferral, record_to_json
+from shared.task_statuses import ACTIVE, TERMINAL
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import ownership as mod
 from sitting.inventory import OpenItem, escalation_key
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 NOW = datetime(2026, 9, 26, 5, 30, tzinfo=UTC)
 QUEUE = '/src/dark-factory/data/escalations'
@@ -92,21 +96,6 @@ class TestIndexSessions:
         assert not index.available
 
 
-class TestParseResultOutcome:
-    @pytest.mark.parametrize(('text', 'expected'), [
-        ('outcome: done\nchanged: x\n', 'done'),
-        ('---\noutcome: handed-off\nchanged: task/5140\naction_needed: poll\n---\nprose', 'handed-off'),
-        ('outcome: blocked', 'blocked'),
-        ('outcome: abandoned\n', 'abandoned'),
-        ('outcome: maybe\n', None),
-        ('', None),
-        ('I finished the work.\n', None),
-        ('---\nchanged: x\n---\noutcome: done\n', None),
-    ])
-    def test_header_outcome_or_none(self, text, expected):
-        assert mod.parse_result_outcome(text) == expected
-
-
 class TestSpawnedSessionProbe:
     def test_in_flight_session_owns(self, sessions_root):
         _session(sessions_root, 'unblock-df-4797-7', status=Status.RUNNING, role='unblock', project='dark_factory',
@@ -135,6 +124,24 @@ class TestSpawnedSessionProbe:
 
         assert result.status == 'mentions'
         assert 'unblock-df-4797-9' in result.evidence
+
+    def test_in_flight_session_with_a_checkpoint_outcome_still_owns(self, sessions_root):
+        _session(sessions_root, 'unblock-df-4797-10', status=Status.RUNNING, result='outcome: in-progress\n',
+                 project='dark_factory', escalation_id='esc-4797-15')
+
+        result = _probe(_sweep(_item(), sessions_root=sessions_root), 'spawned_session')
+
+        assert result.status == 'owns'
+        assert result.owner == 'session unblock-df-4797-10 (in flight)'
+
+    def test_exited_session_at_a_checkpoint_is_only_a_mention_naming_the_checkpoint(self, sessions_root):
+        _session(sessions_root, 'unblock-df-4797-11', status=Status.EXITED, result='---\noutcome: in-progress\n---\n',
+                 project='dark_factory', escalation_id='esc-4797-15')
+
+        result = _probe(_sweep(_item(), sessions_root=sessions_root), 'spawned_session')
+
+        assert result.status == 'mentions'
+        assert 'outcome=in-progress' in result.evidence
 
     def test_same_id_in_another_project_does_not_match(self, sessions_root):
         _session(sessions_root, 'unblock-reify-4797-1', status=Status.RUNNING, project='reify',
@@ -278,7 +285,19 @@ class TestSpawnedFollowupProbe:
         assert result.owner_task_status == 'pending'
 
     @FOLLOWUP_SPELLINGS
-    @pytest.mark.parametrize('status', ['done', 'cancelled'])
+    @pytest.mark.parametrize('status', [status.value for status in sorted(ACTIVE)])
+    def test_every_non_terminal_followup_owns(self, sessions_root, seed_tasks, status, key):
+        rows = seed_tasks([{'id': 7001, 'status': status, 'metadata': {key: 'esc-6798-1'}}])
+
+        result = _probe(_sweep(_item('esc-6798-1', '6798'), sessions_root=sessions_root, task_rows=rows),
+                        'spawned_followup')
+
+        assert result.status == 'owns'
+        assert result.owner_task_id == '7001'
+        assert result.owner_task_status == status
+
+    @FOLLOWUP_SPELLINGS
+    @pytest.mark.parametrize('status', [status.value for status in sorted(TERMINAL)])
     def test_terminal_followup_is_empty(self, sessions_root, seed_tasks, status, key):
         rows = seed_tasks([{'id': 7001, 'status': status, 'metadata': {key: 'esc-6798-1'}}])
 

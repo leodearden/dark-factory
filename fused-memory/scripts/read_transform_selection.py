@@ -57,47 +57,14 @@ from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any
 
+from fused_memory.utils.script_loader import load_script
+
 _SCRIPTS_DIR = Path(__file__).resolve().parent
-
-
-def _load_script(name: str) -> Any:
-    """Load a sibling script in ``scripts/`` by path.
-
-    The same mechanism as ``bake_off_storage_shape._load_sibling_script``
-    (:1513), and registered in ``sys.modules`` for the same reason:
-    ``@dataclass`` and other reflection-based decorators look the defining
-    module up there, so a module loaded without registering breaks on the
-    way in.
-
-    It is spelled out here rather than imported from the bake-off only
-    because of the chicken-and-egg — this is the helper that loads the
-    bake-off in the first place.  Once :func:`bake_off` has returned, any
-    FURTHER sibling (``memory_eval_transcript_corpus``, the calibration
-    fixture loader) is loaded through the bake-off's own helper, so the
-    duplication stops at this one bootstrap.
-    """
-    import importlib.util  # noqa: PLC0415
-    import sys  # noqa: PLC0415
-
-    if name in sys.modules:
-        return sys.modules[name]
-    path = _SCRIPTS_DIR / f'{name}.py'
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'cannot load sibling script {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(name, None)
-        raise
-    return module
 
 
 def bake_off() -> Any:
     """``scripts/bake_off_storage_shape.py`` — the measurement library."""
-    return _load_script('bake_off_storage_shape')
+    return load_script(_SCRIPTS_DIR / 'bake_off_storage_shape.py', 'bake_off_storage_shape')
 
 
 # ---------------------------------------------------------------------------
@@ -1452,8 +1419,9 @@ def run_selection(
 # of it was paid for: render BEFORE writing (:2316) so a render failure
 # leaves both files untouched rather than a stale .md beside a fresh .json;
 # `_atomic_write_text` (:2322); `_cell`/`_NO_MEASUREMENT` (:1955/:1824) so a
-# None cannot print as 0.00; `fixture_provenance` (:1844) for the commit
-# stamps.
+# None cannot print as 0.00;
+# `fused-memory/scripts/bake_off_storage_shape.py::fixture_provenance` for the
+# fixture stamps (commit + blob).
 
 from fused_memory.memory_metadata import (  # noqa: E402
     RESERVED_VOCABULARY_KEYS as _LIVE_RESERVED_KEYS,
@@ -2431,19 +2399,13 @@ def score_from_cache(
         expect_limit=e2_k,
         # Sound ONLY because `materialize_selection_arm` is invoked with all
         # defaults just above and hardcodes `DEFAULT_QUERY_SET_PATH`; if that
-        # ever takes an override, this list must follow it.
+        # ever takes an override, these defaults must follow it.
         #
         # The guard covers the E2 half alone.  The production block stores no
         # fixture digests at all (`extend_fetch_cache` writes only the corpus
         # fingerprint, limit, embedder and rankings), so adding them there is
         # a separate change — this is not coverage of that half.
-        expect_fixtures=[
-            bake.DEFAULT_ALPHA_FIXTURE_PATH,
-            bake.DEFAULT_REGISTRY_PATH,
-            bake.DEFAULT_ARM_CLAIMS_PATH,
-            bake.DEFAULT_QUERY_SET_PATH,
-            bake.DEFAULT_DISTRACTOR_SLAB_PATH,
-        ],
+        expect_fixtures=bake.digest_pinned_fixtures(),
     )
     prod_queries = load_production_queries(production_queries)
     prod_hits = load_production_fetches(

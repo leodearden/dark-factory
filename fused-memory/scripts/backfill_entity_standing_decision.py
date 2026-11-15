@@ -40,9 +40,13 @@ first mutation. Running ``--apply`` from an agent sandbox is therefore expected
 to be refused, loudly, having changed nothing. The dry run works anywhere.
 
 An operator shell is necessary but NOT sufficient: the row has to land in the
-ledger file the running server actually has open. Both halves of that path —
-``CONFIG_PATH`` and ``reconciliation.data_dir`` — are relative to the process
-CWD, and ``ReconLedgerStore.initialize()`` creates what it does not find, so a
+ledger file the running server actually has open. ``CONFIG_PATH``, when unset,
+is relative to the process CWD; a relative ``reconciliation.data_dir`` is
+anchored at this run's checkout (``CHECKOUT_ROOT``, the anchor the config
+applies at load). Either can still name a different data dir from the running
+server's — another checkout's interpreter, an ambient
+``RECONCILIATION_DATA_DIR``, a different ``--config`` — and
+``ReconLedgerStore.initialize()`` creates what it does not find, so a
 misdirected ``--apply`` would otherwise report a written row and exit 0 having
 seeded a fresh empty db nothing reads. :func:`assert_ledger_target_live` is the
 refusal that closes that, and every report names its ``ledger_db_path`` and
@@ -85,6 +89,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from fused_memory.config.checkout_anchor import CHECKOUT_ROOT, anchor_at_checkout
 from fused_memory.reconciliation.standing_decision_constants import (
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     STATE_ACTIVE,
@@ -93,10 +98,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
     LedgerUnavailable,
     write_entity_standing_decision,
 )
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 from fused_memory.utils.validation import is_full_uuid
 
 logger = logging.getLogger(__name__)
@@ -708,15 +710,9 @@ class LedgerTargetUnusable(RuntimeError):
 
 
 def resolve_ledger_db_path(config: Any) -> Path:
-    """Absolutize the recon-ledger file this run would open.
-
-    ABSOLUTE, and resolved exactly once: ``reconciliation.data_dir`` defaults
-    to the relative ``./data/reconciliation``, so the bare configured value
-    names a different file from every directory. The absolute form is what the
-    refusal below quotes and what the report carries, so the artifact says
-    which file the run meant rather than which suffix it was configured with.
-    """
-    return (Path(config.reconciliation.data_dir) / LEDGER_DB_FILENAME).resolve()
+    """The recon-ledger file this run would open: absolute, anchored by the
+    same function the config uses, so the CWD never picks the file."""
+    return Path(anchor_at_checkout(config.reconciliation.data_dir)) / LEDGER_DB_FILENAME
 
 
 def classify_ledger_target(db_path: Path) -> LedgerTargetState:
@@ -776,11 +772,12 @@ def assert_ledger_target_live(
       ``memory_service.set_recon_ledger`` only inside
       ``if config.reconciliation.recon_ledger_enabled``, so on such a host the
       row's only consumer is not wired at all;
-    * the run was launched from the wrong directory (MISSING). ``data_dir`` is
-      relative to the CWD and ``ReconLedgerStore.initialize()`` does
-      ``mkdir(parents=True)`` plus ``CREATE TABLE IF NOT EXISTS`` — so a
-      misdirected run does not fail, it CREATES a fresh empty ledger and writes
-      the row into that;
+    * the run names a different data dir from the running server's (MISSING):
+      its checkout (a relative ``data_dir`` is anchored at ``CHECKOUT_ROOT``),
+      ``RECONCILIATION_DATA_DIR`` or ``--config`` differs from the deployment's,
+      and ``ReconLedgerStore.initialize()`` does ``mkdir(parents=True)`` plus
+      ``CREATE TABLE IF NOT EXISTS`` — so a misdirected run does not fail, it
+      CREATES a fresh empty ledger and writes the row into that;
     * the resolved path holds a file that is not a seeded ledger (NO_SCHEMA).
       Identical outcome to the case above and reached the same way, because
       ``initialize()`` would add the schema to it — which is exactly why
@@ -825,13 +822,16 @@ def assert_ledger_target_live(
     if state is LedgerTargetState.MISSING:
         raise LedgerTargetUnusable(
             f'Refusing --apply: no recon ledger exists at {str(db_path)!r}. '
-            'reconciliation.data_dir is resolved against this process CWD '
-            f'({os.getcwd()!r}), so a run launched from the wrong directory '
-            'would not fail — it would CREATE an empty ledger there, write the '
-            'ACTIVE row into it and exit 0 while the running server kept '
-            "seeing nothing; hint: re-run from the fused-memory server's own "
-            f'working directory — the one whose {LEDGER_DB_FILENAME} the '
-            'server has open — or point --config at that deployment.'
+            "A relative reconciliation.data_dir is anchored at this run's "
+            f'checkout ({str(CHECKOUT_ROOT)!r}), so this run\'s checkout, '
+            'RECONCILIATION_DATA_DIR or --config names a different data dir '
+            "from the running server's — and such a run would not fail: it "
+            'would CREATE an empty ledger there, write the ACTIVE row into it '
+            'and exit 0 while the running server kept seeing nothing; hint: '
+            "run with the deployment checkout's interpreter, set "
+            'RECONCILIATION_DATA_DIR to the data dir whose '
+            f'{LEDGER_DB_FILENAME} the server has open, or point --config at '
+            'that deployment.'
         )
     if state is LedgerTargetState.NO_SCHEMA:
         raise LedgerTargetUnusable(
@@ -844,8 +844,9 @@ def assert_ledger_target_live(
             'every dry run of this script BEFORE task 2900 hardened it left '
             'exactly such a file behind, so one here is likely litter from an '
             f'earlier rehearsal; hint: delete {str(db_path)!r} if that is what '
-            "it is, and re-run from the fused-memory server's own working "
-            'directory — or point --config at that deployment.'
+            "it is, then run with the deployment checkout's interpreter, set "
+            "RECONCILIATION_DATA_DIR to the server's data dir, or point "
+            '--config at that deployment.'
         )
 
 
@@ -890,11 +891,14 @@ def warn_unreadable_ledger_target(state: LedgerTargetState, db_path: Path) -> No
         return
     logger.warning(
         'backfill_entity_standing_decision: DRY RUN against an unusable recon '
-        'ledger target %s (state=%s) — %s. reconciliation.data_dir is resolved '
-        'against this process CWD (%r); re-run from the fused-memory server\'s '
-        'own working directory, or point --config at that deployment, before '
-        '--apply — which refuses this target rather than seeding it.',
-        str(db_path), str(state), reason, os.getcwd(),
+        'ledger target %s (state=%s) — %s. A relative reconciliation.data_dir '
+        'is anchored at this run\'s checkout (%r); if this run\'s checkout, '
+        'RECONCILIATION_DATA_DIR or --config names a different data dir from '
+        'the running server\'s, run with the deployment checkout\'s '
+        'interpreter, set RECONCILIATION_DATA_DIR to the server\'s data dir, '
+        'or point --config at that deployment before --apply — which refuses '
+        'this target rather than seeding it.',
+        str(db_path), str(state), reason, str(CHECKOUT_ROOT),
     )
 
 
@@ -937,8 +941,10 @@ def build_parser() -> argparse.ArgumentParser:
              'nothing at all — not the records, not the ledger row, and not '
              'the ledger FILE, so rehearsing against a wrong target cannot '
              'make the --apply that follows it look legitimate. Must be run '
-             "from the fused-memory MCP server host AND from that server's own "
-             'working directory: an in-sandbox --apply is refused by the '
+             'from the fused-memory MCP server host AND against that '
+             "server's data dir (the deployment checkout's interpreter, its "
+             'RECONCILIATION_DATA_DIR, or --config naming that deployment): '
+             'an in-sandbox --apply is refused by the '
              'store-mutation preflight, and one aimed at a ledger the server '
              'does not read is refused by assert_ledger_target_live.',
     )
@@ -980,22 +986,15 @@ def main(argv: list[str] | None = None) -> int:
     # run-wide environment denial cannot be swallowed by that function's
     # per-record error handling and re-reported as N stamp failures.
     if args.apply:
-        try:
-            assert_store_mutation_allowed(
-                operation='backfill_entity_standing_decision --apply'
-            )
-        except StoreMutationUnavailable:
-            logger.error(
-                'backfill_entity_standing_decision: --apply NOT started '
-                "(fail-closed) — this process cannot write mem0's history "
-                'directory, so a stamp would patch a record and then fail to '
-                'record the change. Nothing was scrolled, no ledger row was '
-                'written and no record was stamped. Re-run from the '
-                'fused-memory MCP server host (the unsandboxed owner of the '
-                'store). To obtain the report safely from anywhere, re-run '
-                'without --apply.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='backfill_entity_standing_decision --apply',
+            logger=logger,
+            extra_detail=(
+                'a stamp would patch a record and then fail to record the change. '
+                'Nothing was scrolled, no ledger row was written and no record was '
+                'stamped.'
+            ),
+        )
 
     async def _run_live() -> dict[str, Any]:
         # Deferred so importing this module — which the tests do, by path —
