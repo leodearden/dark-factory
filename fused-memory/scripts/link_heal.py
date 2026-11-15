@@ -42,16 +42,18 @@ Usage:
         link_heal.projects, else the home project). It then heals what it
         staged only when link_heal.writes is on, --dry-run is absent and the
         adjudicator's exact model and prompt have a passing calibration. It
-        writes a JSON and Markdown report under the reports dir and files an
-        info escalation naming it.
+        writes a JSON and Markdown report under the reports dir, leaves its
+        metric series and summary.json under METRICS_ROOT/link-heal, and files
+        an info escalation naming them.
     calibrate --ratings PATH --items PATH
         Score the adjudicator against blind-rated pairs (the soak's
         adjudications.jsonl and items_all.json), record the result for its
         model and prompt, and write a report. A failed calibration is escalated.
 
 Exit codes: 0 when the run is complete, or partial only by the cap or stale
-skips; 1 when a heal, read or adjudication failed, the run stopped, or a
-calibration failed; 2 when the command was refused before any run started.
+skips; 1 when a heal, read or adjudication failed, the run stopped, a
+calibration failed, or a sweep could not write its report or metrics; 2 when the
+command was refused before any run started.
 """
 
 from __future__ import annotations
@@ -113,6 +115,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     UnknownRun,
     plan_document_path,
 )
+from fused_memory.maintenance.link_heal_metrics import SweepMetricsTarget
 from fused_memory.maintenance.link_heal_report import run_headline
 from fused_memory.maintenance.link_heal_store import (
     CensusFailed,
@@ -138,6 +141,10 @@ STATUS_COUNTS = (
 PLAN_SOURCES = (
     RunSource.CORPUS, RunSource.ADJUDICATOR, RunSource.DETERMINISTIC, RunSource.SWEEP,
 )
+METRICS_ROOT = Path(__file__).resolve().parent.parent / 'data' / 'memory-evals'
+"""``fused-memory/data/memory-evals`` (M1 §3), resolved off this file rather than the
+cwd, so the timer's main-checkout run writes where gate θ reads. Precedent:
+``memory_eval_staleness_sweep.py::_DEFAULT_METRICS_ROOT``."""
 
 
 def load_config(config_path: str | None) -> FusedMemoryConfig:
@@ -183,8 +190,9 @@ class LinkHealEnv:
 
     ``home_root_for`` names the server's own project: escapes file into its queue,
     and a run with no project of its own probes it. ``reports_dir_for`` is where
-    sweep and calibration reports go; ``now`` is the clock a sweep's window ends at
-    and both kinds of report are dated by.
+    sweep and calibration reports go; ``metrics_root`` is where a sweep's metric
+    series and summary go; ``now`` is the clock a sweep's window ends at and both
+    kinds of report are dated by.
     """
 
     config_loader: Callable[[str | None], FusedMemoryConfig] = load_config
@@ -198,6 +206,7 @@ class LinkHealEnv:
     home_root_for: Callable[[FusedMemoryConfig], str] = home_project_root
     adjudicator_for: Callable[[FusedMemoryConfig], LinkAdjudicator] = config_adjudicator
     reports_dir_for: Callable[[FusedMemoryConfig], Path] = config_reports_dir
+    metrics_root: Path = METRICS_ROOT
     now: Callable[[], datetime] = utc_now
 
 
@@ -318,6 +327,8 @@ def sweep_document(report: SweepReport) -> dict[str, Any]:
         'report_json': str(report.json_path),
         'escalation_id': report.escalation_id,
         'report_unwritten': report.report_unwritten,
+        'metrics_unwritten': None,
+        **report.metrics.as_detail(),
         'counts': {
             'plan': view.plan.counts.as_json(),
             'apply': None if view.apply is None else view.apply.counts.as_json(),
@@ -590,11 +601,14 @@ async def _sweep(args: argparse.Namespace, session: _Session) -> CommandOutcome:
             settings=settings,
             filer=FoldedEscapeFiler(session.home_root),
             reports_dir=session.env.reports_dir_for(session.config),
+            metrics=SweepMetricsTarget(
+                root=session.env.metrics_root, project_id=resolve_project_id(session.home_root),
+            ),
             now=now,
             since=since,
         )
     code = max(_counts_exit_code(run.counts) for run in report.view.runs)
-    if report.report_unwritten is not None:
+    if report.report_unwritten is not None or report.metrics.unwritten is not None:
         code = EXIT_FAILED
     return CommandOutcome(sweep_document(report), code)
 
