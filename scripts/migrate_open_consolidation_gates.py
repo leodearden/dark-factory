@@ -854,10 +854,14 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
         return _could_not_run(exc)
     if memory is None:
         from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
 
         config = FusedMemoryConfig()
+        open_as = ServiceOpen.FULL if invocation.mode is Mode.EXECUTE else ServiceOpen.NONE
+        opener = maintenance_service(config=config, open_as=open_as)
     else:
         config = memory.config
+        opener = contextlib.nullcontext((config, memory))
     switched_off = kill_switch_refusal(invocation, config.consolidation_auto)
     if switched_off is not None:
         return _could_not_run(switched_off)
@@ -865,15 +869,8 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
         gates = open_consolidation_gates(invocation.project_root, invocation.tag)
     except UsageError as exc:
         return _could_not_run(exc)
-    async with contextlib.AsyncExitStack() as stack:
-        if memory is None:
-            from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
-
-            open_as = ServiceOpen.FULL if invocation.mode is Mode.EXECUTE else ServiceOpen.NONE
-            _, memory = await stack.enter_async_context(
-                maintenance_service(config=config, open_as=open_as),
-            )
-        return await _migrate_and_emit(invocation, memory, gates)
+    async with opener as (_, service):
+        return await _migrate_and_emit(invocation, service, gates)
 
 
 async def _migrate_and_emit(
