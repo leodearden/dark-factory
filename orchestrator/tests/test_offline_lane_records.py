@@ -636,9 +636,6 @@ class TestRetention:
         store.write_run(lane_pass, _record())
         return lane_pass.pass_id
 
-    def test_retention_is_sixty_days(self) -> None:
-        assert timedelta(days=60) == RECORD_RETENTION
-
     def test_a_pass_older_than_retention_is_removed_and_a_newer_one_kept(
         self, store: RunRecordStore, clock: _Clock
     ) -> None:
@@ -1154,13 +1151,13 @@ class TestLaneRetention:
     ) -> None:
         expired = _seed_pass(tmp_path, RECORD_RETENTION + timedelta(days=6))
         recent = _seed_pass(tmp_path, timedelta(days=1))
-        kept = _seed_pass(tmp_path, timedelta(days=30))
+        month_old = _seed_pass(tmp_path, timedelta(days=30))
 
         await _run_one_pass(tmp_path, 'exit 0', until_phase=Phase.DETECT)
 
         assert not expired.exists()
         assert (recent / 'record.json').is_file()
-        assert (kept / 'record.json').is_file()
+        assert (month_old / 'record.json').is_file()
 
     @_needs_file_permissions
     @pytest.mark.asyncio

@@ -47,7 +47,7 @@ from orchestrator.offline_lane_confirm import (
     outcome_to_json,
     serial_confirm_command,
 )
-from orchestrator.offline_lane_episode_state import PassEffect, PassObservation
+from orchestrator.offline_lane_episode_state import EPISODE_RETENTION, PassEffect, PassObservation
 from orchestrator.offline_lane_episodes import TickResult
 from orchestrator.offline_lane_pass import ConfirmSeam
 from orchestrator.offline_lane_records import (
@@ -1505,10 +1505,16 @@ async def test_a_pass_record_older_than_the_retention_survives_while_a_held_epis
     cmd = LaneCommand(name='q', command='pytest -m integration')
     clock = Clock()
     client = FakeLedgerClient([])
+    config = _make_config(
+        tmp_path,
+        offline_lane_legacy_numeric_enabled=False,
+        offline_lane_commands=[cmd],
+        offline_lane_red_unlanded_hours=240,
+    )
     worker = _make_worker(
         tmp_path,
         git_ops=_make_git_ops(head='HEAD1', worktree_path=tmp_path / '_offline-deep'),
-        config=_make_config(tmp_path, offline_lane_legacy_numeric_enabled=False, offline_lane_commands=[cmd]),
+        config=config,
         command_runner=AsyncMock(return_value=(1, 'tail')),
         confirm=_RecordingConfirm(_HELD),
         task_client=client,
@@ -1523,7 +1529,8 @@ async def test_a_pass_record_older_than_the_retention_survives_while_a_held_epis
     (task_id,) = client.tasks
     client.set_status(task_id, 'in-progress')
 
-    cadence_hours = 23
+    cadence_hours = config.git.offline_lane_red_unlanded_hours - 1
+    assert timedelta(hours=cadence_hours) < EPISODE_RETENTION
     for _ in range(math.ceil(RECORD_RETENTION / timedelta(hours=cadence_hours))):
         clock.advance(hours=cadence_hours)
         await _drive_one_pass(worker, 'q')
