@@ -24,7 +24,7 @@ def _names_added_by(snippet: str, cwd: Path) -> list[str]:
     result = subprocess.run(
         [sys.executable, '-c', _PRELUDE + snippet + _EPILOGUE],
         cwd=cwd,
-        env=sanitized_probe_env(drop=(PROBE,)),
+        env=sanitized_probe_env(drop=(PROBE, 'PYTHON_DOTENV_DISABLED')),
         capture_output=True,
         text=True,
         timeout=120,
@@ -47,7 +47,8 @@ def test_an_in_process_cli_invocation_loads_no_dotenv(dotenv_dir: Path):
     snippet = (
         'from click.testing import CliRunner\n'
         'from orchestrator.cli import main\n'
-        "CliRunner().invoke(main, ['--help'])\n"
+        "result = CliRunner().invoke(main, ['eval', '--help'])\n"
+        'assert result.exit_code == 0, result.output\n'
     )
     assert _names_added_by(snippet, dotenv_dir) == []
 
