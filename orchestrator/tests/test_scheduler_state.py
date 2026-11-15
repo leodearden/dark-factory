@@ -552,7 +552,7 @@ _SNAPSHOT_KEYS = frozenset({
     'skip_counts', 'parks', 'park_stacks', 'effective_priorities',
     'pin_queue', 'overrides', 'current_holders', 'lock_depth', 'snapshot_at',
     'is_paused', 'pause_reason', 'pause_class', 'requeue_cooldowns',
-    'pin_reservations',
+    'pin_reservations', 'held_by_task',
 })
 
 

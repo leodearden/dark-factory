@@ -32,6 +32,7 @@ _SNAPSHOT_KEYS = {
     'pin_queue',
     'overrides',
     'current_holders',
+    'held_by_task',
     'lock_depth',
     'is_paused',
     'pause_reason',
@@ -77,6 +78,7 @@ def _populated() -> SchedulerStateSnapshot:
             ),
         },
         current_holders={'mod/a': 'T7'},
+        held_by_task={'T6': ('mod/a',), 'T7': ('mod/a',)},
         lock_depth=3,
         is_paused=True,
         pause_reason='operator halt',
@@ -112,6 +114,7 @@ class TestEmpty:
             'pin_queue': [],
             'overrides': {},
             'current_holders': {},
+            'held_by_task': {},
             'lock_depth': None,
             'is_paused': False,
             'pause_reason': None,
@@ -186,6 +189,7 @@ class TestWireShape:
         assert wire['skip_counts'] == {'T3': 2}
         assert wire['effective_priorities'] == {'T3': 'high'}
         assert wire['current_holders'] == {'mod/a': 'T7'}
+        assert wire['held_by_task'] == {'T6': ['mod/a'], 'T7': ['mod/a']}
         assert wire['lock_depth'] == 3
         assert wire['is_paused'] is True
         assert wire['pause_reason'] == 'operator halt'
@@ -221,6 +225,23 @@ class TestRollingRestart:
         }
 
 
+class TestHolderTaskIds:
+    def test_every_holder_of_a_shared_key_is_named(self) -> None:
+        snap = SchedulerStateSnapshot.from_json({
+            'current_holders': {'OPERATIONS.md': 'B'},
+            'held_by_task': {'A': ['OPERATIONS.md'], 'B': ['OPERATIONS.md']},
+        })
+        assert snap.holder_task_ids() == frozenset({'A', 'B'})
+
+    def test_an_older_producer_without_held_by_task_reads_current_holders(self) -> None:
+        snap = SchedulerStateSnapshot.from_json({'current_holders': {'m': '7', 'n': '8'}})
+        assert snap.held_by_task == {}
+        assert snap.holder_task_ids() == frozenset({'7', '8'})
+
+    def test_no_holders_names_no_task(self) -> None:
+        assert SchedulerStateSnapshot.empty().holder_task_ids() == frozenset()
+
+
 class TestMalformedInput:
     @pytest.mark.parametrize('body', [[], 'x', None, 3])
     def test_non_mapping_body(self, body: Any) -> None:
@@ -245,6 +266,10 @@ class TestMalformedInput:
     def test_current_holder_must_be_a_string(self) -> None:
         with pytest.raises(MalformedSnapshotError):
             SchedulerStateSnapshot.from_json({'current_holders': {'m': 7}})
+
+    def test_held_by_task_lock_keys_must_be_strings(self) -> None:
+        with pytest.raises(MalformedSnapshotError):
+            SchedulerStateSnapshot.from_json({'held_by_task': {'T1': [7]}})
 
 
 class TestFrozen:
