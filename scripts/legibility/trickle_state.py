@@ -752,8 +752,9 @@ def due_retries(state: TrickleState, *, today: date) -> tuple[date, ...]:
 
 def barren_streak_due(state: TrickleState, max_runs: int) -> bool:
     """Whether *state*'s barren streak has reached *max_runs*: the one
-    threshold predicate the nightly's escalation and the progress probe's
-    verdict are both built from."""
+    threshold predicate the progress probe's verdict is built from, and the
+    first point of the nightly's escalation schedule
+    (:func:`barren_streak_reached`)."""
     return state.consecutive_barren_runs >= max_runs
 
 
@@ -981,21 +982,32 @@ def _schedule_cursor(
 # Escalation re-arm policies — decided on a night's fold, before it is written
 # ---------------------------------------------------------------------------
 
-def barren_streak_reached(night: NightFold, max_runs: int) -> bool:
-    """Whether *night* is the barren night on which its streak first reaches
-    *max_runs*: once per streak, re-armed only when a productive or quiet
-    night resets the streak.
+BARREN_ESCALATION_MULTIPLES: tuple[int, ...] = (1, 2, 4, 8)
+"""The barren streaks, as multiples of the threshold, on which ``nightly.py``
+escalates: 3, 6, 12 and 24 at :data:`DEFAULT_MAX_BARREN_RUNS`.
 
-    Re-firing every night past the threshold would revive task 3270's alarm
-    fatigue; a one-shot latch would leave whoever missed the single
-    escalation in silence, which 3270 rejected as worse. A post that does
-    not land is not retried: ``check_trickle_progress.py`` fails on the same
+A bounded doubling: posting every night would revive task 3270's alarm
+fatigue, and posting once leaves whoever missed that post in silence
+(task 5513). Between and after these points the level-triggered
+``check_trickle_health.py`` posts on each night whose record does not show
+``barren_escalated: true``."""
+
+
+def barren_streak_reached(night: NightFold, max_runs: int) -> bool:
+    """Whether *night* is a barren night whose streak stands on an escalation
+    point: *max_runs* times an entry of :data:`BARREN_ESCALATION_MULTIPLES`.
+    A productive or quiet night resets the streak and so re-arms the
+    schedule from its start.
+
+    Membership alone cannot fire twice in one streak: a barren night always
+    adds exactly 1 to the streak (:func:`_fold_streaks`), and a failed or
+    deferred night carries it without being BARREN. A post that does not
+    land is not retried: ``check_trickle_progress.py`` fails on the same
     streak independently and prints the recorded ``barren_escalated``."""
-    already_due = night.prior is not None and barren_streak_due(night.prior, max_runs)
     return (
         night.state.outcome == RunOutcome.BARREN
-        and barren_streak_due(night.state, max_runs)
-        and not already_due
+        and night.state.consecutive_barren_runs
+        in {max_runs * multiple for multiple in BARREN_ESCALATION_MULTIPLES}
     )
 
 
@@ -1139,7 +1151,8 @@ def record_retry(
 
 
 DEFAULT_MAX_BARREN_RUNS = 3
-"""Consecutive barren runs before ``nightly.py`` escalates and
+"""Consecutive barren runs before ``nightly.py`` first escalates (it
+re-escalates at the multiples in :data:`BARREN_ESCALATION_MULTIPLES`) and
 ``check_trickle_progress.py`` fails.
 
 WHY 3. One barren night can be an ordinary bad day — an unusually large

@@ -1167,12 +1167,13 @@ class TestBarrenStreakReached:
         ]
         assert _reached_on(['barren'] * 30, threshold) == expected
 
-    @pytest.mark.parametrize('kinds', [
-        ['barren'] * 5 + ['failed'] + ['barren'],
-        ['barren'] * 6 + ['deferred', 'barren'],
-    ], ids=['failed', 'deferred'])
-    def test_a_carried_night_neither_fires_nor_shifts_the_schedule(self, kinds):
-        assert _reached_on(kinds, trickle_state.DEFAULT_MAX_BARREN_RUNS) == [3, 6]
+    @pytest.mark.parametrize('kinds, reached', [
+        (['barren'] * 5 + ['failed', 'barren'], [3, 7]),
+        (['barren'] * 6 + ['failed', 'barren'], [3, 6]),
+        (['barren'] * 6 + ['deferred', 'barren'], [3, 6]),
+    ], ids=['failed-before-a-point', 'failed-on-a-point', 'deferred-on-a-point'])
+    def test_a_carried_night_neither_fires_nor_shifts_the_schedule(self, kinds, reached):
+        assert _reached_on(kinds, trickle_state.DEFAULT_MAX_BARREN_RUNS) == reached
 
     def test_a_reset_rearms_the_schedule_from_its_start(self):
         kinds = ['barren'] * 6 + ['productive'] + ['barren'] * 3
