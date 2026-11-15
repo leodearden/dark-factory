@@ -4558,12 +4558,13 @@ quarantine dir FIRST, and only then restores those paths to HEAD in the index
 and the worktree; a path HEAD does not track is deleted. If the copy cannot be
 made, the checkout is left untouched (dirty) instead. `census-state.json`
 rolls back with the rest, so `last_census_at` and the session watermark do not
-move, and the trigger fires again on its next evaluation. Three things do NOT
-roll back:
+move, and the trigger fires again on its next evaluation. Three effects are
+not undone, or were never made:
 
 - Census remediation tickets are filed before the commit; the escalation
   lists them.
-- Census sessions are ledgered only after a landed commit, so none are.
+- Census sessions are ledgered only after a landed commit, so none are
+  ledgered.
 - A trickle night is recorded `failed`, and neither its ledger nor its census
   stage runs. Its date is re-coded later (see "Retried nights" under
   [Legibility trickle health probe (04:30)](#legibility-trickle-health-probe-0430)).
@@ -4590,13 +4591,16 @@ child's own stderr line (`census: commit did not land -- ...` or
 `census: landing gate refused the census -- ...`; census.py exits 1) is in
 `journalctl --user -u legibility-trickle@<project_id>`.
 
-**Where the quarantine is.** `<state dir>/quarantine/<label>-<random>/<repo-relative path>`,
-where `<state dir>` is the directory holding `trickle-state.json`; its
-resolution and the `DARK_FACTORY_LEGIBILITY_STATE_ROOT` lever are in "Where
-the state file lives" above. `<label>` is `trickle-<target date>` or
-`census-<census date>`. Use the dir the escalation names. To list them newest
-first, `ls -lt ~/.local/state/dark-factory/legibility/<project_id>/quarantine/`;
-to see what one holds, `find <dir> -type f`.
+**Where the quarantine is.** `<quarantine root>/<label>-<random>/<repo-relative path>`,
+where `<quarantine root>` is `quarantine/` in the directory holding
+`trickle-state.json`; its resolution and the
+`DARK_FACTORY_LEGIBILITY_STATE_ROOT` lever are in "Where the state file lives"
+above. Print it from its one home, `scripts/legibility/unlanded.py::quarantine_root`,
+in a dark-factory checkout root:
+`python3 -c 'import sys; sys.path.insert(0, "scripts"); from legibility import unlanded; print(unlanded.quarantine_root("<project_id>"))'`.
+`<label>` is `trickle-<target date>` or `census-<census date>`. Use the dir the
+escalation names. To list them newest first, `ls -lt <quarantine root>`; to see
+what one holds, `find <dir> -type f`.
 
 **Recovering.**
 
@@ -4613,7 +4617,11 @@ to see what one holds, `find <dir> -type f`.
    the next fire re-mines the window, but that pays for another census and
    files its tickets again, relying on the curator's dedup. Re-applying keeps
    the codebook's back-links to the tickets already filed
-   (`census_run.py::_after_filing`).
+   (`census_run.py::_after_filing`). It does not ledger the census's sessions,
+   which only a run whose own commit landed does
+   (`census_run.py::_ledger_census_codings`), so the next census re-mines any
+   of them its window still covers, the same re-mine cost a failed ledger
+   write has.
 4. Re-apply with a normal hooked commit, per
    [§9](#9-working-in-the-main-checkout): copy the files to their repo paths,
    then `git -C <project_root> add -- <paths>` and
@@ -4636,7 +4644,7 @@ step 4.
 
 **Breaking a repeated-unlanded-census loop.** The signs: the same census
 escalation recurs on every FIRE night, each adding a `census-<date>-*` dir
-(`ls -d <state dir>/quarantine/census-*` counts them), and after
+(`ls -d <quarantine root>/census-*` counts them), and after
 `trickle_state.DEFAULT_MAX_UNADVANCED_CENSUS_FIRES` fires the 04:30 probe's
 "census fired without advancing" verdict appears. Each repeat pays again for
 mining, verify and synthesis. Two levers:
