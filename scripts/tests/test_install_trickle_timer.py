@@ -7,13 +7,13 @@ first on PATH, plus a real invocation of
 `nightly.py resolve-config` (the REAL Python resolver — no mock — with
 INSTALL_TRICKLE_TIMER_PYTHON=sys.executable substituting for the default `uv
 run` prefix, mirroring watcher-rearm.sh's WATCHER_REARM_PYTHON override, and
-LEGIBILITY_SEARCH_ROOTS pointed at a tmp fixture project). Real systemd is
-never touched.
+LEGIBILITY_SEARCH_ROOTS pointed at a tmp fixture project). The committed
+units are read through `scripts/tests/conftest.py::unit_values` and
+`scripts/tests/conftest.py::unit_environment`. Real systemd is never touched.
 """
 from __future__ import annotations
 
 import os
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -157,33 +157,7 @@ def test_install_does_not_kick_an_immediate_run(fake_timer_systemctl, tmp_path):
         assert call[:1] != ["start"], f"unexpected immediate run: {call!r}"
 
 
-def _service_environment(service_text):
-    """Parse the [Service] section's `Environment=` assignments into a dict.
-
-    Scans from the `[Service]` header to the next section header, and
-    shlex.split()s each directive's right-hand side before splitting every
-    token on its FIRST `=`. The shlex step handles BOTH the
-    one-assignment-per-line form this template uses and systemd's legal
-    space-separated multi-assignment form, so a future reflow of the unit
-    onto a single Environment= line does not silently stop being checked.
-    """
-    env = {}
-    in_service = False
-    for raw_line in service_text.splitlines():
-        line = raw_line.strip()
-        if line.startswith("["):
-            in_service = line == "[Service]"
-            continue
-        if not in_service or not line.startswith("Environment="):
-            continue
-        for token in shlex.split(line[len("Environment="):]):
-            name, sep, value = token.partition("=")
-            if sep:
-                env[name] = value
-    return env
-
-
-def test_service_template_pins_a_path_that_finds_claude():
+def test_service_template_pins_a_path_that_finds_claude(unit_environment):
     """Template-content invariant (NOT install behavior): the committed
     @.service must pin PATH to an absolute list that reaches ``claude``.
 
@@ -196,8 +170,7 @@ def test_service_template_pins_a_path_that_finds_claude():
     digests on reify and 38/38 on dark_factory in about one second. The pin
     is load-bearing, not redundant belt-and-braces; do not "clean it up".
     """
-    service_text = (TEMPLATES_DIR / "legibility-trickle@.service").read_text()
-    env = _service_environment(service_text)
+    env = unit_environment(TEMPLATES_DIR / "legibility-trickle@.service", "Service")
 
     assert "PATH" in env, (
         f"The trickle @.service must pin PATH= so claude resolves under a "
@@ -227,28 +200,7 @@ def test_service_template_pins_a_path_that_finds_claude():
     )
 
 
-def _service_directive(service_text, name):
-    """Every value assigned to directive *name* in the ``[Service]`` section.
-
-    A directive can legally repeat (systemd appends), so this returns a LIST.
-    Sectioned parsing rather than a substring scan over the whole file, for
-    the same reason ``_service_environment`` does it: a directive in [Unit]
-    or [Install] is a different directive, and a test that cannot tell them
-    apart would pass on a unit systemd reads differently.
-    """
-    values = []
-    in_service = False
-    for raw_line in service_text.splitlines():
-        line = raw_line.strip()
-        if line.startswith("["):
-            in_service = line == "[Service]"
-            continue
-        if in_service and line.startswith(f"{name}="):
-            values.append(line[len(name) + 1:].strip())
-    return values
-
-
-def test_service_template_carries_the_account_pool_and_pins_no_account():
+def test_service_template_carries_the_account_pool_and_pins_no_account(unit_values):
     """Template-content invariant (NOT install behavior), task 5488: the unit
     must supply the account POOL and pin no single account out of it.
 
@@ -258,9 +210,10 @@ def test_service_template_carries_the_account_pool_and_pins_no_account():
     here -- what the 2026-09-14 stopgap drop-in did with max-h -- would make
     the whole pool inert again while leaving every test above green.
     """
-    service_text = (TEMPLATES_DIR / "legibility-trickle@.service").read_text()
+    service = TEMPLATES_DIR / "legibility-trickle@.service"
+    service_text = service.read_text()
 
-    env_files = _service_directive(service_text, "EnvironmentFile")
+    env_files = unit_values(service, "Service", "EnvironmentFile")
     assert env_files == [PRODUCTION_ENV_FILE], (
         f"The trickle @.service must name the project .env as the source of "
         f"the CLAUDE_OAUTH_TOKEN_* pool (build_pool loads it in-process too; "
@@ -275,7 +228,7 @@ def test_service_template_carries_the_account_pool_and_pins_no_account():
     # (shared/src/shared/cli_invoke.py::_invoke_claude) is a separate
     # mechanism for a separate process. Two independent guards of one policy
     # is the intent (docs/code-quality.md heuristic 10), not a duplication.
-    assert _service_directive(service_text, "UnsetEnvironment") == [
+    assert unit_values(service, "Service", "UnsetEnvironment") == [
         "ANTHROPIC_API_KEY"
     ], (
         "The trickle @.service must unset ANTHROPIC_API_KEY: the CLI prefers "

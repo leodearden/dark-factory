@@ -13,8 +13,8 @@ Template-content invariants live here rather than in a separate file, per
 `test_install_trickle_timer.py::test_service_template_pins_claude_bin`'s
 precedent; the installer-behaviour half is driven via subprocess with
 `scripts/tests/conftest.py::fake_timer_systemctl` first on PATH, and unit directives
-are read through `scripts/tests/conftest.py::unit_values`. Real systemd is
-never touched.
+are read through `scripts/tests/conftest.py::unit_values` and
+`scripts/tests/conftest.py::unit_environment`. Real systemd is never touched.
 """
 from __future__ import annotations
 
@@ -50,31 +50,6 @@ PRODUCTION_ROOT = '/home/leo/src/dark-factory'
 # read off one file alone.
 TRICKLE_SERVICE_NAME = 'legibility-trickle@.service'
 TRICKLE_TIMER_NAME = 'legibility-trickle@.timer'
-
-
-def _service_environment(service_text):
-    """Parse the [Service] section's `Environment=` assignments into a dict.
-
-    Copied from `test_install_trickle_timer.py::_service_environment`.
-    shlex.split()s each directive's right-hand side
-    before splitting every token on its FIRST `=`, so a future reflow of the
-    unit onto systemd's legal space-separated multi-assignment form does not
-    silently stop being checked.
-    """
-    env = {}
-    in_service = False
-    for raw_line in service_text.splitlines():
-        line = raw_line.strip()
-        if line.startswith('['):
-            in_service = line == '[Service]'
-            continue
-        if not in_service or not line.startswith('Environment='):
-            continue
-        for token in shlex.split(line[len('Environment='):]):
-            name, sep, value = token.partition('=')
-            if sep:
-                env[name] = value
-    return env
 
 
 def _live_directive_text(name) -> str:
@@ -167,7 +142,8 @@ def test_service_execstart_interpreter_is_an_absolute_path(unit_values):
     )
 
 
-def test_service_is_a_journal_logging_oneshot_in_the_dark_factory_checkout(unit_values):
+def test_service_is_a_journal_logging_oneshot_in_the_dark_factory_checkout(
+        unit_values, unit_environment):
     """All generic legibility CODE lives in the dark-factory checkout (PRD §5);
     only the target project varies, via `%i`. `Type=oneshot` is what makes the
     unit's `Result` meaningful to `check_trickle_liveness.sh`, and journal
@@ -179,14 +155,14 @@ def test_service_is_a_journal_logging_oneshot_in_the_dark_factory_checkout(unit_
     assert unit_values(service, 'Service', 'StandardError') == ['journal']
     assert unit_values(service, 'Install', 'WantedBy') == ['timers.target']
 
-    env = _service_environment(SERVICE.read_text())
+    env = unit_environment(SERVICE, 'Service')
     assert env.get('PYTHONPATH') == f'{PRODUCTION_ROOT}/scripts', (
         f'`from legibility import ...` must resolve under a bare ExecStart; '
         f'parsed [Service] Environment={env!r}'
     )
 
 
-def test_service_pins_no_claude_bin():
+def test_service_pins_no_claude_bin(unit_environment):
     """This probe never invokes the coder, so a `LEGIBILITY_CLAUDE_BIN` pin
     would be a needless copy of the nightly unit's — and a copy that rots.
 
@@ -194,7 +170,7 @@ def test_service_pins_no_claude_bin():
     way this unit gets written is by copying `legibility-trickle@.service`,
     which carries that pin for a load-bearing reason that does not apply here.
     """
-    env = _service_environment(SERVICE.read_text())
+    env = unit_environment(SERVICE, 'Service')
     assert 'LEGIBILITY_CLAUDE_BIN' not in env, (
         f'The health probe launches no CLI; parsed [Service] '
         f'Environment={env!r}'

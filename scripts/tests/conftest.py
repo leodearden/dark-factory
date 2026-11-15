@@ -1094,7 +1094,7 @@ def fake_timer_systemctl(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Committed systemd unit reader (task 5285).
+# Committed systemd unit readers (task 5285).
 # ---------------------------------------------------------------------------
 
 
@@ -1116,3 +1116,21 @@ def unit_values():
         return directives.get(section, {}).get(key, [])
 
     return values
+
+
+@pytest.fixture
+def unit_environment():
+    """``environment(path, section)``: the ``{VAR: value}`` map ``[section]``'s ``Environment=`` lines set.
+
+    Read the way systemd reads them, by the production reader
+    ``scripts/systemd_unit_parity.py::environment_map``: several assignments
+    per line, quoted values, and a later assignment winning. A reflow of a
+    unit between those spellings therefore leaves every assertion standing.
+    """
+    import systemd_unit_parity
+
+    def environment(path: Path, section: str) -> dict[str, str]:
+        directives = systemd_unit_parity.parse_unit_directives(path.read_text(encoding='utf-8'))
+        return systemd_unit_parity.environment_map(directives, section)
+
+    return environment

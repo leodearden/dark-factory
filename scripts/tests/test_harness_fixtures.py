@@ -1,8 +1,8 @@
-"""Contract tests for the shared fake-command fixtures in scripts/tests/conftest.py (task 5285).
+"""Contract tests for the shared fixtures task 5285 added to scripts/tests/conftest.py.
 
-Each test requests a fixture and drives what it installs by subprocess,
-asserting only what a consuming suite can observe through the fixture's
-public seam.
+Each test requests a fixture and asserts only what a consuming suite can
+observe through the fixture's public seam: a fake command is driven by
+subprocess, a unit reader is handed a unit file written under tmp_path.
 
 To run just this suite:
 
@@ -237,3 +237,34 @@ def test_unit_values_joins_a_backslash_continued_value(unit_values, tmp_path):
     ))
 
     assert unit_values(unit, 'Service', 'ExecStart') == ['/bin/a --flag']
+
+
+# ---------------------------------------------------------------------------
+# unit_environment
+# ---------------------------------------------------------------------------
+
+
+def test_unit_environment_reads_every_assignment_form_systemd_accepts(unit_environment, tmp_path):
+    unit = tmp_path / 'x.service'
+    unit.write_text((
+        '[Service]\n'
+        'Environment=A=1 "B=two words"\n'
+        'Environment=C=x=y\n'
+        'Environment=A=again\n'
+    ), encoding='utf-8')
+
+    assert unit_environment(unit, 'Service') == {'A': 'again', 'B': 'two words', 'C': 'x=y'}
+
+
+def test_unit_environment_reads_only_live_lines_of_the_named_section(unit_environment, tmp_path):
+    unit = tmp_path / 'x.service'
+    unit.write_text((
+        '[Unit]\n'
+        'Environment=IN_UNIT=1\n'
+        '[Service]\n'
+        '# Environment=COMMENTED=1\n'
+        'Environment=LIVE=1\n'
+    ), encoding='utf-8')
+
+    assert unit_environment(unit, 'Service') == {'LIVE': '1'}
+    assert unit_environment(unit, 'Install') == {}
