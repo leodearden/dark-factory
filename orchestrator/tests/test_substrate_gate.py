@@ -1235,7 +1235,8 @@ class TestRunSlotSubstrateFailClosed:
 
         h = _make_slot_harness(tmp_path)
         _stub_old_carries_substrate_probe(h)
-        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
 
         assignment = MagicMock()
         assignment.task_id = task_id
@@ -1258,7 +1259,7 @@ class TestRunSlotSubstrateFailClosed:
         )
         h.scheduler.set_task_status.assert_awaited_once_with(task_id, 'blocked')  # type: ignore[attr-defined]
 
-        pending = h._escalation_queue.get_pending()
+        pending = esc_queue.get_pending()
         l1s = [e for e in pending if e.task_id == task_id and e.level == 1]
         assert len(l1s) == 1, f'Expected exactly 1 L1 escalation for task {task_id}; got {l1s!r}'
         assert l1s[0].category == 'design_concern', f'Expected design_concern, got {l1s[0].category!r}'
@@ -1355,7 +1356,7 @@ async def _init_gate_repo(repo: Path) -> None:
     await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
-def _make_real_git_harness(repo: Path):
+def _make_real_git_harness(repo: Path, *, escalation_queue=None):
     """Build a Harness whose ``git_ops`` is a REAL ``GitOps`` on *repo*.
 
     Unlike ``_make_harness`` (which replaces ``h.git_ops`` with a bare
@@ -1377,7 +1378,7 @@ def _make_real_git_harness(repo: Path):
     h.scheduler = MagicMock()
     h.scheduler.set_task_status = AsyncMock()
     h.scheduler.is_deterministic = MagicMock(return_value=False)
-    h._escalation_queue = None
+    h._escalation_queue = escalation_queue
     return h
 
 
@@ -1629,6 +1630,22 @@ def _single_l1(esc_queue, task_id: str):
     return esc
 
 
+async def _blocked_gate_l1(tmp_path: Path, assignment):
+    """Run the REAL gate on ``tmp_path / 'repo'``; assert it blocked; return its one L1."""
+    from escalation.queue import EscalationQueue
+
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    h = _make_real_git_harness(tmp_path / 'repo', escalation_queue=esc_queue)
+    set_status = AsyncMock()
+    h.scheduler.set_task_status = set_status
+
+    allowed = await h._run_substrate_gate(assignment)
+
+    assert allowed is False
+    set_status.assert_awaited_once_with(assignment.task_id, 'blocked')
+    return _single_l1(esc_queue, assignment.task_id)
+
+
 def _assert_unverified_l1(esc) -> None:
     summary, detail = esc.summary, esc.detail
     assert summary.startswith('SUBSTRATE_UNVERIFIED'), summary
@@ -1661,16 +1678,6 @@ class TestUnverifiableRecheckEscalation:
     failure must still file the PASS→FAIL claim.
     """
 
-    @staticmethod
-    def _wire(h, tmp_path: Path):
-        from escalation.queue import EscalationQueue
-
-        set_status = AsyncMock()
-        h.scheduler.set_task_status = set_status
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        h._escalation_queue = esc_queue
-        return set_status, esc_queue
-
     @pytest.mark.asyncio
     async def test_worktree_add_failure_files_unverified_l1(self, tmp_path: Path):
         repo = tmp_path / 'repo'
@@ -1678,14 +1685,9 @@ class TestUnverifiableRecheckEscalation:
         # An unborn `main`: resolve_branch_sha returns None, the gate falls
         # back to the symbolic ref, and the real `git worktree add` fails.
         await _init_unborn_repo(repo)
-        h = _make_real_git_harness(repo)
-        set_status, esc_queue = self._wire(h, tmp_path)
 
-        allowed = await h._run_substrate_gate(_make_assignment('8372'))
+        esc = await _blocked_gate_l1(tmp_path, _make_assignment('8372'))
 
-        assert allowed is False
-        set_status.assert_awaited_once_with('8372', 'blocked')
-        esc = _single_l1(esc_queue, '8372')
         _assert_unverified_l1(esc)
         assert 'git worktree add failed' in esc.detail, esc.detail
 
@@ -1694,8 +1696,6 @@ class TestUnverifiableRecheckEscalation:
         repo = tmp_path / 'repo'
         repo.mkdir()
         await _init_gate_repo(repo)
-        h = _make_real_git_harness(repo)
-        set_status, esc_queue = self._wire(h, tmp_path)
 
         # run_substrate_recheck catches its own subprocess errors, so patching
         # the public function is the honest way to reach the except branch
@@ -1704,11 +1704,8 @@ class TestUnverifiableRecheckEscalation:
             'orchestrator.substrate_gate.run_substrate_recheck',
             side_effect=RuntimeError('checker host vanished'),
         ):
-            allowed = await h._run_substrate_gate(_make_assignment('8372'))
+            esc = await _blocked_gate_l1(tmp_path, _make_assignment('8372'))
 
-        assert allowed is False
-        set_status.assert_awaited_once_with('8372', 'blocked')
-        esc = _single_l1(esc_queue, '8372')
         _assert_unverified_l1(esc)
         assert 'RuntimeError' in esc.detail, esc.detail
         assert 'checker host vanished' in esc.detail, esc.detail
@@ -1718,15 +1715,10 @@ class TestUnverifiableRecheckEscalation:
         repo = tmp_path / 'repo'
         repo.mkdir()
         await _init_gate_repo(repo)
-        h = _make_real_git_harness(repo)
-        set_status, esc_queue = self._wire(h, tmp_path)
         assignment = _probe_assignment('8372', [str(tmp_path / 'no-such-checker')])
 
-        allowed = await h._run_substrate_gate(assignment)
+        esc = await _blocked_gate_l1(tmp_path, assignment)
 
-        assert allowed is False
-        set_status.assert_awaited_once_with('8372', 'blocked')
-        esc = _single_l1(esc_queue, '8372')
         _assert_unverified_l1(esc)
         assert 'rc=99' in esc.detail, esc.detail
         assert 'No such file or directory' in esc.detail, esc.detail
@@ -1736,17 +1728,12 @@ class TestUnverifiableRecheckEscalation:
         repo = tmp_path / 'repo'
         repo.mkdir()
         await _init_gate_repo(repo)
-        h = _make_real_git_harness(repo)
-        set_status, esc_queue = self._wire(h, tmp_path)
         # The probe_set path is appended as an argv the -c script ignores.
         assignment = _probe_assignment(
             '8372', [sys.executable, '-c', 'import sys; sys.exit(1)'],
         )
 
-        allowed = await h._run_substrate_gate(assignment)
+        esc = await _blocked_gate_l1(tmp_path, assignment)
 
-        assert allowed is False
-        set_status.assert_awaited_once_with('8372', 'blocked')
-        esc = _single_l1(esc_queue, '8372')
         assert esc.summary == 'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task 8372)'
         assert 're-spec required' in esc.detail, esc.detail
