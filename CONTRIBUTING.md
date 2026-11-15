@@ -437,6 +437,10 @@ check`, the asyncmock/bare-MagicMock style checks on staged test files, and
 `scripts/hook_module_checks.py`). Each registered module that a staged `.py`
 maps to runs its `lint_command` and `type_check_command` verbatim. A staged
 `.py` under `shared` or `escalation` runs the type check of every module. A
+staged repo-root `.py` (`conftest.py`, `df_pytest_isolation.py`), which no
+module can own, runs the hook's own `root:type` unit, pyright over those files
+(`scripts/hook_module_checks.py::root_units`); a root module other than
+`conftest.py` also runs every module's type check, like `shared`/`escalation`. A
 staged file under `plans/`, `docs/` or `review/`, or a `*.yaml`/`*.json`/`*.md`
 outside a workspace package, runs the `scripts/merge_screen.yaml` screen. A
 commit that maps to none of these prints `pre-commit: merge-gate checks

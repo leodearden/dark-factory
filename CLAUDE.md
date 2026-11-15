@@ -440,7 +440,8 @@ directly, not just interactive agents.
   (not a bare `git commit`) so you don't sweep up unrelated staged/dirty state
   from a concurrent process.
 - `pre-commit` runs the merge gate's module checks **only for modules with
-  staged `.py` changes** (`hooks/project-checks` via
+  staged `.py` changes**, plus `root:type` for a staged repo-root `.py`
+  (`hooks/project-checks` via
   `scripts/hook_module_checks.py`, task 8531). A commit mapping to none prints
   `merge-gate checks skipped (...)` and is quick. A docs-only commit runs the
   `scripts/merge_screen.yaml` screen instead (about 10 s warm) when it stages
