@@ -705,6 +705,9 @@ class TestGetStateSnapshotPopulated:
         Assertions mirror the step-13 spec exactly.
         """
         config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.skip_threshold = {
+            'critical': 0, 'high': 1, 'medium': 2, 'low': 4, 'polish': 9999,
+        }
         store = OverrideStore(tmp_path / 'o.db')
 
         # T1 gets a boost override (medium → high).

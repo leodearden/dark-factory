@@ -1804,3 +1804,23 @@ merge_deep:
   chain_cap: 6
   # No warm spec pool here, so builds are git-only (8 builds, max 31 s).
   chain_build_timeout_secs: 300
+
+# TRIAL (Leo 2026-11-14, lock hand-off study): the automatic file reservation
+# is off. A task earns one when its count of skips reaches its tier's threshold,
+# and the count resets only when the task starts or the orchestrator restarts.
+# The busiest tasks are skipped about 130 times a day, so 1000000 is out of
+# reach. The pin reservation (operator and starvation-watchdog pins, at most
+# pin_reservation_max_active owners) is unchanged. Polish stays at its default.
+# Side effect: at a threshold of 1000 or more the scheduler records task_skipped
+# events only at counts 1, 10, 100, 1000 and 10000, so readers of those events
+# see fewer of them; the watchdog reads the in-memory counts and is unaffected.
+# Review and alerts: task 10128. To end the trial delete this block; the code
+# defaults then apply (critical 0, high 1, medium 2, low 4). Green tier:
+# applied with reload_config.
+fairness:
+  skip_threshold:
+    critical: 1000000
+    high: 1000000
+    medium: 1000000
+    low: 1000000
+    polish: 9999
