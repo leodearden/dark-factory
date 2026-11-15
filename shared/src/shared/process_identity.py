@@ -11,7 +11,9 @@ import socket
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, NamedTuple
+from typing import Final
+
+from shared.proc_liveness import pid_alive
 
 __all__ = [
     'PROC_ROOT',
@@ -24,7 +26,6 @@ __all__ = [
 ]
 
 PROC_ROOT: Final = Path('/proc')
-_EXITED_STATES: Final = frozenset({'Z', 'X'})
 
 
 class Liveness(StrEnum):
@@ -64,12 +65,6 @@ class _Absent(ProcessIdentityUnreadable):
     """ENOENT/ESRCH: unreadable unless the caller holds positive evidence that it means exited."""
 
 
-class _Stat(NamedTuple):
-    state: str
-    start_ticks: int
-
-
-_STATE_AFTER_COMM: Final = 0
 _START_TICKS_AFTER_COMM: Final = 19
 
 
@@ -112,7 +107,7 @@ def _read_pid_file(path: Path, proc_root: Path) -> str | None:
         return None
 
 
-def _parse_stat(path: Path, text: str) -> _Stat:
+def _parse_start_ticks(path: Path, text: str) -> int:
     close = text.rfind(')')
     fields = text[close + 1 :].split()
     if close < 0 or len(fields) <= _START_TICKS_AFTER_COMM:
@@ -120,27 +115,22 @@ def _parse_stat(path: Path, text: str) -> _Stat:
     start_ticks = fields[_START_TICKS_AFTER_COMM]
     if not start_ticks.isdecimal():
         raise ProcessIdentityUnreadable(path, f'start_ticks {start_ticks!r} is not a number')
-    return _Stat(state=fields[_STATE_AFTER_COMM], start_ticks=int(start_ticks))
+    return int(start_ticks)
 
 
-def _read_stat(pid: int, proc_root: Path) -> _Stat | None:
+def _start_ticks_of_existing_pid(pid: int, proc_root: Path) -> int | None:
+    if not pid_alive(pid):
+        return None
     path = proc_root / str(pid) / 'stat'
     text = _read_pid_file(path, proc_root)
-    return None if text is None else _parse_stat(path, text)
-
-
-def _running_stat(pid: int, proc_root: Path) -> _Stat | None:
-    stat = _read_stat(pid, proc_root)
-    if stat is None or stat.state in _EXITED_STATES:
-        return None
-    return stat
+    return None if text is None else _parse_start_ticks(path, text)
 
 
 def capture(pid: int, *, proc_root: Path = PROC_ROOT) -> ProcessIdentity | None:
-    stat = _running_stat(pid, proc_root)
-    if stat is None:
+    start_ticks = _start_ticks_of_existing_pid(pid, proc_root)
+    if start_ticks is None:
         return None
-    return ProcessIdentity(pid, stat.start_ticks, _boot_id(proc_root), socket.gethostname())
+    return ProcessIdentity(pid, start_ticks, _boot_id(proc_root), socket.gethostname())
 
 
 def command_name(pid: int, *, proc_root: Path = PROC_ROOT) -> str | None:
@@ -153,7 +143,5 @@ def liveness(identity: ProcessIdentity, *, proc_root: Path = PROC_ROOT) -> Liven
         return Liveness.OTHER_HOST
     if _boot_id(proc_root) != identity.boot_id:
         return Liveness.DEAD
-    stat = _running_stat(identity.pid, proc_root)
-    if stat is None or stat.start_ticks != identity.start_ticks:
-        return Liveness.DEAD
-    return Liveness.ALIVE
+    start_ticks = _start_ticks_of_existing_pid(identity.pid, proc_root)
+    return Liveness.ALIVE if start_ticks == identity.start_ticks else Liveness.DEAD
