@@ -36,11 +36,10 @@ def _module_config(test_command: str = _TEST_CMD) -> ModuleConfig:
     )
 
 
-def _scoped_config(**overrides: object) -> OrchestratorConfig:
+def _scoped_config() -> OrchestratorConfig:
     return OrchestratorConfig(
         verify_use_cgroup_scope=True,
         fused_memory=FusedMemoryConfig(project_id='my-proj'),
-        **overrides,
     )
 
 

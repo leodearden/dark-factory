@@ -17,6 +17,9 @@ import time
 
 import pytest
 import verify_scope_peaks as mod
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 GIB = mod.GIB
 MEMORY = mod.HostMemory(total_gib=125.0, available_gib=90.0)

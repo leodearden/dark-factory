@@ -153,6 +153,11 @@ MERGE_PATH_CONFIG_READS: Mapping[str, Classified] = MappingProxyType({
     'project_root': Classified(
         Fidelity.MERGE_NEUTRAL, "The host's own checkout, read only to tag the cgroup scope."
     ),
+    'fused_memory': Classified(
+        Fidelity.MERGE_NEUTRAL,
+        "The host's project_id, read only to name the project slice the cgroup scope runs under "
+        '(task 3394): it places the run among the host\'s cgroups and leaves its commands alone.',
+    ),
     'verify_admission_background_promote_secs': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
     'verify_admission_enabled': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
     'verify_admission_nice_background': Classified(Fidelity.MERGE_NEUTRAL, _ADMISSION),
