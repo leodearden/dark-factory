@@ -67,11 +67,12 @@ from shared.proc_liveness import pid_alive
 from shared.process_identity import Liveness, ProcessIdentity
 from shared.session_liveness import capture_for_record, judge
 
-# Loaded three ways, so siblings resolve three ways: as orchestrator.session_registry
-# (relative), by absolute path in tier-1 (its own directory is sys.path[0]), and by
-# path under a foreign dotless name (its directory is not on sys.path). Each mode is
-# pinned in test_session_registry.py::TestStdlibOnlySelfContainment. TYPE_CHECKING
-# points the type checker at the package arm, the only one it can resolve.
+# Siblings are imported relative to orchestrator.session_registry, or else from this
+# file's own directory: loaded by path, as tier-1 __main__ or under a foreign dotless
+# name, that directory is on sys.path only if Python put it there (not under -P, -I or
+# PYTHONSAFEPATH, nor for a foreign-name load), so it is borrowed for these imports
+# alone. Each mode is pinned in test_session_registry.py::TestStdlibOnlySelfContainment.
+# TYPE_CHECKING points the type checker at the package arm, the only one it can resolve.
 if TYPE_CHECKING or __package__:
     from . import decision_cli
     from .fleet_files import (
@@ -80,22 +81,22 @@ if TYPE_CHECKING or __package__:
         exclusive_sidecar_lock,
         fleet_root,
     )
-elif __spec__ is None:
-    import decision_cli
-    from fleet_files import (
-        ATOMIC_WRITE_TEMP_SUFFIX,
-        atomic_write_text,
-        exclusive_sidecar_lock,
-        fleet_root,
-    )
 else:
-    from orchestrator import decision_cli
-    from orchestrator.fleet_files import (
-        ATOMIC_WRITE_TEMP_SUFFIX,
-        atomic_write_text,
-        exclusive_sidecar_lock,
-        fleet_root,
-    )
+    _OWN_DIR = str(Path(__file__).resolve().parent)
+    _OWN_DIR_BORROWED = _OWN_DIR not in sys.path
+    if _OWN_DIR_BORROWED:
+        sys.path.append(_OWN_DIR)
+    try:
+        import decision_cli
+        from fleet_files import (
+            ATOMIC_WRITE_TEMP_SUFFIX,
+            atomic_write_text,
+            exclusive_sidecar_lock,
+            fleet_root,
+        )
+    finally:
+        if _OWN_DIR_BORROWED:
+            sys.path.remove(_OWN_DIR)
 
 # ---------------------------------------------------------------------------
 # Schema / contract (PRD §6 G5): consumers import this; they never re-derive

@@ -5325,12 +5325,15 @@ class TestStdlibOnlySelfContainment:
             f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
         )
 
-    def test_bare_shell_write_decision_folds_project_through_shared(self, tmp_path):
+    @pytest.mark.parametrize('flags', [(), ('-I', '-B')], ids=['default', 'isolated'])
+    def test_bare_shell_write_decision_folds_project_through_shared(self, tmp_path, flags):
         """The production spawn-claude/SKILL invocation reaches the shared fold.
 
         ``write-decision`` run by absolute path with no PYTHONPATH stores its
         project folded by ``shared.project_id.fold_project_token``, so the fold
-        the cockpit reads with is reachable from a bare shell.
+        the cockpit reads with is reachable from a bare shell. The isolated case
+        (``-I``, which implies ``-P``) leaves the script's own directory off
+        ``sys.path``, so the sibling imports must not depend on it being there.
         """
         interpreter = _non_venv_interpreter()
         if interpreter is None:
@@ -5340,6 +5343,7 @@ class TestStdlibOnlySelfContainment:
         result = subprocess.run(
             [
                 interpreter,
+                *flags,
                 str(_SR_PKG_ROOT / 'orchestrator' / 'session_registry.py'),
                 'write-decision',
                 '--id', 'esc-1-1',
@@ -5485,23 +5489,37 @@ class TestStdlibOnlySelfContainment:
 
         tests/scripts/review_all_program_fixture.py::load_session_registry loads
         this checkout's session_registry.py with ``spec_from_file_location``
-        under a dotless name, without putting its directory on ``sys.path``.
-        There ``__package__`` is ``''`` while ``__spec__`` is set, so neither a
-        relative sibling import nor a bare one can resolve: only the absolute
-        ``from orchestrator import ...`` arm of a sibling import works.
+        under a dotless name, without putting its directory on ``sys.path``, so
+        that a suite takes the registry from this checkout rather than from
+        whichever ``orchestrator`` the venv resolves. There ``__package__`` is
+        ``''``, so no relative sibling import resolves. The siblings must come
+        from this file's own directory too, and that directory must not be left
+        on the importer's ``sys.path``.
         """
         name = 'sr_foreign_dotless_load_probe'
         path = _SR_PKG_ROOT / 'orchestrator' / 'session_registry.py'
         assert str(path.parent) not in sys.path
+        siblings = ('decision_cli', 'decision_registry', 'fleet_files')
+        assert not any(sibling in sys.modules for sibling in siblings)
         spec = importlib.util.spec_from_file_location(name, path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         monkeypatch.setitem(sys.modules, name, module)
+        path_before = list(sys.path)
 
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
 
-        assert module.__package__ == ''
-        assert callable(module.fleet_root)
+            assert module.__package__ == ''
+            assert sys.path == path_before
+            assert {sibling: Path(sys.modules[sibling].__file__ or '') for sibling in siblings} == {
+                sibling: path.parent / f'{sibling}.py' for sibling in siblings
+            }
+            assert module.decision_cli is sys.modules['decision_cli']
+            assert module.fleet_root is sys.modules['fleet_files'].fleet_root
+        finally:
+            for sibling in siblings:
+                sys.modules.pop(sibling, None)
 
     def test_tier1_is_strictly_stronger_than_tier2(self, tmp_path, bare_shell_probes):
         """The two session_registry rows encode DIFFERENT contracts, not one twice.
