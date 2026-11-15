@@ -8,14 +8,20 @@ the one mapping from a dispatch identity to the role whose settings it uses.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Final
+from typing import Annotated, Final
+
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+
+from shared.backends import Backend, parse_backend
 
 __all__ = [
     'DISPATCHABLE_ROLES',
     'FUSED_MEMORY_ROLES',
     'ORCHESTRATOR_ROLES',
     'REVIEWER_VARIANTS',
+    'Effort',
     'RoleName',
+    'RoleSettings',
     'UnknownRole',
     'config_role',
 ]
@@ -116,3 +122,29 @@ def config_role(dispatch_name: str) -> RoleName:
     except ValueError:
         allowed = (*(r.value for r in RoleName), f'{_REVIEWER_FAMILY_PREFIX}<name>')
         raise UnknownRole(dispatch_name, allowed=allowed) from None
+
+
+class Effort(StrEnum):
+    """Every reasoning-effort level a role may request: the union of the levels the backends accept."""
+
+    OFF = 'off'
+    NONE = 'none'
+    MINIMAL = 'minimal'
+    LOW = 'low'
+    MEDIUM = 'medium'
+    HIGH = 'high'
+    XHIGH = 'xhigh'
+    MAX = 'max'
+
+
+class RoleSettings(BaseModel):
+    """One role's invocation settings."""
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    model: str = Field(min_length=1)
+    backend: Annotated[Backend, BeforeValidator(parse_backend)] = Backend.CLAUDE
+    effort: Effort | None = None
+    budget_usd: float | None = Field(default=None, gt=0)
+    max_turns: int | None = Field(default=None, gt=0)
+    timeout_secs: float | None = Field(default=None, gt=0)
