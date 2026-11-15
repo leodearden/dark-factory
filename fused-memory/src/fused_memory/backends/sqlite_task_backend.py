@@ -40,6 +40,7 @@ from shared.sqlite_column_migration import add_column_if_missing
 from shared.task_created_at import CreatedAtSource
 from shared.task_metadata import (
     _WHOLE_METADATA_FIELD,
+    GATE_EPISODE_STAMP_KEYS,
     SchemaWarning,
     apply_migrations,
     parse_metadata,
@@ -765,8 +766,9 @@ async def _migrate_v3_to_v4(
                     mode='merge',
                     project_root=project_root, tag=group['tag'], task_id=cancel_id,
                 )
-                # Leaving deferred drops its record (plans/deferral-flip-condition-prd.md decision 4).
-                new_metadata = _metadata_without_keys(new_metadata, _CLEARABLE_AUDIT_KEYS)
+                # Leaving deferred drops its record (plans/deferral-flip-condition-prd.md decision 4),
+                # and entering cancelled ends a gate episode (middleware/gate_stamp_lifecycle.py).
+                new_metadata = _metadata_without_keys(new_metadata, _STATUS_CLEARABLE_KEYS)
                 await conn.execute(
                     "UPDATE tasks SET status = 'cancelled', updated_at = ?, "
                     "metadata = ? WHERE tag = ? AND id = ?",
@@ -2658,9 +2660,9 @@ class SqliteTaskBackend:
     ) -> SetTaskStatusResult | StatusWriteNotPersistedResult:
         """Atomically update ``status`` AND merge ``audit_fields`` into metadata.
 
-        ``clear_keys`` (a subset of ``_CLEARABLE_AUDIT_KEYS``) are removed from
+        ``clear_keys`` (a subset of ``_STATUS_CLEARABLE_KEYS``) are removed from
         the resulting blob in the same transaction: leaving ``deferred`` drops
-        its record.
+        its record, and a terminal crossing drops the gate-episode stamps.
 
         The sole atomic status+audit writer (task 2649). Calling
         ``stamp_audit_metadata`` followed by ``set_task_status`` — the
@@ -2702,10 +2704,10 @@ class SqliteTaskBackend:
         :meth:`stamp_audit_metadata`, kept off the 12-method contract so
         other callers do not treat it as sanctioned public surface.
         """
-        if unclearable := clear_keys - _CLEARABLE_AUDIT_KEYS:
+        if unclearable := clear_keys - _STATUS_CLEARABLE_KEYS:
             raise ValueError(
                 f'set_status_and_stamp_audit cannot clear {sorted(unclearable)}; '
-                f'clearable keys are {sorted(_CLEARABLE_AUDIT_KEYS)}'
+                f'clearable keys are {sorted(_STATUS_CLEARABLE_KEYS)}'
             )
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
@@ -4535,7 +4537,7 @@ def _assert_passthrough_only_keys(
     return frozenset(key for key in _PASSTHROUGH_ONLY_METADATA_KEYS if key in incoming)
 
 
-_CLEARABLE_AUDIT_KEYS: frozenset[str] = frozenset({'deferral'})
+_STATUS_CLEARABLE_KEYS: frozenset[str] = frozenset({'deferral'}) | GATE_EPISODE_STAMP_KEYS
 
 
 def _metadata_without_keys(blob_json: str, keys: frozenset[str]) -> str:

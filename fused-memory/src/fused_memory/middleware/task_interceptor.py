@@ -64,7 +64,12 @@ from fused_memory.backends.task_backend_types import (
     TaskFactsRow,
 )
 from fused_memory.config.schema import CuratorConfig
-from fused_memory.middleware import deferral_gate, recon_write_policy, task_text_write_guard
+from fused_memory.middleware import (
+    deferral_gate,
+    gate_stamp_lifecycle,
+    recon_write_policy,
+    task_text_write_guard,
+)
 from fused_memory.middleware.amendment_advisory import (
     TASK_TEXT_FIELDS,
     AmendmentWriter,
@@ -2036,7 +2041,12 @@ class TaskInterceptor:
                     _status_write_body(
                         tm, task_id, status, project_root, tag,
                         audit_fields=audit_fields,
-                        clear_keys=deferral_write.clear_keys,
+                        clear_keys=deferral_write.clear_keys
+                        | gate_stamp_lifecycle.terminal_crossing_clear_keys(
+                            old_status=old_status,
+                            new_status=status,
+                            stored_metadata=stored_metadata,
+                        ),
                         claimant_kwargs=claimant_kwargs,
                     ),
                     agent_id=_journal_agent_id,
