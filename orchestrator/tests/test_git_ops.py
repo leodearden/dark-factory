@@ -11290,12 +11290,9 @@ class TestGetMergeCommitDiffFiles:
 
 @pytest.mark.asyncio
 class TestGetFilesTouchedInBranchWarning:
-    """Step-1 (RED): get_files_touched_in_branch must emit a WARNING when
-    git log exits non-zero (e.g. non-existent base SHA), while still
-    returning [].
-
-    Before step-2 impl: rc!=0 path is silent → RED (no WARNING).
-    After step-2 impl: WARNING captured at 'orchestrator.git_ops'.
+    """get_files_touched_in_branch must emit a WARNING when git log exits
+    non-zero (e.g. non-existent base SHA), and return the error with its
+    empty file list rather than an empty list alone (task 3918).
     """
 
     async def test_nonexistent_sha_returns_empty_and_warns(
@@ -11307,10 +11304,11 @@ class TestGetFilesTouchedInBranchWarning:
         non_existent = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
-            result = await ops.get_files_touched_in_branch(non_existent, 'HEAD')
+            files, err = await ops.get_files_touched_in_branch(non_existent, 'HEAD')
 
-        assert result == [], (
-            f'Expected [] on git error; got {result!r}'
+        assert files == [], f'Expected [] on git error; got {files!r}'
+        assert isinstance(err, Exception), (
+            f'Expected the git error to be returned; got {err!r}'
         )
 
         warning_texts = [r.message for r in caplog.records if r.levelno >= logging.WARNING]

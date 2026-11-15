@@ -146,7 +146,7 @@ from orchestrator.main_health_fix_owner import (
     ensure_main_fix_owner,
 )
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
-from orchestrator.merge_lane.gates import declaration_coverage
+from orchestrator.merge_lane.gates import PlanFilesTouchedResult, declaration_coverage
 from orchestrator.merge_lane.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
     LandingReason,
@@ -156,7 +156,12 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_reported_landing,
 )
 from orchestrator.merge_lane.train_selection import select_train_members
-from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.types import OutcomeKind, QueuedBranch
+from orchestrator.merge_lane.unmeasured_delivery import (
+    UnmeasuredDelivery,
+    diagnose_unmeasured_branch,
+    find_work_on_sibling_ref,
+)
 from orchestrator.merger_failure import merger_failure_report
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.plan_descope import (
@@ -166,7 +171,7 @@ from orchestrator.plan_descope import (
     done_step_records,
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
-from orchestrator.recut_ruling import ruling_to_enforce
+from orchestrator.recut_ruling import recut_supersession, ruling_to_enforce
 from orchestrator.resume_resolution import (
     CarriedResolution,
     render_carried_resolutions,
@@ -12339,6 +12344,41 @@ class TaskWorkflow:
             )
         return None
 
+    async def _block_if_delivery_unmeasured(
+        self, finding: UnmeasuredDelivery | None, *, merge_phase: bool,
+    ) -> WorkflowOutcome | None:
+        """Block with *finding*'s remedy; None when there is no finding."""
+        from orchestrator.merge_lane.worker import _emit_merge_attempt
+
+        if finding is None:
+            return None
+        _emit_merge_attempt(
+            self.event_store, self.task_id, OutcomeKind.plan_files_unmeasured,
+        )
+        return await self._mark_blocked(
+            finding.block_reason(),
+            merge_phase=merge_phase,
+            category='plan_delivery_unmeasured',
+            suggested_action=finding.suggested_action,
+        )
+
+    async def _work_on_sibling_ref(
+        self, check: PlanFilesTouchedResult, branch: str, head: str,
+    ) -> UnmeasuredDelivery | None:
+        """*check*'s work on a sibling ref no executed re-cut ruling superseded.
+
+        Reads the metadata fresh: the dispatch gate persists ``recut_executed``
+        after ``self.task`` was read, so the first incarnation after a re-cut
+        would otherwise miss it.
+        """
+        fresh = await self._merge_fresh_metadata(
+            self.task.get('metadata') or {}, log_context='sibling-ref diagnosis',
+        )
+        return await find_work_on_sibling_ref(
+            check, self.git_ops, branch=branch, head=head, task_id=self.task_id,
+            superseded=recut_supersession({'id': self.task_id, 'metadata': fresh}),
+        )
+
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,
         *, merge_phase: bool = False,
@@ -12368,7 +12408,6 @@ class TaskWorkflow:
         from orchestrator.merge_lane.tip_relation import AttachAction, resolve_attach_action
         from orchestrator.merge_lane.worker import (
             MergeRequest,
-            OutcomeKind,
             _emit_merge_attempt,
         )
 
@@ -12382,7 +12421,14 @@ class TaskWorkflow:
         # steward) is allowed to mediate, and only to drop genuinely
         # unneeded entries.  Adding new files is rejected by the helper's
         # subset check.  The gate's re-check is the source of truth for
-        # pass/fail.
+        # pass/fail.  A range that never measured the task's own work proves
+        # nothing: its in-branch causes are diagnosed before the already-landed
+        # carve-out, work on a sibling ref only after that carve-out declines
+        # and only for a HEAD with no own commits, and both before narrowing;
+        # a ref superseded by a re-cut ruling is never offered.  The re-check
+        # after narrowing repeats only the in-branch diagnosis: narrowing
+        # creates no ref.  See merge_lane/unmeasured_delivery.py and
+        # recut_ruling.py::RecutSupersession.
         if (
             self._task_files
             and self._base_commit is not None
@@ -12430,6 +12476,9 @@ class TaskWorkflow:
                 ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
             )
             if rc == 0 and branch_head.strip():
+                canonical_branch = (
+                    f'{self.config.git.branch_prefix}{branch_name.split("/")[-1]}'
+                )
                 own_base = await self._own_work_base()
                 check = await _check_plan_files_touched_in_branch(
                     list(self._task_files),
@@ -12440,6 +12489,14 @@ class TaskWorkflow:
                 )
                 narrowing_succeeded = False
                 if check.not_touched:
+                    unmeasured = await self._block_if_delivery_unmeasured(
+                        await diagnose_unmeasured_branch(
+                            check, self.worktree, task_id=self.task_id,
+                        ),
+                        merge_phase=merge_phase,
+                    )
+                    if unmeasured is not None:
+                        return unmeasured
                     # ALREADY-LANDED carve-out (task 3539).  Sited INSIDE the
                     # already-failing arm and BEFORE the narrowing pass — not
                     # alongside the cross-repo check at the top of the block —
@@ -12529,10 +12586,7 @@ class TaskWorkflow:
                         # correct for a prefixed caller too, instead of
                         # silently producing `task/task/<id>` and failing
                         # closed on a marker that is really there.
-                        branch=(
-                            f'{self.config.git.branch_prefix}'
-                            f'{branch_name.split("/")[-1]}'
-                        ),
+                        branch=canonical_branch,
                     )
                     if already_landed is not None:
                         _emit_merge_attempt(
@@ -12558,6 +12612,14 @@ class TaskWorkflow:
                             category='already_landed',
                             suggested_action='verify_landing_and_close',
                         )
+                    unmeasured = await self._block_if_delivery_unmeasured(
+                        await self._work_on_sibling_ref(
+                            check, canonical_branch, branch_head.strip(),
+                        ),
+                        merge_phase=merge_phase,
+                    )
+                    if unmeasured is not None:
+                        return unmeasured
                     narrowed = await self._try_narrow_plan(check.not_touched)
                     exit_outcome = await self._consume_narrowing_exit_report(
                         merge_phase=merge_phase,
@@ -12579,6 +12641,15 @@ class TaskWorkflow:
                             )
                             if not check.not_touched:
                                 narrowing_succeeded = True
+                            else:
+                                unmeasured = await self._block_if_delivery_unmeasured(
+                                    await diagnose_unmeasured_branch(
+                                        check, self.worktree, task_id=self.task_id,
+                                    ),
+                                    merge_phase=merge_phase,
+                                )
+                                if unmeasured is not None:
+                                    return unmeasured
                 if check.not_touched:
                     # Task 3110 — the message is CLASS-SCOPED, because the
                     # gate's two failure classes are different failures.

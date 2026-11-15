@@ -1901,7 +1901,7 @@ class TestResolveAlreadyLandedBranch:
 
         assert await widened.get_files_touched_in_branch(
             f'{revert_sha}^1', revert_sha,
-        ) == plan_files
+        ) == (plan_files, None)
         assert await widened.commit_effect_present_in_main(revert_sha)
 
         assert await _resolve(
