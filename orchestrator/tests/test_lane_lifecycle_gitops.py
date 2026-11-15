@@ -21,6 +21,7 @@ from unittest.mock import patch
 import pytest
 from _review_loop_harness import review_loop_workflow
 from _review_payloads import blocking_review
+from _worktree_registrations import lane_admin_dir
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig
@@ -105,15 +106,6 @@ async def _get_head(repo: Path) -> str:
     rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
     assert rc == 0, f'git rev-parse HEAD failed (rc={rc})'
     return out.strip()
-
-
-def _lane_admin_dir(lane: Path) -> Path:
-    """Parse the ``.git/worktrees/<name>`` admin dir path out of a lane's
-    ``.git`` pointer file (``gitdir: <repo>/.git/worktrees/<name>``)."""
-    content = (lane / '.git').read_text().strip()
-    prefix = 'gitdir:'
-    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
-    return Path(content[len(prefix):].strip())
 
 
 def _assert_route_logged(caplog: pytest.LogCaptureFixture, route: AcquireRoute) -> None:
@@ -281,7 +273,7 @@ class TestAcquireRouteClassification:
         # DO NOT release — 'R' stays mapped, so the next acquire_for('R')
         # returns reused=True.
 
-        admin_dir = _lane_admin_dir(lane)
+        admin_dir = lane_admin_dir(lane)
         (admin_dir / 'gitdir').write_text('/tmp/bogus/.git\n')
         assert not await git_ops._is_registered_worktree(lane), (
             'lane must appear unregistered once its admin dir gitdir '
