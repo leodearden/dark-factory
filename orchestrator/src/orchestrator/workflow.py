@@ -6258,14 +6258,29 @@ class TaskWorkflow:
         return True
 
     def _retired_reviews_since(self, since: datetime | None) -> tuple[RetiredReview, ...]:
-        """The quarantine-retired review rounds after *since*, narrowed to this task's lock set; the out-of-scope rest was already filed as follow-up tasks (task 2640)."""
+        """The quarantine-retired review rounds after *since*, narrowed to this task's lock set.
+
+        Each suggestion the narrowing drops is logged at WARNING. It was filed
+        as a follow-up task (task 2640) only if the parked dispatch's lock set
+        excluded it too; one that a changed lock set moved out of scope was
+        amended on the parked branch and never filed.
+        """
         if self.artifacts is None:
             return ()
-        scoped = (
-            replace(review, suggestions=tuple(self._suggestions_in_scope(review.suggestions)))
-            for review in retired_reviews_since(self.artifacts, since)
-        )
+        scoped = (self._retired_review_in_scope(review) for review in retired_reviews_since(self.artifacts, since))
         return tuple(review for review in scoped if review.suggestions)
+
+    def _retired_review_in_scope(self, review: RetiredReview) -> RetiredReview:
+        in_scope = self._suggestions_in_scope(review.suggestions)
+        kept = {id(suggestion) for suggestion in in_scope}
+        for suggestion in review.suggestions:
+            if id(suggestion) not in kept:
+                logger.warning(
+                    'Task %s: retired suggestion at %r from quarantined branch %s falls outside '
+                    'this task\'s lock set; not carried to the architect',
+                    self.task_id, suggestion.get('location'), review.branch,
+                )
+        return replace(review, suggestions=tuple(in_scope))
 
     async def _apply_revalidation_skip(
         self, plan: dict, current_main: str,

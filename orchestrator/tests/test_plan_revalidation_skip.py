@@ -1401,9 +1401,12 @@ def _retire_a_quarantined_lineage(
     assert retire_quarantined_lineages(f.artifacts)
 
 
+def _carried_by(call) -> list[str]:
+    return [s['description'] for review in call.kwargs.get('retired_reviews', ()) for s in review.suggestions]
+
+
 def _carried(builder: AsyncMock) -> list[str]:
-    _, kwargs = builder.call_args
-    return [s['description'] for review in kwargs.get('retired_reviews', ()) for s in review.suggestions]
+    return _carried_by(builder.call_args)
 
 
 @pytest.mark.asyncio
@@ -1477,3 +1480,42 @@ async def test_only_in_scope_retired_suggestions_reach_revalidation(tmp_path: Pa
 
     f.build_revalidation_prompt.assert_awaited_once()
     assert _carried(f.build_revalidation_prompt) == [_CARRIED['description']]
+
+
+@pytest.mark.asyncio
+async def test_a_retired_suggestion_left_out_of_scope_is_logged(tmp_path: Path, caplog: pytest.LogCaptureFixture):
+    f = _make_3663(tmp_path)
+    _retire_a_quarantined_lineage(f, issues=[_CARRIED, _OUT_OF_SCOPE])
+
+    with (
+        caplog.at_level('WARNING', logger='orchestrator.workflow'),
+        pytest.raises(AssertionError, match='architect must NOT'),
+    ):
+        await f.wf._plan()
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == 'WARNING']
+    dropped = [message for message in warnings if _OUT_OF_SCOPE['location'] in message]
+    assert dropped
+    assert all('refs/heads/task/101-20261112T000000Z' in message for message in dropped)
+    assert not [message for message in warnings if _CARRIED['location'] in message]
+
+
+@pytest.mark.asyncio
+async def test_the_done_step_integrity_remedy_pass_carries_the_retired_review_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    f = _make(
+        worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', git_head=True,
+        changed_files=['mod_a/file.py'], plan_steps=_STEP_1_DONE_STEP_2_PENDING,
+        modules=files_to_modules(['mod_a/file.py'], 2),
+    )
+    _retire_a_quarantined_lineage(f)
+    wipe = [_wipe_to('step-1', 'step-2'), _confirm]
+    _scripted_architect(f, monkeypatch, [wipe, wipe])
+
+    await f.wf._plan()
+
+    first_pass, remedy_pass = f.build_revalidation_prompt.call_args_list
+    assert first_pass.kwargs.get('integrity_refusal') is None
+    assert remedy_pass.kwargs.get('integrity_refusal') is not None
+    assert _carried_by(remedy_pass) == [_CARRIED['description']]
