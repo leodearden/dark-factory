@@ -3447,9 +3447,10 @@ directly, not just interactive sessions. Treat it accordingly:
   `git commit --only <path>` (not a bare `git commit`) so you don't sweep
   up unrelated staged or dirty state from a concurrent process.
 - On main, `pre-commit` runs the merge gate's own checks for what the
-  commit stages (task 8531; `scripts/hook_module_checks.py` derives the
-  list, `hooks/project-checks` runs it in parallel), so what a commit costs
-  depends on what it stages:
+  commit stages, plus the hook's own `root:type` unit for repo-root Python
+  that no module owns (task 8531; `scripts/hook_module_checks.py` derives
+  the list, `hooks/project-checks` runs it in parallel), so what a commit
+  costs depends on what it stages:
   - **Staged `.py` under a registered module** — that module's
     `lint_command` and `type_check_command` run verbatim, exactly as the
     merge gate would run them, so a staged `scripts/*.py` now runs
@@ -3457,6 +3458,12 @@ directly, not just interactive sessions. Treat it accordingly:
   - **Staged `.py` under `shared/` or `escalation/`** — every module
     imports them, so the type check of EVERY registered module runs. This
     is the worst case.
+  - **Staged `.py` at the repo root** (`conftest.py`,
+    `df_pytest_isolation.py`) — no module can own a repo-root path, so
+    `root:type` runs pyright over those files
+    (`scripts/hook_module_checks.py::root_units`). A root module other than
+    `conftest.py` also runs the type check of every registered module, as
+    `shared/` and `escalation/` do.
   - **A staged file under `plans/`, `docs/` or `review/`, or a
     `*.yaml`/`*.json`/`*.md` outside a workspace package** — the
     whole-tree screen runs the `scripts/merge_screen.yaml` checks: about
