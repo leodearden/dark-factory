@@ -13,10 +13,13 @@ import assert from 'node:assert/strict';
 import { caughtFrom } from './_caught.mjs';
 import {
   NOTICE_SELECTOR,
+  UNIT_NOTICE_TESTID,
   allowAsyncAct,
   assertReportsOnlyContainedThrows,
+  assertSiblingRenders,
   click,
   failureNotices,
+  mountInsideBoundary,
   noticeLines,
   openContainingWindow,
   openTab,
@@ -559,28 +562,6 @@ test('tabs.jsx::PerfTab Completion paths gives every slice its own PALETTE.paths
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
 // _render_helpers.mjs::assertReportsOnlyContainedThrows says why these tests
 // cannot assert an empty console.
-
-const UNIT_NOTICE_TESTID = 'unit-render-failure-banner';
-const SIBLING_TESTID = 'boundary-sibling';
-
-// The boundary around `child`, beside a sibling that is outside it.
-function mountInsideBoundary(harness, child) {
-  const { React, DF_SHELL, DF_RENDER_FAILURE } = harness.window;
-  const describe = thrown => DF_RENDER_FAILURE.tabRenderFailureNotice('Overview', thrown);
-  const Page = () =>
-    React.createElement(
-      'div',
-      null,
-      React.createElement(DF_SHELL.RenderFailureBoundary, { describe, testId: UNIT_NOTICE_TESTID }, child),
-      React.createElement('span', { 'data-testid': SIBLING_TESTID }, 'outside the boundary'),
-    );
-  const { container } = harness.mount(Page);
-  return { container, describe };
-}
-
-function assertSiblingRenders(container) {
-  assert.equal(container.querySelector(`[data-testid="${SIBLING_TESTID}"]`)?.textContent, 'outside the boundary');
-}
 
 test('shell.jsx::RenderFailureBoundary contains a real DatumReading throw and renders its describe() notice', t => {
   const harness = openContainingWindow(t);

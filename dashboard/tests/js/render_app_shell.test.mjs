@@ -7,12 +7,16 @@ import assert from 'node:assert/strict';
 
 import { caughtFrom } from './_caught.mjs';
 import {
+  UNIT_NOTICE_TESTID,
   assertReportsOnlyContainedThrows,
+  assertSiblingRenders,
   click,
   failureNotices,
+  mountInsideBoundary,
   noticeLines,
   openContainingWindow,
   openTab,
+  openWindow,
   railButton,
 } from './_render_helpers.mjs';
 import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
@@ -21,10 +25,14 @@ import {
   orchestratorRow,
   projectRow,
   receiptsFor,
+  schedulerLockRow,
+  schedulerModule,
+  schedulerSnapshot,
   servingEndpoint,
   taskCensus,
   taskRow,
   tasksSnapshotEntry,
+  wireDatum,
 } from './wire_fixtures.mjs';
 
 const PROJECT = 'p';
@@ -403,4 +411,204 @@ test("app.jsx replaces a tab whose child throws with the tab's notice, and the s
   assert.deepEqual(staleBanners.map(banner => banner.textContent), [staleNotice.text]);
   assert.ok(page.root.querySelectorAll('.rail-nav button').length > 0, 'the rail stopped rendering');
   assertReportsOnlyContainedThrows(page.consoleErrors);
+});
+
+// ── The shell's Datum components draw datumView's answer ──────────────────
+// Every expected value comes from window.DF_DATUM, never a literal of the
+// markup.
+
+const MINUTE_MS = 60_000;
+
+// A Datum whose displayed age is 90 minutes, far from any boundary of
+// formatAge's minute granularity, as a poll that received it now would stamp it.
+function agedDatum(value, overrides) {
+  const asOf = Date.parse(wireDatum(value).as_of);
+  return wireDatum(value, {
+    _served_at: new Date(asOf + 90 * MINUTE_MS).toISOString(),
+    _received_at: Date.now(),
+    ...overrides,
+  });
+}
+
+const DRAWN_DATUMS = [
+  { arm: 'a fresh Datum', datum: agedDatum(5) },
+  { arm: 'a fresh measured zero', datum: agedDatum(0) },
+  { arm: 'a stale Datum', datum: agedDatum(5, { state: 'stale', reason: 'the scheduler stopped answering' }) },
+  { arm: 'a lower_bound Datum', datum: agedDatum(5, { state: 'lower_bound', reason: 'the runs ledger starts later' }) },
+  { arm: 'an unknown Datum', datum: wireDatum(null, { state: 'unknown', reason: 'the map could not be read' }) },
+];
+
+const callerFormat = value => `${value} widgets`;
+
+for (const { arm, datum } of DRAWN_DATUMS) {
+  test(`charts.jsx::StatTile draws datumView's text, title and age over ${arm}`, t => {
+    const harness = openWindow(t);
+    const { DF_CHARTS, DF_DATUM } = harness.window;
+    const { container } = harness.mount(DF_CHARTS.StatTile, { label: 'L', datum, format: callerFormat });
+
+    const view = DF_DATUM.datumView(datum, { format: callerFormat, now: Date.now() });
+    const val = container.querySelector('.kpi .val');
+    assert.ok(val.textContent.startsWith(view.text), `"${val.textContent}" does not start with datumView's ${view.text}`);
+    if (view.title === null) assert.equal(val.hasAttribute('title'), false);
+    else assert.equal(val.title, view.title);
+    const age = [...container.querySelectorAll('.kpi span')].find(span => span.textContent === view.age);
+    if (view.age) assert.ok(age, `the tile shows no age ${view.age}`);
+    else assert.equal(age, undefined);
+  });
+}
+
+test('charts.jsx::StatTile draws a sparkline of its history', t => {
+  const harness = openWindow(t);
+  const { container } = harness.mount(harness.window.DF_CHARTS.StatTile, { label: 'L', datum: wireDatum(3), history: [1, 2, 3] });
+
+  assert.ok(container.querySelector('.kpi .spark svg'), 'a tile given a history must draw its sparkline in .spark');
+});
+
+test('charts.jsx::StatTile handed a bare value and no Datum fails over through assertDatum', t => {
+  const harness = openContainingWindow(t);
+  const { React, DF_CHARTS, DF_DATUM } = harness.window;
+  const { container, describe } = mountInsideBoundary(harness, React.createElement(DF_CHARTS.StatTile, { label: 'L', value: 5 }));
+
+  const expected = describe(caughtFrom(() => DF_DATUM.datumView(undefined)));
+  const notices = container.querySelectorAll(`[data-testid="${UNIT_NOTICE_TESTID}"]`);
+  assert.equal(notices.length, 1);
+  assert.deepEqual(noticeLines(notices[0]), [expected.text, expected.detail]);
+  assertSiblingRenders(container);
+  assertReportsOnlyContainedThrows(harness.consoleErrors);
+});
+
+test('shell.jsx::Pip handed a bare number fails over through assertDatum', t => {
+  const harness = openContainingWindow(t);
+  const { React, DF_SHELL, DF_DATUM } = harness.window;
+  const { container, describe } = mountInsideBoundary(harness, React.createElement(DF_SHELL.Pip, { datum: 42 }));
+
+  const expected = describe(caughtFrom(() => DF_DATUM.datumView(42)));
+  const notices = container.querySelectorAll(`[data-testid="${UNIT_NOTICE_TESTID}"]`);
+  assert.equal(notices.length, 1);
+  assert.deepEqual(noticeLines(notices[0]), [expected.text, expected.detail]);
+  assertSiblingRenders(container);
+  assertReportsOnlyContainedThrows(harness.consoleErrors);
+});
+
+test("shell.jsx::Pip draws its dot and datumView's text through the caller's format", t => {
+  const harness = openWindow(t);
+  const { DF_SHELL, DF_DATUM } = harness.window;
+  const datum = wireDatum(7);
+  const { container } = harness.mount(DF_SHELL.Pip, { datum, format: callerFormat, color: 'red' });
+
+  const pip = container.querySelector('.pip');
+  assert.ok(pip.querySelector('.pip-dot'), 'a Pip given a colour draws no .pip-dot');
+  const { text } = DF_DATUM.datumView(datum, { format: callerFormat });
+  assert.ok(pip.textContent.startsWith(text), `"${pip.textContent}" does not start with datumView's ${text}`);
+});
+
+test("shell.jsx::DatumReading draws datumView's text through the caller's format", t => {
+  const harness = openWindow(t);
+  const { DF_SHELL, DF_DATUM } = harness.window;
+  const datum = wireDatum(7);
+  const { container } = harness.mount(DF_SHELL.DatumReading, { datum, format: callerFormat });
+
+  assert.equal(container.textContent, DF_DATUM.datumView(datum, { format: callerFormat }).text);
+});
+
+// ── OrchTab decides the Locks column per project ──────────────────────────
+
+const OFFLINE_PROJECT = 'pa';
+const MEASURED_PROJECT = 'pb';
+const TAB_PROPS = { projectFilter: [], search: '' };
+
+function seedTwoProjectsWithScheduler(window) {
+  const tasks = [taskRow({ project: OFFLINE_PROJECT, id: '41' }), taskRow({ project: MEASURED_PROJECT, id: '42' })];
+  const lockSet = ['src/held', 'src/free'];
+  seedDashboardData(window, {
+    ORCHESTRATORS: tasks.map((task, i) => orchestratorRow({ pid: i + 1, project: task.project, running: true })),
+    PROJECTS: tasks.map(task => projectRow(task.project)),
+    TASKS_SNAPSHOT: Object.fromEntries(tasks.map(task => [
+      task.project,
+      tasksSnapshotEntry([task], taskCensus({ [task.status]: 1 }, window.DF_TASK_VOCAB)),
+    ])),
+    SCHEDULER: schedulerSnapshot({
+      offlineProjects: [OFFLINE_PROJECT],
+      rows: [schedulerLockRow({ project: MEASURED_PROJECT, taskId: '42', lockSet })],
+      modules: [schedulerModule({ project: MEASURED_PROJECT, path: 'src/held', holder: '42', holderProject: MEASURED_PROJECT })],
+    }),
+    __receipt: receiptsFor(window.DF_DATA_LOADER, ['ORCHESTRATORS', 'TASKS_SNAPSHOT', 'SCHEDULER']),
+  });
+  return { tasks, lockSet };
+}
+
+// The Locks cell of `task`'s row in OrchTab's task table.
+function locksCell(window, container, task) {
+  const idText = window.DF_SHELL.taskId(task.id);
+  const row = [...container.querySelectorAll('tbody tr')].find(tr => tr.querySelector('td')?.textContent === idText);
+  assert.ok(row, `OrchTab draws no row for task ${task.id}`);
+  const column = [...row.closest('table').querySelectorAll('thead th')].findIndex(th => th.textContent === 'Locks');
+  assert.ok(column >= 0, 'the task table has no Locks column');
+  return row.children[column];
+}
+
+test("tabs.jsx::OrchTab draws one project's offline Locks em-dash without blanking another project's chips", t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const { tasks: [offlineTask, measuredTask], lockSet } = seedTwoProjectsWithScheduler(window);
+  const { container } = harness.mount(window.DF_TABS.OrchTab, TAB_PROPS);
+  const D = window.DF_DATA;
+  const { locksCellState, schedulerLocksDatum } = window.DF_TASK_ROW_CELLS;
+  const expectedFor = task =>
+    locksCellState(schedulerLocksDatum(D.SCHEDULER, task.project, D.__receipt), window.DF_SCHED_UTILS.buildSchedLockInfo(task, D.SCHEDULER));
+
+  const offline = expectedFor(offlineTask);
+  assert.ok(offline.placeholder && offline.title, 'locksCellState draws no reasoned placeholder offline, so this fixture tests nothing');
+  const offlineCell = locksCell(window, container, offlineTask);
+  assert.equal(offlineCell.querySelector('.chip-empty')?.textContent, offline.placeholder);
+  assert.equal(offlineCell.querySelector('.chip-empty').title, offline.title);
+
+  assert.equal(expectedFor(measuredTask).placeholder, null, 'locksCellState reads the measured project as unknown');
+  const measuredCell = locksCell(window, container, measuredTask);
+  assert.equal(measuredCell.querySelector('.chip-empty'), null, "the offline project blanked the measured project's locks");
+  assert.deepEqual([...measuredCell.querySelectorAll('.chip[title]')].map(chip => chip.title).sort(), [...lockSet].sort());
+});
+
+// ── Every tab renders its Datum sites from Datums, and keys them off real receipts ──
+
+function openEveryRailTab(page) {
+  const opened = [];
+  for (const button of page.root.querySelectorAll('.rail-nav button')) {
+    click(page.window, button);
+    opened.push({ tab: page.root.querySelector('.crumbs .here')?.textContent, root: page.root });
+    // Each tab's readings, captured while it is open.
+    opened[opened.length - 1].notYetFetched = notYetFetchedReadings(page);
+    opened[opened.length - 1].failures = failureNotices(page.root).map(notice => notice.dataset.testid);
+  }
+  return opened;
+}
+
+function notYetFetchedReadings(page) {
+  const { DATUM_NOT_YET_FETCHED } = page.window.DF_DATUM;
+  return [...page.root.querySelectorAll('[title]')].filter(element => element.title === DATUM_NOT_YET_FETCHED);
+}
+
+test('on the pre-fetch page no tab renders a render-failure banner, and its readings say not yet fetched', t => {
+  const harness = openContainingWindow(t);
+  const page = { ...harness, root: harness.mountPage() };
+
+  const opened = openEveryRailTab(page);
+
+  for (const { tab, failures } of opened) assert.deepEqual(failures, [], `tab ${tab} threw on the pre-fetch page`);
+  assert.ok(opened.some(({ notYetFetched }) => notYetFetched.length > 0), 'no pre-fetch reading says not yet fetched, so the sweep below proves nothing');
+  assert.deepEqual(page.consoleErrors, []);
+});
+
+test('once every polled endpoint has a receipt, no tab renders a not-yet-fetched reading', t => {
+  const harness = openContainingWindow(t);
+  const loader = harness.window.DF_DATA_LOADER;
+  seedDashboardData(harness.window, { __receipt: receiptsFor(loader, everyPolledKey(loader)) });
+  const page = { ...harness, root: harness.mountPage() };
+
+  const opened = openEveryRailTab(page);
+
+  for (const { tab, failures, notYetFetched } of opened) {
+    assert.deepEqual(failures, [], `tab ${tab} threw once every endpoint had answered`);
+    assert.deepEqual(notYetFetched.map(element => element.outerHTML), [], `tab ${tab} still reads an endpoint as not yet fetched`);
+  }
 });

@@ -2,7 +2,8 @@
 // jsx_render_quality.test.mjs, render_app_shell.test.mjs): opening a dashboard
 // window that must stay console.error-free, or one whose contained throws the
 // test checks itself; clicking, and switching the page's tab from its rail;
-// reading render-failure notices; letting React's async act() run; and
+// mounting a child inside a RenderFailureBoundary and reading render-failure
+// notices; letting React's async act() run; and
 // answering on-demand fetches by url.
 import assert from 'node:assert/strict';
 
@@ -103,4 +104,26 @@ export function railButton(root, label) {
 // `page` is a harness plus the #root its mountPage() returned, as `root`.
 export function openTab(page, label) {
   click(page.window, railButton(page.root, label));
+}
+
+export const UNIT_NOTICE_TESTID = 'unit-render-failure-banner';
+const SIBLING_TESTID = 'boundary-sibling';
+
+// The boundary around `child`, beside a sibling that is outside it.
+export function mountInsideBoundary(harness, child) {
+  const { React, DF_SHELL, DF_RENDER_FAILURE } = harness.window;
+  const describe = thrown => DF_RENDER_FAILURE.tabRenderFailureNotice('Overview', thrown);
+  const Page = () =>
+    React.createElement(
+      'div',
+      null,
+      React.createElement(DF_SHELL.RenderFailureBoundary, { describe, testId: UNIT_NOTICE_TESTID }, child),
+      React.createElement('span', { 'data-testid': SIBLING_TESTID }, 'outside the boundary'),
+    );
+  const { container } = harness.mount(Page);
+  return { container, describe };
+}
+
+export function assertSiblingRenders(container) {
+  assert.equal(container.querySelector(`[data-testid="${SIBLING_TESTID}"]`)?.textContent, 'outside the boundary');
 }
