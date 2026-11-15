@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
+from shared.backends import Backend
 from shared.roles import (
     DISPATCHABLE_ROLES,
     FUSED_MEMORY_ROLES,
     ORCHESTRATOR_ROLES,
     REVIEWER_VARIANTS,
+    Effort,
     RoleName,
+    RoleSettings,
     UnknownRole,
     config_role,
 )
@@ -71,3 +75,86 @@ class TestConfigRole:
     def test_unknown_role_is_a_value_error(self) -> None:
         with pytest.raises(ValueError):
             config_role('nope')
+
+
+EFFORT_SPELLINGS = ('off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
+POSITIVE_KNOBS = ('budget_usd', 'max_turns', 'timeout_secs')
+
+
+def _error_locations(exc: ValidationError) -> list[tuple[int | str, ...]]:
+    return [tuple(error['loc']) for error in exc.errors()]
+
+
+class TestRoleSettings:
+    def test_only_model_is_required(self) -> None:
+        row = RoleSettings(model='opus')
+        assert row.backend is Backend.CLAUDE
+        assert row.effort is None
+        assert row.budget_usd is None
+        assert row.max_turns is None
+        assert row.timeout_secs is None
+
+    @pytest.mark.parametrize(
+        'spelling, backend',
+        [('claude_cli', Backend.CLAUDE), ('zcode', Backend.ZCODE)],
+    )
+    def test_backend_is_decoded_by_parse_backend(self, spelling: str, backend: Backend) -> None:
+        row = RoleSettings.model_validate({'model': 'opus', 'backend': spelling})
+        assert row.backend is backend
+
+    def test_unknown_backend_fails_at_load_naming_value_and_allowed(self) -> None:
+        with pytest.raises(ValidationError) as caught:
+            RoleSettings.model_validate({'model': 'opus', 'backend': 'Claude'})
+        message = str(caught.value)
+        assert 'Claude' in message
+        for backend in Backend:
+            assert backend.value in message
+
+    @pytest.mark.parametrize('spelling', EFFORT_SPELLINGS)
+    def test_effort_accepts_each_level(self, spelling: str) -> None:
+        row = RoleSettings.model_validate({'model': 'opus', 'effort': spelling})
+        assert row.effort == spelling
+
+    def test_effort_vocabulary(self) -> None:
+        assert {e.value for e in Effort} == set(EFFORT_SPELLINGS)
+
+    @pytest.mark.parametrize('spelling', ['hgih', 'High', '', 'ultra'])
+    def test_effort_rejects_unknown_levels_at_load(self, spelling: str) -> None:
+        with pytest.raises(ValidationError) as caught:
+            RoleSettings.model_validate({'model': 'opus', 'effort': spelling})
+        (error,) = caught.value.errors()
+        assert tuple(error['loc']) == ('effort',)
+        assert error['input'] == spelling
+
+    def test_effort_renders_as_its_bare_value(self) -> None:
+        row = RoleSettings(model='opus', effort=Effort.XHIGH)
+        assert f'{row.effort}' == 'xhigh'
+
+    @pytest.mark.parametrize('knob', POSITIVE_KNOBS)
+    @pytest.mark.parametrize('value', [0, -1])
+    def test_knob_must_be_positive(self, knob: str, value: int) -> None:
+        with pytest.raises(ValidationError) as caught:
+            RoleSettings.model_validate({'model': 'opus', knob: value})
+        assert _error_locations(caught.value) == [(knob,)]
+
+    @pytest.mark.parametrize('knob', POSITIVE_KNOBS)
+    @pytest.mark.parametrize('value', [5, None])
+    def test_knob_accepts_positive_or_none(self, knob: str, value: int | None) -> None:
+        row = RoleSettings.model_validate({'model': 'opus', knob: value})
+        assert getattr(row, knob) == value
+
+    @pytest.mark.parametrize('raw', [{'model': ''}, {}])
+    def test_model_must_be_a_non_empty_string(self, raw: dict[str, object]) -> None:
+        with pytest.raises(ValidationError) as caught:
+            RoleSettings.model_validate(raw)
+        assert _error_locations(caught.value) == [('model',)]
+
+    def test_unknown_knob_is_rejected(self) -> None:
+        with pytest.raises(ValidationError) as caught:
+            RoleSettings.model_validate({'model': 'x', 'nope': 1})
+        assert _error_locations(caught.value) == [('nope',)]
+
+    def test_row_is_immutable(self) -> None:
+        row = RoleSettings(model='x')
+        with pytest.raises(ValidationError):
+            row.model = 'y'
