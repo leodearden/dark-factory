@@ -209,6 +209,13 @@ def vocabulary_values(partitions: dict[str, frozenset[str]]) -> frozenset[str]:
         f"{_MINIMUM_VOCABULARY_SIZE} (task 4829). Both wire vocabularies are "
         f"expected; a union this small means the module was parsed but not read."
     )
+    promoted = sorted(values & _KNOWN_PHANTOM_VALUES)
+    assert not promoted, (
+        f"{promoted!r} are now real merge-state values but are still listed in "
+        f"`_KNOWN_PHANTOM_VALUES` (task 5178). Drop them from that set: a phantom "
+        f"that became a member would otherwise be reported as EXTRA in every "
+        f"correct span that names it."
+    )
     return values
 
 
@@ -219,6 +226,13 @@ def vocabulary_values(partitions: dict[str, frozenset[str]]) -> frozenset[str]:
 _AMBIGUOUS_TOKENS = frozenset(
     {"done", "blocked", "queued", "conflict", "unknown", "error", "gate", "failed"}
 )
+
+# Values runbooks have invented: `failed` (the real value is `error`) and
+# `needs_rebase` (a bounce surfaces as `blocked` with a needs-rebase `reason`, see
+# orchestrator/src/orchestrator/merge_lane/worker.py::NEEDS_REBASE_REASON_PREFIX).
+# They are in neither vocabulary, so membership filtering would otherwise drop
+# them from a span silently.
+_KNOWN_PHANTOM_VALUES = frozenset({"failed", "needs_rebase"})
 
 
 def discriminating_tokens(partitions: dict[str, frozenset[str]]) -> frozenset[str]:
@@ -405,14 +419,17 @@ def extract_values(body: str, vocabulary_values: frozenset[str], *, source: str 
 
     Membership filtering is what lets a span carry ordinary English (``— stop
     polling here``) without every noun becoming a phantom member. *vocabulary_values*
-    must be the union of BOTH vocabularies — see ``vocabulary_values()``.
+    must be the union of BOTH vocabularies — see ``vocabulary_values()``. The
+    ``_KNOWN_PHANTOM_VALUES`` survive the filter too, so a span naming one is
+    reported as EXTRA rather than silently passing.
 
     Raises rather than returning an empty set: an empty set does compare unequal to
     every partition, so the drift would be caught — but reported as "the list lost
     all five members", sending the reader to fix a list that is fine when the real
     defect is a misplaced `:end` marker.
     """
-    found = frozenset(token for token in _TOKEN_RE.findall(body) if token in vocabulary_values)
+    kept = vocabulary_values | _KNOWN_PHANTOM_VALUES
+    found = frozenset(token for token in _TOKEN_RE.findall(body) if token in kept)
     assert found, (
         f"{source}: a `merge-state-vocab` span body carries no vocabulary member at "
         f"all (task 4829). Body was {body!r}. Almost always a misplaced marker — the "
