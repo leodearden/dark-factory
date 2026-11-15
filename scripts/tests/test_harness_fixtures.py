@@ -169,3 +169,51 @@ def test_fake_systemctl_keeps_state_across_runs_until_reset(fake_systemctl):
     assert fake_systemctl.calls() == []
     after_reset = _systemctl(fake_systemctl, '--user', 'list-timers', '--all')
     assert after_reset.stdout.splitlines() == ['0 timers listed.']
+
+
+# ---------------------------------------------------------------------------
+# unit_values
+# ---------------------------------------------------------------------------
+
+
+def _unit(tmp_path, text):
+    path = tmp_path / 'x.timer'
+    path.write_text(text, encoding='utf-8')
+    return path
+
+
+def test_unit_values_returns_every_value_for_the_key_in_file_order(unit_values, tmp_path):
+    unit = _unit(tmp_path, (
+        '[Unit]\n'
+        'Documentation=man:first(1)\n'
+        'Description=x\n'
+        'Documentation=man:second(1)\n'
+        '[Timer]\n'
+        'OnCalendar=daily\n'
+    ))
+
+    assert unit_values(unit, 'Unit', 'Documentation') == ['man:first(1)', 'man:second(1)']
+    assert unit_values(unit, 'Timer', 'Persistent') == []
+    assert unit_values(unit, 'Install', 'WantedBy') == []
+
+
+def test_unit_values_does_not_read_a_comment_as_a_directive(unit_values, tmp_path):
+    unit = _unit(tmp_path, (
+        '[Timer]\n'
+        '# Persistent=true keeps a missed run\n'
+        '; OnCalendar=daily\n'
+        'Unit=x.service\n'
+    ))
+
+    assert unit_values(unit, 'Timer', 'Persistent') == []
+    assert unit_values(unit, 'Timer', 'OnCalendar') == []
+
+
+def test_unit_values_joins_a_backslash_continued_value(unit_values, tmp_path):
+    unit = _unit(tmp_path, (
+        '[Service]\n'
+        'ExecStart=/bin/a \\\n'
+        '    --flag\n'
+    ))
+
+    assert unit_values(unit, 'Service', 'ExecStart') == ['/bin/a --flag']
