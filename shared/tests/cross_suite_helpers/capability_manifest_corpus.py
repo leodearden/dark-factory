@@ -38,9 +38,9 @@ from pydantic import ValidationError
 
 from shared.capability_manifest import load_capability_manifest
 
-#: Mirrors the suffix in shared.capability_manifest.sidecar_path, the one home
-#: of the PRD → sidecar path rule. Restated rather than imported
-#: (consolidation deliberately deferred by plans/dashboard-prd-lanes-prd.md §10).
+#: Mirrors shared/src/shared/capability_manifest.py::SIDECAR_SUFFIX. Restated
+#: rather than imported until task 6764 (S25 ι in
+#: plans/review-all-s25-scripts-instruments-prd.md) switches it to the import.
 MANIFEST_SUFFIX = '.capability-manifest.yaml'
 
 #: shared/tests/cross_suite_helpers/capability_manifest_corpus.py ->

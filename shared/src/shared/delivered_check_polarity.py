@@ -809,11 +809,10 @@ def _stale_scope_findings(
 # Diagnostic refinements, and the two rules the 2x2 cannot see
 # ---------------------------------------------------------------------------
 
-#: Mirrors the suffix in ``shared.capability_manifest.sidecar_path``, the one
-#: home of the PRD → sidecar path rule, and
+#: Mirrors ``shared/src/shared/capability_manifest.py::SIDECAR_SUFFIX``, as does
 #: ``shared/tests/cross_suite_helpers/capability_manifest_corpus.py::MANIFEST_SUFFIX``.
-#: Restated rather than imported (consolidation deliberately deferred by
-#: ``plans/dashboard-prd-lanes-prd.md`` §10).
+#: Restated rather than imported until task 6764 (S25 ι in
+#: ``plans/review-all-s25-scripts-instruments-prd.md``) switches both to it.
 _MANIFEST_SUFFIX = '.capability-manifest.yaml'
 
 #: A match line in a non-markdown file starting (after leading whitespace)
@@ -1243,8 +1242,6 @@ def extract_delivered_checks(metadata: object) -> list[dict[str, Any]]:
     ``fused_memory``, and ``shared`` must not import ``fused_memory`` (the
     dependency runs the other way — this module exists in ``shared``
     precisely so both ``fused_memory`` and ``orchestrator`` can reach it).
-    ``capability_manifest_corpus.MANIFEST_SUFFIX`` re-declares a
-    ``fused_memory`` constant for the same reason.
 
     The one deliberate divergence: ``extract_files`` routes its ``str``
     branch through ``shared.task_metadata.parse_metadata`` to emit a
