@@ -1,6 +1,6 @@
 """Tests for scripts/install-return-brief-timer.sh and the two systemd units it installs (task 5376).
 
-Drives the installer via subprocess with `scripts/tests/conftest.py::fake_systemctl`
+Drives the installer via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl`
 first on PATH, and reads the committed units through
 `scripts/tests/conftest.py::unit_values` rather than grepping their text. Real
 systemd is never touched.
@@ -30,11 +30,11 @@ TIMER_NAME = 'return-brief.timer'
 PATH_TWIN = 'fused-memory-flag-marker-sweep.service'
 
 
-def _run_script(fake_systemctl, tmp_path, *, env=None, reset_state=True):
+def _run_script(fake_timer_systemctl, *, env=None, reset_state=True):
     if reset_state:
-        fake_systemctl.reset()
+        fake_timer_systemctl.reset()
     full_env = dict(os.environ)
-    full_env['PATH'] = f'{fake_systemctl.bin_dir}{os.pathsep}{full_env["PATH"]}'
+    full_env['PATH'] = f'{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env["PATH"]}'
     if env:
         full_env.update(env)
     return subprocess.run(['bash', str(SCRIPT)], env=full_env, capture_output=True, text=True, timeout=60)
@@ -51,23 +51,23 @@ def test_script_is_executable():
     assert os.access(SCRIPT, os.X_OK), f'chmod +x {SCRIPT}'
 
 
-def test_install_copies_both_units_and_enables_the_timer(fake_systemctl, tmp_path):
+def test_install_copies_both_units_and_enables_the_timer(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / 'xdg-config'
-    result = _run_script(fake_systemctl, tmp_path, env={'XDG_CONFIG_HOME': str(xdg_config)})
+    result = _run_script(fake_timer_systemctl, env={'XDG_CONFIG_HOME': str(xdg_config)})
     assert result.returncode == 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
 
     unit_dir = xdg_config / 'systemd' / 'user'
     for name in (SERVICE_NAME, TIMER_NAME):
         assert (unit_dir / name).read_bytes() == (TEMPLATES_DIR / name).read_bytes()
-    calls = fake_systemctl.calls()
+    calls = fake_timer_systemctl.calls()
     assert ['daemon-reload'] in calls, calls
     assert ['enable', '--now', TIMER_NAME] in calls, calls
 
 
-def test_install_is_idempotent(fake_systemctl, tmp_path):
+def test_install_is_idempotent(fake_timer_systemctl, tmp_path):
     env = {'XDG_CONFIG_HOME': str(tmp_path / 'xdg-config')}
-    first = _run_script(fake_systemctl, tmp_path, env=env)
-    second = _run_script(fake_systemctl, tmp_path, env=env, reset_state=False)
+    first = _run_script(fake_timer_systemctl, env=env)
+    second = _run_script(fake_timer_systemctl, env=env, reset_state=False)
     assert first.returncode == 0, first.stderr
     assert second.returncode == 0, second.stderr
 
@@ -76,8 +76,8 @@ def test_install_is_idempotent(fake_systemctl, tmp_path):
         assert (unit_dir / name).read_bytes() == (TEMPLATES_DIR / name).read_bytes()
 
 
-def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_systemctl, tmp_path):
-    result = _run_script(fake_systemctl, tmp_path, env={
+def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_timer_systemctl, tmp_path):
+    result = _run_script(fake_timer_systemctl, env={
         'XDG_CONFIG_HOME': str(tmp_path / 'xdg'),
         'FAKE_SYSTEMCTL_OMIT_LIST_TIMERS': '1',
     })
@@ -85,11 +85,11 @@ def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_syste
     assert TIMER_NAME in result.stderr, result.stderr
 
 
-def test_install_does_not_kick_an_immediate_run(fake_systemctl, tmp_path):
+def test_install_does_not_kick_an_immediate_run(fake_timer_systemctl, tmp_path):
     """An off-cadence first run would spend a Fable budget nobody scheduled."""
-    result = _run_script(fake_systemctl, tmp_path, env={'XDG_CONFIG_HOME': str(tmp_path / 'xdg')})
+    result = _run_script(fake_timer_systemctl, env={'XDG_CONFIG_HOME': str(tmp_path / 'xdg')})
     assert result.returncode == 0, result.stderr
-    for call in fake_systemctl.calls():
+    for call in fake_timer_systemctl.calls():
         assert call[:1] != ['start'], f'unexpected immediate run: {call!r}'
 
 

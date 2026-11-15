@@ -2,7 +2,7 @@
 install script that replaces the fail-loud stub committed with
 plans/confusion-reduction-prd.md (PRD task epsilon).
 
-Drives the script via subprocess with `scripts/tests/conftest.py::fake_systemctl`
+Drives the script via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl`
 first on PATH, plus a real invocation of
 `nightly.py resolve-config` (the REAL Python resolver — no mock — with
 INSTALL_TRICKLE_TIMER_PYTHON=sys.executable substituting for the default `uv
@@ -68,19 +68,19 @@ def _write_project_config(tmp_path, *, project_id, escalation_port=8199):
 # Script driver
 # ---------------------------------------------------------------------------
 
-def _run_script(fake_systemctl, tmp_path, project_id, *, env=None):
+def _run_script(fake_timer_systemctl, project_id, *, env=None):
     """Run install-trickle-timer.sh <project_id> via subprocess.
 
-    Puts *fake_systemctl* first on PATH, reset on every call, and
+    Puts *fake_timer_systemctl* first on PATH, reset on every call, and
     defaults INSTALL_TRICKLE_TIMER_PYTHON=sys.executable so the script's
     `nightly.py resolve-config` delegation runs the REAL resolver directly
     -- no `uv run`/`--frozen` needed in-test. Callers supply
     XDG_CONFIG_HOME and LEGIBILITY_SEARCH_ROOTS via *env*.
     """
-    fake_systemctl.reset()
+    fake_timer_systemctl.reset()
 
     full_env = dict(os.environ)
-    full_env["PATH"] = f"{fake_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
+    full_env["PATH"] = f"{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["INSTALL_TRICKLE_TIMER_PYTHON"] = sys.executable
     full_env.pop("LEGIBILITY_SEARCH_ROOTS", None)
     if env:
@@ -102,12 +102,12 @@ def test_script_is_executable():
     )
 
 
-def test_install_copies_templates_and_enables_timer(fake_systemctl, tmp_path):
+def test_install_copies_templates_and_enables_timer(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id="proj_a")
     xdg_config = tmp_path / "xdg-config"
 
     result = _run_script(
-        fake_systemctl, tmp_path, "proj_a",
+        fake_timer_systemctl, "proj_a",
         env={"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)},
     )
 
@@ -130,7 +130,7 @@ def test_install_copies_templates_and_enables_timer(fake_systemctl, tmp_path):
     assert "nightly.py" in service_text
     assert "--project-id %i" in service_text
 
-    calls = fake_systemctl.calls()
+    calls = fake_timer_systemctl.calls()
     assert ["daemon-reload"] in calls, f"calls={calls!r}"
     assert ["enable", "--now", "legibility-trickle@proj_a.timer"] in calls, f"calls={calls!r}"
     assert any(c[0] == "list-timers" for c in calls), f"calls={calls!r}"
@@ -279,17 +279,17 @@ def test_service_template_carries_the_account_pool_and_pins_no_account():
     )
 
 
-def test_install_is_idempotent(fake_systemctl, tmp_path):
+def test_install_is_idempotent(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id="proj_a")
     xdg_config = tmp_path / "xdg-config"
     env = {"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)}
 
-    result_1 = _run_script(fake_systemctl, tmp_path, "proj_a", env=env)
+    result_1 = _run_script(fake_timer_systemctl, "proj_a", env=env)
     assert result_1.returncode == 0, (
         f"stdout={result_1.stdout!r} stderr={result_1.stderr!r}"
     )
 
-    result_2 = _run_script(fake_systemctl, tmp_path, "proj_a", env=env)
+    result_2 = _run_script(fake_timer_systemctl, "proj_a", env=env)
     assert result_2.returncode == 0, (
         f"Expected re-running the install to still exit 0; "
         f"stdout={result_2.stdout!r} stderr={result_2.stderr!r}"
@@ -336,13 +336,13 @@ def _seed_stale_dropin(xdg_config):
     return path
 
 
-def test_install_removes_the_stale_account_pin_dropin(fake_systemctl, tmp_path):
+def test_install_removes_the_stale_account_pin_dropin(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id="proj_a")
     xdg_config = tmp_path / "xdg-config"
     stale = _seed_stale_dropin(xdg_config)
 
     result = _run_script(
-        fake_systemctl, tmp_path, "proj_a",
+        fake_timer_systemctl, "proj_a",
         env={"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)},
     )
 
@@ -365,7 +365,7 @@ def test_install_removes_the_stale_account_pin_dropin(fake_systemctl, tmp_path):
     )
 
 
-def test_install_is_idempotent_with_no_dropin_present(fake_systemctl, tmp_path):
+def test_install_is_idempotent_with_no_dropin_present(fake_timer_systemctl, tmp_path):
     """The removal must be a no-op when there is nothing to remove.
 
     Under `set -euo pipefail` a bare `rm`/`rmdir` of a missing path exits
@@ -376,14 +376,14 @@ def test_install_is_idempotent_with_no_dropin_present(fake_systemctl, tmp_path):
     xdg_config = tmp_path / "xdg-config"
     env = {"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)}
 
-    first = _run_script(fake_systemctl, tmp_path, "proj_a", env=env)
+    first = _run_script(fake_timer_systemctl, "proj_a", env=env)
     assert first.returncode == 0, f"stdout={first.stdout!r} stderr={first.stderr!r}"
 
     _seed_stale_dropin(xdg_config)
-    second = _run_script(fake_systemctl, tmp_path, "proj_a", env=env)
+    second = _run_script(fake_timer_systemctl, "proj_a", env=env)
     assert second.returncode == 0
 
-    third = _run_script(fake_systemctl, tmp_path, "proj_a", env=env)
+    third = _run_script(fake_timer_systemctl, "proj_a", env=env)
     assert third.returncode == 0, (
         f"a re-run with the drop-in already gone must still exit 0; "
         f"stdout={third.stdout!r} stderr={third.stderr!r}"
@@ -393,7 +393,7 @@ def test_install_is_idempotent_with_no_dropin_present(fake_systemctl, tmp_path):
     )
 
 
-def test_install_removes_only_the_named_dropin(fake_systemctl, tmp_path):
+def test_install_removes_only_the_named_dropin(fake_timer_systemctl, tmp_path):
     """The guard that matters: an operator's OWN override must survive.
 
     A blanket `rm -rf .service.d` would silently delete a deliberate local
@@ -407,7 +407,7 @@ def test_install_removes_only_the_named_dropin(fake_systemctl, tmp_path):
     operator_override.write_text("[Service]\nNice=10\n", encoding="utf-8")
 
     result = _run_script(
-        fake_systemctl, tmp_path, "proj_a",
+        fake_timer_systemctl, "proj_a",
         env={"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)},
     )
 
@@ -421,12 +421,12 @@ def test_install_removes_only_the_named_dropin(fake_systemctl, tmp_path):
     assert operator_override.read_text() == "[Service]\nNice=10\n"
 
 
-def test_install_fails_when_self_verify_omits_timer(fake_systemctl, tmp_path):
+def test_install_fails_when_self_verify_omits_timer(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id="proj_a")
     xdg_config = tmp_path / "xdg-config"
 
     result = _run_script(
-        fake_systemctl, tmp_path, "proj_a",
+        fake_timer_systemctl, "proj_a",
         env={
             "XDG_CONFIG_HOME": str(xdg_config),
             "LEGIBILITY_SEARCH_ROOTS": str(search_root),
@@ -440,13 +440,13 @@ def test_install_fails_when_self_verify_omits_timer(fake_systemctl, tmp_path):
     )
 
 
-def test_install_fails_when_project_config_unresolvable(fake_systemctl, tmp_path):
+def test_install_fails_when_project_config_unresolvable(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / "xdg-config"
     empty_search_root = tmp_path / "empty-search-root"
     empty_search_root.mkdir()
 
     result = _run_script(
-        fake_systemctl, tmp_path, "no_such_project",
+        fake_timer_systemctl, "no_such_project",
         env={"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(empty_search_root)},
     )
 
@@ -454,9 +454,9 @@ def test_install_fails_when_project_config_unresolvable(fake_systemctl, tmp_path
         f"Expected a non-zero exit for an unresolvable project_id; "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert fake_systemctl.calls() == [], (
+    assert fake_timer_systemctl.calls() == [], (
         f"Expected NO systemctl invocation when config resolution fails first; "
-        f"calls={fake_systemctl.calls()!r}"
+        f"calls={fake_timer_systemctl.calls()!r}"
     )
     assert not (xdg_config / "systemd" / "user" / "legibility-trickle@.service").exists(), (
         "Expected no unit file to be installed when config resolution fails"

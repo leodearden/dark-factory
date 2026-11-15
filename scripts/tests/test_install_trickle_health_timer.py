@@ -12,7 +12,7 @@ the probes bound.
 Template-content invariants live here rather than in a separate file, per
 `test_install_trickle_timer.py::test_service_template_pins_claude_bin`'s
 precedent; the installer-behaviour half is driven via subprocess with
-`scripts/tests/conftest.py::fake_systemctl` first on PATH, and unit directives
+`scripts/tests/conftest.py::fake_timer_systemctl` first on PATH, and unit directives
 are read through `scripts/tests/conftest.py::unit_values`. Real systemd is
 never touched.
 """
@@ -311,7 +311,7 @@ def test_timer_is_installed_into_timers_target(unit_values):
 # Installer behaviour
 # ---------------------------------------------------------------------------
 #
-# Driven via subprocess with `scripts/tests/conftest.py::fake_systemctl` first
+# Driven via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl` first
 # on PATH plus a REAL invocation of `nightly.py resolve-config` -- no mock,
 # because the whole point of the installer delegating to it is that this script
 # never re-implements the project_id -> repo mapping. Real systemd is never
@@ -343,20 +343,20 @@ def _write_project_config(tmp_path, *, project_id, escalation_port=8199):
     return search_root
 
 
-def _run_script(fake_systemctl, tmp_path, project_id, *, env=None):
+def _run_script(fake_timer_systemctl, project_id, *, env=None):
     """Run install-trickle-health-timer.sh <project_id> via subprocess.
 
-    Puts *fake_systemctl* first on PATH, reset on every call, and defaults
+    Puts *fake_timer_systemctl* first on PATH, reset on every call, and defaults
     INSTALL_TRICKLE_HEALTH_TIMER_PYTHON=sys.executable so the script's
     `nightly.py resolve-config` delegation runs the REAL resolver directly --
     no `uv run`/`--frozen` needed in-test. Callers supply XDG_CONFIG_HOME and
     LEGIBILITY_SEARCH_ROOTS via *env*; any ambient LEGIBILITY_SEARCH_ROOTS is
     popped so a developer's shell cannot make this resolve the real projects.
     """
-    fake_systemctl.reset()
+    fake_timer_systemctl.reset()
 
     full_env = dict(os.environ)
-    full_env['PATH'] = f"{fake_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
+    full_env['PATH'] = f"{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env['INSTALL_TRICKLE_HEALTH_TIMER_PYTHON'] = sys.executable
     full_env.pop('LEGIBILITY_SEARCH_ROOTS', None)
     if env:
@@ -374,12 +374,12 @@ def test_script_is_executable():
     )
 
 
-def test_install_copies_templates_and_enables_timer(fake_systemctl, tmp_path):
+def test_install_copies_templates_and_enables_timer(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id='proj_a')
     xdg_config = tmp_path / 'xdg-config'
 
     result = _run_script(
-        fake_systemctl, tmp_path, 'proj_a',
+        fake_timer_systemctl, 'proj_a',
         env={'XDG_CONFIG_HOME': str(xdg_config),
              'LEGIBILITY_SEARCH_ROOTS': str(search_root)},
     )
@@ -399,7 +399,7 @@ def test_install_copies_templates_and_enables_timer(fake_systemctl, tmp_path):
     assert service_path.read_bytes() == SERVICE.read_bytes()
     assert timer_path.read_bytes() == TIMER.read_bytes()
 
-    calls = fake_systemctl.calls()
+    calls = fake_timer_systemctl.calls()
     assert ['daemon-reload'] in calls, f'calls={calls!r}'
     assert ['enable', '--now', 'legibility-trickle-health@proj_a.timer'] in calls, (
         f'calls={calls!r}'
@@ -407,25 +407,25 @@ def test_install_copies_templates_and_enables_timer(fake_systemctl, tmp_path):
     assert any(c[0] == 'list-timers' for c in calls), f'calls={calls!r}'
 
 
-def test_install_is_idempotent(fake_systemctl, tmp_path):
+def test_install_is_idempotent(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id='proj_a')
     xdg_config = tmp_path / 'xdg-config'
     env = {'XDG_CONFIG_HOME': str(xdg_config),
            'LEGIBILITY_SEARCH_ROOTS': str(search_root)}
 
-    result_1 = _run_script(fake_systemctl, tmp_path, 'proj_a', env=env)
+    result_1 = _run_script(fake_timer_systemctl, 'proj_a', env=env)
     assert result_1.returncode == 0, (
         f'stdout={result_1.stdout!r} stderr={result_1.stderr!r}'
     )
 
-    result_2 = _run_script(fake_systemctl, tmp_path, 'proj_a', env=env)
+    result_2 = _run_script(fake_timer_systemctl, 'proj_a', env=env)
     assert result_2.returncode == 0, (
         f'Expected re-running the install to still exit 0; '
         f'stdout={result_2.stdout!r} stderr={result_2.stderr!r}'
     )
 
 
-def test_install_fails_when_self_verify_omits_timer(fake_systemctl, tmp_path):
+def test_install_fails_when_self_verify_omits_timer(fake_timer_systemctl, tmp_path):
     """The guard that stops `enable --now` nominally succeeding while nothing
     observable is installed.
 
@@ -438,7 +438,7 @@ def test_install_fails_when_self_verify_omits_timer(fake_systemctl, tmp_path):
     xdg_config = tmp_path / 'xdg-config'
 
     result = _run_script(
-        fake_systemctl, tmp_path, 'proj_a',
+        fake_timer_systemctl, 'proj_a',
         env={
             'XDG_CONFIG_HOME': str(xdg_config),
             'LEGIBILITY_SEARCH_ROOTS': str(search_root),
@@ -453,7 +453,7 @@ def test_install_fails_when_self_verify_omits_timer(fake_systemctl, tmp_path):
     )
 
 
-def test_install_fails_when_project_config_unresolvable(fake_systemctl, tmp_path):
+def test_install_fails_when_project_config_unresolvable(fake_timer_systemctl, tmp_path):
     """Config resolution happens FIRST, so an unresolvable project_id costs
     nothing: no systemctl invocation and no unit file left behind to be
     enabled by a later unrelated `daemon-reload`."""
@@ -462,7 +462,7 @@ def test_install_fails_when_project_config_unresolvable(fake_systemctl, tmp_path
     empty_search_root.mkdir()
 
     result = _run_script(
-        fake_systemctl, tmp_path, 'no_such_project',
+        fake_timer_systemctl, 'no_such_project',
         env={'XDG_CONFIG_HOME': str(xdg_config),
              'LEGIBILITY_SEARCH_ROOTS': str(empty_search_root)},
     )
@@ -471,16 +471,16 @@ def test_install_fails_when_project_config_unresolvable(fake_systemctl, tmp_path
         f'Expected a non-zero exit for an unresolvable project_id; '
         f'stdout={result.stdout!r} stderr={result.stderr!r}'
     )
-    assert fake_systemctl.calls() == [], (
+    assert fake_timer_systemctl.calls() == [], (
         f'Expected NO systemctl invocation when config resolution fails '
-        f'first; calls={fake_systemctl.calls()!r}'
+        f'first; calls={fake_timer_systemctl.calls()!r}'
     )
     assert not (xdg_config / 'systemd' / 'user' / SERVICE_NAME).exists(), (
         'Expected no unit file to be installed when config resolution fails'
     )
 
 
-def test_installer_does_not_touch_the_trickle_units(fake_systemctl, tmp_path):
+def test_installer_does_not_touch_the_trickle_units(fake_timer_systemctl, tmp_path):
     """This installer must never disturb the LIVE nightly timer.
 
     The two jobs are siblings by design and their unit names differ by one
@@ -493,7 +493,7 @@ def test_installer_does_not_touch_the_trickle_units(fake_systemctl, tmp_path):
     xdg_config = tmp_path / 'xdg-config'
 
     result = _run_script(
-        fake_systemctl, tmp_path, 'proj_a',
+        fake_timer_systemctl, 'proj_a',
         env={'XDG_CONFIG_HOME': str(xdg_config),
              'LEGIBILITY_SEARCH_ROOTS': str(search_root)},
     )
@@ -507,7 +507,7 @@ def test_installer_does_not_touch_the_trickle_units(fake_systemctl, tmp_path):
         f'the health installer wrote the nightly trickle\'s units: {strays!r}'
     )
     touched = [
-        c for c in fake_systemctl.calls()
+        c for c in fake_timer_systemctl.calls()
         if any(TRICKLE_TIMER_NAME.replace('@.', '@') in a for a in c)
     ]
     assert touched == [], (

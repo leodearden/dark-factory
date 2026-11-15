@@ -2,7 +2,7 @@
 systemd unit files it installs (task 4006). The wrapper their ExecStart names
 is tested in test_memory_metadata_coverage_census_wrapper.py.
 
-Drives the installer via subprocess with `scripts/tests/conftest.py::fake_systemctl`
+Drives the installer via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl`
 first on PATH, and reads the committed units through
 `scripts/tests/conftest.py::unit_values` rather than grepping their text. Real
 systemd is never touched.
@@ -33,12 +33,12 @@ SERVICE_NAME = 'memory-metadata-coverage-census.service'
 TIMER_NAME = 'memory-metadata-coverage-census.timer'
 
 
-def _run_script(fake_systemctl, tmp_path, *, env=None, reset_state=True):
+def _run_script(fake_timer_systemctl, *, env=None, reset_state=True):
     if reset_state:
-        fake_systemctl.reset()
+        fake_timer_systemctl.reset()
 
     full_env = dict(os.environ)
-    full_env['PATH'] = f'{fake_systemctl.bin_dir}{os.pathsep}{full_env["PATH"]}'
+    full_env['PATH'] = f'{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env["PATH"]}'
     if env:
         full_env.update(env)
     return subprocess.run(
@@ -55,9 +55,9 @@ def test_script_is_executable():
         f'Expected {SCRIPT} to be executable (os.X_OK); run: chmod +x {SCRIPT}')
 
 
-def test_install_copies_both_units_and_enables_the_timer(fake_systemctl, tmp_path):
+def test_install_copies_both_units_and_enables_the_timer(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / 'xdg-config'
-    result = _run_script(fake_systemctl, tmp_path, env={'XDG_CONFIG_HOME': str(xdg_config)})
+    result = _run_script(fake_timer_systemctl, env={'XDG_CONFIG_HOME': str(xdg_config)})
     assert result.returncode == 0, (
         f'stdout={result.stdout!r} stderr={result.stderr!r}')
 
@@ -67,12 +67,12 @@ def test_install_copies_both_units_and_enables_the_timer(fake_systemctl, tmp_pat
         assert installed.is_file(), f'Expected {installed} to exist after install'
         assert installed.read_bytes() == (TEMPLATES_DIR / name).read_bytes()
 
-    calls = fake_systemctl.calls()
+    calls = fake_timer_systemctl.calls()
     assert ['daemon-reload'] in calls, calls
     assert ['enable', '--now', TIMER_NAME] in calls, calls
 
 
-def test_install_does_not_kick_an_immediate_run(fake_systemctl, tmp_path):
+def test_install_does_not_kick_an_immediate_run(fake_timer_systemctl, tmp_path):
     """No surprise run at install time.
 
     Unlike the flag-marker and reclaim installers, this one never `start`s the
@@ -82,16 +82,16 @@ def test_install_does_not_kick_an_immediate_run(fake_systemctl, tmp_path):
     owns. An operator who wants a look now runs the wrapper by hand, or the
     census with `--no-history`.
     """
-    result = _run_script(fake_systemctl, tmp_path, env={'XDG_CONFIG_HOME': str(tmp_path / 'xdg')})
+    result = _run_script(fake_timer_systemctl, env={'XDG_CONFIG_HOME': str(tmp_path / 'xdg')})
     assert result.returncode == 0, result.stderr
-    for call in fake_systemctl.calls():
+    for call in fake_timer_systemctl.calls():
         assert call[:1] != ['start'], f'unexpected immediate run: {call!r}'
 
 
-def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_systemctl, tmp_path):
+def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_timer_systemctl, tmp_path):
     """The self-verify catches "enable nominally succeeded but the unit is
     absent" -- the case a bare `enable` exit code cannot distinguish."""
-    result = _run_script(fake_systemctl, tmp_path, env={
+    result = _run_script(fake_timer_systemctl, env={
         'XDG_CONFIG_HOME': str(tmp_path / 'xdg'),
         'FAKE_SYSTEMCTL_OMIT_LIST_TIMERS': '1',
     })
@@ -101,11 +101,11 @@ def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_syste
     assert TIMER_NAME in result.stderr, result.stderr
 
 
-def test_install_is_idempotent(fake_systemctl, tmp_path):
+def test_install_is_idempotent(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / 'xdg-config'
     env = {'XDG_CONFIG_HOME': str(xdg_config)}
-    first = _run_script(fake_systemctl, tmp_path, env=env)
-    second = _run_script(fake_systemctl, tmp_path, env=env, reset_state=False)
+    first = _run_script(fake_timer_systemctl, env=env)
+    second = _run_script(fake_timer_systemctl, env=env, reset_state=False)
     assert first.returncode == 0, first.stderr
     assert second.returncode == 0, second.stderr
 

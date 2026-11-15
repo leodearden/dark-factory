@@ -42,7 +42,7 @@ drive the shared session runner end to end. The real UsageGate those fixtures
 drive has its dead-PID probe-dir sweep confined by the plugin
 ``pytest_configure`` arms (task 6275).
 
-And `fake_recorder` / `fake_systemctl` (task 5285): an executable that records
+And `fake_recorder` / `fake_timer_systemctl` (task 5285): an executable that records
 each call's argv and environment, replacing the private recorder and fake-`uv`
 copies in the flag-marker and reclaim wrapper suites, and a fake `systemctl`
 modelling the verbs the timer installers call, replacing the installer suites'
@@ -1021,7 +1021,7 @@ sys.exit(main(sys.argv[1:]))
 """
 
 
-class FakeSystemctl:
+class FakeTimerSystemctl:
     """A fake ``systemctl`` at ``path`` that models the timer installers' verbs.
 
     ``--user`` is dropped and every call is recorded, before it is answered,
@@ -1053,14 +1053,14 @@ class FakeSystemctl:
 
 
 @pytest.fixture
-def fake_systemctl(tmp_path):
-    """A :class:`FakeSystemctl` installed at ``tmp_path / 'bin' / 'systemctl'``.
+def fake_timer_systemctl(tmp_path):
+    """A :class:`FakeTimerSystemctl` installed at ``tmp_path / 'bin' / 'systemctl'``.
 
     The caller prepends ``.bin_dir`` to the PATH of the installer it runs.
     """
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir(exist_ok=True)
-    fake = FakeSystemctl(bin_dir, tmp_path / 'fake-systemctl-state.json')
+    fake = FakeTimerSystemctl(bin_dir, tmp_path / 'fake-timer-systemctl-state.json')
     fake.path.write_text(f'#!{sys.executable}\n' + _FAKE_SYSTEMCTL_SOURCE.format(
         state_path=str(fake._state_path),
     ))

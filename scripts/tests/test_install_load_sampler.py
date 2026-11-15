@@ -1,7 +1,7 @@
 """Tests for scripts/install-load-sampler.sh and the two systemd unit files it
 installs (task 3592, leaf δ of plans/load-throttle-harmonisation-prd.md).
 
-Drives the installer via subprocess with `scripts/tests/conftest.py::fake_systemctl`
+Drives the installer via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl`
 first on PATH, and reads the committed units through
 `scripts/tests/conftest.py::unit_values`. Real systemd is never touched, and
 DARK_FACTORY_ROOT is pointed at a tmp tree so the row check never reads the
@@ -132,12 +132,12 @@ def _seed_db(root: Path, *, rows: bool = True, ts_offset: int = 60) -> Path:
     return db_path
 
 
-def _run_script(fake_systemctl, tmp_path: Path, *, env=None, reset_state=True):
+def _run_script(fake_timer_systemctl, *, env=None, reset_state=True):
     if reset_state:
-        fake_systemctl.reset()
+        fake_timer_systemctl.reset()
 
     full_env = dict(os.environ)
-    full_env['PATH'] = f'{fake_systemctl.bin_dir}{os.pathsep}{full_env["PATH"]}'
+    full_env['PATH'] = f'{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env["PATH"]}'
     if env:
         full_env.update(env)
     return subprocess.run(
@@ -170,11 +170,11 @@ def test_script_is_executable():
         f'Expected {SCRIPT} to be executable (os.X_OK); run: chmod +x {SCRIPT}')
 
 
-def test_install_copies_both_units_verbatim_and_enables_the_timer(fake_systemctl, tmp_path: Path):
+def test_install_copies_both_units_verbatim_and_enables_the_timer(fake_timer_systemctl, tmp_path: Path):
     root = tmp_path / 'root'
     _seed_db(root)
 
-    result = _run_script(fake_systemctl, tmp_path, env=_install_env(tmp_path, root))
+    result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
     assert result.returncode == 0, (
         f'stdout={result.stdout!r} stderr={result.stderr!r}')
 
@@ -184,14 +184,14 @@ def test_install_copies_both_units_verbatim_and_enables_the_timer(fake_systemctl
         assert installed.is_file(), f'Expected {installed} to exist after install'
         assert installed.read_bytes() == (TEMPLATES_DIR / name).read_bytes()
 
-    calls = fake_systemctl.calls()
+    calls = fake_timer_systemctl.calls()
     assert ['daemon-reload'] in calls, calls
     assert ['enable', '--now', TIMER_NAME] in calls, calls
     assert ['list-timers', '--all'] in calls, calls
     assert ['start', SERVICE_NAME] in calls, calls
 
 
-def test_the_timer_is_verified_before_the_service_is_kicked(fake_systemctl, tmp_path: Path):
+def test_the_timer_is_verified_before_the_service_is_kicked(fake_timer_systemctl, tmp_path: Path):
     """The ordering lesson scripts/install-flag-marker-sweep-timer.sh documents.
 
     A failing kick ends the run -- by the explicit `exit 1` inside the
@@ -202,42 +202,42 @@ def test_the_timer_is_verified_before_the_service_is_kicked(fake_systemctl, tmp_
     root = tmp_path / 'root'
     _seed_db(root)
 
-    result = _run_script(fake_systemctl, tmp_path, env=_install_env(tmp_path, root))
+    result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
     assert result.returncode == 0, result.stderr
 
-    verbs = [call[0] for call in fake_systemctl.calls()]
+    verbs = [call[0] for call in fake_timer_systemctl.calls()]
     assert 'list-timers' in verbs and 'start' in verbs, verbs
     assert verbs.index('list-timers') < verbs.index('start'), verbs
 
 
-def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_systemctl, tmp_path: Path):
+def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_timer_systemctl, tmp_path: Path):
     """Catches "enable nominally succeeded but the unit is absent" -- the case
     a bare `enable` exit code cannot distinguish. And it must stop there."""
     root = tmp_path / 'root'
     _seed_db(root)
 
-    result = _run_script(fake_systemctl, tmp_path, env={
+    result = _run_script(fake_timer_systemctl, env={
         **_install_env(tmp_path, root),
         'FAKE_SYSTEMCTL_OMIT_LIST_TIMERS': '1',
     })
 
     assert result.returncode != 0
     assert TIMER_NAME in result.stderr, result.stderr
-    verbs = [call[0] for call in fake_systemctl.calls()]
+    verbs = [call[0] for call in fake_timer_systemctl.calls()]
     assert 'start' not in verbs, f'kicked the service after a failed verify: {verbs}'
 
 
-def test_a_db_with_a_fresh_row_passes_the_row_check(fake_systemctl, tmp_path: Path):
+def test_a_db_with_a_fresh_row_passes_the_row_check(fake_timer_systemctl, tmp_path: Path):
     root = tmp_path / 'root'
     _seed_db(root)
 
-    result = _run_script(fake_systemctl, tmp_path, env=_install_env(tmp_path, root))
+    result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
 
     assert result.returncode == 0, (
         f'stdout={result.stdout!r} stderr={result.stderr!r}')
 
 
-def test_an_empty_db_fails_the_row_check_naming_the_path(fake_systemctl, tmp_path: Path):
+def test_an_empty_db_fails_the_row_check_naming_the_path(fake_timer_systemctl, tmp_path: Path):
     """The row check must be able to FAIL, not just narrate.
 
     An installer that always exits 0 would report a healthy install for a
@@ -246,23 +246,23 @@ def test_an_empty_db_fails_the_row_check_naming_the_path(fake_systemctl, tmp_pat
     root = tmp_path / 'root'
     db_path = _seed_db(root, rows=False)
 
-    result = _run_script(fake_systemctl, tmp_path, env=_install_env(tmp_path, root))
+    result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
 
     assert result.returncode != 0
     assert str(db_path) in result.stderr, result.stderr
 
 
-def test_an_absent_db_fails_the_row_check_naming_the_path(fake_systemctl, tmp_path: Path):
+def test_an_absent_db_fails_the_row_check_naming_the_path(fake_timer_systemctl, tmp_path: Path):
     root = tmp_path / 'root'
     root.mkdir()
 
-    result = _run_script(fake_systemctl, tmp_path, env=_install_env(tmp_path, root))
+    result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
 
     assert result.returncode != 0
     assert str(root / 'data' / 'load-samples.db') in result.stderr, result.stderr
 
 
-def test_the_verified_db_follows_the_unit_not_the_invoking_shell(fake_systemctl, tmp_path: Path):
+def test_the_verified_db_follows_the_unit_not_the_invoking_shell(fake_timer_systemctl, tmp_path: Path):
     """The installer must check the file the UNIT writes, not the operator's env.
 
     sampler/__main__.py resolves <DARK_FACTORY_ROOT or CWD>/data and the unit
@@ -281,7 +281,7 @@ def test_the_verified_db_follows_the_unit_not_the_invoking_shell(fake_systemctl,
     decoy_root = tmp_path / 'decoy-root'
     _seed_db(decoy_root)
 
-    result = _run_script(fake_systemctl, tmp_path, env={
+    result = _run_script(fake_timer_systemctl, env={
         **_install_env(tmp_path, unit_root),
         'DARK_FACTORY_ROOT': str(decoy_root),
     })
@@ -291,7 +291,7 @@ def test_the_verified_db_follows_the_unit_not_the_invoking_shell(fake_systemctl,
 
 
 def test_a_leftover_row_from_an_earlier_install_does_not_pass_the_kick_check(
-    fake_systemctl, tmp_path: Path
+    fake_timer_systemctl, tmp_path: Path
 ):
     """What `pre_kick_ts` is FOR, and nothing exercised it.
 
@@ -305,13 +305,13 @@ def test_a_leftover_row_from_an_earlier_install_does_not_pass_the_kick_check(
     root = tmp_path / 'root'
     db_path = _seed_db(root, ts_offset=-3600)
 
-    result = _run_script(fake_systemctl, tmp_path, env=_install_env(tmp_path, root))
+    result = _run_script(fake_timer_systemctl, env=_install_env(tmp_path, root))
 
     assert result.returncode != 0, result.stdout
     assert str(db_path) in result.stderr, result.stderr
 
 
-def test_a_failed_kick_stops_the_install_naming_the_service(fake_systemctl, tmp_path: Path):
+def test_a_failed_kick_stops_the_install_naming_the_service(fake_timer_systemctl, tmp_path: Path):
     """The kick-failure branch, unreachable until the fake could refuse to start.
 
     It carries the install's most useful sentence -- the timer IS armed even
@@ -322,7 +322,7 @@ def test_a_failed_kick_stops_the_install_naming_the_service(fake_systemctl, tmp_
     root = tmp_path / 'root'
     _seed_db(root)
 
-    result = _run_script(fake_systemctl, tmp_path, env={
+    result = _run_script(fake_timer_systemctl, env={
         **_install_env(tmp_path, root),
         'FAKE_SYSTEMCTL_FAIL_START': '1',
     })
@@ -335,17 +335,17 @@ def test_a_failed_kick_stops_the_install_naming_the_service(fake_systemctl, tmp_
     )
 
 
-def test_running_twice_is_idempotent(fake_systemctl, tmp_path: Path):
+def test_running_twice_is_idempotent(fake_timer_systemctl, tmp_path: Path):
     root = tmp_path / 'root'
     _seed_db(root)
     env = _install_env(tmp_path, root)
 
-    first = _run_script(fake_systemctl, tmp_path, env=env)
+    first = _run_script(fake_timer_systemctl, env=env)
     assert first.returncode == 0, first.stderr
     unit_dir = tmp_path / 'xdg-config' / 'systemd' / 'user'
     before = {n: (unit_dir / n).read_bytes() for n in (SERVICE_NAME, TIMER_NAME)}
 
-    second = _run_script(fake_systemctl, tmp_path, env=env)
+    second = _run_script(fake_timer_systemctl, env=env)
     assert second.returncode == 0, second.stderr
     after = {n: (unit_dir / n).read_bytes() for n in (SERVICE_NAME, TIMER_NAME)}
     assert before == after

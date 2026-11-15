@@ -1,6 +1,6 @@
 """Tests for scripts/install-quality-snapshot-timer.sh and the three units it installs (task 8464).
 
-Drives the installer via subprocess with `scripts/tests/conftest.py::fake_systemctl`
+Drives the installer via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl`
 first on PATH, and reads the committed units through
 `scripts/tests/conftest.py::unit_values` rather than grepping their text.
 ``_run_script`` passes the project root and points the installer's interpreter
@@ -37,11 +37,11 @@ UNIT_NAMES = (SERVICE_NAME, TIMER_NAME, ALARM_NAME)
 ENV_FILE = '%E/dark-factory/quality-snapshot/%i.env'
 
 
-def _run_script(fake_systemctl, tmp_path, root, *, env=None, reset_state=True):
+def _run_script(fake_timer_systemctl, tmp_path, root, *, env=None, reset_state=True):
     if reset_state:
-        fake_systemctl.reset()
+        fake_timer_systemctl.reset()
     full_env = dict(os.environ)
-    full_env['PATH'] = f'{fake_systemctl.bin_dir}{os.pathsep}{full_env["PATH"]}'
+    full_env['PATH'] = f'{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env["PATH"]}'
     full_env['INSTALL_QUALITY_SNAPSHOT_TIMER_PYTHON'] = sys.executable
     full_env['XDG_CONFIG_HOME'] = str(tmp_path / 'xdg')
     if env:
@@ -63,8 +63,8 @@ def _env_dir(tmp_path) -> Path:
     return tmp_path / 'xdg' / 'dark-factory' / 'quality-snapshot'
 
 
-def _nothing_installed(fake_systemctl, tmp_path) -> None:
-    assert fake_systemctl.calls() == []
+def _nothing_installed(fake_timer_systemctl, tmp_path) -> None:
+    assert fake_timer_systemctl.calls() == []
     assert not _unit_dir(tmp_path).exists() or not any(_unit_dir(tmp_path).iterdir())
     assert not _env_dir(tmp_path).exists() or not any(_env_dir(tmp_path).iterdir())
 
@@ -190,8 +190,8 @@ def test_script_is_executable():
     assert os.access(SCRIPT, os.X_OK), f'chmod +x {SCRIPT}'
 
 
-def test_install_copies_the_units_writes_the_root_file_and_enables_the_instance(fake_systemctl, tmp_path, project):
-    result = _run_script(fake_systemctl, tmp_path, project)
+def test_install_copies_the_units_writes_the_root_file_and_enables_the_instance(fake_timer_systemctl, tmp_path, project):
+    result = _run_script(fake_timer_systemctl, tmp_path, project)
     assert result.returncode == 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
 
     for name in UNIT_NAMES:
@@ -200,14 +200,14 @@ def test_install_copies_the_units_writes_the_root_file_and_enables_the_instance(
     assert project_id == 'my_proj'
     env_file = _env_dir(tmp_path) / f'{project_id}.env'
     assert env_file.read_text().splitlines() == [f'QUALITY_SNAPSHOT_ROOT={project}']
-    calls = fake_systemctl.calls()
+    calls = fake_timer_systemctl.calls()
     assert calls.index(['daemon-reload']) < calls.index(
         ['enable', '--now', f'quality-snapshot@{project_id}.timer']
     ), calls
 
 
-def test_the_units_read_the_root_file_the_installer_writes(unit_values, fake_systemctl, tmp_path, project):
-    assert _run_script(fake_systemctl, tmp_path, project).returncode == 0
+def test_the_units_read_the_root_file_the_installer_writes(unit_values, fake_timer_systemctl, tmp_path, project):
+    assert _run_script(fake_timer_systemctl, tmp_path, project).returncode == 0
     project_id = project_id_for_root(project)
     written = _env_dir(tmp_path) / f'{project_id}.env'
 
@@ -224,69 +224,69 @@ def test_the_units_read_the_root_file_the_installer_writes(unit_values, fake_sys
     assert alarm_names == written
 
 
-def test_install_is_idempotent(fake_systemctl, tmp_path, project):
-    first = _run_script(fake_systemctl, tmp_path, project)
-    first_calls = fake_systemctl.calls()
+def test_install_is_idempotent(fake_timer_systemctl, tmp_path, project):
+    first = _run_script(fake_timer_systemctl, tmp_path, project)
+    first_calls = fake_timer_systemctl.calls()
     env_file = _env_dir(tmp_path) / f'{project_id_for_root(project)}.env'
     first_env = env_file.read_bytes()
-    second = _run_script(fake_systemctl, tmp_path, project)
+    second = _run_script(fake_timer_systemctl, tmp_path, project)
     assert first.returncode == 0, first.stderr
     assert second.returncode == 0, second.stderr
 
-    assert fake_systemctl.calls() == first_calls
+    assert fake_timer_systemctl.calls() == first_calls
     assert env_file.read_bytes() == first_env
     assert sorted(p.name for p in _env_dir(tmp_path).iterdir()) == [env_file.name]
     for name in UNIT_NAMES:
         assert (_unit_dir(tmp_path) / name).read_bytes() == (TEMPLATES_DIR / name).read_bytes()
 
 
-def test_a_second_root_with_the_same_id_is_refused_until_its_env_file_is_removed(fake_systemctl, tmp_path, project):
-    assert _run_script(fake_systemctl, tmp_path, project).returncode == 0
+def test_a_second_root_with_the_same_id_is_refused_until_its_env_file_is_removed(fake_timer_systemctl, tmp_path, project):
+    assert _run_script(fake_timer_systemctl, tmp_path, project).returncode == 0
     env_file = _env_dir(tmp_path) / f'{project_id_for_root(project)}.env'
     first_env = env_file.read_bytes()
     other = Path(committed_repo(tmp_path / 'elsewhere' / 'My-Proj', {})).resolve()
 
-    refused = _run_script(fake_systemctl, tmp_path, other)
+    refused = _run_script(fake_timer_systemctl, tmp_path, other)
 
     assert refused.returncode != 0, f'stdout={refused.stdout!r} stderr={refused.stderr!r}'
     assert str(project) in refused.stderr, refused.stderr
     assert str(other) in refused.stderr, refused.stderr
     assert env_file.read_bytes() == first_env
-    assert fake_systemctl.calls() == []
+    assert fake_timer_systemctl.calls() == []
 
     env_file.unlink()
-    moved = _run_script(fake_systemctl, tmp_path, other)
+    moved = _run_script(fake_timer_systemctl, tmp_path, other)
 
     assert moved.returncode == 0, moved.stderr
     assert env_file.read_text().splitlines() == [f'QUALITY_SNAPSHOT_ROOT={other}']
 
 
-def test_a_root_whose_id_the_wrapper_refuses_is_refused_before_anything_is_installed(fake_systemctl, tmp_path):
+def test_a_root_whose_id_the_wrapper_refuses_is_refused_before_anything_is_installed(fake_timer_systemctl, tmp_path):
     root = Path(committed_repo(tmp_path / '_scratch', {})).resolve()
 
-    result = _run_script(fake_systemctl, tmp_path, root)
+    result = _run_script(fake_timer_systemctl, tmp_path, root)
 
     assert result.returncode != 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
     assert "'_scratch' is not a project id" in result.stderr, result.stderr
-    _nothing_installed(fake_systemctl, tmp_path)
+    _nothing_installed(fake_timer_systemctl, tmp_path)
 
 
-def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_systemctl, tmp_path, project):
-    result = _run_script(fake_systemctl, tmp_path, project, env={'FAKE_SYSTEMCTL_OMIT_LIST_TIMERS': '1'})
+def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(fake_timer_systemctl, tmp_path, project):
+    result = _run_script(fake_timer_systemctl, tmp_path, project, env={'FAKE_SYSTEMCTL_OMIT_LIST_TIMERS': '1'})
     assert result.returncode != 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
     assert f'quality-snapshot@{project_id_for_root(project)}.timer' in result.stderr, result.stderr
 
 
-def test_install_does_not_kick_an_immediate_run(fake_systemctl, tmp_path, project):
+def test_install_does_not_kick_an_immediate_run(fake_timer_systemctl, tmp_path, project):
     """The first run belongs on schedule: an install is not an operator's snapshot run."""
-    result = _run_script(fake_systemctl, tmp_path, project)
+    result = _run_script(fake_timer_systemctl, tmp_path, project)
     assert result.returncode == 0, result.stderr
-    for call in fake_systemctl.calls():
+    for call in fake_timer_systemctl.calls():
         assert call[:1] != ['start'], f'unexpected immediate run: {call!r}'
 
 
 @pytest.mark.parametrize('kind', ['plain-directory', 'checkout-without-main'])
-def test_a_root_with_no_main_commit_is_refused_before_anything_is_installed(fake_systemctl, tmp_path, kind):
+def test_a_root_with_no_main_commit_is_refused_before_anything_is_installed(fake_timer_systemctl, tmp_path, kind):
     root = tmp_path / 'Not-Main'
     if kind == 'plain-directory':
         root.mkdir()
@@ -294,26 +294,26 @@ def test_a_root_with_no_main_commit_is_refused_before_anything_is_installed(fake
         committed_repo(root, {})
         subprocess.run(['git', '-C', str(root), 'branch', '-m', 'main', 'trunk'], check=True, timeout=30)
 
-    result = _run_script(fake_systemctl, tmp_path, root)
+    result = _run_script(fake_timer_systemctl, tmp_path, root)
 
     assert result.returncode != 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
     assert str(root.resolve()) in result.stderr, result.stderr
-    _nothing_installed(fake_systemctl, tmp_path)
+    _nothing_installed(fake_timer_systemctl, tmp_path)
 
 
-def test_a_root_an_environment_file_cannot_carry_verbatim_is_refused(fake_systemctl, tmp_path):
+def test_a_root_an_environment_file_cannot_carry_verbatim_is_refused(fake_timer_systemctl, tmp_path):
     root = Path(committed_repo(tmp_path / 'My Proj', {})).resolve()
 
-    result = _run_script(fake_systemctl, tmp_path, root)
+    result = _run_script(fake_timer_systemctl, tmp_path, root)
 
     assert result.returncode != 0, f'stdout={result.stdout!r} stderr={result.stderr!r}'
     assert str(root) in result.stderr, result.stderr
-    _nothing_installed(fake_systemctl, tmp_path)
+    _nothing_installed(fake_timer_systemctl, tmp_path)
 
 
-def test_no_root_argument_prints_usage(fake_systemctl, tmp_path):
-    result = _run_script(fake_systemctl, tmp_path, None)
+def test_no_root_argument_prints_usage(fake_timer_systemctl, tmp_path):
+    result = _run_script(fake_timer_systemctl, tmp_path, None)
 
     assert result.returncode != 0
     assert 'usage' in result.stderr.lower(), result.stderr
-    _nothing_installed(fake_systemctl, tmp_path)
+    _nothing_installed(fake_timer_systemctl, tmp_path)

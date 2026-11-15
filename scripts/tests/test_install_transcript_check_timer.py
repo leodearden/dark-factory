@@ -3,7 +3,7 @@ install script for the legibility-transcript-check systemd user timer
 (task 2901, follow-up to task 2893's lost-transcript detector).
 
 Mirrors scripts/tests/test_install_trickle_timer.py: drives the script via
-subprocess with `scripts/tests/conftest.py::fake_systemctl` first on PATH,
+subprocess with `scripts/tests/conftest.py::fake_timer_systemctl` first on PATH,
 plus a real invocation of `nightly.py resolve-config` (the REAL Python resolver — no
 mock — with INSTALL_TRANSCRIPT_CHECK_TIMER_PYTHON=sys.executable substituting
 for the default `uv run` prefix, and LEGIBILITY_SEARCH_ROOTS pointed at a tmp
@@ -63,19 +63,19 @@ def _write_project_config(tmp_path, *, project_id, escalation_port=8199):
 # Script driver
 # ---------------------------------------------------------------------------
 
-def _run_script(fake_systemctl, tmp_path, project_id, *, env=None):
+def _run_script(fake_timer_systemctl, project_id, *, env=None):
     """Run install-transcript-check-timer.sh <project_id> via subprocess.
 
-    Puts *fake_systemctl* first on PATH, reset on every call, and
+    Puts *fake_timer_systemctl* first on PATH, reset on every call, and
     defaults INSTALL_TRANSCRIPT_CHECK_TIMER_PYTHON=sys.executable so the
     script's `nightly.py resolve-config` delegation runs the REAL resolver
     directly -- no `uv run`/`--frozen` needed in-test. Callers supply
     XDG_CONFIG_HOME and LEGIBILITY_SEARCH_ROOTS via *env*.
     """
-    fake_systemctl.reset()
+    fake_timer_systemctl.reset()
 
     full_env = dict(os.environ)
-    full_env["PATH"] = f"{fake_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
+    full_env["PATH"] = f"{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
     full_env["INSTALL_TRANSCRIPT_CHECK_TIMER_PYTHON"] = sys.executable
     full_env.pop("LEGIBILITY_SEARCH_ROOTS", None)
     if env:
@@ -97,12 +97,12 @@ def test_script_is_executable():
     )
 
 
-def test_install_copies_templates_and_enables_timer(fake_systemctl, tmp_path):
+def test_install_copies_templates_and_enables_timer(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id="proj_a")
     xdg_config = tmp_path / "xdg-config"
 
     result = _run_script(
-        fake_systemctl, tmp_path, "proj_a",
+        fake_timer_systemctl, "proj_a",
         env={"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)},
     )
 
@@ -121,7 +121,7 @@ def test_install_copies_templates_and_enables_timer(fake_systemctl, tmp_path):
     # is asserted directly against the committed template in
     # test_service_template_execstart_shape, independent of install behavior.
 
-    calls = fake_systemctl.calls()
+    calls = fake_timer_systemctl.calls()
     assert ["daemon-reload"] in calls, f"calls={calls!r}"
     assert ["enable", "--now", "legibility-transcript-check@proj_a.timer"] in calls, f"calls={calls!r}"
     assert any(c[0] == "list-timers" for c in calls), f"calls={calls!r}"
@@ -150,29 +150,29 @@ def test_service_template_execstart_shape():
     )
 
 
-def test_install_is_idempotent(fake_systemctl, tmp_path):
+def test_install_is_idempotent(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id="proj_a")
     xdg_config = tmp_path / "xdg-config"
     env = {"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(search_root)}
 
-    result_1 = _run_script(fake_systemctl, tmp_path, "proj_a", env=env)
+    result_1 = _run_script(fake_timer_systemctl, "proj_a", env=env)
     assert result_1.returncode == 0, (
         f"stdout={result_1.stdout!r} stderr={result_1.stderr!r}"
     )
 
-    result_2 = _run_script(fake_systemctl, tmp_path, "proj_a", env=env)
+    result_2 = _run_script(fake_timer_systemctl, "proj_a", env=env)
     assert result_2.returncode == 0, (
         f"Expected re-running the install to still exit 0; "
         f"stdout={result_2.stdout!r} stderr={result_2.stderr!r}"
     )
 
 
-def test_install_fails_when_self_verify_omits_timer(fake_systemctl, tmp_path):
+def test_install_fails_when_self_verify_omits_timer(fake_timer_systemctl, tmp_path):
     search_root = _write_project_config(tmp_path, project_id="proj_a")
     xdg_config = tmp_path / "xdg-config"
 
     result = _run_script(
-        fake_systemctl, tmp_path, "proj_a",
+        fake_timer_systemctl, "proj_a",
         env={
             "XDG_CONFIG_HOME": str(xdg_config),
             "LEGIBILITY_SEARCH_ROOTS": str(search_root),
@@ -186,13 +186,13 @@ def test_install_fails_when_self_verify_omits_timer(fake_systemctl, tmp_path):
     )
 
 
-def test_install_fails_when_project_config_unresolvable(fake_systemctl, tmp_path):
+def test_install_fails_when_project_config_unresolvable(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / "xdg-config"
     empty_search_root = tmp_path / "empty-search-root"
     empty_search_root.mkdir()
 
     result = _run_script(
-        fake_systemctl, tmp_path, "no_such_project",
+        fake_timer_systemctl, "no_such_project",
         env={"XDG_CONFIG_HOME": str(xdg_config), "LEGIBILITY_SEARCH_ROOTS": str(empty_search_root)},
     )
 
@@ -200,9 +200,9 @@ def test_install_fails_when_project_config_unresolvable(fake_systemctl, tmp_path
         f"Expected a non-zero exit for an unresolvable project_id; "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
-    assert fake_systemctl.calls() == [], (
+    assert fake_timer_systemctl.calls() == [], (
         f"Expected NO systemctl invocation when config resolution fails first; "
-        f"calls={fake_systemctl.calls()!r}"
+        f"calls={fake_timer_systemctl.calls()!r}"
     )
     assert not (xdg_config / "systemd" / "user" / "legibility-transcript-check@.service").exists(), (
         "Expected no unit file to be installed when config resolution fails"

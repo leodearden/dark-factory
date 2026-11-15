@@ -2,7 +2,7 @@
 fail-loud, self-verifying installer for the .worktrees-orphaned/ reclaim
 sweep's systemd user timer (task 2980).
 
-Drives the script via subprocess with `scripts/tests/conftest.py::fake_systemctl`
+Drives the script via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl`
 first on PATH, as test_install_flag_marker_sweep_timer.py does. Real systemd
 is never touched. This installer also kicks an immediate one-time drain of the
 current backlog with `systemctl start`, which the fake answers with success.
@@ -29,13 +29,13 @@ TIMER_NAME = "reclaim-orphaned-worktrees.timer"
 # Script driver
 # ---------------------------------------------------------------------------
 
-def _run_script(fake_systemctl, tmp_path, *, env=None):
+def _run_script(fake_timer_systemctl, *, env=None):
     """Run install-reclaim-orphaned-worktrees-timer.sh via subprocess with a
-    *fake_systemctl* first on PATH, reset on every call."""
-    fake_systemctl.reset()
+    *fake_timer_systemctl* first on PATH, reset on every call."""
+    fake_timer_systemctl.reset()
 
     full_env = dict(os.environ)
-    full_env["PATH"] = f"{fake_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
+    full_env["PATH"] = f"{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
     if env:
         full_env.update(env)
     return subprocess.run(
@@ -55,10 +55,10 @@ def test_script_is_executable():
     )
 
 
-def test_install_copies_units_enables_timer_and_kicks_drain(fake_systemctl, tmp_path):
+def test_install_copies_units_enables_timer_and_kicks_drain(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / "xdg-config"
 
-    result = _run_script(fake_systemctl, tmp_path, env={"XDG_CONFIG_HOME": str(xdg_config)})
+    result = _run_script(fake_timer_systemctl, env={"XDG_CONFIG_HOME": str(xdg_config)})
 
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -72,17 +72,17 @@ def test_install_copies_units_enables_timer_and_kicks_drain(fake_systemctl, tmp_
     assert service_path.read_bytes() == (TEMPLATES_DIR / SERVICE_NAME).read_bytes()
     assert timer_path.read_bytes() == (TEMPLATES_DIR / TIMER_NAME).read_bytes()
 
-    calls = fake_systemctl.calls()
+    calls = fake_timer_systemctl.calls()
     assert ["daemon-reload"] in calls, f"calls={calls!r}"
     assert ["enable", "--now", TIMER_NAME] in calls, f"calls={calls!r}"
     assert ["start", SERVICE_NAME] in calls, f"calls={calls!r}"
 
 
-def test_install_fails_loud_when_timer_absent_from_list_timers(fake_systemctl, tmp_path):
+def test_install_fails_loud_when_timer_absent_from_list_timers(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / "xdg-config"
 
     result = _run_script(
-        fake_systemctl, tmp_path,
+        fake_timer_systemctl,
         env={
             "XDG_CONFIG_HOME": str(xdg_config),
             "FAKE_SYSTEMCTL_OMIT_LIST_TIMERS": "1",

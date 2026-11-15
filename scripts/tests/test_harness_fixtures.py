@@ -102,32 +102,32 @@ def test_reinstalling_a_fake_recorder_starts_from_an_empty_call_log(fake_recorde
 
 
 # ---------------------------------------------------------------------------
-# fake_systemctl
+# fake_timer_systemctl
 # ---------------------------------------------------------------------------
 
 
-def _systemctl(fake_systemctl, *args, **extra_env):
+def _systemctl(fake_timer_systemctl, *args, **extra_env):
     env = {
         **os.environ,
-        'PATH': f"{fake_systemctl.bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        'PATH': f"{fake_timer_systemctl.bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
         **extra_env,
     }
-    return _run(fake_systemctl, *args, env=env)
+    return _run(fake_timer_systemctl, *args, env=env)
 
 
-def test_fake_systemctl_strips_user_and_records_every_call_in_order(fake_systemctl):
-    _systemctl(fake_systemctl, '--user', 'daemon-reload')
-    _systemctl(fake_systemctl, '--user', 'enable', '--now', 'x.timer')
+def test_fake_timer_systemctl_strips_user_and_records_every_call_in_order(fake_timer_systemctl):
+    _systemctl(fake_timer_systemctl, '--user', 'daemon-reload')
+    _systemctl(fake_timer_systemctl, '--user', 'enable', '--now', 'x.timer')
 
-    assert fake_systemctl.calls() == [['daemon-reload'], ['enable', '--now', 'x.timer']]
+    assert fake_timer_systemctl.calls() == [['daemon-reload'], ['enable', '--now', 'x.timer']]
 
 
-def test_fake_systemctl_lists_enabled_timers_unless_told_to_omit_them(fake_systemctl):
-    _systemctl(fake_systemctl, '--user', 'enable', '--now', 'x.timer')
+def test_fake_timer_systemctl_lists_enabled_timers_unless_told_to_omit_them(fake_timer_systemctl):
+    _systemctl(fake_timer_systemctl, '--user', 'enable', '--now', 'x.timer')
 
-    listed = _systemctl(fake_systemctl, '--user', 'list-timers', '--all')
+    listed = _systemctl(fake_timer_systemctl, '--user', 'list-timers', '--all')
     omitted = _systemctl(
-        fake_systemctl, '--user', 'list-timers', '--all', FAKE_SYSTEMCTL_OMIT_LIST_TIMERS='1',
+        fake_timer_systemctl, '--user', 'list-timers', '--all', FAKE_SYSTEMCTL_OMIT_LIST_TIMERS='1',
     )
 
     *timer_lines, summary = listed.stdout.splitlines()
@@ -136,43 +136,43 @@ def test_fake_systemctl_lists_enabled_timers_unless_told_to_omit_them(fake_syste
     assert 'x.timer' not in omitted.stdout and 'x.service' not in omitted.stdout
 
 
-def test_fake_systemctl_start_succeeds_unless_told_to_fail_naming_the_unit(fake_systemctl):
-    plain = _systemctl(fake_systemctl, '--user', 'start', 'x.service')
-    no_block = _systemctl(fake_systemctl, '--user', 'start', '--no-block', 'x.service')
+def test_fake_timer_systemctl_start_succeeds_unless_told_to_fail_naming_the_unit(fake_timer_systemctl):
+    plain = _systemctl(fake_timer_systemctl, '--user', 'start', 'x.service')
+    no_block = _systemctl(fake_timer_systemctl, '--user', 'start', '--no-block', 'x.service')
     failed = _systemctl(
-        fake_systemctl, '--user', 'start', '--no-block', 'x.service',
+        fake_timer_systemctl, '--user', 'start', '--no-block', 'x.service',
         FAKE_SYSTEMCTL_FAIL_START='1',
     )
 
     assert (plain.returncode, no_block.returncode) == (0, 0)
     assert failed.returncode != 0
     assert 'Job for x.service failed.' in failed.stderr, failed.stderr
-    assert fake_systemctl.calls()[-1] == ['start', '--no-block', 'x.service']
+    assert fake_timer_systemctl.calls()[-1] == ['start', '--no-block', 'x.service']
 
 
-def test_fake_systemctl_show_answers_the_configured_working_directory(fake_systemctl, tmp_path):
+def test_fake_timer_systemctl_show_answers_the_configured_working_directory(fake_timer_systemctl, tmp_path):
     result = _systemctl(
-        fake_systemctl, '--user', 'show', '-p', 'WorkingDirectory', '--value', 'x.service',
+        fake_timer_systemctl, '--user', 'show', '-p', 'WorkingDirectory', '--value', 'x.service',
         FAKE_SYSTEMCTL_WORKDIR=str(tmp_path / 'checkout'),
     )
 
     assert result.stdout.strip() == str(tmp_path / 'checkout')
 
 
-def test_fake_systemctl_refuses_an_unmodelled_verb(fake_systemctl):
-    assert _systemctl(fake_systemctl, '--user', 'restart', 'x.service').returncode != 0
+def test_fake_timer_systemctl_refuses_an_unmodelled_verb(fake_timer_systemctl):
+    assert _systemctl(fake_timer_systemctl, '--user', 'restart', 'x.service').returncode != 0
 
 
-def test_fake_systemctl_keeps_state_across_runs_until_reset(fake_systemctl):
-    _systemctl(fake_systemctl, '--user', 'enable', '--now', 'first.timer')
-    _systemctl(fake_systemctl, '--user', 'enable', '--now', 'second.timer')
-    carried = _systemctl(fake_systemctl, '--user', 'list-timers', '--all')
+def test_fake_timer_systemctl_keeps_state_across_runs_until_reset(fake_timer_systemctl):
+    _systemctl(fake_timer_systemctl, '--user', 'enable', '--now', 'first.timer')
+    _systemctl(fake_timer_systemctl, '--user', 'enable', '--now', 'second.timer')
+    carried = _systemctl(fake_timer_systemctl, '--user', 'list-timers', '--all')
 
-    fake_systemctl.reset()
+    fake_timer_systemctl.reset()
 
     assert 'first.timer' in carried.stdout and 'second.timer' in carried.stdout
-    assert fake_systemctl.calls() == []
-    after_reset = _systemctl(fake_systemctl, '--user', 'list-timers', '--all')
+    assert fake_timer_systemctl.calls() == []
+    after_reset = _systemctl(fake_timer_systemctl, '--user', 'list-timers', '--all')
     assert after_reset.stdout.splitlines() == ['0 timers listed.']
 
 

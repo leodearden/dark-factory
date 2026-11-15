@@ -2,7 +2,7 @@
 self-verifying installer for the fused-memory stage1_flag_marker sweep's
 systemd user timer (task 2693).
 
-Drives the script via subprocess with `scripts/tests/conftest.py::fake_systemctl`
+Drives the script via subprocess with `scripts/tests/conftest.py::fake_timer_systemctl`
 first on PATH. Real systemd is never touched. Unlike the trickle-timer
 installer, this job is a single non-templated dark_factory instance (no
 project_id argument, no per-project config resolution), so the driver has no
@@ -34,16 +34,16 @@ TIMER_NAME = "fused-memory-flag-marker-sweep.timer"
 # Script driver
 # ---------------------------------------------------------------------------
 
-def _run_script(fake_systemctl, tmp_path, *, env=None):
+def _run_script(fake_timer_systemctl, *, env=None):
     """Run install-flag-marker-sweep-timer.sh via subprocess.
 
-    Puts *fake_systemctl* first on PATH, reset on every call. Callers
+    Puts *fake_timer_systemctl* first on PATH, reset on every call. Callers
     supply XDG_CONFIG_HOME via *env*.
     """
-    fake_systemctl.reset()
+    fake_timer_systemctl.reset()
 
     full_env = dict(os.environ)
-    full_env["PATH"] = f"{fake_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
+    full_env["PATH"] = f"{fake_timer_systemctl.bin_dir}{os.pathsep}{full_env['PATH']}"
     if env:
         full_env.update(env)
     return subprocess.run(
@@ -63,10 +63,10 @@ def test_script_is_executable():
     )
 
 
-def test_install_copies_units_enables_timer_and_kicks_drain(fake_systemctl, tmp_path):
+def test_install_copies_units_enables_timer_and_kicks_drain(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / "xdg-config"
 
-    result = _run_script(fake_systemctl, tmp_path, env={"XDG_CONFIG_HOME": str(xdg_config)})
+    result = _run_script(fake_timer_systemctl, env={"XDG_CONFIG_HOME": str(xdg_config)})
 
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -80,7 +80,7 @@ def test_install_copies_units_enables_timer_and_kicks_drain(fake_systemctl, tmp_
     assert service_path.read_bytes() == (TEMPLATES_DIR / SERVICE_NAME).read_bytes()
     assert timer_path.read_bytes() == (TEMPLATES_DIR / TIMER_NAME).read_bytes()
 
-    calls = fake_systemctl.calls()
+    calls = fake_timer_systemctl.calls()
     assert ["daemon-reload"] in calls, f"calls={calls!r}"
     assert ["enable", "--now", TIMER_NAME] in calls, f"calls={calls!r}"
     assert ["start", SERVICE_NAME] in calls, f"calls={calls!r}"
@@ -99,11 +99,11 @@ def test_install_copies_units_enables_timer_and_kicks_drain(fake_systemctl, tmp_
 # step-5: RED -- fail loud when the timer is absent from `list-timers`
 # ---------------------------------------------------------------------------
 
-def test_install_fails_loud_when_timer_absent_from_list_timers(fake_systemctl, tmp_path):
+def test_install_fails_loud_when_timer_absent_from_list_timers(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / "xdg-config"
 
     result = _run_script(
-        fake_systemctl, tmp_path,
+        fake_timer_systemctl,
         env={
             "XDG_CONFIG_HOME": str(xdg_config),
             "FAKE_SYSTEMCTL_OMIT_LIST_TIMERS": "1",
@@ -126,18 +126,18 @@ def test_install_fails_loud_when_timer_absent_from_list_timers(fake_systemctl, t
 # attributed to the drain specifically) when the drain kick fails
 # ---------------------------------------------------------------------------
 
-def test_self_verify_runs_even_when_drain_kick_fails(fake_systemctl, tmp_path):
+def test_self_verify_runs_even_when_drain_kick_fails(fake_timer_systemctl, tmp_path):
     xdg_config = tmp_path / "xdg-config"
 
     result = _run_script(
-        fake_systemctl, tmp_path,
+        fake_timer_systemctl,
         env={
             "XDG_CONFIG_HOME": str(xdg_config),
             "FAKE_SYSTEMCTL_FAIL_START": "1",
         },
     )
 
-    calls = fake_systemctl.calls()
+    calls = fake_timer_systemctl.calls()
     assert ["list-timers", "--all"] in calls, (
         f"Expected the list-timers self-verify to run even though the "
         f"drain kick (systemctl start) failed; calls={calls!r}"
@@ -178,7 +178,7 @@ def test_self_verify_runs_even_when_drain_kick_fails(fake_systemctl, tmp_path):
     )
 
 
-def test_installed_service_unit_carries_explicit_path_for_boot_catchup(fake_systemctl, tmp_path):
+def test_installed_service_unit_carries_explicit_path_for_boot_catchup(fake_timer_systemctl, tmp_path):
     """Task 2917 EDIT 3, unit half.
 
     The .timer unit sets `Persistent=true`, so a nightly firing missed while
@@ -201,7 +201,7 @@ def test_installed_service_unit_carries_explicit_path_for_boot_catchup(fake_syst
     minimal boot env."""
     xdg_config = tmp_path / "xdg-config"
 
-    result = _run_script(fake_systemctl, tmp_path, env={"XDG_CONFIG_HOME": str(xdg_config)})
+    result = _run_script(fake_timer_systemctl, env={"XDG_CONFIG_HOME": str(xdg_config)})
     assert result.returncode == 0, (
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
