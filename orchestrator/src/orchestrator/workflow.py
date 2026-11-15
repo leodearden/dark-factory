@@ -13364,7 +13364,7 @@ class TaskWorkflow:
             )
 
         if verdict['blocked']:
-            reason = verdict.get('reason') or f'Merger blocked: {merger_result.output[:200]}'
+            reason = self._blocked_verdict_reason(verdict, merger_result)
             self._write_merge_failure_review('merger_blocked', reason)
             return await self._mark_blocked(reason, merge_phase=merge_phase)
 
@@ -13427,6 +13427,11 @@ class TaskWorkflow:
             verdict = None
         return merger_result, verdict
 
+    @staticmethod
+    def _blocked_verdict_reason(verdict: dict, merger_result: AgentResult) -> str:
+        """A blocked verdict's reason, else the merger's output in its place."""
+        return verdict.get('reason') or f'Merger blocked: {merger_result.output[:200]}'
+
     async def _merger_disposition(self, brief: str) -> MergerDisposition:
         """The dispatch_base MergerCall: MERGER on *brief*, read fail-safe."""
         merger_result, verdict = await self._invoke_merger(brief)
@@ -13434,10 +13439,12 @@ class TaskWorkflow:
             report = merger_failure_report(
                 merger_result, observed_at=datetime.now(UTC).isoformat(),
             )
-            return MergerDisposition(resolved=False, reason=report.reason)
-        return MergerDisposition(
-            resolved=not verdict['blocked'], reason=verdict.get('reason') or '',
-        )
+            return MergerDisposition(resolved=False, reason=report.reason, detail=report.detail)
+        if verdict['blocked']:
+            return MergerDisposition(
+                resolved=False, reason=self._blocked_verdict_reason(verdict, merger_result),
+            )
+        return MergerDisposition(resolved=True, reason=verdict.get('reason') or '')
 
     async def _settle_conflicting_base(self) -> WorkflowOutcome | None:
         """Merge main into a resumed branch that conflicts with it, or block: see dispatch_base.py."""
@@ -13470,6 +13477,10 @@ class TaskWorkflow:
             return await self._mark_blocked(
                 settlement.block_reason(), detail=settlement.block_detail(),
                 category=EscalationCategory.MERGE_NEEDS_REBASE.value,
+                dry_run_spawn=(
+                    DryRunSpawn.NEVER if settlement.declined_by_merger
+                    else DryRunSpawn.OUTSIDE_MERGE_PHASE
+                ),
             )
         self.artifacts.update_base_commit(conflict.main_sha)
         self._base_commit = conflict.main_sha
