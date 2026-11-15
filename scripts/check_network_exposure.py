@@ -51,6 +51,7 @@ class SourceUnreadable(Exception):
 class OwnedPort:
     port: int
     owner: str
+    optional_service: str | None = None
 
 
 Sockaddr: TypeAlias = tuple[str, int] | tuple[str, int, int, int]
@@ -84,11 +85,20 @@ LOOPBACK: Final = HostAddress(ip="127.0.0.1", family=socket.AF_INET, scope_id=0,
 COMPOSE_PUBLISHED_PORTS: Final[Mapping[int, str]] = types.MappingProxyType(
     {6379: "falkordb", 6380: "falkordb-scratch", 6333: "qdrant", 6334: "qdrant", 8002: "fused-mcp", 8420: "embedder"}
 )
+# Services fused-memory starts without (`-` ExecStartPre in scripts/fused-memory.service.template); while one has
+# no container its loopback refusal is noted, not failed. Why: OPERATIONS.md §8 "Network exposure check".
+OPTIONAL_COMPOSE_SERVICES: Final[frozenset[str]] = frozenset({"embedder"})
+# Compose's default project name, the compose file's directory; pinned by the tests.
+COMPOSE_PROJECT: Final = "docker"
 RECON_REPORT_PORT: Final = 8003
 
 STATIC_PORTS: Final[tuple[OwnedPort, ...]] = (
     *(
-        OwnedPort(port=port, owner=f"compose service {service}")
+        OwnedPort(
+            port=port,
+            owner=f"compose service {service}",
+            optional_service=service if service in OPTIONAL_COMPOSE_SERVICES else None,
+        )
         for port, service in COMPOSE_PUBLISHED_PORTS.items()
     ),
     OwnedPort(
@@ -98,12 +108,12 @@ STATIC_PORTS: Final[tuple[OwnedPort, ...]] = (
 )
 
 
-def merge_owners(*sources: Iterable[OwnedPort]) -> dict[int, tuple[str, ...]]:
+def merge_owners(*sources: Iterable[OwnedPort]) -> dict[int, tuple[OwnedPort, ...]]:
     """Port -> every owner of it, once each in source order, sorted by port."""
-    owners: dict[int, dict[str, None]] = {}
+    owners: dict[int, dict[OwnedPort, None]] = {}
     for source in sources:
         for owned in source:
-            owners.setdefault(owned.port, {})[owned.owner] = None
+            owners.setdefault(owned.port, {})[owned] = None
     return {port: tuple(owners[port]) for port in sorted(owners)}
 
 
@@ -290,11 +300,11 @@ class Target:
 class Finding:
     kind: FindingKind
     target: Target
-    owners: tuple[str, ...]
+    owners: tuple[OwnedPort, ...]
     result: ProbeResult
 
     def render(self) -> str:
-        subject = f"port {self.target.port} ({', '.join(self.owners)})"
+        subject = f"port {self.target.port} ({', '.join(owned.owner for owned in self.owners)})"
         label = self.target.address.label
         if self.kind is FindingKind.EXPOSED:
             text = f"{subject} accepted a connect on {label}"
@@ -312,7 +322,7 @@ def _port_targets(port: int, addresses: Sequence[HostAddress]) -> list[Target]:
     ]
 
 
-def _finding(target: Target, owners: tuple[str, ...], result: ProbeResult) -> Finding | None:
+def _finding(target: Target, owners: tuple[OwnedPort, ...], result: ProbeResult) -> Finding | None:
     if target.loopback:
         kind = None if result.outcome is Outcome.ACCEPTED else FindingKind.NOT_LISTENING
     else:

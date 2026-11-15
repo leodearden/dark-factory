@@ -249,7 +249,7 @@ def test_static_ports_owns_one_port_per_table_entry():
 
 def test_optional_compose_services_are_published_compose_services():
     assert exposure.OPTIONAL_COMPOSE_SERVICES
-    assert exposure.OPTIONAL_COMPOSE_SERVICES <= set(exposure.COMPOSE_PUBLISHED_PORTS.values())
+    assert exposure.OPTIONAL_COMPOSE_SERVICES.issubset(exposure.COMPOSE_PUBLISHED_PORTS.values())
 
 
 def test_static_ports_mark_exactly_the_optional_services():
