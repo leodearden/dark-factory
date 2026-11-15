@@ -189,6 +189,7 @@ class TestAPreservedPayloadSurvivesACrash:
 
         locator = spool.preserve(_record())
 
+        assert locator is not None
         payload_syncs = [call for call in fsyncs if not call.is_dir]
         assert payload_syncs, fsyncs
         for call in payload_syncs:
