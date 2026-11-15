@@ -1845,7 +1845,7 @@ class TestTheStormEscape:
 
         filed = rig.queue.submitted[0]
         assert filed.task_id == plan_tools._MARKUP_STORM_ANCHOR_TASK_ID
-        assert filed.level == plan_tools._MARKUP_STORM_LEVEL
+        assert filed.level == markup_sink.MARKUP_STORM_LEVEL
         assert rig.queue.reads == [
             (plan_tools._MARKUP_STORM_ANCHOR_TASK_ID, 'pending')
         ]
@@ -2069,8 +2069,8 @@ class TestAnUnrecognisedRecordKindIsStillFiled:
         assert len(queue.submitted) == 1
         esc = queue.submitted[0]
         assert esc.id == esc_id
-        assert esc.category == plan_tools._ESCALATION_FALLBACK_CATEGORY
-        assert plan_tools._ESCALATION_FALLBACK_SUMMARY in esc.summary
+        assert esc.category == markup_sink.ESCALATION_FALLBACK_CATEGORY
+        assert plan_tools.MARKUP_SINK_SPEC.fallback_summary in esc.summary
         assert UNREPAIRABLE_DECISION in esc.detail, (
             'an unfamiliar record still carries a payload — filing it without '
             'that payload would discard the very thing worth keeping'
