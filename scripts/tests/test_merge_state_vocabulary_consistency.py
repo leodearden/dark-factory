@@ -807,6 +807,19 @@ Terminal: `done`, `conflict`, `blocked`, `abandoned`, `superseded`, `wip_halted`
 <!-- merge-state-vocab:end -->
 """
 
+# Values in NEITHER vocabulary that runbooks have actually named.
+_SPAN_PHANTOM_FAILED = """\
+<!-- merge-state-vocab:begin partition=TERMINAL_STATES -->
+Terminal: `done`, `conflict`, `blocked`, `abandoned`, `superseded`, `failed`
+<!-- merge-state-vocab:end -->
+"""
+
+_SPAN_PHANTOM_NEEDS_REBASE = """\
+<!-- merge-state-vocab:begin partition=TERMINAL_STATES -->
+Terminal: `done`, `conflict`, `blocked`, `abandoned`, `superseded`, `needs_rebase`
+<!-- merge-state-vocab:end -->
+"""
+
 _SPAN_ABSENT = """\
 # fixture site
 
@@ -895,6 +908,16 @@ def test_load_vocabulary_values_covers_both_vocabularies() -> None:
         "`failed` is a value the runbooks invented; it appears nowhere in "
         "escalation/src/escalation/server.py (the real value is `error`)"
     )
+
+
+def test_known_phantom_values_are_not_vocabulary_members() -> None:
+    """A phantom that became a real member must leave the phantom set.
+
+    Otherwise every correct span naming that new member would go red.
+    """
+    assert _KNOWN_PHANTOM_VALUES
+    assert {"failed", "needs_rebase"} <= _KNOWN_PHANTOM_VALUES
+    assert _KNOWN_PHANTOM_VALUES.isdisjoint(vocabulary_values(load_vocabulary()))
 
 
 def test_load_vocabulary_raises_when_the_vocabulary_module_is_missing(tmp_path: Path) -> None:
@@ -1224,6 +1247,18 @@ def test_assert_span_matches_accepts_an_exact_match() -> None:
             "a value from the other vocabulary entirely",
             repr(["wip_halted"]),
             id="wrong-vocabulary",
+        ),
+        pytest.param(
+            _SPAN_PHANTOM_FAILED,
+            "a value that never existed — the submit status the runbooks invented",
+            repr(["failed"]),
+            id="phantom-failed",
+        ),
+        pytest.param(
+            _SPAN_PHANTOM_NEEDS_REBASE,
+            "a bounce reason mistaken for a status",
+            repr(["needs_rebase"]),
+            id="phantom-needs-rebase",
         ),
     ],
 )
