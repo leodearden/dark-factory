@@ -5428,9 +5428,9 @@ class TestStdlibOnlySelfContainment:
         in each of the relative, ``orchestrator.``-qualified and bare spellings.
         """
         package = _SR_PKG_ROOT / 'orchestrator'
-        siblings = {path.stem for path in package.glob('*.py')} | {
-            child.name for child in package.iterdir() if (child / '__init__.py').is_file()
-        }
+
+        def is_sibling(name: str) -> bool:
+            return (package / f'{name}.py').is_file() or (package / name / '__init__.py').is_file()
 
         def sibling_imports(module: str) -> set[str]:
             found: set[str] = set()
@@ -5441,14 +5441,14 @@ class TestStdlibOnlySelfContainment:
                         found.update([head[0]] if node.module else [alias.name for alias in node.names])
                     elif head[0] == 'orchestrator':
                         found.update([head[1]] if len(head) > 1 else [alias.name for alias in node.names])
-                    elif head[0] in siblings:
+                    elif is_sibling(head[0]):
                         found.add(head[0])
                 elif isinstance(node, ast.Import):
                     for alias in node.names:
                         head = alias.name.split('.')
                         if head[0] == 'orchestrator' and len(head) > 1:
                             found.add(head[1])
-                        elif head[0] in siblings:
+                        elif is_sibling(head[0]):
                             found.add(head[0])
             return found
 
