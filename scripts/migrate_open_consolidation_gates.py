@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import secrets
@@ -837,11 +838,13 @@ def _could_not_run(cause: object) -> int:
 
 
 async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
-    """The whole run. *memory* is injected by tests; otherwise the live service is built here.
+    """The whole run. *memory* is injected by tests; otherwise the live service is opened here.
 
     ``--execute`` probes the store-mutation capability FIRST, before tasks.db,
     any scroll, or building the service, and then honours the kill switch.
-    Only a self-built service in execute mode is initialized (and closed).
+    Both read only the config, so a refusal opens no store. A self-built
+    service opens FULL in execute mode and NONE otherwise, and is always
+    closed.
     """
     try:
         invocation = parse_invocation(args)
@@ -849,23 +852,28 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
             assert_store_mutation_allowed(operation=_EXECUTE_OPERATION)
     except (UsageError, StoreMutationUnavailable) as exc:
         return _could_not_run(exc)
-    owned = memory is None
-    service = closure_cli.build_memory_service() if owned else memory
-    switched_off = kill_switch_refusal(invocation, service.config.consolidation_auto)
+    if memory is None:
+        from fused_memory.config.schema import FusedMemoryConfig
+
+        config = FusedMemoryConfig()
+    else:
+        config = memory.config
+    switched_off = kill_switch_refusal(invocation, config.consolidation_auto)
     if switched_off is not None:
         return _could_not_run(switched_off)
     try:
         gates = open_consolidation_gates(invocation.project_root, invocation.tag)
     except UsageError as exc:
         return _could_not_run(exc)
-    live = owned and invocation.mode is Mode.EXECUTE
-    if live:
-        await service.initialize()
-    try:
-        return await _migrate_and_emit(invocation, service, gates)
-    finally:
-        if live:
-            await service.close()
+    async with contextlib.AsyncExitStack() as stack:
+        if memory is None:
+            from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
+
+            open_as = ServiceOpen.FULL if invocation.mode is Mode.EXECUTE else ServiceOpen.NONE
+            _, memory = await stack.enter_async_context(
+                maintenance_service(config=config, open_as=open_as),
+            )
+        return await _migrate_and_emit(invocation, memory, gates)
 
 
 async def _migrate_and_emit(
