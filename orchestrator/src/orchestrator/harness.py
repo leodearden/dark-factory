@@ -44,7 +44,12 @@ from shared.elision import elide_at_word
 from shared.eval_lane import eval_lane_provenance
 from shared.loop_stall import LoopStallMonitor
 from shared.mcp_envelope import resolver_failed
-from shared.project_layout import escalation_queue_dir, orchestrator_data_dir, runs_db
+from shared.project_layout import (
+    escalation_queue_dir,
+    orchestrator_data_dir,
+    runs_db,
+    startup_failures_json,
+)
 from shared.repo_paths import (
     rejected_dark_factory_root_override,
     resolve_dark_factory_root,
@@ -194,7 +199,7 @@ from orchestrator.recovery_pins import records_pin_recovery
 from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
-from orchestrator.run_store import RunStore
+from orchestrator.run_store import RunExitReason, RunStore
 from orchestrator.scheduled_deploy_settle import ScheduledDeploySettler
 from orchestrator.scheduler import (
     Scheduler,
@@ -226,6 +231,7 @@ from orchestrator.startup_steps import (
     StartupStep,
     StepOutcome,
     StepStatus,
+    page_crash_loop,
     run_startup_step,
 )
 from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
@@ -2781,7 +2787,9 @@ class Harness:
         # Hoisted out of the try block so the finally clause can tally the
         # reports of slots cancelled at shutdown.
         task_reports: list[TaskReport] = []
-        journal = StartupJournal()
+        journal = StartupJournal.load(startup_failures_json(self.config.project_root))
+        startup_completed_at: datetime | None = None
+        exit_reason: RunExitReason | None = None
 
         try:
             logger.info('Starting fused-memory HTTP server...')
@@ -2798,6 +2806,10 @@ class Harness:
             # intended outcome (plans/startup-hardening-prd.md §3.1).
             service_steps = (
                 StartupStep('1b', self._start_lifecycle_services, fatal=True),
+                StartupStep('1b-crash-loop', lambda: page_crash_loop(
+                    journal, self._escalation_queue,
+                    filing_claimant_run_id=self._filing_claimant_run_id,
+                )),
                 StartupStep('1c', self._dismiss_stale_escalations),
                 StartupStep(
                     '1c0-dirty',
@@ -2920,6 +2932,8 @@ class Harness:
             # never reaches acquire_next but should still leave the Scheduler
             # in a consistent post-startup state.
             self.scheduler.finish_startup()
+            journal.clear()
+            startup_completed_at = datetime.now(UTC)
 
             statuses, _ = await self.scheduler.get_statuses()
             self.report.total_tasks = sum(1 for s in statuses.values() if s == 'pending')
@@ -3066,6 +3080,19 @@ class Harness:
                     and self.report.completed > 0):
                 await self._run_full_review_and_tag()
 
+        except asyncio.CancelledError:
+            exit_reason = RunExitReason.cancelled()
+            raise
+        except BaseException as exc:
+            # A crash after startup completed is the main loop's, not a
+            # startup crash (plans/startup-hardening-prd.md §4).
+            if startup_completed_at is None:
+                exit_reason = RunExitReason.startup_crash(journal.record_crash(exc))
+                page_crash_loop(
+                    journal, self._escalation_queue,
+                    filing_claimant_run_id=self._filing_claimant_run_id,
+                )
+            raise
         finally:
             # Task 3172: set BEFORE the drain loop below (the primary route by
             # which a SIGTERM reaches a slot task) and before the straggler
@@ -3101,7 +3128,10 @@ class Harness:
             # runs row with final aggregates).
             if self._run_store and self._run_id:
                 try:
-                    self._run_store.finish_run(self._run_id, self.report)
+                    self._run_store.finish_run(
+                        self._run_id, self.report,
+                        startup_completed_at=startup_completed_at, exit_reason=exit_reason,
+                    )
                 except Exception as e:
                     logger.warning(f'Failed to finalize run metrics: {e}')
 
