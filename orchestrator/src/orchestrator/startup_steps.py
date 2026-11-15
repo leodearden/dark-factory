@@ -12,10 +12,13 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from escalation.categories import EscalationCategory
 from escalation.file_or_refresh import RefreshableAlarm, file_or_refresh
+from pydantic import BaseModel, ConfigDict, Field
+from shared.safe_io import atomic_write_text
 
 from orchestrator.event_store import EventStore, EventType
 
@@ -28,6 +31,7 @@ STARTUP_STEP_SENTINEL_PREFIX = 'orchestrator-startup-'
 _STEP_NAME_PATTERN = re.compile(r'[0-9a-z][0-9a-z-]*')
 _L1_AGENT_ROLE = 'orchestrator-startup'
 _SUMMARY_LIMIT = 200
+CRASH_LOOP_THRESHOLD = 3
 
 
 def sentinel_task_id(step_name: str) -> str:
@@ -107,18 +111,119 @@ class StepInFlight:
     started_at: datetime
 
 
-class StartupJournal:
-    """Which startup step started last, held in memory."""
+class StartupFailureStreak(BaseModel):
+    """The step (or crash site) that failed on each of the last *consecutive* starts."""
 
-    def __init__(self) -> None:
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    step: str = Field(pattern=f'^{_STEP_NAME_PATTERN.pattern}$')
+    exception_type: str
+    message: str
+    consecutive: int = Field(ge=1)
+    first_seen: datetime
+    last_seen: datetime
+
+    @classmethod
+    def following(
+        cls,
+        prior: StartupFailureStreak | None,
+        *,
+        step: str,
+        exception_type: str,
+        message: str,
+        at: datetime,
+    ) -> StartupFailureStreak:
+        extends = prior is not None and prior.step == step
+        return cls(
+            step=step,
+            exception_type=exception_type,
+            message=message,
+            consecutive=prior.consecutive + 1 if extends else 1,
+            first_seen=prior.first_seen if extends else at,
+            last_seen=at,
+        )
+
+    @property
+    def reached_threshold(self) -> bool:
+        return self.consecutive >= CRASH_LOOP_THRESHOLD
+
+
+class StartupJournal:
+    """This start's step in flight, over the durable failure streak the previous starts left."""
+
+    def __init__(self, path: Path, inherited: StartupFailureStreak | None = None) -> None:
+        self._path = path
+        self._inherited = inherited
         self._in_flight: StepInFlight | None = None
+        self._last_returned: str | None = None
+
+    @classmethod
+    def load(cls, path: Path) -> StartupJournal:
+        return cls(path, _read_streak(path))
+
+    @property
+    def inherited(self) -> StartupFailureStreak | None:
+        return self._inherited
 
     def record_in_flight(self, step: str, started_at: datetime) -> None:
         self._in_flight = StepInFlight(step, started_at)
 
+    def record_returned(self, step: str) -> None:
+        self._in_flight = None
+        self._last_returned = step
+
     @property
     def in_flight(self) -> StepInFlight | None:
         return self._in_flight
+
+    @property
+    def crash_site(self) -> str:
+        if self._in_flight is not None:
+            return self._in_flight.step
+        if self._last_returned is not None:
+            return f'after-{self._last_returned}'
+        return 'before-first-step'
+
+    def record_failure(self, step: str, exception_type: str, message: str) -> StartupFailureStreak:
+        streak = StartupFailureStreak.following(
+            self._inherited, step=step, exception_type=exception_type, message=message,
+            at=datetime.now(UTC),
+        )
+        try:
+            atomic_write_text(self._path, streak.model_dump_json(), mkdir=True)
+        except OSError as exc:
+            logger.warning(
+                'startup failure journal %s: recording %s failed: %s: %s',
+                self._path, step, type(exc).__name__, exc,
+            )
+        return streak
+
+    def record_crash(self, exc: BaseException) -> str:
+        site = self.crash_site
+        self.record_failure(site, type(exc).__name__, str(exc))
+        return site
+
+    def clear(self) -> None:
+        try:
+            self._path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning(
+                'startup failure journal %s: clearing failed: %s: %s',
+                self._path, type(exc).__name__, exc,
+            )
+
+
+def _read_streak(path: Path) -> StartupFailureStreak | None:
+    try:
+        return StartupFailureStreak.model_validate_json(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            'startup failure journal %s is unreadable, inheriting no streak: %s: %s',
+            path, type(exc).__name__, exc,
+        )
+        return None
 
 
 async def run_startup_step(

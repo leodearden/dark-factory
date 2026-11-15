@@ -44,7 +44,12 @@ from shared.elision import elide_at_word
 from shared.eval_lane import eval_lane_provenance
 from shared.loop_stall import LoopStallMonitor
 from shared.mcp_envelope import resolver_failed
-from shared.project_layout import escalation_queue_dir, orchestrator_data_dir, runs_db
+from shared.project_layout import (
+    escalation_queue_dir,
+    orchestrator_data_dir,
+    runs_db,
+    startup_failures_json,
+)
 from shared.repo_paths import (
     rejected_dark_factory_root_override,
     resolve_dark_factory_root,
@@ -2781,7 +2786,7 @@ class Harness:
         # Hoisted out of the try block so the finally clause can tally the
         # reports of slots cancelled at shutdown.
         task_reports: list[TaskReport] = []
-        journal = StartupJournal()
+        journal = StartupJournal.load(startup_failures_json(self.config.project_root))
 
         try:
             logger.info('Starting fused-memory HTTP server...')
