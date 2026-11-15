@@ -8,6 +8,8 @@ imports imports it back.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -18,6 +20,8 @@ from shared.git_async import GitResult, run_git
 
 from orchestrator.git_ops import GitOps, GitQueryFailed
 from orchestrator.merge_lane.outcome_facts import ConflictEvidence
+
+logger = logging.getLogger(__name__)
 
 _GIT_TIMEOUT_SECS = 120.0
 _MERGE_TIMEOUT_SECS = 600.0
@@ -144,11 +148,21 @@ async def settle_base_conflict(
 ) -> Settlement:
     """Merge main into *branch*, handing any conflict to *merger*, then check the result.
 
-    Only an unconcluded merge is ever undone, by ``git merge --abort``;
-    nothing is reset, so a refused settlement leaves its evidence in place.
+    Only a merge left unconcluded, or left open by an exception, is ever undone,
+    by ``git merge --abort``; nothing is reset, so a refusal keeps its evidence.
     """
     if await _checked_out_branch(worktree) != branch:
         return Settlement(conflict, branch, (IntegrationRefusal.BRANCH_NOT_CHECKED_OUT,))
+    try:
+        return await _merge_main_in(git_ops, worktree, conflict, branch, merger)
+    except BaseException:
+        await _abort_after_exception(git_ops, worktree)
+        raise
+
+
+async def _merge_main_in(
+    git_ops: GitOps, worktree: Path, conflict: BaseConflict, branch: str, merger: MergerCall,
+) -> Settlement:
     merge = await run_git(
         ['git', 'merge', '--no-ff', '-m', f'Merge main into {branch}', conflict.main_sha],
         cwd=worktree, timeout=_MERGE_TIMEOUT_SECS,
@@ -237,6 +251,14 @@ async def _unmerged_paths(git_ops: GitOps, worktree: Path) -> tuple[str, ...] | 
 async def _abort_if_merging(git_ops: GitOps, worktree: Path) -> None:
     if await _merge_in_progress(worktree):
         await git_ops.abort_merge(worktree)
+
+
+async def _abort_after_exception(git_ops: GitOps, worktree: Path) -> None:
+    """Close a merge an exception left open, never replacing that exception."""
+    try:
+        await asyncio.shield(_abort_if_merging(git_ops, worktree))
+    except Exception:
+        logger.warning('could not abort the dispatch-start merge in %s', worktree, exc_info=True)
 
 
 async def _head_or_none(worktree: Path) -> str | None:
