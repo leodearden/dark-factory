@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 import pytest_asyncio
 from _out_of_band_task_writes import write_task_out_of_band
+from shared.project_layout import tasks_db
 
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.config.schema import TaskmasterConfig
@@ -113,7 +115,6 @@ async def test_done_provenance_kind_and_commit_come_from_metadata(backend, proje
 @pytest.mark.parametrize(
     'metadata',
     [
-        pytest.param(None, id='no-metadata'),
         pytest.param(json.dumps({'other': 1}), id='no-done-provenance'),
         pytest.param(_provenance(kind='', commit='   '), id='blank'),
         pytest.param(_provenance(kind=7, commit=12345), id='not-a-json-string'),
@@ -131,6 +132,28 @@ async def test_done_provenance_reads_as_none_when_absent_blank_or_malformed(
 
     assert (row['done_provenance_kind'], row['done_provenance_commit']) == (None, None)
     assert row['status'] == 'done'
+
+
+@pytest.mark.asyncio
+async def test_done_provenance_reads_as_none_when_metadata_is_null(backend, project_root):
+    tid = await _add(backend, project_root, 'Finished')
+    write_task_out_of_band(project_root, tid, status='done')
+    _set_metadata_null(project_root, tid)
+
+    row = (await backend.get_task_facts([tid], project_root))[tid]
+
+    assert (row['done_provenance_kind'], row['done_provenance_commit']) == (None, None)
+    assert row['status'] == 'done'
+
+
+def _set_metadata_null(project_root: str, task_id: str) -> None:
+    conn = sqlite3.connect(tasks_db(project_root))
+    try:
+        with conn:
+            updated = conn.execute('UPDATE tasks SET metadata=NULL WHERE id=?', (int(task_id),))
+        assert updated.rowcount == 1
+    finally:
+        conn.close()
 
 
 @pytest.mark.asyncio

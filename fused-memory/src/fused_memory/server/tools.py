@@ -7659,8 +7659,8 @@ def create_mcp_server(
 
         # (5) The referent must name a task the live registry actually has —
         # but ONLY when the registry can be consulted. See
-        # `_verify_mint_referent` for the three-valued distinction and why it
-        # cannot be expressed through `_claim_task_statuses` directly.
+        # `_verify_mint_referent` for the FOUND / NO_SUCH_TASK /
+        # COULD_NOT_CHECK rule.
         if err := await _verify_mint_referent(name_decision.referent, project_id):
             return err
 
