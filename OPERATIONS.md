@@ -1155,21 +1155,29 @@ value is anchored at the checkout by
   different state from "no hit".
 - **Has it fired?** Any row means the trigger has fired:
 
-      sqlite3 -readonly data/reconciliation/reconciliation.db "SELECT ji.completed_at, ji.run_id, r.project_id, ji.num_turns, ji.rejected_tool_calls FROM judge_invocations ji LEFT JOIN runs r ON r.id = ji.run_id WHERE ji.ended_error_max_turns = 1 ORDER BY ji.completed_at LIMIT 1;"
+      sqlite3 -readonly data/reconciliation/reconciliation.db "SELECT ji.completed_at, ji.run_id, r.project_id, ji.schema_salvaged, ji.num_turns, ji.rejected_tool_calls FROM judge_invocations ji LEFT JOIN runs r ON r.id = ji.run_id WHERE ji.ended_error_max_turns = 1 ORDER BY ji.completed_at LIMIT 1;"
 
   A schema-salvaged run counts too: the turn cap ended it, even though its
-  verdict was recovered.
+  verdict was recovered. The `schema_salvaged` column tells the two apart: 1
+  is a run whose verdict was recovered, 0 is a verdict-less one, which also
+  shows up as a `JUDGE_INFRA_FAILURE` no-verdict.
 - **Rejected tool calls.** The judge registers no tool but `StructuredOutput`,
   so the CLI rejects every other call it makes:
 
       sqlite3 -readonly data/reconciliation/reconciliation.db "SELECT COUNT(*), SUM(rejected_tool_calls), SUM(rejected_tool_calls IS NULL) FROM judge_invocations;"
 
   NULL means the transcript was unreadable, not zero.
-- **Live signals.** `journalctl --user -u fused-memory` carries the WARNING
-  `reconciliation.judge_turn_cap_hit` on every hit, logged even when the row
-  write fails, and `reconciliation.judge_invocation_record_failed`, which
-  carries `ended_error_max_turns`, when a row was lost. So the table is a
-  lower bound, and the log is the backstop.
+- **Live signals.** Grep the fused-memory journal with a bounded window:
+
+      journalctl --user -u fused-memory --since -1h --no-pager -o cat --grep 'reconciliation.judge_(turn_cap_hit|invocation_record_failed)'
+
+  The user journal is tens of GB, so widen `--since` with care; the table,
+  not the journal, is the durable record. Each WARNING's message reads
+  `reconciliation.judge_turn_cap_hit run_id=… num_turns=… max_turns=… rejected_tool_calls=… schema_salvaged=…`,
+  logged on every hit even when the row write fails, or
+  `reconciliation.judge_invocation_record_failed run_id=… ended_error_max_turns=…`,
+  logged when a row was lost. So the table is a lower bound, and the log is
+  the backstop.
 - **Next action on a hit.** Re-run
   `fused-memory/scripts/probe_schema_max_turns.py --shape judge` before
   changing `_JUDGE_CLI_MAX_TURNS`
