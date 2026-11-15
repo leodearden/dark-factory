@@ -78,12 +78,13 @@ The C2 middleware makes that quoting COUNTABLE rather than silent: it publishes
 the recovered parameter names whose delivered value still trips
 :func:`detect` on the ``markup_detected`` fact and on both policy payloads.
 
-## The consumer of :func:`repair` and :func:`detect`
+## The consumer of this module's predicates and :func:`repair`
 
 :mod:`shared.mcp_markup_middleware` (``MarkupGuardMiddleware``, contract C2)
-wires :func:`detect` and :func:`repair` at the FastMCP boundary of every server
-that registers it, as a pure boundary layer over them: it adds policy, facts
-and the storm escape, and parses nothing itself.
+consumes this module's predicates and :func:`repair` at the FastMCP boundary of
+every server that registers it, as a pure boundary layer over them: it adds
+policy, facts and the storm escape, and parses nothing itself. Which predicate
+gates there is stated once, where that module imports them.
 
 ## Sentinel-literal hazard — DO NOT "helpfully" un-escape these
 
