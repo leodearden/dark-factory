@@ -141,6 +141,7 @@ def test_legacy_blob_roundtrip_preserves_unknown_keys_and_upgrades_memory_hints(
         ('found_on_main', {'commit': 'abc123', 'note': 'found it'}),
         ('deterministic-deploy', {'pid': 4242, 'unit': 'fused-memory.service'}),
         ('deterministic-deploy-scheduled', {'unit': 'fused-memory.service'}),
+        ('deterministic-deploy-unverified', {}),
     ],
 )
 async def test_orchestrator_done_provenance_all_kinds_accepted_by_backend(
