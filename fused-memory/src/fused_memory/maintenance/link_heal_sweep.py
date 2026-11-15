@@ -60,8 +60,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class SweepSettings:
-    """What one sweep covers, which heals it may stage, and whether it asks to write.
+    """What one sweep covers, which heals it may stage, how much it may ask, and
+    whether it asks to write.
 
+    *max_adjudications* is the most pairs the run asks the adjudicator about; the
+    rest are recorded unexamined and leave the run partial, so its window holds.
     *presence_projects* always includes *projects*: they are where a parent missing
     from its child's project is looked for, so a sweep over a subset of the
     configured projects reports a parent hosted in another one instead of
@@ -73,6 +76,7 @@ class SweepSettings:
     dry_run: bool
     actions: frozenset[HealAction]
     window_hours: int
+    max_adjudications: int
     presence_projects: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -86,6 +90,11 @@ class SweepSettings:
             raise ValueError(
                 'a link-heal sweep covers at least one project: set link_heal.projects '
                 'or name one with --project',
+            )
+        if self.max_adjudications < 1:
+            raise ValueError(
+                'link_heal.max_adjudications_per_run must be at least 1, '
+                f'got {self.max_adjudications}',
             )
 
     @classmethod
@@ -103,6 +112,7 @@ class SweepSettings:
             dry_run=dry_run,
             actions=_heal_actions(config.sweep_actions),
             window_hours=config.sweep_window_hours,
+            max_adjudications=config.max_adjudications_per_run,
             presence_projects=tuple(config.projects),
         )
 
@@ -231,6 +241,7 @@ async def run_sweep(
         created_in=window,
         filer=filer if withheld is None else None,
         presence_projects=settings.presence_projects,
+        max_adjudications=settings.max_adjudications,
     )
     ledger.record_sweep_window(
         plan.run_id, window, projects=settings.projects, complete=plan.counts.complete,
