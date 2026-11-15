@@ -2133,8 +2133,6 @@ class TestStage1CycleSummaryRemediationBackstop:
 # run.stage_reports, so a run whose Stage 2 never produced a report can never
 # have a row synthesized for it (there is no Stage-2 analogue of Stage 1's
 # arm 1 raise-path synthesis).
-#
-# RED — no _ensure_stage2_cycle_summary yet.
 # ---------------------------------------------------------------------------
 
 
