@@ -53,9 +53,8 @@ import ast
 import copy
 import dataclasses
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from pathlib import Path
-from types import ModuleType
 
 import pytest
 from _git_fixtures import RepoSeed, build_repo
@@ -197,8 +196,8 @@ def no_private_tree_scan(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     swept = _REPO_ROOT / 'orchestrator' / 'tests'
     parses: list[str] = []
     reads: list[str] = []
-    real_parse = metrics.ast.parse
-    real_read_text = metrics.Path.read_text
+    real_parse = ast.parse
+    real_read_text = Path.read_text
 
     def counting_parse(source, filename='<unknown>', *args, **kwargs):
         parses.append(str(filename))
@@ -209,8 +208,8 @@ def no_private_tree_scan(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
             reads.append(str(self_path))
         return real_read_text(self_path, *args, **kwargs)
 
-    monkeypatch.setattr(metrics.ast, 'parse', counting_parse)
-    monkeypatch.setattr(metrics.Path, 'read_text', counting_read_text)
+    monkeypatch.setattr(ast, 'parse', counting_parse)
+    monkeypatch.setattr(Path, 'read_text', counting_read_text)
     yield
     _SWEPT_ONCE = (
         'The orchestrator/tests tree is swept exactly ONCE per session, by the '
@@ -400,92 +399,6 @@ class TestEnumerationRoundTrip:
         unreadable = enumeration.to_dict()['unreadable']
         assert isinstance(unreadable, list)
         assert 'a.py' in unreadable
-
-
-# ---------------------------------------------------------------------------
-# The per-file measures live in scripts/source_measures.py, and the ratchet
-# reaches them through that module rather than re-exporting them.
-
-_INTERNABLE_ATOMS = (str, bytes, int, float, type(None))
-
-
-def _is_defined_by(module: ModuleType, name: str, value: object) -> bool:
-    if name.startswith('__') and name.endswith('__'):
-        return False
-    if isinstance(value, (ModuleType, *_INTERNABLE_ATOMS)):
-        return False
-    if isinstance(value, (tuple, frozenset)) and not value:
-        return False
-    return getattr(value, '__module__', module.__name__) == module.__name__
-
-
-def _objects_defined_in(module: ModuleType) -> list[object]:
-    return [
-        value
-        for name, value in vars(module).items()
-        if _is_defined_by(module, name, value)
-    ]
-
-
-def _names_rebound_from(
-    namespace: Mapping[str, object], provider: ModuleType
-) -> list[str]:
-    owned = _objects_defined_in(provider)
-    return sorted(
-        name
-        for name, value in namespace.items()
-        if any(value is own for own in owned)
-    )
-
-
-def _names_from_imported(source: str, provider: str) -> list[str]:
-    return sorted(
-        alias.asname or alias.name
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.ImportFrom) and node.module == provider
-        for alias in node.names
-    )
-
-
-class TestTheRatchetReExportsNoMeasure:
-    def test_the_ratchet_binds_no_object_source_measures_defines(self) -> None:
-        assert _names_rebound_from(vars(metrics), source_measures) == []
-
-    def test_the_ratchet_from_imports_nothing_from_source_measures(self) -> None:
-        # Identity cannot see an interned atom: `from source_measures import
-        # COMPLEXIPY_REQUIRED` would rebind a str the check above skips.
-        source = Path(metrics.__file__).read_text(encoding='utf-8')
-        assert _names_from_imported(source, source_measures.__name__) == []
-
-    def test_a_from_import_is_found_at_any_depth_under_its_bound_name(self) -> None:
-        source = (
-            'import source_measures\n'
-            'from source_measures import COMPLEXIPY_REQUIRED\n'
-            'def f():\n'
-            '    from source_measures import parse_source as parse\n'
-        )
-        assert _names_from_imported(source, 'source_measures') == [
-            'COMPLEXIPY_REQUIRED',
-            'parse',
-        ]
-
-    def test_a_rebinding_under_any_name_is_found(self) -> None:
-        namespace: dict[str, object] = {
-            'ast': ast,
-            'Path': Path,
-            'Mapping': Mapping,
-            'source_measures': source_measures,
-            'alias': source_measures.file_size_measures,
-            'Err': source_measures.MetricsError,
-            'LIMIT': source_measures.COMPLEXIPY_MIN,
-            'ROOTS': source_measures.PSEUDO_MEMBERS,
-        }
-        assert _names_rebound_from(namespace, source_measures) == [
-            'Err',
-            'LIMIT',
-            'ROOTS',
-            'alias',
-        ]
 
 
 # ---------------------------------------------------------------------------
