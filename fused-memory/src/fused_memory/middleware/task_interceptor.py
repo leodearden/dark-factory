@@ -61,6 +61,7 @@ from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.backends.task_backend_types import (
     AmendmentAdvisory,
     MetadataLookupResult,
+    TaskFactsRow,
 )
 from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware import deferral_gate, recon_write_policy, task_text_write_guard
@@ -6208,6 +6209,13 @@ class TaskInterceptor:
         """
         tm = await self._ensure_taskmaster()
         return await tm.get_statuses_raw(project_root, tag=tag, ids=ids)
+
+    async def get_task_facts(
+        self, ids: Sequence[str], project_root: str,
+    ) -> dict[str, TaskFactsRow]:
+        """Pure read of the backend's task facts; no events, no journal entry."""
+        tm = await self._ensure_taskmaster()
+        return await tm.get_task_facts(ids, project_root)
 
     async def get_statuses_fresh(
         self,
