@@ -1914,8 +1914,9 @@ a bind change is restart-only in both processes (the orchestrator's
   the middle of other work escalates rather than renaming itself. A listed
   prefix with no entry renders as undocumented ("do not adopt it").
   Documenting a prefix here is part of widening either list. The shipped
-  schema default documents `recon-stage-`, `curator-` and `link-heal-`; a
-  YAML value replaces that map wholesale, so restate every entry. Green-tier,
+  default (`Mem0UpdateConfig.agent_prefix_sanctioned_use`) documents every
+  prefix on either default allowlist; a YAML value replaces that map
+  wholesale, so restate every entry. Green-tier,
   reloaded as one atomic leaf. This makes the norm legible, not the gate
   enforceable: `agent_id` stays self-reported, and the storm alarm below
   remains the backstop.
