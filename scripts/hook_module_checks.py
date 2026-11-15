@@ -33,6 +33,8 @@ from orchestrator.verify_cmd import (
 )
 from orchestrator.verify_evidence import module_leg_name
 from orchestrator.verify_plan import (
+    FileKind,
+    classify_file,
     derive_verify_plan,
     effective_merge_module_configs,
     executed_module_prefixes,
@@ -93,12 +95,23 @@ def _require_dependency_modules(registry: list[ModuleConfig]) -> None:
         )
 
 
+def staged_root_python(staged: list[str]) -> list[str]:
+    return [path for path in staged if '/' not in path and path.endswith('.py')]
+
+
+def types_every_module(staged: list[str], touched: frozenset[str]) -> bool:
+    # Every member's pyright also resolves repo-root modules, through `..` in its extraPaths.
+    return bool(touched & DEPENDENCY_MODULES) or any(
+        classify_file(path, None) is not FileKind.CONFTEST for path in staged_root_python(staged)
+    )
+
+
 def module_units(
     staged: list[str], registry: list[ModuleConfig], config: OrchestratorConfig,
 ) -> list[Unit]:
     _require_dependency_modules(registry)
     touched = touched_modules(staged, registry, config)
-    typed = registry if touched & DEPENDENCY_MODULES else [mc for mc in registry if mc.prefix in touched]
+    typed = registry if types_every_module(staged, touched) else [mc for mc in registry if mc.prefix in touched]
     lint = [(mc.prefix, 'lint', mc.lint_command) for mc in registry if mc.prefix in touched]
     type_ = [(mc.prefix, 'type', mc.type_check_command) for mc in typed]
     return [
@@ -106,10 +119,6 @@ def module_units(
         for prefix, leg, command in (*lint, *type_)
         if command is not None
     ]
-
-
-def staged_root_python(staged: list[str]) -> list[str]:
-    return [path for path in staged if '/' not in path and path.endswith('.py')]
 
 
 def root_units(staged: list[str]) -> list[Unit]:

@@ -237,11 +237,11 @@ fi
 # a helper failure refuses rather than skips: an empty listing must mean
 # "nothing to check", never "could not answer" (INV-11).
 #
-# At most GATE_SLOTS units run at once: a staged shared/ or escalation/ file
-# lists every module's type check, on a host whose merge verifies already
-# load it. Units are reported in listing order. An interrupt (INT, or TERM
-# sent to this hook alone) stops every running unit's whole process tree;
-# the unit logs go on any exit.
+# At most GATE_SLOTS units run at once: a staged shared/ or escalation/ file,
+# or a repo-root module other than conftest.py, lists every module's type
+# check, on a host whose merge verifies already load it. Units are reported
+# in listing order. An interrupt (INT, or TERM sent to this hook alone) stops
+# every running unit's whole process tree; the unit logs go on any exit.
 GATE_SLOTS=4
 gate_start=$SECONDS
 staged="$(cd "$ROOT" && git -c core.quotepath=false diff --cached --no-renames --name-only --diff-filter=ACMRD)" || {
