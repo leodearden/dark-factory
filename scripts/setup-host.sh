@@ -1510,8 +1510,9 @@ else
   esac
 fi
 
-# Every factory port must refuse off-loopback connects and accept on 127.0.0.1
-# (contract: plans/mcp-network-exposure-prd.md §3). The status is believed only
+# Every factory port must refuse off-loopback connects and accept on 127.0.0.1,
+# unless the report notes it [no-container]: an optional compose service with no
+# container yet (contract: plans/mcp-network-exposure-prd.md §3). The status is believed only
 # with the [network_exposure] tag; the check never exits 2 under it, so `absent`
 # is a failure here.
 _net_exposure_script="$REPO_ROOT/scripts/check_network_exposure.py"
@@ -1530,7 +1531,7 @@ else
     fail "  (status $_net_exposure_exit) — it did not run, so nothing was checked."
     ;;
   parity)
-    ok "Network exposure: every factory port refuses off-loopback connects and accepts on 127.0.0.1"
+    ok "Network exposure: no factory port is reachable off loopback; every running owner accepts on 127.0.0.1 (see the report above)"
     ;;
   absent | finding | *)
     fail "Network exposure: a factory port is reachable off loopback, unreachable on it, or unverified —"
