@@ -1,4 +1,6 @@
-"""A resumed pure gate closes at resolution time, through the production resume route (task 3638).
+"""A resumed held pure gate's runner runs at resolution time, on the production resume route.
+
+That run closes the gate or re-holds it (task 3638).
 
 Every test seeds a gate and dispatches it once, leaving it blocked behind one
 pending born-at-L2 record with both gate stamps. It then resolves a record via
@@ -139,6 +141,41 @@ async def test_resume_with_an_unfired_milestone_re_pends(det_harness: Harness) -
 
     assert await store.get_status('gate-d') == 'pending'
     assert _pending(det_harness, 'gate-d') == []
+
+
+async def test_resume_with_a_fired_milestone_closes_inline(det_harness: Harness) -> None:
+    yesterday = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    record = await _blocked_gate(
+        det_harness, 'gate-j', milestone={'mode': 'dated', 'at': yesterday},
+    )
+
+    await _resolve(det_harness, record.id)
+
+    assert await _store(det_harness).get_status('gate-j') == 'done'
+    assert _pending(det_harness, 'gate-j') == []
+
+
+async def test_resume_of_a_deferred_watch_gate_re_pends(det_harness: Harness) -> None:
+    store = _store(det_harness)
+    record = await _blocked_gate(det_harness, 'gate-k')
+    store._tasks['gate-k']['metadata']['deferred_watch'] = True
+
+    await _resolve(det_harness, record.id)
+
+    assert await store.get_status('gate-k') == 'pending'
+    assert _pending(det_harness, 'gate-k') == []
+
+
+async def test_resume_of_a_deferred_watch_gate_whose_trigger_met_closes_inline(
+    det_harness: Harness,
+) -> None:
+    store = _store(det_harness)
+    record = await _blocked_gate(det_harness, 'gate-l')
+    store._tasks['gate-l']['metadata'].update(deferred_watch=True, trigger_met=True)
+
+    await _resolve(det_harness, record.id)
+
+    assert await store.get_status('gate-l') == 'done'
 
 
 async def test_resume_with_an_external_dependency_re_pends(det_harness: Harness) -> None:

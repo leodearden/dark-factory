@@ -1,10 +1,12 @@
-"""Closes a resolved pure gate at resolution time instead of waiting for a dispatch slot.
+"""Runs a resolved held pure gate's DeterministicRunner at resolution time, not in a slot.
 
-Rationale: docs/deterministic-runner.md §3 "Resuming a pure gate" (task 3638).
+The run closes the gate or re-holds it. Rationale: docs/deterministic-runner.md
+§3 "Resuming a pure gate" (task 3638).
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -44,15 +46,23 @@ async def resume_resolved_pure_gate(
     *,
     now: datetime,
 ) -> WorkflowOutcome | None:
-    """Run *row*'s gate now; ``None`` when it is no held pure gate or dispatch would make it wait."""
+    """Run *row*'s gate now; ``None`` when it is no held pure gate or dispatch would make it wait.
+
+    The holds mirror ``orchestrator/scheduler.py::Scheduler._eligible_for_dispatch``'s
+    ``_deferred_watch_gated``, ``_milestone_time_gated`` and ``_deps_satisfied``.
+    """
     if not is_held_pure_gate(row):
         return None
     metadata = row['metadata']
-    if metadata.get('deferred_watch') or not _milestone_fired(metadata, now):
+    if _deferred_watch_holds(metadata) or not _milestone_fired(metadata, now):
         return None
     if not await _dependencies_satisfied(scheduler, row):
         return None
     return await runner.run(TaskAssignment(task_id=task_id, task=row, modules=[]))
+
+
+def _deferred_watch_holds(metadata: dict) -> bool:
+    return bool(metadata.get('deferred_watch')) and not metadata.get('trigger_met')
 
 
 def _milestone_fired(metadata: dict, now: datetime) -> bool:
@@ -69,11 +79,11 @@ def _milestone_fired(metadata: dict, now: datetime) -> bool:
 
 async def _dependencies_satisfied(scheduler: Scheduler, row: dict) -> bool:
     """``deps_verdict`` with empty caches, so an external or delivered-check dependency waits."""
-    tasks_by_id: dict[str, dict] = {}
-    for dep_id in dependency_ids(row):
-        dep = await scheduler.get_task(dep_id)
-        if dep is not None:
-            tasks_by_id[dep_id] = dep
+    dep_ids = dependency_ids(row)
+    deps = await asyncio.gather(*(scheduler.get_task(dep_id) for dep_id in dep_ids))
+    tasks_by_id = {
+        dep_id: dep for dep_id, dep in zip(dep_ids, deps, strict=True) if dep is not None
+    }
     status_map = {dep_id: str(dep.get('status')) for dep_id, dep in tasks_by_id.items()}
     return deps_verdict(
         row, status_map, tasks_by_id, external_status_cache={}, delivered_check_cache={},
