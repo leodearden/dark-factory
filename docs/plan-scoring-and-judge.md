@@ -860,8 +860,11 @@ collection, no new predicate:
 
 ```
 plan_rate     = (n_admitted - no_plan) / n_admitted
-cost_per_plan = (spend over ADMITTED plan-only cells) / (n_admitted - no_plan)
+cost_per_plan = (candidate spend over ADMITTED plan-only cells) / (n_admitted - no_plan)
 ```
+
+Candidate spend is defined in "A plan-only cell's cost is its candidate's
+spend (task 3848)" under "The composite report (task 3099)" below.
 
 | Figure | Composite row key | θ aggregate key | Rendered column |
 |---|---|---|---|
@@ -1339,6 +1342,33 @@ A no-plan cell is barred from seeding its group's floor, because it is cheap
 and fast precisely because it failed. That closes only the intra-group route.
 The cross-group route needs the composite hard gate. Both are set out in "The
 plan-production predicate (task 3302)" above.
+
+**A plan-only cell's cost is its candidate's spend (task 3848).** Every cost
+figure on a row reads `cell_admission.py::candidate_cost_usd`: both floors, the
+cost ratio, `cost_usd` and `ci95.cost`, and the `cost_per_plan` numerator. For a
+plan-only cell that is `cost_usd - judge_cost_usd`. The plan judge is a fixed
+opus / `effort='max'` OFAT pin (`judge.py::judge_plan_quality`), identical for
+every architect candidate. Folding its spend in compresses the spread the
+composite ranks on, and lets a cell written before task 3629 set a floor that
+later cells pay the judge against. Those older cells persisted
+`judge_cost_usd = 0.0` beside an architect-only `cost_usd`, so the subtraction
+measures the same thing on both vintages without a vintage marker. The latency
+axis already excluded the judge, so the two efficiency axes now agree.
+
+- The judge's spend stays on the row's `judge.cost_usd`, a SUM over every
+  trial (unmeasurable ones included); `cost_usd` is a per-trial MEAN over the
+  measured trials, so the two do not add. A plan-only row's measured spend is
+  `cost_usd × ci95.cost.n + judge.cost_usd` when no unmeasurable trial carries
+  judge spend. Compose a judge-inclusive figure, such as D11's $/usable-plan
+  (`plans/fable-architect-trial-v2-prd.md`), that way or from the cells.
+- A workflow cell keeps its completion-judge spend: that judge's verdict
+  changes the run's own course, and that path has no vintage split.
+- A plan-only `cost_source` of `mixed` still names the persisted
+  two-component sum (`metrics.py::compose_cost_source`), since nothing
+  persisted says which non-CLI source the architect component had.
+- A judge spend above the cell's `cost_usd` breaks the subset invariant
+  `metrics.py::EvalMetrics` declares, and raises a `ValueError` naming the
+  cell rather than clamping it to a free run.
 
 **One admission decision for every measured pool.** An unmeasurable plan-only
 trial (`cell_admission.py::is_unmeasurable`) leaves the plan-quality, composite,
