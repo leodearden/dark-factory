@@ -27,6 +27,7 @@ from orchestrator.startup_steps import (
     StartupStep,
     StepOutcome,
     StepStatus,
+    page_crash_loop,
     run_startup_step,
     sentinel_task_id,
 )
@@ -618,3 +619,91 @@ class TestQuarantine:
         await _run(StartupStep('2e', self._recording_body(calls)), journal, event_store, queue)
 
         assert calls == ['ran']
+
+
+def _crash_loop_pages(queue: EscalationQueue) -> list[Escalation]:
+    return queue.get_by_task('orchestrator-startup-crash-loop', status='pending', level=2)
+
+
+class TestCrashLoopPage:
+    @staticmethod
+    def _journal_over(path: Path, consecutive: int) -> StartupJournal:
+        _seed_streak(path, '2e', consecutive, exception_type='SystemExit', message='boom')
+        return StartupJournal.load(path)
+
+    def test_a_streak_at_the_threshold_files_one_born_at_l2_critical(
+        self, journal_path, queue,
+    ) -> None:
+        journal = self._journal_over(journal_path, CRASH_LOOP_THRESHOLD)
+
+        page_crash_loop(journal, queue, filing_claimant_run_id=CLAIMANT)
+
+        [page] = _crash_loop_pages(queue)
+        assert page.level == 2
+        assert page.severity == 'critical'
+        assert page.category == 'infra_issue'
+        assert page.agent_role.startswith('orchestrator-')
+        assert '2e' in page.summary
+        assert 'SystemExit' in page.summary
+        assert f'"consecutive": {CRASH_LOOP_THRESHOLD}' in page.detail
+        assert _LONG_AGO.strftime('%Y-%m-%dT%H:%M:%S') in page.detail
+        assert page.filing_claimant_run_id == CLAIMANT
+
+    def test_a_second_call_in_the_same_start_files_nothing_more(self, journal_path, queue) -> None:
+        journal = self._journal_over(journal_path, CRASH_LOOP_THRESHOLD)
+
+        page_crash_loop(journal, queue, filing_claimant_run_id=CLAIMANT)
+        page_crash_loop(journal, queue, filing_claimant_run_id=CLAIMANT)
+
+        [page] = _crash_loop_pages(queue)
+        assert page.dedupe_count == 0
+
+    def test_the_next_start_refreshes_the_same_page(self, journal_path, queue) -> None:
+        page_crash_loop(
+            self._journal_over(journal_path, CRASH_LOOP_THRESHOLD), queue,
+            filing_claimant_run_id=CLAIMANT,
+        )
+        [filed] = _crash_loop_pages(queue)
+
+        page_crash_loop(
+            StartupJournal.load(journal_path), queue, filing_claimant_run_id=CLAIMANT,
+        )
+
+        [refreshed] = _crash_loop_pages(queue)
+        assert refreshed.id == filed.id
+        assert refreshed.dedupe_count == 1
+
+    def test_a_streak_below_the_threshold_files_nothing(self, journal_path, queue) -> None:
+        page_crash_loop(
+            self._journal_over(journal_path, CRASH_LOOP_THRESHOLD - 1), queue,
+            filing_claimant_run_id=CLAIMANT,
+        )
+
+        assert queue.get_pending() == []
+
+    def test_no_streak_files_nothing(self, journal, queue) -> None:
+        page_crash_loop(journal, queue, filing_claimant_run_id=CLAIMANT)
+
+        assert queue.get_pending() == []
+
+    def test_no_queue_files_nothing_and_does_not_raise(self, journal_path, queue) -> None:
+        page_crash_loop(
+            self._journal_over(journal_path, CRASH_LOOP_THRESHOLD), None,
+            filing_claimant_run_id=CLAIMANT,
+        )
+
+        assert queue.get_pending() == []
+
+    def test_a_filing_fault_warns_and_does_not_raise(self, tmp_path, journal_path, caplog) -> None:
+        journal = self._journal_over(journal_path, CRASH_LOOP_THRESHOLD)
+
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            page_crash_loop(
+                journal, _SubmitFailsQueue(tmp_path / 'escalations'),
+                filing_claimant_run_id=CLAIMANT,
+            )
+
+        assert any(
+            r.levelno == logging.WARNING and r.name == LOGGER_NAME and r.exc_info is not None
+            for r in caplog.records
+        )
