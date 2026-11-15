@@ -299,6 +299,11 @@ FINDING_KEY_FIELD = 'x_inv12_finding'
 OWNS_NOTE_FIELD = 'x_inv12_owns'
 """Task metadata field carrying the pointer note on a live cited owner."""
 
+CONVERTED_FROM_FIELD = 'escalation_id'
+"""Task metadata field naming the escalation a task was converted from, written by
+``orchestrator/src/orchestrator/escalation_router.py::_submit_arguments`` and by
+the L1 watcher's conversion."""
+
 
 class FindingKind(enum.StrEnum):
     DEAD_OWNER = 'dead_owner'
@@ -445,19 +450,50 @@ def _carriers(ports: Ports, field: str) -> tuple[liveness.TaskRow, ...]:
     return _from_store(ports.db, lambda: liveness.read_tasks_carrying(ports.db, field))
 
 
-def pending_escalation_ids(escalation: ToolCall) -> frozenset[str]:
-    """The ``task_id`` of every pending escalation: one ``get_pending_escalations`` call."""
-    answer = _call(escalation, FailureStage.ESCALATION, 'get_pending_escalations', {'compact': True})
+@dataclass(frozen=True)
+class _StoreHomes:
+    """The store rows that can answer a finding: key carriers, and tasks converted from an escalation."""
+
+    carriers: tuple[liveness.TaskRow, ...]
+    conversions: tuple[liveness.TaskRow, ...]
+
+
+def _store_homes(ports: Ports) -> _StoreHomes:
+    return _StoreHomes(_carriers(ports, FINDING_KEY_FIELD), _carriers(ports, CONVERTED_FROM_FIELD))
+
+
+def _converted_from(rows: Sequence[liveness.TaskRow], ids: frozenset[str]) -> tuple[liveness.TaskRow, ...]:
+    """The *rows* converted from an escalation *ids* names, matched exactly."""
+    return tuple(
+        row for row in rows if isinstance(source := row.metadata.get(CONVERTED_FROM_FIELD), str) and source in ids
+    )
+
+
+def _result_strings(answer: Mapping[str, object], tool: str, field: str) -> frozenset[str]:
+    """Every record's str *field* in an escalation read's ``{'result': [...]}`` answer."""
     records = answer.get('result')
     if not isinstance(records, list):
-        raise SweepFailure(
-            FailureStage.ESCALATION, f'get_pending_escalations answered {answer!r}, not a result list'
-        )
+        raise SweepFailure(FailureStage.ESCALATION, f'{tool} answered {answer!r}, not a result list')
     return frozenset(
-        record['task_id']
-        for record in records
-        if isinstance(record, dict) and isinstance(record.get('task_id'), str)
+        record[field] for record in records if isinstance(record, dict) and isinstance(record.get(field), str)
     )
+
+
+def pending_escalation_ids(escalation: ToolCall) -> frozenset[str]:
+    """The ``task_id`` of every pending escalation: one ``get_pending_escalations`` call."""
+    tool = 'get_pending_escalations'
+    answer = _call(escalation, FailureStage.ESCALATION, tool, {'compact': True})
+    return _result_strings(answer, tool, 'task_id')
+
+
+def escalation_ids_filed_under(escalation: ToolCall, key: FindingKey) -> frozenset[str]:
+    """The id of every escalation ever filed in *key*'s ``task_id`` slot, at any level or status.
+
+    One archive-inclusive ``get_task_escalations`` call; the ids are compared, never parsed.
+    """
+    tool = 'get_task_escalations'
+    args: dict[str, object] = {'task_id': key.escalation_task_id(), 'compact': True}
+    return _result_strings(_call(escalation, FailureStage.ESCALATION, tool, args), tool, 'id')
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +524,7 @@ class Action(enum.Enum):
 
     SKIP_LIVE_TASK = 'skip_live_task'
     SKIP_PENDING_ESCALATION = 'skip_pending_escalation'
+    SKIP_CONVERTED_TASK = 'skip_converted_task'
     ESCALATE_CLOSED_FINDING = 'escalate_closed_finding'
     FILE_TASK = 'file_task'
     FILE_ESCALATION = 'file_escalation'
@@ -497,19 +534,37 @@ class Action(enum.Enum):
         return f'planned {self.value}'
 
 
-_SKIPS = frozenset({Action.SKIP_LIVE_TASK, Action.SKIP_PENDING_ESCALATION})
+_SKIPS = frozenset({Action.SKIP_LIVE_TASK, Action.SKIP_PENDING_ESCALATION, Action.SKIP_CONVERTED_TASK})
+
+
+def _any_open(rows: Sequence[liveness.TaskRow]) -> bool:
+    return any(row.liveness() is OwnerLiveness.OPEN for row in rows)
 
 
 def decide(
-    key: FindingKey, *, carriers: Sequence[liveness.TaskRow], pending: frozenset[str]
+    key: FindingKey,
+    *,
+    carriers: Sequence[liveness.TaskRow],
+    pending: frozenset[str],
+    converted: Sequence[liveness.TaskRow],
 ) -> Action:
-    """What to do about *key*, given the tasks carrying a finding key and the pending escalations."""
+    """What to do about *key*: nothing where it is already raised, else raise it once.
+
+    A finding is already raised in three places: a live task among *carriers*
+    holding its key; a pending escalation in its ``task_id`` slot; and a live
+    task among *converted*, the tasks converted from any escalation ever filed
+    in that slot (every sweep escalation is an info L0 the router converts).
+    A dead-owner finding whose home of either kind has closed escalates, and
+    is never re-filed.
+    """
     mine = [row for row in carriers if FindingKey.from_record(row.metadata.get(FINDING_KEY_FIELD)) == key]
-    if any(row.liveness() is OwnerLiveness.OPEN for row in mine):
+    if _any_open(mine):
         return Action.SKIP_LIVE_TASK
     if key.escalation_task_id() in pending:
         return Action.SKIP_PENDING_ESCALATION
-    if mine and key.kind.escalates_when_closed:
+    if _any_open(converted):
+        return Action.SKIP_CONVERTED_TASK
+    if (mine or converted) and key.kind.escalates_when_closed:
         return Action.ESCALATE_CLOSED_FINDING
     if key.scope in (None, INLINE_SCOPE):
         return Action.FILE_TASK
@@ -820,21 +875,31 @@ class _Outputs:
         self.reports: list[Report] = []
         self.tighten: Performed | None = None
         self.rolled_up = False
-        self._carriers: tuple[liveness.TaskRow, ...] | None = None
+        self._homes: _StoreHomes | None = None
+        self._filed_under: dict[FindingKey, frozenset[str]] = {}
 
     def tally(self) -> Tally:
         return Tally(tuple(self.reports), self.tighten, self.rolled_up)
 
     def _decide(self, key: FindingKey, *, reread: bool) -> Action:
-        if reread or self._carriers is None:
-            self._carriers = _carriers(self.ports, FINDING_KEY_FIELD)
-        return decide(key, carriers=self._carriers, pending=frozenset(self.pending))
+        if reread or self._homes is None:
+            self._homes = _store_homes(self.ports)
+        if key not in self._filed_under:
+            self._filed_under[key] = escalation_ids_filed_under(self.ports.escalation, key)
+        return decide(
+            key,
+            carriers=self._homes.carriers,
+            pending=frozenset(self.pending),
+            converted=_converted_from(self._homes.conversions, self._filed_under[key]),
+        )
 
     def raise_finding(self, key: FindingKey, body: _Body) -> Performed:
         """Perform at most one budgeted output for *key*, returning the step taken.
 
-        The carriers are re-read only where an output can follow (INV-3), so a
-        finding that ends skipped or held back costs no further store scan.
+        The store homes are re-read only where an output can follow (INV-3), so
+        a finding that ends skipped or held back costs no further store scan.
+        A key's escalation history is read once per run: the only escalation
+        the run can add to it is its own, which ``pending`` already holds.
         """
         if self._decide(key, reread=False) in _SKIPS:
             return Performed.SKIPPED_EXISTING
@@ -974,10 +1039,16 @@ class RunConfig:
 
 def plan(scan: Scan, ports: Ports) -> Tally:
     """Each citation's planned step as of *scan*, ignoring the output bound; reads only."""
-    carriers = _carriers(ports, FINDING_KEY_FIELD)
+    homes = _store_homes(ports)
 
     def planned(key: FindingKey) -> Action:
-        return decide(key, carriers=carriers, pending=scan.pending)
+        filed = escalation_ids_filed_under(ports.escalation, key)
+        return decide(
+            key,
+            carriers=homes.carriers,
+            pending=scan.pending,
+            converted=_converted_from(homes.conversions, filed),
+        )
 
     reports = []
     for citation in scan.register.citations:
