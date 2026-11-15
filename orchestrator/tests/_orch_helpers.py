@@ -211,10 +211,10 @@ UNDER_LOAD_HEADROOM_FACTOR = 8
 # runs tighter than a bare local `pytest` -- and a slow test's marker must
 # clear the one that gates its merge.
 #
-# A LITERAL: marks read it at import, and
-# _sanctioned_timeout_names.py::SANCTIONED_TIMEOUT_NAMES and
-# TestSanctionedNameMirrors resolve it only through literal arithmetic.
-# Held to the yaml by
+# A LITERAL: marks read it at import,
+# _sanctioned_timeout_names.py::SANCTIONED_TIMEOUT_NAMES imports it, and
+# test_timeout_marker_inversion_guard.py::TestSanctionedNameMirrors re-derives
+# it from this line through literal arithmetic only.  Held to the yaml by
 # test_timeout_marker_inversion_guard.py::TestVerifyCliBudgetConstant, whose
 # docstring records why that pin is deliberately loud on a retune.
 VERIFY_CLI_PER_TEST_TIMEOUT = 300

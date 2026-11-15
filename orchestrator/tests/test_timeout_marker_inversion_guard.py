@@ -120,8 +120,8 @@ _MIN_DEEP_GATE_MARKER_SITES = 8
 # failures this closes.
 # ---------------------------------------------------------------------------
 
-#: Numbers a sanctioned constant's definition may be written in terms of.  All
-#: four real definitions are literals or literal arithmetic over _orch_helpers'
+#: Numbers a sanctioned constant's definition may be written in terms of.  Every
+#: real definition is a literal or literal arithmetic over _orch_helpers'
 #: own numeric globals, so ONE namespace resolves every case with no test module
 #: imported.
 #: Importing one for a constant would be a bad trade: test modules run code at
@@ -130,7 +130,7 @@ _MIN_DEEP_GATE_MARKER_SITES = 8
 #:
 #: STATED LIMIT: a definition written over a FILE-LOCAL name that shadows an
 #: _orch_helpers global of the same spelling would resolve against the wrong
-#: one.  No such shadow exists (all four definitions were read and resolved),
+#: one.  No such shadow exists (every definition was read and resolved),
 #: and the check is a floor, not a proof -- so this is recorded rather than
 #: engineered around.
 _MIRROR_NAMESPACE: Mapping[str, float] = {
@@ -160,7 +160,7 @@ def _binding_value(node: ast.expr, namespace: Mapping[str, float]) -> float | No
     """*node*'s value, if it is literal arithmetic over *namespace*'s numbers.
 
     Deliberately tiny: numeric literals, names from *namespace*, and ``+ - *``
-    over them is the entire grammar the four real definitions use.  ``bool`` is
+    over them is the entire grammar the real definitions use.  ``bool`` is
     excluded from the literal case for the same reason
     ``shared.testing_timeout_markers.timeout_marker_sites`` excludes it.  Anything else -- a call, an attribute, a name this namespace
     does not carry -- yields None.
@@ -307,7 +307,7 @@ class TestSanctionedNameMirrors:
 
     THE EXECUTABLE LINK the mirror map would otherwise lack -- the same shape
     :class:`TestVerifyCliBudgetConstant` applies to the YAML, one anchor over.
-    Without it the map is an unchecked claim about four constants defined
+    Without it the map is an unchecked claim about constants defined
     elsewhere, and a wrong entry that reads too HIGH is silent: it resolves a
     marker to a safe number while the real constant sits inside the band, so
     the sweep stays green over a live inversion.
