@@ -1634,6 +1634,7 @@
     "orchestrator/tests/test_seed_lane_lock_reentrancy.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_session_resume_integration_gate.py": {"patch_targets": [], "private_reads": 114},
     "orchestrator/tests/test_spec_lane_reacquire.py": {"patch_targets": [], "private_reads": 0},
+    "orchestrator/tests/test_startup_crash_loop_breaker.py": {"patch_targets": [], "private_reads": 5},
     "orchestrator/tests/test_stranded_verified_green.py": {"patch_targets": [], "private_reads": 59},
     "orchestrator/tests/test_substrate_gate.py": {"patch_targets": [], "private_reads": 37},
     "orchestrator/tests/test_suffix_conflict_tracker.py": {"patch_targets": [], "private_reads": 0},
