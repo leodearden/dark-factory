@@ -201,7 +201,7 @@ class TestCompareMergedBaselineFiles:
     stale value re-absorbs the other side's lowering. The bound is what git does
     to the file text, applied per measure against the merge base: a measure one
     side moved stands at that side's value, up or down, and one both sides moved
-    is bounded by scripts/merge_lane_metrics.py::_both_moved_bound.
+    is bounded by scripts/merge_lane_ratchet.py::_both_moved_bound.
 
     The seed's numbers: a.py cognitive 120, b.py cognitive 30, total:cognitive 150.
     """

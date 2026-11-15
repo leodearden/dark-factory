@@ -333,7 +333,7 @@ only_mutate = [
 do_not_mutate_patterns = ['^\s*logger\.(debug|info|warning|error|exception|critical)\(']
 # mutmut maps tests to the functions they reach in-process, so xdist is off.
 pytest_add_cli_args = ["-n", "0", "-p", "no:cacheprovider"]
-# The lane-importing test files (scripts/merge_lane_metrics.py::
+# The lane-importing test files (scripts/merge_lane_cluster.py::
 # imports_lane_module) that execute at least one function of gates.py or
 # types.py: a snapshot, re-derived as the baseline report's Method describes.
 pytest_add_cli_args_test_selection = [

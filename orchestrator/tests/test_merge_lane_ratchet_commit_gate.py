@@ -795,7 +795,7 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
     files at all. Against HEAD alone each read as new; against either parent,
     keeping one side's stale value would re-absorb the other side's lowering.
     The bound is git's own rule per measure, as
-    scripts/merge_lane_metrics.py::compare_merged_baseline_files defines it.
+    scripts/merge_lane_ratchet.py::compare_merged_baseline_files defines it.
     Only entries the merge ITSELF appends cover anything above it.
     """
 
