@@ -6,6 +6,7 @@ import logging
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from types import UnionType
 from typing import Protocol
 
 from shared.task_statuses import TERMINAL, TaskStatus
@@ -111,8 +112,9 @@ async def read_task_facts(
 ) -> dict[TaskRef, TaskFacts]:
     """Facts for every ref in *refs*, from one read per registered project.
 
-    ``reader=None`` means no task store is configured. A project's failure
-    is contained to that project's refs, as ``COULD_NOT_CHECK``.
+    ``reader=None`` means no task store is configured. A project's failed
+    read is contained to that project's refs, and a row that is not a
+    ``TaskFactsRow`` to its own ref, as ``COULD_NOT_CHECK``.
     """
     refs_by_project: dict[str, dict[TaskRef, None]] = {}
     for ref in refs:
@@ -154,15 +156,46 @@ def _could_not_check_all(refs: Iterable[TaskRef], reason: str) -> dict[TaskRef, 
 def _facts_from_row(ref: TaskRef, row: TaskFactsRow | None) -> TaskFacts:
     if row is None:
         return TaskFacts.no_such_task(ref)
-    status = row.get('status') if isinstance(row, Mapping) else None
-    if not isinstance(status, str):
-        return TaskFacts.could_not_check(ref, 'task store returned no usable status')
+    defect = _row_defect(row)
+    if defect is not None:
+        return TaskFacts.could_not_check(ref, f'task store returned a malformed row: {defect}')
+    status = row['status']
     done = status == TaskStatus.DONE
     return TaskFacts.found(
-        ref, status=status, title=row.get('title'),
-        waits_on=() if status in TERMINAL else _waits_on(ref.project_id, row.get('dependencies', ())),
-        finished_how=row.get('done_provenance_kind') if done else None,
-        finished_commit=row.get('done_provenance_commit') if done else None,
+        ref, status=status, title=row['title'],
+        waits_on=() if status in TERMINAL else _waits_on(ref.project_id, row['dependencies']),
+        finished_how=row['done_provenance_kind'] if done else None,
+        finished_commit=row['done_provenance_commit'] if done else None,
+    )
+
+
+_ROW_FIELDS: Mapping[str, type | UnionType] = {
+    'status': str,
+    'title': str,
+    'dependencies': list,
+    'done_provenance_kind': str | None,
+    'done_provenance_commit': str | None,
+}
+
+
+def _row_defect(row: object) -> str | None:
+    """What keeps *row* from being a ``TaskFactsRow``, or ``None`` when nothing does."""
+    if not isinstance(row, Mapping):
+        return f'a {type(row).__name__}, not a mapping'
+    for key, expected in _ROW_FIELDS.items():
+        if key not in row:
+            return f'no {key!r}'
+        if not isinstance(row[key], expected):
+            return f'{key} is {row[key]!r}'
+    bad = [dep for dep in row['dependencies'] if not _is_dependency_fact(dep)]
+    return f'dependencies {bad!r} are not {{id, status}} facts' if bad else None
+
+
+def _is_dependency_fact(dep: object) -> bool:
+    return (
+        isinstance(dep, Mapping)
+        and isinstance(dep.get('id'), str) and dep['id'] != ''
+        and 'status' in dep and isinstance(dep['status'], str | None)
     )
 
 

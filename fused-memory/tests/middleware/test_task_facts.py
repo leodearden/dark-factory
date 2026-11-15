@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -293,18 +294,55 @@ async def test_a_non_mapping_reply_could_not_check_that_project(store: Store):
     assert facts[beta].lookup is Lookup.FOUND
 
 
+def _sound_row(**overrides: object) -> dict[str, object]:
+    return task_facts_rows({'7': 'pending'})['7'] | overrides
+
+
+def _without(key: str) -> dict[str, object]:
+    row = _sound_row()
+    del row[key]
+    return row
+
+
 @pytest.mark.asyncio
-async def test_a_row_without_a_str_status_could_not_check_that_ref_only(store: Store):
+@pytest.mark.parametrize(
+    ('row', 'defect'),
+    [
+        pytest.param(task_facts_rows({'7': None})['7'], 'status is None', id='status-none'),
+        pytest.param(_sound_row(status=7), 'status is 7', id='status-not-a-str'),
+        pytest.param(_sound_row(title=None), 'title is None', id='title-none'),
+        pytest.param(_without('done_provenance_kind'), "no 'done_provenance_kind'",
+                     id='provenance-key-missing'),
+        pytest.param(_sound_row(done_provenance_commit=12345), 'done_provenance_commit is 12345',
+                     id='provenance-not-a-str'),
+        pytest.param(_sound_row(dependencies=None), 'dependencies is None', id='dependencies-none'),
+        pytest.param(_sound_row(dependencies=[{'id': '', 'status': 'pending'}]),
+                     "dependencies [{'id': '', 'status': 'pending'}]", id='dependency-id-empty'),
+        pytest.param(_sound_row(dependencies=[{'id': 3, 'status': 'pending'}]),
+                     "dependencies [{'id': 3, 'status': 'pending'}]", id='dependency-id-not-a-str'),
+        pytest.param(_sound_row(dependencies=[{'id': '3'}]), "dependencies [{'id': '3'}]",
+                     id='dependency-without-status'),
+        pytest.param(_sound_row(dependencies=['3']), "dependencies ['3']", id='dependency-not-a-mapping'),
+        pytest.param(['pending'], 'a list, not a mapping', id='row-not-a-mapping'),
+    ],
+)
+async def test_a_malformed_row_could_not_check_that_ref_only(store: Store, row: object, defect: str):
     broken, sound = TaskRef(ALPHA, '7'), TaskRef(ALPHA, '8')
-    reader = RecordingReader(scripted={
-        store.known_projects[ALPHA]: task_facts_rows({'7': None, '8': 'pending'}),
-    })
+    beta = await store.add(BETA, 'Beta task')
+    reader = RecordingReader(
+        delegate=store.interceptor,
+        scripted={store.known_projects[ALPHA]: {'7': row} | task_facts_rows({'8': 'pending'})},
+    )
 
-    facts = await store.read([broken, sound], reader=reader)
+    facts = await store.read([broken, sound, beta], reader=reader)
 
+    reason = facts[broken].reason
     assert facts[broken].lookup is Lookup.COULD_NOT_CHECK
-    assert facts[broken].reason == 'task store returned no usable status'
+    assert reason is not None
+    assert reason.startswith('task store returned a malformed row: ')
+    assert defect in reason
     assert facts[sound] == _found(sound, 'pending', 'Task 8')
+    assert facts[beta] == _found(beta, 'pending', 'Beta task')
 
 
 # ── 9. An unconfigured interceptor ─────────────────────────────────────
@@ -336,22 +374,36 @@ def test_a_task_ref_refuses_an_empty_field(project_id: str, task_id: str, field_
 
 
 @pytest.mark.parametrize(
-    'fields',
+    ('fields', 'invariant', 'offending'),
     [
-        pytest.param({'lookup': Lookup.COULD_NOT_CHECK, 'reason': None}, id='could-not-check-without-reason'),
-        pytest.param({'lookup': Lookup.FOUND, 'status': None}, id='found-without-status'),
-        pytest.param({'lookup': Lookup.FOUND, 'status': 'done', 'reason': 'x'}, id='found-with-reason'),
-        pytest.param({'lookup': Lookup.NO_SUCH_TASK, 'title': 'T'}, id='no-such-task-with-title'),
+        pytest.param({'lookup': Lookup.COULD_NOT_CHECK, 'reason': None},
+                     'reason is set iff COULD_NOT_CHECK', 'lookup=could_not_check, reason=None',
+                     id='could-not-check-without-reason'),
+        pytest.param({'lookup': Lookup.FOUND, 'status': None},
+                     'status is set iff FOUND', 'lookup=found, status=None', id='found-without-status'),
+        pytest.param({'lookup': Lookup.FOUND, 'status': 'done', 'reason': 'x'},
+                     'reason is set iff COULD_NOT_CHECK', "lookup=found, reason='x'", id='found-with-reason'),
+        pytest.param({'lookup': Lookup.NO_SUCH_TASK, 'title': 'T'},
+                     'a no_such_task entry has no title, waits_on or finished_*', "title='T'",
+                     id='no-such-task-with-title'),
         pytest.param({'lookup': Lookup.FOUND, 'status': 'pending', 'finished_how': 'merged'},
-                     id='finished-how-on-a-pending-task'),
+                     'finished_* are None unless status is done',
+                     "status='pending', finished=('merged', None)", id='finished-how-on-a-pending-task'),
         pytest.param({'lookup': Lookup.FOUND, 'status': 'done',
-                      'waits_on': ((TaskRef('p', '2'), 'pending'),)}, id='terminal-task-waiting'),
+                      'waits_on': ((TaskRef('p', '2'), 'pending'),)},
+                     'waits_on is () for a terminal status',
+                     "status='done', waits_on=((TaskRef(project_id='p', task_id='2'), 'pending'),)",
+                     id='terminal-task-waiting'),
     ],
 )
-def test_task_facts_refuses_a_broken_lookup_invariant(fields: Mapping[str, Any]):
+def test_task_facts_refuses_a_broken_lookup_invariant(
+    fields: Mapping[str, Any], invariant: str, offending: str,
+):
     base: dict[str, Any] = {
         'ref': TaskRef('p', '1'), 'lookup': Lookup.NO_SUCH_TASK, 'reason': None, 'status': None,
         'title': None, 'waits_on': (), 'finished_how': None, 'finished_commit': None,
     }
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=re.escape(invariant)) as refused:
         TaskFacts(**(base | dict(fields)))
+    assert offending in str(refused.value)
+    assert "TaskRef(project_id='p', task_id='1')" in str(refused.value)
