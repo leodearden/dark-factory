@@ -402,6 +402,11 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)  # type: ignore[arg-type]
 
 
+def _deploy_done_kind(target_unit: str | None) -> str:
+    """A deploy's done kind: with no target_unit there was no unit to verify."""
+    return 'deterministic-deploy' if target_unit else 'deterministic-deploy-unverified'
+
+
 def _cite_gate_escalation_id(own_records: list, gate_category: str) -> str | None:
     """Pick the escalation a `deterministic-gate` close should CITE.
 
@@ -1864,7 +1869,7 @@ class DeterministicRunner:
                     task_id,
                     'done',
                     done_provenance=_build_done_provenance(
-                        'deterministic-deploy',
+                        _deploy_done_kind(target_unit),
                         pid=pid,
                         active_enter_timestamp=active_enter_timestamp,
                         unit=target_unit,
@@ -3114,7 +3119,7 @@ class DeterministicRunner:
                         task_id,
                         'done',
                         done_provenance=_build_done_provenance(
-                            'deterministic-deploy',
+                            _deploy_done_kind(_ata_unit),
                             unit=_ata_unit,
                             note='resumed after gate resolution',
                         ),
@@ -3287,7 +3292,7 @@ class DeterministicRunner:
                         task_id,
                         'done',
                         done_provenance=_build_done_provenance(
-                            'deterministic-deploy',
+                            _deploy_done_kind(target_unit),
                             pid=metadata.get('before_done_verified_pid'),
                             note='resumed after verified deploy (crash before done write)',
                             unit=target_unit,
@@ -3399,7 +3404,7 @@ class DeterministicRunner:
                         task_id,
                         'done',
                         done_provenance=_build_done_provenance(
-                            'deterministic-deploy',
+                            _deploy_done_kind(target_unit),
                             note='resumed after human resolution',
                             unit=target_unit,
                         ),
@@ -3775,7 +3780,8 @@ class DeterministicRunner:
                     # a byte-for-byte copy of that helper's run + timeout-
                     # translate + escalate ladder, which could silently drift
                     # from the helper over time — routing through the helper
-                    # makes that impossible).
+                    # makes that impossible). Its done kind comes from
+                    # _deploy_done_kind.
                     no_target_note = (
                         'No target_unit is set — the deploy is driven on the '
                         'script exit code alone (task 2632 / esc-2585-1).'

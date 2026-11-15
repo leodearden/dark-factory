@@ -361,6 +361,7 @@ _DONE_PROVENANCE_RULES: Mapping[str, _KindRules] = MappingProxyType(
         'deterministic-deploy-scheduled': _KindRules(
             evidence=('unit', 'transient_unit', 'fire_delay_secs'),
         ),
+        'deterministic-deploy-unverified': _KindRules(),
         'deterministic-milestone': _KindRules(),
     }
 )
@@ -424,6 +425,7 @@ class DoneProvenance(BaseModel):
         'found_on_main',
         'deterministic-deploy',
         'deterministic-deploy-scheduled',
+        'deterministic-deploy-unverified',
         'deterministic-gate',
         'deterministic-milestone',
         'operational-verified',
