@@ -1879,7 +1879,11 @@ async def _build_task_backend(taskmaster_config, task_metadata_config):
 
 
 def resolve_data_dir(config: FusedMemoryConfig) -> Path:
-    """The absolute directory every server-side store lives in: ``reconciliation.data_dir`` when reconciliation is configured, else ``<checkout>/data``."""
+    """The server's absolute reconciliation data dir: ``reconciliation.data_dir`` when reconciliation is configured, else ``<checkout>/data``.
+
+    It holds the reconciliation-family stores: journal, ledger, event buffer,
+    tickets, curator and report state, write journal and topic clusters.
+    """
     return Path(anchor_at_checkout(config.reconciliation.data_dir if config.reconciliation else 'data'))
 
 

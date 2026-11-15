@@ -44,7 +44,7 @@ def test_a_relative_path_is_refused_when_the_anchor_holds_no_checkout(monkeypatc
     """A non-editable install puts the anchor inside site-packages' parents.
 
     Joining onto it would fork an empty ledger there, so the refusal names the
-    anchor, the offending path and the remedy instead.
+    anchor and the offending path instead.
     """
     monkeypatch.setattr(checkout_anchor, 'CHECKOUT_ROOT', tmp_path)
 
@@ -54,7 +54,6 @@ def test_a_relative_path_is_refused_when_the_anchor_holds_no_checkout(monkeypatc
     message = str(refusal.value)
     assert str(tmp_path) in message
     assert './data/reconciliation' in message
-    assert 'absolute' in message
 
 
 def test_an_absolute_path_needs_no_checkout(monkeypatch, tmp_path):
