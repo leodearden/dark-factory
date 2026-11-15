@@ -98,9 +98,12 @@ def test_every_committed_timer_is_declared_expected_or_armed_elsewhere() -> None
     assert not expected & elsewhere, f'declared both expected and armed elsewhere: {sorted(expected & elsewhere)}'
 
 
-def test_no_timer_is_declared_twice() -> None:
-    unit_files = [timer.unit_file for timer in EXPECTED_TIMERS]
-    assert len(unit_files) == len(set(unit_files)), sorted(f for f in unit_files if unit_files.count(f) > 1)
+def test_no_two_declared_timers_share_a_unit_name() -> None:
+    """systemd knows a unit by its basename alone, so two timers sharing one would overwrite each other."""
+    declared = [timer.unit_file for timer in EXPECTED_TIMERS] + list(ARMED_ELSEWHERE)
+    unit_names = [Path(unit_file).name for unit_file in declared]
+    clashes = sorted(f for f in declared if unit_names.count(Path(f).name) > 1)
+    assert not clashes, f'declared timers sharing a unit name: {clashes}'
 
 
 @pytest.mark.parametrize('timer', EXPECTED_TIMERS, ids=lambda timer: timer.unit_file)

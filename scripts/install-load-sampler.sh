@@ -15,10 +15,10 @@
 # The unit files live in dashboard/, not scripts/ -- which is the only way
 # this installer differs in shape from its siblings.
 #
-# DELIBERATELY NOT scripts/setup-host.sh. That script re-renders EVERY unit on
-# the host and is the known clobber hazard; this one touches exactly the two
-# units it owns. setup-host.sh §7b does invoke this installer, but only when
-# scripts/user_timers.py reports the sampler unarmed. Task δ-prime is the
+# Deliberately not part of setup-host.sh's re-render-every-unit pass (the
+# known clobber hazard): this installer touches exactly the two units it owns,
+# and setup-host.sh §7b invokes it only when scripts/user_timers.py reports
+# the sampler unarmed. Task δ-prime is the
 # deterministic deploy that runs this script; ε1/ε2 are the calibration gates
 # that follow it.
 #
