@@ -937,9 +937,10 @@ class TestPeriodAndCli:
         monkeypatch.setenv(RUN_STAMP_ENV_VAR, stamp)
         opened: list[Any] = []
 
-        async def open_fake_memory(config: Any) -> FakeMemory:
+        @contextlib.asynccontextmanager
+        async def open_fake_memory(config: Any) -> AsyncIterator[FakeMemory]:
             opened.append(config)
-            return FakeMemory(contents={})
+            yield FakeMemory(contents={})
 
         missing = tmp_path / 'absent' / 'write_journal.db'
         root = tmp_path / 'evals'
@@ -958,8 +959,12 @@ class TestPeriodAndCli:
         stamp = _stamp_an_hour_from_now()
         monkeypatch.setenv(RUN_STAMP_ENV_VAR, stamp)
 
-        async def open_fake_memory(config: Any) -> FakeMemory:
-            return memory
+        exited: list[bool] = []
+
+        @contextlib.asynccontextmanager
+        async def open_fake_memory(config: Any) -> AsyncIterator[FakeMemory]:
+            yield memory
+            exited.append(True)
 
         root = tmp_path / 'evals'
 
@@ -971,7 +976,7 @@ class TestPeriodAndCli:
         series = load_metric_series(root / EVAL_ID / f'metrics-{stamp}.json')
         assert [(metric.metric_id, metric.n) for metric in series.metrics] == [('write-after-miss', 2)]
         assert memory.write_calls == []
-        assert memory.closed is True
+        assert exited == [True]
 
 
 class _InitRecordingService:
@@ -994,13 +999,25 @@ class _InitRecordingService:
         self.calls.append('close')
 
 
+_SERVICE_CLASS = 'fused_memory.services.memory_service.MemoryService'
+
+
 class TestTheLiveFactoryOpensForReadsOnly:
-    def test_it_never_starts_the_durable_queue_or_graphiti_maintenance(self):
-        memory = asyncio.run(_mod().open_memory(SimpleNamespace(), service=_InitRecordingService))
+    def test_it_never_starts_the_durable_queue_or_graphiti_maintenance(self, monkeypatch):
+        monkeypatch.setattr(_SERVICE_CLASS, _InitRecordingService)
+        calls_inside: list[list[str]] = []
 
-        assert memory.calls == ['initialize_for_reads']
+        async def open_then_leave() -> _InitRecordingService:
+            async with _mod().open_memory(SimpleNamespace()) as memory:
+                calls_inside.append(list(memory.calls))
+            return memory
 
-    def test_an_unopenable_store_closes_the_service_and_raises_a_named_error(self):
+        memory = asyncio.run(open_then_leave())
+
+        assert calls_inside == [['initialize_for_reads']]
+        assert memory.calls == ['initialize_for_reads', 'close']
+
+    def test_an_unopenable_store_closes_the_service_and_raises_a_named_error(self, monkeypatch):
         opened: list[_InitRecordingService] = []
 
         def failing_service(config: Any) -> _InitRecordingService:
@@ -1008,7 +1025,13 @@ class TestTheLiveFactoryOpensForReadsOnly:
             opened.append(service)
             return service
 
+        monkeypatch.setattr(_SERVICE_CLASS, failing_service)
+
+        async def open_the_store() -> None:
+            async with _mod().open_memory(SimpleNamespace()):
+                pytest.fail('the body must not run')
+
         with pytest.raises(_mod().MemoryStoreUnavailableError, match='OperationalError'):
-            asyncio.run(_mod().open_memory(SimpleNamespace(), service=failing_service))
+            asyncio.run(open_the_store())
 
         assert opened[0].calls == ['initialize_for_reads', 'close']
