@@ -2269,9 +2269,23 @@ def test_the_renderers_still_format_a_real_value():
 def test_lead_time_renders_an_empty_series_as_n_a_never_zero():
     section = mlt.compute_lead_time([], [], [], [], CORPUS_LO_DT, CORPUS_HI_DT)
     body = '\n'.join(mlt._format_lead_time(section, _NA_WINDOW))
-    # Four segments x p50/p90/min/max, every one unmeasured.
-    assert body.count('n/a') == 16
+    # Six series rows x p50/p90/min/max, every one unmeasured.
+    assert body.count('n/a') == 24
     assert '0.0' not in body
+
+
+def test_lead_time_renders_the_requeue_and_verify_to_land_rows_in_order():
+    lines = mlt._format_lead_time(_requeue_result('A1'), _NA_WINDOW)
+    labels = ['lead', 'queue wait', 're-queued', 'verify', 'finalize+CAS',
+              'verify->land']
+    positions = [
+        next(i for i, line in enumerate(lines) if line.startswith(f'    {label} '))
+        for label in labels
+    ]
+    assert positions == sorted(positions)
+    p50 = {label: lines[i].split()[-5] for label, i in zip(labels, positions, strict=True)}
+    assert p50['re-queued'] == '85.0'
+    assert p50['verify->land'] == '5.0'
 
 
 def test_queue_depth_renders_an_empty_series_as_n_a_never_zero():
