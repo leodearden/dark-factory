@@ -76,10 +76,20 @@ target.** That pool is also drained in-cycle by
 `_sweep_stale_mem0_flag_markers` (task 2853), in the same
 `task_knowledge_sync.py` module and via the same shared
 `_sweep_stale_mem0_pool` helper as the 2966 relay collector above. It is
-called unconditionally every reconciliation cycle, for every project — not
-just `dark_factory`, which is the only project this systemd timer targets
-by default — enumerating on `source` alone with no `kind` predicate, and
-age-GCing at 14 days. Records whose `created_at` is missing or unparseable
+called unconditionally every reconciliation cycle and age-GCs at 14 days.
+It enumerates **both** spellings of the pool, `{'source': 'stage1_flag_marker'}`
+and `{'kind': 'stage1_flag_marker'}`, unioned by id
+(`_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS`, task 3915), and passes
+`pool_kind=` so that a record declaring a foreign `kind` is withheld — see
+[The in-cycle collector applies the same arm](#the-in-cycle-collector-applies-the-same-arm-task-6241).
+That is a strictly wider enumeration than this script's: a `kind`-only legacy
+record (task 3915's `know_live` class) is enumerated in-cycle, but neither
+this script's `source` scroll nor its `cross_check` census ever counts it.
+Project coverage does not separate the two collectors: since task 2917 this
+timer also loops over every registered project (see "Schedule", and "When
+coverage is not fleet-wide" for when the registry degrades). They differ in
+cadence — every reconciliation cycle versus nightly at 03:30 — and in what
+they enumerate. Records whose `created_at` is missing or unparseable
 are skipped by that helper's fail-safe KEEP-on-uncertainty filter, so they
 persist by design rather than by neglect. So **both** pools have an
 automatic in-cycle collector, and this timer is a scheduled adjunct to one
@@ -480,7 +490,16 @@ is not a retention argument.
 renders `orphan_count: 0` legible as "saw nothing" rather than "there was
 nothing", and task 3923 armed `--check` to exit 1 on an observed blind
 spot. Retiring the script would delete the sole detector for the exact
-blind spot the two preceding tasks were spent building.
+blind spot the two preceding tasks were spent building. The census has a
+bound: `cross_check` compares the `source` count against the
+`flag_for_stage2` relay pool and never counts the `kind`-only spelling, so
+only the in-cycle collector enumerates that cohort. The cohort measured 0 in
+every project probed by the task-6241 census, and its create path is closed
+by `enforce_flag_record_write_contract` (see
+[The in-cycle collector applies the same arm](#the-in-cycle-collector-applies-the-same-arm-task-6241)).
+That bound narrows what the census proves without reversing the verdict, and
+it strengthens the drain-side conclusion above: the in-cycle drain already
+sees a superset of what the script's delete side sees.
 
 **(b) "narrow it to the targeted predicates" is foreclosed, not
 re-decided.** Task 3897 work item (c) already adjudicated those predicates
