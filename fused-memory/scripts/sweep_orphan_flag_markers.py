@@ -22,15 +22,15 @@ the pre-2406 Mem0 records with no in-cycle collector. That gap has since been pa
 closed: task 2853 restored an automatic, in-cycle, per-project collector —
 ``_sweep_stale_mem0_flag_markers`` (``reconciliation/stages/task_knowledge_sync.py``),
 called unconditionally every cycle from ``TaskKnowledgeSync.run()`` via the shared
-``_sweep_stale_mem0_pool`` helper, whose only enumeration filter is ``source`` (no
-``kind`` predicate) — it enumerates on ``{'source': 'stage1_flag_marker'}`` and
-age-GCs at 14 days, for every project, not just ``dark_factory`` (the only project
-this script's own systemd timer targets by default); see
+``_sweep_stale_mem0_pool`` helper. It enumerates both the ``source`` and ``kind``
+spellings of the pool (``_STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS``, task
+3915), a cohort wider than this script's ``source``-only scroll, withholds records
+that declare a foreign ``kind`` (task 6241), and age-GCs at 14 days for every
+project, as this script's nightly timer has also done since task 2917; see
 ``_sweep_stale_mem0_flag_markers``'s own docstring for the gap it documents closing.
 
-That "only enumeration filter is ``source``" claim is true of
-``_sweep_stale_mem0_flag_markers`` but materially incomplete as a description of
-the in-cycle drain as a whole (task 3897). Task 2966 shipped a SECOND in-cycle
+``_sweep_stale_mem0_flag_markers`` is not the whole in-cycle drain, though
+(task 3897). Task 2966 shipped a SECOND in-cycle
 collector, ``_sweep_stale_mem0_flag_for_stage2_markers``, which enumerates on
 ``{'flag_for_stage2': True}`` (``_FLAG_FOR_STAGE2_ENUM_FILTERS``) and is likewise
 wired unconditionally per-project every cycle
@@ -65,8 +65,11 @@ and NOT the drain. Both clauses previously claimed here are stale:
 ``--check --max-backlog`` gate for want of any ``before_done`` consumer. The
 delete-set predicates are retained per task 3897's own MEASURED-ZERO-RETAINED
 ruling; full rationale in ``docs/flag-marker-sweep-recurring.md`` §"Decision
-(task 3498)". In passing: the in-cycle drain's filter matches on
-``source`` alone and never on ``kind``, so it already collects those task-1659
+(task 3498)". In passing: the in-cycle drain's ``source`` variant matches
+records that carry no ``kind`` at all, and its foreign-kind arm withholds only a
+DECLARED different kind
+(``fused-memory/src/fused_memory/reconciliation/mem0_tombstone.py::is_foreign_kind_record``
+returns False when ``kind`` is None), so it already collects those task-1659
 missing-``kind`` orphans that are older than 14 days and carry a parseable
 ``created_at``; records with a missing or unparseable ``created_at`` are skipped by
 ``_sweep_stale_mem0_pool``'s fail-safe KEEP-on-uncertainty age filter (see that
