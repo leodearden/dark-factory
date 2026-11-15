@@ -3211,10 +3211,12 @@ persisted to `data/fused-memory/fm_liveness_streak.json` rather than held
 in memory because `orchestrator-watchdog.service` is `Type=oneshot` — the
 process exits between probes, so an in-memory counter could never
 accumulate. The streak is **shared across both non-healthy classes** on
-purpose: an fm instance dying mid-probe can legitimately alternate
-`port-down`/`wedged` from tick to tick, and per-class counters would each
-keep resetting, so a genuinely broken process would reach neither
-threshold.
+purpose: on a host without `fused-memory.socket`, an fm instance dying
+mid-probe can legitimately alternate `port-down`/`wedged` from tick to
+tick, and per-class counters would each keep resetting, so a genuinely
+broken process would reach neither threshold. Under socket activation a
+dying instance reads `wedged` throughout; the shared streak is correct
+either way.
 
 **Layer 2 — a revive cap**, on its own clock file
 `data/fused-memory/last_liveness_restart_fused_memory.json`. That is
@@ -3247,12 +3249,51 @@ which defeats systemd's own `StartLimitBurst` backstop, so an uncapped
 lane would re-restart a permanently-unstartable unit (bad config, missing
 dependency, corrupt venv) every ~180s forever.
 
-A shorter, port-down-specific lane was designed under task 4131 and
-DELIBERATELY NOT SHIPPED — see esc-4131-9 (Leo's 2026-09-21 ruling) and
-task 5739, which revisits it once task 5550 has removed the wedge cause.
-Measured 2026-08-23..2026-09-21: 57 `wedged` threshold-crossings against
-exactly 1 `port-down` crossing, and that one was a race with an external
-restart already in flight.
+**No port-down fast lane — closed (task 5739).** A shorter, 600s
+port-down-specific lane was designed under task 4131 and dropped by Leo's
+2026-09-21 ruling on esc-4131-9. Task 5739 re-measured after task 5550 and
+closed it: the single shared `FM_LIVENESS_RESTART_MIN_INTERVAL_SECS` window
+is the permanent answer. The pre-5550 baseline, syslog 2026-08-23..09-21,
+had 57 `wedged` threshold-crossings against 1 `port-down` crossing, and
+that one was a race with an external restart already in flight. The
+post-5550 window, the whole syslog rotation set from 2026-10-18 to
+2026-11-15 (28 days, starting 23 days after the 2026-09-25 merge), had 0
+crossings of either class, 0 capped ticks, 0 `restart issued` lines and 0
+`port-down` verdicts at any streak; its 21 sub-threshold `wedged` ticks (20
+at 1/3, 1 at 2/3) never reached threshold. So the cap was never armed in the
+window and hid nothing, and `port-down` did not occur even below threshold.
+The lane's target class is also gone. Since `fused-memory.socket`
+(2026-09-29, [Socket activation](#socket-activation-mcp-ports-survive-restarts)),
+`port-down` means the socket is down, which is a deliberate stop or disable.
+A crashed process is brought back by systemd's `Restart=on-failure`, and
+reads `wedged` while it comes back. A port-down lane would only re-start,
+sooner, an fm an operator stopped. Reopen only if either holds:
+
+- fm runs on a host without its socket unit, so `port-down` again means
+  "process gone";
+- a syslog re-measure over >=4 weeks finds more than ~1 `port-down`
+  crossing per week. Count with the any-streak form, which also catches the
+  revive that fires as a capped window expires (streak above threshold):
+  `for f in /var/log/syslog*; do echo "$f $(zgrep -cE "verdict 'port-down' \(streak [0-9]+/[0-9]+\); restarting" "$f")"; done`
+  (zgrep reads plain and `.gz` files alike; the task-5739 baseline used
+  the literal `(streak 3/3)` form).
+
+A reopened lane must also meet task 5739's constraints:
+
+- Detection stays class-blind: the shared streak above, pinned by
+  `tests/scripts/test_orchestrator_watchdog.py::test_liveness_pass_mixed_non_healthy_verdicts_reach_threshold`.
+- The lane is resolved from the WHOLE streak, via a sticky "saw a wedge"
+  bit in the streak file (the esc-4131-7 shape), so a mixed streak always
+  arms the 3600s window and no class's cap is ever left un-armed.
+- The true aggregate revive bound is stated here and on the constant's
+  comment. Separate clocks ADD: the 4131 design silently moved <=24/day to
+  <=168/day.
+- It is justified on probe semantics, not on the 3180s figure (READ THAT
+  FIGURE CORRECTLY, above).
+- `--report` shows a revive COUNT, not just an age.
+- `NRestarts` is not evidence of quiet: watchdog revives are manual
+  restarts, which it never counts (the crash-loop paragraph in
+  [§8](#8-fleet-redeploy--watchdog)).
 
 **A failed — or raising — restart still arms the cap.** `restart_unit`
 passes `check=False`, so a non-zero `systemctl` exit has always armed it;
