@@ -9,12 +9,15 @@ from __future__ import annotations
 import json
 import os
 import stat
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 
 from shared.secret_redaction import (
+    MIN_REDACTABLE_LEN,
     FileChangedDuringRedaction,
+    Markup,
     RedactionWouldCorruptJson,
     RefusedLine,
     copy_redacted,
@@ -51,6 +54,21 @@ def _transcript_lines(value: str) -> list[str]:
         }),
         json.dumps({'type': 'assistant', 'message': {'content': 'done'}}),
     ]
+
+
+def _junit_lines(value: str) -> list[str]:
+    suite = ET.Element('testsuite', name='orchestrator', tests='1', failures='1')
+    case = ET.SubElement(suite, 'testcase', classname='tests.test_env', name='test_env_is_scrubbed')
+    failure = ET.SubElement(case, 'failure', message=f'AssertionError: leaked {value} here')
+    failure.text = f"E   AssertionError: {{'{VAR}': '{value}', 'PATH': '/usr/bin'}}"
+    ET.indent(suite)
+    return ET.tostring(suite, encoding='unicode', xml_declaration=True).splitlines()
+
+
+def _parsed_failure(data: bytes) -> ET.Element:
+    failure = ET.fromstring(data).find('testcase/failure')
+    assert failure is not None
+    return failure
 
 
 def _write(path: Path, lines: list[str], *, mode: int = 0o640) -> Path:
@@ -267,3 +285,71 @@ def test_a_file_changed_since_the_stamp_is_left_untouched(tmp_path):
     assert path.read_bytes() == content
     assert content.endswith(appended.encode())
     assert list(path.parent.iterdir()) == [path]
+
+
+class TestXmlMarkup:
+    SPECIALS = 'tok&en<"q\'>-' + 'z' * 30
+
+    @pytest.mark.parametrize('value', [VALUE, SPECIALS])
+    def test_every_placeholder_keeps_its_patterns_byte_length(self, value):
+        needles = redaction_needles({VAR: value}, markup=Markup.XML)
+
+        assert needles
+        for needle in needles:
+            assert len(needle.placeholder) == len(needle.pattern)
+
+    def test_a_redacted_junit_report_still_parses_and_reads_as_the_redaction_label(self, tmp_path):
+        path = _write(tmp_path / 'r.xml', _junit_lines(VALUE))
+        before = path.stat()
+        line_count = len(_lines(path))
+
+        result = redact_in_place(path, redaction_needles({VAR: VALUE}, markup=Markup.XML))
+
+        after = path.stat()
+        data = path.read_bytes()
+        assert dict(result.counts) == {VAR: 2}
+        assert VALUE.encode() not in data
+        assert after.st_size == before.st_size
+        assert len(_lines(path)) == line_count
+        assert stat.S_IMODE(after.st_mode) == 0o640
+        assert after.st_mtime_ns == OLD_MTIME_NS
+        failure = _parsed_failure(data)
+        label = f'<redacted:{VAR}>'
+        assert label in failure.get('message', '')
+        assert label in (failure.text or '')
+
+    @pytest.mark.parametrize(
+        'length', range(MIN_REDACTABLE_LEN, len(f'&lt;redacted:{VAR}&gt;') + 1)
+    )
+    def test_a_value_too_short_for_the_label_never_truncates_mid_entity(self, tmp_path, length):
+        value = 'q' * length
+        path = _write(tmp_path / 'r.xml', _junit_lines(value))
+
+        result = redact_in_place(path, redaction_needles({VAR: value}, markup=Markup.XML))
+
+        assert dict(result.counts) == {VAR: 2}
+        failure = _parsed_failure(path.read_bytes())
+        assert value not in failure.get('message', '')
+        assert value not in (failure.text or '')
+
+    def test_a_value_with_an_xml_special_is_matched_in_its_escaped_form(self, tmp_path):
+        value = 'tok&en-' + 'z' * 30
+        lines = _junit_lines(value)
+        escaped = value.replace('&', '&amp;')
+        assert sum(line.count(escaped) for line in lines) == 2, 'ElementTree escapes & both times'
+        path = _write(tmp_path / 'r.xml', lines)
+
+        result = redact_in_place(path, redaction_needles({VAR: value}, markup=Markup.XML))
+
+        data = path.read_bytes()
+        assert dict(result.counts) == {VAR: 2}
+        assert escaped.encode() not in data
+        failure = _parsed_failure(data)
+        assert value not in failure.get('message', '')
+        assert value not in (failure.text or '')
+
+    def test_text_markup_is_the_default_and_keeps_the_raw_label(self):
+        default = redaction_needles({VAR: VALUE})
+
+        assert default == redaction_needles({VAR: VALUE}, markup=Markup.TEXT)
+        assert all(needle.placeholder.startswith(b'<redacted:') for needle in default)
