@@ -1550,6 +1550,7 @@
     "orchestrator/tests/test_merge_gates_rename_family.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_gates_typecheck.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_guard_pipeline.py": {"patch_targets": ["worker._check_plan_targets_in_tree"], "private_reads": 1},
+    "orchestrator/tests/test_merge_halt_escalation.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_history_leg_runner.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_item_union.py": {"patch_targets": [], "private_reads": 7},
     "orchestrator/tests/test_merge_lane_absorbed_request_ids.py": {"patch_targets": [], "private_reads": 0},
