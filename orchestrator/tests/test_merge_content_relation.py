@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _git_fixtures import RepoSeed, seed_repo
@@ -35,6 +36,7 @@ from orchestrator.merge_lane.landing_evidence import (
     is_ancestor_or_raise,
     range_patch_ids,
 )
+from orchestrator.merge_lane.types import MergeContent, QueuedBranch
 
 SEED = RepoSeed(
     files=(('README.md', '# content relation fixtures\n'),),
@@ -390,3 +392,47 @@ class TestClassifyContent:
 
 def test_unclassifiable_is_a_runtime_error() -> None:
     assert issubclass(ContentUnclassifiable, RuntimeError)
+
+
+def merge_content_fields(worktree: Path) -> dict[str, Any]:
+    return {
+        'branch': QueuedBranch.parse('10215', 'task/'),
+        'tip': 'a' * 40,
+        'worktree': worktree,
+        'task_files': ('a.py',),
+        'module_configs': (),
+        'pre_rebased': False,
+    }
+
+
+class TestMergeContent:
+    def test_content_seq_starts_at_one(self, tmp_path: Path) -> None:
+        assert MergeContent(**merge_content_fields(tmp_path)).content_seq == 1
+
+    def test_value_is_frozen(self, tmp_path: Path) -> None:
+        value = MergeContent(**merge_content_fields(tmp_path))
+
+        pytest.raises(dataclasses.FrozenInstanceError, setattr, value, 'tip', 'b' * 40)
+
+    def test_a_transition_makes_a_new_value(self, tmp_path: Path) -> None:
+        original = MergeContent(**merge_content_fields(tmp_path))
+
+        swapped = dataclasses.replace(original, tip='b' * 40, content_seq=2)
+
+        assert (swapped.tip, swapped.content_seq) == ('b' * 40, 2)
+        assert (original.tip, original.content_seq) == ('a' * 40, 1)
+
+    def test_empty_tip_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match='tip'):
+            MergeContent(**{**merge_content_fields(tmp_path), 'tip': ''})
+
+    def test_content_seq_below_one_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match=r'content_seq.*\b0\b'):
+            MergeContent(**merge_content_fields(tmp_path), content_seq=0)
+
+    def test_tip_is_required(self, tmp_path: Path) -> None:
+        fields = merge_content_fields(tmp_path)
+        del fields['tip']
+
+        with pytest.raises(TypeError, match='tip'):
+            MergeContent(**fields)
