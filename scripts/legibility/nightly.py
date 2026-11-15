@@ -1791,6 +1791,18 @@ def _parse_date(value: str) -> date:
     return date.fromisoformat(value)
 
 
+def _parse_barren_threshold(value: str) -> int:
+    """``--max-barren-runs`` as an int >= 1. Below 1, no barren streak lands
+    on the escalation schedule, so the nightly's alarm would be silently off."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'expected an integer, got {value!r}') from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f'must be 1 or greater, got {value!r}')
+    return parsed
+
+
 def run_scheduled_night(
     *,
     config_path: Path | str | None = None,
@@ -1891,7 +1903,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
     run_parser.add_argument(
-        '--max-barren-runs', type=int, default=trickle_state.DEFAULT_MAX_BARREN_RUNS,
+        '--max-barren-runs', type=_parse_barren_threshold,
+        default=trickle_state.DEFAULT_MAX_BARREN_RUNS,
         help=(
             'Barren-streak threshold: the nightly escalates when the streak '
             'reaches it and again at the multiples in '

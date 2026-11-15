@@ -5733,6 +5733,20 @@ class TestRunScheduledNight:
 
         assert [call['max_barren_runs'] for call in calls] == [7]
 
+    @pytest.mark.parametrize('value', ['0', '-3', 'three'])
+    def test_main_refuses_a_max_barren_runs_below_one(self, monkeypatch, capsys, value):
+        """A threshold below 1 puts no barren streak on the escalation
+        schedule, so it would silently disable the nightly's alarm."""
+        fake, calls = _scripted_run_nightly(_result())
+        monkeypatch.setattr(nightly, 'run_nightly', fake)
+
+        with pytest.raises(SystemExit) as exited:
+            nightly.main(['run', '--project-id', 'proj_a', '--max-barren-runs', value])
+
+        assert exited.value.code == 2
+        assert calls == []
+        assert repr(value) in capsys.readouterr().err
+
     def test_main_fails_when_the_retry_fails(self, monkeypatch):
         fake, calls = _scripted_run_nightly(
             _result(retry_due=(date(2026, 7, 13),)),
