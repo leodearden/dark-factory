@@ -29,7 +29,7 @@ import subprocess
 import sys
 import traceback
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
@@ -38,7 +38,7 @@ import yaml
 from escalation.categories import EscalationCategory
 from escalation.models import Escalation, EvidenceEntry
 from escalation.queue import EscalationQueue
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, ValidationError, model_validator
 from shared import safe_io
 from shared.memory_eval_limits import (
     Alarm,
@@ -108,11 +108,27 @@ class RunnerConfig(BaseModel):
     baseline_window: int
     storm_alarm_limit: int = Field(gt=0)
     producer_timeout_secs: float = Field(gt=0)
+    producer_timeout_secs_by_eval: Mapping[str, PositiveFloat]
+    """Per-eval bounds that replace ``producer_timeout_secs``; ``{}`` declares none."""
 
     @model_validator(mode='after')
     def _check_limits(self) -> RunnerConfig:
         self.limits_config()
         return self
+
+    @model_validator(mode='after')
+    def _check_timeout_overrides_name_registered_evals(self) -> RunnerConfig:
+        registered = sorted(producer.eval_id for producer in DEFAULT_PRODUCERS)
+        unregistered = sorted(set(self.producer_timeout_secs_by_eval) - set(registered))
+        if unregistered:
+            raise ValueError(
+                f'producer_timeout_secs_by_eval names {unregistered}, which no registered '
+                f'producer runs; registered: {registered}'
+            )
+        return self
+
+    def producer_timeout(self, eval_id: str) -> float:
+        return self.producer_timeout_secs_by_eval.get(eval_id, self.producer_timeout_secs)
 
     def limits_config(self) -> LimitsConfig:
         return LimitsConfig(
