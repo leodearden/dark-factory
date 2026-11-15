@@ -3761,7 +3761,7 @@ missing `LoadState` detector).
 | 02:15 | link-heal sweep (adjudicate new triage children; records + report; writes gated) | `fused-memory-link-heal.timer` |
 | 02:30 | Transcript secret sweep | `transcript-secret-sweep.timer` |
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
-| 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`) | `fused-memory-memory-eval.timer` |
+| 03:15 | Scheduled memory evals (produce, judge, file `eval_regression`); runs for hours because of e6, see its section | `fused-memory-memory-eval.timer` |
 | 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
 | 03:45 | Quality-metrics snapshot of main, one instance per Python project (no LLM, never commits) | `quality-snapshot@.timer` |
 | 04:00 | Orphaned-worktree reclaim | `reclaim-orphaned-worktrees.timer` |
@@ -4138,12 +4138,30 @@ resolves one: the watcher is the sole closer.
 | `scripts/fused-memory-memory-eval.timer` | `OnCalendar=*-*-* 03:15:00` |
 | `scripts/install-memory-eval-timer.sh` | Installer |
 | `fused-memory/scripts/memory_eval_runner.py` | The runner and its producer registry |
-| `fused-memory/config/memory-eval.yaml` | Every threshold, including the storm limit K; `runs_per_quarter` must count the timer's cadence (a test pins it) |
+| `fused-memory/config/memory-eval.yaml` | Every threshold, including the storm limit K; `runs_per_quarter` must count the timer's cadence (a test pins it). Also each producer's wall-clock bound: `producer_timeout_secs`, which `producer_timeout_secs_by_eval` overrides per eval |
 
 **Artifacts** live under `fused-memory/data/memory-evals/`: one directory per
 eval (its M1 series, reports and `limits-current.json`), plus
 `verdicts-<STAMP>.json`, `verdicts-current.json` (what the dashboard reads)
 and `run-report-<STAMP>.txt` at the root.
+
+**A run takes hours, because of e6.** `e6-corpus-health` has its own bound in
+`producer_timeout_secs_by_eval`: its lexical sweep of all three Mem0
+categories runs for hours (task 9961). The runner writes the verdicts and the
+run report only after the last producer finishes, so a run's verdicts land
+hours after 03:15. e6 finishes its Qdrant reads in its first few minutes. The
+rest is single-core CPU, so it overlaps the later ladder slots on CPU only.
+To check e6 against its bound in the scheduled context, look in
+`journalctl --user -u fused-memory-memory-eval.service` under
+`--- producer e6-corpus-health output ---`. Read the timestamps inside its
+log lines, not the journal's own, because the runner relays a producer's
+output only after the producer exits, and relays its stdout (e6's JSON plan,
+which has no timestamps) before its stderr log. The first timestamped line
+starts the sweep, and its `Wrote metrics artifact` line marks the end. A
+`TimeoutExpired` for e6 in the run report means its sweep ran past the bound.
+That run never logs `Wrote metrics artifact`, so it gives only a lower bound,
+the bound itself. Size the new bound from the last run that completed, or
+raise it and re-measure.
 
 **The first run is the grandfather snapshot.** An eval with no
 `limits-current.json` records today's failures as known-bad and alarms on
