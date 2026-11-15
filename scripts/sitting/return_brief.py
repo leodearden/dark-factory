@@ -52,9 +52,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'orchestrator' / 's
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 
 from _task_db_scan import discover_project_roots
+from orchestrator.decision_registry import decisions_dir
 from orchestrator.digest import ModelRoleRow
 from orchestrator.fleet_files import fleet_root
-from orchestrator.decision_registry import decisions_dir
 from orchestrator.session_registry import sessions_dir
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, known_project_roots
 from shared.safe_io import atomic_write_text

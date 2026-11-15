@@ -18,11 +18,10 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, TypeVar
 
-from orchestrator.decision_registry import UNKNOWN_QUEUE, DecisionState
+from orchestrator.decision_registry import UNKNOWN_QUEUE, DecisionState, qualify_decision_id
 from shared.project_id import fold_project_token
 from sitting.inventory import OpenItem, queue_tag
 
-from orchestrator import decision_registry
 from orchestrator import session_registry
 
 PREPARED_MARKER = 'x_prepared:'
@@ -241,7 +240,7 @@ def route_finding_to_owner(owner_task_id: str, owner_status: str, finding: Findi
 
 def sitting_decision_id(item: OpenItem) -> str:
     """The id write-decision stores an unrecorded L2 under: ``<project>[-<queue tag>]-<escalation id>``."""
-    return decision_registry.qualify_decision_id(item.project, _sitting_local_decision_id(item))
+    return qualify_decision_id(item.project, _sitting_local_decision_id(item))
 
 
 def close_decision_argv(item: OpenItem, state: str, evidence: str) -> ApplyPayload:

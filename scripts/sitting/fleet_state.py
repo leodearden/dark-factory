@@ -38,13 +38,13 @@ from escalation.authority import HOST_FILER_ROLES
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 from escalation.shadow_ruling import AgreementReport, ClassAgreement, agreement_report
-from orchestrator.digest import ModelRoleRow, query_count_done_in_window, query_model_role_rollup
 from orchestrator.decision_registry import (
     DecisionRecord,
     DecisionState,
     decisions_dir,
     normalize_escalations_dir,
 )
+from orchestrator.digest import ModelRoleRow, query_count_done_in_window, query_model_role_rollup
 from shared.project_id import fold_project_token
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 from sitting import inventory, payloads
@@ -296,7 +296,7 @@ def autonomous_closes(decisions_root: Path | str, window: Window, *, now: dateti
     """Closed decisions carrying ``closing_evidence``, quoted verbatim, windowed on ``closed_at``.
 
     ``closed_at`` is the close instant
-    ``orchestrator/src/orchestrator/session_registry.py::close_decision_with_evidence``
+    ``orchestrator/src/orchestrator/decision_registry.py::close_decision_with_evidence``
     stamps; ``filed_at`` would miss a close of a gate filed before the window.
     A close with no parsable ``closed_at`` is ``undated``: shown, never dropped.
     """

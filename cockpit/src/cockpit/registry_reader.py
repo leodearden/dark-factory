@@ -31,8 +31,7 @@ import logging
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from orchestrator import decision_registry
-from orchestrator import session_registry
+from orchestrator import decision_registry, session_registry
 from shared.project_id import fold_project_token
 
 logger = logging.getLogger(__name__)

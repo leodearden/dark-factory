@@ -1153,7 +1153,8 @@ def _reap_scope_hint(reaper_project: str, *, expect_matches: bool) -> str | None
     if declined is not None:
         return declined
     if expect_matches:
-        return decision_registry.unmatched_project_token_hint(reaper_project, decision_registry.project_token_census(decision_registry.list_decisions()))
+        census = decision_registry.project_token_census(decision_registry.list_decisions())
+        return decision_registry.unmatched_project_token_hint(reaper_project, census)
     return None
 
 

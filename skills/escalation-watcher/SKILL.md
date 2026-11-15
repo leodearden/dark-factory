@@ -1029,7 +1029,7 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   pipeline stall): task 4835 decided against exempting them, because the same-queue custody hold
   keys on stamp equality, so an unstamped sentinel later re-filed with a stamp would re-open a row
   an operator had dropped.
-  There is a third value the field can hold: `<unknown>` (`session_registry.UNKNOWN_QUEUE`) —
+  There is a third value the field can hold: `<unknown>` (`decision_registry.UNKNOWN_QUEUE`) —
   "this record's owning queue was investigated and could not be determined". You never write it —
   and that is now enforced, not just asked: `write-decision` **rejects**
   `--escalations-dir <unknown>` outright, because a record stamped that way is refused by *every*

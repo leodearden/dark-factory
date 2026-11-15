@@ -66,7 +66,6 @@ from escalation.authority import (
     coordinator_denied,
 )
 from escalation.models import Escalation
-from orchestrator.fleet_files import fleet_root
 from orchestrator.decision_registry import (
     AuditVerdict,
     DecisionAuditRefused,
@@ -76,6 +75,7 @@ from orchestrator.decision_registry import (
     normalize_escalations_dir,
     record_audit_outcome,
 )
+from orchestrator.fleet_files import fleet_root
 from shared.mcp_session import McpCallError, SyncMcpSession
 from sitting import audits, brief, payloads, ports
 from sitting import ledger as ledgers
