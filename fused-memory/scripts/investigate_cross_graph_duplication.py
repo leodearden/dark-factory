@@ -42,6 +42,7 @@ Usage
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import sys
@@ -279,13 +280,12 @@ def main() -> int:
 
     async def _run_live() -> int:
         from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
-        try:
+        async with contextlib.AsyncExitStack() as stack:
             try:
-                await memory.initialize()
+                _, memory = await stack.enter_async_context(maintenance_service(config=config))
             except OSError as exc:
                 # Only the store open is converted; see
                 # shared/src/shared/cli_boundary.py::run_cli.
@@ -295,9 +295,6 @@ def main() -> int:
                 )
                 return EXIT_RUN_FAILED
             report = await run(args, memory)
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
         print(json.dumps(report, indent=2, default=str))
         return 0
 

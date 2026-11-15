@@ -371,10 +371,10 @@ def main() -> int:
     async def _run_live() -> int:
         nonlocal outcome
         from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+        from fused_memory.maintenance._utils import maintenance_service
         from fused_memory.reconciliation.journal import (  # noqa: PLC0415
             ReconciliationJournal,
         )
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
         # Backend construction is INSIDE the cleanup scope: a Qdrant/OpenAI
         # connect failure used to leave the already-opened journal unclosed and
@@ -407,23 +407,17 @@ def main() -> int:
             return report(_startup_error('journal', exc))
 
         try:
-            try:
-                memory = MemoryService(config)
-                await memory.initialize()
-            except Exception as exc:
-                # A ``return`` here still runs the outer ``finally``, which is
-                # what closes the journal on this path. A MemoryService that
-                # failed to initialize is deliberately NOT closed: close() walks
-                # per-backend handles that may not exist yet, so calling it on a
-                # failed init risks a second exception masking the first.
-                return report(_startup_error('memory_service', exc))
-            try:
+            async with contextlib.AsyncExitStack() as stack:
+                try:
+                    _, memory = await stack.enter_async_context(
+                        maintenance_service(config=config),
+                    )
+                except Exception as exc:
+                    # A ``return`` here still runs the outer ``finally``, which
+                    # is what closes the journal on this path; maintenance_service
+                    # has already closed the half-opened service.
+                    return report(_startup_error('memory_service', exc))
                 outcome = await run(args, journal=journal, memory=memory)
-            finally:
-                # Unconditional: MemoryService.close is always defined and is
-                # itself per-backend defensive via _safe_close, so a hasattr
-                # guard here would only hide a genuinely missing method.
-                await memory.close()
         finally:
             await journal.close()
 

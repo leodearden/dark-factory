@@ -190,6 +190,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import difflib
 import json
 import logging
@@ -3145,7 +3146,7 @@ async def _run(args: argparse.Namespace) -> int:
     from shared.memory_eval_metrics import run_stamp  # noqa: PLC0415
 
     import fused_memory.config.schema as _schema  # noqa: PLC0415
-    import fused_memory.services.memory_service as _service  # noqa: PLC0415
+    from fused_memory.maintenance._utils import maintenance_service
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
@@ -3155,9 +3156,9 @@ async def _run(args: argparse.Namespace) -> int:
     # Why THIS line specifically. It sits before ``MemoryService`` is
     # constructed and before ``memory.initialize()``, so a refused --apply
     # never opens a client at all -- which is also why it stays OUTSIDE the
-    # ``try:`` below with its ``finally: await memory.close()``. Guarding
-    # inside would entangle the refusal with the teardown of a service that
-    # was never initialized. It likewise precedes the whole scan:
+    # ``maintenance_service`` entry below. Guarding inside would entangle the
+    # refusal with the teardown of a service that was never initialized. It
+    # likewise precedes the whole scan:
     # ``fetch_memories``' per-category ``scroll_by_metadata`` with
     # ``with_vectors=True``, ``fetch_ann_neighbors``' per-record
     # ``query_points`` fan-out, clustering, metrics, and the artifact write.
@@ -3203,10 +3204,9 @@ async def _run(args: argparse.Namespace) -> int:
     stamp = run_stamp()
 
     config = _schema.FusedMemoryConfig()
-    memory = _service.MemoryService(config)
-    try:
+    async with contextlib.AsyncExitStack() as stack:
         try:
-            await memory.initialize()
+            _, memory = await stack.enter_async_context(maintenance_service(config=config))
         except OSError as exc:
             logger.error(
                 'ABORT: the memory store could not be opened (%s): %s',
@@ -3375,8 +3375,6 @@ async def _run(args: argparse.Namespace) -> int:
             result['deleted'], len(apply_candidates), result['delete_errors'],
         )
         return EXIT_RUN_FAILED if result['delete_errors'] > 0 else 0
-    finally:
-        await memory.close()
 
 
 _DEFAULT_METRICS_ROOT = str(Path(__file__).resolve().parent.parent / 'data' / 'memory-evals')
