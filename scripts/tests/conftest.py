@@ -91,8 +91,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-import systemd_unit_parity  # noqa: E402
-
 from df_pytest_isolation import (  # noqa: E402
     _df_claude_binary_unset,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
@@ -1087,6 +1085,8 @@ def unit_values():
     firing. The parsing rules are the production parser's,
     ``scripts/systemd_unit_parity.py::parse_unit_directives``.
     """
+    import systemd_unit_parity
+
     def values(path: Path, section: str, key: str) -> list[str]:
         directives = systemd_unit_parity.parse_unit_directives(path.read_text(encoding='utf-8'))
         return directives.get(section, {}).get(key, [])

@@ -13,6 +13,11 @@ from __future__ import annotations
 import os
 import subprocess
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 
 def _run(fake, *args, env=None):
     return subprocess.run(
