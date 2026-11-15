@@ -6,16 +6,21 @@ The placeholder shape is the one the 2026-10-11 hand redaction left on disk:
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import os
 import stat
 import xml.etree.ElementTree as ET
+import zlib
 from pathlib import Path
 
 import pytest
 
 from shared.secret_redaction import (
     MIN_REDACTABLE_LEN,
+    Codec,
+    CorruptCompressedFile,
     FileChangedDuringRedaction,
     Markup,
     RedactionWouldCorruptJson,
@@ -353,3 +358,113 @@ class TestXmlMarkup:
 
         assert default == redaction_needles({VAR: VALUE}, markup=Markup.TEXT)
         assert all(needle.placeholder.startswith(b'<redacted:') for needle in default)
+
+
+def _write_gzip(path: Path, lines: list[str], *, mode: int = 0o640) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(gzip.compress(''.join(f'{line}\n' for line in lines).encode()))
+    path.chmod(mode)
+    os.utime(path, ns=(OLD_ATIME_NS, OLD_MTIME_NS))
+    return path
+
+
+def _filler_lines(count: int) -> list[str]:
+    return [hashlib.sha256(str(i).encode()).hexdigest() for i in range(count)]
+
+
+class TestGzip:
+    def _xml_needles(self):
+        return redaction_needles({VAR: VALUE}, markup=Markup.XML)
+
+    def test_a_gzipped_report_is_redacted_through_decompress_and_recompress(self, tmp_path):
+        path = _write_gzip(tmp_path / 'r.xml.gz', _junit_lines(VALUE))
+        original = gzip.decompress(path.read_bytes())
+
+        result = redact_in_place(path, self._xml_needles(), codec=Codec.GZIP)
+
+        after = path.stat()
+        data = gzip.decompress(path.read_bytes())
+        assert dict(result.counts) == {VAR: 2}
+        assert VALUE.encode() not in data
+        assert len(data) == len(original)
+        assert len(data.splitlines()) == len(original.splitlines())
+        failure = _parsed_failure(data)
+        assert f'<redacted:{VAR}>' in failure.get('message', '')
+        assert stat.S_IMODE(after.st_mode) == 0o640
+        assert after.st_mtime_ns == OLD_MTIME_NS
+        assert list(path.parent.iterdir()) == [path]
+
+    def test_a_second_gzip_call_finds_nothing_and_does_not_rewrite(self, tmp_path):
+        path = _write_gzip(tmp_path / 'r.xml.gz', _junit_lines(VALUE))
+        redact_in_place(path, self._xml_needles(), codec=Codec.GZIP)
+        before = path.stat()
+
+        result = redact_in_place(path, self._xml_needles(), codec=Codec.GZIP)
+
+        after = path.stat()
+        assert dict(result.counts) == {}
+        assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+    def test_a_clean_gzip_file_is_not_rewritten(self, tmp_path):
+        path = _write_gzip(tmp_path / 'clean.xml.gz', _junit_lines('nothing-secret-here'))
+        before = path.stat()
+        content = path.read_bytes()
+
+        result = redact_in_place(path, self._xml_needles(), codec=Codec.GZIP)
+
+        after = path.stat()
+        assert dict(result.counts) == {}
+        assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+        assert path.read_bytes() == content
+
+    def test_a_value_straddling_a_decompressed_read_boundary_is_found(self, tmp_path):
+        boundaries = [2**k for k in range(12, 23)]
+        body = bytearray(b'a' * (boundaries[-1] + 4096))
+        for boundary in boundaries:
+            start = boundary - 7
+            body[start:start + len(VALUE)] = VALUE.encode()
+        path = tmp_path / 'big.jsonl.gz'
+        path.write_bytes(gzip.compress(b'{"t": "' + bytes(body) + b'"}\n'))
+
+        result = redact_in_place(path, redaction_needles({VAR: VALUE}), codec=Codec.GZIP)
+
+        data = gzip.decompress(path.read_bytes())
+        assert dict(result.counts) == {VAR: len(boundaries)}
+        assert VALUE.encode() not in data
+        json.loads(data)
+
+    def test_a_gzip_file_changed_since_the_stamp_is_left_untouched(self, tmp_path):
+        path = _write_gzip(tmp_path / 'live' / 'r.xml.gz', _junit_lines(VALUE))
+        stamp = file_stamp(path)
+        path.write_bytes(gzip.compress(''.join(f'{line}\n' for line in [
+            *_junit_lines(VALUE), '<!-- rewritten -->',
+        ]).encode()))
+        content = path.read_bytes()
+
+        with pytest.raises(FileChangedDuringRedaction):
+            redact_in_place(path, self._xml_needles(), codec=Codec.GZIP, unchanged_since=stamp)
+
+        assert path.read_bytes() == content
+        assert list(path.parent.iterdir()) == [path]
+
+    @pytest.mark.parametrize('holds_value', [True, False], ids=['value-in-prefix', 'no-value'])
+    def test_a_truncated_gzip_member_raises_corrupt_compressed_file_and_is_left_as_found(
+        self, tmp_path, holds_value
+    ):
+        head = [f'{VAR}={VALUE}'] if holds_value else ['clean head']
+        path = _write_gzip(tmp_path / 'cut' / 'r.xml.gz', [*head, *_filler_lines(2000)])
+        whole = path.read_bytes()
+        path.write_bytes(whole[: len(whole) // 2])
+        if holds_value:
+            prefix = zlib.decompressobj(wbits=31).decompress(path.read_bytes())
+            assert VALUE.encode() in prefix, 'fixture premise: the value is in the decodable prefix'
+        content = path.read_bytes()
+
+        with pytest.raises(CorruptCompressedFile) as excinfo:
+            redact_in_place(path, redaction_needles({VAR: VALUE}), codec=Codec.GZIP)
+
+        message = str(excinfo.value)
+        assert str(path) in message
+        assert VALUE not in message
+        assert path.read_bytes() == content
+        assert list(path.parent.iterdir()) == [path]
