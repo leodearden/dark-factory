@@ -102,13 +102,19 @@ class UnknownRole(ValueError):
 
     Attributes:
         value: The offending value, verbatim.
-        allowed: The names that would have been accepted.
+        allowed: The role names that would have been accepted.
+        family_prefix: When set, any name made of this prefix and a non-empty
+            suffix would also have been accepted.
     """
 
-    def __init__(self, value: object, *, allowed: tuple[str, ...]) -> None:
+    def __init__(
+        self, value: object, *, allowed: tuple[str, ...], family_prefix: str | None = None
+    ) -> None:
         self.value = value
         self.allowed = allowed
-        super().__init__(f'unknown role {value!r}; known roles: {", ".join(allowed)}')
+        self.family_prefix = family_prefix
+        family = f'; or {family_prefix}<name>' if family_prefix is not None else ''
+        super().__init__(f'unknown role {value!r}; known roles: {", ".join(allowed)}{family}')
 
 
 def config_role(dispatch_name: str) -> RoleName:
@@ -122,8 +128,11 @@ def config_role(dispatch_name: str) -> RoleName:
     try:
         return RoleName(dispatch_name)
     except ValueError:
-        allowed = (*(r.value for r in RoleName), f'{_REVIEWER_FAMILY_PREFIX}<name>')
-        raise UnknownRole(dispatch_name, allowed=allowed) from None
+        raise UnknownRole(
+            dispatch_name,
+            allowed=tuple(r.value for r in RoleName),
+            family_prefix=_REVIEWER_FAMILY_PREFIX,
+        ) from None
 
 
 class Effort(StrEnum):
@@ -147,9 +156,9 @@ class RoleSettings(BaseModel):
     model: str = Field(min_length=1)
     backend: Annotated[Backend, BeforeValidator(parse_backend)] = Backend.CLAUDE
     effort: Effort | None = None
-    budget_usd: float | None = Field(default=None, gt=0)
-    max_turns: int | None = Field(default=None, gt=0)
-    timeout_secs: float | None = Field(default=None, gt=0)
+    budget_usd: float | None = Field(default=None, gt=0, strict=True, allow_inf_nan=False)
+    max_turns: int | None = Field(default=None, gt=0, strict=True)
+    timeout_secs: float | None = Field(default=None, gt=0, strict=True, allow_inf_nan=False)
 
 
 _ROLE_TABLE: Final = TypeAdapter(dict[RoleName, RoleSettings])
@@ -157,16 +166,16 @@ _ROLE_TABLE: Final = TypeAdapter(dict[RoleName, RoleSettings])
 
 def merge_role_table(
     defaults: Mapping[RoleName, RoleSettings],
-    raw: Mapping[str, object],
+    raw: object,
 ) -> dict[RoleName, RoleSettings]:
     """The one entry-wise, knob-wise merge of a raw role table over its defaults.
 
-    It raises on an unknown role or knob and never drops one. Each raw row is a
-    mapping of knobs or a ``RoleSettings``; anything else raises ``ValueError``
-    naming the role.
+    It raises on an unknown role or knob and never drops one. The raw table is a
+    mapping of role to row, and each row is a mapping of knobs or a
+    ``RoleSettings``; anything else raises ``ValueError`` naming the value.
     """
     overrides: dict[RoleName, Mapping[str, object]] = {}
-    for key, row in raw.items():
+    for key, row in _table_rows(raw).items():
         role = _table_role(key, defaults)
         overrides[role] = _named_knobs(role, row)
     merged = {
@@ -177,7 +186,13 @@ def merge_role_table(
     return _ROLE_TABLE.validate_python(merged)
 
 
-def _table_role(key: str, defaults: Mapping[RoleName, RoleSettings]) -> RoleName:
+def _table_rows(raw: object) -> Mapping[object, object]:
+    if isinstance(raw, Mapping):
+        return raw
+    raise ValueError(f'a role table must be a mapping of role to knobs, got {raw!r}')
+
+
+def _table_role(key: object, defaults: Mapping[RoleName, RoleSettings]) -> RoleName:
     try:
         role = RoleName(key)
     except ValueError:

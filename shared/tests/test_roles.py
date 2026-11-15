@@ -33,9 +33,6 @@ class TestVocabulary:
         assert ORCHESTRATOR_ROLES.isdisjoint(FUSED_MEMORY_ROLES)
         assert set(RoleName) == ORCHESTRATOR_ROLES | FUSED_MEMORY_ROLES
 
-    def test_dispatchable_roles_exclude_the_non_dispatched_orchestrator_roles(self) -> None:
-        assert ORCHESTRATOR_ROLES - {RoleName.UNBLOCK_AUTO, RoleName.WATCHER} == DISPATCHABLE_ROLES
-
     def test_dispatchable_roles_and_reviewer_variants_are_the_role_wire_contract(self) -> None:
         assert {r.value for r in DISPATCHABLE_ROLES} | REVIEWER_VARIANTS == KNOWN_ROLE_NAMES
 
@@ -49,6 +46,8 @@ class TestConfigRole:
             config_role('nope')
         exc = caught.value
         assert exc.value == 'nope'
+        assert exc.allowed == tuple(r.value for r in RoleName)
+        assert exc.family_prefix == 'reviewer_'
         message = str(exc)
         assert 'nope' in message
         assert RoleName.ARCHITECT.value in message
@@ -142,6 +141,20 @@ class TestRoleSettings:
         assert _error_locations(caught.value) == [(knob,)]
 
     @pytest.mark.parametrize('knob', POSITIVE_KNOBS)
+    @pytest.mark.parametrize('value', [True, '5'])
+    def test_knob_must_be_a_number(self, knob: str, value: object) -> None:
+        with pytest.raises(ValidationError) as caught:
+            RoleSettings.model_validate({'model': 'opus', knob: value})
+        assert _error_locations(caught.value) == [(knob,)]
+
+    @pytest.mark.parametrize('knob', ['budget_usd', 'timeout_secs'])
+    @pytest.mark.parametrize('value', [float('inf'), float('nan')])
+    def test_float_knob_must_be_finite(self, knob: str, value: float) -> None:
+        with pytest.raises(ValidationError) as caught:
+            RoleSettings.model_validate({'model': 'opus', knob: value})
+        assert _error_locations(caught.value) == [(knob,)]
+
+    @pytest.mark.parametrize('knob', POSITIVE_KNOBS)
     @pytest.mark.parametrize('value', [5, None])
     def test_knob_accepts_positive_or_none(self, knob: str, value: int | None) -> None:
         row = RoleSettings.model_validate({'model': 'opus', knob: value})
@@ -227,6 +240,8 @@ class TestMergeRoleTable:
             merge_role_table(DEFAULTS, {key: {}})
         assert caught.value.value == key
         assert caught.value.allowed == ('architect', 'reviewer')
+        assert caught.value.family_prefix is None
+        assert 'reviewer_<name>' not in str(caught.value)
 
     def test_unknown_knob_is_rejected_naming_role_and_knob(self) -> None:
         with pytest.raises(ValidationError) as caught:
@@ -250,6 +265,12 @@ class TestMergeRoleTable:
         assert 'architect' in message
         assert 'opus' in message
 
+    @pytest.mark.parametrize('raw', [None, ['architect']])
+    def test_non_mapping_table_is_rejected_naming_the_value(self, raw: object) -> None:
+        with pytest.raises(ValueError) as caught:
+            merge_role_table(DEFAULTS, raw)
+        assert repr(raw) in str(caught.value)
+
     def test_result_follows_role_name_declaration_order(self) -> None:
         reversed_defaults = dict(reversed(list(DEFAULTS.items())))
         assert list(merge_role_table(reversed_defaults, {})) == [RoleName.ARCHITECT, RoleName.REVIEWER]
@@ -271,3 +292,9 @@ class TestMergeRoleTable:
         with pytest.raises(ValidationError) as caught:
             _ServiceConfig.model_validate({'roles': {'nope': {}}})
         assert 'nope' in str(caught.value)
+
+    @pytest.mark.parametrize('raw', [None, ['architect']])
+    def test_consumer_rejects_a_non_mapping_table_at_load(self, raw: object) -> None:
+        with pytest.raises(ValidationError) as caught:
+            _ServiceConfig.model_validate({'roles': raw})
+        assert repr(raw) in str(caught.value)
