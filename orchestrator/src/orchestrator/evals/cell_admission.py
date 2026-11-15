@@ -139,6 +139,31 @@ def is_unmeasurable(metrics: dict[str, Any]) -> bool:
     return is_plan_only(metrics) and not has_plan_quality_score(metrics)
 
 
+def candidate_cost_usd(metrics: dict[str, Any], *, where: str = '?') -> float:
+    """The spend attributable to the candidate under test in one cell.
+
+    A plan-only cell nets out ``judge_cost_usd``: its plan judge is a fixed
+    harness pin, identical for every architect candidate. The netting is
+    vintage-invariant because cells written before task 3629 persisted
+    ``judge_cost_usd=0.0`` beside an architect-only ``cost_usd``. A workflow
+    cell's ``cost_usd`` is returned unchanged.
+
+    Raises ``ValueError`` naming *where* when a plan-only cell's judge spend
+    exceeds its ``cost_usd``. Rationale: docs/plan-scoring-and-judge.md, "The
+    composite report (task 3099)".
+    """
+    cost = float(metrics.get('cost_usd', 0.0) or 0.0)
+    if not is_plan_only(metrics):
+        return cost
+    judge = float(metrics.get('judge_cost_usd', 0.0) or 0.0)
+    if judge > cost:
+        raise ValueError(
+            f'judge_cost_usd {judge} exceeds cost_usd {cost} for {where}: '
+            "judge spend is a subset of the cell's cost_usd"
+        )
+    return cost - judge
+
+
 # The σ validity marker's key, spelled ONCE (task 3628). The sibling
 # definition is ``scripts/run_fable_trial_v2_campaign.py``'s ``MARKER_KEY``;
 # the two are kept in agreement by :func:`judged_without_reference` below,
