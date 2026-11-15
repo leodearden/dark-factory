@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -1323,7 +1324,6 @@ def test_a_dead_owner_finding_names_the_dry_run_that_lists_it(project_root, seed
 
     sweep_once(parse_register(document), ports_for(project_root, stub))
 
-    assert DRY_RUN_COMMAND == 'uv run --project shared python scripts/exception_owner_sweep.py --dry-run'
     (escalated,) = stub.tool_calls('escalate_info')
     (submitted,) = stub.tool_calls('submit_task')
     for body in (escalated['detail'], submitted['description']):
@@ -1498,6 +1498,14 @@ def test_build_ports_reach_fused_memory_at_its_base_and_escalation_at_its_endpoi
 SWEEP_SCRIPT = Path(__file__).resolve().parents[1] / 'exception_owner_sweep.py'
 
 
+def dry_run_command_argv() -> list[str]:
+    """DRY_RUN_COMMAND as this test runs it: the command's own script and flags, under this interpreter."""
+    tokens = shlex.split(DRY_RUN_COMMAND)
+    (script_at,) = [index for index, token in enumerate(tokens) if token.endswith('.py')]
+    assert (SWEEP_SCRIPT.parents[1] / tokens[script_at]).resolve() == SWEEP_SCRIPT
+    return [sys.executable, str(SWEEP_SCRIPT), *tokens[script_at + 1 :]]
+
+
 def unbound_port() -> int:
     """A loopback port nothing listens on: bound, read, then released."""
     with socket.socket() as probe:
@@ -1511,12 +1519,11 @@ def test_the_cli_dry_run_against_unreachable_servers_is_exit_two_and_writes_noth
     seed([{'id': 77, 'status': 'done'}])
     tree = register_tree(tmp_path / 'tree', {'m.py': OWNED_MODULE})
     port = unbound_port()
+    prior = write_prior_stamp(project_root).read_text(encoding='utf-8')
 
     completed = subprocess.run(
         [
-            sys.executable,
-            str(SWEEP_SCRIPT),
-            '--dry-run',
+            *dry_run_command_argv(),
             '--root',
             str(tree),
             '--project-root',
@@ -1535,7 +1542,7 @@ def test_the_cli_dry_run_against_unreachable_servers_is_exit_two_and_writes_noth
     assert completed.returncode == 2, completed.stderr
     assert json.loads(completed.stdout.splitlines()[-1])['ok'] is False
     assert 'Traceback' not in completed.stderr
-    assert not stamp_path(project_root).exists()
+    assert stamp_path(project_root).read_text(encoding='utf-8') == prior
 
 
 def test_a_missing_import_is_exit_two_and_never_a_traceback(tmp_path: Path):
