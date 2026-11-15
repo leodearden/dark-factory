@@ -168,7 +168,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    Note: once `charged: true` is returned the slot is consumed even if the merge does not succeed.
    Completion is observed via `merge_status` polling (not a blocking return); outcomes that cost a
    slot: `{'error': ...}` (orchestrator down), or a polled/resolved state of `conflict`, `blocked`,
-   `abandoned`, `failed`, `unknown_branch`, or `unknown` (unconfirmed on main). These
+   `abandoned`, `error`, `unknown_branch`, or `unknown` (unconfirmed on main). These
    post-charge aborts cost a slot. This is the accepted §4.2 tradeoff. A hand-off at step 8's
    deadline consumes no further slot, because resume mode never charges.
 
@@ -201,7 +201,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      The six worker-internal outcomes (`wip_halted`, `done_wip_recovery`,
      `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare;
      `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when
-     observed by polling (`escalation/src/escalation/server.py::_map_terminal_state`) —
+     observed by polling (`escalation/src/escalation/merge_status_answer.py::map_terminal_state`) —
      handle them as `blocked`. (`failed`, which this list named until task 4829, is not a
      value the server ever returns; the real one is `error`.)
      The call returns a `request_id` in all
@@ -264,9 +264,10 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      Proceed to step 9 with the final `result.state` if the deadline is not reached.
 
 9. **Handle the outcome.** The `merge_request` (in-window) and `merge_status` (polled) vocabularies
-   overlap but differ: `failed`/`unknown_branch` appear only as `merge_request` statuses (the server
-   collapses them to `blocked` when observed via polling); `abandoned` is a polled-only state that
-   `merge_request` never returns; `unknown` is a polled-only fallback state.
+   overlap but differ: `error`/`unknown_branch` and the other worker-internal outcomes appear only
+   as `merge_request` statuses (the server collapses them to `blocked`, and `done_wip_recovery` to
+   `done`, when observed via polling); `abandoned` is a polled-only state that `merge_request`
+   never returns; `unknown` is a polled-only fallback state.
 
    - **`done` (polled state) or `already_merged` (submit-time):** success.
      `already_merged` comes in two sub-cases:
@@ -320,9 +321,9 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      d. `mcp__escalation__resolve_issue(escalation_id, resolution="Auto-merged low-risk fix
         (unblock-low-risk): <what changed + merge sha>", resolved_by="unblock-low-risk")`.
 
-   - **`conflict` | `blocked` | `abandoned` | `failed` | `unknown_branch`:**
+   - **`conflict` | `blocked` | `abandoned` | `error` | `unknown_branch`:**
      call `mcp__escalation__merge_cancel(request_id)` then **ABORT**. Do not resolve, do not
-     retry, do not direct-merge. (`failed`/`unknown_branch` appear only on the in-window
+     retry, do not direct-merge. (`error`/`unknown_branch` appear only on the in-window
      `merge_request` path; `abandoned` appears only on the polled `merge_status` path.)
 
    - **`superseded`:** **not a failure, and never handled as one.** `superseded` is
@@ -591,7 +592,7 @@ On any ABORT:
   `merge_request` submission (a `request_id` was returned — which excludes the `already_merged`
   fast-path), call `mcp__escalation__merge_cancel(request_id)` FIRST, before anything else, on:
   - an entry still `queued` at step 8's polling deadline;
-  - step 9's `conflict` | `blocked` | `abandoned` | `failed` | `unknown_branch` arm;
+  - step 9's `conflict` | `blocked` | `abandoned` | `error` | `unknown_branch` arm;
   - the ladder's genuine not-landed outcome ([this skill's dispositions](#ladder-dispositions)).
 
   Every other ABORT leaves the entry alone, and step 8's hand-off of a picked-up entry is not an
