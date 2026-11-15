@@ -69,10 +69,7 @@ Injected in tests so the real ``~/.claude`` tree is never touched."""
 DEFAULT_SPAWN_SCRIPT = Path(__file__).resolve().parents[2] / 'skills' / 'spawn' / 'spawn-claude.sh'
 """Spawn script the ``--check-preventer`` guard reads: the dark-factory
 checkout's ``skills/spawn/spawn-claude.sh``, whatever project ``--project-id``
-names. The ``run_check`` tests pass an explicit ``spawn_script_path`` fixture
-so they control the verdict;
-``test_main_check_preventer_passes_on_committed_spawn_script`` pins that the
-guard recognises the committed file."""
+names."""
 
 PREFIX_LEN = 200
 """Number of leading prompt characters used as the strong-match needle. A

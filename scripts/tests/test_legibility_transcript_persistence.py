@@ -11,9 +11,8 @@ Every test injects a tmp ``fleet_root`` (so ``session_registry`` never
 touches the real ``~/.claude`` tree), a tmp ``projects_root``, a FIXED
 ``now``, a written fixture ``legibility.yaml``, and a fake ``poster`` — no
 real ``~/.claude`` and no live escalation server. Every preventer-guard test
-reads a fixture spawn script, except
-``test_main_check_preventer_passes_on_committed_spawn_script``, which pins
-the guard against the committed ``skills/spawn/spawn-claude.sh``.
+reads a fixture spawn script except the one that pins the guard against the
+committed ``skills/spawn/spawn-claude.sh``.
 """
 from __future__ import annotations
 
@@ -1212,12 +1211,13 @@ def test_main_check_preventer_passes_on_committed_spawn_script(tmp_path, capsys)
         "--check-preventer",
     ])
 
-    out = capsys.readouterr().out
-    assert rc == 0 and "preventer guard present" in out, (
+    captured = capsys.readouterr()
+    assert rc == 0 and "preventer guard present" in captured.out, (
         "the --check-preventer guard no longer recognises the "
         "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 export in the committed "
         "skills/spawn/spawn-claude.sh, so an operator's --check-preventer run "
-        f"would false-alarm (rc={rc}, stdout={out!r})"
+        f"would false-alarm (rc={rc}, stdout={captured.out!r}, "
+        f"stderr={captured.err!r})"
     )
 
 
