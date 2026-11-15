@@ -16,7 +16,10 @@
 #
 # TRANSCRIPT_SECRET_SWEEP_CMD overrides the interpreter prefix (tests inject a
 # fake recorder there), and REPO is overridable so tests can point it at a tmp
-# dir: the seam convention of scripts/exception-owner-sweep.sh.
+# dir: the seam convention of scripts/exception-owner-sweep.sh. The default
+# prefix is `uv run --no-sync --project $REPO/shared python`:
+# --no-sync, not --frozen, so a timer run never re-syncs the shared root .venv
+# (tests/scripts/test_uv_run_venv_isolation.py).
 set -uo pipefail
 
 REPO="${REPO:-/home/leo/src/dark-factory}"
@@ -25,7 +28,7 @@ set -a
 [ -f "$REPO/.env" ] && source "$REPO/.env"
 set +a
 
-read -r -a SWEEP_CMD <<<"${TRANSCRIPT_SECRET_SWEEP_CMD:-uv run --frozen --project $REPO/shared python}"
+read -r -a SWEEP_CMD <<<"${TRANSCRIPT_SECRET_SWEEP_CMD:-uv run --no-sync --project $REPO/shared python}"
 
 echo "transcript-secret-sweep: sweeping agent transcripts for live secret values"
 "${SWEEP_CMD[@]}" "$REPO/scripts/transcript_secret_sweep.py"

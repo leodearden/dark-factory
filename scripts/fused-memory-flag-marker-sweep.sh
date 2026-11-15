@@ -27,11 +27,13 @@
 # Backlog visibility is instead left to the existing reconciliation
 # Stage-1/2 re-flag net (the mechanism that filed this task).
 #
-# FLAG_MARKER_SWEEP_CMD overrides the default `uv run --frozen --project
+# FLAG_MARKER_SWEEP_CMD overrides the default `uv run --no-sync --project
 # $FM python` interpreter prefix (tests inject a fake recorder here to
 # assert the sweep is invoked correctly, without uv/live stores) --
 # mirrors install-trickle-timer.sh's INSTALL_TRICKLE_TIMER_PYTHON /
-# watcher-rearm.sh's WATCHER_REARM_PYTHON override convention. REPO is
+# watcher-rearm.sh's WATCHER_REARM_PYTHON override convention. --no-sync,
+# not --frozen, so a timer run never re-syncs the shared root .venv
+# (tests/scripts/test_uv_run_venv_isolation.py). REPO is
 # similarly overridable so tests can point it at a tmp dir with no `.env`
 # (a no-op source). FLAG_MARKER_SWEEP_PROJECT_IDS (whitespace-separated)
 # overrides the per-project sweep list -- see the loop at the bottom.
@@ -72,8 +74,8 @@ else
   UV_RESOLVED="$(require_uv_bin)" || exit $?
   # Built literally (not via a \${X:-...} default inside an unquoted array
   # expansion) so "$FM" survives verbatim even when the repo path contains
-  # spaces -- see test_wrapper_default_prefix_invokes_uv_run_frozen_project.
-  SWEEP_CMD=("$UV_RESOLVED" run --frozen --project "$FM" python)
+  # spaces -- see test_wrapper_default_prefix_invokes_uv_run_no_sync_project.
+  SWEEP_CMD=("$UV_RESOLVED" run --no-sync --project "$FM" python)
 fi
 
 # --- Per-project sweep loop (task 2917 EDIT 1) ------------------------------

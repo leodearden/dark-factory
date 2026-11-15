@@ -4854,8 +4854,8 @@ is no commit seam, unlike the 05:00 census:
 from the repo root:
 
 ```bash
-uv run --frozen --project shared python scripts/sitting/nightly_prepare.py
-uv run --frozen --project shared python scripts/sitting/return_brief.py --output data/return-brief.md
+uv run --no-sync --project shared python scripts/sitting/nightly_prepare.py
+uv run --no-sync --project shared python scripts/sitting/return_brief.py --output data/return-brief.md
 ```
 
 The first spends a Fable budget. For a **no-cost re-render**, skip it:

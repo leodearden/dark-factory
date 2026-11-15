@@ -18,7 +18,10 @@
 # EXCEPTION_OWNER_SWEEP_CMD overrides the interpreter prefix (tests inject a
 # fake recorder there), and REPO is overridable so tests can point it at a tmp
 # dir with no `.env`: the seam convention of
-# scripts/memory-metadata-coverage-census.sh.
+# scripts/memory-metadata-coverage-census.sh. The default prefix is `uv run
+# --no-sync --project $REPO/shared python`:
+# --no-sync, not --frozen, so a timer run never re-syncs the shared root .venv
+# (tests/scripts/test_uv_run_venv_isolation.py).
 set -uo pipefail
 
 # The register runs `git ls-files` under $REPO, and an inherited GIT_DIR or
@@ -34,7 +37,7 @@ set -a
 [ -f "$REPO/.env" ] && source "$REPO/.env"
 set +a
 
-read -r -a SWEEP_CMD <<<"${EXCEPTION_OWNER_SWEEP_CMD:-uv run --frozen --project $REPO/shared python}"
+read -r -a SWEEP_CMD <<<"${EXCEPTION_OWNER_SWEEP_CMD:-uv run --no-sync --project $REPO/shared python}"
 
 echo "exception-owner-sweep: sweeping the owners cited in $REPO"
 "${SWEEP_CMD[@]}" "$REPO/scripts/exception_owner_sweep.py" --project-root "$REPO"
