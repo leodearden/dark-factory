@@ -1155,6 +1155,7 @@ fi
 # 7b. Expected user timers — the nightly ladder and the load sampler
 # ---------------------------------------------------------------------------
 info "Arming the expected user timers"
+info "  An unarmed timer's installer may run its job once, which can take minutes; the report prints when arming ends."
 
 # The registry is scripts/expected_user_timers.py. Only an unarmed timer's
 # installer runs, and a masked one is left alone. The status is believed only

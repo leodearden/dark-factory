@@ -19,6 +19,7 @@ from typing import Final, TextIO
 import expected_user_timers
 from expected_user_timers import ExpectedTimer
 from systemd_unit_parity import emit
+from unit_load_state import LoadVerdict, load_verdict
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'shared' / 'src'))
 
@@ -29,7 +30,6 @@ TOOL: Final = 'user_timers'
 SHOW_FIELDS: Final = ('Id', 'LoadState', 'UnitFileState', 'ActiveState')
 SHOW_TIMEOUT_SECS: Final = 30
 INSTALLER_TIMEOUT_SECS: Final = 600
-NOT_INSTALLED_LOAD_STATES: Final = frozenset({'', 'not-found'})
 ARM_HINT: Final = (
     'scripts/user_timers.py arm runs the installer of each one not armed, except masked or unreadable ones'
 )
@@ -82,18 +82,19 @@ def bind_targets(repo_root: Path) -> tuple[Target, ...]:
 
 
 def classify(fields: Mapping[str, str]) -> Arming:
-    load_state = fields.get('LoadState', '')
-    if load_state in NOT_INSTALLED_LOAD_STATES:
-        return Arming.NOT_INSTALLED
-    if load_state == 'masked':
-        return Arming.MASKED
-    if load_state != 'loaded':
-        return Arming.NOT_LOADED
-    if fields.get('UnitFileState') != 'enabled':
-        return Arming.NOT_ENABLED
-    if fields.get('ActiveState') != 'active':
-        return Arming.NOT_ACTIVE
-    return Arming.ARMED
+    match load_verdict(fields.get('LoadState', '')):
+        case LoadVerdict.NOT_INSTALLED:
+            return Arming.NOT_INSTALLED
+        case LoadVerdict.MASKED:
+            return Arming.MASKED
+        case LoadVerdict.NOT_LOADED:
+            return Arming.NOT_LOADED
+        case LoadVerdict.LOADED:
+            if fields.get('UnitFileState') != 'enabled':
+                return Arming.NOT_ENABLED
+            if fields.get('ActiveState') != 'active':
+                return Arming.NOT_ACTIVE
+            return Arming.ARMED
 
 
 def read_states(units: Sequence[str]) -> tuple[dict[str, Arming], str]:
@@ -167,7 +168,15 @@ def check(targets: Sequence[Target], *, out: TextIO) -> TimersExit:
     return TimersExit.ALL_ARMED if all_armed else TimersExit.NEEDS_OPERATOR
 
 
-def run_installer(target: Target, arming: Arming, *, out: TextIO) -> bool:
+def _echo_installer_output(output: str | bytes | None, *, out: TextIO) -> None:
+    """Re-emit an installer's output under the tag; a timeout hands over the bytes read so far."""
+    if isinstance(output, bytes):
+        output = output.decode(errors='replace')
+    for line in (output or '').splitlines():
+        emit(TOOL, f'  | {line}', out=out)
+
+
+def run_installer(target: Target, arming: Arming, *, timeout_secs: int, out: TextIO) -> bool:
     """Run *target*'s installer, re-emitting its output under the tag; True when it exited 0."""
     emit(TOOL, f'[arming] {target.unit} ({arming.value}): running {target.install_command}', out=out)
     installer = target.timer.installer
@@ -179,33 +188,37 @@ def run_installer(target: Target, arming: Arming, *, out: TextIO) -> bool:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=INSTALLER_TIMEOUT_SECS,
+            timeout=timeout_secs,
         )
-    except subprocess.TimeoutExpired:
-        emit(TOOL, f'[arm-failed] {target.unit}: {installer} timed out after {INSTALLER_TIMEOUT_SECS}s', out=out)
+    except subprocess.TimeoutExpired as exc:
+        _echo_installer_output(exc.stdout, out=out)
+        emit(TOOL, f'[arm-failed] {target.unit}: {installer} timed out after {timeout_secs}s', out=out)
         return False
     except OSError as exc:
         emit(TOOL, f'[arm-failed] {target.unit}: {installer} could not start: {exc}', out=out)
         return False
-    for line in completed.stdout.splitlines():
-        emit(TOOL, f'  | {line}', out=out)
+    _echo_installer_output(completed.stdout, out=out)
     if completed.returncode != 0:
         emit(TOOL, f'[arm-failed] {target.unit}: {installer} exited {completed.returncode}', out=out)
         return False
     return True
 
 
-def arm_unarmed(targets: Sequence[Target], states: Mapping[str, Arming], *, out: TextIO) -> tuple[int, int]:
+def arm_unarmed(
+    targets: Sequence[Target], states: Mapping[str, Arming], *, timeout_secs: int, out: TextIO,
+) -> tuple[int, int]:
     """Run the installer of every armable target in registry order; (installers run, installers failed)."""
     armable = [target for target in targets if states[target.unit] in ARMABLE]
-    failed = sum(1 for target in armable if not run_installer(target, states[target.unit], out=out))
+    failed = sum(
+        1 for target in armable if not run_installer(target, states[target.unit], timeout_secs=timeout_secs, out=out)
+    )
     return len(armable), failed
 
 
-def arm(targets: Sequence[Target], *, out: TextIO) -> TimersExit:
+def arm(targets: Sequence[Target], *, installer_timeout_secs: int, out: TextIO) -> TimersExit:
     units = [target.unit for target in targets]
     states, diagnostic = read_states(units)
-    ran, failed = arm_unarmed(targets, states, out=out)
+    ran, failed = arm_unarmed(targets, states, timeout_secs=installer_timeout_secs, out=out)
     if ran:
         states, diagnostic = read_states(units)
     all_armed = render_report(targets, states, diagnostic, hint=UNARMED_AFTER_ARM_HINT, out=out)
@@ -214,7 +227,14 @@ def arm(targets: Sequence[Target], *, out: TextIO) -> TimersExit:
     return TimersExit.ALL_ARMED if all_armed and not failed else TimersExit.NEEDS_OPERATOR
 
 
-_COMMANDS: Final = {'check': check, 'arm': arm}
+def _positive_secs(raw: str) -> int:
+    try:
+        secs = int(raw)
+    except ValueError:
+        secs = 0
+    if secs <= 0:
+        raise argparse.ArgumentTypeError(f'must be a positive whole number of seconds, got {raw!r}')
+    return secs
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -234,10 +254,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('check', parents=[common], help='report each expected timer; never changes the host')
-    commands.add_parser(
+    arm_parser = commands.add_parser(
         'arm',
         parents=[common],
         help='run the installer of each expected timer not armed, except masked or unreadable ones, then report',
+    )
+    arm_parser.add_argument(
+        '--installer-timeout',
+        type=_positive_secs,
+        default=INSTALLER_TIMEOUT_SECS,
+        metavar='SECS',
+        help=f'stop an installer still running after SECS and report it failed (default: {INSTALLER_TIMEOUT_SECS})',
     )
     return parser
 
@@ -252,7 +279,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         targets = bind_targets(repo_root)
     except (CheckoutRootError, ValueError) as exc:
         parser.error(str(exc))
-    return int(_COMMANDS[args.command](targets, out=sys.stdout))
+    if args.command == 'arm':
+        return int(arm(targets, installer_timeout_secs=args.installer_timeout, out=sys.stdout))
+    return int(check(targets, out=sys.stdout))
 
 
 if __name__ == '__main__':

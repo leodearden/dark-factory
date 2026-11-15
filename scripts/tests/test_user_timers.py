@@ -6,7 +6,7 @@ import os
 import shlex
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,12 +32,15 @@ CENSUS = 'memory-metadata-coverage-census.timer'
 QUALITY = f'quality-snapshot@{PROJECT}.timer'
 TRICKLE = f'legibility-trickle@{PROJECT}.timer'
 RETURN_BRIEF = 'return-brief.timer'
+#: Long enough for a loaded host to start a bash stub and let it print; the 'hangs' stub then sleeps past it.
+INSTALLER_TIMEOUT_SECS = 5
 
 _FAKE_SYSTEMCTL_SRC = r'''#!/usr/bin/env python3
 """Fake `systemctl --user` answering `show` per unit and flipping state on `enable --now`.
 
 Every call minus `--user` is recorded into $FAKE_SYSTEMCTL_STATE. A unit absent
-from state["units"] answers the shape a missing unit has on a real host.
+from state["units"] answers the shape a missing unit has on a real host; a unit in
+state["unanswered"] gets no block at all.
 """
 import json
 import os
@@ -57,6 +60,8 @@ def _show(state, rest):
     units = [arg for i, arg in enumerate(rest) if i not in (flag, flag + 1)]
     blocks = []
     for unit in units:
+        if unit in state["unanswered"]:
+            continue
         values = state["units"].get(unit, NOT_FOUND)
         lines = [f"Id={unit}"] + [f"{field}={values.get(field, '')}" for field in fields if field != "Id"]
         blocks.append("\n".join(lines))
@@ -97,13 +102,17 @@ _STUB_BEHAVIOURS = {
     'fails': 'echo "cannot install {unit}"\nexit 3',
     'skips-enable': 'exit 0',
     'enables-then-fails': 'systemctl --user enable --now {unit}\nexit 1',
+    'hangs': 'exec sleep 60',
 }
 
 
-def install_stub_installers(root: Path, log: Path, stubs: Mapping[str, str]) -> Path:
-    """An executable stub at root/<installer> for every registry entry, logging its argv to *log*.
+def install_stub_installers(
+    root: Path, log: Path, stubs: Mapping[str, str], unexecutable: Collection[str] = (),
+) -> Path:
+    """A stub at root/<installer> for every registry entry, logging its argv to *log*.
 
     *stubs* maps a resolved unit to a _STUB_BEHAVIOURS key; every other stub 'enables'.
+    Every stub is executable except those of the units in *unexecutable*.
     """
     for timer in EXPECTED_TIMERS:
         unit = timer.unit_name(PROJECT)
@@ -117,7 +126,7 @@ def install_stub_installers(root: Path, log: Path, stubs: Mapping[str, str]) -> 
             f'echo "installing {unit}"\n'
             f'{behaviour}\n'
         )
-        stub.chmod(0o755)
+        stub.chmod(0o644 if unit in unexecutable else 0o755)
     return log
 
 
@@ -152,7 +161,12 @@ def host_units(
     return units
 
 
-def install_fake_systemctl(tmp_path: Path, units: Mapping[str, Mapping[str, str]], show_exit: int = 0) -> dict[str, str]:
+def install_fake_systemctl(
+    tmp_path: Path,
+    units: Mapping[str, Mapping[str, str]],
+    show_exit: int = 0,
+    unanswered: Collection[str] = (),
+) -> dict[str, str]:
     """Write the fake onto a tmp bin/ and return the environment that puts it first on PATH."""
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir(exist_ok=True)
@@ -162,6 +176,7 @@ def install_fake_systemctl(tmp_path: Path, units: Mapping[str, Mapping[str, str]
     state_path = tmp_path / 'systemctl_state.json'
     state_path.write_text(json.dumps({
         'calls': [], 'units': dict(units), 'show_exit': show_exit, 'show_error': SYSTEMCTL_ERROR,
+        'unanswered': list(unanswered),
     }))
     return {
         **os.environ,
@@ -186,10 +201,11 @@ def check(
     root_name: str = 'dark-factory',
     project_id: str = PROJECT,
     show_exit: int = 0,
+    unanswered: Collection[str] = (),
 ) -> TimersRun:
     root = tmp_path / root_name
     root.mkdir(exist_ok=True)
-    env = install_fake_systemctl(tmp_path, host_units(overrides, project_id), show_exit)
+    env = install_fake_systemctl(tmp_path, host_units(overrides, project_id), show_exit, unanswered)
     return run_timers(tmp_path, env, 'check', '--repo-root', str(root))
 
 
@@ -199,13 +215,16 @@ def arm(
     *,
     stubs: Mapping[str, str] | None = None,
     show_exit: int = 0,
+    unanswered: Collection[str] = (),
+    unexecutable: Collection[str] = (),
+    arm_args: tuple[str, ...] = (),
 ) -> tuple[TimersRun, list[str]]:
     """Run `arm` over stub installers; return the run and each installer call it made."""
     root = tmp_path / 'dark-factory'
     root.mkdir(exist_ok=True)
-    log = install_stub_installers(root, tmp_path / 'installer-calls.log', stubs or {})
-    env = install_fake_systemctl(tmp_path, host_units(overrides), show_exit)
-    run = run_timers(tmp_path, env, 'arm', '--repo-root', str(root))
+    log = install_stub_installers(root, tmp_path / 'installer-calls.log', stubs or {}, unexecutable)
+    env = install_fake_systemctl(tmp_path, host_units(overrides), show_exit, unanswered)
+    run = run_timers(tmp_path, env, 'arm', '--repo-root', str(root), *arm_args)
     return run, log.read_text().splitlines() if log.exists() else []
 
 
@@ -324,7 +343,19 @@ def test_a_failed_show_makes_every_unit_unreadable_and_reports_why(tmp_path: Pat
     assert SYSTEMCTL_ERROR in run.output
 
 
-@pytest.mark.parametrize('args', [(), ('check', '--bogus')], ids=['no-subcommand', 'unknown-flag'])
+def test_a_unit_show_answers_no_block_for_is_unreadable_and_named(tmp_path: Path) -> None:
+    run = check(tmp_path, unanswered=[CENSUS])
+    assert run.result.returncode == 1, run.output
+    assert_verdict(run.output, CENSUS, 'unreadable')
+    assert f'systemctl --user show answered no block for {CENSUS}' in run.output
+    assert_others_armed(run.output, CENSUS)
+
+
+@pytest.mark.parametrize(
+    'args',
+    [(), ('check', '--bogus'), ('arm', '--installer-timeout', '0')],
+    ids=['no-subcommand', 'unknown-flag', 'non-positive-installer-timeout'],
+)
 def test_a_usage_error_exits_two_untagged(tmp_path: Path, args: tuple[str, ...]) -> None:
     env = install_fake_systemctl(tmp_path, host_units())
     run = run_timers(tmp_path, env, *args)
@@ -334,7 +365,6 @@ def test_a_usage_error_exits_two_untagged(tmp_path: Path, args: tuple[str, ...])
 
 def test_the_script_is_executable() -> None:
     assert os.access(SCRIPT, os.X_OK)
-
 
 
 def test_arm_with_every_timer_armed_runs_no_installer(tmp_path: Path) -> None:
@@ -409,3 +439,48 @@ def test_an_installer_failure_is_never_folded_into_a_green_exit(tmp_path: Path) 
     assert_others_armed(run.output)
     assert any(line.startswith(f'[arm-failed] {CENSUS}') for line in untagged_lines(run.output)), run.output
     assert run.result.returncode == 1, run.output
+
+
+def test_arm_runs_no_installer_for_a_unit_show_answers_no_block_for(tmp_path: Path) -> None:
+    run, calls = arm(tmp_path, {RETURN_BRIEF: None}, unanswered=[CENSUS])
+    assert run.result.returncode == 1, run.output
+    assert calls == ['scripts/install-return-brief-timer.sh']
+    assert_verdict(run.output, CENSUS, 'unreadable')
+    assert_others_armed(run.output, CENSUS)
+
+
+def test_arm_runs_the_installer_of_a_unit_file_systemd_rejected(tmp_path: Path) -> None:
+    rejected = {'LoadState': 'bad-setting', 'UnitFileState': 'enabled', 'ActiveState': 'inactive'}
+    run, calls = arm(tmp_path, {CENSUS: rejected})
+    assert run.result.returncode == 0, run.output
+    assert calls == ['scripts/install-memory-metadata-coverage-census-timer.sh']
+    assert any(line.startswith(f'[arming] {CENSUS} (not-loaded)') for line in untagged_lines(run.output)), run.output
+    assert_others_armed(run.output)
+
+
+def test_an_installer_that_cannot_start_is_named_and_the_next_one_still_runs(tmp_path: Path) -> None:
+    run, calls = arm(tmp_path, {CENSUS: None, RETURN_BRIEF: None}, unexecutable=[CENSUS])
+    assert run.result.returncode == 1, run.output
+    assert calls == ['scripts/install-return-brief-timer.sh']
+    failed = [line for line in untagged_lines(run.output) if line.startswith(f'[arm-failed] {CENSUS}')]
+    assert len(failed) == 1, run.output
+    assert 'could not start' in failed[0]
+    assert_verdict(run.output, CENSUS, 'not-installed')
+    assert_others_armed(run.output, CENSUS)
+
+
+def test_an_installer_past_its_timeout_shows_its_output_so_far_and_the_next_one_still_runs(tmp_path: Path) -> None:
+    run, calls = arm(
+        tmp_path,
+        {CENSUS: None, RETURN_BRIEF: None},
+        stubs={CENSUS: 'hangs'},
+        arm_args=('--installer-timeout', str(INSTALLER_TIMEOUT_SECS)),
+    )
+    assert run.result.returncode == 1, run.output
+    assert calls == ['scripts/install-memory-metadata-coverage-census-timer.sh', 'scripts/install-return-brief-timer.sh']
+    lines = untagged_lines(run.output)
+    failed = next(i for i, line in enumerate(lines) if line.startswith(f'[arm-failed] {CENSUS}'))
+    assert f'timed out after {INSTALLER_TIMEOUT_SECS}s' in lines[failed]
+    assert lines[failed - 1] == f'  | installing {CENSUS}', run.output
+    assert_verdict(run.output, CENSUS, 'not-installed')
+    assert_others_armed(run.output, CENSUS)
