@@ -5,9 +5,12 @@ Reads newline-separated staged paths on stdin and prints one ``<unit>\\t<command
 line per check: ``module:<prefix>:lint`` and ``module:<prefix>:type`` carry the
 registered module's own commands, verbatim, for every module the gate would
 execute for those paths; ``screen:<id>`` runs one scripts/merge_screen.yaml check
-when a staged path is one the whole-tree screen reads. Exit 0 is a listing,
-possibly empty; exit 2 means no listing could be derived, with the named cause on
-stderr. Contract: plans/merge-lane-policy-prd.md D8 / §6 'Hook contract'.
+when a staged path is one the whole-tree screen reads. ``root:type`` is the
+hook's own unit, pyright over the staged repo-root ``.py`` files: no registered
+module can own a repo-root path, so the gate's registry never lists it, and the
+hook's main-only ruff pass already lints them. Exit 0 is a listing, possibly
+empty; exit 2 means no listing could be derived, with the named cause on stderr.
+Contract: plans/merge-lane-policy-prd.md D8 / §6 'Hook contract'.
 """
 from __future__ import annotations
 
@@ -38,6 +41,9 @@ from orchestrator.verify_plan import (
 TOP_CONFIG = 'dark-factory-orchestrator.yaml'
 # A staged .py here can break any importer, so it type-checks every module (task 2551).
 DEPENDENCY_MODULES = frozenset({'shared', 'escalation'})
+ROOT_TYPE_UNIT = 'root:type'
+# Run from the root with no --directory, so the root pyproject's [tool.pyright] governs it.
+ROOT_TYPE_COMMAND = parse_config_command('uv run --project shared pyright')
 SCREEN_MANIFEST = Path('scripts/merge_screen.yaml')
 SCREEN_TREES = ('plans/', 'docs/', 'review/')
 SCREEN_SUFFIXES = frozenset({'.yaml', '.json', '.md'})
@@ -100,6 +106,17 @@ def module_units(
         for prefix, leg, command in (*lint, *type_)
         if command is not None
     ]
+
+
+def staged_root_python(staged: list[str]) -> list[str]:
+    return [path for path in staged if '/' not in path and path.endswith('.py')]
+
+
+def root_units(staged: list[str]) -> list[Unit]:
+    present = [path for path in staged_root_python(staged) if (_checkout.ROOT / path).is_file()]
+    if not present:
+        return []
+    return [(ROOT_TYPE_UNIT, render(scope_to(ROOT_TYPE_COMMAND, present)))]
 
 
 @dataclass(frozen=True)
@@ -201,7 +218,7 @@ def screen_units(checks: Sequence[ScreenCheck]) -> list[Unit]:
 
 def listed_units(staged: list[str]) -> list[Unit]:
     config, registry = load_registry()
-    units = module_units(staged, registry, config)
+    units = [*module_units(staged, registry, config), *root_units(staged)]
     if not screen_triggered(staged, member_package_dirs()):
         return units
     checks = load_screen_checks(_checkout.ROOT / SCREEN_MANIFEST, registry)

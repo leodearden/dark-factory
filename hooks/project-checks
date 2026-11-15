@@ -227,10 +227,12 @@ fi
 
 # ── merge-gate module checks and screen (main only) ──────────────────
 #
-# scripts/hook_module_checks.py lists the units the merge gate would run for
-# what this commit stages -- module:<m>:lint / module:<m>:type with each
-# module's registered command, and screen:<id> for scripts/merge_screen.yaml --
-# and every listed unit runs here, in parallel, verbatim
+# scripts/hook_module_checks.py lists the units to run for what this commit
+# stages -- the merge gate's own module:<m>:lint / module:<m>:type with each
+# module's registered command and screen:<id> for scripts/merge_screen.yaml,
+# plus root:type, pyright over staged repo-root .py files, which no module can
+# own and so is the hook's unit rather than a registry one -- and every listed
+# unit runs here, in parallel, verbatim
 # (plans/merge-lane-policy-prd.md D8). NO `|| true` on the staged listing, and
 # a helper failure refuses rather than skips: an empty listing must mean
 # "nothing to check", never "could not answer" (INV-11).
@@ -304,7 +306,7 @@ else
     done
     echo "pre-commit: merge-gate checks: ${#gate_units[@]} unit(s) in $((SECONDS - gate_start))s"
     if [ "$gate_failed" = true ]; then
-        echo "pre-commit: commit REFUSED -- fix the unit(s) above (the merge gate runs the same commands)"
+        echo "pre-commit: commit REFUSED -- fix the unit(s) above (module: and screen: units are the merge gate's commands)"
         exit 1
     fi
 fi
