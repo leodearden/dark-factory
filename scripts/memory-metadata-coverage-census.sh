@@ -71,9 +71,8 @@
 # (tests inject fake recorders here to assert argument construction and
 # ordering without touching uv, live Qdrant or the live corpus) -- mirrors the
 # FLAG_MARKER_SWEEP_CMD / REIFY_CLOSURE_SWEEP_CMD seam convention. The default
-# prefix is `uv run --no-sync --project "$FM" python`: --no-sync, not --frozen,
-# so a timer run never re-syncs the shared root .venv
-# (tests/scripts/test_uv_run_venv_isolation.py). REPO is
+# prefix passes --no-sync, not --frozen, so a timer run never re-syncs the
+# shared root .venv (tests/scripts/test_uv_run_venv_isolation.py). REPO is
 # similarly overridable so tests can point it at a tmp dir with no `.env` (a
 # no-op source). CENSUS_COMMIT=0 measures and rehearses but lands nothing;
 # CENSUS_LANDING_TIMEOUT_SECS bounds the wait for the landing.

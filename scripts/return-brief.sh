@@ -15,9 +15,8 @@
 # SEAMS. PREPARE_CMD and RETURN_BRIEF_CMD override the two interpreter
 # prefixes (tests inject a fake recorder); REPO overrides the checkout;
 # RETURN_BRIEF_SKIP_PREPARE=1 skips step 1 for a no-cost re-render. Both
-# default to `uv run --no-sync --project "$REPO/shared" python`:
-# --no-sync, not --frozen, so a timer run never re-syncs the shared root .venv
-# (tests/scripts/test_uv_run_venv_isolation.py).
+# defaults pass --no-sync, not --frozen, so a timer run never re-syncs the
+# shared root .venv (tests/scripts/test_uv_run_venv_isolation.py).
 #
 # ALWAYS EXITS 0 (OPERATIONS.md §12): a recurring oneshot that exits non-zero
 # enters systemd `failed` state and stays there, silently ending the nightly

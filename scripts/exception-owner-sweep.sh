@@ -18,8 +18,7 @@
 # EXCEPTION_OWNER_SWEEP_CMD overrides the interpreter prefix (tests inject a
 # fake recorder there), and REPO is overridable so tests can point it at a tmp
 # dir with no `.env`: the seam convention of
-# scripts/memory-metadata-coverage-census.sh. The default prefix is `uv run
-# --no-sync --project $REPO/shared python`:
+# scripts/memory-metadata-coverage-census.sh. The default prefix passes
 # --no-sync, not --frozen, so a timer run never re-syncs the shared root .venv
 # (tests/scripts/test_uv_run_venv_isolation.py).
 set -uo pipefail
