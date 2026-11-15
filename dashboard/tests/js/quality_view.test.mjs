@@ -412,6 +412,21 @@ test('an instrument marker is not drawn on a landing-axis chart: it annotates th
   assert.deepEqual(marks.map(mark => mark.key), [FLIP.id]);
 });
 
+// regime-markers.yaml lists `instrument` among its curated kinds; such an entry
+// names no snapshot point, so it is placed on the landing axis by its date.
+const CURATED_INSTRUMENT = qualityMarker({
+  id: 'curated:0123456789abcdef', ordinal: 14, kind: 'instrument', label: 'metrics script rewritten',
+  source: { type: 'curated', file: 'regime-markers.yaml' },
+});
+
+test('a curated instrument-kind marker is drawn on a landing-axis chart, as its kind’s rug', () => {
+  const marks = qualityMarks({
+    axis: GAPPED_AXIS, markers: [CURATED_INSTRUMENT], alarms: [], beforeAfter: [], metricId: 'rejected', kind: 'rate',
+  });
+
+  assert.deepEqual(marks.map(mark => [mark.key, mark.kind, mark.fraction]), [[CURATED_INSTRUMENT.id, 'instrument', 0.75]]);
+});
+
 // ── The snapshot series ───────────────────────────────────────────────────
 // One column per served point, in served order; every figure is the point's
 // own served count, and nothing is averaged, totalled, ranked or sorted.
@@ -517,6 +532,10 @@ test('only instrument markers are drawn on the snapshot charts', () => {
 
   assert.deepEqual(snapshotMarks([NIGHTLY_2, NIGHTLY_3], [effort]), []);
   assert.deepEqual(snapshotMarks([NIGHTLY_2, NIGHTLY_3], null), []);
+});
+
+test('a curated instrument-kind marker names no snapshot point and is not drawn on the snapshot charts', () => {
+  assert.deepEqual(snapshotMarks([NIGHTLY_2, NIGHTLY_3], [CURATED_INSTRUMENT]), []);
 });
 
 test('a series of one point places no mark: there is no column fraction to place it at', () => {

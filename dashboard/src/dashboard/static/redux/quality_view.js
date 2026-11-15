@@ -212,9 +212,15 @@ function qualityMarkerMark(marker, ordinals, verdict) {
   return placement && { key: marker.id, kind: marker.kind, label: marker.label, ...placement, ref: marker.ref, verdict };
 }
 
-// The marker kind that annotates the snapshot series, not landings
-// (quality_markers.py::REGIME_ROLE gives it no role on a landing axis).
-const QUALITY_INSTRUMENT_KIND = 'instrument';
+// The marker source that annotates the snapshot series, not landings: a
+// derived instrument marker names the snapshot point it sits at
+// (quality_markers.py::MarkerSource.point). A curated entry of kind
+// 'instrument' names no point, so it stays on the landing axis.
+const QUALITY_INSTRUMENT_SOURCE = 'instrument';
+
+function annotatesSnapshots(marker) {
+  return marker.source.type === QUALITY_INSTRUMENT_SOURCE;
+}
 
 function qualityMarks({ axis, markers, alarms, beforeAfter, metricId, kind }) {
   const ordinals = axis.map(point => point.ordinal);
@@ -223,7 +229,7 @@ function qualityMarks({ axis, markers, alarms, beforeAfter, metricId, kind }) {
     .filter(entry => entry.metric === metricId)
     .map(entry => [entry.marker_id, beforeAfterText(entry, kind)]));
   const placed = served
-    .filter(marker => marker.kind !== QUALITY_INSTRUMENT_KIND && qualityAppliesTo(marker, metricId))
+    .filter(marker => !annotatesSnapshots(marker) && qualityAppliesTo(marker, metricId))
     .map(marker => qualityMarkerMark(marker, ordinals, verdicts.get(marker.id) ?? null))
     .filter(mark => mark !== null);
   const byId = indexMarkers(served);
@@ -318,7 +324,7 @@ function snapshotMarks(points, markers) {
     fraction: at(index), ref: point.as_of_sha, verdict: null,
   }] : []));
   const instruments = (markers || [])
-    .filter(marker => marker.kind === QUALITY_INSTRUMENT_KIND)
+    .filter(annotatesSnapshots)
     .map(marker => ({
       key: marker.id, kind: marker.kind, label: marker.label,
       fraction: at(points.findIndex(point => point.id === marker.source.point)), ref: marker.ref, verdict: null,
