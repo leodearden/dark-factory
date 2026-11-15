@@ -1474,9 +1474,9 @@ def test_importing_the_snapshot_never_loads_the_ratchet() -> None:
 def test_the_cluster_numbers_agree_with_the_ratchet() -> None:
     # Row 12: both instruments read one set of measures. The TEST may import the
     # ratchet; the snapshot never does (see the layering test above).
-    import merge_lane_metrics
+    import merge_lane_cluster
 
-    report: dict[str, Any] = merge_lane_metrics.build_report(REPO_ROOT)  # type: ignore[assignment]
+    report: dict[str, Any] = merge_lane_cluster.build_report(REPO_ROOT)
     cluster = set(report['files'])
     domain = tuple(
         dataclasses.replace(member, files=tuple(f for f in member.files if f.path in cluster))

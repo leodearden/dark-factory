@@ -307,6 +307,7 @@ _DRIVER_FILES = (
     'pyproject.toml',
     'scripts/merge_lane_ratchet_merge.py',
     'scripts/merge_lane_metrics.py',
+    'scripts/merge_lane_cluster.py',
     'scripts/source_measures.py',
     'scripts/_checkout.py',
     'shared/src/shared/__init__.py',

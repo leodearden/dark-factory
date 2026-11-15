@@ -60,6 +60,7 @@ import pytest
 from _git_fixtures import RepoSeed, build_repo
 from _merge_lane_ratchet_fixtures import (
     blank_file_entry,
+    lane_cluster,
     metrics,
     source_measures,
     synthetic_report,
@@ -98,7 +99,7 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 # NOTE this mark is deliberate and NOT compelled by the family guard
 # test_whole_tree_scan_timeout_guard.py: its ``_scans_whole_tree_py`` detector
 # looks for a literal ``rglob('*.py')`` in the TEST file's own source, and this
-# module's sweep lives in scripts/merge_lane_metrics.py instead. Adding a marked
+# module's sweep lives in scripts/merge_lane_cluster.py instead. Adding a marked
 # module cannot break that guard either -- its family invariant uses ``>=``
 # floors.
 #
@@ -155,7 +156,7 @@ def live_measurement() -> LiveMeasurement:
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(source_measures, 'file_cognitive_measures', recording)
-        report = metrics.build_report(_REPO_ROOT)
+        report = lane_cluster.build_report(_REPO_ROOT)
     return LiveMeasurement(report=report, complexipy_calls=tuple(calls))
 
 
@@ -255,17 +256,17 @@ _MERGE_LANE_GLOB = 'orchestrator/src/orchestrator/merge_lane/**/*.py'
 
 class TestClusterPathSpec:
     def test_cluster_paths_covers_every_appendix_a_src_module(self) -> None:
-        assert set(_APPENDIX_A_SRC) <= set(metrics.CLUSTER_PATHS)
+        assert set(_APPENDIX_A_SRC) <= set(lane_cluster.CLUSTER_PATHS)
 
     def test_cluster_paths_includes_git_ops(self) -> None:
         # Measured but not gated by the file-size ceiling (PRD decision 9).
-        assert _GIT_OPS in metrics.CLUSTER_PATHS
+        assert _GIT_OPS in lane_cluster.CLUSTER_PATHS
 
     def test_cluster_paths_includes_the_three_test_paths(self) -> None:
-        assert set(_APPENDIX_A_TESTS) <= set(metrics.CLUSTER_PATHS)
+        assert set(_APPENDIX_A_TESTS) <= set(lane_cluster.CLUSTER_PATHS)
 
     def test_cluster_paths_carries_one_merge_lane_glob(self) -> None:
-        globs = [p for p in metrics.CLUSTER_PATHS if '*' in p]
+        globs = [p for p in lane_cluster.CLUSTER_PATHS if '*' in p]
         assert globs == [_MERGE_LANE_GLOB]
 
     def test_cluster_paths_has_exactly_the_appendix_a_entries(self) -> None:
@@ -275,24 +276,24 @@ class TestClusterPathSpec:
             | set(_APPENDIX_A_TESTS)
             | {_MERGE_LANE_GLOB}
         )
-        assert set(metrics.CLUSTER_PATHS) == expected
+        assert set(lane_cluster.CLUSTER_PATHS) == expected
 
     def test_cluster_paths_is_an_ordered_tuple(self) -> None:
         # Order is part of the spec: `params.cluster_paths` is compared against
         # it in check_against_baseline, and a stable order keeps that diff
         # readable when Appendix A is deliberately edited.
-        assert isinstance(metrics.CLUSTER_PATHS, tuple)
+        assert isinstance(lane_cluster.CLUSTER_PATHS, tuple)
 
     def test_size_ceiling_exempt_is_exactly_git_ops(self) -> None:
         # PRD decision 9: git_ops.py is the git engine for warm lanes, the
         # scheduler and recovery -- not only the merge lane -- and its split is
         # a follow-up PRD. The exemption is scoped to the CEILING; git_ops.py is
         # still ratcheted (pinned by TestSizeCeilingExemptionIsScoped).
-        assert set(metrics.SIZE_CEILING_EXEMPT) == {_GIT_OPS}
+        assert set(lane_cluster.SIZE_CEILING_EXEMPT) == {_GIT_OPS}
 
     def test_ceiling_constants(self) -> None:
-        assert metrics.FILE_LINE_CEILING == 1500
-        assert metrics.NEW_FUNCTION_COGNITIVE_CEILING == 15
+        assert lane_cluster.FILE_LINE_CEILING == 1500
+        assert lane_cluster.NEW_FUNCTION_COGNITIVE_CEILING == 15
 
 
 # ---------------------------------------------------------------------------
@@ -302,17 +303,17 @@ class TestClusterPathSpec:
 
 class TestResolveClusterPaths:
     def test_real_repo_enumeration_is_complete(self) -> None:
-        enumeration = metrics.resolve_cluster_paths(_REPO_ROOT)
+        enumeration = lane_cluster.resolve_cluster_paths(_REPO_ROOT)
         assert enumeration.complete is True
         assert enumeration.unreadable == ()
 
     def test_real_repo_enumeration_resolves_every_literal_path(self) -> None:
-        enumeration = metrics.resolve_cluster_paths(_REPO_ROOT)
-        literals = {p for p in metrics.CLUSTER_PATHS if '*' not in p}
+        enumeration = lane_cluster.resolve_cluster_paths(_REPO_ROOT)
+        literals = {p for p in lane_cluster.CLUSTER_PATHS if '*' not in p}
         assert literals <= set(enumeration.resolved)
 
     def test_resolved_paths_are_repo_relative_forward_slash(self) -> None:
-        enumeration = metrics.resolve_cluster_paths(_REPO_ROOT)
+        enumeration = lane_cluster.resolve_cluster_paths(_REPO_ROOT)
         for path in enumeration.resolved:
             assert not path.startswith('/'), path
             assert '\\' not in path, path
@@ -324,17 +325,17 @@ class TestResolveClusterPaths:
         # arrives in PRD task zeta1. A glob that matches nothing is fine; a
         # LITERAL that matches nothing is the finding (next test).
         (tmp_path / 'a.py').write_text('x = 1\n', encoding='utf-8')
-        monkeypatch.setattr(metrics, 'CLUSTER_PATHS', ('a.py', 'nowhere/**/*.py'))
-        enumeration = metrics.resolve_cluster_paths(tmp_path)
+        monkeypatch.setattr(lane_cluster, 'CLUSTER_PATHS', ('a.py', 'nowhere/**/*.py'))
+        enumeration = lane_cluster.resolve_cluster_paths(tmp_path)
         assert enumeration.complete is True
         assert enumeration.resolved == ('a.py',)
 
     def test_missing_literal_path_raises_naming_the_path(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(metrics, 'CLUSTER_PATHS', ('gone/missing.py',))
-        with pytest.raises(metrics.RatchetError) as excinfo:
-            metrics.resolve_cluster_paths(tmp_path)
+        monkeypatch.setattr(lane_cluster, 'CLUSTER_PATHS', ('gone/missing.py',))
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+            lane_cluster.resolve_cluster_paths(tmp_path)
         assert 'gone/missing.py' in str(excinfo.value)
 
     def test_missing_literal_path_never_returns_a_partial_enumeration(
@@ -343,23 +344,23 @@ class TestResolveClusterPaths:
         # The INV-11 seam: a present sibling must not let the missing path be
         # silently dropped from an otherwise plausible-looking result.
         (tmp_path / 'a.py').write_text('x = 1\n', encoding='utf-8')
-        monkeypatch.setattr(metrics, 'CLUSTER_PATHS', ('a.py', 'gone/missing.py'))
-        with pytest.raises(metrics.RatchetError):
-            metrics.resolve_cluster_paths(tmp_path)
+        monkeypatch.setattr(lane_cluster, 'CLUSTER_PATHS', ('a.py', 'gone/missing.py'))
+        with pytest.raises(lane_cluster.RatchetError):
+            lane_cluster.resolve_cluster_paths(tmp_path)
 
     def test_literal_path_that_is_a_directory_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         (tmp_path / 'adir.py').mkdir()
-        monkeypatch.setattr(metrics, 'CLUSTER_PATHS', ('adir.py',))
-        with pytest.raises(metrics.RatchetError) as excinfo:
-            metrics.resolve_cluster_paths(tmp_path)
+        monkeypatch.setattr(lane_cluster, 'CLUSTER_PATHS', ('adir.py',))
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
+            lane_cluster.resolve_cluster_paths(tmp_path)
         assert 'adir.py' in str(excinfo.value)
 
 
 class TestEnumerationRoundTrip:
     def test_to_dict_carries_the_four_completeness_keys(self) -> None:
-        enumeration = metrics.Enumeration(
+        enumeration = lane_cluster.Enumeration(
             requested=('a.py', 'b/**/*.py'),
             resolved=('a.py',),
             unreadable=(),
@@ -375,7 +376,7 @@ class TestEnumerationRoundTrip:
     def test_to_dict_is_json_serialisable(self) -> None:
         import json
 
-        enumeration = metrics.Enumeration(
+        enumeration = lane_cluster.Enumeration(
             requested=('a.py',), resolved=('a.py',), unreadable=('c.py',), complete=False
         )
         assert json.loads(json.dumps(enumeration.to_dict()))['complete'] is False
@@ -383,7 +384,7 @@ class TestEnumerationRoundTrip:
     def test_enumeration_is_frozen(self) -> None:
         import dataclasses
 
-        enumeration = metrics.Enumeration(
+        enumeration = lane_cluster.Enumeration(
             requested=(), resolved=(), unreadable=(), complete=True
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
@@ -392,7 +393,7 @@ class TestEnumerationRoundTrip:
     def test_unreadable_entries_make_the_enumeration_incomplete(self) -> None:
         # `complete` is the single legible signal a caller checks; it must
         # never read True while files were skipped.
-        enumeration = metrics.Enumeration(
+        enumeration = lane_cluster.Enumeration(
             requested=('a.py',), resolved=(), unreadable=('a.py',), complete=False
         )
         assert enumeration.complete is False
@@ -438,7 +439,7 @@ class TestTheMeasuresOverTheRealCluster:
         # Anti-vacuity: the PRD's ceilings row counts the function-local imports
         # inside the package; on this tree the count is well above zero.
         total = 0
-        for relpath in metrics.resolve_cluster_paths(_REPO_ROOT).resolved:
+        for relpath in lane_cluster.resolve_cluster_paths(_REPO_ROOT).resolved:
             source = (_REPO_ROOT / relpath).read_text(encoding='utf-8')
             total += source_measures.function_local_imports(source, path=relpath)
         assert total > 0
@@ -622,7 +623,7 @@ class TestLanePatchTargets:
         ],
     )
     def test_the_lane_binding(self, body: str, expected: list[str]) -> None:
-        measures = metrics.test_file_measures(
+        measures = lane_cluster.test_file_measures(
             _LANE_IMPORT + body, path='t.py', patch_modules=_PATCH_MODULES
         )
         assert measures is not None
@@ -679,7 +680,7 @@ class TestLanePatchModules:
                 f'{_LANE_SRC}/pkg/leaf.py': '',
             },
         )
-        assert metrics.lane_patch_modules(root) == {
+        assert lane_cluster.lane_patch_modules(root) == {
             'orchestrator.merge_lane',
             'orchestrator.merge_lane.gates',
             'orchestrator.merge_lane.pkg',
@@ -688,7 +689,7 @@ class TestLanePatchModules:
 
     def test_a_tree_without_the_package_still_names_the_package(self, tmp_path: Path) -> None:
         root = _committed_tree(tmp_path, {'README.md': 'x\n'})
-        assert metrics.lane_patch_modules(root) == {metrics.LANE_PACKAGE}
+        assert lane_cluster.lane_patch_modules(root) == {lane_cluster.LANE_PACKAGE}
 
 
 # ---------------------------------------------------------------------------
@@ -698,20 +699,20 @@ class TestLanePatchModules:
 class TestImportsLaneModule:
     def test_import_from_a_cluster_module_is_lane_importing(self) -> None:
         source = 'from orchestrator.offline_lane import OfflineLaneWorker\n'
-        assert metrics.imports_lane_module(source, path='t.py') is True
+        assert lane_cluster.imports_lane_module(source, path='t.py') is True
 
     def test_plain_import_of_merge_lane_is_lane_importing(self) -> None:
-        assert metrics.imports_lane_module('import orchestrator.merge_lane\n', path='t.py') is True
+        assert lane_cluster.imports_lane_module('import orchestrator.merge_lane\n', path='t.py') is True
 
     def test_import_from_a_merge_lane_submodule_is_lane_importing(self) -> None:
         source = 'from orchestrator.merge_lane.worker import W\n'
-        assert metrics.imports_lane_module(source, path='t.py') is True
+        assert lane_cluster.imports_lane_module(source, path='t.py') is True
 
     def test_from_orchestrator_import_of_a_cluster_leaf_is_lane_importing(self) -> None:
-        assert metrics.imports_lane_module('from orchestrator import offline_lane\n', path='t.py') is True
+        assert lane_cluster.imports_lane_module('from orchestrator import offline_lane\n', path='t.py') is True
 
     def test_from_orchestrator_import_of_the_package_is_lane_importing(self) -> None:
-        assert metrics.imports_lane_module('from orchestrator import merge_lane\n', path='t.py') is True
+        assert lane_cluster.imports_lane_module('from orchestrator import merge_lane\n', path='t.py') is True
 
     @pytest.mark.parametrize(
         'source',
@@ -724,22 +725,22 @@ class TestImportsLaneModule:
     def test_the_package_is_named_by_lane_package_alone(
         self, source: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(metrics, 'LANE_PACKAGE', 'orchestrator.moved_lane')
-        assert metrics.imports_lane_module(source, path='t.py') is True
+        monkeypatch.setattr(lane_cluster, 'LANE_PACKAGE', 'orchestrator.moved_lane')
+        assert lane_cluster.imports_lane_module(source, path='t.py') is True
 
     def test_an_unrelated_orchestrator_module_is_not_lane_importing(self) -> None:
-        assert metrics.imports_lane_module('import orchestrator.workflow\n', path='t.py') is False
+        assert lane_cluster.imports_lane_module('import orchestrator.workflow\n', path='t.py') is False
 
     def test_a_module_with_no_imports_is_not_lane_importing(self) -> None:
-        assert metrics.imports_lane_module('x = 1\n', path='t.py') is False
+        assert lane_cluster.imports_lane_module('x = 1\n', path='t.py') is False
 
     def test_the_module_name_set_is_derived_from_cluster_paths(self) -> None:
         # Derived, never hand-listed, so the two can't drift when Appendix A is
         # edited.
-        assert 'orchestrator.offline_lane' in metrics.lane_module_names()
-        assert 'orchestrator.git_ops' in metrics.lane_module_names()
-        assert 'orchestrator.merge_queue' not in metrics.lane_module_names()
-        assert 'orchestrator.workflow' not in metrics.lane_module_names()
+        assert 'orchestrator.offline_lane' in lane_cluster.lane_module_names()
+        assert 'orchestrator.git_ops' in lane_cluster.lane_module_names()
+        assert 'orchestrator.merge_queue' not in lane_cluster.lane_module_names()
+        assert 'orchestrator.workflow' not in lane_cluster.lane_module_names()
 
 
 class TestTheTreeAndSourceFormsAgree:
@@ -766,15 +767,15 @@ class TestTheTreeAndSourceFormsAgree:
         ('from_source', 'from_tree'),
         [
             pytest.param(
-                lambda src: metrics.imports_lane_module(src, path='t.py'),
-                lambda src, tree: metrics.imports_lane_module_in_tree(tree),
+                lambda src: lane_cluster.imports_lane_module(src, path='t.py'),
+                lambda src, tree: lane_cluster.imports_lane_module_in_tree(tree),
                 id='imports_lane_module',
             ),
             pytest.param(
-                lambda src: metrics.test_file_measures(
+                lambda src: lane_cluster.test_file_measures(
                     src, path='t.py', patch_modules=_PATCH_MODULES
                 ),
-                lambda src, tree: metrics.test_file_measures_in_tree(tree, _PATCH_MODULES),
+                lambda src, tree: lane_cluster.test_file_measures_in_tree(tree, _PATCH_MODULES),
                 id='test_file_measures',
             ),
         ],
@@ -794,7 +795,7 @@ class TestTestFileMeasures:
         # non-lane-importing file can never be summed into the report by
         # accident.
         source = 'import orchestrator.workflow\n\nworker._x\n'
-        assert metrics.test_file_measures(source, path='t.py', patch_modules=_PATCH_MODULES) is None
+        assert lane_cluster.test_file_measures(source, path='t.py', patch_modules=_PATCH_MODULES) is None
 
     def test_a_lane_importing_file_yields_both_measures(self) -> None:
         source = (
@@ -803,7 +804,7 @@ class TestTestFileMeasures:
             "patch('orchestrator.merge_lane.worker.foo', x)\n"
             'worker._a._b\n'
         )
-        assert metrics.test_file_measures(source, path='t.py', patch_modules=_PATCH_MODULES) == {
+        assert lane_cluster.test_file_measures(source, path='t.py', patch_modules=_PATCH_MODULES) == {
             'patch_targets': ['worker.foo'],
             'private_reads': 2,
         }
@@ -814,7 +815,7 @@ class TestTestFileMeasures:
             "patch('orchestrator.merge_lane.worker.z', x)\n"
             "patch('orchestrator.merge_lane.worker.a', x)\n"
         )
-        measures = metrics.test_file_measures(source, path='t.py', patch_modules=_PATCH_MODULES)
+        measures = lane_cluster.test_file_measures(source, path='t.py', patch_modules=_PATCH_MODULES)
         assert measures is not None
         assert measures['patch_targets'] == ['worker.a', 'worker.z']
 
@@ -907,10 +908,10 @@ class TestBuildReport:
     def test_params_records_how_the_measurement_was_taken(self, report: dict) -> None:
         params = report['params']
         assert params['complexipy_version'] == source_measures.complexipy_version()
-        assert params['cluster_paths'] == list(metrics.CLUSTER_PATHS)
-        assert params['file_line_ceiling'] == metrics.FILE_LINE_CEILING
+        assert params['cluster_paths'] == list(lane_cluster.CLUSTER_PATHS)
+        assert params['file_line_ceiling'] == lane_cluster.FILE_LINE_CEILING
         assert params['new_function_cognitive_ceiling'] == (
-            metrics.NEW_FUNCTION_COGNITIVE_CEILING
+            lane_cluster.NEW_FUNCTION_COGNITIVE_CEILING
         )
 
     def test_enumeration_is_complete(self, report: dict) -> None:
@@ -993,7 +994,7 @@ def _test_tree_strays(block: dict) -> dict[str, list[str]]:
     `merge_lane/**` to real files), leaving two of the three silently weaker.
     An empty dict is clean; a non-empty one names the offending list and entries.
     """
-    cluster = set(metrics.CLUSTER_PATHS)
+    cluster = set(lane_cluster.CLUSTER_PATHS)
     strays = {}
     for key, value in block.items():
         if not isinstance(value, list):
@@ -1001,7 +1002,7 @@ def _test_tree_strays(block: dict) -> dict[str, list[str]]:
         found = [
             entry for entry in value
             if isinstance(entry, str)
-            and entry.startswith(f'{metrics.TESTS_ROOT}/')
+            and entry.startswith(f'{lane_cluster.TESTS_ROOT}/')
             and entry not in cluster
         ]
         if found:
@@ -1029,7 +1030,7 @@ class TestReportEnumerationSplitsTheTwoHalves:
         # The cluster half is PATHS, glob literals included -- those literals are
         # the SPOT record of PRD Appendix A and an unexpectedly-missing one IS
         # the finding, so a count could not express it.
-        assert enumeration['requested'] == list(metrics.CLUSTER_PATHS)
+        assert enumeration['requested'] == list(lane_cluster.CLUSTER_PATHS)
 
     def test_no_test_tree_path_list_survives_anywhere_in_the_block(
         self, enumeration: dict
@@ -1076,7 +1077,7 @@ class TestTestTreeSweep:
 
     @staticmethod
     def _tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-        monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
+        monkeypatch.setattr(lane_cluster, 'TESTS_ROOT', 'orchestrator/tests')
         return _committed_tree(
             tmp_path,
             {
@@ -1096,7 +1097,7 @@ class TestTestTreeSweep:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The sweep's contract: 3 files asked for, 1 measured, as COUNTS.
-        sweep = metrics.sweep_repo(self._tree(tmp_path, monkeypatch))
+        sweep = lane_cluster.sweep_repo(self._tree(tmp_path, monkeypatch))
         assert sweep.test_tree.requested == 3
         assert sweep.test_tree.resolved == 1
         assert list(sweep.tests) == ['orchestrator/tests/test_lane.py']
@@ -1107,7 +1108,7 @@ class TestTestTreeSweep:
         # INV-11 POLARITY at the sweep boundary: the skip is fail-SOFT per file
         # (an unrelated mid-edit test must not redden the lane's ratchet) but the
         # RECORD is not -- the path is named verbatim.
-        sweep = metrics.sweep_repo(self._tree(tmp_path, monkeypatch))
+        sweep = lane_cluster.sweep_repo(self._tree(tmp_path, monkeypatch))
         assert list(sweep.unreadable) == ['orchestrator/tests/test_broken.py']
 
     def test_a_skipped_file_marks_the_composed_block_incomplete(
@@ -1115,14 +1116,14 @@ class TestTestTreeSweep:
     ) -> None:
         # The seam that makes check_against_baseline REFUSE to compare: the
         # sweep's soft skip must still reach `complete` in the report block.
-        sweep = metrics.sweep_repo(self._tree(tmp_path, monkeypatch))
-        cluster = metrics.Enumeration(
+        sweep = lane_cluster.sweep_repo(self._tree(tmp_path, monkeypatch))
+        cluster = lane_cluster.Enumeration(
             requested=('a.py',), resolved=('a.py',), unreadable=(), complete=True
         )
-        block = metrics._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
+        block = lane_cluster._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
         assert block['complete'] is False
         assert block['unreadable'] == ['orchestrator/tests/test_broken.py']
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics._require_complete_enumeration({'enumeration': block})
         assert 'orchestrator/tests/test_broken.py' in str(excinfo.value)
 
@@ -1130,15 +1131,15 @@ class TestTestTreeSweep:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The other polarity, so the test above cannot pass vacuously.
-        monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
+        monkeypatch.setattr(lane_cluster, 'TESTS_ROOT', 'orchestrator/tests')
         root = _committed_tree(
             tmp_path, {'orchestrator/tests/test_ok.py': 'import json\n'}
         )
-        sweep = metrics.sweep_repo(root)
-        cluster = metrics.Enumeration(
+        sweep = lane_cluster.sweep_repo(root)
+        cluster = lane_cluster.Enumeration(
             requested=('a.py',), resolved=('a.py',), unreadable=(), complete=True
         )
-        block = metrics._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
+        block = lane_cluster._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
         assert block['complete'] is True
         assert block['unreadable'] == []
         assert block['test_tree'] == {'requested': 1, 'resolved': 0}
@@ -1148,7 +1149,7 @@ class TestTestTreeSweep:
     ) -> None:
         # ``only_in_tmp`` exists in no real checkout, so a module set read from
         # anywhere but the swept root would leave the receiver unbound.
-        monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
+        monkeypatch.setattr(lane_cluster, 'TESTS_ROOT', 'orchestrator/tests')
         root = _committed_tree(
             tmp_path,
             {
@@ -1161,7 +1162,7 @@ class TestTestTreeSweep:
                 ),
             },
         )
-        sweep = metrics.sweep_repo(root)
+        sweep = lane_cluster.sweep_repo(root)
         assert sweep.tests == {
             'orchestrator/tests/test_g.py': {
                 'patch_targets': ['only_in_tmp.X'],
@@ -1174,12 +1175,12 @@ class TestTestTreeSweep:
     ) -> None:
         # Both halves' unreadable paths travel verbatim in ONE top-level list --
         # the cluster half's finding must not be diluted or dropped.
-        monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
-        sweep = metrics.sweep_repo(_committed_tree(tmp_path, {'README.md': 'x\n'}))
-        cluster = metrics.Enumeration(
+        monkeypatch.setattr(lane_cluster, 'TESTS_ROOT', 'orchestrator/tests')
+        sweep = lane_cluster.sweep_repo(_committed_tree(tmp_path, {'README.md': 'x\n'}))
+        cluster = lane_cluster.Enumeration(
             requested=('a.py',), resolved=(), unreadable=('a.py',), complete=False
         )
-        block = metrics._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
+        block = lane_cluster._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
         assert block['unreadable'] == ['a.py']
         assert block['complete'] is False
 
@@ -1232,7 +1233,7 @@ class TestStoredEnumerationIsChurnFree:
         # a swept-but-never-measured file must not reach the baseline, and the
         # only orchestrator/tests paths left are CLUSTER_PATHS literals.
         report = self._report(
-            requested=list(metrics.CLUSTER_PATHS),
+            requested=list(lane_cluster.CLUSTER_PATHS),
             resolved=['orchestrator/tests/conftest.py'],
         )
         assert _test_tree_strays(self._stored(report)) == {}, (
@@ -1244,11 +1245,11 @@ class TestStoredEnumerationIsChurnFree:
         # LITERALS never appear in `resolved`, so a resolved-only stored list
         # would silently delete them -- and a glob expanding to zero would stop
         # being legible in the RESULT.
-        globs = [entry for entry in metrics.CLUSTER_PATHS if '*' in entry]
+        globs = [entry for entry in lane_cluster.CLUSTER_PATHS if '*' in entry]
         assert globs, 'expected at least one glob entry in CLUSTER_PATHS'
-        report = self._report(requested=list(metrics.CLUSTER_PATHS))
+        report = self._report(requested=list(lane_cluster.CLUSTER_PATHS))
         kept = self._stored(report)['requested']
-        assert kept == list(metrics.CLUSTER_PATHS)
+        assert kept == list(lane_cluster.CLUSTER_PATHS)
         for glob in globs:
             assert glob in kept
 
@@ -1375,21 +1376,21 @@ class TestBaselineIO:
         # INV-11: a missing baseline is never an empty-baseline PASS, which
         # would silently disarm the ratchet for every downstream task.
         missing = tmp_path / 'nope.json'
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.load_baseline(missing)
         assert 'nope.json' in str(excinfo.value)
 
     def test_malformed_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         target = tmp_path / 'baseline.json'
         target.write_text('{"files": ', encoding='utf-8')
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.load_baseline(target)
         assert 'baseline.json' in str(excinfo.value)
 
     def test_non_object_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         target = tmp_path / 'baseline.json'
         target.write_text('[]', encoding='utf-8')
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.load_baseline(target)
         assert 'baseline.json' in str(excinfo.value)
 
@@ -1609,8 +1610,8 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
     def test_a_ratchet_fault_is_an_instrument_failure(self) -> None:
         # The ratchet names its own faults, but they are still exit 2: every
         # boundary catches the measure layer's MetricsError for both layers.
-        assert issubclass(metrics.RatchetError, source_measures.MetricsError)
-        assert issubclass(metrics.AppendOnlyViolation, metrics.RatchetError)
+        assert issubclass(lane_cluster.RatchetError, source_measures.MetricsError)
+        assert issubclass(metrics.AppendOnlyViolation, lane_cluster.RatchetError)
 
     # CEILINGS ARE A HOLE OF THE SAME SHAPE, and the reason is subtle: the two
     # ceilings apply only to keys ABSENT from the baseline. So a blind
@@ -1627,7 +1628,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
         current['files'][self._NEW_PATH] = blank_file_entry(
-            lines=metrics.FILE_LINE_CEILING + 1
+            lines=lane_cluster.FILE_LINE_CEILING + 1
         )
 
         with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
@@ -1645,7 +1646,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
         current['functions'][f'{_MQ}::brand_new'] = (
-            metrics.NEW_FUNCTION_COGNITIVE_CEILING + 1
+            lane_cluster.NEW_FUNCTION_COGNITIVE_CEILING + 1
         )
 
         with pytest.raises(metrics.UnauthorizedRaise) as excinfo:
@@ -1665,7 +1666,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         current = copy.deepcopy(_ratchet_baseline())
         current['files'][self._NEW_PATH] = blank_file_entry(
-            lines=metrics.FILE_LINE_CEILING
+            lines=lane_cluster.FILE_LINE_CEILING
         )
 
         assert metrics.write_baseline(target, current).record is None
@@ -1697,7 +1698,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         ledger = tmp_path / 'raises'
         current = copy.deepcopy(_ratchet_baseline())
         current['files'][self._NEW_PATH] = blank_file_entry(
-            lines=metrics.FILE_LINE_CEILING + 1
+            lines=lane_cluster.FILE_LINE_CEILING + 1
         )
 
         metrics.write_baseline(
@@ -1709,8 +1710,8 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
             row for row in measures if row['measure'] == 'new_file_over_ceiling'
         )
         assert breach['key'] == self._NEW_PATH
-        assert breach['baseline'] == metrics.FILE_LINE_CEILING
-        assert breach['current'] == metrics.FILE_LINE_CEILING + 1
+        assert breach['baseline'] == lane_cluster.FILE_LINE_CEILING
+        assert breach['current'] == lane_cluster.FILE_LINE_CEILING + 1
 
 
 class TestAuthorizedRaise:
@@ -1850,7 +1851,7 @@ class TestAuthorizedRaise:
         # whether the report it accompanied happened to raise anything -- a
         # blank --reason over a lowering run would pass unremarked, and the
         # ledger's whole purpose is to answer WHO and WHY (heuristic 10).
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.RaiseAuthorization(task_id=task_id, reason=reason)
 
         assert field in str(excinfo.value)
@@ -1861,7 +1862,7 @@ class TestAuthorizedRaise:
         target, ledger = self._seeded(tmp_path)
         before = target.read_text(encoding='utf-8')
 
-        with pytest.raises(metrics.RatchetError):
+        with pytest.raises(lane_cluster.RatchetError):
             metrics.write_baseline(
                 target,
                 self._raised(),
@@ -1928,7 +1929,7 @@ class TestAuthorizedRaiseLedger:
 
         assert metrics.load_ledger(missing) == []
 
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.load_baseline(missing)
         assert 'nope.json' in str(excinfo.value)
 
@@ -1952,7 +1953,7 @@ class TestAuthorizedRaiseLedger:
         ledger = tmp_path / 'raises'
         ledger.mkdir()
         (ledger / name).write_text(content, encoding='utf-8')
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.load_ledger(ledger)
         assert name in str(excinfo.value), why
 
@@ -1962,7 +1963,7 @@ class TestAuthorizedRaiseLedger:
         # The retired shape at the new path: a single file is not a ledger.
         target = tmp_path / 'raises'
         target.write_text('{"raises": []}', encoding='utf-8')
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.load_ledger(target)
         assert 'not a directory' in str(excinfo.value)
 
@@ -2058,10 +2059,10 @@ def _ratchet_baseline() -> dict:
         'schema_version': 1,
         'params': {
             'complexipy_version': '6.2.0',
-            'cluster_paths': list(metrics.CLUSTER_PATHS),
-            'file_line_ceiling': metrics.FILE_LINE_CEILING,
+            'cluster_paths': list(lane_cluster.CLUSTER_PATHS),
+            'file_line_ceiling': lane_cluster.FILE_LINE_CEILING,
             'new_function_cognitive_ceiling': (
-                metrics.NEW_FUNCTION_COGNITIVE_CEILING
+                lane_cluster.NEW_FUNCTION_COGNITIVE_CEILING
             ),
         },
         # REAL-SHAPED means the STORED shape, which has no `test_tree` key: the
@@ -2390,7 +2391,7 @@ class TestComparatorPreconditions:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         current['params']['complexipy_version'] = '7.0.1'
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.check_against_baseline(current, baseline)
         assert '7.0.1' in str(excinfo.value)
         assert '6.2.0' in str(excinfo.value)
@@ -2399,9 +2400,9 @@ class TestComparatorPreconditions:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         baseline['params']['cluster_paths'] = [
-            p for p in metrics.CLUSTER_PATHS if p != _GIT_OPS
+            p for p in lane_cluster.CLUSTER_PATHS if p != _GIT_OPS
         ] + ['orchestrator/src/orchestrator/ghost.py']
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.check_against_baseline(current, baseline)
         message = str(excinfo.value)
         assert _GIT_OPS in message
@@ -2415,7 +2416,7 @@ class TestComparatorPreconditions:
         current = copy.deepcopy(baseline)
         current['enumeration']['complete'] = False
         current['enumeration']['unreadable'] = ['orchestrator/tests/test_broken.py']
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.check_against_baseline(current, baseline)
         assert 'test_broken.py' in str(excinfo.value)
 
@@ -2427,7 +2428,7 @@ class TestComparatorPreconditions:
         current = copy.deepcopy(baseline)
         current['enumeration']['complete'] = False
         current['files'][_MQ]['cognitive'] += 5000
-        with pytest.raises(metrics.RatchetError):
+        with pytest.raises(lane_cluster.RatchetError):
             metrics.check_against_baseline(current, baseline)
 
 
@@ -2481,7 +2482,7 @@ def stub_measurement(monkeypatch: pytest.MonkeyPatch, live_report: dict) -> dict
     CLI test using this fixture still compares live numbers.
     """
     monkeypatch.setattr(
-        metrics, 'build_report', lambda root: copy.deepcopy(live_report)
+        lane_cluster, 'build_report', lambda root: copy.deepcopy(live_report)
     )
     return live_report
 
@@ -2667,7 +2668,7 @@ class TestCheckCli:
             roots.append(root)
             return copy.deepcopy(live_report)
 
-        monkeypatch.setattr(metrics, 'build_report', recording)
+        monkeypatch.setattr(lane_cluster, 'build_report', recording)
         assert metrics.main(['--check']) == 0
         assert [r.resolve() for r in roots] == [_REPO_ROOT.resolve()]
 
@@ -2721,7 +2722,7 @@ class TestAuthorizeRaiseCli:
         monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
     ) -> None:
         target, ledger, raised = self._seeded(stub_measurement, tmp_path)
-        monkeypatch.setattr(metrics, 'build_report', lambda root: copy.deepcopy(raised))
+        monkeypatch.setattr(lane_cluster, 'build_report', lambda root: copy.deepcopy(raised))
 
         assert metrics.main([
             '--write-baseline', str(target),
@@ -2749,7 +2750,7 @@ class TestAuthorizeRaiseCli:
         # reader to the wrong file.
         target, ledger, raised = self._seeded(stub_measurement, tmp_path)
         before = target.read_text(encoding='utf-8')
-        monkeypatch.setattr(metrics, 'build_report', lambda root: copy.deepcopy(raised))
+        monkeypatch.setattr(lane_cluster, 'build_report', lambda root: copy.deepcopy(raised))
 
         assert metrics.main(['--write-baseline', str(target)]) == 1
 
@@ -2762,7 +2763,7 @@ class TestAuthorizeRaiseCli:
         def explode(root: Path) -> dict:
             raise source_measures.MetricsError('complexipy 7.0.1 is outside >=6.2,<7')
 
-        monkeypatch.setattr(metrics, 'build_report', explode)
+        monkeypatch.setattr(lane_cluster, 'build_report', explode)
         assert metrics.main(['--write-baseline', str(target)]) == 2
 
     @pytest.mark.parametrize(
@@ -2829,7 +2830,7 @@ class TestAuthorizeRaiseCli:
         def explode(root: Path) -> dict:
             raise AssertionError('measured despite a blank --reason')
 
-        monkeypatch.setattr(metrics, 'build_report', explode)
+        monkeypatch.setattr(lane_cluster, 'build_report', explode)
         target = tmp_path / 'b.json'
 
         with pytest.raises(SystemExit) as excinfo:
@@ -2854,7 +2855,7 @@ class TestAuthorizeRaiseCli:
         metrics.write_baseline(target, stub_measurement)
         lowered = copy.deepcopy(stub_measurement)
         lowered['files'][_MQ]['cognitive'] -= 10
-        monkeypatch.setattr(metrics, 'build_report', lambda root: copy.deepcopy(lowered))
+        monkeypatch.setattr(lane_cluster, 'build_report', lambda root: copy.deepcopy(lowered))
 
         assert metrics.main([
             '--write-baseline', str(target),
@@ -2896,7 +2897,7 @@ class TestCliContract:
         def explode(root: Path) -> dict:
             raise source_measures.MetricsError('complexipy 7.0.1 is outside >=6.2,<7')
 
-        monkeypatch.setattr(metrics, 'build_report', explode)
+        monkeypatch.setattr(lane_cluster, 'build_report', explode)
         assert metrics.main(['--report']) == 2
         err = capsys.readouterr().err
         assert 'complexipy 7.0.1' in err
@@ -3072,7 +3073,7 @@ class TestBaselineIsNotVacuous:
         # just as happily. Measured 22 resolved paths from 23 CLUSTER_PATHS
         # entries (merge_lane/** expands to zero until PRD task zeta1).
         enumeration = committed_baseline['enumeration']
-        assert enumeration['requested'] == list(metrics.CLUSTER_PATHS)
+        assert enumeration['requested'] == list(lane_cluster.CLUSTER_PATHS)
         assert len(enumeration['resolved']) >= 15
 
     def test_the_live_sweep_denominator_covers_the_whole_test_tree(

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
+    import merge_lane_cluster as lane_cluster
     import merge_lane_metrics as metrics
     import ratchet_revisions as revisions
     import source_measures
@@ -72,7 +73,7 @@ def _commit(root: Path, revision: str) -> str:
     """The commit *revision* names; a ``RatchetError`` when it names none."""
     oid = revisions.object_id(root, f'{revision}^{{commit}}')
     if oid is None:
-        raise metrics.RatchetError(f'{revision!r} names no commit, so there is no move to audit')
+        raise lane_cluster.RatchetError(f'{revision!r} names no commit, so there is no move to audit')
     return oid
 
 

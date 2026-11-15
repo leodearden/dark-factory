@@ -24,19 +24,20 @@ from typing import Self
 
 from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
-_CHECKOUT = Path(__file__).parents[2]
-_SCRIPTS = _CHECKOUT / 'scripts'
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
+sys.path.insert(0, str(Path(__file__).parents[2] / 'scripts'))
 
-import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
-import source_measures  # type: ignore[import-not-found]  # noqa: E402
+import merge_lane_cluster as lane_cluster
+import merge_lane_metrics as metrics
+import source_measures
+
+_CHECKOUT = Path(__file__).parents[2]
 
 __all__ = [
     'GATE_IMPORT_CLOSURE',
     'RatchetRepo',
     'a_py_cognitive_raise',
     'blank_file_entry',
+    'lane_cluster',
     'metrics',
     'record',
     'source_measures',
@@ -51,6 +52,7 @@ __all__ = [
 GATE_IMPORT_CLOSURE = (
     'scripts/ratchet_revisions.py',
     'scripts/merge_lane_metrics.py',
+    'scripts/merge_lane_cluster.py',
     'scripts/source_measures.py',
     'scripts/_checkout.py',
     'pyproject.toml',

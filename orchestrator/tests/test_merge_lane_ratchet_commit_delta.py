@@ -19,7 +19,12 @@ import json
 from pathlib import Path
 
 import pytest
-from _merge_lane_ratchet_fixtures import blank_file_entry, metrics, synthetic_report
+from _merge_lane_ratchet_fixtures import (
+    blank_file_entry,
+    lane_cluster,
+    metrics,
+    synthetic_report,
+)
 
 
 def _baseline_image(tmp_path: Path, name: str, report: dict) -> Path:
@@ -146,7 +151,7 @@ class TestCompareBaselineFiles:
         # Proves ``_check_ceilings`` is reached, not just the four rise arms: a
         # path ABSENT from the previous image is held to the ceiling, so writing
         # an oversized new file into the baseline cannot grandfather it.
-        oversized = metrics.FILE_LINE_CEILING + 1
+        oversized = lane_cluster.FILE_LINE_CEILING + 1
         previous, current = self._pair(
             tmp_path,
             lambda report: report['files'].__setitem__(
@@ -159,7 +164,7 @@ class TestCompareBaselineFiles:
         assert (
             'new_file_over_ceiling',
             'new_big.py',
-            metrics.FILE_LINE_CEILING,
+            lane_cluster.FILE_LINE_CEILING,
             oversized,
         ) in [_violation_fields(v) for v in raises]
 
@@ -169,7 +174,7 @@ class TestCompareBaselineFiles:
         previous = _baseline_image(tmp_path, 'previous.json', synthetic_report())
         absent = tmp_path / 'gone.json'
 
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.compare_baseline_files(previous, absent)
 
         assert str(absent) in str(excinfo.value)
@@ -179,7 +184,7 @@ class TestCompareBaselineFiles:
         broken = tmp_path / 'broken.json'
         broken.write_text('{"files": {', encoding='utf-8')
 
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.compare_baseline_files(previous, broken)
 
         message = str(excinfo.value)
@@ -635,7 +640,7 @@ class TestLegacyLedgerEntries:
     def test_a_malformed_retired_array_is_a_named_hard_failure(self, text: str) -> None:
         # Its entries are history being moved: one that cannot be read cannot be
         # checked into a file, and must never read as "nothing to move".
-        with pytest.raises(metrics.RatchetError) as excinfo:
+        with pytest.raises(lane_cluster.RatchetError) as excinfo:
             metrics.legacy_ledger_entries(text)
 
         assert metrics.LEGACY_LEDGER_RELPATH in str(excinfo.value)
@@ -767,7 +772,7 @@ class TestUnrecordedRaises:
         breach = metrics.Violation(
             measure=metrics.NEW_FUNCTION_OVER_CEILING,
             key='a.py::new',
-            baseline=metrics.NEW_FUNCTION_COGNITIVE_CEILING,
+            baseline=lane_cluster.NEW_FUNCTION_COGNITIVE_CEILING,
             current=40,
             message='breach',
         )
