@@ -42,6 +42,7 @@ class StepStatus(StrEnum):
     OK = 'ok'
     FAILED = 'failed'
     PARTIAL = 'partial'
+    QUARANTINED = 'quarantined'
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,10 @@ class StepOutcome:
     def partial(cls, step: str, failures: tuple[EntryFailure, ...]) -> StepOutcome:
         return cls(step, StepStatus.PARTIAL, failed_entries=failures)
 
+    @classmethod
+    def quarantined(cls, step: str) -> StepOutcome:
+        return cls(step, StepStatus.QUARANTINED)
+
 
 @dataclass(frozen=True)
 class StepInFlight:
@@ -164,6 +169,13 @@ class StartupJournal:
     @property
     def inherited(self) -> StartupFailureStreak | None:
         return self._inherited
+
+    def is_quarantined(self, step: StartupStep) -> bool:
+        streak = self._inherited
+        return (
+            not step.fatal and streak is not None
+            and streak.step == step.name and streak.reached_threshold
+        )
 
     def record_in_flight(self, step: str, started_at: datetime) -> None:
         self._in_flight = StepInFlight(step, started_at)
@@ -234,12 +246,16 @@ async def run_startup_step(
     escalation_queue: EscalationQueue | None,
     filing_claimant_run_id: str | None,
 ) -> StepOutcome:
-    """Run *step*; report a non-ok outcome; re-raise only a fatal step's exception."""
+    """Run *step* unless quarantined; report a non-ok outcome; re-raise only a fatal step's exception.
+
+    A raise leaves the step in flight on *journal*, so the outer handler can blame it.
+    """
+    streak = journal.inherited
+    if streak is not None and journal.is_quarantined(step):
+        return _skip_quarantined(step.name, streak)
     journal.record_in_flight(step.name, datetime.now(UTC))
     try:
-        result = step.run()
-        if inspect.isawaitable(result):
-            result = await result
+        result = await _run_body(step)
     except Exception as exc:
         outcome = StepOutcome.failed(step.name, exc)
         logger.error(
@@ -247,9 +263,11 @@ async def run_startup_step(
             step.name, ' (fatal, startup refused)' if step.fatal else '',
             outcome.exception_type, outcome.message, exc_info=exc,
         )
+        journal.record_failure(step.name, type(exc).__name__, str(exc))
         _report(outcome, step.fatal, event_store, escalation_queue, filing_claimant_run_id)
         if step.fatal:
             raise
+        journal.record_returned(step.name)
         return outcome
     outcome = _outcome_of_result(step.name, result)
     if outcome.status is StepStatus.PARTIAL:
@@ -258,7 +276,24 @@ async def run_startup_step(
             step.name, len(outcome.failed_entries), _entry_names(outcome),
         )
         _report(outcome, step.fatal, event_store, escalation_queue, filing_claimant_run_id)
+    journal.record_returned(step.name)
     return outcome
+
+
+async def _run_body(step: StartupStep) -> object:
+    result = step.run()
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
+def _skip_quarantined(step: str, streak: StartupFailureStreak) -> StepOutcome:
+    logger.warning(
+        'startup step %s quarantined: it failed on %d consecutive starts (last %s: %s); '
+        'skipping it on this start',
+        step, streak.consecutive, streak.exception_type, streak.message,
+    )
+    return StepOutcome.quarantined(step)
 
 
 def _outcome_of_result(step: str, result: object) -> StepOutcome:
