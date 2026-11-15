@@ -6,7 +6,7 @@ as one runnable report, so the PRD's downstream decompositions read one table
 instead of each hand-writing its own SQL (and each getting a slightly different
 answer).
 
-Sections: landings/day, the four-segment lead-time split, verify duration by
+Sections: landings/day, the lead-time split, verify duration by
 runner, remote-host occupancy (three estimators, side by side), heartbeat queue
 depth, merge_attempt/merge_finalized outcome mixes, and — behind flags — the
 speculation and merge-ahead-chain sections, plus `--policy`: the lane policy
@@ -37,6 +37,7 @@ import sqlite3
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
+from dataclasses import asdict, dataclass, fields
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -397,23 +398,58 @@ def _any_between(
     return False
 
 
-def _first_at_or_after(
-    events: Sequence[dict[str, Any]], cutoff: datetime
-) -> tuple[datetime, dict[str, Any]] | None:
-    """The earliest event at or after *cutoff*, with its parsed timestamp."""
-    best: tuple[datetime, dict[str, Any]] | None = None
-    for event in events:
-        ts = _parse_ts(event.get('timestamp'))
-        if ts is None or ts < cutoff:
-            continue
-        if best is None or ts < best[0]:
-            best = (ts, event)
-    return best
+def _rows_in(
+    events: Sequence[dict[str, Any]], lo: datetime, hi: datetime
+) -> list[tuple[datetime, dict[str, Any]]]:
+    """Events stamped in the half-open ``[lo, hi)``, in time order, with timestamps."""
+    stamped = [(_parse_ts(event.get('timestamp')), event) for event in events]
+    in_span = [(ts, event) for ts, event in stamped if ts is not None and lo <= ts < hi]
+    return sorted(in_span, key=lambda pair: pair[0])
+
+
+def _minutes(earlier: datetime, later: datetime) -> float:
+    return (later - earlier).total_seconds() / 60.0
 
 
 # ---------------------------------------------------------------------------
-# Section: the four-segment lead-time split.
+# Section: the lead-time split.
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LandingSplit:
+    """One landing's lead time in minutes; ``None`` is unattributable, not 0."""
+
+    lead: float
+    wait: float | None
+    requeued: float | None
+    verify: float | None
+    residual: float | None
+    last_verify_to_land: float | None
+
+
+def _split_landing(
+    queued_ts: datetime,
+    finalized_ts: datetime,
+    dequeue_rows: Sequence[dict[str, Any]],
+    verify_rows: Sequence[dict[str, Any]],
+) -> LandingSplit:
+    dispatches = [ts for ts, _ in _rows_in(dequeue_rows, queued_ts, finalized_ts)]
+    attempt_start = dispatches[-1] if dispatches else queued_ts
+    attempt = [
+        (ts, minutes)
+        for ts, row in _rows_in(verify_rows, attempt_start, finalized_ts)
+        if (minutes := _duration_minutes(row.get('data', {}))) is not None
+    ]
+    lead = _minutes(queued_ts, finalized_ts)
+    verify = sum(minutes for _, minutes in attempt) if attempt else None
+    to_land = _minutes(attempt[-1][0], finalized_ts) if attempt else None
+    if not dispatches:
+        return LandingSplit(lead, None, None, verify, None, to_land)
+    wait = _minutes(queued_ts, dispatches[0])
+    requeued = _minutes(dispatches[0], dispatches[-1])
+    residual = lead - wait - requeued - (verify or 0.0)
+    return LandingSplit(lead, wait, requeued, verify, residual, to_land)
 
 
 def compute_lead_time(
@@ -424,9 +460,9 @@ def compute_lead_time(
     lo: datetime,
     hi: datetime,
 ) -> dict[str, Any]:
-    """Split merge lead time into queue wait, verify, and a finalize+CAS residual.
+    """Split merge lead time into queue wait, re-queued, verify and finalize+CAS.
 
-        merge_queued -> merge_dequeued -> sum(merge_verify) -> merge_finalized
+        merge_queued -> merge_dequeued+ -> sum(merge_verify) -> merge_finalized
 
     THE JOIN (plan decision 2, validated live).  For each landing — a
     `merge_finalized` row with ``data['state'] == 'done'`` — the lead-time
@@ -443,65 +479,57 @@ def compute_lead_time(
     timestamp, so every duration here is a difference of row ``timestamp``
     columns.  Verify time is the sum of ``data['duration_ms']`` — read via
     :func:`_duration_minutes`, NOT the events table's ``duration_ms`` COLUMN,
-    which `event_store.py` leaves NULL for this event type — over the task's
-    `merge_verify` rows in ``[queued_ts, finalized_ts)``.
+    which `event_store.py` leaves NULL for this event type.
 
-    THE VERIFY SUM IS SCOPED TO THE JOINED ATTEMPT, for the same reason the
-    lead join is.  A task that re-queued has `merge_verify` rows from its
-    earlier, superseded attempts still in the window under the same task_id;
-    summing every one of them charges this attempt for work it did not do, and
-    the residual then goes negative — a task queued 00:00, verified 50 min,
-    re-queued 02:00, verified 5 min and landed 02:20 gives lead 20.0, wait
-    2.0, verify 55.0 and a meaningless residual of -37.0.  Restricting the sum
-    to the joined attempt's span is what makes ``lead = wait + verify +
-    residual`` an actual decomposition.  This is not a hypothetical: over the
-    dated window below, the unscoped sum gave a NEGATIVE residual on 20 of 199
-    landings (worst -124.3 min) and inflated verify p90 from 52.5 to 70.3;
-    scoped, 0 of 199 are negative and the residual's own minimum is +0.08.  A
-    residual could still go negative if a single verify's duration reached
-    back before its own queue row (the event is emitted at completion, so a
-    long verify straddling the join is timestamped in-span), so
-    ``n_negative_residual`` counts them rather than letting them hide inside a
-    percentile.
+    THE DISPATCHES.  An internal re-queue
+    (`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._requeue_request`)
+    emits no `merge_queued`, so it shows only as a further `merge_dequeued`
+    under the same joined queue row.  :func:`_split_landing` cuts each landing
+    at its dispatches, the `merge_dequeued` rows in ``[queued_ts,
+    finalized_ts)``: queue wait runs to the first, re-queued from the first to
+    the last (aborted attempts plus their re-queue waits), and
+    ``lead = wait + requeued + verify + residual``.  A dequeue stamped at or
+    after the landing (a stale duplicate request later found already_merged)
+    is no landing's wait: taking it as one made wait exceed lead.
+
+    THE VERIFY SUM IS SCOPED TO THE LANDING ATTEMPT, ``[last dispatch,
+    finalized_ts)`` (``[queued_ts, finalized_ts)`` without a dispatch), for
+    the same reason the lead join is: earlier attempts' `merge_verify` rows
+    are still in the window under the same task_id, and re-queued already
+    holds their time, so summing them too drives the residual negative.  Over
+    the PRD's dated window an unscoped sum gave a NEGATIVE residual on 20 of
+    199 landings (worst -124.3 min) and inflated verify p90 from 52.5 to 70.3.
+    One verify whose duration reaches back before its own dispatch (the event
+    is emitted at completion) still can, so ``n_negative_residual`` counts
+    them rather than letting them hide inside a percentile.
 
     Segment availability differs per task, so each series carries its own ``n``:
       lead      every matched landing
-      wait      landings with a `merge_dequeued` at or after the joined queue row
-      verify    landings with at least one in-window `merge_verify` row — a task
-                with none is EXCLUDED rather than contributing 0.0, which would
-                read as an instantaneous verify
-      residual  lead - wait - verify, over landings that have a wait (without
-                one the remainder is not attributable to finalize+CAS).  A
-                missing verify counts as 0 there, so a task whose verify rows
-                fell outside the window inflates its residual.
+      wait      landings with at least one dispatch
+      requeued  the same landings; 0.0 for a single dispatch
+      verify    landings with a usable `merge_verify` row in the attempt scope
+                — one with none is EXCLUDED, not 0.0 (an instantaneous verify)
+      residual  lead - wait - requeued - verify (a missing verify counts as 0),
+                over landings with a dispatch: without one it is not finalize+CAS
+      last_verify_to_land
+                landing minus the attempt's latest `merge_verify` row, over the
+                verify landings: finalize time alone.  NOT additive, because the
+                residual also holds the gap from the last dispatch to its verify.
 
     WINDOW EDGE.  A landing early in the window is often `unmatched` only
     because its `merge_queued` row predates *lo*; that is a truncation
     artefact, not evidence the task was never queued.  The resolved bounds are
     returned so a caller can say so.
 
-    RE-MEASURED on this branch against the live dark_factory store over the
-    PRD's dated window 2026-08-20T16:10:00+00:00..2026-09-03T16:10:00+00:00
-    (n=199 matched landings, 1 unmatched at the window's leading edge):
-    lead p50/p90 = 49.9/172.0 min against the PRD's 50.0/171.7, and queue wait
-    p50/p90 = 0.0/110.7 against the PRD's "~0 / 110.4".  Verify p50/p90 =
-    40.7/52.5 and residual p50/p90 = 2.0/24.6, with no negative residual.
-    Neither the lead nor the wait figure moved when the verify sum was scoped
-    — those two are joins, not sums — so the PRD rows this reproduces are
-    unaffected by that correction.
-
-    Returns ``{'lead', 'wait', 'verify', 'residual', 'matched', 'unmatched',
-    'unmatched_task_ids', 'n_negative_residual', 'window'}``; the four series
-    are :func:`_series` dicts.
+    Returns the six :func:`_series` dicts keyed by the :class:`LandingSplit`
+    field names, plus ``'matched'``, ``'unmatched'``, ``'unmatched_task_ids'``,
+    ``'n_negative_residual'`` and ``'window'``.
     """
     queued_by_task = _by_task(queued_events)
     dequeued_by_task = _by_task(dequeued_events)
     verify_by_task = _by_task(verify_events)
 
-    lead: list[float] = []
-    wait: list[float] = []
-    verify: list[float] = []
-    residual: list[float] = []
+    columns: dict[str, list[float]] = {f.name: [] for f in fields(LandingSplit)}
     matched = 0
     unmatched_task_ids: list[str] = []
 
@@ -518,49 +546,23 @@ def compute_lead_time(
         if joined is None:
             unmatched_task_ids.append(task_id)
             continue
-        queued_ts, _ = joined
         matched += 1
-
-        lead_min = (finalized_ts - queued_ts).total_seconds() / 60.0
-        lead.append(lead_min)
-
-        # Scoped to THIS attempt, exactly as the lead join is.  A task that
-        # re-queues has `merge_verify` rows from its earlier, superseded
-        # attempts still sitting in the window under the same task_id; summing
-        # all of them charges the current attempt for work it did not do and
-        # can drive the residual negative, which is meaningless as a
-        # "finalize+CAS" figure.  So only rows in [queued_ts, finalized_ts) —
-        # the span the lead was measured over — count.
-        verify_min: float | None = None
-        attempt_minutes: list[float] = []
-        for row in verify_by_task.get(task_id, []):
-            row_ts = _parse_ts(row.get('timestamp'))
-            if row_ts is None or row_ts < queued_ts or row_ts >= finalized_ts:
-                continue
-            minutes = _duration_minutes(row.get('data', {}))
-            if minutes is not None:
-                attempt_minutes.append(minutes)
-        if attempt_minutes:
-            verify_min = sum(attempt_minutes)
-            verify.append(verify_min)
-
-        dequeued = _first_at_or_after(dequeued_by_task.get(task_id, []), queued_ts)
-        if dequeued is not None:
-            wait_min = (dequeued[0] - queued_ts).total_seconds() / 60.0
-            wait.append(wait_min)
-            residual.append(lead_min - wait_min - (verify_min or 0.0))
+        split = _split_landing(
+            joined[0], finalized_ts,
+            dequeued_by_task.get(task_id, []), verify_by_task.get(task_id, []),
+        )
+        for name, value in asdict(split).items():
+            if value is not None:
+                columns[name].append(value)
 
     return {
-        'lead': _series(lead),
-        'wait': _series(wait),
-        'verify': _series(verify),
-        'residual': _series(residual),
+        **{name: _series(values) for name, values in columns.items()},
         'matched': matched,
         'unmatched': len(unmatched_task_ids),
         'unmatched_task_ids': unmatched_task_ids,
-        # Surfaced, not swallowed: a negative residual means the three
-        # segments did not decompose the lead for that landing.
-        'n_negative_residual': sum(1 for value in residual if value < 0),
+        # Surfaced, not swallowed: a negative residual means the segments did
+        # not decompose the lead for that landing.
+        'n_negative_residual': sum(1 for value in columns['residual'] if value < 0),
         'window': (_iso(lo), _iso(hi)),
     }
 
