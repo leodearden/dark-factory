@@ -80,7 +80,6 @@ class TestIsUnmeasurable:
         assert is_unmeasurable(_implementer(cap_tainted=True)) is False
 
 
-
 class TestCandidateCostUsd:
     """A plan-only cell's spend nets out its plan judge; a workflow cell's does not."""
 
@@ -119,6 +118,7 @@ class TestCandidateCostUsd:
         assert '0.3' in message
         assert '0.5' in message
         assert 'subset' in message
+
 
 class TestJudgedWithoutReference:
     """An absent marker is unknown, never False."""

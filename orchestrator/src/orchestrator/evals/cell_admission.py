@@ -149,8 +149,8 @@ def candidate_cost_usd(metrics: dict[str, Any], *, where: str = '?') -> float:
     cell's ``cost_usd`` is returned unchanged.
 
     Raises ``ValueError`` naming *where* when a plan-only cell's judge spend
-    exceeds its ``cost_usd``. Rationale: docs/plan-scoring-and-judge.md, "The
-    composite report (task 3099)".
+    exceeds its ``cost_usd``. Rationale: docs/plan-scoring-and-judge.md, "A
+    plan-only cell's cost is its candidate's spend (task 3848)".
     """
     cost = float(metrics.get('cost_usd', 0.0) or 0.0)
     if not is_plan_only(metrics):
