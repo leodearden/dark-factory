@@ -85,9 +85,9 @@ def test_agent_cli_backends_are_the_six_dispatch_arms() -> None:
 
 
 def test_sdk_backends_are_the_in_process_sdks() -> None:
-    assert SDK_BACKENDS == {Backend.ANTHROPIC_API, Backend.OPENAI_API}
+    assert {Backend.ANTHROPIC_API, Backend.OPENAI_API} == SDK_BACKENDS
 
 
 def test_every_backend_is_exactly_one_kind() -> None:
     assert AGENT_CLI_BACKENDS.isdisjoint(SDK_BACKENDS)
-    assert AGENT_CLI_BACKENDS | SDK_BACKENDS == set(Backend)
+    assert set(Backend) == AGENT_CLI_BACKENDS | SDK_BACKENDS
