@@ -141,7 +141,7 @@ async def diagnose_unmeasured_delivery(
         return await _diagnose(check, Path(worktree), git_ops, branch)
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             'unmeasured-delivery: diagnosis raised for task_id=%s branch=%s — '
             'the not-touched verdict is reported unchanged',
