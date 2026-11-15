@@ -6,17 +6,23 @@ Every operator entry point under ``fused-memory/scripts/`` and the repo-root
 opening and close are one policy.  The guard runs on every verify because the
 delivered checks run once, and no pyright gate covers the root ``scripts/``.
 
-AST, not grep: prose naming the class, an import of it and an
-``isinstance(x, MemoryService)`` are not construction.
+AST, not grep. Any reference to the class as a value can build a service, so
+each one is flagged: a call, a parameter default, an alias
+(``cls = MemoryService``), an argument (``functools.partial(MemoryService, c)``,
+``open_memory(c, service=MemoryService)``). Prose, an import, an annotation and
+the type argument of ``isinstance``/``issubclass`` name the class without being
+able to build one, so they are not flagged.
 """
 
 from __future__ import annotations
 
 import ast
 import pathlib
+from collections.abc import Iterator
+from typing import TypeGuard
 
 import pytest
-from _ast_guard import calls_named, parse_python_module
+from _ast_guard import parse_python_module
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -25,23 +31,42 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 OPERATOR_SCRIPT_ROOTS = (REPO_ROOT / 'fused-memory' / 'scripts', REPO_ROOT / 'scripts')
 CLASS_NAME = 'MemoryService'
 RULE = 'construct the service through fused_memory.maintenance._utils.maintenance_service'
+_TYPE_TESTS = frozenset({'isinstance', 'issubclass'})
 
 
-def _names_the_class(node: ast.expr | None) -> bool:
-    return (isinstance(node, ast.Name) and node.id == CLASS_NAME) or (
-        isinstance(node, ast.Attribute) and node.attr == CLASS_NAME
-    )
+def _loads_the_class(node: ast.AST) -> TypeGuard[ast.Name | ast.Attribute]:
+    if isinstance(node, ast.Name):
+        return node.id == CLASS_NAME and isinstance(node.ctx, ast.Load)
+    if isinstance(node, ast.Attribute):
+        return node.attr == CLASS_NAME and isinstance(node.ctx, ast.Load)
+    return False
+
+
+def _naming_only_subtrees(tree: ast.Module) -> Iterator[ast.expr]:
+    """Annotations and type-test arguments: where the class is named, never used."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg | ast.AnnAssign) and node.annotation is not None:
+            yield node.annotation
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.returns is not None:
+            yield node.returns
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in _TYPE_TESTS
+        ):
+            yield from node.args[1:]
 
 
 def construction_sites(tree: ast.Module) -> list[int]:
-    """Lines that call the class, or take it as a parameter default."""
-    lines = [call.lineno for call in calls_named(tree, CLASS_NAME)]
-    for arguments in ast.walk(tree):
-        if not isinstance(arguments, ast.arguments):
-            continue
-        defaults = [*arguments.defaults, *arguments.kw_defaults]
-        lines.extend(default.lineno for default in defaults if _names_the_class(default))
-    return sorted(lines)
+    """Lines that reference the class as a value."""
+    naming_only = {
+        id(node) for subtree in _naming_only_subtrees(tree) for node in ast.walk(subtree)
+    }
+    return sorted(
+        node.lineno
+        for node in ast.walk(tree)
+        if _loads_the_class(node) and id(node) not in naming_only
+    )
 
 
 def operator_scripts() -> list[pathlib.Path]:
@@ -82,6 +107,19 @@ def factory(service=MemoryService):
 
 def keyword_factory(*, service=memory_service.MemoryService):
     return service
+
+def aliased(c):
+    cls = MemoryService
+    return cls(c)
+
+def partial_factory(c):
+    return functools.partial(memory_service.MemoryService, c)
+
+def keyword_argument(c):
+    return open_memory(c, service=MemoryService)
+
+def alternate_constructor(c):
+    return MemoryService.from_config(c)
 """
 
 _IGNORED = '''
@@ -96,8 +134,13 @@ def check(x):
     return isinstance(x, MemoryService)
 
 
-def annotated(service: MemoryService | None = None):
-    return service
+def annotated(service: MemoryService | None = None) -> MemoryService | None:
+    held: type[MemoryService] | None = None
+    return service or held
+
+
+def type_tests(x, cls):
+    return isinstance(x, (MemoryService, int)) or issubclass(cls, memory_service.MemoryService)
 '''
 
 
@@ -107,9 +150,9 @@ def _sites_in(tmp_path: pathlib.Path, source: str) -> list[int]:
     return construction_sites(parse_python_module(path))
 
 
-def test_the_classifier_flags_calls_and_parameter_defaults(tmp_path):
-    assert _sites_in(tmp_path, _FLAGGED) == [3, 7, 9, 12]
+def test_the_classifier_flags_every_reference_to_the_class_as_a_value(tmp_path):
+    assert _sites_in(tmp_path, _FLAGGED) == [3, 7, 9, 12, 16, 20, 23, 26]
 
 
-def test_the_classifier_ignores_prose_imports_isinstance_and_annotations(tmp_path):
+def test_the_classifier_ignores_prose_imports_annotations_and_type_tests(tmp_path):
     assert _sites_in(tmp_path, _IGNORED) == []
