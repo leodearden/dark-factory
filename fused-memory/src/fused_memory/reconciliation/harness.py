@@ -651,7 +651,7 @@ def _cycle_summary_ledger_write_missing(report: object, stage_prefix: str) -> bo
     """Shared core of :func:`_stage1_ledger_write_missing` and
     :func:`_stage2_ledger_write_missing` — the two differ only in the
     ``stage1``/``stage2`` stat prefix, so the predicate lives once (task 3732
-    amendment). Read either wrapper's docstring for the rationale behind each
+    amendment). Read the wrappers' docstrings for the rationale behind each
     clause; this body is deliberately mechanical.
 
     *stage_prefix* is ``'stage1'`` or ``'stage2'``, selecting the
@@ -746,12 +746,7 @@ def _stage2_ledger_write_missing(report: object) -> bool:
     it). It also keeps every stubbed-Stage-2 harness test inert, since the
     shared ``_mock_stage_run`` helper builds reports with ``stats={}``.
 
-    Also excludes the degraded-synth arm's own harness-synthesized report
-    (stamped ``stats['stage2_cycle_summary_degraded_backstop'] = True``), so
-    the two arms of ``_ensure_stage2_cycle_summary`` can never double-process
-    the same run.
-
-    Likewise excludes a report whose write-recovery already CONFIRMED a
+    Excludes a report whose write-recovery already CONFIRMED a
     landed row (``stats['stage2_cycle_summary_write_recovered_backstop'] is
     True``, task 4186), so the driver's ``finally`` does not re-fire the arm
     after the pre-Stage-3 flush recovered it. ``is True`` only: a ``False``
@@ -760,11 +755,9 @@ def _stage2_ledger_write_missing(report: object) -> bool:
 
     Returns False for anything whose ``.stats`` isn't a dict — including a
     non-``StageReport`` object (e.g. a plain dict, the shape
-    ``run.stage_reports['_error']`` entries use, and the shape a
-    journal-round-tripped entry can keep — journal.py reconstructs
-    ``StageReport(**v)`` only when ``isinstance(v, dict) and 'stage' in v``)
-    — since ``run.stage_reports`` is typed ``dict[str, StageReport | dict]``
-    and this predicate must never raise when handed one of those.
+    ``run.stage_reports['_error']`` entries use) — since
+    ``run.stage_reports`` is typed ``dict[str, StageReport | dict]`` and
+    this predicate must never raise when handed one of those.
     """
     return _cycle_summary_ledger_write_missing(report, 'stage2')
 
@@ -3944,18 +3937,18 @@ class ReconciliationHarness:
     # ── Shared cycle-summary backstop arms ────────────────────────────
     #
     # _ensure_stage1_cycle_summary and _ensure_stage2_cycle_summary keep their
-    # own (deliberately different) FIRE GATES, but their arm BODIES were
-    # near-verbatim clones; the bodies live here once (task 3732 amendment) so a
-    # fix to either arm cannot be applied to one stage and forgotten on the
-    # other. Each helper may raise — both callers wrap them in the
-    # ``except BaseException`` swallow their own docstrings promise.
+    # own (deliberately different) FIRE GATES, but their write-recovered arm
+    # BODIES were near-verbatim clones; that body lives here once as
+    # _reattempt_cycle_summary_write (task 3732 amendment) so a fix to it
+    # cannot be applied to one stage and forgotten on the other.
+    # _write_degraded_cycle_summary serves Stage 1's arm 1 only. Each helper
+    # may raise — its callers wrap it in the ``except BaseException`` swallow
+    # their own docstrings promise.
     #
     # Concrete log events emitted here, kept greppable despite the f-strings:
     #   reconciliation.stage1_cycle_summary_write_recovered
     #   reconciliation.stage2_cycle_summary_write_recovered
     #   reconciliation.stage1_cycle_summary_backstop_fired
-    #   reconciliation.stage2_cycle_summary_backstop_fired
-    #   reconciliation.stage2_cycle_summary_backstop_row_present
 
     async def _reattempt_cycle_summary_write(
         self,
@@ -4049,11 +4042,11 @@ class ReconciliationHarness:
         run_id: str,
         project_id: str,
         cycle_start_time: datetime,
-        skip_if_row_exists: bool = False,
     ) -> None:
         """Degraded-synth arm: write a zeroed, self-identifying
         ``cycle_summary`` row for a stage that demonstrably ran but whose real
-        numbers are unrecoverable.
+        numbers are unrecoverable. Backs Stage 1's arm 1 in
+        :meth:`_ensure_stage1_cycle_summary`.
 
         The synthesized report is honestly degraded, not fabricated:
         ``llm_calls``/``tokens_used`` are 0 and ``started_at`` is the
@@ -4065,80 +4058,26 @@ class ReconciliationHarness:
         will silently undercount. That stat is the row's non-negotiable
         self-identification.
 
-        *skip_if_row_exists* (task 3732 amendment) makes this a no-op when an
-        authoritative row for the identity already exists. The ledger upsert is
-        last-write-wins on the 5-part identity, so a zeroed synth would
-        otherwise CLOBBER a good row carrying real llm_calls/tokens — strictly
-        worse than doing nothing. Callers whose fire gate already proves no row
-        can exist (Stage 1's arm 1 fires only when the stage raised before its
-        own write) leave it off and skip the read; callers gated only on the
-        SHAPE of the ``stage_reports`` entry (Stage 2's degraded arm, which has
-        no evidence the stage's own write failed) must set it. A read that
-        raises propagates to the caller's swallow, so a ledger fault means no
-        degraded row rather than a possible clobber.
-
-        The read runs INSIDE the ``asyncio.shield`` below, never ahead of it:
-        ``asyncio.shield`` only protects work once its coroutine exists as its
-        own Task, so an unshielded read ahead of the shield would raise
-        ``CancelledError`` on exactly the already-being-cancelled path the
-        shield exists for — landing no row at all, silently, since the
-        caller swallows ``BaseException``. The shield therefore covers the
-        read and the write as one uninterruptible unit; a caller passing
-        *skip_if_row_exists=False* still performs no read at all, shielded or
-        not.
+        The write runs under ``asyncio.shield`` so a second cancellation
+        cannot abort it.
 
         Finally, when the run already carries an ``_error`` record, the arm
         stamps its outcome there as a breadcrumb rather than adding a new
         top-level ``stage_reports`` key — the same place operators already look
         for a failed cycle's diagnosis.
         """
-        # ledger may be None (no ReconLedgerStore wired): there is then no row
-        # to clobber, and the upsert itself is a no-op. Both callers that pass
-        # skip_if_row_exists already gate on the ledger being present, so this
-        # is a type-narrowing belt-and-braces, not a live path.
-        ledger = getattr(self.memory, 'recon_ledger', None)
-
-        async def _read_then_write() -> tuple[bool, bool | None]:
-            """Returns ``(skipped, ledger_written)``. Run as ONE shielded unit
-            (see the call site below) so a second cancellation arriving while
-            the clobber-guard read is in flight cannot separate the read from
-            the write it gates — see the skip_if_row_exists docstring
-            paragraph above.
-            """
-            if skip_if_row_exists and ledger is not None:
-                existing = await ledger.get_by_identity(
-                    project_id,
-                    'cycle_summary',
-                    task_id='',
-                    flag_type=stage_id.value,
-                    run_id=run_id,
-                )
-                if existing is not None:
-                    return True, None
-
-            degraded_report = StageReport(
-                stage=stage_id,
-                # Whole-cycle anchor, not the stage's real start (see docstring).
-                started_at=cycle_start_time,
-                completed_at=datetime.now(UTC),
-                items_flagged=[],
-                stats={f'{stage_prefix}_cycle_summary_degraded_backstop': True},
-                # Zeroed means "unrecoverable", NOT "no work happened" (see docstring).
-                llm_calls=0,
-                tokens_used=0,
-            )
-            return False, await writer(degraded_report)
-
-        # Shielded against a second cancellation arriving mid-read or
-        # mid-write; the read-then-write keeps running to completion in its
-        # own Task even if this method's own task is cancelled again.
-        skipped, ledger_written = await asyncio.shield(_read_then_write())
-        if skipped:
-            logger.info(
-                f'reconciliation.{stage_prefix}_cycle_summary_backstop_row_present',
-                extra={'run_id': run_id, 'project_id': project_id},
-            )
-            return
+        degraded_report = StageReport(
+            stage=stage_id,
+            # Whole-cycle anchor, not the stage's real start (see docstring).
+            started_at=cycle_start_time,
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={f'{stage_prefix}_cycle_summary_degraded_backstop': True},
+            # Zeroed means "unrecoverable", NOT "no work happened" (see docstring).
+            llm_calls=0,
+            tokens_used=0,
+        )
+        ledger_written = await asyncio.shield(writer(degraded_report))
         logger.warning(
             f'reconciliation.{stage_prefix}_cycle_summary_backstop_fired',
             extra={
@@ -4176,17 +4115,17 @@ class ReconciliationHarness:
         It exists because the pair's ORDER is load-bearing and must not be able
         to drift between those sites: Stage 1 runs STRICTLY FIRST so a Stage-2
         backstop fault can never starve that pre-existing arm (task 3732). That
-        is the same argument that put the arm BODIES in
-        :meth:`_reattempt_cycle_summary_write` /
-        :meth:`_write_degraded_cycle_summary` — "so a fix to either arm cannot
-        be applied to one stage and forgotten on the other" — applied one level
+        is the same argument that put the shared write-recovered arm body in
+        :meth:`_reattempt_cycle_summary_write` — "so a fix to it cannot be
+        applied to one stage and forgotten on the other" — applied one level
         up, to the sequence itself.
 
-        *anchor* is the cycle-anchor timestamp the degraded-synth paths stamp
-        when a stage's real ``started_at`` is unrecoverable: ``cycle_start_time``
-        on a full cycle, ``run.started_at`` on a remediation pass (that driver
-        has no separate local). *current_stage_name* is read only by Stage 1's
-        arm-1 gate.
+        *anchor* and *current_stage_name* are read only by Stage 1's arm 1:
+        *current_stage_name* by its gate, *anchor* as the cycle-anchor
+        timestamp its degraded synthesis stamps when Stage 1's real
+        ``started_at`` is unrecoverable — ``cycle_start_time`` on a full
+        cycle, ``run.started_at`` on a remediation pass (that driver has no
+        separate local).
 
         Never raises: both callees swallow ``BaseException`` themselves and
         shield their own writes, which is what makes it safe to await unshielded
@@ -4195,9 +4134,7 @@ class ReconciliationHarness:
         await self._ensure_stage1_cycle_summary(
             run, run_id, project_id, current_stage_name, anchor,
         )
-        await self._ensure_stage2_cycle_summary(
-            run, run_id, project_id, anchor,
-        )
+        await self._ensure_stage2_cycle_summary(run, run_id, project_id)
 
     async def _persist_stage_reports_then_gc_config_dir(
         self, run: ReconciliationRun,
@@ -4393,9 +4330,9 @@ class ReconciliationHarness:
                     project_id=project_id,
                 )
             else:
-                # Arm 1 (task 2440): see docstring. No skip_if_row_exists read —
-                # this arm fires only when Stage 1 raised BEFORE its own write,
-                # so no authoritative row can exist to clobber.
+                # Arm 1 (task 2440): see docstring. It fires only when Stage 1
+                # raised BEFORE its own write, so no authoritative row can exist
+                # to clobber.
                 await self._write_degraded_cycle_summary(
                     run,
                     writer,
@@ -4423,151 +4360,99 @@ class ReconciliationHarness:
         run: ReconciliationRun,
         run_id: str,
         project_id: str,
-        cycle_start_time: datetime,
     ) -> None:
-        """Recover a Stage 2 ``cycle_summary`` ledger row for *run_id* when
-        Stage 2 ran but its row did not land (task 3732).
+        """Re-attempt Stage 2's ``cycle_summary`` ledger write for *run_id*
+        when Stage 2 completed but its own in-stage write failed (task 3732).
 
         Stage-2 counterpart of :meth:`_ensure_stage1_cycle_summary`, fired
         from the same :meth:`_flush_cycle_summaries` call pair (both S1→S2→S3
         drivers' ``finally`` blocks, plus task 4186's pre-Stage-3 flush), and
-        deliberately NARROWER than the Stage 1 method in one decisive way:
-        it has no analogue of Stage 1's arm 1 (synthesize a row when the
-        stage produced no report at all). Fabricating a summary for a cycle
-        whose Stage 2 never ran is exactly what this backstop must not do,
-        so BOTH arms are hard-gated on the ``task_knowledge_sync`` key being
-        PRESENT in ``run.stage_reports``.
+        deliberately NARROWER than the Stage 1 method: it has no analogue of
+        Stage 1's arm 1 (synthesize a row when the stage produced no report
+        at all). Fabricating a summary for a cycle whose Stage 2 never ran is
+        exactly what this backstop must not do, so it is hard-gated on a
+        ``StageReport`` being PRESENT under the ``task_knowledge_sync`` key of
+        ``run.stage_reports``. An entry that is not a ``StageReport`` is
+        inert.
 
-        That presence gate is what makes fabrication structurally impossible,
-        and it is exact rather than heuristic: both drivers assign
+        That presence gate is exact rather than heuristic: both drivers assign
         ``run.stage_reports[key] = report`` strictly AFTER ``stage.run()``
-        RETURNS, and :meth:`~fused_memory.reconciliation.stages.base.BaseStage.run`
+        RETURNS its ``StageReport``, and
+        :meth:`~fused_memory.reconciliation.stages.base.BaseStage.run`
         re-raises ``CancelledError`` without returning a partial report — so
         an absent key is proof Stage 2 produced no report, never merely a
-        bookkeeping gap. (``_run_remediation_pass``'s scope-freshness
-        short-circuit returns from inside its ``try:`` block, so its
-        ``finally`` does run on that path; this presence gate keeps the
-        method inert there, since a short-circuited pass runs no stage and
-        records no ``task_knowledge_sync`` key.) A SECOND population the
-        presence gate alone would not exclude — a Stage 2 that started, was
-        recorded, but died before reaching its own write — is excluded by
+        bookkeeping gap. A SECOND population the presence gate alone would
+        not exclude — a Stage 2 that started, was recorded, but died before
+        reaching its own write — is excluded by
         :func:`_stage2_ledger_write_missing` treating an ABSENT
         ``stage2_cycle_summary_ledger_written`` stat as no-fire.
 
-        - **Write-recovered arm** — Stage 2 completed and DID return a real
-          report, but its own in-stage ledger upsert failed transiently
-          (``write_cycle_summary``'s ``ledger.upsert`` caught the failure,
-          logged a WARNING and returned False), leaving the explicit failure
-          signal ``stats['stage2_cycle_summary_ledger_written'] == 0`` (see
-          :func:`_stage2_ledger_write_missing` for the stat/marker
-          predicate). Gated additionally on a ``ReconLedgerStore`` actually
-          being wired (``self.memory.recon_ledger is not None``) — otherwise
-          an intentionally ``recon_ledger_enabled=False`` deployment (whose
-          stat is always 0) would re-fire, and WARNING, every cycle for no
-          reason.
+        It fires when Stage 2's own in-stage ledger upsert failed transiently
+        (``write_cycle_summary``'s ``ledger.upsert`` caught the failure,
+        logged a WARNING and returned False), leaving the explicit failure
+        signal ``stats['stage2_cycle_summary_ledger_written'] == 0`` (see
+        :func:`_stage2_ledger_write_missing` for the stat/marker predicate),
+        and only when a ``ReconLedgerStore`` is actually wired
+        (``self.memory.recon_ledger is not None``) — otherwise an
+        intentionally ``recon_ledger_enabled=False`` deployment (whose stat
+        is always 0) would re-fire, and WARNING, every cycle for no reason.
 
-          It RE-ATTEMPTS ``write_stage2_cycle_summary`` with the REAL Stage 2
-          report (real llm_calls/tokens/stats), not a zeroed synth — the
-          ledger upsert is idempotent (``ON CONFLICT`` on the 5-part
-          identity), so a re-attempt after a transient failure is safe and
-          cannot duplicate. The body is
-          :meth:`_reattempt_cycle_summary_write` (shared with Stage 1's arm 2);
-          read its docstring for the
-          ``stage2_cycle_summary_write_recovered_backstop`` marker discipline
-          — in particular why the writer is handed a marker-stamped COPY while
-          the live report records only the CONFIRMED outcome, and the
-          cancellation-path asymmetry that follows.
-          ``stage2_cycle_summary_ledger_written`` itself is left at its
-          in-stage value of 0 either way — the ledger row's mere EXISTENCE is
-          the authoritative presence signal ``get_cycle_summary_presence``
-          reads, not either stat.
-
-        - **Degraded-synth arm** — the ``task_knowledge_sync`` entry is
-          present but is NOT a ``StageReport``: the plain-dict shape
-          ``run.stage_reports`` (typed ``dict[str, StageReport | dict]``) is
-          allowed to hold. ``journal`` reconstructs ``StageReport(**v)`` only
-          when the stored value ``isinstance(v, dict) and 'stage' in v``, and
-          otherwise keeps the raw dict, so a run whose reports were read back
-          from the journal can carry one (the resume path task 5514 retired
-          was the production route that did). It is the only remaining shape where Stage 2 demonstrably
-          produced a report yet no faithful re-attempt is possible, so it is
-          the one place a synthesized row is honest rather than fabricated.
-
-          Unlike the write-recovered arm it has NO evidence that Stage 2's own
-          write failed — it fires on the SHAPE of the ``stage_reports`` entry
-          alone — and the ledger upsert is last-write-wins on the 5-part
-          identity, so a zeroed synth could otherwise CLOBBER an authoritative
-          row carrying real llm_calls/tokens. It therefore runs with
-          :meth:`_write_degraded_cycle_summary`'s ``skip_if_row_exists``
-          guard: the row is read back first and the write is skipped outright
-          when one already exists. (Stage 1's arm 1 needs no such guard — it
-          fires only when Stage 1 raised BEFORE its own write, so no row can
-          exist to clobber.) Read that method's docstring for the degraded
-          row's contents, the mandatory
-          ``stage2_cycle_summary_degraded_backstop`` self-identification, and
-          the ``_error`` breadcrumb.
-
-        The two arms are mutually exclusive by construction: the first
-        requires a real ``StageReport``, the second requires the entry NOT be
-        one. :func:`_stage2_ledger_write_missing` additionally excludes any
-        report stamped ``stage2_cycle_summary_degraded_backstop``, so even a
-        synthesized row round-tripping back through here cannot be
-        double-processed.
+        It RE-ATTEMPTS ``write_stage2_cycle_summary`` with the REAL Stage 2
+        report (real llm_calls/tokens/stats), not a zeroed synth — the ledger
+        upsert is idempotent (``ON CONFLICT`` on the 5-part identity), so a
+        re-attempt after a transient failure is safe and cannot duplicate.
+        The body is :meth:`_reattempt_cycle_summary_write` (shared with
+        Stage 1's arm 2); read its docstring for the
+        ``stage2_cycle_summary_write_recovered_backstop`` marker discipline —
+        in particular why the writer is handed a marker-stamped COPY while
+        the live report records only the CONFIRMED outcome, and the
+        cancellation-path asymmetry that follows.
+        ``stage2_cycle_summary_ledger_written`` itself is left at its
+        in-stage value of 0 either way — the ledger row's mere EXISTENCE is
+        the authoritative presence signal ``get_cycle_summary_presence``
+        reads, not either stat.
 
         Unlike Stage 1's arm 2, this method applies NO ``RunType.remediation``
         exclusion. Stage 1 excludes remediation because its own ``run()``
         early-returns before its summary write on such a pass, so firing
-        there would fabricate a spurious row. Stage 2 is the exact opposite,
-        and its source says so explicitly (see the cross-reference comment
-        above ``TaskKnowledgeSync.run``'s write: the call "is unconditional —
-        it also fires on remediation passes, not just full cycles. That is
-        intentional, not a missed guard ... Do not 'fix' this to mirror Stage
+        there would fabricate a spurious row. Stage 2 is the exact opposite:
+        its in-stage write is deliberately unconditional on remediation
+        passes too (see the cross-reference comment above
+        ``TaskKnowledgeSync.run``'s write — "Do not 'fix' this to mirror Stage
         1's full-cycle-only gating"). A lost Stage 2 ledger write on a
         remediation pass is therefore a genuine gap this backstop must close,
         so ``remediation`` is derived from the run and forwarded to the write
         — keeping the recovered row's ``payload['remediation']`` identical to
         what the in-stage write would have stamped, which
         ``get_cycle_summary_presence`` reads to disambiguate expected-missing
-        rows. Note this does not weaken the never-fabricate guarantee on that
-        driver either: ``_run_remediation_pass``'s scope-freshness
-        short-circuit returns from inside its ``try:`` block, so its
-        ``finally`` — and therefore this method — does run on that
-        never-ran-any-stage path, but the presence gate keeps this method
-        inert there, since a short-circuited pass records no
-        ``task_knowledge_sync`` key.
+        rows. ``_run_remediation_pass``'s scope-freshness short-circuit
+        returns from inside its ``try:`` block, so its ``finally`` — and
+        therefore this method — does run on that never-ran-any-stage path,
+        but the presence gate keeps this method inert there, since a
+        short-circuited pass records no ``task_knowledge_sync`` key.
 
         Must never raise: awaited unshielded in the ``finally``, immediately
         before ``update_run_stage_reports``, and AFTER
-        :meth:`_ensure_stage1_cycle_summary` (an order now single-sourced on
+        :meth:`_ensure_stage1_cycle_summary` (an order single-sourced on
         :meth:`_flush_cycle_summaries`) so a fault here can never starve that
         pre-existing arm. An exception escaping would replace whatever
         exception is already propagating and skip that persistence call, so
-        the body swallows ``BaseException`` and each write itself runs under
+        the body swallows ``BaseException`` and the write itself runs under
         ``asyncio.shield`` to survive a second cancellation arriving
         mid-write. ``update_run_stage_reports`` itself is now also shielded
         (task 4431), so the persisted copy this guarantee protects actually
         reaches the DB instead of being discarded by a second cancellation
         landing at that next, previously-unshielded await.
         """
-        s2_key = StageId.task_knowledge_sync.value
-        s2_report = run.stage_reports.get(s2_key)
-        if s2_report is None:
-            # Never fabricate a cycle that did not happen.
+        s2_report = run.stage_reports.get(StageId.task_knowledge_sync.value)
+        if not isinstance(s2_report, StageReport):
             return
         if getattr(self.memory, 'recon_ledger', None) is None:
             return
+        if not _stage2_ledger_write_missing(s2_report):
+            return
 
         remediation = run.run_type == RunType.remediation
-        write_recovered = (
-            isinstance(s2_report, StageReport)
-            and _stage2_ledger_write_missing(s2_report)
-        )
-        # Report present but NOT a usable StageReport: Stage 2 demonstrably ran
-        # and produced something, so a row is honest — but its real numbers are
-        # unrecoverable, so the row is degraded rather than re-attempted.
-        degraded = not isinstance(s2_report, StageReport)
-        if not (write_recovered or degraded):
-            return
 
         def writer(report: StageReport) -> Awaitable[bool]:
             # Resolved at call time so a patched module global is honoured.
@@ -4577,30 +4462,14 @@ class ReconciliationHarness:
             )
 
         try:
-            if write_recovered and isinstance(s2_report, StageReport):
-                # See _reattempt_cycle_summary_write for the marker discipline.
-                await self._reattempt_cycle_summary_write(
-                    s2_report,
-                    writer,
-                    stage_prefix='stage2',
-                    run_id=run_id,
-                    project_id=project_id,
-                )
-            else:
-                # skip_if_row_exists, unlike Stage 1's arm 1: this arm fires on
-                # the SHAPE of the stage_reports entry alone, with no evidence
-                # Stage 2's own write failed, so a row may well already exist
-                # and a zeroed synth must never clobber it (see docstring).
-                await self._write_degraded_cycle_summary(
-                    run,
-                    writer,
-                    stage_id=StageId.task_knowledge_sync,
-                    stage_prefix='stage2',
-                    run_id=run_id,
-                    project_id=project_id,
-                    cycle_start_time=cycle_start_time,
-                    skip_if_row_exists=True,
-                )
+            # See _reattempt_cycle_summary_write for the marker discipline.
+            await self._reattempt_cycle_summary_write(
+                s2_report,
+                writer,
+                stage_prefix='stage2',
+                run_id=run_id,
+                project_id=project_id,
+            )
         except BaseException:
             # BaseException (not Exception): also catches a second cancellation
             # and, deliberately, SystemExit/KeyboardInterrupt — this is a single
