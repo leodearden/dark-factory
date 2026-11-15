@@ -770,7 +770,9 @@ class _Adjudicated:
 
     reused: tuple[AdjudicationRow, ...]
     records: tuple[AdjudicationRecord, ...]
+    asked: int
     failed: int
+    capped: int
     storms: tuple[Mapping[str, Any], ...]
 
     def storm_escapes(self, projects: Sequence[str]) -> tuple[Escape, ...]:
@@ -778,17 +780,23 @@ class _Adjudicated:
 
 
 async def _adjudicate(
-    candidates: Sequence[_Candidate], ledger: LinkHealLedger, adjudicate: LinkAdjudicator,
+    candidates: Sequence[_Candidate],
+    ledger: LinkHealLedger,
+    adjudicate: LinkAdjudicator,
+    *,
+    max_asked: int | None,
 ) -> _Adjudicated:
-    """Reuse each candidate's verdict by *adjudicate* at its current texts; ask about the rest."""
+    """Reuse each candidate's verdict by *adjudicate* at its current texts; ask about
+    the first *max_asked* of the rest in read order (``None`` asks them all)."""
     reused: list[AdjudicationRow] = []
-    asked: list[_Candidate] = []
+    unjudged: list[_Candidate] = []
     for candidate in candidates:
         row = candidate.judged(ledger, adjudicate)
         if row is None:
-            asked.append(candidate)
+            unjudged.append(candidate)
         else:
             reused.append(row)
+    asked = unjudged if max_asked is None else unjudged[:max_asked]
     storms: list[Mapping[str, Any]] = []
     verdicts = (
         await adjudicate([candidate.pair() for candidate in asked], on_failure_storm=storms.append)
@@ -803,7 +811,9 @@ async def _adjudicate(
     return _Adjudicated(
         reused=tuple(reused),
         records=records,
+        asked=len(asked),
         failed=len(verdicts) - len(records),
+        capped=len(unjudged) - len(asked),
         storms=tuple(storms),
     )
 
@@ -822,6 +832,7 @@ async def run_adjudicator_plan(
     created_in: CreatedWindow | None = None,
     filer: EscapeFiler | None = None,
     presence_projects: Sequence[str] = (),
+    max_adjudications: int | None = None,
 ) -> RunReport:
     """A non-writing run of *source* planning heals from the link adjudicator's verdicts.
 
@@ -829,7 +840,9 @@ async def run_adjudicator_plan(
     A parent is looked for in *presence_projects* as well as *projects*.
     The adjudicator is asked only about the links the verdict rows decide and
     that this adjudicator (model and prompt version) has not judged at their
-    current texts, so a model or brief change asks again. Every read
+    current texts, so a model or brief change asks again. Only the first
+    *max_adjudications* of those are asked (``None`` asks them all); the rest are
+    unexamined, counted ``adjudication_capped``, and leave the run partial. Every read
     and every question is made before the run row exists. The run rests on the
     adjudications it makes and on those it reuses. A failed verdict is counted,
     never ledgered. Only heals in *enabled_actions* are staged (``None`` stages
@@ -843,7 +856,9 @@ async def run_adjudicator_plan(
     reads = await read_links(
         store, census, projects, created_in, presence_projects=presence_projects,
     )
-    adjudicated = await _adjudicate(_candidates(reads), ledger, adjudicate)
+    adjudicated = await _adjudicate(
+        _candidates(reads), ledger, adjudicate, max_asked=max_adjudications,
+    )
     run_id = ledger.start_run(source, writes=False)
     new_ids = ledger.add_adjudications(run_id, adjudicated.records)
     ledger.reuse_adjudications(run_id, [row.adjudication_id for row in adjudicated.reused])
@@ -859,6 +874,8 @@ async def run_adjudicator_plan(
         plan.counts,
         adjudications_reused=len(adjudicated.reused),
         adjudication_failed=adjudicated.failed,
+        adjudications_asked=adjudicated.asked,
+        adjudication_capped=adjudicated.capped,
     )
     storms = adjudicated.storm_escapes(projects)
     escaped = () if filer is None else tuple(
