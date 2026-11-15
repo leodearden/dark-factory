@@ -809,10 +809,11 @@ def _stale_scope_findings(
 # Diagnostic refinements, and the two rules the 2x2 cannot see
 # ---------------------------------------------------------------------------
 
-#: Mirrors ``fused_memory.server.manifest_stamping._SIDECAR_SUFFIX`` and
+#: Mirrors the suffix in ``shared.capability_manifest.sidecar_path``, the one
+#: home of the PRD → sidecar path rule, and
 #: ``shared/tests/cross_suite_helpers/capability_manifest_corpus.py::MANIFEST_SUFFIX``.
-#: Re-declared rather than imported for the same reason the latter does it:
-#: ``shared`` must not depend on ``fused_memory``.
+#: Restated rather than imported (consolidation deliberately deferred by
+#: ``plans/dashboard-prd-lanes-prd.md`` §10).
 _MANIFEST_SUFFIX = '.capability-manifest.yaml'
 
 #: A match line in a non-markdown file starting (after leading whitespace)
