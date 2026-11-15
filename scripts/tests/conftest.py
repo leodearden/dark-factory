@@ -42,9 +42,11 @@ drive the shared session runner end to end. The real UsageGate those fixtures
 drive has its dead-PID probe-dir sweep confined by the plugin
 ``pytest_configure`` arms (task 6275).
 
-And `fake_recorder` (task 5285): an executable that records each call's argv
-and environment, replacing the private recorder and fake-`uv` copies in the
-flag-marker and reclaim wrapper suites.
+And `fake_recorder` / `fake_systemctl` (task 5285): an executable that records
+each call's argv and environment, replacing the private recorder and fake-`uv`
+copies in the flag-marker and reclaim wrapper suites, and a fake `systemctl`
+modelling the verbs the timer installers call, replacing the installer suites'
+private copies.
 """
 import json
 import os
@@ -955,3 +957,112 @@ def fake_recorder(tmp_path):
         return FakeRecorder(path, state_path)
 
     return _install
+
+
+# ---------------------------------------------------------------------------
+# Shared fake systemctl for the timer installers (task 5285).
+#
+# The union of the verbs the scripts/install-*.sh timer installers call. Every
+# installer's self-verify greps its unit name out of `list-timers`, so the
+# date on each listed line is cosmetic.
+# ---------------------------------------------------------------------------
+
+_FAKE_SYSTEMCTL_SOURCE = """\
+import json
+import os
+import sys
+
+STATE_PATH = {state_path!r}
+
+
+def main(argv):
+    args = [a for a in argv if a != '--user']
+    if not args:
+        return 1
+    verb, rest = args[0], args[1:]
+    units = [a for a in rest if not a.startswith('-')]
+
+    with open(STATE_PATH) as f:
+        state = json.load(f)
+    state['calls'].append(args)
+    if verb == 'enable':
+        for unit in units:
+            if unit not in state['enabled_timers']:
+                state['enabled_timers'].append(unit)
+    with open(STATE_PATH, 'w') as f:
+        json.dump(state, f)
+
+    if verb in ('daemon-reload', 'enable'):
+        return 0
+    if verb == 'start':
+        if os.environ.get('FAKE_SYSTEMCTL_FAIL_START') == '1':
+            unit = units[0] if units else '<unit>'
+            print('Job for %s failed. See "journalctl -xeu %s" for details.' % (unit, unit),
+                  file=sys.stderr)
+            return 1
+        return 0
+    if verb == 'show':
+        print(os.environ.get('FAKE_SYSTEMCTL_WORKDIR', ''))
+        return 0
+    if verb == 'list-timers':
+        enabled = state['enabled_timers']
+        if os.environ.get('FAKE_SYSTEMCTL_OMIT_LIST_TIMERS') == '1':
+            enabled = []
+        for unit in enabled:
+            service = unit.replace('.timer', '.service')
+            print('Mon 2026-07-14 03:00:00 UTC  8h left  n/a  n/a  %s  %s' % (unit, service))
+        print('%d timers listed.' % len(enabled))
+        return 0
+    return 1
+
+
+sys.exit(main(sys.argv[1:]))
+"""
+
+
+class FakeSystemctl:
+    """A fake ``systemctl`` at ``path`` that models the timer installers' verbs.
+
+    ``--user`` is dropped and every call is recorded, before it is answered,
+    into ``calls()``. ``daemon-reload`` succeeds. ``enable`` marks each
+    non-flag argument enabled. ``list-timers`` prints one line per enabled
+    unit, then ``N timers listed.``. ``show`` prints $FAKE_SYSTEMCTL_WORKDIR.
+    ``start`` succeeds. Any other verb exits 1, so an installer that starts
+    calling a new verb fails loudly.
+
+    Two env vars, read per call, inject faults. FAKE_SYSTEMCTL_OMIT_LIST_TIMERS=1
+    makes ``list-timers`` list nothing. FAKE_SYSTEMCTL_FAIL_START=1 makes
+    ``start`` print systemd's own ``Job for <unit> failed.`` wording and exit 1.
+    That text shares a stream with the script under test's own stderr, so a
+    test must assert on a token only that script prints.
+
+    State persists across calls until ``reset()``.
+    """
+
+    def __init__(self, bin_dir: Path, state_path: Path):
+        self.bin_dir = bin_dir
+        self.path = bin_dir / 'systemctl'
+        self._state_path = state_path
+
+    def calls(self) -> list[list[str]]:
+        return json.loads(self._state_path.read_text())['calls']
+
+    def reset(self) -> None:
+        self._state_path.write_text(json.dumps({'calls': [], 'enabled_timers': []}))
+
+
+@pytest.fixture
+def fake_systemctl(tmp_path):
+    """A :class:`FakeSystemctl` installed at ``tmp_path / 'bin' / 'systemctl'``.
+
+    The caller prepends ``.bin_dir`` to the PATH of the installer it runs.
+    """
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir(exist_ok=True)
+    fake = FakeSystemctl(bin_dir, tmp_path / 'fake-systemctl-state.json')
+    fake.path.write_text(f'#!{sys.executable}\n' + _FAKE_SYSTEMCTL_SOURCE.format(
+        state_path=str(fake._state_path),
+    ))
+    fake.path.chmod(0o755)
+    fake.reset()
+    return fake
