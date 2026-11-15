@@ -38,7 +38,7 @@ def _service(**mem0_update_kwargs):
 
 
 class TestLiveRead:
-    """config/reload.py's precondition for registering the five leaves."""
+    """config/reload.py's precondition for registering every mem0_update leaf."""
 
     def test_reads_config_live_on_every_call(self):
         # 'stranger-' as the not-on-the-bar example, NOT 'curator-': that was
@@ -251,6 +251,119 @@ class TestDecisionShape:
         )
 
 
+
+_UNDOCUMENTED = 'no sanctioned use documented'
+
+
+def _refuse(svc, *, content_amend=True, metadata_patch=False):
+    decision = resolve_mem0_update_authorization(
+        svc, agent_id='rando',
+        content_amend=content_amend, metadata_patch=metadata_patch,
+    )
+    assert decision.allowed is False
+    assert decision.error_type == 'Mem0UpdateNotAuthorized', decision
+    assert isinstance(decision.error, str)
+    return decision.error
+
+
+class TestNotAuthorizedRendersSanctionedUse:
+    """The refusal pairs each prefix on the refusing arm's bar with the role it
+    declares, read live from mem0_update.agent_prefix_sanctioned_use."""
+
+    def test_refusal_pairs_each_prefix_with_its_own_sanctioned_use(self):
+        svc = _service(agent_prefix_sanctioned_use={
+            'recon-stage-': 'RECON-ROLE', 'curator-': 'CURATOR-ROLE',
+        })
+        error = _refuse(svc)
+        assert "'recon-stage-': RECON-ROLE" in error, error
+        assert "'curator-': CURATOR-ROLE" in error, error
+
+    def test_refusal_renders_only_the_refusing_arms_prefixes(self):
+        svc = _service(
+            content_amend_allowed_agent_prefixes=['recon-stage-'],
+            metadata_patch_allowed_agent_prefixes=['recon-stage-', 'link-heal-'],
+            agent_prefix_sanctioned_use={
+                'recon-stage-': 'RECON-ROLE', 'link-heal-': 'LINK-HEAL-ROLE',
+            },
+        )
+        content_error = _refuse(svc, content_amend=True, metadata_patch=False)
+        assert 'link-heal-' not in content_error, content_error
+        metadata_error = _refuse(svc, content_amend=False, metadata_patch=True)
+        assert "'link-heal-': LINK-HEAL-ROLE" in metadata_error, metadata_error
+
+    def test_undocumented_prefix_is_rendered_not_dropped(self):
+        svc = _service(
+            content_amend_allowed_agent_prefixes=['recon-stage-', 'auditor-'],
+            agent_prefix_sanctioned_use={'recon-stage-': 'RECON-ROLE'},
+        )
+        error = _refuse(svc)
+        assert "'auditor-'" in error, error
+        assert _UNDOCUMENTED in error, error
+        assert 'mem0_update.agent_prefix_sanctioned_use' in error, error
+
+    def test_refusal_carries_the_self_reported_escalate_norm(self):
+        error = _refuse(_service())
+        assert 'self-reported' in error, error
+        assert 'escalate' in error, error
+
+    def test_empty_bar_refusal_says_the_list_is_empty(self):
+        error = _refuse(_service(content_amend_allowed_agent_prefixes=[]))
+        assert 'mem0_update.content_amend_allowed_agent_prefixes' in error, error
+        assert 'empty' in error, error
+
+    def test_sanctioned_use_is_read_live(self):
+        svc = _service(agent_prefix_sanctioned_use={
+            'recon-stage-': 'RECON-ROLE', 'curator-': 'OLD-ROLE',
+        })
+        assert "'curator-': OLD-ROLE" in _refuse(svc)
+
+        svc.config.mem0_update.agent_prefix_sanctioned_use['curator-'] = 'NEW-ROLE'
+
+        assert "'curator-': NEW-ROLE" in _refuse(svc)
+
+    @pytest.mark.parametrize(
+        'corrupt', [None, 'curator-: role', 42, ['curator-'], MagicMock()],
+    )
+    def test_corrupt_map_renders_every_prefix_undocumented_and_never_raises(
+        self, corrupt,
+    ):
+        svc = _service()
+        object.__setattr__(
+            svc.config.mem0_update, 'agent_prefix_sanctioned_use', corrupt,
+        )
+        error = _refuse(svc)
+        for prefix in svc.config.mem0_update.content_amend_allowed_agent_prefixes:
+            assert f'{prefix!r}: {_UNDOCUMENTED}' in error, error
+
+    def test_missing_map_renders_every_prefix_undocumented_and_never_raises(self):
+        svc = SimpleNamespace(config=SimpleNamespace(mem0_update=SimpleNamespace(
+            enabled=True, content_amend_allowed_agent_prefixes=['recon-stage-'],
+        )))
+        error = _refuse(svc)
+        assert f"'recon-stage-': {_UNDOCUMENTED}" in error, error
+
+    def test_non_str_entries_are_dropped_individually(self):
+        svc = _service()
+        object.__setattr__(
+            svc.config.mem0_update, 'agent_prefix_sanctioned_use',
+            {'recon-stage-': 'RECON-ROLE', 'curator-': 42, 'x-': '  '},
+        )
+        error = _refuse(svc)
+        assert "'recon-stage-': RECON-ROLE" in error, error
+        assert f"'curator-': {_UNDOCUMENTED}" in error, error
+
+    def test_rendering_never_changes_the_decision(self):
+        svc = _service()
+        object.__setattr__(
+            svc.config.mem0_update, 'agent_prefix_sanctioned_use', None,
+        )
+        decision = resolve_mem0_update_authorization(
+            svc, agent_id='recon-stage-1', content_amend=True, metadata_patch=True,
+        )
+        assert decision.allowed is True
+        assert decision.error is None
+
+
 _PROJECT_ID = 'dark_factory'
 _MEMORY_ID = '77a3f6bc-0000-0000-0000-000000000000'
 
@@ -301,6 +414,22 @@ class TestUpdateMemoryToolGate:
         assert isinstance(result, dict), f'expected dict, got {type(result)}: {result!r}'
         assert result.get('error_type') == 'Mem0UpdateNotAuthorized', result
         assert isinstance(result.get('error'), str) and result['error']
+        mock_service.update_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tool_refusal_carries_sanctioned_use_and_norm(self):
+        mock_service = _mock_service(agent_prefix_sanctioned_use={
+            'recon-stage-': 'RECON-ROLE', 'curator-': 'CURATOR-ROLE',
+        })
+
+        result = await _call_tool(
+            mock_service,
+            content='rewritten', reason='because', agent_id='claude-interactive',
+        )
+
+        assert result.get('error_type') == 'Mem0UpdateNotAuthorized', result
+        assert "'curator-': CURATOR-ROLE" in result['error'], result
+        assert 'escalate' in result['error'], result
         mock_service.update_memory.assert_not_called()
 
     @pytest.mark.asyncio
