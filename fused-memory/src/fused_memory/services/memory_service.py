@@ -172,6 +172,7 @@ from fused_memory.services.write_journal import (
     Mem0IntentStatus,
     Mem0WriteMethod,
     decode_mem0_intent_metadata,
+    decode_mem0_intent_write_method,
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
@@ -6770,18 +6771,13 @@ class MemoryService:
                     write_method=Mem0WriteMethod.ADD,
                 )
             try:
-                mem0_result = await self._journaled_backend_call(
+                mem0_outcome = await self._call_mem0_write(
+                    Mem0WriteMethod.ADD,
+                    content=content,
+                    scope=scope,
+                    metadata=meta,
                     write_op_id=write_op_id,
                     causation_id=causation_id,
-                    backend='mem0',
-                    operation='add',
-                    payload={'content': content[:200]},
-                    coro=self.mem0.add(content=content, scope=scope, metadata=meta),
-                )
-                mem0_outcome = read_mem0_add_result(
-                    mem0_result,
-                    operation='add',
-                    zero_ids_anomalous=_MEM0_ADD_INFER_PINNED_FALSE,
                 )
                 memory_ids.extend(mem0_outcome.memory_ids)
                 stores_written.extend(mem0_outcome.stores_written)
@@ -6926,17 +6922,53 @@ class MemoryService:
             agent_id=intent.get('agent_id'),
             session_id=intent.get('session_id'),
         )
-        metadata = decode_mem0_intent_metadata(intent)
-        raw = await self._journaled_backend_call(
+        return await self._call_mem0_write(
+            decode_mem0_intent_write_method(intent),
+            content=content,
+            scope=scope,
+            metadata=decode_mem0_intent_metadata(intent),
             write_op_id=intent['write_op_id'],
             causation_id=intent.get('causation_id'),
+        )
+
+    async def _call_mem0_write(
+        self,
+        write_method: Mem0WriteMethod,
+        *,
+        content: str,
+        scope: Scope,
+        metadata: dict,
+        write_op_id: str,
+        causation_id: str | None,
+    ) -> Mem0AddOutcome:
+        """Write through the ``Mem0Backend`` method ``write_method`` names and read its result.
+
+        The one dispatch from method to backend call, shared by the original
+        write and its re-issue so the two cannot diverge. The backend_op label
+        is ``add`` for both methods: the mem0 primitive each one calls.
+        """
+        match write_method:
+            case Mem0WriteMethod.ADD:
+                coro = self.mem0.add(content=content, scope=scope, metadata=metadata)
+                zero_ids_anomalous = _MEM0_ADD_INFER_PINNED_FALSE
+            case Mem0WriteMethod.ADD_SYSTEM_RECORD:
+                coro = self.mem0.add_system_record(
+                    content=content, scope=scope, metadata=metadata
+                )
+                # Mem0Backend.add_system_record pins infer=False locally.
+                zero_ids_anomalous = True
+            case _:
+                assert_never(write_method)
+        raw = await self._journaled_backend_call(
+            write_op_id=write_op_id,
+            causation_id=causation_id,
             backend='mem0',
             operation='add',
             payload={'content': content[:200]},
-            coro=self.mem0.add(content=content, scope=scope, metadata=metadata),
+            coro=coro,
         )
         return read_mem0_add_result(
-            raw, operation='add', zero_ids_anomalous=_MEM0_ADD_INFER_PINNED_FALSE
+            raw, operation=write_method.value, zero_ids_anomalous=zero_ids_anomalous
         )
 
     @property
@@ -7203,16 +7235,13 @@ class MemoryService:
         mem0_outcome = RAISED_MEM0_ADD
         _mem0_error: str | None = None
         try:
-            mem0_result = await self._journaled_backend_call(
+            mem0_outcome = await self._call_mem0_write(
+                Mem0WriteMethod.ADD_SYSTEM_RECORD,
+                content=content,
+                scope=scope,
+                metadata=meta,
                 write_op_id=write_op_id,
                 causation_id=causation_id,
-                backend='mem0',
-                operation='add',
-                payload={'content': content[:200]},
-                coro=self.mem0.add_system_record(content=content, scope=scope, metadata=meta),
-            )
-            mem0_outcome = read_mem0_add_result(
-                mem0_result, operation='add_system_record', zero_ids_anomalous=True
             )
         except Exception as e:
             # Mirrors add_memory's try/except around its Mem0 branch (task
