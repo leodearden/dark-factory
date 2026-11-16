@@ -51,7 +51,11 @@ from typing import Any
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
+from shared.mcp_markup_middleware import (
+    MARKUP_RECURRENCE_ROUTING,
+    MarkupGuardMiddleware,
+    RepairPolicy,
+)
 from shared.toolcall_markup import INVOKE_CLOSER, closer_for, detect
 
 from escalation.models import BORN_AT_L2_SEVERITIES, Escalation
@@ -480,6 +484,17 @@ class TestUnrepairableResidueIsPreserved:
         return residues[0]
 
     @pytest.mark.asyncio
+    async def test_the_residue_routes_the_recurrence_through_the_shared_sentence(
+        self, tmp_path: Path
+    ):
+        queue, _ = await self._refuse(tmp_path)
+
+        assert MARKUP_RECURRENCE_ROUTING in self._residue(queue).detail, (
+            'the routing sentence has one home, '
+            'shared/src/shared/mcp_markup_middleware.py::MARKUP_RECURRENCE_ROUTING'
+        )
+
+    @pytest.mark.asyncio
     async def test_the_call_is_refused(self, tmp_path: Path):
         """(a) The boundary is a guess, so nothing is forwarded."""
         _, payload = await self._refuse(tmp_path)
@@ -768,6 +783,19 @@ class TestStormBurstAlarm:
         return sorted(
             (esc for esc in queue.get_pending() if esc.category == STORM_CATEGORY),
             key=lambda esc: esc.id,
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_alarm_routes_the_recurrence_through_the_shared_sentence(
+        self, tmp_path: Path
+    ):
+        queue, server = build(tmp_path)
+        await self._burst(server)
+
+        [alarm] = self._alarms(queue)
+        assert MARKUP_RECURRENCE_ROUTING in alarm.suggested_action, (
+            'the routing sentence has one home, '
+            'shared/src/shared/mcp_markup_middleware.py::MARKUP_RECURRENCE_ROUTING'
         )
 
     @pytest.mark.asyncio
