@@ -7,8 +7,9 @@ from contextlib import aclosing
 from typing import Any, TypeVar
 
 from mem0 import AsyncMemory
+from qdrant_client import QdrantClient
 
-from fused_memory.backends.timeout_budget import await_within
+from fused_memory.backends.timeout_budget import await_within, socket_timeout_outlasting
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
@@ -238,7 +239,15 @@ class Mem0Backend:
     only half a fix, so both halves are enforced in one place: every timed
     call on this class goes through :meth:`_timed_read` / :meth:`_timed_write`
     to ``backends/timeout_budget.py::await_within``, the single home of the
-    message format.
+    message format.  mem0's instance construction (its collection listing and
+    payload-index creates) runs off the event loop under the write budget as
+    ``create_instance``, and the Qdrant client mem0's vector store uses is this
+    backend's own, its socket timeout from ``socket_timeout_outlasting`` over
+    both budgets, so a slow mem0 leg fails on its named budget
+    (tests/test_mem0_vector_store_client.py).  The one exception left: the
+    direct async client's socket timeout is still the read budget, so its
+    calls can still fail unattributed: its writes, and :meth:`list_projects`'
+    untimed listing (gap (2) of task 8196; see :meth:`_ensure_collection`).
 
     This paragraph is the CANONICAL statement of the rule, and a method's own
     ``Raises:`` line adds only the consequence specific to IT — so there is one
@@ -254,6 +263,7 @@ class Mem0Backend:
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
         self._async_qdrant_client = None  # Lazy async client for count/list ops
+        self._vector_store_client: QdrantClient | None = None
 
     def _build_config_dict(self, collection_name: str) -> dict[str, Any]:
         """Build a Mem0 config dict from the unified config."""
@@ -385,10 +395,19 @@ class Mem0Backend:
         return await asyncio.shield(creation)
 
     async def _create_instance(self, scope: Scope) -> AsyncMemory:
+        """Build and cache *scope*'s instance; start afresh if :meth:`close` closed its client meanwhile.
+
+        mem0 swallows a failed payload-index create, so an instance built on a
+        client closed mid-build is returned as if whole and would fail every call.
+        """
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         config_dict = self._build_config_dict(collection_name)
         await self._ensure_collection(collection_name)
-        instance = AsyncMemory.from_config(config_dict)
+        client = self._get_vector_store_client()
+        config_dict['vector_store']['config']['client'] = client
+        instance = await self._timed_write(asyncio.to_thread(AsyncMemory.from_config, config_dict), 'create_instance')
+        if client is not self._vector_store_client:
+            return await self._create_instance(scope)
         self._instances[scope.project_id] = instance
         logger.info(f'Mem0 instance created for project {scope.project_id} (collection: {collection_name})')
         return instance
@@ -396,7 +415,7 @@ class Mem0Backend:
     async def _ensure_collection(self, collection_name: str) -> None:
         """Create the collection if absent, under this backend's own budgets (tests/test_mem0_collection_provisioning.py).
 
-        Gap, owned by task 8196: the shared client's socket timeout is
+        Gap, owned by task 8196: the direct async client's socket timeout is
         ``int(read budget)``, so a create slower than that fails as an
         unattributed ``ResponseHandlingException`` before the write budget.
         """
@@ -757,6 +776,15 @@ class Mem0Backend:
             instance.delete(memory_id),
             'delete',
         )
+
+    def _get_vector_store_client(self) -> QdrantClient:
+        """Get or create the sync Qdrant client every mem0 instance's vector store shares."""
+        if self._vector_store_client is None:
+            self._vector_store_client = QdrantClient(
+                url=self.config.mem0.qdrant_url,
+                timeout=socket_timeout_outlasting(self._read_timeout, self._write_timeout),
+            )
+        return self._vector_store_client
 
     async def _get_async_qdrant(self):
         """Get or create a shared async Qdrant client for lightweight ops."""
@@ -1698,14 +1726,13 @@ class Mem0Backend:
         return {str(point.id): float(point.score) for point in response.points}
 
     async def close(self) -> None:
-        """Close all cached AsyncMemory instances and release their connections."""
+        """Drop the cached AsyncMemory instances and close the two Qdrant clients this backend owns."""
         import contextlib
-        for instance in self._instances.values():
-            with contextlib.suppress(Exception):
-                client = getattr(getattr(instance, 'vector_store', None), 'client', None)
-                if client is not None and hasattr(client, 'close'):
-                    await client.close()
         self._instances.clear()
+        if self._vector_store_client is not None:
+            with contextlib.suppress(Exception):
+                self._vector_store_client.close()
+            self._vector_store_client = None
         if self._async_qdrant_client is not None:
             with contextlib.suppress(Exception):
                 await self._async_qdrant_client.close()
