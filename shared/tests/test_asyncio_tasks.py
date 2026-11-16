@@ -10,7 +10,9 @@ import logging
 import weakref
 from collections.abc import Iterator
 
-from shared.asyncio_tasks import abandon_task, cancel_bounded, track_task
+import pytest
+
+from shared.asyncio_tasks import abandon_task, cancel_bounded, gather_unwound, track_task
 
 
 class _Boom(Exception):
@@ -337,3 +339,137 @@ class TestCancelBounded:
             _collect_and_confirm_gone(task_ref)
 
         assert errors == []
+
+
+async def _all_started(*started: asyncio.Event) -> None:
+    async with asyncio.timeout(5.0):
+        for event in started:
+            await event.wait()
+
+
+def _record_at_return(outer: asyncio.Task, record: list[str]) -> list[list[str]]:
+    """What *record* held the moment *outer* ended, not whenever the test looks."""
+    snapshots: list[list[str]] = []
+    outer.add_done_callback(lambda _outer: snapshots.append(list(record)))
+    return snapshots
+
+
+async def _parked(started: asyncio.Event) -> None:
+    started.set()
+    await asyncio.Event().wait()
+
+
+async def _unwinds_slowly(label: str, started: asyncio.Event, record: list[str], *, cleanup_secs: float) -> None:
+    started.set()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await asyncio.sleep(cleanup_secs)
+        record.append(f'{label}-unwound')
+
+
+async def _raises_boom_once(started: asyncio.Event, *siblings_started: asyncio.Event) -> None:
+    started.set()
+    await _all_started(*siblings_started)
+    raise _Boom('raised by one gathered child')
+
+
+async def _value_after(delay: float, value: str) -> str:
+    await asyncio.sleep(delay)
+    return value
+
+
+class TestGatherUnwound:
+    async def test_returns_each_childs_result_in_argument_order(self):
+        async with asyncio.timeout(5.0):
+            results = await gather_unwound(
+                _value_after(0.05, 'slowest'), _value_after(0.0, 'fastest'), _value_after(0.02, 'middle'),
+            )
+
+        assert results == ['slowest', 'fastest', 'middle']
+
+    async def test_an_outer_cancel_raises_only_after_every_child_has_unwound(self):
+        record: list[str] = []
+        a_started, b_started = asyncio.Event(), asyncio.Event()
+        outer = asyncio.create_task(gather_unwound(
+            _unwinds_slowly('a', a_started, record, cleanup_secs=0.2), _parked(b_started),
+        ))
+        await _all_started(a_started, b_started)
+        at_return = _record_at_return(outer, record)
+
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            async with asyncio.timeout(5.0):
+                await outer
+
+        assert at_return == [['a-unwound']]
+
+    async def test_a_child_already_cancelling_is_not_cancelled_again(self):
+        record: list[str] = []
+        a_started, b_started = asyncio.Event(), asyncio.Event()
+
+        async def a() -> None:
+            a_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                try:
+                    await asyncio.sleep(0.2)
+                except asyncio.CancelledError:
+                    record.append('a-cleanup-interrupted')
+                    raise
+                record.append('a-cleanup-finished')
+                raise
+
+        outer = asyncio.create_task(gather_unwound(a(), _parked(b_started)))
+        await _all_started(a_started, b_started)
+        at_return = _record_at_return(outer, record)
+
+        outer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            async with asyncio.timeout(5.0):
+                await outer
+
+        assert at_return == [['a-cleanup-finished']]
+
+    async def test_a_child_cancelled_on_its_own_cancels_and_awaits_its_siblings(self):
+        record: list[str] = []
+        victim_started, sibling_started = asyncio.Event(), asyncio.Event()
+        victim = asyncio.create_task(_parked(victim_started))
+        outer = asyncio.create_task(gather_unwound(
+            victim, _unwinds_slowly('sibling', sibling_started, record, cleanup_secs=0.1),
+        ))
+        await _all_started(victim_started, sibling_started)
+        at_return = _record_at_return(outer, record)
+
+        victim.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            async with asyncio.timeout(5.0):
+                await outer
+
+        assert at_return == [['sibling-unwound']]
+
+    async def test_a_failing_child_cancels_its_siblings_and_its_exception_propagates(self):
+        record: list[str] = []
+        failing_started, sibling_started = asyncio.Event(), asyncio.Event()
+        outer = asyncio.create_task(gather_unwound(
+            _raises_boom_once(failing_started, sibling_started),
+            _unwinds_slowly('sibling', sibling_started, record, cleanup_secs=0.1),
+        ))
+        at_return = _record_at_return(outer, record)
+
+        with pytest.raises(_Boom):
+            async with asyncio.timeout(5.0):
+                await outer
+
+        assert failing_started.is_set()
+        assert at_return == [['sibling-unwound']]
+
+    async def test_a_plain_future_child_is_cancelled_when_a_sibling_fails(self):
+        never_resolved: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        with pytest.raises(_Boom):
+            async with asyncio.timeout(5.0):
+                await gather_unwound(never_resolved, _raises_boom_once(asyncio.Event()))
+
+        assert never_resolved.cancelled()
