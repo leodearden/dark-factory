@@ -7,7 +7,7 @@ its module body. No module rebinds an object a lower module, or
 name through its defining module. :data:`PLACEMENT_CASES` drives the placement
 rule over small synthetic sources, so each placement it accepts or refuses is
 shown to be accepted or refused. The layers on the import path that binds the
-checkout, :data:`UNBOUND_LAYERS`, import no workspace member at all.
+checkout, :data:`BINDING_PATH_LAYERS`, import no workspace member at all.
 """
 
 import ast
@@ -104,7 +104,7 @@ def test_no_scripts_module_imports_the_cli() -> None:
 #: ``merge_lane_cluster`` imports ``source_measures``. Whether a workspace-member
 #: import in either resolved this checkout's copy would rest on statement order,
 #: not intent, so they import none.
-UNBOUND_LAYERS = ('source_measures', 'merge_lane_cluster')
+BINDING_PATH_LAYERS = ('source_measures', 'merge_lane_cluster')
 
 
 def _workspace_packages() -> frozenset[str]:
@@ -135,8 +135,8 @@ def test_the_workspace_packages_are_found() -> None:
     assert {'shared', 'orchestrator'} <= _workspace_packages()
 
 
-@pytest.mark.parametrize('stem', UNBOUND_LAYERS)
-def test_no_layer_imported_before_the_checkout_binds_imports_a_workspace_member(
+@pytest.mark.parametrize('stem', BINDING_PATH_LAYERS)
+def test_no_layer_on_the_binding_import_path_imports_a_workspace_member(
     stem: str,
 ) -> None:
     found = _workspace_imports(_source_of(stem), _workspace_packages())
