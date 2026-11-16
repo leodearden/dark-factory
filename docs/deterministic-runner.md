@@ -89,6 +89,21 @@ sub-path below) and excludes every resume/idempotency branch above (those
 already have `before_done_ran_at` or `gate_escalated_at` set, so they
 never reach this first-dispatch check).
 
+**Refused `before_done` record** (task 9116): next, still before the
+stamp, the runner resolves the record's paths once through
+`shared/src/shared/before_done_paths.py::resolve_before_done_paths`.  A
+`BeforeDonePathsRefused` (a missing, non-string or blank `script`, a
+non-string `cwd`, or a `script_root` the record may not use, reaching the
+runner through `update_task`) files a
+born-at-L2 `infra_issue` — summary "Deploy refused before_done:
+<target_unit>", or "Deploy refused before_done (no target_unit)" — and
+blocks without running the deploy, without stamping `before_done_ran_at`
+and without advancing `deploy_state`.  Because nothing is stamped, fixing
+the record and resolving the escalation (`resume`/`restart`) leads to a
+first dispatch that really runs the deploy; filed after the stamp, a
+`resume` would drive the task to done with the deploy never run.  The
+cross-unit sub-path reuses these resolved paths.
+
 The `before_done_ran_at` stamp is written FIRST (crash-safe I1) and is
 SHARED between the self-target (ε) and cross-unit sub-paths below.
 
@@ -166,7 +181,16 @@ Phase ε **self-restart** sub-path (`before_done.target_unit` == own unit):
   re-filing the gate — the human-approval gate is NEVER bypassed.
 - If scheduling fails (`rc != 0`): file born-at-L2 infra_issue, block
   (parallel to γ's rc≠0/verify-fail handling); `before_done_ran_at`
-  already stamped (not re-run, I1).
+  already stamped (not re-run, I1).  Scheduling also fails, before any
+  transient unit is registered, when the resolved script is missing or not
+  executable (`shared/src/shared/before_done_paths.py::require_runnable_script`,
+  the same rule `submit_task` applies).  A script removed, renamed or
+  chmod'ed after submit, or a `before_done` edited through `update_task`,
+  therefore blocks the task with the `Self-restart scheduling failed: <unit>`
+  infra_issue instead of a phantom `deterministic-deploy-scheduled` done.
+  Either way no restart is scheduled, and as for any escalation filed after
+  the stamp, resolving with `resume` marks the task done without one; the
+  escalation detail says to restart the unit by hand first.
 
 Phase γ **cross-unit** sub-path (`target_unit` ≠ own unit or `ORCH_UNIT` unset):
 - Capture baseline unit state (`unit_inspector`).
@@ -284,7 +308,11 @@ Phase γ **predicate** sub-path (`before_done['kind'] == 'predicate'`):
   `orchestrator/src/orchestrator/before_done_script.py::ScriptTimeout` class
   docstring for the full rationale.
 - Outer-guard timeout, an unresolvable factory script root
-  (`FactoryRootUnresolved`, task 6386) or an unexpected `run_fn` error
+  (`shared/src/shared/before_done_paths.py::FactoryRootUnresolved`, task
+  6386), any other refused `before_done` record
+  (`shared/src/shared/before_done_paths.py::BeforeDonePathsRefused`, summary
+  "Predicate before_done refused (check not run)", task 9116) or an
+  unexpected `run_fn` error
   (likewise no verdict — an infra fault, not a check failure): file
   born-at-L2 `infra_issue` and block — again NO `gate_escalated_at`
   stamp, so the check is simply re-attempted on the next dispatch.  The

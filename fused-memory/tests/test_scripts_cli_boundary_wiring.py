@@ -18,6 +18,7 @@ growing a ``_spawn`` of their own.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -44,6 +45,7 @@ _MIGRATED_SCRIPTS = [
     ('measure_stale_status_snapshot_sweep.py', '--triage-note'),
     ('repair_recon_citation.py', '--target-run-id'),
     ('run_write_triage_config_matrix.py', '--data-root'),
+    ('duplicate_cluster_report.py', '--plan'),
 ]
 """``(script, a flag its help must show)`` for every migrated script."""
 
@@ -97,6 +99,23 @@ def _gate_backlog_dry_run_argv(out_root: Path) -> list[str]:
     return ['--queue-dir', str(out_root)]
 
 
+def _duplicate_report_plan_argv(out_root: Path) -> list[str]:
+    """Rebuilds a report from one saved plan under *out_root*, then prints its summary."""
+    plan = out_root / 'plan-procedural_knowledge.json'
+    plan.write_text(json.dumps({
+        'near_duplicate_groups': [],
+        'threshold': 0.85,
+        'scan_coverage': {
+            'procedural_knowledge': {'scanned': 0, 'truncated': 0, 'scan_limit': 5000},
+        },
+    }), encoding='utf-8')
+    return [
+        '--config', str(_SCRIPTS_DIR.parent / 'config' / 'duplicate-audit.yaml'),
+        '--out-root', str(out_root / 'reports'), '--project-id', 'p',
+        '--plan', str(plan), '--run-stamp', _STAMP,
+    ]
+
+
 _STORE_FREE_RUNS = pytest.mark.parametrize(
     ('script', 'argv_for'),
     [
@@ -115,6 +134,10 @@ _STORE_FREE_RUNS = pytest.mark.parametrize(
         pytest.param(
             'backfill_gate_backlog_summaries.py', _gate_backlog_dry_run_argv,
             id='backfill_gate_backlog_summaries',
+        ),
+        pytest.param(
+            'duplicate_cluster_report.py', _duplicate_report_plan_argv,
+            id='duplicate_cluster_report',
         ),
     ],
 )

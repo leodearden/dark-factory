@@ -8,7 +8,9 @@ endpoint-selection variable (``AGENT_ENDPOINT_VARS``: the endpoint and its
 client key) and no Python-environment selection (``shared.python_env``); an
 endpoint reaches a child only through its caller's overrides.
 ``without_agent_endpoint_vars`` is those two scrubs alone, for a child that
-needs its inherited credentials. Operator view: ``OPERATIONS.md``.
+needs its inherited credentials. A target project's verify or offline-lane
+child inherits every credential except the ``CLAUDE_OAUTH_TOKEN_*`` account
+pool (``without_account_pool``). Operator view: ``OPERATIONS.md``.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ __all__ = [
     'agent_subprocess_env',
     'is_secret_env_name',
     'secret_env_values',
+    'without_account_pool',
     'without_agent_endpoint_vars',
 ]
 
@@ -34,8 +37,16 @@ AGENT_ENDPOINT_VARS = frozenset({'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN'})
 _SECRET_SUFFIXES = ('_API_KEY', '_TOKEN')
 
 
+def _is_pool_token_name(name: str) -> bool:
+    return name.startswith(POOL_TOKEN_PREFIX)
+
+
 def is_secret_env_name(name: str) -> bool:
-    return name.startswith(POOL_TOKEN_PREFIX) or name.endswith(_SECRET_SUFFIXES)
+    return _is_pool_token_name(name) or name.endswith(_SECRET_SUFFIXES)
+
+
+def without_account_pool(environ: Mapping[str, str]) -> dict[str, str]:
+    return {name: value for name, value in environ.items() if not _is_pool_token_name(name)}
 
 
 def without_agent_endpoint_vars(environ: Mapping[str, str]) -> dict[str, str]:

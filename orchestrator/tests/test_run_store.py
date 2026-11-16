@@ -5,12 +5,13 @@ from __future__ import annotations
 import dataclasses
 import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from orchestrator.harness import HarnessReport, TaskReport
 from orchestrator.pause_policy import PauseClass, policy_for
-from orchestrator.run_store import RunStore, TaskResultRecord
+from orchestrator.run_store import RunExitKind, RunExitReason, RunStore, TaskResultRecord
 from orchestrator.workflow import WorkflowOutcome
 
 
@@ -1231,10 +1232,109 @@ class TestRunsCodeSha:
         fresh = tmp_path / 'fresh.db'
         RunStore(fresh)
         assert self._runs_columns(legacy) == self._runs_columns(fresh)
-        assert self._runs_columns(legacy)[-1] == 'code_sha'
+        columns = self._runs_columns(legacy)
+        assert columns[columns.index('code_sha') + 1:] == ['startup_completed_at', 'exit_reason']
         assert self._code_sha(legacy, 'run-legacy') is None
         store.start_run('run-new', 'proj-a', '2026-10-20T00:00:00+00:00', code_sha='e' * 40)
         assert self._code_sha(legacy, 'run-new') == 'e' * 40
+
+
+class TestRunsStartupOutcome:
+    """Task 8269: ``runs.startup_completed_at`` and ``runs.exit_reason`` record how a start ended."""
+
+    _COLUMNS = ['code_sha', 'startup_completed_at', 'exit_reason']
+
+    @staticmethod
+    def _runs_columns(db_path) -> list[str]:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return [row[1] for row in conn.execute('PRAGMA table_info(runs)')]
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _outcome(db_path, run_id: str) -> tuple[str | None, str | None]:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            return conn.execute(
+                'SELECT startup_completed_at, exit_reason FROM runs WHERE run_id = ?', (run_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _started(tmp_path) -> tuple[RunStore, Path]:
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        store.start_run('run-1', 'proj', '2026-11-15T00:00:00+00:00')
+        return store, db_path
+
+    def test_a_fresh_db_appends_both_columns_after_code_sha(self, tmp_path):
+        db_path = tmp_path / 'runs.db'
+        RunStore(db_path)
+
+        assert self._runs_columns(db_path)[-3:] == self._COLUMNS
+
+    def test_a_legacy_db_migrates_to_the_fresh_column_order_with_null_rows(self, tmp_path):
+        legacy = tmp_path / 'legacy.db'
+        _build_legacy_db(legacy)
+
+        RunStore(legacy)
+        RunStore(legacy)  # idempotent
+        fresh = tmp_path / 'fresh.db'
+        RunStore(fresh)
+
+        assert self._runs_columns(legacy) == self._runs_columns(fresh)
+        assert self._outcome(legacy, 'run-legacy') == (None, None)
+
+    def test_a_clean_return_leaves_both_null(self, tmp_path):
+        store, db_path = self._started(tmp_path)
+
+        store.finish_run('run-1', _sample_report())
+
+        assert self._outcome(db_path, 'run-1') == (None, None)
+
+    def test_startup_completed_at_is_stored_as_utc_text(self, tmp_path):
+        store, db_path = self._started(tmp_path)
+        completed = datetime(2026, 11, 15, 1, 2, 3, tzinfo=timezone(timedelta(hours=2)))
+
+        store.finish_run(
+            'run-1', _sample_report(), startup_completed_at=completed, exit_reason=None,
+        )
+
+        assert self._outcome(db_path, 'run-1') == ('2026-11-14T23:02:03+00:00', None)
+
+    @pytest.mark.parametrize(
+        ('reason', 'stored'),
+        [(RunExitReason.startup_crash('2e'), 'startup_crash:2e'), (RunExitReason.cancelled(), 'cancelled')],
+        ids=['startup-crash', 'cancelled'],
+    )
+    def test_exit_reason_is_stored_as_its_column_value(self, tmp_path, reason, stored):
+        store, db_path = self._started(tmp_path)
+
+        store.finish_run('run-1', _sample_report(), exit_reason=reason)
+
+        assert self._outcome(db_path, 'run-1') == (None, stored)
+
+    @pytest.mark.parametrize(
+        ('kind', 'site'),
+        [(RunExitKind.STARTUP_CRASH, None), (RunExitKind.CANCELLED, '2e')],
+        ids=['crash-without-site', 'cancelled-with-site'],
+    )
+    def test_a_site_is_required_exactly_for_a_startup_crash(self, kind, site):
+        with pytest.raises(ValueError) as raised:
+            RunExitReason(kind=kind, site=site)
+
+        assert kind.value in str(raised.value)
+        assert repr(site) in str(raised.value)
+
+    def test_a_naive_startup_completed_at_is_refused(self, tmp_path):
+        store, _db_path = self._started(tmp_path)
+
+        with pytest.raises(ValueError, match='timezone-aware'):
+            store.finish_run(
+                'run-1', _sample_report(), startup_completed_at=datetime(2026, 11, 15),
+            )
 
 
 class TestGetTaskOutcome:

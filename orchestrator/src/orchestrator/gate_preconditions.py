@@ -10,7 +10,9 @@ import copy
 import logging
 from dataclasses import dataclass
 
-from orchestrator.dependency_verdict import task_dependency_ids, task_external_deps
+from shared.task_fields import dependency_ids
+
+from orchestrator.dependency_verdict import task_external_deps
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,7 @@ class GatePreconditions:
     @classmethod
     def of_task(cls, task: dict) -> GatePreconditions:
         return cls(
-            dependencies=frozenset(task_dependency_ids(task)),
+            dependencies=frozenset(dependency_ids(task)),
             external_deps=frozenset(task_external_deps(task)),
             milestone=copy.deepcopy((task.get('metadata') or {}).get('milestone')),
         )

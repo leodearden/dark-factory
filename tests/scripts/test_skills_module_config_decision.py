@@ -226,7 +226,7 @@ SKILLS_CONSUMING_TESTS = (
     # both walk the repo with no skills/ prune, feeding
     # test_every_enumeration_site_is_pinned and the citation-drift checks —
     # the single broadest skills/ consumer in the repo (task 4941).
-    "scripts/tests/test_design_invariants_consistency.py",
+    "tests/repo_guards/test_design_invariants_consistency.py",
     # Reads the skills/ docs named in its _GUARDED_DOCS to execute their
     # `entities=` examples against the live entities_gate (tasks 3675, 5555, 5866).
     "fused-memory/tests/test_referent_declaration_examples.py",

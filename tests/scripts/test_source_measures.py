@@ -1631,7 +1631,8 @@ def test_importing_the_layer_loads_no_consumer_and_no_tool() -> None:
     code = (
         'import sys\n'
         'import source_measures\n'
-        "print(sorted({'merge_lane_metrics', 'complexipy', 'radon'} & set(sys.modules)))\n"
+        "consumers = {'merge_lane_metrics', 'merge_lane_cluster', 'merge_lane_ratchet'}\n"
+        "print(sorted((consumers | {'complexipy', 'radon'}) & set(sys.modules)))\n"
     )
     proc = subprocess.run(
         [sys.executable, '-c', code],

@@ -109,7 +109,7 @@ def is_missing_collection_error(exc: BaseException) -> bool:
     home for the Scope-addressed metadata reads; any other caller that
     degrades on this predicate should likewise log the missing collection.
     """
-    from qdrant_client.http.exceptions import UnexpectedResponse  # noqa: PLC0415
+    from qdrant_client.http.exceptions import UnexpectedResponse
 
     if not isinstance(exc, UnexpectedResponse) or exc.status_code != 404:
         return False
@@ -855,7 +855,7 @@ class Mem0Backend:
                 '_build_payload_filter requires at least one filter or text needle; '
                 'an empty filter would select every point in the collection',
             )
-        from qdrant_client.http import models as qmodels  # noqa: PLC0415
+        from qdrant_client.http import models as qmodels
 
         must: list[qmodels.Condition] = [
             qmodels.FieldCondition(key=k, match=qmodels.MatchValue(value=v))
@@ -1199,7 +1199,7 @@ class Mem0Backend:
                 'result as a clean corpus'
             )
 
-        from fused_memory.utils.toolcall_xml_leak import (  # noqa: PLC0415
+        from fused_memory.utils.toolcall_xml_leak import (
             PREFILTER_NEEDLES,
             find_toolcall_xml_leak,
         )

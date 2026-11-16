@@ -2698,7 +2698,7 @@ class TestDecidedPredispatchRequestsLeaveTheCensus:
 # ---------------------------------------------------------------------------
 
 
-def _stub_train_callback_factory(train_id: str):  # noqa: ARG001
+def _stub_train_callback_factory(train_id: str):
     """Minimal TrainCallbacks stub (duplicated from
     test_merge_queue_coalesce.py's _stub_factory — per-file duplication
     convention, see this file's module docstring)."""

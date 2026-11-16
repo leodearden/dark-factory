@@ -186,6 +186,7 @@ def test_an_unbindable_checkout_refuses_to_import(tmp_path: Path, pyproject: str
 
 _BOUND_SCRIPTS = (
     'merge_lane_metrics',
+    'merge_lane_ratchet',
     'quality_metrics_snapshot',
     'inline_suppression_classify',
     'inline_suppressions',
@@ -219,7 +220,14 @@ _SAFE_IO_REPORTS_ITS_FILE = "import sys\nprint('safe_io:' + __file__, file=sys.s
 
 def test_merge_lane_metrics_run_from_a_copy_uses_the_copys_shared(tmp_path: Path) -> None:
     checkout = _layout(
-        tmp_path, scripts=('_checkout.py', 'merge_lane_metrics.py', 'source_measures.py')
+        tmp_path,
+        scripts=(
+            '_checkout.py',
+            'merge_lane_metrics.py',
+            'merge_lane_ratchet.py',
+            'merge_lane_cluster.py',
+            'source_measures.py',
+        ),
     )
     for shared_package in (checkout / 'shared' / 'src' / 'shared', tmp_path / _DECOY / 'shared'):
         (shared_package / 'safe_io.py').write_text(_SAFE_IO_REPORTS_ITS_FILE, encoding='utf-8')
@@ -250,7 +258,8 @@ def test_each_ratchet_gate_reports_an_unbindable_checkout_as_an_instrument_failu
 ) -> None:
     gate_scripts = (
         '_checkout.py',
-        'merge_lane_metrics.py',
+        'merge_lane_ratchet.py',
+        'merge_lane_cluster.py',
         'source_measures.py',
         'ratchet_revisions.py',
         gate,

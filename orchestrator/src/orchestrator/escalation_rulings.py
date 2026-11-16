@@ -1,6 +1,9 @@
 """Turn a task's resolved escalation records into the rulings an agent is briefed with.
 
-A ruling is an escalation filed on the task that someone resolved with text; it
+A ruling is an escalation filed on the task that someone resolved with text; a
+record closed as it was filed
+(``escalation/src/escalation/models.py::closed_at_filing``) is not one, because
+no one ruled on it.  A ruling
 binds every later agent on the task (task 4764).  A resumed agent learns its
 resolutions from ``orchestrator/resume_resolution.py`` instead, which shares
 :func:`ruling_resolution` so both paths agree on what counts as one.  Order is imposed
@@ -17,7 +20,7 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
-from escalation.models import cascade_parent_id
+from escalation.models import cascade_parent_id, closed_at_filing
 
 if TYPE_CHECKING:
     from escalation.models import Escalation
@@ -80,8 +83,10 @@ class Ruling:
 
 
 def ruling_resolution(record: Escalation) -> str | None:
-    """The resolution text that makes *record* a ruling, else None."""
-    return record.resolution if record.status == 'resolved' else None
+    """The resolution text that makes *record* a ruling, else None; a record closed at filing (escalation/src/escalation/models.py::closed_at_filing) is never one, because no one ruled on it."""
+    if record.status != 'resolved' or closed_at_filing(record):
+        return None
+    return record.resolution
 
 
 def select_rulings(

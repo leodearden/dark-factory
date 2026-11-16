@@ -15,6 +15,8 @@ from pydantic_settings import (
 )
 from shared.config_models import UsageCapConfig
 
+from fused_memory.config.checkout_anchor import anchor_at_checkout
+
 # The ONE topic-slug namespace (task 3198, PRD D4). Imported from the
 # stdlib-only leaf, NOT from fused_memory.memory_metadata: that module
 # imports backends.mem0_client, which imports THIS module at module scope,
@@ -359,6 +361,15 @@ class FalkorDBProviderConfig(BaseModel):
     # group_id at request time.  Kept for backward-compat with existing configs.
     database: str | None = None
     expected_graph_timeout_ms: int = 30000
+    socket_timeout_seconds: float = Field(
+        default=130.0,
+        description=(
+            'Socket timeout of the FalkorDB connection. FusedMemoryConfig rejects '
+            'a value not above both queue.backend_read_timeout_seconds and '
+            'queue.backend_write_timeout_seconds, so a slow Cypher call fails on '
+            'its named budget rather than on a socket error.'
+        ),
+    )
 
 
 class GraphitiBackendConfig(BaseModel):
@@ -1461,15 +1472,14 @@ class ReconciliationConfig(BaseModel):
         return data
 
     enabled: bool = Field(default=True)
-    # data_dir MAY be RELATIVE, and the default is (task 4592).  Nothing
-    # absolutizes it, so a standalone/systemd launch anchors it at the PROCESS
-    # cwd; every in-process consumer shares that anchor and so agrees by
-    # construction.  The per-run CLI config dir derived from it does NOT get to
-    # inherit the relativity — it crosses a process boundary as
-    # CLAUDE_CONFIG_DIR — and is absolutized exactly once, at
-    # reconciliation/cli_stage_runner.py::recon_config_base_dir, which carries
-    # the full deployment story and rationale.
-    data_dir: str = Field(default='./data/reconciliation')
+    # A relative value is anchored at the checkout root at load
+    # (config/checkout_anchor.py::anchor_at_checkout), never the process CWD (task 5462).
+    data_dir: str = Field(default='./data/reconciliation', validate_default=True)
+
+    @field_validator('data_dir')
+    @classmethod
+    def _anchor_data_dir(cls, value: str) -> str:
+        return anchor_at_checkout(value)
 
     # Buffer triggers
     buffer_size_threshold: int = Field(default=10)
@@ -3154,6 +3164,38 @@ class Mem0UpdateConfig(BaseModel):
             'preserving half. Green-tier hot-reloadable via reload_config.'
         ),
     )
+    agent_prefix_sanctioned_use: dict[str, str] = Field(
+        default_factory=lambda: {
+            'recon-stage-': (
+                'the reconciliation stage agents, which run automatically as '
+                'agent_id recon-stage-<stage>; no interactive or task-dispatched '
+                'session holds this role'
+            ),
+            'curator-': (
+                'an interactive memory-consolidation curation sitting executing '
+                'the procedure in skills/curate-fused-memories/SKILL.md, adopted '
+                'as curator-<sitting-slug>; read that procedure before any write '
+                'under this prefix'
+            ),
+            'link-heal-': (
+                'the link-heal executor (fused-memory/scripts/link_heal.py), which '
+                'writes metadata-only heals as agent_id link-heal-<run>; no '
+                'session adopts it by hand'
+            ),
+        },
+        description=(
+            'Maps each agent_id prefix to the role that prefix DECLARES. The '
+            'Mem0UpdateNotAuthorized refusal renders it per prefix for the '
+            'refusing arm\'s allowlist only; an allowlisted prefix with no entry '
+            'renders as undocumented, telling the caller not to adopt it. '
+            'Documenting a prefix here is part of the same act as widening '
+            'either allowlist. An entry for an ungranted prefix is inert. A YAML '
+            'value REPLACES this map wholesale, so restate every entry. agent_id '
+            'is self-reported: this text makes the norm legible, not the gate '
+            'enforceable. Green-tier hot-reloadable via reload_config as one '
+            'atomic leaf.'
+        ),
+    )
     storm_threshold: int = Field(
         default=20,
         gt=0,
@@ -3178,6 +3220,24 @@ class Mem0UpdateConfig(BaseModel):
             'read-live-per-record() basis as storm_threshold.'
         ),
     )
+
+    @field_validator('agent_prefix_sanctioned_use')
+    @classmethod
+    def _require_non_blank_sanctioned_uses(
+        cls, value: dict[str, str],
+    ) -> dict[str, str]:
+        for prefix, use in value.items():
+            if not prefix.strip():
+                raise ValueError(
+                    'mem0_update.agent_prefix_sanctioned_use has a blank prefix '
+                    f'key {prefix!r}; every key must name an agent_id prefix'
+                )
+            if not use.strip():
+                raise ValueError(
+                    f'mem0_update.agent_prefix_sanctioned_use[{prefix!r}] is '
+                    'blank; state the role the prefix declares, or remove the entry'
+                )
+        return value
 
 
 class EntityMintConfig(BaseModel):
@@ -3762,6 +3822,24 @@ class FusedMemoryConfig(BaseSettings):
     # Curator's usage-gate pool; independent from ``reconciliation.usage_cap``
     # because each UsageGate instance tracks cap state per-process / per-loop.
     usage_cap: UsageCapConfig | None = Field(default_factory=_default_curator_usage_cap)
+
+    @model_validator(mode='after')
+    def _validate_socket_timeout_outlasts_backend_budgets(self) -> 'FusedMemoryConfig':
+        socket_timeout = self.graphiti.falkordb.socket_timeout_seconds
+        widest_budget = max(
+            self.queue.backend_read_timeout_seconds,
+            self.queue.backend_write_timeout_seconds,
+        )
+        if socket_timeout <= widest_budget:
+            raise ValueError(
+                f'graphiti.falkordb.socket_timeout_seconds ({socket_timeout}) must exceed '
+                f'queue.backend_read_timeout_seconds '
+                f'({self.queue.backend_read_timeout_seconds}) and '
+                f'queue.backend_write_timeout_seconds '
+                f'({self.queue.backend_write_timeout_seconds}): otherwise a slow Cypher '
+                'call fails on a socket error instead of its named budget.'
+            )
+        return self
 
     model_config = SettingsConfigDict(
         env_prefix='',

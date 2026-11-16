@@ -1,0 +1,135 @@
+# Machine-readable twin of one-merge-request-per-task-prd.capability-manifest.md
+# Partial decompose (2026-11-15): blocks A and B only. The later decompose of
+# leaves C to G adds their blocks and sets signal_leaves to F.
+prd: plans/one-merge-request-per-task-prd.md
+schema_version: 1
+tasks:
+  - label: "A"
+    task_id: 10215
+    title: "Merge content relation, public containment classifier and the MergeContent value"
+    note: "Intermediate leaf; its consumer is leaf C, filed by the pre-authorised decompose gate."
+    capabilities:
+      - name: "patch-containment-parse-exists"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/landing_evidence.py::patch_content_contained` wired: it calls the private _classify_patch_containment"
+        verdict: PASS
+      - name: "checked-ancestry-test-exists"
+        binding: "`grep:orchestrator/src/orchestrator/git_ops.py::GitOps.is_ancestor_checked`"
+        verdict: PASS
+      - name: "request-types-module-exists"
+        binding: "`grep:orchestrator/src/orchestrator/merge_lane/types.py::WaiterRecord`"
+        verdict: PASS
+      - name: "content-relation"
+        binding: "built here; grep absent on main 27c93d6f75"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class ContentRelation\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: present
+      - name: "classify-content"
+        binding: "built here; grep absent on main 27c93d6f75"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def classify_content\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: present
+      - name: "classified-containment"
+        binding: "built here; grep absent on main 27c93d6f75"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def classify_containment\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: present
+      - name: "range-patch-ids"
+        binding: "built here; grep absent on main 27c93d6f75"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def range_patch_ids\\("
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: present
+      - name: "merge-content-value"
+        binding: "built here; grep absent on main 27c93d6f75"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class MergeContent[(:]"
+          paths: ["orchestrator/src/orchestrator/merge_lane/"]
+          expect: present
+      - name: "unreadable-ref-raises"
+        binding: "built here; rejection-mechanism bound by A's own fixture (boundary row 18, last case)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the raise is observed by A's real-git fixture, not expressible as a grep"
+  - label: "B"
+    task_id: 10216
+    title: "Lazy restart rejoin: a recovered merge request that fails fixably sends its task back to the merge phase"
+    capabilities:
+      - name: "recovered-merge-owner"
+        binding: "producer:task-7277 upstream (RecoveredMergeOwner, OutcomeTasks, Settled, ClaimantSource.MERGE_REQUEST; wired as a dependency)"
+        verdict: PASS
+      - name: "recovered-file-hold"
+        binding: "producer:task-10093 upstream (wired as a dependency; B verifies PRD D19's three points against it as landed and carries what it lacks)"
+        verdict: PASS
+      - name: "merge-phase-entry"
+        binding: "`grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._merge_and_finalise`"
+        verdict: PASS
+      - name: "merge-retry-resume"
+        binding: "`grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._resume_merge_retry_if_pending`"
+        verdict: PASS
+      - name: "merge-phase-preconditions"
+        binding: "`grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._setup_worktree_and_artifacts` `grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._recover_if_already_merged`"
+        verdict: PASS
+      - name: "train-member-park"
+        binding: "`grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._maybe_defer_as_train_member`"
+        verdict: PASS
+      - name: "hold-test"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler.is_actively_held`"
+        verdict: PASS
+      - name: "lock-acquire"
+        binding: "`grep:orchestrator/src/orchestrator/lock_table.py::ModuleLockTable.try_acquire`"
+        verdict: PASS
+      - name: "reloadable-key-table"
+        binding: "`grep:orchestrator/src/orchestrator/config.py::RELOADABLE_FIELDS`"
+        verdict: PASS
+      - name: "rejoin-on-table"
+        binding: "built here; grep absent on main 27c93d6f75"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "REJOIN_ON\\b"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "stamp-then-pend"
+        binding: "built here; grep absent on main 27c93d6f75"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def stamp_rejoin_then_pend\\("
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "rejoin-wait-bound-config"
+        binding: "built here; grep absent on main 27c93d6f75"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "merge_rejoin"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "task-rejoined-merge-event"
+        binding: "built here; grep absent on main 27c93d6f75"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "task_rejoined_merge"
+          paths: ["orchestrator/src/orchestrator/", "shared/src/shared/"]
+          expect: present
+      - name: "non-rejoin-outcomes-refused"
+        binding: "built here; rejection-mechanism bound by B's own tests (boundary rows 21 and 22)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the block-not-rejoin behaviour is observed by B's real-worker tests, not expressible as a grep"

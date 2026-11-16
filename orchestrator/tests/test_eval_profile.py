@@ -24,16 +24,20 @@ from __future__ import annotations
 from typing import cast
 
 import pytest
+from shared.transcript_archive import resolve_archive_root
 
 from orchestrator import config
 from orchestrator.config import OrchestratorConfig
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.profile import (
     EVAL_PROFILE,
+    UnderEvalRoot,
     apply_eval_profile,
     resolve_eval_profile_update,
+    resolved_eval_profile,
 )
 from orchestrator.evals.runner import build_eval_orch_config
+from orchestrator.evals.snapshots import eval_worktree_root
 from orchestrator.fm_retry import FM_NULL_SENTINEL_URL, is_fm_null_sentinel
 
 
@@ -50,8 +54,8 @@ def _changed_leaf_paths(a: OrchestratorConfig, b: OrchestratorConfig) -> set[str
 
 
 def test_eval_profile_documented_keys():
-    """EVAL_PROFILE is exactly the 7 documented C1 leaves — no more, no less."""
-    assert EVAL_PROFILE == {
+    """EVAL_PROFILE is exactly the 8 documented leaves — no more, no less."""
+    assert {
         'rebase_before_verify': False,
         'inter_iteration_rebase': False,
         'unblock_auto.enabled': False,
@@ -59,7 +63,8 @@ def test_eval_profile_documented_keys():
         'simple_task_enabled': False,
         'fused_memory.url': 'http://127.0.0.1:1',
         'strict_mcp_config': True,
-    }
+        'transcript_archive.root': UnderEvalRoot('agent-transcripts'),
+    } == EVAL_PROFILE
 
 
 def test_eval_profile_sentinel_single_sourced_from_fm_retry():
@@ -76,9 +81,9 @@ def test_eval_profile_sentinel_single_sourced_from_fm_retry():
     assert EVAL_PROFILE['fused_memory.url'] == FM_NULL_SENTINEL_URL
     # (b) The transport predicate recognizes exactly the profile's sentinel —
     # the live cross-module contract that makes the fail-fast actually fire.
-    # EVAL_PROFILE is heterogeneous (dict[str, bool | str]); this leaf is the
-    # str sentinel (asserted == FM_NULL_SENTINEL_URL above), so narrow bool | str
-    # -> str for the str | None predicate param.
+    # EVAL_PROFILE is heterogeneous (dict[str, bool | str | UnderEvalRoot]);
+    # this leaf is the str sentinel (asserted == FM_NULL_SENTINEL_URL above), so
+    # narrow it to str for the str | None predicate param.
     assert is_fm_null_sentinel(cast(str, EVAL_PROFILE['fused_memory.url'])) is True
     # (c) Identity — proves profile.py references the shared constant object
     # rather than holding a second copy of the literal (CPython does not intern
@@ -127,20 +132,22 @@ def test_apply_eval_profile_parity(tmp_path):
     Invariant P1 / Boundary test B1 — the D5 root-cause guard. Exactness holds
     by identity: model_copy(update=X) changes exactly X's leaves and every
     profile leaf diverges from its base value (the 5 bool True -> False flips,
-    the strict_mcp_config False -> True flip, and the D8 fused_memory.url
-    production -> null-sentinel change), so the diff is precisely the 7
-    documented EVAL_PROFILE keys — never more (an undocumented leak) or fewer
-    (a no-op profile entry).
+    the strict_mcp_config False -> True flip, the D8 fused_memory.url
+    production -> null-sentinel change, and transcript_archive.root moving
+    under the eval worktree root), so the diff is precisely the 8 documented
+    EVAL_PROFILE keys — never more (an undocumented leak) or fewer (a no-op
+    profile entry).
     """
     base = OrchestratorConfig(project_root=tmp_path)
 
-    # Loud premise guard: every EVAL_PROFILE path must DIFFER from its profile
-    # value on a fresh code-default base, or applying it below wouldn't
-    # actually change anything and the parity assertion would pass vacuously.
-    # Generalized from the old "is True" form (which only held for the bool
-    # flips) so the string-valued fused_memory.url entry is guarded too.
+    # Loud premise guard: every EVAL_PROFILE path must DIFFER from its value
+    # resolved for this base, or applying it below wouldn't actually change
+    # anything and the parity assertion would pass vacuously. Compared against
+    # the resolved value so the UnderEvalRoot-valued transcript_archive.root is
+    # guarded against the string it really becomes, not its marker.
+    profile = resolved_eval_profile(base)
     for path in EVAL_PROFILE:
-        assert config._get_leaf(base, path) != EVAL_PROFILE[path], (
+        assert config._get_leaf(base, path) != profile[path], (
             f'premise violated: {path!r} already equals its EVAL_PROFILE value '
             f'on a fresh code-default OrchestratorConfig — the parity assertion '
             f'below would be vacuous for this leaf'
@@ -199,3 +206,48 @@ def test_build_eval_orch_config_applies_profile_and_inherits_base(tmp_path):
     # Per-run overrides still applied on top of the profile-resolved base.
     assert result.models.implementer == 'sonnet'
     assert result.sandbox.enabled is False
+
+
+def _archive_root(cfg: OrchestratorConfig):
+    """Where the producer hook archives this config's transcripts, by production's own composition."""
+    return resolve_archive_root(cfg.project_root, cfg.transcript_archive.root)
+
+
+@pytest.mark.usefixtures('code_default_config')
+def test_transcript_archive_root_resolves_under_the_eval_worktree_root(tmp_path):
+    """An eval cell archives its transcripts under the eval root, never the project's archive.
+
+    S1 λ1 / C11: production archives every session under
+    ``project_root/data/orchestrator/agent-transcripts``; the profiled config
+    moves only the root, and keeps every sibling leaf of *base*'s
+    ``transcript_archive`` (a submodel copy, not a fresh default).
+    """
+    project_root = tmp_path / 'proj'
+    base = OrchestratorConfig(project_root=project_root)
+
+    resolved = apply_eval_profile(base)
+
+    archive_root = _archive_root(resolved)
+    assert archive_root == eval_worktree_root(project_root) / 'agent-transcripts'
+    assert not archive_root.is_relative_to(project_root)
+    assert resolved.transcript_archive.enabled == base.transcript_archive.enabled
+    assert resolved.transcript_archive.retention == base.transcript_archive.retention
+    assert resolved.transcript_archive.storm_threshold == base.transcript_archive.storm_threshold
+
+
+def test_build_eval_orch_config_roots_transcripts_under_the_fixture_project(tmp_path):
+    """The transcript root follows the fixture's project, not the campaign's base.
+
+    Campaigns load one base (dark-factory's) for fixtures of several projects
+    (reify's among them); the cell's transcripts belong beside its worktree,
+    under the fixture project's eval root.
+    """
+    base = OrchestratorConfig(project_root=tmp_path / 'a')
+    cfg = EvalConfig(name='t', backend='claude', model='sonnet', effort='high')
+    task = {'id': 't', 'project_root': str(tmp_path / 'b')}
+
+    result = build_eval_orch_config(cfg, task, base)
+
+    archive_root = _archive_root(result)
+    assert archive_root.is_relative_to(eval_worktree_root(tmp_path / 'b'))
+    assert not archive_root.is_relative_to(eval_worktree_root(tmp_path / 'a'))

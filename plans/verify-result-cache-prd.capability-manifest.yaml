@@ -94,15 +94,12 @@ tasks:
   - name: decision-against-a-view
     binding: "`grep:orchestrator/src/orchestrator/verify_cache/policy.py::decide` wired — reads the RegistryView | Unavailable that consult returns"
     verdict: PASS
-  - name: runner-keyed-input
-    binding: built here — toolchain.runner is a keyed input on every key
+  - name: one-pool-for-all-hosts
+    binding: built here — the candidate query and the backing check carry no runner filter (A6)
     verdict: PASS
     delivered_check:
-      kind: grep
-      pattern: toolchain\.runner
-      paths:
-      - orchestrator/src/orchestrator/verify_cache/
-      expect: present
+      kind: manual
+      reason: proved by η's boundary row 22 on the fixture repo
   - name: view-rides-both-verify-specs
     binding: built here — a verify_cache block on MergeVerifySpec and TaskVerifySpec
     verdict: PASS

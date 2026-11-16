@@ -780,7 +780,7 @@ class _ChunkedLocksPath(Path):
         self._snapshots: list[str | OSError] = list(snapshots)
         self.reads: int = 0
 
-    def read_text(self, *args, **kwargs) -> str:  # noqa: ARG002 -- signature parity
+    def read_text(self, *args, **kwargs) -> str:  # signature parity
         self.reads += 1
         if not self._snapshots:
             raise AssertionError(

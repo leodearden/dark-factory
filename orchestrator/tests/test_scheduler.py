@@ -2951,6 +2951,15 @@ class TestFairness:
         config.fairness.skip_threshold = 3
         return config
 
+    @pytest.fixture
+    def per_tier_config(self) -> OrchestratorConfig:
+        """OrchestratorConfig with per-tier thresholds; high parks on its first skip."""
+        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config.fairness.skip_threshold = {
+            'critical': 0, 'high': 1, 'medium': 2, 'low': 4, 'polish': 9999,
+        }
+        return config
+
     @staticmethod
     def _broad_task():
         return {
@@ -3104,15 +3113,13 @@ class TestFairness:
     # ---- skip-threshold / unconditional park tests ----
 
     @pytest.mark.asyncio
-    async def test_parks_install_unconditionally_without_v2_flag(self):
-        """Parks install after the per-tier threshold with default config.
+    async def test_parks_install_unconditionally_without_v2_flag(self, per_tier_config):
+        """Parks install after the per-tier threshold with no flag set.
 
-        Regression guard: no flag is needed.  Default high-tier threshold=1,
+        Regression guard: no flag is needed.  High-tier threshold=1,
         so one skip is enough.
         """
-        # Default config — no flag assignment needed.
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        scheduler = Scheduler(config)
+        scheduler = Scheduler(per_tier_config)
         scheduler.finish_startup()
 
         # Seed compiler/src so A (high priority) is forced to skip.
@@ -3131,16 +3138,14 @@ class TestFairness:
         assert scheduler.lock_table.has_parks('A')
 
     @pytest.mark.asyncio
-    async def test_eager_park_full_module_set(self):
+    async def test_eager_park_full_module_set(self, per_tier_config):
         """Parks install on ALL of A's modules at once (eager, full coverage).
 
         Even modules not currently held by another task are covered — this
         prevents racing lower-priority tasks from grabbing a free module
         while A waits for a blocked one.
         """
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
-        # Per-tier defaults: high -> threshold=1.
-        scheduler = Scheduler(config)
+        scheduler = Scheduler(per_tier_config)
         scheduler.finish_startup()
 
         # B holds compiler/src; C holds eval/src; tools/src is FREE.
@@ -3168,7 +3173,7 @@ class TestFairness:
         assert not scheduler.lock_table.try_acquire('D', ['tools/src'])
 
     @pytest.mark.asyncio
-    async def test_cross_tier_preemption(self):
+    async def test_cross_tier_preemption(self, per_tier_config):
         """A high-tier skip-bump SHADOWS (not destroys) an overlapping low-tier park.
 
         Setup: low-priority L is already parked on m1+m2 with skip_count=3.
@@ -3180,7 +3185,7 @@ class TestFairness:
         (L shadowed on m1).  ZERO reservation_evicted events — the old destructive
         eviction is no longer emitted on preemption.
         """
-        config = OrchestratorConfig(max_per_module=1, lock_depth=2)
+        config = per_tier_config
         event_store = _RecordingEventStore()
         scheduler = Scheduler(config, event_store=event_store)  # type: ignore[arg-type]
         scheduler.finish_startup()
@@ -4626,51 +4631,6 @@ class TestScoreFunction:
         """Age + CPM together never cross a tier boundary."""
         huge = scheduler._compute_score_legacy('low', age=10_000, transitive_count=10_000)
         assert huge < TIER_BASE['medium']
-
-
-class TestAgeAnchor:
-    """Age anchor resets on cancellation → pending resurrection."""
-
-    def test_cancelled_resurrection_no_age_jump(self):
-        """A previously-cancelled task re-pended scores no higher than brand-new medium."""
-        filed, reopened = '2026-10-01T00:00:00+00:00', '2026-10-05T00:00:00+00:00'
-
-        def stamped(task_id: str, status: str, pending_since: str) -> dict:
-            task = _pending_task(task_id, status=status)
-            task['metadata']['pending_since'] = pending_since
-            return task
-
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
-        scheduler.finish_startup()
-        # Tick 1: task 1 and task 100 are pending.
-        scheduler._update_age_anchors(
-            [stamped('1', 'pending', filed), stamped('100', 'pending', filed)], max_id=100,
-        )
-        age_100_t1 = scheduler._compute_age('100', max_id=100)
-        # Tick 2: task 1 is cancelled; its stamp is unchanged.
-        scheduler._update_age_anchors(
-            [stamped('1', 'cancelled', filed), stamped('100', 'pending', filed)], max_id=100,
-        )
-        # Tick 3: task 1 is reinstated, which D3 marks with a new stamp.
-        tasks_tick3 = [stamped('1', 'pending', reopened), stamped('100', 'pending', filed)]
-        scheduler._update_age_anchors(tasks_tick3, max_id=100)
-        age_1 = scheduler._compute_age('1', max_id=100)
-        age_100 = scheduler._compute_age('100', max_id=100)
-        # Resurrected 1 must not leapfrog brand-new 100.
-        assert age_1 <= age_100
-        # Brand-new-pending baseline is 0.
-        assert age_100_t1 == 0
-        assert age_100 == 0
-        assert age_1 == 0
-
-    def test_old_pending_accumulates_age(self):
-        """Continuously-pending old tasks accumulate age from their creation id."""
-        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
-        scheduler.finish_startup()
-        # First-ever tick sees task 5 as pending — anchor to task_id.
-        scheduler._update_age_anchors([_pending_task('5')], max_id=100)
-        age = scheduler._compute_age('5', max_id=100)
-        assert age == 95
 
 
 class TestPerTierSkipThreshold:
@@ -11579,17 +11539,17 @@ class TestAcquireNextBookkeepingPurgesAbsentTasks:
     async def test_bookkeeping_purged_for_absent_task(self, scheduler: Scheduler):
         """Bookkeeping entries for a task absent from the active fetch must be purged.
 
-        Includes _pending_anchor: a task that went pending → terminal without
-        ever being dispatched would leak its anchor entry permanently under
-        active-only filtering because _update_age_anchors only iterates the
+        Includes the age anchors: a task that went pending → terminal without
+        ever being dispatched would leak its held anchor permanently under
+        active-only filtering because AgeAnchors.observe only iterates the
         fetched tasks list (and terminal tasks are absent from it).
         """
         # Seed bookkeeping for task 'X' that is now completed/absent.
         scheduler._skip_count['X'] = 3
         scheduler._last_dispatch_at['X'] = 123.0
         scheduler._module_cache['X'] = ['backend/module_x']
-        # Seed _pending_anchor as if X was pending once and assigned an anchor.
-        scheduler._pending_anchor['X'] = 5
+        # X was pending once: a non-numeric id anchors at max_id 5.
+        scheduler.age_anchors.observe([_pending_task('X')], max_id=5)
 
         # Unrelated pending task (not X); X is terminal → excluded from active fetch.
         other_task = {
@@ -11614,13 +11574,11 @@ class TestAcquireNextBookkeepingPurgesAbsentTasks:
         assert 'X' not in scheduler._module_cache, (
             f"Expected 'X' purged from _module_cache but it's still there: {scheduler._module_cache}"
         )
-        # _pending_anchor must also be purged so the dict stays bounded.
-        assert 'X' not in scheduler._pending_anchor, (
-            f"Expected 'X' purged from _pending_anchor but it's still there: {scheduler._pending_anchor}"
-        )
+        # The held age anchor must also be purged so the holding stays bounded.
+        assert 'X' not in scheduler.age_anchors.tracked_ids()
         # Absence is not a cancellation (D3): X returns with the anchor it left with.
-        scheduler._update_age_anchors([_pending_task('X')], max_id=100)
-        assert scheduler._compute_age('X', 100) == 95
+        scheduler.age_anchors.observe([_pending_task('X')], max_id=100)
+        assert scheduler.age_anchors.age('X', 100) == 95
 
 
 class TestOrchestratorStatusSetsMatchShared:
@@ -12835,10 +12793,10 @@ class TestStreakRegistryMigration:
         never touch 'probe').
 
         NOTE: the spine entry uses ``_skip_count`` rather than
-        ``_pending_anchor`` — ``_update_age_anchors`` (called earlier in the
-        same tick, before the stale-id sweep) never anchors a tid observed
-        with a terminal status, so a task reported as already-'done' in its
-        very first observed tick never enters ``_pending_anchor`` and so
+        ``age_anchors.tracked_ids()`` — ``AgeAnchors.observe`` (called earlier
+        in the same tick, before the stale-id sweep) never anchors a tid
+        observed with a terminal status, so a task reported as already-'done'
+        in its very first observed tick never enters ``tracked_ids()`` and so
         never reaches the stale-id sweep through it.  ``_skip_count`` has no such early-pop and is one of
         the four ``_all_tracked`` spine dicts, so it reliably lands 'T' in
         ``_stale_ids`` for this single-tick repro.
@@ -13352,11 +13310,11 @@ class TestExternalDepEscalationSurvivesTransientAbsence:
 
         async def _tick(*, present: bool) -> None:
             if present:
-                # Model the real tick's _update_age_anchors: the pending-age
+                # Model the real tick's AgeAnchors.observe: the pending-age
                 # anchor is stamped every tick the dependent appears in the
                 # fetch, so the ONE absent tick exercises the stale_sweep
                 # absence-GC path under test.
-                scheduler._pending_anchor['10'] = 10
+                scheduler.age_anchors.observe([task], max_id=10)
                 ctx = TickContext(
                     tasks=[task],
                     status_map={'10': 'pending'},
@@ -13406,7 +13364,7 @@ class TestExternalDepEscalationSurvivesTransientAbsence:
 
         async def _tick(*, present: bool) -> None:
             if present:
-                scheduler._pending_anchor['10'] = 10
+                scheduler.age_anchors.observe([task], max_id=10)
                 ctx = TickContext(
                     tasks=[task],
                     status_map={'10': 'pending'},

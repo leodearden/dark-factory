@@ -74,7 +74,6 @@ these invariants is violated:
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, assert_never, get_args
@@ -82,10 +81,13 @@ from typing import Any, assert_never, get_args
 from pydantic import ValidationError
 from shared.before_done_paths import (
     CwdRefused,
+    FactoryRootUnresolved,
+    ScriptMissing,
+    ScriptNotExecutable,
+    ScriptRefused,
     ScriptRootRefused,
-    before_done_cwd,
+    require_runnable_script,
     resolve_before_done_paths,
-    resolve_script_base,
 )
 from shared.repo_paths import DARK_FACTORY_ROOT_ENV, resolve_dark_factory_root
 from shared.task_metadata import (
@@ -126,12 +128,6 @@ _VALID_KINDS: frozenset[str] = frozenset({'normal', 'deterministic'})
 # all — as a less-targeted warning at the (enforce=False, warn-only) write
 # boundary.
 _VALID_BEFORE_DONE_KINDS: frozenset[str] = frozenset({'deploy', 'predicate'})
-
-# How the diagnostics name each before_done.script_root's base directory.
-_SCRIPT_BASE_NAMES: dict[str, str] = {
-    'project': 'project_root',
-    'factory': 'the dark-factory root',
-}
 
 
 # ---------------------------------------------------------------------------
@@ -632,16 +628,15 @@ def _validate_before_done(
             hint="Omit 'kind' (defaults to 'deploy'), or set it to 'deploy' or 'predicate'.",
         )
 
-    # script: required non-empty string
-    script = before_done.get('script')
-    if not isinstance(script, str) or not script.strip():
+    try:
+        paths = resolve_before_done_paths(
+            before_done, Path(project_root).resolve(), factory_root_resolver,
+        )
+    except ScriptRefused as exc:
         return _validation_error(
-            "before_done.script is required and must be a non-empty string path.",
+            str(exc),
             hint="Set 'script' to a relative path of an executable file under project_root.",
         )
-
-    try:
-        before_done_cwd(before_done)
     except CwdRefused as exc:
         return _validation_error(
             str(exc),
@@ -650,9 +645,6 @@ def _validate_before_done(
                 'directory path; a relative cwd joins project_root.'
             ),
         )
-
-    try:
-        base = resolve_script_base(before_done, Path(project_root), factory_root_resolver)
     except ScriptRootRefused as exc:
         return _validation_error(
             str(exc),
@@ -661,21 +653,18 @@ def _validate_before_done(
                 "script_root='factory' together with kind='predicate'."
             ),
         )
-    if base is None:
+    except FactoryRootUnresolved as exc:
         return _validation_error(
-            "before_done.script_root='factory' but the dark-factory root could not "
-            "be resolved, so the script cannot be located.",
+            str(exc),
             hint=(
                 f'Set {DARK_FACTORY_ROOT_ENV} for the fused-memory process to the '
                 "dark-factory checkout, or use script_root='project'."
             ),
         )
-    where = _SCRIPT_BASE_NAMES[before_done.get('script_root', 'project')]
-    script_base = base.resolve()
-    script_path = resolve_before_done_paths(
-        before_done, Path(project_root).resolve(), script_base=script_base,
-    ).script
-    err = _validate_script_under(script, script_path, script_base, where)
+    script_base = paths.script_base.resolve()
+    err = _validate_script_under(
+        before_done['script'], paths.script, script_base, paths.script_root.base_name,
+    )
     if err is not None:
         return err
 
@@ -735,14 +724,14 @@ def _validate_script_under(
             hint=f"Use a path relative to {where} without leading '../' segments.",
         )
 
-    # File must exist and be executable
-    if not resolved_script.exists():
+    try:
+        require_runnable_script(resolved_script)
+    except ScriptMissing:
         return _validation_error(
             f"before_done.script {script!r} does not exist under {where}.",
             hint=f"Expected an executable file at: {resolved_script}",
         )
-
-    if not os.access(resolved_script, os.X_OK):
+    except ScriptNotExecutable:
         return _validation_error(
             f"before_done.script {script!r} exists but is not executable "
             "(os.X_OK check failed).",

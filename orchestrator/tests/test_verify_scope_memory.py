@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fake_systemd_run import assert_scope_carries, recorded_scope_spawns
+from _fake_systemd_run import assert_scope_carries, recorded_scope_spawns, scope_payload_command
 from _fake_systemd_run import fake_systemd_run as fake_systemd_run
 
 from orchestrator.config import (
@@ -102,7 +102,7 @@ class TestScopeSpawnCarriesMemoryLimits:
         )
         assert result.passed, result.summary
         records = recorded_scope_spawns(fake_systemd_run)
-        assert sorted(record[-1] for record in records) == sorted(
+        assert sorted(scope_payload_command(record) for record in records) == sorted(
             ['true segment-a', 'true segment-b', _LINT_CMD, _TYPE_CMD],
         )
         for record in records:

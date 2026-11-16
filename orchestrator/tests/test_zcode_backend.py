@@ -18,7 +18,7 @@ import pytest
 from _operator_home_fixture import OPERATOR_EMAIL, OPERATOR_IGNORED_FILE, write_operator_home
 from _plan_tools_mcp_fixture import plan_tools_mcp
 from _zcode_fixture import BASE_URL, measured_output
-from shared.cli_invoke import _SubprocessResult
+from shared.cli_invoke import SubprocessResult
 from shared.process_cost import ProcessCostBasis
 
 from orchestrator.agents.zcode_backend import (
@@ -41,8 +41,8 @@ PROMPT_PREFIX_BYTES = len('--prompt=')
 
 def _subprocess_result(
     stdout: str = '', stderr: str = '', returncode: int = 0, timed_out: bool = False,
-) -> _SubprocessResult:
-    return _SubprocessResult(
+) -> SubprocessResult:
+    return SubprocessResult(
         stdout=stdout, stderr=stderr, returncode=returncode, duration_ms=1234,
         timed_out=timed_out,
     )

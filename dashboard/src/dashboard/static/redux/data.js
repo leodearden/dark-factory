@@ -61,8 +61,7 @@ function fromBody(bodyKey, spec) {
 // endpoint is registered here by searching this shipped source for `'KEY'` or
 // `"KEY"`. Unquoting them is silent: the registry still works and those four
 // tests fail with "add it as the mapped key", naming a key that is in fact
-// already present. Same reasoning as DEFAULT_TIMEOUT_MS further down, which
-// two other Python tests parse straight out of this file.
+// already present.
 function endpointsFor(win) {
   const w = encodeURIComponent(win);
   return {
@@ -98,14 +97,15 @@ const NARROWED_POLL_URLS = Object.freeze({
 });
 
 // Keys fetched on a USER ACTION rather than by the poll loop, each parameterised
-// by the one value its caller already holds. Three declared rows today:
+// by the one value its caller already holds. Four declared rows today:
 // `terminal`, through which tab_tasks.jsx and, via
 // task_snapshot.js::createTerminalWindowHooks, tabs.jsx::OrchTab fetch
 // `?terminal=<project>`; `taskProse`, a task's description/details
 // addressed by its row's own uid (`<project>/T-<id>`), which the Task Detail
 // pane reads for the selected task and the Escalations drawer for the linked
-// one; and `quality`, the Quality tab's one read, addressed by the canonical
-// query qualityQuery builds.
+// one; `quality`, the Quality tab's one read, addressed by the canonical
+// query qualityQuery builds; and `qualitySnapshotDiff`, one snapshot point's
+// instrument --diff text, addressed by the query snapshotDiffQuery builds.
 //
 // A ROW CARRIES BUILDERS, NOT TEMPLATE STRINGS, and nothing re-derives either
 // one at a call site — a caller holds the parameter and asks for the row, so
@@ -157,6 +157,15 @@ const ON_DEMAND_KEYS = {
     fields: Object.freeze(['QUALITY', 'QUALITY_MARKERS', 'QUALITY_SNAPSHOTS']),
     retain: 4,
   },
+  // The point the Quality tab's snapshot selector shows. PLAIN: the diff is
+  // the instrument's report text, not a measurement.
+  qualitySnapshotDiff: {
+    url: query => `/api/v2/dashboard/quality/snapshot-diff?${query}`,
+    key: (query, field = 'QUALITY_SNAPSHOT_DIFF') => `${field}:${query}`,
+    spec: PLAIN,
+    fields: Object.freeze(['QUALITY_SNAPSHOT_DIFF']),
+    retain: 8,
+  },
 };
 
 // A task row's uid, `<project>/T-<id>`: the taskProse param. It restates
@@ -170,6 +179,15 @@ function taskUid(project, id) {
 function qualityQuery({ project, window: landingWindow, module: moduleName }) {
   const parts = [['project', project], ['window', landingWindow]];
   if (moduleName !== null && moduleName !== undefined && moduleName !== '') parts.push(['module', moduleName]);
+  return encodedQuery(parts);
+}
+
+// The qualitySnapshotDiff param, in one fixed key order as qualityQuery's is.
+function snapshotDiffQuery({ project, point }) {
+  return encodedQuery([['project', project], ['point', point]]);
+}
+
+function encodedQuery(parts) {
   return parts.map(([name, value]) => `${name}=${encodeURIComponent(value)}`).join('&');
 }
 
@@ -572,12 +590,7 @@ const JITTER_MAX_MS = 1500;
 // with an abort deadline; timing out is treated exactly like a thrown
 // fetch error (counts toward backoff, clears in-flight in `finally`).
 //
-// LEAVE THIS EXACTLY AS IT IS — same name, same literal, same assignment
-// shape. Two Python structural tests parse it straight out of this shipped
-// source with /DEFAULT_TIMEOUT_MS\s*=\s*(\d+)/ — test_tasks_budget.py and
-// test_fetch_tasks_whole_operation_budget.py — where it is the ONLY ceiling
-// on the server-side budgets. Renaming it, or tidying it into a computed
-// expression, fails both loudly.
+// The server-side budget tests read the delay refreshOne arms through dashboard/tests/js/_abort_delay_probe.mjs.
 const DEFAULT_TIMEOUT_MS = 30000; // 10x the poll interval
 
 // A shorter deadline for an endpoint that has already demonstrated it is
@@ -1182,6 +1195,7 @@ const DF_DATA_LOADER_API = {
   ON_DEMAND_KEYS,
   taskUid,
   qualityQuery,
+  snapshotDiffQuery,
   requestOnDemand,
   onDemandReceipt,
   REFRESH_OUTCOMES,

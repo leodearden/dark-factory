@@ -710,16 +710,16 @@ tasks:
           paths: ["skills/prd/references/gates.md"]
           expect: present
       - name: "family-consistency"
-        binding: "behavioural — boundary row 23: scripts/tests/test_design_invariants_consistency.py passes with the slug in every pinned site"
+        binding: "behavioural — boundary row 23: tests/repo_guards/test_design_invariants_consistency.py passes with the slug in every pinned site"
         verdict: PASS
         delivered_check:
           kind: manual
-          reason: "a reviewer confirms uv run --project shared pytest scripts/tests/test_design_invariants_consistency.py passes on the merge commit"
+          reason: "a reviewer confirms uv run --project shared pytest tests/repo_guards/test_design_invariants_consistency.py passes on the merge commit"
       - name: "consistency-guard-substrate"
-        binding: "substrate — scripts/tests/test_design_invariants_consistency.py::PINNED_SITES exists at a85cb1ad78; not a producer check"
+        binding: "substrate — tests/repo_guards/test_design_invariants_consistency.py::PINNED_SITES exists at a85cb1ad78; not a producer check"
         verdict: PASS
         delivered_check:
           kind: grep
           pattern: "^PINNED_SITES = "
-          paths: ["scripts/tests/test_design_invariants_consistency.py"]
+          paths: ["tests/repo_guards/test_design_invariants_consistency.py"]
           expect: present

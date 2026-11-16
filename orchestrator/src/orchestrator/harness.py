@@ -44,7 +44,12 @@ from shared.elision import elide_at_word
 from shared.eval_lane import eval_lane_provenance
 from shared.loop_stall import LoopStallMonitor
 from shared.mcp_envelope import resolver_failed
-from shared.project_layout import escalation_queue_dir, orchestrator_data_dir, runs_db
+from shared.project_layout import (
+    escalation_queue_dir,
+    orchestrator_data_dir,
+    runs_db,
+    startup_failures_json,
+)
 from shared.repo_paths import (
     rejected_dark_factory_root_override,
     resolve_dark_factory_root,
@@ -65,7 +70,7 @@ from shared.transcript_archive import (
     set_archival_failure_hook,
 )
 
-from orchestrator import delivered_check_owner, recovery_pins, recut_ruling
+from orchestrator import cross_repo_gate, delivered_check_owner, recovery_pins, recut_ruling
 from orchestrator import digest as digest_mod
 from orchestrator.agent_session_reaper import (
     ReapTally,
@@ -194,7 +199,7 @@ from orchestrator.recovery_pins import records_pin_recovery
 from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
-from orchestrator.run_store import RunStore
+from orchestrator.run_store import RunExitReason, RunStore
 from orchestrator.scheduled_deploy_settle import ScheduledDeploySettler
 from orchestrator.scheduler import (
     Scheduler,
@@ -226,6 +231,7 @@ from orchestrator.startup_steps import (
     StartupStep,
     StepOutcome,
     StepStatus,
+    page_crash_loop,
     run_startup_step,
 )
 from orchestrator.starvation_watchdog import STARVATION_WATCHDOG_ROLE
@@ -257,6 +263,7 @@ from orchestrator.task_ground_truth import (
     report_pins_recovery,
     report_would_duplicate_a_handoff,
 )
+from orchestrator.task_priority import TaskPriority
 from orchestrator.task_runtime import TaskRuntimeState, build_task_runtime_snapshot
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
@@ -1665,7 +1672,8 @@ class Harness:
                 (config.max_concurrent_tasks + config.git.spare_warm_lanes)
                 if config.git.warm_lane_pool else 0
             ),
-            # Spec-pool size: K (same as speculation_depth) when knob on, else 0.
+            # Spec-pool size: K (same as speculation_depth), one warm lane per
+            # frontier entry, when the knob is on; else 0.
             # self._speculation_k is safe here — self.config is already set above.
             merge_spec_warm_lane_pool_size=(
                 self._speculation_k if config.git.merge_spec_warm_lane_pool else 0
@@ -2288,17 +2296,25 @@ class Harness:
         return tid in self._action_teardown_tasks
 
     @property
-    def _speculation_k(self) -> int:
-        """Single shared K source: 1 + len(enabled_verify_runners).
+    def _verify_hosts(self) -> int:
+        """Verify hosts the merge lane's allocator manages, one lease slot each.
 
-        Used by BOTH GitOps spec-pool sizing (harness.__init__) and
-        _start_merge_worker (speculation_depth + enforce_persistent_worktree_serial_lane)
-        so the spec pool size and the worker cap cannot drift as verify_runners grows.
-
-        Mirrors the invariant comment at _start_merge_worker: all three Lever-C knobs
-        derive from ONE expression.
+        The local trust-anchor plus every enabled remote verify runner.  It
+        bounds concurrently leased verifies, so it is what the persistent
+        merge worktree's serial-lane guard is fed in _start_merge_worker.
         """
         return 1 + len(self.config.enabled_verify_runners)
+
+    @property
+    def _speculation_k(self) -> int:
+        """The merge lane's speculation depth K = verify hosts + 1.
+
+        The frontier holds one verified entry awaiting landing beyond the
+        hosts verifying (plans/merge-lane-policy-prd.md D4).  K sizes both the
+        GitOps spec warm-lane pool (harness.__init__) and the worker's
+        speculation_depth (_start_merge_worker), so the two cannot drift.
+        """
+        return self._verify_hosts + 1
 
     def _init_digest_state(self) -> None:
         """Initialise task-1327 AFK-hardening digest counters.
@@ -2771,7 +2787,9 @@ class Harness:
         # Hoisted out of the try block so the finally clause can tally the
         # reports of slots cancelled at shutdown.
         task_reports: list[TaskReport] = []
-        journal = StartupJournal()
+        journal = StartupJournal.load(startup_failures_json(self.config.project_root))
+        startup_completed_at: datetime | None = None
+        exit_reason: RunExitReason | None = None
 
         try:
             logger.info('Starting fused-memory HTTP server...')
@@ -2788,6 +2806,10 @@ class Harness:
             # intended outcome (plans/startup-hardening-prd.md §3.1).
             service_steps = (
                 StartupStep('1b', self._start_lifecycle_services, fatal=True),
+                StartupStep('1b-crash-loop', lambda: page_crash_loop(
+                    journal, self._escalation_queue,
+                    filing_claimant_run_id=self._filing_claimant_run_id,
+                )),
                 StartupStep('1c', self._dismiss_stale_escalations),
                 StartupStep(
                     '1c0-dirty',
@@ -2910,6 +2932,8 @@ class Harness:
             # never reaches acquire_next but should still leave the Scheduler
             # in a consistent post-startup state.
             self.scheduler.finish_startup()
+            journal.clear()
+            startup_completed_at = datetime.now(UTC)
 
             statuses, _ = await self.scheduler.get_statuses()
             self.report.total_tasks = sum(1 for s in statuses.values() if s == 'pending')
@@ -3056,6 +3080,19 @@ class Harness:
                     and self.report.completed > 0):
                 await self._run_full_review_and_tag()
 
+        except asyncio.CancelledError:
+            exit_reason = RunExitReason.cancelled()
+            raise
+        except BaseException as exc:
+            # A crash after startup completed is the main loop's, not a
+            # startup crash (plans/startup-hardening-prd.md §4).
+            if startup_completed_at is None:
+                exit_reason = RunExitReason.startup_crash(journal.record_crash(exc))
+                page_crash_loop(
+                    journal, self._escalation_queue,
+                    filing_claimant_run_id=self._filing_claimant_run_id,
+                )
+            raise
         finally:
             # Task 3172: set BEFORE the drain loop below (the primary route by
             # which a SIGTERM reaches a slot task) and before the straggler
@@ -3091,7 +3128,10 @@ class Harness:
             # runs row with final aggregates).
             if self._run_store and self._run_id:
                 try:
-                    self._run_store.finish_run(self._run_id, self.report)
+                    self._run_store.finish_run(
+                        self._run_id, self.report,
+                        startup_completed_at=startup_completed_at, exit_reason=exit_reason,
+                    )
                 except Exception as e:
                     logger.warning(f'Failed to finalize run metrics: {e}')
 
@@ -6037,7 +6077,7 @@ class Harness:
         # audit trail plus a zero-pending-escalation task is the honest state:
         # nothing here awaits a human.
         if self._escalation_queue is not None:
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
 
             esc = Escalation(
                 id=self._escalation_queue.make_id(tid),
@@ -6224,7 +6264,7 @@ class Harness:
             )
             return
 
-        from escalation.models import Escalation  # noqa: PLC0415
+        from escalation.models import Escalation
 
         status = getattr(outcome, 'status', 'unknown')
         reason = getattr(outcome, 'reason', '') or ''
@@ -7468,7 +7508,8 @@ class Harness:
             # predates a later reopen_at, so completing the task now would
             # phantom-complete a stale claim (task 2677). Route to the
             # shared sink (dedupe-guarded born-at-L2) instead of the
-            # generic reconcile_persistent_rejection L1 escalation — this
+            # generic reconcile_persistent_rejection escalation
+            # (``_escalate_reconcile_failure``) — this
             # is NOT an unexpected persistence-layer contradiction, it is
             # the provenance-integrity gate doing its job.
             self._provenance_conflict_sink.record_from_rejection(
@@ -7501,15 +7542,14 @@ class Harness:
         tid: str,
         exc: SetTaskStatusRejected,
     ) -> None:
-        """Submit an L1 escalation for a persistent reconcile failure.
+        """File an L0 for a reconcile-sweep recovery write the persistence layer refused.
 
-        Fired directly on every recovery-write rejection the reconcile sweep
-        observes for *tid* — a mark-done on landing evidence or the pending
-        revert of a stranded task (task 2243, W10-θ2 step-14 — the per-tid
-        strike counter and its ``MAX_RECONCILE_FAILURES`` threshold gate are
-        retired): the persistence layer refusing the sweep's recovery is
-        L1-worthy on its own without waiting for a run of consecutive sweeps
-        to confirm it.
+        Fires on every refused write the sweep observes for *tid* — a
+        mark-done on landing evidence, or the pending revert of a stranded
+        task — with no dedup of its own; task 2243 retired the per-tid strike
+        counter.  Level 0 is deliberate: the orphan L0 reaper promotes the
+        first aged record to one L1 and dismisses later ones as covered.
+        See orchestrator/tests/test_harness_escalation_filing_identity.py::TestReconcileFailureReachesL1ThroughTheReaper.
         """
         if not self._escalation_queue:
             return
@@ -7537,6 +7577,7 @@ class Harness:
                 f'name the gate that refused it. Manual investigation required.'
             ),
             suggested_action='investigate_persistence_layer_rejection',
+            level=0,
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
@@ -7612,7 +7653,7 @@ class Harness:
                 )
                 return
 
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
 
             error_code = getattr(exc, 'error_code', type(exc).__name__)
             raw = getattr(exc, 'raw', str(exc))
@@ -7818,7 +7859,7 @@ class Harness:
         try:
             if self._escalation_queue.has_open_l1(self._ARCHIVAL_STORM_SENTINEL):
                 return                         # dedup: one open L1 at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             ta = self.config.transcript_archive
             archive_root = Path(self.config.project_root) / ta.root
             labels = list(summary.get('labels') or ())
@@ -7916,7 +7957,7 @@ class Harness:
         try:
             if self._escalation_queue.has_open_l1(self._CONFIG_DIR_AMBIGUOUS_SENTINEL):
                 return                         # dedup: one open L1 at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             shown = found[:20]
             more = len(found) - len(shown)
             candidates = '\n'.join(f'  - {p}' for p in shown)
@@ -8017,7 +8058,7 @@ class Harness:
         try:
             if self._escalation_queue.has_open_l1(self._POOL_STORAGE_ABSENT_SENTINEL):
                 return                         # dedup: one open L1 at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             esc = Escalation(
                 id=self._escalation_queue.make_id(self._POOL_STORAGE_ABSENT_SENTINEL),
                 task_id=self._POOL_STORAGE_ABSENT_SENTINEL,
@@ -8271,7 +8312,7 @@ class Harness:
         try:
             if self._escalation_queue.has_open_l1(self._SESSION_RESUME_STORM_SENTINEL):
                 return                         # dedup: one open L1 at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             threshold = self.config.session_resume.fallback_storm_threshold
             rendered = '\n'.join(
                 self._render_resume_failure(failure)
@@ -8441,66 +8482,14 @@ class Harness:
 
         Wired as ``on_external_dep_block`` in the ``SchedulerCallbacks`` bundle
         passed to the Scheduler constructor, alongside ``on_park_stop_trip``.
-
-        Sets the task to ``blocked`` via ``scheduler.set_task_status`` and
-        submits a level-1 ``Escalation`` to the queue.  Deduped by
-        ``has_open_l1`` so repeated ticks for the same task do not stack
-        duplicate escalations.  No-ops gracefully when no escalation queue is
-        attached (bare-Harness unit tests stay green).
+        Blocks and files through ``_block_and_file_dispatch_gate_l1``.  Since
+        task 7170 the dedupe is scoped to the *category* the scheduler chose,
+        so its infra_issue filing (resolver degraded) and its
+        dependency_discovered filings (cancelled / unresolved) no longer hide
+        each other.
         """
-        # Set task to blocked regardless of queue state — the queue is only for
-        # human notification; the gate stays closed via the external-dep cache.
-        # Wrapped in try/except so a transient set_task_status failure (e.g.
-        # fused-memory temporarily unavailable) does not prevent the L1 escalation
-        # from being filed; the human must still be notified even if the status
-        # write failed so they can intervene and set it manually.
-        try:
-            await self.scheduler.set_task_status(task_id, 'blocked')
-        except Exception:
-            logger.warning(
-                'External dep block for task %s — set_task_status raised; '
-                'will still attempt to file escalation',
-                task_id,
-                exc_info=True,
-            )
-
-        if not self._escalation_queue:
-            logger.warning(
-                'External dep block for task %s — no escalation queue, skipping L1 file',
-                task_id,
-            )
-            return
-
-        if self._escalation_queue.has_open_l1(task_id):
-            # Log at WARNING: the pre-existing L1 may be for an unrelated cause
-            # (e.g. an infra escalation), so the external-dep block reason could
-            # be masked.  The warning makes the suppression observable.
-            logger.warning(
-                'External dep block for task %s — open L1 already exists, suppressing '
-                'duplicate; pre-existing L1 may be for an unrelated cause',
-                task_id,
-            )
-            return
-
-        from escalation.models import Escalation
-
-        esc = Escalation(
-            id=self._escalation_queue.make_id(task_id),
-            task_id=task_id,
-            agent_role='orchestrator-scheduler',
-            severity='blocking',
-            category=category,
-            summary=summary[:200],
-            detail=detail,
-            suggested_action='manual_intervention',
-            level=1,
-            filing_claimant_run_id=self._filing_claimant_run_id,
-        )
-        self._escalation_queue.submit(esc)
-        logger.warning(
-            'Filed L1 external-dep escalation %s for task %s',
-            esc.id,
-            task_id,
+        await self._block_and_file_dispatch_gate_l1(
+            task_id, category=category, summary=summary, detail=detail,
         )
 
     # ── task 3500: authoring-defect diagnosis for a failed delivered check ──
@@ -8568,8 +8557,8 @@ class Harness:
 
         Wired as ``on_delivered_check_block`` in the ``SchedulerCallbacks``
         bundle passed to the Scheduler constructor, alongside
-        ``on_external_dep_block``. Structurally mirrors
-        ``_block_and_escalate_external_dep`` but files with
+        ``on_external_dep_block``. Mirrors the dispatch-gate policy in
+        ``_block_and_file_dispatch_gate_l1`` but files with
         ``severity='critical'`` and ``level=2`` explicitly — combined with
         ``agent_role='orchestrator-scheduler'`` (a harness-sentinel role,
         ``escalation/server.py`` ``_is_harness_sentinel_role``), the record
@@ -8834,10 +8823,12 @@ class Harness:
         open notice already exists (pending, level=0, this role), this is a
         no-op.  Best-effort: any submit failure is swallowed and logged.
 
-        **Routing note:** ``severity='info', level=0``.  Level-0 INFO is
-        surfaced via the steward's pending-escalation view and external
-        monitors/dashboards/webhooks; it does NOT auto-promote and does NOT
-        additionally halt the scheduler (the watchdog's own latch already did).
+        **Routing note:** ``severity='info', level=0``, against a sentinel
+        task no steward serves; ``_WARM_BASE_HARD_DOWN_ROLE`` is listed in
+        ``escalation.classify.INFO_L0_MECHANICAL_ROLES``.  Filing it never
+        halts the scheduler; the watchdog's own latch already halted dispatch.
+        How the orphan reaper routes it:
+        orchestrator/tests/test_info_l0_router_harness.py::TestHarnessSentinelNoticesAreRoutedNotLeftPending.
         """
         if not self._escalation_queue:
             return
@@ -8851,7 +8842,7 @@ class Harness:
             ]
             if existing:
                 return  # dedup: one open notice at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             esc = Escalation(
                 id=self._escalation_queue.make_id(self._WARM_BASE_HARD_DOWN_SENTINEL),
                 task_id=self._WARM_BASE_HARD_DOWN_SENTINEL,
@@ -8901,7 +8892,7 @@ class Harness:
             ]
             if existing:
                 return  # dedup: one open L2 at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             esc = Escalation(
                 id=self._escalation_queue.make_id(self._WARM_BASE_HARD_DOWN_SENTINEL),
                 task_id=self._WARM_BASE_HARD_DOWN_SENTINEL,
@@ -8967,7 +8958,7 @@ class Harness:
     def _file_no_landings_info_escalation(self, trip: BreakerTrip) -> None:
         """File a non-blocking INFO escalation for the no-landings circuit-breaker.
 
-        Mirrors ``_file_starvation_info`` (pure operator-signal INFO, level=0)
+        Mirrors ``_file_starvation_info`` (pure operator-signal INFO)
         and uses the ``_NO_LANDINGS_SENTINEL`` sentinel task_id (mirroring
         ``_SCHEDULER_PAUSE_SENTINEL``) so the escalation is global / not tied
         to a specific task.
@@ -8976,12 +8967,14 @@ class Harness:
         agent_role=``orchestrator-no-landings-breaker``), this is a no-op.
         Best-effort: any submit failure is swallowed and logged.
 
-        **Routing note:** ``severity='info', level=0``.  Level-0 INFO is
-        surfaced via the steward's pending-escalation view and external monitors/
-        dashboards/webhooks.  Does NOT auto-promote and does NOT additionally
-        halt the scheduler (``force_halt_scheduler`` already handles the halt;
-        ``file_escalation=False`` was passed there to avoid the auto-watcher
-        resolving the scheduler-pause L1 and silently undoing the halt).
+        **Routing note:** ``severity='info', level=0``, against a sentinel
+        task no steward serves; ``orchestrator-no-landings-breaker`` is listed
+        in ``escalation.classify.INFO_L0_MECHANICAL_ROLES``.  Filing it never
+        halts the scheduler (``force_halt_scheduler`` already handles the
+        halt; ``file_escalation=False`` was passed there to avoid the
+        auto-watcher resolving the scheduler-pause L1 and silently undoing
+        the halt).  How the orphan reaper routes it:
+        orchestrator/tests/test_info_l0_router_harness.py::TestHarnessSentinelNoticesAreRoutedNotLeftPending.
         """
         if not self._escalation_queue:
             return
@@ -8995,7 +8988,7 @@ class Harness:
             ]
             if existing:
                 return  # dedup: one open INFO at a time
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
             esc = Escalation(
                 id=self._escalation_queue.make_id(self._NO_LANDINGS_SENTINEL),
                 task_id=self._NO_LANDINGS_SENTINEL,
@@ -9111,7 +9104,7 @@ class Harness:
         The key defaults to 1 (active) when absent, preserving backward
         compatibility with test mocks that omit ``'depth'``.
         """
-        import shutil as _shutil  # noqa: PLC0415
+        import shutil as _shutil
 
         if self._merge_worker is None:
             return
@@ -9349,7 +9342,7 @@ class Harness:
         Called once unconditionally at ``run()`` startup, adjacent to the
         interactive-worktree reaper, before the first dispatch.
         """
-        from orchestrator import verify as verify_mod  # noqa: PLC0415
+        from orchestrator import verify as verify_mod
 
         try:
             reaped = await verify_mod.reap_leftover_verify_scopes(
@@ -9379,133 +9372,24 @@ class Harness:
         *,
         verdict,
     ) -> None:
-        """Block a task and file an L1 escalation for a cross-repo misfile.
-
-        Structurally a sibling of ``_block_and_escalate_substrate_flip`` below —
-        the two dispatch-gate blockers are kept adjacent deliberately:
-        - Sets the task to ``blocked`` via ``scheduler.set_task_status``
-          (unconditional; wrapped in try/except so a transient write failure does
-          not prevent the L1 from being filed).
-        - Submits a level-1 ``Escalation`` with category='scope_violation'.
-        - Deduped by ``has_open_l1`` so repeated dispatch attempts (after the
-          requeue cooldown expires) do not stack duplicate escalations.
-        - No-ops gracefully when ``_escalation_queue`` is None (bare-Harness tests).
+        """Block a task and file an L1 for a cross-repo BLOCK verdict (misfile or unverifiable).
 
         ``scope_violation`` rather than the substrate gate's ``design_concern``:
-        the task's work belongs to ANOTHER project — a scope failure, not a
-        premise failure.
+        a misfile's work belongs to ANOTHER project — a scope failure, not a
+        premise failure.  A classifier crash fails closed on that same question.
 
-        The summary NAMES the owning project when the verdict resolved one, so
-        the L1 is directly actionable ("refile task N under project B") instead
-        of costing a triage round trip.  When no owner could be resolved it says
-        so explicitly: the orchestrator has no cross-project registry, and a
-        placeholder name in an L1 is worse than an honest "unresolved".
-
-        The summary/detail are written to CLAIM ONLY WHAT THE FIRING SIGNALS
-        ESTABLISH — see the comment on the claim/remedy branch below.  A verdict
-        carrying only path-containment evidence asserts "paths outside
-        project_root", not "owned by another project", because the gate has no
-        way to tell a sibling checkout from a path no project owns.
+        The summary/detail come from
+        ``orchestrator/src/orchestrator/cross_repo_gate.py::block_escalation_text``.
+        Blocking and filing go through ``_block_and_file_dispatch_gate_l1``,
+        whose dedupe is category-scoped, so an open L1 for another cause no
+        longer hides this one (task 7170).
         """
-        try:
-            await self.scheduler.set_task_status(task_id, 'blocked')
-        except Exception:
-            logger.warning(
-                'Cross-repo block for task %s — set_task_status raised; '
-                'will still attempt to file escalation',
-                task_id,
-                exc_info=True,
-            )
-
-        if not self._escalation_queue:
-            logger.warning(
-                'Cross-repo block for task %s — no escalation queue, skipping L1 file',
-                task_id,
-            )
-            return
-
-        if self._escalation_queue.has_open_l1(task_id):
-            logger.warning(
-                'Cross-repo block for task %s — open L1 already exists, suppressing '
-                'duplicate; pre-existing L1 may be for an unrelated cause',
-                task_id,
-            )
-            return
-
-        from escalation.models import Escalation  # noqa: PLC0415
-
-        from orchestrator.cross_repo_gate import SIGNAL_MARKER  # noqa: PLC0415
-
-        owner = verdict.owner_project
-        signals = tuple(verdict.signals or ())
-
-        # Claim exactly what the evidence establishes, and no more.
-        #
-        # The path-containment leg proves only "every declared path is absolute
-        # and resolves outside project_root" — with no cross-project registry it
-        # CANNOT distinguish a sibling project's checkout from a path that
-        # belongs to no project at all (~/.claude/skills/…, /etc/…, a stray
-        # $HOME path).  Asserting foreign OWNERSHIP there, and telling the
-        # operator to refile under "the owning project", would be unactionable
-        # advice for a task whose paths have no owner.  _resolve_owner already
-        # refuses to invent a name; this prose holds the same line.
-        #
-        # The marker leg is different: metadata.cross_repo is the submit path's
-        # own assertion that the declared files ARE owned elsewhere, so ownership
-        # may be stated as fact even when nothing named the owner.
-        if owner:
-            claim = f'declares work owned by {owner}'
-            remedy = (
-                f'The fix is to refile this task under {owner} (and cancel or '
-                f're-scope this one), not to unblock it here.'
-            )
-        elif SIGNAL_MARKER in signals:
-            claim = 'declares work owned by another project (owner unresolved)'
-            remedy = (
-                'The submit path marked this task cross-repo but named no owner '
-                '(no metadata.cross_repo_project companion). The fix is to identify '
-                'the owning project and refile the task there, not to unblock it here.'
-            )
-        else:
-            claim = "declares only paths outside this orchestrator's project_root"
-            remedy = (
-                'This gate has no cross-project registry, so it CANNOT tell whether '
-                'these paths belong to another project or to no project at all. Two '
-                'remedies, depending on which it is: refile the task under the owning '
-                'project if one owns them, or correct metadata.files to the in-tree '
-                'paths this task actually delivers. Do not simply unblock it here.'
-            )
-
-        summary = f'CROSS_REPO_MISFILE: task {task_id} {claim}'
-        paths = '\n'.join(f'  - {path}' for path in verdict.foreign_paths) or '  (none declared)'
-        detail = (
-            f'Dispatch-time cross-repo admission gate blocked this task BEFORE any '
-            f'agent spun up.\n'
-            f'Owning project: {owner if owner else "UNRESOLVED — nothing in the task metadata named it"}\n'
-            f'Signals: {", ".join(signals) or "(none)"}\n'
-            f'Observed: {verdict.reason}\n'
-            f'Paths judged outside project_root:\n{paths}\n'
-            f'This orchestrator owns a single project_root and cannot legitimately land '
-            f'work outside it. {remedy}'
-        )
-        esc = Escalation(
-            id=self._escalation_queue.make_id(task_id),
-            task_id=task_id,
-            agent_role='orchestrator-scheduler',
-            severity='blocking',
-            category='scope_violation',
-            summary=summary[:200],
-            detail=detail,
-            suggested_action='manual_intervention',
-            level=1,
-            filing_claimant_run_id=self._filing_claimant_run_id,
-        )
-        self._escalation_queue.submit(esc)
-        logger.warning(
-            'Filed L1 cross-repo-misfile escalation %s for task %s (owner=%s)',
-            esc.id,
+        text = cross_repo_gate.block_escalation_text(task_id, verdict)
+        await self._block_and_file_dispatch_gate_l1(
             task_id,
-            owner or 'unresolved',
+            category=EscalationCategory.SCOPE_VIOLATION,
+            summary=text.summary,
+            detail=text.detail,
         )
 
     async def _block_and_escalate_substrate_flip(
@@ -9516,46 +9400,11 @@ class Harness:
     ) -> None:
         """Block a task and file an L1 escalation for a PASS→FAIL substrate flip.
 
-        Mirrors ``_block_and_escalate_external_dep``:
-        - Sets the task to ``blocked`` via ``scheduler.set_task_status`` (unconditional;
-          wrapped in try/except so a transient write failure does not prevent the L1
-          from being filed).
-        - Submits a level-1 ``Escalation`` with category='design_concern' to the queue.
-        - Deduped by ``has_open_l1`` so repeated dispatch attempts (after the requeue
-          cooldown expires) do not stack duplicate escalations.
-        - No-ops gracefully when ``_escalation_queue`` is None (bare-Harness unit tests).
-
         A PASS→FAIL flip means the task's probe-set premise no longer holds on
         current main; the design_concern class routes it to human/curator judgment
-        (same class as report_false_premise).
+        (same class as report_false_premise).  Blocking, filing and the
+        category-scoped dedupe live in ``_block_and_file_dispatch_gate_l1``.
         """
-        try:
-            await self.scheduler.set_task_status(task_id, 'blocked')
-        except Exception:
-            logger.warning(
-                'Substrate flip block for task %s — set_task_status raised; '
-                'will still attempt to file escalation',
-                task_id,
-                exc_info=True,
-            )
-
-        if not self._escalation_queue:
-            logger.warning(
-                'Substrate flip block for task %s — no escalation queue, skipping L1 file',
-                task_id,
-            )
-            return
-
-        if self._escalation_queue.has_open_l1(task_id):
-            logger.warning(
-                'Substrate flip block for task %s — open L1 already exists, suppressing '
-                'duplicate; pre-existing L1 may be for an unrelated cause',
-                task_id,
-            )
-            return
-
-        from escalation.models import Escalation  # noqa: PLC0415
-
         summary = f'SUBSTRATE_FLIP: probe set PASS→FAIL on current main (task {task_id})'
         detail = (
             f'Dispatch-time substrate re-check detected a PASS→FAIL flip.\n'
@@ -9565,23 +9414,8 @@ class Harness:
             f'The task premise (probe set authored at investigation time) no longer holds '
             f'on current main — re-spec required before dispatch.'
         )
-        esc = Escalation(
-            id=self._escalation_queue.make_id(task_id),
-            task_id=task_id,
-            agent_role='orchestrator-scheduler',
-            severity='blocking',
-            category='design_concern',
-            summary=summary[:200],
-            detail=detail,
-            suggested_action='manual_intervention',
-            level=1,
-            filing_claimant_run_id=self._filing_claimant_run_id,
-        )
-        self._escalation_queue.submit(esc)
-        logger.warning(
-            'Filed L1 substrate-flip escalation %s for task %s',
-            esc.id,
-            task_id,
+        await self._block_and_file_dispatch_gate_l1(
+            task_id, category=EscalationCategory.DESIGN_CONCERN, summary=summary, detail=detail,
         )
 
     async def _run_recut_ruling_gate(self, assignment) -> recut_ruling.RecutGateResult:
@@ -9615,7 +9449,7 @@ class Harness:
             ruling_id = result.ruling.ruling_id if result.ruling else 'unreadable'
             await self._block_and_file_dispatch_gate_l1(
                 task_id,
-                category='design_concern',
+                category=EscalationCategory.DESIGN_CONCERN,
                 summary=f'RECUT_RULING_REFUSED: task {task_id} ruling {ruling_id} cannot be honoured',
                 detail=(
                     f'{result.reason}\n'
@@ -9641,14 +9475,22 @@ class Harness:
     async def _block_and_file_dispatch_gate_l1(
         self, task_id: str, *, category: str, summary: str, detail: str,
     ) -> None:
-        """Block *task_id* and file one category-scoped L1 for a dispatch gate."""
+        """Block *task_id* and file one category-scoped L1 for a dispatch gate.
+
+        The single home of the dispatch gates' block-and-file policy:
+        - the ``blocked`` status write comes first and is unconditional;
+        - a failed write is logged and the L1 is still filed;
+        - with no escalation queue the filing is a logged no-op;
+        - the dedupe is ``_file_harness_l1``'s: only an open L1 of *category*
+          suppresses this one, so an L1 for another cause cannot hide it.
+        """
         try:
             await self.scheduler.set_task_status(task_id, 'blocked')
         except Exception:
             logger.warning(
-                'Dispatch-gate block for task %s — set_task_status raised; '
-                'will still attempt to file escalation',
-                task_id, exc_info=True,
+                'Dispatch-gate block for task %s (%s) — set_task_status raised; '
+                'will still attempt to file escalation: %s',
+                task_id, category, summary, exc_info=True,
             )
         self._file_harness_l1(
             task_id, category=category, summary=summary, detail=detail,
@@ -9703,7 +9545,9 @@ class Harness:
             filing_claimant_run_id=self._filing_claimant_run_id,
         )
         self._escalation_queue.submit(esc)
-        logger.warning('Filed L1 %s escalation %s for task %s', category, esc.id, task_id)
+        logger.warning(
+            'Filed L1 %s escalation %s for task %s: %s', category, esc.id, task_id, summary,
+        )
 
     async def _run_cross_repo_gate(self, assignment) -> bool:
         """Run the dispatch-time cross-repo admission gate (task 3121).
@@ -9725,8 +9569,6 @@ class Harness:
             False  — BLOCK (task blocked + L1 filed inside the gate; caller must
                      arm the requeue cooldown and skip workflow construction).
         """
-        from orchestrator import cross_repo_gate  # noqa: PLC0415
-
         task_id = assignment.task_id
 
         try:
@@ -9735,19 +9577,9 @@ class Harness:
                 project_root=self.config.project_root,
             )
         except Exception as exc:
-            logger.warning(
-                'cross_repo_gate: classify_cross_repo raised for task %s: %s',
-                task_id, exc, exc_info=True,
-            )
             # Fail CLOSED — an unverifiable classification is not a clean bill
             # of health (mirrors _run_substrate_gate's except branch).
-            verdict = cross_repo_gate.CrossRepoVerdict(
-                verdict=cross_repo_gate.BLOCK,
-                owner_project=None,
-                signals=('classify_error',),
-                foreign_paths=(),
-                reason=f'cross-repo unverifiable / classify_cross_repo raised: {exc}',
-            )
+            verdict = cross_repo_gate.classify_error_verdict(task_id, exc)
 
         logger.info(
             'cross_repo_gate: task %s verdict=%s owner=%s signals=%r reason=%r',
@@ -9776,9 +9608,9 @@ class Harness:
             False  — FLIP (task blocked + L1 filed; caller must arm requeue cooldown
                      and skip workflow construction).
         """
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
-        from orchestrator import substrate_gate  # noqa: PLC0415
+        from orchestrator import substrate_gate
 
         task_id = assignment.task_id
         gate_path = self.git_ops.worktree_base / f'_substrate-gate-{task_id}'
@@ -10658,8 +10490,6 @@ class Harness:
             # It admits PRESENT-BUT-UNREADABLE metadata for the same reason, so
             # the gate's loud SKIP is actually reachable from here rather than
             # being a guarantee the dispatch path quietly withholds.
-            from orchestrator import cross_repo_gate  # noqa: PLC0415
-
             if cross_repo_gate.carries_cross_repo_signal(assignment.task) and not await self._run_cross_repo_gate(assignment):
                 # Foreign-owned: task is already blocked + escalated inside the
                 # gate.  Return a BLOCKED report so the caller (and
@@ -10692,7 +10522,7 @@ class Harness:
             # FLIP, so gating dispatch on any other definition (e.g. one that
             # requires a well-formed descriptor) would let a malformed
             # descriptor skip the gate entirely instead of failing closed.
-            from orchestrator import substrate_gate  # noqa: PLC0415
+            from orchestrator import substrate_gate
 
             if substrate_gate.carries_substrate_probe(assignment.task) and not await self._run_substrate_gate(assignment):
                 # FLIP detected: task is already blocked + escalated inside
@@ -10728,6 +10558,7 @@ class Harness:
                 cost_store=self.cost_store,
                 cancel_event=cancel_event,
                 task_verify=self._task_verify_dispatcher,
+                task_priority=self._task_priority,
                 resume_session_id=recovered_session,
                 run_id=self._run_id,
                 # ε (task 3733): the harness IS the sink — it owns the streak,
@@ -10992,7 +10823,7 @@ class Harness:
                 # path. Best-effort — never blocks slot release.
                 try:
                     await self._maybe_auto_eval(assignment, report)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning(
                         'Task %s: auto-eval hook failed (non-fatal): %s',
                         assignment.task_id, exc,
@@ -11109,7 +10940,7 @@ class Harness:
                     continue
                 prior_ids.append(tid)
             return prior_ids
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'Task %s: auto-eval prior-redo lookup failed (%s) — '
                 'skipping supersede',
@@ -11163,7 +10994,7 @@ class Harness:
             status_by_id, err = await self.scheduler.get_statuses(ids=candidate_ids)
             if err is not None:
                 raise err
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'Auto-eval supersede re-check failed (%s) — skipping cancel '
                 'of %d candidate(s) this round: %s',
@@ -11206,7 +11037,7 @@ class Harness:
                 {'routing': _bumped_routing_dump(assignment.task.get('metadata'))},
                 metadata_mode='merge',
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'Task %s: routing-tier bump failed (non-fatal): %s',
                 assignment.task_id, exc,
@@ -11233,7 +11064,7 @@ class Harness:
                 {'routing': _bumped_routing_dump(task.get('metadata'))},
                 metadata_mode='merge',
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'Task %s: escalate_model routing-tier bump failed (non-fatal): %s',
                 task_id, exc,
@@ -11381,7 +11212,7 @@ class Harness:
         # the rename below run with the redo still deferred.
         try:
             await self.scheduler.set_task_status(new_task_id, 'pending')
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # The flip may have landed despite the failure (a timeout), which
             # would leave a live pending redo with no back-link or budget
             # tracking; if it really failed, a deferred orphan would collide
@@ -11415,7 +11246,7 @@ class Harness:
                     new_branch=new_branch,
                 )
                 renamed = True
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'Task %s: auto-eval rename failed (%s) — continuing '
                     'without rename',
@@ -11450,7 +11281,7 @@ class Harness:
                     },
                     timeout=15,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'Task %s: auto-eval supersede cancel of prior redo '
                     '%s failed (%s) — continuing',
@@ -11467,7 +11298,7 @@ class Harness:
                 metadata={'auto_eval_pair': str(new_task_id)},
                 metadata_mode='merge',
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'Task %s: auto-eval back-link update failed (%s)',
                 original_id, exc,
@@ -11514,7 +11345,7 @@ class Harness:
                 frozenset(self._auto_eval_redo_task_ids),
                 since=since,
             )
-        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+        except Exception as exc:  # never block dispatch on this
             logger.warning(
                 '_auto_eval_budget_used_24h: trailing-24h cost query failed (%s) — fail-open',
                 exc,
@@ -11555,7 +11386,7 @@ class Harness:
         cutoff_24h_iso = (now - timedelta(hours=24)).isoformat()
         try:
             total, watcher = await self.cost_store.cost_totals_in_window(cutoff_24h_iso, now_iso)
-        except Exception as exc:  # noqa: BLE001 — never block dispatch on this
+        except Exception as exc:  # never block dispatch on this
             logger.warning(
                 '_enforce_cost_ceilings: trailing-24h cost query failed (%s) — fail-open',
                 exc,
@@ -11724,7 +11555,7 @@ class Harness:
                 block_phase=report.block_phase,
                 filed_at=self._zero_progress_filed_at,
             )
-        except Exception as exc:  # noqa: BLE001 — never disturb cap accounting
+        except Exception as exc:  # never disturb cap accounting
             logger.warning(
                 'Task %s: zero-progress requeue check failed (non-fatal): %s',
                 task_id, exc,
@@ -11964,7 +11795,7 @@ class Harness:
                 ),
             )
             return observation
-        except Exception as exc:  # noqa: BLE001 — telemetry never disturbs a sweep
+        except Exception as exc:  # telemetry never disturbs a sweep
             logger.warning(
                 'Task %s: recovery-disposition emission failed (non-fatal): %s',
                 task_id, exc,
@@ -12027,7 +11858,7 @@ class Harness:
         """
         try:
             self._recovery_process_latch().discard(str(site))
-        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a sweep
+        except Exception as exc:  # bookkeeping never aborts a sweep
             logger.warning(
                 'recovery queue-absent notice re-arm failed (non-fatal): %s', exc,
             )
@@ -12052,7 +11883,7 @@ class Harness:
             tracker = getattr(self, '_recovery_veto_tracker', None)
             if tracker is not None:
                 tracker.clear(site, task_id)
-        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a tick
+        except Exception as exc:  # bookkeeping never aborts a tick
             logger.warning(
                 'Task %s: recovery veto-streak clear failed (non-fatal): %s',
                 task_id, exc,
@@ -12140,7 +11971,7 @@ class Harness:
                     threshold=threshold,
                     filed_at=self._recovery_streak_memo(),
                 )
-        except Exception as exc:  # noqa: BLE001 — bookkeeping never aborts a sweep
+        except Exception as exc:  # bookkeeping never aborts a sweep
             logger.warning(
                 'recovery veto-streak release failed (non-fatal): %s', exc,
             )
@@ -12358,13 +12189,10 @@ class Harness:
         )
         from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
-        # K = 1 (local trust-anchor) + number of enabled remote verify runners.
-        # Sizes the liveness guard (merge_ahead_bound + num_hosts), the
-        # serial-lane bound (num_hosts), and the worker's speculation cap
-        # (speculation_depth).  All three knobs derive from ONE expression so
-        # they cannot drift apart as verify_runners grows.  num_hosts=K makes
-        # the per-host bound ceil(K/num_hosts)=ceil(K/K)=1, so each of the K
-        # hosts runs at most one in-flight merge-verify at a time.
+        # K = verify hosts + 1 counts the frontier and sizes the worker's
+        # speculation cap (speculation_depth).  Leased verifies are bounded by
+        # the hosts (one allocator slot each), so the serial-lane guard below
+        # takes the host count and its per-host bound stays 1.
         #
         # NOTE: K was previously pinned to _MERGE_AHEAD_BOUND (=1).  Wired from
         # config.verify_runners by task 1716 (Lever C operator-enable path).
@@ -12387,9 +12215,9 @@ class Harness:
         # changed, not because the guard weakened.
         #
         # Intentional asymmetry: enforce_persistent_worktree_serial_lane below
-        # still receives num_hosts=_k (per-host serial-lane bound is genuinely
+        # still receives the host count (per-host serial-lane bound is genuinely
         # per-host; that guard's model did not change).  Only the liveness guard
-        # drops _k: the two guards describe independent physical constraints.
+        # takes no bound: the two guards describe independent physical constraints.
         #
         # Any OTHER exception (e.g. config resolution failure in a mock or
         # misconfigured environment) is still fail-OPEN (non-fatal warning),
@@ -12402,12 +12230,14 @@ class Harness:
             logger.warning('enforce_merge_liveness_margin failed (non-fatal): %s', e)
 
         # Fail-CLOSED: persistent warm worktree is serial-lane-only (PRD §10
-        # invariant 3).  If the knob is on and _k > 1, refuse startup rather
-        # than risk concurrent cargo on a shared target/.
-        # num_hosts=_k: each of the K hosts gets its own serial lane so
-        # per-host lane bound = ceil(K/num_hosts) = 1.
+        # invariant 3).  If the knob is on and more than one leased verify could
+        # share a host, refuse startup rather than risk concurrent cargo on a
+        # shared target/.  Leased verifies are bounded by the hosts, so each
+        # host gets its own serial lane: per-host bound = hosts/hosts = 1.
         enforce_persistent_worktree_serial_lane(
-            self.config, merge_ahead_bound=_k, num_hosts=_k,
+            self.config,
+            merge_ahead_bound=self._verify_hosts,
+            num_hosts=self._verify_hosts,
         )
 
         self._service_restart_coordinators = [
@@ -12443,6 +12273,7 @@ class Harness:
             runner_quarantine=self._runner_quarantine,
             host_holder_reader=self._host_pool.holders,
             on_host_readmitted=self._note_verify_host_readmitted,
+            task_priority=self._task_priority,
         )
         # Manage every remote host from the start, so a task-path bench before
         # the first merge lands on a tracked host (task 6670).  Without a
@@ -12535,6 +12366,11 @@ class Harness:
                 'the task verify goes on without the bench', name,
             )
 
+    def _task_priority(self, task_id: str) -> TaskPriority:
+        """The live scheduler's effective tier and pin for *task_id*, read through
+        ``self.scheduler`` on every call (task 9908)."""
+        return self.scheduler.task_priority(task_id)
+
     def _note_verify_host_readmitted(self, name: str) -> None:
         """The merge lane's readmission hook: re-offer *name* to the task pool's waiters."""
         self._host_pool.note_readmitted(name, self.config)
@@ -12580,7 +12416,7 @@ class Harness:
             await self._maybe_pipeline_landing_tripwire(
                 task_id, base_sha, head_sha, prefetched_diff,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 '_note_merge_all: pipeline-landing tripwire failed for %s..%s: %s',
                 base_sha[:12],
@@ -12592,7 +12428,7 @@ class Harness:
         for coord in self._service_restart_coordinators:
             try:
                 await coord.note_merge(task_id, base_sha, head_sha, prefetched_diff=prefetched_diff)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     '_note_merge_all: coordinator %s note_merge failed: %s',
                     getattr(coord, '_service_name', repr(coord)),
@@ -12695,7 +12531,7 @@ class Harness:
         )
         try:
             await notifiee(task_id, base_sha, head_sha)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 'offline-lane on_post_merge notifiee raised for task %s; ignoring (fail-open)',
                 task_id,
@@ -14362,7 +14198,7 @@ class Harness:
         # `dead_l0` and `queue_handoff` buckets, so the L0 liveness fork
         # cannot change this site's answer — and this hot per-dispatch-tick
         # path skips claimant resolution entirely for an identical result.
-        from escalation.pins import classify_pins  # noqa: PLC0415
+        from escalation.pins import classify_pins
 
         pinned = classify_pins(task_id, rows, live_claimant=False)
 
@@ -15767,8 +15603,8 @@ class Harness:
         to re-run and the harness files it, failing closed as CATEGORY_POLICY
         does for a timeout; only the tip-advanced arm suppresses it.
         """
-        from orchestrator import critical_gate  # noqa: PLC0415
-        from orchestrator import verify as verify_mod  # noqa: PLC0415
+        from orchestrator import critical_gate
+        from orchestrator import verify as verify_mod
 
         main_sha: str = await self.git_ops.get_main_sha()  # type: ignore[union-attr]
         if not main_sha:
@@ -15824,7 +15660,7 @@ class Harness:
             )
             return
 
-        from escalation.models import Escalation  # noqa: PLC0415
+        from escalation.models import Escalation
 
         task_id = f'main-sweep-{swept_sha[:12]}'
         # Dedup against a surviving L1 from a prior run: _last_swept_main_sha
@@ -16139,7 +15975,7 @@ class Harness:
                 f'before this task can be safely resumed or re-triaged.'
             )
 
-        from escalation.models import Escalation  # noqa: PLC0415
+        from escalation.models import Escalation
 
         description = (task or {}).get('description', '')
         summary = (
@@ -16218,7 +16054,7 @@ class Harness:
         if self._escalation_queue is None:
             return
 
-        from escalation.models import Escalation  # noqa: PLC0415
+        from escalation.models import Escalation
 
         # The stamp is the original fire time, so a recovered review_due
         # carries the runner's fired_at.
@@ -16873,7 +16709,7 @@ class Harness:
         # (server.py:671). This replaces the harness's former independent
         # _ACTION_TARGETS copy and action-string routing, closing the Table B
         # drift (PRD task-status-authority C6, finding 10.0).
-        from escalation.action_effects import (  # noqa: PLC0415
+        from escalation.action_effects import (
             WORKFLOW_NONE,
             WORKFLOW_RESUME,
             effect_for,
@@ -17313,7 +17149,7 @@ class Harness:
             ok = await self.scheduler.update_task(
                 task_id, metadata=cleaned, metadata_mode='replace',
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort: never block the restart
+        except Exception as exc:  # best-effort: never block the restart
             logger.warning(
                 'action-teardown restart: could not clear merge_retry_pending for '
                 'task %s (%s) — proceeding with the restart; the re-dispatch may '
@@ -18510,7 +18346,7 @@ class Harness:
         # Table B (ω3, task 2196): source the target from the same authority
         # _on_escalation_resolved / escalation.server.resolve_issue use, so
         # resume→pending cannot drift into a third independent copy.
-        from escalation.action_effects import effect_for  # noqa: PLC0415
+        from escalation.action_effects import effect_for
 
         _resume_effect = effect_for('resume', escalation.level, escalation.category)
         if _resume_effect is not None and _resume_effect.target_status is not None:

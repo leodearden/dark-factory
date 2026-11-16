@@ -4775,9 +4775,11 @@ def heartbeat_lease(
     holder's lease kept the AND-guard from ever firing -- the lease became
     structurally unreapable and outlived its holder indefinitely.
 
-    Fail-soft is unchanged: an absent lease is ABSENT and an OSError from
-    ``os.utime`` is FAULTED after a logger.error -- never a raise, so a
-    lease-substrate fault cannot interrupt a watcher's main loop.
+    Fail-soft is unchanged: an absent lease is ABSENT -- including one a
+    concurrent --force release or reap removes after the ownership gate but
+    before the touch -- and any other OSError from ``os.utime`` is FAULTED
+    after a logger.error -- never a raise, so a lease-substrate fault cannot
+    interrupt a watcher's main loop.
     """
     path = lease_path_for_name(name, root=root)
     terminal, holder = _check_lease_ownership(path, slug=slug, force=force, verb='heartbeat_lease')
@@ -4785,6 +4787,8 @@ def heartbeat_lease(
         return terminal
     try:
         os.utime(path, None)
+    except FileNotFoundError:
+        return LeaseMutation.ABSENT
     except OSError:
         logger.error('heartbeat_lease: failed to touch %s', path, exc_info=True)
         return LeaseMutation.FAULTED
@@ -4814,7 +4818,6 @@ def _check_lease_ownership(
     slug: str,
     force: bool,
     verb: str,
-    now: datetime | None = None,
 ) -> tuple[LeaseMutation | None, LeaseHolder | None]:
     """Gate a lease mutation on ownership (task 3994).
 
@@ -4830,25 +4833,24 @@ def _check_lease_ownership(
     identical fields a contention message does -- the holder a refused
     caller is told about is the holder a contending claim would report.
 
-    - lease absent -> (ABSENT, None), and QUIET: an idempotent release is
-      not a failure and must not manufacture an ERROR.
-    - body unreadable/corrupt -> not owned by anybody, so REFUSED (fail
-      TOWARD held, mirroring _read_lease_holder_state's own documented rule
-      -- a corrupt lease is not stranded: reap_stale_leases still removes it
-      under the ``corrupt`` rule once past LEASE_HEARTBEAT_TTL, and --force
-      covers immediate operator recovery).
+    - no readable holder and no file -- absent from the start, or removed
+      mid-check by a concurrent --force release or reap -> (ABSENT, None),
+      QUIET: an idempotent release is not a failure and must not
+      manufacture an ERROR.
+    - body still present but unreadable/corrupt -> not owned by anybody, so
+      REFUSED (fail TOWARD held, mirroring _read_lease_holder_state's own
+      documented rule -- a corrupt lease is not stranded: reap_stale_leases
+      still removes it under the ``corrupt`` rule once past
+      LEASE_HEARTBEAT_TTL, and --force covers immediate operator recovery).
     - slug matches -> proceed.
     - slug mismatch -> REFUSED + logger.error naming the verb, the lease,
       the REAL holder (slug + pid), the heartbeat age and the requester, so
       the refusal is greppable and both parties are attributable (INV-2).
     - *force* overrides either refusal, at WARNING, naming both parties.
     """
-    if now is None:
-        now = datetime.now(UTC)
-    if not path.exists():
+    holder, _holder_alive, age_secs = _read_lease_holder_state(path, now=datetime.now(UTC))
+    if holder is None and not path.exists():
         return LeaseMutation.ABSENT, None
-
-    holder, _holder_alive, age_secs = _read_lease_holder_state(path, now=now)
     if _is_lease_owner(holder, slug):
         return None, holder
 

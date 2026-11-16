@@ -366,3 +366,35 @@ class TestSeedManager:
             f"Expected exactly 1 add_memory call after fast-fail, "
             f"got {mock_service.add_memory.await_count}"
         )
+
+    @pytest.mark.asyncio
+    async def test_seed_report_records_queued_stores_beside_written_stores(
+        self, guardrails_source: Path
+    ):
+        """The seeds are dual writes: Mem0 is written, Graphiti is queued."""
+        from fused_memory.maintenance.seed_autopilot_video_triage_guardrails import (
+            SeedManager,
+        )
+        from fused_memory.models.enums import SourceStore
+        from fused_memory.models.memory import AddMemoryResponse
+
+        mock_service = MagicMock()
+        mock_service.add_memory = AsyncMock(
+            return_value=AddMemoryResponse(
+                memory_ids=["mem-1"],
+                stores_written=[SourceStore.mem0],
+                stores_queued=[SourceStore.graphiti],
+            )
+        )
+
+        report = await SeedManager(mock_service).seed(
+            agent_id="agent-X", source_path=guardrails_source
+        )
+
+        assert set(report.stores_written_by_name) == {
+            "attribution_stub_anti_pattern",
+            "nav_hints_anti_pattern",
+        }
+        for name in report.stores_written_by_name:
+            assert report.stores_written_by_name[name] == ["mem0"]
+            assert report.stores_queued_by_name[name] == ["graphiti"]

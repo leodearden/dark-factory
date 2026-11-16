@@ -803,12 +803,12 @@ def render_finding_provenance_section(*, can_file_tasks: bool) -> str:
         + capability_clause
     )
 
-# Shared guidance about the memory_ids=[] + stores=['graphiti'] → graphiti_writes_queued
+# Shared guidance about the memory_ids=[] + stores_queued=['graphiti'] → graphiti_writes_queued
 # invariant.  Both stages need to teach the LLM not to count async-enqueued Graphiti
 # writes under their `memories_*` stats; only the stat-key tokens differ between stages.
 _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE = (
-    "Graphiti-only async-enqueued writes show `stores: ['graphiti']` in the response but "
-    "return `memory_ids: []` because the write is queued rather than persisted inline. These "
+    "Graphiti-only async-enqueued writes show `stores_queued: ['graphiti']` in the response "
+    "and return `memory_ids: []` because the write is queued rather than persisted inline. These "
     "must NOT be counted under {stat_keys_phrase}. Report them instead under "
     "a separate `graphiti_writes_queued` stat. The stats verifier enforces this split "
     "independently and will override any inflated {primary_stat_key} count, but you should "

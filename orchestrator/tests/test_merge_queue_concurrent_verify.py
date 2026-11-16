@@ -63,10 +63,7 @@ from _verify_result_doubles import (
     format_fail_open_records,
     real_verify_result,
 )
-from _wait_hygiene_scan import (
-    suppressed_result_wait_items,
-    unguarded_worker_teardown_items,
-)
+from _wait_hygiene_scan import suppressed_result_wait_items
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.event_store import EventType
@@ -3474,9 +3471,17 @@ class TestRunnerUnavailableHeadCascade:
         #   · both N and N+1 are re-dispatched via the redispatch park
         gate_a_release.set()
 
-        # Release N+1's gate so the (possibly still-running) gated task
-        # can unblock even if cancel() arrives slightly late.
-        gate_b_release.set()
+        # N+1's verify stays gated until the cascade cancels it: a verify that
+        # finished first would already have released its lease at its verdict
+        # (task 8526), leaving the cascade no remote verify to cancel.
+        async def _cascade_cancelled_b() -> None:
+            while not gated_remote.cancel_verify.called:
+                await asyncio.sleep(0.01)
+
+        try:
+            await asyncio.wait_for(_cascade_cancelled_b(), timeout=45.0)
+        finally:
+            gate_b_release.set()
 
         # Wait for both to resolve. A real timeout now fails loudly by
         # name (task 3477) instead of leaving outcome_X as a confusing
@@ -5296,7 +5301,7 @@ class _FakeEscalationQueue:
         self._seq = 0
         self.submitted: list[Any] = []
 
-    def has_open_l1(self, task_id: str) -> bool:  # noqa: ARG002
+    def has_open_l1(self, task_id: str) -> bool:
         return self._open_l1
 
     def make_id(self, task_id: str) -> str:
@@ -5804,12 +5809,12 @@ class TestLoudWaitMigrationRatchet:
     """Enforced invariant, task 4219, ratcheted to zero by task 4846: THIS
     module's own source carries no suppressed result wait -- neither the
     `with contextlib.suppress(TimeoutError):` spelling nor the swallowing
-    `try/except TimeoutError:` spelling -- and every method that waits
-    through `wait_responsive` stops its worker from a `finally:`.
+    `try/except TimeoutError:` spelling. The worker-teardown half (every
+    method that waits through `wait_responsive` stops its worker from a
+    `finally:`) is enforced tree-wide by test_worker_teardown_leak_guard.py.
 
-    No `@pytest.mark.timeout` mark needed: neither of these two methods
-    performs a real await, so `_wait_budget_audit.py::item_wait_budgets`
-    bills each of them 0.0.
+    No `@pytest.mark.timeout` mark needed: this method performs no real
+    await, so `_wait_budget_audit.py::item_wait_budgets` bills it 0.0.
     """
 
     def test_no_suppressed_result_waits(self) -> None:
@@ -5833,23 +5838,4 @@ class TestLoudWaitMigrationRatchet:
             'by-label timeout. Migrate the wait to '
             '`_orch_helpers.wait_responsive` (or, for a bare result future '
             'with no starvation accounting needed, `_await_outcome`).'
-        )
-
-    def test_migrated_methods_stop_worker_in_finally(self) -> None:
-        """No method that calls `wait_responsive` may leave `worker.stop()`
-        outside a `finally:` block (esc-3980-4): `wait_responsive` gives up
-        by raising `_pytest.outcomes.Failed`, so a straight-line body that
-        skips `worker.stop()` on give-up leaks a live merge worker plus its
-        run task into pytest-asyncio teardown -- how one red test used to
-        cascade into unrelated failures elsewhere in the session.
-        """
-        source = Path(__file__).read_text()
-        offenders = unguarded_worker_teardown_items(source)
-
-        assert not offenders, (
-            'The following methods call wait_responsive but do not call '
-            'worker.stop() from inside a finally: block (esc-3980-4 leak '
-            'invariant -- see '
-            '_merge_worker_drive.py::stop_merge_worker):\n'
-            + '\n'.join(f'  - {offender}' for offender in offenders)
         )

@@ -1,12 +1,16 @@
-/* Quality tab — one project's per-landing quality series (quality-dashboard ε).
+/* Quality tab — one project's per-landing quality series (quality-dashboard ε)
+ * and its quality-metrics snapshot series (ι).
  *
  * Every figure arrives in one on-demand read of /api/v2/dashboard/quality
  * (data.js::ON_DEMAND_KEYS.quality), addressed by the canonical query
  * data.js::qualityQuery builds from the chosen project, landing window and
  * module. It is never polled, so nothing here reads a static DF_DATA.QUALITY.
+ * The one other read is the selected snapshot point's instrument --diff text
+ * (ON_DEMAND_KEYS.qualitySnapshotDiff, addressed by snapshotDiffQuery).
  * The decisions — layout, headline, rule, alarm and before/after text, chart
- * arrays and mark placement — are quality_view.js's; this file only wires
- * them to charts.jsx and does no arithmetic on a served series.
+ * arrays and mark placement, and the snapshot axis, charts, marks, member
+ * table and texts — are quality_view.js's; this file only wires them to
+ * charts.jsx and does no arithmetic on a served series.
  *
  * The landing window is the tab's own (window_chip.js::WINDOW_SETS.landings),
  * not the global chip: an on-demand receipt is keyed by its query, so the
@@ -41,10 +45,18 @@ const {
   beforeAfterText,
   costModelReadings,
   qualityMarks,
+  snapshotAxis,
+  snapshotCharts,
+  snapshotMarks,
+  snapshotTable,
+  snapshotLabel: qualitySnapshotLabel,
+  snapshotHeading,
+  snapshotDiffText,
 } = window.DF_QUALITY_VIEW;
 const {
   createOnDemandHook,
   qualityQuery,
+  snapshotDiffQuery,
   ON_DEMAND_KEYS: QUALITY_ON_DEMAND_KEYS,
   ON_DEMAND_VIEWS: QUALITY_ON_DEMAND_VIEWS,
   datumFor,
@@ -70,6 +82,9 @@ const QUALITY_SERIES_COLORS = Object.freeze({
   ewma: QUALITY_PALETTE.fg2,
   ucl: QUALITY_PALETTE.bad,
 });
+// Neutral hues, in a snapshot chart's series order: a count is not a verdict.
+const QUALITY_SNAPSHOT_COLORS = Object.freeze([QUALITY_PALETTE.accent, QUALITY_PALETTE.accent2, QUALITY_PALETTE.info]);
+const QUALITY_DIFF_STYLE = Object.freeze({ fontSize: 11, maxHeight: 360, overflow: 'auto', whiteSpace: 'pre', marginTop: 8 });
 
 function qualityFieldDatum(query, field) {
   return datumFor(QUALITY_ON_DEMAND_KEYS.quality.key(query, field));
@@ -243,25 +258,106 @@ function QualityModules({ rows, onModule }) {
   );
 }
 
-function QualitySnapshots({ datum }) {
-  const reading = datumView(datum);
+function QualitySnapshotChart({ chart, labels, marks }) {
+  const series = chart.series.map((s, i) => ({ ...s, color: QUALITY_SNAPSHOT_COLORS[i], fill: false }));
   return (
-    <div data-quality-section="snapshots" className="panel">
-      <div className="panel-head"><span className="title">Snapshots</span></div>
-      <div className="panel-body" style={QUALITY_NOTE_STYLE}>
-        {reading.isHole ? reading.title : 'The snapshot series is served; its view arrives with quality-dashboard leaf ι.'}
+    <div className="panel" data-quality-snapshot-chart={chart.group}>
+      <div className="panel-head"><span className="title">{chart.title}</span></div>
+      <div className="panel-body">
+        <div style={{ ...QUALITY_NOTE_STYLE, display: 'flex', gap: 10, marginBottom: 14 }}>
+          {series.map(s => <span key={s.key} style={{ color: s.color }}>{s.label}</span>)}
+        </div>
+        <QualityMarkedChart marks={marks} legend>
+          <QualityLineChart series={series} labels={labels} countAxis height={160} />
+        </QualityMarkedChart>
       </div>
     </div>
   );
 }
 
-function QualitySeries({ query, quality, onModule }) {
-  const markersDatum = qualityFieldDatum(query, 'QUALITY_MARKERS');
-  const markersReading = datumView(markersDatum);
-  const markers = markersReading.isHole ? [] : markersDatum.value.markers;
+function QualitySnapshotDiff({ project, point }) {
+  const { view, value } = useQualityOnDemand('qualitySnapshotDiff', snapshotDiffQuery({ project, point }));
+  if (view === QUALITY_ON_DEMAND_VIEWS.loading) return <div style={QUALITY_NOTE_STYLE}>loading…</div>;
+  if (view !== QUALITY_ON_DEMAND_VIEWS.ready) {
+    return <div style={{ ...QUALITY_NOTE_STYLE, color: 'var(--warn)' }}>The snapshot diff could not be fetched.</div>;
+  }
+  return <pre className="mono" data-quality-snapshot-diff="" style={QUALITY_DIFF_STYLE}>{snapshotDiffText(value)}</pre>;
+}
+
+function QualitySnapshotPoint({ point, points, onChoose, project }) {
+  const table = snapshotTable(point);
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+        <select aria-label="snapshot" value={point.id} onChange={e => onChoose(e.target.value)}>
+          {points.map(p => <option key={p.id} value={p.id}>{qualitySnapshotLabel(p)}</option>)}
+        </select>
+        <span className="mono" style={QUALITY_NOTE_STYLE} data-quality-snapshot-heading="">{snapshotHeading(point)}</span>
+      </div>
+      <table className="tbl">
+        <thead><tr>{table.headers.map(header => <th key={header}>{header}</th>)}</tr></thead>
+        <tbody>
+          {table.rows.map(([member, ...cells]) => (
+            <tr key={member}>
+              <td>{member}</td>
+              {cells.map((cell, i) => <td key={i} className="mono">{cell}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <QualitySnapshotDiff project={project} point={point.id} />
+    </div>
+  );
+}
+
+function QualitySnapshotUnplaced({ files }) {
+  return (
+    <div style={{ ...QUALITY_NOTE_STYLE, marginTop: 8 }}>
+      Not placed:
+      <ul>
+        {files.map(file => <li key={file.id}><span className="mono">{file.file}</span>: {file.reason}</li>)}
+      </ul>
+    </div>
+  );
+}
+
+function QualitySnapshotSeries({ series, project, markers }) {
+  const { points, unplaced } = series;
+  const [chosen, setChosen] = useQualityState(null);
+  const selected = points.find(point => point.id === chosen) ?? points[points.length - 1];
+  const labels = snapshotAxis(points);
+  const marks = snapshotMarks(points, markers);
   return (
     <>
-      {markersReading.isHole && <div style={QUALITY_NOTE_STYLE}>Markers unavailable: {markersReading.title}</div>}
+      {points.length === 0 && <div style={QUALITY_NOTE_STYLE}>No snapshot file is placed.</div>}
+      {points.length > 0 && (
+        <div className="grid cols-2" style={{ gap: 12 }}>
+          {snapshotCharts(points).map(chart => <QualitySnapshotChart key={chart.group} chart={chart} labels={labels} marks={marks} />)}
+        </div>
+      )}
+      {selected && <QualitySnapshotPoint point={selected} points={points} onChoose={setChosen} project={project} />}
+      {unplaced.length > 0 && <QualitySnapshotUnplaced files={unplaced} />}
+    </>
+  );
+}
+
+function QualitySnapshots({ datum, project, markers }) {
+  const reading = datumView(datum);
+  return (
+    <div data-quality-section="snapshots" className="panel">
+      <div className="panel-head"><span className="title">Snapshots</span></div>
+      <div className="panel-body">
+        {reading.title && <div style={QUALITY_NOTE_STYLE}>{reading.title}</div>}
+        {!reading.isHole && <QualitySnapshotSeries series={datum.value} project={project} markers={markers} />}
+      </div>
+    </div>
+  );
+}
+
+function QualitySeries({ quality, markers, markersHole, onModule }) {
+  return (
+    <>
+      {markersHole && <div style={QUALITY_NOTE_STYLE}>Markers unavailable: {markersHole}</div>}
       <QualityHeadlines metrics={quality.metrics} />
       <QualityMetricSection name="outcomes" title="Outcomes" entries={QUALITY_TAB_LAYOUT.outcomes} quality={quality} markers={markers} />
       <QualityMetricSection name="change-cost" title="Change cost" entries={QUALITY_TAB_LAYOUT.changeCost} quality={quality} markers={markers}>
@@ -269,19 +365,29 @@ function QualitySeries({ query, quality, onModule }) {
       </QualityMetricSection>
       <QualityBeforeAfter quality={quality} markers={markers} />
       <QualityModules rows={quality.modules} onModule={onModule} />
-      <QualitySnapshots datum={qualityFieldDatum(query, 'QUALITY_SNAPSHOTS')} />
     </>
   );
 }
 
-function QualityRead({ view, value, query, onModule }) {
+// QUALITY, QUALITY_MARKERS and QUALITY_SNAPSHOTS are independent datums of one
+// response: a QUALITY hole hides the landing series, never the snapshots.
+function QualityRead({ view, value, project, query, onModule }) {
   if (view === QUALITY_ON_DEMAND_VIEWS.loading) return <div style={QUALITY_NOTE_STYLE}>loading…</div>;
   if (view !== QUALITY_ON_DEMAND_VIEWS.ready) {
     return <div style={{ ...QUALITY_NOTE_STYLE, color: 'var(--warn)' }}>The quality series could not be fetched.</div>;
   }
   const reading = datumView(value);
-  if (reading.isHole) return <div style={QUALITY_NOTE_STYLE}>{reading.title}</div>;
-  return <QualitySeries query={query} quality={value.value} onModule={onModule} />;
+  const markersDatum = qualityFieldDatum(query, 'QUALITY_MARKERS');
+  const markersReading = datumView(markersDatum);
+  const markers = markersReading.isHole ? [] : markersDatum.value.markers;
+  return (
+    <>
+      {reading.isHole
+        ? <div style={QUALITY_NOTE_STYLE}>{reading.title}</div>
+        : <QualitySeries quality={value.value} markers={markers} markersHole={markersReading.isHole ? markersReading.title : null} onModule={onModule} />}
+      <QualitySnapshots datum={qualityFieldDatum(query, 'QUALITY_SNAPSHOTS')} project={project} markers={markers} />
+    </>
+  );
 }
 
 // The read's own outcome re-renders the header too, so the served-window echo
@@ -301,7 +407,7 @@ function QualityProject({ projects, project, onProject, landings, onLandings, mo
         moduleName={moduleName}
         onClearModule={() => onModule(null)}
       />
-      <QualityRead view={view} value={value} query={query} onModule={onModule} />
+      <QualityRead view={view} value={value} project={project} query={query} onModule={onModule} />
     </div>
   );
 }

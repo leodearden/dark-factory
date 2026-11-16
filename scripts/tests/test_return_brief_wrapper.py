@@ -154,7 +154,7 @@ def test_every_line_is_prefixed_and_failures_go_to_stderr(tmp_path):
     assert all(line.startswith(PREFIX) for line in result.stderr.splitlines())
 
 
-def test_default_seams_are_uv_run_frozen_under_the_shared_project(tmp_path):
+def test_default_seams_are_uv_run_no_sync_under_the_shared_project(tmp_path):
     """A space in REPO makes a dropped quote around ``$REPO/shared`` word-split the argv."""
     result, repo, state, _ = _run_wrapper(tmp_path, seams=False, repo_name='fake repo with spaces')
 
@@ -162,7 +162,7 @@ def test_default_seams_are_uv_run_frozen_under_the_shared_project(tmp_path):
     calls = _recorded(state)
     assert len(calls) == 2
     for call in calls:
-        assert call[:5] == ['run', '--frozen', '--project', f'{repo}/shared', 'python'], call
+        assert call[:5] == ['run', '--no-sync', '--project', f'{repo}/shared', 'python'], call
     assert [Path(call[5]).name for call in calls] == ['nightly_prepare.py', 'return_brief.py']
 
 

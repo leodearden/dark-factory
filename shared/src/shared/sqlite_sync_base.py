@@ -18,7 +18,7 @@ from __future__ import annotations
 import sqlite3
 
 # Re-export CheckpointResult from the async sibling — single definition, no duplication.
-from shared.async_sqlite_base import CheckpointResult  # noqa: F401
+from shared.async_sqlite_base import CheckpointResult
 
 __all__ = ['apply_full_durability_pragmas_sync', 'CheckpointResult']
 

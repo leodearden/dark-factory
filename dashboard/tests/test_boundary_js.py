@@ -41,6 +41,7 @@ from _boundary_payloads import (
     QUALITY_PENDING_TRAIN,
     QUALITY_RECLAIMED_BACK,
     QUALITY_SMALL_N,
+    QUALITY_SNAPSHOT_TIMES,
     QUALITY_SOURCE_EPOCH,
     QUALITY_STORED,
     QUALITY_TICK,
@@ -72,7 +73,7 @@ _JS_DIR = Path(__file__).parent / 'js'
 
 _SKETCH_ROWS = frozenset(range(1, 14))
 _PRD_LANES_ROWS = frozenset({20, 21})
-_QUALITY_ROWS = frozenset({3, 4, 5, 9, 10, 12})
+_QUALITY_ROWS = frozenset({3, 4, 5, 9, 10, 12, 20})
 
 # A top-level TAP result for a passing test named 'sketch #N: ...',
 # 'prd lanes #N: ...' or 'quality #N: ...'; TAP escapes the '#' because a bare
@@ -547,3 +548,45 @@ def test_quality_module_drill_down_serves_the_landings_touching_the_module(serve
     assert _ordinals(series) == list(QUALITY_MODULE_ORDINALS)
     for metric_id, metric in series['metrics'].items():
         assert len(metric['points']) == len(QUALITY_MODULE_ORDINALS), metric_id
+
+
+def test_quality_sketch_20_snapshot_step_series(served_bodies):
+    body = served_bodies['quality_snapshots']
+    snapshots = body['QUALITY_SNAPSHOTS']
+    assert snapshots['state'] == 'fresh', snapshots['reason']
+    points = snapshots['value']['points']
+
+    assert [datetime.fromisoformat(point['committed_at']) for point in points] == list(QUALITY_SNAPSHOT_TIMES)
+    assert [point['baseline'] for point in points] == [True, False, False]
+    assert snapshots['value']['unplaced'] == []
+    [instrument] = [marker for marker in body['QUALITY_MARKERS']['value']['markers'] if marker['kind'] == 'instrument']
+    second = points[1]
+    assert instrument['ref'] == second['as_of_sha']
+    assert (instrument['id'], instrument['source']['point']) == ('instrument:' + second['id'], second['id'])
+    assert datetime.fromisoformat(instrument['at']) == datetime.fromisoformat(second['committed_at'])
+    diff = served_bodies['quality_snapshot_diff']['QUALITY_SNAPSHOT_DIFF']
+    assert (diff['point_id'], diff['previous_id'], diff['state']) == (second['id'], points[0]['id'], 'ready'), diff
+    assert diff['text'].startswith('params differ: '), diff['text'][:200]
+
+
+def test_quality_same_commit_instrument_marker_names_the_nightly_point(served_bodies):
+    body = served_bodies['quality_snapshots_same_commit']
+    snapshots = body['QUALITY_SNAPSHOTS']
+    assert snapshots['state'] == 'fresh', snapshots['reason']
+    points = snapshots['value']['points']
+
+    assert points[0]['as_of_sha'] == points[1]['as_of_sha']
+    assert [point['baseline'] for point in points] == [True, False, False]
+    [instrument] = [marker for marker in body['QUALITY_MARKERS']['value']['markers'] if marker['kind'] == 'instrument']
+    nightly = points[1]
+    assert (instrument['id'], instrument['source']['point']) == ('instrument:' + nightly['id'], nightly['id'])
+    diff = served_bodies['quality_snapshots_same_commit_diff']['QUALITY_SNAPSHOT_DIFF']
+    assert (diff['point_id'], diff['previous_id'], diff['state']) == (nightly['id'], points[0]['id'], 'ready'), diff
+    assert diff['text'].startswith('params differ: '), diff['text'][:200]
+
+
+def test_quality_a_root_holding_neither_snapshot_home_serves_no_snapshot_yet(served_bodies):
+    snapshots = served_bodies['quality_no_snapshot']['QUALITY_SNAPSHOTS']
+
+    assert (snapshots['state'], snapshots['value']) == ('unknown', None), snapshots
+    assert snapshots['reason'].startswith('no snapshot yet'), snapshots['reason']

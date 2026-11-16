@@ -376,7 +376,7 @@ async def enumerate_topic_bearing(
         *coverage* maps category -> the expected/scrolled/recount/delta/
         complete cell, and *complete* is the conjunction over all cells.
     """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     backend = memory_service.mem0
     category_values = (
@@ -1433,7 +1433,7 @@ def load_mcp_client_module() -> Any:
     Exposed so :func:`open_mcp_client` reads that module's ``DEFAULT_SERVER``
     beside its client class, rather than restating the URL a third time.
     """
-    import importlib.util  # noqa: PLC0415
+    import importlib.util
 
     sibling = Path(__file__).parent / 'strip_leaked_control_keys.py'
     mod_name = 'strip_leaked_control_keys'
@@ -2251,8 +2251,8 @@ async def open_live_memory_service():
     Imports deferred so importing this module — which the tests do, by path —
     never constructs a backend.
     """
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.services.memory_service import MemoryService
 
     memory = MemoryService(FusedMemoryConfig())
     try:
@@ -2322,7 +2322,7 @@ def main(
     args = _build_parser().parse_args(argv)
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
 
         os.environ['CONFIG_PATH'] = str(args.config)
 

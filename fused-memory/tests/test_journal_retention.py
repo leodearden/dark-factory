@@ -13,7 +13,7 @@ from fused_memory.services.journal_retention import (
     TABLES_WITHOUT_RETENTION,
     prune_every_table_at_startup,
 )
-from fused_memory.services.write_journal import WriteJournal
+from fused_memory.services.write_journal import Mem0WriteMethod, WriteJournal
 
 _LONG_AGO = '2000-01-01T00:00:00+00:00'
 
@@ -76,6 +76,7 @@ async def _seed_one_row_per_table(journal: WriteJournal) -> dict[str, tuple[str,
     intent_id = str(uuid.uuid4())
     await journal.log_mem0_intent(
         intent_id=intent_id, write_op_id=str(uuid.uuid4()), content='c', payload_digest=None,
+        write_method=Mem0WriteMethod.ADD,
     )
     await journal.resolve_mem0_intent(intent_id, 'completed')
     client_op_id = str(uuid.uuid4())
@@ -114,6 +115,7 @@ async def test_the_sweep_ages_out_mem0_intents_and_idempotent_ops_at_their_confi
     intent_id = str(uuid.uuid4())
     await journal.log_mem0_intent(
         intent_id=intent_id, write_op_id=str(uuid.uuid4()), content='c', payload_digest=None,
+        write_method=Mem0WriteMethod.ADD,
     )
     await journal.resolve_mem0_intent(intent_id, 'completed')
     _backdate(journal, 'mem0_intents', 'id', intent_id,

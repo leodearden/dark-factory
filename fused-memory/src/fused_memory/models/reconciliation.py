@@ -151,11 +151,6 @@ class RunStatus(StrEnum):
     failed = 'failed'
     rolled_back = 'rolled_back'
     circuit_breaker = 'circuit_breaker'
-    # Legacy, read-only. Task 2717's retired resume path wrote it for a run
-    # cancelled mid-stage; nothing writes it since task 5514, and
-    # harness.py::ReconciliationHarness._recover_legacy_interrupted_runs
-    # converts any such row to 'failed' at startup.
-    interrupted = 'interrupted'
 
 
 class ReconciliationRun(BaseModel):

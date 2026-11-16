@@ -738,26 +738,6 @@ _VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r'^=== INTERRUPTED \(worktree removed\) ===', re.MULTILINE),
 ]
 
-# verify.py::_run_cmd's `systemd-run --user --scope` could not start the leg's
-# scope (task 7258). Grounded samples, each the leg's ENTIRE output at rc=1:
-#   'Failed to start transient scope unit: Transport endpoint is not connected'
-#     (task 7217's cockpit test/lint/type legs, 2026-10-20)
-#   'Failed to connect to bus: No such file or directory'
-#     (systemd 255.4, user bus unreachable, measured 2026-10-22)
-# Matched against the WHOLE output, never per line: systemd-run fails before
-# exec'ing the leg, so its refusal is all the leg can print, and any other
-# output means the command ran and its own verdict stands. Only systemd-run
-# prints the scope-unit line, so any reason after it means the scope never
-# started. `systemctl --user` and `busctl --user` print the bus-connect line
-# verbatim too (measured), so only its observed reasons match; a leg whose own
-# systemctl prints exactly that line still reads as infra until task 7339 tags
-# the spawn path structurally. Add a reason only on a newly observed sample
-# (the _CARGO_CLI_ERROR_RE discipline).
-_SCOPE_SPAWN_FAILURE_RE = re.compile(
-    r'Failed to start transient scope unit: [^\n]+'
-    r'|Failed to connect to bus: No such file or directory'
-)
-
 
 def _reports_fatal_slot_timeout(
     scoped: str, event_channel: VerifyEventChannel | None,
@@ -772,8 +752,7 @@ def _classify_environmental(
 ) -> FailureCategory | None:
     """Tool-blind host-infrastructure guard: DISK_FULL / ENV_TRANSIENT (broken
     ``_merge-verify`` worktree, incl. restart collateral; mis-resolved pyright
-    interpreter; a verify scope systemd-run could not start) /
-    SEMAPHORE_TIMEOUT.
+    interpreter) / SEMAPHORE_TIMEOUT.
 
     Checked in ``classify_failure`` immediately after the ``timed_out`` ->
     ``INFRA_TIMEOUT`` guard and before any per-tool dispatch — these
@@ -1017,13 +996,6 @@ def _classify_environmental(
     per-tool table duplication (Invariant C1 intact — C1 forbids duplicating
     the same pattern across per-tool tables, not a category being reachable
     from more than one guard).
-
-    ENV_TRANSIENT — verify scope never started (task 7258): when
-    ``verify.py::_run_cmd``'s ``systemd-run --user --scope`` cannot reach the
-    user bus it exits before exec'ing the leg, so the leg's entire output is
-    systemd-run's one-line refusal (``_SCOPE_SPAWN_FAILURE_RE``). It is matched
-    only as the WHOLE scoped output, so it cannot tie with any other arm and
-    its position among them is not load-bearing.
     """
     # task 4492 — every POSITIVE detector below reads `scoped`, the output
     # with each PASSED suite's interior blanked; the one NEGATIVE/veto
@@ -1065,8 +1037,6 @@ def _classify_environmental(
         return FailureCategory.ENV_TRANSIENT
     if is_interpreter_missing_workspace_packages(scoped):
         return FailureCategory.ENV_TRANSIENT
-    if _SCOPE_SPAWN_FAILURE_RE.fullmatch(scoped.rstrip('\n')):
-        return FailureCategory.ENV_TRANSIENT
     # task 4212: sentinel half is gated on disposition
     # (`_has_fatal_slot_timeout_sentinel` above has the full grounding);
     # basename half stays ungated — its emitters carry no `disposition` field.
@@ -1103,7 +1073,7 @@ def classify_failure(
        ``FailureCategory.SEMAPHORE_TIMEOUT``, or ``FailureCategory.ENV_TRANSIENT``
        (broken ``_merge-verify`` worktree; a mis-resolved pyright
        interpreter holding none of the workspace's third-party packages —
-       task 3367; or a verify scope systemd-run could not start — task 7258)
+       task 3367)
        when grounded in *output* (wins over any per-tool output
        pattern for the same "root cause is the environment, not the command
        output" reason as guard 2 — a host condition like a full disk, a

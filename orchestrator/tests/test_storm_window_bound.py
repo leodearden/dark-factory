@@ -273,7 +273,7 @@ def test_the_sampler_excludes_the_outcomes_the_streak_carves_out(
     absent key must be KEPT; that is the arm the coalesce in the SELECT exists
     for, and dropping it would sample nothing at all on today's live corpus.
     """
-    from orchestrator.harness import (  # noqa: PLC0415
+    from orchestrator.harness import (
         _BY_DESIGN_RESTORE_OUTCOMES,
     )
 
@@ -344,7 +344,7 @@ def test_the_runs_db_locator_is_shared_with_resume_age_bound():
     NESTING: a strictly narrower window is a subset of the wider one by
     construction, so the corpora always overlap.
     """
-    from orchestrator import resume_age_bound as rab  # noqa: PLC0415
+    from orchestrator import resume_age_bound as rab
 
     assert swb.default_runs_db_path is rab.default_runs_db_path
     assert swb.parsed_utc is rab.parsed_utc

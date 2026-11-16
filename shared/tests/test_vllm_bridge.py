@@ -11,8 +11,8 @@ import pytest
 # Skip entire module when aiohttp is not installed (optional [vllm] extra)
 pytest.importorskip('aiohttp')
 
-import aiohttp  # noqa: E402
-from aiohttp import web  # noqa: E402
+import aiohttp
+from aiohttp import web
 
 from shared.vllm_bridge import (
     VllmBridge,

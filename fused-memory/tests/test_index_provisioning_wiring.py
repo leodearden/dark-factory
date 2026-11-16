@@ -34,6 +34,7 @@ from _falkor_index_doubles import (
     statements_read,
     statements_written,
 )
+from _graph_access_fake import FakeGraphAccess
 from shared.testing_virtual_clock import virtual_clock_test
 
 from fused_memory.backends.falkor_indices import (
@@ -124,6 +125,23 @@ class TestStartupSweep:
         # A registered but ABSENT graph is left to its first write (D6); an
         # unregistered one is never touched, whatever its name looks like (D5).
         assert _requested_graphs(backend) == {'reg_a'}
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_lists_graphs_through_the_injected_provider(
+        self, mock_config, make_backend, make_graph_mock,
+    ):
+        graph = make_graph_mock(rows_for(TRAP_PRESENT), header=LIVE_HEADER)
+        other = make_graph_mock([], header=LIVE_HEADER)
+        backend = make_backend(
+            mock_config,
+            registered_graph_ids={'reg_a'},
+            graph_access=FakeGraphAccess({'reg_a': graph, 'unreg_probe': other}),
+        )
+
+        await backend.provision_registered_graphs()
+
+        assert statements_written(graph) == _plan_for(TRAP_PRESENT)
+        assert statements_written(other) == []
 
     @pytest.mark.asyncio
     async def test_one_graph_raising_does_not_stop_the_sweep(

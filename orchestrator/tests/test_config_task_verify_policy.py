@@ -8,7 +8,7 @@ merge-time verify to the owning package's full suite.
 
 RATCHET CONSTRAINT: this module imports orchestrator.config only — never
 orchestrator.merge_lane or orchestrator.git_ops — so it stays outside both
-merge-lane ratchet gates (scripts/merge_lane_metrics.py::imports_lane_module).
+merge-lane ratchet gates (scripts/merge_lane_cluster.py::imports_lane_module).
 """
 
 from __future__ import annotations

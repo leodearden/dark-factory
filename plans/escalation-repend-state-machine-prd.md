@@ -7,6 +7,8 @@ correctness-class issue — semantics decided here, before decomposition.
 **Goal frame** (shared across the trio): increase throughput by reducing issue-handling and
 scheduling latency, without sacrificing final correctness of code reaching main.
 
+> **Amended 2026-11-14** by plans/info-l0-disposition-router-prd.md (D3; leaf γ, task 5222): D4/C7's third disjunct (`level >= 2`) is narrowed for info. A level ≥ 2 record now gates only when `escalation/src/escalation/pins.py::is_queue_handoff` calls it a queue handoff, so an info record never gates at any level and never short-circuits the escalated wait. The gate is now `(severity == 'blocking' and level == 0) or needs_human(e)` (`orchestrator/src/orchestrator/workflow.py::_is_gating_escalation`, with `needs_human` in `escalation/src/escalation/pins.py`). Disjuncts 1–2, the born-at-L2 stop-the-line and the stale-plain-L1 property are unchanged, and an explicit severity raised by an LLM tier still gates.
+
 ## Goal
 
 One coherent escalation-resolution state machine in which:

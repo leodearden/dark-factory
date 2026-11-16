@@ -124,7 +124,7 @@ class TestHygienePhases:
         # A non-delivered streak for the same dependent — must STILL be GC'd.
         scheduler._streak_local_backfill.counts[('10', '9')] = 2
         # '10' is tracked (pending-age anchor) but drops out of the fetch.
-        scheduler._pending_anchor['10'] = 10
+        scheduler.age_anchors.observe([{'id': '10', 'status': 'pending'}], max_id=10)
 
         ctx = TickContext(
             tasks=[],
@@ -141,7 +141,7 @@ class TestHygienePhases:
         assert scheduler._streak_local_backfill.value(('10', '9')) == 0
         # Bookkeeping cleanup preserved — '10' is still stale-swept.
         assert '10' in ctx.stale_ids
-        assert '10' not in scheduler._pending_anchor
+        assert '10' not in scheduler.age_anchors.tracked_ids()
 
     @pytest.mark.asyncio
     async def test_phase_stale_sweep_still_gcs_delivered_streaks_on_terminal_status(
@@ -151,7 +151,7 @@ class TestHygienePhases:
         GC'd — the protection is narrowed to non-terminal transient absence,
         not a blanket exemption (task 2743)."""
         scheduler._streak_delivered_fail.counts[('11', '21')] = 2
-        scheduler._pending_anchor['11'] = 11
+        scheduler.age_anchors.observe([{'id': '11', 'status': 'pending'}], max_id=11)
 
         ctx = TickContext(
             tasks=[],
@@ -164,7 +164,7 @@ class TestHygienePhases:
         # Terminal → still cleaned up (no leak on genuine completion).
         assert scheduler._streak_delivered_fail.value(('11', '21')) == 0
         assert '11' in ctx.stale_ids
-        assert '11' not in scheduler._pending_anchor
+        assert '11' not in scheduler.age_anchors.tracked_ids()
 
     @pytest.mark.asyncio
     async def test_phase_stale_sweep_protects_external_streaks_on_transient_absence(
@@ -186,7 +186,7 @@ class TestHygienePhases:
         scheduler._streak_hold.counts['10'] = 2
         scheduler._streak_local_backfill.counts[('10', '9')] = 2
         # '10' is tracked (pending-age anchor) but drops out of the fetch.
-        scheduler._pending_anchor['10'] = 10
+        scheduler.age_anchors.observe([{'id': '10', 'status': 'pending'}], max_id=10)
 
         ctx = TickContext(
             tasks=[],
@@ -204,7 +204,7 @@ class TestHygienePhases:
         assert scheduler._streak_local_backfill.value(('10', '9')) == 0
         # Bookkeeping cleanup preserved — '10' is still stale-swept.
         assert '10' in ctx.stale_ids
-        assert '10' not in scheduler._pending_anchor
+        assert '10' not in scheduler.age_anchors.tracked_ids()
 
     @pytest.mark.asyncio
     async def test_phase_stale_sweep_still_gcs_external_streaks_on_terminal_status(
@@ -216,7 +216,7 @@ class TestHygienePhases:
         (task 2746)."""
         scheduler._streak_external_unresolved.counts[('11', 'dark_factory:5')] = 2
         scheduler._streak_resolver_degraded.counts['11'] = 2
-        scheduler._pending_anchor['11'] = 11
+        scheduler.age_anchors.observe([{'id': '11', 'status': 'pending'}], max_id=11)
 
         ctx = TickContext(
             tasks=[],
@@ -230,7 +230,7 @@ class TestHygienePhases:
         assert scheduler._streak_external_unresolved.value(('11', 'dark_factory:5')) == 0
         assert scheduler._streak_resolver_degraded.value('11') == 0
         assert '11' in ctx.stale_ids
-        assert '11' not in scheduler._pending_anchor
+        assert '11' not in scheduler.age_anchors.tracked_ids()
 
     @pytest.mark.asyncio
     async def test_phase_cooldown_gc_drops_expired(self, scheduler: Scheduler):

@@ -244,8 +244,8 @@ def script_root_kind_conflict(script_root: str, kind: str) -> str | None:
     """Why ``before_done`` may not pair *script_root* with *kind*; ``None`` when it may.
 
     The single statement of the predicate-only rule for factory-rooted scripts,
-    called by ``BeforeDone``, the fused-memory submit guard and
-    ``shared.before_done_paths.resolve_script_base``.
+    called by ``BeforeDone`` and ``shared.before_done_paths.resolve_before_done_paths``
+    (which the fused-memory submit guard and the runner both call).
     """
     if script_root == 'factory' and kind != 'predicate':
         return (

@@ -32,6 +32,7 @@ from _workflow_helpers import (
     _make_git_ops,
 )
 from escalation.models import Escalation
+from escalation.note_to_file import file_note_to_file
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
 from test_plan_revalidation_skip import (
@@ -146,6 +147,26 @@ class _FlakyReviewerStub(AgentStub):
         if self.reviewer_attempts == 1:
             return AgentResult(success=False, output='Connection refused', cost_usd=0.0)
         return super()._reviewer(role, output_schema)
+
+
+class _NoteFilingImplementerStub(AgentStub):
+    """The implementer files one note to file on its first turn, as a deviation note."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.queue: EscalationQueue | None = None
+        self.notes: list[str] = []
+
+    async def _implementer(self, cwd: Path) -> AgentResult:
+        if not self.notes:
+            assert self.queue is not None
+            filed = file_note_to_file(self.queue, Escalation(
+                id=self.queue.make_id(TASK_ID), task_id=TASK_ID, agent_role='implementer',
+                severity='info', category='design_concern',
+                summary='deviated from step-1: kept the helper private', note_to_file=True,
+            ))
+            self.notes.append(filed['id'])
+        return await super()._implementer(cwd)
 
 
 def _declared_simple(assignment: TaskAssignment) -> TaskAssignment:
@@ -308,6 +329,24 @@ class TestAFullRunBriefsTheRulings:
         assert run.briefing.briefed
         assert all(ids == [] for _builder, ids in run.briefing.briefed)
         assert run.briefed_rows() == []
+
+    async def test_an_implementer_s_note_to_file_is_never_briefed_as_a_ruling(
+        self, tmp_path, monkeypatch,
+    ):
+        stub = _NoteFilingImplementerStub()
+        run = _FullRun(tmp_path, monkeypatch, stub=stub)
+        stub.queue = run.queue
+        ruling = _resolve_ruling(run.queue, TASK_ID)
+
+        assert await run.run() == WorkflowOutcome.DONE
+
+        assert len(stub.notes) == 1
+        note = run.queue.get(stub.notes[0])
+        assert note is not None and note.status == 'resolved'
+        reviewer = run.briefing.rulings_for('build_reviewer_prompt')
+        assert reviewer
+        assert all(ids == [ruling] for ids in reviewer)
+        assert all(note.id not in row['data']['escalation_ids'] for row in run.briefed_rows())
 
     async def test_a_queue_fault_costs_only_the_rulings(self, tmp_path, monkeypatch):
         run = _FullRun(tmp_path, monkeypatch)

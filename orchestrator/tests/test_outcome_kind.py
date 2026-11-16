@@ -2,7 +2,7 @@
 
 Task 2165: ``OutcomeKind(StrEnum)`` is the enumerated contract for the
 ``data['outcome']`` values emitted by ``_emit_merge_attempt`` (merge_queue.py).
-These tests pin: the exact 23-member vocabulary, str-compatibility (existing
+These tests pin: the exact 24-member vocabulary, str-compatibility (existing
 ``==``/``in``/json comparisons must keep working unchanged), the
 ``is_terminal`` classification, byte-identical payloads through the real
 ``EventStore`` emit chokepoint, and the non-terminal set as a frozen contract
@@ -23,7 +23,7 @@ from orchestrator.event_store import EventStore
 from orchestrator.merge_lane.types import OutcomeKind
 from orchestrator.merge_lane.worker import _emit_merge_attempt
 
-# The exact 23-member vocabulary emitted through _emit_merge_attempt (see its
+# The exact 24-member vocabulary emitted through _emit_merge_attempt (see its
 # docstring at merge_queue.py:1363 and plans/dashboard-alignment-prd.md).
 # 'blocked' is intentionally excluded: bare-infrastructure 'blocked' outcomes
 # are documented as NOT emitted by _emit_merge_attempt.
@@ -38,6 +38,9 @@ _EXPECTED_VALUES = {
     # sibling `plan_files_cross_repo`: both name a branch that is legitimately
     # EMPTY, so there is nothing left for a retry to do.
     'plan_files_already_landed',
+    # Task 3918 — a not-touched verdict that measured nothing; terminal like
+    # `plan_files_already_landed`.
+    'plan_files_unmeasured',
     'cas_retry', 'gate_retry', 'post_merge_generation_chained',
 }
 
@@ -49,7 +52,7 @@ _NON_TERMINAL_VALUES = {
 
 
 class TestOutcomeKindVocabulary:
-    """The enum's value set is exactly the 23-member _emit_merge_attempt vocabulary."""
+    """The enum's value set is exactly the 24-member _emit_merge_attempt vocabulary."""
 
     def test_value_set_is_exact(self) -> None:
         assert {m.value for m in OutcomeKind} == _EXPECTED_VALUES
@@ -85,7 +88,7 @@ class TestOutcomeKindIsTerminal:
 
     def test_terminal_members_are_terminal(self) -> None:
         terminal_values = _EXPECTED_VALUES - _NON_TERMINAL_VALUES
-        assert len(terminal_values) == 19
+        assert len(terminal_values) == 20
         for value in terminal_values:
             member = OutcomeKind(value)
             assert member.is_terminal is True, f'{member!r} should be terminal'
@@ -102,6 +105,9 @@ class TestOutcomeKindIsTerminal:
         assert (
             OutcomeKind.plan_files_already_landed not in _NON_TERMINAL_OUTCOMES
         )
+
+    def test_plan_files_unmeasured_is_terminal(self) -> None:
+        assert OutcomeKind.plan_files_unmeasured.is_terminal is True
 
     def test_plan_files_cross_repo_is_terminal(self) -> None:
         """The new cross-repo outcome is TERMINAL (ends the merge attempt) and

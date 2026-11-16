@@ -69,14 +69,13 @@ mechanisms together, not the cap in isolation.
 Mirrors :meth:`ReconciliationHarness._reconcile_status_correction` /
 ``_delete_status_correction_memories``'s read-compare-supersede,
 add-then-delete pool-cap pattern, and reuses
-:func:`fused_memory.reconciliation.flag_dedup._content_fingerprint` for a
+:func:`fused_memory.reconciliation.flag_identity.content_fingerprint` for a
 deterministic description fingerprint (avoids storing full description text
 in the snapshot payload).
 
-This module has no imports from ``harness`` or ``stages/`` (other than the
-pure ``flag_dedup`` fingerprint helper) — callers inject ``memory_service``,
-``taskmaster``, and a ``resolve_project_root`` callable, keeping it
-decoupled and unit-testable without a real harness.
+This module has no imports from ``harness`` or ``stages/`` — callers inject
+``memory_service``, ``taskmaster``, and a ``resolve_project_root`` callable,
+keeping it decoupled and unit-testable without a real harness.
 """
 
 from __future__ import annotations
@@ -86,7 +85,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from fused_memory.reconciliation.flag_dedup import _content_fingerprint
+from fused_memory.reconciliation.flag_identity import content_fingerprint
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -233,7 +232,7 @@ def build_scope_snapshot_metadata(
     ``'dark_factory:2405'``) + ``flag_type=flag_key`` — the pair
     :func:`precheck_scope_correction_freshness` queries back on the next
     cycle via ``get_memories_by_metadata``.  ``subject_description_fingerprint``
-    reuses :func:`fused_memory.reconciliation.flag_dedup._content_fingerprint`
+    reuses :func:`fused_memory.reconciliation.flag_identity.content_fingerprint`
     (deterministic SHA-256 of the normalized description) rather than storing
     the full description text.
 
@@ -256,7 +255,7 @@ def build_scope_snapshot_metadata(
         'subject_task_id': subject_task_id,
         'subject_status': status,
         'subject_updated_at': updated_at,
-        'subject_description_fingerprint': _content_fingerprint(description or ''),
+        'subject_description_fingerprint': content_fingerprint(description or ''),
         'run_id': run_id,
         'snapshot_at': snapshot_at,
         'skip_streak': skip_streak,
@@ -297,7 +296,7 @@ def snapshot_is_fresh(snapshot_metadata: dict[str, Any], live_task: Any) -> bool
 
     Requires ALL THREE of live ``status``, ``updatedAt``, and the
     content-fingerprint of ``description`` (via
-    :func:`fused_memory.reconciliation.flag_dedup._content_fingerprint`) to
+    :func:`fused_memory.reconciliation.flag_identity.content_fingerprint`) to
     equal the snapshot's ``subject_status``, ``subject_updated_at``, and
     ``subject_description_fingerprint`` respectively.  ``updatedAt`` is the
     load-bearing signal — sqlite_task_backend always advances it on any
@@ -320,7 +319,7 @@ def snapshot_is_fresh(snapshot_metadata: dict[str, Any], live_task: Any) -> bool
         return False
     if updated_at != snapshot_metadata['subject_updated_at']:
         return False
-    return _content_fingerprint(description or '') == snapshot_metadata['subject_description_fingerprint']
+    return content_fingerprint(description or '') == snapshot_metadata['subject_description_fingerprint']
 
 
 async def _pool_cap_scope_snapshots(

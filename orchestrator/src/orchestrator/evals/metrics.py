@@ -470,7 +470,7 @@ def read_decline_artifacts(
             continue
         try:
             artifact = reader()
-        except Exception as exc:                       # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'decline artifact %s unreadable (%s): %s', kind,
                 type(exc).__name__, exc,

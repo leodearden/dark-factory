@@ -21,7 +21,6 @@ from fused_memory.models.reconciliation import (
     ContextItem,
     EventType,
     ReconciliationEvent,
-    Watermark,
 )
 from fused_memory.reconciliation.child_memory_link import render_parent_link
 from fused_memory.services.read_telemetry import (
@@ -127,7 +126,6 @@ class ContextAssembler:
     async def assemble(
         self,
         events: list[ReconciliationEvent],
-        watermark: Watermark,
         project_id: str,
     ) -> AssembledPayload:
         """Build a token-budgeted payload from events with per-event context.

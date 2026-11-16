@@ -26,6 +26,7 @@ from fused_memory.backends.task_backend_types import (
     RemoveTaskResult,
     SetTaskStatusResult,
     StatusWriteNotPersistedResult,
+    TaskFactsRow,
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
@@ -99,6 +100,12 @@ class TaskBackendProtocol(Protocol):
         ids: list[str] | None = None,
     ) -> dict[str, str]:
         """Return ``{id_str: status_str}`` without decoding metadata columns."""
+        ...
+
+    async def get_task_facts(
+        self, ids: Sequence[str], project_root: str,
+    ) -> dict[str, TaskFactsRow]:
+        """Status, title, dependencies and done provenance of *ids*; see plans/live-task-facts-at-recall-prd.md C1."""
         ...
 
     async def get_statuses(

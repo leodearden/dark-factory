@@ -146,7 +146,7 @@ from orchestrator.main_health_fix_owner import (
     ensure_main_fix_owner,
 )
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
-from orchestrator.merge_lane.gates import declaration_coverage
+from orchestrator.merge_lane.gates import PlanFilesTouchedResult, declaration_coverage
 from orchestrator.merge_lane.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
     LandingReason,
@@ -156,7 +156,12 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_reported_landing,
 )
 from orchestrator.merge_lane.train_selection import select_train_members
-from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.types import OutcomeKind, QueuedBranch
+from orchestrator.merge_lane.unmeasured_delivery import (
+    UnmeasuredDelivery,
+    diagnose_unmeasured_branch,
+    find_work_on_sibling_ref,
+)
 from orchestrator.merger_failure import merger_failure_report
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.plan_descope import (
@@ -166,7 +171,7 @@ from orchestrator.plan_descope import (
     done_step_records,
 )
 from orchestrator.recovery_pins import records_pin_blocked_recovery
-from orchestrator.recut_ruling import ruling_to_enforce
+from orchestrator.recut_ruling import recut_supersession, ruling_to_enforce
 from orchestrator.resume_resolution import (
     CarriedResolution,
     render_carried_resolutions,
@@ -217,6 +222,7 @@ from orchestrator.stranded_verified_green import (
     merge_request_marker_is_fresh,
     submit_verified_green_merge_request,
 )
+from orchestrator.task_priority import TaskPriorityLookup
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_STATUSES,
@@ -737,6 +743,9 @@ logger = logging.getLogger(__name__)
 # Mirrors the _inherited_break_info pattern: set by _execute_iterations, consumed
 # at the BLOCKED route in _execute_verify_review_loop (task 1739).
 ZERO_OUTPUT_HANG_REASON = 'infra: zero-output CLI hang (consecutive fresh-invocation timeouts)'
+
+# Bound, in characters, on each output tail a zero-output evidence JSON keeps.
+_ZERO_OUTPUT_EVIDENCE_TAIL_CHARS = 4000
 
 # Reason string used when the progress-resume churn circuit breaker trips:
 # config.max_progress_resume_iterations ceiling-kill+resume cycles of a
@@ -1378,6 +1387,7 @@ class TaskWorkflow:
         prompt_store: PromptArtifactStore | None = None,
         resume_outcome_sink: ResumeOutcomeSink | None = None,
         task_verify: TaskVerifyPort | None = None,
+        task_priority: TaskPriorityLookup | None = None,
     ):
         self.assignment = assignment
         self.config = config
@@ -1407,6 +1417,9 @@ class TaskWorkflow:
         # TaskVerifyDispatcher); None keeps the module-level
         # run_scoped_verification, resolved at call time.
         self._task_verify = task_verify
+        # Task 9908: the scheduler's tier/pin lookup, recorded on merge_queued;
+        # None leaves those keys null.
+        self._task_priority = task_priority
 
         self.machine = WorkflowStateMachine(WorkflowState.PLAN)
         self._phase_cost_at_entry: float = 0.0
@@ -2043,6 +2056,7 @@ class TaskWorkflow:
         # coalescing after the train merge starts executing.
         await register_and_enqueue_merge_request(
             self.merge_queue, req, self.event_store, self.merge_inflight_registry,
+            task_priority=self._task_priority,
         )
 
         # W9-θ: a cancel-win now raises WorkflowCancelled('soft') instead of
@@ -4007,7 +4021,7 @@ class TaskWorkflow:
             return None
         try:
             rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=self.worktree)
-        except Exception as exc:  # noqa: BLE001 — fail-safe: fall through to full pipeline
+        except Exception as exc:  # fail-safe: fall through to full pipeline
             logger.warning(
                 'Task %s: could not read worktree HEAD resolving '
                 'merge_retry_pending (%s) — running full pipeline',
@@ -4039,7 +4053,7 @@ class TaskWorkflow:
         try:
             main_sha = await self.git_ops.get_main_sha()
             probe = await self.git_ops.merge_tree_conflicts(main_sha, current_head)
-        except Exception as exc:  # noqa: BLE001 — fail-safe: fall through to full pipeline
+        except Exception as exc:  # fail-safe: fall through to full pipeline
             # A probe FAILURE is not a conflict VERDICT: it says nothing about
             # whether the branch still merges.  So fall back to the full
             # pipeline for this dispatch but leave the durable stamp intact for
@@ -6346,7 +6360,7 @@ class TaskWorkflow:
 
         try:
             result = await self._invoke(SIMPLE_TASK, build_prompt, self.worktree)
-        except Exception as exc:  # noqa: BLE001 — fall through to architect
+        except Exception as exc:  # fall through to architect
             logger.warning(
                 'Task %s: SIMPLE_TASK invocation failed (%s) — '
                 'falling through to architect path',
@@ -6506,7 +6520,7 @@ class TaskWorkflow:
                 {'optimistic_path': kind},
                 metadata_mode='merge',  # type: ignore[reportCallIssue]
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort
+        except Exception as exc:  # best-effort
             logger.warning(
                 'Task %s: failed to stamp optimistic_path=%s: %s',
                 self.task_id, kind, exc,
@@ -6689,7 +6703,7 @@ class TaskWorkflow:
         """
         try:
             fresh_task = await self.scheduler.get_task(self.task_id)
-        except Exception as exc:  # noqa: BLE001 — best-effort unless require_fresh
+        except Exception as exc:  # best-effort unless require_fresh
             if require_fresh:
                 logger.warning(
                     'Task %s: failed to refresh metadata before %s write; '
@@ -6835,7 +6849,7 @@ class TaskWorkflow:
         """
         try:
             current_main_sha = await self.git_ops.get_main_sha()
-        except Exception as exc:  # noqa: BLE001 — fall through to standard path
+        except Exception as exc:  # fall through to standard path
             logger.warning(
                 'Task %s: could not read main SHA for no-plan cycle counter: %s',
                 self.task_id, exc,
@@ -6857,7 +6871,7 @@ class TaskWorkflow:
         self.task['metadata'] = new_metadata
         try:
             await self.scheduler.update_task(self.task_id, metadata=new_metadata)
-        except Exception as exc:  # noqa: BLE001 — counter can't be trusted; escalate.
+        except Exception as exc:  # counter can't be trusted; escalate.
             logger.warning(
                 'Task %s: failed to persist no-plan cycle counter; '
                 'escalating to human (counter cannot be trusted): %s',
@@ -7062,7 +7076,7 @@ class TaskWorkflow:
             await self.scheduler.update_task(
                 self.task_id, metadata=new_metadata,
             )
-        except Exception as exc:  # noqa: BLE001 — counter can't be trusted; escalate.
+        except Exception as exc:  # counter can't be trusted; escalate.
             logger.warning(
                 'Task %s: failed to persist infra-resume thrash counter; '
                 'escalating to human (counter cannot be trusted): %s',
@@ -7179,7 +7193,7 @@ class TaskWorkflow:
             await self.scheduler.update_task(
                 self.task_id, metadata=new_metadata,
             )
-        except Exception as exc:  # noqa: BLE001 — counter can't be trusted; escalate.
+        except Exception as exc:  # counter can't be trusted; escalate.
             logger.warning(
                 'Task %s: failed to persist merge-thrash counter; '
                 'escalating to human (counter cannot be trusted): %s',
@@ -7304,7 +7318,7 @@ class TaskWorkflow:
             await self.scheduler.update_task(
                 self.task_id, metadata=fresh,
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+        except Exception as exc:  # best-effort, log and proceed
             logger.warning(
                 'Task %s: failed to persist merge_first_enqueued_at: %s',
                 self.task_id, exc,
@@ -7332,7 +7346,7 @@ class TaskWorkflow:
         """
         try:
             rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=self.worktree)
-        except Exception as exc:  # noqa: BLE001 — best-effort, log and skip
+        except Exception as exc:  # best-effort, log and skip
             logger.warning(
                 'Task %s: could not read worktree HEAD for merge_retry_pending '
                 'stamp (skipping durable stamp): %s', self.task_id, exc,
@@ -7348,7 +7362,7 @@ class TaskWorkflow:
             return
         try:
             base_sha = await self.git_ops.get_main_sha()
-        except Exception as exc:  # noqa: BLE001 — base_sha is advisory context only
+        except Exception as exc:  # base_sha is advisory context only
             logger.warning(
                 'Task %s: could not read main SHA for merge_retry_pending stamp: %s',
                 self.task_id, exc,
@@ -7367,7 +7381,7 @@ class TaskWorkflow:
         self.task['metadata'] = fresh
         try:
             await self.scheduler.update_task(self.task_id, metadata=fresh)
-        except Exception as exc:  # noqa: BLE001 — durability best-effort, never fatal
+        except Exception as exc:  # durability best-effort, never fatal
             logger.warning(
                 'Task %s: failed to persist merge_retry_pending stamp '
                 '(retry obligation not durable this cycle): %s',
@@ -7463,7 +7477,7 @@ class TaskWorkflow:
                 # Protocol is outside task 3024's scope — see escalate_info.
                 metadata_mode='replace',  # type: ignore[reportCallIssue]
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
+        except Exception as exc:  # best-effort, never fatal
             logger.warning(
                 'Task %s: could not clear merge_retry_pending (metadata refresh or '
                 'persist failed) — leaving the stamp in place; a later dispatch '
@@ -7538,7 +7552,7 @@ class TaskWorkflow:
         self.task['metadata'] = fresh
         try:
             await self.scheduler.update_task(self.task_id, metadata=fresh)
-        except Exception as exc:  # noqa: BLE001 — durability best-effort, never fatal
+        except Exception as exc:  # durability best-effort, never fatal
             logger.warning(
                 'Task %s: failed to persist merge_phase_liveness stamp '
                 '(merge-phase liveness not durable this cycle): %s',
@@ -7629,7 +7643,7 @@ class TaskWorkflow:
                 metadata=fresh,
                 metadata_mode='replace',  # type: ignore[reportCallIssue]
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
+        except Exception as exc:  # best-effort, never fatal
             logger.warning(
                 'Task %s: failed to persist merge_phase_liveness clear: %s',
                 self.task_id, exc,
@@ -7751,7 +7765,7 @@ class TaskWorkflow:
                 },
                 timeout=15,
             )
-        except Exception as exc:  # noqa: BLE001 — best-effort, log and proceed
+        except Exception as exc:  # best-effort, log and proceed
             logger.warning(
                 'Task %s: add_dependency(%s -> %s) failed: %s — proceeding '
                 'with requeue anyway',
@@ -8548,7 +8562,7 @@ class TaskWorkflow:
                 )
                 return
 
-            from escalation.models import Escalation  # noqa: PLC0415
+            from escalation.models import Escalation
 
             esc = Escalation(
                 id=self.escalation_queue.make_id(self.task_id),
@@ -9486,7 +9500,7 @@ class TaskWorkflow:
                             f'consecutive_zero_output={consecutive_zero_output} '
                             f'at_iteration_cap=True '
                             f'iteration={self.metrics.execute_iterations} '
-                            f'evidence: .task/zero_output_evidence-iter*.json'
+                            f'evidence: {self.artifacts.zero_output_evidence_glob()}'
                         ),
                     }
                 elif consecutive_progress_timeouts > 0:
@@ -9676,7 +9690,7 @@ class TaskWorkflow:
                             f'iteration={self.metrics.execute_iterations} '
                             f'duration_ms={result.duration_ms} '
                             f'subtype={result.subtype!r} '
-                            f'evidence: .task/zero_output_evidence-iter*.json'
+                            f'evidence: {self.artifacts.zero_output_evidence_glob()}'
                         ),
                     }
                     self._preserve_config_dir = True
@@ -9935,13 +9949,14 @@ class TaskWorkflow:
         self._archive_then_cleanup_config_dir()
 
     def _capture_zero_output_evidence(self, result: AgentResult, iteration: int) -> None:
-        """Persist forensic evidence for a zero-output CLI timeout to .task/.
+        """Persist forensic evidence for a zero-output CLI timeout.
 
-        Called on EVERY zero-output timeout in ``_execute_iterations`` (before
-        the threshold check) so both sub-threshold and tripping occurrences
-        are captured.  Writes to the task root, which outlives the per-task
-        ``TaskConfigDir`` cleanup and the BLOCKED worktree (not GC'd since the
-        task is not DONE).
+        Called on EVERY zero-output timeout in ``_execute_iterations``,
+        including the 5xx-attributed one that requeues, before any breaker
+        check.  Writes to ``self.artifacts.zero_output_evidence_path``, which
+        lies under the TASK root (``TaskArtifacts.task_root_for``) outside the
+        worktree, so it survives ``TaskConfigDir`` cleanup and worktree reset
+        or reuse.
 
         Best-effort: any I/O failure is caught and logged rather than
         propagated — evidence capture must never crash the iteration loop.
@@ -9969,7 +9984,9 @@ class TaskWorkflow:
                 'turns': result.turns,
                 'cost_usd': result.cost_usd,
                 'subtype': result.subtype,
-                'stderr_tail': (result.stderr or '')[-4000:],
+                'api_error_status': result.api_error_status,
+                'output_tail': (result.output or '')[-_ZERO_OUTPUT_EVIDENCE_TAIL_CHARS:],
+                'stderr_tail': (result.stderr or '')[-_ZERO_OUTPUT_EVIDENCE_TAIL_CHARS:],
                 'proc_tree': result.proc_tree,
                 'config_dir': config_dir_str,
                 'config_dir_listing': config_dir_listing,
@@ -12327,6 +12344,41 @@ class TaskWorkflow:
             )
         return None
 
+    async def _block_if_delivery_unmeasured(
+        self, finding: UnmeasuredDelivery | None, *, merge_phase: bool,
+    ) -> WorkflowOutcome | None:
+        """Block with *finding*'s remedy; None when there is no finding."""
+        from orchestrator.merge_lane.worker import _emit_merge_attempt
+
+        if finding is None:
+            return None
+        _emit_merge_attempt(
+            self.event_store, self.task_id, OutcomeKind.plan_files_unmeasured,
+        )
+        return await self._mark_blocked(
+            finding.block_reason(),
+            merge_phase=merge_phase,
+            category='plan_delivery_unmeasured',
+            suggested_action=finding.suggested_action,
+        )
+
+    async def _work_on_sibling_ref(
+        self, check: PlanFilesTouchedResult, branch: str, head: str,
+    ) -> UnmeasuredDelivery | None:
+        """*check*'s work on a sibling ref no executed re-cut ruling superseded.
+
+        Reads the metadata fresh: the dispatch gate persists ``recut_executed``
+        after ``self.task`` was read, so the first incarnation after a re-cut
+        would otherwise miss it.
+        """
+        fresh = await self._merge_fresh_metadata(
+            self.task.get('metadata') or {}, log_context='sibling-ref diagnosis',
+        )
+        return await find_work_on_sibling_ref(
+            check, self.git_ops, branch=branch, head=head, task_id=self.task_id,
+            superseded=recut_supersession({'id': self.task_id, 'metadata': fresh}),
+        )
+
     async def _submit_to_merge_queue(
         self, branch_name: str, pre_rebased: bool = False,
         *, merge_phase: bool = False,
@@ -12356,7 +12408,6 @@ class TaskWorkflow:
         from orchestrator.merge_lane.tip_relation import AttachAction, resolve_attach_action
         from orchestrator.merge_lane.worker import (
             MergeRequest,
-            OutcomeKind,
             _emit_merge_attempt,
         )
 
@@ -12370,7 +12421,14 @@ class TaskWorkflow:
         # steward) is allowed to mediate, and only to drop genuinely
         # unneeded entries.  Adding new files is rejected by the helper's
         # subset check.  The gate's re-check is the source of truth for
-        # pass/fail.
+        # pass/fail.  A range that never measured the task's own work proves
+        # nothing: its in-branch causes are diagnosed before the already-landed
+        # carve-out, work on a sibling ref only after that carve-out declines
+        # and only for a HEAD with no own commits, and both before narrowing;
+        # a ref superseded by a re-cut ruling is never offered.  The re-check
+        # after narrowing repeats only the in-branch diagnosis: narrowing
+        # creates no ref.  See merge_lane/unmeasured_delivery.py and
+        # recut_ruling.py::RecutSupersession.
         if (
             self._task_files
             and self._base_commit is not None
@@ -12418,6 +12476,9 @@ class TaskWorkflow:
                 ['git', 'rev-parse', 'HEAD'], cwd=self.worktree,
             )
             if rc == 0 and branch_head.strip():
+                canonical_branch = (
+                    f'{self.config.git.branch_prefix}{branch_name.split("/")[-1]}'
+                )
                 own_base = await self._own_work_base()
                 check = await _check_plan_files_touched_in_branch(
                     list(self._task_files),
@@ -12428,6 +12489,14 @@ class TaskWorkflow:
                 )
                 narrowing_succeeded = False
                 if check.not_touched:
+                    unmeasured = await self._block_if_delivery_unmeasured(
+                        await diagnose_unmeasured_branch(
+                            check, self.worktree, task_id=self.task_id,
+                        ),
+                        merge_phase=merge_phase,
+                    )
+                    if unmeasured is not None:
+                        return unmeasured
                     # ALREADY-LANDED carve-out (task 3539).  Sited INSIDE the
                     # already-failing arm and BEFORE the narrowing pass — not
                     # alongside the cross-repo check at the top of the block —
@@ -12517,10 +12586,7 @@ class TaskWorkflow:
                         # correct for a prefixed caller too, instead of
                         # silently producing `task/task/<id>` and failing
                         # closed on a marker that is really there.
-                        branch=(
-                            f'{self.config.git.branch_prefix}'
-                            f'{branch_name.split("/")[-1]}'
-                        ),
+                        branch=canonical_branch,
                     )
                     if already_landed is not None:
                         _emit_merge_attempt(
@@ -12546,6 +12612,14 @@ class TaskWorkflow:
                             category='already_landed',
                             suggested_action='verify_landing_and_close',
                         )
+                    unmeasured = await self._block_if_delivery_unmeasured(
+                        await self._work_on_sibling_ref(
+                            check, canonical_branch, branch_head.strip(),
+                        ),
+                        merge_phase=merge_phase,
+                    )
+                    if unmeasured is not None:
+                        return unmeasured
                     narrowed = await self._try_narrow_plan(check.not_touched)
                     exit_outcome = await self._consume_narrowing_exit_report(
                         merge_phase=merge_phase,
@@ -12567,6 +12641,15 @@ class TaskWorkflow:
                             )
                             if not check.not_touched:
                                 narrowing_succeeded = True
+                            else:
+                                unmeasured = await self._block_if_delivery_unmeasured(
+                                    await diagnose_unmeasured_branch(
+                                        check, self.worktree, task_id=self.task_id,
+                                    ),
+                                    merge_phase=merge_phase,
+                                )
+                                if unmeasured is not None:
+                                    return unmeasured
                 if check.not_touched:
                     # Task 3110 — the message is CLASS-SCOPED, because the
                     # gate's two failure classes are different failures.
@@ -12732,6 +12815,7 @@ class TaskWorkflow:
         if not attached:
             _acquired = await register_and_enqueue_merge_request(
                 self.merge_queue, merge_request, self.event_store, self.merge_inflight_registry,
+                task_priority=self._task_priority,
             )
 
         # task 2753: the request is now on the durable, crash-safe merge journal
@@ -13666,17 +13750,30 @@ class TaskWorkflow:
             self.task_id, context,
         )
 
+    async def _solo_upstream(self, member_ids: list[str], index: int) -> str | None:
+        """The ref member *index*'s own commits sit on: a successor's
+        predecessor branch, or wherever the anchor's own delta starts, which is
+        above any unlanded stack base an earlier train left under it (task
+        6300), not necessarily main.  None when that cannot be told.
+        """
+        prefix = self.git_ops.config.branch_prefix
+        if index > 0:
+            return f'{prefix}{member_ids[index - 1]}'
+        return await self.git_ops.own_delta_upstream(f'{prefix}{member_ids[0]}')
+
     async def _reverify_one_member(
         self,
         member: dict,
-        predecessor_ref: str,
+        upstream: str | None,
     ) -> SoloVerifyResult:
         """Un-stack a member's own delta onto main and verify it in isolation.
 
-        1. Call ``git_ops.materialize_member_solo(member_id, predecessor_ref)``
+        1. Call ``git_ops.materialize_member_solo(member_id, upstream)``
            to create an isolated worktree carrying only this member's commits.
-        2. If the un-stack fails (returns None — rebase conflict), return a
-           failed result with reason='unstackable'.
+        2. If there is no *upstream* (its own delta cannot be told
+           apart; nothing is materialized) or the un-stack fails (returns
+           None — rebase conflict), return a failed result with
+           reason='unstackable'.
         3. Otherwise call ``merge_queue.reverify_member_solo`` (verify-only;
            never advances main) and return its result.
         """
@@ -13686,8 +13783,8 @@ class TaskWorkflow:
         )
 
         member_id = str(member.get('id', ''))
-        solo_wt_info = await self.git_ops.materialize_member_solo(
-            member_id, predecessor_ref,
+        solo_wt_info = None if upstream is None else (
+            await self.git_ops.materialize_member_solo(member_id, upstream)
         )
         if solo_wt_info is None:
             return SoloVerifyResult(
@@ -13727,7 +13824,11 @@ class TaskWorkflow:
         Design (δ):
         - For each member root→tip, un-stack its own delta onto current main via
           ``_reverify_one_member`` (wraps materialize_member_solo +
-          reverify_member_solo; never advances).  Exactly N solo verifies.
+          reverify_member_solo; never advances).  At most N solo verifies.
+          The anchor's delta starts at ``GitOps.own_delta_upstream`` rather
+          than at main (task 6300), so it never carries an unlanded stack
+          base's commits; when that cannot be told, the anchor is an
+          un-stackable failer.
         - Partition into passers / failers (un-stack conflict → failer).
         - All pass → genuine cross-member INTERACTION: emit train_derailed
           (verdict='interaction'), escalate the train, land nothing.
@@ -13750,7 +13851,7 @@ class TaskWorkflow:
           and neither does a failed revert.
         """
         # Sort members by their metadata train 'order' (root→tip) so that the
-        # predecessor_ref computation is correct regardless of caller-side ordering.
+        # _solo_upstream computation is correct regardless of caller-side ordering.
         # tasks_by_train normally returns them sorted, but attributing the right
         # delta to each member depends on strict stacking order — a silently
         # mis-ordered list would rebase against the wrong predecessor, either
@@ -13762,22 +13863,18 @@ class TaskWorkflow:
         )
 
         member_ids = [str(m.get('id', '')) for m in members]
-        branch_prefix = self.git_ops.config.branch_prefix
-        main_branch = self.git_ops.config.main_branch
 
         logger.info(
             'Task %s: train %r union verify failed — re-verifying %d members as singles',
             self.task_id, train_id, len(members),
         )
 
-        # Collect per-member solo verify results (root→tip; N verifies total).
+        # Collect per-member solo verify results (root→tip; at most N verifies).
         solo_results: list[SoloVerifyResult] = []
         for i, member in enumerate(members):
-            predecessor_ref = (
-                main_branch if i == 0
-                else f'{branch_prefix}{members[i - 1].get("id", "")}'
+            solo = await self._reverify_one_member(
+                member, await self._solo_upstream(member_ids, i),
             )
-            solo = await self._reverify_one_member(member, predecessor_ref)
             solo_results.append(solo)
             logger.debug(
                 'Task %s: member %s solo verify: passed=%s reason=%r',
@@ -13795,7 +13892,7 @@ class TaskWorkflow:
                 if sr.solo_wt is not None:
                     try:
                         await self.git_ops.cleanup_merge_worktree(sr.solo_wt)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             'Task %s: all-pass teardown: cleanup_merge_worktree '
                             'failed for member %s', self.task_id, sr.member_id,
@@ -13804,7 +13901,7 @@ class TaskWorkflow:
                 if sr.solo_branch is not None:
                     try:
                         await self.git_ops.delete_solo_branch(sr.solo_branch)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             'Task %s: all-pass teardown: delete_solo_branch '
                             'failed for member %s', self.task_id, sr.member_id,
@@ -13864,7 +13961,7 @@ class TaskWorkflow:
                     reverify_on_rebase=False,
                 )
                 adv = outcome.result
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 # advance_main raised (unexpected); leave member parked for
                 # re-dispatch and continue processing the remaining passers.
                 logger.warning(
@@ -13881,7 +13978,7 @@ class TaskWorkflow:
                 if r.solo_wt is not None:
                     try:
                         await self.git_ops.cleanup_merge_worktree(r.solo_wt)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             'Task %s: passer teardown: cleanup_merge_worktree '
                             'failed for member %s', self.task_id, r.member_id,
@@ -13890,7 +13987,7 @@ class TaskWorkflow:
                 if r.solo_branch is not None:
                     try:
                         await self.git_ops.delete_solo_branch(r.solo_branch)
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             'Task %s: passer teardown: delete_solo_branch '
                             'failed for member %s', self.task_id, r.member_id,
@@ -15857,7 +15954,7 @@ class TaskWorkflow:
             remaining = deadline - asyncio.get_event_loop().time()
             try:
                 if remaining <= 0:
-                    raise TimeoutError  # noqa: TRY301 — uniform expiry handling
+                    raise TimeoutError  # uniform expiry handling
                 await asyncio.wait_for(self._escalation_event.wait(), remaining)
             except TimeoutError:  # asyncio.TimeoutError is an alias since 3.11
                 # Before giving up: is the steward observably still working?
@@ -16318,7 +16415,7 @@ class TaskWorkflow:
         """
         try:
             await self.scheduler.set_task_status(mid, 'pending')
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 'Task %s: train %r member %s (%s) — delivered-checks withheld '
                 'but the revert to pending FAILED; member remains '
@@ -16387,7 +16484,7 @@ class TaskWorkflow:
             return None
         try:
             member = await self.scheduler.get_task(mid)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 'Task %s: could not read member %s metadata for the '
                 'delivered-checks guard (%s) — withholding the done-stamp',
@@ -16405,7 +16502,7 @@ class TaskWorkflow:
             return await self._delivered_checks_block(
                 mid, (member.get('metadata') or {}), site=site,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning(
                 'Task %s: delivered-checks guard errored for member %s (%s) '
                 '— withholding the done-stamp',
@@ -19782,6 +19879,7 @@ def build_workflow(
     run_id: str | None = None,
     resume_outcome_sink: ResumeOutcomeSink | None = None,
     task_verify: TaskVerifyPort | None = None,
+    task_priority: TaskPriorityLookup | None = None,
 ) -> TaskWorkflow:
     """Single construction point for :class:`TaskWorkflow` (PRD C2 / Invariant P2).
 
@@ -19818,4 +19916,5 @@ def build_workflow(
         run_id=run_id,
         resume_outcome_sink=resume_outcome_sink,
         task_verify=task_verify,
+        task_priority=task_priority,
     )

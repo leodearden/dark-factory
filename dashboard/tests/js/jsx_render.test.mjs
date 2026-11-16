@@ -11,8 +11,24 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { caughtFrom } from './_caught.mjs';
-import { allowAsyncAct, click, openWindow, settle, stubFetch } from './_render_helpers.mjs';
-import { buildDashboardWindow, seedDashboardData } from './dom_harness.mjs';
+import {
+  NOTICE_SELECTOR,
+  UNIT_NOTICE_TESTID,
+  allowAsyncAct,
+  assertReportsOnlyContainedThrows,
+  assertSiblingRenders,
+  click,
+  failureNotices,
+  graphNode,
+  mountInsideBoundary,
+  noticeLines,
+  openContainingWindow,
+  openTab,
+  openWindow,
+  settle,
+  stubFetch,
+} from './_render_helpers.mjs';
+import { seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
   escalationAnalytics,
@@ -68,10 +84,6 @@ function seedOneTask(window, task) {
 function orchTaskRow(window, container, task) {
   const idText = window.DF_SHELL.taskId(task.id);
   return [...container.querySelectorAll('tbody tr')].find(tr => tr.querySelector('td')?.textContent === idText);
-}
-
-function graphNode(container, task) {
-  return [...container.querySelectorAll('.node')].find(node => node.querySelector('.ttl')?.textContent === task.title);
 }
 
 // By PRD is the Tasks tab's default view, and it draws no graph until a lanes
@@ -545,59 +557,8 @@ test('tabs.jsx::PerfTab Completion paths gives every slice its own PALETTE.paths
 });
 
 // ── Decision 6: a render throw is contained, and its notice is render_failure.js's ──
-// React's development build reports every throw a boundary catches on
-// console.error: jsdom's report of the replayed throw (its stack, or
-// 'undefined' for a non-Error), then a note naming the boundary that caught
-// it. So these tests cannot assert an empty console. They assert that every
-// report is of a throw RenderFailureBoundary caught, and nothing else.
-
-const CAUGHT_NOTE = 'using the error boundary you provided, ';
-const UNCAUGHT_NOTE = 'Consider adding an error boundary';
-
-function assertReportsOnlyContainedThrows(consoleErrors) {
-  const caughtNotes = consoleErrors.filter(entry => entry.includes(CAUGHT_NOTE));
-  assert.ok(caughtNotes.length > 0, `no throw was reported as caught by a boundary: ${JSON.stringify(consoleErrors)}`);
-  for (const note of caughtNotes) {
-    assert.ok(note.includes(`${CAUGHT_NOTE}RenderFailureBoundary.`), `a boundary other than RenderFailureBoundary caught: ${note}`);
-  }
-  for (const entry of consoleErrors) {
-    assert.ok(!entry.includes(UNCAUGHT_NOTE), `a throw escaped every boundary: ${entry}`);
-    assert.ok(!entry.startsWith('Warning:'), `React warned beside the contained throw: ${entry}`);
-  }
-}
-
-// Like openWindow, but the test asserts the window's reports itself.
-function openContainingWindow(t) {
-  const harness = buildDashboardWindow();
-  t.after(() => harness.close());
-  return harness;
-}
-
-const UNIT_NOTICE_TESTID = 'unit-render-failure-banner';
-const SIBLING_TESTID = 'boundary-sibling';
-
-function noticeLines(notice) {
-  return [...notice.children].map(line => line.textContent);
-}
-
-// The boundary around `child`, beside a sibling that is outside it.
-function mountInsideBoundary(harness, child) {
-  const { React, DF_SHELL, DF_RENDER_FAILURE } = harness.window;
-  const describe = thrown => DF_RENDER_FAILURE.tabRenderFailureNotice('Overview', thrown);
-  const Page = () =>
-    React.createElement(
-      'div',
-      null,
-      React.createElement(DF_SHELL.RenderFailureBoundary, { describe, testId: UNIT_NOTICE_TESTID }, child),
-      React.createElement('span', { 'data-testid': SIBLING_TESTID }, 'outside the boundary'),
-    );
-  const { container } = harness.mount(Page);
-  return { container, describe };
-}
-
-function assertSiblingRenders(container) {
-  assert.equal(container.querySelector(`[data-testid="${SIBLING_TESTID}"]`)?.textContent, 'outside the boundary');
-}
+// _render_helpers.mjs::assertReportsOnlyContainedThrows says why these tests
+// cannot assert an empty console.
 
 test('shell.jsx::RenderFailureBoundary contains a real DatumReading throw and renders its describe() notice', t => {
   const harness = openContainingWindow(t);
@@ -682,8 +643,6 @@ for (const reader of DATUM_READERS) {
 // Every fault lands as a malformed payload a poll could deliver, then App's
 // own re-render signal; nothing patches a component or writes DF_DATA directly.
 
-const NOTICE_SELECTOR = '[data-testid$="-render-failure-banner"]';
-
 // Lands `payloads` as one poll would: each key with its endpoint's receipt.
 function landPayloads(window, payloads) {
   seedDashboardData(window, { ...payloads, __receipt: receiptsFor(window.DF_DATA_LOADER, Object.keys(payloads)) });
@@ -700,22 +659,6 @@ function openPage(t, seed = null) {
 function landPoll(window, payloads) {
   landPayloads(window, payloads);
   window.React.act(() => window.dispatchEvent(new window.Event('df-data-refresh')));
-}
-
-function railButton(root, label) {
-  const button = [...root.querySelectorAll('.rail-nav button')].find(candidate =>
-    [...candidate.children].some(part => part.textContent === label),
-  );
-  assert.ok(button, `the rail has no "${label}" button`);
-  return button;
-}
-
-function openTab(page, label) {
-  click(page.window, railButton(page.root, label));
-}
-
-function failureNotices(root) {
-  return [...root.querySelectorAll(NOTICE_SELECTOR)];
 }
 
 function crumb(root) {

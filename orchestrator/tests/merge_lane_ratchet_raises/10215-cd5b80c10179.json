@@ -1,0 +1,24 @@
+{
+  "task_id": "10215",
+  "reason": "net-additive (PRD one-merge-request-per-task leaf A): new merge_lane/content_relation.py classifier, public classify_containment/range_patch_ids/is_ancestor_or_raise in landing_evidence.py, MergeContent post-init invariant in types.py; the vacuous ancestry rule is shared, not duplicated",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+      "baseline": 166,
+      "current": 175
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+      "baseline": 95,
+      "current": 97
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5297,
+      "current": 5314
+    }
+  ]
+}

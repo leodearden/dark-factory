@@ -76,7 +76,7 @@ from test_merge_queue_concurrent_verify import (
 )
 from test_merge_queue_rebased_landing_dead_base import _git_until_it_takes, _land_foreign_commit
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import MergeDeepConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MERGE_WORKER_SHUTDOWN_REASON, MergeLane, MergeRequest
 from orchestrator.merge_lane.types import RecoveryEvidence
@@ -692,6 +692,10 @@ class TestHostFreedWhileHeadVerifies:
         """stop() owns the park once it is requested: a host freeing inside
         stop()'s drain must not dispatch a parked item behind the drain,
         where nothing resolves its Future or releases its lease."""
+        # Deep chains off (task 8527): under the operational yaml's chain_cap the
+        # merger holds stop-second until stop-first's dispatch decides, and
+        # stop-first waits for a host, so stop-second would never park.
+        config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
         async with _running_lane(git_ops, config) as lane:
             await lane.allocator.quarantine_and_release(_remote_lease(lane))
             drift_check_lease = lane.allocator.acquire_local(lambda: lane.remote)

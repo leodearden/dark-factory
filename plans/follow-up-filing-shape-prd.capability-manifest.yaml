@@ -54,7 +54,7 @@ tasks:
         verdict: PASS
         delivered_check:
           kind: path
-          paths: ["shared/tests/test_declared_scope_readers.py"]
+          paths: ["tests/repo_guards/test_declared_scope_readers.py"]
           expect: present
       - name: "undeclared-band-via-get-task"
         binding: "manual — sketch row 20, stamp half; the curator-render half is γ's"

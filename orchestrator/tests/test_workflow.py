@@ -163,7 +163,7 @@ def _stub_architect(
     """
     invocations: list[object] = []
 
-    async def fake_invoke(role, prompt, cwd, **_kw):  # noqa: ARG001
+    async def fake_invoke(role, prompt, cwd, **_kw):
         invocations.append(role)
         assert wf.artifacts is not None
         wf.artifacts.write_plan({'files': list(files)})
@@ -275,7 +275,7 @@ async def _drive_merge_submission(
         check_seq,
     )
 
-    async def fake_run(cmd, **kwargs):  # noqa: ARG001
+    async def fake_run(cmd, **kwargs):
         return 0, 'fake_head_sha\n', ''
     monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -505,7 +505,7 @@ class TestSubmitToMergeQueuePlanTightening:
             check_seq,
         )
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -547,7 +547,7 @@ class TestSubmitToMergeQueuePlanTightening:
             check_seq,
         )
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -611,11 +611,11 @@ class TestSubmitToMergeQueueCrossRepo:
         ``plan_files_not_touched`` escalation (the RED behaviour), giving a
         clean assertion failure rather than an ``await MagicMock`` crash.
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
-        async def fake_check(*a, **k):  # noqa: ARG001
+        async def fake_check(*a, **k):
             return PlanFilesTouchedResult(not_touched=['__unreached__'])
         monkeypatch.setattr(
             'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
@@ -710,7 +710,7 @@ class TestSubmitToMergeQueueStalePathMessage:
             check_seq,
         )
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_head_sha\n', ''
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
 
@@ -1010,7 +1010,7 @@ class TestRunMergeDeferredGuard:
         submitting to the merge queue.  The execute/verify/review pipeline
         still runs (stubbed via _execute_verify_review_loop).
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -1034,7 +1034,7 @@ class TestRunMergeDeferredGuard:
         """A task without metadata.train must NOT call _enter_merge_deferred and
         must proceed to _submit_to_merge_queue — the pre-γ₁ merge path unchanged.
         """
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'fake_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -1245,7 +1245,7 @@ class TestMergePhaseGraceStampLifecycle:
         window the self-redeploy must not cancel)."""
         wf = _make_workflow(tmp_path=tmp_path, task_id='2656')
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -2190,7 +2190,7 @@ class TestHandleSoftCancelOutcome:
         assignment.task = {'id': '99', 'title': 'T', 'description': 'd'}
         assignment.modules = []
 
-        from _orch_helpers import pydantic_spec  # noqa: PLC0415
+        from _orch_helpers import pydantic_spec
 
         _spec = pydantic_spec(OrchestratorConfig)
         config = MagicMock(spec_set=_spec)
@@ -2615,7 +2615,7 @@ class _RecordingFakeSteward:
 
     instances: list[_RecordingFakeSteward] = []
 
-    def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+    def __init__(self, wt_path, cfg_dir):
         self.outcome_channel = None
         self.wip_probe = None
         type(self).instances.append(self)

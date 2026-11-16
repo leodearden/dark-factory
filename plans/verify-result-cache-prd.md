@@ -140,7 +140,7 @@ The figures are the replayable share of module pytest seconds: a projection, not
   A runner keeps no copy between dispatches.
 - Before a remote dispatch (`verify_runner.py::RemoteRunner.run_merge_verify`,
   `verify_runner.py::RemoteRunner.run_task_verify`) the dispatcher reads, for the plan's unit
-  ids, the most recent recorded greens whose keyed inputs name that runner, at most
+  ids, the most recent recorded greens, from any host (A6), at most
   `verify_cache.remote_candidates_per_unit` per unit. It ships them with the dispatch, together
   with the effective mode for the role and the kill-switch state. A shipped candidate is
   `(unit_id, key, entry_id, evidence_event_id)`, not the entry's input list.
@@ -152,7 +152,7 @@ The figures are the replayable share of module pytest seconds: a projection, not
   (`verify_evidence.py::VerifyUnit`, through `verify_runner.py::result_to_dict`). It evaluates
   `verify_cache/policy.py::admissible` where the leg ran and returns that verdict with the unit.
 - On the dispatcher, before the verdict reaches its caller, every `cache_hit` unit must match a
-  live entry `(unit_id, key)` whose keyed inputs name that runner. A hit the registry does not
+  live entry `(unit_id, key)`, recorded on any host (A6). A hit the registry does not
   back makes the whole result a no-verdict (`verify_runner.py::RunnerUnavailable`), which takes
   the existing re-dispatch path. The re-dispatch ships a fresh view, so the same unbacked hit
   cannot recur. Backed hits are written to `consumed` (I6). Admitted greens are recorded through
@@ -160,14 +160,9 @@ The figures are the replayable share of module pytest seconds: a projection, not
 - The mode and the kill switch ride the dispatch, as the merge-deciding profile already does
   (`verify_runner.py::MergeVerifySpec`, task 2822). A runner's own config cannot turn replay on.
 
-**A5.1 — Pools are per host until R-cache-2 is ruled.** The runner's name becomes a keyed input,
-`toolchain.runner`, on every key, the dispatcher host's own included
-(`verify_cache/toolchain.py::ToolchainFingerprint.as_inputs`). A green recorded on one host
-therefore never serves another. Adding the input changes every key once; the registry is derived
-state, so that is a cold start. Whether a green may serve across hosts when every other keyed
-input is equal is R-cache-2 (§ Pre-conditions), pending. R-cache-1 was ruled while a remote
-runner always missed, and the multihost PRD's drift detector exists because hosts have disagreed,
-so this PRD does not assume the answer.
+**A5.1 — Superseded by A6 (2026-11-14).** As first written, the runner's name was to become a
+keyed input, `toolchain.runner`, keeping one pool per host until R-cache-2 was ruled. Leo ruled
+it on 2026-11-14: greens serve across hosts. The input is not added; see A6.
 
 **A5.2 — Remote replay has its own mode and its own log window.** `verify_cache.remote_task_mode`
 and `verify_cache.remote_merge_mode` take `off | log | on`, default `off`, green-tier. A remote
@@ -181,7 +176,38 @@ test and do not fit a dispatch. ζ1 and ζ2 stay dispatcher-host-only; Open ques
 
 **Work.** One new leaf, γ2, after γ. γ changes in one respect: its remote arm still returns
 `UNAVAILABLE`, but through the `consult` seam, so γ2 swaps the view source and adds no second
-decision path (INV-5). η gains boundary rows 21 to 24. θ documents the remote modes and R-cache-2.
+decision path (INV-5). η gains boundary rows 21 to 24. θ documents the remote modes and the R-cache-2 ruling (A6).
+
+## Amendment — 2026-11-14: greens serve across hosts (A6)
+
+Leo ruled R-cache-2 on 2026-11-14: a green recorded on one host may serve a verify dispatched
+to another. This replaces A5.1. The rest of A5 stands.
+
+- **No runner input.** `toolchain.runner` is not added to the keyed inputs. No key changes, and
+  the registry keeps its entries.
+- **What still keeps unequal hosts apart.** Each runner computes its own unit keys from its own
+  worktree and toolchain (INV-3). A host whose interpreter, lockfile, pyright, ruff or
+  `verify_env` overlay differs computes a different key and misses.
+- **The view and the backing check lose their runner filter.** The dispatcher ships the most
+  recent recorded greens for the plan's unit ids from any host, and backs a returned hit with a
+  live entry `(unit_id, key)`.
+- **Why this does not weaken the gate.** One merge verify already runs on one host, chosen by
+  the allocator, so the gate has never promised a green on both. A replayed unit carries the
+  evidence event it replays (R-cache-1, unchanged), and that event names the host that ran it,
+  so a cross-host replay is traceable.
+- **What is not measured.** Whether the two hosts' toolchain fingerprints are equal today. The
+  realised share lies between the per-host figure (38.6%) and the cross-host figure (48.5%).
+  γ2's `log` window shows it: a remote `would_hit` unit whose evidence event ran on another host.
+
+**Work.** γ2 (task 9123) drops its keyed-input step and its runner filters. Boundary row 22 is
+rewritten. η and θ follow. No new leaf.
+
+**Gates.** G1: the consumer is unchanged (remote merge-gate and task-leg verifies). G2: under
+`remote_merge_mode: log`, a laptop `merge_verify` event lists a `would_hit` unit whose evidence
+event ran on the workstation. G3: no new substrate; the amendment removes one planned input.
+G4: the multihost PRD's scope guard is answered by R-cache-1 and R-cache-2 together. G6: the ten
+points are a projection (above). G7 `corroborate-before-acting`: the runner keys its own tree,
+and the dispatcher re-reads the registry before it uses a hit.
 
 ## Background
 
@@ -246,7 +272,7 @@ shared.
   this is the machine-checked form of 1724's ground (INV-1).
 - **Toolchain fingerprint** = interpreter version, `uv.lock` blob, pyright version
   (from `node_modules/.package-lock.json` or `package-lock.json`), ruff version,
-  `verify_env` overlay, and since A5 the runner's name (`toolchain.runner`). A remote runner
+  `verify_env` overlay. The runner's name is not keyed (A6). A remote runner
   holds no registry; it misses unless the dispatch ships a view (A5).
 - Keys are git object ids (content hashes) computed from the tree at dispatch, never
   from a snapshot (INV-3).
@@ -397,8 +423,9 @@ the full-breadth gate itself.
 17. **A remote runner decides against a view the dispatcher ships; the registry has one
     home.** The dispatcher re-reads the registry before it uses a returned hit, and is the
     only writer of entries and `consumed` (A5, Leo 2026-11-10).
-18. **Pools are per host.** The runner's name is a keyed input; cross-host serving waits
-    for R-cache-2 (A5.1).
+18. **One pool for all hosts.** A green recorded on any host serves any host whose own
+    computed key is equal; the runner's name is not a keyed input (A6, Leo 2026-11-14;
+    replaces the per-host pools of A5.1).
 19. **Remote replay has its own per-role mode and its own three-day log window**, and is
     never less conservative than the role's mode (A5.2).
 
@@ -411,12 +438,11 @@ the full-breadth gate itself.
   verdict carries the evidence event it replays; an entry under a different spec
   hash never serves. θ adds a dated pointer to this ruling beside the multihost
   PRD's scope guard and in `OPERATIONS.md`.
-- **R-cache-2 (PENDING, Leo):** may a green recorded on one host serve a verify dispatched
-  to another when every other keyed input is equal? Until it is ruled, `toolchain.runner`
-  keeps the pools apart (decision 18). The 2026-11-10 simulation prices a yes at about ten
-  points of replayable share (38.6% to 48.5%), and only if the two hosts' toolchain
-  fingerprints are in fact equal, which this PRD has not measured. A yes removes one keyed
-  input; nothing else in A5 changes.
+- **R-cache-2 (RULED, Leo, 2026-11-14): yes.** A green recorded on one host serves a verify
+  dispatched to another when every keyed input is equal (A6, decision 18). The 2026-11-10
+  simulation prices this at about ten points of replayable share (38.6% to 48.5%), reached
+  only where the two hosts' toolchain fingerprints are in fact equal, which this PRD has not
+  measured. γ2's `log` window shows the realised share (A6).
 - Task **4226** (offline-lane red path misclassifies timeouts/crashes as failing
   tests; pending, depends on 5036) — the audit's attribution consumes the lane's
   confirmed failing set and must not inherit that misclassification. Blocks ε only;
@@ -439,7 +465,7 @@ the full-breadth gate itself.
 | Task 5409 (NULL tip_sha) / 2752 checkpoint | parallel | tip checkpoint remains for task-leg redispatch; registry is a superset | 5409 stays | wired |
 | `plans/flake-ledger-prd.md` / 5492 | consumes | `flake_suppression` on `VerifyResult` read by admission | flake ledger owns; this PRD reads | wired |
 | `plans/verify-scope-inversion-prd.md` | consumes | `VerifyPlan.runs`, `merge_verify_breadth` unchanged | verify-plan owns | wired |
-| `plans/merge-throughput-multihost-verify-prd.md` | constrained by | scope guard; a remote runner replays only through a shipped view (A5) | R-cache-1; R-cache-2 across hosts | R-cache-1 ruled; R-cache-2 pending |
+| `plans/merge-throughput-multihost-verify-prd.md` | constrained by | scope guard; a remote runner replays only through a shipped view (A5) | R-cache-1; R-cache-2 across hosts | both ruled (R-cache-2: yes, 2026-11-14) |
 | `plans/remote-task-leg-verify-prd.md` (remote task legs; gate 6673 parity window) | constrained by | remote modes default `off`; in `log` a runner still runs every unit, so the window's population is unchanged | this PRD (γ2); the flip to `on` is an operator action after the window | queued |
 | `plans/merge-lane-policy-prd.md` δ (task 8526) | parallel | same file, `verify_runner.py`; γ2 depends on 8526 by a real edge, so the policy chain is never the one waiting | this PRD (γ2) | wired at decompose |
 | Reify per-step tier (`scripts/verify.sh` steps, reify 7424 stamps) | produces seam | § Reify seam contract: skip-set env + per-step verdict sidecar | **reify PRD**, triggered by milestone ι; this PRD owns the contract only | queued (ι) |
@@ -486,14 +512,13 @@ class ShippedCandidate:
     evidence_event_id: int
 @dataclass(frozen=True)
 class ShippedView:                       # rides MergeVerifySpec / TaskVerifySpec as `verify_cache`
-    runner: str                          # the `toolchain.runner` value the runner keys with
     mode: CacheMode                      # the more conservative of role mode and remote mode
     disabled_until: datetime | None
     disabled_reason: str | None
     candidates: tuple[ShippedCandidate, ...]
     truncated: bool                      # the per-unit cap or the size bound dropped candidates
 class Registry:
-    async def candidates(self, unit_ids: Sequence[str], *, runner: str, per_unit: int) -> tuple[ShippedCandidate, ...]
+    async def candidates(self, unit_ids: Sequence[str], *, per_unit: int) -> tuple[ShippedCandidate, ...]
 ```
 
 Invariants:
@@ -573,7 +598,7 @@ Invariants:
   and the census `orchestrator/tests/test_merge_verify_config_fidelity.py::MERGE_PATH_CONFIG_READS`.
   The local decision, recorder and `consumed` write are γ's (5653), upstream by a real edge.
 - **G4** no reciprocal ownership. The multihost PRD's scope guard is answered by R-cache-1 for
-  one host and left to R-cache-2 across hosts.
+  one host and by R-cache-2 (ruled yes, 2026-11-14) across hosts.
 - **G5** B+H unchanged; η proves the remote seam with rows 21 to 24.
 - **G7** `contracts-machine-checked`: the view is a typed wire object and the modes and cap are
   config schema. `corroborate-before-acting`: the runner keys its own tree and the dispatcher
@@ -641,8 +666,8 @@ points with an injected registry path.
 | 18 | per-test: new test always runs | no recording for t5 | t5 runs, recording created |
 | 19 | kill switch honoured everywhere | `disabled_until` in future | task and merge roles both miss |
 | 20 | per-test: a branch-edited test ignores main's recording (A4) | recording of t1 from main (reads a.py); the branch edits t1 so it now also reads c.py; change c.py | t1 runs at both roles; no replay |
-| 21 | remote runner replays its own green (A5) | entry for `alpha` recorded from runner R's earlier result; role and remote modes `on`; change only `beta/`; dispatch to R | R's result lists `alpha` legs `cache_hit` with the entry's evidence id; the dispatcher wrote `consumed`; `beta` ran and is recorded with `toolchain.runner` = R |
-| 22 | pools are per host (A5.1) | entry for `alpha` recorded on the dispatcher host only | a dispatch to R misses `alpha`; R's green becomes a second entry |
+| 21 | remote runner replays its own green (A5) | entry for `alpha` recorded from runner R's earlier result; role and remote modes `on`; change only `beta/`; dispatch to R | R's result lists `alpha` legs `cache_hit` with the entry's evidence id; the dispatcher wrote `consumed`; `beta` ran and is recorded, its evidence event naming R |
+| 22 | a green serves across hosts (A6) | entry for `alpha` recorded on the dispatcher host only; first R's keyed inputs are equal, then R's interpreter version differs | equal inputs: R's result lists `alpha` legs `cache_hit` with that entry's evidence id and the dispatcher wrote `consumed`; differing toolchain: R misses `alpha` and its green becomes a second entry |
 | 23 | the dispatcher's mode wins (A5.2) | role mode `log`, remote mode `on`, R's own config says `on` | R runs every unit; units read `would_hit`; nothing is consumed |
 | 24 | an unbacked hit is no verdict (I9) | entry shipped to R, then evicted before R answers | R's result is refused as a no-verdict naming the unit and key; the re-dispatch ships a view without the entry and the unit runs |
 
@@ -657,7 +682,7 @@ proves the seam.
 | α | Verify spec hash + per-unit outcomes on `merge_verify` / `workflow_verify`; `duration_ms` on `workflow_verify` | orchestrator: `verify.py`, `verify_runner.py`, `workflow.py`, `event_store.py`, tests | intermediate → unlocks β, γ, ε; observable now: every verify event carries `plan_hash` and `units` with `ran_green/ran_red` | — |
 | β | `verify_cache/` registry, keys, policy (modes, never-cache, kill state), toolchain fingerprint | orchestrator: new package + `config.py` keys + tests on a fixture repo | intermediate → unlocks γ, ε, ζ; observable: `orchestrator verify-cache status` CLI prints mode, entry count, policy state | α |
 | γ | Per-module decision at the fan-out seam, both roles; hit synthesis with provenance; log mode; unscoped-typecheck consult (absorbs 5294) | orchestrator: `verify.py`, `merge_queue.py`/`merge_lane` (by symbol), tests | leaf: after 3 days of `log`, `merge_verify` events carry `would_hit` units; after `on`, a gate whose modules all hit completes under 10 min with units listed as `cache_hit` | α, β |
-| γ2 | Remote runners decide against a dispatcher-shipped view (A5): candidate query, `verify_cache` block on both verify specs, `toolchain.runner` keyed input, dispatcher-side validation, consumption and recording for remote results, remote modes and candidate cap | orchestrator: `verify_runner.py`, `task_verify_spec.py`, `verify.py`, `verify_cache/` (registry, policy, toolchain), `config.py`, root yaml, tests | leaf: with `remote_merge_mode: log`, a `merge_verify` event whose `runner` is the laptop lists `would_hit` units with keys; with `on`, a laptop gate whose module units all hit completes at the un-cacheable floor, every unit `cache_hit` with an `evidence_event_id` the dispatcher's registry holds | γ, merge-lane-policy δ (8526, same file) |
+| γ2 | Remote runners decide against a dispatcher-shipped view (A5): candidate query, `verify_cache` block on both verify specs, one pool for all hosts (A6), dispatcher-side validation, consumption and recording for remote results, remote modes and candidate cap | orchestrator: `verify_runner.py`, `task_verify_spec.py`, `verify.py`, `verify_cache/` (registry, policy, toolchain), `config.py`, root yaml, tests | leaf: with `remote_merge_mode: log`, a `merge_verify` event whose `runner` is the laptop lists `would_hit` units with keys; with `on`, a laptop gate whose module units all hit completes at the un-cacheable floor, every unit `cache_hit` with an `evidence_event_id` the dispatcher's registry holds | γ, merge-lane-policy δ (8526, same file) |
 | δ | Repo-wide guard module: relocate whole-tree tests out of `shared`, `scripts`, `tests/scripts` into a `repo_guards` module flagged `verify_cache: never`; keep `TestWholeTreeGate`, manifest corpus, drift guards, whole-tree greps there | shared/, scripts/, tests/scripts/, root yaml, `orchestrator.yaml` per module | leaf: the 08-20 shape — a `plans/*.capability-manifest.yaml` change with `shared/` untouched — runs the manifest guard at the gate while `shared`'s pytest leg replays | β (flag) |
 | ε | Audit: `verify-cache-audit` lane command, `audit.py` attribution, eviction, streak kill switch, L2 blocker | orchestrator: `offline_lane.py` hook, `verify_cache/audit.py`, yaml, tests | leaf: a seeded leak on the fixture yields eviction + a fix task carrying the leak record; a second within 7 d sets `disabled_until` and files the blocker | α, β, 4226 |
 | ζ1 | Per-test recorder: coverage contexts + observer plugin + `repo_state` marker enforcement; per-test keys recorded in log mode | new plugin module beside `df_pytest_isolation.py`, `verify_cache/keys.py`, conftests, tests | intermediate → unlocks ζ2; observable: recordings exist for every executed test after one gate; an unmarked repo-state read fails at task role with the instruction | β, γ |

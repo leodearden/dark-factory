@@ -2124,7 +2124,7 @@ class TestFileUnattributedLandingEscalationStampsCitationSha:
     """
 
     def _queue(self, tmp_path):
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         return EscalationQueue(tmp_path / 'queue')
 
@@ -2219,7 +2219,7 @@ class TestResolvedCitationSuppressesIdenticalRefile:
     SHA_B = 'c' * 40
 
     def _queue(self, tmp_path):
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         return EscalationQueue(tmp_path / 'queue')
 
@@ -2269,7 +2269,7 @@ class TestResolvedCitationSuppressesIdenticalRefile:
         return queue, pending[0].id
 
     def _seq(self, queue) -> str:
-        from escalation.queue import SEQ_COUNTER_SUFFIX  # noqa: PLC0415
+        from escalation.queue import SEQ_COUNTER_SUFFIX
 
         return (queue.queue_dir / f'esc-{self.TASK}{SEQ_COUNTER_SUFFIX}').read_text().strip()
 
@@ -2395,7 +2395,7 @@ class TestResolvedCitationSuppressesIdenticalRefile:
         Mirrors task 3116's ruling on the pending guard: a new root cause must
         never hide behind an unrelated adjudication.
         """
-        from escalation.models import Escalation  # noqa: PLC0415
+        from escalation.models import Escalation
 
         queue = self._queue(tmp_path)
         unrelated = Escalation(
@@ -2428,7 +2428,7 @@ class TestSuppressedRefileIsCounted:
     SHA_B = 'c' * 40
 
     def _queue(self, tmp_path):
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         return EscalationQueue(tmp_path / 'queue')
 
@@ -2547,7 +2547,7 @@ class TestSuppressionFailsOpen:
     SHA = 'b' * 40
 
     def _queue(self, tmp_path):
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         return EscalationQueue(tmp_path / 'queue')
 
@@ -2930,7 +2930,7 @@ class TestReportedClaimEscalation:
         )
 
     def _queue(self, tmp_path):
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         return EscalationQueue(tmp_path / 'queue')
 

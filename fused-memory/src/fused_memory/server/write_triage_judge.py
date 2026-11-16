@@ -1001,7 +1001,7 @@ async def _call_openai_responses(
     Unset means a non-reasoning model, pinned to ``temperature=0.0`` as on the
     other two arms.
     """
-    import openai  # noqa: PLC0415 — per-call import, matching judge.py
+    import openai  # per-call import, matching judge.py
 
     sampling: dict[str, Any] = (
         {'temperature': 0.0}
@@ -1048,7 +1048,7 @@ async def _call_openai_chat(
     ``llm.client_class: openai_generic`` (llama.cpp, vLLM, LM Studio). Its
     compat 400s are task 5277 C's.
     """
-    import openai  # noqa: PLC0415 — per-call import, matching judge.py
+    import openai  # per-call import, matching judge.py
 
     async with openai.AsyncOpenAI(
         **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,
@@ -1085,7 +1085,7 @@ async def _call_anthropic(
     ``temperature=0.0`` because Anthropic's default is 1.0, and the system
     prompt via ``system=`` because Anthropic has no system role.
     """
-    import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
+    import anthropic  # per-call import, matching judge.py
 
     async with anthropic.AsyncAnthropic(
         **creds.client_kwargs, max_retries=_JUDGE_SDK_MAX_RETRIES,

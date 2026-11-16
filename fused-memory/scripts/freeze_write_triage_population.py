@@ -420,8 +420,8 @@ def _summary(snapshot: Mapping[str, Any], path: Path, sha256: str) -> dict[str, 
 
 
 async def _freeze_live(args: argparse.Namespace) -> dict[str, Any]:
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.services.memory_service import MemoryService
 
     frozen_at = datetime.now(UTC)
     directory = snapshot_dir(args.out_root, frozen_at)

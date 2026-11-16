@@ -14,9 +14,10 @@ from collections import Counter
 from collections.abc import Awaitable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, TypedDict, TypeVar, cast
+from typing import Any, TypedDict, TypeVar
 from urllib.parse import urlparse
 
+from falkordb.asyncio import FalkorDB
 from graphiti_core import Graphiti
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
@@ -57,6 +58,13 @@ from fused_memory.backends.falkor_server_settings import (
     warn_on_shortfalls,
 )
 from fused_memory.backends.falkor_string_bounds import exact_string_upper_bound
+from fused_memory.backends.graph_access import (
+    STORE,
+    FalkorGraphAccess,
+    GraphAccess,
+    OpBoundReader,
+    paged_ro_query,
+)
 from fused_memory.backends.llm_clients import (
     ForceJsonObjectOpenAIGenericClient,
     TokenRecordingOpenAIGenericClient,
@@ -93,7 +101,6 @@ from fused_memory.backends.paged_read import RESULTSET_SIZE as _RESULTSET_SIZE
 from fused_memory.backends.paged_read import (
     census_count as _census_count,  # noqa: F401 - re-export; home is paged_read  # debt: task 9363
 )
-from fused_memory.backends.paged_read import paged_ro_query as _paged_ro_query
 from fused_memory.backends.recent_episodes import read_recent_group_episodes
 from fused_memory.backends.relates_to_schema import ACTIVE_EDGE_PREDICATE, active_edge_filter
 from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
@@ -320,7 +327,7 @@ def _canonicalize_group_args(func):
     GraphitiBackend method taking a project group_id/group_ids must
     canonicalize those ARGUMENTS via α's ``canonicalize_project_id`` before
     the method body runs, so the FalkorDB graph KEY (``_driver_for`` /
-    ``_graph_for``), the node/edge ``group_id`` PROPERTY (graphiti_core's
+    ``graph_access.graph``), the node/edge ``group_id`` PROPERTY (graphiti_core's
     ``client.add_episode``), and any direct-Cypher ``$group_id`` FILTER
     always agree (RCA §4).
 
@@ -378,13 +385,25 @@ def _canonicalize_group_args(func):
 class EdgeDict(TypedDict):
     """Normalised edge dict returned by GraphitiBackend._edge_dict.
 
-    Consumed by get_valid_edges_for_node, get_all_valid_edges,
-    _canonical_facts, and rebuild_entity_from_edges.
+    Consumed by get_all_valid_edges, _canonical_facts, and
+    rebuild_entity_from_edges.  get_valid_edges_for_node returns the dated
+    subtype, DatedEdgeDict.
     """
 
     uuid: str
     fact: str
     name: str
+
+
+class DatedEdgeDict(EdgeDict):
+    """An EdgeDict with the edge's stored ISO-8601 validity window.
+
+    ``valid_at`` / ``invalid_at`` are returned verbatim as FalkorDB holds them,
+    ``None`` when the property is NULL.
+    """
+
+    valid_at: str | None
+    invalid_at: str | None
 
 
 class EdgeWithEndpoints(TypedDict):
@@ -699,7 +718,7 @@ def apply_incompleteness_policy(
 ) -> None:
     """Apply the SPLIT incompleteness policy to an enumeration's PagedRead.
 
-    ONE implementation, shared by every caller of ``_paged_ro_query`` that
+    ONE implementation, shared by every caller of ``paged_ro_query`` that
     returns a plain collection (the two task-4340 back-compat shims and the
     task-4869 reads) AND by every consumer that calls an ``enumerate_*``
     method directly, because the policy is a single decision and not a
@@ -928,6 +947,22 @@ class _MultiTenantFalkorDriver(FalkorDriver):
     search_interface = FalkorEdgeSearch()
     graph_operations_interface = FalkorGraphOperations()
 
+    def __init__(
+        self,
+        *,
+        host: str = 'localhost',
+        port: int = 6379,
+        password: str | None = None,
+        socket_timeout: float | None = None,
+        falkor_db: FalkorDB | None = None,
+        database: str = 'default_db',
+    ):
+        if falkor_db is None:
+            falkor_db = FalkorDB(
+                host=host, port=port, password=password, socket_timeout=socket_timeout,
+            )
+        super().__init__(falkor_db=falkor_db, database=database)
+
     async def build_indices_and_constraints(self, delete_existing=False):
         pass
 
@@ -972,7 +1007,7 @@ class _MultiTenantFalkorDriver(FalkorDriver):
         validate_group_ids(group_ids)
         return build_query(self.sanitize(query), group_ids, max_query_length)
 
-    def clone(self, database: str) -> 'GraphDriver':
+    def clone(self, database: str) -> '_MultiTenantFalkorDriver':
         if database == self._database:
             return self
         cloned = _MultiTenantFalkorDriver(falkor_db=self.client, database=database)
@@ -1118,9 +1153,12 @@ class GraphitiBackend:
     (named after the project_id / group_id).  The driver is cloned per-request
     so every operation targets the correct graph.
 
-    TIMEOUT POSTURE.  Every budgeted read and write goes through
-    :meth:`_timed_read` / :meth:`_timed_write`, so it follows the rule stated
-    in ``backends/timeout_budget.py``.  The one exception is index
+    TIMEOUT POSTURE.  Every budgeted read and write follows the rule stated in
+    ``backends/timeout_budget.py``.  Raw Cypher is budgeted by the
+    ``GraphHandle`` that :attr:`graph_access` resolves
+    (``backends/graph_access.py``), and graph listings by its
+    ``GraphAccess.list_graphs``; graphiti_core calls go through
+    :meth:`_timed_read` / :meth:`_timed_write`.  The one exception is index
     provisioning (``_ensure_indices``, ``provision_registered_graphs``): it
     runs on its own ``_index_provision_timeout`` budget and never raises, per
     docs/prds/falkordb-index-provisioning.md D4-D6.
@@ -1140,6 +1178,7 @@ class GraphitiBackend:
         )
         self.client: Graphiti | None = None
         self._driver: FalkorDriver | None = None
+        self._graph_access: GraphAccess | None = None
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
         # First-write provisioning runs INSIDE the triggering write's own budget
@@ -1171,6 +1210,7 @@ class GraphitiBackend:
         llm_client: LLMClient | None = None,
         embedder: EmbedderClient | None = None,
         cross_encoder: CrossEncoderClient | None = None,
+        graph_access: GraphAccess | None = None,
     ) -> 'GraphitiBackend':
         """A backend over *driver* and the given sub-clients, wired without ``initialize()``.
 
@@ -1178,10 +1218,17 @@ class GraphitiBackend:
         base ``client`` is built: methods that need one raise until it is assigned.
         The registry is required because the derived one names real project graphs.
         The backend takes ownership: ``close()`` releases the driver and sub-clients.
+
+        An injected *graph_access* serves every raw Cypher call until ``close()``;
+        graphiti_core calls still run over *driver*.
         """
         backend = cls(config, registered_graph_ids=registered_graph_ids)
         backend._attach(
-            driver, llm_client=llm_client, embedder=embedder, cross_encoder=cross_encoder,
+            driver,
+            llm_client=llm_client,
+            embedder=embedder,
+            cross_encoder=cross_encoder,
+            graph_access=graph_access,
         )
         return backend
 
@@ -1192,11 +1239,28 @@ class GraphitiBackend:
         llm_client: LLMClient | None,
         embedder: EmbedderClient | None,
         cross_encoder: CrossEncoderClient | None,
+        graph_access: GraphAccess | None,
     ) -> None:
         self._driver = driver
+        self._graph_access = graph_access
         self._llm_client = llm_client
         self._embedder = embedder
         self._cross_encoder = cross_encoder
+
+    @property
+    def graph_access(self) -> GraphAccess:
+        """The provider every raw Cypher call resolves its graph through.
+
+        The injected one, else a budgeted view over the CURRENT driver, so the
+        driver stays the one owner of the connection.
+        """
+        if self._graph_access is not None:
+            return self._graph_access
+        return FalkorGraphAccess(
+            self._require_driver(),
+            read_budget_s=self._read_timeout,
+            write_budget_s=self._write_timeout,
+        )
 
     @property
     def registered_graph_ids(self) -> frozenset[str]:
@@ -1215,13 +1279,13 @@ class GraphitiBackend:
     async def _timed_read(self, awaitable: Awaitable[_T], op: str) -> _T:
         """``await_within`` under this backend's READ budget."""
         return await await_within(
-            awaitable, store='Graphiti', op=op, budget_s=self._read_timeout,
+            awaitable, store=STORE, op=op, budget_s=self._read_timeout,
         )
 
     async def _timed_write(self, awaitable: Awaitable[_T], op: str) -> _T:
         """``await_within`` under this backend's WRITE budget."""
         return await await_within(
-            awaitable, store='Graphiti', op=op, budget_s=self._write_timeout,
+            awaitable, store=STORE, op=op, budget_s=self._write_timeout,
         )
 
     # --- Per-request driver routing ---
@@ -1295,11 +1359,6 @@ class GraphitiBackend:
         self._group_clients[group_id] = client
         return client
 
-    def _graph_for(self, group_id: str) -> Any:
-        """Return the FalkorGraph object for *group_id* (for direct Cypher)."""
-        driver = self._require_driver()
-        return driver._get_graph(group_id)
-
     @_canonicalize_group_args
     def _identity_lock_for(self, group_id: str) -> asyncio.Lock:
         """Return the per-group_id write-time-identity lock, creating it lazily.
@@ -1344,11 +1403,6 @@ class GraphitiBackend:
         if self._driver is None:
             raise RuntimeError('GraphitiBackend not initialized — call initialize() first')
         return self._driver
-
-    def _require_falkor_client(self) -> Any:
-        """Return the FalkorDB client from the underlying driver."""
-        driver = self._require_driver()
-        return cast(Any, driver).client
 
     async def read_server_settings(self) -> FalkorServerSettings:
         """Read the live TIMEOUT and appendonly settings; read-only, and a failed read is reported, not raised."""
@@ -1427,7 +1481,7 @@ class GraphitiBackend:
             )
 
     async def _provision_existing_registered_graphs(self) -> None:
-        existing = await self._require_falkor_client().list_graphs()
+        existing = await self.graph_access.list_graphs()
         for graph_name in sorted(set(existing) & self._registered_graph_ids):
             await self._ensure_indices(graph_name)
 
@@ -1464,7 +1518,7 @@ class GraphitiBackend:
 
         # --- FalkorDB driver ---
         # The driver is created with a placeholder database.  Actual graph
-        # selection happens per-request via _driver_for() / _graph_for().
+        # selection happens per-request via _driver_for() / graph_access.graph().
         falkor_cfg = cfg.graphiti.falkordb
         if falkor_cfg.database is not None:
             logger.warning(
@@ -1480,6 +1534,7 @@ class GraphitiBackend:
             host=host,
             port=port,
             password=falkor_cfg.password,
+            socket_timeout=falkor_cfg.socket_timeout_seconds,
         )
 
         # --- Cross-encoder (reranker) ---
@@ -1510,7 +1565,11 @@ class GraphitiBackend:
         cross_encoder = OpenAIRerankerClient(config=reranker_config)
 
         self._attach(
-            driver, llm_client=llm_client, embedder=embedder_client, cross_encoder=cross_encoder,
+            driver,
+            llm_client=llm_client,
+            embedder=embedder_client,
+            cross_encoder=cross_encoder,
+            graph_access=None,
         )
         self.client = Graphiti(
             graph_driver=driver,
@@ -1697,9 +1756,10 @@ class GraphitiBackend:
             )
         if not group_ids:
             return []
-        episodes = await self._timed_read(
-            read_recent_group_episodes(self._graph_for(group_ids[0]), group_ids, last_n),
-            'retrieve_episodes',
+        episodes = await read_recent_group_episodes(
+            OpBoundReader(self.graph_access.graph(group_ids[0]), op='retrieve_episodes'),
+            group_ids,
+            last_n,
         )
         return sorted(
             episodes,
@@ -1806,14 +1866,12 @@ class GraphitiBackend:
                 'the leak is not a redaction)'
             )
 
-        graph = self._graph_for(group_id)
-        result = await self._timed_read(
-            graph.ro_query(
-                'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
-                'RETURN e.content',
-                {'uuid': episode_uuid, 'group_id': group_id},
-            ),
-            'redact_episode_content.read',
+        graph = self.graph_access.graph(group_id)
+        result = await graph.ro_query(
+            'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
+            'RETURN e.content',
+            {'uuid': episode_uuid, 'group_id': group_id},
+            op='redact_episode_content.read',
         )
         if not result.result_set:
             raise NodeNotFoundError(
@@ -1821,13 +1879,11 @@ class GraphitiBackend:
             )
         old_content = result.result_set[0][0] or ''
 
-        await self._timed_write(
-            graph.query(
-                'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
-                'SET e.content = $content',
-                {'uuid': episode_uuid, 'group_id': group_id, 'content': new_content},
-            ),
-            'redact_episode_content.write',
+        await graph.query(
+            'MATCH (e:Episodic {uuid: $uuid, group_id: $group_id}) '
+            'SET e.content = $content',
+            {'uuid': episode_uuid, 'group_id': group_id, 'content': new_content},
+            op='redact_episode_content.write',
         )
         logger.info(
             'redact_episode_content: episode=%s group=%s old_len=%d new_len=%d',
@@ -1916,15 +1972,13 @@ class GraphitiBackend:
         self, edge_uuid: str, invalid_at: datetime | None, *, group_id: str,
     ) -> None:
         """Set one RELATES_TO edge's ``invalid_at``, or remove it for ``None``; nothing else changes."""
-        await self._timed_write(
-            self._graph_for(group_id).query(
-                'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() SET e.invalid_at = $invalid_at',
-                {
-                    'uuid': edge_uuid,
-                    'invalid_at': None if invalid_at is None else invalid_at.isoformat(),
-                },
-            ),
-            'update_edge.invalid_at',
+        await self.graph_access.graph(group_id).query(
+            'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() SET e.invalid_at = $invalid_at',
+            {
+                'uuid': edge_uuid,
+                'invalid_at': None if invalid_at is None else invalid_at.isoformat(),
+            },
+            op='update_edge.invalid_at',
         )
 
     @_canonicalize_group_args
@@ -1991,7 +2045,7 @@ class GraphitiBackend:
             raise ValueError(
                 f"reassign_edge: which_end must be 'source' or 'target', got {which_end!r}"
             )
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         # Read the edge's TRUE endpoints from TOPOLOGY, not the
         # e.source_node_uuid/e.target_node_uuid PROPERTIES: redirect_node_edges
         # sets only the moved side's property and leaves the other absent/NULL,
@@ -2004,6 +2058,7 @@ class GraphitiBackend:
             bind_entity_endpoints('MATCH ()-[e:RELATES_TO {uuid: $edge_uuid}]->()')
             + ' RETURN n.uuid, m.uuid',
             {'edge_uuid': edge_uuid},
+            op='reassign_edge',
         )
         if not topo.result_set:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {edge_uuid}')
@@ -2027,6 +2082,7 @@ class GraphitiBackend:
         node_check = await graph.ro_query(
             'MATCH (n:Entity {uuid: $new_endpoint_uuid}) RETURN n.uuid',
             {'new_endpoint_uuid': new_endpoint_uuid},
+            op='reassign_edge',
         )
         if not node_check.result_set:
             raise NodeNotFoundError(f'Entity node not found: {new_endpoint_uuid}')
@@ -2111,6 +2167,7 @@ class GraphitiBackend:
                     'new_endpoint_uuid': new_endpoint_uuid,
                     'old_endpoint_uuid': old_endpoint_uuid,
                 },
+                op='reassign_edge',
             )
 
         # Best-effort refresh of the two AFFECTED endpoint summaries: the OLD
@@ -2182,7 +2239,7 @@ class GraphitiBackend:
         return all nodes with embeddings and filter client-side by parsing the
         raw vector text representation (``<v1, v2, ...>``).
 
-        PAGINATED (task 4869) through ``_paged_ro_query``, because the embedded
+        PAGINATED (task 4869) through ``paged_ro_query``, because the embedded
         population exceeds the server's result-set cap; incompleteness follows
         the shared ``apply_incompleteness_policy``.  Measured counts are in
         plans/falkordb-resultset-cap-audit.md.
@@ -2234,10 +2291,10 @@ class GraphitiBackend:
 
         The one body of the two stale-embedding reads, which differ only in the
         population paged (``page_template``/``census_cypher``, as for
-        ``_paged_ro_query``) and the ``method``/``noun`` they report under.
+        ``paged_ro_query``) and the ``method``/``noun`` they report under.
         """
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(graph, page_template, census_cypher)
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(graph, page_template, census_cypher, op=method)
         stale = [
             (row[0], row[1], dim)
             for row in _first_row_per_uuid(paged.rows, reader=method)
@@ -2307,9 +2364,10 @@ class GraphitiBackend:
         if not prefix:
             raise ValueError(f'{method} needs a non-empty prefix')
         upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
             graph, page_template, census_cypher, params={'prefix': prefix, 'upper': upper},
+            op=method,
         )
         matches = [
             (row[0], row[1] or '')
@@ -2335,7 +2393,7 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
 
-        PAGINATED (task 4869) through ``_paged_ro_query``, because a window
+        PAGINATED (task 4869) through ``paged_ro_query``, because a window
         spanning more edges than the server's result-set cap was silently
         truncated; incompleteness follows the shared
         ``apply_incompleteness_policy``.  See
@@ -2352,13 +2410,14 @@ class GraphitiBackend:
         Raises:
             IncompleteEnumerationError: The read was structurally incomplete.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         params = {'start': start, 'end': end}
-        paged = await _paged_ro_query(
+        paged = await paged_ro_query(
             graph,
             _EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE,
             _EDGES_IN_VALID_AT_WINDOW_CENSUS,
             params=params,
+            op='query_edges_by_time_range',
         )
         edges = [
             {
@@ -2381,7 +2440,9 @@ class GraphitiBackend:
         return edges
 
     @_canonicalize_group_args
-    async def get_valid_edges_for_node(self, node_uuid: str, *, group_id: str) -> list[EdgeDict]:
+    async def get_valid_edges_for_node(
+        self, node_uuid: str, *, group_id: str,
+    ) -> list[DatedEdgeDict]:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
         Matches the node as either source or target (undirected) and excludes
@@ -2399,17 +2460,17 @@ class GraphitiBackend:
             group_id: Project graph to query.
 
         Returns:
-            List of dicts with keys: uuid, fact, name.
+            List of DatedEdgeDicts with keys: uuid, fact, name, valid_at, invalid_at.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-() '
             f'WHERE {ACTIVE_EDGE_PREDICATE} '
-            'RETURN e.uuid, e.fact, e.name'
+            'RETURN e.uuid, e.fact, e.name, e.valid_at, e.invalid_at'
         )
-        result = await graph.ro_query(cypher, {'uuid': node_uuid})
-        seen: dict[str, EdgeDict] = {}
-        edges: list[EdgeDict] = []
+        result = await graph.ro_query(cypher, {'uuid': node_uuid}, op='get_valid_edges_for_node')
+        seen: dict[str, DatedEdgeDict] = {}
+        edges: list[DatedEdgeDict] = []
         for row in (result.result_set or []):
             edge_uuid = row[0]
             if edge_uuid in seen:
@@ -2419,7 +2480,7 @@ class GraphitiBackend:
                 # genuinely-distinct edges sharing a uuid would silently
                 # collapse to the first-seen row. Surface it at debug level
                 # rather than failing silently.
-                dup = self._edge_dict(row[0], row[1], row[2])
+                dup = self._dated_edge_dict(*row[:5])
                 prior = seen[edge_uuid]
                 if dup['fact'] != prior['fact'] or dup['name'] != prior['name']:
                     logger.debug(
@@ -2430,7 +2491,7 @@ class GraphitiBackend:
                         edge_uuid, prior['fact'], prior['name'], dup['fact'], dup['name'],
                     )
                 continue
-            edge = self._edge_dict(row[0], row[1], row[2])
+            edge = self._dated_edge_dict(*row[:5])
             seen[edge_uuid] = edge
             edges.append(edge)
         return edges
@@ -2523,14 +2584,14 @@ class GraphitiBackend:
             IndexError/TypeError/ValueError: if the row is present but its
                 first column cannot be read as an int.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = 'MATCH (n:Entity {uuid: $uuid})-[r]-(m) '
         params: dict[str, Any] = {'uuid': node_uuid}
         if episode_uuid:
             cypher += "WHERE NOT (type(r) = 'MENTIONS' AND m.uuid = $episode_uuid) "
             params['episode_uuid'] = episode_uuid
         cypher += 'RETURN count(r)'
-        result = await graph.ro_query(cypher, params)
+        result = await graph.ro_query(cypher, params, op='count_foreign_relationships')
         rows = result.result_set or []
         if not rows:
             # NOT a node with no relationships — that comes back as a readable
@@ -2564,13 +2625,13 @@ class GraphitiBackend:
         Raises:
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
             f'WHERE {ACTIVE_EDGE_PREDICATE} AND m.uuid <> $uuid '
             'RETURN DISTINCT m.uuid'
         )
-        result = await graph.ro_query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid}, op='get_connected_entity_uuids')
         return [row[0] for row in (result.result_set or [])]
 
     @_canonicalize_group_args
@@ -2587,19 +2648,20 @@ class GraphitiBackend:
         Args:
             group_id: Project graph to query.
             page_size: Rows per page. Must stay strictly below the server's
-                result-set cap — see _paged_ro_query.
+                result-set cap — see paged_ro_query.
 
         Returns:
             (grouped, paged) where *grouped* is the same dict
             get_all_valid_edges returns and *paged* is the PagedRead carrying
             ``complete``/``rows_seen``/``expected_rows``/``reason``.
         """
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
             graph,
             _ALL_VALID_EDGES_PAGE_TEMPLATE,
             _ALL_VALID_EDGES_CENSUS,
             page_size=page_size,
+            op='enumerate_all_valid_edges',
         )
         return self._group_valid_edge_rows(
             paged.rows, reader='enumerate_all_valid_edges'
@@ -2639,13 +2701,14 @@ class GraphitiBackend:
                 'enumerate_valid_edges_mentioning needs a non-empty substring: '
                 f'an empty one matches every valid edge (got {substring!r})'
             )
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
             graph,
             _VALID_EDGES_MENTIONING_PAGE_TEMPLATE,
             _VALID_EDGES_MENTIONING_CENSUS,
             params={'substring': substring},
             page_size=page_size,
+            op='enumerate_valid_edges_mentioning',
         )
         return self._group_valid_edge_rows(
             paged.rows, reader='enumerate_valid_edges_mentioning'
@@ -2718,7 +2781,7 @@ class GraphitiBackend:
         found this live in plans/falkordb-resultset-cap-audit.md (the single
         place they are recorded, so a re-measurement is a one-file edit); the
         ORDER BY and completeness rules that make paging safe are in
-        _paged_ro_query.
+        paged_ro_query.
 
         This is read_all_valid_edges_checked without the verdict.
         Incompleteness is handled by the shared apply_incompleteness_policy:
@@ -2770,14 +2833,14 @@ class GraphitiBackend:
             return 0
         logger.info('Deleting %d edge(s)', len(uuids))
         logger.debug('Edge UUIDs to delete: %s', uuids)
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         # Pre-count: how many of the requested UUIDs actually exist as edges
         count_cypher = (
             'MATCH ()-[e:RELATES_TO]->() '
             'WHERE e.uuid IN $uuids '
             'RETURN count(e) AS found'
         )
-        count_result = await graph.query(count_cypher, {'uuids': uuids})
+        count_result = await graph.query(count_cypher, {'uuids': uuids}, op='bulk_remove_edges')
         found = int(count_result.result_set[0][0]) if count_result.result_set else 0
         # Delete the edges
         delete_cypher = (
@@ -2785,7 +2848,7 @@ class GraphitiBackend:
             'WHERE e.uuid IN $uuids '
             'DELETE e'
         )
-        await graph.query(delete_cypher, {'uuids': uuids})
+        await graph.query(delete_cypher, {'uuids': uuids}, op='bulk_remove_edges')
         return found
 
     @_canonicalize_group_args
@@ -2823,13 +2886,13 @@ class GraphitiBackend:
         Raises:
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-(m:Entity) '
             f'WHERE {ACTIVE_EDGE_PREDICATE} '
             'RETURN m.uuid, e.uuid, e.fact, e.valid_at'
         )
-        result = await graph.ro_query(cypher, {'uuid': node_uuid})
+        result = await graph.ro_query(cypher, {'uuid': node_uuid}, op='dedup_valid_edges_for_node')
         duplicate_uuids = self._duplicate_edge_uuids(result.result_set or [])
         if not duplicate_uuids:
             return 0
@@ -2921,13 +2984,14 @@ class GraphitiBackend:
             after each per-edge query completes successfully, so they
             reflect edges actually redirected rather than merely enumerated.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
 
         # Phase 1: Delete inter-node edges (edges between the two merging nodes)
         count_inter = await graph.query(
             'MATCH (dep:Entity {uuid: $dep_uuid})-[e:RELATES_TO]-(sur:Entity {uuid: $sur_uuid}) '
             'RETURN count(e) AS cnt',
             {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
+            op='redirect_node_edges',
         )
         inter_node_deleted = (
             int(count_inter.result_set[0][0]) if count_inter.result_set else 0
@@ -2936,6 +3000,7 @@ class GraphitiBackend:
             'MATCH (dep:Entity {uuid: $dep_uuid})-[e:RELATES_TO]-(sur:Entity {uuid: $sur_uuid}) '
             'DELETE e',
             {'dep_uuid': deprecated_uuid, 'sur_uuid': surviving_uuid},
+            op='redirect_node_edges',
         )
 
         # Phase 2: Redirect outgoing edges (deprecated → target). Enumerate
@@ -2947,6 +3012,7 @@ class GraphitiBackend:
             'MATCH (dep:Entity {uuid: $dep_uuid})-[old:RELATES_TO]->() '
             'RETURN ID(old) AS eid',
             {'dep_uuid': deprecated_uuid},
+            op='redirect_node_edges',
         )
         out_eids = [row[0] for row in (out_enum.result_set or [])]
         outgoing_redirected = 0
@@ -2977,6 +3043,7 @@ class GraphitiBackend:
                     'eid': eid,
                     'new_uuid': new_uuid,
                 },
+                op='redirect_node_edges',
             )
             outgoing_redirected += 1
 
@@ -2989,6 +3056,7 @@ class GraphitiBackend:
             'MATCH (source)-[old:RELATES_TO]->(dep:Entity {uuid: $dep_uuid}) '
             'RETURN ID(old) AS eid',
             {'dep_uuid': deprecated_uuid},
+            op='redirect_node_edges',
         )
         in_eids = [row[0] for row in (in_enum.result_set or [])]
         incoming_redirected = 0
@@ -3019,6 +3087,7 @@ class GraphitiBackend:
                     'eid': eid,
                     'new_uuid': new_uuid,
                 },
+                op='redirect_node_edges',
             )
             incoming_redirected += 1
 
@@ -3093,12 +3162,13 @@ class GraphitiBackend:
             ``already_linked`` (links left in place because the survivor
             already carried that episode).
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
 
         enumerated = await graph.ro_query(
             'MATCH (ep:Episodic)-[m:MENTIONS]->(dep:Entity {uuid: $dep_uuid}) '
             'RETURN ID(m) AS eid, ep.uuid AS episode_uuid',
             {'dep_uuid': deprecated_uuid},
+            op='redirect_node_mentions',
         )
         links = [(row[0], row[1]) for row in (enumerated.result_set or [])]
 
@@ -3110,6 +3180,7 @@ class GraphitiBackend:
                 '(sur:Entity {uuid: $sur_uuid}) '
                 'RETURN m.uuid LIMIT 1',
                 {'episode_uuid': episode_uuid, 'sur_uuid': surviving_uuid},
+                op='redirect_node_mentions',
             )
             if existing.result_set:
                 already_linked += 1
@@ -3130,6 +3201,7 @@ class GraphitiBackend:
                     'sur_uuid': surviving_uuid,
                     'eid': eid,
                 },
+                op='redirect_node_mentions',
             )
             redirected += 1
 
@@ -3203,7 +3275,7 @@ class GraphitiBackend:
         Returns:
             Count of edges re-minted (0 on a clean graph — no-op).
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         detect_cypher = (
             'MATCH ()-[e:RELATES_TO]->() '
             'WITH e.uuid AS u, count(*) AS c, collect(ID(e)) AS eids '
@@ -3211,7 +3283,7 @@ class GraphitiBackend:
             'RETURN u, eids'
         )
         start = time.monotonic()
-        detect_result = await graph.ro_query(detect_cypher)
+        detect_result = await graph.ro_query(detect_cypher, op='_repair_duplicate_edge_uuids')
         dup_groups = detect_result.result_set or []
         repaired = 0
         for old_uuid, eids in dup_groups:
@@ -3222,6 +3294,7 @@ class GraphitiBackend:
                     'WHERE ID(e) = $eid '
                     'SET e.uuid = $new_uuid, e.superseded_edge_uuid = $old_uuid',
                     {'eid': eid, 'new_uuid': new_uuid, 'old_uuid': old_uuid},
+                    op='_repair_duplicate_edge_uuids',
                 )
                 repaired += 1
         elapsed_ms = (time.monotonic() - start) * 1000
@@ -3342,7 +3415,7 @@ class GraphitiBackend:
             residual = await self.count_foreign_relationships(
                 deprecated_uuid, group_id=group_id,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             # Deliberately NOT prefixed 'merge_entities: ' — that prefix
             # identifies the one structured JSON record per merge emitted
             # below, and a diagnostic sharing it would break any auditor that
@@ -3446,7 +3519,7 @@ class GraphitiBackend:
             try:
                 await self.refresh_entity_summary(nbr, group_id=group_id)
                 refreshed.append(nbr)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'delete_entity: refresh_entity_summary failed for nbr=%s '
                     '(deleted node uuid=%s): %s',
@@ -3484,17 +3557,19 @@ class GraphitiBackend:
             NodeNotFoundError: if no node with that UUID exists.
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         # Pre-check: verify node exists before deleting (read-only)
         check_result = await graph.ro_query(
             'MATCH (n:Entity {uuid: $uuid}) RETURN n.name, n.summary',
             {'uuid': uuid},
+            op='delete_entity_node',
         )
         if not check_result.result_set:
             raise NodeNotFoundError(f'Entity node not found: {uuid}')
         await graph.query(
             'MATCH (n:Entity {uuid: $uuid}) DETACH DELETE n',
             {'uuid': uuid},
+            op='delete_entity_node',
         )
         logger.info('delete_entity_node: deleted node=%s', uuid)
 
@@ -3507,16 +3582,41 @@ class GraphitiBackend:
         Raises:
             NodeNotFoundError: if no node with that UUID exists.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid}) '
             'RETURN n.name, n.summary'
         )
-        result = await graph.ro_query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid}, op='get_node_text')
         if not result.result_set:
             raise NodeNotFoundError(f'Entity node not found: {uuid}')
         row = result.result_set[0]
         return (row[0], row[1] or '')
+
+    @_canonicalize_group_args
+    async def get_node_names_by_uuids(
+        self, uuids: Sequence[str], *, group_id: str,
+    ) -> dict[str, str]:
+        """Name the Entity nodes among *uuids* in one indexed read (``Entity(uuid)`` range index).
+
+        It names the endpoints of a batch of graph hits. A node that is absent
+        or has no name is omitted: it has no name to give. Like
+        get_edges_by_uuids, it applies no ``n.group_id`` predicate, so an
+        edge's endpoint is named as stored.
+        """
+        wanted = list(dict.fromkeys(uuids))
+        if not wanted:
+            return {}
+        result = await self.graph_access.graph(group_id).ro_query(
+            'MATCH (n:Entity) WHERE n.uuid IN $uuids RETURN n.uuid, n.name',
+            {'uuids': wanted},
+            op='get_node_names_by_uuids',
+        )
+        names: dict[str, str] = {}
+        for node_uuid, name in result.result_set or []:
+            if isinstance(name, str) and name:
+                names.setdefault(node_uuid, name)
+        return names
 
     @_canonicalize_group_args
     async def resolve_entity_by_name(self, name: str, *, group_id: str) -> str:
@@ -3537,9 +3637,9 @@ class GraphitiBackend:
                 with all matching UUIDs listed in the error message.
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = 'MATCH (n:Entity {name: $name}) RETURN n.uuid, n.name'
-        result = await graph.ro_query(cypher, {'name': name})
+        result = await graph.ro_query(cypher, {'name': name}, op='resolve_entity_by_name')
         rows = result.result_set
         if not rows:
             raise NodeNotFoundError(f'No entity found with name: {name!r}')
@@ -3563,7 +3663,7 @@ class GraphitiBackend:
         treat an empty result as "fall back to fuzzy search" and pick nodes[0] on a hit.
 
         Scoped by an explicit `n.group_id = $group_id` property predicate (2026-07-06
-        amendment), not just the graph key selected via _graph_for — task-2115's active
+        amendment), not just the graph key selected via graph_access — task-2115's active
         cross-graph leak can plant a misrouted foreign node (group_id property of
         ANOTHER project) physically inside this graph key, and this predicate keeps
         such a clone from ever surfacing here.
@@ -3581,12 +3681,12 @@ class GraphitiBackend:
         Raises:
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {name: $name}) WHERE n.group_id = $group_id '
             'RETURN n.uuid, n.name, n.summary, labels(n)'
         )
-        result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id})
+        result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id}, op='get_nodes_by_exact_name')
         return [
             {
                 'uuid': row[0],
@@ -3636,7 +3736,7 @@ class GraphitiBackend:
         invariant rather than a convenience.
 
         Scoped by an explicit `n.group_id = $group_id` property predicate (2026-07-06
-        amendment), not just the graph key selected via _graph_for — task-2115's active
+        amendment), not just the graph key selected via graph_access — task-2115's active
         cross-graph leak can plant a misrouted foreign node (group_id property of
         ANOTHER project) physically inside this graph key, and this predicate keeps
         such a clone from ever being treated as a duplicate to collapse.
@@ -3657,7 +3757,7 @@ class GraphitiBackend:
         Raises:
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {name: $name}) '
             'WHERE n.group_id = $group_id '
@@ -3666,7 +3766,7 @@ class GraphitiBackend:
               'edge_count + mentions_count AS provenance_rank '
             + _PROVENANCE_RANK_ORDER
         )
-        result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id})
+        result = await graph.ro_query(cypher, {'name': name, 'group_id': group_id}, op='find_duplicate_entity_nodes')
         return [
             {
                 'uuid': row[0],
@@ -3734,7 +3834,7 @@ class GraphitiBackend:
         group_id property names ANOTHER project physically inside this graph
         key, and a caller collapsing duplicates must never see it.
 
-        Single un-paginated ro_query rather than _paged_ro_query, which needs a
+        Single un-paginated ro_query rather than paged_ro_query, which needs a
         total `ORDER BY n.uuid` for stable SKIP/LIMIT paging and so cannot
         carry the survivor-first ordering that makes rows[0] meaningful. A
         selective substring returns a handful of rows, so paging would buy
@@ -3759,7 +3859,7 @@ class GraphitiBackend:
         Raises:
             RuntimeError: if the backend is not initialized.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity) '
             'WHERE n.group_id = $group_id AND n.name CONTAINS $substring '
@@ -3770,7 +3870,7 @@ class GraphitiBackend:
         )
         start = time.monotonic()
         result = await graph.ro_query(
-            cypher, {'substring': substring, 'group_id': group_id}
+            cypher, {'substring': substring, 'group_id': group_id}, op='find_entity_nodes_by_name_substring'
         )
         elapsed_ms = (time.monotonic() - start) * 1000
         rows = [
@@ -3825,7 +3925,7 @@ class GraphitiBackend:
             List of (name, count) tuples for every duplicated name (count > 1).
             Empty list when the graph has no exact-name duplicates.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity) WHERE n.group_id = $group_id '
             'WITH n.name AS name, count(*) AS cnt '
@@ -3833,7 +3933,7 @@ class GraphitiBackend:
             'RETURN name, cnt'
         )
         start = time.monotonic()
-        result = await graph.ro_query(cypher, {'group_id': group_id})
+        result = await graph.ro_query(cypher, {'group_id': group_id}, op='_scan_duplicate_entity_names')
         elapsed_ms = (time.monotonic() - start) * 1000
         duplicates = [(row[0], row[1]) for row in (result.result_set or [])]
         logger.debug(
@@ -4138,7 +4238,7 @@ class GraphitiBackend:
         """
         await self._ensure_indices(group_id)
         node_uuid = str(uuid.uuid4())
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         await graph.query(
             'CREATE (n:Entity {uuid: $uuid, name: $name, group_id: $group_id, '
             'summary: $summary, created_at: $created_at})',
@@ -4149,6 +4249,7 @@ class GraphitiBackend:
                 'summary': summary,
                 'created_at': datetime.now(UTC).isoformat(),
             },
+            op='_mint_entity_node',
         )
         logger.info(
             '_mint_entity_node: minted node=%s name=%r group_id=%s',
@@ -4195,6 +4296,18 @@ class GraphitiBackend:
             'fact': fact if fact is not None else '',
             'name': name if name is not None else '',
         }
+
+    @classmethod
+    def _dated_edge_dict(
+        cls,
+        uuid: str,
+        fact: str | None,
+        name: str | None,
+        valid_at: str | None,
+        invalid_at: str | None,
+    ) -> DatedEdgeDict:
+        """An _edge_dict carrying the stored validity window verbatim."""
+        return {**cls._edge_dict(uuid, fact, name), 'valid_at': valid_at, 'invalid_at': invalid_at}
 
     @staticmethod
     def _duplicate_edge_uuids(rows: Sequence[Sequence[Any]]) -> list[str]:
@@ -4500,7 +4613,7 @@ class GraphitiBackend:
         Args:
             group_id: Project graph to query.
             page_size: Rows per page. Must stay strictly below the server's
-                result-set cap — see _paged_ro_query.
+                result-set cap — see paged_ro_query.
 
         Rows are deduplicated on ``n.uuid`` across ALL pages — see
         ``_first_row_per_uuid`` for why paging makes that necessary where a
@@ -4513,12 +4626,13 @@ class GraphitiBackend:
             ``paged.rows_seen`` counts ROWS FETCHED, so it can exceed
             ``len(nodes)`` when a boundary row was re-emitted.
         """
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
             graph,
             _ENTITY_NODES_PAGE_TEMPLATE,
             _ENTITY_NODES_CENSUS,
             page_size=page_size,
+            op='enumerate_entity_nodes',
         )
         # The consumers downstream rely on the dedup: detect_stale_with_edges
         # reports one stale entry per element and uses len(entities) as its
@@ -4546,13 +4660,14 @@ class GraphitiBackend:
         Returns:
             (rows, paged), *paged* being the read's PagedRead.
         """
-        graph = self._graph_for(group_id)
-        paged = await _paged_ro_query(
+        graph = self.graph_access.graph(group_id)
+        paged = await paged_ro_query(
             graph,
             _RANKED_ENTITY_NODES_PAGE_TEMPLATE,
             _RANKED_ENTITY_NODES_CENSUS,
             params={'group_id': group_id},
             page_size=page_size,
+            op='enumerate_ranked_entity_nodes',
         )
         rows = [
             {
@@ -4841,12 +4956,12 @@ class GraphitiBackend:
             summary: New summary text (may be empty string to clear).
             group_id: Project graph to query.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid}) '
             'SET n.summary = $summary'
         )
-        await graph.query(cypher, {'uuid': uuid, 'summary': summary})
+        await graph.query(cypher, {'uuid': uuid, 'summary': summary}, op='update_node_summary')
 
     @_canonicalize_group_args
     async def update_node_name(self, uuid: str, name: str, *, group_id: str) -> None:
@@ -4857,12 +4972,12 @@ class GraphitiBackend:
             name: New name text.
             group_id: Project graph to query.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid}) '
             'SET n.name = $name'
         )
-        await graph.query(cypher, {'uuid': uuid, 'name': name})
+        await graph.query(cypher, {'uuid': uuid, 'name': name}, op='update_node_name')
 
     @_canonicalize_group_args
     async def get_edge_text(self, uuid: str, *, group_id: str) -> tuple[str, str]:
@@ -4873,12 +4988,12 @@ class GraphitiBackend:
         Raises:
             EdgeNotFoundError: if no edge with that UUID exists.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
             'RETURN e.name, e.fact'
         )
-        result = await graph.ro_query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid}, op='get_edge_text')
         if not result.result_set:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
         row = result.result_set[0]
@@ -4898,10 +5013,11 @@ class GraphitiBackend:
         """
         if not uuids:
             return []
-        result = await self._graph_for(group_id).ro_query(
+        result = await self.graph_access.graph(group_id).ro_query(
             'MATCH (a)-[e:RELATES_TO]->(b) WHERE e.uuid IN $uuids '
             f'RETURN e.uuid, e.fact, a.name, b.name, e.episodes, {ACTIVE_EDGE_PREDICATE}',
             {'uuids': list(uuids)},
+            op='get_edges_by_uuids',
         )
         by_uuid: dict[str, EdgeWithEndpoints] = {}
         for edge_uuid, fact, source_name, target_name, episodes, active in result.result_set:
@@ -4926,12 +5042,12 @@ class GraphitiBackend:
         Raises:
             EdgeNotFoundError: if no edge with that UUID exists.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
             'RETURN e.invalid_at'
         )
-        result = await graph.ro_query(cypher, {'uuid': uuid})
+        result = await graph.ro_query(cypher, {'uuid': uuid}, op='get_edge_invalid_at')
         if not result.result_set:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
         return result.result_set[0][0]
@@ -4939,22 +5055,22 @@ class GraphitiBackend:
     @_canonicalize_group_args
     async def update_node_embedding(self, uuid: str, embedding: list[float], *, group_id: str) -> None:
         """Update the name_embedding vector for an Entity node using vecf32()."""
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH (n:Entity {uuid: $uuid}) '
             'SET n.name_embedding = vecf32($embedding)'
         )
-        await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
+        await graph.query(cypher, {'uuid': uuid, 'embedding': embedding}, op='update_node_embedding')
 
     @_canonicalize_group_args
     async def update_edge_embedding(self, uuid: str, embedding: list[float], *, group_id: str) -> None:
         """Update the fact_embedding vector for a RELATES_TO edge using vecf32()."""
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = (
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
             'SET e.fact_embedding = vecf32($embedding)'
         )
-        await graph.query(cypher, {'uuid': uuid, 'embedding': embedding})
+        await graph.query(cypher, {'uuid': uuid, 'embedding': embedding}, op='update_edge_embedding')
 
     @_canonicalize_group_args
     async def list_indices(self, *, group_id: str) -> list[dict]:
@@ -5025,7 +5141,9 @@ class GraphitiBackend:
         write-capable command) and update the integration test to pin the new
         behavior.
         """
-        return await read_index_records(self._graph_for(group_id))
+        return await read_index_records(
+            OpBoundReader(self.graph_access.graph(group_id), op='list_indices'),
+        )
 
     @_canonicalize_group_args
     async def ensure_indices(self, *, group_id: str) -> IndexProvisionResult:
@@ -5054,7 +5172,7 @@ class GraphitiBackend:
           graph that does not exist yet DOES carry zero indices and is provisioned
           from scratch — measured, the CREATE statements auto-create the key, so
           this is self-healing.  Absence is decided STRUCTURALLY
-          (``group_id not in await client.list_graphs()``), never by matching
+          (``group_id not in await self.graph_access.list_graphs()``), never by matching
           FalkorDB's error wording (D2).
         * **Serialized per graph.**  The read-diff-write section runs under a
           per-``group_id`` ``asyncio.Lock`` (``_index_provision_locks``, an
@@ -5086,7 +5204,7 @@ class GraphitiBackend:
         (``tests/_fm_falkor_live.await_index_operational``), never here.
 
         Decorated with ``@_canonicalize_group_args`` for correctness, not hygiene:
-        the writes resolve a FalkorDB graph KEY through ``_graph_for``, and the
+        the writes resolve a FalkorDB graph KEY through ``graph_access``, and the
         inner ``list_indices`` call being decorated does not cover that — the diff
         read and the writes resolve the key independently (PRD seam S4).
 
@@ -5179,10 +5297,10 @@ class GraphitiBackend:
             # which would issue every statement against a graph that may already
             # be fully provisioned.
             #
-            # The RAW client's list_graphs() is used, not GraphitiBackend's, which
-            # filters `default_db` / `*_db` and would misclassify those names as
-            # absent.
-            if group_id in await self._require_falkor_client().list_graphs():
+            # The provider's UNFILTERED listing is used, not
+            # GraphitiBackend.list_graphs(), which filters `default_db` / `*_db`
+            # and would misclassify those names as absent.
+            if group_id in await self.graph_access.list_graphs():
                 raise
             records = []
 
@@ -5196,7 +5314,7 @@ class GraphitiBackend:
         missing = expected - actual
         already_present = len(expected & actual)
 
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         created: list[IndexSpec] = []
         failed: list[tuple[IndexSpec, str]] = []
         statements: list[str] = []
@@ -5204,8 +5322,8 @@ class GraphitiBackend:
         for statement, specs in plan_index_statements(missing):
             statements.append(statement)
             try:
-                await graph.query(statement)
-            except Exception as exc:  # noqa: BLE001 - absorbed by contract, see docstring
+                await graph.query(statement, op='_ensure_indices_locked')
+            except Exception as exc:  # absorbed by contract, see docstring
                 failed.extend((spec, str(exc)) for spec in specs)
                 # Emitted HERE rather than reconstructed from `failed` afterwards
                 # because `failed` is keyed by IndexSpec, and a fulltext spec's
@@ -5248,9 +5366,9 @@ class GraphitiBackend:
         VECTOR index must go through :meth:`drop_vector_index`; see
         :meth:`drop_vector_indices` for the measurement and why it matters.
         """
-        graph = self._graph_for(group_id)
+        graph = self.graph_access.graph(group_id)
         cypher = f'DROP INDEX ON :{label}({field})'
-        await graph.query(cypher)
+        await graph.query(cypher, op='drop_index')
 
     @_canonicalize_group_args
     async def drop_vector_index(
@@ -5276,8 +5394,8 @@ class GraphitiBackend:
                 neither call site has to re-order to reach the other.
             group_id: The graph to act on.
         """
-        graph = self._graph_for(group_id)
-        await graph.query(vector_drop_statement(label, field, entity_type=entity_type))
+        graph = self.graph_access.graph(group_id)
+        await graph.query(vector_drop_statement(label, field, entity_type=entity_type), op='drop_vector_index')
 
     @_canonicalize_group_args
     async def drop_vector_indices(
@@ -5449,8 +5567,7 @@ class GraphitiBackend:
 
     async def list_graphs(self) -> list[str]:
         """Enumerate non-empty FalkorDB graphs (excluding default_db)."""
-        client = self._require_falkor_client()
-        all_graphs = await client.list_graphs()
+        all_graphs = await self.graph_access.list_graphs()
         return [g for g in all_graphs if g != 'default_db' and not g.endswith('_db')]
 
     async def node_count(self, graph_name: str) -> int:
@@ -5458,8 +5575,8 @@ class GraphitiBackend:
 
         Uses ro_query since no writes are performed.
         """
-        graph: Any = self._graph_for(graph_name)
-        result = await graph.ro_query('MATCH (n) RETURN count(n) as count')
+        graph = self.graph_access.graph(graph_name)
+        result = await graph.ro_query('MATCH (n) RETURN count(n) as count', op='node_count')
         return result.result_set[0][0] if result.result_set else 0
 
     async def close(self) -> None:
@@ -5474,6 +5591,7 @@ class GraphitiBackend:
         await close_wrapped_sdk_clients(self._sdk_client_wrappers())
         self.client = None
         self._driver = None
+        self._graph_access = None
         # Per-group clients each hold a driver that aliases an entry already
         # closed above via the _cloned_drivers loop (or self._driver itself), so
         # Graphiti.close() is never called: it would double-close the single

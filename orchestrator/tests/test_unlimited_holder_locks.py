@@ -175,6 +175,54 @@ class TestReservationsOnAnUnlimitedKey:
         assert table.try_acquire('P', ['OPERATIONS.md', 'docs/x.md', 'pkg/p.py'])
 
 
+class TestSnapshotsNameEveryHolder:
+    @pytest.mark.parametrize('order', [('A', 'B'), ('B', 'A')])
+    def test_every_holder_of_a_shared_key_is_in_the_lossless_snapshot(self, order):
+        table = _table(DOCS_AND_ROOT_MARKDOWN)
+        for task_id in order:
+            assert table.try_acquire(task_id, ['OPERATIONS.md'])
+
+        assert table.snapshot_held_by_task() == {
+            'A': ('OPERATIONS.md',),
+            'B': ('OPERATIONS.md',),
+        }
+
+    def test_lock_keys_are_sorted(self):
+        table = _table(DOCS_AND_ROOT_MARKDOWN)
+        assert table.try_acquire('A', ['docs/b.md', 'docs/a.md'])
+
+        assert table.snapshot_held_by_task()['A'] == ('docs/a.md', 'docs/b.md')
+
+    def test_snapshot_holders_is_a_one_holder_per_key_projection_of_it(self):
+        table = _table(DOCS_AND_ROOT_MARKDOWN)
+        assert table.try_acquire('A', ['OPERATIONS.md', 'docs/x.md'])
+        assert table.try_acquire('B', ['OPERATIONS.md'])
+        assert table.try_acquire('C', ['src/c.py'])
+
+        held_by_task = table.snapshot_held_by_task()
+        holders = table.snapshot_holders()
+        assert set(holders) == {key for keys in held_by_task.values() for key in keys}
+        for key, task_id in holders.items():
+            assert key in held_by_task[task_id]
+
+    def test_a_released_task_leaves_the_snapshot(self):
+        table = _table(DOCS_AND_ROOT_MARKDOWN)
+        assert table.try_acquire('A', ['OPERATIONS.md'])
+        assert table.try_acquire('B', ['OPERATIONS.md'])
+
+        table.release('A')
+
+        assert 'A' not in table.snapshot_held_by_task()
+
+    def test_a_task_admitted_with_no_keys_is_in_neither_snapshot(self):
+        table = _table(DOCS_AND_ROOT_MARKDOWN)
+        assert table.try_acquire('G', [])
+        assert table.is_held('G'), 'a gate task is admitted, holding no key'
+
+        assert table.snapshot_held_by_task() == {}
+        assert table.snapshot_holders() == {}
+
+
 class TestPrefixValidation:
     @pytest.mark.parametrize('prefix', [
         '', 'docs', '/docs/', 'docs\\x/', './docs/', 'docs/../x/', 'docs//x/', '/',

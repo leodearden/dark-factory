@@ -32,7 +32,7 @@ from _merge_lane_fakes import (
 )
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, make_placeholder_future, wait_responsive
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane.intake import enqueue_merge_request
 from orchestrator.merge_lane.queue_store import MergeQueueStore, recover_pending_merges
@@ -821,6 +821,10 @@ async def test_stop_releases_finalizing_head_worktree_host_slot_and_speculation_
     The head was merged speculatively onto the request ahead of it, so it
     carries a permit, and it verifies at _inflight[0] (task 5303).
     """
+    # Deep chains off (task 8527): under the operational yaml's chain_cap the
+    # first request, alone in the verify frontier, would chain the second into
+    # one tip verify, and this scene needs each verifying on its own.
+    config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
     store = MergeQueueStore(tmp_path / 'data' / 'orchestrator' / 'merge_queue.json')
 
     ahead_wt = await _make_branch_with_file(
@@ -846,38 +850,40 @@ async def test_stop_releases_finalizing_head_worktree_host_slot_and_speculation_
     await queue.put(head)
 
     try:
-        await _wait_for_speculative_head(worker, head)
+        try:
+            await _wait_for_speculative_head(worker, head)
 
-        gate_ahead.set()
-        outcome = await wait_responsive(
-            ahead.result, timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
-            label='the request ahead of the speculative head to land',
-        )
-        assert outcome.status == 'done', f'Expected the ahead request to land; got {outcome!r}'
+            gate_ahead.set()
+            outcome = await wait_responsive(
+                ahead.result, timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='the request ahead of the speculative head to land',
+            )
+            assert outcome.status == 'done', f'Expected the ahead request to land; got {outcome!r}'
 
-        await asyncio.wait_for(
-            verifier.await_entry(2), timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
-        )
-        await _wait_for_finalizing_head(worker, store, head)
+            await asyncio.wait_for(
+                verifier.await_entry(2), timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+            )
+            await _wait_for_finalizing_head(worker, store, head)
 
-        head_entry = next(
-            (e for e in worker.snapshot()['entries'] if e['task_id'] == head.task_id),
-            None,
-        )
-        assert head_entry is not None and head_entry['host'] is not None, (
-            f'the verifying finalize head must be listed with a host: {head_entry!r}'
-        )
-        head_merge_wt = Path(head_entry['worktree']).resolve()
-        host = head_entry['host']
+            head_entry = next(
+                (e for e in worker.snapshot()['entries'] if e['task_id'] == head.task_id),
+                None,
+            )
+            assert head_entry is not None and head_entry['host'] is not None, (
+                f'the verifying finalize head must be listed with a host: {head_entry!r}'
+            )
+            head_merge_wt = Path(head_entry['worktree']).resolve()
+            host = head_entry['host']
 
-        assert _finalize_head_holdings(worker, head_merge_wt, host) == {
-            'worktree_on_disk': True,
-            'worktree_owned': True,
-            'host_slot': 'busy',
-            'verifier_owned_permits': 1,
-        }, 'the verifying finalize head must hold every resource before stop()'
-
-        await worker.stop()
+            assert _finalize_head_holdings(worker, head_merge_wt, host) == {
+                'worktree_on_disk': True,
+                'worktree_owned': True,
+                'host_slot': 'busy',
+                'verifier_owned_permits': 1,
+            }, 'the verifying finalize head must hold every resource before stop()'
+        finally:
+            # The act under test; a finally so a give-up above still stops the worker.
+            await worker.stop()
 
         assert head.result.result() == MergeOutcome(
             'blocked', reason=MERGE_WORKER_SHUTDOWN_REASON,
@@ -911,6 +917,10 @@ async def test_stop_resolves_deque_head_verifying_before_its_first_await(
     awaits -- here the worktree cleanup of an item awaiting verify -- and the
     verifier loop can finalize it during any of them.
     """
+    # Deep chains off (task 8527): under the operational yaml's chain_cap the
+    # first request, alone in the verify frontier, would chain the second into
+    # one tip verify, and this scene needs each verifying on its own.
+    config = config.model_copy(update={'merge_deep': MergeDeepConfig(chain_cap=0)})
     head_wt = await _make_branch_with_file(
         git_ops, 'deque-head-shutdown', 'deque_head.py', 'h = 1\n',
     )

@@ -327,7 +327,7 @@ class TestOverrideStorePragmas:
             try:
                 barrier.wait()
                 store.set_override('proj', task_id, pinned=True)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 errors.append(exc)
 
         t1 = threading.Thread(target=pin_task, args=('A',))

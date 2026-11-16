@@ -4043,7 +4043,7 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
         cannot silently turn this seed into a MISS (which would make the whole
         test pass vacuously — the gate is HIT-only).
         """
-        from fused_memory.reconciliation.flag_dedup import compute_marker_signature
+        from fused_memory.reconciliation.flag_identity import compute_marker_signature
         from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 
         signature = compute_marker_signature(self._suppressed_flag(), project_id=self.PROJECT_ID)
@@ -4158,7 +4158,7 @@ class TestCrossProjectSuppressedFlagIsNotAcknowledged:
 
     @pytest.mark.asyncio
     async def test_cross_project_drop_is_excluded_from_acknowledge(self, ledger_store):
-        from fused_memory.reconciliation.flag_dedup import (
+        from fused_memory.reconciliation.flag_identity import (
             compute_flag_signature,
             compute_marker_signature,
         )

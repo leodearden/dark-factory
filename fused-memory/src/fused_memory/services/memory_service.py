@@ -81,6 +81,7 @@ from fused_memory.models.memory import (
     EpisodeStatus,
     MemoryResult,
     ReadRouteResult,
+    render_add_memory_message,
 )
 from fused_memory.models.reconciliation import (
     EventSource,
@@ -124,6 +125,7 @@ from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQue
 from fused_memory.services.mem0_add_outcome import (
     RAISED_MEM0_ADD,
     Mem0AddOutcome,
+    Mem0LegResult,
     read_mem0_add_result,
 )
 from fused_memory.services.mem0_write_retry import (
@@ -169,7 +171,9 @@ from fused_memory.services.topic_anchor import (
 )
 from fused_memory.services.write_journal import (
     Mem0IntentStatus,
+    Mem0WriteMethod,
     decode_mem0_intent_metadata,
+    decode_mem0_intent_write_method,
 )
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
@@ -1500,11 +1504,10 @@ def _edge_to_dict(e: Any) -> dict:
     """Normalize a Graphiti edge into get_entity's edge dict shape.
 
     Accepts either a dict (exact-match path, from graphiti.get_valid_edges_for_node —
-    an EdgeDict {uuid, fact, name} with no temporal fields) or an object with
-    attributes (fuzzy-match path, from graphiti.search — a fact-search result
-    that may carry valid_at/invalid_at). Dict inputs yield temporal=None today
-    since EdgeDict has no valid_at/invalid_at keys; _serialize_temporal is used
-    regardless so this stays forward-compatible if EdgeDict is later enriched.
+    a DatedEdgeDict {uuid, fact, name, valid_at, invalid_at} carrying the stored
+    ISO-8601 validity window) or an object with attributes (fuzzy-match path, from
+    graphiti.search — a graphiti_core EntityEdge with valid_at/invalid_at). Both
+    shapes map their window through _serialize_temporal.
     """
     if isinstance(e, dict):
         return {
@@ -1529,6 +1532,65 @@ def _edge_is_retired(edge: Any) -> bool:
     keeps it).
     """
     return getattr(edge, 'invalid_at', None) is not None
+
+
+def _edge_provenance(edge: Any) -> list[str]:
+    return [str(ep) for ep in (getattr(edge, 'episodes', None) or [])]
+
+
+def _surviving_search_edges(
+    edges: Sequence[Any], planned_uuids: set[str], *, include_planned: bool, limit: int,
+) -> list[tuple[Any, bool]]:
+    """The first *limit* search edges a caller sees, each paired with whether it is planned-only.
+
+    A retired edge is dropped, and so is a planned-only edge (every provenance
+    episode planned) unless *include_planned*.
+    """
+    survivors: list[tuple[Any, bool]] = []
+    for edge in edges:
+        if len(survivors) >= limit:
+            break
+        if _edge_is_retired(edge):
+            continue
+        provenance = _edge_provenance(edge)
+        is_planned = bool(provenance) and all(ep in planned_uuids for ep in provenance)
+        if is_planned and not include_planned:
+            continue
+        survivors.append((edge, is_planned))
+    return survivors
+
+
+def _edge_endpoint_uuids(edge: Any) -> tuple[str, ...]:
+    """The distinct node uuids a graphiti-core ``EntityEdge`` joins, source first."""
+    ends = (getattr(edge, 'source_node_uuid', None), getattr(edge, 'target_node_uuid', None))
+    return tuple(dict.fromkeys(node_uuid for node_uuid in ends if node_uuid))
+
+
+def _graph_search_result(
+    edge: Any, rank: int, *, is_planned: bool, node_names: Mapping[str, str],
+) -> MemoryResult:
+    """A surviving search edge as a MemoryResult naming its endpoints, source first."""
+    metadata: dict[str, Any] = {'store_rank': rank, 'store_score': None}
+    if is_planned:
+        metadata['planned'] = True
+    return MemoryResult(
+        id=getattr(edge, 'uuid', str(rank)),
+        content=getattr(edge, 'fact', str(edge)),
+        category=None,
+        source_store=SourceStore.graphiti,
+        relevance_score=_rrf_score(rank),
+        provenance=_edge_provenance(edge),
+        temporal=_serialize_temporal(
+            getattr(edge, 'valid_at', None), getattr(edge, 'invalid_at', None),
+        ),
+        entities=list(dict.fromkeys(
+            node_names[node_uuid]
+            for node_uuid in _edge_endpoint_uuids(edge)
+            if node_uuid in node_names
+        )),
+        metadata=metadata,
+        created_at=_created_at_to_utc_iso(getattr(edge, 'created_at', None)),
+    )
 
 
 # Defensive: resolve the embedding-provider's RateLimitError class at module
@@ -2873,6 +2935,9 @@ class MemoryService:
         graphiti_core's ingestion-time entity resolution (resolve_extracted_nodes)
         only resolves each extracted node against candidates surfaced by hybrid
         embedding+BM25 search — there is no guaranteed exact-name Cypher lookup.
+        (Until FalkorDB index provisioning landed — docs/prds/falkordb-index-provisioning.md,
+        task 3708, 2026-10-02 — no fulltext index existed, so the BM25 leg silently
+        returned zero rows and this search was cosine-only.)
         When that search misses an existing canonical node, ingestion mints a
         brand-new node even though a node with the exact same name already
         exists. This sweep re-checks each entity name this episode touched by
@@ -6210,7 +6275,7 @@ class MemoryService:
         for node_uuid in uuids:
             try:
                 await self.graphiti.refresh_entity_summary(node_uuid, group_id=group_id)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'post-ingest refresh_entity_summary failed for uuid=%s group=%s: %s',
                     node_uuid, group_id, exc,
@@ -6604,6 +6669,7 @@ class MemoryService:
 
         memory_ids: list[str] = []
         stores_written: list[SourceStore] = []
+        stores_queued: list[SourceStore] = []
         stores_pending_retry: list[SourceStore] = []
         meta['category'] = resolved_category.value
         _stamp_unverified_claim(meta, unverified_claim)
@@ -6721,8 +6787,7 @@ class MemoryService:
                     ),
                     callback=QueueCallback.REFRESH_ENTITY_SUMMARIES,
                 )
-                # Durably persisted to SQLite — report as written
-                stores_written.append(SourceStore.graphiti)
+                stores_queued.append(SourceStore.graphiti)
             except Exception as e:
                 logger.error(f'Graphiti enqueue failed: {e}')
                 _graphiti_error = f'{type(e).__name__}: {e}'
@@ -6734,96 +6799,42 @@ class MemoryService:
         # QueueOperation.MEM0_ADD rows still decode and execute for backward
         # compat — any in-flight queue items from before this fix still drain correctly.
         if write_mem0:
-            # Write-ahead intent (task 2710): durably journal the intended
-            # mem0 write BEFORE the risky await, so a crash mid-mem0-write
-            # leaves a 'pending' trace instead of a silently orphaned Graphiti
-            # twin. recover_mem0_intents reconciles any pending intent at
-            # startup. Keyed to the existing write_op_id so the reconciler can
-            # correlate with the per-call mem0 backend_op as evidence.
-            intent_id: str | None = None
-            if self._write_journal:
-                intent_id = str(uuid_mod.uuid4())
-                payload_digest = self._mem0_payload_digest(
-                    content,
-                    project_id,
-                    agent_id,
-                    session_id,
-                    resolved_category.value,
-                    meta,
+            leg = await self._write_mem0_leg(
+                Mem0WriteMethod.ADD,
+                content=content,
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                category=resolved_category.value,
+                metadata=meta,
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                defer_transient=defer_transient_mem0_failure,
+            )
+            memory_ids.extend(leg.outcome.memory_ids)
+            stores_written.extend(leg.outcome.stores_written)
+            _mem0_empty_result = leg.outcome.empty_result_error
+            _mem0_pending = leg.pending_retry_reason
+            if leg.pending_retry:
+                stores_pending_retry.append(SourceStore.mem0)
+            if leg.error is not None:
+                logger.error(f'Mem0 write failed: {leg.error}')
+                _mem0_error = leg.error
+            if _mem0_empty_result:
+                # mem0.add() did not raise but returned no results — a silent
+                # dedup/infer no-op drop (task 1974). Under the pinned
+                # infer=False, a successful write always returns exactly one
+                # result with an id, so this is always anomalous.
+                logger.warning(
+                    'MemoryService.add_memory: mem0 add returned zero memory_ids '
+                    '(silent empty-result drop; possible dedup/infer no-op)',
+                    extra={
+                        'project_id': project_id,
+                        'category': resolved_category.value,
+                        'causation_id': causation_id,
+                        'kind': meta.get('kind'),
+                    },
                 )
-                await self._write_journal.log_mem0_intent(
-                    intent_id=intent_id,
-                    write_op_id=write_op_id,
-                    causation_id=causation_id,
-                    project_id=project_id,
-                    agent_id=agent_id,
-                    session_id=session_id,
-                    category=resolved_category.value,
-                    content=content,
-                    metadata=meta,
-                    payload_digest=payload_digest,
-                )
-            try:
-                mem0_result = await self._journaled_backend_call(
-                    write_op_id=write_op_id,
-                    causation_id=causation_id,
-                    backend='mem0',
-                    operation='add',
-                    payload={'content': content[:200]},
-                    coro=self.mem0.add(content=content, scope=scope, metadata=meta),
-                )
-                mem0_outcome = read_mem0_add_result(
-                    mem0_result,
-                    operation='add',
-                    zero_ids_anomalous=_MEM0_ADD_INFER_PINNED_FALSE,
-                )
-                memory_ids.extend(mem0_outcome.memory_ids)
-                stores_written.extend(mem0_outcome.stores_written)
-                _mem0_empty_result = mem0_outcome.empty_result_error
-                if self._write_journal and intent_id:
-                    if _mem0_empty_result:
-                        await self._write_journal.resolve_mem0_intent(
-                            intent_id, Mem0IntentStatus.FAILED, reason=_mem0_empty_result
-                        )
-                    else:
-                        await self._write_journal.resolve_mem0_intent(
-                            intent_id, Mem0IntentStatus.COMPLETED
-                        )
-                if _mem0_empty_result:
-                    # mem0.add() did not raise but returned no results — a silent
-                    # dedup/infer no-op drop (task 1974). Under the pinned
-                    # infer=False, a successful write always returns exactly one
-                    # result with an id, so this is always anomalous.
-                    logger.warning(
-                        'MemoryService.add_memory: mem0 add returned zero memory_ids '
-                        '(silent empty-result drop; possible dedup/infer no-op)',
-                        extra={
-                            'project_id': project_id,
-                            'category': resolved_category.value,
-                            'causation_id': causation_id,
-                            'kind': meta.get('kind'),
-                        },
-                    )
-            except Exception as e:
-                _mem0_pending = (
-                    await self._defer_mem0_write_for_retry(
-                        e, intent_id=intent_id, write_op_id=write_op_id
-                    )
-                    if defer_transient_mem0_failure
-                    else None
-                )
-                if _mem0_pending is not None:
-                    stores_pending_retry.append(SourceStore.mem0)
-                else:
-                    logger.error(f'Mem0 write failed: {e}')
-                    _mem0_error = str(e)
-                    # add() provably raised → mem0 did NOT persist. Stamp the
-                    # intent 'failed' (the reconciler treats a failed-only
-                    # backend_op as safe to re-issue).
-                    if self._write_journal and intent_id:
-                        await self._write_journal.resolve_mem0_intent(
-                            intent_id, Mem0IntentStatus.FAILED, reason=str(e)
-                        )
 
         # Layer 1 journal entry
         if self._write_journal:
@@ -6843,6 +6854,7 @@ class MemoryService:
                 result_summary={
                     'memory_ids': memory_ids,
                     'stores': [s.value for s in stores_written],
+                    'stores_queued': [s.value for s in stores_queued],
                     'stores_pending': [s.value for s in stores_pending_retry],
                 },
                 success=not (_graphiti_error or _mem0_error or _mem0_empty_result),
@@ -6863,26 +6875,102 @@ class MemoryService:
             agent_id=agent_id,
         ))
 
-        msg = f'Memory queued for {[s.value for s in stores_written]}'
-        if _graphiti_error:
-            msg += f' [graphiti_error: {_graphiti_error}]'
-        if _mem0_error:
-            msg += f' [mem0_error: {_mem0_error}]'
-        if _mem0_empty_result:
-            msg += f' [{_mem0_empty_result}]'
-        if _mem0_pending:
-            msg += f' [mem0_pending_retry: {_mem0_pending}]'
-        if classification_fallback is not None:
-            msg += f' [classification_fallback: {classification_fallback.value}]'
-
         return AddMemoryResponse(
             memory_ids=memory_ids,
             stores_written=stores_written,
+            stores_queued=stores_queued,
             stores_pending_retry=stores_pending_retry,
             category=resolved_category,
-            message=msg,
+            message=render_add_memory_message(
+                stores_written=stores_written,
+                stores_queued=stores_queued,
+                stores_pending_retry=stores_pending_retry,
+                graphiti_error=_graphiti_error,
+                mem0_error=_mem0_error,
+                mem0_empty_result=_mem0_empty_result,
+                mem0_pending_retry=_mem0_pending,
+                classification_fallback=classification_fallback,
+            ),
             classification_fallback=classification_fallback,
         )
+
+    async def _write_mem0_leg(
+        self,
+        write_method: Mem0WriteMethod,
+        *,
+        content: str,
+        project_id: str,
+        agent_id: str | None,
+        session_id: str | None,
+        category: str,
+        metadata: dict,
+        write_op_id: str,
+        causation_id: str | None,
+        defer_transient: bool,
+    ) -> Mem0LegResult:
+        """Write one Mem0 leg behind a write-ahead intent; defer a transient failure when asked.
+
+        The intent (task 2710) is committed BEFORE the await, so a crash
+        mid-write leaves a ``pending`` row that ``recover_mem0_intents``
+        reconciles against the mem0 backend_op journaled under the same
+        ``write_op_id``. It journals the caller's raw ``project_id``.
+        """
+        scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
+        intent_id: str | None = None
+        if self._write_journal:
+            intent_id = str(uuid_mod.uuid4())
+            await self._write_journal.log_mem0_intent(
+                intent_id=intent_id,
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                category=category,
+                content=content,
+                metadata=metadata,
+                payload_digest=self._mem0_payload_digest(
+                    content, project_id, agent_id, session_id, category, metadata
+                ),
+                write_method=write_method,
+            )
+        try:
+            outcome = await self._call_mem0_write(
+                write_method,
+                content=content,
+                scope=scope,
+                metadata=metadata,
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+            )
+        except Exception as e:
+            reason = (
+                await self._defer_mem0_write_for_retry(
+                    e, intent_id=intent_id, write_op_id=write_op_id
+                )
+                if defer_transient
+                else None
+            )
+            if reason is not None:
+                return Mem0LegResult(RAISED_MEM0_ADD, pending_retry_reason=reason)
+            # The add provably raised, so mem0 did NOT persist: the reconciler
+            # treats a failed intent with a failed-only backend_op as safe to
+            # re-issue.
+            if self._write_journal and intent_id:
+                await self._write_journal.resolve_mem0_intent(
+                    intent_id, Mem0IntentStatus.FAILED, reason=str(e)
+                )
+            return Mem0LegResult(RAISED_MEM0_ADD, error=str(e))
+        if self._write_journal and intent_id:
+            if outcome.empty_result_error:
+                await self._write_journal.resolve_mem0_intent(
+                    intent_id, Mem0IntentStatus.FAILED, reason=outcome.empty_result_error
+                )
+            else:
+                await self._write_journal.resolve_mem0_intent(
+                    intent_id, Mem0IntentStatus.COMPLETED
+                )
+        return Mem0LegResult(outcome)
 
     async def _defer_mem0_write_for_retry(
         self, error: Exception, *, intent_id: str | None, write_op_id: str
@@ -6921,17 +7009,53 @@ class MemoryService:
             agent_id=intent.get('agent_id'),
             session_id=intent.get('session_id'),
         )
-        metadata = decode_mem0_intent_metadata(intent)
-        raw = await self._journaled_backend_call(
+        return await self._call_mem0_write(
+            decode_mem0_intent_write_method(intent),
+            content=content,
+            scope=scope,
+            metadata=decode_mem0_intent_metadata(intent),
             write_op_id=intent['write_op_id'],
             causation_id=intent.get('causation_id'),
+        )
+
+    async def _call_mem0_write(
+        self,
+        write_method: Mem0WriteMethod,
+        *,
+        content: str,
+        scope: Scope,
+        metadata: dict,
+        write_op_id: str,
+        causation_id: str | None,
+    ) -> Mem0AddOutcome:
+        """Write through the ``Mem0Backend`` method ``write_method`` names and read its result.
+
+        The one dispatch from method to backend call, shared by the original
+        write and its re-issue so the two cannot diverge. The backend_op label
+        is ``add`` for both methods: the mem0 primitive each one calls.
+        """
+        match write_method:
+            case Mem0WriteMethod.ADD:
+                coro = self.mem0.add(content=content, scope=scope, metadata=metadata)
+                zero_ids_anomalous = _MEM0_ADD_INFER_PINNED_FALSE
+            case Mem0WriteMethod.ADD_SYSTEM_RECORD:
+                coro = self.mem0.add_system_record(
+                    content=content, scope=scope, metadata=metadata
+                )
+                # Mem0Backend.add_system_record pins infer=False locally.
+                zero_ids_anomalous = True
+            case _:
+                assert_never(write_method)
+        raw = await self._journaled_backend_call(
+            write_op_id=write_op_id,
+            causation_id=causation_id,
             backend='mem0',
             operation='add',
             payload={'content': content[:200]},
-            coro=self.mem0.add(content=content, scope=scope, metadata=metadata),
+            coro=coro,
         )
         return read_mem0_add_result(
-            raw, operation='add', zero_ids_anomalous=_MEM0_ADD_INFER_PINNED_FALSE
+            raw, operation=write_method.value, zero_ids_anomalous=zero_ids_anomalous
         )
 
     @property
@@ -7137,8 +7261,10 @@ class MemoryService:
         category is stamped into the metadata as a tag only, not used for
         store routing. Models the Mem0 branch of :meth:`add_memory` minus
         the Graphiti half and minus the general-add dedup-dependent path.
+        It writes ahead a mem0 intent naming ``add_system_record``, so a
+        transient provider failure is acked ``stores_pending_retry`` and
+        re-issued through the same dedup-exempt method.
         """
-        scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         write_op_id = str(uuid_mod.uuid4())
 
         # Stage-1 flag-record write contract: flag_record_contract.py.
@@ -7171,8 +7297,8 @@ class MemoryService:
         # PRD D8/§2 name add_system_record as the second unguarded write path
         # that a tools-layer validator would leak past, so it shares the very
         # same helper rather than getting a parallel implementation that could
-        # drift. Placed after the tagging helpers and before the
-        # _journaled_backend_call below, for the reasons spelled out at
+        # drift. Placed after the tagging helpers and before the write-ahead
+        # intent and backend call below, for the reasons spelled out at
         # add_memory's call site.
         #
         # `reaches_mem0=True` unconditionally (task 3508): this path never
@@ -7195,29 +7321,23 @@ class MemoryService:
             find_canonical=self.get_memories_by_metadata,
         )
 
-        mem0_outcome = RAISED_MEM0_ADD
-        _mem0_error: str | None = None
-        try:
-            mem0_result = await self._journaled_backend_call(
-                write_op_id=write_op_id,
-                causation_id=causation_id,
-                backend='mem0',
-                operation='add',
-                payload={'content': content[:200]},
-                coro=self.mem0.add_system_record(content=content, scope=scope, metadata=meta),
-            )
-            mem0_outcome = read_mem0_add_result(
-                mem0_result, operation='add_system_record', zero_ids_anomalous=True
-            )
-        except Exception as e:
-            # Mirrors add_memory's try/except around its Mem0 branch (task
-            # 2222 amendment): without this, a raised exception would skip
-            # BOTH the Layer-1 write-journal entry and the memory_added
-            # event below, and propagate a bare error to the tool boundary
-            # with no audit trail — exactly what this guaranteed-persistence
-            # system-write path exists to rule out.
-            logger.error(f'Mem0 system-record write failed: {e}')
-            _mem0_error = str(e)
+        leg = await self._write_mem0_leg(
+            Mem0WriteMethod.ADD_SYSTEM_RECORD,
+            content=content,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            category=resolved_category.value,
+            metadata=meta,
+            write_op_id=write_op_id,
+            causation_id=causation_id,
+            defer_transient=True,
+        )
+        mem0_outcome = leg.outcome
+        if leg.error is not None:
+            # Without this the raise would leave no audit trail on the
+            # guaranteed-persistence system-write path (task 2222 amendment).
+            logger.error(f'Mem0 system-record write failed: {leg.error}')
 
         # Mem0Backend.add_system_record pins infer=False LOCALLY and
         # unconditionally (never inherited from the general add() pin — see
@@ -7229,6 +7349,7 @@ class MemoryService:
         # must not be journaled as an unconditional success.
         mem0_ids = list(mem0_outcome.memory_ids)
         stores_written = mem0_outcome.stores_written
+        stores_pending_retry = [SourceStore.mem0] if leg.pending_retry else []
         if mem0_outcome.empty_result_error:
             logger.warning(
                 'MemoryService.add_system_record: mem0 add_system_record '
@@ -7255,25 +7376,28 @@ class MemoryService:
                 result_summary={
                     'memory_ids': mem0_ids,
                     'stores': [s.value for s in stores_written],
+                    'stores_pending': [s.value for s in stores_pending_retry],
                 },
-                success=mem0_outcome.landed,
-                error=_mem0_error or mem0_outcome.empty_result_error,
+                # A write durably queued for retry was accepted, as on add_memory.
+                success=mem0_outcome.landed or leg.pending_retry,
+                error=leg.error or mem0_outcome.empty_result_error,
             )
 
-        # An empty result (whether from a caught exception above or a
-        # silent zero-id return) is tagged directly on the event payload —
-        # not just the Layer-1 journal — so a reconciliation consumer
-        # keying off memory_added alone can still distinguish a real write
-        # from a drop (task 2222 amendment).
+        # A write that did not land is tagged on the event payload itself, not
+        # just the Layer-1 journal, so a reconciliation consumer keying off
+        # memory_added alone can tell a real write from a drop (task 2222
+        # amendment) and from one queued for retry.
         _event_payload = {
             'memory_ids': mem0_ids,
             'category': resolved_category.value,
             'content_preview': content[:200],
         }
-        if not mem0_outcome.landed:
+        if leg.pending_retry:
+            _event_payload['pending_retry'] = True
+        elif not mem0_outcome.landed:
             _event_payload['empty_result'] = True
-            if _mem0_error:
-                _event_payload['error'] = _mem0_error
+            if leg.error:
+                _event_payload['error'] = leg.error
 
         await self._emit_event(ReconciliationEvent(
             id=str(uuid_mod.uuid4()),
@@ -7285,17 +7409,18 @@ class MemoryService:
             agent_id=agent_id,
         ))
 
-        msg = f'Memory queued for {[s.value for s in stores_written]}'
-        if _mem0_error:
-            msg += f' [mem0_error: {_mem0_error}]'
-        elif mem0_outcome.empty_result_error:
-            msg += f' [{mem0_outcome.empty_result_error}]'
-
         return AddMemoryResponse(
             memory_ids=mem0_ids,
             stores_written=stores_written,
+            stores_pending_retry=stores_pending_retry,
             category=resolved_category,
-            message=msg,
+            message=render_add_memory_message(
+                stores_written=stores_written,
+                stores_pending_retry=stores_pending_retry,
+                mem0_error=leg.error,
+                mem0_empty_result=mem0_outcome.empty_result_error,
+                mem0_pending_retry=leg.pending_retry_reason,
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -7873,6 +7998,10 @@ class MemoryService:
 
         ``relevance_score`` is the ordinal ``_rrf_score(store_rank)``, not a
         similarity.
+
+        ``entities`` names each hit's endpoints, source first, from one
+        ``get_node_names_by_uuids`` read over the survivors; that read is not
+        caught, so its failure fails this leg.
         """
         edges = await self.graphiti.search(
             query=query,
@@ -7887,67 +8016,24 @@ class MemoryService:
                 scope.graphiti_group_id
             )
 
-        results = []
-        for edge in edges:
-            # Skip superseded edges (invalid_at set means the fact has been
-            # replaced by a newer edge).  Check this before anything else to
-            # avoid unnecessary work on edges that will be discarded, and so a
-            # dropped edge consumes no rank.
-            if _edge_is_retired(edge):
-                continue
-
-            fact = getattr(edge, 'fact', str(edge))
-            temporal = _serialize_temporal(
-                getattr(edge, 'valid_at', None),
-                getattr(edge, 'invalid_at', None),
+        survivors = _surviving_search_edges(
+            edges, planned_uuids, include_planned=include_planned, limit=limit,
+        )
+        endpoint_uuids = list(dict.fromkeys(
+            node_uuid for edge, _ in survivors for node_uuid in _edge_endpoint_uuids(edge)
+        ))
+        names = (
+            await self.graphiti.get_node_names_by_uuids(
+                endpoint_uuids, group_id=scope.graphiti_group_id,
             )
-
-            # Extract entity names from source/target nodes
-            entities = []
-            source_node = getattr(edge, 'source_node', None)
-            target_node = getattr(edge, 'target_node', None)
-            if source_node and hasattr(source_node, 'name'):
-                entities.append(source_node.name)
-            if target_node and hasattr(target_node, 'name'):
-                entities.append(target_node.name)
-
-            # Episode provenance
-            episodes = getattr(edge, 'episodes', None) or []
-            provenance = [str(ep) for ep in episodes]
-
-            # Determine whether this edge is purely aspirational (all episodes planned).
-            is_planned_edge = bool(provenance) and all(
-                ep in planned_uuids for ep in provenance
-            )
-
-            if is_planned_edge and not include_planned:
-                # Skip planning-only edges in normal search results.
-                continue
-
-            # Rank over SURVIVORS only (task 3658): the raw enumerate index
-            # counted edges skipped above, and since RRF maps rank directly to
-            # score, a gap would silently penalize Graphiti for facts the
-            # caller never sees.
-            rank = len(results) + 1
-
-            metadata: dict[str, Any] = {'store_rank': rank, 'store_score': None}
-            if is_planned_edge:
-                metadata['planned'] = True
-
-            results.append(MemoryResult(
-                id=getattr(edge, 'uuid', str(rank)),
-                content=fact,
-                category=None,
-                source_store=SourceStore.graphiti,
-                relevance_score=_rrf_score(rank),
-                provenance=provenance,
-                temporal=temporal,
-                entities=entities,
-                metadata=metadata,
-                created_at=_created_at_to_utc_iso(getattr(edge, 'created_at', None)),
-            ))
-        # Truncate to the original limit (over-fetch may have produced extras).
-        return results[:limit]
+            if endpoint_uuids else {}
+        )
+        # Rank over SURVIVORS only (task 3658): RRF maps rank directly to score,
+        # so a gap would silently penalize Graphiti for facts the caller never sees.
+        return [
+            _graph_search_result(edge, rank, is_planned=is_planned, node_names=names)
+            for rank, (edge, is_planned) in enumerate(survivors, start=1)
+        ]
 
     async def _search_mem0(
         self,

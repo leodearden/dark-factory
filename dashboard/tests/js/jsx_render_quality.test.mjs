@@ -22,7 +22,10 @@ import {
   qualityMetric,
   qualityModuleRow,
   qualityPayload,
+  qualitySnapshotPoint,
+  qualitySnapshots,
   receiptsFor,
+  wireDatum,
 } from './wire_fixtures.mjs';
 
 // Arrays built inside the window belong to its realm, so a helper's result is
@@ -574,6 +577,7 @@ test('tab_quality.jsx::QualityTab renders a QUALITY hole by its reason', async t
 
   assert.ok(container.textContent.includes(reason), container.textContent);
   assert.equal(section(container, 'headlines'), null, 'a hole draws no headline tiles');
+  assert.ok(section(container, 'snapshots').textContent.includes(body.QUALITY_SNAPSHOTS.reason), 'the snapshots still say why they are a hole');
 });
 
 test('tab_quality.jsx::QualityTab renders one StatTile per laid-out metric, its headline through headlineText and its sparkline from rolling.center', async t => {
@@ -790,11 +794,234 @@ test('tab_quality.jsx::QualityTab re-requests for the project chosen in its sele
   assert.deepEqual(asked(), [qualityUrl(window), other]);
 });
 
-test("tab_quality.jsx::QualityTab's Snapshots section renders the QUALITY_SNAPSHOTS hole's reason", async t => {
+// ── The Snapshots section ─────────────────────────────────────────────────
+// Three served points: a schema-2 baseline, then two schema-3 nightly points,
+// with an instrument marker at the second. Each selected point's diff is
+// answered by its own /quality/snapshot-diff url.
+
+const SNAPSHOT_SHAS = ['1', '2', '3'].map(digit => digit.repeat(40));
+const SNAPSHOT_BASELINE = qualitySnapshotPoint({
+  id: 'review-all-dark_factory-20261008', baseline: true, asOfSha: SNAPSHOT_SHAS[0],
+  committedAt: '2026-10-08T18:30:00+00:00',
+  params: { complexipy_version: '6.2.0', h14_soft_ceiling_lines: 1500, h14_alarm_lines: 2000 },
+  unknownParams: ['instrument', 'python_version'],
+  cycles: { cycles: 5, hidden: 3, typing: null }, cycleClosingImports: null, deferredImports: 30,
+});
+const SNAPSHOT_NIGHTLY = qualitySnapshotPoint({
+  id: 'nightly-2', asOfSha: SNAPSHOT_SHAS[1], committedAt: '2026-11-01T02:00:00+00:00',
+  h14: { atSoftCeiling: 6, atAlarm: 1 }, deferredImports: 18,
+  diff: { previous_id: SNAPSHOT_BASELINE.id, state: 'ready', reason: null },
+});
+const SNAPSHOT_NEWEST = qualitySnapshotPoint({
+  id: 'nightly-3', asOfSha: SNAPSHOT_SHAS[2], committedAt: '2026-11-02T02:00:00+00:00',
+  h14: { atSoftCeiling: 5, atAlarm: 1 }, deferredImports: 21,
+  members: {
+    columns: SNAPSHOT_NIGHTLY.members.columns,
+    rows: [
+      { member: 'zeta', pseudo: false, cells: SNAPSHOT_NIGHTLY.members.rows[0].cells },
+      { member: 'alpha', pseudo: true, cells: SNAPSHOT_NIGHTLY.members.rows[1].cells },
+    ],
+  },
+  diff: { previous_id: SNAPSHOT_NIGHTLY.id, state: 'ready', reason: null },
+});
+const SNAPSHOT_POINTS = [SNAPSHOT_BASELINE, SNAPSHOT_NIGHTLY, SNAPSHOT_NEWEST];
+const SNAPSHOT_UNPLACED = {
+  id: 'reify-20261009', file: '/repo/plans/quality-metrics/reify-20261009.json', baseline: true,
+  reason: 'the instrument refused it: schema_version 7 is not a schema this instrument reads',
+};
+const INSTRUMENT_MARKER = qualityMarker({
+  id: `instrument:${SNAPSHOT_NIGHTLY.id}`, ordinal: 3, kind: 'instrument',
+  label: 'instrument params changed: instrument (unknown), python_version (unknown)',
+  ref: SNAPSHOT_SHAS[1], source: { type: 'instrument', point: SNAPSHOT_NIGHTLY.id },
+});
+const NEWEST_DIFF_TEXT = 'params differ: none\n\n| member | src lines |\n|---|---|\n| zeta | 3400 -> 3410 |\n';
+const BASELINE_DIFF_REASON = "the series' first point has no earlier snapshot to diff against";
+
+function snapshotDiffUrl(window, point) {
+  const { ON_DEMAND_KEYS, snapshotDiffQuery } = window.DF_DATA_LOADER;
+  return ON_DEMAND_KEYS.qualitySnapshotDiff.url(snapshotDiffQuery({ project: QUALITY_PROJECT, point }));
+}
+
+function servedDiff(point, state, { text = null, reason = null } = {}) {
+  return answered({ QUALITY_SNAPSHOT_DIFF: { point_id: point.id, previous_id: point.diff.previous_id, state, text, reason } });
+}
+
+async function mountSnapshots(harness) {
+  const { window } = harness;
+  const body = qualityBody({
+    quality: qualityFixture(window).QUALITY.value,
+    markers: qualityMarkers([...QUALITY_MARKER_ROWS, INSTRUMENT_MARKER]),
+    snapshots: wireDatum(qualitySnapshots(SNAPSHOT_POINTS, { unplaced: [SNAPSHOT_UNPLACED] })),
+  });
+  const mounted = mountQuality(harness, {
+    answers: {
+      [qualityUrl(window)]: answered(body),
+      [snapshotDiffUrl(window, SNAPSHOT_NEWEST.id)]: servedDiff(SNAPSHOT_NEWEST, 'ready', { text: NEWEST_DIFF_TEXT }),
+      [snapshotDiffUrl(window, SNAPSHOT_BASELINE.id)]: servedDiff(SNAPSHOT_BASELINE, 'first', { reason: BASELINE_DIFF_REASON }),
+    },
+  });
+  await settle(window);
+  await settle(window);
+  return { ...mounted, snapshots: section(mounted.container, 'snapshots') };
+}
+
+function chooseSnapshot(window, snapshots, pointId) {
+  const select = snapshots.querySelector('select[aria-label="snapshot"]');
+  window.React.act(() => {
+    select.value = pointId;
+    select.dispatchEvent(new window.Event('change', { bubbles: true }));
+  });
+}
+
+const snapshotHeadingText = snapshots => snapshots.querySelector('[data-quality-snapshot-heading]').textContent;
+
+test("tab_quality.jsx::QualityTab's Snapshots section renders an unknown QUALITY_SNAPSHOTS by its no-snapshot-yet reason", async t => {
   const harness = openWindow(t);
   const { container, body } = await mountAnswered(harness);
 
+  assert.ok(body.QUALITY_SNAPSHOTS.reason.startsWith('no snapshot yet'));
   assert.ok(section(container, 'snapshots').textContent.includes(body.QUALITY_SNAPSHOTS.reason));
+});
+
+test('tab_quality.jsx::QualityTab draws one step chart per snapshotCharts group, each with its baseline and instrument marks', async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const { snapshots } = await mountSnapshots(harness);
+  const { snapshotCharts, snapshotAxis } = window.DF_QUALITY_VIEW;
+  const { axisStepPaths, axisPaths, axisMax, plottableMax } = window.DF_SPARK_PATH;
+  const charts = snapshotCharts(SNAPSHOT_POINTS);
+
+  assert.deepEqual(
+    [...snapshots.querySelectorAll('[data-quality-snapshot-chart]')].map(panel => panel.getAttribute('data-quality-snapshot-chart')),
+    [...charts.map(chart => chart.group)],
+  );
+  for (const chart of charts) {
+    const panel = snapshots.querySelector(`[data-quality-snapshot-chart="${chart.group}"]`);
+    const [, , width, height] = panel.querySelector('svg').getAttribute('viewBox').split(' ').map(Number);
+    const values = chart.series.flatMap(series => series.values);
+    const geom = plotGeom(window, SNAPSHOT_POINTS.length, axisMax(plottableMax(values, 1), 4, true), { width, height });
+
+    for (const series of chart.series) {
+      const { line } = axisStepPaths(series.values, geom);
+      assert.ok(pathWithD(panel, line), `${chart.group}: ${series.key} is drawn as its step path`);
+      assert.equal(pathWithD(panel, axisPaths(series.values, geom).line), undefined, `${chart.group}: ${series.key} is not interpolated`);
+      assert.ok(panel.textContent.includes(series.label), `${chart.group}: ${series.key} is named`);
+    }
+    assert.deepEqual(
+      [...panel.querySelectorAll('text[text-anchor="middle"]')].map(text => text.textContent),
+      [...snapshotAxis(SNAPSHOT_POINTS)],
+      `${chart.group}: one column per snapshot, labelled by its commit date`,
+    );
+    assert.equal(panel.querySelectorAll('.chart-mark-baseline').length, 1, `${chart.group}: the baseline mark`);
+    const rugs = [...panel.querySelectorAll('.chart-mark-rug')];
+    assert.equal(rugs.length, 1, `${chart.group}: the instrument mark`);
+    assert.ok(rugs[0].getAttribute('title').includes(INSTRUMENT_MARKER.label));
+    assert.ok(panel.textContent.includes('/review-all baseline'), `${chart.group}: the legend names the baseline`);
+  }
+});
+
+test('tab_quality.jsx::QualityTab selects the newest snapshot and shows its members table as served, with no domain row', async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const { snapshots } = await mountSnapshots(harness);
+  const { snapshotTable, snapshotHeading, snapshotLabel } = window.DF_QUALITY_VIEW;
+  const select = snapshots.querySelector('select[aria-label="snapshot"]');
+  const table = snapshotTable(SNAPSHOT_NEWEST);
+
+  assert.deepEqual([...select.options].map(option => [option.value, option.textContent]), SNAPSHOT_POINTS.map(point => [point.id, snapshotLabel(point)]));
+  assert.equal(select.value, SNAPSHOT_NEWEST.id);
+  assert.equal(snapshotHeadingText(snapshots), snapshotHeading(SNAPSHOT_NEWEST));
+  const members = snapshots.querySelector('table.tbl');
+  assert.deepEqual([...members.querySelectorAll('thead th')].map(th => th.textContent), [...table.headers]);
+  assert.deepEqual(
+    [...members.querySelectorAll('tbody tr')].map(row => [...row.querySelectorAll('td')].map(td => td.textContent)),
+    table.rows.map(row => [...row]),
+  );
+  assert.deepEqual([...members.querySelectorAll('tbody tr')].map(row => row.firstChild.textContent), ['zeta', 'alpha'], 'served order, never sorted');
+  assert.equal(members.textContent.includes('(domain)'), false);
+  assert.equal(/average|mean|total lines/i.test(snapshots.textContent), false, 'no average and no headline total');
+});
+
+test('tab_quality.jsx::QualityTab reads the baseline point as instrument unknown', async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const { snapshots } = await mountSnapshots(harness);
+
+  chooseSnapshot(window, snapshots, SNAPSHOT_BASELINE.id);
+  await settle(window);
+
+  assert.equal(snapshotHeadingText(snapshots), window.DF_QUALITY_VIEW.snapshotHeading(SNAPSHOT_BASELINE));
+  assert.ok(snapshotHeadingText(snapshots).includes('instrument unknown'));
+});
+
+test("tab_quality.jsx::QualityTab requests the selected point's diff and renders it verbatim in a pre, a first point's by its reason", async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const { snapshots, asked } = await mountSnapshots(harness);
+  const diff = () => snapshots.querySelector('pre[data-quality-snapshot-diff]');
+
+  assert.ok(asked().includes(snapshotDiffUrl(window, SNAPSHOT_NEWEST.id)));
+  assert.equal(diff().textContent, NEWEST_DIFF_TEXT);
+  assert.ok(diff().classList.contains('mono'));
+
+  chooseSnapshot(window, snapshots, SNAPSHOT_BASELINE.id);
+  await settle(window);
+  await settle(window);
+
+  assert.ok(asked().includes(snapshotDiffUrl(window, SNAPSHOT_BASELINE.id)));
+  assert.equal(diff().textContent, BASELINE_DIFF_REASON);
+});
+
+test('tab_quality.jsx::QualityTab names each unplaced snapshot file with its reason', async t => {
+  const harness = openWindow(t);
+  const { snapshots } = await mountSnapshots(harness);
+
+  assert.ok(snapshots.textContent.includes(SNAPSHOT_UNPLACED.file));
+  assert.ok(snapshots.textContent.includes(SNAPSHOT_UNPLACED.reason));
+});
+
+test('tab_quality.jsx::QualityTab draws a served QUALITY_SNAPSHOTS under a QUALITY hole, its instrument marks still placed', async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const reason = 'no landing of dark_factory has been sampled yet';
+  const body = {
+    ...qualityBody({
+      quality: qualityFixture(window).QUALITY.value,
+      markers: qualityMarkers([INSTRUMENT_MARKER]),
+      snapshots: wireDatum(qualitySnapshots(SNAPSHOT_POINTS)),
+    }),
+    QUALITY: { value: null, as_of: null, state: 'unknown', reason, freshness_bound_seconds: 1200 },
+  };
+  const { container } = mountQuality(harness, {
+    answers: {
+      [qualityUrl(window)]: answered(body),
+      [snapshotDiffUrl(window, SNAPSHOT_NEWEST.id)]: servedDiff(SNAPSHOT_NEWEST, 'ready', { text: NEWEST_DIFF_TEXT }),
+    },
+  });
+  await settle(window);
+  await settle(window);
+  const snapshots = section(container, 'snapshots');
+  const charts = window.DF_QUALITY_VIEW.snapshotCharts(SNAPSHOT_POINTS);
+
+  assert.ok(container.textContent.includes(reason), container.textContent);
+  assert.equal(section(container, 'headlines'), null, 'the landing series stays a hole');
+  assert.ok(snapshots, 'the snapshot section is drawn');
+  assert.equal(snapshots.querySelectorAll('[data-quality-snapshot-chart]').length, charts.length);
+  assert.equal(snapshots.querySelectorAll('.chart-mark-rug').length, charts.length, 'each chart carries the instrument mark');
+  assert.equal(snapshots.querySelector('pre[data-quality-snapshot-diff]').textContent, NEWEST_DIFF_TEXT);
+});
+
+test('tab_quality.jsx::QualityTab draws no instrument mark on a landing-axis chart', async t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const { container } = await mountSnapshots(harness);
+  const { QUALITY_LAYOUT } = window.DF_QUALITY_VIEW;
+
+  for (const { metric: id } of [...QUALITY_LAYOUT.outcomes, ...QUALITY_LAYOUT.changeCost]) {
+    const titles = [...metricPanel(container, id).querySelectorAll('[title]')].map(node => node.getAttribute('title'));
+    assert.equal(titles.some(title => title.includes(INSTRUMENT_MARKER.label)), false, id);
+    assert.equal(metricPanel(container, id).textContent.includes(INSTRUMENT_MARKER.label), false, id);
+  }
 });
 
 // The whole page also lands one async App update outside act() after any tab

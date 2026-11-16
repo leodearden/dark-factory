@@ -103,7 +103,7 @@ _BUILD_WORKFLOW_PARAMS = (
     'escalation_queue', 'escalation_event', 'usage_gate', 'initial_plan',
     'steward_factory', 'merge_queue', 'merge_worker', 'merge_inflight_registry',
     'event_store', 'cost_store', 'cancel_event', 'resume_session_id', 'run_id',
-    'resume_outcome_sink', 'task_verify',
+    'resume_outcome_sink', 'task_verify', 'task_priority',
 )
 
 

@@ -388,7 +388,8 @@ Sizes are expected changed lines. Same-file leaves are serialised by the edges s
 - **η — Write replies echo live task facts; guidance tells writers what to record.** fused-memory:
   `server/tools.py` (`add_memory`, `add_episode`, `update_memory`),
   `utils/referent_resolution.py::render_referent_declaration_guidance`;
-  docs: `skills/memory/SKILL.md`, `CLAUDE.md` (memory section; and correct its statement that the task-search
+  docs: `.claude/commands/memory.md` (the `/memory` reference; corrected at decompose 2026-11-14 from a
+  non-existent `skills/memory/SKILL.md`), `CLAUDE.md` (memory section; and correct its statement that the task-search
   corpus leaves out deferred tasks, measured false), tests. ~500. Contract C3. Signal: an `add_memory` whose
   text says a finished task is pending returns `task_facts` showing it done. Prereqs: α, γ, δ (same file).
 - **θ — Code writers carry the task as structure and write no status value.** orchestrator:

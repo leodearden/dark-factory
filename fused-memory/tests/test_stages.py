@@ -14529,7 +14529,7 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
         only signals asserting liveness are the lingering worktree + the
         (monkeypatched) project-wide orchestrator lock.
         """
-        import subprocess  # noqa: PLC0415 — module-local per this file's convention
+        import subprocess  # module-local per this file's convention
 
         old_ts = (self._NOW - timedelta(hours=48)).isoformat()
 
@@ -14734,7 +14734,7 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
         must drop. Pass *worktree_for_branch* to additionally register a live
         worktree for that branch.
         """
-        import subprocess  # noqa: PLC0415 — module-local per this file's convention
+        import subprocess  # module-local per this file's convention
 
         def side_effect(args, **kwargs):
             if '--porcelain' in args:

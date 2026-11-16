@@ -7069,7 +7069,7 @@ async def test_main_wires_ticket_store_into_interceptor(
     2. The returned store is open — initialize() was called.
     3. A TaskInterceptor built with ticket_store=store exposes it as _ticket_store.
     """
-    from fused_memory.server.main import _build_ticket_store  # noqa: PLC0415
+    from fused_memory.server.main import _build_ticket_store
 
     store = await _build_ticket_store(tmp_path)
 

@@ -579,7 +579,7 @@ def manifest_paths(project_root: str) -> list[Path]:
     """Every tracked ``*.capability-manifest.yaml`` under *project_root*.
 
     ``git ls-files``, never ``rglob`` — the same anti-worktree reasoning
-    ``shared/tests/capability_manifest_corpus.py`` records: ``.worktrees/`` is
+    ``shared/tests/cross_suite_helpers/capability_manifest_corpus.py`` records: ``.worktrees/`` is
     gitignored and holds thousands of other tasks' checkouts, so an
     rglob-based sweep would audit unrelated working copies. A non-checkout
     yields ``[]`` rather than raising: the tasks.db half of the join is still
@@ -623,7 +623,7 @@ def load_manifest_checks(
     for path in manifest_paths(project_root):
         try:
             doc = load_capability_manifest(path)
-        except Exception:  # noqa: BLE001 - counted, never silent; see docstring
+        except Exception:  # counted, never silent; see docstring
             unloadable += 1
             continue
         rel = str(path.relative_to(project_root))

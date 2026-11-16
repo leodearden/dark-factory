@@ -285,8 +285,8 @@ def build_memory_service() -> Any:
     check needs neither FalkorDB/Graphiti nor an embedder / OPENAI_API_KEY —
     the same argument ``census_memory_metadata.py::_build_backend`` makes.
     """
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.services.memory_service import MemoryService
 
     return MemoryService(FusedMemoryConfig())
 
@@ -379,7 +379,7 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
         scrolled = await scroll_cluster(
             memory, project_id, topic, block=block
         )
-    except Exception as exc:  # noqa: BLE001 — any store failure is "could not check"
+    except Exception as exc:  # any store failure is "could not check"
         store_error = f"{type(exc).__name__}: {exc}"
         scrolled = {
             "members": [],

@@ -6,8 +6,9 @@ Background
 ----------
 Graphiti node f02a32ea-0efd-4865-94b4-97a412d8ffda (name 'orchestrator',
 group_id='reify') has been observed present in three separate FalkorDB
-graphs: 'reify', 'dark_factory', and 'know_live'. ``GraphitiBackend._driver_for``
-/ ``_graph_for`` (fused_memory/backends/graphiti_client.py) use ``group_id``
+graphs: 'reify', 'dark_factory', and 'know_live'.
+``fused_memory/backends/graphiti_client.py::GraphitiBackend._driver_for`` and
+``fused_memory/backends/graph_access.py::FalkorGraphAccess.graph`` use ``group_id``
 VERBATIM as the FalkorDB graph name, with NO canonicalization applied. By
 contrast, ``resolve_project_id`` (fused_memory/models/scope.py) -- which
 lowercases a project root's basename and maps hyphens to underscores -- IS
@@ -121,11 +122,12 @@ async def probe_node_across_graphs(
     """
     entries: list[dict] = []
     for name in graph_names:
-        graph = graphiti._graph_for(name)
+        graph = graphiti.graph_access.graph(name)
         try:
             result = await graph.ro_query(
                 'MATCH (n {uuid: $uuid}) RETURN n.uuid, n.name, n.group_id',
                 {'uuid': uuid},
+                op='probe_node_across_graphs',
             )
         except Exception as e:
             logger.warning(
@@ -272,12 +274,12 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> int:
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.services.memory_service import MemoryService
 
         config = FusedMemoryConfig()
         memory = MemoryService(config)

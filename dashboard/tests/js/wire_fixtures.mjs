@@ -64,6 +64,11 @@ export function servingEndpoint(loader, key, win = '24h') {
   return { stateKey: loader.pollKey(url), spec: keySpecs[key] };
 }
 
+// Every DF_DATA key some endpoint data.js polls at window `win` serves.
+export function everyPolledKey(loader, win = '24h') {
+  return Object.values(loader.endpointsFor(win)).flatMap(keySpecs => Object.keys(keySpecs));
+}
+
 // The __receipt entries a poll records for the endpoints serving `keys`,
 // received now so nothing reads as aged.
 export function receiptsFor(loader, keys, win = '24h') {
@@ -503,19 +508,22 @@ export function qualityComparison({
   };
 }
 
-const NO_SNAPSHOT_PRODUCER = 'no producer has written here: the nightly quality-metrics snapshot series has no writer yet';
+const NO_SNAPSHOT_YET = 'no snapshot yet: neither plans/quality-metrics/ nor data/quality-metrics/dark_factory/ '
+  + `holds a snapshot file (scanned at ${WIRE_AS_OF})`;
 
 // The whole /api/v2/dashboard/quality body, as api/quality.py::api_quality
 // serves it: `quality` (a qualityPayload value) and `markers` (a
-// qualityMarkers value) as fresh Datums, the snapshot Datum unknown because
-// its producer has not landed, and the landing window echo `window` asked
-// for and served.
-export function qualityBody({ quality, markers = qualityMarkers([]), window = '100' }) {
+// qualityMarkers value) as fresh Datums, `snapshots` as given (a Datum, by
+// default the unknown a scan that found neither home serves), and the landing
+// window echo `window` asked for and served.
+export function qualityBody({
+  quality, markers = qualityMarkers([]), snapshots = unreadWireDatum(NO_SNAPSHOT_YET), window = '100',
+}) {
   const landings = window === 'all' ? null : Number(window);
   return {
     QUALITY: wireDatum(quality),
     QUALITY_MARKERS: wireDatum(markers),
-    QUALITY_SNAPSHOTS: unreadWireDatum(NO_SNAPSHOT_PRODUCER),
+    QUALITY_SNAPSHOTS: snapshots,
     WINDOW: { requested: window, served: window, landings },
     served_at: WIRE_AS_OF,
   };
@@ -557,4 +565,87 @@ export function qualityMarkers(markers) {
     curated_parse_failures: 0,
     skipped_records: 0,
   };
+}
+
+// The QUALITY_SNAPSHOTS value and its points, as
+// dashboard/src/dashboard/data/quality_snapshots.py::SnapshotSeries.to_wire and
+// ::ScannedPoint.to_wire serve them; those methods own the shape. The columns
+// are the instrument's --summary headers (scripts/quality_metrics_snapshot.py
+// ::_SUMMARY_COLUMNS), and each member row holds the instrument's cell texts.
+
+const SNAPSHOT_COLUMNS = Object.freeze([
+  'src files', 'src lines', 'src prose lines', 'src cognitive max / total', 'tests files', 'tests lines',
+  'tests cognitive total', 'files >= 1500 lines', 'files >= 2000 lines', 'function-local imports',
+  're-export names', 'reach-back imports', 'private patch targets', 'private reads',
+]);
+
+const SNAPSHOT_MEMBERS = Object.freeze({
+  columns: SNAPSHOT_COLUMNS,
+  rows: Object.freeze([
+    Object.freeze({
+      member: 'dashboard', pseudo: false,
+      cells: Object.freeze(['12', '3400', '210', '41 / 380', '9', '2100', '150', '1', '0', '4', '2', '0', '3', '5']),
+    }),
+    Object.freeze({
+      member: 'scripts', pseudo: true,
+      cells: Object.freeze(['30', '9100', '640', '77 / 1210', '22', '6600', '410', '2', '1', '11', '0', '3', '6', '9']),
+    }),
+  ]),
+});
+
+const SCHEMA_3_PARAMS = Object.freeze({
+  complexipy_version: '6.2.0',
+  h14_soft_ceiling_lines: 1500,
+  h14_alarm_lines: 2000,
+  python_version: '3.13.9',
+  instrument: Object.freeze({ quality_metrics_snapshot: 'a'.repeat(40), source_measures: 'b'.repeat(40) }),
+});
+
+// One QUALITY_SNAPSHOTS.value.points entry: a complete schema-3 nightly point
+// that is its series' first (diff state 'first'), unless overridden. A
+// baseline names its file under plans/quality-metrics/.
+export function qualitySnapshotPoint({
+  id = 'nightly-1',
+  baseline = false,
+  asOfSha = '1'.repeat(40),
+  file = baseline
+    ? `/repo/plans/quality-metrics/review-all-dark_factory-${id}.json`
+    : `/repo/data/quality-metrics/dark_factory/${asOfSha}.json`,
+  committedAt = WIRE_AS_OF,
+  runId = `run-${id}`,
+  params = SCHEMA_3_PARAMS,
+  unknownParams = [],
+  complete = true,
+  members = SNAPSHOT_MEMBERS,
+  h14 = { atSoftCeiling: 3, atAlarm: 1 },
+  cycles = { cycles: 2, hidden: 1, typing: 0 },
+  deferredImports = 15,
+  cycleClosingImports = 4,
+  privatePatchTargets = 9,
+  diff = { previous_id: null, state: 'first', reason: null },
+} = {}) {
+  return {
+    id,
+    file,
+    baseline,
+    as_of_sha: asOfSha,
+    committed_at: committedAt,
+    run_id: runId,
+    params,
+    unknown_params: unknownParams,
+    complete,
+    members,
+    h14: { soft_ceiling_lines: 1500, alarm_lines: 2000, at_soft_ceiling: h14.atSoftCeiling, at_alarm: h14.atAlarm },
+    cycles: { cycles: cycles.cycles, hidden_cycles: cycles.hidden, typing_cycles: cycles.typing },
+    deferred_imports: deferredImports,
+    cycle_closing_imports: cycleClosingImports,
+    private_patch_targets: privatePatchTargets,
+    diff,
+  };
+}
+
+// The QUALITY_SNAPSHOTS Datum's value: `points` as given (in served order),
+// nothing unplaced and nothing pending unless given.
+export function qualitySnapshots(points, { unplaced = [], pendingFiles = 0, pendingDiffs = 0 } = {}) {
+  return { points, unplaced, pending: { files: pendingFiles, diffs: pendingDiffs } };
 }

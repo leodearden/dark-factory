@@ -10,6 +10,7 @@ from fused_memory.models.enums import SourceStore
 from fused_memory.services.mem0_add_outcome import (
     RAISED_MEM0_ADD,
     Mem0AddOutcome,
+    Mem0LegResult,
     read_mem0_add_result,
 )
 
@@ -89,3 +90,65 @@ def test_outcome_is_frozen():
     for field in dataclasses.fields(outcome):
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(outcome, field.name, None)
+
+
+_LANDED = Mem0AddOutcome(memory_ids=('m1',), empty_result_error=None)
+_EMPTY = Mem0AddOutcome(
+    memory_ids=(), empty_result_error='empty_result: mem0 add returned zero memory_ids'
+)
+
+
+@pytest.mark.parametrize(
+    ('outcome', 'raised_fields'),
+    [
+        (_LANDED, {}),
+        (_EMPTY, {}),
+        (RAISED_MEM0_ADD, {'error': 'boom'}),
+        (RAISED_MEM0_ADD, {'pending_retry_reason': 'rate_limited: RateLimitError'}),
+    ],
+    ids=['landed', 'empty-result', 'raised', 'deferred'],
+)
+def test_a_consistent_leg_constructs(outcome, raised_fields):
+    leg = Mem0LegResult(outcome, **raised_fields)
+
+    assert leg.outcome is outcome
+    assert leg.error == raised_fields.get('error')
+    assert leg.pending_retry_reason == raised_fields.get('pending_retry_reason')
+
+
+def test_a_leg_cannot_both_fail_and_be_deferred():
+    with pytest.raises(ValueError) as excinfo:
+        Mem0LegResult(RAISED_MEM0_ADD, error='boom', pending_retry_reason='rate_limited')
+
+    message = str(excinfo.value)
+    assert "'boom'" in message
+    assert "'rate_limited'" in message
+
+
+@pytest.mark.parametrize(
+    'raised_field', [{'error': 'boom'}, {'pending_retry_reason': 'rate_limited'}]
+)
+def test_a_landed_leg_cannot_carry_a_raise(raised_field):
+    with pytest.raises(ValueError, match="'m1'"):
+        Mem0LegResult(_LANDED, **raised_field)
+
+
+@pytest.mark.parametrize(
+    'raised_field', [{'error': 'boom'}, {'pending_retry_reason': 'rate_limited'}]
+)
+def test_a_raised_leg_is_exactly_the_raised_outcome(raised_field):
+    with pytest.raises(ValueError, match='zero memory_ids'):
+        Mem0LegResult(_EMPTY, **raised_field)
+
+
+@pytest.mark.parametrize(
+    ('outcome', 'raised_fields', 'pending'),
+    [
+        (_LANDED, {}, False),
+        (RAISED_MEM0_ADD, {'error': 'boom'}, False),
+        (RAISED_MEM0_ADD, {'pending_retry_reason': 'rate_limited'}, True),
+    ],
+    ids=['landed', 'raised', 'deferred'],
+)
+def test_only_a_deferred_leg_is_pending_retry(outcome, raised_fields, pending):
+    assert Mem0LegResult(outcome, **raised_fields).pending_retry is pending

@@ -628,30 +628,42 @@ class TestStoredPassesSince:
 
 
 class TestRetention:
-    def _allocate_aged(self, store: RunRecordStore, clock: _Clock, now: datetime, days: int) -> str:
-        clock.current = now - timedelta(days=days)
+    def _allocate_aged(
+        self, store: RunRecordStore, clock: _Clock, now: datetime, age: timedelta
+    ) -> str:
+        clock.current = now - age
         lane_pass = store.allocate_pass('unit', Leg.GENERIC, HEAD)
         store.write_run(lane_pass, _record())
         return lane_pass.pass_id
-
-    def test_retention_is_fourteen_days(self) -> None:
-        assert timedelta(days=14) == RECORD_RETENTION
 
     def test_a_pass_older_than_retention_is_removed_and_a_newer_one_kept(
         self, store: RunRecordStore, clock: _Clock
     ) -> None:
         now = T0 + timedelta(days=30)
-        old = self._allocate_aged(store, clock, now, 15)
-        recent = self._allocate_aged(store, clock, now, 13)
+        old = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=1))
+        recent = self._allocate_aged(store, clock, now, RECORD_RETENTION - timedelta(days=1))
 
         assert store.prune(now) == [old]
 
         assert not (store.root / 'unit' / old).exists()
         assert (store.root / 'unit' / recent / 'record.json').is_file()
 
+    def test_a_pass_older_than_fourteen_days_and_younger_than_sixty_survives_a_prune(
+        self, store: RunRecordStore, clock: _Clock
+    ) -> None:
+        now = T0 + timedelta(days=30)
+        fifteen = self._allocate_aged(store, clock, now, timedelta(days=15))
+        fifty_nine = self._allocate_aged(store, clock, now, timedelta(days=59))
+        sixty_one = self._allocate_aged(store, clock, now, timedelta(days=61))
+
+        assert store.prune(now) == [sixty_one]
+
+        assert (store.root / 'unit' / fifteen / 'record.json').is_file()
+        assert (store.root / 'unit' / fifty_nine / 'record.json').is_file()
+
     def test_a_pinned_pass_survives(self, store: RunRecordStore, clock: _Clock) -> None:
         now = T0 + timedelta(days=30)
-        old = self._allocate_aged(store, clock, now, 15)
+        old = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=1))
 
         assert store.prune(now, pinned_pass_ids={old}) == []
 
@@ -659,7 +671,7 @@ class TestRetention:
 
     def test_pruning_covers_every_command(self, store: RunRecordStore, clock: _Clock) -> None:
         now = T0 + timedelta(days=30)
-        clock.current = now - timedelta(days=20)
+        clock.current = now - RECORD_RETENTION - timedelta(days=6)
         first = store.allocate_pass('one', Leg.GENERIC, HEAD).pass_id
         second = store.allocate_pass(LEGACY_INFRA_COMMAND, Leg.INFRA, 'fedcba9876').pass_id
 
@@ -676,7 +688,7 @@ class TestRetention:
         self, store: RunRecordStore, clock: _Clock
     ) -> None:
         now = T0 + timedelta(days=30)
-        old = self._allocate_aged(store, clock, now, 15)
+        old = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=1))
         (store.root / 'unit' / old / 'record.json').write_text('garbage')
 
         assert store.prune(now) == [old]
@@ -690,8 +702,8 @@ class TestRetention:
         self, store: RunRecordStore, clock: _Clock, caplog: pytest.LogCaptureFixture
     ) -> None:
         now = T0 + timedelta(days=30)
-        stuck = self._allocate_aged(store, clock, now, 15)
-        removable = self._allocate_aged(store, clock, now, 16)
+        stuck = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=1))
+        removable = self._allocate_aged(store, clock, now, RECORD_RETENTION + timedelta(days=2))
 
         with _locked_subdirectory(store.root / 'unit' / stuck), caplog.at_level(logging.WARNING):
             assert store.prune(now) == [removable]
@@ -1139,11 +1151,13 @@ class TestLaneRetention:
     ) -> None:
         expired = _seed_pass(tmp_path, RECORD_RETENTION + timedelta(days=6))
         recent = _seed_pass(tmp_path, timedelta(days=1))
+        month_old = _seed_pass(tmp_path, timedelta(days=30))
 
         await _run_one_pass(tmp_path, 'exit 0', until_phase=Phase.DETECT)
 
         assert not expired.exists()
         assert (recent / 'record.json').is_file()
+        assert (month_old / 'record.json').is_file()
 
     @_needs_file_permissions
     @pytest.mark.asyncio

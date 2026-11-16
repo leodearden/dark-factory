@@ -180,7 +180,7 @@ class _FakeProc:
         self._on_enter = on_enter
         self._on_exit = on_exit
 
-    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:  # noqa: A002
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
         self._on_enter()
         try:
             await asyncio.sleep(0.02)
@@ -271,7 +271,7 @@ class _BlockingProc:
         self._entered = entered
         self._tag = tag
 
-    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:  # noqa: A002
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
         self._entered.append(self._tag)
         await self._released.wait()
         return b'', b''

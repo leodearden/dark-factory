@@ -18,7 +18,7 @@ from typing import cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _workflow_helpers import (  # noqa: F401  _Fixture: re-export, see test_workflow_helpers.py
+from _workflow_helpers import (  # _Fixture: re-export, see test_workflow_helpers.py
     _bind_landed_row,
     _Fixture,
     _make,

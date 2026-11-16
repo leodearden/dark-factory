@@ -580,7 +580,7 @@ def build_report(
             registry_coverage, registry_error = _build_registry_coverage(
                 project_totals, registry,
             )
-        except Exception as exc:  # noqa: BLE001 - the gauge is never fatal
+        except Exception as exc:  # the gauge is never fatal
             registry_coverage = None
             registry_error = f'{type(exc).__name__}: {exc}'
 
@@ -723,7 +723,7 @@ def load_registry_or_error(path: str) -> tuple[TopicRegistry | None, str | None]
     """
     try:
         registry = load_topic_registry(path)
-    except Exception as exc:  # noqa: BLE001 - every load failure is disclosed
+    except Exception as exc:  # every load failure is disclosed
         return None, f'{type(exc).__name__}: {exc}'
     return registry, None
 
@@ -861,11 +861,11 @@ def read_canonical_uniqueness_enforced(config: Any | None = None) -> bool | None
     """
     try:
         if config is None:
-            from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+            from fused_memory.config.schema import FusedMemoryConfig
 
             config = FusedMemoryConfig()
         return bool(config.memory_metadata.enforce)
-    except Exception as exc:  # noqa: BLE001 - any load failure degrades to null
+    except Exception as exc:  # any load failure degrades to null
         logger.warning(
             'could not read memory_metadata.enforce (%s: %s) -- reporting null',
             type(exc).__name__,
@@ -1200,7 +1200,7 @@ def load_coverage_history(path: str) -> dict[str, Any]:
         return empty_coverage_history()
     try:
         raw = json.loads(history_path.read_text(encoding='utf-8'))
-    except Exception as exc:  # noqa: BLE001 - every unreadable shape is named
+    except Exception as exc:  # every unreadable shape is named
         raise CoverageHistoryError(
             f'{path}: unreadable coverage history ({type(exc).__name__}: {exc})',
         ) from exc
@@ -1783,7 +1783,7 @@ async def census_project(
         ``collection_points_before``/``collection_points`` pair, and
         per-category expected/recount/scrolled/delta/complete.
     """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
+    from fused_memory.models.scope import Scope
 
     category_values = list(categories) if categories is not None else [
         c.value for c in CENSUS_CATEGORIES
@@ -1911,11 +1911,12 @@ def _regen_command(params: dict[str, Any]) -> str:
     # relative to `fused-memory/` while `--registry` / `--history-out` carry
     # `_repo_relative` values -- relative to the repo ROOT -- so a run using
     # either non-default path emitted a command whose script and whose flags
-    # could not both resolve from any single directory. `--frozen` is not
-    # decoration: regenerating a committed artifact under a resolved-fresh
-    # dependency set is not a reproduction of the run that wrote it.
+    # could not both resolve from any single directory. `--no-sync` is not
+    # decoration: with no resolve and no sync, the regen reproduces the run
+    # under the environment that run used, and never installs into the shared
+    # root .venv (measured in scripts/orchestrator-autopilot-video.service).
     parts = [
-        'uv run --frozen --project fused-memory python '
+        'uv run --no-sync --project fused-memory python '
         'fused-memory/scripts/census_memory_metadata.py',
     ]
     projects = params.get('projects') or []
@@ -2719,7 +2720,7 @@ def _build_backend(config: Any) -> Any:
     still runs when the graph store or LLM credentials are unavailable.
     Seam kept separate so the CLI band is testable without a live Qdrant.
     """
-    from fused_memory.backends.mem0_client import Mem0Backend  # noqa: PLC0415
+    from fused_memory.backends.mem0_client import Mem0Backend
 
     return Mem0Backend(config)
 
@@ -2729,9 +2730,9 @@ async def _run(args: argparse.Namespace) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    import os  # noqa: PLC0415
+    import os
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)

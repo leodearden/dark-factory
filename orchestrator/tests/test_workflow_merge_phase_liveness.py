@@ -127,7 +127,7 @@ def _persisted_metadata(update_task: AsyncMock) -> dict:
 def _fake_run(*, head: str = 'HEAD-SHA', rc: int = 0):
     """Return an async stand-in for orchestrator.workflow._run (git rev-parse)."""
 
-    async def _run(cmd, cwd=None, **kwargs):  # noqa: ARG001
+    async def _run(cmd, cwd=None, **kwargs):
         if rc == 0:
             return (0, head + '\n', '')
         return (rc, '', 'fatal: bad revision')
@@ -463,7 +463,7 @@ class TestEntryOrdering:
         wf.config.max_merge_retries = 1
         wf.config.max_pre_merge_retries = 1
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -590,7 +590,7 @@ class TestEntryReadCoalescing:
         wf.config.max_merge_retries = 1
         wf.config.max_pre_merge_retries = 1
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
@@ -668,7 +668,7 @@ class TestRetryLoopReStamp:
         wf.config.max_merge_retries = 2
         wf.config.max_pre_merge_retries = 1
 
-        async def fake_run(cmd, **kwargs):  # noqa: ARG001
+        async def fake_run(cmd, **kwargs):
             return 0, 'branch_head_sha\n', ''
 
         monkeypatch.setattr('orchestrator.workflow._run', fake_run)
