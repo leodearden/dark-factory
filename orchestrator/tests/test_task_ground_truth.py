@@ -32,13 +32,19 @@ from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from escalation.models import Escalation
-from escalation.pins import PinRecord, _norm_id, classify_pins
+from escalation.pins import (
+    ClusterPinRecord,
+    PinRecord,
+    _norm_id,
+    classify_pins,
+    pinned_only_by_human_parked,
+)
 from escalation.queue import EscalationQueue
 from shared.deploy_state import DeployPhase
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, compose_claimant_run_id
 
 from orchestrator.artifacts import TaskArtifacts
-from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
+from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.task_ground_truth import (
     BranchState,
     BranchStateKind,
@@ -174,6 +180,14 @@ class TestEscalationRefSatisfiesPinRecord:
         record: PinRecord = EscalationRef(id='esc-1-1', level=0, severity='blocking')
         assert record.id == 'esc-1-1'
         assert record.filing_claimant_run_id is None
+
+    def test_escalation_ref_is_structurally_a_cluster_pin_record(self) -> None:
+        """Checked statically by pyright too: the members-carrying sub-protocol
+        ``pinned_only_by_human_parked`` reads (task 7709)."""
+        record: ClusterPinRecord = EscalationRef(
+            id='esc-1-1', level=2, severity='blocking', members=('esc-1-2',),
+        )
+        assert record.members == ('esc-1-2',)
 
     def test_real_refs_classify_into_the_three_buckets(self) -> None:
         refs = [
@@ -487,20 +501,30 @@ def _make_ground_truth(
     )
 
 
-def _plan_lock_artifacts(worktree: Path) -> TaskArtifacts:
-    """``TaskArtifacts`` addressed where the resolver actually READS plan.lock.
+def _plan_lock_artifacts(worktree: Path, tid: str) -> TaskArtifacts:
+    """``TaskArtifacts`` addressed where the resolver actually READS *tid*'s plan.lock.
 
-    ``<worktree_base>/.task-meta/<worktree_name>`` — a SIBLING of the worktree,
-    derived through ``TaskArtifacts.meta_root_for`` (the single owner of that
-    path shape) rather than hand-joined, exactly as the sole production writer
-    does (``TaskWorkflow``, workflow.py) and as
-    ``TaskGroundTruth._resolve_live_claimant`` does on the read side (task
-    4028).  Every fixture in this module that manufactures a lock for the
-    resolver to find must go through here; a bare ``TaskArtifacts(worktree)``
-    writes the LEGACY ``<worktree>/.task`` path, which the resolver
-    deliberately never consults.
+    plan.lock is task-scoped, so it lives at
+    ``<worktree_base>/.task-meta/task-<tid>`` (``TaskArtifacts.for_task``, the
+    same construction the sole production writer, ``TaskWorkflow``, resolves
+    to).  Every fixture in this module that manufactures a lock for the
+    resolver to find must go through here; the lane root and the LEGACY
+    ``<worktree>/.task`` are both addresses the resolver never consults.
     """
-    return TaskArtifacts(worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name))
+    return TaskArtifacts.for_task(worktree, tid)
+
+
+@pytest.fixture
+def worktree(tmp_path: Path) -> Path:
+    """A worktree whose ``.task-meta`` siblings are private to this test.
+
+    The task root is keyed by task id alone, so a worktree at ``tmp_path``
+    itself would put ``task-<tid>`` in pytest's session-wide basetemp, shared
+    by every test resolving the same tid.
+    """
+    wt = tmp_path / 'wt'
+    wt.mkdir()
+    return wt
 
 
 class TestDefaultHeartbeatTtl:
@@ -744,20 +768,20 @@ class TestDeriveTruthLiveClaimant:
         scheduler.get_task.assert_awaited_once_with('12')
 
     async def test_no_db_claimant_live_plan_lock_returns_plan_lock_claimant(
-        self, tmp_path: Path,
+        self, worktree: Path,
     ) -> None:
         # task 3563: the lock records the process run_id, so the resolved
         # identity is the FULL composed shape — not the bare session id it
         # used to return.  The raw session id survives under session_id.
-        artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
+        artifacts = _plan_lock_artifacts(worktree, '13')
+        artifacts.task_root.mkdir(parents=True)
         artifacts.lock_plan('sess-13-abc123', run_id='run-13')
         lock_data = artifacts.read_plan_lock()
         assert lock_data is not None
         locked_at = lock_data['locked_at']
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
-        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: worktree)
 
         report = await resolver.derive_truth('13')
 
@@ -769,13 +793,13 @@ class TestDeriveTruthLiveClaimant:
         )
 
     async def test_stale_db_claimant_returns_none_even_with_live_plan_lock(
-        self, tmp_path: Path,
+        self, worktree: Path,
     ) -> None:
         # A present-but-stale db claimant must collapse straight to None —
         # it must NOT fall through to the plan.lock fallback, which exists
         # only for rows with no db claimant at all (pre-2182 rows).
-        artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
+        artifacts = _plan_lock_artifacts(worktree, '14')
+        artifacts.task_root.mkdir(parents=True)
         artifacts.lock_plan('sess-14-abc123')
         fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
         task = {
@@ -786,7 +810,7 @@ class TestDeriveTruthLiveClaimant:
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
         resolver = _make_ground_truth(
             scheduler=scheduler,
-            worktree_resolver=lambda tid: tmp_path,
+            worktree_resolver=lambda tid: worktree,
             now_fn=lambda: fixed_now,
             heartbeat_ttl=timedelta(minutes=10),
         )
@@ -813,15 +837,15 @@ class TestDeriveTruthLiveClaimant:
 
         assert report.live_claimant is None
 
-    async def test_plan_lock_dead_owner_pid_returns_none(self, tmp_path: Path) -> None:
-        # _pid_alive(2**31 - 1) is deterministically False — not a valid
+    async def test_plan_lock_dead_owner_pid_returns_none(self, worktree: Path) -> None:
+        # pid_alive(2**31 - 1) is deterministically False — not a valid
         # live PID on any standard Linux (mirrors
-        # test_pid_alive_contract.py's identical convention) — so a
+        # shared/tests/test_proc_liveness.py's identical convention) — so a
         # plan.lock whose owner process has died must NOT be treated as a
         # live claimant (review finding #3).
-        artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(worktree, '25')
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text(json.dumps({
             'session_id': 'sess-dead-abc123',
             'locked_at': '2026-07-12T00:00:00+00:00',
@@ -829,14 +853,14 @@ class TestDeriveTruthLiveClaimant:
         }))
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
-        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: worktree)
 
         report = await resolver.derive_truth('25')
 
         assert report.live_claimant is None
 
     async def test_fresh_db_claimant_precedes_stale_plan_lock(
-        self, tmp_path: Path,
+        self, worktree: Path,
     ) -> None:
         # Task-2588 regression pin. A plan.lock whose owner_pid has died
         # (2**31 - 1 — same dead-PID convention as
@@ -847,9 +871,9 @@ class TestDeriveTruthLiveClaimant:
         # out from under its own still-live claimant). The db-claimant
         # branch (task_ground_truth.py:368-376) must win: it returns
         # BEFORE the stale plan.lock at line 378+ is ever consulted.
-        artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(worktree, '37')
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text(json.dumps({
             'session_id': 'sess-dead-abc123',
             'locked_at': '2026-07-12T00:00:00+00:00',
@@ -864,7 +888,7 @@ class TestDeriveTruthLiveClaimant:
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
         resolver = _make_ground_truth(
             scheduler=scheduler,
-            worktree_resolver=lambda tid: tmp_path,
+            worktree_resolver=lambda tid: worktree,
             now_fn=lambda: fixed_now,
             heartbeat_ttl=timedelta(minutes=10),
         )
@@ -877,13 +901,13 @@ class TestDeriveTruthLiveClaimant:
             source=ClaimantSource.DB,
         )
 
-    async def test_plan_lock_malformed_owner_pid_returns_none(self, tmp_path: Path) -> None:
+    async def test_plan_lock_malformed_owner_pid_returns_none(self, worktree: Path) -> None:
         # A non-numeric owner_pid must be swallowed by the int(owner_pid)
         # TypeError/ValueError guard rather than raise out of derive_truth
         # (review finding #3).
-        artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(worktree, '26')
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text(json.dumps({
             'session_id': 'sess-malformed-abc123',
             'locked_at': '2026-07-12T00:00:00+00:00',
@@ -891,14 +915,14 @@ class TestDeriveTruthLiveClaimant:
         }))
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
-        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: worktree)
 
         report = await resolver.derive_truth('26')
 
         assert report.live_claimant is None
 
     async def test_plan_lock_alive_owner_pid_but_stale_locked_at_returns_none(
-        self, tmp_path: Path,
+        self, worktree: Path,
     ) -> None:
         # owner_pid alone isn't sufficient: PID reuse means a dead
         # orchestrator's pid can be recycled by an unrelated, genuinely
@@ -908,9 +932,9 @@ class TestDeriveTruthLiveClaimant:
         # coincidentally-alive owner_pid must not read as a phantom-live
         # claimant, or it would silently block recovery of a genuinely
         # stranded task (review finding).
-        artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(worktree, '36')
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text(json.dumps({
             'session_id': 'sess-reused-pid-abc123',
             'locked_at': '2026-07-01T00:00:00+00:00',
@@ -921,7 +945,7 @@ class TestDeriveTruthLiveClaimant:
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
         resolver = _make_ground_truth(
             scheduler=scheduler,
-            worktree_resolver=lambda tid: tmp_path,
+            worktree_resolver=lambda tid: worktree,
             now_fn=lambda: fixed_now,
             heartbeat_ttl=timedelta(minutes=10),
         )
@@ -930,24 +954,24 @@ class TestDeriveTruthLiveClaimant:
 
         assert report.live_claimant is None
 
-    async def test_corrupt_plan_lock_json_returns_none_not_raise(self, tmp_path: Path) -> None:
+    async def test_corrupt_plan_lock_json_returns_none_not_raise(self, worktree: Path) -> None:
         # A truncated/corrupt plan.lock (a realistic outcome of the very
         # crash this resolver recovers from) must degrade to "no plan-lock
         # claimant", not propagate json.JSONDecodeError out of derive_truth
         # (review finding #1).
-        artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(worktree, '27')
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text('{not valid json')
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
-        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: worktree)
 
         report = await resolver.derive_truth('27')
 
         assert report.live_claimant is None
 
-    async def test_plan_lock_non_utf8_bytes_returns_none_not_raise(self, tmp_path: Path) -> None:
+    async def test_plan_lock_non_utf8_bytes_returns_none_not_raise(self, worktree: Path) -> None:
         # A byte-corrupt (non-UTF-8) plan.lock — another realistic outcome
         # of a torn write during the crash this resolver recovers from —
         # raises UnicodeDecodeError from read_plan_lock's
@@ -956,19 +980,19 @@ class TestDeriveTruthLiveClaimant:
         # pre-fix (json.JSONDecodeError, OSError) guard let it escape
         # uncaught (amendment review finding #2). Must degrade to "no
         # plan-lock claimant", same as the corrupt-JSON case above.
-        artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(worktree, '33')
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_bytes(b'\xff\xfe\x00\x01garbage')
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
-        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: worktree)
 
         report = await resolver.derive_truth('33')
 
         assert report.live_claimant is None
 
-    async def test_non_dict_plan_lock_json_returns_none_not_raise(self, tmp_path: Path) -> None:
+    async def test_non_dict_plan_lock_json_returns_none_not_raise(self, worktree: Path) -> None:
         # read_plan_lock's `-> dict | None` hint is aspirational: it is a bare
         # json.loads, so syntactically VALID but non-dict JSON (a lock
         # truncated to a list/number/string) passes through without raising
@@ -985,15 +1009,38 @@ class TestDeriveTruthLiveClaimant:
         # saw the non-dict payload there and the citation was vacuous. That
         # parametrization has since collapsed into
         # test_vestigial_worktree_lock_is_inert_and_unlinked (task 4028).
-        artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
-        lock_path = artifacts.root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(worktree, '34')
+        artifacts.task_root.mkdir(parents=True)
+        lock_path = artifacts.artifact_path('plan.lock')
         lock_path.write_text('["not", "an", "object"]')
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
-        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: worktree)
 
         report = await resolver.derive_truth('34')
+
+        assert report.live_claimant is None
+
+    @pytest.mark.parametrize('owner_pid', [10**20, True], ids=['unrepresentable', 'json-true'])
+    async def test_corrupt_owner_pid_in_a_fresh_lock_is_not_a_live_claimant(
+        self, worktree: Path, owner_pid: object,
+    ) -> None:
+        """A pid no process can hold reads as no claimant, without raising.
+
+        10**20 overflows the C pid_t, and a JSON ``true`` must not become pid 1.
+        The lock is fresh, so only the pid judgment can produce the None.
+        """
+        _write_plan_lock(worktree, '41', {
+            'session_id': 'sess-corrupt-abc123',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': owner_pid,
+            'run_id': 'run-corrupt',
+        })
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: worktree)
+
+        report = await resolver.derive_truth('41')
 
         assert report.live_claimant is None
 
@@ -1016,32 +1063,21 @@ class TestDeriveTruthLiveClaimant:
 
 
 # ---------------------------------------------------------------------------
-# task 4028 — the plan.lock read is addressed at the `.task-meta` root
+# tasks 4028 / 3155 — the plan.lock read is addressed at the task's own root
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-class TestPlanLockIsReadFromTheMetaRoot:
-    """The plan.lock leg reads the `.task-meta` sibling, never the legacy path.
+class TestPlanLockIsReadFromTheTaskRoot:
+    """The plan.lock leg reads ``.task-meta/task-<tid>``, and no other address.
 
-    The lock's sole writer is ``TaskWorkflow``, which constructs its
-    ``TaskArtifacts`` with ``_meta_root_for_worktree(self.worktree)``
-    (workflow.py) — so it writes ``<base>/.task-meta/<name>/plan.lock``.  Until
-    task 4028 the reader constructed ``TaskArtifacts(worktree_path)`` with no
-    ``meta_root`` and therefore looked under ``<worktree>/.task``: a live lock
-    was invisible and the whole leg (with it ``ClaimantSource.PLAN_LOCK`` and
-    task 3563's composed identity) was inert in production.
-
-    The POSITIVE half of this pair is
-    ``TestDeriveTruthLiveClaimant::test_no_db_claimant_live_plan_lock_returns_
-    plan_lock_claimant``, which drives a real ``lock_plan`` acquisition at the
-    meta root and asserts the full resolved ``Claimant`` — it is not duplicated
-    here.  What lives here is the half no other test can express: the repoint
-    is deliberately SINGLE-PATH, with no new-then-old fallback.  Nothing has
-    written ``<worktree>/.task/plan.lock`` since the meta-root migration, so a
-    legacy fallback would be dead code on arrival — the exact confusion this
-    task removes.  Pinning "legacy is ignored" keeps a future reader from
-    mistaking the omission for an oversight.
+    plan.lock is task-scoped (``ARTIFACT_ROOTS``), so its sole writer,
+    ``TaskWorkflow``, puts it at ``<base>/.task-meta/task-<tid>/plan.lock``.
+    Task 4028 moved the read off the legacy ``<worktree>/.task``; task 3155
+    moved it off the lane root ``<base>/.task-meta/<name>``.  Both moves are
+    SINGLE-PATH, with no new-then-old fallback (PRD
+    ``plans/task-meta-task-keying-prd.md`` decision 7), and the pins below keep
+    a future reader from mistaking either omission for an oversight.
     """
 
     @staticmethod
@@ -1057,38 +1093,58 @@ class TestPlanLockIsReadFromTheMetaRoot:
         )
         return (await resolver.derive_truth(tid)).live_claimant
 
-    async def test_lock_at_the_legacy_root_is_ignored(self, tmp_path: Path) -> None:
-        # Equally fresh, equally well-formed, equally alive — and still None,
-        # because it is at the address nothing writes any more.
-        worktree = tmp_path / 'wt-4028'
-        worktree.mkdir()
-        legacy = TaskArtifacts(worktree)  # no meta_root -> <worktree>/.task
-        legacy.root.mkdir(parents=True)
-        assert legacy.lock_plan('sess-legacy-abc123', run_id='run-legacy-abc123')
-        assert not _plan_lock_artifacts(worktree).root.exists()
+    @staticmethod
+    def _lock_at(worktree: Path, root: Path) -> None:
+        view = TaskArtifacts(worktree, root)
+        root.mkdir(parents=True)
+        assert view.lock_plan('sess-40-abc123', run_id='run-40-abc123')
+
+    async def test_a_fresh_live_lock_at_the_task_root_is_the_claimant(self, worktree: Path) -> None:
+        self._lock_at(worktree, TaskArtifacts.task_root_for(worktree.parent, '40'))
+
+        claimant = await self._resolve(worktree)
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        assert claimant.session_id == 'sess-40-abc123'
+
+    async def test_lock_at_the_lane_root_is_ignored(self, worktree: Path) -> None:
+        self._lock_at(worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name))
 
         assert await self._resolve(worktree) is None
+
+    async def test_lock_at_the_legacy_root_is_ignored(self, worktree: Path) -> None:
+        # Equally fresh, equally well-formed, equally alive — and still None,
+        # because it is at an address nothing writes any more.
+        self._lock_at(worktree, worktree / '.task')
+        assert not _plan_lock_artifacts(worktree, '40').task_root.exists()
+
+        assert await self._resolve(worktree) is None
+
+    async def test_an_unaddressable_task_id_degrades_to_no_plan_lock_claimant(
+        self, worktree: Path,
+    ) -> None:
+        """``task_root_for`` refuses 'a/b'; the sweep reads that as no claimant."""
+        assert await self._resolve(worktree, tid='a/b') is None
 
 
 @pytest.mark.asyncio
 class TestPlanLockAttributionIsByAddress:
-    """A lock at the task's resolved meta root is ITS lock — no session check.
+    """A lock at the task's resolved root is ITS lock — no session check.
 
     ``_resolve_live_claimant`` attributes any fresh, live-pid lock found at
-    ``<base>/.task-meta/<worktree_name>/plan.lock`` to the task being
-    resolved, WITHOUT requiring ``session_id`` to carry the ``'{tid}-'``
-    prefix that ``TaskArtifacts.clear_stale_plan_lock`` keys on.  That
-    asymmetry is deliberate; these tests exist so it is a pinned decision
-    rather than an unexamined one (task 4028).
+    ``<base>/.task-meta/task-<tid>/plan.lock`` to the task being resolved,
+    WITHOUT requiring ``session_id`` to carry the ``'{tid}-'`` prefix that
+    ``TaskArtifacts.clear_stale_plan_lock`` keys on.  That asymmetry is
+    deliberate; these tests exist so it is a pinned decision rather than an
+    unexamined one (task 4028).
 
     Why no gate:
 
-    * A warm lane's meta root is keyed by LANE name and, unlike the legacy
-      ``<worktree>/.task``, survives worktree cleanup — so a previous
-      occupant's lock genuinely can outlive it.  Every DIFFERENT-task
-      acquisition route clears it first (``GitOps._clear_foreign_meta_root``);
-      the same-task reuse routes preserve it precisely because those
-      artifacts belong to the task being resolved.
+    * The root is keyed by task id and outlives every lane the task ran in,
+      so the lock it holds is the task's own unless something wrote the wrong
+      address; a session check would guard against a writer bug, not a
+      lifecycle.
     * The dominant real stale lock is a crashed PRIOR incarnation of the SAME
       task, whose session id DOES match the prefix — a gate would not catch
       the case that actually happens.
@@ -1116,7 +1172,7 @@ class TestPlanLockAttributionIsByAddress:
     async def test_fresh_foreign_session_lock_is_attributed_to_this_task(
         self, tmp_path: Path,
     ) -> None:
-        """A lane's leftover lock from task 999 resolves as task 42's claimant.
+        """A lock at task 42's root carrying task 999's session resolves as 42's claimant.
 
         Pins the CURRENT behaviour, with eyes open: the lock is driven through
         a real ``lock_plan`` (so ``owner_pid`` is this live process, exactly as
@@ -1125,8 +1181,8 @@ class TestPlanLockAttributionIsByAddress:
         """
         lane = tmp_path / '_lane-0'
         lane.mkdir()
-        artifacts = _plan_lock_artifacts(lane)
-        artifacts.root.mkdir(parents=True)
+        artifacts = _plan_lock_artifacts(lane, '42')
+        artifacts.task_root.mkdir(parents=True)
         assert artifacts.lock_plan('999-aaaaaaaa', run_id='run-999')
 
         claimant = await self._resolve(lane, tid='42')
@@ -1143,14 +1199,14 @@ class TestPlanLockAttributionIsByAddress:
 
         ``owner_pid`` is deliberately THIS process (alive, as production's
         orchestrator pid always is), so ``_pid_alive`` cannot be what rejects
-        it — only ``_lock_fresh`` can.  That is what caps how long a leftover
-        lane lock can suppress another task's recovery.
+        it — only ``_lock_fresh`` can.  That is what caps how long a
+        misattributed lock can suppress this task's recovery.
         """
         lane = tmp_path / '_lane-0'
         lane.mkdir()
-        artifacts = _plan_lock_artifacts(lane)
-        artifacts.root.mkdir(parents=True)
-        (artifacts.root / 'plan.lock').write_text(json.dumps({
+        artifacts = _plan_lock_artifacts(lane, '42')
+        artifacts.task_root.mkdir(parents=True)
+        artifacts.artifact_path('plan.lock').write_text(json.dumps({
             'session_id': '999-aaaaaaaa',
             'run_id': 'run-999',
             'owner_pid': os.getpid(),
@@ -1165,23 +1221,23 @@ class TestPlanLockAttributionIsByAddress:
 # ---------------------------------------------------------------------------
 
 
-def _write_plan_lock(root: Path, payload: dict) -> Path:
-    """Write a raw plan.lock literal (bypassing lock_plan) under *root*.
+def _write_plan_lock(root: Path, tid: str, payload: dict) -> Path:
+    """Write a raw plan.lock literal (bypassing lock_plan) for *tid* beside *root*.
 
     Used for the malformed/legacy shapes ``lock_plan`` itself can no longer
     produce — exactly the locks already sitting on disk from before this
     change, which the resolver must still degrade safely on.
 
-    *root* is the WORKTREE; the lock lands under its ``.task-meta`` sibling,
-    where the resolver reads (``_plan_lock_artifacts``, task 4028).  It must
+    *root* is the WORKTREE; the lock lands under *tid*'s ``.task-meta`` task
+    root, where the resolver reads (``_plan_lock_artifacts``).  It must
     stay a raw ``json.dumps`` write that bypasses ``lock_plan`` — that is the
     only way to produce the malformed shapes ``lock_plan`` can no longer emit
     — but writing it at an address the resolver never consults would make
     every degradation assertion below vacuous.
     """
-    artifacts = _plan_lock_artifacts(root)
-    artifacts.root.mkdir(parents=True, exist_ok=True)
-    lock_path = artifacts.root / 'plan.lock'
+    artifacts = _plan_lock_artifacts(root, tid)
+    artifacts.task_root.mkdir(parents=True, exist_ok=True)
+    lock_path = artifacts.artifact_path('plan.lock')
     lock_path.write_text(json.dumps(payload))
     return lock_path
 
@@ -1210,15 +1266,15 @@ class TestClaimantRunIdIsComposedOrNone:
     def _unclaimed_task() -> dict:
         return {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
 
-    async def _resolve(self, tmp_path: Path, tid: str = '13') -> Claimant | None:
+    async def _resolve(self, worktree: Path, tid: str = '13') -> Claimant | None:
         scheduler = _fake_scheduler(is_actively_held=False, task=self._unclaimed_task())
         resolver = _make_ground_truth(
-            scheduler=scheduler, worktree_resolver=lambda _tid: tmp_path,
+            scheduler=scheduler, worktree_resolver=lambda _tid: worktree,
         )
         return (await resolver.derive_truth(tid)).live_claimant
 
     async def test_well_formed_raw_payload_resolves_to_composed_identity(
-        self, tmp_path: Path,
+        self, worktree: Path,
     ) -> None:
         """POSITIVE CONTROL for the whole ``_write_plan_lock`` family.
 
@@ -1232,14 +1288,14 @@ class TestClaimantRunIdIsComposedOrNone:
         ``_lock_fresh`` and ``_pid_alive`` coverage its siblings provide
         (task 4028).
         """
-        _write_plan_lock(tmp_path, {
+        _write_plan_lock(worktree, '13', {
             'session_id': 'sess-control-abc123',
             'locked_at': datetime.now(UTC).isoformat(),
             'owner_pid': os.getpid(),
             'run_id': 'run-control-abc',
         })
 
-        claimant = await self._resolve(tmp_path)
+        claimant = await self._resolve(worktree)
 
         assert claimant is not None
         assert claimant.source == ClaimantSource.PLAN_LOCK
@@ -1249,13 +1305,13 @@ class TestClaimantRunIdIsComposedOrNone:
         assert claimant.session_id == 'sess-control-abc123'
 
     async def test_lock_with_run_id_resolves_to_composed_identity(
-        self, tmp_path: Path,
+        self, worktree: Path,
     ) -> None:
-        artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
+        artifacts = _plan_lock_artifacts(worktree, '13')
+        artifacts.task_root.mkdir(parents=True)
         artifacts.lock_plan('sess-13-abc123', run_id='run-abc')
 
-        claimant = await self._resolve(tmp_path)
+        claimant = await self._resolve(worktree)
 
         assert claimant is not None
         assert claimant.source == ClaimantSource.PLAN_LOCK
@@ -1268,16 +1324,16 @@ class TestClaimantRunIdIsComposedOrNone:
         assert claimant.session_id == 'sess-13-abc123'
 
     async def test_legacy_lock_without_run_id_resolves_to_none_not_bare_session(
-        self, tmp_path: Path,
+        self, worktree: Path,
     ) -> None:
         """The pre-3563 shape still on disk must degrade to UNKNOWN."""
-        _write_plan_lock(tmp_path, {
+        _write_plan_lock(worktree, '13', {
             'session_id': 'sess-legacy-abc123',
             'locked_at': datetime.now(UTC).isoformat(),
             'owner_pid': os.getpid(),
         })
 
-        claimant = await self._resolve(tmp_path)
+        claimant = await self._resolve(worktree)
 
         assert claimant is not None
         assert claimant.source == ClaimantSource.PLAN_LOCK
@@ -1292,23 +1348,23 @@ class TestClaimantRunIdIsComposedOrNone:
         ids=['empty', 'blank', 'int', 'null', 'list'],
     )
     async def test_blank_or_non_str_run_id_resolves_to_none(
-        self, tmp_path: Path, run_id,
+        self, worktree: Path, run_id,
     ) -> None:
-        _write_plan_lock(tmp_path, {
+        _write_plan_lock(worktree, '13', {
             'session_id': 'sess-13-abc123',
             'locked_at': datetime.now(UTC).isoformat(),
             'owner_pid': os.getpid(),
             'run_id': run_id,
         })
 
-        claimant = await self._resolve(tmp_path)
+        claimant = await self._resolve(worktree)
 
         assert claimant is not None
         assert claimant.run_id is None
         assert claimant.session_id == 'sess-13-abc123'
 
     async def test_string_owner_pid_composes_from_the_PARSED_int(
-        self, tmp_path: Path,
+        self, worktree: Path,
     ) -> None:
         """The composed identity embeds the PARSED int, not the raw JSON value.
 
@@ -1329,14 +1385,14 @@ class TestClaimantRunIdIsComposedOrNone:
         assert int(padded_pid) == os.getpid()  # same process...
         assert padded_pid != str(os.getpid())  # ...different byte sequence
 
-        _write_plan_lock(tmp_path, {
+        _write_plan_lock(worktree, '13', {
             'session_id': 'sess-13-abc123',
             'locked_at': datetime.now(UTC).isoformat(),
             'owner_pid': padded_pid,
             'run_id': 'run-abc',
         })
 
-        claimant = await self._resolve(tmp_path)
+        claimant = await self._resolve(worktree)
 
         assert claimant is not None
         assert claimant.source == ClaimantSource.PLAN_LOCK
@@ -1352,17 +1408,17 @@ class TestClaimantRunIdIsComposedOrNone:
         ids=['empty', 'blank', 'int', 'null', 'list'],
     )
     async def test_valid_run_id_with_bad_session_id_resolves_to_none(
-        self, tmp_path: Path, session_id,
+        self, worktree: Path, session_id,
     ) -> None:
         """No PARTIALLY-composed identity — every component or nothing."""
-        _write_plan_lock(tmp_path, {
+        _write_plan_lock(worktree, '13', {
             'session_id': session_id,
             'locked_at': datetime.now(UTC).isoformat(),
             'owner_pid': os.getpid(),
             'run_id': 'run-abc',
         })
 
-        claimant = await self._resolve(tmp_path)
+        claimant = await self._resolve(worktree)
 
         assert claimant is not None
         assert claimant.run_id is None
@@ -1406,7 +1462,7 @@ class TestClaimantRunIdIsComposedOrNone:
         assert report.live_claimant.session_id is None
 
     async def test_composed_identity_survives_escalation_pins_shape_guard(
-        self, tmp_path: Path,
+        self, worktree: Path,
     ) -> None:
         """Cross-module shape agreement — the whole point of the change.
 
@@ -1415,11 +1471,11 @@ class TestClaimantRunIdIsComposedOrNone:
         to unknown.  ``None`` is the honest unknown and is allowed; any
         NON-None value must carry the ``/pid=`` marker.
         """
-        artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
+        artifacts = _plan_lock_artifacts(worktree, '13')
+        artifacts.task_root.mkdir(parents=True)
         artifacts.lock_plan('sess-13-abc123', run_id='run-abc')
 
-        claimant = await self._resolve(tmp_path)
+        claimant = await self._resolve(worktree)
 
         assert claimant is not None
         assert claimant.run_id is not None
@@ -1552,6 +1608,32 @@ class TestDeriveTruthRemainingFields:
         assert all(ref.created_at for ref in report.open_escalations), (
             'the filing time must survive the JSON round-trip (task 3535)'
         )
+
+    async def test_refs_round_trip_members_via_real_queue(self, tmp_path: Path) -> None:
+        """Task 7709: the L2's members survive JSON, the atomic write and
+        from_dict, so the reconcile sweep's predicate sees the promoted hold."""
+        queue = self._real_queue(tmp_path)
+        queue.submit(Escalation(
+            id='esc-40-1', task_id='40', agent_role='implementer',
+            severity='blocking', category='infra_issue', summary='s1', level=1,
+        ))
+        queue.submit(Escalation(
+            id='esc-40-2', task_id='40', agent_role='escalation-watcher-auto',
+            severity='blocking', category='infra_issue', summary='s2', level=2,
+            members=['esc-40-1'],
+        ))
+        resolver = _make_ground_truth(escalation_queue=queue)
+
+        report = await resolver.derive_truth('40')
+
+        refs = sorted(report.open_escalations, key=lambda r: r.id)
+        assert [(ref.id, ref.members) for ref in refs] == [
+            ('esc-40-1', ()),
+            ('esc-40-2', ('esc-40-1',)),
+        ]
+        assert pinned_only_by_human_parked(
+            classify_pins('40', refs, live_claimant=False), refs,
+        ) is True
 
     async def test_legacy_on_disk_record_without_filing_identity_resolves_to_none(
         self, tmp_path: Path,
@@ -1701,19 +1783,19 @@ class TestDeriveTruthRemainingFields:
 
         scheduler.get_task.assert_awaited_once_with('24')
 
-    async def test_resolves_worktree_path_exactly_once(self, tmp_path: Path) -> None:
+    async def test_resolves_worktree_path_exactly_once(self, worktree: Path) -> None:
         # worktree_resolver(tid) backs both `worktree_present` and
         # `_resolve_live_claimant`'s plan.lock read; derive_truth must call
         # it exactly ONCE and share the resulting Path between the two,
         # mirroring the task-row single-fetch discipline above (review
         # finding #2). A bound plan.lock (and no db claimant) is required
         # to exercise the plan.lock leg that previously re-resolved.
-        artifacts = _plan_lock_artifacts(tmp_path)
-        artifacts.root.mkdir(parents=True)
+        artifacts = _plan_lock_artifacts(worktree, '29')
+        artifacts.task_root.mkdir(parents=True)
         artifacts.lock_plan('sess-29-abc123')
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
-        worktree_resolver = MagicMock(side_effect=lambda tid: tmp_path)
+        worktree_resolver = MagicMock(side_effect=lambda tid: worktree)
         resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=worktree_resolver)
 
         await resolver.derive_truth('29')
@@ -1873,6 +1955,14 @@ class TestEscalationRefCreatedAt:
     def test_created_at_is_carried_verbatim(self):
         ref = EscalationRef(id='esc-1', level=1, created_at='2026-08-10T12:00:00+00:00')
         assert ref.created_at == '2026-08-10T12:00:00+00:00'
+
+
+class TestEscalationRefMembers:
+    """``members`` names the ids an L2's cluster holds (task 7709)."""
+
+    def test_members_defaults_to_holding_nothing(self):
+        """Defaulted, so every existing construction site keeps working."""
+        assert EscalationRef(id='esc-1', level=1).members == ()
 
 
 class TestTruthReportStoreUnavailable:

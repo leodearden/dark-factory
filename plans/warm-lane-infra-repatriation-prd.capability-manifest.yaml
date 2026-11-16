@@ -247,13 +247,24 @@ tasks:
 - label: κ
   external_task_id: reify:5616
   title: Delete reify's relocated script copies and retire the duplicated tests
+  note: 'delivered_check re-pointed by task 6047. The grep it replaced (^scripts/warm-lane-gc\.sh$
+    over scripts/verify-pipeline-paths.txt, expect absent) already passed at reify main
+    before any κ work, because that manifest has never listed the script, so the polarity
+    lint rejected it as vacuous_absent. The path check names the seven deletions themselves.
+    Its task-record copy is reify 5616''s metadata.delivered_checks; change both halves
+    together.'
   capabilities:
   - name: reify-scripts-reduced-to-contract-primitives
     binding: rejection-mechanism — the seven relocated scripts absent from reify/scripts/
     verdict: PASS
     delivered_check:
-      kind: grep
-      pattern: ^scripts/warm-lane-gc\.sh$
+      kind: path
       paths:
-      - scripts/verify-pipeline-paths.txt
+      - scripts/warm-lane-gc.sh
+      - scripts/warm-lane-gc-sweep.sh
+      - scripts/thin-warm-lane.sh
+      - scripts/warm-lane-disk-guard.sh
+      - scripts/warm-lane-audit.sh
+      - scripts/warm-lane-degenerate-ref-check.sh
+      - scripts/provision-warm-lane-fs.sh
       expect: absent

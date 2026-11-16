@@ -48,9 +48,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import SENTINEL, deny, neutralise_fixture
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 from fused_memory.models import SourceStore
+from fused_memory.models.memory import render_add_memory_message
+from fused_memory.utils.store_mutation_preflight import StoreMutationUnavailable
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_toolcall_xml_leak.py'
 
@@ -433,8 +440,9 @@ def _ok_response(**overrides) -> SimpleNamespace:
     fields = {
         'memory_ids': ['new-id'],
         'stores_written': [SourceStore.mem0],
+        'stores_queued': [],
         'category': None,
-        'message': "Memory queued for ['mem0']",
+        'message': render_add_memory_message(stores_written=[SourceStore.mem0]),
     }
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -940,7 +948,7 @@ class TestReaddPersistedPredicate:
         """The delete removed the mem0 copy; a re-add that landed only in
         Graphiti has not restored it."""
         ok, reason = _mod.readd_persisted(
-            _ok_response(stores_written=[SourceStore.graphiti])
+            _ok_response(stores_written=[], stores_queued=[SourceStore.graphiti])
         )
         assert ok is False
         assert 'mem0' in reason
@@ -1379,7 +1387,8 @@ class TestRunApplyVerifiesPersistence:
         service.add_memory = AsyncMock(
             return_value=_ok_response(
                 memory_ids=['graphiti-only-id'],
-                stores_written=[SourceStore.graphiti],
+                stores_written=[],
+                stores_queued=[SourceStore.graphiti],
             )
         )
 
@@ -1669,7 +1678,7 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
-        with pytest.raises(_mod.StoreMutationUnavailable, match=SENTINEL):
+        with pytest.raises(StoreMutationUnavailable, match=SENTINEL):
             await _mod.run(_args(apply=True), service)
 
         service.delete_memory.assert_not_awaited()
@@ -1684,10 +1693,23 @@ class TestRunApplyStoreMutationPreflight:
         deny(_mod, monkeypatch)
         service = _service([_match('r', _TAIL_LEAK)])
 
-        with pytest.raises(_mod.StoreMutationUnavailable):
+        with pytest.raises(StoreMutationUnavailable):
             await _mod.run(_args(apply=True), service)
 
         service.scan_memory_content.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_logs_its_fail_closed_diagnosis(self, monkeypatch, caplog):
+        """``main`` prints only the partial report, so this script's own logger
+        carries the one record saying what was refused and what to do."""
+        deny(_mod, monkeypatch)
+        service = _service([_match('r', _TAIL_LEAK)])
+
+        with caplog.at_level(logging.ERROR), pytest.raises(StoreMutationUnavailable):
+            await _mod.run(_args(apply=True), service)
+
+        (record,) = fail_closed_records(caplog, 'sweep_toolcall_xml_leak')
+        assert SENTINEL in record.getMessage()
 
     def test_the_refusal_is_loud_and_reaches_mains_fatal_abort_path(
         self, monkeypatch, capsys
@@ -1741,9 +1763,8 @@ class TestRunApplyStoreMutationPreflight:
         assert _mod.resolve_exit_code(report) == 0
 
     @pytest.mark.asyncio
-    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+    async def test_apply_is_unchanged_when_the_preflight_passes(self):
         """Happy path: a writable environment repairs exactly as before."""
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
         service = _service([_match('r', _TAIL_LEAK)])
 
         report = await _mod.run(_args(apply=True), service)

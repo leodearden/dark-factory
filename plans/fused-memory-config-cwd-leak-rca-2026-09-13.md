@@ -245,11 +245,25 @@ own files. `fused-memory/config/config.yaml` stays the layout's home, and
 schema's relative defaults (`.`, `./data/queue`, …). Pinning them would need the env layer, which is
 M2's defect; that fixture's one user reads no path leaf.
 
-**Adjacent leak, out of scope.**
+**Adjacent leak, closed by task 6456.**
 `fused-memory/src/fused_memory/middleware/task_interceptor.py::_combine_audit_path` writes
 `data/combine_audit.jsonl` relative to the process CWD unless `DARK_FACTORY_DATA_DIR` is set. That
 is a module-level `os.getenv`, not a config leaf. The measurement runs created
-`fused-memory/data/combine_audit.jsonl` in the task worktree. Filed as task 6456.
+`fused-memory/data/combine_audit.jsonl` in the task worktree. Task 6456 pins the variable at
+`<tmp_path>/data` in a separate autouse fixture, `fused-memory/tests/conftest.py::_isolate_fm_data_dir`,
+and deletes the nine test-local redirects that duplicated it.
+`fused-memory/tests/test_data_dir_hermeticity.py` drives a curator combine from a sibling CWD, and
+again under an inherited value, and asserts that the record lands in the test's own tmp.
+Measured on the task 6456 branch with the registered module command above:
+`7 failed, 33921 passed, 12 skipped, 14 xfailed` in 570.78s, with no `combine_audit.jsonl` under
+`fused-memory/data/` or `data/` afterwards. The 7 failures (`test_lane_dependency_probe.py` ×5,
+`test_roll_up_journal_reads_script.py` ×2) fail identically with the base conftest in the same
+sandboxed agent session, so they do not come from this change. From the repo-root CWD, the two tests
+that had leaked 231 rows into the main checkout's `fused-memory/data/combine_audit.jsonl` gave
+`2 passed` and created no `data/`. At planning time the live service's audit, the repo-root
+`data/combine_audit.jsonl` (the unit's `WorkingDirectory` is the repo root), held 62 fixture rows
+(`project_id` `project`, 2026-04-18..2026-08-03) from earlier repo-root runs. Cleaning them up is
+operator work, filed as task 8687.
 
 ## A second hole, confirmed and deliberately not fixed here
 

@@ -2,13 +2,16 @@
 
 ## Status — what is and is not in force
 
-**Every CANDIDATE class in this document is SHADOW MODE ONLY. None is adopted.**
+**Every CANDIDATE class in this document is SHADOW MODE ONLY. None is live.**
 That covers the first-tranche list and the ratified skeleton it is judged by:
 for those, the L2 session's actions are unchanged — it stamps what it *would*
 have ruled, then handles the record exactly as
-`skills/escalation-watcher/SKILL.md` already says. No candidate class grants any
-authority, and nothing in the task that wrote them changed
-`escalation/src/escalation/authority.py`.
+`skills/escalation-watcher/SKILL.md` already says. No candidate class grants
+any new authority.
+
+`escalation/src/escalation/authority.py::POLICY_TABLE` now holds the executor
+policy table (task 8422, `plans/decision-stream-prd.md` §5.1). Every class in it
+starts `shadow`, and none is `live`.
 
 This is *not* the same as saying nothing here is in force. Two things are, they
 are live today, and they are the next two sections: the standing rule that lets
@@ -134,10 +137,20 @@ more — reverts to human routing until it has been re-shadowed.
 - `add_dependency` — wire the subject behind the work it is actually waiting on.
 - `update_task_amendment` — amend the task record rather than escalate.
 - `file_task` — file the follow-up the record is really asking for.
+- `done_flip` — mark the subject task done on proof it landed, then close the
+  record `close_only`. A done flip cannot be undone, so it is not reversible.
+  It is listed here under a waiver of the skeleton's reversibility condition
+  (Leo, 2026-11-04; `plans/decision-stream-prd.md` §3 decision 7), and it is
+  scored as the `close_only` it ends in.
 
-Only the first two are C1 `resolution_action` values, so only those two leave a
-trace the weekly count can compare against. The other three are task-side and
-are reported `not_comparable` — see "How the shadow measurement is read" below.
+`escalation/src/escalation/authority.py::PolicyRow.reversible` reads the same
+list, so a row is reversible only when every act it allows is listed above other
+than `done_flip`: the waiver makes `done_flip` stampable, not reversible.
+
+Only `close_only` and `resume` are C1 `resolution_action` values, so only those
+two leave a trace the weekly count can compare against. `done_flip` is compared
+through its trailing `close_only`. The other three are task-side and are
+reported `not_comparable` — see "How the shadow measurement is read" below.
 
 ## Human-forever gates
 
@@ -196,11 +209,99 @@ it, rather than having to be re-derived then.
 ## First-tranche candidate classes
 
 **To be shadowed, not adopted.** Each of these is a recurring L2 shape the
-measurement exists to judge. None of them may be ruled today.
+measurement exists to judge. None of them is live for the executor today.
+
+This list is read off `escalation/src/escalation/authority.py::POLICY_TABLE`:
+one bullet per row, which is the set
+`escalation.shadow_ruling.FIRST_TRANCHE_CLASSES` is derived from. The table is
+where each class's records, acts and required evidence live. The glosses below
+name the class or item of `plans/decision-stream-prd.md` §3 decision 7 that each
+row implements.
 
 <!-- Same extraction contract as the two lists above: the leading backticked
      slug of each bullet is held equal to
      escalation.shadow_ruling.FIRST_TRANCHE_CLASSES. -->
+
+### Moved classes
+
+These are acts the interactive session already holds. They move to the executor
+as `live` after a shadow period that only measures.
+
+- `landing_provenance` — class 1b: a `provenance_unattributed` record whose work
+  is already on main. Proposal: `done_flip`, quoting the SHA and the ancestry
+  probe.
+- `found_on_main` — class 3, self-execute item 12: any record whose subject's
+  work is found on main. This class is a disposition, not a category. Proposal:
+  `done_flip` on the same evidence as `landing_provenance`.
+- `delivered_check_repath` — class 2's `update_task` half: a
+  `dependency_capability` record whose delivered check passes at main once
+  re-pathed. Proposal: amend the check and `resume`.
+- `read_only_probe_answered` — item 1: a record a read-only probe answers.
+  Proposal: close it, quoting the probe and its result.
+- `premature_gate_followup` — item 3: a gate raised before its work could exist.
+  Proposal: file or wire the delayed follow-up, then close.
+- `preserved_payload_recovered` — item 4: a record whose preserved payload has
+  been recovered into a task. Proposal: amend that task, then close.
+- `owner_finding_appended` — item 5: a finding the owning pending task can carry.
+  Proposal: append it to that task, then close.
+- `completion_claim_true` — class 1a's true arm: an
+  `unverified_completion_claim` whose cited task really is done and landed.
+  Proposal: close it, quoting the task status and the ancestry probe (Leo,
+  2026-11-09, sitting item 522, esc-8475-2; humans always closed these records
+  `close_only`, and none was ever resolved `abandon`).
+- `superseded_main_sweep` — a task-2630 carve-out class: a main-sweep record
+  superseded by a newer sweep on a main that is green again. Proposal: close it.
+- `self_cleared_infra` — a task-2630 carve-out class: an `infra_issue` whose
+  quoted liveness probe now reads healthy. Proposal: close it.
+- `stale_task_scoped` — a task-2630 carve-out class: a record whose subject task
+  went terminal, was re-scoped or was re-dispatched. Proposal: close it.
+- `applies_named_ruling` — item 6's carve-out half and item 7, the "applies a
+  named ruling" row: a record that a dated, cited ruling already decides.
+  Proposal: `close_only` or `resume`, as the ruling says.
+
+Item 11, cancelling the task the router spawned from an
+`unverified_completion_claim`, has no row. It stays interactive-only, under
+self-execute item 11 of `skills/escalation-watcher/SKILL.md`. The spawned task's
+`spawned_from: unverified-claim-<n>` provenance is task metadata
+(`orchestrator/src/orchestrator/escalation_router.py::_submit_arguments`). Its
+`task_failure` L2 carries that provenance in no field, and a row matches only a
+record's category and agent role, so a row could find that L2 only by free-text
+matching.
+
+### New delegations
+
+These start `shadow`. Leo flips each `live` at the η gate, once it reaches
+n ≥ 10 at ≥ 95% agreement.
+
+- `curator_cause_cleared` — class 5: a curator or ticket failure whose cause
+  has cleared. Proposal: close it.
+- `completion_claim_false_positive` — class 1a's false-positive arm: an
+  `unverified_completion_claim` raised on an imperative rather than an
+  assertion. Proposal: close it.
+- `detector_stood_down` — detector-close confirmation: an alarm from the
+  recovery-veto-streak, verify-host or zero-progress-requeue detector whose
+  detector has stood down. Proposal: close it.
+- `dead_letter_replayed` — dead-letter replay: a `durable_write_dead_letter`.
+  Proposal: `replay_dead_letters`, then close.
+- `verify_host_reprobed` — quarantine re-probe: a `verify_host_unreachable`
+  whose host answers again. Proposal: `reprobe_quarantine`, then close.
+- `b3_low_risk_unblock` — B3: a low-risk `task_failure` or `review_issues` block
+  that the B3 gate clears. Proposal: `b3_apply` and `resume`. A file-writing
+  class.
+- `red_main_recovery` — red main (§3 decision 6): a `preexisting_main_break`
+  confirmed by two independent signals. Proposal: `recover_main` to the newest
+  green tip. A file-writing class.
+
+### Recon self-clears
+
+- `recon_run_self_cleared` — recon self-clears (§3 decision 10), the one row the
+  reconciliation queue serves: a `recon_stale_run` that a later run cleared.
+  Proposal: close it.
+
+### Legacy first tranche
+
+The four classes the skeleton shadowed before the table existed. The
+shadow-stamp archive freezes their slugs.
 
 - `risk_identified_branch_behind_main` — a `risk_identified` reporting a branch
   N commits behind main, or a save-WIP tip. Proposal: hand it to the
@@ -212,6 +313,10 @@ measurement exists to judge. None of them may be ruled today.
   amendment, and escalate only when the two are genuinely incompatible.
 - `infra_issue_transient_self_cleared` — an `infra_issue` of a transient class
   whose probe has since self-cleared. Proposal: close it.
+
+`design_concern_semantic_collision` cannot be reached by the executor, because
+`design_concern` is on the executor's deny list. Only the interactive arm
+measures it.
 
 **How `design_concern_semantic_collision` is scoped against the live rule
 above.** It is the *semantic-collision* class, and a semantic collision is a
@@ -229,17 +334,32 @@ A class adopts only when **both** hold:
 2. The class has met the threshold in the skeleton above — 95% or better over at
    least 10 items.
 
-**What `authority.py` does and does not require.** Its
-`L2_AUTO_CLOSE_DENY_CATEGORIES` / `L2_AUTO_CLOSE_DENY_ROLES` constrain **only
-identified callers** listed in `ROLE_LEVEL_ALLOWLIST`, whose sole member is the
-auto-watcher identity `orchestrator-escalation-watcher-auto`. A header-less
-interactive connection is never narrowed by that module — its own docstring says
-so, and that is the esc-2087-2 human-channel guarantee.
+**What `authority.py` does and does not require.** It constrains **only
+identified callers**. The auto-watcher `orchestrator-escalation-watcher-auto`
+has an {0,1} ceiling and the task-2630 `close_only` carve-out. The executor
+`orchestrator-escalation-executor` acts only through its arm in
+`authority.py::POLICY_TABLE`, which is gated per queue by
+`<queue_dir>/policy-table-state.json`
+(`escalation/src/escalation/policy_state.py`). A class switch moves
+`off → shadow → live → shadow` only, and the storm escape drops a live class
+back to `shadow`. η flips classes live. The coordinator
+`interactive:coordinator` has full levels and is denied only on a record that
+carries a fresh executor claim. A header-less interactive connection is never
+narrowed by that module — its own docstring says so, and that is the esc-2087-2
+human-channel guarantee.
 
 So adopting a class for the **interactive** session needs no `authority.py`
 change. The 2026-09-17 rule is the existence proof: a live rule closing `design_concern`
 from the interactive session, shipped with no `authority.py` edit at all.
-Extending any class to the **auto-watcher** arm is the case that would need one.
+Flipping an existing row live for the **executor** is a switch-file write, not
+an `authority.py` edit. Adding a row, or extending a class to the
+**auto-watcher** arm, is the case that needs one.
+
+Renaming or removing a row leaves its old slug in every switch file that names
+it. On such a queue the executor is refused `policy_state_unreadable` until the
+next `set_class_state` there drops the stale slug. The renamed class then comes
+back at its row's initial `shadow` switch, so a live class must be flipped live
+again under its new name.
 
 Which arm you are extending decides whether `authority.py` is in your diff.
 
@@ -263,7 +383,8 @@ Each stamped proposal is compared against the record's observed outcome and
 lands in exactly one bucket:
 
 - `agreed` / `diverged` — the proposal was a C1 action *and* the record recorded
-  one, so the two could be checked against each other.
+  one, so the two could be checked against each other. A `done_flip` proposal
+  is checked as its trailing `close_only`.
 - `not_comparable` — one of those two sides is missing: the proposal was one of
   the three task-side actions, which leave `resolution_action` unset, or the
   record itself recorded no `resolution_action` (the legacy shape D10 in
@@ -293,6 +414,31 @@ The rate is computed over the comparable subset only, and the comparable
 denominator is printed beside it, so "95% or better over at least 10 items" is
 decidable from a pasted report alone.
 
+## Classes measured on a proxy act
+
+Four rows allow a deciding act that is not in the reversible-action list. The
+only one of the row's acts a stamp can meaningfully propose is the trailing
+`close_only` (or `resume`), so the class's agreement rate measures whether the
+record should close, not whether the deciding act should run (Leo, 2026-11-09,
+sitting item 522). The codec checks a proposal against the reversible-action
+list only, not against the row's own acts; task 8478 adds that per-row check.
+
+- `red_main_recovery` (`recover_main`) and `b3_low_risk_unblock` (`b3_apply`) —
+  file-writing, audited at 100% until n ≥ 20 (`PolicyRow.audit_full_until`;
+  `plans/decision-stream-prd.md` §3 decisions 5-6). That audit is the real
+  check on the act; the agreement rate is not.
+- `verify_host_reprobed` (`reprobe_quarantine`) — the verify-host monitor
+  resolves these records itself
+  (`orchestrator/src/orchestrator/merge_lane/liveness.py::_resolve_pending_alarm`):
+  a non-human resolver, with no `resolution_action`. Every stamp therefore
+  lands in `non_human_resolver`, and the class's agreement rate is `None` while
+  the monitor closes them. η cannot flip it on this measurement.
+- `dead_letter_replayed` (`replay_dead_letters`) — not file-writing, so only the
+  random audit draw checks the replay. No ruling yet names a stronger check.
+
+`escalation/tests/test_shadow_ruling.py` holds this set of four equal to the
+table.
+
 ## Pointers
 
 - The shadow-mode arm the L2 session follows:
@@ -307,3 +453,7 @@ decidable from a pasted report alone.
 
 - The vocabularies, the detector and the report:
   `escalation/src/escalation/shadow_ruling.py`.
+- The policy table every candidate class is read off:
+  `escalation/src/escalation/authority.py::POLICY_TABLE`.
+- The per-queue class switches:
+  `escalation/src/escalation/policy_state.py`.

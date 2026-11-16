@@ -193,29 +193,26 @@ both fakes parse argv and discard the unit token outright: the name never
 reaches the factory, only the real subprocess.  That divergence is deliberate;
 do not "fix" it back into line with the others.
 
-WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO, and why the rest are
-deliberately not.  Nine conftests import from this module; the git ceiling and
-the deploy-clock guard are in all nine.  ``_df_no_leaked_drain_processes`` is
-wired only into the ROOT conftest (covering ``tests/``) and
-``scripts/tests/conftest.py`` — exactly the two rootdirs that spawn the drain
-script, and the two the incident came from.  Task 3799's
-``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
-started on those same two and gained a THIRD in task 3951:
-``orchestrator/tests/conftest.py``, which is the fleet heartbeat's PRODUCER
-rootdir rather than a drain-script spawner (see the next two paragraphs).  Of
-the seven subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
-``fused-memory``, ``orchestrator``, ``sampler``, ``shared``) that run as their
-own pytest sessions from their own venvs, ``orchestrator`` therefore now carries
-the fleet-dir pair and the remaining six carry neither; none carries the
-drain-process guard, so the root conftest does not reach them: no token is
-stamped, and ``leaked_drain_processes`` fails CLOSED on an absent token, so
-those sessions report all-clear unconditionally rather than falsely.  That is a
-real gap, not a proof of safety: ``orchestrator`` was the one to watch, since
-``orchestrator/src/orchestrator/service_restart.py`` is the PRODUCTION caller of
-the drain script and its tests today only assert on config strings.  Widening
-the drain-process wiring is a mechanical edit to those seven files and is out of
-task 3798's locked scope; until then, read a green subproject run as
-"unmeasured", never as "no leak".
+WHICH ROOTDIRS THE DRAIN-SCRIPT DEFENCES ARE WIRED INTO.  Ten conftests
+import from this module; the git ceiling and the deploy-clock guard are in
+all ten.  ``_df_no_leaked_drain_processes`` is armed in nine: bound by
+import in the ROOT conftest (covering ``tests/``) and
+``scripts/tests/conftest.py`` — the two rootdirs that spawn the drain
+script — and armed by :func:`arm_leaked_drain_process_guard` in the seven
+subproject rootdirs (``cockpit``, ``dashboard``, ``escalation``,
+``fused-memory``, ``orchestrator``, ``sampler``, ``shared``), each of which
+runs as its own pytest session and so stamps its own token.  In those nine a
+green run means the teardown sweep ran; see ``_df_no_leaked_drain_processes``
+for its detection window.  The tenth, ``client-feed``, does not arm this
+guard, so no sweep runs there and a green ``client-feed`` run is unmeasured.
+
+Task 3799's ``_df_fleet_dir_redirect`` / ``_df_no_synthetic_heartbeats_in_live_fleet``
+pair is a SEPARATE defence, bound in three rootdirs: root ``tests/``,
+``scripts/tests/`` and ``orchestrator/tests/``.  The last is the fleet
+heartbeat's PRODUCER rootdir rather than a drain-script spawner (see the next
+two paragraphs).  The other six subproject rootdirs above carry neither; that
+gap is still open and is out of this module's scope to close, since none of
+those six subprojects drives the fleet heartbeat producer path.
 
 THE WRITE-SIDE GAP IN THAT RATIONALE, stated explicitly rather than left to be
 rediscovered.  "The rootdirs that spawn the drain script" is the right criterion
@@ -273,6 +270,30 @@ scoped, unlike all four siblings, because its hazard is introduced MID-session
 by another test rather than present at session start — task 4966 measured
 exactly that as a 1-in-3 flake, green standalone and green in its own file.
 
+SIXTH DEFENCE — an ambient ``CLAUDE_BINARY`` can never reroute a faked ``claude``.
+
+Since task 4448 every shared claude spawn takes ``CLAUDE_BINARY`` ahead of PATH,
+so a test that hides or fakes ``claude`` by editing PATH, and proves it with
+``shutil.which``, passes for the wrong reason under an operator's override: the
+spawn runs the real CLI.  ``_df_claude_binary_unset`` is function scoped, for
+the same mid-session reason as the fifth.  The literal name is pinned to
+shared's resolver behaviourally by
+``tests/scripts/test_claude_binary_isolation.py``.
+
+SEVENTH DEFENCE — a ``UsageGate`` a test builds in-process never sweeps the real
+tempdir.
+
+Its dead-PID probe-dir sweep (task 3086) is confined to a private per-test root
+in the four rootdirs that build gates — ``shared``, ``orchestrator``,
+``fused-memory`` and ``scripts/tests`` — each armed by
+:func:`arm_usage_gate_sweep_confinement`.  That list is the known coverage
+boundary, and nothing checks it: a fifth rootdir that starts building gates
+sweeps the real tempdir, with no test failing, until its conftest arms the
+plugin too.  The plugin patches this process, so it cannot reach a spawned
+child: a gate built in a child sweeps whatever tempdir the child inherits, and
+that child's spawner must pass a private ``TMPDIR``, as
+``orchestrator/tests/test_sighup.py::_exit_after_hup_then_term`` does.
+
 Import constraint: STDLIB + PYTEST ONLY.  Every subproject conftest imports this
 module, so it must import cleanly inside every member venv — escalation's lacks
 aiosqlite and stubs ``shared`` in ``sys.modules``, so nothing under ``shared/src``
@@ -294,12 +315,14 @@ import math
 import os
 import signal
 import subprocess
+import tempfile
 import time
 import uuid
 import warnings
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Any, assert_never
+from types import ModuleType
+from typing import Any, NamedTuple, assert_never
 
 import pytest
 
@@ -663,10 +686,10 @@ def deploy_clock_snapshot(
 # The provenance vocabulary (task 4823) — the three spellings four tiers must
 # agree on and none can import from another (see the module docstring's
 # stdlib+pytest import constraint). `scripts/restart-all-orchestrators.sh` and
-# `scripts/orchestrator-watchdog.py` each mirror them as their own literals, and
-# all three mirrors are pinned together by
+# `scripts/_watchdog_state.py` (the watchdog's clock writer) each mirror them as
+# their own literals, and all three mirrors are pinned together by
 # tests/scripts/test_restart_all_orchestrators.py and
-# tests/scripts/test_orchestrator_watchdog.py, which assert against THESE
+# tests/scripts/test_watchdog_state.py, which assert against THESE
 # objects rather than against strings of their own.
 PYTEST_SESSION_TOKEN_ENV = 'DF_PYTEST_SESSION_TOKEN'
 CLOCK_PROVENANCE_SOURCE_KEY = 'source'
@@ -1709,6 +1732,49 @@ def run_in_new_session_until(
     return RunUntilOutcome(completed, stopped_on_condition=True)
 
 
+def run_in_new_session_while_progressing(
+    cmd: list[str],
+    *,
+    progress: Callable[[], object],
+    stall_timeout: float,
+    env: dict[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    text: bool = True,
+) -> subprocess.CompletedProcess:
+    """:func:`run_in_new_session` whose deadline counts only time WITHOUT progress.
+
+    The clock re-arms whenever *progress* returns a value unequal to its
+    previous one, so a slow child that is still advancing is never killed and
+    a stuck one is, *stall_timeout* seconds after its last change. *progress*
+    is called every ``_CONDITION_POLL_SLICE_SECS`` and must be cheap and safe
+    to call while the child runs.
+
+    Raises ``TimeoutExpired`` (``timeout == stall_timeout``, partial output
+    attached) on a stall; an exception from *progress* stops the group and
+    propagates.
+    """
+    last: object = object()
+    last_change = time.monotonic()
+
+    def stalled() -> bool:
+        nonlocal last, last_change
+        current = progress()
+        if current != last:
+            last, last_change = current, time.monotonic()
+            return False
+        return time.monotonic() - last_change >= stall_timeout
+
+    outcome = run_in_new_session_until(
+        cmd, condition=stalled, timeout=math.inf, env=env, cwd=cwd, text=text,
+    )
+    if outcome.stopped_on_condition:
+        raise subprocess.TimeoutExpired(
+            cmd, stall_timeout,
+            output=outcome.completed.stdout, stderr=outcome.completed.stderr,
+        )
+    return outcome.completed
+
+
 def _spawn_in_new_session(
     cmd: list[str],
     *,
@@ -1789,6 +1855,11 @@ def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
     ``TimeoutExpired``, and masking that with a signalling error would replace
     a legible timeout with a confusing one. ``ProcessLookupError`` is the
     ordinary case of a child that exited between the timeout and the signal.
+
+    The ``Popen`` sibling of
+    ``shared/src/shared/proc_group.py::sigkill_process_group``, ported rather
+    than imported per this module's import constraint (see the module
+    docstring), so a fix to either belongs in both.
     """
     reason = _unsafe_pgid_reason(pgid)
     if reason is not None:
@@ -1807,7 +1878,9 @@ def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
 # Three test modules prove "a timeout reaches the grandchild too", one per
 # spawner plus this module's own. They need the same three things: a script that
 # forks a survivor, a way to learn that survivor's pid, and a way to wait for it
-# to die. Those live HERE for exactly the reason `run_in_new_session` does —
+# to die. The wait counts a zombie as dead; a caller that needs the pid to name
+# no process at all checks `read_proc_state(pid) is None` instead. Those live
+# HERE for exactly the reason `run_in_new_session` does —
 # `tests/scripts/` and `scripts/tests/` cannot import each other's test modules,
 # so a copy in each is a copy that can only be kept in step by hand. Centralising
 # the spawn while leaving its probes triplicated would just move the "which of
@@ -1858,27 +1931,80 @@ def read_leaked_pid(pidfile: Path, *, timeout: float = 10.0) -> int:
         time.sleep(0.05)
 
 
-def pid_is_gone(pid: int) -> bool:
-    """Whether *pid* no longer exists. Signal 0 is the standard liveness probe."""
+class ProcState(NamedTuple):
+    """A pid's ``/proc/<pid>/stat`` state letter and parent pid."""
+
+    state: str
+    ppid: int
+
+    @property
+    def exited(self) -> bool:
+        """A zombie has terminated and is only awaiting its (possibly reparented) parent's reap."""
+        return self.state in ('Z', 'X')
+
+
+def read_proc_state(pid: int, *, _proc_root: Path = Path('/proc')) -> ProcState | None:
+    """*pid*'s :class:`ProcState`, or None when it has no ``/proc`` entry at all.
+
+    None means neither running nor a zombie; an unreadable entry raises its
+    ``OSError`` and a malformed one ``ValueError``, rather than reading as gone.
+    Parsed after the LAST ``') '`` exactly as
+    :func:`orchestrator.verify_cancel.read_ppid_map` does, since ``comm`` may
+    hold spaces or parens, and decoded with replacement as ``comm`` is arbitrary
+    bytes.  A stdlib port of
+    ``shared/src/shared/proc_group.py::read_stat_fields`` (see the module
+    docstring's import constraint); ``_proc_root`` is a test seam.
+    """
+    stat = _proc_root / str(pid) / 'stat'
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        # Alive and owned by someone else — a pid the kernel already recycled.
-        return False
-    return False
+        raw = stat.read_bytes().decode('utf-8', 'replace')
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    try:
+        fields = raw.rsplit(') ', 1)[1].split()
+        return ProcState(state=fields[0], ppid=int(fields[1]))
+    except (IndexError, ValueError) as exc:
+        raise ValueError(f'unparseable {stat}: {raw!r}') from exc
+
+
+def wait_pids_exited(
+    pids: set[int],
+    *,
+    timeout: float,
+    interval: float = 0.05,
+    _read_state: Callable[[int], ProcState | None] = read_proc_state,
+    _clock: Callable[[], float] = time.monotonic,
+) -> dict[int, ProcState]:
+    """Poll until every pid in *pids* has exited; return the still-RUNNING ones.
+
+    Each survivor maps to its last observed :class:`ProcState`; an empty dict
+    means every pid exited.  A zombie counts as exited: reaping a reparented
+    orphan is its subreaper's job (``systemd --user`` on this fleet), not the
+    code under test's -- the same criterion as
+    ``orchestrator/tests/test_verify_cancel.py::_is_running`` (task 3955).
+
+    The verdict is always the probe of the returning iteration, so a caller
+    descheduled across the deadline never asserts on a stale observation;
+    ``timeout=0`` is exactly one probe.
+    """
+    deadline = _clock() + timeout
+    while True:
+        running = {
+            pid: state for pid in pids
+            if (state := _read_state(pid)) is not None and not state.exited
+        }
+        if not running or _clock() >= deadline:
+            return running
+        time.sleep(interval)
 
 
 def wait_pid_gone(pid: int, *, timeout: float = 3.0) -> bool:
-    """Poll for *pid* to disappear, allowing for SIGKILL delivery and reaping."""
-    deadline = time.monotonic() + timeout
-    while True:
-        if pid_is_gone(pid):
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
+    """Poll until *pid* has exited; False if it is still running at *timeout*.
+
+    Exited means no ``/proc`` entry, or a zombie (:attr:`ProcState.exited`)
+    awaiting its possibly-reparented parent's reap.  ``timeout=0`` is one probe.
+    """
+    return not wait_pids_exited({pid}, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -2143,6 +2269,150 @@ def _df_no_leaked_drain_processes():
                 with contextlib.suppress(OSError):
                     os.kill(pid, signal.SIGKILL)
             pytest.fail(reason, pytrace=False)
+
+
+_LEAKED_DRAIN_GUARD_PLUGIN = 'df-leaked-drain-process-guard'
+
+
+class _LeakedDrainProcessGuardPlugin:
+    """The plugin :func:`arm_leaked_drain_process_guard` registers: that guard alone."""
+
+    _df_no_leaked_drain_processes = _df_no_leaked_drain_processes
+
+
+def arm_leaked_drain_process_guard(config: pytest.Config) -> None:
+    """Arm :func:`_df_no_leaked_drain_processes` for this session, from ``pytest_configure``.
+
+    Idempotent, because a session that collects several test roots runs each
+    root's ``pytest_configure``.
+    """
+    if not config.pluginmanager.has_plugin(_LEAKED_DRAIN_GUARD_PLUGIN):
+        config.pluginmanager.register(_LeakedDrainProcessGuardPlugin, _LEAKED_DRAIN_GUARD_PLUGIN)
+
+
+# ---------------------------------------------------------------------------
+# UsageGate probe-dir sweep confinement (tasks 5328, 6275)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope='session')
+def _df_usage_gate_sweep_parent(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp('usage-gate-sweep')
+
+
+@pytest.fixture
+def usage_gate_sweep_root(_df_usage_gate_sweep_parent: Path) -> Path:
+    """The private, initially empty dir every UsageGate probe-dir sweep in this test is confined to.
+
+    Request it to plant dirs the sweep should see.
+    """
+    return Path(tempfile.mkdtemp(dir=_df_usage_gate_sweep_parent))
+
+
+@pytest.fixture
+def real_probe_dir_sweep() -> bool:
+    """Opt this test out of :func:`confine_usage_gate_sweep` (task 3086).
+
+    The test must itself redirect ``tempfile.gettempdir`` — e.g.
+    ``patch('shared.config_dir.tempfile.gettempdir', return_value=str(tmp_path))``
+    — because the real sweep deletes under it.
+    """
+    return True
+
+
+# Above Linux's PID_MAX_LIMIT (2**22): no process can ever own this PID.
+_NEVER_LIVE_PID = 2**22 + 1
+
+
+@pytest.fixture
+def plant_dead_pid_dir() -> Callable[[Path, str], Path]:
+    """Return ``plant(base, prefix)``, making a dir that a dead-PID sweep of *prefix* under *base* reclaims.
+
+    The dir is ``<base>/<prefix>ghost-<pid>`` for a PID no process can own. Like
+    a real probe dir it holds a ``.credentials.json``, and it is aged an hour,
+    past the sweep's min-age floor.
+    """
+
+    def plant(base: Path, prefix: str) -> Path:
+        ghost = base / f'{prefix}ghost-{_NEVER_LIVE_PID}'
+        ghost.mkdir()
+        (ghost / '.credentials.json').write_text('')
+        an_hour_ago = time.time() - 3600
+        os.utime(ghost, (an_hour_ago, an_hour_ago))
+        return ghost
+
+    return plant
+
+
+def confine_usage_gate_sweep(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    usage_gate_module: ModuleType,
+) -> None:
+    """Re-base, not stub, the probe-dir sweep of every UsageGate this test builds in-process.
+
+    ``UsageGate.__init__`` sweeps dead-PID probe dirs under the system tempdir.
+    Confining that sweep for every test means safety no longer rests on which
+    test first set the once-per-process mark. ``real_probe_dir_sweep`` is the
+    escape hatch. ``usage_gate_sweep_root`` is resolved on the first sweep, so a
+    test that builds no gate and does not request it creates no directory.
+    *usage_gate_module* is ``shared.usage_gate``, passed in because this module
+    may not import ``shared`` (see the module docstring's import constraint).
+    """
+    if 'real_probe_dir_sweep' in request.fixturenames:
+        return
+    real_sweep = usage_gate_module.sweep_stale_pid_dirs
+
+    def _confined_sweep(prefix: str, **kwargs: Any) -> int:
+        if 'base_dir' not in kwargs:
+            kwargs['base_dir'] = request.getfixturevalue('usage_gate_sweep_root')
+        return real_sweep(prefix, **kwargs)
+
+    monkeypatch.setattr(usage_gate_module, 'sweep_stale_pid_dirs', _confined_sweep, raising=True)
+
+
+_USAGE_GATE_SWEEP_PLUGIN = 'df-usage-gate-sweep-confinement'
+
+
+def arm_usage_gate_sweep_confinement(config: pytest.Config, usage_gate_module: ModuleType) -> None:
+    """Confine every test's UsageGate probe-dir sweep for this session, from ``pytest_configure``.
+
+    Registers :func:`usage_gate_sweep_root`, :func:`real_probe_dir_sweep`,
+    :func:`plant_dead_pid_dir` and an autouse fixture applying
+    :func:`confine_usage_gate_sweep` to
+    *usage_gate_module*. Idempotent, because a session that collects several
+    test roots runs each root's ``pytest_configure``. Only the first arm's
+    module is patched, so a re-arm with a different module object is refused
+    with ``pytest.UsageError`` rather than leaving that module's gates unconfined.
+    """
+    armed = config.pluginmanager.get_plugin(_USAGE_GATE_SWEEP_PLUGIN)
+    if armed is not None:
+        if armed.usage_gate_module is not usage_gate_module:
+            raise pytest.UsageError(
+                f'the UsageGate probe-dir sweep confinement already patches '
+                f'{armed.usage_gate_module!r}, so it cannot also confine '
+                f'{usage_gate_module!r}; every test root must arm it with the '
+                f'one shared.usage_gate module object this session imports'
+            )
+        return
+
+    @pytest.fixture(autouse=True)
+    def confine(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+        confine_usage_gate_sweep(request, monkeypatch, usage_gate_module)
+
+    plugin = type(
+        '_UsageGateSweepConfinementPlugin',
+        (),
+        {
+            'usage_gate_module': usage_gate_module,
+            '_df_usage_gate_sweep_parent': _df_usage_gate_sweep_parent,
+            'usage_gate_sweep_root': usage_gate_sweep_root,
+            'real_probe_dir_sweep': real_probe_dir_sweep,
+            'plant_dead_pid_dir': plant_dead_pid_dir,
+            '_df_confine_usage_gate_sweep': confine,
+        },
+    )
+    config.pluginmanager.register(plugin, _USAGE_GATE_SWEEP_PLUGIN)
 
 
 # ---------------------------------------------------------------------------
@@ -2717,3 +2987,24 @@ def _df_git_env_hermetic():
         for key in git_redirect_env(os.environ):
             del os.environ[key]
         os.environ.update(saved)
+
+
+# ---------------------------------------------------------------------------
+# Ambient claude-binary override
+# ---------------------------------------------------------------------------
+
+CLAUDE_BINARY_ENV = 'CLAUDE_BINARY'
+
+
+@pytest.fixture(autouse=True)
+def _df_claude_binary_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SIXTH DEFENCE — an ambient ``CLAUDE_BINARY`` never reaches a test body.
+
+    ``shared.cli_invoke::claude_binary_spec`` reads it ahead of PATH, so a test
+    that hides or fakes ``claude`` by editing PATH can still be routed to the
+    real CLI, and verify inherits the orchestrator's environment. FUNCTION
+    scoped like :func:`_df_git_env_hermetic`, because a leak can arrive
+    mid-session. ``monkeypatch`` restores the pre-test value, and a test may
+    still set the variable deliberately.
+    """
+    monkeypatch.delenv(CLAUDE_BINARY_ENV, raising=False)

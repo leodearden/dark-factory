@@ -1553,8 +1553,8 @@ class TestSchema:
         critical index. This test creates a fresh DB using _SCHEMA (production)
         and asserts the index is present.
         """
-        import sys  # noqa: PLC0415
-        from pathlib import Path  # noqa: PLC0415
+        import sys
+        from pathlib import Path
 
         # shared is not a dashboard venv dependency; locate it via relative path
         # parents[2] = worktree root (e.g. .worktrees/317)
@@ -1564,7 +1564,7 @@ class TestSchema:
         sys.path.insert(0, shared_src)
         try:
             from shared.cost_store import (
-                _SCHEMA as PROD_SCHEMA,  # noqa: PLC0415
+                _SCHEMA as PROD_SCHEMA,
             )
         finally:
             sys.path.remove(shared_src)

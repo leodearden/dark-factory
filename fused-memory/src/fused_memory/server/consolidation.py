@@ -22,7 +22,10 @@ selects the PROPOSAL arm, which callers reach through
 the emit boundary — so the LLM that wrote a mis-shaped claim fixes it in-turn
 — and task delta's executor when it re-checks an aged ledger row whose limits
 have since moved (PRD B7).  The id, topic and arm rules are therefore checked
-once, in one place, rather than re-typed per caller.
+once, in one place, rather than re-typed per caller.  That executor
+(``reconciliation/consolidation_auto_executor.py``) reads the refusal through
+:func:`proposal_shape_codes`, which names it as structured codes built from
+the same rule helpers rather than by parsing the error string.
 
 ``reconciliation/consolidation_auto.py::evaluate_auto_predicate`` deliberately
 calls NONE of this: PRD C2 makes the benign codes the emit boundary's business,
@@ -61,9 +64,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
-from fused_memory.memory_metadata import normalize_supersedes
+from fused_memory.memory_metadata import is_canonical, normalize_supersedes
 from fused_memory.models.enums import MemoryCategory
 from fused_memory.topic_slug import TOPIC_SLUG_MAX_LEN, is_valid_topic_slug
 
@@ -80,7 +84,9 @@ if TYPE_CHECKING:
 
 __all__ = [
     'ProposalLimits',
+    'ProposalShapeCode',
     'build_consolidation_result',
+    'proposal_shape_codes',
     'validate_consolidate_args',
     'validate_proposal_args',
 ]
@@ -734,14 +740,63 @@ def validate_proposal_args(
     return err, members
 
 
+class ProposalShapeCode(StrEnum):
+    """Why :func:`validate_proposal_args` refused a proposal, as a structured code."""
+
+    MEMBER_COUNT_OUT_OF_RANGE = 'member_count_out_of_range'
+    INVALID_SLUG = 'invalid_slug'
+    CLAIM_NOT_INDEX_SHAPED = 'claim_not_index_shaped'
+    PROPOSAL_SHAPE_INVALID = 'proposal_shape_invalid'
+
+
+def proposal_shape_codes(
+    *,
+    topic: Any,
+    member_ids: Any,
+    run_id: Any,
+    claim: Any,
+    category: Any,
+    rationale: Any,
+    seeded_from: Any = None,
+    limits: ProposalLimits,
+) -> tuple[ProposalShapeCode, ...]:
+    """The codes for every rule :func:`validate_proposal_args` refuses, in enum order.
+
+    Empty exactly when the validator accepts. Each code is named by the same
+    rule helper the validator calls; a refusal none of them names is
+    ``PROPOSAL_SHAPE_INVALID``.
+    """
+    err, normalized_ids = validate_proposal_args(
+        topic=topic,
+        member_ids=member_ids,
+        run_id=run_id,
+        claim=claim,
+        category=category,
+        rationale=rationale,
+        seeded_from=seeded_from,
+        limits=limits,
+    )
+    if err is None:
+        return ()
+    fired = {
+        ProposalShapeCode.MEMBER_COUNT_OUT_OF_RANGE: bool(
+            _member_count_problems(normalized_ids, limits, _PROPOSAL_LABELS.member_arm)
+        ),
+        ProposalShapeCode.INVALID_SLUG: not is_valid_topic_slug(topic),
+        ProposalShapeCode.CLAIM_NOT_INDEX_SHAPED: (
+            not isinstance(claim, str)
+            or not claim.strip()
+            or bool(_claim_problems(claim, topic, max_chars=limits.claim_max_chars))
+        ),
+    }
+    codes = tuple(code for code in ProposalShapeCode if fired.get(code))
+    return codes or (ProposalShapeCode.PROPOSAL_SHAPE_INVALID,)
+
+
 def _closure_member_ref(row: Any) -> dict[str, Any]:
     if not isinstance(row, dict):
         return {'id': None, 'canonical': False}
-    meta = row.get('metadata')
-    return {
-        'id': row.get('id'),
-        'canonical': isinstance(meta, dict) and meta.get('canonical') is True,
-    }
+    return {'id': row.get('id'), 'canonical': is_canonical(row.get('metadata'))}
 
 
 def build_consolidation_result(

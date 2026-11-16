@@ -83,6 +83,9 @@ import types
 from collections.abc import Iterator
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 SCRIPT_PATH = REPO_ROOT / "skills" / "factory-init" / "scripts" / "find_escalation_port.py"
@@ -1481,7 +1484,7 @@ def nightly(monkeypatch: pytest.MonkeyPatch) -> Iterator[types.ModuleType]:
     """
     monkeypatch.syspath_prepend(str(REPO_ROOT / "scripts" / "legibility"))
     before = set(sys.modules)
-    from legibility import nightly as nightly_mod  # noqa: PLC0415
+    from legibility import nightly as nightly_mod
 
     yield nightly_mod
 

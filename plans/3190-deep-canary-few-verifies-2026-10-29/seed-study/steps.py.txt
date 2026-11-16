@@ -1,0 +1,40 @@
+import json,time,collections,statistics as st,bisect,calendar
+def pct(xs,q):
+    xs=sorted(xs);k=q*(len(xs)-1);f=int(k);c=min(f+1,len(xs)-1);return xs[f]+(xs[c]-xs[f])*(k-f)
+rows=[]
+first=True
+for l in open('/home/leo/src/reify/data/verify-logs/verify-runs.jsonl',errors='replace'):
+    try:r=json.loads(l)
+    except Exception:continue
+    rows.append(r)
+print('sample step',json.dumps(rows[-1]['steps'][0])[:400])
+print('step names',collections.Counter(s.get('name') or s.get('step') or s.get('phase') for r in rows for s in r.get('steps',[])).most_common(25))
+print('per ISO-ish era: role,n,wall p50,p90; n steps')
+eras=[('10-15..18',calendar.timegm((2026,10,15,0,0,0)),calendar.timegm((2026,10,19,0,0,0))),('10-19..21',calendar.timegm((2026,10,19,0,0,0)),calendar.timegm((2026,10,22,0,0,0))),('10-22..25',calendar.timegm((2026,10,22,0,0,0)),calendar.timegm((2026,10,26,0,0,0))),('10-26..30',calendar.timegm((2026,10,26,0,0,0)),9e12)]
+for nm,lo,hi in eras:
+    for role in ('task','merge','offline','background'):
+        v=[r['wall_secs'] for r in rows if r.get('role')==role and lo<=r.get('started_at',0)<hi and r.get('wall_secs')]
+        if v:print(nm,role,len(v),f"{pct(v,.5):.0f} {pct(v,.9):.0f} sum_h={sum(v)/3600:.0f}")
+def nm(s):return s.get('name') or s.get('step') or s.get('phase')
+print('median step wall for role=task,merge by era (top steps by total wall)')
+for role in ('task','merge'):
+  tot=collections.Counter()
+  for r in rows:
+    if r.get('role')==role:
+        for s in r.get('steps',[]):tot[nm(s)]+=s.get('wall_secs') or 0
+  top=[k for k,_ in tot.most_common(7)]
+  for k in top:
+    out=[]
+    for en,lo,hi in eras:
+        v=[s.get('wall_secs') for r in rows if r.get('role')==role and lo<=r.get('started_at',0)<hi for s in r.get('steps',[]) if nm(s)==k and s.get('wall_secs') is not None]
+        out.append(f"{en} n={len(v)} p50={pct(v,.5):.0f}" if v else f"{en} -")
+    print(role,k,' | '.join(out))
+print('fields in step',list(rows[-1]['steps'][0].keys()))
+ns=[]
+for r in rows:
+    for s in r.get('steps',[]):
+        n=s.get('nextest')
+        if isinstance(n,dict):ns.append((r['started_at'],r['role'],n))
+print('nextest sample',json.dumps(ns[-1][2])[:300] if ns else None)
+sc=[(r['started_at'],s['sccache']) for r in rows for s in r.get('steps',[]) if isinstance(s.get('sccache'),dict)]
+print('sccache sample',json.dumps(sc[-1][1])[:300] if sc else None)

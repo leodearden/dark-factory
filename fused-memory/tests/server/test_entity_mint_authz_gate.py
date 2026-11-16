@@ -22,8 +22,13 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+import pytest_asyncio
+from _task_facts_rows import task_facts_rows
 
-from fused_memory.config.schema import EntityMintConfig, FusedMemoryConfig
+from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+from fused_memory.config.schema import EntityMintConfig, FusedMemoryConfig, TaskmasterConfig
+from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.server.entity_mint_authz import (
     resolve_entity_mint_authorization,
     validate_mint_name,
@@ -548,9 +553,9 @@ class TestMintNameTaskVerification:
         interceptor = None
         if task_interceptor:
             interceptor = MagicMock()
-            interceptor.get_statuses = AsyncMock(
+            interceptor.get_task_facts = AsyncMock(
                 side_effect=RuntimeError('taskmaster down') if raises else None,
-                return_value=None if raises else (statuses or {}),
+                return_value=None if raises else task_facts_rows(statuses or {}),
             )
         server = create_mcp_server(
             mock_service,
@@ -572,7 +577,7 @@ class TestMintNameTaskVerification:
 
         assert result.get('error_type') is None, result
         mock_service.ensure_entity_node.assert_awaited_once()
-        interceptor.get_statuses.assert_awaited_once()
+        interceptor.get_task_facts.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_a_successfully_consulted_registry_that_lacks_the_task_refuses(self):
@@ -591,7 +596,7 @@ class TestMintNameTaskVerification:
         assert result.get('error_type') == 'EntityMintUnknownTask', result
         assert '3222' in (result.get('error') or ''), result
         mock_service.ensure_entity_node.assert_not_called()
-        interceptor.get_statuses.assert_awaited_once()
+        interceptor.get_task_facts.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_a_dict_lacking_the_id_also_refuses(self):
@@ -610,20 +615,12 @@ class TestMintNameTaskVerification:
     async def test_an_acknowledged_id_with_a_non_str_status_does_not_refuse(self):
         """PRESENCE is the existence signal; the value's TYPE is not.
 
-        Amendment (review finding: robustness). `_batched_task_statuses` only
-        records a `resolved` entry when the status `isinstance(value, str)`.
-        That filter is benign for `_claim_task_statuses` (a dropped key
-        collapses into the same 'unverifiable' tag) but WRONG here: the project
-        is `consulted`, the key is absent from `resolved`, and this guard would
-        read that as a positive "no such task" — refusing to mint for a task
-        that demonstrably exists.
-
+        `SqliteTaskBackend.get_task_facts` omits unknown ids entirely and
+        coerces even a NULL status to `'unknown'`, so a returned row is a real
+        record however odd its status. `read_task_facts` reads a row without a
+        str status as COULD_NOT_CHECK, never NO_SUCH_TASK, so this guard
+        proceeds rather than refusing to mint for a task that exists.
         `{'3222': None}` is the input that separates the two readings.
-        `TaskInterceptor.get_statuses` omits unknown ids ENTIRELY and
-        `SqliteTaskBackend.get_statuses_raw` coerces even a NULL status to the
-        sentinel string `'unknown'`, so a returned key is a real record however
-        odd its value; only a protocol-violating backend produces this shape,
-        and the correct response to one is to proceed, not to accuse.
         """
         mock_service = _mock_service()
         server, interceptor = self._server(
@@ -634,7 +631,7 @@ class TestMintNameTaskVerification:
 
         assert result.get('error_type') is None, result
         mock_service.ensure_entity_node.assert_awaited_once()
-        interceptor.get_statuses.assert_awaited_once()
+        interceptor.get_task_facts.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_an_unconfigured_taskmaster_does_not_refuse(self):
@@ -665,7 +662,7 @@ class TestMintNameTaskVerification:
 
         assert result.get('error_type') is None, result
         mock_service.ensure_entity_node.assert_awaited_once()
-        interceptor.get_statuses.assert_not_awaited()
+        interceptor.get_task_facts.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_raising_status_read_does_not_refuse(self):
@@ -696,8 +693,8 @@ class TestMintNameTaskVerification:
         )
 
         assert result.get('error_type') is None, result
-        interceptor.get_statuses.assert_awaited_once()
-        kwargs = interceptor.get_statuses.call_args.kwargs
+        interceptor.get_task_facts.assert_awaited_once()
+        kwargs = interceptor.get_task_facts.call_args.kwargs
         assert kwargs.get('project_root') == '/tmp/reify', (
             "the probe must target the REFERENT's project root, not the "
             f'writing project\'s; got {kwargs!r}'
@@ -713,7 +710,62 @@ class TestMintNameTaskVerification:
         result = await _call_on(server, agent_id='claude-interactive')
 
         assert result.get('error_type') == 'EntityMintNotAuthorized', result
-        interceptor.get_statuses.assert_not_awaited()
+        interceptor.get_task_facts.assert_not_awaited()
+
+
+class TestMintNameTaskVerificationOverARealStore:
+    """Guard 4 against a real SqliteTaskBackend behind a bare TaskInterceptor."""
+
+    @pytest_asyncio.fixture
+    async def store(self, tmp_path):
+        backend = SqliteTaskBackend(TaskmasterConfig(project_root=str(tmp_path)))
+        await backend.start()
+        interceptor = TaskInterceptor(backend, None, EventBuffer(db_path=None))
+        root = str(tmp_path / 'df')
+        await backend.add_task(project_root=root, title='Seeded mint referent')
+        try:
+            yield interceptor, root
+        finally:
+            await interceptor.close()
+            await backend.close()
+
+    @staticmethod
+    def _real_server(mock_service, store):
+        interceptor, root = store
+        return _server(
+            mock_service, task_interceptor=interceptor, known_projects={_PROJECT_ID: root},
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_task_the_store_has_dispatches(self, store):
+        mock_service = _mock_service()
+
+        result = await _call_on(
+            self._real_server(mock_service, store), name='Task 1', agent_id='curator-repair',
+        )
+
+        assert result.get('error_type') is None, result
+        mock_service.ensure_entity_node.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_an_id_the_store_lacks_refuses(self, store):
+        mock_service = _mock_service()
+
+        result = await _call_on(self._real_server(mock_service, store), agent_id='curator-repair')
+
+        assert result.get('error_type') == 'EntityMintUnknownTask', result
+        mock_service.ensure_entity_node.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_an_unregistered_referent_project_dispatches(self, store):
+        mock_service = _mock_service()
+
+        result = await _call_on(
+            self._real_server(mock_service, store), name='reify:132', agent_id='curator-repair',
+        )
+
+        assert result.get('error_type') is None, result
+        mock_service.ensure_entity_node.assert_awaited_once()
 
 
 class TestRefusalEnvelopeShape:

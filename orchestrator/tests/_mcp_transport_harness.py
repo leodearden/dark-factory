@@ -20,6 +20,10 @@ WHAT THE HANDLER REPRODUCES.  Both live rejections, measured by curl against
   * ``POST /mcp/``            -> 307, Location: /mcp   (trailing slash)
   * ``POST /mcp`` w/o Accept  -> 406 "Client must accept application/json"
   * ``POST /mcp`` w/ Accept   -> 200 + a real JSON-RPC result
+  * a ``tools/call`` for a tool named in ``tool_replies`` -> 200 + the
+    FastMCP result envelope carrying that reply, both as ``structuredContent``
+    and as a JSON text block (:func:`tool_reply_envelope`), so a caller that
+    reads the tool's reply sees a ticket or a refusal the way it arrives live
 
 Both matter, because fixing only the slash moves the failure from a silent 307
 no-op to a silent 406 no-op — still a lost write.
@@ -34,6 +38,8 @@ discarded writes turned on.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from typing import Any
 
 import httpx
 
@@ -42,6 +48,7 @@ __all__ = [
     'MCP_PATH_WITH_SLASH',
     'RecordingClientFactory',
     'RecordingMcpServer',
+    'tool_reply_envelope',
 ]
 
 #: Captured at import, BEFORE any ``patch('httpx.AsyncClient', ...)`` is
@@ -53,10 +60,25 @@ MCP_PATH = '/mcp'
 MCP_PATH_WITH_SLASH = '/mcp/'
 
 
+def tool_reply_envelope(reply: Mapping[str, Any]) -> dict:
+    """The JSON-RPC body FastMCP answers a ``tools/call`` with when the tool replies *reply*."""
+    return {
+        'jsonrpc': '2.0',
+        'id': 1,
+        'result': {
+            'content': [{'type': 'text', 'text': json.dumps(reply)}],
+            'structuredContent': dict(reply),
+            'isError': False,
+        },
+    }
+
+
 class RecordingMcpServer:
     """``httpx.MockTransport`` handler reproducing the live fused-memory server."""
 
-    def __init__(self):
+    def __init__(self, tool_replies: Mapping[str, Mapping[str, Any]] | None = None):
+        #: Tool name -> the reply that tool answers every delivered call with.
+        self._tool_replies = dict(tool_replies or {})
         #: (path, json_body) for every request the server actually PROCESSED.
         self.delivered: list[tuple[str, dict]] = []
         #: Requests refused with a 307 because of the trailing slash.
@@ -99,6 +121,11 @@ class RecordingMcpServer:
 
         body = json.loads(request.content)
         self.delivered.append((path, body))
+        tool_name = body.get('params', {}).get('name')
+        if body.get('method') == 'tools/call' and tool_name in self._tool_replies:
+            return httpx.Response(
+                200, json=tool_reply_envelope(self._tool_replies[tool_name]),
+            )
         return httpx.Response(
             200,
             json={'jsonrpc': '2.0', 'id': 1, 'result': {'content': []}},

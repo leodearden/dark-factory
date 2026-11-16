@@ -7,7 +7,10 @@ accompanies a PRD's ``.capability-manifest.md`` (see
 (fused-memory, task γ) is the canonical writer of the sidecar's ``task_id``
 field and of a producer task's ``metadata.delivered_checks``; the scheduler
 (orchestrator, task δ) is the canonical reader of ``metadata.delivered_checks``
-at the dispatch gate.
+at the dispatch gate. :func:`sidecar_path` is the one home of the rule that
+derives a PRD's sidecar path from its PRD key, :func:`sidecar_for` the one
+home of where that sidecar sits under a project root, and
+:func:`tracked_sidecar_paths` the one home of which sidecars git tracks there.
 
 This module also registers the ``metadata.delivered_checks`` sub-model with
 ``shared.task_metadata``'s W10 extension point
@@ -22,8 +25,11 @@ comment at the bottom of this module).
 
 from __future__ import annotations
 
+import os
+import re
+import subprocess
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Final, Literal, get_args
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -33,14 +39,84 @@ from shared.task_metadata import ExternalDep, register_metadata_submodel
 __all__ = [
     'CHECK_SUBJECT_FIELD',
     'MECHANICAL_CHECK_KINDS',
+    'SIDECAR_SUFFIX',
     'CapabilityManifestDoc',
     'DeliveredCheck',
     'DeliveredCheckMeta',
     'ManifestCapability',
+    'ManifestDiscoveryUnavailable',
     'ManifestTask',
     'load_capability_manifest',
     'parse_capability_manifest',
+    'sidecar_for',
+    'sidecar_path',
+    'tracked_sidecar_paths',
 ]
+
+SIDECAR_SUFFIX: Final = '.capability-manifest.yaml'
+
+
+def sidecar_path(prd_key: str) -> str:
+    """The one PRD key → sidecar path rule, for the commit_planning stamper and the delivered-check owner lookup.
+
+    ``plans/x-prd.md`` → ``plans/x-prd.capability-manifest.yaml``.
+    """
+    return re.sub(r'\.md$', '', prd_key) + SIDECAR_SUFFIX
+
+
+def sidecar_for(prd_path: object, project_root: str | os.PathLike[str]) -> str | None:
+    """The root-relative POSIX path of the sidecar commit_planning would open for *prd_path* under *project_root*.
+
+    ``None`` when *prd_path* is not a non-empty str, cannot be resolved (an
+    embedded NUL), or resolves outside the root; contract C3 of
+    ``plans/review-all-s20-cli-invocation-and-usage-gate-prd.md``.
+    """
+    if not isinstance(prd_path, str) or not prd_path:
+        return None
+    root = Path(project_root).resolve()
+    try:
+        resolved = (root / sidecar_path(prd_path)).resolve()
+    except ValueError:
+        return None
+    if not resolved.is_relative_to(root):
+        return None
+    return resolved.relative_to(root).as_posix()
+
+
+class ManifestDiscoveryUnavailable(RuntimeError):
+    """git could not list the tracked sidecars.
+
+    Raised rather than returning ``[]`` because an empty corpus and an
+    unlistable one must not look alike (``docs/legibility/design-invariants.md``,
+    no-silent-fail-soft).
+    """
+
+
+def tracked_sidecar_paths(project_root: str | os.PathLike[str], *, timeout: float = 30) -> list[str]:
+    """Sorted root-relative paths of every git-TRACKED sidecar under *project_root*.
+
+    Raises :class:`ManifestDiscoveryUnavailable` when git cannot be run, times
+    out, exits non-zero, or lists a path that is not UTF-8.
+    """
+    root = os.fspath(project_root)
+    try:
+        completed = subprocess.run(
+            ['git', '-C', root, 'ls-files', '-z', '--', f'*{SIDECAR_SUFFIX}'],
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ManifestDiscoveryUnavailable(f'could not run git ls-files in {root}: {exc}') from exc
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode('utf-8', errors='replace').strip()
+        raise ManifestDiscoveryUnavailable(
+            f'git ls-files failed in {root} (rc={completed.returncode}): {stderr or "no stderr"}'
+        )
+    try:
+        listing = completed.stdout.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise ManifestDiscoveryUnavailable(f'git ls-files in {root} listed a non-UTF-8 path: {exc}') from exc
+    return sorted({p for p in listing.split('\0') if p})
 
 
 def _check_kind_conditional_fields(
@@ -298,9 +374,13 @@ class ManifestTask(BaseModel):
     registry (if any) holds the task that produces its capabilities:
 
     - ``task_id`` set — the producer is a LOCAL dark-factory task, stamped
-      by ``commit_planning``; never author-supplied for a real batch. This
-      is the ordinary case, and the only one whose ``delivered_check``\\ s
-      this project's dispatch gate evaluates.
+      by ``commit_planning``; never author-supplied for a real batch. The one
+      exception, sanctioned by ``plans/dashboard-prd-lanes-prd.md`` §9 ε, is
+      the minimal sidecar that its ε1–ε4 write for a legacy, chain-only PRD:
+      it binds an EXISTING task's id by hand, is not a real batch, and
+      ``commit_planning`` never stamps it. A local
+      ``task_id`` is the ordinary case, and the only one whose
+      ``delivered_check``\\ s this project's dispatch gate evaluates.
     - ``external_task_id`` set — the producer lives in ANOTHER project's
       registry, named in the repo's canonical qualified
       ``"project_id:task_id"`` form (``docs/task-authoring.md`` §3.2, the
@@ -389,6 +469,13 @@ class CapabilityManifestDoc(BaseModel):
     ``min_length=1`` on ``label`` already rejects an empty label on its
     own, so that branch here is a defense-in-depth restatement of the same
     rule at doc granularity).
+
+    ``signal_leaves`` names the label(s) of the block(s) whose completion
+    delivers the PRD's goal signal, usually its integration gate. The
+    dashboard derives the PRD's delivered / partial / not-yet mark from those
+    tasks' status at read time; nothing writes it at runtime. Absent means
+    the PRD names no signal leaf. Contract: ``plans/dashboard-prd-lanes-prd.md``
+    §4.7 and §5.2.
     """
 
     model_config = ConfigDict(extra='forbid')
@@ -396,6 +483,7 @@ class CapabilityManifestDoc(BaseModel):
     prd: str
     schema_version: Literal[1]
     tasks: list[ManifestTask]
+    signal_leaves: list[str] | None = None
 
     @model_validator(mode='after')
     def _check_labels(self) -> CapabilityManifestDoc:
@@ -406,6 +494,24 @@ class CapabilityManifestDoc(BaseModel):
             if task.label in seen:
                 raise ValueError(f'CapabilityManifestDoc: duplicate task label {task.label!r}.')
             seen.add(task.label)
+        return self
+
+    @model_validator(mode='after')
+    def _check_signal_leaves(self) -> CapabilityManifestDoc:
+        if self.signal_leaves is None:
+            return self
+        if not self.signal_leaves:
+            raise ValueError(
+                'CapabilityManifestDoc: signal_leaves must be non-empty when present — '
+                'omit the field when the PRD names no signal leaf.'
+            )
+        known = [task.label for task in self.tasks]
+        for label in self.signal_leaves:
+            if label not in known:
+                raise ValueError(
+                    f'CapabilityManifestDoc: signal_leaves label {label!r} names no task '
+                    f'block; known labels: {known!r}.'
+                )
         return self
 
 

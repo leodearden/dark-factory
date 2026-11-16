@@ -44,7 +44,9 @@ So, readable from this module alone:
 * MARK_DONE -> ``.vetoes_done_flip``, via :func:`records_pin_blocked_done_flip`
   here and ``task_ground_truth._vetoes_done_flip`` at the resolver.  Consumed
   by the ON_MAIN blocked-arm clause, the ``_RECOVERY`` table's escalation
-  element, and the already-landed dispatch gate.
+  element, and the already-landed dispatch gate.  The ON_MAIN blocked-arm
+  clause alone relaxes the wider :data:`ON_MAIN_REMEDIABLE_ESC_CATEGORIES`;
+  every recovery-side site keeps :data:`MERGE_REMEDIABLE_ESC_CATEGORIES`.
 * RE-FILE DEDUP -> the OWNED buckets, via
   :func:`records_would_duplicate_a_handoff`.  A third question, not a third
   spelling of the first two: "does a record with an owner already sit on this
@@ -63,13 +65,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from escalation.pins import PinRecord, classify_pins
+from escalation.pins import PinRecord, classify_pins, needs_human
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 __all__ = [
     'MERGE_REMEDIABLE_ESC_CATEGORIES',
+    'ON_MAIN_REMEDIABLE_ESC_CATEGORIES',
     'only_merge_remediable',
     'records_pin_blocked_done_flip',
     'records_pin_blocked_recovery',
@@ -102,20 +105,37 @@ MERGE_REMEDIABLE_ESC_CATEGORIES: frozenset[str] = frozenset({
     'stranded_blocked',
 })
 
+# Categories whose ask is satisfied BY CONSTRUCTION once the branch is ON MAIN
+# (task 4645).  A `preexisting_main_break` escalation exists because the
+# branch could not merge while main was already red; its ask is a fixed main
+# so the merge can be made.  Once the branch IS on main that ask is moot, so the escalation
+# must not veto the on-main self-heal it requested.  The ask is NOT satisfied
+# for an off-main branch (the merge is still unmade), which is why this is a
+# SECOND set consumed by the ON_MAIN blocked-arm clause alone, and not a
+# widening of the shared one.  Always a derivation of the shared set, never a
+# second literal, so a later widening of the shared set cannot bypass it.
+ON_MAIN_REMEDIABLE_ESC_CATEGORIES: frozenset[str] = MERGE_REMEDIABLE_ESC_CATEGORIES | frozenset({'preexisting_main_break'})
 
-def only_merge_remediable(open_escalations: Sequence) -> bool:
-    """Are *open_escalations* ALL of a merge-remediable class?
 
-    The single category authority for the relaxed blocked-arm veto (INV-5),
-    consumed through :func:`records_pin_blocked_recovery` by BOTH
-    ``Harness._reconcile_one_stranded``'s blocked clauses and
-    ``Scheduler._phase_redispatch_stranded_blocked``.
+def only_merge_remediable(
+    open_escalations: Sequence,
+    categories: frozenset[str] = MERGE_REMEDIABLE_ESC_CATEGORIES,
+) -> bool:
+    """Are *open_escalations* ALL of a class in *categories*?
+
+    The single category authority for the relaxed blocked-arm veto (INV-5).
+    Two sets feed it, and which wrapper passes which is the whole policy:
+    :func:`records_pin_blocked_recovery` (the EXISTS_OFF_MAIN clause, the
+    CONVERT scoping clause and ``Scheduler._phase_redispatch_stranded_blocked``)
+    uses the default :data:`MERGE_REMEDIABLE_ESC_CATEGORIES`;
+    :func:`records_pin_blocked_done_flip` (the ON_MAIN clause alone) passes
+    :data:`ON_MAIN_REMEDIABLE_ESC_CATEGORIES`.
 
     Vacuously ``True`` for an empty list — so a task with no open escalation
     classifies exactly as it does today.  ``False`` as soon as ONE escalation
-    falls outside :data:`MERGE_REMEDIABLE_ESC_CATEGORIES`, preserving the
-    safety invariant that a human-concern escalation still vetoes the
-    self-heal.
+    falls outside *categories*, preserving the safety invariant that a
+    human-concern escalation still vetoes the self-heal whichever set is
+    passed.
 
     Takes any record carrying a ``category`` — both
     ``orchestrator.task_ground_truth.EscalationRef`` (the resolver-side ref)
@@ -124,10 +144,7 @@ def only_merge_remediable(open_escalations: Sequence) -> bool:
     that protocol is the pin-CLASS surface, and category is orchestrator
     policy.
     """
-    return all(
-        ref.category in MERGE_REMEDIABLE_ESC_CATEGORIES
-        for ref in open_escalations
-    )
+    return all(ref.category in categories for ref in open_escalations)
 
 
 def records_pin_recovery(
@@ -183,6 +200,15 @@ def records_pin_blocked_recovery(
     to judge — ``only_merge_remediable(())`` would be vacuously True and
     silently relax a strand nobody can see.
 
+    A record that needs a human (:func:`escalation.pins.needs_human`) is never
+    relaxed (task 6145).  A re-dispatch meets the workflow gate that stops on
+    that record, so relaxing it loops block -> re-pend; a direct merge (the
+    harness's EXISTS_OFF_MAIN verified-green submit) never meets that gate and
+    would merge past the record, which repend-PRD D4 stop-the-line forbids.
+    ``orchestrator/tests/test_merge_gate_implies_sweep_pin.py`` pins the
+    property, and ``orchestrator/tests/test_stranded_verified_green_human_held.py``
+    the direct-merge consumer.
+
     NOT the predicate for a done-flip — see
     :func:`records_pin_blocked_done_flip`, its deliberately-more-conservative
     twin.
@@ -194,7 +220,11 @@ def records_pin_blocked_recovery(
         records,
         live_claimant=live_claimant,
         live_claimant_id=live_claimant_id,
-    ) and not only_merge_remediable(records)
+    ) and not _relaxed_for_recovery(records)
+
+
+def _relaxed_for_recovery(records: Sequence[PinRecord]) -> bool:
+    return only_merge_remediable(records) and not any(needs_human(r) for r in records)
 
 
 def records_pin_blocked_done_flip(
@@ -207,11 +237,21 @@ def records_pin_blocked_done_flip(
     """Do *records* forbid flipping a BLOCKED task to done?
 
     :func:`records_pin_blocked_recovery`'s deliberately-more-conservative twin.
-    Same merge-remediable relaxation, same ``records is None`` ordering and the
-    same rationale for it — but built on ``vetoes_done_flip`` rather than
-    ``pins``, so the two differ on EXACTLY ONE input class: a dead-filer L0.
+    Same ``records is None`` ordering and the same rationale for it, but built
+    on ``vetoes_done_flip`` rather than ``pins`` and relaxing over the wider
+    :data:`ON_MAIN_REMEDIABLE_ESC_CATEGORIES`.  The two therefore differ on
+    EXACTLY THREE input classes:
 
-    That asymmetry is PRD D3 ("Done-flip vetoes stay maximally conservative:
+    * a dead-filer L0 — the done-flip is MORE conservative (below);
+    * a ``preexisting_main_break``-only pin — the done-flip is LESS
+      conservative, because this predicate is consumed only where the branch is
+      ON MAIN and that escalation's ask is already met (task 4645);
+    * a human-held merge-remediable record — the recovery predicate is MORE
+      conservative, because a re-dispatch meets the gate that stops on it and
+      a direct merge would pass it (task 6145); the done-flip, reached only on
+      main, merges nothing and keeps relaxing it.
+
+    The dead-L0 asymmetry is PRD D3 ("Done-flip vetoes stay maximally conservative:
     any non-info open record still vetoes MARK_DONE") and spec
     ``docs/task-escalation-state-spec.md`` §6 demand 3, not a local judgement.
     A dead L0 has no consumer LEFT, which is why recovery may proceed past it —
@@ -219,7 +259,7 @@ def records_pin_blocked_done_flip(
     proceeding past the same record phantom-completes the task; the record gets
     an owner later, when the orphan-L0 reaper promotes it to L1.
 
-    The divergence is pinned as an enumerated set in
+    The divergence is pinned as an enumerated mapping in
     ``orchestrator/tests/test_recovery_pins.py`` so neither predicate can
     widen it silently.
     """
@@ -230,7 +270,9 @@ def records_pin_blocked_done_flip(
         records,
         live_claimant=live_claimant,
         live_claimant_id=live_claimant_id,
-    ).vetoes_done_flip and not only_merge_remediable(records)
+    ).vetoes_done_flip and not only_merge_remediable(
+        records, ON_MAIN_REMEDIABLE_ESC_CATEGORIES,
+    )
 
 
 def records_would_duplicate_a_handoff(

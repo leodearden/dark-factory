@@ -48,7 +48,7 @@ are not separate gates.
 
 Map your entry point onto the ladder:
 
-- **`ref rc≠0` / `ancestry rc=128`** → [step 2](#step-2)'s *branch GONE* arm decides on the marker alone. An empty marker there is [step 4](#step-4)'s genuine not-landed outcome.
+- **`ref rc≠0` / `ancestry rc=128`** → [step 2](#step-2)'s *branch GONE* arm decides on the marker alone. An empty marker there goes to [step 4](#step-4)'s rc=128 arm; outside its carve-outs it is the genuine not-landed outcome.
 - **`ref rc=0` (marker-first)** → [step 2](#step-2)'s *branch EXISTS* arm; containment is required before stamping. A marker that is empty or disqualified falls through to [step 3](#step-3)/[step 4](#step-4), where the ancestry check tells you which of rc=0 and rc=1 you are on. (`ref rc=0` alone does **not** mean rc=0: it means rc=0 *or* rc=1.)
 - **`ancestry rc=0` (ancestry-first)** → the same *branch EXISTS* arm, but you already know the answer the ancestry check would give, so do not re-run it: containment first, and on an empty or disqualified marker go straight to [step 4](#step-4)'s **rc=0** sub-ladder.
 - **`ancestry rc=1` (ancestry-first)** → [step 4](#step-4)'s **rc=1** arm directly. Steps 1–2 cannot change that verdict: containment can only come back stale or marker-empty on this arm, since a containment rc=0 would make the branch an ancestor of main and contradict rc=1.
@@ -68,15 +68,15 @@ contract](#doneprovenance-contract) for what a stamp must carry.
 
 ```bash
 S="Merge task/<TASK_ID> into main"
-git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+git log main --fixed-strings --grep="task/<TASK_ID>" --format='%H%x09%s' \
   | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}'
 ```
 
 It prints the newest commit on main whose **subject** is exactly the marker, or nothing. The
-`--grep` half is a whole-message prefilter that git evaluates *during* the revision walk — there is
-no commit-message index, so it reads commit objects as it goes; the `awk` half is the subject
-selection, and **[it is not optional](#step-1-subject-check)** — the two paragraphs below are
-why, and why there is no `--max-count=1` here.
+`--grep` half is only a coarse pre-filter on the bare branch name, which git evaluates *during* the
+revision walk — there is no commit-message index, so it reads commit objects as it goes; the `awk`
+half is the subject selection, and **[it is not optional](#step-1-subject-check)** — the two
+paragraphs below are why, and why there is no `--max-count=1` here.
 
 **The `awk` has no `exit`, and putting one back breaks the pipeline.** A `{print $1; exit}` closes
 the pipe while `git log` is still walking, so git dies of `SIGPIPE` and the pipeline reports **141
@@ -90,33 +90,36 @@ silences genuine git failures such as `main` not resolving; the sticky flag keep
 without ever closing the pipe early.
 
 This mirrors the in-repo authority, `orchestrator/src/orchestrator/git_ops.py::GitOps.find_merge_marker`
-— the same function `merge_status`'s git-authority tier calls on the deleted-branch path.
-`--fixed-strings` against the exact subject from
-`orchestrator/src/orchestrator/git_ops.py::_merge_subject` (canonical form
-`Merge <full-branch> into <main-branch>`) is what makes it **substring-safe**: `Merge task/1
-into main` cannot match inside `Merge task/10 into main`, because the `0` falls where the
-pattern has a space. Do **not** substitute a bare `--grep="task/<TASK_ID>"` — that is BRE, not
-restricted to merge commits, matches any commit merely *mentioning* the task, and re-opens the
-`task/1`/`task/10` collision. If a project overrides `git.branch_prefix` (default `task/`) or
-`git.main_branch`, build the subject from `_merge_subject` rather than hardcoding it.
+— the same function `merge_status`'s git-authority tier calls on the deleted-branch path — and its
+scan, `orchestrator/src/orchestrator/git_ops.py::GitOps._scan_merge_marker`, pre-filters on the
+same bare branch name. The pre-filter is the branch, not the subject, because git applies `--grep`
+to each line of the message separately while `%s` joins a wrapped first paragraph into one subject:
+a full-subject pattern misses a marker whose subject wraps, and a branch name, which has no
+whitespace, survives. `--fixed-strings` keeps the branch name literal, and the search is
+**substring-safe** because of the `awk` equality against the exact subject from
+`shared/src/shared/merge_subject.py::format_merge_subject` (canonical form
+`Merge <full-branch> into <main-branch>`): the `task/1` pre-filter does match inside `task/10`, but
+`Merge task/10 into main` is not equal to `Merge task/1 into main`. Do **not** put the full subject
+back into `--grep`. If a project overrides `git.branch_prefix` (default `task/`) or
+`git.main_branch`, build the branch and the subject from config, the subject from
+`format_merge_subject(branch, main_branch)`, rather than hardcoding them.
 
-**Substring-safety is not subject-scoping, and the search alone does not give you the latter.**
-`git log --grep` matches the **whole commit message**, not the subject, so this command also
-returns any ordinary commit whose *body* happens to quote the marker string — a documentation
+**Substring-safety is not subject-scoping, and the `--grep` half gives you neither.**
+`git log --grep` matches the **whole commit message**, not the subject, so the `--grep` half alone
+also returns any ordinary commit whose message merely *mentions* the branch — a documentation
 commit describing this very mechanism, a revert, a commit message citing another task's merge.
 That is a live hazard in this repo, not a hypothetical: measured 2026-09-22,
-`git log main --fixed-strings --grep="Merge task/4181 into main" --max-count=1 --format=%H`
+`git log main --fixed-strings --grep="Merge task/4181 into main" --max-count=1 --format=%H` <!-- marker-search-guard: counterexample -->
 returns `d0d67f0c53`, a **non-merge** docs commit from task 4612 whose body quotes the subject,
-rather than the true train merge `d25b24468c` — which the command above does return. The
-substring-safety argument covers only the `task/1`-inside-`task/10` collision; it says nothing
-about a body match.
+rather than the true train merge `d25b24468c` — which the command above does return. Only the
+subject equality rules out the `task/1`-inside-`task/10` collision and a body match alike.
 
 <a id="step-1-subject-check"></a>
 **So a hit is not a marker until its SUBJECT matches.** A message match whose subject is something
 else is **not** a marker and may never be treated as one on either of [step 2](#step-2)'s arms —
 [step 2](#step-2)'s *branch GONE* arm otherwise treats the marker as authoritative on its own with
 no further check, so this selection is the only thing standing between a body match and a stamped
-`done_provenance`. Equality is against the `_merge_subject` string you searched for; nothing weaker
+`done_provenance`. Equality is against the `format_merge_subject` string bound to `S`; nothing weaker
 (prefix, substring, case-folded) counts.
 
 **Select the newest subject-matching hit — do not take the newest hit and then test it.** These
@@ -135,9 +138,14 @@ walk. Measured 2026-09-22 over main's ~68k commits, against a marker a few hundr
 ~2.1s (range 1.3–3.0s). On a query with **no** match the two are indistinguishable — both walk
 everything — so benchmarking a missing marker will wrongly suggest the flag is free to restore.
 Roughly two seconds, once, at the moment a task is stamped, is the price of not recording a
-documentation commit as a merge. Note that **nothing enforces this mechanically** — no test greps
-these snippets for the flag, so this paragraph is the only thing standing between a plausible-looking
-optimization and a wrong `done_provenance`.
+documentation commit as a merge. `tests/scripts/test_merge_marker_search_snippets.py` enforces
+this: it runs every marker search in `skills/` — any `git log` or `git rev-list` that greps for
+`$S`, a merge subject or the bare `task/…` branch name, with or without `--fixed-strings` — against
+a history where a newer body match shadows the genuine marker, once with a one-line marker subject
+and once with one wrapped onto two lines, so putting the flag back — or any other
+take-the-newest-hit shortcut, or a full-subject pre-filter — turns it red. A snippet that quotes a
+bare form on purpose, like the measured one above, carries
+`<!-- marker-search-guard: counterexample -->` right after its closing backtick and is not run.
 
 The shadowing is common and it is *growing*, because this repo's own commits about this mechanism
 quote the subject they document. Measured 2026-09-22 over all 68,279 commits on main: 12 branches
@@ -154,7 +162,7 @@ substitute for selecting correctly in the first place.
 
 Do **not** instead add `--merges` to the search. It would diverge from the in-repo authority this
 command explicitly mirrors (`GitOps.find_merge_marker`, on both its index and scan paths, selects
-the newest commit on main whose SUBJECT equals `_merge_subject`, and does not restrict to merge
+the newest commit on main whose SUBJECT equals `format_merge_subject(branch, main_branch)`, and does not restrict to merge
 commits — `orchestrator/src/orchestrator/git_ops.py::_merge_markers_by_branch`), whose whole value
 is that writer and reader share one derivation and so cannot silently drift apart; and it is lossy —
 measured in this repo, `ba1bba2611 Merge task/176 into main` is a genuine subject-shaped marker
@@ -164,10 +172,10 @@ of the selecting form: paired with `--max-count=1` subject equality *was* lossy,
 cases above.)
 
 The shell selection above and the server's lookup now apply the same rule: the newest commit whose
-subject equals the merge subject. The `awk` selection is the agent re-supplying in the shell what
-the server already does — the same relationship [step 2](#step-2)'s containment check has to
-`find_merge_marker`'s branch-existence gate. It is not optional: the bare `--grep` still matches
-bodies.
+subject equals the merge subject; the server's direct scan shares the bare-branch pre-filter too.
+The `awk` selection is the agent re-supplying in the shell what the server already does — the same
+relationship [step 2](#step-2)'s containment check has to `find_merge_marker`'s branch-existence
+gate. It is not optional: the bare `--grep` still matches bodies.
 
 - **Printed a sha** → its subject already matched, by construction. Go to [step 2](#step-2); whether it is authoritative depends on the branch ref.
 - **Printed nothing** (no hits at all, or every hit was a body match) → go to [step 3](#step-3). An empty result is **not** a not-landed verdict.
@@ -234,6 +242,15 @@ Two kinds of genuinely-landed work carry no `Merge task/<TASK_ID> into main` mar
 rule 3). A hand-performed `git merge --no-ff` is a third: it writes the subject `Merge branch
 'task/<TASK_ID>'`, which the orchestrator-shaped marker deliberately does not match (see
 [`orchestrate/SKILL.md`](../orchestrate/SKILL.md)'s hand-merge carve-out).
+
+A **worker-rebased solo landing** is a fourth. When main moves under a solo request's verify (a
+direct-to-main commit, say), `orchestrator/src/orchestrator/git_ops.py::GitOps.advance_main`'s
+rebased path rebases the branch onto main and fast-forwards main to the rebased tip. No merge
+commit is written, every branch commit is rewritten, and the task ref is retained at its
+pre-rebase tip, because `GitOps._branch_has_commits_beyond_main` counts `main..<branch>` by sha.
+It reaches [step 4](#step-4) at rc=1; its arm is [the rebased-solo-landing
+arm](#rebased-solo-landing). `merge_status`'s git tier now resolves this shape on a
+`branch`/`task_id` poll, through its patch-id arm.
 
 Aborting on an empty search alone would abandon merged work un-stamped — and at several call
 sites you are already holding a server-issued `done`/`already_merged` verdict, which you must
@@ -398,7 +415,8 @@ commits reachable from the branch but **not** from main; on this arm ancestry rc
 proved every branch commit *is* reachable from main, so it prints nothing for a genuine
 fast-forward and a phantom branch alike and cannot separate them. (`git cherry` is correct where
 [`merge-queue/SKILL.md`](../merge-queue/SKILL.md) rule 2b uses it — the rc=1 arm, where the
-branch is *not* an ancestor — and that usage stands.)
+branch is *not* an ancestor — and that usage stands. It is correct on the
+[rebased-solo-landing arm](#rebased-solo-landing) for the same rc=1 reason.)
 
 #### rc=1 — branch exists, not an ancestor of main: **not a not-landed verdict on its own**
 
@@ -421,9 +439,105 @@ read which exit each scheduler status yields, its **landed-but-not-credited** re
 content proof cannot discharge the veto from 2v, and the `git cherry main task/<TASK_ID>` content
 proof itself from 2b, not from here. **rc=1 is NOT not-landed on the `coalesce-*` arm.**
 
-Only outside that arm — no train absorption anywhere in this task's history — is rc=1 a genuine
-not-landed outcome. What to do with it there is the call site's own disposition (`unblock` and
-`merge-queue` keep polling / resubmit; `unblock-low-risk` aborts).
+<a id="rebased-solo-landing"></a>
+##### Outside the `coalesce-*` arm: the rebased-solo-landing arm
+
+With no train absorption anywhere in this task's history, rc=1 is still not a verdict: a solo
+request that landed through [step 3](#step-3)'s worker-rebased path sits here permanently, its
+ref holding pre-rebase shas none of which is on main. What decides it is whether you hold a
+**request-scoped `done`**:
+
+- a `done` from `merge_status(request_id=...)`, or
+- an in-window `done`/`already_merged` from `merge_request` that carries a `request_id`; its
+  `commit`, when present, is the sha.
+
+A polled request_id-arm `done` from the event-store tier (`source: "event_store"`) carries the
+request's recorded landing sha as its top-level `merge_sha`
+(`escalation/src/escalation/server.py::merge_status`, its current-run tier). On the rebased path
+it is the rebased tip. **Never** take the sha from a record-sourced `branch`/`task_id`-arm answer
+(its top-level `merge_sha` beside `source: "event_store"`, or `last_outcome`): those resolve to
+the newest record for the branch, which can be a prior round's. A `source: "git"` `found_on_main` answer is not record-sourced; the
+no-request-scoped-`done` bullet below says how to use it.
+
+Holding that sha as `<MERGE_SHA>`, run all four lines:
+
+```bash
+M=$(git rev-parse --verify --quiet "<MERGE_SHA>^{commit}"); echo "merge_sha=${M:-unresolved}"
+git merge-base --is-ancestor "$M" main; echo "landed rc=$?"
+git log --cherry-mark --left-only --no-merges --format='%m %H' main...task/<TASK_ID> | grep -cxF "= $M"
+git cherry main task/<TASK_ID>
+```
+
+- **(a)** `landed rc=0`: M is on main.
+- **(b)** The count prints `1`: M is the rebased image of one of this branch's own commits, since
+  `--cherry-mark` marks a main-side commit `=` only when a branch commit has the same patch id.
+  This is attribution by **patch-equivalence**, not by subject citation: most task-branch tips
+  are uncited `amend:` commits, so a citation test would refuse most real rebased landings. An
+  unrelated commit on main passes (a) and never passes (b). (`grep -c` exits 1 when it prints
+  `0`; read the number.)
+- **(c)** The `git cherry` output is **non-empty and every line starts with `-`**: every branch
+  commit has a patch-equivalent image on main.
+
+The pipe in (b) is safe where [step 1](#step-1)'s early-exiting `awk` was not: `grep -c` reads all
+of its input, so `git log` is never cut off by `SIGPIPE`. Check (c) is the merge worker's own
+predicate, `orchestrator/src/orchestrator/merge_lane/landing_evidence.py::patch_content_contained`,
+with one deliberate difference. That function reads EMPTY output as contained; this arm does not,
+because `git cherry` skips merges, so a branch whose only commit beyond main is a sync merge
+prints nothing. That is the same rule as [`merge-queue/SKILL.md`](../merge-queue/SKILL.md) rule 2b.
+(`orchestrator/tests/test_rebased_solo_landing_ladder.py` pins each premise against real git.)
+`merge_status`'s patch-id arm
+(`orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed`) applies check
+(c)'s empty-output rule: it classifies containment through the same `git cherry` call and refuses
+empty output from a tip that is not an ancestor of main as `not_landed`.
+
+- **All three pass** → landed. Stamp `{"kind": "merged", "commit": "<M>", "note": "rebased solo
+  landing: request <request_id>'s recorded merge_sha; every branch commit patch-equivalent on
+  main (git cherry); branch tip <git rev-parse task/<TASK_ID>>"}`. The kind is `merged` because
+  this request supplied the landing; the note keeps it auditable.
+- **You hold the request-scoped `done` and any check fails** (M unresolved, `landed rc≠0`, a
+  count of `0`, a `+` line, or empty output) → **landing-unattributable**. A `+` line can be
+  context drift on a genuine landing, because patch-id hashes the hunk's context lines and a main
+  commit edited near the branch's change gives the rebased image a different patch id. It can
+  also be a commit added to the branch after the landing. Only a reader can tell which, and the
+  server-issued `done` must not be overridden ([step 3](#step-3)).
+- **You hold no request-scoped `done`** → first poll `merge_status(branch="task/<TASK_ID>")`. Its
+  patch-id arm (`escalation/src/escalation/git_authority.py::probe_landing`, deciding through
+  `orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_work_landed`) decides
+  containment with its containment classifier, behind the degeneracy and empty-net-diff guards,
+  and attributes a sha WITHOUT a request: the most recent commit on main citing the task by the
+  project's `git.commit_citation_pattern`, else the branch tip's patch-id twin on main.
+  - `state: "done"`, `kind: "found_on_main"`, `source: "git"` → landed. Stamp
+    `{"kind": "found_on_main", "commit": "<merge_sha>", "note": "rebased solo landing confirmed by
+    merge_status's git tier (patch-id arm); branch tip <git rev-parse task/<TASK_ID>>"}`. This
+    `merge_sha` may legitimately differ from a request-scoped M (the citing commit rather than the
+    rebased tip). Both are commits on main carrying this task's rebased work, so neither is
+    "corrected" into the other.
+  - `reason: "landing_unattributable"` → this ladder's **landing-unattributable**.
+  - Any other answer leaves the decision to `git cherry main task/<TASK_ID>` alone. A non-done
+    answer is never a not-landed verdict by itself: a `+` from context drift makes the arm
+    under-report.
+    - Non-empty with every line `-`: the content is on main with no sha you can attribute:
+      **landing-unattributable**.
+    - Any `-` line mixed with `+` lines, or `+` lines that may be context drift (see above): **not
+      confirmed landed**. Report it and do **not** `merge_cancel` or resubmit; a reader decides.
+    - The genuine not-landed outcome is reserved for the branch tip not being an ancestor of main
+      (rc=1 here) **and** no main commit patch-equivalent to any branch commit (`git cherry`
+      prints no `-` line: all `+`, or empty output). What to do with it is the call site's own
+      disposition (`unblock` and `merge-queue` keep polling / resubmit; `unblock-low-risk`
+      aborts). It never licenses `merge_cancel`: a single-commit branch that landed rebased with
+      context drift prints exactly one `+` line, which is this same output, so `git cherry` alone
+      cannot exclude a landing.
+- **No sha on the request-scoped `done`** (no `merge_sha` on a polled one, no `commit` on an
+  in-window one; e.g. the rebase+fast-forward no-marker shape) is expected to be rare. It routes to **landing-unattributable**: a human derives and stamps it
+  (`git cherry` all `-` plus a diff check).
+
+<a id="landing-unattributable"></a>
+**Landing-unattributable** is defined once, here. It reuses the server's own term,
+`shared/src/shared/merge_state.py::MergeReason.landing_unattributable`, whose `merge_status` hint
+reads "Do not resubmit; verify the landing on main". It is **never a not-landed verdict**. Like
+the rc=0 arm's un-evaluable citation gate, it forbids every not-landed action: call sites must
+not abort-as-failure, `merge_cancel` or resubmit on it. Stamp nothing; stop and report it as
+landing-unattributable, naming the failing check and quoting the `git cherry` output.
 
 #### rc=128 with an empty marker search — **not a not-landed verdict on its own**
 
@@ -452,6 +566,11 @@ not-landed outcome. There the branch ref is gone and nothing on main cites the t
 remains that could prove otherwise: treat as NOT landed and stop rather than stamping
 provenance. What to do with it there is the call site's own disposition (`unblock` and
 `merge-queue` keep polling / resubmit; `unblock-low-risk` aborts and cancels).
+**Except while you hold a [request-scoped `done`](#rebased-solo-landing):** then it is
+[landing-unattributable](#landing-unattributable), not not-landed. A rebased solo landing whose
+ref was deleted afterwards reaches exactly this state, and with the ref gone checks (b) and (c)
+cannot run, so nothing can overrule the server's `done`. Same rules: stamp nothing, take no
+not-landed action, report.
 
 The rc=128 marker search must be the **exact-subject** one from [step 1](#step-1) — **never an
 unfiltered `git log main --merges | head -5`.** An unfiltered listing takes no task argument, so

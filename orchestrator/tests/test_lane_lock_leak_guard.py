@@ -59,7 +59,7 @@ import pytest
 # test_verify_scope_kappa.py / test_coalesce_integration_gate.py).  `git_repo`
 # and `real_git_ops` are pytest FIXTURES: importing them binds them as module
 # attributes here, which is what makes them requestable by the tests below.
-from test_merge_verify_lease_guard import (  # noqa: F401 -- fixtures used by name
+from test_merge_verify_lease_guard import (  # fixtures used by name
     _get_merge_commit,
     _git_config,
     _git_ops,
@@ -838,13 +838,13 @@ class TestRequireLaneLockHolders:
 # Pinned here in isolation against an INJECTED reader — the same convention as
 # the two classes above — so every case is deterministic, and touches no real
 # lock and no real /proc/locks.  No case asserts on ELAPSED wall clock (this
-# repo's 1335/1836/2819/3451/3491 load-sensitive flake class); the one case
-# that must observe the helper polling at all bounds the loop through the
-# explicit `timeout=`/`interval=0` parameters instead of shrinking the module
-# global, which leaves its read count robust by orders of magnitude rather than
-# by two sleeps (task 3783 review amendment — see that case's docstring).  The
-# end-to-end behaviour at both real call sites is pinned separately, further
-# below, by `TestContendedRaiseSurvivesALossyHolderRead`.
+# repo's 1335/1836/2819/3451/3491 load-sensitive flake class); the cases that
+# must observe the helper polling bound the loop through the explicit
+# `timeout=`/`interval=0` parameters instead of the module globals, which
+# leaves their read counts robust by orders of magnitude rather than by two
+# sleeps (task 3783 review amendment, task 6117 — see those cases'
+# docstrings).  The end-to-end behaviour at both real call sites is pinned
+# separately, further below, by `TestContendedRaiseSurvivesALossyHolderRead`.
 # ---------------------------------------------------------------------------
 
 
@@ -858,7 +858,7 @@ class TestSettledLaneLockHolderRead:
         """THE headline case: a lossy empty snapshot must not be the answer.
 
         Mechanism absorbed, measured on this host and recorded in full at
-        ``test_live_in_process_span_is_not_a_leak`` below (:1723-1731):
+        ``test_live_in_process_span_is_not_a_leak`` below:
         ``/proc/locks`` is a seq_file the kernel serves one PAGE per read(2)
         regardless of the caller's buffer (a 13062-byte table took 4 reads
         even for a 1 MiB request), and each read restarts the per-CPU
@@ -875,8 +875,13 @@ class TestSettledLaneLockHolderRead:
         have released in between, which is exactly what today's degraded
         message says — so it is RE-READ, not disbelieved (see
         ``test_a_permanently_empty_read_degrades_and_never_raises``).
+
+        The poll is bounded through the explicit ``timeout=``/``interval=0``
+        parameters rather than the 0.5s/0.02s globals, so the read count does
+        not depend on the wall clock (see
+        ``test_a_permanently_empty_read_degrades_and_never_raises``).
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         lock_path = tmp_path / 'lane.lock'
         lock_path.touch()  # stat-able: NOT the structural-empty short-circuit
@@ -890,13 +895,20 @@ class TestSettledLaneLockHolderRead:
 
         monkeypatch.setattr(git_ops_mod, 'lane_lock_holder_pids', _lossy_reader)
 
-        result = await git_ops_mod._settled_lane_lock_holder_pids(lock_path)
+        result = await git_ops_mod._settled_lane_lock_holder_pids(
+            lock_path, timeout=10.0, interval=0,
+        )
 
         assert result == [4242], (
             f'a lossy empty read must be polled past, not returned as the '
             f'holder set — returning it drops the holder pid+pgid from the '
             f'operator message and fails layer (1) of the leak predicate; '
             f'got {result!r} after {len(calls)} read(s)'
+        )
+        assert len(calls) == 3, (
+            f'the helper must return on the FIRST non-empty poll rather than '
+            f'keep reading the kernel lock table to the deadline; the reader '
+            f'was called {len(calls)} time(s)'
         )
 
     async def test_a_non_empty_first_read_is_returned_without_a_second_read(
@@ -911,7 +923,7 @@ class TestSettledLaneLockHolderRead:
         takes, and it is also what keeps the single-snapshot invariant
         ``_lane_lock_holder_facts`` documents cheap to honour.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         lock_path = tmp_path / 'lane.lock'
         lock_path.touch()
@@ -958,10 +970,13 @@ class TestSettledLaneLockHolderRead:
         Call-time resolution of the module globals is pinned separately and
         deterministically by
         ``test_the_settle_bound_is_read_from_the_module_globals_at_call_time``;
-        the shipped default pair is exercised by
-        ``test_polls_past_a_lossy_empty_read`` above.
+        the shipped default pair is exercised end to end at both production
+        call sites by ``TestContendedRaiseSurvivesALossyHolderRead``, through
+        ``test_a_lossy_first_read_still_names_the_foreign_holder`` (reset site)
+        and ``test_the_lease_contended_raise_also_names_the_foreign_holder``
+        (lease site).
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         lock_path = tmp_path / 'lane.lock'
         lock_path.touch()
@@ -1007,7 +1022,7 @@ class TestSettledLaneLockHolderRead:
         once and the read count is exactly one.  Were the 0.5s default frozen
         instead, the same reader would be called ~25 times.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         lock_path = tmp_path / 'lane.lock'
         lock_path.touch()  # stat-able: NOT the structural-empty short-circuit
@@ -1050,7 +1065,7 @@ class TestSettledLaneLockHolderRead:
         return value, opposite cause, and the ``_lane_lock_identity``
         short-circuit is what tells them apart.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         lock_path = tmp_path / 'never-created.lock'
         assert not lock_path.exists(), 'staging error: the path must be unstat-able'
@@ -1111,7 +1126,7 @@ class TestSettledLaneLockHolderRead:
         re-read either succeeds in microseconds or is structurally broken —
         the same reasoning that sized ``_LANE_LOCK_STRICT_READ_SECS``.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         global_timeout = _require_effective_per_test_timeout(
             pytestconfig, premise='the settle bound',
@@ -1652,7 +1667,7 @@ class TestEffectivePerTestTimeout:
         its ini registration, this is the one test that would actually
         notice; the stub cases above cannot, by construction.
         """
-        from pytest_timeout import get_env_settings  # noqa: PLC0415
+        from pytest_timeout import get_env_settings
 
         assert _effective_per_test_timeout(pytestconfig) == get_env_settings(pytestconfig).timeout
 
@@ -1919,8 +1934,8 @@ class TestSelfOwnedLaneLockLeak:
         The tree must still be left untouched — detection changes the
         DIAGNOSIS, never the fail-closed refusal to mutate unprotected.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
-        from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
+        from orchestrator.git_ops import LaneLockSelfOwnedLeak
 
         monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
 
@@ -1988,8 +2003,8 @@ class TestSelfOwnedLaneLockLeak:
         exactly those two properties — a subclass that broke either would break
         that test from a distance.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
-        from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
+        from orchestrator.git_ops import LaneLockSelfOwnedLeak
 
         assert issubclass(LaneLockSelfOwnedLeak, MergeVerifyLeaseContended), (
             'a standalone type would miss both isinstance-based merge-worker '
@@ -2039,8 +2054,8 @@ class TestSelfOwnedLaneLockLeak:
         must stay unwritten: the lease never took the lock, so claiming holder
         status would corrupt the very liveness signal layer (3) reads.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
-        from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
+        from orchestrator.git_ops import LaneLockSelfOwnedLeak
 
         monkeypatch.setattr(git_ops_mod, '_MERGE_VERIFY_LEASE_WAIT_SECS', 1)
 
@@ -2073,8 +2088,8 @@ class TestSelfOwnedLaneLockLeak:
         an isinstance check here would pass even if every foreign contention
         were misreported as a leak.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
-        from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
+        from orchestrator.git_ops import LaneLockSelfOwnedLeak
 
         monkeypatch.setattr(
             git_ops_mod,
@@ -2294,7 +2309,7 @@ class TestContendedRaiseSurvivesALossyHolderRead:
         "the kernel reports no FLOCK holder of that lock", discarding the
         holder pid+pgid — the one forensic datum the incident needed.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         monkeypatch.setattr(
             git_ops_mod,
@@ -2367,7 +2382,7 @@ class TestContendedRaiseSurvivesALossyHolderRead:
         — a count would itself be racy if a delegated real read were ever
         lossy.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         monkeypatch.setattr(
             git_ops_mod,
@@ -2432,8 +2447,8 @@ class TestContendedRaiseSurvivesALossyHolderRead:
         kernel state, identical staging, and the only difference is whether
         the read was settled.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
-        from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
+        from orchestrator.git_ops import LaneLockSelfOwnedLeak
 
         monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
 
@@ -2470,7 +2485,7 @@ class TestContendedRaiseSurvivesALossyHolderRead:
         an empty snapshot were misrouted into a loud leak escalation — the
         precise false alarm this asymmetry exists to prevent.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         git_ops = _git_ops(tmp_path)
         # Simulate acquire_merge_verify_flock's bounded-wait TIMEOUT (-> None),
@@ -2533,7 +2548,7 @@ class TestContendedRaiseSurvivesALossyHolderRead:
         Fully deterministic — the acquire is stubbed, so no real lock, no
         `/proc/locks` read and no wall clock is involved.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         real_register = git_ops_mod._register_held_lane_lock
         observed: dict[str, int | None] = {'acquire': None, 'register': None}
@@ -2597,7 +2612,7 @@ class TestContendedRaiseSurvivesALossyHolderRead:
         `MergeVerifyLeaseContended`, so an isinstance check would pass on
         exactly the false alarm this excludes.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         git_ops = _git_ops(tmp_path)
         lock_path = lane_lock_path(git_ops.persistent_merge_worktree_path)
@@ -2666,7 +2681,7 @@ class TestContendedRaiseSurvivesALossyHolderRead:
         RED before task 3783: the one-shot read at the lease site degrades the
         clause to "no FLOCK holder" exactly as the reset site did.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         monkeypatch.setattr(
             git_ops_mod,
@@ -2716,7 +2731,7 @@ class TestContendedRaiseSurvivesALossyHolderRead:
         raise, so this pins that it can neither leave a rendezvous behind nor
         let the body run.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         git_ops = _git_ops(tmp_path)
         monkeypatch.setattr(
@@ -2794,7 +2809,7 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
         while the acquire is provably mid-flight, with no dependence on kernel
         lock timing, and the late win happens exactly when the test says so.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         obs: dict[str, object] = {
             'running': threading.Event(),
@@ -2921,7 +2936,7 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
         asserted in the same breath because B13's layer (2) reads it: an
         unregistered legitimate hold is libelled a leak.
         """
-        from orchestrator.git_ops import (  # noqa: PLC0415
+        from orchestrator.git_ops import (
             _lane_lock_held_in_process,
         )
 
@@ -2996,7 +3011,7 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
         acquisition, handed over by releasing a genuinely foreign holder after
         the cancellation.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         # Bounded well above the ~0.1s poll that actually elapses, so the
         # acquire cannot reach its deadline and return None — which would make
@@ -3087,7 +3102,7 @@ class TestCancelledResetNeverOrphansTheLaneLock:
         value) and ``thread_id``.  Pass-through, not a stub — the lock handover
         below has to be a genuine kernel acquisition or it proves nothing.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         polling = threading.Event()
         outcome: dict[str, object] = {}
@@ -3120,7 +3135,7 @@ class TestCancelledResetNeverOrphansTheLaneLock:
         The tree assertion is the other half: a cancelled reset must not have
         mutated the worktree on its way out.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         # Long enough that the acquire is provably STILL POLLING when the
         # cancellation lands — the whole point is a win that arrives after its
@@ -3184,7 +3199,7 @@ class TestCancelledResetNeverOrphansTheLaneLock:
         found the reset in.  Pinning the seam makes that regression loud instead
         of invisible.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         calls: list[tuple[Path, float]] = []
         real_seam = GitOps._acquire_lane_flock_off_thread
@@ -3343,7 +3358,7 @@ class TestChunkSkippedReadStillClassifiesASelfOwnedLeak:
         snapshot read tolerantly upstream, so this pins the equivalence of the
         two routes rather than a live outage.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
 
@@ -3381,7 +3396,7 @@ class TestChunkSkippedReadStillClassifiesASelfOwnedLeak:
         task: a wrong classification and a degraded message, from a read that
         never raised and so gave the OSError-keyed retries nothing to catch.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator import git_ops as git_ops_mod
 
         lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
 

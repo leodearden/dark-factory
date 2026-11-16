@@ -76,10 +76,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fused_memory.utils.store_mutation_preflight import (
-    StoreMutationUnavailable,
-    assert_store_mutation_allowed,
-)
+from fused_memory.utils.store_mutation_preflight import assert_store_mutation_allowed
 
 logger = logging.getLogger('cleanup_pin_queue_edges')
 
@@ -368,7 +365,7 @@ async def apply_cleanup(
 
 def connect_graph(args: argparse.Namespace) -> Any:
     """Open the falkordb graph handle for ``args.project_id``."""
-    from falkordb import FalkorDB  # noqa: PLC0415
+    from falkordb import FalkorDB
 
     return FalkorDB(host=args.falkor_host, port=args.falkor_port).select_graph(args.project_id)
 
@@ -383,15 +380,16 @@ async def run(
         # BEFORE its rollback-audit memory is written, so a process that cannot
         # write mem0's history would strand invalidated edges with no record of
         # what they said.
-        try:
-            assert_store_mutation_allowed(operation='cleanup_pin_queue_edges --apply')
-        except StoreMutationUnavailable:
-            logger.error(
-                'cleanup_pin_queue_edges: --apply NOT started (fail-closed) — this '
-                'process cannot write mem0 history. Route through the fused-memory '
-                'MCP server, or re-run without --apply for the report only.'
-            )
-            raise
+        assert_store_mutation_allowed(
+            operation='cleanup_pin_queue_edges --apply',
+            logger=logger,
+            extra_detail=(
+                'each update_edge would supersede its edge and then fail to write '
+                'its rollback-audit memory, stranding invalidated edges with no '
+                'record of what they said. Nothing was read and nothing was '
+                'mutated.'
+            ),
+        )
 
     if graph is None:
         graph = connect_graph(args)
@@ -434,8 +432,8 @@ def main() -> int:
     async def _run_live() -> int:
         memory = None
         if args.apply:
-            from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-            from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+            from fused_memory.config.schema import FusedMemoryConfig
+            from fused_memory.services.memory_service import MemoryService
 
             memory = MemoryService(FusedMemoryConfig())
             await memory.initialize()

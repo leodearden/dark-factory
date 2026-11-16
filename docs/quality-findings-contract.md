@@ -181,10 +181,8 @@ Before filing, in this order, and the report records the step that
 decided each finding:
 
 1. **Key lookup.** `find_tasks_by_metadata(project_root, key="x_finding_key",
-   value=<key>)` (fused-memory MCP; until it lands, a read-only forensic
-   query per `CLAUDE.md` §"Forensic reads of tasks.db" that tests
-   membership with `json_each(metadata, '$.x_finding_key')`, since the key
-   may be a scalar or a list).
+   value=<key>)` (fused-memory MCP), which matches a list-valued
+   `x_finding_key` by membership.
    a. A task in `pending`, `in-progress`, `blocked`, `deferred` or
       `merge-deferred` → disposition `filed:<id>`; do not file.
    b. A `cancelled` task carrying `x_acceptance_reason` → `accepted:<id>`;
@@ -284,8 +282,10 @@ nor `always_escalates` is rejected at submit, so the chain collapses to
 the human gate alone, carrying `milestone: {mode: delayed, after_secs:
 259200}` (three days of settling) and depending on the run's `critical` and
 `high` tasks (all filed tasks if there are none); it is filed `deferred`
-under `planning_mode`, gains dependencies as `/prd` sessions file them, and
-is committed once the program's FILED table is complete. A run that files
+under `planning_mode`, re-stamped `until_condition` (with the echo check of
+`docs/task-authoring.md` §9 "Deferring a task") if it is held past its filing
+session, gains dependencies as `/prd` sessions file them, and is released to
+`pending` once the program's FILED table is complete. A run that files
 no tasks files no chain and says so in its report. The exact calls for
 both forms, the supersede order and the probe live in
 `skills/_shared/filing-the-trigger-chain.md`; skills cite it.

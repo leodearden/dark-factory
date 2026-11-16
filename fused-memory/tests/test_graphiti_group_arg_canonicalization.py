@@ -284,6 +284,12 @@ class TestGroupIdsFilterAgreement:
 #
 # `enumerate_valid_edges_mentioning` (task 4851) joined for the same reason as
 # enumerate_all_valid_edges, whose narrowed sibling it is.
+#
+# `get_edges_by_uuids` (task 6137) joined because it resolves a graph key via
+# _graph_for, as its single-edge sibling get_edge_text does.
+#
+# `get_node_names_by_uuids` (task 10080) joined for the same reason as its
+# single-node sibling get_node_text.
 _ALL_GROUP_ARG_SWEEP_CASES = [
     ('get_episode_by_uuid', ('ep1',), {'group_id': _PATH_SHAPED}),
     ('remove_episode', ('ep1',), {'group_id': _PATH_SHAPED}),
@@ -305,6 +311,7 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('delete_entity', ('n1',), {'group_id': _PATH_SHAPED}),
     ('delete_entity_node', ('n1',), {'group_id': _PATH_SHAPED}),
     ('get_node_text', ('n1',), {'group_id': _PATH_SHAPED}),
+    ('get_node_names_by_uuids', (['n1'],), {'group_id': _PATH_SHAPED}),
     ('resolve_entity_by_name', ('Foo',), {'group_id': _PATH_SHAPED}),
     ('find_entity_nodes_by_name_substring', ('605',), {'group_id': _PATH_SHAPED}),
     ('refresh_entity_summary', ('n1',), {'group_id': _PATH_SHAPED}),
@@ -321,6 +328,7 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('update_node_name', ('n1', 'Name'), {'group_id': _PATH_SHAPED}),
     ('get_edge_text', ('e1',), {'group_id': _PATH_SHAPED}),
     ('get_edge_invalid_at', ('e1',), {'group_id': _PATH_SHAPED}),
+    ('get_edges_by_uuids', (['e1'],), {'group_id': _PATH_SHAPED}),
     ('update_node_embedding', ('n1', [0.1]), {'group_id': _PATH_SHAPED}),
     ('update_edge_embedding', ('e1', [0.1]), {'group_id': _PATH_SHAPED}),
     ('list_indices', (), {'group_id': _PATH_SHAPED}),
@@ -335,8 +343,8 @@ _ALL_GROUP_ARG_SWEEP_CASES = [
     ('retrieve_episodes', (), {'group_ids': [_PATH_SHAPED]}),
 ]
 
-assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 44, (
-    'Sweep must cover exactly the 44 public group-arg GraphitiBackend methods '
+assert len(_ALL_GROUP_ARG_SWEEP_CASES) == 46, (
+    'Sweep must cover exactly the 46 public group-arg GraphitiBackend methods '
     'this table claims: every one not covered by the step-1/3/5 positive-path '
     'tests, plus find_entity_nodes_by_name_substring, which is in both (see the '
     'comment above) — update this table if the decorated surface ever changes.'

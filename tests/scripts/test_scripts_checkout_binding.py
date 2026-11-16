@@ -17,6 +17,9 @@ from pathlib import Path
 from types import MappingProxyType
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -183,6 +186,7 @@ def test_an_unbindable_checkout_refuses_to_import(tmp_path: Path, pyproject: str
 
 _BOUND_SCRIPTS = (
     'merge_lane_metrics',
+    'merge_lane_ratchet',
     'quality_metrics_snapshot',
     'inline_suppression_classify',
     'inline_suppressions',
@@ -216,7 +220,14 @@ _SAFE_IO_REPORTS_ITS_FILE = "import sys\nprint('safe_io:' + __file__, file=sys.s
 
 def test_merge_lane_metrics_run_from_a_copy_uses_the_copys_shared(tmp_path: Path) -> None:
     checkout = _layout(
-        tmp_path, scripts=('_checkout.py', 'merge_lane_metrics.py', 'source_measures.py')
+        tmp_path,
+        scripts=(
+            '_checkout.py',
+            'merge_lane_metrics.py',
+            'merge_lane_ratchet.py',
+            'merge_lane_cluster.py',
+            'source_measures.py',
+        ),
     )
     for shared_package in (checkout / 'shared' / 'src' / 'shared', tmp_path / _DECOY / 'shared'):
         (shared_package / 'safe_io.py').write_text(_SAFE_IO_REPORTS_ITS_FILE, encoding='utf-8')
@@ -235,19 +246,28 @@ def test_merge_lane_metrics_run_from_a_copy_uses_the_copys_shared(tmp_path: Path
     assert _lies_under(loaded[0], checkout / 'shared' / 'src'), loaded[0]
 
 
-def test_the_ratchet_commit_gate_reports_an_unbindable_checkout_as_an_instrument_failure(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ('gate', 'revisions'),
+    [
+        pytest.param('check_staged_ratchet_raise.py', (), id='commit-gate'),
+        pytest.param('check_ratchet_advance.py', ('HEAD', 'HEAD'), id='advance-gate'),
+    ],
+)
+def test_each_ratchet_gate_reports_an_unbindable_checkout_as_an_instrument_failure(
+    tmp_path: Path, gate: str, revisions: tuple[str, ...]
 ) -> None:
     gate_scripts = (
         '_checkout.py',
-        'merge_lane_metrics.py',
+        'merge_lane_ratchet.py',
+        'merge_lane_cluster.py',
         'source_measures.py',
-        'check_staged_ratchet_raise.py',
+        'ratchet_revisions.py',
+        gate,
     )
     checkout = _layout(tmp_path, pyproject=None, scripts=gate_scripts)
 
     proc = _python(
-        [str(checkout / 'scripts' / 'check_staged_ratchet_raise.py'), '--root', str(checkout)],
+        [str(checkout / 'scripts' / gate), '--root', str(checkout), *revisions],
         decoy=tmp_path / _DECOY,
     )
 

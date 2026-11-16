@@ -1403,23 +1403,14 @@ class TestRepairLiveRunRefusalAndDryRun:
 # imported from the implementation's own allowlist, so this states an
 # INDEPENDENT expectation instead of restating the code under test, and
 # ``test_verdict_map_covers_every_run_status`` pins it to the enum EXACTLY: add a
-# seventh status later and this module fails until someone labels it, rather
+# new status later and this module fails until someone labels it, rather
 # than the new member silently defaulting to repairable — which is precisely how
 # ``interrupted`` slipped through the original single-value guard.
 _STATUS_VERDICTS: dict[RunStatus, str] = {
     # In flight by its own row.
     RunStatus.running: 'refused',
-    # RESUMABLE, not finished — the specifically dangerous one.
-    # ``journal.get_interrupted_runs()`` is literally
-    # ``SELECT * FROM runs WHERE status = 'interrupted'``, so this is the ONE
-    # status the startup adopt-and-resume pass re-claims. The resumed cycle sets
-    # ``status = running`` IN MEMORY ONLY (harness's own comment: "The row is
-    # 'interrupted' on disk") and then rewrites the whole ``stage_reports`` blob
-    # from its loaded copy at each stage boundary — so a repair applied after
-    # that load reports success and is then silently overwritten.
-    RunStatus.interrupted: 'refused',
-    # Genuinely terminal: the ``get_interrupted_runs`` query above never selects
-    # these, and nothing else re-adopts a run, so no writer can clobber a repair.
+    # Genuinely terminal: no writer re-adopts a run once it leaves 'running', so
+    # nothing can clobber a repair.
     RunStatus.completed: 'repairable',
     RunStatus.failed: 'repairable',
     RunStatus.rolled_back: 'repairable',
@@ -1903,9 +1894,9 @@ class TestFingerprintExtractionConvergence:
 
     @pytest.mark.asyncio
     async def test_both_extractions_agree_on_category_and_agent_id(self, mock_config):
-        from unittest.mock import MagicMock  # noqa: PLC0415
+        from unittest.mock import MagicMock
 
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService
 
         service = MemoryService(mock_config)
         service.mem0 = MagicMock()

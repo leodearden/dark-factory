@@ -1,0 +1,30 @@
+{
+  "task_id": "8526",
+  "reason": "Net-additive merge-lane policy delta (task 8526): a verify host is released at its verdict, not at landing. worker.py cognitive +10 is the new behaviour, each new function at cognitive <= 4: _release_lease_at_verdict 4 (the verdict/lease/head/persistent-lane guard clause), _entry_row 3 (a heartbeat row for a held lease or for an entry released at its verdict), _leased_by_host 2 (lease occupancy excludes released rows, mirroring _verifying_by_host), _lands_behind_another 1. _occupancy_block was brought back to its baseline 2. test_merge_serial_lane_tripwire.py private_reads +3 are the three worker._inflight_append calls of the new K = hosts + 1 tripwire test, the same seam every test in that class drives; its allocator is injected through test_merge_queue_concurrent_verify::_inject_two_host_allocator rather than a direct _host_allocator write. The new test_merge_lane_lease_at_verdict.py row has 0 private reads.",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1961,
+      "current": 1971
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_serial_lane_tripwire.py",
+      "baseline": 16,
+      "current": 19
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5195,
+      "current": 5205
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6492,
+      "current": 6495
+    }
+  ]
+}

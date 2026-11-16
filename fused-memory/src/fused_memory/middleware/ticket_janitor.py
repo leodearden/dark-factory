@@ -1,19 +1,32 @@
-"""Periodic background sweep that surfaces failed tickets to the orchestrator.
+"""Periodic background sweep over the tickets no request is waiting on.
 
 Replaces the per-call ``resolve_ticket`` wait that the steward / deep_reviewer
 used to chain after every ``submit_task``. With those waits removed (drop
-plan), candidates that the curator rejects (or that expire while pending)
-would otherwise terminalise silently in :class:`TicketStore`. The janitor
-runs on a fixed interval, batches such failures by
-``(project_id, task_id, escalation_id)``, and submits one info-severity
-``ticket_failure`` escalation per batch so the next steward loop can re-stamp
-metadata and retriage if it chooses. It also emits a second kind of
-escalation, a blocking ``infra_issue`` for the curator dedup-outage signature
-(see ``plans/curator-dedup-outage-2026-08-15-rca.md``).
+plan), tickets would otherwise sit or terminalise silently in
+:class:`TicketStore`. Each :meth:`TicketJanitor.tick` runs, in order:
+
+0. **Drain.** Every due ``awaiting_curation`` ticket, oldest first, is handed
+   back to curation through the injected ``requeue_ticket``. It runs first
+   because a requeue registers worker intent, which the reaper must see. It is
+   the only retrier of parked tickets.
+1. **Reap.** The ``pending`` tickets of a project whose curator worker is gone
+   are recovered by the store's one rule (re-parked if already deferred, else
+   ``failed/worker_dead``) and their waiters woken.
+2. **Dedup outage.** A blocking ``infra_issue`` for the curator dedup-outage
+   signature (see ``plans/curator-dedup-outage-2026-08-15-rca.md``).
+3. **Failed tickets.** Failures are batched by
+   ``(project_id, task_id, escalation_id)`` into one info-severity
+   ``ticket_failure`` escalation per batch, so the next steward loop can
+   re-stamp metadata and retriage if it chooses.
+4. **Curation backlog.** One folded ``infra_issue`` per
+   ``(project_id, defer_reason)`` once a parked ticket there has survived a
+   retry, under :func:`curation_backlog_anchor`, with the reason's
+   :func:`~fused_memory.middleware.curation_deferral.backlog_severity` and
+   :func:`~fused_memory.middleware.curation_deferral.backlog_remediation`.
 
 Routing parallels :mod:`curator_escalator`:
 
-* Per-project :class:`EscalationQueue` instances built lazily.
+* Each filing opens the project's :class:`EscalationQueue` inside its off-loop hop.
 * Orchestrator liveness via
   ``fused_memory/services/orchestrator_detector.py::is_orchestrator_lock_held``.
   No live orchestrator → log + retry on the next tick (failures stay flagged
@@ -21,6 +34,12 @@ Routing parallels :mod:`curator_escalator`:
 * Per-group rolling cooldown to prevent escalation storms when the curator
   flaps. When the cooldown suppresses a fresh group, the rows still get
   ``escalated_at`` stamped — accepted loss-of-signal in exchange for no spam.
+
+The curation backlog is the exception: it files through
+:func:`~fused_memory.middleware._folded_escalation.file_folded_escalation`,
+whose fold into the pending record under its anchor survives restarts, and it
+does not wait for a live orchestrator. After the record is resolved, the
+cooldown spaces a refile.
 
 Notes:
     * ``failed/server_restart`` rows from
@@ -39,12 +58,18 @@ import json
 import logging
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from shared.project_layout import escalation_queue_dir
 
+from fused_memory.middleware._folded_escalation import file_folded_escalation
+from fused_memory.middleware.curation_deferral import (
+    DeferReason,
+    backlog_remediation,
+    backlog_severity,
+)
 from fused_memory.models.scope import build_known_projects_map
 from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
 
@@ -53,7 +78,7 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
 
     from fused_memory.config.schema import DedupOutageDetectorConfig
-    from fused_memory.middleware.ticket_store import DedupHealth, TicketStore
+    from fused_memory.middleware.ticket_store import CurationBacklog, DedupHealth, TicketStore
 
 # Match curator_escalator's defensive import so the janitor degrades to a
 # log-only no-op in minimal envs without the escalation package.
@@ -86,6 +111,26 @@ _PROBE_DEFECT = '_probe_defect_'
 # Cooldown-key sentinel for dedup-outage escalations, in the same style.
 _DEDUP_OUTAGE = '_dedup_outage_'
 
+# The curator-bucket SUBJECT pseudo-task id, shared deliberately with curator_escalator;
+# pinned equal by tests/test_folded_escalation.py::_DELIBERATE_ALIASES.
+_ANCHOR_TASK_ID: str = 'task-curator'
+
+_CURATION_BACKLOG = '_curation_backlog_'
+CURATION_BACKLOG_ANCHOR: Final = 'curation-backlog'
+_CURATION_BACKLOG_DETAIL_TICKETS: Final = 20
+
+
+def curation_backlog_anchor(reason: DeferReason) -> str:
+    return f'{CURATION_BACKLOG_ANCHOR}-{reason}'
+
+
+def _curation_backlog_action(reason: DeferReason) -> str:
+    return (
+        'These submissions are parked and retried automatically on backoff until the '
+        'curator reaches a verdict; nothing is lost and nothing should be re-submitted. '
+        f'{backlog_remediation(reason)}'
+    )
+
 
 def is_dedup_outage(health: DedupHealth, cfg: DedupOutageDetectorConfig) -> bool:
     """True when a window holds enough curated tickets, none combined, resolved implausibly fast."""
@@ -96,6 +141,22 @@ def is_dedup_outage(health: DedupHealth, cfg: DedupOutageDetectorConfig) -> bool
         and health.median_resolve_seconds <= cfg.max_median_resolve_seconds
     )
 
+
+def _file_janitor_escalation(
+    project_root: str, *, task_id: str, severity: str, category: str, summary: str, detail: str,
+) -> str:
+    """Open the project's queue, mint and durably submit one janitor record; blocking queue I/O, so callers run it off the loop."""
+    queue = EscalationQueue(escalation_queue_dir(project_root))
+    return queue.submit(Escalation(
+        id=queue.make_id('ticket-janitor'),
+        task_id=task_id,
+        agent_role='fused-memory/ticket-janitor',
+        severity=severity,
+        category=category,
+        summary=summary,
+        detail=detail,
+        level=1,
+    ))
 
 
 class TicketJanitor:
@@ -139,8 +200,12 @@ class TicketJanitor:
         known_projects: dict[str, str] | None = None,
         probe_defect_threshold: int = 3,
         dedup_outage: DedupOutageDetectorConfig | None = None,
+        requeue_ticket: Callable[[str, str], Awaitable[bool]] | None = None,
+        curation_backlog_min_attempts: int = 2,
     ) -> None:
         self._store = store
+        self._requeue_ticket = requeue_ticket
+        self._curation_backlog_min_attempts = curation_backlog_min_attempts
         # None (the default) leaves the dedup-outage detector off.
         self._dedup_outage_cfg = dedup_outage
         self._cooldown_secs = cooldown_secs
@@ -176,7 +241,6 @@ class TicketJanitor:
         # rolling-window cooldown. group_key is (project_id, task_id,
         # escalation_id). Reset on process restart by design.
         self._escalation_log: dict[tuple[str, str, str], list[float]] = defaultdict(list)
-        self._queues: dict[str, EscalationQueue] = {}
         if not TicketJanitor._registry_log_emitted:
             TicketJanitor._registry_log_emitted = True
             logger.info(
@@ -184,13 +248,6 @@ class TicketJanitor:
                 'restart to pick up DASHBOARD_KNOWN_PROJECT_ROOTS changes (task 1164)',
                 len(self._known_projects),
             )
-
-    def _queue_for(self, project_root: str) -> EscalationQueue:
-        q = self._queues.get(project_root)
-        if q is None:
-            q = EscalationQueue(escalation_queue_dir(project_root))
-            self._queues[project_root] = q
-        return q
 
     def _parse_candidate(self, row: dict) -> dict:
         """Extract the candidate metadata block, gracefully handling bad JSON.
@@ -205,7 +262,7 @@ class TicketJanitor:
             kwargs = blob.get('kwargs') or {}
             # ``task_id`` is the canonical key per the plan; fall back to
             # ``spawned_from`` (steward's convention) before defaulting.
-            task_id = metadata.get('task_id') or metadata.get('spawned_from') or 'task-curator'
+            task_id = metadata.get('task_id') or metadata.get('spawned_from') or _ANCHOR_TASK_ID
             return {
                 'task_id': str(task_id),
                 'escalation_id': metadata.get('escalation_id') or _NO_ESCALATION,
@@ -270,28 +327,25 @@ class TicketJanitor:
             )
             return False
 
-        queue = self._queue_for(project_root)
-        escalation = Escalation(
-            id=queue.make_id('ticket-janitor'),
-            task_id='task-curator',
-            agent_role='fused-memory/ticket-janitor',
-            severity=severity,
-            category='infra_issue',
-            level=1,
-            summary=summary,
-            detail=detail,
-        )
         try:
-            queue.submit(escalation)
+            escalation_id = await asyncio.to_thread(
+                _file_janitor_escalation,
+                project_root,
+                task_id=_ANCHOR_TASK_ID,
+                severity=severity,
+                category='infra_issue',
+                summary=summary,
+                detail=detail,
+            )
         except Exception:
-            logger.warning(
+            logger.exception(
                 'ticket_janitor: failed to submit infra escalation for %s; '
                 'will retry next tick: %s', pid, summary,
             )
             return False
         logger.warning(
             'ticket_janitor: surfaced infra escalation %s for %s: %s',
-            escalation.id, pid, summary,
+            escalation_id, pid, summary,
         )
         return True
 
@@ -380,6 +434,91 @@ class TicketJanitor:
         if submitted:
             self._escalation_log[key].append(now)
 
+    async def _drain_awaiting_curation(self, requeue_ticket: Callable[[str, str], Awaitable[bool]]) -> None:
+        try:
+            due = await self._store.fetch_due_awaiting_curation(
+                now=datetime.now(UTC), limit=self._batch_limit,
+            )
+        except Exception:
+            logger.exception('ticket_janitor: fetch_due_awaiting_curation failed')
+            return
+        for row in due:
+            try:
+                await requeue_ticket(row['project_id'], row['ticket_id'])
+            except Exception:
+                logger.exception(
+                    'ticket_janitor: requeue of parked ticket %s failed; it stays '
+                    'parked for the next tick', row['ticket_id'],
+                )
+
+    async def _escalate_curation_backlog(self) -> None:
+        """File one folded escalation per ``(project, defer_reason)`` backlog that survived a retry."""
+        try:
+            backlogs = await self._store.summarise_awaiting_curation()
+        except Exception:
+            logger.exception('ticket_janitor: summarise_awaiting_curation failed')
+            return
+        for backlog in backlogs:
+            if backlog.max_attempts < self._curation_backlog_min_attempts:
+                continue
+            try:
+                await self._escalate_one_curation_backlog(backlog)
+            except Exception:
+                logger.exception(
+                    'ticket_janitor: curation-backlog escalation failed for %s/%s',
+                    backlog.project_id, backlog.defer_reason,
+                )
+
+    async def _escalate_one_curation_backlog(self, backlog: CurationBacklog) -> None:
+        now = time.monotonic()
+        key = (backlog.project_id, _CURATION_BACKLOG, backlog.defer_reason.value)
+        if self._cooldown_blocks(key, now):
+            return
+        severity = backlog_severity(backlog.defer_reason)
+        parked = await self._store.oldest_awaiting_curation(
+            backlog.project_id,
+            defer_reason=backlog.defer_reason,
+            limit=_CURATION_BACKLOG_DETAIL_TICKETS,
+        )
+        tickets = [
+            {
+                'ticket_id': row['ticket_id'],
+                'candidate_title': self._parse_candidate(row)['candidate_title'],
+                'created_at': row['created_at'],
+                'attempts': row['attempts'],
+                'next_attempt_at': row['next_attempt_at'],
+            }
+            for row in parked
+        ]
+        esc_id = await asyncio.to_thread(
+            file_folded_escalation,
+            self._known_projects.get(backlog.project_id),
+            anchor_task_id=curation_backlog_anchor(backlog.defer_reason),
+            agent_role='fused-memory/ticket-janitor',
+            category='infra_issue',
+            severity=severity,
+            summary=(
+                f'{backlog.count} task submission(s) parked awaiting curation for project '
+                f'{backlog.project_id}: {backlog.defer_reason} (oldest {backlog.oldest_created_at}, '
+                f'up to {backlog.max_attempts} deferrals)'
+            ),
+            detail=json.dumps({
+                'project_id': backlog.project_id,
+                'defer_reason': backlog.defer_reason.value,
+                'severity': severity,
+                'count': backlog.count,
+                'oldest_created_at': backlog.oldest_created_at,
+                'max_attempts': backlog.max_attempts,
+                'tickets': tickets,
+            }),
+            suggested_action=_curation_backlog_action(backlog.defer_reason),
+            logger=logger,
+            log_label='ticket_janitor',
+            context=f'curation backlog {backlog.project_id}/{backlog.defer_reason}',
+        )
+        if esc_id is not None:
+            self._escalation_log[key].append(now)
+
     async def tick(self) -> None:
         """One janitor pass.
 
@@ -387,9 +526,17 @@ class TicketJanitor:
         loop never crashes the server. Background work for an MCP server
         should be allergic to unhandled exceptions.
         """
-        # 1) terminalise pending tickets whose project has no live curator
-        #    worker — replaces the old wall-clock TTL janitor with an honest
-        #    "is the worker actually processing?" signal.
+        if self._requeue_ticket is not None:
+            await self._drain_awaiting_curation(self._requeue_ticket)
+        await self._reap_dead_workers()
+        cfg = self._dedup_outage_cfg
+        if cfg is not None and cfg.enabled:
+            await self._check_dedup_outage(cfg)
+        await self._escalate_failed_tickets()
+        await self._escalate_curation_backlog()
+
+    async def _reap_dead_workers(self) -> None:
+        """Recover the pending tickets of every project whose curator worker is gone."""
         if self._liveness_probe is not None:
             _pending_list_ok = False
             try:
@@ -421,25 +568,27 @@ class TicketJanitor:
                     self._probe_failures.pop(pid, None)
                 if not alive:
                     try:
-                        reaped_ids = await self._store.mark_pending_failed_for_project(
+                        recovery = await self._store.recover_pending_for_dead_worker(
                             pid, reason='worker_dead',
                         )
                     except Exception:
                         logger.exception(
-                            'ticket_janitor: mark_pending_failed_for_project '
+                            'ticket_janitor: recover_pending_for_dead_worker '
                             'failed for %s', pid,
                         )
                         continue
+                    reaped_ids = recovery.failed_ids + recovery.reparked_ids
                     if reaped_ids:
                         logger.warning(
                             'ticket_janitor: reaped %d pending ticket(s) for '
                             'dead worker on project %s', len(reaped_ids), pid,
                         )
                         # Signal blocked resolve_ticket waiters so they wake
-                        # promptly with failed/worker_dead instead of waiting
+                        # promptly with failed/worker_dead (or
+                        # awaiting_curation, if re-parked) instead of waiting
                         # for their own timeout.  Strictly after the
-                        # terminalising UPDATE so the woken caller re-reads a
-                        # terminal row (not still-pending).  Best-effort:
+                        # recovering UPDATE so the woken caller re-reads a
+                        # row that is no longer pending.  Best-effort:
                         # a buggy callback must not crash the janitor loop.
                         if self._signal_ticket_resolved is not None:
                             for tid in reaped_ids:
@@ -461,11 +610,8 @@ class TicketJanitor:
                 for _stale_pid in _stale:
                     self._probe_failures.pop(_stale_pid, None)
 
-        # 1b) the dedup-outage detector, fault-isolated per project.
-        cfg = self._dedup_outage_cfg
-        if cfg is not None and cfg.enabled:
-            await self._check_dedup_outage(cfg)
-
+    async def _escalate_failed_tickets(self) -> None:
+        """Surface each group of un-escalated failed tickets as one ``ticket_failure``."""
         # 2) collect rows that haven't been escalated yet
         try:
             rows = await self._store.fetch_unescalated_failures(
@@ -540,8 +686,6 @@ class TicketJanitor:
                     )
                 continue
 
-            # Build the escalation
-            queue = self._queue_for(project_root)
             detail_payload = []
             for row, cand in items:
                 detail_payload.append({
@@ -552,21 +696,19 @@ class TicketJanitor:
                     'created_at': row.get('created_at'),
                     'resolved_at': row.get('resolved_at'),
                 })
-            escalation = Escalation(
-                id=queue.make_id('ticket-janitor'),
-                task_id=task_id if task_id and task_id != '_unparseable_' else 'task-curator',
-                agent_role='fused-memory/ticket-janitor',
-                severity='info',
-                category='ticket_failure',
-                summary=(
-                    f'{len(items)} ticket(s) failed for task {task_id} '
-                    f'escalation {escalation_id}'
-                ),
-                detail=json.dumps(detail_payload, indent=2),
-                level=1,
-            )
             try:
-                queue.submit(escalation)
+                filed_id = await asyncio.to_thread(
+                    _file_janitor_escalation,
+                    project_root,
+                    task_id=task_id if task_id and task_id != '_unparseable_' else _ANCHOR_TASK_ID,
+                    severity='info',
+                    category='ticket_failure',
+                    summary=(
+                        f'{len(items)} ticket(s) failed for task {task_id} '
+                        f'escalation {escalation_id}'
+                    ),
+                    detail=json.dumps(detail_payload, indent=2),
+                )
             except Exception:
                 logger.exception(
                     'ticket_janitor: failed to submit escalation for group %s; '
@@ -589,7 +731,7 @@ class TicketJanitor:
             logger.info(
                 'ticket_janitor: queued escalation %s for project %s '
                 '(task=%s escalation=%s, %d ticket(s))',
-                escalation.id, project_id, task_id, escalation_id, len(items),
+                filed_id, project_id, task_id, escalation_id, len(items),
             )
 
     async def run_loop(self, interval_seconds: float) -> None:

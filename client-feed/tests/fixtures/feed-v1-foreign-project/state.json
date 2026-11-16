@@ -1,0 +1,19 @@
+{
+  "project_id": "demo-client",
+  "feed_version": "1.0",
+  "watermark_seq": 3,
+  "as_of": "2026-10-14T09:03:00Z",
+  "head": "3f2a9c1e7b4d5a60812c9e0f4b7a1d2c3e5f6a7b",
+  "engagement_version": 2,
+  "degraded": [],
+  "factory": null,
+  "prds": {},
+  "tasks": {},
+  "in_flight": [],
+  "branches": null,
+  "tree": null,
+  "revealed": [],
+  "criteria": {},
+  "criteria_declared": {},
+  "recent": []
+}

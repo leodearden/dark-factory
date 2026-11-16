@@ -22,8 +22,8 @@ from _merge_lane_fakes import DrivenMerge, drive_merge
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_queue import MergeOutcome, MergeRequest
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import MergeOutcome, MergeRequest
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------

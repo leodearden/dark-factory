@@ -1,0 +1,13 @@
+Synced-write latency, measured 2026-10-22 between 14:35 and 14:45 UTC (lead session, by hand).
+Command on each host, in the directory the gates write to:
+    dd if=/dev/zero of=<dir>/fsync.test bs=4k count=300 oflag=dsync
+
+host                               dir          dd's own output                                    per 4 KiB dsync write
+laptop (7940HS, ext4 on NVMe)      $HOME        1228800 bytes copied, 0.165031 s, 7.4 MB/s         0.55 ms
+Milan pod (overlay on host disk)   /root        1228800 bytes copied, 0.668406 s, 1.8 MB/s         2.2 ms
+Turin pod (overlay on host disk)   /root        1228800 bytes copied, 37.9477 s, 32.4 kB/s         126 ms
+workstation (3950X, ext4, loaded)  /home/leo    1228800 bytes copied, 1.97082 s, 623 kB/s          6.6 ms
+Turin pod under eatmydata          /root        1228800 bytes copied, 0.000357896 s, 3.4 GB/s      (no-op)
+
+The pods were mid-gate when measured (Milan: its 2-at-once DF batch; Turin: its stopped first run);
+300 dsync writes is a few seconds of load at most.

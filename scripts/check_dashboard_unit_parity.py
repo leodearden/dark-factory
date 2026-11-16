@@ -52,11 +52,15 @@ are split by CLASS, because one rule cannot fit all of them:
 - **Presence-only** — directives whose value embeds a host path (ExecStart,
   WorkingDirectory, Documentation).  Value-comparing them would report drift
   on every machine that is not this one.  Their meaningful content is reached
-  instead through per-flag ExecStart comparison.
-- **ExecStart flags** — the uvicorn flags are extracted from the
-  continuation-JOINED logical ExecStart of both copies and compared
-  individually, so the ``uv`` binary path and repo root are ignored while a
-  stale ``--timeout-graceful-shutdown`` is not.
+  instead through per-option ExecStart comparison.
+- **ExecStart options** — options are read from the continuation-JOINED
+  logical ExecStart of both copies and compared individually, so the ``uv``
+  binary path and repo root are ignored while a stale
+  ``--timeout-graceful-shutdown`` is not.  Argument-taking flags are compared
+  by value, argument-less switches (``--no-sync``) by presence, and every long
+  option on the committed command must be compared or waived with a reason.
+  A long option the registry does not name is still compared by presence, so
+  an option on one copy only (a hand-added installed ``--reload``) is drift.
 - **Environment=** — compared by variable-NAME set (a dropped variable is
   always drift), with values compared only for names off
   ``DIVERGENCE_ALLOWLIST``.  That allowlist exists because the one measured
@@ -113,7 +117,7 @@ the same template and changes nothing.
 
 Design notes
 ------------
-- Stdlib-only (argparse, dataclasses, pathlib, re, sys) — runs under plain
+- Stdlib-only (argparse, dataclasses, pathlib, sys) — runs under plain
   python3, exactly like scripts/check_fused_memory_unit_parity.py, whose
   idioms this script follows deliberately rather than inventing a new pattern.
 - No ``--fix``, unlike that precedent.  Propagating repo units into
@@ -121,7 +125,7 @@ Design notes
   ``scripts/setup-host.sh`` does; duplicating it here would be a fourth copy of
   the install logic.  Drift is reported with a remediation pointer instead.
 - Two consumers branch on the 0/1/2 exit codes: ``setup-host.sh``, and
-  ``scripts/orchestrator-watchdog.py::unit_parity_pass``, which runs this
+  ``scripts/_watchdog_dashboard_parity.py::unit_parity_pass``, which runs this
   checker read-only, at most hourly, on the watchdog's timer tick.  Changing
   the codes changes both.
 
@@ -138,7 +142,6 @@ no change to this file can affect.
 import argparse
 import dataclasses
 import pathlib
-import re
 import sys
 from collections.abc import Sequence
 from typing import Final
@@ -210,8 +213,8 @@ class UnitSpec:
     # value-comparing them would report drift on every machine that is not
     # this one — a gate that fires unconditionally is a gate that gets
     # switched off. Their MEANINGFUL content is still reached, just not by
-    # string equality: exec_start_flags compares the uvicorn flags inside
-    # ExecStart individually, ignoring the host-specific prefix.
+    # string equality: exec_start_flags and exec_start_switches compare the
+    # options inside ExecStart individually, ignoring the host-specific prefix.
     present_only: tuple[tuple[str, str], ...] = ()
     # Section whose Environment= directives are compared by variable-NAME set
     # (values compared only for names off DIVERGENCE_ALLOWLIST). None disables
@@ -223,11 +226,21 @@ class UnitSpec:
     # side alone is reported, which is the whole point on a unit that should
     # declare none at all.
     environment_section: str | None = None
-    # Bare uvicorn flag names (no leading '--') compared INSIDE [Service]
-    # ExecStart. This is how a presence-only ExecStart still gets its
+    # Bare names (no leading '--') of options that TAKE an argument on the
+    # [Service] ExecStart command line, uv's as well as uvicorn's, compared by
+    # that argument. This is how a presence-only ExecStart still gets its
     # meaningful content checked: the host-specific `uv` path and repo-root
     # prefix are ignored, while a stale --timeout-graceful-shutdown is not.
     exec_start_flags: tuple[str, ...] = ()
+    # Bare names of ARGUMENT-LESS options (no leading '--') compared by
+    # PRESENCE inside [Service] ExecStart. Such an option has no argument to
+    # compare by value: registered on exec_start_flags it reads as NO_ARGUMENT,
+    # which test_registry_exec_start_flags_are_really_on_the_committed_command
+    # rejects. Registering it here is the declaration
+    # test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked
+    # requires. At run time it compares by presence, as an unregistered option
+    # does.
+    exec_start_switches: tuple[str, ...] = ()
     # (section, key) pairs that must be present on BOTH sides or NEITHER,
     # registered because their presence on the installed side alone redirects
     # the effective configuration somewhere this checker never reads.
@@ -293,10 +306,17 @@ class UnitSpec:
     # requires every directive in the committed unit to be either in
     # covered_directives() or named here.
     #
-    # That guard is DIRECTIVE-granular. Tokens inside ExecStart are reached
-    # only through exec_start_flags, and nothing enforces that list's
-    # completeness.
+    # That guard is DIRECTIVE-granular. ExecStart's LONG options are held
+    # complete one level down, by
+    # test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked
+    # (see unchecked_exec_start_options); short options and positional
+    # arguments on the command are not reached.
     unchecked_directives: tuple[tuple[str, str, str], ...] = ()
+    # (option name, reason) pairs for long options on the committed ExecStart
+    # that are DELIBERATELY not compared: the option-level counterpart of
+    # unchecked_directives, held to the same rule — keep it small, and keep
+    # every reason specific. No spec needs one today.
+    unchecked_exec_start_options: tuple[tuple[str, str], ...] = ()
 
     def covered_directives(self) -> frozenset[tuple[str, str]]:
         """Every ``(section, key)`` a compare_unit branch checks as a whole directive.
@@ -305,32 +325,90 @@ class UnitSpec:
         enumeration of its directive-level branches, held in step with them by
         tests/scripts/test_check_dashboard_unit_parity.py::test_covered_directives_is_exactly_what_compare_unit_checks.
         The completeness guard and ``__post_init__`` both read it rather than
-        re-deriving the list. exec_start_flags and env_matches_directive cover
-        no directive of their own: they reach tokens inside one, or relate two.
+        re-deriving the list. exec_start_flags, exec_start_switches and
+        env_matches_directive cover no directive of their own: they reach
+        tokens inside one, or relate two.
         """
         covered = {*self.compared, *self.present_only, *self.override_directives}
         if self.environment_section is not None:
             covered.add((self.environment_section, "Environment"))
         return frozenset(covered)
 
+    def covered_exec_start_options(self) -> frozenset[str]:
+        """Every ExecStart long option registered by kind (flag or switch), by bare name.
+
+        The option-level counterpart of covered_directives(), read by
+        ``__post_init__`` and ``unregistered_exec_start_options``.
+        """
+        return frozenset((*self.exec_start_flags, *self.exec_start_switches))
+
+    def unregistered_exec_start_options(
+        self, service_directives: dict[str, list[str]]
+    ) -> frozenset[str]:
+        """Long options on one parsed [Service] ExecStart this spec neither registers nor waives.
+
+        The one statement of what "unregistered" means: read_exec_start_options
+        compares these by presence, and
+        tests/scripts/test_check_dashboard_unit_parity.py::test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked
+        requires the committed command to have none.
+        """
+        waived = {option for option, _reason in self.unchecked_exec_start_options}
+        return (
+            exec_start_option_names(service_directives) - self.covered_exec_start_options() - waived
+        )
+
+    def read_exec_start_options(
+        self, service_directives: dict[str, list[str]]
+    ) -> dict[str, str | None]:
+        """How each long option reads on one parsed [Service] ExecStart, by bare name.
+
+        A flag reads as its argument as ``_exec_start_flag`` renders it, a
+        switch as its own ``--name`` token, and a registered option the command
+        lacks as None. Every unregistered option on the command reads as its
+        token too, so an option the registry never names is still compared by
+        presence: the completeness guard holds only the COMMITTED command's
+        options registered, and cannot see one that exists on the installed
+        copy alone. compare_unit diffs two of these readings.
+        """
+        readings: dict[str, str | None] = {
+            **{flag: _exec_start_flag(service_directives, flag) for flag in self.exec_start_flags},
+            **{
+                switch: _exec_start_switch(service_directives, switch)
+                for switch in self.exec_start_switches
+            },
+        }
+        unregistered = self.unregistered_exec_start_options(service_directives)
+        readings.update((name, f"--{name}") for name in sorted(unregistered))
+        return readings
+
     def __post_init__(self) -> None:
         """Reject a registry entry that contradicts itself or could never run.
 
-        ``env_matches_directive`` reads both halves out of
-        ``environment_section``, so registering a pair without setting that
-        field makes the branch a silent no-op: the spec reads as though the
-        value were checked while nothing is compared at all — the one failure
-        mode a gate must not have, and the one its own report cannot reveal.
+        Four rejections, each turning a spec that would check other than it
+        says into an import-time error on the registry, where it is
+        unmissable, instead of a green run:
 
-        A directive both covered by a branch and listed in
-        ``unchecked_directives`` is the same defect from the other side: its
-        reason string tells a reviewer the directive is deliberately not
-        compared while a branch compares it, so the waiver can no longer be
-        trusted to mean what it says.
-
-        Raising turns either into an import-time error on the registry, where
-        it is unmissable, instead of a green run that checked other than it says.
+        - ``env_matches_directive`` without ``environment_section``. Both
+          halves are read out of that section, so the branch would be a silent
+          no-op — the one failure mode a gate must not have, and the one its
+          own report cannot reveal.
+        - A directive both covered by a branch and listed in
+          ``unchecked_directives``. Its reason string tells a reviewer the
+          directive is deliberately not compared while a branch compares it,
+          so the waiver can no longer be trusted to mean what it says.
+        - An option on both ``exec_start_flags`` and ``exec_start_switches``.
+          It either takes an argument or it does not, so one of the two
+          readers would read it wrongly.
+        - An option both covered and listed in
+          ``unchecked_exec_start_options`` — the directive-waiver defect, one
+          level down.
         """
+        self._reject_env_relation_without_section()
+        self._reject_covered_directive_waivers()
+        self._reject_options_of_both_kinds()
+        self._reject_covered_option_waivers()
+
+    def _reject_env_relation_without_section(self) -> None:
         if self.env_matches_directive and self.environment_section is None:
             raise ValueError(
                 f"{self.name}: env_matches_directive="
@@ -338,6 +416,8 @@ class UnitSpec:
                 "be set — both the variable and the directive are read from that "
                 "section, so the comparison would silently check nothing"
             )
+
+    def _reject_covered_directive_waivers(self) -> None:
         covered = self.covered_directives()
         for section, key, reason in self.unchecked_directives:
             if (section, key) in covered:
@@ -348,9 +428,31 @@ class UnitSpec:
                     "the registry says what it actually checks"
                 )
 
+    def _reject_options_of_both_kinds(self) -> None:
+        for option in self.exec_start_flags:
+            if option in self.exec_start_switches:
+                raise ValueError(
+                    f"{self.name}: --{option} is registered on both "
+                    "exec_start_flags and exec_start_switches — an option either "
+                    "takes an argument (exec_start_flags) or does not "
+                    "(exec_start_switches), so one reader would read it wrongly"
+                )
+
+    def _reject_covered_option_waivers(self) -> None:
+        covered = self.covered_exec_start_options()
+        for option, reason in self.unchecked_exec_start_options:
+            if option in covered:
+                raise ValueError(
+                    f"{self.name}: --{option} is listed in "
+                    f"unchecked_exec_start_options (reason: {reason!r}) but is "
+                    "also compared via exec_start_flags or exec_start_switches — "
+                    "remove one of the two so the registry says what it actually "
+                    "checks"
+                )
+
 
 def _render(values: list[str] | None) -> str:
-    """Render a directive's values for a Drift record / the report."""
+    """Render a directive's values, or a flag's arguments, for a Drift record / the report."""
     if not values:
         return ABSENT
     if len(values) == 1:
@@ -358,8 +460,18 @@ def _render(values: list[str] | None) -> str:
     return " | ".join(values)
 
 
+# How a flag present on the command with no argument reads: followed by another
+# long option, ending the command, or spelled ``--flag=``.
+NO_ARGUMENT: Final = "<no argument>"
+
+
+def _exec_start_argv(service_directives: dict[str, list[str]]) -> tuple[str, ...]:
+    """The whitespace-split parsed [Service] ExecStart; ``_exec_start_flag`` says why parsed."""
+    return tuple(" ".join(service_directives.get("ExecStart", [])).split())
+
+
 def _exec_start_flag(service_directives: dict[str, list[str]], flag: str) -> str | None:
-    """Return the argument of ``--<flag>`` in ExecStart, or None if absent.
+    """Return the argument of each ``--<flag>`` in ExecStart, or None if absent.
 
     Reads the ALREADY-JOINED ExecStart value out of a parsed section — never
     the raw file text.  That scoping is load-bearing, and the hazard is real
@@ -375,48 +487,101 @@ def _exec_start_flag(service_directives: dict[str, list[str]], flag: str) -> str
     uvicorn's parser treats them identically, so rejecting one would report a
     reformatted-but-correct command as a missing flag.
 
-    Returns the RAW token, not an int (unlike ``_uvicorn_int_flag`` in
-    tests/scripts/test_dashboard_service_template.py, whose idiom this
-    borrows), so non-numeric flags like ``--host 127.0.0.1`` work too.
+    Returns the RAW token, not an int, so non-numeric flags like
+    ``--host 127.0.0.1`` work too.
+
+    Every occurrence is read, joined as ``_render`` joins a repeated
+    directive's values.  click (uvicorn) and clap (uv) apply the LAST
+    occurrence, so an appended installed ``--port 9090`` override must not
+    read as parity on the first ``--port``.
+
+    An occurrence with no argument reads as ``NO_ARGUMENT``: never as the next
+    option's token, and never as absent.  So an installed ``--project
+    --no-sync`` is reported as a missing argument rather than as the argument
+    ``--no-sync``.  That covers an occurrence followed by another long option,
+    ending the command, or spelled ``--flag=``.  It does not cover one followed
+    by a positional: a switch registered here by mistake and followed by
+    ``python`` reads ``python`` as its argument.
     """
-    values = service_directives.get("ExecStart")
-    if not values:
-        return None
-    command = " ".join(values)
-    match = re.search(rf"--{re.escape(flag)}[=\s]+(\S+)", command)
-    return match.group(1) if match else None
+    option = f"--{flag}"
+    argv = _exec_start_argv(service_directives)
+    arguments: list[str] = []
+    for index, token in enumerate(argv):
+        if token == option:
+            following = argv[index + 1] if index + 1 < len(argv) else ""
+            takes_none = not following or following.startswith("--")
+            arguments.append(NO_ARGUMENT if takes_none else following)
+        elif token.startswith(f"{option}="):
+            arguments.append(token.removeprefix(f"{option}=") or NO_ARGUMENT)
+    return _render(arguments) if arguments else None
 
 
-def _compare_exec_start_flags(
+def _exec_start_switch(service_directives: dict[str, list[str]], switch: str) -> str | None:
+    """Return the literal ``--<switch>`` token if ExecStart carries it, else None.
+
+    Presence is rendered as the token itself, so a drift report shows what is
+    missing rather than a bare boolean.
+    """
+    option = f"--{switch}"
+    return option if option in _exec_start_argv(service_directives) else None
+
+
+def exec_start_option_names(service_directives: dict[str, list[str]]) -> frozenset[str]:
+    """Bare names of every LONG option on [Service] ExecStart.
+
+    ``--name=value`` yields ``name``; a bare ``--`` is skipped. Long options
+    only: short options (``-m``) and positionals (the app target) are not
+    reached. ``UnitSpec.unregistered_exec_start_options`` subtracts the
+    registry from this enumeration.
+
+    Names are not scoped by program: uv's options (before ``python -m
+    uvicorn``) and uvicorn's (after) share one namespace, so a name both
+    programs take would read as one option.
+    """
+    names = (
+        token[2:].partition("=")[0]
+        for token in _exec_start_argv(service_directives)
+        if token.startswith("--")
+    )
+    return frozenset(name for name in names if name)
+
+
+def _compare_exec_start_options(
     spec: UnitSpec,
     repo: dict[str, dict[str, list[str]]],
     installed: dict[str, dict[str, list[str]]],
 ) -> list[Drift]:
-    """Compare each of ``spec.exec_start_flags`` inside [Service] ExecStart."""
-    drifts: list[Drift] = []
-    repo_service = repo.get("Service", {})
-    installed_service = installed.get("Service", {})
+    """Diff ``spec.read_exec_start_options`` of the two copies, option by option.
 
-    for flag in spec.exec_start_flags:
-        repo_value = _exec_start_flag(repo_service, flag)
-        installed_value = _exec_start_flag(installed_service, flag)
+    Flags compare by argument; switches and unregistered options by presence,
+    since each reads as its own token or None, so only a flag can reach the
+    argument-differs reason.
+    """
+    drifts: list[Drift] = []
+    repo_readings = spec.read_exec_start_options(repo.get("Service", {}))
+    installed_readings = spec.read_exec_start_options(installed.get("Service", {}))
+    names = [*repo_readings, *sorted(installed_readings.keys() - repo_readings.keys())]
+
+    for name in names:
+        repo_value = repo_readings.get(name)
+        installed_value = installed_readings.get(name)
         if repo_value == installed_value:
             continue
         if repo_value is None:
-            reason = f"--{flag} present on the installed command, absent from the repo command"
+            reason = f"--{name} present on the installed command, absent from the repo command"
         elif installed_value is None:
-            reason = f"--{flag} present on the repo command, absent from the installed command"
+            reason = f"--{name} present on the repo command, absent from the installed command"
         else:
-            reason = f"--{flag} argument differs between the repo and installed commands"
+            reason = f"--{name} argument differs between the repo and installed commands"
         drifts.append(
             Drift(
                 unit=spec.name,
                 section="Service",
-                # Keyed by FLAG, not by 'ExecStart': the command is long and
+                # Keyed by OPTION, not by 'ExecStart': the command is long and
                 # mostly host-specific, so naming the whole directive would
                 # send the operator back to a manual diff to find the token
                 # that actually moved.
-                key=f"ExecStart --{flag}",
+                key=f"ExecStart --{name}",
                 repo_value=repo_value if repo_value is not None else ABSENT,
                 installed_value=installed_value if installed_value is not None else ABSENT,
                 reason=reason,
@@ -673,7 +838,7 @@ def compare_unit(
             )
         )
 
-    drifts.extend(_compare_exec_start_flags(spec, repo, installed))
+    drifts.extend(_compare_exec_start_options(spec, repo, installed))
     drifts.extend(_compare_environment(spec, repo, installed))
     drifts.extend(_compare_env_matches_directive(spec, repo, installed))
 
@@ -775,7 +940,7 @@ UNITS: dict[str, UnitSpec] = {
         present_only=(
             # All three carry absolute host paths (/home/leo/.local/bin/uv,
             # the repo root). Presence only; ExecStart's content is reached
-            # via exec_start_flags.
+            # via exec_start_flags and exec_start_switches.
             ("Unit", "Documentation"),
             ("Service", "ExecStart"),
             ("Service", "WorkingDirectory"),
@@ -815,6 +980,17 @@ UNITS: dict[str, UnitSpec] = {
             # can reach.
             "host",
             "port",
+            # `--project dashboard` is relative (resolved against
+            # WorkingDirectory=) and host-invariant in both the template and
+            # the committed unit, so it is value-comparable.
+            "project",
+        ),
+        exec_start_switches=(
+            # Task 5553 (commit 93e62a6c8f) put `uv run --no-sync` on every
+            # committed uv-run unit: only --no-sync stops a process start from
+            # re-syncing the shared root .venv. On 2026-10-05 the installed
+            # copy lacked it while this gate reported parity.
+            "no-sync",
         ),
     ),
     "dark-factory-dashboard-watchdog.service": UnitSpec(

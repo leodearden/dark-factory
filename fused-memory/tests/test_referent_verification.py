@@ -2758,7 +2758,7 @@ class TestCorroboratedIsDerivedFromTheRecordedEvidence:
         carries. The two agree only while distinct referents cannot render
         alike, and `Referent.node_name` drops `kind` entirely for a FOREIGN
         referent (`f'{project_id}:{number}'`), so today's injectivity rests
-        wholly on `_KIND_LABELS` holding exactly one kind. Add a second and a
+        wholly on `KIND_LABELS` holding exactly one kind. Add a second and a
         foreign citation of the new kind corroborates a foreign 'task' endpoint
         of the same number: a genuine misattachment demoted to INFO and booked
         into the 'corroborated' counter axis.
@@ -2774,7 +2774,7 @@ class TestCorroboratedIsDerivedFromTheRecordedEvidence:
         a precondition of THIS property; task 4506 holds no lock on that file
         (esc-3671-3 amendment pass).
         """
-        kinds = sorted(canonical_labels._KIND_LABELS)
+        kinds = sorted(canonical_labels.KIND_LABELS)
         # BOTH renderings, because they fail differently: the local form
         # discriminates on the kind LABEL ('Task 2500' vs a second label) and
         # stays injective, while the foreign form drops the kind and is the one

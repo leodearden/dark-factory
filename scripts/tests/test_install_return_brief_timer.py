@@ -15,7 +15,11 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from sitting import nightly_prepare
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / 'install-return-brief-timer.sh'
 TEMPLATES_DIR = Path(__file__).parent.parent

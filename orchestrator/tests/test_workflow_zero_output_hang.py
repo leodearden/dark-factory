@@ -13,6 +13,7 @@ All tests are RED until step-8 (circuit breaker + routing) is implemented.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -344,14 +345,14 @@ class TestExecuteVerifyReviewLoopZeroOutputRouting:
 
 
 class TestCaptureZeroOutputEvidence:
-    """_capture_zero_output_evidence writes a JSON evidence file under artifacts.root.
+    """_capture_zero_output_evidence writes a JSON evidence file under the task root.
 
     Fails RED because _capture_zero_output_evidence does not exist yet (step-10
     will implement it).
     """
 
     def test_evidence_file_created_under_artifacts_root(self, tmp_path: Path):
-        """Evidence JSON file is written at artifacts.root/zero_output_evidence-iter{N}.json.
+        """Evidence JSON file is written at zero_output_evidence_path(N).
 
         Builds a workflow with a real TaskConfigDir containing sentinel files, calls
         _capture_zero_output_evidence, and asserts the file exists and contains the
@@ -362,7 +363,7 @@ class TestCaptureZeroOutputEvidence:
         assert wf.artifacts is not None
 
         # Build a real TaskConfigDir with sentinel files
-        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         sentinel_a = config_dir.path / 'sentinel_a.txt'
         sentinel_a.write_text('hello')
         sentinel_b = config_dir.path / 'sentinel_b.json'
@@ -384,7 +385,7 @@ class TestCaptureZeroOutputEvidence:
         iteration = 3
         wf._capture_zero_output_evidence(result, iteration)  # type: ignore[attr-defined]
 
-        evidence_path = wf.artifacts.root / f'zero_output_evidence-iter{iteration}.json'
+        evidence_path = wf.artifacts.zero_output_evidence_path(iteration)
         assert evidence_path.exists(), (
             f'Expected evidence file at {evidence_path} but it does not exist'
         )
@@ -434,7 +435,7 @@ class TestCleanupConfigDir:
         """When _preserve_config_dir=True, _cleanup_config_dir() must NOT delete the dir."""
         wf = _make_workflow(tmp_path=tmp_path)
         assert wf.artifacts is not None
-        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         sentinel = config_dir.path / 'keep_me.txt'
         sentinel.write_text('preserve test')
         wf._config_dir = config_dir  # type: ignore[attr-defined]
@@ -452,7 +453,7 @@ class TestCleanupConfigDir:
         """When _preserve_config_dir=False, _cleanup_config_dir() deletes the dir."""
         wf = _make_workflow(tmp_path=tmp_path)
         assert wf.artifacts is not None
-        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         sentinel = config_dir.path / 'remove_me.txt'
         sentinel.write_text('cleanup test')
         wf._config_dir = config_dir  # type: ignore[attr-defined]
@@ -500,7 +501,7 @@ class TestRecycleConfigDir:
         """
         wf = _make_workflow(tmp_path=tmp_path)
         assert wf.artifacts is not None
-        old_config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        old_config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         sentinel = old_config_dir.path / 'old_sentinel.txt'
         sentinel.write_text('stale session state')
         old_path = old_config_dir.path
@@ -615,7 +616,7 @@ class TestCaptureEvidenceLoopWiring:
     ):
         """With threshold=2, two zero-output timeouts must produce two distinct
         evidence files (zero_output_evidence-iter1.json and iter2.json) under
-        artifacts.root.
+        the task root.
 
         Evidence files are created before the circuit breaker trips so that even
         the sub-threshold timeout (iteration 1) leaves a forensic record.
@@ -628,8 +629,8 @@ class TestCaptureEvidenceLoopWiring:
         )
         _stub_iteration_helpers(wf, _zero_output_agent_result())
         # Wire up a real TaskConfigDir so _capture_zero_output_evidence can write
-        from shared.config_dir import TaskConfigDir as _TCD
-        wf._config_dir = _TCD(wf.task_id, base_dir=wf.artifacts.root)  # type: ignore[attr-defined]
+        assert wf.artifacts is not None
+        wf._config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
 
         outcome = await wf._execute_iterations()
 
@@ -637,15 +638,15 @@ class TestCaptureEvidenceLoopWiring:
         assert wf.artifacts is not None
 
         # Two iterations ran (threshold=2), so two evidence files must exist.
-        iter1_path = wf.artifacts.root / 'zero_output_evidence-iter1.json'
-        iter2_path = wf.artifacts.root / 'zero_output_evidence-iter2.json'
+        iter1_path = wf.artifacts.zero_output_evidence_path(1)
+        iter2_path = wf.artifacts.zero_output_evidence_path(2)
         assert iter1_path.exists(), (
             f'Evidence file for iteration 1 missing: {iter1_path}\n'
-            f'artifacts.root contents: {list(wf.artifacts.root.iterdir())}'
+            f'task root contents: {list(wf.artifacts.task_root.iterdir())}'
         )
         assert iter2_path.exists(), (
             f'Evidence file for iteration 2 missing: {iter2_path}\n'
-            f'artifacts.root contents: {list(wf.artifacts.root.iterdir())}'
+            f'task root contents: {list(wf.artifacts.task_root.iterdir())}'
         )
 
         # Each file must contain valid JSON with iteration numbers matching
@@ -698,7 +699,7 @@ class TestCaptureZeroOutputEvidenceEnriched:
         assert wf.artifacts is not None
 
         # Build a real TaskConfigDir so _capture_zero_output_evidence can list it
-        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.root)
+        config_dir = TaskConfigDir(wf.task_id, base_dir=wf.artifacts.lane_root)
         wf._config_dir = config_dir  # type: ignore[attr-defined]
 
         # Write a JSONL transcript using the REAL nested CLI schema.
@@ -755,7 +756,7 @@ class TestCaptureZeroOutputEvidenceEnriched:
         iteration = 2
         wf._capture_zero_output_evidence(result, iteration)  # type: ignore[attr-defined]
 
-        evidence_path = wf.artifacts.root / f'zero_output_evidence-iter{iteration}.json'
+        evidence_path = wf.artifacts.zero_output_evidence_path(iteration)
         assert evidence_path.exists(), f'Expected evidence file at {evidence_path}'
 
         data = json.loads(evidence_path.read_text())
@@ -792,3 +793,130 @@ class TestCaptureZeroOutputEvidenceEnriched:
                 f'Expected each last_records entry to have a "message" key '
                 f'(real nested CLI schema); got keys {list(rec.keys())!r}'
             )
+
+
+# ---------------------------------------------------------------------------
+# Task 3319 (PRD ε): the evidence JSON names a provider-outage cause
+# ---------------------------------------------------------------------------
+
+_PROVIDER_529_ERROR = (
+    'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
+)
+
+
+def _server_error_zero_output_result() -> AgentResult:
+    """The 2026-07-29 incident shape: a watchdog-killed run whose flushed
+    result JSON carried a 529, with the provider's error at the END of output."""
+    return AgentResult(
+        success=False,
+        output='x' * 10_000 + _PROVIDER_529_ERROR,
+        timed_out=True,
+        turns=0,
+        cost_usd=0.0,
+        duration_ms=120_000,
+        transcript_turns=0,
+        api_error_status=529,
+    )
+
+
+class TestZeroOutputEvidenceCarriesServerErrorCause:
+    """Evidence from a 5xx zero-output run is self-describing: it carries the
+    HTTP status and the tail of the CLI output that holds the provider error."""
+
+    def test_evidence_records_api_error_status_and_output_tail(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
+        result = _server_error_zero_output_result()
+
+        wf._capture_zero_output_evidence(result, 1)
+
+        data = json.loads(wf.artifacts.zero_output_evidence_path(1).read_text())
+        assert data['api_error_status'] == 529
+        assert data['output_tail'].endswith(_PROVIDER_529_ERROR)
+        assert len(data['output_tail']) < len(result.output)
+
+    def test_wedge_evidence_records_null_api_error_status(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path)
+        assert wf.artifacts is not None
+
+        wf._capture_zero_output_evidence(_zero_output_agent_result(), 1)
+
+        data = json.loads(wf.artifacts.zero_output_evidence_path(1).read_text())
+        assert 'api_error_status' in data
+        assert data['api_error_status'] is None
+
+    @pytest.mark.asyncio
+    async def test_server_error_requeue_writes_evidence_with_status(self, tmp_path: Path):
+        wf = _make_workflow(tmp_path=tmp_path)
+        _stub_iteration_helpers(wf, _server_error_zero_output_result())
+        wf.scheduler.set_task_status = AsyncMock()
+        wf._mark_blocked = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.REQUEUED
+        assert wf.artifacts is not None
+        evidence_path = wf.artifacts.zero_output_evidence_path(1)
+        assert evidence_path.exists()
+        data = json.loads(evidence_path.read_text())
+        assert data['api_error_status'] == 529
+        assert 'overloaded_error' in data['output_tail']
+
+
+def _with_dual_root_artifacts(wf: TaskWorkflow) -> TaskArtifacts:
+    """Swap the harness's single-root artifacts for the production dual-root shape."""
+    assert wf.worktree is not None
+    artifacts = TaskArtifacts.for_task(wf.worktree, wf.task_id)
+    artifacts.task_root.mkdir(parents=True, exist_ok=True)
+    wf.artifacts = artifacts
+    return artifacts
+
+
+@pytest.mark.asyncio
+class TestHangDetailNamesTaskRootEvidence:
+    """The infra block detail names a glob that finds the evidence the run wrote,
+    under the TASK root rather than the lane root."""
+
+    async def test_breaker_trip_detail_names_the_evidence_glob(self, tmp_path: Path):
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=10,
+            max_consecutive_zero_output_timeouts=2,
+        )
+        artifacts = _with_dual_root_artifacts(wf)
+        _stub_iteration_helpers(wf, _zero_output_agent_result())
+        glob = artifacts.zero_output_evidence_glob()
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        info = wf._zero_output_hang_info
+        assert info is not None
+        assert glob in info['detail']
+        assert Path(glob).parent == artifacts.task_root
+        for n in (1, 2):
+            evidence_path = artifacts.zero_output_evidence_path(n)
+            assert evidence_path.exists()
+            assert fnmatch.fnmatch(str(evidence_path), glob)
+
+    async def test_iteration_cap_detail_names_the_evidence_glob(self, tmp_path: Path):
+        wf = _make_workflow(
+            tmp_path=tmp_path,
+            max_execute_iterations=1,
+            max_consecutive_zero_output_timeouts=2,
+        )
+        artifacts = _with_dual_root_artifacts(wf)
+        _stub_iteration_helpers(wf, _zero_output_agent_result())
+        glob = artifacts.zero_output_evidence_glob()
+
+        outcome = await wf._execute_iterations()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        info = wf._zero_output_hang_info
+        assert info is not None
+        detail = info['detail']
+        assert glob in detail
+        assert 'at_iteration_cap=True' in detail
+        evidence_path = artifacts.zero_output_evidence_path(1)
+        assert evidence_path.exists()
+        assert fnmatch.fnmatch(str(evidence_path), glob)

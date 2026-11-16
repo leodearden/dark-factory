@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import subprocess
 from collections import Counter
@@ -18,6 +19,7 @@ from pathlib import Path
 import pytest
 from _eval_sampler_fixtures import make_candidate, rich_corpus
 from click.testing import CliRunner
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 from orchestrator.cli import main
 from orchestrator.evals.task_sampler import (
@@ -45,6 +47,8 @@ from orchestrator.evals.task_sampler import (
     stratification_counts,
     stratify,
 )
+
+_SAMPLER_LOGGER = 'orchestrator.evals.task_sampler'
 
 
 def _git(args: list[str], cwd: Path) -> str:
@@ -566,7 +570,10 @@ class TestGitGlue:
     ) -> None:
         repo, task_id, merge_sha, pre, post = merge_repo
         cands = asyncio.run(
-            discover_completed_tasks(repo, since=None, project='dark_factory')
+            discover_completed_tasks(
+                repo, since=None, project='dark_factory',
+                branch_prefix='task/', main_branch='main',
+            )
         )
         assert len(cands) == 1
         c = cands[0]
@@ -889,6 +896,29 @@ class TestEnrichCandidatesFromTaskDb:
             [_cand(task_id='df_12', title='')], db,
         )
         assert enriched[0].title == ''
+
+    def test_stub_db_keeps_stubs_and_warning_names_the_refusal(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        stub = tmp_path / 'tasks.db'
+        stub.write_bytes(b'')
+        candidates = [_cand(task_id='12', title='orig')]
+        with caplog.at_level(logging.WARNING, logger=_SAMPLER_LOGGER):
+            enriched = enrich_candidates_from_task_db(candidates, stub)
+        assert enriched == candidates
+        refusal = TaskDbUnreadable(stub.resolve(), TaskDbProblem.EMPTY_STUB)
+        assert str(refusal) in caplog.text
+
+    def test_missing_db_warning_names_the_absent_refusal(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        absent = tmp_path / 'nope.db'
+        candidates = [_cand(task_id='12', title='orig')]
+        with caplog.at_level(logging.WARNING, logger=_SAMPLER_LOGGER):
+            enriched = enrich_candidates_from_task_db(candidates, absent)
+        assert enriched == candidates
+        refusal = TaskDbUnreadable(absent.resolve(), TaskDbProblem.ABSENT)
+        assert str(refusal) in caplog.text
 
 
 # ---------------------------------------------------------------------------

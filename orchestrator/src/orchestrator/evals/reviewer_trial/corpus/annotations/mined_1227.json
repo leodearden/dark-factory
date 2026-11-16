@@ -24,6 +24,54 @@
       "severity": "suggestion",
       "description": "The useMemo dependency array is only [text]. If `marked`/`DOMPurify` load asynchronously or fail their integrity check on first render, the memo caches `null` and degrades to plain text; once the libraries later become available the memo will not recompute (text unchanged), leaving the description permanently un-rendered as markdown. Library availability is not part of the memo key.",
       "mutation_type": "logic"
+    },
+    {
+      "id": "mined_1227_pool_01",
+      "location": "dashboard/src/dashboard/static/redux/index.html:19-20",
+      "category": "wrong_sri_hash",
+      "severity": "blocking",
+      "description": "The integrity attributes on the new marked@12.0.0 and dompurify@3.2.4 script tags do not match the bytes unpkg serves (correct values are sha384-NNQgBjjuhtXzPmmy4gurS5X7P4uTt1DThyevz4Ua0IVK5+kazYQI1W27JHjbbxQz and sha384-eEu5CTj3qGvu9PdJuS+YlkNi7d2XxQROAFYOr59zgObtlcux1ae1Il3u7jvdCSWu). Browsers block both scripts, so `marked` and `DOMPurify` are never defined, MarkdownText always takes its plain-text fallback, and the feature never renders markdown; the silent fallback hides the failure.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1227_pool_02",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:224",
+      "category": "behavioral_regression",
+      "severity": "suggestion",
+      "description": "The old `.desc` rule used `white-space: pre-line`, which preserved single newlines; the change removes it and calls `marked.parse(text)` with default options (`breaks: false`), so line-separated plain-text descriptions/details without blank lines are merged into one run-on paragraph in the rendered path.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1227_pool_03",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:227",
+      "category": "edge_case",
+      "severity": "suggestion",
+      "description": "A whitespace-only description is truthy, so MarkdownText skips the `empty` ('\u2014') placeholder; marked renders it to an empty string and the Description section shows a blank div. This is not a regression: the old `task.description || '\u2014'` also rendered whitespace-only text as blank.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1227_pool_04",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:230",
+      "category": "silent_fallback",
+      "severity": "suggestion",
+      "description": "When `marked` or `DOMPurify` is undefined, MarkdownText silently renders plain text with no console warning or other signal, so a failed CDN load (including an SRI mismatch) is indistinguishable from the pre-change UI.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1227_pool_05",
+      "location": "dashboard/src/dashboard/static/redux/tab_tasks.jsx:208-229",
+      "category": "comments_stance",
+      "severity": "suggestion",
+      "description": "MarkdownText and the DOMPurify hook carry reviewer-facing rationale comments (why memoise, 'streaming status updates from another tab', the list of CDN failure modes) that justify decisions rather than clarify code; this prose belongs in the commit message and is prone to drift.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1227_pool_06",
+      "location": "dashboard/tests/test_scaffold.py:178",
+      "category": "test_gap",
+      "severity": "suggestion",
+      "description": "No automated check covers the change: nothing asserts index.html carries the marked/DOMPurify script tags with integrity attributes (let alone that the hashes match the pinned files), and no test exercises sanitisation or MarkdownText's branches. The task did not request tests and the dashboard has no JS harness.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

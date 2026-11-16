@@ -145,3 +145,5 @@ tasks:
     delivered_check:
       kind: manual
       reason: decided inside L1 (open question 2)
+signal_leaves:
+- L1

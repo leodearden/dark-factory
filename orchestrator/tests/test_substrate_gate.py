@@ -786,30 +786,34 @@ def _fake_proc(returncode: int):
 class TestBlockAndEscalateSubstrateFlip:
     """Unit tests for ``Harness._block_and_escalate_substrate_flip``."""
 
-    @pytest.mark.asyncio
-    async def test_sets_task_blocked(self, tmp_path: Path):
-        """set_task_status('blocked') is called with the task_id."""
+    @staticmethod
+    def _harness_with_queue(tmp_path: Path):
         from escalation.queue import EscalationQueue
 
         h = _make_harness(tmp_path)
-        h._escalation_queue = EscalationQueue(tmp_path / 'esc')
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        h._escalation_queue = esc_queue
+        return h, esc_queue
 
-        verdict = _flip_verdict()
-        await h._block_and_escalate_substrate_flip('99', verdict=verdict)
+    @staticmethod
+    async def _block_flip(h, task_id: str) -> None:
+        await h._block_and_escalate_substrate_flip(task_id, verdict=_flip_verdict())
+
+    @pytest.mark.asyncio
+    async def test_sets_task_blocked(self, tmp_path: Path):
+        """set_task_status('blocked') is called with the task_id."""
+        h, _ = self._harness_with_queue(tmp_path)
+
+        await self._block_flip(h, '99')
 
         h.scheduler.set_task_status.assert_awaited_once_with('99', 'blocked')  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_files_l1_escalation_design_concern(self, tmp_path: Path):
         """Files exactly one L1 with category='design_concern' and severity='blocking'."""
-        from escalation.queue import EscalationQueue
+        h, esc_queue = self._harness_with_queue(tmp_path)
 
-        h = _make_harness(tmp_path)
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        h._escalation_queue = esc_queue
-
-        verdict = _flip_verdict()
-        await h._block_and_escalate_substrate_flip('77', verdict=verdict)
+        await self._block_flip(h, '77')
 
         pending = esc_queue.get_pending()
         l1s = [e for e in pending if e.task_id == '77' and e.level == 1]
@@ -821,19 +825,37 @@ class TestBlockAndEscalateSubstrateFlip:
     @pytest.mark.asyncio
     async def test_deduped_by_has_open_l1(self, tmp_path: Path):
         """Second call with open L1 is suppressed (no duplicate filed)."""
-        from escalation.queue import EscalationQueue
+        h, esc_queue = self._harness_with_queue(tmp_path)
 
-        h = _make_harness(tmp_path)
-        esc_queue = EscalationQueue(tmp_path / 'esc')
-        h._escalation_queue = esc_queue
-
-        verdict = _flip_verdict()
-        await h._block_and_escalate_substrate_flip('55', verdict=verdict)
-        await h._block_and_escalate_substrate_flip('55', verdict=verdict)
+        await self._block_flip(h, '55')
+        await self._block_flip(h, '55')
 
         pending = esc_queue.get_pending()
         l1s = [e for e in pending if e.task_id == '55' and e.level == 1]
         assert len(l1s) == 1, f'Expected exactly 1 L1 after dedup; got {l1s!r}'
+
+    @pytest.mark.asyncio
+    async def test_open_l1_of_another_category_does_not_suppress(self, tmp_path: Path):
+        """The cross-repo gate's open L1 must not hide the flip's root cause."""
+        from orchestrator.cross_repo_gate import BLOCK, CrossRepoVerdict
+
+        h, esc_queue = self._harness_with_queue(tmp_path)
+        misfile = CrossRepoVerdict(
+            verdict=BLOCK,
+            owner_project='dark_factory',
+            signals=('cross_repo_marker', 'all_files_foreign'),
+            foreign_paths=('/home/leo/src/dark-factory/orchestrator/src/x.py',),
+            reason='all 1 declared metadata.files entries resolve outside project_root',
+        )
+        await h._block_and_escalate_cross_repo('45', verdict=misfile)
+
+        await self._block_flip(h, '45')
+
+        pending_l1s = [e for e in esc_queue.get_pending() if e.task_id == '45' and e.level == 1]
+        by_category = {e.category: e for e in pending_l1s}
+        assert len(pending_l1s) == 2, f'Expected one L1 per gate for task 45; got {pending_l1s!r}'
+        assert by_category['scope_violation'].summary.startswith('CROSS_REPO_MISFILE')
+        assert by_category['design_concern'].summary.startswith('SUBSTRATE_FLIP')
 
     @pytest.mark.asyncio
     async def test_noop_when_no_escalation_queue(self, tmp_path: Path):
@@ -841,9 +863,8 @@ class TestBlockAndEscalateSubstrateFlip:
         h = _make_harness(tmp_path)
         h._escalation_queue = None  # bare-harness scenario
 
-        verdict = _flip_verdict()
         # Should not raise
-        await h._block_and_escalate_substrate_flip('33', verdict=verdict)
+        await self._block_flip(h, '33')
 
         # set_task_status is still called (blocking the task is unconditional)
         h.scheduler.set_task_status.assert_awaited_once_with('33', 'blocked')  # type: ignore[attr-defined]
@@ -1014,7 +1035,7 @@ def _stub_old_carries_substrate_probe(h) -> None:
     dispatch gate run unconditionally and mask the defect — hence the explicit
     ``side_effect`` rather than a bare mock.
     """
-    from orchestrator.substrate_gate import extract_probe_set  # noqa: PLC0415
+    from orchestrator.substrate_gate import extract_probe_set
     h.scheduler.carries_substrate_probe = MagicMock(
         side_effect=lambda t: extract_probe_set(t) is not None
     )
@@ -1041,7 +1062,7 @@ class TestRunSlotSubstrateFailClosed:
         self, tmp_path: Path, *, task_id: str, metadata: dict,
     ) -> None:
         """Shared body for the two malformed-descriptor cases (a) and (b)."""
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         h = _make_slot_harness(tmp_path)
         _stub_old_carries_substrate_probe(h)
@@ -1098,7 +1119,7 @@ class TestRunSlotSubstrateFailClosed:
     @pytest.mark.asyncio
     async def test_no_probe_key_allows_dispatch(self, tmp_path: Path):
         """(c) companion: no substrate_probe key at all — dispatch proceeds normally."""
-        from escalation.queue import EscalationQueue  # noqa: PLC0415
+        from escalation.queue import EscalationQueue
 
         h = _make_slot_harness(tmp_path)
         _stub_old_carries_substrate_probe(h)

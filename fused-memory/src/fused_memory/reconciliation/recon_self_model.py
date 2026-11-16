@@ -48,6 +48,7 @@ transcription, not yet a verified single source of truth.
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -123,6 +124,11 @@ MEM0_TOMBSTONE_DELETERS = (
     'stage2_cycle_summary_trim',
     'consolidate_memories',
 )
+
+
+def format_mem0_tombstone_deleters() -> str:
+    """MEM0_TOMBSTONE_DELETERS as the backtick-wrapped, comma-separated list the recon prompts render."""
+    return ', '.join(f'`{deleter}`' for deleter in MEM0_TOMBSTONE_DELETERS)
 
 
 @dataclass(frozen=True)
@@ -311,11 +317,16 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     ),
     'resolve_ticket': (
         'resolve_ticket(ticket, project_root) -> '
-        "{'status': 'created'|'combined'|'failed'|'refused', 'task_id'?: ..., "
-        "'reason'?: ...}  "
+        "{'status': 'created'|'combined'|'failed'|'refused'|'cancelled'"
+        "|'pending'|'awaiting_curation', "
+        "'task_id'?: ..., 'ticket'?: ..., 'reason'?: ...}  "
         '# refused = a deterministic guard rejected the candidate: NO task was '
         'created and NO task_id key is present. Terminal and intended; never '
-        'retry it and never record a task id for it.'
+        'retry it and never record a task id for it. '
+        '# cancelled = terminal, NO task_id. '
+        '# pending / awaiting_curation = OPEN: not decided yet; carries the '
+        'ticket, never a task_id. Do not count it or flag it as a discrepancy; '
+        're-poll the same ticket, never re-submit.'
     ),
     'add_finding': (
         'add_finding(severity, category, flag_type, actionable, description, '
@@ -458,6 +469,10 @@ def render_suppression_schema_section() -> str:
     )
 
 
+#: Heading of the section below; other prompt sections refer to it by this constant.
+ENTITY_STANDING_DECISIONS_HEADING = '## Entity Standing Decisions'
+
+
 def render_entity_standing_decision_schema_section() -> str:
     """Render the SHARED entity-standing-decision schema section (task 2898 ε,
     PRD plans/stage1-entity-standing-decision-prd.md §ε).
@@ -480,7 +495,7 @@ def render_entity_standing_decision_schema_section() -> str:
       deterministic filter (γ) and reads never consult mem0 for authority.
     """
     return (
-        '## Entity Standing Decisions\n'
+        f'{ENTITY_STANDING_DECISIONS_HEADING}\n'
         f'The `{RECORD_KIND_ENTITY_STANDING_DECISION}` ledger record is the SOLE '
         'machine-consulted standing-decision form — the durable record that a prior '
         'investigation adjudicated a recurring class of complaint about an entity and '
@@ -503,6 +518,10 @@ def render_entity_standing_decision_schema_section() -> str:
     )
 
 
+#: Heading of the section below; other prompt sections refer to it by this constant.
+INVESTIGATION_OUTCOME_RECORDS_HEADING = '## Investigation Outcome Records'
+
+
 def render_investigation_outcome_section() -> str:
     """Render the STAGE-2-ONLY investigation_outcome section (task 2898 ε,
     PRD plans/stage1-entity-standing-decision-prd.md §ε).
@@ -519,7 +538,7 @@ def render_investigation_outcome_section() -> str:
     design (PRD decision 8).
     """
     return (
-        '## Investigation Outcome Records\n'
+        f'{INVESTIGATION_OUTCOME_RECORDS_HEADING}\n'
         'When you (Stage 2) conclude an investigation of a flagged entity and '
         'determine it is not actionable, write an '
         f'`{MEM0_KIND_INVESTIGATION_OUTCOME}` mem0 record so the conclusion is durable '
@@ -557,7 +576,6 @@ def render_cycle_summary_section() -> str:
         f"  - stage='{stage}' -> recon_pool='{pool}'"
         for stage, pool in CYCLE_SUMMARY_STAGE_TO_RECON_POOL.items()
     )
-    deleters_str = ', '.join(f'`{deleter}`' for deleter in MEM0_TOMBSTONE_DELETERS)
     return (
         '## Per-Cycle Summary\n'
         'Python writes exactly one per-cycle summary memory per stage, '
@@ -588,7 +606,7 @@ def render_cycle_summary_section() -> str:
         'The Mem0 record is a best-effort searchable copy; the AUTHORITATIVE '
         'record is the ReconLedgerStore cycle_summary row — check it with '
         '`get_cycle_summary_presence`, never by looking for the mirror.\n\n'
-        f'Deletes performed by these named sweeps — {deleters_str} — leave a '
+        f'Deletes performed by these named sweeps — {format_mem0_tombstone_deleters()} — leave a '
         "TOMBSTONE, returned by `get_memory_by_id` on its not-found branch as "
         "a `'tombstone'` key naming the sweep that deleted the record "
         '(`deleter`), the run that performed the deletion (`deleting_run_id`), '
@@ -796,8 +814,9 @@ def render_task_creation_accounting_section() -> str:
         'no new task id: count it under `tasks_combined`, never under '
         '`tasks_created`.\n\n'
         'Confirmation rule: see `## Verifying Task Operations` above for the '
-        'full rule, including its `get_task`-verified fallback for a status '
-        'other than `created`/`combined`/`failed`. Only the '
+        'full rule, including its `get_task`-verified fallback for an '
+        'unrecognised status, and its rule that an open status (`pending`, '
+        '`awaiting_curation`) counts toward neither tally. Only the '
         '`resolve_ticket`-confirmed subset of that rule — `status` `created` '
         'or `combined` WITH a `task_id` — is machine-countable via the '
         'action record below; never record on the `submit_task` call '
@@ -915,24 +934,58 @@ class Violation:
     detail: str
 
 
-# Tempered-dot gap that refuses to cross a negation cue (not/never/n't)
-# OR a clause terminator (./;) between a rule's subject and verb — used in
-# place of a bare `[^.]*` wildcard so:
+# Positions the gaps of the marker rule may not span — the gap between its
+# subject and verb, and between its verb and marker — so that:
 #   (a) a CORRECTLY negated statement (e.g. "Stage 3 remediation does NOT
-#       delete the flag marker") does not match as a false-premise
-#       violation. premise_lint exists to flag FALSE premises; a true
-#       statement of the invariant — even phrased as a negation — is not
-#       one, and matching it anyway would be a false positive that rejects
-#       a correct task description once wired at task ξ.
-#   (b) the gap does not span across unrelated clauses in a multi-clause
-#       field. Without the `.`/`;` exclusion, a benign description like
-#       "Stage 3 processes the flag_for_stage2 marker; GC later deletes
-#       the marker on terminal task" would spuriously match ("Stage 3" ...
-#       "deletes" ... "marker") even though the sentence never asserts the
-#       false premise — the "Stage 3" and "deletes" clauses are unrelated.
-#       Stopping the gap at a clause terminator keeps subject/verb/object
-#       matches confined to a single clause.
-_GAP_NO_NEGATION = r"(?:(?!\bnot\b|\bnever\b|n['’]t\b|[.;]).)*"
+#       delete the flag marker") does not match. premise_lint exists to flag
+#       FALSE premises; a true statement of the invariant, even phrased as a
+#       negation, is not one, and matching it would reject a correct task.
+#   (b) a match stays inside one clause. Without the terminators, "Stage 3
+#       processes the flag_for_stage2 marker; GC later deletes the marker on
+#       terminal task" would match "Stage 3" ... "deletes" ... "marker"
+#       across two unrelated clauses.
+# A newline is a terminator, but one INSIDE a subject or marker name
+# ("Stage\n3", "flag\nmarker") does not end the clause: only gaps are checked.
+# Zero-width, so every stop is found, however close together.
+_GAP_STOP = re.compile(r"(?=\bnot\b|\bnever\b|n['’]t\b|[.;\n])", re.IGNORECASE)
+
+_NON_GC_DELETER = re.compile(r'stage\s*3|remediation|the\s+llm', re.IGNORECASE)
+_DELETION_VERB = re.compile(
+    r'\b(?:deletes?|removes?|clears?|purges?)\b', re.IGNORECASE
+)
+_MARKER_NOUN = re.compile(
+    r'\b(?:flag_for_stage2|flag\s+marker|stage1_flag_marker|marker)\b',
+    re.IGNORECASE,
+)
+
+
+# One pass per pattern, then a gap [a, b) is clean iff a and b fall in the
+# same clause, numbered by the stops before them.
+def _asserts_non_gc_marker_deletion(text: str) -> bool:
+    stops = [stop.start() for stop in _GAP_STOP.finditer(text)]
+
+    def clause_of(position: int) -> int:
+        return bisect_left(stops, position)
+
+    first_deleter_end: dict[int, int] = {}
+    for deleter in _NON_GC_DELETER.finditer(text):
+        first_deleter_end.setdefault(clause_of(deleter.end()), deleter.end())
+    last_marker_start = {
+        clause_of(marker.start()): marker.start()
+        for marker in _MARKER_NOUN.finditer(text)
+    }
+    for verb in _DELETION_VERB.finditer(text):
+        deleter_end = first_deleter_end.get(clause_of(verb.start()))
+        marker_start = last_marker_start.get(clause_of(verb.end()))
+        if (
+            deleter_end is not None
+            and deleter_end <= verb.start()
+            and marker_start is not None
+            and marker_start >= verb.end()
+        ):
+            return True
+    return False
+
 
 # What a clearance claim must be ABOUT for the probe rules below to fire.
 # Without it, an unrelated task reporting "the flaky test did not reproduce"
@@ -1126,13 +1179,7 @@ _PREMISE_RULES: tuple[tuple[Callable[[str], object], str, str], ...] = (
         ),
     ),
     (
-        re.compile(
-            r'(?:stage\s*3|remediation|the\s+llm)' + _GAP_NO_NEGATION
-            + r'\b(?:deletes?|removes?|clears?|purges?)\b'
-            + _GAP_NO_NEGATION + r'\b(?:flag_for_stage2|flag\s+marker|'
-            r'stage1_flag_marker|marker)\b',
-            re.IGNORECASE,
-        ).search,
+        _asserts_non_gc_marker_deletion,
         'markers_deleted_only_by_gc',
         (
             'Per-task markers (stage1_flag_marker, flag_for_stage2, '

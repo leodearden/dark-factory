@@ -7,25 +7,23 @@ unavailable store is a flagged zero, never a bare one. That is the mechanism
 behind the return brief's "every claim re-checked at generation time and
 timestamped": an unstamped claim is unrepresentable.
 
-The runs.db figures are ``orchestrator.digest``'s own readers, called directly
-(they import cleanly under the scripts env). They fail open to a zero that
-cannot be told from a true zero, so each call is preceded by this module's
-probe of the store and of the tables its query reads, and followed by a look
-at what the reader swallowed: every failure it answers with a zero it first
-logs at WARNING with the exception attached, and that exception flags the
-figure ``unreadable``.
+The runs.db figures are the connection-taking query forms of
+``orchestrator.digest``'s readers (``query_count_done_in_window``,
+``query_model_role_rollup``), run over this module's own ``connect_ro``
+connection. The path-taking digest readers fail open to a zero that cannot be
+told from a true zero, so this module never calls them: a ``sqlite3.Error``
+from the open or the query flags the figure ``unreadable``, a missing table
+included, since the query names it.
 
 Read-only: every store is opened ``mode=ro`` and every queue is read through
 the unlocked scan helpers, so nothing here creates a file or a directory.
 """
 from __future__ import annotations
 
-import logging
 import sqlite3
 import statistics
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -33,34 +31,28 @@ from types import MappingProxyType
 from typing import Generic, Literal, TypeVar
 
 from _task_db_scan import (
-    TABLE_NAMES_SQL,
-    TaskDbProblem,
-    TaskDbUnreadable,
-    connect_ro,
     runs_db_path,
     tasks_db_path,
 )
+from escalation.authority import HOST_FILER_ROLES
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths
 from escalation.shadow_ruling import AgreementReport, ClassAgreement, agreement_report
-from orchestrator.digest import ModelRoleRow, count_done_in_window, model_role_rollup
-from orchestrator.digest import logger as digest_log
+from orchestrator.digest import ModelRoleRow, query_count_done_in_window, query_model_role_rollup
 from orchestrator.session_registry import (
     DecisionRecord,
     DecisionState,
     decisions_dir,
     normalize_escalations_dir,
-    normalize_project_token,
 )
+from shared.project_id import fold_project_token
+from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable, connect_ro
 from sitting import inventory, payloads
 from sitting.inventory import QUEUE_SUBDIRS, PendingRecords, Shortfall
 from sitting.payloads import RejectedMarker
 
 Status = Literal['ok', 'source_missing', 'unreadable']
 STATUSES: tuple[Status, ...] = ('ok', 'source_missing', 'unreadable')
-
-LANDED_TABLES = ('events',)
-SPEND_TABLES = ('events', 'invocations', 'task_results')
 
 NO_OPEN_ESCALATION = 'blocked with no open escalation'
 UNKNOWN_OPEN_ESCALATIONS = 'open escalations unknown: no queue of this project was read'
@@ -139,6 +131,20 @@ class OpenEscalation:
         root = inventory.queue_project_root(self.queue_dir)
         queue = self.queue_dir if root is None else str(Path(self.queue_dir).relative_to(root))
         return f'{self.escalation_id} ({self.category}, L{self.level}, {age}, {queue})'
+
+
+@dataclass(frozen=True)
+class HostAlarm:
+    """A pending record a host filer raised (``authority.HOST_FILER_ROLES``): the host needs a human at any level."""
+
+    escalation_id: str
+    queue_dir: str
+    project: str
+    level: int
+    severity: str
+    agent_role: str
+    age_days: float | None
+    summary: str
 
 
 @dataclass(frozen=True)
@@ -251,14 +257,14 @@ def project_queue_dirs(project_root: Path | str) -> tuple[str, ...]:
 
 
 def landed(runs_db: Path | str, window: Window, *, now: datetime) -> Measurement[int]:
-    """Tasks completed ``done`` in *window*, per ``orchestrator.digest.count_done_in_window``."""
-    return _from_runs_db(Path(runs_db), LANDED_TABLES, 0, lambda db: count_done_in_window(db, *window.iso()), now)
+    """Tasks completed ``done`` in *window*, per ``orchestrator.digest.query_count_done_in_window``."""
+    return _from_runs_db(Path(runs_db), 0, lambda conn: query_count_done_in_window(conn, *window.iso()), now)
 
 
 def spend_and_cap_hits(runs_db: Path | str, window: Window, *, now: datetime) -> Measurement[tuple[ModelRoleRow, ...]]:
-    """Per-(model, role) cost, cap-hit rate and $/done, per ``orchestrator.digest.model_role_rollup``."""
+    """Per-(model, role) cost, cap-hit rate and $/done, per ``orchestrator.digest.query_model_role_rollup``."""
     return _from_runs_db(
-        Path(runs_db), SPEND_TABLES, (), lambda db: tuple(model_role_rollup(db, *window.iso()).rows), now,
+        Path(runs_db), (), lambda conn: tuple(query_model_role_rollup(conn, *window.iso()).rows), now,
     )
 
 
@@ -314,6 +320,40 @@ def autonomous_closes(decisions_root: Path | str, window: Window, *, now: dateti
     return Measurement(closes, stamp, str(registry), 'ok', tuple(shortfalls))
 
 
+def host_alarms(pending: Mapping[str, PendingRecords], *, now: datetime) -> Measurement[tuple[HostAlarm, ...]]:
+    """Every pending host-filer record of any level in the inventory's own root-tier parse, oldest first.
+
+    A root record that could not be read is a shortfall: it may be an alarm.
+    """
+    stamp = _stamp(now)
+    if not pending:
+        missing = Shortfall('escalation_queue', 'none', 'no escalation queue was scanned')
+        return Measurement((), stamp, 'escalation queues', 'source_missing', (missing,))
+    alarms = sorted(
+        (_host_alarm(queue_dir, esc, now)
+         for queue_dir, records in pending.items()
+         for escs in records.by_task.values()
+         for esc in escs
+         if esc.agent_role in HOST_FILER_ROLES),
+        key=lambda alarm: (alarm.age_days is None, -(alarm.age_days or 0.0), alarm.queue_dir, alarm.escalation_id),
+    )
+    unreadable = tuple(shortfall for records in pending.values() for shortfall in records.unreadable)
+    return Measurement(tuple(alarms), stamp, ', '.join(pending), 'ok', unreadable)
+
+
+def _host_alarm(queue_dir: str, esc: Escalation, now: datetime) -> HostAlarm:
+    return HostAlarm(
+        escalation_id=esc.id,
+        queue_dir=queue_dir,
+        project=inventory.queue_project(queue_dir),
+        level=esc.level,
+        severity=esc.severity,
+        agent_role=esc.agent_role,
+        age_days=inventory.age_days(esc.timestamp, now),
+        summary=' '.join(esc.summary.split()),
+    )
+
+
 def standing_policy_rulings(
     queue_dirs: Iterable[str], window: Window, *, now: datetime,
 ) -> Measurement[StandingPolicyRulings]:
@@ -350,7 +390,7 @@ def measure_projects(
     _stamp(now)
     by_project: dict[str, list[Path | str]] = defaultdict(list)
     for root in project_roots:
-        by_project[normalize_project_token(Path(root).name)].append(root)
+        by_project[fold_project_token(Path(root).name)].append(root)
     return MappingProxyType({
         project: _measure_project(project, roots[0], _fold_collisions(project, roots), pending, window, now)
         for project, roots in by_project.items()
@@ -382,75 +422,22 @@ def _refusal(store: str, path: Path, exc: TaskDbUnreadable | sqlite3.Error) -> R
     return 'unreadable', Shortfall(store, str(path), str(exc))
 
 
-def _from_runs_db(runs_db: Path, tables: Sequence[str], empty: T, read: Callable[[Path], T], now: datetime) -> Measurement[T]:
+def _from_runs_db(runs_db: Path, empty: T, read: Callable[[sqlite3.Connection], T], now: datetime) -> Measurement[T]:
     stamp = _stamp(now)
-    refusal = _probe_runs_db(runs_db, tables)
-    if refusal is None:
-        with _swallowed_by_digest() as swallowed:
-            value = read(runs_db)
-        refusal = _read_refusal(runs_db, swallowed)
-        if refusal is None:
-            return Measurement(value, stamp, str(runs_db), 'ok')
-    status, shortfall = refusal
-    return Measurement(empty, stamp, str(runs_db), status, (shortfall,))
-
-
-class _ExceptionCollector(logging.Handler):
-    def __init__(self) -> None:
-        super().__init__(logging.WARNING)
-        self.caught: list[BaseException] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        if record.exc_info and record.exc_info[1] is not None:
-            self.caught.append(record.exc_info[1])
-
-
-@contextmanager
-def _swallowed_by_digest() -> Iterator[list[BaseException]]:
-    """The exceptions ``orchestrator.digest``'s readers catch and log while the block runs.
-
-    When logging is disabled outright those logs never happen, so the list
-    starts with a note saying the read cannot be vouched for.
-    """
-    collector = _ExceptionCollector()
-    saved_level = digest_log.level
-    digest_log.setLevel(min(digest_log.getEffectiveLevel(), logging.WARNING))
-    digest_log.addHandler(collector)
-    if not digest_log.isEnabledFor(logging.WARNING):
-        collector.caught.append(RuntimeError('logging is disabled, so a failed read cannot be told from a zero'))
     try:
-        yield collector.caught
-    finally:
-        digest_log.removeHandler(collector)
-        digest_log.setLevel(saved_level)
-
-
-def _read_refusal(runs_db: Path, swallowed: Sequence[BaseException]) -> Refusal | None:
-    """Why the digest's answer cannot be stood behind, or None when it can."""
-    if not runs_db.exists():
-        return 'source_missing', Shortfall('runs_db', str(runs_db), 'vanished during the read')
-    if swallowed:
-        return 'unreadable', Shortfall('runs_db', str(runs_db),
-                                       '; '.join(f'{type(exc).__name__}: {exc}' for exc in swallowed))
-    return None
-
-
-def _probe_runs_db(runs_db: Path, tables: Sequence[str]) -> Refusal | None:
-    """Why *runs_db* cannot answer a query over *tables*, or None when it can."""
-    try:
-        conn = connect_ro(runs_db)
+        value = _read_runs_db(runs_db, read)
     except (TaskDbUnreadable, sqlite3.Error) as exc:
-        return _refusal('runs_db', runs_db, exc)
+        status, shortfall = _refusal('runs_db', runs_db, exc)
+        return Measurement(empty, stamp, str(runs_db), status, (shortfall,))
+    return Measurement(value, stamp, str(runs_db), 'ok')
+
+
+def _read_runs_db(runs_db: Path, read: Callable[[sqlite3.Connection], T]) -> T:
+    conn = connect_ro(runs_db)
     try:
-        present = {name for (name,) in conn.execute(TABLE_NAMES_SQL)}
-    except sqlite3.Error as exc:
-        return _refusal('runs_db', runs_db, exc)
+        return read(conn)
     finally:
         conn.close()
-    missing = [table for table in tables if table not in present]
-    if missing:
-        return 'unreadable', Shortfall('runs_db', str(runs_db), f'no {", ".join(missing)} table')
-    return None
 
 
 def _blocked_tasks(db: Path) -> dict[str, str] | Refusal:
@@ -490,7 +477,7 @@ def _autonomous_close(record: DecisionRecord) -> AutonomousClose:
     return AutonomousClose(
         decision_id=record.id,
         escalation_id=record.escalation_id,
-        project=normalize_project_token(record.project),
+        project=fold_project_token(record.project),
         state=str(record.state),
         filed_at=record.filed_at,
         closed_at=record.closed_at,

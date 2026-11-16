@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import threading
 import uuid
@@ -10,13 +9,13 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _dead_letter_helpers import journaled_events, parked_queue, seed_dead_letters
 
 from fused_memory.models.reconciliation import (
     EventSource,
     EventType,
     ReconciliationEvent,
 )
-from fused_memory.reconciliation.event_journal import EventJournal
 from fused_memory.reconciliation.event_queue import EventQueue
 from fused_memory.server.tools import (
     _DEAD_LETTER_PAYLOAD_MAX_BYTES,
@@ -180,24 +179,6 @@ def _make_recon_event(project_id: str) -> ReconciliationEvent:
     )
 
 
-def _make_failing_buf() -> AsyncMock:
-    """A mock EventBuffer whose push raises non-retriable ValueError."""
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=ValueError('schema mismatch'))
-    return buf
-
-
-def _make_parked_buf(released: asyncio.Event) -> AsyncMock:
-    """A mock EventBuffer whose push parks until *released* is set — holds the drainer still."""
-
-    async def _park(_event):
-        await released.wait()
-
-    buf = AsyncMock()
-    buf.push = AsyncMock(side_effect=_park)
-    return buf
-
-
 # ── step-11 tests ──────────────────────────────────────────────────────────
 
 
@@ -208,27 +189,9 @@ class TestGetDeadLettersEventQueue:
     async def test_event_queue_items_filtered_by_project_id(self, tmp_path):
         """Items from event_queue filtered by project_id; each has required fields."""
         dl = tmp_path / 'dl.jsonl'
-        buf = _make_failing_buf()
-        eq = EventQueue(
-            buf,
-            dead_letter_path=dl,
-            maxsize=100,
-            retry_initial_seconds=0.01,
-            retry_max_seconds=0.05,
-            shutdown_flush_seconds=1.0,
-        )
-        await eq.start()
-        try:
-            # Enqueue 3 events for proj-a, 2 for proj-b
-            for _ in range(3):
-                eq.enqueue(_make_recon_event('proj-a'))
-            for _ in range(2):
-                eq.enqueue(_make_recon_event('proj-b'))
-            # Wait for drainer to dead-letter all of them
-            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
-            assert eq.stats()['dead_letters'] == 5
-        finally:
-            await eq.close()
+        seed_dead_letters(dl, [_make_recon_event('proj-a') for _ in range(3)])
+        seed_dead_letters(dl, [_make_recon_event('proj-b') for _ in range(2)])
+        eq = EventQueue(AsyncMock(), dead_letter_path=dl)
 
         svc = AsyncMock()
         svc.durable_queue = None
@@ -255,24 +218,9 @@ class TestGetDeadLettersEventQueue:
     async def test_event_queue_merges_with_durable_queue_without_project_id(self, tmp_path):
         """Without project_id, items from both sources appear in the result."""
         dl = tmp_path / 'dl2.jsonl'
-        buf = _make_failing_buf()
-        eq = EventQueue(
-            buf,
-            dead_letter_path=dl,
-            maxsize=100,
-            retry_initial_seconds=0.01,
-            retry_max_seconds=0.05,
-            shutdown_flush_seconds=1.0,
-        )
-        await eq.start()
-        try:
-            for _ in range(3):
-                eq.enqueue(_make_recon_event('proj-a'))
-            for _ in range(2):
-                eq.enqueue(_make_recon_event('proj-b'))
-            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
-        finally:
-            await eq.close()
+        seed_dead_letters(dl, [_make_recon_event('proj-a') for _ in range(3)])
+        seed_dead_letters(dl, [_make_recon_event('proj-b') for _ in range(2)])
+        eq = EventQueue(AsyncMock(), dead_letter_path=dl)
 
         svc = _make_mock_service(get_dead_items_return=_FAKE_DEAD_ITEMS)
         server = create_mcp_server(svc, event_queue=eq)
@@ -357,40 +305,21 @@ class TestGetDeadLettersPayloadTruncation:
     @pytest.mark.asyncio
     async def test_large_event_queue_payload_is_truncated(self, tmp_path):
         """Event-queue items with large payloads are also truncated and flagged."""
-        import json as _json
-
         dl = tmp_path / 'dl.jsonl'
-        big_payload = {'blob': 'x' * 5000}
-        event = _make_recon_event('proj-trunc')
-        # Manually write a record with an oversized payload into the JSONL file.
-        record = {
-            'event': {
-                **event.model_dump(mode='json'),
-                'payload': big_payload,
-            },
-            'reason': 'non_retriable',
-            'attempts': 1,
-            'failed_at': '2026-01-01T00:00:00+00:00',
-        }
-        dl.write_text(_json.dumps(record) + '\n')
+        event = _make_recon_event('proj-trunc').model_copy(
+            update={'payload': {'blob': 'x' * 5000}},
+        )
+        seed_dead_letters(dl, [event])
+        eq = EventQueue(AsyncMock(), dead_letter_path=dl)
 
-        # Use start/close symmetry so the test is resilient to future init
-        # changes in EventQueue (drainer task lifecycle etc.).  No events are
-        # enqueued — the queue drains immediately on close.
-        buf = AsyncMock()
-        eq = EventQueue(buf, dead_letter_path=dl)
-        await eq.start()
-        try:
-            svc = AsyncMock()
-            svc.durable_queue = None
-            server = create_mcp_server(svc, event_queue=eq)
+        svc = AsyncMock()
+        svc.durable_queue = None
+        server = create_mcp_server(svc, event_queue=eq)
 
-            result = await server._tool_manager.call_tool(
-                'get_dead_letters',
-                {'project_id': 'proj-trunc'},
-            )
-        finally:
-            await eq.close()
+        result = await server._tool_manager.call_tool(
+            'get_dead_letters',
+            {'project_id': 'proj-trunc'},
+        )
 
         items = result['items']
         assert len(items) == 1
@@ -762,25 +691,9 @@ class TestGetStatusToolDeadLetters:
     async def test_get_status_includes_event_queue_dead_letter_count(self, tmp_path):
         """event_queue dead-letters for a project are counted in dead_letters."""
         dl_path = tmp_path / 'dl.jsonl'
-        buf = _make_failing_buf()
-        eq = EventQueue(
-            buf,
-            dead_letter_path=dl_path,
-            maxsize=100,
-            retry_initial_seconds=0.01,
-            retry_max_seconds=0.05,
-            shutdown_flush_seconds=1.0,
-        )
-        await eq.start()
-        try:
-            for _ in range(3):
-                eq.enqueue(_make_recon_event('proj-a'))
-            for _ in range(2):
-                eq.enqueue(_make_recon_event('proj-b'))
-            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
-            assert eq.stats()['dead_letters'] == 5
-        finally:
-            await eq.close()
+        seed_dead_letters(dl_path, [_make_recon_event('proj-a') for _ in range(3)])
+        seed_dead_letters(dl_path, [_make_recon_event('proj-b') for _ in range(2)])
+        eq = EventQueue(AsyncMock(), dead_letter_path=dl_path)
 
         svc = _make_status_mock_service(queue_counts={'dead': 0})
         server = create_mcp_server(svc, event_queue=eq)
@@ -802,22 +715,8 @@ class TestGetStatusToolDeadLetters:
     async def test_get_status_dead_letters_total_matches_get_dead_letters(self, tmp_path):
         """get_status dead_letters.total equals len(get_dead_letters.items) for same project."""
         dl_path = tmp_path / 'dl.jsonl'
-        buf = _make_failing_buf()
-        eq = EventQueue(
-            buf,
-            dead_letter_path=dl_path,
-            maxsize=100,
-            retry_initial_seconds=0.01,
-            retry_max_seconds=0.05,
-            shutdown_flush_seconds=1.0,
-        )
-        await eq.start()
-        try:
-            for _ in range(3):
-                eq.enqueue(_make_recon_event('proj-a'))
-            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
-        finally:
-            await eq.close()
+        seed_dead_letters(dl_path, [_make_recon_event('proj-a') for _ in range(3)])
+        eq = EventQueue(AsyncMock(), dead_letter_path=dl_path)
 
         # Service reports 2 durable dead for proj-a; get_dead_letters returns 2 items
         svc = _make_status_mock_service(queue_counts={'dead': 2})
@@ -856,9 +755,9 @@ class TestReplayEventDeadLettersTool:
     async def test_replays_dead_lettered_events_back_into_queue(self, tmp_path):
         """With dead-lettered recon events present, the tool returns
         {'status':'replayed','replayed':3,'failed':0}, every replayed event is
-        durably back in the queue (journaled, observed with the drainer held
-        parked so the state is settled rather than raced), and the dead-letter
-        file no longer holds them.
+        durably back in the queue unchanged (journaled, observed with the
+        drainer parked so the state is settled rather than raced), and the
+        dead-letter file no longer holds them.
 
         Replayed events re-enter through the ordinary enqueue path, whose drainer
         commit is covered by
@@ -866,23 +765,10 @@ class TestReplayEventDeadLettersTool:
         """
         dl = tmp_path / 'dl.jsonl'
         ej = tmp_path / 'ej.db'
-        released = asyncio.Event()
-        buf = _make_parked_buf(released)
-        eq = EventQueue(
-            buf,
-            dead_letter_path=dl,
-            journal_path=ej,
-            maxsize=100,
-            retry_initial_seconds=0.01,
-            retry_max_seconds=0.05,
-            shutdown_flush_seconds=1.0,
-        )
-        await eq.start()
-        try:
+        async with parked_queue(dl, ej) as eq:
             # Seed 3 dead-letter records for proj-a directly.
             seeded = [_make_recon_event('proj-a') for _ in range(3)]
-            for event in seeded:
-                eq._write_dead_letter(event, reason='non_retriable', attempts=1)
+            seed_dead_letters(dl, seeded)
             assert len(dl.read_text().strip().splitlines()) == 3
 
             svc = AsyncMock()
@@ -896,20 +782,9 @@ class TestReplayEventDeadLettersTool:
             assert result == {'status': 'replayed', 'replayed': 3, 'failed': 0}, (
                 f'Unexpected replay result: {result}'
             )
-            reader = EventJournal(ej)
-            try:
-                journaled_ids = {e.id for e in reader.load_unprocessed()}
-            finally:
-                reader.close()
-            seeded_ids = {e.id for e in seeded}
-            assert journaled_ids == seeded_ids, (
-                f'journaled ids {journaled_ids} != replayed ids {seeded_ids}'
-            )
+            assert journaled_events(ej) == {e.id: e for e in seeded}
             # The dead-letter file no longer holds the replayed records.
             assert (dl.read_text().strip() if dl.exists() else '') == ''
-        finally:
-            released.set()
-            await eq.close()
 
     @pytest.mark.asyncio
     async def test_replay_enqueue_stays_on_loop_thread(self, tmp_path):
@@ -924,23 +799,8 @@ class TestReplayEventDeadLettersTool:
         post-fix (enqueue marshalled onto the loop).
         """
         dl = tmp_path / 'dl.jsonl'
-        released = asyncio.Event()
-        buf = _make_parked_buf(released)
-        eq = EventQueue(
-            buf,
-            dead_letter_path=dl,
-            journal_path=tmp_path / 'ej.db',
-            maxsize=100,
-            retry_initial_seconds=0.01,
-            retry_max_seconds=0.05,
-            shutdown_flush_seconds=1.0,
-        )
-        await eq.start()
-        try:
-            for _ in range(3):
-                eq._write_dead_letter(
-                    _make_recon_event('proj-a'), reason='non_retriable', attempts=1,
-                )
+        async with parked_queue(dl, tmp_path / 'ej.db') as eq:
+            seed_dead_letters(dl, [_make_recon_event('proj-a') for _ in range(3)])
 
             # Record the thread each put_nowait runs on. Patched AFTER start()
             # so recover()'s (loop-thread) puts are excluded — only the replay
@@ -973,9 +833,6 @@ class TestReplayEventDeadLettersTool:
                 'put_nowait was invoked off the event-loop thread during replay: '
                 f'loop={loop_thread_id} put_threads={put_threads}'
             )
-        finally:
-            released.set()
-            await eq.close()
 
     @pytest.mark.asyncio
     async def test_project_id_forwarded_to_event_queue(self, tmp_path):

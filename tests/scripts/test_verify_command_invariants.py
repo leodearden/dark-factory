@@ -62,6 +62,9 @@ import shlex
 
 import pytest
 import verify_command_invariants as vci
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Spelled as LITERALS on purpose, even though ``vci`` now exports the same three
 # strings. This file is the module's oracle, so it must be able to disagree with
@@ -432,6 +435,31 @@ def test_positional_targets_needs_no_entry_for_the_equals_spelling() -> None:
     """``--flag=value`` is one shlex token and the ``-`` prefix drops it whole."""
     segment = "uv run --project shared pytest tests/scripts/ --timeout=300 -q"
     assert vci.positional_targets(segment, _PYTEST) == ["tests/scripts/"]
+
+
+def test_pytest_value_flags_drop_the_separate_value_of_every_flag_either_guard_needed() -> None:
+    """One exported set covers what both former private copies listed.
+
+    Task 6172. ``test_skills_module_config_decision.py`` and
+    ``test_fallback_verify_config.py`` each kept their own set, and the second
+    lacked ``--junitxml``, ``--color`` and ``--log-level``, so it read those
+    flags' values as suites. This command carries flags from both copies,
+    including the three only the first had.
+    """
+    segment = (
+        "uv run --project shared pytest tests/scripts/ -k expr --junitxml out.xml "
+        "--color yes --log-level INFO -n 4 --dist loadgroup --timeout 300"
+    )
+    targets = vci.positional_targets(segment, _PYTEST, value_flags=vci.PYTEST_VALUE_FLAGS)
+    assert targets == ["tests/scripts/"]
+
+
+def test_pytest_value_flags_holds_no_boolean_flag() -> None:
+    """The dangerous direction: a listed boolean flag swallows a real target."""
+    booleans = {"-q", "-v", "-x", "-s", "-l", "--lf", "--ff", "--sw"}
+    assert booleans.isdisjoint(vci.PYTEST_VALUE_FLAGS), sorted(
+        booleans & vci.PYTEST_VALUE_FLAGS
+    )
 
 
 def test_positional_targets_threads_path_anchor_to_the_anchor_split() -> None:

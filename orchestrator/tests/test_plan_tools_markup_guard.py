@@ -60,6 +60,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_checkouts import git, main_checkout_with_lane
+from _markup_corpus import corpus_specimen
 from _markup_helpers import (
     INVOKE_CLOSER,
     LT,
@@ -187,7 +189,7 @@ class Harness:
 
     @property
     def plan_path(self) -> Path:
-        return self.artifacts.root / 'plan.json'
+        return self.artifacts.artifact_path('plan.json')
 
     def plan_bytes(self) -> bytes:
         return self.plan_path.read_bytes()
@@ -946,36 +948,12 @@ class TestEveryToolDeclaresTheOverrideParameter:
 # preserved verbatim in the escalation named above".
 
 #: The committed corpus of REAL leaked calls (task 3688, boundary row B13).
-CORPUS_PATH = (
-    Path(__file__).resolve().parents[2]
-    / 'shared' / 'tests' / 'fixtures' / 'toolcall_markup_corpus.jsonl'
-)
-
-
-def _specimen(tool_use_id: str) -> dict[str, Any]:
-    """The committed corpus record with this ``tool_use_id``.
-
-    Keyed by id rather than by index or by "the shortest one", so a corpus
-    refresh that adds records cannot silently repoint a test at a different
-    payload. Read as JSON, which is also how the raw envelope literals reach
-    this module WITHOUT appearing in its own source text — the corpus escapes
-    every one of them as ``\\u003c``.
-    """
-    for line in CORPUS_PATH.read_text(encoding='utf-8').splitlines():
-        if not line.strip():
-            continue
-        record = json.loads(line)
-        if record.get('tool_use_id') == tool_use_id:
-            return record
-    raise AssertionError(f'specimen {tool_use_id!r} is missing from {CORPUS_PATH}')
-
-
 #: A REAL ``add_design_decision.decision`` payload whose own boundary cannot be
 #: determined. A refusal is the one outcome an invented specimen can trivially
 #: fake — anything sufficiently mangled refuses — so the assertion that this
 #: guard never guesses is only worth something against input the harness really
 #: produced.
-UNREPAIRABLE_SPECIMEN = _specimen('toolu_01CX8okLpKgz5auenVYQzY23')
+UNREPAIRABLE_SPECIMEN = corpus_specimen('toolu_01CX8okLpKgz5auenVYQzY23')
 UNREPAIRABLE_DECISION: str = UNREPAIRABLE_SPECIMEN['value']
 
 #: What ``add_design_decision`` declares, as the middleware resolves it LIVE
@@ -1084,8 +1062,8 @@ def build_residue_rig(
 
     real_factory = plan_tools._markup_escalation_sink
 
-    def recording_factory(sink_artifacts: TaskArtifacts):
-        sink = real_factory(sink_artifacts)
+    def recording_factory(sink_artifacts: TaskArtifacts, loss_sink):
+        sink = real_factory(sink_artifacts, loss_sink)
 
         # ASYNC, because the real sink is: it does its blocking work on a
         # worker thread so a git subprocess and two fsync'd queue writes never
@@ -1249,11 +1227,11 @@ class TestUnrepairableResidueIsPreserved:
     ):
         """The record is filed under a NON-TASK anchor, and that is deliberate.
 
-        The middleware declares residue at ``level=2``, and a PENDING level>=2
-        escalation carrying a live task id is a stop-the-line event in this
-        repo: ``workflow._is_gating_escalation`` gates on ``level >= 2``,
+        The middleware declares residue at ``level=2``, and a PENDING non-info
+        level>=2 escalation carrying a live task id is a stop-the-line event in this
+        repo: ``workflow._is_gating_escalation`` gates on a non-info ``level >= 2``,
         ``_check_escalations`` looks records up by task id alone, and
-        ``_wait_for_resolution`` raises ``_StewardReescalated`` — which
+        ``_wait_for_resolution`` raises ``_NoStewardApplicable`` — which
         ``run()`` turns into ``_mark_blocked``.
 
         So filing under the leaking task's own id would turn ONE leaked tool
@@ -1429,7 +1407,7 @@ class TestUnrepairableResidueIsPreserved:
 #: A SECOND real unrepairable ``add_design_decision.decision`` payload, so
 #: "residue records never dedup" is asserted across two DISTINCT caller
 #: payloads rather than the same one twice.
-SECOND_UNREPAIRABLE_SPECIMEN = _specimen('toolu_0183rUJqrD3dMjmWAx71mKmP')
+SECOND_UNREPAIRABLE_SPECIMEN = corpus_specimen('toolu_0183rUJqrD3dMjmWAx71mKmP')
 SECOND_UNREPAIRABLE_DECISION: str = SECOND_UNREPAIRABLE_SPECIMEN['value']
 
 
@@ -1548,7 +1526,7 @@ class TestTheStormEscape:
                 'crossing_subject_agent_role': None,
                 'callers': [],
             },
-            plan_tools._MARKUP_SINK_SPEC,
+            plan_tools.MARKUP_SINK_SPEC,
         )
 
     def test_the_open_records_subject_reads_back_through_one_spelling(self):
@@ -1802,7 +1780,7 @@ class TestTheStormEscape:
                 'callers': [spoof],
             },
             'test-1',
-            plan_tools._MARKUP_SINK_SPEC,
+            plan_tools.MARKUP_SINK_SPEC,
         )
 
         assert spoof not in detail, 'the raw newline reached the body verbatim'
@@ -1914,13 +1892,6 @@ class TestTheStormEscape:
 # data exactly where this leaf promises none is lost.
 
 
-def _git(*args: str, cwd: Path) -> None:
-    """Run one git command in *cwd*, failing loudly."""
-    subprocess.run(
-        ['git', *args], cwd=str(cwd), check=True, capture_output=True, text=True,
-    )
-
-
 class TestWhereTheRecordLands:
     """``_markup_project_root`` decides which queue every record reaches."""
 
@@ -1932,7 +1903,7 @@ class TestWhereTheRecordLands:
         """
         checkout = tmp_path / 'repo'
         checkout.mkdir()
-        _git('init', cwd=checkout)
+        git('init', cwd=checkout)
 
         assert plan_tools._markup_project_root(checkout) == checkout.resolve()
 
@@ -1944,13 +1915,7 @@ class TestWhereTheRecordLands:
         would answer with the lane itself, filing each record into a directory
         that is deleted when the lane is reset.
         """
-        checkout = tmp_path / 'repo'
-        checkout.mkdir()
-        _git('init', cwd=checkout)
-        _git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit',
-             '--allow-empty', '-m', 'root', cwd=checkout)
-        lane = tmp_path / 'lane'
-        _git('worktree', 'add', str(lane), '-b', 'task/1', cwd=checkout)
+        checkout, lane = main_checkout_with_lane(tmp_path)
 
         assert plan_tools._markup_project_root(lane) == checkout.resolve()
         assert plan_tools._markup_project_root(lane) != lane.resolve()
@@ -2091,7 +2056,7 @@ class TestAnUnrecognisedRecordKindIsStillFiled:
         monkeypatch.setattr(
             plan_tools, '_escalation_channel', lambda root: (Escalation, queue)
         )
-        sink = plan_tools._markup_escalation_sink(artifacts)
+        sink = plan_tools._markup_escalation_sink(artifacts, _RecordingArm())
 
         esc_id = await sink({
             'error_type': 'mcp_markup_something_new',
@@ -2405,13 +2370,11 @@ class _RecordingArm:
 def _compose(monkeypatch, artifacts, journal: _RecordingArm, stamp: _RecordingArm):
     """Build ``_markup_fact_sink`` over two fake arms.
 
-    Substitutes the module-level SEAMS rather than reaching into the built
-    sink, which is the convention ``_markup_escalation_sink`` and
-    ``_markup_fact_journal`` already keep on this module.
+    The journal is handed in, as ``create_server`` hands in the one it shares
+    with the escalation sink; the stamp is substituted at its module-level seam.
     """
-    monkeypatch.setattr(plan_tools, '_markup_fact_journal', lambda _a: journal)
     monkeypatch.setattr(plan_tools, '_markup_plan_stamp', lambda _a: stamp)
-    return plan_tools._markup_fact_sink(artifacts)
+    return plan_tools._markup_fact_sink(artifacts, journal)
 
 
 class TestTheFactSinkFansOutToBothChannels:
@@ -2516,10 +2479,9 @@ class TestTheTwoArmsAreIsolatedFromEachOther:
             order.append('stamp')
             return 'plan.json'
 
-        monkeypatch.setattr(plan_tools, '_markup_fact_journal', lambda _a: journal)
         monkeypatch.setattr(plan_tools, '_markup_plan_stamp', lambda _a: stamp)
 
-        await plan_tools._markup_fact_sink(artifacts)({'tool': 'add_design_decision'})
+        await plan_tools._markup_fact_sink(artifacts, journal)({'tool': 'add_design_decision'})
 
         assert order == ['journal', 'stamp']
 

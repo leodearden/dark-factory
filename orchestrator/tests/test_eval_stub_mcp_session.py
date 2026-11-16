@@ -451,7 +451,14 @@ class TestBuildEvalScheduler:
         """
         from orchestrator.config import OrchestratorConfig
 
-        config = OrchestratorConfig()
+        # task 4481: max_per_module pinned rather than inherited.  The
+        # contention this test stages exists only at limit 1 — the docstring
+        # and the comment below both already say so — but the value was being
+        # read from dark-factory-orchestrator.yaml, where an operator raising
+        # it (the fleet runs 8) makes the expansion SUCCEED and the assertion
+        # invert.  Matches the suite-wide OrchestratorConfig(max_per_module=1)
+        # idiom.
+        config = OrchestratorConfig(max_per_module=1)
         scheduler, stub = _build_eval_scheduler(
             config, 'task-99', ['some_module']
         )

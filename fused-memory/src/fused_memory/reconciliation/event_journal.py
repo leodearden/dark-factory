@@ -30,8 +30,10 @@ its blocking dead-letter *file* I/O to an ``asyncio.to_thread`` worker; the
 re-enqueue — and therefore every ``append``/``mark_processed`` it triggers — is
 marshalled back onto the loop thread (see
 ``EventQueue._resolve_replay_enqueue``), because the in-memory ``asyncio.Queue``
-that ``enqueue`` mutates is not thread-safe. So the connection is never touched
-off the loop thread. ``check_same_thread=False`` is retained as
+that ``enqueue`` mutates is not thread-safe. A dead-letter hand-off releases its
+row from a loop callback, scheduled only after the dead-letter writer thread
+reports the record written (``event_queue.py::_release_row_once_written``). So
+the connection is never touched off the loop thread. ``check_same_thread=False`` is retained as
 defence-in-depth — Python's ``sqlite3`` serializes connection access internally
 under its default thread-safe build — not because any current path requires it.
 """

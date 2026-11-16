@@ -608,7 +608,7 @@ async def run(
             record = await memory_service.get_memory_by_id(
                 project_id=project_id, memory_id=target.memory_id,
             )
-        except Exception as exc:  # noqa: BLE001 -- unknown is not absent
+        except Exception as exc:  # unknown is not absent
             logger.warning(
                 'amend_stale_resume_cwd_records: read FAILED for %s: %r',
                 target.memory_id, exc,
@@ -742,17 +742,13 @@ async def _apply_amendments(
     try:
         assert_store_mutation_allowed(
             operation='amend_stale_resume_cwd_records --apply',
+            logger=logger,
+            extra_detail=(
+                'an amendment would rewrite a record and then fail to journal the '
+                'change. Nothing was written.'
+            ),
         )
     except StoreMutationUnavailable as exc:
-        logger.error(
-            'amend_stale_resume_cwd_records: --apply NOT started (fail-closed) '
-            "-- this process cannot write mem0's history directory, so an "
-            'amendment would rewrite a record and then fail to journal the '
-            'change. Nothing was written. Re-run from the fused-memory MCP '
-            "server's environment or an unsandboxed operator shell; to obtain "
-            'the report safely from anywhere, re-run without --apply. (%r)',
-            exc,
-        )
         return [
             {**d, 'action': 'refuse:store_unavailable', 'error': str(exc)}
             if d['action'] == 'amend' else d
@@ -804,7 +800,7 @@ async def _apply_amendments(
             fresh = await memory_service.get_memory_by_id(
                 project_id=project_id, memory_id=target.memory_id,
             )
-        except Exception as exc:  # noqa: BLE001 -- unknown is not absent
+        except Exception as exc:  # unknown is not absent
             logger.warning(
                 'amend_stale_resume_cwd_records: pre-write re-read FAILED '
                 'for %s: %r -- NOT writing',
@@ -861,7 +857,7 @@ async def _apply_amendments(
                 agent_id=WRITE_SOURCE,
                 _source=WRITE_SOURCE,
             )
-        except Exception as exc:  # noqa: BLE001 -- report, never propagate
+        except Exception as exc:  # report, never propagate
             logger.warning(
                 'amend_stale_resume_cwd_records: write RAISED for %s: %r',
                 target.memory_id, exc,
@@ -951,14 +947,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.config:
-        import os  # noqa: PLC0415
+        import os
         os.environ['CONFIG_PATH'] = str(args.config)
 
     async def _run_live() -> int:
         # Deferred so importing this module for tests never touches config or
         # a backend (mirrors tag_cgl_eta_rehome_scope.main).
-        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+        from fused_memory.config.schema import FusedMemoryConfig
+        from fused_memory.services.memory_service import MemoryService
 
         memory = MemoryService(FusedMemoryConfig())
         await memory.initialize()

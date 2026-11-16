@@ -105,8 +105,9 @@ logger = logging.getLogger(__name__)
 # What none of that changed: the semantics are byte-for-byte the ones this
 # module has always had — fail-closed on a literal boolean True only,
 # dict-or-JSON-string tolerant, never raising, and stripped NON-mutatingly in
-# the caller's own shape before dispatch. shared/tests/test_toolcall_markup.py
-# pins both the semantics and this re-export.
+# the caller's own shape before dispatch.
+# shared/tests/test_toolcall_markup_override.py pins both the semantics and
+# this re-export.
 
 # Storm thresholds are plain module constants rather than FusedMemoryConfig
 # fields, following the _PLACEHOLDER_DROP_STORM_* precedent (harness.py:200-215):

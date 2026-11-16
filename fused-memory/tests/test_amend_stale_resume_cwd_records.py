@@ -12,7 +12,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from _fm_helpers import load_script_module
-from _store_mutation_preflight_contract import deny, neutralise_fixture
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'amend_stale_resume_cwd_records.py'
@@ -445,7 +450,7 @@ def _memory_service(contents: dict[str, str] | None = None) -> AsyncMock:
 
     service = AsyncMock()
 
-    async def _get(*, project_id, memory_id):  # noqa: ARG001
+    async def _get(*, project_id, memory_id):
         if memory_id not in contents:
             return None
         return {'id': memory_id, 'content': contents[memory_id], 'metadata': {}}
@@ -551,7 +556,7 @@ class TestRunDryRun:
 
     @pytest.mark.asyncio
     async def test_dry_run_over_an_amendable_corpus_reports_amend_but_applies_nothing(
-        self, write_capable_targets,  # noqa: ARG002
+        self, write_capable_targets,
     ):
         # The same path with something actually to do: the report says 'amend'
         # and the applied flags stay False. This is what makes the dry run a
@@ -666,12 +671,12 @@ class TestPreWriteRecorroboration:
         contents = {t.memory_id: t.expected_preimage for t in _mod.AMEND_TARGETS}
         service = AsyncMock()
 
-        async def _get(*, project_id, memory_id):  # noqa: ARG001
+        async def _get(*, project_id, memory_id):
             if memory_id not in contents:
                 return None
             return {'id': memory_id, 'content': contents[memory_id], 'metadata': {}}
 
-        async def _update(*, memory_id, **kwargs):  # noqa: ARG001
+        async def _update(*, memory_id, **kwargs):
             if memory_id == STALE_ID:
                 contents[WARNING_ID] = new_content
             return {'status': 'updated', 'store': 'mem0'}
@@ -726,7 +731,7 @@ class TestPreWriteRecorroboration:
             calls.append(('read', memory_id))
             return await served(project_id=project_id, memory_id=memory_id)
 
-        async def _tracked_update(*, memory_id, **kwargs):  # noqa: ARG001
+        async def _tracked_update(*, memory_id, **kwargs):
             calls.append(('write', memory_id))
             return {'status': 'updated'}
 
@@ -782,7 +787,7 @@ class TestApplyStoreMutationPreflight:
         )
         service = _memory_service()
 
-        async def _update(**kwargs):  # noqa: ARG001
+        async def _update(**kwargs):
             order.append('write')
             return {'status': 'updated'}
 
@@ -831,6 +836,18 @@ class TestApplyStoreMutationPreflight:
         ]
         assert all(c['applied'] is False for c in report['changes'])
         assert report['totals']['refused'] == 2
+
+    @pytest.mark.asyncio
+    async def test_refused_preflight_logs_exactly_one_fail_closed_diagnosis(
+        self, monkeypatch, caplog,
+    ):
+        deny(_mod, monkeypatch)
+
+        with caplog.at_level('ERROR'):
+            await _mod.run(_memory_service(), project_id='dark_factory', apply=True)
+
+        (record,) = fail_closed_records(caplog, 'amend_stale_resume_cwd_records')
+        assert SENTINEL in record.getMessage()
 
 
 @pytest.mark.usefixtures('write_capable_targets')

@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _workflow_helpers import _Fixture, _make
 
+from orchestrator.config import DeliveredChecksConfig
 from orchestrator.workflow import WorkflowOutcome
 
 _CITATION = 'citationsha123'
@@ -166,6 +167,26 @@ class TestFallbackStampsTheTasksOwnCitation:
         assert kwargs['pattern_template'] == f.wf.git_ops.config.commit_citation_pattern
         assert kwargs['delivered_checks'] == checks
         assert 'candidate_sha' not in kwargs
+
+    @pytest.mark.parametrize('enabled', [True, False])
+    async def test_forwards_the_projects_delivered_checks_leaf(
+        self, tmp_path: Path, guard: _Guard, note: str, tip: str, enabled: bool,
+    ) -> None:
+        """The kill switch reaches the validator from the project config,
+        because a real ``GitOps.config`` cannot carry it."""
+        f = _fixture(tmp_path)
+        f.wf.config.delivered_checks = DeliveredChecksConfig(enabled=enabled)
+        checks = [{'name': 'cap-x', 'kind': 'grep', 'pattern': 'y', 'expect': 'present'}]
+        f.wf.task['metadata'] = {'delivered_checks': checks}
+        validate = AsyncMock(return_value=SimpleNamespace(
+            accepted=False, evidence_sha=None, reason='no_citation',
+        ))
+
+        with patch(_VALIDATE_TARGET, validate):
+            await guard(f)
+
+        assert validate.await_args is not None
+        assert validate.await_args.kwargs['checks_enabled'] is enabled
 
     async def test_the_real_validation_asks_git_about_the_tasks_branch(
         self, tmp_path: Path, guard: _Guard, note: str, tip: str,

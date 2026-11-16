@@ -18,7 +18,7 @@ from escalation.dedupe import compute_content_fingerprint
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreUnpopulated
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'backfill_recon_escalations.py'
 
@@ -770,7 +770,7 @@ class TestSafetyAndCli:
 
     def test_cli_main_dry_run_emits_json(self, tmp_path: Path, capsys) -> None:
         """main() with no --apply prints JSON report to stdout."""
-        import sys as _sys  # noqa: PLC0415
+        import sys as _sys
 
         _submit_esc(EscalationQueue(tmp_path), _esc())
         old_argv = _sys.argv
@@ -787,7 +787,7 @@ class TestSafetyAndCli:
 
     def test_cli_apply_flag(self, tmp_path: Path, capsys) -> None:
         """main() with --apply sets dry_run=False in the report."""
-        import sys as _sys  # noqa: PLC0415
+        import sys as _sys
 
         queue = EscalationQueue(tmp_path)
         base_ts = datetime(2026, 1, 1, tzinfo=UTC)
@@ -831,11 +831,11 @@ class TestRunTargetStorePreflight:
 
     def test_dry_run_refuses_a_missing_queue_dir(self, tmp_path: Path) -> None:
         """The DRY RUN refuses too: its report is exactly as false as an apply."""
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             run(tmp_path / 'data' / 'reconciliation' / 'escalations', apply=False)
 
     def test_apply_refuses_a_missing_queue_dir(self, tmp_path: Path) -> None:
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             run(tmp_path / 'data' / 'reconciliation' / 'escalations', apply=True)
 
     @pytest.mark.parametrize('apply', [False, True])
@@ -843,7 +843,7 @@ class TestRunTargetStorePreflight:
         """The queue was never constructed, so the ``mkdir`` never happened."""
         target = tmp_path / 'data' / 'reconciliation' / 'escalations'
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             run(target, apply=apply)
 
         assert not target.exists()
@@ -860,7 +860,7 @@ class TestRunTargetStorePreflight:
         count, which ``resolve_exit_code`` grades as a clean 0 — reproducing
         the very defect the guard exists to fix.
         """
-        import sys as _sys  # noqa: PLC0415
+        import sys as _sys
 
         target = tmp_path / 'data' / 'reconciliation' / 'escalations'
         if create_empty_dir:
@@ -868,7 +868,7 @@ class TestRunTargetStorePreflight:
         old_argv = _sys.argv
         try:
             _sys.argv = ['backfill_recon_escalations.py', '--queue-dir', str(target)]
-            with pytest.raises(TargetStoreMissing):
+            with pytest.raises(TargetStoreUnpopulated):
                 _mod.main()
         finally:
             _sys.argv = old_argv
@@ -878,7 +878,7 @@ class TestRunTargetStorePreflight:
 
         The predicate is pinned in test_target_store_preflight.py::TestQueueDirArm.
         """
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             run(tmp_path, apply=False)
 
 

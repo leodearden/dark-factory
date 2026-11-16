@@ -4,7 +4,7 @@ MCP response (task 3142, PRD leaf pi).
 The harm in reify esc-5603-1 was five false GRAPHITI EDGES extracted from one
 episode. A tag that lived only on the tool's return dict would have labelled
 none of them. So the tag rides the identical channel `temporal_context` does:
-add_episode parameter -> durable-queue payload key -> '[unverified_claim] '
+add_episode parameter -> durable-queue value field -> '[unverified_claim] '
 source_description prefix on the Graphiti episodic node, and (see the Mem0 half
 below) metadata['unverified_claim']=True on every derived fact.
 
@@ -18,9 +18,11 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _queued_write_fixtures import enqueued, envelope, episode_write, mem0_fact, queued
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.services.memory_service import MemoryService
+from fused_memory.services.queued_writes import QueuedGraphitiMemoryWrite, QueuedMem0Fact
 
 
 @pytest.fixture
@@ -106,30 +108,22 @@ class TestGraphitiBackendUnverifiedClaimTag:
 
 
 class TestExecuteGraphitiWriteUnverifiedClaim:
-    """The flag is popped off the queue payload alongside temporal_context and
-    reference_time, and forwarded to the backend."""
+    """The queued value's flag is forwarded to the backend alongside temporal_context and
+    reference_time."""
 
     @pytest.mark.asyncio
     async def test_flag_in_payload_is_forwarded(self, service):
         await service._execute_graphiti_write(
-            'add_episode', _graphiti_payload(unverified_claim=True),
+            queued('add_episode', _graphiti_payload(unverified_claim=True)),
         )
 
         assert service.graphiti.add_episode.call_args[1]['unverified_claim'] is True
 
     @pytest.mark.asyncio
     async def test_absent_flag_forwards_false(self, service):
-        await service._execute_graphiti_write('add_episode', _graphiti_payload())
+        await service._execute_graphiti_write(queued('add_episode', _graphiti_payload()))
 
         assert service.graphiti.add_episode.call_args[1]['unverified_claim'] is False
-
-    @pytest.mark.asyncio
-    async def test_flag_is_popped_not_left_on_the_payload(self, service):
-        payload = _graphiti_payload(unverified_claim=True)
-
-        await service._execute_graphiti_write('add_episode', payload)
-
-        assert 'unverified_claim' not in payload
 
 
 class TestAddEpisodeEnqueuesTheFlag:
@@ -141,15 +135,15 @@ class TestAddEpisodeEnqueuesTheFlag:
             unverified_claim=True,
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['unverified_claim'] is True
+        value = service.durable_queue.enqueue.call_args.args[0]
+        assert value.unverified_claim is True
 
     @pytest.mark.asyncio
     async def test_default_is_false_on_the_payload(self, service):
         await service.add_episode(content='ordinary note', project_id='dark_factory')
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['unverified_claim'] is False
+        value = service.durable_queue.enqueue.call_args.args[0]
+        assert value.unverified_claim is False
 
 
 class TestMem0HalfCarriesTheTag:
@@ -164,13 +158,19 @@ class TestMem0HalfCarriesTheTag:
         service._refresh_entity_summaries_from_result = AsyncMock()
 
         await service._dual_write_callback(
-            'dual_write_episode', result,
-            {'project_id': 'dark_factory', 'unverified_claim': True},
+            episode_write(
+                envelope=envelope(project_id='dark_factory', group_id='dark_factory'),
+                unverified_claim=True,
+            ),
+            result,
         )
 
-        batch = service.durable_queue.enqueue_batch.call_args[0][0]
+        batch = enqueued(service.durable_queue.enqueue_batch)
         assert batch
-        assert all(item['payload']['unverified_claim'] is True for item in batch)
+        assert all(
+            isinstance(value, QueuedMem0Fact) and value.unverified_claim is True
+            for value, _callback in batch
+        )
 
     @pytest.mark.asyncio
     async def test_tagged_fact_is_stamped_on_the_mem0_record(self, service):
@@ -186,8 +186,7 @@ class TestMem0HalfCarriesTheTag:
         classification.primary = next(iter(MEM0_PRIMARY))
 
         await service._execute_mem0_classify_and_add(
-            {'fact_text': 'the fix has been applied', 'project_id': 'dark_factory',
-             'unverified_claim': True},
+            mem0_fact(fact_text='the fix has been applied', unverified_claim=True),
         )
 
         metadata = service.mem0.add.call_args[1]['metadata']
@@ -205,7 +204,7 @@ class TestMem0HalfCarriesTheTag:
         service.classifier.classify = AsyncMock(return_value=classification)
 
         await service._execute_mem0_classify_and_add(
-            {'fact_text': 'an ordinary note', 'project_id': 'dark_factory'},
+            mem0_fact(fact_text='an ordinary note'),
         )
 
         metadata = service.mem0.add.call_args[1]['metadata']
@@ -226,9 +225,9 @@ class TestAddMemoryCarriesTheFlag:
             unverified_claim=True,
         )
 
-        call = service.durable_queue.enqueue.call_args[1]
-        assert call['operation'] == 'add_memory_graphiti'
-        assert call['payload']['unverified_claim'] is True
+        value = service.durable_queue.enqueue.call_args.args[0]
+        assert isinstance(value, QueuedGraphitiMemoryWrite)
+        assert value.unverified_claim is True
 
     @pytest.mark.asyncio
     async def test_graph_bound_default_is_false_on_the_payload(self, service):
@@ -238,8 +237,8 @@ class TestAddMemoryCarriesTheFlag:
             project_id='dark_factory',
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['unverified_claim'] is False
+        value = service.durable_queue.enqueue.call_args.args[0]
+        assert value.unverified_claim is False
 
     @pytest.mark.asyncio
     async def test_the_flag_survives_the_queue_round_trip(self, service):
@@ -249,9 +248,9 @@ class TestAddMemoryCarriesTheFlag:
             project_id='dark_factory',
             unverified_claim=True,
         )
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
+        value = service.durable_queue.enqueue.call_args.args[0]
 
-        await service._execute_graphiti_write('add_memory_graphiti', payload)
+        await service._execute_graphiti_write(value)
 
         assert service.graphiti.add_episode.call_args.kwargs['unverified_claim'] is True
 
@@ -289,8 +288,8 @@ class TestAddMemoryCarriesTheFlag:
             unverified_claim=True,
         )
 
-        payload = service.durable_queue.enqueue.call_args[1]['payload']
-        assert payload['unverified_claim'] is True
+        value = service.durable_queue.enqueue.call_args.args[0]
+        assert value.unverified_claim is True
         metadata = service.mem0.add.call_args.kwargs['metadata']
         assert metadata['unverified_claim'] is True
 
