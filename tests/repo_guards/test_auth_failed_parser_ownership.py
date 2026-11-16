@@ -150,10 +150,8 @@ class TestSingleResetsParserOwnership:
     WHAT IS MECHANICALLY ENFORCED, stated exactly so the claim and the scan
     cannot drift apart: across EVERY workspace member's `<pkg>/src` tree, no
     module but the owner may define either name at module level or call either
-    bare name; and `orchestrator/src/orchestrator/usage_gate.py` — the shim
-    that used to re-export both — may not bind either name. Test trees,
-    `scripts/` and prose anywhere are deliberately NOT scanned: a copy in one
-    of those cannot reach production.
+    bare name. Test trees, `scripts/` and prose anywhere are deliberately NOT
+    scanned: a copy in one of those cannot reach production.
 
     Task 4042 moved the fabricating `usage_gate._parse_resets_at` fork's ONE
     live call site — `_handle_auth_failure` — onto the non-fabricating
@@ -238,53 +236,6 @@ class TestSingleResetsParserOwnership:
             'surface task 4357 removed, and the copy that used to live in '
             'shared/src/shared/usage_gate.py fabricated `now + 1h` on parse '
             'failure.'
-        )
-
-    def test_orchestrator_shim_does_not_reexport_the_retired_names(self, first_party_tree):
-        """The orchestrator shim is public-surface-only.
-
-        `shared.usage_gate.__all__` lists no underscore names, so the star
-        import cannot reintroduce these — only an explicit re-export tuple
-        could, which is how they used to survive there.
-
-        An AST scan of the FILE rather than `import orchestrator.usage_gate`
-        + `hasattr`, for two independent reasons. (1) Layering: `shared/`
-        must not import `orchestrator/` (program decision #4 — the same note
-        appears in `test_server_error.py` and
-        `test_invocation_outcome_boundary.py`). (2) That import is not even
-        available here: verify runs `cd shared && uv run pytest` FIRST in its
-        chain, which syncs the workspace venv down to `shared`'s own
-        dependencies, so `orchestrator` is not installed and the import
-        raises `ModuleNotFoundError` — the guard would go red for a reason
-        with nothing to do with what it guards, and go green again only if
-        some earlier command happened to leave an `--all-packages` venv
-        behind. Reading the source keeps the assertion true of the file,
-        which is what "does not re-export" actually means. The AST walked is
-        the session's shared one (`first_party_tree`).
-        """
-        shim_rel = 'orchestrator/src/orchestrator/usage_gate.py'
-        shim = next((r for r in first_party_tree if r.relpath == shim_rel), None)
-        assert shim is not None, (
-            f'orchestrator usage_gate shim missing from the shared tree: {shim_rel}'
-        )
-        assert shim.tree is not None, f'{shim_rel} does not parse: {shim.syntax_error}'
-        bound: set[str] = set()
-        for node in shim.tree.body:
-            if isinstance(node, ast.Import | ast.ImportFrom):
-                # A `from ... import *` alias is literally named '*' and binds
-                # nothing statically — it cannot reintroduce these two, since
-                # shared.usage_gate.__all__ lists no underscore names.
-                bound.update(alias.asname or alias.name for alias in node.names)
-            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                bound.add(node.name)
-            elif isinstance(node, ast.Assign):
-                bound.update(t.id for t in node.targets if isinstance(t, ast.Name))
-        leaked = sorted(bound & set(_OWNED_NAMES))
-        assert leaked == [], (
-            f'orchestrator/src/orchestrator/usage_gate.py re-exports {leaked}. '
-            f'Both live ONLY in {_STRICT_PARSE_OWNER}; re-exporting them from a '
-            'second module is what let the retired fabricating fork stay '
-            'importable.'
         )
 
     def test_shared_tree_spans_every_production_src_root(self, first_party_tree):

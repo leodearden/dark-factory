@@ -34,6 +34,7 @@ from _workflow_helpers import (
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import outcome_allows_status
+from shared.usage_gate import SessionBudgetExhausted
 
 from orchestrator import session_registry
 from orchestrator.agents.invoke import AgentResult
@@ -6802,8 +6803,6 @@ class TestSessionBudgetExhaustionEscalation:
         self, config, git_ops, task_assignment, monkeypatch, tmp_path
     ):
         """L1 escalation summary carries budget limit and cost-spent figures."""
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -6863,8 +6862,6 @@ class TestSessionBudgetExhaustionEscalation:
         Before step-4 impl, the detail defaults to the summary string (no separate
         detail is passed to _mark_blocked), so the metric-label assertions fail.
         """
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
@@ -6930,8 +6927,6 @@ class TestFirstInvocationBudgetExhaustion:
           (iii) detail contains 'last_completed_role=n/a'  (new label + default fallback)
           (iv)  summary contains 'last completed role: n/a'  (new summary wording)
         """
-        from orchestrator.usage_gate import SessionBudgetExhausted
-
         stub = AgentStub()
         config.usage_cap.session_budget_usd = 0.10
         workflow, _, queue = _build_workflow_with_escalation(
