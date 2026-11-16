@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -32,6 +32,7 @@ from orchestrator.flake_report import (
     compute_non_convergence,
     compute_systemic,
     corroborate_owners,
+    render_report,
 )
 
 NOW = datetime(2026, 11, 16, 12, 0, 0, tzinfo=UTC)
@@ -239,3 +240,129 @@ class TestCorroborateOwners:
         out = await corroborate_owners(report, reader)
         assert reader.calls == []
         assert out.owner_read is None
+
+
+def _corroborated(
+    rows: list[DebtRow], read: OwnerStatuses | OwnerReadFailed | None,
+) -> FlakeLedgerReport:
+    """A report carrying *read*, its counter recomputed the way corroborate_owners does."""
+    return replace(
+        _report(rows),
+        owner_read=read,
+        non_convergence=compute_non_convergence(
+            rows, NOW, age_days=5,
+            owner_statuses=read if isinstance(read, OwnerStatuses) else None,
+        ),
+    )
+
+
+def _open_debt_lines(rendered: str) -> list[str]:
+    lines = rendered.splitlines()
+    return lines[lines.index('OPEN DEBT') + 2:lines.index('RECURRENCE CHAINS') - 1]
+
+
+def _row_line(rendered: str, test_id: str) -> str:
+    (line,) = [ln for ln in _open_debt_lines(rendered) if test_id in ln]
+    return line
+
+
+_DONE_MARKER = 'OWNER DONE, DEBT CYCLE NOT CLOSED (invariant breach)'
+_CLOSED_MARKER = 'OWNER CANCELLED OR GONE (invariant breach)'
+_SPECIMEN_6286 = (
+    'tests/test_api_curator_cancel.py::'
+    'test_two_url_all_unreachable_invalidates_each_session_in_order'
+)
+_SPECIMEN_6291 = (
+    'scripts/tests/test_lms_healthcheck.py::'
+    'test_a_vllm_shaped_null_prompt_tokens_details_still_produces_both_latencies'
+)
+
+
+class TestOwnerLivenessRendering:
+    MIXED = [
+        _row('t/done_a', '101'),
+        _row('t/done_b', '102'),
+        _row('t/cancelled', '103'),
+        _row('t/gone', '104'),
+        _row('t/pending', '105'),
+        _row('t/deferred', '106'),
+    ]
+    MIXED_READ = OwnerStatuses({
+        '101': 'done', '102': 'done', '103': 'cancelled', '105': 'pending', '106': 'deferred',
+    })
+
+    def test_the_acceptance_specimens_render_as_done_owner_breaches(self):
+        rows = [_row(_SPECIMEN_6286, '6286'), _row(_SPECIMEN_6291, '6291')]
+        rendered = render_report(
+            _corroborated(rows, OwnerStatuses({'6286': 'done', '6291': 'done'})),
+        )
+        for test_id, owner in ((_SPECIMEN_6286, '6286'), (_SPECIMEN_6291, '6291')):
+            line = _row_line(rendered, test_id)
+            assert f'owner={owner}' in line, line
+            assert _DONE_MARKER in line, line
+        assert 'owner_done=2' in rendered, rendered
+        assert [ln for ln in rendered.splitlines()
+                if 'WARNING' in ln and '2 row(s)' in ln and 'DONE de-flake task' in ln], rendered
+
+    def test_cancelled_and_omitted_owners_render_as_closed_owner_breaches(self):
+        rows = [_row('t/cancelled', '103'), _row('t/gone', '104')]
+        rendered = render_report(_corroborated(rows, OwnerStatuses({'103': 'cancelled'})))
+        assert _CLOSED_MARKER in _row_line(rendered, 't/cancelled')
+        assert _CLOSED_MARKER in _row_line(rendered, 't/gone')
+        assert 'owner_closed=2' in rendered, rendered
+
+    def test_a_deferred_owner_is_a_note_and_a_pending_owner_is_plain(self):
+        rendered = render_report(_corroborated(self.MIXED, self.MIXED_READ))
+        deferred = _row_line(rendered, 't/deferred')
+        assert '(deferred' in deferred, deferred
+        assert 'invariant breach' not in deferred, deferred
+        pending = _row_line(rendered, 't/pending')
+        assert 'owner=105' in pending, pending
+        assert '***' not in pending and '(deferred' not in pending, pending
+
+    def test_the_row_markers_and_the_counts_never_disagree(self):
+        report = _corroborated(self.MIXED, self.MIXED_READ)
+        rows = _open_debt_lines(render_report(report))
+        assert report.non_convergence.owner_done_tests == 2
+        assert report.non_convergence.owner_closed_tests == 2
+        assert len([ln for ln in rows if 'OWNER DONE' in ln]) == 2
+        assert len([ln for ln in rows if 'OWNER CANCELLED OR GONE' in ln]) == 2
+
+    def test_owners_not_consulted_say_so_and_mark_no_row(self):
+        rendered = render_report(_corroborated(self.MIXED, None))
+        assert 'owner_done=n/a' in rendered and 'owner_closed=n/a' in rendered, rendered
+        assert [ln for ln in rendered.splitlines() if 'owner liveness: not consulted' in ln]
+        assert not [ln for ln in _open_debt_lines(rendered) if '***' in ln or '(deferred' in ln]
+
+    def test_a_failed_read_says_so_and_marks_no_row(self):
+        rendered = render_report(
+            _corroborated(self.MIXED, OwnerReadFailed('RuntimeError: fm down')),
+        )
+        assert [ln for ln in rendered.splitlines()
+                if 'owner liveness: READ FAILED (RuntimeError: fm down)' in ln], rendered
+        assert 'owner_done=n/a' in rendered and 'owner_closed=n/a' in rendered, rendered
+        assert not [ln for ln in _open_debt_lines(rendered) if '***' in ln or '(deferred' in ln]
+
+    def test_a_successful_read_names_how_many_owners_it_read(self):
+        rows = [_row('t/a', '101'), _row('t/b', '102'), _row('t/c', '101')]
+        rendered = render_report(
+            _corroborated(rows, OwnerStatuses({'101': 'pending', '102': 'pending'})),
+        )
+        assert [ln for ln in rendered.splitlines()
+                if 'owner liveness: read live (2 owner(s))' in ln], rendered
+
+    def test_an_unowned_row_renders_as_before_whatever_the_read_says(self):
+        rows = [_row('t/orphan', None), _row('t/filing', None), _row('t/owned', '101')]
+        report = _corroborated(rows, OwnerStatuses({'101': 'done'}))
+        report = replace(report, open_debt=[
+            replace(r, pending_since='2026-11-16T11:00:00+00:00')
+            if r.debt.test_id == 't/filing' else r
+            for r in report.open_debt
+        ])
+        rendered = render_report(report)
+        assert '*** NO OWNER (invariant breach) ***' in _row_line(rendered, 't/orphan')
+        assert 'filing pending since' in _row_line(rendered, 't/filing')
+
+    def test_a_corroborated_render_is_byte_deterministic(self):
+        report = _corroborated(self.MIXED, self.MIXED_READ)
+        assert render_report(report) == render_report(report)
