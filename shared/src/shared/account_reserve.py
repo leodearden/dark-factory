@@ -8,13 +8,21 @@ and nothing here logs or does I/O.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
 from typing import TypeAlias
 
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+
 __all__ = [
+    'DEFAULT_ADMIT_TIERS',
+    'AdmitTiers',
+    'ReserveConfig',
     'ReserveEvent',
+    'WeeklyReset',
     'WorkClass',
     'WorkClassSource',
     'WorkKind',
@@ -59,3 +67,105 @@ class ReserveEvent(StrEnum):
     SERVED = 'reserve_served'
     SCHEDULE_DRIFT = 'reserve_schedule_drift'
     ACCOUNT_UNAVAILABLE = 'reserve_account_unavailable'
+
+
+def _as_utc(instant: datetime) -> datetime:
+    if instant.tzinfo is None:
+        raise ValueError(f'expected a timezone-aware datetime, got {instant!r}')
+    return instant.astimezone(UTC)
+
+
+_WEEKDAY_NAMES = ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun')
+_WEEKLY_RESET_TEXT = re.compile(r'([a-z]{3})\s+(\d{1,2}):(\d{2})')
+
+
+@dataclass(frozen=True)
+class WeeklyReset:
+    """A weekly instant in UTC; ``weekday`` counts as ``datetime.weekday()`` does (0 is Monday)."""
+
+    weekday: int
+    time_utc: time
+
+    def __post_init__(self) -> None:
+        if self.weekday not in range(len(_WEEKDAY_NAMES)):
+            raise ValueError(f'weekday must be 0 (Monday) to 6 (Sunday), got {self.weekday!r}')
+        if self.time_utc.tzinfo is not None:
+            raise ValueError(f'time_utc is UTC and carries no tzinfo, got {self.time_utc!r}')
+
+    @classmethod
+    def parse(cls, text: str) -> WeeklyReset:
+        refusal = (
+            f'weekly_reset_utc must be a weekday and HH:MM in UTC, like "mon 21:00"; got {text!r}'
+        )
+        match = _WEEKLY_RESET_TEXT.fullmatch(text.strip().lower())
+        if match is None:
+            raise ValueError(refusal)
+        day, hour, minute = match.groups()
+        try:
+            return cls(_WEEKDAY_NAMES.index(day), time(int(hour), int(minute)))
+        except ValueError:
+            raise ValueError(refusal) from None
+
+    def __str__(self) -> str:
+        return f'{_WEEKDAY_NAMES[self.weekday]} {self.time_utc:%H:%M}'
+
+    def next_after(self, instant: datetime) -> datetime:
+        """The first reset strictly after ``instant``."""
+        now = _as_utc(instant)
+        days_ahead = timedelta(days=(self.weekday - now.weekday()) % 7)
+        candidate = datetime.combine(now.date() + days_ahead, self.time_utc, tzinfo=UTC)
+        return candidate if candidate > now else candidate + timedelta(days=7)
+
+
+DEFAULT_ADMIT_TIERS: tuple[str, ...] = ('critical', 'high')
+
+
+class AdmitTiers(BaseModel):
+    """The tiers admitted in the protected window: ``default``, or a list keyed by project_id."""
+
+    model_config = ConfigDict(frozen=True, extra='allow')
+    __pydantic_extra__: dict[str, tuple[str, ...]] = Field(init=False)
+
+    default: tuple[str, ...] = DEFAULT_ADMIT_TIERS
+
+    def for_project(self, project_id: str | None) -> tuple[str, ...]:
+        if project_id is None:
+            return self.default
+        return self.__pydantic_extra__.get(project_id, self.default)
+
+
+class ReserveConfig(BaseModel):
+    """The accounts file's ``reserve:`` block (PRD §6.2), and the weekly calendar it implies.
+
+    Windows are half-open: the release window is ``[release_at, next_reset)`` and the protected
+    window begins at the reset instant itself.
+    """
+
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    account: str = Field(min_length=1)
+    weekly_reset_utc: WeeklyReset
+    release_hours: int = Field(gt=0, lt=168, strict=True)
+    admit_tiers: AdmitTiers = Field(default_factory=AdmitTiers)
+
+    @field_validator('weekly_reset_utc', mode='plain')
+    @classmethod
+    def _parse_weekly_reset(cls, value: object) -> WeeklyReset:
+        if isinstance(value, WeeklyReset):
+            return value
+        if isinstance(value, str):
+            return WeeklyReset.parse(value)
+        raise ValueError(f'weekly_reset_utc must be text like "mon 21:00", got {value!r}')
+
+    @field_serializer('weekly_reset_utc')
+    def _write_weekly_reset(self, value: WeeklyReset) -> str:
+        return str(value)
+
+    def next_reset(self, now: datetime) -> datetime:
+        return self.weekly_reset_utc.next_after(now)
+
+    def release_at(self, now: datetime) -> datetime:
+        return self.next_reset(now) - timedelta(hours=self.release_hours)
+
+    def in_release_window(self, now: datetime) -> bool:
+        return self.release_at(now) <= _as_utc(now)
