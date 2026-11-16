@@ -455,8 +455,6 @@ def test_the_readiness_bound_clears_the_measured_first_start_with_headroom(
 ) -> None:
     """``_READY_TIMEOUT_S`` must clear the worst first start on record by the headroom factor.
 
-    The factor is
-    ``shared/src/shared/testing_timeout_headroom.py::UNDER_LOAD_HEADROOM_FACTOR``.
     The anchor is a failure-path figure, and it still bounds the happy path: a
     successful start does every step the failed one did, then lifespan startup
     and a handshake.

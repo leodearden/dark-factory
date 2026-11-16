@@ -1,7 +1,6 @@
 """The headroom a per-test timeout ceiling keeps over its family's measured-under-load worst case, held where every package's tests can import it.
 
-A pure-stdlib leaf like every ``shared.testing_*`` module, registered in
-``shared/tests/test_pure_stdlib_leaves.py``.
+A pure-stdlib leaf, registered in ``shared/tests/test_pure_stdlib_leaves.py``.
 """
 
 from __future__ import annotations
