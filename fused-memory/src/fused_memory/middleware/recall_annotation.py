@@ -5,13 +5,15 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
 from fused_memory.memory_metadata import is_completion_record
-from fused_memory.middleware.task_facts import TaskRef
+from fused_memory.middleware.task_facts import Lookup, TaskFacts, TaskRef
 from fused_memory.models.memory import MemoryResult
 from fused_memory.utils.canonical_labels import Referent, parse_node_name, scan_content
+from fused_memory.utils.clip_disclosure import fit_at_word
 from fused_memory.utils.validation import canonicalize_project_id
 
 __all__ = [
@@ -19,8 +21,10 @@ __all__ = [
     'MAX_TASKS',
     'Binding',
     'BoundTask',
+    'FactsUnavailable',
     'TaskBindings',
     'bind_tasks',
+    'render_task_facts',
 ]
 
 MAX_TASKS = 40
@@ -153,3 +157,122 @@ def _merge(links: Sequence[tuple[str, _Link]]) -> list[BoundTask]:
         )
         for ref in ordered
     ]
+
+
+@dataclass(frozen=True)
+class FactsUnavailable:
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason:
+            raise ValueError(f'FactsUnavailable.reason must be non-empty, got {self.reason!r}')
+
+
+_TITLE_LIMIT = 60
+_ITEM_JOIN = ' · '
+
+
+def render_task_facts(
+    bindings: TaskBindings,
+    facts: Mapping[TaskRef, TaskFacts] | FactsUnavailable,
+    *,
+    project_id: str,
+    read_at: datetime,
+) -> str:
+    """The C4 briefing block for *bindings*, or '' when there is nothing to report."""
+    if read_at.tzinfo is None or read_at.utcoffset() is None:
+        raise ValueError(f'render_task_facts needs an aware read_at, got {read_at!r}')
+    if isinstance(facts, FactsUnavailable):
+        return f'**Live task status** could not be read from the task store: {facts.reason}'
+    missing = [bound.ref for bound in bindings.tasks if bound.ref not in facts]
+    if missing:
+        raise ValueError(f'render_task_facts has no facts for bound refs {missing!r}')
+    project = canonicalize_project_id(project_id)
+    lines = [
+        *_group_lines(bindings.tasks, facts, project),
+        *_trailing_lines(bindings),
+    ]
+    if not lines:
+        return ''
+    return '\n'.join([_header(read_at), *lines])
+
+
+def _header(read_at: datetime) -> str:
+    return (
+        f'**Live task status** (read from the task store at {read_at.astimezone(UTC):%H:%M}Z; '
+        'status words inside the memory text below are history)'
+    )
+
+
+def _group_lines(
+    tasks: Sequence[BoundTask], facts: Mapping[TaskRef, TaskFacts], project: str,
+) -> Iterator[str]:
+    by_status: dict[str, list[str]] = {}
+    mentioned: list[str] = []
+    no_such: list[str] = []
+    unchecked: list[str] = []
+    for bound in tasks:
+        fact = facts[bound.ref]
+        label = _label(bound.ref, project)
+        if fact.lookup is Lookup.NO_SUCH_TASK:
+            no_such.append(label)
+        elif fact.lookup is Lookup.COULD_NOT_CHECK:
+            unchecked.append(f'{label} ({fact.reason})')
+        elif bound.binding is Binding.STRUCTURAL:
+            by_status.setdefault(str(fact.status), []).append(_found_item(fact, project))
+        else:
+            mentioned.append(f'{_titled(label, fact.title)} ({fact.status})')
+    for status, items in by_status.items():
+        yield _line(status, items)
+    for heading, items in (
+        ('mentioned in the text only, check the title', mentioned),
+        ('no such task', no_such),
+        ('could not check', unchecked),
+    ):
+        if items:
+            yield _line(heading, items)
+
+
+def _found_item(fact: TaskFacts, project: str) -> str:
+    item = _titled(_label(fact.ref, project), fact.title) + _finished(fact)
+    if fact.waits_on:
+        waits = ', '.join(f'{_label(ref, project)} ({status})' for ref, status in fact.waits_on)
+        item += f', waits on {waits}'
+    return item
+
+
+def _finished(fact: TaskFacts) -> str:
+    parts: list[str] = []
+    if fact.finished_how:
+        parts.append(fact.finished_how.replace('_', ' '))
+    if fact.finished_commit:
+        parts.append(fact.finished_commit[:10])
+    return f' ({" ".join(parts)})' if parts else ''
+
+
+def _titled(label: str, title: str | None) -> str:
+    return label if title is None else f'{label} "{fit_at_word(title, _TITLE_LIMIT)}"'
+
+
+def _label(ref: TaskRef, project: str) -> str:
+    return ref.task_id if ref.project_id == project else f'{ref.project_id}:{ref.task_id}'
+
+
+def _line(heading: str, items: Sequence[str]) -> str:
+    return f'- {heading}: {_ITEM_JOIN.join(items)}'
+
+
+def _trailing_lines(bindings: TaskBindings) -> Iterator[str]:
+    if bindings.ambiguous:
+        yield f'- ambiguous, not looked up: {", ".join(bindings.ambiguous)}'
+    overflow: list[str] = []
+    if bindings.omitted_tasks:
+        overflow.append(_count(bindings.omitted_tasks, 'more task', 'more tasks'))
+    if bindings.results_not_scanned:
+        overflow.append(_count(bindings.results_not_scanned, 'result not scanned', 'results not scanned'))
+    if overflow:
+        yield f'- not shown: {"; ".join(overflow)}'
+
+
+def _count(n: int, singular: str, plural: str) -> str:
+    return f'{n} {singular if n == 1 else plural}'
