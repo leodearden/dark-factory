@@ -548,8 +548,8 @@ class TestMeasureDetectorArm:
         assert (row.auc.n_true, row.auc.n_hard_negative) == (1, 1)
 
 
-def _row(name='arm-a', *, hits=3, total=4, flagged=3, auc=0.85, auc_lo=0.81, recall_lo=0.76,
-         precision_lo=0.91, threshold=0.5):
+def _row(name='arm-a', *, hits=3, total=4, flagged=3, auc: float | None = 0.85, auc_lo=0.81,
+         recall_lo=0.76, precision_lo=0.91, threshold: float | None = 0.5):
     m = _mod()
     return m.DetectorRow(
         arm=name, arm_class='local_cross_encoder', model='fake/model', granularity='full_text',
