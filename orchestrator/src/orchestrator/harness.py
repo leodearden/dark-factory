@@ -108,6 +108,7 @@ from orchestrator.background_service import (
     LifecycleRegistry,
     ManagedService,
 )
+from orchestrator.born_at_l2 import BornAtL2Alarm, file_deduped_born_at_l2
 from orchestrator.chain_telemetry import ChainTelemetry
 from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
 from orchestrator.config import (
@@ -9793,68 +9794,64 @@ class Harness:
     # disabled) — the dedup contract from plans/escalation-l2-tiering.md.
     _WATCHER_OUTAGE_SENTINEL: str = '__watcher_supervisor__'
     _WATCHER_OUTAGE_ROOT_CAUSE: str = 'watcher_supervisor_down'
+    _WATCHER_OUTAGE_ALARM: ClassVar[BornAtL2Alarm] = BornAtL2Alarm(
+        root_cause=_WATCHER_OUTAGE_ROOT_CAUSE,
+        task_id=_WATCHER_OUTAGE_SENTINEL,
+        role='orchestrator-watcher-supervisor',
+        category=EscalationCategory.INFRA_ISSUE,
+        suggested_action='investigate_watcher_supervisor',
+        created_reason='watcher-supervisor-outage',
+    )
+
+    def _file_deduped_born_at_l2(
+        self, alarm: BornAtL2Alarm, *, summary: str, detail: str,
+    ) -> None:
+        """File *alarm* through born_at_l2.py::file_deduped_born_at_l2 with this
+        harness's queue, event store and filing identity.
+
+        The getattr reads exist for the same ``__new__``-fixture reason as
+        :attr:`_filing_claimant_run_id`.
+        """
+        file_deduped_born_at_l2(
+            getattr(self, '_escalation_queue', None),
+            alarm,
+            summary=summary,
+            detail=detail,
+            event_store=getattr(self, 'event_store', None),
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
 
     def _file_watcher_outage_l2(self, reason: str) -> None:
         """File an L2 outage escalation when the watcher subsystem is not running.
 
-        Mirrors _file_scheduler_pause_escalation (L1 helper) but targets the
-        human L2 stream because a watcher outage means no-one is handling L1s.
-
-        Dedup: find_pending_l2_by_root_cause(root_cause) returns early when an
-        open L2 with the same root_cause already exists, so multiple trips
-        (e.g. crashloop + cost-ceiling simultaneously) file exactly one L2.
-
-        Best-effort: a missing queue (bare-Harness tests) or any filing failure
-        is swallowed so this never breaks the supervisor / cost-ceiling /
-        startup paths.
+        A watcher outage means no-one is triaging L1s, so it goes to the human
+        L2 stream.  One root cause keys every trip reason, so concurrent trips
+        (e.g. crashloop + cost-ceiling) file one L2.  The no-op, dedup and
+        fail-open rules are :meth:`_file_deduped_born_at_l2`'s.
         """
         queue = getattr(self, '_escalation_queue', None)
-        if not queue:        # bare-Harness unit tests / lifecycle tests stay green
+        if queue is None:
             return
         try:
-            if queue.find_pending_l2_by_root_cause(
-                self._WATCHER_OUTAGE_ROOT_CAUSE
-            ) is not None:
-                return                         # dedup: one open L2 at a time
-            from escalation.models import Escalation
-            # NOTE: two get_pending() traversals occur here (one inside
-            # find_pending_l2_by_root_cause above, one for n_l1 below).
-            # This is acceptable at typical escalation-queue depths; if the
-            # queue grows large, consider caching the pending list within a
-            # single call or offloading to asyncio.to_thread.
-            n_l1 = len([
-                e for e in queue.get_pending() if e.level == 1
-            ])
-            esc = Escalation(
-                id=queue.make_id(self._WATCHER_OUTAGE_SENTINEL),
-                task_id=self._WATCHER_OUTAGE_SENTINEL,
-                agent_role='orchestrator-watcher-supervisor',
-                severity='urgent',
-                category='infra_issue',
-                level=2,
-                root_cause=self._WATCHER_OUTAGE_ROOT_CAUSE,
-                summary=(
-                    f'escalation-watcher-auto down ({reason}); {n_l1} L1 pending'
-                )[:200],
-                detail=(
-                    'The escalation-watcher-auto supervisor is not running or has '
-                    'been paused.  No autonomous L1 triage is taking place.\n\n'
-                    f'Reason: {reason}\n'
-                    f'Pending L1 escalations: {n_l1}\n\n'
-                    'Investigate the reason, fix the underlying issue, and restart '
-                    'the orchestrator (or re-enable the watcher supervisor) to resume '
-                    'autonomous triage.'
-                ),
-                suggested_action='investigate_watcher_supervisor',
-                filing_claimant_run_id=self._filing_claimant_run_id,
-            )
-            queue.submit(esc)
-            logger.warning(
-                'Filed L2 watcher-outage escalation %s (reason=%s, n_l1=%d)',
-                esc.id, reason, n_l1,
-            )
+            n_l1 = sum(1 for e in queue.get_pending() if e.level == 1)
         except Exception:
-            logger.warning('Failed to file watcher-outage L2 escalation', exc_info=True)
+            logger.warning(
+                'Watcher-outage L2 not filed: could not count pending L1s', exc_info=True,
+            )
+            return
+        self._file_deduped_born_at_l2(
+            self._WATCHER_OUTAGE_ALARM,
+            summary=f'escalation-watcher-auto down ({reason}); {n_l1} L1 pending',
+            detail=(
+                'The escalation-watcher-auto supervisor is not running or has '
+                'been paused.  No autonomous L1 triage is taking place.\n\n'
+                f'Reason: {reason}\n'
+                f'Pending L1 escalations: {n_l1}\n\n'
+                'Investigate the reason, fix the underlying issue, and restart '
+                'the orchestrator (or re-enable the watcher supervisor) to resume '
+                'autonomous triage.'
+            ),
+        )
 
     def _resolve_watcher_outage_l2(self, evidence: WatcherRecoveryEvidence) -> None:
         """Resolve the pending watcher-outage L2 with *evidence*, unless the scheduler is paused.
@@ -9886,7 +9883,7 @@ class Harness:
             queue.resolve(
                 existing_id,
                 resolution=evidence.value,
-                resolved_by='orchestrator-watcher-supervisor',
+                resolved_by=self._WATCHER_OUTAGE_ALARM.role,
             )
             logger.info(
                 'Resolved watcher-outage L2 escalation %s (watcher recovered, evidence=%s)',
