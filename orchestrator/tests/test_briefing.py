@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import AsyncMock, patch
@@ -828,9 +829,21 @@ _ARCHITECT_DISPATCHES: dict[str, _ArchitectDispatch] = {
 }
 
 
-async def _dispatch_briefing(briefing: BriefingAssembler, dispatch: str) -> str:
-    builder, args, options = _ARCHITECT_DISPATCHES[dispatch]
-    return await getattr(briefing, builder)(*args, context='', **options)
+async def _brief(
+    briefing: BriefingAssembler, dispatch: _ArchitectDispatch, options: Mapping[str, object],
+) -> str:
+    return await getattr(briefing, dispatch.builder)(*dispatch.args, context='', **options)
+
+
+async def _dispatch_briefing(briefing: BriefingAssembler, name: str) -> str:
+    dispatch = _ARCHITECT_DISPATCHES[name]
+    return await _brief(briefing, dispatch, dispatch.options)
+
+
+def _optional_sections(builder: str) -> set[str]:
+    """The keyword-only parameters of *builder*; each feeds one optional briefing section."""
+    parameters = inspect.signature(getattr(BriefingAssembler, builder)).parameters.values()
+    return {param.name for param in parameters if param.kind is inspect.Parameter.KEYWORD_ONLY}
 
 
 def _invokes_architect(call: ast.Call) -> bool:
@@ -930,11 +943,9 @@ def _workflow_architect_builders() -> set[str]:
 class TestArchitectPlanToolsRecipeSingleHome:
     """Every ARCHITECT dispatch spells each plan-tools recipe signature once.
 
-    The dispatched prompt is ``ARCHITECT.system_prompt`` plus the briefing:
-    the signatures live in the recipe, and the briefing spells none of them.
-    ``_ARCHITECT_DISPATCHES`` must cover every briefing builder that
-    workflow.py dispatches to ARCHITECT; a test below derives that set from
-    workflow.py's source.
+    The dispatched prompt is ``ARCHITECT.system_prompt`` plus the briefing. Tests
+    tie ``_ARCHITECT_DISPATCHES`` to workflow.py's ARCHITECT builders and to every
+    optional section each builder's signature declares.
     """
 
     def test_recipe_reaches_only_the_architect_exactly_once(self) -> None:
@@ -989,15 +1000,50 @@ class TestArchitectPlanToolsRecipeSingleHome:
             'tool without its signature, `tool(...)`, or point at the recipe.'
         )
 
+    def test_dispatches_pass_every_optional_section_of_each_tabled_builder(self) -> None:
+        passed: dict[str, set[str]] = {}
+        for dispatch in _ARCHITECT_DISPATCHES.values():
+            passed.setdefault(dispatch.builder, set()).update(dispatch.options)
+        assert any(_optional_sections(builder) for builder in passed), (
+            '_optional_sections finds no keyword-only parameter on any builder '
+            '_ARCHITECT_DISPATCHES names, so this check sees no optional '
+            'section; it no longer matches how the architect builders declare them.'
+        )
+        unpassed = {
+            builder: sorted(missing)
+            for builder, options in sorted(passed.items())
+            if (missing := _optional_sections(builder) - options)
+        }
+        assert not unpassed, (
+            f'No _ARCHITECT_DISPATCHES entry passes these optional sections of '
+            f'the builders it names: {unpassed}. Add or extend a '
+            "'<dispatch>_with_optional_sections' entry that passes them, with "
+            'fixture text free of recipe signatures: a section no entry renders '
+            'is a section the recipe-signature check never scans.'
+        )
+
     @pytest.mark.asyncio
-    async def test_optional_sections_dispatch_renders_every_optional_section(
-        self, briefing: BriefingAssembler,
+    @pytest.mark.parametrize(
+        'dispatch', sorted(name for name, entry in _ARCHITECT_DISPATCHES.items() if entry.options),
+    )
+    async def test_each_optional_section_a_dispatch_passes_renders_into_its_briefing(
+        self, briefing: BriefingAssembler, dispatch: str,
     ) -> None:
-        rendered = await _dispatch_briefing(briefing, 'fresh_with_optional_sections')
-        proposal = _SPOT_TASK['metadata']['dry_run_proposals'][-1]['proposal_text']
-        assert proposal in rendered, 'the prior-proposal section did not render'
-        assert _SPOT_COMMITTED_WORK[0]['subject'] in rendered, (
-            'the already-committed-work section did not render'
+        entry = _ARCHITECT_DISPATCHES[dispatch]
+        rendered = await _brief(briefing, entry, entry.options)
+        inert = [
+            option
+            for option in sorted(entry.options)
+            if rendered == await _brief(
+                briefing,
+                entry,
+                {key: value for key, value in entry.options.items() if key != option},
+            )
+        ]
+        assert not inert, (
+            f'Dropping {inert} from the {dispatch!r} dispatch leaves its briefing '
+            'byte-identical: those options reach no section, so the '
+            'recipe-signature check is not scanning the sections it claims to.'
         )
 
     def test_dispatch_table_covers_every_workflow_architect_builder(self) -> None:
