@@ -6,9 +6,8 @@ its module body. No module rebinds an object a lower module, or
 ``scripts/source_measures.py`` beneath them all, defines; consumers reach each
 name through its defining module. :data:`PLACEMENT_CASES` drives the placement
 rule over small synthetic sources, so each placement it accepts or refuses is
-shown to be accepted or refused. The layers the command line imports before
-``_checkout`` binds the checkout, :data:`UNBOUND_LAYERS`, import no workspace
-member at all.
+shown to be accepted or refused. The layers on the import path that binds the
+checkout, :data:`UNBOUND_LAYERS`, import no workspace member at all.
 """
 
 import ast
@@ -100,9 +99,11 @@ def test_no_scripts_module_imports_the_cli() -> None:
     )
 
 
-#: What ``scripts/merge_lane_metrics.py`` imports before ``merge_lane_ratchet``
-#: binds this checkout's workspace members through ``_checkout``: the
-#: measurement stratum, and ``source_measures`` beneath it.
+#: The layers on the import path that binds this checkout's workspace members:
+#: ``source_measures`` imports ``_checkout``, and the measurement stratum
+#: ``merge_lane_cluster`` imports ``source_measures``. Whether a workspace-member
+#: import in either resolved this checkout's copy would rest on statement order,
+#: not intent, so they import none.
 UNBOUND_LAYERS = ('source_measures', 'merge_lane_cluster')
 
 
@@ -142,8 +143,10 @@ def test_no_layer_imported_before_the_checkout_binds_imports_a_workspace_member(
 
     assert found == [], (
         f'scripts/{stem}.py imports a workspace member, (line, module) {found}. '
-        'The CLI imports it before merge_lane_ratchet imports _checkout, so that '
-        "import would bind the environment's copy of the member, not this checkout's"
+        'It lies on the import path that binds the checkout (source_measures imports '
+        '_checkout, merge_lane_cluster imports source_measures), so whether that import '
+        "resolves this checkout's copy of the member would rest on statement order, "
+        'not intent'
     )
 
 
