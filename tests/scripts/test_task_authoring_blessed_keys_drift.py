@@ -118,12 +118,12 @@ def _documented_blessed_keys(markdown_text):
 _HAPPY_DOC = """\
 This is `_BLESSED_METADATA_KEYS` in `shared/src/shared/task_metadata.py`:
 
-<!-- tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:begin -->
 ```
 alpha, beta, gamma_delta,
 epsilon
 ```
-<!-- /tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:end -->
 
 Some qualifying prose mentioning `zeta` and `eta`, deliberately outside the
 marker and therefore unpinned.
@@ -135,45 +135,14 @@ _NO_BEGIN_MARKER_DOC = """\
 ```
 alpha, beta
 ```
-<!-- /tier-a-blessed-keys-mirror -->
-"""
-
-_NO_END_MARKER_DOC = """\
-<!-- tier-a-blessed-keys-mirror -->
-```
-alpha, beta
-```
-"""
-
-_DUPLICATE_MARKER_DOC = """\
-<!-- tier-a-blessed-keys-mirror -->
-```
-alpha, beta
-```
-<!-- /tier-a-blessed-keys-mirror -->
-
-## A later section
-
-<!-- tier-a-blessed-keys-mirror -->
-```
-gamma, delta
-```
-<!-- /tier-a-blessed-keys-mirror -->
-"""
-
-_INVERTED_MARKER_DOC = """\
-<!-- /tier-a-blessed-keys-mirror -->
-```
-alpha, beta
-```
-<!-- tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:end -->
 """
 
 _EMPTY_FENCE_DOC = """\
-<!-- tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:begin -->
 ```
 ```
-<!-- /tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:end -->
 """
 
 _DECOY_DOC = """\
@@ -181,12 +150,12 @@ _DECOY_DOC = """\
 decoy_before, another_decoy
 ```
 
-<!-- tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:begin -->
 ```
 alpha, beta, gamma_delta,
 epsilon
 ```
-<!-- /tier-a-blessed-keys-mirror -->
+<!-- tier-a-blessed-keys-mirror:end -->
 
 ```
 decoy_after
@@ -211,36 +180,32 @@ def test_documented_blessed_keys_ignores_unmarked_fences():
     assert _documented_blessed_keys(_DECOY_DOC) == _HAPPY_KEYS
 
 
-@pytest.mark.parametrize(
-    "markdown_text,case",
-    [
-        (_NO_BEGIN_MARKER_DOC, "opening marker deleted"),
-        (_NO_END_MARKER_DOC, "closing marker deleted"),
-        (_DUPLICATE_MARKER_DOC, "marker pair duplicated"),
-        (_INVERTED_MARKER_DOC, "markers inverted"),
-        (_EMPTY_FENCE_DOC, "marked fence emptied"),
-    ],
-)
-def test_documented_blessed_keys_fails_loudly_on_a_broken_marker(markdown_text, case):
-    """(c) A missing, duplicated, inverted or emptied marker RAISES — never [].
+def _assert_names_this_guard(excinfo):
+    message = str(excinfo.value)
+    assert "tier-a-blessed-keys-mirror" in message
+    assert "task-authoring.md" in message
+    assert "3780" in message
 
-    All five are the same failure at different depths: each would otherwise
-    silently reduce this guard to a tautology while the suite kept reporting
-    green. The message must tell a human what to restore and where, so the
-    assertions check the marker literal, the doc path and this guard's task are
-    all named. ``doc_path`` and ``task`` are ARGUMENTS threaded into
-    ``marked_span``, so without these a copy-paste from the task-4303 caller
-    next door would leave this file green while sending every broken-marker
-    reader to the wrong guard and the wrong document. Identifiers only, so any
-    rewording of the shared message templates stays green.
+
+def test_documented_blessed_keys_names_its_marker_document_and_task_on_a_missing_marker():
+    """A missing opening marker raises, naming this guard's slug, document and task.
+
+    The malformed-marker shapes are the shared helper's contract, pinned once in
+    `test_verify_command_invariants.py`; this pins only that the wrapper passes
+    this guard's slug, source and task to it.
     """
     with pytest.raises(AssertionError) as excinfo:
-        _documented_blessed_keys(markdown_text)
+        _documented_blessed_keys(_NO_BEGIN_MARKER_DOC)
 
-    message = str(excinfo.value)
-    assert "tier-a-blessed-keys-mirror" in message, case
-    assert "task-authoring.md" in message, case
-    assert "3780" in message, case
+    _assert_names_this_guard(excinfo)
+
+
+def test_documented_blessed_keys_refuses_an_empty_fence():
+    """The fence lines make the span non-blank, so this guard's own names check must refuse it."""
+    with pytest.raises(AssertionError) as excinfo:
+        _documented_blessed_keys(_EMPTY_FENCE_DOC)
+
+    _assert_names_this_guard(excinfo)
 
 
 def test_task_authoring_marker_pair_is_present_and_non_empty():
