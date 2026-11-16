@@ -23,9 +23,12 @@ Shape contract (returned by collect_scheduler_state):
 
     modules: list[dict]  — one per unique module path that appears in any lock set:
         path        str
-        holder      str | None   task_id of in-flight holder, or None
+        holders     list[str]    every in-flight holder's task_id, sorted
+        holder      str | None   holders[0], for display, or None
+        at_holder_limit bool     True iff the holders fill the key's holder limit
         holder_live bool | None  True/False iff a holder exists and the live set
-                                 is known; None otherwise (unknown, never departed)
+                                 is known (True when ANY holder is live); None
+                                 otherwise (unknown, never departed)
         contention  int          count of tasks whose lock_set includes this path
         sorted by contention desc, ties broken alphabetically by path
 
@@ -87,7 +90,7 @@ from shared.scheduler_state import (
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import collect_tasks_with_counts
 from dashboard.data.datum import Datum, DatumState, unknown_datum
-from dashboard.data.lock_contention import holder_of, lock_wanters
+from dashboard.data.lock_contention import key_holders, lock_wanters
 from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.served_read import ServedRead
@@ -315,13 +318,13 @@ async def get_scheduler_snapshot(
 
 def _module_contention_counts(
     rows: list[dict],
-    current_holders: Mapping[str, str],
+    snapshot: SchedulerStateSnapshot,
     *,
     project: str | None = None,
     park_stacks: _ParkStacks | None = None,
     live_task_ids: set[str] | None = None,
 ) -> list[dict]:
-    """Build a sorted module-contention list from task rows and current holders.
+    """Build a sorted module-contention list from task rows and the snapshot's lock holders.
 
     For each module path that appears in any task's ``lock_set`` **or** in
     ``park_stacks`` keys, count how many live tasks include it and attach park
@@ -329,27 +332,27 @@ def _module_contention_counts(
     ``dashboard/src/dashboard/data/lock_contention.py``'s, the rule the PRD
     view's contention line shares.
 
-    The holder for a module is resolved via the shared hierarchical prefix rule
+    A module's holders are resolved via the shared hierarchical prefix rule
     (``modules_conflict``), not dict-equality, so a holder key that is a
     sub-``lock_depth`` parent of the module still matches.  Both *rows*'
-    ``lock_set`` and *current_holders* keys are normalized module locks.
+    ``lock_set`` and the snapshot's held keys are normalized module locks.
     The same rule is used to match *park_stacks* keys to contended paths so
     park and holder resolution stay consistent.
 
     Args:
         rows:            Task row dicts, each with ``task_id`` and ``lock_set``
                          (normalized module locks).
-        current_holders: ``{module_path: task_id}`` from the scheduler snapshot
-                         (module keys normalized to lock_depth).
+        snapshot:        The project's scheduler snapshot: who holds each key
+                         (``holders_by_key``) and its holder limit
+                         (``holder_limit``), module keys normalized to lock_depth.
         project:         Optional project label to tag each module entry with.
                          Module paths are NOT globally unique (two projects can
                          each have ``src/utils.py``), so we propagate the
                          owning project label on every module so the merge
                          step can key by ``(project, path)`` without conflating
                          unrelated contention.  When set and a holder exists,
-                         ``holder_project`` is also populated — the snapshot's
-                         ``current_holders`` map only contains task_ids from
-                         the same project root.
+                         ``holder_project`` is also populated — the snapshot
+                         only names task_ids from the same project root.
         park_stacks:     Optional ``{module_key: [entry, ...]}`` from
                          ``snapshot.park_stacks``.  Each stack is in
                          bottom→top order (``stack[-1]`` is the active top).
@@ -365,12 +368,16 @@ def _module_contention_counts(
                          ``park_stacks`` is also ``None``.
 
     Returns:
-        ``[{path, holder, contention, project, holder_project, holder_live,
-            parked_by, parked_by_project, parked_owner_live, park_stack}, ...]``
+        ``[{path, holders, holder, at_holder_limit, contention, project,
+            holder_project, holder_live, parked_by, parked_by_project,
+            parked_owner_live, park_stack}, ...]``
         sorted by contention descending, ties broken alphabetically by path.
 
-        holder_live  bool | None  True/False iff a holder exists and
-                     *live_task_ids* was supplied
+        holders          list[str]    every task holding a conflicting key, sorted
+        holder           str | None   holders[0], for display
+        at_holder_limit  bool         True iff the holders fill the key's limit
+        holder_live      bool | None  True iff ANY holder is in *live_task_ids*;
+                         None unless a holder exists and *live_task_ids* was supplied
 
         New additive fields (inert when *park_stacks* is ``None``):
           parked_by        str | None  active-top park owner (stack[-1]) if any
@@ -402,12 +409,14 @@ def _module_contention_counts(
     }
     all_paths = contended_paths | park_only_keys
 
+    holders_by_key = snapshot.holders_by_key()
     result: list[dict] = []
     for path in all_paths:
         count = counts.get(path, 0)
-        holder = holder_of(path, current_holders)
+        held = key_holders(path, holders_by_key, snapshot.holder_limit)
+        holder = held.holders[0] if held.holders else None
         holder_live = (
-            (holder in live_task_ids)
+            any(h in live_task_ids for h in held.holders)
             if (holder is not None and live_task_ids is not None)
             else None
         )
@@ -438,14 +447,16 @@ def _module_contention_counts(
 
         result.append({
             'path': path,
+            'holders': list(held.holders),
             'holder': holder,
+            'at_holder_limit': held.at_limit,
             'contention': count,
             # `project` scopes this module entry; `holder_project` qualifies
             # the holder task_id since taskmaster ids are project-scoped.
             'project': project,
             'holder_project': project if holder else None,
-            # The holder's liveness against the same live_task_ids that sets
-            # parked_owner_live; None when unknown.
+            # Whether any holder is live, against the same live_task_ids that
+            # sets parked_owner_live; None when unknown.
             'holder_live': holder_live,
             # Park ownership — additive fields; inert when park_stacks is None.
             'parked_by': parked_by,
@@ -958,7 +969,7 @@ async def collect_scheduler_state(
             })
 
         # Compose rows — normalize footprints to the scheduler's lock_depth so
-        # row lock_set values match the snapshot's current_holders keys.  Older
+        # row lock_set values match the snapshot's held keys.  Older
         # snapshots without lock_depth degrade to the default depth of 2.
         depth = snapshot.lock_depth if snapshot.lock_depth is not None else _DEFAULT_LOCK_DEPTH
         rows = _compose_rows(enriched, snapshot, depth, now=effective_now)
@@ -981,7 +992,7 @@ async def collect_scheduler_state(
         # get an entry (contention: 0) and every module entry carries
         # parked_by/park_stack (PRD §5 read-seam contract, task γ B1/B2).
         modules = _module_contention_counts(
-            rows, snapshot.current_holders,
+            rows, snapshot,
             project=label,
             park_stacks=park_stacks,
             live_task_ids=live_task_ids,
@@ -1094,6 +1105,8 @@ def _merge_module_lists(
             merged[key]['contention'] += m['contention']
             if m.get('holder'):
                 merged[key]['holder'] = m['holder']
+                merged[key]['holders'] = m['holders']
+                merged[key]['at_holder_limit'] = m['at_holder_limit']
                 # holder_project must travel with holder so the React side
                 # can build the composite ${holder_project}/${holder} key
                 # used to look up sparklines and joined row metadata.
