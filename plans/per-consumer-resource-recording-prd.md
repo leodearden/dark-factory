@@ -547,7 +547,7 @@ to their size, rather than from one list for the whole service. No memory limit 
 | Hold events name the holding orchestrator's cgroup | `dispatch_deferred` payload `sample.own_cgroup` (live, 2026-11-16) | verified; a unit path before the slices, the project slice after |
 | A scope script can run a capture after the command, and the kill path can read first | `orchestrator/src/orchestrator/scope_launch_handshake.py::ScopeLaunchHandshake.payload`; `verify.py::_run_cmd`; `verify.py::_reap_command_subtree`; `orchestrator/src/orchestrator/relocated_scopes.py` | verified |
 | Summary whitelist and wire carrier | `verify.py::_build_summary_payload`; `orchestrator/src/orchestrator/verify_runner.py::result_from_dict` (strict); `orchestrator/src/orchestrator/remote_gate.py::wire_fingerprint` keeps both hosts on one code version | verified |
-| Event registry in `runs.db` | `orchestrator/src/orchestrator/event_store.py` | verified |
+| Event registry in `runs.db` | `orchestrator/src/orchestrator/event_store.py` (`EventType`; task 9766 moves it to `shared/src/shared/run_events.py`) | verified |
 | Added nullable columns on `invocations` | `shared/src/shared/cost_store.py` ("Added columns stay LAST and nullable") | verified |
 | One `invocations` row per attempt | task 9812 and its writer (review-all stream 20) | **queued prerequisite** for leaf 7a |
 | Delegation, `DelegateSubgroup`, memory-only subtree, scope launches from inside | `delegate_probe.sh`, `delegate_probe2.sh`; systemd 255.4 on both hosts | verified |
@@ -563,7 +563,7 @@ to their size, rather than from one list for the whole service. No memory limit 
 | Task 3394, per-project slices (`docs/cgroup-slice-topology.md` on its branch) | consumes | slice names (`shared/src/shared/cgroup_slice.py::project_slice_name`); verify scopes under `df.slice/df-<id>.slice`; `ensure_project_slice_weight`; the topology doc's statement that agents inherit the service cgroup | 3394 owns the slices. This PRD owns the classifier's coverage of both placements (leaf 1), the weight check's acceptance of `daemon` (leaf 6), and updating the topology doc (leaf 7b) | 3394 pending, mid-implementation |
 | Task 9985, operator reinstall | adds a dependency | one reinstall carries `Slice=` (3394) and `Delegate=memory` plus `DelegateSubgroup=daemon` (leaf 6) | 9985's steps are amended at decompose | pending gate |
 | `plans/load-throttle-harmonisation-prd.md` | consumes | `METRIC_GROUPS` and INV-14; `resolve_own_cgroup` semantics (its §6.3) | that PRD. This one adds groups and must not move the own reading (C3) | shipped |
-| Review-all stream 4, `plans/review-all-s4-verify-run-context-and-runner-contract-prd.md` (splits `verify.py`; `_run_cmd` becomes `verify_exec.py::SubprocessRunner`) | file contention | the capture hook, `CheckRun`, the summary and `VerifyResult` shapes | stream 4 owns the moves. Leaves 4 and 5 put their hooks wherever stream 4 has left that code at dispatch, and are serialized after its pending leaves on the same files | sequencing at decompose |
+| Review-all stream 4, `plans/review-all-s4-verify-run-context-and-runner-contract-prd.md` (splits `verify.py`; `_run_cmd` becomes `verify_exec.py::SubprocessRunner`) | file contention | the capture hook, `CheckRun`, the summary and `VerifyResult` shapes | stream 4 owns the moves. Stream 4's refactor already waits on task 6355 (leaf 4; its task 9130 depends on 6355, with about 225 open stream-4 tasks behind it), so leaf 4 lands on today's layout at high priority and stream 4 carries it forward. Leaf 5 lands wherever stream 4 has left `VerifyResult` at dispatch | wired at decompose 2026-11-16 |
 | Review-all stream 20, `plans/review-all-s20-cli-invocation-and-usage-gate-prd.md` (splits `cli_invoke.py`; the spawn moves to `shared/claude_runner.py`; task 9812 and its writer make `invocations` one row per attempt) | consumes and file contention | the spawn prefix; the attempt row | stream 20 owns the moves and the row grain. Leaf 7a lands on them and depends on 9812 and its writer | sequencing at decompose |
 | Review-all stream 16, `plans/review-all-s16-orchestrator-config-shape-defaults-and-routing-prd.md` | file contention | the leaf 7b switch's config layout | stream 16 | sequencing at decompose |
 | `plans/remote-task-leg-verify-prd.md` | consumes | `VerifyResult` as the only remote carrier; `RemoteRunner` pass summaries | that PRD (shipped). Leaf 5 adds a field | shipped |
@@ -778,8 +778,9 @@ Leaves are numbered; existing tasks keep their ids. Sizes are expected changed l
   - the C2 summary.
 
   With no holds it prints "0 memory holds since <ts>". Earlier holds are listed as "recorder not live". The output is
-  also available as `--json`. The project list comes from repeated `--project-root`, defaulting to the dashboard's
-  known project roots.
+  also available as `--json`. The project list is repeated `--project-root`, required: the dashboard's known-roots
+  variable is set only in its installed unit, so a default would silently read one project from a shell. The report
+  prints the roots it read.
 - **Prereqs:** leaf 1 merged and writing in production (INV-13 `readers-prove-their-producer`: a reader lands only
   once its producer has written).
 
@@ -816,7 +817,8 @@ Leaves are numbered; existing tasks keep their ids. Sizes are expected changed l
 - **Modules:**
   - `orchestrator/src/orchestrator/verify_runner.py` (`VerifyResult` field, pass summaries, `_archive_failure_streams`);
   - `orchestrator/src/orchestrator/remote_gate.py`;
-  - `orchestrator/src/orchestrator/event_store.py`;
+  - the `EventType` registry: `orchestrator/src/orchestrator/event_store.py`, or `shared/src/shared/run_events.py`
+    once task 9766 has moved it;
   - `orchestrator/src/orchestrator/task_verify_dispatch.py`, and the local emit point beside the admission-plan event;
   - tests.
 - **Observable signal:** on the day it deploys, Dark Factory's `runs.db` holds `verify_command_resources` events with
@@ -916,8 +918,9 @@ edges, and force a re-plan wherever the text fingerprint changes.
     layout, and that the slice weight still reads 100.
   - State that this delays the slice rollout, and with it task 5220's 14-day calibration clock and task 9984, by
     however long leaf 6 takes.
-- **Task 3394.** Note that Leo's 2026-11-16 ruling supersedes its "agents inherit the service cgroup" for the long
-  run. Its own scope is unchanged.
+- **Task 3394.** Deliberately NOT edited: it is mid-implementation at high priority, and any text change forces a
+  re-plan. That Leo's 2026-11-16 ruling supersedes its "agents inherit the service cgroup" is recorded here, in
+  leaf 7b, and in the topology doc that leaf 7b updates.
 - **Tasks 9984 and 7112.** Add a pointer to leaves 1 and 8 as their data sources.
 
 **Graph.**
@@ -933,12 +936,13 @@ edges, and force a re-plan wherever the text fingerprint changes.
 Filed 2026-11-16 as tasks 10456 (leaf 1), 10457 (2), 10458 (3), 6355 (4), 10459 (5), 10460 (6), 10461 (7a),
 10462 (7b) and 10463 (8). Each is serialized, where it shares files with pending work, behind:
 
-- leaf 4: tasks 3394 and 8078;
+- leaf 4: task 8078 (not task 3394: leaf 4 gates stream 4's refactor and edits a different region of the scope
+  launch code, so it rebases over 3394 instead of waiting on it);
 - leaf 5: task 9766;
 - leaf 7a: task 9846 (stream 20's writer) and task 9850 (stream 20's spawn move);
 - leaf 7b: task 10430 (the allowance-reserve PRD).
 
-Task 6987 now waits on leaf 1.
+Task 6987 now waits on leaf 1. Task 9984 now waits on task 9985, as its text says.
 
 **G7 walk** (`docs/legibility/design-invariants.md`, all fourteen):
 

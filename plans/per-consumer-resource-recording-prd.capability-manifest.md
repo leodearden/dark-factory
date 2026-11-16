@@ -17,7 +17,7 @@ Every row below is now PASS.
 **Notes that are not FAIL** (no capability is missing; these are batch-wiring points for decompose):
 
 - Leaf 7a: wire task 10429 (allowance reserve 1b) and task 9850 (stream 20 task 9850, moves the spawn to `shared/claude_runner.py`) as same-file serialization. The task the PRD calls "stream 20's per-attempt writer" is **9846** (stream 20 task 9846, from that PRD's sidecar), which depends on 9812.
-- Leaf 4 (existing task 6355): review-all stream 4's moves already wait on it (task 9130 depends on 6355), so it serializes behind tasks 3394 and 8078 instead. `_run_cmd` pointers resolve on main today.
+- Leaf 4 (existing task 6355): review-all stream 4's moves already wait on it (task 9130 depends on 6355), so it serializes behind task 8078 only (it rebases over task 3394 rather than waiting on it). `_run_cmd` pointers resolve on main today.
 - Leaf 3: a pure gate (`always_escalates`, no `before_done`) cannot run the report; its escalation body carries the command. The PRD says "Check: runs ...". If the runner must run it, the leaf is act-then-ask.
 - Leaf 7b: task 9985 is the production signal, not a code dependency; no edge 9985 -> 7b. The needed edge 6 -> 9985 is on the existing task.
 - Leaf 2 "merged and writing in production" (INV-13) is a rollout condition, not a code capability.
@@ -46,7 +46,7 @@ Legend: `producer:task-N upstream` is a leaf label of this PRD (or a real task i
 - `consumer-classifier-module` → built here; sampler/src/sampler/consumers.py, the one rule table, walk, residuals and consumer-name encode and parse (D2). **PASS**.
   - delivered_check: path present: sampler/src/sampler/consumers.py
 - `refault-and-swap-in-counters-read` → built here; memory.stat keys pswpin, pgsteal_kswapd, pgsteal_direct and workingset_refault_anon and _file read per cgroup (C1); absent on main. **PASS**.
-  - delivered_check: grep present, pattern `workingset_refault_anon`, paths sampler/src/sampler/, shared/src/shared/
+  - delivered_check: grep present, pattern `workingset_refault`, paths sampler/src/sampler/, shared/src/shared/
 - `reclaim-thread-cpu-recorded` → built here; the background reclaim and compaction threads' CPU from /proc/<pid>/stat, kswapd and kcompactd (C1); absent on main. **PASS**.
   - delivered_check: grep present, pattern `kswapd`, paths sampler/src/sampler/
 - `two-zero-series-retired` → built here; the verify_rss_total_bytes metric declaration leaves the table (D6); present in metrics.py on main. **PASS**.
@@ -108,7 +108,7 @@ Legend: `producer:task-N upstream` is a leaf label of this PRD (or a real task i
 - `summary-whitelist-and-run-result` → `grep:orchestrator/src/orchestrator/verify.py::_build_summary_payload`; `grep:orchestrator/src/orchestrator/verify.py::CheckRun`. **PASS**.
 - `census-reads-local-summaries` → `grep:scripts/verify_budget_census.py::load_records` wired: it reads the summaries under data/verify-logs. **PASS**.
 - `c4-record-fields` → built here; the C4 dataclass with user_usec, system_usec, the three stall totals and the identity fields, one home, listed in remote_gate wire_classes; absent on main. **PASS**.
-  - delivered_check: grep present, pattern `user_usec`, paths orchestrator/src/orchestrator/, shared/src/shared/
+  - delivered_check: grep present, pattern `user_usec`, paths orchestrator/src/orchestrator/ (not shared/, where leaf 1's cgroup.stat parser lands first)
 - `kill-path-capture-state` → built here; the before_kill capture state, read from the scope's sysfs path before the kill; absent on main. **PASS**.
   - delivered_check: grep present, pattern `before_kill`, paths orchestrator/src/orchestrator/
 - `census-prints-cpu-and-peak` → built here; scripts/verify_budget_census.py prints CPU and peak memory per command from the record; absent on main. **PASS**.
@@ -124,8 +124,8 @@ Legend: `producer:task-N upstream` is a leaf label of this PRD (or a real task i
 - `strict-wire-reader` → `grep:orchestrator/src/orchestrator/verify_runner.py::result_from_dict` `grep:orchestrator/src/orchestrator/remote_gate.py::wire_classes` `grep:orchestrator/src/orchestrator/remote_gate.py::wire_fingerprint` result_from_dict is the strict reader of the VerifyResult wire; wire_classes is the registry the record is added to. **PASS**.
 - `pass-summary-payloads` → `grep:orchestrator/src/orchestrator/verify_runner.py::_task_pass_summary_payload`; `grep:orchestrator/src/orchestrator/verify_runner.py::_merge_pass_summary_payload`; `grep:orchestrator/src/orchestrator/verify_runner.py::RemoteRunner._archive_failure_streams`. **PASS**.
 - `event-registry-and-local-emit-precedent` → `grep:orchestrator/src/orchestrator/event_store.py::EventType` `grep:orchestrator/src/orchestrator/verify.py::_recorded_admission_plan` `grep:orchestrator/src/orchestrator/task_verify_dispatch.py` wired: EventType is the registry; _recorded_admission_plan is the local emit point beside the admission-plan event; remote dispatch is in task_verify_dispatch. **PASS**.
-- `event-type-registered` → built here; verify_command_resources in the EventType registry; absent on main. **PASS**.
-  - delivered_check: grep present, pattern `verify_command_resources`, paths orchestrator/src/orchestrator/event_store.py
+- `event-type-registered` → built here; verify_command_resources in the EventType registry (shared/src/shared/run_events.py once task 9766 has moved it); absent on main. **PASS**.
+  - delivered_check: grep present, pattern `verify_command_resources`, paths orchestrator/src/orchestrator/event_store.py, shared/src/shared/run_events.py
 - `event-emitted-per-command-run` → built here; one verify_command_resources event per command run, local and remote, task id or merge sha and request id; absent on main. **PASS**.
   - delivered_check: grep present, pattern `EventType\.verify_command_resources`, paths orchestrator/src/orchestrator/
 - `laptop-and-local-events-and-pass-summaries` → built here; runs.db holds events with runner laptop and runner local, and a remote green pass summary carries the same records. **PASS**.
@@ -162,8 +162,8 @@ Legend: `producer:task-N upstream` is a leaf label of this PRD (or a real task i
 - `added-columns-stay-last-and-nullable` → `grep:shared/src/shared/cost_store.py::_ADDED_INVOCATION_COLUMNS` `grep:shared/src/shared/cost_store.py::CostStore.save_invocation` the table the C5 columns are appended to, and the writer. **PASS**.
 - `c5-columns-on-invocations` → built here; cgroup_capture, cgroup_capture_reason, cpu_usec, memory_peak_bytes, swap_peak_bytes and the four stall totals; absent on main. **PASS**.
   - delivered_check: grep present, pattern `cgroup_capture_reason`, paths shared/src/shared/cost_store.py
-- `outermost-join-prefix` → built here; a launch prefix writes its own pid into the child's cgroup.procs and execs, outside the govern and nice prefixes and the sandbox wrap; absent from shared/src/shared on main. **PASS**.
-  - delivered_check: grep present, pattern `cgroup\.procs`, paths shared/src/shared/
+- `outermost-join-prefix` → built here; a launch prefix writes its own pid into the child's cgroup.procs and execs, outside the govern and nice prefixes and the sandbox wrap; absent from the spawn files on main. **PASS**.
+  - delivered_check: grep present, pattern `cgroup\.procs`, paths shared/src/shared/cli_invoke.py, shared/src/shared/claude_runner.py (not all of shared/, where leaf 1's parser lands first)
 - `placement-protocol-and-stdin-survives` → built here; the placement protocol (prefix and env before, reading after) declared in shared code; the stdin-starvation pin in shared/tests/test_cli_invoke.py stays green through the new prefix. **PASS**.
   - delivered_check: manual. The protocol's names are the architect's; the CI spawn through the full prefix chain with a fixture placement is the leaf's signal.
 
