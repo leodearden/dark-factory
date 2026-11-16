@@ -61,3 +61,8 @@ recall_caveat:
     # Paraphrase recall is too low to enumerate a gate's members from.
     gate_filing: blocked
   gate_filing_owner_task: 4916
+  # Dated adjudicator-over-ANN measurements on the same fixture, written by
+  # fused-memory/scripts/measure_duplicate_detector_recall.py. An entry's
+  # meets_proposed_gate is judged against an UNRATIFIED proposal; task 10244
+  # ratifies it and sets fitness.gate_filing.
+  adjudicator_measurements: []

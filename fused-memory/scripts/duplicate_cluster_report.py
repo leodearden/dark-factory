@@ -97,13 +97,69 @@ class ParaphraseRecall(_Frozen):
     of: int = Field(gt=0)
 
 
+class ScanSet(_Frozen):
+    setting: Literal['fixture_only']
+    records: int = Field(gt=0)
+
+
+class CandidateGeneration(_Frozen):
+    top_k: int = Field(gt=0)
+    caught: int = Field(ge=0)
+    of: int = Field(gt=0)
+
+
+class AdjudicatorRecall(_Frozen):
+    caught: int = Field(ge=0)
+    of: int = Field(gt=0)
+    rate: float
+    wilson_95: tuple[float, float]
+
+
+class AdjudicatorPrecision(_Frozen):
+    flagged: int = Field(gt=0)
+    rate: float
+    wilson_95: tuple[float, float]
+
+
+class HardNegativeFlagged(_Frozen):
+    flagged: int = Field(ge=0)
+    of: int = Field(gt=0)
+
+
+class AucMeasurement(_Frozen):
+    value: float
+    n_true: int = Field(gt=0)
+    n_hard_negative: int = Field(gt=0)
+    hanley_mcneil_95: tuple[float, float]
+
+
+class AdjudicatorMeasurement(_Frozen):
+    """One dated adjudicator-over-ANN measurement, as measure_duplicate_detector_recall.py emits it."""
+
+    measured_at: str = Field(min_length=1)
+    detector: str = Field(min_length=1)
+    scan_set: ScanSet
+    candidate_generation: CandidateGeneration
+    operating_threshold: float | None
+    paraphrase_band_recall: AdjudicatorRecall
+    precision_at_operating_point: AdjudicatorPrecision | None
+    hard_negative_flagged: HardNegativeFlagged
+    auc_true_vs_hard_negative: AucMeasurement
+    meets_proposed_gate: bool = Field(strict=True)
+    source: str = Field(min_length=1)
+
+
 class Fitness(_Frozen):
     regrowth_measurement: Literal['supported', 'unsupported']
     gate_filing: Literal['blocked', 'cleared']
 
 
 class RecallCaveat(_Frozen):
-    """The measured detector recall every report carries, and the bars it clears."""
+    """The measured detector recall every report carries, and the bars it clears.
+
+    ``adjudicator_measurements`` holds dated adjudicator-over-ANN measurements
+    on the same fixture.
+    """
 
     measured_at: str = Field(min_length=1)
     fixture: str = Field(min_length=1)
@@ -112,6 +168,7 @@ class RecallCaveat(_Frozen):
     source: str = Field(min_length=1)
     fitness: Fitness
     gate_filing_owner_task: int
+    adjudicator_measurements: tuple[AdjudicatorMeasurement, ...]
 
 
 class Cadence(_Frozen):
