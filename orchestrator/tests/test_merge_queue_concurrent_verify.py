@@ -78,8 +78,11 @@ from orchestrator.merge_lane.worker import (
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease
 
-# Names MERGE_RESULT_TIMEOUT for verify gate-entry waits (`gate_entered.wait()`,
-# `gate_*_entered.wait()`) (task 6436).  A hang still fails, just later.
+# Liveness bound for waits on a verify's gate-entry event (task 6436); a hang
+# still fails, just later.  Deliberately departs from
+# _orch_helpers.py::MERGE_GATE_BARRIER_TIMEOUT for this hub: esc-6307-1
+# measured a gate-entry wait at that bound timing out under full-suite xdist
+# load.  The tight `timeout=5.0` gate-entry waits are a deliberate exception.
 GATE_ENTRY_TIMEOUT = MERGE_RESULT_TIMEOUT
 
 # ---------------------------------------------------------------------------
