@@ -144,6 +144,16 @@ A *consumer* is one of these:
 (measured) Host memory "full" pressure above the hold threshold of 3 appeared in 7% of 5-second samples on 11-12
 and 11-13, and in 24% on 11-15 and 11-16 (measured, `load-samples.db`).
 
+**Why only two projects hold.** The memory arm is on in every project by code default:
+`orchestrator/src/orchestrator/config.py::PsiAdmissionConfig` has `enabled` true, memory "full" 3.0 and memory "some"
+15.0, and no project's config turns it off. A hold is recorded only when a ready task is turned away, and since
+2026-11-13 the other projects have dispatched nothing (measured 2026-11-16 from their `runs.db` and task stores):
+
+- solar-challenge is under Leo's operator pause of 2026-11-08;
+- pump-web-ui is paused on its cost ceiling since 2026-11-02;
+- stream-touch and scoping-intake have started no task since 11-13 and 11-12;
+- know-live and autopilot-video have nothing pending.
+
 **Three things changed after the study:**
 
 - **The code-index watcher** (`jcodemunch-watcher.service`) was stopped at 2026-11-16 06:28Z and is disabled. It
