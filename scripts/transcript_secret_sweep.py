@@ -21,9 +21,11 @@ same-length placeholders. It reads only regular files, and skips those
 modified within ``min_age_secs``, which a live session or test run may still
 be appending to. A sweep that redacted or refused anything files one
 ``risk_identified`` info escalation. A dry run (``--dry-run``) rewrites and
-files nothing and lists what a real run would redact under ``matched``.
-Nothing it prints or files carries a value. Operator view: ``OPERATIONS.md``
-§12.
+files nothing and lists what a real run would redact under ``matched``. On a
+host with no orchestrator units (the laptop), ``--host-configs-dir`` takes
+project roots from its verify configs and ``--no-escalation`` leaves the
+record line as the only report. Nothing it prints or files carries a value.
+Operator view: ``OPERATIONS.md`` §12.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from typing import Protocol
 
 try:
     import orchestrator_projects
+    import yaml
     from dashboard.config import DashboardConfig
     from shared.mcp_post import mcp_server_base
     from shared.mcp_session import SyncMcpSession
@@ -175,6 +178,35 @@ def pytest_base_temp() -> Path:
     return Path(tempfile.gettempdir()) / f'pytest-of-{getpass.getuser()}'
 
 
+class _UnusableHostConfig(Exception):
+    pass
+
+
+def host_config_roots(configs_dir: Path) -> tuple[tuple[Path, ...], tuple[str, ...]]:
+    """The ``project_root`` each ``configs_dir/*.yaml`` names, and one problem line per file that names none."""
+    if not configs_dir.is_dir():
+        return (), (f'{configs_dir}: not a directory of host configs',)
+    roots: list[Path] = []
+    problems: list[str] = []
+    for config in sorted(path for path in configs_dir.glob('*.yaml') if path.is_file()):
+        try:
+            roots.append(_project_root_of(config))
+        except _UnusableHostConfig as exc:
+            problems.append(f'{config}: {exc}')
+    return tuple(roots), tuple(problems)
+
+
+def _project_root_of(config: Path) -> Path:
+    try:
+        loaded = yaml.safe_load(config.read_text())
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise _UnusableHostConfig(f'unreadable ({type(exc).__name__})') from exc
+    root = loaded.get('project_root') if isinstance(loaded, dict) else None
+    if not isinstance(root, str) or not Path(root).is_absolute():
+        raise _UnusableHostConfig('names no absolute project_root')
+    return Path(root).resolve()
+
+
 def swept_trees(
     project_roots: Iterable[Path], claude_projects_dir: Path, *, pytest_tmp_dir: Path | None = None
 ) -> tuple[SweptTree, ...]:
@@ -195,14 +227,14 @@ def run(
     config: SweepConfig,
     *,
     environ: Mapping[str, str],
-    post_escalation: PostEscalation,
+    post_escalation: PostEscalation | None,
 ) -> SweepResult:
     secrets = secret_env_values(environ)
     needles = {markup: redaction_needles(secrets, markup=markup) for markup in Markup}
     if not needles[Markup.JSON]:
         return SweepResult(ok=False, cause=NO_SECRETS_CAUSE)
     result = _scan(config, needles)
-    if config.dry_run or not (result.redacted or result.refused):
+    if config.dry_run or post_escalation is None or not (result.redacted or result.refused):
         return result
     try:
         post_escalation(_escalation_arguments(result, config.now))
@@ -394,18 +426,31 @@ def _parser() -> argparse.ArgumentParser:
         action='store_true',
         help='rewrite nothing and file no escalation; list the files a real run would redact under "matched"',
     )
+    parser.add_argument(
+        '--host-configs-dir',
+        type=Path,
+        default=None,
+        help='also sweep the project_root each DIR/*.yaml names (a host with no orchestrator units, '
+        'e.g. ~/.config/orchestrator on the laptop)',
+    )
+    parser.add_argument(
+        '--no-escalation',
+        action='store_true',
+        help='file no escalation; the record line is the only report (a host with no escalation server)',
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     targets, unit_scan = orchestrator_projects.targets_from_args(args)
-    for problem in unit_scan.problems:
+    host_roots, host_problems = host_config_roots(args.host_configs_dir) if args.host_configs_dir else ((), ())
+    for problem in (*unit_scan.problems, *host_problems):
         print(f'transcript_secret_sweep.py: {problem}', file=sys.stderr)
     claude_projects = args.claude_projects_dir or Path.home() / '.claude' / 'projects'
     config = SweepConfig(
         trees=swept_trees(
-            [target.root for target in targets],
+            dict.fromkeys([*(target.root for target in targets), *host_roots]),
             claude_projects,
             pytest_tmp_dir=args.pytest_tmp_dir or pytest_base_temp(),
         ),
@@ -416,7 +461,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     result = run(
         config,
         environ=os.environ,
-        post_escalation=functools.partial(_post_escalate_info, args.escalation_url),
+        post_escalation=None if args.no_escalation else functools.partial(_post_escalate_info, args.escalation_url),
     )
     print(json.dumps(result.record(), sort_keys=True))
     if not result.ok:
