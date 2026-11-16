@@ -904,3 +904,35 @@ class TestTheCommittedReport:
         markdown = _COMMITTED_REPORT.with_suffix('.md').read_text()
 
         assert _mod().render_markdown(_committed_report()) == markdown
+
+
+_COMMITTED_AUDIT_CONFIG = SCRIPTS.parent / 'config' / 'duplicate-audit.yaml'
+
+
+class TestTheRecallCaveatCarriesTheCommittedMeasurement:
+    """The yaml is the single home the 10244 resolver reads; the report is its derivation."""
+
+    def _caveat(self):
+        return _report_schema().load_config(_COMMITTED_AUDIT_CONFIG).recall_caveat
+
+    def test_its_single_adjudicator_entry_is_the_reports_entry_verbatim(self):
+        reported = _committed_report()['recall_caveat_entry']
+
+        (entry,) = self._caveat().adjudicator_measurements
+
+        assert entry.source == reported['source']
+        assert entry.model_dump(mode='json') == reported
+
+    def test_gate_filing_stays_blocked_and_owned_by_4916(self):
+        caveat = self._caveat()
+
+        assert caveat.fitness.gate_filing == 'blocked'
+        assert caveat.gate_filing_owner_task == 4916
+
+    def test_the_2026_08_11_measurement_is_unchanged(self):
+        caveat = self._caveat()
+
+        assert caveat.measured_at == '2026-08-11'
+        assert caveat.paraphrase_band_recall['ann'].model_dump() == {'caught': 25, 'of': 301}
+        assert caveat.paraphrase_band_recall['lexical'].model_dump() == {'caught': 0, 'of': 301}
+        assert caveat.auc_true_vs_hard_negative == 0.2534
