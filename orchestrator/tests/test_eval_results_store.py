@@ -159,6 +159,27 @@ class TestExistence:
         assert store.paths_matching('t', 'cfg') == []
 
 
+class TestTaskCells:
+    def test_every_config_of_the_task_is_listed_in_path_order(
+        self, store: ResultStore
+    ):
+        b = store.save(_result(task_id='df_task_1', config_name='cfg-b'))
+        a = store.save(_result(task_id='df_task_1', config_name='cfg-a'))
+        store.save(_result(task_id='df_task_12', config_name='cfg-a'))
+        store.save(_result(task_id='u', config_name='cfg-a'))
+        assert store.paths_for_task('df_task_1') == sorted([a, b])
+
+    def test_names_outside_the_grammar_are_not_cells(self, store: ResultStore):
+        cell = store.save(_result(task_id='df_task_1', config_name='cfg'))
+        payload = json.dumps(_result(task_id='df_task_1', config_name='cfg').to_dict())
+        (store.directory / 'df_task_1__cfg.json').write_text(payload)
+        (store.directory / 'df_task_1__cfg__r__x.json').write_text(payload)
+        assert store.paths_for_task('df_task_1') == [cell]
+
+    def test_a_missing_directory_lists_no_task_cells(self, store: ResultStore):
+        assert store.paths_for_task('t') == []
+
+
 class TestCellPaths:
     def test_only_top_level_json_files_are_cells(self, store: ResultStore):
         cell = store.save(_result())

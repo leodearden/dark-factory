@@ -16,15 +16,16 @@
 # Cost: one live `eval-ofat` over the OFAT candidate set × a single fixture
 # (default df_task_12) — real LLM budget and minutes. It is the operator
 # go/no-go gate, NOT a CI test. Set SMOKE_SKIP_EVAL to run ONLY the Phase-2
-# assertions over whatever results already sit in RESULTS_DIR — the
+# assertions over whatever results already sit in the results dir — the
 # assertion-logic path the test suite (test_eval_bootstrap_smoke.py) drives
-# over synthetic result JSONs, with no LLM spend.
+# over synthetic result JSONs, with no LLM spend. Cells are listed by
+# scripts/list_eval_cells.py, so only names in ResultStore's grammar count.
 #
 # Env knobs (all optional):
 #   SMOKE_SKIP_EVAL    set to any value → skip the live eval-ofat; assert only.
-#   SMOKE_RESULTS_DIR  results dir to assert over
-#                      (default: orchestrator/src/orchestrator/evals/results —
-#                      where eval-ofat writes).
+#   SMOKE_RESULTS_DIR  results dir to assert over (default: the packaged store,
+#                      orchestrator/src/orchestrator/evals/results.py::ResultStore.packaged
+#                      — where eval-ofat writes).
 #   SMOKE_FIXTURE      fixture id to run/assert (default: df_task_12).
 #   SMOKE_CONFIG       orchestrator config YAML
 #                      (default: <repo>/dark-factory-orchestrator.yaml).
@@ -35,14 +36,27 @@ set -euo pipefail
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CONFIG=${SMOKE_CONFIG:-$REPO_ROOT/dark-factory-orchestrator.yaml}
 FIXTURE=${SMOKE_FIXTURE:-df_task_12}
-RESULTS_DIR=${SMOKE_RESULTS_DIR:-$REPO_ROOT/orchestrator/src/orchestrator/evals/results}
 PYBIN=$REPO_ROOT/.venv/bin/python
 TIMEOUT=${SMOKE_TIMEOUT:-25}
 
+cells_args=("$FIXTURE")
+if [[ -n "${SMOKE_RESULTS_DIR:-}" ]]; then
+  cells_args+=(--results-dir "$SMOKE_RESULTS_DIR")
+fi
+
+# Fills the array named $1 with the fixture's cells, one element per path.
+fixture_cells_into() {
+  local -n cells=$1
+  local listing
+  listing=$("$PYBIN" "$REPO_ROOT/scripts/list_eval_cells.py" "${cells_args[@]}")
+  cells=()
+  if [[ -n "$listing" ]]; then mapfile -t cells <<<"$listing"; fi
+}
+
 # --- Phase 0: tie the harness/JSON-parser to the pin -------------------------
-# The result JSON below is parsed with $PYBIN; fail fast unless it is itself the
-# pinned 3.13, so a stale/mismatched interpreter can't silently mask a BUG-2
-# regression.
+# $PYBIN lists the cells (scripts/list_eval_cells.py) and parses the result JSON
+# below; fail fast unless it is itself the pinned 3.13, so a stale/mismatched
+# interpreter can't silently mask a BUG-2 regression.
 ver=$("$PYBIN" --version 2>&1 || true)
 case "$ver" in
   "Python 3.13."*) : ;;
@@ -54,12 +68,12 @@ case "$ver" in
 esac
 
 # --- Phase 1: live eval-ofat (skipped entirely when SMOKE_SKIP_EVAL set) ------
-shopt -s nullglob
 if [[ -z "${SMOKE_SKIP_EVAL:-}" ]]; then
   # Snapshot the pre-existing result set so Phase 2 asserts only over THIS
   # run's freshly-written results, not stale ones from a prior run.
-  declare -A _before
-  for f in "$RESULTS_DIR/${FIXTURE}__"*.json; do _before["$f"]=1; done
+  fixture_cells_into before_cells
+  declare -A _before=()
+  for f in "${before_cells[@]}"; do _before["$f"]=1; done
 
   tasks_dir=$(mktemp -d)
   trap 'rm -rf "$tasks_dir"' EXIT
@@ -70,13 +84,14 @@ if [[ -z "${SMOKE_SKIP_EVAL:-}" ]]; then
     --config "$CONFIG" --tasks-dir "$tasks_dir" \
     --max-parallel 1 --trials 1 --timeout "$TIMEOUT"
 
+  fixture_cells_into after_cells
   check_files=()
-  for f in "$RESULTS_DIR/${FIXTURE}__"*.json; do
-    [[ -n "${_before[$f]:-}" ]] || check_files+=("$f")
+  for f in "${after_cells[@]}"; do
+    if [[ -z "${_before[$f]:-}" ]]; then check_files+=("$f"); fi
   done
 else
-  # Dry-run: assert over ALL of this fixture's results already in RESULTS_DIR.
-  check_files=("$RESULTS_DIR/${FIXTURE}__"*.json)
+  # Dry-run: assert over ALL of this fixture's cells already in the results dir.
+  fixture_cells_into check_files
 fi
 
 # --- Phase 2: assert BUG 1 & BUG 2 over the result JSONs (parsed via $PYBIN, no jq)
