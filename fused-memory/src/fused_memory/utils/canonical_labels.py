@@ -10,9 +10,9 @@
 
 Precision over recall: the pads around '#' and ':' are space or tab, never a
 line break; the task word and the digits are ASCII; and the right edge refuses
-any Unicode digit, so a mixed digit run yields nothing. The measured cases live
-in tests/test_canonical_labels.py, and the reasons in
-plans/review-all-s26-memory-service-write-path-and-graph-client-prd.md
+any word character, so a mixed digit run or a hash such as '8c7e163' yields
+nothing. The measured cases live in tests/test_canonical_labels.py, and the
+reasons in plans/review-all-s26-memory-service-write-path-and-graph-client-prd.md
 §Rationale rehomed.
 """
 
@@ -79,7 +79,7 @@ _MARK = _Fragment(_PAD, '[#:]', _PAD)
 _SEPARATOR = _either(_MARK, _GAP)
 _MENTION_SEPARATOR = _either(_MARK, _GAP, r'[-/]')
 _NUMBER = _Fragment(r'([0-9]+)')
-_NUMBER_END = _Fragment(r'(?!\d)')
+_NUMBER_END = _Fragment(r'(?!\w)')
 _QUALIFIER = _Fragment(r'([A-Za-z][A-Za-z0-9_-]{2,})')
 _MENTION_LEFT_EDGE = _Fragment(r'(?<![\w:-])')
 _REF_LEFT_EDGE = _Fragment(r'(?<![\w:/.-])')
