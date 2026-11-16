@@ -9,28 +9,40 @@ and nothing here logs or does I/O.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
-from typing import TypeAlias, assert_never
+from typing import ClassVar, TypeAlias, assert_never
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_serializer,
+    field_validator,
+)
 
 __all__ = [
+    'ActiveReserve',
     'DEFAULT_ADMIT_TIERS',
     'DRIFT_HORIZON',
     'DRIFT_TOLERANCE',
     'TIER_WHEN_UNKNOWN',
     'AdmitTiers',
+    'InvalidReserve',
+    'Reserve',
     'ReserveConfig',
     'ReserveEvent',
+    'ReserveState',
     'ScheduleDrift',
     'WeeklyReset',
     'WorkClass',
     'WorkClassSource',
     'WorkKind',
     'admits',
+    'parse_reserve',
     'resolve_work_class',
     'schedule_drift',
 ]
@@ -214,3 +226,51 @@ def schedule_drift(config: ReserveConfig, observed_reset: datetime) -> ScheduleD
     if DRIFT_TOLERANCE < abs(observed - nearest) <= DRIFT_HORIZON:
         return ScheduleDrift(configured_reset=nearest, observed_reset=observed)
     return None
+
+
+class ReserveState(StrEnum):
+    ACTIVE = 'active'
+    INVALID = 'invalid'
+
+
+@dataclass(frozen=True)
+class ActiveReserve:
+    config: ReserveConfig
+    state: ClassVar[ReserveState] = ReserveState.ACTIVE
+
+
+@dataclass(frozen=True)
+class InvalidReserve:
+    """A block that was present but unusable: inert, and always saying why."""
+
+    reason: str
+    state: ClassVar[ReserveState] = ReserveState.INVALID
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ValueError(f'an invalid reserve needs a reason, got {self.reason!r}')
+
+
+Reserve: TypeAlias = ActiveReserve | InvalidReserve
+
+
+def parse_reserve(block: object, account_names: Collection[str]) -> Reserve:
+    """The accounts file's ``reserve:`` block as a reserve; every failure is an InvalidReserve."""
+    try:
+        config = ReserveConfig.model_validate(block)
+    except ValidationError as error:
+        return InvalidReserve(_validation_reason(error))
+    if config.account not in account_names:
+        listed = ', '.join(account_names) or 'none'
+        return InvalidReserve(
+            f'reserve.account {config.account!r} names no listed account (listed: {listed})'
+        )
+    return ActiveReserve(config)
+
+
+def _validation_reason(error: ValidationError) -> str:
+    entries = []
+    for detail in error.errors():
+        location = '.'.join(['reserve', *(str(part) for part in detail['loc'])])
+        entries.append(f'{location}: {detail["msg"]}')
+    return '; '.join(entries)
