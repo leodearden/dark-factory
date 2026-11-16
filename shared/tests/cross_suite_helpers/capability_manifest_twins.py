@@ -1,7 +1,10 @@
 """Which of a capability-manifest sidecar's task labels its human-readable .md twin never mentions.
 
-Pinned by ``shared/tests/test_capability_manifest_twins.py``. A label is mentioned when the
-twin contains it as a token bounded by the label alphabet ``[\\w′-]``, verbatim or, for an
+Unit-tested by ``shared/tests/test_capability_manifest_twins.py`` and consumed by the corpus
+guard ``tests/repo_guards/test_checked_in_capability_manifest_twins.py``. Importable bare
+because both suites' conftests put this ``cross_suite_helpers/`` directory on sys.path.
+
+A label is mentioned when the twin contains it as a token bounded by the label alphabet ``[\\w′-]``, verbatim or, for an
 ASCII Greek name with optional digits (``gamma1``), as its Greek letter in either case.
 """
 

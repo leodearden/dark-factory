@@ -1,21 +1,19 @@
-"""Tests for capability_manifest_twins: a sidecar's task labels must all appear in its .md twin."""
+"""Tests for capability_manifest_twins: a sidecar's task labels must all appear in its .md twin.
+
+The sweep over the committed corpus is tests/repo_guards/test_checked_in_capability_manifest_twins.py.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
-from capability_manifest_corpus import REPO_ROOT, discover_manifests
 from capability_manifest_twins import check_md_twin, md_twin_path, unmentioned_labels
 from pydantic import ValidationError
 
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-_DISCOVERED = discover_manifests()
-_SIDECARS = _DISCOVERED or []
-_SIDECAR_IDS = [str(p.relative_to(REPO_ROOT)) for p in _SIDECARS]
 
 
 class TestMdTwinPath:
@@ -150,14 +148,3 @@ class TestCheckMdTwin:
         with pytest.raises(ValidationError):
             check_md_twin(sidecar, tmp_path)
 
-
-class TestCheckedInManifestTwins:
-    def test_corpus_discovery_is_not_vacuous(self):
-        if _DISCOVERED is None:
-            pytest.skip('not a git checkout (git ls-files failed)')
-        assert _SIDECARS, 'discover_manifests() returned an empty corpus'
-
-    @pytest.mark.parametrize('sidecar', _SIDECARS, ids=_SIDECAR_IDS)
-    def test_md_twin_mentions_every_sidecar_label(self, sidecar):
-        message = check_md_twin(sidecar, REPO_ROOT)
-        assert message is None, message
