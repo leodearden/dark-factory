@@ -883,17 +883,12 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
 
     The walk repeats until a pass changes nothing, bounded by
     :data:`_MAX_REPAIR_ROUNDS`. The loop exists because a recovered value is a
-    verbatim substring of the corrupted tail and can therefore itself carry
-    markup — the nested double-leak class cancelled task 3654 identified.
-    Landing such a value in a hole and stopping would leave a repairable string
-    behind and break the binding "a second run reports 0" invariant.
-
-    A SECOND ROUND IS REACHABLE IN PRINCIPLE, which is what makes this loop
-    LOAD-BEARING rather than merely structural: two widenings of ``repair()``
-    have landed (tasks **4502** and **5620**) and neither restored the premise
-    this paragraph used to rest on. No document in either live corpus has been
-    OBSERVED to need a second round — a different claim, and a weaker one. See
-    :data:`_MAX_REPAIR_ROUNDS`, where both are stated once.
+    verbatim substring of the corrupted tail and may itself QUOTE a closing tag
+    (task 4502's carve-out). Round one lands such a value in its hole still
+    tripping detect(), and only a later round can refuse it, so stopping after
+    one pass would leave that residue unreported. Why a second round is
+    reachable, and what the live corpora have actually been observed to need,
+    are stated once at :data:`_MAX_REPAIR_ROUNDS`.
 
     Exceeding the bound is reported LOUDLY as a
     :data:`ACTION_DID_NOT_CONVERGE` outcome naming the path that was still

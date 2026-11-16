@@ -898,14 +898,14 @@ def repair(
         if any(_hides_parameter_opener(v, schema) for v in recovered.values()):
             continue
         clean_value = value[: candidate.start()]
-        # PREFIX-CLEAN, the third accept-time condition. The scan steps over a
+        # PREFIX-CLEAN, an accept-time condition. The scan steps over a
         # candidate whose tail does not parse, which leaves that closer sitting
         # inside every LATER candidate's prefix — and if it is itself an
         # envelope literal, accepting would hand back a clean_value that still
         # trips the detector while permanently dropping whatever arguments hide
-        # in the residue. `continue` rather than `return None` keeps all three
-        # refusals one shape; the outcome is identical either way because
-        # candidate start positions increase monotonically, so a poisoned
+        # in the residue. `continue` rather than `return None` keeps every
+        # accept-time refusal one shape; the outcome is identical either way
+        # because candidate start positions increase monotonically, so a poisoned
         # prefix stays poisoned — but `continue` needs no such argument to be
         # correct.
         #
@@ -923,14 +923,15 @@ def repair(
 
         misclose = candidate.group(0)
         # Both union scans run on the ACCEPT PATH ONLY — the prefix scan just
-        # above fires only after a tail has already parsed and passed B8/B9,
-        # and this one only after the prefix came back clean. repair() refuses
-        # far more often than it reaches either: every value with no qualifying
-        # candidate at all, plus every ordinary argument that merely happens to
-        # contain a closing tag. Hoisting a detect() above the loop would
-        # instead pay a full-string scan on that overwhelmingly common no-op
-        # path, at a per-tool-call middleware boundary (PRD contract C2) over
-        # values the corpus shows reaching tens of KB. That argument is
+        # above fires only after a tail has already parsed and passed every
+        # other accept-time condition, and this one only after the prefix
+        # came back clean. repair() refuses far more often than it reaches
+        # either: every value with no qualifying candidate at all, plus every
+        # ordinary argument that merely happens to contain a closing tag.
+        # Hoisting a detect() above the loop would instead pay a full-string
+        # scan on that overwhelmingly common no-op path, at a per-tool-call
+        # middleware boundary (PRD contract C2) over values the corpus shows
+        # reaching tens of KB. That argument is
         # unchanged by task 4696: the accept path now pays the WIDENED scan
         # above, and the refuse path still pays neither.
         #

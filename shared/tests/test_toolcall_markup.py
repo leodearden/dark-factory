@@ -926,9 +926,12 @@ class TestQuotedReportIsRepairable:
 
     (g)/(h) ARE A PAIR, NOT FULL COVERAGE of the opener side. Task **5639**
     closed the residual 5620 declared, a sibling opener with no closing tag
-    anywhere, and the last test in BOUNDS
-    (``test_the_opener_verdict_does_not_depend_on_a_closing_tag``) pins the
-    opener verdict with and without a closer in both dialects.
+    anywhere. ``test_the_opener_verdict_does_not_depend_on_a_closing_tag``
+    pins the opener verdict with and without a closer in both dialects;
+    ``test_an_opener_hidden_in_a_LATER_recovered_value_is_refused`` and
+    ``test_an_opener_refusal_does_not_fall_through_to_a_later_truncation``
+    pin that every recovered value is checked and that a refusal only
+    advances the scan.
     """
 
     # escalate_info's eleven parameters, and the five the corrupted call
