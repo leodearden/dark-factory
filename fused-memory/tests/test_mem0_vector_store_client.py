@@ -159,3 +159,4 @@ async def test_a_first_touch_overrunning_its_write_budget_raises_a_timeout_namin
                 await backend.get(MEMORY_ID, SCOPE)
             stub.release_event.set()
             await poll_until(lambda: not stub.collection_lists_in_flight())
+            assert await backend.get(MEMORY_ID, SCOPE) is None

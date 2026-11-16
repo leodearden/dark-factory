@@ -246,8 +246,8 @@ class Mem0Backend:
     both budgets, so a slow mem0 leg fails on its named budget
     (tests/test_mem0_vector_store_client.py).  The one exception left: the
     direct async client's socket timeout is still the read budget, so its
-    writes can still fail unattributed (gap (2) of task 8196; see
-    :meth:`_ensure_collection`).
+    calls can still fail unattributed: its writes, and :meth:`list_projects`'
+    untimed listing (gap (2) of task 8196; see :meth:`_ensure_collection`).
 
     This paragraph is the CANONICAL statement of the rule, and a method's own
     ``Raises:`` line adds only the consequence specific to IT — so there is one
