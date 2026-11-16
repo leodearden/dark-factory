@@ -49,10 +49,11 @@ a restored task holds it.
 
 - *Skipping the review.* A review killed mid-flight has no verdict, so it runs again. (The reviewer's own agent
   session can be continued, and today sometimes is: 5 times since 2026-10-25, against 11 attempts that fell back
-  to a fresh review, 10 of them because the session's transcript was not found. Rule: `session_resume` and
-  `session_resume_fallback` events with role `reviewer_comprehensive` in `data/orchestrator/runs.db`, read
-  2026-11-15. That is a separate defect and a separate investigation, started 2026-11-15; it is not part of this
-  plan.)
+  to a fresh review. Rule: `session_resume` and `session_resume_fallback` events with role
+  `reviewer_comprehensive` in `data/orchestrator/runs.db`, read 2026-11-15. Every fallback named a session that
+  had not started: it was waiting for an account at the stop, so no transcript existed and no review work was
+  lost. Task 4802 owns the telemetry fix; `plans/reviewer-transcripts-study-2026-11-15/REPORT.md` has the
+  evidence. It is not part of this plan.)
 - *Skipping the verify.* Choice 5 in section 6.
 - *Capped agent accounts.* A resumed task whose agent account is capped starts and then waits, holding its
   files, exactly as it would have if there had been no restart. This plan does not change that.
@@ -371,7 +372,7 @@ Four tasks and one gate, serialised because each edits `scheduler.py` or `harnes
 
 ## 12. Out of scope
 
-- Skipping verify or review, and the reviewer-session transcript defect (section 2, choice 5).
+- Skipping verify or review, and the reviewer-session fallbacks (section 2, choice 5; task 4802).
 - Reservations, skip counts and watchdog counts across a restart (task 3824; the trial runs to 2026-11-30).
 - Draining running tasks to a phase boundary before a stop (ruled 2026-10-04).
 - Re-attaching to a verify that was running at the stop.
