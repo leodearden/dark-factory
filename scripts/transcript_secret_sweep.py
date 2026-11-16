@@ -20,8 +20,10 @@ the repo ``.env``), and replaces them with ``shared.secret_redaction``'s
 same-length placeholders. It reads only regular files, and skips those
 modified within ``min_age_secs``, which a live session or test run may still
 be appending to. A sweep that redacted or refused anything files one
-``risk_identified`` info escalation. Nothing it prints or files carries a
-value. Operator view: ``OPERATIONS.md`` §12.
+``risk_identified`` info escalation. A dry run (``--dry-run``) rewrites and
+files nothing and lists what a real run would redact under ``matched``.
+Nothing it prints or files carries a value. Operator view: ``OPERATIONS.md``
+§12.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 try:
     import orchestrator_projects
@@ -61,6 +64,7 @@ try:
         FileRedaction,
         Markup,
         Needle,
+        preview_redaction,
         redact_in_place,
         redaction_needles,
     )
@@ -96,6 +100,10 @@ PostEscalation = Callable[[dict[str, object]], object]
 NeedlesByMarkup = Mapping[Markup, Sequence[Needle]]
 
 
+class Redact(Protocol):
+    def __call__(self, path: Path, needles: Sequence[Needle], *, codec: Codec) -> FileRedaction: ...
+
+
 @dataclass(frozen=True)
 class SweptTree:
     root: Path
@@ -107,10 +115,11 @@ class SweepConfig:
     trees: tuple[SweptTree, ...]
     now: datetime.datetime
     min_age_secs: float = DEFAULT_MIN_AGE_SECS
+    dry_run: bool = False
 
 
 @dataclass(frozen=True)
-class RedactedFile:
+class FileHits:
     path: Path
     counts: Mapping[str, int]
 
@@ -134,7 +143,9 @@ class _Verdict(enum.Enum):
 class SweepResult:
     ok: bool
     cause: str | None = None
-    redacted: tuple[RedactedFile, ...] = ()
+    dry_run: bool = False
+    redacted: tuple[FileHits, ...] = ()
+    matched: tuple[FileHits, ...] = ()
     refused: tuple[RefusedFileLine, ...] = ()
     deferred: tuple[Path, ...] = ()
     unreadable: tuple[Path, ...] = ()
@@ -145,13 +156,19 @@ class SweepResult:
         return {
             'ok': self.ok,
             'cause': self.cause,
-            'redacted': [{'path': str(f.path), 'counts': dict(f.counts)} for f in self.redacted],
+            'dry_run': self.dry_run,
+            'redacted': _hits_record(self.redacted),
+            'matched': _hits_record(self.matched),
             'refused': [{'path': str(f.path), 'var': f.var, 'line': f.line_number} for f in self.refused],
             'deferred': [str(path) for path in self.deferred],
             'unreadable': [str(path) for path in self.unreadable],
             'clean': self.clean,
             'escalation_error': self.escalation_error,
         }
+
+
+def _hits_record(files: Iterable[FileHits]) -> list[dict[str, object]]:
+    return [{'path': str(f.path), 'counts': dict(f.counts)} for f in files]
 
 
 def pytest_base_temp() -> Path:
@@ -185,7 +202,7 @@ def run(
     if not needles[Markup.JSON]:
         return SweepResult(ok=False, cause=NO_SECRETS_CAUSE)
     result = _scan(config, needles)
-    if not (result.redacted or result.refused):
+    if config.dry_run or not (result.redacted or result.refused):
         return result
     try:
         post_escalation(_escalation_arguments(result, config.now))
@@ -196,17 +213,18 @@ def run(
 
 def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
     cutoff_ns = int((config.now.timestamp() - config.min_age_secs) * 1e9)
-    redacted: list[RedactedFile] = []
+    redact: Redact = preview_redaction if config.dry_run else redact_in_place
+    hits: list[FileHits] = []
     refused: list[RefusedFileLine] = []
     deferred: list[Path] = []
     unreadable: list[Path] = []
     clean = 0
     for path in _swept_files(config.trees, unreadable):
-        outcome = _sweep_file(path, needles, cutoff_ns)
+        outcome = _sweep_file(path, needles, cutoff_ns, redact)
         match outcome:
             case FileRedaction():
                 if outcome.redacted:
-                    redacted.append(RedactedFile(path, outcome.counts))
+                    hits.append(FileHits(path, outcome.counts))
                 refused.extend(RefusedFileLine(path, line.var, line.line_number) for line in outcome.refused)
             case _Verdict.CLEAN:
                 clean += 1
@@ -218,7 +236,9 @@ def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
                 pass
     return SweepResult(
         ok=True,
-        redacted=tuple(redacted),
+        dry_run=config.dry_run,
+        redacted=() if config.dry_run else tuple(hits),
+        matched=tuple(hits) if config.dry_run else (),
         refused=tuple(refused),
         deferred=tuple(deferred),
         unreadable=tuple(unreadable),
@@ -248,7 +268,9 @@ def _format_of(name: str) -> tuple[Markup, Codec]:
     return Markup.JSON, Codec.PLAIN
 
 
-def _sweep_file(path: Path, needles: NeedlesByMarkup, cutoff_ns: int) -> FileRedaction | _Verdict:
+def _sweep_file(
+    path: Path, needles: NeedlesByMarkup, cutoff_ns: int, redact: Redact
+) -> FileRedaction | _Verdict:
     try:
         st = os.lstat(path)
     except FileNotFoundError:
@@ -261,7 +283,7 @@ def _sweep_file(path: Path, needles: NeedlesByMarkup, cutoff_ns: int) -> FileRed
         return _Verdict.DEFERRED
     markup, codec = _format_of(path.name)
     try:
-        redaction = redact_in_place(path, needles[markup], codec=codec)
+        redaction = redact(path, needles[markup], codec=codec)
     except FileChangedDuringRedaction:
         return _Verdict.DEFERRED
     except FileNotFoundError:
@@ -336,9 +358,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             'Redact live secret values from agent transcripts, verify logs and offline-lane logs '
-            'already on disk.'
+            'already on disk, or with --dry-run list what is still there.'
         ),
-        epilog='Exit 0: the sweep ran. Exit 2: it could not run, or its escalation was not filed.',
+        epilog=(
+            'Exit 0: the sweep ran (a dry run\'s answer is the record\'s "matched" list). '
+            'Exit 2: it could not run, or its escalation was not filed.'
+        ),
     )
     orchestrator_projects.add_arguments(parser)
     parser.add_argument(
@@ -364,6 +389,11 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_MIN_AGE_SECS,
         help=f'skip files modified more recently than this (default: {DEFAULT_MIN_AGE_SECS:g})',
     )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='rewrite nothing and file no escalation; list the files a real run would redact under "matched"',
+    )
     return parser
 
 
@@ -381,6 +411,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         now=datetime.datetime.now(datetime.UTC),
         min_age_secs=args.min_age_secs,
+        dry_run=args.dry_run,
     )
     result = run(
         config,

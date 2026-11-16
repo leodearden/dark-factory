@@ -641,7 +641,7 @@ class TestDryRun:
         assert {hit.path: dict(hit.counts) for hit in result.matched} == expected
         assert {path: (path.read_bytes(), _identity(path)) for path in before} == before
         assert poster.calls == []
-        record = result.record()
+        record = json.loads(json.dumps(result.record()))
         assert record['dry_run'] is True
         assert record['redacted'] == []
         assert {hit['path']: hit['counts'] for hit in record['matched']} == {
