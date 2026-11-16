@@ -9,6 +9,10 @@ from capability_manifest_corpus import REPO_ROOT, discover_manifests
 from capability_manifest_twins import check_md_twin, md_twin_path, unmentioned_labels
 from pydantic import ValidationError
 
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 _DISCOVERED = discover_manifests()
 _SIDECARS = _DISCOVERED or []
 _SIDECAR_IDS = [str(p.relative_to(REPO_ROOT)) for p in _SIDECARS]
