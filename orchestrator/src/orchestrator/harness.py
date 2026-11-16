@@ -17571,9 +17571,14 @@ class Harness:
             ),
         )
 
-    _STRUCTURAL_EXHAUSTION_SENTINEL: str = '__warm_lane_structural_exhaustion__'
-    _STRUCTURAL_EXHAUSTION_ROOT_CAUSE: str = 'warm_lane_pool_structurally_exhausted'
-    _STRUCTURAL_EXHAUSTION_ROLE: str = 'orchestrator-warm-lane-structural-exhaustion'
+    _STRUCTURAL_EXHAUSTION_ALARM: ClassVar[BornAtL2Alarm] = BornAtL2Alarm(
+        root_cause='warm_lane_pool_structurally_exhausted',
+        task_id='__warm_lane_structural_exhaustion__',
+        role='orchestrator-warm-lane-structural-exhaustion',
+        category=EscalationCategory.INFRA_ISSUE,
+        suggested_action='investigate_warm_lane_structural_exhaustion',
+        created_reason='warm-lane-structural-exhaustion-threshold',
+    )
 
     def _file_structural_exhaustion_l2(
         self, count: int, census: WarmLanePoolCensus,
@@ -17591,20 +17596,11 @@ class Harness:
         sized too small) would requeue every task forever with NO loud signal.
         This born-at-L2 is that sole loud signal.
 
-        Mirrors :meth:`_file_lane_record_drift_l2`:
-          - No-op when _escalation_queue is None (bare-Harness unit tests).
-          - Deduped via find_pending_l2_by_root_cause(
-            'warm_lane_pool_structurally_exhausted') — a bare fixed literal (not
-            a per-task f-string) so repeated threshold trips file exactly one
-            pending L2.
-          - Best-effort: every exception is swallowed so filing can never break
-            the pool's acquire path (I3 fail-open).
-          - agent_role is an orchestrator sentinel + severity='urgent' → the L2
-            is exempt from the agent-role downgrade gate and routes straight to
-            a human.
-          - Carries the α census counts (size / n_free / n_assigned_dispatched /
-            n_pinned_non_dispatched / n_unknown_dispatch / n_quarantined) as
-            structured fields so an operator sees WHY the pool is full (INV-2).
+        Carries the α census counts (size / n_free / n_assigned_dispatched /
+        n_pinned_non_dispatched / n_unknown_dispatch / n_quarantined) as
+        structured fields so an operator sees WHY the pool is full (INV-2).
+
+        The no-op, dedup and fail-open rules are :meth:`_file_deduped_born_at_l2`'s.
 
         SIZING ASSUMPTION (review amendment — robustness): this L2 is a reliable
         ABNORMALITY signal only when the warm-lane pool is sized to
@@ -17622,21 +17618,14 @@ class Harness:
         an abnormality signal.  Census-shape severity gating (saturation ⇒ lower
         tier) was considered and deliberately deferred as out of scope here.
         """
-        queue = getattr(self, '_escalation_queue', None)
-        if not queue:        # bare-Harness unit tests / lifecycle tests stay green
-            return
-        try:
-            if queue.find_pending_l2_by_root_cause(
-                self._STRUCTURAL_EXHAUSTION_ROOT_CAUSE
-            ) is not None:
-                return                         # dedup: one open L2 at a time
-            from escalation.models import Escalation
-            census_line = census.render()
-            summary = (
+        census_line = census.render()
+        self._file_deduped_born_at_l2(
+            self._STRUCTURAL_EXHAUSTION_ALARM,
+            summary=(
                 f'warm-lane pool structurally exhausted: {count} consecutive '
                 f'EXHAUSTED acquires — {census_line}'
-            )[:200]
-            detail = (
+            ),
+            detail=(
                 f'acquire_warm_lane has returned EXHAUSTED {count} consecutive '
                 'time(s), reaching warm_lane_structural_exhaustion_l2_threshold — '
                 'no FREE lane and no reclaimable capacity across that many '
@@ -17652,52 +17641,8 @@ class Harness:
                 'n_assigned_dispatched == size means genuine saturation (raise '
                 'max_concurrent_tasks / pool size or shed load); '
                 'n_quarantined > 0 means durably quarantined lanes need recovery.'
-            )
-            esc = Escalation(
-                id=queue.make_id(self._STRUCTURAL_EXHAUSTION_SENTINEL),
-                task_id=self._STRUCTURAL_EXHAUSTION_SENTINEL,
-                agent_role=self._STRUCTURAL_EXHAUSTION_ROLE,
-                severity='urgent',
-                category='infra_issue',
-                level=2,
-                root_cause=self._STRUCTURAL_EXHAUSTION_ROOT_CAUSE,
-                summary=summary,
-                detail=detail,
-                suggested_action='investigate_warm_lane_structural_exhaustion',
-                filing_claimant_run_id=self._filing_claimant_run_id,
-            )
-            queue.submit(esc)
-            try:
-                if self.event_store:
-                    self.event_store.emit(
-                        EventType.escalation_created,
-                        task_id=self._STRUCTURAL_EXHAUSTION_SENTINEL,
-                        data={
-                            'escalation_id': esc.id,
-                            'category': esc.category,
-                            'severity': esc.severity,
-                            'level': esc.level,
-                            'reason': 'warm-lane-structural-exhaustion-threshold',
-                        },
-                    )
-            except Exception:
-                # Isolated from the outer handler: the L2 is already filed, so a
-                # failure here is an observability-only miss, never a "failed to
-                # file L2" condition.
-                logger.warning(
-                    'warm-lane-structural-exhaustion: L2 %s filed but '
-                    'escalation_created emit failed', esc.id, exc_info=True,
-                )
-            logger.warning(
-                'warm-lane-structural-exhaustion: pool structurally exhausted '
-                '(consecutive EXHAUSTED=%d); L2 filed %s — %s',
-                count, esc.id, census_line,
-            )
-        except Exception:
-            logger.warning(
-                'warm-lane-structural-exhaustion: failed to file L2 escalation',
-                exc_info=True,
-            )
+            ),
+        )
 
     @staticmethod
     def _reblock_signature(escalation) -> str:
