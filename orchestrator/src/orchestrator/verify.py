@@ -11352,7 +11352,7 @@ async def run_node_ids(
         )
 
     if concurrent_groups:
-        group_statuses = await asyncio.gather(*map(run_group, qualified_by_prefix))
+        group_statuses = await gather_unwound(*map(run_group, qualified_by_prefix))
     else:
         group_statuses = [await run_group(prefix) for prefix in qualified_by_prefix]
     statuses: dict[str, NodeIdStatus] = {}
