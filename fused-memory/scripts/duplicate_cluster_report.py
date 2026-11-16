@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import subprocess
 import sys
 from collections import Counter
@@ -47,10 +48,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -102,39 +104,93 @@ class ScanSet(_Frozen):
     records: int = Field(gt=0)
 
 
+def _ordered_unit_interval(bounds: tuple[float, float]) -> tuple[float, float]:
+    low, high = bounds
+    if not 0.0 <= low <= high <= 1.0:
+        raise ValueError(f'must be an ordered interval within [0, 1], got {list(bounds)}')
+    return bounds
+
+
+UnitRate = Annotated[float, Field(ge=0.0, le=1.0)]
+UnitInterval = Annotated[tuple[float, float], AfterValidator(_ordered_unit_interval)]
+
+_FLOAT_SLACK = 1e-9
+
+
+def _require_rate(rate: float, caught: int, of: int, interval: tuple[float, float]) -> None:
+    """*rate* is *caught*/*of*, and *interval* contains it."""
+    if not math.isclose(rate, caught / of, rel_tol=_FLOAT_SLACK, abs_tol=_FLOAT_SLACK):
+        raise ValueError(f'rate {rate} is not {caught}/{of}')
+    low, high = interval
+    if not low - _FLOAT_SLACK <= rate <= high + _FLOAT_SLACK:
+        raise ValueError(f'rate {rate} lies outside its interval {list(interval)}')
+
+
 class CandidateGeneration(_Frozen):
     top_k: int = Field(gt=0)
     caught: int = Field(ge=0)
     of: int = Field(gt=0)
 
+    @model_validator(mode='after')
+    def _caught_within_of(self) -> CandidateGeneration:
+        if self.caught > self.of:
+            raise ValueError(f'caught {self.caught} exceeds of {self.of}')
+        return self
+
 
 class AdjudicatorRecall(_Frozen):
     caught: int = Field(ge=0)
     of: int = Field(gt=0)
-    rate: float
-    wilson_95: tuple[float, float]
+    rate: UnitRate
+    wilson_95: UnitInterval
+
+    @model_validator(mode='after')
+    def _rate_is_caught_over_of(self) -> AdjudicatorRecall:
+        if self.caught > self.of:
+            raise ValueError(f'caught {self.caught} exceeds of {self.of}')
+        _require_rate(self.rate, self.caught, self.of, self.wilson_95)
+        return self
 
 
 class AdjudicatorPrecision(_Frozen):
     flagged: int = Field(gt=0)
-    rate: float
-    wilson_95: tuple[float, float]
+    rate: UnitRate
+    wilson_95: UnitInterval
 
 
 class HardNegativeFlagged(_Frozen):
     flagged: int = Field(ge=0)
     of: int = Field(gt=0)
 
+    @model_validator(mode='after')
+    def _flagged_within_of(self) -> HardNegativeFlagged:
+        if self.flagged > self.of:
+            raise ValueError(f'flagged {self.flagged} exceeds of {self.of}')
+        return self
+
 
 class AucMeasurement(_Frozen):
-    value: float
+    value: UnitRate
     n_true: int = Field(gt=0)
     n_hard_negative: int = Field(gt=0)
-    hanley_mcneil_95: tuple[float, float]
+    hanley_mcneil_95: UnitInterval
+
+    @model_validator(mode='after')
+    def _interval_contains_value(self) -> AucMeasurement:
+        low, high = self.hanley_mcneil_95
+        if not low - _FLOAT_SLACK <= self.value <= high + _FLOAT_SLACK:
+            raise ValueError(
+                f'value {self.value} lies outside its interval {list(self.hanley_mcneil_95)}',
+            )
+        return self
 
 
 class AdjudicatorMeasurement(_Frozen):
-    """One dated adjudicator-over-ANN measurement, as measure_duplicate_detector_recall.py emits it."""
+    """One dated adjudicator-over-ANN measurement, as measure_duplicate_detector_recall.py emits it.
+
+    Its blocks must agree: every count is drawn from the same labelled pairs,
+    and the adjudicator flags only pairs the generator formed.
+    """
 
     measured_at: str = Field(min_length=1)
     detector: str = Field(min_length=1)
@@ -147,6 +203,40 @@ class AdjudicatorMeasurement(_Frozen):
     auc_true_vs_hard_negative: AucMeasurement
     meets_proposed_gate: bool = Field(strict=True)
     source: str = Field(min_length=1)
+
+    @model_validator(mode='after')
+    def _counts_agree(self) -> AdjudicatorMeasurement:
+        recall, generated = self.paraphrase_band_recall, self.candidate_generation
+        auc, hard = self.auc_true_vs_hard_negative, self.hard_negative_flagged
+        if generated.of != recall.of:
+            raise ValueError(f'candidate_generation.of {generated.of} is not recall of {recall.of}')
+        if recall.caught > generated.caught:
+            raise ValueError(f'recall caught {recall.caught} exceeds the {generated.caught} generated')
+        if auc.n_true > recall.of or auc.n_hard_negative > hard.of:
+            raise ValueError(
+                f'AUC counts {auc.n_true} true / {auc.n_hard_negative} hard negative exceed '
+                f'the labelled {recall.of} / {hard.of}',
+            )
+        return self
+
+    @model_validator(mode='after')
+    def _operating_point_agrees(self) -> AdjudicatorMeasurement:
+        recall, precision = self.paraphrase_band_recall, self.precision_at_operating_point
+        if (self.operating_threshold is None) != (precision is None):
+            raise ValueError(
+                'operating_threshold and precision_at_operating_point are set or null together',
+            )
+        flagged = 0 if precision is None else precision.flagged
+        if precision is not None:
+            _require_rate(precision.rate, recall.caught, flagged, precision.wilson_95)
+        elif recall.caught:
+            raise ValueError(f'recall caught {recall.caught} with no operating point')
+        if self.hard_negative_flagged.flagged > flagged - recall.caught:
+            raise ValueError(
+                f'{self.hard_negative_flagged.flagged} hard negatives flagged, but only '
+                f'{flagged - recall.caught} false positives',
+            )
+        return self
 
 
 class Fitness(_Frozen):

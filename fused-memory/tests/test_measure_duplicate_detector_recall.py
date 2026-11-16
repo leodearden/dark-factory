@@ -625,7 +625,7 @@ def _generation():
     m = _mod()
     return m.CandidateGeneration(
         top_k=3, candidates=((0, 1), (0, 2)),
-        true_caught=m.Proportion(hits=1, total=4, rate=0.25, wilson_95=(0.05, 0.7)),
+        true_caught=m.Proportion(hits=3, total=4, rate=0.75, wilson_95=(0.3, 0.95)),
         hard_negative_generated=1, cross_category_true_pairs=37,
         disclosure={'top_k_saturated': 2, 'missing_vector': 0},
     )
@@ -719,7 +719,9 @@ class TestReportAndProposal:
         assert self._chosen([_baseline(), _skipped()]) is None
 
     def test_the_recall_caveat_entry_validates_against_the_config_schema(self):
-        report = _report([_skipped(), _row('chosen-arm', hits=3, total=4)])
+        report = _report([_skipped(), _row(
+            'chosen-arm', hits=3, total=4, flagged=4, recall_lo=0.3, precision_lo=0.3,
+        )])
 
         entry = report['recall_caveat_entry']
 
@@ -730,7 +732,7 @@ class TestReportAndProposal:
             'fused-memory/calibration/duplicate_detector_recall_report.json (task 10243)'
         )
         assert (model.paraphrase_band_recall.caught, model.paraphrase_band_recall.of) == (3, 4)
-        assert (model.candidate_generation.caught, model.candidate_generation.of) == (1, 4)
+        assert (model.candidate_generation.caught, model.candidate_generation.of) == (3, 4)
         assert model.meets_proposed_gate is report['chosen']['verdict']['on_point_estimates']
         assert list(entry) == list(_report_schema().AdjudicatorMeasurement.model_fields)
 

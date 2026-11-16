@@ -103,6 +103,10 @@ def _with_adjudicator_entry(data: dict, **changes: object) -> dict:
     return _with_caveat(data, adjudicator_measurements=[{**_ADJUDICATOR_ENTRY, **changes}])
 
 
+def _with_adjudicator_block(data: dict, block: str, **changes: object) -> dict:
+    return _with_adjudicator_entry(data, **{block: {**_ADJUDICATOR_ENTRY[block], **changes}})
+
+
 _BAD_CONFIGS = {
     'missing_key': lambda d: _without(d, 'scan_limit'),
     'unknown_key': lambda d: _with(d, gate_cap=3),
@@ -129,6 +133,55 @@ _BAD_CONFIGS = {
     'adjudicator_entry_non_bool_verdict': lambda d: _with_adjudicator_entry(
         d, meets_proposed_gate='yes',
     ),
+    'adjudicator_entry_rate_above_one': lambda d: _with_adjudicator_block(
+        d, 'precision_at_operating_point', rate=1.4,
+    ),
+    'adjudicator_entry_auc_above_one': lambda d: _with_adjudicator_block(
+        d, 'auc_true_vs_hard_negative', value=1.2,
+    ),
+    'adjudicator_entry_recall_caught_over_of': lambda d: _with_adjudicator_block(
+        d, 'paraphrase_band_recall', caught=8,
+    ),
+    'adjudicator_entry_recall_rate_not_caught_over_of': lambda d: _with_adjudicator_block(
+        d, 'paraphrase_band_recall', rate=0.5,
+    ),
+    'adjudicator_entry_reversed_interval': lambda d: _with_adjudicator_block(
+        d, 'paraphrase_band_recall', wilson_95=[0.84, 0.25],
+    ),
+    'adjudicator_entry_interval_excludes_rate': lambda d: _with_adjudicator_block(
+        d, 'paraphrase_band_recall', wilson_95=[0.6, 0.84],
+    ),
+    'adjudicator_entry_auc_interval_excludes_value': lambda d: _with_adjudicator_block(
+        d, 'auc_true_vs_hard_negative', hanley_mcneil_95=[0.7, 1.0],
+    ),
+    'adjudicator_entry_precision_rate_not_caught_over_flagged': lambda d: _with_adjudicator_block(
+        d, 'precision_at_operating_point', rate=0.5,
+    ),
+    'adjudicator_entry_generation_caught_over_of': lambda d: _with_adjudicator_block(
+        d, 'candidate_generation', caught=8,
+    ),
+    'adjudicator_entry_generation_of_is_not_recall_of': lambda d: _with_adjudicator_block(
+        d, 'candidate_generation', of=8,
+    ),
+    'adjudicator_entry_recall_beyond_generation': lambda d: _with_adjudicator_block(
+        d, 'candidate_generation', caught=3,
+    ),
+    'adjudicator_entry_auc_counts_exceed_labels': lambda d: _with_adjudicator_block(
+        d, 'auc_true_vs_hard_negative', n_true=8,
+    ),
+    'adjudicator_entry_threshold_without_precision': lambda d: _with_adjudicator_entry(
+        d, precision_at_operating_point=None,
+    ),
+    'adjudicator_entry_caught_without_operating_point': lambda d: _with_adjudicator_entry(
+        d, operating_threshold=None, precision_at_operating_point=None,
+        hard_negative_flagged={'flagged': 0, 'of': 2},
+    ),
+    'adjudicator_entry_hard_negatives_beyond_false_positives': lambda d: _with_adjudicator_entry(
+        d, hard_negative_flagged={'flagged': 3, 'of': 3},
+    ),
+    'adjudicator_entry_hard_negative_flagged_over_of': lambda d: _with_adjudicator_entry(
+        d, hard_negative_flagged={'flagged': 3, 'of': 2},
+    ),
 }
 
 
@@ -143,6 +196,8 @@ class TestAdjudicatorMeasurements:
     def test_an_unreachable_precision_floor_loads_as_nulls(self, tmp_path: Path) -> None:
         path = _write_yaml(tmp_path, _with_adjudicator_entry(
             _committed_yaml(), operating_threshold=None, precision_at_operating_point=None,
+            paraphrase_band_recall={'caught': 0, 'of': 7, 'rate': 0.0, 'wilson_95': [0.0, 0.35]},
+            hard_negative_flagged={'flagged': 0, 'of': 2},
         ))
 
         (entry,) = report.load_config(path).recall_caveat.adjudicator_measurements
