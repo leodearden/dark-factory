@@ -4,7 +4,7 @@
    consumers can destructure from the global.
 
    Exports: window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo,
-             disambiguateLabels, labelFor, lockChipStateFor }
+             disambiguateLabels, labelFor, isLockHolder, lockHeldAgainst, lockChipStateFor }
    (Canonical list: the window.DF_SCHED_UTILS assignment at the bottom of this file.)
 */
 
@@ -111,35 +111,64 @@ function labelFor(paths) {
   return disambiguateLabels(paths || []);
 }
 
-// The holder > parked > free precedence. Its callers, LockChip (tabs.jsx), the
-// Task-detail ModuleLocksSection (tab_tasks.jsx) and the Scheduler heatmap's
-// cellStateFor (scheduler_heatmap.jsx), all reach it through lockChipStateFor,
-// the module's only classifier export, so one lock reads the same in all three.
+// The one place a task is decided to hold a SCHEDULER.modules entry's lock:
+// its id is among the entry's holders, in this project, an entry with no
+// holder_project read as the task's own project.
+function isLockHolder(module, taskId, project) {
+  const m = module || {};
+  return (m.holders || []).includes(taskId) && (m.holder_project || project) === project;
+}
+
+// The one place a lock is decided to block a task on its holders: they fill
+// the key's holder limit and the task is not one of them. An entry without the
+// server's at_holder_limit verdict blocks nothing.
+function lockHeldAgainst(module, taskId, project) {
+  const m = module || {};
+  return m.at_holder_limit === true && !isLockHolder(m, taskId, project);
+}
+
+function holdersOwnerLabel(holders) {
+  const more = holders.length > 1 ? ` +${holders.length - 1}` : '';
+  return `T-${holders[0]}${more}`;
+}
+
+// The mine > held against > parked > free precedence. Its callers, LockChip
+// (tabs.jsx), the Task-detail ModuleLocksSection (tab_tasks.jsx) and the
+// Scheduler heatmap's cellStateFor (scheduler_heatmap.jsx), all reach it
+// through lockChipStateFor, the module's only classifier export, so one lock
+// reads the same in all three. A key shared below its holder limit blocks no
+// one, so it reads free, its hint naming the holders.
 // Returns { cls, hint, ownerLabel } where ownerLabel is null when the chip has
 // no owner to display (lock-free or lock-mine without a counterpart label).
-function lockChipState({ holder, isMine, parkedBy, parkedOwnerLive }) {
-  if (holder) {
-    if (isMine) return { cls: 'lock-mine', hint: 'held by this task', ownerLabel: null };
-    return { cls: 'lock-taken', hint: `held by T-${holder}`, ownerLabel: `T-${holder}` };
+function lockChipState({ holders, isMine, heldAgainst, parkedBy, parkedOwnerLive }) {
+  const holderNames = holders.map(h => `T-${h}`).join(', ');
+  if (isMine) return { cls: 'lock-mine', hint: 'held by this task', ownerLabel: null };
+  if (heldAgainst) {
+    return { cls: 'lock-taken', hint: `held by ${holderNames}`, ownerLabel: holdersOwnerLabel(holders) };
   }
   if (parkedBy) {
     const label = `T-${parkedBy}${parkedOwnerLive === false ? ' ⚠' : ''}`;
     return { cls: 'lock-parked', hint: `parked by T-${parkedBy}`, ownerLabel: label };
   }
+  if (holders.length > 0) {
+    return { cls: 'lock-free', hint: `shared with ${holderNames}, below its holder limit`, ownerLabel: null };
+  }
   return { cls: 'lock-free', hint: 'available', ownerLabel: null };
 }
 
-// lockChipState for one task's view of one SCHEDULER.modules entry (or none):
-// the one place a lock is decided to be "mine" — held by this task id in this
-// project, an entry with no holder_project read as the task's own project.
+// lockChipState for one task's view of one SCHEDULER.modules entry (or none).
 function lockChipStateFor(module, taskId, project) {
   const m = module || {};
   return lockChipState({
-    holder: m.holder,
-    isMine: Boolean(m.holder) && m.holder === taskId && (m.holder_project || project) === project,
+    holders: m.holders || [],
+    isMine: isLockHolder(m, taskId, project),
+    heldAgainst: lockHeldAgainst(m, taskId, project),
     parkedBy: m.parked_by,
     parkedOwnerLive: m.parked_owner_live,
   });
 }
 
-window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels, labelFor, lockChipStateFor };
+window.DF_SCHED_UTILS = {
+  fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels, labelFor,
+  isLockHolder, lockHeldAgainst, lockChipStateFor,
+};
