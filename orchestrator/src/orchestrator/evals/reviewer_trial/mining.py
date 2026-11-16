@@ -27,6 +27,7 @@ from pathlib import Path
 from shared.merge_subject import MergeSubject, parse_merge_subject
 
 from orchestrator.agents.invoke import invoke_agent
+from orchestrator.evals.paths import main_checkout
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest, GroundTruthIssue
 
@@ -542,7 +543,7 @@ If there are no issues, return an empty issues list. Output your findings as JSO
     result = await invoke_agent(
         prompt=prompt,
         system_prompt=system_prompt,
-        cwd=Path('/home/leo/src/dark-factory'),
+        cwd=main_checkout(),
         model=model,
         max_turns=max_turns,
         max_budget_usd=2.0,
