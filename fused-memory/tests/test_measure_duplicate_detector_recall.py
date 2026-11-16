@@ -360,3 +360,176 @@ class TestClaimLevelArms:
             assert scorer.inner is sentinel
         assert opened_with == [context, context]
         assert (full.name, claims.name) == ('fake', 'fake+claims')
+
+
+def _fake_arm(open_, name='fake-arm', arm_class=None):
+    spec = _arms().ArmSpec(
+        name=name, arm_class=arm_class or _arms().ArmClass.local_cross_encoder,
+        model='fake/model', open=open_,
+    )
+    return _mod().DetectorArm(spec, _mod().Granularity.full_text)
+
+
+def _yielding(scorer):
+    return lambda context: contextlib.nullcontext(scorer)
+
+
+class TestMeasureDetectorArm:
+    # Six records t0..t5. True pairs (0,1) (2,3) (4,5); hard negatives (0,2)
+    # (1,3); every other pair unrelated. The candidates leave out the true
+    # pair (4,5) and the hard negative (1,3), which must still be scored.
+    _PAIR_SCORES = {
+        (0, 1): 0.9, (2, 3): 0.7, (4, 5): 0.8,
+        (0, 2): 0.75, (1, 3): 0.3, (1, 4): 0.6,
+    }
+    _CANDIDATES = ((0, 1), (0, 2), (1, 4), (2, 3))
+    _FLOOR = 0.6
+
+    def _memories(self):
+        return [
+            {'id': f'm{i}', 'content': f't{i}', 'category': _PK, 'vector': [1.0, 0.0]}
+            for i in range(6)
+        ]
+
+    def _classes(self):
+        classes = {(i, j): 'unrelated_pairs' for i in range(6) for j in range(i + 1, 6)}
+        classes.update({p: 'true_dup_pairs' for p in ((0, 1), (2, 3), (4, 5))})
+        classes.update({p: 'hard_negative_pairs' for p in ((0, 2), (1, 3))})
+        return classes
+
+    def _table(self):
+        table = {}
+        for (i, j), score in self._PAIR_SCORES.items():
+            table[(f't{i}', f't{j}')] = score
+            table[(f't{j}', f't{i}')] = score
+        return table
+
+    def _measure(self, arm, *, max_spend_usd=1.0, clock=None, memories=None):
+        return _mod().measure_detector_arm(
+            arm, memories or self._memories(), self._CANDIDATES, self._classes(),
+            context=_context(), max_spend_usd=max_spend_usd,
+            clock=clock or iter([10.0, 12.5]).__next__,
+            proposal=types.SimpleNamespace(precision_floor=self._FLOOR),
+        )
+
+    def _scorer(self, **kwargs):
+        facts = _arms().ScorerFacts(device='cpu', vram_peak_mib=None, max_length=512)
+        return _TableScorer(self._table(), facts=facts, **kwargs)
+
+    def test_auc_covers_every_labelled_pair_even_ungenerated_ones(self):
+        scorer = self._scorer()
+        row = self._measure(_fake_arm(_yielding(scorer)))
+
+        assert row.status == 'measured'
+        assert row.auc.value == pytest.approx(5 / 6)
+        assert (row.auc.n_true, row.auc.n_hard_negative) == (3, 2)
+        assert row.auc.hanley_mcneil_95 == _mod().auc_interval_95(row.auc.value, 3, 2)
+        assert ('t4', ('t1', 't5')) in scorer.calls
+
+    def test_the_operating_point_is_chosen_over_candidates_only(self):
+        row = self._measure(_fake_arm(_yielding(self._scorer())))
+
+        assert row.operating_rule == 'max_caught_at_precision_floor'
+        assert row.operating_threshold == pytest.approx(0.7)
+        assert (row.paraphrase_band_recall.hits, row.paraphrase_band_recall.total) == (2, 3)
+        assert row.paraphrase_band_recall.rate == pytest.approx(2 / 3)
+        assert (row.precision.hits, row.precision.total) == (2, 3)
+        assert (row.hard_negative_flagged.hits, row.hard_negative_flagged.total) == (1, 2)
+
+    def test_recall_at_each_precision_floor_is_reported(self):
+        row = self._measure(_fake_arm(_yielding(self._scorer())))
+
+        assert set(row.recall_at_precision) == {0.80, 0.90, 0.95}
+        for point in row.recall_at_precision.values():
+            assert (point.threshold, point.caught, point.flagged) == (pytest.approx(0.9), 1, 1)
+
+    def test_cost_truncation_device_and_time_are_recorded(self):
+        scorer = self._scorer(costs=[0.01] * 6, over=[0, 1, 0, 0, 2, 0])
+        row = self._measure(_fake_arm(_yielding(scorer)))
+
+        assert row.pairs_scored == 12
+        assert row.unscored_pairs == 0
+        assert row.cost_usd == pytest.approx(0.06)
+        assert row.pairs_over_max_length == 3
+        assert (row.device, row.vram_peak_mib, row.max_length) == ('cpu', None, 512)
+        assert row.scoring_seconds == pytest.approx(2.5)
+
+    def test_an_unmeasured_truncation_is_none(self):
+        scorer = self._scorer(over=[0, None, 0, 0, 0, 0])
+
+        assert self._measure(_fake_arm(_yielding(scorer))).pairs_over_max_length is None
+
+    def test_an_empty_endpoint_is_counted_unscored(self):
+        memories = self._memories()
+        memories[5]['content'] = '  '
+
+        row = self._measure(_fake_arm(_yielding(self._scorer())), memories=memories)
+
+        assert row.unscored_pairs == 1
+        assert row.auc.n_true == 2
+
+    def _assert_skipped(self, row, reason, detail):
+        assert row.status == 'skipped'
+        assert row.skip_reason == reason
+        assert row.skip_detail == detail
+        assert row.arm == 'fake-arm'
+        for metric in (
+            row.auc, row.operating_threshold, row.paraphrase_band_recall, row.precision,
+            row.hard_negative_flagged, row.recall_at_precision, row.pairs_scored,
+            row.cost_usd, row.pairs_over_max_length, row.scoring_seconds,
+        ):
+            assert metric is None
+
+    def test_an_unavailable_arm_is_a_skipped_row(self):
+        def open_(context):
+            raise _arms().ArmUnavailable(_arms().SkipReason.no_credential, 'KEY unset')
+
+        row = self._measure(_fake_arm(open_))
+
+        self._assert_skipped(row, 'no_credential', 'KEY unset')
+
+    def test_crossing_the_spend_ceiling_is_a_skipped_row(self):
+        row = self._measure(
+            _fake_arm(_yielding(self._scorer(costs=[0.01] * 6))), max_spend_usd=0.015,
+        )
+
+        assert row.status == 'skipped'
+        assert row.skip_reason == 'over_budget'
+        assert row.auc is None
+
+    def test_any_other_failure_is_a_skipped_error_row(self):
+        class Boom:
+            def score(self, entry, candidate_texts):
+                raise RuntimeError('boom')
+
+            def facts(self):
+                return None
+
+        row = self._measure(_fake_arm(_yielding(Boom())))
+
+        self._assert_skipped(row, 'error', 'RuntimeError: boom')
+
+    def test_the_ann_baseline_scores_the_existing_detector(self):
+        records = [
+            _record('a', 'C1', 'canonical', _PK),
+            _record('b', 'C1', 'duplicate', _PK),
+            _record('c', 'C2', 'canonical', _PK),
+            _record('d', 'C2', 'distinct', _PK),
+        ]
+        memories = _scan(records, {
+            'a': [1.0, 0.0], 'b': [0.8, 0.6], 'c': [0.6, 0.8], 'd': [0.0, 1.0],
+        })
+        classes = _mod().labelled_pair_classes(records)
+        neighbors = _mod().fixture_neighbors(memories, top_k=1)
+
+        row = _mod().measure_ann_baseline(memories, neighbors, {_PK: 0.79}, classes)
+
+        # Hits at >= 0.79: a-b (0.8), b-c (0.96), c-d (0.8 from d's list).
+        # True (a,b); hard negative (c,d); unrelated the rest.
+        assert row.operating_rule == 'calibrated_ann_cutoffs'
+        assert row.operating_threshold is None
+        assert (row.paraphrase_band_recall.hits, row.paraphrase_band_recall.total) == (1, 1)
+        assert (row.precision.hits, row.precision.total) == (1, 3)
+        assert (row.hard_negative_flagged.hits, row.hard_negative_flagged.total) == (1, 1)
+        assert row.auc.value == 0.5
+        assert (row.auc.n_true, row.auc.n_hard_negative) == (1, 1)
