@@ -70,9 +70,9 @@ REPAIRABLE_TIERS: frozenset[Tier] = frozenset({Tier.TERMINAL, Tier.HYGIENE})
 def _require_repairable(tiers: frozenset[Tier]) -> None:
     unrepairable = sorted(tier.value for tier in tiers - REPAIRABLE_TIERS)
     if unrepairable:
+        repairable = sorted(tier.value for tier in REPAIRABLE_TIERS)
         raise ValueError(
-            f'tiers {unrepairable} cannot be selected for repair: ledgered rows are '
-            'sanctioned C4-E2 exceptions and are never written'
+            f'tiers {unrepairable} cannot be selected for repair; only {repairable} may be'
         )
 
 

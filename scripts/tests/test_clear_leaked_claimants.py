@@ -860,6 +860,20 @@ class TestLedgeredRows:
         assert _skip_delta(report, 4028) == {'tier': ('terminal', 'ledgered')}
         assert _claimants(root)[4028] == _seeded_claimant(POSITIVE_CONTROL)
 
+    def test_a_row_unledgered_after_the_census_arrives_during_the_window(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        _mutate_store(root, 'UPDATE tasks SET metadata = NULL WHERE id = 111')
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server, clock=_ticking_clock())
+
+        assert _tiers_by_id(census)[111] is Tier.LEDGERED
+        assert 111 not in server.written_ids()
+        assert _outcome_for(report, 111).bucket is Bucket.ARRIVED_DURING_WINDOW
+        assert _tiers_by_id(_verification(report))[111] is Tier.TERMINAL
+        assert _claimants(root)[111] == _seeded_claimant(LEDGERED_DONE)
+
     def test_a_dry_run_reports_ledgered_rows_separately(self, seed_root):
         result = _sweep([seed_root(TIER_TABLE_ROWS)], None, apply=False)
 
