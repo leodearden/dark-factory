@@ -292,21 +292,18 @@ class TestPricing:
 
         assert _estimate(data) == pytest.approx(expected, abs=1e-9)
 
-    def test_fable_5_2_list_rates_are_pinned(self) -> None:
-        """Published list price (unfitted): 8 in / 40 out / 0.20 read / 10 5m / 16 1h per 1M."""
-        usage = {
-            'input_tokens': 1_000_000,
-            'output_tokens': 1_000_000,
-            'cache_read_input_tokens': 1_000_000,
-            'cache_creation_input_tokens': 2_000_000,
-            'cache_creation': {
-                'ephemeral_1h_input_tokens': 1_000_000,
-                'ephemeral_5m_input_tokens': 1_000_000,
-            },
-        }
+    @pytest.mark.parametrize(('usage', 'expected'), [
+        (_usage(input_tokens=1_000_000), 8),
+        (_usage(output_tokens=1_000_000), 40),
+        (_usage(cache_read=1_000_000), 0.20),
+        (_usage(cache_write_1h=1_000_000), 16),
+        ({'cache_creation_input_tokens': 1_000_000}, 10),
+    ], ids=['input', 'output', 'cache-read', 'cache-write-1h', 'cache-write-5m'])
+    def test_fable_5_2_list_rate_per_usage_kind(self, usage, expected) -> None:
+        """Published list price (unfitted), per 1M tokens of one usage kind."""
         data = _result(total=1000.0, usage=usage, model_usage=_single_model('claude-fable-5-2'))
 
-        assert _estimate(data) == pytest.approx(8 + 40 + 0.20 + 10 + 16, abs=1e-9)
+        assert _estimate(data) == pytest.approx(expected, abs=1e-9)
 
     def test_cache_write_without_a_split_is_priced_at_the_5m_rate(self) -> None:
         usage = {'cache_creation_input_tokens': 1_000_000}
