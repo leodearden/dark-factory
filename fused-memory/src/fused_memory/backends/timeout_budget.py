@@ -11,8 +11,11 @@ what reaches an operator's log and
 ``services/memory_service.py::_store_failure_diagnostics``'s ``error`` field —
 so the message is a contract, and this module is its only home.
 
-It is also the home of the socket-deadline rule: a client's own socket timeout
-must outlast every budget its calls run under (``socket_timeout_outlasting``).
+A client's own socket timeout must outlast every budget its calls run under.
+``socket_timeout_outlasting`` derives one that does; a second, independent
+enforcement point checks FalkorDB's CONFIGURED socket timeout against the same
+rule: ``config/schema.py::FusedMemoryConfig._validate_socket_timeout_outlasts_backend_budgets``.
+A change to the rule changes both.
 """
 
 import asyncio
@@ -36,12 +39,12 @@ async def await_within(awaitable: Awaitable[_T], *, store: str, op: str, budget_
         raise TimeoutError(f'{store} {op} timed out after {budget_s}s') from exc
 
 
-def socket_timeout_outlasting(*budgets_s: float) -> int:
-    """The smallest whole second strictly above every one of *budgets_s*.
+def socket_timeout_outlasting(budget_s: float, *more_s: float) -> int:
+    """The smallest whole second strictly above *budget_s* and every one of *more_s*.
 
     A client's socket timeout must outlast every ``await_within`` budget its
     calls run under, so a stalled call fails on its NAMED budget and never on an
     anonymous socket error first; it is whole seconds because qdrant-client's
     ``timeout`` is an ``int``.
     """
-    return math.floor(max(budgets_s)) + 1
+    return math.floor(max((budget_s, *more_s))) + 1
