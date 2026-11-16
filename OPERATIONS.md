@@ -256,8 +256,9 @@ owning task id and how long the debt has been open), **per-test recurrence
 chains** (how many times a test has been re-suppressed, and when and by
 which commit it was last resolved), and **three health counters** — gate
 blind, non-convergence, and systemic. It also reads each open debt row's
-owner status live from fused-memory. Like `orchestrator status`, it needs
-fused-memory but no running orchestrator.
+owner status live from fused-memory when it can; when it cannot, it still
+prints the whole ledger and says `owner liveness: READ FAILED`. Like
+`orchestrator status`, it needs no running orchestrator.
 
 Gate blind and systemic are printed per call site, one block for each
 `FlakeCallSite` member and for any other spelling stored in the ledger; a
