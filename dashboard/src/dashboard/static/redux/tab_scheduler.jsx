@@ -15,7 +15,7 @@ const { Segmented, ProjectChips, timeago, fmtDateTime } = window.DF_SHELL;
 const { SchedulerHeatmap, cellStateFor } = window.DF_SCHED_HEATMAP;
 const { SchedulerDrawer } = window.DF_SCHED_DRAWER;
 // Shared helpers loaded by scheduler_utils.jsx (must come before this script).
-const { fmtAge, totalEvents, avgWaitSeconds, labelFor } = window.DF_SCHED_UTILS;
+const { fmtAge, totalEvents, avgWaitSeconds, labelFor, isLockHolder } = window.DF_SCHED_UTILS;
 
 const D = window.DF_DATA;
 
@@ -275,10 +275,10 @@ function ModulesView({ modules, rows, eventsMap }) {
         const waiters = (rows || []).filter(r =>
           (!m.project || r.project === m.project) &&
           (r.lock_set || []).includes(m.path) &&
-          m.holder !== r.task_id
+          !isLockHolder(m, r.task_id, r.project)
         );
         // The holder task_id is project-scoped; pair it with `holder_project`
-        // (set by the server when `current_holders` is non-empty) so the
+        // (set by the server whenever the module has a holder) so the
         // joined row lookup hits the correct project's row.
         const holderProject = m.holder_project || m.project || '';
         const holder = m.holder ? rowByCompositeKey[`${holderProject}/${m.holder}`] : null;
@@ -309,7 +309,10 @@ function ModulesView({ modules, rows, eventsMap }) {
             {m.holder ? (
               <div style={{ fontSize: 11, marginBottom: 8, padding: '6px 8px', background: 'var(--bg-2)', borderRadius: 4 }}>
                 <span style={{ color: 'var(--fg-3)' }}>held by </span>
-                <span className="mono" style={{ color: 'var(--accent)' }}>T-{m.holder}</span>
+                <span className="mono" style={{ color: 'var(--accent)' }}>{m.holders.map(h => `T-${h}`).join(', ')}</span>
+                {!m.at_holder_limit && (
+                  <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 8 }}>below its holder limit</span>
+                )}
                 {holderAge && (
                   <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 8 }}>({holderAge})</span>
                 )}
