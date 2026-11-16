@@ -2,8 +2,9 @@
 
 Drives ``TaskWorkflow._run_merge_phase`` around a REAL ``EscalationQueue``,
 with a short 0.5 + 0.5s escalated-wait window and every merge internal
-downstream of the gate stubbed.  Consumed by
-``test_workflow_merge_gating_strand.py`` and ``test_info_l2_never_gates.py``.
+downstream of the gate stubbed.  Its consumers are whichever test modules
+import it: ``test_merge_phase_fixtures_single_source.py`` finds them by that
+import and holds each to this module's objects.
 
 A uniquely named module rather than ``conftest.py`` for the reason
 ``_briefing_helpers.py`` gives: it imports by name from a test file without

@@ -1,63 +1,81 @@
 """Structural guard: the merge-phase scaffolding has ONE home (task 6780).
 
-Both consumers take it from orchestrator/tests/_merge_phase_fixtures.py (SPOT,
-heuristic 11), and neither uses a sibling test module as an import source, so
-each test file makes sense on its own (heuristic 13).
+Every test module that imports orchestrator/tests/_merge_phase_fixtures.py is
+found by that import, never listed by hand.  Each must bind that module's own
+objects under the names it shares with it (SPOT, heuristic 11), and none may
+use a sibling test module as an import source, so each test file makes sense
+on its own (heuristic 13).
 """
 from __future__ import annotations
 
 import ast
 import importlib
 from pathlib import Path
+from types import ModuleType
 
 # A module import, not a name import: importing a fixture by name would
 # register it in this test module.
 import _merge_phase_fixtures as fixtures
 import pytest
 
-SHARED = (
-    'git_repo',
-    'config',
-    'git_ops',
-    'task_assignment',
-    'PLAN',
-    '_build_workflow',
-    '_make_advanced_worktree',
-    '_make_silent_steward',
-    '_stub_merge_internals',
-    '_submit_gating_l0',
-    '_time_the_wait',
-    '_wire_resolve_callback',
-)
+_TESTS_DIR = Path(__file__).parent
 
-CONSUMERS = ('test_workflow_merge_gating_strand', 'test_info_l2_never_gates')
+
+def _imported_modules(source: str) -> list[str]:
+    imported: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported.append(node.module)
+        elif isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+    return imported
+
+
+def _consumers() -> tuple[str, ...]:
+    found = []
+    for path in sorted(_TESTS_DIR.glob('*.py')):
+        if path.name == Path(__file__).name:
+            continue
+        source = path.read_text()
+        if fixtures.__name__ in source and fixtures.__name__ in _imported_modules(source):
+            found.append(path.stem)
+    return tuple(found)
+
+
+CONSUMERS = _consumers()
+
+
+def _names_shared_with_fixtures(consumer: ModuleType) -> list[str]:
+    shared = vars(consumer).keys() & vars(fixtures).keys()
+    return sorted(n for n in shared if not (n.startswith('__') and n.endswith('__')))
+
+
+def test_the_scan_finds_the_support_modules_consumers() -> None:
+    assert CONSUMERS, (
+        f'No module in {_TESTS_DIR} imports {fixtures.__name__}, so every '
+        'consumer check below is an empty parametrization. Either the scan '
+        'is broken or the support module is dead and should be deleted.'
+    )
 
 
 @pytest.mark.parametrize('name', CONSUMERS)
 def test_each_consumer_binds_the_support_modules_objects(name: str) -> None:
     consumer = importlib.import_module(name)
-    bound = [n for n in SHARED if hasattr(consumer, n)]
-    assert bound, (
-        f'{name} binds none of the shared merge-phase scaffolding, so this '
-        'check asserted nothing.'
-    )
     # Identity, never equality: an equal re-paste passes a value comparison.
-    separate = [n for n in bound if getattr(consumer, n) is not getattr(fixtures, n)]
+    separate = [
+        n for n in _names_shared_with_fixtures(consumer)
+        if getattr(consumer, n) is not getattr(fixtures, n)
+    ]
     assert not separate, (
-        f'{name} binds its own copies of {separate}. Their one home is '
-        'orchestrator/tests/_merge_phase_fixtures.py; import them from there.'
+        f'{name} binds its own objects under {separate}, names that '
+        'orchestrator/tests/_merge_phase_fixtures.py also binds. That module '
+        'is their one home; import them from there, or rename the local.'
     )
 
 
 @pytest.mark.parametrize('name', CONSUMERS)
 def test_no_consumer_imports_a_sibling_test_module(name: str) -> None:
-    tree = ast.parse((Path(__file__).parent / f'{name}.py').read_text())
-    imported: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module:
-            imported.append(node.module)
-        elif isinstance(node, ast.Import):
-            imported.extend(alias.name for alias in node.names)
+    imported = _imported_modules((_TESTS_DIR / f'{name}.py').read_text())
     sibling_tests = sorted(m for m in imported if m.startswith('test_'))
     assert not sibling_tests, (
         f'{name} imports from the test module(s) {sibling_tests}. Import '
