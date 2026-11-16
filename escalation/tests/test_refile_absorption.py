@@ -1,0 +1,249 @@
+"""Contract guards on ``escalation.refile_absorption`` — which resolutions are absorbing refiles.
+
+Task 4915. ``escalation/src/escalation/queue.py::EscalationQueue.note_suppressed_refile``
+bumps ``refiles_suppressed`` on a resolved or dismissed record each time its
+resolution suppresses an identical refile. No triage surface lists terminal
+records, so the counter was readable only by someone who already knew the id.
+These tests hold the listing that closes that discovery gap.
+
+Every counted record is built through the REAL queue (submit -> resolve ->
+note_suppressed_refile), so the listing is held against the archive layout and
+JSON production writes, never against this file's beliefs about them.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import os
+from pathlib import Path
+
+import pytest
+
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue, iter_all_escalation_paths
+from escalation.refile_absorption import AbsorptionReport, absorbing_resolutions
+
+_CITATION = 'a' * 40
+
+
+class _Fixture:
+    """Builds records through the real queue's production write paths."""
+
+    def __init__(self, tmp_path: Path):
+        self.queue = EscalationQueue(tmp_path / 'escalations')
+        self._seq = 0
+
+    def _record(self, category: str, citation_sha: str | None) -> Escalation:
+        self._seq += 1
+        return Escalation(
+            id=f'esc-4915-{self._seq}', task_id='4915',
+            agent_role='orchestrator-landing-evidence', severity='blocking',
+            category=category, summary='refile absorption subject', level=1,
+            citation_sha=citation_sha,
+        )
+
+    def submit(
+        self, *, category: str = 'provenance_unattributed',
+        citation_sha: str | None = _CITATION,
+    ) -> Escalation:
+        record = self._record(category, citation_sha)
+        self.queue.submit(record)
+        return record
+
+    def resolve(self, record: Escalation) -> None:
+        resolved = self.queue.resolve(record.id, 'ruled', dismiss=True, resolved_by='watcher')
+        assert resolved is not None
+
+    def absorb(self, record: Escalation, times: int) -> None:
+        for _ in range(times):
+            assert self.queue.note_suppressed_refile(record.id) is not None
+
+    def resolved_absorbing(
+        self, times: int, *, category: str = 'provenance_unattributed',
+        citation_sha: str | None = _CITATION,
+    ) -> Escalation:
+        record = self.submit(category=category, citation_sha=citation_sha)
+        self.resolve(record)
+        self.absorb(record, times)
+        return record
+
+    def report(self) -> AbsorptionReport:
+        return absorbing_resolutions(self.queue.queue_dir)
+
+
+def _tier_of(fixture: _Fixture, escalation_id: str) -> str:
+    paths = [
+        p for p in iter_all_escalation_paths(fixture.queue.queue_dir)
+        if p.stem == escalation_id
+    ]
+    assert len(paths) == 1, f'expected exactly one file for {escalation_id}, got {paths}'
+    return 'archive' if 'archive' in paths[0].relative_to(fixture.queue.queue_dir).parts else 'root'
+
+
+class TestListing:
+    def test_a_resolution_bumped_three_times_is_one_row_carrying_the_record(
+        self, tmp_path: Path,
+    ):
+        fixture = _Fixture(tmp_path)
+        record = fixture.resolved_absorbing(3)
+
+        report = fixture.report()
+
+        assert len(report.rows) == 1
+        row = report.rows[0]
+        assert row.escalation_id == record.id
+        assert row.task_id == '4915'
+        assert row.category == 'provenance_unattributed'
+        assert row.status == 'dismissed'
+        assert row.refiles_suppressed == 3
+        assert row.citation_sha == _CITATION
+        assert row.resolved_by == 'watcher'
+        assert row.resolved_at is not None
+        assert report.total_absorbed == 3
+
+    def test_unbumped_and_pending_records_are_scanned_but_not_listed(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        bumped = fixture.resolved_absorbing(1)
+        never_bumped = fixture.submit()
+        fixture.resolve(never_bumped)
+        fixture.submit()
+
+        report = fixture.report()
+
+        assert [row.escalation_id for row in report.rows] == [bumped.id]
+        assert report.scanned == 3
+
+    def test_rows_sort_by_count_descending_then_by_id(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        two = fixture.resolved_absorbing(2)
+        five = fixture.resolved_absorbing(5)
+        tied_first = fixture.resolved_absorbing(1)
+        tied_second = fixture.resolved_absorbing(1)
+
+        report = fixture.report()
+
+        assert [row.escalation_id for row in report.rows] == [
+            five.id, two.id, tied_first.id, tied_second.id,
+        ]
+        assert report.total_absorbed == 9
+
+    def test_the_listing_is_category_agnostic(self, tmp_path: Path):
+        """Two producers bump this counter: landing evidence keyed on a citation
+        SHA, and the reconciliation harness's finding-task filer with none."""
+        fixture = _Fixture(tmp_path)
+        provenance = fixture.resolved_absorbing(2)
+        finding = fixture.resolved_absorbing(
+            1, category='recon_task_finding', citation_sha=None,
+        )
+
+        rows = {row.escalation_id: row for row in fixture.report().rows}
+
+        assert rows[provenance.id].category == 'provenance_unattributed'
+        assert rows[provenance.id].citation_sha == _CITATION
+        assert rows[finding.id].category == 'recon_task_finding'
+        assert rows[finding.id].citation_sha is None
+
+    def test_both_the_queue_root_and_the_archive_are_swept(self, tmp_path: Path):
+        """A failed archive move leaves the resolved file in the queue root
+        (``queue.py::EscalationQueue._archive_resolved``); a regular file where
+        the archive directory belongs is a real way to make that move fail."""
+        fixture = _Fixture(tmp_path)
+        fixture.queue.queue_dir.mkdir(parents=True, exist_ok=True)
+        blocker = fixture.queue.queue_dir / 'archive'
+        blocker.write_text('not a directory')
+        in_root = fixture.resolved_absorbing(4)
+        blocker.unlink()
+        in_archive = fixture.resolved_absorbing(2)
+        assert _tier_of(fixture, in_root.id) == 'root'
+        assert _tier_of(fixture, in_archive.id) == 'archive'
+
+        report = fixture.report()
+
+        assert [row.escalation_id for row in report.rows] == [in_root.id, in_archive.id]
+        assert report.total_absorbed == 6
+
+
+class TestScanCarriesItsShortfall:
+    """One bad file costs one record, and the report says which kind it was."""
+
+    def test_a_non_json_file_is_counted_unparsable(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        record = fixture.resolved_absorbing(1)
+        (fixture.queue.queue_dir / 'esc-junk-1.json').write_text('this is not json')
+
+        report = fixture.report()
+
+        assert [row.escalation_id for row in report.rows] == [record.id]
+        assert report.skipped_unparsable == 1
+        assert (report.skipped_vanished, report.skipped_unreadable) == (0, 0)
+        assert report.scanned == 1
+
+    def test_a_non_utf8_file_is_counted_unparsable_without_raising(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        record = fixture.resolved_absorbing(1)
+        (fixture.queue.queue_dir / 'esc-bin-1.json').write_bytes(b'\xff\xfe\x00')
+
+        report = fixture.report()
+
+        assert [row.escalation_id for row in report.rows] == [record.id]
+        assert report.skipped_unparsable == 1
+
+    def test_a_file_gone_between_listing_and_read_is_counted_vanished(self, tmp_path: Path):
+        """A dangling symlink is globbed like any other esc-*.json and then
+        fails the read with the same ENOENT a concurrent relocation produces."""
+        fixture = _Fixture(tmp_path)
+        record = fixture.resolved_absorbing(1)
+        queue_dir = fixture.queue.queue_dir
+        (queue_dir / 'esc-vanished-1.json').symlink_to(queue_dir / 'gone.json')
+
+        report = fixture.report()
+
+        assert [row.escalation_id for row in report.rows] == [record.id]
+        assert report.skipped_vanished == 1
+        assert (report.skipped_unreadable, report.skipped_unparsable) == (0, 0)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root reads a mode-000 file')
+    def test_a_file_present_but_unreadable_is_counted_unreadable(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        record = fixture.resolved_absorbing(1)
+        unreadable = fixture.queue.queue_dir / 'esc-unreadable-1.json'
+        unreadable.write_text('{}')
+        unreadable.chmod(0o000)
+        try:
+            report = fixture.report()
+        finally:
+            unreadable.chmod(0o600)
+
+        assert [row.escalation_id for row in report.rows] == [record.id]
+        assert report.skipped_unreadable == 1
+        assert (report.skipped_vanished, report.skipped_unparsable) == (0, 0)
+
+    def test_a_missing_queue_dir_is_an_empty_report(self, tmp_path: Path):
+        report = absorbing_resolutions(tmp_path / 'does-not-exist')
+
+        assert report.rows == ()
+        assert report.total_absorbed == 0
+        assert (
+            report.scanned, report.skipped_vanished,
+            report.skipped_unreadable, report.skipped_unparsable,
+        ) == (0, 0, 0, 0)
+
+
+class TestReportIsImmutable:
+    def test_the_report_is_frozen(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.resolved_absorbing(1)
+        report = fixture.report()
+
+        field = 'scanned'
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(report, field, 0)
+
+    def test_a_row_is_frozen(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.resolved_absorbing(1)
+        row = fixture.report().rows[0]
+
+        field = 'refiles_suppressed'
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            setattr(row, field, 0)
