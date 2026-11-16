@@ -28,9 +28,10 @@ from pathlib import Path
 import codebook as codebook_mod
 import coder as mod
 import digest as digest_mod
+import legibility_sighting_fit_fixtures as reify_fit
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
-from legibility import invariants, session_runner
+from legibility import invariants, session_runner, sighting_fit
 from quality_doc_texts import code_quality, definition_body, heuristic_headlines
 
 # Imported AFTER `coder`, deliberately: it is coder.py's own module-level
@@ -1563,6 +1564,43 @@ def test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger():
     merged_text = json.dumps(merge.codebook)
     assert populated
     assert [value for value in populated if value not in merged_text] == []
+
+
+_RULE_STAMP = {"method": "title", "run_id": "census-reify-20261116"}
+
+
+def _code_reify(reply) -> dict:
+    result = mod.code_digest(
+        _hand_digest(_SESSION_ID, "marker"), reify_fit.reify_codebook_at_rest(), project="reify",
+        invariant_slugs=_NO_SLUGS, invoke=lambda prompt, model: json.dumps(reply),
+    )
+    assert result.ok, result.reason
+    assert result.record is not None
+    return result.record
+
+
+def test_a_reply_never_carries_a_rule_stamp():
+    record = _code_reify({
+        "matches": [{"entry_id": reify_fit.ENTRY_ID, "note": "same", "attached_by": _RULE_STAMP}],
+        "candidates": [{"title": "A novel shape", "attached_by": _RULE_STAMP}],
+    })
+
+    assert record["matches"] == [{"entry_id": reify_fit.ENTRY_ID, "note": "same"}]
+    assert record["candidates"] == [{"title": "A novel shape"}]
+
+
+def test_a_match_claiming_a_rule_attach_never_counts_toward_the_filing_gate():
+    record = _code_reify({
+        "matches": [{"entry_id": reify_fit.ENTRY_ID, "note": "same", "attached_by": _RULE_STAMP}],
+        "candidates": [],
+    })
+
+    merge = codebook_mod.apply_coding_records(reify_fit.reify_codebook_at_rest(), [record], invariant_slugs=())
+
+    assert merge.invalid_records == ()
+    entry = codebook_mod.record_by_id(merge.codebook["entries"], reify_fit.ENTRY_ID, kind="entry")
+    assert sighting_fit.standings(merge.codebook, entry)[_SESSION_ID] is sighting_fit.Standing.UNEVIDENCED
+    assert sighting_fit.counted_sessions(merge.codebook, entry) == frozenset({reify_fit.FOUNDING_SESSION})
 
 
 @pytest.mark.parametrize(

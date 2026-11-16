@@ -253,6 +253,24 @@ def _prescribed_reply() -> dict[str, list[dict[str, str | None]]]:
 _REPLY_KEYS = tuple(_prescribed_reply())
 """The reply schema code_digest reads: exactly the keys build_prompt prescribes."""
 
+_RULE_STAMP_FIELD = "attached_by"
+"""The finding field only a census rule writes: how an attach placed a
+sighting, which ``sighting_fit`` counts without a fit check."""
+
+
+def _without_rule_stamps(findings: object) -> object:
+    """*findings* with any rule stamp a reply claims removed. Every other field
+    passes through: the schema gate refuses a malformed one, and the merger's
+    never-delete guard names a removal action rather than letting it land as
+    a plain match."""
+    if not isinstance(findings, list):
+        return findings
+    return [
+        {field: value for field, value in finding.items() if field != _RULE_STAMP_FIELD}
+        if isinstance(finding, dict) else finding
+        for finding in findings
+    ]
+
 
 def build_prompt(
     digest_text: str, codebook_index: str, *, invariant_slugs: Sequence[str]
@@ -393,8 +411,9 @@ def code_digest(
     parse its strict-JSON judgment ->
     assemble a §7.3 coding record with a DETERMINISTIC header
     (session/date/agent_class from the digest's own frontmatter; project
-    from *project* — the LLM never supplies the header) -> schema-gate it
-    via codebook.validate_coding_record.
+    from *project* — the LLM never supplies the header; nor a rule stamp,
+    which is removed from every finding) -> schema-gate it via
+    codebook.validate_coding_record.
 
     Never-fabricate contract: unparseable/malformed digest frontmatter, an
     invocation error, a usage/auth CAP, unparseable LLM output, a reply
@@ -490,7 +509,7 @@ def code_digest(
         "date": meta.get("date"),
         "project": project,
         "agent_class": meta.get("agent_class"),
-        **{key: judgment[key] for key in _REPLY_KEYS},
+        **{key: _without_rule_stamps(judgment[key]) for key in _REPLY_KEYS},
     }
 
     errors = codebook_mod.validate_coding_record(record)
