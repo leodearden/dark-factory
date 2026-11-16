@@ -3,6 +3,7 @@
 import logging
 from pathlib import Path
 
+import pytest
 import yaml
 
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig, TaskmasterConfig
@@ -68,6 +69,14 @@ class TestOpenAIProviderConfigRetiredKeys:
         warnings = [message for message in _retired_warnings(caplog) if 'organization_id' in message]
         assert len(warnings) == 1, warnings
 
+    def test_warning_names_both_sections_that_hold_the_model(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            OpenAIProviderConfig.model_validate({'organization_id': 'org-1'})
+
+        [warning] = _retired_warnings(caplog)
+        assert 'llm.providers.openai' in warning, warning
+        assert 'embedder.providers.openai' in warning, warning
+
     def test_embedder_provider_with_organization_id_still_loads(self, tmp_path, monkeypatch, caplog):
         config_file = tmp_path / 'config.yaml'
         config_file.write_text(yaml.safe_dump({
@@ -81,6 +90,17 @@ class TestOpenAIProviderConfigRetiredKeys:
         assert config.embedder.providers.openai is not None
         assert config.embedder.providers.openai.api_key == 'k'
         assert any('organization_id' in message for message in _retired_warnings(caplog))
+
+
+@pytest.mark.parametrize('model', [TaskmasterConfig, OpenAIProviderConfig])
+def test_no_live_field_is_dropped_as_retired(model, caplog):
+    every_live_field = model().model_dump()
+
+    with caplog.at_level(logging.WARNING):
+        reloaded = model.model_validate(every_live_field)
+
+    assert _retired_warnings(caplog) == []
+    assert reloaded.model_dump() == every_live_field
 
 
 def test_shipped_config_yaml_carries_no_retired_key(monkeypatch, caplog):

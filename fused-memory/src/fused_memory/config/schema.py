@@ -238,7 +238,9 @@ class OpenAIProviderConfig(BaseModel):
     @classmethod
     def _drop_retired_keys(cls, data: object) -> object:
         return drop_retired_keys(
-            data, section='providers.openai', retired=_RETIRED_OPENAI_PROVIDER_KEYS,
+            data,
+            section='llm.providers.openai or embedder.providers.openai',
+            retired=_RETIRED_OPENAI_PROVIDER_KEYS,
         )
 
 
