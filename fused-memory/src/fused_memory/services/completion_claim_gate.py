@@ -696,6 +696,22 @@ _FORWARD_ONLY_LEAD_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+_CONTINGENCY_HEADS: str = (
+    r'conditional\s+(?:on|upon)|contingent\s+(?:on|upon)|dependent\s+(?:on|upon)|'
+    r'depend(?:s|ed|ing)?\s+(?:on|upon)|gated\s+on|blocked\s+on|subject\s+to|'
+    r'provid(?:ed|ing)(?:\s+that)?|assuming(?:\s+that)?|assum(?:e|es|ed)\s+that'
+)
+_NON_ASSERTING_HEADS: tuple[str, ...] = (_CONTINGENCY_HEADS,)
+
+# A ref that is the object of a head which does not assert its complement ('depends
+# on task N having landed') takes no backward-bound marker. Forward binding is
+# untouched, so 'depends on cancelled task N' still claims N. 'pending' is excluded
+# by measurement (task 6824). Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
+_NON_ASSERTING_GOVERNOR_RE: re.Pattern[str] = re.compile(
+    r'(?<![-\w])(?:' + '|'.join(_NON_ASSERTING_HEADS) + r')\s+(?:(?:the|a|an)\s+)?$',
+    re.IGNORECASE,
+)
+
 
 def _bind_marker(
     clause: str,
@@ -707,7 +723,9 @@ def _bind_marker(
     FORWARD first, because the complement is what the claim asserts into
     existence ('task N was merged as commit X' is a claim about X): the first
     ref after the marker, when :func:`_binds_forward` admits the gap. Otherwise
-    BACKWARD: the nearest ref before the marker, with no barrier between them.
+    BACKWARD: the nearest ref before the marker, when :func:`_binds_backward`
+    admits it, which a barrier between them or a non-asserting head governing
+    the ref (:data:`_NON_ASSERTING_GOVERNOR_RE`) refuses.
     A marker led by a determiner or a temporal cue (:data:`_FORWARD_ONLY_LEAD_RE`)
     binds forward only.
     """
@@ -717,11 +735,21 @@ def _bind_marker(
     if _FORWARD_ONLY_LEAD_RE.search(clause, 0, marker.start):
         return None
     preceding = next((m for m in reversed(mentions) if m.end <= marker.start), None)
-    if preceding is not None and not _BINDING_BARRIER_RE.search(
-        clause[preceding.end:marker.start]
-    ):
+    if preceding is not None and _binds_backward(clause, marker, preceding):
         return preceding
     return None
+
+
+def _binds_backward(clause: str, marker: _Marker, mention: _RefMention) -> bool:
+    """Whether *marker* reaches back to the *mention* before it.
+
+    Not across a binding barrier, and not to a ref a non-asserting head governs.
+    The head is read up to the ref's written phrase, so a registered qualifier
+    is part of the ref ('depends on dark_factory task 5707 having landed').
+    """
+    if _BINDING_BARRIER_RE.search(clause[mention.end:marker.start]):
+        return False
+    return _NON_ASSERTING_GOVERNOR_RE.search(clause, 0, mention.phrase_start) is None
 
 
 def _binds_forward(clause: str, marker: _Marker, mention: _RefMention) -> bool:
