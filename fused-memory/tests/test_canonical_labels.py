@@ -1528,8 +1528,17 @@ class TestOneGrammar:
         [
             pytest.param(
                 '_QUALIFIER',
-                ('_QUALIFIED_REF_PATTERN', '_QUALIFIED_NODE_NAME_PATTERN'),
+                (
+                    '_QUALIFIED_REF_PATTERN',
+                    '_QUALIFIED_NODE_NAME_PATTERN',
+                    '_LOCAL_MENTION_PATTERN',
+                ),
                 id='one-qualifier-class',
+            ),
+            pytest.param(
+                '_REF_LEFT_EDGE',
+                ('_QUALIFIED_REF_PATTERN', '_LOCAL_MENTION_PATTERN'),
+                id='one-qualifier-left-edge',
             ),
             pytest.param(
                 '_NUMBER',
@@ -1537,13 +1546,24 @@ class TestOneGrammar:
                     '_TASK_NODE_NAME_PATTERN',
                     '_QUALIFIED_NODE_NAME_PATTERN',
                     '_LOCAL_MENTION_PATTERN',
+                    '_LISTED_NUMBER_PATTERN',
                     '_QUALIFIED_REF_PATTERN',
                 ),
                 id='one-digit-capture',
             ),
             pytest.param(
+                '_DIGITS',
+                ('_NUMBER', '_LIST_ITEM'),
+                id='one-digit-run',
+            ),
+            pytest.param(
                 '_NUMBER_END',
-                ('_LOCAL_MENTION_PATTERN', '_QUALIFIED_REF_PATTERN'),
+                (
+                    '_LOCAL_MENTION_PATTERN',
+                    '_LISTED_NUMBER_PATTERN',
+                    '_LIST_ITEM',
+                    '_QUALIFIED_REF_PATTERN',
+                ),
                 id='one-right-edge',
             ),
             pytest.param(
@@ -1585,3 +1605,159 @@ class TestOneGrammar:
             assert any(part is shared for part in _parts_at_any_depth(parts)), (
                 f'{rule} spells {fragment} itself instead of composing the shared fragment'
             )
+
+
+def _node_names(referents):
+    return [referent.node_name for referent in referents]
+
+
+class TestWordGluedDigitsAreNotTaskNumbers:
+    """A digit run glued to a letter or underscore is a hash or an identifier,
+    not a task number: 'task 8c7e163fcf' once yielded Task 8 (task 10082)."""
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'task 8c7e163fcf',
+            'see task-8c7e1 now',
+            'task #12ab',
+            'reify:8c7e163',
+            'Task 115e notes',
+            'task 5_retry',
+        ],
+    )
+    def test_glued_digits_yield_nothing(self, content):
+        scan = scan_content(content, group_id='dark_factory')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    def test_a_glued_run_does_not_hide_a_real_mention_beside_it(self):
+        scan = scan_content('task 8c7e163fcf and task 42', group_id='dark_factory')
+        assert _node_names(scan.refs) == ['Task 42']
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            ("task-173's", ['Task 173']),
+            ('task 5.', ['Task 5']),
+            ('task 5181-fix', ['Task 5181']),
+            ('task/6059-entities', ['Task 6059']),
+            ('dark_factory:2500)', ['Task 2500']),
+        ],
+    )
+    def test_punctuation_after_the_digits_still_ends_them(self, content, expected):
+        assert _node_names(scan_content(content, group_id='dark_factory').refs) == expected
+
+
+class TestPluralTaskWordReadsTheWholeList:
+    """After the PLURAL task word every listed number is a mention:
+    'tasks 2226 and 2227' once yielded only 2226 (task 10082)."""
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            ('tasks 2226 and 2227', ['Task 2226', 'Task 2227']),
+            ('tasks 2226, 2227 and 2228', ['Task 2226', 'Task 2227', 'Task 2228']),
+            ('Tasks 2226, 2227, and 2228', ['Task 2226', 'Task 2227', 'Task 2228']),
+            ('tasks 2207/2210', ['Task 2207', 'Task 2210']),
+            ('tasks #5, #6 and #7', ['Task 5', 'Task 6', 'Task 7']),
+            ('tasks 5 or 6', ['Task 5', 'Task 6']),
+            ('done tasks 3659, 3666, 3669', ['Task 3659', 'Task 3666', 'Task 3669']),
+        ],
+    )
+    def test_every_listed_number_is_a_mention(self, content, expected):
+        assert _node_names(scan_content(content, group_id='dark_factory').refs) == expected
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'task 5, 3 files changed',
+            'task 5 and 6',
+            'tasks 5 and the parser',
+            'tasks 5,\n6',
+            'tasks 5 and 6th',
+        ],
+        ids=['singular-comma', 'singular-and', 'non-number', 'line-break', 'glued'],
+    )
+    def test_the_list_stops_where_it_is_not_a_task_list(self, content):
+        assert _node_names(scan_content(content, group_id='dark_factory').refs) == ['Task 5']
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            ('Tasks: 12/40 complete', ['Task 12', 'Task 40']),
+            ('tasks 3/5 done', ['Task 3', 'Task 5']),
+        ],
+    )
+    def test_a_progress_fraction_after_the_plural_word_reads_as_a_list(self, content, expected):
+        """Accepted: the slash lists siblings ('tasks 2207/2210'), and the
+        fraction's head number already read as a task before lists were read."""
+        assert _node_names(scan_content(content, group_id='dark_factory').refs) == expected
+
+    def test_every_listed_number_contests_like_a_bare_mention(self):
+        scan = scan_content('reify:2227 versus tasks 2226 and 2227', group_id='dark_factory')
+        assert _node_names(scan.refs) == ['Task 2226']
+        assert _node_names(scan.ambiguous) == ['reify:2227', 'Task 2227']
+
+
+class TestRegisteredProjectNameQualifiesAMention:
+    """With a registry, a registered project's name directly before the task
+    word qualifies the mention: 'Reify task 3674' once bound to the LOCAL Task
+    3674 (task 10082). Without a usable registry nothing changes."""
+
+    REGISTRY = {'dark_factory': '/src/df', 'reify': '/src/reify'}
+
+    def _scan(self, content, *, group_id='dark_factory', known_project_ids=REGISTRY):
+        return scan_content(content, group_id=group_id, known_project_ids=known_project_ids)
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            ('Reify task 3674 was cancelled', ['reify:3674']),
+            ('in reify, task 9727 landed', ['reify:9727']),
+            ('Reify tasks 2226 and 2227', ['reify:2226', 'reify:2227']),
+            ('REIFY task 5', ['reify:5']),
+        ],
+    )
+    def test_the_registered_name_qualifies_the_mention(self, content, expected):
+        scan = self._scan(content)
+        assert _node_names(scan.refs) == expected
+        assert scan.ambiguous == ()
+
+    def test_a_self_qualified_prose_mention_never_contests(self):
+        scan = self._scan('dark_factory task 5 and reify:5')
+        assert _node_names(scan.refs) == ['Task 5', 'reify:5']
+        assert scan.ambiguous == ()
+
+    def test_the_own_project_name_keeps_the_mention_local(self):
+        scan = self._scan('Reify task 5181 was cancelled', group_id='reify')
+        assert _node_names(scan.refs) == ['Task 5181']
+
+    def test_a_qualified_and_a_bare_mention_of_one_number_contest(self):
+        scan = self._scan('Reify task 3674; task 3674 is ours')
+        assert scan.refs == ()
+        assert set(_node_names(scan.ambiguous)) == {'reify:3674', 'Task 3674'}
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'Completed task 5',
+            'Nowhere task 5',
+            'reify\ntask 5',
+            '/src/reify task 5',
+            'subtasks task 5',
+        ],
+        ids=['unregistered-word', 'unregistered-name', 'line-break', 'path', 'task-vocabulary'],
+    )
+    def test_anything_else_before_the_task_word_stays_local(self, content):
+        assert _node_names(self._scan(content).refs) == ['Task 5']
+
+    @pytest.mark.parametrize('known_project_ids', [None, {}], ids=['no-registry', 'empty'])
+    def test_permissive_mode_is_unchanged(self, known_project_ids):
+        scan = self._scan('Reify task 3674', known_project_ids=known_project_ids)
+        assert _node_names(scan.refs) == ['Task 3674']
+
+    def test_a_hyphen_glued_task_word_is_still_not_a_mention(self):
+        scan = self._scan('reify-task 2500')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
