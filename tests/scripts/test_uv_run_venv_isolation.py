@@ -36,7 +36,7 @@ import re
 import subprocess
 
 import pytest
-from git_listing import git
+from git_listing import git, listed_files
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shell_logical_lines import logical_lines
 from systemd_unit_invariants import (
@@ -172,6 +172,10 @@ _SHELL_UV_MENTION_RUN_RE = re.compile(r'(?i:\buv|\$\{?\w*uv)\S*(?:\s+-\S+)*\s+ru
 
 # The prefixes systemd allows before an ExecStart executable (systemd.service(5)).
 _SYSTEMD_EXEC_PREFIXES = "-@:+!"
+
+# Git pathspecs naming every shell script outside a test tree; a plain `*.sh`
+# matches at every depth.
+_NON_TEST_SHELL_SCRIPTS = ("*.sh", ":(exclude,glob)**/tests/**")
 
 
 def discover_exec_start_files() -> list[str]:
@@ -396,7 +400,12 @@ def uv_run_sites(rel_path: str, root: pathlib.Path = REPO_ROOT) -> list[UvRunSit
     wrapper = wrapper_script_of(exec_start, root)
     if wrapper is None:
         return []
-    return shell_uv_run_sites((root / wrapper).read_text(encoding="utf-8"), wrapper)
+    return script_uv_run_sites(wrapper, root)
+
+
+def script_uv_run_sites(rel_path: str, root: pathlib.Path = REPO_ROOT) -> list[UvRunSite]:
+    """Every `uv run` in the shell script at *rel_path* under *root*."""
+    return shell_uv_run_sites((root / rel_path).read_text(encoding="utf-8"), rel_path)
 
 
 def discover_uv_run_units() -> list[str]:
@@ -420,6 +429,25 @@ def discover_uv_run_units() -> list[str]:
             pass
         units.append(rel_path)
     return units
+
+
+def discover_uv_run_scripts(root: pathlib.Path = REPO_ROOT) -> list[str]:
+    """*root*-relative paths of every non-test shell script git lists that runs `uv run`.
+
+    An UnreadableWrapper INCLUDES the path rather than skipping it, for the
+    reasons discover_uv_run_units gives.  listed_files raises on a git failure,
+    so discovery never silently answers [].
+    """
+    scripts = []
+    for path in listed_files(root, *_NON_TEST_SHELL_SCRIPTS):
+        rel_path = path.relative_to(root).as_posix()
+        try:
+            if not script_uv_run_sites(rel_path, root):
+                continue
+        except UnreadableWrapper:
+            pass
+        scripts.append(rel_path)
+    return sorted(scripts)
 
 
 def swept_paths() -> list[str]:
