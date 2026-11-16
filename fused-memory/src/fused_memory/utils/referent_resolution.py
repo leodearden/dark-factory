@@ -778,9 +778,11 @@ def resolve_referents(
             ``_canonical_allowlist`` and is not re-checked here. Populated, it
             drops FOREIGN referents naming a project outside it, so a junk
             qualifier ('localhost:6379', 'INFO:1234') stops minting one.
-            Narrowing is STRICTLY SUBTRACTIVE by the guarantee ``scan_content``
-            states: a dropped candidate keeps the ambiguity contest it created,
-            so this can only ever remove a referent, never add one.
+            By the guarantee ``scan_content`` states, narrowing never mints a
+            referent from an unregistered qualifier, and a dropped candidate
+            keeps the ambiguity contest it created; a registered project's
+            name directly before a mention ('Reify task 3674') re-qualifies
+            that mention.
 
     Raises:
         InputValidationError: On a malformed ``declared`` entry (see

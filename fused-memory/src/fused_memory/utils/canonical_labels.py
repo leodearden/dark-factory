@@ -6,7 +6,9 @@
   'sub_task'. It is deliberately not built from _TASK_WORD, so 'Task' counts
   only once its caller has lowercased it.
 - _LOCAL_MENTION_PATTERN: a bare mention in prose, 'blocked on task-173'. After
-  the plural task word it also reads the list that follows, 'tasks 2226 and 2227'.
+  the plural task word it also reads the list that follows, 'tasks 2226 and 2227',
+  and it captures a name directly before the task word, 'Reify task 3674', which
+  qualifies the mention only when it names a registered project.
 - _LISTED_NUMBER_PATTERN: one number inside that list.
 - _QUALIFIED_REF_PATTERN: a project-qualified mention, 'see dark_factory: 2500'.
 
@@ -97,6 +99,7 @@ _LIST_ITEM = _Fragment('(?:', _LIST_SEPARATOR, '#?', _DIGITS, _NUMBER_END, ')')
 _LIST_CONTINUATION = _Fragment('(?P<continuation>', _LIST_ITEM, '*)')
 _MENTION_LEFT_EDGE = _Fragment(r'(?<![\w:-])')
 _REF_LEFT_EDGE = _Fragment(r'(?<![\w:/.-])')
+_PROSE_QUALIFIER = _Fragment('(?:', _REF_LEFT_EDGE, _QUALIFIER, ',?', _BLANKS, ')?')
 
 _TASK_NODE_NAME_PATTERN = _compile(
     _WIDE_PAD, _TASK_WORD, _SEPARATOR, _NUMBER, _WIDE_PAD, anchored=True
@@ -104,6 +107,7 @@ _TASK_NODE_NAME_PATTERN = _compile(
 _QUALIFIED_NODE_NAME_PATTERN = _compile(_PAD, _QUALIFIER, _COLON, _NUMBER, _PAD, anchored=True)
 _TASK_VOCABULARY_QUALIFIER = _compile(r'(sub_?)?tasks?', anchored=True)
 _LOCAL_MENTION_PATTERN = _compile(
+    _PROSE_QUALIFIER,
     _MENTION_LEFT_EDGE,
     _TASK_WORD,
     _MENTION_SEPARATOR,
@@ -238,6 +242,15 @@ def _mentioned_numbers(mention: re.Match[str]) -> Iterator[tuple[int, str]]:
         yield listed.start(), listed.group('number')
 
 
+def _prose_project(mention: re.Match[str], allowlist: frozenset[str] | None) -> str | None:
+    """The registered project a name directly before the task word names, or None."""
+    qualifier = mention.group('qualifier')
+    if qualifier is None or allowlist is None:
+        return None
+    project_id = _project_of(qualifier)
+    return project_id if project_id in allowlist else None
+
+
 def scan_content(
     content: str,
     *,
@@ -249,9 +262,12 @@ def scan_content(
     A ref qualified with *group_id*'s own project is reclassified as an
     own-project referent. When *known_project_ids* (any iterable, consumed
     once; a mapping's keys work) has a usable entry, foreign refs outside it
-    are dropped, but a dropped ref still contests a bare mention of its number,
-    so narrowing only ever removes referents. A path-shaped *group_id* yields
-    an empty scan. Accepted blind spots: bare digits, task titles, non-ASCII
+    are dropped, and a registered project's name directly before the task word
+    ('Reify task 3674', 'in reify, task 9727') qualifies that mention, its list
+    included; without a usable registry that name is ignored. Narrowing never
+    mints a referent from an unregistered qualifier, and a dropped candidate
+    keeps the contest it creates with a bare mention of its number. A
+    path-shaped *group_id* yields an empty scan. Accepted blind spots: bare digits, task titles, non-ASCII
     digits or lookalike letters, a qualified ref hard-wrapped across a line
     break, and a list after the singular task word.
     """
@@ -267,10 +283,16 @@ def scan_content(
     foreign: set[tuple[str, str]] = set()
 
     for mention in _LOCAL_MENTION_PATTERN.regex.finditer(content):
+        prose_project = _prose_project(mention, allowlist)
         for offset, number in _mentioned_numbers(mention):
-            referent = Referent(number=number)
+            if prose_project is None or prose_project == local_project:
+                referent = Referent(number=number)
+                if prose_project is None:
+                    bare.add((referent.kind, referent.number))
+            else:
+                referent = Referent(project_id=prose_project, number=number)
+                foreign.add((referent.kind, referent.number))
             found.append((offset, referent))
-            bare.add((referent.kind, referent.number))
 
     for match in _QUALIFIED_REF_PATTERN.regex.finditer(content):
         project_id = _project_of(match.group('qualifier'))

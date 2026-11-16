@@ -1528,8 +1528,17 @@ class TestOneGrammar:
         [
             pytest.param(
                 '_QUALIFIER',
-                ('_QUALIFIED_REF_PATTERN', '_QUALIFIED_NODE_NAME_PATTERN'),
+                (
+                    '_QUALIFIED_REF_PATTERN',
+                    '_QUALIFIED_NODE_NAME_PATTERN',
+                    '_LOCAL_MENTION_PATTERN',
+                ),
                 id='one-qualifier-class',
+            ),
+            pytest.param(
+                '_REF_LEFT_EDGE',
+                ('_QUALIFIED_REF_PATTERN', '_LOCAL_MENTION_PATTERN'),
+                id='one-qualifier-left-edge',
             ),
             pytest.param(
                 '_NUMBER',
