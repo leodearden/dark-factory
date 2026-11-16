@@ -2708,8 +2708,10 @@ class ReconciliationHarness:
           also returned None;
         - the target is not a routable queue key (``is_routable_task_id``);
         - the project is not registered in ``_known_projects``;
-        - no process holds that root's orchestrator flock, or the probe
-          raised, so nothing would drain the record;
+        - no process holds that root's orchestrator flock, so nothing would
+          drain the record; or the flock probe raised, so whether anything
+          would is unknown (the recon-queue filing already covers the
+          finding);
         - a pending record already covers this finding: a level-0 record with
           the same finding fingerprint, or a routed record a human already
           holds at a higher level
