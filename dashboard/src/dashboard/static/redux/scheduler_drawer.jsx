@@ -1,5 +1,5 @@
 /* scheduler_drawer.jsx — slide-in override drawer for a selected task.
-   Behavioral invariants (no JS test runner; verified manually per task spec).
+   Rendered in jsdom by dashboard/tests/js/jsx_render.test.mjs.
 
    Exports: window.DF_SCHED_DRAWER = { SchedulerDrawer }
 */
@@ -28,7 +28,7 @@ function HolderEtas({ task, modules, spark }) {
   if (blocked.length === 0) {
     return (
       <div style={{ color: 'var(--fg-3)', fontSize: 11, fontStyle: 'italic' }}>
-        No modules currently held by another task.
+        No lock this task needs is held to its limit by other tasks.
       </div>
     );
   }
