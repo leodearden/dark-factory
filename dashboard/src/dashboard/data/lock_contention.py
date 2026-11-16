@@ -49,15 +49,3 @@ def key_holders(
         return KeyHolders(holders=(), at_limit=False)
     limit = holder_limit(key) if key in holders_by_key else min(map(holder_limit, conflicting))
     return KeyHolders(holders=holders, at_limit=len(holders) >= limit)
-
-
-def holder_of(key: str, current_holders: Mapping[str, str]) -> str | None:
-    """The first holder, in *current_holders* order, whose lock conflicts with *key*.
-
-    Conflict is the hierarchical prefix rule, so a holder of a sub-depth parent
-    key holds its children.
-    """
-    return next(
-        (holder for held, holder in current_holders.items() if modules_conflict(held, key)),
-        None,
-    )
