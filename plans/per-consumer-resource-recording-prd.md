@@ -632,8 +632,9 @@ free on the volume (measured 2026-11-16).
   - `service` and `agents`: keyed by the last segment of the hold's `own_cgroup`. That segment is the unit before
     task 9985 and the project slice after, which is exactly how D2 keys these two roles;
   - `verify`: the tag computed from the root by the one shared scope-tag rule (leaf 1);
-  - `project`: the slice computed by `project_slice_name(project_id)`, with the project id read from that root's
-    config.
+  - `project`: keyed by the same last segment when it names a project slice (after task 9985). Before that, a
+    project has no `project` consumer of its own. reify's own `reify.slice` is listed as its own consumer, unmapped.
+    The report imports nothing from task 3394, so it does not wait on the slices.
 - **No assumed equality.** The report never assumes the unit stem, the verify slug and the project id are spelled
   alike: `orchestrator-my-solar-challenge.service` verifies as `solar-challenge`.
 - **"Who grew"** ranks consumers by program-memory and swap growth over the window before the hold.
@@ -785,7 +786,9 @@ Leaves are numbered; existing tasks keep their ids. Sizes are expected changed l
 **Leaf 3 — Decision task: a week of consumer data on the memory holds** (new; `task_kind='deterministic'`,
 `always_escalates`, delayed 7 days after leaf 2 is done)
 
-- **Check:** runs `scripts/resource_report.py holds --since 7d --summary --json`.
+- **Shape:** a pure human gate. Whoever handles its escalation runs
+  `scripts/resource_report.py holds --since 7d --summary --json`. A deterministic check cannot name the script at
+  filing time, because leaf 2 creates it.
 - **Observable signal:** an escalation to Leo carrying that summary: holds per project, the consumers that most often
   topped each ranking, the unattributed share, and the reclaim threads' share.
 - **Prereqs:** leaf 2.
@@ -920,11 +923,22 @@ edges, and force a re-plan wherever the text fingerprint changes.
 **Graph.**
 
 - 1 → 2 → 3
+- 2 → 8 (leaf 8 extends leaf 2's script)
 - 1 → 4 → 5 → 8
 - 3394 → 6 → 7b → 8
-- 7a → 7b
+- 1 → 7a → 7b (both use leaf 1's cgroup parser)
 - 9812 and stream 20's writer → 7a
 - 6 → 9985 (an edge on the existing task)
+
+Filed 2026-11-16 as tasks 10456 (leaf 1), 10457 (2), 10458 (3), 6355 (4), 10459 (5), 10460 (6), 10461 (7a),
+10462 (7b) and 10463 (8). Each is serialized, where it shares files with pending work, behind:
+
+- leaf 4: tasks 3394 and 8078;
+- leaf 5: task 9766;
+- leaf 7a: task 9846 (stream 20's writer) and task 9850 (stream 20's spawn move);
+- leaf 7b: task 10430 (the allowance-reserve PRD).
+
+Task 6987 now waits on leaf 1.
 
 **G7 walk** (`docs/legibility/design-invariants.md`, all fourteen):
 
