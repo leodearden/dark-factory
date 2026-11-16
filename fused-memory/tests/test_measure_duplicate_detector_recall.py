@@ -585,7 +585,7 @@ def _generation():
     return m.CandidateGeneration(
         top_k=3, candidates=((0, 1), (0, 2)),
         true_caught=m.Proportion(hits=1, total=4, rate=0.25, wilson_95=(0.05, 0.7)),
-        hard_negative_generated=1, cross_category_true_pairs=7,
+        hard_negative_generated=1, cross_category_true_pairs=37,
         disclosure={'top_k_saturated': 2, 'missing_vector': 0},
     )
 
@@ -699,8 +699,11 @@ class TestReportAndProposal:
         assert set(report['chosen']['verdict']) == {'on_point_estimates', 'on_lower_bounds'}
         assert report['gate_proposal'] == _mod().gate_proposal_json(_mod().GATE_PROPOSAL)
         assert report['provenance'] == _PROVENANCE
+        assert any(
+            caveat.startswith('37 of the 1 true pairs are cross-category')
+            for caveat in report['caveats']
+        )
         caveats = ' '.join(report['caveats'])
-        assert '7' in caveats
         assert 'arm-x' in caveats and 'dependency_unavailable' in caveats
         assert 'in-sample' in caveats
         assert 'fixture_only' in caveats
@@ -708,13 +711,13 @@ class TestReportAndProposal:
         json.dumps(report)
 
     def test_the_markdown_is_a_function_of_the_json_alone(self):
-        report = _report([_skipped(), _row('a')])
+        report = _report([_skipped(), _row('chosen-arm-x')])
         proposal = _mod().GATE_PROPOSAL
 
         markdown = _mod().render_markdown(report)
 
         assert markdown == _mod().render_markdown(json.loads(json.dumps(report)))
-        assert 'a' in markdown
+        assert '**Chosen:** chosen-arm-x' in markdown
         for bar in (proposal.precision_floor, proposal.min_paraphrase_band_recall, proposal.min_auc):
             assert f'{bar:.2f}' in markdown
 
