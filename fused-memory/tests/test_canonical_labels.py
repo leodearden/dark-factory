@@ -1537,13 +1537,24 @@ class TestOneGrammar:
                     '_TASK_NODE_NAME_PATTERN',
                     '_QUALIFIED_NODE_NAME_PATTERN',
                     '_LOCAL_MENTION_PATTERN',
+                    '_LISTED_NUMBER_PATTERN',
                     '_QUALIFIED_REF_PATTERN',
                 ),
                 id='one-digit-capture',
             ),
             pytest.param(
+                '_DIGITS',
+                ('_NUMBER', '_LIST_ITEM'),
+                id='one-digit-run',
+            ),
+            pytest.param(
                 '_NUMBER_END',
-                ('_LOCAL_MENTION_PATTERN', '_QUALIFIED_REF_PATTERN'),
+                (
+                    '_LOCAL_MENTION_PATTERN',
+                    '_LISTED_NUMBER_PATTERN',
+                    '_LIST_ITEM',
+                    '_QUALIFIED_REF_PATTERN',
+                ),
                 id='one-right-edge',
             ),
             pytest.param(

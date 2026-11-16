@@ -1,11 +1,13 @@
-"""The canonical task-label grammar: named fragments composed into five rules.
+"""The canonical task-label grammar: named fragments composed into six rules.
 
 - _TASK_NODE_NAME_PATTERN: a whole own-project node name, 'task #1153'.
 - _QUALIFIED_NODE_NAME_PATTERN: a whole foreign node name, 'reify:132'.
 - _TASK_VOCABULARY_QUALIFIER: a lowercased qualifier that is task vocabulary,
   'sub_task'. It is deliberately not built from _TASK_WORD, so 'Task' counts
   only once its caller has lowercased it.
-- _LOCAL_MENTION_PATTERN: a bare mention in prose, 'blocked on task-173'.
+- _LOCAL_MENTION_PATTERN: a bare mention in prose, 'blocked on task-173'. After
+  the plural task word it also reads the list that follows, 'tasks 2226 and 2227'.
+- _LISTED_NUMBER_PATTERN: one number inside that list.
 - _QUALIFIED_REF_PATTERN: a project-qualified mention, 'see dark_factory: 2500'.
 
 Precision over recall: the pads around '#' and ':' are space or tab, never a
@@ -20,7 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Self
@@ -70,17 +72,29 @@ def _either(*branches: str) -> _Fragment:
     return _Fragment('(?:', *alternation, ')')
 
 
-_TASK_WORD = _Fragment(r'[Tt][Aa][Ss][Kk][Ss]?')
+_TASK_STEM = _Fragment(r'[Tt][Aa][Ss][Kk]')
+_PLURAL = _Fragment(r'(?P<plural>[Ss])')
+_TASK_WORD = _Fragment(_TASK_STEM, _PLURAL, '?')
 _PAD = _Fragment(r'[ \t]*')
+_BLANKS = _Fragment(r'[ \t]+')
 _WIDE_PAD = _Fragment(r'\s*')
 _GAP = _Fragment(r'\s+')
 _COLON = _Fragment(_PAD, ':', _PAD)
 _MARK = _Fragment(_PAD, '[#:]', _PAD)
 _SEPARATOR = _either(_MARK, _GAP)
 _MENTION_SEPARATOR = _either(_MARK, _GAP, r'[-/]')
-_NUMBER = _Fragment(r'([0-9]+)')
+_DIGITS = _Fragment(r'[0-9]+')
+_NUMBER = _Fragment('(?P<number>', _DIGITS, ')')
 _NUMBER_END = _Fragment(r'(?!\w)')
-_QUALIFIER = _Fragment(r'([A-Za-z][A-Za-z0-9_-]{2,})')
+_QUALIFIER = _Fragment(r'(?P<qualifier>[A-Za-z][A-Za-z0-9_-]{2,})')
+_CONJUNCTION = _Fragment('(?:and|or)')
+_LIST_SEPARATOR = _either(
+    _Fragment(_PAD, ',', _PAD, '(?:', _CONJUNCTION, _BLANKS, ')?'),
+    _Fragment(_BLANKS, _CONJUNCTION, _BLANKS),
+    _Fragment(_PAD, '/', _PAD),
+)
+_LIST_ITEM = _Fragment('(?:', _LIST_SEPARATOR, '#?', _DIGITS, _NUMBER_END, ')')
+_LIST_CONTINUATION = _Fragment('(?P<continuation>', _LIST_ITEM, '*)')
 _MENTION_LEFT_EDGE = _Fragment(r'(?<![\w:-])')
 _REF_LEFT_EDGE = _Fragment(r'(?<![\w:/.-])')
 
@@ -90,8 +104,15 @@ _TASK_NODE_NAME_PATTERN = _compile(
 _QUALIFIED_NODE_NAME_PATTERN = _compile(_PAD, _QUALIFIER, _COLON, _NUMBER, _PAD, anchored=True)
 _TASK_VOCABULARY_QUALIFIER = _compile(r'(sub_?)?tasks?', anchored=True)
 _LOCAL_MENTION_PATTERN = _compile(
-    _MENTION_LEFT_EDGE, _TASK_WORD, _MENTION_SEPARATOR, _NUMBER, _NUMBER_END, anchored=False
+    _MENTION_LEFT_EDGE,
+    _TASK_WORD,
+    _MENTION_SEPARATOR,
+    _NUMBER,
+    _NUMBER_END,
+    _LIST_CONTINUATION,
+    anchored=False,
 )
+_LISTED_NUMBER_PATTERN = _compile(_NUMBER, _NUMBER_END, anchored=False)
 _QUALIFIED_REF_PATTERN = _compile(
     _REF_LEFT_EDGE, _QUALIFIER, _COLON, _NUMBER, _NUMBER_END, anchored=False
 )
@@ -162,14 +183,14 @@ def parse_node_name(name: str) -> Referent | None:
     """
     local = _TASK_NODE_NAME_PATTERN.regex.match(name)
     if local is not None:
-        return Referent(number=local.group(1))
+        return Referent(number=local.group('number'))
     qualified = _QUALIFIED_NODE_NAME_PATTERN.regex.match(name)
     if qualified is None:
         return None
-    project_id = _project_of(qualified.group(1))
+    project_id = _project_of(qualified.group('qualifier'))
     if project_id is None:
         return None
-    return Referent(project_id=project_id, number=qualified.group(2))
+    return Referent(project_id=project_id, number=qualified.group('number'))
 
 
 def _canonical_allowlist(known_project_ids: Iterable[str] | None) -> frozenset[str] | None:
@@ -205,6 +226,18 @@ def _canonical_allowlist(known_project_ids: Iterable[str] | None) -> frozenset[s
     return None
 
 
+def _mentioned_numbers(mention: re.Match[str]) -> Iterator[tuple[int, str]]:
+    """Each number a mention names, with its offset: the head, then the list
+    that follows a plural task word."""
+    yield mention.start(), mention.group('number')
+    if mention.group('plural') is None:
+        return
+    for listed in _LISTED_NUMBER_PATTERN.regex.finditer(
+        mention.string, mention.start('continuation'), mention.end('continuation')
+    ):
+        yield listed.start(), listed.group('number')
+
+
 def scan_content(
     content: str,
     *,
@@ -218,9 +251,9 @@ def scan_content(
     once; a mapping's keys work) has a usable entry, foreign refs outside it
     are dropped, but a dropped ref still contests a bare mention of its number,
     so narrowing only ever removes referents. A path-shaped *group_id* yields
-    an empty scan. Accepted blind spots: bare digits, task titles, list
-    continuations, non-ASCII digits or lookalike letters, and a qualified ref
-    hard-wrapped across a line break.
+    an empty scan. Accepted blind spots: bare digits, task titles, non-ASCII
+    digits or lookalike letters, a qualified ref hard-wrapped across a line
+    break, and a list after the singular task word.
     """
     if not content:
         return LabelScan()
@@ -233,19 +266,20 @@ def scan_content(
     bare: set[tuple[str, str]] = set()
     foreign: set[tuple[str, str]] = set()
 
-    for match in _LOCAL_MENTION_PATTERN.regex.finditer(content):
-        referent = Referent(number=match.group(1))
-        found.append((match.start(), referent))
-        bare.add((referent.kind, referent.number))
+    for mention in _LOCAL_MENTION_PATTERN.regex.finditer(content):
+        for offset, number in _mentioned_numbers(mention):
+            referent = Referent(number=number)
+            found.append((offset, referent))
+            bare.add((referent.kind, referent.number))
 
     for match in _QUALIFIED_REF_PATTERN.regex.finditer(content):
-        project_id = _project_of(match.group(1))
+        project_id = _project_of(match.group('qualifier'))
         if project_id is None:
             continue
         if project_id == local_project:
-            found.append((match.start(), Referent(number=match.group(2))))
+            found.append((match.start(), Referent(number=match.group('number'))))
             continue
-        referent = Referent(project_id=project_id, number=match.group(2))
+        referent = Referent(project_id=project_id, number=match.group('number'))
         foreign.add((referent.kind, referent.number))
         if allowlist is None or project_id in allowlist:
             found.append((match.start(), referent))
