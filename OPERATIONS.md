@@ -949,7 +949,10 @@ through the **B3 low-risk gate** instead of spawning an interactive
   never cancelled at the sub-agent's 20-minute polling ceiling: the
   sub-agent hands its `request_id` back to the watcher, which resumes
   polling it to terminal in a fresh background sub-agent. Only an entry
-  still queued at the ceiling is cancelled.
+  still queued at the ceiling is cancelled. A submission superseded by a
+  successor (a generation advance or a coalesce train) that has not
+  resolved by the ceiling is handed back and resumed the same way, never
+  cancelled.
 - Anything else (drift, an aborted low-risk attempt, a capped budget) is
   left pending, written to the project's `afk-digest.md`, and recorded as
   a decision for the next human return-triage pass. A handed-off merge
