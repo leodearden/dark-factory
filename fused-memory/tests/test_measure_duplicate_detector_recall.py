@@ -8,6 +8,7 @@ from the literals in the test. Nothing touches the network, torch or a store.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import json
 import types
@@ -566,7 +567,11 @@ def _skipped(name='arm-skipped', reason='no_credential', detail='KEY unset'):
 
 
 def _baseline(hits=10):
-    return _row(_mod().BASELINE_ARM, hits=hits, total=10, flagged=10, threshold=None)
+    row = _row(_mod().BASELINE_ARM, hits=hits, total=10, flagged=10)
+    return dataclasses.replace(
+        row, arm_class='baseline', operating_rule=_mod().OPERATING_RULE_BASELINE,
+        operating_threshold=None,
+    )
 
 
 def _generation():

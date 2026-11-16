@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import json
 import logging
 import math
 import re
@@ -64,6 +65,8 @@ else:
 
 TRUE_DUP = 'true_dup_pairs'
 HARD_NEGATIVE = 'hard_negative_pairs'
+UNRELATED = 'unrelated_pairs'
+PAIR_CLASSES = (TRUE_DUP, HARD_NEGATIVE, UNRELATED)
 
 Pair = tuple[int, int]
 EmbedFn = Callable[[str, str], Sequence[float]]
@@ -382,6 +385,7 @@ DETECTOR_ARMS: tuple[DetectorArm, ...] = (
 # ---------------------------------------------------------------------------
 
 BASELINE_ARM = 'calibrated-ann'
+BASELINE_ARM_CLASS = 'baseline'
 OPERATING_RULE_FLOOR = 'max_caught_at_precision_floor'
 OPERATING_RULE_BASELINE = 'calibrated_ann_cutoffs'
 
@@ -621,7 +625,7 @@ def measure_ann_baseline(
 
     return DetectorRow(
         arm=BASELINE_ARM,
-        arm_class='baseline',
+        arm_class=BASELINE_ARM_CLASS,
         model='cosine',
         granularity=str(Granularity.full_text),
         status=str(_arms.ArmStatus.measured),
@@ -632,3 +636,337 @@ def measure_ann_baseline(
         precision=proportion(caught, len(flagged)),
         hard_negative_flagged=proportion(len(flagged & set(hard_negatives)), len(hard_negatives)),
     )
+
+
+# ---------------------------------------------------------------------------
+# The pre-registered gate proposal, the choice, and the report
+# ---------------------------------------------------------------------------
+
+#: Fixed in the task 10243 plan BEFORE any adjudicator was measured; task
+#: 10244 ratifies or re-bases it.
+GATE_PROPOSAL = GateProposal(
+    precision_floor=0.90,
+    min_paraphrase_band_recall=0.75,
+    min_auc=0.80,
+    proposed_on='2026-11-16',
+    basis=(
+        "precision 0.90: a filed gate's member list is the curator's working list (task 4916), "
+        'and a false member is a distinct claim proposed for folding; at the fixture\'s mean '
+        'cluster of about 5 members (104 records / 20 canonicals, about 10 pairs) that is about '
+        'one false pair per gate.',
+        'recall 0.75: guards against the systematically under-inclusive gate (the esc-5541 '
+        'false-closure shape flagged in the 2026-07-30 review of PRD leaf kappa); transitive '
+        'closure recovers a member through any one caught pair, so member recall is at least '
+        "pair recall; the floor sits below the per-category top-10 generator's ceiling "
+        "(262/301 = 0.870 when registered; this report's candidate_generation block "
+        're-measures it), so it is attainable by an adjudicator over this generator.',
+        'AUC 0.80: Hosmer, Lemeshow and Sturdivant, Applied Logistic Regression, 3rd ed., '
+        "section 5.2.4, rate 0.8-0.9 'excellent' discrimination; hard negatives are exactly "
+        'the same-topic, different-claim pairs whose folding loses information; with 18 hard '
+        'negatives the Hanley-McNeil interval is about +/-0.08, so both the point and '
+        'lower-bound verdicts are reported for the ratifier (task 10244).',
+    ),
+)
+
+SCAN_SET = 'fixture_only'
+CHOICE_RULE = (
+    'the measured non-baseline arm catching the most true pairs at the precision floor; '
+    'a tie goes to the higher AUC, then the earlier row'
+)
+COMMITTED_SOURCE = 'fused-memory/calibration/duplicate_detector_recall_report.json (task 10243)'
+
+
+def gate_proposal_json(proposal: GateProposal) -> dict[str, Any]:
+    return {**asdict(proposal), 'basis': list(proposal.basis)}
+
+
+def gate_verdict(row: Mapping[str, Any], proposal: GateProposal) -> dict[str, bool]:
+    """*row* against *proposal*, on point estimates and on interval lower bounds."""
+    recall, precision, auc = row['paraphrase_band_recall'], row['precision'], row['auc']
+    if (
+        row['operating_threshold'] is None or recall is None or precision is None
+        or auc is None or auc['value'] is None or auc['hanley_mcneil_95'] is None
+    ):
+        return {'on_point_estimates': False, 'on_lower_bounds': False}
+    return {
+        'on_point_estimates': bool(
+            recall['rate'] >= proposal.min_paraphrase_band_recall
+            and precision['rate'] >= proposal.precision_floor
+            and auc['value'] >= proposal.min_auc
+        ),
+        'on_lower_bounds': bool(
+            recall['wilson_95'][0] >= proposal.min_paraphrase_band_recall
+            and precision['wilson_95'][0] >= proposal.precision_floor
+            and auc['hanley_mcneil_95'][0] >= proposal.min_auc
+        ),
+    }
+
+
+def choose_detector(rows: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    """The row :data:`CHOICE_RULE` picks, or None when no arm was measured."""
+    eligible = [
+        (index, row) for index, row in enumerate(rows)
+        if row['status'] == _arms.ArmStatus.measured
+        and row['arm_class'] != BASELINE_ARM_CLASS
+        and row['paraphrase_band_recall'] is not None
+    ]
+    if not eligible:
+        return None
+
+    def rank(item: tuple[int, Mapping[str, Any]]) -> tuple[int, bool, float, int]:
+        index, row = item
+        auc = row['auc']['value'] if row['auc'] else None
+        return (-row['paraphrase_band_recall']['hits'], auc is None, -(auc or 0.0), index)
+
+    return min(eligible, key=rank)[1]
+
+
+def recall_caveat_entry(report: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The chosen arm as a ``recall_caveat.adjudicator_measurements`` entry, or None."""
+    chosen = report['chosen']
+    if chosen is None:
+        return None
+    (row,) = [row for row in report['arms'] if row['arm'] == chosen['arm']]
+    generated = report['candidate_generation']['true_caught']
+    recall, precision = row['paraphrase_band_recall'], row['precision']
+    hard, auc = row['hard_negative_flagged'], row['auc']
+    return {
+        'measured_at': report['provenance']['measured_at'],
+        'detector': row['arm'],
+        'scan_set': {'setting': report['setting']['scan_set'], 'records': report['setting']['records']},
+        'candidate_generation': {
+            'top_k': report['setting']['top_k'], 'caught': generated['hits'], 'of': generated['total'],
+        },
+        'operating_threshold': row['operating_threshold'],
+        'paraphrase_band_recall': {
+            'caught': recall['hits'], 'of': recall['total'],
+            'rate': recall['rate'], 'wilson_95': recall['wilson_95'],
+        },
+        'precision_at_operating_point': None if precision is None else {
+            'flagged': precision['total'], 'rate': precision['rate'],
+            'wilson_95': precision['wilson_95'],
+        },
+        'hard_negative_flagged': {'flagged': hard['hits'], 'of': hard['total']},
+        'auc_true_vs_hard_negative': {
+            'value': auc['value'], 'n_true': auc['n_true'],
+            'n_hard_negative': auc['n_hard_negative'], 'hanley_mcneil_95': auc['hanley_mcneil_95'],
+        },
+        'meets_proposed_gate': chosen['verdict']['on_point_estimates'],
+        'source': COMMITTED_SOURCE,
+    }
+
+
+def caveats_for(report: Mapping[str, Any]) -> list[str]:
+    """What a reader must know to read the numbers, stated from the report's own data."""
+    setting = report['setting']
+    true_total = report['pair_counts'][TRUE_DUP]
+    floor = report['gate_proposal']['precision_floor']
+    caveats = [
+        f'The scan set is the fixture alone ({setting["scan_set"]}, {setting["records"]} records): '
+        'the most favourable setting, with no live-corpus distractors competing for each '
+        f'record\'s top_k={setting["top_k"]} window.',
+        f'{report["candidate_generation"]["cross_category_true_pairs"]} of the {true_total} true '
+        'pairs are cross-category. The per-category generator never forms them, so no '
+        f'adjudicator over it can catch them; recall still divides by all {true_total}.',
+        f'Each arm\'s operating threshold is selected in-sample on these {setting["records"]} '
+        f'records at the {floor:.2f} precision floor; nothing is held out.',
+        'AUC is rank-based (Mann-Whitney, ties count half) over every true and hard-negative '
+        'pair, including pairs the generator never forms; its interval is Hanley-McNeil (1982).',
+        'A pair\'s adjudicator score is the mean of its two directional scores: the scorers are '
+        'query/document asymmetric, the duplicate relation is symmetric.',
+        f'The {BASELINE_ARM} baseline replays the 2026-08-11 detector (ANN hits at each '
+        'category\'s calibrated cutoff, AUC over raw cosine). It is never eligible to be chosen.',
+        'jev-choice is excluded by design: its scores are a probability distribution over one '
+        'slate, not a pairwise judgement.',
+        'The LLM pairwise arm is not run at claim granularity: claims multiply its call count '
+        'roughly a hundredfold.',
+    ]
+    truncation = [
+        f'{row["arm"]} at {row["max_length"]} tokens: {row["pairs_over_max_length"]} slate pair(s) over'
+        for row in report['arms'] if row['max_length'] is not None
+    ]
+    if truncation:
+        caveats.append(
+            'pairs_over_max_length is a lower bound on truncation (entry plus candidate tokens, '
+            f'without the template): {"; ".join(truncation)}.',
+        )
+    caveats.extend(
+        f'{row["arm"]} was skipped ({row["skip_reason"]}): {row["skip_detail"]}'
+        for row in report['arms'] if row['status'] == _arms.ArmStatus.skipped
+    )
+    return caveats
+
+
+def build_report(
+    *,
+    generation: CandidateGeneration,
+    pair_classes: Mapping[Pair, str],
+    baseline: DetectorRow,
+    arm_rows: Sequence[DetectorRow],
+    records: int,
+    embedder: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+    proposal: GateProposal = GATE_PROPOSAL,
+) -> dict[str, Any]:
+    rows = [row.to_json() for row in arm_rows]
+    chosen = choose_detector(rows)
+    measured: dict[str, Any] = {
+        'setting': {
+            'scan_set': SCAN_SET, 'records': records, 'top_k': generation.top_k,
+            'per_category': True, 'embedder': dict(embedder),
+        },
+        'pair_counts': {
+            name: sum(cls == name for cls in pair_classes.values()) for name in PAIR_CLASSES
+        },
+        'candidate_generation': generation.to_json(),
+        'baseline': baseline.to_json(),
+        'arms': rows,
+        'chosen': None if chosen is None else {
+            'arm': chosen['arm'], 'rule': CHOICE_RULE, 'verdict': gate_verdict(chosen, proposal),
+        },
+        'gate_proposal': gate_proposal_json(proposal),
+        'provenance': dict(provenance),
+    }
+    return {
+        **{key: measured[key] for key in (
+            'setting', 'pair_counts', 'candidate_generation', 'baseline', 'arms', 'chosen',
+            'gate_proposal',
+        )},
+        'recall_caveat_entry': recall_caveat_entry(measured),
+        'caveats': caveats_for(measured),
+        'provenance': measured['provenance'],
+    }
+
+
+def _fmt(value: Any, spec: str = '') -> str:
+    return 'n/a' if value is None else format(value, spec)
+
+
+def _interval(bounds: Sequence[float] | None) -> str:
+    return 'n/a' if bounds is None else f'[{bounds[0]:.3f}, {bounds[1]:.3f}]'
+
+
+def _count(value: Mapping[str, Any] | None) -> str:
+    if value is None:
+        return 'n/a'
+    return f'{value["hits"]}/{value["total"]} ({value["rate"]:.3f})'
+
+
+def _table_row(row: Mapping[str, Any]) -> str:
+    auc = row['auc']
+    cells = [
+        row['arm'], row['arm_class'], row['granularity'], row['status'], _fmt(row['skip_reason']),
+        _fmt(row['operating_threshold'], '.4f'),
+        _count(row['paraphrase_band_recall']),
+        _interval(row['paraphrase_band_recall']['wilson_95'] if row['paraphrase_band_recall'] else None),
+        _count(row['precision']),
+        _interval(row['precision']['wilson_95'] if row['precision'] else None),
+        _count(row['hard_negative_flagged']),
+        _fmt(auc['value'] if auc else None, '.4f'),
+        _interval(auc['hanley_mcneil_95'] if auc else None),
+        _fmt(row['cost_usd'], '.4f'), _fmt(row['device']),
+    ]
+    return '| ' + ' | '.join(cells) + ' |'
+
+
+def _floor_cells(row: Mapping[str, Any]) -> str:
+    points = row['recall_at_precision'] or []
+    cells = [
+        f'{point["caught"]}/{point["recall"]["total"] if point["recall"] else "n/a"} '
+        f'@ {_fmt(point["threshold"], ".4f")}'
+        for point in points
+    ]
+    return '| ' + ' | '.join([row['arm'], *cells]) + ' |'
+
+
+def render_markdown(report: Mapping[str, Any]) -> str:
+    """The human-readable sibling of the JSON report, rendered from it alone."""
+    setting, counts = report['setting'], report['pair_counts']
+    generation = report['candidate_generation']
+    proposal, chosen = report['gate_proposal'], report['chosen']
+    measured_rows = [row for row in report['arms'] if row['recall_at_precision'] is not None]
+    verdict = (
+        'none measured' if chosen is None else
+        f'{chosen["arm"]} — on point estimates: '
+        f'{"pass" if chosen["verdict"]["on_point_estimates"] else "fail"}; '
+        f'on lower bounds: {"pass" if chosen["verdict"]["on_lower_bounds"] else "fail"}'
+    )
+    lines = [
+        '# Duplicate-detector recall on the task 3130 fixture',
+        '',
+        'Rendered from the JSON report beside this file by '
+        '`scripts/measure_duplicate_detector_recall.py`.',
+        '',
+        f'**Setting:** {setting["scan_set"]}, {setting["records"]} records, per-category '
+        f'top_k={setting["top_k"]}, embedder {setting["embedder"]["model"]} '
+        f'({setting["embedder"]["dimensions"]} dimensions). Pairs: '
+        f'{counts[TRUE_DUP]} true, {counts[HARD_NEGATIVE]} hard negative, '
+        f'{counts[UNRELATED]} unrelated.',
+        '',
+        f'**Generator ceiling:** {_count(generation["true_caught"])} true pairs generated '
+        f'{_interval(generation["true_caught"]["wilson_95"] if generation["true_caught"] else None)}; '
+        f'{generation["hard_negative_generated"]} hard negative(s) generated; '
+        f'{generation["cross_category_true_pairs"]} cross-category true pair(s); '
+        f'{generation["candidates_generated"]} candidates.',
+        '',
+        f'**Chosen:** {verdict}',
+        '',
+        '| detector | class | granularity | status | skip reason | threshold | recall | recall 95% '
+        '| precision | precision 95% | hard negatives flagged | AUC | AUC 95% | cost USD | device |',
+        '|' + '---|' * 15,
+        _table_row(report['baseline']),
+        *(_table_row(row) for row in report['arms']),
+        '',
+        '## Recall at precision floors',
+        '',
+        '| detector | ' + ' | '.join(f'{floor:.2f}' for floor in RECALL_AT_PRECISION_FLOORS) + ' |',
+        '|' + '---|' * (1 + len(RECALL_AT_PRECISION_FLOORS)),
+        *(_floor_cells(row) for row in measured_rows),
+        '',
+        f'## Gate proposal (pre-registered {proposal["proposed_on"]}, unratified)',
+        '',
+        f'- precision floor at the operating point: {proposal["precision_floor"]:.2f}',
+        f'- minimum paraphrase-band recall: {proposal["min_paraphrase_band_recall"]:.2f}',
+        f'- minimum AUC (true vs hard negative): {proposal["min_auc"]:.2f}',
+        '',
+        'Basis:',
+        '',
+        *(f'- {basis}' for basis in proposal['basis']),
+        '',
+        '## Caveats',
+        '',
+        *(f'- {caveat}' for caveat in report['caveats']),
+        '',
+        '## Provenance',
+        '',
+        *(f'- `{key}`: {json.dumps(value)}' for key, value in report['provenance'].items()),
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def write_report(report: Mapping[str, Any], report_path: Path) -> None:
+    """Write the JSON report and its ``.md`` sibling."""
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2) + '\n')
+    report_path.with_suffix('.md').write_text(render_markdown(report))
+
+
+#: The COMMITTED artifact the yaml entry is derived from.
+_DEFAULT_REPORT_PATH = _PACKAGE_ROOT / 'calibration' / 'duplicate_detector_recall_report.json'
+
+
+def guard_report_path(report_path: str | Path, *, arm_filter: Sequence[str] | None) -> Path:
+    """Every refusal of ``--report-path``, made before anything is embedded.
+
+    An ``--arm`` subset aimed at the committed report is refused however its
+    path is spelled: a partial run there would be a different population
+    under the same name.
+    """
+    path = _reranker.require_json_report_path(report_path)
+    if arm_filter and path.resolve() == _DEFAULT_REPORT_PATH.resolve():
+        raise ValueError(
+            f'--arm {", ".join(arm_filter)} would overwrite the committed report '
+            f'{_calibrate.package_relative(path)} with a partial measurement; '
+            'pass --report-path somewhere else',
+        )
+    return path
