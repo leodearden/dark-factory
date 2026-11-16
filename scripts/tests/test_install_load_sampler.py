@@ -358,27 +358,24 @@ def test_install_fails_loud_when_the_timer_is_absent_from_list_timers(tmp_path: 
     assert 'start' not in verbs, f'kicked the service after a failed verify: {verbs}'
 
 
-def test_a_db_with_a_fresh_row_passes_the_row_check(tmp_path: Path):
-    root = tmp_path / 'root'
-    _seed_db(root)
-
-    result = _run_script(tmp_path, env=_install_env(tmp_path, root))
-
-    assert result.returncode == 0, (
-        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+_LEAF = 'orchestrator-dark-factory.service'
+_HOST_AND_ONE_LEAF: Samples = MappingProxyType({
+    SampleKey('runqueue_ratio'): 4.06,
+    SampleKey('own_read_ok', _LEAF): 1.0,
+    SampleKey('own_cpu_some10', _LEAF): 0.5,
+})
 
 
-def test_the_row_check_counts_every_row_the_tick_wrote_host_and_per_leaf(
-    tmp_path: Path
+@pytest.mark.parametrize(
+    'tick',
+    [_ONE_HOST_ROW, _HOST_AND_ONE_LEAF],
+    ids=['host-only', 'host-and-one-leaf'],
+)
+def test_a_fresh_tick_passes_the_row_check_counting_every_row_it_wrote(
+    tmp_path: Path, tick: Samples
 ):
     """A per-leaf row is a real row of the tick, and the report counts it."""
     root = tmp_path / 'root'
-    leaf = 'orchestrator-dark-factory.service'
-    tick = {
-        SampleKey('runqueue_ratio'): 4.06,
-        SampleKey('own_read_ok', leaf): 1.0,
-        SampleKey('own_cpu_some10', leaf): 0.5,
-    }
     _seed_db(root, tick=tick)
 
     result = _run_script(tmp_path, env=_install_env(tmp_path, root))
