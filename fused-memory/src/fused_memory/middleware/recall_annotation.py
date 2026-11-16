@@ -86,7 +86,20 @@ def _bindings_defect(bindings: TaskBindings) -> str | None:
     kinds = [bound.binding for bound in bindings.tasks]
     if kinds != sorted(kinds, key=_is_mentioned):
         return f'STRUCTURAL entries come before MENTIONED ones (got {[kind.value for kind in kinds]})'
+    return _ambiguous_defect(bindings)
+
+
+def _ambiguous_defect(bindings: TaskBindings) -> str | None:
+    if len(set(bindings.ambiguous)) != len(bindings.ambiguous):
+        return f'each ambiguous number appears once (got {bindings.ambiguous!r})'
+    looked_up = sorted(set(bindings.ambiguous) & _bound_numbers(bindings.tasks))
+    if looked_up:
+        return f'an ambiguous number is never a bound task_id (got {looked_up!r})'
     return None
+
+
+def _bound_numbers(tasks: Sequence[BoundTask]) -> set[str]:
+    return {bound.ref.task_id for bound in tasks}
 
 
 def _is_mentioned(binding: Binding) -> bool:
@@ -100,18 +113,26 @@ def bind_tasks(
     results: Sequence[MemoryResult], *, project_id: str, known_projects: Mapping[str, str],
 ) -> TaskBindings:
     """The tasks the first MAX_RESULTS_SCANNED *results* are about or mention:
-    structural first, then by first result rank, the first MAX_TASKS kept."""
+    structural first, then by first result rank, the first MAX_TASKS kept.
+
+    *project_id* always counts as registered, so an empty or unusable
+    *known_projects* narrows the scan instead of letting any text qualifier
+    ('localhost:6379') mint a task.
+    """
     project = canonicalize_project_id(project_id)
+    registry = (*known_projects, project)
     links: list[tuple[str, _Link]] = []
     ambiguous: dict[str, None] = {}
     for result in results[:MAX_RESULTS_SCANNED]:
-        scan = scan_content(result.content, group_id=project, known_project_ids=known_projects)
+        scan = scan_content(result.content, group_id=project, known_project_ids=registry)
         links.extend((result.id, link) for link in _result_links(result, scan.refs, project))
         ambiguous.update(dict.fromkeys(referent.number for referent in scan.ambiguous))
     tasks = _merge(links)
+    kept = tasks[:MAX_TASKS]
+    looked_up = _bound_numbers(kept)
     return TaskBindings(
-        tasks=tuple(tasks[:MAX_TASKS]),
-        ambiguous=tuple(ambiguous),
+        tasks=tuple(kept),
+        ambiguous=tuple(number for number in ambiguous if number not in looked_up),
         omitted_tasks=max(0, len(tasks) - MAX_TASKS),
         results_not_scanned=max(0, len(results) - MAX_RESULTS_SCANNED),
     )
@@ -251,7 +272,10 @@ def _finished(fact: TaskFacts) -> str:
 
 
 def _titled(label: str, title: str | None) -> str:
-    return label if title is None else f'{label} "{fit_at_word(title, _TITLE_LIMIT)}"'
+    if title is None:
+        return label
+    one_line = ' '.join(title.split()).replace('"', "'")
+    return f'{label} "{fit_at_word(one_line, _TITLE_LIMIT)}"'
 
 
 def _label(ref: TaskRef, project: str) -> str:

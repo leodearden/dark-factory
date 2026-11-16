@@ -88,6 +88,32 @@ class TestPrdFixtures:
         assert bindings.tasks == ()
         assert bindings.ambiguous == ('3674',)
 
+    def test_a_number_bound_by_another_result_is_not_also_ambiguous(self):
+        bindings = _bind([
+            _note('n1', 'reify:3674 blocks task 3674'),
+            _note('n2', 'Task 3674 is done'),
+        ])
+        assert bindings.tasks == (BoundTask(_local('3674'), Binding.MENTIONED, ('n2',)),)
+        assert bindings.ambiguous == ()
+
+
+class TestRegistry:
+    @pytest.mark.parametrize(
+        'known_projects', [{}, {'/src/df': 'dark_factory'}], ids=['empty', 'path-shaped-keys'],
+    )
+    def test_without_a_usable_registry_a_text_qualifier_binds_nothing(self, known_projects):
+        bindings = bind_tasks(
+            [_note('n1', 'Total: 42 and localhost:6379')],
+            project_id=PROJECT, known_projects=known_projects,
+        )
+        assert bindings.tasks == ()
+
+    def test_without_a_registry_the_own_project_still_qualifies(self):
+        bindings = bind_tasks(
+            [_note('n1', 'see dark_factory: 12')], project_id=PROJECT, known_projects={},
+        )
+        assert _refs(bindings) == [_local('12')]
+
 
 class TestStructuralLinks:
     def test_a_looked_up_node_presented_as_a_graph_result_is_structural(self):
@@ -222,6 +248,14 @@ class TestInvariants:
         with pytest.raises(ValueError, match=r"once.*task_id='1'"):
             _bindings([_mentioned('1'), _mentioned('1')])
 
+    def test_a_duplicate_ambiguous_number_is_refused(self):
+        with pytest.raises(ValueError, match=r"ambiguous.*once.*'7', '7'"):
+            _bindings([], ambiguous=('7', '7'))
+
+    def test_an_ambiguous_number_that_is_also_bound_is_refused(self):
+        with pytest.raises(ValueError, match=r"ambiguous.*bound.*'1'"):
+            _bindings([_mentioned('1')], ambiguous=('1',))
+
     def test_a_mentioned_entry_before_a_structural_one_is_refused(self):
         structural = BoundTask(_local('2'), Binding.STRUCTURAL, ('e1',))
         with pytest.raises(ValueError, match=r'STRUCTURAL.*before.*MENTIONED'):
@@ -306,6 +340,12 @@ class TestRenderTaskFacts:
         assert _render(_structural('1', '2'), facts).splitlines()[1] == (
             f'- pending: 1 "{fit_at_word(title, 60)}" · 2'
         )
+
+    def test_a_title_renders_on_one_line_inside_its_own_quotes(self):
+        facts = _by_ref(_found('1', 'pending', 'Line one\n  line "two"'))
+        assert _render(_structural('1'), facts).splitlines()[1:] == [
+            '- pending: 1 "Line one line \'two\'"',
+        ]
 
     @pytest.mark.parametrize(
         ('task_count', 'result_count', 'expected'),
