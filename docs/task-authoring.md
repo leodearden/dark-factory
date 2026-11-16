@@ -1954,7 +1954,7 @@ new row whose canonical is unblessed fails the suite rather than silently
 re-creating that task's defect, where authors were told to migrate to
 `related_tasks` and still minted a census line.
 
-<!-- tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:begin -->
 
 | Canonical | Aliases to avoid |
 |---|---|
@@ -1964,7 +1964,7 @@ re-creating that task's defect, where authors were told to migrate to
 | `source_finding_id` | `origin_finding_id`, `origin_finding`, `origin_stage1_finding_id`, `source_finding`, `finding_id` |
 | `superseded_by` | `x_superseded_by`, `x_subsumed_by`, `subsumed_by`, `x_coalesced_into`, `x_replacement` |
 
-<!-- /tier-b-canonical-keys -->
+<!-- tier-b-canonical-keys:end -->
 
 **The finding-provenance row splits into two classes** (ruling:
 `esc-3796-1`, 2026-08-17). `origin_finding_id` is the **retired** alias and
