@@ -575,6 +575,18 @@ class TestAttributiveMarkersBindForwardOnly:
                 'task 5578 is merge-deferred with a queued carrier branch',
                 id='queued-carrier',
             ),
+            pytest.param(
+                "This task's cite lands under merge task_id=9207, so #9236 gets no "
+                'landed-outbox hit',
+                id='esc-unverified-claim-9236-3',
+            ),
+            pytest.param('task 5422 has no landed fix yet', id='negative-determiner'),
+            pytest.param(
+                '#7129 fixed the eval half and #6577 the compile half, so keeping the member '
+                'read would leave the demo showing a workaround, and #6577\'s Type::Field '
+                'typing arm with no shipped-example coverage',
+                id='no-shipped-example',
+            ),
         ],
     )
     def test_an_attributive_marker_does_not_claim_an_earlier_ref(self, text):
