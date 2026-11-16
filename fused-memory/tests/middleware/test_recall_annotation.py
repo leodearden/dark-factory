@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta, timezone
+
 import pytest
 from orchestrator.completion_record import completion_record_metadata
 
@@ -14,12 +16,15 @@ from fused_memory.middleware.recall_annotation import (
     MAX_TASKS,
     Binding,
     BoundTask,
+    FactsUnavailable,
     TaskBindings,
     bind_tasks,
+    render_task_facts,
 )
-from fused_memory.middleware.task_facts import TaskRef
+from fused_memory.middleware.task_facts import TaskFacts, TaskRef
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
+from fused_memory.utils.clip_disclosure import fit_at_word
 
 PROJECT = 'dark_factory'
 KNOWN = {'dark_factory': '/src/df', 'reify': '/src/reify'}
@@ -225,3 +230,132 @@ class TestInvariants:
     def test_a_bound_task_needs_a_result(self):
         with pytest.raises(ValueError, match=r'result_ids.*\(\)'):
             BoundTask(_local('1'), Binding.MENTIONED, ())
+
+
+READ_AT = datetime(2026, 11, 13, 15, 4, 5, tzinfo=UTC)
+HEADER = (
+    '**Live task status** (read from the task store at 15:04Z; '
+    'status words inside the memory text below are history)'
+)
+
+
+def _render(bindings: TaskBindings, facts, *, read_at: datetime = READ_AT) -> str:
+    return render_task_facts(bindings, facts, project_id=PROJECT, read_at=read_at)
+
+
+def _found(task_id: str, status: str, title: str | None = 'T', **finished) -> TaskFacts:
+    return TaskFacts.found(_local(task_id), status=status, title=title, **finished)
+
+
+def _by_ref(*facts: TaskFacts) -> dict[TaskRef, TaskFacts]:
+    return {fact.ref: fact for fact in facts}
+
+
+def _structural(*task_ids: str) -> TaskBindings:
+    return _bind([_edge(f'e{task_id}', 'a fact', [f'Task {task_id}']) for task_id in task_ids])
+
+
+class TestRenderTaskFacts:
+    def test_the_block_groups_and_labels_every_kind_of_fact(self):
+        bindings = _bind([
+            _edge('e1', 'a fact', ['Task 3651']),
+            _edge('e2', 'a fact', ['Task 9261']),
+            _edge('e3', 'a fact', ['Task 4725']),
+            _note('n4', 'task 3127 is pending'),
+            _edge('e5', 'a fact', ['reify:132']),
+            _note('n6', 'task 77 is open'),
+            _note('n7', 'reify:3674 blocks task 3674'),
+        ])
+        facts = _by_ref(
+            _found('3651', 'done', 'Short title', finished_how='merged', finished_commit='8ca12d33a1b2c3d4'),
+            _found('9261', 'pending', waits_on=((_local('3057'), 'pending'),)),
+            _found('4725', 'done', 'Other', finished_how='found_on_main'),
+            _found('3127', 'done'),
+            TaskFacts.could_not_check(TaskRef('reify', '132'), 'project not registered'),
+            TaskFacts.no_such_task(_local('77')),
+        )
+        assert _render(bindings, facts).splitlines() == [
+            HEADER,
+            '- done: 3651 "Short title" (merged 8ca12d33a1) · 4725 "Other" (found on main)',
+            '- pending: 9261 "T", waits on 3057 (pending)',
+            '- mentioned in the text only, check the title: 3127 "T" (done)',
+            '- no such task: 77',
+            '- could not check: reify:132 (project not registered)',
+            '- ambiguous, not looked up: 3674',
+        ]
+
+    def test_a_done_task_without_provenance_has_no_parenthesis(self):
+        facts = _by_ref(_found('3651', 'done', 'Short title'))
+        assert _render(_structural('3651'), facts).splitlines()[1] == '- done: 3651 "Short title"'
+
+    def test_no_such_task_and_could_not_check_ignore_the_binding(self):
+        bindings = _bind([_edge('e1', 'a fact', ['Task 77']), _note('n2', 'task 78 and task 79')])
+        facts = _by_ref(
+            TaskFacts.no_such_task(_local('77')),
+            TaskFacts.no_such_task(_local('78')),
+            TaskFacts.could_not_check(_local('79'), 'task store read failed: OSError: gone'),
+        )
+        assert _render(bindings, facts).splitlines()[1:] == [
+            '- no such task: 77 · 78',
+            '- could not check: 79 (task store read failed: OSError: gone)',
+        ]
+
+    def test_a_long_title_is_cut_at_a_word_and_a_missing_one_has_no_quotes(self):
+        title = 'a title long enough that it must be cut somewhere past sixty characters'
+        facts = _by_ref(_found('1', 'pending', title), _found('2', 'pending', None))
+        assert _render(_structural('1', '2'), facts).splitlines()[1] == (
+            f'- pending: 1 "{fit_at_word(title, 60)}" · 2'
+        )
+
+    @pytest.mark.parametrize(
+        ('task_count', 'result_count', 'expected'),
+        [
+            (60, 105, '- not shown: 20 more tasks; 5 results not scanned'),
+            (45, 100, '- not shown: 5 more tasks'),
+            (1, 105, '- not shown: 5 results not scanned'),
+        ],
+    )
+    def test_overflow_is_a_trailing_line_with_only_its_non_zero_parts(
+        self, task_count, result_count, expected,
+    ):
+        results = [_note(f'n{i}', f'task {1000 + i} is open') for i in range(task_count)]
+        results += [_note(f'x{i}', 'nothing here') for i in range(result_count - task_count)]
+        bindings = _bind(results)
+        facts = _by_ref(*(_found(bound.ref.task_id, 'pending') for bound in bindings.tasks))
+        assert _render(bindings, facts).splitlines()[-1] == expected
+
+    def test_the_read_time_is_rendered_in_utc(self):
+        plus_two = datetime(2026, 11, 13, 17, 4, 5, tzinfo=timezone(timedelta(hours=2)))
+        facts = _by_ref(_found('1', 'pending'))
+        assert _render(_structural('1'), facts, read_at=plus_two).splitlines()[0] == HEADER
+
+    def test_the_project_is_canonicalized(self):
+        facts = _by_ref(_found('1', 'pending'))
+        rendered = render_task_facts(
+            _structural('1'), facts, project_id='Dark-Factory', read_at=READ_AT,
+        )
+        assert rendered.splitlines()[1] == '- pending: 1 "T"'
+
+
+class TestRenderTaskFactsOtherForms:
+    @pytest.mark.parametrize('task_ids', [(), ('1',)], ids=['no-tasks', 'tasks'])
+    def test_unavailable_facts_render_one_line_with_the_reason(self, task_ids):
+        rendered = _render(_structural(*task_ids), FactsUnavailable('no task store configured'))
+        assert rendered.splitlines() == [rendered]
+        assert 'could not be read' in rendered
+        assert 'no task store configured' in rendered
+
+    def test_an_empty_reason_is_refused(self):
+        with pytest.raises(ValueError, match='reason'):
+            FactsUnavailable('')
+
+    def test_nothing_to_report_renders_nothing(self):
+        assert _render(_bind([_note('n1', 'nothing here')]), {}) == ''
+
+    def test_a_naive_read_time_is_refused(self):
+        with pytest.raises(ValueError, match='read_at'):
+            _render(_structural('1'), _by_ref(_found('1', 'pending')), read_at=datetime(2026, 11, 13))
+
+    def test_a_bound_ref_without_facts_is_refused_by_name(self):
+        with pytest.raises(ValueError, match="task_id='3651'"):
+            _render(_structural('3651'), {})
