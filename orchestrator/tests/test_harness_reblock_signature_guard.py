@@ -437,10 +437,12 @@ class TestReblockGuardEscalationEvent:
         Asserts:
         - set_task_status is NOT called (flip withheld)
         - Exactly one L2 submitted to the queue
+        - The L2 is filed against the real task with the reblock-guard root
+          cause and suggested action
         - event_store.emit called exactly once with positional
           EventType.escalation_created, task_id='42', and a data dict
-          carrying escalation_id/category/severity/level for the just-filed
-          L2.
+          carrying escalation_id/category/severity/level/reason for the
+          just-filed L2.
         """
         task_id = '42'
         esc = _make_l1_esc(
@@ -474,6 +476,9 @@ class TestReblockGuardEscalationEvent:
             f'Expected 1 L2 submitted, got {len(q._submitted)}'
         )
         filed = q._submitted[0]
+        assert filed.task_id == task_id
+        assert filed.root_cause == 'reblock-guard:42'
+        assert filed.suggested_action == 'investigate_reblock_loop'
 
         # escalation_created must be emitted exactly once, for the new L2
         harness.event_store.emit.assert_called_once()
@@ -485,35 +490,7 @@ class TestReblockGuardEscalationEvent:
         assert data.get('category') == 'task_failure'
         assert data.get('severity') == 'urgent'
         assert data.get('level') == 2
-
-    async def test_threshold_trip_l2_carries_the_reblock_guard_identity(
-        self, harness: Harness
-    ):
-        esc = _make_l1_esc(
-            task_id='42',
-            category='infra_issue',
-            summary='disk full',
-            resolved_by='l2-cascade:esc-100-1',
-        )
-        sig = Harness._reblock_signature(esc)
-        q = _make_mock_queue()
-        harness._escalation_queue = q
-        harness.event_store = MagicMock()
-        _make_fake_scheduler(
-            harness,
-            initial_metadata={'reblock_guard': {'count': 3, 'signature': sig}},
-        )
-
-        harness._on_escalation_resolved(esc)
-        await asyncio.gather(*list(harness._background_tasks))
-
-        (filed,) = q._submitted
-        assert filed.task_id == '42'
-        assert filed.root_cause == 'reblock-guard:42'
-        assert filed.suggested_action == 'investigate_reblock_loop'
-        assert harness.event_store.emit.call_args.kwargs['data']['reason'] == (
-            'reblock-guard-threshold'
-        )
+        assert data.get('reason') == 'reblock-guard-threshold'
 
     async def test_dedup_withhold_emits_no_escalation_created_event(
         self, harness: Harness

@@ -2827,7 +2827,7 @@ class TestFileWatcherOutageL2:
         h.event_store.emit.assert_called_once()
         (event_type,) = h.event_store.emit.call_args.args
         assert event_type is EventType.escalation_created
-        assert h.event_store.emit.call_args.kwargs['task_id'] == h._WATCHER_OUTAGE_SENTINEL
+        assert h.event_store.emit.call_args.kwargs['task_id'] == '__watcher_supervisor__'
         data = h.event_store.emit.call_args.kwargs['data']
         assert data['escalation_id'] == l2.id
         assert (data['level'], data['severity']) == (2, 'urgent')
