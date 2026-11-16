@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, time, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -21,6 +21,7 @@ from shared.account_reserve import (
     ReserveEvent,
     ReserveState,
     ScheduleDrift,
+    WeeklyReset,
     WorkClass,
     WorkKind,
     admits,
@@ -168,6 +169,13 @@ class TestWeeklyResetText:
         assert dumped['weekly_reset_utc'] == 'mon 21:00'
         assert ReserveConfig.model_validate(dumped) == config
 
+    @pytest.mark.parametrize(
+        'off_the_minute', [time(21, 0, 30), time(21, 0, 0, 1)], ids=['second', 'microsecond']
+    )
+    def test_a_reset_off_the_whole_minute_is_refused(self, off_the_minute: time) -> None:
+        with pytest.raises(ValueError, match=re.escape(repr(off_the_minute))):
+            WeeklyReset(0, off_the_minute)
+
 
 class TestAdmitTiers:
     def test_without_admit_tiers_every_project_gets_critical_and_high(self) -> None:
@@ -186,6 +194,16 @@ class TestAdmitTiers:
         assert tiers.for_project('dark_factory') == ('critical', 'high', 'medium')
         assert tiers.for_project('reify') == ('critical', 'high')
         assert tiers.for_project(None) == ('critical', 'high')
+
+    @pytest.mark.parametrize('misspelling', ['defaults', 'Default'])
+    def test_a_misspelled_default_is_read_as_a_project_and_the_default_stands(
+        self, misspelling: str
+    ) -> None:
+        reserve = parse_reserve(prd_block(admit_tiers={misspelling: ['critical']}), ROSTER)
+
+        assert isinstance(reserve, ActiveReserve)
+        assert reserve.config.admit_tiers.for_project(None) == ('critical', 'high')
+        assert reserve.config.admit_tiers.for_project(misspelling) == ('critical',)
 
 
 PROTECTED = utc(2026, 11, 18, 12)
@@ -333,6 +351,13 @@ class TestParseReserve:
             ),
             pytest.param(prd_block(weekly_reset_utc='mon'), 'weekly_reset_utc', id='no-time'),
             pytest.param(prd_block(weekly_reset_utc='21:00'), 'weekly_reset_utc', id='no-day'),
+            pytest.param(
+                prd_block(admit_tiers={'dark_factory': 'high'}),
+                'admit_tiers.dark_factory',
+                id='project-tiers-as-text',
+            ),
+            pytest.param(prd_block(admit_tiers=None), 'admit_tiers', id='admit-tiers-null'),
+            pytest.param(prd_block(admit_tiers=['high']), 'admit_tiers', id='admit-tiers-list'),
             pytest.param(None, 'reserve: ', id='empty-block'),
             pytest.param([prd_block()], 'reserve: ', id='list-block'),
         ],
@@ -372,12 +397,14 @@ class TestAccountsFileLoader:
         assert without_block.model_dump() == with_block.model_dump()
 
     def test_seen_from_wednesday_the_prd_block_releases_on_sunday_morning(
-        self, tmp_path: Path
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        config = UsageCapConfig(
-            accounts_file=write_accounts_file(tmp_path / 'accounts.yaml', reserve=prd_block())
-        )
+        with caplog.at_level(logging.WARNING):
+            config = UsageCapConfig(
+                accounts_file=write_accounts_file(tmp_path / 'accounts.yaml', reserve=prd_block())
+            )
 
+        assert caplog.records == []
         assert isinstance(config.reserve, ActiveReserve)
         assert config.reserve.config.release_at(utc(2026, 11, 18, 12)) == utc(2026, 11, 22, 9)
 
@@ -421,18 +448,26 @@ class TestAccountsFileLoader:
         assert reloaded == config
         assert reloaded.reserve == config.reserve
 
-    def test_an_inline_reserve_is_ignored(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize('beside_a_file', [False, True], ids=['no-file', 'file-without-block'])
+    def test_an_inline_reserve_is_ignored_with_a_warning_naming_it(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, beside_a_file: bool
+    ) -> None:
         inline = {'account': 'max-h'}
-        without_file = UsageCapConfig.model_validate({'reserve': inline})
-        beside_a_file_without_block = UsageCapConfig.model_validate(
-            {
-                'accounts_file': write_accounts_file(tmp_path / 'accounts.yaml'),
-                'reserve': inline,
-            }
-        )
+        data: dict[str, object] = {'reserve': inline}
+        if beside_a_file:
+            data['accounts_file'] = write_accounts_file(tmp_path / 'accounts.yaml')
 
-        assert without_file.reserve is None
-        assert beside_a_file_without_block.reserve is None
+        with caplog.at_level(logging.WARNING):
+            config = UsageCapConfig.model_validate(data)
+
+        assert config.reserve is None
+        warnings = [record.getMessage() for record in caplog.records]
+        assert len(warnings) == 1
+        assert 'usage_cap.reserve' in warnings[0]
+        assert repr(inline) in warnings[0]
+
+    def test_no_project_config_gains_a_reserve_key(self) -> None:
+        assert 'reserve' not in UsageCapConfig.model_fields
 
     def test_a_changed_block_is_a_changed_config(self, tmp_path: Path) -> None:
         path = tmp_path / 'accounts.yaml'

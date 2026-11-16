@@ -106,6 +106,8 @@ class WeeklyReset:
             raise ValueError(f'weekday must be 0 (Monday) to 6 (Sunday), got {self.weekday!r}')
         if self.time_utc.tzinfo is not None:
             raise ValueError(f'time_utc is UTC and carries no tzinfo, got {self.time_utc!r}')
+        if self.time_utc.second or self.time_utc.microsecond:
+            raise ValueError(f'time_utc is a whole minute, got {self.time_utc!r}')
 
     @classmethod
     def parse(cls, text: str) -> WeeklyReset:
