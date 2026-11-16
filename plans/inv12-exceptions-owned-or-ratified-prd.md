@@ -663,7 +663,7 @@ Grants (propose: design, not governed):
 `orchestrator/src/orchestrator/config.py::RELOADABLE_FIELDS`; the entity-mint and
 mem0-update prefix configs;
 `fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::_BRIEFING_REFRESH_PROJECT_ALLOWLIST`;
-`scripts/render_systemd_unit.py::HOST_LOCAL_ENVIRONMENT`.
+`scripts/systemd_unit_parity.py::ENV_POLICY` (the single declaration the renderer's preserve sets, the dashboard divergence allowlist and the fused-memory required `Environment=` lines project from).
 
 ### Part 3 — questions
 
