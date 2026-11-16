@@ -769,7 +769,7 @@ def _no_dry_run_unblock(monkeypatch, request):
 
 @pytest.fixture(autouse=True)
 def _forbid_agent_cli_spawn(monkeypatch, request):
-    """Fail any test that starts an agent-CLI process (claude/codex/gemini/pi).
+    """Fail any test that starts an agent CLI (``_agent_cli_guard.AGENT_CLI_BINARIES``).
 
     Fails at the spawn seam, and again at teardown for a spawn whose raise a
     caller absorbed. The guard is ``_agent_cli_guard.py``; its tests are

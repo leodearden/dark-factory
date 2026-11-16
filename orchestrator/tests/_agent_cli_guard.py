@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-AGENT_CLI_BINARIES: frozenset[str] = frozenset({'claude', 'codex', 'gemini', 'pi'})
+AGENT_CLI_BINARIES: frozenset[str] = frozenset({'claude', 'codex', 'gemini', 'pi', 'zcode', 'mimo'})
 
 
 _REMEDY = (

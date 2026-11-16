@@ -149,6 +149,7 @@ def _flag_value(argv: list[str], flag: str) -> str:
 
 
 @pytest.mark.asyncio
+@pytest.mark.spawns_agent_cli
 class TestInvokeMimo:
 
     async def test_the_result_is_read_from_the_session_store(self, fake_mimo, worktree):
