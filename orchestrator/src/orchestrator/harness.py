@@ -17496,27 +17496,22 @@ class Harness:
     def _file_reblock_guard_l2(self, task_id: str, prev_count: int, sig: str) -> None:
         """File a born-at-L2 human escalation when the re-block guard threshold is hit.
 
-        Mirrors _file_watcher_outage_l2:
-          - No-op when _escalation_queue is None (bare-Harness unit tests).
-          - Deduped via find_pending_l2_by_root_cause(root_cause) so repeated
-            trips for the same stuck task file exactly one L2.
-          - Best-effort: all exceptions are swallowed (same pattern as
-            _file_watcher_outage_l2) so this never breaks the re-pend path.
-          - agent_role='harness-reblock-guard' — a harness-sentinel that stays
-            born-at-L2 under the C4 allowlist (severity='urgent').
+        One pending L2 per stuck task: the root cause is per task, and the
+        record is filed against the real task.  The 'harness-reblock-guard'
+        sentinel role keeps it born at L2.  The no-op, dedup and fail-open
+        rules are :meth:`_file_deduped_born_at_l2`'s.
         """
-        queue = getattr(self, '_escalation_queue', None)
-        if not queue:
-            return
-        try:
-            root_cause = f'reblock-guard:{task_id}'
-            if queue.find_pending_l2_by_root_cause(root_cause) is not None:
-                return  # dedup: one open L2 per stuck task
-            from escalation.models import Escalation
-            summary = (
-                f'persistent re-block: {prev_count} redispatches, signature {sig}'
-            )[:200]
-            detail = (
+        self._file_deduped_born_at_l2(
+            BornAtL2Alarm(
+                root_cause=f'reblock-guard:{task_id}',
+                task_id=task_id,
+                role='harness-reblock-guard',
+                category=EscalationCategory.TASK_FAILURE,
+                suggested_action='investigate_reblock_loop',
+                created_reason='reblock-guard-threshold',
+            ),
+            summary=f'persistent re-block: {prev_count} redispatches, signature {sig}',
+            detail=(
                 f'Task {task_id} has been re-blocked {prev_count} time(s) with the '
                 f'same failure signature, reaching the _REBLOCK_GUARD_THRESHOLD.\n\n'
                 f'Signature: {sig}\n\n'
@@ -17524,53 +17519,8 @@ class Harness:
                 f'signature.  Investigate the root cause, fix the underlying issue, '
                 f'and clear metadata.reblock_guard on the task to allow future '
                 f're-pends to proceed.'
-            )
-            esc = Escalation(
-                id=queue.make_id(task_id),
-                task_id=task_id,
-                agent_role='harness-reblock-guard',
-                severity='urgent',
-                category='task_failure',
-                level=2,
-                root_cause=root_cause,
-                summary=summary,
-                detail=detail,
-                suggested_action='investigate_reblock_loop',
-                filing_claimant_run_id=self._filing_claimant_run_id,
-            )
-            queue.submit(esc)
-            try:
-                if self.event_store:
-                    self.event_store.emit(
-                        EventType.escalation_created,
-                        task_id=task_id,
-                        data={
-                            'escalation_id': esc.id,
-                            'category': esc.category,
-                            'severity': esc.severity,
-                            'level': esc.level,
-                            'reason': 'reblock-guard-threshold',
-                        },
-                    )
-            except Exception:
-                # Isolated from the outer handler: the L2 is already filed at
-                # this point, so a failure here is an observability-only
-                # miss, never a "failed to file L2" condition.
-                logger.warning(
-                    'reblock-guard: L2 %s filed for task %s but '
-                    'escalation_created emit failed', esc.id, task_id,
-                    exc_info=True,
-                )
-            logger.warning(
-                'reblock-guard: task %s hit threshold (count=%d, sig=%r); '
-                'flip withheld, L2 filed %s',
-                task_id, prev_count, sig, esc.id,
-            )
-        except Exception:
-            logger.warning(
-                'reblock-guard: failed to file L2 for task %s', task_id,
-                exc_info=True,
-            )
+            ),
+        )
 
     # Warm-lane record-drift born-at-L2 filer (task 2986, W2b I3/I4). Constant
     # (not per-task) dedup key — one open L2 at a time regardless of how many
