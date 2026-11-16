@@ -33,7 +33,7 @@ class BornAtL2Alarm:
     """What stays the same each time one kind of alarm is filed."""
 
     root_cause: str
-    sentinel_task: str
+    task_id: str
     role: str
     category: EscalationCategory
     suggested_action: str
@@ -88,8 +88,8 @@ def _escalation(
     filing_claimant_run_id: str | None,
 ) -> Escalation:
     return Escalation(
-        id=queue.make_id(alarm.sentinel_task),
-        task_id=alarm.sentinel_task,
+        id=queue.make_id(alarm.task_id),
+        task_id=alarm.task_id,
         agent_role=alarm.role,
         severity='urgent',
         category=alarm.category,
@@ -110,7 +110,7 @@ def _emit_created(
     try:
         event_store.emit(
             EventType.escalation_created,
-            task_id=alarm.sentinel_task,
+            task_id=alarm.task_id,
             data={
                 'escalation_id': escalation.id,
                 'category': escalation.category,
