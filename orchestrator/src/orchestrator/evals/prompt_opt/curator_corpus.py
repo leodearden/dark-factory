@@ -640,8 +640,8 @@ async def propose_curator_label_frontier(
 ) -> FrontierLabel:
     """Propose a GOLD curator label for *candidate* via a frontier model.
 
-    Build-time only -- never called from a hermetic test (those inject a
-    fake ``FrontierProposerFn``). Mirrors
+    Its production callers are build-time only; corpus-building tests inject a
+    fake ``FrontierProposerFn`` instead. Mirrors
     ``reviewer_trial.mining.propose_labels_frontier``'s ``invoke_agent``
     pattern: no tools, structured JSON output, cost always reported --
     unlike the reviewer_trial version (which returns a ``(issues, cost_usd)``
