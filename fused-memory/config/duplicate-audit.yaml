@@ -66,6 +66,11 @@ recall_caveat:
   # meets_proposed_gate is judged against an UNRATIFIED proposal; task 10244
   # ratifies it and sets fitness.gate_filing.
   adjudicator_measurements:
+    # The 2026-11-16 report's calibrated-ann baseline, re-embedded, caught
+    # 27/301 at AUC 0.2540, not the 25/301 and 0.2534 above. The ANN cutoffs
+    # were identical. In the 2026-08-11 cosines, two true pairs sat 0.00014
+    # and 0.00009 below their cutoffs, and none sat within 0.002 above.
+    # Hypothesis: re-embedding drift moved those two pairs across.
     - measured_at: '2026-11-16'
       detector: 'bge-reranker-v2-m3+claims'
       scan_set:
