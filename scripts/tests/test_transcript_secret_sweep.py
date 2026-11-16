@@ -15,6 +15,7 @@ import gzip
 import hashlib
 import json
 import os
+import shutil
 import stat
 import tempfile
 import xml.etree.ElementTree as ET
@@ -578,6 +579,44 @@ def test_a_file_that_changes_while_it_is_redacted_is_deferred(tree, monkeypatch)
     result = sweep.run(tree.config(), environ=ENVIRON, post_escalation=Recorder())
 
     assert result.deferred == (tree.pool_subagent, tree.fresh)
+    assert {hit.path for hit in result.redacted} == {tree.pool_main, tree.openai}
+
+
+def test_a_file_that_vanishes_before_it_is_read_is_passed_over(tree, monkeypatch):
+    """pytest prunes its own old base temps while the sweep walks them."""
+    real_redact_in_place = sweep.redact_in_place
+
+    def pruned_before_reading(path, needles, **kwargs):
+        if path == tree.pool_subagent:
+            path.unlink()
+            raise FileNotFoundError(2, 'No such file or directory', str(path))
+        return real_redact_in_place(path, needles, **kwargs)
+
+    monkeypatch.setattr(sweep, 'redact_in_place', pruned_before_reading)
+
+    result = sweep.run(tree.config(), environ=ENVIRON, post_escalation=Recorder())
+
+    assert result.unreadable == ()
+    assert tree.pool_subagent not in result.deferred
+    assert {hit.path for hit in result.redacted} == {tree.pool_main, tree.openai}
+    assert result.clean == 2
+
+
+def test_a_directory_that_vanishes_before_it_is_listed_is_passed_over(tree, monkeypatch):
+    real_redact_in_place = sweep.redact_in_place
+    pruned = tree.pool_subagent.parent.parent
+
+    def pruned_mid_walk(path, needles, **kwargs):
+        if path == tree.pool_main:
+            shutil.rmtree(pruned)
+        return real_redact_in_place(path, needles, **kwargs)
+
+    monkeypatch.setattr(sweep, 'redact_in_place', pruned_mid_walk)
+
+    result = sweep.run(tree.config(), environ=ENVIRON, post_escalation=Recorder())
+
+    assert not pruned.exists()
+    assert result.unreadable == ()
     assert {hit.path for hit in result.redacted} == {tree.pool_main, tree.openai}
 
 
