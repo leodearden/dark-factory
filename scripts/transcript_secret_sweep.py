@@ -1,15 +1,23 @@
-"""Nightly sweep: redact live secret values from every agent transcript already on disk.
+"""Nightly sweep: redact live secret values from agent transcripts and test logs on disk.
 
-Archive-time redaction (``shared.transcript_archive``) covers what is archived
-from now on; this sweep covers what is already on disk: each factory
-project's agent-transcript archive and ``~/.claude/projects``, including
-archive staging copies a hard kill stranded. It matches the values its OWN
-environment holds (the wrapper sources the repo ``.env``), and replaces them
-with ``shared.secret_redaction``'s same-length placeholders. It reads only
-regular files, and skips those modified within ``min_age_secs``, which a live
-session may still be appending to. A sweep that redacted or refused anything
-files one ``risk_identified`` info escalation. Nothing it prints or files
-carries a value. Operator view: ``OPERATIONS.md`` §12.
+Archive-time redaction (``shared.transcript_archive``) covers transcripts
+archived from now on; this sweep covers what is already on disk. For each
+factory project it walks the agent-transcript archive (``*.jsonl``, including
+archive staging copies a hard kill stranded), the verify logs and the
+offline-lane logs (``LOG_SUFFIXES``: ``*.log``, ``*.json``, junit ``*.xml``
+and gzipped junit ``*.xml.gz``), and it walks ``~/.claude/projects`` for
+transcripts. A ``*.log`` is matched for the raw value as well as its
+JSON-escaped form; transcripts and ``*.json`` for the JSON-escaped form only.
+Gzipped junit is redacted by decompressing, replacing and
+recompressing it, and XML gets an entity-escaped placeholder so a report still
+parses; a ``.gz`` that does not decompress is reported unreadable and left as
+found. It matches the values its OWN environment holds (the wrapper sources
+the repo ``.env``), and replaces them with ``shared.secret_redaction``'s
+same-length placeholders. It reads only regular files, and skips those
+modified within ``min_age_secs``, which a live session or test run may still
+be appending to. A sweep that redacted or refused anything files one
+``risk_identified`` info escalation. Nothing it prints or files carries a
+value. Operator view: ``OPERATIONS.md`` §12.
 """
 
 from __future__ import annotations
@@ -33,11 +41,19 @@ try:
     from dashboard.config import DashboardConfig
     from shared.mcp_post import mcp_server_base
     from shared.mcp_session import SyncMcpSession
-    from shared.project_layout import agent_transcripts_dir, default_project_root
+    from shared.project_layout import (
+        agent_transcripts_dir,
+        default_project_root,
+        offline_lane_dir,
+        verify_logs_dir,
+    )
     from shared.secret_env import secret_env_values
     from shared.secret_redaction import (
+        Codec,
+        CorruptCompressedFile,
         FileChangedDuringRedaction,
         FileRedaction,
+        Markup,
         Needle,
         redact_in_place,
         redaction_needles,
@@ -57,13 +73,27 @@ ESCALATION_TIMEOUT_SECS = 30.0
 MAX_DETAIL_FILES = 200
 NO_SECRETS_CAUSE = 'no secret-bearing values in the environment'
 TRANSCRIPT_SUFFIXES = ('.jsonl', '.jsonl' + STAGING_SUFFIX)
+LOG_SUFFIXES = ('.log', '.json', '.xml', '.xml.gz')
+
+_FORMATS: tuple[tuple[str, Markup, Codec], ...] = (
+    ('.xml.gz', Markup.XML, Codec.GZIP),
+    ('.xml', Markup.XML, Codec.PLAIN),
+    ('.log', Markup.TEXT, Codec.PLAIN),
+)
 
 PostEscalation = Callable[[dict[str, object]], object]
+NeedlesByMarkup = Mapping[Markup, Sequence[Needle]]
+
+
+@dataclass(frozen=True)
+class SweptTree:
+    root: Path
+    suffixes: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class SweepConfig:
-    roots: tuple[Path, ...]
+    trees: tuple[SweptTree, ...]
     now: datetime.datetime
     min_age_secs: float = DEFAULT_MIN_AGE_SECS
 
@@ -75,7 +105,7 @@ class RedactedFile:
 
 
 @dataclass(frozen=True)
-class RefusedTranscriptLine:
+class RefusedFileLine:
     path: Path
     var: str
     line_number: int
@@ -93,7 +123,7 @@ class SweepResult:
     ok: bool
     cause: str | None = None
     redacted: tuple[RedactedFile, ...] = ()
-    refused: tuple[RefusedTranscriptLine, ...] = ()
+    refused: tuple[RefusedFileLine, ...] = ()
     deferred: tuple[Path, ...] = ()
     unreadable: tuple[Path, ...] = ()
     clean: int = 0
@@ -112,8 +142,17 @@ class SweepResult:
         }
 
 
-def transcript_roots(project_roots: Iterable[Path], claude_projects_dir: Path) -> tuple[Path, ...]:
-    return (*(agent_transcripts_dir(root) for root in project_roots), claude_projects_dir)
+def swept_trees(project_roots: Iterable[Path], claude_projects_dir: Path) -> tuple[SweptTree, ...]:
+    per_project = (
+        tree
+        for root in project_roots
+        for tree in (
+            SweptTree(agent_transcripts_dir(root), TRANSCRIPT_SUFFIXES),
+            SweptTree(verify_logs_dir(root), LOG_SUFFIXES),
+            SweptTree(offline_lane_dir(root), LOG_SUFFIXES),
+        )
+    )
+    return (*per_project, SweptTree(claude_projects_dir, TRANSCRIPT_SUFFIXES))
 
 
 def run(
@@ -122,8 +161,9 @@ def run(
     environ: Mapping[str, str],
     post_escalation: PostEscalation,
 ) -> SweepResult:
-    needles = redaction_needles(secret_env_values(environ))
-    if not needles:
+    secrets = secret_env_values(environ)
+    needles = {markup: redaction_needles(secrets, markup=markup) for markup in Markup}
+    if not needles[Markup.JSON]:
         return SweepResult(ok=False, cause=NO_SECRETS_CAUSE)
     result = _scan(config, needles)
     if not (result.redacted or result.refused):
@@ -135,20 +175,20 @@ def run(
     return result
 
 
-def _scan(config: SweepConfig, needles: Sequence[Needle]) -> SweepResult:
+def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
     cutoff_ns = int((config.now.timestamp() - config.min_age_secs) * 1e9)
     redacted: list[RedactedFile] = []
-    refused: list[RefusedTranscriptLine] = []
+    refused: list[RefusedFileLine] = []
     deferred: list[Path] = []
     unreadable: list[Path] = []
     clean = 0
-    for path in _transcripts(config.roots, unreadable):
+    for path in _swept_files(config.trees, unreadable):
         outcome = _sweep_file(path, needles, cutoff_ns)
         match outcome:
             case FileRedaction():
                 if outcome.redacted:
                     redacted.append(RedactedFile(path, outcome.counts))
-                refused.extend(RefusedTranscriptLine(path, line.var, line.line_number) for line in outcome.refused)
+                refused.extend(RefusedFileLine(path, line.var, line.line_number) for line in outcome.refused)
             case _Verdict.CLEAN:
                 clean += 1
             case _Verdict.DEFERRED:
@@ -167,21 +207,28 @@ def _scan(config: SweepConfig, needles: Sequence[Needle]) -> SweepResult:
     )
 
 
-def _transcripts(roots: Iterable[Path], unreadable: list[Path]) -> Iterator[Path]:
+def _swept_files(trees: Iterable[SweptTree], unreadable: list[Path]) -> Iterator[Path]:
     def note_unlistable(error: OSError) -> None:
         unreadable.append(Path(error.filename))
 
-    for root in roots:
-        if not root.is_dir():
+    for tree in trees:
+        if not tree.root.is_dir():
             continue
-        for directory, subdirs, files in os.walk(root, onerror=note_unlistable):
+        for directory, subdirs, files in os.walk(tree.root, onerror=note_unlistable):
             subdirs.sort()
             for name in sorted(files):
-                if name.endswith(TRANSCRIPT_SUFFIXES):
+                if name.endswith(tree.suffixes):
                     yield Path(directory) / name
 
 
-def _sweep_file(path: Path, needles: Sequence[Needle], cutoff_ns: int) -> FileRedaction | _Verdict:
+def _format_of(name: str) -> tuple[Markup, Codec]:
+    for suffix, markup, codec in _FORMATS:
+        if name.endswith(suffix):
+            return markup, codec
+    return Markup.JSON, Codec.PLAIN
+
+
+def _sweep_file(path: Path, needles: NeedlesByMarkup, cutoff_ns: int) -> FileRedaction | _Verdict:
     try:
         st = os.lstat(path)
     except OSError:
@@ -190,11 +237,12 @@ def _sweep_file(path: Path, needles: Sequence[Needle], cutoff_ns: int) -> FileRe
         return _Verdict.NOT_A_FILE
     if st.st_mtime_ns > cutoff_ns:
         return _Verdict.DEFERRED
+    markup, codec = _format_of(path.name)
     try:
-        redaction = redact_in_place(path, needles)
+        redaction = redact_in_place(path, needles[markup], codec=codec)
     except FileChangedDuringRedaction:
         return _Verdict.DEFERRED
-    except OSError:
+    except (CorruptCompressedFile, OSError):
         return _Verdict.UNREADABLE
     finally:
         _drop_page_cache(path)
@@ -242,7 +290,7 @@ def _escalation_arguments(result: SweepResult, now: datetime.datetime) -> dict[s
         'summary': summary,
         'detail': '\n'.join(_bounded(lines)),
         'suggested_action': (
-            'These live credentials were on disk in agent transcripts: consider rotating them. '
+            'These live credentials were on disk in agent transcripts or verify logs: consider rotating them. '
             'A refused line still holds its value and needs redacting by hand.'
         ),
         'evidence': [{'observation': summary, 'measured_at': now.isoformat(), 'ref': AGENT_ROLE}],
@@ -262,7 +310,10 @@ def _post_escalate_info(url: str | None, arguments: dict[str, object]) -> object
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='Redact live secret values from every agent transcript already on disk.',
+        description=(
+            'Redact live secret values from agent transcripts, verify logs and offline-lane logs '
+            'already on disk.'
+        ),
         epilog='Exit 0: the sweep ran. Exit 2: it could not run, or its escalation was not filed.',
     )
     orchestrator_projects.add_arguments(parser)
@@ -293,7 +344,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f'transcript_secret_sweep.py: {problem}', file=sys.stderr)
     claude_projects = args.claude_projects_dir or Path.home() / '.claude' / 'projects'
     config = SweepConfig(
-        roots=transcript_roots([target.root for target in targets], claude_projects),
+        trees=swept_trees([target.root for target in targets], claude_projects),
         now=datetime.datetime.now(datetime.UTC),
         min_age_secs=args.min_age_secs,
     )

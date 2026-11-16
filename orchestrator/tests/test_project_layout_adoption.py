@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 from _escalation_server_capture import create_server_kwargs
+from _markup_sink_rig import LossRecorder
 from _orch_helpers import _init_harness_state_for_test
 from _sandbox_soak_fixtures import (
     build_events_db,
@@ -28,6 +29,7 @@ from escalation.queue import EscalationQueue
 from pydantic import ValidationError
 from shared import project_layout
 from shared.cli_invoke import AgentResult
+from shared.mcp_markup_middleware import MARKUP_STORM_ERROR_TYPE
 from shared.project_id import project_id_for_root
 from shared.project_layout import (
     ESCALATION_QUEUE_RELPATH,
@@ -267,15 +269,17 @@ class TestOperatorToolsFollowTheLayout:
             storm_consequence='every later leaked call is written through.',
             attribution_source='read the test journal',
         )
+        losses = LossRecorder()
         sink = markup_sink.make_escalation_sink(
             worktree=tmp_path / 'proj' / '.worktrees' / '6714',
             spec=spec,
             subject_task_id=lambda: '6714',
             resolve_root=lambda _wt: tmp_path,
+            loss_sink=losses,
         )
 
         filed = await sink({
-            'error_type': markup_sink.MARKUP_STORM_ERROR_TYPE,
+            'error_type': MARKUP_STORM_ERROR_TYPE,
             'count': 7,
             'threshold': 5,
             'window_seconds': 3600,
@@ -287,6 +291,7 @@ class TestOperatorToolsFollowTheLayout:
         assert [e.id for e in EscalationQueue(escalation_queue_dir(tmp_path)).get_pending()] == [
             filed,
         ]
+        assert losses.records == []
 
 
 def test_the_census_ignore_audit_reads_the_layout_task_store(tmp_path):

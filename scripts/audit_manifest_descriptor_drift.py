@@ -6,8 +6,9 @@ sidecar does not declare (task -> sidecar).
 
 READ-ONLY / REPORT-ONLY, in both directions: this module and its CLI never
 mutate a task record or a manifest file. Its one database connection, to the
-task store, goes through ``_task_db_scan.py::connect_ro``, a read-only SQLite
-URI (``mode=ro``), so the sweep is structurally incapable of writing to the live
+task store, goes through
+``shared/src/shared/tasks_db_readonly.py::connect_ro``, a read-only SQLite URI
+(``mode=ro``), so the sweep is structurally incapable of writing to the live
 WAL database the running orchestrator holds open. Manifest YAML on disk is only
 ever read. There is no ``--apply`` flag and no MCP client is ever constructed.
 RESYNCING A DRIFTED SIDECAR, OR FIXING AN UNBOUND LABEL, IS A SEPARATE,
@@ -109,13 +110,13 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
-    connect_ro,
     decode_metadata,
     format_coverage_block,
     format_kv_line,
     run_audit_cli,
     tasks_db_path,
 )
+from shared.tasks_db_readonly import connect_ro
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
 # path, never a hardcoded absolute. An editable install puts the MAIN
@@ -125,6 +126,9 @@ from _task_db_scan import (
 # worktree (that is what --manifest-root is for). Same reasoning and same form
 # as audit_combine_gate_marker_loss.py (tasks 2881/2882/3329). The shared.*
 # imports below MUST stay after this insert.
+# The shared.tasks_db_readonly import ABOVE is sound without it: importing
+# _task_db_scan already ran `import _checkout`, which bound this checkout's
+# shared/src.
 _SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
@@ -346,9 +350,9 @@ def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
     no tag, so an unpinned query would let an unrelated same-id row from another
     tag masquerade as the producer.
 
-    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
-    refusals). Closed in a ``try/finally`` and never a ``with`` block — a
-    sqlite3 ``with`` is a TRANSACTION, not a close.
+    Opens through ``shared/src/shared/tasks_db_readonly.py::connect_ro``
+    (read-only; see there for refusals). Closed in a ``try/finally`` and never
+    a ``with`` block — a sqlite3 ``with`` is a TRANSACTION, not a close.
     """
     row_ids: set[int] = set()
     delivered_checks: dict[int, dict[str, dict]] = {}
@@ -871,7 +875,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
     # told that instead of reading a zero as "none found".
     try:
         audited_project_id: str | None = resolve_project_id_for_root(root)
-    except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
+    except Exception as exc:  # recorded, never swallowed
         audited_project_id = None
         uncomparable_details.append(
             f"{root}: could not resolve this project's own project_id "
@@ -882,7 +886,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
     for relpath in relpaths:
         try:
             doc = load_capability_manifest(Path(manifests_root) / relpath)
-        except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
+        except Exception as exc:  # recorded, never swallowed
             # NAMED, not merely counted: a sweep that could not read half the
             # corpus must never read as complete (no-silent-fail-soft).
             parse_failure_details.append(f"{relpath}: {exc}")
@@ -965,7 +969,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
 
                 try:
                     expected = _expected_meta(capability.name, check)
-                except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
+                except Exception as exc:  # recorded, never swallowed
                     # SYMMETRIC with the task-record guard below, and for the
                     # same reason: an unconvertible descriptor is a coverage
                     # row, never a finding and never an abort. See
@@ -980,7 +984,7 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
 
                 try:
                     actual = DeliveredCheckMeta(**entry).model_dump()
-                except Exception as exc:  # noqa: BLE001 — recorded, never swallowed
+                except Exception as exc:  # recorded, never swallowed
                     # NAMED, never silently dropped. A task-record entry
                     # that will not validate cannot be compared, and is a
                     # different defect from a drifted one — it goes to the

@@ -796,12 +796,15 @@ pairs dropped.
 ## `memory_eval_topic_registry.json`
 
 The probed-topic registry for the **E1 retrieval-health** eval
-(`docs/prds/memory-eval-program.md` §5 leaf β, task 3208). Read by
-`fused-memory/scripts/memory_eval_retrieval_probe.py` via
-`load_topic_registry()`; its shape is contract-tested in
-`fused-memory/tests/test_memory_eval_retrieval_probe.py`, and its
+(`docs/prds/memory-eval-program.md` §5 leaf β, task 3208). Loaded by
+`fused-memory/src/fused_memory/eval/topic_registry.py::load_topic_registry`,
+which the probe script, the metadata census, `retro_stamp_topics.py` and
+the LME harness all use; its shape is still contract-tested in
+`fused-memory/tests/test_memory_eval_retrieval_probe.py`, its
 `briefing_query` topics are pinned to their source in
-`fused-memory/tests/test_memory_eval_briefing_topics.py`.
+`fused-memory/tests/test_memory_eval_briefing_topics.py`, and its re-keyed
+canonicals to their frozen live records in
+`fused-memory/tests/test_memory_eval_registry_live_canonicals.py`.
 
 ### Purpose
 
@@ -862,10 +865,17 @@ this one result list" — no pointer-shape knowledge at runtime at all.
 - **20 `curator_gate`** — one per adjudicated cluster in
   `write_triage_calibration.jsonl` (17 `esc-55xx`/`56xx` gates). The
   `canonical`-labelled row is the topic canonical; `duplicate`-labelled rows
-  become `members` and `supersedes_pairs`. Because that fixture commits
-  `content` verbatim, **every hash here is computable offline** — no Qdrant,
-  no embedder, no `OPENAI_API_KEY` — so a reviewer can re-derive and audit any
-  entry.
+  become `members` and `supersedes_pairs`. 15 canonicals still derive from
+  that fixture's verbatim `content`. The other 5 (`docs-prd-landing`,
+  `harness-layout-gate-decision-rule`, `pkill-pgrep-self-match`,
+  `reify-debug-mcp-tool-addition`, `tracing-interest-cache-poisoning`) were
+  re-keyed by task 6094 to their live `canonical: true` record, whose content
+  is frozen verbatim in `memory_eval_registry_live_canonicals.json` (below).
+  Either way **every hash here is computable offline** — no Qdrant, no
+  embedder, no `OPENAI_API_KEY` — so a reviewer can re-derive and audit any
+  entry. `provenance.cluster_id` still names the calibration cluster, the join
+  key E2 and `retro_stamp_topics.py` read, even where
+  `canonical.last_known_id` has moved on.
 - **4 `topic_guard_cluster`** — slugs from
   `fused_memory/config/schema.py:_default_topic_guard_clusters()`.
 - **4 `census_topic`** — multi-entry topics from
@@ -892,9 +902,14 @@ which lands in its arm records' metadata. Its committed fetch cache
 (`e2_fetch_cache.json`) therefore pins this file through the per-shape corpus
 fingerprint, not through the file's bytes; the merge lane asserts that in
 `fused-memory/tests/test_bake_off_fetch_cache.py::TestMeasurementAnchor::test_the_committed_fixtures_still_materialize_the_cached_corpus`.
-An E1-only edit or a canonical re-key needs no E2 re-pin. An edit that moves a
-fingerprint, such as renaming a `curator_gate` topic, needs a live
-`--dump-fetches` re-seed.
+An E1-only edit or a canonical re-key needs no fetch-cache re-pin. An edit
+that moves a fingerprint, such as renaming a `curator_gate` topic, needs a
+live `--dump-fetches` re-seed. Any content edit to this file, an E1-only one
+included, still moves its git-blob stamp in the read-transform selection
+report (`fused-memory/scripts/read_transform_selection.py::main` stamps it),
+so the report must be regenerated: see step 5 of "Re-keying a topic" below,
+and the coupling rule in the module docstring of
+`fused-memory/tests/test_read_transform_selection_regeneration.py`.
 
 ### What the registry does **not** cover (`_disclosures`)
 
@@ -938,7 +953,10 @@ anywhere in this repo. The `briefing_query` canonicals were hand-adjudicated
 on 2026-09-30 by read-only searches under each topic's own `search_scope`,
 chosen as the entry that SHOULD answer the query rather than whatever ranked
 first. Both sets of hashes are therefore re-derivable only against a live
-store; the curator-gate 20 are not.
+store; the curator-gate 20 are not. The one exception is the
+`topic_guard_cluster` topic `pytest-xdist-serial-override`: task 6094
+likewise re-keyed its canonical and froze the content in
+`memory_eval_registry_live_canonicals.json`.
 
 ### Exclusions
 
@@ -952,11 +970,53 @@ store; the curator-gate 20 are not.
   adjudicated them as separate claims that only *read* as contradictory;
   folding them in would poison the contamination metric with entries that
   legitimately answer a different question.
-- **Four curator canonicals no longer resolve by UUID**
-  (`0e954870…`, `168c3a6b…`, `417d86d0…`, `c8ca5f55…`) — they have rotated
-  since the calibration session. They are kept deliberately: their
-  content hashes are still valid, so they exercise the hash-primary /
-  id-fallback matcher on real decay rather than on a synthetic case.
+- **Two rotated curator canonicals have nothing live to re-key to:**
+  `harness-layout-gate-move-gotchas` (`417d86d0…`) and
+  `reify-debug-mcp-gotchas` (`c8ca5f55…`). Measured 2026-10-26: neither
+  registry hash nor id occurs anywhere in `fused_reify`, and neither topic
+  carries a `canonical: true` record. They stay on the census split's
+  absent-with-records worklist until a canonical is stamped, then get
+  re-keyed by the procedure below. The other two rotated canonicals
+  (`0e954870…`, `168c3a6b…`) were re-keyed by task 6094.
+
+### `memory_eval_registry_live_canonicals.json`
+
+The verbatim live record each re-keyed topic's canonical keys derive from:
+`{"records": [...]}`, one per topic, sorted by `topic`, each carrying
+`topic`, `project_id`, `collection`, `id`, `mem0_hash`, `content` and its own
+`read_at`. Each was read by a read-only Qdrant `points/scroll` filtered on
+`topic = T AND canonical = true` (no embedder, no writes). `mem0_hash` is
+mem0's own md5 of `content`, so a hand-edited copy fails
+`fused-memory/tests/test_memory_eval_registry_live_canonicals.py`. That
+module also asserts, through the probe's `canonical_hit`, that each entry
+finds its record by `content_hash`, falls back to its `id`, and anchors
+`content_prefix` on its opening, and that every `supersedes_pairs` successor
+is its entry's canonical. In the other direction, it asserts that every
+`curator_gate` canonical hash is the `content_key` of its calibration row or
+of its record here. A re-key that skips step 3 below therefore fails.
+
+Re-keying a topic:
+
+1. Read its live `canonical: true` record read-only, as above. Exactly one
+   must exist; with none or several there is nothing to adjudicate yet.
+2. Adjudicate it against the topic's phrasings, held-out included.
+3. Replace or add its record here, serialised with `indent=2,
+   sort_keys=True, ensure_ascii=False`.
+4. From it, set the entry's `canonical.content_hash`
+   (`fused-memory/scripts/memory_eval_retrieval_probe.py::content_key`),
+   `content_prefix` (whitespace-normalised content, first 160 characters) and
+   `last_known_id`, and re-point every `supersedes_pairs[].successor_hash` at
+   the new hash. Never change `provenance.cluster_id`.
+5. No E2 fetch-cache re-pin is needed: the cache anchors on the corpus
+   fingerprint (see "Also read by E2" above). If that anchor test fails
+   anyway, the edit moved a `topic`, and the cache needs a live
+   `--dump-fetches`. The registry is also a stamped fixture of the
+   read-transform selection report, so AFTER the registry edit is committed,
+   regenerate `plans/read-transform-selection-report.{json,md}` with
+   `uv run --project fused-memory python fused-memory/scripts/read_transform_selection.py`
+   and commit both files in the same change. Never hand-edit a blob;
+   `fused-memory/tests/test_read_transform_selection_regeneration.py::TestEveryCommittedFixtureBlobIsWhatHeadHolds`
+   enforces it.
 
 ---
 

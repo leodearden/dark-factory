@@ -188,6 +188,12 @@ class QuarantineReason(StrEnum):
     RESTATER_FAILED = 'restater_failed'
 
 
+class RulingKind(StrEnum):
+    NOT_A_DEFECT = 'not_a_defect'
+    NOT_COVERED = 'not_covered'
+    CHANGE_REQUEST = 'change_request'
+
+
 class _Record(BaseModel):
     model_config = ConfigDict(frozen=True, extra='forbid')
     __test__ = False  # pytest never collects a model imported into a test module
@@ -663,7 +669,18 @@ class DefectReported(_Record):
     outcome: DefectOutcome
 
 
-InboxLine = Annotated[RevealRequested | DefectReported, Field(discriminator='type')]
+class DefectRuled(_Record):
+    """inbox.jsonl: the portal relaying Leo's ruling on a reported defect as its kind alone; the note to the client stays on the portal."""
+
+    seq: Seq
+    at: UtcTimestamp
+    type: Literal['defect_ruled'] = 'defect_ruled'
+    block: PositiveInt
+    report: PositiveInt
+    kind: RulingKind
+
+
+InboxLine = Annotated[RevealRequested | DefectReported | DefectRuled, Field(discriminator='type')]
 _INBOX_LINE_ADAPTER: Final = TypeAdapter(InboxLine)
 
 

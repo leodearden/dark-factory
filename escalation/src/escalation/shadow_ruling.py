@@ -44,7 +44,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 
-from escalation.authority import L2_AUTO_CLOSE_DENY_CATEGORIES, L2_AUTO_CLOSE_DENY_ROLES
+from escalation.authority import (
+    L2_AUTO_CLOSE_DENY_CATEGORIES,
+    L2_AUTO_CLOSE_DENY_ROLES,
+    POLICY_TABLE,
+    REVERSIBILITY_WAIVED_ACTIONS,
+    REVERSIBLE_POLICY_ACTIONS,
+)
 from escalation.classify import classify_resolver_tier
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
@@ -57,31 +63,28 @@ logger = logging.getLogger(__name__)
 #: for a stamp.
 SHADOW_RULING_MARKER = 'x_shadow_ruling:'
 
-#: The first-tranche candidate classes, SHADOWED AND NOT ADOPTED. Each names a
-#: recurring L2 shape the standing-policy skeleton proposes could be ruled by
-#: the adjudicating session. Enumerated with their prose gloss in
-#: ``docs/escalation-standing-policy.md``; that document and this frozenset are
-#: held equal by ``tests/scripts/test_shadow_ruling_doc_contract.py``.
-FIRST_TRANCHE_CLASSES: frozenset[str] = frozenset({
-    'risk_identified_branch_behind_main',
-    'risk_identified_recovery_veto_streak',
-    'design_concern_semantic_collision',
-    'infra_issue_transient_self_cleared',
-})
+#: The candidate classes a shadow stamp may name: exactly the slugs of
+#: ``escalation/src/escalation/authority.py::POLICY_TABLE``, the only
+#: enumeration of policy classes (``plans/decision-stream-prd.md`` §5.1).
+#: ``docs/escalation-standing-policy.md`` glosses each one and is held equal to
+#: this set by ``tests/scripts/test_shadow_ruling_doc_contract.py``.
+FIRST_TRANCHE_CLASSES: frozenset[str] = frozenset(row.policy_class for row in POLICY_TABLE)
 
-#: The reversible actions the ratified skeleton permits. A SUPERSET of the C1
-#: ``resolution_action`` vocabulary: ``close_only`` and ``resume`` are C1 values
-#: a resolved record records, while ``add_dependency``, ``update_task_amendment``
-#: and ``file_task`` are task-side operations that leave ``resolution_action``
-#: unset — which is why the weekly count needs a third ``not_comparable``
-#: outcome rather than folding them into agreement or divergence.
-REVERSIBLE_ACTIONS: frozenset[str] = frozenset({
-    'close_only',
-    'resume',
-    'add_dependency',
-    'update_task_amendment',
-    'file_task',
-})
+#: The actions a stamp may propose, DERIVED from
+#: ``escalation/src/escalation/authority.py``'s ``REVERSIBLE_POLICY_ACTIONS`` and
+#: ``REVERSIBILITY_WAIVED_ACTIONS``, so the codec and ``PolicyRow.reversible``
+#: read one list. A SUPERSET of the C1 ``resolution_action`` vocabulary:
+#: ``close_only`` and ``resume`` are C1 values a resolved record records, while
+#: ``add_dependency``, ``update_task_amendment`` and ``file_task`` are task-side
+#: operations that leave ``resolution_action`` unset — which is why the weekly
+#: count needs a third ``not_comparable`` outcome rather than folding them into
+#: agreement or divergence.
+#:
+#: ``done_flip`` is the waived member, scored as the ``close_only`` it ends in
+#: (:data:`_TRAILING_RESOLUTION_ACTION`).
+REVERSIBLE_ACTIONS: frozenset[str] = frozenset(
+    action.value for action in REVERSIBLE_POLICY_ACTIONS | REVERSIBILITY_WAIVED_ACTIONS
+)
 
 #: The seven classes of decision that stay with the human FOREVER, whatever any
 #: shadow measurement shows. Only the first two have a record-level signal; see
@@ -107,10 +110,10 @@ DETECTABLE_GATES: frozenset[str] = frozenset({'milestone_gate', 'deterministic_r
 #: QUESTIONS, and ``design_concern`` is the single cell where the two answers
 #: diverge:
 #:
-#: * authority.py asks *may the AUTO-WATCHER IDENTITY auto-close this at L2?* —
-#:   a table its own docstring scopes to the identified callers in
-#:   ``ROLE_LEVEL_ALLOWLIST``, whose sole member is the auto-watcher. Nothing
-#:   here changes that answer: the auto-watcher still may not auto-close a
+#: * authority.py asks *may an identified AUTOMATED caller auto-close this at
+#:   L2?* — the auto-watcher through its close_only carve-out, the executor
+#:   through its deny list, which includes every one of these categories.
+#:   Nothing here changes that answer: neither may auto-close a
 #:   ``design_concern``.
 #: * this detector asks *does the ratified skeleton keep this record with the
 #:   human FOREVER, whatever the measurement shows?* The skeleton's gate list is
@@ -167,6 +170,12 @@ _MILESTONE_CATEGORIES: frozenset[str] = frozenset({
 #: convention ``escalation/src/escalation/authority.py`` already uses for the
 #: watcher identity string and ``action_effects.py`` for its target statuses.
 COMPARABLE_ACTIONS: frozenset[str] = frozenset({'close_only', 'resume'})
+
+#: The C1 ``resolution_action`` a proposal is scored against when it is not
+#: itself a C1 value but ends in one. A ``done_flip`` marks the task done and
+#: then closes the record ``close_only`` (``plans/decision-stream-prd.md`` §3
+#: decision 7), so a human ``close_only`` is agreement with it.
+_TRAILING_RESOLUTION_ACTION: Mapping[str, str] = MappingProxyType({'done_flip': 'close_only'})
 
 #: Each wire key of the JSON payload against the :class:`ShadowRuling` attribute
 #: it carries — the ONE place that vocabulary is written. The encoder renders
@@ -658,10 +667,12 @@ def agreement_report(
         # proposal that becomes a silent ``diverged`` for every such record —
         # depressing the single number adoption is read off, in the direction
         # that looks like disagreement rather than like missing data.
-        if (ruling.proposed_action not in COMPARABLE_ACTIONS
-                or record.resolution_action is None):
+        compared = _TRAILING_RESOLUTION_ACTION.get(
+            ruling.proposed_action, ruling.proposed_action,
+        )
+        if compared not in COMPARABLE_ACTIONS or record.resolution_action is None:
             not_comparable[ruling.ruling_class] += 1
-        elif record.resolution_action == ruling.proposed_action:
+        elif record.resolution_action == compared:
             agreed[ruling.ruling_class] += 1
         else:
             diverged[ruling.ruling_class] += 1

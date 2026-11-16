@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     destructure_bindings,
     extract_function_body,
     strip_js_comments,
@@ -214,11 +214,11 @@ class TestRowsComeFromTheSnapshotByView:
         gate = re.search(
             rf'\bconst\s+(\w+)\s*=\s*{listed}\.placeholder\s*&&\s*{filtered}\.length\s*===\s*0\s*;', tasks_tab_code,
         )
-        body = gate and re.search(rf'\{{\s*!\s*{gate.group(1)}\s*&&\s*\(', tasks_tab_code)
+        body = gate and re.search(rf'!\s*{gate.group(1)}\s*&&\s*\(', tasks_tab_code)
         drawn = body and walk_balanced(tasks_tab_code, body.end() - 1, '(', ')')
-        assert drawn and '<TaskGraph' in drawn and '<ProjectPrdGroups' in drawn, (
+        assert drawn and '<TaskGraph' in drawn, (
             f'TasksTab does not bind `const X = {listed}.placeholder && {filtered}.length === 0;` '
-            'and gate both graph bodies behind `{!X && (...)}`'
+            'and gate the graph body behind `!X && (...)`'
         )
 
 

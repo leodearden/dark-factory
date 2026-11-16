@@ -1,0 +1,24 @@
+{
+  "task_id": "3918",
+  "reason": "task 3918: split unmeasured-delivery diagnosis around the already-landed carve-out; recut-superseded sibling refs excluded",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/unmeasured_delivery.py",
+      "baseline": 40,
+      "current": 46
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/unmeasured_delivery.py::_sibling_refs",
+      "baseline": 2,
+      "current": 6
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5282,
+      "current": 5288
+    }
+  ]
+}

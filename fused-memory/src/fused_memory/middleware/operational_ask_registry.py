@@ -184,8 +184,8 @@ _CODE_CHANGE_TITLE_SIGNALS: tuple[str, ...] = ("fix", "bug", "crash", "implement
 # boundary operational_routing_guard.inject_operational_routing (task β)
 # coerces every tagged operational/decision ask to a deterministic PURE-GATE
 # on the submit path, so re-routing here would be a second coercion site
-# (INV-5). Mirrors operational_routing_guard._COERCED_EXECUTION_CLASSES =
-# {'operational', 'decision'} for symmetry; spelled out explicitly (NOT
+# (INV-5). Mirrors the keys of operational_routing_guard._TRIGGER_BY_EXECUTION_CLASS
+# = {'operational', 'decision'} for symmetry; spelled out explicitly (NOT
 # derived by subtracting 'code_tdd' from recon_self_model.EXECUTION_CLASSES)
 # so a future code-oriented execution class added there is not silently swept
 # into the skip set. 'code_tdd' is intentionally excluded — a code_tdd-tagged

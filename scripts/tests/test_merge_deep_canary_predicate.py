@@ -23,6 +23,9 @@ from canary_predicate_summary import (
 )
 from cli_subprocess_timeout import cli_timeout_from_env
 from orchestrator.event_store import EventStore, EventType
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PREDICATE = Path(__file__).resolve().parents[1] / 'merge-deep-canary-predicate.sh'
 _PREDICATE_TIMEOUT = cli_timeout_from_env('MERGE_DEEP_CANARY_PREDICATE_CLI_TIMEOUT_SECS')

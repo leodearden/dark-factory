@@ -1,0 +1,48 @@
+{
+  "task_id": "8524",
+  "reason": "esc-8524-2 review fix: a released held permit is treated as absent (claim + RemergeClaim guard), a hostless dispatch after a re-merge parks the replacement instead of the superseded original, plus regression tests",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/remerge_base.py",
+      "baseline": 33,
+      "current": 37
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/remerge_base.py::RemergeClaim::__post_init__",
+      "baseline": 1,
+      "current": 3
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/remerge_base.py::claim_remerge_base",
+      "baseline": 3,
+      "current": 5
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1952,
+      "current": 1953
+    },
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_merge_queue_chain_intact.py",
+      "baseline": 82,
+      "current": 85
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5125,
+      "current": 5130
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6466,
+      "current": 6469
+    }
+  ]
+}

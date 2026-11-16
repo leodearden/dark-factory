@@ -38,6 +38,7 @@ def _plan(task_id: str) -> dict:
         'prerequisites': [],
         'steps': [{'id': 'step-1', 'type': 'impl', 'description': 'x',
                    'status': 'pending', 'commit': None}],
+        '_finalized_at': '2026-10-18T00:00:00+00:00',
     }
 
 
@@ -76,7 +77,7 @@ def _wiping_replan(wf: TaskWorkflow) -> AsyncMock:
     """A replan whose create_plan() rewrote plan.json from scratch."""
     async def _side_effect(_reviews) -> None:
         assert wf.artifacts is not None
-        wf.artifacts.write_plan({**_plan(wf.task_id), '_finalized_at': '2026-10-18T00:00:00+00:00'})
+        wf.artifacts.write_plan(_plan(wf.task_id))
 
     return AsyncMock(side_effect=_side_effect)
 

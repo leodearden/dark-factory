@@ -25,6 +25,9 @@ from pathlib import Path
 
 import pytest
 import run_fable_trial_v2_campaign as mod
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PRE_SIGMA = (mod.MARKER_KEY,)
 """``drop_metrics`` argument for a cell that PREDATES eval-revival σ (task 3628).
@@ -377,7 +380,7 @@ def test_summary_rows_match_the_report_layer_field_for_field():
     Re-deriving any of them in this driver would create exactly that second
     surface. This test pins the equality field for field.
     """
-    from orchestrator.evals.report import build_plan_quality_report
+    from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
     results = _mixed_results()
     rows = mod.summarize_candidates(results)
@@ -1350,14 +1353,14 @@ def test_uniform_corpora_are_unchanged():
 # recipe re-runs cap-tainted fixtures, so a post-σ re-run writes keyed cells
 # beside older keyless ones. Two operator-facing surfaces, built inside one
 # function from one input, contradicting each other about one quantity is exactly
-# what ``report.py``:334-340 and ``metrics.py`` assert three times over must not
-# happen — "two consumers of one field must not answer the same question
-# differently".
+# what ``cell_admission.py::judged_without_reference`` and ``metrics.py`` assert
+# three times over must not happen — "two consumers of one field must not answer
+# the same question differently".
 
 
 def _report_entries(results):
     """The report layer's per-config accumulator, keyed by ``config_name``."""
-    from orchestrator.evals.report import build_plan_quality_report
+    from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
     return {c['config_name']: c for c in build_plan_quality_report(results)['configs']}
 

@@ -85,7 +85,7 @@ def _stored(memory_id: str, **metadata: Any) -> dict:
 
 
 def _enumerate(store: _Store, projects=('dark_factory', 'reify')):
-    import asyncio  # noqa: PLC0415
+    import asyncio
 
     return asyncio.run(_mod().enumerate_population(
         store, projects=projects, since=SINCE, frozen_at=FROZEN_AT,
@@ -274,7 +274,7 @@ def _searching_store(
 
 
 def _freeze(store: _Store, writes: list[dict]) -> dict:
-    import asyncio  # noqa: PLC0415
+    import asyncio
 
     return asyncio.run(_mod().freeze_population(
         store, writes, k=K, t_high=T_HIGH, t_low=T_LOW,
@@ -519,7 +519,7 @@ class TestSnapshotFiles:
 
 class TestFreezeSnapshot:
     def test_the_top_level_records_what_was_frozen_and_how(self) -> None:
-        import asyncio  # noqa: PLC0415
+        import asyncio
 
         store = _searching_store(
             {'content of m': [_row('x', 0.7)]},

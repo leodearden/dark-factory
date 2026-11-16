@@ -119,10 +119,11 @@ def _stale_lease_then_success(gate):
     return invoke_fn, calls
 
 
-async def test_success_after_unattributed_resume_fallback_is_confirmed_and_uncapped():
+async def test_unattributed_resumed_attempt_is_returned_with_its_own_verdict():
     gate = make_gate(['a', 'b'])
     cost_store = make_mock_cost_store()
     invoke_fn, calls = _stale_lease_then_success(gate)
+    rebuild_prompt = AsyncMock(return_value='rebuilt')
     try:
         result = await invoke_with_cap_retry(
             gate,
@@ -131,35 +132,14 @@ async def test_success_after_unattributed_resume_fallback_is_confirmed_and_uncap
             cost_store=cost_store,
             prompt='real task',
             resume_session_id='sess-crashed',
+            rebuild_prompt=rebuild_prompt,
         )
-        assert (result.success, result.resume_fallbacks, result.account_name) == (True, 1, 'b')
-        assert calls[0]['resume_session_id'] == 'sess-crashed'
-        assert 'resume_session_id' not in calls[1]
-
-        assert gate.cumulative_cost == pytest.approx(1.23)
-        cost_store.save_invocation.assert_awaited_once()
-        row = cost_store.save_invocation.await_args.kwargs
-        assert (row['capped'], row['capped_reason'], row['account_name']) == (False, None, 'b')
-    finally:
-        await gate.shutdown()
-
-
-async def test_declined_retry_after_unattributed_attempt_keeps_that_attempts_verdict():
-    gate = make_gate(['a', 'b'])
-    cost_store = make_mock_cost_store()
-    invoke_fn, calls = _stale_lease_then_success(gate)
-    try:
-        result = await invoke_with_cap_retry(
-            gate,
-            'lbl',
-            invoke_fn=invoke_fn,
-            cost_store=cost_store,
-            prompt='real task',
-            resume_session_id='sess-crashed',
-            rebuild_prompt=AsyncMock(return_value=None),
-        )
-        assert result.retry_aborted is True
         assert len(calls) == 1
+        assert calls[0]['resume_session_id'] == 'sess-crashed'
+        assert (result.success, result.resume_fallbacks, result.retry_aborted) == (False, 0, False)
+        rebuild_prompt.assert_not_awaited()
+
+        assert gate.cumulative_cost == 0
         cost_store.save_invocation.assert_awaited_once()
         row = cost_store.save_invocation.await_args.kwargs
         assert (row['capped'], row['capped_reason']) == (True, 'account')

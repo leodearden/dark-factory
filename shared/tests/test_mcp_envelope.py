@@ -4,6 +4,9 @@ TDD pair 1: happy-path (GREEN on impl step-2).
 TDD pair 2: the 5 non-raising abnormal shapes (GREEN on impl step-4).
 TDD pair 3: RAISED catch-all + invariant (GREEN on impl step-6).
 TDD pair 4: resolver_failed truth table (GREEN on impl step-8).
+TestToolErrorText / TestToolTextBlocks / TestParseToolResultTextBlockLocation:
+the quiet envelope readers and parse_tool_result share one text-block locator
+(task 6216).
 """
 from __future__ import annotations
 
@@ -18,6 +21,8 @@ from shared.mcp_envelope import (
     EnvelopeShape,
     parse_tool_result,
     resolver_failed,
+    tool_error_text,
+    tool_text_blocks,
     write_failure_reason,
 )
 
@@ -116,6 +121,8 @@ class TestHappyPath:
 # Pair 2 — 5 non-raising abnormal shapes (step-3 RED / step-4 GREEN)
 # ---------------------------------------------------------------------------
 
+_JSON_DECODE_ENV = {"result": {"content": [{"type": "text", "text": "{not json"}]}}
+
 # Each tuple: (shape_member, result_input, key, expected_type)
 _ABNORMAL_CASES = [
     # NO_TEXT_BLOCK — result is not a dict
@@ -133,8 +140,14 @@ _ABNORMAL_CASES = [
     (EnvelopeShape.NO_TEXT_BLOCK, {}, "k", dict),
     # NO_TEXT_BLOCK — result["result"] is a non-dict (e.g. string); second .get would raise
     (EnvelopeShape.NO_TEXT_BLOCK, {"result": "oops"}, "k", dict),
-    # JSON_DECODE_ERROR — text block present but invalid JSON (placeholder; replaced below)
-    (EnvelopeShape.JSON_DECODE_ERROR, None, "k", dict),
+    # NO_TEXT_BLOCK — result["result"] has no content key
+    (EnvelopeShape.NO_TEXT_BLOCK, {"result": {}}, "k", dict),
+    # NO_TEXT_BLOCK — content is null
+    (EnvelopeShape.NO_TEXT_BLOCK, {"result": {"content": None}}, "k", dict),
+    # NO_TEXT_BLOCK — content is not a list
+    (EnvelopeShape.NO_TEXT_BLOCK, {"result": {"content": 7}}, "k", dict),
+    # JSON_DECODE_ERROR — text block present but invalid JSON
+    (EnvelopeShape.JSON_DECODE_ERROR, _JSON_DECODE_ENV, "k", dict),
     # INNER_NOT_DICT — parsed JSON is a list (not a dict)
     (EnvelopeShape.INNER_NOT_DICT, _env([1, 2, 3]), "k", dict),
     # INNER_NOT_DICT — parsed JSON is a scalar
@@ -156,10 +169,6 @@ _ABNORMAL_CASES = [
     ),
 ]
 
-# Build the JSON_DECODE_ERROR case properly (None slot was placeholder)
-_JSON_DECODE_ENV = {"result": {"content": [{"type": "text", "text": "{not json"}]}}
-_ABNORMAL_CASES[5] = (EnvelopeShape.JSON_DECODE_ERROR, _JSON_DECODE_ENV, "k", dict)
-
 
 @pytest.mark.parametrize(
     "shape,result_input,key,expected_type",
@@ -170,6 +179,9 @@ _ABNORMAL_CASES[5] = (EnvelopeShape.JSON_DECODE_ERROR, _JSON_DECODE_ENV, "k", di
         "no_text_block_no_text_type",
         "no_text_block_missing_result",
         "no_text_block_result_not_dict",
+        "no_text_block_content_missing",
+        "no_text_block_content_none",
+        "no_text_block_content_not_a_list",
         "json_decode_error",
         "inner_not_dict_list",
         "inner_not_dict_scalar",
@@ -549,6 +561,100 @@ class TestStructuredContentPreference:
         value, err = parse_tool_result(env, "k", str)
         assert err is None
         assert value == "from-text"
+
+
+# ---------------------------------------------------------------------------
+# The quiet envelope readers and the shared text-block locator (task 6216)
+# ---------------------------------------------------------------------------
+
+
+class TestToolErrorText:
+    """A tool reports its own failure in a well-formed body carrying isError;
+    tool_error_text() is the single reader that tells that apart from a result."""
+
+    def test_a_reply_without_is_error_is_not_a_failure(self):
+        assert tool_error_text({'content': [{'type': 'text', 'text': 'ok'}]}) is None
+
+    def test_is_error_false_is_not_a_failure(self):
+        reply = {'isError': False, 'content': [{'type': 'text', 'text': 'ok'}]}
+        assert tool_error_text(reply) is None
+
+    def test_is_error_returns_the_text_block(self):
+        reply = {'isError': True, 'content': [{'type': 'text', 'text': 'Error: boom'}]}
+        assert tool_error_text(reply) == 'Error: boom'
+
+    def test_the_first_text_block_wins_past_non_dict_and_non_text_blocks(self):
+        reply = {
+            'isError': True,
+            'content': [
+                'not a block',
+                {'type': 'image', 'data': '...'},
+                {'type': 'text', 'text': 'first'},
+                {'type': 'text', 'text': 'second'},
+            ],
+        }
+        assert tool_error_text(reply) == 'first'
+
+    @pytest.mark.parametrize(
+        'reply',
+        [
+            {'isError': True, 'content': [{'type': 'image', 'data': '...'}]},
+            {'isError': True},
+            {'isError': True, 'content': None},
+            {'isError': True, 'content': 7},
+        ],
+        ids=['no-text-block', 'content-missing', 'content-none', 'content-not-a-list'],
+    )
+    def test_a_silent_failure_is_empty_text_not_none(self, reply):
+        assert tool_error_text(reply) == ''
+
+    def test_a_non_str_text_value_is_coerced(self):
+        reply = {'isError': True, 'content': [{'type': 'text', 'text': 42}]}
+        assert tool_error_text(reply) == '42'
+
+
+class TestToolTextBlocks:
+    """tool_text_blocks() is the one reader of an envelope's text content, so
+    the success path and tool_error_text() cannot disagree on its shape."""
+
+    def test_every_text_block_in_order_past_non_dict_and_non_text_blocks(self):
+        reply = {
+            'content': [
+                {'type': 'text', 'text': 'first'},
+                'not a block',
+                {'type': 'image', 'data': '...'},
+                {'type': 'text', 'text': 'second'},
+            ],
+        }
+        assert tool_text_blocks(reply) == ('first', 'second')
+
+    @pytest.mark.parametrize(
+        'reply',
+        [{}, {'content': None}, {'content': []}, {'content': 7}],
+        ids=['content-missing', 'content-none', 'content-empty', 'content-not-a-list'],
+    )
+    def test_an_envelope_without_a_content_list_has_no_text(self, reply):
+        assert tool_text_blocks(reply) == ()
+
+    def test_a_non_str_text_value_is_coerced(self):
+        assert tool_text_blocks({'content': [{'type': 'text', 'text': 42}]}) == ('42',)
+
+
+class TestParseToolResultTextBlockLocation:
+    """parse_tool_result finds text blocks by the same rule as tool_text_blocks."""
+
+    def test_the_first_text_block_wins_past_non_dict_and_non_text_blocks(self):
+        env = {
+            "result": {
+                "content": [
+                    "not a block",
+                    {"type": "image", "data": "..."},
+                    {"type": "text", "text": '{"k": 1}'},
+                    {"type": "text", "text": '{"k": 2}'},
+                ]
+            }
+        }
+        assert parse_tool_result(env, "k", int) == (1, None)
 
 
 # ---------------------------------------------------------------------------

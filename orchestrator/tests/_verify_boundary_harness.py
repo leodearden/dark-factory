@@ -516,7 +516,7 @@ def describe_proc_exit(proc: subprocess.Popen, label: str) -> str:
     if rc is not None and proc.stderr is not None:
         try:
             tail = stderr_tail(drain_exited_stderr(proc))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             tail = f'<unreadable: {e!r}>'
         description += f'; stderr tail:\n{tail}'
     return description

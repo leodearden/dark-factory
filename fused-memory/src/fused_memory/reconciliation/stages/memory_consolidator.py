@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
+import functools
 import json
 import logging
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
-    ContextItem,
     ReconciliationEvent,
     StageReport,
     Watermark,
@@ -27,7 +26,6 @@ from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     extract_open_gate_task_ids,
     sweep_resolved_curator_gates,
 )
-from fused_memory.reconciliation.dangling_citation import render_dangling_citation_line
 from fused_memory.reconciliation.degenerate_task_node_sweep import (
     extract_terminal_task_ids,
     sweep_degenerate_task_nodes,
@@ -36,24 +34,8 @@ from fused_memory.reconciliation.episode_window import (
     UNFINISHED_WRITE_START_STAT,
     unfinished_write_start_stat,
 )
-from fused_memory.reconciliation.flag_dedup import (
-    EntityStandingSuppressionResult,
-    acknowledge_resolved_flags,
-    compute_marker_signature,
-    dedup_flags,
-    filter_accounted_cluster_growth_flags,
-    filter_already_recorded_caveat_flags,
-    filter_already_tracked_systemic_patterns,
-    filter_entity_standing_decisions,
-    filter_false_absence_flags,
-    filter_stale_bulk_get_statuses_flags,
-    filter_stale_count_snapshot_corrections,
-    filter_style_only_authorship_flags,
-    filter_terminal_metadata_flags,
-)
+from fused_memory.reconciliation.flag_dedup import EntityStandingSuppressionResult
 from fused_memory.reconciliation.gate_owned_finding_phrasing import (
-    extract_human_gated_task_ids,
-    normalize_gate_owned_suggested_actions,
     stamp_curator_gate_sweep_provenance,
 )
 from fused_memory.reconciliation.live_workflow_citation_guard import check_live_workflow_citations
@@ -67,6 +49,7 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
 )
 from fused_memory.reconciliation.overreach_flags import render_overreach_flags_section
 from fused_memory.reconciliation.preservation_specimen_guard import (
+    PreservationSuppressionResult,
     filter_preservation_specimen_flags,
     maybe_escalate_preservation_suppression_storm,
 )
@@ -74,6 +57,19 @@ from fused_memory.reconciliation.prompts import _STAGE1_PROJECT_ID_GUIDELINE
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.recon_pool_map import (
     STAGE1_CYCLE_SUMMARY_RECON_POOL as _STAGE1_CYCLE_SUMMARY_RECON_POOL,
+)
+from fused_memory.reconciliation.stage1_flag_chain import FlagChainContext, run_stage1_flag_chain
+from fused_memory.reconciliation.stage1_payload_format import (
+    append_note,
+    format_context_fetch_failures,
+    format_context_items,
+    format_episodes,
+    format_events,
+    format_findings,
+    format_memories,
+    format_watermark,
+    parse_instant,
+    to_utc,
 )
 from fused_memory.reconciliation.stage1_stall_detector import (
     compute_stalled_task_ids,
@@ -105,22 +101,17 @@ from fused_memory.reconciliation.standing_decision_storm_escape import (
 from fused_memory.reconciliation.summary_pool import (
     write_cycle_summary,
 )
-from fused_memory.reconciliation.sweep_deletion_guard import (
-    filter_benign_sweep_deletion_flags,
-)
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
     detect_census_inconsistency,
     format_filtered_task_tree,
-    strip_snapshot_lines,
 )
 from fused_memory.reconciliation.tree_read_instant import resolve_tree_read_instant
 from fused_memory.reconciliation.unlanded_path_check import (
     UnlandedPathCheckResult,
     check_unlanded_path_claims,
 )
-from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
-from fused_memory.utils.clip_disclosure import clip_note, elide_text, fetch_cap_note
+from fused_memory.utils.clip_disclosure import clip_note, fetch_cap_note
 
 if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
@@ -136,8 +127,48 @@ logger = logging.getLogger(__name__)
 # enforce_summary_pool_cap call trims the pool to at most this many members by
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
-_RECORD_BODY_CHARS = 2_000  # basis: plans/recon-evidence-caps-measurement-2026-10.md
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
+
+_T = TypeVar('_T')
+
+# (stat key, sweep result key) for each full-cycle sweep, in publication order.
+_StatMap = tuple[tuple[str, str], ...]
+_CURATOR_GATE_SWEEP_STATS: _StatMap = (
+    ('curator_gate_resolution_scanned', 'scanned'),
+    ('curator_gate_resolution_errors', 'errors'),
+)
+_CURATOR_GATE_FLAGS_EMITTED_STAT = 'curator_gate_resolution_flags_emitted'
+_ORPHAN_SWEEP_STATS: _StatMap = (
+    ('orphaned_recon_escalations_scanned', 'scanned'),
+    ('orphaned_recon_escalations_terminal', 'terminal'),
+    ('orphaned_recon_escalations_missing', 'missing'),
+    ('orphaned_recon_escalations_live', 'live'),
+    ('orphaned_recon_escalations_ambiguous', 'ambiguous'),
+    ('orphaned_recon_escalations_unresolvable', 'unresolvable'),
+    ('orphaned_recon_escalations_errors', 'errors'),
+)
+_ORPHAN_FLAGS_EMITTED_STAT = 'orphaned_recon_escalations_flags_emitted'
+_DEGENERATE_SWEEP_STATS: _StatMap = (
+    ('degenerate_task_nodes_swept', 'deleted'),
+    ('degenerate_task_nodes_scanned', 'scanned'),
+)
+_STATUS_SNAPSHOT_SWEEP_STATS: _StatMap = (
+    ('stale_status_snapshot_edges_invalidated', 'invalidated'),
+    ('stale_status_snapshot_edges_scanned', 'scanned'),
+    ('stale_status_snapshot_edges_candidates', 'candidate_edges'),
+    ('stale_status_snapshot_edges_errors', 'errors'),
+    ('stale_blocked_edges_superseded', 'superseded'),
+    ('stale_blocked_edges_supersede_errors', 'supersede_errors'),
+    ('stale_blocked_edges_supersede_skipped', 'supersede_skipped'),
+    (STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY, 'enumeration_complete'),
+    (STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY, 'enumeration_incomplete_kind'),
+)
+_PRIORITY_OVERRIDE_SWEEP_STATS: _StatMap = (
+    ('stale_priority_override_edges_invalidated', 'invalidated'),
+    ('stale_priority_override_edges_scanned', 'scanned'),
+    (PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY, 'enumeration_complete'),
+    (PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY, 'enumeration_incomplete_kind'),
+)
 
 
 async def write_stage1_cycle_summary(
@@ -262,6 +293,7 @@ class MemoryConsolidator(BaseStage):
     # Fetch degraded sources for the current run — reset at the top of assemble_payload
     # and _format_assembled_payload; copied to report.stats['stage1_fetch_degraded'] in run()
     # (task 1812). Empty list = genuine empty corpus; non-empty = fetch failure on that source.
+    # 'event_context' means the ContextAssembler could not fetch some event's context (task 5370).
     # Initialized per-instance in __init__ to avoid the shared-mutable-default hazard.
     _fetch_degraded_sources: list
 
@@ -295,203 +327,126 @@ class MemoryConsolidator(BaseStage):
         prior_reports: list[StageReport],
         run_id: str,
         model: str | None = None,
-        resume_session_id: str | None = None,
     ) -> StageReport:
-        """Execute Stage 1 and post-process items_flagged through the flag deduplicator.
+        """Run Stage 1's agent, then guard, extend and post-process its report.
 
-        Remediation runs (``remediation_findings`` set) skip dedup — the whole
-        point of a remediation pass is to re-emit a curated list, and running
-        dedup on those flags would defeat the remediation contract.
+        Phantom-citation verification already ran inside ``super().run()``, for
+        every stage; repeating it here would double-count each citation stat.
+        The two guards run above the remediation early-return because a
+        remediation pass needs them too. A remediation pass re-emits a curated
+        flag list, so it skips the flag chain and every full-cycle step.
+
+        The flag-emitting steps (curator gate, orphan sweep, unlanded check)
+        run above the flag chain, so their flags earn ``stage1_flag_marker``
+        rows and can fire the chain on a cycle where the agent flagged nothing.
         """
         self._live_workflow_snapshot = None
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
-            resume_session_id=resume_session_id,
         )
+        self._publish_always_present_stats(report)
+        preservation_result = await self._apply_preservation_specimen_guard(report)
+        self._apply_live_workflow_citation_guard(report)
+        if self.remediation_findings is not None:
+            return report
 
-        # Phantom-citation verification (task 2978) used to run here. Task 2979
-        # HOISTED it into BaseStage.run(), which performs it on the shared
-        # items_flagged assembly for all three stages — see the rationale
-        # comment there. The stage1_* citation stats therefore arrive on
-        # report.stats via super().run() above, already present on full AND
-        # remediation passes. Do not re-add a call here: it would double-count
-        # every stage1_* citation stat and double the get_memory_by_id load.
+        await self._escalate_preservation_storm(preservation_result, run_id)
+        await self._append_curator_gate_sweep_flags(report, run_id)
+        await self._run_auto_consolidation(report, run_id)
+        await self._append_orphaned_recon_escalation_flags(report, run_id)
+        await self._append_unlanded_path_flags(report, events)
+        standing_decision_result = await self._run_flag_chain(report, events, run_id)
+        await self._account_suppression_streaks(run_id, standing_decision_result, report)
+        self._detect_census_inconsistency(report, events, run_id)
+        self._surface_harness_health_records(report, run_id)
+        await self._escalate_human_operator_stalls(report, run_id)
+        await self._escalate_stalled_gate_backlog(report, run_id)
+        await self._run_graph_sweeps(report, run_id)
 
-        report.stats['entity_summary_snapshot_lines_stripped'] = (
-            self._entity_summary_snapshot_lines_stripped
+        ledger_written = await write_stage1_cycle_summary(
+            self.memory, self.project_id, report, run_id,
         )
-        report.stats['stage1_fetch_degraded'] = self._fetch_degraded_sources or []
-        report.stats['stage1_assembled_budget'] = (
-            self.assembled_payload.budget_report() if self.assembled_payload is not None else None
-        )
+        report.stats['stage1_cycle_summary_ledger_written'] = 1 if ledger_written else 0
+        return report
 
-        # Always present (task 4574, mirrors stage1_fetch_degraded above): set BEFORE
-        # the remediation early-return so the key is unconditionally present, including
-        # on remediation passes (which never call assemble_payload's freshness filters
-        # and so leave the per-instance counter at its __init__/reset value of 0).
-        report.stats['stage1_undatable_freshness_records'] = self._undatable_freshness_records
-        report.stats[UNFINISHED_WRITE_START_STAT] = unfinished_write_start_stat(
-            self._unfinished_graphiti_write_start
-        )
+    def _publish_always_present_stats(self, report: StageReport) -> None:
+        """Publish, at its default, every stat key a Stage 1 report always carries.
 
-        # Always present (task-2312): set BEFORE the remediation early-return below
-        # so downstream consumers see this key on every run, including remediation
-        # passes (which skip dedup_flags entirely and so never reach the overwrite
-        # below). Overwritten after dedup_flags on a full (non-remediation) run with
-        # items_flagged; stays 0 otherwise.
-        report.stats['stage1_completion_markers_self_deleted'] = 0
+        Stage 1's stats blob is serialized verbatim into Stage 2's prompt
+        (``stages/task_knowledge_sync.py::_format_report``), so each key
+        published here is present on every report, remediation passes
+        included; the full-cycle steps overwrite their own. Other keys stay
+        absent until the step that observes them publishes them, because a
+        default there would claim an observation that never happened;
+        ``_run_graph_sweeps`` states the case. ``stage1_cycle_summary_ledger_written``
+        reflects only the ledger upsert, never the Mem0 mirror that
+        ``write_cycle_summary`` also attempts.
+        """
+        report.stats.update({
+            'entity_summary_snapshot_lines_stripped': self._entity_summary_snapshot_lines_stripped,
+            'stage1_fetch_degraded': self._fetch_degraded_sources or [],
+            'stage1_assembled_budget': (
+                self.assembled_payload.budget_report()
+                if self.assembled_payload is not None
+                else None
+            ),
+            'stage1_undatable_freshness_records': self._undatable_freshness_records,
+            UNFINISHED_WRITE_START_STAT: unfinished_write_start_stat(
+                self._unfinished_graphiti_write_start
+            ),
+            'stage1_completion_markers_self_deleted': 0,
+            'stage1_cycle_summary_ledger_written': 0,
+            **_zeroed(_CURATOR_GATE_SWEEP_STATS),
+            _CURATOR_GATE_FLAGS_EMITTED_STAT: 0,
+            **_zeroed(_ORPHAN_SWEEP_STATS),
+            _ORPHAN_FLAGS_EMITTED_STAT: 0,
+            **UnlandedPathCheckResult.empty().stats(),
+            'entity_standing_decision_suppressed': 0,
+            'entity_standing_decision_max_suppression_streak': 0,
+            'preservation_specimen_suppressed': 0,
+            'preservation_specimen_unresolved': 0,
+            'preservation_specimen_citations': {},
+            CITATION_CONTRADICTIONS_STAT: 0,
+            'gate_owned_suggested_actions_normalized': 0,
+            **auto_consolidation_initial_stats(),
+        })
 
-        # Always present (task 2229 amendment, mirrors the task-2312 pattern
-        # above): set BEFORE the remediation early-return so this key is
-        # never conditionally absent. Stage 2's equivalent
-        # stage2_cycle_summary_ledger_written (task_knowledge_sync.py) is set
-        # unconditionally, so a consumer aggregating both stages' stats
-        # should not need a .get(..., 0) fallback for Stage 1's key.
-        # Overwritten below on a full (non-remediation) cycle once
-        # write_cycle_summary actually runs; stays 0 on remediation passes,
-        # which intentionally skip the write (see that call site below).
-        #
-        # Named "..._ledger_written", not "..._written" (reviewer finding
-        # observability, task 2229 amendment pass round 2): this reflects
-        # ONLY the authoritative ReconLedgerStore upsert. write_cycle_summary
-        # also attempts a best-effort Mem0 mirror write regardless of ledger
-        # outcome (see its docstring), so a deployment running with
-        # recon_ledger_enabled=False can have this stat at 0 while the
-        # mirror was in fact written — the "_ledger_" qualifier makes that
-        # distinction explicit instead of implying "no summary at all".
-        report.stats['stage1_cycle_summary_ledger_written'] = 0
+    async def _apply_preservation_specimen_guard(
+        self, report: StageReport,
+    ) -> PreservationSuppressionResult | None:
+        """Drop stranded/reset findings about a documented preservation specimen (task 4223).
 
-        # Always present (task 3084, mirroring the two pre-inits above): set
-        # BEFORE the remediation early-return so no key is ever conditionally
-        # absent — Stage 1's whole report.stats blob is serialized verbatim
-        # into Stage 2's prompt by _format_report (task_knowledge_sync.py), so
-        # a consumer should not need a .get(..., 0) fallback.  Overwritten
-        # below on a full (non-remediation) cycle once the sweep actually runs;
-        # stays 0 on remediation passes (which deliberately skip the sweep, see
-        # that block below) and when filtered_task_tree is unset.
-        #
-        # _errors is reported alongside the other two (reviewer finding
-        # "observability", amendment pass) because without it a cycle in which
-        # EVERY gate failed its Qdrant read is byte-identical, in the report and
-        # therefore in Stage 2's prompt, to a cycle in which every gate was
-        # cleanly checked and none was resolved — both read scanned=N,
-        # flags_emitted=0.  The failure would exist only in the process log,
-        # which is exactly the silent-degradation shape the no-silent-fail-soft
-        # invariant targets.  With all three present, the reader can also spot
-        # the sweep's zero-recall signature (scanned > 0, flags_emitted == 0,
-        # errors == 0 — see the sweep module docstring on source-key drift).
-        report.stats['curator_gate_resolution_scanned'] = 0
-        report.stats['curator_gate_resolution_flags_emitted'] = 0
-        report.stats['curator_gate_resolution_errors'] = 0
-        # Same always-present contract for the orphaned-recon-escalation sweep
-        # (task 3052).  Zeroed HERE, above the remediation early-return, so a
-        # remediation pass — which never runs the sweep — still publishes the
-        # keys.  With all eight present a reader can distinguish a clean cycle
-        # that found nothing (scanned > 0, flags_emitted == 0, errors == 0)
-        # from a degraded one (errors > 0), from a registry gap
-        # (unresolvable > 0) and from a cross-tag id collision
-        # (ambiguous > 0), without a .get(..., 0) fallback.  The classification
-        # counts are fleet-wide while flags_emitted is this project's only, so
-        # terminal + missing > flags_emitted is normal.
-        report.stats['orphaned_recon_escalations_scanned'] = 0
-        report.stats['orphaned_recon_escalations_terminal'] = 0
-        report.stats['orphaned_recon_escalations_missing'] = 0
-        report.stats['orphaned_recon_escalations_live'] = 0
-        report.stats['orphaned_recon_escalations_ambiguous'] = 0
-        report.stats['orphaned_recon_escalations_unresolvable'] = 0
-        report.stats['orphaned_recon_escalations_errors'] = 0
-        report.stats['orphaned_recon_escalations_flags_emitted'] = 0
-        # Same always-present contract for the unlanded-path check (task 5626).
-        report.stats.update(UnlandedPathCheckResult.empty().stats())
-
-        # Always present (task 2896 γ): count of recon flags suppressed this cycle
-        # by an ACTIVE entity_standing_decision (Hook A).  Overwritten below to the
-        # actual sum on a full cycle with items_flagged; stays 0 when nothing was
-        # flagged and on a remediation pass, which returns just below.  Pre-inited
-        # HERE, above that early return, rather than beside the filter it belongs to
-        # (reviewer finding correctness, amendment pass): a key set below the return
-        # is simply ABSENT from a remediation report, which is the .get(..., 0)
-        # fallback the always-present convention exists to spare consumers — and
-        # Stage 1's whole stats blob is serialized verbatim into Stage 2's prompt.
-        # The longest cross-cycle suppression streak (task 2943) follows the same
-        # convention: overwritten by _account_suppression_streaks on every full
-        # cycle, 0 on a remediation pass.
-        report.stats['entity_standing_decision_suppressed'] = 0
-        report.stats['entity_standing_decision_max_suppression_streak'] = 0
-
-        # ── Preservation-specimen corroboration guard (task 4223) ──────────────
-        # Decline stranded/reset recommendations for tasks whose odd state is
-        # DOCUMENTED as deliberate — a preserved validation specimen.  Task 3105
-        # is in-progress with a null claimant and a null heartbeat on purpose,
-        # and this finding twice became an operator-gate task asking for it to be
-        # reset (tasks 5080 and 5104, the second born-at-L2 critical); both were
-        # declined by hand.
-        #
-        # Placement is the whole point, and it is NOT beside Hook A below.  The
-        # remediation early-return three lines down sits ABOVE the entire filter
-        # chain, so anything wired next to filter_entity_standing_decisions is
-        # unreachable on a remediation pass — and a BLANKET stage1_flag_suppression
-        # for task 3105 failed to stop the recurrence for exactly that reason: the
-        # recurrences that continued after it was widened were remediation runs.
-        # This is the placement verify_cited_memories already uses to cover both
-        # passes, for the same reason.
-        #
-        # Both stats are pre-inited here, above the return, so neither key is ever
-        # conditionally absent from a remediation report (the always-present
-        # convention the three pre-inits above follow).
-        #
-        # Best-effort: a guard failure must never abort the stage or leave
-        # items_flagged partially mutated, so items_flagged is reassigned only on
-        # success and the stats stay at their pre-inited 0.
-        report.stats['preservation_specimen_suppressed'] = 0
-        report.stats['preservation_specimen_unresolved'] = 0
-        report.stats['preservation_specimen_citations'] = {}
-        preservation_result = None
+        Best-effort: on failure the flags pass through unfiltered, the stats
+        keep their defaults, and None is returned. The unresolved count and
+        the citations travel with the suppressed count, so a degraded or
+        stale suppression is visible to Stage 2, not only in the log.
+        """
+        result = None
         try:
-            preservation_result = await filter_preservation_specimen_flags(
+            result = await filter_preservation_specimen_flags(
                 memory_service=self.memory,
                 project_id=self.project_id,
                 flags=report.items_flagged,
             )
-            report.items_flagged = preservation_result.kept_flags
+            report.items_flagged = result.kept_flags
             report.stats['preservation_specimen_suppressed'] = sum(
-                preservation_result.suppressed_by_task.values()
+                result.suppressed_by_task.values()
             )
-            # INV-11: a cycle whose corroboration reads FAILED is not a clean
-            # cycle.  Surfacing the count here keeps the degradation visible in
-            # the blob Stage 2's prompt serializes, not only in the process log.
-            report.stats['preservation_specimen_unresolved'] = len(
-                preservation_result.unresolved_task_ids
-            )
-            # The evidence travels with the number.  A count alone is the
-            # anonymous drop citations_by_task exists to prevent: the storm
-            # escape only names a citation above its threshold, so in normal
-            # operation this map is the ONLY place an operator (or Stage 2,
-            # which is handed this blob verbatim) can see WHICH record
-            # authorised the suppression and judge whether it is still current.
-            report.stats['preservation_specimen_citations'] = dict(
-                preservation_result.citations_by_task
-            )
-            # Suppression is NOT resolution — but unlike Hook A below, that needs
-            # no signature bookkeeping here: this guard runs ABOVE the
-            # acknowledgment snapshot (_pre_filter_flags), so a flag it drops is
-            # already gone before acknowledgment candidates are computed and can
-            # never be reclaimed as resolved.  Enforced by position, not by
-            # exclusion; the snapshot comment below names the same dependency.
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
+            report.stats['preservation_specimen_unresolved'] = len(result.unresolved_task_ids)
+            report.stats['preservation_specimen_citations'] = dict(result.citations_by_task)
         except Exception:
             logger.exception(
                 'preservation-specimen guard failed for project %s (best-effort — '
                 'passing %d flag(s) through unfiltered this cycle)',
                 self.project_id, len(report.items_flagged or []),
             )
+        return result
 
-        # Live-workflow citation guard (task 4874): annotate, never drop, a finding
-        # citing a signal THIS run's section did not render (rationale: the module
-        # docstring of live_workflow_citation_guard).  Above the remediation
-        # early-return, like the guard above, so both passes are covered.
-        report.stats[CITATION_CONTRADICTIONS_STAT] = 0
+    def _apply_live_workflow_citation_guard(self, report: StageReport) -> None:
+        """Annotate, never drop, a finding citing a signal this run's section did not render.
+
+        Task 4874; the rationale is live_workflow_citation_guard's module docstring.
+        """
         try:
             report.items_flagged, report.stats[CITATION_CONTRADICTIONS_STAT] = (
                 check_live_workflow_citations(report.items_flagged or [], self._live_workflow_snapshot)
@@ -499,140 +454,62 @@ class MemoryConsolidator(BaseStage):
         except Exception:
             logger.exception('live-workflow citation guard failed for project %s', self.project_id)
 
-        # Always present (task 4814, same convention as the three pre-inits
-        # above — tasks 2312 / 2229 / 3084): set BEFORE the remediation
-        # early-return so this key is never conditionally absent.  Stage 1's
-        # whole report.stats blob is serialized verbatim into Stage 2's prompt
-        # by _format_report (task_knowledge_sync.py), so a consumer should not
-        # need a .get(..., 0) fallback.  Overwritten at the END of the
-        # ``if report.items_flagged:`` block below on a full cycle; stays 0 on
-        # remediation passes, when filtered_task_tree is unset, and when no
-        # active task is human-gate-owned.
-        report.stats['gate_owned_suggested_actions_normalized'] = 0
+    async def _escalate_preservation_storm(
+        self, preservation_result: PreservationSuppressionResult | None, run_id: str,
+    ) -> None:
+        """The preservation guard's per-cycle storm escape, with its unreadable-corroboration disclosure.
 
-        # Always present (task 5240), the same convention as the pre-inits above;
-        # the key set's one home is auto_consolidation_initial_stats.
-        report.stats.update(auto_consolidation_initial_stats())
+        It runs whether or not any flag survived: a storm is the cycle in which
+        the guard may have suppressed every flag.
+        """
+        if self._escalation_queue is None or preservation_result is None:
+            return
+        await maybe_escalate_preservation_suppression_storm(
+            escalation_queue=self._escalation_queue,
+            project_id=self.project_id,
+            run_id=run_id,
+            result=preservation_result,
+        )
 
-        # Skip dedup for remediation passes
-        if self.remediation_findings is not None:
-            return report
+    async def _append_curator_gate_sweep_flags(self, report: StageReport, run_id: str) -> None:
+        """Flag open curator gates whose ruling is already in Mem0, for Stage 2 to close (task 3084).
 
-        # Per-cycle "storm escape" for the guard above (INV-4), and its
-        # unreadable-corroboration disclosure.  Full-cycle only, mirroring the
-        # Hook A storm call below; skipped when no escalation queue is wired
-        # (nothing would consume the escalation).
-        #
-        # Deliberately NOT inside the ``if report.items_flagged:`` block below:
-        # a storm is precisely the cycle in which the guard may have suppressed
-        # EVERY flag, which would leave that block unentered and the storm
-        # unreported — the one cycle it most needs filing.
-        if self._escalation_queue is not None and preservation_result is not None:
-            await maybe_escalate_preservation_suppression_storm(
-                escalation_queue=self._escalation_queue,
-                project_id=self.project_id,
-                run_id=run_id,
-                result=preservation_result,
-            )
+        These flags skip the citation verification inside ``super().run()``, but
+        their ids resolve by construction: they come from a same-cycle Qdrant
+        scroll, and the sweep emits no flag unless that scroll returned a row.
+        """
+        if self.filtered_task_tree is None:
+            return
+        active_tasks = self.filtered_task_tree.active_tasks
+        gate_ids = extract_open_gate_task_ids(active_tasks)
+        swept = set(gate_ids)
+        # Titles for the flag descriptions only; selection stays with extract_open_gate_task_ids.
+        gate_tasks_by_id = {
+            str(task.get('id')): task
+            for task in active_tasks
+            if isinstance(task, dict) and str(task.get('id')) in swept
+        }
+        gate_sweep = await _await_best_effort(
+            lambda: sweep_resolved_curator_gates(
+                self.memory, self.project_id, gate_ids, tasks_by_id=gate_tasks_by_id,
+            ),
+            event='reconciliation.curator_gate_resolution_sweep_failed',
+            project_id=self.project_id,
+            run_id=run_id,
+            gate_id_count=len(gate_ids),
+        )
+        if gate_sweep is None:
+            return
+        report.items_flagged = (report.items_flagged or []) + (
+            stamp_curator_gate_sweep_provenance(gate_sweep['flags'])
+        )
+        _publish_sweep_stats(report, _CURATOR_GATE_SWEEP_STATS, gate_sweep)
+        report.stats[_CURATOR_GATE_FLAGS_EMITTED_STAT] = len(gate_sweep['flags'])
 
-        # ── Resolved human-curator-gate sweep (task 3084) ──────────────────────
-        # Flag open ``operational_mode == 'gate'`` tasks for which the reify
-        # curator has ALREADY written its ruling to Mem0 (an entry stamped
-        # ``metadata.source == 'curator_gate_{task_id}'``).  Detection was an
-        # ad-hoc Stage-3 spot-check that missed ~25% of cases (run ec45eed0:
-        # gates 5561 and 5563 were resolved-but-stale and went undetected).
-        # Stage 1 runs under DISALLOW_TASK_WRITES, so this only FLAGS; Stage 2
-        # (which holds set_task_status) acts.
-        #
-        # Placement, deliberately unlike the three other Stage-1 sweeps below
-        # (degenerate_task_node / stale_status_snapshot / stale_priority_override,
-        # which all run well after the filter chain): those only mutate Graphiti
-        # and return int stats — none of them touch the flag channel.  This one
-        # EMITS flags, so it must sit ABOVE dedup_flags, for two reasons.
-        # (1) Each appended flag then gets a stage1_flag_marker ledger row keyed
-        #     on (task_id, flag_type), giving cross-cycle recurrence tracking and
-        #     honoring explicit suppression records.  Appending below dedup_flags
-        #     would bypass dedup entirely, so an un-actioned gate flag would
-        #     re-emit unmarked every cycle with no recurrence history and no way
-        #     for an operator to suppress it.  (dedup_flags never DROPS on a hit —
-        #     only filter_suppressed drops — so re-emission until Stage 2 closes
-        #     the gate is preserved, which is the desired behaviour.)
-        # (2) It lets the ``if report.items_flagged:`` guard below fire on a cycle
-        #     where the LLM emitted zero flags of its own but the sweep found a
-        #     resolved gate.
-        #
-        # That placement DOES step over verify_cited_memories (above, right after
-        # super().run()), so the cited_memories these flags carry are the one
-        # citation set that citation_verifier.py's end-to-end "a cited memory id
-        # must resolve" invariant never sees, and stage1_citations_verified /
-        # stage1_phantom_citations_dropped deliberately exclude them (reviewer
-        # finding "architecture", amendment pass).  That exemption is sound
-        # BECAUSE of where these ids come from: the verifier exists to catch
-        # LLM-authored ids that were never real and ids whose queued add_memory
-        # write later failed, whereas these ids are read straight off a Qdrant
-        # scroll microseconds earlier in the same cycle — they resolve by
-        # construction, and sweep_resolved_curator_gates additionally refuses to
-        # emit a flag at all unless that scroll returned at least one row (its
-        # count/scroll-divergence guard), so an uncitable gate flag is impossible
-        # by a different route.  Moving the sweep above the verifier is NOT the
-        # cheap fix it looks like: the verifier sits above the remediation
-        # early-return so that both full and remediation passes are covered, and
-        # this sweep must run on full cycles ONLY, so the move would require
-        # duplicating the remediation guard here.
-        #
-        # Best-effort: a whole-sweep failure must never abort the stage or leave
-        # items_flagged partially mutated — it is logged and swallowed, and all
-        # three stats stay at their pre-early-return 0 for this cycle.
-        if self.filtered_task_tree is not None:
-            gate_ids = extract_open_gate_task_ids(self.filtered_task_tree.active_tasks)
-            # Title-enrichment map (reviewer finding "dead-code", amendment
-            # pass).  extract_open_gate_task_ids deliberately returns bare ids,
-            # so without this the sweep can only name a gate by number and
-            # build_gate_resolution_flag's title branch would be unreachable in
-            # production.  Keyed on the same str(id) coercion the selector uses
-            # and restricted to the swept ids; it is load-bearing for the
-            # description ONLY — selection remains the selector's job alone, so
-            # a partial map can never change which gates are swept or flagged.
-            _gate_id_set = set(gate_ids)
-            gate_tasks_by_id = {
-                str(task.get('id')): task
-                for task in self.filtered_task_tree.active_tasks
-                if isinstance(task, dict) and str(task.get('id')) in _gate_id_set
-            }
-            try:
-                gate_sweep = await sweep_resolved_curator_gates(
-                    self.memory, self.project_id, gate_ids,
-                    tasks_by_id=gate_tasks_by_id,
-                )
-            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-                raise
-            except Exception:
-                logger.exception(
-                    'reconciliation.curator_gate_resolution_sweep_failed',
-                    extra={
-                        'project_id': self.project_id,
-                        'run_id': run_id,
-                        'gate_id_count': len(gate_ids),
-                    },
-                )
-            else:
-                # Stamped here because this call site is the only place that
-                # KNOWS these flags came from the sweep; the task-4814 phrasing
-                # carve-out below needs that provenance rather than the
-                # free-form flag_type string an LLM finding may also pick.
-                report.items_flagged = (report.items_flagged or []) + (
-                    stamp_curator_gate_sweep_provenance(gate_sweep['flags'])
-                )
-                report.stats['curator_gate_resolution_scanned'] = gate_sweep['scanned']
-                report.stats['curator_gate_resolution_flags_emitted'] = len(
-                    gate_sweep['flags'],
-                )
-                report.stats['curator_gate_resolution_errors'] = gate_sweep['errors']
-
-        # ── Auto-consolidation executor (task 5240) ────────────────────────────
-        # Contract: plans/memory-auto-consolidation-prd.md C4.
-        try:
-            await run_auto_consolidation(
+    async def _run_auto_consolidation(self, report: StageReport, run_id: str) -> None:
+        """The auto-consolidation executor (task 5240); contract: plans/memory-auto-consolidation-prd.md C4."""
+        await _await_best_effort(
+            lambda: run_auto_consolidation(
                 self.memory,
                 self.taskmaster,
                 self._escalation_queue,
@@ -640,528 +517,147 @@ class MemoryConsolidator(BaseStage):
                 project_root=self.project_root,
                 run_id=run_id,
                 config=self.memory.config.consolidation_auto,
-                active_tasks=(
-                    self.filtered_task_tree.active_tasks
-                    if self.filtered_task_tree is not None
-                    else None
-                ),
+                active_tasks=self._active_tasks(),
                 report=report,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception:
-            logger.exception(
-                'reconciliation.auto_consolidation_failed',
-                extra={'project_id': self.project_id, 'run_id': run_id},
-            )
+            ),
+            event='reconciliation.auto_consolidation_failed',
+            project_id=self.project_id,
+            run_id=run_id,
+        )
 
-        # ── Orphaned recon-escalation sweep (task 3052) ────────────────────────
-        # Flag pending L1 ``reconciliation_stale_*`` records whose subject task
-        # has gone terminal (done/cancelled) or vanished from its own project's
-        # task store.  Those records are filed only while the subject is
-        # ``status == 'blocked'``
-        # (stage1_stall_detector.py::extract_stalled_gate_backlog_task_ids), so
-        # they can never re-file, yet nothing closes them: the harness never
-        # resolves its own escalation queue (A7b), and the orchestrator's
-        # revalidation sweep reads a different queue and returns early on
-        # ``level != 2`` while every recon record is L1.
-        #
-        # DETECTION ONLY — the sweep never calls queue.resolve(); the port-8103
-        # watcher session is the sole closer, reached via
-        # skills/recon-escalation-watcher/SKILL.md.
-        #
-        # The sweep emits flags only for THIS project's orphans, while its
-        # counts cover the whole shared queue; the trade-off is stated at
-        # orphaned_recon_escalation_sweep.py::sweep_orphaned_recon_escalations.
-        #
-        # Placement mirrors the curator-gate block above, for the same two
-        # reasons: this sweep EMITS flags, so it must sit ABOVE dedup_flags so
-        # (1) each appended flag earns a stage1_flag_marker ledger row keyed on
-        # (task_id, flag_type) — cross-cycle recurrence tracking plus honoring
-        # explicit suppression, where appending below would re-emit unmarked
-        # forever — and (2) the ``if report.items_flagged:`` guard below can fire
-        # on a cycle where the LLM emitted no flags of its own.
-        #
-        # Unlike the curator-gate flags, these carry NO cited_memories at all, so
-        # the verify_cited_memories exemption reasoning above does not apply to
-        # them in either direction: there is no citation set for the verifier to
-        # miss.  Their evidence is the escalation record's own fields plus a
-        # status census read microseconds earlier in this same call.
-        #
-        # Best-effort: a whole-sweep failure must never abort the stage or leave
-        # items_flagged partially mutated — it is logged and swallowed, and all
-        # seven stats stay at their pre-early-return 0 for this cycle.
-        if self._escalation_queue is not None and self.taskmaster is not None:
-            try:
-                orphan_sweep = await sweep_orphaned_recon_escalations(
-                    self._escalation_queue,
-                    self.taskmaster,
-                    self.known_projects,
-                    running_project_id=self.project_id,
-                )
-            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-                raise
-            except Exception:
-                logger.exception(
-                    'reconciliation.orphaned_recon_escalation_sweep_failed',
-                    extra={
-                        'project_id': self.project_id,
-                        'run_id': run_id,
-                    },
-                )
-            else:
-                report.items_flagged = (
-                    (report.items_flagged or []) + orphan_sweep['flags']
-                )
-                report.stats['orphaned_recon_escalations_scanned'] = orphan_sweep[
-                    'scanned'
-                ]
-                report.stats['orphaned_recon_escalations_terminal'] = orphan_sweep[
-                    'terminal'
-                ]
-                report.stats['orphaned_recon_escalations_missing'] = orphan_sweep[
-                    'missing'
-                ]
-                report.stats['orphaned_recon_escalations_live'] = orphan_sweep['live']
-                report.stats['orphaned_recon_escalations_ambiguous'] = orphan_sweep[
-                    'ambiguous'
-                ]
-                report.stats['orphaned_recon_escalations_unresolvable'] = orphan_sweep[
-                    'unresolvable'
-                ]
-                report.stats['orphaned_recon_escalations_errors'] = orphan_sweep[
-                    'errors'
-                ]
-                report.stats['orphaned_recon_escalations_flags_emitted'] = len(
-                    orphan_sweep['flags'],
-                )
+    async def _append_orphaned_recon_escalation_flags(
+        self, report: StageReport, run_id: str,
+    ) -> None:
+        """Flag pending L1 recon stale records whose subject task went terminal or vanished (task 3052).
 
-        # Done-task memories naming paths the branch added then removed before merge (task 5626);
-        # emits flags, so it sits above dedup_flags — see reconciliation/unlanded_path_check.py.
-        unlanded = await check_unlanded_path_claims(self.memory, self.project_id, self.project_root, events)
+        Detection only: the recon-escalation watcher is the sole closer. Flags
+        name this project's orphans while the counts cover the whole shared
+        queue; sweep_orphaned_recon_escalations states the trade-off.
+        """
+        if self._escalation_queue is None or self.taskmaster is None:
+            return
+        orphan_sweep = await _await_best_effort(
+            lambda: sweep_orphaned_recon_escalations(
+                self._escalation_queue,
+                self.taskmaster,
+                self.known_projects,
+                running_project_id=self.project_id,
+            ),
+            event='reconciliation.orphaned_recon_escalation_sweep_failed',
+            project_id=self.project_id,
+            run_id=run_id,
+        )
+        if orphan_sweep is None:
+            return
+        report.items_flagged = (report.items_flagged or []) + orphan_sweep['flags']
+        _publish_sweep_stats(report, _ORPHAN_SWEEP_STATS, orphan_sweep)
+        report.stats[_ORPHAN_FLAGS_EMITTED_STAT] = len(orphan_sweep['flags'])
+
+    async def _append_unlanded_path_flags(
+        self, report: StageReport, events: list[ReconciliationEvent],
+    ) -> None:
+        """Flag done-task memories naming paths their branch added then removed before merge (task 5626).
+
+        The check guards itself, so it needs no best-effort wrapper; see
+        reconciliation/unlanded_path_check.py.
+        """
+        unlanded = await check_unlanded_path_claims(
+            self.memory, self.project_id, self.project_root, events,
+        )
         report.items_flagged = (report.items_flagged or []) + list(unlanded.flags)
         report.stats.update(unlanded.stats())
 
-        # Always present (task-2029 amendment): downstream consumers that read this
-        # stat symmetrically with stats['stage2_flag_markers_acknowledged'] (which is
-        # unconditionally set) should never need a .get(..., 0) fallback.  Overwritten
-        # below when there is anything to acknowledge; stays 0 when items_flagged is
-        # empty/falsy.
+    async def _run_flag_chain(
+        self, report: StageReport, events: list[ReconciliationEvent], run_id: str,
+    ) -> EntityStandingSuppressionResult:
+        """Run reconciliation/stage1_flag_chain.py over the cycle's flags; return Hook A's result.
+
+        ``stage1_flag_markers_acknowledged`` is published on every full cycle,
+        symmetric with Stage 2's ``stage2_flag_markers_acknowledged``. A cycle
+        that flagged nothing returns the empty batch: no decision drained anything.
+        """
         report.stats['stage1_flag_markers_acknowledged'] = 0
-        # Hook A reassigns this inside the block below; a cycle that flagged
-        # nothing keeps the empty batch, which is the same observation.
-        _esd_result = EntityStandingSuppressionResult.empty_batch()
-        if report.items_flagged:
-            # Snapshot before the filter chain (task-2029): used below to compute
-            # which flags the chain dropped for a MOOT reason — terminal task,
-            # false-absence, or stale-snapshot correction — so any persisted
-            # stage1_flag_marker for a now-moot flag can be reclaimed instead of
-            # waiting for the 14-day age-GC or a recurrence.  Flags dropped by
-            # dedup_flags' own suppression gate (filter_suppressed) are identified
-            # separately below and deliberately EXCLUDED from acknowledgment: a
-            # suppression means the issue is intentionally hidden, not resolved, so
-            # acknowledging it would erase recurrence history for when the
-            # suppression is later lifted.
-            # Taken BELOW the preservation-specimen guard (task 4223) on purpose:
-            # that guard's drops are a suppression, not a resolution, and their
-            # absence from this snapshot is what keeps their stage1_flag_marker
-            # alive.  Moving this above the guard would need the same explicit
-            # signature exclusion Hook A does below.
-            _pre_filter_flags = list(report.items_flagged)
+        if not report.items_flagged:
+            return EntityStandingSuppressionResult.empty_batch()
+        outcome = await run_stage1_flag_chain(
+            report.items_flagged, self._flag_chain_context(events, run_id),
+        )
+        report.items_flagged = outcome.kept_flags
+        report.stats.update(outcome.stats)
+        return outcome.standing_decision_result
 
-            # ── Stale count-snapshot correction filter (task-1786): drop false ────
-            # 'off-by-N correction' findings on stale-by-design task-count snapshot
-            # edges BEFORE dedup_flags so no stage1_flag_marker churn occurs.
-            # Pure, sync — no I/O needed (reads only the flag's own text fields).
-            # Surfaces dropped count as report.stats['stale_count_snapshot_corrections_dropped'].
-            _before_snapshot_filter = len(report.items_flagged)
-            report.items_flagged = filter_stale_count_snapshot_corrections(
-                report.items_flagged,
-            )
-            report.stats['stale_count_snapshot_corrections_dropped'] = (
-                _before_snapshot_filter - len(report.items_flagged)
-            )
-            # ── Terminal-metadata guard (task-1725): drop stale_metadata flags for ──
-            # cancelled/done tasks BEFORE dedup_flags so no marker write/delete churn
-            # occurs.  Fail-safe: only drops on positively-confirmed terminal status.
-            report.items_flagged = await filter_terminal_metadata_flags(
-                taskmaster=self.taskmaster,
-                project_root=self.project_root,
-                flags=report.items_flagged,
-            )
-            # ── Stale bulk get_statuses guard (task-3007): drop ───────────────────
-            # stale_bulk_get_statuses_recurrence flags whose alleged bulk-vs-scoped
-            # census divergence does NOT reproduce on a fresh LIVE A/B read.  The
-            # recurrence is a misdiagnosis of the harness's frozen cycle-start
-            # unscoped census compared against live reads minutes later (not a
-            # backend defect — the read path is provably write-synchronous-fresh);
-            # dropping the phantom flag before dedup_flags stops the per-cycle
-            # marker churn AND the phantom backend-investigation task each
-            # recurrence would otherwise mint.  Fail-safe: only drops on
-            # positively-confirmed live agreement; a reproduced divergence, a
-            # missing/None cited status, or a read error KEEP the flag so a genuine
-            # regression is never silenced.  Surfaces the dropped count as
-            # report.stats['stale_bulk_get_statuses_flags_dropped'] (mirrors the
-            # stale_count_snapshot_corrections_dropped before/after idiom above).
-            _before_stale_bulk_get_statuses_filter = len(report.items_flagged)
-            report.items_flagged = await filter_stale_bulk_get_statuses_flags(
-                taskmaster=self.taskmaster,
-                project_root=self.project_root,
-                flags=report.items_flagged,
-            )
-            report.stats['stale_bulk_get_statuses_flags_dropped'] = (
-                _before_stale_bulk_get_statuses_filter - len(report.items_flagged)
-            )
-            # ── Already-tracked systemic-pattern guard (task-2416): drop ──────────
-            # systemic_pattern "never tracked" findings BEFORE dedup_flags so a
-            # dropped finding never writes a stage1 flag marker.  Hardens against
-            # the e61b38f9/1938 false-positive incident: Stage 1 asserted an idea
-            # was never converted to a tracked task despite a done dark_factory
-            # task already implementing it (which spawned duplicate task 2412).
-            # The whole cross-project routing map is handed over (task 4381):
-            # the filter fans one get_tasks out per known project and matches on
-            # TEXT coverage, where a same-project match is genuine evidence — so
-            # unlike dedup_flags' foreign-only cited-task gate below, ALL known
-            # projects are queried.  It naturally no-ops when known_projects is
-            # empty.  Uses get_tasks(statuses=...) rather than the semantic
-            # search_tasks named in the task description: search_tasks lives only
-            # on TaskInterceptor/the MCP wrapper, not on TaskBackendProtocol, so it
-            # is unreachable from self.taskmaster (a raw SqliteTaskBackend) here —
-            # see design_decisions in .task/plan.json for the full rationale.
-            _before_already_tracked_filter = len(report.items_flagged)
-            report.items_flagged = await filter_already_tracked_systemic_patterns(
-                taskmaster=self.taskmaster,
-                known_projects=self.known_projects,
-                flags=report.items_flagged,
-            )
-            report.stats['systemic_pattern_already_tracked_dropped'] = (
-                _before_already_tracked_filter - len(report.items_flagged)
-            )
-            # ── Style-only authorship guard (task 3138): drop ─────────────────────
-            # injection/fabrication flags whose cited entries turn out to have been
-            # written by our OWN agents.  Closes reify esc-5564-1, in which Stage 1
-            # flagged its own earlier consolidator output (agent_id
-            # recon-stage-memory_consolidator) as "possibly injected/fabricated"
-            # purely because the imperative writing style looked foreign — it never
-            # read the stored agent_id.  Provenance comes from
-            # memory.get_memory_by_id, whose metadata is the raw Qdrant payload and
-            # so still carries the top-level agent_id that mem0 promotes out of
-            # metadata on the search/get paths.  Fail-safe: drops only on
-            # positively-confirmed wholly-house authorship; foreign, missing, mixed
-            # or unresolvable provenance all KEEP the flag (and get annotated with
-            # the agent_ids actually checked).  Surfaces the dropped count as
-            # report.stats['style_only_authorship_flags_dropped'].
-            #
-            # Placement before dedup_flags is load-bearing: it is what routes a
-            # dropped flag through the marker-reclaim tail below, so its Stage-2
-            # disposition marker is acknowledged rather than stranded.
-            _before_authorship_filter = len(report.items_flagged)
-            report.items_flagged = await filter_style_only_authorship_flags(
-                memory_service=self.memory,
-                project_id=self.project_id,
-                flags=report.items_flagged,
-            )
-            report.stats['style_only_authorship_flags_dropped'] = (
-                _before_authorship_filter - len(report.items_flagged)
-            )
-            # ── Accounted duplicate-cluster-growth guard (task 3476): drop ────────
-            # "cluster has grown beyond what gate task N tracks" findings whose
-            # cited memory UUIDs are ALREADY written into that task's CURRENT
-            # description body.  Stage 1 diffs the candidate UUID against a
-            # title-derived / remembered COUNT, so an addendum appended to the body
-            # since the title was written reads as unaccounted growth: in run
-            # df364849-21e9-4f54-b802-a126a49eba97 (finding 96a14765) 2 of 3 such
-            # flags were FALSE POSITIVES — task 3417's title still reads "(3
-            # primary + 3 secondary entries)" while its body already lists the
-            # "new" UUID verbatim as primary entry #3 of 3, and task 3468's
-            # "Cluster UUIDs (mem0)" list has the same shape.  Fail-safe: drops
-            # only when SOME single candidate task's body contains EVERY cited
-            # UUID; partial presence, a lookup error, a body-less result or no
-            # resolvable task id all KEEP the flag, so a genuine growth signal is
-            # never silenced.  project_root=, not the known_projects= that
-            # filter_already_tracked_systemic_patterns switched to under task 4381:
-            # this filter resolves ids in the RUNNING project's root only.
-            # Surfaces the dropped count as
-            # report.stats['accounted_cluster_growth_flags_dropped'].
-            #
-            # Position is load-bearing in both directions: before dedup_flags so a
-            # dropped flag never writes a stage1_flag_marker, and after the
-            # _pre_filter_flags snapshot above so drops join the task-2029
-            # flag-marker acknowledgment diff below for free.
-            _before_accounted_cluster_growth_filter = len(report.items_flagged)
-            report.items_flagged = await filter_accounted_cluster_growth_flags(
-                taskmaster=self.taskmaster,
-                project_root=self.project_root,
-                flags=report.items_flagged,
-            )
-            report.stats['accounted_cluster_growth_flags_dropped'] = (
-                _before_accounted_cluster_growth_filter - len(report.items_flagged)
-            )
-            # ── Already-recorded caveat guard (task 5271): drop ──────────────────
-            # "task N's metadata still lacks the caveat" findings whose cited
-            # caveat-source memory id the task's LIVE metadata already records.
-            # Fail-KEEP; rationale in filter_already_recorded_caveat_flags'
-            # docstring.  After the _pre_filter_flags snapshot and before
-            # dedup_flags, so a drop writes no stage1_flag_marker and is
-            # acknowledged as resolved by the task-2029 diff below.
-            _before_already_recorded_caveat_filter = len(report.items_flagged)
-            report.items_flagged = await filter_already_recorded_caveat_flags(
-                taskmaster=self.taskmaster,
-                project_root=self.project_root,
-                flags=report.items_flagged,
-            )
-            report.stats['already_recorded_caveat_flags_dropped'] = (
-                _before_already_recorded_caveat_filter - len(report.items_flagged)
-            )
-            # ── Benign sweep-deletion guard (task 5271): drop ─────────────────────
-            # evidentiary-anchor deletion-pattern findings whose every swept id
-            # carries a documented recon sweep's tombstone (a designed trim, not
-            # an anomaly).  Reads this cycle's buffered `events` for deletions
-            # that left no tombstone.  Fail-KEEP; rationale in the
-            # sweep_deletion_guard module docstring.  After the _pre_filter_flags
-            # snapshot and before dedup_flags, so a drop writes no
-            # stage1_flag_marker and is acknowledged as resolved below.
-            _before_benign_sweep_deletion_filter = len(report.items_flagged)
-            report.items_flagged = await filter_benign_sweep_deletion_flags(
-                memory_service=self.memory,
-                project_id=self.project_id,
-                flags=report.items_flagged,
-                events=events,
-            )
-            report.stats['benign_sweep_deletion_flags_dropped'] = (
-                _before_benign_sweep_deletion_filter - len(report.items_flagged)
-            )
-            # ── Entity-standing-decision suppression (task 2896 γ, Hook A) ────────
-            # Drop flags already adjudicated by an ACTIVE entity_standing_decision
-            # ledger row BEFORE dedup_flags so a suppressed flag never writes a
-            # stage1_flag_marker.  Whole-batch fail-open (ledger unavailable or read
-            # error → no suppression this cycle; a read failure must never hide a
-            # finding).  Suppression is NOT resolution: the dropped flags' signatures
-            # are collected here and unioned into suppressed_signatures below so they
-            # are EXCLUDED from acknowledge_resolved_flags — preserving recurrence
-            # history for when the decision is later lifted.
-            _pre_esd_flags = list(report.items_flagged)
-            _esd_result = await filter_entity_standing_decisions(
-                memory_service=self.memory,
-                project_id=self.project_id,
-                flags=report.items_flagged,
-            )
-            report.items_flagged = _esd_result.kept_flags
-            report.stats['entity_standing_decision_suppressed'] = sum(
-                _esd_result.suppressed_by_decision.values()
-            )
-            esd_suppressed_signatures = _marker_signatures(
-                _pre_esd_flags, project_id=self.project_id
-            ) - _marker_signatures(report.items_flagged, project_id=self.project_id)
-            # Per-cycle "storm escape": one active decision suppressing more than the
-            # threshold in a single cycle is a signal it may be over-broad or the
-            # entity's situation changed — file one L1 recon escalation for that
-            # entity (best-effort; recurrences fold onto it by content fingerprint).
-            # Skipped when no escalation queue is wired (nothing would consume the
-            # escalation).  Its cross-cycle streak arm runs after this block.
-            if self._escalation_queue is not None:
-                await maybe_escalate_suppression_storm(
-                    escalation_queue=self._escalation_queue,
-                    project_id=self.project_id,
-                    run_id=run_id,
-                    result=_esd_result,
-                    threshold=SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
-                )
-            # Snapshot immediately before dedup_flags, which internally applies the
-            # suppression gate (filter_suppressed) as its first step, so suppression
-            # drops can be isolated below and excluded from acknowledgment.
-            _pre_dedup_flags = list(report.items_flagged)
-            _dedup_stats: dict[str, int] = {}
-            report.items_flagged = await dedup_flags(
-                memory_service=self.memory,
-                project_id=self.project_id,
-                run_id=run_id,
-                flags=report.items_flagged,
-                # Cross-project fix-task suppression (task 4381): without BOTH
-                # of these, dedup_flags' HIT-path gate degrades to a silent
-                # no-op by design.
-                taskmaster=self.taskmaster,
-                known_projects=self.known_projects,
-                # Out-dict for dedup_flags' own drop counters (task 4381
-                # amendment) — see the report.stats publication below.
-                stats=_dedup_stats,
-            )
-            # Every sibling filter in this chain publishes its drop count; the
-            # cross-project gate now does too, so an operator reading a cycle
-            # report can tell "a foreign fix task resolved this" apart from "a
-            # stage1_flag_suppression record hid this" — two very different
-            # signals that the signature diff below deliberately merges.
-            report.stats['stage1_flag_cross_project_fix_task_suppressed'] = int(
-                _dedup_stats.get('cross_project_fix_task_suppressed', 0)
-            )
-            # Findings whose cited fix task is already done yet which keep
-            # recurring: suppression EXPIRED and they were surfaced again
-            # (dedup_flags logs each at WARNING).  A non-zero value here means
-            # a landed fix did not stop its finding.
-            report.stats['stage1_flag_cross_project_fix_task_suppression_exhausted'] = int(
-                _dedup_stats.get('cross_project_fix_task_suppression_exhausted', 0)
-            )
-            # One-time completion markers dedup_flags emitted-then-self-deleted this
-            # cycle (task-2312) — counts flags annotated completion_marker_self_deleted
-            # by the flag_for_stage2=False branch; 0 when none were present.
-            report.stats['stage1_completion_markers_self_deleted'] = sum(
-                1 for f in report.items_flagged
-                if f.get('completion_marker_self_deleted') is True
-            )
-            # Signatures dropped INSIDE dedup_flags: present before, absent
-            # after.  As of task 4381 dedup_flags drops for TWO reasons — its
-            # filter_suppressed gate, and a ledger HIT whose cited_tasks resolve
-            # to a live, non-cancelled fix task in a FOREIGN known project — so
-            # this diff no longer isolates suppression alone.  Both causes are
-            # deliberately folded into `suppressed_signatures` here, and are
-            # therefore EXCLUDED from acknowledge_resolved_flags below.  That is
-            # correct for the same reason the existing suppression carve-out is:
-            # a cross-project fix task that has been FILED has not yet LANDED, so
-            # the marker must retain its recurrence history for the day that task
-            # is cancelled or closed without landing the fix — exactly like "a
-            # suppression means the issue is intentionally hidden, not resolved".
-            # The two causes cannot be told apart by this diff — dedup_flags
-            # returns only a list — so the cross-project count is reported
-            # separately above, out of dedup_flags' `stats` out-dict, alongside
-            # the `reconciliation.stage1_flag_cross_project_fix_task_suppressed`
-            # INFO log that names the specific fix task behind each drop.
-            suppressed_signatures = _marker_signatures(
-                _pre_dedup_flags, project_id=self.project_id
-            ) - _marker_signatures(report.items_flagged, project_id=self.project_id)
-            # Fold in the entity-standing-decision drops (task 2896 γ): they are a
-            # suppression, not a resolution, so — exactly like dedup_flags' own
-            # suppression drops above — their signatures are excluded from
-            # acknowledge_resolved_flags so the persisted stage1_flag_marker (and thus
-            # recurrence history) survives until the standing decision is lifted.
-            suppressed_signatures |= esd_suppressed_signatures
-            # ── Deletion guard: drop absence-type flags that cannot be confirmed absent ──
-            # filter_false_absence_flags is fail-closed: keeps an absence-asserting flag
-            # ONLY when get_task POSITIVELY confirms the task does not exist.  Present or
-            # inconclusive → drop to prevent irreversible delete_memory ops on real tasks.
-            report.items_flagged = await filter_false_absence_flags(
-                taskmaster=self.taskmaster,
-                project_root=self.project_root,
-                flags=report.items_flagged,
-            )
+    def _flag_chain_context(
+        self, events: list[ReconciliationEvent], run_id: str,
+    ) -> FlagChainContext:
+        return FlagChainContext(
+            memory_service=self.memory,
+            taskmaster=self.taskmaster,
+            escalate_suppression_storm=functools.partial(
+                self._escalate_suppression_storm, run_id=run_id,
+            ),
+            project_id=self.project_id,
+            project_root=self.project_root,
+            known_projects=self.known_projects,
+            run_id=run_id,
+            events=events,
+            active_tasks=self._active_tasks(),
+        )
 
-            # ── Flag-marker acknowledgment (task-2029 scenario a) ──────────────────
-            # Flags DROPPED anywhere in the chain above (e.g. terminal task, false-absence,
-            # stale-snapshot correction, or already-tracked systemic-pattern) have a
-            # moot requested action; reclaim any persisted stage1_flag_marker for them
-            # best-effort.  Computed as a
-            # signature diff against the survivors rather than threading a "dropped"
-            # list through each filter, so none of the filters' contracts change.
-            # suppressed_signatures (computed above) is explicitly subtracted out —
-            # suppression is not the same as resolved; see the snapshot comment above.
-            surviving_signatures = _marker_signatures(
-                report.items_flagged, project_id=self.project_id
-            )
-            dropped_flags = [
-                f for f in _pre_filter_flags
-                if _marker_signatures([f], project_id=self.project_id)
-                - surviving_signatures - suppressed_signatures
-            ]
-            report.stats['stage1_flag_markers_acknowledged'] = await acknowledge_resolved_flags(
-                memory_service=self.memory,
-                project_id=self.project_id,
-                run_id=run_id,
-                resolved_flags=dropped_flags,
-                mode='delete',
-            )
+    async def _escalate_suppression_storm(
+        self, result: EntityStandingSuppressionResult, run_id: str,
+    ) -> None:
+        """Hook A's per-cycle storm escape, handed to the flag chain."""
+        if self._escalation_queue is None:
+            return
+        await maybe_escalate_suppression_storm(
+            escalation_queue=self._escalation_queue,
+            project_id=self.project_id,
+            run_id=run_id,
+            result=result,
+            threshold=SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+        )
 
-            # ── Gate-owned suggested_action normalization (task 4814) ─────────
-            # The deterministic half of the gate-owned phrasing fix; the
-            # Stage-1 prompt norm quoting the same constant is the
-            # probabilistic half.  Rationale, evidence and the sweep carve-out
-            # live in one place: gate_owned_finding_phrasing.py's module
-            # docstring.  Corrects the STRUCTURED-REPORT channel only —
-            # report.items_flagged, which Stage 2 reads through
-            # task_knowledge_sync.py::_format_flagged (via assemble_payload's
-            # combined_flags, the same path that makes the new
-            # gate_owned_action_normalized key visible to Stage 2 at all).
-            # The mem0_active_query marker relay assemble_payload merges into
-            # that same list is NOT corrected here; see the module docstring.
-            #
-            # PLACEMENT — last in the block, after the acknowledgment diff, on
-            # three grounds:
-            #
-            # 1. It never DROPS, so normalizing a flag a later filter would
-            #    discard is wasted work.  Running last means it only ever
-            #    touches survivors.
-            # 2. It must sit after the curator-gate sweep that appends the
-            #    carved-out flags, so the carve-out is genuinely exercised in
-            #    production rather than only in tests.
-            # 3. Running after the acknowledgment diff makes the safety
-            #    STRUCTURAL rather than argued: surviving_signatures and
-            #    dropped_flags are already computed above and provably cannot
-            #    observe this rewrite.
-            #
-            # Running after dedup_flags is separately safe, and that argument
-            # is kept because ground 3 covers only the acknowledgment diff:
-            # compute_flag_signature reads ONLY task_id/flag_type/cited_tasks,
-            # none of which this touches, and compute_content_fingerprint_signature
-            # (the only path that hashes finding TEXT) returns None the moment a
-            # flag has a task_id or any cited_tasks task id — which a gate-owned
-            # finding, selected BY its cited task, structurally always has.
-            #
-            # The durable recon_report row deliberately keeps the LLM's
-            # verbatim self-report (the more faithful audit trail of what the
-            # stage produced); the gate_owned_action_normalized=True marker on
-            # each corrected flag makes that divergence explicit and greppable.
-            #
-            # Pure and sync — deliberately NOT try/except-wrapped, matching its
-            # pure sibling filter_stale_count_snapshot_corrections at the head
-            # of this same chain.
-            if self.filtered_task_tree is not None:
-                _gate_task_ids = extract_human_gated_task_ids(
-                    self.filtered_task_tree.active_tasks,
-                )
-                if _gate_task_ids:
-                    report.items_flagged, _normalized = (
-                        normalize_gate_owned_suggested_actions(
-                            report.items_flagged, _gate_task_ids,
-                            project_id=self.project_id,
-                        )
-                    )
-                    report.stats['gate_owned_suggested_actions_normalized'] = _normalized
+    def _active_tasks(self) -> list[dict] | None:
+        if self.filtered_task_tree is None:
+            return None
+        return self.filtered_task_tree.active_tasks
 
-        await self._account_suppression_streaks(run_id, _esd_result, report)
+    def _detect_census_inconsistency(
+        self, report: StageReport, events: list[ReconciliationEvent], run_id: str,
+    ) -> None:
+        """Record event task ids above the census max, the signature of a partial or wrong-source bulk read.
 
-        # ── Census inconsistency detection ────────────────────────────────────
-        # Compare task IDs referenced in this cycle's events against the census
-        # max from the filtered task tree.  IDs exceeding the max indicate a
-        # partial/wrong-source bulk task read (the "highest-ID below known task IDs"
-        # signature) and should be surfaced as a structured observation so operators
-        # can investigate the root cause.
-        #
-        # Guard: skip when max_task_id == 0 (empty tree or all IDs unparseable).
-        # If every referenced task ID is "above" a zero ceiling the result is a
-        # false-positive flood rather than a genuine truncation signal.
-        if self.filtered_task_tree is not None and self.filtered_task_tree.max_task_id > 0:
-            event_task_ids = [
-                e.payload.get('task_id')
-                for e in events
-                if e.payload.get('task_id') is not None
-            ]
-            inconsistent = detect_census_inconsistency(
-                self.filtered_task_tree.max_task_id, event_task_ids
-            )
-            if inconsistent:
-                report.stats['task_tree_census_inconsistent'] = inconsistent
-                logger.warning(
-                    'reconciliation.task_tree_census_inconsistent',
-                    extra={
-                        'project_id': self.project_id,
-                        'run_id': run_id,
-                        'census_max': self.filtered_task_tree.max_task_id,
-                        'offending_ids': inconsistent,
-                    },
-                )
+        Skipped when the max is 0 (an empty tree or no parseable id), where every
+        id would read as above it: a false-positive flood, not a truncation signal.
+        """
+        tree = self.filtered_task_tree
+        if tree is None or tree.max_task_id <= 0:
+            return
+        event_task_ids = [
+            e.payload.get('task_id')
+            for e in events
+            if e.payload.get('task_id') is not None
+        ]
+        inconsistent = detect_census_inconsistency(tree.max_task_id, event_task_ids)
+        if not inconsistent:
+            return
+        report.stats['task_tree_census_inconsistent'] = inconsistent
+        logger.warning(
+            'reconciliation.task_tree_census_inconsistent',
+            extra={
+                'project_id': self.project_id,
+                'run_id': run_id,
+                'census_max': tree.max_task_id,
+                'offending_ids': inconsistent,
+            },
+        )
 
-        # ── Task-count cross-verification (task 1785) ─────────────────────────
-        # Surface the authoritative get_statuses census vs. get_tasks-derived
-        # FilteredTaskTree comparison so the async judge / recon report can act
-        # on count divergence without relying on a possibly-dropped Graphiti edge.
+    def _surface_harness_health_records(self, report: StageReport, run_id: str) -> None:
+        """Copy each harness-set health record into the report, warning when it is unhealthy.
+
+        Surfacing only. Index drift is escalated by the harness detector that
+        the startup sweep shares, so the two paths never fork (task 3709).
+        """
         if self.task_count_verification is not None:
             report.stats['task_count_verification'] = self.task_count_verification
             if not self.task_count_verification.get('consistent', True):
@@ -1174,11 +670,6 @@ class MemoryConsolidator(BaseStage):
                         'tree': self.task_count_verification.get('tree'),
                     },
                 )
-
-        # ── Graphiti async-queue health (task 1785) ────────────────────────────
-        # Surface the dead-letter count from DurableWriteQueue so the silent
-        # add_memory drop (success=True at enqueue, dead-lettered asynchronously)
-        # is visible in the Stage 1 report.
         if self.graphiti_queue_health is not None:
             report.stats['graphiti_queue_health'] = self.graphiti_queue_health
             if not self.graphiti_queue_health.get('healthy', True):
@@ -1190,19 +681,6 @@ class MemoryConsolidator(BaseStage):
                         'dead_count': self.graphiti_queue_health.get('dead_count'),
                     },
                 )
-
-        # ── FalkorDB index-provisioning health (task 3709 / PRD δ) ────────────
-        # Surface the index drift record so a graph serving queries without the
-        # indices it should have is visible in the Stage 1 report — ζ's
-        # activation verification reads this, so the HEALTHY case is surfaced
-        # too, not just the drifted one.
-        #
-        # Deliberately does NOT file the escalation here, unlike the
-        # HOR/gate-backlog path which is stage-only: the Q3 startup sweep has no
-        # stage, so the filing lives in the harness detector both paths share.
-        # A stage-resident filer would fork δ into two divergent detectors and
-        # leave the startup half unable to escalate at all.  This stage is a
-        # surfacing point only.
         if self.index_health is not None:
             report.stats['index_health'] = self.index_health
             if not self.index_health.get('healthy', True):
@@ -1216,255 +694,101 @@ class MemoryConsolidator(BaseStage):
                         'expected_total': self.index_health.get('expected_total'),
                     },
                 )
-
-        # ── Status-correction reconciliation (task 1938) ───────────────────────
-        # Surface the cached project_status_correction memory vs. live get_statuses
-        # diff/supersede record so a stale Mem0 correction never silently outlives
-        # the authoritative census.
         if self.status_correction_reconciliation is not None:
             report.stats['status_correction_reconciliation'] = (
                 self.status_correction_reconciliation
             )
 
-        # ── Stale human-operator-required detector (task 1201) ────────────────
-        # Short-circuit when the escalation queue is unavailable — writing Mem0
-        # markers that nothing will ever consume only wastes Qdrant capacity.
-        # If a queue becomes available in a future cycle the counter starts
-        # from zero for that cycle; that is an acceptable trade-off.
-        if self._escalation_queue is not None:
-            hor_task_ids = extract_human_operator_task_ids(report.items_flagged or [])
-            if hor_task_ids:
-                stall_counts = await track_human_operator_stalls(
-                    memory_service=self.memory,
-                    project_id=self.project_id,
-                    run_id=run_id,
-                    task_ids=hor_task_ids,
-                )
-                stalled = compute_stalled_task_ids(stall_counts)
-                report.stats['stage1_human_operator_stalled'] = len(stalled)
-                if stalled:
-                    escalated = await maybe_escalate_stalled_tasks(
-                        escalation_queue=self._escalation_queue,
-                        project_id=self.project_id,
-                        run_id=run_id,
-                        stalled_task_ids=stalled,
-                        stall_counts=stall_counts,
-                        flags=report.items_flagged or [],
-                    )
-                    report.stats['stage1_human_operator_escalated'] = len(escalated)
-                else:
-                    report.stats['stage1_human_operator_escalated'] = 0
+    async def _escalate_human_operator_stalls(self, report: StageReport, run_id: str) -> None:
+        """Escalate human-operator-required findings that keep recurring unactioned (task 1201).
 
-        # ── Stale gate-backlog age check (task 3017) ──────────────────────────
-        # Deterministic, stateless age check: a blocked human-decision gate task
-        # whose metadata.gate_escalated_at (the born-at-L2 idempotency stamp) has
-        # aged past 48h files an independent level-1
-        # reconciliation_stale_gate_backlog escalation.  Unlike the HOR path above
-        # this needs NO Mem0 marker accumulation and NO LLM finding — it reads the
-        # durable stamp straight off the Stage-1 task tree.  Guarded on both the
-        # escalation queue AND filtered_task_tree (active_tasks is the input, and
-        # restricting to it excludes resolved-and-done gates for free); full-cycle
-        # only (below the remediation early-return).
-        if self._escalation_queue is not None and self.filtered_task_tree is not None:
-            now = datetime.now(UTC)
-            gate_stalled = extract_stalled_gate_backlog_task_ids(
-                self.filtered_task_tree.active_tasks, now=now,
-            )
-            report.stats['stage1_gate_backlog_stalled'] = len(gate_stalled)
-            if gate_stalled:
-                task_by_id = {
-                    str(t.get('id')): t
-                    for t in self.filtered_task_tree.active_tasks
-                    if t.get('id') is not None
-                }
-                gate_escalated = await maybe_escalate_stalled_gate_backlog(
-                    escalation_queue=self._escalation_queue,
-                    project_id=self.project_id,
-                    run_id=run_id,
-                    stalled_task_ids=gate_stalled,
-                    task_by_id=task_by_id,
-                    now=now,
-                )
-                report.stats['stage1_gate_backlog_escalated'] = len(gate_escalated)
-            else:
-                report.stats['stage1_gate_backlog_escalated'] = 0
+        Skipped without an escalation queue: stall markers nothing would
+        consume only waste Qdrant capacity.
+        """
+        if self._escalation_queue is None:
+            return
+        hor_task_ids = extract_human_operator_task_ids(report.items_flagged or [])
+        if not hor_task_ids:
+            return
+        stall_counts = await track_human_operator_stalls(
+            memory_service=self.memory,
+            project_id=self.project_id,
+            run_id=run_id,
+            task_ids=hor_task_ids,
+        )
+        stalled = compute_stalled_task_ids(stall_counts)
+        report.stats['stage1_human_operator_stalled'] = len(stalled)
+        if not stalled:
+            report.stats['stage1_human_operator_escalated'] = 0
+            return
+        escalated = await maybe_escalate_stalled_tasks(
+            escalation_queue=self._escalation_queue,
+            project_id=self.project_id,
+            run_id=run_id,
+            stalled_task_ids=stalled,
+            stall_counts=stall_counts,
+            flags=report.items_flagged or [],
+        )
+        report.stats['stage1_human_operator_escalated'] = len(escalated)
 
-        # ── Degenerate task-node sweep (task 2107) ─────────────────────────────
-        # Delete degenerate ("tasks {id}", edge_count == 0) placeholder Graphiti
-        # nodes for terminal (done + cancelled) tasks. extract_terminal_task_ids
-        # returns [] for a None filtered_task_tree, so this naturally no-ops when
-        # the harness hasn't set one. Best-effort: a sweep failure must never
-        # abort the stage or leave a partial/incorrect stat — it is logged and
-        # swallowed, and no degenerate_task_nodes_* stat is set for this cycle.
+    async def _escalate_stalled_gate_backlog(self, report: StageReport, run_id: str) -> None:
+        """Escalate blocked human-decision gates whose gate_escalated_at stamp is over 48h old (task 3017).
+
+        Stateless: it reads the durable stamp off the active task tree, so it
+        needs no Mem0 marker and no LLM finding.
+        """
+        if self._escalation_queue is None or self.filtered_task_tree is None:
+            return
+        active_tasks = self.filtered_task_tree.active_tasks
+        now = datetime.now(UTC)
+        gate_stalled = extract_stalled_gate_backlog_task_ids(active_tasks, now=now)
+        report.stats['stage1_gate_backlog_stalled'] = len(gate_stalled)
+        if not gate_stalled:
+            report.stats['stage1_gate_backlog_escalated'] = 0
+            return
+        task_by_id = {str(t.get('id')): t for t in active_tasks if t.get('id') is not None}
+        gate_escalated = await maybe_escalate_stalled_gate_backlog(
+            escalation_queue=self._escalation_queue,
+            project_id=self.project_id,
+            run_id=run_id,
+            stalled_task_ids=gate_stalled,
+            task_by_id=task_by_id,
+            now=now,
+        )
+        report.stats['stage1_gate_backlog_escalated'] = len(gate_escalated)
+
+    async def _run_graph_sweeps(self, report: StageReport, run_id: str) -> None:
+        """Run the three Graphiti sweeps: degenerate task nodes, stale status snapshots, stale priority overrides.
+
+        Each is best-effort, and a sweep that raised publishes none of its
+        stats. Absent is honest there, where a False ``enumeration_complete``
+        would claim a corpus was observed and found incomplete.
+        """
         terminal_ids = extract_terminal_task_ids(self.filtered_task_tree)
         if terminal_ids:
-            try:
-                sweep_stats = await sweep_degenerate_task_nodes(
-                    self.memory, self.project_id, terminal_ids,
-                )
-            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-                raise
-            except Exception:
-                logger.exception(
-                    'reconciliation.degenerate_task_node_sweep_failed',
-                    extra={
-                        'project_id': self.project_id,
-                        'run_id': run_id,
-                        'terminal_id_count': len(terminal_ids),
-                    },
-                )
-            else:
-                report.stats['degenerate_task_nodes_swept'] = sweep_stats['deleted']
-                report.stats['degenerate_task_nodes_scanned'] = sweep_stats['scanned']
-
-        # ── Stale task-status snapshot edge sweep (tasks 2613, 3037) ──────────
-        # Invalidate VALID (invalid_at IS NULL) task-status-snapshot Graphiti
-        # edges whose asserted status is now contradicted, via a deterministic
-        # direct-lookup sweep (never semantic search). Two selection rules:
-        #   - the TERMINAL rule (task 2613): an asserted active/pending/
-        #     in-progress status contradicted by a terminal (done/cancelled)
-        #     task;
-        #   - the BLOCKED-ASSERTION rule (task 3037): an asserted BLOCKED
-        #     status contradicted by ANY other positively-known status —
-        #     'pending', 'in-progress', 'review', … — not merely a terminal
-        #     one. Without it a blocked->pending unblock left 'Task N remains
-        #     blocked' asserted as current until the task eventually reached
-        #     done, which is most of a task's life.
-        # Second half of the blocked rule's deterministic step: after each
-        # successful blocked-rule invalidation the sweep writes ONE superseding
-        # resulting-state-only temporal_fact per contradicted task per cycle,
-        # so the graph records what replaced the retired assertion instead of
-        # merely losing it — surfaced here as stale_blocked_edges_superseded.
-        # Its two failure modes are surfaced beside it rather than left to the
-        # log: a bare superseded=0 cannot distinguish "no blocked edge needed
-        # superseding this cycle" from "every superseding write failed" or
-        # "the per-cycle write ceiling truncated them" — the same
-        # 0-vs-N ambiguity this task was filed against.  (amendment,
-        # reviewer_comprehensive observability finding)
-        # The enumeration-completeness pair is surfaced for the SAME reason
-        # and by the same argument (task 4386): a bare _scanned/_invalidated
-        # pair cannot distinguish a clean cycle over the WHOLE corpus from a
-        # clean cycle over whatever part of it could be fetched.  When
-        # `..._enumeration_complete` is not True, this cycle's counts describe
-        # a partial corpus and its absences are not evidence;
-        # `..._enumeration_incomplete_kind` names which way it was partial.
-        # Two additions, one pattern — 0-vs-N ambiguities resolved in the
-        # stats rather than left for a reader to reconstruct from logs.
-        # The `_candidates`/`_errors` pair closes the last one (task 4851):
-        # `_invalidated` alone cannot tell "nothing was stale" from "every
-        # invalidation failed".
-        # Best-effort: a sweep failure must never abort the stage or leave a
-        # partial/incorrect stat — it is logged and swallowed, and NONE of
-        # these stats is set for this cycle.  That includes the enumeration
-        # pair: ABSENT is honest for a sweep that raised, where False would
-        # claim a corpus was observed and found incomplete.
-        try:
-            snapshot_sweep_stats = await sweep_stale_status_snapshot_edges(
-                self.memory, self.taskmaster, self.project_id, self.project_root,
+            _publish_sweep_stats(report, _DEGENERATE_SWEEP_STATS, await _await_best_effort(
+                lambda: sweep_degenerate_task_nodes(self.memory, self.project_id, terminal_ids),
+                event='reconciliation.degenerate_task_node_sweep_failed',
+                project_id=self.project_id,
                 run_id=run_id,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception:
-            logger.exception(
-                'reconciliation.stale_status_snapshot_edge_sweep_failed',
-                extra={
-                    'project_id': self.project_id,
-                    'run_id': run_id,
-                },
-            )
-        else:
-            report.stats['stale_status_snapshot_edges_invalidated'] = (
-                snapshot_sweep_stats['invalidated']
-            )
-            report.stats['stale_status_snapshot_edges_scanned'] = (
-                snapshot_sweep_stats['scanned']
-            )
-            report.stats['stale_status_snapshot_edges_candidates'] = (
-                snapshot_sweep_stats['candidate_edges']
-            )
-            report.stats['stale_status_snapshot_edges_errors'] = (
-                snapshot_sweep_stats['errors']
-            )
-            report.stats['stale_blocked_edges_superseded'] = (
-                snapshot_sweep_stats['superseded']
-            )
-            report.stats['stale_blocked_edges_supersede_errors'] = (
-                snapshot_sweep_stats['supersede_errors']
-            )
-            report.stats['stale_blocked_edges_supersede_skipped'] = (
-                snapshot_sweep_stats['supersede_skipped']
-            )
-            report.stats[STATUS_SNAPSHOT_ENUMERATION_COMPLETE_STAT_KEY] = (
-                snapshot_sweep_stats['enumeration_complete']
-            )
-            report.stats[STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY] = (
-                snapshot_sweep_stats['enumeration_incomplete_kind']
-            )
-
-        # ── Stale priority-override / pin-queue edge sweep (task 2781) ─────────
-        # Invalidate VALID (invalid_at IS NULL) priority-override / pin-queue
-        # Graphiti edges whose task is absent from live scheduler-override state
-        # (override consumed by dispatch/clear_terminal or expired-and-cleared by
-        # clear_expired) or whose TTL edge's live ttl_until has elapsed, via a
-        # deterministic direct-lookup sweep beside the task 2613 sweep above.
-        # Carries the same enumeration-completeness pair as the task 2613
-        # sweep above, under its own prefix and from its own read: the two key
-        # sets are INDEPENDENT, so a truncated corpus for one sweep never
-        # marks the other.  Same meaning in both places — not True means this
-        # cycle's counts describe whatever corpus could be fetched.  (4386)
-        # Best-effort: a sweep failure must never abort the stage or leave a
-        # partial/incorrect stat — it is logged and swallowed, and no
-        # stale_priority_override_edges_* stat is set for this cycle.
-        try:
-            priority_override_sweep_stats = await sweep_stale_priority_override_edges(
-                self.memory, self.project_id, self.project_root,
-                run_id=run_id,
-            )
-        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-            raise
-        except Exception:
-            logger.exception(
-                'reconciliation.stale_priority_override_edge_sweep_failed',
-                extra={
-                    'project_id': self.project_id,
-                    'run_id': run_id,
-                },
-            )
-        else:
-            report.stats['stale_priority_override_edges_invalidated'] = (
-                priority_override_sweep_stats['invalidated']
-            )
-            report.stats['stale_priority_override_edges_scanned'] = (
-                priority_override_sweep_stats['scanned']
-            )
-            report.stats[PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY] = (
-                priority_override_sweep_stats['enumeration_complete']
-            )
-            report.stats[PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY] = (
-                priority_override_sweep_stats['enumeration_incomplete_kind']
-            )
-
-        # ── Deterministic per-cycle summary write (task 2229 W5-λ) ────────────
-        # Python writes the authoritative cycle_summary ledger row directly
-        # from `report` — no LLM turn, no nonce, no verify/reconstruct
-        # self-heal (all retired by this task; see
-        # summary_pool.write_cycle_summary). Mirrors Stage 2's identical
-        # wiring in task_knowledge_sync.py. Only reached on full
-        # (non-remediation) cycles — the remediation payload
-        # (_assemble_remediation_payload) never asked for a cycle_summary
-        # under the old LLM-driven mechanism either, so writing one here would
-        # fabricate a spurious summary every remediation pass. The stat set
-        # below overwrites the `= 0` default assigned before the
-        # remediation early-return above.
-        ledger_written = await write_stage1_cycle_summary(
-            self.memory, self.project_id, report, run_id,
-        )
-        # Reflects the ledger upsert only — see the "_ledger_written" naming
-        # note above the `= 0` default earlier in this method.
-        report.stats['stage1_cycle_summary_ledger_written'] = 1 if ledger_written else 0
-
-        return report
+                terminal_id_count=len(terminal_ids),
+            ))
+        _publish_sweep_stats(report, _STATUS_SNAPSHOT_SWEEP_STATS, await _await_best_effort(
+            lambda: sweep_stale_status_snapshot_edges(
+                self.memory, self.taskmaster, self.project_id, self.project_root, run_id=run_id,
+            ),
+            event='reconciliation.stale_status_snapshot_edge_sweep_failed',
+            project_id=self.project_id,
+            run_id=run_id,
+        ))
+        _publish_sweep_stats(report, _PRIORITY_OVERRIDE_SWEEP_STATS, await _await_best_effort(
+            lambda: sweep_stale_priority_override_edges(
+                self.memory, self.project_id, self.project_root, run_id=run_id,
+            ),
+            event='reconciliation.stale_priority_override_edge_sweep_failed',
+            project_id=self.project_id,
+            run_id=run_id,
+        ))
 
     async def _account_suppression_streaks(
         self,
@@ -1484,17 +808,17 @@ class MemoryConsolidator(BaseStage):
         never files.
 
         It runs on EVERY full cycle, zero-flag ones included, which is why
-        run() calls it after the ``if report.items_flagged:`` block rather than
-        beside Hook A inside it.  A cycle that flagged nothing is one in which
-        no decision drained anything, so it must reset every streak; skipping it
-        would let a decision suppressing on alternate cycles reach K with gaps
-        in between.  On such a cycle *esd_result* is the pre-bound empty batch.
+        run() calls it after the flag chain rather than from inside it.  A
+        cycle that flagged nothing is one in which no decision drained
+        anything, so it must reset every streak; skipping it would let a
+        decision suppressing on alternate cycles reach K with gaps in between.
+        On such a cycle *esd_result* is the empty batch _run_flag_chain returns.
 
         The state update sits outside the escalation-queue gate so the streak is
         already real when a queue is wired; only the filing needs the queue.
         Both callees are best-effort and never raise.  The updater's per-cycle
-        cutoff is the N run() hands the per-cycle escape, so a cycle that
-        escape reported is never counted a second time.
+        cutoff is the N that _escalate_suppression_storm hands the per-cycle
+        escape, so a cycle that escape reported is never counted a second time.
         """
         updates = await update_suppression_streaks(
             memory_service=self.memory,
@@ -1531,14 +855,14 @@ class MemoryConsolidator(BaseStage):
     ) -> list[dict]:
         """Return the subset of *records* strictly newer than *watermark*.
 
-        Parses each record's raw timestamp exactly once via ``_parse_instant``
+        Parses each record's raw timestamp exactly once via ``parse_instant``
         and compares it against *watermark* normalized to UTC exactly once per
         call (hoisted out of the loop as ``wm_utc``) — the same two steps
-        ``_is_newer_than_watermark`` (task 4574) performs per call, inlined
-        here so a record's timestamp is never parsed twice and the watermark
-        is never re-normalized per record. ``_is_newer_than_watermark`` stays
-        the public, independently unit-tested predicate for external callers;
-        this method does not call it.
+        ``stage1_payload_format.py::is_newer_than_watermark`` (task 4574)
+        performs per call, inlined here so a record's timestamp is never
+        parsed twice and the watermark is never re-normalized per record.
+        This method does not call that predicate: it needs the parsed instant
+        itself to tell an undatable record from an older one.
 
         ALSO classifies and counts the "undatable" case here at the call
         site: a record whose timestamp is missing, empty, or unparseable. An
@@ -1559,11 +883,11 @@ class MemoryConsolidator(BaseStage):
         lets the caller apply the mem0-only ``created_at`` -> ``updated_at``
         fallback without duplicating this method per record shape.
         """
-        wm_utc = _to_utc(watermark)
+        wm_utc = to_utc(watermark)
         new_records = []
         for record in records:
             raw_ts = get_raw_ts(record)
-            ts = _parse_instant(raw_ts)
+            ts = parse_instant(raw_ts)
             if ts is None:
                 self._undatable_freshness_records += 1
                 logger.warning(
@@ -1627,7 +951,7 @@ class MemoryConsolidator(BaseStage):
             self._fetch_degraded_sources.append('episodes')
         new_episodes = episodes
         if watermark.last_episode_timestamp:
-            # WHY _is_newer_than_watermark and not `str(watermark...) > str(...)`:
+            # WHY an instant comparison and not `str(watermark...) > str(...)`:
             # str(datetime) renders with a space separator
             # ('2026-08-20 12:00:00+00:00'), while e['created_at'] here comes
             # from services/memory_service.py::_created_at_to_utc_iso as
@@ -1689,7 +1013,7 @@ class MemoryConsolidator(BaseStage):
         status = await self._fetch_status()
 
         # 4. Events summary
-        event_summary = _format_events(events)
+        event_summary = format_events(events)
 
         # 5. Prior S3 findings (backstop from last completed run)
         prior_s3_section = ''
@@ -1698,7 +1022,7 @@ class MemoryConsolidator(BaseStage):
                 f'\n### Prior Stage 3 Findings ({len(self.prior_s3_findings)})\n'
                 f'These issues were found in the last integrity check and should be addressed '
                 f'during this consolidation pass if possible.\n'
-                f'{_format_findings(self.prior_s3_findings)}\n'
+                f'{format_findings(self.prior_s3_findings)}\n'
             )
 
         # 6. Cycle fence section
@@ -1722,17 +1046,17 @@ class MemoryConsolidator(BaseStage):
         overreach_flags_section = render_overreach_flags_section(self.overreach_flags)
 
         # 8. Format
-        episodes_str, ep_n = _format_episodes(new_episodes)
-        memories_str, mem_n = _format_memories(new_memories)
+        episodes_str, ep_n = format_episodes(new_episodes)
+        memories_str, mem_n = format_memories(new_memories)
         self._entity_summary_snapshot_lines_stripped = ep_n + mem_n
         # Episodes arrive newest-first (undatable last), so one the watermark filter
         # dropped proves nothing newer lay past the cap. mem0's get_all scrolls in
         # point-id order, which proves nothing, so its note rests on the count alone.
         if len(new_episodes) == len(episodes):
-            episodes_str = _append_note(episodes_str, fetch_cap_note(
+            episodes_str = append_note(episodes_str, fetch_cap_note(
                 fetched=len(episodes), noun='episode(s)', cap_name='episode_limit', cap=self.episode_limit,
             ))
-        memories_str = _append_note(memories_str, fetch_cap_note(
+        memories_str = append_note(memories_str, fetch_cap_note(
             fetched=len(mem0_memories), noun='memory record(s)', cap_name='memory_limit',
             cap=self.memory_limit,
         ))
@@ -1753,7 +1077,7 @@ class MemoryConsolidator(BaseStage):
 {json.dumps(status, indent=2, default=str)}
 
 ### Previous Reconciliation
-{_format_watermark(watermark, include_freshness_cutoffs=True)}
+{format_watermark(watermark, include_freshness_cutoffs=True)}
 {prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{overreach_flags_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
@@ -1791,6 +1115,8 @@ Review the above data and perform memory consolidation:
         # assemble_payload's line-262 reset is bypassed by the early return at lines 250-251.
         # Reset here so each assembled-path call starts clean (no leak from a prior run).
         self._fetch_degraded_sources = []
+        if ap.context_fetch_failures:
+            self._fetch_degraded_sources.append('event_context')
         # This path does no freshness filtering (it formats ContextAssembler output
         # directly, not the episodes/mem0-memories filters below), so the count stays
         # 0 here — but reset it anyway so a reused instance never inherits a stale
@@ -1799,7 +1125,7 @@ Review the above data and perform memory consolidation:
         self._undatable_freshness_records = 0
         self._unfinished_graphiti_write_start = None
 
-        event_summary = _format_events(ap.events)
+        event_summary = format_events(ap.events)
         deferred_events_note = clip_note(
             omitted=ap.events_remaining,
             omitted_noun='buffered event(s)',
@@ -1807,7 +1133,7 @@ Review the above data and perform memory consolidation:
             cap=ap.token_budget,
             dropped_first='the newest events (still buffered for a later chunk)',
         )
-        event_summary = _append_note(event_summary, deferred_events_note)
+        event_summary = append_note(event_summary, deferred_events_note)
 
         # Store status (cheap fetch, always useful)
         status = await self._fetch_status()
@@ -1819,7 +1145,7 @@ Review the above data and perform memory consolidation:
                 f'\n### Prior Stage 3 Findings ({len(self.prior_s3_findings)})\n'
                 f'These issues were found in the last integrity check and should be addressed '
                 f'during this consolidation pass if possible.\n'
-                f'{_format_findings(self.prior_s3_findings)}\n'
+                f'{format_findings(self.prior_s3_findings)}\n'
             )
 
         # Cycle fence
@@ -1842,8 +1168,9 @@ Review the above data and perform memory consolidation:
         # Overreach shadow flags (design.md §6.1 O4, task 6137)
         overreach_flags_section = render_overreach_flags_section(self.overreach_flags)
 
-        ctx_str, ctx_n = _format_context_items(ap.context_items)
+        ctx_str, ctx_n = format_context_items(ap.context_items)
         self._entity_summary_snapshot_lines_stripped = ctx_n
+        ctx_str = append_note(ctx_str, format_context_fetch_failures(ap.context_fetch_failures))
 
         return f"""## Reconciliation Run — Stage 1: Memory Consolidation
 ## Project: {self.project_id}
@@ -1858,7 +1185,7 @@ Review the above data and perform memory consolidation:
 {json.dumps(status, indent=2, default=str)}
 
 ### Previous Reconciliation
-{_format_watermark(watermark)}
+{format_watermark(watermark)}
 {prior_s3_section}{cycle_fence_section}{task_tree_section}{task_count_census_section}{overreach_flags_section}{await self._render_required_sections()}
 ## Your Task
 Review the above data and perform memory consolidation:
@@ -1997,7 +1324,7 @@ Review the above data and perform memory consolidation:
 ## Project: {self.project_id}
 
 ### Actionable Findings to Remediate ({len(findings)})
-{_format_findings(findings)}{await self._render_required_sections()}
+{format_findings(findings)}{await self._render_required_sections()}
 
 ## Your Task
 This is a focused remediation run. Address ONLY the specific findings listed above:
@@ -2010,293 +1337,34 @@ This is a focused remediation run. Address ONLY the specific findings listed abo
 """
 
 
-def _marker_signatures(
-    flags: Iterable[dict[str, Any]], *, project_id: str
-) -> set[tuple[str, str]]:
-    """The ``stage1_flag_marker`` identities of *flags*, so every diff in
-    :meth:`MemoryConsolidator.run` compares keys from one identity space."""
-    return {
-        sig for f in flags
-        if (sig := compute_marker_signature(f, project_id=project_id)) is not None
-    }
+async def _await_best_effort(
+    make: Callable[[], Awaitable[_T]],
+    *,
+    event: str,
+    project_id: str,
+    run_id: str,
+    **extra: Any,
+) -> _T | None:
+    """Await ``make()``; on an Exception, log *event* with its extras and return None.
 
-
-def _to_utc(dt: datetime) -> datetime:
-    """Coerce *dt* to a tz-aware UTC datetime, assuming UTC when naive.
-
-    Shared normalization step for both sides of ``_is_newer_than_watermark``'s
-    comparison, mirroring ``backends/graphiti_client.py::_as_sortable_utc``'s
-    "naive means UTC" convention for its sort key.
+    *make* is called inside the try, so building the call's arguments is
+    guarded too. Cancellation is not an Exception, so it propagates.
     """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC)
-
-
-def _parse_instant(raw_ts: str | None) -> datetime | None:
-    """Parse *raw_ts* into a tz-aware UTC datetime, or None if it is
-    missing, empty, or unparseable ("undatable" — see
-    ``_is_newer_than_watermark`` and ``MemoryConsolidator._filter_records_newer_than_watermark``,
-    which count and log this case rather than silently dropping it).
-
-    Catches both ``ValueError`` (malformed ISO-8601 text) and ``TypeError``
-    (a non-str, non-None value such as a ``datetime``, an int epoch, or a
-    dict — ``datetime.fromisoformat`` raises ``TypeError`` rather than
-    ``ValueError`` for these) so one malformed record is classified as
-    undatable rather than raising out of the caller's filter loop.
-    """
-    if not raw_ts:
-        return None
     try:
-        ts = datetime.fromisoformat(raw_ts)
-    except (TypeError, ValueError):
+        return await make()
+    except Exception:
+        logger.exception(event, extra={'project_id': project_id, 'run_id': run_id, **extra})
         return None
-    return _to_utc(ts)
 
 
-def _is_newer_than_watermark(raw_ts: str | None, watermark: datetime) -> bool:
-    """True iff *raw_ts* is a parseable instant STRICTLY after *watermark*.
-
-    Both sides are compared as instants, never as strings: *raw_ts* is
-    parsed with ``datetime.fromisoformat`` and *watermark* is taken as
-    given, then each is coerced to a tz-aware UTC datetime — naive
-    (tzinfo-less) values on EITHER side are assumed to already be UTC
-    rather than raising on naive-vs-aware comparison, mirroring
-    ``backends/graphiti_client.py::_as_sortable_utc`` — before comparing
-    with ``>`` (strictly after, not ``>=``, so an instant exactly equal to
-    *watermark* is not re-surfaced). A non-UTC offset is therefore compared
-    correctly by its true instant, not by its printed digits.
-
-    Comparing these values as STRINGS is wrong: ``str(datetime)`` renders
-    with a space separator (``'2026-08-20 12:00:00+00:00'``) while
-    ``created_at`` values produced by
-    ``services/memory_service.py::_created_at_to_utc_iso`` use ``T``
-    (``'2026-08-20T01:52:27+00:00'``) — a lexical ``>`` then short-circuits
-    at the separator and degenerates to date-granularity (task 4574).
-
-    *raw_ts* that is missing, empty, or unparseable returns False — an
-    undatable record cannot be shown to be newer than the watermark, so it
-    is treated as not-newer rather than raising.
-    """
-    ts = _parse_instant(raw_ts)
-    if ts is None:
-        return False
-    return ts > _to_utc(watermark)
+def _zeroed(stat_map: _StatMap) -> dict[str, int]:
+    return dict.fromkeys((stat_key for stat_key, _ in stat_map), 0)
 
 
-def _format_events(events: list[ReconciliationEvent]) -> str:
-    if not events:
-        return 'No events.'
-    lines = []
-    for e in events:
-        lines.append(f'- [{e.type.value}] {e.timestamp.isoformat()}: {json.dumps(e.payload)}')
-    return '\n'.join(lines)
-
-
-def _append_note(body: str, note: str) -> str:
-    return f'{body}\n\n{note}' if note else body
-
-
-def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
-    if not episodes:
-        return 'No new episodes.', 0
-    lines = []
-    total_stripped = 0
-    for ep in episodes:
-        raw = ep.get('content') or ''
-        cleaned, n = strip_snapshot_lines(raw)
-        total_stripped += n
-        content = elide_text(cleaned, _RECORD_BODY_CHARS, field='content').text
-        lines.append(f'- [{ep.get("uuid", "?")}] {ep.get("created_at", "?")}: {content}')
-    return '\n'.join(lines), total_stripped
-
-
-def _parent_link(meta: Mapping[str, Any]) -> str:
-    """Render a child's parent link for prompts/stage1.py::CHILD_MEMORY_AUTHORITY_RULE."""
-    parent_id = _parent_id_in_meta(meta)
-    if parent_id is None:
-        return ''
-    return f' {PARENT_ID_KEY}={parent_id} kind={meta["kind"]}'
-
-
-def _format_memories(memories: list[dict]) -> tuple[str, int]:
-    if not memories:
-        return 'No memories.', 0
-    lines = []
-    total_stripped = 0
-    for m in memories:
-        raw = m.get('memory') or ''
-        cleaned, n = strip_snapshot_lines(raw)
-        total_stripped += n
-        content = elide_text(cleaned, _RECORD_BODY_CHARS, field='content').text
-        meta = m.get('metadata', {}) or {}
-        cat = meta.get('category', '?')
-        lines.append(f'- [{m.get("id", "?")}]{_parent_link(meta)} ({cat}): {content}')
-    return '\n'.join(lines), total_stripped
-
-
-def _format_context_items(items: dict[str, ContextItem]) -> tuple[str, int]:
-    """Format context items grouped by source, stripping count-snapshot lines."""
-    if not items:
-        return 'No related context.', 0
-    by_source: dict[str, list[ContextItem]] = {}
-    for item in items.values():
-        by_source.setdefault(item.source, []).append(item)
-    sections = []
-    total_stripped = 0
-    for source, source_items in sorted(by_source.items()):
-        sections.append(f'**{source}** ({len(source_items)})')
-        for item in source_items:
-            cleaned, n = strip_snapshot_lines(item.formatted)
-            total_stripped += n
-            sections.append(cleaned)
-    return '\n'.join(sections), total_stripped
-
-
-def _format_findings(findings: list[dict]) -> str:
-    """Render a list of finding dicts as a human-readable string.
-
-    Each finding is formatted with its header fields (description, severity,
-    category, suggested_action) followed by the four typed citation lists
-    (cited_entities, cited_edges, cited_tasks, cited_memories) from PRD §9.3,
-    then the dangling-citation line naming the repair ids when the finding
-    carries that handoff record (task 5749).
-    Empty citation lists are omitted from output.
-
-    Rendering limits (reviewer finding incomplete_rendering):
-    - Each citation list is capped at 5 entries (``... +N more`` appended).
-    - ``fact_text_snapshot`` is truncated at 120 characters to avoid inflating
-      payload size when feeding findings into the next reconciliation context.
-    - cited_tasks includes the task title so downstream consumers can read
-      findings without re-fetching tasks.
-    """
-    _CITE_CAP = 5
-    _SNAPSHOT_CAP = 120
-    # Caps for LLM-controlled free-text fields (reviewer finding incomplete_rendering):
-    # without a cap, verbose descriptions from a handful of findings can dominate
-    # the downstream stage payload and swamp per-citation limits.
-    _DESC_CAP = 500
-    _ACTION_CAP = 500
-
-    if not findings:
-        return 'No findings.'
-    lines = []
-    for i, f in enumerate(findings, 1):
-        desc = f.get('description', '?')
-        severity = f.get('severity', '?')
-        category = f.get('category', '?')
-        action = f.get('suggested_action', '?')
-
-        if len(desc) > _DESC_CAP:
-            desc = desc[:_DESC_CAP] + '...'
-        if len(action) > _ACTION_CAP:
-            action = action[:_ACTION_CAP] + '...'
-
-        parts = [
-            f'{i}. [{severity}/{category}] {desc}',
-            f'   Suggested action: {action}',
-        ]
-
-        cited_entities = f.get('cited_entities') or []
-        if cited_entities:
-            shown = cited_entities[:_CITE_CAP]
-            entity_strs = ', '.join(
-                f"{e.get('canonical_name', '?')} ({e.get('entity_uuid', '?')})"
-                for e in shown
-            )
-            extra = len(cited_entities) - len(shown)
-            if extra:
-                entity_strs += f', ... +{extra} more'
-                logger.debug('_format_findings: finding %d cited_entities truncated (%d dropped)', i, extra)
-            parts.append(f'   Cited entities: {entity_strs}')
-
-        cited_edges = f.get('cited_edges') or []
-        if cited_edges:
-            shown = cited_edges[:_CITE_CAP]
-            edge_parts = []
-            for e in shown:
-                snapshot = e.get('fact_text_snapshot', '?')
-                if len(snapshot) > _SNAPSHOT_CAP:
-                    snapshot = snapshot[:_SNAPSHOT_CAP] + '...'
-                edge_parts.append(f"{e.get('edge_uuid', '?')}: {snapshot}")
-            edge_strs = ', '.join(edge_parts)
-            extra = len(cited_edges) - len(shown)
-            if extra:
-                edge_strs += f', ... +{extra} more'
-                logger.debug('_format_findings: finding %d cited_edges truncated (%d dropped)', i, extra)
-            parts.append(f'   Cited edges: {edge_strs}')
-
-        cited_tasks = f.get('cited_tasks') or []
-        if cited_tasks:
-            shown = cited_tasks[:_CITE_CAP]
-            task_strs = ', '.join(
-                f"{t.get('project_id', '?')}/{t.get('task_id', '?')} ({t.get('title', '?')})"
-                for t in shown
-            )
-            extra = len(cited_tasks) - len(shown)
-            if extra:
-                task_strs += f', ... +{extra} more'
-                logger.debug('_format_findings: finding %d cited_tasks truncated (%d dropped)', i, extra)
-            parts.append(f'   Cited tasks: {task_strs}')
-
-        cited_memories = f.get('cited_memories') or []
-        if cited_memories:
-            shown = cited_memories[:_CITE_CAP]
-            memory_strs = ', '.join(
-                f"{m.get('memory_id', '?')} ({m.get('store', '?')})"
-                for m in shown
-            )
-            extra = len(cited_memories) - len(shown)
-            if extra:
-                memory_strs += f', ... +{extra} more'
-                logger.debug('_format_findings: finding %d cited_memories truncated (%d dropped)', i, extra)
-            parts.append(f'   Cited memories: {memory_strs}')
-
-        line = render_dangling_citation_line(f)
-        if line is not None:
-            parts.append(f'   {line}')
-
-        lines.append('\n'.join(parts))
-    return '\n'.join(lines)
-
-
-def _format_watermark(watermark: Watermark, *, include_freshness_cutoffs: bool = False) -> str:
-    """Render the "Previous Reconciliation" section.
-
-    *include_freshness_cutoffs* must be True ONLY from the caller that
-    actually ran the episode/mem0 "new since last reconciliation" filters
-    against these cutoffs — today that is exclusively the time-windowed
-    ``assemble_payload`` path. ``_format_assembled_payload`` (the
-    ContextAssembler/token-budget path) does no freshness filtering at all
-    and formats ``### Related Context`` instead of a filtered episode/mem0
-    count, so it leaves this False (the default): showing the cutoffs there
-    would claim a relationship to the displayed items that does not exist
-    (task 4574 review amendment).
-    """
-    if watermark.last_full_run_completed is None:
-        return 'First run — no previous reconciliation.'
-    lines = [
-        f'Last full run: {watermark.last_full_run_id} '
-        f'at {watermark.last_full_run_completed.isoformat()}'
-    ]
-    if include_freshness_cutoffs:
-        # Disclose the freshness cutoffs the episode/mem0 "new since last
-        # reconciliation" filters above actually compared against (task 4574).
-        # Previously invisible here — the payload showed a filtered COUNT
-        # ("New Episodes Since Last Reconciliation (N)") with no way to see
-        # what cursor N was computed against, which is why the 894fbe90
-        # incident survived three full cycles of re-investigation undiagnosed.
-        # Rendered via .isoformat() (never str(datetime), which uses a space
-        # separator — see _is_newer_than_watermark) and omitted entirely
-        # (rather than printed as the literal 'None') when unset, e.g. on a
-        # watermark that has a completed full run but has not yet recorded an
-        # episode or memory cutoff.
-        if watermark.last_episode_timestamp is not None:
-            lines.append(
-                f'Episode freshness cutoff: {watermark.last_episode_timestamp.isoformat()}'
-            )
-        if watermark.last_memory_timestamp is not None:
-            lines.append(
-                f'Mem0 memory freshness cutoff: {watermark.last_memory_timestamp.isoformat()}'
-            )
-    return '\n'.join(lines)
+def _publish_sweep_stats(
+    report: StageReport, stat_map: _StatMap, sweep_result: Mapping[str, Any] | None,
+) -> None:
+    """Copy *sweep_result*'s counts into the report; a sweep that failed (None) publishes none."""
+    if sweep_result is None:
+        return
+    report.stats.update({stat_key: sweep_result[result_key] for stat_key, result_key in stat_map})

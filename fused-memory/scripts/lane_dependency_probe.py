@@ -5,6 +5,9 @@ exit ``OUTAGE_EXIT_STATUS`` after printing ONE stdout line ``<dependency>: <step
 dependency that is not usable; the line is built from a fixed vocabulary so that it is identical on every
 run of the same outage. Diagnostics go to stderr, never a traceback.
 
+FalkorDB is checked on the scratch server the integration tests use (FALKOR_HOST/FALKOR_PORT), never on
+production: the check writes a graph. A FALKOR_* aimed at production is a broken probe, not an outage.
+
 Usage: ``python scripts/lane_dependency_probe.py [dependency ...]`` from ``fused-memory/``; naming
 dependencies checks only those, always in canonical order.
 """
@@ -35,6 +38,11 @@ from shared.lane_probe import OUTAGE_EXIT_STATUS
 
 from fused_memory.arm_harness.checks import SMOKE_MESSAGES, SmokeEntities
 from fused_memory.backends.graphiti_client import build_embedder, build_llm_client
+from fused_memory.config.falkordb_endpoints import (
+    FalkorEndpoint,
+    scratch_falkordb_from_env,
+    with_falkordb,
+)
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.utils.store_mutation_preflight import (
     StoreMutationUnavailable,
@@ -210,6 +218,11 @@ async def first_failure(dependencies: Sequence[str], cfg: FusedMemoryConfig) -> 
     return None
 
 
+def probe_config(cfg: FusedMemoryConfig, scratch: FalkorEndpoint) -> FusedMemoryConfig:
+    """*cfg* with its FalkorDB replaced by the scratch server, which has no password."""
+    return with_falkordb(cfg, scratch)
+
+
 def build_parser() -> LoudArgumentParser:
     parser = LoudArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument(
@@ -234,7 +247,12 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:
         print(f'error: config did not load: {type(error).__name__}', file=sys.stderr)
         return BROKEN_CONFIG_EXIT_STATUS
-    failure = asyncio.run(first_failure(selected, cfg))
+    try:
+        scratch = scratch_falkordb_from_env()
+    except RuntimeError as error:
+        print(f'error: {error}', file=sys.stderr)
+        return BROKEN_CONFIG_EXIT_STATUS
+    failure = asyncio.run(first_failure(selected, probe_config(cfg, scratch)))
     if failure is None:
         return 0
     print(failure.line)

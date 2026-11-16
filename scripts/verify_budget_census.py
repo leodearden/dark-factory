@@ -43,15 +43,20 @@ so.
 from __future__ import annotations
 
 import argparse
+import functools
+import importlib
+import inspect
 import json
 import math
 import re
 import sys
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
+from types import ModuleType
 from typing import Any, TypeGuard
 
 import yaml
@@ -83,11 +88,21 @@ _RANGE_SEP = '..'
 DEFAULT_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WINDOW = '14d'
 
-# The budget family's home. Resolved off THIS FILE's location rather than
-# imported by bare name, because a bare `from module_budget_family import ...`
-# resolves only under pytest — tests/scripts/conftest.py is what puts that
-# directory on sys.path, and this script must also run as a plain CLI.
+# The home of the budget family and of the census records. Resolved off THIS
+# FILE's location rather than imported by bare name, because a bare
+# `import module_budget_family` resolves only under pytest —
+# tests/scripts/conftest.py is what puts that directory on sys.path, and this
+# script must also run as a plain CLI.
 _FAMILY_DIR = Path(__file__).resolve().parent.parent / 'tests' / 'scripts'
+_FAMILY_MODULE = 'module_budget_family'
+_RECORDS_MODULE = 'verify_budget_census_records'
+
+# The records table naming the modules the gate holds to D17's census floor,
+# looked up AND cited through this one name.
+RULED_TABLE = 'RULED_BUDGET_CENSUS'
+# The gate's table of measured worst runs, in
+# module_budget_family.FAMILY_READER_PATH.
+GATE_WORST_TABLE = 'MEASURED_MODULE_SUITE_WORST_SECS'
 
 # D17's refusal ceiling, restated here for the REPORT only. The gate that acts
 # on it is test_module_verify_budgets.py::CENSUS_FLOOR_REFUSAL_CEILING; this
@@ -95,11 +110,33 @@ _FAMILY_DIR = Path(__file__).resolve().parent.parent / 'tests' / 'scripts'
 # a FINDING without having to read the guard.
 REFUSAL_CEILING = 7200
 
-# The constant this census feeds, named in the report so an operator running it
-# knows where the number lands.
-FEEDS_CONSTANT = (
-    'tests/scripts/verify_budget_census_records.py::ORCHESTRATOR_BUDGET_CENSUS'
-)
+
+class FloorRule(StrEnum):
+    D17_CENSUS = 'd17_census'
+    MIN_BUDGET = 'min_budget'
+
+
+@dataclass(frozen=True)
+class Citation:
+    """Where the figure a module's floor derives from lives: ``path::symbol[key]``."""
+
+    path: str
+    symbol: str
+    key: str | None
+
+    def to_record(self) -> dict[str, str | None]:
+        return {'path': self.path, 'symbol': self.symbol, 'key': self.key}
+
+
+@dataclass(frozen=True)
+class GateFloorRule:
+    """The floor rule the budget guards apply to one module, and the report's note on it."""
+
+    rule: FloorRule
+    derive: Callable[[float], int]
+    refusal_ceiling: int | None
+    feeds: Citation
+    note_for: Callable[[int], str]
 
 
 @dataclass(frozen=True)
@@ -416,6 +453,11 @@ class Selection:
     rejected_records: dict[str, int]
 
 
+def module_yaml_path(prefix: str) -> Path:
+    """A module's own config, relative to the project root holding it."""
+    return Path(prefix) / 'orchestrator.yaml'
+
+
 def read_module_test_command(root: Path, prefix: str) -> str | None:
     """The ``test_command`` a module declares, read from its own yaml.
 
@@ -431,7 +473,7 @@ def read_module_test_command(root: Path, prefix: str) -> str | None:
     against every record in the corpus and reject them all, reporting ``n=0``,
     which reads exactly like "this module never ran the full suite".
     """
-    path = root / prefix / 'orchestrator.yaml'
+    path = root / module_yaml_path(prefix)
     try:
         data = yaml.safe_load(path.read_text(encoding='utf-8'))
     except (OSError, UnicodeDecodeError, yaml.YAMLError):
@@ -1160,7 +1202,7 @@ def build_report(
         'load_movement': load_movement(legs),
         'cold_separability': cold_separability(legs),
         'merge_gate': merge_gate_budget(roots[0]),
-        'budget_check': budget_check(summarise_legs(legs)),
+        'budget_check': budget_check(module, summarise_legs(legs)),
     }
 
 
@@ -1181,6 +1223,34 @@ def _format_row(name: str, row: dict[str, Any]) -> str:
         f"  {name:<14} {_format_series(row['durations'])}"
         f"  timed_out={row['timed_out']:<3} failed={row['failed']}"
     )
+
+
+_RULE_HEADERS: dict[str | None, str] = {
+    FloorRule.D17_CENSUS.value: 'ruling D17: 1.5x the measured max, rounded up to 100s',
+    FloorRule.MIN_BUDGET.value: 'min_budget: ~2x the measured max, rounded down to 100s',
+    None: 'rule UNAVAILABLE',
+}
+
+
+def _format_citation(feeds: dict[str, Any] | None) -> str:
+    if feeds is None:
+        return '<unavailable>'
+    key = '' if feeds['key'] is None else f"[{feeds['key']!r}]"
+    return f"{feeds['path']}::{feeds['symbol']}{key}"
+
+
+def _format_budget_check(check: dict[str, Any]) -> list[str]:
+    worst, floor, ceiling = check['measured_max'], check['derived_floor'], check['refusal_ceiling']
+    return [
+        '',
+        f"DERIVED BUDGET FLOOR ({_RULE_HEADERS[check['rule']]})",
+        f"  measured max   {'-' if worst is None else worst}",
+        f"  derived floor  {'<none>' if floor is None else floor}"
+        + ('' if ceiling is None else f'  (refusal ceiling {ceiling})'),
+        f"  feeds          {_format_citation(check['feeds'])}",
+        f"  provenance     {check['provenance']}",
+        f"  {check['note']}",
+    ]
 
 
 def format_report(report: dict[str, Any]) -> str:
@@ -1238,17 +1308,7 @@ def format_report(report: dict[str, Any]) -> str:
         lines += ['', 'BY DAY (UTC)']
         lines += [_format_row(day, row) for day, row in report['by_day'].items()]
 
-    check = report['budget_check']
-    lines += [
-        '',
-        'DERIVED BUDGET FLOOR (ruling D17: 1.5x the measured max, '
-        'rounded up to 100s)',
-        f"  measured max   {check['measured_max'] or '-'}",
-        f"  derived floor  {check['derived_floor'] or '<none>'}"
-        f"  (refusal ceiling {check['refusal_ceiling']})",
-        f"  feeds          {check['feeds']}",
-        f"  {check['note']}",
-    ]
+    lines += _format_budget_check(report['budget_check'])
 
     cold = report['cold_separability']
     lines += [
@@ -1348,91 +1408,141 @@ def main(argv: Sequence[str], now: datetime | None = None) -> int:
 
 
 
-def _census_budget_floor(worst: float) -> int | None:
-    """D17's derived floor for *worst*, via the budget family's ONE spelling.
-
-    Imported rather than re-spelled, so the floor this report PRINTS and the
-    floor ``test_module_verify_budgets``' excepted branch ASSERTS cannot drift
-    apart — an operator must be able to run this, read a number, and set the
-    budget to it without the gate disagreeing. This is the same property the
-    family's canonical-expression guard establishes for ``min_budget``.
-
-    Returns ``None`` when the family module cannot be located, and the report
-    says the derivation is UNAVAILABLE. Recomputing ``1.5 * worst`` here as a
-    fallback is the one thing this function must not do: a second spelling
-    would agree with the family today and drift silently the moment either
-    side changed, which is the whole failure the shared expression prevents.
-
-    Both halves are held up by executable guards in
-    tests/scripts/test_verify_budget_census.py. The delegation guards patch
-    ``module_budget_family.census_budget_floor`` to a sentinel and assert the
-    floor this report prints — in the JSON document and in the text rendering
-    alike — follows it, which a locally-spelled multiple could not; a third
-    makes the family unreachable and asserts the floor comes back ``None``
-    rather than a number the gate never agreed to. The import below sits after
-    the ``sys.path`` insertion it depends on, inside the function body, and
-    resolving that name at call time is also what makes the delegation
-    observable.
-    """
+def _import_from_family_dir(name: str) -> ModuleType | None:
+    """Import *name* from tests/scripts, or None. Never a local recomputation fallback."""
     if str(_FAMILY_DIR) not in sys.path:
         sys.path.insert(0, str(_FAMILY_DIR))
     try:
-        # Resolved by the sys.path insertion above, so pyright cannot see it.
-        # Suppressed at this single site rather than by widening the root
-        # extraPaths table: a static path entry would also claim a guarantee
-        # this function deliberately does not make — hence the ImportError arm.
-        from module_budget_family import (  # pyright: ignore[reportMissingImports]
-            census_budget_floor,
-        )
+        return importlib.import_module(name)
     except ImportError:
         return None
-    return census_budget_floor(worst)
 
 
-def budget_check(overall: dict[str, Any]) -> dict[str, Any]:
-    """The derived-floor section: what this distribution implies for a budget.
+def _checkout_relative(path: Path) -> str:
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(DEFAULT_PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(resolved)
 
-    ``derived_floor`` is ``None`` when there is no max to derive from — never a
-    ``0``, which would read as a derived answer — and when the family module is
-    unreachable, which is reported as its own state.
+
+def gate_floor_rule(module: str) -> GateFloorRule | None:
+    """The floor rule the budget guards hold *module* to.
+
+    tests/scripts/test_module_verify_budgets.py holds the ruled modules and the
+    rest of its table; each ``published_pairs()`` module is held by its own
+    sibling publisher, which ``feeds`` names.
+
+    ``None`` only when either tests/scripts module cannot be imported, as from a
+    partial checkout: without both, the rule is unknowable, so none is assumed.
+    A module that imports but no longer publishes a name read here is a code
+    defect, not a partial checkout, and raises.
     """
-    worst = overall['durations']['max']
-    floor = None if worst is None else _census_budget_floor(worst)
-    if worst is None:
-        note = (
-            'No full-suite run in this window, so no floor is derived. This is '
-            'NOT a floor of zero.'
+    family = _import_from_family_dir(_FAMILY_MODULE)
+    records = _import_from_family_dir(_RECORDS_MODULE)
+    if family is None or records is None:
+        return None
+    if module in getattr(records, RULED_TABLE):
+        return GateFloorRule(
+            rule=FloorRule.D17_CENSUS,
+            derive=family.census_budget_floor,
+            refusal_ceiling=REFUSAL_CEILING,
+            feeds=Citation(_checkout_relative(Path(inspect.getfile(records))), RULED_TABLE, module),
+            note_for=functools.partial(_refusal_ceiling_note, ceiling=REFUSAL_CEILING),
         )
-    elif floor is None:
-        note = (
-            f'Derivation UNAVAILABLE: could not import census_budget_floor from '
-            f'{_FAMILY_DIR}. Deliberately NOT recomputed locally — a second '
-            f'spelling would agree today and drift later. Run this from a full '
-            f'checkout to get the floor.'
+    publisher = family.published_pairs().get(module)
+    if publisher is not None:
+        return GateFloorRule(
+            rule=FloorRule.MIN_BUDGET,
+            derive=family.min_budget,
+            refusal_ceiling=None,
+            feeds=Citation(_checkout_relative(publisher.path), family.WORST_NAME, None),
+            note_for=lambda _floor: _MIN_BUDGET_NOTE,
         )
-    elif floor > REFUSAL_CEILING:
-        note = (
-            f'The derived floor {floor}s EXCEEDS the {REFUSAL_CEILING}s refusal '
+    return GateFloorRule(
+        rule=FloorRule.MIN_BUDGET,
+        derive=family.min_budget,
+        refusal_ceiling=None,
+        feeds=Citation(_checkout_relative(family.FAMILY_READER_PATH), GATE_WORST_TABLE, module),
+        note_for=lambda _floor: _MIN_BUDGET_NOTE + _UNCHECKED_GATE_ROW_NOTE,
+    )
+
+
+def _refusal_ceiling_note(floor: int, ceiling: int) -> str:
+    if floor > ceiling:
+        return (
+            f'The derived floor {floor}s EXCEEDS the {ceiling}s refusal '
             f'ceiling. THIS IS A FINDING TO ESCALATE, NOT A BUDGET TO RAISE '
             f'(ruling D17; commit 36c4c71eb4 recorded that "the next raise '
             f'should be refused"). File '
             f"escalate_blocker(category='design_concern') with these figures. "
             f'The remedy is trimming the suite, not a wider budget.'
         )
-    else:
-        note = (
-            f'The derived floor {floor}s is within the {REFUSAL_CEILING}s '
-            f'refusal ceiling, with {REFUSAL_CEILING - floor}s of floor to '
-            f'spare. A slower worst run consumes that margin; crossing it is a '
-            f'finding to escalate rather than a number to raise.'
+    return (
+        f'The derived floor {floor}s is within the {ceiling}s '
+        f'refusal ceiling, with {ceiling - floor}s of floor to '
+        f'spare. A slower worst run consumes that margin; crossing it is a '
+        f'finding to escalate rather than a number to raise.'
+    )
+
+
+_MIN_BUDGET_NOTE = (
+    'The budget guards hold this module to min_budget(W), ~2x its worst '
+    'measured run rounded down to 100s, and to a budget strictly below the '
+    'repo-root fleet ceiling. W is the figure cited under feeds; its '
+    'provenance is the verify-budget comment block of the yaml named under '
+    'provenance. No escalation cap applies beyond that fleet ceiling.'
+)
+
+_UNCHECKED_GATE_ROW_NOTE = (
+    ' This census does not check that the cited row exists. The gate\'s '
+    'coverage guard places every module config it discovers in one of its '
+    'tables, so a --module outside them, such as a typo, cites a row that is '
+    'not there.'
+)
+
+
+def _budget_note(
+    worst: float | None, gate_rule: GateFloorRule | None, floor: int | None,
+) -> str:
+    if worst is None:
+        return (
+            'No full-suite run in this window, so no floor is derived. This is '
+            'NOT a floor of zero.'
         )
+    if gate_rule is None or floor is None:
+        return (
+            f'Derivation UNAVAILABLE: could not import {_FAMILY_MODULE} and '
+            f'{_RECORDS_MODULE} from {_FAMILY_DIR}, so the rule the budget gate '
+            f'applies to this module is unknown. Deliberately NOT guessed or '
+            f'recomputed locally — a second spelling would agree today and '
+            f'drift later. Run this from a full checkout to get the floor.'
+        )
+    return gate_rule.note_for(floor)
+
+
+def budget_check(module: str, overall: dict[str, Any]) -> dict[str, Any]:
+    """The derived-floor section: the floor the budget gate holds *module* to.
+
+    ``derived_floor`` is ``None`` when there is no max to derive from — never a
+    ``0``, which would read as a derived answer — and when the gate's rule is
+    unavailable, which is reported as its own state.
+    """
+    worst = overall['durations']['max']
+    gate_rule = gate_floor_rule(module)
+    floor = None if worst is None or gate_rule is None else gate_rule.derive(worst)
+    ceiling = None if gate_rule is None else gate_rule.refusal_ceiling
     return {
+        'rule': None if gate_rule is None else gate_rule.rule.value,
         'measured_max': worst,
         'derived_floor': floor,
-        'refusal_ceiling': REFUSAL_CEILING,
-        'exceeds_refusal_ceiling': floor is not None and floor > REFUSAL_CEILING,
-        'feeds': FEEDS_CONSTANT,
-        'note': note,
+        'refusal_ceiling': ceiling,
+        'exceeds_refusal_ceiling': (
+            floor is not None and ceiling is not None and floor > ceiling
+        ),
+        'feeds': None if gate_rule is None else gate_rule.feeds.to_record(),
+        'provenance': module_yaml_path(module).as_posix(),
+        'note': _budget_note(worst, gate_rule, floor),
     }
 
 if __name__ == '__main__':

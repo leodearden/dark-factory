@@ -159,7 +159,7 @@ def stub_stage_runs(
     """Replace ``run`` on every pipeline stage class with *fake_run* until test teardown.
 
     *fake_run* has the signature
-    ``(self, events, watermark, prior_reports, run_id, model=None, resume_session_id=None)``.
+    ``(self, events, watermark, prior_reports, run_id, model=None)``.
     """
     for stage_class in _PIPELINE_STAGE_CLASSES:
         monkeypatch.setattr(stage_class, 'run', fake_run)

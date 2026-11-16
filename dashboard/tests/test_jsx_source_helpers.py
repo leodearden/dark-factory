@@ -1,13 +1,12 @@
-"""Contract for the shared JSX source-slicing helpers in `_dashboard_helpers`.
+"""Contract for the shared JSX source-slicing helpers in `_jsx_source_helpers`.
 
-The dashboard suite asserts structural contracts against the *served* .jsx
-text (there is no JS runtime in this project), and nearly every such
-assertion first needs to scope itself to one function's body — otherwise a
-token appearing anywhere else in the file satisfies it and the test proves
-nothing.  That scoping helper used to be copied into each consuming module,
-which meant a fix to it had to be applied nine times or not at all.  This
-file owns its contract so the single shared implementation can be changed
-with confidence.
+These helpers serve the Python suites that assert structural contracts
+against the *served* .jsx text, and nearly every such assertion first needs
+to scope itself to one function's body — otherwise a token appearing
+anywhere else in the file satisfies it and the test proves nothing.  That
+scoping helper used to be copied into each consuming module, which meant a
+fix to it had to be applied nine times or not at all.  This file owns its
+contract so the single shared implementation can be changed with confidence.
 
 `extract_function_body` is the brace-walk variant: it returns exactly the
 brace-delimited block of a named `function` declaration, signature excluded,
@@ -24,11 +23,12 @@ here: blanking real code would disarm every absence assertion downstream.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 import pytest
-from _dashboard_helpers import (
+from _jsx_source_helpers import (
     DF_CHARTS_DESTRUCTURE_RE,
     DF_CHARTS_EXPORT_RE,
     ScriptTagCollector,
@@ -39,6 +39,8 @@ from _dashboard_helpers import (
     find_function_params,
     find_script_position,
     jsx_open_tag_end,
+    jsx_open_tags,
+    jsx_prop_expr,
     strip_js_comments,
     walk_balanced,
 )
@@ -945,6 +947,78 @@ class TestJsxOpenTagEnd:
         """Past the tag name, as the census's old walk took it, is now loud."""
         with pytest.raises(ValueError, match=r'start=4\b'):
             jsx_open_tag_end('<Pip datum={d} />', 4)
+
+
+class TestJsxOpenTags:
+    """Every opening tag matching a pattern, in source order, read from the
+    comment-stripped source: a tag with children yields its opening tag only,
+    and a tag the walk cannot close raises rather than being dropped.
+    """
+
+    _A = re.compile(r'<A\b')
+
+    def test_returns_each_opening_tag_whole_in_source_order(self) -> None:
+        src = '<A x={1} /> <B/> <A y="2">c</A>'
+
+        assert jsx_open_tags(src, self._A) == ['<A x={1} />', '<A y="2">']
+
+    def test_a_quoted_brace_or_self_close_does_not_end_the_tag(self) -> None:
+        src = '<A t="a } b" u="c/>d" v={1} />'
+
+        assert jsx_open_tags(src, self._A) == [src]
+
+    def test_a_comment_inside_an_attribute_expression_is_stripped(self) -> None:
+        src = "<A\n  s={[\n    // don't\n    1,\n  ]}\n/>"
+        tags = jsx_open_tags(src, self._A)
+
+        assert len(tags) == 1
+        assert "don't" not in tags[0]
+        assert tags[0].endswith('/>')
+
+    def test_a_commented_out_tag_is_not_returned(self) -> None:
+        assert jsx_open_tags('// <A x={1} />\n<A y={2} />', self._A) == ['<A y={2} />']
+
+    def test_a_tag_the_walk_cannot_close_raises_quoting_it(self) -> None:
+        with pytest.raises(AssertionError, match=r'<A x=\{1\}'):
+            jsx_open_tags('<A x={1}', self._A)
+
+    def test_no_match_is_an_empty_list(self) -> None:
+        assert jsx_open_tags('<B x={1} />', self._A) == []
+
+    def test_a_match_not_starting_at_the_angle_is_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            jsx_open_tags('<A />', re.compile(r'A\b'))
+
+
+class TestJsxPropExpr:
+    """The expression an opening tag passes in its own ``prop={...}``, read
+    quote-aware: a quoted brace or a quoted ``prop={`` is not code, and a
+    nested element's prop is not the tag's.
+    """
+
+    def test_returns_the_braced_expression_stripped(self) -> None:
+        assert jsx_prop_expr('<A x={ [{ v: 1 }] } />', 'x') == '[{ v: 1 }]'
+
+    def test_an_absent_or_string_valued_prop_is_none(self) -> None:
+        assert jsx_prop_expr('<A y={1} />', 'x') is None
+        assert jsx_prop_expr('<A x="1" />', 'x') is None
+
+    def test_only_the_whole_prop_name_matches(self) -> None:
+        assert jsx_prop_expr('<A xdatum={1} datum={2} />', 'datum') == '2'
+
+    def test_a_quoted_brace_inside_the_expression_does_not_end_it(self) -> None:
+        assert jsx_prop_expr("<A f={v => '}'} />", 'f') == "v => '}'"
+        assert jsx_prop_expr('<A f={v => `${v}%`} />', 'f') == 'v => `${v}%`'
+
+    def test_a_quoted_prop_in_another_attribute_is_not_the_prop(self) -> None:
+        assert jsx_prop_expr('<A t="x={1}" x={2} />', 'x') == '2'
+
+    def test_a_nested_elements_prop_is_not_the_tags(self) -> None:
+        assert jsx_prop_expr('<A legend={<B x={1} />} />', 'x') is None
+
+    def test_an_expression_that_never_closes_raises_quoting_the_tag(self) -> None:
+        with pytest.raises(AssertionError, match=r'<A x=\{1'):
+            jsx_prop_expr('<A x={1', 'x')
 
 
 class TestScriptOrderHelpers:

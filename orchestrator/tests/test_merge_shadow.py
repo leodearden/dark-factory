@@ -28,6 +28,61 @@ from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
 
 
+@pytest.mark.asyncio
+class TestColdShadowRowsAreLocalByRule:
+    """Both cold-shadow legs run on a local-only pool, so their merge_verify
+    rows report ``local_only_rule`` and no base relation (task 8523)."""
+
+    @staticmethod
+    def _req(repo: Path) -> MagicMock:
+        req = MagicMock()
+        req.task_id = 'task-8523-shadow'
+        req.task_files = None
+        req.module_configs = []
+        req.config = OrchestratorConfig(project_root=repo)
+        return req
+
+    @staticmethod
+    def _dispatch_facts(event_store: MagicMock) -> list[tuple]:
+        from orchestrator.event_store import EventType
+
+        return [
+            (call.kwargs['data']['runner_reason'], call.kwargs['data']['base_relation'])
+            for call in event_store.emit.call_args_list
+            if call.args[0] == EventType.merge_verify
+        ]
+
+    async def test_per_test_cold_shadow_row(
+        self, shadow_git_ops: GitOps, shadow_git_repo: Path,
+    ) -> None:
+        from _merge_lane_fakes import FakeVerifier
+
+        from orchestrator.merge_lane.shadow import _run_cold_shadow_verify
+
+        head = await _shadow_head_sha(shadow_git_ops.project_root)
+        event_store = MagicMock()
+        await _run_cold_shadow_verify(
+            shadow_git_ops, self._req(shadow_git_repo), head, event_store,
+            verifier=FakeVerifier(),
+        )
+        assert self._dispatch_facts(event_store) == [('local_only_rule', None)]
+
+    async def test_suite_cold_shadow_row(
+        self, shadow_git_ops: GitOps, shadow_git_repo: Path,
+    ) -> None:
+        from _merge_lane_fakes import FakeVerifier
+
+        from orchestrator.merge_lane.shadow import _run_cold_shadow_verify_suite
+
+        head = await _shadow_head_sha(shadow_git_ops.project_root)
+        event_store = MagicMock()
+        await _run_cold_shadow_verify_suite(
+            shadow_git_ops, self._req(shadow_git_repo), head, event_store,
+            verifier=FakeVerifier(),
+        )
+        assert self._dispatch_facts(event_store) == [('local_only_rule', None)]
+
+
 def test_merge_shadow_exports_moved_public_symbols() -> None:
     from orchestrator.merge_lane.shadow import (
         _LIBTEST_TEST_LINE_RE,

@@ -12,6 +12,9 @@ import pathlib
 import subprocess
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 HOOK = pathlib.Path(__file__).resolve().parents[1] / "stop-socket-unless-restarting.sh"
 SERVICE = "orchestrator-reify.service"

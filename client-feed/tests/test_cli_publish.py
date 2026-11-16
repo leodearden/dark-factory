@@ -18,7 +18,7 @@ import pytest
 import yaml
 from _git_repo import Repo, make_repo
 from _in_dir import write_engagement
-from _stores import RunsDb, TasksDb
+from _stores import EscalationQueueDir, RunsDb, TasksDb
 
 from client_feed.cli import main
 from client_feed.contract import (
@@ -78,6 +78,7 @@ def root(tmp_path: Path) -> Path:
     TasksDb.create(repo.root).add(
         7, title='Ship /home/leo/x', status='done', updated_at='2026-10-21T09:00:00.000Z'
     )
+    EscalationQueueDir.create(repo.root)
     runs = RunsDb.create(repo.root)
     runs.emit('phase_enter', at=at(-25), task_id=7, phase='merge')
     runs.emit(
@@ -338,6 +339,7 @@ def test_a_snapshot_of_this_checkout_is_a_valid_feed_that_leaks_nothing(
         updated_at='2026-10-21T09:30:00.000Z', metadata={'prd_path': CLIENT_FEED_PRD},
     )
     RunsDb.create(repo.root).emit('phase_enter', at=at(0), task_id=2, phase='implement')
+    EscalationQueueDir.create(repo.root)
     visible = ['*/src/**', '*/tests/**']
     (tmp_path / 'out').mkdir()
     config = write_config(tmp_path, repo.root, visible_globs=visible)

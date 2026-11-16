@@ -12,11 +12,9 @@ fixture project). Real systemd is never touched.
 
 Divergences from the mirrored trickle install test:
   * SCRIPT / unit basenames re-pointed at legibility-transcript-check@.
-  * The installed @.service content assertion additionally checks it
-    references check_transcript_persistence.py (NOT nightly.py) and does
-    NOT pass --check-preventer (DD2: the 2893 preventer-guard regex
-    false-negatives against the real spawn-claude.sh, so passing it would
-    make the timer exit 1 on every run — a perpetual false alarm).
+  * The @.service ExecStart assertion additionally checks it references
+    check_transcript_persistence.py (NOT nightly.py) and does NOT pass
+    --check-preventer (kept off by task 5859).
 """
 from __future__ import annotations
 
@@ -25,6 +23,11 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = Path(__file__).parent.parent / "legibility" / "install-transcript-check-timer.sh"
 TEMPLATES_DIR = Path(__file__).parent.parent  # scripts/tests/../ = scripts/
@@ -209,7 +212,7 @@ def test_install_copies_templates_and_enables_timer(tmp_path):
     assert timer_path.is_file(), f"Expected {timer_path} to exist after install"
     # Byte-equality with the committed templates above already proves the
     # install copied them verbatim; the @.service ExecStart *shape* invariant
-    # (references the detector, passes %i, and — DD2 — never --check-preventer)
+    # (references the detector, passes %i, and — task 5859 — never --check-preventer)
     # is asserted directly against the committed template in
     # test_service_template_execstart_shape, independent of install behavior.
 
@@ -221,24 +224,28 @@ def test_install_copies_templates_and_enables_timer(tmp_path):
 
 def test_service_template_execstart_shape():
     """Template-content invariant (NOT install behavior): the committed
-    @.service's ExecStart must target the DETECTOR
+    @.service's ExecStart line must target the DETECTOR
     (check_transcript_persistence.py) with the %i instance placeholder
     (systemd expands %i at instantiation — the template is copied verbatim,
-    never per-instance edited) and must NOT pass --check-preventer.
-
-    DD2: the 2893 preventer-guard regex false-negatives against the real
-    spawn-claude.sh, so passing --check-preventer would make the timer exit 1
-    on EVERY run (a perpetual false alarm). This pins the ExecStart shape at
-    its source, so a future template edit that reintroduced --check-preventer
-    fails here regardless of the install path.
+    never per-instance edited) and must NOT pass --check-preventer, which
+    task 5859 keeps off; rationale in OPERATIONS.md §"Nightly legibility
+    transcript check (04:00)".
     """
     service_text = (TEMPLATES_DIR / "legibility-transcript-check@.service").read_text()
-    assert "check_transcript_persistence.py" in service_text
-    assert "--project-id %i" in service_text
-    assert "--check-preventer" not in service_text, (
-        "The transcript-check service template must NOT pass --check-preventer "
-        "(DD2): the 2893 preventer-guard regex false-negatives against the real "
-        "spawn-claude.sh, which would make the timer exit 1 on every run."
+    execstart_lines = [
+        line for line in service_text.splitlines() if line.startswith("ExecStart=")
+    ]
+    assert len(execstart_lines) == 1, f"ExecStart lines: {execstart_lines!r}"
+    (execstart,) = execstart_lines
+    assert not execstart.endswith("\\"), (
+        "ExecStart continues onto another line; this test reads only its first"
+    )
+    assert "check_transcript_persistence.py" in execstart
+    assert "--project-id %i" in execstart
+    assert "--check-preventer" not in execstart, (
+        "The transcript-check service's ExecStart must NOT pass "
+        "--check-preventer (kept off by task 5859). Read OPERATIONS.md "
+        '§"Nightly legibility transcript check (04:00)" before changing this.'
     )
 
 

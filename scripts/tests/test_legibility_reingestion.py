@@ -32,7 +32,11 @@ from legibility_carrier_fixtures import (
     user_record,
     with_origin,
 )
-from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT
+from shared.cli_invoke import (
+    CAP_HIT_RESUME_PROMPT,
+    CRASH_RECOVERY_RESUME_PROMPT,
+    PROGRESS_TIMEOUT_RESUME_PROMPT,
+)
 
 # ---------------------------------------------------------------------------
 # is_coder_judgment_payload -- the re-ingestion content classifier's
@@ -133,8 +137,9 @@ class TestReingestedContentClassifier:
         assert reingestion.is_reingested_content(text) is True
 
     @pytest.mark.parametrize(
-        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
-        ids=['usage_limit', 'crash_recovery'],
+        'resume_prompt',
+        [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT, PROGRESS_TIMEOUT_RESUME_PROMPT],
+        ids=['usage_limit', 'crash_recovery', 'progress_timeout'],
     )
     def test_resume_prompt_is_reingested_lockstep(self, resume_prompt):
         # LOCKSTEP, as in test_resume_prompt_is_excluded_lockstep: asserted
@@ -205,8 +210,9 @@ class TestHarnessInjectedTurnFilter:
         )
 
     @pytest.mark.parametrize(
-        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
-        ids=['usage_limit', 'crash_recovery'],
+        'resume_prompt',
+        [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT, PROGRESS_TIMEOUT_RESUME_PROMPT],
+        ids=['usage_limit', 'crash_recovery', 'progress_timeout'],
     )
     def test_resume_prompt_is_excluded_lockstep(self, resume_prompt):
         # LOCKSTEP: asserted against each canonical constant, not a

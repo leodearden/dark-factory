@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -10,7 +11,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest  # pyright: ignore[reportMissingImports]
+from _process_identity_variants import IdentityVariant, own_identity
 from _process_tree_fakes import claude_process_tree
+from _reap_report_wait import await_reap_report
+from _session_hook_fixtures import launching_record, owner_ppid_env
+from shared.process_identity import ProcessIdentity
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
@@ -30,12 +35,14 @@ def _record(
     *,
     owner_pid: int | None,
     status: sr.Status = sr.Status.RUNNING,
+    owner_identity: ProcessIdentity | None = None,
 ) -> sr.SessionRecord:
     return sr.SessionRecord(
         session_slug=slug,
         status=status,
         claude_session_id='claude-session-uuid',
         claude_owner_pid=owner_pid,
+        claude_owner_identity=owner_identity,
     )
 
 
@@ -318,7 +325,42 @@ class TestReapStaleSessionPointers:
     def test_an_absent_pointer_dir_is_an_empty_pass(self, tmp_path: Path) -> None:
         assert sr.reap_stale_session_pointers(root=tmp_path) == []
 
-    def test_a_corrupt_record_is_never_parsed_so_its_pointer_is_kept(
+    @pytest.mark.parametrize('variant', list(IdentityVariant))
+    def test_a_live_pids_pointer_is_judged_by_its_records_owner_identity(
+        self, tmp_path: Path, variant: IdentityVariant
+    ) -> None:
+        owner = _record(self._SLUG, owner_pid=os.getpid(), owner_identity=own_identity(variant))
+        sr.write_record(owner, root=tmp_path)
+        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+        pointer = sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path)
+        removed = variant.judged_dead
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == ([pointer] if removed else [])
+        assert pointer.exists() is not removed
+
+    def test_a_dead_pids_pointer_to_a_record_reclaimed_by_a_live_owner_is_removed(
+        self, tmp_path: Path
+    ) -> None:
+        owner = _record(self._SLUG, owner_pid=os.getpid(), owner_identity=own_identity())
+        sr.write_record(owner, root=tmp_path)
+        sr.write_session_pointer(_DEAD_PID, self._SLUG, root=tmp_path)
+        pointer = sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path)
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
+        assert not pointer.exists()
+
+    def test_a_live_pids_pointer_to_a_record_owned_by_another_pid_is_judged_by_its_own_pid(
+        self, tmp_path: Path
+    ) -> None:
+        elsewhere = dataclasses.replace(own_identity(), pid=_DEAD_PID)
+        owner = _record(self._SLUG, owner_pid=_DEAD_PID, owner_identity=elsewhere)
+        sr.write_record(owner, root=tmp_path)
+        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+
+        assert sr.reap_stale_session_pointers(root=tmp_path) == []
+        assert sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
+
+    def test_a_corrupt_record_reads_unqualified_so_a_live_pids_pointer_is_kept(
         self, tmp_path: Path
     ) -> None:
         record_path = sr.record_path_for_slug(self._SLUG, root=tmp_path)
@@ -384,6 +426,7 @@ class TestPointerSweepDrivers:
         slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
         expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
         assert capsys.readouterr().out == f'{expected_dir}\n'
+        await_reap_report(tmp_path)
         assert not sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path).exists()
 
 
@@ -1025,6 +1068,63 @@ class TestLeaseClaimCliRecordSlug:
 
         assert len(calls) == expected_calls
         assert _lease_body(tmp_path).pid == expected_body_pid
+
+
+_REMINT_OWNER = 5_918_001
+_REMINT_OWNER_PARENT = 5_918_000
+_REMINT_SPAWN_SLUG = 'session-cockpit-5918000'
+
+
+def _spawned_by_remint_owner_parent_env(root: Path) -> dict[str, str]:
+    """Seed the spawn-claude.sh LAUNCHING record that a claude parented by ``_REMINT_OWNER_PARENT`` binds."""
+    launching_record(_REMINT_SPAWN_SLUG, root, pid=_REMINT_OWNER_PARENT)
+    return owner_ppid_env(_REMINT_SPAWN_SLUG, _REMINT_OWNER_PARENT)
+
+
+class TestALeaseFollowsItsHoldersRecordAcrossARemint:
+    @pytest.mark.parametrize(
+        'lane',
+        [_hand_launched_env, _spawned_by_remint_owner_parent_env],
+        ids=['hand-launched', 'spawned'],
+    )
+    @pytest.mark.parametrize('source', ['clear', 'compact'])
+    def test_a_lease_claimed_before_a_remint_names_the_live_record(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        source: str,
+        lane: Callable[[Path], Mapping[str, str]],
+    ) -> None:
+        tree = claude_process_tree(_REMINT_OWNER, _REMINT_OWNER_PARENT)
+        env = lane(tmp_path)
+        first = sh.run_session_start(
+            {'session_id': 'sid-before', 'cwd': _CWD, 'source': 'startup'},
+            env,
+            root=tmp_path,
+            process_tree=tree,
+        )
+        monkeypatch.setenv('CLAUDE_PID', str(_REMINT_OWNER))
+        assert sr.main(['lease-claim', '--name', _LEASE]) == 0
+        assert _lease_body(tmp_path).record_slug == first.session_slug
+
+        sh.run_session_start(
+            {'session_id': 'sid-after', 'cwd': _CWD, 'source': source},
+            env,
+            root=tmp_path,
+            process_tree=tree,
+        )
+        sh.run_stop({'session_id': 'sid-after', 'cwd': _CWD}, env, root=tmp_path, process_tree=tree)
+
+        live = sr.resolve_session_slug_for_claude_session_id('sid-after', root=tmp_path)
+        assert live is not None
+        status = sr.lease_status(_LEASE, root=tmp_path)
+        assert (status.holder_record_slug, status.holder_record_state) == (
+            live,
+            sr.HolderRecordState.ACTIVE,
+        )
+        assert sr.resolve_session_slug_for_pid(_REMINT_OWNER, root=tmp_path) == live
+        record = sr.read_record(live, root=tmp_path)
+        assert (record.claude_session_id, record.status) == ('sid-after', sr.Status.IDLE)
 
 
 def _claim_lines(capsys: pytest.CaptureFixture[str], *extra: str) -> list[str]:

@@ -39,6 +39,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _fm_helpers import load_script_module
+from _graph_access_fake import FakeGraphAccess
 from _store_mutation_preflight_contract import SENTINEL, deny
 
 from fused_memory.maintenance.cross_graph_move import (
@@ -100,22 +101,26 @@ def _manifest_path(migrate, tmp_path) -> Path:
     return path
 
 
-def _shim() -> tuple[types.SimpleNamespace, MagicMock]:
-    """Production's backend shim shape: ``SimpleNamespace(graphiti=backend)``.
+@pytest.fixture
+def make_shim(make_backend, mock_config):
+    """Factory fixture: () -> production's backend shim shape, ``SimpleNamespace(graphiti=backend)``.
 
-    Returns the shim and the single graph mock every ``_graph_for`` lookup
-    resolves to, so a test can assert no write ever reached a graph.
+    The backend is real, over one raw graph wired under every graph key the
+    manifest names. The factory returns the shim and that raw graph, so a
+    test can assert no write ever reached a graph.
     """
-    empty = MagicMock()
-    empty.result_set = []
-    graph = MagicMock()
-    graph.query = AsyncMock(return_value=empty)
-    graph.ro_query = AsyncMock(side_effect=lambda *_a, **_kw: empty)
-    graphiti = MagicMock()
-    graphiti._graph_for = MagicMock(return_value=graph)
-    graphiti.list_graphs = AsyncMock(return_value=['reify'])
-    graphiti._require_falkor_client = MagicMock(return_value=MagicMock())
-    return types.SimpleNamespace(graphiti=graphiti), graph
+    def _factory() -> tuple[types.SimpleNamespace, MagicMock]:
+        empty = MagicMock()
+        empty.result_set = []
+        graph = MagicMock()
+        graph.query = AsyncMock(return_value=empty)
+        graph.ro_query = AsyncMock(side_effect=lambda *_a, **_kw: empty)
+        backend = make_backend(
+            mock_config, graph_access=FakeGraphAccess({'reify': graph, 'dark_factory': graph}),
+        )
+        return types.SimpleNamespace(graphiti=backend), graph
+
+    return _factory
 
 
 # ===========================================================================
@@ -171,7 +176,7 @@ class TestInheritedStoreMutationPreflight:
 
     @pytest.mark.asyncio
     async def test_the_unconditional_apply_refuses_when_the_store_is_unwritable(
-        self, tmp_path, monkeypatch,
+        self, make_shim, tmp_path, monkeypatch,
     ):
         """The behavioural claim, driven through this script's own loader.
 
@@ -185,7 +190,7 @@ class TestInheritedStoreMutationPreflight:
         """
         migrate = _load_migrate_from_this_tree(monkeypatch)
         manifest = _manifest_path(migrate, tmp_path)
-        shim, graph = _shim()
+        shim, graph = make_shim()
 
         create = AsyncMock()
         recreate = AsyncMock()
@@ -212,7 +217,7 @@ class TestInheritedStoreMutationPreflight:
 
     @pytest.mark.asyncio
     async def test_the_apply_is_unchanged_when_the_preflight_passes(
-        self, tmp_path, monkeypatch,
+        self, make_shim, tmp_path, monkeypatch,
     ):
         """Non-vacuity for the test above: with the probe passing, the SAME
         call migrates exactly as before. Without this, a manifest that silently
@@ -220,7 +225,7 @@ class TestInheritedStoreMutationPreflight:
         pass for the wrong reason."""
         migrate = _load_migrate_from_this_tree(monkeypatch)
         manifest = _manifest_path(migrate, tmp_path)
-        shim, _ = _shim()
+        shim, _ = make_shim()
 
         create = AsyncMock(return_value=CreateResult(
             uuid='u-move', source_graph='reify', target_graph='dark_factory',
@@ -246,7 +251,7 @@ class TestInheritedStoreMutationPreflight:
 
     @pytest.mark.asyncio
     async def test_the_probe_names_the_operation_and_runs_once(
-        self, tmp_path, monkeypatch,
+        self, make_shim, tmp_path, monkeypatch,
     ):
         """One probe for the whole bulk apply, attributable in a log.
 
@@ -256,7 +261,7 @@ class TestInheritedStoreMutationPreflight:
         """
         migrate = _load_migrate_from_this_tree(monkeypatch)
         manifest = _manifest_path(migrate, tmp_path)
-        shim, _ = _shim()
+        shim, _ = make_shim()
 
         monkeypatch.setattr(migrate, 'create_moved_node', AsyncMock(return_value=CreateResult(
             uuid='u-move', source_graph='reify', target_graph='dark_factory',
@@ -284,7 +289,7 @@ class TestInheritedStoreMutationPreflight:
 
     @pytest.mark.asyncio
     async def test_the_scripts_own_dry_run_census_is_never_gated(
-        self, monkeypatch,
+        self, make_shim, monkeypatch,
     ):
         """Step 2 of this script's sequence is a fresh dry-run census
         (``SimpleNamespace(apply=False, ...)`` at the ``migrate.run`` above the
@@ -301,7 +306,7 @@ class TestInheritedStoreMutationPreflight:
         buy that back; see the comment at the step-5 call site for why a
         single probe site was preferred anyway."""
         migrate = _load_migrate_from_this_tree(monkeypatch)
-        shim, _ = _shim()
+        shim, _ = make_shim()
 
         calls: list[dict] = []
         monkeypatch.setattr(
@@ -316,3 +321,39 @@ class TestInheritedStoreMutationPreflight:
 
         assert manifest['dry_run'] is True
         assert calls == [], 'a census mutates nothing, so it must not probe'
+
+
+class TestDumpCrossTargetRecoveryDump:
+    """dump_cross_target(backend, migrate, manifest) over a real backend."""
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_edge_is_dumped_with_its_compact_embedding(
+        self, tmp_path, monkeypatch, make_backend, mock_config,
+    ):
+        monkeypatch.setattr(_mod, 'OUTDIR', tmp_path)
+        migrate = _load_migrate_from_this_tree(monkeypatch)
+        manifest = {'nodes': [{
+            'uuid': 'u1', 'disposition': 'MOVE',
+            'source_graph': 'reify', 'target_graph': 'dark_factory',
+        }]}
+        reify = MagicMock()
+        reify.ro_query = AsyncMock(return_value=MagicMock(
+            result_set=[['e1', 'REL', 'fact', 'u1', 'A', 'x9', 'B']],
+        ))
+        reify.execute_command = AsyncMock(return_value=['h', [[[12, [b'0.5', b'1.25']]]], 'stats'])
+        dark_factory = MagicMock()
+        dark_factory.ro_query = AsyncMock(return_value=MagicMock(result_set=[]))
+        backend = make_backend(
+            mock_config, graph_access=FakeGraphAccess({'reify': reify, 'dark_factory': dark_factory}),
+        )
+
+        dest = await _mod.dump_cross_target(backend, migrate, manifest)
+
+        dump = json.loads(dest.read_text())
+        assert dump['count'] == 1
+        assert dump['edges'][0]['fact_embedding_compact'] == '[0.5, 1.25]'
+        reify.execute_command.assert_awaited_once_with(
+            'GRAPH.RO_QUERY', 'reify',
+            "MATCH ()-[e:RELATES_TO {uuid: 'e1'}]-() RETURN e.fact_embedding",
+            '--compact',
+        )

@@ -23,10 +23,24 @@ from pathlib import Path
 from typing import Annotated
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictFloat,
+    StrictInt,
+    StringConstraints,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 LOG_LEVEL_ENV_VAR = 'LEGIBILITY_LOG_LEVEL'
 LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
+RETIRED_CENSUS_KEYS = ('max_interval_days', 'tasks_landed_threshold', 'tasks_landed_min_days')
+_SOURCE_CONTEXT_KEY = 'source'
+
+logger = logging.getLogger('legibility.config')
 
 
 class Budgets(BaseModel):
@@ -52,21 +66,21 @@ class NoveltySpike(BaseModel):
     minimum, and ``multiple`` x the median of the daily window counts over
     the trailing ``baseline_days`` is the relative bar."""
 
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra='allow', frozen=True)
 
-    count: int = Field(default=4, ge=0, strict=True)
-    window_hours: int = Field(default=72, ge=0, strict=True)
-    multiple: int = Field(default=2, ge=0, strict=True)
-    baseline_days: int = Field(default=30, ge=0, strict=True)
+    count: StrictInt = Field(default=4, ge=0)
+    window_hours: StrictInt = Field(default=72, ge=0)
+    multiple: StrictInt = Field(default=2, ge=0)
+    baseline_days: StrictInt = Field(default=30, ge=0)
 
 
 class Saturation(BaseModel):
     """``census.saturation`` — the mining-stop condition (PRD §5.2 point 7)."""
 
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra='allow', frozen=True)
 
-    dup_rate: float = 0.9
-    consecutive_batches: int = 2
+    dup_rate: StrictFloat = Field(default=0.9, ge=0.0, le=1.0)
+    consecutive_batches: StrictInt = Field(default=2, ge=1)
 
 
 class TrickleCensusCaps(BaseModel):
@@ -84,8 +98,8 @@ class TrickleCensusCaps(BaseModel):
 
     model_config = ConfigDict(extra='allow', frozen=True)
 
-    max_batches: int | None = Field(default=50, ge=1, strict=True)
-    max_verify_clusters: int | None = Field(default=150, ge=1, strict=True)
+    max_batches: StrictInt | None = Field(default=50, ge=1)
+    max_verify_clusters: StrictInt | None = Field(default=150, ge=1)
 
 
 class Adjudication(BaseModel):
@@ -101,9 +115,9 @@ class Adjudication(BaseModel):
 
     model_config = ConfigDict(extra='allow', frozen=True)
 
-    attach_min_similarity: float = Field(default=0.90, ge=0.0, le=1.0)
-    cluster_min_similarity: float = Field(default=0.85, ge=0.0, le=1.0)
-    max_clusters_per_run: int = Field(default=10, ge=0, strict=True)
+    attach_min_similarity: StrictFloat = Field(default=0.90, ge=0.0, le=1.0)
+    cluster_min_similarity: StrictFloat = Field(default=0.85, ge=0.0, le=1.0)
+    max_clusters_per_run: StrictInt = Field(default=10, ge=0)
     embedding_model: str = 'text-embedding-3-small'
 
 
@@ -115,28 +129,46 @@ class LandingGate(BaseModel):
     model_config = ConfigDict(extra='allow', frozen=True)
 
     argv: tuple[Annotated[str, StringConstraints(min_length=1)], ...] = Field(min_length=1)
-    timeout_secs: int = Field(default=900, ge=1, strict=True)
+    timeout_secs: StrictInt = Field(default=900, ge=1)
 
 
 class Census(BaseModel):
     """``census`` block — census-trigger (ζ), saturation tuning (PRD §5.2
     points 6-7), the nightly trickle's census launch caps, the similarity
     stage, the length of the census mining window (which is also the
-    session ledger's retention), and the landing gate a census output must
-    pass before it lands."""
+    session ledger's retention), the landing gate a census output must
+    pass before it lands, and the completion share (as a percentage) at
+    which the previous run's filed tasks fire the census
+    (plans/census-incremental-prd.md C7 (a)). The census block is validated
+    strictly here, once, at ``load_config``, and this model is its only
+    reader."""
 
-    model_config = ConfigDict(extra='allow')
+    model_config = ConfigDict(extra='allow', frozen=True)
 
-    ledger_retention_days: int = Field(default=30, ge=1, strict=True)
-    max_interval_days: int = 10
-    tasks_landed_threshold: int = 120
-    tasks_landed_min_days: int = 7
+    ledger_retention_days: StrictInt = Field(default=30, ge=1)
+    completion_threshold_pct: StrictInt = Field(default=70, ge=1, le=100)
     novelty_spike: NoveltySpike = Field(default_factory=NoveltySpike)
-    floor_days: int = 5
+    floor_days: StrictInt = Field(default=5, ge=0)
     saturation: Saturation = Field(default_factory=Saturation)
     trickle_caps: TrickleCensusCaps = Field(default_factory=TrickleCensusCaps)
     adjudication: Adjudication = Field(default_factory=Adjudication)
     landing_gate: LandingGate | None = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_retired_keys(cls, data: object, info: ValidationInfo) -> object:
+        if not isinstance(data, dict):
+            return data
+        present = [key for key in RETIRED_CENSUS_KEYS if key in data]
+        if not present:
+            return data
+        logger.warning(
+            'legibility config census: %s retired (plans/census-incremental-prd.md '
+            'C7, L8b), ignored -- delete from %s',
+            ', '.join(present),
+            (info.context or {}).get(_SOURCE_CONTEXT_KEY, 'legibility.yaml'),
+        )
+        return {key: value for key, value in data.items() if key not in RETIRED_CENSUS_KEYS}
 
 
 class Models(BaseModel):
@@ -310,7 +342,30 @@ def load_config(path: Path | str) -> LegibilityConfig:
     """
     with open(path, encoding='utf-8') as f:
         raw = yaml.safe_load(f) or {}
-    return LegibilityConfig(**raw)
+    return LegibilityConfig.model_validate(raw, context={_SOURCE_CONTEXT_KEY: str(path)})
+
+
+def project_root_mismatch(
+    project_root: Path, cfg: LegibilityConfig, config_path: Path,
+) -> str | None:
+    """Why the resolved *project_root* a CLI was given and the
+    ``project_root`` of *cfg*, loaded from *config_path*, name different
+    trees; ``None`` when they agree.
+
+    A census CLI reads the codebook, the census state and the reports under
+    *project_root*, while ``cfg.project_root`` drives the census window and
+    ``cfg.project_id`` stamps every filing, so the two must be one tree.
+    Roots are compared resolved, so an equivalent relative spelling is no
+    mismatch (task 3269).
+    """
+    cfg_project_root = Path(cfg.project_root).resolve()
+    if cfg_project_root == project_root:
+        return None
+    return (
+        f'--project-root {project_root} disagrees with the project_root in '
+        f'{config_path} ({cfg.project_root!r} -> {cfg_project_root}); refusing '
+        f'to mix two projects (project_id={cfg.project_id!r})'
+    )
 
 
 def _resolve_level(value: str) -> int | None:

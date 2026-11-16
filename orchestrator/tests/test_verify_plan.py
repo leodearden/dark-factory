@@ -1715,14 +1715,14 @@ class TestDroppedChainClausesAreLogged:
     #
     # The two root configs are the regression cases, and their counts are the
     # SEGMENT DELTA across the retained prefix (measured, not assumed): the
-    # type-check chain is 16 segments retaining 2, the test chain 18 retaining
+    # type-check chain is 16 segments retaining 2, the test chain 19 retaining
     # 2. Both were over-reported by one when the count was taken over the whole
     # original. The root `test_command` was additionally absent from this list
     # entirely, which is exactly what let it emit at INFO claiming a dropped
     # sibling check when every clause it drops is a pytest fan-out.
     _DROP_CASES = [
         (ROOT_TYPE_CHECK_COMMAND, 'pyright', 14, logging.DEBUG),
-        (ROOT_TEST_COMMAND, 'pytest', 16, logging.DEBUG),
+        (ROOT_TEST_COMMAND, 'pytest', 17, logging.DEBUG),
         (_SIBLING_CHECKER_TEST_COMMAND, 'pytest', 1, logging.INFO),
         (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest', 1, logging.INFO),
         (_SIBLING_CHECKER_TYPE_CHECK_COMMAND, 'pyright', 1, logging.INFO),

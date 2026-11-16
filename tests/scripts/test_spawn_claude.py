@@ -7,7 +7,6 @@ branches by name (the script dispatches on the first word of $CLAUDE_TERMINAL_CM
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import pathlib
@@ -15,58 +14,56 @@ import re
 import shlex
 import shutil
 import signal
-import sqlite3
 import subprocess
 import sys
 import textwrap
 import threading
 import time
+import urllib.parse
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime, timedelta
-from typing import NamedTuple
+from typing import Any
 
 import pytest
 
-REPO_ROOT = pathlib.Path(__file__).parents[2]
-SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"
+# orchestrator/src goes FIRST, ahead of any editable install pointing at a
+# different checkout, so `orchestrator.session_registry` is the module
+# spawn-claude.sh itself invokes by absolute path (task 2285). The repo root
+# and orchestrator/tests/cross_suite_helpers (the t3-lane section's fake T3
+# server) are APPENDED, never inserted: see the root conftest.py. Bare
+# module-level calls, because ruff exempts exactly that shape from E402.
+sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "orchestrator" / "src"))
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[2]))
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[2] / "orchestrator" / "tests" / "cross_suite_helpers"))
 
-# Insert this worktree's orchestrator/src onto sys.path (ahead of any
-# editable install pointing at a different checkout) so `import
-# orchestrator.session_registry` resolves to the module spawn-claude.sh
-# itself invokes by absolute path (task 2285) -- letting this file assert
-# in-process against the exact same record/reap contract. Also gives the
-# task-2298 (Fleet Cockpit C7) two-way boundary test direct, in-process
-# access to session_hooks.run_session_start -- the already-landed C1/C2
-# consumer of the CLAUDE_SPAWN_PARENT_ID this file's sibling-mode tests
-# export.
-_ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
-if str(_ORCH_SRC) not in sys.path:
-    sys.path.insert(0, str(_ORCH_SRC))
-
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ -- the failure the root conftest.py
-# docstring exists to prevent. Mirrors the same block in
-# tests/scripts/test_orchestrator_watchdog.py and
-# tests/scripts/test_fleet_dir_isolation.py. Needed here because
-# --import-mode=importlib does not put a test module's own tree on sys.path.
-if str(REPO_ROOT.resolve()) not in sys.path:
-    sys.path.append(str(REPO_ROOT.resolve()))
+from _fake_t3_server import (
+    DEAD_ORIGIN,
+    ENVIRONMENT_ID,
+    FakeT3Server,
+    RecordedRequest,
+    ToolFailure,
+    ToolSuccess,
+    replies_in_turn,
+)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # `_load_scaled_grace` lives in df_pytest_isolation (task 4890 promoted it out
 # of this file so scripts/tests/ could reach it); aliased back to the local
 # name every call site below already uses. See the task-2733 section comment
 # further down for the history and the reason it is load-scaled at all.
-from df_pytest_isolation import (  # noqa: E402
+from df_pytest_isolation import (
     load_scaled_grace as _load_scaled_grace,
 )
-
-# noqa must sit on the STATEMENT's first line: E402 is reported at the start of
-# the import, so the per-name noqas ruff's I001 fix left on lines below suppress
-# nothing. The pyright ignores stay per-name, where each attribute is flagged.
-from orchestrator import (  # noqa: E402
+from orchestrator import (
     session_hooks,  # pyright: ignore[reportAttributeAccessIssue]
     session_registry,  # pyright: ignore[reportAttributeAccessIssue]
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
+REPO_ROOT = pathlib.Path(__file__).parents[2]
+SPAWN_SCRIPT = REPO_ROOT / "skills" / "spawn" / "spawn-claude.sh"
+_ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
 
 # Branch routing: the script dispatches on the first word of $CLAUDE_TERMINAL_CMD.
 FOREGROUND_NAMES = ["gnome-terminal", "xterm", "kitty"]
@@ -1437,69 +1434,72 @@ def test_registry_write_refresh_reap_two_way_boundary(tmp_path: pathlib.Path) ->
     written = session_registry.SessionRecord.from_json(record_path.read_text())
     assert written.status == session_registry.Status.EXITED
 
-    # Backdate the mtime so the refresh's heartbeat bump is unambiguous even
-    # on filesystems with coarse mtime resolution.
-    backdated_ts = record_path.stat().st_mtime - 100
-    os.utime(record_path, (backdated_ts, backdated_ts))
+    # The real spawn started a detached `reap`; holding its lock waits that
+    # out and keeps any other out, so the reap below is the only one.
+    with session_registry.reap_lock(fleet_root):
+        # Backdate the mtime so the refresh's heartbeat bump is unambiguous even
+        # on filesystems with coarse mtime resolution.
+        backdated_ts = record_path.stat().st_mtime - 100
+        os.utime(record_path, (backdated_ts, backdated_ts))
 
-    # --- Consumer: a simulated hook write refreshes under the SAME key ----
-    # The exact CLI invocation the T6 SessionStart hook will make.
-    rc = session_registry.main(
-        ["refresh", "--record", str(slug_dir), "--status", "running"]
-    )
-    assert rc == 0
+        # --- Consumer: a simulated hook write refreshes under the SAME key ----
+        # The exact CLI invocation the T6 SessionStart hook will make.
+        rc = session_registry.main(
+            ["refresh", "--record", str(slug_dir), "--status", "running"]
+        )
+        assert rc == 0
 
-    refreshed_paths = list((fleet_root / "sessions").glob("*/record.json"))
-    assert refreshed_paths == [record_path], (
-        f"refresh must update the SAME record.json path (same key), "
-        f"found: {refreshed_paths}"
-    )
-    refreshed = session_registry.SessionRecord.from_json(record_path.read_text())
-    assert refreshed.session_slug == written.session_slug
-    assert refreshed.status == session_registry.Status.RUNNING
-    assert record_path.stat().st_mtime > backdated_ts, (
-        "refresh must bump the record's mtime heartbeat"
-    )
+        refreshed_paths = list((fleet_root / "sessions").glob("*/record.json"))
+        assert refreshed_paths == [record_path], (
+            f"refresh must update the SAME record.json path (same key), "
+            f"found: {refreshed_paths}"
+        )
+        refreshed = session_registry.SessionRecord.from_json(record_path.read_text())
+        assert refreshed.session_slug == written.session_slug
+        assert refreshed.status == session_registry.Status.RUNNING
+        assert record_path.stat().st_mtime > backdated_ts, (
+            "refresh must bump the record's mtime heartbeat"
+        )
 
-    # --- Upsert-on-absent: a hand-launched session with no prior write ----
-    # (the T6 hand-launched-capture path -- no spawn-claude.sh write exists
-    # for this slug at all).
-    absent_slug = "unblock-df-999-424242"
-    assert not session_registry.record_path_for_slug(absent_slug, root=fleet_root).is_file()
+        # --- Upsert-on-absent: a hand-launched session with no prior write ----
+        # (the T6 hand-launched-capture path -- no spawn-claude.sh write exists
+        # for this slug at all).
+        absent_slug = "unblock-df-999-424242"
+        assert not session_registry.record_path_for_slug(absent_slug, root=fleet_root).is_file()
 
-    upserted = session_registry.refresh_record(
-        absent_slug, root=fleet_root, status=session_registry.Status.AWAITING_INPUT,
-    )
-    assert upserted.session_slug == absent_slug
-    assert upserted.status == session_registry.Status.AWAITING_INPUT
-    assert upserted.schema_version == session_registry.SCHEMA_VERSION
-    assert upserted.start_ts, "an upserted record must still get a populated start_ts"
-    upserted_path = session_registry.record_path_for_slug(absent_slug, root=fleet_root)
-    assert upserted_path.is_file()
-    assert session_registry.read_record(absent_slug, root=fleet_root) == upserted
+        upserted = session_registry.refresh_record(
+            absent_slug, root=fleet_root, status=session_registry.Status.AWAITING_INPUT,
+        )
+        assert upserted.session_slug == absent_slug
+        assert upserted.status == session_registry.Status.AWAITING_INPUT
+        assert upserted.schema_version == session_registry.SCHEMA_VERSION
+        assert upserted.start_ts, "an upserted record must still get a populated start_ts"
+        upserted_path = session_registry.record_path_for_slug(absent_slug, root=fleet_root)
+        assert upserted_path.is_file()
+        assert session_registry.read_record(absent_slug, root=fleet_root) == upserted
 
-    # --- The hook-refreshed record still reaps correctly -------------------
-    # Force a guaranteed-dead launcher_pid (the real spawn's own $$ has
-    # already exited by now, but relying on incidental PID death would be
-    # racy under PID reuse) and age it past the non-terminal heartbeat TTL,
-    # so it reaps via the stale_pid rule now that its status is RUNNING
-    # (non-terminal) after the hook's refresh.
-    dead_record = session_registry.SessionRecord.from_json(record_path.read_text())
-    dead_record.launcher_pid = _DEAD_PID
-    record_path.write_text(dead_record.to_json())
-    now = datetime.now(UTC)
-    stale_ts = (
-        now - session_registry.NON_TERMINAL_HEARTBEAT_TTL - timedelta(hours=1)
-    ).timestamp()
-    os.utime(record_path, (stale_ts, stale_ts))
+        # --- The hook-refreshed record still reaps correctly -------------------
+        # Force a guaranteed-dead launcher_pid (the real spawn's own $$ has
+        # already exited by now, but relying on incidental PID death would be
+        # racy under PID reuse) and age it past the non-terminal heartbeat TTL,
+        # so it reaps via the stale_pid rule now that its status is RUNNING
+        # (non-terminal) after the hook's refresh.
+        dead_record = session_registry.SessionRecord.from_json(record_path.read_text())
+        dead_record.launcher_pid = _DEAD_PID
+        record_path.write_text(dead_record.to_json())
+        now = datetime.now(UTC)
+        stale_ts = (
+            now - session_registry.NON_TERMINAL_HEARTBEAT_TTL - timedelta(hours=1)
+        ).timestamp()
+        os.utime(record_path, (stale_ts, stale_ts))
 
-    reaped = session_registry.reap_stale_records(root=fleet_root, now=now)
-    reaped_by_slug = {r.session_slug: r.reason for r in reaped}
-    assert reaped_by_slug.get(dead_record.session_slug) == "stale_pid"
-    assert not slug_dir.exists()
-    assert absent_slug not in reaped_by_slug, (
-        "the freshly-upserted record must not be reaped -- its heartbeat is new"
-    )
+        reaped = session_registry.reap_stale_records(root=fleet_root, now=now)
+        reaped_by_slug = {r.session_slug: r.reason for r in reaped}
+        assert reaped_by_slug.get(dead_record.session_slug) == "stale_pid"
+        assert not slug_dir.exists()
+        assert absent_slug not in reaped_by_slug, (
+            "the freshly-upserted record must not be reaped -- its heartbeat is new"
+        )
 
 
 # ===========================================================================
@@ -4950,94 +4950,16 @@ def test_payload_publishes_sentinel_by_atomic_rename(tmp_path: pathlib.Path) -> 
 # task 7489: CLAUDE_SPAWN_BACKEND vocabulary and the t3 lane
 # ===========================================================================
 # The t3 lane drives orchestrator/src/orchestrator/spawn_t3_lane.py, which
-# shells out to `t3`. The fake `t3` below answers `thread start --json` and
-# `thread list --json` in the shapes T3 Code v0.1.2 prints
-# (apps/server/src/cli/thread.ts: ThreadLaunchResult, and an array of
-# packages/contracts/src/orchestratorMcp.ts::OrchestratorMcpThreadListItem),
-# logs every call, and on `thread start` plays the child: it writes a
-# transcript carrying the prompt (which names the record dir) and, when asked,
-# a final result.md. With `listed_for` set, the thread drops out of the listing
-# after that many `thread list` calls made after `thread start` and `thread show --json` reports it
-# archived, as T3 does for an archived thread.
+# reaches T3 over /mcp. Here T3 is
+# orchestrator/tests/cross_suite_helpers/_fake_t3_server.py's FakeT3Server,
+# named by server-runtime.json and paired with this host; the _T3Lane
+# responders answer in T3 Code v0.1.6's shapes and, on
+# t3_thread_launch, play the child: a transcript carrying the message (which
+# names the record dir) and, when asked, a final result.md.
 
-_FAKE_T3_SCRIPT = textwrap.dedent('''\
-    #!/usr/bin/env python3
-    import json, os, pathlib, re, sys
+_T3_THREAD_ID = "thread-7489"
+_T3_PROJECT_ID = "project-df"
 
-    scenario = json.loads(pathlib.Path(os.environ["FAKE_T3_SCENARIO"]).read_text())
-    argv = sys.argv[1:]
-    stdin = sys.stdin.read() if "-" in argv else ""
-    with open(scenario["log"], "a") as log:
-        log.write(json.dumps({"argv": argv, "stdin": stdin}) + "\\n")
-
-    def flag(name):
-        return argv[argv.index(name) + 1] if name in argv else None
-
-    def list_item(state):
-        item = dict(scenario["list_item"])
-        item.update(threadId=scenario["start"]["threadId"], title=state.get("title", ""),
-                    status=scenario["thread_status"], latestRunId=scenario["latest_run_id"])
-        return item
-
-    state_path = pathlib.Path(scenario["log"] + ".state")
-    state = json.loads(state_path.read_text()) if state_path.exists() else {}
-    if argv[:2] == ["thread", "start"]:
-        if scenario["start_rc"]:
-            print("The T3 server could not be reached.", file=sys.stderr)
-            sys.exit(scenario["start_rc"])
-        state["title"] = flag("--title") or ""
-        state_path.write_text(json.dumps(state))
-        if scenario["transcript_dir"]:
-            tdir = pathlib.Path(scenario["transcript_dir"])
-            tdir.mkdir(parents=True, exist_ok=True)
-            line = {"type": "user", "message": {"role": "user", "content": stdin}}
-            (tdir / (scenario["sid"] + ".jsonl")).write_text(json.dumps(line) + "\\n")
-        result = re.search(r"write your outcome to: (\\S+)", stdin)
-        if scenario["write_result"] and result:
-            pathlib.Path(result.group(1)).write_text(
-                "---\\noutcome: done\\nchanged: none\\naction_needed: none\\n---\\nDone.\\n")
-        print(json.dumps(scenario["start"]))
-    elif argv[:2] == ["thread", "list"]:
-        if "title" in state:
-            state["lists"] = state.get("lists", 0) + 1
-            state_path.write_text(json.dumps(state))
-        listed_for = scenario["listed_for"]
-        dropped = listed_for is not None and state.get("lists", 0) > listed_for
-        listed = scenario["list_includes_thread"] and "title" in state and not dropped
-        print(json.dumps([list_item(state)] if listed else []))
-    elif argv[:2] == ["thread", "show"] and scenario["listed_for"] is not None:
-        thread = {"threadId": scenario["start"]["threadId"], "title": state.get("title", ""),
-                  "status": "completed", "latestRunId": scenario["latest_run_id"],
-                  "archived": True, "settled": False}
-        print(json.dumps({"thread": thread, "messages": []}))
-    else:
-        print("fake t3: unsupported call " + " ".join(argv), file=sys.stderr)
-        sys.exit(2)
-''')
-
-_T3_THREAD_LIST_ITEM = {
-    "threadId": "",
-    "title": "",
-    "createdBy": "user",
-    "creationSource": "mcp",
-    "status": "running",
-    "latestRunId": None,
-    "providerInstanceId": "claudeAgent",
-    "model": "claude-opus-5-5",
-    "runtimeMode": "full-access",
-    "interactionMode": "default",
-    "linkedPullRequest": None,
-    "pullRequests": [],
-    "settled": False,
-    "settledAt": None,
-    "snoozed": False,
-    "snoozedUntil": None,
-    "parentThreadId": None,
-    "relationshipToParent": None,
-    "itemCount": 2,
-    "createdAt": "2026-10-25T10:00:00.000Z",
-    "updatedAt": "2026-10-25T10:00:05.000Z",
-}
 
 def _path_without_real_t3() -> str:
     dirs = os.environ.get("PATH", "").split(":")
@@ -5057,12 +4979,12 @@ def _process_started_at_iso(pid: int) -> str:
     return started.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _write_t3_home(tmp_path: pathlib.Path, pid: int, started_at: str) -> pathlib.Path:
+def _write_t3_home(tmp_path: pathlib.Path, pid: int, started_at: str, origin: str) -> pathlib.Path:
     home = tmp_path / "t3home"
     (home / "userdata").mkdir(parents=True)
     (home / "userdata" / "server-runtime.json").write_text(json.dumps({
-        "version": 1, "pid": pid, "port": 3773, "origin": "http://127.0.0.1:3773",
-        "startedAt": started_at, "serviceManaged": True, "serverVersion": "0.1.2",
+        "version": 1, "pid": pid, "port": 3773, "origin": origin,
+        "startedAt": started_at, "serviceManaged": True, "serverVersion": "0.1.6",
         "ownerId": "owner-test",
     }))
     return home
@@ -5072,9 +4994,14 @@ _ORCH_MODULE_DIR = _ORCH_SRC / "orchestrator"
 
 # Runs the real module of the same name, except for the verbs listed in
 # FAULTING_VERBS, which fault the way spawn_t3_lane.py does (traceback, exit 3).
+# With CALL_LOG set, each argv is first appended to it as one JSON line.
 _MODULE_PROXY_TEMPLATE = textwrap.dedent('''\
-    import os, sys
+    import json, os, sys
     FAULTING_VERBS = {faulting_verbs!r}
+    CALL_LOG = {call_log!r}
+    if CALL_LOG is not None:
+        with open(CALL_LOG, "a") as log:
+            log.write(json.dumps(sys.argv[1:]) + "\\n")
     if sys.argv[1:2] and sys.argv[1] in FAULTING_VERBS:
         print("Traceback (most recent call last):\\nRuntimeError: injected", file=sys.stderr)
         sys.exit(3)
@@ -5084,112 +5011,163 @@ _MODULE_PROXY_TEMPLATE = textwrap.dedent('''\
 
 
 def _spawn_script_with_faulting_lane_verbs(
-    tmp_path: pathlib.Path, faulting_verbs: set[str],
+    tmp_path: pathlib.Path, faulting_verbs: set[str], *, registry_call_log: pathlib.Path | None = None,
 ) -> pathlib.Path:
-    """A copy of spawn-claude.sh in a scratch repo tree whose lane module faults on *faulting_verbs*."""
+    """A copy of spawn-claude.sh in a scratch repo tree whose lane module faults on *faulting_verbs*.
+
+    With *registry_call_log*, its session_registry.py logs each argv there.
+    """
     repo = tmp_path / "repo"
     script = repo / "skills" / "spawn" / "spawn-claude.sh"
     script.parent.mkdir(parents=True)
     shutil.copy2(SPAWN_SCRIPT, script)
     module_dir = repo / "orchestrator" / "src" / "orchestrator"
     module_dir.mkdir(parents=True)
-    for name, verbs in (("session_registry.py", set()), ("spawn_t3_lane.py", faulting_verbs)):
+    proxies = (
+        ("session_registry.py", set(), registry_call_log),
+        ("spawn_t3_lane.py", faulting_verbs, None),
+    )
+    for name, verbs, call_log in proxies:
         (module_dir / name).write_text(_MODULE_PROXY_TEMPLATE.format(
-            faulting_verbs=sorted(verbs), orch_src=str(_ORCH_SRC),
-            real_module=str(_ORCH_MODULE_DIR / name),
+            faulting_verbs=sorted(verbs), call_log=None if call_log is None else str(call_log),
+            orch_src=str(_ORCH_SRC), real_module=str(_ORCH_MODULE_DIR / name),
         ))
     return script
 
 
-class _T3Call(NamedTuple):
-    argv: list[str]
-    stdin: str
-
-
 class _T3Lane:
-    """A t3-lane spawn fixture: a fake `t3` first on PATH, its scenario and call log."""
+    """A t3-lane spawn: the fake T3 the runtime names, this host paired with it, and the scenario it plays."""
 
-    def __init__(self, tmp_path: pathlib.Path, *, with_fake_t3: bool = True) -> None:
+    def __init__(self, tmp_path: pathlib.Path, server: FakeT3Server) -> None:
         self.tmp_path = tmp_path
+        self.server = server
         self.bin_dir = _make_bin_dir(tmp_path)
         _write_fake_claude(self.bin_dir, exit_code=0)
         self.emulator_marker = tmp_path / "emulator_used"
         _write_marker_only_failing_terminal(self.bin_dir, "xterm", self.emulator_marker)
         self.cwd = tmp_path / "project"
         self.cwd.mkdir()
-        self.log = tmp_path / "t3_calls.log"
         self.env = _base_env(self.bin_dir, "xterm")
         self.env["PATH"] = f"{self.bin_dir}:{_path_without_real_t3()}"
         self.env["CLAUDE_SPAWN_BACKEND"] = "t3"
-        self.env["T3CODE_HOME"] = str(_write_t3_home(tmp_path, 1, "2026-10-23T09:09:43.139Z"))
+        self.env["T3CODE_HOME"] = str(_write_t3_home(tmp_path, 1, "2026-10-23T09:09:43.139Z", server.origin))
         self.env["SPAWN_STARTED_GRACE_SECS"] = "20"
-        self.env["SPAWN_T3_POLL_SECS"] = "1"
-        self.env["FAKE_T3_SCENARIO"] = str(tmp_path / "t3_scenario.json")
         self.spawn_tmp = tmp_path / "spawntmp"
         self.spawn_tmp.mkdir()
         self.env["TMPDIR"] = str(self.spawn_tmp)
-        self.scenario: dict[str, object] = {
-            "log": str(self.log),
-            "start": {"threadId": "thread-7489", "projectId": "project-df", "runId": "run-1"},
-            "start_rc": 0,
+        self.registry_log = tmp_path / "registry_calls.log"
+        self.script = SPAWN_SCRIPT
+        self.scenario: dict[str, Any] = {
+            "workspace_root": str(self.cwd),
+            "project_archived_at": None,
             "thread_status": "running",
             "latest_run_id": "run-1",
-            "list_includes_thread": True,
-            "listed_for": None,
-            "transcript_dir": str(
-                pathlib.Path(self.env["CLAUDE_PROJECTS_DIR"])
-                / session_registry.encode_cwd(str(self.cwd))
-            ),
+            "archived_after_reads": None,
+            "writes_transcript": True,
             "sid": "0b7c2f1e-7489-4c3a-9d1e-5a6b7c8d9e0f",
             "write_result": False,
-            "workspace_root": str(self.cwd),
-            "list_item": _T3_THREAD_LIST_ITEM,
         }
-        self.script = SPAWN_SCRIPT
-        if with_fake_t3:
-            fake = self.bin_dir / "t3"
-            fake.write_text(_FAKE_T3_SCRIPT)
-            fake.chmod(0o755)
+        self._launched = False
+        self._reads = 0
+        self.credential = server.write_paired_credential(self.env["CLAUDE_FLEET_ROOT"])
+        server.tool_replies |= {
+            "t3_project_list": self.answer_project_list,
+            "t3_thread_launch": self.answer_launch,
+            "t3_thread_read": self.answer_read,
+            "t3_thread_wait": self.answer_wait,
+            "t3_thread_list": self.answer_thread_list,
+        }
+
+    def answer_project_list(self, arguments: Mapping[str, Any]) -> ToolSuccess:
+        project = {
+            "id": _T3_PROJECT_ID, "title": "df", "workspaceRoot": self.scenario["workspace_root"],
+            "archivedAt": self.scenario["project_archived_at"], "deletedAt": None,
+        }
+        return ToolSuccess({"projects": [project], "nextCursor": None})
+
+    def answer_launch(self, arguments: Mapping[str, Any]) -> ToolSuccess:
+        self._launched = True
+        message = str(arguments.get("message", ""))
+        if self.scenario["writes_transcript"]:
+            transcripts = pathlib.Path(self.env["CLAUDE_PROJECTS_DIR"]) / session_registry.encode_cwd(str(self.cwd))
+            transcripts.mkdir(parents=True, exist_ok=True)
+            line = {"type": "user", "message": {"role": "user", "content": message}}
+            (transcripts / f"{self.scenario['sid']}.jsonl").write_text(json.dumps(line) + "\n")
+        result = re.search(r"write your outcome to: (\S+)", message)
+        if self.scenario["write_result"] and result:
+            pathlib.Path(result.group(1)).write_text(
+                "---\noutcome: done\nchanged: none\naction_needed: none\n---\nDone.\n")
+        default_selection = {"instanceId": "claudeAgent", "model": "claude-opus-5-5"}
+        return ToolSuccess({
+            "threadId": _T3_THREAD_ID, "projectId": _T3_PROJECT_ID, "runId": "run-1", "status": "starting",
+            "modelSelection": arguments.get("modelSelection") or default_selection,
+        })
+
+    def _archived(self) -> bool:
+        after = self.scenario["archived_after_reads"]
+        return after is not None and self._reads > after
+
+    def answer_read(self, arguments: Mapping[str, Any]) -> ToolSuccess:
+        self._reads += 1
+        thread = {
+            "threadId": _T3_THREAD_ID, "projectId": _T3_PROJECT_ID, "title": "worker:df#7489 t3-lane-test",
+            "status": self.scenario["thread_status"], "latestRunId": self.scenario["latest_run_id"],
+            "archived": self._archived(), "settled": False, "worktreePath": None, "runtimeMode": "full-access",
+        }
+        return ToolSuccess({"thread": thread, "recentRuns": [], "items": [], "nextPosition": None, "hasMore": False})
+
+    def answer_wait(self, arguments: Mapping[str, Any]) -> ToolSuccess:
+        return ToolSuccess({
+            "threadId": _T3_THREAD_ID, "runId": self.scenario["latest_run_id"],
+            "status": self.scenario["thread_status"], "timedOut": False,
+        })
+
+    def answer_thread_list(self, arguments: Mapping[str, Any]) -> ToolSuccess:
+        listed = self._launched and not self._archived()
+        threads = [{"threadId": _T3_THREAD_ID, "status": self.scenario["thread_status"]}] if listed else []
+        return ToolSuccess({"projectId": _T3_PROJECT_ID, "threads": threads, "nextCursor": None, "total": len(threads)})
 
     def run(
-        self, *, skip_perms: str = "true", timeout: int = 60, start_new_session: bool = False,
+        self,
+        *,
+        skip_perms: str = "true",
+        timeout: int = 60,
+        start_new_session: bool = False,
+        title: str = "worker:df#7489 t3-lane-test",
     ) -> subprocess.CompletedProcess[bytes]:
-        pathlib.Path(self.env["FAKE_T3_SCENARIO"]).write_text(json.dumps(self.scenario))
-        self._register_project(str(self.scenario["workspace_root"]))
         return subprocess.run(
-            [str(self.script), str(self.cwd), skip_perms, "worker:df#7489 t3-lane-test", "do the thing"],
+            [str(self.script), str(self.cwd), skip_perms, title, "do the thing"],
             env=self.env,
             capture_output=True,
             timeout=_spawn_run_budget(timeout),
             start_new_session=start_new_session,
         )
 
-    def _register_project(self, workspace_root: str) -> None:
-        """Mirror the server's project projection, where spawn_t3_lane.py reads registered roots."""
-        userdata = pathlib.Path(self.env["T3CODE_HOME"]) / "userdata"
-        if not userdata.is_dir():
-            return
-        with contextlib.closing(sqlite3.connect(userdata / "statev2.sqlite")) as db:
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS projection_projects "
-                "(project_id TEXT PRIMARY KEY, workspace_root TEXT NOT NULL, deleted_at TEXT)"
-            )
-            db.execute(
-                "INSERT OR REPLACE INTO projection_projects VALUES ('project-df', ?, NULL)",
-                (workspace_root,),
-            )
-            db.commit()
+    def calls(self) -> list[RecordedRequest]:
+        return self.server.mcp_requests()
 
-    def calls(self) -> list[_T3Call]:
-        if not self.log.exists():
+    def started_threads(self) -> list[Any]:
+        return self.server.tool_calls("t3_thread_launch")
+
+    def unpair(self) -> None:
+        self.credential.unlink()
+
+    def log_registry_calls(self, faulting_lane_verbs: set[str] | None = None) -> None:
+        self.script = _spawn_script_with_faulting_lane_verbs(
+            self.tmp_path, faulting_lane_verbs or set(), registry_call_log=self.registry_log,
+        )
+
+    def registry_exit_calls(self) -> list[list[str]]:
+        if not self.registry_log.exists():
             return []
-        return [_T3Call(**json.loads(line)) for line in self.log.read_text().splitlines()]
-
-    def started_threads(self) -> list[_T3Call]:
-        return [c for c in self.calls() if c.argv[:2] == ["thread", "start"]]
+        argvs = [json.loads(line) for line in self.registry_log.read_text().splitlines()]
+        return [argv for argv in argvs if argv[:1] == ["exit"]]
 
     def records(self) -> list[pathlib.Path]:
         return list(pathlib.Path(self.env["CLAUDE_FLEET_ROOT"]).glob("sessions/*/record.json"))
+
+    def record_dir(self) -> str:
+        return str(_find_one_record(pathlib.Path(self.env["CLAUDE_FLEET_ROOT"])).parent)
 
     def record(self) -> session_registry.SessionRecord:
         records = self.records()
@@ -5197,175 +5175,336 @@ class _T3Lane:
         return session_registry.SessionRecord.from_json(records[0].read_text())
 
 
-def test_unknown_spawn_backend_is_bad_usage(tmp_path: pathlib.Path) -> None:
-    lane = _T3Lane(tmp_path)
-    lane.env["CLAUDE_SPAWN_BACKEND"] = "kitty"
+@pytest.fixture
+def t3_lane(tmp_path: pathlib.Path) -> Iterator[_T3Lane]:
+    with FakeT3Server.running() as server:
+        yield _T3Lane(tmp_path, server)
 
-    result = lane.run()
+
+def _enter_worktree(lane: _T3Lane) -> pathlib.Path:
+    """Spawn from a worktree under the project root, which stays the T3 project."""
+    worktree = lane.cwd / ".worktrees" / "7489"
+    worktree.mkdir(parents=True)
+    lane.cwd = worktree
+    return worktree
+
+
+def test_unknown_spawn_backend_is_bad_usage(t3_lane: _T3Lane) -> None:
+    t3_lane.env["CLAUDE_SPAWN_BACKEND"] = "kitty"
+
+    result = t3_lane.run()
 
     assert result.returncode == 2, f"stderr: {result.stderr.decode()}"
     assert "CLAUDE_SPAWN_BACKEND='kitty'" in result.stderr.decode()
-    assert not lane.records(), "bad usage must write no session record"
-    assert not lane.calls() and not lane.emulator_marker.exists()
+    assert not t3_lane.records(), "bad usage must write no session record"
+    assert not t3_lane.calls() and not t3_lane.emulator_marker.exists()
 
 
-def test_wm_backend_takes_the_emulator_path(tmp_path: pathlib.Path) -> None:
-    lane = _T3Lane(tmp_path)
-    _write_foreground_terminal(lane.bin_dir, "xterm")
-    lane.env["CLAUDE_SPAWN_BACKEND"] = "wm"
+def test_wm_backend_takes_the_emulator_path(t3_lane: _T3Lane) -> None:
+    _write_foreground_terminal(t3_lane.bin_dir, "xterm")
+    t3_lane.env["CLAUDE_SPAWN_BACKEND"] = "wm"
 
-    result = lane.run()
+    result = t3_lane.run()
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
-    assert lane.record().status == session_registry.Status.EXITED
-    assert not lane.calls(), "the wm backend must never call t3"
+    assert t3_lane.record().status == session_registry.Status.EXITED
+    assert not t3_lane.calls(), "the wm backend must never call T3"
 
 
-@pytest.mark.parametrize(("skip_perms", "claude_args", "refused_input"), [
-    ("false", None, "skip_permissions=false"),
-    ("true", "--resume abc", "CLAUDE_SPAWN_CLAUDE_ARGS"),
-])
-def test_explicit_t3_lane_refuses_inputs_it_cannot_honour_before_launch(
-    tmp_path: pathlib.Path, skip_perms: str, claude_args: str | None, refused_input: str,
-) -> None:
-    lane = _T3Lane(tmp_path)
-    if claude_args is not None:
-        lane.env["CLAUDE_SPAWN_CLAUDE_ARGS"] = claude_args
+def test_explicit_t3_lane_refuses_claude_cli_arguments_before_launch(t3_lane: _T3Lane) -> None:
+    t3_lane.env["CLAUDE_SPAWN_CLAUDE_ARGS"] = "--resume abc"
 
-    result = lane.run(skip_perms=skip_perms)
+    result = t3_lane.run()
 
     stderr = result.stderr.decode()
     assert result.returncode == 145, f"stderr: {stderr}"
-    assert refused_input in stderr
+    assert "CLAUDE_SPAWN_CLAUDE_ARGS" in stderr
     assert "t3 lane" in stderr and "explicitly (CLAUDE_SPAWN_BACKEND=t3)" in stderr
-    assert not lane.records(), "a refusal must precede the launching record"
-    assert not lane.calls() and not lane.emulator_marker.exists()
+    assert not t3_lane.records(), "a refusal must precede the launching record"
+    assert not t3_lane.calls() and not t3_lane.emulator_marker.exists()
 
 
-def test_auto_backend_selects_the_t3_lane_inside_a_t3_hosted_spawner(tmp_path: pathlib.Path) -> None:
-    lane = _T3Lane(tmp_path)
-    lane.env.pop("CLAUDE_SPAWN_BACKEND")
-    lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
-    lane.env["T3CODE_HOME"] = str(
-        _write_t3_home(tmp_path / "hosted", os.getpid(), _process_started_at_iso(os.getpid()))
-    )
+@pytest.mark.parametrize(("skip_perms", "runtime_mode"), [
+    ("false", "approval-required"),
+    ("true", "full-access"),
+])
+def test_t3_lane_runs_the_thread_in_the_runtime_mode_skip_permissions_picks(
+    t3_lane: _T3Lane, skip_perms: str, runtime_mode: str,
+) -> None:
+    t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
 
-    # A new session has no controlling tty, as inside a T3-hosted claude.
-    result = lane.run(start_new_session=True)
+    result = t3_lane.run(skip_perms=skip_perms)
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
-    assert len(lane.started_threads()) == 1, "auto must have chosen the t3 lane"
-    assert not lane.emulator_marker.exists()
+    (launch,) = t3_lane.started_threads()
+    assert launch["runtimeMode"] == runtime_mode
 
 
-def test_auto_backend_without_a_t3_server_takes_the_emulator_path(tmp_path: pathlib.Path) -> None:
-    lane = _T3Lane(tmp_path)
-    _write_foreground_terminal(lane.bin_dir, "xterm")
-    lane.env.pop("CLAUDE_SPAWN_BACKEND")
-    lane.env["T3CODE_HOME"] = str(tmp_path / "no-t3-home")
+def test_auto_backend_selects_the_t3_lane_inside_a_t3_hosted_spawner(t3_lane: _T3Lane) -> None:
+    t3_lane.env.pop("CLAUDE_SPAWN_BACKEND")
+    t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    t3_lane.env["T3CODE_HOME"] = str(_write_t3_home(
+        t3_lane.tmp_path / "hosted", os.getpid(), _process_started_at_iso(os.getpid()), t3_lane.server.origin,
+    ))
 
-    result = lane.run(skip_perms="false", start_new_session=True)
+    # A new session has no controlling tty, as inside a T3-hosted claude.
+    result = t3_lane.run(start_new_session=True)
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    assert len(t3_lane.started_threads()) == 1, "auto must have chosen the t3 lane"
+    assert not t3_lane.emulator_marker.exists()
+
+
+def test_auto_backend_without_a_t3_server_takes_the_emulator_path(t3_lane: _T3Lane) -> None:
+    _write_foreground_terminal(t3_lane.bin_dir, "xterm")
+    t3_lane.env.pop("CLAUDE_SPAWN_BACKEND")
+    t3_lane.env["T3CODE_HOME"] = str(t3_lane.tmp_path / "no-t3-home")
+
+    result = t3_lane.run(skip_perms="false", start_new_session=True)
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
     assert "T3 host detection faulted" not in result.stderr.decode()
-    assert not lane.calls(), "no server-runtime.json means not T3-hosted"
+    assert not t3_lane.calls(), "no server-runtime.json means not T3-hosted"
 
 
-def test_t3_lane_without_t3_on_path_has_no_launcher(tmp_path: pathlib.Path) -> None:
-    lane = _T3Lane(tmp_path, with_fake_t3=False)
+def test_t3_lane_without_a_credential_or_a_t3_to_self_pair_names_the_pair_verb(t3_lane: _T3Lane) -> None:
+    t3_lane.unpair()
 
-    result = lane.run()
+    result = t3_lane.run()
 
-    assert result.returncode == 126, f"stderr: {result.stderr.decode()}"
-    assert "t3-missing" in result.stderr.decode()
+    stderr = result.stderr.decode()
+    assert result.returncode == 126, f"stderr: {stderr}"
+    assert "t3-mcp-pair-failed" in stderr and "spawn_t3_lane.py pair" in stderr
+    assert not t3_lane.started_threads()
 
 
-def test_t3_lane_refuses_a_cwd_that_is_not_the_project_root(tmp_path: pathlib.Path) -> None:
-    lane = _T3Lane(tmp_path)
-    lane.scenario["workspace_root"] = str(tmp_path)
+def test_t3_lane_with_nothing_answering_the_runtime_origin_says_start_t3_not_pair(t3_lane: _T3Lane) -> None:
+    t3_lane.env["T3CODE_HOME"] = str(_write_t3_home(t3_lane.tmp_path / "dead", 1, "2026-10-23T09:09:43.139Z", DEAD_ORIGIN))
 
-    result = lane.run()
+    result = t3_lane.run()
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 126, f"stderr: {stderr}"
+    assert "descriptor-unreachable" in stderr and "start T3 Code" in stderr
+    assert "spawn_t3_lane.py pair" not in stderr
+
+
+def test_t3_lane_refuses_a_cwd_outside_every_t3_project(t3_lane: _T3Lane) -> None:
+    t3_lane.scenario["workspace_root"] = str(t3_lane.tmp_path / "elsewhere")
+
+    result = t3_lane.run()
 
     stderr = result.stderr.decode()
     assert result.returncode == 145, f"stderr: {stderr}"
-    assert f"cwd={lane.cwd}" in stderr and "explicitly (CLAUDE_SPAWN_BACKEND=t3)" in stderr
-    assert not lane.started_threads()
+    assert "cwd-outside-projects" in stderr and f"cwd={t3_lane.cwd}" in stderr
+    assert "explicitly (CLAUDE_SPAWN_BACKEND=t3)" in stderr
+    assert not t3_lane.started_threads()
+    assert result.stdout == b"", "a refused spawn names no record"
 
 
-def test_t3_lane_launch_failure_with_no_thread_found_is_127(tmp_path: pathlib.Path) -> None:
-    lane = _T3Lane(tmp_path)
-    lane.scenario["start_rc"] = 1
+def test_t3_lane_refuses_a_cwd_only_an_archived_project_contains_naming_its_root(t3_lane: _T3Lane) -> None:
+    t3_lane.scenario["project_archived_at"] = "2026-10-30T00:00:00.000Z"
 
-    result = lane.run()
+    result = t3_lane.run()
 
-    assert result.returncode == 127, f"stderr: {result.stderr.decode()}"
-
-
-def test_t3_thread_that_fails_before_running_is_failed_to_start(tmp_path: pathlib.Path) -> None:
-    lane = _T3Lane(tmp_path)
-    lane.scenario.update(thread_status="failed", latest_run_id=None, transcript_dir=None)
-
-    result = lane.run()
-
-    assert result.returncode == 144, f"stderr: {result.stderr.decode()}"
-    assert lane.record().status == session_registry.Status.FAILED_TO_START
+    stderr = result.stderr.decode()
+    assert result.returncode == 145, f"stderr: {stderr}"
+    assert f"project-archived: {os.path.realpath(t3_lane.cwd)}" in stderr
+    assert not t3_lane.started_threads()
 
 
-def test_t3_child_mode_finishes_on_the_threads_result_file(tmp_path: pathlib.Path) -> None:
-    lane = _T3Lane(tmp_path)
-    lane.scenario["write_result"] = True
+def test_t3_lane_binds_a_worktree_cwd_as_the_projects_existing_worktree(t3_lane: _T3Lane) -> None:
+    worktree = _enter_worktree(t3_lane)
+    t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
 
-    result = lane.run()
+    result = t3_lane.run()
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
-    record = lane.record()
-    assert record.claude_session_id == lane.scenario["sid"], "await-started must bind the transcript"
-    (start,) = lane.started_threads()
-    assert record.result_file and record.result_file in start.stdin
-    assert not list(lane.spawn_tmp.glob("spawn-claude-t3-prompt-*")), "the prompt temp file must be cleaned up"
+    (launch,) = t3_lane.started_threads()
+    assert launch["projectId"] == _T3_PROJECT_ID
+    assert launch["workspaceStrategy"] == {"type": "existing_worktree", "worktreePath": str(worktree)}
 
 
-def test_t3_child_mode_finishes_when_the_thread_is_archived(tmp_path: pathlib.Path) -> None:
-    lane = _T3Lane(tmp_path)
-    lane.scenario["listed_for"] = 1
+def test_t3_lane_refuses_a_worktree_t3_does_not_list_with_t3s_own_message(t3_lane: _T3Lane) -> None:
+    worktree = _enter_worktree(t3_lane)
+    t3_lane.server.tool_replies["t3_thread_launch"] = ToolFailure("invalid_request", "not listed by git worktree list")
 
-    result = lane.run()
+    result = t3_lane.run()
 
-    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
-    assert any(c.argv[:2] == ["thread", "show"] for c in lane.calls())
+    stderr = result.stderr.decode()
+    assert result.returncode == 145, f"stderr: {stderr}"
+    assert "cwd-not-project-worktree" in stderr and "not listed by git worktree list" in stderr
+    assert f"cwd={worktree}" in stderr
+    assert t3_lane.record().display is None
 
 
-def test_t3_child_mode_wait_fault_reports_a_lost_join_not_a_launch_failure(
-    tmp_path: pathlib.Path,
-) -> None:
-    lane = _T3Lane(tmp_path)
-    lane.script = _spawn_script_with_faulting_lane_verbs(tmp_path, {"wait"})
+def test_t3_lane_launch_failure_prints_t3s_detail_verbatim_and_is_127(t3_lane: _T3Lane) -> None:
+    detail = "50% of %41 \\n \u2014 x"
+    t3_lane.server.tool_replies["t3_thread_launch"] = ToolFailure("orchestration_error", detail)
 
-    result = lane.run()
+    result = t3_lane.run()
 
     stderr = result.stderr.decode()
     assert result.returncode == 127, f"stderr: {stderr}"
-    record = lane.record()
-    assert "JOIN LOST" in stderr and "thread-7489 may still be running" in stderr
-    assert str(_find_one_record(pathlib.Path(lane.env["CLAUDE_FLEET_ROOT"])).parent) in stderr
+    assert f"orchestration_error: {detail}" in stderr
+
+
+def test_t3_thread_that_fails_before_running_is_failed_to_start(t3_lane: _T3Lane) -> None:
+    t3_lane.scenario.update(thread_status="failed", latest_run_id=None, writes_transcript=False)
+
+    result = t3_lane.run()
+
+    assert result.returncode == 144, f"stderr: {result.stderr.decode()}"
+    assert t3_lane.record().status == session_registry.Status.FAILED_TO_START
+
+
+def test_t3_child_mode_finishes_on_the_threads_result_file_and_records_the_exit(t3_lane: _T3Lane) -> None:
+    t3_lane.log_registry_calls()
+    t3_lane.scenario["write_result"] = True
+
+    result = t3_lane.run()
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    record = t3_lane.record()
+    assert (record.status, record.exit_code) == (session_registry.Status.EXITED, 0)
+    assert t3_lane.registry_exit_calls() == [["exit", "--record", t3_lane.record_dir(), "--code", "0"]]
+    assert record.claude_session_id == t3_lane.scenario["sid"], "await-started must bind the transcript"
+    (launch,) = t3_lane.started_threads()
+    assert record.result_file and record.result_file in launch["message"]
+    assert not list(t3_lane.spawn_tmp.glob("spawn-claude-t3-prompt-*")), "the prompt temp file must be cleaned up"
+    assert result.stdout == b"", "child mode names no record on stdout"
+
+
+def test_t3_child_mode_finishes_when_the_thread_is_archived(t3_lane: _T3Lane) -> None:
+    t3_lane.log_registry_calls()
+    t3_lane.scenario["archived_after_reads"] = 1
+
+    result = t3_lane.run()
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    record = t3_lane.record()
+    assert (record.status, record.exit_code) == (session_registry.Status.EXITED, 0)
+    assert t3_lane.registry_exit_calls() == [["exit", "--record", t3_lane.record_dir(), "--code", "0"]]
+
+
+def test_t3_child_mode_on_a_deleted_thread_is_127_and_records_it(t3_lane: _T3Lane) -> None:
+    t3_lane.log_registry_calls()
+    t3_lane.server.tool_replies["t3_thread_read"] = replies_in_turn(
+        t3_lane.answer_read, ToolFailure("thread_not_found", f"Thread '{_T3_THREAD_ID}' was not found."),
+    )
+
+    result = t3_lane.run()
+
+    assert result.returncode == 127, f"stderr: {result.stderr.decode()}"
+    assert t3_lane.registry_exit_calls() == [["exit", "--record", t3_lane.record_dir(), "--code", "127"]]
+
+
+def test_t3_child_mode_wait_fault_reports_a_lost_join_and_records_no_exit(t3_lane: _T3Lane) -> None:
+    t3_lane.log_registry_calls(faulting_lane_verbs={"wait"})
+
+    result = t3_lane.run()
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 127, f"stderr: {stderr}"
+    assert "JOIN LOST" in stderr and f"{_T3_THREAD_ID} may still be running" in stderr
+    assert t3_lane.record_dir() in stderr
+    assert t3_lane.record().status == session_registry.Status.RUNNING
+    assert t3_lane.registry_exit_calls() == [], "a lost join must not write an exit code"
+
+
+def test_t3_sibling_mode_returns_with_a_running_t3_record(t3_lane: _T3Lane) -> None:
+    t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    t3_lane.env["CLAUDE_SPAWN_MODEL"] = "sonnet"
+
+    result = t3_lane.run()
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    record = t3_lane.record()
     assert record.status == session_registry.Status.RUNNING
+    assert record.display is not None and record.display.kind == "t3"
+    assert record.display.t3_environment_id == ENVIRONMENT_ID
+    (launch,) = t3_lane.started_threads()
+    assert launch["modelSelection"] == {"instanceId": "claudeAgent", "model": "sonnet"}
+    assert launch["title"] == "worker:df#7489 t3-lane-test"
 
 
-def test_t3_sibling_mode_returns_with_a_running_t3_record(tmp_path: pathlib.Path) -> None:
-    lane = _T3Lane(tmp_path)
+def _named_successor(spawn: subprocess.CompletedProcess[bytes]) -> dict[str, str]:
+    """The `record=… t3_thread_id=…` line a T3 sibling spawn printed, split on its one space and percent-decoded."""
+    (line,) = spawn.stdout.decode().splitlines()
+    tokens = {key: value for key, _, value in (word.partition("=") for word in line.split(" "))}
+    assert tokens.keys() == {"record", "t3_thread_id"}, line
+    return {key: urllib.parse.unquote(value) for key, value in tokens.items()}
+
+
+@pytest.mark.parametrize("fleet_dir", [None, "fleet root é"], ids=["default-root", "spaced-root"])
+def test_t3_sibling_spawn_names_its_stamped_record_on_stdout(t3_lane: _T3Lane, fleet_dir: str | None) -> None:
+    t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    if fleet_dir is not None:
+        t3_lane.env["CLAUDE_FLEET_ROOT"] = str(t3_lane.tmp_path / fleet_dir)
+        t3_lane.credential = t3_lane.server.write_paired_credential(t3_lane.env["CLAUDE_FLEET_ROOT"])
+
+    result = t3_lane.run()
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    assert _named_successor(result) == {"record": t3_lane.record_dir(), "t3_thread_id": _T3_THREAD_ID}
+    record = t3_lane.record()
+    assert record.status == session_registry.Status.RUNNING
+    assert record.display is not None and record.display.t3_thread_id == _T3_THREAD_ID
+
+
+_PROXY_ONLY_T3_SETTINGS = {
+    "defaultModelSelection": {"instanceId": "claude-proxy", "model": "claude-opus-5-5"},
+    "providerInstances": {
+        "claudeAgent": {"driver": "claudeAgent", "enabled": False},
+        "claude-proxy": {"driver": "claudeAgent", "enabled": True},
+    },
+}
+
+
+def _with_proxy_only_settings(lane: _T3Lane) -> _T3Lane:
+    settings = pathlib.Path(lane.env["T3CODE_HOME"]) / "userdata" / "settings.json"
+    settings.write_text(json.dumps(_PROXY_ONLY_T3_SETTINGS))
+    return lane
+
+
+def test_t3_lane_runs_a_pinned_model_on_the_projects_enabled_instance(t3_lane: _T3Lane) -> None:
+    lane = _with_proxy_only_settings(t3_lane)
     lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
-    lane.env["CLAUDE_SPAWN_MODEL"] = "sonnet"
+    lane.env["CLAUDE_SPAWN_MODEL"] = "fable"
 
     result = lane.run()
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    (launch,) = lane.started_threads()
+    assert launch["modelSelection"] == {"instanceId": "claude-proxy", "model": "fable"}
     record = lane.record()
-    assert record.status == session_registry.Status.RUNNING
-    assert record.display is not None and record.display.kind == "t3"
-    (start,) = lane.started_threads()
-    argv = start.argv
-    assert argv[argv.index("--model") + 1] == "sonnet"
-    assert argv[argv.index("--title") + 1] == "worker:df#7489 t3-lane-test"
+    assert record.display is not None and record.display.t3_thread_id == _T3_THREAD_ID
+
+
+@pytest.mark.parametrize(("model", "provider", "settings_override", "expected_stderr"), [
+    ("fable", "claudeAgent", {}, "CLAUDE_SPAWN_T3_PROVIDER names it"),
+    ("", "claudeAgent", {}, "without CLAUDE_SPAWN_MODEL"),
+    ("fable", "", {"defaultModelSelection": None, "providerInstances": {
+        "claudeAgent": {"driver": "claudeAgent", "enabled": False},
+    }}, "the fallback is disabled"),
+])
+def test_t3_lane_refuses_a_provider_it_cannot_use_and_writes_no_record(
+    t3_lane: _T3Lane, model: str, provider: str, settings_override: dict, expected_stderr: str,
+) -> None:
+    lane = _with_proxy_only_settings(t3_lane)
+    if settings_override:
+        settings = pathlib.Path(lane.env["T3CODE_HOME"]) / "userdata" / "settings.json"
+        settings.write_text(json.dumps({**_PROXY_ONLY_T3_SETTINGS, **settings_override}))
+    lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    lane.env["CLAUDE_SPAWN_MODEL"] = model
+    lane.env["CLAUDE_SPAWN_T3_PROVIDER"] = provider
+
+    result = lane.run()
+
+    assert result.returncode == 145, f"stderr: {result.stderr.decode()}"
+    assert expected_stderr in result.stderr.decode()
+    assert not lane.records(), "a refused provider must precede the launching record"
+    assert not lane.started_threads()
 
 
 @pytest.mark.parametrize(("spawn_mode", "spawner_env", "expected_parent"), [
@@ -5375,46 +5514,204 @@ def test_t3_sibling_mode_returns_with_a_running_t3_record(tmp_path: pathlib.Path
     ("child", {}, None),
 ])
 def test_t3_lane_stamps_the_spawn_parent_on_the_record(
-    tmp_path: pathlib.Path, spawn_mode: str, spawner_env: dict[str, str], expected_parent: str | None,
+    t3_lane: _T3Lane, spawn_mode: str, spawner_env: dict[str, str], expected_parent: str | None,
 ) -> None:
-    lane = _T3Lane(tmp_path)
-    lane.env["CLAUDE_SPAWN_MODE"] = spawn_mode
-    lane.env.update(spawner_env)
-    lane.scenario["write_result"] = True
+    t3_lane.env["CLAUDE_SPAWN_MODE"] = spawn_mode
+    t3_lane.env.update(spawner_env)
+    t3_lane.scenario["write_result"] = True
 
-    result = lane.run()
-
-    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
-    assert lane.record().parent_session_id == expected_parent
-
-
-def test_t3_lane_self_exit_asks_the_thread_to_archive_itself(tmp_path: pathlib.Path) -> None:
-    lane = _T3Lane(tmp_path)
-    lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
-    lane.env["CLAUDE_SPAWN_SELF_EXIT"] = "1"
-
-    result = lane.run()
+    result = t3_lane.run()
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
-    (start,) = lane.started_threads()
-    prompt = start.stdin
-    assert "t3_thread_organize" in prompt and '"archive"' in prompt
-    assert "exit-requested" not in prompt
+    assert t3_lane.record().parent_session_id == expected_parent
 
 
 @pytest.mark.parametrize("self_exit", [None, "", "true", "0"])
 def test_t3_lane_leaves_self_exit_off_unless_the_input_is_exactly_1(
-    tmp_path: pathlib.Path, self_exit: str | None,
+    t3_lane: _T3Lane, self_exit: str | None,
 ) -> None:
-    lane = _T3Lane(tmp_path)
-    lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
-    lane.env.pop("CLAUDE_SPAWN_SELF_EXIT", None)
+    t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    t3_lane.env.pop("CLAUDE_SPAWN_SELF_EXIT", None)
     if self_exit is not None:
-        lane.env["CLAUDE_SPAWN_SELF_EXIT"] = self_exit
+        t3_lane.env["CLAUDE_SPAWN_SELF_EXIT"] = self_exit
 
-    result = lane.run()
+    result = t3_lane.run()
 
     assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
-    (start,) = lane.started_threads()
-    assert "t3_thread_organize" not in start.stdin and "exit-requested" not in start.stdin
-    assert lane.record().self_exit is False
+    (launch,) = t3_lane.started_threads()
+    assert "t3_thread_organize" not in launch["message"] and "exit-requested" not in launch["message"]
+    assert t3_lane.record().self_exit is False
+
+
+_SPAWN_SKILL_DOC = SPAWN_SCRIPT.parents[2] / "skills" / "spawn" / "SKILL.md"
+_T3_ACTS = {"settle", "archive"}
+
+
+def _set_end_of_work_inputs(env: dict[str, str], t3_end: str | None, self_exit: str | None) -> None:
+    """Set or clear CLAUDE_SPAWN_T3_END and CLAUDE_SPAWN_SELF_EXIT; None means unset."""
+    for key, value in (("CLAUDE_SPAWN_T3_END", t3_end), ("CLAUDE_SPAWN_SELF_EXIT", self_exit)):
+        env.pop(key, None)
+        if value is not None:
+            env[key] = value
+
+
+@pytest.mark.parametrize(("t3_end", "self_exit", "expected_end", "expected_self_exit"), [
+    (None, None, None, False),
+    ("none", None, None, False),
+    ("", None, None, False),
+    ("settle", None, session_registry.T3End.SETTLE, False),
+    ("archive", None, session_registry.T3End.ARCHIVE, True),
+    (None, "1", session_registry.T3End.ARCHIVE, True),
+    ("archive", "1", session_registry.T3End.ARCHIVE, True),
+])
+def test_t3_lane_resolves_the_end_of_work_act_into_the_record_and_the_trailer(
+    t3_lane: _T3Lane,
+    t3_end: str | None,
+    self_exit: str | None,
+    expected_end: session_registry.T3End | None,
+    expected_self_exit: bool,
+) -> None:
+    t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    _set_end_of_work_inputs(t3_lane.env, t3_end, self_exit)
+
+    result = t3_lane.run()
+
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+    record = t3_lane.record()
+    assert record.t3_end is expected_end
+    assert record.self_exit is expected_self_exit
+    (launch,) = t3_lane.started_threads()
+    prompt = launch["message"]
+    assert "exit-requested" not in prompt
+    if expected_end is None:
+        assert "t3_thread_organize" not in prompt
+        return
+    (other_act,) = _T3_ACTS - {expected_end.value}
+    assert "t3_thread_organize" in prompt
+    assert f'"{expected_end.value}"' in prompt and f'"{other_act}"' not in prompt
+    assert "Ending a T3 session" in prompt
+    assert str(_SPAWN_SKILL_DOC) in prompt
+    assert "### Ending a T3 session" in _SPAWN_SKILL_DOC.read_text().splitlines(), "the trailer points at no heading"
+
+
+@pytest.mark.parametrize(("t3_end", "self_exit", "named"), [
+    ("settle", "1", ("CLAUDE_SPAWN_SELF_EXIT=1", "CLAUDE_SPAWN_T3_END=settle")),
+    ("Archive", None, ("CLAUDE_SPAWN_T3_END='Archive'",)),
+    ("exit", None, ("CLAUDE_SPAWN_T3_END='exit'",)),
+])
+def test_t3_lane_refuses_a_contradictory_or_unknown_end_of_work_input_before_anything(
+    t3_lane: _T3Lane, t3_end: str, self_exit: str | None, named: tuple[str, ...],
+) -> None:
+    _set_end_of_work_inputs(t3_lane.env, t3_end, self_exit)
+
+    result = t3_lane.run()
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 2, f"stderr: {stderr}"
+    assert all(name in stderr for name in named), stderr
+    assert not t3_lane.records(), "bad usage must write no session record"
+    assert not t3_lane.calls(), "bad usage must precede every T3 call"
+    assert not t3_lane.emulator_marker.exists()
+
+
+def test_tmux_lane_notes_once_that_t3_end_does_not_apply_and_stamps_nothing(tmp_path: pathlib.Path) -> None:
+    bin_dir = _make_bin_dir(tmp_path)
+    prompt_file = tmp_path / "captured_prompt.txt"
+    env_file = tmp_path / "captured_env.bin"
+    tmux_used = tmp_path / "tmux_used"
+    _write_fake_claude_obeying_exit_marker(bin_dir, prompt_file, env_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    _write_fake_tmux(bin_dir, tmux_used)
+    env = _base_env(bin_dir, "xterm")
+    env["CLAUDE_SPAWN_BACKEND"] = "tmux"
+    env["CLAUDE_SPAWN_PROJECT"] = "proj"
+    _set_end_of_work_inputs(env, "archive", None)
+
+    result = _run_spawn(env, tmp_path)
+
+    stderr = result.stderr.decode()
+    assert result.returncode == 0, f"stderr: {stderr}"
+    assert len([line for line in stderr.splitlines() if "CLAUDE_SPAWN_T3_END" in line]) == 1, stderr
+    record = session_registry.SessionRecord.from_json(
+        _find_one_record(pathlib.Path(env["CLAUDE_FLEET_ROOT"])).read_text()
+    )
+    assert record.t3_end is None
+    assert record.self_exit is True
+    prompt = prompt_file.read_text()
+    assert "exit-requested" in prompt and "t3_thread_organize" not in prompt
+    assert "CLAUDE_SPAWN_T3_END" not in _read_spawn_namespace(env_file)
+
+
+@pytest.mark.parametrize("backend", ["wm", "tmux"])
+def test_unknown_t3_end_is_bad_usage_on_every_lane(t3_lane: _T3Lane, backend: str) -> None:
+    t3_lane.env["CLAUDE_SPAWN_BACKEND"] = backend
+    _set_end_of_work_inputs(t3_lane.env, "junk", None)
+
+    result = t3_lane.run()
+
+    assert result.returncode == 2, f"stderr: {result.stderr.decode()}"
+    assert "CLAUDE_SPAWN_T3_END='junk'" in result.stderr.decode()
+    assert not t3_lane.records(), "bad usage must write no session record"
+    assert not t3_lane.emulator_marker.exists()
+
+
+# PRD §7 B11: a T3-hosted watcher's handoff archives itself only once the
+# successor the spawn named on stdout is confirmed by that record.
+
+_HANDOFF_TITLE = "escalation-watcher:df handoff"
+_PREDECESSOR_THREAD_ID = "thread-predecessor"
+
+
+def _seed_watcher_record(lane: _T3Lane, slug_pid: int, **fields: Any) -> pathlib.Path:
+    """Write an escalation-watcher record titled like the handoff's successor under the lane's fleet root."""
+    root = lane.env["CLAUDE_FLEET_ROOT"]
+    slug = session_registry.build_session_slug("escalation-watcher", "df", None, slug_pid)
+    session_registry.write_record(session_registry.SessionRecord(
+        session_slug=slug, title=_HANDOFF_TITLE, role="escalation-watcher", project="df",
+        launcher_pid=os.getpid(), **fields,
+    ), root=root)
+    return session_registry.record_path_for_slug(slug, root=root).parent
+
+
+def _seed_predecessor(lane: _T3Lane) -> pathlib.Path:
+    return _seed_watcher_record(
+        lane, os.getpid(), status=session_registry.Status.RUNNING, start_ts="2026-11-02T00:00:00+00:00",
+        display=session_registry.Display(kind="t3", t3_thread_id=_PREDECESSOR_THREAD_ID),
+    )
+
+
+def _seed_older_namesake(lane: _T3Lane) -> pathlib.Path:
+    return _seed_watcher_record(
+        lane, os.getppid(), status=session_registry.Status.LAUNCHING, start_ts="2026-11-01T00:00:00+00:00",
+    )
+
+
+@pytest.mark.parametrize("older_namesake", [False, True], ids=["alone", "older-namesake"])
+def test_t3_handoff_confirms_the_successor_the_spawn_named_and_exits_the_predecessor(
+    t3_lane: _T3Lane, older_namesake: bool,
+) -> None:
+    """An executable mirror of skills/spawn/SKILL.md §handoff steps 4-6 on their production surfaces; it does not guard that prose."""
+    t3_lane.env["CLAUDE_SPAWN_MODE"] = "sibling"
+    own_dir = _seed_predecessor(t3_lane)
+    decoy_dir = _seed_older_namesake(t3_lane) if older_namesake else None
+
+    spawn = t3_lane.run(title=_HANDOFF_TITLE)
+
+    assert spawn.returncode == 0, f"stderr: {spawn.stderr.decode()}"
+    named = _named_successor(spawn)
+    named_dir = pathlib.Path(named["record"])
+    assert named_dir not in (own_dir, decoy_dir)
+    root = t3_lane.env["CLAUDE_FLEET_ROOT"]
+    successor = session_registry.read_record(named_dir.name, root=root)
+    assert successor.title == _HANDOFF_TITLE
+    assert successor.status == session_registry.Status.RUNNING
+    assert successor.display is not None and successor.display.t3_thread_id == named["t3_thread_id"] == _T3_THREAD_ID
+
+    exit_verb = subprocess.run(
+        ["python3", str(_ORCH_MODULE_DIR / "session_registry.py"), "exit", "--record", str(own_dir), "--code", "0"],
+        env=t3_lane.env, capture_output=True, timeout=60,
+    )
+
+    assert exit_verb.returncode == 0, exit_verb.stderr.decode()
+    own = session_registry.read_record(own_dir.name, root=root)
+    assert (own.status, own.exit_code) == (session_registry.Status.EXITED, 0)

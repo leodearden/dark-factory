@@ -675,6 +675,22 @@ class TestHolderPreflight:
         assert report.outcomes == ()
         assert report.verification_census is None
 
+    @pytest.mark.parametrize('named', ['4028', '7777'])
+    def test_a_selected_row_sharing_a_key_with_another_holder_refuses(self, seed_root, named):
+        root = seed_root(TIER_TABLE_ROWS)
+        _write_scheduler_state(root, json.dumps({
+            'current_holders': {'docs/shared.md': named},
+            'held_by_task': {'4028': ['docs/shared.md'], '7777': ['docs/shared.md']},
+            'parks': {},
+        }))
+        server = _FakeClaimantServer()
+
+        report = _apply(take_census(root, NOW), server)
+
+        assert report.refused is True
+        assert report.holder_intersection == (4028,)
+        assert server.calls == []
+
     def test_holders_outside_the_selected_rows_do_not_refuse(self, seed_root):
         root = seed_root(TIER_TABLE_ROWS)
         _write_scheduler_state(root, _holders(scripts='103', docs='7777'))

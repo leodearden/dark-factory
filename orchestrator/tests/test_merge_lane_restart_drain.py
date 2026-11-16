@@ -27,10 +27,15 @@ from _merge_lane_fakes import (
     make_lane,
     running_lane,
 )
-from _orch_helpers import git_env_with_ceiling, wait_responsive
+from _orch_helpers import (
+    MERGE_GATE_BARRIER_TIMEOUT,
+    MERGE_RESULT_TIMEOUT,
+    git_env_with_ceiling,
+    wait_responsive,
+)
 from df_pytest_isolation import git_redirect_env
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import GroupMergeRequest, MergeLane, MergeRequest, QueuedBranch
 from orchestrator.merge_lane.types import TrainCallbacks
@@ -351,8 +356,8 @@ def _git(cwd: Path, *args: str) -> str:
 
 async def test_a_gate_reverify_deadline_runs_from_the_reverify_start(tmp_path: Path) -> None:
     """R2: a main that moves under a head's verify costs a gate re-verify, a
-    whole new verify; its deadline is measured from ITS start, not the first
-    verify's dispatch."""
+    whole new verify dispatched as the rebased head (task 8525); its deadline
+    is measured from ITS start, not the first verify's dispatch."""
     repo = seed_repo(tmp_path / 'repo', _SEED)
     scene = _Scene(
         repo=repo, git_ops=GitOps(_GIT, repo),
@@ -384,7 +389,7 @@ async def test_a_gate_reverify_deadline_runs_from_the_reverify_start(tmp_path: P
         outcome = await run.outcome(head)
 
     assert first['kind'] == 'verify'
-    assert gate['kind'] == 'gate_reverify'
+    assert gate['kind'] == 'verify'
     assert gate['started_ts'] >= first['started_ts'] + 5_000.0
     assert gate['deadline_ts'] - gate['started_ts'] == budget
     assert outcome.status == 'done', outcome
@@ -400,6 +405,12 @@ async def test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_
     """A halt requeues both a parked train T and the predecessor A it waited
     on, T ahead of A. Once admission resumes T must not park on A, which can
     only move after T: that would stall the merger for the whole park."""
+    # Deep chains off (task 7720): under the operational yaml's chain_cap the
+    # merger waits for pred's chain decision while pred waits for the one
+    # host, so it could not take T into the park this scene is about.
+    scene = dataclasses.replace(
+        scene, config=lane_scene_config(scene.repo, _GIT, merge_deep=MergeDeepConfig(chain_cap=0)),
+    )
     release_head = asyncio.Event()
     verifier = FakeVerifier(scripts={'head': hangs_until(release_head)})
     queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -410,15 +421,21 @@ async def test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_
 
     async with running_lane(lane) as run:
         await queue.put(head)
-        await wait_responsive(verifier.await_entry(1), label='head verify under way')
+        await wait_responsive(
+            verifier.await_entry(1),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
+            label='head verify under way',
+        )
         await queue.put(pred)
         await wait_responsive(
             _until(lambda: _state(lane, pred) in {'awaiting_verify', 'awaiting_host'}),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
             label='predecessor merged, waiting for the one host',
         )
         await queue.put(train)
         await wait_responsive(
             _until(lambda: _state(lane, train) == 'merging'),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
             label='train parked behind the predecessor',
         )
 
@@ -427,12 +444,15 @@ async def test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_
         assert (await run.outcome(head)).status == 'done'
         await wait_responsive(
             _until(lambda: (_state(lane, train), _state(lane, pred)) == ('queued', 'queued')),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
             label='train and predecessor both requeued',
         )
 
         lane.resume_admission()
         train_outcome = await wait_responsive(
-            asyncio.shield(train.result), label='train lands without parking on pred',
+            asyncio.shield(train.result),
+            timeout=MERGE_RESULT_TIMEOUT,
+            label='train lands without parking on pred',
         )
         pred_outcome = await run.outcome(pred)
 

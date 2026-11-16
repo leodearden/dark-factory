@@ -258,8 +258,10 @@ async def _run_script_check(
     On timeout, ``asyncio.wait_for`` cancels the ``runner`` coroutine, and
     ``orchestrator.git_ops._run`` then kills the script's whole process group
     (any helpers it forked included) and reaps the script (tasks 2608/4155).
-    The residual: a script that already exited, leaving a helper behind, gets
-    no signal (``shared/src/shared/git_async.py`` module docstring).
+    A script that already exited still has the helpers it left behind killed,
+    through a pidfd held from spawn (task 6251), unless it was reaped within
+    the spawn handshake, as a bare ``helper & exit 0`` often is; that residual
+    is stated in the ``shared/src/shared/git_async.py`` module docstring.
     """
     assert meta.script is not None  # enforced by the script cross-field validator
     assert meta.timeout_secs is not None  # enforced by the script cross-field validator

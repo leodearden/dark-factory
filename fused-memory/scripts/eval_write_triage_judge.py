@@ -394,7 +394,7 @@ def guard_committed_report(
         return report_path
 
     if dry_run:
-        import tempfile  # noqa: PLC0415
+        import tempfile
 
         redirected = str(Path(tempfile.gettempdir()) / _DRY_RUN_REPORT_NAME)
         logger.warning(
@@ -444,7 +444,7 @@ def apply_field_chars(config: Any, requested: int | None) -> int:
     A negative width is refused: the resolver would silently read the default
     instead, so the provenance would record a width the judge never used.
     """
-    from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+    from fused_memory.server.write_triage_judge import (
         resolve_judge_field_chars,
     )
 
@@ -525,13 +525,13 @@ def _retrieved_plan(
     The retrieval width and both band edges come from the SAME config the
     shipped ``triage_write`` reads, so a re-calibration moves this eval with it.
     """
-    import asyncio  # noqa: PLC0415
+    import asyncio
 
-    from fused_memory.server.write_triage import (  # noqa: PLC0415
+    from fused_memory.maintenance._utils import maintenance_service
+    from fused_memory.server.write_triage import (
         resolve_bands,
         resolve_candidate_k,
     )
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
     retrieval = load_retrieval()
     service = types.SimpleNamespace(config=config)
@@ -544,14 +544,10 @@ def _retrieved_plan(
     )
 
     async def prefetch() -> dict[str, dict[str, Any]]:
-        memory = MemoryService(config)
-        await memory.initialize()
-        try:
+        async with maintenance_service(config=config) as (_, memory):
             return await retrieval.prefetch_retrievals(
                 memory, labelled, project_id=args.project_id, k=k,
             )
-        finally:
-            await memory.close()
 
     slates = retrieval.retrieved_slates(
         labelled, asyncio.run(prefetch()),
@@ -570,10 +566,10 @@ def _retrieved_plan(
 
 
 def _run(args: Any) -> int:
-    import os  # noqa: PLC0415
+    import os
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.server.write_triage_judge import (
         resolve_judge_candidate_count,
         resolve_judge_enabled,
         resolve_judge_model,
@@ -684,7 +680,7 @@ def _run(args: Any) -> int:
 
 
 def main() -> int:
-    import argparse  # noqa: PLC0415
+    import argparse
 
     repo = Path(__file__).parent.parent
     parser = argparse.ArgumentParser(description=__doc__)

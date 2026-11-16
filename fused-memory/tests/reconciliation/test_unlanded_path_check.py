@@ -15,7 +15,7 @@ from itertools import count
 from pathlib import Path
 
 import pytest
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 from _merged_branch_repo import (
     INCIDENT_BRIEFING,
     INCIDENT_GUARD,
@@ -30,8 +30,8 @@ from fused_memory.reconciliation.cli_stage_runner import FINDING_ITEM_SCHEMA
 from fused_memory.reconciliation.flag_dedup import (
     ABSENCE_FLAG_TYPES,
     STALE_METADATA_FAMILY,
-    compute_flag_signature,
 )
+from fused_memory.reconciliation.flag_identity import compute_flag_signature
 from fused_memory.reconciliation.unlanded_path_check import (
     UNLANDED_PATH_FLAG_CATEGORY,
     UNLANDED_PATH_FLAG_TYPE,

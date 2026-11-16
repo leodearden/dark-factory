@@ -79,7 +79,7 @@ _BRIDGE_AGENT_ID = 'claude-interactive'
 def _init_git_repo(path: Path) -> str:
     """Create a minimal git repo at *path* with one commit; return full SHA.
 
-    Mirrors fused-memory/tests/_fm_helpers.py's ``_init_git_repo`` exactly,
+    Mirrors fused-memory/tests/_fm_git_repos.py's ``_init_git_repo`` exactly,
     kept local to this file — cross-package test-file import is avoided (see
     plan.json design_decisions/reuse). ``git init`` creates *path* itself.
     """

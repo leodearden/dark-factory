@@ -56,8 +56,13 @@ class TestFileDirtyTreeEscalation:
         esc = escs[0]
         assert esc.severity == 'critical'
         assert esc.level == 2
-        assert esc.agent_role.startswith('orchestrator-')
+        assert esc.task_id == _DIRTY_TREE_ESCALATION_SENTINEL
+        assert esc.agent_role == 'orchestrator-dirty-tree-guard'
         assert esc.category == 'cleanup_needed'
+        assert esc.summary == 'dirty project_root at startup - commit or stash WIP'
+        assert esc.suggested_action == (
+            'Commit or stash the dirty files listed above in project_root.'
+        )
         assert 'src/foo.py' in esc.detail
         assert 'src/bar.py' in esc.detail
 
@@ -95,6 +100,10 @@ class TestFileDirtyTreeEscalation:
         h.git_ops.has_dirty_working_tree = AsyncMock(return_value='src/foo.py')
 
         await h._file_dirty_tree_escalation(force_dirty_start=False)
+        assert h._escalation_queue is not None
+        [first] = h._escalation_queue.get_by_task(
+            _DIRTY_TREE_ESCALATION_SENTINEL, status='pending', level=2,
+        )
 
         # Simulate a watchdog restart: still dirty, but the file list changed.
         h.git_ops.has_dirty_working_tree = AsyncMock(
@@ -108,7 +117,9 @@ class TestFileDirtyTreeEscalation:
         )
         assert len(escs) == 1, 'second dirty startup must refresh, not duplicate'
         esc = escs[0]
-        assert esc.dedupe_count >= 1
+        assert esc.id == first.id
+        assert esc.dedupe_count == 1
+        assert esc.summary == first.summary
         assert 'src/baz.py' in esc.detail
 
     @pytest.mark.asyncio

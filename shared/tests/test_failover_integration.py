@@ -26,6 +26,7 @@ from shared.cli_invoke import (
 from shared.config_dir import TaskConfigDir
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.cost_store import CostStore
+from shared.testing_resume_rejection import measured_resume_rejection
 from shared.usage_gate import (
     SessionBudgetExhausted,
     UsageGate,
@@ -257,11 +258,11 @@ class TestSessionResumeAcrossFailover:
         assert third.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
     async def test_resume_fails_falls_back_to_fresh(self):
-        """A caps (sess-1) -> B resume fails (not cap) -> C fresh with original prompt."""
+        """A caps (sess-1) -> B's resume rejected by the CLI -> C fresh with original prompt."""
         gate = make_gate(['A', 'B', 'C'])
 
         capped_a = make_cap_result(session_id='sess-1', stderr=_cap_stderr('A'))
-        failed_resume = make_result(success=False, output='resume error')
+        failed_resume = measured_resume_rejection('sess-1')
         ok = make_result(success=True, output='fresh success')
 
         with (
@@ -287,7 +288,7 @@ class TestSessionResumeAcrossFailover:
 
         results = [
             make_cap_result(session_id='sess-1', stderr=_cap_stderr('A')),  # A caps
-            make_result(success=False, output='resume error'),          # B resume fails
+            measured_resume_rejection('sess-1'),                        # B resume rejected
             make_result(success=True, output='ok'),                     # C fresh
         ]
 
@@ -308,7 +309,7 @@ class TestSessionResumeAcrossFailover:
         # Call 2: resume from sess-1
         assert calls[1].kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
         assert calls[1].kwargs.get('resume_session_id') == 'sess-1'
-        # Call 3: fresh (resume failed)
+        # Call 3: fresh (resume rejected)
         assert calls[2].kwargs.get('prompt') == 'my prompt'
         assert 'resume_session_id' not in calls[2].kwargs
 

@@ -227,10 +227,9 @@ class TestDetection:
 
 class TestRunSelection:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('status', ['running', 'interrupted'])
-    async def test_unsettled_runs_are_not_read(self, journal_a: Any, status: str) -> None:
+    async def test_unsettled_runs_are_not_read(self, journal_a: Any) -> None:
         await _seed_run(
-            journal_a, RUN_LIVE, started_at=_later(5), status=status,
+            journal_a, RUN_LIVE, started_at=_later(5), status='running',
             reports={'memory_consolidator': [_finding(FINDING_2, _citation(ABSENT_2))]},
         )
         memory = FakeMemoryLookup()

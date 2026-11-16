@@ -7,19 +7,23 @@ escalation, survives a restart, and a resume restarts every window.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import logging
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from _orch_helpers import wait_responsive
 from _shadow_coordinator_doubles import (
     INCUMBENTS,
     PROJECT_ID,
     RUN_ID,
     START,
     CoordinatorRig,
+    RecordingEscalator,
     build_coordinator,
     completed,
     make_task,
@@ -28,7 +32,7 @@ from _shadow_coordinator_doubles import (
 from shared.cost_store import CostStore
 
 from orchestrator.event_store import EventType, ShadowSkipReason
-from orchestrator.run_store import ShadowCell, ShadowCellQuery
+from orchestrator.run_store import ShadowCell, ShadowCellQuery, ShadowStormRecord
 from orchestrator.shadow_eval import (
     COST_UNREADABLE_PAUSE,
     PRODUCTION_COST_BASIS,
@@ -162,7 +166,7 @@ _STREAK = {
         _ended('c7', _S.FAILED),
     ),
 }
-_RATIO = {'ratios': {'minimax-m3-endpoint': cost_ratio_verdict([_pair(9.0, _M, 2.0)], ceiling=3.0)}}
+_RATIO = {'ratios': {'minimax-m3.1-flash-endpoint': cost_ratio_verdict([_pair(9.0, _M, 2.0)], ceiling=3.0)}}
 
 
 class TestEvaluateStorm:
@@ -189,7 +193,7 @@ class TestEvaluateStorm:
 
         assert trip is not None
         assert trip.cause is ShadowStormCause.COST_RATIO
-        assert 'minimax-m3-endpoint' in trip.detail
+        assert 'minimax-m3.1-flash-endpoint' in trip.detail
         assert '4.50' in trip.detail
         assert '3.00' in trip.detail
 
@@ -362,6 +366,7 @@ def _seed(
         base_sha='a' * 40,
         state=state,
         cost_basis=CostBasis.METERED,
+        configured_model='sonnet',
         plan_source=PlanSource.PRODUCTION,
         reason=_SEEDED_REASONS.get(state),
         reference_kind=ReferenceKind.NONE if state is _S.SETTLED else None,
@@ -529,6 +534,131 @@ class TestCostGuardsEscape:
         assert {cell.state for cell in _cells(rig)} == {_S.SETTLED}
         assert _causes(rig) == expected
         assert rig.coordinator.storm_state().paused is bool(expected)
+
+
+class _AnnouncingEscalator(RecordingEscalator):
+    """A recording escalator that also signals, thread-safely, once a trip is filed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.announced = threading.Event()
+
+    async def __call__(self, trip: StormTrip) -> None:
+        await super().__call__(trip)
+        self.announced.set()
+
+
+class _ParkedEscalator(RecordingEscalator):
+    """A recording escalator whose filing hangs until the test releases it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.filing = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, trip: StormTrip) -> None:
+        await super().__call__(trip)
+        self.filing.set()
+        await self.release.wait()
+
+
+class TestConcurrentStormEvaluations:
+    @pytest.mark.asyncio
+    async def test_a_stale_calm_snapshot_does_not_overwrite_a_concurrent_pause(
+        self, tmp_path, costs, monkeypatch,
+    ):
+        escalator = _AnnouncingEscalator()
+        rig = build_coordinator(
+            tmp_path, costs, config=shadow_config(daily_budget_usd=1.0), escalator=escalator,
+        )
+        _seed(rig, _S.AWAITING_REFERENCE, task_id='budget-a', cost_usd=0.6)
+        loop = asyncio.get_running_loop()
+        snapshot_taken = asyncio.Event()
+        held: list[bool] = []
+        find = rig.store.find_shadow_cells
+
+        def find_then_hold(query: ShadowCellQuery) -> list[ShadowCell]:
+            cells = find(query)
+            is_budget_window = query.opened_since is not None and query.states is None
+            if is_budget_window and not held:
+                held.append(True)
+                loop.call_soon_threadsafe(snapshot_taken.set)
+                escalator.announced.wait(timeout=1.0)
+            return cells
+
+        monkeypatch.setattr(rig.store, 'find_shadow_cells', find_then_hold)
+
+        try:
+            evaluation_a = asyncio.create_task(rig.coordinator.expire(rig.clock.now()))
+            await wait_responsive(snapshot_taken.wait(), label='the first storm snapshot is held')
+            _seed(rig, _S.AWAITING_REFERENCE, task_id='budget-b', cost_usd=0.6)
+            await rig.coordinator.expire(rig.clock.now())
+            await evaluation_a
+        finally:
+            escalator.announced.set()
+
+        assert _causes(rig) == [ShadowStormCause.DAILY_BUDGET]
+        assert rig.coordinator.storm_state() == StormState.of(rig.store.get_shadow_storm(PROJECT_ID))
+        assert rig.coordinator.storm_state().paused is True
+
+    @pytest.mark.asyncio
+    async def test_a_stale_paused_snapshot_does_not_overwrite_a_concurrent_resume(
+        self, tmp_path, costs, monkeypatch,
+    ):
+        rig = await _tripped_streak(tmp_path, costs)
+        loop = asyncio.get_running_loop()
+        snapshot_taken = asyncio.Event()
+        resumed = threading.Event()
+        held: list[bool] = []
+        get = rig.store.get_shadow_storm
+
+        def get_then_hold(project_id: str) -> ShadowStormRecord:
+            storm = get(project_id)
+            if storm.paused and not held:
+                held.append(True)
+                loop.call_soon_threadsafe(snapshot_taken.set)
+                resumed.wait(timeout=1.0)
+            return storm
+
+        monkeypatch.setattr(rig.store, 'get_shadow_storm', get_then_hold)
+
+        evaluation = asyncio.create_task(rig.coordinator.expire(rig.clock.now()))
+        await wait_responsive(snapshot_taken.wait(), label='a paused storm snapshot is held')
+        try:
+            assert await rig.coordinator.resume() is True
+        finally:
+            resumed.set()
+        await evaluation
+
+        assert rig.store.get_shadow_storm(PROJECT_ID).paused is False
+        assert rig.coordinator.storm_state() == StormState(paused=False, cause=None, detail=None)
+        assert len(rig.escalator.trips) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_hung_storm_escalation_does_not_hold_the_operators_resume(
+        self, tmp_path, costs,
+    ):
+        escalator = _ParkedEscalator()
+        rig = build_coordinator(
+            tmp_path, costs, config=shadow_config(daily_budget_usd=1.0), escalator=escalator,
+        )
+        _seed(rig, _S.AWAITING_REFERENCE, task_id='over-budget', cost_usd=1.2)
+
+        evaluation = asyncio.create_task(rig.coordinator.expire(rig.clock.now()))
+        try:
+            await wait_responsive(escalator.filing.wait(), label='the storm escalation is parked')
+            resumed = await wait_responsive(
+                rig.coordinator.resume(), label='resume while the storm escalation hangs',
+            )
+            still_filing = not evaluation.done()
+        finally:
+            escalator.release.set()
+        await evaluation
+
+        assert (resumed, still_filing) == (True, True)
+        assert _causes(rig) == [ShadowStormCause.DAILY_BUDGET]
+        assert rig.store.get_shadow_storm(PROJECT_ID).paused is False
+        assert rig.coordinator.storm_state() == StormState(paused=False, cause=None, detail=None)
 
 
 async def _unreadable_cost(project_id: str, task_ids, **_: object) -> float:

@@ -65,7 +65,10 @@ const MODULE_SPECIFIER = '../../src/dashboard/static/redux/spark_path.js';
 // predicate and its two private helpers.
 //
 // `axisMax` (task 6370) is the count-axis maximum rule charts.jsx calls, tested
-// in spark_path_count_axis.test.mjs.
+// in spark_path_count_axis.test.mjs; `bandPaths` (task 8461) is LineChart's
+// bound-band builder, tested in spark_path_band.test.mjs; `axisStepPaths`
+// (task 8465) is LineChart's step-series builder, tested in
+// spark_path_step.test.mjs.
 const EXPECTED_FUNCTION_NAMES = [
   'isPlottable',
   'sparkPaths',
@@ -75,6 +78,8 @@ const EXPECTED_FUNCTION_NAMES = [
   'axisY',
   'axisMax',
   'axisPaths',
+  'axisStepPaths',
+  'bandPaths',
   'barFractions',
   'stackedAreaPaths',
 ];

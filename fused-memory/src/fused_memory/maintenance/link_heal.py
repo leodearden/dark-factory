@@ -31,6 +31,7 @@ from types import MappingProxyType
 from typing import Any
 
 from fused_memory.maintenance.link_heal_store import (
+    CreatedWindow,
     LinkCensus,
     LinkHealStore,
     LiveRecord,
@@ -658,7 +659,12 @@ class RunCounts:
     ``unexamined`` counts the examined links that reached the verdict rows with no basis.
     ``adjudications_reused`` counts the adjudicator verdicts already ledgered at the
     texts a link shows; ``adjudication_failed`` the links the adjudicator was asked
-    about and gave no verdict.
+    about and gave no verdict. ``withheld_uncalibrated`` counts the heals a writing
+    sweep's plan run or an apply run withheld because the adjudicator behind their
+    verdict has no passing calibration: a policy refusal, not a failure, so it
+    leaves a run complete. ``superseded`` counts the pending heals a plan run
+    retired because its own ruling on their link, at the texts they rest on, no
+    longer plans them.
     """
 
     links_total: int = 0
@@ -671,6 +677,7 @@ class RunCounts:
     planned_by_action: Mapping[str, int] = field(default_factory=dict)
     already_pending: int = 0
     undo_suppressed: int = 0
+    not_enabled: int = 0
     bases_unlinked: int = 0
     read_failed: int = 0
     applied: int = 0
@@ -678,6 +685,8 @@ class RunCounts:
     skipped_cap: int = 0
     failed: int = 0
     not_attempted: int = 0
+    withheld_uncalibrated: int = 0
+    superseded: int = 0
     stale_rating: int = 0
     contested_reported: int = 0
     chain_reported: int = 0
@@ -724,9 +733,62 @@ class RunCounts:
 
 
 @dataclass(frozen=True)
+class LinkDecision:
+    """One examined link: as read, the verdict matched to it, and the table's outcome.
+
+    ``planned`` is the heal the outcome plans, set exactly when ``decision`` is a
+    :class:`HealAction`.
+    """
+
+    state: LinkState
+    basis: LinkBasis | None
+    decision: HealAction | Report
+    planned: PlannedAction | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.decision, HealAction) != (self.planned is not None):
+            raise ValueError(f'{self.decision} plans a heal exactly when it is a HealAction')
+
+    @property
+    def basis_ref(self) -> tuple[BasisSource | None, str | None]:
+        """The source and key the decision rests on: its heal's, else the matched verdict's."""
+        if self.planned is not None:
+            return self.planned.basis_source, self.planned.basis_key
+        if self.basis is not None:
+            return self.basis.source, self.basis.key
+        return None, None
+
+    def rules_on(self, heal: PlannedAction) -> bool:
+        """Whether this decision is a ruling on *heal*'s link at the texts *heal* rests
+        on: the same link, the child text read now, and the parent text read now unless
+        *heal* rests on the child alone. An unexamined link and a stale rating rule on
+        nothing."""
+        if self.decision in _NO_RULING:
+            return False
+        state = self.state
+        parent_sha256 = None if state.parent is None else state.parent.text_sha256
+        return (
+            heal.project_id == state.project_id
+            and heal.child_id == state.child.memory_id
+            and heal.pre_image.parent_id == state.link.parent_id
+            and heal.child_sha256 == state.child.text_sha256
+            and heal.parent_sha256 in (None, parent_sha256)
+        )
+
+
+#: The outcomes that judge nothing at the texts a link shows: no basis, or one
+#: that judges other texts.
+_NO_RULING = frozenset({Report.UNEXAMINED, Report.STALE_RATING})
+
+
+@dataclass(frozen=True)
 class Plan:
-    actions: tuple[PlannedAction, ...]
+    decisions: tuple[LinkDecision, ...]
     counts: RunCounts
+
+    @property
+    def actions(self) -> tuple[PlannedAction, ...]:
+        return tuple(item.planned for item in self.decisions if item.planned is not None)
 
 
 async def read_link_state(
@@ -779,14 +841,27 @@ class LinkReads:
 
 
 async def read_links(
-    store: LinkHealStore, census: LinkCensus, projects: Sequence[str],
+    store: LinkHealStore,
+    census: LinkCensus,
+    projects: Sequence[str],
+    created_in: CreatedWindow | None = None,
+    *,
+    presence_projects: Sequence[str] = (),
 ) -> LinkReads:
+    """Every live link of *projects*, only those whose child *created_in* admits
+    when it is given.
+
+    A parent missing from its child's project is looked for in *projects* and in
+    *presence_projects*, so a subset run still reads a parent hosted elsewhere as
+    in another project rather than absent.
+    """
+    universe = tuple(dict.fromkeys((*projects, *presence_projects)))
     states: list[LinkState] = []
     unread: list[tuple[str, str]] = []
     for project_id in projects:
-        for child_id in await census.linked_ids(project_id):
+        for child_id in await census.linked_ids(project_id, created_in):
             try:
-                state = await read_link_state(store, project_id, child_id, projects)
+                state = await read_link_state(store, project_id, child_id, universe)
             except StoreReadFailed:
                 unread.append((project_id, child_id))
                 continue
@@ -811,9 +886,11 @@ async def build_plan(
     store: LinkHealStore,
     census: LinkCensus,
     projects: Sequence[str],
+    created_in: CreatedWindow | None = None,
 ) -> Plan:
-    """Decide every live link of *projects* against *bases*. Writes nothing."""
-    return plan_links(await read_links(store, census, projects), bases)
+    """Decide every live link of *projects* (narrowed by *created_in*, as in
+    :func:`read_links`) against *bases*. Writes nothing."""
+    return plan_links(await read_links(store, census, projects, created_in), bases)
 
 
 def _link_key(project_id: str, child_id: str, parent_id: str | None) -> tuple[str, str, str | None]:
@@ -832,15 +909,13 @@ class _PlanTally:
         self._matched: set[tuple[str, str, str | None]] = set()
         self._unread: set[tuple[str, str]] = set()
         self._reports: Counter[Report] = Counter()
-        self._actions: list[PlannedAction] = []
-        self._examined = 0
+        self._decisions: list[LinkDecision] = []
         self._adjudicated = 0
 
     def record_read_failure(self, project_id: str, child_id: str) -> None:
         self._unread.add((project_id, child_id))
 
     def record(self, state: LinkState) -> None:
-        self._examined += 1
         key = _link_key(state.project_id, state.child.memory_id, state.link.parent_id)
         basis = self._bases.get(key)
         if basis is not None:
@@ -848,10 +923,14 @@ class _PlanTally:
             if not is_stale(state, basis):
                 self._adjudicated += 1
         decision = decide(state, basis)
+        planned = None
         if isinstance(decision.outcome, HealAction):
-            self._actions.append(_planned_action(state, decision.outcome, decision.basis_source, basis))
+            planned = _planned_action(state, decision.outcome, decision.basis_source, basis)
         else:
             self._reports[decision.outcome] += 1
+        self._decisions.append(
+            LinkDecision(state=state, basis=basis, decision=decision.outcome, planned=planned),
+        )
 
     def _bases_unlinked(self) -> int:
         return sum(
@@ -862,17 +941,19 @@ class _PlanTally:
 
     def plan(self) -> Plan:
         reported: dict[str, Any] = {report.value: self._reports[report] for report in Report}
+        decisions = tuple(self._decisions)
+        actions = [item.planned for item in decisions if item.planned is not None]
         counts = RunCounts(
-            links_total=self._examined + len(self._unread),
-            examined=self._examined,
+            links_total=len(decisions) + len(self._unread),
+            examined=len(decisions),
             adjudicated=self._adjudicated,
-            planned=len(self._actions),
-            planned_by_action=Counter(action.action.value for action in self._actions),
+            planned=len(actions),
+            planned_by_action=Counter(action.action.value for action in actions),
             bases_unlinked=self._bases_unlinked(),
             read_failed=len(self._unread),
             **reported,
         )
-        return Plan(actions=tuple(self._actions), counts=counts)
+        return Plan(decisions=decisions, counts=counts)
 
 
 def _planned_action(

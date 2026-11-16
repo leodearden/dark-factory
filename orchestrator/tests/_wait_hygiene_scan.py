@@ -3,21 +3,29 @@ result wait, which turns a hang into a confusing ``outcome is None``, and a
 worker stop that a ``wait_responsive`` give-up can skip, which leaks the
 worker into the next test.
 
-Pure: source text in, pytest item ids out. It bills no wall clock. It shares
+Pure: source text in, pytest item ids out (for the teardown scan, a census
+of them). It bills no wall clock. It shares
 only the item traversal and the ``asyncio.wait_for`` call shape with
 _wait_budget_audit.py, so both scans see the same items.
 
 Each scan must never raise: a crash would fail the whole suite over an
 unrelated edit to a scanned file. Unparseable source has no items, so it
-yields [].
+yields none.
 """
 
 from __future__ import annotations
 
 import ast
 from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import NamedTuple
 
-from _wait_budget_audit import collect_test_items, is_asyncio_wait_for_call, item_id
+from _wait_budget_audit import (
+    collect_test_items,
+    is_asyncio_wait_for_call,
+    is_responsive_wait_call,
+    item_id,
+)
 
 
 def _is_timeout_error(node: ast.expr) -> bool:
@@ -119,15 +127,43 @@ def suppressed_result_wait_items(source: str) -> list[str]:
     )
 
 
-def _is_wait_responsive_call(node: ast.AST) -> bool:
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == 'wait_responsive'
+@dataclass(frozen=True)
+class WorkerTeardownScan:
+    """Sorted item ids: those calling a responsive wait (the scan's scope), those of them that also stop a worker, and those with a stop outside a guarding finally."""
+
+    waiting_items: tuple[str, ...]
+    stopping_items: tuple[str, ...]
+    unguarded_items: tuple[str, ...]
+
+
+_TASK_SPAWNERS = frozenset({'create_task', 'ensure_future'})
+
+
+def _spawns_a_task(call: ast.Call) -> bool:
+    func = call.func
+    return (isinstance(func, ast.Attribute) and func.attr in _TASK_SPAWNERS) or (
+        isinstance(func, ast.Name) and func.id in _TASK_SPAWNERS
     )
 
 
-def _is_worker_stop_call(node: ast.AST) -> bool:
+def _run_task_receivers(function: ast.AST) -> frozenset[str]:
+    """Every Name ``R`` that *function* runs as a task: ``create_task(R.run(...))`` or ``ensure_future(R.run(...))``."""
+    receivers: set[str] = set()
+    for node in ast.walk(function):
+        if not (isinstance(node, ast.Call) and _spawns_a_task(node) and node.args):
+            continue
+        task = node.args[0]
+        if (
+            isinstance(task, ast.Call)
+            and isinstance(task.func, ast.Attribute)
+            and task.func.attr == 'run'
+            and isinstance(task.func.value, ast.Name)
+        ):
+            receivers.add(task.func.value.id)
+    return frozenset(receivers)
+
+
+def _is_worker_stop_call(node: ast.AST, receivers: frozenset[str]) -> bool:
     if not isinstance(node, ast.Call):
         return False
     func = node.func
@@ -137,15 +173,13 @@ def _is_worker_stop_call(node: ast.AST) -> bool:
         isinstance(func, ast.Attribute)
         and func.attr == 'stop'
         and isinstance(func.value, ast.Name)
-        and func.value.id == 'worker'
+        and func.value.id in receivers
     )
 
 
-def _has_unguarded_worker_stop(function: ast.AST) -> bool:
-    wait_calls = [node for node in ast.walk(function) if _is_wait_responsive_call(node)]
-    if not wait_calls:
-        return False
-    guarded: set[ast.AST] = set()
+def _guarded_nodes(function: ast.AST, wait_calls: list[ast.AST]) -> set[int]:
+    """Ids of every node inside a ``finally:`` whose ``try:`` body encloses all of *wait_calls*."""
+    guarded: set[int] = set()
     for try_node in ast.walk(function):
         if not isinstance(try_node, ast.Try):
             continue
@@ -153,14 +187,53 @@ def _has_unguarded_worker_stop(function: ast.AST) -> bool:
         # A give-up raised by a wait OUTSIDE this try's body skips its
         # finally, so the finally guards nothing unless it encloses them all.
         if all(id(wait) in enclosed for wait in wait_calls):
-            guarded.update(
-                node
-                for stmt in try_node.finalbody
-                for node in ast.walk(stmt)
-                if _is_worker_stop_call(node)
-            )
-    return any(
-        _is_worker_stop_call(node) and node not in guarded for node in ast.walk(function)
+            guarded.update(id(node) for stmt in try_node.finalbody for node in ast.walk(stmt))
+    return guarded
+
+
+class _TeardownRoles(NamedTuple):
+    waits: bool
+    stops_a_worker: bool
+    stops_one_unguarded: bool
+
+
+_NO_TEARDOWN_ROLE = _TeardownRoles(waits=False, stops_a_worker=False, stops_one_unguarded=False)
+
+
+def _classify_teardown(function: ast.AST) -> _TeardownRoles:
+    wait_calls = [node for node in ast.walk(function) if is_responsive_wait_call(node)]
+    if not wait_calls:
+        return _NO_TEARDOWN_ROLE
+    receivers = frozenset({'worker'}) | _run_task_receivers(function)
+    stop_calls = [node for node in ast.walk(function) if _is_worker_stop_call(node, receivers)]
+    guarded = _guarded_nodes(function, wait_calls)
+    return _TeardownRoles(
+        waits=True,
+        stops_a_worker=bool(stop_calls),
+        stops_one_unguarded=any(id(stop) not in guarded for stop in stop_calls),
+    )
+
+
+def scan_worker_teardown(source: str) -> WorkerTeardownScan:
+    """The esc-3980-4 teardown census of *source*'s pytest items
+    (see :func:`unguarded_worker_teardown_items` for the rule). Never raises:
+    unparseable source yields three empty tuples."""
+    waiting: set[str] = set()
+    stopping: set[str] = set()
+    unguarded: set[str] = set()
+    for owner, function in collect_test_items(source):
+        roles = _classify_teardown(function)
+        item = item_id(owner, function.name)
+        if roles.waits:
+            waiting.add(item)
+        if roles.stops_a_worker:
+            stopping.add(item)
+        if roles.stops_one_unguarded:
+            unguarded.add(item)
+    return WorkerTeardownScan(
+        waiting_items=tuple(sorted(waiting)),
+        stopping_items=tuple(sorted(stopping)),
+        unguarded_items=tuple(sorted(unguarded)),
     )
 
 
@@ -176,25 +249,24 @@ def unguarded_worker_teardown_items(source: str) -> list[str]:
     That leak is why one red test used to cascade into unrelated failures
     (task 4219).
 
-    An item is reported when it calls ``wait_responsive(...)`` and calls a
-    worker stop -- ``worker.stop()`` or the shared ``stop_merge_worker(...)``
-    helper -- anywhere other than inside a ``finally:`` whose ``try:`` body
-    encloses EVERY ``wait_responsive`` call in the item. Crediting any
+    An item is reported when it calls a responsive wait (wait_responsive or
+    poll_responsive, per _wait_budget_audit.py::is_responsive_wait_call) and
+    calls a worker stop -- ``<receiver>.stop()`` or the shared
+    ``stop_merge_worker(...)`` helper -- anywhere other than inside a
+    ``finally:`` whose ``try:`` body encloses EVERY responsive wait in the
+    item. Crediting any
     finally at all would miss a wait that sits before the ``try:``, whose
     give-up skips that finally too (task 4219 amendment). Recognising
     ``stop_merge_worker`` keeps the scan from going vacuous for an item that
     adopts the other blessed teardown shape.
 
-    Deliberately scoped to items that call ``wait_responsive``: unmigrated
+    Deliberately scoped to items that call a responsive wait: unmigrated
     straight-line teardown elsewhere is not this scan's business, which is
-    to stop the migrated set regressing. Deliberately narrow to a variable
-    literally named ``worker``: a false negative on an oddly named variable
-    is the safe direction for a regression guard.
+    to stop the migrated set regressing. A receiver is a worker by
+    structure, not by a list of names: a variable named ``worker``, or any
+    Name whose ``.run()`` the item hands to ``create_task(...)`` or
+    ``ensure_future(...)``, attribute or bare spelling. A stop on
+    any other receiver is not a worker stop, the safe direction for a
+    regression guard.
     """
-    return sorted(
-        {
-            item_id(owner, function.name)
-            for owner, function in collect_test_items(source)
-            if _has_unguarded_worker_stop(function)
-        }
-    )
+    return list(scan_worker_teardown(source).unguarded_items)

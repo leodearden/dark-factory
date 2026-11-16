@@ -28,10 +28,11 @@ Lifecycle:
 The give-up contract is load-bearing for BOTH workflow waiters, which is why
 it lives here rather than in either consumer.  ``_mark_blocked`` →
 ``_await_steward_completion`` reads the published outcome off the in-process
-channel; ``run()``'s ESCALATED branch → ``_wait_for_resolution`` is
-escalation-queue-only and is woken ONLY by the dismissal (``resolve`` →
-``_resolve_callback`` → ``harness._on_escalation_resolved`` →
-``_escalation_events[task_id].set()``).  A new early return that publishes
+channel, where every outcome is tagged with the escalation it is about
+(``PublishedStewardOutcome``); ``run()``'s ESCALATED branch →
+``_wait_for_resolution`` is escalation-queue-only and is woken ONLY by the
+dismissal (``resolve`` → ``_resolve_callback`` →
+``harness._on_escalation_resolved`` → ``_escalation_events[task_id].set()``).  A new early return that publishes
 without dismissing is therefore invisible to the second waiter — it parks the
 workflow forever while this steward re-handles the record at loop speed, which
 is exactly what task 2248 shipped.
@@ -49,7 +50,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from escalation.classify import classify_resolver_tier
+from escalation.classify import closed_by_non_sweep_resolver
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -60,11 +61,12 @@ from shared.process_cost import next_resume_prior
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import STEWARD
-from orchestrator.event_store import EventStore, EventType
+from orchestrator.event_store import EventStore, EventType, cli_resume_failed_data
 from orchestrator.guard_state import PersistentMap, PersistentSet, guard_path
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.workflow_types import (
+    PublishedStewardOutcome,
     StewardBudgetExhausted,
     StewardInterrupted,
     StewardReescalatedL1,
@@ -231,7 +233,7 @@ class TaskSteward:
         # for stewards built without that wiring (most of this module's
         # unit tests, and any other caller) — _publish_outcome is a no-op
         # and the wip-gated guards below default to wip=False in that case.
-        self._outcome_channel: asyncio.Queue | None = None
+        self._outcome_channel: asyncio.Queue[PublishedStewardOutcome] | None = None
         self._wip_probe: Callable[[], Awaitable[bool]] | None = None
 
     # ------------------------------------------------------------------
@@ -245,10 +247,14 @@ class TaskSteward:
         )
         logger.info(f'Steward started for task {self.task_id}')
 
-    def set_outcome_channel(self, channel: asyncio.Queue) -> None:
+    def set_outcome_channel(
+        self, channel: asyncio.Queue[PublishedStewardOutcome],
+    ) -> None:
         """Register the in-process channel :meth:`_handle_escalation` publishes on.
 
-        Wired by :meth:`TaskWorkflow._ensure_steward_started`.  Left unset
+        Every publication is a :class:`PublishedStewardOutcome` tagged with the
+        escalation it is about.  Wired by
+        :meth:`TaskWorkflow._ensure_steward_started`.  Left unset
         (``None``) by every caller that does not need the typed outcome —
         :meth:`_publish_outcome` is then a no-op.
         """
@@ -264,8 +270,10 @@ class TaskSteward:
         """
         self._wip_probe = probe
 
-    def _publish_outcome(self, outcome: StewardOutcome) -> None:
-        """Put *outcome* on the registered channel; no-op when none is set.
+    def _publish_outcome(self, escalation_id: str, outcome: StewardOutcome) -> None:
+        """Put *outcome*, tagged with *escalation_id*, on the registered channel.
+
+        No-op when no channel is set.
 
         Synchronous (``put_nowait``, not ``await queue.put``) so it is safe
         to call from both async call sites (``_handle_escalation``) and sync
@@ -274,7 +282,9 @@ class TaskSteward:
         ``QueueFull``.
         """
         if self._outcome_channel is not None:
-            self._outcome_channel.put_nowait(outcome)
+            self._outcome_channel.put_nowait(
+                PublishedStewardOutcome(escalation_id, outcome),
+            )
 
     async def stop(self) -> None:
         """Cancel the steward loop and cleanup."""
@@ -769,7 +779,9 @@ class TaskSteward:
                 or result.output
                 or escalation.summary
             )
-            self._publish_outcome(StewardResolved(resolution_text=resolution_text))
+            self._publish_outcome(
+                escalation.id, StewardResolved(resolution_text=resolution_text),
+            )
 
     # ------------------------------------------------------------------
     # Session-aware invocation with cap-hit recovery
@@ -820,7 +832,10 @@ class TaskSteward:
         auth routing) to the shared ``invoke_with_cap_retry``.  This method
         does only session-id bookkeeping: it forwards ``self._session_id``
         as ``resume_session_id`` when a prior session exists, and captures
-        the result's ``session_id`` for the next call.
+        the result's ``session_id`` for the next call.  A fresh session
+        replaces ``_session_id`` only after the CLI provably rejected the
+        armed resume, and that replacement is reported
+        (``_note_rejected_resume``).
 
         The steward is always a LIVE continuation, never a crash-recovery
         resume: ``prompt`` (built by ``_handle_escalation``) carries the new
@@ -898,6 +913,7 @@ class TaskSteward:
             kwargs['resume_session_id'] = self._session_id
             if self._session_reported_total_usd is not None:
                 kwargs['resume_prior_total_cost_usd'] = self._session_reported_total_usd
+        armed = kwargs.get('resume_session_id')
 
         # `backend` below reaches invoke_agent: invoke_with_cap_retry forwards
         # it into invoke_kwargs only when a custom invoke_fn is supplied, and
@@ -931,9 +947,35 @@ class TaskSteward:
             **kwargs,
         )
 
+        self._note_rejected_resume(armed, result)
         self._adopt_session(result)
 
         return result
+
+    def _note_rejected_resume(self, armed: str | None, result) -> None:
+        """Report that the CLI rejected the steward's own armed resume.
+
+        No resume-outcome-sink call: a steward resume is a live continuation,
+        never an adopted crash-recovery resume, so it must not feed the INV-4
+        storm streak.
+        """
+        data = cli_resume_failed_data(
+            armed_session_id=armed,
+            role=STEWARD.name,
+            fallbacks=result.resume_fallbacks,
+            dropped_session_ids=result.resume_fallback_session_ids,
+        )
+        if data is None:
+            return
+        logger.warning(
+            'Steward for task %s: the CLI rejected resume of session %s before '
+            'any model turn — adopting fresh session %s',
+            self.task_id, data['session_id'], result.session_id,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.session_resume_failed, task_id=self.task_id, data=data,
+            )
 
     def _adopt_session(self, result) -> None:
         """Resume *result*'s session next time, carrying its reported total as the prior."""
@@ -1021,26 +1063,27 @@ class TaskSteward:
         suggestions = json.loads(_strip_hash_prefix(escalation.detail))
         prompt = build_triage_prompt(suggestions, self.task)
 
-        meta_root = TaskArtifacts.meta_root_for(self.worktree.parent, self.worktree.name)
-        if not meta_root.is_dir():
-            # TaskWorkflow._setup normally creates this (via artifacts.init())
-            # for this exact worktree before any steward is ever constructed
-            # against it. If it's still missing here, the verdict-tools
-            # server spawned below (same --meta-root) would silently no-op
-            # its write_verdict call, and read_verdict() further down would
-            # return None indistinguishably from a genuine triage failure —
-            # log distinctly and create it so a misconfigured meta-root is
-            # diagnosable instead of masquerading as an ordinary fallback.
+        artifacts = TaskArtifacts.for_task(self.worktree, self.task_id)
+        for root in (artifacts.lane_root, artifacts.task_root):
+            if root.is_dir():
+                continue
+            # TaskWorkflow._setup normally creates both roots (via
+            # artifacts.init()) for this exact dispatch before any steward is
+            # ever constructed against it. If one is still missing here, the
+            # verdict-tools server spawned below (same roots) would silently
+            # no-op its write_verdict call, and read_verdict() further down
+            # would return None indistinguishably from a genuine triage
+            # failure — log distinctly and create it so a misconfigured root
+            # is diagnosable instead of masquerading as an ordinary fallback.
             logger.warning(
-                'Steward for task %s: pre-triage meta-root %s did not '
+                'Steward for task %s: pre-triage artifact root %s did not '
                 'exist — creating it now. This should already have been '
                 'created by workflow setup; a missing root here means '
                 'pre-triage would otherwise silently and permanently '
                 'degrade to inline triage.',
-                self.task_id, meta_root,
+                self.task_id, root,
             )
-            meta_root.mkdir(parents=True, exist_ok=True)
-        artifacts = TaskArtifacts(self.worktree, meta_root)
+            root.mkdir(parents=True, exist_ok=True)
         artifacts.clear_verdict('triage')  # I-FRESH: never consume a stale verdict
 
         # Base the injected config on the steward's own fused-memory wiring
@@ -1054,6 +1097,7 @@ class TaskSteward:
         # escalation_url: TRIAGE grants no escalation tools.
         mcp_config = _inject_verdict_tools_mcp(
             self.mcp.mcp_config_json(), self.worktree, TRIAGE,
+            task_root=artifacts.task_root,
         )
 
         try:
@@ -1326,9 +1370,10 @@ class TaskSteward:
                 f'resume-plan interruption'
             )
             self._publish_outcome(
+                escalation.id,
                 StewardResolved(
                     resolution_text=stored.resolution or escalation.summary,
-                )
+                ),
             )
             return
 
@@ -1337,7 +1382,7 @@ class TaskSteward:
             f'({outcome.reason}) with WIP present — dismissed the L0 and '
             f'published a resume-plan interruption (no L1 filed)'
         )
-        self._publish_outcome(outcome)
+        self._publish_outcome(escalation.id, outcome)
 
     # ------------------------------------------------------------------
     # Auto-escalation to level-1 (human)
@@ -1396,6 +1441,7 @@ class TaskSteward:
             f'to level 1: {reason}'
         )
         self._publish_outcome(
+            escalation.id,
             outcome if outcome is not None else StewardReescalatedL1(esc_id=reesc.id),
         )
 
@@ -1450,18 +1496,14 @@ def _dismissal_was_overtaken(stored: Escalation) -> bool:
 
     ANOTHER automated sweep winning (``harness-orphan-reaper`` et al.) is
     deliberately NOT a lost race: it closed the record the same way this
-    steward was about to, carrying no agent finding to publish.  The tier test
-    goes through ``escalation.classify`` rather than an inline
-    ``'auto-dismissed'`` literal so that membership stays single-sited (INV-5).
+    steward was about to, carrying no agent finding to publish.
 
-    MagicMock-safe by construction, which is load-bearing for the ~150
-    ``test_steward.py`` cases whose mock queue returns a bare ``MagicMock``
-    from ``resolve()``: the status test is a membership check that a MagicMock
-    fails, and it short-circuits before the tier lookup ever sees one.
+    The rule lives in ``escalation/classify.py::closed_by_non_sweep_resolver``,
+    which keeps the sweep-tier membership single-sited (INV-5) and is
+    MagicMock-safe for the ``test_steward.py`` cases whose mock queue returns
+    a bare ``MagicMock`` from ``resolve()``.
     """
-    if stored.status not in ('resolved', 'dismissed'):
-        return False
-    return classify_resolver_tier(stored.resolved_by) != 'reaper-sweep'
+    return closed_by_non_sweep_resolver(stored)
 
 
 def _strip_hash_prefix(detail: str) -> str:

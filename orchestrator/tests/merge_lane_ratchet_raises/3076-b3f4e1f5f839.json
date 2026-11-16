@@ -1,0 +1,42 @@
+{
+  "task_id": "3076",
+  "reason": "net-additive \u03b4 work \u2014 best-effort note_in_use / note_idle writers (the first writers of LaneState.IN_USE) sharing one never-raise helper",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 41,
+      "current": 46
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 681,
+      "current": 725
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/lane_lifecycle.py",
+      "baseline": 305,
+      "current": 319
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 4829,
+      "current": 4834
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 57357,
+      "current": 57401
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31952,
+      "current": 31966
+    }
+  ]
+}

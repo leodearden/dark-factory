@@ -91,7 +91,7 @@ class Wrapper(NamedTuple):
         fn: Callable[..., Awaitable[Any]] = getattr(git_ops, self.method)
         if self.method == 'warm_lane_ref_is_degenerate':
             return fn('3072')
-        if self.method == '_run_thin_warm_lane':
+        if self.method == 'thin_warm_lane':
             return fn(git_ops.worktree_base / 'task-3072')
         return fn()
 
@@ -104,7 +104,7 @@ WRAPPERS = (
     Wrapper('_run_warm_lane_audit', 'warm-lane-audit.sh', None),
     Wrapper('_run_warm_lane_gc_reclaim', 'warm-lane-gc.sh', 127),
     Wrapper('warm_lane_ref_is_degenerate', 'warm-lane-degenerate-ref-check.sh', False),
-    Wrapper('_run_thin_warm_lane', 'thin-warm-lane.sh', 127),
+    Wrapper('thin_warm_lane', 'thin-warm-lane.sh', 127),
 )
 
 WRAPPER_PARAMS = [pytest.param(w, id=w.method.lstrip('_')) for w in WRAPPERS]
@@ -115,7 +115,7 @@ def project_root(tmp_path: Path) -> Path:
     """Bare project root whose pool storage reads as PRESENT.
 
     The ``.pool-root`` sentinel keeps the pre-resolution pool-storage guards in
-    ``_run_warm_lane_gc_reclaim`` and ``_run_thin_warm_lane`` from
+    ``_run_warm_lane_gc_reclaim`` and ``thin_warm_lane`` from
     short-circuiting, so tests here reach the resolution step they mean to
     exercise.  ``TestPreResolutionGuardsStillWinTheRace`` deliberately removes
     it to pin the opposite.
@@ -795,7 +795,7 @@ class TestPreResolutionGuardsStillWinTheRace:
         git_ops = _make_git_ops(root)
 
         with caplog.at_level(logging.DEBUG, logger=GIT_OPS_LOGGER):
-            result = await git_ops._run_thin_warm_lane(git_ops.worktree_base / 'lane')
+            result = await git_ops.thin_warm_lane(git_ops.worktree_base / 'lane')
 
         assert result == 127
         warnings = _records(caplog, logging.WARNING)

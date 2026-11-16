@@ -157,7 +157,7 @@ def _within_spawn_budget(request, monkeypatch):
     construction.  Nine copies in nine class bodies is the other way to dodge
     that, and a flat SPOT violation in a file already this long.  The opt-in
     is visible on each class, and
-    test_timeout_marker_inversion_guard.py::TestDeepLandingModuleMarkers pins
+    test_spawn_budget_guard.py::TestDeepLandingModuleMarkers pins
     the marker/fixture pairing in BOTH directions.
 
     A WIRE between two shared parts and nothing else: ``count_git_spawns``
@@ -287,9 +287,9 @@ def _assert_quiescent(
           ``sweep_resolved()`` runs; calling it here before ``is_empty()``
           is required, not optional.
       (e) worker.two_layer_invariants(main_sha) == [] — *main_sha* MUST be a
-          REAL sha, never 'unknown': the base-chain and verify-base
-          sub-checks are silently skipped for the 'unknown' sentinel, which
-          would make this assertion pass vacuously rather than meaningfully.
+          REAL sha, never 'unknown': the base-chain (INV-3) sub-check is
+          silently skipped for the 'unknown' sentinel, which would make this
+          assertion pass vacuously rather than meaningfully.
       (f) worker.snapshot()['entries'] == [] — the lane's public census is
           empty: every request_id has left both the containers and the
           ItemLifecycle registry (snapshot's own non-terminal section is
@@ -499,7 +499,7 @@ class TestLandedViaChainCarrier:
         assert set(rows[0]) == {
             'request_id', 'branch', 'state', 'snapshot_tip', 'merge_sha',
             'superseded_by', 'generation', 'reason', 'landed_via_chain',
-            'absorbed_request_ids',
+            'absorbed_request_ids', 'queue_to_land_secs',
         }
         assert rows[0]['absorbed_request_ids'] == []
         assert rows[0]['request_id'] == req.request_id
@@ -1797,7 +1797,7 @@ async def _head_and_prefix_scene(
         ),
         merge_wt=_ephemeral_merge_wt(git_ops, 'head'),
         base_sha=main_sha,          # slot 1 CASes against REAL main
-        speculative=head_speculative,   # the trust anchor — never chained
+        speculative=head_speculative,   # the trust anchor (chains only when alone, PRD D5)
     )
     spec_item = RealMergeItem(
         request=reqs['101'],
@@ -2157,9 +2157,7 @@ class TestHeadCancelOnAdoption:
         await _deliver_terminal_blocked(s, 'dead/hung verify cap-out x3')
         worker, head = s['worker'], s['head_entry']
 
-        adopted = await worker._adopt_head_on_tip_authority(
-            s['reqs']['101'].request_id, '101',
-        )
+        adopted = await worker._adopt_head_on_tip_authority(s['spec_item'])
 
         assert adopted is None, (
             'a head whose outcome is already delivered must not be adopted; '
@@ -2273,9 +2271,7 @@ class TestHeadCancelOnAdoption:
         assert s['head_task'].done()
         assert not s['reqs']['100'].result.done(), 'future deliberately UNresolved'
 
-        adopted = await s['worker']._adopt_head_on_tip_authority(
-            s['reqs']['101'].request_id, '101',
-        )
+        adopted = await s['worker']._adopt_head_on_tip_authority(s['spec_item'])
 
         assert adopted is s['head_entry']
         assert s['head_entry'].chain_adopted is True
@@ -2290,13 +2286,50 @@ class TestHeadCancelOnAdoption:
         assert not s['head_task'].done()
         assert not s['reqs']['100'].result.done()
 
-        adopted = await s['worker']._adopt_head_on_tip_authority(
-            s['reqs']['101'].request_id, '101',
-        )
+        adopted = await s['worker']._adopt_head_on_tip_authority(s['spec_item'])
 
         assert adopted is s['head_entry']
         assert s['head_entry'].chain_adopted is True
         assert s['head_entry'].verify_task is None, 'torn down, per topology 1'
+
+    async def test_a_non_speculative_tip_adopts_nothing_ahead_of_it(
+        self, git_repo: Path, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """A non-speculative tip is built on main, so its tree contains no entry ahead of it.
+
+        When the chained item IS the head (PRD D5), the only entry that can sit
+        ahead of it in ``_inflight`` is a vacated one: here I0, whose own verify
+        requeued its request, still head-of-line and awaiting finalize.  It must
+        not be marked adopted.
+        """
+        import dataclasses
+
+        from orchestrator.merge_lane.types import InflightStatus, InflightVerifyResult
+
+        def _requeued_verify(_git_ops) -> asyncio.Future:
+            done = asyncio.get_running_loop().create_future()
+            done.set_result(InflightVerifyResult(
+                outcome=None, merge_wt=None, status=InflightStatus.REQUEUED,
+            ))
+            return done
+
+        s = await _head_and_prefix_scene(
+            git_repo, tmp_path, monkeypatch, db_name='delta-head-non-spec-tip.db',
+            head_task_factory=_requeued_verify,
+        )
+        requeued = s['head_entry']
+        requeued.lease = None
+        requeued.status = InflightStatus.REQUEUED
+        assert requeued.vacated
+        chained_head = dataclasses.replace(
+            s['spec_item'], speculative=False, permit=None, base_sha=s['main_sha'],
+        )
+
+        adopted = await s['worker']._adopt_head_on_tip_authority(chained_head)
+
+        assert adopted is None
+        assert requeued.chain_adopted is False
+        assert requeued.status is InflightStatus.REQUEUED
 
 
 @pytest.mark.asyncio
@@ -2636,8 +2669,9 @@ class TestAdoptedHeadLandsWithThePostVerifyWorktree:
     async def test_a_gated_adopted_head_still_heads_the_frozen_prefix(
         self, git_repo: Path, tmp_path: Path, monkeypatch,
     ) -> None:
-        """An adopted head has no verify task, and while it waits on its gate
-        re-verify it must still head the frozen prefix (task 6155).
+        """An adopted head has no verify task, and while it waits on its gate,
+        and then while its rebased commit re-verifies as a dispatch, it must
+        still head the frozen prefix (tasks 6155, 8525).
 
         Read off the verify task alone, the prefix drops it there: a follower
         then reads as the head, and dispatch reads no verify in flight.
@@ -3352,7 +3386,7 @@ class _DeltaScene:
             ),
             merge_wt=wt,
             base_sha=main_before,   # this round really CASes against main
-            speculative=True,       # slot 2 — the only kind that chains
+            speculative=True,       # slot 2 — chains whatever the frontier holds (PRD D5)
         )
         entry = await worker._dispatch_item(item)
         assert entry is not None, 'dispatch must not decline: a host is free'

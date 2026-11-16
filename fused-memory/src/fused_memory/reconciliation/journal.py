@@ -25,6 +25,7 @@ from shared.phantom_verdict import UNPARSEABLE_VERDICT_CODE, is_phantom_verdict_
 from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.models.reconciliation import (
+    JudgeInvocation,
     JudgeVerdict,
     ReconciliationRun,
     RunStatus,
@@ -53,10 +54,7 @@ CITATION_REPAIRS_KEY = 'citation_repairs'
 # REFUSING yields a loud, recoverable error. So a status absent from the
 # enum-of-today must land on the refusing side by default.
 #
-# These four are genuinely terminal: nothing re-adopts them. ``interrupted`` is
-# excluded precisely because something does — ``get_interrupted_runs()`` feeds
-# the startup adopt-and-resume pass, and the resumed cycle rewrites the whole
-# stage_reports blob from its own loaded copy.
+# These four are genuinely terminal.
 #
 # It lives here, beside CITATION_REPAIRS_KEY, because it is also this layer's
 # invariant: a write that does not carry repairs forward must never land on a
@@ -183,6 +181,17 @@ CREATE TABLE IF NOT EXISTS judge_pending (
     marked_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_judge_pending_project ON judge_pending(project_id);
+
+CREATE TABLE IF NOT EXISTS judge_invocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    ended_error_max_turns INTEGER NOT NULL,
+    schema_salvaged INTEGER NOT NULL,
+    num_turns INTEGER,
+    rejected_tool_calls INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_judge_invocations_completed ON judge_invocations(completed_at);
 """
 
 
@@ -233,19 +242,15 @@ class ReconciliationJournal:
         *,
         connect: Connector = connect_daemon,
     ):
-        """Store *data_dir* VERBATIM — it may be RELATIVE, and by default is.
+        """Store *data_dir* VERBATIM; nothing coerces it here.
 
-        Nothing coerces it here, and nothing upstream does either (task 4592;
-        why, and the deployment story behind it, at ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``).
+        A config-sourced value is already absolute: a relative
+        ``reconciliation.data_dir`` is anchored at config load by
+        ``fused-memory/src/fused_memory/config/checkout_anchor.py::anchor_at_checkout``
+        (task 5462; the deployment story is at
+        ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir``).
 
-        In-process that is deliberate: ``initialize`` mkdirs ``data_dir`` and
-        opens ``reconciliation.db`` under it, and
-        ``fused-memory/src/fused_memory/server/main.py`` builds ten sibling paths
-        (``WriteJournal``, ``EventBuffer``, ``TicketStore``, curator/report state,
-        the dead-letter JSONL) the same way — all anchored at the PROCESS cwd, all
-        in this process, so they agree with each other by construction.
-
-        A CROSS-PROCESS consumer must NOT inherit that relativity: a path handed
+        A CROSS-PROCESS consumer must NOT inherit a relative one: a path handed
         to a child is resolved against the CHILD's cwd, so the two would silently
         name different directories. ``fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py::recon_config_base_dir`` is the boundary that absolutizes it for
         the ``CLAUDE_CONFIG_DIR`` chain, and
@@ -292,7 +297,7 @@ class ReconciliationJournal:
             # Safe migration: add session-capture columns to existing DBs (task 2744).
             # session_id / stage_cursor snapshot the in-flight stage subprocess's CLI
             # session (cleared between stages); attempt is a monotonic count of
-            # stage-subprocess launches, the substrate task σ's resume gate consumes.
+            # stage-subprocess launches, kept as durable launch history.
             await add_column_if_missing(db, 'runs', 'session_id', 'TEXT')
             await add_column_if_missing(db, 'runs', 'stage_cursor', 'TEXT')
             await add_column_if_missing(db, 'runs', 'attempt', 'INTEGER DEFAULT 0')
@@ -546,10 +551,8 @@ class ReconciliationJournal:
         such a retry the CLI's live session differs from the value stored here.
         Note too that ``attempt`` counts ``BaseStage.run`` stage invocations, not
         the underlying subprocess spawns — a cap retry spawns again without
-        bumping ``attempt``. Task σ's resume gate therefore must treat this
-        snapshot as best-effort: validate that the transcript for the persisted
-        session actually exists before trusting it to ``--resume`` rather than
-        resuming the persisted id blindly.
+        bumping ``attempt``. Any reader must therefore treat this snapshot as
+        best-effort rather than as the CLI's live session id.
         """
         async with self._require_access().write() as db:
             await db.execute(
@@ -580,6 +583,11 @@ class ReconciliationJournal:
             return None
         return _row_to_run(row)
 
+    #: No longer a ``RunStatus`` member; kept only for
+    #: ``_stage_reports_are_settled`` under task 3731's contract
+    #: (``plans/stage3-ledger-presence-prd.md``). Removal tracked by task 10047.
+    _LEGACY_INTERRUPTED_STATUS = 'interrupted'
+
     #: Run statuses at which ``runs.stage_reports`` is known to have been
     #: PERSISTED, i.e. every status :meth:`complete_run` can write.
     #:
@@ -599,7 +607,7 @@ class ReconciliationJournal:
             RunStatus.failed.value,
             RunStatus.rolled_back.value,
             RunStatus.circuit_breaker.value,
-            RunStatus.interrupted.value,
+            _LEGACY_INTERRUPTED_STATUS,
         }
     )
 
@@ -610,27 +618,26 @@ class ReconciliationJournal:
         """Is ``stage_reports`` a FINISHED account of the run, safe to read as
         evidence that a stage did or did not execute?
 
-        A persisted status is necessary but not sufficient, because
-        ``'interrupted'`` is the one terminal status a run can leave: the
-        startup pass (``reconciliation/harness.py::_resume_interrupted_runs``)
-        adopts exactly those runs, and ``run_full_cycle`` marks the adopted run
-        running only on the in-memory object — :meth:`complete_run` is the sole
-        writer of the column, so a run re-executing this very stage still reads
-        back ``'interrupted'`` on disk. Pairing that terminal-looking status
-        with the stale blob its interrupted attempt flushed is worse than the
-        empty first-attempt case: the stage key is absent precisely BECAUSE
-        this attempt has not re-filed it yet, which is the shape most likely to
-        be a genuine lost write.
+        A persisted status is necessary but not sufficient for a legacy
+        ``'interrupted'`` row. Before task 5514 retired resume, the startup
+        adopt-and-resume pass took over exactly those runs, and ``run_full_cycle``
+        marked the adopted run running only on the in-memory object —
+        :meth:`complete_run` is the sole writer of the column, so a run
+        re-executing a stage still read back ``'interrupted'`` on disk. Pairing
+        that terminal-looking status with the stale blob its interrupted attempt
+        flushed is worse than the empty first-attempt case: the stage key is
+        absent precisely BECAUSE that attempt had not re-filed it yet, which is
+        the shape most likely to be a genuine lost write.
 
-        ``_resume`` bookkeeping is persisted before the adopt, so its presence
+        ``_resume`` bookkeeping was persisted before each adopt, so its presence
         is the durable signal. A resumed run that has since reached any other
-        terminal status has been flushed by that run's own ``finally`` and is
+        terminal status was flushed by that run's own ``finally`` and is
         settled again, which is why this narrows ``'interrupted'`` alone rather
         than distrusting every run that was ever resumed.
         """
         if run_status not in ReconciliationJournal._STAGE_REPORTS_PERSISTED_STATUSES:
             return False
-        if run_status == RunStatus.interrupted.value:
+        if run_status == ReconciliationJournal._LEGACY_INTERRUPTED_STATUS:
             return resumed is False
         return True
 
@@ -657,22 +664,22 @@ class ReconciliationJournal:
           silently suppress a real data-loss finding.
 
         The membership test is keyed on ``stage``, never "is there any report at
-        all": ``reconciliation/harness.py`` writes the out-of-band ``_error`` and
-        ``_resume`` keys straight into ``run.stage_reports`` before persisting,
-        and a run holding only those did not run the stage.
+        all": ``reconciliation/harness.py`` writes the out-of-band ``_error`` key
+        (and, before task 5514, ``_resume``) straight into ``run.stage_reports``
+        before persisting, and a run holding only those did not run the stage.
 
         ``settled`` is the signal a caller weighing ``stage_ran`` as evidence
         should consume: ``stage_ran=False`` means "the stage never ran" ONLY
         when the blob is a finished account of the run. Deciding that needs
         harness lifecycle knowledge — which statuses flush the blob, and that
-        an adopted run is executing again behind a terminal-looking disk status
-        — so it is answered here, next to the read, rather than re-derived by
+        a legacy adopted run may have been executing again behind a
+        terminal-looking disk status — so it is answered here, next to the read, rather than re-derived by
         every consumer (see :meth:`_stage_reports_are_settled`).
 
         ``resumed`` is the raw evidence behind that verdict: whether the
-        ``_resume`` key is present, i.e. whether the startup adopt-and-resume
-        pass (``reconciliation/harness.py::_resume_interrupted_runs``) has taken
-        this run over at least once. It is three-valued for the same reason
+        ``_resume`` key is present, i.e. whether task 2717's startup
+        adopt-and-resume pass (retired by task 5514) took this run over at
+        least once. It is three-valued for the same reason
         ``stage_ran`` is — an unparseable blob answers neither question, and
         collapsing it to ``False`` would read as positive evidence the run was
         never adopted.
@@ -822,6 +829,23 @@ class ReconciliationJournal:
             )
             for row in rows
         ]
+
+    async def record_judge_invocation(self, invocation: JudgeInvocation) -> None:
+        async with self._require_access().write() as db:
+            await db.execute(
+                """INSERT INTO judge_invocations
+                   (run_id, completed_at, ended_error_max_turns, schema_salvaged,
+                    num_turns, rejected_tool_calls)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    invocation.run_id,
+                    invocation.completed_at.isoformat(),
+                    int(invocation.ended_error_max_turns),
+                    int(invocation.schema_salvaged),
+                    invocation.num_turns,
+                    invocation.rejected_tool_calls,
+                ),
+            )
 
     # ── Judge pending markers (durable across restarts) ─────────────────
 
@@ -997,21 +1021,6 @@ class ReconciliationJournal:
         """
         rows = await self._require_access().read_all(
             "SELECT * FROM runs WHERE status = 'running'"
-        )
-        return [_row_to_run(row) for row in rows]
-
-    async def get_interrupted_runs(self) -> list[ReconciliationRun]:
-        """Return every run marked 'interrupted', with no age filter.
-
-        Mirrors ``get_running_runs`` but filters the restart-interrupt status
-        (see ``RunStatus.interrupted``). Consumed by the startup
-        adopt-and-resume pass (task σ / ``_resume_interrupted_runs``): a run left
-        ``interrupted`` by a dead predecessor still carries its session_id /
-        stage_cursor snapshot and its drained events, so the pass can --resume
-        the same run_id rather than re-run it from scratch.
-        """
-        rows = await self._require_access().read_all(
-            "SELECT * FROM runs WHERE status = 'interrupted'"
         )
         return [_row_to_run(row) for row in rows]
 
@@ -1323,11 +1332,11 @@ def flagged_findings_by_id(items_flagged: Any) -> dict[str, dict[str, Any]]:
 def _row_to_run(row: aiosqlite.Row) -> ReconciliationRun:
     """Map a single ``runs`` table row to a ``ReconciliationRun``.
 
-    Shared by ``get_run``, ``get_recent_runs``, ``get_stale_runs``,
-    ``get_running_runs``, and ``get_interrupted_runs`` (task 3885 dedup;
-    originally task 2711) — every query differs only in its WHERE clause, so
-    the row→model mapping (including ``stage_reports`` parsing) lives in
-    exactly one place and can't drift between call sites.
+    Shared by ``get_run``, ``get_recent_runs``, ``get_stale_runs`` and
+    ``get_running_runs`` (task 3885 dedup; originally task 2711) — every query
+    differs only in its WHERE clause, so the row→model mapping (including
+    ``stage_reports`` parsing) lives in exactly one place and can't drift
+    between call sites.
     """
     reports_raw = json.loads(row['stage_reports'] or '{}')
     stage_reports: dict[str, StageReport | dict] = {}

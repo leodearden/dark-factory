@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from shared.boundary_storm_escape import BoundaryStormEscape, call_sink
+from shared.boundary_storm_escape import BoundaryStormEscape, call_sink, storm_outcome_label
 
 
 class _Clock:
@@ -132,6 +132,64 @@ class TestTheKeyIsProjectAndOutcomeTogether:
         for _ in range(3):
             await escape.record('absorbed', 'alpha')
         assert await escape.record('absorbed', 'beta') is None
+
+
+class TestAReasonSplitsTheKey:
+    """An optional ``reason`` qualifies an outcome: it is part of the counting
+    key and of the fired record, so two reasons never pool into one burst."""
+
+    async def _fire(self, escape: BoundaryStormEscape) -> dict[str, Any] | None:
+        for _ in range(2):
+            await escape.record('absorbed', 'alpha', reason='timed_out')
+        return await escape.record('absorbed', 'alpha', reason='timed_out')
+
+    async def test_two_reasons_do_not_pool_into_a_premature_fire(self) -> None:
+        escape, _ = build_escape()
+        fired = [
+            await escape.record('absorbed', 'alpha', reason=reason)
+            for reason in ('timed_out', 'unreachable', 'timed_out', 'unreachable')
+        ]
+        assert fired == [None, None, None, None]
+
+    async def test_the_third_same_reason_record_fires_naming_its_reason(self) -> None:
+        filed: list[dict[str, Any]] = []
+        escape, _ = build_escape(filed.append)
+        summary = await self._fire(escape)
+        expected = {
+            'count': 3,
+            'threshold': 3,
+            'window_seconds': 3600.0,
+            'outcome': 'absorbed',
+            'reason': 'timed_out',
+            'project': 'alpha',
+        }
+        assert summary == expected
+        assert summary is not None and list(summary) == list(expected)
+        assert filed == [{'error_type': ERROR_TYPE, **expected}]
+
+    async def test_a_reasonless_record_has_no_reason_slot(self) -> None:
+        escape, _ = build_escape()
+        for _ in range(2):
+            await escape.record('absorbed', 'alpha')
+        summary = await escape.record('absorbed', 'alpha')
+        assert summary is not None and 'reason' not in summary
+
+    async def test_reason_is_a_reserved_record_key(self) -> None:
+        escape, _ = build_escape()
+        with pytest.raises(ValueError) as excinfo:
+            await escape.record('absorbed', 'alpha', crossing={'reason': 'x'})
+        assert repr('reason') in str(excinfo.value)
+
+    async def test_the_error_line_names_the_reason(self, caplog: Any) -> None:
+        escape, _ = build_escape()
+        with caplog.at_level(logging.ERROR, logger='shared.boundary_storm_escape'):
+            await self._fire(escape)
+        [line] = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert line.startswith('test_guard_storm: 3 absorbed (timed_out)')
+
+    def test_the_outcome_label_appends_a_reason_only_when_present(self) -> None:
+        assert storm_outcome_label({'outcome': 'absorbed'}) == 'absorbed'
+        assert storm_outcome_label({'outcome': 'absorbed', 'reason': 'timed_out'}) == 'absorbed (timed_out)'
 
 
 class TestTheTuningIsReadLive:

@@ -100,7 +100,9 @@ class SchedulerStateSnapshot(BaseModel):
     module to its whole stack, bottom to top, as open entry records; ``lock_depth``
     is the depth the producer normalises lock keys to. ``pause_class`` is the wire
     value of ``orchestrator/src/orchestrator/pause_policy.py::PauseClass`` (shared
-    cannot import orchestrator), ``None`` when not paused.
+    cannot import orchestrator), ``None`` when not paused. ``held_by_task`` maps
+    each holding task to its sorted lock keys and names every holder of a shared
+    key, while ``current_holders`` names one holder per key, for display.
 
     Frozen means no field can be reassigned. The mappings are plain dicts that
     validation copies from its input, so a snapshot never aliases its producer's
@@ -117,6 +119,7 @@ class SchedulerStateSnapshot(BaseModel):
     pin_queue: tuple[PinQueueEntry, ...] = ()
     overrides: Mapping[str, OverrideRecord] = Field(default_factory=dict)
     current_holders: Mapping[str, str] = Field(default_factory=dict)
+    held_by_task: Mapping[str, tuple[str, ...]] = Field(default_factory=dict)
     lock_depth: StrictInt | None = None
     is_paused: bool = False
     pause_reason: str | None = None
@@ -145,3 +148,12 @@ class SchedulerStateSnapshot(BaseModel):
 
     def to_json(self) -> dict[str, Any]:
         return self.model_dump(mode='json')
+
+    def holder_task_ids(self) -> frozenset[str]:
+        """Every task id the snapshot names as holding a lock key.
+
+        ``held_by_task`` names every holder of a shared key. ``current_holders``
+        names one per key, and is all an older producer writes; the union
+        reads either producer.
+        """
+        return frozenset(self.held_by_task) | frozenset(self.current_holders.values())

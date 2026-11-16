@@ -1,18 +1,16 @@
 /* Tasks tab: per-project dependency graph + filters + detail panel.
    Least-dependent tasks at top; tasks depending on them stack below. */
-const { ProjectGroup: PG_T, Segmented: SEG_T, Pip, DatumReading } = window.DF_SHELL;
+const { ProjectGroup: PG_T, Segmented: SEG_T, Pip } = window.DF_SHELL;
 const { PALETTE: CP_T } = window.DF_CHARTS;
 const DF_T = window.DF_DATA;
 // One namespace alias, so no data.js const is rebound under its own name —
 // see the SCOPE note in dashboard/tests/js/classic_script_scope.test.mjs.
 const DF_LOADER_T = window.DF_DATA_LOADER;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
-const { computeTiers, computeNeighborhood, focusGroupView, layoutSignature, taskGraphLayout } = window.DF_GRAPH_LAYOUT;
-const {
-  prdTitle, aggregatePrdStatus, summarizePrdMembers, prdIsFinished, prdBarSegments, prdProgress, prdProgressReading,
-  groupTasksByPrd, orderPrdGroups,
-} = window.DF_PRD_GROUPING;
-const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
+const { computeNeighborhood, focusGroupView, layoutSignature, taskGraphLayout } = window.DF_GRAPH_LAYOUT;
+const { ProjectPrdLanes, PrdContentionLine } = window.DF_PRD_LANES;
+const { projectPrdView, projectPrdContention } = window.DF_PRD_LANES_VIEW;
+const { strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum, filedCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
 const { tasksBannerNoticesFor } = window.DF_TASKS_OFFLINE_BANNER;
 const { invariantChipFor, chainChipFor } = window.DF_INVARIANT_CHIP;
@@ -20,7 +18,7 @@ const { deferralCellState, deferralNeedsHumanChip } = window.DF_DEFERRAL_CELL;
 // Const exports renamed, function exports not: test_tab_tasks_prose.py::_LOAD_SAFETY_MECHANISM.
 const {
   projectCensus, projectRows, viewRows, snapshotRowsOver, unrequestedTerminalRows, terminalWindowProjects,
-  terminalWindowEntrants, sameDatum,
+  terminalWindowEntrants,
   CENSUS_VIEWS: CENSUS_VIEWS_T, EVERY_VIEW: EVERY_VIEW_T,
 } = window.DF_TASK_SNAPSHOT;
 const { createPersistedHooks } = window.DF_PERSISTED_STATE;
@@ -63,6 +61,38 @@ function DeferralHold({ task }) {
   );
 }
 
+// The detail pane's lock chips. Whether anything is known about the project's
+// locks is locksCellState's answer, drawn as tabs.jsx::LocksCell draws it.
+function ModuleLocksSection({ task }) {
+  const { buildSchedLockInfo, disambiguateLabels, lockChipStateFor } = window.DF_SCHED_UTILS;
+  const lockInfo = buildSchedLockInfo(task, DF_T.SCHEDULER);
+  const cell = locksCellState(schedulerLocksDatum(DF_T.SCHEDULER, task.project, DF_T.__receipt), lockInfo);
+  if (cell.placeholder) {
+    return (<>
+      <div className="section-lbl">Module locks</div>
+      <span className="chip-empty" title={cell.title || undefined}>{cell.placeholder}</span>
+    </>);
+  }
+  const { rawTaskId, lockSet, moduleByPath } = lockInfo;
+  if (!lockSet.length) return null;
+  const labelMap = disambiguateLabels(lockSet);
+  return (<>
+    <div className="section-lbl">Module locks ({lockSet.length})</div>
+    <div className="chips column">
+      {lockSet.map(modPath => {
+        const { cls, ownerLabel } = lockChipStateFor(moduleByPath.get(modPath), rawTaskId, task.project);
+        return (
+          <span key={modPath} className={`chip ${cls}`} title={modPath}>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{labelMap.get(modPath)}</span>
+            {cls === 'lock-parked' && <span className="holder">⏸ {ownerLabel}</span>}
+            {cls === 'lock-taken' && <span className="holder">⊘ {ownerLabel}</span>}
+          </span>
+        );
+      })}
+    </div>
+  </>);
+}
+
 // ── Edge router: draw curves from each parent (dep) to each child node ──
 function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhood }) {
   const [paths, setPaths] = uS_T([]);
@@ -94,10 +124,6 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhoo
           if (!visible.has(d.id)) continue;
           const parentEl = nodeRefs.current[d.id];
           if (!parentEl) continue;
-          // Both endpoints resolved to the same DOM node — e.g. two tasks in
-          // the same collapsed PRD box, both proxied to their shared header
-          // (see PrdBox below). A same-point curve isn't a meaningful edge.
-          if (parentEl === childEl) continue;
           const pb = parentEl.getBoundingClientRect();
           const cBox = childEl.getBoundingClientRect();
           const x1 = pb.left - cb.left + pb.width / 2;
@@ -134,8 +160,7 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhoo
       ro.observe(containerRef.current);
     } else {
       // First mount only: containerRef is owned by an ANCESTOR of this
-      // component in every caller (the single ungrouped TaskGraph's own
-      // wrapper div, or the multi-box grouped view's hoisted wrapper) —
+      // component (TaskGraph's own wrapper div) —
       // React attaches refs bottom-up during commit, so a still-mounting
       // ancestor's own ref can be null at the exact moment THIS layout
       // effect body runs, even though the whole commit (every ref in the
@@ -173,18 +198,9 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhoo
   );
 }
 
-// nodeRefs/renderEdges are optional escape hatches for the grouped PRD-box
-// view (task 2530): when a shared nodeRefs map is supplied, this instance
-// registers its nodes into it instead of a private one, and renderEdges=false
-// skips this instance's own TaskGraphEdges overlay entirely — used when a
-// single hoisted overlay (spanning multiple TaskGraph instances) draws edges
-// instead. Neither prop is passed by the ungrouped per-project call site in
-// TasksTab's projects.map() below, so that path's behavior is unchanged: its
-// own private nodeRefs, own overlay.
-function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: externalNodeRefs, renderEdges = true }) {
+function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus }) {
   const containerRef = uR_T(null);
-  const ownNodeRefs = uR_T({});
-  const nodeRefs = externalNodeRefs || ownNodeRefs;
+  const nodeRefs = uR_T({});
 
   // Keyed on content, not on `tasks`: callers pass a fresh array every render
   // (each poll, each click). The layout holds ids only (see
@@ -228,10 +244,8 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
 
   return (
     <div className="taskgraph" ref={containerRef}>
-      {renderEdges && (
-        <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={tasks}
-                        selectedId={selectedId} neighborhood={neighborhood} />
-      )}
+      <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={tasks}
+                      selectedId={selectedId} neighborhood={neighborhood} />
       {blocks.map((block, bi) => (
         <div key={bi} className="component-block">
           {block.map((row, ri) => (
@@ -251,193 +265,6 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
           <div className="row">
             {singletons.map(id => renderNode(taskById.get(id)))}
           </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// The Datum this component already holds while a fresh stamped copy is the
-// same Datum, so a memo keyed on it reruns when a poll lands, not per render.
-function useHeldDatum(datum) {
-  const held = uR_T(datum);
-  if (!sameDatum(held.current, datum)) held.current = datum;
-  return held.current;
-}
-
-// Per-project "group by PRD" render: buckets the project's filtered tasks
-// into PRD boxes (groupTasksByPrd), orders the boxes via orderPrdGroups (a
-// PRD consuming another PRD's tasks renders below it; "no PRD" trails), and
-// lays out each box's induced subgraph via the existing per-box TaskGraph
-// machinery (which itself calls computeTiers/partitionComponents/orderRows).
-// Kept as its own component (not an inline computation inside the
-// projects.map() callback below) because the refs and memos it holds are
-// hooks, and the Rules of Hooks forbid calling one from inside a map
-// callback — a mounted component per project gives each its own consistent
-// ref/memo identity.
-// The flat view needs no such wrapper: it renders TaskGraph directly, having
-// nothing left to memoize once the narrowing moved to the call site.
-//
-// Cross-box dependency edges: a SINGLE TaskGraphEdges overlay is hoisted here
-// (spanning every box) instead of each TaskGraph instance rendering its own —
-// it resolves endpoint positions purely from getBoundingClientRect() over a
-// nodeRefs map, so one overlay covering all boxes draws intra-box AND
-// cross-box edges with no edge-router change. It's fed the project's full
-// filtered (and, in focus mode, focus-narrowed — see graphTasks below) task
-// list so it can see cross-box dep edges. Each per-box TaskGraph is told
-// renderEdges={false} (skip its own overlay) and handed the SAME shared
-// nodeRefs map (via the nodeRefs prop) so its nodes register into the map
-// the hoisted overlay reads from.
-function ProjectPrdGroups({ graphTasks, allProjectTasks, rows, terminal, selectedId, onSelect, onEnterFocus }) {
-  const containerRef = uR_T(null);
-  const nodeRefs = uR_T({});
-
-  // `graphTasks` arrives ALREADY focus-narrowed as a prop, from the single
-  // focusGroupView call in the projects.map() callback below (shared with the
-  // flat view's TaskGraph and with the header's shown count). It is still the
-  // focus-narrowed set and not the project's full membership: onEnterFocus is
-  // wired into every rendered node's double-click below exactly like the list
-  // view, so were it not narrowed the "focus" affordance would silently do
-  // nothing while grouped. `allProjectTasks` below is deliberately NOT
-  // narrowed — see fullMembersByPrd.
-
-  // Content signatures so the pricier work below (bucketing + PRD-level
-  // mini-DAG tiering, and the full-member summaries) only reruns when
-  // something it actually reads changes. `graphTasks`/`allProjectTasks` are
-  // fresh array instances on every TasksTab render — each data poll and each
-  // interaction — which would defeat a plain reference-keyed useMemo on every
-  // one (same reasoning as the `layoutKey` of TaskGraphEdges and TaskGraph
-  // above). Bucketing, tiering and the neighborhood read only id, status, prd
-  // and dep ids, so `groupingKey` holds exactly those; a poll that changes only
-  // what a node draws (title, age, hold) reruns none of them. So `groups` is
-  // structure only: each box renders the CURRENT task objects, looked up by id
-  // in `taskById`, never the copies cached in `groups`.
-  const groupingKey = JSON.stringify(graphTasks.map(t => [t.id, t.status, t.prd || null, (t.deps || []).map(d => d.id)]));
-  // fullMembersByPrd (below) only feeds summarizePrdMembers, which looks at
-  // nothing but id/status/prd — a narrower, cheaper signature.
-  const allSig = uM_T(() => allProjectTasks.map(t => `${t.id}:${t.status}:${t.prd || ''}`).join('|'), [allProjectTasks]);
-
-  const groups = uM_T(() => orderPrdGroups(groupTasksByPrd(graphTasks), computeTiers), [groupingKey]);
-  const neighborhood = uM_T(() => computeNeighborhood(graphTasks, selectedId), [groupingKey, selectedId]);
-  const taskById = new Map(graphTasks.map(t => [t.id, t]));
-
-  // The outline/pip aggregate status and the member bar both read from each
-  // PRD's FULL member set (every task with that prd,
-  // regardless of the active status display filter or focus narrowing) —
-  // per the plan's truthful-burndown requirement. Keyed by prd (null for
-  // the "no PRD" bucket) for O(1) lookup per rendered box below. Rendered
-  // node layout (g.tasks, from `groups` above) stays on the narrowed set.
-  const fullMembersByPrd = uM_T(() => {
-    const m = new Map();
-    for (const g of groupTasksByPrd(allProjectTasks)) m.set(g.noPrd ? null : g.prd, g.tasks);
-    return m;
-  }, [allSig]);
-
-  const heldRows = useHeldDatum(rows);
-  const heldTerminal = useHeldDatum(terminal);
-  const progress = uM_T(() => prdProgress(heldRows, heldTerminal), [heldRows, heldTerminal]);
-
-  return (
-    <div className="prd-groups" ref={containerRef}>
-      <TaskGraphEdges containerRef={containerRef} nodeRefs={nodeRefs} tasks={graphTasks}
-                      selectedId={selectedId} neighborhood={neighborhood} />
-      {groups.map(g => {
-        const key = g.noPrd ? null : g.prd;
-        const fullMembers = fullMembersByPrd.get(key) || g.tasks;
-        return (
-          <PrdBox key={g.noPrd ? '__no_prd__' : g.prd} group={g} currentTasks={g.tasks.map(t => taskById.get(t.id))}
-                  fullMembers={fullMembers} progress={progress}
-                  selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus} nodeRefs={nodeRefs} />
-        );
-      })}
-    </div>
-  );
-}
-
-// One PRD box's chrome: title (basename via prdTitle, full path as a
-// tooltip), a status-colored outline + title pip (aggregatePrdStatus over
-// the FULL member set's tally, driving an `s-<status>` class exactly like the
-// `.taskgraph .node.s-*` idiom — see graph_layout-era node rendering above),
-// "≥n/m terminal" (prdProgress, over the snapshot rows and the terminal
-// window), a thin bar with one segment per member (prdBarSegments over the
-// tally), and a collapse control that hides the box body while
-// leaving the title bar + bar visible. Finished PRDs default to collapsed.
-//
-// Kept as its own component (not inlined in ProjectPrdGroups' .map() above)
-// so each box's `collapsed` state is an independent useState — Rules of
-// Hooks requires one consistent hook set per mounted component instance,
-// not a variable-count hook call inside a loop over `groups`.
-function PrdBox({ group: g, currentTasks, fullMembers, progress, selectedId, onSelect, onEnterFocus, nodeRefs }) {
-  const summary = uM_T(() => summarizePrdMembers(fullMembers), [fullMembers]);
-  const agg = aggregatePrdStatus(summary);
-
-  // Lazy-init only: this is a *default*, not an enforced state — later
-  // renders (e.g. a member finishing while the box is open) must not yank a
-  // manually-reopened box shut again, so the argument is only consulted by
-  // React on the box's first mount.
-  const [collapsed, setCollapsed] = uS_T(() => prdIsFinished(summary));
-  const title = g.noPrd ? 'No PRD' : prdTitle(g.prd);
-  const headRef = uR_T(null);
-
-  // Collapsing unmounts this box's TaskGraph, which deletes its tasks'
-  // entries from the shared nodeRefs map (each node's own ref callback fires
-  // with el=null). The hoisted TaskGraphEdges overlay above silently skips
-  // any edge whose endpoint ref is missing — so without this, a cross-box
-  // dependency edge into or out of a collapsed box's tasks would vanish
-  // entirely. Since finished PRDs collapse by default, that would routinely
-  // hide real upstream/downstream relationships on first paint. Fix: while
-  // collapsed, proxy every member task id to the (always-mounted) header
-  // element instead, so those edges anchor to the box's title bar rather
-  // than disappearing (TaskGraphEdges' parentEl===childEl guard drops the
-  // degenerate case where both ends of an edge land in the same collapsed
-  // box).
-  //
-  // useLayoutEffect (not useEffect) so this box's own cleanup/setup pair is
-  // ordered deterministically around this box's own node mounts/unmounts:
-  // React finishes ref attachment/detachment for the WHOLE tree before ANY
-  // layout effect runs, so this effect only ever sees the post-unmount
-  // (collapsing) or post-mount (expanding — where the guarded cleanup below
-  // is a no-op, since the entry no longer points at the header) state, never
-  // a half-updated one. On first paint of an already-collapsed box, the
-  // hoisted TaskGraphEdges' own first recompute (an earlier sibling's layout
-  // effect) can still run before this effect does; its ResizeObserver fires
-  // once more right after for any newly-observed element even with no size
-  // change, which recomputes again by which point this proxy is in place.
-  uLE_T(() => {
-    if (!collapsed) return;
-    const el = headRef.current;
-    if (!el) return;
-    const ids = g.tasks.map(t => t.id);
-    for (const id of ids) nodeRefs.current[id] = el;
-    return () => {
-      for (const id of ids) {
-        if (nodeRefs.current[id] === el) delete nodeRefs.current[id];
-      }
-    };
-  }, [collapsed, g.tasks, nodeRefs]);
-
-  return (
-    <div className={`prd-box s-${agg}`}>
-      <div className="prd-box-head" ref={headRef} data-open={collapsed ? 'false' : 'true'} onClick={() => setCollapsed(c => !c)}>
-        <span className="twirl">
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-            <path d="M3.5 2L6.5 5L3.5 8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
-          </svg>
-        </span>
-        <span className="status-pip"></span>
-        <span className="prd-box-title" title={g.noPrd ? undefined : g.prd}>{title}</span>
-        {/* PRD decision 8: a lower_bound '≥n/m', not a tooltip — task 4416's option (a). */}
-        <span className="prd-box-count"><DatumReading datum={progress} format={prdProgressReading(g.prd)} /> terminal</span>
-      </div>
-      <div className="prd-bar">
-        {prdBarSegments(summary).map(seg => (
-          <span key={seg.member} className="prd-bar-seg" style={{ width: `${seg.share}%`, background: CP_T[seg.tone] }} />
-        ))}
-      </div>
-      {!collapsed && (
-        <div className="prd-box-body">
-          <TaskGraph tasks={currentTasks} selectedId={selectedId} onSelect={onSelect} onEnterFocus={onEnterFocus}
-                     nodeRefs={nodeRefs} renderEdges={false} />
         </div>
       )}
     </div>
@@ -564,6 +391,7 @@ function TaskDetail({ task, allTasks }) {
               columns; deliberately INDEPENDENT of `agent` below, which is only
               worktree presence and stays truthy after the agent dies. */}
           {(() => { const sb = strandBadgeState(task); return sb && <span className={sb.cls} style={{ marginLeft: sb.marginLeft }} title={sb.title}>{sb.label}</span>; })()}</span>
+        <span className="k">filed</span>{(() => { const fc = filedCellState(task); return <span style={{ fontFamily: 'var(--mono)', fontSize: 11 }} title={fc.title}>{fc.text}</span>; })()}
         {deferralCellState(task) && (
           <React.Fragment>
             <span className="k">hold</span>
@@ -622,35 +450,7 @@ function TaskDetail({ task, allTasks }) {
         </>);
       })()}
 
-      {(() => {
-        const { buildSchedLockInfo, disambiguateLabels } = window.DF_SCHED_UTILS || {};
-        const { rawTaskId, lockSet, moduleByPath } = buildSchedLockInfo
-          ? buildSchedLockInfo(task, DF_T.SCHEDULER)
-          : { rawTaskId: String(task.id).split('/T-').pop(), lockSet: [], moduleByPath: new Map() };
-        if (!lockSet.length) return null;
-        const labelMap = disambiguateLabels ? disambiguateLabels(lockSet) : null;
-        return (<>
-          <div className="section-lbl">Module locks ({lockSet.length})</div>
-          <div className="chips column">
-            {lockSet.map(modPath => {
-              const m = moduleByPath.get(modPath);
-              const holder = m && m.holder;
-              const holderProject = m && m.holder_project;
-              const parkedBy = m && m.parked_by;
-              const parkedOwnerLive = m && m.parked_owner_live;
-              const isMine = holder === rawTaskId && (holderProject || task.project) === task.project;
-              const { cls, ownerLabel } = window.DF_SCHED_UTILS.lockChipState({ holder, isMine, parkedBy, parkedOwnerLive });
-              return (
-                <span key={modPath} className={`chip ${cls}`} title={modPath}>
-                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{labelMap ? labelMap.get(modPath) : modPath}</span>
-                  {cls === 'lock-parked' && <span className="holder">⏸ {ownerLabel}</span>}
-                  {cls === 'lock-taken' && <span className="holder">⊘ {ownerLabel}</span>}
-                </span>
-              );
-            })}
-          </div>
-        </>);
-      })()}
+      <ModuleLocksSection task={task} />
     </div>
   );
 }
@@ -660,11 +460,10 @@ function TasksTab({ projectFilter, search }) {
   const [openMap, setOpenMap] = usePersistedState('df.tasksOpen', {});
   const toggle = (id) => setOpenMap(m => withProjectDeviation(m, id, m[id] === false ? undefined : false));
 
-  // Per-project "group by PRD" view toggle, persisted (same per-project-id
-  // map shape as openMap). Key absent/'flat' -> today's ungrouped view;
-  // 'prd' -> the grouped-by-PRD view.
+  // Per-project view, persisted (same per-project-id map shape as openMap):
+  // the PRD lanes by default, 'flat' for the task graph listed flat.
   const [groupByPrdMap, setGroupByPrdMap] = usePersistedState('df.tasksGroupByPrd', {});
-  const setGroupByPrd = (id, v) => setGroupByPrdMap(m => withProjectDeviation(m, id, v === 'prd' ? 'prd' : undefined));
+  const setGroupByPrd = (id, v) => setGroupByPrdMap(m => withProjectDeviation(m, id, v === 'flat' ? 'flat' : undefined));
 
   // Selected task (single, across all projects)
   const [selectedId, setSelectedId] = uS_T(null);
@@ -709,8 +508,7 @@ function TasksTab({ projectFilter, search }) {
   // as the project enters the wanted set and never per poll. It is always
   // lower_bound, so its age badge says how old it is.
   const projectIds = projects.map(p => p.id);
-  const grouped = projectIds.filter(id => groupByPrdMap[id] === 'prd');
-  const wanted = terminalWindowProjects(projectIds, filter, grouped);
+  const wanted = terminalWindowProjects(projectIds, filter);
   const wantedKey = wanted.join('\n');
   const [terminalOutcomes, setTerminalOutcomes] = uS_T({});
   // No cleanup cancels a pending outcome: a later run does not re-request a
@@ -737,7 +535,7 @@ function TasksTab({ projectFilter, search }) {
   // whole-handler budget expires, a silently-missing project would otherwise
   // read as a project with nothing to do.
   //
-  // The three-way distinction itself is decided SERVER-SIDE (app.api_tasks)
+  // The distinction between those cases is decided SERVER-SIDE (app.api_tasks)
   // and turned into copy by tasks_offline_banner.js. Nothing here re-derives
   // it: a `k of N` judgement made in the JSX would drift from the one the
   // handler made. N likewise comes from the server (TASKS_PROJECT_COUNT): the
@@ -751,6 +549,7 @@ function TasksTab({ projectFilter, search }) {
     partial: 'tasks-partial-banner',
     degraded: 'tasks-degraded-banner',
     'count-unknown': 'tasks-count-unknown-banner',
+    'count-stale': 'tasks-count-stale-banner',
   };
 
   // Runtime-probe health, derived frontend-side from the snapshot rows
@@ -761,7 +560,7 @@ function TasksTab({ projectFilter, search }) {
   // row vocabulary by active_tasks._probe_status — grep either end to find
   // the other.
   //
-  // A SIBLING of bannerNotices above, not a fifth kind inside it. The two
+  // A SIBLING of bannerNotices above, not another kind inside it. The two
   // answer different questions: tasksBannerNotices reports whether TASK DATA
   // is available, a distinction decided server-side in app.api_tasks, while
   // rtProbeSummary is a client-side derivation over the snapshot rows
@@ -866,29 +665,17 @@ function TasksTab({ projectFilter, search }) {
             const held = viewRows(rows, terminal, EVERY_VIEW_T).rows;
             const filtered = listed.rows.filter(searchMatches);
             const onlyThePlaceholder = listed.placeholder && filtered.length === 0;
-            // The ONE focus-narrowing site. Both the header count below and
-            // the group body read this single result, so they cannot be fed
-            // different arrays — which is exactly what went wrong before
-            // (task 4137): focus state is global, narrowing was applied per
-            // group, and the header counted the PRE-focus `filtered`, so every
-            // non-anchor project rendered an empty graph under "N/N shown".
-            // A plain call, not a hook, so it is legal here inside map().
+            // The ONE focus-narrowing site. The header count below and the
+            // group body — the flat graph, or the lanes page's expanded rows
+            // drawn from `pool` — read this single result, so they cannot be
+            // fed different arrays (task 4137: narrowing applied per group
+            // while the header counted the PRE-focus `filtered`). A plain
+            // call, not a hook, so it is legal here inside map().
             //
-            // This replaces a useMemo that sat in each of the two per-project
-            // render paths (a ProjectTaskGraph wrapper, since deleted, and
-            // ProjectPrdGroups). For an OPEN group dropping them costs no
-            // measured work: both were reference-keyed on `filtered`, which
-            // listed.rows.filter(...) above rebuilds as a fresh array on every
-            // TasksTab render — each data poll and each interaction — so both
-            // already recomputed every render. That is the same hazard
-            // ProjectPrdGroups documents for its own signature-keyed memos.
-            //
-            // For a COLLAPSED group it IS new work, deliberately. shell.jsx's
+            // It runs for a COLLAPSED group too, deliberately: shell.jsx's
             // ProjectGroup renders `summary` unconditionally but `children`
-            // only when open, so neither per-project component ever mounted
-            // and the narrowing never ran — yet the header still has to show
-            // the narrowed count, which is the whole defect. So this runs for
-            // every project on every render, closed ones included. The bound
+            // only when open, yet the header still shows the narrowed count.
+            // So this runs for every project on every render. The bound
             // is computeNeighborhood's O(|neighborhood| x |tasks|) descendants
             // scan over ONE project's filtered list (hundreds at most today),
             // and it is free in the two common cases: focus off is a
@@ -896,7 +683,7 @@ function TasksTab({ projectFilter, search }) {
             // nothing to scan.
             const groupView = focusGroupView(filtered, { focusMode, selectedId, focusAnchorId });
             const isOpen = openMap[p.id] !== false; // default-open
-            const groupByPrd = groupByPrdMap[p.id] === 'prd';
+            const groupByPrd = groupByPrdMap[p.id] !== 'flat';
             const invariantChip = invariantChipFor(DF_T.INVARIANTS, p.id);
             const chainChip = chainChipFor(DF_T.INVARIANTS, p.id);
             const deferralChip = deferralNeedsHumanChip(rows.value || []);
@@ -936,16 +723,18 @@ function TasksTab({ projectFilter, search }) {
             return (
               <PG_T key={p.id} id={p.id} label={p.id} open={isOpen} onToggle={() => toggle(p.id)}
                     summary={summary} summaryRight={summaryRight}>
+                <PrdContentionLine contention={projectPrdContention(DF_T, p.id)} />
                 {listed.placeholder && <div className="empty" title={listed.placeholder.title}>{listed.placeholder.text}</div>}
                 {listed.notes.map(note => (
                   <div key={note} className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{note}</div>
                 ))}
-                {!onlyThePlaceholder && (groupView.emptiedByFocus
-                  ? <div className="empty">no tasks in the focused neighborhood — Esc to exit focus</div>
-                  : groupByPrd
-                    ? <ProjectPrdGroups graphTasks={groupView.shown} allProjectTasks={held} rows={rows} terminal={terminal}
-                                        selectedId={selectedId}
-                                        onSelect={setSelectedId} onEnterFocus={enterFocus} />
+                {groupByPrd
+                  ? <ProjectPrdLanes project={p.id} view={projectPrdView(DF_T, p.id)} pool={groupView.shown}
+                                     renderMembers={tasks => <TaskGraph tasks={tasks} selectedId={selectedId}
+                                                                        onSelect={setSelectedId} onEnterFocus={enterFocus} />}
+                                     onSelect={setSelectedId} />
+                  : !onlyThePlaceholder && (groupView.emptiedByFocus
+                    ? <div className="empty">no tasks in the focused neighborhood — Esc to exit focus</div>
                     : <TaskGraph tasks={groupView.shown} selectedId={selectedId}
                                  onSelect={setSelectedId} onEnterFocus={enterFocus} />)}
               </PG_T>

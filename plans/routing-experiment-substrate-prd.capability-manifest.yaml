@@ -1,0 +1,123 @@
+# Machine-readable twin of routing-experiment-substrate-prd.capability-manifest.md
+# Bindings verified against main 6c16d8cdd8 (2026-11-03). Every mechanical check
+# below is absent on that commit (polarity rule); task_id values are stamped by
+# commit_planning.
+prd: plans/routing-experiment-substrate-prd.md
+schema_version: 1
+signal_leaves: ["η"]
+tasks:
+  - label: "α"
+    task_id: 8373
+    title: "Split condition, plan-shape fields on routing_decision, split_bucket in shared"
+    capabilities:
+      - name: "split-condition-in-rule-vocabulary"
+        binding: "capability→producer (α) — config.py gains SplitMatch; _rule_matches consumes it"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class SplitMatch"
+          paths: ["orchestrator/src/orchestrator/config.py"]
+          expect: present
+      - name: "split-bucket-single-home-in-shared"
+        binding: "capability→producer (α) — shared/src/shared/routing_split.py::split_bucket"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def split_bucket\\("
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "plan-shape-on-routing-decision-event"
+        binding: "capability→producer (α) — workflow.py::_record_routing_decision and routing_dispatch.py::resolve_and_record_route emit plan_steps/plan_modules"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "['\"]plan_modules['\"]"
+          paths: ["orchestrator/src/orchestrator/workflow.py", "orchestrator/src/orchestrator/routing_dispatch.py"]
+          expect: present
+      - name: "malformed-split-rejected-at-load"
+        binding: "rejection-mechanism — RuleMatch extra='forbid' plus SplitMatch validators; α's boundary test observes the error"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rejection quality is judged by α's own test fixtures, not a grep"
+  - label: "β"
+    task_id: 8374
+    title: "Routing experiment readout and A/A check script"
+    capabilities:
+      - name: "readout-script-exists-and-imports-split-bucket"
+        binding: "capability→producer (β) — scripts/routing_experiment_readout.py"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "split_bucket"
+          paths: ["scripts/routing_experiment_readout.py"]
+          expect: present
+      - name: "aa-mode-exits-nonzero-on-skew"
+        binding: "rejection-mechanism — β's test forces a skewed fixture and asserts a non-zero exit"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "exit-code behaviour is a test property"
+  - label: "γ"
+    task_id: 8375
+    title: "Experiment-1 rule table: large-plan-modules-4 on arm 1, large-plan-modules on arm 0"
+    capabilities:
+      - name: "split-rules-present-in-defaults"
+        binding: "capability→producer (γ) — defaults.yaml rule ids large-plan-modules-4 and large-plan-modules with split conditions"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "large-plan-modules-4"
+          paths: ["orchestrator/src/orchestrator/defaults.yaml", "dark-factory-orchestrator.yaml"]
+          expect: present
+  - label: "δ"
+    task_id: 8390
+    title: "Arm experiment 1: A/A check then reload every unit"
+    note: "Deterministic; before_done is scripts/routing_experiment_arm.sh, committed before filing. Reload dispositions are read per unit at run time."
+    capabilities:
+      - name: "units-reloaded-after-passing-aa-check"
+        binding: "capability→producer (δ) — the arming program runs the readout in --aa mode, then reload_config per unit"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "reload dispositions live in each unit's reload_config reply, not in the tree"
+  - label: "ε"
+    task_id: 8376
+    title: "Curator complexity hint; treated-arm simple declaration keyed on candidate_key"
+    capabilities:
+      - name: "curator-schema-carries-complexity-hint"
+        binding: "capability→producer (ε) — task_curator.py CURATOR_OUTPUT_SCHEMA and batch schema gain complexity_hint"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "complexity_hint"
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py", "fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "filer-declaration-wins"
+        binding: "rejection-mechanism — ε's test asserts a submitter-set complexity survives a treated-arm hint"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "precedence is a test property"
+  - label: "ζ"
+    task_id: 8377
+    title: "Documentation: OPERATIONS.md §7 corrected, task-authoring §4 hint paragraph, skill pointers"
+    capabilities:
+      - name: "operations-section-7-no-longer-claims-inactive-substrate"
+        binding: "capability→producer (ζ) — the stale sentence is removed"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Adaptive-routing substrate \\(not yet active\\)"
+          paths: ["OPERATIONS.md"]
+          expect: absent
+  - label: "η"
+    task_id: 8378
+    title: "Readout gate: rule keep/revert/extend for both experiments"
+    capabilities:
+      - name: "gate-escalates-with-both-readouts"
+        binding: "capability→producer (η) — deterministic always_escalates gate, delayed milestone 28 days after δ, ε, β"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the escalation is observed on the queue, not in the tree"

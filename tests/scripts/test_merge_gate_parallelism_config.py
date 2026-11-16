@@ -48,8 +48,11 @@ import pytest
 # insertion this directory relies on under --import-mode=importlib.
 import verify_command_invariants as vci
 from orchestrator.config import ModuleConfig
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator import verify_cmd
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 if TYPE_CHECKING:
     from collections.abc import Callable

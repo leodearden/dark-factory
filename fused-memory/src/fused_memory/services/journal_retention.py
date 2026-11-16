@@ -33,8 +33,12 @@ async def prune_every_table_at_startup(
 
     Every prune is fire-and-forget, so this never raises.
     """
-    mem0_intents = await journal.prune_mem0_intents()
-    idempotent_ops = await journal.prune_idempotent_ops()
+    mem0_intents = await journal.prune_mem0_intents(
+        older_than_days=config.mem0_intents_retention_days,
+    )
+    idempotent_ops = await journal.prune_idempotent_ops(
+        older_than_days=config.idempotent_ops_retention_days,
+    )
     deadline = prune_deadline(config.prune_max_seconds)
     write_ops = await prune_write_ops_pass(journal, config)
     backend_ops = await journal.prune_backend_ops(

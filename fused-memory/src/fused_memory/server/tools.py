@@ -25,7 +25,12 @@ from shared.delivered_check_polarity import (
     lint_delivered_checks,
     polarity_error,
 )
+from shared.project_id import normalize_project_id
+from shared.pure_gate_provenance import PURE_GATE_FROM_KEY
+from shared.task_metadata import TASK_METADATA_CAPABILITIES
 from shared.task_statuses import ACTIVE
+from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
+from shared.task_submit import is_ticket_id, looks_like_task_id
 from shared.uuid_prefix_guard import Namespace, Resolution, ResolverUnavailable
 
 from fused_memory.backends.defect_records import (
@@ -42,6 +47,10 @@ from fused_memory.backends.metadata_lookup import (
     DEFAULT_LOOKUP_LIMIT,
     InvalidMetadataLookupError,
     validate_metadata_query,
+)
+from fused_memory.backends.task_projection import (
+    InvalidTaskProjectionField,
+    parse_task_projection,
 )
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
@@ -93,12 +102,13 @@ from fused_memory.middleware.routing_intent_guard import (
     routing_intent_warning,
 )
 from fused_memory.middleware.simple_task_files_guard import simple_task_files_error
+from fused_memory.middleware.task_facts import Lookup, TaskFactsReader, TaskRef, read_task_facts
 from fused_memory.middleware.task_interceptor import (
-    TERMINAL_STATUSES,
     TicketStoreNotConfiguredError,
-    _is_ticket_id,
-    _looks_like_task_id,
+    interceptor_write_succeeded,
 )
+from fused_memory.middleware.task_text_write_guard import TASK_TEXT_FP_KEY, text_fp_of
+from fused_memory.middleware.trigger_chain_guard import trigger_chain_open_error
 from fused_memory.models.enums import (
     MEM0_PRIMARY,
     MemoryCategory,
@@ -115,6 +125,10 @@ from fused_memory.reconciliation.consolidation_proposal import (
     PROPOSER_AGENT_ID,
     ConsolidationProposal,
     record_proposal,
+)
+from fused_memory.reconciliation.enumeration_guard import (
+    enumeration_gate_for_filing,
+    enumeration_gate_for_update,
 )
 from fused_memory.reconciliation.flag_record_contract import (
     recon_stage_flag_kind_refusal,
@@ -199,11 +213,14 @@ from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     ROUTED_KEY,
+    TRIAGE_FAIL_OPEN_KEY,
+    FailOpenStage,
     TriageFailOpenCounter,
     attach_write_durable,
     declares_attach_keys,
     declares_supersession,
     emit_triage_fail_open_storm_escalation,
+    is_orchestrator_completion_write,
     resolve_write_triage_enabled,
     triage_write,
 )
@@ -242,7 +259,6 @@ from fused_memory.services.supersession_mark import mark_superseded
 from fused_memory.utils.clip_disclosure import truncation_fields
 from fused_memory.utils.validation import (
     PathShapedProjectIdError,
-    _to_underscore_canonical,
     canonicalize_project_id,
     validate_full_uuid,
     validate_int_ids,
@@ -1301,6 +1317,20 @@ def _validate_statuses(statuses: Any) -> dict[str, Any] | None:
     }
 
 
+def _validate_fields(fields: Any) -> dict[str, Any] | None:
+    """Return the INV-2 ValidationError payload unless ``fields`` is a valid ``get_tasks`` projection."""
+    try:
+        parse_task_projection(fields)
+    except InvalidTaskProjectionField as e:
+        return {
+            'error': str(e),
+            'error_type': 'ValidationError',
+            'field': e.field,
+            'allowed': list(e.allowed),
+        }
+    return None
+
+
 # find_tasks_by_metadata's page-size cap, and its include_value page budget in
 # serialized bytes of ``results`` (plans/task-metadata-lookup-prd.md decision 6).
 METADATA_LOOKUP_LIMIT_CAP = 100
@@ -1391,6 +1421,7 @@ def create_mcp_server(
         # collection prefix applies to the next resolution.
         return id_resolver or IdResolver.for_memory_service(memory_service)
     _taskmaster_configured = task_interceptor is not None
+    _task_facts_reader: TaskFactsReader | None = task_interceptor
 
     async def _backlog_gate(project_id: str) -> dict | None:
         """WP-D: reject memory writes when the per-project backlog is over the
@@ -1677,13 +1708,12 @@ def create_mcp_server(
     _VALID_TEMPORAL_CONTEXTS = frozenset({'retrospective', 'planning', 'current'})
     # Derived from the authoritative sets so this validator stays in lockstep
     # automatically when a new status is added to either partition. Both names
-    # are re-exported from shared.task_statuses (PRD task-status-authority
-    # C1/C2, finding 6.4) — the single source of truth:
+    # come from shared.task_statuses (PRD task-status-authority C1/C2,
+    # finding 6.4) — the single source of truth:
     #   ACTIVE_TASK_STATUSES  — shared.ACTIVE: non-terminal in-flight statuses
     #                           (re-exported by fused_memory.reconciliation.task_filter)
     #   TERMINAL_STATUSES     — shared.TERMINAL: terminal statuses requiring
-    #                           reopen_reason to exit (re-exported by
-    #                           fused_memory.middleware.task_interceptor)
+    #                           reopen_reason to exit (imported directly)
     # Do NOT hardcode this as a literal; use the union so a future status added
     # to shared.task_statuses.TaskStatus is automatically accepted here without
     # a separate edit to this file.
@@ -1709,7 +1739,7 @@ def create_mcp_server(
     #
     # `contested` maps to AMENDMENT_KIND and NOT to SIGHTING_KIND, and the
     # difference is content visibility rather than bookkeeping: grouped_read
-    # DIGESTS amendment text into the grouped document, while sightings are
+    # CARRIES amendment text into the grouped document, while sightings are
     # only COUNTED. A contested child filed as a sighting has its correction
     # suppressed to a tally underneath the very entry it contests — the
     # esc-5712 five-week-wrong-appendix shape that grouped_read.
@@ -2023,166 +2053,48 @@ def create_mcp_server(
                 refs.append(claim.ref)
         return grouped
 
-    async def _batched_task_statuses(
-        refs_by_project: dict[str | None, list[str]],
-        *,
-        log_prefix: str,
-    ) -> tuple[
-        dict[tuple[str | None, str], str],
-        set[str | None],
-        set[tuple[str | None, str]],
-    ]:
-        """One batched status read per project; report WHICH projects answered.
-
-        Returns ``(resolved, consulted, acknowledged)``.
-
-        ``resolved`` is the ``(project_id, ref) -> status`` map, exactly as
-        ``_claim_task_statuses`` has always produced it. ``consulted`` is the
-        set of projects whose ``get_statuses`` returned WITHOUT RAISING — and it
-        is the whole reason this body was extracted rather than copied.
-
-        ``acknowledged`` is the set of ``(project_id, ref)`` keys the registry
-        RETURNED AT ALL, independent of the value's type, and it exists because
-        ``resolved`` alone cannot answer "does this task exist". The
-        ``get_statuses`` contract is explicit that PRESENCE is the existence
-        signal — ``middleware/task_interceptor.py::TaskInterceptor.get_statuses``
-        documents "unknown ids are silently omitted", and
-        ``backends/sqlite_task_backend.py::SqliteTaskBackend.get_statuses_raw``
-        coerces even a NULL status to the sentinel string ``'unknown'`` rather
-        than dropping the row. So a key present with a non-``str`` value is a
-        task that EXISTS whose status came back unusable, which the
-        ``isinstance(value, str)`` filter below erases from ``resolved``.
-        That erasure is benign for ``_claim_task_statuses`` (an absent key
-        collapses into the same 'unverifiable' tag either way) and WRONG for
-        ``_verify_mint_referent``, which would otherwise read the gap as a
-        positive "no such task" and refuse to mint for a task that is really
-        there. Reported separately rather than by loosening the filter, so
-        ``resolved``'s values stay ``str`` for the claim gate that types them.
-
-        WHY THE SECOND RETURN VALUE EXISTS. ``_claim_task_statuses``'s own
-        docstring states that "an ABSENT key is the unresolvable signal", which
-        is correct for the completion-claim gate: an unchecked claim is TAGGED,
-        so the two unresolvable causes ("no such task" and "could not consult")
-        may safely collapse. ``_verify_mint_referent`` cannot collapse them —
-        it must REFUSE on "no such task" and PROCEED on "could not consult", or
-        the mint tool becomes unusable on any deployment without a task
-        registry. A project in ``consulted`` whose key is nonetheless absent is
-        a positive "no such task"; a project outside it is genuinely
-        unresolvable.
-
-        Duplicating this probe into the mint path instead would be the lockstep
-        duplication INV-5 forbids, in exactly the seam the task text says to
-        reuse.
-
-        PRECEDENT: the ``_claim_ticket_rows`` sibling below already draws this
-        same distinction, in the same two parts. The FUNCTION encodes "key
-        mapped to None means the registry answered NO SUCH TICKET; an absent key
-        means it could not be consulted", and the ``UNRESOLVABLE`` sentinel is
-        applied at its CALL SITE via
-        ``ticket_probe=lambda ref: tickets.get(ref, UNRESOLVABLE)``. This
-        extraction reproduces that split with the answered-set carried
-        explicitly rather than encoded in a None value, because a status map's
-        values are already meaningful strings and have no spare None to spend.
-
-        The guard is ``_taskmaster_configured``, NOT ``task_interceptor is not
-        None``: that name is rebound later in this same closure to a bare
-        ``TaskInterceptor(None, None, _fallback_buffer)`` fallback, after which
-        the latter test is always true.
-        """
-        resolved: dict[tuple[str | None, str], str] = {}
-        consulted: set[str | None] = set()
-        acknowledged: set[tuple[str | None, str]] = set()
-        for claimed_project, project_refs in refs_by_project.items():
-            refs = sorted(project_refs)
-            root = _kp.get(claimed_project) if claimed_project is not None else None
-            if not _taskmaster_configured or root is None:
-                logger.warning(
-                    '%s: live status unresolvable for %d task ref(s) '
-                    '(taskmaster_configured=%s claimed_project=%r registered=%s)',
-                    log_prefix, len(refs), _taskmaster_configured, claimed_project,
-                    root is not None,
-                )
-                continue
-            try:
-                statuses = await task_interceptor.get_statuses(  # type: ignore[union-attr]
-                    project_root=root,
-                    ids=refs,
-                )
-            except Exception:
-                logger.warning(
-                    '%s: get_statuses failed for claimed_project=%r; the %d '
-                    'task ref(s) are UNVERIFIABLE',
-                    log_prefix, claimed_project, len(refs), exc_info=True,
-                )
-                continue
-            # Recorded only AFTER the call returned: a raising read consulted
-            # nothing, and treating it as an answer would turn an outage into a
-            # confident "no such task".
-            consulted.add(claimed_project)
-            for key, value in (statuses or {}).items():
-                acknowledged.add((claimed_project, str(key)))
-                if isinstance(value, str):
-                    resolved[(claimed_project, str(key))] = value
-        return resolved, consulted, acknowledged
-
     async def _claim_task_statuses(
         claims: list[Any], project_id: str
     ) -> dict[tuple[str | None, str], str]:
         """Live status for every task claim, keyed ``(project_id, ref)``.
 
-        One batched read per CLAIMED project — not per claim (which would
-        multiply authority traffic by the claim count for no gain) and not one
-        read scoped to the writer (which would consult the wrong tree for a
-        cross-project claim).
-
-        An ABSENT key is the unresolvable signal — the sync probe handed to
+        One batched read per CLAIMED project, through ``read_task_facts``. An
+        ABSENT key is the unresolvable signal: the sync probe handed to
         verify_claims returns None for it, which lands the claim on
-        'unverifiable' and therefore tagged. Every failure mode (no interceptor,
-        unregistered project, a raising read) deliberately leaves the key absent
+        'unverifiable' and therefore tagged. Only FOUND facts get a key, so "no
+        such task", "could not check" and an unusable status all stay absent
         rather than fabricating a permissive answer.
-
-        Delegates to ``_batched_task_statuses`` and DISCARDS both its
-        ``consulted`` set and its ``acknowledged`` key set: this gate collapses
-        "no such task", "the registry could not be consulted" and "the status
-        came back unusable" into the same tag, so external behaviour here is
-        byte-identical to the pre-extraction body.
         """
-        grouped = _group_refs_by_project(claims, 'task')
-        if not grouped:
+        refs = {
+            TaskRef(claim.project_id, claim.ref)
+            for claim in claims
+            if claim.subject == 'task' and claim.project_id
+        }
+        if not refs:
             return {}
-        resolved, _consulted, _acknowledged = await _batched_task_statuses(
-            grouped, log_prefix=f'completion_claim_gate (writer_project={project_id!r})',
-        )
-        return resolved
+        facts = await read_task_facts(refs, reader=_task_facts_reader, known_projects=_kp)
+        for fact in facts.values():
+            if fact.lookup is Lookup.COULD_NOT_CHECK:
+                logger.warning(
+                    'completion_claim_gate (writer_project=%r): live status unresolvable '
+                    'for task %r in project %r (%s)',
+                    project_id, fact.ref.task_id, fact.ref.project_id, fact.reason,
+                )
+        return {
+            (fact.ref.project_id, fact.ref.task_id): fact.status
+            for fact in facts.values()
+            if fact.lookup is Lookup.FOUND and fact.status is not None
+        }
 
     async def _verify_mint_referent(referent: Any, project_id: str) -> dict | None:
         """Guard 4: refuse to mint a node for a task the registry does not have.
 
         Returns an ``EntityMintUnknownTask`` refusal dict, or ``None`` to
-        proceed.
-
-        THE THREE-VALUED ANSWER, which is why this shares
-        ``_batched_task_statuses`` with ``_claim_task_statuses`` rather than
-        reusing that function directly:
-
-        * ref PRESENT in the resolved map -> the task exists; proceed.
-        * ref ACKNOWLEDGED but not resolved -> the registry returned the key
-          with a non-``str`` value, so the task EXISTS and only its status is
-          unusable. Proceed: ``get_statuses`` omits unknown ids entirely and
-          coerces even a NULL status to ``'unknown'``, so PRESENCE is the
-          existence signal and the value's type is not. Reading this gap as
-          "no such task" would refuse a mint for a task that is really there —
-          the one input where the filter ``resolved`` shares with
-          ``_claim_task_statuses`` would give this caller the wrong answer.
-        * project CONSULTED but the ref absent ENTIRELY -> the registry
-          ANSWERED, and the answer was "no such task". Refuse: minting a node
-          for a task that does not exist creates exactly the orphan this gate
-          exists to prevent, and nothing sweeps orphan minted nodes.
-        * project NOT consulted -> unresolvable (no taskmaster, the referent's
-          project unregistered, or a raising read). Log a structured WARNING and
-          PROCEED. Refusing here would make the tool unusable on any deployment
-          without the task registry, which is a far worse failure than the
-          occasional unverified mint.
+        proceed, by the referent's ``Lookup``: FOUND proceeds; NO_SUCH_TASK
+        refuses, because the store answered and a node for a task that does not
+        exist is an orphan nothing sweeps; COULD_NOT_CHECK logs a WARNING and
+        proceeds, because an unreachable registry must not make this tool
+        unusable.
 
         The adjudicating project is the REFERENT's own
         (``referent.project_id or project_id``), never the writer's: reading the
@@ -2194,22 +2106,11 @@ def create_mcp_server(
         ref = str(getattr(referent, 'number', '') or '')
         if not ref:
             return None
-        resolved, consulted, acknowledged = await _batched_task_statuses(
-            {claimed_project: [ref]},
-            log_prefix=f'entity_mint (writer_project={project_id!r})',
-        )
-        if (claimed_project, ref) in resolved:
-            return None
-        if (claimed_project, ref) in acknowledged:
-            logger.warning(
-                'entity_mint: the task registry acknowledged task %r in project '
-                '%r but returned a non-str status for it; the task EXISTS, so '
-                'the mint proceeds — a present key is the existence signal and '
-                'the status value is not. writer_project=%r',
-                ref, claimed_project, project_id,
-            )
-            return None
-        if claimed_project in consulted:
+        task_ref = TaskRef(claimed_project, ref)
+        facts = (await read_task_facts(
+            [task_ref], reader=_task_facts_reader, known_projects=_kp,
+        ))[task_ref]
+        if facts.lookup is Lookup.NO_SUCH_TASK:
             return {
                 'status': 'refused',
                 'error': (
@@ -2223,14 +2124,14 @@ def create_mcp_server(
                 'project_id': claimed_project,
                 'ref': ref,
             }
-        logger.warning(
-            'entity_mint: could not verify task %r in project %r against the '
-            'task registry (taskmaster_configured=%s, registered=%s); minting '
-            'anyway rather than refusing, because an unreachable registry must '
-            'not make this tool unusable. writer_project=%r',
-            ref, claimed_project, _taskmaster_configured,
-            _kp.get(claimed_project) is not None, project_id,
-        )
+        if facts.lookup is Lookup.COULD_NOT_CHECK:
+            logger.warning(
+                'entity_mint: could not verify task %r in project %r against the '
+                'task registry (%s); minting anyway rather than refusing, because '
+                'an unreachable registry must not make this tool unusable. '
+                'writer_project=%r',
+                ref, claimed_project, facts.reason, project_id,
+            )
         return None
 
     async def _claim_ticket_rows(claims: list[Any]) -> dict[str, Any]:
@@ -3632,8 +3533,8 @@ def create_mcp_server(
         or different, explicitly or implicitly (ruling:
         plans/write-triage-flip-readiness-prd.md §11.3 C1''); it does not
         adjudicate which of the two is right. Your full text is stored and
-        readable in the canonical's grouped document (a contesting
-        amendment's text is carried there in full up to
+        readable in the canonical's grouped document (every amendment's
+        text is carried there in full up to
         ``write_triage.judge_field_chars``; sighting text is still only
         counted) and marked as
         contesting it, and the memory you contradict is left untouched. No
@@ -3893,9 +3794,11 @@ def create_mcp_server(
         # the attach below OVERWRITES, so a caller that set either force-stores
         # exactly like allow_near_duplicate. See write_triage.declares_attach_keys
         # for why ANY `kind` counts (not just the child kinds) and what that
-        # costs in coverage.
+        # costs in coverage. An orchestrator completion record force-stores even
+        # without its kind; see write_triage.is_orchestrator_completion_write.
         caller_owns_attach_keys = declares_attach_keys(metadata)
         caller_declares_supersession = declares_supersession(metadata)
+        caller_is_completion_record = is_orchestrator_completion_write(metadata)
         # Write triage (task 3127, PRD leaf beta) SUPERSEDES the two reject
         # guards below rather than layering on top of them (D2: redirect
         # supersedes reject). The two paths are mutually exclusive: when triage
@@ -3934,6 +3837,7 @@ def create_mcp_server(
                 allow_near_duplicate=allow_near_duplicate,
                 caller_owns_attach_keys=caller_owns_attach_keys,
                 caller_declares_supersession=caller_declares_supersession,
+                caller_is_completion_record=caller_is_completion_record,
             )
         # DEFERRED, DELIBERATELY: the topic-cluster signal contributes nothing
         # to triage routing in this leaf. The PRD's band rule (§Bands) is
@@ -4121,6 +4025,7 @@ def create_mcp_server(
             if triage_decision is not None and attach_kind is not None
             else None
         )
+        fail_open_stage = triage_decision.fail_open_stage if triage_decision is not None else None
         if (
             triage_decision is not None
             and attach_kind is None
@@ -4155,6 +4060,7 @@ def create_mcp_server(
                 triage_decision.outcome, OUTCOME_STORED,
             )
             _triage_fail_open_counter.record(project=project_id)
+            fail_open_stage = FailOpenStage.UNWIRED_VERDICT
         write_meta = cleaned_meta
         if attached_to is not None:
             # Every key written here is an ATTACH_OWNED_KEY (the triage-contest
@@ -4174,7 +4080,7 @@ def create_mcp_server(
             if triage_decision is not None and triage_decision.outcome == OUTCOME_CONTESTED:
                 # The one key that distinguishes a contested child from an
                 # ordinary amendment — both are AMENDMENT_KIND, because both
-                # need their text DIGESTED into the grouped document rather
+                # need their text CARRIED in the grouped document rather
                 # than counted. Composed from grouped_read's constant, never
                 # the 'x_contested' literal: that module owns the read-side
                 # predicate (is_contested_child) which has to recognise what
@@ -4188,7 +4094,7 @@ def create_mcp_server(
                 # measured rather than assumed: the only consumer of
                 # CONTESTED_METADATA_KEY /
                 # is_contested_child is grouped_read's READ-SIDE suppression,
-                # which keeps the submitted text visible and digested in the
+                # which keeps the submitted text visible, carried in the
                 # canonical's grouped document while marking it as contesting.
                 # There is no gate, no escalation and no operator surface --
                 # reconciliation/consolidation_gate.py keys on a DIFFERENT
@@ -4238,6 +4144,7 @@ def create_mcp_server(
                 attached_to,
             )
             _triage_fail_open_counter.record(project=project_id)
+            fail_open_stage = FailOpenStage.ATTACH_WRITE
             attached_to = None
             result = await memory_service.add_memory(
                 content=content,
@@ -4290,6 +4197,7 @@ def create_mcp_server(
                 attached_to, OUTCOME_STORED, getattr(result, 'message', None),
             )
             _triage_fail_open_counter.record(project=project_id)
+            fail_open_stage = FailOpenStage.ATTACH_NOT_DURABLE
             attached_to = None
         # Marks each record this write supersedes, now that the new id exists.
         # Not a triage event; see services/supersession_mark.py.
@@ -4323,6 +4231,9 @@ def create_mcp_server(
             ack = {**ack, ROUTED_KEY: outcome}
             if attached_to is not None:
                 ack[CANONICAL_ID_KEY] = attached_to
+            # See write_triage.TRIAGE_FAIL_OPEN_KEY.
+            if fail_open_stage is not None:
+                ack[TRIAGE_FAIL_OPEN_KEY] = fail_open_stage.value
             ack.update(truncation_fields(*triage_decision.truncation_facts))
             # Drained AFTER any fallback record above, so one drain covers both
             # triage_write's internal fail-opens and this body's own.
@@ -4364,6 +4275,14 @@ def create_mcp_server(
         A caller that deliberately passes agent_id='recon-stage-*' can
         still reach this path; the gate's purpose is to prevent accidental
         use by ordinary callers, not to defend against a malicious one.
+
+        If the embedding provider fails transiently (429, 5xx, connection), the
+        write is NOT dropped: the ack carries stores_pending_retry=['mem0'] and
+        empty memory_ids, the message says mem0_pending_retry, and the server
+        re-issues it through the same dedup-exempt backend method. A later
+        non-transient failure dead-letters it (status 'dead' in the write
+        journal's mem0_intents). Do NOT re-submit the same content. The write
+        has landed only when memory_ids is non-empty.
 
         Args:
             content: The system record content (e.g. a deterministic cycle summary).
@@ -4610,22 +4529,21 @@ def create_mcp_server(
             entry, not beside it.
 
             A result carrying children gains a 'grouped' block:
-            {'amendments': [{'id','digest','created_at','kind'}],
+            {'amendments': [{'id','content','created_at','kind'}],
              'amendment_count': int, 'sighting_count': int} — the counts are
-            EXACT while the digest list is bounded and TRUNCATED to a cap
-            (marked 'truncated': True, and each digest body is itself
-            truncated), so never read the list as the whole set.  Any child that
-            was folded away is pinned into 'grouped'['matched_children'] as
-            {'id','content','created_at','kind','matched': True} carrying its
-            FULL body — that is where a matched child's text lives.  A digest
-            already listing the matched child is marked 'matched': True in
-            place instead and gains a 'content' key carrying that same FULL
-            body alongside its truncated 'digest', so a matched child's text is
-            never shortened by grouping wherever it ends up.  A digest marked
-            'contested': True also carries 'content', whether or not the child
-            itself matched: the child's text capped at
+            EXACT while the amendment list is bounded and TRUNCATED to a cap
+            (marked 'truncated': True), so never read the list as the whole
+            set.  Each amendment's 'content' is its text capped at
             write_triage.judge_field_chars, with the counted elision marker
-            when cut.
+            when cut; one that contests its parent is also marked
+            'contested': True.  Any child that was folded away is pinned into
+            'grouped'['matched_children'] as
+            {'id','content','created_at','kind','matched': True} carrying its
+            FULL body — that is where a matched child's text lives.  An
+            amendment entry already listing the matched child is marked
+            'matched': True in place instead and its 'content' becomes that
+            same FULL body, so a matched child's text is never shortened by
+            grouping wherever it ends up.
 
             Loud-fault keys, present only when something is genuinely unknown:
             'grouped'['children_unavailable'] (+ 'error_type') means the child
@@ -4713,7 +4631,7 @@ def create_mcp_server(
                     memory_service,
                     project_id,
                     results,
-                    contested_text_chars=resolve_judge_field_chars(memory_service),
+                    amendment_text_chars=resolve_judge_field_chars(memory_service),
                 )
             except Exception:
                 # A grouping fault must never turn a working search into an
@@ -5197,10 +5115,12 @@ def create_mcp_server(
 
             A hit additionally carries an optional ``grouped`` key (task 3129)
             when the record participates in a parent/child group: a CANONICAL
-            gains ``{'amendments': [digests], 'amendment_count', 'sighting_count'}``
-            (a digest marked ``'contested': True`` also carries ``'content'``,
-            its text capped at ``write_triage.judge_field_chars``; plus
-            ``'truncated': True`` when the digest listing is bounded, or
+            gains ``{'amendments': [entries], 'amendment_count', 'sighting_count'}``
+            (each entry ``{'id', 'content', 'created_at', 'kind'}``, its
+            ``content`` capped at ``write_triage.judge_field_chars`` with the
+            counted elision marker, one that contests its parent also marked
+            ``'contested': True``; plus ``'truncated': True`` when the
+            amendment listing is bounded, or
             ``{'children_unavailable': True, 'error_type'}`` when the child
             reads failed); a CHILD gains ``{'parent': {'id', ...same block...}}``
             while keeping its OWN ``content``/``metadata``/``memory_id``.  On
@@ -5290,7 +5210,7 @@ def create_mcp_server(
                 project_id,
                 memory_id,
                 record,
-                contested_text_chars=resolve_judge_field_chars(memory_service),
+                amendment_text_chars=resolve_judge_field_chars(memory_service),
             )
         except Exception:
             logger.warning(
@@ -7747,8 +7667,8 @@ def create_mcp_server(
 
         # (5) The referent must name a task the live registry actually has —
         # but ONLY when the registry can be consulted. See
-        # `_verify_mint_referent` for the three-valued distinction and why it
-        # cannot be expressed through `_claim_task_statuses` directly.
+        # `_verify_mint_referent` for the FOUND / NO_SUCH_TASK /
+        # COULD_NOT_CHECK rule.
         if err := await _verify_mint_referent(name_decision.referent, project_id):
             return err
 
@@ -7852,6 +7772,11 @@ def create_mcp_server(
         ``queue`` is the durable-write-queue subsystem, and conflating it with
         reconciliation state is the exact mis-triage task 2920 fixed.
 
+        The top-level ``task_metadata_capabilities`` lists the task-metadata
+        capabilities this running server's submit guard enforces. Filing
+        recipes probe it (skills/_shared/filing-the-trigger-chain.md §2)
+        because it comes from the running process, not from main.
+
         Args:
             project_id: Get stats for a specific project (optional)
         """
@@ -7924,6 +7849,9 @@ def create_mcp_server(
         # exact mis-triage task 2920 fixed.
         if write_journal is not None and isinstance(result, dict) and 'error' not in result:
             result['journal_drops'] = write_journal.journal_drop_stats()
+
+        if isinstance(result, dict) and 'error' not in result:
+            result['task_metadata_capabilities'] = sorted(TASK_METADATA_CAPABILITIES)
 
         return result
 
@@ -8619,10 +8547,10 @@ def create_mcp_server(
         task tools. Returning a clear error here prevents confusing downstream
         failures inside the taskmaster backend.
 
-        Delegates to :func:`~fused_memory.middleware.task_interceptor._is_ticket_id`
-        so there is a single source of truth for the ticket-id prefix.
+        Delegates to ``shared/src/shared/task_submit.py::is_ticket_id`` so
+        there is a single source of truth for the ticket-id prefix.
         """
-        if _is_ticket_id(value):
+        if is_ticket_id(value):
             return {
                 'error': (
                     f'Ticket-shaped id {value!r} not allowed here; '
@@ -8640,6 +8568,7 @@ def create_mcp_server(
         page_size: int | None = None,
         offset: int = 0,
         statuses: Any = None,
+        fields: Any = None,
     ) -> dict[str, Any]:
         """List all tasks in the project.
 
@@ -8658,6 +8587,16 @@ def create_mcp_server(
                 results to matching tasks via a SQL ``status IN (...)`` predicate.  An
                 empty list (``[]``) is valid and returns no tasks.  A bare string is
                 rejected with a ValidationError.
+            fields: Optional row projection.  None returns full rows, unchanged.  Each
+                entry is a top-level row key or ``metadata.<key>`` (key matching
+                ``[A-Za-z_][A-Za-z0-9_]*``); ``id`` is always returned, and a requested
+                metadata key absent on a task, or a requested row key the store's schema
+                lacks, is omitted.  An invalid entry is a ValidationError carrying
+                ``field`` and ``allowed``.  Composes with ``statuses`` and ``page_size``.
+                The row keys are ``backends/task_projection.py::TASK_ROW_KEYS``; among
+                them ``created_at`` is the filing time and ``created_at_source`` its
+                provenance, a ``shared/src/shared/task_created_at.py::CreatedAtSource``
+                value.
         """
         # Input validation — early-exit before touching the interceptor.
         # Shared with get_statuses so both tools reject identical inputs
@@ -8668,12 +8607,17 @@ def create_mcp_server(
         _statuses_error = _validate_statuses(statuses)
         if _statuses_error is not None:
             return _statuses_error
+        _fields_error = _validate_fields(fields)
+        if _fields_error is not None:
+            return _fields_error
 
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
-        result = await task_interceptor.get_tasks(project_root=project_root, tag=tag, statuses=statuses)
+        result = await task_interceptor.get_tasks(
+            project_root=project_root, tag=tag, statuses=statuses, fields=fields,
+        )
         if isinstance(result, dict) and 'error' not in result:
             pid = resolve_project_id(project_root)
             # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
@@ -9025,15 +8969,16 @@ def create_mcp_server(
             if not sep or not project_id or not task_id or not task_id.isdigit():
                 result[dep] = 'malformed'
                 continue
-            # Normalise project_id via the shared raise-free primitive (task 2267
-            # / seam S1) so 'dark-factory' == 'dark_factory', mirroring
-            # models/scope.py:resolve_project_id. Deliberately NOT the raising
+            # Normalise project_id with the raise-free one rule
+            # shared.project_id.normalize_project_id (as
+            # fused_memory/models/scope.py::resolve_project_id does) so
+            # 'dark-factory' == 'dark_factory'. Deliberately NOT the raising
             # canonicalize_project_id: this tool's contract is sentinel-only
             # (never raise on a semantic problem), and a path-shaped project_id
             # must fall through to the 'unknown_project' sentinel below rather
             # than raise PathShapedProjectIdError. Registry lookup uses the
             # normalised form; result is keyed by the original verbatim dep string.
-            norm_project_id = _to_underscore_canonical(project_id)
+            norm_project_id = normalize_project_id(project_id)
             # Look up project_root in registry
             if norm_project_id not in _kp:
                 result[dep] = 'unknown_project'
@@ -9084,6 +9029,9 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Get a single task by ID.
 
+        The response carries ``task_text_fp``, the fingerprint of its
+        description+details: pass it to ``update_task`` as ``expected_text_fp``.
+
         Args:
             id: Task ID (e.g., "15", "15.2")
             project_root: Absolute path to project root
@@ -9097,7 +9045,12 @@ def create_mcp_server(
         if isinstance(result, dict) and 'error' not in result:
             pid = resolve_project_id(project_root)
             # Shallow copy to avoid mutating a potentially shared/cached interceptor dict.
-            result = {**result, 'project_id': pid, 'project_root': project_root}
+            result = {
+                **result,
+                'project_id': pid,
+                'project_root': project_root,
+                TASK_TEXT_FP_KEY: text_fp_of(result),
+            }
             await _log_read(
                 'get_task',
                 project_id=pid,
@@ -9333,6 +9286,15 @@ def create_mcp_server(
         Planning mode returns ``{"task_id": "<id>", "status": "deferred",
         "planning_mode": True}`` synchronously — no ticket, no
         ``resolve_ticket`` follow-up needed.
+
+        ``metadata.execution_class`` 'operational' or 'decision' converts the
+        submission into a deterministic pure gate that escalates to a HUMAN at
+        dispatch; the response then carries ``routing_notice`` and the task
+        carries ``metadata.pure_gate_from``, unless the metadata already
+        declares that shape (``task_kind='deterministic'`` +
+        ``always_escalates=True``), in which case nothing is rewritten and
+        neither appears. A docs, comment or rename edit is agent work:
+        ``task_kind='normal'`` + ``metadata.complexity='simple'``.
 
         Any string argument carrying a raw MCP envelope fragment — not just
         ``title``/``description``/``details``/``prompt`` — is REJECTED outright
@@ -9604,6 +9566,16 @@ def create_mcp_server(
         if _gate_err is not None:
             return _gate_err
 
+        # One open trigger chain per (project, skill), PRD
+        # plans/completion-driven-triggers-prd.md C2. Before the interceptor's
+        # planning_mode split, so it covers the curator and planning_mode paths;
+        # it fails open (see middleware/trigger_chain_guard.py).
+        _chain_err = await trigger_chain_open_error(
+            metadata, project_root, source=task_interceptor, tag=tag,
+        )
+        if _chain_err is not None:
+            return _chain_err
+
         # Operational-routing boundary coercion (task 2802/β) — the
         # AUTHORITATIVE operational→deterministic coercion, an unbypassable
         # boundary invariant. Maps the declared (execution_class,
@@ -9617,6 +9589,11 @@ def create_mcp_server(
         # the interceptor-side twin re-running on this coerced metadata is a
         # no-op. This deliberately reverses the declaration-only scoping of
         # tasks 2085/2563 (owner-greenlit 2026-07-19).
+        #
+        # pure_gate_from is machine-written, so a caller's copy (metadata
+        # cloned from get_task, say) is dropped here at the outer boundary,
+        # never in the twin, which must keep the stamp written just below.
+        metadata.pop(PURE_GATE_FROM_KEY, None)
         metadata = inject_operational_routing(metadata)
 
         # Premise-lint guard xi (task 2231/W5-xi) — see premise_lint_guard.py.
@@ -9625,6 +9602,19 @@ def create_mcp_server(
         )
         if _premise_err is not None:
             return _premise_err
+
+        # Enumeration liveness gate (task 3056) — see enumeration_guard's
+        # module docstring. Rebinds description/metadata to the cleaned payload.
+        _enumeration = await enumeration_gate_for_filing(
+            agent_id=agent_id,
+            description=description,
+            metadata=metadata,
+            memory_service=memory_service,
+            project_root=project_root,
+        )
+        if _enumeration.rejection is not None:
+            return _enumeration.rejection
+        description, metadata = _enumeration.description, _enumeration.metadata
 
         # Routing-intent lint (task 2563) — declaration-only: a
         # task_kind='normal' submission whose text DECLARES a different
@@ -9700,6 +9690,8 @@ def create_mcp_server(
         if _gitignored_finding is not None and isinstance(result, dict) and 'error' not in result:
             result.update(gitignored_deliverable_warning(_gitignored_finding))
             log_gitignored_deliverable_flagged(_gitignored_finding)
+        if _enumeration.stats is not None and interceptor_write_succeeded(result):
+            result['enumeration_liveness'] = _enumeration.stats
         return result
 
     @mcp.tool()
@@ -9742,14 +9734,14 @@ def create_mcp_server(
                 under the MCP 120 s hard limit) so external callers that omit this
                 parameter cannot hang indefinitely on an orphaned ticket.
         """
-        if not _is_ticket_id(ticket):
+        if not is_ticket_id(ticket):
             # Idempotent passthrough: if the caller passed a numeric task id,
             # short-circuit instead of erroring.  This catches agents that
             # blindly use the two-step submit/resolve dance after a
             # ``planning_mode=True`` submit_task that already returned a
             # synchronous ``task_id``.  No store lookup is performed — the
             # contract is that any numeric id is treated as already-resolved.
-            if _looks_like_task_id(ticket):
+            if looks_like_task_id(ticket):
                 return {
                     'status': 'created',
                     'task_id': str(ticket).strip(),
@@ -10248,7 +10240,7 @@ def create_mcp_server(
                 'error_type': 'ValidationError',
             }
         for tid in ids:
-            if _is_ticket_id(tid):
+            if is_ticket_id(tid):
                 return {
                     'error': (
                         f'commit_planning: task_ids must contain numeric task ids, '
@@ -10418,6 +10410,7 @@ def create_mcp_server(
         dependencies: list[str] | None = None,
         agent_id: str | None = None,
         client_op_id: str | None = None,
+        expected_text_fp: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Update an existing task.
@@ -10436,6 +10429,13 @@ def create_mcp_server(
         ``prompt`` is legacy: it routes through the LLM-driven Taskmaster
         path which can drift on re-rewrite. It will be removed once the
         sqlite cutover is complete.
+
+        A call that supplies none of ``prompt``, ``metadata``, ``title``,
+        ``description``, ``details``, ``priority`` or ``dependencies`` is
+        REFUSED with ``error_type='NoFieldsToUpdateError'`` and writes nothing
+        (task 4867): it used to bump ``updated_at`` and report success, hiding
+        an argument that was misnamed and dropped. ``append``, ``metadata_mode``
+        and ``tag`` alone do not make a write.
 
         Any string argument carrying raw MCP envelope markup — not just
         ``title``/``description``/``details``/``prompt`` — is REJECTED outright
@@ -10542,6 +10542,18 @@ def create_mcp_server(
             client_op_id: Optional client-supplied idempotency key (task 2712).
                 A retry with the same key applies once and returns the recorded
                 outcome. Omit for today's behavior.
+            expected_text_fp: The ``task_text_fp`` from the ``get_task`` read
+                taken immediately before composing this write (task 4650).
+                REQUIRED for a recon-stage write that replaces ``description``,
+                or ``details``/``prompt`` without ``append=True``; without it
+                that write is rejected with ``ReconTaskTextBaseRequired``.
+                Optional for every other caller, and honoured whenever
+                supplied. A mismatch returns ``TaskTextBaseStale``: the text
+                changed since your read, so re-read, recompose against the
+                returned text and resend with the fresh token. A recon-stage
+                text write's response carries ``text_verified``: True only when
+                a fresh read under the write lock shows the stored field equal
+                to the written text or, under ``append=True``, ending with it.
         """
         agent_id, _ = _resolve_identity(agent_id, None, ctx)
         if err := _reject_if_ticket_id('id', id):
@@ -10568,9 +10580,24 @@ def create_mcp_server(
         if _mo_err is not None:
             return _mo_err
 
+        # Enumeration liveness gate (task 3056), update half: see the matching
+        # submit_task call site and enumeration_guard's module docstring.
+        _enumeration = await enumeration_gate_for_update(
+            agent_id=agent_id,
+            description=description,
+            metadata=metadata,
+            memory_service=memory_service,
+            project_root=project_root,
+            metadata_mode=metadata_mode,
+            append=append,
+        )
+        if _enumeration.rejection is not None:
+            return _enumeration.rejection
+        description, metadata = _enumeration.description, _enumeration.metadata
+
         if isinstance(metadata, dict):
             metadata = json.dumps(metadata)
-        return await task_interceptor.update_task(
+        result = await task_interceptor.update_task(
             task_id=id,
             project_root=project_root,
             prompt=prompt,
@@ -10586,7 +10613,11 @@ def create_mcp_server(
             dependencies=dependencies,
             agent_id=agent_id,
             client_op_id=client_op_id,
+            expected_text_fp=expected_text_fp,
         )
+        if _enumeration.stats is not None and interceptor_write_succeeded(result):
+            result['enumeration_liveness'] = _enumeration.stats
+        return result
 
     @mcp.tool()
     @mcp_tool_errors()

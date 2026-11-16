@@ -988,10 +988,10 @@ async def _run(args: argparse.Namespace) -> int:
 
     assert_task_store_populated(args.project_root, operation='audit_found_on_main_provenance')
 
-    import os  # noqa: PLC0415
+    import os
 
-    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend  # noqa: PLC0415
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import FusedMemoryConfig
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)

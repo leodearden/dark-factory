@@ -141,7 +141,7 @@ test('scope change: opening a rows tab upgrades the census poll to the full /tas
 
   await load.scope('tasks');
 
-  assert.deepEqual(load.requested, [FULL_TASKS_URL, `${DASH}/invariants`]);
+  assert.deepEqual(load.requested, [FULL_TASKS_URL, `${DASH}/invariants`, `${DASH}/prds`]);
 });
 
 test('scope change: leaving a rows tab fetches nothing — the full payload already holds the census', async () => {

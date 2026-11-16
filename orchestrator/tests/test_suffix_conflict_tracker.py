@@ -116,6 +116,7 @@ def _make_tracker(
     frozen_requests=None,
     frozen_prefix_tip=None,
     retire_item=None,
+    is_reserved=None,
 ) -> SuffixConflictTracker:
     """Build a bare SuffixConflictTracker with trivial default callables.
 
@@ -143,12 +144,17 @@ def _make_tracker(
         def _default_retire_item(rid):
             return None
         retire_item = _default_retire_item
+    if is_reserved is None:
+        def _default_is_reserved(rid):
+            return False
+        is_reserved = _default_is_reserved
     return SuffixConflictTracker(
         git_ops=lambda: git_ops,
         lane_buffers=lane_buffers,
         frozen_requests=frozen_requests,
         frozen_prefix_tip=frozen_prefix_tip,
         retire_item=retire_item,
+        is_reserved=is_reserved,
     )
 
 
@@ -578,6 +584,40 @@ class TestTrackerBounceWithoutWorker:
             'GroupMergeRequest future was resolved — trains must NOT be '
             'escalated by bounce_conflicting_suffix_items().'
         )
+
+    async def test_reserved_request_is_neither_rebased_nor_escalated(
+        self, git_ops, config, git_repo,
+    ):
+        """A deep chain's reserved link is under a tip verify (task 7720): the
+        bounce leaves it alone, while an unreserved conflicting peer is still
+        bounced."""
+        reserved = _make_req('591', '591', config, git_repo)
+        reserved.worktree = git_repo / 'reserved-wt'
+        peer = _make_req('592', '592', config, git_repo)
+        buffers = {'high': collections.deque(), 'normal': collections.deque([reserved, peer])}
+        tracker = _make_tracker(
+            git_ops, lane_buffers=lambda: buffers,
+            frozen_prefix_tip=lambda s: 'FROZENTIP',
+            is_reserved=lambda rid: rid == reserved.request_id,
+        )
+        tracker.graph = SuffixConflictGraph(
+            nodes=(reserved.request_id, peer.request_id),
+            textual_edges=frozenset(),
+            footprint_edges=frozenset(),
+            conflicts_with_main=frozenset({reserved.request_id, peer.request_id}),
+        )
+        tracker.signature = ((reserved.request_id, peer.request_id), 'deadbeef0000')
+        git_ops.rebase_onto_main = AsyncMock(return_value=False)
+
+        await tracker.bounce_conflicting_suffix_items()
+
+        rebased = [call.args[0] for call in git_ops.rebase_onto_main.await_args_list]
+        assert rebased == [peer.worktree]
+        assert list(buffers['normal']) == [reserved]
+        assert not reserved.result.done()
+        assert tracker.bounce_registry.count('591') == 0
+        assert peer.result.done()
+        assert peer.result.result().status == 'blocked'
 
     async def test_empty_conflicts_with_main_is_a_noop(self, git_ops, config, git_repo):
         """Empty conflicts_with_main -> return immediately; signature untouched."""

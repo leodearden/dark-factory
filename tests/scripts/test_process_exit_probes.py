@@ -17,6 +17,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from df_pytest_isolation import (
     ProcState,
@@ -24,6 +25,8 @@ from df_pytest_isolation import (
     wait_pid_gone,
     wait_pids_exited,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 #: A child that renames its own comm to bytes that are not UTF-8, then waits.
 _UNDECODABLE_COMM_SLEEPER = (

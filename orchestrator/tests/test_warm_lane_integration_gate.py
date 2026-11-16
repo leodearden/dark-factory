@@ -1453,8 +1453,8 @@ class TestOmegaLiveRequeueReuseGate:
       is 0-beyond-main, so α's _branch_has_commits_beyond_main deletes it, and
       merge_to_main → resolve_queued_branch_ref hits unknown_branch.
 
-    With the step-4 fix (_reuse_warm_lane calls rebind_branch_to_head after
-    rebase_onto_main):
+    With the step-4 fix (_reuse_warm_lane leaves the lane attached, with
+    refs/heads/task/<id> equal to the lane HEAD):
       Phase 0 — create_worktree(id); write .task/plan.json {"task_id": id}
                  (forces disk-backstop reuse route 2); commit WIP (n>0 beyond
                  main); advance main so pre-detach tip falls to 0-beyond-main.

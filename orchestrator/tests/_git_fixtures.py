@@ -23,6 +23,18 @@ from _orch_helpers import git_env_with_ceiling
 from df_pytest_isolation import git_redirect_env
 
 
+def _plain_text_of(path: Path) -> str:
+    """*path*'s UTF-8 text, refusing by path anything a text seed would silently alter."""
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f'a tree seed carries regular files only: {path}')
+    if path.stat().st_mode & 0o111:
+        raise ValueError(f'a tree seed carries no file modes, so cannot keep {path} executable')
+    try:
+        return path.read_bytes().decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise ValueError(f'a tree seed carries UTF-8 text only: {path}') from exc
+
+
 @dataclass(frozen=True)
 class RepoSeed:
     """The initial commit's contents: ``(relative path, text)`` pairs plus a message."""
@@ -38,8 +50,26 @@ class RepoSeed:
             if not path.parts or path.is_absolute() or '..' in path.parts:
                 raise ValueError(f'seed path must stay inside the repo: {relpath!r}')
 
+    @classmethod
+    def from_tree(cls, root: Path, message: str) -> RepoSeed:
+        """Seed every file under *root*; one a text seed cannot carry raises, naming it."""
+        if not root.is_dir():
+            raise ValueError(f'a tree seed needs a directory: {root}')
+        return cls(
+            files=tuple(
+                (path.relative_to(root).as_posix(), _plain_text_of(path))
+                for path in sorted(root.rglob('*'))
+                if path.is_symlink() or not path.is_dir()
+            ),
+            message=message,
+        )
+
 
 README_SEED = RepoSeed(files=(('README.md', '# Test\n'),), message='Initial commit')
+LIB_VARIABLE_SEED = RepoSeed(files=(('lib.py', 'x = 1\n'),), message='Initial')
+LIB_FUNCTION_SEED = RepoSeed(
+    files=(('lib.py', 'def greet(name): return name\n'),), message='Initial commit',
+)
 
 
 def _git_env(cwd: Path) -> dict[str, str]:
@@ -70,7 +100,7 @@ def build_repo(dest: Path, seed: RepoSeed) -> Path:
     for relpath, text in seed.files:
         target = dest / relpath
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text)
+        target.write_text(text, encoding='utf-8')
     _git(dest, 'add', '-A')
     _git(dest, 'commit', '-m', seed.message)
     return dest

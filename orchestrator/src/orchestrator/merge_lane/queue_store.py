@@ -711,7 +711,7 @@ async def recover_pending_merges(
 
             # Branch exists, is not yet merged, and worktree is present.
             survivors.append((record, qb))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'merge_queue_store: error recovering %s: %s',
                 record.request_id,
@@ -736,7 +736,7 @@ async def recover_pending_merges(
                     record.request_id,
                     qb.full_name,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'merge_queue_store: error recovering %s: %s',
                     record.request_id,
@@ -869,7 +869,7 @@ async def recover_pending_merges(
                     winner_qb.full_name,
                     len(group) - 1,
                 )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 'merge_queue_store: error collapsing branch group %s: %s',
                 bare_id,

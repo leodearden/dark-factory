@@ -42,8 +42,10 @@ from orchestrator.harness import (
     _WATCHER_MAX_BACKOFF_SECS,
     _WATCHER_TIMEOUT_GRACE_SECS,
     Harness,
+    WatcherRecoveryEvidence,
 )
-from orchestrator.pause_policy import PauseClass
+from orchestrator.pause_policy import PAUSE_POLICY, PauseClass
+from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
 # step-3: Config field presence and defaults
@@ -2714,6 +2716,7 @@ def _make_harness_with_queue(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
     h._watcher_supervisor_task = None
     h._watcher_unclean_exits = deque()
     h._watcher_degenerate_clean_exits = deque()
+    h.scheduler = Scheduler(config)
 
     queue = EscalationQueue(tmp_path / 'esc')
     h._escalation_queue = queue
@@ -2831,19 +2834,20 @@ class TestResolveWatcherOutageL2:
         l2_id = l2s_before[0].id
 
         # Resolve
-        h._resolve_watcher_outage_l2()
+        h._resolve_watcher_outage_l2(WatcherRecoveryEvidence.HEALTHY_ROTATION)
 
         # Must no longer be in pending
         l2s_after = [e for e in queue.get_pending() if e.level == 2]
         assert len(l2s_after) == 0, (
             f'Expected 0 pending L2s after resolve; got {l2s_after}'
         )
-        # Must be resolved in the full queue
+        # Must be resolved in the full queue, recording the caller's evidence
         resolved = queue.get(l2_id)
         assert resolved is not None, f'escalation {l2_id} not found in queue'
         assert resolved.status == 'resolved', (
             f'Expected status="resolved"; got {resolved.status!r}'
         )
+        assert resolved.resolution == WatcherRecoveryEvidence.HEALTHY_ROTATION
 
     def test_noop_when_no_open_l2(self, tmp_path: Path) -> None:
         """When no pending L2 with root_cause='watcher_supervisor_down', must be a no-op."""
@@ -2853,7 +2857,7 @@ class TestResolveWatcherOutageL2:
         pending_before = list(queue.get_pending())
 
         # Must not raise
-        h._resolve_watcher_outage_l2()
+        h._resolve_watcher_outage_l2(WatcherRecoveryEvidence.DRAINED_QUEUE)
 
         # Queue unchanged
         pending_after = list(queue.get_pending())
@@ -2869,7 +2873,7 @@ class TestResolveWatcherOutageL2:
         h._escalation_queue = None
 
         # Must not raise
-        h._resolve_watcher_outage_l2()
+        h._resolve_watcher_outage_l2(WatcherRecoveryEvidence.HEALTHY_ROTATION)
 
 
 # ---------------------------------------------------------------------------
@@ -3046,6 +3050,7 @@ class TestEnforceCostCeilingsFilesL2:
 def _make_loop_harness_with_queue(tmp_path: Path) -> tuple[Harness, EscalationQueue]:
     """Extend _make_loop_harness with a real EscalationQueue for recovery tests."""
     h = _make_loop_harness(tmp_path)
+    h.scheduler = Scheduler(h.config)
     queue = EscalationQueue(tmp_path / 'esc')
     h._escalation_queue = queue
     return h, queue
@@ -3060,7 +3065,8 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
 
         Pre-file an outage L2, drive _watcher_supervisor_loop with one rotation
         lasting >= watcher_misconfigured_min_rotation_secs (healthy-clean path),
-        then assert the L2 is no longer pending (it was resolved).
+        then assert the L2 is no longer pending and records HEALTHY_ROTATION
+        as the evidence that cleared it.
         """
         h, queue = _make_loop_harness_with_queue(tmp_path)
         min_secs = 30.0
@@ -3080,6 +3086,7 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
             if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
         ]
         assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
+        l2_id = pending_before[0].id
 
         # Drive with one healthy-clean rotation (duration > min_secs)
         await _run_supervisor_with_rotation_durations(h, [min_secs + 1.0])
@@ -3092,6 +3099,9 @@ class TestWatcherSupervisorLoopRecoveryResolvesL2:
             f'Expected outage L2 to be resolved after healthy-clean rotation; '
             f'still pending: {pending_after}'
         )
+        resolved = queue.get(l2_id)
+        assert resolved is not None
+        assert resolved.resolution == WatcherRecoveryEvidence.HEALTHY_ROTATION
 
     @pytest.mark.asyncio
     async def test_degenerate_clean_does_NOT_resolve_outage_l2(self, tmp_path: Path) -> None:
@@ -3881,6 +3891,28 @@ class TestWatcherHasActionableL1:
 # task 2629 step-5: _watcher_supervisor_loop consults the empty-queue precheck
 # ---------------------------------------------------------------------------
 
+async def _run_one_drained_supervisor_iteration(h: Harness) -> tuple[AsyncMock, list[float]]:
+    """Drive one supervisor iteration that ends at the empty-queue poll sleep.
+
+    Returns the rotation spy and the recorded sleep durations; the fake sleep
+    raises CancelledError so the loop stops after its first poll.
+    """
+    sleep_durations: list[float] = []
+    rotation_spy = AsyncMock()
+
+    async def fake_sleep(duration: float) -> None:
+        sleep_durations.append(duration)
+        raise asyncio.CancelledError()
+
+    with (
+        patch.object(h, '_run_watcher_rotation', rotation_spy),
+        patch('orchestrator.harness.asyncio.sleep', fake_sleep),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await h._watcher_supervisor_loop()
+    return rotation_spy, sleep_durations
+
+
 class TestWatcherSupervisorLoopEmptyQueueSkip:
     """_watcher_supervisor_loop skips the rotation launch when the L1 queue
     has no actionable work, and launches normally otherwise.
@@ -3892,19 +3924,8 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
         the loop sleeps watcher_empty_queue_poll_secs and re-checks.
         """
         h, _queue = _make_loop_harness_with_queue(tmp_path)
-        sleep_durations: list[float] = []
-        rotation_spy = AsyncMock()
-        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
 
-        async def fake_sleep(duration: float) -> None:
-            sleep_durations.append(duration)
-            raise asyncio.CancelledError()
-
-        with (
-            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await h._watcher_supervisor_loop()
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
 
         rotation_spy.assert_not_called()
         assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
@@ -3917,11 +3938,11 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
         """Empty L1 queue with a stale outage L2 open -> the skip path both
         skips the rotation launch AND resolves the outage L2.
 
-        Reaching the empty-queue skip branch proves the supervisor loop is
-        alive and the queue is readable (the precheck fails open on a
-        None/erroring queue), which is exactly the 'watcher is up again'
-        signal the outage L2 represents -- so a stale L2 must not linger as
-        a false alarm just because the L1 queue happens to be drained.
+        With no scheduler pause holding, reaching the empty-queue skip branch
+        evidences that the supervisor loop is alive and the queue is readable
+        (the precheck fails open on a None/erroring queue), so a stale L2
+        must not linger as a false alarm just because the L1 queue happens to
+        be drained. The resolution records DRAINED_QUEUE as that evidence.
         """
         h, queue = _make_loop_harness_with_queue(tmp_path)
 
@@ -3934,20 +3955,9 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
             if e.level == 2 and e.root_cause == h._WATCHER_OUTAGE_ROOT_CAUSE
         ]
         assert len(pending_before) == 1, 'Pre-condition: outage L2 must be filed before loop runs'
+        l2_id = pending_before[0].id
 
-        sleep_durations: list[float] = []
-        rotation_spy = AsyncMock()
-        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
-
-        async def fake_sleep(duration: float) -> None:
-            sleep_durations.append(duration)
-            raise asyncio.CancelledError()
-
-        with (
-            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await h._watcher_supervisor_loop()
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
 
         rotation_spy.assert_not_called()
         assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (
@@ -3963,6 +3973,9 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
             f'Expected the stale outage L2 to be resolved on the empty-queue skip path; '
             f'still pending: {pending_after}'
         )
+        resolved = queue.get(l2_id)
+        assert resolved is not None
+        assert resolved.resolution == WatcherRecoveryEvidence.DRAINED_QUEUE
 
     @pytest.mark.asyncio
     async def test_launch_when_actionable_l1_present(self, tmp_path: Path) -> None:
@@ -4012,6 +4025,134 @@ class TestWatcherSupervisorLoopEmptyQueueSkip:
 
 
 # ---------------------------------------------------------------------------
+# task 5315: no recovery evidence clears the outage L2 while a pause holds
+# ---------------------------------------------------------------------------
+
+def _pending_outage_l2_id(h: Harness, queue: EscalationQueue) -> str:
+    l2_id = queue.find_pending_l2_by_root_cause(h._WATCHER_OUTAGE_ROOT_CAUSE)
+    assert l2_id is not None, 'Pre-condition: an outage L2 must be pending'
+    return l2_id
+
+
+class TestWatcherOutageL2HeldOpenWhileSchedulerPaused:
+    """While the scheduler holds a pause, neither a drained precheck nor a
+    healthy rotation resolves the shared watcher-outage L2; after a resume
+    the next drained poll does.
+    """
+
+    @pytest.mark.asyncio
+    async def test_cost_ceiling_pause_with_drained_queue_keeps_outage_l2_open(
+        self, tmp_path: Path,
+    ) -> None:
+        """The real watcher cost trip, then a drained precheck, leaves the L2 open.
+
+        _enforce_cost_ceilings pauses with COST_CEILING and files both the
+        scheduler-pause L1 and the outage L2. Promoting that L1 into a cluster
+        drains the actionable queue, which is the state in which the precheck
+        used to mark the L2 'watcher recovered' while the hold still stood,
+        and _enforce_cost_ceilings' paused early return never re-files it.
+        """
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        h._run_store = None
+        h.event_store = None
+        cost_store = MagicMock()
+        cost_store.cost_totals_in_window = AsyncMock(
+            return_value=(0.0, h.config.watcher_daily_cost_ceiling_usd + 1.0),
+        )
+        h.cost_store = cost_store
+
+        await h._enforce_cost_ceilings()
+
+        pause_l1_ids = [e.id for e in queue.get_pending() if e.level == 1]
+        assert len(pause_l1_ids) == 1, f'Expected the one scheduler-pause L1; got {pause_l1_ids}'
+        _submit_sample_l2(queue, 'task-pause-cluster', members=pause_l1_ids)
+
+        assert h._watcher_has_actionable_l1() is False
+        assert h.scheduler.is_paused
+        assert h.scheduler.pause_class is PauseClass.COST_CEILING
+        l2_id = _pending_outage_l2_id(h, queue)
+
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
+
+        rotation_spy.assert_not_called()
+        assert sleep_durations == [h.config.watcher_empty_queue_poll_secs]
+        held = queue.get(l2_id)
+        assert held is not None
+        assert held.status == 'pending'
+        assert held.resolution is None
+        assert h.scheduler.is_paused
+
+    @pytest.mark.asyncio
+    async def test_healthy_rotation_during_cost_ceiling_pause_keeps_outage_l2_open(
+        self, tmp_path: Path,
+    ) -> None:
+        """Rotations keep running during a cost-ceiling hold; a healthy one
+        must not mark the outage L2 recovered while the hold stands.
+        """
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        min_secs = 30.0
+        h.config = h.config.model_copy(update={'watcher_misconfigured_min_rotation_secs': min_secs})
+        h.scheduler.pause('cost_ceiling_watcher_exceeded', PauseClass.COST_CEILING)
+        h._file_watcher_outage_l2('cost_ceiling_watcher_exceeded')
+        _submit_sample_l1(queue)
+        l2_id = _pending_outage_l2_id(h, queue)
+
+        sleep_durations = await _run_supervisor_with_rotation_durations(h, [min_secs + 1.0])
+
+        assert sleep_durations == [h.config.watcher_subprocess_restart_backoff_secs], (
+            f'Expected the healthy-clean restart-backoff sleep (proving the rotation '
+            f'ran its full course); got {sleep_durations}'
+        )
+        held = queue.get(l2_id)
+        assert held is not None
+        assert held.status == 'pending'
+        assert held.resolution is None
+
+    @pytest.mark.parametrize('evidence', list(WatcherRecoveryEvidence))
+    @pytest.mark.parametrize(
+        'pause_class', [c for c in PauseClass if PAUSE_POLICY[c].may_halt],
+    )
+    def test_no_evidence_clears_outage_l2_under_any_pause(
+        self,
+        tmp_path: Path,
+        pause_class: PauseClass,
+        evidence: WatcherRecoveryEvidence,
+    ) -> None:
+        """The gate is uniform: any pause class blocks every evidence kind."""
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.scheduler.pause('held', pause_class)
+        h._file_watcher_outage_l2('watcher_crashloop')
+        l2_id = _pending_outage_l2_id(h, queue)
+
+        h._resolve_watcher_outage_l2(evidence)
+
+        held = queue.get(l2_id)
+        assert held is not None
+        assert held.status == 'pending'
+        assert held.resolution is None
+
+    @pytest.mark.asyncio
+    async def test_drained_poll_after_resume_resolves_with_drained_evidence(
+        self, tmp_path: Path,
+    ) -> None:
+        """Once a human resumes, the next drained poll clears the held L2."""
+        h, queue = _make_loop_harness_with_queue(tmp_path)
+        h.scheduler.pause('cost_ceiling_watcher_exceeded', PauseClass.COST_CEILING)
+        h._file_watcher_outage_l2('cost_ceiling_watcher_exceeded')
+        l2_id = _pending_outage_l2_id(h, queue)
+        h.scheduler.resume()
+
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
+
+        rotation_spy.assert_not_called()
+        assert sleep_durations == [h.config.watcher_empty_queue_poll_secs]
+        resolved = queue.get(l2_id)
+        assert resolved is not None
+        assert resolved.status == 'resolved'
+        assert resolved.resolution == WatcherRecoveryEvidence.DRAINED_QUEUE
+
+
+# ---------------------------------------------------------------------------
 # task 4559 step-17: the empty-queue precheck must not skip digest re-evaluation
 # ---------------------------------------------------------------------------
 
@@ -4046,20 +4187,8 @@ class TestDigestRunsRegardlessOfEmptyQueuePrecheck:
 
         digest_spy = AsyncMock()
         h._maybe_write_digest = digest_spy  # type: ignore[method-assign]
-        rotation_spy = AsyncMock()
-        h._run_watcher_rotation = rotation_spy  # type: ignore[method-assign]
 
-        sleep_durations: list[float] = []
-
-        async def fake_sleep(duration: float) -> None:
-            sleep_durations.append(duration)
-            raise asyncio.CancelledError()
-
-        with (
-            patch('orchestrator.harness.asyncio.sleep', fake_sleep),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await h._watcher_supervisor_loop()
+        rotation_spy, sleep_durations = await _run_one_drained_supervisor_iteration(h)
 
         rotation_spy.assert_not_called()
         assert sleep_durations == [h.config.watcher_empty_queue_poll_secs], (

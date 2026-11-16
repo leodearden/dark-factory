@@ -67,6 +67,14 @@ import pytest
 from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.task_read import TaskFound
+from test_deterministic_runner import _make_assignment
+from test_gate_escalation_fields import (
+    FIXED_NOW,
+    _chain_scheduler,
+    _completion_gate,
+    _human_gate_task,
+)
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.deploy_state import DeployPhase
@@ -710,6 +718,79 @@ class TestRecoverStrandedDeterministicGate:
 
         h.event_store.emit.assert_not_called()
         h.scheduler.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_human_gate_refiles_review_due_with_the_original_fire_time(
+        self, tmp_path: Path,
+    ) -> None:
+        """PRD completion-driven-triggers C4: a recovered human gate files the
+        same review_due the runner would have, fired at its stamp."""
+        stamp = '2026-10-05T00:00:00+00:00'
+        task = _human_gate_task()
+        task['metadata']['gate_escalated_at'] = stamp
+        completion_gate = _completion_gate()
+        h = _make_recon_harness()
+        h.event_store = MagicMock()
+        h.scheduler = _chain_scheduler(task, {'41': TaskFound(completion_gate)})
+        queue = EscalationQueue(tmp_path)
+        h._escalation_queue = queue
+
+        await h._recover_stranded_deterministic_gate('42', task, task['metadata'])
+
+        pending = queue.get_by_task('42', status='pending')
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.category == 'review_due'
+        assert esc.level == 2
+        assert esc.review_due is not None
+        assert esc.review_due['verdict'] == completion_gate['metadata']['predicate_verdict']
+        assert esc.review_due['launched_from'] == esc.id
+        assert esc.review_due['fired_at'] == stamp
+        assert h.event_store.emit.call_args.kwargs['data']['category'] == 'review_due'
+        h.scheduler.set_task_status.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recovered_human_gate_matches_the_runner_filing_apart_from_ids(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        reads = {'41': TaskFound(_completion_gate())}
+        task = _human_gate_task()
+        queue_a = EscalationQueue(tmp_path / 'a')
+        scheduler = _chain_scheduler(task, reads)
+        runner = DeterministicRunner(
+            scheduler=scheduler, escalation_queue=queue_a, clock=lambda: FIXED_NOW,
+        )
+        await runner.run(_make_assignment(task))
+        stamped = [
+            call.args[1]['gate_escalated_at']
+            for call in scheduler.update_task.await_args_list
+            if 'gate_escalated_at' in call.args[1]
+        ]
+        assert len(stamped) == 1
+
+        stranded = _human_gate_task()
+        stranded['metadata']['gate_escalated_at'] = stamped[0]
+        h = _make_recon_harness()
+        h.event_store = MagicMock()
+        h.scheduler = _chain_scheduler(stranded, reads)
+        queue_b = EscalationQueue(tmp_path / 'b')
+        h._escalation_queue = queue_b
+        await h._recover_stranded_deterministic_gate('42', stranded, stranded['metadata'])
+
+        def without_ids(esc: Escalation) -> dict:
+            record = esc.to_dict()
+            for key in ('id', 'timestamp', 'filing_claimant_run_id'):
+                record.pop(key)
+            assert record['review_due']['launched_from'] == esc.id
+            record['review_due'] = {**record['review_due'], 'launched_from': '<own id>'}
+            return record
+
+        (filed,) = queue_a.get_by_task('42', status='pending')
+        (recovered,) = queue_b.get_by_task('42', status='pending')
+        assert filed.category == 'review_due'
+        assert without_ids(recovered) == without_ids(filed)
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,18 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _lane_confirm_project import Sabotage, arm, disarm, lane_project, node_id, write_script
+from _host_pytest_temp_root import listing, seed_dead_session_dirs
+from _lane_confirm_project import (
+    Sabotage,
+    arm,
+    disarm,
+    inherited_temp_root,
+    lane_project,
+    node_id,
+    write_pytest_config,
+    write_script,
+)
+from _serial_recovery_helpers import effective_worker_count
 
 from orchestrator.config import LaneCommand
 from orchestrator.offline_lane_confirm import (
@@ -73,9 +84,8 @@ from orchestrator.verify_cmd import ToolKind, parse_config_command
 T0 = datetime(2026, 10, 16, 9, 0, 0, tzinfo=UTC)
 JUNIT_PATH = Path('/records/unit/pass/confirm.junit.xml')
 FUSED_MEMORY_ADDOPTS = "-n auto --dist loadgroup --max-worker-restart=0 -m 'not integration'"
-TASK_TEXT_EXAMPLE = (
-    "pytest -m integration -p no:xdist -o 'addopts=-m '\"'\"'not integration'\"'\"'' "
-    "--timeout 300 --junitxml {junit} 'tests/test_a.py::TestX::test_b[1]'"
+NARROWED_CONFIRM_UNDER_XDIST_ADDOPTS = (
+    "pytest -m integration -n 0 --timeout 300 --junitxml {junit} 'tests/test_a.py::TestX::test_b[1]'"
 )
 
 _VERIFY_USAGE_DUMP = (
@@ -225,9 +235,22 @@ class TestConfirmMode:
             else:
                 assert call.argv[-1] == command
 
+    @pytest.mark.asyncio
+    async def test_an_intersected_confirm_pins_zero_xdist_workers(self, tmp_path: Path) -> None:
+        target = _generic(tmp_path, 'pytest -m integration')
+        detect = _run(('tests/t.py::test_a', 'failed'), ids_available=False)
+        runner = _FakeRunner(_rerun(('tests/t.py::test_a', 'failed')))
+
+        outcome = await confirm(target, detect, runner)
+
+        assert outcome == Confirmed(ConfirmMode.INTERSECTED, ('tests/t.py::test_a',), (), ())
+        tokens = shlex.split(runner.only_call.argv[-1])
+        assert effective_worker_count(tokens) == '0'
+        assert 'no:xdist' not in tokens
+
 
 class TestSerialConfirmCommand:
-    def test_the_narrowed_command_renders_the_task_texts_example(self, tmp_path: Path) -> None:
+    def test_the_narrowed_command_pins_zero_workers_under_xdist_addopts(self, tmp_path: Path) -> None:
         worktree = _project(tmp_path)
         command = serial_confirm_command(
             _lane_command(),
@@ -235,16 +258,25 @@ class TestSerialConfirmCommand:
             invocation_dir=worktree / 'fused-memory',
             junit_path=JUNIT_PATH,
         )
-        assert command == TASK_TEXT_EXAMPLE.format(junit=JUNIT_PATH)
+        assert command == NARROWED_CONFIRM_UNDER_XDIST_ADDOPTS.format(junit=JUNIT_PATH)
 
-    def test_it_runs_serially_with_the_governing_addopts_minus_xdist(self, tmp_path: Path) -> None:
-        worktree = _project(tmp_path, addopts="-n 4 -m 'not warm_lane_bash'")
-        tokens = shlex.split(serial_confirm_command(
+    @staticmethod
+    def _tokens(tmp_path: Path, addopts: str) -> list[str]:
+        worktree = _project(tmp_path, addopts=addopts)
+        return shlex.split(serial_confirm_command(
             _lane_command('pytest -m warm_lane_bash'),
             ['tests/t.py::test_a'],
             invocation_dir=worktree / 'fused-memory',
             junit_path=JUNIT_PATH,
         ))
+
+    def test_it_pins_zero_xdist_workers_where_the_governing_addopts_run_xdist(self, tmp_path: Path) -> None:
+        tokens = self._tokens(tmp_path, "-n 4 -m 'not warm_lane_bash'")
+        assert tokens[:5] == ['pytest', '-m', 'warm_lane_bash', '-n', '0']
+        assert '-o' not in tokens and 'no:xdist' not in tokens
+
+    def test_it_takes_the_recovery_form_where_nothing_runs_xdist(self, tmp_path: Path) -> None:
+        tokens = self._tokens(tmp_path, "-m 'not warm_lane_bash'")
         assert tokens[:7] == ['pytest', '-m', 'warm_lane_bash', '-p', 'no:xdist', '-o', "addopts=-m 'not warm_lane_bash'"]
 
     def test_it_carries_the_per_test_timeout_and_the_junit_path(self, tmp_path: Path) -> None:
@@ -789,6 +821,7 @@ class TestIntersectedRoundTrip:
 LANE = LaneCommand(name='lane', command='pytest -q tests', cwd='.')
 OPAQUE = LaneCommand(name='opaque', command='timeout 600 pytest -q tests', cwd='.')
 KILLED = LaneCommand(name='killed', command='kill -9 $$', cwd='.')
+POOLED_ADDOPTS = '-n 2 --dist loadgroup'
 HEAD = 'c0ffee1234'
 SPACING = timedelta(minutes=31)
 
@@ -850,10 +883,7 @@ class TestRealPytestGenericLeg:
     async def test_an_xdist_loadgroup_detection_is_confirmed_by_its_plain_node_id(
         self, tmp_path: Path, store: RunRecordStore,
     ) -> None:
-        project = lane_project(tmp_path / 'wt', 'test_grouped_flaky', 'test_ok')
-        (project / 'pyproject.toml').write_text(
-            '[tool.pytest.ini_options]\naddopts = "-p no:cacheprovider -n 2 --dist loadgroup"\n',
-        )
+        project = lane_project(tmp_path / 'wt', 'test_grouped_flaky', 'test_ok', addopts=POOLED_ADDOPTS)
 
         detect = await _detect(store, LANE, project)
         assert [f.node for f in detect.failures] == [node_id('test_grouped_flaky')]
@@ -862,6 +892,49 @@ class TestRealPytestGenericLeg:
 
         assert outcome == Confirmed(ConfirmMode.NARROWED, (), (node_id('test_grouped_flaky'),), ())
         assert _confirm_record(store, LANE.name).outcomes == {node_id('test_grouped_flaky'): 'passed'}
+
+    @pytest.mark.asyncio
+    async def test_a_pooled_detection_of_a_flaky_worker_id_test_is_cleared_by_the_narrowed_confirm(
+        self, tmp_path: Path, store: RunRecordStore,
+    ) -> None:
+        project = lane_project(tmp_path / 'wt', 'test_flaky_uses_worker_id', 'test_ok', addopts=POOLED_ADDOPTS)
+
+        detect = await _detect(store, LANE, project)
+        assert [f.node for f in detect.failures] == [node_id('test_flaky_uses_worker_id')]
+
+        outcome = await _confirm(store, LANE, project, detect)
+
+        assert outcome == Confirmed(ConfirmMode.NARROWED, (), (node_id('test_flaky_uses_worker_id'),), ())
+        assert _confirm_record(store, LANE.name).outcomes == {node_id('test_flaky_uses_worker_id'): 'passed'}
+
+    @pytest.mark.asyncio
+    async def test_a_pooled_detection_leaves_the_hosts_default_pytest_temp_root_untouched(
+        self, tmp_path: Path, store: RunRecordStore, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        host = tmp_path / 'host-temp'
+        seed_dead_session_dirs(host)
+        before = listing(host)
+        monkeypatch.setenv('PYTEST_DEBUG_TEMPROOT', str(host))
+        project = lane_project(
+            tmp_path / 'wt', 'test_grouped_flaky', 'test_records_its_temp_root', addopts=POOLED_ADDOPTS,
+        )
+
+        detect = await _detect(store, LANE, project)
+
+        assert [f.node for f in detect.failures] == [node_id('test_grouped_flaky')]
+        assert inherited_temp_root(project) == str(host), (
+            'the pooled session never inherited PYTEST_DEBUG_TEMPROOT, so it would '
+            'use the real host temp root and leave the stand-in untouched with or '
+            'without --basetemp: the assertion below would pass vacuously'
+        )
+        after = listing(host)
+        assert after == before, (
+            "a nested lane session must not create, lock or clean dirs in the "
+            "host's default pytest temp root: its exit-time cleanup of other "
+            "sessions' dead dirs is unbounded and runs before the lane's "
+            "proc.wait() returns\n"
+            f'before: {before}\nafter:  {after}'
+        )
 
     @pytest.mark.asyncio
     async def test_7_an_opaque_confirm_red_only_on_another_test_reproduces_only_the_detected_one(
@@ -933,7 +1006,7 @@ class TestRealPytestGenericLeg:
     ) -> None:
         project = tmp_path / 'wt'
         (project / 'tests').mkdir(parents=True)
-        (project / 'pyproject.toml').write_text('[tool.pytest.ini_options]\naddopts = "-p no:cacheprovider"\n')
+        write_pytest_config(project)
         (project / 'tests' / 'test_t.py').write_text(
             "import pytest\n\n\n@pytest.mark.parametrize('word', ['a] b'])\n"
             "def test_a(word):\n    assert word == 'ab'\n",

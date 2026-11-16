@@ -961,7 +961,7 @@ class TestIdProximity:
         rest of the equal-length two-digits-apart population) as a near-miss
         and inflate the cause evidence.
         """
-        import difflib  # noqa: PLC0415
+        import difflib
 
         assert difflib.SequenceMatcher(None, '3443', '4043').ratio() == 0.75
         assert id_proximity('3443', {'4043'})[0] == 'unrelated'

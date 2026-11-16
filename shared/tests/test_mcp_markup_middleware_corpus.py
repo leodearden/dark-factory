@@ -208,7 +208,7 @@ def _synthetic_tool(name: str, params: tuple[str, ...], sink: Any) -> Any:
         "    return 'ok'\n"
     )
     namespace: dict[str, Any] = {'sink': sink}
-    exec(source, namespace)  # noqa: S102 — see the docstring; every interpolated
+    exec(source, namespace)  # see the docstring; every interpolated
     return namespace[name]                # name is asserted to be an identifier
 
 

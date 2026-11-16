@@ -512,7 +512,9 @@ class TestSuppressionStormStreak:
         q = _FakeEscalationQueue(open_l2=None)
 
         for _ in range(threshold):
-            vm._bump_suppression_streak_and_maybe_escalate(q, '2768', _MERGE_SHA)
+            vm._bump_suppression_streak_and_maybe_escalate(
+                q, '2768', _MERGE_SHA, call_site=FlakeCallSite.merge_gate,
+            )
 
         assert len(q.submitted) == 1, q.submitted
         esc = q.submitted[0]
@@ -529,7 +531,9 @@ class TestSuppressionStormStreak:
         q = _FakeEscalationQueue(open_l2=None)
 
         for _ in range(threshold - 1):
-            vm._bump_suppression_streak_and_maybe_escalate(q, '2768', _MERGE_SHA)
+            vm._bump_suppression_streak_and_maybe_escalate(
+                q, '2768', _MERGE_SHA, call_site=FlakeCallSite.merge_gate,
+            )
 
         assert q.submitted == []
         assert vm._merge_flake_suppression_streak == threshold - 1
@@ -540,7 +544,9 @@ class TestSuppressionStormStreak:
         q = _FakeEscalationQueue(open_l2=object())  # a truthy open L2
 
         for _ in range(threshold):
-            vm._bump_suppression_streak_and_maybe_escalate(q, '2768', _MERGE_SHA)
+            vm._bump_suppression_streak_and_maybe_escalate(
+                q, '2768', _MERGE_SHA, call_site=FlakeCallSite.merge_gate,
+            )
 
         assert q.submitted == []
         # get_by_task consulted for dedup on the same sentinel, at level=2.
@@ -553,10 +559,25 @@ class TestSuppressionStormStreak:
         threshold = vm._MERGE_FLAKE_SUPPRESSION_STREAK_THRESHOLD
 
         for _ in range(threshold):
-            vm._bump_suppression_streak_and_maybe_escalate(None, '2768', _MERGE_SHA)
+            vm._bump_suppression_streak_and_maybe_escalate(
+                None, '2768', _MERGE_SHA, call_site=FlakeCallSite.merge_gate,
+            )
 
         # No crash; window resets without filing (no queue to file into).
         assert vm._merge_flake_suppression_streak == 0
+
+    def test_a_call_site_without_live_signals_is_refused(self) -> None:
+        vm = self._reset()
+        q = _FakeEscalationQueue(open_l2=None)
+
+        with pytest.raises(ValueError, match='offline_lane'):
+            vm._bump_suppression_streak_and_maybe_escalate(
+                q, '2768', _MERGE_SHA, call_site=FlakeCallSite.offline_lane,
+            )
+
+        # A refused call site neither opens nor advances a window.
+        assert vm._merge_flake_suppression_streak == 0
+        assert q.submitted == []
 
 
 @pytest.mark.asyncio
@@ -712,8 +733,8 @@ class TestRecordEnqueuesDebt:
 _STORM_AT = 5
 _STORM_SENTINEL = 'merge-flake-suppression-storm'
 _STORM_SUMMARY = (
-    'Merge-verify flake-suppression storm: the isolated-rerun-confirm gate has '
-    f'suppressed {_STORM_AT} merge-verify reds since the last reset'
+    f'Flake-suppression storm: isolated re-runs have suppressed {_STORM_AT} reds since the '
+    'last reset (merge_gate: merge-verify reds)'
 )
 
 
@@ -788,6 +809,161 @@ class TestScenario32MergeGateUnchanged:
             assert block['description'] == merge_gate_deflake_description(row)
             assert block['metadata'] == _metadata(row)
             assert (block['priority'], block['planning_mode']) == ('medium', True)
+
+
+_PROBED_MAIN_SHA = 'c' * 40
+
+
+@pytest.mark.asyncio
+class TestTheStormNamesItsCallSites:
+    """Task 7249: the INV-4 storm L2 names the call sites that fed its window, so a
+    main_probe storm points the reader at main instead of at merge-verify reds.
+    ASYNC-ONLY CLASS."""
+
+    async def _merge_gate(self, tmp_path: Path, n: int, q: Any) -> None:
+        s = _suppression(observed_at=f'2026-08-22T12:{n:02d}:00+00:00')
+        await _record(_result(s), tmp_path, escalation_queue=q)
+
+    async def _main_probe(self, tmp_path: Path, n: int, q: Any) -> None:
+        s = replace(
+            _suppression(observed_at=f'2026-08-22T12:{n:02d}:00+00:00'),
+            call_site=FlakeCallSite.main_probe, runner='local',
+        )
+        await flake_recorder.record_flake_observation(
+            s,
+            project_root=tmp_path,
+            project_id=_PROJECT_ID,
+            merge_sha=_PROBED_MAIN_SHA,
+            task_id=_TASK_ID,
+            escalation_queue=q,
+        )
+
+    async def test_a_main_probe_storm_names_main_probe_and_points_at_main(
+        self, tmp_path: Path,
+    ) -> None:
+        q = _FakeEscalationQueue(open_l2=None)
+        for n in range(_STORM_AT):
+            await self._main_probe(tmp_path, n, q)
+
+        (storm,) = q.submitted
+        for text in (storm.summary, storm.detail):
+            assert 'main_probe' in text
+            assert 'look at main' in text
+            assert 'merge_gate' not in text
+        assert f'probed main SHA {_PROBED_MAIN_SHA}' in storm.detail
+        assert f'observing task_id: {_TASK_ID}' in storm.detail
+        assert 'merge-verify' not in storm.summary
+
+    async def test_a_wire_shaped_str_call_site_still_names_main_probe(
+        self, tmp_path: Path,
+    ) -> None:
+        q = _FakeEscalationQueue(open_l2=None)
+        for n in range(_STORM_AT):
+            s = replace(
+                _suppression(observed_at=f'2026-08-22T12:{n:02d}:00+00:00'),
+                call_site='main_probe', runner='local',
+            )
+            await flake_recorder.record_flake_observation(
+                s,
+                project_root=tmp_path,
+                project_id=_PROJECT_ID,
+                merge_sha=_PROBED_MAIN_SHA,
+                task_id=_TASK_ID,
+                escalation_queue=q,
+            )
+
+        (storm,) = q.submitted
+        assert 'main_probe' in storm.summary
+        assert 'call_site=main_probe, probed main SHA' in storm.detail
+
+    async def test_a_merge_gate_storm_names_merge_gate_only(self, tmp_path: Path) -> None:
+        q = _FakeEscalationQueue(open_l2=None)
+        for n in range(_STORM_AT):
+            await self._merge_gate(tmp_path, n, q)
+
+        (storm,) = q.submitted
+        assert storm.summary == _STORM_SUMMARY
+        assert 'merge_gate' in storm.detail
+        assert f'merge SHA {_MERGE_SHA}' in storm.detail
+        for text in (storm.summary, storm.detail):
+            assert 'main_probe' not in text
+            assert 'look at main' not in text
+
+    async def test_a_mixed_storm_names_both_call_sites(self, tmp_path: Path) -> None:
+        q = _FakeEscalationQueue(open_l2=None)
+        for n in range(3):
+            await self._merge_gate(tmp_path, n, q)
+        for n in range(3, _STORM_AT):
+            await self._main_probe(tmp_path, n, q)
+
+        (storm,) = q.submitted
+        for text in (storm.summary, storm.detail):
+            assert 'merge_gate' in text
+            assert 'main_probe' in text
+        assert 'look at main' in storm.summary
+        assert f'probed main SHA {_PROBED_MAIN_SHA}' in storm.detail
+
+    async def test_the_next_window_names_only_its_own_call_sites(self, tmp_path: Path) -> None:
+        q = _FakeEscalationQueue(open_l2=None)
+        for n in range(_STORM_AT):
+            await self._merge_gate(tmp_path, n, q)
+        for n in range(_STORM_AT, 2 * _STORM_AT):
+            await self._main_probe(tmp_path, n, q)
+
+        first, second = q.submitted
+        for text in (first.summary, first.detail):
+            assert 'merge_gate' in text
+            assert 'main_probe' not in text
+        for text in (second.summary, second.detail):
+            assert 'main_probe' in text
+            assert 'merge_gate' not in text
+
+    async def test_a_window_opened_after_the_count_is_reset_names_only_its_own_call_sites(
+        self, tmp_path: Path,
+    ) -> None:
+        q = _FakeEscalationQueue(open_l2=None)
+        await self._merge_gate(tmp_path, 0, q)
+        # The reset every storm-path fixture in orchestrator/tests performs, until task
+        # 7689 gives the streak an owned home.
+        flake_recorder._merge_flake_suppression_streak = 0
+        for n in range(1, _STORM_AT + 1):
+            await self._main_probe(tmp_path, n, q)
+
+        (storm,) = q.submitted
+        for text in (storm.summary, storm.detail):
+            assert 'main_probe' in text
+            assert 'merge_gate' not in text
+
+    async def test_dedup_on_the_fixed_sentinel_is_unchanged_across_call_sites(
+        self, tmp_path: Path,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'queue')
+        for n in range(_STORM_AT):
+            await self._main_probe(tmp_path, n, queue)
+        for n in range(_STORM_AT, 2 * _STORM_AT):
+            await self._merge_gate(tmp_path, n, queue)
+
+        (storm,) = _storms(queue)
+        assert [e.task_id for e in queue.get_pending()] == [_STORM_SENTINEL]
+        for text in (storm.summary, storm.detail):
+            assert 'main_probe' in text
+            assert 'merge_gate' not in text
+
+    async def test_a_deduped_window_logs_the_call_sites_the_open_l2_does_not_name(
+        self, tmp_path: Path, caplog,
+    ) -> None:
+        queue = EscalationQueue(tmp_path / 'queue')
+        for n in range(_STORM_AT):
+            await self._main_probe(tmp_path, n, queue)
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.flake_recorder'):
+            for n in range(_STORM_AT, 2 * _STORM_AT):
+                await self._merge_gate(tmp_path, n, queue)
+
+        (deduped,) = [r for r in caplog.records if _STORM_SENTINEL in r.getMessage()]
+        assert 'call site(s) merge_gate' in deduped.getMessage()
+        assert f'merge SHA {_MERGE_SHA}' in deduped.getMessage()
 
 
 _HEAD = 'e' * 40

@@ -12,7 +12,7 @@ import logging
 import time
 
 import pytest
-from _fm_helpers import poll_until
+from _fm_polling import poll_until
 
 from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
 

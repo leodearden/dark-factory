@@ -13,6 +13,9 @@ import pytest
 from pydantic import ValidationError
 
 from shared.task_metadata import DoneProvenance
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 DECLARED_KINDS = get_args(DoneProvenance.model_fields['kind'].annotation)
 SHA = '0123456789abcdef0123456789abcdef01234567'

@@ -36,6 +36,7 @@ from orchestrator.merge_lane.outcome_facts import ConflictEvidence
 from orchestrator.merge_lane.reverify_gate_decision import (
     MAX_LOGGED_OVERLAP_PATHS,
     GateClearance,
+    ReverifyDispatch,
     ReverifyGateDecision,
     ReverifyGateReason,
     emit_reverify_gate_decision,
@@ -387,11 +388,16 @@ class PlanFilesTouchedResult:
             architect's spelling, pre-normalization) so the diagnostic names
             exactly what plan.json says.  A resolution alone never passes the
             gate — the resolved path must additionally be in the touched set.
+        touched_set_error: The branch's history scan failed, so
+            ``not_touched`` lists every declared entry UNMEASURED and
+            nothing about the branch can be concluded from it.  ``None``
+            when the touched set was read.
     """
 
     not_touched: list[str] = field(default_factory=list)
     missing_from_tree: list[str] = field(default_factory=list)
     resolved_renames: dict[str, str] = field(default_factory=dict)
+    touched_set_error: str | None = None
 
 
 DROPPED_PLAN_TARGETS_REASON_PREFIX = 'Merge commit is missing plan target files'
@@ -484,10 +490,10 @@ before this prefix may be used, and for the three traps a naive version misses.
 
 ALREADY_LANDED_CITATION_PATTERN: str = (
     r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
-    r'\(#?{tid}\)!?:'
-    r'|^Merge task/{tid} into '
+    r'\(#?{tid}([ ,/][^)]*)?\)!?:'
+    r'|{merge_subject}'
 )
-r"""STRICTER citation template for :func:`_resolve_already_landed_branch`.
+r"""Scope-position citation template for :func:`_resolve_already_landed_branch`.
 
 ``GitOps.DEFAULT_COMMIT_CITATION_PATTERN`` is deliberately permissive — it
 also accepts the UNANCHORED ``\(#?{tid}\)`` / ``\(task {tid}\)`` alternatives
@@ -501,18 +507,29 @@ wrong for THIS question, which is "is this commit this task's own delivery":
 and both touch exactly the paths the original landing touched, so signal 3
 (coverage) passes too and the branch is declared already-landed on a commit
 that is the OPPOSITE of its delivery.  Requiring the id in the
-conventional-commit SCOPE position — ``impl(3717):`` — is what separates an
-AUTHORED delivery from a commit that merely mentions the id.
+conventional-commit SCOPE position is what separates an AUTHORED delivery
+from a commit that merely mentions the id.  The id may close the scope
+(``impl(3717):``) or be followed by a qualifier (``impl(3717 step-8):``,
+``feat(3717/step-2):``); a qualifier is still scope position, so the reading
+holds, and only the scope's LEADING id attributes (``fix(4200/3717):`` is
+4200's).  Why the qualifier separator class is closed to ``[ ,/]`` (no dot,
+no hyphen) is stated once, in the doc comment of
+``orchestrator/src/orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN``;
+``orchestrator/tests/test_already_landed_citation_pattern.py`` pins that the
+two templates agree on scope-position subjects, with one exception: a
+``#``-led qualified scope (``fix(#3717 step-1):``) attributes here, but the
+default does not cite it at all.
 
-Measured before narrowing, on this repo's last 4000 main commits: 1298
-subjects match this strict form, and exactly ONE subject matched only the
-dropped arms (itself a body-line false-cite, not a real citation).  So the
-narrowing costs no real attribution and removes the whole false-cite class.
-Anything it does miss falls through to the UNCHANGED
+The narrowing trades recall for precision: a delivery cited only outside
+scope position, as in ``fix(git_ops): ... (task 3717)``, is not attributed
+here (census: the message of commit ``impl(6221 step-2): accept the qualified
+scope``).  Anything this template misses falls through to the UNCHANGED
 ``plan_files_not_touched`` path — fail-closed, per this predicate's contract.
 
 Valid as both a git ``--extended-regexp`` pattern and a Python ``re``, which
-``find_task_citation_commit`` requires of any override.
+``find_task_citation_commit`` requires of any override; its ``{merge_subject}``
+arm is filled by ``orchestrator/src/orchestrator/git_ops.py::render_citation_pattern``
+from the GitOps config.
 """
 
 
@@ -1836,7 +1853,7 @@ async def resolve_already_landed_branch(
         )
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001
+    except Exception:
         logger.warning(
             'already-landed: probe raised for task_id=%s branch=%s — failing '
             'closed (the unchanged plan_files_not_touched path runs)',
@@ -2036,18 +2053,17 @@ async def _resolve_already_landed_branch(
         return None
 
     # --- signal 3: the landing COVERS every declared entry -----------------
-    touched = await git_ops.get_files_touched_in_branch(
+    touched, touched_err = await git_ops.get_files_touched_in_branch(
         f'{landed_sha}^1', landed_sha,
     )
     touched_set = set(touched)
-    if not touched_set:
-        # `get_files_touched_in_branch` fails OPEN with [] on a git error, so
-        # an empty set is indistinguishable from "could not measure".  Either
-        # way there is no coverage evidence, so decline.
+    if touched_err is not None or not touched_set:
+        # An unreadable history and a landing that touched nothing are both
+        # absent coverage evidence, so decline either way.
         logger.warning(
             'already-landed: attributing commit %s (mechanism=%s) touched no '
-            'measurable files task_id=%s — failing closed',
-            landed_sha, mechanism, task_id,
+            'measurable files task_id=%s err=%s — failing closed',
+            landed_sha, mechanism, task_id, touched_err,
         )
         return None
 
@@ -2657,6 +2673,12 @@ async def _resolve_renamed_plan_path(
     return candidates
 
 
+def _with_git_stderr(err: Exception) -> str:
+    """*err* as text, carrying git's own message when *err* has a ``stderr``."""
+    stderr = (getattr(err, 'stderr', None) or '').strip()
+    return f'{err}: {stderr[:200]}' if stderr else str(err)
+
+
 async def _check_plan_files_touched_in_branch(
     plan_files: list[str],
     base_sha: str,
@@ -2691,14 +2713,27 @@ async def _check_plan_files_touched_in_branch(
 
     Empty ``plan_files`` returns no entries — vacuously satisfied.
 
-    Fail-open on git error (matches :func:`_check_plan_targets_in_tree`):
-    return an empty ``PlanFilesTouchedResult`` so a transient diff error
-    doesn't block a real merge.  Loud-log so regressions surface in ops.
+    When the branch's history cannot be read the gate fails CLOSED but
+    says so: every non-empty declared entry is returned in ``not_touched``
+    with ``touched_set_error`` set, and no per-entry probe runs, so the
+    caller can report the delivery as unmeasured rather than undelivered.
     """
     if not plan_files:
         return PlanFilesTouchedResult()
 
-    touched = await git_ops.get_files_touched_in_branch(base_sha, branch_head)
+    touched, touched_err = await git_ops.get_files_touched_in_branch(
+        base_sha, branch_head,
+    )
+    if touched_err is not None:
+        logger.warning(
+            'plan-files-touched: touched set unreadable task_id=%s base=%s '
+            'head=%s err=%s — every declared entry is unmeasured',
+            task_id or '<unknown>', base_sha, branch_head, touched_err,
+        )
+        return PlanFilesTouchedResult(
+            not_touched=[entry for entry in plan_files if entry],
+            touched_set_error=_with_git_stderr(touched_err),
+        )
     touched_set = set(touched)
 
     # Lazily-computed, once-per-invocation listing of every path in the
@@ -3476,7 +3511,8 @@ async def _reverify_rebased_tree(
     keep_worktrees: Collection[Path] | None = None,
     run_post_merge_verify: Callable[..., Awaitable[MergeOutcome | None]],
     event_store: EventStore | None,
-) -> MergeOutcome | GateClearance:
+    dispatch_reverify: bool = False,
+) -> MergeOutcome | GateClearance | ReverifyDispatch:
     """Shared gate for the disjoint-delta re-verify check.
 
     Called by both CAS loops after ``advance_main`` returns
@@ -3486,8 +3522,9 @@ async def _reverify_rebased_tree(
     every member's commits, so the branch-touched set is the train's union
     footprint, not the tip member's own diff.
 
-    Returns the :class:`GateClearance` the caller may advance on, or the
-    ``MergeOutcome`` that ends the attempt.
+    Returns the :class:`GateClearance` the caller may advance on, the
+    ``MergeOutcome`` that ends the attempt, or, under *dispatch_reverify*, the
+    :class:`ReverifyDispatch` that hands a full re-verify back to the caller.
 
     Algorithm
     ---------
@@ -3519,7 +3556,11 @@ async def _reverify_rebased_tree(
        the worker's handles it carries write the re-verify's ``merge_verify``
        row.  ``None`` from it → ``GateClearance.reverified``; a
        ``MergeOutcome`` → verification failed or the disk guard fired, and
-       *merge_wt* has already been cleaned up.
+       *merge_wt* has already been cleaned up.  Under the keyword-only
+       *dispatch_reverify* opt-in this arm runs no verify and returns
+       ``ReverifyDispatch(decision)`` instead: the single-branch caller
+       re-verifies the rebased tree as an ordinary dispatch of the rebased
+       head (task 8525).  The history leg still runs here.
 
     Parameters
     ----------
@@ -3549,6 +3590,9 @@ async def _reverify_rebased_tree(
         ``history_leg_command``, on a same tree.
     event_store:
         Receives the decision row only.
+    dispatch_reverify:
+        Hand a full re-verify back as a :class:`ReverifyDispatch` rather than
+        running it.  Trains leave it False and re-verify inline.
     """
     decision = await _decide_reverify_gate(
         git_ops, req,
@@ -3561,6 +3605,8 @@ async def _reverify_rebased_tree(
     emit_reverify_gate_decision(event_store, decision)
     if (clearance := decision.reason.skip_clearance) is not None:
         return clearance
+    if dispatch_reverify and decision.dispatches:
+        return ReverifyDispatch(decision)
     failure = await run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts=timeouts,

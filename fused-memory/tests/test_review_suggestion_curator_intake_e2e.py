@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from _fm_helpers import _init_git_repo
+from _fm_git_repos import _init_git_repo
 from orchestrator.artifacts import ReviewAggregation
 from orchestrator.config import OrchestratorConfig
 from orchestrator.review_suggestions.disposition import SuggestionDisposition

@@ -54,6 +54,40 @@ def _utc_iso(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat()
 
 
+class RunExitKind(StrEnum):
+    STARTUP_CRASH = 'startup_crash'
+    CANCELLED = 'cancelled'
+
+
+@dataclass(frozen=True)
+class RunExitReason:
+    """Why a run did not return cleanly: the one home of ``runs.exit_reason``'s vocabulary."""
+
+    kind: RunExitKind
+    site: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.site is not None) != (self.kind is RunExitKind.STARTUP_CRASH):
+            raise ValueError(
+                f'a run exit reason carries a site exactly for {RunExitKind.STARTUP_CRASH.value} '
+                f'(got kind={self.kind.value} site={self.site!r})'
+            )
+
+    @classmethod
+    def startup_crash(cls, site: str) -> RunExitReason:
+        return cls(RunExitKind.STARTUP_CRASH, site)
+
+    @classmethod
+    def cancelled(cls) -> RunExitReason:
+        return cls(RunExitKind.CANCELLED)
+
+    @property
+    def column_value(self) -> str:
+        if self.site is None:
+            return self.kind.value
+        return f'{self.kind.value}:{self.site}'
+
+
 @dataclass(frozen=True)
 class ShadowCell:
     """One ``shadow_cells`` row (plans/live-shadow-eval-prd.md C1); field names are its columns."""
@@ -68,6 +102,7 @@ class ShadowCell:
     base_sha: str
     state: ShadowCellState
     cost_basis: CostBasis
+    configured_model: str
     opened_at: datetime
     settle_deadline: datetime
     parent_cell_id: str | None = None
@@ -79,6 +114,7 @@ class ShadowCell:
     result_path: Path | None = None
     cost_usd: float = 0.0
     cost_credits: float = 0.0
+    served_model: str | None = None
     run_id: str | None = None
     running_at: datetime | None = None
     run_ended_at: datetime | None = None
@@ -87,6 +123,7 @@ class ShadowCell:
 
     def __post_init__(self) -> None:
         self._check_identity()
+        self._check_served_model()
         self._check_timestamps()
         self._check_costs()
         self._check_stratum()
@@ -97,12 +134,27 @@ class ShadowCell:
         raise ValueError(f'ShadowCell {self.cell_id!r}: {invariant}')
 
     def _check_identity(self) -> None:
-        for name in ('cell_id', 'project_id', 'task_id', 'candidate', 'incumbent', 'base_sha', 'owner'):
+        for name in (
+            'cell_id', 'project_id', 'task_id', 'candidate', 'incumbent', 'base_sha', 'owner',
+            'configured_model',
+        ):
             value = getattr(self, name)
             if _is_blank(value):
                 self._refuse(f'{name} must be non-blank (got {value!r})')
         if self.parent_cell_id == self.cell_id:
             self._refuse(f'parent_cell_id must differ from cell_id (got {self.parent_cell_id!r})')
+
+    def _check_served_model(self) -> None:
+        if self.served_model is None:
+            return
+        if _is_blank(self.served_model):
+            self._refuse(f'served_model must be None or non-blank (got {self.served_model!r})')
+        if self.running_at is None or self.run_ended_at is None:
+            self._refuse(
+                f'a served_model is learned only from a run that started and ended '
+                f'(got served_model={self.served_model!r}, running_at={self.running_at!r}, '
+                f'run_ended_at={self.run_ended_at!r})'
+            )
 
     def _check_timestamps(self) -> None:
         for name in _SHADOW_CELL_TIME_COLUMNS:
@@ -141,6 +193,11 @@ _REASON_REQUIRED_STATES = ', '.join(
     f"'{state.value}'" for state in ShadowCellState if state.requires_reason
 )
 _SQL_BLANK_CHARS = f"char({', '.join(str(ord(c)) for c in _BLANK_CHARS)})"
+# Shared by the fresh DDL and the pre-8086 migration, which cannot add NOT NULL.
+_MODEL_COLUMN_DDL = {
+    column: f"TEXT CHECK ({column} IS NULL OR trim({column}, {_SQL_BLANK_CHARS}) <> '')"
+    for column in ('configured_model', 'served_model')
+}
 
 _SHADOW_CELLS_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS shadow_cells (
@@ -163,6 +220,8 @@ CREATE TABLE IF NOT EXISTS shadow_cells (
     cost_usd        REAL NOT NULL DEFAULT 0,
     cost_credits    REAL NOT NULL DEFAULT 0,
     cost_basis      TEXT NOT NULL,
+    configured_model {_MODEL_COLUMN_DDL['configured_model']} NOT NULL,
+    served_model    {_MODEL_COLUMN_DDL['served_model']},
     run_id          TEXT,
     opened_at       TEXT NOT NULL,
     running_at      TEXT,
@@ -350,6 +409,7 @@ class CellChange:
     reason: str | None = None
     reference_kind: ReferenceKind | None = None
     reference_sha: str | None = None
+    served_model: str | None = None
 
     def __post_init__(self) -> None:
         if self.state is ShadowCellState.SETTLED:
@@ -359,6 +419,16 @@ class CellChange:
                 f'reference fields belong only to a {ShadowCellState.SETTLED.value!r} change '
                 f'(got reference_kind={self.reference_kind!r}, reference_sha={self.reference_sha!r})'
             )
+        if self.served_model is not None:
+            self._check_served_model()
+
+    def _check_served_model(self) -> None:
+        if not self.state.stamps_run_ended_at:
+            self._refuse(
+                f'a served_model is learned only when a run ends (got served_model={self.served_model!r})'
+            )
+        if _is_blank(self.served_model):
+            self._refuse(f'served_model must be None or non-blank (got {self.served_model!r})')
 
     def _check_reference(self) -> None:
         if self.reference_kind is None:
@@ -509,7 +579,12 @@ CREATE TABLE IF NOT EXISTS runs (
     -- Task 6565: the commit the process's verify wire path was imported from
     -- (orchestrator.deployed_sha.DeployedSha.sha); NULL when unreadable or the
     -- row predates 6565.  Migrated by _migrate_runs_code_sha.
-    code_sha       TEXT
+    code_sha       TEXT,
+    -- Task 8269: when startup finished, and why the run did not return
+    -- cleanly (RunExitReason.column_value); a NULL exit_reason is a clean
+    -- return.  Migrated by _migrate_runs_startup_outcome.
+    startup_completed_at TEXT,
+    exit_reason          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_results (
@@ -616,7 +691,9 @@ class RunStore:
             self._migrate_scheduler_state_ewa_value(conn)
             self._migrate_scheduler_state_hold_columns(conn)
             self._migrate_runs_code_sha(conn)
+            self._migrate_runs_startup_outcome(conn)
             self._migrate_shadow_cells_run_ended_at(conn)
+            self._migrate_shadow_cells_model_columns(conn)
         finally:
             conn.close()
 
@@ -718,6 +795,21 @@ class RunStore:
             conn.commit()
             logger.info('RunStore: migrated runs — added code_sha')
 
+    def _migrate_runs_startup_outcome(self, conn: sqlite3.Connection) -> None:
+        """Add ``startup_completed_at`` then ``exit_reason`` to a pre-8269 ``runs``.
+
+        Same shape as :meth:`_migrate_runs_code_sha`, run right after it so a
+        migrated DB gets a fresh one's column order. An existing row reads NULL
+        in both.
+        """
+        added = [
+            column for column in ('startup_completed_at', 'exit_reason')
+            if add_column_if_missing_sync(conn, 'runs', column, 'TEXT')
+        ]
+        if added:
+            conn.commit()
+            logger.info('RunStore: migrated runs — added %s', ', '.join(added))
+
     def _migrate_shadow_cells_run_ended_at(self, conn: sqlite3.Connection) -> None:
         """Add ``run_ended_at`` to a pre-5387 ``shadow_cells``.
 
@@ -727,6 +819,22 @@ class RunStore:
         if add_column_if_missing_sync(conn, 'shadow_cells', 'run_ended_at', 'TEXT'):
             conn.commit()
             logger.info('RunStore: migrated shadow_cells — added run_ended_at')
+
+    def _migrate_shadow_cells_model_columns(self, conn: sqlite3.Connection) -> None:
+        """Add ``configured_model`` and ``served_model`` to a pre-8086 ``shadow_cells``.
+
+        Each column keeps its blank-refusing CHECK. A pre-8086 row reads
+        ``configured_model`` NULL and is refused on read by ``ShadowCell`` (no
+        such row exists: the coordinator has never run a cell).
+        """
+        added = [
+            column
+            for column, column_ddl in _MODEL_COLUMN_DDL.items()
+            if add_column_if_missing_sync(conn, 'shadow_cells', column, column_ddl)
+        ]
+        if added:
+            conn.commit()
+            logger.info('RunStore: migrated shadow_cells — added %s', ', '.join(added))
 
     def start_run(
         self,
@@ -843,15 +951,22 @@ class RunStore:
         self,
         run_id: str,
         report: HarnessReport,
+        *,
+        startup_completed_at: datetime | None = None,
+        exit_reason: RunExitReason | None = None,
     ) -> None:
-        """Update the runs row with final aggregates at shutdown."""
+        """Update the runs row with final aggregates and how the run ended, at shutdown."""
+        startup_completed_text = (
+            None if startup_completed_at is None else _utc_iso(startup_completed_at)
+        )
         conn = self._connect()
         try:
             conn.execute(
                 'UPDATE runs SET '
                 'completed_at = ?, total_tasks = ?, completed = ?, '
                 'blocked = ?, escalated = ?, total_cost_usd = ?, '
-                'paused_for_cap = ?, cap_pause_secs = ? '
+                'paused_for_cap = ?, cap_pause_secs = ?, '
+                'startup_completed_at = ?, exit_reason = ? '
                 'WHERE run_id = ?',
                 (
                     report.completed_at,
@@ -862,6 +977,8 @@ class RunStore:
                     report.total_cost_usd,
                     int(report.paused_for_cap),
                     report.cap_pause_duration_secs,
+                    startup_completed_text,
+                    None if exit_reason is None else exit_reason.column_value,
                     run_id,
                 ),
             )

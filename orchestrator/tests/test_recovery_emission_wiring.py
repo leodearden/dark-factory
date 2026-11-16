@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _null_task_escalation import submit_null_task_escalation
 from _orch_helpers import (
     wire_clear_claim_then_set_status,
     wire_live_status_from_get_task,
@@ -41,8 +42,12 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import Harness
 from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.recovery_emission import (
+    RECOVERY_VETO_STREAK_ROLE,
     RECOVERY_VETO_STREAK_SENTINEL_PREFIX,
+    LeaveReason,
+    RecoverySite,
     RecoveryVetoStreakTracker,
+    emit_recovery_veto_streak_escalation,
 )
 from orchestrator.task_ground_truth import (
     BranchState,
@@ -646,7 +651,7 @@ class TestZeroDispositionChange:
                 for c in harness.scheduler.set_task_status.await_args_list
             ],
             'escalations': sorted(
-                e.id for e in harness._escalation_queue.get_by_task(
+                e.id for e in _queue(harness).get_by_task(
                     'T1', status='pending',
                 )
             ),
@@ -688,7 +693,7 @@ class TestZeroDispositionChange:
 
         await harness._reconcile_stranded_in_progress(mid_run=False)
 
-        assert harness._escalation_queue.get_by_task('T1', status='pending') == []
+        assert _queue(harness).get_by_task('T1', status='pending') == []
 
     async def test_a_broken_event_store_never_disturbs_the_sweep(self, harness):
         """Telemetry is fire-and-forget: a store fault must not strand a task
@@ -769,6 +774,37 @@ def _alarms(harness, tid: str = 'T1') -> list:
     )
 
 
+def _outside_l2(
+    queue: EscalationQueue,
+    esc_id: str,
+    *,
+    members: tuple[str, ...],
+    task_id: str = '9',
+    severity: str = 'blocking',
+) -> Escalation:
+    """A pending cluster L2 the auto-watcher filed under ANOTHER task id."""
+    l2 = Escalation(
+        id=esc_id, task_id=task_id, agent_role='escalation-watcher-auto',
+        severity=severity, category='risk_identified', summary='cluster',
+        level=2, members=list(members),
+    )
+    queue.submit(l2)
+    return l2
+
+
+def _count_pending_scans(monkeypatch, queue: EscalationQueue) -> list[None]:
+    """One entry per ``queue.get_pending()`` call — each a full root scan."""
+    scans: list[None] = []
+    real = queue.get_pending
+
+    def counted():
+        scans.append(None)
+        return real()
+
+    monkeypatch.setattr(queue, 'get_pending', counted)
+    return scans
+
+
 @pytest.mark.asyncio
 class TestVetoStreakAlarm:
     async def test_the_first_two_sweeps_file_nothing(self, clocked):
@@ -830,7 +866,7 @@ class TestVetoStreakAlarm:
         await _sweeps(harness, clock, 5)
 
         assert len(_alarms(harness)) == 1, 'precondition: the alarm did fire'
-        assert harness._escalation_queue.get_by_task('T1', status='pending') == [], (
+        assert _queue(harness).get_by_task('T1', status='pending') == [], (
             'the subject task\'s own pending set must be untouched by the alarm'
         )
         assert classify_recovery(report) is RecoveryAction.LEAVE, (
@@ -1085,6 +1121,95 @@ class TestHumanParkedHoldsDoNotAlarm:
 
         assert len(_alarms(harness)) == 1
 
+    # -- task 7716: the L2 holding the L1 was filed under ANOTHER task id --
+
+    async def test_an_l1_held_by_an_l2_filed_under_another_task_files_no_alarm(
+        self, clocked,
+    ):
+        """``promote_to_l2`` mints a cluster L2 under one task id, so the task's
+        own read never sees it; the pending queue does."""
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 8)
+
+        assert _alarms(harness) == []
+
+    async def test_outside_holder_suppression_is_not_blindness(self, clocked):
+        """The veto rows still name the task's own pin, and never the outside L2."""
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 8)
+
+        rows = _rows(harness, EventType.recovery_vetoed)
+        assert rows
+        assert all('esc-1' in json.dumps(r['data']) for r in rows)
+        assert not [r for r in rows if 'esc-9-2' in json.dumps(r['data'])]
+
+    async def test_an_outside_l2_holding_another_id_still_alarms(self, clocked):
+        """COUNTER-SIGNAL: the outside L2 leaves this task's L1 unpromoted."""
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-other',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+    async def test_a_resolved_outside_l2_holds_nothing(self, clocked):
+        """COUNTER-SIGNAL: a closed L2 is no longer in front of anyone."""
+        harness, clock = clocked
+        holder = _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _queue(harness).resolve(holder.id, 'answered')
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+    async def test_an_info_outside_l2_holds_nothing(self, clocked):
+        """COUNTER-SIGNAL: link 1 makes an info L2 an annotation, not a handoff."""
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',), severity='info')
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(_alarms(harness)) == 1
+
+    async def test_each_sweep_scans_the_pending_queue_once_per_held_task(
+        self, clocked, monkeypatch,
+    ):
+        harness, clock = clocked
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+        scans = _count_pending_scans(monkeypatch, _queue(harness))
+
+        await _sweeps(harness, clock, 3)
+
+        assert len(scans) == 3
+
+    async def test_with_the_suppression_off_no_sweep_scans_the_pending_queue(
+        self, clocked, monkeypatch,
+    ):
+        """Every pending read is a root scan, and with the knob off no filing
+        reads the answer."""
+        harness, clock = clocked
+        harness.config.recovery_emission = RecoveryEmissionConfig(
+            streak_escalation_suppress_human_parked=False,
+        )
+        _outside_l2(_queue(harness), 'esc-9-2', members=('esc-1',))
+        _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1', level=1)])})
+        scans = _count_pending_scans(monkeypatch, _queue(harness))
+
+        await _sweeps(harness, clock, 3)
+
+        assert scans == []
+        assert len(_alarms(harness)) == 1
+
 
 @pytest.mark.asyncio
 class TestPerTickSitesNeverCharge:
@@ -1097,7 +1222,7 @@ class TestPerTickSitesNeverCharge:
     """
 
     async def test_hammering_the_dispatch_gate_never_files_an_l1(self, harness):
-        harness._escalation_queue.submit(Escalation(
+        _queue(harness).submit(Escalation(
             id='esc-T1-1', task_id='T1', agent_role='implementer',
             severity='blocking', category='design_concern',
             summary='an open handoff on task T1', level=1,
@@ -1271,3 +1396,124 @@ class TestBothAdaptersAgreeOnTheVetoSignature:
         assert s._recovery_veto_tracker.observe(
             RecoverySite.scheduler_blocked_redispatch, 'T1', expected,
         ).changed is False
+
+
+
+def _inherit_pending_alarms(harness) -> None:
+    """Startup step 2c3, as the restarted process runs it."""
+    harness._inherit_pending_streak_alarms()
+
+
+def _restart_with_prior_alarm(harness, *, deterministic_sweep: bool) -> None:
+    """Make *harness* the RESTARTED process: a prior one filed T1's alarm."""
+    harness.config.deterministic_recon_sweep_enabled = deterministic_sweep
+    assert emit_recovery_veto_streak_escalation(
+        escalation_queue=_queue(harness), task_id='T1',
+        site=RecoverySite.reconcile_sweep, streak=3, threshold=3,
+        span_seconds=3600.0, min_span_seconds=0.0,
+        reason=LeaveReason.escalation_pinned, shape='x', escalation_ids=['esc-1'],
+        human_parked=False, suppress_human_parked=True,
+    ) is True
+    _inherit_pending_alarms(harness)
+
+
+@pytest.mark.asyncio
+class TestVetoStreakAlarmSurvivesRestart:
+    """The fixture harness is the restarted process: its tracker and memo are
+    empty, and the prior process's alarm exists only on the queue."""
+
+    async def test_a_task_that_left_the_candidate_set_is_released(self, clocked):
+        harness, clock = clocked
+        _restart_with_prior_alarm(harness, deterministic_sweep=False)
+        # T9 keeps the status map non-empty, so the sweep does not abort.
+        _bind_reports(harness, {'T9': _report(claimant=_live_claimant())})
+
+        await _sweeps(harness, clock, 1)
+
+        assert _alarms(harness, 'T1') == []
+
+    async def test_a_null_task_id_record_does_not_stop_the_inheritance(self, clocked):
+        harness, clock = clocked
+        null_record = submit_null_task_escalation(_queue(harness))
+        _restart_with_prior_alarm(harness, deterministic_sweep=False)
+        _bind_reports(harness, {'T9': _report(claimant=_live_claimant())})
+
+        await _sweeps(harness, clock, 1)
+
+        assert _alarms(harness, 'T1') == []
+        assert null_record.id in {esc.id for esc in _queue(harness).get_pending()}
+
+    async def test_a_task_still_held_keeps_one_alarm_until_the_hold_clears(
+        self, clocked,
+    ):
+        harness, clock = clocked
+        _restart_with_prior_alarm(harness, deterministic_sweep=False)
+        stub = _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
+
+        await _sweeps(harness, clock, 5)
+        assert len(_alarms(harness, 'T1')) == 1, 'no duplicate of the inherited alarm'
+
+        stub.reports['T1'] = _report(
+            db_status=TaskStatus.BLOCKED,
+            branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
+        )
+        await _sweeps(harness, clock, 1)
+
+        assert _alarms(harness, 'T1') == []
+
+    async def test_a_hold_that_clears_below_the_threshold_resolves_it(self, clocked):
+        """Two held sweeps are below the threshold of 3, so this process's own
+        streak cannot open the resolver's gate; only the inherited memo can."""
+        harness, clock = clocked
+        _restart_with_prior_alarm(harness, deterministic_sweep=False)
+        stub = _bind_reports(harness, {'T1': _pinned_hold(escalations=[_ref('esc-1')])})
+
+        await _sweeps(harness, clock, 2)
+        stub.reports['T1'] = _report(
+            db_status=TaskStatus.BLOCKED,
+            branch=BranchStateKind.EXISTS_OFF_MAIN, sha=None,
+        )
+        await _sweeps(harness, clock, 1)
+
+        assert _alarms(harness, 'T1') == []
+
+    async def test_every_released_site_must_vouch_before_the_alarm_resolves(
+        self, clocked,
+    ):
+        """The disk record does not say which site charged it, so the
+        deterministic sweep must also pass without T1 — failing toward NOT
+        releasing, as the release's flap guard requires."""
+        harness, clock = clocked
+        _restart_with_prior_alarm(harness, deterministic_sweep=True)
+        _bind_reports(harness, {'T9': _report(claimant=_live_claimant())})
+
+        await _sweeps(harness, clock, 1)
+        assert len(_alarms(harness, 'T1')) == 1
+
+        await harness._run_deterministic_recon_sweep()
+
+        assert _alarms(harness, 'T1') == []
+
+    async def test_a_real_id_echo_is_inherited_and_resolved(self, clocked):
+        harness, clock = clocked
+        harness.config.deterministic_recon_sweep_enabled = False
+        _queue(harness).submit(Escalation(
+            id='esc-T1-echo', task_id='T1', agent_role=RECOVERY_VETO_STREAK_ROLE,
+            severity='blocking', level=1, category='risk_identified',
+            summary='echoed streak alarm',
+        ))
+        _inherit_pending_alarms(harness)
+        _bind_reports(harness, {'T9': _report(claimant=_live_claimant())})
+
+        await _sweeps(harness, clock, 1)
+
+        assert _queue(harness).get_by_task('T1', status='pending') == []
+
+    async def test_no_queue_is_a_no_op(self, clocked):
+        harness, _clock = clocked
+        harness.config.deterministic_recon_sweep_enabled = True
+        harness._escalation_queue = None
+
+        _inherit_pending_alarms(harness)
+
+        assert tuple(harness._recovery_veto_tracker.tracked()) == ()

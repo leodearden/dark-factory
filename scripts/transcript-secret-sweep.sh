@@ -4,7 +4,8 @@
 # .timer-driven, nightly 02:30).
 #
 # Runs scripts/transcript_secret_sweep.py over every factory project's
-# agent-transcript archive and ~/.claude/projects. The sweep matches the
+# agent-transcript archive, verify logs and offline-lane logs (gzipped junit
+# included), and over ~/.claude/projects. The sweep matches the
 # secret values ITS OWN environment holds, so this wrapper sources $REPO/.env
 # (the same file the orchestrators load) before running it. Nothing here
 # echoes an environment value.
@@ -16,7 +17,9 @@
 #
 # TRANSCRIPT_SECRET_SWEEP_CMD overrides the interpreter prefix (tests inject a
 # fake recorder there), and REPO is overridable so tests can point it at a tmp
-# dir: the seam convention of scripts/exception-owner-sweep.sh.
+# dir: the seam convention of scripts/exception-owner-sweep.sh. The default
+# prefix passes --no-sync, not --frozen, so a timer run never re-syncs the
+# shared root .venv (tests/scripts/test_uv_run_venv_isolation.py).
 set -uo pipefail
 
 REPO="${REPO:-/home/leo/src/dark-factory}"
@@ -25,9 +28,9 @@ set -a
 [ -f "$REPO/.env" ] && source "$REPO/.env"
 set +a
 
-read -r -a SWEEP_CMD <<<"${TRANSCRIPT_SECRET_SWEEP_CMD:-uv run --frozen --project $REPO/shared python}"
+read -r -a SWEEP_CMD <<<"${TRANSCRIPT_SECRET_SWEEP_CMD:-uv run --no-sync --project $REPO/shared python}"
 
-echo "transcript-secret-sweep: sweeping agent transcripts for live secret values"
+echo "transcript-secret-sweep: sweeping agent transcripts and verify/offline-lane logs for live secret values"
 "${SWEEP_CMD[@]}" "$REPO/scripts/transcript_secret_sweep.py"
 sweep_rc=$?
 if [ "$sweep_rc" -ne 0 ]; then

@@ -1,0 +1,239 @@
+"""Phase-1 integration gate for ``plans/server-side-api-error-handling-prd.md``.
+
+One simulated incident hour, driven once through the real harness, workflow,
+scheduler and escalation queue by ``_api_outage_harness.run_incident_burst``,
+must satisfy boundary rows 1-5 together. Each assertion helper owns one row and
+prefixes its messages ``row N:`` so a failure names the row it broke.
+"""
+
+from __future__ import annotations
+
+import pytest
+from _api_outage_harness import (
+    BURST_SIZE,
+    KILLS_PER_TASK,
+    PROVIDER_529_ERROR,
+    BurstLedger,
+    DispatchRecord,
+    incident_529_result,
+    reify_4429_wedge_result,
+    run_incident_burst,
+    sigkill_wedge_result,
+)
+from shared.cli_invoke import AgentFailureKind, classify_agent_failure, is_zero_output_timeout
+
+from orchestrator.scheduler import is_transient_api_requeue
+from orchestrator.workflow import ZERO_OUTPUT_HANG_REASON, WorkflowOutcome
+
+_API_ERROR_MARKER = 'agent API error: HTTP 529'
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('code_default_config')
+async def test_incident_burst_rows_1_to_5_hold_in_one_harness_run(tmp_path, monkeypatch):
+    ledger = await run_incident_burst(tmp_path, monkeypatch)
+
+    _assert_burst_premises(ledger)
+    _assert_row_1(ledger)
+    _assert_rows_2_and_3(ledger)
+    _assert_row_4(ledger)
+    _assert_row_5(ledger)
+    _assert_recovery(ledger)
+
+
+def _assert_burst_premises(ledger: BurstLedger) -> None:
+    config = ledger.config
+    assert config.max_consecutive_zero_output_timeouts == 2, 'premise: zero-output threshold default'
+    assert config.transient_requeue_cap == 10, 'premise: transient requeue cap default'
+    assert config.transient_requeue_backoff_base_secs == 30.0, 'premise: backoff base default'
+    assert config.transient_requeue_backoff_cap_secs == 900.0, 'premise: backoff cap default'
+    assert config.requeue_cooldown_secs == 30.0, 'premise: flat requeue cooldown default'
+    assert config.park_stop_enabled is True, 'premise: park-stop enabled by default'
+    assert config.park_stop_parked_window_hours == 1.0, 'premise: park-stop window default'
+    assert config.park_stop_parked_threshold <= BURST_SIZE, (
+        f'premise: a burst of {BURST_SIZE} wrongful blocks must be able to trip park-stop '
+        f'(threshold {config.park_stop_parked_threshold})'
+    )
+
+    shape = incident_529_result()
+    assert is_zero_output_timeout(shape), 'premise: the injected 529 shape is a zero-output timeout'
+    classified = classify_agent_failure(shape)
+    assert classified.kind == AgentFailureKind.API_ERROR, (
+        f'premise: the injected 529 shape classifies API_ERROR, got {classified.kind!r}'
+    )
+    assert _API_ERROR_MARKER in classified.summary, f'premise: marker missing from {classified.summary!r}'
+
+    kill_times = [r.at for tid in ledger.cast.burst for r in ledger.kills_of(tid)]
+    assert kill_times, 'premise: no burst kills recorded'
+    window_secs = config.park_stop_parked_window_hours * 3600
+    assert max(kill_times) - min(kill_times) < window_secs, (
+        f'premise: the burst must sit inside one park-stop window ({window_secs}s); '
+        f'it spans {max(kill_times) - min(kill_times):.0f}s'
+    )
+
+
+def _assert_row_1(ledger: BurstLedger) -> None:
+    for tid in ledger.cast.burst:
+        kills = ledger.kills_of(tid)
+        for n, record in enumerate(kills, start=1):
+            report = record.report
+            where = f'row 1: task {tid} kill {n}'
+            assert report.outcome == WorkflowOutcome.REQUEUED, f'{where}: outcome {report.outcome!r}'
+            assert report.api_error_status == 529, f'{where}: api_error_status {report.api_error_status!r}'
+            assert _API_ERROR_MARKER in report.block_reason, f'{where}: reason {report.block_reason!r}'
+            assert is_transient_api_requeue(
+                report.block_reason, api_error_status=report.api_error_status,
+            ), f'{where}: the scheduler does not read this report as a transient requeue'
+            assert record.cli_calls == 1, (
+                f'{where}: {record.cli_calls} CLI calls — a 5xx must leave on the first, '
+                'not feed the zero-output counter'
+            )
+            assert record.transient_requeue_count == n, (
+                f'{where}: transient_requeue_count {record.transient_requeue_count}'
+            )
+            assert record.non_transient_requeue_count == 0, (
+                f'{where}: non-transient requeue count {record.non_transient_requeue_count}'
+            )
+            assert len(record.evidence) == 1, f'{where}: evidence files {record.evidence!r}'
+            evidence = record.evidence[0]
+            assert evidence.api_error_status == 529, f'{where}: evidence {evidence!r}'
+            assert 'overloaded_error' in evidence.output_tail, f'{where}: evidence {evidence!r}'
+            assert evidence.output_tail.endswith(PROVIDER_529_ERROR), f'{where}: evidence {evidence!r}'
+        assert len(kills) == KILLS_PER_TASK, f'row 1: task {tid} had {len(kills)} kills'
+        writes = ledger.status_writes[tid]
+        assert 'blocked' not in writes, f'row 1: task {tid} was written blocked: {writes}'
+        assert ledger.escalations_by_task[tid] == (), (
+            f'row 1: task {tid} filed escalations: {ledger.escalations_by_task[tid]}'
+        )
+
+
+def _assert_rows_2_and_3(ledger: BurstLedger) -> None:
+    wedges = {
+        'row 2': (ledger.cast.sigkill_wedge, sigkill_wedge_result()),
+        'row 3': (ledger.cast.reify_wedge, reify_4429_wedge_result()),
+    }
+    for row, (tid, shape) in wedges.items():
+        where = f'{row}: wedge control {tid}'
+        classified = classify_agent_failure(shape)
+        assert classified.kind == AgentFailureKind.TIMED_OUT, (
+            f'{where}: premise — a no-status zero-output kill classifies TIMED_OUT, got {classified.kind!r}'
+        )
+        assert is_zero_output_timeout(shape), f'{where}: premise — the shape is a zero-output timeout'
+        dispatches = ledger.dispatches_of(tid)
+        assert len(dispatches) == 1, f'{where}: {len(dispatches)} dispatches'
+        record = dispatches[0]
+        assert record.cli_calls == 2, (
+            f'{where}: {record.cli_calls} CLI calls — the wedge breaker trips at the default threshold of 2'
+        )
+        report = record.report
+        assert report.outcome == WorkflowOutcome.BLOCKED, f'{where}: outcome {report.outcome!r}'
+        assert report.block_category == 'infra_issue', f'{where}: category {report.block_category!r}'
+        assert ZERO_OUTPUT_HANG_REASON in report.block_reason, f'{where}: reason {report.block_reason!r}'
+        assert report.api_error_status is None, f'{where}: api_error_status {report.api_error_status}'
+        assert 'blocked' in ledger.status_writes[tid], f'{where}: never written blocked'
+        categories = {e.category for e in ledger.escalations_by_task[tid]}
+        assert 'infra_issue' in categories, f'{where}: no infra_issue escalation, got {categories}'
+
+    after_wedges = ledger.after_wedges
+    wedge_ids = {ledger.cast.sigkill_wedge, ledger.cast.reify_wedge}
+    blocked = {tid for tid, writes in ledger.status_writes.items() if 'blocked' in writes}
+    assert blocked == wedge_ids, f'rows 2/3: blocked writes went to {sorted(blocked)}'
+    assert after_wedges.parked_live_count == len(wedge_ids), (
+        f'rows 2/3: the park-stop deque holds {after_wedges.parked_live_count} tasks, expected the two wedges'
+    )
+    assert after_wedges.paused is False, 'rows 2/3: two blocks are under the park-stop threshold yet paused'
+
+
+_TRANSIENT_ENVELOPES = (30.0, 60.0, 120.0, 240.0, 480.0)
+
+
+def _assert_row_4(ledger: BurstLedger) -> None:
+    assert len(_TRANSIENT_ENVELOPES) == KILLS_PER_TASK
+    for tid in ledger.cast.burst:
+        for n, record in enumerate(ledger.kills_of(tid), start=1):
+            where = f'row 4: task {tid} kill {n}'
+            cooldown = record.cooldown
+            assert cooldown is not None, f'{where}: no cooldown armed'
+            envelope = _TRANSIENT_ENVELOPES[n - 1]
+            assert cooldown.envelope_secs == envelope, f'{where}: envelope {cooldown.envelope_secs}'
+            assert envelope / 2 <= cooldown.armed_secs <= envelope, (
+                f'{where}: armed {cooldown.armed_secs}s outside [{envelope / 2}, {envelope}]'
+            )
+            assert cooldown.transient is True, f'{where}: cooldown not marked transient'
+            assert cooldown.transient_count == n, f'{where}: transient_count {cooldown.transient_count}'
+    for n in range(1, KILLS_PER_TASK + 1):
+        armed = {_armed_secs(ledger.kills_of(tid)[n - 1]) for tid in ledger.cast.burst}
+        assert len(armed) > 1, f'row 4: no jitter at kill {n} — every burst task armed {armed}'
+
+    genuine = ledger.cast.genuine
+    first = ledger.dispatches_of(genuine)[0]
+    where = f'row 4: genuine control {genuine}'
+    assert first.report.outcome == WorkflowOutcome.REQUEUED, f'{where}: outcome {first.report.outcome!r}'
+    assert first.report.api_error_status is None, f'{where}: api_error_status {first.report.api_error_status}'
+    assert not is_transient_api_requeue(first.report.block_reason, api_error_status=None), (
+        f'{where}: reason reads as a transient requeue: {first.report.block_reason!r}'
+    )
+    assert first.cooldown is not None, f'{where}: no cooldown armed'
+    assert first.cooldown.armed_secs == ledger.config.requeue_cooldown_secs, (
+        f'{where}: armed {first.cooldown.armed_secs}s, expected the flat {ledger.config.requeue_cooldown_secs}s'
+    )
+    assert first.cooldown.transient is False, f'{where}: cooldown marked transient'
+    assert first.transient_requeue_count == 0, f'{where}: transient count {first.transient_requeue_count}'
+    assert first.report.counts_against_requeue_cap is True, (
+        f'{where}: the requeue is history-only, not counted against requeue_cap'
+    )
+    assert first.non_transient_requeue_count == 1, (
+        f'{where}: non-transient count {first.non_transient_requeue_count}'
+    )
+
+
+def _armed_secs(record: DispatchRecord) -> float:
+    assert record.cooldown is not None, f'row 4: task {record.task_id} has no cooldown armed'
+    return record.cooldown.armed_secs
+
+
+def _assert_row_5(ledger: BurstLedger) -> None:
+    assert ledger.park_stop_trip_wired, (
+        'row 5: the scheduler has no on_park_stop_trip callback, so an empty deque proves nothing'
+    )
+    burst = ledger.burst_dispatches()
+    assert burst, 'row 5: no burst-phase dispatches recorded'
+    for record in burst:
+        where = f'row 5: task {record.task_id} at t={record.at:.0f}s'
+        assert record.parked_live_count == 0, f'{where}: parked_live_count {record.parked_live_count}'
+        assert record.parked_window_churn_count == 0, (
+            f'{where}: parked_window_churn_count {record.parked_window_churn_count}'
+        )
+        assert record.paused is False, f'{where}: scheduler paused'
+    end = ledger.after_burst
+    assert end.pending_escalations == (), f'row 5: escalations pending after the burst: {end.pending_escalations}'
+    assert end.paused is False, 'row 5: scheduler paused after the burst'
+    assert end.parked_live_count == 0, f'row 5: parked_live_count {end.parked_live_count} after the burst'
+    assert end.parked_window_churn_count == 0, (
+        f'row 5: parked_window_churn_count {end.parked_window_churn_count} after the burst'
+    )
+
+
+def _assert_recovery(ledger: BurstLedger) -> None:
+    expected_dispatches = {
+        **dict.fromkeys(ledger.cast.burst, KILLS_PER_TASK + 1),
+        ledger.cast.genuine: 2,
+    }
+    for tid, expected in expected_dispatches.items():
+        where = f'recovery: task {tid}'
+        dispatches = ledger.dispatches_of(tid)
+        assert len(dispatches) == expected, f'{where}: {len(dispatches)} dispatches, expected {expected}'
+        last = dispatches[-1]
+        assert last.report.outcome == WorkflowOutcome.DONE, f'{where}: last outcome {last.report.outcome!r}'
+        assert last.transient_requeue_count == 0, (
+            f'{where}: transient count {last.transient_requeue_count} survived DONE'
+        )
+        assert last.requeue_history == (), f'{where}: requeue history survived DONE: {last.requeue_history}'
+        assert ledger.final_status[tid] == 'done', f'{where}: final status {ledger.final_status[tid]!r}'
+        assert 'blocked' not in ledger.status_writes[tid], (
+            f'{where}: written blocked at some point: {ledger.status_writes[tid]}'
+        )
+        assert ledger.escalations_by_task[tid] == (), (
+            f'{where}: escalations filed during the run: {ledger.escalations_by_task[tid]}'
+        )
+    assert ledger.end_of_run.paused is False, 'recovery: scheduler paused at end of run'

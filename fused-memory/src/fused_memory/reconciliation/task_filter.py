@@ -428,7 +428,7 @@ WIDE_CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'\.(?!\w)|[;\n!?]')
 #
 # Two consumers meet that test today; each states its own consequence at its
 # point of use rather than repeating the argument above:
-#   - reconciliation/stale_status_snapshot_edge_sweep._list_segment — closes a
+#   - reconciliation/status_snapshot_extraction.py::_list_segment — closes a
 #     segment from which BARE DIGITS are harvested as task ids, ending in
 #     memory_service.update_edge(invalid_at=...)
 #   - middleware/dependency_direction_check.extract_dependency_assertions —

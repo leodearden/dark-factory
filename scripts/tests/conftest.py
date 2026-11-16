@@ -38,7 +38,9 @@ merge-lane-throughput and speculation-depth suites.
 And `fake_claude_cli` / `pool_roster` / `sentinel_login` (task 6042): a
 JSON-mode fake `claude` binary keyed on the leased OAuth token, a hermetic
 account roster, and a decoy operator login, for the legibility suites that
-drive the shared session runner end to end.
+drive the shared session runner end to end. The real UsageGate those fixtures
+drive has its dead-PID probe-dir sweep confined by the plugin
+``pytest_configure`` arms (task 6275).
 """
 import json
 import os
@@ -91,13 +93,17 @@ from df_pytest_isolation import (  # noqa: E402
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     _df_no_leaked_drain_processes,  # noqa: F401  — the binding IS the wiring
     _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — binding IS wiring
+    arm_usage_gate_sweep_confinement,
     reject_unsafe_basetemp,
 )
 
 
 def pytest_configure(config):
-    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
+    """Refuse an unsafe --basetemp (esc-3072-3); arm the UsageGate probe-dir sweep confinement."""
     reject_unsafe_basetemp(config)
+    from shared import usage_gate
+
+    arm_usage_gate_sweep_confinement(config, usage_gate)
 
 
 # The fleet-deploy-clock redirect this directory relied on used to be defined

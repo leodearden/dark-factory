@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from _git_repo import make_repo
 from _in_dir import write_engagement
-from _stores import RunsDb, TasksDb
+from _stores import EscalationQueueDir, RunsDb, TasksDb
 
 from client_feed.contract import (
     INBOX_FILENAME,
@@ -150,6 +150,7 @@ def policy(tmp_path: Path, in_dir: Path) -> Policy:
     repo.commit('c1', when=T0)
     TasksDb.create(repo.root)
     RunsDb.create(repo.root)
+    EscalationQueueDir.create(repo.root)
     write_engagement(in_dir, project_id=PROJECT)
     out_dir = tmp_path / 'out'
     out_dir.mkdir()

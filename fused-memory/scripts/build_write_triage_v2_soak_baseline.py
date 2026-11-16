@@ -33,6 +33,10 @@ Subcommands, run from ``fused-memory/``:
   depend on the brief and keep their names.
   ``third``, ``rerate`` and ``assemble`` refuse while any line awaits a re-ask
   or any pair lacks a primary or second answer.
+- ``redigest --verdicts PATH...``: after a change to the amendment render
+  (``grouped_read.py::amendment_text``), re-derive DIGEST on each committed
+  verdicts file in place from the bundle's child texts (:func:`redigest`),
+  every rater answer untouched, and print a summary per file.
 
 Which v1 rows are held is measured on the lines rated under the round-0 brief
 alone, so a partial re-rate under a later brief cannot change it; the check
@@ -431,6 +435,31 @@ def _assembled_rater_row(
     return assembled
 
 
+def _rater_loss_yes(row: Mapping[str, Any]) -> bool:
+    return row['role'] != Role.DERIVED and row.get(Binary.LOSS) == Answer.YES
+
+
+def redigest(
+    verdicts: Iterable[Mapping[str, Any]], child_texts: Mapping[str, str],
+) -> list[dict[str, Any]]:
+    """*verdicts* in order, with DIGEST re-derived on every rater LOSS YES row from *child_texts*.
+
+    DIGEST is given exactly as :func:`assemble` gives it
+    (``write_triage_rating_rounds.py::with_digest``), so it follows the current
+    amendment render; a derived row never carries one, and every other key of
+    every row is kept as it was.
+    """
+    redigested = []
+    for row in verdicts:
+        if not _rater_loss_yes(row):
+            redigested.append(dict(row))
+            continue
+        if (child_text := child_texts.get(row['entry_id'])) is None:
+            raise ValueError(f'no child text for entry {row["entry_id"]!r}, whose row answers LOSS YES')
+        redigested.append(_rounds.with_digest(row, child_text))
+    return redigested
+
+
 def _verdict_order(row: Mapping[str, Any]) -> tuple[str, str, str, str]:
     return (row['entry_id'], row['target_id'], row['basis'], row['rater'])
 
@@ -586,10 +615,25 @@ def _rating_entries(
     return entries, sorted(unrecoverable)
 
 
-def _refuse_inside(parser: argparse.ArgumentParser, scratch: Path, bundle: Path) -> None:
-    scratch, bundle = scratch.resolve(), bundle.resolve()
-    if scratch == bundle or bundle in scratch.parents:
-        parser.error(f'--scratch {scratch} is inside the read-only --bundle {bundle}')
+def _refuse_writes_inside(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Refuse a run that would write into the read-only bundle, or rewrite a file of either input.
+
+    ``redigest`` rewrites every ``--verdicts`` path in place, so a mistyped one
+    naming a bundle or scratch file would otherwise be overwritten.
+    """
+    _refuse_inside(parser, ('--scratch', args.scratch), ('--bundle', args.bundle))
+    for path in args.verdicts if args.command == 'redigest' else ():
+        for root in (('--bundle', args.bundle), ('--scratch', args.scratch)):
+            _refuse_inside(parser, ('--verdicts', path), root)
+
+
+def _refuse_inside(
+    parser: argparse.ArgumentParser, written: tuple[str, Path], root: tuple[str, Path],
+) -> None:
+    (written_flag, written_path), (root_flag, root_path) = written, root
+    written_path, root_path = written_path.resolve(), root_path.resolve()
+    if written_path == root_path or root_path in written_path.parents:
+        parser.error(f'{written_flag} {written_path} is inside {root_flag} {root_path}')
 
 
 def _soak_key(scratch: _rounds.RatingScratch) -> dict[str, Any]:
@@ -730,6 +774,29 @@ def _assemble_command(args: argparse.Namespace) -> dict[str, Any]:
     return {'items': len(soak), 'verdicts': len(corpus.assembly.verdicts)}
 
 
+def _redigest_command(args: argparse.Namespace) -> dict[str, dict[str, int]]:
+    scratch = _rounds.RatingScratch(args.scratch, brief=args.brief)
+    soak = _SoakBundle.read(args.bundle).keyed_items(_soak_key(scratch))
+    child_texts = {soaked.item['entry_id']: soaked.child_text for soaked in soak}
+    return {str(path): _redigest_file(path, child_texts) for path in args.verdicts}
+
+
+def _redigest_file(path: Path, child_texts: Mapping[str, str]) -> dict[str, int]:
+    """Rewrite *path* through :func:`redigest`; what it holds and how many rows moved."""
+    before = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    after = redigest(before, child_texts)
+    _write_jsonl(path, after)
+    loss = [row for row in after if _rater_loss_yes(row)]
+    return {
+        'rows': len(after),
+        'loss_yes_rows': len(loss),
+        'digest_yes': sum(row['digest'] == Answer.YES for row in loss),
+        'digest_no': sum(row['digest'] == Answer.NO for row in loss),
+        'changed': sum(old != new for old, new in zip(before, after, strict=True)),
+        'longest_loss_child_chars': max((len(child_texts[row['entry_id']]) for row in loss), default=0),
+    }
+
+
 _SAMPLE_COUNTS = ('adjudicated', 'extension', 'unrecoverable')
 
 
@@ -757,7 +824,7 @@ def _write_json(path: Path, value: Any) -> None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     commands = parser.add_subparsers(dest='command', required=True)
-    for name in ('shards', 'reask', 'third', 'rerate', 'assemble'):
+    for name in ('shards', 'reask', 'third', 'rerate', 'assemble', 'redigest'):
         command = commands.add_parser(name)
         command.add_argument('--bundle', type=Path, required=True, metavar='DIR',
                              help="the soak bundle's correctness/ directory (read-only)")
@@ -779,13 +846,16 @@ def _build_parser() -> argparse.ArgumentParser:
         '--brief-version', required=True, metavar='LABEL',
         help="the label of --brief, e.g. v2.2; it names the re-rate and assemble's outputs")
     commands.choices['assemble'].add_argument('--out-dir', type=Path, required=True, metavar='DIR')
+    commands.choices['redigest'].add_argument(
+        '--verdicts', type=Path, nargs='+', required=True, metavar='PATH',
+        help='a committed verdicts JSONL file, rewritten in place')
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    _refuse_inside(parser, args.scratch, args.bundle)
+    _refuse_writes_inside(parser, args)
     if args.command == 'shards':
         args.history_db = args.history_db.expanduser()
         args.journal_db = args.journal_db.expanduser()
@@ -796,6 +866,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = _third_command(args)
     elif args.command == 'rerate':
         summary = _rerate_command(args)
+    elif args.command == 'redigest':
+        summary = _redigest_command(args)
     else:
         summary = _assemble_command(args)
     print(json.dumps(summary, indent=2))
