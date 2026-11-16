@@ -1523,19 +1523,19 @@ def _prescribed_reply():
     return json.loads(line)
 
 
-def _filled(field, value):
+def _filled(key, field, value):
     if value != "...":
         return value
     if field == "entry_id":
         return "one-shot-subagent-contract"
     if field.endswith("_phase"):
         return "unknown"
-    return f"populated {field}"
+    return f"populated {key} {field}"
 
 
 def test_a_reply_shaped_as_the_prompt_prescribes_reaches_the_merger():
     reply = {
-        key: [{field: _filled(field, value) for field, value in item.items()} for item in items]
+        key: [{field: _filled(key, field, value) for field, value in item.items()} for item in items]
         for key, items in _prescribed_reply().items()
     }
     populated = [

@@ -241,7 +241,7 @@ def _prescribed_reply() -> dict[str, list[dict[str, str | None]]]:
     return {
         _MATCHES_KEY: [{
             "entry_id": "...", "origin_phase": "...", "manifested_phase": "...",
-            "invariant_violated": None, "note": "...",
+            "invariant_violated": None, "note": "...", "evidence_quote": "...",
         }],
         _CANDIDATES_KEY: [{
             "title": "...", "cause": "...", "area": "...", "origin_phase": "...",
@@ -278,6 +278,9 @@ def build_prompt(
         "causes not yet in the codebook (candidates).\n\n"
         "Never guess a phase you can't support from the evidence — use "
         '"unknown" instead. Legal phase values: ' + phases + ".\n\n"
+        "Match an entry only when the digest shows the mechanism that "
+        "entry's title names, not merely a related theme, and copy the "
+        "digest text that shows it into the match's evidence_quote.\n\n"
         "Respond with STRICT JSON ONLY (no prose, no markdown fences), "
         "exactly this shape:\n"
         + json.dumps(_prescribed_reply()) + "\n"

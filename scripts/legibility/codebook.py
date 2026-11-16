@@ -177,6 +177,24 @@ _TASK_REF_SCHEMA = {
     "required": ["project_root", "task_id"],
 }
 
+SIGHTING_FITS_KEY = "sighting_fits"
+"""The entry key holding the census's fit verdict on each attached sighting
+(plans/census-incremental-prd.md C1). Checked by sighting_fit_errors."""
+
+_SIGHTING_FITS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "session": {"type": "string", "minLength": 1},
+            "exhibits": {"type": "boolean"},
+            "run_id": _RUN_ID_SCHEMA,
+            "reason": {"type": "string"},
+        },
+        "required": ["session", "exhibits", "run_id"],
+    },
+}
+
 ENTRY_SEVERITIES: tuple[str, ...] = ("high", "medium", "low")
 
 _ENTRY_SCHEMA = {
@@ -262,6 +280,7 @@ _MATCH_SCHEMA = {
         "manifested_phase": {"enum": PHASES},
         "invariant_violated": {"type": ["string", "null"]},
         "note": {"type": "string"},
+        "evidence_quote": {"type": "string"},
         "attached_by": _ATTACHED_BY_SCHEMA,
     },
     "required": ["entry_id"],
@@ -334,6 +353,7 @@ def _type_matches(value, type_spec) -> bool:
         "string": lambda v: isinstance(v, str),
         "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
         "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+        "boolean": lambda v: isinstance(v, bool),
         "null": lambda v: v is None,
     }
     return any(checks[t](value) for t in types if t in checks)
@@ -412,6 +432,30 @@ def filed_ticket_errors(row: Mapping[str, object]) -> list[str]:
     """The one statement of the C1 ``filed_tickets`` row invariant: validate()
     applies it to every entry's rows, and disposition.BackLink to itself."""
     return _validate_node(row, _FILED_TICKET_SCHEMA, ["filed_ticket"])
+
+
+def sighting_fit_errors(entry: Mapping[str, Any]) -> list[str]:
+    """The one statement of the C1 ``sighting_fits`` row invariant: each row
+    is well formed, names a session one of *entry*'s sightings carries, and
+    is that session's only row. validate() applies it to every entry, and
+    sighting_fit.check to each entry it stamps."""
+    location = f"entry {entry.get('id')!r}/{SIGHTING_FITS_KEY}"
+    rows = entry.get(SIGHTING_FITS_KEY, [])
+    errors = _validate_node(rows, _SIGHTING_FITS_SCHEMA, [location])
+    if not isinstance(rows, list):
+        return errors
+    sighted = set(sessions_of(entry))
+    seen: set[str] = set()
+    for index, row in enumerate(rows):
+        session = row.get("session") if isinstance(row, dict) else None
+        if not isinstance(session, str):
+            continue
+        if session not in sighted:
+            errors.append(f"{location}/{index}: session {session!r} is none of the entry's sightings")
+        if session in seen:
+            errors.append(f"{location}/{index}: session {session!r} already has a row")
+        seen.add(session)
+    return errors
 
 
 FINDING_IDENTITY_FIELDS = ("finding_key", "finding_area", "finding_anchor", "finding_tags")
@@ -495,7 +539,8 @@ def validate(codebook: dict) -> list[str]:
     id/title/severity/status, origin_phase/manifested_phase enums, sighting
     shape, candidate id regex + disposition, the optional C1 finding fields,
     finding_identity_errors, accepted ⇒ accepted_by, promoted ⇒ a
-    promoted_to naming an entry, the entry filing marker); permissive on v1
+    promoted_to naming an entry, the entry filing marker,
+    sighting_fit_errors); permissive on v1
     free-form fields (validate() never rejects on their presence, absence,
     or type).
     """
@@ -519,6 +564,7 @@ def validate(codebook: dict) -> list[str]:
                 seen_ids.add(entry_id)
             if entry.get("status") == "accepted" and "accepted_by" not in entry:
                 errors.append(f"entry {entry_id!r}: status 'accepted' requires accepted_by (contract §7)")
+            errors.extend(sighting_fit_errors(entry))
 
     candidates = codebook.get("candidates", []) if isinstance(codebook, dict) else []
     if isinstance(candidates, list):
