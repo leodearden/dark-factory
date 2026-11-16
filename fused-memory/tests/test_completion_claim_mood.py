@@ -1,11 +1,13 @@
-"""Unit tests for the completion-claim gate's non-assertive-mood filter (task 6677).
+"""Unit tests for the completion-claim gate's non-assertive-mood filter (tasks 6677 and 6824).
 
 A completion marker only makes a claim when the writer ASSERTS it. Quoted
 text, modal forms, conditional/interrogative/imperative scopes, present-tense
 temporal clauses and attributive participles mention a task's landing without
 asserting it, and the reify escalations behind this task
 (esc-unverified-claim-5471-*, -7407-3, -8246-5, -6020-2, -5023-2) were each
-tagged for exactly that confusion.
+tagged for exactly that confusion. Refs governed by a contingency, necessity or
+simulation head are covered too, as are premise notes whose 'dependency N' is
+the marker's true subject.
 
 Only the public :func:`extract_completion_claims` is driven here.
 """

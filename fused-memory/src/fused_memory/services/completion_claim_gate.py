@@ -36,7 +36,11 @@ A claim must also be ASSERTED (task 6677). A marker inside a quotation,
 governed by a modal, inside a conditional/interrogative, present-tense
 temporal or imperative scope, or in attributive position is not a claim. Nor is
 a bare participle after a temporal cue ('until merged') a claim about an earlier
-ref (task 7811). See tests/test_completion_claim_mood.py and
+ref (task 7811). A marker predicated of a ref that a contingency, necessity or
+simulation head governs ('depends on task N having landed', 'needs task N merged
+first', 'a mock of task N's edits merged') is not a claim either; nor is one after
+the determiner 'no' or a catch-up 'merged up to' (task 6824). See
+tests/test_completion_claim_mood.py and
 docs/completion-claim-mood-filter-2026-10/measurement.md.
 
 Verification is split from detection behind INJECTED probes (mirroring
