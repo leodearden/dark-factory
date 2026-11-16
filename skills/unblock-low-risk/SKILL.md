@@ -397,11 +397,13 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 ### Resuming a handed-off merge (resume mode)
 
 The escalation-watcher launches this skill in **resume mode** after a prior run returned
-`handed_off` (step 8's deadline disposition). Resume mode finishes that run's merge; it is not a
-second attempt.
+`handed_off`, either from step 8's deadline disposition or from step 9's `superseded` arm. Resume
+mode finishes that run's merge; it is not a second attempt.
 
-- **Inputs:** `task_id`, `escalation_id`, `project_root`, `worktree`, `request_id`. If any is
-  missing, ABORT without `merge_cancel`.
+- **Inputs:** `task_id`, `escalation_id`, `project_root`, `worktree`, `request_id`, and an
+  optional `superseded_by`. `superseded_by` is present exactly when the hand-off came from step
+  9's `superseded` arm, and is the `mr-*` or `coalesce-*` value that run read. If a required
+  input is missing, ABORT without `merge_cancel`.
 - **Skip** preconditions 0–6 and Procedure steps 1–7. **Never** call `merge_request`,
   `b3_gate check`, `record-launch` or `charge`: the fix is already committed, gated and charged,
   and the entry is already submitted. Re-charging would spend a second cap slot, and resubmitting
@@ -410,23 +412,33 @@ second attempt.
   If it is not, someone has taken the item: return `aborted` without `merge_cancel` and without
   touching the task, with a `reason` that says the escalation is no longer pending and names its
   status. The merge carries on, and whoever resolved the escalation owns it.
-- **Poll:** enter step 8's poll loop at its first `merge_status(request_id)` call (no submit), with
-  the resume parameters: `deadline = now() + 3 h`, cadence clamp [60 s, 300 s]. Past pickup there
-  is nothing left to cancel, and the remaining wait is a verify of about 50–60 min
-  (`plans/verify-admission-task-slots-gate.md`, M2); 3 h covers a verify plus a gate re-verify
-  with margin, at a cadence that keeps this sub-agent's context small. A wait over 120 s still
-  uses the foreground form of
+- **Poll** with the resume parameters: `deadline = now() + 3 h`, cadence clamp [60 s, 300 s].
+  Past pickup there is nothing left to cancel, and the remaining wait is a verify of about 50–60
+  min (`plans/verify-admission-task-slots-gate.md`, M2); 3 h covers a verify plus a gate
+  re-verify with margin, at a cadence that keeps this sub-agent's context small. A wait over
+  120 s still uses the foreground form of
   [Waiting between polls](../merge-queue/SKILL.md#waiting-between-polls), with an explicit Bash
-  `timeout` above the wait.
-- **At the resume deadline** step 8's deadline disposition applies unchanged: still `queued` →
-  `merge_cancel` and ABORT; picked up → `handed_off` again. The watcher does not launch a second
-  resume (its "Completion handling").
+  `timeout` above the wait. Where to start depends on `superseded_by`:
+  - **Without `superseded_by`:** enter step 8's poll loop at its first `merge_status(request_id)`
+    call (no submit).
+  - **With `superseded_by`:** do **not** poll `request_id`. It is already superseded, and a
+    coalesce-absorbed id answers an honest `unknown` that would wrongly route into step 9's
+    `unknown` arm. Instead re-enter step 9's `superseded` arm at "Resolve it by ancestry",
+    treating the given `superseded_by` as the value read. Keep its `mr-*`/`coalesce-*` reading
+    and every `coalesce-*` carve-out, including no self-stamp on either arm.
+- **At the resume deadline** step 8's deadline disposition applies unchanged to a request-id
+  resume: still `queued` → `merge_cancel` and ABORT; picked up → `handed_off` again. A superseded
+  resume whose successor is still unresolved returns `handed_off` again with the same
+  `request_id` and `superseded_by`. It never calls `merge_cancel`, whatever state the branch
+  handle reports. The watcher does not launch a second resume (its "Completion handling").
 - **Otherwise run step 9 exactly as written**, including [this skill's
   dispositions](#ladder-dispositions) on the ladder's verdicts. A polled `done` follows sub-step
   a's **Polled** bullet: recover the sha with the task-scoped merge-marker ladder
   ([Deriving the landed sha](#deriving-the-landed-sha)), stamp `kind` `"merged"` (or
   `"found_on_main"`, as that bullet allows), then run sub-steps b–d. The superseded and
-  `coalesce-*` arms keep polling to this run's polling deadline.
+  `coalesce-*` arms keep polling to this run's polling deadline. A `superseded` first seen during
+  a request-id resume takes that arm too, and at the resume deadline it hands off carrying
+  `superseded_by`.
 - Return per "Return value".
 
 ### Rebase recovery preflight
