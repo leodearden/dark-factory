@@ -44,7 +44,7 @@ wording, never a byte-size figure.
 
 from __future__ import annotations
 
-from _role_splice_contract import assert_opens_own_section
+from _role_splice_contract import assert_brace_free, assert_nonempty, assert_opens_own_section
 
 from orchestrator.agents.harness_guidance import (
     ERROR_REMEDY_HINT_GUIDANCE,
@@ -64,12 +64,10 @@ def test_error_remedy_hint_guidance_is_nonempty() -> None:
     constant is ever emptied. This one-line assertion is the sole guard
     against the guidance being silently dropped in a prompt refactor.
     """
-    assert ERROR_REMEDY_HINT_GUIDANCE.strip(), (
-        'ERROR_REMEDY_HINT_GUIDANCE is empty. Every containment test added '
-        'for this constant still passes when it is — the empty string is a '
-        'substring of anything — so this assertion is the sole guard '
-        'against the census-4964 guidance being silently dropped in a '
-        'prompt refactor.'
+    assert_nonempty(
+        'ERROR_REMEDY_HINT_GUIDANCE',
+        ERROR_REMEDY_HINT_GUIDANCE,
+        remedy='Restore the census-4964 guidance rather than letting a prompt refactor drop it.',
     )
 
 
@@ -101,13 +99,14 @@ def test_guidance_is_brace_free() -> None:
     nothing and keeps the constant interpolation-safe if a future splice
     site does use an f-string.
     """
-    assert '{' not in ERROR_REMEDY_HINT_GUIDANCE and (
-        '}' not in ERROR_REMEDY_HINT_GUIDANCE
-    ), (
-        'ERROR_REMEDY_HINT_GUIDANCE contains a literal brace. Role prompts '
-        'are deliberately not f-strings, but this constant is held '
-        'brace-free defensively so it stays interpolation-safe if a future '
-        'splice site needs it.'
+    assert_brace_free(
+        'ERROR_REMEDY_HINT_GUIDANCE',
+        ERROR_REMEDY_HINT_GUIDANCE,
+        remedy=(
+            'Role prompts are deliberately not f-strings, but this constant is '
+            'held brace-free defensively so it stays interpolation-safe if a '
+            'future splice site needs it.'
+        ),
     )
 
 
