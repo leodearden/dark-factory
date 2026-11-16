@@ -1,7 +1,8 @@
 """Tests for scripts/clear_leaked_claimants.py (task 4625).
 
 Every expectation is hand-derived from the tier table in
-docs/prds/claimant-invariant-enforcement.md D3, never computed by calling the
+docs/prds/claimant-invariant-enforcement.md D3 and the ledger of
+docs/prds/claimant-invariant-detection.md D-5, never computed by calling the
 shared predicates, and every store is a synthetic temp tasks.db.
 """
 from __future__ import annotations
