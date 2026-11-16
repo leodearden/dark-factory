@@ -242,11 +242,8 @@ def test_placement_immediately_follows_tool_call_rejection_guidance() -> None:
         follows=TOOL_CALL_REJECTION_GUIDANCE,
         follows_name='TOOL_CALL_REJECTION_GUIDANCE',
         remedy=(
-            'It must immediately follow TOOL_CALL_REJECTION_GUIDANCE in every '
-            'role that carries that block. A role reported ABSENT has dropped '
-            'the new block entirely, which '
-            'test_carried_by_exactly_the_tool_call_rejection_role_set also '
-            'reports as missing_new: restore the splice rather than moving '
-            'anything.'
+            'A role reported ABSENT also fails '
+            'test_carried_by_exactly_the_tool_call_rejection_role_set as '
+            'missing_new: restore the splice rather than moving anything.'
         ),
     )
