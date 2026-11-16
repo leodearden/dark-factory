@@ -15,8 +15,11 @@
 Precision over recall: the pads around '#' and ':' are space or tab, never a
 line break; the task word and the digits are ASCII; and the right edge refuses
 any word character, so a mixed digit run or a hash such as '8c7e163' yields
-nothing. The measured cases live in tests/test_canonical_labels.py, and the
-reasons in plans/review-all-s26-memory-service-write-path-and-graph-client-prd.md
+nothing. One accepted loss: '/' lists after the plural word ('tasks 2207/2210'),
+so a progress fraction there ('tasks 3/5 done') reads as two tasks; its head
+number was already one before lists were read. The measured cases live in
+tests/test_canonical_labels.py, and the reasons in
+plans/review-all-s26-memory-service-write-path-and-graph-client-prd.md
 §Rationale rehomed.
 """
 

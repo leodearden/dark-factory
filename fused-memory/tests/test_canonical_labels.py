@@ -1682,6 +1682,18 @@ class TestPluralTaskWordReadsTheWholeList:
     def test_the_list_stops_where_it_is_not_a_task_list(self, content):
         assert _node_names(scan_content(content, group_id='dark_factory').refs) == ['Task 5']
 
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            ('Tasks: 12/40 complete', ['Task 12', 'Task 40']),
+            ('tasks 3/5 done', ['Task 3', 'Task 5']),
+        ],
+    )
+    def test_a_progress_fraction_after_the_plural_word_reads_as_a_list(self, content, expected):
+        """Accepted: the slash lists siblings ('tasks 2207/2210'), and the
+        fraction's head number already read as a task before lists were read."""
+        assert _node_names(scan_content(content, group_id='dark_factory').refs) == expected
+
     def test_every_listed_number_contests_like_a_bare_mention(self):
         scan = scan_content('reify:2227 versus tasks 2226 and 2227', group_id='dark_factory')
         assert _node_names(scan.refs) == ['Task 2226']
