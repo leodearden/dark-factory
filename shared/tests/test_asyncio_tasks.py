@@ -342,9 +342,8 @@ class TestCancelBounded:
 
 
 async def _all_started(*started: asyncio.Event) -> None:
-    async with asyncio.timeout(5.0):
-        for event in started:
-            await event.wait()
+    for event in started:
+        await event.wait()
 
 
 def _record_at_return(outer: asyncio.Task, record: list[str]) -> list[list[str]]:

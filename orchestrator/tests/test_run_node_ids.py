@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from _poll_responsive import poll_responsive
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.verify import run_node_ids
@@ -442,12 +443,15 @@ def test_a_cancelled_concurrent_run_returns_only_after_a_group_only_sigkill_ends
             tree, _make_config(tree), [_module_config(module) for module in TWO_MODULES],
             [A_OK, B_OK], concurrent_groups=True,
         ))
-        async with asyncio.timeout(60.0):
-            while len(_spinning_pids(pids)) < len(TWO_MODULES):
-                if call.done():
-                    call.result()
-                    raise AssertionError('run_node_ids finished before both tests had started')
-                await asyncio.sleep(0.01)
+        def both_spinning() -> bool:
+            if len(_spinning_pids(pids)) == len(TWO_MODULES):
+                return True
+            if call.done():
+                call.result()
+                raise AssertionError('run_node_ids finished before both tests had started')
+            return False
+
+        await poll_responsive(both_spinning, label='both groups\' tests have written their pids')
         await asyncio.sleep(_SPAWN_RETURN_SECS)
         stubborn = _spinning_pids(pids)['pkg_a']
         alive_at_return: list[bool] = []
