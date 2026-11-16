@@ -558,6 +558,25 @@ class TestNonAssertiveScopes:
     def test_a_ref_governed_by_a_simulation_head_is_not_claimed(self, text):
         assert _triples(text) == []
 
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param(
+                '- 195: branch task/195 (6e75730) is merged up to aca7236 and waits on a '
+                'stale L2 escalation',
+                'solar_challenge',
+                id='esc-unverified-claim-195-2',
+            ),
+            pytest.param('branch task/5422 is merged up with main', 'reify', id='merged-up-with'),
+            pytest.param('task/5422 was merged up to main', 'reify', id='merged-up-to'),
+        ],
+    )
+    def test_a_catch_up_merge_into_a_branch_is_not_a_claim(self, text, project):
+        assert _triples(text, project) == []
+
+    def test_a_merge_into_main_is_still_a_claim(self):
+        assert _triples('task 5422 was merged into main') == [('applied_work', 'task', '5422')]
+
 
 _ESC_5471_1 = (
     '(3) PRD2 ε #5471 owns the shipped Bool-balance and stock-size examples, '
