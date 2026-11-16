@@ -292,6 +292,22 @@ class TestPricing:
 
         assert _estimate(data) == pytest.approx(expected, abs=1e-9)
 
+    def test_fable_5_2_list_rates_are_pinned(self) -> None:
+        """Published list price (unfitted): 8 in / 40 out / 0.20 read / 10 5m / 16 1h per 1M."""
+        usage = {
+            'input_tokens': 1_000_000,
+            'output_tokens': 1_000_000,
+            'cache_read_input_tokens': 1_000_000,
+            'cache_creation_input_tokens': 2_000_000,
+            'cache_creation': {
+                'ephemeral_1h_input_tokens': 1_000_000,
+                'ephemeral_5m_input_tokens': 1_000_000,
+            },
+        }
+        data = _result(total=1000.0, usage=usage, model_usage=_single_model('claude-fable-5-2'))
+
+        assert _estimate(data) == pytest.approx(8 + 40 + 0.20 + 10 + 16, abs=1e-9)
+
     def test_cache_write_without_a_split_is_priced_at_the_5m_rate(self) -> None:
         usage = {'cache_creation_input_tokens': 1_000_000}
         data = _result(total=1000.0, usage=usage, model_usage=_single_model('claude-opus-5'))

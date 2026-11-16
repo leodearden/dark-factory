@@ -472,6 +472,10 @@ ARCHITECT_EVAL_CONFIGS = [
     # fable-trial-v2 δ's stage-2 screen) — one extra live architect invocation
     # per fixture/trial cell for any campaign that pulls the full candidate set.
     EvalConfig('architect-fable-max', 'claude', 'claude-fable-5', 'max', role=RoleUnderTest.ARCHITECT),
+    # Fable 5.2 arms (task 10488): the newest Fable on the line. Separate names
+    # from the claude-fable-5 arms above, whose stored results are keyed by name.
+    EvalConfig('architect-fable52-high', 'claude', 'claude-fable-5-2', 'high', role=RoleUnderTest.ARCHITECT),
+    EvalConfig('architect-fable52-max', 'claude', 'claude-fable-5-2', 'max', role=RoleUnderTest.ARCHITECT),
 ]
 
 
