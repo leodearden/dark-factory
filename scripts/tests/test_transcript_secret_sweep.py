@@ -669,6 +669,14 @@ class TestDryRun:
         assert record['redacted']
 
 
+def test_a_run_with_no_poster_redacts_and_files_nothing(tree):
+    result = sweep.run(tree.config(), environ=ENVIRON, post_escalation=None)
+
+    assert result.escalation_error is None
+    assert {hit.path for hit in result.redacted} == {tree.pool_main, tree.pool_subagent, tree.openai}
+    assert POOL_A.encode() not in tree.pool_main.read_bytes()
+
+
 def test_a_failed_escalation_is_reported_and_the_redaction_still_stands(tree):
     result = sweep.run(tree.config(), environ=ENVIRON, post_escalation=FailingPoster())
 
@@ -686,13 +694,14 @@ def _served_tool_calls(server: StubMcpServer) -> list[tuple[str, dict]]:
     ]
 
 
-class TestMain:
-    @pytest.fixture
-    def secretless_environ(self, monkeypatch):
-        for name in list(os.environ):
-            if is_secret_env_name(name):
-                monkeypatch.delenv(name)
+@pytest.fixture
+def secretless_environ(monkeypatch):
+    for name in list(os.environ):
+        if is_secret_env_name(name):
+            monkeypatch.delenv(name)
 
+
+class TestMain:
     def _argv(
         self, tree: Tree | LogTree, tmp_path: Path, *, escalation_url: str = 'http://127.0.0.1:1/mcp'
     ) -> list[str]:
@@ -801,3 +810,95 @@ class TestMain:
         assert record['escalation_error'] is None
         assert {path: (path.read_bytes(), _identity(path)) for path in before} == before
         assert POOL_A[:16] not in out + err
+
+    def test_no_escalation_redacts_and_exits_0_with_no_server_listening(
+        self, secretless_environ, monkeypatch, tmp_path, capsys
+    ):
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', POOL_A)
+        tree = Tree(tmp_path)
+
+        assert sweep.main([*self._argv(tree, tmp_path), '--no-escalation']) == 0
+
+        out, err = capsys.readouterr()
+        (line,) = out.splitlines()
+        record = json.loads(line)
+        assert record['escalation_error'] is None
+        assert str(tree.pool_main) in {hit['path'] for hit in record['redacted']}
+        assert POOL_A.encode() not in tree.pool_main.read_bytes()
+        assert POOL_A not in out + err
+
+
+class TestHostConfigsDir:
+    """The laptop has no orchestrator units; its verify configs name its project roots."""
+
+    def _leaking_log(self, root: Path) -> Path:
+        return _write(verify_logs_dir(root) / '9000' / 'attempt-1.test-X.log', [f'E   {POOL_A}'])
+
+    def _argv(self, tmp_path: Path, configs: Path, *extra: str) -> list[str]:
+        empty_units = tmp_path / 'units'
+        empty_units.mkdir(exist_ok=True)
+        return [
+            '--units-dir', str(empty_units),
+            '--claude-projects-dir', str(tmp_path / 'no-claude'),
+            '--pytest-tmp-dir', str(tmp_path / 'no-pytest'),
+            '--host-configs-dir', str(configs),
+            '--min-age-secs', '0',
+            '--no-escalation',
+            *extra,
+        ]
+
+    @pytest.fixture
+    def configs(self, tmp_path: Path) -> Path:
+        configs = tmp_path / 'orchestrator'
+        configs.mkdir()
+        (configs / 'a.yaml').write_text(f'project_root: "{tmp_path / "proj"}"\n')
+        (configs / 'b.yaml').write_text('project_root: relative/proj\n')
+        (configs / 'c.yaml').write_text('max_concurrent_tasks: 2\n')
+        (configs / 'd.yaml').write_text('project_root: [unclosed\n')
+        (configs / 'a.yaml.bak-20261115').write_text(f'project_root: "{tmp_path / "old-proj"}"\n')
+        return configs
+
+    def test_each_host_configs_project_root_is_swept_and_backups_are_not(
+        self, secretless_environ, monkeypatch, tmp_path, capsys, configs
+    ):
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', POOL_A)
+        swept = self._leaking_log(tmp_path / 'proj')
+        backup_root_log = self._leaking_log(tmp_path / 'old-proj')
+        backup_content = backup_root_log.read_bytes()
+
+        assert sweep.main(self._argv(tmp_path, configs)) == 0
+
+        out, err = capsys.readouterr()
+        (line,) = out.splitlines()
+        assert [hit['path'] for hit in json.loads(line)['redacted']] == [str(swept)]
+        assert POOL_A.encode() not in swept.read_bytes()
+        assert backup_root_log.read_bytes() == backup_content
+        problems = err.splitlines()
+        for name in ('b.yaml', 'c.yaml', 'd.yaml'):
+            assert len([problem for problem in problems if f'{configs / name}' in problem]) == 1, name
+        assert not [problem for problem in problems if 'a.yaml' in problem]
+        assert POOL_A not in out + err
+
+    def test_a_root_named_twice_is_swept_once(self, secretless_environ, monkeypatch, tmp_path, capsys, configs):
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', POOL_A)
+        swept = self._leaking_log(tmp_path / 'proj')
+
+        argv = self._argv(tmp_path, configs, '--project-root', str(tmp_path / 'proj'))
+        assert sweep.main(argv) == 0
+
+        (line,) = capsys.readouterr().out.splitlines()
+        assert [hit['path'] for hit in json.loads(line)['redacted']] == [str(swept)]
+
+    def test_host_config_roots_names_every_problem_file_and_reads_absolute_roots(self, tmp_path, configs):
+        roots, problems = sweep.host_config_roots(configs)
+
+        assert roots == (tmp_path / 'proj',)
+        assert [problem.split(':')[0] for problem in problems] == [
+            str(configs / name) for name in ('b.yaml', 'c.yaml', 'd.yaml')
+        ]
+
+    def test_a_missing_configs_dir_is_one_problem(self, tmp_path):
+        roots, (problem,) = sweep.host_config_roots(tmp_path / 'absent')
+
+        assert roots == ()
+        assert str(tmp_path / 'absent') in problem
