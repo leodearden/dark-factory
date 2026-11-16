@@ -44,13 +44,39 @@ wording, never a byte-size figure.
 
 from __future__ import annotations
 
-from _role_splice_contract import assert_brace_free, assert_nonempty, assert_opens_own_section
+from _role_splice_contract import (
+    SpliceContract,
+    assert_brace_free,
+    assert_nonempty,
+    assert_opens_own_section,
+)
 
 from orchestrator.agents.harness_guidance import (
     ERROR_REMEDY_HINT_GUIDANCE,
     TOOL_CALL_REJECTION_GUIDANCE,
 )
-from orchestrator.agents.roles import ROLES
+from orchestrator.agents.roles import ROLES, AgentRole
+
+
+def _carries_tool_call_rejection_guidance(role: AgentRole) -> bool:
+    return TOOL_CALL_REJECTION_GUIDANCE in role.system_prompt
+
+
+#: This block travels with this set (see test_carried_by_exactly_the_tool_call_rejection_role_set).
+_TOOL_CALL_REJECTION_CARRIERS = frozenset(
+    name for name, role in ROLES.items() if _carries_tool_call_rejection_guidance(role)
+)
+
+# `roles` is DERIVED from `capability`, so `assert_role_set_matches_capability`
+# would compare the derivation with itself; it is deliberately never called here.
+_CONTRACT = SpliceContract(
+    constant_name='ERROR_REMEDY_HINT_GUIDANCE',
+    constant=ERROR_REMEDY_HINT_GUIDANCE,
+    roles=_TOOL_CALL_REJECTION_CARRIERS,
+    role_set_name='_TOOL_CALL_REJECTION_CARRIERS',
+    capability=_carries_tool_call_rejection_guidance,
+    capability_description='TOOL_CALL_REJECTION_GUIDANCE in its system_prompt',
+)
 
 
 def test_error_remedy_hint_guidance_is_nonempty() -> None:
@@ -126,9 +152,6 @@ def test_carried_by_exactly_the_tool_call_rejection_role_set() -> None:
     into `reviewer_comprehensive` here shows up as `extra_new` below,
     without a separate negative test duplicating that coverage.
     """
-    tcrg_carriers = {
-        name for name, role in ROLES.items() if TOOL_CALL_REJECTION_GUIDANCE in role.system_prompt
-    }
     new_carriers = {
         name for name, role in ROLES.items() if ERROR_REMEDY_HINT_GUIDANCE in role.system_prompt
     }
@@ -139,7 +162,7 @@ def test_carried_by_exactly_the_tool_call_rejection_role_set() -> None:
     # equality check below would hold VACUOUSLY (empty == empty) and this
     # test would pass on a total regression. This assertion is the sole
     # guard against that.
-    shared = tcrg_carriers & new_carriers
+    shared = _TOOL_CALL_REJECTION_CARRIERS & new_carriers
     assert shared, (
         'No role carries both TOOL_CALL_REJECTION_GUIDANCE and '
         'ERROR_REMEDY_HINT_GUIDANCE. The equality check below still passes '
@@ -148,8 +171,8 @@ def test_carried_by_exactly_the_tool_call_rejection_role_set() -> None:
         'prompt at once.'
     )
 
-    missing_new = sorted(tcrg_carriers - new_carriers)
-    extra_new = sorted(new_carriers - tcrg_carriers)
+    missing_new = sorted(_TOOL_CALL_REJECTION_CARRIERS - new_carriers)
+    extra_new = sorted(new_carriers - _TOOL_CALL_REJECTION_CARRIERS)
     assert missing_new == [] and extra_new == [], (
         f'ERROR_REMEDY_HINT_GUIDANCE carrier set diverges from '
         f'TOOL_CALL_REJECTION_GUIDANCE: missing_new={missing_new} (carry '
@@ -174,19 +197,14 @@ def test_guidance_appears_exactly_once_per_role() -> None:
     so a role that has not yet received the splice fails exactly one test
     for that one root cause instead of two. Mirrors the sibling module's
     `test_guidance_appears_exactly_once_per_role`.
-    """
-    offenders = {}
-    for name in sorted(ROLES):
-        count = ROLES[name].system_prompt.count(ERROR_REMEDY_HINT_GUIDANCE)
-        if count == 0:
-            continue
-        if count != 1:
-            offenders[name] = count
 
-    assert offenders == {}, (
-        f'Roles carrying more than one copy of ERROR_REMEDY_HINT_GUIDANCE: '
-        f'{offenders}. A stale duplicate splice was probably left beside a '
-        'new one — delete the extra copy.'
+    It iterates `_TOOL_CALL_REJECTION_CARRIERS`; a copy in any other role is
+    reported as `extra_new` by
+    `test_carried_by_exactly_the_tool_call_rejection_role_set`.
+    """
+    _CONTRACT.assert_spliced_exactly_once(
+        absent_ok=True,
+        remedy='Keep exactly one ERROR_REMEDY_HINT_GUIDANCE term per splice chain.',
     )
 
 
