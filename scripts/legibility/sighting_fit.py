@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from legibility import codebook, coder, filing_policy, prescreen, report_text
+from legibility import codebook, coder, filing_policy, prescreen, report_text, session_runner
 
 logger = logging.getLogger("legibility.census.sighting_fit")
 
@@ -163,26 +163,34 @@ def _fit_check(cb: Mapping[str, Any], entry: Mapping[str, Any], unchecked: Seque
     )
 
 
-def at_stake(cb: Mapping[str, Any], entries: Iterable[Mapping[str, Any]]) -> tuple[FitCheck, ...]:
-    """A FitCheck for each of *entries* below the singleton gate that its
-    unchecked sightings could carry over it: the only entries whose filing a
-    fit verdict decides."""
+Releases = Callable[[Mapping[str, Any], int], bool]
+"""``releases(entry, sighting_count)``: whether the filing gate files *entry*
+at *sighting_count* counted sessions."""
+
+
+def at_stake(
+    cb: Mapping[str, Any], entries: Iterable[Mapping[str, Any]], *, releases: Releases,
+) -> tuple[FitCheck, ...]:
+    """A FitCheck for each of *entries* the gate *releases* holds back at its
+    counted sessions but files once its unchecked sightings count too: the
+    only entries whose filing a fit verdict decides."""
     checks = []
     for entry in entries:
         entry_standings = standings(cb, entry)
         counted = sum(1 for standing in entry_standings.values() if standing in COUNTED)
         unchecked = [session for session, standing in entry_standings.items() if standing is Standing.UNCHECKED]
-        if counted < filing_policy.MIN_UNREMEDIATED_SIGHTINGS <= counted + len(unchecked):
+        if unchecked and not releases(entry, counted) and releases(entry, counted + len(unchecked)):
             checks.append(_fit_check(cb, entry, unchecked))
     return tuple(checks)
 
 
 def _judge(fit_check: FitCheck, fit_fn: FitFn, model: str) -> tuple[dict[str, FitVerdict], str | None]:
     """The first verdict *fit_fn* gives each offered session, or none and the
-    error when it fails: an unrun check only delays a filing."""
+    error when the judge was unreachable or gave no judgment: an unrun check
+    only delays a filing. Any other exception is a defect and propagates."""
     try:
         verdicts = tuple(fit_fn(fit_check, model=model))
-    except Exception as exc:  # any failure leaves the sightings unchecked, never crashes the census
+    except (session_runner.InvocationFailed, FitReplyError) as exc:
         logger.warning("sighting fit check for entry %r failed: %s", fit_check.entry_id, exc)
         return {}, f"{type(exc).__name__}: {exc}"
     offered = {offer.session for offer in fit_check.offered}

@@ -1291,7 +1291,11 @@ def plan_filing(
     # (plans/census-incremental-prd.md C1, L7).
     cb, fit_outcomes = sighting_fit.check(
         cb,
-        sighting_fit.at_stake(cb, census_filing.releasable_entries(list(placed.fileable), cb)),
+        sighting_fit.at_stake(
+            cb,
+            census_filing.withheld_awaiting_count(list(placed.fileable), cb),
+            releases=functools.partial(census_filing.entry_releases, cb),
+        ),
         fit_fn=effects.fit_fn,
         model=run.config.models.census_verify,
         run_id=run.run_id,

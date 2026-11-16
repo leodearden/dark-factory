@@ -7769,36 +7769,8 @@ def _matches_reply(entry_id):
     return {"matches": [{"entry_id": entry_id, "evidence_quote": "the same confusion again"}], "candidates": []}
 
 
-def _census_fit_fn(decide):
-    """A fit_fn whose verdicts are ``decide(check)``; it records each call."""
-    calls = []
-
-    def fit_fn(check, *, model):
-        calls.append({"check": check, "model": model})
-        return decide(check)
-
-    fit_fn.calls = calls
-    return fit_fn
-
-
-def _judging(*exhibits_by_position):
-    """Verdicts on a check's offered sightings, by position; every offered
-    sighting past the last given takes the last value."""
-    def decide(check):
-        return [
-            sighting_fit.FitVerdict(
-                session=offer.session,
-                exhibits=exhibits_by_position[min(index, len(exhibits_by_position) - 1)],
-                reason="judged from the quote",
-            )
-            for index, offer in enumerate(check.offered)
-        ]
-
-    return decide
-
-
 def _confirming_fit_fn():
-    return _census_fit_fn(_judging(True))
+    return reify_fit.recording_fit_fn(reify_fit.judging(True))
 
 
 def _recurrence_kwargs(tmp_path, first, *, reply, title=_GATED_TITLE, **overrides):
@@ -8057,9 +8029,12 @@ def _reify_entry(kwargs):
     return _persisted_entry(kwargs["codebook_path"], reify_fit.TITLE)
 
 
+def _persisted_sections(kwargs):
+    return census_report.census_report_sections(_run_record(kwargs))
+
+
 def _sighting_fit_section(kwargs) -> str:
-    report = kwargs["report_path"].read_text(encoding="utf-8")
-    return report.split("\n## Sighting Fit\n", 1)[1].split("\n## ", 1)[0]
+    return _section_text(_persisted_sections(kwargs), census_report.SECTION_SIGHTING_FIT)
 
 
 def test_run_census_keeps_the_reify_entry_withheld_without_a_fit_call(tmp_path):
@@ -8073,11 +8048,11 @@ def test_run_census_keeps_the_reify_entry_withheld_without_a_fit_call(tmp_path):
     record = _run_record(kwargs)
     assert record["sighting_fit"] == []
     assert "sighting-fit" not in record["cost_note"]
-    assert "## Sighting Fit" not in kwargs["report_path"].read_text(encoding="utf-8")
+    assert census_report.SECTION_SIGHTING_FIT not in [section.key for section in _persisted_sections(kwargs)]
 
 
 def test_run_census_stamps_refuted_fits_and_keeps_the_reify_entry_withheld(tmp_path):
-    fit_fn = _census_fit_fn(_judging(False))
+    fit_fn = reify_fit.recording_fit_fn(reify_fit.judging(False))
     kwargs = _reify_kwargs(tmp_path, reify_fit.reify_codebook_with_quotes(), fit_fn=fit_fn)
 
     outcome = _done(census_run.run_census(**kwargs))
@@ -8100,7 +8075,7 @@ def test_run_census_stamps_refuted_fits_and_keeps_the_reify_entry_withheld(tmp_p
 
 def test_run_census_files_the_reify_entry_once_a_fit_check_confirms_a_sighting(tmp_path):
     kwargs = _reify_kwargs(
-        tmp_path, reify_fit.reify_codebook_with_quotes(), fit_fn=_census_fit_fn(_judging(True, False)),
+        tmp_path, reify_fit.reify_codebook_with_quotes(), fit_fn=reify_fit.recording_fit_fn(reify_fit.judging(True, False)),
     )
 
     outcome = _done(census_run.run_census(**kwargs))
@@ -8113,9 +8088,11 @@ def test_run_census_files_the_reify_entry_once_a_fit_check_confirms_a_sighting(t
 
 def test_run_census_leaves_the_reify_entry_unchecked_when_the_fit_judge_fails(tmp_path):
     def unavailable(check):
-        raise RuntimeError("fit judge unavailable")
+        raise session_runner.InvocationFailed("fit judge unavailable")
 
-    kwargs = _reify_kwargs(tmp_path, reify_fit.reify_codebook_with_quotes(), fit_fn=_census_fit_fn(unavailable))
+    kwargs = _reify_kwargs(
+        tmp_path, reify_fit.reify_codebook_with_quotes(), fit_fn=reify_fit.recording_fit_fn(unavailable),
+    )
 
     outcome = _done(census_run.run_census(**kwargs))
 
@@ -8125,6 +8102,80 @@ def test_run_census_leaves_the_reify_entry_unchecked_when_the_fit_judge_fails(tm
     section = _sighting_fit_section(kwargs)
     assert "fit judge unavailable" in section
     assert all(session in section for session in reify_fit.MISATTACHED_SESSIONS)
+
+
+_FIT_ERROR = "InvocationFailed: fit judge unavailable"
+_UNREACHABLE_FIT = sighting_fit.FitOutcome(
+    entry_id=reify_fit.ENTRY_ID,
+    title=reify_fit.TITLE,
+    confirmed=(),
+    refuted=(),
+    unchecked=reify_fit.MISATTACHED_SESSIONS,
+    error=_FIT_ERROR,
+)
+
+
+def test_census_report_sections_sighting_fit_is_gated_and_positioned():
+    assert census_report.SECTION_SIGHTING_FIT not in _section_keys()
+    assert census_report.SECTION_SIGHTING_FIT not in _section_keys(fit_outcomes=())
+
+    keys = _section_keys(
+        withheld=(filing_policy.WithheldCluster(title=_GATED_TITLE, sighting_count=1),),
+        fit_outcomes=(_UNREACHABLE_FIT,),
+    )
+    assert keys.index(census_report.SECTION_WITHHELD) < keys.index(census_report.SECTION_SIGHTING_FIT)
+    assert keys.index(census_report.SECTION_SIGHTING_FIT) < keys.index(census_report.SECTION_COST)
+
+
+def test_census_report_sections_sighting_fit_renders_each_check_and_its_error():
+    record = _census_record(fit_outcomes=(_UNREACHABLE_FIT,))
+
+    section = _section(census_report.census_report_sections(record), census_report.SECTION_SIGHTING_FIT)
+
+    assert section.lines == tuple(sighting_fit.report_lines(record["sighting_fit"]))
+    assert reify_fit.TITLE in section.text
+    assert _FIT_ERROR in section.text
+
+
+def _reify_recurrence_reply(prompt, model):
+    if "s-recurrence" in prompt:
+        return json.dumps({
+            "matches": [],
+            "candidates": [{"title": reify_fit.TITLE, "origin_phase": "unknown", "manifested_phase": "unknown"}],
+        })
+    return _NO_JUDGMENT
+
+
+def _reify_codebook_with_a_fixed_twin() -> dict:
+    """The reify codebook plus a fixed entry of the same title, so a re-mined
+    cluster of that title is surfaced and verified, while the merge routes its
+    sighting to the open reify entry its promoted candidate points at."""
+    cb = reify_fit.reify_codebook_at_rest()
+    [entry] = cb["entries"]
+    twin = {key: value for key, value in copy.deepcopy(entry).items() if key != codebook.ENTRY_FILING_KEY}
+    cb["entries"].append({**twin, "id": "entry-fixed-twin", "status": "fixed", "sightings": []})
+    return cb
+
+
+def test_run_census_holds_back_a_verdict_dropped_on_an_entry_whose_other_sightings_carry_only_notes(tmp_path):
+    kwargs = _reify_kwargs(
+        tmp_path, _reify_codebook_with_a_fixed_twin(),
+        batch_source=[[_hand_digest("s-recurrence", "the same confusion again")]],
+        invoke=make_fake_invoke(_reify_recurrence_reply),
+        verify_fn=_make_fake_verify_fn(verified_titles={reify_fit.TITLE}, remediation=None),
+    )
+
+    outcome = _done(census_run.run_census(**kwargs))
+
+    dropped = _one_dropped(outcome)
+    assert (dropped.verdict, dropped.standing_id) == ("verified", reify_fit.CANDIDATE_ID)
+    persisted = codebook.load(kwargs["codebook_path"])
+    entry = codebook.record_by_id(persisted["entries"], reify_fit.ENTRY_ID, kind="entry")
+    assert census_filing.distinct_sessions(entry) >= filing_policy.MIN_UNREMEDIATED_SIGHTINGS
+    assert sighting_fit.counted_sessions(persisted, entry) == frozenset({reify_fit.FOUNDING_SESSION})
+    assert kwargs["effects"].submit_fn.calls == []
+    assert outcome.released_entry_ids == ()
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
 
 
 # ---------------------------------------------------------------------------

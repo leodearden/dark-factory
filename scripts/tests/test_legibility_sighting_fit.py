@@ -4,10 +4,11 @@ check that decides the ones a judgment attached."""
 from __future__ import annotations
 
 import copy
+import functools
 import json
 
 import pytest
-from legibility import census_filing, codebook, filing_policy, sighting_fit
+from legibility import census_filing, codebook, filing_policy, session_runner, sighting_fit
 from legibility.sighting_fit import FitReplyError, FitVerdict, OfferedSighting, Standing
 from legibility_sighting_fit_fixtures import (
     CAUSE,
@@ -18,6 +19,8 @@ from legibility_sighting_fit_fixtures import (
     MISATTACHED_NOTES,
     MISATTACHED_SESSIONS,
     TITLE,
+    judging,
+    recording_fit_fn,
     reify_codebook_at_rest,
     reify_codebook_with_quotes,
 )
@@ -143,10 +146,17 @@ def test_a_founding_session_stays_founding_whatever_a_row_says():
 # running the checks
 # ---------------------------------------------------------------------------
 
+def _at_stake(cb: dict, releases=None) -> tuple[sighting_fit.FitCheck, ...]:
+    """at_stake over the reify entry, gated as the census gates it unless
+    *releases* says otherwise."""
+    gate = functools.partial(census_filing.entry_releases, cb) if releases is None else releases
+    return sighting_fit.at_stake(cb, [_entry(cb)], releases=gate)
+
+
 def test_at_stake_offers_the_quoted_sightings_of_a_withheld_entry_one_short_of_the_gate():
     cb = reify_codebook_with_quotes()
 
-    [check] = sighting_fit.at_stake(cb, [_entry(cb)])
+    [check] = _at_stake(cb)
 
     assert check.entry_id == ENTRY_ID
     assert check.title == TITLE
@@ -162,7 +172,7 @@ def test_at_stake_offers_the_quoted_sightings_of_a_withheld_entry_one_short_of_t
 def test_at_stake_offers_nothing_when_no_sighting_quotes_evidence():
     cb = reify_codebook_at_rest()
 
-    assert sighting_fit.at_stake(cb, [_entry(cb)]) == ()
+    assert _at_stake(cb) == ()
 
 
 def test_at_stake_offers_nothing_for_an_entry_already_at_the_gate():
@@ -171,60 +181,56 @@ def test_at_stake_offers_nothing_for_an_entry_already_at_the_gate():
         _sighting("s-rule", attached_by={"method": "title", "run_id": _RUN_ID}),
     )
 
-    assert sighting_fit.at_stake(cb, [_entry(cb)]) == ()
+    assert _at_stake(cb) == ()
 
 
 def test_at_stake_offers_nothing_when_even_every_unchecked_sighting_stays_short(monkeypatch):
     monkeypatch.setattr(filing_policy, "MIN_UNREMEDIATED_SIGHTINGS", 5)
     cb = reify_codebook_with_quotes()
 
-    assert sighting_fit.at_stake(cb, [_entry(cb)]) == ()
+    assert _at_stake(cb) == ()
 
 
-def _fake_fit_fn(decide):
-    """A fit_fn whose verdicts are ``decide(check)``; it records each call."""
-    calls = []
-
-    def fit_fn(check, *, model):
-        calls.append((check, model))
-        return decide(check)
-
-    fit_fn.calls = calls
-    return fit_fn
+@pytest.mark.parametrize(
+    "releases",
+    [lambda entry, count: True, lambda entry, count: False],
+    ids=["gate-already-releases", "gate-never-releases"],
+)
+def test_at_stake_offers_nothing_whose_release_the_gate_does_not_turn_on_the_unchecked(releases):
+    assert _at_stake(reify_codebook_with_quotes(), releases) == ()
 
 
-def _refuting(check):
-    return [FitVerdict(session=offer.session, exhibits=False, reason="other probe") for offer in check.offered]
+def test_at_stake_asks_the_gate_at_the_counted_and_at_the_reachable_count():
+    asked = []
 
+    def releases(entry, count):
+        asked.append((entry["id"], count))
+        return count >= 3
 
-def _confirming_first(check):
-    first, *rest = check.offered
-    return [
-        FitVerdict(session=first.session, exhibits=True, reason="same probe"),
-        *(FitVerdict(session=offer.session, exhibits=False, reason="other probe") for offer in rest),
-    ]
+    [check] = _at_stake(reify_codebook_with_quotes(), releases)
+
+    assert check.entry_id == ENTRY_ID
+    assert asked == [(ENTRY_ID, 1), (ENTRY_ID, 1 + len(MISATTACHED_SESSIONS))]
 
 
 def _check(cb, fit_fn):
-    return sighting_fit.check(
-        cb, sighting_fit.at_stake(cb, [_entry(cb)]), fit_fn=fit_fn, model="m", run_id=_RUN_ID,
-    )
+    return sighting_fit.check(cb, _at_stake(cb), fit_fn=fit_fn, model="m", run_id=_RUN_ID)
 
 
 def test_check_stamps_a_refuting_row_per_offered_session_on_a_new_codebook():
     cb = reify_codebook_with_quotes()
     before = copy.deepcopy(cb)
-    fit_fn = _fake_fit_fn(_refuting)
+    fit_fn = recording_fit_fn(judging(False))
 
     stamped, [outcome] = _check(cb, fit_fn)
 
     assert cb == before
-    assert [model for _check_arg, model in fit_fn.calls] == ["m"]
+    assert [call["model"] for call in fit_fn.calls] == ["m"]
     rows = _entry(stamped)[codebook.SIGHTING_FITS_KEY]
     assert [(row["session"], row["exhibits"], row["run_id"]) for row in rows] == [
         (session, False, _RUN_ID) for session in MISATTACHED_SESSIONS
     ]
-    assert all(row["reason"] == "other probe" for row in rows)
+    assert all(row["reason"] == "judged from the quote" for row in rows)
     assert codebook.validate(stamped) == []
     assert sighting_fit.counted_sessions(stamped, _entry(stamped)) == frozenset({FOUNDING_SESSION})
     assert outcome.refuted == MISATTACHED_SESSIONS
@@ -234,7 +240,7 @@ def test_check_stamps_a_refuting_row_per_offered_session_on_a_new_codebook():
 
 
 def test_check_counts_a_confirmed_session():
-    stamped, [outcome] = _check(reify_codebook_with_quotes(), _fake_fit_fn(_confirming_first))
+    stamped, [outcome] = _check(reify_codebook_with_quotes(), recording_fit_fn(judging(True, False)))
 
     assert sighting_fit.counted_sessions(stamped, _entry(stamped)) == frozenset(
         {FOUNDING_SESSION, MISATTACHED_SESSIONS[0]}
@@ -250,7 +256,7 @@ def test_check_ignores_a_verdict_on_an_unoffered_session_and_leaves_an_omitted_o
             FitVerdict(session=MISATTACHED_SESSIONS[1], exhibits=False, reason="other probe"),
         ]
 
-    stamped, [outcome] = _check(reify_codebook_with_quotes(), _fake_fit_fn(decide))
+    stamped, [outcome] = _check(reify_codebook_with_quotes(), recording_fit_fn(decide))
 
     rows = _entry(stamped)[codebook.SIGHTING_FITS_KEY]
     assert [row["session"] for row in rows] == list(MISATTACHED_SESSIONS[:2])
@@ -267,18 +273,18 @@ def test_check_keeps_the_first_verdict_a_reply_gives_a_session():
             FitVerdict(session=session, exhibits=True, reason="second"),
         ]
 
-    stamped, _ = _check(reify_codebook_with_quotes(), _fake_fit_fn(decide))
+    stamped, _ = _check(reify_codebook_with_quotes(), recording_fit_fn(decide))
 
     [row] = _entry(stamped)[codebook.SIGHTING_FITS_KEY]
     assert (row["exhibits"], row["reason"]) == (False, "first")
 
 
-def test_check_leaves_every_offered_session_unchecked_when_the_fit_fn_raises():
+def test_check_leaves_every_offered_session_unchecked_when_the_judge_is_unreachable():
     def decide(check):
-        raise RuntimeError("judge unavailable")
+        raise session_runner.InvocationFailed("judge unavailable")
 
     cb = reify_codebook_with_quotes()
-    stamped, [outcome] = _check(cb, _fake_fit_fn(decide))
+    stamped, [outcome] = _check(cb, recording_fit_fn(decide))
 
     assert codebook.SIGHTING_FITS_KEY not in _entry(stamped)
     assert outcome.unchecked == MISATTACHED_SESSIONS
@@ -287,8 +293,16 @@ def test_check_leaves_every_offered_session_unchecked_when_the_fit_fn_raises():
     assert "judge unavailable" in outcome.error
 
 
+def test_check_lets_a_defect_in_the_fit_fn_propagate():
+    def decide(check):
+        raise TypeError("a fit_fn defect")
+
+    with pytest.raises(TypeError, match="a fit_fn defect"):
+        _check(reify_codebook_with_quotes(), recording_fit_fn(decide))
+
+
 def test_a_fit_outcome_record_is_json_safe():
-    _, [outcome] = _check(reify_codebook_with_quotes(), _fake_fit_fn(_confirming_first))
+    _, [outcome] = _check(reify_codebook_with_quotes(), recording_fit_fn(judging(True, False)))
 
     record = json.loads(json.dumps(outcome.to_record()))
 
@@ -318,8 +332,7 @@ def _fake_invoke(reply):
 
 
 def _reify_check():
-    cb = reify_codebook_with_quotes()
-    [check] = sighting_fit.at_stake(cb, [_entry(cb)])
+    [check] = _at_stake(reify_codebook_with_quotes())
     return check
 
 
@@ -429,7 +442,7 @@ def _bare_entry(entry_id: str, **fields) -> dict:
     }
 
 
-def test_releasable_entries_are_the_withheld_open_entries_no_fileable_cluster_releases():
+def test_withheld_awaiting_count_is_the_withheld_open_entries_no_fileable_cluster_releases():
     cb = reify_codebook_at_rest()
     withheld = {codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD}
     cb["entries"] += [
@@ -440,6 +453,25 @@ def test_releasable_entries_are_the_withheld_open_entries_no_fileable_cluster_re
     ]
     fileable = [({"title": "Confusion entry-named"}, "entry-named")]
 
-    releasable = census_filing.releasable_entries(fileable, cb)
+    awaiting = census_filing.withheld_awaiting_count(fileable, cb)
 
-    assert [entry["id"] for entry in releasable] == [ENTRY_ID, "entry-partially"]
+    assert [entry["id"] for entry in awaiting] == [ENTRY_ID, "entry-partially"]
+
+
+def test_an_entry_cluster_quotes_evidence_only_from_counted_sessions():
+    cb = reify_codebook_with_quotes()
+
+    cluster = census_filing.entry_cluster(cb, _entry(cb))
+
+    assert cluster["evidence"] == [FOUNDING_EVIDENCE]
+    assert len(cluster["sightings"]) == 1 + len(MISATTACHED_SESSIONS)
+
+
+def test_an_entry_cluster_quotes_a_confirmed_sighting_but_never_a_refuted_one():
+    confirmed, refuted, _unchecked = MISATTACHED_SESSIONS
+    cb = _with_fit_row(reify_codebook_with_quotes(), confirmed, exhibits=True)
+    cb = _with_fit_row(cb, refuted, exhibits=False)
+
+    cluster = census_filing.entry_cluster(cb, _entry(cb))
+
+    assert cluster["evidence"] == [FOUNDING_EVIDENCE, MISATTACHED_EVIDENCE[confirmed]]

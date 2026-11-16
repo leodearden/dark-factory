@@ -1,14 +1,16 @@
-"""The reify regression codebook for the sighting fit rule (task 6787): entry
-entry-cand-20260926-5 as it stood in reify's codebook, withheld with one
-verified founding session and three coder ``matches`` that do not exhibit its
-mechanism.
+"""Fixtures for the sighting fit rule tests (task 6787): the reify regression
+codebook, entry entry-cand-20260926-5 as it stood in reify's codebook, withheld
+with one verified founding session and three coder ``matches`` that do not
+exhibit its mechanism; and a fake fit judge.
 
 A plain module rather than a conftest fixture, like
 ``legibility_carrier_fixtures``: conftest appends this directory to
-``sys.path``, so the test files import it by bare name. Each function returns
-a fresh codebook.
+``sys.path``, so the test files import it by bare name. Each codebook function
+returns a fresh codebook.
 """
 from __future__ import annotations
+
+from legibility import sighting_fit
 
 ENTRY_ID = "entry-cand-20260926-5"
 CANDIDATE_ID = "cand-20260926-5"
@@ -145,3 +147,33 @@ def reify_codebook_with_quotes(*, project: str = "reify") -> dict:
     """The same entry, with each mis-attached sighting also quoting the
     command its session actually ran."""
     return _codebook(project, quoted=True)
+
+
+def judging(*exhibits_by_position: bool):
+    """A ``decide(check)`` giving verdicts on a check's offered sightings, by
+    position; every offered sighting past the last given takes the last value."""
+
+    def decide(check: sighting_fit.FitCheck) -> list[sighting_fit.FitVerdict]:
+        return [
+            sighting_fit.FitVerdict(
+                session=offer.session,
+                exhibits=exhibits_by_position[min(index, len(exhibits_by_position) - 1)],
+                reason="judged from the quote",
+            )
+            for index, offer in enumerate(check.offered)
+        ]
+
+    return decide
+
+
+def recording_fit_fn(decide):
+    """A fit_fn whose verdicts are ``decide(check)``; it records each call as
+    ``{"check": ..., "model": ...}`` in ``.calls``."""
+    calls = []
+
+    def fit_fn(check, *, model):
+        calls.append({"check": check, "model": model})
+        return decide(check)
+
+    fit_fn.calls = calls
+    return fit_fn
