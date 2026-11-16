@@ -1,14 +1,23 @@
-"""Starting a unit must not mutate the shared root .venv.
+"""Neither starting a unit nor running a checked-in shell script may mutate the shared root .venv.
 
 SCOPE, stated precisely because the honest boundary is narrower than the
 invariant one would want.  This module sweeps every committed unit whose start
 runs ``uv run``: in its ExecStart, or one level down, in the checkout's shell
 wrapper its ExecStart executes (read as text by shell_uv_run_sites, never run).
+A second arm sweeps every non-test ``*.sh`` the checkout lists, by content,
+whether or not a unit runs it.
 It does NOT follow a wrapper's own callees, a wrapper not named ``*.sh``, a uv
 the wrapper reaches through a variable whose name never mentions uv, or a
 ``*_CMD`` seam a unit overrides through ``Environment=`` (no committed unit
 does today).  Inside that boundary "cannot answer" raises rather than skips: a
 ``.sh`` the checkout does not hold, and a uv-then-``run`` the scan cannot read.
+Python code that BUILDS a ``uv run`` argv is invisible to a text scan of shell,
+so each such site is pinned at its own seam instead:
+tests/scripts/test_dashboard_watchdog.py::test_b4_ceiling_escalation_runs_uv_without_syncing_the_shared_venv,
+tests/scripts/test_watchdog_crash_loop.py::test_submit_argv_is_the_born_at_l2_shape
+and scripts/tests/test_sitting_nightly_prepare.py::test_the_prepare_command_never_syncs_the_shared_root_venv.
+Command examples in markdown are not swept, apart from the one unit copy-source
+FACTORY_INIT_REFERENCE names.
 Recording the boundary here is the point: a guard reporting green over what it
 never read is worse than one that says what it does not cover.
 
@@ -34,6 +43,7 @@ import dataclasses
 import pathlib
 import re
 import subprocess
+from collections.abc import Callable
 
 import pytest
 from git_listing import git, listed_files
@@ -302,7 +312,7 @@ def run_level_flags(args: list[str], command: str) -> list[str]:
 
 
 class UnreadableWrapper(ValueError):
-    """A followed wrapper holds a `uv run` this scan cannot read; the unit FAILS, never skips."""
+    """A shell script holds a `uv run` this scan cannot read; its case FAILS, never skips."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -455,18 +465,26 @@ def swept_paths() -> list[str]:
     return sorted([*discover_uv_run_units(), FACTORY_INIT_REFERENCE])
 
 
-def _uv_run_sites_of(rel_path: str) -> list[UvRunSite]:
-    """The `uv run` sites of *rel_path*, failing rather than returning none.
+def swept_cases() -> list:
+    """Every swept source paired with the reader that yields its `uv run` sites."""
+    return [pytest.param(p, uv_run_sites, id=p) for p in swept_paths()] + [
+        pytest.param(p, script_uv_run_sites, id=p) for p in discover_uv_run_scripts()
+    ]
 
-    swept_paths only yields paths whose start ran a `uv run`, so an empty list
-    here means a file changed shape between collection and the test body.
+
+def _uv_run_sites_of(
+    rel_path: str, read_sites: Callable[[str], list[UvRunSite]]
+) -> list[UvRunSite]:
+    """The `uv run` sites *read_sites* finds in *rel_path*, failing rather than returning none.
+
+    swept_cases only yields paths that ran a `uv run`, so an empty list here
+    means a file changed shape between collection and the test body.
     """
-    sites = uv_run_sites(rel_path)
+    sites = read_sites(rel_path)
     assert sites, (
-        f"{rel_path} was swept as a `uv run` unit but no longer runs `uv run` "
-        "directly or through its wrapper. It was discovered by its ExecStart= "
-        "and must not leave the sweep silently — check whether the command "
-        "shape changed."
+        f"{rel_path} was swept as running `uv run` but no longer runs `uv run`. "
+        "It was discovered by its ExecStart= or as a shell script and must not "
+        "leave the sweep silently — check whether the command shape changed."
     )
     return sites
 
@@ -583,13 +601,15 @@ def test_script_discovery_covers_every_known_uv_run_script() -> None:
     )
 
 
-@pytest.mark.parametrize("rel_path", swept_paths(), ids=lambda p: p)
-def test_uv_run_unit_passes_no_sync(rel_path: str) -> None:
-    """Every `uv run` a unit's start runs must carry `--no-sync` among its RUN-LEVEL flags."""
-    sites = _uv_run_sites_of(rel_path)
+@pytest.mark.parametrize(("rel_path", "read_sites"), swept_cases())
+def test_uv_run_site_passes_no_sync(
+    rel_path: str, read_sites: Callable[[str], list[UvRunSite]]
+) -> None:
+    """Every `uv run` a unit's start or a shell script runs must carry `--no-sync` among its RUN-LEVEL flags."""
+    sites = _uv_run_sites_of(rel_path, read_sites)
     missing = [s for s in sites if "--no-sync" not in s.flags]
     assert not missing, (
-        f"{rel_path} starts `uv run` without a run-level `--no-sync` at: "
+        f"{rel_path} runs `uv run` without a run-level `--no-sync` at: "
         f"{'; '.join(_describe(s) for s in missing)}. Without it, process "
         "start INSTALLS the named member's missing dependency closure into the "
         "ONE shared root .venv "
@@ -599,24 +619,26 @@ def test_uv_run_unit_passes_no_sync(rel_path: str) -> None:
         "measurement is in scripts/orchestrator-autopilot-video.service, above "
         "its ExecStart). The flag must sit BEFORE the command token, or uv "
         "never sees it. The accepted cost is that an unsynced venv now fails "
-        "the unit with ModuleNotFoundError instead of repairing itself; the "
+        "the command with ModuleNotFoundError instead of repairing itself; the "
         "repair path is scripts/sync-orchestrator-env.sh (`uv sync "
         "--all-packages`)."
     )
 
 
-@pytest.mark.parametrize("rel_path", swept_paths(), ids=lambda p: p)
-def test_uv_run_unit_carries_no_lockfile_flag(rel_path: str) -> None:
+@pytest.mark.parametrize(("rel_path", "read_sites"), swept_cases())
+def test_uv_run_site_carries_no_lockfile_flag(
+    rel_path: str, read_sites: Callable[[str], list[UvRunSite]]
+) -> None:
     """Beside `--no-sync`, a run-level `--frozen`/`--locked` is a no-op — so forbid it.
 
     Its own test rather than a second assert in the arm above: the two fail for
     different reasons, a reader of a failure should see which one fired, and the
     presence arm must stay green independently of this one.
     """
-    sites = _uv_run_sites_of(rel_path)
+    sites = _uv_run_sites_of(rel_path, read_sites)
     offending = [s for s in sites if {"--frozen", "--locked"} & set(s.flags)]
     assert not offending, (
-        f"{rel_path} starts `uv run` with a run-level `--frozen`/`--locked` at: "
+        f"{rel_path} runs `uv run` with a run-level `--frozen`/`--locked` at: "
         f"{'; '.join(_describe(s) for s in offending)}. `--no-sync` skips the LOCK step "
         "along with the sync, so both lockfile flags buy literally nothing next "
         "to it — measured, with the exit codes and the unchanged lockfile "
