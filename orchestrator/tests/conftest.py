@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import _async_mock_orphans
 import pytest
 import pytest_asyncio
+from _harness_store_paths import point_harness_stores_at
 from _live_mcp_guard import (
     REAL_MCP_SESSION_MARKER,
     assert_no_live_attempts,
@@ -486,16 +487,9 @@ def _no_mock_derived_stray_dirs(request):
     does not cascade into a failure for every subsequent test sharing the same
     xdist worker's CWD.
 
-    **Deliberately narrow — directory shape only.**  This does NOT match the
-    ``<MagicMock name='...' id='...'>`` FILE shape.  That is the
-    ``str(mock)``/repr shape, it is pre-existing on main and unrelated to task
-    3223 (produced by ``sqlite3.connect(str(...))`` at
-    ``park_eviction_requests.py:84``, not by ``safe_io``), and it is already
-    contained by the ``<MagicMock*`` entry at ``.gitignore:50`` — dozens of
-    such files currently sit untracked in the main checkout, so a guard
-    matching them would go red on day one for reasons this task cannot fix.
-    That pollution is tracked separately as follow-up ticket
-    ``tkt_0RRXS67RDHVVRVM811KFCAPSX8``.
+    **``os.fspath()`` shape only.**  This covers the ``MagicMock/`` tree; the
+    sibling :func:`_no_mock_repr_stray_entries` covers any file or directory
+    named by a mock's ``str()``/repr, ``<MagicMock name='...' id='...'>``.
     """
     yield
     stray = Path.cwd() / "MagicMock"
@@ -510,6 +504,49 @@ def _no_mock_derived_stray_dirs(request):
         "(e.g. `git_ops.project_root = tmp_path`) rather than leaving the "
         "attribute to auto-spec into a child mock. The stray tree has been "
         "removed so following tests are unaffected."
+    )
+
+
+#: The repr of every unittest.mock class, plus its sqlite -wal/-shm/-journal sidecars.
+_MOCK_REPR_ENTRY_GLOB = '<*Mock *'
+
+
+def _mock_repr_entries(directory: Path) -> frozenset[Path]:
+    return frozenset(directory.glob(_MOCK_REPR_ENTRY_GLOB))
+
+
+@pytest.fixture(autouse=True)
+def _no_mock_repr_stray_entries(request):
+    """Fail any test that leaves a NEW ``<...Mock ...>`` repr-named entry in the CWD.
+
+    ``str()`` of a mock is its repr, so a mock-derived path reaching
+    ``sqlite3.connect(str(...))`` or ``open()`` creates a real file named after
+    it.  Only entries absent from the setup snapshot are blamed and removed, so
+    strays that predate the test can neither turn it red nor cascade onto later
+    tests.  Pinned by ``test_mock_repr_stray_guard.py``.
+    """
+    cwd = Path.cwd()
+    before = _mock_repr_entries(cwd)
+    yield
+    new = sorted(_mock_repr_entries(cwd) - before)
+    if not new:
+        return
+    for entry in new:
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+    pytest.fail(
+        f"{request.node.nodeid} left mock-repr entries in {cwd}: "
+        f"{[entry.name for entry in new]}. str() of a MagicMock is its repr, so "
+        "a mock-derived path reaching sqlite3.connect(str(...)) or open() "
+        "creates a real file in the CWD. Give the mock a genuine path (e.g. "
+        "`req.config.project_root = tmp_path`); for a locally built Harness "
+        "config, call `_harness_store_paths.point_harness_stores_at(config, "
+        "tmp_path)` or use conftest's mock_orch_config. The entries have been "
+        "removed. Under xdist every worker shares this CWD, so a test running "
+        "concurrently on another worker may be the true source; rerun that "
+        "module with `-n 0` to attribute exactly."
     )
 
 
@@ -1138,9 +1175,8 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
       - ``sandbox.backend`` = 'auto'
       - ``fused_memory`` = pre-created sub-section mock (no default value)
       - ``escalation`` = pre-created sub-section mock (no default value)
-      - ``overrides_db_path`` = ``tmp_path / 'overrides.db'``
-      - ``park_eviction_requests_db_path`` = ``tmp_path / 'park_eviction_requests.db'``
-      - ``eligibility_clock_db_path`` = ``tmp_path / 'scheduler_eligibility.db'``
+      - every Harness-wired sqlite store's ``*_db_path`` under ``tmp_path``
+        (``_harness_store_paths.point_harness_stores_at``)
 
     The top-level mock and each sub-section (usage_cap, review, sandbox,
     fused_memory, escalation) are spec_set'd against their pydantic model's
@@ -1243,22 +1279,7 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # Always-on services (task 5344): no enable gate, so the interval must be real.
     config.merge_heartbeat_interval_secs = 15.0
     config.stale_service_restart_interval_secs = 15.0
-    # Real Path so OverrideStore.__init__ can call .parent.mkdir() and
-    # sqlite3.connect(str(...)) without crashing — config.overrides_db_path
-    # is a @property on OrchestratorConfig (see config.py) and Harness wires
-    # OverrideStore.from_config(config) at construction (task 1313).
-    config.overrides_db_path = tmp_path / 'overrides.db'
-    # Real Path so ParkEvictionRequestStore.from_config(config) can call
-    # .parent.mkdir() and sqlite3.connect(str(...)) without stringifying an
-    # unpatched MagicMock into a stray on-disk file — park_eviction_requests_db_path
-    # is a @property on OrchestratorConfig (see config.py) and Harness wires
-    # ParkEvictionRequestStore.from_config(config) at construction (task 1871).
-    # Same failure mode as overrides_db_path above (tasks 1313/1339); this
-    # instance of it is task 2045.
-    config.park_eviction_requests_db_path = tmp_path / 'park_eviction_requests.db'
-    # Real Path for EligibilityClockStore.from_config(config), which Harness
-    # wires at construction (task 3821); same stray-file failure mode as above.
-    config.eligibility_clock_db_path = tmp_path / 'scheduler_eligibility.db'
+    point_harness_stores_at(config, tmp_path)
     # Production default (task 4757). Unassigned, TaskWorkflow._invoke would
     # read a truthy Mock and run every mock-config workflow test strictly scoped.
     config.strict_mcp_config = False

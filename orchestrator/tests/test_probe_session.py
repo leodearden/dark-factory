@@ -62,3 +62,19 @@ def test_a_basetemp_smuggled_through_extra_is_refused_before_any_session_starts(
 
     assert extra[0] in str(refused.value)
     assert not basetemp.exists() and not smuggled.exists(), 'a session started anyway'
+
+
+def test_a_probe_session_runs_from_the_cwd_its_caller_names(tmp_path: Path) -> None:
+    cwd = tmp_path / 'cwd'
+    cwd.mkdir()
+
+    run = run_probe_session(
+        _PROBE, basetemp=tmp_path / 'probe-basetemp', kill_secs=60, backstop_secs=240,
+        cwd=cwd, extra=('--junitxml=cwd-marker.xml',),
+    )
+
+    assert run.returncode == 0, run.stdout[-3000:] + run.stderr[-2000:]
+    assert (cwd / 'cwd-marker.xml').is_file(), (
+        f'a relative --junitxml must resolve against the cwd the caller named ({cwd}); '
+        f'it holds {sorted(p.name for p in cwd.iterdir())}'
+    )
