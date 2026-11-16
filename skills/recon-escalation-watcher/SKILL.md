@@ -258,12 +258,12 @@ exists to prevent.
 |---|---|---|
 | `WATCHER_REARM_OUTCOME: FIRED` | 0 | Go to step 4 and drain. Exit 0 with EMPTY stdout is a caught SIGTERM (`escalation.watcher` converts it to a clean `sys.exit(0)`; `scripts/watcher-rearm.sh` header), a non-fire that counts against the cap: this queue's **sole closer** must not silently skip a cycle on it. |
 | `WATCHER_REARM_OUTCOME: CEILING` | 124 | The bounded slice expired. Not an error, no report: skip step 4, re-drain and re-arm. The cap exempts it. |
-| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Something reaped the background task (codebook `watcher-loop-harness-mismatch`). Re-touch the `recon-watcher-<project>` lease, then re-arm per the cap. Counts against the cap. |
+| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Something reaped the background task (codebook `watcher-loop-harness-mismatch`). If the CLI's task notification says it stopped the command at its background time limit, the Bash `timeout` was missing or shorter than the slice: re-arm with the step-2 value, a material change (the sibling skill's "Diagnostic — an arm stopped from outside"). Re-touch the `recon-watcher-<project>` lease, then re-arm per the cap. Counts against the cap. |
 | `WATCHER_REARM_OUTCOME: ERROR` | any other; exit 2 prints NO marker | Read the stderr diagnostic before any retry. Exit 2 is a usage/env guard (most often an unset `DARK_FACTORY_ROOT`, `plans/confusion-census-2026-07-24.md` §1.5): it returns *instantly*, before the watcher runs (`scripts/watcher-rearm.sh` header), and recurs until the invocation is fixed, so fix it instead of spending the retry on it. Every other rc counts against the cap. |
 
 **Identical-retry cap: 1.** After KILLED, ERROR, a missing marker or an
-empty-stdout FIRED, re-issue the identical invocation (same script, flags and
-background launch) at most once. If it fails again, change the invocation
+empty-stdout FIRED, re-issue the identical invocation (same script, flags,
+background launch and Bash `timeout`) at most once. If it fails again, change the invocation
 materially or stop the loop and report the outcome to the human; never loop on
 the identical call. Falling through to "re-drain and re-arm" on a failing
 launch turns a mis-configured launch into a hot busy-loop of failed invocations

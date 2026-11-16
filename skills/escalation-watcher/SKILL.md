@@ -504,9 +504,10 @@ A short slice buys no protection. A FOREGROUND call (debugging only) is capped b
 `timeout` of at least 600000 ms.
 
 **Diagnostic — an arm stopped from outside:** the wrapper prints `WATCHER_REARM_OUTCOME` on every
-exit path it controls, including its own timeout, so a missing line means the process group was
-killed from outside (the 07-09 exit-143 failure mode the wrapper exists to bound; it cannot bound a
-kill of the whole group). When the CLI's task notification says the command was stopped at its
+exit path it controls, including its own timeout, except the exit-2 guard error (the ERROR row
+above). So a missing line with any exit other than 2 means the process group was killed from
+outside (the 07-09 exit-143 failure mode the wrapper exists to bound; it cannot bound a kill of the
+whole group). When the CLI's task notification says the command was stopped at its
 background time limit, the Bash `timeout` was missing or shorter than the slice, whatever marker the
 wrapper printed: re-arm with `(--timeout + 60) × 1000` ms. This hides during a backlog drain, where
 every arm FIRES within seconds, and shows once the queue is triaged and the watcher genuinely waits.
