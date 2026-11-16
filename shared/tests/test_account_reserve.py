@@ -15,10 +15,12 @@ import pytest
 from shared.account_reserve import (
     ReserveConfig,
     ReserveEvent,
+    ScheduleDrift,
     WorkClass,
     WorkKind,
     admits,
     resolve_work_class,
+    schedule_drift,
 )
 
 
@@ -258,3 +260,44 @@ class TestAdmits:
         )
 
         assert admits(reserve_config(), steward_on_a_low_task, PROTECTED) is False
+
+
+class TestScheduleDrift:
+    """PRD §6.2 config; the configured reset nearest these banners is Mon 2026-11-23 21:00 UTC."""
+
+    @pytest.mark.parametrize(
+        'observed',
+        [
+            pytest.param(utc(2026, 11, 23, 22), id='an-hour-late'),
+            pytest.param(utc(2026, 11, 23, 20), id='an-hour-early'),
+            pytest.param(utc(2026, 11, 24, 0), id='exactly-three-hours-late'),
+        ],
+    )
+    def test_a_banner_off_by_more_than_half_an_hour_is_drift(self, observed: datetime) -> None:
+        assert schedule_drift(reserve_config(), observed) == ScheduleDrift(
+            configured_reset=utc(2026, 11, 23, 21), observed_reset=observed
+        )
+
+    @pytest.mark.parametrize(
+        'observed',
+        [
+            pytest.param(utc(2026, 11, 23, 21), id='on-time'),
+            pytest.param(utc(2026, 11, 23, 21, 10), id='ten-minutes-late'),
+            pytest.param(utc(2026, 11, 23, 21, 30), id='exactly-half-an-hour-late'),
+            pytest.param(utc(2026, 11, 24, 2), id='five-hours-late'),
+        ],
+    )
+    def test_a_banner_near_the_reset_or_far_from_it_is_not_drift(
+        self, observed: datetime
+    ) -> None:
+        assert schedule_drift(reserve_config(), observed) is None
+
+    def test_drift_is_measured_against_the_nearest_reset_in_any_week(self) -> None:
+        drift = schedule_drift(reserve_config(), utc(2026, 11, 16, 19, 30))
+
+        assert drift is not None
+        assert drift.configured_reset == utc(2026, 11, 16, 21)
+
+    def test_a_naive_banner_time_is_refused(self) -> None:
+        with pytest.raises(ValueError, match='timezone-aware'):
+            schedule_drift(reserve_config(), datetime(2026, 11, 23, 22))
