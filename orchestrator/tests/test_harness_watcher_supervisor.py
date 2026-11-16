@@ -36,6 +36,7 @@ from shared.repo_paths import DARK_FACTORY_ROOT_ENV
 from orchestrator.agents.skill_prompt import load_skill_system_prompt
 from orchestrator.agents.watcher_rearm_outcome_guidance import WATCHER_REARM_OUTCOME_GUIDANCE
 from orchestrator.config import OrchestratorConfig
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.harness import (
     _WATCHER_ALLOWED_TOOLS,
     _WATCHER_DISALLOWED_TOOLS,
@@ -2815,6 +2816,33 @@ class TestFileWatcherOutageL2:
 
         # Must not raise
         h._file_watcher_outage_l2('watcher_crashloop')
+
+    def test_filing_emits_escalation_created_for_the_l2(self, tmp_path: Path) -> None:
+        h, queue = _make_harness_with_queue(tmp_path)
+        h.event_store = MagicMock(spec=EventStore)
+
+        h._file_watcher_outage_l2('watcher_crashloop')
+
+        (l2,) = [e for e in queue.get_pending() if e.level == 2]
+        h.event_store.emit.assert_called_once()
+        (event_type,) = h.event_store.emit.call_args.args
+        assert event_type is EventType.escalation_created
+        assert h.event_store.emit.call_args.kwargs['task_id'] == h._WATCHER_OUTAGE_SENTINEL
+        data = h.event_store.emit.call_args.kwargs['data']
+        assert data['escalation_id'] == l2.id
+        assert (data['level'], data['severity']) == (2, 'urgent')
+        assert data['category'] == 'infra_issue'
+        assert data['reason'] == 'watcher-supervisor-outage'
+
+    def test_pending_count_failure_files_nothing_and_does_not_raise(
+        self, tmp_path: Path,
+    ) -> None:
+        h, queue = _make_harness_with_queue(tmp_path)
+
+        with patch.object(queue, 'get_pending', side_effect=RuntimeError('boom')):
+            h._file_watcher_outage_l2('watcher_crashloop')
+
+        assert queue.get_pending() == []
 
 
 # ---------------------------------------------------------------------------
