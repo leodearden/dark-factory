@@ -194,9 +194,11 @@ def test_guidance_appears_exactly_once_per_role() -> None:
     Scoped to catching a stale duplicate splice left beside a new one, NOT
     to enforcing presence — that is
     `test_carried_by_exactly_the_tool_call_rejection_role_set`'s job. A role
-    where the block is entirely absent is skipped here rather than flagged,
-    so a role that has not yet received the splice fails exactly one test
-    for that one root cause instead of two. Mirrors the sibling module's
+    where the block is entirely absent is skipped here rather than flagged.
+    Presence belongs to that test's `missing_new`, and
+    `test_placement_immediately_follows_tool_call_rejection_guidance` also
+    records it as ABSENT, so counting it here would make a third failure for
+    one root cause. Mirrors the sibling module's
     `test_guidance_appears_exactly_once_per_role`.
 
     It iterates `_TOOL_CALL_REJECTION_CARRIERS`; a copy in any other role is
@@ -216,10 +218,11 @@ def test_placement_immediately_follows_tool_call_rejection_guidance() -> None:
     block's, so a carrier that gained an out-of-place copy is still checked.
     A carrier where the new block is absent is recorded as an `'ABSENT'`
     offender rather than skipped, as `SpliceContract.assert_placement`
-    records it for every consumer, so this test cannot pass vacuously on its
-    own. Such a role also fails
+    records it for every consumer. Such a role also fails
     `test_carried_by_exactly_the_tool_call_rejection_role_set`'s
-    `missing_new` check.
+    `missing_new` check. If `TOOL_CALL_REJECTION_GUIDANCE` vanishes from
+    every role, the carrier set is empty and this test passes vacuously;
+    that test's `shared` guard is what catches it.
 
     Why the new block cannot be placed EARLIER: two pre-existing invariants
     constrain the front of every role prompt. For the 7 roles carrying
