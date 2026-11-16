@@ -34,12 +34,28 @@ from shared.secret_redaction import (
 
 VAR = 'CLAUDE_OAUTH_TOKEN_A'
 VALUE = 'sk-ant-oat01-' + 'f4ke' * 9
+API_KEY_VALUE = 'sk-ant-api03-' + hashlib.sha512(b'a live anthropic key').hexdigest()[:95]
+REFUSED_VALUE = '00e9' + 'X' * 40
 OLD_MTIME_NS = 1_700_000_000_123_456_789
 OLD_ATIME_NS = 1_700_000_100_987_654_321
 
 
 def _placeholder(var: str, length: int) -> bytes:
     return (f'<redacted:{var}>' + 'x' * length)[:length].encode()
+
+
+def _refused_lines() -> list[str]:
+    lines = [
+        json.dumps({'text': f'plain {REFUSED_VALUE} occurrence'}),
+        json.dumps({'text': 'café' + 'X' * 40}),
+        json.dumps({'text': f'another {REFUSED_VALUE}'}),
+    ]
+    assert '\\u00e9' + 'X' * 40 in lines[1], 'the value must sit inside a \\u escape'
+    return lines
+
+
+def _refused_needles():
+    return redaction_needles({VAR: REFUSED_VALUE})
 
 
 def _transcript_lines(value: str) -> list[str]:
@@ -185,41 +201,27 @@ class TestRedactInPlace:
 
 
 class TestRefusedLine:
-    VALUE = '00e9' + 'X' * 40
-
-    def _lines(self) -> list[str]:
-        lines = [
-            json.dumps({'text': f'plain {self.VALUE} occurrence'}),
-            json.dumps({'text': 'café' + 'X' * 40}),
-            json.dumps({'text': f'another {self.VALUE}'}),
-        ]
-        assert '\\u00e9' + 'X' * 40 in lines[1], 'the value must sit inside a \\u escape'
-        return lines
-
-    def _needles(self):
-        return redaction_needles({VAR: self.VALUE})
-
     def test_only_the_line_whose_rewrite_would_break_json_keeps_its_value(self, tmp_path):
-        path = _write(tmp_path / 'held' / 's.jsonl', self._lines())
+        path = _write(tmp_path / 'held' / 's.jsonl', _refused_lines())
         original = _lines(path)
 
-        result = redact_in_place(path, self._needles())
+        result = redact_in_place(path, _refused_needles())
 
         after = _lines(path)
         assert result.refused == (RefusedLine(2, VAR),)
         assert dict(result.counts) == {VAR: 2}
         assert after[1] == original[1]
-        assert self.VALUE.encode() not in after[0] + after[2]
+        assert REFUSED_VALUE.encode() not in after[0] + after[2]
         assert len(path.read_bytes()) == sum(len(line) + 1 for line in original)
         _assert_every_line_is_json(path)
         assert list(path.parent.iterdir()) == [path]
 
     def test_a_file_whose_only_hit_is_refused_is_not_rewritten(self, tmp_path):
-        path = _write(tmp_path / 'held' / 's.jsonl', [self._lines()[1]])
+        path = _write(tmp_path / 'held' / 's.jsonl', [_refused_lines()[1]])
         before = path.stat()
         content = path.read_bytes()
 
-        result = redact_in_place(path, self._needles())
+        result = redact_in_place(path, _refused_needles())
 
         after = path.stat()
         assert result.refused == (RefusedLine(1, VAR),)
@@ -229,8 +231,8 @@ class TestRefusedLine:
         assert list(path.parent.iterdir()) == [path]
 
     def test_raise_if_refused_names_the_path_line_and_variable_but_never_the_value(self, tmp_path):
-        path = _write(tmp_path / 'held' / 's.jsonl', self._lines())
-        result = redact_in_place(path, self._needles())
+        path = _write(tmp_path / 'held' / 's.jsonl', _refused_lines())
+        result = redact_in_place(path, _refused_needles())
 
         with pytest.raises(RedactionWouldCorruptJson) as excinfo:
             result.raise_if_refused(path)
@@ -241,7 +243,7 @@ class TestRefusedLine:
         assert str(path) in message
         assert 'line 2' in message
         assert VAR in message
-        assert self.VALUE not in message
+        assert REFUSED_VALUE not in message
 
     def test_raise_if_refused_is_silent_for_a_complete_redaction(self, tmp_path):
         path = _write(tmp_path / 's.jsonl', _transcript_lines(VALUE))
@@ -500,7 +502,7 @@ class TestTruncatedPrefix:
     diff) still leaks its head; a prefix followed by a truncation marker is a hit."""
 
     VAR = 'ANTHROPIC_API_KEY'
-    VALUE = 'sk-ant-api03-' + hashlib.sha512(b'a live anthropic key').hexdigest()[:95]
+    VALUE = API_KEY_VALUE
     PREFIX = VALUE[:40]
 
     def _needles(self, markup: Markup = Markup.TEXT, value: str | None = None):
@@ -665,27 +667,38 @@ class TestTruncatedPrefix:
                 assert head not in repr(needle)
 
     def test_a_refused_prefix_hit_names_the_variable_but_never_the_value(self, tmp_path):
-        value = '00e9' + 'X' * 40
         line = json.dumps({'text': 'café' + 'X' * 20 + '...'})
         assert '\\u00e9' + 'X' * 20 + '...' in line, 'the prefix must sit inside a \\u escape'
         path = _write(tmp_path / 's.jsonl', [line])
         content = path.read_bytes()
 
-        result = redact_in_place(path, redaction_needles({VAR: value}))
+        result = redact_in_place(path, _refused_needles())
 
         assert result.refused == (RefusedLine(1, VAR),)
         assert not result.redacted
         assert path.read_bytes() == content
         with pytest.raises(RedactionWouldCorruptJson) as excinfo:
             result.raise_if_refused(path)
-        assert value[:MIN_TRUNCATED_PREFIX_LEN] not in str(excinfo.value)
+        assert REFUSED_VALUE[:MIN_TRUNCATED_PREFIX_LEN] not in str(excinfo.value)
         assert VAR in str(excinfo.value)
+
+    @pytest.mark.parametrize('codec', [Codec.PLAIN, Codec.GZIP])
+    def test_a_lone_prefix_straddling_any_read_boundary_is_found(self, tmp_path, codec):
+        encode, decode = (gzip.compress, gzip.decompress) if codec is Codec.GZIP else (bytes, bytes)
+        for boundary in [2**k for k in range(12, 23)]:
+            path = tmp_path / f'straddle-{boundary}.log'
+            path.write_bytes(encode(b'a' * (boundary - 7) + f'{self.PREFIX}...'.encode() + b'a' * 4096 + b'\n'))
+
+            result = redact_in_place(path, self._needles(), codec=codec)
+
+            assert dict(result.counts) == {self.VAR: 1}, boundary
+            assert self.VALUE[:MIN_TRUNCATED_PREFIX_LEN].encode() not in decode(path.read_bytes()), boundary
 
 
 class TestPreviewRedaction:
     """``preview_redaction`` reports what ``redact_in_place`` would and writes nothing."""
 
-    VALUE = TestTruncatedPrefix.VALUE
+    VALUE = API_KEY_VALUE
 
     def _lines(self) -> list[str]:
         return [
@@ -723,12 +736,11 @@ class TestPreviewRedaction:
         self._assert_untouched(path, content, before)
 
     def test_a_refused_line_is_reported_and_the_file_left_untouched(self, tmp_path):
-        refused = TestRefusedLine()
-        path = _write(tmp_path / 'held' / 's.jsonl', refused._lines())
+        path = _write(tmp_path / 'held' / 's.jsonl', _refused_lines())
         before = path.stat()
         content = path.read_bytes()
 
-        preview = preview_redaction(path, refused._needles())
+        preview = preview_redaction(path, _refused_needles())
 
         assert preview.refused == (RefusedLine(2, VAR),)
         assert dict(preview.counts) == {VAR: 2}
