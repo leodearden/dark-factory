@@ -4806,12 +4806,32 @@ down escalation server is swallowed. So a night with a finding leaves the
 unit `failed`. That is the alarm, not a broken unit, and the liveness probe
 below tells the two apart.
 
-**Why no `--check-preventer`.** The comment in
-`legibility-transcript-check@.service` (task 2901 DD2) says the 2893 guard
-regex missed `spawn-claude.sh`'s mid-line export, so the flag would make the
-timer exit 1 every night. Task 2923 fixed that regex on 2026-07-23. Measured
-on 2026-09-24, the guard finds the export, so the comment is stale. Whether to
-enable the flag is an open decision owned by task 5859.
+**Why no `--check-preventer`.** With the flag, the detector also exits 1 when `skills/spawn/spawn-claude.sh` stops
+exporting `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`. Task 5859 decided to
+leave it off. The reason task 2901 gave (DD2: the guard regex missed the
+script's mid-line export, so the timer would exit 1 every night) has been
+false since task 2923 fixed the regex on 2026-07-23, and
+`scripts/tests/test_legibility_transcript_persistence.py::test_main_check_preventer_passes_on_committed_spawn_script`
+now pins that the guard recognises the committed script. The current
+reasons:
+
+- **The export is already a merge gate.**
+  `tests/scripts/test_spawn_claude.py::test_spawn_exports_session_and_parent_ids`
+  and `::test_spawn_id_exports_fail_soft_when_registry_faults` run the real
+  script against a fake `claude` and assert the child sees the variable set
+  to `1`, so a change that drops the export cannot land. The nightly guard
+  would only re-check a tracked file after the fact, by regex.
+- **A preventer-only failure files nothing.** `run_check` POSTs only when
+  there is a lost-transcript finding, and the liveness probe reads exit 1 as
+  ALIVE, so no reader is bound to that exit.
+- **It would give exit 1 a second meaning**, where this section and the
+  probe read it as a lost-transcript finding.
+- **It is not per-project.** The guard reads the dark-factory checkout's
+  spawn script whatever `%i` names, so the `dark_factory` and `reify`
+  instances would both report the same fact.
+
+The r6 chain carrier (task 4681, below) runs the same command without the
+flag and inherits this decision.
 
 | File | Role |
 |---|---|
