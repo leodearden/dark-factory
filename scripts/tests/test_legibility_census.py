@@ -32,6 +32,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
+import legibility_sighting_fit_fixtures as reify_fit
 import pytest
 import yaml
 from legibility import (
@@ -61,6 +62,7 @@ from legibility import (
     prescreen,
     session_ledger,
     session_runner,
+    sighting_fit,
     similarity,
     state_docs,
     synthesis,
@@ -2513,6 +2515,7 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
             gate=_passing_gate,
             commit=_poison("commit"),
             roll_back=_poison("roll_back"),
+            fit_fn=_poison("fit_fn"),
         ),
         codebook_dict=_minimal_v2_codebook(),
         config=_census_config(tmp_path),
@@ -7763,7 +7766,39 @@ def _withheld_entry_id(first, title=_GATED_TITLE):
 
 
 def _matches_reply(entry_id):
-    return {"matches": [{"entry_id": entry_id}], "candidates": []}
+    return {"matches": [{"entry_id": entry_id, "evidence_quote": "the same confusion again"}], "candidates": []}
+
+
+def _census_fit_fn(decide):
+    """A fit_fn whose verdicts are ``decide(check)``; it records each call."""
+    calls = []
+
+    def fit_fn(check, *, model):
+        calls.append({"check": check, "model": model})
+        return decide(check)
+
+    fit_fn.calls = calls
+    return fit_fn
+
+
+def _judging(*exhibits_by_position):
+    """Verdicts on a check's offered sightings, by position; every offered
+    sighting past the last given takes the last value."""
+    def decide(check):
+        return [
+            sighting_fit.FitVerdict(
+                session=offer.session,
+                exhibits=exhibits_by_position[min(index, len(exhibits_by_position) - 1)],
+                reason="judged from the quote",
+            )
+            for index, offer in enumerate(check.offered)
+        ]
+
+    return decide
+
+
+def _confirming_fit_fn():
+    return _census_fit_fn(_judging(True))
 
 
 def _recurrence_kwargs(tmp_path, first, *, reply, title=_GATED_TITLE, **overrides):
@@ -7787,6 +7822,7 @@ def _recurrence_kwargs(tmp_path, first, *, reply, title=_GATED_TITLE, **override
         submit_fn=_make_fake_submit_fn(),
         escalate_fn=_make_fake_escalate_fn(),
         commit=_make_fake_commit(),
+        fit_fn=_confirming_fit_fn(),
         date="2026-07-21",
         report_path=tmp_path / "confusion-census-2026-07-21.md",
     )
@@ -7992,6 +8028,103 @@ def test_run_census_never_files_a_recurring_legacy_entry(tmp_path):
 
     assert kwargs["effects"].submit_fn.calls == []
     assert outcome.released_entry_ids == ()
+
+
+# ---------------------------------------------------------------------------
+# task 6787: a withheld entry's count includes only founding, rule-attached and
+# fit-confirmed sightings, and the census checks fit where a release is at stake.
+# ---------------------------------------------------------------------------
+
+_NO_JUDGMENT = json.dumps({"matches": [], "candidates": []})
+
+
+def _reify_kwargs(tmp_path, cb, **overrides):
+    """A census over *cb* whose one digest codes to nothing."""
+    kwargs = dict(
+        codebook_dict=cb,
+        batch_source=[[_hand_digest("s-unrelated", "an unrelated session")]],
+        invoke=make_fake_invoke(default=_NO_JUDGMENT),
+        verify_fn=_make_fake_verify_fn(remediation=None),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        escalate_fn=_make_fake_escalate_fn(),
+        commit=_make_fake_commit(),
+    )
+    kwargs.update(overrides)
+    return _run_census_kwargs(tmp_path, **kwargs)
+
+
+def _reify_entry(kwargs):
+    return _persisted_entry(kwargs["codebook_path"], reify_fit.TITLE)
+
+
+def _sighting_fit_section(kwargs) -> str:
+    report = kwargs["report_path"].read_text(encoding="utf-8")
+    return report.split("\n## Sighting Fit\n", 1)[1].split("\n## ", 1)[0]
+
+
+def test_run_census_keeps_the_reify_entry_withheld_without_a_fit_call(tmp_path):
+    kwargs = _reify_kwargs(tmp_path, reify_fit.reify_codebook_at_rest())
+
+    outcome = _done(census_run.run_census(**kwargs))
+
+    assert kwargs["effects"].submit_fn.calls == []
+    assert outcome.released_entry_ids == ()
+    assert _reify_entry(kwargs)[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
+    record = _run_record(kwargs)
+    assert record["sighting_fit"] == []
+    assert "sighting-fit" not in record["cost_note"]
+    assert "## Sighting Fit" not in kwargs["report_path"].read_text(encoding="utf-8")
+
+
+def test_run_census_stamps_refuted_fits_and_keeps_the_reify_entry_withheld(tmp_path):
+    fit_fn = _census_fit_fn(_judging(False))
+    kwargs = _reify_kwargs(tmp_path, reify_fit.reify_codebook_with_quotes(), fit_fn=fit_fn)
+
+    outcome = _done(census_run.run_census(**kwargs))
+
+    assert kwargs["effects"].submit_fn.calls == []
+    assert outcome.released_entry_ids == ()
+    entry = _reify_entry(kwargs)
+    assert entry[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_WITHHELD
+    assert [(row["session"], row["exhibits"], row["run_id"]) for row in entry[codebook.SIGHTING_FITS_KEY]] == [
+        (session, False, kwargs["run_id"]) for session in reify_fit.MISATTACHED_SESSIONS
+    ]
+    [call] = fit_fn.calls
+    assert call["model"] == kwargs["config"].models.census_verify
+    record = _run_record(kwargs)
+    [fit] = record["sighting_fit"]
+    assert (fit["entry_id"], fit["refuted"]) == (reify_fit.ENTRY_ID, list(reify_fit.MISATTACHED_SESSIONS))
+    assert f"{kwargs['config'].models.census_verify} sighting-fit=1" in record["cost_note"]
+    assert reify_fit.TITLE in _sighting_fit_section(kwargs)
+
+
+def test_run_census_files_the_reify_entry_once_a_fit_check_confirms_a_sighting(tmp_path):
+    kwargs = _reify_kwargs(
+        tmp_path, reify_fit.reify_codebook_with_quotes(), fit_fn=_census_fit_fn(_judging(True, False)),
+    )
+
+    outcome = _done(census_run.run_census(**kwargs))
+
+    [filed] = kwargs["effects"].submit_fn.calls
+    assert filed["title"] == f"[legibility census] {reify_fit.TITLE}"
+    assert outcome.released_entry_ids == (reify_fit.ENTRY_ID,)
+    assert _reify_entry(kwargs)[codebook.ENTRY_FILING_KEY] == codebook.ENTRY_FILING_FILED
+
+
+def test_run_census_leaves_the_reify_entry_unchecked_when_the_fit_judge_fails(tmp_path):
+    def unavailable(check):
+        raise RuntimeError("fit judge unavailable")
+
+    kwargs = _reify_kwargs(tmp_path, reify_fit.reify_codebook_with_quotes(), fit_fn=_census_fit_fn(unavailable))
+
+    outcome = _done(census_run.run_census(**kwargs))
+
+    assert kwargs["effects"].submit_fn.calls == []
+    assert outcome.released_entry_ids == ()
+    assert codebook.SIGHTING_FITS_KEY not in _reify_entry(kwargs)
+    section = _sighting_fit_section(kwargs)
+    assert "fit judge unavailable" in section
+    assert all(session in section for session in reify_fit.MISATTACHED_SESSIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -8333,6 +8466,7 @@ def test_run_census_files_a_released_legacy_entry_without_a_key(tmp_path):
         synthesize_fn=_make_fake_synthesize_fn(),
         escalate_fn=_make_fake_escalate_fn(),
         commit=_make_fake_commit(),
+        fit_fn=_confirming_fit_fn(),
     )
 
     census_run.run_census(**kwargs)
@@ -9588,8 +9722,11 @@ def test_run_census_does_not_refile_a_recurring_abandoned_entry_the_curator_refu
 def test_run_census_carries_a_present_reverify_onto_a_released_withheld_entry(tmp_path):
     sightings = [
         {"date": "2026-07-01", "project": "dark_factory", "session": session,
-         "origin_phase": "implement", "manifested_phase": "merge"}
-        for session in ("s-old-1", "s-old-2")
+         "origin_phase": "implement", "manifested_phase": "merge", **attach}
+        for session, attach in (
+            ("s-old-1", {}),
+            ("s-old-2", {"attached_by": {"method": "title", "run_id": "census-dark_factory-20260701"}}),
+        )
     ]
     kwargs = _outcome_kwargs(
         tmp_path, "present", sightings=sightings, **{codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD},
