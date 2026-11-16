@@ -8,10 +8,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 import shared.project_layout
-from orchestrator.evals import paths
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, CheckoutRootError
+
+from orchestrator.evals import paths
 
 
 @pytest.fixture
