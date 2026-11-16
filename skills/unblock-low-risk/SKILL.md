@@ -1,6 +1,6 @@
 ---
 name: unblock-low-risk
-description: "Autonomous, NON-INTERACTIVE unblock of a single blocked task — but ONLY when the orchestrator's at-block-time dry-run investigation labelled the fix `risk_label == 'low'`. This is the unattended counterpart to /unblock, built for AFK windows: the L2 escalation-watcher launches it as a sub-agent (no terminal) for `task_failure`/`review_issues` escalations whose latest `metadata.dry_run_proposals[-1]` is low-risk and fresh. It re-derives the fix from the proposal prose, applies it scoped to `files_referenced`, runs the project verify suite, and merges via the orchestrator merge queue — aborting cleanly (leaving the escalation pending for a human) on ANY doubt: non-low risk, stale proposal, scope creep, rebase conflict, verify failure, or a merge-queue result other than done. A merge the worker has already picked up and is still live at the polling ceiling is handed back to the watcher (outcome handed_off), never cancelled. It NEVER touches main directly, never --no-verify, never retries. NOT for: medium / human-review-required proposals, interactive unblocking (use /unblock), any task without a low-risk dry-run proposal, or post-merge-red-main fix-forward tasks (block reason starts with 'Post-merge unscoped type-check failed' — b3_gate.check_proposal hard-ABORTs this entire class regardless of risk_label; see task 1680)."
+description: "Autonomous, NON-INTERACTIVE unblock of a single blocked task — but ONLY when the orchestrator's at-block-time dry-run investigation labelled the fix `risk_label == 'low'`. This is the unattended counterpart to /unblock, built for AFK windows: the L2 escalation-watcher launches it as a sub-agent (no terminal) for `task_failure`/`review_issues` escalations whose latest `metadata.dry_run_proposals[-1]` is low-risk and fresh. It re-derives the fix from the proposal prose, applies it scoped to `files_referenced`, runs the project verify suite, and merges via the orchestrator merge queue — aborting cleanly (leaving the escalation pending for a human) on ANY doubt: non-low risk, stale proposal, scope creep, rebase conflict, verify failure, or a merge-queue result other than done. A merge the worker has already picked up and is still live at the polling ceiling is handed back to the watcher (outcome handed_off), never cancelled; a submission superseded by a successor still unresolved at the ceiling is handed back the same way. It NEVER touches main directly, never --no-verify, never retries. NOT for: medium / human-review-required proposals, interactive unblocking (use /unblock), any task without a low-risk dry-run proposal, or post-merge-red-main fix-forward tasks (block reason starts with 'Post-merge unscoped type-check failed' — b3_gate.check_proposal hard-ABORTs this entire class regardless of risk_label; see task 1680)."
 ---
 
 # Unblock — Low-Risk (autonomous, non-interactive)
@@ -169,8 +169,9 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    Completion is observed via `merge_status` polling (not a blocking return); outcomes that cost a
    slot: `{'error': ...}` (orchestrator down), or a polled/resolved state of `conflict`, `blocked`,
    `abandoned`, `failed`, `unknown_branch`, or `unknown` (unconfirmed on main). These
-   post-charge aborts cost a slot. This is the accepted §4.2 tradeoff. A hand-off at step 8's
-   deadline consumes no further slot, because resume mode never charges.
+   post-charge aborts cost a slot. This is the accepted §4.2 tradeoff. A hand-off, whether at
+   step 8's deadline or from step 9's `superseded` arm, consumes no further slot, because resume
+   mode never charges.
 
 8. **Merge via the queue — never directly.** Submit:
 
@@ -621,8 +622,8 @@ On any ABORT:
   - step 9's `conflict` | `blocked` | `abandoned` | `failed` | `unknown_branch` arm;
   - the ladder's genuine not-landed outcome ([this skill's dispositions](#ladder-dispositions)).
 
-  Every other ABORT leaves the entry alone, and step 8's hand-off of a picked-up entry is not an
-  ABORT at all. Where the call is made, it prevents an orphaned durable-intent entry (PRD D2 —
+  Every other ABORT leaves the entry alone. Neither hand-off is an ABORT at all: not step 8's
+  hand-off of a picked-up entry, and not step 9's hand-off of an unresolved successor. Where the call is made, it prevents an orphaned durable-intent entry (PRD D2 —
   submitted merges now outlive the MCP call and session) from accumulating. `merge_cancel` never
   raises and is a safe no-op if the entry already finalized (it returns `cancelled: false` with
   the terminal state). A coalesced or `attached` `request_id` may resolve to `state: "unknown"` —
@@ -649,7 +650,8 @@ Return ONLY this JSON object (no prose):
   "task_id": "<id>",
   "escalation_id": "<id>",
   "request_id": "<merge request id when this run submitted or resumed one, else null — always set for handed_off>",
-  "reason": "<merged: what changed + merge sha | aborted: which precondition/step failed and why | handed_off: the live merge state at the polling deadline>",
+  "superseded_by": "<successor id (mr-* or coalesce-*) when handed_off from step 9's superseded arm, else null>",
+  "reason": "<merged: what changed + merge sha | aborted: which precondition/step failed and why | handed_off: the live merge state at the polling deadline, or the unresolved successor and the ladder's last verdict>",
   "commit": "<merge sha if merged, else null>"
 }
 ```
