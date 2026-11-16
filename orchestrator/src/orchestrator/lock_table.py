@@ -901,6 +901,10 @@ class ModuleLockTable:
         """
         return {task_id: tuple(sorted(keys)) for task_id, keys in self._held.items() if keys}
 
+    def snapshot_holder_limits(self) -> dict[str, int]:
+        """``{lock key: holder limit}`` for every held key, as the acquire gate resolves it (``UNLIMITED_HOLDERS`` for a key taking unlimited holders)."""
+        return {key: self._limit_for(key) for keys in self._held.values() for key in keys}
+
     # --- Limit lookup ---
 
     def _limit_for(self, module: str) -> int:
