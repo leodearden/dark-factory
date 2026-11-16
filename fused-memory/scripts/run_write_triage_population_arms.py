@@ -57,7 +57,6 @@ import time
 import types
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -142,13 +141,7 @@ ARMS: tuple[Arm, ...] = (
 )
 
 
-class Slates(StrEnum):
-    """Which slate a write is judged on."""
-
-    #: The slate as frozen 2026-10-05, records created after the write included (π).
-    FROZEN = 'frozen'
-    #: Only records created strictly before the write, band re-decided (π2, PRD §12 D19).
-    WRITE_TIME = 'write-time'
+Slates = _freeze.Slates
 
 
 #: π2's arms (PRD §12.4): the flip-decision arms at width 5; sol:low@20 is over budget.

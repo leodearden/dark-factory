@@ -89,9 +89,6 @@ _wording = load_script(_SCRIPTS / 'write_triage_judge_wording.py', 'write_triage
 _freeze = load_script(
     _SCRIPTS / 'freeze_write_triage_population.py', 'freeze_write_triage_population',
 )
-_arms = load_script(
-    _SCRIPTS / 'run_write_triage_population_arms.py', 'run_write_triage_population_arms',
-)
 _gate = load_script(
     _REPO_ROOT / 'scripts' / 'check_write_triage_readiness_gate.py',
     'check_write_triage_readiness_gate',
@@ -190,10 +187,10 @@ class Population:
                 f'the population artifact is not shaped as π publishes it: {malformed}'
             ) from None
         slates = block.get('slates')
-        if slates != _arms.Slates.WRITE_TIME:
+        if slates != _freeze.Slates.WRITE_TIME:
             raise MatrixInputError(
                 'μ scores write-time slates (PRD §12 D19); this artifact\'s population.slates'
-                f' is {slates!r}, not {_arms.Slates.WRITE_TIME.value!r}'
+                f' is {slates!r}, not {_freeze.Slates.WRITE_TIME.value!r}'
             )
         absent = [
             key for key in (*_C2_SOURCE_KEYS.values(), 'snapshot_path') if key not in block
@@ -250,7 +247,7 @@ def _read_arm(arm: PiArm, population: Population, data_root: Path) -> list[dict[
     rows = _read_jsonl(path)
     _refuse_foreign_rows(arm, path, rows, 'arm', arm.name)
     _refuse_foreign_rows(arm, path, rows, 'snapshot_sha256', population.block['snapshot_sha256'])
-    _refuse_foreign_rows(arm, path, rows, 'slates', _arms.Slates.WRITE_TIME.value)
+    _refuse_foreign_rows(arm, path, rows, 'slates', _freeze.Slates.WRITE_TIME.value)
     return rows
 
 
