@@ -85,11 +85,10 @@ _ESC_433_1_CLAIM = (
 )
 
 
-# The claimed clause of scoping_intake esc-unverified-claim-506-1 (memory dd0410c1),
-# verbatim. 'task 506's merged tree' here is the branch tree with its work merged in.
+# A verbatim excerpt of the claimed clause of scoping_intake esc-unverified-claim-506-1
+# (memory dd0410c1). 'task 506's merged tree' here is the branch tree with its work merged in.
 _ESC_506_1_CLAIM = (
-    "In scoping-intake, the README Checks' `uv run pytest` runs serially (pyproject sets no "
-    'xdist), and measured on 2026-11-02 the full suite on task 506\'s merged tree took 692 s '
+    'measured on 2026-11-02 the full suite on task 506\'s merged tree took 692 s '
     'for 5778 tests under host load ~100 on 32 cores (604 s for 5737 at 17:20 the same day)'
 )
 
