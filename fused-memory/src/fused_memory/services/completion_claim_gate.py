@@ -238,9 +238,12 @@ _EXTERNAL_TASK_REF_RE: re.Pattern[str] = re.compile(
 
 # A premise note names a dependency by number ('dependency 327 merged at a106cd8'), and
 # without this family the marker binds back to the branch task the note is written on
-# (solar esc-unverified-claim-432-2). A bare number only: 'dependency #N' is TASK_REF_RE's.
-# Pinned by tests/test_completion_claim_mood.py::TestPremiseNotesClaimTheirDependency.
-_DEPENDENCY_REF_RE: re.Pattern[str] = re.compile(r'\bdependency\s+(\d+)\b', re.IGNORECASE)
+# (solar esc-unverified-claim-432-2). A bare number only: 'dependency #N' is TASK_REF_RE's,
+# and 'dependency 2.0' is a version. Pinned by
+# tests/test_completion_claim_mood.py::TestPremiseNotesClaimTheirDependency.
+_DEPENDENCY_REF_RE: re.Pattern[str] = re.compile(
+    r'\bdependency\s+(\d+)\b(?!\.\d)', re.IGNORECASE,
+)
 
 APPLIED_WORK_RE: re.Pattern[str] = re.compile(
     r'\b(?:'
@@ -721,10 +724,13 @@ _CONTINGENCY_HEADS: str = (
     r'depend(?:s|ed|ing)?\s+(?:on|upon)|gated\s+on|blocked\s+on|subject\s+to|'
     r'provid(?:ed|ing)(?:\s+that)?|assuming(?:\s+that)?|assum(?:e|es|ed)\s+that'
 )
-_NECESSITY_VERBS: str = r'need(?:s|ed)?|requir(?:e|es|ed|ing)|want(?:s|ed)?'
-_SIMULATION_HEADS: str = (
-    r'(?:mock|simulation|stub|fake|dry[-\s]run|trial(?:\s+merge)?|prototype)s?\s+of'
+# After a determiner a necessity participle is attributive ('the required task N has
+# landed') and governs nothing.
+_NECESSITY_VERBS: str = (
+    r'(?<!\bthe\s)(?<!\ban\s)(?<!\ba\s)'
+    r'(?:need(?:s|ed)?|requir(?:e|es|ed|ing)|want(?:s|ed)?)'
 )
+_SIMULATION_HEADS: str = r'(?:mock|dry[-\s]run|trial\s+merge)s?\s+of'
 _NON_ASSERTING_HEADS: tuple[str, ...] = (
     _CONTINGENCY_HEADS, _NECESSITY_VERBS, _SIMULATION_HEADS,
 )
@@ -734,12 +740,17 @@ _NON_ASSERTING_HEADS: tuple[str, ...] = (
 # complement ('needs task N merged first') is a precondition, not a report, and a ref
 # inside a simulation of its work ('a mock of task N's planned edits merged') names a
 # stand-in, not the task's landing. Forward binding is untouched, so 'depends on
-# cancelled task N' still claims N. 'pending' is excluded by measurement (task 6824).
+# cancelled task N' still claims N. 'pending' is excluded by measurement, and only
+# the simulation heads a specimen evidences are listed (task 6824).
 # Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
 _NON_ASSERTING_GOVERNOR_RE: re.Pattern[str] = re.compile(
     r'(?<![-\w])(?:' + '|'.join(_NON_ASSERTING_HEADS) + r')\s+(?:(?:the|a|an)\s+)?$',
     re.IGNORECASE,
 )
+
+# A relative clause after a governed ref is a predication of the ref's own, which the
+# head does not reach ('blocked on task N which merged yesterday' claims N).
+_RELATIVE_PRONOUN_RE: re.Pattern[str] = re.compile(r'\b(?:which|that|who)\b', re.IGNORECASE)
 
 
 def _bind_marker(
@@ -772,12 +783,17 @@ def _bind_marker(
 def _binds_backward(clause: str, marker: _Marker, mention: _RefMention) -> bool:
     """Whether *marker* reaches back to the *mention* before it.
 
-    Not across a binding barrier, and not to a ref a non-asserting head governs.
-    The head is read up to the ref's written phrase, so a registered qualifier
-    is part of the ref ('depends on dark_factory task 5707 having landed').
+    Not across a binding barrier, and not to a ref a non-asserting head governs
+    unless a relative pronoun between them opens a predication of the ref's own
+    (:data:`_RELATIVE_PRONOUN_RE`). The head is read up to the ref's written
+    phrase, so a registered qualifier is part of the ref ('depends on dark_factory
+    task 5707 having landed').
     """
-    if _BINDING_BARRIER_RE.search(clause[mention.end:marker.start]):
+    gap = clause[mention.end:marker.start]
+    if _BINDING_BARRIER_RE.search(gap):
         return False
+    if _RELATIVE_PRONOUN_RE.search(gap):
+        return True
     return _NON_ASSERTING_GOVERNOR_RE.search(clause, 0, mention.phrase_start) is None
 
 

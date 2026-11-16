@@ -466,10 +466,33 @@ class TestNonAssertiveScopes:
                 'solar_challenge',
                 id='esc-unverified-claim-222-2',
             ),
+            pytest.param(
+                'depends on dark_factory task 5707 having landed', 'reify', id='qualified-ref',
+            ),
         ],
     )
     def test_a_ref_governed_by_a_contingency_head_is_not_claimed(self, text, project):
         assert _triples(text, project) == []
+
+    @pytest.mark.parametrize(
+        ('text', 'claim'),
+        [
+            pytest.param(
+                'depends on task 5707 and task 5708 having landed',
+                ('applied_work', 'task', '5708'),
+                id='coordinated-object',
+            ),
+            pytest.param(
+                'Depends on: task 5707 having landed',
+                ('applied_work', 'task', '5707'),
+                id='colon-after-the-head',
+            ),
+        ],
+    )
+    def test_a_head_not_directly_before_the_ref_is_a_known_residual(self, text, claim):
+        # Known residual, unchanged by task 6824 and unmeasured: the head is read only
+        # directly before the ref, so a second coordinated object or a colon escapes it.
+        assert _triples(text) == [claim]
 
     @pytest.mark.parametrize(
         ('text', 'project', 'claim'),
@@ -494,6 +517,16 @@ class TestNonAssertiveScopes:
                 'solar_challenge',
                 ('filing_dispatch', 'task', '1686'),
                 id='pending-is-not-a-head',
+            ),
+            pytest.param(
+                'task 5423 is blocked on task 5422 which merged yesterday', 'reify',
+                ('applied_work', 'task', '5422'),
+                id='relative-clause-after-the-object',
+            ),
+            pytest.param(
+                'task 5422 depends on task 5421 which has since landed', 'reify',
+                ('applied_work', 'task', '5421'),
+                id='relative-clause-has-since',
             ),
         ],
     )
@@ -545,6 +578,14 @@ class TestNonAssertiveScopes:
                 ('applied_work', 'task', '2697'),
                 id='necessity-verb-earlier-in-the-clause',
             ),
+            pytest.param(
+                'it required task 5422 which landed', ('applied_work', 'task', '5422'),
+                id='relative-clause-after-the-object',
+            ),
+            pytest.param(
+                'the required task 5422 has landed', ('applied_work', 'task', '5422'),
+                id='attributive-participle',
+            ),
         ],
     )
     def test_a_necessity_verb_governs_only_its_own_object(self, text, claim):
@@ -560,13 +601,20 @@ class TestNonAssertiveScopes:
             pytest.param('a dry run of task 5422 merged cleanly', id='dry-run-of'),
             pytest.param('a trial merge of task 5422 merged cleanly', id='trial-merge-of'),
             pytest.param('a mock of the task 5422 edits merged cleanly', id='mock-of-the'),
-            pytest.param(
-                'the simulation of task 5422 landed without conflicts', id='simulation-of',
-            ),
         ],
     )
     def test_a_ref_governed_by_a_simulation_head_is_not_claimed(self, text):
         assert _triples(text) == []
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('The prototype of task 5422 merged at abc1234', id='prototype-of'),
+            pytest.param('the stub of task 5422 landed in abc1234', id='stub-of'),
+        ],
+    )
+    def test_a_stand_in_head_no_specimen_evidences_still_claims(self, text):
+        assert _triples(text) == [('applied_work', 'task', '5422')]
 
     @pytest.mark.parametrize(
         ('text', 'project'),
@@ -622,6 +670,11 @@ class TestPremiseNotesClaimTheirDependency:
 
     def test_a_hash_dependency_ref_is_claimed_once(self):
         assert _triples('dependency #6020 has landed') == [('applied_work', 'task', '6020')]
+
+    def test_a_dependency_version_is_not_a_ref(self):
+        assert _triples("task 5422's dependency 2.0 upgrade landed") == [
+            ('applied_work', 'task', '5422'),
+        ]
 
 
 _ESC_5471_1 = (
