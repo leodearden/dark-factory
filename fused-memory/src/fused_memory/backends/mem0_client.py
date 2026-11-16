@@ -1713,14 +1713,13 @@ class Mem0Backend:
         return {str(point.id): float(point.score) for point in response.points}
 
     async def close(self) -> None:
-        """Close all cached AsyncMemory instances and release their connections."""
+        """Drop the cached AsyncMemory instances and close the two Qdrant clients this backend owns."""
         import contextlib
-        for instance in self._instances.values():
-            with contextlib.suppress(Exception):
-                client = getattr(getattr(instance, 'vector_store', None), 'client', None)
-                if client is not None and hasattr(client, 'close'):
-                    await client.close()
         self._instances.clear()
+        if self._vector_store_client is not None:
+            with contextlib.suppress(Exception):
+                self._vector_store_client.close()
+            self._vector_store_client = None
         if self._async_qdrant_client is not None:
             with contextlib.suppress(Exception):
                 await self._async_qdrant_client.close()
