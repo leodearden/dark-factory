@@ -78,8 +78,8 @@ from orchestrator.merge_lane.worker import (
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease
 
-# Names MERGE_RESULT_TIMEOUT for verify gate-entry waits (`gate_*_entered.wait()`)
-# (task 6436).  A hang still fails, just later.
+# Names MERGE_RESULT_TIMEOUT for verify gate-entry waits (`gate_entered.wait()`,
+# `gate_*_entered.wait()`) (task 6436).  A hang still fails, just later.
 GATE_ENTRY_TIMEOUT = MERGE_RESULT_TIMEOUT
 
 # ---------------------------------------------------------------------------
@@ -754,7 +754,7 @@ class TestRunInflightVerifyAbortPoll:
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
 
         # Wait for the gated runner to enter
-        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         # Trigger sole-waiter abandon
         req.result.cancel()
@@ -792,7 +792,7 @@ class TestRunInflightVerifyAbortPoll:
         lease = HostLease(name='slow-wt', runner=gated, is_local=False)
 
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
-        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
         req.result.cancel()
         await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
         gate_release.set()
@@ -828,7 +828,7 @@ class TestRunInflightVerifyAbortPoll:
         lease = HostLease(name='slow-halt', runner=gated, is_local=False)
 
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
-        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         worker.operator_halt('test: halt mid-verify')
 
@@ -863,7 +863,7 @@ class TestRunInflightVerifyAbortPoll:
         lease = HostLease(name='slow-halt2', runner=gated, is_local=False)
 
         verify_future = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
-        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         worker.operator_halt('test: halt mid-verify')
         await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS * 2)
@@ -3696,7 +3696,7 @@ class TestRunInflightVerifyRemoteCancelOnAbort:
         verify_future = asyncio.ensure_future(
             worker._run_inflight_verify(item, lease)
         )
-        await asyncio.wait_for(gate_entered.wait(), timeout=45.0)
+        await asyncio.wait_for(gate_entered.wait(), timeout=GATE_ENTRY_TIMEOUT)
 
         # Trigger abandon.  The abort poll will cancel verify_task
         # (propagating CancelledError into the gated verifier's release wait),
