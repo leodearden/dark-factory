@@ -701,12 +701,15 @@ _CONTINGENCY_HEADS: str = (
     r'depend(?:s|ed|ing)?\s+(?:on|upon)|gated\s+on|blocked\s+on|subject\s+to|'
     r'provid(?:ed|ing)(?:\s+that)?|assuming(?:\s+that)?|assum(?:e|es|ed)\s+that'
 )
-_NON_ASSERTING_HEADS: tuple[str, ...] = (_CONTINGENCY_HEADS,)
+_NECESSITY_VERBS: str = r'need(?:s|ed)?|requir(?:e|es|ed|ing)|want(?:s|ed)?'
+_NON_ASSERTING_HEADS: tuple[str, ...] = (_CONTINGENCY_HEADS, _NECESSITY_VERBS)
 
 # A ref that is the object of a head which does not assert its complement ('depends
-# on task N having landed') takes no backward-bound marker. Forward binding is
-# untouched, so 'depends on cancelled task N' still claims N. 'pending' is excluded
-# by measurement (task 6824). Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
+# on task N having landed') takes no backward-bound marker; a necessity verb's object
+# complement ('needs task N merged first') is a precondition, not a report. Forward
+# binding is untouched, so 'depends on cancelled task N' still claims N. 'pending' is
+# excluded by measurement (task 6824). Pinned by
+# tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
 _NON_ASSERTING_GOVERNOR_RE: re.Pattern[str] = re.compile(
     r'(?<![-\w])(?:' + '|'.join(_NON_ASSERTING_HEADS) + r')\s+(?:(?:the|a|an)\s+)?$',
     re.IGNORECASE,
