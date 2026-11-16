@@ -7,8 +7,9 @@ from contextlib import aclosing
 from typing import Any, TypeVar
 
 from mem0 import AsyncMemory
+from qdrant_client import QdrantClient
 
-from fused_memory.backends.timeout_budget import await_within
+from fused_memory.backends.timeout_budget import await_within, socket_timeout_outlasting
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
@@ -238,7 +239,10 @@ class Mem0Backend:
     only half a fix, so both halves are enforced in one place: every timed
     call on this class goes through :meth:`_timed_read` / :meth:`_timed_write`
     to ``backends/timeout_budget.py::await_within``, the single home of the
-    message format.
+    message format.  The Qdrant client mem0's vector store uses is this
+    backend's own, its socket timeout from ``socket_timeout_outlasting`` over
+    both budgets, so a slow Qdrant leg fails on its named budget
+    (tests/test_mem0_vector_store_client.py).
 
     This paragraph is the CANONICAL statement of the rule, and a method's own
     ``Raises:`` line adds only the consequence specific to IT — so there is one
@@ -254,6 +258,7 @@ class Mem0Backend:
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
         self._async_qdrant_client = None  # Lazy async client for count/list ops
+        self._vector_store_client: QdrantClient | None = None
 
     def _build_config_dict(self, collection_name: str) -> dict[str, Any]:
         """Build a Mem0 config dict from the unified config."""
@@ -388,6 +393,7 @@ class Mem0Backend:
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         config_dict = self._build_config_dict(collection_name)
         await self._ensure_collection(collection_name)
+        config_dict['vector_store']['config']['client'] = self._get_vector_store_client()
         instance = AsyncMemory.from_config(config_dict)
         self._instances[scope.project_id] = instance
         logger.info(f'Mem0 instance created for project {scope.project_id} (collection: {collection_name})')
@@ -757,6 +763,15 @@ class Mem0Backend:
             instance.delete(memory_id),
             'delete',
         )
+
+    def _get_vector_store_client(self) -> QdrantClient:
+        """Get or create the sync Qdrant client every mem0 instance's vector store shares."""
+        if self._vector_store_client is None:
+            self._vector_store_client = QdrantClient(
+                url=self.config.mem0.qdrant_url,
+                timeout=socket_timeout_outlasting(self._read_timeout, self._write_timeout),
+            )
+        return self._vector_store_client
 
     async def _get_async_qdrant(self):
         """Get or create a shared async Qdrant client for lightweight ops."""
