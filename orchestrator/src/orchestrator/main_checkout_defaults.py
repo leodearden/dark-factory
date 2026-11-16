@@ -45,9 +45,9 @@ def _unavailable(flag: str | None, env_var: str | None, cause: CheckoutRootError
     )
 
 
-def cli_default(flag: str, derive: Callable[[Path], Path], *, env_var: str | None = None) -> Path:
-    """:func:`env_or_main_checkout` for an omitted click *flag*, failing as a usage error."""
+def cli_default(flag: str, derive: Callable[[Path], Path]) -> Path:
+    """*derive* applied to the main checkout for an omitted click *flag*, failing as a usage error."""
     try:
-        return env_or_main_checkout(env_var, derive, flag=flag)
+        return env_or_main_checkout(None, derive, flag=flag)
     except CheckoutRootError as exc:
         raise click.UsageError(str(exc)) from exc

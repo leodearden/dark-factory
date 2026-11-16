@@ -382,9 +382,9 @@ still in flight. Re-running with a higher `--target-total` extends the
 corpus further; the `--limit` option caps how many *new* candidates a single
 invocation attempts (useful for a small validation run before a full batch).
 
-`--runs-db`, `--escalations-dir`, and `--repo-path` default to this
-deployment's on-disk paths in the main repo checkout, and can be overridden
-either via the flag or via the `REVIEWER_TRIAL_RUNS_DB` /
-`REVIEWER_TRIAL_ESCALATIONS_DIR` / `REVIEWER_TRIAL_REPO_ROOT` env vars. If
-`--runs-db` doesn't point at a real file, `mine` fails fast with a clear
+`--runs-db`, `--escalations-dir`, and `--repo-path` default to the main
+repo checkout's runs.db, escalation queue and the checkout itself (derived
+from wherever this code runs, even a linked worktree), and are overridden
+only by the flags; `mine` prints the sources it resolved before it starts.
+If `--runs-db` doesn't point at a real file, `mine` fails fast with a clear
 error rather than letting `sqlite3` silently create an empty database.
