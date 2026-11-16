@@ -7,6 +7,7 @@ from the literals in the test. Nothing touches the network, torch or a store.
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import types
 from pathlib import Path
@@ -30,6 +31,19 @@ def _mod() -> types.ModuleType:
 @functools.cache
 def _calibrate() -> types.ModuleType:
     return load_script_module(SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
+
+
+@functools.cache
+def _arms() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'eval_write_triage_reranker_arms.py', 'eval_write_triage_reranker_arms',
+    )
+
+
+def _context():
+    return _arms().ArmContext(
+        device='cpu', local_batch_size=1, vram_cap_gib=1.0, pairwise_concurrency=1,
+    )
 
 
 def _record(memory_id: str, cluster_id: str, label: str, category: str | None) -> dict:
@@ -232,3 +246,117 @@ class TestOperatingPointAndIntervals:
             floor: _mod().operating_point(self._SCORES, self._POSITIVES, 10, floor)
             for floor in (0.80, 0.90, 0.95)
         }
+
+
+class _TableScorer:
+    """A fake arms Scorer: ``table[(entry, candidate)]`` per candidate, with per-call extras."""
+
+    def __init__(self, table, *, costs=(), over=(), facts=None):
+        self.table = table
+        self.costs = list(costs)
+        self.over = list(over)
+        self._facts = facts
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+
+    def score(self, entry, candidate_texts):
+        call = len(self.calls)
+        self.calls.append((entry, tuple(candidate_texts)))
+        return _arms().SlateScores(
+            scores=tuple(self.table[(entry, c)] for c in candidate_texts),
+            cost_usd=self.costs[call] if call < len(self.costs) else 0.0,
+            pairs_over_max_length=self.over[call] if call < len(self.over) else 0,
+        )
+
+    def facts(self):
+        return self._facts
+
+
+class TestClaimLevelArms:
+    def test_split_claims_cuts_at_lines_and_sentence_ends(self):
+        assert _mod().split_claims('A is true. B holds.\n- C\n\nD') == [
+            'A is true.', 'B holds.', '- C', 'D',
+        ]
+
+    def test_a_dotted_path_is_not_a_sentence_end(self):
+        assert _mod().split_claims('see foo.py::bar now') == ['see foo.py::bar now']
+
+    def test_text_with_no_boundary_is_one_claim(self):
+        assert _mod().split_claims('  one claim only  ') == ['one claim only']
+
+    _TABLE = {
+        ('E1.', 'C1.'): 0.2, ('E1.', 'D1.'): 0.1, ('E1.', 'D2.'): 0.9, ('E1.', 'D3'): 0.3,
+        ('E2.', 'C1.'): 0.6, ('E2.', 'D1.'): 0.5, ('E2.', 'D2.'): 0.4, ('E2.', 'D3'): 0.0,
+    }
+
+    def test_a_candidate_scores_the_mean_over_entry_claims_of_its_best_claim(self):
+        inner = _TableScorer(self._TABLE)
+
+        slate = _mod().ClaimLevelScorer(inner).score('E1. E2.', ['C1.', 'D1. D2.\nD3'])
+
+        assert slate.scores == pytest.approx(((0.2 + 0.6) / 2, (0.9 + 0.5) / 2))
+        assert inner.calls == [
+            ('E1.', ('C1.', 'D1.', 'D2.', 'D3')),
+            ('E2.', ('C1.', 'D1.', 'D2.', 'D3')),
+        ]
+
+    def test_cost_and_truncation_sum_over_inner_calls(self):
+        inner = _TableScorer(self._TABLE, costs=[0.01, 0.02], over=[1, 2])
+
+        slate = _mod().ClaimLevelScorer(inner).score('E1. E2.', ['C1.'])
+
+        assert slate.cost_usd == pytest.approx(0.03)
+        assert slate.pairs_over_max_length == 3
+
+    def test_an_unmeasured_inner_cost_or_truncation_is_unmeasured(self):
+        inner = _TableScorer(self._TABLE, costs=[0.01, None], over=[None, 2])
+
+        slate = _mod().ClaimLevelScorer(inner).score('E1. E2.', ['C1.'])
+
+        assert slate.cost_usd is None
+        assert slate.pairs_over_max_length is None
+
+    def test_facts_delegate_to_the_inner_scorer(self):
+        facts = _arms().ScorerFacts(device='cpu', vram_peak_mib=None, max_length=512)
+
+        assert _mod().ClaimLevelScorer(_TableScorer({}, facts=facts)).facts() is facts
+
+    def test_detector_arms_are_d1_minus_jev_plus_claims_over_local_cross_encoders(self):
+        arms_mod = _arms()
+        names = [arm.name for arm in _mod().DETECTOR_ARMS]
+        full_text = [a for a in _mod().DETECTOR_ARMS if a.granularity == 'full_text']
+        claims = [a for a in _mod().DETECTOR_ARMS if a.granularity == 'claims']
+        local = [
+            s for s in arms_mod.D1_ARMS
+            if s.arm_class == arms_mod.ArmClass.local_cross_encoder
+        ]
+
+        assert [a.spec for a in full_text] == [
+            s for s in arms_mod.D1_ARMS if s.arm_class != arms_mod.ArmClass.jev_choice
+        ]
+        assert [a.spec for a in claims] == local
+        assert [a.name for a in claims] == [f'{s.name}+claims' for s in local]
+        assert len(names) == len(set(names))
+        assert 'jev-choice' not in names
+
+    def test_a_claim_arm_opens_its_spec_and_wraps_the_scorer(self):
+        sentinel = _TableScorer({})
+        opened_with = []
+
+        def open_(context):
+            opened_with.append(context)
+            return contextlib.nullcontext(sentinel)
+
+        spec = _arms().ArmSpec(
+            name='fake', arm_class=_arms().ArmClass.local_cross_encoder, model='m', open=open_,
+        )
+        full = _mod().DetectorArm(spec, _mod().Granularity.full_text)
+        claims = _mod().DetectorArm(spec, _mod().Granularity.claims)
+        context = _context()
+
+        with _mod().open_detector_scorer(full, context) as scorer:
+            assert scorer is sentinel
+        with _mod().open_detector_scorer(claims, context) as scorer:
+            assert isinstance(scorer, _mod().ClaimLevelScorer)
+            assert scorer.inner is sentinel
+        assert opened_with == [context, context]
+        assert (full.name, claims.name) == ('fake', 'fake+claims')
