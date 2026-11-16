@@ -783,6 +783,22 @@ class TestReportAndProposal:
         for bar in (proposal.precision_floor, proposal.min_paraphrase_band_recall, proposal.min_auc):
             assert f'{bar:.2f}' in markdown
 
+    def test_thresholds_render_in_significant_figures(self):
+        m = _mod()
+        near_one = m.OperatingPoint(
+            threshold=0.9999645352363586, caught=3, flagged=3, of=4, floor=0.90,
+            reading=m.PrecisionReading.point_estimate,
+        )
+        row = dataclasses.replace(
+            _row('tiny-threshold', threshold=4.1591740231250167e-07),
+            recall_at_precision=dict.fromkeys(m.RECALL_AT_PRECISION_FLOORS, near_one),
+        )
+
+        markdown = m.render_markdown(json.loads(json.dumps(_report([row]))))
+
+        assert '| 4.15917e-07 |' in markdown
+        assert '3/4 @ 0.999965' in markdown
+
     def test_write_report_writes_the_json_and_its_markdown_sibling(self, tmp_path):
         report = _report([_row('a')])
         path = tmp_path / 'out.json'

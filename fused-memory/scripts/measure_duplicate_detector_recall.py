@@ -928,6 +928,11 @@ def _fmt(value: Any, spec: str = '') -> str:
     return 'n/a' if value is None else format(value, spec)
 
 
+def _threshold(value: float | None) -> str:
+    """Six significant figures: scores sit near 1 (0.999965) and near 0 (4.15917e-07)."""
+    return _fmt(value, '.6g')
+
+
 def _interval(bounds: Sequence[float] | None) -> str:
     return 'n/a' if bounds is None else f'[{bounds[0]:.3f}, {bounds[1]:.3f}]'
 
@@ -942,7 +947,7 @@ def _table_row(row: Mapping[str, Any]) -> str:
     auc = row['auc']
     cells = [
         row['arm'], row['arm_class'], row['granularity'], row['status'], _fmt(row['skip_reason']),
-        _fmt(row['operating_threshold'], '.4f'),
+        _threshold(row['operating_threshold']),
         _count(row['paraphrase_band_recall']),
         _interval(row['paraphrase_band_recall']['wilson_95'] if row['paraphrase_band_recall'] else None),
         _count(row['precision']),
@@ -959,7 +964,7 @@ def _floor_cells(row: Mapping[str, Any]) -> str:
     points = row['recall_at_precision'] or []
     cells = [
         f'{point["caught"]}/{point["recall"]["total"] if point["recall"] else "n/a"} '
-        f'@ {_fmt(point["threshold"], ".4f")}'
+        f'@ {_threshold(point["threshold"])}'
         for point in points
     ]
     return '| ' + ' | '.join([row['arm'], *cells]) + ' |'

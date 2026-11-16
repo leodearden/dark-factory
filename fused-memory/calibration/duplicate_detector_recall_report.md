@@ -12,27 +12,27 @@ Rendered from the JSON report beside this file by `scripts/measure_duplicate_det
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | calibrated-ann | baseline | full_text | measured | n/a | n/a | 27/301 (0.090) | [0.062, 0.127] | 27/27 (1.000) | [0.875, 1.000] | 0/18 (0.000) | 0.2540 | [0.120, 0.387] | n/a | n/a |
 | qwen3-reranker-0.6b | local_cross_encoder | full_text | measured | n/a | n/a | 0/301 (0.000) | [0.000, 0.013] | n/a | n/a | 0/18 (0.000) | 0.2030 | [0.078, 0.328] | 0.0000 | cuda:0 (NVIDIA GeForce RTX 3090) |
-| mxbai-rerank-base-v2 | local_cross_encoder | full_text | measured | n/a | 0.9999 | 105/301 (0.349) | [0.297, 0.404] | 105/115 (0.913) | [0.847, 0.952] | 8/18 (0.444) | 0.3354 | [0.195, 0.476] | 0.0000 | cuda:0 (NVIDIA GeForce RTX 3090) |
-| bge-reranker-v2-m3 | local_cross_encoder | full_text | measured | n/a | 0.8898 | 52/301 (0.173) | [0.134, 0.220] | 52/57 (0.912) | [0.811, 0.962] | 1/18 (0.056) | 0.4308 | [0.289, 0.572] | 0.0000 | cuda:0 (NVIDIA GeForce RTX 3090) |
-| gpt-4o-mini-pairwise | llm_pairwise | full_text | measured | n/a | 0.0096 | 145/301 (0.482) | [0.426, 0.538] | 145/161 (0.901) | [0.845, 0.938] | 10/18 (0.556) | 0.4035 | [0.262, 0.545] | 0.2516 | remote:api.openai.com |
+| mxbai-rerank-base-v2 | local_cross_encoder | full_text | measured | n/a | 0.999945 | 105/301 (0.349) | [0.297, 0.404] | 105/115 (0.913) | [0.847, 0.952] | 8/18 (0.444) | 0.3354 | [0.195, 0.476] | 0.0000 | cuda:0 (NVIDIA GeForce RTX 3090) |
+| bge-reranker-v2-m3 | local_cross_encoder | full_text | measured | n/a | 0.889818 | 52/301 (0.173) | [0.134, 0.220] | 52/57 (0.912) | [0.811, 0.962] | 1/18 (0.056) | 0.4308 | [0.289, 0.572] | 0.0000 | cuda:0 (NVIDIA GeForce RTX 3090) |
+| gpt-4o-mini-pairwise | llm_pairwise | full_text | measured | n/a | 0.00964212 | 145/301 (0.482) | [0.426, 0.538] | 145/161 (0.901) | [0.845, 0.938] | 10/18 (0.556) | 0.4035 | [0.262, 0.545] | 0.2516 | remote:api.openai.com |
 | jina-reranker | hosted_api | full_text | skipped | no_credential | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 | voyage-rerank | hosted_api | full_text | skipped | no_credential | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 | cohere-rerank | hosted_api | full_text | skipped | no_credential | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
-| qwen3-reranker-0.6b+claims | local_cross_encoder | claims | measured | n/a | 8.1146 | 9/301 (0.030) | [0.016, 0.056] | 9/10 (0.900) | [0.596, 0.982] | 1/18 (0.056) | 0.2901 | [0.153, 0.428] | 0.0000 | cuda:0 (NVIDIA GeForce RTX 3090) |
-| mxbai-rerank-base-v2+claims | local_cross_encoder | claims | measured | n/a | 0.9993 | 12/301 (0.040) | [0.023, 0.068] | 12/12 (1.000) | [0.757, 1.000] | 0/18 (0.000) | 0.4747 | [0.335, 0.614] | 0.0000 | cuda:0 (NVIDIA GeForce RTX 3090) |
-| bge-reranker-v2-m3+claims | local_cross_encoder | claims | measured | n/a | 0.3686 | 148/301 (0.492) | [0.436, 0.548] | 148/164 (0.902) | [0.847, 0.939] | 11/18 (0.611) | 0.3402 | [0.199, 0.481] | 0.0000 | cuda:0 (NVIDIA GeForce RTX 3090) |
+| qwen3-reranker-0.6b+claims | local_cross_encoder | claims | measured | n/a | 8.11458 | 9/301 (0.030) | [0.016, 0.056] | 9/10 (0.900) | [0.596, 0.982] | 1/18 (0.056) | 0.2901 | [0.153, 0.428] | 0.0000 | cuda:0 (NVIDIA GeForce RTX 3090) |
+| mxbai-rerank-base-v2+claims | local_cross_encoder | claims | measured | n/a | 0.999273 | 12/301 (0.040) | [0.023, 0.068] | 12/12 (1.000) | [0.757, 1.000] | 0/18 (0.000) | 0.4747 | [0.335, 0.614] | 0.0000 | cuda:0 (NVIDIA GeForce RTX 3090) |
+| bge-reranker-v2-m3+claims | local_cross_encoder | claims | measured | n/a | 0.368648 | 148/301 (0.492) | [0.436, 0.548] | 148/164 (0.902) | [0.847, 0.939] | 11/18 (0.611) | 0.3402 | [0.199, 0.481] | 0.0000 | cuda:0 (NVIDIA GeForce RTX 3090) |
 
 ## Recall at precision floors
 
 | detector | 0.80 | 0.90 | 0.95 |
 |---|---|---|---|
-| qwen3-reranker-0.6b | 195/301 @ 6.5000 | 0/301 @ n/a | 0/301 @ n/a |
-| mxbai-rerank-base-v2 | 232/301 @ 0.9997 | 105/301 @ 0.9999 | 68/301 @ 1.0000 |
-| bge-reranker-v2-m3 | 92/301 @ 0.8070 | 52/301 @ 0.8898 | 41/301 @ 0.9123 |
-| gpt-4o-mini-pairwise | 209/301 @ 0.0000 | 145/301 @ 0.0096 | 42/301 @ 0.6602 |
-| qwen3-reranker-0.6b+claims | 221/301 @ 1.5031 | 9/301 @ 8.1146 | 5/301 @ 8.3891 |
-| mxbai-rerank-base-v2+claims | 143/301 @ 0.9313 | 12/301 @ 0.9993 | 12/301 @ 0.9993 |
-| bge-reranker-v2-m3+claims | 211/301 @ 0.1424 | 148/301 @ 0.3686 | 17/301 @ 0.6693 |
+| qwen3-reranker-0.6b | 195/301 @ 6.5 | 0/301 @ n/a | 0/301 @ n/a |
+| mxbai-rerank-base-v2 | 232/301 @ 0.999662 | 105/301 @ 0.999945 | 68/301 @ 0.999965 |
+| bge-reranker-v2-m3 | 92/301 @ 0.806954 | 52/301 @ 0.889818 | 41/301 @ 0.912336 |
+| gpt-4o-mini-pairwise | 209/301 @ 4.15917e-07 | 145/301 @ 0.00964212 | 42/301 @ 0.660244 |
+| qwen3-reranker-0.6b+claims | 221/301 @ 1.50313 | 9/301 @ 8.11458 | 5/301 @ 8.38914 |
+| mxbai-rerank-base-v2+claims | 143/301 @ 0.931305 | 12/301 @ 0.999273 | 12/301 @ 0.999273 |
+| bge-reranker-v2-m3+claims | 211/301 @ 0.142394 | 148/301 @ 0.368648 | 17/301 @ 0.669307 |
 
 ## Gate proposal (pre-registered 2026-11-16, unratified)
 
