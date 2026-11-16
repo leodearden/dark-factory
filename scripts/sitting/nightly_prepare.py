@@ -120,7 +120,7 @@ TAIL_CHARS = 2000
 DEFAULT_MCP_JSON = _REPO_ROOT / '.mcp.json'
 NIGHTLY_MCP_SERVERS: tuple[str, ...] = ('escalation', 'fused-memory')
 
-PREPARE_COMMAND = 'uv run --frozen --project shared python scripts/sitting/prepare_sitting.py'
+PREPARE_COMMAND = 'uv run --no-sync --project shared python scripts/sitting/prepare_sitting.py'
 """The one shell spelling the run may execute; repo-relative, so the child runs in the run's root."""
 
 _GIT_READS = git_read_rules('show', 'log')

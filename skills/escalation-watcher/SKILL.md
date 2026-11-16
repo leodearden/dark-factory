@@ -1855,7 +1855,7 @@ of record and never writes them; its only files are under `data/sitting/`, plus
 `data/return-brief.md`. Every mutation below is an agent action from a pre-built payload, taken
 only for an item Leo has answered or one that clears the carve-out in "Ruled-elsewhere check
 (answered-but-unrecorded)" above, whose gates it evaluates and does not restate. Run it from the
-project root as `uv run --frozen --project shared python scripts/sitting/prepare_sitting.py
+project root as `uv run --no-sync --project shared python scripts/sitting/prepare_sitting.py
 <subcommand>`.
 
 #### When it runs
