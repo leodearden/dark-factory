@@ -33,7 +33,6 @@ from fused_memory.arm_harness.embedding_graph_phase import (
     ArmGraphClient,
     EmbeddingSearchBackend,
     GraphPhase,
-    Sleep,
     run_graph_phase,
 )
 from fused_memory.arm_harness.embedding_run_manifest import (
@@ -76,6 +75,7 @@ from fused_memory.arm_harness.retrieval import (
 )
 from fused_memory.arm_harness.run import RUN_MANIFEST_FILENAME, require_pre_run_checks
 from fused_memory.arm_harness.run_manifest import EffectiveEmbedder
+from fused_memory.arm_harness.sleep_seam import Sleep
 from fused_memory.config.schema import FusedMemoryConfig
 
 logger = logging.getLogger(__name__)
