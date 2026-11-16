@@ -8,7 +8,11 @@ Covered here: the replay-frame primitive (block text, base commit refusal), the
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+
+from orchestrator.review_lineage import RetiredReview
 
 _BASE = '20c934ca597c7c9e3e2eb79f572970a8099f9243'
 
@@ -163,6 +167,16 @@ class TestPlanOnlyCliBriefsInReplayFrame:
 
 _FRAMED_BASE = 'abc123def'
 _TASK = {'id': '9001', 'title': 'T', 'description': 'D'}
+_RETIRED = RetiredReview(
+    branch='refs/heads/task/9001-20261112T000000Z',
+    tip_sha='abc123',
+    parking='/q/9001-20261112T000000Z',
+    quarantined_at='2026-11-12T00:00:00+00:00',
+    amendment_rounds_total=1,
+    review_cycles_total=0,
+    archive=Path('/meta/task-9001/retired-reviews/9001-20261112T000000Z'),
+    suggestions=({'location': 'a.py:1', 'description': 'd', 'suggested_fix': 'f'},),
+)
 
 
 def _assemblers(tmp_path):
@@ -186,6 +200,7 @@ class TestReplayFramedBriefingAssembler:
             {'committed_work': [{'sha': 'a' * 40, 'subject': 's'}]},
             id='committed-work',
         ),
+        pytest.param({'retired_reviews': (_RETIRED,)}, id='retired-reviews'),
     ])
     async def test_architect_prompt_is_production_prompt_plus_frame(
         self, tmp_path, call_shape,
