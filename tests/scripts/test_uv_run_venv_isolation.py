@@ -95,6 +95,7 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "scripts/orchestrator-solar-challenge-platform.service",
         "scripts/orchestrator-stream-touch.service",
         "scripts/return-brief.service",
+        "scripts/transcript-secret-sweep.laptop.conf",
         "scripts/transcript-secret-sweep.service",
     }
 )
