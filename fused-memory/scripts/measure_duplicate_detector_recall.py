@@ -25,12 +25,15 @@ Usage
 """
 from __future__ import annotations
 
+import contextlib
 import itertools
 import math
-from collections.abc import Callable, Collection, Mapping, Sequence
+import re
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from shared.quality_series.stats import Z_95, wilson_interval
 
@@ -263,3 +266,109 @@ def recall_at_precision(
         floor: operating_point(candidate_scores, positives, n_positive, floor)
         for floor in RECALL_AT_PRECISION_FLOORS
     }
+
+
+# ---------------------------------------------------------------------------
+# The arms: signal (an arms ArmSpec) x granularity (full text or claims)
+# ---------------------------------------------------------------------------
+
+CLAIM_SPLIT_RE = re.compile(r'\n|(?<=[.!?])\s+')
+
+
+def split_claims(text: str) -> list[str]:
+    """*text* cut at line breaks and at sentence-ending punctuation followed by whitespace."""
+    return [piece.strip() for piece in CLAIM_SPLIT_RE.split(text) if piece.strip()]
+
+
+_Num = TypeVar('_Num', int, float)
+
+
+def _sum_or_none(values: Sequence[_Num | None]) -> _Num | None:
+    """The sum, or None when there is nothing to sum or any term was unmeasured."""
+    measured = [value for value in values if value is not None]
+    if not values or len(measured) != len(values):
+        return None
+    return sum(measured[1:], start=measured[0])
+
+
+class ClaimLevelScorer:
+    """Any arms Scorer, applied claim by claim (a BERTScore-style alignment).
+
+    A candidate's score is the mean, over the entry's claims, of the best
+    inner score among that candidate's claims. The inner scorer sees one
+    entry claim against every candidate's claims at once.
+    """
+
+    def __init__(self, inner: _arms.Scorer) -> None:
+        self.inner = inner
+
+    def score(self, entry: str, candidate_texts: Sequence[str]) -> _arms.SlateScores:
+        candidate_claims = [split_claims(text) for text in candidate_texts]
+        flat = [claim for claims in candidate_claims for claim in claims]
+        slates = [self.inner.score(claim, flat) for claim in split_claims(entry)]
+        best_per_slate = [self._best_per_candidate(slate, candidate_claims) for slate in slates]
+        return _arms.SlateScores(
+            scores=tuple(
+                sum(best[c] for best in best_per_slate) / len(best_per_slate)
+                for c in range(len(candidate_texts))
+            ),
+            cost_usd=_sum_or_none([slate.cost_usd for slate in slates]),
+            pairs_over_max_length=_sum_or_none([slate.pairs_over_max_length for slate in slates]),
+        )
+
+    @staticmethod
+    def _best_per_candidate(
+        slate: _arms.SlateScores, candidate_claims: Sequence[Sequence[str]],
+    ) -> list[float]:
+        if len(slate.scores) != sum(len(claims) for claims in candidate_claims):
+            raise ValueError(
+                f'{len(slate.scores)} scores for '
+                f'{sum(len(claims) for claims in candidate_claims)} candidate claims',
+            )
+        best: list[float] = []
+        start = 0
+        for claims in candidate_claims:
+            best.append(max(slate.scores[start:start + len(claims)]))
+            start += len(claims)
+        return best
+
+    def facts(self) -> _arms.ScorerFacts:
+        return self.inner.facts()
+
+
+class Granularity(StrEnum):
+    full_text = 'full_text'
+    claims = 'claims'
+
+
+@dataclass(frozen=True)
+class DetectorArm:
+    spec: _arms.ArmSpec
+    granularity: Granularity
+
+    @property
+    def name(self) -> str:
+        if self.granularity == Granularity.claims:
+            return f'{self.spec.name}+claims'
+        return self.spec.name
+
+
+@contextlib.contextmanager
+def open_detector_scorer(arm: DetectorArm, context: _arms.ArmContext) -> Iterator[_arms.Scorer]:
+    """*arm*'s signal opened through its own spec, at *arm*'s granularity."""
+    with arm.spec.open(context) as scorer:
+        yield ClaimLevelScorer(scorer) if arm.granularity == Granularity.claims else scorer
+
+
+#: jev-choice is excluded by design: its scores are a distribution over one
+#: slate, not a pairwise judgement.
+DETECTOR_ARMS: tuple[DetectorArm, ...] = (
+    *(
+        DetectorArm(spec, Granularity.full_text) for spec in _arms.D1_ARMS
+        if spec.arm_class != _arms.ArmClass.jev_choice
+    ),
+    *(
+        DetectorArm(spec, Granularity.claims) for spec in _arms.D1_ARMS
+        if spec.arm_class == _arms.ArmClass.local_cross_encoder
+    ),
+)
