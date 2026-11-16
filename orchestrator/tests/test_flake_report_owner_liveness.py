@@ -143,13 +143,6 @@ def _report(open_rows: list[DebtRow], *, age_days: int = 5) -> FlakeLedgerReport
 _Answer = tuple[Mapping[str, str], Exception | None]
 
 
-class _NotAPair(_Answer):
-    """An answer that claims the pair shape but holds one element, so it will not unpack."""
-
-    def __new__(cls) -> _NotAPair:
-        return super().__new__(cls, ({},))
-
-
 class _Reader:
     """An owner-status reader answering a canned value, recording every call."""
 
@@ -221,9 +214,11 @@ class TestCorroborateOwners:
         assert 'Timeout' in out.owner_read.error
         assert '0.05' in out.owner_read.error
 
-    async def test_an_answer_that_is_not_a_pair_is_a_failed_read(self):
-        out = await corroborate_owners(_report(self.ROWS), _Reader(_NotAPair()))
+    async def test_a_timeout_the_reader_raises_itself_keeps_its_own_message(self):
+        reader = _Reader(raises=TimeoutError('socket read timed out'))
+        out = await corroborate_owners(_report(self.ROWS), reader, budget_secs=60)
         assert isinstance(out.owner_read, OwnerReadFailed)
+        assert out.owner_read.error == 'TimeoutError: socket read timed out'
 
     @pytest.mark.parametrize('rows', [[], [_row('t/unowned', None)]])
     async def test_no_owned_rows_reads_nothing_and_counts_zero(self, rows):
@@ -242,18 +237,11 @@ class TestCorroborateOwners:
         assert out.owner_read is None
 
 
-def _corroborated(
-    rows: list[DebtRow], read: OwnerStatuses | OwnerReadFailed | None,
-) -> FlakeLedgerReport:
-    """A report carrying *read*, its counter recomputed the way corroborate_owners does."""
-    return replace(
-        _report(rows),
-        owner_read=read,
-        non_convergence=compute_non_convergence(
-            rows, NOW, age_days=5,
-            owner_statuses=read if isinstance(read, OwnerStatuses) else None,
-        ),
-    )
+def _corroborated(rows: list[DebtRow], answer: Mapping[str, str] | Exception) -> FlakeLedgerReport:
+    """*rows*' report as corroborate_owners returns it when the owner read answers *answer*,
+    or raises it."""
+    reader = _Reader(raises=answer) if isinstance(answer, Exception) else _Reader((answer, None))
+    return asyncio.run(corroborate_owners(_report(rows), reader))
 
 
 def _open_debt_lines(rendered: str) -> list[str]:
@@ -287,15 +275,13 @@ class TestOwnerLivenessRendering:
         _row('t/pending', '105'),
         _row('t/deferred', '106'),
     ]
-    MIXED_READ = OwnerStatuses({
+    MIXED_READ = {
         '101': 'done', '102': 'done', '103': 'cancelled', '105': 'pending', '106': 'deferred',
-    })
+    }
 
     def test_the_acceptance_specimens_render_as_done_owner_breaches(self):
         rows = [_row(_SPECIMEN_6286, '6286'), _row(_SPECIMEN_6291, '6291')]
-        rendered = render_report(
-            _corroborated(rows, OwnerStatuses({'6286': 'done', '6291': 'done'})),
-        )
+        rendered = render_report(_corroborated(rows, {'6286': 'done', '6291': 'done'}))
         for test_id, owner in ((_SPECIMEN_6286, '6286'), (_SPECIMEN_6291, '6291')):
             line = _row_line(rendered, test_id)
             assert f'owner={owner}' in line, line
@@ -306,7 +292,7 @@ class TestOwnerLivenessRendering:
 
     def test_cancelled_and_omitted_owners_render_as_closed_owner_breaches(self):
         rows = [_row('t/cancelled', '103'), _row('t/gone', '104')]
-        rendered = render_report(_corroborated(rows, OwnerStatuses({'103': 'cancelled'})))
+        rendered = render_report(_corroborated(rows, {'103': 'cancelled'}))
         assert _CLOSED_MARKER in _row_line(rendered, 't/cancelled')
         assert _CLOSED_MARKER in _row_line(rendered, 't/gone')
         assert 'owner_closed=2' in rendered, rendered
@@ -329,15 +315,13 @@ class TestOwnerLivenessRendering:
         assert len([ln for ln in rows if 'OWNER CANCELLED OR GONE' in ln]) == 2
 
     def test_owners_not_consulted_say_so_and_mark_no_row(self):
-        rendered = render_report(_corroborated(self.MIXED, None))
+        rendered = render_report(_report(self.MIXED))
         assert 'owner_done=n/a' in rendered and 'owner_closed=n/a' in rendered, rendered
         assert [ln for ln in rendered.splitlines() if 'owner liveness: not consulted' in ln]
         assert not [ln for ln in _open_debt_lines(rendered) if '***' in ln or '(deferred' in ln]
 
     def test_a_failed_read_says_so_and_marks_no_row(self):
-        rendered = render_report(
-            _corroborated(self.MIXED, OwnerReadFailed('RuntimeError: fm down')),
-        )
+        rendered = render_report(_corroborated(self.MIXED, RuntimeError('fm down')))
         assert [ln for ln in rendered.splitlines()
                 if 'owner liveness: READ FAILED (RuntimeError: fm down)' in ln], rendered
         assert 'owner_done=n/a' in rendered and 'owner_closed=n/a' in rendered, rendered
@@ -345,15 +329,13 @@ class TestOwnerLivenessRendering:
 
     def test_a_successful_read_names_how_many_owners_it_read(self):
         rows = [_row('t/a', '101'), _row('t/b', '102'), _row('t/c', '101')]
-        rendered = render_report(
-            _corroborated(rows, OwnerStatuses({'101': 'pending', '102': 'pending'})),
-        )
+        rendered = render_report(_corroborated(rows, {'101': 'pending', '102': 'pending'}))
         assert [ln for ln in rendered.splitlines()
                 if 'owner liveness: read live (2 owner(s))' in ln], rendered
 
     def test_an_unowned_row_renders_as_before_whatever_the_read_says(self):
         rows = [_row('t/orphan', None), _row('t/filing', None), _row('t/owned', '101')]
-        report = _corroborated(rows, OwnerStatuses({'101': 'done'}))
+        report = _corroborated(rows, {'101': 'done'})
         report = replace(report, open_debt=[
             replace(r, pending_since='2026-11-16T11:00:00+00:00')
             if r.debt.test_id == 't/filing' else r
@@ -366,3 +348,11 @@ class TestOwnerLivenessRendering:
     def test_a_corroborated_render_is_byte_deterministic(self):
         report = _corroborated(self.MIXED, self.MIXED_READ)
         assert render_report(report) == render_report(report)
+
+    def test_an_unmeasured_report_prints_no_owner_liveness_line(self, tmp_path):
+        report = asyncio.run(
+            corroborate_owners(build_report(tmp_path / 'absent' / 'runs.db', now=NOW), _Reader()),
+        )
+        rendered = render_report(report)
+        assert 'NO LEDGER' in rendered, rendered
+        assert 'owner liveness' not in rendered, rendered

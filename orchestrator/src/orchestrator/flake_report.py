@@ -966,15 +966,18 @@ def _owner_ids(report: FlakeLedgerReport) -> list[str]:
 async def _read_owner_statuses(
     read_statuses: OwnerStatusReader, ids: list[str], budget_secs: float,
 ) -> OwnerStatuses | OwnerReadFailed:
-    """*ids*' live statuses, bounded by *budget_secs*.  A raise, a timeout, an answer that
-    is not a pair and an in-band error all land on the one failure path, as in
-    :func:`flake_ledger._read_owner`."""
+    """*ids*' live statuses, bounded by *budget_secs*.  A raise, the budget expiring and
+    an in-band error all land on the one failure path, as in
+    :func:`flake_ledger._read_owner`; a TimeoutError the reader raises itself keeps its
+    own message."""
+    deadline = asyncio.timeout(budget_secs)
     try:
-        statuses, error = await asyncio.wait_for(read_statuses(ids), timeout=budget_secs)
+        async with deadline:
+            statuses, error = await read_statuses(ids)
         if error is None:
             return OwnerStatuses(statuses)
-    except TimeoutError:
-        error = TimeoutError(f'no answer within {budget_secs}s')
+    except TimeoutError as exc:
+        error = TimeoutError(f'no answer within {budget_secs}s') if deadline.expired() else exc
     except Exception as exc:
         error = exc
     return OwnerReadFailed(f'{type(error).__name__}: {error}')
@@ -1040,7 +1043,7 @@ _OWNER_LIVENESS_SUFFIX: Mapping[OwnerLiveness, str] = MappingProxyType({
     OwnerLiveness.OPEN: '',
 })
 
-_STORED_POINTERS = 'the owners above are stored pointers, not live statuses'
+_STORED_POINTER_CAVEAT = 'the owners above are stored pointers, not live statuses'
 
 
 def _owner_cell(row: DebtReportRow, owner_read: OwnerStatuses | OwnerReadFailed | None) -> str:
@@ -1067,7 +1070,11 @@ def _count_or_na(count: int | None) -> str:
 
 def _owner_liveness_lines(report: FlakeLedgerReport) -> list[str]:
     """A WARNING per kind of dead owner, then the one line saying whether the owners were
-    read live, could not be read, or were not consulted."""
+    read live, could not be read, or were not consulted.  Nothing for an unmeasured
+    report: its header already says the counters are not a measurement, and it has no
+    owners to speak of."""
+    if not report.measured:
+        return []
     nc = report.non_convergence
     lines: list[str] = []
     if nc.owner_done_tests:
@@ -1084,9 +1091,9 @@ def _owner_liveness_lines(report: FlakeLedgerReport) -> list[str]:
         case OwnerStatuses():
             lines.append(f'      owner liveness: read live ({len(_owner_ids(report))} owner(s))')
         case OwnerReadFailed(error=error):
-            lines.append(f'      owner liveness: READ FAILED ({error}) — {_STORED_POINTERS}')
+            lines.append(f'      owner liveness: READ FAILED ({error}) — {_STORED_POINTER_CAVEAT}')
         case None:
-            lines.append(f'      owner liveness: not consulted — {_STORED_POINTERS}')
+            lines.append(f'      owner liveness: not consulted — {_STORED_POINTER_CAVEAT}')
     return lines
 
 
