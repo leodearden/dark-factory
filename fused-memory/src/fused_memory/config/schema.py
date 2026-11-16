@@ -589,7 +589,7 @@ _RETIRED_TASKMASTER_KEYS: frozenset[str] = frozenset({
 class TaskmasterConfig(BaseModel):
     """The server's primary project root, this section's only field.
 
-    ``fused_memory.models.scope::configured_primary_root`` normalises it. The
+    ``fused_memory/models/scope.py::configured_primary_root`` normalises it. The
     class and ``taskmaster:`` section names predate the SQLite cutover. Keys
     retired with the Taskmaster subprocess are dropped at load with a warning.
     """
