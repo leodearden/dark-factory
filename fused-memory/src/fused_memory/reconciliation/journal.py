@@ -25,6 +25,7 @@ from shared.phantom_verdict import UNPARSEABLE_VERDICT_CODE, is_phantom_verdict_
 from shared.sqlite_column_migration import add_column_if_missing
 
 from fused_memory.models.reconciliation import (
+    JudgeInvocation,
     JudgeVerdict,
     ReconciliationRun,
     RunStatus,
@@ -180,6 +181,17 @@ CREATE TABLE IF NOT EXISTS judge_pending (
     marked_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_judge_pending_project ON judge_pending(project_id);
+
+CREATE TABLE IF NOT EXISTS judge_invocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    ended_error_max_turns INTEGER NOT NULL,
+    schema_salvaged INTEGER NOT NULL,
+    num_turns INTEGER,
+    rejected_tool_calls INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_judge_invocations_completed ON judge_invocations(completed_at);
 """
 
 
@@ -817,6 +829,23 @@ class ReconciliationJournal:
             )
             for row in rows
         ]
+
+    async def record_judge_invocation(self, invocation: JudgeInvocation) -> None:
+        async with self._require_access().write() as db:
+            await db.execute(
+                """INSERT INTO judge_invocations
+                   (run_id, completed_at, ended_error_max_turns, schema_salvaged,
+                    num_turns, rejected_tool_calls)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    invocation.run_id,
+                    invocation.completed_at.isoformat(),
+                    int(invocation.ended_error_max_turns),
+                    int(invocation.schema_salvaged),
+                    invocation.num_turns,
+                    invocation.rejected_tool_calls,
+                ),
+            )
 
     # ── Judge pending markers (durable across restarts) ─────────────────
 

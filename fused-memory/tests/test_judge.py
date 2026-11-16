@@ -95,10 +95,23 @@ class FakeJudgeOpenAIResponse:
     choices: list = field(default_factory=list)
 
 
+def _journal_double() -> MagicMock:
+    """A MagicMock journal whose judge-invocation write succeeds."""
+    journal = MagicMock()
+    journal.record_judge_invocation = AsyncMock(return_value=None)
+    return journal
+
+
+@pytest.fixture(autouse=True)
+def _claude_config_dir(tmp_path, monkeypatch):
+    """Keep the judge's transcript read off the real ~/.claude."""
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(tmp_path / 'claude-config'))
+
+
 @pytest.fixture
 def mock_journal():
     """A mock ReconciliationJournal that returns empty data."""
-    journal = MagicMock()
+    journal = _journal_double()
     journal.get_run = AsyncMock(return_value=None)
     journal.get_recent_verdicts = AsyncMock(return_value=[])
     journal.add_verdict = AsyncMock(return_value=None)
@@ -253,7 +266,7 @@ async def test_judge_call_llm_anthropic_normal(mock_journal):
     mock_client.messages = mock_messages
 
     with patch('anthropic.AsyncAnthropic', return_value=mock_client):
-        result = await judge._call_llm('Evaluate this run.')
+        result = await judge._call_llm('Evaluate this run.', run_id='run-test')
 
     assert result == verdict_text
 
@@ -282,7 +295,7 @@ async def test_judge_call_llm_anthropic_no_text_blocks(mock_journal):
     mock_client.messages = mock_messages
 
     with patch('anthropic.AsyncAnthropic', return_value=mock_client):
-        result = await judge._call_llm('Evaluate this run.')
+        result = await judge._call_llm('Evaluate this run.', run_id='run-test')
 
     assert result == ''
 
@@ -308,7 +321,7 @@ async def test_judge_call_llm_anthropic_mixed_content(mock_journal):
     mock_client.messages = mock_messages
 
     with patch('anthropic.AsyncAnthropic', return_value=mock_client):
-        result = await judge._call_llm('Evaluate this.')
+        result = await judge._call_llm('Evaluate this.', run_id='run-test')
 
     # Only first text block's text is returned
     assert result == 'First text block'
@@ -343,7 +356,7 @@ async def test_judge_call_llm_openai_normal(mock_journal):
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
-        result = await judge._call_llm('Evaluate this run.')
+        result = await judge._call_llm('Evaluate this run.', run_id='run-test')
 
     assert result == verdict_text
 
@@ -785,7 +798,7 @@ async def test_judge_call_llm_openai_none_content(mock_journal):
     mock_client.chat = mock_chat
 
     with patch('openai.AsyncOpenAI', return_value=mock_client):
-        result = await judge._call_llm('Evaluate this run.')
+        result = await judge._call_llm('Evaluate this run.', run_id='run-test')
 
     assert result == ''
 
@@ -800,7 +813,7 @@ class TestJudgeCallLlmReleasesClient:
         )
 
         with patch('anthropic.AsyncAnthropic', return_value=client):
-            await judge._call_llm('p')
+            await judge._call_llm('p', run_id='run-test')
 
         client.__aexit__.assert_awaited_once()
 
@@ -818,7 +831,7 @@ class TestJudgeCallLlmReleasesClient:
         )
 
         with patch('openai.AsyncOpenAI', return_value=client):
-            await judge._call_llm('p')
+            await judge._call_llm('p', run_id='run-test')
 
         client.__aexit__.assert_awaited_once()
 
@@ -832,7 +845,7 @@ class TestJudgeCallLlmReleasesClient:
             patch('anthropic.AsyncAnthropic', return_value=client),
             pytest.raises(RuntimeError, match='boom'),
         ):
-            await judge._call_llm('p')
+            await judge._call_llm('p', run_id='run-test')
 
         client.__aexit__.assert_awaited_once()
 
@@ -1993,7 +2006,7 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
     ) as mock_invoke:
         mock_invoke.return_value = fake_result
 
-        result = await judge._call_judge_cli('Evaluate this run.')
+        result = await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     mock_invoke.assert_called_once()
     call_kwargs = mock_invoke.call_args.kwargs
@@ -2066,7 +2079,7 @@ async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
         new_callable=AsyncMock,
         return_value=fake_result,
     ) as mock_invoke:
-        await judge._call_judge_cli('Evaluate this run.')
+        await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     call_kwargs = mock_invoke.call_args.kwargs
     assert call_kwargs['output_schema'] is JUDGE_VERDICT_SCHEMA
@@ -2133,7 +2146,7 @@ async def test_call_judge_cli_returns_structured_payload_ignoring_prose(mock_jou
         'fused_memory.reconciliation.judge.invoke_with_cap_retry',
         new=AsyncMock(return_value=result),
     ):
-        assert await judge._call_judge_cli('p') == payload
+        assert await judge._call_judge_cli('p', run_id='run-test') == payload
 
 
 @pytest.mark.asyncio
@@ -2163,7 +2176,7 @@ async def test_call_judge_cli_json_string_structured_output_is_loaded(mock_journ
         'fused_memory.reconciliation.judge.invoke_with_cap_retry',
         new=AsyncMock(return_value=result),
     ):
-        assert await judge._call_judge_cli('p') == {'severity': 'ok', 'findings': []}
+        assert await judge._call_judge_cli('p', run_id='run-test') == {'severity': 'ok', 'findings': []}
 
 
 @pytest.mark.asyncio
@@ -2198,7 +2211,7 @@ async def test_call_judge_cli_empty_output_returns_empty_string(mock_journal):
         new_callable=AsyncMock,
         return_value=empty_output_result,
     ):
-        result = await judge._call_judge_cli('Evaluate this run.')
+        result = await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     assert result == ''
 
@@ -2244,7 +2257,7 @@ async def test_call_judge_cli_input_rejected_raises_infra_error(mock_journal):
         new_callable=AsyncMock,
         return_value=rejected_result,
     ), pytest.raises(JudgeInfraError) as excinfo:
-        await judge._call_judge_cli('Evaluate this run.')
+        await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     assert 'Input must be provided' in str(excinfo.value), (
         f'the raised message must carry the CLI stderr cause, got {excinfo.value!r}'
@@ -2293,7 +2306,7 @@ async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, 
         mock_agent.return_value = fake_result
 
         judge = Judge(config=config, journal=mock_journal, usage_gate=None)
-        await judge._call_judge_cli('Evaluate this run.')
+        await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     mock_agent.assert_called_once()
     call_kwargs = mock_agent.call_args.kwargs
@@ -2343,7 +2356,7 @@ async def test_call_judge_cli_scopes_mcp_to_no_servers(mock_journal):
     ) as mock_invoke:
         mock_invoke.return_value = fake_result
 
-        await judge._call_judge_cli('Evaluate this run.')
+        await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     mock_invoke.assert_called_once()
     call_kwargs = mock_invoke.call_args.kwargs
@@ -2409,7 +2422,7 @@ async def test_call_judge_cli_forwards_mcp_scoping_to_invoke_claude_agent(mock_j
         mock_agent.return_value = fake_result
 
         judge = Judge(config=config, journal=mock_journal, usage_gate=None)
-        await judge._call_judge_cli('Evaluate this run.')
+        await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     mock_agent.assert_called_once()
     call_kwargs = mock_agent.call_args.kwargs
@@ -2466,7 +2479,7 @@ async def test_call_judge_cli_failure_surfaces_stderr_and_summary_in_judge_infra
         mock_invoke.return_value = failing_result
 
         with pytest.raises(JudgeInfraError) as excinfo:
-            await judge._call_judge_cli('Evaluate this run.')
+            await judge._call_judge_cli('Evaluate this run.', run_id='run-test')
 
     msg = str(excinfo.value)
     assert msg.startswith('Claude CLI judge failed:'), f'unexpected prefix: {msg!r}'
@@ -2488,7 +2501,7 @@ class TestJudgeCapWaitSanityBound:
     @pytest.mark.asyncio
     async def test_call_judge_cli_forwards_cap_wait_sanity_secs(self):
         """(b) _call_judge_cli forwards cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import AsyncMock
 
         from shared.cli_invoke import AgentResult
 
@@ -2498,8 +2511,7 @@ class TestJudgeCapWaitSanityBound:
             judge_llm_provider='claude_cli',
             judge_llm_model='claude-sonnet-4-5',
         )
-        mock_jrnl = MagicMock()
-        judge = Judge(config=config, journal=mock_jrnl, usage_gate=make_gate_mock())
+        judge = Judge(config=config, journal=_journal_double(), usage_gate=make_gate_mock())
         # A usable structured payload: a success carrying none is now classified
         # as cli_output_empty infra, which would mask this test's kwargs assertion.
         ok_result = AgentResult(
@@ -2510,7 +2522,7 @@ class TestJudgeCapWaitSanityBound:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=mock,
         ):
-            await judge._call_judge_cli('p')
+            await judge._call_judge_cli('p', run_id='run-test')
         assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 
 
@@ -2534,7 +2546,7 @@ class TestCallJudgeCliTaxonomy:
             judge_llm_provider='claude_cli',
             judge_llm_model='claude-sonnet-4-5',
         )
-        return Judge(config=config, journal=MagicMock(), usage_gate=make_gate_mock())
+        return Judge(config=config, journal=_journal_double(), usage_gate=make_gate_mock())
 
     @pytest.mark.asyncio
     async def test_api_error_raises_judge_infra_error(self):
@@ -2551,7 +2563,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ), pytest.raises(JudgeInfraError):
-            await judge._call_judge_cli('prompt')
+            await judge._call_judge_cli('prompt', run_id='run-test')
 
     @pytest.mark.asyncio
     async def test_timed_out_raises_judge_infra_error(self):
@@ -2566,7 +2578,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ), pytest.raises(JudgeInfraError):
-            await judge._call_judge_cli('prompt')
+            await judge._call_judge_cli('prompt', run_id='run-test')
 
     @pytest.mark.asyncio
     async def test_genuine_empty_output_stays_benign(self):
@@ -2586,7 +2598,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ):
-            assert await judge._call_judge_cli('prompt') == ''
+            assert await judge._call_judge_cli('prompt', run_id='run-test') == ''
 
     @pytest.mark.asyncio
     async def test_success_returns_structured_payload(self):
@@ -2609,7 +2621,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ):
-            assert await judge._call_judge_cli('prompt') == {'severity': 'ok', 'findings': []}
+            assert await judge._call_judge_cli('prompt', run_id='run-test') == {'severity': 'ok', 'findings': []}
 
     @pytest.mark.asyncio
     async def test_all_accounts_capped_raises_judge_infra_error(self):
@@ -2626,7 +2638,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(side_effect=AllAccountsCappedException(3, 1800.0, 'judge')),
         ), pytest.raises(JudgeInfraError):
-            await judge._call_judge_cli('prompt')
+            await judge._call_judge_cli('prompt', run_id='run-test')
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('subtype', ['error_max_turns', 'error_empty_output'])
@@ -2664,7 +2676,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ), pytest.raises(JudgeInfraError) as exc_info:
-            await judge._call_judge_cli('prompt')
+            await judge._call_judge_cli('prompt', run_id='run-test')
         assert exc_info.value.code == 'cli_schema_tool_denied'
         assert 'cli_schema_tool_denied' in str(exc_info.value)
 
@@ -2684,7 +2696,7 @@ class TestCallJudgeCliTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ), pytest.raises(JudgeInfraError) as exc_info:
-            await judge._call_judge_cli('prompt')
+            await judge._call_judge_cli('prompt', run_id='run-test')
         assert exc_info.value.code is None
 
 
@@ -2713,7 +2725,7 @@ class TestCallJudgeCliStructuredOutputTaxonomy:
             judge_llm_provider='claude_cli',
             judge_llm_model='claude-sonnet-4-5',
         )
-        return Judge(config=config, journal=MagicMock(), usage_gate=make_gate_mock())
+        return Judge(config=config, journal=_journal_double(), usage_gate=make_gate_mock())
 
     async def _raises(self, result):
         """Invoke _call_judge_cli against *result*, returning the JudgeInfraError."""
@@ -2724,7 +2736,7 @@ class TestCallJudgeCliStructuredOutputTaxonomy:
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ), pytest.raises(JudgeInfraError) as exc_info:
-            await judge._call_judge_cli('prompt')
+            await judge._call_judge_cli('prompt', run_id='run-test')
         return exc_info.value
 
     @pytest.mark.asyncio
@@ -2842,7 +2854,7 @@ class TestCallJudgeCliStructuredOutputTaxonomy:
                 success=True, output='', structured_output=payload,
             )),
         ):
-            assert await judge._call_judge_cli('prompt') == payload
+            assert await judge._call_judge_cli('prompt', run_id='run-test') == payload
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('payload', [
@@ -2886,7 +2898,7 @@ class TestCallJudgeCliStructuredOutputTaxonomy:
             new=AsyncMock(return_value=result),
         ):
             # Explicitly must NOT raise.
-            assert await judge._call_judge_cli('prompt') == ''
+            assert await judge._call_judge_cli('prompt', run_id='run-test') == ''
 
 
 class TestReviewRunNoStructuredVerdict:
