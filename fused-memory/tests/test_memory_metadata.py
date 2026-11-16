@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
-
 from orchestrator.completion_record import completion_record_metadata
 
 from fused_memory.config.schema import _default_topic_guard_clusters

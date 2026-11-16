@@ -13,7 +13,7 @@ from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claima
 from shared.task_fields import dependency_ids as task_dependency_ids
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.memory_metadata import normalize_supersedes
+from fused_memory.memory_metadata import TARGETED_RECONCILIATION_SOURCE, normalize_supersedes
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
 from fused_memory.middleware.task_interceptor import (
     _extract_metadata_files,
@@ -81,10 +81,10 @@ _SNAPSHOT_CONTRADICTING_TRANSITIONS: frozenset[str] = frozenset(
 # ``claimant_clear`` (see TargetedReconciler._clear_claimant_before_unblock).
 ClaimantClearOutcome = Literal['cleared', 'not_needed', 'claimant_live', 'rejected', 'failed']
 
-# Metadata `source` value stamped on the completion-echo memory written by
-# _on_task_done's fast path.  Single-sourced so _is_authoritative_resolution
-# and the fast-path write can't drift out of sync (task 1984).
-_ECHO_SOURCE = 'targeted_reconciliation'
+# The metadata `source` value stamped on the completion-echo memory written by
+# _on_task_done's fast path is memory_metadata.TARGETED_RECONCILIATION_SOURCE.
+# Single-sourced so _is_authoritative_resolution and the fast-path write can't
+# drift out of sync (task 1984).
 
 # Per-verdict framing for the codebase-verification memory written by
 # _on_task_done (task 4723 / PRD D7).  Both verdicts previously shared ONE
@@ -127,7 +127,7 @@ _AUTHORITATIVE_PRECHECK_LIMIT = 25
 # _delete_stale_completion_echoes (task 2433). Mirrors
 # _AUTHORITATIVE_PRECHECK_LIMIT's bounded-scroll rationale immediately above,
 # but narrower: the scroll's server-side filter already restricts matches to
-# source == _ECHO_SOURCE AND transition == 'done' (task 2433 review
+# source == TARGETED_RECONCILIATION_SOURCE AND transition == 'done' (task 2433 review
 # amendment — efficiency_robustness), so this cap bounds ONLY this
 # reconciler's own completion echoes for the task, not every task_id-tagged
 # memory — memory_hints, stage1/stage2 markers, etc. never compete for the
@@ -156,11 +156,11 @@ _STALE_ECHO_DELETE_LIMIT = 25
 # drift if the prompt wording changes without a matching update here.
 #
 # Second writer (task 2642): _on_task_done's own fast-path completion echo
-# ALSO stamps this key unconditionally (source=_ECHO_SOURCE), so Stage 2's
+# ALSO stamps this key unconditionally (source=TARGETED_RECONCILIATION_SOURCE), so Stage 2's
 # count_memories_by_metadata({'task_id': ..., 'stage2_suppress': True}) gate
 # recognizes a targeted-reconciliation completion record and skips its own
 # redundant completion-summary write. _is_authoritative_resolution still
-# requires `source != _ECHO_SOURCE` for the stage2_suppress branch, so a
+# requires `source != TARGETED_RECONCILIATION_SOURCE` for the stage2_suppress branch, so a
 # targeted self-echo carrying this key satisfies Stage 2's external count
 # gate WITHOUT becoming authoritative to _on_task_done's own pre-echo guard
 # — preserving the task-1984 "a task's own earlier echoes never trigger
@@ -630,7 +630,7 @@ class TargetedReconciler:
                         content += f"\nDetails: {fit_at_word(details, 500)}"
 
             write_metadata: dict[str, Any] = {
-                'source': _ECHO_SOURCE,
+                'source': TARGETED_RECONCILIATION_SOURCE,
                 'task_id': task_id,
                 'transition': 'done',
                 # Task 2642: seed Stage 2's "Completion-Note Suppression
@@ -638,7 +638,7 @@ class TargetedReconciler:
                 # completion echo, so a task completed via
                 # TargetedReconciliation is recognized and Stage 2 skips
                 # writing its own redundant completion summary.
-                # _is_authoritative_resolution's source != _ECHO_SOURCE
+                # _is_authoritative_resolution's source != TARGETED_RECONCILIATION_SOURCE
                 # discriminator (above) keeps this self-stamp from making
                 # the echo authoritative to THIS reconciler's own pre-echo
                 # guard, preserving the task-1984 invariant.
@@ -916,7 +916,7 @@ class TargetedReconciler:
                         category='observations_and_summaries',
                         project_id=scope.project_id,
                         metadata={
-                            'source': 'targeted_reconciliation',
+                            'source': TARGETED_RECONCILIATION_SOURCE,
                             'task_id': task_id,
                             'verification_verdict': verification.verdict,
                         },
@@ -1013,7 +1013,7 @@ class TargetedReconciler:
         removes it.
 
         Matches ONLY memories whose metadata carries both
-        ``source == _ECHO_SOURCE`` and ``transition == 'done'`` — i.e.
+        ``source == TARGETED_RECONCILIATION_SOURCE`` and ``transition == 'done'`` — i.e.
         exactly the completion echoes `_on_task_done`'s fast path writes —
         so memory_hints, stage1/stage2 markers, and any other task_id-tagged
         memory are never touched. The match is enforced twice (task 2433
@@ -1032,13 +1032,13 @@ class TargetedReconciler:
         """
         memories = await self.memory.get_memories_by_metadata(
             project_id=scope.project_id,
-            filters={'task_id': task_id, 'source': _ECHO_SOURCE, 'transition': 'done'},
+            filters={'task_id': task_id, 'source': TARGETED_RECONCILIATION_SOURCE, 'transition': 'done'},
             limit=_STALE_ECHO_DELETE_LIMIT,
         )
         stale = [
             m for m in memories
             if isinstance(m, dict)
-            and (m.get('metadata') or {}).get('source') == _ECHO_SOURCE
+            and (m.get('metadata') or {}).get('source') == TARGETED_RECONCILIATION_SOURCE
             and (m.get('metadata') or {}).get('transition') == 'done'
         ]
         deleted_ids: list[str] = []
@@ -2645,7 +2645,7 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
       non-authoritative — a list whose only member is empty is not a
       supersession edge; or
     - a truthy ``_STAGE2_SUPPRESS_KEY`` (``stage2_suppress``) marker whose
-      ``source`` is NOT this reconciler's own echo (``source != _ECHO_SOURCE``)
+      ``source`` is NOT this reconciler's own echo (``source != TARGETED_RECONCILIATION_SOURCE``)
       — Stage 2's real, task_id-scoped "Completion-Note Suppression Pre-Check
       (stage2_suppress guard)" write side (prompts/stage2.py) is one writer of
       this key; TargetedReconciliation's own fast-path completion echo
@@ -2665,7 +2665,7 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     branch dead code (dead_trigger_correctness finding) — replaced here with
     the real ``stage2_suppress`` marker.
 
-    Plain prior targeted echoes (``source=_ECHO_SOURCE``, no ``supersedes``, no
+    Plain prior targeted echoes (``source=TARGETED_RECONCILIATION_SOURCE``, no ``supersedes``, no
     ``stage2_suppress``) are deliberately NOT authoritative, so a task's own
     earlier echoes never trigger suppression or oscillation — see
     _on_task_done's pre-echo guard (task 1984).
@@ -2678,8 +2678,8 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     check, that would make a task's own prior echo authoritative to THIS
     pre-check too — silently regressing the task-1984 invariant above on a
     re-done transition. So the ``stage2_suppress`` branch requires
-    ``source != _ECHO_SOURCE``: Stage 2's real guard writes (which carry
-    ``stage2_suppress`` without ``source=_ECHO_SOURCE``) stay authoritative,
+    ``source != TARGETED_RECONCILIATION_SOURCE``: Stage 2's real guard writes (which carry
+    ``stage2_suppress`` without ``source=TARGETED_RECONCILIATION_SOURCE``) stay authoritative,
     while a targeted self-echo carrying ``stage2_suppress`` stays
     non-authoritative to this pre-check — even though it still satisfies
     Stage 2's separate, external count gate.
@@ -2688,7 +2688,7 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
         return False
     if any(normalize_supersedes(metadata.get('supersedes'))):
         return True
-    return bool(metadata.get(_STAGE2_SUPPRESS_KEY)) and metadata.get('source') != _ECHO_SOURCE
+    return bool(metadata.get(_STAGE2_SUPPRESS_KEY)) and metadata.get('source') != TARGETED_RECONCILIATION_SOURCE
 
 
 # Bounds on the evidence pointers carried by the contradicted-verdict L1

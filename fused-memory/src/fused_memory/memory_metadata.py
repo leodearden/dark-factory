@@ -65,6 +65,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from shared.memory_supersession import SUPERSEDED_BY_METADATA_KEY
+from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
 
@@ -107,12 +108,14 @@ __all__ = [
     'RESERVED_VOCABULARY_KEYS',
     'SERVER_STAMPED_KEYS',
     'SUPERSEDED_BY_METADATA_KEY',
+    'TARGETED_RECONCILIATION_SOURCE',
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
     'TRIAGE_CONTESTED_METADATA_KEY',
     'check_canonical_routing',
     'classify_unknown_keys',
     'is_canonical',
+    'is_completion_record',
     'is_orchestrator_completion_record',
     'is_valid_topic_slug',
     'normalize_supersedes',
@@ -690,6 +693,20 @@ ORCHESTRATOR_COMPLETION_SOURCE = 'orchestrator_completion'
 
 def is_orchestrator_completion_record(meta: Mapping[str, Any]) -> bool:
     return meta.get('source') == ORCHESTRATOR_COMPLETION_SOURCE
+
+
+#: The ``source`` reconciliation/targeted.py::TargetedReconciler stamps on its
+#: notes: the completion echo (with ``transition`` 'done') and the
+#: verification-verdict note (with none).
+TARGETED_RECONCILIATION_SOURCE = 'targeted_reconciliation'
+
+
+def is_completion_record(meta: Mapping[str, Any]) -> bool:
+    """Is this a record ABOUT its metadata.task_id, as opposed to one merely written by that task?"""
+    return is_orchestrator_completion_record(meta) or (
+        meta.get('source') == TARGETED_RECONCILIATION_SOURCE
+        and meta.get('transition') == TaskStatus.DONE
+    )
 
 
 #: Union of every known layer, precomputed for the unknown-key scan.

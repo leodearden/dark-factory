@@ -3407,7 +3407,7 @@ def test_is_authoritative_resolution_truth_table(metadata, expected):
     task's own earlier echoes never trigger suppression or oscillation.
 
     `stage2_suppress` is authoritative only when the memory is NOT this
-    reconciler's own echo (source != _ECHO_SOURCE):
+    reconciler's own echo (source != TARGETED_RECONCILIATION_SOURCE):
     `targeted_echo_with_suppress_not_authoritative` below locks in that even
     once TargetedReconciliation's own completion echo also stamps
     `stage2_suppress` (to seed Stage 2's suppression count gate), that
@@ -4574,7 +4574,7 @@ async def test_on_task_done_refetches_when_snapshot_provenance_unusable(
 # redispatched, but the stale echo was never deleted, so it kept lingering in
 # Mem0 search alongside (and even after) a second, correctly-cited echo.
 # _on_task_blocked must delete this reconciler's own completion echoes
-# (metadata source==_ECHO_SOURCE AND transition=='done') for task_id when the
+# (metadata source==TARGETED_RECONCILIATION_SOURCE AND transition=='done') for task_id when the
 # PRE-transition status (task_before) was 'done' -- i.e. a genuine
 # reopen-from-done, not an ordinary pending/in-progress->blocked transition.
 
@@ -4737,7 +4737,7 @@ async def test_on_task_blocked_reopen_preserves_non_echo_memories(
     echoes. A non-echo, task_id-tagged memory (e.g. flag_dedup.py's
     stage1_flag_marker) picked up by the same {'task_id'} scroll must never
     be deleted -- _is_authoritative_resolution's over-suppression concern
-    (task 1984) applies equally here: only source==_ECHO_SOURCE AND
+    (task 1984) applies equally here: only source==TARGETED_RECONCILIATION_SOURCE AND
     transition=='done' identifies a completion echo. Hint attachment must
     still proceed normally alongside the (no-op) sweep."""
     mock_memory_service.get_memories_by_metadata = AsyncMock(return_value=[
