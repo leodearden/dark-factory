@@ -86,7 +86,8 @@ _ESC_433_1_CLAIM = (
 
 
 # A verbatim excerpt of the claimed clause of scoping_intake esc-unverified-claim-506-1
-# (memory dd0410c1). 'task 506's merged tree' here is the branch tree with its work merged in.
+# (memory dd0410c1). 'task 506's merged tree' here is the tree of branch task/506 with main
+# merged into it; task 506 itself had not landed.
 _ESC_506_1_CLAIM = (
     'measured on 2026-11-02 the full suite on task 506\'s merged tree took 692 s '
     'for 5778 tests under host load ~100 on 32 cores (604 s for 5737 at 17:20 the same day)'
@@ -626,7 +627,7 @@ class TestNonAssertiveScopes:
                 id='esc-unverified-claim-195-2',
             ),
             pytest.param('branch task/5422 is merged up with main', 'reify', id='merged-up-with'),
-            pytest.param('task/5422 was merged up to main', 'reify', id='merged-up-to'),
+            pytest.param('task/5422 was merged up to abc1234', 'reify', id='merged-up-to-sha'),
         ],
     )
     def test_a_catch_up_merge_into_a_branch_is_not_a_claim(self, text, project):
