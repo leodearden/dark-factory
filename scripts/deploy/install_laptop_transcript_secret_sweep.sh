@@ -106,5 +106,5 @@ enabled="$($SSH "$LAPTOP_HOST" systemctl --user is-enabled "$UNIT.timer" || true
 log "done: $UNIT.timer enabled on $LAPTOP_HOST with the laptop drop-in (nightly 02:30, no run kicked)"
 log "run one now:  ssh $LAPTOP_HOST systemctl --user start $UNIT.service"
 log "its record:   ssh $LAPTOP_HOST journalctl --user -u $UNIT.service"
-log "dry run:      ssh $LAPTOP_HOST PATH=\$HOME/.local/bin:\$PATH $REMOTE_REPO/scripts/$UNIT.sh" \
-    "--host-configs-dir /home/leo/.config/orchestrator --no-escalation --dry-run"
+log "dry run:      ssh $LAPTOP_HOST 'PATH=\$HOME/.local/bin:\$PATH $REMOTE_REPO/scripts/$UNIT.sh" \
+    "--host-configs-dir /home/leo/.config/orchestrator --no-escalation --dry-run'"
