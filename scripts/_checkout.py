@@ -3,9 +3,13 @@
 Importing this module puts every ``<member>/src`` that this checkout's root
 pyproject.toml declares at the front of ``sys.path``, in declared order. A script
 binds itself with ``import _checkout as _checkout`` placed before its first
-first-party import. :func:`workspace_members` is the one reader of the member
-list, and scripts/source_measures.py reads it through here. Contract:
-plans/review-all-s25-scripts-instruments-prd.md C1/D2.
+first-party import. Contract: plans/review-all-s25-scripts-instruments-prd.md
+C1/D2.
+
+:func:`workspace_members` extends C1, whose import was the whole API, with a
+callable reader of any root's member list. It is the one reader of that list
+in scripts/: the binding goes through it, and so does
+scripts/source_measures.py when it measures a tree.
 """
 from __future__ import annotations
 
@@ -14,12 +18,17 @@ import tomllib
 from pathlib import Path
 from typing import Final
 
-MEMBERS_KEY: Final = '[tool.uv.workspace].members'
+_MEMBERS_PATH: Final = ('tool', 'uv', 'workspace', 'members')
+MEMBERS_KEY: Final = f'[{".".join(_MEMBERS_PATH[:-1])}].{_MEMBERS_PATH[-1]}'
 _GLOB_CHARS: Final = '*?['
 
 
 class CheckoutBindingError(ImportError, RuntimeError):
-    """This checkout's members are unknown, so its script must not run against another's."""
+    """A pyproject's [tool.uv.workspace].members cannot be read as a plain member list.
+
+    Raised at import, it means this checkout's members are unknown, so its script
+    must not run against another's.
+    """
 
 
 def _refusal(pyproject: Path, reason: str) -> CheckoutBindingError:
@@ -35,7 +44,7 @@ def _read_config(pyproject: Path) -> object:
 
 def _declared_value(config: object) -> object:
     found: object = config
-    for key in ('tool', 'uv', 'workspace', 'members'):
+    for key in _MEMBERS_PATH:
         found = found.get(key) if isinstance(found, dict) else None
     return found
 

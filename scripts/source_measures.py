@@ -1077,15 +1077,14 @@ def _lookup(config: object, *keys: str) -> object:
     return found
 
 
-def _declared_members(root: Path) -> tuple[str, ...]:
-    """*root*'s workspace members, as ``_checkout.workspace_members`` accepts them.
+def _declared_members(path: Path) -> tuple[str, ...]:
+    """The workspace members the pyproject.toml at *path* declares.
 
-    The acceptance rule is the checkout reader's. Here a member is refused if it
-    is listed twice or shares a pseudo-member's name.
+    The acceptance rule is ``_checkout.workspace_members``'. Here a member is
+    also refused if it is listed twice or shares a pseudo-member's name.
     """
-    path = root / 'pyproject.toml'
     try:
-        members = _checkout.workspace_members(root)
+        members = _checkout.workspace_members(path.parent)
     except _checkout.CheckoutBindingError as exc:
         raise MetricsError(str(exc)) from exc
     duplicates = sorted({member for member in members if members.count(member) > 1})
@@ -1149,7 +1148,7 @@ def _domain_members(root: Path) -> tuple[MemberRoots, ...]:
     if _lookup(config, 'tool', 'uv', 'workspace') is None:
         return _single_package_members(root, path, config)
     return (
-        *(MemberRoots.declared(name) for name in _declared_members(root)),
+        *(MemberRoots.declared(name) for name in _declared_members(path)),
         *PSEUDO_MEMBERS,
     )
 
