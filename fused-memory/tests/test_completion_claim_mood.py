@@ -19,7 +19,9 @@ from fused_memory.services.completion_claim_gate import (
     extract_completion_claims,
 )
 
-_KNOWN = frozenset({'reify', 'dark_factory', 'solar_challenge', 'solar_challenge_platform'})
+_KNOWN = frozenset({
+    'reify', 'dark_factory', 'solar_challenge', 'solar_challenge_platform', 'scoping_intake',
+})
 
 # Verbatim from reify memory 4e6fb418. The quotation spans the '...' clause
 # boundary, so the clause holding 'shipped' has no closing quote of its own.
@@ -375,6 +377,93 @@ class TestNonAssertiveScopes:
             'place of a path'
         )
         assert _triples(text, 'solar_challenge') == [('disposition', 'task', '359')]
+
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param(
+                'task 5422 is conditional on #6020 having landed', 'reify',
+                id='conditional-on',
+            ),
+            pytest.param(
+                'conditional upon task 6020 having merged', 'reify', id='conditional-upon',
+            ),
+            pytest.param(
+                'contingent on task 6020 having landed', 'reify', id='contingent-on',
+            ),
+            pytest.param(
+                'the rollout is contingent upon task 6020 having shipped', 'reify',
+                id='contingent-upon',
+            ),
+            pytest.param(
+                'dependent on task 6020 having landed', 'reify', id='dependent-on',
+            ),
+            pytest.param('the fix is gated on task 6020 landed', 'reify', id='gated-on'),
+            pytest.param(
+                'task 5422 stays blocked on task 6020 merged', 'reify', id='blocked-on',
+            ),
+            pytest.param('subject to task 6020 having shipped', 'reify', id='subject-to'),
+            pytest.param('provided that task 6020 has landed', 'reify', id='provided-that'),
+            pytest.param('provided task 6020 has landed', 'reify', id='provided'),
+            pytest.param('assuming task 6020 has landed', 'reify', id='assuming'),
+            pytest.param('assuming that task 6020 has landed', 'reify', id='assuming-that'),
+            pytest.param(
+                'Depends on task 5707 having landed (jsx_open_tag_end must exist on main)',
+                'dark_factory',
+                id='depends-on-70528099',
+            ),
+            pytest.param(
+                'Depends on task 4317 (param-before-let fix) being merged first', 'reify',
+                id='depends-on-4e700da5',
+            ),
+            pytest.param(
+                'DEPENDS ON task 826 being merged, because times.Clock lands there',
+                'scoping_intake',
+                id='depends-on-b028e795',
+            ),
+            pytest.param(
+                'Do not skip S1 work assuming Task 1648 was cancelled', 'reify',
+                id='assuming-c33dbed7',
+            ),
+            pytest.param(
+                "Rationale: The task's two branches assume that task 222 is either "
+                'unplanned or landed',
+                'solar_challenge',
+                id='esc-unverified-claim-222-2',
+            ),
+        ],
+    )
+    def test_a_ref_governed_by_a_contingency_head_is_not_claimed(self, text, project):
+        assert _triples(text, project) == []
+
+    @pytest.mark.parametrize(
+        ('text', 'project', 'claim'),
+        [
+            pytest.param(
+                'task 1543 depends on cancelled task 1542', 'reify',
+                ('disposition', 'task', '1542'),
+                id='forward-bound-attributive',
+            ),
+            pytest.param(
+                'Task 445 (test_web_chart_colours.py palette-edit guard no longer depends on '
+                'a hand-listed set of chart builders) landed via merge c63fb49c15 touching '
+                'tests/unit/test_web_chart_colours.py',
+                'solar_challenge',
+                ('applied_work', 'task', '445'),
+                id='head-inside-a-parenthetical',
+            ),
+            # 'pending' is left out of the heads by measurement: its status-adjective reading dominates.
+            pytest.param(
+                'Pending task 1686 is filed the same way: task_kind normal, and no dependency '
+                'on the task 1523 merge it waits for',
+                'solar_challenge',
+                ('filing_dispatch', 'task', '1686'),
+                id='pending-is-not-a-head',
+            ),
+        ],
+    )
+    def test_a_contingency_head_governs_only_its_own_object(self, text, project, claim):
+        assert _triples(text, project) == [claim]
 
 
 _ESC_5471_1 = (
