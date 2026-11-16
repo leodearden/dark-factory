@@ -227,10 +227,19 @@ class ServerConfig(BaseModel):
 
 # --- LLM ---
 
+_RETIRED_OPENAI_PROVIDER_KEYS: frozenset[str] = frozenset({'organization_id'})
+
+
 class OpenAIProviderConfig(BaseModel):
     api_key: str | None = None
     api_url: str = 'https://api.openai.com/v1'
-    organization_id: str | None = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_retired_keys(cls, data: object) -> object:
+        return drop_retired_keys(
+            data, section='providers.openai', retired=_RETIRED_OPENAI_PROVIDER_KEYS,
+        )
 
 
 class AnthropicProviderConfig(BaseModel):
