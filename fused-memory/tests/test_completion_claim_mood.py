@@ -75,6 +75,14 @@ _ESC_1125_1_MEMORY = (
 )
 
 
+# The claimed clause of scoping_intake esc-unverified-claim-433-1, verbatim; it is also
+# the whole text of scoping-intake task 440. What merged is a mock of the planned edits.
+_ESC_433_1_CLAIM = (
+    'Measured: `git merge-file` of the prototype against a mock of task 433\'s planned '
+    "edits merged cleanly, and so did a merge against a mock of task 422's"
+)
+
+
 def _extract(text: str, default_project_id: str = 'reify') -> list[CompletionClaim]:
     return extract_completion_claims(
         text,
@@ -531,6 +539,24 @@ class TestNonAssertiveScopes:
     )
     def test_a_necessity_verb_governs_only_its_own_object(self, text, claim):
         assert _triples(text) == [claim]
+
+    def test_a_trial_merge_against_a_mock_claims_neither_task(self):
+        claimed = {ref for _, _, ref in _triples(_ESC_433_1_CLAIM, 'scoping_intake')}
+        assert claimed.isdisjoint({'433', '422'})
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param('a dry run of task 5422 merged cleanly', id='dry-run-of'),
+            pytest.param('a trial merge of task 5422 merged cleanly', id='trial-merge-of'),
+            pytest.param('a mock of the task 5422 edits merged cleanly', id='mock-of-the'),
+            pytest.param(
+                'the simulation of task 5422 landed without conflicts', id='simulation-of',
+            ),
+        ],
+    )
+    def test_a_ref_governed_by_a_simulation_head_is_not_claimed(self, text):
+        assert _triples(text) == []
 
 
 _ESC_5471_1 = (
