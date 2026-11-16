@@ -5,16 +5,16 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+import pytest
 from shared.scheduler_state import SchedulerStateSnapshot
 
-from dashboard.data.lock_contention import KeyHolders, key_holders, lock_wanters
+from dashboard.data.lock_contention import KeyHolders, key_holders_in, lock_wanters
 
 UNLIMITED = sys.maxsize
 
 
 def _held(key: str, **snapshot: Any) -> KeyHolders:
-    snap = SchedulerStateSnapshot.from_json(snapshot)
-    return key_holders(key, snap.holders_by_key(), snap.holder_limit)
+    return key_holders_in(SchedulerStateSnapshot.from_json(snapshot))(key)
 
 
 def test_each_member_wants_a_key_once_however_often_its_lock_set_names_it():
@@ -113,3 +113,27 @@ class TestBlocks:
 
     def test_an_unheld_key_blocks_no_task(self):
         assert KeyHolders(holders=(), at_limit=False).blocks('B') is False
+
+
+class TestKeyHoldersInvariants:
+    def test_no_holders_cannot_fill_a_limit(self):
+        with pytest.raises(ValueError, match=r'holders=\(\), at_limit=True'):
+            KeyHolders(holders=(), at_limit=True)
+
+    def test_holders_out_of_order_are_refused(self):
+        with pytest.raises(ValueError, match=r"\('B', 'A'\)"):
+            KeyHolders(holders=('B', 'A'), at_limit=True)
+
+    def test_a_repeated_holder_is_refused(self):
+        with pytest.raises(ValueError, match=r"\('A', 'A'\)"):
+            KeyHolders(holders=('A', 'A'), at_limit=False)
+
+
+def test_one_snapshot_answers_every_key_it_is_asked_about():
+    holders_of = key_holders_in(SchedulerStateSnapshot.from_json({
+        'held_by_task': {'A': ['src/a.py'], 'B': ['OPERATIONS.md']},
+        'holder_limits': {'src/a.py': 1, 'OPERATIONS.md': UNLIMITED},
+    }))
+    assert holders_of('src/a.py') == KeyHolders(holders=('A',), at_limit=True)
+    assert holders_of('OPERATIONS.md') == KeyHolders(holders=('B',), at_limit=False)
+    assert holders_of('src/b.py') == KeyHolders(holders=(), at_limit=False)

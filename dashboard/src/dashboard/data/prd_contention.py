@@ -30,7 +30,7 @@ from dashboard.data.datum import (
     aged_at,
     unknown_datum,
 )
-from dashboard.data.lock_contention import KeyHolders, key_holders, lock_wanters
+from dashboard.data.lock_contention import KeyHolders, key_holders_in, lock_wanters
 from dashboard.data.prd_view import (
     HIGH_PRIORITIES,
     InputState,
@@ -171,7 +171,13 @@ class NeverStarted:
 
 @dataclass(frozen=True, slots=True)
 class Contention:
-    """One root's contention line (PRD §5.5's ``Contention``)."""
+    """One root's contention line: PRD §5.5's ``Contention`` as task 10211 reshaped it.
+
+    That PRD still shows ``top[].holder`` and ``held_share[].naming_held_key``.
+    Each ``top`` entry now names every holder (``holders``) and whether they
+    fill the key's limit (``at_holder_limit``), and ``held_share`` counts
+    ``naming_full_key``.
+    """
 
     lock_depth: int
     snapshot_at: datetime
@@ -255,10 +261,8 @@ def _wants(
 ) -> _Wants:
     keys = {row['id']: _lock_keys(row, lock_depth) for row in ready}
     wanted = lock_wanters(keys.values())
-    holders_by_key = snapshot.holders_by_key()
-    return _Wants(keys, wanted, {
-        key: key_holders(key, holders_by_key, snapshot.holder_limit) for key in wanted
-    })
+    holders_of = key_holders_in(snapshot)
+    return _Wants(keys, wanted, {key: holders_of(key) for key in wanted})
 
 
 def _top(wants: _Wants, status_map: Mapping[int, str]) -> tuple[LockKey, ...]:

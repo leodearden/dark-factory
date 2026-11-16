@@ -90,7 +90,7 @@ from shared.scheduler_state import (
 from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import collect_tasks_with_counts
 from dashboard.data.datum import Datum, DatumState, unknown_datum
-from dashboard.data.lock_contention import key_holders, lock_wanters
+from dashboard.data.lock_contention import key_holders_in, lock_wanters
 from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.served_read import ServedRead
@@ -409,11 +409,11 @@ def _module_contention_counts(
     }
     all_paths = contended_paths | park_only_keys
 
-    holders_by_key = snapshot.holders_by_key()
+    holders_of = key_holders_in(snapshot)
     result: list[dict] = []
     for path in all_paths:
         count = counts.get(path, 0)
-        held = key_holders(path, holders_by_key, snapshot.holder_limit)
+        held = holders_of(path)
         holder = held.holders[0] if held.holders else None
         holder_live = (
             any(h in live_task_ids for h in held.holders)
