@@ -49,6 +49,9 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
+
+from shared.task_statuses import OwnerLiveness, owner_liveness
 
 from orchestrator.flake_ledger import (
     DUE_ITEM_STALE_AFTER,
@@ -297,6 +300,27 @@ def compute_gate_blind(
 
 
 @dataclass(frozen=True)
+class OwnerStatuses:
+    """One successful live read of the open rows' owners.  An id the read omitted is a
+    corroborated absence, so it classifies ``CLOSED``."""
+
+    statuses: Mapping[str, str]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'statuses', MappingProxyType(dict(self.statuses)))
+
+    def liveness(self, owner_task_id: str) -> OwnerLiveness:
+        return owner_liveness(self.statuses.get(owner_task_id))
+
+
+@dataclass(frozen=True)
+class OwnerReadFailed:
+    """The owner read produced nothing, so no verdict on any owner is made."""
+
+    error: str
+
+
+@dataclass(frozen=True)
 class NonConvergenceCounter:
     """Open debt that is not resolving: recurrence, age, and unowned rows."""
 
@@ -312,6 +336,24 @@ class NonConvergenceCounter:
     # stamps from remote hosts, so skew between such a host and the dispatcher lands
     # here.  Counted separately because the two have different fixes.
     future_dated: int = 0
+    # Owned rows whose owner reads DONE / cancelled-or-gone; None = owners not read.
+    owner_done_tests: int | None = None
+    owner_closed_tests: int | None = None
+
+
+def _terminal_owner_counts(
+    open_debt_rows: Sequence[DebtRow],
+    owner_statuses: OwnerStatuses | None,
+) -> tuple[int | None, int | None]:
+    """(DONE, CLOSED) owned-row counts, or ``(None, None)`` when the owners were not read."""
+    if owner_statuses is None:
+        return None, None
+    verdicts = [
+        owner_statuses.liveness(row.owner_task_id)
+        for row in open_debt_rows
+        if row.owner_task_id
+    ]
+    return verdicts.count(OwnerLiveness.DONE), verdicts.count(OwnerLiveness.CLOSED)
 
 
 def compute_non_convergence(
@@ -319,6 +361,7 @@ def compute_non_convergence(
     now: datetime,
     *,
     age_days: int = DEFAULT_DEBT_AGE_ESCALATE_DAYS,
+    owner_statuses: OwnerStatuses | None = None,
 ) -> NonConvergenceCounter:
     """Summarise open debt against §5.6's class-2 triggers.
 
@@ -333,7 +376,10 @@ def compute_non_convergence(
     breach, and the single most consequential state this report can encounter, because
     §5.7's suppression LANDS the merge: once a test is suppressed, nothing except the
     debt invariant keeps it visible at all.  Counting it (and rendering it loudly) is a
-    READ of the ledger; ι files nothing.
+    READ of the ledger; ι files nothing.  An owner that *owner_statuses* reads DONE or
+    cancelled/gone is the same §5.9 breach, since no live task owns the test; those are
+    counted separately (``owner_done_tests`` / ``owner_closed_tests``) because the
+    remedies differ.
 
     An unparseable ``opened_at`` is counted in its own bucket and contributes to neither
     ``over_age_tests`` nor ``oldest_age``, so a row whose clock cannot be read is
@@ -363,6 +409,7 @@ def compute_non_convergence(
             over_age += 1
         if oldest is None or age > oldest:
             oldest = age
+    owner_done, owner_closed = _terminal_owner_counts(open_debt_rows, owner_statuses)
     return NonConvergenceCounter(
         open_tests=len(open_debt_rows),
         recurrent_tests=recurrent,
@@ -372,6 +419,8 @@ def compute_non_convergence(
         oldest_age=oldest,
         age_threshold_days=age_days,
         future_dated=future_dated,
+        owner_done_tests=owner_done,
+        owner_closed_tests=owner_closed,
     )
 
 
