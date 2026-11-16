@@ -7,7 +7,7 @@ the matcher's unit tests are in shared/tests/test_capability_manifest_twins.py.
 from __future__ import annotations
 
 import pytest
-from capability_manifest_corpus import REPO_ROOT, discover_manifests
+from capability_manifest_corpus import REPO_ROOT, discover_manifests, missing_from_worktree_message
 from capability_manifest_twins import check_md_twin
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
@@ -26,5 +26,8 @@ class TestCheckedInManifestTwins:
 
     @pytest.mark.parametrize('sidecar', _SIDECARS, ids=_SIDECAR_IDS)
     def test_md_twin_mentions_every_sidecar_label(self, sidecar):
-        message = check_md_twin(sidecar, REPO_ROOT)
+        try:
+            message = check_md_twin(sidecar, REPO_ROOT)
+        except FileNotFoundError:
+            pytest.fail(missing_from_worktree_message(sidecar))
         assert message is None, message

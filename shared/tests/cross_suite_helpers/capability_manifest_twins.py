@@ -60,6 +60,7 @@ def _display(path: Path, repo_root: Path) -> Path:
 
 
 def check_md_twin(sidecar: Path, repo_root: Path) -> str | None:
+    labels = [task.label for task in load_capability_manifest(sidecar).tasks]
     twin = md_twin_path(sidecar)
     sidecar_rel, twin_rel = _display(sidecar, repo_root), _display(twin, repo_root)
     if not twin.is_file():
@@ -67,7 +68,6 @@ def check_md_twin(sidecar: Path, repo_root: Path) -> str | None:
             f'{sidecar_rel}: no .md twin at {twin_rel} — '
             'the human-readable manifest must sit beside its sidecar'
         )
-    labels = [task.label for task in load_capability_manifest(sidecar).tasks]
     missing = unmentioned_labels(labels, twin.read_text(encoding='utf-8'))
     if not missing:
         return None

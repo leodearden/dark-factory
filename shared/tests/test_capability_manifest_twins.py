@@ -142,6 +142,22 @@ class TestCheckMdTwin:
         assert message is not None
         assert '\n' not in message
 
+    def test_a_path_outside_repo_root_is_displayed_absolute(self, tmp_path):
+        sidecar = _write_pair(tmp_path / 'elsewhere', _sidecar_yaml('α'), None)
+        message = check_md_twin(sidecar, tmp_path / 'repo')
+        assert message is not None
+        assert str(sidecar) in message
+        assert str(sidecar.with_suffix('.md')) in message
+
+    @pytest.mark.parametrize('md_text', [None, '## α — first\n'])
+    def test_a_sidecar_missing_from_disk_propagates_whether_or_not_its_twin_exists(
+        self, tmp_path, md_text
+    ):
+        sidecar = _write_pair(tmp_path, _sidecar_yaml('α'), md_text)
+        sidecar.unlink()
+        with pytest.raises(FileNotFoundError):
+            check_md_twin(sidecar, tmp_path)
+
     def test_a_schema_invalid_sidecar_propagates_instead_of_reporting_twin_drift(self, tmp_path):
         invalid = _sidecar_yaml('α', extra_capability_key='        verdcit: PASS\n')
         sidecar = _write_pair(tmp_path, invalid, '## α — first\n')
