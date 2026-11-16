@@ -16,6 +16,7 @@ import pytest
 from _markup_sink_rig import LossRecorder
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from shared.mcp_markup_middleware import MARKUP_STORM_ERROR_TYPE, MARKUP_UNREPAIRABLE_ERROR_TYPE
 from shared.project_layout import escalation_queue_dir
 
 from orchestrator.mcp import markup_sink
@@ -36,7 +37,7 @@ SPEC = markup_sink.MarkupSinkSpec(
 
 def _residue_record() -> dict[str, Any]:
     return {
-        'error_type': markup_sink.MARKUP_RESIDUE_ERROR_TYPE,
+        'error_type': MARKUP_UNREPAIRABLE_ERROR_TYPE,
         'category': 'mcp_markup_residue',
         'owner': 'l2-escalation-watcher',
         'level': 2,
@@ -53,7 +54,7 @@ def _residue_record() -> dict[str, Any]:
 
 def _storm_record() -> dict[str, Any]:
     return {
-        'error_type': markup_sink.MARKUP_STORM_ERROR_TYPE,
+        'error_type': MARKUP_STORM_ERROR_TYPE,
         'count': 7,
         'threshold': 5,
         'window_seconds': 3600,
