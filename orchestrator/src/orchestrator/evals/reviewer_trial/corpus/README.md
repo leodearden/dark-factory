@@ -40,8 +40,12 @@ Each entry: `{diff_id, language, source, description, project?, split?}`.
 - `language` — `"python" | "rust" | "typescript"`.
 - `source` — `"synthetic"` (planted mutation) | `"real_world"` (hand-picked
   real bug, pre-task-2495) | `"mined"` (task-2495 FN mining, see below).
-- `project` — optional; selects the working directory a reviewer would see
-  around the diff (`corpus._PROJECT_CWD_MAP`). All mined diffs use
+- `project` — optional; selects the checkout a fixture is read from
+  (`CorpusDiff.source_dir`). `"dark-factory"` fixtures, and those with no
+  `project`, use this repository's main checkout. Other projects use their
+  `DASHBOARD_KNOWN_PROJECT_ROOTS` entry (`"reify-gui"` is reify's `gui/`). A
+  fixture whose project has no registered root is reported as not
+  materialisable, never reviewed in dark-factory. All mined diffs use
   `"dark-factory"`.
 - `split` — `"train" | "selection" | "test"`, assigned by
   `mining.assign_split()` (see "Split" below). Every diff has one.

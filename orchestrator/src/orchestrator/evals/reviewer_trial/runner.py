@@ -40,11 +40,7 @@ from orchestrator.evals.reviewer_trial.checkout import (
     FixtureNotMaterialisable,
     fixture_checkout,
 )
-from orchestrator.evals.reviewer_trial.corpus import (
-    DEFAULT_FIXTURE_CWD,
-    CorpusDiff,
-    CorpusManifest,
-)
+from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest
 from orchestrator.evals.reviewer_trial.scorer import ScoringResult, score_panel_run
 from orchestrator.evals.reviewer_trial.variants import (
     ReviewerSpec,
@@ -200,7 +196,7 @@ async def _review_subject(diff: CorpusDiff, checkout: FixtureCheckout) -> Review
         raise FixtureNotMaterialisable(
             diff.diff_id, checkout.unapplied_reason or 'its change is not committed in the clone',
         )
-    conventions_relpath = project_review_config(diff.cwd or DEFAULT_FIXTURE_CWD).briefing_path
+    conventions_relpath = project_review_config(diff.source_dir()).briefing_path
     if not (checkout.root / conventions_relpath).is_file():
         logger.info(
             'Fixture %s: no conventions at %s in its tree; its d2 panel is briefed without them',
@@ -250,7 +246,7 @@ async def _run_single_reviewer(
     role = build_trial_reviewer_role(spec)
     prompt = await _assembler().build_reviewer_prompt(role.name, diff.diff_text, context='')
     return await _review(
-        spec, role, prompt, cwd=diff.cwd or DEFAULT_FIXTURE_CWD, diff_id=diff.diff_id,
+        spec, role, prompt, cwd=diff.source_dir(), diff_id=diff.diff_id,
         max_retries=max_retries, meta_root=meta_root,
     )
 
