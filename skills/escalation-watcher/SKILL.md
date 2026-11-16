@@ -464,7 +464,7 @@ re-finds it). The wrapper preserves the underlying watcher's exit code and emits
 |---|---|---|
 | `WATCHER_REARM_OUTCOME: FIRED` | 0 | A wake: loop back to re-arm, then drain (Main Loop). Exit 0 with EMPTY stdout is a caught SIGTERM (`scripts/watcher-rearm.sh` header), not a fire, and it counts against the cap. |
 | `WATCHER_REARM_OUTCOME: CEILING` | 124 | The hourly heartbeat: re-arm in the background as normal. The cap exempts it, because this lane's AFK loop runs on CEILING ticks for up to 48h. |
-| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Never re-issue a killed FOREGROUND arm in the foreground: move to the `run_in_background` pattern. A BACKGROUND arm that died with no marker at ~2 min had no Bash `timeout` ("Diagnostic — watcher dies at ~2 minutes" below), and re-arming WITH it is a material change. Re-touch the `watcher-<project>` lease before assuming a second watcher is needed. Counts against the cap. |
+| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Never re-issue a killed FOREGROUND arm in the foreground: move to the `run_in_background` pattern. A BACKGROUND arm the CLI stopped at its background time limit (its task notification says so) had no Bash `timeout`, or one shorter than the slice ("Diagnostic — an arm stopped from outside" below), and re-arming WITH it is a material change. Re-touch the `watcher-<project>` lease before assuming a second watcher is needed. Counts against the cap. |
 | `WATCHER_REARM_OUTCOME: ERROR` | any other; exit 2 prints NO marker | Diagnose from stderr before any retry. Exit 2 is a usage/guard error (unset `DARK_FACTORY_ROOT`, unresolved queue dir, bad flag): it returns before the watcher runs and recurs until fixed. Counts against the cap. |
 
 **Identical-retry cap: 1.** After KILLED, ERROR, a missing marker, an empty-stdout FIRED or a
@@ -490,26 +490,27 @@ here always means a drop. The line travels the watcher's logging stream, so it c
 level as a prefix (`ERROR: WATCHER_NTFY_OUTCOME: FAILED ...`) — match on the marker as a
 substring rather than anchoring at the start of the line.
 
-**Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice before
-returning, and **every** call — background *and* foreground — must carry an explicit Bash-tool
-`timeout` parameter sized to at least `(--timeout + 60s) × 1000` ms — e.g. `timeout: 3660000` for
-`--timeout 3600`. `run_in_background: true` does **not** exempt a call from the harness timeout.
-With that parameter passed, use the long canonical slice: `--timeout 3600` yields at most one heartbeat wake per hour (`CEILING`) while a
-real L2 escalation still fires instantly via inotify. A short slice buys no protection — the old
-`--timeout 540` merely forced a wake-notify-rearm turn every 9 minutes. A slice that long requires
-`BASH_MAX_TIMEOUT_MS` ≥ that value in the settings env (dark-factory onboarding provisions it —
-see `skills/factory-init`). Only on a machine WITHOUT that setting does the harness's 600000ms
-(10 min) cap apply: there, cap the slice at `--timeout 540` and set the Bash tool's `timeout`
-**≥ 600000ms** so the slice can return before the harness kills it.
+**Bash-tool timeout contract:** the wrapper blocks for up to `--timeout` seconds per slice. Every
+call, background and foreground, carries an explicit Bash-tool `timeout` of at least
+`(--timeout + 60s) × 1000` ms, e.g. `timeout: 3660000` for `--timeout 3600`. For a background call
+that parameter is the CLI's background deadline, and at that limit the CLI stops the command.
+Without it the CLI applies its default background deadline (the Bash tool's description states the
+current default and maximum; on CLI 2.1.325 they are 1800000 ms and 7200000 ms), which stops a
+3600 s slice before it can return `CEILING`. Use the long canonical slice `--timeout 3600`: at most
+one heartbeat wake per hour (`CEILING`) while a real L2 escalation still fires at once via inotify.
+A short slice buys no protection. A FOREGROUND call (debugging only) is capped by
+`BASH_MAX_TIMEOUT_MS`, 600000 ms when unset (dark-factory onboarding raises it, see
+`skills/factory-init`); without that setting a foreground arm uses `--timeout 540` and a Bash
+`timeout` of at least 600000 ms.
 
-**Diagnostic — watcher dies at ~2 minutes with no outcome line:** if an arm disappears after
-roughly 120s and stderr carries **no** `WATCHER_REARM_OUTCOME` line, the Bash `timeout` parameter
-was omitted. The wrapper emits that line on every exit path including its own timeout, so its
-absence means the exit handler never ran — an external SIGKILL to the process group, not a wrapper
-or watcher fault (the 07-09 exit-143 failure mode the wrapper exists to bound; it cannot bound a
-kill of the whole group). This hides during a backlog drain, where every arm FIRES within seconds
-and finishes well inside the 120s window; the kills only start once the queue is fully triaged and
-the watcher genuinely waits, leaving a loop that looks armed but reaps itself every ~2 minutes.
+**Diagnostic — an arm stopped from outside:** the wrapper prints `WATCHER_REARM_OUTCOME` on every
+exit path it controls, including its own timeout, except the exit-2 guard error (the ERROR row
+above). So a missing line with any exit other than 2 means the process group was killed from
+outside (the 07-09 exit-143 failure mode the wrapper exists to bound; it cannot bound a kill of the
+whole group). When the CLI's task notification says the command was stopped at its
+background time limit, the Bash `timeout` was missing or shorter than the slice, whatever marker the
+wrapper printed: re-arm with `(--timeout + 60) × 1000` ms. This hides during a backlog drain, where
+every arm FIRES within seconds, and shows once the queue is triaged and the watcher genuinely waits.
 
 **Re-arming over deliberately-pending items:** any L2 item you deliberately left pending (Priority
 3b, `design_concern`, `risk_identified`, `infra_issue`, AFK leave-pending paths) sits in the queue
@@ -1201,7 +1202,7 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
    <!-- merge-state-vocab:end -->
    (`already_merged` is a *submit* status the server collapses to `done` when observed by
    polling — see step 1 and
-   `escalation/src/escalation/server.py::_map_terminal_state`.)
+   `escalation/src/escalation/merge_status_answer.py::map_terminal_state`.)
    After an orchestrator restart,
    `{state: 'unknown', hint: 'check git log main'}` → fall back to `git log main` (PRD I3).
 
