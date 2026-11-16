@@ -17,6 +17,7 @@ from shared.account_reserve import (
     ReserveEvent,
     WorkClass,
     WorkKind,
+    admits,
     resolve_work_class,
 )
 
@@ -182,3 +183,78 @@ class TestAdmitTiers:
         assert tiers.for_project('dark_factory') == ('critical', 'high', 'medium')
         assert tiers.for_project('reify') == ('critical', 'high')
         assert tiers.for_project(None) == ('critical', 'high')
+
+
+PROTECTED = utc(2026, 11, 18, 12)
+RELEASE = utc(2026, 11, 22, 10)
+
+ESSENTIAL = WorkClass(kind=WorkKind.ESSENTIAL)
+BACKGROUND = WorkClass(kind=WorkKind.BACKGROUND)
+
+
+def task_work(tier: str | None, project_id: str | None = 'dark_factory') -> WorkClass:
+    return WorkClass(kind=WorkKind.TASK, project_id=project_id, tier=tier)
+
+
+class TestAdmits:
+    @pytest.mark.parametrize(
+        ('work_class', 'admitted'),
+        [
+            pytest.param(ESSENTIAL, True, id='essential'),
+            pytest.param(BACKGROUND, False, id='background'),
+            pytest.param(task_work('critical'), True, id='task-critical'),
+            pytest.param(task_work('high'), True, id='task-high'),
+            pytest.param(task_work('medium'), False, id='task-medium'),
+            pytest.param(task_work('low'), False, id='task-low'),
+            pytest.param(task_work(None), False, id='task-without-tier'),
+        ],
+    )
+    def test_protected_window_with_the_default_list(
+        self, work_class: WorkClass, admitted: bool
+    ) -> None:
+        assert admits(reserve_config(), work_class, PROTECTED) is admitted
+
+    @pytest.mark.parametrize(
+        ('work_class', 'admitted'),
+        [
+            pytest.param(task_work('medium', 'dark_factory'), True, id='listed-project'),
+            pytest.param(task_work('medium', 'reify'), False, id='other-project'),
+            pytest.param(task_work('medium', None), False, id='no-project'),
+            pytest.param(task_work(None, 'dark_factory'), True, id='missing-tier-reads-medium'),
+        ],
+    )
+    def test_protected_window_with_a_project_list(
+        self, work_class: WorkClass, admitted: bool
+    ) -> None:
+        config = reserve_config(admit_tiers={'dark_factory': ['critical', 'high', 'medium']})
+
+        assert admits(config, work_class, PROTECTED) is admitted
+
+    def test_an_empty_default_list_still_admits_essential_work(self) -> None:
+        config = reserve_config(admit_tiers={'default': []})
+
+        assert admits(config, task_work('high'), PROTECTED) is False
+        assert admits(config, ESSENTIAL, PROTECTED) is True
+
+    @pytest.mark.parametrize(
+        'work_class',
+        [
+            pytest.param(BACKGROUND, id='background'),
+            pytest.param(task_work('low'), id='task-low'),
+            pytest.param(task_work(None), id='task-without-tier'),
+            pytest.param(ESSENTIAL, id='essential'),
+        ],
+    )
+    def test_release_window_admits_everything(self, work_class: WorkClass) -> None:
+        assert admits(reserve_config(), work_class, RELEASE) is True
+
+    def test_the_kind_decides_not_the_role(self) -> None:
+        steward_on_a_low_task = WorkClass(
+            kind=WorkKind.TASK,
+            project_id='dark_factory',
+            tier='low',
+            task_id='42',
+            role='steward',
+        )
+
+        assert admits(reserve_config(), steward_on_a_low_task, PROTECTED) is False
