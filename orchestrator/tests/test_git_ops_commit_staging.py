@@ -8,6 +8,7 @@ lands.  Git is real because the behaviour under test is git's own staging.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from pathlib import Path
 
@@ -120,6 +121,31 @@ class TestCommitEmbeddedRepoGitlinks:
         entries = _committed_entries(wt, sha)
         assert 'work.py' in entries
         assert _gitlink_paths(entries) == []
+
+    async def test_unstaging_a_glob_named_gitlink_keeps_its_lookalike_sibling(
+        self, git_ops: GitOps,
+    ) -> None:
+        wt = (await git_ops.create_worktree('gitlink-glob')).path
+        _plant_embedded_repo(wt, 'scratch/[t]0', with_commit=True)
+        (wt / 'scratch/t0').write_text('real work\n')
+
+        sha = await git_ops.commit(wt, 'wip')
+
+        assert sha is not None
+        entries = _committed_entries(wt, sha)
+        assert 'scratch/t0' in entries
+        assert _gitlink_paths(entries) == []
+
+    async def test_non_utf8_staged_path_fails_closed(self, git_ops: GitOps) -> None:
+        wt = (await git_ops.create_worktree('non-utf8')).path
+        (wt / os.fsdecode(b'\xe9.txt')).write_text('x\n')
+        head_before = _git(wt, 'rev-parse', 'HEAD')
+
+        with pytest.raises(RuntimeError, match='not valid UTF-8') as excinfo:
+            await git_ops.commit(wt, 'wip')
+
+        assert str(wt) in str(excinfo.value)
+        assert _git(wt, 'rev-parse', 'HEAD') == head_before
 
     async def test_embedded_repo_as_only_change_commits_nothing(
         self, git_ops: GitOps,

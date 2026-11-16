@@ -11,17 +11,16 @@ registered submodule's pointer bump (160000 to 160000) is legitimate.
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Sequence
 from pathlib import Path
+
+from orchestrator.rebase_recovery import AbortRunner as GitRunner
 
 logger = logging.getLogger(__name__)
 
 GITLINK_MODE = '160000'
 
-#: Runs a git argv in ``cwd`` and returns ``(returncode, stdout, stderr)``.
-#: Injected because the caller, ``orchestrator/src/orchestrator/git_ops.py``,
-#: owns the spawn seam.
-GitRunner = Callable[..., Awaitable[tuple[int, str, str]]]
+_LISTED_PATH_LIMIT = 10
 
 _STAGED_RAW_DIFF_ARGV: tuple[str, ...] = (
     'git', 'diff', '--cached', '--raw', '-z', '--no-renames', '--ignore-submodules=none',
@@ -32,14 +31,12 @@ async def unstage_new_gitlinks(worktree: Path, run: GitRunner) -> tuple[str, ...
     """Unstage every gitlink the index newly introduces and return their paths.
 
     The embedded repositories stay on disk.  Raises :class:`RuntimeError` when
-    either git call fails, so an unchecked index never reaches a commit.
+    the staged changes cannot be listed or the unstage fails, so an unchecked
+    index never reaches a commit.  That includes a staged path whose name is
+    not valid UTF-8: *run* decodes git's output strictly, and the ``-z``
+    listing prints every staged path verbatim.
     """
-    rc, raw_diff, err = await run(list(_STAGED_RAW_DIFF_ARGV), cwd=worktree)
-    if rc != 0:
-        raise RuntimeError(
-            f'could not list staged changes in {worktree} to screen for '
-            f'embedded-repo gitlinks (rc={rc}): {err.strip()}'
-        )
+    raw_diff = await _list_staged_changes(worktree, run)
     paths = newly_staged_gitlinks(raw_diff)
     if not paths:
         return ()
@@ -48,14 +45,31 @@ async def unstage_new_gitlinks(worktree: Path, run: GitRunner) -> tuple[str, ...
     )
     if rc != 0:
         raise RuntimeError(
-            f'could not unstage embedded-repo gitlink(s) {list(paths)} '
+            f'could not unstage embedded-repo gitlink(s) {_listed(paths)} '
             f'in {worktree} (rc={rc}): {err.strip()}'
         )
     logger.warning(
         'left %d embedded git repositor%s out of the commit in %s: %s',
-        len(paths), 'y' if len(paths) == 1 else 'ies', worktree, ', '.join(paths),
+        len(paths), 'y' if len(paths) == 1 else 'ies', worktree, _listed(paths),
     )
     return paths
+
+
+async def _list_staged_changes(worktree: Path, run: GitRunner) -> str:
+    screen = f'list staged changes in {worktree} to screen for embedded-repo gitlinks'
+    try:
+        rc, raw_diff, err = await run(list(_STAGED_RAW_DIFF_ARGV), cwd=worktree)
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f'could not {screen}: a staged path is not valid UTF-8') from exc
+    if rc != 0:
+        raise RuntimeError(f'could not {screen} (rc={rc}): {err.strip()}')
+    return raw_diff
+
+
+def _listed(paths: Sequence[str]) -> str:
+    shown = ', '.join(paths[:_LISTED_PATH_LIMIT])
+    hidden = len(paths) - _LISTED_PATH_LIMIT
+    return f'{shown} (+{hidden} more)' if hidden > 0 else shown
 
 
 def newly_staged_gitlinks(raw_diff: str) -> tuple[str, ...]:

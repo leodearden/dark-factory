@@ -7,6 +7,7 @@ are reached.  The real-git behaviour is pinned in test_git_ops_commit_staging.py
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -122,3 +123,25 @@ class TestUnstageNewGitlinks:
         assert str(tmp_path) in message
         assert 'rc=1' in message
         assert 'index.lock' in message
+        assert run.calls[1] == [
+            'git', '--literal-pathspecs', 'reset', '-q', 'HEAD', '--', 'scratch/t0',
+        ]
+
+    @pytest.mark.asyncio
+    async def test_warning_lists_at_most_ten_paths_and_counts_the_rest(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        paths = [f's/a{index:02d}' for index in range(12)]
+        run = _ScriptedRunner(
+            (0, ''.join(_record('000000', '160000', 'A', path) for path in paths), ''),
+            (0, '', ''),
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.staged_gitlinks'):
+            assert await unstage_new_gitlinks(tmp_path, run) == tuple(paths)
+
+        assert run.calls[1][-12:] == paths
+        [message] = [record.getMessage() for record in caplog.records]
+        assert message.startswith('left 12 embedded git repositories')
+        assert 's/a09 (+2 more)' in message
+        assert 's/a10' not in message
