@@ -7,9 +7,11 @@ that seam.  Built on stdlib ``http.server`` for the reason
 ``_mock_openai_server.py`` gives: no HTTP-mock library is installed.
 
 Collection meta-ops (create) run one after another under a single lock, as a
-real Qdrant runs them.  A create's latency is set per collection, and it is
-waited out on :attr:`StubQdrantServer.release_event` rather than slept, so a
-test can end the wait early and no handler thread outlives the server.
+real Qdrant runs them.  The latency of a create, of a point upsert
+(``PUT /collections/{name}/points``) and of a point retrieve
+(``POST /collections/{name}/points``) is set per collection, and it is waited
+out on :attr:`StubQdrantServer.release_event` rather than slept, so a test can
+end the wait early and no handler thread outlives the server.
 
 Binds 127.0.0.1 on port 0, so ``-n auto`` xdist workers cannot collide.
 """
@@ -51,22 +53,28 @@ class StubQdrantServer:
         self,
         *,
         create_delay_s: Mapping[str, float],
+        upsert_delay_s: Mapping[str, float],
+        retrieve_delay_s: Mapping[str, float],
         preexisting: Iterable[str],
         conflict_on_create: Iterable[str],
         create_status: Mapping[str, int],
     ) -> None:
         self.url = ''
         self.release_event = threading.Event()
-        """Set it to finish every pending and future create without its delay."""
+        """Set it to finish every pending and future delayed request without its delay."""
         self._create_delay_s = dict(create_delay_s)
+        self._upsert_delay_s = dict(upsert_delay_s)
+        self._retrieve_delay_s = dict(retrieve_delay_s)
         self._conflict_on_create = frozenset(conflict_on_create)
         self._create_status = dict(create_status)
         self._state_lock = threading.Lock()
         self._meta_op_lock = threading.Lock()
         self._create_requests: Counter[str] = Counter()
         self._exists_requests: Counter[str] = Counter()
+        self._upsert_requests: Counter[str] = Counter()
         self._create_bodies: dict[str, list[dict[str, Any]]] = {}
         self._created: dict[str, threading.Event] = {}
+        self._upserted: dict[str, threading.Event] = {}
         for name in preexisting:
             self._created_event(name).set()
 
@@ -85,13 +93,26 @@ class StubQdrantServer:
         with self._state_lock:
             return self._exists_requests[name]
 
+    def upserts(self, name: str) -> int:
+        """How many ``PUT /collections/{name}/points`` requests the server has received."""
+        with self._state_lock:
+            return self._upsert_requests[name]
+
     def wait_created(self, name: str, timeout: float) -> bool:
         """Block until collection *name* exists server-side; False on timeout."""
         return self._created_event(name).wait(timeout)
 
+    def wait_upserted(self, name: str, timeout: float) -> bool:
+        """Block until an upsert into collection *name* has finished server-side; False on timeout."""
+        return self._upserted_event(name).wait(timeout)
+
     def _created_event(self, name: str) -> threading.Event:
         with self._state_lock:
             return self._created.setdefault(name, threading.Event())
+
+    def _upserted_event(self, name: str) -> threading.Event:
+        with self._state_lock:
+            return self._upserted.setdefault(name, threading.Event())
 
     def _exists(self, name: str) -> bool:
         with self._state_lock:
@@ -123,6 +144,17 @@ class StubQdrantServer:
             self._created_event(name).set()
             return 200, _ok(True)
 
+    def _upsert(self, name: str) -> tuple[int, dict[str, Any]]:
+        with self._state_lock:
+            self._upsert_requests[name] += 1
+        self.release_event.wait(self._upsert_delay_s.get(name, 0.0))
+        self._upserted_event(name).set()
+        return 200, _ok({'operation_id': 0, 'status': 'completed'})
+
+    def _retrieve(self, name: str) -> tuple[int, dict[str, Any]]:
+        self.release_event.wait(self._retrieve_delay_s.get(name, 0.0))
+        return 200, _ok([])
+
     def respond(self, method: str, path: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Route one request to its canned Qdrant answer."""
         segments = [unquote(part) for part in urlsplit(path).path.split('/') if part]
@@ -137,8 +169,10 @@ class StubQdrantServer:
                 return self._create(name, body)
             case 'PUT', ['collections', _, 'index']:
                 return 200, _ok({'operation_id': 0, 'status': 'completed'})
-            case 'POST', ['collections', _, 'points']:
-                return 200, _ok([])
+            case 'PUT', ['collections', name, 'points']:
+                return self._upsert(name)
+            case 'POST', ['collections', name, 'points']:
+                return self._retrieve(name)
         return 404, _error(f'stub has no route for {method} {path}')
 
 
@@ -179,13 +213,17 @@ class _QuietServer(ThreadingHTTPServer):
 def stub_qdrant_server(
     *,
     create_delay_s: Mapping[str, float] | None = None,
+    upsert_delay_s: Mapping[str, float] | None = None,
+    retrieve_delay_s: Mapping[str, float] | None = None,
     preexisting: Iterable[str] = (),
     conflict_on_create: Iterable[str] = (),
     create_status: Mapping[str, int] | None = None,
 ) -> Iterator[StubQdrantServer]:
     """Serve the stub on an ephemeral local port.
 
-    *create_delay_s* is how long a create of each named collection takes.
+    *create_delay_s* is how long a create of each named collection takes, and
+    *upsert_delay_s* and *retrieve_delay_s* how long a point upsert into, or a
+    point retrieve from, it takes; a retrieve always answers no points.
     *preexisting* collections exist from the start.  A create of a collection
     in *conflict_on_create* answers 409 AND leaves it created, as when another
     creator wins between an exists check and the create.  A create of a
@@ -194,6 +232,8 @@ def stub_qdrant_server(
     """
     state = StubQdrantServer(
         create_delay_s=create_delay_s or {},
+        upsert_delay_s=upsert_delay_s or {},
+        retrieve_delay_s=retrieve_delay_s or {},
         preexisting=preexisting,
         conflict_on_create=conflict_on_create,
         create_status=create_status or {},
