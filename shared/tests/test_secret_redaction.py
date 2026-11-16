@@ -27,6 +27,7 @@ from shared.secret_redaction import (
     RedactionWouldCorruptJson,
     RefusedLine,
     file_stamp,
+    preview_redaction,
     redact_in_place,
     redaction_needles,
 )
@@ -679,3 +680,90 @@ class TestTruncatedPrefix:
             result.raise_if_refused(path)
         assert value[:MIN_TRUNCATED_PREFIX_LEN] not in str(excinfo.value)
         assert VAR in str(excinfo.value)
+
+
+class TestPreviewRedaction:
+    """``preview_redaction`` reports what ``redact_in_place`` would and writes nothing."""
+
+    VALUE = TestTruncatedPrefix.VALUE
+
+    def _lines(self) -> list[str]:
+        return [
+            *_transcript_lines(self.VALUE),
+            json.dumps({'t': f"{{'K': '{self.VALUE[:40]}...'}}"}),
+        ]
+
+    def _needles(self):
+        return redaction_needles({VAR: self.VALUE})
+
+    def _assert_untouched(self, path: Path, content: bytes, before: os.stat_result) -> None:
+        after = path.stat()
+        assert path.read_bytes() == content
+        assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+        assert list(path.parent.iterdir()) == [path]
+
+    def test_a_preview_reports_exactly_what_a_redaction_of_a_copy_does(self, tmp_path):
+        previewed = _write(tmp_path / 'preview' / 's.jsonl', self._lines())
+        redacted = _write(tmp_path / 'redact' / 's.jsonl', self._lines())
+
+        preview = preview_redaction(previewed, self._needles())
+        redaction = redact_in_place(redacted, self._needles())
+
+        assert dict(preview.counts) == dict(redaction.counts) == {VAR: 3}
+        assert preview.refused == redaction.refused == ()
+
+    def test_a_previewed_file_is_left_byte_identical_with_no_temp_beside_it(self, tmp_path):
+        path = _write(tmp_path / 'preview' / 's.jsonl', self._lines())
+        before = path.stat()
+        content = path.read_bytes()
+
+        preview = preview_redaction(path, self._needles())
+
+        assert preview.redacted
+        self._assert_untouched(path, content, before)
+
+    def test_a_refused_line_is_reported_and_the_file_left_untouched(self, tmp_path):
+        refused = TestRefusedLine()
+        path = _write(tmp_path / 'held' / 's.jsonl', refused._lines())
+        before = path.stat()
+        content = path.read_bytes()
+
+        preview = preview_redaction(path, refused._needles())
+
+        assert preview.refused == (RefusedLine(2, VAR),)
+        assert dict(preview.counts) == {VAR: 2}
+        self._assert_untouched(path, content, before)
+
+    def test_a_gzipped_report_is_previewed_through_decompress_and_left_as_found(self, tmp_path):
+        path = _write_gzip(tmp_path / 'gz' / 'r.xml.gz', _junit_lines(f'{self.VALUE[:40]}...'))
+        before = path.stat()
+        content = path.read_bytes()
+
+        preview = preview_redaction(
+            path, redaction_needles({VAR: self.VALUE}, markup=Markup.XML), codec=Codec.GZIP
+        )
+
+        assert dict(preview.counts) == {VAR: 2}
+        self._assert_untouched(path, content, before)
+
+    def test_a_truncated_gzip_member_raises_corrupt_compressed_file(self, tmp_path):
+        path = _write_gzip(tmp_path / 'cut' / 'r.xml.gz', [f'{VAR}={self.VALUE}', *_filler_lines(2000)])
+        whole = path.read_bytes()
+        path.write_bytes(whole[: len(whole) // 2])
+        content = path.read_bytes()
+
+        with pytest.raises(CorruptCompressedFile):
+            preview_redaction(path, self._needles(), codec=Codec.GZIP)
+
+        assert path.read_bytes() == content
+
+    def test_a_clean_file_previews_as_empty_counts(self, tmp_path):
+        path = _write(tmp_path / 'clean' / 's.jsonl', _transcript_lines('nothing-secret-here'))
+        before = path.stat()
+        content = path.read_bytes()
+
+        preview = preview_redaction(path, self._needles())
+
+        assert dict(preview.counts) == {}
+        assert preview.refused == ()
+        self._assert_untouched(path, content, before)
