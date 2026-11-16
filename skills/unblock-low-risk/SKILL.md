@@ -376,9 +376,10 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        mode](#resuming-a-handed-off-merge-resume-mode). This hand-off, like step 8's, is **not**
        an ABORT. A `coalesce-*` landing that signal (a) shows but the scheduler has not credited
        is not unresolved: it takes the **landed-but-not-credited** report in [this skill's
-       dispositions](#ladder-dispositions) instead. Never call `merge_cancel` and never claim a failure: this is **not** the plain
-       abort-as-failure the `conflict` / `blocked` / `abandoned` arm above prescribes. Never
-       resubmit and never direct-merge while the successor is unresolved.
+       dispositions](#ladder-dispositions) instead. Never call `merge_cancel` and never claim a
+       failure: this is **not** the plain abort-as-failure the `conflict` / `blocked` /
+       `abandoned` arm above prescribes. Never resubmit and never direct-merge while the
+       successor is unresolved.
 
    - **`unknown`** (e.g., after an orchestrator restart; `merge_status` carries
      `hint="check git log main"`): fall back to the **task-scoped merge-marker search** (see
