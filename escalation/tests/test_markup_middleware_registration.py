@@ -53,6 +53,7 @@ from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import (
     MARKUP_RECURRENCE_ROUTING,
+    MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT,
     MarkupGuardMiddleware,
     RepairPolicy,
 )
@@ -740,9 +741,11 @@ STORM_THRESHOLD = 3
 class TestStormBurstAlarm:
     """The burst path against the REAL server (INV-4).
 
-    ``_file_markup_storm`` is the half of the escalation server's sink that
-    nothing exercised: the residue path was covered from step 9, the burst path
-    by nothing at all. Everything it decides — the dedup predicate, the
+    ``escalation/src/escalation/server.py::_MARKUP_STORM_ALARM``, filed via
+    ``escalation/src/escalation/guard_storm_alarm.py::file_storm_once``, is the
+    half of the escalation server's sink that nothing exercised: the residue
+    path was covered from step 9, the burst path by nothing at all. Everything
+    it decides — the dedup predicate, the
     read-failure fall-through, ``level=1``/``severity='blocking'``, and the
     summary it builds — was therefore unverified.
 
@@ -1143,6 +1146,11 @@ class TestTheResidueProseMatchesItsKind:
         ]
         assert len(residues) == 1, (
             f'the dropped slice must be preserved anyway, found {len(residues)}'
+        )
+        assert MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT in residues[0].detail, (
+            'the residue must state its outcome through '
+            'shared/src/shared/mcp_markup_middleware.py::'
+            'MARKUP_UNRECOVERED_PARAM_OUTCOME_CAVEAT'
         )
         assert 'landed' not in residues[0].detail.lower(), (
             'the residue claims a landing it cannot see: it is filed before '
