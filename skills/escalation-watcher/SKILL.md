@@ -276,9 +276,10 @@ After `lease-claim` returns `acquired` or `proceed`, and before the first brief:
    mind for the session and carry into your own handover while they still hold.
 
    A **handed-off B3 merge** in the In flight section (`{task_id, escalation_id, request_id,
-   worktree}`) has no live owner: any resume-mode run polling it ended with the predecessor. If
-   `get_escalation(escalation_id)` still shows the escalation `pending`, launch
-   `unblock-low-risk` in resume mode for it once, exactly as the `handed_off` bullet of B3
+   worktree}`, plus `superseded_by` when the hand-off carried one) has no live owner: any
+   resume-mode run polling it ended with the predecessor. If `get_escalation(escalation_id)`
+   still shows the escalation `pending`, launch `unblock-low-risk` in resume mode for it once,
+   passing the recorded `superseded_by` when present, exactly as the `handed_off` bullet of B3
    "Completion handling" does, and track the `task_id` as in flight from then on. This launch
    replaces a resume the stop cut off; it is not a second resume. Do not run `b3_gate check` or
    `record-launch` first: `check` reports `already_attempted` for this task, and skipping on that
@@ -311,7 +312,8 @@ Four steps, in this order:
    into the handover's in-flight section. A B3 `unblock-low-risk` sub-agent cut off by the stop is
    not relaunched by a successor: its `record-launch` marker makes `check` report
    `already_attempted`. A handed-off B3 merge whose resume has not yet returned is different:
-   record its `{task_id, escalation_id, request_id, worktree}` in the In flight section, whether
+   record its `{task_id, escalation_id, request_id, worktree}`, plus `superseded_by` when the
+   hand-off carried one, in the In flight section, whether
    or not a resume-mode run was still polling at the stop. Step 3 of "Reading the predecessor's
    handover at launch" says what the successor does with it.
 2. **Write the handover** (see "The handover file (`l2-handover.md`)"). It goes before the release,
@@ -1463,21 +1465,26 @@ launch by `task_id` / background-task-id):
   pending, write only the digest line and file no DecisionRecord: whoever took the escalation
   owns it, and the merge carries on.
 - `outcome == "handed_off"`: neither a failure nor an abort. The merge `request_id` it returns
-  was picked up by the merge worker and is still live (merging or verifying); the sub-agent did
-  not cancel it, did not change the task status, and left the escalation pending. **Never
-  `merge_cancel` it**, and never submit another merge for that `task_id`: it is an in-flight
-  merge, so record its `{task_id, escalation_id, request_id}` per "Tracking in-flight merges". Launch
+  is either picked up by the merge worker and still live (merging or verifying), or, when the
+  result also carries `superseded_by`, superseded by a successor that has not resolved yet: an
+  `mr-*` generation advance or a `coalesce-*` train. Either way the sub-agent did not cancel
+  it, did not change the task status, and left the escalation pending. **Never
+  `merge_cancel` it**, and never submit another merge for that `task_id`, whichever shape it is:
+  it is an in-flight merge, so record its `{task_id, escalation_id, request_id}`, plus
+  `superseded_by` when present, per "Tracking in-flight merges". Launch
   `unblock-low-risk` again as a NON-INTERACTIVE background sub-agent in **resume mode**, exactly
   as B3 is launched above (`Agent` tool, general-purpose, `run_in_background: true`), pointing it
   at the "Resuming a handed-off merge (resume mode)" subsection of
   `skills/unblock-low-risk/SKILL.md` and passing `task_id`, `escalation_id`, `project_root`,
-  `worktree` and `request_id`. Do **not** run `b3_gate check` or `record-launch` for it: the slot
+  `worktree` and `request_id`, plus `superseded_by` when the result carried one. Do **not** run
+  `b3_gate check` or `record-launch` for it: the slot
   is already charged, and `check` would report `already_attempted`. Keep the `task_id` in flight
   until that run completes; its completion is handled by this same list. **Resume once per B3
   launch:** if a resume-mode run itself returns `handed_off` (its 3 h backstop expired with the
-  merge still live), do not resume again — leave the escalation pending, write the digest line,
-  and file a DecisionRecord via `write-decision` whose `--text` names the `request_id` and its
-  last state. Still never cancel. A resume-mode `merged` is handled by the `merged` bullet, and a
+  merge still live or its successor still unresolved), do not resume again — leave the
+  escalation pending, write the digest line, and file a DecisionRecord via `write-decision`
+  whose `--text` names the `request_id`, the `superseded_by` when present, and the last state.
+  Still never cancel. A resume-mode `merged` is handled by the `merged` bullet, and a
   resume-mode `aborted` by the `aborted` bullet, including its resume-mode exceptions.
 
 The sub-agent re-checks the gate defensively and refuses anything not unambiguously low-risk; treat
@@ -1500,6 +1507,9 @@ outcome ledger for AFK and attended modes alike; AFK shift 3 manages it):
 - **Drift-reinvestigated, relaunched**: `B3 <task_id> — drift re-investigated; re-gate: fresh → launched`
 - **Handed off**: `B3 <task_id> — handed off: <request_id> still <state> at the polling ceiling → resume launched`
 - **Resume backstop**: `B3 <task_id> — resume backstop: <request_id> still <state> → pending (not cancelled)`
+
+In both hand-off lines `<state>` is the live merge state, or `superseded by <superseded_by>` when
+the hand-off came from unblock-low-risk step 9's superseded arm.
 
 Every outcome above that left a decision open reaches the return brief through its DecisionRecord
 — that is every outcome except "Merged", a first "Handed off" (its resume is still running) and a
