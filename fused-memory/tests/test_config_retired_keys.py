@@ -1,6 +1,7 @@
 """Retired config keys still load, are dropped, and are named in one WARNING."""
 
 import logging
+from pathlib import Path
 
 import yaml
 
@@ -80,3 +81,14 @@ class TestOpenAIProviderConfigRetiredKeys:
         assert config.embedder.providers.openai is not None
         assert config.embedder.providers.openai.api_key == 'k'
         assert any('organization_id' in message for message in _retired_warnings(caplog))
+
+
+def test_shipped_config_yaml_carries_no_retired_key(monkeypatch, caplog):
+    yaml_path = Path(__file__).resolve().parent.parent / 'config' / 'config.yaml'
+    assert yaml_path.is_file(), f'expected config.yaml at {yaml_path}'
+    monkeypatch.setenv('CONFIG_PATH', str(yaml_path))
+
+    with caplog.at_level(logging.WARNING):
+        FusedMemoryConfig()
+
+    assert _retired_warnings(caplog) == []
