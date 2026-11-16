@@ -14,14 +14,17 @@ JSON production writes, never against this file's beliefs about them.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue, iter_all_escalation_paths
-from escalation.refile_absorption import AbsorptionReport, absorbing_resolutions
+from escalation.refile_absorption import AbsorptionReport, absorbing_resolutions, main
 
 _CITATION = 'a' * 40
 
@@ -247,3 +250,116 @@ class TestReportIsImmutable:
         field = 'refiles_suppressed'
         with pytest.raises(dataclasses.FrozenInstanceError):
             setattr(row, field, 0)
+
+
+def _summary_tokens(out: str) -> set[str]:
+    return {token for token in out.split() if '=' in token}
+
+
+class TestCliTable:
+    def test_a_bumped_record_is_one_row_and_the_summary_line_follows(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ):
+        fixture = _Fixture(tmp_path)
+        record = fixture.resolved_absorbing(4)
+
+        rc = main(['--queue-dir', str(fixture.queue.queue_dir)])
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        row_lines = [line for line in out.splitlines() if record.id in line]
+        assert len(row_lines) == 1
+        cells = row_lines[0].split()
+        for value in ('4915', 'provenance_unattributed', 'dismissed', '4'):
+            assert value in cells
+        assert {
+            'total_absorbed=4', 'records=1', 'scanned=1', 'skipped_vanished=0',
+            'skipped_unreadable=0', 'skipped_unparsable=0',
+        } <= _summary_tokens(out)
+
+    def test_an_empty_listing_says_so_and_still_prints_the_summary(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ):
+        fixture = _Fixture(tmp_path)
+        unbumped = fixture.submit()
+        fixture.resolve(unbumped)
+
+        rc = main(['--queue-dir', str(fixture.queue.queue_dir)])
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert 'no resolution has absorbed a refile' in out
+        assert {
+            'total_absorbed=0', 'records=0', 'scanned=1', 'skipped_vanished=0',
+            'skipped_unreadable=0', 'skipped_unparsable=0',
+        } <= _summary_tokens(out)
+
+    def test_a_lost_record_is_printed_in_the_summary(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ):
+        fixture = _Fixture(tmp_path)
+        fixture.resolved_absorbing(1)
+        (fixture.queue.queue_dir / 'esc-junk-1.json').write_text('this is not json')
+
+        rc = main(['--queue-dir', str(fixture.queue.queue_dir)])
+
+        assert rc == 0
+        assert 'skipped_unparsable=1' in _summary_tokens(capsys.readouterr().out)
+
+
+class TestCliJson:
+    def test_json_carries_the_rows_and_the_shortfall(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ):
+        fixture = _Fixture(tmp_path)
+        fixture.resolved_absorbing(3)
+        fixture.resolved_absorbing(1, category='recon_task_finding', citation_sha=None)
+        (fixture.queue.queue_dir / 'esc-junk-1.json').write_text('this is not json')
+        report = fixture.report()
+
+        rc = main(['--queue-dir', str(fixture.queue.queue_dir), '--json'])
+
+        payload = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        assert [
+            (r['escalation_id'], r['refiles_suppressed'], r['category'], r['status'],
+             r['citation_sha'])
+            for r in payload['rows']
+        ] == [
+            (row.escalation_id, row.refiles_suppressed, row.category, row.status,
+             row.citation_sha)
+            for row in report.rows
+        ]
+        assert payload['total_absorbed'] == report.total_absorbed == 4
+        assert payload['scanned'] == report.scanned
+        assert payload['skipped_vanished'] == report.skipped_vanished
+        assert payload['skipped_unreadable'] == report.skipped_unreadable
+        assert payload['skipped_unparsable'] == report.skipped_unparsable == 1
+
+
+class TestCliDegradesLoudly:
+    def test_a_missing_queue_dir_exits_2_naming_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ):
+        """A typo'd path must never read back as a clean empty listing."""
+        missing = tmp_path / 'not-a-queue'
+
+        rc = main(['--queue-dir', str(missing)])
+
+        captured = capsys.readouterr()
+        assert rc == 2
+        assert str(missing) in captured.err
+        assert 'total_absorbed' not in captured.out
+
+    def test_the_documented_module_invocation_runs(self, tmp_path: Path):
+        fixture = _Fixture(tmp_path)
+        fixture.resolved_absorbing(2)
+
+        completed = subprocess.run(
+            [sys.executable, '-m', 'escalation.refile_absorption',
+             '--queue-dir', str(fixture.queue.queue_dir)],
+            capture_output=True, text=True, check=False,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert 'total_absorbed=2' in _summary_tokens(completed.stdout)
