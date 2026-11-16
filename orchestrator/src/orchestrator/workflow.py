@@ -63,6 +63,7 @@ from shared.transcript_archive import (
     resolve_archive_root,
     restore_archived_transcript,
 )
+from shared.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 
 from orchestrator import chronic_flake
 from orchestrator.agents.briefing import PriorAttemptCause, VerifyAttemptContext
@@ -235,7 +236,6 @@ from orchestrator.task_status import (
 )
 from orchestrator.task_verify_dispatch import LOCAL_RUNNER, TaskVerifyPort, verdict_runner
 from orchestrator.unblock_types import BlockClass, classify_block_reason
-from orchestrator.usage_gate import SessionBudgetExhausted as _SessionBudgetExhausted
 from orchestrator.verify import (
     VerifyInfraError,
     VerifyResult,
@@ -584,11 +584,11 @@ if TYPE_CHECKING:
     from escalation.disposition import ExitKind
     from escalation.models import Escalation, EvidenceEntry, TrainState
     from escalation.queue import EscalationQueue
+    from shared.usage_gate import UsageGate
 
     from orchestrator.merge_lane.types import OperatorMergeCancel
     from orchestrator.merge_lane.worker import InFlightMergeRegistry, MergeOutcome, SoloVerifyResult
     from orchestrator.scheduler import SchedulerFacade
-    from orchestrator.usage_gate import UsageGate
 
 
 # ---------------------------------------------------------------------------

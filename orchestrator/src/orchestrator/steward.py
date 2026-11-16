@@ -81,11 +81,11 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
     from shared.config_dir import TaskConfigDir
     from shared.cost_store import CostStore
+    from shared.usage_gate import UsageGate
 
     from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.config import OrchestratorConfig
     from orchestrator.mcp_lifecycle import McpLifecycle
-    from orchestrator.usage_gate import UsageGate
     from orchestrator.workflow_types import StewardOutcome
 
 logger = logging.getLogger(__name__)
