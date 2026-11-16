@@ -17,6 +17,7 @@ from _reap_report_wait import await_reap_report
 from _session_hook_fixtures import launching_record, owner_ppid_env
 from shared.process_identity import ProcessIdentity
 
+from orchestrator import decision_registry as dr
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
 
@@ -1223,20 +1224,19 @@ class TestLeaseClaimPrintsHolderRecordLast:
         assert lines[2:] == [f'slug={_LEASE}-{self._PID}']
 
 
-def _decision(**overrides: object) -> sr.DecisionRecord:
-    fields: dict[str, object] = {
-        'id': 'esc-4237-1',
-        'project': 'dark_factory',
-        'text': 'Adopt the plan?',
-        'filed_at': '2026-09-25T12:00:00+00:00',
-        'escalations_dir': '/queues/orch',
-        **overrides,
-    }
-    return sr.DecisionRecord(**fields)  # pyright: ignore[reportArgumentType]
+def _decision(**overrides: object) -> dr.DecisionRecord:
+    base = dr.DecisionRecord(
+        id='esc-4237-1',
+        project='dark_factory',
+        text='Adopt the plan?',
+        filed_at='2026-09-25T12:00:00+00:00',
+        escalations_dir='/queues/orch',
+    )
+    return dataclasses.replace(base, **overrides)
 
 
 def _write_decision_raw(root: Path, body: dict[str, object]) -> None:
-    path = sr.decision_path_for_id(str(body['id']), root=root)
+    path = dr.decision_path_for_id(str(body['id']), root=root)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(body), encoding='utf-8')
 
@@ -1248,13 +1248,13 @@ class TestDecisionRecordSlug:
         decision = _decision(session_id='watcher-df-51795', record_slug=self._SLUG)
 
         assert decision.to_dict()['record_slug'] == self._SLUG
-        assert sr.DecisionRecord.from_dict(decision.to_dict()) == decision
-        assert sr.DecisionRecord.from_json(decision.to_json()) == decision
+        assert dr.DecisionRecord.from_dict(decision.to_dict()) == decision
+        assert dr.DecisionRecord.from_json(decision.to_json()) == decision
 
     def test_record_slug_survives_the_registry(self, tmp_path: Path) -> None:
-        sr.write_decision(_decision(record_slug=self._SLUG), root=tmp_path)
+        dr.write_decision(_decision(record_slug=self._SLUG), root=tmp_path)
 
-        [listed] = sr.list_decisions(root=tmp_path)
+        [listed] = dr.list_decisions(root=tmp_path)
 
         assert listed.record_slug == self._SLUG
 
@@ -1274,7 +1274,7 @@ class TestDecisionRecordSlug:
             },
         )
 
-        [listed] = sr.list_decisions(root=tmp_path)
+        [listed] = dr.list_decisions(root=tmp_path)
 
         assert listed.record_slug == ''
         assert listed.session_id == 'watcher-df-51795'
@@ -1282,7 +1282,7 @@ class TestDecisionRecordSlug:
     def test_an_explicit_null_parses_blank(self) -> None:
         body = {**_decision().to_dict(), 'record_slug': None}
 
-        assert sr.DecisionRecord.from_dict(body).record_slug == ''
+        assert dr.DecisionRecord.from_dict(body).record_slug == ''
 
     @pytest.mark.parametrize(
         ('record_slug', 'session_id', 'expected'),
@@ -1305,7 +1305,7 @@ class TestDecisionRecordSlug:
         existing = _decision(record_slug=self._SLUG)
         incoming = _decision(record_slug='the-second-filers-record')
 
-        merged = sr.merge_decision_enrichment(existing, incoming)
+        merged = dr.merge_decision_enrichment(existing, incoming)
 
         assert merged.record_slug == self._SLUG
 
@@ -1313,7 +1313,7 @@ class TestDecisionRecordSlug:
         existing = _decision(session_id=None, record_slug='')
         incoming = _decision(session_id='watcher-recon-2', record_slug=self._SLUG)
 
-        merged = sr.merge_decision_enrichment(existing, incoming)
+        merged = dr.merge_decision_enrichment(existing, incoming)
 
         assert merged.session_id == 'watcher-recon-2'
         assert merged.record_slug == self._SLUG
@@ -1323,16 +1323,16 @@ class TestDecisionRecordSlug:
         existing = _decision(
             record_slug=self._SLUG,
             filed_at='2026-07-07T00:00:00+00:00',
-            state=sr.DecisionState.DROPPED,
+            state=dr.DecisionState.DROPPED,
             manual_boost=7,
         )
         incoming = _decision(record_slug=incoming_slug, filed_at='2026-09-25T00:00:00+00:00')
 
-        merged = sr.merge_same_queue_refile(existing, incoming)
+        merged = dr.merge_same_queue_refile(existing, incoming)
 
         assert merged.record_slug == incoming_slug
         assert merged.filed_at == '2026-07-07T00:00:00+00:00'
-        assert merged.state == sr.DecisionState.DROPPED
+        assert merged.state == dr.DecisionState.DROPPED
         assert merged.manual_boost == 7
 
 
@@ -1362,7 +1362,7 @@ class TestWriteDecisionRecordSlug:
     _RESTARTED_PID = 4_237_700
     _RESUMED = 7_614_700
     _ID = 'esc-4237-1'
-    _FILED_ID = sr.qualify_decision_id('dark_factory', _ID)
+    _FILED_ID = dr.qualify_decision_id('dark_factory', _ID)
 
     def _file(
         self,
@@ -1371,7 +1371,7 @@ class TestWriteDecisionRecordSlug:
         *,
         queue: str = 'queue-a',
         session_id: str = f'watcher-df-{_PID}',
-    ) -> tuple[str, sr.DecisionRecord]:
+    ) -> tuple[str, dr.DecisionRecord]:
         capsys.readouterr()
         rc = sr.main(
             [
@@ -1384,8 +1384,8 @@ class TestWriteDecisionRecordSlug:
             ]
         )
         assert rc == 0
-        path = sr.decision_path_for_id(self._FILED_ID, root=root)
-        return capsys.readouterr().out, sr.DecisionRecord.from_json(path.read_text())
+        path = dr.decision_path_for_id(self._FILED_ID, root=root)
+        return capsys.readouterr().out, dr.DecisionRecord.from_json(path.read_text())
 
     def test_the_filers_own_record_is_stamped_beside_its_session_id(
         self,

@@ -57,17 +57,16 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
-from orchestrator.session_registry import (
+from orchestrator.decision_registry import (
     DecisionRecord,
     DecisionState,
-    SessionRecord,
-    Status,
     set_manual_boost,
     update_decision_state,
 )
-from orchestrator.session_registry import (
+from orchestrator.fleet_files import (
     fleet_root as resolve_fleet_root,
 )
+from orchestrator.session_registry import SessionRecord, Status
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding

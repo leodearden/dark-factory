@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from orchestrator import decision_registry as dr
 from orchestrator import session_registry as sr
 
 
@@ -138,7 +139,7 @@ def _make_decision(**overrides):
         'filed_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.DecisionRecord(**fields)
+    return dr.DecisionRecord(**fields)
 
 
 class TestRenderDecisionDetail:
@@ -151,7 +152,7 @@ class TestRenderDecisionDetail:
             task_id='2085',
             escalation_id='esc-99',
             severity='blocking',
-            state=sr.DecisionState.OPEN,
+            state=dr.DecisionState.OPEN,
         )
         now = datetime(2026, 7, 7, 0, 5, 0, tzinfo=UTC)
 
