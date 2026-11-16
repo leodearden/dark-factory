@@ -6,8 +6,12 @@ factory project it walks the agent-transcript archive (``*.jsonl``, including
 archive staging copies a hard kill stranded), the verify logs and the
 offline-lane logs (``LOG_SUFFIXES``: ``*.log``, ``*.json``, junit ``*.xml``
 and gzipped junit ``*.xml.gz``), and it walks ``~/.claude/projects`` for
-transcripts. A ``*.log`` is matched for the raw value as well as its
-JSON-escaped form; transcripts and ``*.json`` for the JSON-escaped form only.
+transcripts and pytest's per-user base temp (``pytest_base_temp``) for the
+environment dumps env-capturing tests leave there, by name
+(``PYTEST_ENV_DUMP_SUFFIXES``). A ``*.log``, a ``*.bin`` and an ``env-dump``
+are matched for the raw value as well as its JSON-escaped form; transcripts
+and ``*.json`` for the JSON-escaped form only. A value a log cut short is
+matched by its prefix (``shared.secret_redaction.MIN_TRUNCATED_PREFIX_LEN``).
 Gzipped junit is redacted by decompressing, replacing and
 recompressing it, and XML gets an entity-escaped placeholder so a report still
 parses; a ``.gz`` that does not decompress is reported unreadable and left as
@@ -28,10 +32,12 @@ import dataclasses
 import datetime
 import enum
 import functools
+import getpass
 import json
 import os
 import stat
 import sys
+import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,11 +80,16 @@ MAX_DETAIL_FILES = 200
 NO_SECRETS_CAUSE = 'no secret-bearing values in the environment'
 TRANSCRIPT_SUFFIXES = ('.jsonl', '.jsonl' + STAGING_SUFFIX)
 LOG_SUFFIXES = ('.log', '.json', '.xml', '.xml.gz')
+PYTEST_ENV_DUMP_SUFFIXES = (
+    'env-dump', 'env-dump.json', 'env.bin', 'env.json', 'capture.json', 'capture.jsonl', 'state.json',
+)
 
 _FORMATS: tuple[tuple[str, Markup, Codec], ...] = (
     ('.xml.gz', Markup.XML, Codec.GZIP),
     ('.xml', Markup.XML, Codec.PLAIN),
     ('.log', Markup.TEXT, Codec.PLAIN),
+    ('.bin', Markup.TEXT, Codec.PLAIN),
+    ('env-dump', Markup.TEXT, Codec.PLAIN),
 )
 
 PostEscalation = Callable[[dict[str, object]], object]
@@ -142,7 +153,13 @@ class SweepResult:
         }
 
 
-def swept_trees(project_roots: Iterable[Path], claude_projects_dir: Path) -> tuple[SweptTree, ...]:
+def pytest_base_temp() -> Path:
+    return Path(tempfile.gettempdir()) / f'pytest-of-{getpass.getuser()}'
+
+
+def swept_trees(
+    project_roots: Iterable[Path], claude_projects_dir: Path, *, pytest_tmp_dir: Path | None = None
+) -> tuple[SweptTree, ...]:
     per_project = (
         tree
         for root in project_roots
@@ -152,7 +169,8 @@ def swept_trees(project_roots: Iterable[Path], claude_projects_dir: Path) -> tup
             SweptTree(offline_lane_dir(root), LOG_SUFFIXES),
         )
     )
-    return (*per_project, SweptTree(claude_projects_dir, TRANSCRIPT_SUFFIXES))
+    pytest_tree = () if pytest_tmp_dir is None else (SweptTree(pytest_tmp_dir, PYTEST_ENV_DUMP_SUFFIXES),)
+    return (*per_project, SweptTree(claude_projects_dir, TRANSCRIPT_SUFFIXES), *pytest_tree)
 
 
 def run(
@@ -324,6 +342,12 @@ def _parser() -> argparse.ArgumentParser:
         help='the interactive sessions\' transcript dir (default: ~/.claude/projects)',
     )
     parser.add_argument(
+        '--pytest-tmp-dir',
+        type=Path,
+        default=None,
+        help="pytest's per-user base temp, swept for environment dumps (default: <tmpdir>/pytest-of-<user>)",
+    )
+    parser.add_argument(
         '--escalation-url',
         default=None,
         help="the escalation server's MCP URL (default: this checkout's configured escalation server)",
@@ -344,7 +368,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f'transcript_secret_sweep.py: {problem}', file=sys.stderr)
     claude_projects = args.claude_projects_dir or Path.home() / '.claude' / 'projects'
     config = SweepConfig(
-        trees=swept_trees([target.root for target in targets], claude_projects),
+        trees=swept_trees(
+            [target.root for target in targets],
+            claude_projects,
+            pytest_tmp_dir=args.pytest_tmp_dir or pytest_base_temp(),
+        ),
         now=datetime.datetime.now(datetime.UTC),
         min_age_secs=args.min_age_secs,
     )
