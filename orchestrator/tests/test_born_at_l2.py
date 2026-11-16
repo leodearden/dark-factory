@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import pytest
 from escalation.categories import EscalationCategory
+from escalation.models import HARNESS_SENTINEL_ROLE_PREFIXES
 from escalation.queue import EscalationQueue
 
 from orchestrator.born_at_l2 import BornAtL2Alarm, file_deduped_born_at_l2
@@ -43,6 +46,29 @@ def _logged_warning_for(caplog, error: BaseException) -> bool:
         r.levelname == 'WARNING' and r.exc_info is not None and r.exc_info[1] is error
         for r in caplog.records
     )
+
+
+@pytest.mark.parametrize('role', [
+    'reblock-guard',
+    'orchestrator',
+    'architect',
+    'Orchestrator-probe',
+    ' orchestrator-probe',
+    '',
+])
+def test_alarm_refuses_a_role_outside_the_sentinel_namespace(role):
+    with pytest.raises(ValueError, match=re.escape(repr(role))) as excinfo:
+        replace(_ALARM, role=role)
+
+    if role == 'orchestrator':
+        assert all(prefix in str(excinfo.value) for prefix in HARNESS_SENTINEL_ROLE_PREFIXES)
+
+
+@pytest.mark.parametrize('prefix', HARNESS_SENTINEL_ROLE_PREFIXES)
+def test_alarm_accepts_each_sentinel_prefix(prefix):
+    alarm = replace(_ALARM, role=f'{prefix}probe')
+
+    assert alarm.role == f'{prefix}probe'
 
 
 def test_files_an_urgent_level_two_escalation_for_a_human(queue, event_store):
