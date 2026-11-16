@@ -25,18 +25,26 @@ Usage
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
+import datetime
+import importlib.metadata
 import itertools
 import json
 import logging
 import math
+import os
 import re
+import sys
+import time
+import types
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from shared.cli_boundary import LoudArgumentParser, run_cli
 from shared.quality_series.stats import Z_95, wilson_interval
 
 from fused_memory.utils.script_loader import load_script
@@ -970,3 +978,127 @@ def guard_report_path(report_path: str | Path, *, arm_filter: Sequence[str] | No
             'pass --report-path somewhere else',
         )
     return path
+
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+_FIXTURES = _PACKAGE_ROOT / 'tests' / 'fixtures'
+_LIBRARIES = ('torch', 'sentence-transformers', 'transformers', 'openai')
+
+
+def build_parser() -> LoudArgumentParser:
+    parser = LoudArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('--fixture', default=str(_FIXTURES / 'write_triage_calibration.jsonl'))
+    parser.add_argument('--report-path', dest='report_path', default=str(_DEFAULT_REPORT_PATH))
+    parser.add_argument('--config', default=None, help='fused-memory config file (sets CONFIG_PATH)')
+    parser.add_argument('--top-k', dest='top_k', type=int, default=_audit._DEFAULT_ANN_TOP_K)
+    parser.add_argument(
+        '--arm', action='append', default=None, choices=[arm.name for arm in DETECTOR_ARMS],
+        help='measure only this arm (repeatable; refused at the committed report path)',
+    )
+    parser.add_argument('--max-arm-spend-usd', dest='max_arm_spend_usd', type=float, default=2.0)
+    parser.add_argument('--pairwise-concurrency', dest='pairwise_concurrency', type=int, default=20)
+    parser.add_argument('--local-batch-size', dest='local_batch_size', type=int, default=4)
+    parser.add_argument('--device', default='auto', help="local arms' torch device: auto, cpu or cuda")
+    parser.add_argument('--vram-cap-gib', dest='vram_cap_gib', type=float, default=8.0)
+    return parser
+
+
+def _library_versions() -> dict[str, str | None]:
+    versions: dict[str, str | None] = {}
+    for name in _LIBRARIES:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def run_measurement(
+    args: argparse.Namespace,
+    *,
+    embed_factory: Callable[[Any], EmbedFn] | None = None,
+    arms: Sequence[DetectorArm] | None = None,
+    config_factory: Callable[[], Any] | None = None,
+    today: datetime.date | None = None,
+) -> int:
+    """Replay the protocol, measure the baseline and every selected arm, write the report.
+
+    The embedder is the ANN generator, not an arm: without its credential no
+    row can be produced, so its failure is raised rather than recorded.
+    """
+    report_path = guard_report_path(args.report_path, arm_filter=args.arm)
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+    records = _calibrate.load_fixture(args.fixture)
+    if config_factory is None:
+        from fused_memory.config.schema import FusedMemoryConfig
+        config_factory = FusedMemoryConfig
+    config = config_factory()
+    embed = (embed_factory or _calibrate.build_embed_fn)(config)
+
+    logger.info('embedding %d fixture record(s)', len(records))
+    memories = fixture_scan(records, embed)
+    neighbors = fixture_neighbors(memories, args.top_k)
+    pair_classes = labelled_pair_classes(records)
+    generation = candidate_generation(memories, neighbors, pair_classes, args.top_k)
+    categories = sorted({str(r['category']) for r in records if r.get('category')})
+    cutoffs, cutoff_disclosure = _audit.resolve_ann_threshold(
+        types.SimpleNamespace(config=config), None, categories, project_id=None,
+    )
+    baseline = measure_ann_baseline(memories, neighbors, cutoffs, pair_classes)
+
+    context = _arms.ArmContext(
+        device=args.device, local_batch_size=args.local_batch_size,
+        vram_cap_gib=args.vram_cap_gib, pairwise_concurrency=args.pairwise_concurrency,
+    )
+    selected = [
+        arm for arm in (DETECTOR_ARMS if arms is None else arms)
+        if not args.arm or arm.name in args.arm
+    ]
+    rows = []
+    for arm in selected:
+        logger.info('measuring arm %s (%s)', arm.name, arm.spec.model)
+        rows.append(measure_detector_arm(
+            arm, memories, generation.candidates, pair_classes, context=context,
+            max_spend_usd=args.max_arm_spend_usd, clock=time.perf_counter, proposal=GATE_PROPOSAL,
+        ))
+
+    report = build_report(
+        generation=generation, pair_classes=pair_classes, baseline=baseline, arm_rows=rows,
+        records=len(records),
+        embedder={'model': config.embedder.model, 'dimensions': len(memories[0]['vector'])},
+        provenance={
+            'fixture_path': _calibrate.package_relative(args.fixture),
+            'record_count': len(records),
+            'top_k': args.top_k,
+            'ann_cutoffs': cutoffs,
+            'ann_cutoff_disclosure': cutoff_disclosure,
+            'project_id': None,
+            'measured_at': (today or datetime.date.today()).isoformat(),
+            'arm_filter': args.arm,
+            'device': args.device,
+            'local_batch_size': args.local_batch_size,
+            'vram_cap_gib': args.vram_cap_gib,
+            'pairwise_concurrency': args.pairwise_concurrency,
+            'max_arm_spend_usd': args.max_arm_spend_usd,
+            'libraries': _library_versions(),
+        },
+    )
+    write_report(report, report_path)
+    print(json.dumps(report, indent=2))
+    return 0
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    return run_measurement(build_parser().parse_args())
+
+
+if __name__ == '__main__':
+    sys.exit(run_cli(main))
