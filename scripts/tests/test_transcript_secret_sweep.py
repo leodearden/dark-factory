@@ -10,14 +10,12 @@ is the 2026-10-11 one.
 from __future__ import annotations
 
 import datetime
-import getpass
 import gzip
 import hashlib
 import json
 import os
 import shutil
 import stat
-import tempfile
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
@@ -296,8 +294,11 @@ def test_the_pytest_base_temp_is_swept_last_and_only_for_env_dump_names(tree, tm
     )
 
 
-def test_the_pytest_base_temp_is_pytests_own_per_user_dir():
-    assert sweep.pytest_base_temp() == Path(tempfile.gettempdir()) / f'pytest-of-{getpass.getuser()}'
+def test_the_pytest_base_temp_is_the_one_this_pytest_run_uses(request, tmp_path_factory):
+    if request.config.getoption('basetemp') or os.environ.get('PYTEST_DEBUG_TEMPROOT'):
+        pytest.skip('an explicit --basetemp or PYTEST_DEBUG_TEMPROOT moves this run off the per-user default')
+
+    assert sweep.pytest_base_temp().resolve() in tmp_path_factory.getbasetemp().parents
 
 
 def test_one_sweep_redacts_the_env_dumps_a_pytest_base_temp_holds(tmp_path):
@@ -889,16 +890,14 @@ class TestHostConfigsDir:
         (line,) = capsys.readouterr().out.splitlines()
         assert [hit['path'] for hit in json.loads(line)['redacted']] == [str(swept)]
 
-    def test_host_config_roots_names_every_problem_file_and_reads_absolute_roots(self, tmp_path, configs):
-        roots, problems = sweep.host_config_roots(configs)
+    def test_scan_host_configs_names_every_problem_file_and_reads_absolute_roots(self, tmp_path, configs):
+        scan = sweep.scan_host_configs(configs)
 
-        assert roots == (tmp_path / 'proj',)
-        assert [problem.split(':')[0] for problem in problems] == [
-            str(configs / name) for name in ('b.yaml', 'c.yaml', 'd.yaml')
-        ]
+        assert scan.roots == (tmp_path / 'proj',)
+        assert [problem.path for problem in scan.problems] == [configs / name for name in ('b.yaml', 'c.yaml', 'd.yaml')]
 
     def test_a_missing_configs_dir_is_one_problem(self, tmp_path):
-        roots, (problem,) = sweep.host_config_roots(tmp_path / 'absent')
+        scan = sweep.scan_host_configs(tmp_path / 'absent')
 
-        assert roots == ()
-        assert str(tmp_path / 'absent') in problem
+        assert scan.roots == ()
+        assert [problem.path for problem in scan.problems] == [tmp_path / 'absent']

@@ -3,9 +3,8 @@
 # Invoked by scripts/transcript-secret-sweep.service's ExecStart (systemd
 # .timer-driven, nightly 02:30).
 #
-# Runs scripts/transcript_secret_sweep.py over every factory project's
-# agent-transcript archive, verify logs and offline-lane logs (gzipped junit
-# included), and over ~/.claude/projects. The sweep matches the
+# Runs scripts/transcript_secret_sweep.py over the trees
+# scripts/transcript_secret_sweep.py::swept_trees names. The sweep matches the
 # secret values ITS OWN environment holds, so this wrapper sources $REPO/.env
 # (the same file the orchestrators load) before running it. Nothing here
 # echoes an environment value.
@@ -34,7 +33,7 @@ set +a
 
 read -r -a SWEEP_CMD <<<"${TRANSCRIPT_SECRET_SWEEP_CMD:-uv run --no-sync --project $REPO/shared python}"
 
-echo "transcript-secret-sweep: sweeping agent transcripts and verify/offline-lane logs for live secret values"
+echo "transcript-secret-sweep: sweeping for live secret values"
 "${SWEEP_CMD[@]}" "$REPO/scripts/transcript_secret_sweep.py" "$@"
 sweep_rc=$?
 if [ "$sweep_rc" -ne 0 ]; then

@@ -178,22 +178,35 @@ def pytest_base_temp() -> Path:
     return Path(tempfile.gettempdir()) / f'pytest-of-{getpass.getuser()}'
 
 
+@dataclass(frozen=True)
+class HostConfigProblem:
+    path: Path
+    reason: str
+
+
+@dataclass(frozen=True)
+class HostConfigScan:
+    """The ``project_root`` each host config names, and each config (or the dir) that names none."""
+
+    roots: tuple[Path, ...] = ()
+    problems: tuple[HostConfigProblem, ...] = ()
+
+
 class _UnusableHostConfig(Exception):
     pass
 
 
-def host_config_roots(configs_dir: Path) -> tuple[tuple[Path, ...], tuple[str, ...]]:
-    """The ``project_root`` each ``configs_dir/*.yaml`` names, and one problem line per file that names none."""
+def scan_host_configs(configs_dir: Path) -> HostConfigScan:
     if not configs_dir.is_dir():
-        return (), (f'{configs_dir}: not a directory of host configs',)
+        return HostConfigScan(problems=(HostConfigProblem(configs_dir, 'not a directory of host configs'),))
     roots: list[Path] = []
-    problems: list[str] = []
+    problems: list[HostConfigProblem] = []
     for config in sorted(path for path in configs_dir.glob('*.yaml') if path.is_file()):
         try:
             roots.append(_project_root_of(config))
         except _UnusableHostConfig as exc:
-            problems.append(f'{config}: {exc}')
-    return tuple(roots), tuple(problems)
+            problems.append(HostConfigProblem(config, str(exc)))
+    return HostConfigScan(tuple(roots), tuple(problems))
 
 
 def _project_root_of(config: Path) -> Path:
@@ -444,13 +457,13 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     targets, unit_scan = orchestrator_projects.targets_from_args(args)
-    host_roots, host_problems = host_config_roots(args.host_configs_dir) if args.host_configs_dir else ((), ())
-    for problem in (*unit_scan.problems, *host_problems):
+    host_scan = scan_host_configs(args.host_configs_dir) if args.host_configs_dir else HostConfigScan()
+    for problem in (*unit_scan.problems, *(f'{p.path}: {p.reason}' for p in host_scan.problems)):
         print(f'transcript_secret_sweep.py: {problem}', file=sys.stderr)
     claude_projects = args.claude_projects_dir or Path.home() / '.claude' / 'projects'
     config = SweepConfig(
         trees=swept_trees(
-            dict.fromkeys([*(target.root for target in targets), *host_roots]),
+            dict.fromkeys([*(target.root for target in targets), *host_scan.roots]),
             claude_projects,
             pytest_tmp_dir=args.pytest_tmp_dir or pytest_base_temp(),
         ),
