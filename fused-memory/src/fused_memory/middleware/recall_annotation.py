@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -37,6 +38,17 @@ class BoundTask:
     binding: Binding
     result_ids: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        broken = _bound_task_defect(self)
+        if broken is not None:
+            raise ValueError(f'BoundTask for {self.ref!r} breaks an invariant: {broken}')
+
+
+def _bound_task_defect(bound: BoundTask) -> str | None:
+    if not bound.result_ids:
+        return f'result_ids is non-empty (got {bound.result_ids!r})'
+    return None
+
 
 @dataclass(frozen=True)
 class TaskBindings:
@@ -45,6 +57,37 @@ class TaskBindings:
     omitted_tasks: int
     results_not_scanned: int
 
+    def __post_init__(self) -> None:
+        broken = _bindings_defect(self)
+        if broken is not None:
+            raise ValueError(f'TaskBindings breaks an invariant: {broken}')
+
+
+def _bindings_defect(bindings: TaskBindings) -> str | None:
+    count = len(bindings.tasks)
+    if count > MAX_TASKS:
+        return f'at most MAX_TASKS={MAX_TASKS} tasks (got {count})'
+    if bindings.omitted_tasks < 0:
+        return f'omitted_tasks is not negative (got {bindings.omitted_tasks})'
+    if bindings.results_not_scanned < 0:
+        return f'results_not_scanned is not negative (got {bindings.results_not_scanned})'
+    if bindings.omitted_tasks and count < MAX_TASKS:
+        return (
+            f'omitted_tasks is 0 unless MAX_TASKS={MAX_TASKS} tasks are kept '
+            f'(omitted_tasks={bindings.omitted_tasks}, tasks={count})'
+        )
+    duplicates = [ref for ref, seen in Counter(bound.ref for bound in bindings.tasks).items() if seen > 1]
+    if duplicates:
+        return f'each ref appears once (duplicates: {duplicates!r})'
+    kinds = [bound.binding for bound in bindings.tasks]
+    if kinds != sorted(kinds, key=_is_mentioned):
+        return f'STRUCTURAL entries come before MENTIONED ones (got {[kind.value for kind in kinds]})'
+    return None
+
+
+def _is_mentioned(binding: Binding) -> bool:
+    return binding is Binding.MENTIONED
+
 
 _Link = tuple[TaskRef, Binding]
 
@@ -52,16 +95,21 @@ _Link = tuple[TaskRef, Binding]
 def bind_tasks(
     results: Sequence[MemoryResult], *, project_id: str, known_projects: Mapping[str, str],
 ) -> TaskBindings:
-    """The tasks *results* are about or mention, structural first, then by first result rank."""
+    """The tasks the first MAX_RESULTS_SCANNED *results* are about or mention:
+    structural first, then by first result rank, the first MAX_TASKS kept."""
     project = canonicalize_project_id(project_id)
     links: list[tuple[str, _Link]] = []
     ambiguous: dict[str, None] = {}
-    for result in results:
+    for result in results[:MAX_RESULTS_SCANNED]:
         scan = scan_content(result.content, group_id=project, known_project_ids=known_projects)
         links.extend((result.id, link) for link in _result_links(result, scan.refs, project))
         ambiguous.update(dict.fromkeys(referent.number for referent in scan.ambiguous))
+    tasks = _merge(links)
     return TaskBindings(
-        tasks=tuple(_merge(links)), ambiguous=tuple(ambiguous), omitted_tasks=0, results_not_scanned=0,
+        tasks=tuple(tasks[:MAX_TASKS]),
+        ambiguous=tuple(ambiguous),
+        omitted_tasks=max(0, len(tasks) - MAX_TASKS),
+        results_not_scanned=max(0, len(results) - MAX_RESULTS_SCANNED),
     )
 
 
