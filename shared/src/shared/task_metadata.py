@@ -41,6 +41,9 @@ from shared.strand_conversion import STRAND_CONVERTED_METADATA_KEY, StrandConver
 from shared.task_deferral import DeferralRecord
 
 __all__ = [
+    'GATE_EPISODE_STAMP_KEYS',
+    'GATE_ESCALATED_AT_KEY',
+    'GATE_ESCALATED_PRECONDITIONS_KEY',
     'HUMAN_CURATOR_ADJUDICATED_AT_KEY',
     'HUMAN_CURATOR_GATE_KEY',
     'KNOWN_ROLE_NAMES',
@@ -149,6 +152,19 @@ HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
 # delete the only detector.  An in-process `is`/`id()` check cannot substitute:
 # CPython interns identifier-shaped literals, so it passes either way.
 HUMAN_CURATOR_ADJUDICATED_AT_KEY: str = 'human_curator_adjudicated_at'
+
+# The stamps of a deterministic task's OPEN gate episode
+# (orchestrator/src/orchestrator/deterministic_runner.py). A pure gate, an
+# act-then-ask deploy and a predicate all stamp gate_escalated_at when they
+# file; a pure gate writes gate_escalated_preconditions in the same write
+# (orchestrator/src/orchestrator/gate_preconditions.py). fused-memory removes
+# both from any row on a terminal status crossing
+# (fused-memory/src/fused_memory/middleware/gate_stamp_lifecycle.py, task 3638).
+GATE_ESCALATED_AT_KEY: str = 'gate_escalated_at'
+GATE_ESCALATED_PRECONDITIONS_KEY: str = 'gate_escalated_preconditions'
+GATE_EPISODE_STAMP_KEYS: frozenset[str] = frozenset(
+    {GATE_ESCALATED_AT_KEY, GATE_ESCALATED_PRECONDITIONS_KEY},
+)
 
 
 def validate_model_overrides(value: object) -> None:
@@ -1413,8 +1429,8 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         'combined_at',
         # stamped by the task curator on every create its dedupe pass did not judge; the re-dedupe sweep key
         'dedupe_skipped',
-        'gate_escalated_at',
-        'gate_escalated_preconditions',
+        GATE_ESCALATED_AT_KEY,
+        GATE_ESCALATED_PRECONDITIONS_KEY,
         'before_done_ran_at',
         'before_done_verified_at',
         'before_done_verified_pid',

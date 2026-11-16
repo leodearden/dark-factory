@@ -2686,7 +2686,10 @@ def create_server(
         NOTE: resolve_issue itself writes no task status — this call changes
         only the escalation record. The orchestrator harness applies the
         ``target_status`` values above. Table B's consumers are listed in the
-        ``escalation/src/escalation/action_effects.py`` module docstring.
+        ``escalation/src/escalation/action_effects.py`` module docstring. A
+        ``resume`` of a held deterministic pure gate is run by the harness
+        inline, which closes it or re-holds it, instead of being re-pended, see
+        ``orchestrator/src/orchestrator/harness.py::Harness._run_held_pure_gate_inline``.
         """
         if terminate is not None:
             return {
@@ -3186,8 +3189,8 @@ def create_server(
         the reconciliation queue are separate stores), so a caller connected to
         one of them learns nothing about records in the other: confirm which
         queue you are talking to before reading any [] as a gap.  Auditing a
-        ``done`` ``task_kind='deterministic'`` gate task that has
-        ``metadata.gate_escalated_at`` set?  Those records live in the
+        ``done`` ``task_kind='deterministic'`` gate task whose
+        ``done_provenance.kind`` is ``'deterministic-gate'``?  Those records live in the
         ORCHESTRATOR queue — call this tool against THAT server before emitting
         any finding, flag, memory or remediation task claiming the escalation
         record was never written.  (Reconciliation stages are denied this tool
@@ -3264,8 +3267,8 @@ def create_server(
         so a caller connected to one of them learns nothing about records in
         the other: confirm which queue you are talking to before treating
         ``count: 0`` as proof that no record was ever filed. Auditing a
-        ``done`` ``task_kind='deterministic'`` gate task that has
-        ``metadata.gate_escalated_at`` set? Those records live in the
+        ``done`` ``task_kind='deterministic'`` gate task whose
+        ``done_provenance.kind`` is ``'deterministic-gate'``? Those records live in the
         ORCHESTRATOR queue — query THAT server before emitting any finding,
         flag, memory or remediation task claiming the escalation record was
         never written. (Reconciliation stages are denied this tool outright

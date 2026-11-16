@@ -509,12 +509,14 @@ _ESCALATION_BOUNDARY_NO_ACTION = (
 # stage prompts and requires every such example to carry `run_id=`).
 _GATE_CLOSURE_ARCHIVE_GUIDANCE = """\
 ### Deterministic-gate closure is established from the TASK RECORD
-Scope: a `done` task with `task_kind='deterministic'`, `metadata.gate_escalated_at` \
-set, and a `done_provenance.kind` of `deterministic-gate` or `deterministic-milestone`.
+Scope: a `done` task with `task_kind='deterministic'` and a `done_provenance.kind` of \
+`deterministic-gate` or `deterministic-milestone`.
 
 Call `mcp__fused-memory__get_task(task_id)` — a READ you do hold. `status == 'done'` \
-PLUS `metadata.gate_escalated_at` set PLUS one of those `done_provenance.kind` values \
-IS LEGITIMATE CLOSURE on its own; this rule is primary and sufficient. Do not flag such \
+PLUS `task_kind='deterministic'` PLUS one of those `done_provenance.kind` values IS \
+LEGITIMATE CLOSURE on its own; this rule is primary and sufficient. Since task 3638 \
+`metadata.gate_escalated_at` is removed when a gate closes; older closures may still \
+carry it, and its presence or absence changes nothing here. Do not flag such \
 a task, do not file remediation work against it, and do not write a memory asserting a \
 missing escalation record. An archive-inclusive `get_task_escalations` lookup that would \
 confirm the record directly does exist, but only on the ORCHESTRATOR-side escalation \

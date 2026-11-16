@@ -981,7 +981,7 @@ action); task goes `blocked` until resolved.
 |---|---|---|---|
 | present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
 | present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask (incompatible with `human_curator_gate`) |
-| absent | `true` | escalate born-at-L2 immediately; `done` after `resume`; re-fires instead if resumed behind a new dependency, external dependency or milestone | **pure gate** |
+| absent | `true` | escalate born-at-L2 immediately; `done` on `resume` (immediately, unless it waits on a dependency, milestone or `deferred_watch`, or carries any `external_deps` or delivered-check dependency — see `docs/deterministic-runner.md` §"Resuming a pure gate"); re-fires instead if resumed behind a new dependency, external dependency or milestone | **pure gate** |
 | absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
 
 **Validation (enforced at `submit_task`):** `task_kind='deterministic'`
@@ -1016,6 +1016,9 @@ author-supplied): `before_done_ran_at`, `before_done_verified_at`,
 `deterministic-*` kinds — see the requirement table in §2 for
 per-kind semantics; `deterministic-milestone` is stamped on both the
 first-pass check and the post-escalation re-check described in §6).
+Both gate stamps are removed by fused-memory when the task enters or
+leaves `done`/`cancelled` (task 3638), so a closed gate carries neither
+and a reopened one files afresh.
 
 A **pure-gate** close cites the resolving `milestone_gate` record via
 `done_provenance.escalation_id`, exactly as the curator-gate close already
@@ -1031,13 +1034,14 @@ dependency (by CLAUDE.md's `planning_mode=True` → `add_dependency` →
 fresh gate escalation itself, because the task now waits on more than its
 `gate_escalated_preconditions` record (rationale:
 `docs/deterministic-runner.md` §3), so nobody clears `gate_escalated_at` by
-hand. Wiring the hold after the resume races: the task re-pends with
-nothing new to wait on and closes. One transitional exception: a gate
-whose metadata has no `gate_escalated_preconditions` record fired before
-task 9520 deployed, and closes when the hold lands. For it, set
-`gate_escalated_at` to null after wiring the hold and before the resume,
-so the gate files afresh. The exception can go once no blocked gate lacks
-the record.
+hand. The hold must be wired BEFORE the resume: a resume with nothing new
+to wait on closes the gate at once, at resolution time (task 3638). One
+transitional exception: a gate whose metadata has no
+`gate_escalated_preconditions` record fired before task 9520 deployed, and
+closes when the hold lands. For it, set `gate_escalated_at` to null after
+wiring the hold and before the resume; with no stamp it is not a held pure
+gate, so the resume re-pends it and it files afresh on dispatch. The
+exception can go once no blocked gate lacks the record.
 
 **`done_provenance.kind='operational-verified'`** — a related but distinct
 closure path (see §2), used for `normal`-task no-code operational asks
