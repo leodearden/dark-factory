@@ -16,7 +16,7 @@ from orchestrator.event_store import EventStore, EventType
 
 _ALARM = BornAtL2Alarm(
     root_cause='probe_condition',
-    sentinel_task='__probe_condition__',
+    task_id='__probe_condition__',
     role='orchestrator-probe-condition',
     category=EscalationCategory.INFRA_ISSUE,
     suggested_action='investigate_probe_condition',
@@ -78,7 +78,7 @@ def test_files_an_urgent_level_two_escalation_for_a_human(queue, event_store):
     (pending,) = queue.get_pending()
     assert pending.id == escalation.id
     assert (pending.level, pending.severity) == (2, 'urgent')
-    assert pending.task_id == _ALARM.sentinel_task
+    assert pending.task_id == _ALARM.task_id
     assert pending.agent_role == _ALARM.role
     assert pending.category == _ALARM.category
     assert pending.category == 'infra_issue'
@@ -95,7 +95,7 @@ def test_emits_escalation_created_with_the_alarm_reason(queue, event_store):
     event_store.emit.assert_called_once()
     (event_type,) = event_store.emit.call_args.args
     assert event_type is EventType.escalation_created
-    assert event_store.emit.call_args.kwargs['task_id'] == _ALARM.sentinel_task
+    assert event_store.emit.call_args.kwargs['task_id'] == _ALARM.task_id
     data = event_store.emit.call_args.kwargs['data']
     assert data['escalation_id'] == escalation.id
     assert data['reason'] == _ALARM.created_reason
