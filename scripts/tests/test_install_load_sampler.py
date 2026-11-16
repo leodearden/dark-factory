@@ -25,7 +25,9 @@ import subprocess
 import time
 from pathlib import Path
 
+import _checkout as _checkout
 import pytest
+from sampler.metrics import SampleKey
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
@@ -377,6 +379,27 @@ def test_a_db_with_a_fresh_row_passes_the_row_check(tmp_path: Path):
 
     assert result.returncode == 0, (
         f'stdout={result.stdout!r} stderr={result.stderr!r}')
+
+
+def test_the_row_check_counts_every_row_the_tick_wrote_host_and_per_leaf(
+    tmp_path: Path
+):
+    """A per-leaf row is a real row of the tick, and the report counts it."""
+    root = tmp_path / 'root'
+    leaf = 'orchestrator-dark-factory.service'
+    tick = {
+        SampleKey('runqueue_ratio'): 4.06,
+        SampleKey('own_read_ok', leaf): 1.0,
+        SampleKey('own_cpu_some10', leaf): 0.5,
+    }
+    _seed_db(root, tick=tick)
+
+    result = _run_script(tmp_path, env=_install_env(tmp_path, root))
+
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    assert f'{len(tick)} sample rows written by the kick' in result.stdout, (
+        result.stdout)
 
 
 def test_an_empty_db_fails_the_row_check_naming_the_path(tmp_path: Path):
