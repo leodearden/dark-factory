@@ -41,7 +41,6 @@ class BornAtL2Alarm:
 
     def __post_init__(self) -> None:
         require_registered_category(self.category)
-        # Task 9686 adds escalation/models.py::is_harness_sentinel_role; switch to it when it lands.
         if not self.role.startswith(HARNESS_SENTINEL_ROLE_PREFIXES):
             raise ValueError(
                 f'BornAtL2Alarm {self.root_cause!r} has role={self.role!r}; it needs a role '
@@ -76,7 +75,9 @@ def file_deduped_born_at_l2(
         logger.warning('%s: failed to file the born-at-L2', alarm.root_cause, exc_info=True)
         return None
     _emit_created(event_store, alarm, escalation)
-    logger.warning('%s: born-at-L2 %s filed', alarm.root_cause, escalation.id)
+    logger.warning(
+        '%s: born-at-L2 %s filed: %s', alarm.root_cause, escalation.id, escalation.summary,
+    )
     return escalation
 
 

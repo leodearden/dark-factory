@@ -13274,7 +13274,7 @@ class Harness:
             )
 
         # Telemetry is strictly secondary to the dismissal above: a failure
-        # here must never abort startup (the _file_reblock_guard_l2 precedent).
+        # here must never abort startup (the born_at_l2.py::_emit_created precedent).
         try:
             self._report_stale_l0_strands(strands)
         except Exception as e:  # pragma: no cover - defensive
@@ -15548,10 +15548,9 @@ class Harness:
                 reason,
             )
         # File the watcher-outage L2 so the human L2 stream is notified even
-        # when the watcher subsystem is not running.  No outer try/except needed
-        # here: _file_watcher_outage_l2 is already best-effort (its body is
-        # entirely wrapped in `except Exception`), so any filing failure is
-        # swallowed internally.  CancelledError is not raised by the sync helper.
+        # when the watcher subsystem is not running.  Best-effort without an
+        # outer try: born_at_l2.py::file_deduped_born_at_l2 swallows filing
+        # failures and the L1 count has its own guard.
         self._file_watcher_outage_l2(reason)
         return True  # always stop, even if pause_scheduler raised
 

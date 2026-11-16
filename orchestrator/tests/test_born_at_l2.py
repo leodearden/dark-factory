@@ -60,8 +60,7 @@ def test_alarm_refuses_a_role_outside_the_sentinel_namespace(role):
     with pytest.raises(ValueError, match=re.escape(repr(role))) as excinfo:
         replace(_ALARM, role=role)
 
-    if role == 'orchestrator':
-        assert all(prefix in str(excinfo.value) for prefix in HARNESS_SENTINEL_ROLE_PREFIXES)
+    assert all(prefix in str(excinfo.value) for prefix in HARNESS_SENTINEL_ROLE_PREFIXES)
 
 
 @pytest.mark.parametrize('prefix', HARNESS_SENTINEL_ROLE_PREFIXES)
@@ -99,6 +98,19 @@ def test_emits_escalation_created_with_the_alarm_reason(queue, event_store):
     data = event_store.emit.call_args.kwargs['data']
     assert data['escalation_id'] == escalation.id
     assert data['reason'] == _ALARM.created_reason
+
+
+def test_filed_warning_carries_the_summary(queue, caplog):
+    with caplog.at_level('WARNING'):
+        escalation = _file(queue, summary='probe tripped: 3 lanes drifted')
+
+    assert escalation is not None
+    assert any(
+        r.levelname == 'WARNING'
+        and escalation.id in r.getMessage()
+        and 'probe tripped: 3 lanes drifted' in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_long_summary_is_cut_to_one_line_limit(queue):
