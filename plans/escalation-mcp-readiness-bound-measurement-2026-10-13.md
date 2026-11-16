@@ -20,7 +20,8 @@ and `::test_the_readiness_bound_expires_before_the_verify_per_test_budget`.
 
 Adopted wholesale from task 5442 (`plans/pytest-per-test-timeout-measurement-2026-09-17.md`),
 not invented here. The factor is
-`orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR` (8); the
+`shared/src/shared/testing_timeout_headroom.py::UNDER_LOAD_HEADROOM_FACTOR` (8; moved from
+`orchestrator/tests/_orch_helpers.py` by task 6555); the
 rationale for 8x rather than 2x lives in that note. The worst run is kept,
 never the freshest. The bound is never-narrow: lower it only on a new
 measurement taken at comparable or higher load, never on judgement.
