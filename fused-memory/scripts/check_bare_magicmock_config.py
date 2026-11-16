@@ -738,7 +738,7 @@ def _dataclass_double_violation(
 # on trailing path COMPONENTS, so the package directory keeps them distinct.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     # orchestrator/tests
-    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 65,
+    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 49,
     'orchestrator/tests/test_merge_queue_request_liveness.py': 10,
     'orchestrator/tests/test_offline_lane.py': 10,
     'orchestrator/tests/test_live_merge_worker.py': 6,
