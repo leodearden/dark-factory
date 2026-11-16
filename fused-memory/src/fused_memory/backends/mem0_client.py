@@ -239,10 +239,15 @@ class Mem0Backend:
     only half a fix, so both halves are enforced in one place: every timed
     call on this class goes through :meth:`_timed_read` / :meth:`_timed_write`
     to ``backends/timeout_budget.py::await_within``, the single home of the
-    message format.  The Qdrant client mem0's vector store uses is this
+    message format.  mem0's instance construction (its collection listing and
+    payload-index creates) runs off the event loop under the write budget as
+    ``create_instance``, and the Qdrant client mem0's vector store uses is this
     backend's own, its socket timeout from ``socket_timeout_outlasting`` over
-    both budgets, so a slow Qdrant leg fails on its named budget
-    (tests/test_mem0_vector_store_client.py).
+    both budgets, so a slow mem0 leg fails on its named budget
+    (tests/test_mem0_vector_store_client.py).  The one exception left: the
+    direct async client's socket timeout is still the read budget, so its
+    writes can still fail unattributed (gap (2) of task 8196; see
+    :meth:`_ensure_collection`).
 
     This paragraph is the CANONICAL statement of the rule, and a method's own
     ``Raises:`` line adds only the consequence specific to IT — so there is one
@@ -394,7 +399,7 @@ class Mem0Backend:
         config_dict = self._build_config_dict(collection_name)
         await self._ensure_collection(collection_name)
         config_dict['vector_store']['config']['client'] = self._get_vector_store_client()
-        instance = AsyncMemory.from_config(config_dict)
+        instance = await self._timed_write(asyncio.to_thread(AsyncMemory.from_config, config_dict), 'create_instance')
         self._instances[scope.project_id] = instance
         logger.info(f'Mem0 instance created for project {scope.project_id} (collection: {collection_name})')
         return instance
@@ -402,7 +407,7 @@ class Mem0Backend:
     async def _ensure_collection(self, collection_name: str) -> None:
         """Create the collection if absent, under this backend's own budgets (tests/test_mem0_collection_provisioning.py).
 
-        Gap, owned by task 8196: the shared client's socket timeout is
+        Gap, owned by task 8196: the direct async client's socket timeout is
         ``int(read budget)``, so a create slower than that fails as an
         unattributed ``ResponseHandlingException`` before the write budget.
         """
