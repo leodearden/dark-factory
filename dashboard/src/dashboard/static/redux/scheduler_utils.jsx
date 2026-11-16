@@ -4,7 +4,8 @@
    consumers can destructure from the global.
 
    Exports: window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo,
-             disambiguateLabels, labelFor, isLockHolder, lockHeldAgainst, lockChipStateFor }
+             disambiguateLabels, labelFor, isLockHolder, lockHeldAgainst, holdersLabel,
+             lockChipStateFor }
    (Canonical list: the window.DF_SCHED_UTILS assignment at the bottom of this file.)
 */
 
@@ -127,6 +128,11 @@ function lockHeldAgainst(module, taskId, project) {
   return m.at_holder_limit === true && !isLockHolder(m, taskId, project);
 }
 
+// How a lock's holders are named wherever every holder is listed.
+function holdersLabel(holders) {
+  return holders.map(h => `T-${h}`).join(', ');
+}
+
 function holdersOwnerLabel(holders) {
   const more = holders.length > 1 ? ` +${holders.length - 1}` : '';
   return `T-${holders[0]}${more}`;
@@ -141,7 +147,7 @@ function holdersOwnerLabel(holders) {
 // Returns { cls, hint, ownerLabel } where ownerLabel is null when the chip has
 // no owner to display (lock-free or lock-mine without a counterpart label).
 function lockChipState({ holders, isMine, heldAgainst, parkedBy, parkedOwnerLive }) {
-  const holderNames = holders.map(h => `T-${h}`).join(', ');
+  const holderNames = holdersLabel(holders);
   if (isMine) return { cls: 'lock-mine', hint: 'held by this task', ownerLabel: null };
   if (heldAgainst) {
     return { cls: 'lock-taken', hint: `held by ${holderNames}`, ownerLabel: holdersOwnerLabel(holders) };
@@ -170,5 +176,5 @@ function lockChipStateFor(module, taskId, project) {
 
 window.DF_SCHED_UTILS = {
   fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels, labelFor,
-  isLockHolder, lockHeldAgainst, lockChipStateFor,
+  isLockHolder, lockHeldAgainst, holdersLabel, lockChipStateFor,
 };

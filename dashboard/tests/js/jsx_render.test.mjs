@@ -1432,18 +1432,48 @@ for (const { name, module: buildModule } of DRAWER_UNBLOCKED_CASES) {
 
 test('scheduler_drawer.jsx::SchedulerDrawer names the holders of a full key held against the task, and no empty state', t => {
   const harness = openWindow(t);
+  const { holdersLabel, lockHeldAgainst } = harness.window.DF_SCHED_UTILS;
   const module = schedulerModule({
-    project: PROJECT, path: 'OPERATIONS.md', holder: '1', holderProject: PROJECT, holders: ['1'], atHolderLimit: true,
+    project: PROJECT, path: 'OPERATIONS.md', holder: '1', holderProject: PROJECT, holders: ['1', '3'], atHolderLimit: true,
   });
-  assert.equal(harness.window.DF_SCHED_UTILS.lockHeldAgainst(module, DRAWER_TASK.task_id, PROJECT), true,
+  assert.equal(lockHeldAgainst(module, DRAWER_TASK.task_id, PROJECT), true,
     'lockHeldAgainst does not read this module as held against the task, so this fixture tests nothing');
 
   const section = drawerLockHolders(harness, module);
   assert.ok(section, "the drawer draws no 'Lock holders' section");
   const lines = heldByLines(section);
   assert.equal(lines.length, 1, 'the drawer must draw one held-by line for the one blocking module');
-  assert.ok(lines[0].textContent.includes('T-1'), `the held-by line does not name T-1: ${lines[0].textContent}`);
+  const named = holdersLabel(module.holders);
+  assert.ok(lines[0].textContent.includes(named), `the held-by line does not name ${named}: ${lines[0].textContent}`);
   assert.ok(!section.textContent.includes(NO_LOCK_HELD_AGAINST), 'the drawer draws its empty state beside a blocking holder');
+});
+
+// ── The Orchestrators tab's Locks column puts blocked keys first (tabs.jsx::LocksCell) ──
+
+test('tabs.jsx::LocksCell draws a key held against the task before a key shared below its holder limit', t => {
+  const harness = openWindow(t);
+  const { window } = harness;
+  const task = inProgressTask(false);
+  const shared = schedulerModule({
+    project: PROJECT, path: 'OPERATIONS.md', holder: '1', holderProject: PROJECT, holders: ['1'], atHolderLimit: false,
+  });
+  const full = schedulerModule({ project: PROJECT, path: 'src/taken', holder: '7', holderProject: PROJECT });
+  // The lock set lists the shared key first, so only the blocked-first sort puts the full key ahead.
+  seedTaskWithScheduler(window, task, schedulerSnapshot({
+    rows: [schedulerLockRow({ project: PROJECT, taskId: task.id, lockSet: [shared.path, full.path] })],
+    modules: [shared, full],
+  }));
+  const { lockHeldAgainst } = window.DF_SCHED_UTILS;
+  assert.equal(lockHeldAgainst(full, task.id, PROJECT), true,
+    'lockHeldAgainst does not read the full key as held against the task, so this fixture tests nothing');
+  assert.equal(lockHeldAgainst(shared, task.id, PROJECT), false,
+    'lockHeldAgainst reads the shared key as held against the task, so this fixture tests nothing');
+
+  const { container } = harness.mount(window.DF_TABS.OrchTab, TAB_PROPS);
+  const row = orchTaskRow(window, container, task);
+  assert.ok(row, 'the task never reached the Orchestrators table');
+  const chipPaths = lockChips(row).map(chip => chip.title.split(' · ')[0]);
+  assert.deepEqual(chipPaths, [full.path, shared.path], 'the key held against the task must draw first');
 });
 
 // ── The memory-eval section (tab_memory_evals.jsx::MemoryEvalsSection) ──

@@ -15,7 +15,7 @@ const { Segmented, ProjectChips, timeago, fmtDateTime } = window.DF_SHELL;
 const { SchedulerHeatmap, cellStateFor } = window.DF_SCHED_HEATMAP;
 const { SchedulerDrawer } = window.DF_SCHED_DRAWER;
 // Shared helpers loaded by scheduler_utils.jsx (must come before this script).
-const { fmtAge, totalEvents, avgWaitSeconds, labelFor, isLockHolder } = window.DF_SCHED_UTILS;
+const { fmtAge, totalEvents, avgWaitSeconds, labelFor, isLockHolder, holdersLabel } = window.DF_SCHED_UTILS;
 
 const D = window.DF_DATA;
 
@@ -309,8 +309,8 @@ function ModulesView({ modules, rows, eventsMap }) {
             {m.holder ? (
               <div style={{ fontSize: 11, marginBottom: 8, padding: '6px 8px', background: 'var(--bg-2)', borderRadius: 4 }}>
                 <span style={{ color: 'var(--fg-3)' }}>held by </span>
-                <span className="mono" style={{ color: 'var(--accent)' }}>{m.holders.map(h => `T-${h}`).join(', ')}</span>
-                {!m.at_holder_limit && (
+                <span className="mono" style={{ color: 'var(--accent)' }}>{holdersLabel(m.holders)}</span>
+                {m.at_holder_limit === false && (
                   <span style={{ color: 'var(--fg-3)', fontSize: 10, marginLeft: 8 }}>below its holder limit</span>
                 )}
                 {holderAge && (

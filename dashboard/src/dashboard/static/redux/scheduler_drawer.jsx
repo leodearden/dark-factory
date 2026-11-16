@@ -6,7 +6,7 @@
 const { useState: sdUseState, useCallback: sdUseCallback, useRef: sdUseRef, useEffect: sdUseEffect } = React;
 const { timeago, fmtDateTime } = window.DF_SHELL;
 // Shared helpers loaded by scheduler_utils.jsx (must come before this script).
-const { fmtAge, totalEvents, avgWaitSeconds, labelFor, lockHeldAgainst } = window.DF_SCHED_UTILS;
+const { fmtAge, totalEvents, avgWaitSeconds, labelFor, lockHeldAgainst, holdersLabel } = window.DF_SCHED_UTILS;
 
 // Derive which modules are currently blocking this task.
 // A module blocks this task when it is in the task's lock_set AND its holders
@@ -47,7 +47,7 @@ function HolderEtas({ task, modules, spark }) {
               {labelMap.get(m.path)}
             </div>
             <div style={{ color: 'var(--fg-2)' }}>
-              held by <span className="mono" style={{ color: 'var(--accent)' }}>{m.holders.map(h => `T-${h}`).join(', ')}</span>
+              held by <span className="mono" style={{ color: 'var(--accent)' }}>{holdersLabel(m.holders)}</span>
             </div>
           </div>
           <div style={{ textAlign: 'right', flexShrink: 0 }}>

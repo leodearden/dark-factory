@@ -9,10 +9,11 @@ precedence matrix:
 A key held by others below its holder limit is not held against the task, so
 it reads by its park, else free.
 
-It is the module's only classifier export: it derives "this lock is mine" from
-a task's view of a SCHEDULER.modules entry and applies the precedence. The
-Scheduler heatmap's cellStateFor is executed below beside it, and must answer
-every lock state exactly as the task-row LockChip does; membership
+It is the module's only classifier export, and it applies the precedence to a
+task's view of a SCHEDULER.modules entry. isLockHolder decides whether the lock
+is mine and lockHeldAgainst whether it blocks the task; both are executed below
+as well. The Scheduler heatmap's cellStateFor is executed below beside it, and
+must answer every lock state exactly as the task-row LockChip does; membership
 (rowTouchesModule) is the only thing it adds.
 """
 
@@ -88,7 +89,7 @@ def chip_states() -> dict[str, dict]:
 
 
 class TestLockChipStateFor:
-    """lockChipStateFor(module, taskId, project) is the one place a lock is "mine".
+    """lockChipStateFor(module, taskId, project) applies the precedence to isLockHolder and lockHeldAgainst.
 
     Mine means held by this task id IN this project; a module that names no
     holder_project is read as the task's own project. A holder outranks a park.
@@ -170,7 +171,8 @@ def test_lock_chip_state_for_is_the_only_classifier_exported():
     assert 'lockChipStateFor' in exported, exported
     assert 'lockChipState' not in exported, (
         'window.DF_SCHED_UTILS still exports the bare lockChipState, which takes a '
-        'caller-computed isMine; lockChipStateFor is the one place a lock is decided to be mine'
+        'caller-computed isMine; isLockHolder decides whether a lock is mine, and '
+        'lockChipStateFor is the one entry point that applies the precedence to it'
     )
 
 

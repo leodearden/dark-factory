@@ -551,34 +551,18 @@ def test_cell_state_classifies_through_the_one_lock_classifier(scheduler_heatmap
     assert token not in body, f'cellStateFor still reads or returns `{token}`'
 
 
-@pytest.fixture(scope='module')
-def scheduler_drawer_jsx_body(_client):
-    return _client.get('/static/redux/scheduler_drawer.jsx').text
+def test_modules_view_asks_is_lock_holder_who_waits(tab_scheduler_jsx_body):
+    """ModulesView's waiters leave out a key's holders by asking isLockHolder, not by restating it.
 
-
-# Each JSX holder test that once restated `m.holder !== <task id>` inline, the
-# predicate it now calls, and the restatement that must not survive. Their
-# behaviour is executed by test_lock_chip_state.py's node-vm tests of
-# isLockHolder and lockHeldAgainst; these components have no render harness,
-# so the call is pinned at the source seam, as cellStateFor's is above.
-_HOLDER_TEST_SEAMS = {
-    'scheduler_drawer.jsx::blockingModules': (
-        'scheduler_drawer_jsx_body', 'blockingModules', 'lockHeldAgainst', 'm.holder !==',
-    ),
-    'tab_scheduler.jsx::ModulesView': (
-        'tab_scheduler_jsx_body', 'ModulesView', 'isLockHolder', 'm.holder !== r.task_id',
-    ),
-    'tabs.jsx::LocksCell': ('tabs_jsx_body', 'LocksCell', 'lockHeldAgainst', 'ha !== rawTaskId'),
-}
-
-
-@pytest.mark.parametrize('seam', list(_HOLDER_TEST_SEAMS))
-def test_holder_tests_route_through_the_shared_lock_predicates(request, seam):
-    """No component restates who holds a lock or whether it blocks a task; each asks scheduler_utils.jsx."""
-    fixture, function, predicate, restatement = _HOLDER_TEST_SEAMS[seam]
-    body = strip_js_comments(extract_function_body(request.getfixturevalue(fixture), function))
-    assert re.search(rf'\b{predicate}\s*\(', body), f'{seam} does not call {predicate}'
-    assert restatement not in body, f'{seam} still restates the holder test `{restatement}`'
+    isLockHolder's behaviour is executed by test_lock_chip_state.py. No jsdom
+    test mounts the Scheduler tab, so this call is pinned at the source seam,
+    as cellStateFor's is above. The drawer's blockingModules and the
+    Orchestrators tab's LocksCell are rendered by
+    dashboard/tests/js/jsx_render.test.mjs instead.
+    """
+    body = strip_js_comments(extract_function_body(tab_scheduler_jsx_body, 'ModulesView'))
+    assert re.search(r'\bisLockHolder\s*\(', body), 'ModulesView does not call isLockHolder'
+    assert 'm.holder !== r.task_id' not in body, 'ModulesView still restates the holder test `m.holder !== r.task_id`'
 
 
 def test_scheduler_heatmap_derives_no_park_map(scheduler_heatmap_jsx_body):
