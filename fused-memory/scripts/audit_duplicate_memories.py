@@ -24,6 +24,12 @@ about what a cluster IS -- only about which pairs are candidates.
     lexical scan cannot, at zero embedding API calls and with no second
     metric space.
 
+The adjudicated-ANN detector (``ann_candidate_pairs`` + ``adjudicate_pairs``
++ ``adjudicated_pairs``, task 10243) re-scores cutoff-free ANN candidates
+with an injected slate scorer. It is a LIBRARY path, not wired into
+``build_sweep_plan``, the stdout plan or ``--apply``, so it can never produce
+a delete candidate; ``scripts/measure_duplicate_detector_recall.py`` measures it.
+
 The ANN path is NOT a replacement -- swapping one detector for the other
 would lose signal, so the actioned plan clusters over the UNION and every
 emitted cluster records which path(s) found it (``found_by``,
@@ -197,7 +203,7 @@ import logging
 import math
 import re
 import sys
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1292,6 +1298,51 @@ def ann_candidate_pairs(
     No similarity cutoff applies; the disclosure is ``ann_pairs_from_neighbors``'s.
     """
     return ann_pairs_from_neighbors(memories, neighbors_by_id, -math.inf, top_k=top_k)
+
+
+SlateScorer = Callable[[str, Sequence[str]], Sequence[float]]
+
+
+def adjudicate_pairs(
+    memories: list[dict],
+    pairs: Iterable[tuple[int, int]],
+    score_slate: SlateScorer,
+) -> dict[tuple[int, int], float]:
+    """Score each canonical pair as the mean of its two directional scores.
+
+    *score_slate* is called once per record, with its partners in index
+    order. A pair with an empty endpoint is never scored and is absent.
+    """
+    texts = [(m.get('content') or '').strip() for m in memories]
+    scorable = {(i, j) for i, j in pairs if texts[i] and texts[j]}
+    partners: dict[int, list[int]] = {}
+    for i, j in scorable:
+        partners.setdefault(i, []).append(j)
+        partners.setdefault(j, []).append(i)
+
+    directional: dict[tuple[int, int], float] = {}
+    for i in sorted(partners):
+        others = sorted(partners[i])
+        scores = score_slate(texts[i], [texts[j] for j in others])
+        if len(scores) != len(others):
+            raise ValueError(
+                f'score_slate returned {len(scores)} scores for memory '
+                f'{memories[i].get("id")!r}, expected {len(others)}',
+            )
+        directional.update(((i, j), float(s)) for j, s in zip(others, scores, strict=True))
+
+    return {
+        (i, j): (directional[(i, j)] + directional[(j, i)]) / 2
+        for i, j in sorted(scorable)
+    }
+
+
+def adjudicated_pairs(
+    scores: Mapping[tuple[int, int], float],
+    threshold: float,
+) -> list[tuple[int, int]]:
+    """The pairs scoring at or above *threshold* (inclusive), sorted."""
+    return sorted(pair for pair, score in scores.items() if score >= threshold)
 
 
 def _created_at_sort_key(created_at: Any) -> tuple[int, float]:
