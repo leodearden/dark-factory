@@ -53,6 +53,14 @@ class _Fixture:
         self.queue.submit(record)
         return record
 
+    def submit_task_less(self) -> Escalation:
+        """Submit a record with ``task_id`` null, the shape
+        ``fused_memory.reconciliation.backlog_policy.BacklogPolicy`` files."""
+        shape = self._record('infra_issue', None).to_dict()
+        record = Escalation.from_dict({**shape, 'task_id': None})
+        self.queue.submit(record)
+        return record
+
     def resolve(self, record: Escalation) -> None:
         resolved = self.queue.resolve(record.id, 'ruled', dismiss=True, resolved_by='watcher')
         assert resolved is not None
@@ -69,6 +77,17 @@ class _Fixture:
         self.resolve(record)
         self.absorb(record, times)
         return record
+
+    def write_by_hand(self, **fields: object) -> Path:
+        """Write a dismissed record absorbing two refiles straight into the queue
+        root, with *fields* overridden as a hand edit or a foreign writer could;
+        the real queue never writes an ill-typed field."""
+        record = self._record('provenance_unattributed', _CITATION)
+        payload = {**record.to_dict(), 'status': 'dismissed', 'refiles_suppressed': 2, **fields}
+        self.queue.queue_dir.mkdir(parents=True, exist_ok=True)
+        path = self.queue.queue_dir / f'{record.id}.json'
+        path.write_text(json.dumps(payload))
+        return path
 
     def report(self) -> AbsorptionReport:
         return absorbing_resolutions(self.queue.queue_dir)
@@ -191,6 +210,64 @@ class TestScanCarriesItsShortfall:
         assert [row.escalation_id for row in report.rows] == [record.id]
         assert report.skipped_unparsable == 1
 
+    @pytest.mark.parametrize('content', ['[]', 'null', '"text"', '42'])
+    def test_valid_json_that_is_not_an_object_is_counted_unparsable(
+        self, tmp_path: Path, content: str,
+    ):
+        fixture = _Fixture(tmp_path)
+        record = fixture.resolved_absorbing(1)
+        (fixture.queue.queue_dir / 'esc-list-1.json').write_text(content)
+
+        report = fixture.report()
+
+        assert [row.escalation_id for row in report.rows] == [record.id]
+        assert report.skipped_unparsable == 1
+        assert report.scanned == 1
+
+    @pytest.mark.parametrize('counter', [None, '3', 1.5, True])
+    def test_a_counter_that_is_not_a_count_is_counted_unparsable(
+        self, tmp_path: Path, counter: object, caplog: pytest.LogCaptureFixture,
+    ):
+        fixture = _Fixture(tmp_path)
+        record = fixture.resolved_absorbing(1)
+        corrupt = fixture.write_by_hand(refiles_suppressed=counter)
+
+        report = fixture.report()
+
+        assert [row.escalation_id for row in report.rows] == [record.id]
+        assert report.skipped_unparsable == 1
+        assert report.scanned == 1
+        assert str(corrupt) in caplog.text
+
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [('id', None), ('category', None), ('status', None), ('task_id', 4915),
+         ('resolved_by', 7)],
+    )
+    def test_an_absorbing_record_with_an_ill_typed_row_field_is_counted_unparsable(
+        self, tmp_path: Path, field: str, value: object,
+    ):
+        fixture = _Fixture(tmp_path)
+        record = fixture.resolved_absorbing(1)
+        fixture.write_by_hand(**{field: value})
+
+        report = fixture.report()
+
+        assert [row.escalation_id for row in report.rows] == [record.id]
+        assert report.skipped_unparsable == 1
+
+    def test_an_ill_typed_row_field_on_an_unlisted_record_is_not_a_loss(
+        self, tmp_path: Path,
+    ):
+        """Only a record that becomes a row needs renderable text fields."""
+        fixture = _Fixture(tmp_path)
+        fixture.write_by_hand(refiles_suppressed=0, category=None)
+
+        report = fixture.report()
+
+        assert report.rows == ()
+        assert (report.scanned, report.skipped_unparsable) == (1, 0)
+
     def test_a_file_gone_between_listing_and_read_is_counted_vanished(self, tmp_path: Path):
         """A dangling symlink is globbed like any other esc-*.json and then
         fails the read with the same ENOENT a concurrent relocation produces."""
@@ -293,6 +370,40 @@ class TestCliTable:
             'total_absorbed=0', 'records=0', 'scanned=1', 'skipped_vanished=0',
             'skipped_unreadable=0', 'skipped_unparsable=0',
         } <= _summary_tokens(out)
+
+    def test_a_record_filed_with_no_task_id_is_a_row_with_a_dash(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ):
+        """Production files task-less records; the row must not lose them."""
+        fixture = _Fixture(tmp_path)
+        record = fixture.submit_task_less()
+        fixture.resolve(record)
+        fixture.absorb(record, 2)
+
+        rc = main(['--queue-dir', str(fixture.queue.queue_dir)])
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        row_lines = [line for line in out.splitlines() if record.id in line]
+        assert len(row_lines) == 1
+        assert row_lines[0].split()[1] == '-'
+        assert 'records=1' in _summary_tokens(out)
+
+    def test_ill_typed_records_cost_one_row_each_not_the_table(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ):
+        fixture = _Fixture(tmp_path)
+        record = fixture.resolved_absorbing(1)
+        fixture.write_by_hand(category=None)
+        fixture.write_by_hand(refiles_suppressed=None)
+        (fixture.queue.queue_dir / 'esc-list-1.json').write_text('[]')
+
+        rc = main(['--queue-dir', str(fixture.queue.queue_dir)])
+
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert record.id in out
+        assert {'records=1', 'scanned=1', 'skipped_unparsable=3'} <= _summary_tokens(out)
 
     def test_a_lost_record_is_printed_in_the_summary(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str],

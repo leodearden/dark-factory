@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -24,13 +25,15 @@ from pathlib import Path
 from escalation.models import Escalation
 from escalation.queue import iter_all_escalation_paths, read_escalation_for_scan
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class AbsorbingResolution:
     """One terminal record and the refiles its resolution has absorbed."""
 
     escalation_id: str
-    task_id: str
+    task_id: str | None
     category: str
     status: str
     refiles_suppressed: int
@@ -72,14 +75,55 @@ class AbsorptionReport:
         return sum(row.refiles_suppressed for row in self.rows)
 
 
-#: Content faults that cost one record rather than the listing. ``ValueError``
-#: is a deliberate member: ``UnicodeDecodeError`` from a truncated or binary
-#: file subclasses it.
-_SCAN_PARSE_ERRORS: tuple[type[BaseException], ...] = (
-    json.JSONDecodeError, KeyError, TypeError, ValueError,
+#: Content faults that cost one record rather than the listing.
+#: ``UnicodeDecodeError`` from a truncated or binary file subclasses
+#: ``ValueError``; ``AttributeError`` is what ``Escalation.from_dict`` raises on
+#: valid JSON that is not an object, such as ``[]``.
+_LISTING_PARSE_ERRORS: tuple[type[BaseException], ...] = (
+    json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError,
 )
 
 _SKIP_REASONS = ('vanished', 'unreadable', 'unparsable')
+
+_CONTEXT = 'refile_absorption.absorbing_resolutions'
+
+
+def _type_fault(record: Escalation) -> str | None:
+    """Name the fields this listing needs that lack their declared type, if any.
+
+    ``Escalation.from_dict`` checks no types, so ``"refiles_suppressed": null``
+    parses. The counter is checked on every record; the row's text fields only
+    on a record that becomes a row, so a record the listing would not show is
+    never reported as lost.
+    """
+    count = record.refiles_suppressed
+    if not isinstance(count, int) or isinstance(count, bool):
+        return f'refiles_suppressed={count!r}'
+    if count <= 0:
+        return None
+    text = {'id': record.id, 'category': record.category, 'status': record.status}
+    optional_text = {
+        'task_id': record.task_id, 'citation_sha': record.citation_sha,
+        'resolved_at': record.resolved_at, 'resolved_by': record.resolved_by,
+    }
+    wrong = [f'{name}={value!r}' for name, value in text.items() if not isinstance(value, str)]
+    wrong += [
+        f'{name}={value!r}' for name, value in optional_text.items()
+        if value is not None and not isinstance(value, str)
+    ]
+    return ', '.join(wrong) or None
+
+
+def _read(path: Path) -> tuple[Escalation | None, str]:
+    """``read_escalation_for_scan``, with an ill-typed record counted unparsable."""
+    record, reason = read_escalation_for_scan(
+        path, context=_CONTEXT, parse_errors=_LISTING_PARSE_ERRORS,
+    )
+    fault = None if record is None else _type_fault(record)
+    if fault is None:
+        return record, reason
+    logger.warning('%s: Failed to parse %s: ill-typed %s', _CONTEXT, path, fault)
+    return None, 'unparsable'
 
 
 def absorbing_resolutions(escalations_dir: Path | str) -> AbsorptionReport:
@@ -93,10 +137,7 @@ def absorbing_resolutions(escalations_dir: Path | str) -> AbsorptionReport:
     skipped = dict.fromkeys(_SKIP_REASONS, 0)
 
     for path in iter_all_escalation_paths(Path(escalations_dir)):
-        record, reason = read_escalation_for_scan(
-            path, context='refile_absorption.absorbing_resolutions',
-            parse_errors=_SCAN_PARSE_ERRORS,
-        )
+        record, reason = _read(path)
         if record is not None:
             scanned += 1
             if record.refiles_suppressed > 0:
@@ -152,7 +193,7 @@ def _as_table(report: AbsorptionReport) -> str:
         )]
         lines.extend(
             _ROW.format(
-                escalation_id=row.escalation_id, task_id=row.task_id,
+                escalation_id=row.escalation_id, task_id=_shown(row.task_id),
                 category=row.category, status=row.status,
                 absorbed=row.refiles_suppressed, resolved_at=_shown(row.resolved_at),
                 resolved_by=_shown(row.resolved_by), citation_sha=_shown(row.citation_sha),

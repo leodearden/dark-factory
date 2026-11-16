@@ -613,7 +613,8 @@ def read_escalation_for_scan(
     one record rather than the whole measurement),
     ``refile_absorption.py::absorbing_resolutions`` (task 4915; the operator
     listing of resolutions absorbing refiles, also run over the live tree and
-    passing its own wider tuple with ``ValueError`` for the same reason),
+    passing its own wider tuple with ``ValueError`` for the same reason, plus
+    ``AttributeError`` for a file holding valid JSON that is not an object),
     ``queue.py::EscalationQueue.get_by_task``,
     ``queue.py::EscalationQueue.get_pending`` (which also backs
     ``dismiss_all_pending``, so the startup L0 sweep inherits the fix),
