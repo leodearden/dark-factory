@@ -10,6 +10,10 @@
 # (the same file the orchestrators load) before running it. Nothing here
 # echoes an environment value.
 #
+# Arguments are forwarded to the sweep: leo-laptop's drop-in
+# (scripts/transcript-secret-sweep.laptop.conf) adds --host-configs-dir and
+# --no-escalation, and a hand run can add --dry-run.
+#
 # ALWAYS EXITS 0. A recurring oneshot that exits non-zero enters systemd
 # `failed` state and stays there, silently stopping the timer (the lesson in
 # scripts/fused-memory-flag-marker-sweep.sh). The sweep's own exit code is
@@ -31,7 +35,7 @@ set +a
 read -r -a SWEEP_CMD <<<"${TRANSCRIPT_SECRET_SWEEP_CMD:-uv run --no-sync --project $REPO/shared python}"
 
 echo "transcript-secret-sweep: sweeping agent transcripts and verify/offline-lane logs for live secret values"
-"${SWEEP_CMD[@]}" "$REPO/scripts/transcript_secret_sweep.py"
+"${SWEEP_CMD[@]}" "$REPO/scripts/transcript_secret_sweep.py" "$@"
 sweep_rc=$?
 if [ "$sweep_rc" -ne 0 ]; then
     echo "transcript-secret-sweep: the sweep exited $sweep_rc -- it could not run, or its" \
