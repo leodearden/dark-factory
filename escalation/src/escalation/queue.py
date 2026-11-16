@@ -605,12 +605,15 @@ def read_escalation_for_scan(
     file in this package was audited when this helper was introduced; the
     asymmetry below is deliberate, not an oversight.
 
-    FIXED -- the unlocked scans, all seven reads routed through this helper:
+    FIXED -- the unlocked scans, all eight reads routed through this helper:
     ``shadow_ruling.py::agreement_report`` (task 5374; the weekly shadow-ruling
     count, which the watcher skill points at the LIVE ``data/escalations``
     tree and which passes a WIDER ``parse_errors`` tuple than the default --
     it adds ``ValueError`` so a truncated file's ``UnicodeDecodeError`` costs
     one record rather than the whole measurement),
+    ``refile_absorption.py::absorbing_resolutions`` (task 4915; the operator
+    listing of resolutions absorbing refiles, also run over the live tree and
+    passing its own wider tuple with ``ValueError`` for the same reason),
     ``queue.py::EscalationQueue.get_by_task``,
     ``queue.py::EscalationQueue.get_pending`` (which also backs
     ``dismiss_all_pending``, so the startup L0 sweep inherits the fix),
@@ -2836,13 +2839,14 @@ class EscalationQueue:
         non-zero only on already-adjudicated records has no business inflating
         every pending row.
 
-        The residual gap is DISCOVERY, not access: the counter accrues only on
-        RESOLVED/DISMISSED records, which no triage surface lists, so reading it
-        means knowing the id to ask about.  The suppression WARNING in
-        ``file_unattributed_landing_escalation`` names that id on every
-        suppression, which is the intended entry point; a listing surface or a
-        named operator query for "resolutions absorbing refiles" is genuine
-        follow-up work and is filed as such rather than being silently assumed.
+        DISCOVERY is a separate surface from access: the counter accrues only
+        on RESOLVED/DISMISSED records, which no triage surface lists.  The
+        suppression WARNING in ``file_unattributed_landing_escalation`` names
+        the id on every suppression; the listing of every record with a
+        non-zero counter is
+        ``escalation/src/escalation/refile_absorption.py::absorbing_resolutions``,
+        run as the named operator query in OPERATIONS.md §"Which resolutions
+        are absorbing refiles?".
 
         Locking: the whole read-modify-write runs under ``escalation_id_lock``
         — a concurrent same-id bump from another harness/worker process must not

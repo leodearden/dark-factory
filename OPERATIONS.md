@@ -1264,6 +1264,41 @@ That latency is faster than any real model call.
 Incident, back-test and residual risks:
 [`plans/curator-dedup-outage-2026-08-15-rca.md`](plans/curator-dedup-outage-2026-08-15-rca.md).
 
+### Which resolutions are absorbing refiles?
+
+A resolved or dismissed escalation gains one `refiles_suppressed` each time its
+resolution suppresses an identical refile. What the counter means, and why it
+never escalates, is in
+`escalation/src/escalation/queue.py::EscalationQueue.note_suppressed_refile`.
+Two producers bump it, both on the per-project orchestrator queue
+`<project_root>/data/escalations`, not the reconciliation queue:
+
+- `orchestrator/src/orchestrator/merge_lane/landing_evidence.py::file_unattributed_landing_escalation`:
+  `provenance_unattributed`, keyed on `citation_sha`.
+- `fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._file_finding_task_escalation`:
+  `recon_task_finding`, with no `citation_sha`.
+
+List them from the repo root. The command is read-only; add `--json` for
+machine output:
+
+    uv run --directory escalation python -m escalation.refile_absorption --queue-dir <project_root>/data/escalations
+
+Each project has its own queue, so for the fleet:
+
+    for q in /home/leo/src/*/data/escalations; do echo "== $q"; uv run --directory escalation python -m escalation.refile_absorption --queue-dir "$q"; done
+
+- **Reading it.** Rows come largest count first. The last line,
+  `total_absorbed=… records=… scanned=… skipped_vanished=… skipped_unreadable=… skipped_unparsable=…`,
+  always prints. A non-zero `skipped_*` is records the scan lost, not noise;
+  stderr names each unreadable or unparsable file. Open a row with
+  `mcp__escalation__get_escalation(<id>)` for the full record. Exit 2 means
+  `--queue-dir` is not a directory.
+- **Limits.** The counter is a lifetime total per record, not windowed. It is
+  deliberately unthresholded, so nothing pages on it and this query is how you
+  hear about it. A record whose dated archive subdir has been pruned
+  (`escalation/src/escalation/archive.py::prune_archive`) is gone, so the
+  listing covers only what the archive still holds.
+
 ---
 
 ## 5. Unblocking work
