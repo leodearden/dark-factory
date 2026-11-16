@@ -2170,7 +2170,7 @@ async def write_suppression_record(
 
 #: Per-cycle task-count drift bound used by filter_stale_count_snapshot_corrections.
 #:
-#: Rationale: in normal operation the authoritative ## Active Task Tree header advances
+#: Rationale: in normal operation the authoritative `### Active Task Tree` header (task_filter.ACTIVE_TASK_TREE_HEADER) advances
 #: by at most one task between consecutive snapshot writes (one task created or
 #: completed per recon cycle).  The incident (run 929b4135 finding 2ebc814c) showed
 #: a drift of exactly +1/+1, consistent with one task-creation event between the edge

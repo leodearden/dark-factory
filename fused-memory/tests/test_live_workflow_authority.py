@@ -129,3 +129,12 @@ class TestStageAbsenceRulesAreScopedToTheTree:
             f'`{ACTIVE_TASK_TREE_HEADER}` lists; either one left unqualified lets the '
             "model read 'never probed' as 'not live'"
         )
+
+
+@pytest.mark.parametrize(
+    'prompt', [STAGE1_SYSTEM_PROMPT, STAGE2_SYSTEM_PROMPT], ids=['stage1', 'stage2'],
+)
+class TestPromptNamesTheTreeHeaderThePayloadRenders:
+    def test_cites_the_rendered_header_and_no_other_heading_level(self, prompt: str) -> None:
+        assert ACTIVE_TASK_TREE_HEADER in prompt
+        assert f'## {ACTIVE_TASK_TREE_TITLE}' not in prompt.replace(ACTIVE_TASK_TREE_HEADER, '')
