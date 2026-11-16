@@ -46,18 +46,17 @@ deliberately outside the marker and unpinned, and this guard must not be extende
 to them. Parser BEHAVIOUR is pinned by ``shared/tests/test_task_metadata.py``;
 neither implies the other.
 
-Marker plumbing lives in ``task_authoring_marker_span.marked_span`` (task 4999),
-shared with the task-4303 guard next door; read that module for why the markers
-are explicit and why every failure is loud.
+The marked span comes from ``tests/scripts/verify_command_invariants.py::marked_body``,
+whose ``marked_span`` docstring says why every marker failure is loud.
 """
 from __future__ import annotations
 
 import pathlib
 
 import pytest
+import verify_command_invariants as vci
 from shared.task_metadata import _BLESSED_METADATA_KEYS
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
-from task_authoring_marker_span import marked_span
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -65,10 +64,7 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 TASK_AUTHORING_PATH = REPO_ROOT / "docs" / "task-authoring.md"
 
-# The full HTML-comment forms, not the bare slug: `marked_span` requires the two
-# literals not to overlap as substrings, and the bare slug sits inside both.
-MIRROR_BEGIN = "<!-- tier-a-blessed-keys-mirror -->"
-MIRROR_END = "<!-- /tier-a-blessed-keys-mirror -->"
+MIRROR_SLUG = "tier-a-blessed-keys-mirror"
 
 _FENCE = "```"
 
@@ -76,23 +72,22 @@ _FENCE = "```"
 def _documented_blessed_keys(markdown_text):
     """The comma-separated key names in the fence delimited by the mirror markers.
 
-    Everything below the ``marked_span`` call is this guard's OWN fence-content
-    extraction; it raises loudly rather than returning ``[]`` for the same
-    reason ``marked_span`` does.
+    Everything below the ``vci.marked_body`` call is this guard's OWN
+    fence-content extraction; it raises loudly rather than returning ``[]`` for
+    the same reason ``vci.marked_body`` does.
 
     Returns the names in DOCUMENT ORDER (a list, not a set) so the caller can
     also detect an accidental double-entry, which set equality alone cannot see.
     """
-    marked = marked_span(
+    marked = vci.marked_body(
         markdown_text,
-        MIRROR_BEGIN,
-        MIRROR_END,
-        doc_path="docs/task-authoring.md",
-        task="task 3780",
-        delimits=(
+        slug=MIRROR_SLUG,
+        source="docs/task-authoring.md",
+        label=(
             "the fenced Tier-A listing that mirrors _BLESSED_METADATA_KEYS in "
             "shared/src/shared/task_metadata.py"
         ),
+        task="3780",
     )
 
     # Strip the fence delimiter lines; everything between them is the listing.
@@ -108,7 +103,7 @@ def _documented_blessed_keys(markdown_text):
     names = [name for name in names if name]
 
     assert names, (
-        f"the fenced listing between {MIRROR_BEGIN!r} and {MIRROR_END!r} in "
+        f"the fenced listing inside the {MIRROR_SLUG!r} marker in "
         f"docs/task-authoring.md is empty (task 3780) — this mirror invariant "
         f"would pass vacuously against an empty allowlist"
     )
