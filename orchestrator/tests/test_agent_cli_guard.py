@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -18,6 +20,8 @@ from shared.cli_invoke import build_claude_argv
 import orchestrator.workflow
 from orchestrator.agents import invoke, sandbox_dispatch
 from orchestrator.agents.landlock import build_landlock_command
+
+_WORKSPACE_PACKAGES = ('shared', 'orchestrator')
 
 
 def _real_claude_argv() -> list[str]:
@@ -261,3 +265,24 @@ class TestForbidAgentCliSpawnFixture:
 
         assert result.returncode == 0
         assert result.stdout.strip() == 'fake-claude'
+
+
+def test_importing_the_guard_loads_no_workspace_package() -> None:
+    probe = (
+        'import json, sys, _agent_cli_guard; '
+        f'print(json.dumps(sorted(set({_WORKSPACE_PACKAGES!r}) & set(sys.modules))))'
+    )
+    child = subprocess.run(
+        [sys.executable, '-c', probe],
+        cwd=Path(__file__).parent,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert child.returncode == 0, child.stderr
+
+    leaked = json.loads(child.stdout)
+    assert leaked == [], (
+        f'importing _agent_cli_guard loaded {leaked}; conftest.py imports it '
+        'before putting this worktree\'s src dirs on sys.path'
+    )
