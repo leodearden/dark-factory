@@ -4077,12 +4077,25 @@ everything already on disk.
   `~/.config/systemd/user/orchestrator-*.service`) and under
   `~/.claude/projects`, subagent transcripts included. It also scans the
   `*.jsonl.archive-tmp` staging copies a hard kill can strand mid-archive,
-  which are redacted only after they are staged.
+  which are redacted only after they are staged. Under each of those project
+  roots it also scans `data/verify-logs` and `data/orchestrator/offline-lane`.
+  In both it scans `*.log`, `*.json` and `*.xml`, and the gzipped junit
+  `*.xml.gz`. A `*.xml.gz` is redacted by decompressing it, replacing the
+  value and recompressing it, with mode and mtime kept. These logs were added
+  after failing pytest env assertions printed live tokens into them (task
+  10144). `~/.claude/projects` is still scanned for transcripts only. The
+  full tree list is `scripts/transcript_secret_sweep.py::swept_trees`.
 - **What it matches.** Only the live values the sweep's own environment holds.
   The wrapper sources the repo `.env` for them. It never matches a token-shaped
-  pattern. Each hit is replaced in place, by the 2026-10-11 method: a
+  pattern. A value is matched in the form the file holds it: JSON-escaped in
+  `*.jsonl` and `*.json`, raw or JSON-escaped in a `*.log`, and entity-escaped
+  in junit text and attribute values. Each hit is replaced in place, by the
+  2026-10-11 method: a
   `<redacted:VAR>` placeholder padded with `x` to the same length, mode and
-  mtime kept, no backup. A rewrite that would break a JSON line is refused
+  mtime kept, no backup. In XML the placeholder is entity-escaped
+  (`&lt;redacted:VAR&gt;`), so a junit report still parses and reads as
+  `<redacted:VAR>`. `scripts/suite_census_evidence.py` reads these reports as
+  census evidence. A rewrite that would break a JSON line is refused
   for that line only: the line keeps its value, the rest of the file is still
   redacted, and the escalation names the path, the line and the variable.
 - **What it cannot see.** A secret defined only in another factory project's
@@ -4092,8 +4105,10 @@ everything already on disk.
 - **What it files.** One `risk_identified` info escalation per sweep that
   redacted or refused anything, naming each path with its per-variable counts.
   It prints one JSON record line to the journal, and never prints a value.
+  A `*.xml.gz` that does not decompress is listed under `unreadable` in that
+  record line and left as found.
 - **What it skips.** Files modified in the last 15 minutes, which a live
-  session may still be appending to. The next night picks them up.
+  session or test run may still be appending to. The next night picks them up.
 
 Installing it is a post-merge deterministic deploy
 (`scripts/install-transcript-secret-sweep-timer.sh`, which kicks no immediate
