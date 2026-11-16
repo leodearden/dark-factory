@@ -74,6 +74,7 @@ PURE_STDLIB_LEAVES = (
     'mcp_idempotency',
     'merge_subject',
     'neutral_cwd',
+    'pidfd',
     'plan_deviation',
     'proc_group',
     'proc_liveness',
