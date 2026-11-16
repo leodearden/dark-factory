@@ -15,7 +15,12 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _agent_cli_guard import AGENT_CLI_BINARIES, AgentCliSpawnGuard, agent_cli_in
+from _agent_cli_guard import (
+    AGENT_CLI_BINARIES,
+    SPAWNS_AGENT_CLI_MARKER,
+    AgentCliSpawnGuard,
+    agent_cli_in,
+)
 from _operator_home_fixture import OPERATOR_ENV_VARS, write_operator_home
 from _zcode_fixture import BASE_URL as ZCODE_BASE_URL
 from shared.backends import AGENT_CLI_BACKENDS
@@ -174,7 +179,7 @@ class TestAgentCliSpawnGuard:
         assert _NODEID in message
         assert "'claude'" in message
         assert repr(_NICE_CLAUDE) in message
-        assert 'spawns_agent_cli' in message
+        assert f'@pytest.mark.{SPAWNS_AGENT_CLI_MARKER}' in message
         assert 'orchestrator.workflow.invoke_agent' in message
         assert not isinstance(exc.value, Exception)
 
@@ -287,6 +292,7 @@ class TestForbidAgentCliSpawnFixture:
             )
 
         [attempt] = _forbid_agent_cli_spawn.take_attempts()
+        assert Path(attempt[1]).name == 'landlock_exec.py', attempt
         assert agent_cli_in(attempt) == 'claude'
 
     @pytest.mark.asyncio

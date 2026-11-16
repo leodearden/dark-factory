@@ -9,19 +9,21 @@ bypass.
 from __future__ import annotations
 
 import os
+import subprocess
 from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
 
 AGENT_CLI_BINARIES: frozenset[str] = frozenset({'claude', 'codex', 'gemini', 'pi', 'zcode', 'mimo'})
+SPAWNS_AGENT_CLI_MARKER = 'spawns_agent_cli'
 
 
 _REMEDY = (
     "Patch invoke_agent at the CONSUMING module's import site, e.g. "
     'orchestrator.workflow.invoke_agent, not orchestrator.agents.invoke.invoke_agent: '
     'a stale target silently calls the real CLI. Mark the test '
-    '@pytest.mark.spawns_agent_cli only if it deliberately spawns an agent-CLI '
+    f'@pytest.mark.{SPAWNS_AGENT_CLI_MARKER} only if it deliberately spawns an agent-CLI '
     'process, e.g. a fake `claude` script on PATH.'
 )
 _ABSORBED = (
@@ -79,3 +81,22 @@ class AgentCliSpawnGuard:
         if not self._attempts:
             return None
         return _spawn_message(self._nodeid, self._attempts, _ABSORBED)
+
+
+def install_agent_cli_guard(
+    monkeypatch: pytest.MonkeyPatch, node: pytest.Item,
+) -> AgentCliSpawnGuard:
+    """Guard ``Popen.__init__`` for *node* unless it carries the opt-out marker; return the guard."""
+    guard = AgentCliSpawnGuard(node.nodeid)
+    if not node.get_closest_marker(SPAWNS_AGENT_CLI_MARKER):
+        monkeypatch.setattr(
+            subprocess.Popen, '__init__', guard.guarded(subprocess.Popen.__init__),
+        )
+    return guard
+
+
+def assert_no_agent_cli_spawns(guard: AgentCliSpawnGuard) -> None:
+    """Fail at teardown if *guard* still holds a spawn attempt a caller absorbed."""
+    message = guard.violation_message()
+    if message is not None:
+        pytest.fail(message)

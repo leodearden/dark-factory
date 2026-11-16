@@ -10,7 +10,6 @@ import itertools
 import json
 import os
 import shutil
-import subprocess
 import sys
 import uuid
 from collections.abc import Iterator
@@ -20,7 +19,7 @@ from unittest.mock import AsyncMock, MagicMock
 import _async_mock_orphans
 import pytest
 import pytest_asyncio
-from _agent_cli_guard import AgentCliSpawnGuard
+from _agent_cli_guard import assert_no_agent_cli_spawns, install_agent_cli_guard
 from _harness_store_paths import point_harness_stores_at
 from _live_mcp_guard import (
     REAL_MCP_SESSION_MARKER,
@@ -772,18 +771,14 @@ def _forbid_agent_cli_spawn(monkeypatch, request):
     """Fail any test that starts an agent CLI (``_agent_cli_guard.AGENT_CLI_BINARIES``).
 
     Fails at the spawn seam, and again at teardown for a spawn whose raise a
-    caller absorbed. The guard is ``_agent_cli_guard.py``; its tests are
-    ``test_agent_cli_guard.py``. Opt out with the ``spawns_agent_cli`` marker.
+    caller absorbed. Mechanism and the opt-out marker: ``_agent_cli_guard.py``;
+    tests: ``test_agent_cli_guard.py``.
     """
-    if request.node.get_closest_marker('spawns_agent_cli'):
-        yield None
-        return
-    guard = AgentCliSpawnGuard(request.node.nodeid)
-    monkeypatch.setattr(subprocess.Popen, '__init__', guard.guarded(subprocess.Popen.__init__))
+    guard = install_agent_cli_guard(monkeypatch, request.node)
+
     yield guard
-    message = guard.violation_message()
-    if message is not None:
-        pytest.fail(message)
+
+    assert_no_agent_cli_spawns(guard)
 
 
 @pytest.fixture(autouse=True)
