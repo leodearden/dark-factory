@@ -39,7 +39,8 @@ say the opposite and fails on a legitimate tightening — so it only taxes
 future prompt edits. Every assertion in this file is an existence /
 containment / count / index check against a NAMED CONSTANT: never a
 string literal asserted against the constant's prose, never a regex over
-wording, never a byte-size figure.
+wording, never a byte-size figure. `_role_splice_contract.py` holds the
+mechanical half of each check.
 """
 
 from __future__ import annotations
@@ -212,14 +213,13 @@ def test_placement_immediately_follows_tool_call_rejection_guidance() -> None:
     """The new block lands immediately after `TOOL_CALL_REJECTION_GUIDANCE`, always.
 
     Iterates `TOOL_CALL_REJECTION_GUIDANCE`'s own carrier set, not the new
-    block's, so a role that gained an out-of-place copy is still checked.
-    Presence is deliberately NOT this test's job: a role that has dropped
-    the splice entirely already fails
+    block's, so a carrier that gained an out-of-place copy is still checked.
+    A carrier where the new block is absent is recorded as an `'ABSENT'`
+    offender rather than skipped, as `SpliceContract.assert_placement`
+    records it for every consumer, so this test cannot pass vacuously on its
+    own. Such a role also fails
     `test_carried_by_exactly_the_tool_call_rejection_role_set`'s
-    `missing_new` check (that test's `shared` guard is what keeps such a
-    failure from ever passing vacuously), so it is skipped here rather than
-    re-flagged — the same "one root cause fails one test" discipline
-    `test_guidance_appears_exactly_once_per_role` documents.
+    `missing_new` check.
 
     Why the new block cannot be placed EARLIER: two pre-existing invariants
     constrain the front of every role prompt. For the 7 roles carrying
@@ -235,28 +235,15 @@ def test_placement_immediately_follows_tool_call_rejection_guidance() -> None:
     is the one position that satisfies both, uniformly, with no per-role
     branching.
     """
-    tcrg_carriers = {
-        name for name, role in ROLES.items() if TOOL_CALL_REJECTION_GUIDANCE in role.system_prompt
-    }
-
-    offenders = {}
-    for name in sorted(tcrg_carriers):
-        prompt = ROLES[name].system_prompt
-        idx = prompt.find(ERROR_REMEDY_HINT_GUIDANCE)
-        if idx == -1:
-            # Presence is test_carried_by_exactly_the_tool_call_rejection_role_set's
-            # job (its missing_new check), not this one's — see the
-            # docstring above.
-            continue
-
-        expected = prompt.find(TOOL_CALL_REJECTION_GUIDANCE) + len(TOOL_CALL_REJECTION_GUIDANCE)
-        if idx != expected:
-            offenders[name] = {'offset': idx, 'expected': expected}
-
-    assert offenders == {}, (
-        f'Roles placing ERROR_REMEDY_HINT_GUIDANCE incorrectly: {offenders}. '
-        'It must immediately follow TOOL_CALL_REJECTION_GUIDANCE in every '
-        'role that carries both blocks (a role missing the new block '
-        'entirely is a different, already-covered failure — see '
-        'test_carried_by_exactly_the_tool_call_rejection_role_set).'
+    _CONTRACT.assert_placement(
+        follows=TOOL_CALL_REJECTION_GUIDANCE,
+        follows_name='TOOL_CALL_REJECTION_GUIDANCE',
+        remedy=(
+            'It must immediately follow TOOL_CALL_REJECTION_GUIDANCE in every '
+            'role that carries that block. A role reported ABSENT has dropped '
+            'the new block entirely, which '
+            'test_carried_by_exactly_the_tool_call_rejection_role_set also '
+            'reports as missing_new: restore the splice rather than moving '
+            'anything.'
+        ),
     )
