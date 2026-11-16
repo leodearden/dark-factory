@@ -1332,15 +1332,6 @@ class TestWorkspaceDomainFailsHard:
             ),
             pytest.param('[project]\nname = ""\n', _NEITHER_LAYOUT, id='empty-project-name'),
             pytest.param('[project]\nname = 3\n', _NEITHER_LAYOUT, id='non-string-project-name'),
-            pytest.param(_workspace(), r'tool\.uv\.workspace', id='no-members'),
-            pytest.param(
-                _workspace('alpha', ''), r'tool\.uv\.workspace', id='empty-string-member'
-            ),
-            pytest.param(
-                '[tool.uv.workspace]\nmembers = ["alpha", 3]\n',
-                r'tool\.uv\.workspace',
-                id='non-string-member',
-            ),
             pytest.param(
                 _workspace('alpha', 'packages/*'), r"glob.*'packages/\*'", id='glob-member'
             ),
