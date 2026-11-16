@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import datetime
 import functools
 import json
 import types
@@ -40,6 +41,11 @@ def _arms() -> types.ModuleType:
     return load_script_module(
         SCRIPTS / 'eval_write_triage_reranker_arms.py', 'eval_write_triage_reranker_arms',
     )
+
+
+@functools.cache
+def _audit_mod() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'audit_duplicate_memories.py', 'audit_duplicate_memories')
 
 
 @functools.cache
@@ -743,3 +749,102 @@ class TestReportAndProposal:
         path = tmp_path / 'smoke.json'
 
         assert _mod().guard_report_path(path, arm_filter=['bge-reranker-v2-m3']) == path
+
+
+class _ConstantScorer:
+    def score(self, entry, candidate_texts):
+        return _arms().SlateScores(
+            scores=(0.5,) * len(candidate_texts), cost_usd=0.0, pairs_over_max_length=0,
+        )
+
+    def facts(self):
+        return _arms().ScorerFacts(device='cpu', vram_peak_mib=None, max_length=512)
+
+
+class TestCli:
+    _VECTORS = {'a': [1.0, 0.0], 'b': [0.8, 0.6], 'c': [0.6, 0.8], 'd': [0.0, 1.0]}
+
+    def _fixture(self, tmp_path):
+        records = [
+            _record('a', 'C1', 'canonical', _PK), _record('b', 'C1', 'duplicate', _PK),
+            _record('c', 'C2', 'canonical', _PK), _record('d', 'C2', 'distinct', _PK),
+        ]
+        path = tmp_path / 'fixture.jsonl'
+        path.write_text(''.join(json.dumps(record) + '\n' for record in records))
+        return path
+
+    def _config(self):
+        return types.SimpleNamespace(
+            write_triage=types.SimpleNamespace(t_high=0.5, t_high_by_category={_PK: 0.79}),
+            embedder=types.SimpleNamespace(model='fake-embedder'),
+        )
+
+    def _arms_under_test(self):
+        def unavailable(context):
+            raise _arms().ArmUnavailable(_arms().SkipReason.no_credential, 'KEY unset')
+
+        return [_fake_arm(_yielding(_ConstantScorer()), name='arm-ok'),
+                _fake_arm(unavailable, name='arm-unavailable')]
+
+    def _run(self, tmp_path, argv, embed_calls):
+        args = _mod().build_parser().parse_args(argv)
+
+        def embed_factory(config):
+            embed_calls.append(config)
+            return lambda memory_id, content: self._VECTORS[memory_id]
+
+        return _mod().run_measurement(
+            args, embed_factory=embed_factory, arms=self._arms_under_test(),
+            config_factory=self._config, today=datetime.date(2099, 1, 2),
+        )
+
+    def test_a_run_writes_the_report_with_its_provenance(self, tmp_path):
+        fixture = self._fixture(tmp_path)
+        report_path = tmp_path / 'out' / 'report.json'
+        calls: list = []
+
+        rc = self._run(
+            tmp_path, ['--fixture', str(fixture), '--report-path', str(report_path)], calls,
+        )
+
+        assert rc == 0
+        assert len(calls) == 1
+        report = json.loads(report_path.read_text())
+        assert report_path.with_suffix('.md').exists()
+        provenance = report['provenance']
+        assert provenance['fixture_path'] == _calibrate().package_relative(fixture)
+        assert provenance['record_count'] == 4
+        assert provenance['top_k'] == _audit_mod()._DEFAULT_ANN_TOP_K
+        assert provenance['ann_cutoffs'] == {_PK: 0.79}
+        assert provenance['project_id'] is None
+        assert provenance['measured_at'] == '2099-01-02'
+        assert provenance['arm_filter'] is None
+        assert provenance['device'] == 'auto'
+        assert provenance['local_batch_size'] == 4
+        assert provenance['vram_cap_gib'] == 8.0
+        assert provenance['pairwise_concurrency'] == 20
+        assert provenance['max_arm_spend_usd'] == 2.0
+        assert isinstance(provenance['libraries'], dict)
+        assert report['setting']['embedder'] == {'model': 'fake-embedder', 'dimensions': 2}
+        rows = {row['arm']: row for row in report['arms']}
+        assert rows['arm-unavailable']['status'] == 'skipped'
+        assert rows['arm-unavailable']['skip_reason'] == 'no_credential'
+        assert rows['arm-ok']['status'] == 'measured'
+
+    def test_an_unknown_arm_is_rejected_by_the_parser(self):
+        with pytest.raises(SystemExit):
+            _mod().build_parser().parse_args(['--arm', 'no-such-arm'])
+
+    def test_a_filtered_run_at_the_committed_path_is_refused_before_embedding(self, tmp_path):
+        fixture = self._fixture(tmp_path)
+        calls: list = []
+        arm = _mod().DETECTOR_ARMS[0].name
+
+        with pytest.raises(ValueError, match='committed'):
+            self._run(tmp_path, ['--fixture', str(fixture), '--arm', arm], calls)
+        assert calls == []
+
+    def test_the_parser_is_loud(self):
+        from shared.cli_boundary import LoudArgumentParser
+
+        assert isinstance(_mod().build_parser(), LoudArgumentParser)
