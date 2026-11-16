@@ -12,34 +12,28 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager
+from collections.abc import Iterator
 
-import httpx
 import pytest
 from _fm_polling import poll_until
-from _mock_openai_server import mock_openai_server
+from _mem0_stub_backend import (
+    MEMORY_ID,
+    backend_against,
+    httpx_default_read_timeout,
+    stub_ready_config,
+)
 from _stub_qdrant_server import POOLING_LOOPBACK_HOST, stub_qdrant_server
 
-from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.scope import Scope
 
 SCOPE = Scope(project_id='vector_store_client_probe')
-MEMORY_ID = '00000000-0000-4000-8000-000000000001'
 CONTENT = 'A slow Qdrant leg fails on its configured budget, never on a hidden one.'
 
 
 @pytest.fixture
 def config(mock_config, monkeypatch) -> Iterator[FusedMemoryConfig]:
-    """mem0 telemetry off, and mem0's embedder served by a local mock."""
-    monkeypatch.setattr('mem0.memory.main.capture_event', lambda *a, **kw: None)
-    monkeypatch.setattr('mem0.memory.main.MEM0_TELEMETRY', False)
-    config = mock_config.model_copy(deep=True)
-    embedder = config.embedder.providers.openai
-    assert embedder is not None
-    with mock_openai_server() as server:
-        embedder.api_url = server.base_url
+    with stub_ready_config(mock_config, monkeypatch) as config:
         yield config
 
 
@@ -50,21 +44,7 @@ def target(config) -> str:
 
 @pytest.fixture
 def default_read() -> float:
-    """httpx's library-default read timeout: the hidden deadline mem0's own client carried."""
-    with httpx.Client() as client:
-        read = client.timeout.read
-    assert read is not None
-    return read
-
-
-@asynccontextmanager
-async def backend_against(qdrant_url: str, config: FusedMemoryConfig) -> AsyncIterator[Mem0Backend]:
-    config.mem0.qdrant_url = qdrant_url
-    backend = Mem0Backend(config)
-    try:
-        yield backend
-    finally:
-        await backend.close()
+    return httpx_default_read_timeout()
 
 
 @pytest.mark.asyncio
