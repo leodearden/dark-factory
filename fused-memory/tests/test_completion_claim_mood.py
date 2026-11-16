@@ -58,6 +58,23 @@ _ESC_1053_1_MEMORY = (
 )
 
 
+# Verbatim from solar_challenge memory a51fb7b9 (esc-unverified-claim-1125-1). 'need task
+# 1125 landed first' states a precondition; nothing in the record says 1125 landed.
+_ESC_1125_1_MEMORY = (
+    "Ordering facts for task 1125 (validate config reads a fleet file's finance: block), "
+    'checked 2026-10-29 at main 716a8eb. Its required row, bristol-phase1-flex.yaml with '
+    "event_hours: .inf exiting 1, needs task 862's EventWindow refusal, so 1125 was "
+    "reported blocked on task 862. Task 862's plan adds a tests/unit/test_cli_validate.py "
+    "test on a scenario: document whose docstring says a fleet file's finance: block is not "
+    'read (esc-862-1), and 1125 must restate it. Task 957 (S6 γ) later rewrites '
+    "cli/validate.py's _homes_defined_by onto load_scenarios/parse_scenario, which reads "
+    "finance, seg and flex_band for every document form, so 1125's validate.py code is "
+    'interim and its rows pin behaviour 957 must keep. Task 866 (S4 ε)\'s C3 rows through '
+    'validate config on that fleet file need task 1125 landed first, but 866 does not '
+    'depend on 1125.'
+)
+
+
 def _extract(text: str, default_project_id: str = 'reify') -> list[CompletionClaim]:
     return extract_completion_claims(
         text,
@@ -464,6 +481,56 @@ class TestNonAssertiveScopes:
     )
     def test_a_contingency_head_governs_only_its_own_object(self, text, project, claim):
         assert _triples(text, project) == [claim]
+
+    @pytest.mark.parametrize(
+        ('text', 'project'),
+        [
+            pytest.param(
+                _ESC_1125_1_MEMORY, 'solar_challenge', id='esc-unverified-claim-1125-1',
+            ),
+            pytest.param(
+                'It needs task 465 merged, since make_fleet_results_of must exist on main',
+                'solar_challenge',
+                id='needs',
+            ),
+            pytest.param(
+                'This needs task 506 merged first, because the public harness names exist '
+                'only on task/506 until then',
+                'solar_challenge',
+                id='needs-first',
+            ),
+            pytest.param(
+                'Deferred actions (require task 3543 branch merged to main first):', 'reify',
+                id='require',
+            ),
+            pytest.param(
+                'Both modules need task 736 merged first, because as_read must exist',
+                'scoping_intake',
+                id='need',
+            ),
+            pytest.param('wants task 5422 landed before the cut', 'reify', id='wants'),
+        ],
+    )
+    def test_a_ref_governed_by_a_necessity_verb_is_not_claimed(self, text, project):
+        assert _triples(text, project) == []
+
+    @pytest.mark.parametrize(
+        ('text', 'claim'),
+        [
+            pytest.param(
+                'Task 2320 branch needs rebase onto main after task 2330 merged',
+                ('applied_work', 'task', '2330'),
+                id='necessity-object-is-not-the-ref',
+            ),
+            pytest.param(
+                "task 2682 required a fused-memory restart to load task 2697's merged fix",
+                ('applied_work', 'task', '2697'),
+                id='necessity-verb-earlier-in-the-clause',
+            ),
+        ],
+    )
+    def test_a_necessity_verb_governs_only_its_own_object(self, text, claim):
+        assert _triples(text) == [claim]
 
 
 _ESC_5471_1 = (
