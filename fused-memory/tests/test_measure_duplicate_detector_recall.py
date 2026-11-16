@@ -168,3 +168,67 @@ class TestFixtureReplay:
         assert generation.disclosure['top_k_saturated'] == 6
         assert generation.disclosure['missing_vector'] == 0
         assert generation.disclosure['below_threshold_dropped'] == 0
+
+
+class TestOperatingPointAndIntervals:
+    def test_hanley_mcneil_matches_the_hand_computed_interval(self):
+        lo, hi = _mod().auc_interval_95(0.8, 301, 18)
+
+        assert lo == pytest.approx(0.8 - 1.96 * 0.04158, abs=1e-3)
+        assert hi == pytest.approx(0.8 + 1.96 * 0.04158, abs=1e-3)
+        assert (lo, hi) == pytest.approx((0.7185, 0.8815), abs=1e-3)
+
+    def test_the_interval_is_clamped_to_the_unit_range(self):
+        assert _mod().auc_interval_95(1.0, 301, 18) == (1.0, 1.0)
+        assert _mod().auc_interval_95(0.99, 5, 3)[1] == 1.0
+
+    def test_an_empty_class_has_no_interval(self):
+        assert _mod().auc_interval_95(0.8, 0, 18) is None
+        assert _mod().auc_interval_95(0.8, 301, 0) is None
+
+    # p1 0.9 T, p2 0.8 F, p3 0.7 T, p4 0.6 T, p5 0.5 F
+    _SCORES = {(0, 1): 0.9, (0, 2): 0.8, (0, 3): 0.7, (0, 4): 0.6, (0, 5): 0.5}
+    _POSITIVES = frozenset({(0, 1), (0, 3), (0, 4)})
+
+    def _point(self, scores, positives, floor, n_positive=10):
+        return _mod().operating_point(scores, positives, n_positive, floor)
+
+    def test_the_most_caught_threshold_meeting_the_floor_wins(self):
+        point = self._point(self._SCORES, self._POSITIVES, 0.75)
+
+        assert (point.threshold, point.caught, point.flagged) == (0.6, 3, 4)
+
+    def test_a_stricter_floor_keeps_only_the_qualifying_prefix(self):
+        point = self._point(self._SCORES, self._POSITIVES, 0.8)
+
+        assert (point.threshold, point.caught, point.flagged) == (0.9, 1, 1)
+
+    def test_recall_divides_by_every_true_pair_not_the_generated_ones(self):
+        point = self._point(self._SCORES, self._POSITIVES, 0.75, n_positive=10)
+
+        assert point.recall.hits == 3
+        assert point.recall.total == 10
+
+    def test_no_qualifying_threshold_is_no_operating_point(self):
+        point = self._point({(0, 2): 0.8, (0, 5): 0.5}, self._POSITIVES, 0.5)
+
+        assert (point.threshold, point.caught, point.flagged) == (None, 0, 0)
+
+    def test_tied_scores_are_flagged_together(self):
+        point = self._point({(0, 1): 0.9, (0, 2): 0.9}, self._POSITIVES, 0.5)
+
+        assert (point.threshold, point.caught, point.flagged) == (0.9, 1, 2)
+
+    def test_a_tie_on_caught_goes_to_the_higher_threshold(self):
+        point = self._point({(0, 1): 0.9, (0, 2): 0.5}, self._POSITIVES, 0.5)
+
+        assert (point.threshold, point.caught, point.flagged) == (0.9, 1, 1)
+
+    def test_recall_at_precision_reports_one_point_per_floor(self):
+        points = _mod().recall_at_precision(self._SCORES, self._POSITIVES, 10)
+
+        assert _mod().RECALL_AT_PRECISION_FLOORS == (0.80, 0.90, 0.95)
+        assert points == {
+            floor: _mod().operating_point(self._SCORES, self._POSITIVES, 10, floor)
+            for floor in (0.80, 0.90, 0.95)
+        }
