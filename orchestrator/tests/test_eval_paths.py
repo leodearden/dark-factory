@@ -13,11 +13,20 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import shared.project_layout
 from _eval_refusal import answered
-from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, CheckoutRootError
+from click.testing import CliRunner
+from shared.project_layout import (
+    KNOWN_PROJECT_ROOTS_ENV,
+    CheckoutRootError,
+    escalation_queue_dir,
+    reconciliation_tickets_db,
+    runs_db,
+)
 
 from orchestrator.evals import paths
 from orchestrator.evals.prompt_opt import curator_corpus, optimizer
+from orchestrator.evals.prompt_opt.__main__ import cli as prompt_opt_cli
 from orchestrator.evals.reviewer_trial import mining, scorer
+from orchestrator.evals.reviewer_trial.__main__ import cli as reviewer_trial_cli
 from orchestrator.evals.reviewer_trial.checkout import FixtureNotMaterialisable, fixture_checkout
 from orchestrator.evals.reviewer_trial.corpus import (
     CorpusDiff,
@@ -197,3 +206,49 @@ class TestCorpusFixtureSources:
         assert KNOWN_PROJECT_ROOTS_ENV in caught.value.reason
         assert 'reify' in caught.value.reason
         assert list(scratch.iterdir()) == []
+
+
+class TestCliDefaultsResolveUnderTheMainCheckout:
+    def test_the_miner_reads_and_echoes_main_checkout_sources(
+        self, main_checkout_at: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv('REVIEWER_TRIAL_RUNS_DB', str(tmp_path / 'decoy' / 'runs.db'))
+        monkeypatch.setenv('REVIEWER_TRIAL_ESCALATIONS_DIR', str(tmp_path / 'decoy' / 'escalations'))
+        monkeypatch.setenv('REVIEWER_TRIAL_REPO_ROOT', str(tmp_path / 'decoy'))
+
+        result = CliRunner().invoke(reviewer_trial_cli, ['mine'])
+
+        assert result.exit_code == 1, result.output
+        root = main_checkout_at
+        for fragment in (
+            f'runs_db={runs_db(root)}',
+            f'escalations_dir={escalation_queue_dir(root)}',
+            f'repo_path={root}',
+            f'runs.db not found at {runs_db(root)}',
+        ):
+            assert fragment in result.output
+        assert 'decoy' not in result.output
+
+    def test_the_canary_reads_the_main_checkout_runs_db(
+        self, main_checkout_at: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv('PROMPT_OPT_RUNS_DB', str(tmp_path / 'decoy' / 'runs.db'))
+
+        result = CliRunner().invoke(prompt_opt_cli, [
+            'canary', '--deploy-at', '2026-06-15T00:00:00+00:00', '--project-id', 'dark_factory',
+        ])
+
+        assert result.exit_code == 2, result.output
+        assert f'runs.db not found at {runs_db(main_checkout_at)}' in result.output
+        assert 'decoy' not in result.output
+
+    def test_the_curator_corpus_builder_reads_the_main_checkout_tickets_db(
+        self, main_checkout_at: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv('CURATOR_TICKETS_DB', str(tmp_path / 'decoy' / 'tickets.db'))
+
+        result = CliRunner().invoke(prompt_opt_cli, ['build-curator-corpus'])
+
+        assert result.exit_code != 0, result.output
+        assert f'tickets.db not found at {reconciliation_tickets_db(main_checkout_at)}' in result.output
+        assert 'decoy' not in result.output

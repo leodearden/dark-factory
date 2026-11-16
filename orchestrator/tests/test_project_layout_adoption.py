@@ -319,9 +319,7 @@ class TestHomePathDefaultsDeriveFromTheMainCheckout:
         monkeypatch.delenv(rab.RUNS_DB_ENV_VAR, raising=False)
         assert rab.default_runs_db_path() == runs_db(default_project_root())
 
-    def test_the_prompt_opt_canary_reads_the_layout_runs_db(self, monkeypatch):
-        monkeypatch.delenv('PROMPT_OPT_RUNS_DB', raising=False)
-
+    def test_the_prompt_opt_canary_reads_the_layout_runs_db(self):
         result = CliRunner().invoke(prompt_opt_cli, [
             'canary', '--deploy-at', '2026-06-15T00:00:00+00:00', '--project-id', 'dark_factory',
         ])
@@ -329,9 +327,7 @@ class TestHomePathDefaultsDeriveFromTheMainCheckout:
         assert result.exit_code == 2, result.output
         assert f'runs.db not found at {runs_db(default_project_root())}' in result.output
 
-    def test_the_reviewer_trial_miner_reads_the_layout_runs_db(self, monkeypatch):
-        monkeypatch.delenv('REVIEWER_TRIAL_RUNS_DB', raising=False)
-
+    def test_the_reviewer_trial_miner_reads_the_layout_runs_db(self):
         result = CliRunner().invoke(reviewer_trial_cli, ['mine'])
 
         assert result.exit_code == 1, result.output
@@ -353,15 +349,14 @@ class TestMainCheckoutDefaultsNameTheirOverrides:
         pytest.param(
             prompt_opt_cli,
             ['canary', '--deploy-at', '2026-06-15T00:00:00+00:00', '--project-id', 'dark_factory'],
-            '--runs-db', 'PROMPT_OPT_RUNS_DB', id='prompt-opt-canary',
+            '--runs-db', None, id='prompt-opt-canary',
         ),
         pytest.param(
-            prompt_opt_cli, ['build-curator-corpus'], '--db-path', 'CURATOR_TICKETS_DB',
+            prompt_opt_cli, ['build-curator-corpus'], '--db-path', None,
             id='prompt-opt-build-curator-corpus',
         ),
         pytest.param(
-            reviewer_trial_cli, ['mine'], '--runs-db', 'REVIEWER_TRIAL_RUNS_DB',
-            id='reviewer-trial-mine',
+            reviewer_trial_cli, ['mine'], '--runs-db', None, id='reviewer-trial-mine',
         ),
         pytest.param(
             reviewer_trial_cli, ['campaign', '--results-dir', 'results'], '--config', None,
