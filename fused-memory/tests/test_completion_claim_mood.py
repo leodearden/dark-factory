@@ -578,6 +578,36 @@ class TestNonAssertiveScopes:
         assert _triples('task 5422 was merged into main') == [('applied_work', 'task', '5422')]
 
 
+class TestPremiseNotesClaimTheirDependency:
+
+    @pytest.mark.parametrize(
+        ('text', 'project', 'claim'),
+        [
+            pytest.param(
+                'Analysis: PREMISES, verified on task/432 == main == a106cd8 '
+                '(dependency 327 merged at a106cd8):',
+                'solar_challenge',
+                ('applied_work', 'task', '327'),
+                id='esc-unverified-claim-432-2',
+            ),
+            pytest.param(
+                'Dependency 6399 (L8a) is done (merged 4b891fe407)', 'dark_factory',
+                ('applied_work', 'task', '6399'),
+                id='dependency-00a117d0',
+            ),
+        ],
+    )
+    def test_a_bare_dependency_ref_takes_the_marker(self, text, project, claim):
+        assert _triples(text, project) == [claim]
+
+    def test_a_dependency_ref_honours_a_project_qualifier(self):
+        claims = _extract('dark_factory dependency 6020 has landed', 'reify')
+        assert [(c.ref, c.project_id) for c in claims] == [('6020', 'dark_factory')]
+
+    def test_a_hash_dependency_ref_is_claimed_once(self):
+        assert _triples('dependency #6020 has landed') == [('applied_work', 'task', '6020')]
+
+
 _ESC_5471_1 = (
     '(3) PRD2 ε #5471 owns the shipped Bool-balance and stock-size examples, '
     'so a new Bool exemplar here would duplicate it'
