@@ -16,6 +16,7 @@ import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
+import _checkout
 import pytest
 import source_measures
 from git_listing import git
@@ -1301,6 +1302,16 @@ def _stage_conflict(root: Path, relpath: str) -> None:
 #: A tree that is neither layout is refused naming both keys that would make it one.
 _NEITHER_LAYOUT = r'tool\.uv\.workspace.*\[project\]\.name'
 
+#: Workspace-table member lists the checkout reader refuses.
+_READER_REFUSED_MEMBER_LISTS = {
+    'no-members-key': '[tool.uv.workspace]\n',
+    'empty-members': _workspace(),
+    'members-not-a-list': '[tool.uv.workspace]\nmembers = "alpha"\n',
+    'non-string-member': '[tool.uv.workspace]\nmembers = ["alpha", 3]\n',
+    'empty-string-member': _workspace('alpha', ''),
+    'glob-member': _workspace('alpha', 'packages/*'),
+}
+
 
 class TestWorkspaceDomainFailsHard:
     """A domain that cannot be enumerated whole raises, never reads as partial."""
@@ -1321,12 +1332,6 @@ class TestWorkspaceDomainFailsHard:
             ),
             pytest.param('[project]\nname = ""\n', _NEITHER_LAYOUT, id='empty-project-name'),
             pytest.param('[project]\nname = 3\n', _NEITHER_LAYOUT, id='non-string-project-name'),
-            pytest.param(_workspace(), r'tool\.uv\.workspace', id='no-members'),
-            pytest.param(
-                '[tool.uv.workspace]\nmembers = ["alpha", 3]\n',
-                r'tool\.uv\.workspace',
-                id='non-string-member',
-            ),
             pytest.param(
                 _workspace('alpha', 'packages/*'), r"glob.*'packages/\*'", id='glob-member'
             ),
@@ -1351,6 +1356,21 @@ class TestWorkspaceDomainFailsHard:
         root = _domain_repo(tmp_path / 'repo', pyproject=pyproject)
         with pytest.raises(source_measures.MetricsError, match=pattern):
             source_measures.workspace_domain(root)
+
+    @pytest.mark.parametrize(
+        'pyproject',
+        _READER_REFUSED_MEMBER_LISTS.values(),
+        ids=_READER_REFUSED_MEMBER_LISTS.keys(),
+    )
+    def test_a_refused_member_list_carries_the_checkout_readers_reason(
+        self, tmp_path: Path, pyproject: str
+    ) -> None:
+        root = _domain_repo(tmp_path / 'repo', pyproject=pyproject)
+        with pytest.raises(_checkout.CheckoutBindingError) as read:
+            _checkout.workspace_members(root)
+        with pytest.raises(source_measures.MetricsError) as measured:
+            source_measures.workspace_domain(root)
+        assert str(read.value) in str(measured.value)
 
     def test_a_declared_member_with_no_tracked_python_is_refused(
         self, tmp_path: Path
