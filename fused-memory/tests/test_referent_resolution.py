@@ -2003,3 +2003,8 @@ class TestDerivedPathReadsTheScanFixes:
         resolution = self._derive('merged 8c7e163fcf for task 8c7e163fcf')
         assert resolution.source == 'none'
         assert resolution.referents == ()
+
+    def test_every_number_of_a_plural_list_is_derived(self):
+        resolution = self._derive('tasks 2226 and 2227 both landed')
+        assert resolution.source == 'derived'
+        assert resolution.referents == (Referent(number='2226'), Referent(number='2227'))

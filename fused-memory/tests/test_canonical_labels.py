@@ -1627,3 +1627,42 @@ class TestWordGluedDigitsAreNotTaskNumbers:
     )
     def test_punctuation_after_the_digits_still_ends_them(self, content, expected):
         assert _node_names(scan_content(content, group_id='dark_factory').refs) == expected
+
+
+class TestPluralTaskWordReadsTheWholeList:
+    """After the PLURAL task word every listed number is a mention:
+    'tasks 2226 and 2227' once yielded only 2226 (task 10082)."""
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            ('tasks 2226 and 2227', ['Task 2226', 'Task 2227']),
+            ('tasks 2226, 2227 and 2228', ['Task 2226', 'Task 2227', 'Task 2228']),
+            ('Tasks 2226, 2227, and 2228', ['Task 2226', 'Task 2227', 'Task 2228']),
+            ('tasks 2207/2210', ['Task 2207', 'Task 2210']),
+            ('tasks #5, #6 and #7', ['Task 5', 'Task 6', 'Task 7']),
+            ('tasks 5 or 6', ['Task 5', 'Task 6']),
+            ('done tasks 3659, 3666, 3669', ['Task 3659', 'Task 3666', 'Task 3669']),
+        ],
+    )
+    def test_every_listed_number_is_a_mention(self, content, expected):
+        assert _node_names(scan_content(content, group_id='dark_factory').refs) == expected
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'task 5, 3 files changed',
+            'task 5 and 6',
+            'tasks 5 and the parser',
+            'tasks 5,\n6',
+            'tasks 5 and 6th',
+        ],
+        ids=['singular-comma', 'singular-and', 'non-number', 'line-break', 'glued'],
+    )
+    def test_the_list_stops_where_it_is_not_a_task_list(self, content):
+        assert _node_names(scan_content(content, group_id='dark_factory').refs) == ['Task 5']
+
+    def test_every_listed_number_contests_like_a_bare_mention(self):
+        scan = scan_content('reify:2227 versus tasks 2226 and 2227', group_id='dark_factory')
+        assert _node_names(scan.refs) == ['Task 2226']
+        assert _node_names(scan.ambiguous) == ['reify:2227', 'Task 2227']
