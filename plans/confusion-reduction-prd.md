@@ -188,7 +188,7 @@ JSONL, one object per digest, strict schema:
 ```json
 {"session": "...", "date": "...", "project": "...", "agent_class": "...",
  "matches": [{"entry_id": "...", "origin_phase": "...", "manifested_phase": "...",
-              "invariant_violated": null, "note": "..."}],
+              "invariant_violated": null, "note": "...", "evidence_quote": "..."}],
  "candidates": [{"title": "...", "cause": "...", "area": "...",
                  "origin_phase": "...", "manifested_phase": "...", "evidence_quote": "..."}]}
 ```
