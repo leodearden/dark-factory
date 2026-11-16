@@ -61,3 +61,42 @@ recall_caveat:
     # Paraphrase recall is too low to enumerate a gate's members from.
     gate_filing: blocked
   gate_filing_owner_task: 4916
+  # Dated adjudicator-over-ANN measurements on the same fixture, written by
+  # fused-memory/scripts/measure_duplicate_detector_recall.py. An entry's
+  # meets_proposed_gate is judged against an UNRATIFIED proposal; task 10244
+  # ratifies it and sets fitness.gate_filing.
+  adjudicator_measurements:
+    # The 2026-11-16 report's calibrated-ann baseline, re-embedded, caught
+    # 27/301 at AUC 0.2540, not the 25/301 and 0.2534 above. The ANN cutoffs
+    # were identical. In the 2026-08-11 cosines, two true pairs sat 0.00014
+    # and 0.00009 below their cutoffs, and none sat within 0.002 above.
+    # Hypothesis: re-embedding drift moved those two pairs across.
+    - measured_at: '2026-11-16'
+      detector: 'bge-reranker-v2-m3+claims'
+      scan_set:
+        setting: 'fixture_only'
+        records: 104
+      candidate_generation:
+        top_k: 10
+        caught: 262
+        of: 301
+      operating_threshold: 0.36864760730012286
+      paraphrase_band_recall:
+        caught: 148
+        of: 301
+        rate: 0.49169435215946844
+        wilson_95: [0.43567745265075203, 0.5479205864620199]
+      precision_at_operating_point:
+        flagged: 164
+        rate: 0.9024390243902439
+        wilson_95: [0.8474022431479169, 0.9390535580360566]
+      hard_negative_flagged:
+        flagged: 11
+        of: 18
+      auc_true_vs_hard_negative:
+        value: 0.3401624215577704
+        n_true: 301
+        n_hard_negative: 18
+        hanley_mcneil_95: [0.19935917998199817, 0.4809656631335426]
+      meets_proposed_gate: false
+      source: 'fused-memory/calibration/duplicate_detector_recall_report.json (task 10243)'
