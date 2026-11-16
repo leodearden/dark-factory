@@ -8,7 +8,7 @@ signal_leaves:
 - T9
 tasks:
 - label: T1
-  task_id: null
+  task_id: 10472
   title: The successor relation in the lock table and the early-start dependency answer
   note: Intermediate; unlocks T4 and T5a (shared scheduler.py). No prerequisites.
   capabilities:
@@ -79,7 +79,7 @@ tasks:
       kind: manual
       reason: A behavioural equality over recorded inputs; no text marks it.
 - label: T2a
-  task_id: null
+  task_id: 10473
   title: Stacked worktree, the re-stack, and own work
   note: Intermediate; unlocks T2b, T5b. After task 7736 (in progress, same worktree-reuse path). Supersedes task 7660.
   capabilities:
@@ -141,7 +141,7 @@ tasks:
       kind: manual
       reason: Behavioural; proved on a real repository.
 - label: T2b
-  task_id: null
+  task_id: 10474
   title: The landed question and the replay that pauses
   note: Intermediate; unlocks T6a, T6b, T6c. After T2a (same files).
   capabilities:
@@ -167,7 +167,7 @@ tasks:
       kind: manual
       reason: The entry point name is the architect's; the T2b signal (a paused replay is continued and only then drops the record) proves it.
 - label: T3
-  task_id: null
+  task_id: 10475
   title: The borrowed slot
   note: Intermediate; unlocks T5b. No prerequisites. Keep the slot-ended signal in slot_lease.py so T3 stays off scheduler.py.
   capabilities:
@@ -199,7 +199,7 @@ tasks:
       kind: manual
       reason: Proved by the harness-loop tests over the five exits, not by a name.
 - label: T4
-  task_id: null
+  task_id: 10476
   title: The task picture and the claim-time check
   note: Intermediate; unlocks T5a. Serialized after T1 by scheduler.py.
   capabilities:
@@ -237,7 +237,7 @@ tasks:
       kind: manual
       reason: A figure in the task's result, not code.
 - label: T5a
-  task_id: null
+  task_id: 10477
   title: The early-start selection in the scheduler
   note: Intermediate; unlocks T5b. After T1 and T4 (scheduler.py).
   capabilities:
@@ -281,7 +281,7 @@ tasks:
       kind: manual
       reason: Behavioural (tests 33, 34); no name marks it.
 - label: T5b
-  task_id: null
+  task_id: 10478
   title: The early-start coroutine and launch in the harness
   note: Intermediate; unlocks T6a. After T5a, T2a and T3.
   capabilities:
@@ -346,7 +346,7 @@ tasks:
       kind: manual
       reason: The metadata key is the architect's; tests 42 and 43 build and read it.
 - label: T6a
-  task_id: null
+  task_id: 10479
   title: Stop when the predecessor's work does not land
   note: Intermediate; unlocks T6b. After T5b and T2b.
   capabilities:
@@ -423,7 +423,7 @@ tasks:
       kind: manual
       reason: Behavioural; the alert key is checked at T6c.
 - label: T6b
-  task_id: null
+  task_id: 10480
   title: Settle when it lands
   note: Intermediate; unlocks T6c. After T6a.
   capabilities:
@@ -470,7 +470,7 @@ tasks:
       kind: manual
       reason: Behavioural (tests 13 to 16).
 - label: T6c
-  task_id: null
+  task_id: 10481
   title: The landed question at every later start
   note: Intermediate; unlocks T7. Depends on T6b.
   capabilities:
@@ -520,7 +520,7 @@ tasks:
       kind: manual
       reason: Behavioural (tests 25, 37).
 - label: T7
-  task_id: null
+  task_id: 10482
   title: Operator views, and the default turned on
   note: 'Intermediate; unlocks T8, T9. Depends on T6c. Soft pre-condition: task 10211.'
   capabilities:
@@ -562,7 +562,7 @@ tasks:
       kind: manual
       reason: A default value; a grep for its literal text is too brittle to gate T8 and T9 on.
 - label: T8
-  task_id: null
+  task_id: 10483
   title: 'Gate: read the first real pairs'
   note: Signal leaf. Pure gate, delayed two days after T7 is done.
   capabilities:
@@ -576,7 +576,7 @@ tasks:
       kind: manual
       reason: A reading of production events after two days; nothing in the tree changes.
 - label: T9
-  task_id: null
+  task_id: 10484
   title: 'Gate: read two weeks of early starts'
   note: Signal leaf. Pure gate, delayed fourteen days after T7 is done; carries the end-to-end proof if T8 closed without a completed pair.
   capabilities:
