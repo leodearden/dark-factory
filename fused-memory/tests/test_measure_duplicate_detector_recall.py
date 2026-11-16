@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import json
 import types
 from pathlib import Path
 
@@ -38,6 +39,11 @@ def _arms() -> types.ModuleType:
     return load_script_module(
         SCRIPTS / 'eval_write_triage_reranker_arms.py', 'eval_write_triage_reranker_arms',
     )
+
+
+@functools.cache
+def _report_schema() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'duplicate_cluster_report.py', 'duplicate_cluster_report')
 
 
 def _context():
@@ -533,3 +539,202 @@ class TestMeasureDetectorArm:
         assert (row.hard_negative_flagged.hits, row.hard_negative_flagged.total) == (1, 1)
         assert row.auc.value == 0.5
         assert (row.auc.n_true, row.auc.n_hard_negative) == (1, 1)
+
+
+def _row(name='arm-a', *, hits=3, total=4, flagged=3, auc=0.85, auc_lo=0.81, recall_lo=0.76,
+         precision_lo=0.91, threshold=0.5):
+    m = _mod()
+    return m.DetectorRow(
+        arm=name, arm_class='local_cross_encoder', model='fake/model', granularity='full_text',
+        status='measured', operating_rule=m.OPERATING_RULE_FLOOR,
+        auc=None if auc is None else m.AucBlock(
+            value=auc, n_true=total, n_hard_negative=2, hanley_mcneil_95=(auc_lo, 1.0),
+        ),
+        operating_threshold=threshold,
+        paraphrase_band_recall=m.Proportion(
+            hits=hits, total=total, rate=hits / total, wilson_95=(recall_lo, 0.99),
+        ),
+        precision=None if threshold is None else m.Proportion(
+            hits=hits, total=flagged, rate=hits / flagged, wilson_95=(precision_lo, 1.0),
+        ),
+        hard_negative_flagged=m.Proportion(hits=1, total=2, rate=0.5, wilson_95=(0.09, 0.91)),
+    )
+
+
+def _skipped(name='arm-skipped', reason='no_credential', detail='KEY unset'):
+    return _mod().DetectorRow.skipped(_fake_arm(_yielding(None), name=name), reason, detail)
+
+
+def _baseline(hits=10):
+    return _row(_mod().BASELINE_ARM, hits=hits, total=10, flagged=10, threshold=None)
+
+
+def _generation():
+    m = _mod()
+    return m.CandidateGeneration(
+        top_k=3, candidates=((0, 1), (0, 2)),
+        true_caught=m.Proportion(hits=1, total=4, rate=0.25, wilson_95=(0.05, 0.7)),
+        hard_negative_generated=1, cross_category_true_pairs=7,
+        disclosure={'top_k_saturated': 2, 'missing_vector': 0},
+    )
+
+
+_CLASSES = {
+    (0, 1): 'true_dup_pairs', (0, 2): 'hard_negative_pairs',
+    (1, 2): 'hard_negative_pairs', (0, 3): 'unrelated_pairs',
+}
+_PROVENANCE = {'measured_at': '2099-01-02', 'record_count': 17}
+
+
+def _report(arm_rows):
+    return _mod().build_report(
+        generation=_generation(), pair_classes=_CLASSES, baseline=_baseline(),
+        arm_rows=arm_rows, records=17,
+        embedder={'model': 'fake-embedder', 'dimensions': 2}, provenance=_PROVENANCE,
+    )
+
+
+class TestReportAndProposal:
+    def test_the_gate_proposal_is_the_pre_registered_one(self):
+        proposal = _mod().GATE_PROPOSAL
+
+        assert proposal.precision_floor == 0.90
+        assert proposal.min_paraphrase_band_recall == 0.75
+        assert proposal.min_auc == 0.80
+        assert proposal.proposed_on == '2026-11-16'
+        assert proposal.basis and all(proposal.basis)
+
+    def _verdict(self, row):
+        return _mod().gate_verdict(row.to_json(), _mod().GATE_PROPOSAL)
+
+    def test_a_row_exactly_at_every_bar_passes_both_readings(self):
+        row = _row(hits=3, total=4, auc=0.80, recall_lo=0.75, precision_lo=0.90, auc_lo=0.80)
+
+        assert self._verdict(row) == {'on_point_estimates': True, 'on_lower_bounds': True}
+
+    @pytest.mark.parametrize('changes', [
+        {'hits': 74, 'total': 100}, {'auc': 0.79},
+    ])
+    def test_a_point_estimate_below_its_bar_fails_that_reading(self, changes):
+        row = _row(**{'recall_lo': 0.75, 'precision_lo': 0.9, 'auc_lo': 0.8, **changes})
+
+        assert self._verdict(row)['on_point_estimates'] is False
+
+    @pytest.mark.parametrize('changes', [
+        {'recall_lo': 0.749}, {'precision_lo': 0.899}, {'auc_lo': 0.799},
+    ])
+    def test_a_lower_bound_below_its_bar_fails_that_reading(self, changes):
+        row = _row(**{'hits': 3, 'total': 4, 'auc': 0.9, **changes})
+
+        assert self._verdict(row) == {'on_point_estimates': True, 'on_lower_bounds': False}
+
+    def test_no_operating_point_fails_both_readings(self):
+        row = _row(threshold=None)
+
+        assert self._verdict(row) == {'on_point_estimates': False, 'on_lower_bounds': False}
+
+    def _chosen(self, rows):
+        chosen = _mod().choose_detector([row.to_json() for row in rows])
+        return None if chosen is None else chosen['arm']
+
+    def test_the_most_true_pairs_caught_wins_and_the_baseline_never_does(self):
+        rows = [
+            _baseline(hits=10), _skipped(),
+            _row('a', hits=2), _row('b', hits=3, auc=0.7), _row('c', hits=1, auc=0.99),
+        ]
+
+        assert self._chosen(rows) == 'b'
+
+    def test_a_tie_on_caught_goes_to_the_higher_auc_then_the_earlier_row(self):
+        assert self._chosen([_row('a', auc=None), _row('b', auc=0.5)]) == 'b'
+        assert self._chosen([_row('a', auc=0.6), _row('b', auc=0.6)]) == 'a'
+
+    def test_nothing_measured_chooses_nothing(self):
+        assert self._chosen([_baseline(), _skipped()]) is None
+
+    def test_the_recall_caveat_entry_validates_against_the_config_schema(self):
+        report = _report([_skipped(), _row('chosen-arm', hits=3, total=4)])
+
+        entry = _mod().recall_caveat_entry(report)
+
+        model = _report_schema().AdjudicatorMeasurement.model_validate(entry)
+        assert model.measured_at == '2099-01-02'
+        assert model.detector == 'chosen-arm'
+        assert model.source == (
+            'fused-memory/calibration/duplicate_detector_recall_report.json (task 10243)'
+        )
+        assert (model.paraphrase_band_recall.caught, model.paraphrase_band_recall.of) == (3, 4)
+        assert (model.candidate_generation.caught, model.candidate_generation.of) == (1, 4)
+        assert list(entry) == list(_report_schema().AdjudicatorMeasurement.model_fields)
+
+    def test_no_chosen_arm_is_no_entry(self):
+        assert _mod().recall_caveat_entry(_report([_skipped()])) is None
+
+    def test_the_report_carries_setting_counts_rows_and_derived_caveats(self):
+        report = _report([_skipped('arm-x', 'dependency_unavailable', 'no torch'), _row('a')])
+
+        assert list(report) == [
+            'setting', 'pair_counts', 'candidate_generation', 'baseline', 'arms', 'chosen',
+            'gate_proposal', 'recall_caveat_entry', 'caveats', 'provenance',
+        ]
+        assert report['setting'] == {
+            'scan_set': 'fixture_only', 'records': 17, 'top_k': 3, 'per_category': True,
+            'embedder': {'model': 'fake-embedder', 'dimensions': 2},
+        }
+        assert report['pair_counts'] == {
+            'true_dup_pairs': 1, 'hard_negative_pairs': 2, 'unrelated_pairs': 1,
+        }
+        assert report['chosen']['arm'] == 'a'
+        assert set(report['chosen']['verdict']) == {'on_point_estimates', 'on_lower_bounds'}
+        assert report['gate_proposal'] == _mod().gate_proposal_json(_mod().GATE_PROPOSAL)
+        assert report['provenance'] == _PROVENANCE
+        caveats = ' '.join(report['caveats'])
+        assert '7' in caveats
+        assert 'arm-x' in caveats and 'dependency_unavailable' in caveats
+        assert 'in-sample' in caveats
+        assert 'fixture_only' in caveats
+        assert 'jev-choice' in caveats
+        json.dumps(report)
+
+    def test_the_markdown_is_a_function_of_the_json_alone(self):
+        report = _report([_skipped(), _row('a')])
+        proposal = _mod().GATE_PROPOSAL
+
+        markdown = _mod().render_markdown(report)
+
+        assert markdown == _mod().render_markdown(json.loads(json.dumps(report)))
+        assert 'a' in markdown
+        for bar in (proposal.precision_floor, proposal.min_paraphrase_band_recall, proposal.min_auc):
+            assert f'{bar:.2f}' in markdown
+
+    def test_write_report_writes_the_json_and_its_markdown_sibling(self, tmp_path):
+        report = _report([_row('a')])
+        path = tmp_path / 'out.json'
+
+        _mod().write_report(report, path)
+
+        assert json.loads(path.read_text()) == json.loads(json.dumps(report))
+        assert path.with_suffix('.md').read_text() == _mod().render_markdown(report)
+
+    def test_a_non_json_report_path_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match='.json'):
+            _mod().guard_report_path(tmp_path / 'out.md', arm_filter=None)
+
+    def test_a_filtered_run_is_refused_at_the_committed_path_however_spelled(self, monkeypatch):
+        monkeypatch.chdir(SCRIPTS.parent)
+        relative = 'calibration/duplicate_detector_recall_report.json'
+
+        with pytest.raises(ValueError, match='committed'):
+            _mod().guard_report_path(relative, arm_filter=['bge-reranker-v2-m3'])
+        with pytest.raises(ValueError, match='committed'):
+            _mod().guard_report_path(
+                SCRIPTS / '..' / relative, arm_filter=['bge-reranker-v2-m3'],
+            )
+        assert _mod().guard_report_path(relative, arm_filter=None).name == (
+            'duplicate_detector_recall_report.json'
+        )
+
+    def test_a_filtered_run_elsewhere_passes(self, tmp_path):
+        path = tmp_path / 'smoke.json'
+
+        assert _mod().guard_report_path(path, arm_filter=['bge-reranker-v2-m3']) == path
