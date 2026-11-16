@@ -486,6 +486,35 @@ class TestReblockGuardEscalationEvent:
         assert data.get('severity') == 'urgent'
         assert data.get('level') == 2
 
+    async def test_threshold_trip_l2_carries_the_reblock_guard_identity(
+        self, harness: Harness
+    ):
+        esc = _make_l1_esc(
+            task_id='42',
+            category='infra_issue',
+            summary='disk full',
+            resolved_by='l2-cascade:esc-100-1',
+        )
+        sig = Harness._reblock_signature(esc)
+        q = _make_mock_queue()
+        harness._escalation_queue = q
+        harness.event_store = MagicMock()
+        _make_fake_scheduler(
+            harness,
+            initial_metadata={'reblock_guard': {'count': 3, 'signature': sig}},
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        (filed,) = q._submitted
+        assert filed.task_id == '42'
+        assert filed.root_cause == 'reblock-guard:42'
+        assert filed.suggested_action == 'investigate_reblock_loop'
+        assert harness.event_store.emit.call_args.kwargs['data']['reason'] == (
+            'reblock-guard-threshold'
+        )
+
     async def test_dedup_withhold_emits_no_escalation_created_event(
         self, harness: Harness
     ):
