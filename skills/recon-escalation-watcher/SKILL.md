@@ -124,12 +124,6 @@ stand-down, and once its heartbeat is past the TTL the reaper reclaims it. The p
 `lease-heartbeat` is the **only** liveness signal a hosted holder has
 (`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
 
-**One-time rollout note (task 6916).** A lease a hosted session claimed *before* this change carries
-the bare `<--name>-$CLAUDE_PID` slug, so that session's re-derived heartbeat and release get
-`result=refused` (naming the holder's pid `alive`) — nothing is damaged. The lease becomes
-reclaimable once its heartbeat is past the 2h TTL; to skip the wait, release it with its original
-`--slug` (`lease-show` prints it as `holder_slug`) and claim again.
-
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** naming both,
 rather than silently drifting to a slug your own later heartbeat would fail to match; the CLI will
 not invent one, because a synthesized token would be identical for every degraded session and let
@@ -237,7 +231,7 @@ show freshness, because the heartbeat is the file's mtime.
    orphans" below) — BEFORE every drain, so the drain never sees them
 1. Drain all pending recon escalations
 2. Start the watcher: `scripts/watcher-rearm.sh` (background task, recon queue
-   dir, NO --level, --timeout 3600)
+   dir, NO --level, --timeout 3600, with the Bash tool's `timeout` parameter set to 3660000)
 3. Wait for it to exit, then branch per "Distinguishing the exits at step 3"
    below: FIRED → 4; CEILING → 5, skipping 4; KILLED / ERROR → that table's
    row and its identical-retry cap
@@ -406,14 +400,11 @@ is the only acceptable failure direction for this queue's sole closer (contrast
 `--baseline` below, which fails silent). Blank lines and `#` comments are
 skipped (`watcher.py:143-146`), so the file can be annotated.
 
-**Slice length (recon delta on the shared timeout rules).** In the background
-the wrapper is exempt from the Bash tool's foreground timeouts, so this skill
-uses the long canonical slice `--timeout 3600`: at most one heartbeat wake per
-hour (`CEILING`) while a real escalation still fires instantly via inotify. Only
-**foreground** calls (e.g. debugging) are governed by the harness timeouts —
-there, size the Bash `timeout` to at least `(--timeout + 60s) × 1000` ms, or cap
-the slice at `--timeout 540` on a machine without a raised `BASH_MAX_TIMEOUT_MS`;
-the sibling skill's §"Starting the watcher" has the full rules.
+**Slice length.** Use the long canonical slice `--timeout 3600`: at most one
+heartbeat wake per hour (`CEILING`) while a real escalation still fires at once
+via inotify. Pass the Bash `timeout` on the background call too (`3660000` for
+`--timeout 3600`); the rule and its reason are in the sibling skill's §"Starting
+the watcher" (Bash-tool timeout contract).
 
 **`--baseline` is NOT safe for this loop — do not reach for it here**,
 even though `escalation.watcher` accepts it as a flag. `_snapshot_pending_ids()`
