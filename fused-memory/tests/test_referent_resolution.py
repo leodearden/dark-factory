@@ -2008,3 +2008,12 @@ class TestDerivedPathReadsTheScanFixes:
         resolution = self._derive('tasks 2226 and 2227 both landed')
         assert resolution.source == 'derived'
         assert resolution.referents == (Referent(number='2226'), Referent(number='2227'))
+
+    def test_a_registered_project_name_qualifies_a_derived_mention(self):
+        resolution = self._derive('Reify task 3674 was cancelled')
+        assert resolution.source == 'derived'
+        assert resolution.referents == (Referent(project_id='reify', number='3674'),)
+
+    def test_without_a_registry_the_mention_stays_local(self):
+        resolution = self._derive('Reify task 3674 was cancelled', known_project_ids=None)
+        assert resolution.referents == (Referent(number='3674'),)

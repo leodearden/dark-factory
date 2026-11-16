@@ -1677,3 +1677,66 @@ class TestPluralTaskWordReadsTheWholeList:
         scan = scan_content('reify:2227 versus tasks 2226 and 2227', group_id='dark_factory')
         assert _node_names(scan.refs) == ['Task 2226']
         assert _node_names(scan.ambiguous) == ['reify:2227', 'Task 2227']
+
+
+class TestRegisteredProjectNameQualifiesAMention:
+    """With a registry, a registered project's name directly before the task
+    word qualifies the mention: 'Reify task 3674' once bound to the LOCAL Task
+    3674 (task 10082). Without a usable registry nothing changes."""
+
+    REGISTRY = {'dark_factory': '/src/df', 'reify': '/src/reify'}
+
+    def _scan(self, content, *, group_id='dark_factory', known_project_ids=REGISTRY):
+        return scan_content(content, group_id=group_id, known_project_ids=known_project_ids)
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            ('Reify task 3674 was cancelled', ['reify:3674']),
+            ('in reify, task 9727 landed', ['reify:9727']),
+            ('Reify tasks 2226 and 2227', ['reify:2226', 'reify:2227']),
+            ('REIFY task 5', ['reify:5']),
+        ],
+    )
+    def test_the_registered_name_qualifies_the_mention(self, content, expected):
+        scan = self._scan(content)
+        assert _node_names(scan.refs) == expected
+        assert scan.ambiguous == ()
+
+    def test_a_self_qualified_prose_mention_never_contests(self):
+        scan = self._scan('dark_factory task 5 and reify:5')
+        assert _node_names(scan.refs) == ['Task 5', 'reify:5']
+        assert scan.ambiguous == ()
+
+    def test_the_own_project_name_keeps_the_mention_local(self):
+        scan = self._scan('Reify task 5181 was cancelled', group_id='reify')
+        assert _node_names(scan.refs) == ['Task 5181']
+
+    def test_a_qualified_and_a_bare_mention_of_one_number_contest(self):
+        scan = self._scan('Reify task 3674; task 3674 is ours')
+        assert scan.refs == ()
+        assert set(_node_names(scan.ambiguous)) == {'reify:3674', 'Task 3674'}
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'Completed task 5',
+            'Nowhere task 5',
+            'reify\ntask 5',
+            '/src/reify task 5',
+            'subtasks task 5',
+        ],
+        ids=['unregistered-word', 'unregistered-name', 'line-break', 'path', 'task-vocabulary'],
+    )
+    def test_anything_else_before_the_task_word_stays_local(self, content):
+        assert _node_names(self._scan(content).refs) == ['Task 5']
+
+    @pytest.mark.parametrize('known_project_ids', [None, {}], ids=['no-registry', 'empty'])
+    def test_permissive_mode_is_unchanged(self, known_project_ids):
+        scan = self._scan('Reify task 3674', known_project_ids=known_project_ids)
+        assert _node_names(scan.refs) == ['Task 3674']
+
+    def test_a_hyphen_glued_task_word_is_still_not_a_mention(self):
+        scan = self._scan('reify-task 2500')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
