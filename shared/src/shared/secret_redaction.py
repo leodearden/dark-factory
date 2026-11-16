@@ -53,6 +53,7 @@ __all__ = [
     'RedactionWouldCorruptJson',
     'RefusedLine',
     'file_stamp',
+    'preview_redaction',
     'redact_in_place',
     'redaction_needles',
 ]
@@ -119,6 +120,9 @@ class FileRedaction:
             raise RedactionWouldCorruptJson(Path(path), first.line_number, first.var)
 
 
+_NO_HITS = FileRedaction(MappingProxyType({}))
+
+
 @dataclass(frozen=True)
 class FileStamp:
     st_ino: int
@@ -182,7 +186,7 @@ def redact_in_place(
     original = os.stat(path)
     stamp = unchanged_since or _stamp_of(original)
     if not needles or not _contains_any(path, needles, codec):
-        return FileRedaction(MappingProxyType({}))
+        return _NO_HITS
 
     fd, temp_name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.redacting', dir=path.parent)
     os.close(fd)
@@ -192,7 +196,7 @@ def redact_in_place(
             _decoded(path, codec) as reader,
             _encoded(temp, codec, name=path.name, mtime=int(original.st_mtime)) as writer,
         ):
-            result = _copy_lines(reader, writer, needles)
+            result = _copy_lines(reader, writer.write, needles)
         if not result.redacted:
             return result
         os.chmod(temp, stat.S_IMODE(original.st_mode))
@@ -203,6 +207,16 @@ def redact_in_place(
     finally:
         temp.unlink(missing_ok=True)
     return result
+
+
+def preview_redaction(
+    path: StrPath, needles: Sequence[Needle], *, codec: Codec = Codec.PLAIN
+) -> FileRedaction:
+    path = Path(path)
+    if not needles or not _contains_any(path, needles, codec):
+        return _NO_HITS
+    with _decoded(path, codec) as reader:
+        return _copy_lines(reader, lambda _line: None, needles)
 
 
 def _json_escaped_forms(value: str) -> tuple[str, ...]:
@@ -313,12 +327,12 @@ def _contains_any(path: Path, needles: Sequence[Needle], codec: Codec) -> bool:
 
 
 def _copy_lines(
-    reader: io.BufferedIOBase, writer: io.BufferedIOBase, needles: Sequence[Needle]
+    reader: io.BufferedIOBase, write: Callable[[bytes], object], needles: Sequence[Needle]
 ) -> FileRedaction:
     counts: Counter[str] = Counter()
     refused: list[RefusedLine] = []
     for line_number, line in enumerate(reader, start=1):
-        writer.write(_redact_line(line, needles, counts, refused, line_number))
+        write(_redact_line(line, needles, counts, refused, line_number))
     return FileRedaction(MappingProxyType(dict(counts)), tuple(refused))
 
 
