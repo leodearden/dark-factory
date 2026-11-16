@@ -36,6 +36,7 @@ import re
 import subprocess
 
 import pytest
+from git_listing import git
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from shell_logical_lines import logical_lines
 from systemd_unit_invariants import (
@@ -83,6 +84,33 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
         "scripts/orchestrator-stream-touch.service",
         "scripts/return-brief.service",
         "scripts/transcript-secret-sweep.service",
+    }
+)
+
+# Every non-test shell script in the checkout that runs `uv run`, whether or not
+# a unit runs it; asserted by EQUALITY for the reason _EXPECTED_UV_RUN_UNITS states.
+_EXPECTED_UV_RUN_SCRIPTS = frozenset(
+    {
+        "fused-memory/scripts/cgl_eta_auto_apply.sh",
+        "scripts/check_dashboard_payload_budgets.sh",
+        "scripts/check_sandbox_soak.sh",
+        "scripts/check_write_triage_flip_preconditions.sh",
+        "scripts/eval_bootstrap_smoke.sh",
+        "scripts/exception-owner-sweep.sh",
+        "scripts/fused-memory-duplicate-audit.sh",
+        "scripts/fused-memory-flag-marker-check.sh",
+        "scripts/fused-memory-flag-marker-sweep.sh",
+        "scripts/fused-memory-link-heal.sh",
+        "scripts/fused-memory-memory-eval.sh",
+        "scripts/install-exception-owner-sweep-timer.sh",
+        "scripts/legibility/install-transcript-check-timer.sh",
+        "scripts/legibility/install-trickle-health-timer.sh",
+        "scripts/legibility/install-trickle-timer.sh",
+        "scripts/local-model-serving/install-lms-units.sh",
+        "scripts/memory-metadata-coverage-census.sh",
+        "scripts/rerun_cap_tainted.sh",
+        "scripts/return-brief.sh",
+        "scripts/transcript-secret-sweep.sh",
     }
 )
 
@@ -495,6 +523,38 @@ def test_discovery_covers_every_known_uv_run_unit() -> None:
     )
 
 
+def test_script_discovery_covers_every_known_uv_run_script() -> None:
+    """Coverage guard for the script arm: non-empty and exactly the known scripts.
+
+    Equality for the reason test_discovery_covers_every_known_uv_run_unit
+    gives: discovery ends in a parser, so a script re-spelled past it would
+    otherwise leave the sweep quietly.
+    """
+    discovered = set(discover_uv_run_scripts())
+    assert discovered, (
+        "discovery found no shell script running `uv run` at all, so the "
+        "parametrized sweeps below would check no script and report green. "
+        f"Check that git lists the checkout's *.sh files (REPO_ROOT={REPO_ROOT})."
+    )
+    missing = _EXPECTED_UV_RUN_SCRIPTS - discovered
+    extra = discovered - _EXPECTED_UV_RUN_SCRIPTS
+    assert not missing, (
+        f"these known `uv run` shell scripts dropped out of the sweep: {sorted(missing)}. "
+        "Either the script stopped running `uv run` (then remove it from "
+        "_EXPECTED_UV_RUN_SCRIPTS deliberately), or it moved, or shell_uv_run_sites "
+        "stopped recognising its `uv run`. A script that leaves this sweep "
+        "silently is the failure mode the sweep exists to prevent."
+    )
+    assert not extra, (
+        f"the sweep picked up shell scripts not in _EXPECTED_UV_RUN_SCRIPTS: {sorted(extra)}. "
+        "A shell script that newly runs `uv run` shares the one root .venv and "
+        "carries the same obligation, so add it to the constant. A script whose "
+        "`uv run` this scan cannot read also lands here, deliberately (see "
+        "discover_uv_run_scripts); its own case below names the defect. A test "
+        "fixture belongs under a tests/ directory, which discovery excludes."
+    )
+
+
 @pytest.mark.parametrize("rel_path", swept_paths(), ids=lambda p: p)
 def test_uv_run_unit_passes_no_sync(rel_path: str) -> None:
     """Every `uv run` a unit's start runs must carry `--no-sync` among its RUN-LEVEL flags."""
@@ -734,3 +794,31 @@ def test_uv_run_sites_raises_for_a_wrapper_the_checkout_lacks(tmp_path: pathlib.
     _plant(tmp_path, {"u.service": _WRAPPER_UNIT})
     with pytest.raises(MalformedExecStart, match=r"scripts/u\.sh"):
         uv_run_sites("u.service", tmp_path)
+
+
+def test_discover_uv_run_scripts_reads_every_shell_script_outside_test_trees(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Guard the guard: every *.sh with a site, an unreadable one included; test trees and non-.sh excluded."""
+    git(tmp_path, "init", "-q")
+    _plant(
+        tmp_path,
+        {
+            "top.sh": "uv run --no-sync --project shared python x.py\n",
+            "scripts/a.sh": "uv run --no-sync --project shared python x.py\n",
+            "scripts/odd.sh": '"${UV:-uv}" run --frozen --project shared python\n',
+            "scripts/plain.sh": "python3 x.py\n",
+            "scripts/tests/t.sh": "uv run --frozen --project shared python x.py\n",
+            "pkg/tests/u.sh": "uv run --frozen --project shared python x.py\n",
+            "scripts/notes.txt": "uv run --frozen --project shared python x.py\n",
+        },
+    )
+    assert discover_uv_run_scripts(tmp_path) == ["scripts/a.sh", "scripts/odd.sh", "top.sh"]
+
+
+def test_script_uv_run_sites_names_the_script_it_read(tmp_path: pathlib.Path) -> None:
+    """A script's sites carry its *root*-relative path as their source."""
+    _plant(tmp_path, {"scripts/w.sh": "exec uv run --frozen --project shared python x.py\n"})
+    assert [(s.source, s.flags) for s in script_uv_run_sites("scripts/w.sh", tmp_path)] == [
+        ("scripts/w.sh", ("--frozen", "--project"))
+    ]
