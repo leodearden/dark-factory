@@ -127,6 +127,7 @@ class _Verdict(enum.Enum):
     DEFERRED = 'deferred'
     UNREADABLE = 'unreadable'
     NOT_A_FILE = 'not-a-file'
+    VANISHED = 'vanished'
 
 
 @dataclass(frozen=True)
@@ -213,7 +214,7 @@ def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
                 deferred.append(path)
             case _Verdict.UNREADABLE:
                 unreadable.append(path)
-            case _Verdict.NOT_A_FILE:
+            case _Verdict.NOT_A_FILE | _Verdict.VANISHED:
                 pass
     return SweepResult(
         ok=True,
@@ -227,7 +228,8 @@ def _scan(config: SweepConfig, needles: NeedlesByMarkup) -> SweepResult:
 
 def _swept_files(trees: Iterable[SweptTree], unreadable: list[Path]) -> Iterator[Path]:
     def note_unlistable(error: OSError) -> None:
-        unreadable.append(Path(error.filename))
+        if not isinstance(error, FileNotFoundError):
+            unreadable.append(Path(error.filename))
 
     for tree in trees:
         if not tree.root.is_dir():
@@ -249,6 +251,8 @@ def _format_of(name: str) -> tuple[Markup, Codec]:
 def _sweep_file(path: Path, needles: NeedlesByMarkup, cutoff_ns: int) -> FileRedaction | _Verdict:
     try:
         st = os.lstat(path)
+    except FileNotFoundError:
+        return _Verdict.VANISHED
     except OSError:
         return _Verdict.UNREADABLE
     if not stat.S_ISREG(st.st_mode):
@@ -260,6 +264,8 @@ def _sweep_file(path: Path, needles: NeedlesByMarkup, cutoff_ns: int) -> FileRed
         redaction = redact_in_place(path, needles[markup], codec=codec)
     except FileChangedDuringRedaction:
         return _Verdict.DEFERRED
+    except FileNotFoundError:
+        return _Verdict.VANISHED
     except (CorruptCompressedFile, OSError):
         return _Verdict.UNREADABLE
     finally:
