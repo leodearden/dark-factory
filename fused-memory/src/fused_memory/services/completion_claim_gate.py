@@ -685,12 +685,13 @@ _NOT_ADVERBIAL_ONCE: str = (
 )
 
 # A marker with no subject of its own binds forward only. After a determiner it is
-# attributive ('the shipped examples'); after a temporal cue it heads a verbless clause
+# attributive ('the shipped examples'), and after 'no' it is negated besides ('gets no
+# landed-outbox hit'); after a temporal cue it heads a verbless clause
 # ('holds once merged') with no auxiliary for the _MOOD_SCOPES tense gate to read.
 # Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes (temporal
 # cue) and ::TestAttributiveMarkersBindForwardOnly (determiner).
 _FORWARD_ONLY_LEAD_RE: re.Pattern[str] = re.compile(
-    r'(?:\b(?:the|a|an|its|their|our|your|his|her|my)|'
+    r'(?:\b(?:the|a|an|no|its|their|our|your|his|her|my)|'
     + _NOT_ADVERBIAL_ONCE + _TEMPORAL_CUE + r')'
     r'\s+(?:(?:\w+ly|already|just|now)\s+)?$',
     re.IGNORECASE,
