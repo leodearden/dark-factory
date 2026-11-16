@@ -28,6 +28,7 @@ from shared.project_layout import (
     offline_lane_dir,
     orchestrator_data_dir,
     park_eviction_requests_db,
+    reconciliation_tickets_db,
     runs_db,
     scheduler_eligibility_db,
     scheduler_overrides_db,
@@ -79,6 +80,12 @@ class TestStoreLocators:
     def test_scheduler_eligibility_db_is_exported(self) -> None:
         assert 'scheduler_eligibility_db' in shared.project_layout.__all__
 
+    def test_reconciliation_tickets_db(self, root: str | Path) -> None:
+        assert reconciliation_tickets_db(root) == Path(root) / 'data' / 'reconciliation' / 'tickets.db'
+
+    def test_reconciliation_tickets_db_is_exported(self) -> None:
+        assert 'reconciliation_tickets_db' in shared.project_layout.__all__
+
     def test_tasks_db_is_the_real_store_not_the_decoy(self, root: str | Path) -> None:
         assert tasks_db(root) == Path(root) / '.taskmaster' / 'tasks' / 'tasks.db'
 
@@ -88,6 +95,7 @@ class TestStoreLocators:
             escalation_queue_dir,
             orchestrator_data_dir,
             *(locator for locator, _ in _ORCHESTRATOR_STORES),
+            reconciliation_tickets_db,
             tasks_db,
             verify_logs_dir,
         ],
@@ -109,6 +117,7 @@ class TestLocatorsArePure:
             escalation_queue_dir,
             orchestrator_data_dir,
             *(locator for locator, _ in _ORCHESTRATOR_STORES),
+            reconciliation_tickets_db,
             tasks_db,
             verify_logs_dir,
         ],
@@ -123,6 +132,7 @@ class TestLocatorsArePure:
         assert runs_db('proj') == Path('proj/data/orchestrator/runs.db')
         assert tasks_db('proj') == Path('proj/.taskmaster/tasks/tasks.db')
         assert escalation_queue_dir('proj') == Path('proj/data/escalations')
+        assert reconciliation_tickets_db('proj') == Path('proj/data/reconciliation/tickets.db')
 
 
 class TestKnownProjectRoots:
