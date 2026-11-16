@@ -23,6 +23,7 @@ from shared.eval_lane import eval_lane_provenance
 # not pull fastmcp into every consumer of the base layer.
 from shared.mcp_markup_middleware import (
     FACT_MARKUP_DETECTED,
+    MARKUP_RECURRENCE_ROUTING,
     MARKUP_RESIDUE_ERROR_TYPES,
     MARKUP_STORM_ERROR_TYPE,
     MARKUP_UNRECOVERED_PARAM_ERROR_TYPE,
@@ -950,8 +951,8 @@ _MARKUP_STORM_ALARM = GuardStormAlarm(
     agent_role=_MARKUP_GUARD_AGENT_ROLE,
     condition='the serialization leak is ACTIVE',
     suggested_action=(
-        'identify the leaking caller from the markup_detected facts and '
-        'report it against plans/toolcall-markup-containment-prd.md'
+        'identify the leaking caller from the markup_detected facts, then '
+        f'{MARKUP_RECURRENCE_ROUTING}'
     ),
 )
 
@@ -1497,8 +1498,8 @@ def create_server(
             '',
             'RAW PAYLOAD, VERBATIM AND ENTIRE — the only surviving copy. '
             'Recover it for the caller if it is still needed, then chase the '
-            'harness serialization leak that produced it '
-            '(plans/toolcall-markup-containment-prd.md).',
+            'harness serialization leak that produced it and '
+            f'{MARKUP_RECURRENCE_ROUTING}.',
             '',
             str(record.get('raw_value') or ''),
         ])
