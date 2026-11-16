@@ -5,6 +5,7 @@ plans/review-all-s18-evals-measurement-prd.md D11.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -17,7 +18,14 @@ from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, CheckoutRootError
 from orchestrator.evals import paths
 from orchestrator.evals.prompt_opt import curator_corpus, optimizer
 from orchestrator.evals.reviewer_trial import mining, scorer
-from orchestrator.evals.reviewer_trial.corpus import GroundTruthIssue
+from orchestrator.evals.reviewer_trial.checkout import FixtureNotMaterialisable, fixture_checkout
+from orchestrator.evals.reviewer_trial.corpus import (
+    CorpusDiff,
+    CorpusManifest,
+    FixtureContext,
+    FixtureTaskRecord,
+    GroundTruthIssue,
+)
 
 
 @pytest.fixture
@@ -123,3 +131,69 @@ class TestHarnessCallsRunInTheMainCheckout:
             mock_invoke.return_value = answered(payload, cost_usd=0.2)
             await curator_corpus.propose_curator_label_frontier({'title': 't'})
         assert mock_invoke.call_args.kwargs['cwd'] == main_checkout_at
+
+
+def _corpus_diff(project: str | None, *, cwd: Path | None = None) -> CorpusDiff:
+    return CorpusDiff(
+        diff_id='fx_1', language='python', source='synthetic', diff_text='',
+        description='a fixture', ground_truth=[], project=project, cwd=cwd,
+        context=FixtureContext(
+            task=FixtureTaskRecord(title='T', description='d', test_strategy='ts'),
+            changed_files=[],
+            base_sha='0' * 40,
+        ),
+    )
+
+
+@pytest.fixture
+def manifest_path(tmp_path: Path) -> Path:
+    corpus = tmp_path / 'corpus'
+    corpus.mkdir()
+    entries = [
+        {'diff_id': f'fx_{index}', 'language': 'python', 'source': 'synthetic', 'description': 'd'}
+        | ({'project': project} if project else {})
+        for index, project in enumerate(['dark-factory', 'reify', 'reify-gui', None])
+    ]
+    path = corpus / 'manifest.json'
+    path.write_text(json.dumps({'version': '1.0', 'diffs': entries}))
+    return path
+
+
+class TestCorpusFixtureSources:
+    def test_each_project_resolves_to_its_checkout(
+        self, main_checkout_at: Path, manifest_path: Path, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(tmp_path / 'reify'))
+        sources = [diff.source_dir() for diff in CorpusManifest.load(manifest_path).diffs]
+        assert sources == [
+            main_checkout_at, tmp_path / 'reify', tmp_path / 'reify' / 'gui', main_checkout_at,
+        ]
+
+    @pytest.mark.parametrize('project', [None, 'dark-factory', 'reify'])
+    def test_an_explicit_cwd_wins(
+        self, main_checkout_at: Path, tmp_path: Path, project: str | None
+    ) -> None:
+        assert _corpus_diff(project, cwd=tmp_path / 'x').source_dir() == tmp_path / 'x'
+
+    def test_an_unregistered_project_loads_but_has_no_source(
+        self, main_checkout_at: Path, manifest_path: Path
+    ) -> None:
+        diffs = CorpusManifest.load(manifest_path).diffs
+        assert [diff.cwd for diff in diffs] == [None, None, None, None]
+        reify = next(diff for diff in diffs if diff.project == 'reify')
+        with pytest.raises(paths.ProjectCheckoutNotFound):
+            reify.source_dir()
+
+    @pytest.mark.asyncio
+    async def test_an_unregistered_project_is_not_materialised_in_this_repository(
+        self, main_checkout_at: Path, tmp_path: Path
+    ) -> None:
+        scratch = tmp_path / 'scratch'
+        scratch.mkdir()
+        with pytest.raises(FixtureNotMaterialisable) as caught:
+            async with fixture_checkout(_corpus_diff('reify'), scratch_parent=scratch):
+                pass
+        assert KNOWN_PROJECT_ROOTS_ENV in caught.value.reason
+        assert 'reify' in caught.value.reason
+        assert list(scratch.iterdir()) == []
