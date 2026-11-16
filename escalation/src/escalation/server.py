@@ -1066,8 +1066,11 @@ def _markup_residue_prose(record: dict[str, Any]) -> str:
     produces both.  ``MARKUP_UNREPAIRABLE_ERROR_TYPE`` means the call was
     REFUSED — nothing was written, and the caller was told, so a human may
     reasonably wait for it to resend.  ``MARKUP_UNRECOVERED_PARAM_ERROR_TYPE``
-    means the call was FORWARDED and LANDED without the parameter, and nobody
-    was told: no retry is coming, and the stored record is already wrong.  One
+    means the call was FORWARDED without the parameter, and nobody was told: no
+    retry is coming.  This record is filed BEFORE the forwarded call runs
+    (``shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware._handle_markup``
+    preserves the slice, then forwards), so it cannot say whether the call
+    succeeded — only that, if it did, what it stored lacks the value.  One
     hardcoded "the call was refused" sentence renders the second kind a record
     that contradicts its own summary three lines above, and the false half is
     the half that changes what an operator does.
@@ -1094,13 +1097,14 @@ def _markup_residue_prose(record: dict[str, Any]) -> str:
         )
     if error_type == MARKUP_UNRECOVERED_PARAM_ERROR_TYPE:
         return (
-            'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER, and it LANDED. The '
-            'value below was recovered from the leak but could not be typed '
-            'against the parameter\'s declared schema, so it was dropped from '
-            'the call rather than passed through untyped. The caller was NOT '
-            'told — nobody is waiting on a retry, and the record that call '
-            'filed is already stored missing this field. The payload below is '
-            'the only surviving copy of it.'
+            'THE CALL WAS FORWARDED WITHOUT THIS PARAMETER. The value below '
+            'was recovered from the leak but could not be typed against the '
+            'parameter\'s declared schema, so it was dropped from the call '
+            'rather than passed through untyped. This record was filed BEFORE '
+            'the call ran, so whether the call then succeeded is not known '
+            'here; if it did, whatever it stored is missing this field. The '
+            'caller was NOT told the value was dropped, so do not wait on a '
+            'resend of it. The payload below is the only surviving copy of it.'
         )
     logger.warning(
         'markup guard: filing an unrecognised residue kind %r — the middleware '
