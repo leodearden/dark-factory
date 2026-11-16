@@ -3806,7 +3806,8 @@ class MeasurementError(RuntimeError):
     """A query returned nothing measurable, so nothing was measured.
 
     ``Mem0Backend`` reads propagate a read timeout
-    (``backends/mem0_client.py::Mem0Backend._timed`` raises ``TimeoutError``),
+    (``backends/mem0_client.py::Mem0Backend._timed_read`` raises
+    ``TimeoutError`` through ``backends/timeout_budget.py::await_within``),
     so a timeout never reaches here as an empty reply.  An empty response is
     still a reply that measured nothing, and this module's own rule ("an
     empty hits list with a real expectation IS a measured zero") would score
@@ -4103,13 +4104,14 @@ async def fetch_arm(
         MeasurementError: _test_e2_bakeoff_e2_bakeoff_c_peers_main returned no
         results for a 10-limit query
 
-    That abort is kept here as history.  At the time ``Mem0Client.search``
+    That abort is kept here as history.  At the time ``Mem0Backend.search``
     swallowed its read timeout and returned ``{}``, and the hypothesis was
     that eight concurrent searches queued behind each other in mem0's client
     and exceeded ``config.queue.backend_read_timeout_seconds``.  Since task
-    5265 the read timeout raises (``Mem0Backend._timed`` raises
-    ``TimeoutError``) instead of returning ``{}``, so the same overload would
-    now abort loudly with a ``TimeoutError`` rather than as an empty ranking.
+    5265 the read timeout raises (``Mem0Backend._timed_read`` raises
+    ``TimeoutError`` via ``await_within``) instead of returning ``{}``, so
+    the same overload would now abort loudly with a ``TimeoutError`` rather
+    than as an empty ranking.
     The serial bound stays until someone re-measures the concurrent read path;
     this script's whole posture is that an empty ranking must never be
     published as a measured zero.  The write side keeps its bound because
