@@ -6,12 +6,18 @@ plans/review-all-s18-evals-measurement-prd.md D11.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import shared.project_layout
+from _eval_refusal import answered
 from shared.project_layout import KNOWN_PROJECT_ROOTS_ENV, CheckoutRootError
 
 from orchestrator.evals import paths
+from orchestrator.evals.prompt_opt import curator_corpus, optimizer
+from orchestrator.evals.reviewer_trial import mining, scorer
+from orchestrator.evals.reviewer_trial.corpus import GroundTruthIssue
 
 
 @pytest.fixture
@@ -69,3 +75,51 @@ class TestEvalPaths:
         message = str(caught.value)
         for fragment in ('reify', 'dark_factory', KNOWN_PROJECT_ROOTS_ENV, str(tmp_path / 'other')):
             assert fragment in message
+
+
+class TestHarnessCallsRunInTheMainCheckout:
+    @pytest.mark.asyncio
+    async def test_the_heuristics_optimizer(self, main_checkout_at: Path) -> None:
+        calls: list[dict] = []
+
+        async def fake(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(structured_output=None, output='x')
+
+        await optimizer.propose_heuristics_edit(
+            'h', [], [], max_edits=1, optimizer_model='m', invoke_fn=fake
+        )
+        assert [call['cwd'] for call in calls] == [main_checkout_at]
+
+    @pytest.mark.asyncio
+    async def test_the_issue_matcher(self, main_checkout_at: Path) -> None:
+        ground_truth = GroundTruthIssue(
+            id='gt1', location='a.py:1', category='bug', severity='blocking',
+            description='A bug', mutation_type='logic',
+        )
+        with patch('orchestrator.evals.reviewer_trial.scorer.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = answered({'matches': []}, cost_usd=0.1)
+            await scorer.match_issues(
+                reviewer_issues=[{'location': 'a.py:1', 'category': 'bug', 'description': 'x'}],
+                ground_truth=[ground_truth],
+                diff_text='diff',
+            )
+        assert mock_invoke.call_args.kwargs['cwd'] == main_checkout_at
+
+    @pytest.mark.asyncio
+    async def test_the_frontier_label_proposer(self, main_checkout_at: Path) -> None:
+        with patch('orchestrator.evals.reviewer_trial.mining.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = answered({'issues': []}, cost_usd=0.15)
+            await mining.propose_labels_frontier('diff text', model='opus', description='d')
+        assert mock_invoke.call_args.kwargs['cwd'] == main_checkout_at
+
+    @pytest.mark.asyncio
+    async def test_the_curator_label_proposer_ignores_the_old_env_var(
+        self, main_checkout_at: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv('CURATOR_REPO_ROOT', str(tmp_path / 'decoy'))
+        payload = {'action': 'create', 'justification': 'new work'}
+        with patch('orchestrator.agents.invoke.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            mock_invoke.return_value = answered(payload, cost_usd=0.2)
+            await curator_corpus.propose_curator_label_frontier({'title': 't'})
+        assert mock_invoke.call_args.kwargs['cwd'] == main_checkout_at
