@@ -34,7 +34,11 @@ class ProjectCheckoutNotFound(CheckoutRootError):
 
 
 def main_checkout() -> Path:
-    """The main checkout of this repository; raises CheckoutRootError when none can be derived."""
+    """The eval package's name for shared.project_layout.default_project_root.
+
+    Raises CheckoutRootError when none can be derived. Eval CLI flag defaults reach the
+    same root through orchestrator/src/orchestrator/main_checkout_defaults.py::cli_default.
+    """
     return default_project_root()
 
 
@@ -46,6 +50,13 @@ def project_checkout(project_id: str, environ: Mapping[str, str] = os.environ) -
         return main
     roots = known_project_roots(environ)
     for root in roots:
-        if project_id_for_root(root) == wanted:
+        if _registered_project_id(root) == wanted:
             return root
     raise ProjectCheckoutNotFound(wanted, main, roots)
+
+
+def _registered_project_id(root: Path) -> str | None:
+    try:
+        return project_id_for_root(root)
+    except ValueError:
+        return None

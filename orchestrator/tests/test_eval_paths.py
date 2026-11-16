@@ -6,6 +6,8 @@ plans/review-all-s18-evals-measurement-prd.md D11.
 from __future__ import annotations
 
 import json
+import logging
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -35,6 +37,8 @@ from orchestrator.evals.reviewer_trial.corpus import (
     FixtureTaskRecord,
     GroundTruthIssue,
 )
+from orchestrator.evals.reviewer_trial.runner import run_trial
+from orchestrator.evals.reviewer_trial.variants import ReviewerSpec, VariantConfig
 
 
 @pytest.fixture
@@ -74,6 +78,20 @@ class TestEvalPaths:
     def test_an_explicit_environ_is_honoured(self, main_checkout_at: Path, tmp_path: Path) -> None:
         environ = {KNOWN_PROJECT_ROOTS_ENV: str(tmp_path / 'reify')}
         assert paths.project_checkout('reify', environ=environ) == tmp_path / 'reify'
+
+    @pytest.mark.parametrize('nameless', ['/', '/srv/..'])
+    def test_a_registered_root_with_no_project_id_is_passed_over(
+        self, main_checkout_at: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nameless: str
+    ) -> None:
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, f'{nameless},{tmp_path / "reify"}')
+        assert paths.project_checkout('reify') == tmp_path / 'reify'
+
+    def test_a_registry_of_nameless_roots_finds_no_checkout(
+        self, main_checkout_at: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, '/')
+        with pytest.raises(paths.ProjectCheckoutNotFound):
+            paths.project_checkout('reify')
 
     def test_an_unregistered_project_reports_an_empty_registry(self, main_checkout_at: Path) -> None:
         with pytest.raises(paths.ProjectCheckoutNotFound) as caught:
@@ -206,6 +224,33 @@ class TestCorpusFixtureSources:
         assert KNOWN_PROJECT_ROOTS_ENV in caught.value.reason
         assert 'reify' in caught.value.reason
         assert list(scratch.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_a_trial_names_its_sourceless_fixtures_before_any_panel_runs(
+        self, main_checkout_at: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        diffs = [
+            replace(_corpus_diff(project), diff_id=f'fx_{index}')
+            for index, project in enumerate(['reify', 'reify-gui', 'reify'])
+        ] + [replace(_corpus_diff(None, cwd=tmp_path / 'absent'), diff_id='fx_here')]
+        variant = VariantConfig(
+            name='v', description='d', reviewers=[ReviewerSpec(name='r', model='sonnet', specialization='s')],
+        )
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.evals.reviewer_trial.runner'),
+            patch('orchestrator.evals.reviewer_trial.runner.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+        ):
+            results = await run_trial(
+                [variant], CorpusManifest(diffs=diffs), results_dir=tmp_path / 'results', stagger_secs=0,
+            )
+
+        assert results == []
+        mock_invoke.assert_not_called()
+        summary = caplog.records[0].getMessage()
+        for fragment in ('3 of 4 fixtures', 'reify (2)', 'reify-gui (1)', KNOWN_PROJECT_ROOTS_ENV):
+            assert fragment in summary, summary
+        assert 'fx_here' not in summary and 'absent' not in summary, summary
 
 
 class TestCliDefaultsResolveUnderTheMainCheckout:

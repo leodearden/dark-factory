@@ -19,12 +19,14 @@ import os
 import sys
 import tempfile
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
 from shared.cli_invoke import invoke_with_cap_retry
+from shared.project_layout import CheckoutRootError
 from shared.safe_io import atomic_write_text
 from shared.usage_gate import UsageGate
 
@@ -580,13 +582,15 @@ async def run_trial(
     Reused legacy panels are counted in one warning.
 
     Raises FixtureEnrichmentMissing, before any reviewer runs, when a
-    context-complete variant meets a fixture with no ``context``. A pair whose
-    fixture cannot be materialised is logged and yields no result.
+    context-complete variant meets a fixture with no ``context``. Fixtures with
+    no resolvable source checkout are named in one warning before any reviewer
+    runs. A pair whose fixture cannot be materialised is logged and yields no result.
     """
     if any(variant.briefing is ReviewBriefing.CONTEXT_COMPLETE for variant in variants):
         unenriched = [diff.diff_id for diff in corpus.diffs if diff.context is None]
         if unenriched:
             raise FixtureEnrichmentMissing(unenriched)
+    _warn_of_sourceless_fixtures(corpus.diffs)
 
     semaphore = asyncio.Semaphore(max_parallel_panels)
     all_results: list[PanelRunResult] = []
@@ -627,6 +631,25 @@ async def run_trial(
             legacy, results_dir or _RESULTS_DIR,
         )
     return all_results
+
+
+def _warn_of_sourceless_fixtures(diffs: Sequence[CorpusDiff]) -> None:
+    projects_by_reason: dict[str, Counter[str]] = {}
+    for diff in diffs:
+        try:
+            diff.source_dir()
+        except CheckoutRootError as exc:
+            projects_by_reason.setdefault(str(exc), Counter())[diff.project or 'this repository'] += 1
+    if not projects_by_reason:
+        return
+    groups = '; '.join(
+        f'{", ".join(f"{project} ({count})" for project, count in sorted(projects.items()))}: {reason}'
+        for reason, projects in projects_by_reason.items()
+    )
+    logger.warning(
+        '%d of %d fixtures have no source checkout, so each is skipped unless its panel is already cached: %s',
+        sum(projects.total() for projects in projects_by_reason.values()), len(diffs), groups,
+    )
 
 
 async def run_and_score(
