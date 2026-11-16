@@ -1374,6 +1374,78 @@ test('tab_tasks.jsx::TaskDetail draws no Module locks section for a task holding
   assert.equal(moduleLocksSection(detail), null, 'a measured project with no locks draws no Module locks section');
 });
 
+// ── The scheduler drawer's lock holders (scheduler_drawer.jsx::HolderEtas) ──
+
+const DRAWER_TASK = schedulerLockRow({ project: PROJECT, taskId: '2', lockSet: ['OPERATIONS.md'] });
+const NO_LOCK_HELD_AGAINST = 'No lock this task needs is held to its limit by other tasks.';
+
+// The drawer's 'Lock holders' section, as SchedulerDrawer renders it for
+// DRAWER_TASK over `module`; null when the drawer draws no such section.
+function drawerLockHolders(harness, module) {
+  const { container } = harness.mount(harness.window.DF_SCHED_DRAWER.SchedulerDrawer, {
+    task: DRAWER_TASK,
+    modules: [module],
+    eventsForTask: null,
+    allRows: [DRAWER_TASK],
+    onClose() {},
+    onSubmitOverride() {},
+  });
+  return [...container.querySelectorAll('.sched-drawer-section')].find(
+    section => section.querySelector('.sched-drawer-section-lbl')?.textContent === 'Lock holders',
+  ) ?? null;
+}
+
+function heldByLines(section) {
+  return [...section.querySelectorAll('div')].filter(div => div.textContent.startsWith('held by'));
+}
+
+const DRAWER_UNBLOCKED_CASES = [
+  {
+    name: 'a key another task holds below its holder limit',
+    module: () => schedulerModule({
+      project: PROJECT, path: 'OPERATIONS.md', holder: '1', holderProject: PROJECT, holders: ['1'], atHolderLimit: false,
+    }),
+  },
+  {
+    name: 'a full key the task itself co-holds',
+    module: () => schedulerModule({
+      project: PROJECT, path: 'OPERATIONS.md', holder: '1', holderProject: PROJECT, holders: ['1', '2'], atHolderLimit: true,
+    }),
+  },
+];
+
+for (const { name, module: buildModule } of DRAWER_UNBLOCKED_CASES) {
+  test(`scheduler_drawer.jsx::SchedulerDrawer never says another task holds ${name} against the task`, t => {
+    const harness = openWindow(t);
+    const module = buildModule();
+    assert.equal(harness.window.DF_SCHED_UTILS.lockHeldAgainst(module, DRAWER_TASK.task_id, PROJECT), false,
+      'lockHeldAgainst reads this module as held against the task, so this fixture tests nothing');
+
+    const section = drawerLockHolders(harness, module);
+    assert.ok(section, "the drawer draws no 'Lock holders' section");
+    assert.deepEqual(heldByLines(section), [], 'the drawer names a holder for a lock that does not block the task');
+    assert.ok(!section.textContent.includes('held by another task'),
+      `the drawer claims the lock is held by another task: ${section.textContent}`);
+    assert.ok(section.textContent.includes(NO_LOCK_HELD_AGAINST), `the drawer does not say why no holder is listed: ${section.textContent}`);
+  });
+}
+
+test('scheduler_drawer.jsx::SchedulerDrawer names the holders of a full key held against the task, and no empty state', t => {
+  const harness = openWindow(t);
+  const module = schedulerModule({
+    project: PROJECT, path: 'OPERATIONS.md', holder: '1', holderProject: PROJECT, holders: ['1'], atHolderLimit: true,
+  });
+  assert.equal(harness.window.DF_SCHED_UTILS.lockHeldAgainst(module, DRAWER_TASK.task_id, PROJECT), true,
+    'lockHeldAgainst does not read this module as held against the task, so this fixture tests nothing');
+
+  const section = drawerLockHolders(harness, module);
+  assert.ok(section, "the drawer draws no 'Lock holders' section");
+  const lines = heldByLines(section);
+  assert.equal(lines.length, 1, 'the drawer must draw one held-by line for the one blocking module');
+  assert.ok(lines[0].textContent.includes('T-1'), `the held-by line does not name T-1: ${lines[0].textContent}`);
+  assert.ok(!section.textContent.includes(NO_LOCK_HELD_AGAINST), 'the drawer draws its empty state beside a blocking holder');
+});
+
 // ── The memory-eval section (tab_memory_evals.jsx::MemoryEvalsSection) ──
 
 const MEMORY_EVAL_ID = 'e1-retrieval-health';
