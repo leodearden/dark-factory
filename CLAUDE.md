@@ -369,7 +369,7 @@ the task-author pin is in `docs/task-authoring.md`.
 ## Session Lifecycle
 
 ### Starting a session
-1. Build the context briefing in `/memory` → "Context Briefing" (`.claude/commands/memory.md`). Its query phrasing has one home, `shared/src/shared/briefing_queries.py`; this file does not restate it. There is no project-overview search: for orientation read the documents that section's last paragraph names.
+1. Build the context briefing in `/memory` → "Context Briefing" (`.claude/commands/memory.md`). Its query phrasing has one home, `shared/src/shared/briefing_queries.py`; this file does not restate it. There is no project-overview search: for orientation read the documents that section's "Two queries are absent on purpose" paragraph names.
 2. Read task state narrowly, as item 3 of that section says. Never call `get_tasks` without `statuses` and `fields`.
 3. If working on a specific task, read it with `get_task` — and if it carries
    `memory_hints`, execute the hint queries. This works in an **interactive** session;
