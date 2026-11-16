@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import pytest
-from fused_memory.middleware.recall_annotation import (
-    Binding,
-    BoundTask,
-    TaskBindings,
-    bind_tasks,
-)
 from orchestrator.completion_record import completion_record_metadata
 
 from fused_memory.memory_metadata import (
     ORCHESTRATOR_COMPLETION_SOURCE,
     TARGETED_RECONCILIATION_SOURCE,
+)
+from fused_memory.middleware.recall_annotation import (
+    MAX_RESULTS_SCANNED,
+    MAX_TASKS,
+    Binding,
+    BoundTask,
+    TaskBindings,
+    bind_tasks,
 )
 from fused_memory.middleware.task_facts import TaskRef
 from fused_memory.models.enums import SourceStore
@@ -147,3 +149,79 @@ class TestPurity:
         first = _bind(results)
         assert results == before
         assert _bind(results) == first
+
+
+class TestBounds:
+    def test_b7_many_tasks_keep_the_late_structural_hits_and_count_the_rest(self):
+        notes = [_note(f'n{i}', f'task {1000 + i} is open') for i in range(50)]
+        edges = [_edge(f'e{i}', 'a fact', [f'Task {2000 + i}']) for i in range(10)]
+        bindings = _bind([*notes, *edges])
+        assert len(bindings.tasks) == MAX_TASKS
+        assert bindings.omitted_tasks == 20
+        assert _refs(bindings) == [
+            *(_local(str(2000 + i)) for i in range(10)),
+            *(_local(str(1000 + i)) for i in range(30)),
+        ]
+        assert [bound.binding for bound in bindings.tasks] == (
+            [Binding.STRUCTURAL] * 10 + [Binding.MENTIONED] * 30
+        )
+
+    def test_results_beyond_the_scan_cap_are_counted(self):
+        bindings = _bind([_note(f'n{i}', 'nothing here') for i in range(MAX_RESULTS_SCANNED + 5)])
+        assert bindings.results_not_scanned == 5
+
+    def test_a_task_named_only_beyond_the_scan_cap_is_absent_and_not_omitted(self):
+        results = [_note(f'n{i}', 'nothing here') for i in range(MAX_RESULTS_SCANNED)]
+        results += [
+            _note('late-note', 'task 7 is open'),
+            _edge('late-edge', 'a fact', ['Task 8']),
+            _note('late-record', 'Merged.', completion_record_metadata('9')),
+        ]
+        bindings = _bind(results)
+        assert bindings.tasks == ()
+        assert bindings.omitted_tasks == 0
+        assert bindings.results_not_scanned == 3
+
+    @pytest.mark.parametrize('count', [0, 1, MAX_RESULTS_SCANNED])
+    def test_at_or_under_the_scan_cap_nothing_is_unscanned(self, count):
+        bindings = _bind([_note(f'n{i}', 'task 5') for i in range(count)])
+        assert bindings.results_not_scanned == 0
+
+
+def _mentioned(task_id: str) -> BoundTask:
+    return BoundTask(_local(task_id), Binding.MENTIONED, ('n1',))
+
+
+def _bindings(tasks, *, omitted_tasks=0, results_not_scanned=0, ambiguous=()) -> TaskBindings:
+    return TaskBindings(
+        tasks=tuple(tasks), ambiguous=ambiguous,
+        omitted_tasks=omitted_tasks, results_not_scanned=results_not_scanned,
+    )
+
+
+class TestInvariants:
+    def test_more_than_max_tasks_is_refused(self):
+        with pytest.raises(ValueError, match=rf'MAX_TASKS.*{MAX_TASKS + 1}'):
+            _bindings(_mentioned(str(i)) for i in range(MAX_TASKS + 1))
+
+    @pytest.mark.parametrize('field', ['omitted_tasks', 'results_not_scanned'])
+    def test_a_negative_count_is_refused(self, field):
+        with pytest.raises(ValueError, match=rf'{field}.*-1'):
+            _bindings([], **{field: -1})
+
+    def test_omitted_tasks_needs_a_full_task_list(self):
+        with pytest.raises(ValueError, match=r'omitted_tasks.*3'):
+            _bindings([_mentioned('1')], omitted_tasks=3)
+
+    def test_a_duplicate_ref_is_refused(self):
+        with pytest.raises(ValueError, match=r"once.*task_id='1'"):
+            _bindings([_mentioned('1'), _mentioned('1')])
+
+    def test_a_mentioned_entry_before_a_structural_one_is_refused(self):
+        structural = BoundTask(_local('2'), Binding.STRUCTURAL, ('e1',))
+        with pytest.raises(ValueError, match=r'STRUCTURAL.*before.*MENTIONED'):
+            _bindings([_mentioned('1'), structural])
+
+    def test_a_bound_task_needs_a_result(self):
+        with pytest.raises(ValueError, match=r'result_ids.*\(\)'):
+            BoundTask(_local('1'), Binding.MENTIONED, ())
