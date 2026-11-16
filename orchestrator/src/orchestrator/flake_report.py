@@ -958,6 +958,11 @@ def build_report(
 OwnerStatusReader = Callable[[list[str]], Awaitable[tuple[Mapping[str, str], Exception | None]]]
 
 
+def _owner_ids(report: FlakeLedgerReport) -> list[str]:
+    """The open rows' distinct owner ids, sorted: what one owner read asks about."""
+    return sorted({row.debt.owner_task_id for row in report.open_debt if row.debt.owner_task_id})
+
+
 async def _read_owner_statuses(
     read_statuses: OwnerStatusReader, ids: list[str], budget_secs: float,
 ) -> OwnerStatuses | OwnerReadFailed:
@@ -990,7 +995,7 @@ async def corroborate_owners(
     """
     if not report.measured:
         return report
-    ids = sorted({row.debt.owner_task_id for row in report.open_debt if row.debt.owner_task_id})
+    ids = _owner_ids(report)
     read = await _read_owner_statuses(read_statuses, ids, budget_secs) if ids else OwnerStatuses({})
     return replace(
         report,
@@ -1027,6 +1032,62 @@ def _due_line(report: FlakeLedgerReport) -> str:
 
 
 _NEVER_WRITTEN = 'no rows ever written from this call site'
+
+_OWNER_LIVENESS_SUFFIX: Mapping[OwnerLiveness, str] = MappingProxyType({
+    OwnerLiveness.DONE: ' *** OWNER DONE, DEBT CYCLE NOT CLOSED (invariant breach) ***',
+    OwnerLiveness.CLOSED: ' *** OWNER CANCELLED OR GONE (invariant breach) ***',
+    OwnerLiveness.DEFERRED: ' (deferred: filed, never released)',
+    OwnerLiveness.OPEN: '',
+})
+
+_STORED_POINTERS = 'the owners above are stored pointers, not live statuses'
+
+
+def _owner_cell(row: DebtReportRow, owner_read: OwnerStatuses | OwnerReadFailed | None) -> str:
+    """*row*'s owner cell.  A §5.9 breach renders loudly, never as a blank cell:
+    suppression LANDS the merge (§5.7), so a test with no live owner is silently no
+    longer blocking anything and nobody owns fixing it.  An item on the due list means
+    the drain has not filed the owner YET, which is expected, not a breach.  Only a
+    successful live read marks an owned row; a stored owner alone proves nothing."""
+    d = row.debt
+    if not d.owner_task_id:
+        if row.pending_since is not None:
+            return f'filing pending since {row.pending_since}'
+        return '*** NO OWNER (invariant breach) ***'
+    suffix = (
+        _OWNER_LIVENESS_SUFFIX[owner_read.liveness(d.owner_task_id)]
+        if isinstance(owner_read, OwnerStatuses) else ''
+    )
+    return f'owner={d.owner_task_id}{suffix}'
+
+
+def _count_or_na(count: int | None) -> str:
+    return 'n/a' if count is None else str(count)
+
+
+def _owner_liveness_lines(report: FlakeLedgerReport) -> list[str]:
+    """A WARNING per kind of dead owner, then the one line saying whether the owners were
+    read live, could not be read, or were not consulted."""
+    nc = report.non_convergence
+    lines: list[str] = []
+    if nc.owner_done_tests:
+        lines.append(
+            f'      WARNING: {nc.owner_done_tests} row(s) are owned by a DONE de-flake task '
+            'whose debt cycle never closed, so no live task owns them (a §5.9 breach)'
+        )
+    if nc.owner_closed_tests:
+        lines.append(
+            f'      WARNING: {nc.owner_closed_tests} row(s) are owned by a cancelled or '
+            'deleted task, so no live task owns them (a §5.9 breach)'
+        )
+    match report.owner_read:
+        case OwnerStatuses():
+            lines.append(f'      owner liveness: read live ({len(_owner_ids(report))} owner(s))')
+        case OwnerReadFailed(error=error):
+            lines.append(f'      owner liveness: READ FAILED ({error}) — {_STORED_POINTERS}')
+        case None:
+            lines.append(f'      owner liveness: not consulted — {_STORED_POINTERS}')
+    return lines
 
 
 def _gate_blind_lines(gb: GateBlindCounter, *, measured: bool) -> list[str]:
@@ -1133,18 +1194,7 @@ def render_report(report: FlakeLedgerReport) -> str:
         lines.append('  (no open debt)')
     for row in report.open_debt:
         d = row.debt
-        # A blank owner cell would render a §5.9 breach as MISSING DATA.  It is instead
-        # the single most consequential state this report can encounter: suppression
-        # LANDS the merge (§5.7), so an unowned debt row means a flaky test is silently
-        # no longer blocking anything and nobody owns fixing it.  Naming it loudly is a
-        # READ of the ledger — ι files nothing.  An item on the due list for the test
-        # means the drain has not filed the owner YET, which is expected, not a breach.
-        if d.owner_task_id:
-            owner = f'owner={d.owner_task_id}'
-        elif row.pending_since is not None:
-            owner = f'filing pending since {row.pending_since}'
-        else:
-            owner = '*** NO OWNER (invariant breach) ***'
+        owner = _owner_cell(row, report.owner_read)
         # Same predicate the `over_age=N` summary below counts with — never a second
         # spelling of the comparison (INV-5).
         over = ' OVER-AGE' if _is_over_age(row.age, nc.age_threshold_days) else ''
@@ -1187,6 +1237,8 @@ def render_report(report: FlakeLedgerReport) -> str:
     lines.append(
         f'      open={nc.open_tests}  recurrent={nc.recurrent_tests}  '
         f'over_age={nc.over_age_tests}  unowned={nc.unowned_tests}  '
+        f'owner_done={_count_or_na(nc.owner_done_tests)}  '
+        f'owner_closed={_count_or_na(nc.owner_closed_tests)}  '
         f'oldest={format_age(nc.oldest_age)}'
     )
     if nc.unparseable_opened_at:
@@ -1201,5 +1253,6 @@ def render_report(report: FlakeLedgerReport) -> str:
             f'      WARNING: {nc.future_dated} row(s) are FUTURE-DATED (opened_at is '
             'ahead of now — clock skew) and can never reach the age backstop'
         )
+    lines += _owner_liveness_lines(report)
 
     return '\n'.join(lines)
