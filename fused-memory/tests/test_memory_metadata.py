@@ -14,12 +14,18 @@ from pathlib import Path
 import pytest
 from _fm_helpers import load_script_module
 
+from orchestrator.completion_record import completion_record_metadata
+
 from fused_memory.config.schema import _default_topic_guard_clusters
 from fused_memory.memory_metadata import (
     KIND_REGISTRY,
+    ORCHESTRATOR_COMPLETION_SOURCE,
+    TARGETED_RECONCILIATION_SOURCE,
     TOPIC_SLUG_MAX_LEN,
     TOPIC_SLUG_RE,
     MemoryMetadataValidationError,
+    is_completion_record,
+    is_orchestrator_completion_record,
     normalize_supersedes,
 )
 
@@ -1283,3 +1289,55 @@ class TestCanonicalRoutingRule:
     # code.  A dedicated test would pin call shape rather than behaviour and
     # add nothing the siblings do not already catch.  The reason it is sync
     # while `_check_canonical_uniqueness` is async is in its docstring.
+
+
+class TestCompletionRecordRegistry:
+    """``is_completion_record`` answers: is this record ABOUT its metadata.task_id?"""
+
+    ORCHESTRATOR_RECORD = completion_record_metadata('4102')
+    LEGACY_ORCHESTRATOR_RECORD = {'task_id': '4102', 'source': ORCHESTRATOR_COMPLETION_SOURCE}
+    RECONCILIATION_ECHO = {
+        'source': TARGETED_RECONCILIATION_SOURCE, 'task_id': '5', 'transition': 'done',
+    }
+
+    @pytest.mark.parametrize(
+        'meta',
+        [ORCHESTRATOR_RECORD, LEGACY_ORCHESTRATOR_RECORD, RECONCILIATION_ECHO],
+        ids=['orchestrator', 'legacy-unkinded-orchestrator', 'reconciliation-echo'],
+    )
+    def test_a_registered_completion_record_counts(self, meta):
+        assert is_completion_record(meta) is True
+
+    @pytest.mark.parametrize(
+        'meta',
+        [
+            {'task_id': '5'},
+            {
+                'source': TARGETED_RECONCILIATION_SOURCE, 'task_id': '5',
+                'verification_verdict': 'confirmed',
+            },
+            {'source': TARGETED_RECONCILIATION_SOURCE, 'task_id': '5', 'transition': 'blocked'},
+            {'kind': 'task_completion', 'task_id': '5'},
+            {},
+        ],
+        ids=[
+            'bare-task-id', 'verification-verdict-note', 'echo-source-not-done',
+            'agent-written-kind-only', 'empty',
+        ],
+    )
+    def test_anything_else_does_not_count(self, meta):
+        assert is_completion_record(meta) is False
+
+    @pytest.mark.parametrize(
+        ('meta', 'expected'),
+        [
+            (ORCHESTRATOR_RECORD, True),
+            (LEGACY_ORCHESTRATOR_RECORD, True),
+            (RECONCILIATION_ECHO, False),
+            ({'task_id': '5'}, False),
+            ({}, False),
+        ],
+        ids=['orchestrator', 'legacy', 'echo', 'bare-task-id', 'empty'],
+    )
+    def test_the_orchestrator_only_predicate_is_unchanged(self, meta, expected):
+        assert is_orchestrator_completion_record(meta) is expected
