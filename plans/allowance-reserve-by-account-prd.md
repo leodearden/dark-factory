@@ -1,6 +1,8 @@
 # A reserve account for urgent work: one account of the shared pool held back for high-priority tasks until shortly before its weekly reset
 
-**Status:** active. Authored 2026-11-16. Rulings by Leo on 2026-11-16 (section 3). Not yet decomposed.
+**Status:** active. Authored 2026-11-16. Rulings by Leo on 2026-11-16 (section 3). Decomposed 2026-11-16 into
+tasks 10428 to 10436 (section 8, which records the changes made at decompose); manifest
+`plans/allowance-reserve-by-account-prd.capability-manifest.md`.
 **Code anchors** verified against main `ba39519b67` (2026-11-16). Main moves fast: cite by symbol; re-locate at
 implementation time.
 **Evidence:** `plans/cross-project-weights-study-2026-11-12/`: the study report (`REPORT.md`, sections 6 to 9), the
@@ -216,7 +218,7 @@ overflow.
 | One invocation row per attempt, task 9812 | none | the `invocations` table | untouched here: served calls are recorded as account events with their cost |
 | Daily cost ceiling, task 8262 | none | — | the reserve reads no spend, so it is not a second spend rule |
 | Halt retirement, `plans/scheduler-pause-halt-retirement-prd.md`, task 5313 | none | "a halt is permissible only for a pause class whose predicate remains durably re-testable" | the dispatch hold is recomputed every tick from the clock and the gate, and stores nothing |
-| Per-consumer CPU and memory recording (PRD being written in a separate session, 2026-11-16) | none | none | — |
+| Per-consumer CPU and memory recording, `plans/per-consumer-resource-recording-prd.md` (another session, 2026-11-16) | file contention only | both edit `cli_invoke.py`, and both add event types to `orchestrator/src/orchestrator/event_store.py::EventType`; no semantic seam | that PRD's leaf 7a follows this PRD's task 1b (10429); that PRD's decompose wires the edge |
 | Max-b and max-h stay listed, ruling 2026-10-06 (task 5944) | config | max-h's entry | max-h stays listed and stays last in the file. Selection tries it first only in its release window (R3). The file's header comment, which still says both are switched off, is corrected in task 6 |
 | Interactive proxy (`cliproxyapi.service`) | none (R4) | max-h is last in its order | no change. The report counts its requests to max-h |
 
@@ -363,10 +365,15 @@ Three consumers:
   choosing the task already settled inside the scheduler: its fairness skip count and parks, its starvation
   anchor, and the dispatch stamp. That is accepted for the task or two per dry spell it affects.
 - **Reconciliation** (D13). It asks for background work at both places a cycle drains events (the project loop
-  and the backlog chunk runner). Refused, it starts no cycle, writes no run row, and logs the deferral at most
+  and the backlog chunk runner). The backlog runner drains twice: per chunk and in its final consolidation, so a
+  refusal between chunks ends the iteration as the budget yield does, with the final consolidation skipped.
+  Refused, it starts no cycle, writes no run row, and logs the deferral at most
   once every ten minutes, because its loop comes round every few seconds while events are buffered. A judge that
   falls due while refused keeps its pending marker and is fired by the existing pending-judge recovery pass, which
-  reconciliation now also runs when a refusal ends, not only at start-up. A reconciliation process finds out about
+  reconciliation now also runs when a refusal ends, not only at start-up. That pass was written for start-up, when
+  no judge is in flight; a judge's marker is written before its task starts and cleared only when its verdict
+  commits, so run later the pass skips every run whose judge task is still in flight, or it would start a second
+  judge for the same run. A reconciliation process finds out about
   caps only through its own calls, so the first cycle of a dry spell is not refused and ends as it does today, as
   a deferred run after its 30-minute bound.
 
@@ -402,7 +409,8 @@ By the gate, in the caller's own `account_events` table, through its single even
 | `reserve_account_unavailable` | the reserve account fails authentication | `account` |
 
 The gate gains a method by which a store is attached, and writes `reserve_config` there. The orchestrator calls it
-in place of writing the gate's private attribute.
+in place of writing the gate's private attribute. The memory service's curator gate, which is given its store in
+its constructor today, attaches it through the same method, so the curator store gets its row.
 
 By the orchestrator, in its event store: `dispatch_reserve_hold` (section 6.4) and `reserve_slot_wait`
 (section 6.5).
@@ -484,45 +492,59 @@ Caller side (`orchestrator/`, `fused-memory/`, `scripts/`):
 
 ## 8. Decomposition plan
 
-Eight tasks.
+Nine tasks, filed 2026-11-16 as 10428 to 10436. The PRD's task 1 was split at decompose (1a and 1b); the other
+changes made then are marked *At decompose*.
 
-1. **Gate: the reserve rule, selection, wait, query and events** (`shared/`).
-   The new `account_reserve.py` (config model, calendar, `WorkClass`, `admits`); the `reserve:` block read by
-   `UsageCapConfig._load_accounts_file`; the hook in `try_lease`; the reserve wait in `before_invoke` and its event
+1a. **The reserve rule and its config** (`shared/`), task 10428.
+   The new `account_reserve.py` (config model, calendar, `WorkClass` and its resolver, `admits`, the drift test,
+   the event names); the `reserve:` block read by `UsageCapConfig._load_accounts_file`.
+   Signal: its unit tests pass in CI; a fixture accounts file carrying section 6.2's block loads as an active
+   reserve whose release, seen from a Wednesday, is Sunday 09:00 UTC.
+   *At decompose:* split from task 1, which was over the overlay's size band (about 2,000 changed lines with the
+   B1 to B20 tests). 1a touches no file that the gate refactor chain holds.
+1b. **Gate: selection, wait, query and events** (`shared/`), task 10429. Depends on 1a.
+   The hook in `try_lease`; the reserve wait in `before_invoke` and its event
    set in `_transition`; the two `PoolFrozen` fields and the messages built from them; `reserve_refusal`,
-   `reserve_waiters` and `reserve_state`; the method that attaches a store; the six events, `reserve_served`
-   written when the slot settles; the keyword forwarded through `invoke_slot` and `invoke_with_cap_retry` only when
-   given; `shared/testing.py::make_gate_mock` accepting it.
+   `reserve_waiters` and `reserve_state`; the method that attaches a store (`attach_cost_store`); the six events,
+   `reserve_served` written when the slot settles; the keyword forwarded through `invoke_slot` and
+   `invoke_with_cap_retry` only when given; `shared/testing.py::make_gate_mock` accepting it.
    Signal: boundary rows B1 to B20 pass in CI. Unlocks tasks 2, 4 and 5. With no block in the live file, no process
    changes behaviour.
-2. **Orchestrator: a class at every call site** (`orchestrator/`). Depends on 1.
-   The classes of section 6.1 for the task roles, the dry-run unblock, the steward, the automatic watcher, the
-   review checkpoint, the module tagger and the evals; the harness attaches the gate's store through the new
-   method; the hand-written gate doubles in `orchestrator/tests/test_dry_run_unblock.py`, `test_steward.py` and
-   `test_invoke.py` accept the keyword.
+2. **Orchestrator: a class at every call site** (`orchestrator/`), task 10430. Depends on 1b.
+   The one helper that builds a task's `WorkClass`; the classes of section 6.1 for the task roles, the dry-run
+   unblock, the steward, the automatic watcher, the review checkpoint, the module tagger and the evals; the
+   harness attaches the gate's store through the new method; the hand-written gate doubles in
+   `orchestrator/tests/test_dry_run_unblock.py`, `test_steward.py` and `test_invoke.py` accept the keyword.
    Signal: rows C1 and C2 pass in CI, and the review, watcher and steward parts of C8; an orchestrator test shows a
    `reserve_config` row written at start-up from a fixture accounts file.
-3. **Orchestrator: the dispatch hold and the slot-wait signal** (`orchestrator/`). Depends on 2 (both edit
-   `harness.py`).
+   *At decompose:* the `WorkClass` helper moved here from task 3, because the task roles use it first.
+3. **Orchestrator: the dispatch hold and the slot-wait signal** (`orchestrator/`), task 10431. Depends on 2 (both
+   edit `harness.py`, and it reuses task 2's helper).
    The callable handed to the scheduler and the refusal in `Scheduler._eligible_for_dispatch`; the
    `dispatch_reserve_hold` event; the all-held tick kept out of the drained-queue branch; the second check in the
-   main loop and the put-back; the one helper that builds a task's `WorkClass`; `reserve_slot_wait` and its
+   main loop and the put-back; `reserve_slot_wait` and its
    escalation; the start-up check of tier names and its keyed escalation.
    Signal: rows C3 to C7, C4b included, pass in CI against a real `UsageGate` built from a fixture accounts file.
 4. **Memory service and nightly jobs: classes, reconciliation's deferral, messages** (`fused-memory/`,
-   `scripts/`). Depends on 1.
+   `scripts/`), task 10432. Depends on 1b.
    The curator, pack judge and path-scope adjudicator as essential; reconciliation, the census and the return-brief
-   preparer as background; reconciliation's check at both drain sites, its throttled deferral log and the
-   pending-judge pass run when a refusal ends; the census's and the preparer's frozen-pool messages name the
-   reserve.
+   preparer as background; the curator gate's store attached through the new method; reconciliation's check at
+   both drain sites, its throttled deferral log and the pending-judge pass run when a refusal ends, skipping
+   judges in flight; the census's and the preparer's frozen-pool messages name the reserve.
    Signal: the curator part of C8, and rows C9 and C10, pass in CI.
-5. **The weekly report, and the dashboard's event list** (`scripts/`, `dashboard/`). Depends on 1 for the gate's
-   event names; the two orchestrator event names are fixed by section 6.6.
+   *At decompose:* the curator store attach (section 6.6), the backlog runner's final consolidation and the
+   in-flight skip (section 6.4) were added after reading the code.
+5. **The weekly report, and the dashboard's event list** (`scripts/`, `dashboard/`), task 10433. Depends on 1b
+   and 3.
+   The report is standard-library Python, executable, so that task 7 can run it directly; it keeps a local copy of
+   the event names, checked against the shared constants and the orchestrator's `EventType` by a test.
    Signal: run against the live stores before the reserve is switched on, it prints for each of the last four weeks
    when max-h reached its limit and its recorded spend by project, and "reserve not active" for every process;
    against a fixture store carrying every event of section 6.6 it prints every section of 6.7; `--state` exits
    non-zero on a fixture with one store missing its row.
-6. **Switch it on** (`config/usage-accounts.yaml`, `OPERATIONS.md`). Depends on 2, 3 and 4.
+   *At decompose:* the edge to task 3 was added so the report's tests read rows written by the real producers of
+   both orchestrator events (design invariant `readers-prove-their-producer`).
+6. **Switch it on** (`config/usage-accounts.yaml`, `OPERATIONS.md`), task 10434. Depends on 2, 3 and 4.
    Adds the block of section 6.2 with Leo's values; corrects the file's header comment, which still says max-b and
    max-h are switched off; adds a short operator section on the reserve (what it does, how to turn it off by
    removing the block, where the report is, how to admit `pinned` once that tier exists and why that also admits
@@ -531,21 +553,29 @@ Eight tasks.
    until the next redeploy.
    Signal: loading the live file through `UsageCapConfig` yields an active reserve whose next release is a Sunday at
    09:00 UTC, shown by a one-line command in the operator section.
-7. **Check the fleet picked it up** (a dated check, no code). Depends on 5 and 6; runs a day after task 6 lands.
-   Runs the report with `--state`, `--since` the time of task 6's commit, the nine project roots and the memory
-   service's curator store. It escalates to Leo, naming the processes, if any has not reported an active reserve.
+7. **Check the fleet picked it up** (a dated check, no code), task 10435. Depends on 5 and 6; runs a day after
+   both are done (a delayed milestone).
+   Runs the report with `--state`, the nine project roots and the memory service's curator store, as a
+   deterministic predicate. It escalates to Leo, naming the processes, if any has not reported an active reserve.
    Signal: the check's output lists all nine orchestrators and the memory service's curator as active, or an
    escalation names the ones that are not.
-8. **Two-week reading** (a dated gate for Leo). Depends on 7; fires after two full weeks of the reserve running.
+   *At decompose:* `--since` is fixed at 2026-11-16T00:00Z, not task 6's commit time, which cannot be known when
+   the task is filed. That is equivalent, because no process writes a `reserve_config` row before task 6 adds the
+   block. The predicate's script does not exist until task 5 lands, and filing refuses a missing script, so the
+   task was filed as a pure gate and then switched to the predicate; task 5's check on the script's presence keeps
+   it from dispatching early.
+8. **Two-week reading** (a dated gate for Leo), task 10436. Depends on 7; fires 20 days after task 7 is done (a
+   delayed milestone). Any 21-day span contains two full reserve weeks, reset to reset, and task 7 runs a day after
+   the switch-on.
    Runs the report and sends Leo the result with a recommendation on the release hours, the admitted tiers, and
    whether lending slots (section 9) is worth a PRD of its own. For that last point it reports how often, and for
    how long, every slot in a project was held by a task waiting on the reserve, and how many of those times
    followed a restart.
    Signal: Leo receives the escalation with the two weeks' tables.
 
-At decompose time, also: make tasks 9804 and 9846 (the refactor chain) depend on task 1, with a note on each naming
-the keyword, the selection hook, the reserve wait, the settle-time event, the store-attaching method and
-`account_reserve.py`.
+At decompose time, also: tasks 9804 and 9846 (the refactor chain) were made to depend on task 1b (10429), with a
+note on each naming the keyword, the selection hook, the reserve wait, the settle-time event, the store-attaching
+method, the `PoolFrozen` fields and `account_reserve.py`.
 
 ## 9. Out of scope
 
@@ -574,17 +604,16 @@ the keyword, the selection hook, the reserve wait, the settle-time event, the st
    orchestrator already escalates an unknown config key on reload. **Suggested:** reuse that path, with a key from
    the block's content for the first and from the project and the reserve's week for the second. Decide in task 3.
 2. **The heartbeat for the reserve wait.** The per-scope wait has none (task 7243). **Suggested:** share one helper
-   with the all-capped wait. Decide in task 1.
+   with the all-capped wait. Decide in task 1b.
 3. **The put-back's exact call.** `Scheduler.release(task_id, requeued=False)` and the semaphore's release, in the
    order `SlotLease.release` uses. **Suggested:** build the lease first and release through it. Decide in task 3.
 4. **Where reconciliation's checks sit.** **Suggested:** one helper on the reconciliation harness, called in the
    project loop after the buffer says a cycle is due and before the run is marked active, in the backlog chunk
    runner before it drains, and where a judge is spawned, after its pending marker is written. Decide in task 4.
-5. **How the two dated tasks are dated.** Task 7 a day after task 6 lands; task 8 two full reserve weeks after
-   task 7 passes. **Suggested:** delayed milestones. Decide at decompose time against `docs/task-authoring.md`.
+5. **How the two dated tasks are dated.** Decided at decompose: delayed milestones (section 8, tasks 7 and 8).
 6. **Readers that describe the pool without a class** (`UsageGate.active_account_name`, `soonest_resets_at` in the
    cap-wait log line). **Suggested:** leave their meaning alone and make the log line name the reserve when the
-   wait is a reserve wait. Decide in task 1.
+   wait is a reserve wait. Decide in task 1b.
 7. **Fairness parks and pin reservations of a held task.** A held task keeps its fairness parks for the length of
    the hold, and a held pinned task loses its pin reservation. **Suggested:** leave both as they are and say so in
    the operator note. Decide in task 3.
