@@ -6,11 +6,14 @@ the public names.
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+import yaml
 
 from shared.account_reserve import (
     ActiveReserve,
@@ -26,6 +29,7 @@ from shared.account_reserve import (
     resolve_work_class,
     schedule_drift,
 )
+from shared.config_models import UsageCapConfig
 
 
 def prd_block(**overrides: object) -> dict[str, object]:
@@ -353,3 +357,97 @@ class TestParseReserve:
     def test_an_invalid_reserve_always_carries_its_reason(self, reason: str) -> None:
         with pytest.raises(ValueError, match='reason'):
             InvalidReserve(reason)
+
+
+def write_accounts_file(path: Path, **beside_accounts: object) -> str:
+    """An accounts file listing ROSTER, with any other top-level keys (``reserve=...``) beside it."""
+    accounts = [{'name': name, 'oauth_token_env': f'TOKEN_{name.upper()}'} for name in ROSTER]
+    path.write_text(yaml.safe_dump({'accounts': accounts, **beside_accounts}))
+    return str(path)
+
+
+class TestAccountsFileLoader:
+    def test_without_a_block_there_is_no_reserve_and_the_dump_is_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / 'accounts.yaml'
+        without_block = UsageCapConfig(accounts_file=write_accounts_file(path))
+        with_block = UsageCapConfig(accounts_file=write_accounts_file(path, reserve=prd_block()))
+
+        assert without_block.reserve is None
+        assert [account.name for account in without_block.accounts] == ROSTER
+        assert without_block.model_dump() == with_block.model_dump()
+
+    def test_seen_from_wednesday_the_prd_block_releases_on_sunday_morning(
+        self, tmp_path: Path
+    ) -> None:
+        config = UsageCapConfig(
+            accounts_file=write_accounts_file(tmp_path / 'accounts.yaml', reserve=prd_block())
+        )
+
+        assert isinstance(config.reserve, ActiveReserve)
+        assert config.reserve.config.release_at(utc(2026, 11, 18, 12)) == utc(2026, 11, 22, 9)
+
+    @pytest.mark.parametrize(
+        ('block', 'cause'),
+        [
+            pytest.param(prd_block(account='max-z'), 'max-z', id='unlisted-account'),
+            pytest.param(prd_block(release_hours=0), 'release_hours', id='release-hours-0'),
+            pytest.param(None, 'reserve: ', id='key-without-body'),
+        ],
+    )
+    def test_an_invalid_block_loads_as_an_invalid_reserve_with_a_warning(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        block: object,
+        cause: str,
+    ) -> None:
+        path = write_accounts_file(tmp_path / 'accounts.yaml', reserve=block)
+
+        with caplog.at_level(logging.WARNING):
+            config = UsageCapConfig(accounts_file=path)
+
+        assert isinstance(config.reserve, InvalidReserve)
+        assert cause in config.reserve.reason
+        assert [account.name for account in config.accounts] == ROSTER
+        warnings = [record.getMessage() for record in caplog.records]
+        assert len(warnings) == 1
+        assert path in warnings[0]
+        assert config.reserve.reason in warnings[0]
+
+    def test_the_reload_round_trip_reads_the_reserve_from_the_file_again(
+        self, tmp_path: Path
+    ) -> None:
+        config = UsageCapConfig(
+            accounts_file=write_accounts_file(tmp_path / 'accounts.yaml', reserve=prd_block())
+        )
+
+        reloaded = UsageCapConfig.model_validate(config.model_dump())
+
+        assert reloaded == config
+        assert reloaded.reserve == config.reserve
+
+    def test_an_inline_reserve_is_ignored(self, tmp_path: Path) -> None:
+        inline = {'account': 'max-h'}
+        without_file = UsageCapConfig.model_validate({'reserve': inline})
+        beside_a_file_without_block = UsageCapConfig.model_validate(
+            {
+                'accounts_file': write_accounts_file(tmp_path / 'accounts.yaml'),
+                'reserve': inline,
+            }
+        )
+
+        assert without_file.reserve is None
+        assert beside_a_file_without_block.reserve is None
+
+    def test_a_changed_block_is_a_changed_config(self, tmp_path: Path) -> None:
+        path = tmp_path / 'accounts.yaml'
+        first = UsageCapConfig(accounts_file=write_accounts_file(path, reserve=prd_block()))
+        unchanged = UsageCapConfig(accounts_file=write_accounts_file(path, reserve=prd_block()))
+        changed = UsageCapConfig(
+            accounts_file=write_accounts_file(path, reserve=prd_block(release_hours=24))
+        )
+
+        assert unchanged == first
+        assert changed != first
