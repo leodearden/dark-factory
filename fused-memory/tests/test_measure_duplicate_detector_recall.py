@@ -848,3 +848,59 @@ class TestCli:
         from shared.cli_boundary import LoudArgumentParser
 
         assert isinstance(_mod().build_parser(), LoudArgumentParser)
+
+
+_CALIBRATION = SCRIPTS.parent / 'calibration'
+_COMMITTED_REPORT = _CALIBRATION / 'duplicate_detector_recall_report.json'
+_COMMITTED_FIXTURE = SCRIPTS.parent / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'
+
+
+@functools.cache
+def _committed_report() -> dict:
+    return json.loads(_COMMITTED_REPORT.read_text())
+
+
+class TestTheCommittedReport:
+    """STRUCTURE only: the measured values inform task 10244's ruling and gate no build."""
+
+    def test_it_measured_the_whole_committed_fixture_with_every_arm(self):
+        report = _committed_report()
+        records = _calibrate().load_fixture(_COMMITTED_FIXTURE)
+
+        assert report['provenance']['record_count'] == len(records)
+        assert report['provenance']['fixture_path'] == 'tests/fixtures/write_triage_calibration.jsonl'
+        assert report['provenance']['arm_filter'] is None
+        assert report['setting']['scan_set'] == 'fixture_only'
+        assert report['setting']['records'] == len(records)
+
+    def test_its_pair_counts_are_the_fixtures(self):
+        records = _calibrate().load_fixture(_COMMITTED_FIXTURE)
+        expected = {
+            name: len(pairs) for name, pairs in _calibrate().build_pair_sets(records).items()
+        }
+
+        assert _committed_report()['pair_counts'] == expected
+
+    def test_every_detector_arm_has_exactly_one_row_beside_the_baseline(self):
+        report = _committed_report()
+        names = [row['arm'] for row in report['arms']]
+
+        assert sorted(names) == sorted(arm.name for arm in _mod().DETECTOR_ARMS)
+        assert len(names) == len(set(names))
+        assert report['baseline']['arm'] == _mod().BASELINE_ARM
+
+    def test_it_carries_the_pre_registered_proposal(self):
+        assert _committed_report()['gate_proposal'] == _mod().gate_proposal_json(
+            _mod().GATE_PROPOSAL,
+        )
+
+    def test_its_recall_caveat_entry_is_absent_or_schema_valid(self):
+        entry = _committed_report()['recall_caveat_entry']
+
+        if entry is not None:
+            _report_schema().AdjudicatorMeasurement.model_validate(entry)
+
+    def test_the_markdown_re_renders_from_the_json(self):
+        markdown = _COMMITTED_REPORT.with_suffix('.md').read_text()
+
+        assert _mod().render_markdown(_committed_report()) == markdown
