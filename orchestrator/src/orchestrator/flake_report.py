@@ -12,7 +12,9 @@ resolves anything, or escalates.  All ledger DATA comes from α's public READ AP
 ``read_call_sites_written``);
 the only SQL of its
 own is :func:`probe_ledger`'s single ``sqlite_master`` SELECT, which mutates strictly
-less than those readers do (no DDL, no journal-mode pragma).  One consequence is not
+less than those readers do (no DDL, no journal-mode pragma).  The only read outside the
+ledger is :func:`corroborate_owners`' caller-supplied ``get_statuses`` read of the open
+rows' owners, and it writes nothing.  One consequence is not
 obvious and is enforced by :func:`build_report`'s guards: α's readers PROVISION on read
 (``_open`` does ``parent.mkdir`` → ``connect`` → ``executescript(_SCHEMA)``), so calling
 one against a project that has no ledger would create ``data/orchestrator/runs.db`` plus
@@ -44,9 +46,10 @@ echoes it — the same split as ``eval-list-fixtures`` →
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
@@ -98,6 +101,9 @@ DEFAULT_SYSTEMIC_WINDOW_MINUTES = 60
 # design — α's module docstring, §11 Q1).  A read that fills this limit is surfaced as
 # truncated rather than silently yielding a rate over an unknown window.
 DEFAULT_OCCURRENCE_READ_LIMIT = 20000
+
+# An interactive report must not ride out fused-memory's ~120s restart retry window.
+DEFAULT_OWNER_READ_BUDGET_SECS = 15.0
 
 
 # --- ledger reachability -----------------------------------------------------
@@ -688,6 +694,8 @@ class FlakeLedgerReport:
     # Every call site that has EVER written a row; None = not read, so no
     # never-written claim is made.
     call_sites_written: frozenset[str] | None = None
+    # The live read of the open rows' owners; None means the owners were not read.
+    owner_read: OwnerStatuses | OwnerReadFailed | None = None
 
     def __post_init__(self) -> None:
         gate_blind, systemic = set(self.gate_blind_by_call_site), set(self.systemic_by_call_site)
@@ -940,6 +948,59 @@ def build_report(
         systemic_by_call_site=systemic,
         due=due,
         call_sites_written=read_call_sites_written(db_path),
+    )
+
+
+# --- live owner corroboration -----------------------------------------------
+
+# The FlakeLedgerTaskClient.get_statuses shape: a SchedulerChronicFlakeTaskClient's bound
+# get_statuses is passed as-is, so this module imports nothing from chronic_flake.
+OwnerStatusReader = Callable[[list[str]], Awaitable[tuple[Mapping[str, str], Exception | None]]]
+
+
+async def _read_owner_statuses(
+    read_statuses: OwnerStatusReader, ids: list[str], budget_secs: float,
+) -> OwnerStatuses | OwnerReadFailed:
+    """*ids*' live statuses, bounded by *budget_secs*.  A raise, a timeout, an answer that
+    is not a pair and an in-band error all land on the one failure path, as in
+    :func:`flake_ledger._read_owner`."""
+    try:
+        statuses, error = await asyncio.wait_for(read_statuses(ids), timeout=budget_secs)
+        if error is None:
+            return OwnerStatuses(statuses)
+    except TimeoutError:
+        error = TimeoutError(f'no answer within {budget_secs}s')
+    except Exception as exc:
+        error = exc
+    return OwnerReadFailed(f'{type(error).__name__}: {error}')
+
+
+async def corroborate_owners(
+    report: FlakeLedgerReport,
+    read_statuses: OwnerStatusReader,
+    *,
+    budget_secs: float = DEFAULT_OWNER_READ_BUDGET_SECS,
+) -> FlakeLedgerReport:
+    """*report* with its open rows' owners read live and its non-convergence recomputed.
+
+    READ ONLY, and never raises.  This is §5.9's second enforcement point, INV-3 on the
+    read side: a stored owner is a snapshot, so a DONE or vanished owner shows only when
+    it is read.  An unmeasured report comes back unchanged and unread.  Task θ calls this
+    with its own task client.
+    """
+    if not report.measured:
+        return report
+    ids = sorted({row.debt.owner_task_id for row in report.open_debt if row.debt.owner_task_id})
+    read = await _read_owner_statuses(read_statuses, ids, budget_secs) if ids else OwnerStatuses({})
+    return replace(
+        report,
+        owner_read=read,
+        non_convergence=compute_non_convergence(
+            [row.debt for row in report.open_debt],
+            report.generated_at,
+            age_days=report.non_convergence.age_threshold_days,
+            owner_statuses=read if isinstance(read, OwnerStatuses) else None,
+        ),
     )
 
 
