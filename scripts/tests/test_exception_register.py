@@ -825,6 +825,9 @@ def test_a_missing_shared_import_is_exit_two_and_never_exit_one(tmp_path: Path):
     )
 
     assert completed.returncode == 2, completed.stderr
+    assert any(
+        f"No module named '{name}" in completed.stderr for name in ('yaml', 'shared')
+    ), completed.stderr
     assert 'uv run --project shared' in completed.stderr
     assert 'Traceback' not in completed.stderr
 
