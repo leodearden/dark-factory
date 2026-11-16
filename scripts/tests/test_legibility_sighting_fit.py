@@ -7,7 +7,7 @@ import copy
 import json
 
 import pytest
-from legibility import codebook, filing_policy, sighting_fit
+from legibility import census_filing, codebook, filing_policy, sighting_fit
 from legibility.sighting_fit import FitReplyError, FitVerdict, OfferedSighting, Standing
 from legibility_sighting_fit_fixtures import (
     CAUSE,
@@ -396,3 +396,48 @@ def test_check_leaves_an_entry_unchecked_when_the_fit_reply_is_no_judgment():
 
     assert outcome.unchecked == MISATTACHED_SESSIONS
     assert "FitReplyError" in outcome.error
+
+
+# ---------------------------------------------------------------------------
+# step-9: the census release loop counts only what the rule counts
+# ---------------------------------------------------------------------------
+
+def test_the_release_loop_holds_the_reify_entry_back():
+    assert census_filing.filing_queue([], reify_codebook_at_rest()) == []
+
+
+def test_the_release_loop_releases_an_entry_a_fit_verdict_carries_over_the_gate():
+    cb = _with_fit_row(reify_codebook_with_quotes(), MISATTACHED_SESSIONS[0], exhibits=True)
+
+    [pending] = census_filing.filing_queue([], cb)
+
+    assert pending.withheld_entry_id == ENTRY_ID
+
+
+def _bare_entry(entry_id: str, **fields) -> dict:
+    return {
+        "id": entry_id,
+        "title": f"Confusion {entry_id}",
+        "severity": "low",
+        "status": "open",
+        "origin_phase": "unknown",
+        "manifested_phase": "unknown",
+        "sightings": [_sighting(f"s-{entry_id}")],
+        **fields,
+    }
+
+
+def test_releasable_entries_are_the_withheld_open_entries_no_fileable_cluster_releases():
+    cb = reify_codebook_at_rest()
+    withheld = {codebook.ENTRY_FILING_KEY: codebook.ENTRY_FILING_WITHHELD}
+    cb["entries"] += [
+        _bare_entry("entry-partially", status="partially", **withheld),
+        _bare_entry("entry-named", **withheld),
+        _bare_entry("entry-retired", status="retired", **withheld),
+        _bare_entry("entry-unmarked"),
+    ]
+    fileable = [({"title": "Confusion entry-named"}, "entry-named")]
+
+    releasable = census_filing.releasable_entries(fileable, cb)
+
+    assert [entry["id"] for entry in releasable] == [ENTRY_ID, "entry-partially"]
