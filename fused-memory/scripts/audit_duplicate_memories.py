@@ -2760,9 +2760,7 @@ def _project_cutoffs(config: Any, project_id: str | None) -> tuple[dict[str, flo
     return cutoffs, getattr(entry, 'calibration_report_path', None)
 
 
-def _write_triage_cutoffs(
-    memory_service: Any, project_id: str | None = None,
-) -> _CalibrationCutoffs:
+def _write_triage_cutoffs(config: Any, project_id: str | None = None) -> _CalibrationCutoffs:
     """The ONE read of the calibration config, merged for *project_id*.
 
     Both the cutoff resolver and :func:`categories_without_own_cutoff` need
@@ -2770,7 +2768,6 @@ def _write_triage_cutoffs(
     project-over-global merge live here once — the config keeps a single
     reader, and the two consumers can never disagree about what it said.
     """
-    config = getattr(memory_service, 'config', None)
     write_triage = getattr(config, 'write_triage', None)
     raw_t_high = getattr(write_triage, 't_high', None)
     global_map = getattr(write_triage, 't_high_by_category', None)
@@ -2812,7 +2809,9 @@ def categories_without_own_cutoff(
     """
     if _calibrated_float(override) is not None:
         return frozenset(categories)
-    by_category = _write_triage_cutoffs(memory_service, project_id).by_category
+    by_category = _write_triage_cutoffs(
+        getattr(memory_service, 'config', None), project_id,
+    ).by_category
     return frozenset(
         category for category in categories
         if _calibrated_float(by_category.get(category)) is None
@@ -2826,7 +2825,20 @@ def resolve_ann_threshold(
     *,
     project_id: str | None = None,
 ) -> tuple[dict[str, float], dict[str, int]]:
-    """Resolve the ANN cosine cutoff PER CATEGORY. READ, never invented.
+    """:func:`resolve_ann_cutoffs` over *memory_service*'s ``config``."""
+    return resolve_ann_cutoffs(
+        getattr(memory_service, 'config', None), override, categories, project_id=project_id,
+    )
+
+
+def resolve_ann_cutoffs(
+    config: Any,
+    override: float | None = None,
+    categories: Iterable[str] = ALL_CATEGORIES,
+    *,
+    project_id: str | None = None,
+) -> tuple[dict[str, float], dict[str, int]]:
+    """Resolve the ANN cosine cutoff PER CATEGORY from *config*. READ, never invented.
 
     Every cutoff is a CALIBRATION OUTPUT derived by
     ``scripts/calibrate_write_triage.py`` from measured similarity
@@ -2860,7 +2872,7 @@ def resolve_ann_threshold(
     scalar) is ignored wholesale rather than probed.
 
     Args:
-        memory_service: Live (or mock) MemoryService.
+        config: A FusedMemoryConfig (or a stand-in), read defensively.
         override: Operator-supplied ``--ann-threshold``. Wins when given,
             including over an uncalibrated config.
         categories: The categories actually being swept. Nothing is resolved
@@ -2894,7 +2906,7 @@ def resolve_ann_threshold(
             {'ann_disabled_uncalibrated': 0, 'ann_pooled_fallback_categories': 0},
         )
 
-    cutoffs = _write_triage_cutoffs(memory_service, project_id)
+    cutoffs = _write_triage_cutoffs(config, project_id)
     raw_t_high, pooled, by_category = cutoffs.raw_t_high, cutoffs.pooled, cutoffs.by_category
     from_project = sorted(cutoffs.project_categories.intersection(swept))
     if from_project:
@@ -3450,7 +3462,7 @@ relative default would scatter artifacts wherever the scheduler happened to
 start — invisible to the limits evaluator, which scans one root.
 """
 
-_DEFAULT_ANN_TOP_K = 10
+DEFAULT_ANN_TOP_K = 10
 """Neighbours requested per record.
 
 A resource knob, not a similarity threshold: it trades query cost against
@@ -3498,8 +3510,8 @@ def build_parser() -> LoudArgumentParser:
              'scrolling an empty corpus and reporting a clean sweep.',
     )
     parser.add_argument(
-        '--ann-top-k', dest='ann_top_k', type=int, default=_DEFAULT_ANN_TOP_K,
-        help=f'ANN neighbours per record (default: {_DEFAULT_ANN_TOP_K}). '
+        '--ann-top-k', dest='ann_top_k', type=int, default=DEFAULT_ANN_TOP_K,
+        help=f'ANN neighbours per record (default: {DEFAULT_ANN_TOP_K}). '
              'Saturation is reported as top_k_saturated.',
     )
     parser.add_argument(

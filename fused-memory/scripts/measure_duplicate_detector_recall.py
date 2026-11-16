@@ -37,7 +37,6 @@ import os
 import re
 import sys
 import time
-import types
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from enum import StrEnum
@@ -533,7 +532,7 @@ def measure_detector_arm(
     context: _arms.ArmContext,
     max_spend_usd: float,
     clock: Callable[[], float],
-    proposal: GateProposal,
+    precision_floor: float,
 ) -> DetectorRow:
     """Adjudicate every candidate and labelled pair once with *arm*, and summarise it as a row.
 
@@ -544,7 +543,8 @@ def measure_detector_arm(
     try:
         return _measure(
             arm, memories, candidates, pair_classes,
-            context=context, max_spend_usd=max_spend_usd, clock=clock, proposal=proposal,
+            context=context, max_spend_usd=max_spend_usd, clock=clock,
+            precision_floor=precision_floor,
         )
     except _arms.ArmUnavailable as exc:
         logger.warning('arm %s skipped (%s): %s', arm.name, exc.reason, exc.detail)
@@ -566,7 +566,7 @@ def _measure(
     context: _arms.ArmContext,
     max_spend_usd: float,
     clock: Callable[[], float],
-    proposal: GateProposal,
+    precision_floor: float,
 ) -> DetectorRow:
     true_pairs = _pairs_of(pair_classes, TRUE_DUP)
     hard_negatives = _pairs_of(pair_classes, HARD_NEGATIVE)
@@ -580,7 +580,7 @@ def _measure(
 
     candidate_scores = {pair: scores[pair] for pair in candidates if pair in scores}
     positives = set(true_pairs)
-    point = operating_point(candidate_scores, positives, len(true_pairs), proposal.precision_floor)
+    point = operating_point(candidate_scores, positives, len(true_pairs), precision_floor)
     flagged = (
         set() if point.threshold is None
         else set(_audit.adjudicated_pairs(candidate_scores, point.threshold))
@@ -996,7 +996,7 @@ def build_parser() -> LoudArgumentParser:
     parser.add_argument('--fixture', default=str(_FIXTURES / 'write_triage_calibration.jsonl'))
     parser.add_argument('--report-path', dest='report_path', default=str(_DEFAULT_REPORT_PATH))
     parser.add_argument('--config', default=None, help='fused-memory config file (sets CONFIG_PATH)')
-    parser.add_argument('--top-k', dest='top_k', type=int, default=_audit._DEFAULT_ANN_TOP_K)
+    parser.add_argument('--top-k', dest='top_k', type=int, default=_audit.DEFAULT_ANN_TOP_K)
     parser.add_argument(
         '--arm', action='append', default=None, choices=[arm.name for arm in DETECTOR_ARMS],
         help='measure only this arm (repeatable; refused at the committed report path)',
@@ -1048,8 +1048,8 @@ def run_measurement(
     pair_classes = labelled_pair_classes(records)
     generation = candidate_generation(memories, neighbors, pair_classes, args.top_k)
     categories = sorted({str(r['category']) for r in records if r.get('category')})
-    cutoffs, cutoff_disclosure = _audit.resolve_ann_threshold(
-        types.SimpleNamespace(config=config), None, categories, project_id=None,
+    cutoffs, cutoff_disclosure = _audit.resolve_ann_cutoffs(
+        config, None, categories, project_id=None,
     )
     baseline = measure_ann_baseline(memories, neighbors, cutoffs, pair_classes)
 
@@ -1066,7 +1066,8 @@ def run_measurement(
         logger.info('measuring arm %s (%s)', arm.name, arm.spec.model)
         rows.append(measure_detector_arm(
             arm, memories, generation.candidates, pair_classes, context=context,
-            max_spend_usd=args.max_arm_spend_usd, clock=time.perf_counter, proposal=GATE_PROPOSAL,
+            max_spend_usd=args.max_arm_spend_usd, clock=time.perf_counter,
+            precision_floor=GATE_PROPOSAL.precision_floor,
         ))
 
     report = build_report(

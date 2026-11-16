@@ -422,7 +422,7 @@ class TestMeasureDetectorArm:
             arm, memories or self._memories(), self._CANDIDATES, self._classes(),
             context=_context(), max_spend_usd=max_spend_usd,
             clock=clock or iter([10.0, 12.5]).__next__,
-            proposal=types.SimpleNamespace(precision_floor=self._FLOOR),
+            precision_floor=self._FLOOR,
         )
 
     def _scorer(self, **kwargs):
@@ -817,7 +817,7 @@ class TestCli:
         provenance = report['provenance']
         assert provenance['fixture_path'] == _calibrate().package_relative(fixture)
         assert provenance['record_count'] == 4
-        assert provenance['top_k'] == _audit_mod()._DEFAULT_ANN_TOP_K
+        assert provenance['top_k'] == _audit_mod().DEFAULT_ANN_TOP_K
         assert provenance['ann_cutoffs'] == {_PK: 0.79}
         assert provenance['project_id'] is None
         assert provenance['measured_at'] == '2099-01-02'
