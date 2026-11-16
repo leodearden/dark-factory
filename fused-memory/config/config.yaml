@@ -616,8 +616,7 @@ link_heal:
   # The projects with write-triage children in the 2026-10-19 soak.
   projects: [dark_factory, reify, solar_challenge, solar_challenge_platform, scoping_intake]
   # Writes need a passing soak calibration and an operator flip (INV-12 owned hold; runbook: OPERATIONS.md).
-  # Flipped on 2026-11-16 by Leo (esc-9407-1, step 4) after calibration 44579c3c passed and dry-run backlog 62c63cc6.
-  writes: true
+  writes: false
 #   # Heal actions a sweep may stage; the rest are recorded as not_enabled.
 #   sweep_actions: [detach, relabel]
 #   # How far back the first sweep looks; later sweeps resume from the last complete one.
