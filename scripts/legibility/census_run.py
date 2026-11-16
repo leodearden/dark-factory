@@ -722,6 +722,7 @@ class CensusEffects:
     selection_of: Callable[[], census_window.SessionSelection | None]
     invoke: Callable[[str, str], str]
     verify_fn: Callable[..., Mapping[str, Any] | None]
+    fit_fn: sighting_fit.FitFn
     synthesize_fn: Callable[..., str]
     embedder: embeddings.Embedder
     submit_fn: Callable[..., Any]
@@ -1248,6 +1249,7 @@ class FilingPlan:
     refiled: tuple[disposition.Refiling, ...]
     backfilled: disposition.Backfill
     reverify_probes: int
+    fit_outcomes: tuple[sighting_fit.FitOutcome, ...]
 
 
 def plan_filing(
@@ -1284,6 +1286,16 @@ def plan_filing(
         remaining=merged.reverify_budget,
     )
     cb, status_changes = disposition.project(cb, outcomes, reverified.reverifications, as_of_sha=run.as_of_sha)
+    # A withheld entry whose release turns on sightings a judgment attached
+    # gets their fit checked before the release loop counts it
+    # (plans/census-incremental-prd.md C1, L7).
+    cb, fit_outcomes = sighting_fit.check(
+        cb,
+        sighting_fit.at_stake(cb, census_filing.releasable_entries(list(placed.fileable), cb)),
+        fit_fn=effects.fit_fn,
+        model=run.config.models.census_verify,
+        run_id=run.run_id,
+    )
     refiled = disposition.refilings(outcomes, reverified.reverifications, sighted=placed.sighted)
     queue = census_filing.with_refilings(census_filing.filing_queue(list(placed.fileable), cb), refiled, cb)
     payloads = census_filing.build_task_payloads(
@@ -1309,6 +1321,7 @@ def plan_filing(
         refiled=refiled,
         backfilled=backfilled,
         reverify_probes=reverified.probes,
+        fit_outcomes=fit_outcomes,
     )
 
 
@@ -1387,6 +1400,8 @@ def _census_record(
         f"{config.models.census_synthesis} synthesis={synthesis_report.calls}, "
         f"{config.models.trickle} headroom-probe={probe_calls}"
     )
+    if plan.fit_outcomes:
+        cost_note += f", {config.models.census_verify} sighting-fit={len(plan.fit_outcomes)}"
     if storm_batch_indices:
         cost_note += (
             f"; WARNING: {len(storm_batch_indices)} storm batch(es) at indices "
@@ -1435,6 +1450,7 @@ def _census_record(
         dropped_verdicts=tuple(placed.dropped_verdicts),
         mass_rejection=verdicts.mass_rejection,
         withheld=placed.withheld,
+        fit_outcomes=plan.fit_outcomes,
         findings=[
             row.to_record()
             for row in census_findings.finding_rows(

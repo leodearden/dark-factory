@@ -283,6 +283,7 @@ def test_check_leaves_every_offered_session_unchecked_when_the_fit_fn_raises():
     assert codebook.SIGHTING_FITS_KEY not in _entry(stamped)
     assert outcome.unchecked == MISATTACHED_SESSIONS
     assert outcome.confirmed == outcome.refuted == ()
+    assert outcome.error is not None
     assert "judge unavailable" in outcome.error
 
 
@@ -395,6 +396,7 @@ def test_check_leaves_an_entry_unchecked_when_the_fit_reply_is_no_judgment():
     _, [outcome] = _check(cb, sighting_fit.build_fit_fn(_fake_invoke("no judgment here")))
 
     assert outcome.unchecked == MISATTACHED_SESSIONS
+    assert outcome.error is not None
     assert "FitReplyError" in outcome.error
 
 

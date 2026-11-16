@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from legibility import codebook, coder, filing_policy, prescreen
+from legibility import codebook, coder, filing_policy, prescreen, report_text
 
 logger = logging.getLogger("legibility.census.sighting_fit")
 
@@ -303,3 +303,30 @@ def build_fit_fn(invoke: Callable[[str, str], str]) -> FitFn:
         return _parse_reply(invoke(_fit_prompt(fit_check), model))
 
     return fit_fn
+
+
+def _sessions(sessions: Sequence[str]) -> str:
+    return ", ".join(sessions) or "none"
+
+
+def report_lines(records: Sequence[Mapping[str, Any]]) -> list[str]:
+    """The report's ``## Sighting Fit`` section, rendered from the run
+    record's ``sighting_fit`` value (FitOutcome.to_record per check)."""
+    lines = [
+        "",
+        "## Sighting Fit",
+        "",
+        f"- {len(records)} withheld entr(ies) could reach "
+        f"{filing_policy.MIN_UNREMEDIATED_SIGHTINGS} sightings only through attached "
+        "sightings no rule placed. Each such sighting's quoted evidence was judged "
+        "against the mechanism its entry's title names; only a confirmed one counts.",
+    ]
+    for record in records:
+        lines.append(
+            f"  - {report_text.quoted_title(record['title'])} ({record['entry_id']}): "
+            f"confirmed {_sessions(record['confirmed'])}; refuted {_sessions(record['refuted'])}; "
+            f"unchecked {_sessions(record['unchecked'])}"
+        )
+        if record["error"]:
+            lines.append(f"    - the fit check failed, so its sightings stay unchecked: {record['error']}")
+    return lines
