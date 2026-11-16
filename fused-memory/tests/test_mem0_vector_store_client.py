@@ -10,13 +10,13 @@ budget, and the failure named no budget at all.
 
 from __future__ import annotations
 
-import asyncio
 import re
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 
 import httpx
 import pytest
+from _fm_polling import poll_until
 from _mock_openai_server import mock_openai_server
 from _stub_qdrant_server import POOLING_LOOPBACK_HOST, stub_qdrant_server
 
@@ -103,9 +103,10 @@ async def test_close_releases_every_connection_the_backend_opened(config):
         async with backend_against(stub.url, config) as backend:
             assert await backend.get(MEMORY_ID, SCOPE) is None
             await backend.close()
-            async with asyncio.timeout(10):
-                while stub.open_connections():
-                    await asyncio.sleep(0.01)
+            await poll_until(
+                lambda: not stub.open_connections(),
+                message='the stub still holds a connection the closed backend opened',
+            )
 
 
 @pytest.mark.asyncio
