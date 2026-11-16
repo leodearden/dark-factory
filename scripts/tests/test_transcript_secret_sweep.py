@@ -620,6 +620,55 @@ def test_a_directory_that_vanishes_before_it_is_listed_is_passed_over(tree, monk
     assert {hit.path for hit in result.redacted} == {tree.pool_main, tree.openai}
 
 
+class TestDryRun:
+    def _config(self, logs: LogTree, dumps: PytestTmpTree, *, dry_run: bool) -> sweep.SweepConfig:
+        trees = sweep.swept_trees(logs.project_roots, logs.claude_projects, pytest_tmp_dir=dumps.root)
+        return sweep.SweepConfig(trees=trees, now=NOW, dry_run=dry_run)
+
+    def _files(self, logs: LogTree, dumps: PytestTmpTree) -> list[Path]:
+        return [*logs.expected_counts(), *dumps.expected_counts(), logs.notes, logs.fresh, dumps.fresh]
+
+    def test_a_dry_run_lists_every_hit_and_changes_and_posts_nothing(self, tmp_path):
+        logs, dumps = LogTree(tmp_path), PytestTmpTree(tmp_path)
+        before = {path: (path.read_bytes(), _identity(path)) for path in self._files(logs, dumps)}
+        poster = Recorder()
+
+        result = sweep.run(self._config(logs, dumps, dry_run=True), environ=ENVIRON, post_escalation=poster)
+
+        assert result.ok
+        assert result.redacted == ()
+        expected = {**logs.expected_counts(), **dumps.expected_counts()}
+        assert {hit.path: dict(hit.counts) for hit in result.matched} == expected
+        assert {path: (path.read_bytes(), _identity(path)) for path in before} == before
+        assert poster.calls == []
+        record = result.record()
+        assert record['dry_run'] is True
+        assert record['redacted'] == []
+        assert {hit['path']: hit['counts'] for hit in record['matched']} == {
+            str(path): counts for path, counts in expected.items()
+        }
+        _no_value_in(json.dumps(record))
+
+    def test_a_dry_run_after_a_real_run_matches_nothing(self, tmp_path):
+        logs, dumps = LogTree(tmp_path), PytestTmpTree(tmp_path)
+        sweep.run(self._config(logs, dumps, dry_run=False), environ=ENVIRON, post_escalation=Recorder())
+
+        result = sweep.run(self._config(logs, dumps, dry_run=True), environ=ENVIRON, post_escalation=Recorder())
+
+        assert result.matched == ()
+        assert result.refused == ()
+
+    def test_a_real_run_records_no_dry_run_and_no_matches(self, tmp_path):
+        logs, dumps = LogTree(tmp_path), PytestTmpTree(tmp_path)
+
+        result = sweep.run(self._config(logs, dumps, dry_run=False), environ=ENVIRON, post_escalation=Recorder())
+
+        record = result.record()
+        assert record['dry_run'] is False
+        assert record['matched'] == []
+        assert record['redacted']
+
+
 def test_a_failed_escalation_is_reported_and_the_redaction_still_stands(tree):
     result = sweep.run(tree.config(), environ=ENVIRON, post_escalation=FailingPoster())
 
@@ -733,4 +782,22 @@ class TestMain:
         (line,) = out.splitlines()
         assert str(dumps.env_dump) in {hit['path'] for hit in json.loads(line)['redacted']}
         assert POOL_A.encode() not in dumps.env_dump.read_bytes()
+        assert POOL_A[:16] not in out + err
+
+    def test_a_dry_run_exits_0_lists_matches_and_posts_and_changes_nothing(
+        self, secretless_environ, monkeypatch, tmp_path, capsys
+    ):
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', POOL_A)
+        logs = LogTree(tmp_path)
+        before = {path: (path.read_bytes(), _identity(path)) for path in logs.expected_counts()}
+
+        assert sweep.main([*self._argv(logs, tmp_path), '--dry-run']) == 0
+
+        out, err = capsys.readouterr()
+        (line,) = out.splitlines()
+        record = json.loads(line)
+        assert record['dry_run'] is True
+        assert record['matched']
+        assert record['escalation_error'] is None
+        assert {path: (path.read_bytes(), _identity(path)) for path in before} == before
         assert POOL_A[:16] not in out + err
