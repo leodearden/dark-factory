@@ -10,6 +10,7 @@ budget, and the failure named no budget at all.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -17,7 +18,7 @@ from contextlib import asynccontextmanager
 import httpx
 import pytest
 from _mock_openai_server import mock_openai_server
-from _stub_qdrant_server import stub_qdrant_server
+from _stub_qdrant_server import POOLING_LOOPBACK_HOST, stub_qdrant_server
 
 from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.config.schema import FusedMemoryConfig
@@ -94,3 +95,23 @@ async def test_an_add_overrunning_its_write_budget_raises_a_timeout_naming_it(co
                 await backend.add(CONTENT, SCOPE)
             stub.release_event.set()
             assert stub.wait_upserted(target, timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_close_releases_every_connection_the_backend_opened(config):
+    with stub_qdrant_server(host=POOLING_LOOPBACK_HOST) as stub:
+        async with backend_against(stub.url, config) as backend:
+            assert await backend.get(MEMORY_ID, SCOPE) is None
+            await backend.close()
+            async with asyncio.timeout(10):
+                while stub.open_connections():
+                    await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_a_backend_used_again_after_close_still_serves(config):
+    with stub_qdrant_server() as stub:
+        async with backend_against(stub.url, config) as backend:
+            assert await backend.get(MEMORY_ID, SCOPE) is None
+            await backend.close()
+            assert await backend.get(MEMORY_ID, SCOPE) is None

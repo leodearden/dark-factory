@@ -13,7 +13,7 @@ real Qdrant runs them.  The latency of a create, of a point upsert
 out on :attr:`StubQdrantServer.release_event` rather than slept, so a test can
 end the wait early and no handler thread outlives the server.
 
-Binds 127.0.0.1 on port 0, so ``-n auto`` xdist workers cannot collide.
+Binds a loopback address on port 0, so ``-n auto`` xdist workers cannot collide.
 """
 
 from __future__ import annotations
@@ -31,6 +31,12 @@ from urllib.parse import unquote, urlsplit
 #: The server version reported on ``GET /``, which qdrant-client reads for its
 #: client/server compatibility check.
 STUB_SERVER_VERSION = '1.17.1'
+
+#: A loopback address qdrant-client keeps connections alive to.  It turns
+#: keep-alive off for the hosts ``localhost`` and ``127.0.0.1`` only
+#: (``qdrant_client/qdrant_remote.py``), so a stub on the default address never
+#: holds a connection past its request, and nothing is left for a close to release.
+POOLING_LOOPBACK_HOST = '127.0.0.2'
 
 
 def _ok(result: Any) -> dict[str, Any]:
@@ -75,6 +81,7 @@ class StubQdrantServer:
         self._create_bodies: dict[str, list[dict[str, Any]]] = {}
         self._created: dict[str, threading.Event] = {}
         self._upserted: dict[str, threading.Event] = {}
+        self._open_connections = 0
         for name in preexisting:
             self._created_event(name).set()
 
@@ -97,6 +104,19 @@ class StubQdrantServer:
         """How many ``PUT /collections/{name}/points`` requests the server has received."""
         with self._state_lock:
             return self._upsert_requests[name]
+
+    def open_connections(self) -> int:
+        """How many client connections the server is holding open right now."""
+        with self._state_lock:
+            return self._open_connections
+
+    def _connection_opened(self) -> None:
+        with self._state_lock:
+            self._open_connections += 1
+
+    def _connection_closed(self) -> None:
+        with self._state_lock:
+            self._open_connections -= 1
 
     def wait_created(self, name: str, timeout: float) -> bool:
         """Block until collection *name* exists server-side; False on timeout."""
@@ -183,6 +203,16 @@ def _make_handler(state: StubQdrantServer) -> type[BaseHTTPRequestHandler]:
         def log_message(self, *args: Any) -> None:
             """Silence the default stderr access log."""
 
+        def setup(self) -> None:
+            super().setup()
+            state._connection_opened()
+
+        def finish(self) -> None:
+            try:
+                super().finish()
+            finally:
+                state._connection_closed()
+
         def _serve(self) -> None:
             length = int(self.headers.get('Content-Length') or 0)
             request_body = json.loads(self.rfile.read(length)) if length else {}
@@ -212,6 +242,7 @@ class _QuietServer(ThreadingHTTPServer):
 @contextmanager
 def stub_qdrant_server(
     *,
+    host: str = '127.0.0.1',
     create_delay_s: Mapping[str, float] | None = None,
     upsert_delay_s: Mapping[str, float] | None = None,
     retrieve_delay_s: Mapping[str, float] | None = None,
@@ -219,7 +250,7 @@ def stub_qdrant_server(
     conflict_on_create: Iterable[str] = (),
     create_status: Mapping[str, int] | None = None,
 ) -> Iterator[StubQdrantServer]:
-    """Serve the stub on an ephemeral local port.
+    """Serve the stub on an ephemeral port of loopback address *host*.
 
     *create_delay_s* is how long a create of each named collection takes, and
     *upsert_delay_s* and *retrieve_delay_s* how long a point upsert into, or a
@@ -238,9 +269,9 @@ def stub_qdrant_server(
         conflict_on_create=conflict_on_create,
         create_status=create_status or {},
     )
-    httpd = _QuietServer(('127.0.0.1', 0), _make_handler(state))
-    host, port = httpd.server_address[:2]
-    state.url = f'http://{host!s}:{port}'
+    httpd = _QuietServer((host, 0), _make_handler(state))
+    bound_host, port = httpd.server_address[:2]
+    state.url = f'http://{bound_host!s}:{port}'
     thread = threading.Thread(target=httpd.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True)
     thread.start()
     try:
