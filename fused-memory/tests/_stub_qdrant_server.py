@@ -9,9 +9,11 @@ that seam.  Built on stdlib ``http.server`` for the reason
 Collection meta-ops (create) run one after another under a single lock, as a
 real Qdrant runs them.  The latency of a create, of a point upsert
 (``PUT /collections/{name}/points``) and of a point retrieve
-(``POST /collections/{name}/points``) is set per collection, and it is waited
-out on :attr:`StubQdrantServer.release_event` rather than slept, so a test can
-end the wait early and no handler thread outlives the server.
+(``POST /collections/{name}/points``) is set per collection; the latency of a
+collection list (``GET /collections``), which names no collection, is one
+scalar.  Every latency is waited out on :attr:`StubQdrantServer.release_event`
+rather than slept, so a test can end the wait early and no handler thread
+outlives the server.
 
 Binds a loopback address on port 0, so ``-n auto`` xdist workers cannot collide.
 """
@@ -61,6 +63,7 @@ class StubQdrantServer:
         create_delay_s: Mapping[str, float],
         upsert_delay_s: Mapping[str, float],
         retrieve_delay_s: Mapping[str, float],
+        list_collections_delay_s: float,
         preexisting: Iterable[str],
         conflict_on_create: Iterable[str],
         create_status: Mapping[str, int],
@@ -71,6 +74,7 @@ class StubQdrantServer:
         self._create_delay_s = dict(create_delay_s)
         self._upsert_delay_s = dict(upsert_delay_s)
         self._retrieve_delay_s = dict(retrieve_delay_s)
+        self._list_collections_delay_s = list_collections_delay_s
         self._conflict_on_create = frozenset(conflict_on_create)
         self._create_status = dict(create_status)
         self._state_lock = threading.Lock()
@@ -82,6 +86,7 @@ class StubQdrantServer:
         self._created: dict[str, threading.Event] = {}
         self._upserted: dict[str, threading.Event] = {}
         self._open_connections = 0
+        self._collection_lists_in_flight = 0
         for name in preexisting:
             self._created_event(name).set()
 
@@ -109,6 +114,11 @@ class StubQdrantServer:
         """How many client connections the server is holding open right now."""
         with self._state_lock:
             return self._open_connections
+
+    def collection_lists_in_flight(self) -> int:
+        """How many ``GET /collections`` requests the server is holding unanswered right now."""
+        with self._state_lock:
+            return self._collection_lists_in_flight
 
     def _connection_opened(self) -> None:
         with self._state_lock:
@@ -148,6 +158,16 @@ class StubQdrantServer:
         with self._state_lock:
             return [name for name, event in self._created.items() if event.is_set()]
 
+    def _list_collections(self) -> tuple[int, dict[str, Any]]:
+        with self._state_lock:
+            self._collection_lists_in_flight += 1
+        try:
+            self.release_event.wait(self._list_collections_delay_s)
+            return 200, _ok({'collections': [{'name': name} for name in self._collection_names()]})
+        finally:
+            with self._state_lock:
+                self._collection_lists_in_flight -= 1
+
     def _create(self, name: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         with self._state_lock:
             self._create_requests[name] += 1
@@ -182,7 +202,7 @@ class StubQdrantServer:
             case 'GET', []:
                 return 200, {'title': 'qdrant - vector search engine', 'version': STUB_SERVER_VERSION}
             case 'GET', ['collections']:
-                return 200, _ok({'collections': [{'name': name} for name in self._collection_names()]})
+                return self._list_collections()
             case 'GET', ['collections', name, 'exists']:
                 return self._check_exists(name)
             case 'PUT', ['collections', name]:
@@ -246,6 +266,7 @@ def stub_qdrant_server(
     create_delay_s: Mapping[str, float] | None = None,
     upsert_delay_s: Mapping[str, float] | None = None,
     retrieve_delay_s: Mapping[str, float] | None = None,
+    list_collections_delay_s: float = 0.0,
     preexisting: Iterable[str] = (),
     conflict_on_create: Iterable[str] = (),
     create_status: Mapping[str, int] | None = None,
@@ -255,6 +276,7 @@ def stub_qdrant_server(
     *create_delay_s* is how long a create of each named collection takes, and
     *upsert_delay_s* and *retrieve_delay_s* how long a point upsert into, or a
     point retrieve from, it takes; a retrieve always answers no points.
+    *list_collections_delay_s* is how long every ``GET /collections`` takes.
     *preexisting* collections exist from the start.  A create of a collection
     in *conflict_on_create* answers 409 AND leaves it created, as when another
     creator wins between an exists check and the create.  A create of a
@@ -265,6 +287,7 @@ def stub_qdrant_server(
         create_delay_s=create_delay_s or {},
         upsert_delay_s=upsert_delay_s or {},
         retrieve_delay_s=retrieve_delay_s or {},
+        list_collections_delay_s=list_collections_delay_s,
         preexisting=preexisting,
         conflict_on_create=conflict_on_create,
         create_status=create_status or {},

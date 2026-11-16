@@ -10,6 +10,7 @@ budget, and the failure named no budget at all.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
@@ -116,3 +117,31 @@ async def test_a_backend_used_again_after_close_still_serves(config):
             assert await backend.get(MEMORY_ID, SCOPE) is None
             await backend.close()
             assert await backend.get(MEMORY_ID, SCOPE) is None
+
+
+@pytest.mark.asyncio
+async def test_a_first_touch_leaves_the_event_loop_free_while_mem0_lists_collections(config):
+    with stub_qdrant_server(list_collections_delay_s=30.0) as stub:
+        async with backend_against(stub.url, config) as backend:
+            creation = asyncio.create_task(backend.get(MEMORY_ID, SCOPE))
+            try:
+                await poll_until(
+                    lambda: stub.collection_lists_in_flight() == 1,
+                    message='the event loop never ran while mem0 listed collections at first touch',
+                )
+            finally:
+                stub.release_event.set()
+                result = await creation
+            assert result is None
+
+
+@pytest.mark.asyncio
+async def test_a_first_touch_overrunning_its_write_budget_raises_a_timeout_naming_it(config):
+    budget = 1.0
+    config.queue.backend_write_timeout_seconds = budget
+    with stub_qdrant_server(list_collections_delay_s=60.0) as stub:
+        async with backend_against(stub.url, config) as backend:
+            with pytest.raises(TimeoutError, match=re.escape(f'Mem0 create_instance timed out after {budget}s')):
+                await backend.get(MEMORY_ID, SCOPE)
+            stub.release_event.set()
+            await poll_until(lambda: not stub.collection_lists_in_flight())
