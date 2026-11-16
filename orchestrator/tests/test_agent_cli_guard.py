@@ -220,7 +220,28 @@ class TestAgentCliSpawnGuard:
         assert guard.take_attempts() == [_NICE_CLAUDE, second]
 
 
+@pytest.fixture
+def no_agent_cli_on_path(monkeypatch, tmp_path):
+    empty_bin = tmp_path / 'empty-bin'
+    empty_bin.mkdir()
+    monkeypatch.setenv('PATH', str(empty_bin))
+    monkeypatch.setenv('HOME', str(write_operator_home(tmp_path / 'operator')))
+    for name in OPERATOR_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.mark.usefixtures('no_agent_cli_on_path')
+def test_every_test_is_guarded_without_requesting_the_fixture(request):
+    with pytest.raises(pytest.fail.Exception, match=re.escape(request.node.nodeid)):
+        subprocess.run(['claude', '--version'])
+
+    assert request.getfixturevalue('_forbid_agent_cli_spawn').take_attempts() == [
+        ('claude', '--version'),
+    ]
+
+
 class TestForbidAgentCliSpawnFixture:
+    @pytest.mark.usefixtures('no_agent_cli_on_path')
     def test_sync_agent_spawn_fails_at_the_seam(self, _forbid_agent_cli_spawn, request):
         with pytest.raises(pytest.fail.Exception, match=re.escape(request.node.nodeid)):
             subprocess.run(['claude', '--version'])
@@ -228,6 +249,7 @@ class TestForbidAgentCliSpawnFixture:
         assert _forbid_agent_cli_spawn.take_attempts() == [('claude', '--version')]
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures('no_agent_cli_on_path')
     async def test_async_agent_spawn_fails_at_the_seam(self, _forbid_agent_cli_spawn, request):
         with pytest.raises(pytest.fail.Exception, match=re.escape(request.node.nodeid)):
             await asyncio.create_subprocess_exec(
@@ -240,15 +262,8 @@ class TestForbidAgentCliSpawnFixture:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('backend', sorted(AGENT_CLI_BACKENDS))
     async def test_unmocked_invoke_agent_is_stopped_before_spawning(
-        self, _forbid_agent_cli_spawn, request, monkeypatch, tmp_path, backend,
+        self, _forbid_agent_cli_spawn, no_agent_cli_on_path, request, tmp_path, backend,
     ):
-        empty_bin = tmp_path / 'empty-bin'
-        empty_bin.mkdir()
-        monkeypatch.setenv('PATH', str(empty_bin))
-        monkeypatch.setenv('HOME', str(write_operator_home(tmp_path / 'operator')))
-        for name in OPERATOR_ENV_VARS:
-            monkeypatch.delenv(name, raising=False)
-
         with pytest.raises(pytest.fail.Exception, match=re.escape(request.node.nodeid)):
             await invoke.invoke_agent(
                 prompt='p', system_prompt='s', cwd=tmp_path, backend=backend,
@@ -259,6 +274,7 @@ class TestForbidAgentCliSpawnFixture:
         assert agent_cli_in(attempt) == backend
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures('no_agent_cli_on_path')
     async def test_the_sandbox_branch_is_stopped_before_spawning(
         self, _forbid_agent_cli_spawn, monkeypatch, tmp_path,
     ):
@@ -274,6 +290,7 @@ class TestForbidAgentCliSpawnFixture:
         assert agent_cli_in(attempt) == 'claude'
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures('no_agent_cli_on_path')
     async def test_the_task_882_stale_patch_is_caught_at_the_seam(
         self, _forbid_agent_cli_spawn, tmp_path,
     ):
@@ -287,6 +304,7 @@ class TestForbidAgentCliSpawnFixture:
         [attempt] = _forbid_agent_cli_spawn.take_attempts()
         assert agent_cli_in(attempt) == 'claude'
 
+    @pytest.mark.usefixtures('no_agent_cli_on_path')
     def test_a_swallowed_spawn_is_still_recorded(self, _forbid_agent_cli_spawn):
         with contextlib.suppress(BaseException):
             subprocess.run(['claude'])
