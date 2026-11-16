@@ -19,6 +19,7 @@ import pytest
 
 from shared.secret_redaction import (
     MIN_REDACTABLE_LEN,
+    MIN_TRUNCATED_PREFIX_LEN,
     Codec,
     CorruptCompressedFile,
     FileChangedDuringRedaction,
@@ -491,3 +492,190 @@ class TestGzip:
         assert VALUE not in message
         assert path.read_bytes() == content
         assert list(path.parent.iterdir()) == [path]
+
+
+class TestTruncatedPrefix:
+    """A log that cut a value short (``repr`` of an environ, a pytest assertion
+    diff) still leaks its head; a prefix followed by a truncation marker is a hit."""
+
+    VAR = 'ANTHROPIC_API_KEY'
+    VALUE = 'sk-ant-api03-' + hashlib.sha512(b'a live anthropic key').hexdigest()[:95]
+    PREFIX = VALUE[:40]
+
+    def _needles(self, markup: Markup = Markup.TEXT, value: str | None = None):
+        return redaction_needles({self.VAR: value or self.VALUE}, markup=markup)
+
+    def _redacted_line(self, line: str, secret: str) -> bytes:
+        return line.encode().replace(secret.encode(), _placeholder(self.VAR, len(secret.encode())))
+
+    def test_the_value_is_the_length_of_a_live_anthropic_key(self):
+        assert len(self.VALUE) == 108
+
+    def test_the_assertion_repr_a_verify_log_held_is_redacted_to_the_same_length(self, tmp_path):
+        truncated = self.VALUE[:95]
+        line = f"E   AssertionError: {{'{self.VAR}': '{truncated}...', 'PATH': '/usr/bin'}}"
+        path = _write(tmp_path / 'remote-laptop.test-x.log', [line, '1 failed'])
+        before = path.stat()
+
+        result = redact_in_place(path, self._needles())
+
+        after = path.stat()
+        assert dict(result.counts) == {self.VAR: 1}
+        assert _lines(path) == [self._redacted_line(line, truncated), b'1 failed']
+        assert truncated.encode() not in path.read_bytes()
+        assert after.st_size == before.st_size
+        assert stat.S_IMODE(after.st_mode) == 0o640
+        assert after.st_mtime_ns == OLD_MTIME_NS
+
+    @pytest.mark.parametrize(
+        'marker', ['...', '…', "'", '"', ')', ']', '}', '>', '\\u2026', '\\"'],
+    )
+    def test_a_text_prefix_followed_by_a_truncation_marker_is_redacted(self, tmp_path, marker):
+        line = f'token={self.PREFIX}{marker} tail'
+        path = _write(tmp_path / 'r.log', [line])
+
+        result = redact_in_place(path, self._needles())
+
+        assert dict(result.counts) == {self.VAR: 1}
+        assert _lines(path) == [self._redacted_line(line, self.PREFIX)]
+
+    @pytest.mark.parametrize(
+        ('ellipsis', 'ensure_ascii'), [('...', True), ('…', True), ('…', False)],
+        ids=['dots', 'escaped-ellipsis', 'raw-ellipsis'],
+    )
+    def test_a_jsonl_prefix_followed_by_an_ellipsis_is_redacted_and_stays_json(
+        self, tmp_path, ellipsis, ensure_ascii
+    ):
+        line = json.dumps({'t': f"{{'K': '{self.PREFIX}{ellipsis}'}}"}, ensure_ascii=ensure_ascii)
+        path = _write(tmp_path / 's.jsonl', [line])
+
+        result = redact_in_place(path, self._needles(Markup.JSON))
+
+        (redacted,) = _lines(path)
+        assert dict(result.counts) == {self.VAR: 1}
+        assert self.PREFIX.encode() not in redacted
+        assert len(redacted) == len(line.encode())
+        assert f'<redacted:{self.VAR}>' in json.loads(redacted)['t']
+
+    def test_a_junit_prefix_followed_by_an_ellipsis_is_redacted_and_still_parses(self, tmp_path):
+        path = _write(tmp_path / 'r.xml', _junit_lines(f'{self.PREFIX}...'))
+        before = path.stat()
+
+        result = redact_in_place(path, self._needles(Markup.XML))
+
+        data = path.read_bytes()
+        assert dict(result.counts) == {self.VAR: 2}
+        assert self.PREFIX.encode() not in data
+        assert path.stat().st_size == before.st_size
+        failure = _parsed_failure(data)
+        label = f'<redacted:{self.VAR}>'
+        assert label in failure.get('message', '')
+        assert label in (failure.text or '')
+        assert self.PREFIX not in failure.get('message', '') + (failure.text or '')
+
+    def test_a_prefix_of_the_minimum_length_is_redacted(self, tmp_path):
+        head = self.VALUE[:MIN_TRUNCATED_PREFIX_LEN]
+        line = f'x={head}... end'
+        path = _write(tmp_path / 'r.log', [line])
+
+        result = redact_in_place(path, self._needles())
+
+        assert MIN_TRUNCATED_PREFIX_LEN == 16
+        assert dict(result.counts) == {self.VAR: 1}
+        assert _lines(path) == [self._redacted_line(line, head)]
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            f'other={VALUE[:20]}{"Z" * 30}... done',
+            f'x={VALUE[:30]}Q rest',
+            f'x={VALUE[:30]} rest',
+            f'x={VALUE[:MIN_TRUNCATED_PREFIX_LEN - 1]}... end',
+        ],
+        ids=['lookalike-token', 'prefix-then-letter', 'prefix-then-space', 'below-minimum'],
+    )
+    def test_a_near_miss_is_left_byte_identical(self, tmp_path, text):
+        path = _write(tmp_path / 'r.log', [text])
+        before = path.stat()
+        content = path.read_bytes()
+
+        result = redact_in_place(path, self._needles())
+
+        after = path.stat()
+        assert dict(result.counts) == {}
+        assert path.read_bytes() == content
+        assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+        assert list(path.parent.iterdir()) == [path]
+
+    def test_a_whole_value_followed_by_an_ellipsis_counts_once(self, tmp_path):
+        line = f'x={self.VALUE}... end'
+        path = _write(tmp_path / 'r.log', [line])
+
+        result = redact_in_place(path, self._needles())
+
+        assert dict(result.counts) == {self.VAR: 1}
+        assert _lines(path) == [self._redacted_line(line, self.VALUE)]
+
+    def test_the_longest_span_wins_where_a_values_forms_overlap(self, tmp_path):
+        quoted = 'sk-ant-api03-abcde"' + hashlib.sha256(b'quoted').hexdigest()
+        assert quoted.index('"') == 18
+        escaped = json.dumps(quoted)[1:-1]
+        whole_escaped = f'payload: {json.dumps({"token": quoted})}'
+        truncated_raw = f"E   {{'K': '{quoted[:40]}...'}}"
+        path = _write(tmp_path / 'r.log', [whole_escaped, truncated_raw])
+
+        result = redact_in_place(path, self._needles(value=quoted))
+
+        assert dict(result.counts) == {self.VAR: 2}
+        assert _lines(path) == [
+            self._redacted_line(whole_escaped, escaped),
+            self._redacted_line(truncated_raw, quoted[:40]),
+        ]
+        assert quoted[:MIN_TRUNCATED_PREFIX_LEN].encode() not in path.read_bytes()
+
+    def test_a_prefix_inside_a_gzipped_junit_report_is_redacted_and_the_archive_stays_valid(
+        self, tmp_path
+    ):
+        path = _write_gzip(tmp_path / 'r.xml.gz', _junit_lines(f'{self.PREFIX}...'))
+        original = gzip.decompress(path.read_bytes())
+
+        result = redact_in_place(path, self._needles(Markup.XML), codec=Codec.GZIP)
+
+        after = path.stat()
+        data = gzip.decompress(path.read_bytes())
+        assert dict(result.counts) == {self.VAR: 2}
+        assert self.PREFIX.encode() not in data
+        assert len(data) == len(original)
+        assert f'<redacted:{self.VAR}>' in _parsed_failure(data).get('message', '')
+        assert stat.S_IMODE(after.st_mode) == 0o640
+        assert after.st_mtime_ns == OLD_MTIME_NS
+        assert list(path.parent.iterdir()) == [path]
+
+    def test_no_repr_carries_the_value_or_a_prefix_of_it(self, tmp_path):
+        path = _write(tmp_path / 'r.log', [f'x={self.PREFIX}... end'])
+        head = self.VALUE[:MIN_TRUNCATED_PREFIX_LEN]
+
+        result = redact_in_place(path, self._needles())
+
+        assert result.redacted
+        assert head not in repr(result)
+        for markup in Markup:
+            for needle in self._needles(markup):
+                assert head not in repr(needle)
+
+    def test_a_refused_prefix_hit_names_the_variable_but_never_the_value(self, tmp_path):
+        value = '00e9' + 'X' * 40
+        line = json.dumps({'text': 'café' + 'X' * 20 + '...'})
+        assert '\\u00e9' + 'X' * 20 + '...' in line, 'the prefix must sit inside a \\u escape'
+        path = _write(tmp_path / 's.jsonl', [line])
+        content = path.read_bytes()
+
+        result = redact_in_place(path, redaction_needles({VAR: value}))
+
+        assert result.refused == (RefusedLine(1, VAR),)
+        assert not result.redacted
+        assert path.read_bytes() == content
+        with pytest.raises(RedactionWouldCorruptJson) as excinfo:
+            result.raise_if_refused(path)
+        assert value[:MIN_TRUNCATED_PREFIX_LEN] not in str(excinfo.value)
+        assert VAR in str(excinfo.value)
