@@ -25,12 +25,14 @@ Usage
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+import itertools
+import math
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from shared.quality_series.stats import wilson_interval
+from shared.quality_series.stats import Z_95, wilson_interval
 
 from fused_memory.utils.script_loader import load_script
 
@@ -187,3 +189,77 @@ def candidate_generation(
         ),
         disclosure=disclosure,
     )
+
+
+# ---------------------------------------------------------------------------
+# Intervals and the operating point
+# ---------------------------------------------------------------------------
+
+def auc_interval_95(
+    auc: float | None, n_true: int, n_hard_negative: int,
+) -> tuple[float, float] | None:
+    """Hanley & McNeil (1982)'s 95% interval for an AUC, clamped to [0, 1]."""
+    if auc is None or n_true == 0 or n_hard_negative == 0:
+        return None
+    q1 = auc / (2 - auc)
+    q2 = 2 * auc * auc / (1 + auc)
+    variance = (
+        auc * (1 - auc)
+        + (n_true - 1) * (q1 - auc * auc)
+        + (n_hard_negative - 1) * (q2 - auc * auc)
+    ) / (n_true * n_hard_negative)
+    half = Z_95 * math.sqrt(max(variance, 0.0))
+    return max(0.0, auc - half), min(1.0, auc + half)
+
+
+@dataclass(frozen=True)
+class OperatingPoint:
+    """The inclusive threshold chosen, with the pairs it flags; ``of`` is every true pair."""
+
+    threshold: float | None
+    caught: int
+    flagged: int
+    of: int
+
+    @property
+    def recall(self) -> Proportion | None:
+        return proportion(self.caught, self.of)
+
+    @property
+    def precision(self) -> Proportion | None:
+        return proportion(self.caught, self.flagged)
+
+
+def operating_point(
+    candidate_scores: Mapping[Pair, float],
+    positives: Collection[Pair],
+    n_positive: int,
+    floor: float,
+) -> OperatingPoint:
+    """The candidate-score threshold catching the most true pairs at precision >= *floor*.
+
+    Only a threshold equal to some candidate's score is considered, and tied
+    scores are flagged together. A tie on caught goes to the higher threshold.
+    """
+    best = OperatingPoint(threshold=None, caught=0, flagged=0, of=n_positive)
+    flagged = caught = 0
+    descending = sorted(candidate_scores.items(), key=lambda item: -item[1])
+    for score, tied in itertools.groupby(descending, key=lambda item: item[1]):
+        pairs = [pair for pair, _ in tied]
+        flagged += len(pairs)
+        caught += sum(pair in positives for pair in pairs)
+        if caught / flagged >= floor and caught > best.caught:
+            best = OperatingPoint(threshold=score, caught=caught, flagged=flagged, of=n_positive)
+    return best
+
+
+RECALL_AT_PRECISION_FLOORS = (0.80, 0.90, 0.95)
+
+
+def recall_at_precision(
+    candidate_scores: Mapping[Pair, float], positives: Collection[Pair], n_positive: int,
+) -> dict[float, OperatingPoint]:
+    return {
+        floor: operating_point(candidate_scores, positives, n_positive, floor)
+        for floor in RECALL_AT_PRECISION_FLOORS
+    }
