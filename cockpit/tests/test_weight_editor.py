@@ -158,7 +158,7 @@ class TestKnownProjectsOffersCanonicalNamesOnly:
     as the reason it stopped short of this work.
 
     The fold is applied to all three input channels locally and is
-    deliberately redundant with the upstream folds: normalize_project_token
+    deliberately redundant with the upstream folds: fold_project_token
     is idempotent, so it costs nothing, and it makes the guarantee LOCAL to
     the picker rather than contingent on three remote callers (CockpitApp's
     scanner is a DI seam -- a fake or future scanner can hand this function

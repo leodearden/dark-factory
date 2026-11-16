@@ -1,9 +1,9 @@
 """Role-prompt guidance: source text pasted into a Python string literal is rewritten by Python.
 
-`orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+`orchestrator/src/orchestrator/agents/harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE`
 splices `PASTED_TEXT_PYTHON_LITERAL_GUIDANCE` into every role holding
-unqualified `Bash`. It is a leaf module, imported downward by roles.py, only so
-that already oversized file does not grow further.
+unqualified `Bash`. It is a leaf module, imported downward by
+harness_guidance.py.
 
 A plain literal decodes the backslash sequences in pasted code: an incomplete
 one rejects the whole script at compile time, and a complete one is silently

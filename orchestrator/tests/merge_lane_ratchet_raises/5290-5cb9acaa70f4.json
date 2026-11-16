@@ -1,0 +1,24 @@
+{
+  "task_id": "5290",
+  "reason": "task 5290 review amendments: the unreachability alarm states an unknown ssh target instead of guessing the runner name (liveness +1), and the occupancy rows / heartbeat share one typed derivation plus a named ssh-target map (worker +2, in new functions of cognitive <= 2; no existing function rose)",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/liveness.py",
+      "baseline": 64,
+      "current": 65
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 2246,
+      "current": 2248
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5018,
+      "current": 5021
+    }
+  ]
+}

@@ -156,7 +156,8 @@ account it bought an eval run was frequently already capped, at the cost of
 spending the one account interactive work depends on.
 
 **What replaces it: cap tolerance, not a reserve.** `run_architect_eval`
-routes every invocation through `invoke_with_cap_retry` with 48h of patience,
+routes every invocation through `invoke_with_cap_retry` with the shared default
+cap-wait patience (`shared/src/shared/cli_invoke.py::_DEFAULT_CAP_WAIT_SANITY_SECS`),
 resuming the capped session via `--resume` on whichever account frees up
 first, so banked spend survives a failover instead of being discarded. A
 fully-capped pool now also announces itself — `UsageGate.before_invoke` emits

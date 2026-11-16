@@ -210,3 +210,6 @@ tasks:
     delivered_check:
       kind: manual
       reason: an escalation resolution is not greppable on the committed tree
+signal_leaves:
+- λ
+- μ

@@ -270,14 +270,12 @@ class ReferentFinding:
     #: resolves-or-mints and handles them identically); this flag is what stops
     #: the first from being folded in with them.
     #:
-    #: THE CONCRETE STAKE. Task 3672's landed repair path reads
-    #: :attr:`new_endpoint_uuid` at exactly ONE site —
-    #: ``minted=finding.new_endpoint_uuid is None`` in
-    #: :meth:`_repair_episode_referents` — so today a transient FalkorDB error
-    #: books as ``minted=True`` telemetry: a node reported as newly created
-    #: where in fact nobody could look. This flag is the discriminator that
-    #: makes that a one-line fix in eta; zeta produces it and does not act on it
-    #: (that consequence is filed as its own follow-up).
+    #: WHO ACTS ON IT. zeta produces this flag and does not act on it. eta
+    #: (``fused_memory/services/memory_service.py::MemoryService._repair_edge_findings``)
+    #: DEFERS a degraded finding, recording it as ``'failed'`` with nothing
+    #: written, rather than resolving-or-minting off a lookup that could not
+    #: look. Read as "absent", it would book ``minted=True`` for a node nobody
+    #: showed was missing.
     #:
     #: Fail-closed like :attr:`resolvable`: a finding whose lookup never ran —
     #: one with no ``intended_referent`` — is not a finding whose lookup was
@@ -330,7 +328,7 @@ class ReferentFinding:
         agree only while distinct referents cannot render alike.
         :attr:`Referent.node_name` drops ``kind`` entirely for a FOREIGN
         referent (``f'{project_id}:{number}'``), so the rendering is injective
-        purely because ``canonical_labels._KIND_LABELS`` holds exactly one kind
+        purely because ``canonical_labels.KIND_LABELS`` holds exactly one kind
         today. Register a second, and a foreign citation of the new kind
         corroborates a foreign ``'task'`` endpoint of the same number — a genuine
         misattachment silently demoted to INFO and booked as corroborated, i.e.
@@ -906,7 +904,7 @@ def _implausible_target_reason(
         return ''
     if target.kind == 'task' and not target.project_id:
         # (ii) A bare own-project `Task N` referent — the dominant live shape.
-        # The `kind` test is redundant TODAY, since `_KIND_LABELS` holds exactly
+        # The `kind` test is redundant TODAY, since `KIND_LABELS` holds exactly
         # one kind, and is written anyway so that registering a second kind
         # fails CLOSED here rather than silently widening what counts as "a bare
         # own-project Task-N referent".

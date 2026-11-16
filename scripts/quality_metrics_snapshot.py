@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""The whole-repo quality metrics snapshot: plans/quality-metrics-snapshot-prd.md §Contract, schema 1.
+"""The whole-repo quality metrics snapshot: plans/quality-metrics-snapshot-prd.md §Contract, schema 3 (schemas 1 and 2 are still read).
 
 A report, never a gate: it emits measures and the quality doc's two heuristic-14
-marks, and no verdict, ranking, average or threshold of its own.
+marks, and no verdict, ranking, average or threshold of its own. The params
+fields are plans/quality-dashboard-prd.md §Contract (Snapshot identity).
 
     --run-id RUN_ID --out PATH [--root DIR] [--diff PREVIOUS.json]   measure HEAD, write PATH
     --current SNAPSHOT.json --diff PREVIOUS.json                      diff two snapshots
     --summary SNAPSHOT.json                                           per-member table
+    --summary SNAPSHOT.json --json                                    the same table as one JSON object
+    --params                                                          the params a measurement here records
 
 Exit 0 when done; exit 2 on an instrument failure, with the cause named on
 stderr. The PRD holds the rationale for every choice made here.
@@ -17,18 +20,20 @@ import argparse
 import ast
 import dataclasses
 import json
+import platform
 import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeGuard
 
+import _checkout as _checkout
 import source_measures
 
 from shared import safe_io
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 INSTRUMENT = 'quality-metrics-snapshot'
 
 #: heuristic 14's two marks (docs/code-quality.md, heuristic 14) -- the doc's figures, not this script's thresholds.
@@ -106,20 +111,28 @@ def _ancestor_packages(module: str, known: frozenset[str]) -> frozenset[str]:
     return frozenset(prefix for prefix in prefixes if prefix in known)
 
 
-def _reach_back(
-    statement: source_measures.ImportStatement, module: str, source: _FileImports, known: frozenset[str]
-) -> dict[str, Any] | None:
+@dataclasses.dataclass(frozen=True)
+class _ImportSite:
+    """One import statement of src *module*, its first-party src targets resolved once."""
+
+    module: str
+    source: _FileImports
+    statement: source_measures.ImportStatement
+    targets: tuple[str, ...]
+
+
+def _reach_back(site: _ImportSite, known: frozenset[str]) -> dict[str, Any] | None:
     """A from-import of names (not submodules) out of an ancestor package, or None."""
-    node = statement.node
+    node = site.statement.node
     if not isinstance(node, ast.ImportFrom):
         return None
-    resolved = _from_module(node, source)
-    if resolved is None or resolved not in _ancestor_packages(module, known):
+    resolved = _from_module(node, site.source)
+    if resolved is None or resolved not in _ancestor_packages(site.module, known):
         return None
     names = sorted({alias.name for alias in node.names if f'{resolved}.{alias.name}' not in known})
     if not names:
         return None
-    return {'from': module, 'to': resolved, 'names': names, 'line': statement.line}
+    return {'from': site.module, 'to': resolved, 'names': names, 'line': site.statement.line}
 
 
 def _imported_names(statement: source_measures.ImportStatement, source: _FileImports) -> list[str]:
@@ -134,13 +147,12 @@ def _imported_names(statement: source_measures.ImportStatement, source: _FileImp
     return [f'{prefix}{alias.name}' for alias in node.names]
 
 
-def _deferred_entry(
-    statement: source_measures.ImportStatement, module: str, source: _FileImports
-) -> dict[str, Any]:
+def _deferred_entry(site: _ImportSite, *, closes_cycle: bool) -> dict[str, Any]:
     return {
-        'from': module,
-        'line': statement.line,
-        'imports': sorted(_imported_names(statement, source)),
+        'from': site.module,
+        'line': site.statement.line,
+        'imports': sorted(_imported_names(site.statement, site.source)),
+        'closes_cycle': closes_cycle,
     }
 
 
@@ -198,15 +210,58 @@ def _cycles(edges: Iterable[tuple[str, str]]) -> tuple[tuple[str, ...], ...]:
     return tuple(sorted(components))
 
 
-def _module_edges(
-    module: str, source: _FileImports, known: frozenset[str], *, runtime_only: bool
-) -> set[tuple[str, str]]:
-    return {
-        (module, target)
+_Include = Callable[[source_measures.ImportStatement], bool]
+
+
+def _at_import_time(statement: source_measures.ImportStatement) -> bool:
+    """Module level, outside ``if TYPE_CHECKING:``: it runs when its importer is imported."""
+    return statement.runtime and not statement.deferred
+
+
+def _at_run_time(statement: source_measures.ImportStatement) -> bool:
+    """It runs at some point: a function-local import too."""
+    return statement.runtime
+
+
+def _at_any_time(statement: source_measures.ImportStatement) -> bool:
+    """Every import, ``if TYPE_CHECKING:`` too: what a type checker follows."""
+    return True
+
+
+def _import_sites(sources: Iterable[_FileImports], known: frozenset[str]) -> list[_ImportSite]:
+    """Every src file's import statements; a tests file has no module."""
+    return [
+        _ImportSite(source.module, source, statement, _targets(statement, source, known))
+        for source in sources
+        if source.module is not None
         for statement in source.statements
-        if not runtime_only or (statement.runtime and not statement.deferred)
-        for target in _targets(statement, source, known)
-    }
+    ]
+
+
+def _edges(sites: Iterable[_ImportSite], include: _Include) -> set[tuple[str, str]]:
+    return {(site.module, target) for site in sites if include(site.statement) for target in site.targets}
+
+
+def _reach_backs(sites: Iterable[_ImportSite], known: frozenset[str]) -> list[dict[str, Any]]:
+    return [entry for site in sites if (entry := _reach_back(site, known)) is not None]
+
+
+def _closes_cycle(site: _ImportSite, component: Mapping[str, int]) -> bool:
+    """A run-time import one of whose targets shares its importer's hidden-cycle component."""
+    if not _at_run_time(site.statement) or site.module not in component:
+        return False
+    return any(component.get(target) == component[site.module] for target in site.targets)
+
+
+def _deferred_entries(
+    sites: Iterable[_ImportSite], hidden_cycles: Iterable[Sequence[str]]
+) -> list[dict[str, Any]]:
+    component = {module: number for number, cycle in enumerate(hidden_cycles) for module in cycle}
+    return [
+        _deferred_entry(site, closes_cycle=_closes_cycle(site, component))
+        for site in sites
+        if site.statement.deferred
+    ]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -214,7 +269,9 @@ class _ImportGraph:
     edges: tuple[tuple[str, str], ...]
     reach_back: tuple[Mapping[str, Any], ...]
     deferred: tuple[Mapping[str, Any], ...]
-    cycles: tuple[tuple[str, ...], ...]
+    cycles: tuple[tuple[str, ...], ...]  # over import-time edges
+    hidden_cycles: tuple[tuple[str, ...], ...]  # over run-time edges
+    typing_cycles: tuple[tuple[str, ...], ...]  # over every edge
     field_counts: Mapping[str, Mapping[str, int]]  # src record field -> module -> count
 
     def file_fields(self, module: str) -> dict[str, int]:
@@ -227,6 +284,8 @@ class _ImportGraph:
             'reach_back': [dict(entry) for entry in self.reach_back],
             'deferred': [dict(entry) for entry in self.deferred],
             'cycles': [list(cycle) for cycle in self.cycles],
+            'hidden_cycles': [list(cycle) for cycle in self.hidden_cycles],
+            'typing_cycles': [list(cycle) for cycle in self.typing_cycles],
         }
 
 
@@ -243,28 +302,21 @@ def _tests_importers(sources: Iterable[_FileImports], known: frozenset[str]) -> 
 
 def _import_graph(sources: Sequence[_FileImports], known: frozenset[str]) -> _ImportGraph:
     """The graph over src modules; tests files only count toward fan_in_tests."""
-    edges: set[tuple[str, str]] = set()
-    runtime_edges: set[tuple[str, str]] = set()
-    reach_back: list[dict[str, Any]] = []
-    deferred: list[dict[str, Any]] = []
-    for source in sources:
-        module = source.module
-        if module is None:
-            continue
-        edges |= _module_edges(module, source, known, runtime_only=False)
-        runtime_edges |= _module_edges(module, source, known, runtime_only=True)
-        for statement in source.statements:
-            if (entry := _reach_back(statement, module, source, known)) is not None:
-                reach_back.append(entry)
-            if statement.deferred:
-                deferred.append(_deferred_entry(statement, module, source))
+    sites = _import_sites(sources, known)
+    edges = _edges(sites, _at_any_time)
+    hidden_cycles = _cycles(_edges(sites, _at_run_time))
+    reach_back = _reach_backs(sites, known)
+    deferred = _deferred_entries(sites, hidden_cycles)
     return _ImportGraph(
         edges=tuple(sorted(edges)),
         reach_back=tuple(sorted(reach_back, key=lambda e: (e['from'], e['line'], e['to']))),
         deferred=tuple(sorted(deferred, key=lambda e: (e['from'], e['line']))),
-        cycles=_cycles(runtime_edges),
+        cycles=_cycles(_edges(sites, _at_import_time)),
+        hidden_cycles=hidden_cycles,
+        typing_cycles=_cycles(edges),
         field_counts={
             'reach_back_imports': Counter(entry['from'] for entry in reach_back),
+            'cycle_closing_imports': Counter(entry['from'] for entry in deferred if entry['closes_cycle']),
             'fan_out': Counter(source for source, _target in edges),
             'fan_in_src': Counter(target for _source, target in edges),
             'fan_in_tests': _tests_importers(sources, known),
@@ -483,10 +535,25 @@ def _require_unmoved_head(root: Path, as_of: str) -> None:
         )
 
 
+def measurement_params() -> dict[str, Any]:
+    """What a measurement by this interpreter and this instrument records as its params."""
+    complexipy_version = source_measures.require_complexipy()
+    return {
+        'complexipy_version': complexipy_version,
+        'python_version': platform.python_version(),
+        'instrument': {
+            'quality_metrics_snapshot': source_measures.blob_sha(Path(__file__).resolve()),
+            'source_measures': source_measures.blob_sha(Path(source_measures.__file__).resolve()),
+        },
+        'h14_soft_ceiling_lines': H14_SOFT_CEILING_LINES,
+        'h14_alarm_lines': H14_ALARM_LINES,
+    }
+
+
 def take_snapshot(root: Path, *, run_id: str, since: str) -> dict[str, Any]:
-    """Measure *root*'s HEAD as a schema-1 snapshot; refuse a dirty domain or a moved HEAD."""
+    """Measure *root*'s HEAD as a SCHEMA_VERSION snapshot; refuse a dirty domain or a moved HEAD."""
     started = time.monotonic()
-    version = source_measures.require_complexipy()
+    params = measurement_params()
     as_of = source_measures.head_commit(root)
     domain = source_measures.workspace_domain(root)
     _require_clean_domain(root, as_of)
@@ -501,16 +568,43 @@ def take_snapshot(root: Path, *, run_id: str, since: str) -> dict[str, Any]:
         'since': since,
         'evidence': _evidence(domain, measured),
         'cost': {'wall_clock_s': round(time.monotonic() - started, 1)},
-        'params': {
-            'complexipy_version': version,
-            'h14_soft_ceiling_lines': H14_SOFT_CEILING_LINES,
-            'h14_alarm_lines': H14_ALARM_LINES,
-        },
+        'params': params,
         'files': {path: dict(record) for path, record in measured.files.items()},
         'functions': dict(measured.functions),
         'import_graph': dict(measured.import_graph),
     }
     return validate_snapshot(snapshot, origin='this measurement')
+
+
+@dataclasses.dataclass(frozen=True)
+class MeasurementIdentity:
+    """plans/quality-dashboard-prd.md decision 17: the params held as canonical JSON, so the value is hashable and fixed."""
+
+    as_of_sha: str
+    params_json: str
+
+    @classmethod
+    def of(cls, as_of_sha: str, params: Mapping[str, Any]) -> MeasurementIdentity:
+        return cls(as_of_sha, json.dumps(params, sort_keys=True))
+
+    def __str__(self) -> str:
+        return f'{self.as_of_sha} {self.params_json}'
+
+
+def identity_known(snapshot: Mapping[str, Any]) -> bool:
+    """Whether a validated snapshot's schema records every params key, so that it has an identity."""
+    return not _unknown_params(snapshot)
+
+
+def measurement_identity(snapshot: Mapping[str, Any]) -> MeasurementIdentity:
+    """A validated snapshot's identity; refused when it is not *identity_known*, since unknown equals nothing."""
+    unknown = _unknown_params(snapshot)
+    if unknown:
+        raise source_measures.MetricsError(
+            f'a schema-{snapshot["schema_version"]} snapshot records no {", ".join(unknown)}: '
+            'its measurement identity is unknown, and unknown equals no identity'
+        )
+    return MeasurementIdentity.of(snapshot['as_of_sha'], snapshot['params'])
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +622,7 @@ def _described(value: object) -> str:
 
 def _invalid(origin: str, where: str, found: str, expected: str) -> source_measures.MetricsError:
     return source_measures.MetricsError(
-        f'{origin}: {where} is {found}; schema {SCHEMA_VERSION} expects {expected}'
+        f'{origin}: {where} is {found}; expected {expected}'
     )
 
 
@@ -615,7 +709,7 @@ class _ByKind:
         _Object({**self.common, **self.kinds[kind]}).check(value, where, origin)
 
 
-def _is_int(value: object) -> bool:
+def _is_int(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
@@ -633,74 +727,134 @@ _STRING = _Leaf(lambda value: isinstance(value, str), 'a string')
 _BOOLEAN = _Leaf(lambda value: isinstance(value, bool), 'a boolean')
 _STRINGS = _ListOf(_STRING)
 
-_RECORD = _ByKind(
-    common={
-        'member': _STRING,
-        'kind': _STRING,
-        'blob': _STRING,
-        'lines': _INTEGER,
-        'prose_lines': _INTEGER,
-        'prose_ratio': _Leaf(lambda value: value is None or _is_number(value), 'a number or null'),
-        'cognitive_total': _INTEGER,
-        'cognitive_max': _INTEGER,
-        'cognitive_max_function': _Leaf(
-            lambda value: value is None or isinstance(value, str), 'a string or null'
-        ),
-        'functions': _INTEGER,
-    },
-    kinds={
-        _SRC: {
-            'module': _STRING,
-            'package_init': _BOOLEAN,
-            'function_local_imports': _INTEGER,
-            'reexport_names': _STRINGS,
-            'reach_back_imports': _INTEGER,
-            'fan_out': _INTEGER,
-            'fan_in_src': _INTEGER,
-            'fan_in_tests': _INTEGER,
+def _record_shape(src: Mapping[str, _Shape]) -> _ByKind:
+    """A file record whose src kind has the fields *src*."""
+    return _ByKind(
+        common={
+            'member': _STRING,
+            'kind': _STRING,
+            'blob': _STRING,
+            'lines': _INTEGER,
+            'prose_lines': _INTEGER,
+            'prose_ratio': _Leaf(lambda value: value is None or _is_number(value), 'a number or null'),
+            'cognitive_total': _INTEGER,
+            'cognitive_max': _INTEGER,
+            'cognitive_max_function': _Leaf(
+                lambda value: value is None or isinstance(value, str), 'a string or null'
+            ),
+            'functions': _INTEGER,
         },
-        _TESTS: {'private_patch_targets': _STRINGS, 'private_reads': _INTEGER},
-    },
-)
+        kinds={_SRC: src, _TESTS: {'private_patch_targets': _STRINGS, 'private_reads': _INTEGER}},
+    )
+
+
+_SCHEMA_1_SRC: Mapping[str, _Shape] = {
+    'module': _STRING,
+    'package_init': _BOOLEAN,
+    'function_local_imports': _INTEGER,
+    'reexport_names': _STRINGS,
+    'reach_back_imports': _INTEGER,
+    'fan_out': _INTEGER,
+    'fan_in_src': _INTEGER,
+    'fan_in_tests': _INTEGER,
+}
+
+_EDGES = _ListOf(_Leaf(_is_edge, 'a [from, to] pair of module names'))
+_REACH_BACKS = _ListOf(_Object({'from': _STRING, 'to': _STRING, 'names': _STRINGS, 'line': _INTEGER}))
+_CYCLES = _ListOf(_STRINGS)
 
 _IMPORT_GRAPH = _Object({
-    'edges': _ListOf(_Leaf(_is_edge, 'a [from, to] pair of module names')),
-    'reach_back': _ListOf(_Object({'from': _STRING, 'to': _STRING, 'names': _STRINGS, 'line': _INTEGER})),
-    'deferred': _ListOf(_Object({'from': _STRING, 'line': _INTEGER, 'imports': _STRINGS})),
-    'cycles': _ListOf(_STRINGS),
+    'edges': _EDGES,
+    'reach_back': _REACH_BACKS,
+    'deferred': _ListOf(
+        _Object({'from': _STRING, 'line': _INTEGER, 'imports': _STRINGS, 'closes_cycle': _BOOLEAN})
+    ),
+    'cycles': _CYCLES,
+    'hidden_cycles': _CYCLES,
+    'typing_cycles': _CYCLES,
 })
 _IMPORT_GRAPH_KEYS = tuple(_IMPORT_GRAPH.fields)
 
-#: Schema 1 (plans/quality-metrics-snapshot-prd.md §Contract): every field the file holds.
-_SNAPSHOT = _Object(
-    {
-        'schema_version': _Leaf(lambda value: _is_int(value) and value == SCHEMA_VERSION, str(SCHEMA_VERSION)),
-        'instrument': _Leaf(lambda value: value == INSTRUMENT, json.dumps(INSTRUMENT)),
-        'run_id': _STRING,
-        'as_of_sha': _STRING,
-        'since': _STRING,
-        'evidence': _Object(
-            {
-                'members': _ListOf(_Object({'name': _STRING, 'pseudo': _BOOLEAN, 'domain_files': _INTEGER})),
-                'domain_files': _INTEGER,
-                'measured_files': _INTEGER,
-                'unreadable': _STRINGS,
-                'complete': _BOOLEAN,
-            },
-            ordered=True,
-        ),
-        'cost': _Object({'wall_clock_s': _NUMBER}),
-        'params': _Object({
-            'complexipy_version': _STRING,
-            'h14_soft_ceiling_lines': _INTEGER,
-            'h14_alarm_lines': _INTEGER,
-        }),
-        'files': _MapOf(_RECORD),
-        'functions': _MapOf(_INTEGER),
-        'import_graph': _IMPORT_GRAPH,
-    },
-    ordered=True,
-)
+_SCHEMA_1_IMPORT_GRAPH = _Object({
+    'edges': _EDGES,
+    'reach_back': _REACH_BACKS,
+    'deferred': _ListOf(_Object({'from': _STRING, 'line': _INTEGER, 'imports': _STRINGS})),
+    'cycles': _CYCLES,
+})
+
+_SCHEMA_1_PARAMS = _Object({
+    'complexipy_version': _STRING,
+    'h14_soft_ceiling_lines': _INTEGER,
+    'h14_alarm_lines': _INTEGER,
+})
+
+_PARAMS = _Object({
+    **_SCHEMA_1_PARAMS.fields,
+    'python_version': _STRING,
+    'instrument': _Object({'quality_metrics_snapshot': _STRING, 'source_measures': _STRING}),
+})
+
+_INSTRUMENT = _Leaf(lambda value: value == INSTRUMENT, json.dumps(INSTRUMENT))
+
+
+@dataclasses.dataclass(frozen=True)
+class _Schema:
+    """What a schema version's file record, import graph and params hold."""
+
+    record: _ByKind
+    import_graph: _Object
+    params: _Object
+
+
+def _snapshot_shape(version: int, schema: _Schema) -> _Object:
+    """Every field a schema-*version* file holds (plans/quality-metrics-snapshot-prd.md §Contract)."""
+    return _Object(
+        {
+            'schema_version': _Leaf(lambda value: _is_int(value) and value == version, str(version)),
+            'instrument': _INSTRUMENT,
+            'run_id': _STRING,
+            'as_of_sha': _STRING,
+            'since': _STRING,
+            'evidence': _Object(
+                {
+                    'members': _ListOf(_Object({'name': _STRING, 'pseudo': _BOOLEAN, 'domain_files': _INTEGER})),
+                    'domain_files': _INTEGER,
+                    'measured_files': _INTEGER,
+                    'unreadable': _STRINGS,
+                    'complete': _BOOLEAN,
+                },
+                ordered=True,
+            ),
+            'cost': _Object({'wall_clock_s': _NUMBER}),
+            'params': schema.params,
+            'files': _MapOf(schema.record),
+            'functions': _MapOf(_INTEGER),
+            'import_graph': schema.import_graph,
+        },
+        ordered=True,
+    )
+
+
+_SCHEMA_2_RECORD = _record_shape({**_SCHEMA_1_SRC, 'cycle_closing_imports': _INTEGER})
+
+#: Schemas 1 and 2 are read so a committed pre-6612 or pre-8463 snapshot still diffs and summarises (the PRD's §Contract).
+_SCHEMAS: Mapping[int, _Schema] = {
+    1: _Schema(_record_shape(_SCHEMA_1_SRC), _SCHEMA_1_IMPORT_GRAPH, _SCHEMA_1_PARAMS),
+    2: _Schema(_SCHEMA_2_RECORD, _IMPORT_GRAPH, _SCHEMA_1_PARAMS),
+    SCHEMA_VERSION: _Schema(_SCHEMA_2_RECORD, _IMPORT_GRAPH, _PARAMS),
+}
+_SNAPSHOTS: Mapping[int, _Object] = {
+    version: _snapshot_shape(version, schema) for version, schema in _SCHEMAS.items()
+}
+
+#: Every params key a read schema records, so a key neither side records still reads unknown.
+_PARAMS_KEYS = tuple(sorted({key for schema in _SCHEMAS.values() for key in schema.params.fields}))
+
+
+def _unknown_params(snapshot: Mapping[str, Any]) -> list[str]:
+    """The params keys *snapshot*'s schema does not record: unknown, which equals nothing, not even unknown."""
+    recorded = _SCHEMAS[snapshot['schema_version']].params.fields
+    return [key for key in _PARAMS_KEYS if key not in recorded]
 
 
 def _require_evidence_agrees(snapshot: Mapping[str, Any], origin: str) -> None:
@@ -730,6 +884,67 @@ def _require_evidence_agrees(snapshot: Mapping[str, Any], origin: str) -> None:
     for where, found, meaning, expected in agreements:
         if found != expected:
             raise _invalid(origin, where, json.dumps(found), f'{meaning}, {json.dumps(expected)}')
+
+
+# ---------------------------------------------------------------------------
+# The import graph's kinds of entry, as --diff compares and --summary counts them.
+
+
+@dataclasses.dataclass(frozen=True)
+class _GraphKind:
+    """One kind of import-graph entry, named by *label* in prose and by *slug* in --summary --json."""
+
+    label: str
+    slug: str
+    needs: tuple[str, ...]  # the import_graph lists it derives from; its entries are the first's
+    key: Callable[[Any], tuple[Any, ...]]  # what --diff compares: never a line number
+    render: Callable[[Any], str]  # a key, as --diff names it
+    keeps: Callable[[Any], bool] = lambda entry: True
+
+    def entries(self, graph: Mapping[str, Any]) -> list[Any]:
+        return [entry for entry in graph[self.needs[0]] if self.keeps(entry)]
+
+
+def _records(snapshot: Mapping[str, Any], kind: _GraphKind) -> bool:
+    """Whether *snapshot*'s schema records *kind*; what it does not is unknown, never empty."""
+    lists = _SCHEMAS[snapshot['schema_version']].import_graph.fields
+    return all(name in lists for name in kind.needs)
+
+
+def _deferred_key(entry: Mapping[str, Any]) -> tuple[str, tuple[str, ...]]:
+    return entry['from'], tuple(entry['imports'])
+
+
+def _deferred_rendered(key: tuple[str, tuple[str, ...]]) -> str:
+    return f'{key[0]}: {", ".join(key[1])}'
+
+
+def _cycle_kind(label: str, name: str) -> _GraphKind:
+    return _GraphKind(label, name, (name,), lambda cycle: tuple(cycle), lambda key: ', '.join(key))
+
+
+_GRAPH_KINDS: tuple[_GraphKind, ...] = (
+    _GraphKind('edge', 'edges', ('edges',), lambda edge: tuple(edge), lambda key: f'{key[0]} -> {key[1]}'),
+    _GraphKind(
+        'reach-back',
+        'reach_backs',
+        ('reach_back',),
+        lambda entry: (entry['from'], entry['to'], tuple(entry['names'])),
+        lambda key: f'{key[0]} -> {key[1]} ({", ".join(key[2])})',
+    ),
+    _GraphKind('deferred import', 'deferred_imports', ('deferred',), _deferred_key, _deferred_rendered),
+    _GraphKind(
+        'cycle-closing deferred import',
+        'cycle_closing_imports',
+        ('deferred', 'hidden_cycles'),
+        _deferred_key,
+        _deferred_rendered,
+        keeps=lambda entry: entry['closes_cycle'],
+    ),
+    _cycle_kind('cycle', 'cycles'),
+    _cycle_kind('hidden cycle', 'hidden_cycles'),
+    _cycle_kind('typing cycle', 'typing_cycles'),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -790,10 +1005,19 @@ def load_snapshot(path: Path) -> dict[str, Any]:
 
 
 def validate_snapshot(snapshot: object, *, origin: str) -> dict[str, Any]:
-    """*snapshot*, once it has every schema-1 field and its evidence agrees; else MetricsError naming *origin*."""
+    """*snapshot*, once it has every field of a schema read here and its evidence agrees.
+
+    Else a MetricsError naming *origin*, and the schema once it is known.
+    """
     top = _json_object(snapshot, 'the top level', origin)
-    _SNAPSHOT.check(top, '', origin)
-    _require_evidence_agrees(top, origin)
+    _INSTRUMENT.check(top.get('instrument'), 'instrument', origin)
+    version = top.get('schema_version')
+    shape = _SNAPSHOTS.get(version) if _is_int(version) else None
+    if shape is None:
+        raise _invalid(origin, 'schema_version', _described(version), f'one of {sorted(_SNAPSHOTS)}')
+    versioned = f'{origin} (schema {version})'
+    shape.check(top, '', versioned)
+    _require_evidence_agrees(top, versioned)
     return top
 
 
@@ -806,6 +1030,11 @@ _PAIR_MOVED = (
 )
 _PAIR_ADDED = '; total up: complexity added'
 _CROSSING_LABEL = 'measure per heuristic 14, not a target'
+_PARAMS_DIFFER = 'params differ: '
+_NOT_ATTRIBUTABLE = (
+    'not attributable to code: a delta below may come from the params change, not from the code'
+)
+_UNKNOWN = 'unknown'
 
 
 @dataclasses.dataclass(frozen=True)
@@ -881,6 +1110,32 @@ def _record_pairs(
     return sorted(pairs, key=lambda pair: pair[0])
 
 
+def _param_rendered(snapshot: Mapping[str, Any], key: str) -> str:
+    """*key*'s value as JSON, or bare unknown when *snapshot*'s schema does not record it."""
+    if key in _unknown_params(snapshot):
+        return _UNKNOWN
+    return json.dumps(snapshot['params'][key], sort_keys=True)
+
+
+def _params_entries(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
+    """Every params key unknown on either side or differing, sorted: unknown never equals unknown."""
+    renderings = (
+        (key, _param_rendered(previous, key), _param_rendered(current, key)) for key in _PARAMS_KEYS
+    )
+    return [
+        f'{key} {before} -> {after}'
+        for key, before, after in renderings
+        if _UNKNOWN in (before, after) or before != after
+    ]
+
+
+def _params_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
+    entries = _params_entries(current, previous)
+    if not entries:
+        return []
+    return [_PARAMS_DIFFER + '; '.join(entries), f'  {_NOT_ATTRIBUTABLE}']
+
+
 def _header(label: str, snapshot: Mapping[str, Any]) -> str:
     complete = json.dumps(snapshot['evidence']['complete'])
     return f'{label}: {snapshot["run_id"]} as_of {snapshot["as_of_sha"]} complete={complete}'
@@ -931,33 +1186,27 @@ def _crossing_entries(pairs: Sequence[_RecordPair]) -> list[str]:
     return entries
 
 
-#: (label, import_graph list, comparison key without line numbers, rendering of a key).
-_GRAPH_KINDS: tuple[tuple[str, str, Any, Any], ...] = (
-    ('edge', 'edges', lambda edge: tuple(edge), lambda key: f'{key[0]} -> {key[1]}'),
-    (
-        'reach-back',
-        'reach_back',
-        lambda entry: (entry['from'], entry['to'], tuple(entry['names'])),
-        lambda key: f'{key[0]} -> {key[1]} ({", ".join(key[2])})',
-    ),
-    (
-        'deferred',
-        'deferred',
-        lambda entry: (entry['from'], tuple(entry['imports'])),
-        lambda key: f'{key[0]}: {", ".join(key[1])}',
-    ),
-    ('cycle', 'cycles', lambda cycle: tuple(cycle), lambda key: ', '.join(key)),
-)
+def _graph_kind_entries(
+    kind: _GraphKind, current: Mapping[str, Any], previous: Mapping[str, Any]
+) -> list[str]:
+    """One kind's additions and removals; unknown, never compared, when a side's schema lacks it."""
+    unknown = [
+        f'{kind.label}s unknown: the {side} snapshot is schema {taken["schema_version"]}'
+        for side, taken in (('current', current), ('previous', previous))
+        if not _records(taken, kind)
+    ]
+    if unknown:
+        return unknown
+    before = Counter(kind.key(entry) for entry in kind.entries(previous['import_graph']))
+    after = Counter(kind.key(entry) for entry in kind.entries(current['import_graph']))
+    return [
+        *(f'{kind.label} added: {kind.render(key)}' for key in sorted((after - before).elements())),
+        *(f'{kind.label} removed: {kind.render(key)}' for key in sorted((before - after).elements())),
+    ]
 
 
 def _graph_change_entries(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
-    entries = []
-    for label, name, key_of, render in _GRAPH_KINDS:
-        before = Counter(key_of(item) for item in previous['import_graph'][name])
-        after = Counter(key_of(item) for item in current['import_graph'][name])
-        entries += [f'{label} added: {render(key)}' for key in sorted((after - before).elements())]
-        entries += [f'{label} removed: {render(key)}' for key in sorted((before - after).elements())]
-    return entries
+    return [entry for kind in _GRAPH_KINDS for entry in _graph_kind_entries(kind, current, previous)]
 
 
 def _change_parts(old: Iterable[str], new: Iterable[str]) -> list[str]:
@@ -1007,10 +1256,15 @@ def _diff_section(header: str, entries: Sequence[str]) -> list[str]:
 
 
 def diff_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
-    """What moved from *previous* to *current*: measures and their changes, never a verdict."""
+    """What moved from *previous* to *current*: measures and their changes, never a verdict.
+
+    When a params key differs or is unknown on either side, a params-differ line
+    and its not-attributable label come first.
+    """
     pairing = _pairing(current, previous)
     pairs = _record_pairs(pairing, current, previous)
     return [
+        *_params_lines(current, previous),
         _header('current', current),
         _header('previous', previous),
         *_diff_section('unreadable (measures unknown, never zero):', _unreadable_entries(current, previous)),
@@ -1031,63 +1285,110 @@ def diff_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[
 # --summary: per-member counts and totals, members in name order.
 
 _Records = Sequence[Mapping[str, Any]]
+#: A cell's typed value: a count or total, or the (max, total) cognitive pair.
+_CellValue = int | tuple[int, int]
 
 
-def _sum_over(kind: str | None, value: Callable[[Mapping[str, Any]], int]) -> Callable[[_Records], str]:
+def _sum_over(kind: str | None, value: Callable[[Mapping[str, Any]], int]) -> Callable[[_Records], int]:
     """An aggregator summing *value* over the records of *kind* (every record when None)."""
 
-    def aggregate(records: _Records) -> str:
-        return str(sum(value(record) for record in records if kind in (None, record['kind'])))
+    def aggregate(records: _Records) -> int:
+        return sum(value(record) for record in records if kind in (None, record['kind']))
 
     return aggregate
 
 
-def _cognitive_pair(records: _Records) -> str:
+def _cognitive_pair(records: _Records) -> tuple[int, int]:
     src = [record for record in records if record['kind'] == _SRC]
     highest = max((record['cognitive_max'] for record in src), default=0)
-    return f'{highest} / {sum(record["cognitive_total"] for record in src)}'
+    return highest, sum(record['cognitive_total'] for record in src)
 
 
-#: Every column after member and pseudo, as (header, aggregator over file records).
-_SUMMARY_COLUMNS: tuple[tuple[str, Callable[[_Records], str]], ...] = (
-    ('src files', _sum_over(_SRC, lambda record: 1)),
-    ('src lines', _sum_over(_SRC, lambda record: record['lines'])),
-    ('src prose lines', _sum_over(_SRC, lambda record: record['prose_lines'])),
-    ('src cognitive max / total', _cognitive_pair),
-    ('tests files', _sum_over(_TESTS, lambda record: 1)),
-    ('tests lines', _sum_over(_TESTS, lambda record: record['lines'])),
-    ('tests cognitive total', _sum_over(_TESTS, lambda record: record['cognitive_total'])),
+def _cell_text(value: _CellValue) -> str:
+    """A cell as the markdown table prints it."""
+    if isinstance(value, tuple):
+        highest, total = value
+        return f'{highest} / {total}'
+    return str(value)
+
+
+_SummaryColumn = tuple[str, str, Callable[[_Records], _CellValue]]
+
+#: Each heuristic-14 column's slug and the line mark it counts files at.
+_H14_COLUMN_MARKS: Mapping[str, int] = {
+    'files_at_soft_ceiling': H14_SOFT_CEILING_LINES,
+    'files_at_alarm': H14_ALARM_LINES,
+}
+
+
+def _h14_column(slug: str, mark: int) -> _SummaryColumn:
+    return slug, f'files >= {mark} lines', _sum_over(None, lambda record: record['lines'] >= mark)
+
+
+#: Every column after member and pseudo, as (slug, header, aggregator over file records).
+_SUMMARY_COLUMNS: tuple[_SummaryColumn, ...] = (
+    ('src_files', 'src files', _sum_over(_SRC, lambda record: 1)),
+    ('src_lines', 'src lines', _sum_over(_SRC, lambda record: record['lines'])),
+    ('src_prose_lines', 'src prose lines', _sum_over(_SRC, lambda record: record['prose_lines'])),
+    ('src_cognitive_max_total', 'src cognitive max / total', _cognitive_pair),
+    ('tests_files', 'tests files', _sum_over(_TESTS, lambda record: 1)),
+    ('tests_lines', 'tests lines', _sum_over(_TESTS, lambda record: record['lines'])),
+    ('tests_cognitive_total', 'tests cognitive total', _sum_over(_TESTS, lambda record: record['cognitive_total'])),
+    *(_h14_column(slug, mark) for slug, mark in _H14_COLUMN_MARKS.items()),
+    ('function_local_imports', 'function-local imports', _sum_over(_SRC, lambda record: record['function_local_imports'])),
+    ('reexport_names', 're-export names', _sum_over(_SRC, lambda record: len(record['reexport_names']))),
+    ('reach_back_imports', 'reach-back imports', _sum_over(_SRC, lambda record: record['reach_back_imports'])),
     (
-        f'files >= {H14_SOFT_CEILING_LINES} lines',
-        _sum_over(None, lambda record: record['lines'] >= H14_SOFT_CEILING_LINES),
-    ),
-    (
-        f'files >= {H14_ALARM_LINES} lines',
-        _sum_over(None, lambda record: record['lines'] >= H14_ALARM_LINES),
-    ),
-    ('function-local imports', _sum_over(_SRC, lambda record: record['function_local_imports'])),
-    ('re-export names', _sum_over(_SRC, lambda record: len(record['reexport_names']))),
-    ('reach-back imports', _sum_over(_SRC, lambda record: record['reach_back_imports'])),
-    (
+        'private_patch_targets',
         'private patch targets',
         _sum_over(_TESTS, lambda record: len(record['private_patch_targets'])),
     ),
-    ('private reads', _sum_over(_TESTS, lambda record: record['private_reads'])),
+    ('private_reads', 'private reads', _sum_over(_TESTS, lambda record: record['private_reads'])),
 )
+
+
+def _row_values(records: _Records) -> list[_CellValue]:
+    return [aggregate(records) for _slug, _header, aggregate in _SUMMARY_COLUMNS]
+
+
+def _member_rows(snapshot: Mapping[str, Any]) -> list[tuple[str, bool, list[_CellValue]]]:
+    """(member, pseudo, cell values) per member, in name order."""
+    by_member: dict[str, list[Mapping[str, Any]]] = {}
+    for record in snapshot['files'].values():
+        by_member.setdefault(record['member'], []).append(record)
+    pseudo = {member['name']: member['pseudo'] for member in snapshot['evidence']['members']}
+    return [(name, pseudo[name], _row_values(by_member.get(name, []))) for name in sorted(pseudo)]
 
 
 def _markdown_row(cells: Sequence[str]) -> str:
     return '| ' + ' | '.join(cells) + ' |'
 
 
+def _graph_counts(snapshot: Mapping[str, Any]) -> dict[str, int | None]:
+    """The import graph's count of each kind by slug; a kind its schema does not record is None, never zero."""
+    graph = snapshot['import_graph']
+    return {
+        kind.slug: len(kind.entries(graph)) if _records(snapshot, kind) else None for kind in _GRAPH_KINDS
+    }
+
+
+def _graph_line(snapshot: Mapping[str, Any]) -> str:
+    counts = _graph_counts(snapshot)
+    known = [f'{counts[kind.slug]} {kind.label}s' for kind in _GRAPH_KINDS if counts[kind.slug] is not None]
+    unknown = [f'{kind.label}s' for kind in _GRAPH_KINDS if counts[kind.slug] is None]
+    line = f'import graph: {", ".join(known)}'
+    if unknown:
+        line += f'; {", ".join(unknown)} unknown (schema {snapshot["schema_version"]})'
+    return line
+
+
 def _summary_header(snapshot: Mapping[str, Any]) -> list[str]:
-    evidence, graph = snapshot['evidence'], snapshot['import_graph']
+    evidence = snapshot['evidence']
     lines = [
         f'run: {snapshot["run_id"]} as_of {snapshot["as_of_sha"]} since {snapshot["since"]}',
         f'files: {evidence["measured_files"]}/{evidence["domain_files"]} measured, '
         f'complete={json.dumps(evidence["complete"])}',
-        f'import graph: {len(graph["edges"])} edges, {len(graph["reach_back"])} reach-backs, '
-        f'{len(graph["deferred"])} deferred imports, {len(graph["cycles"])} cycles',
+        _graph_line(snapshot),
     ]
     if evidence['unreadable']:
         lines.append('unreadable (measures unknown, never zero):')
@@ -1097,17 +1398,12 @@ def _summary_header(snapshot: Mapping[str, Any]) -> list[str]:
 
 def summary_table(snapshot: Mapping[str, Any]) -> str:
     """Header lines, then one markdown row per member in name order and a (domain) row."""
-    records = list(snapshot['files'].values())
-    by_member: dict[str, list[Mapping[str, Any]]] = {}
-    for record in records:
-        by_member.setdefault(record['member'], []).append(record)
-    pseudo = {member['name']: member['pseudo'] for member in snapshot['evidence']['members']}
     rows = [
-        [name, json.dumps(pseudo[name]), *(cell(by_member.get(name, [])) for _h, cell in _SUMMARY_COLUMNS)]
-        for name in sorted(pseudo)
+        [name, json.dumps(pseudo), *map(_cell_text, values)]
+        for name, pseudo, values in _member_rows(snapshot)
     ]
-    rows.append(['(domain)', '', *(cell(records) for _h, cell in _SUMMARY_COLUMNS)])
-    headers = ['member', 'pseudo', *(header for header, _cell in _SUMMARY_COLUMNS)]
+    rows.append(['(domain)', '', *map(_cell_text, _row_values(list(snapshot['files'].values())))])
+    headers = ['member', 'pseudo', *(header for _slug, header, _aggregate in _SUMMARY_COLUMNS)]
     return '\n'.join([
         *_summary_header(snapshot),
         '',
@@ -1117,6 +1413,35 @@ def summary_table(snapshot: Mapping[str, Any]) -> str:
     ])
 
 
+def _json_cells(values: Sequence[_CellValue]) -> list[dict[str, Any]]:
+    return [{'value': value, 'text': _cell_text(value)} for value in values]
+
+
+def summary_json(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """summary_table's figures as one JSON object: each cell its typed value and its markdown text."""
+    evidence = snapshot['evidence']
+    return {
+        'run_id': snapshot['run_id'],
+        'as_of_sha': snapshot['as_of_sha'],
+        'since': snapshot['since'],
+        'schema_version': snapshot['schema_version'],
+        'params': snapshot['params'],
+        'unknown_params': _unknown_params(snapshot),
+        'complete': evidence['complete'],
+        'measured_files': evidence['measured_files'],
+        'domain_files': evidence['domain_files'],
+        'unreadable': evidence['unreadable'],
+        'columns': [{'slug': slug, 'header': header} for slug, header, _aggregate in _SUMMARY_COLUMNS],
+        'members': [
+            {'member': name, 'pseudo': pseudo, 'cells': _json_cells(values)}
+            for name, pseudo, values in _member_rows(snapshot)
+        ],
+        'domain': {'cells': _json_cells(_row_values(list(snapshot['files'].values())))},
+        'h14_marks': dict(_H14_COLUMN_MARKS),
+        'import_graph': _graph_counts(snapshot),
+    }
+
+
 # ---------------------------------------------------------------------------
 # The command line.
 
@@ -1124,8 +1449,10 @@ def summary_table(snapshot: Mapping[str, Any]) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            'Measure every workspace member\'s tracked Python at HEAD as a schema-1 '
-            'snapshot (plans/quality-metrics-snapshot-prd.md), diff two snapshots, '
+            "Measure the domain's tracked Python (a uv workspace's members or a single "
+            'src-layout package, plus pseudo-members) at HEAD as a '
+            f'schema-{SCHEMA_VERSION} snapshot (plans/quality-metrics-snapshot-prd.md), '
+            'diff two snapshots, '
             'or print one as a per-member table. A report, never a gate.'
         ),
         epilog=(
@@ -1142,12 +1469,27 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--diff', help='The previous snapshot to diff against.')
     parser.add_argument('--current', help='Diff this snapshot instead of measuring.')
     parser.add_argument('--summary', help='Print this snapshot as a per-member table.')
+    parser.add_argument(
+        '--json',
+        action='store_true',
+        help='With --summary: print the table as one JSON object, each cell its typed value and its text.',
+    )
+    parser.add_argument(
+        '--params',
+        action='store_true',
+        help='Print the params a measurement here would record, as one JSON line; measure nothing.',
+    )
     return parser
 
 
 def _require_one_mode(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     measuring = (args.run_id, args.out, args.root) != (None, None, None)
-    if args.summary is not None:
+    if args.json and args.summary is None:
+        parser.error('--json is only for --summary')
+    if args.params:
+        if measuring or (args.diff, args.current, args.summary) != (None, None, None):
+            parser.error('--params takes no other argument')
+    elif args.summary is not None:
         if measuring or args.diff is not None or args.current is not None:
             parser.error('--summary takes no other argument')
     elif args.current is not None:
@@ -1156,7 +1498,7 @@ def _require_one_mode(parser: argparse.ArgumentParser, args: argparse.Namespace)
     elif args.run_id is None or args.out is None:
         parser.error(
             'measuring needs both --run-id and --out; '
-            'otherwise give --current with --diff, or --summary'
+            'otherwise give --current with --diff, --summary, or --params'
         )
 
 
@@ -1201,8 +1543,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _require_one_mode(parser, args)
     try:
+        if args.params:
+            print(json.dumps(measurement_params()))
+            return 0
         if args.summary is not None:
-            print(summary_table(load_snapshot(Path(args.summary))))
+            summarised = load_snapshot(Path(args.summary))
+            print(json.dumps(summary_json(summarised), sort_keys=True) if args.json else summary_table(summarised))
             return 0
         if args.current is not None:
             return _compare(args)

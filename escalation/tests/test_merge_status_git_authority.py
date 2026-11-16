@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -24,6 +25,15 @@ from unittest.mock import call as mock_call
 
 import pytest
 from _merge_tool_calls import call_merge_request, call_merge_status
+from _rebased_landing_git import (
+    add_unlanded_branch,
+    build_rebased_solo_landing,
+    new_repo,
+    reapply_tip_on_main,
+)
+from _rebased_landing_git import git as landing_git
+from shared.merge_state import MergeReason
+from shared.task_read import TaskFound, TaskReadFailed
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
@@ -111,8 +121,18 @@ def _make_config(
     )
 
 
+def _read_task_raising() -> AsyncMock:
+    return AsyncMock(side_effect=RuntimeError('scheduler unreachable'))
+
+
+def _read_task_reporting_failure() -> AsyncMock:
+    return AsyncMock(
+        return_value=TaskReadFailed("get_task error='boom', error_type='BackendUnavailable'"),
+    )
+
+
 def _stub_harness(
-    git_ops, *, metadata: dict[str, Any] | None = None, get_task_raises: bool = False,
+    git_ops, *, metadata: dict[str, Any] | None = None, faulty_read_task: AsyncMock | None = None,
 ) -> types.SimpleNamespace:
     """Return the standard merge_status harness stub wired to *git_ops*.
 
@@ -123,22 +143,22 @@ def _stub_harness(
     the citation gate), and the shape every pre-existing test in this module
     already uses.
 
-    Pass ``metadata=`` to attach a ``.scheduler`` whose ``get_task`` resolves
-    to ``{'metadata': metadata}``, or ``get_task_raises=True`` to attach one
-    whose ``get_task`` raises — the scheduler-fault path.
+    Pass ``metadata=`` to attach a ``.scheduler`` whose ``read_task`` resolves
+    to ``TaskFound({'metadata': metadata})``, or ``faulty_read_task=`` to attach
+    a scheduler fault: :func:`_read_task_reporting_failure` is the production
+    shape, since the real ``Scheduler.read_task`` never raises, and
+    :func:`_read_task_raising` is a duck-typed scheduler's.
     """
     harness = types.SimpleNamespace(
         _merge_worker=None,
         _terminal_retention=None,
         git_ops=git_ops,
     )
-    if get_task_raises:
-        harness.scheduler = types.SimpleNamespace(
-            get_task=AsyncMock(side_effect=RuntimeError('scheduler unreachable')),
-        )
+    if faulty_read_task is not None:
+        harness.scheduler = types.SimpleNamespace(read_task=faulty_read_task)
     elif metadata is not None:
         harness.scheduler = types.SimpleNamespace(
-            get_task=AsyncMock(return_value={'metadata': metadata}),
+            read_task=AsyncMock(return_value=TaskFound({'metadata': metadata})),
         )
     return harness
 
@@ -161,14 +181,14 @@ def _record_validate_landing_evidence(
     additionally observed.
 
     Patch the DEFINING module, not the importer: server.py's
-    ``from orchestrator.landing_evidence import ...`` is lazy and inside the
+    ``from orchestrator.merge_lane.landing_evidence import ...`` is lazy and inside the
     function body, so the module attribute is re-resolved on every call.
 
     Read ``call.kwargs['delivered_checks']`` BY NAME rather than by positional
     index, so the pin survives task 4500 flipping that parameter to
     keyword-only.
     """
-    from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.landing_evidence import (
         validate_landing_evidence as _real,
     )
 
@@ -179,7 +199,7 @@ def _record_validate_landing_evidence(
         return await _real(*args, **kwargs)
 
     monkeypatch.setattr(
-        'orchestrator.landing_evidence.validate_landing_evidence', _recorder,
+        'orchestrator.merge_lane.landing_evidence.validate_landing_evidence', _recorder,
     )
     return calls
 
@@ -225,6 +245,20 @@ def orch_config(git_repo: Path) -> OrchestratorConfig:  # type: ignore[reportInv
 @pytest.fixture
 def git_ops(orch_config: OrchestratorConfig) -> GitOps:  # type: ignore[reportInvalidTypeForm]
     return GitOps(orch_config.git, orch_config.project_root)
+
+
+@pytest.fixture
+def fresh_landing_tally(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Charge the real ``branch_work_landed``'s verdicts to a throwaway tally.
+
+    The patch-id arm runs the producer for real, and it charges the
+    process-lifetime ``orchestrator.merge_lane.landing_evidence.LANDING_TALLY``
+    on every verdict; that attribute's own comment says tests replace it.
+    """
+    from orchestrator.merge_lane.landing_evidence import LandingTally
+    monkeypatch.setattr(
+        'orchestrator.merge_lane.landing_evidence.LANDING_TALLY', LandingTally(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +385,7 @@ class TestMergeStatusGitAuthority:
     async def test_fire_safe_resolve_branch_sha_raises_returns_unknown(
         self, tmp_path: Path
     ) -> None:
-        """(a) fire-safe: resolve_branch_sha raising → state='unknown', no raise."""
+        """(a) fire-safe: resolve_branch_sha raising → a git probe_failed unknown, no raise."""
         rsb = AsyncMock(side_effect=RuntimeError('git exploded'))
         stub_git = _stub_git_ops(resolve_branch_sha=rsb)
         server = await self._make_server_with_git_ops(tmp_path, stub_git)
@@ -359,14 +393,16 @@ class TestMergeStatusGitAuthority:
         result = await call_merge_status(server, task_id='T')
 
         assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
+        assert result.get('reason') == MergeReason.probe_failed, f'Expected probe_failed: {result}'
+        assert result.get('source') == 'git', f'Expected source=git: {result}'
         assert 'hint' in result, f'Expected hint key in unknown response: {result}'
 
     async def test_fire_safe_is_ancestor_raises_returns_unknown(
         self, tmp_path: Path
     ) -> None:
-        """(a) fire-safe: is_ancestor raising → state='unknown', no raise."""
+        """(a) fire-safe: is_ancestor raising → a git probe_failed unknown, no raise."""
         tip = 'c' * 40
-        rsb = AsyncMock(return_value=tip)
+        rsb = AsyncMock(side_effect=lambda b: tip if b.startswith('task/') else 'm' * 40)
         ia = AsyncMock(side_effect=RuntimeError('git subprocess died'))
         stub_git = _stub_git_ops(resolve_branch_sha=rsb, is_ancestor=ia)
         server = await self._make_server_with_git_ops(tmp_path, stub_git)
@@ -374,12 +410,38 @@ class TestMergeStatusGitAuthority:
         result = await call_merge_status(server, task_id='T')
 
         assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
+        assert result.get('reason') == MergeReason.probe_failed, f'Expected probe_failed: {result}'
+        assert result.get('source') == 'git', f'Expected source=git: {result}'
         assert 'hint' in result, f'Expected hint key in unknown response: {result}'
 
-    async def test_genuine_miss_branch_present_not_on_main_returns_unknown(
+    @pytest.mark.usefixtures('fresh_landing_tally')
+    async def test_patch_id_arm_git_error_returns_unknown(self, tmp_path: Path) -> None:
+        """A patch-id arm that could not look answers unknown, never a miss.
+
+        The stub answers only the dispatch's two calls (a live tip that is
+        neither main's tip nor an ancestor of it), so the real
+        ``branch_work_landed`` hits a missing primitive and reports
+        ``git_error``.
+        """
+        tip = 'a' * 40
+        stub_git = types.SimpleNamespace(
+            resolve_branch_sha=AsyncMock(
+                side_effect=lambda b: tip if b.startswith('task/') else 'm' * 40,
+            ),
+            is_ancestor=AsyncMock(return_value=False),
+        )
+        server = await self._make_server_with_git_ops(tmp_path, stub_git)
+
+        result = await call_merge_status(server, task_id='T')
+
+        assert result.get('state') == 'unknown', f'got: {result}'
+        assert result.get('reason') == MergeReason.probe_failed, f'got: {result}'
+        assert result.get('source') == 'git', f'got: {result}'
+
+    async def test_genuine_miss_branch_present_not_on_main_returns_no_record(
         self, tmp_path: Path
     ) -> None:
-        """(b) genuine miss: tip present, is_ancestor=False, no marker → unknown.
+        """(b) genuine miss: tip present, is_ancestor=False, no marker → no_record.
 
         A branch that exists but hasn't landed on main yet must NOT
         false-positive as 'done'.
@@ -394,16 +456,17 @@ class TestMergeStatusGitAuthority:
 
         result = await call_merge_status(server, task_id='T-pending')
 
-        assert result.get('state') == 'unknown', (
-            f'Branch not on main must stay unknown, got: {result}'
+        assert result.get('state') == 'no_record', (
+            f'Branch not on main must be no_record, got: {result}'
         )
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
         # find_merge_marker must NOT be called when tip is present (cheaper path)
         fmm.assert_not_called()
 
-    async def test_guard_orch_config_absent_returns_unknown(
+    async def test_guard_orch_config_absent_returns_no_record(
         self, tmp_path: Path
     ) -> None:
-        """(c) guard: git_ops present but no orch_config → straight to honest unknown."""
+        """(c) guard: git_ops present but no orch_config → the git tier is skipped."""
         stub_git = _stub_git_ops(
             resolve_branch_sha=AsyncMock(return_value='e' * 40),
             is_ancestor=AsyncMock(return_value=True),
@@ -419,14 +482,15 @@ class TestMergeStatusGitAuthority:
 
         result = await call_merge_status(server, task_id='T-noconfig')
 
-        assert result.get('state') == 'unknown', (
-            f'No orch_config must yield unknown, got: {result}'
+        assert result.get('state') == 'no_record', (
+            f'No orch_config must yield no_record, got: {result}'
         )
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
 
-    async def test_guard_git_ops_absent_returns_unknown(
+    async def test_guard_git_ops_absent_returns_no_record(
         self, tmp_path: Path
     ) -> None:
-        """(d) guard: harness without git_ops attr → straight to honest unknown."""
+        """(d) guard: harness without git_ops attr → the git tier is skipped."""
         # Harness with NO git_ops attribute at all
         stub_harness = types.SimpleNamespace(
             _merge_worker=None,
@@ -443,24 +507,25 @@ class TestMergeStatusGitAuthority:
 
         result = await call_merge_status(server, task_id='T-nogit')
 
-        assert result.get('state') == 'unknown', (
-            f'No git_ops must yield unknown, got: {result}'
+        assert result.get('state') == 'no_record', (
+            f'No git_ops must yield no_record, got: {result}'
         )
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
 
     # ── suggestion-1: branch-at-main-HEAD no-op guard ────────────────────────
 
-    async def test_branch_at_main_head_returns_unknown(
+    async def test_branch_at_main_head_returns_no_record(
         self, tmp_path: Path
     ) -> None:
-        """Branch tip == main tip (no extra commits) must return unknown, not done.
+        """Branch tip == main tip (no extra commits) must return no_record, not done.
 
         A commit is its own ancestor, so is_ancestor(tip, main) would return
         True even when the branch has no extra commits and nothing has been
         merged — a false-positive 'done'.
 
         The tip != main_tip guard prevents this: when the branch sits at
-        exactly main's HEAD, Tier-3.5 falls through to the honest Tier-4
-        unknown.  is_ancestor must NOT be called (Python short-circuit).
+        exactly main's HEAD, the git tier reports no signal and the walk ends
+        in no_record.  is_ancestor must NOT be called (Python short-circuit).
         """
         tip = 'f' * 40  # branch and main both at the same SHA
         rsb = AsyncMock(return_value=tip)   # returns same SHA for ALL resolve calls
@@ -475,9 +540,10 @@ class TestMergeStatusGitAuthority:
 
         result = await call_merge_status(server, task_id='same-as-main')
 
-        assert result.get('state') == 'unknown', (
-            f'Branch at main HEAD must return unknown (not false-positive done): {result}'
+        assert result.get('state') == 'no_record', (
+            f'Branch at main HEAD must return no_record (not false-positive done): {result}'
         )
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
         # is_ancestor must NOT be called — tip==main_tip guard short-circuits first
         ia.assert_not_called()
         # find_merge_marker must NOT be called — tip is not None so deleted-branch
@@ -486,10 +552,10 @@ class TestMergeStatusGitAuthority:
 
     # ── task 3103: ancestor-arm degeneracy guard ─────────────────────────────
 
-    async def test_degenerate_ancestor_branch_returns_unknown(
+    async def test_degenerate_ancestor_branch_returns_no_record(
         self, tmp_path: Path
     ) -> None:
-        """A branch parked at an OLD main commit must return unknown, not done.
+        """A branch parked at an OLD main commit must return no_record, not done.
 
         The live 3024/3031 shape (53 of the 64 reify census candidates): a
         warm-lane CoW seed that faulted, or a task that never committed, sits
@@ -499,7 +565,7 @@ class TestMergeStatusGitAuthority:
         containing none of the task's work.
 
         branch_tip_sha == branch_base_sha proves zero commits were ever
-        pushed, so the honest answer is Tier-4 unknown.
+        pushed, so the git tier reports no signal and the answer is no_record.
         """
         tip = 'a' * 40
         main_sha = 'm' * 40
@@ -518,15 +584,16 @@ class TestMergeStatusGitAuthority:
 
         result = await call_merge_status(server, task_id='3024')
 
-        assert result.get('state') == 'unknown', (
+        assert result.get('state') == 'no_record', (
             f'Degenerate branch must NOT resolve as done, got: {result}'
         )
-        assert 'hint' in result, f'Expected hint key in unknown response: {result}'
-        # No terminal-shaped keys may leak into the honest unknown
-        assert 'merge_sha' not in result, f'merge_sha leaked into unknown: {result}'
-        assert 'kind' not in result, f'kind leaked into unknown: {result}'
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
+        assert 'hint' in result, f'Expected hint key in no_record response: {result}'
+        # No terminal-shaped keys may leak into the epistemic answer
+        assert 'merge_sha' not in result, f'merge_sha leaked into no_record: {result}'
+        assert 'kind' not in result, f'kind leaked into no_record: {result}'
 
-    async def test_degenerate_branch_with_citation_on_main_still_unknown(
+    async def test_degenerate_branch_with_citation_on_main_still_no_record(
         self, tmp_path: Path
     ) -> None:
         """Ordering pin: the degeneracy guard runs BEFORE the citation gate.
@@ -559,10 +626,11 @@ class TestMergeStatusGitAuthority:
 
         result = await call_merge_status(server, task_id='5493')
 
-        assert result.get('state') == 'unknown', (
-            f'Degenerate branch must stay unknown even with a citation on '
+        assert result.get('state') == 'no_record', (
+            f'Degenerate branch must stay no_record even with a citation on '
             f'main, got: {result}'
         )
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
         ftcc.assert_not_called()
 
     async def test_degenerate_guard_consults_task_metadata_by_bare_id(
@@ -591,10 +659,11 @@ class TestMergeStatusGitAuthority:
 
         result = await call_merge_status(server, branch='task/3024')
 
-        assert result.get('state') == 'unknown', (
-            f'Degenerate branch via branch= form must be unknown, got: {result}'
+        assert result.get('state') == 'no_record', (
+            f'Degenerate branch via branch= form must be no_record, got: {result}'
         )
-        stub_harness.scheduler.get_task.assert_awaited_once_with('3024')
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
+        stub_harness.scheduler.read_task.assert_awaited_once_with('3024')
 
     # ── task 3103: ancestor-arm citation gate ────────────────────────────────
 
@@ -607,7 +676,7 @@ class TestMergeStatusGitAuthority:
         citation: str | None = None,
         effect_present: bool = True,
         metadata: dict[str, Any] | None = None,
-        get_task_raises: bool = False,
+        faulty_read_task: AsyncMock | None = None,
         commit_citation_pattern: str | None = None,
     ) -> tuple[Any, types.SimpleNamespace]:
         """Build a server whose branch is a NON-degenerate ancestor of main.
@@ -624,7 +693,7 @@ class TestMergeStatusGitAuthority:
             commit_effect_present_in_main=AsyncMock(return_value=effect_present),
         )
         stub_harness = _stub_harness(
-            stub_git, metadata=metadata, get_task_raises=get_task_raises,
+            stub_git, metadata=metadata, faulty_read_task=faulty_read_task,
         )
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(
@@ -636,10 +705,10 @@ class TestMergeStatusGitAuthority:
         )
         return server, stub_git
 
-    async def test_reseeded_ancestor_branch_without_citation_returns_unknown(
+    async def test_reseeded_ancestor_branch_without_citation_returns_unattributable(
         self, tmp_path: Path
     ) -> None:
-        """A re-seeded branch with no citing commit on main must be unknown.
+        """A re-seeded branch with no citing commit on main must be unattributable.
 
         The 11-of-64 class the degeneracy predicate MISSES: a warm lane
         re-seeded the branch ref to a NEWER main commit after creation, so
@@ -655,9 +724,10 @@ class TestMergeStatusGitAuthority:
 
         result = await call_merge_status(server, task_id='3031')
 
-        assert result.get('state') == 'unknown', (
-            f'Uncited ancestor branch must be unknown, got: {result}'
+        assert result.get('state') == 'no_record', (
+            f'Uncited ancestor branch must be no_record, got: {result}'
         )
+        assert result.get('reason') == MergeReason.landing_unattributable, f'got: {result}'
         stub_git.find_task_citation_commit.assert_awaited_once()
 
     async def test_cited_ancestor_branch_returns_done_with_evidence_sha(
@@ -686,7 +756,7 @@ class TestMergeStatusGitAuthority:
             f'not the branch tip ({tip!r}); got: {result.get("merge_sha")!r}'
         )
 
-    async def test_cited_ancestor_branch_effect_absent_returns_unknown(
+    async def test_cited_ancestor_branch_effect_absent_returns_unattributable(
         self, tmp_path: Path
     ) -> None:
         """FIX 1' (task-1175 shape): a reverted landing must not read as done."""
@@ -697,12 +767,13 @@ class TestMergeStatusGitAuthority:
 
         result = await call_merge_status(server, task_id='901')
 
-        assert result.get('state') == 'unknown', (
-            f'A citation whose effect is absent at main HEAD must be unknown, '
+        assert result.get('state') == 'no_record', (
+            f'A citation whose effect is absent at main HEAD must be no_record, '
             f'got: {result}'
         )
+        assert result.get('reason') == MergeReason.landing_unattributable, f'got: {result}'
 
-    async def test_absent_branch_base_sha_without_citation_returns_unknown(
+    async def test_absent_branch_base_sha_without_citation_returns_unattributable(
         self, tmp_path: Path
     ) -> None:
         """Metadata {} fails OPEN out of degeneracy — the citation gate decides."""
@@ -712,9 +783,10 @@ class TestMergeStatusGitAuthority:
 
         result = await call_merge_status(server, task_id='902')
 
-        assert result.get('state') == 'unknown', (
-            f'No branch_base_sha and no citation must be unknown, got: {result}'
+        assert result.get('state') == 'no_record', (
+            f'No branch_base_sha and no citation must be no_record, got: {result}'
         )
+        assert result.get('reason') == MergeReason.landing_unattributable, f'got: {result}'
 
     async def test_absent_branch_base_sha_with_citation_returns_done(
         self, tmp_path: Path
@@ -783,30 +855,41 @@ class TestMergeStatusGitAuthority:
         )
 
     @pytest.mark.parametrize(
-        ('citation', 'expected_state'),
-        [('c' * 40, 'done'), (None, 'unknown')],
+        'faulty_read_task',
+        [_read_task_reporting_failure, _read_task_raising],
+        ids=['reports_failure', 'raises'],
+    )
+    @pytest.mark.parametrize(
+        ('citation', 'expected_state', 'expected_reason'),
+        [('c' * 40, 'done', None), (None, 'no_record', MergeReason.landing_unattributable)],
         ids=['cited', 'uncited'],
     )
-    async def test_get_task_raises_still_applies_citation_gate(
-        self, tmp_path: Path, citation: str | None, expected_state: str
+    async def test_scheduler_fault_still_applies_citation_gate(
+        self,
+        tmp_path: Path,
+        citation: str | None,
+        expected_state: str,
+        expected_reason: MergeReason | None,
+        faulty_read_task: Callable[[], AsyncMock],
     ) -> None:
         """A scheduler fault degrades ONE guard, never the whole probe.
 
         The metadata lookup's own try/except is nested inside the Tier-3.5
-        fire-safe wrapper precisely so a raising get_task cannot swallow the
+        fire-safe wrapper precisely so a failing read_task cannot swallow the
         citation gate along with the degeneracy check.
         """
         server, _ = self._ancestor_arm_server(
             tmp_path, '906', tip='a' * 40, citation=citation, effect_present=True,
-            get_task_raises=True,
+            faulty_read_task=faulty_read_task(),
         )
 
         result = await call_merge_status(server, task_id='906')
 
         assert isinstance(result, dict), 'merge_status must not raise'
         assert result.get('state') == expected_state, (
-            f'Expected {expected_state} with a raising scheduler, got: {result}'
+            f'Expected {expected_state} with a failing scheduler, got: {result}'
         )
+        assert result.get('reason') == expected_reason, f'got: {result}'
 
     # ── task 3103: marker-arm veto + CANDIDATE-mode landing evidence ─────────
 
@@ -834,7 +917,7 @@ class TestMergeStatusGitAuthority:
         )
         return server, stub_git
 
-    async def test_marker_predating_branch_base_sha_returns_unknown(
+    async def test_marker_predating_branch_base_sha_returns_no_record(
         self, tmp_path: Path
     ) -> None:
         """A marker older than this incarnation's base belongs to a PREVIOUS run.
@@ -855,9 +938,10 @@ class TestMergeStatusGitAuthority:
 
         result = await call_merge_status(server, task_id='800')
 
-        assert result.get('state') == 'unknown', (
-            f'A marker predating branch_base_sha must be unknown, got: {result}'
+        assert result.get('state') == 'no_record', (
+            f'A marker predating branch_base_sha must be no_record, got: {result}'
         )
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
         stub_git.commit_effect_present_in_main.assert_not_called()
 
     async def test_marker_not_predating_base_returns_done(
@@ -907,7 +991,7 @@ class TestMergeStatusGitAuthority:
         assert result.get('merge_sha') == marker
         stub_git.is_ancestor.assert_not_called()
 
-    async def test_marker_effect_absent_returns_unknown(
+    async def test_marker_effect_absent_returns_unattributable(
         self, tmp_path: Path
     ) -> None:
         """FIX 1' on the marker arm: a reverted merge must not read as done.
@@ -923,10 +1007,11 @@ class TestMergeStatusGitAuthority:
 
         result = await call_merge_status(server, task_id='803')
 
-        assert result.get('state') == 'unknown', (
-            f'A marker whose effect is absent at main HEAD must be unknown, '
+        assert result.get('state') == 'no_record', (
+            f'A marker whose effect is absent at main HEAD must be no_record, '
             f'got: {result}'
         )
+        assert result.get('reason') == MergeReason.landing_unattributable, f'got: {result}'
 
     # ── task 4498: delivered_checks wiring at both git-authority arms ────────
     #
@@ -1131,7 +1216,7 @@ class TestMergeStatusGitAuthorityIntegration:
             f'merge_sha must be a 40-char SHA, got: {result["merge_sha"]!r}'
         )
 
-    async def test_degenerate_branch_parked_on_old_main_returns_unknown(
+    async def test_degenerate_branch_parked_on_old_main_returns_no_record(
         self, tmp_path: Path, git_ops: GitOps, orch_config: OrchestratorConfig  # type: ignore[reportInvalidTypeForm]
     ) -> None:
         """End-to-end, no stubs: the user-observable false-positive signal.
@@ -1143,7 +1228,7 @@ class TestMergeStatusGitAuthorityIntegration:
         answered done/found_on_main against a foreign commit.
 
         The advancing commit on main deliberately does NOT cite the task, so
-        the citation gate is not what produces the unknown here; the
+        the citation gate is not what produces the no_record here; the
         degeneracy guard is.
         """
         tid = '3024'
@@ -1191,12 +1276,13 @@ class TestMergeStatusGitAuthorityIntegration:
 
         result = await call_merge_status(server, task_id=tid)
 
-        assert result.get('state') == 'unknown', (
-            f'A branch parked on an old main commit must return unknown, '
+        assert result.get('state') == 'no_record', (
+            f'A branch parked on an old main commit must return no_record, '
             f'got: {result}'
         )
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
 
-    async def test_reseeded_uncited_ancestor_branch_returns_unknown(
+    async def test_reseeded_uncited_ancestor_branch_returns_unattributable(
         self, tmp_path: Path, git_ops: GitOps, orch_config: OrchestratorConfig  # type: ignore[reportInvalidTypeForm]
     ) -> None:
         """End-to-end: a re-seeded branch the degeneracy predicate MISSES.
@@ -1268,10 +1354,11 @@ class TestMergeStatusGitAuthorityIntegration:
 
         result = await call_merge_status(server, task_id=tid)
 
-        assert result.get('state') == 'unknown', (
-            f'A re-seeded, uncited ancestor branch must return unknown, '
+        assert result.get('state') == 'no_record', (
+            f'A re-seeded, uncited ancestor branch must return no_record, '
             f'got: {result}'
         )
+        assert result.get('reason') == MergeReason.landing_unattributable, f'got: {result}'
 
     async def test_live_branch_merge_sha_is_the_citation_commit_on_main(
         self, tmp_path: Path, git_ops: GitOps, orch_config: OrchestratorConfig  # type: ignore[reportInvalidTypeForm]
@@ -1391,11 +1478,11 @@ class TestMergeStatusGitAuthorityIntegration:
 
         This test is the positive half of the pair that keeps the tier
         MEASURED.  Its negative twin,
-        ``test_cited_ancestor_branch_effect_absent_returns_unknown``, is a
-        GENUINE revert and must stay at ``unknown``.  The two answering
-        DIFFERENTLY is precisely the signal that the tightening worked; if
-        this one ever regresses to ``unknown`` again, the survival predicate
-        has collapsed back into byte-identity.
+        ``test_cited_ancestor_branch_effect_absent_returns_unattributable``,
+        is a GENUINE revert and must stay ``landing_unattributable``.  The two
+        answering DIFFERENTLY is precisely the signal that the tightening
+        worked; if this one ever regresses to ``landing_unattributable``, the
+        survival predicate has collapsed back into byte-identity.
         """
         tid = '772'
 
@@ -1427,7 +1514,7 @@ class TestMergeStatusGitAuthorityIntegration:
         assert rc == 0, f'later edit failed: {err!r}'
 
         # --- Preconditions: this is a GENUINE landing, not a degenerate or
-        # uncited branch — so `unknown` below can only come from the
+        # uncited branch — so a non-done answer below can only come from the
         # effect-present half of the citation gate. ---
         assert await git_ops.is_ancestor(f'task/{tid}', 'main'), (
             'precondition: the landed branch must be an ancestor of main'
@@ -1468,6 +1555,98 @@ class TestMergeStatusGitAuthorityIntegration:
             f'Expected merge_sha={merge_result.merge_commit!r}, got: {result}'
         )
 
+    @pytest.mark.usefixtures('fresh_landing_tally')
+    async def test_rebased_solo_landing_with_retained_ref_returns_done(
+        self, tmp_path: Path,
+    ) -> None:
+        """The worker-rebased solo landing answers ``done`` with no record anywhere.
+
+        ``GitOps.advance_main``'s rebased path rewrites every branch commit
+        onto main, writes no merge marker and retains ``task/<id>`` at its
+        pre-rebase tip, so neither the ancestor arm nor the marker arm can
+        see it.  The patch-id arm answers on every poll key that names the
+        branch, and its merge_sha is the rebased citing commit on main.
+        """
+        tid = '6978'
+        branch = f'task/{tid}'
+        landing = build_rebased_solo_landing(tmp_path / 'repo', tid, cited=True)
+        repo = landing.repo
+
+        rc, _, _ = await _run(['git', 'merge-base', '--is-ancestor', branch, 'main'], cwd=repo)
+        assert rc == 1, 'precondition: the retained tip is not an ancestor of main'
+        assert landing_git(
+            repo, 'log', 'main', '--fixed-strings', f'--grep=Merge {branch} into main',
+            '--format=%H',
+        ) == '', 'precondition: a rebased fast-forward writes no merge marker'
+        assert landing_git(repo, 'rev-parse', '--verify', branch) == landing.branch_tip, (
+            'precondition: the ref is retained at its pre-rebase tip'
+        )
+
+        config = _make_config(repo)
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            harness=_stub_harness(GitOps(config.git, repo)), orch_config=config,
+        )
+
+        for poll in ({'task_id': tid}, {'branch': tid}, {'branch': branch}):
+            result = await call_merge_status(server, **poll)
+
+            assert result.get('state') == 'done', f'{poll}: {result}'
+            assert result.get('kind') == 'found_on_main', f'{poll}: {result}'
+            assert result.get('source') == 'git', f'{poll}: {result}'
+            assert result.get('merge_sha') == landing.citing_sha, f'{poll}: {result}'
+            rc, _, _ = await _run(
+                ['git', 'merge-base', '--is-ancestor', result['merge_sha'], 'main'], cwd=repo,
+            )
+            assert rc == 0, f'{poll}: merge_sha must be a commit on main'
+
+    @pytest.mark.usefixtures('fresh_landing_tally')
+    async def test_live_unlanded_branch_is_not_done(self, tmp_path: Path) -> None:
+        """A non-ancestor live branch whose work is absent stays a plain miss.
+
+        Never ``done``, and never ``unknown`` either: the patch-id arm's
+        ``not_landed`` is a clean negative, not a probe that could not look.
+        """
+        tid = '6979'
+        repo = tmp_path / 'repo'
+        new_repo(repo)
+        add_unlanded_branch(repo, tid)
+        config = _make_config(repo)
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            harness=_stub_harness(GitOps(config.git, repo)), orch_config=config,
+        )
+
+        result = await call_merge_status(server, task_id=tid)
+
+        assert result.get('state') == 'no_record', f'got: {result}'
+        assert result.get('reason') == MergeReason.never_submitted, f'got: {result}'
+
+    @pytest.mark.usefixtures('fresh_landing_tally')
+    async def test_contained_but_unattributable_rebased_landing_answers_landing_unattributable(
+        self, tmp_path: Path,
+    ) -> None:
+        """Every branch commit is on main but no single sha carries the tip's patch.
+
+        The tip was reverted and re-applied on main, so two commits share its
+        patch-id and subject.  git proved the landing; only attribution
+        failed, which is ``landing_unattributable`` (do not resubmit), never
+        ``never_submitted``.
+        """
+        tid = '6980'
+        landing = build_rebased_solo_landing(tmp_path / 'repo', tid, cited=False)
+        reapply_tip_on_main(landing)
+        config = _make_config(landing.repo)
+        server = create_server(
+            EscalationQueue(tmp_path / 'esc'),
+            harness=_stub_harness(GitOps(config.git, landing.repo)), orch_config=config,
+        )
+
+        result = await call_merge_status(server, task_id=tid)
+
+        assert result.get('state') == 'no_record', f'got: {result}'
+        assert result.get('reason') == MergeReason.landing_unattributable, f'got: {result}'
+
 
 # ---------------------------------------------------------------------------
 # merge_request's use of the extracted tier (task 4887 / PRD label ζ)
@@ -1500,7 +1679,7 @@ async def _run_merge_request_fast_path(
     ancestor arm hits and the tool returns ``already_merged`` before any
     worker or queue interaction — which is why no fake worker is needed here.
     """
-    from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane.worker import (
         InFlightMergeRegistry,
     )
 
@@ -1511,9 +1690,10 @@ async def _run_merge_request_fast_path(
     )
     harness = types.SimpleNamespace(git_ops=git_ops)
     harness.scheduler = types.SimpleNamespace(
-        get_task=(
+        read_task=(
             AsyncMock(side_effect=RuntimeError('scheduler unreachable'))
-            if scheduler_raises else AsyncMock(return_value={'metadata': metadata or {}})
+            if scheduler_raises
+            else AsyncMock(return_value=TaskFound({'metadata': metadata or {}}))
         ),
     )
 
@@ -1587,7 +1767,7 @@ class TestMergeRequestUsesTheExtractedTier:
         """Behaviour-preservation: merge_request reads ``.metadata`` and
         IGNORES the new ``unavailable`` flag, exactly as today.
 
-        With a scheduler whose ``get_task`` raises, the extracted probe
+        With a scheduler whose ``read_task`` raises, the extracted probe
         reports ``unavailable=True`` — and the fast path must still answer
         its legacy ``already_merged`` rather than raising or declining.  A
         metadata fault must degrade a single guard, not the whole submission.

@@ -17,7 +17,8 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TypeVar
+from types import MappingProxyType
+from typing import Any, TypeVar, assert_never
 
 import aiosqlite
 from escalation.queue import iter_all_escalation_paths
@@ -77,20 +78,55 @@ def _cutoff(days: int, *, now: datetime | None = None) -> str:
     return (resolve_now(now) - timedelta(days=days)).isoformat()
 
 
-# A cancel ends an attempt from outside (shutdown drain, operator cancel, takeover); the resumed attempt
-# records its own row, so no reading counts one. Values of orchestrator/src/orchestrator/workflow_types.py::WorkflowOutcome.
-_NOT_A_CANCEL = "outcome NOT IN ('cancelled', 'soft-cancelled')"
+class _Reading(enum.Enum):
+    """How a task_results row's outcome reads on the completion-path card."""
+
+    PASSED = enum.auto()  # sliced by how it passed
+    REQUEUED = enum.auto()  # the 'requeued' slice
+    BLOCKED = enum.auto()  # the 'blocked' slice
+    UNCOUNTED = enum.auto()  # counted by no reading
+
+
+# Keyed by shared/src/shared/task_transitions.py::WORKFLOW_OUTCOMES. Why each outcome reads as it does:
+# dashboard/tests/test_performance.py::_SLICE_OF_A_CLEAN_ATTEMPT.
+_READING_BY_OUTCOME: Mapping[str, _Reading] = MappingProxyType(
+    {
+        'done': _Reading.PASSED,
+        'merge-deferred': _Reading.PASSED,
+        'requeued': _Reading.REQUEUED,
+        'planned': _Reading.REQUEUED,
+        'blocked': _Reading.BLOCKED,
+        'escalated': _Reading.BLOCKED,
+        'cancelled': _Reading.UNCOUNTED,
+        'soft-cancelled': _Reading.UNCOUNTED,
+    }
+)
+
+
+def _reading_of(outcome: str) -> _Reading:
+    """How *outcome* reads; an outcome the table does not name reads as a block."""
+    return _READING_BY_OUTCOME.get(outcome, _Reading.BLOCKED)
+
+
+_COUNTED_OUTCOME_SQL = (
+    'outcome NOT IN ('
+    + ', '.join(
+        f"'{outcome}'"
+        for outcome in sorted(o for o, reading in _READING_BY_OUTCOME.items() if reading is _Reading.UNCOUNTED)
+    )
+    + ')'
+)
 
 
 async def _latest_completions(db: aiosqlite.Connection) -> dict[str, str]:
     """Return ``{project_id: MAX(completed_at)}`` for every project with a
-    recorded completion, a cancel not counting (see ``_NOT_A_CANCEL``) —
-    the projects a card family tallies by default."""
+    recorded completion, an uncounted outcome such as a cancel not counting
+    (see ``_COUNTED_OUTCOME_SQL``) — the projects a card family tallies by default."""
     rows = await db.execute_fetchall(
         'SELECT project_id, MAX(completed_at) '
         '  FROM task_results '
         " WHERE completed_at IS NOT NULL AND completed_at != '' "
-        f'   AND {_NOT_A_CANCEL} '
+        f'   AND {_COUNTED_OUTCOME_SQL} '
         ' GROUP BY project_id',
     )
     return {row[0]: row[1] for row in rows}
@@ -123,6 +159,22 @@ async def _window_rows_by_project(
 # ---------------------------------------------------------------------------
 
 
+def _path_of_a_pass(
+    task_id: str,
+    review_cycles: int | None,
+    steward_invocations: int | None,
+    interactive_task_ids: Collection[str],
+) -> str:
+    """The completion-path slice of an attempt that passed: how it passed."""
+    if task_id in interactive_task_ids:
+        return 'via-interactive'
+    if steward_invocations and steward_invocations > 0:
+        return 'via-steward'
+    if review_cycles and review_cycles > 0:
+        return 'multi-pass'
+    return 'one-pass'
+
+
 async def get_completion_paths(
     db: aiosqlite.Connection | None,
     escalations_dir: Path,
@@ -135,8 +187,9 @@ async def get_completion_paths(
 
     Returns {project_id: [{path: str, count: int, pct: float}, ...]} for each
     of *projects* (default: every project with a recorded completion).
-    Paths: one-pass, multi-pass, via-steward, via-interactive, blocked; a
-    cancel outcome is no path and is not counted (see ``_NOT_A_CANCEL``).
+    Paths: one-pass, multi-pass, via-steward, via-interactive, requeued,
+    blocked. Each row's outcome reads through ``_reading_of``: a
+    merge-deferred attempt is sliced as a pass, and a cancel is not counted.
     """
     escalations = _load_escalations(escalations_dir)
 
@@ -156,7 +209,7 @@ async def get_completion_paths(
             '       steward_invocations '
             '  FROM task_results '
             ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
-            f'  AND {_NOT_A_CANCEL} ',
+            f'  AND {_COUNTED_OUTCOME_SQL} ',
             since,
             projects,
         )
@@ -166,22 +219,24 @@ async def get_completion_paths(
                 'multi-pass': 0,
                 'via-steward': 0,
                 'via-interactive': 0,
+                'requeued': 0,
                 'blocked': 0,
             }
-            for row in rows:
-                task_id, outcome, review_cycles, steward_inv = row
-                task_id = str(task_id)
-
-                if outcome != 'done':
-                    counts['blocked'] += 1
-                elif task_id in interactive_task_ids:
-                    counts['via-interactive'] += 1
-                elif steward_inv and steward_inv > 0:
-                    counts['via-steward'] += 1
-                elif review_cycles and review_cycles > 0:
-                    counts['multi-pass'] += 1
-                else:
-                    counts['one-pass'] += 1
+            for task_id, outcome, review_cycles, steward_inv in rows:
+                match _reading_of(outcome):
+                    case _Reading.UNCOUNTED:
+                        continue
+                    case _Reading.REQUEUED:
+                        counts['requeued'] += 1
+                    case _Reading.BLOCKED:
+                        counts['blocked'] += 1
+                    case _Reading.PASSED:
+                        passed_via = _path_of_a_pass(
+                            str(task_id), review_cycles, steward_inv, interactive_task_ids,
+                        )
+                        counts[passed_via] += 1
+                    case unreachable:
+                        assert_never(unreachable)
 
             total = sum(counts.values()) or 1
             result[project_id] = [
@@ -573,7 +628,7 @@ async def get_escalation_rates(
             'SELECT project_id, task_id, steward_invocations '
             '  FROM task_results '
             ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
-            f'  AND {_NOT_A_CANCEL} ',
+            f'  AND {_COUNTED_OUTCOME_SQL} ',
             since,
             projects,
         )
@@ -749,9 +804,10 @@ async def _project_max_completed(
     project_id: str,
 ) -> str:
     """Return the most recent completed_at for *project_id* (empty string if none),
-    a cancel not counting (see ``_NOT_A_CANCEL``), as ``_hour_bucketed_history`` counts none."""
+    an uncounted outcome such as a cancel not counting (see ``_COUNTED_OUTCOME_SQL``),
+    as ``_hour_bucketed_history`` counts none."""
     async with db.execute(
-        f'SELECT MAX(completed_at) FROM task_results WHERE project_id = ? AND {_NOT_A_CANCEL}',
+        f'SELECT MAX(completed_at) FROM task_results WHERE project_id = ? AND {_COUNTED_OUTCOME_SQL}',
         (project_id,),
     ) as cur:
         row = await cur.fetchone()
@@ -768,8 +824,9 @@ async def _hour_bucketed_history(
     """Return per-hour rows for *project_id* over the trailing *days* window.
 
     Each row carries: bucket label, p50/p95 of duration_ms (done tasks),
-    count of done tasks, count of one-pass (review_cycles=0 done) tasks,
-    count of escalated (steward_invocations>0) tasks, and total tasks.
+    count of done tasks, count of one-pass attempts (review_cycles=0 passes, a
+    pass as ``_reading_of`` reads one), count of escalated
+    (steward_invocations>0) tasks, and total tasks.
     Caller derives ratios.
 
     Args:
@@ -800,7 +857,7 @@ async def _hour_bucketed_history(
            AND completed_at >= ?
            AND completed_at IS NOT NULL
            AND completed_at != ''
-           AND {_NOT_A_CANCEL}
+           AND {_COUNTED_OUTCOME_SQL}
          ORDER BY bucket
         """,
         (project_id, _cutoff(days, now=now)),
@@ -814,14 +871,13 @@ async def _hour_bucketed_history(
         steward = row[4] or 0
         b = buckets.setdefault(
             bucket,
-            {'durations': [], 'total': 0, 'one_pass_done': 0, 'escalated': 0},
+            {'durations': [], 'total': 0, 'one_pass': 0, 'escalated': 0},
         )
         b['total'] += 1
-        if outcome == 'done':
-            if duration is not None and duration > 0:
-                b['durations'].append(duration)
-            if review_cycles == 0:
-                b['one_pass_done'] += 1
+        if outcome == 'done' and duration is not None and duration > 0:
+            b['durations'].append(duration)
+        if _reading_of(outcome) is _Reading.PASSED and review_cycles == 0:
+            b['one_pass'] += 1
         if steward > 0:
             b['escalated'] += 1
 
@@ -838,7 +894,7 @@ async def _hour_bucketed_history(
         p50s.append(round(percentile(durations, 50)) if durations else 0)
         p95s.append(round(percentile(durations, 95)) if durations else 0)
         one_pass_pcts.append(
-            round(info['one_pass_done'] / total * 100, 1) if total else 0.0
+            round(info['one_pass'] / total * 100, 1) if total else 0.0
         )
         escalation_pcts.append(
             round(info['escalated'] / total * 100, 1) if total else 0.0
@@ -963,7 +1019,7 @@ async def aggregate_performance_history(
         try:
             rows = await db.execute_fetchall(
                 'SELECT DISTINCT project_id FROM task_results '
-                f'WHERE completed_at >= ? AND {_NOT_A_CANCEL}',
+                f'WHERE completed_at >= ? AND {_COUNTED_OUTCOME_SQL}',
                 (since,),
             )
             pid_sets.append({r[0] for r in rows if r[0]})

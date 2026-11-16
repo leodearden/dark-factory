@@ -79,6 +79,8 @@ from _workflow_helpers import (
     _make,
     _make_review,
     _make_warmlane_workflow,
+    agent_side_artifacts,
+    fixed_prompt,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -92,9 +94,9 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
-from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.merge_lane.landed_outbox import MergeProvenance
 from orchestrator.module_charter import derive_modules
-from orchestrator.scheduler import BlastRadiusResult, TaskAssignment
+from orchestrator.scheduler import BlastRadiusResult, SetTaskStatusRejected, TaskAssignment
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
@@ -103,6 +105,7 @@ from orchestrator.workflow_types import (
     STATE_TO_STATUS,
     BlockDisposition,
     IllegalTransition,
+    PublishedStewardOutcome,
     RequeueKind,
     StewardInterrupted,
     StewardResolved,
@@ -374,7 +377,7 @@ def git_repo(tmp_path: Path) -> Path:
     """A bare-minimum git repo with an initial commit (mirrors test_workflow_e2e.py)."""
     repo = tmp_path / 'repo'
     repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    _init_repo(repo)
     return repo
 
 
@@ -474,9 +477,9 @@ class _WideningArchitectStub(AgentStub):
         plan = dict(PLAN)
         plan['files'] = ['lib.py', 'locked_module.py']
         plan['_schema_version'] = 1
-        task_dir = TaskArtifacts(cwd).root
-        task_dir.mkdir(parents=True, exist_ok=True)
-        (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+        plan_path = agent_side_artifacts(cwd).artifact_path('plan.json')
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(json.dumps(plan, indent=2) + '\n')
         return AgentResult(success=True, output='Plan created', cost_usd=0.50)
 
 
@@ -507,7 +510,7 @@ class _WideningReplanStub(AgentStub):
         )
 
     async def _architect(self, cwd: Path) -> AgentResult:
-        plan_path = TaskArtifacts(cwd).root / 'plan.json'
+        plan_path = agent_side_artifacts(cwd).artifact_path('plan.json')
         if plan_path.exists():
             plan = json.loads(plan_path.read_text())
             plan['files'] = [*plan['files'], 'locked_module.py']
@@ -569,6 +572,72 @@ def _drive_replan_into_lock_conflict(
             passed=True, test_output='', lint_output='',
             type_output='', summary='All checks passed',
         )),
+    )
+    return workflow, scheduler
+
+
+def _wire_simple_task_run(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    task_assignment: TaskAssignment,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    simple_widens: bool,
+    conflict: BlastRadiusResult,
+) -> tuple[TaskWorkflow, FakeScheduler, AgentStub]:
+    """Wire a real run() for a declared-simple task.  When *simple_widens*,
+    the SIMPLE_TASK agent completes a plan whose files reach a module the
+    task does not lock; otherwise it writes nothing and gives up.  Any
+    architect that runs afterwards widens the same way, and the scheduler
+    reports every widen as *conflict*."""
+    stub = _WideningArchitectStub()
+    simple = replace(task_assignment, task={
+        **task_assignment.task,
+        'metadata': {**task_assignment.task['metadata'], 'complexity': 'simple'},
+    })
+    workflow, scheduler = _build_workflow(config, git_ops, simple, stub)
+    scheduler.blast_radius_result = conflict
+
+    async def _invoke(**kwargs: Any) -> AgentResult:
+        if 'You are a SIMPLE_TASK agent' not in kwargs['system_prompt']:
+            return await stub.invoke_agent(**kwargs)
+        stub.calls.append('simple_task')
+        if simple_widens:
+            cwd: Path = kwargs['cwd']
+            plan_path = agent_side_artifacts(cwd).artifact_path('plan.json')
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            plan = {
+                **PLAN, '_schema_version': 1,
+                'files': ['lib.py', 'locked_module.py'],
+                'steps': [
+                    {**step, 'status': 'done', 'commit': 'abc123'}
+                    for step in PLAN['steps']
+                ],
+            }
+            plan_path.write_text(json.dumps(plan, indent=2) + '\n')
+        return AgentResult(success=True, output='Simple task done', cost_usd=0.30)
+
+    monkeypatch.setattr('orchestrator.workflow.invoke_agent', _invoke)
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_scoped_verification',
+        AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+    )
+    return workflow, scheduler, stub
+
+
+def _drive_simple_task_into_lock_conflict(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    task_assignment: TaskAssignment,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict: BlastRadiusResult,
+) -> tuple[TaskWorkflow, FakeScheduler]:
+    """Wire a real run() whose SIMPLE_TASK agent completes a plan that
+    widens its scope into a blast-radius lock conflict the scheduler reports
+    as *conflict*."""
+    workflow, scheduler, _stub = _wire_simple_task_run(
+        config, git_ops, task_assignment, monkeypatch,
+        simple_widens=True, conflict=conflict,
     )
     return workflow, scheduler
 
@@ -661,6 +730,48 @@ class TestStateMachineLegalityAndConsistency:
         assert outcome_allows_status(report.outcome, last_status)
         assert report.phase == workflow.machine.state
 
+    async def test_row6_rejected_merged_done_write_exits_blocked_on_a_blocked_row(
+        self, config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
+    ):
+        """Reify 7286: the merged-done write is refused after a clean merge.
+
+        The run must leave a 'blocked' row behind one L1 and report BLOCKED,
+        never a DONE over the claimed 'in-progress' row.
+        """
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        queue = EscalationQueue(tmp_path / 'esc')
+        workflow.escalation_queue = queue
+        tid = workflow.task_id
+
+        async def _refuse_done(task_id, *, kind, sha, note=None):
+            raise SetTaskStatusRejected(
+                task_id=tid, error_code='pre_done_hook_rejected',
+                raw='pre-done hook exited rc 125',
+            )
+
+        monkeypatch.setattr(scheduler, 'mark_done', _refuse_done)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='OK', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses[tid][-1] == 'blocked'
+        assert outcome_allows_status(report.outcome, 'blocked')
+        assert report.phase == workflow.machine.state == WorkflowState.BLOCKED
+        assert _exit_contract_records(caplog, 'violation') == []
+        l1s = queue.get_by_task(tid, status='pending', level=1)
+        assert len(l1s) == 1, [(e.level, e.category, e.summary) for e in l1s]
+        assert 'set_task_status(done) rejected' in l1s[0].summary
+
     async def test_row6_allaccountscapped_blocked_run_is_consistent(
         self, config, git_ops, task_assignment, monkeypatch,
     ):
@@ -687,6 +798,42 @@ class TestStateMachineLegalityAndConsistency:
         assert last_status == 'blocked'
         assert outcome_allows_status(report.outcome, last_status)
         assert report.phase == workflow.machine.state
+
+    async def test_row6_exit_while_an_action_teardown_owns_the_row_is_unjudged(
+        self, config, git_ops, task_assignment, monkeypatch, caplog,
+    ):
+        """A Table-B restart tears the slot down mid-run: the harness writes
+        'pending' and absorbs this workflow's own 'blocked' write.  The row is
+        the teardown's, so the outcome<->status half goes unjudged — the same
+        carve-out as eval mode and a hard cancel."""
+        from shared.cli_invoke import AllAccountsCappedException
+
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        event_store = MagicMock()
+        workflow.event_store = event_store
+        tid = workflow.task_id
+
+        async def raise_cap_exc(*args, **kwargs):
+            scheduler.blocked_write_suppressed_ids.add(tid)
+            await scheduler.set_task_status(tid, 'pending')
+            raise AllAccountsCappedException(
+                retries=3, elapsed_secs=120.0, label='Task 42 [architect]',
+            )
+
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', raise_cap_exc)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert scheduler.statuses[tid][-1] == 'pending'
+        assert _exit_contract_records(caplog, 'violation') == []
+        assert _exit_contract_events(event_store) == []
 
     async def test_row6_warmlane_requeued_run_is_consistent(self, tmp_path: Path):
         """REQUEUED run (reuses test_workflow_warm_lane_requeue setup)."""
@@ -719,6 +866,7 @@ class TestStateMachineLegalityAndConsistency:
         run() RETURNS the real BLOCKED report — no synthetic mislabel (spec
         §8-E11) — and the violation is recorded in log mode, never raised.
         """
+        monkeypatch.setattr(config, 'workflow_exit_contract_enforce', False)
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
         event_store = MagicMock()
@@ -825,7 +973,8 @@ class TestStateMachineLegalityAndConsistency:
     @pytest.mark.parametrize(('drive', 'detail_prefix'), [
         (_drive_plan_into_lock_conflict, 'Plan expansion blocked'),
         (_drive_replan_into_lock_conflict, 'Replan expansion blocked'),
-    ], ids=['plan', 'replan'])
+        (_drive_simple_task_into_lock_conflict, 'SIMPLE_TASK plan expansion blocked'),
+    ], ids=['plan', 'replan', 'simple'])
     async def test_row6_lock_conflict_with_dead_repend_is_store_unavailable(
         self, drive, detail_prefix, enforce,
         config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
@@ -866,8 +1015,12 @@ class TestStateMachineLegalityAndConsistency:
         assert queue.get_by_task(workflow.task_id) == []
 
     @pytest.mark.parametrize(
-        'drive', [_drive_plan_into_lock_conflict, _drive_replan_into_lock_conflict],
-        ids=['plan', 'replan'],
+        'drive', [
+            _drive_plan_into_lock_conflict,
+            _drive_replan_into_lock_conflict,
+            _drive_simple_task_into_lock_conflict,
+        ],
+        ids=['plan', 'replan', 'simple'],
     )
     async def test_row6_lock_conflict_with_healthy_repend_is_consistent(
         self, drive, config, git_ops, task_assignment, monkeypatch, caplog,
@@ -889,6 +1042,45 @@ class TestStateMachineLegalityAndConsistency:
         assert _exit_contract_records(caplog, 'store_unavailable') == []
         assert _exit_contract_records(caplog, 'violation') == []
         assert _exit_contract_events(event_store) == []
+
+    async def test_row6_simple_task_give_up_falls_through_to_the_architect(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """A SIMPLE_TASK agent that writes no plan gives up: the run drops
+        its plan and runs the architect, whose own widen then conflicts."""
+        workflow, _scheduler, stub = _wire_simple_task_run(
+            config, git_ops, task_assignment, monkeypatch,
+            simple_widens=False, conflict=BlastRadiusResult(applied=False),
+        )
+
+        report = await workflow.run()
+
+        assert stub.calls == ['simple_task', 'architect']
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert report.detail.startswith('Plan expansion blocked')
+
+    async def test_row6_simple_task_lock_conflict_runs_nothing_after_the_conflict(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        """The scheduler re-pended the row and dropped every lock, so the
+        dispatch ends at the conflict: no architect, no implementer, no
+        second status write — and the stamped plan survives for the next
+        dispatch."""
+        workflow, scheduler, stub = _wire_simple_task_run(
+            config, git_ops, task_assignment, monkeypatch,
+            simple_widens=True, conflict=BlastRadiusResult(applied=False),
+        )
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert report.reason == 'plan_blast_radius_lock_conflict'
+        assert stub.calls == ['simple_task']
+        assert scheduler.statuses[workflow.task_id].count('pending') == 1
+        assert workflow.artifacts is not None
+        plan = workflow.artifacts.read_plan()
+        assert plan['steps']
+        assert plan['_session_id']
 
     async def test_row6_failed_bypass_reopen_is_store_unavailable(
         self, config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
@@ -935,6 +1127,72 @@ class TestStateMachineLegalityAndConsistency:
         assert [
             esc.category for esc in queue.get_by_task(workflow.task_id, status='pending')
         ] == ['bypass_done']
+
+    @pytest.mark.parametrize('site', ['architect', 'simple'])
+    async def test_row6_plan_phase_exit_meeting_a_cancelled_row_ends_the_run(
+        self, config, git_ops, task_assignment, monkeypatch, caplog, site,
+    ):
+        """The task is cancelled while its planning agent runs, so the agent's
+        unactionable_task exit meets a cancelled row and reports CANCELLED.
+
+        Neither dispatch site may read CANCELLED as "keep going": the plan
+        site must not fall through toward EXECUTE, and the simple-task site
+        must not mistake it for its give-up fall-through and head for an
+        architect.  Either move leaves the absorbing CANCELLED state,
+        which crashes the run.
+        """
+        from orchestrator.scheduler import TerminalExitRejection
+
+        if site == 'simple':
+            task_assignment = replace(task_assignment, task={
+                **task_assignment.task, 'metadata': {'complexity': 'simple'},
+            })
+        workflow, scheduler = _build_workflow(
+            config, git_ops, task_assignment, AgentStub(),
+        )
+        record_write = scheduler.set_task_status
+
+        async def _cancelled_row_refuses_the_park(
+            task_id: str, status: str, **kwargs,
+        ):
+            if status != 'blocked':
+                await record_write(task_id, status, **kwargs)
+                return
+            await record_write(task_id, 'cancelled')
+            raise TerminalExitRejection(
+                task_id, old_status='cancelled', target_status=status,
+                raw='terminal-exit gate',
+            )
+
+        dispatched: list[Path] = []
+
+        async def _agent_reports_unactionable(*, cwd: Path, **kwargs) -> AgentResult:
+            dispatched.append(cwd)
+            agent_side_artifacts(cwd).write_unactionable_task(
+                reason='the spec contradicts itself', evidence='ev',
+            )
+            return AgentResult(success=True, output='', cost_usd=0.5)
+
+        monkeypatch.setattr(scheduler, 'set_task_status', _cancelled_row_refuses_the_park)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', _agent_reports_unactionable)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+        )
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+        caplog.set_level(logging.ERROR, logger='orchestrator.workflow')
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        assert report.phase == workflow.machine.state == WorkflowState.CANCELLED
+        assert scheduler.statuses[workflow.task_id][-1] == 'cancelled'
+        assert _exit_contract_records(caplog, 'violation') == []
+        assert [
+            r.getMessage() for r in caplog.records
+            if r.name == 'orchestrator.workflow' and r.levelno >= logging.ERROR
+        ] == []
+        assert len(dispatched) == 1, 'only the reporting agent may be paid for'
 
     async def test_row6_none_status_does_not_crash_normal_run(
         self, config, git_ops, task_assignment, monkeypatch,
@@ -1003,7 +1261,7 @@ class TestHarnessConsumesTerminalReport:
         """
         repo = tmp_path / 'repo'
         repo.mkdir()
-        await _init_git_repo(repo)
+        _init_git_repo(repo)
         config = OrchestratorConfig(project_root=repo, max_concurrent_tasks=1)
         harness = _build_harness(config)
         # `_build_harness` leaves `Scheduler` a bare MagicMock (only the
@@ -1230,12 +1488,12 @@ class TestStewardOutcomeRouting:
     ):
         wf = _make_workflow(tmp_path=tmp_path)
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed the flaky import'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='fixed the flaky import'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardResolved(resolution_text='fixed the flaky import')
 
@@ -1249,9 +1507,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='fixed it'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='fixed it'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
 
         outcome = await wf._mark_blocked('agent hit a transient failure')
@@ -1276,12 +1534,12 @@ class TestStewardOutcomeRouting:
         wf._steward_outcome_channel = asyncio.Queue()
         # An unrelated outcome sits on the channel; the terminal/deferred
         # status read still wins.
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='irrelevant — status overrides'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='irrelevant — status overrides'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value=status)
 
-        outcome = await wf._await_steward_completion()
+        outcome = await wf._await_steward_completion(escalation_id=None)
 
         assert outcome == StewardTerminalDecision(new_status=TaskStatus(status))
 
@@ -1291,9 +1549,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='irrelevant — status overrides'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='irrelevant — status overrides'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='done')
 
         outcome = await wf._mark_blocked('agent hit a transient failure')
@@ -1312,9 +1570,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardResolved(resolution_text='irrelevant — status overrides'),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardResolved(resolution_text='irrelevant — status overrides'),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='cancelled')
         wf._ensure_l1_escalation_for_blocked = AsyncMock()
 
@@ -1333,9 +1591,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardInterrupted('attempt_cap', wip_commits_present=True),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardInterrupted('attempt_cap', wip_commits_present=True),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         pending_l0 = MagicMock(id='esc-orig-0')
         wf.escalation_queue.get_by_task.return_value = [pending_l0]  # type: ignore[union-attr]
@@ -1392,9 +1650,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardInterrupted('timeout', wip_commits_present=True),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardInterrupted('timeout', wip_commits_present=True),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         l0 = _make_escalation(id='esc-42-1', level=0, agent_role='orchestrator')
         l1 = _make_escalation(
@@ -1434,9 +1692,9 @@ class TestStewardOutcomeRouting:
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(
-            StewardInterrupted('timeout', wip_commits_present=True),
-        )
+        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
+            'esc-2253-1', StewardInterrupted('timeout', wip_commits_present=True),
+        ))
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         swept = [
             _make_escalation(id='esc-42-1', level=0, agent_role='orchestrator'),
@@ -1521,8 +1779,10 @@ class TestStewardOutcomeRouting:
 
         mock_invoke.assert_not_called()
         steward.escalation_queue.submit.assert_not_called()  # type: ignore[attr-defined]  # no L1 filed
-        assert channel.get_nowait() == StewardInterrupted(
-            reason='attempt_cap', wip_commits_present=True,
+        assert channel.get_nowait() == PublishedStewardOutcome(
+            esc.id, StewardInterrupted(
+                reason='attempt_cap', wip_commits_present=True,
+            ),
         )
 
     # -- Row 9 cancel-safety guard --------------------------------------------
@@ -1853,7 +2113,7 @@ async def _invoke_probe(
         new_callable=AsyncMock,
         return_value=AgentResult(success=True, output=''),
     ) as mock_cap_retry:
-        await workflow._invoke(role, 'PROMPT', cwd)
+        await workflow._invoke(role, fixed_prompt('PROMPT'), cwd)
 
     assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
     assert mock_cap_retry.await_args is not None

@@ -16,6 +16,30 @@
       "severity": "suggestion",
       "description": "Doubling the latency assertion bound from 2.0s to 4.0s weakens the regression guard; a real 2-3x per-call slowdown would now pass silently. Acceptable as CI-jitter mitigation but reduces the test's sensitivity.",
       "mutation_type": "test_gap"
+    },
+    {
+      "id": "mined_988_pool_01",
+      "location": "fused-memory/tests/test_task_interceptor.py:2556-2573",
+      "category": "test_cannot_deliver_diagnostic",
+      "severity": "blocking",
+      "description": "The new pytest.fail calls run inside the mocked tm.add_task side_effect, which executes on TaskInterceptor's per-project _curator_worker task, not on the test coroutine. pytest.fail raises _pytest.outcomes.Failed, a BaseException, which escapes every 'except Exception' on that path and the worker's 'except asyncio.CancelledError', killing the worker before mark_resolved/_signal_ticket_event run. The add_task facade then waits its full 115 s and raises its own timeout RuntimeError, and the per-project diagnostic is never reported (the dead worker is skipped by the teardown's 'if not _wt.done()'). Before the change the TimeoutError was an Exception that resolved the ticket as failed within about 10 s, so the change makes the failure slower and less legible, the opposite of task 988's goal; the test also never asserts after gather that both projects entered.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_988_pool_02",
+      "location": "fused-memory/tests/test_task_interceptor.py:2554-2573",
+      "category": "duplication",
+      "severity": "suggestion",
+      "description": "The A and B rendezvous branches are mirror copies of the same set/wait/try/except/fail block differing only in which Event and label they use, and the interpolated flag state adds no information because in each branch the own flag is always set and the peer flag always unset at timeout.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_988_pool_03",
+      "location": "fused-memory/tests/test_task_interceptor.py:2755-2758",
+      "category": "unrelated_change_and_comment",
+      "severity": "suggestion",
+      "description": "The diff bundles an unrelated change to test_single_call_latency_not_regressed (bound raised from 2 s to 4 s) into a task about the two-projects rendezvous diagnostic, and the new inline comment is change history ('bumping from 2s to 4s') that contradicts itself ('on a mock' vs 'real SQLite event-buffer writes') and claims 32 xdist workers where the same file says 16.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

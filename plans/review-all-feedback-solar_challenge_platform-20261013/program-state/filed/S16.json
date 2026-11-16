@@ -1,0 +1,113 @@
+{
+ "stream": "S16",
+ "prd_path": "docs/prds/review-all-tariff-as-a-typed-domain-value.md",
+ "sidecar_path": "docs/prds/review-all-tariff-as-a-typed-domain-value.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "alpha",
+   "task_id": "1231",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-5d75488e4f4a",
+    "fk-2b9dd4a48643",
+    "fk-c7780f124df0"
+   ],
+   "depends_on": []
+  },
+  {
+   "label": "beta",
+   "task_id": "1234",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-c7780f124df0",
+    "fk-5d75488e4f4a"
+   ],
+   "depends_on": [
+    "1231",
+    "555"
+   ]
+  },
+  {
+   "label": "gamma",
+   "task_id": "1233",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-d003be3efacc"
+   ],
+   "depends_on": []
+  },
+  {
+   "label": "delta",
+   "task_id": "1236",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-d003be3efacc"
+   ],
+   "depends_on": [
+    "1234",
+    "1233",
+    "1127",
+    "1130",
+    "1138",
+    "1095",
+    "1096",
+    "1131",
+    "1134",
+    "1136"
+   ]
+  },
+  {
+   "label": "epsilon",
+   "task_id": "1241",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-2b9dd4a48643",
+    "fk-d003be3efacc"
+   ],
+   "depends_on": [
+    "1236",
+    "1098",
+    "1139"
+   ]
+  },
+  {
+   "label": "zeta",
+   "task_id": "1244",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-2b9dd4a48643"
+   ],
+   "depends_on": [
+    "1241",
+    "194",
+    "1213",
+    "1070"
+   ]
+  },
+  {
+   "label": "delta2",
+   "task_id": "1299",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-d003be3efacc"
+   ],
+   "depends_on": [
+    "1130",
+    "1138",
+    "1236",
+    "1241"
+   ],
+   "note": "added 2026-10-16 by Leo's Q1 ruling (ledger prepend); not a gate dep"
+  }
+ ],
+ "held_leaves": [],
+ "gate_dependencies_added": [],
+ "commit_planning_result": "all 6 pending; sidecar stamped; no leaf is high",
+ "lead_rulings": [
+  "803 and 811 cancelled by the lead naming 1231+1234 / 1231+1241 (2026-10-15).",
+  "Coordination notes on 1207 (S10-eta, Q2: TouTariff type is the one home; is_tou retypes to TariffTerms) and 521 (TariffSpan.version_id after 1241); edge 1241 -> 1139 (S17-zeta wire registry) added at decompose.",
+  "delta's pointer-fallback-deleted check widened to tariff_pointer|TariffNotFound|tariff_not_found so it is red today.",
+  "Briefing (interactive on main, after 1236): tariff and known-gap lines.",
+  "2026-10-16 (Leo, Q1 option B): delta2 = task 1299 filed (ledger prepend, PREPENDABLE opt-in); sidecar δ2 block committed at a629f24; S21's contract gains EffectiveDatedLedger.prepend + PREPENDABLE via 1299 (dated note in the S21 PRD §7)."
+ ]
+}

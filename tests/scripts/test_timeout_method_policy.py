@@ -19,10 +19,12 @@ WHY SIGNAL IS VALID UNDER XDIST. A Python signal handler only ever runs on the
 MAIN thread. pytest-xdist 3.6.0 (changelog #1027) starts its workers with
 execnet's ``main_thread_only`` execmodel
 (``xdist/workermanage.py::NodeManager``), so tests run on each worker's main
-thread and SIGALRM reaches them. The member floors do NOT guarantee that: they
-read ``pytest-xdist>=3.5.0``, and orchestrator's ``>=3.0``. What guarantees it
-is the single workspace ``uv.lock`` pin, at 3.8.0 when this was written. A
-resolve below 3.6.0 would put tests back on a non-main thread, and
+thread and SIGALRM reaches them. The member floors guarantee that: every
+workspace member's pytest-xdist declaration reads ``>=3.6.0`` (esc-5470-3,
+ruled 2026-10-07; task 6477), which
+``test_every_pytest_xdist_floor_admits_only_main_thread_workers`` enforces, and
+the single workspace ``uv.lock`` pin (3.8.0 when this was written) sits above
+it. A resolve below 3.6.0 would put tests back on a non-main thread, and
 ``test_runs_on_main_thread`` in the probe below is what turns that red.
 
 THE MEASUREMENT (task 5470; pytest 9.0.3, pytest-xdist 3.8.0, execnet 2.1.2,
@@ -36,31 +38,82 @@ the main thread:
   * thread, with ``--max-worker-restart=0``: "worker 'gwN' crashed while
     running ..." and "worker restarting disabled"; two tests never ran.
 
-The two probes below re-run that measurement on every collection.
+THE REAL-CONFTEST MEASUREMENT (task 6354, 2026-10-31; the same versions on
+CPython 3.13, load average 175 on 32 cores). A throwaway probe ran inside the
+REAL ``orchestrator/tests`` and ``fused-memory/tests`` conftests at
+``-o timeout_method=signal -n 2 --max-worker-restart=0``: five tests in one
+``xdist_group``, each capped at 3s, then successor tests. Signal interrupted all
+five main-thread shapes:
+
+  * ``asyncio.sleep(3600)``, raised from the selector's wait;
+  * an async test holding a pending task and a coroutine it never started;
+  * ``threading.Event().wait()``;
+  * ``subprocess.run`` of a ``sleep 3600`` child, which ``subprocess.run`` then
+    killed;
+  * ``asyncio.to_thread`` of ``Event().wait``.
+
+In both suites no worker crashed and no INTERNALERROR was raised; the successor
+sync and async tests ran on the same worker and passed, and the tally was
+complete. Two collateral costs appeared, and NEITHER COST THE TALLY:
+
+  * In orchestrator only, the never-started coroutine raised "coroutine ... was
+    never awaited". orchestrator's ``filterwarnings`` promotes that to an error,
+    and it was blamed on the NEXT test on that worker, the one whose
+    ``gc.collect()`` found it: one extra red. Any test that fails partway can
+    leave the same collateral, so it is not specific to signal.
+  * A thread parked in asyncio's default executor made the timed-out test's
+    loop teardown wait up to 300s in ``shutdown_default_executor``.
+
+That probe is not committed, because it would import the heaviest conftest in
+the repo into a nested session on every scripts run. The executable probes
+below carry the two shapes the flip depends on, a main thread parked in the
+asyncio selector and one parked in a subprocess wait, beside the original
+``Event().wait()``, and re-run on every collection. ``to_thread`` is left out
+for its 300s teardown, and the unstarted coroutine because it measures
+orchestrator's ``filterwarnings``, not signal.
 
 THE DECISION:
 
-  * ``signal`` is this repo's default: every config outside
-    ``THREAD_TIMEOUT_METHOD_CONFIGS`` runs it. dashboard and escalation keep it
-    ON THIS MEASUREMENT. Their earlier reason, "runs no pytest-xdist", was
-    false: verify injects ``-n`` into every gated pytest leg, and since task
-    5408 their own addopts carry ``-n auto``.
-  * orchestrator and fused-memory run ``thread``. The premise recorded for that
-    choice was "signal only works in the main thread / is incompatible with
-    pytest-xdist" (fused-memory, commit 0afc3098f4, 2026-04-24, when uv.lock
-    already pinned xdist 3.8.0). The signal probe below falsifies it.
-  * What thread still offers over signal is pytest-timeout's own account. Its
-    README calls thread "the surest and most portable method" and warns that
-    signal "may interfere with the code under test": a test that uses SIGALRM
-    itself must take thread. Separately, CPython runs a signal handler only
-    when the main thread returns to the interpreter, so a C call that blocks
-    without returning is not interrupted by signal. Neither case is measured
-    here.
-  * The two thread settings are RETAINED, not re-justified. Evaluating a flip
-    touches ``--max-worker-restart=0``, ``faulthandler_timeout`` and verify's
-    worker-death discriminators, so it is a separate follow-up filed from task
-    5470. ``THREAD_TIMEOUT_METHOD_CONFIGS`` pins the partition, so that a flip or
-    a new thread config has to update this record and its rationale.
+  * ``signal`` is every config's method. ``THREAD_TIMEOUT_METHOD_CONFIGS`` is
+    empty, and the empty set is the recorded state: a future thread config must
+    be added to it, with its reason, in this docstring.
+  * orchestrator and fused-memory ran ``thread`` until task 6354. The premise
+    recorded for that choice, "signal only works in the main thread / is
+    incompatible with pytest-xdist" (fused-memory, commit 0afc3098f4,
+    2026-04-24, when uv.lock already pinned xdist 3.8.0), is falsified by the
+    signal probe below. Under thread with ``--max-worker-restart=0`` one breach
+    truncated the whole session, and verify refuses to confirm a truncated run
+    as a flake
+    (``orchestrator/src/orchestrator/verify.py::_unmeasured_session_reason``).
+    Under signal the starved test fails as itself, with its own traceback, and
+    an isolated re-run can confirm it as a flake.
+  * dashboard and escalation run signal ON TASK 5470'S MEASUREMENT. Their
+    earlier reason, "runs no pytest-xdist", was false: verify injects ``-n``
+    into every gated pytest leg, and since task 5408 their own addopts carry
+    ``-n auto``.
+  * What thread still offers over signal. Each case is UNMEASURED here:
+
+      - CPython runs a signal handler only when the main thread returns to the
+        interpreter, so a main thread blocked in a C call that never returns is
+        never interrupted. The worker hangs until verify's outer kill, and
+        orchestrator's ``faulthandler_timeout`` dump is the only witness.
+      - A C call that does return (complexipy's Rust analysis, say) only
+        defers the failure until it returns.
+      - Code under test that catches ``BaseException`` in the frame where the
+        signal lands can swallow pytest-timeout's single alarm.
+
+    pytest-timeout's README also calls thread "the surest and most portable
+    method" and warns that signal "may interfere with the code under test": a
+    test that uses SIGALRM itself must take thread.
+  * ``--max-worker-restart=0`` stays in orchestrator and fused-memory. The
+    method and the restart cap are separate axes: under signal the cap still
+    governs the worker deaths that remain (segfault, OOM, ``os._exit`` in code
+    under test). ``test_xdist_worker_restart_policy.py`` records why, and pins
+    it.
+  * Every pytest-xdist floor is ``>=3.6.0``, by esc-5470-3's ruling (task
+    6477). Three things guard the premise above: the floor test
+    (``tests/scripts/test_timeout_method_policy.py::test_every_pytest_xdist_floor_admits_only_main_thread_workers``),
+    the ``uv.lock`` pin, and the probe's main-thread assertions.
 
 Citations are by ``path::symbol``, never file:line, which is the house style
 ``test_line_pin_policy.py`` enforces in this directory.
@@ -74,31 +127,56 @@ import pathlib
 import re
 import subprocess
 import sys
+import tomllib
 import types
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import Version
+from process_group_run import ProcessGroupOverrun, run_process_group
+from pytest_config_discovery import (
+    REPO_ROOT,
+    ROOT_CONFIG_NAME,
+    discovered_pytest_configs,
+    workspace_members,
+)
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
-# The one config-discovery walk, with its anti-vacuity floors. Resolves because
-# tests/scripts/conftest.py puts this directory on sys.path.
-import test_pytest_per_test_timeout_policy as per_test_timeout_policy
+from df_pytest_isolation import wait_pid_gone
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SIGNAL_METHOD = 'signal'
 THREAD_METHOD = 'thread'
 
-# The configs that run timeout_method = "thread". This is the RECORDED
-# DIVERGENCE from the signal default, and the module docstring states why it
-# is retained.
-THREAD_TIMEOUT_METHOD_CONFIGS = frozenset({'orchestrator', 'fused-memory'})
+# The configs that run timeout_method = "thread": none since task 6354. Any
+# future member is a recorded divergence from signal, with its reason in the
+# module docstring.
+THREAD_TIMEOUT_METHOD_CONFIGS: frozenset[str] = frozenset()
+
+# The first pytest-xdist release whose workers run under execnet's
+# main_thread_only execmodel (changelog #1027), which the docstring's signal
+# premise depends on.
+MAIN_THREAD_WORKERS_XDIST = Version('3.6.0')
+XDIST_DISTRIBUTION = 'pytest-xdist'
+
+# A FLOOR, not an equality: 8 at authorship, every workspace member. Same idiom
+# as pytest_config_discovery.MIN_EXPECTED_PYTEST_CONFIGS.
+MIN_EXPECTED_XDIST_DECLARERS = 8
 
 PROBE_WORKERS = 2
 PROBE_TIMEOUT_SECS = 2
+
+# What pytest-timeout's failure reads when the probe's ini cap fires.
+TIMEOUT_FAILURE = f'Timeout (>{float(PROBE_TIMEOUT_SECS)}s) from pytest-timeout'
 
 # The pytest11 entry-point names of the only plugins the probe child may load.
 # pytest's `plugins:` header shows the same names for the two distributions.
 PROBE_PLUGINS = ('xdist', 'timeout')
 
-# Every probe test except the blocking one overrides the ini cap with this, so
-# that only the blocking test races PROBE_TIMEOUT_SECS. On a loaded host a
+# Every probe test except the blocking ones overrides the ini cap with this, so
+# that only BLOCKING_TESTS race PROBE_TIMEOUT_SECS. On a loaded host a
 # trivial test can take longer than 2s, and the tally must not depend on that.
 NON_BLOCKING_TIMEOUT_SECS = 60
 
@@ -112,10 +190,16 @@ TIMEOUT_METHOD_PROBE_GROUP = 'timeout_method_probe'
 
 PROBE_MODULE_NAME = 'test_timeout_probe.py'
 BLOCKING_TEST = 'test_a_blocks_main_thread'
+ASYNCIO_BLOCKING_TEST = 'test_a_blocks_in_asyncio_selector'
+SUBPROCESS_BLOCKING_TEST = 'test_a_blocks_waiting_on_a_subprocess'
+BLOCKING_TESTS = (BLOCKING_TEST, ASYNCIO_BLOCKING_TEST, SUBPROCESS_BLOCKING_TEST)
 SAME_WORKER_SUCCESSOR = 'test_b_runs_after_on_same_worker'
 MAIN_THREAD_TEST = 'test_runs_on_main_thread'
 
 _PROBE_MODULE = f'''\
+import asyncio
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -124,6 +208,16 @@ import pytest
 @pytest.mark.xdist_group('same_worker')
 def {BLOCKING_TEST}():
     threading.Event().wait()
+
+
+@pytest.mark.xdist_group('same_worker')
+def {ASYNCIO_BLOCKING_TEST}():
+    asyncio.run(asyncio.sleep(3600))
+
+
+@pytest.mark.xdist_group('same_worker')
+def {SUBPROCESS_BLOCKING_TEST}():
+    subprocess.run([sys.executable, '-c', 'import time; time.sleep(3600)'], check=False)
 
 
 @pytest.mark.xdist_group('same_worker')
@@ -170,8 +264,11 @@ def _run_probe_suite(
 ) -> subprocess.CompletedProcess[str]:
     """Run *suite* at ``-n PROBE_WORKERS --dist loadgroup -rA`` plus *extra*.
 
-    A child still running after *budget_secs* is killed and fails the calling
-    test with whatever it had printed.
+    A child still running after *budget_secs* fails the calling test with
+    whatever it had printed and the live members of its process group. The
+    whole group is killed when the run ends, so no descendant can hold the run
+    open or outlive it
+    (``tests/scripts/process_group_run.py::run_process_group``).
 
     ``PYTEST_*`` is scrubbed from the child's environment, so an inherited
     ``PYTEST_ADDOPTS``, ``PYTEST_TIMEOUT`` or ``PYTEST_XDIST_WORKER`` cannot
@@ -190,7 +287,7 @@ def _run_probe_suite(
     env = {key: value for key, value in os.environ.items() if not key.startswith('PYTEST_')}
     env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
     try:
-        result = subprocess.run(
+        result = run_process_group(
             [
                 sys.executable, '-m', 'pytest',
                 '-c', str(suite.ini),
@@ -201,21 +298,20 @@ def _run_probe_suite(
                 '-rA',
                 *extra,
             ],
-            cwd=str(suite.root),
+            cwd=suite.root,
             env=env,
-            capture_output=True,
-            text=True,
-            timeout=budget_secs,
-            check=False,
+            budget_secs=budget_secs,
         )
-    except subprocess.TimeoutExpired as exc:
+    except ProcessGroupOverrun as overrun:
         pytest.fail(
             f'the probe child did not finish within its budget of {budget_secs}s. '
-            'A starved child and a wedged one look the same here; the partial '
-            'output shows how far it got: the header alone means it was stuck '
-            'in startup, and progress characters without an F mean '
-            f'{BLOCKING_TEST} never timed out.\n'
-            f'{_captured(exc)}',
+            'Its output goes to files, so no descendant can hold it open: the '
+            'controller itself was still running. A stdout ending in the '
+            'terminal summary means the controller hung in its own exit after '
+            'the session finished, the header alone means it was stuck in '
+            'startup, and progress characters without an F mean no test in '
+            f'{BLOCKING_TESTS!r} ever timed out.\n'
+            f'{overrun}',
             pytrace=False,
         )
     loaded = _header_plugins(result.stdout)
@@ -235,24 +331,33 @@ def _header_plugins(output: str) -> set[str] | None:
     return {entry.rsplit('-', 1)[0] for entry in header.group(1).split(', ')}
 
 
-def _captured(result: subprocess.CompletedProcess[str] | subprocess.TimeoutExpired) -> str:
-    return f'stdout:\n{_text(result.stdout)}\nstderr:\n{_text(result.stderr)}'
+def _failed_test_names(output: str) -> list[str]:
+    """The test names on the short summary's FAILED lines, ``@<group>`` suffix stripped."""
+    return re.findall(r'^FAILED \S*::([^\s@]+)', output, re.MULTILINE)
 
 
-def _text(stream: str | bytes | None) -> str:
-    """*stream* as text: a TimeoutExpired holds bytes or None even under ``text=True``."""
-    if stream is None:
-        return ''
-    if isinstance(stream, bytes):
-        return stream.decode('utf-8', errors='replace')
-    return stream
+def _failure_sections(output: str) -> dict[str, str]:
+    """Each test's section of pytest's FAILURES block, keyed by its head line.
+
+    The short summary truncates a FAILED line's message to the terminal width,
+    so why a test failed is read here instead.
+    """
+    block = re.search(r'^=+ FAILURES =+$(.*?)(?=^=+ .* =+$|\Z)', output, re.MULTILINE | re.DOTALL)
+    if block is None:
+        return {}
+    parts = re.split(r'^_{3,} (\S+) _{3,}$', block.group(1), flags=re.MULTILINE)
+    return dict(zip(parts[1::2], parts[2::2], strict=True))
+
+
+def _captured(result: subprocess.CompletedProcess[str]) -> str:
+    return f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
 
 
 @pytest.mark.xdist_group(TIMEOUT_METHOD_PROBE_GROUP)
 def test_signal_timeout_fails_the_test_and_the_xdist_worker_survives(
     tmp_path: pathlib.Path,
 ) -> None:
-    """THE MEASUREMENT that keeps dashboard and escalation on signal."""
+    """THE MEASUREMENT that keeps every config on signal."""
     result = _run_probe_suite(_write_probe_suite(tmp_path, SIGNAL_METHOD))
     output = result.stdout + result.stderr
 
@@ -260,15 +365,25 @@ def test_signal_timeout_fails_the_test_and_the_xdist_worker_survives(
         f'the signal-method probe exited {result.returncode}, not '
         f'{int(pytest.ExitCode.TESTS_FAILED)} (TESTS_FAILED).\n{_captured(result)}'
     )
-    failed = re.findall(r'^FAILED .*$', output, re.MULTILINE)
-    assert len(failed) == 1 and BLOCKING_TEST in failed[0], (
-        f'expected exactly one FAILED line, naming {BLOCKING_TEST}; got '
-        f'{failed!r}.\n{_captured(result)}'
+    failed = _failed_test_names(output)
+    assert set(failed) == set(BLOCKING_TESTS), (
+        f'expected the FAILED lines to name exactly {sorted(BLOCKING_TESTS)}; '
+        f'got {sorted(failed)}.\n{_captured(result)}'
+    )
+    sections = _failure_sections(output)
+    not_on_the_cap = [
+        name for name in BLOCKING_TESTS if TIMEOUT_FAILURE not in sections.get(name, '')
+    ]
+    assert not not_on_the_cap, (
+        f'{not_on_the_cap!r} failed, but not on the pytest-timeout cap: signal '
+        'did not interrupt the main thread where that test blocks.\n'
+        f'{_captured(result)}'
     )
     for survivor in (SAME_WORKER_SUCCESSOR, MAIN_THREAD_TEST):
         assert re.search(rf'^PASSED \S*::{survivor}\b', output, re.MULTILINE), (
             f'{survivor} did not pass. If it is {SAME_WORKER_SUCCESSOR}, the '
-            'worker did not survive the signal timeout; if either fails its '
+            f'worker did not survive {len(BLOCKING_TESTS)} successive signal '
+            'timeouts; if either fails its '
             'main-thread assertion, xdist is no longer running tests on the '
             "worker's main thread (pytest-xdist < 3.6.0?), and signal is no "
             'longer valid under xdist. Re-read this file\'s docstring before '
@@ -280,19 +395,15 @@ def test_signal_timeout_fails_the_test_and_the_xdist_worker_survives(
     assert re.search(r'^INTERNALERROR>', output, re.MULTILINE) is None, (
         f'the signal-method probe raised an INTERNALERROR.\n{_captured(result)}'
     )
-    assert 'Timeout' in output, (
-        f'{BLOCKING_TEST} failed, but not on the pytest-timeout cap.\n'
-        f'{_captured(result)}'
-    )
-    assert '1 failed, 8 passed' in output, (
-        'the tally is not the complete "1 failed, 8 passed": a signal timeout '
+    assert '3 failed, 8 passed' in output, (
+        'the tally is not the complete "3 failed, 8 passed": a signal timeout '
         f'must cost exactly the one test it fires in.\n{_captured(result)}'
     )
 
 
 @pytest.mark.xdist_group(TIMEOUT_METHOD_PROBE_GROUP)
 def test_thread_timeout_kills_the_xdist_worker(tmp_path: pathlib.Path) -> None:
-    """THE PAIRED CONTROL: the same suite under thread, as orchestrator and fused-memory run.
+    """THE PAIRED CONTROL: the same suite under thread, as orchestrator and fused-memory ran until task 6354.
 
     Run on the signal probe's OWN suite, this is that probe's non-vacuity check:
     on this input, a method that kills the worker does produce the crash
@@ -325,28 +436,12 @@ def test_thread_timeout_kills_the_xdist_worker(tmp_path: pathlib.Path) -> None:
     )
 
 
-def test_a_timed_out_probe_child_reports_its_partial_output() -> None:
-    partial = 'bringing up nodes...\n........'
-    timed_out = subprocess.TimeoutExpired(
-        ['python', '-m', 'pytest'], 240, output=partial.encode(), stderr=None
-    )
-
-    report = _captured(timed_out)
-
-    assert partial in report, (
-        "a TimeoutExpired carries the child's streams as bytes, even under "
-        f'text=True; they must be decoded, not shown as a repr.\n{report}'
-    )
-    assert 'stdout:' in report and 'stderr:' in report, report
-    assert "b'" not in report, report
-
-
 def test_a_probe_child_that_outlives_its_budget_fails_the_calling_test(
     tmp_path: pathlib.Path,
 ) -> None:
     budget_secs = 0.5
     # --timeout=0 lifts the cap on BLOCKING_TEST, so the child can never finish;
-    # -n 0 runs it in the child itself, so the kill leaves no xdist worker behind.
+    # -n 0 keeps the child to one process.
     never_finishes = ('--timeout=0', '-n', '0')
 
     with pytest.raises(pytest.fail.Exception) as failure:
@@ -359,6 +454,41 @@ def test_a_probe_child_that_outlives_its_budget_fails_the_calling_test(
     report = str(failure.value)
     assert f'within its budget of {budget_secs}s' in report, report
     assert 'stdout:' in report and 'stderr:' in report, report
+
+
+def test_a_descendant_still_holding_the_probe_childs_output_does_not_hold_up_the_probe(
+    tmp_path: pathlib.Path,
+) -> None:
+    suite = _write_probe_suite(tmp_path, SIGNAL_METHOD)
+    pidfile = tmp_path / 'lingerer.pid'
+    # Spawned after the session summary, like a descendant that outlives the
+    # controller; it inherits the child's stdout and stderr, and sleeps past
+    # the budget so that a run waiting for EOF overruns while a leak still
+    # ends by itself.
+    (suite.root / 'conftest.py').write_text(
+        'import pathlib\n'
+        'import subprocess\n'
+        'import sys\n'
+        '\n'
+        '\n'
+        'def pytest_unconfigure(config):\n'
+        '    lingerer = subprocess.Popen(\n'
+        f"        [sys.executable, '-c', 'import time; time.sleep({PROBE_SUBPROCESS_TIMEOUT_SECS + 60})']\n"
+        '    )\n'
+        f'    pathlib.Path({str(pidfile)!r}).write_text(str(lingerer.pid))\n',
+        encoding='utf-8',
+    )
+
+    result = _run_probe_suite(suite, '-n', '0', '-k', MAIN_THREAD_TEST)
+
+    assert result.returncode == pytest.ExitCode.OK, (
+        f'the probe child exited {result.returncode}, not 0 (OK).\n{_captured(result)}'
+    )
+    lingerer = int(pidfile.read_text(encoding='utf-8'))
+    assert wait_pid_gone(lingerer, timeout=30), (
+        f'the lingering descendant {lingerer} is still running: the probe\'s '
+        'process group must not outlive the run.'
+    )
 
 
 @pytest.mark.parametrize(
@@ -377,6 +507,26 @@ def test_header_plugins_names_each_plugin_without_its_version(
     output: str, plugins: set[str] | None,
 ) -> None:
     assert _header_plugins(output) == plugins
+
+
+def test_each_failure_is_read_from_its_own_section() -> None:
+    output = (
+        '==================== FAILURES ====================\n'
+        '_______________ test_one _______________\n'
+        f'E   Failed: {TIMEOUT_FAILURE}.\n'
+        '_______________ test_two _______________\n'
+        'E   AssertionError\n'
+        '============= short test summary info ============\n'
+        'FAILED suite.py::test_one@same_worker - Failed:...\n'
+        'FAILED suite.py::test_two\n'
+    )
+
+    sections = _failure_sections(output)
+
+    assert _failed_test_names(output) == ['test_one', 'test_two']
+    assert sorted(sections) == ['test_one', 'test_two']
+    assert TIMEOUT_FAILURE in sections['test_one']
+    assert TIMEOUT_FAILURE not in sections['test_two']
 
 
 def _timeout_marks(module: types.ModuleType) -> list[tuple[str, float]]:
@@ -452,7 +602,7 @@ def test_the_probes_take_this_runs_per_test_timeout_and_the_child_budget_sits_be
 def test_thread_timeout_method_is_confined_to_the_recorded_configs() -> None:
     thread_configs = {
         name
-        for name, ini_options in per_test_timeout_policy.discovered_pytest_configs().items()
+        for name, ini_options in discovered_pytest_configs().items()
         if ini_options.get('timeout_method') == THREAD_METHOD
     }
     assert thread_configs == THREAD_TIMEOUT_METHOD_CONFIGS, (
@@ -465,4 +615,94 @@ def test_thread_timeout_method_is_confined_to_the_recorded_configs() -> None:
         'THREAD_TIMEOUT_METHOD_CONFIGS and the rationale in '
         'tests/scripts/test_timeout_method_policy.py\'s module docstring in the '
         'same change.'
+    )
+
+
+def _xdist_requirements(config_name: str) -> list[Requirement]:
+    """Every pytest-xdist entry *config_name*'s pyproject.toml declares.
+
+    Reads all three tables that can declare one: ``[project].dependencies``,
+    every list in ``[project.optional-dependencies]``, and every group in
+    ``[dependency-groups]``. Dict entries such as ``{include-group = ...}`` name
+    another group rather than a distribution, so they are skipped; the group
+    they include is walked in its own right.
+    """
+    pyproject = REPO_ROOT / config_name / 'pyproject.toml'
+    data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
+    project = data.get('project', {})
+    declaration_lists = [
+        project.get('dependencies', []),
+        *project.get('optional-dependencies', {}).values(),
+        *data.get('dependency-groups', {}).values(),
+    ]
+    requirements = [
+        Requirement(entry)
+        for entries in declaration_lists
+        for entry in entries
+        if isinstance(entry, str)
+    ]
+    return [req for req in requirements if canonicalize_name(req.name) == XDIST_DISTRIBUTION]
+
+
+def _floor_violation(config_name: str, requirement: Requirement) -> str | None:
+    """Why *requirement* admits an xdist below ``MAIN_THREAD_WORKERS_XDIST``, or None."""
+    floors = [
+        Version(clause.version)
+        for clause in requirement.specifier
+        if clause.operator == '>='
+    ]
+    if not floors:
+        return (
+            f'{config_name}/pyproject.toml declares {str(requirement)!r}, which has no '
+            f'`>=` floor; spell it {XDIST_DISTRIBUTION}>={MAIN_THREAD_WORKERS_XDIST}'
+        )
+    if max(floors) < MAIN_THREAD_WORKERS_XDIST:
+        return (
+            f'{config_name}/pyproject.toml declares {str(requirement)!r}, below the '
+            f'required floor {XDIST_DISTRIBUTION}>={MAIN_THREAD_WORKERS_XDIST}'
+        )
+    return None
+
+
+def test_every_pytest_xdist_floor_admits_only_main_thread_workers() -> None:
+    """The declaration-level guard on the signal premise.
+
+    The probes above check the resolved xdist at run time and ``uv.lock`` pins
+    it; this checks what the root pyproject.toml and every workspace member
+    admit, in any dependency table, so a lowered floor or a new declaration at
+    an old one fails here, by name, before any relock can resolve below it.
+    """
+    declarers: list[str] = []
+    violations: list[str] = []
+    config_names = [
+        ROOT_CONFIG_NAME,
+        *workspace_members(),
+    ]
+    for config_name in config_names:
+        requirements = _xdist_requirements(config_name)
+        if requirements:
+            declarers.append(config_name)
+        violations.extend(
+            violation
+            for violation in (_floor_violation(config_name, req) for req in requirements)
+            if violation is not None
+        )
+
+    assert len(declarers) >= MIN_EXPECTED_XDIST_DECLARERS, (
+        f'only {len(declarers)} pyproject.toml files declare {XDIST_DISTRIBUTION} '
+        f'({sorted(declarers)}), expected at least {MIN_EXPECTED_XDIST_DECLARERS}. '
+        'Discovery reads the root pyproject.toml plus one per '
+        '[tool.uv.workspace].members entry, and in each the [project] '
+        'dependencies, [project.optional-dependencies] and [dependency-groups]; '
+        'a declaration it stopped finding is one this guard no longer checks.'
+    )
+    assert not violations, (
+        f'these {XDIST_DISTRIBUTION} declarations admit a release below '
+        f'{MAIN_THREAD_WORKERS_XDIST}:\n'
+        + '\n'.join(f'  {violation}' for violation in violations)
+        + f'\n\nBelow {MAIN_THREAD_WORKERS_XDIST}, xdist does not run tests on the '
+        "worker's main thread, so SIGALRM never reaches them and this file's "
+        'premise that timeout_method = "signal" is valid under xdist fails. '
+        'See tests/scripts/test_timeout_method_policy.py\'s module docstring and '
+        'esc-5470-3.'
     )

@@ -1,0 +1,18 @@
+{
+  "task_id": "3076",
+  "reason": "net-additive \u03b4 work \u2014 five independent workflow call-site spies (agent _invoke, implement verify, merge re-verify, venv sync, dry-run investigator) must drive those private TaskWorkflow sites, as test_task_verify_lease.py does",
+  "measures": [
+    {
+      "measure": "private_reads",
+      "key": "orchestrator/tests/test_lane_in_use.py",
+      "baseline": 0,
+      "current": 10
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6658,
+      "current": 6668
+    }
+  ]
+}

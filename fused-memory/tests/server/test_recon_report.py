@@ -16,6 +16,8 @@ Covers:
 
 import pytest
 
+from fused_memory.reconciliation.flag_identity import description_digest
+
 # ---------------------------------------------------------------------------
 # step-1: Config schema — RED until step-2 adds the fields
 # ---------------------------------------------------------------------------
@@ -461,7 +463,7 @@ class TestReconReportCompleteIdempotence:
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='cat',
             description='d',
             suggested_action='a',
@@ -522,7 +524,7 @@ class TestReconReportPostCompletionGuard:
         state.start_report(run_id='r1', stage='s1', project_id='p')
         state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='d',
             suggested_action='a',
@@ -536,7 +538,7 @@ class TestReconReportPostCompletionGuard:
         state = self._make_completed_state()
         result = state.add_finding(
             run_id='r1',
-            severity='high',
+            severity='serious',
             category='c',
             description='late finding',
             suggested_action='a',
@@ -635,7 +637,7 @@ class TestReconReportRunIdMismatch:
         state = self._make_state()
         result = state.add_finding(
             run_id='ghost',
-            severity='low',
+            severity='minor',
             category='cat',
             description='d',
             suggested_action='a',
@@ -682,10 +684,10 @@ class TestReconReportStateIsolation:
         state.start_report('r1', 'stage1', 'p')
         state.start_report('r2', 'stage2', 'p')
 
-        state.add_finding(run_id='r1', severity='low', category='c',
+        state.add_finding(run_id='r1', severity='minor', category='c',
                           description='r1-finding', suggested_action='a',
                           task_id='1', flag_type='f1')
-        state.add_finding(run_id='r2', severity='high', category='c',
+        state.add_finding(run_id='r2', severity='serious', category='c',
                           description='r2-finding', suggested_action='a',
                           task_id='2', flag_type='f2')
 
@@ -715,10 +717,10 @@ class TestReconReportStateIsolation:
         state = self._make_state()
         state.start_report('r1', 's1', 'p')
         state.start_report('r2', 's2', 'p')
-        id1 = state.add_finding(run_id='r1', severity='low', category='c',
+        id1 = state.add_finding(run_id='r1', severity='minor', category='c',
                                  description='d', suggested_action='a',
                                  task_id='1', flag_type='f')['finding_id']
-        id2 = state.add_finding(run_id='r2', severity='low', category='c',
+        id2 = state.add_finding(run_id='r2', severity='minor', category='c',
                                  description='d', suggested_action='a',
                                  task_id='1', flag_type='f')['finding_id']
         assert id1 != id2
@@ -902,7 +904,7 @@ class TestReconReportReaper:
         state.start_report('r1', 'stage_two', 'dark_factory')
         second = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='informational',
             description='shared null-null observation',
             suggested_action='none',
@@ -922,9 +924,8 @@ class TestReconReportReaper:
         assert state.get_assembled_report('r1', 'stage_one') is None
         assert state.get_assembled_report('r1', 'stage_two') is None
 
-        assert 'r1' not in state._run_sig_index
-        assert 'r1' not in state._run_desc_index
-        assert 'r1' not in state._run_finding_index
+        assert state.run_index('r1') is None
+        assert state.violations() == []
 
     def test_partial_eviction_of_one_run_does_not_affect_concurrent_run(self):
         """Evicting a completed stage of run r1 while r1 is still live must
@@ -981,7 +982,9 @@ class TestReconReportReaper:
 
         # r2's sig index, finding index, and dedup behavior must be entirely
         # unaffected by r1's partial eviction.
-        assert state._run_sig_index.get('r2', {}).get(
+        r2_index = state.run_index('r2')
+        assert r2_index is not None
+        assert r2_index.by_signature(
             ('2077', 'cycle_summary_prune_rerun_needed_post_2077')
         ) == r2_finding_id
         assert state._resolve_finding('r2', r2_finding_id) is not None
@@ -1017,6 +1020,7 @@ class TestReconReportReaper:
             f'Expected r1 dedup to survive its own partial eviction, got: {r1_dup}'
         )
         assert r1_dup['existing_finding_id'] == r1_finding_id
+        assert state.violations() == []
 
 
 # ---------------------------------------------------------------------------
@@ -1066,7 +1070,7 @@ class TestCreateReconReportServer:
         # add_finding
         result = await tm.call_tool('add_finding', {
             'run_id': 'r1',
-            'severity': 'low',
+            'severity': 'minor',
             'category': 'cat',
             'description': 'd',
             'suggested_action': 'a',
@@ -1414,7 +1418,7 @@ class TestReconReportCrossStageDedup:
     ):
         defaults = dict(
             run_id=run_id,
-            severity='high',
+            severity='serious',
             category='stuck_task',
             description='d',
             suggested_action='a',
@@ -1537,7 +1541,7 @@ class TestReconReportCrossStageCitability:
         state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
         res1 = state.add_finding(
             run_id='r1',
-            severity='high',
+            severity='serious',
             category='stuck_task',
             description='task is stuck',
             suggested_action='investigate',
@@ -1551,7 +1555,7 @@ class TestReconReportCrossStageCitability:
         state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
         dup = state.add_finding(
             run_id='r1',
-            severity='high',
+            severity='serious',
             category='stuck_task',
             description='same task is stuck (Stage 2 view)',
             suggested_action='investigate',
@@ -1595,7 +1599,7 @@ class TestReconReportCrossStageCitability:
         state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
         res1 = state.add_finding(
             run_id='r1',
-            severity='high',
+            severity='serious',
             category='stuck_task',
             description='task is stuck',
             suggested_action='investigate',
@@ -1610,7 +1614,7 @@ class TestReconReportCrossStageCitability:
         state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
         dup = state.add_finding(
             run_id='r1',
-            severity='high',
+            severity='serious',
             category='stuck_task',
             description='same task (Stage 2 view)',
             suggested_action='investigate',
@@ -1673,7 +1677,7 @@ class TestReconReportNullDescDedup:
     ):
         defaults = dict(
             run_id=run_id,
-            severity='low',
+            severity='minor',
             category='informational',
             description=description,
             suggested_action='none',
@@ -1751,7 +1755,7 @@ class TestReconReportNullDescDedup:
 
         with_sig = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='informational',
             description='shared text',
             suggested_action='none',
@@ -1801,8 +1805,8 @@ class TestReconReportNullDescDedup:
         assert r1['finding_id'] != r2['finding_id']
 
     def test_eviction_clears_desc_index(self):
-        """After TTL eviction via tick(), _run_desc_index must not retain the
-        evicted run's hashes (prevents unbounded growth across runs)."""
+        """After TTL eviction via tick(), the run's finding index must not
+        retain the evicted run's hashes (prevents unbounded growth across runs)."""
         state, t = self._make_state(ttl=300)
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         self._finding(state, run_id='r1', description='an informational note')
@@ -1816,8 +1820,9 @@ class TestReconReportNullDescDedup:
         # Entry is gone
         assert state.get_assembled_report('r1', 's1') is None
 
-        # _run_desc_index must not retain r1's hashes
-        assert 'r1' not in state._run_desc_index
+        # The run's finding index, and with it r1's hashes, is released
+        assert state.run_index('r1') is None
+        assert state.violations() == []
 
     def test_partial_eviction_preserves_deschash_dedup_for_live_run(self):
         """Same partial-eviction scenario as the reaper's signature-path test,
@@ -1923,7 +1928,10 @@ class TestReconReportNullDescDedup:
         # Run is still LIVE (stage_two in-progress) — the run-level desc
         # index must be PRESERVED, not torn down just because stage_one
         # evicted, and dedup against the canonical finding must still fire.
-        assert 'r1' in state._run_desc_index
+        r1_index = state.run_index('r1')
+        assert r1_index is not None
+        assert r1_index.by_desc(description_digest('shared observation')) == first_id
+        assert state.violations() == []
         still_dup = self._finding(state, run_id='r1', description='shared observation')
         assert still_dup.get('error') == 'duplicate_finding', (
             f'Expected dedup to survive partial eviction, got: {still_dup}'
@@ -1937,10 +1945,9 @@ class TestReconReportNullDescDedup:
         assert evicted_2 == 1, f'Expected 1 eviction, got {evicted_2}'
         assert state.get_assembled_report('r1', 'stage_two') is None
 
-        # Full quiescence — the run-level indices must now be released.
-        assert 'r1' not in state._run_desc_index
-        assert 'r1' not in state._run_sig_index
-        assert 'r1' not in state._run_finding_index
+        # Full quiescence — the run's finding index must now be released.
+        assert state.run_index('r1') is None
+        assert state.violations() == []
 
 
 # ---------------------------------------------------------------------------
@@ -2225,7 +2232,7 @@ class TestGetAssembledReportNonActionableEchoSuppression:
         state.start_report(run_id, 'memory_consolidator', 'dark_factory')
         r = state.add_finding(
             run_id=run_id,
-            severity='low',
+            severity='minor',
             category='cross_project',
             description='Stage 1 cross-project finding about reify/3803',
             suggested_action='Check reify project',
@@ -2245,7 +2252,7 @@ class TestGetAssembledReportNonActionableEchoSuppression:
         state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
         r2 = state.add_finding(
             run_id=run_id,
-            severity='low',
+            severity='minor',
             category='cross_project',
             description='Stage 2 echo of the same cross-project finding',
             suggested_action='Check reify project (echo)',
@@ -2277,7 +2284,7 @@ class TestGetAssembledReportNonActionableEchoSuppression:
         # Stage 1: cites reify/3803 with flag_type='cross_project'
         state.start_report(run_id, 'memory_consolidator', 'dark_factory')
         r = state.add_finding(
-            run_id=run_id, severity='low', category='cross_project',
+            run_id=run_id, severity='minor', category='cross_project',
             description='Stage 1 finding', suggested_action='act',
             actionable=False, task_id=None, flag_type='cross_project',
         )
@@ -2290,7 +2297,7 @@ class TestGetAssembledReportNonActionableEchoSuppression:
         # it cites the same Stage-1 target.
         state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
         r2 = state.add_finding(
-            run_id=run_id, severity='high', category='cross_project',
+            run_id=run_id, severity='serious', category='cross_project',
             description='Actionable finding about reify/3803',
             suggested_action='Fix this', actionable=True,  # actionable!
             task_id=None, flag_type='stale_metadata',
@@ -2317,7 +2324,7 @@ class TestGetAssembledReportNonActionableEchoSuppression:
         # Stage 1: cites reify/3803 with flag_type='cross_project'
         state.start_report(run_id, 'memory_consolidator', 'dark_factory')
         r = state.add_finding(
-            run_id=run_id, severity='low', category='cross_project',
+            run_id=run_id, severity='minor', category='cross_project',
             description='Stage 1 finding', suggested_action='act',
             actionable=False, task_id=None, flag_type='cross_project',
         )
@@ -2363,7 +2370,7 @@ class TestGetAssembledReportNonActionableEchoSuppression:
         # Stage 1: add a single non-actionable finding + cite reify/3803
         state.start_report(run_id, 'memory_consolidator', 'dark_factory')
         r = state.add_finding(
-            run_id=run_id, severity='low', category='cross_project',
+            run_id=run_id, severity='minor', category='cross_project',
             description='Unique Stage-1 cross-project finding',
             suggested_action='Check reify', actionable=False,
             task_id=None, flag_type='cross_project',
@@ -2399,7 +2406,7 @@ class TestGetAssembledReportNonActionableEchoSuppression:
 
         # Finding A — non-actionable, cites reify/3803 with flag_type='cross_project'
         r_a = state.add_finding(
-            run_id=run_id, severity='low', category='cross_project',
+            run_id=run_id, severity='minor', category='cross_project',
             description='Stage-1 sibling A about reify/3803',
             suggested_action='Check reify', actionable=False,
             task_id=None, flag_type='cross_project',
@@ -2412,7 +2419,7 @@ class TestGetAssembledReportNonActionableEchoSuppression:
         # Finding B — non-actionable, also cites reify/3803 with a different flag_type
         # (to avoid the in-run sig dedup which keys on (task_id, flag_type)).
         r_b = state.add_finding(
-            run_id=run_id, severity='low', category='cross_project',
+            run_id=run_id, severity='minor', category='cross_project',
             description='Stage-1 sibling B also about reify/3803',
             suggested_action='Check reify again', actionable=False,
             task_id=None, flag_type='stale_edge',
@@ -2646,7 +2653,7 @@ class TestCrossProjectRoutingTaxonomyGuard:
 
         r_systemic = state.add_finding(
             run_id=run_id,
-            severity='low',
+            severity='minor',
             category='systemic_pattern',
             description='Recurring pattern observed across the run',
             suggested_action='Investigate the recurrence',
@@ -2742,7 +2749,7 @@ class TestReconReportGetFindingsForRun:
         assert 'finding_id' in f1, f'Stage 1 add_finding #1 failed: {f1}'
         f2 = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='task_memory_mismatch',
             description='mismatch d',
             suggested_action='a2',
@@ -2757,7 +2764,7 @@ class TestReconReportGetFindingsForRun:
         state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='p')
         f3 = state.add_finding(
             run_id='r1',
-            severity='high',
+            severity='serious',
             category='systemic_pattern',
             description='systemic d2',
             suggested_action='a3',
@@ -2841,7 +2848,7 @@ class TestReconReportSignatureTypeCanonicalization:
 
     Root cause (run 9542fa10): ``sig = (task_id, flag_type)`` was built from
     the RAW argument values with no type coercion, so ``(1976, ft) != ('1976',
-    ft)`` and the ``_run_sig_index`` lookup missed, allocating a second
+    ft)`` and the signature lookup missed, allocating a second
     finding row instead of returning ``duplicate_finding``.  This mirrors
     flag_dedup.compute_flag_signature's str-coercion, which documents
     "integer task_id is common in LLM output" as the reason for it.
@@ -3136,8 +3143,8 @@ class TestReconReportFlagTypeInheritance:
         }
 
     def test_null_flag_inherit_survives_partial_eviction(self):
-        """The inherit lookup reads the run-quiescence-scoped _run_sig_index
-        (task-2088), so it must still find Stage 1's established flag_type
+        """The inherit lookup reads the run's finding index, which lives until
+        the run quiesces (task-2088), so it must still find Stage 1's established flag_type
         even after Stage 1's own _ReportEntry has been evicted by tick() —
         as long as the run itself (Stage 2) is still live.
         """
@@ -3262,7 +3269,7 @@ class TestReconReportFlagTypeInheritance:
         assert task_b['finding_id'] != task_a['finding_id']
 
     def test_null_flag_not_inherited_across_different_run(self):
-        """The inherit lookup scans ``_run_sig_index.get(run_id, {})``, so a
+        """The inherit lookup reads the run's own finding index, so a
         flag_type established for a task_id in run r1 must never be
         inherited by a bare-null re-raise for the SAME task_id filed under a
         DIFFERENT run_id r2 — in-run dedup (and its inheritance extension)
@@ -3322,7 +3329,7 @@ class TestReconReportOverlengthTruncation:
         overlength = 'x' * (_MAX_FINDING_TEXT_CHARS + 500)
         result = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description=overlength,
             suggested_action='a',
@@ -3350,7 +3357,7 @@ class TestReconReportOverlengthTruncation:
         overlength = 'y' * (_MAX_FINDING_TEXT_CHARS + 500)
         result = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='d',
             suggested_action=overlength,
@@ -3383,7 +3390,7 @@ class TestReconReportOverlengthTruncation:
         overlength = 'z' * (_MAX_FINDING_TEXT_CHARS + 500)
         result = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category=overlength,
             description='d',
             suggested_action='a',
@@ -3406,7 +3413,7 @@ class TestReconReportOverlengthTruncation:
 
         result = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='d',
             suggested_action='a',
@@ -3419,6 +3426,54 @@ class TestReconReportOverlengthTruncation:
         item = report['flagged_items'][0]
         assert item['description'] == 'd'
         assert item['suggested_action'] == 'a'
+
+    def test_text_exactly_at_the_cap_is_stored_whole_without_warnings(self):
+        from fused_memory.server.recon_report import _MAX_FINDING_TEXT_CHARS
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        at_cap = 'x' * _MAX_FINDING_TEXT_CHARS
+        result = state.add_finding(
+            run_id='r1',
+            severity='minor',
+            category=at_cap,
+            description=at_cap,
+            suggested_action=at_cap,
+        )
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+        assert 'warnings' not in result
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['description'] == at_cap
+        assert item['suggested_action'] == at_cap
+        assert item['category'] == at_cap
+
+    def test_text_one_char_over_the_cap_is_cut_to_the_cap_and_marked(self):
+        from fused_memory.server.recon_report import (
+            _MAX_FINDING_TEXT_CHARS,
+            _TRUNCATION_MARKER,
+        )
+
+        state, _ = self._make_state()
+        state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
+
+        result = state.add_finding(
+            run_id='r1',
+            severity='minor',
+            category='c',
+            description='x' * (_MAX_FINDING_TEXT_CHARS + 1),
+            suggested_action='a',
+        )
+        assert 'finding_id' in result, f'add_finding failed: {result}'
+        assert result['warnings'] == [f'description truncated to {_MAX_FINDING_TEXT_CHARS} chars']
+
+        report = state.get_assembled_report('r1', 's1')
+        assert report is not None
+        item = report['flagged_items'][0]
+        assert item['description'] == 'x' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
 
     def test_overlength_null_null_findings_dedup_on_truncated_text(self):
         """Two null-null findings whose descriptions are identical for the
@@ -3435,7 +3490,7 @@ class TestReconReportOverlengthTruncation:
         shared_prefix = 'x' * _MAX_FINDING_TEXT_CHARS
         first = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='informational',
             description=shared_prefix + ' tail one',
             suggested_action='none',
@@ -3445,7 +3500,7 @@ class TestReconReportOverlengthTruncation:
 
         second = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='informational',
             description=shared_prefix + ' tail two',
             suggested_action='none',
@@ -3475,7 +3530,7 @@ class TestReconReportOverlengthTruncation:
 
         first = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='d',
             suggested_action='a',
@@ -3487,7 +3542,7 @@ class TestReconReportOverlengthTruncation:
         overlength = 'z' * (_MAX_FINDING_TEXT_CHARS + 500)
         dup = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description=overlength,
             suggested_action='a',
@@ -3512,7 +3567,7 @@ class TestReconReportOverlengthTruncation:
         shared = 'q' * (_MAX_FINDING_TEXT_CHARS + 500)
         first = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='informational',
             description=shared,
             suggested_action='none',
@@ -3522,7 +3577,7 @@ class TestReconReportOverlengthTruncation:
 
         dup = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='informational',
             description=shared,
             suggested_action='none',
@@ -3543,7 +3598,7 @@ class TestReconReportOverlengthTruncation:
 
         first = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='d',
             suggested_action='a',
@@ -3554,7 +3609,7 @@ class TestReconReportOverlengthTruncation:
 
         dup = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='different but same sig',
             suggested_action='a',
@@ -3588,7 +3643,7 @@ class TestReconReportDeleteFinding:
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         added = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='d',
             suggested_action='a',
@@ -3622,7 +3677,7 @@ class TestReconReportDeleteFinding:
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         added = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='d',
             suggested_action='a',
@@ -3639,7 +3694,7 @@ class TestReconReportDeleteFinding:
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         added = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='d',
             suggested_action='a',
@@ -3670,7 +3725,7 @@ class TestReconReportDeleteFinding:
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         added = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='d',
             suggested_action='a',
@@ -3684,7 +3739,7 @@ class TestReconReportDeleteFinding:
 
         refiled = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='corrected description',
             suggested_action='corrected action',
@@ -3700,7 +3755,7 @@ class TestReconReportDeleteFinding:
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         added = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='informational',
             description='shared observation',
             suggested_action='none',
@@ -3713,7 +3768,7 @@ class TestReconReportDeleteFinding:
 
         refiled = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='informational',
             description='shared observation',
             suggested_action='none',
@@ -3738,7 +3793,7 @@ class TestReconReportDeleteFinding:
 
         added = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='informational',
             description='   ',
             suggested_action='none',
@@ -3756,7 +3811,7 @@ class TestReconReportDeleteFinding:
 
         refiled = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='informational',
             description='   ',
             suggested_action='none',
@@ -3775,7 +3830,7 @@ class TestReconReportDeleteFinding:
         state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
         added = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='d',
             suggested_action='a',
@@ -3807,7 +3862,7 @@ class TestReconReportDeleteFinding:
         delete_finding's index cleanup recomputes the signature from the
         STORED finding.task_id/flag_type (never from a caller-submitted
         None) -- deleting via the id obtained through the inheriting
-        re-raise must pop ONLY ('42', 'f1') from _run_sig_index, leave B's
+        re-raise must pop ONLY ('42', 'f1') from the run's finding index, leave B's
         ('42', 'f2') entry untouched, and allow a fresh (42, 'f1') finding
         to be filed afterwards instead of bouncing off a stale
         duplicate_finding pointer.
@@ -3858,8 +3913,10 @@ class TestReconReportDeleteFinding:
         delete_result = state.delete_finding('r1', reraise['existing_finding_id'])
         assert delete_result == {'status': 'deleted', 'finding_id': fid_a}
 
-        assert state._run_sig_index.get('r1', {}).get(('42', 'f1')) is None
-        assert state._run_sig_index.get('r1', {}).get(('42', 'f2')) == fid_b
+        r1_index = state.run_index('r1')
+        assert r1_index is not None
+        assert r1_index.by_signature(('42', 'f1')) is None
+        assert r1_index.by_signature(('42', 'f2')) == fid_b
 
         refiled = state.add_finding(
             run_id='r1',
@@ -3872,6 +3929,7 @@ class TestReconReportDeleteFinding:
         )
         assert 'finding_id' in refiled, f'refile after delete failed: {refiled}'
         assert refiled['finding_id'] != fid_a
+        assert state.violations() == []
 
     @pytest.mark.asyncio
     async def test_cite_after_delete_of_cross_stage_duplicate_returns_finding_unknown(self):
@@ -3897,7 +3955,7 @@ class TestReconReportDeleteFinding:
         state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
         res1 = state.add_finding(
             run_id='r1',
-            severity='high',
+            severity='serious',
             category='stuck_task',
             description='task is stuck',
             suggested_action='investigate',
@@ -3911,7 +3969,7 @@ class TestReconReportDeleteFinding:
         state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
         dup = state.add_finding(
             run_id='r1',
-            severity='high',
+            severity='serious',
             category='stuck_task',
             description='same task (Stage 2 view)',
             suggested_action='investigate',
@@ -3984,7 +4042,7 @@ class TestReconReportSupersedes:
     def _file(self, state, run_id='r1', task_id='42', flag_type='f', description='d'):
         added = state.add_finding(
             run_id=run_id,
-            severity='low',
+            severity='minor',
             category='c',
             description=description,
             suggested_action='a',
@@ -4003,7 +4061,7 @@ class TestReconReportSupersedes:
         """
         added = state.add_finding(
             run_id=run_id,
-            severity='low',
+            severity='minor',
             category='c',
             description=f'retires {target_fid}',
             suggested_action='a',
@@ -4028,7 +4086,7 @@ class TestReconReportSupersedes:
 
         added = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='resolved after all',
             suggested_action='a',
@@ -4055,7 +4113,7 @@ class TestReconReportSupersedes:
 
         state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='resolved after all',
             suggested_action='a',
@@ -4084,7 +4142,7 @@ class TestReconReportSupersedes:
         state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
         added = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='mechanism X was fixed; the contradiction no longer holds',
             suggested_action='a',
@@ -4112,7 +4170,7 @@ class TestReconReportSupersedes:
 
         result = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='resolved after all',
             suggested_action='a',
@@ -4133,7 +4191,7 @@ class TestReconReportSupersedes:
 
         result = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='resolved after all',
             suggested_action='a',
@@ -4164,7 +4222,7 @@ class TestReconReportSupersedes:
 
         rejected = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='resolved after all',
             suggested_action='a',
@@ -4179,7 +4237,7 @@ class TestReconReportSupersedes:
         # No index residue: the SAME signature re-files cleanly.
         retry = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='resolved after all',
             suggested_action='a',
@@ -4207,7 +4265,7 @@ class TestReconReportSupersedes:
         state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
         added = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='the contradiction no longer holds',
             suggested_action='a',
@@ -4246,7 +4304,7 @@ class TestReconReportSupersedes:
 
         result = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='resolved after all',
             suggested_action='a',
@@ -4268,7 +4326,7 @@ class TestReconReportSupersedes:
         b_fid = self._file(state, flag_type='memory_mechanism_contradiction')
         a_added = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='resolved after all',
             suggested_action='a',
@@ -4300,7 +4358,7 @@ class TestReconReportSupersedes:
         state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='dark_factory')
         a_added = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='resolved after all',
             suggested_action='a',
@@ -4399,7 +4457,7 @@ class TestReconReportSupersedes:
 
         dup = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='d',
             suggested_action='a',
@@ -4424,7 +4482,7 @@ class TestReconReportSupersedes:
 
         dup = state.add_finding(
             run_id='r1',
-            severity='low',
+            severity='minor',
             category='c',
             description='d',
             suggested_action='a',
@@ -4472,7 +4530,7 @@ class TestSupersededFindingProjection:
     def _file(self, state, run_id, flag_type, supersedes=None, actionable=True):
         added = state.add_finding(
             run_id=run_id,
-            severity='low',
+            severity='minor',
             category='c',
             description=f'finding {flag_type}',
             suggested_action='a',
@@ -4556,7 +4614,7 @@ class TestSupersededFindingProjection:
 
         state.start_report(run_id, 'memory_consolidator', 'dark_factory')
         r1 = state.add_finding(
-            run_id=run_id, severity='low', category='cross_project',
+            run_id=run_id, severity='minor', category='cross_project',
             description='Stage 1 finding about reify/3803', suggested_action='act',
             actionable=False, task_id=None, flag_type='cross_project',
         )
@@ -4567,7 +4625,7 @@ class TestSupersededFindingProjection:
 
         state.start_report(run_id, 'task_knowledge_sync', 'dark_factory')
         r2 = state.add_finding(
-            run_id=run_id, severity='high', category='cross_project',
+            run_id=run_id, severity='serious', category='cross_project',
             description='Stage 2 actionable finding about reify/3803',
             suggested_action='Fix this', actionable=True,
             task_id=None, flag_type='stale_edge',
@@ -4579,7 +4637,7 @@ class TestSupersededFindingProjection:
         )
 
         r3 = state.add_finding(
-            run_id=run_id, severity='low', category='cross_project',
+            run_id=run_id, severity='minor', category='cross_project',
             description='and now it is resolved', suggested_action='none',
             actionable=True, task_id=None, flag_type='stale_edge_resolved',
             supersedes=echoing_fid,
@@ -4633,7 +4691,7 @@ class TestDeleteFindingViaFastMCP:
         })
         added = await tm.call_tool('add_finding', {
             'run_id': 'r1',
-            'severity': 'low',
+            'severity': 'minor',
             'category': 'cat',
             'description': 'd',
             'suggested_action': 'a',
@@ -4678,7 +4736,7 @@ class TestSupersedesViaFastMCP:
     async def _start_and_file(self, tm, flag_type, supersedes=None):
         args = {
             'run_id': 'r1',
-            'severity': 'low',
+            'severity': 'minor',
             'category': 'cat',
             'description': f'd {flag_type}',
             'suggested_action': 'a',
@@ -4734,3 +4792,126 @@ class TestSupersedesViaFastMCP:
             'supersedes must be optional with a None default; every existing '
             'add_finding caller omits it.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task-4429: add_finding enforces the closed FindingSeverity vocabulary at the
+# write boundary, atomically, before supersedes resolution and dedup.
+# ---------------------------------------------------------------------------
+
+
+_OFF_VOCABULARY_SEVERITIES = ['info', 'low', 'high', 'Minor', '', 'ok']
+
+
+class TestAddFindingSeverityIsValidated:
+    """An off-vocabulary severity is rejected with a structured error that
+    echoes the value and lists the legal ones, and the rejection mutates
+    nothing: no row, no dedup-index entry, no supersedes stamp.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        return state
+
+    def _add(self, state, severity, *, run_id='r1', flag_type='f', supersedes=None):
+        return state.add_finding(
+            run_id=run_id,
+            severity=severity,
+            category='memory_stale',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type=flag_type,
+            supersedes=supersedes,
+        )
+
+    def _assert_invalid_severity(self, result, severity):
+        from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES
+
+        assert result.get('error') == 'invalid_severity', result
+        assert result['error_type'] == 'ReconReportInvalidSeverity'
+        assert result['severity'] == severity
+        assert result['known_severities'] == list(FINDING_SEVERITY_VALUES)
+        assert result['hint']
+        assert 'actionable' in result['hint']
+        assert 'finding_id' not in result
+
+    @pytest.mark.parametrize('severity', _OFF_VOCABULARY_SEVERITIES)
+    def test_off_vocabulary_severity_is_rejected(self, severity):
+        state = self._make_state()
+        self._assert_invalid_severity(self._add(state, severity), severity)
+
+    @pytest.mark.parametrize('severity', _OFF_VOCABULARY_SEVERITIES)
+    def test_rejection_stores_nothing_and_burns_no_dedup_signature(self, severity):
+        state = self._make_state()
+        self._add(state, severity)
+
+        assert _flagged_items(state, 'r1', 'memory_consolidator') == []
+        retry = self._add(state, 'minor')
+        assert 'finding_id' in retry, (
+            f'a corrected retry after an {severity!r} rejection was refused: {retry}'
+        )
+
+    def test_rejected_supersedes_call_leaves_the_target_unstamped(self):
+        state = self._make_state()
+        target = self._add(state, 'moderate', flag_type='claim')
+        assert 'finding_id' in target, target
+
+        result = self._add(
+            state, 'info', flag_type='claim_resolved', supersedes=target['finding_id'],
+        )
+
+        self._assert_invalid_severity(result, 'info')
+        items = _flagged_items(state, 'r1', 'memory_consolidator')
+        assert [i['finding_id'] for i in items] == [target['finding_id']]
+        assert items[0]['superseded_by'] is None
+
+    def test_every_vocabulary_member_is_accepted_and_round_trips(self):
+        from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES
+
+        state = self._make_state()
+        for severity in FINDING_SEVERITY_VALUES:
+            added = self._add(state, severity, flag_type=f'f_{severity}')
+            assert 'finding_id' in added, added
+
+        items = _flagged_items(state, 'r1', 'memory_consolidator')
+        assert [i['severity'] for i in items] == list(FINDING_SEVERITY_VALUES)
+
+    def test_unknown_run_id_still_reports_run_id_unknown(self):
+        state = self._make_state()
+        result = self._add(state, 'info', run_id='ghost')
+        assert result == {'error': 'run_id_unknown', 'error_type': 'ReconReportRunUnknown'}
+
+    def test_completed_report_still_reports_report_already_completed(self):
+        state = self._make_state()
+        state.complete('r1', 'summary')
+        result = self._add(state, 'info')
+        assert result['error'] == 'report_already_completed'
+        assert result['error_type'] == 'ReconReportAlreadyCompleted'
+
+    @pytest.mark.asyncio
+    async def test_mcp_tool_returns_the_same_structured_error(self):
+        from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+
+        state = ReconReportState(ttl_seconds=300, clock=lambda: 0.0)
+        tm = create_recon_report_server(state)._tool_manager
+        await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 'memory_consolidator', 'project_id': 'dark_factory',
+        })
+
+        result = await tm.call_tool('add_finding', {
+            'run_id': 'r1',
+            'severity': 'info',
+            'category': 'cat',
+            'description': 'd',
+            'suggested_action': 'a',
+            'task_id': '42',
+            'flag_type': 'f',
+        })
+
+        self._assert_invalid_severity(result, 'info')
+        assert _flagged_items(state, 'r1', 'memory_consolidator') == []

@@ -19,6 +19,9 @@ from pathlib import Path
 import pytest
 import yaml
 from _fm_helpers import load_script_module
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Load the checker script by path to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -509,6 +512,36 @@ class TestCliExitCodes:
         captured = capsys.readouterr()
         assert captured.out == '', 'scan ran despite a missing explicit path'
         assert 'test_absent.py' in captured.err
+
+    def test_explicit_conftest_is_never_read(self, tmp_path: Path, capsys):
+        """An explicitly passed conftest.py is filtered out BEFORE it is read.
+
+        hooks/project-checks hands this checker every staged file, conftest.py
+        included.  Undecodable bytes make a read visible: it would exit 2 with an
+        ``error reading`` line.
+        """
+        conftest = tmp_path / 'conftest.py'
+        conftest.write_bytes(b'\xff\xfe not utf-8\n')
+        ok = tmp_path / 'test_ok.py'
+        ok.write_text('def test_ok():\n    assert True\n')
+
+        assert main([str(conftest), str(ok)]) == 0
+        assert capsys.readouterr().err == ''
+
+    def test_explicit_non_test_module_is_not_read(self, tmp_path: Path, capsys):
+        """A non-``test_*.py`` explicit path is filtered out before it is read, like conftest.py."""
+        helpers = tmp_path / 'helpers.py'
+        helpers.write_bytes(b'\xff\xfe not utf-8\n')
+        ok = tmp_path / 'test_ok.py'
+        ok.write_text('def test_ok():\n    assert True\n')
+
+        assert main([str(helpers), str(ok)]) == 0
+        assert capsys.readouterr().err == ''
+
+    def test_missing_explicit_conftest_still_fails_fast(self, tmp_path: Path, capsys):
+        """The existence check precedes the scannability filter."""
+        assert main([str(tmp_path / 'conftest.py')]) == 2
+        assert 'conftest.py' in capsys.readouterr().err
 
 
 class TestCliDirectoryScan:

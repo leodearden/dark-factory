@@ -78,19 +78,13 @@ The C2 middleware makes that quoting COUNTABLE rather than silent: it publishes
 the recovered parameter names whose delivered value still trips
 :func:`detect` on the ``markup_detected`` fact and on both policy payloads.
 
-## Staged API — the consumer of :func:`repair` and :func:`detect`
+## The consumer of this module's predicates and :func:`repair`
 
-This is task ALPHA of a staged PRD: it shipped its API one task ahead of the
-consumer. That consumer has since landed —
-:mod:`shared.mcp_markup_middleware` (``MarkupGuardMiddleware``, task **3689**,
-contract C2) wires :func:`detect` and :func:`repair` at the FastMCP boundary,
-and is a pure boundary layer over them, contributing policy, facts and the
-storm escape but no parsing of its own. Task **3690** registers that middleware
-on the servers.
-
-Until 3690 lands, the middleware is CONSTRUCTED only by its own tests, so a
-dead-code sweep can still misread this chain as unreachable. It is intentional
-staging — check 3690 before concluding otherwise.
+:mod:`shared.mcp_markup_middleware` (``MarkupGuardMiddleware``, contract C2)
+consumes this module's predicates and :func:`repair` at the FastMCP boundary of
+every server that registers it, as a pure boundary layer over them: it adds
+policy, facts and the storm escape, and parses nothing itself. Which predicate
+gates there is stated once, where that module imports them.
 
 ## Sentinel-literal hazard — DO NOT "helpfully" un-escape these
 
@@ -104,10 +98,10 @@ file and silently dropping the sibling arguments of that same call. ``\\x3c`` is
 byte-identical at runtime and never appears verbatim in the file text, so it is
 immune. Leave it escaped.
 Runtime text quoting them gets the same spelling via :func:`escape_envelope_literals`.
+``tests/scripts/raw_envelope_literal_guard.py`` enforces the rule, repo-wide via
 ``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``
-enforces the rule on every ``.py`` source that already spells the bracket as
-``chr(60)`` or ``\\x3c``, or imports this module; a source spelling envelope
-literals only raw is outside that population.
+and per module in each ``lint_command``. Which files it covers is stated once,
+in that guard's POPULATION paragraph.
 
 This module is pure and stdlib-only (``re``, ``json``). It deliberately imports
 nothing from ``fused_memory``, ``orchestrator`` or ``escalation`` so that every
@@ -430,7 +424,7 @@ _ANY_OPENER_RE = re.compile(
 )
 
 # Structural bounds. repair() must be total for adversarial input WITHOUT a
-# blanket try/except (that is signature (b) of shared/tests/silent_fallthrough_scan.py
+# blanket try/except (that is signature (b) of tests/repo_guards/silent_fallthrough_scan.py
 # and would demand an allowlist entry), so the two unbounded loops are bounded
 # by construction instead. Both ceilings are far above any real call: no MCP
 # tool has 64 parameters, and a value carrying 64 qualifying closers is prose

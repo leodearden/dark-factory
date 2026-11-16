@@ -17,6 +17,11 @@ import time
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 # ---------------------------------------------------------------------------
 # Step-1: loop-independence test for _watchdog_thread_loop
 # ---------------------------------------------------------------------------
@@ -42,7 +47,7 @@ class TestWatchdogThreadLoop:
         - At least 2 pings fired                     (proves periodic behaviour)
         - Thread is not alive after stop             (clean shutdown)
         """
-        import fused_memory.server.main as main  # noqa: PLC0415
+        import fused_memory.server.main as main
 
         # Collect calls from the heartbeat thread into a thread-safe list.
         calls: list[str] = []
@@ -119,7 +124,7 @@ class TestWatchdogThreadLifecycle:
     ) -> None:
         """_start_watchdog_thread() with NOTIFY_SOCKET set returns True and
         spawns exactly one alive daemon thread."""
-        import fused_memory.server.main as main  # noqa: PLC0415
+        import fused_memory.server.main as main
 
         monkeypatch.setattr(main, '_sd_notify', lambda _: None)
         monkeypatch.setenv('NOTIFY_SOCKET', '/run/systemd/notify')
@@ -140,7 +145,7 @@ class TestWatchdogThreadLifecycle:
     ) -> None:
         """A second _start_watchdog_thread() call must return False and NOT
         spawn a new thread while one is already running."""
-        import fused_memory.server.main as main  # noqa: PLC0415
+        import fused_memory.server.main as main
 
         monkeypatch.setattr(main, '_sd_notify', lambda _: None)
         monkeypatch.setenv('NOTIFY_SOCKET', '/run/systemd/notify')
@@ -164,7 +169,7 @@ class TestWatchdogThreadLifecycle:
     ) -> None:
         """_start_watchdog_thread() without NOTIFY_SOCKET returns False and
         does not spawn any thread."""
-        import fused_memory.server.main as main  # noqa: PLC0415
+        import fused_memory.server.main as main
 
         monkeypatch.setattr(main, '_sd_notify', lambda _: None)
         monkeypatch.delenv('NOTIFY_SOCKET', raising=False)
@@ -184,7 +189,7 @@ class TestWatchdogThreadLifecycle:
     ) -> None:
         """_stop_watchdog_thread() sets the stop event, joins the thread, and
         clears both module refs so a subsequent _start_watchdog_thread() works."""
-        import fused_memory.server.main as main  # noqa: PLC0415
+        import fused_memory.server.main as main
 
         monkeypatch.setattr(main, '_sd_notify', lambda _: None)
         monkeypatch.setenv('NOTIFY_SOCKET', '/run/systemd/notify')
@@ -211,7 +216,7 @@ class TestWatchdogThreadLifecycle:
     ) -> None:
         """After _stop_watchdog_thread(), a fresh _start_watchdog_thread()
         must succeed (restartable)."""
-        import fused_memory.server.main as main  # noqa: PLC0415
+        import fused_memory.server.main as main
 
         monkeypatch.setattr(main, '_sd_notify', lambda _: None)
         monkeypatch.setenv('NOTIFY_SOCKET', '/run/systemd/notify')

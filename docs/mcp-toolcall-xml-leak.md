@@ -433,7 +433,7 @@ writer passes through them. Five writers of task text run in-process below
 | `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._dispatch_ticket_decision` | the curator worker's deferred replay of a ticket, hours after the guarded submit |
 | `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._submit_task_planning_mode` | a `deferred` insert under planning mode |
 | `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor.update_task` | description and details, for any in-process caller |
-| `fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::_queue_briefing_refresh_tasks` | a briefing-refresh task composed from stage output, bypassing the curator |
+| `fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::queue_briefing_refresh_tasks` | a briefing-refresh task composed from stage output, bypassing the curator |
 
 Both sinks call
 `fused-memory/src/fused_memory/backends/task_text_markup_gate.py::refuse_leaked_task_text`

@@ -55,7 +55,7 @@ const { api: bands, window: loadedWindow } = loadBurndownBands();
 const { burndownStacks, burndownLegend, parityBannerState, burndownDatum, forecastText } = bands;
 const { BURNDOWN_ENDPOINT } = bands;
 const { MEMBERS, TONES, SERIES_KEYS } = loadedWindow.DF_TASK_VOCAB;
-const { datumView } = loadedWindow.DF_DATUM;
+const { datumView, servedDatum } = loadedWindow.DF_DATUM;
 
 const EXPECTED_FUNCTION_NAMES = [
   'burndownStacks',
@@ -385,6 +385,19 @@ test('burndownDatum: a stamped FRESH reading within its bound draws no badge', (
 
   assert.equal(view.age, null);
   assert.equal(view.title, null);
+});
+
+test("burndownDatum: a receipt that cannot age a Datum is no receipt — servedDatum's own verdict", () => {
+  for (const receipt of [{ servedAt: SERVED_AT }, { servedAt: SERVED_AT, receivedAt: 'not a clock' }]) {
+    const data = { __receipt: { [BURNDOWN_ENDPOINT]: receipt } };
+    const block = { latest: servedLatest() };
+
+    const datum = burndownDatum(data, block, 'latest');
+
+    const label = JSON.stringify(receipt);
+    assert.equal(datum.state, 'unknown', `${label} stamped a Datum it cannot age`);
+    assert.deepEqual(datum, servedDatum(block.latest, BURNDOWN_ENDPOINT, 'unused', data.__receipt), label);
+  }
 });
 
 // ---------------------------------------------------------------------------

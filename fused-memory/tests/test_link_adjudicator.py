@@ -14,16 +14,19 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import pytest
-from shared.cli_invoke import AgentResult, no_mcp_servers_config
+from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, looks_like_capacity_banner
+from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers_config
 from shared.neutral_cwd import neutral_cli_cwd
 
 from fused_memory.config.schema import LinkHealConfig
+from fused_memory.maintenance import link_adjudicator
 from fused_memory.maintenance.link_adjudicator import (
     RATER_BRIEF_PATH,
     TRUNCATION_MARKER,
     VERDICT_OUTPUT_SCHEMA,
     AdjudicationFailure,
     ClaudeShardAsker,
+    Invoke,
     LinkPair,
     LinkVerdict,
     Shard,
@@ -32,6 +35,8 @@ from fused_memory.maintenance.link_adjudicator import (
     adjudicate_links,
     cap_text,
     configured_adjudicator,
+    prompt_sha256,
+    render_system_prompt,
 )
 from fused_memory.maintenance.link_heal import (
     AGREEING_VERDICTS,
@@ -376,8 +381,41 @@ class TestShardFailureStorm:
         assert storm['model'] == 'opus'
         assert storm['shards_total'] == 4
         assert storm['shards_failed'] == 2
+        assert set(storm) == {
+            'count', 'threshold', 'labels', 'shards_failed', 'model', 'shards_total',
+        }
         assert _failures(verdicts)[4:] == [AdjudicationFailure.NOT_ATTEMPTED] * 4
         assert all(verdict.verdict is None for verdict in verdicts)
+
+    @pytest.mark.asyncio
+    async def test_the_storm_names_only_the_current_runs_failures(self):
+        """cli-fail, success, parse-fail, parse-fail: the success ended the first
+        run, so the storm's labels are the second run's alone, while
+        shards_failed counts every failed shard of the call."""
+        def mixed(call: int, shard: Shard) -> ShardReply:
+            if call == 0:
+                return ShardReply(success=False, detail='down')
+            if call == 1:
+                return _valid(call, shard)
+            return ShardReply(success=True, structured_output=[])
+
+        storms: list[Mapping[str, Any]] = []
+        ask = FakeAsker(mixed)
+
+        verdicts = await _adjudicate(
+            _pairs(10), ask, failure_streak=2, on_failure_storm=storms.append,
+        )
+
+        assert len(ask.shards) == 4
+        (storm,) = storms
+        assert storm['labels'] == ['parse_failure']
+        assert storm['count'] == 2
+        assert storm['shards_failed'] == 3
+        not_attempted = verdicts[8:]
+        assert _failures(not_attempted) == [AdjudicationFailure.NOT_ATTEMPTED] * 2
+        assert {verdict.detail for verdict in not_attempted} == {
+            'adjudication stopped after 3 failed shards',
+        }
 
     @pytest.mark.asyncio
     async def test_a_success_between_failures_resets_the_streak(self):
@@ -495,6 +533,19 @@ class TestClaudeShardAsker:
         assert reply.cost_usd == 0.1
 
     @pytest.mark.asyncio
+    async def test_a_given_brief_text_is_used_and_the_path_never_read(self, tmp_path):
+        invoke = FakeInvoke(_ok())
+        ask = ClaudeShardAsker(
+            brief_text=FIXED_BRIEF, brief_path=tmp_path / 'missing.md', invoke=invoke,
+        )
+
+        reply = await ask(_SHARD)
+
+        assert reply.success is True
+        (call,) = invoke.calls
+        assert call['system_prompt'] == render_system_prompt(FIXED_BRIEF)
+
+    @pytest.mark.asyncio
     async def test_an_invoke_that_raises_is_a_failed_reply(self, brief):
         invoke = FakeInvoke(RuntimeError('all accounts capped'))
 
@@ -504,7 +555,80 @@ class TestClaudeShardAsker:
         assert reply.detail == 'RuntimeError: all accounts capped'
 
 
+FIXED_BRIEF = '# A fixed brief\n\nJudge each pair, once.\n'
+
+
+class TestPromptVersion:
+    """The prompt version names everything besides the model that decides what the
+    model is asked: the rendered system prompt, and the cap its pair texts are cut to."""
+
+    def test_it_is_a_sha256(self):
+        assert re.fullmatch(r'[0-9a-f]{64}', prompt_sha256(FIXED_BRIEF, 4000))
+
+    def test_it_is_stable_for_a_brief_and_moves_with_it(self):
+        assert prompt_sha256(FIXED_BRIEF, 4000) == prompt_sha256(FIXED_BRIEF, 4000)
+        assert prompt_sha256(FIXED_BRIEF, 4000) != prompt_sha256(
+            FIXED_BRIEF + 'One more rule.\n', 4000,
+        )
+
+    def test_it_moves_with_the_field_cap(self):
+        assert prompt_sha256(FIXED_BRIEF, 4000) != prompt_sha256(FIXED_BRIEF, 2000)
+
+    def test_a_configured_adjudicator_names_the_version_of_its_own_field_cap(self):
+        config = LinkHealConfig(field_chars=1234)
+
+        adjudicate = configured_adjudicator(config, ask=FakeAsker(), brief_text=FIXED_BRIEF)
+
+        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF, 1234)
+
+
 class TestConfiguredAdjudicator:
+    @pytest.mark.asyncio
+    async def test_a_given_brief_names_the_model_and_prompt_every_shard_carries(self, tmp_path):
+        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+        invoke = FakeInvoke(_ok(structured_output=answer))
+        ask = ClaudeShardAsker(
+            brief_text=FIXED_BRIEF, brief_path=tmp_path / 'missing.md', invoke=invoke,
+        )
+        adjudicate = configured_adjudicator(
+            LinkHealConfig(adjudicator_model='haiku', shard_size=1),
+            ask=ask, brief_text=FIXED_BRIEF,
+        )
+
+        verdicts = await adjudicate(_pairs(2))
+
+        assert adjudicate.model == 'haiku'
+        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF, LinkHealConfig().field_chars)
+        assert [verdict.verdict for verdict in verdicts] == [Verdict.SAME, Verdict.SAME]
+        assert [call['system_prompt'] for call in invoke.calls] == [
+            render_system_prompt(FIXED_BRIEF),
+        ] * 2
+
+    @pytest.mark.asyncio
+    async def test_without_a_brief_text_the_brief_is_read_once_at_construction(self, tmp_path):
+        brief = tmp_path / 'brief.md'
+        brief.write_text(FIXED_BRIEF, encoding='utf-8')
+        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+        invoke = FakeInvoke(_ok(structured_output=answer))
+        config = LinkHealConfig(shard_size=1)
+        adjudicate = configured_adjudicator(config, brief_path=brief, invoke=invoke)
+        brief.unlink()
+
+        verdicts = await adjudicate(_pairs(2))
+
+        assert [verdict.verdict for verdict in verdicts] == [Verdict.SAME, Verdict.SAME]
+        assert [call['system_prompt'] for call in invoke.calls] == [
+            render_system_prompt(FIXED_BRIEF),
+        ] * 2
+        assert adjudicate.prompt_sha256 == prompt_sha256(FIXED_BRIEF, config.field_chars)
+        assert adjudicate.model == config.adjudicator_model
+
+    def test_by_default_the_brief_is_the_rater_brief(self):
+        adjudicate = configured_adjudicator(LinkHealConfig(), ask=FakeAsker())
+
+        brief = link_adjudicator.RATER_BRIEF_PATH.read_text(encoding='utf-8')
+        assert adjudicate.prompt_sha256 == prompt_sha256(brief, LinkHealConfig().field_chars)
+
     @pytest.mark.asyncio
     async def test_the_config_leaves_bind_model_sharding_cap_and_streak(self):
         ask = FakeAsker()
@@ -536,21 +660,69 @@ class TestConfiguredAdjudicator:
         assert _failures(verdicts)[2:] == [AdjudicationFailure.NOT_ATTEMPTED] * 2
 
 
+_LIVE_PAIR = LinkPair(
+    key='live',
+    child_text='Never run git stash in any checkout: refs/stash is one ref shared by every worktree.',
+    parent_text='git stash is unsafe here because the stash stack is shared across all worktrees.',
+)
+
+
+async def _live_edge_verdict(invoke: Invoke) -> LinkVerdict:
+    """The live pair's verdict; capacity skips and auth reds, per shared/tests/_capacity_skip.py."""
+    results: list[AgentResult] = []
+
+    async def recording(**kwargs: Any) -> AgentResult:
+        result = await invoke(**kwargs)
+        results.append(result)
+        return result
+
+    (verdict,) = await adjudicate_links(
+        [_LIVE_PAIR], model='sonnet', shard_size=40, field_chars=4000, failure_streak=3,
+        ask=ClaudeShardAsker(invoke=recording),
+    )
+    replies = [f'{result.output}\n{result.stderr}'.strip() for result in results]
+    banners = [reply for reply in replies if looks_like_capacity_banner(reply) is not None]
+    if verdict.failed and banners:
+        pytest.skip(f'the claude CLI account is at capacity: {banners[0][:200]}')
+    return verdict
+
+
+class TestTheLiveEdgeCapacityGuard:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('banner', REAL_CLI_CAP_HIT_MESSAGES)
+    async def test_a_capacity_banner_skips_the_live_edge(self, banner):
+        invoke = FakeInvoke(AgentResult(success=False, output=banner))
+
+        with pytest.raises(pytest.skip.Exception, match=re.escape(banner)):
+            await _live_edge_verdict(invoke)
+
+    @pytest.mark.asyncio
+    async def test_an_auth_failure_is_not_skipped(self):
+        invoke = FakeInvoke(AgentResult(success=False, output='Not logged in · Please run /login'))
+
+        verdict = await _live_edge_verdict(invoke)
+
+        assert verdict.failed
+        assert verdict.failure is AdjudicationFailure.CLI_FAILED
+
+    @pytest.mark.asyncio
+    async def test_a_successful_reply_is_returned_as_is(self):
+        answer = {'verdicts': [{'id': 'p1', 'verdict': Verdict.SAME.value, 'reason': 'r'}]}
+        invoke = FakeInvoke(_ok(structured_output=answer))
+
+        verdict = await _live_edge_verdict(invoke)
+
+        assert not verdict.failed
+        assert verdict.verdict is Verdict.SAME
+
+
 @pytest.mark.integration
 @pytest.mark.skipif(shutil.which('claude') is None, reason='needs the claude CLI')
 class TestTheLiveEdge:
     @pytest.mark.asyncio
     @pytest.mark.timeout(600)
     async def test_a_restatement_gets_a_verdict_from_the_real_cli(self):
-        pair = LinkPair(
-            key='live',
-            child_text='Never run git stash in any checkout: refs/stash is one ref shared by every worktree.',
-            parent_text='git stash is unsafe here because the stash stack is shared across all worktrees.',
-        )
-
-        (verdict,) = await adjudicate_links(
-            [pair], model='sonnet', shard_size=40, field_chars=4000, failure_streak=3,
-        )
+        verdict = await _live_edge_verdict(invoke_with_cap_retry)
 
         assert not verdict.failed, verdict
         assert isinstance(verdict.verdict, Verdict)

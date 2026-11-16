@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _workflow_helpers import fixed_prompt
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import ARCHITECT, ROLES
@@ -148,7 +149,7 @@ class TestInvokeWiresWarning:
 
         with patch('orchestrator.workflow.invoke_with_cap_retry', new=AsyncMock(return_value=stub_result)), \
              patch.object(wf, '_maybe_warn_missing_escalation') as mock_warn:
-            await wf._invoke(ARCHITECT, prompt='x', cwd=Path('/tmp'))
+            await wf._invoke(ARCHITECT, build_prompt=fixed_prompt('x'), cwd=Path('/tmp'))
 
         mock_warn.assert_called_once_with(ARCHITECT.name)
 

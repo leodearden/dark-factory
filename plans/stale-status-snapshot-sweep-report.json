@@ -1,0 +1,114 @@
+{
+  "complete": true,
+  "measured_at": "2026-10-10T06:01:49.509811+00:00",
+  "projects": [
+    {
+      "complete": true,
+      "coverage": {
+        "gate_passing": 590,
+        "selected": 0,
+        "terminal_referencing": 180,
+        "unselected": 180,
+        "unselected_samples": [
+          "Task 3697 applied a third status value 'blocked' for permanently unstartable plan steps, which is not treated as completed work in the orchestrator's implementer loop.",
+          "Task 2238 is the high-priority pending follow-up to Task 2237.",
+          "Tasks 1483-1485 backfilled and collapsed the pending recon escalation pile.",
+          "Task 5022 is wired behind the still-in-progress members of its pre-condition branch list, which includes task 3226 and task 4930.",
+          "Task 1327 is now done, having been pending in prior runs.",
+          "Task 880 has been escalated to high priority by Stage 2 recon due to being pending with no agent for over 6 reconciliation cycles since April 15, 2026.",
+          "CRITICAL task 6040 includes a pin-owned reservation for the head blocked pin.",
+          "The reversible retirement of Claude Max accounts max-b is tracked by task 5944, which is pending with no done provenance.",
+          "Live-Workflow Authority bars any status-changing action against task 3302 while it has an active claimant and fresh heartbeat.",
+          "Task 847 was confirmed done on 2026-04-28, and Task 1144 is newly pending as of 2026-04-29.",
+          "Task 3049 is filed and pending to address the capacity issue.",
+          "The task 3660 is filed pending as part of the esc-3253-1 evidence session.",
+          "Task 1229 was previously in progress in the dark_factory project but is now done or absent.",
+          "Task 1303 is a helper function in task_filter.py that ensures consistency between the hint-section and Active Task Tree counts under a character limit.",
+          "Blocked task 4761 is based on the premise that re-rule task 3635 should be against the band being decline-shaped, not incapability-shaped.",
+          "Task 4004's history corroborates the hypothesis of the 39-member cluster regarding the ALARM MECHANISM, as it was blocked for five days due to escalation-queue residue while the alarm fired.",
+          "The check on dark_factory task 2955 found no pending escalations using get_pending_escalations. ",
+          "The action='restart' was triggered for task 3517 as it was blocked with no live workflow.",
+          "Task 842 status changed to done on 2026-04-19T17:56:46.959070Z with implementation shipped via merge commit 1f3c6c343ab48fb26e1f750249fabff3d91cc1de (Merge task/842 into main). Implementation added orthogonal dashboard filter checkboxes (Active/Pending/Done) replacing the show/hide toggle.",
+          "The escalation-watcher monitors task 2083 during its active human L2 resolution.",
+          "FalkorDB index provisioning is DESIGNED to cover the first write to a graph, so newly-registered projects are caught without requiring a service restart. This wiring is owned by task 3708 (FalkorDB index provisioning \u03b3), which is still pending as of 2026-08-19 \u2014 re-check 3708's live status before treating this as shipped behaviour.",
+          "Task 3415 is tracked as pending with four independent reproductions including esc-3502-3.",
+          "The lifecycle of Task 1043 includes being cancelled, reinstated pending, in-progress, blocked, re-cancelled as a duplicate, then reinstated again and ultimately completed as done (2026-04-25T06:47) with autopilot_video guardrails written to Mem0 (attribution_stub=5fa3a134, nav_hints=09130bfc).",
+          "Task 887 (Add PERPLEXITY_API_KEY to fused-memory systemd EnvironmentFile) was blocked by missing key for 7+ consecutive cycles and was deferred on 2026-04-21.",
+          "Task 4137 should be hand-carried immediately rather than leaving it pending."
+        ]
+      },
+      "general_rule": {
+        "asserted": [
+          {
+            "count": 9,
+            "marker": "pending",
+            "status": "pending"
+          },
+          {
+            "count": 1,
+            "marker": "stalled",
+            "status": "pending"
+          }
+        ],
+        "newly_retired": 0,
+        "newly_retired_samples": [],
+        "undefined_contradiction": [
+          "active",
+          "stalled"
+        ],
+        "verdict": "DO NOT WIDEN: the general rule would newly retire no edge in the measured corpus, so the selection stays terminal rule plus blocked-only rule 2."
+      },
+      "incomplete_kind": null,
+      "project_id": "dark_factory",
+      "project_root": "/home/leo/src/dark-factory",
+      "token_internal_breaks": {
+        "counts": {
+          "!": 0,
+          ".": 8607,
+          ";": 4,
+          "?": 1
+        },
+        "samples": {
+          "!": [],
+          ".": [
+            "path_not_found_guidance.py follows the shape of grep_pattern_guidance.py.",
+            "TaskWorkflow._escalate_unreconciled_done_step is located in orchestrator/src/orchestrator/workflow.py.",
+            "Task 3632 has tests at scripts/tests/test_run_fable_trial_v2_campaign.py.",
+            "Phase 2 gained Step 1.5, which only reads the newest bug-hotspot-survey files for prioritization.",
+            "The new consumer contract tests are placed in each consumer's own module, including test_tree_scan_sharing.py.",
+            "conftest.py grows from 751 to about 785 lines and test_conftest_fixtures.py grows from 601 to about 670 lines.",
+            "The audit requires tasks.db to function and runs only on demand.",
+            "The script scripts/export-data.sh is located in the dark-factory directory.",
+            "The project priority is documented in project_current_focus_stability.md.",
+            "The rewrite_audit_trail enforces the rule by calling the sqlite_task_backend.py::_assert_done_provenance_passthrough.",
+            "The summary.json keys include writing_runs_7d.",
+            "The function _carries_pytest_failure_verdict is used within verify_classify.py.",
+            "Conftest.py and merge_queue.py are related as merge-lane ratchet cluster paths.",
+            "Removing models/scope.resolve_main_checkout would break path resolution for all task tools.",
+            "verify_cmd.py's VerifyCmd model has been referenced in the context of Task 2125.",
+            "Task_runtime.py includes the _probe_one function.",
+            "The orchestrator restart allows metadata.files to survive due to the Scheduler's persist.",
+            "The invariant regarding the sweep's precondition must be documented in ARCHITECTURE.md and the MCP docstrings.",
+            "The root pyrightconfig.json adds executionEnvironments pointing pyright at the root .venv.",
+            "The app.py file includes the healthz apparatus.",
+            "Boundary tests in test_submit_resolve_tools.py run the REAL probe against a temp git repo.",
+            "fused_memory/src/fused_memory/server/main.py monkeypatches the _safe_call_tool chokepoint.",
+            "The tests in tests/_relates_to_doubles.py use only public functions.",
+            "The plan 'plans/server-side-api-error-handling-prd.md' was decomposed into task 3320.",
+            "The import_graph.py file is used by the summary to read the JSON contract."
+          ],
+          ";": [
+            "Steward auto-resolution covers L0 design_concern escalations from reviewer/integration-reviewer roles via two-layer defense (commit 9468b8b1db merged 2026-04-18; task 832 confirmed done 2026-04-19). L0 escalations from deep-reviewer sessions using synthetic task_id 'review-&lt;id&gt;' are handled by ReviewCheckpoint post-hoc triage (task 840 confirmed duplicate of 9468b8b1db, closed done 2026-04-19).",
+            "dark_factory task 1911 (done, merged commit 7bbc1f44b86f2e5dae2b57508dcf44d265c7fa57) made merge_request branch resolution tolerant of both already-prefixed (task/&lt;id&gt;) and full non-task branch names, via the canonical GitOps.resolve_queued_branch_ref resolver used by both classification and merge."
+          ],
+          "?": [
+            "The chrome's cheap task-census source is a projection of the existing endpoint GET /api/v2/dashboard/tasks?projection=census."
+          ]
+        }
+      },
+      "valid_edges": 27369
+    }
+  ],
+  "schema_version": 1,
+  "triage_note": "Read by eye on 2026-10-10 over the unselected samples listed above (the first 25 by edge uuid).\n\nMost are NOT current-status snapshots. They are historical or narrative facts whose status word describes something else or a past state: 'was blocked for five days', 'is now done, having been pending', 'found no pending escalations', 'Active/Pending/Done checkboxes', 'applied a third status value blocked'. Retiring them would be over-selection.\n\nThe genuine snapshots the shipped rules miss fall into four lexical classes. Each sits deliberately outside the closed-class copula/article anchoring:\n\n1. Relative clause: 'tracked by task 5944, which is pending'; 'task 3708 (...), which is still pending'.\n2. Attributive pre-modifier or predicate nominal: 'Blocked task 4761 is based on ...'; 'Task 2238 is the high-priority pending follow-up'.\n3. Gerund or participle: 'due to being pending with no agent'.\n4. Secondary or coordinated predicate: 'is filed and pending'; 'is filed pending'; 'is tracked as pending'.\n\nAll four are under-selection, the fail-safe direction. Such an edge stays valid until the periodic sweep, Stage 2 or a later rewrite retires it. None is a precision hazard. No class is widened by task 4851: each would need its own precision pass against the non-snapshot shapes above.\n"
+}

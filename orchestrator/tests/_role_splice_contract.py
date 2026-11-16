@@ -2,16 +2,18 @@
 
 A "splice contract" is the family of invariants that hold when a named prompt
 constant is spliced into a machine-derived set of role prompts: the constant is
-non-empty, it reaches every role in the set, it reaches no role outside it, it
-appears exactly once per role, it lands in a structurally defined spot, and the
-hand-maintained role set still equals the set derived from the capability that
-justifies the splice. This module holds that shape once, and is the
+non-empty, it opens its own ``##`` section, it reaches every role in the set, it
+reaches no role outside it, it appears exactly once per role, it lands in a
+structurally defined spot, and the hand-maintained role set still equals the set
+derived from the capability that justifies the splice. This module holds that shape once, and is the
 AUTHORITATIVE home for the rationale behind it — the consumers point here rather
 than restating it, so there is one place to correct.
 
 It also holds the shared Bash-capable carrier set and predicate
 (``BASH_CAPABLE_UNPINNED_ROLES``, ``bash_capable_unpinned``) that every block
-spliced through roles.py::_BASH_CAPABLE_ROLE_PREAMBLE derives from, and the
+spliced through harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE derives from, the
+derived literal-prompt sets (``UNPINNED_ROLES``, ``READ_ONLY_UNPINNED_ROLES``) for
+blocks spliced into every literal-prompt role, and the
 preamble-tail contract (``PreambleTailBlock`` + ``PreambleTailContractTests``),
 which a new tail block adopts with one subclass instead of cloning its tests.
 
@@ -62,7 +64,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar
 
-from orchestrator.agents.roles import GREP_LOOKAROUND_GUIDANCE, ROLES, AgentRole
+from orchestrator.agents.harness_guidance import GREP_LOOKAROUND_GUIDANCE
+from orchestrator.agents.roles import ROLES, AgentRole
 
 # A splice unit opens with its own ``\n## `` heading, so "spliced between the
 # identity paragraph and the role's first real section" is exactly "its heading
@@ -72,7 +75,7 @@ from orchestrator.agents.roles import GREP_LOOKAROUND_GUIDANCE, ROLES, AgentRole
 # no-opped when the heading was not found.
 MARKDOWN_HEADING = '\n## '
 
-#: The carrier set of roles.py::_BASH_CAPABLE_ROLE_PREAMBLE. Outside it: judge
+#: The carrier set of harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE. Outside it: judge
 #: (`Bash(git:*)` only) and reviewer_comprehensive (PromptSpec-backed, also
 #: `Bash(git:*)`). A block whose carriers differ declares its own set rather
 #: than editing this one.
@@ -90,6 +93,13 @@ BASH_CAPABLE_UNPINNED_ROLES = frozenset({
 def bash_capable_unpinned(role: AgentRole) -> bool:
     """The capability BASH_CAPABLE_UNPINNED_ROLES derives from; `Bash(git:*)` does not qualify."""
     return role.prompt_spec is None and 'Bash' in role.allowed_tools
+
+
+#: Every role whose system_prompt is literal text a splice reliably reaches (not PromptSpec-backed), derived from ROLES.
+UNPINNED_ROLES = frozenset(name for name, role in ROLES.items() if role.prompt_spec is None)
+
+#: Literal-prompt roles outside BASH_CAPABLE_UNPINNED_ROLES (`judge` today), which build their own chain around the read-only Grep variant. May legitimately be empty.
+READ_ONLY_UNPINNED_ROLES = UNPINNED_ROLES - BASH_CAPABLE_UNPINNED_ROLES
 
 
 def assert_nonempty(name: str, value: str, *, remedy: str) -> None:
@@ -124,6 +134,21 @@ def assert_brace_free(name: str, value: str, *, remedy: str) -> None:
         f'{name} contains a literal brace, so it is not safe at an interpolating '
         f'splice site (it raises at format time or mangles the rendered prompt). '
         f'{remedy}'
+    )
+
+
+def assert_opens_own_section(name: str, value: str, *, remedy: str) -> None:
+    """Assert ``value`` opens with its own ``MARKDOWN_HEADING``.
+
+    A splice unit reaches a prompt by plain concatenation, so one that does not
+    open with its own heading reads as a continuation of the block before it.
+    It is also the precondition for ``SpliceContract.assert_placement``'s
+    up-front arm, whose landmark is the prompt's first ``MARKDOWN_HEADING``.
+    """
+    assert value.startswith(MARKDOWN_HEADING), (
+        f'{name} does not start with MARKDOWN_HEADING ({MARKDOWN_HEADING!r}), so '
+        'where it is spliced it reads as an unheaded continuation of whichever '
+        f'block precedes it rather than as its own section. {remedy}'
     )
 
 
@@ -478,7 +503,7 @@ def _joined(*parts: str) -> str:
 
 @dataclass(frozen=True)
 class PreambleTailBlock:
-    """A census block appended at the tail of roles.py::_BASH_CAPABLE_ROLE_PREAMBLE.
+    """A census block appended at the tail of harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE.
 
     It carries the remedy prose only that block can state.
     """
@@ -522,11 +547,14 @@ class PreambleTailContractTests:
 
     def test_guidance_opens_its_own_section(self) -> None:
         """The block opens with its own ``\\n## `` heading."""
-        assert self.block.constant.startswith(MARKDOWN_HEADING), (
-            f'{self.block.constant_name} does not start with MARKDOWN_HEADING, so '
-            'at the tail of _BASH_CAPABLE_ROLE_PREAMBLE it would read as an unheaded '
-            'continuation of whichever block precedes it. Give it a leading blank '
-            'line and a `## ` heading.'
+        assert_opens_own_section(
+            self.block.constant_name,
+            self.block.constant,
+            remedy=(
+                'At the tail of BASH_CAPABLE_ROLE_PREAMBLE it would run on from '
+                'whichever census block precedes it. Give it a leading blank line '
+                'and a `## ` heading.'
+            ),
         )
 
     def test_role_set_matches_bash_capability(self) -> None:
@@ -546,7 +574,7 @@ class PreambleTailContractTests:
         self.block.contract.assert_every_role_carries(
             remedy=(
                 f'Append {self.block.constant_name} to the tail of '
-                'roles.py::_BASH_CAPABLE_ROLE_PREAMBLE; that one composite reaches '
+                'harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE; that one composite reaches '
                 'every Bash-capable role.'
             ),
         )
@@ -577,14 +605,14 @@ class PreambleTailContractTests:
         error-remedy and grep blocks each still abut their predecessor.
 
         (b) Adjacency is deliberately NOT pinned (esc-5966-3): sibling census
-        blocks append to the same tail of `_BASH_CAPABLE_ROLE_PREAMBLE` in any
+        blocks append to the same tail of `BASH_CAPABLE_ROLE_PREAMBLE` in any
         merge order.
         """
         self.block.contract.assert_lands_after(
             follows=GREP_LOOKAROUND_GUIDANCE,
             follows_name='GREP_LOOKAROUND_GUIDANCE',
             remedy=_joined(
-                'Re-append it at the END of roles.py::_BASH_CAPABLE_ROLE_PREAMBLE; '
+                'Re-append it at the END of harness_guidance.py::BASH_CAPABLE_ROLE_PREAMBLE; '
                 'moving it earlier breaks the adjacency pins of the blocks ahead of it.',
                 self.block.order_note,
             ),

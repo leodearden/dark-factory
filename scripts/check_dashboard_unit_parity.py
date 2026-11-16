@@ -17,31 +17,9 @@ nothing reported that until this check existed.
 
 Exit codes
 ----------
-0 — parity (every compared directive agrees, at least one unit was actually
-    compared, and nothing overrides the units that were)
-1 — drift (one or more compared directives disagree), OR a committed unit
-    VANISHED (no committed copy found, so nothing could be verified for it),
-    OR an installed unit carries a drop-in override (so the unit file was
-    compared but the EFFECTIVE configuration was not)
-2 — installed unit absent (no installed copy found for one or more units)
-
-PRECEDENCE: drift (1) DOMINATES absence (2).  With three units a single run can
-hit both at once, and returning 2 there would let an unrelated uninstalled unit
-mask an actionable finding — ``setup-host.sh`` treats 2 as a benign "not
-installed on this host, skipping" and only 1 as something to act on.
-
-A run that compared ZERO units can NEVER report parity.  A vanished committed
-unit and a drop-in override share exit 1 with drift rather than minting new
-codes, for the same reason: both mean the gate could not make its claim, which
-is the opposite of the benign "not installed here" that 2 denotes, and
-``setup-host.sh`` already branches on this 0/1/2 vocabulary.  Exit 1 therefore
-means "drift or unverifiable", and the three cases are worded APART in the
-report ([drift] / [vanished] / [override]) so an operator is sent to the right
-place.  Before that was true, ``--repo-root`` naming a tree with no units
-compared nothing and still printed "parity — 3 unit(s) match", so a typo'd
-path, a renamed unit or a ``git mv`` of ``dashboard/*.service`` silently
-disarmed the whole check.  The success line therefore reports the number of
-units actually COMPARED, never the number selected.
+The family's codes are defined once, in
+``systemd_unit_parity.py::ParityExit``. Its consumers are listed under
+Design notes below.
 
 Usage
 -----
@@ -74,11 +52,15 @@ are split by CLASS, because one rule cannot fit all of them:
 - **Presence-only** — directives whose value embeds a host path (ExecStart,
   WorkingDirectory, Documentation).  Value-comparing them would report drift
   on every machine that is not this one.  Their meaningful content is reached
-  instead through per-flag ExecStart comparison.
-- **ExecStart flags** — the uvicorn flags are extracted from the
-  continuation-JOINED logical ExecStart of both copies and compared
-  individually, so the ``uv`` binary path and repo root are ignored while a
-  stale ``--timeout-graceful-shutdown`` is not.
+  instead through per-option ExecStart comparison.
+- **ExecStart options** — options are read from the continuation-JOINED
+  logical ExecStart of both copies and compared individually, so the ``uv``
+  binary path and repo root are ignored while a stale
+  ``--timeout-graceful-shutdown`` is not.  Argument-taking flags are compared
+  by value, argument-less switches (``--no-sync``) by presence, and every long
+  option on the committed command must be compared or waived with a reason.
+  A long option the registry does not name is still compared by presence, so
+  an option on one copy only (a hand-added installed ``--reload``) is drift.
 - **Environment=** — compared by variable-NAME set (a dropped variable is
   always drift), with values compared only for names off
   ``DIVERGENCE_ALLOWLIST``.  That allowlist exists because the one measured
@@ -123,9 +105,8 @@ checker treats as truth is not the source of the copy it compares against.
 That renderer also PRESERVES the installed copy's host-local ``Environment=``
 values across a re-install, which is why the remediation this report prints
 ("run scripts/setup-host.sh") is now safe to follow on a host carrying nine
-aggregation roots; see the DASHBOARD_KNOWN_PROJECT_ROOTS entry in
-``DIVERGENCE_ALLOWLIST`` below.  The two repo-side
-files are held in lockstep by
+aggregation roots; see its row in ``systemd_unit_parity.py::ENV_POLICY``.
+The two repo-side files are held in lockstep by
 ``tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file``,
 which renders the template with setup-host.sh's own substitutions and asserts
 BYTE-FOR-BYTE equality with the committed unit (see the comment on that
@@ -136,7 +117,7 @@ the same template and changes nothing.
 
 Design notes
 ------------
-- Stdlib-only (argparse, dataclasses, pathlib, re, sys) — runs under plain
+- Stdlib-only (argparse, dataclasses, pathlib, sys) — runs under plain
   python3, exactly like scripts/check_fused_memory_unit_parity.py, whose
   idioms this script follows deliberately rather than inventing a new pattern.
 - No ``--fix``, unlike that precedent.  Propagating repo units into
@@ -144,7 +125,7 @@ Design notes
   ``scripts/setup-host.sh`` does; duplicating it here would be a fourth copy of
   the install logic.  Drift is reported with a remediation pointer instead.
 - Two consumers branch on the 0/1/2 exit codes: ``setup-host.sh``, and
-  ``scripts/orchestrator-watchdog.py::unit_parity_pass``, which runs this
+  ``scripts/_watchdog_dashboard_parity.py::unit_parity_pass``, which runs this
   checker read-only, at most hourly, on the watchdog's timer tick.  Changing
   the codes changes both.
 
@@ -161,9 +142,24 @@ no change to this file can affect.
 import argparse
 import dataclasses
 import pathlib
-import re
 import sys
 from collections.abc import Sequence
+from typing import Final
+
+from systemd_unit_parity import (
+    ABSENT,
+    ENV_POLICY,
+    SERVICE_SECTION,
+    BlockText,
+    Drift,
+    ParityRun,
+    ReportText,
+    UnitFamily,
+    UnitRef,
+    environment_map,
+    parse_unit_directives,
+    run_parity,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -175,96 +171,19 @@ from collections.abc import Sequence
 # greps for over scripts/ (dashboard_unit_parity|DASHBOARD_UNIT_PARITY).
 LOG_TAG = "dashboard_unit_parity"
 
-# Environment variable NAMES whose VALUE is permitted to differ between the
-# committed unit and the installed one, each with the documented reason it is
-# blessed.  Presence is still required — see the Environment= branch of
-# compare_unit: allowlisting a value must never bless the variable vanishing.
-#
-# THIS IS A HOLE IN THE GATE.  Keep it small, and keep every entry's reason
-# specific enough that a reviewer can check it.  The gate's whole value comes
-# from being believable when it fires.
-DIVERGENCE_ALLOWLIST: dict[str, str] = {
-    "DASHBOARD_KNOWN_PROJECT_ROOTS": (
-        "Cost/burndown aggregation roots. The committed unit's own comment "
-        "declares the divergence deliberate: 'additional project roots are "
-        "LOCAL settings, added to the installed unit, not committed here'. "
-        "Measured 2026-08-01: the installed unit carries 9 roots, the "
-        "committed one carries this repo only. Value-comparing it would "
-        "therefore report drift on every run of a correctly-configured host, "
-        "and a gate that is always red gets switched off — taking the "
-        "accidental drift it exists to catch with it. "
-        "SECOND CONSUMER (task 4793): scripts/render_systemd_unit.py now "
-        "PRESERVES this variable's installed value when setup-host.sh "
-        "re-renders the unit. Its HOST_LOCAL_ENVIRONMENT is the host-local "
-        "SUBSET of this allowlist, not the allowlist itself — the two entries "
-        "here are on it for opposite reasons, and preserving the other one "
-        "would pin the data root at the previous checkout. Held by "
-        "tests/scripts/test_render_systemd_unit.py::"
-        "test_host_local_environment_is_a_subset_of_the_divergence_allowlist "
-        "and ::test_host_local_environment_excludes_project_root. So editing "
-        "THIS dict has a second blast radius: adding a name here does not make "
-        "it preserved, but removing one that the renderer preserves turns this "
-        "gate red on every correctly-configured host."
-    ),
-    "DASHBOARD_PROJECT_ROOT": (
-        "The dashboard's data root. The committed unit hardcodes "
-        "/home/leo/src/dark-factory, while setup-host.sh renders the installed "
-        "copy from scripts/dashboard.service.template with THAT host's real "
-        "$REPO_ROOT — so a cross-copy value comparison reports drift on every "
-        "correctly-configured host that is not this one. "
-        "NOT A HOLE, unlike the entry above: the value is still checked, just "
-        "not across copies. UnitSpec.env_matches_directive relates it to the "
-        "SAME copy's WorkingDirectory= (see there for why), and the name-set "
-        "branch still makes a dropped variable drift. The two entries are a "
-        "PAIR — removing either gives back the failure the other prevents."
-    ),
-}
+# Environment variable NAMES whose VALUE may differ between the committed and
+# installed copies; presence is still compared. THIS IS A HOLE IN THE GATE: keep
+# it small. Each row's reason: plans/review-all-s25-scripts-instruments-prd.md D5.
+DIVERGENCE_ALLOWLIST: Final[frozenset[str]] = ENV_POLICY.divergence_allowlist(UnitFamily.DASHBOARD)
 
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
 _DEFAULT_INSTALLED_DIR = pathlib.Path.home() / ".config" / "systemd" / "user"
 
 
-def _log(message: str, *, stream=None) -> None:
-    """Print *message* prefixed with the log tag."""
-    print(f"[{LOG_TAG}] {message}", file=stream if stream is not None else sys.stdout)
-
-
 # ---------------------------------------------------------------------------
-# Unit parser
+# Unit specs
 # ---------------------------------------------------------------------------
-
-
-# The parser lives in scripts/systemd_unit_parity.py and is RE-EXPORTED here
-# deliberately. A second consumer appeared (check_orchestrator_unit_parity.py),
-# and duplicating ~90 lines of parser into it is how the two copies drift until
-# one silently stops catching the defect -- inside the tooling built to catch
-# exactly that. Re-exporting rather than rewriting call sites keeps the module
-# surface this script's test suite reads (mod.parse_unit_directives,
-# mod._join_continuations) intact, so that suite is the extraction's own
-# regression net.
-#
-# find_dropins moved there too, for a sharper version of the same reason: it
-# was already forked, code-identical, between this file and
-# check_orchestrator_unit_parity.py, and check_lms_unit_parity.py would have
-# been a third copy. Re-exported on the same terms -- this suite's existing
-# find_dropins tests still call mod.find_dropins and are what proves the lift
-# was behaviour-preserving.
-from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
-    _ABSENT,
-    Drift,
-    _join_continuations,  # noqa: F401  (re-exported: read by the test suite)
-    find_dropins,
-    parse_unit_directives,
-)
-
-# ---------------------------------------------------------------------------
-# Drift records and unit specs
-# ---------------------------------------------------------------------------
-
-# ``Drift`` and ``_ABSENT`` are re-exported from scripts/systemd_unit_parity.py
-# (see the import above). They were code-identical in all three checkers; the
-# lift COLLAPSED that fork rather than pre-empting a hypothetical one.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -294,8 +213,8 @@ class UnitSpec:
     # value-comparing them would report drift on every machine that is not
     # this one — a gate that fires unconditionally is a gate that gets
     # switched off. Their MEANINGFUL content is still reached, just not by
-    # string equality: exec_start_flags compares the uvicorn flags inside
-    # ExecStart individually, ignoring the host-specific prefix.
+    # string equality: exec_start_flags and exec_start_switches compare the
+    # options inside ExecStart individually, ignoring the host-specific prefix.
     present_only: tuple[tuple[str, str], ...] = ()
     # Section whose Environment= directives are compared by variable-NAME set
     # (values compared only for names off DIVERGENCE_ALLOWLIST). None disables
@@ -307,11 +226,21 @@ class UnitSpec:
     # side alone is reported, which is the whole point on a unit that should
     # declare none at all.
     environment_section: str | None = None
-    # Bare uvicorn flag names (no leading '--') compared INSIDE [Service]
-    # ExecStart. This is how a presence-only ExecStart still gets its
+    # Bare names (no leading '--') of options that TAKE an argument on the
+    # [Service] ExecStart command line, uv's as well as uvicorn's, compared by
+    # that argument. This is how a presence-only ExecStart still gets its
     # meaningful content checked: the host-specific `uv` path and repo-root
     # prefix are ignored, while a stale --timeout-graceful-shutdown is not.
     exec_start_flags: tuple[str, ...] = ()
+    # Bare names of ARGUMENT-LESS options (no leading '--') compared by
+    # PRESENCE inside [Service] ExecStart. Such an option has no argument to
+    # compare by value: registered on exec_start_flags it reads as NO_ARGUMENT,
+    # which test_registry_exec_start_flags_are_really_on_the_committed_command
+    # rejects. Registering it here is the declaration
+    # test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked
+    # requires. At run time it compares by presence, as an unregistered option
+    # does.
+    exec_start_switches: tuple[str, ...] = ()
     # (section, key) pairs that must be present on BOTH sides or NEITHER,
     # registered because their presence on the installed side alone redirects
     # the effective configuration somewhere this checker never reads.
@@ -354,7 +283,7 @@ class UnitSpec:
     # that is merely configured elsewhere.
     #
     # BOTH halves are read out of environment_section — the variable through
-    # _environment_map, the directive through that same section's parsed keys.
+    # environment_map, the directive through that same section's parsed keys.
     # A pair whose directive lives ELSEWHERE (('SOME_VAR', 'WantedBy'), which
     # is in [Install]) would therefore compare against <absent> in both copies
     # forever: permanent, unexplainable drift, which is the always-red-gate
@@ -377,10 +306,17 @@ class UnitSpec:
     # requires every directive in the committed unit to be either in
     # covered_directives() or named here.
     #
-    # That guard is DIRECTIVE-granular. Tokens inside ExecStart are reached
-    # only through exec_start_flags, and nothing enforces that list's
-    # completeness.
+    # That guard is DIRECTIVE-granular. ExecStart's LONG options are held
+    # complete one level down, by
+    # test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked
+    # (see unchecked_exec_start_options); short options and positional
+    # arguments on the command are not reached.
     unchecked_directives: tuple[tuple[str, str, str], ...] = ()
+    # (option name, reason) pairs for long options on the committed ExecStart
+    # that are DELIBERATELY not compared: the option-level counterpart of
+    # unchecked_directives, held to the same rule — keep it small, and keep
+    # every reason specific. No spec needs one today.
+    unchecked_exec_start_options: tuple[tuple[str, str], ...] = ()
 
     def covered_directives(self) -> frozenset[tuple[str, str]]:
         """Every ``(section, key)`` a compare_unit branch checks as a whole directive.
@@ -389,32 +325,90 @@ class UnitSpec:
         enumeration of its directive-level branches, held in step with them by
         tests/scripts/test_check_dashboard_unit_parity.py::test_covered_directives_is_exactly_what_compare_unit_checks.
         The completeness guard and ``__post_init__`` both read it rather than
-        re-deriving the list. exec_start_flags and env_matches_directive cover
-        no directive of their own: they reach tokens inside one, or relate two.
+        re-deriving the list. exec_start_flags, exec_start_switches and
+        env_matches_directive cover no directive of their own: they reach
+        tokens inside one, or relate two.
         """
         covered = {*self.compared, *self.present_only, *self.override_directives}
         if self.environment_section is not None:
             covered.add((self.environment_section, "Environment"))
         return frozenset(covered)
 
+    def covered_exec_start_options(self) -> frozenset[str]:
+        """Every ExecStart long option registered by kind (flag or switch), by bare name.
+
+        The option-level counterpart of covered_directives(), read by
+        ``__post_init__`` and ``unregistered_exec_start_options``.
+        """
+        return frozenset((*self.exec_start_flags, *self.exec_start_switches))
+
+    def unregistered_exec_start_options(
+        self, service_directives: dict[str, list[str]]
+    ) -> frozenset[str]:
+        """Long options on one parsed [Service] ExecStart this spec neither registers nor waives.
+
+        The one statement of what "unregistered" means: read_exec_start_options
+        compares these by presence, and
+        tests/scripts/test_check_dashboard_unit_parity.py::test_every_committed_exec_start_option_is_compared_or_explicitly_unchecked
+        requires the committed command to have none.
+        """
+        waived = {option for option, _reason in self.unchecked_exec_start_options}
+        return (
+            exec_start_option_names(service_directives) - self.covered_exec_start_options() - waived
+        )
+
+    def read_exec_start_options(
+        self, service_directives: dict[str, list[str]]
+    ) -> dict[str, str | None]:
+        """How each long option reads on one parsed [Service] ExecStart, by bare name.
+
+        A flag reads as its argument as ``_exec_start_flag`` renders it, a
+        switch as its own ``--name`` token, and a registered option the command
+        lacks as None. Every unregistered option on the command reads as its
+        token too, so an option the registry never names is still compared by
+        presence: the completeness guard holds only the COMMITTED command's
+        options registered, and cannot see one that exists on the installed
+        copy alone. compare_unit diffs two of these readings.
+        """
+        readings: dict[str, str | None] = {
+            **{flag: _exec_start_flag(service_directives, flag) for flag in self.exec_start_flags},
+            **{
+                switch: _exec_start_switch(service_directives, switch)
+                for switch in self.exec_start_switches
+            },
+        }
+        unregistered = self.unregistered_exec_start_options(service_directives)
+        readings.update((name, f"--{name}") for name in sorted(unregistered))
+        return readings
+
     def __post_init__(self) -> None:
         """Reject a registry entry that contradicts itself or could never run.
 
-        ``env_matches_directive`` reads both halves out of
-        ``environment_section``, so registering a pair without setting that
-        field makes the branch a silent no-op: the spec reads as though the
-        value were checked while nothing is compared at all — the one failure
-        mode a gate must not have, and the one its own report cannot reveal.
+        Four rejections, each turning a spec that would check other than it
+        says into an import-time error on the registry, where it is
+        unmissable, instead of a green run:
 
-        A directive both covered by a branch and listed in
-        ``unchecked_directives`` is the same defect from the other side: its
-        reason string tells a reviewer the directive is deliberately not
-        compared while a branch compares it, so the waiver can no longer be
-        trusted to mean what it says.
-
-        Raising turns either into an import-time error on the registry, where
-        it is unmissable, instead of a green run that checked other than it says.
+        - ``env_matches_directive`` without ``environment_section``. Both
+          halves are read out of that section, so the branch would be a silent
+          no-op — the one failure mode a gate must not have, and the one its
+          own report cannot reveal.
+        - A directive both covered by a branch and listed in
+          ``unchecked_directives``. Its reason string tells a reviewer the
+          directive is deliberately not compared while a branch compares it,
+          so the waiver can no longer be trusted to mean what it says.
+        - An option on both ``exec_start_flags`` and ``exec_start_switches``.
+          It either takes an argument or it does not, so one of the two
+          readers would read it wrongly.
+        - An option both covered and listed in
+          ``unchecked_exec_start_options`` — the directive-waiver defect, one
+          level down.
         """
+        self._reject_env_relation_without_section()
+        self._reject_covered_directive_waivers()
+        self._reject_options_of_both_kinds()
+        self._reject_covered_option_waivers()
+
+    def _reject_env_relation_without_section(self) -> None:
         if self.env_matches_directive and self.environment_section is None:
             raise ValueError(
                 f"{self.name}: env_matches_directive="
@@ -422,6 +416,8 @@ class UnitSpec:
                 "be set — both the variable and the directive are read from that "
                 "section, so the comparison would silently check nothing"
             )
+
+    def _reject_covered_directive_waivers(self) -> None:
         covered = self.covered_directives()
         for section, key, reason in self.unchecked_directives:
             if (section, key) in covered:
@@ -432,18 +428,50 @@ class UnitSpec:
                     "the registry says what it actually checks"
                 )
 
+    def _reject_options_of_both_kinds(self) -> None:
+        for option in self.exec_start_flags:
+            if option in self.exec_start_switches:
+                raise ValueError(
+                    f"{self.name}: --{option} is registered on both "
+                    "exec_start_flags and exec_start_switches — an option either "
+                    "takes an argument (exec_start_flags) or does not "
+                    "(exec_start_switches), so one reader would read it wrongly"
+                )
+
+    def _reject_covered_option_waivers(self) -> None:
+        covered = self.covered_exec_start_options()
+        for option, reason in self.unchecked_exec_start_options:
+            if option in covered:
+                raise ValueError(
+                    f"{self.name}: --{option} is listed in "
+                    f"unchecked_exec_start_options (reason: {reason!r}) but is "
+                    "also compared via exec_start_flags or exec_start_switches — "
+                    "remove one of the two so the registry says what it actually "
+                    "checks"
+                )
+
 
 def _render(values: list[str] | None) -> str:
-    """Render a directive's values for a Drift record / the report."""
+    """Render a directive's values, or a flag's arguments, for a Drift record / the report."""
     if not values:
-        return _ABSENT
+        return ABSENT
     if len(values) == 1:
         return values[0]
     return " | ".join(values)
 
 
+# How a flag present on the command with no argument reads: followed by another
+# long option, ending the command, or spelled ``--flag=``.
+NO_ARGUMENT: Final = "<no argument>"
+
+
+def _exec_start_argv(service_directives: dict[str, list[str]]) -> tuple[str, ...]:
+    """The whitespace-split parsed [Service] ExecStart; ``_exec_start_flag`` says why parsed."""
+    return tuple(" ".join(service_directives.get("ExecStart", [])).split())
+
+
 def _exec_start_flag(service_directives: dict[str, list[str]], flag: str) -> str | None:
-    """Return the argument of ``--<flag>`` in ExecStart, or None if absent.
+    """Return the argument of each ``--<flag>`` in ExecStart, or None if absent.
 
     Reads the ALREADY-JOINED ExecStart value out of a parsed section — never
     the raw file text.  That scoping is load-bearing, and the hazard is real
@@ -459,80 +487,108 @@ def _exec_start_flag(service_directives: dict[str, list[str]], flag: str) -> str
     uvicorn's parser treats them identically, so rejecting one would report a
     reformatted-but-correct command as a missing flag.
 
-    Returns the RAW token, not an int (unlike ``_uvicorn_int_flag`` in
-    tests/scripts/test_dashboard_service_template.py, whose idiom this
-    borrows), so non-numeric flags like ``--host 127.0.0.1`` work too.
+    Returns the RAW token, not an int, so non-numeric flags like
+    ``--host 127.0.0.1`` work too.
+
+    Every occurrence is read, joined as ``_render`` joins a repeated
+    directive's values.  click (uvicorn) and clap (uv) apply the LAST
+    occurrence, so an appended installed ``--port 9090`` override must not
+    read as parity on the first ``--port``.
+
+    An occurrence with no argument reads as ``NO_ARGUMENT``: never as the next
+    option's token, and never as absent.  So an installed ``--project
+    --no-sync`` is reported as a missing argument rather than as the argument
+    ``--no-sync``.  That covers an occurrence followed by another long option,
+    ending the command, or spelled ``--flag=``.  It does not cover one followed
+    by a positional: a switch registered here by mistake and followed by
+    ``python`` reads ``python`` as its argument.
     """
-    values = service_directives.get("ExecStart")
-    if not values:
-        return None
-    command = " ".join(values)
-    match = re.search(rf"--{re.escape(flag)}[=\s]+(\S+)", command)
-    return match.group(1) if match else None
+    option = f"--{flag}"
+    argv = _exec_start_argv(service_directives)
+    arguments: list[str] = []
+    for index, token in enumerate(argv):
+        if token == option:
+            following = argv[index + 1] if index + 1 < len(argv) else ""
+            takes_none = not following or following.startswith("--")
+            arguments.append(NO_ARGUMENT if takes_none else following)
+        elif token.startswith(f"{option}="):
+            arguments.append(token.removeprefix(f"{option}=") or NO_ARGUMENT)
+    return _render(arguments) if arguments else None
 
 
-def _compare_exec_start_flags(
+def _exec_start_switch(service_directives: dict[str, list[str]], switch: str) -> str | None:
+    """Return the literal ``--<switch>`` token if ExecStart carries it, else None.
+
+    Presence is rendered as the token itself, so a drift report shows what is
+    missing rather than a bare boolean.
+    """
+    option = f"--{switch}"
+    return option if option in _exec_start_argv(service_directives) else None
+
+
+def exec_start_option_names(service_directives: dict[str, list[str]]) -> frozenset[str]:
+    """Bare names of every LONG option on [Service] ExecStart.
+
+    ``--name=value`` yields ``name``; a bare ``--`` is skipped. Long options
+    only: short options (``-m``) and positionals (the app target) are not
+    reached. ``UnitSpec.unregistered_exec_start_options`` subtracts the
+    registry from this enumeration.
+
+    Names are not scoped by program: uv's options (before ``python -m
+    uvicorn``) and uvicorn's (after) share one namespace, so a name both
+    programs take would read as one option.
+    """
+    names = (
+        token[2:].partition("=")[0]
+        for token in _exec_start_argv(service_directives)
+        if token.startswith("--")
+    )
+    return frozenset(name for name in names if name)
+
+
+def _compare_exec_start_options(
     spec: UnitSpec,
     repo: dict[str, dict[str, list[str]]],
     installed: dict[str, dict[str, list[str]]],
 ) -> list[Drift]:
-    """Compare each of ``spec.exec_start_flags`` inside [Service] ExecStart."""
-    drifts: list[Drift] = []
-    repo_service = repo.get("Service", {})
-    installed_service = installed.get("Service", {})
+    """Diff ``spec.read_exec_start_options`` of the two copies, option by option.
 
-    for flag in spec.exec_start_flags:
-        repo_value = _exec_start_flag(repo_service, flag)
-        installed_value = _exec_start_flag(installed_service, flag)
+    Flags compare by argument; switches and unregistered options by presence,
+    since each reads as its own token or None, so only a flag can reach the
+    argument-differs reason.
+    """
+    drifts: list[Drift] = []
+    repo_readings = spec.read_exec_start_options(repo.get("Service", {}))
+    installed_readings = spec.read_exec_start_options(installed.get("Service", {}))
+    names = [*repo_readings, *sorted(installed_readings.keys() - repo_readings.keys())]
+
+    for name in names:
+        repo_value = repo_readings.get(name)
+        installed_value = installed_readings.get(name)
         if repo_value == installed_value:
             continue
         if repo_value is None:
-            reason = f"--{flag} present on the installed command, absent from the repo command"
+            reason = f"--{name} present on the installed command, absent from the repo command"
         elif installed_value is None:
-            reason = f"--{flag} present on the repo command, absent from the installed command"
+            reason = f"--{name} present on the repo command, absent from the installed command"
         else:
-            reason = f"--{flag} argument differs between the repo and installed commands"
+            reason = f"--{name} argument differs between the repo and installed commands"
         drifts.append(
             Drift(
                 unit=spec.name,
                 section="Service",
-                # Keyed by FLAG, not by 'ExecStart': the command is long and
+                # Keyed by OPTION, not by 'ExecStart': the command is long and
                 # mostly host-specific, so naming the whole directive would
                 # send the operator back to a manual diff to find the token
                 # that actually moved.
-                key=f"ExecStart --{flag}",
-                repo_value=repo_value if repo_value is not None else _ABSENT,
-                installed_value=installed_value if installed_value is not None else _ABSENT,
+                key=f"ExecStart --{name}",
+                repo_value=repo_value if repo_value is not None else ABSENT,
+                installed_value=installed_value if installed_value is not None else ABSENT,
                 reason=reason,
             )
         )
 
     return drifts
-
-
-# _environment_map lives in scripts/systemd_unit_parity.py and is RE-EXPORTED
-# here under its existing PRIVATE name, on the same terms as the parser and
-# find_dropins above.  The THIRD lift, and the first whose second consumer is
-# not another checker: scripts/render_systemd_unit.py must read the INSTALLED
-# unit's Environment= map to preserve this host's host-local
-# DASHBOARD_KNOWN_PROJECT_ROOTS when setup-host.sh re-renders that unit, and a
-# value this checker can SEE has to be exactly a value the installer can
-# PRESERVE -- two readers with two ideas of what an Environment= line means is
-# how the installer silently drops a variable this gate then reports as fine.
-#
-# The renderer deliberately does NOT import this module to get it: the
-# section-8 harness in tests/scripts/test_check_dashboard_unit_parity.py builds
-# a tmp repo where write_checker(body=...) replaces this file with an argparse
-# stub (and with_checker=False omits it entirely), so a renderer importing it
-# would ImportError under the two tests asserting the install still happens
-# when the gate did not run.  Hence DOWN into the shared module, not sideways.
-#
-# Kept under the private name because this suite reads mod._environment_map
-# directly (test_check_dashboard_unit_parity.py's registry-staleness guards),
-# so that surface stays intact and IS the extraction's regression net.
-from systemd_unit_parity import (  # noqa: E402  (kept beside the other parser code)
-    environment_map as _environment_map,
-)
 
 
 def _compare_environment(
@@ -561,8 +617,8 @@ def _compare_environment(
     if section is None:
         return []
 
-    repo_env = _environment_map(repo, section)
-    installed_env = _environment_map(installed, section)
+    repo_env = environment_map(repo, section)
+    installed_env = environment_map(installed, section)
     drifts: list[Drift] = []
 
     for name in sorted(set(repo_env) | set(installed_env)):
@@ -581,8 +637,8 @@ def _compare_environment(
                 unit=spec.name,
                 section=section,
                 key=f"Environment={name}",
-                repo_value=repo_env.get(name, _ABSENT),
-                installed_value=installed_env.get(name, _ABSENT),
+                repo_value=repo_env.get(name, ABSENT),
+                installed_value=installed_env.get(name, ABSENT),
                 reason=reason,
             )
         )
@@ -639,11 +695,11 @@ def _compare_env_matches_directive(
         mismatched_sides: list[str] = []
 
         for side_name, side in (("repo", repo), ("installed", installed)):
-            env = _environment_map(side, section) if section is not None else {}
+            env = environment_map(side, section) if section is not None else {}
             directive = _render(side.get(section or "", {}).get(key))
             if var not in env:
                 # Reported by the name-set branch; see the docstring.
-                observed[side_name] = _ABSENT
+                observed[side_name] = ABSENT
                 continue
             observed[side_name] = f"{var}={env[var]} / {key}={directive}"
             if not env[var].strip() or not directive.strip():
@@ -697,7 +753,7 @@ def compare_unit(
 
     Comparison is SYMMETRIC over the curated key set: a compared directive the
     installed copy declares and the repo copy does not is drift just as much
-    as the reverse.  A missing key is treated as ``_ABSENT`` on its side, so
+    as the reverse.  A missing key is treated as ``ABSENT`` on its side, so
     both asymmetric cases fall out of the same equality test.
 
     The full values LIST is compared, not just the first value, so a repeated
@@ -782,7 +838,7 @@ def compare_unit(
             )
         )
 
-    drifts.extend(_compare_exec_start_flags(spec, repo, installed))
+    drifts.extend(_compare_exec_start_options(spec, repo, installed))
     drifts.extend(_compare_environment(spec, repo, installed))
     drifts.extend(_compare_env_matches_directive(spec, repo, installed))
 
@@ -884,7 +940,7 @@ UNITS: dict[str, UnitSpec] = {
         present_only=(
             # All three carry absolute host paths (/home/leo/.local/bin/uv,
             # the repo root). Presence only; ExecStart's content is reached
-            # via exec_start_flags.
+            # via exec_start_flags and exec_start_switches.
             ("Unit", "Documentation"),
             ("Service", "ExecStart"),
             ("Service", "WorkingDirectory"),
@@ -905,7 +961,7 @@ UNITS: dict[str, UnitSpec] = {
         # EnvironmentFile= is VISIBLE: it could override any Environment= the
         # name-set comparison below just checked, from a file off this tree.
         override_directives=(("Service", "EnvironmentFile"),),
-        environment_section="Service",
+        environment_section=SERVICE_SECTION,
         env_matches_directive=(
             # The dashboard's DATA ROOT (config.py's project_root falls back to
             # Path.cwd() when it is unset), so =/tmp/wrong must not read as
@@ -924,6 +980,17 @@ UNITS: dict[str, UnitSpec] = {
             # can reach.
             "host",
             "port",
+            # `--project dashboard` is relative (resolved against
+            # WorkingDirectory=) and host-invariant in both the template and
+            # the committed unit, so it is value-comparable.
+            "project",
+        ),
+        exec_start_switches=(
+            # Task 5553 (commit 93e62a6c8f) put `uv run --no-sync` on every
+            # committed uv-run unit: only --no-sync stops a process start from
+            # re-syncing the shared root .venv. On 2026-10-05 the installed
+            # copy lacked it while this gate reported parity.
+            "no-sync",
         ),
     ),
     "dark-factory-dashboard-watchdog.service": UnitSpec(
@@ -960,7 +1027,7 @@ UNITS: dict[str, UnitSpec] = {
         # policy, so an inline injection here is the same class of hole
         # EnvironmentFile= was registered to close — on the same unit, left
         # open until now.
-        environment_section="Service",
+        environment_section=SERVICE_SECTION,
         unchecked_directives=(("Unit", "Description", _DESCRIPTION_IS_COSMETIC),),
     ),
     "dark-factory-dashboard-watchdog.timer": UnitSpec(
@@ -988,18 +1055,27 @@ UNITS: dict[str, UnitSpec] = {
 # ---------------------------------------------------------------------------
 
 
+def _compare(unit: UnitRef, repo_text: str, installed_text: str) -> list[Drift]:
+    return compare_unit(UNITS[unit.name], repo_text, installed_text)
+
+
+_REPORT = ReportText(
+    drift=BlockText(
+        "drift",
+        "{count} directive(s) differ between repo and installed units:",
+        (
+            "To propagate the committed units to this host, run: scripts/setup-host.sh  "
+            "(this checker is read-only by design — see the module docstring for why "
+            "there is no --fix)",
+        ),
+    )
+)
+
+
 def main(argv: Sequence[str]) -> int:
-    """Parse args and run the parity check.
+    """Parse args and run the parity check through ``systemd_unit_parity.run_parity``.
 
-    Returns:
-        0 — parity (and at least one unit was actually compared)
-        1 — drift, OR a committed unit vanished, OR a drop-in override
-        2 — one or more installed units absent
-
-    Drift DOMINATES absence: a run that hits both returns 1.  An absent unit
-    is still reported in that case — dominated, not hidden.  A run that
-    compared ZERO units never reports parity: see the exit-code table in the
-    module docstring.
+    Exit codes: see ``systemd_unit_parity.ParityExit``.
     """
     parser = argparse.ArgumentParser(
         description="Verify parity between the in-repo and installed dashboard units."
@@ -1027,127 +1103,11 @@ def main(argv: Sequence[str]) -> int:
         ),
     )
     args = parser.parse_args(argv)
-
-    installed_dir: pathlib.Path = args.installed_dir
-    repo_root: pathlib.Path = args.repo_root
-    selected = args.unit or sorted(UNITS)
-
-    drifts: list[tuple[Drift, pathlib.Path, pathlib.Path]] = []
-    missing: list[pathlib.Path] = []
-    vanished: list[tuple[str, pathlib.Path]] = []
-    overridden: list[tuple[str, list[pathlib.Path]]] = []
-    # Units that actually reached compare_unit. The success line reports THIS
-    # count, not len(selected): a report may only claim what it verified.
-    compared: list[str] = []
-
-    for name in selected:
-        spec = UNITS[name]
-        repo_path = repo_root / spec.repo_relpath
-        installed_path = installed_dir / name
-
-        if not repo_path.is_file():
-            # The committed unit is the source of truth; without it there is
-            # nothing to compare against, so this unit was NOT checked.
-            vanished.append((name, repo_path))
-            continue
-
-        if not installed_path.is_file():
-            missing.append(installed_path)
-            continue
-
-        # Checked even when the unit itself is at parity: a drop-in is layered
-        # OVER a matching unit file, so it is invisible to every text
-        # comparison below.
-        dropins = find_dropins(installed_dir, name)
-        if dropins:
-            overridden.append((name, dropins))
-
-        compared.append(name)
-        for drift in compare_unit(
-            spec,
-            repo_path.read_text(encoding="utf-8"),
-            installed_path.read_text(encoding="utf-8"),
-        ):
-            drifts.append((drift, repo_path, installed_path))
-
-    for path in missing:
-        _log(f"[skip] installed unit not found: {path} (not installed on this host)")
-
-    if vanished:
-        # Deliberately worded apart from the drift block below. Both exit 1,
-        # but they send the operator to different places: a drift is a
-        # directive diff to propagate, whereas this is "the file I compare
-        # against is gone" — telling them to hunt for a diff would waste the
-        # trip.
-        _log(
-            f"[vanished] {len(vanished)} committed unit(s) not found — "
-            "nothing was verified for them:"
-        )
-        for name, repo_path in vanished:
-            _log(f"  {name}: expected committed copy at {repo_path}")
-        _log(
-            "[vanished] The committed unit is this checker's source of truth. "
-            "Check --repo-root, and whether the unit was renamed or moved "
-            "(the paths live in UNITS in this script)."
-        )
-
-    if overridden:
-        # Worded apart from [drift] for the same reason [vanished] is: this is
-        # not a directive diff to propagate. The unit files may match exactly;
-        # what the run could not establish is that the EFFECTIVE configuration
-        # matches, because systemd merges these over the unit at load time.
-        # It shares exit 1 because "I could not verify" belongs with "I found
-        # a difference", not with the benign "not installed here" that 2
-        # denotes — reporting parity here would overstate what was checked.
-        _log(
-            f"[override] {len(overridden)} unit(s) have drop-in overrides — "
-            "the unit files were compared, but the EFFECTIVE configuration "
-            "was NOT verified:"
-        )
-        for name, dropins in overridden:
-            for dropin in dropins:
-                _log(f"  {name}: {dropin}")
-        _log(
-            "[override] systemd merges these over the unit at load time, so a "
-            "directive set here silently wins over the committed value. "
-            "Inspect with: systemctl --user cat <unit>  (and remove the "
-            "drop-in, or move the setting into the committed unit)."
-        )
-
-    if drifts:
-        _log(f"[drift] {len(drifts)} directive(s) differ between repo and installed units:")
-        for drift, repo_path, installed_path in drifts:
-            _log(f"  {drift.unit} [{drift.section}] {drift.key}")
-            _log(f"      {drift.reason}")
-            _log(f"      repo      {repo_path}: {drift.repo_value}")
-            _log(f"      installed {installed_path}: {drift.installed_value}")
-        _log(
-            "[drift] To propagate the committed units to this host, run: "
-            "scripts/setup-host.sh  (this checker is read-only by design — "
-            "see the module docstring for why there is no --fix)"
-        )
-
-    if drifts or vanished or overridden:
-        return 1
-
-    if missing:
-        return 2
-
-    if not compared:
-        # UNREACHABLE BY CONSTRUCTION, kept as defence — not a tested path.
-        # Every unit that was not compared took an earlier `continue` into
-        # `vanished` or `missing`, and both return above, so reaching here
-        # requires `selected` itself to be empty: impossible while UNITS is
-        # non-empty (`args.unit or sorted(UNITS)`) and argparse `choices`
-        # rejects an unknown --unit. It stays because the invariant it
-        # enforces — a run that verified nothing must never report parity — is
-        # one a future early-`continue` could quietly break, and the cost of
-        # holding it is three lines.
-        _log("[error] no units were compared — nothing was verified.")
-        return 1
-
-    _log(f"[ok] parity — {len(compared)} unit(s) match their committed copies.")
-    return 0
+    units = [
+        UnitRef(name, args.repo_root / UNITS[name].repo_relpath, args.installed_dir / name)
+        for name in args.unit or sorted(UNITS)
+    ]
+    return run_parity(ParityRun(LOG_TAG, units, _compare, _REPORT), out=sys.stdout)
 
 
 if __name__ == "__main__":

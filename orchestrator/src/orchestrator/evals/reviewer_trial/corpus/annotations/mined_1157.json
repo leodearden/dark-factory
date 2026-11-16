@@ -24,6 +24,78 @@
       "severity": "suggestion",
       "description": "The new contract test only exercises `_format_report` serialization of the stats key; it does not verify that Stage 1 actually writes `entity_refresh_failed_uuids` on an error response, nor that Stage 2 reads and retries them, so the core producer/consumer behavior claimed by the change remains untested.",
       "mutation_type": "test_gap"
+    },
+    {
+      "id": "mined_1157_pool_01",
+      "location": "fused-memory/tests/test_refresh_entity_summary.py:871",
+      "category": "test_placement",
+      "severity": "suggestion",
+      "description": "The new TestEntityRefreshFailedUuidsFlowsToStage2Payload test exercises task_knowledge_sync._format_report serialization but is placed in the refresh_entity_summary test module next to prompt-content tests rather than with the Stage 2 payload tests.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1157_pool_02",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:148",
+      "category": "spot_cross_stage_keys",
+      "severity": "suggestion",
+      "description": "The cross-stage contract key entity_refresh_failed_uuids (and Stage 2's entity_refresh_retried_* keys) are hand-written string literals in the Stage 1 prompt, the Stage 2 prompt and the test, and the 'successful only when no error key' rule and source_description rationale are copied into both prompts; nothing ties the producer and consumer spellings together, so a rename on one side silently breaks the handoff.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1157_pool_03",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:155",
+      "category": "prompt_rationale_prose",
+      "severity": "suggestion",
+      "description": "Both new prompt sections carry reviewer-facing rationale rather than operative instructions: the rejected source_description side channel and speculative cost claims ('forces Stage 2 to re-scan all entity summaries heuristically', 'forces the next Stage 1 cycle to re-discover ... heuristically') that no stage instruction backs; Stage 1 also describes a stats dict 'built up across the cycle' with initialise/append steps although stats are emitted once in the final structured output. This adds tokens to every run and can mislead the agent.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1157_pool_04",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py:146",
+      "category": "task_deviation_unrecorded",
+      "severity": "suggestion",
+      "description": "The task details (and the plan) specify a fallback: if stats are already finalized, emit a one-sentence add_memory(observations_and_summaries) with the UUID. The implementation omits it, asserting the agent can always record in stats before finalising. Since stats are emitted once at the end this is defensible and the description's 'OR' is met, but the deviation from the specified implementation is not recorded anywhere.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1157_pool_05",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:217",
+      "category": "scope_creep_policy",
+      "severity": "suggestion",
+      "description": "The task asked for a Stage 1 prompt change; the change also adds a Stage 2 retry policy with a 20-UUID cap, a 3-consecutive-error circuit breaker and three new stats keys (entity_refresh_retried_succeeded/failed/deferred). The numeric limits are not grounded in the task, are enforced only by prompt prose, and nothing in the harness tests or reads the new keys.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1157_pool_06",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:218",
+      "category": "prompt_imprecision",
+      "severity": "suggestion",
+      "description": "Stage 2 is told to look for entity_refresh_failed_uuids 'in its structured report' of 'the Stage 1 payload', whereas the data actually appears as the JSON on the 'Stats:' line under the '### Stage 1 Report Summary' heading of the Stage 2 user prompt; naming that location would make the lookup reliable.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1157_pool_07",
+      "location": "fused-memory/src/fused_memory/reconciliation/cli_stage_runner.py:66",
+      "category": "schema_description_drift",
+      "severity": "suggestion",
+      "description": "STAGE_REPORT_SCHEMA describes stats as 'Counts and metrics from this stage', but the change instructs Stage 1 and Stage 2 to emit list-valued UUID keys in stats; the schema description no longer matches the data and consumers assuming integer-only stats could mishandle them.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1157_pool_08",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:226",
+      "category": "wasteful_retry",
+      "severity": "suggestion",
+      "description": "Stage 2 immediately retries, in the same cycle and before other work, entities whose refresh just failed in Stage 1, including deterministic NodeNotFoundError failures that are unlikely to resolve within minutes, spending up to 20 tool calls; the cap and breaker live only in prompt prose and are not enforced by the harness. Retries of transient errors are reasonable, so the cost is bounded.",
+      "mutation_type": "pooled_2026_10_22"
+    },
+    {
+      "id": "mined_1157_pool_09",
+      "location": "fused-memory/src/fused_memory/reconciliation/prompts/stage2.py:233",
+      "category": "no_escalation_path",
+      "severity": "suggestion",
+      "description": "UUIDs that fail again in Stage 2 are recorded only in entity_refresh_retried_failed plus a prose note in the report; they are not emitted as flagged_items, which Stage 3 consumes, so persistently unreachable entities reach no integrity check or escalation path.",
+      "mutation_type": "pooled_2026_10_22"
     }
   ],
   "provenance": {

@@ -88,7 +88,8 @@ what this module's _REMEDIATION warns against." The re-render is no longer
 destructive. setup-host.sh section 8 now installs this unit through
 scripts/render_systemd_unit.py, which reads the ALREADY-INSTALLED unit's
 host-local Environment= values and puts them back
-(render_systemd_unit.HOST_LOCAL_ENVIRONMENT), so a re-run preserves the nine
+(systemd_unit_parity.ENV_POLICY's host-local rows, preserved by
+scripts/render_systemd_unit.py), so a re-run preserves the nine
 roots instead of collapsing them to one. _REMEDIATION below is rewritten
 accordingly. What is unchanged is the argument in the paragraph above: BYTE
 parity is still the wrong invariant for this module, because the divergence is
@@ -210,6 +211,7 @@ import pathlib
 import shutil
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 from systemd_unit_invariants import (
     INSTALLED_UNIT_DIR,
     SYSTEMCTL_SKIP_REASON,
@@ -218,6 +220,8 @@ from systemd_unit_invariants import (
     restart_directive,
     systemctl_user_show,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 UNIT_BASENAME = "dark-factory-dashboard.service"
 INSTALLED_UNIT_PATH = INSTALLED_UNIT_DIR / UNIT_BASENAME

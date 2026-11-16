@@ -26,6 +26,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from shared.cli_invoke import resolve_claude_binary
 
 from orchestrator.agents.invoke import invoke_agent
 
@@ -62,6 +63,7 @@ def fake_claude(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Callable[[],
     script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ.get("PATH", "")}')
+    assert resolve_claude_binary() == str(script)
     monkeypatch.setenv('FAKE_CLAUDE_ENV_DUMP', str(dump))
     for var in (_RESET_VAR, 'DF_AGENT_CPU_NICE', 'DF_AGENT_CPU_GOVERN'):
         monkeypatch.delenv(var, raising=False)

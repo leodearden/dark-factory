@@ -58,6 +58,7 @@ from _plan_markup_fixtures import (
     on_disk,
     plan_artifacts,  # noqa: F401 — a fixture, requested by test parameter name
 )
+from shared.plan_deviation import DEVIATION_KINDS
 from shared.toolcall_markup import detect
 
 from orchestrator.artifacts import (
@@ -176,10 +177,10 @@ _COLLECTION_SCHEMA_TOOL_NAME = {
     'dropped_files': 'drop_plan_file',
 }
 
-#: The only three ``TaskArtifacts`` methods that mutate plan.json — measured,
-#: not assumed: ``write_plan`` (artifacts.py:356), ``update_step_status``
-#: (:734) and ``mark_step_committed`` (:753) each write
-#: ``self.root / 'plan.json'`` (the latter via a call to ``self.write_plan``).
+#: The ``TaskArtifacts`` plan-mutating methods that plan-tools impls call:
+#: ``artifacts.py::TaskArtifacts.write_plan_model`` is plan.json's only writer;
+#: ``::write_plan`` (its dict adapter), ``::update_step_status``,
+#: ``::mark_step_committed`` and ``::append_step_deviation`` each reach it.
 #: ``_plan_writing_tool_names()`` below keys its live-module walk on this set
 #: to derive the candidate set for "could this plan-tools entry point write a
 #: ``_REPAIRABLE_PLAN_FIELDS`` cell?".
@@ -190,9 +191,11 @@ _COLLECTION_SCHEMA_TOOL_NAME = {
 #: own separate artifact file and never touches plan.json, so admitting one
 #: here would wrongly pull the whole ``report_*`` family into the sweep.
 _PLAN_MUTATING_ARTIFACT_METHODS = frozenset({
+    'write_plan_model',
     'write_plan',
     'update_step_status',
     'mark_step_committed',
+    'append_step_deviation',
 })
 
 
@@ -201,8 +204,8 @@ def _registered_plan_tool_names() -> frozenset[str]:
     """The tool names plan-tools' server actually REGISTERS, read from the server.
 
     Derived, never restated: builds a real server over a throwaway artifacts
-    root and asks it what it registered. Measured against the live tree — 16
-    names, the 11 plan writers plus the 5 ``report_*``.
+    root and asks it what it registered: the plan writers plus the
+    ``report_*`` family.
 
     Cached because several callers ask for the registered surface, which
     cannot change within a process; without it each would pay its own server
@@ -468,8 +471,16 @@ def _alternate_writer_changed_the_cell(
             kwargs[name] = seeded_id
         elif name == 'step_type':
             kwargs[name] = 'test'
-        elif name in ('sha', 'commit_sha'):
+        elif name == 'kind':
+            kwargs[name] = sorted(DEVIATION_KINDS)[0]
+        elif name == 'prose_only':
+            kwargs[name] = False
+        elif name in ('sha', 'commit_sha', 'commit'):
             kwargs[name] = 'a' * 40
+        elif name == 'disposition':
+            kwargs[name] = 'orphan'
+        elif name == 'authority':
+            kwargs[name] = f'Probe marker for {tool_name}.{name}.'
         elif name == 'files':
             kwargs[name] = ['a.py']
         elif name == 'task_id':
@@ -481,6 +492,7 @@ def _alternate_writer_changed_the_cell(
         elif name in (
             'description', 'analysis', 'title', 'decision', 'rationale',
             'what', 'where', 'how', 'reason',
+            'observed', 'expected', 'action_taken', 'note',
         ):
             kwargs[name] = f'Probe marker for {tool_name}.{name}.'
         else:
@@ -935,10 +947,10 @@ class TestRepairableFieldTable:
         TWO HALVES, both derived:
 
         (a) Every REGISTERED tool that is not a ``report_*`` separate-artifact
-            writer. Measured, production's own claims alone (half (b)) floor
-            only 8 of the 11 — ``confirm_plan``, ``mark_step_done`` and
-            ``remove_plan_step`` are declared as no row's alternate, so all
-            three could vanish from the sweep and every test here would still
+            writer. Production's own claims alone (half (b)) do not floor
+            every plan writer — a writer such as ``confirm_plan`` or
+            ``mark_step_done`` that is declared as no row's alternate could
+            vanish from the sweep and every test here would still
             report green, which is exactly what this test's name claims to
             rule out. The ``report_*`` exclusion is not a prefix guess: the
             behaviour it stands for is pinned against the live module by
@@ -1042,8 +1054,7 @@ class TestRepairableFieldTable:
         # registered OUTSIDE that convention (written inline inside
         # `create_server`, or delegating to a differently-named helper) would
         # not fail — it would silently be no candidate at all, which is the
-        # under-reporting this whole surface exists to end. Measured: all 16
-        # registered tools follow it today.
+        # under-reporting this whole surface exists to end.
         for name in sorted(registered):
             impl = getattr(plan_tools, '_' + name, None)
             assert inspect.isfunction(impl) and impl.__module__ == plan_tools.__name__, (
@@ -2051,14 +2062,14 @@ class TestRepairWriteBackByteFormat:
         """
         _seed_corrupt(plan_artifacts)
         repaired, _ = plan_tools._read_plan_repaired(plan_artifacts)
-        via_write_back = plan_artifacts.root / 'plan.json'
+        via_write_back = plan_artifacts.artifact_path('plan.json')
 
         reference_worktree = tmp_path / 'reference'
         reference_worktree.mkdir()
         reference = TaskArtifacts(reference_worktree)
         reference.init('test-1', 'Test task', 'A test')
         reference.write_plan(copy.deepcopy(repaired))
-        via_write_plan = reference.root / 'plan.json'
+        via_write_plan = reference.artifact_path('plan.json')
 
         assert via_write_back.read_bytes() == via_write_plan.read_bytes()
         # ...and the same PERMISSIONS, a difference the content comparison
@@ -2137,7 +2148,7 @@ class TestReadPlanRepaired:
 
         plan_tools._read_plan_repaired(plan_artifacts)
 
-        on_disk = json.loads((plan_artifacts.root / 'plan.json').read_text())
+        on_disk = json.loads(plan_artifacts.artifact_path('plan.json').read_text())
         assert on_disk['design_decisions'][0]['rationale'] == _RATIONALE_PROSE
         # ...and the refusing field is BYTE-IDENTICAL on disk, not sanitized.
         assert on_disk['design_decisions'][1]['decision'] == PROSE_QUOTED
@@ -2147,7 +2158,7 @@ class TestReadPlanRepaired:
 
         plan_tools._read_plan_repaired(plan_artifacts)
 
-        on_disk = json.loads((plan_artifacts.root / 'plan.json').read_text())
+        on_disk = json.loads(plan_artifacts.artifact_path('plan.json').read_text())
         assert on_disk['_schema_version'] == PLAN_SCHEMA_VERSION
         for key in ('task_id', 'title', 'analysis', 'files', 'prerequisites',
                     'steps', 'reuse'):
@@ -2166,20 +2177,20 @@ class TestReadPlanRepaired:
         turn a read into a write for the overwhelmingly common clean path.
         """
         _seed_mixed_plan(plan_artifacts)
-        plan_path = plan_artifacts.root / 'plan.json'
+        plan_path = plan_artifacts.artifact_path('plan.json')
 
         first, _ = plan_tools._read_plan_repaired(plan_artifacts)
         before_bytes = plan_path.read_bytes()
         before_mtime = plan_path.stat().st_mtime_ns
 
         writes: list = []
-        real_write_plan = TaskArtifacts.write_plan
+        real_write_plan_model = TaskArtifacts.write_plan_model
 
-        def spy(self, plan):
+        def spy(self, plan, **kwargs):
             writes.append(plan)
-            return real_write_plan(self, plan)
+            return real_write_plan_model(self, plan, **kwargs)
 
-        monkeypatch.setattr(TaskArtifacts, 'write_plan', spy)
+        monkeypatch.setattr(TaskArtifacts, 'write_plan_model', spy)
 
         second, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
@@ -2191,11 +2202,11 @@ class TestReadPlanRepaired:
 
     def test_a_wholly_clean_plan_is_never_written(self, plan_artifacts, monkeypatch):
         plan_artifacts.write_plan(corrupt_plan())
-        plan_path = plan_artifacts.root / 'plan.json'
+        plan_path = plan_artifacts.artifact_path('plan.json')
         before_mtime = plan_path.stat().st_mtime_ns
         writes: list = []
         monkeypatch.setattr(
-            TaskArtifacts, 'write_plan', lambda self, plan: writes.append(plan)
+            TaskArtifacts, 'write_plan_model', lambda self, plan, **kwargs: writes.append(plan)
         )
 
         plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2211,11 +2222,11 @@ class TestReadPlanRepaired:
         plan = corrupt_plan()
         plan['design_decisions'][0]['decision'] = PROSE_QUOTED
         plan_artifacts.write_plan(plan)
-        plan_path = plan_artifacts.root / 'plan.json'
+        plan_path = plan_artifacts.artifact_path('plan.json')
         before_bytes = plan_path.read_bytes()
         writes: list = []
         monkeypatch.setattr(
-            TaskArtifacts, 'write_plan', lambda self, plan: writes.append(plan)
+            TaskArtifacts, 'write_plan_model', lambda self, plan, **kwargs: writes.append(plan)
         )
 
         _, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2308,7 +2319,7 @@ class TestReadPlanRepaired:
         assert sorted(f['outcome'] for f in first) == ['repaired', 'unrepairable']
 
         # Re-corrupt the same field and read again: reported afresh.
-        on_disk = json.loads((plan_artifacts.root / 'plan.json').read_text())
+        on_disk = json.loads(plan_artifacts.artifact_path('plan.json').read_text())
         on_disk['design_decisions'][0]['rationale'] = TRAILING_RATIONALE
         plan_artifacts.write_plan(on_disk)
 
@@ -2332,7 +2343,7 @@ class TestReadPlanRepaired:
             assert payload['event'] == MARKUP_FACT_EVENT
             assert set(payload) >= FACT_LOG_KEYS
             assert payload['outcome'] in {'repaired', 'unrepairable'}
-            assert payload['path'] == str(plan_artifacts.root / 'plan.json')
+            assert payload['path'] == str(plan_artifacts.artifact_path('plan.json'))
         assert sorted(p['outcome'] for p in payloads) == ['repaired', 'unrepairable']
 
     def test_the_logged_payload_carries_the_full_locator(self, plan_artifacts, caplog):
@@ -2373,12 +2384,12 @@ class TestReadPlanRepaired:
         self, plan_artifacts, monkeypatch
     ):
         """No plan.json -> ``{}``, no facts, no write. No NEW failure mode."""
-        plan_path = plan_artifacts.root / 'plan.json'
+        plan_path = plan_artifacts.artifact_path('plan.json')
         plan_path.unlink(missing_ok=True)
         assert plan_artifacts.read_plan() == {}
         writes: list = []
         monkeypatch.setattr(
-            TaskArtifacts, 'write_plan', lambda self, plan: writes.append(plan)
+            TaskArtifacts, 'write_plan_model', lambda self, plan, **kwargs: writes.append(plan)
         )
 
         plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2391,14 +2402,14 @@ class TestReadPlanRepaired:
     def test_unparseable_plan_raises_exactly_what_read_plan_raises(
         self, plan_artifacts, monkeypatch
     ):
-        plan_path = plan_artifacts.root / 'plan.json'
+        plan_path = plan_artifacts.artifact_path('plan.json')
         plan_path.write_text('{not json at all')
         before_bytes = plan_path.read_bytes()
         with pytest.raises(json.JSONDecodeError):
             plan_artifacts.read_plan()
         writes: list = []
         monkeypatch.setattr(
-            TaskArtifacts, 'write_plan', lambda self, plan: writes.append(plan)
+            TaskArtifacts, 'write_plan_model', lambda self, plan, **kwargs: writes.append(plan)
         )
 
         with pytest.raises(json.JSONDecodeError):
@@ -2419,10 +2430,10 @@ class TestReadPlanRepaired:
 
         # Patched at the writer plan-tools now delegates to, so the contract
         # is still exercised after the module's own writer was retired.
-        def boom(self, plan):
+        def boom(self, plan, **kwargs):
             raise ArtifactWriteError('disk on fire')
 
-        monkeypatch.setattr(TaskArtifacts, 'write_plan', boom)
+        monkeypatch.setattr(TaskArtifacts, 'write_plan_model', boom)
 
         with caplog.at_level(logging.WARNING, logger=plan_tools.__name__):
             plan, facts = plan_tools._read_plan_repaired(plan_artifacts)
@@ -2598,6 +2609,18 @@ def _plan_finalized(plan: dict) -> None:
     assert plan['_revalidated_at']
 
 
+def _deviation_recorded(plan: dict) -> None:
+    assert plan['steps'][0]['deviations'][0]['kind'] == 'other'
+    assert plan['steps'][0]['status'] == 'pending'
+
+
+def _descope_recorded(plan: dict) -> None:
+    assert [(d['step_id'], d['commit']) for d in plan['_descoped_steps']] == [
+        ('step-1', _NEW_SHA),
+    ]
+    assert plan['_rescoped_note'] == 'Descoped.'
+
+
 #: ``(id, call, expected-response-subset, on-disk-mutation-check)`` for every
 #: plan-tools entry point that OPENS an existing plan. ``_create_plan`` is
 #: absent on purpose: it overwrites the document wholesale, so it has no read to
@@ -2646,6 +2669,22 @@ READ_PATH_CASES = [
         lambda a: plan_tools._mark_step_done(a, 'step-1', _NEW_SHA),
         {'status': 'ok', 'step_id': 'step-1', 'new_status': 'done', 'commit': _NEW_SHA},
         _step_marked_done,
+    ),
+    (
+        'record_step_deviation',
+        lambda a: plan_tools._record_step_deviation(
+            a, 'step-1', 'other', 'Observed.', 'Expected.', 'Acted.'
+        ),
+        {'status': 'ok', 'step_id': 'step-1', 'deviations': 1},
+        _deviation_recorded,
+    ),
+    (
+        'record_descoped_step',
+        lambda a: plan_tools._record_descoped_step(
+            a, 'step-1', _NEW_SHA, 'orphan', 'esc-probe', 'Descoped.'
+        ),
+        {'status': 'ok', 'step_id': 'step-1', 'commit': _NEW_SHA, 'descoped_steps': 1},
+        _descope_recorded,
     ),
     (
         # Contract A1's DELIBERATELY divergent envelope — ``ok`` plus ``status``
@@ -2831,7 +2870,7 @@ class TestCreatePlanIsDeliberatelyNotHooked:
 
 
 class TestRepairWriteBackDelegatesToTaskArtifacts:
-    """`TaskArtifacts.write_plan` is the SINGLE owner of the plan.json write.
+    """`TaskArtifacts.write_plan_model` is the SINGLE owner of the plan.json write.
 
     plan-tools used to carry `_atomic_write_plan` — a parallel implementation
     of the same byte format and the same durability contract, kept only
@@ -2841,7 +2880,7 @@ class TestRepairWriteBackDelegatesToTaskArtifacts:
     """
 
     @staticmethod
-    def _spy_on_write_plan(monkeypatch) -> list[dict]:
+    def _spy_on_write_plan_model(monkeypatch) -> list[dict]:
         """A DELEGATING spy: records the call, then performs the real write.
 
         Delegating rather than stubbing is what keeps the on-disk assertions
@@ -2849,26 +2888,26 @@ class TestRepairWriteBackDelegatesToTaskArtifacts:
         turning every "and the bytes landed" check vacuous.
         """
         calls: list[dict] = []
-        real_write_plan = TaskArtifacts.write_plan
+        real_write_plan_model = TaskArtifacts.write_plan_model
 
-        def spy(self, plan):
-            calls.append(plan)
-            return real_write_plan(self, plan)
+        def spy(self, plan, **kwargs):
+            calls.append(plan.to_json())
+            return real_write_plan_model(self, plan, **kwargs)
 
-        monkeypatch.setattr(TaskArtifacts, 'write_plan', spy)
+        monkeypatch.setattr(TaskArtifacts, 'write_plan_model', spy)
         return calls
 
-    def test_repair_write_back_goes_through_task_artifacts_write_plan(
+    def test_repair_write_back_goes_through_task_artifacts_write_plan_model(
         self, plan_artifacts, monkeypatch
     ):
         _seed_mixed_plan(plan_artifacts)
-        calls = self._spy_on_write_plan(monkeypatch)
+        calls = self._spy_on_write_plan_model(monkeypatch)
 
         repaired, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
         assert any(f['outcome'] == 'repaired' for f in facts)
         assert len(calls) == 1, (
-            f'expected exactly one write_plan call, got {len(calls)} — the '
+            f'expected exactly one write_plan_model call, got {len(calls)} — the '
             'repair write-back must go through TaskArtifacts'
         )
         assert calls[0] == repaired
@@ -2878,7 +2917,7 @@ class TestRepairWriteBackDelegatesToTaskArtifacts:
     def test_a_clean_plan_still_writes_nothing(self, plan_artifacts, monkeypatch):
         """Consolidating the writer must not convert a read into a write."""
         plan_artifacts.write_plan(corrupt_plan())
-        calls = self._spy_on_write_plan(monkeypatch)
+        calls = self._spy_on_write_plan_model(monkeypatch)
 
         _, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
@@ -2892,11 +2931,11 @@ class TestRepairWriteBackDelegatesToTaskArtifacts:
         plan = corrupt_plan()
         plan['design_decisions'][0]['decision'] = PROSE_QUOTED
         plan_artifacts.write_plan(plan)
-        before_bytes = (plan_artifacts.root / 'plan.json').read_bytes()
-        calls = self._spy_on_write_plan(monkeypatch)
+        before_bytes = plan_artifacts.artifact_path('plan.json').read_bytes()
+        calls = self._spy_on_write_plan_model(monkeypatch)
 
         _, facts = plan_tools._read_plan_repaired(plan_artifacts)
 
         assert [f['outcome'] for f in facts] == ['unrepairable']
         assert calls == []
-        assert (plan_artifacts.root / 'plan.json').read_bytes() == before_bytes
+        assert plan_artifacts.artifact_path('plan.json').read_bytes() == before_bytes

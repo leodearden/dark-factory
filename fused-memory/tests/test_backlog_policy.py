@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
 import json
 import logging
 import os
@@ -13,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 from _fm_helpers import pydantic_spec, submit_and_resolve
+from shared.project_layout import escalation_queue_dir
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.reconciliation import backlog_policy
@@ -180,6 +183,70 @@ async def test_escalation_when_over_threshold_and_orchestrator_live(
     assert body['project_id'] == 'proj'
     assert body['workflow_state'] == 'infra'
     assert body['category'] == 'infra_issue'
+
+
+def _write_orchestrator_lock(project_root: Path, first_line: str) -> Path:
+    """Write ``<project_root>/data/orchestrator/orchestrator.lock`` with *first_line*; return its path."""
+    lock_dir = project_root / 'data' / 'orchestrator'
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / 'orchestrator.lock'
+    lock_path.write_text(first_line + '\n', encoding='utf-8')
+    return lock_path
+
+
+@pytest.mark.asyncio
+async def test_default_detector_rejects_when_the_lock_names_a_live_pid_but_nothing_holds_it(
+    event_buffer, tmp_path,
+):
+    await _seed_buffered(event_buffer, 'proj', n=6)
+    project_root = tmp_path / 'proj_root'
+    _write_orchestrator_lock(project_root, f'PID {os.getpid()} started 2026-04-18T00:00:00Z')
+    policy = BacklogPolicy(event_buffer, _StubQueue(), hard_limit=5)
+
+    verdict = await policy.check('proj', project_root=str(project_root))
+
+    assert verdict.outcome == 'rejection'
+    esc_dir = escalation_queue_dir(project_root)
+    assert not esc_dir.exists() or not any(esc_dir.glob('esc-*.json'))
+
+
+@pytest.mark.asyncio
+async def test_default_detector_escalates_when_the_lock_is_held_whatever_pid_it_names(
+    event_buffer, tmp_path,
+):
+    await _seed_buffered(event_buffer, 'proj', n=6)
+    project_root = tmp_path / 'proj_root'
+    lock_path = _write_orchestrator_lock(project_root, 'PID 2147483646 started 2026-04-13T00:00:00Z')
+    policy = BacklogPolicy(event_buffer, _StubQueue(), hard_limit=5)
+
+    handle = lock_path.open('r+b')
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        verdict = await policy.check('proj', project_root=str(project_root))
+    finally:
+        handle.close()
+
+    assert verdict.outcome == 'escalated'
+    assert verdict.escalation_path is not None
+    record = json.loads(Path(verdict.escalation_path).read_text(encoding='utf-8'))
+    assert record['error_type'] == 'ReconciliationBacklogExceeded'
+
+
+@pytest.mark.asyncio
+async def test_escalation_lands_in_the_layout_escalation_queue_when_relocated(
+    event_buffer, tmp_path, escalation_queue_relocation,
+):
+    await _seed_buffered(event_buffer, 'proj', n=12)
+    project_root = tmp_path / 'proj_root'
+    project_root.mkdir()
+    policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True, hard_limit=10)
+
+    verdict = await policy.check('proj', project_root=str(project_root))
+
+    assert verdict.escalation_path is not None
+    assert Path(verdict.escalation_path).parent == escalation_queue_dir(project_root)
+    assert Path(verdict.escalation_path).exists()
+    assert not (project_root / escalation_queue_relocation.legacy_relpath).exists()
 
 
 @pytest.mark.asyncio
@@ -537,6 +604,45 @@ async def test_watchdog_wedge_survives_count_buffered_failure(tmp_path, caplog):
 
 
 @pytest.mark.asyncio
+async def test_watchdog_wedge_survives_one_projects_orchestrator_probe_failure(
+    event_buffer, tmp_path, caplog,
+):
+    """A probe that raises for one project must not suppress the rest of the fan-out.
+
+    The lock probe lets flock errors other than BlockingIOError propagate (e.g.
+    ENOLCK on an NFS root without lockd). Projects are routed in sorted order,
+    so the broken one goes first and would starve the healthy one.
+    """
+    logger_name = 'fused_memory.reconciliation.backlog_policy'
+    broken_root = tmp_path / 'a_broken_root'
+    healthy_root = tmp_path / 'b_healthy_root'
+    broken_root.mkdir()
+    healthy_root.mkdir()
+
+    def detector(project_root: str) -> bool:
+        if project_root == str(broken_root):
+            raise OSError(errno.ENOLCK, 'No locks available')
+        return True
+
+    policy = BacklogPolicy(event_buffer, _StubQueue(queue_depth=5), detector)
+    policy.register_project_root('a_broken', str(broken_root))
+    policy.register_project_root('b_healthy', str(healthy_root))
+
+    with caplog.at_level(logging.ERROR, logger=logger_name):
+        verdicts = await policy.on_watchdog_wedge({'stale_for_seconds': 180.0})
+
+    assert [(v.project_id, v.outcome, v.error_type) for v in verdicts] == [
+        ('b_healthy', 'escalated', 'SqliteDrainerWedged'),
+    ]
+    assert len(list(escalation_queue_dir(healthy_root).glob('esc-*.json'))) == 1
+    failures = [
+        r for r in caplog.records
+        if r.name == logger_name and 'a_broken' in r.getMessage()
+    ]
+    assert failures and failures[0].exc_info is not None
+
+
+@pytest.mark.asyncio
 async def test_rejection_branch_warning_is_throttled(event_buffer, tmp_path, caplog):
     """The rejection WARNING must not repeat on every ~5s halted tick.
 
@@ -678,17 +784,6 @@ def test_orchestrator_detector_unparseable_lock(tmp_path):
 
 
 # ── orchestrator_started_at (task 2963) ───────────────────────────────────
-
-
-def _write_orchestrator_lock(project_root, first_line: str):
-    """Write ``<project_root>/data/orchestrator/orchestrator.lock`` with *first_line*.
-
-    Mirrors the ``PID <N> started <ISO>`` lock-write fixture pattern used by
-    the ``is_orchestrator_live_for`` tests above.
-    """
-    lock_dir = project_root / 'data' / 'orchestrator'
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_dir.joinpath('orchestrator.lock').write_text(first_line + '\n', encoding='utf-8')
 
 
 def test_orchestrator_started_at_parses_z_suffix_utc_aware(tmp_path):
@@ -1119,6 +1214,29 @@ def _persisted_record(esc_dir: Path, esc_id: str) -> dict:
     return json.loads(archived[-1].read_text(encoding='utf-8'))
 
 
+def _write_pending_halt_record(esc_dir: Path, esc_id: str, *, project_id: str) -> None:
+    """Write a pending judge-halt record for *project_id* straight into *esc_dir*."""
+    (esc_dir / f'{esc_id}.json').write_text(
+        json.dumps({
+            'id': esc_id,
+            'task_id': None,
+            'agent_role': 'fused-memory',
+            'severity': 'blocking',
+            'category': 'infra_issue',
+            'summary': f'Reconciliation HALTED for {project_id}',
+            'detail': f'halt belonging to {project_id}',
+            'suggested_action': 'inspect_judge_halt',
+            'timestamp': '2026-07-28T00:00:00+00:00',
+            'status': 'pending',
+            'level': 1,
+            'workflow_state': 'infra',
+            'project_id': project_id,
+            'error_type': 'ReconciliationJudgeHalted',
+        }, indent=2),
+        encoding='utf-8',
+    )
+
+
 class TestOnJudgeUnhalt:
     """Clearing a halt must close the escalation the halt opened.
 
@@ -1151,25 +1269,7 @@ class TestOnJudgeUnhalt:
 
         esc_dir = project_root / 'data' / 'escalations'
         other_id = 'esc-reconciliation-halt-other-project'
-        (esc_dir / f'{other_id}.json').write_text(
-            json.dumps({
-                'id': other_id,
-                'task_id': None,
-                'agent_role': 'fused-memory',
-                'severity': 'blocking',
-                'category': 'infra_issue',
-                'summary': 'Reconciliation HALTED for other',
-                'detail': 'halt belonging to a DIFFERENT project',
-                'suggested_action': 'inspect_judge_halt',
-                'timestamp': '2026-07-28T00:00:00+00:00',
-                'status': 'pending',
-                'level': 1,
-                'workflow_state': 'infra',
-                'project_id': 'other',
-                'error_type': 'ReconciliationJudgeHalted',
-            }, indent=2),
-            encoding='utf-8',
-        )
+        _write_pending_halt_record(esc_dir, other_id, project_id='other')
         return policy, esc_dir, halt_id, backlog_id, other_id
 
     @pytest.mark.asyncio
@@ -1290,6 +1390,21 @@ class TestOnJudgeUnhalt:
             r.getMessage() for r in caplog.records if r.name == logger_name
         )
         assert 'nope' in text
+
+    @pytest.mark.asyncio
+    async def test_closes_the_halt_in_the_layout_escalation_queue_when_relocated(
+        self, event_buffer, tmp_path, escalation_queue_relocation,
+    ):
+        project_root = tmp_path / 'proj_root'
+        esc_dir = escalation_queue_dir(project_root)
+        esc_dir.mkdir(parents=True)
+        halt_id = 'esc-reconciliation-halt-proj-seeded'
+        _write_pending_halt_record(esc_dir, halt_id, project_id='proj')
+        policy = BacklogPolicy(event_buffer, _StubQueue(), lambda _: True)
+        policy.register_project_root('proj', str(project_root))
+
+        assert await policy.on_judge_unhalt('proj') == [halt_id]
+        assert not (project_root / escalation_queue_relocation.legacy_relpath).exists()
 
 
 # ── Fold isolation: what the fingerprint must keep apart ──────────────────

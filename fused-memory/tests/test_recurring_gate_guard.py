@@ -17,6 +17,7 @@ erroring out at collection time.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -356,7 +357,7 @@ class TestIsGateSubmission:
 
 
 class TestFindOpenGate:
-    """find_open_gate(tasks, subject) -> mapping | None. PURE — no I/O, no async."""
+    """find_open_gate(tasks, subject) -> mapping | None. Total — no fetch, no async."""
 
     def test_matching_pending_carrier_is_returned(self):
         from fused_memory.middleware.recurring_gate_guard import find_open_gate
@@ -827,3 +828,71 @@ class TestRecurringGateGuardError:
         )
         assert err is not None
         assert err['existing_gate_task_id'] == '5929'
+
+
+_SCHEMA_WARNING = 'task_metadata.schema_warning'
+_SOURCE = 'source=recurring_gate_guard'
+
+
+def _discard_lines(caplog) -> list[str]:
+    messages = (r.getMessage() for r in caplog.records)
+    return [m for m in messages if _SCHEMA_WARNING in m and _SOURCE in m]
+
+
+class TestUnreadableMetadataIsDiscardedLoudly:
+    """Unreadable metadata reads as empty under the shared wire rule, logged once per read."""
+
+    @pytest.mark.asyncio
+    async def test_unreadable_submission_does_no_io_and_logs_one_census_line(self, caplog):
+        from fused_memory.middleware.recurring_gate_guard import (
+            recurring_gate_guard_error,
+        )
+
+        fetch = AsyncMock()
+        with caplog.at_level(logging.WARNING):
+            result = await recurring_gate_guard_error(
+                '{not json', 'recon-stage-x', '/proj', fetch_tasks=fetch
+            )
+        assert result is None
+        assert fetch.await_count == 0
+        assert len(_discard_lines(caplog)) == 1
+
+    @pytest.mark.parametrize('metadata', ['{not json', ['not', 'a', 'dict'], 42], ids=repr)
+    def test_unreadable_stored_row_is_skipped_and_logged_once(self, metadata, caplog):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        with caplog.at_level(logging.WARNING):
+            assert find_open_gate([_row(task_id='5902', metadata=metadata)], '5879') is None
+        assert len(_discard_lines(caplog)) == 1
+
+    def test_unreadable_stored_row_is_logged_under_its_own_row_id(self, caplog):
+        from fused_memory.middleware.recurring_gate_guard import find_open_gate
+
+        corpus = [_row(task_id='5902', metadata='{not json'), _row(task_id='5903', metadata=42)]
+        with caplog.at_level(logging.WARNING):
+            assert find_open_gate(corpus, '5879') is None
+        lines = _discard_lines(caplog)
+        assert len(lines) == 2
+        assert 'source=recurring_gate_guard.find_open_gate[5902] ' in lines[0]
+        assert 'source=recurring_gate_guard.find_open_gate[5903] ' in lines[1]
+
+    def test_unreadable_submission_is_not_tagged_as_a_stored_row(self, caplog):
+        from fused_memory.middleware.recurring_gate_guard import is_gate_submission
+
+        with caplog.at_level(logging.WARNING):
+            is_gate_submission('{not json')
+        assert not any('find_open_gate' in line for line in _discard_lines(caplog))
+
+    def test_extract_gate_subject_logs_one_census_line(self, caplog):
+        from fused_memory.middleware.recurring_gate_guard import extract_gate_subject
+
+        with caplog.at_level(logging.WARNING):
+            assert extract_gate_subject('{not json') is None
+        assert len(_discard_lines(caplog)) == 1
+
+    def test_is_gate_submission_logs_one_census_line(self, caplog):
+        from fused_memory.middleware.recurring_gate_guard import is_gate_submission
+
+        with caplog.at_level(logging.WARNING):
+            assert is_gate_submission('{not json') is False
+        assert len(_discard_lines(caplog)) == 1

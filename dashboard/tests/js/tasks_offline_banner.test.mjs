@@ -10,7 +10,7 @@
 // statically detect named exports assigned from a variable, so
 // `import { tasksBannerNotices } from '...'` would come back undefined. We
 // therefore default-import the module and destructure instead (mirrors
-// task_status_counts.test.mjs / prd_grouping.test.mjs).
+// graph_layout.test.mjs / task_vocab.test.mjs).
 //
 // WHY THIS IS A TESTED MODULE AND NOT JSX. The defect being closed is a copy
 // decision: the Tasks tab rendered ONE global banner reading "fused-memory
@@ -24,7 +24,7 @@ import assert from 'node:assert/strict';
 
 import banner from '../../src/dashboard/static/redux/tasks_offline_banner.js';
 
-const { tasksBannerNotices } = banner;
+const { tasksBannerNotices, tasksBannerNoticesFor } = banner;
 
 // The real-outage wording, preserved VERBATIM from the pre-change JSX
 // (tab_tasks.jsx). The global case was never the bug — it was the only case,
@@ -233,7 +233,7 @@ test('every notice is a {kind, text} pair with a known kind', () => {
   for (const notice of notices) {
     assert.deepEqual(Object.keys(notice).sort(), ['kind', 'text']);
     assert.ok(
-      ['global', 'partial', 'degraded', 'count-unknown'].includes(notice.kind),
+      ['global', 'partial', 'degraded', 'count-unknown', 'count-stale'].includes(notice.kind),
       notice.kind
     );
     assert.equal(typeof notice.text, 'string');
@@ -292,4 +292,138 @@ test('a missing countUnknownProjects key produces no notice', () => {
     tasksBannerNotices({ offline: false, countUnknownProjects: undefined, totalProjects: 3 }),
     []
   );
+});
+
+test('a count-stale project is NAMED, with copy that agrees with its aged surfaces', () => {
+  // The census for this root is served from its last good value, and every
+  // census surface renders that value with an age badge. Calling the count
+  // unknown or unavailable would contradict the value shown beside it.
+  const notices = tasksBannerNotices({
+    offline: false,
+    countStaleProjects: ['reify'],
+    totalProjects: 9,
+  });
+
+  assert.deepEqual(kinds(notices), ['count-stale']);
+  const [{ text }] = notices;
+  assert.ok(text.includes('reify'), text);
+  assert.ok(text.includes('1 of 9'), text);
+  assert.match(text, /last measured/);
+  assert.match(text, /age/);
+  assert.doesNotMatch(text, /unknown|unavailable/);
+  assert.ok(!text.includes('fused-memory offline'), text);
+  // A unit served past its freshness bound is count-stale with BOTH halves
+  // aged (task_snapshot.py::classify), so the copy cannot vouch for the rows.
+  assert.doesNotMatch(text, /rows/);
+});
+
+test('count-stale composes with count-unknown', () => {
+  const notices = tasksBannerNotices({
+    offline: false,
+    countUnknownProjects: ['a'],
+    countStaleProjects: ['b'],
+    totalProjects: 4,
+  });
+
+  assert.deepEqual(kinds(notices), ['count-unknown', 'count-stale']);
+});
+
+test('a global outage subsumes the count-stale notice', () => {
+  const notices = tasksBannerNotices({
+    offline: true,
+    offlineProjects: ['a', 'b'],
+    countStaleProjects: ['c'],
+    totalProjects: 3,
+  });
+
+  assert.deepEqual(kinds(notices), ['global']);
+});
+
+test('a missing countStaleProjects key produces no notice', () => {
+  assert.deepEqual(
+    tasksBannerNotices({ offline: false, countStaleProjects: undefined, totalProjects: 3 }),
+    []
+  );
+});
+
+// ── tasksBannerNoticesFor: the ONE mapping from DF_DATA's /tasks keys ────────
+// The Tasks-tab banner and the System health Taskmaster row both read the
+// /tasks fan-out through it, so they cannot disagree about it.
+
+test('tasksBannerNoticesFor: a global outage reads TASKS_OFFLINE and names the failed root', () => {
+  const notices = tasksBannerNoticesFor({
+    TASKS_OFFLINE: true,
+    TASKS_OFFLINE_PROJECTS: ['a'],
+    TASKS_PROJECT_COUNT: 2,
+  });
+
+  assert.deepEqual(kinds(notices), ['global']);
+  assert.ok(notices[0].text.endsWith(' (a)'), notices[0].text);
+});
+
+test('tasksBannerNoticesFor: each per-root list maps to its own notice, counted against TASKS_PROJECT_COUNT', () => {
+  const notices = tasksBannerNoticesFor({
+    TASKS_OFFLINE: false,
+    TASKS_OFFLINE_PROJECTS: ['a'],
+    TASKS_DEGRADED_PROJECTS: ['b'],
+    TASKS_COUNT_UNKNOWN_PROJECTS: ['c'],
+    TASKS_COUNT_STALE_PROJECTS: ['d'],
+    TASKS_PROJECT_COUNT: 9,
+  });
+
+  assert.deepEqual(kinds(notices), ['partial', 'degraded', 'count-unknown', 'count-stale']);
+  for (const notice of notices) assert.ok(notice.text.includes('1 of 9'), notice.text);
+});
+
+test('tasksBannerNoticesFor: a DF_DATA with every /tasks key absent produces no notice', () => {
+  // The pre-fetch seed and the poll-scope driver's proxy both look like this.
+  assert.deepEqual(tasksBannerNoticesFor({}), []);
+});
+
+test('tasksBannerNoticesFor is tasksBannerNotices over the same keys', () => {
+  const data = {
+    TASKS_OFFLINE: false,
+    TASKS_OFFLINE_PROJECTS: ['a', 'b'],
+    TASKS_DEGRADED_PROJECTS: ['c'],
+    TASKS_COUNT_UNKNOWN_PROJECTS: [],
+    TASKS_COUNT_STALE_PROJECTS: ['d'],
+    TASKS_PROJECT_COUNT: 5,
+  };
+
+  assert.deepEqual(
+    tasksBannerNoticesFor(data),
+    tasksBannerNotices({
+      offline: false,
+      offlineProjects: ['a', 'b'],
+      degradedProjects: ['c'],
+      countUnknownProjects: [],
+      countStaleProjects: ['d'],
+      totalProjects: 5,
+    }),
+  );
+});
+
+test('tasksBannerNoticesFor reads exactly the six /tasks keys, so no runtime-probe fact can enter the pipeline', () => {
+  // tab_tasks.jsx hands DF_DATA over whole, so this is the one place the
+  // input set is decided. A probe fact folded in here would be suppressed by
+  // the offline short-circuit (test_tab_tasks_runtime.py::
+  // test_probe_banner_is_not_a_tasksbannernotices_kind).
+  const read = new Set();
+  const data = new Proxy({ TASKS_PROJECT_COUNT: 3, RUNTIME_PROBE: { status: 'timeout' } }, {
+    get(target, key) {
+      if (typeof key === 'string') read.add(key);
+      return target[key];
+    },
+  });
+
+  tasksBannerNoticesFor(data);
+
+  assert.deepEqual([...read].sort(), [
+    'TASKS_COUNT_STALE_PROJECTS',
+    'TASKS_COUNT_UNKNOWN_PROJECTS',
+    'TASKS_DEGRADED_PROJECTS',
+    'TASKS_OFFLINE',
+    'TASKS_OFFLINE_PROJECTS',
+    'TASKS_PROJECT_COUNT',
+  ]);
 });

@@ -1,0 +1,12 @@
+{
+  "task_id": "5172",
+  "reason": "Move, not new coupling: _spy_post_merge_verify was a drifted clone in test_merge_queue_deep_dispatch.py and test_merge_queue_deep_integration_gate.py and now has one home in _merge_deep_scene.py; both consumers keep other _run_post_merge_verify patch sites, so their per-file rows and the patch_targets union total are unchanged and only the shared scene's distinct count rises 1->2.",
+  "measures": [
+    {
+      "measure": "patch_targets",
+      "key": "orchestrator/tests/_merge_deep_scene.py",
+      "baseline": 1,
+      "current": 2
+    }
+  ]
+}

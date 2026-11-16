@@ -34,7 +34,7 @@ from types import SimpleNamespace
 
 import pytest
 from shared import toolcall_markup
-from shared.mcp_markup_middleware import OUTCOMES
+from shared.mcp_markup_middleware import MARKUP_RECURRENCE_ROUTING, OUTCOMES
 
 from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
@@ -280,8 +280,8 @@ class TestEmitMarkupStormEscalation:
         assert 'toolcall-markup-containment-prd.md' in routing_text, (
             f'must route the burst at the live successor PRD: {payload!r}'
         )
-        assert '3083' in routing_text, (
-            f'must still name DF 3083, as the closed predecessor: {payload!r}'
+        assert MARKUP_RECURRENCE_ROUTING in detail, (
+            f'must carry the ONE shared routing sentence, not a local copy: {detail!r}'
         )
         # The count's key is outcome-NEUTRAL and static (task 4505): this one
         # filer serves all three of the middleware's outcomes, and a key naming
@@ -806,7 +806,7 @@ class TestEmitMarkupStormEscalation:
         )
         # The routing survives — the grep is demoted, not the destination.
         assert 'plans/toolcall-markup-containment-prd.md' in action, action
-        assert '3083 is done and closed to appends' in action, action
+        assert MARKUP_RECURRENCE_ROUTING in action, action
 
     def test_the_remedy_is_still_static(self, tmp_path):
         """Never interpolated with the resolved values, and the reason is old.
@@ -1063,3 +1063,37 @@ class TestDelegatesToTheSharedHelper:
 
         assert seen['category'] == 'mcp_markup_residue'
         assert seen['level'] == 2
+
+
+# ---------------------------------------------------------------------------
+# Where the residue record sends a recurrence.
+#
+# Appended at end of file, per this module's own convention above.
+# ---------------------------------------------------------------------------
+
+
+class TestTheResidueRecordRouting:
+    """The residue filer routes through the shared sentence (task 5698)."""
+
+    def test_the_residue_record_routes_a_recurrence_through_the_shared_sentence(
+        self, tmp_path,
+    ):
+        """Driven through the REAL queue: the routing lives in the record an
+        operator reads, so read that record back off disk."""
+        pytest.importorskip('escalation')
+
+        esc_id = markup_tripwire.emit_markup_residue_escalation(
+            str(tmp_path),
+            {'tool': 'add_memory', 'field': 'content', 'raw_value': 'payload bytes'},
+        )
+
+        assert esc_id is not None
+        files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(files) == 1, f'expected exactly one escalation file, found: {files}'
+        payload = json.loads(files[0].read_text())
+        assert payload['id'] == esc_id
+        assert 'toolcall-markup-containment-prd.md' in payload['detail']
+        assert MARKUP_RECURRENCE_ROUTING in payload['detail'], (
+            f'must carry the ONE shared routing sentence, not a local copy: '
+            f'{payload["detail"]!r}'
+        )

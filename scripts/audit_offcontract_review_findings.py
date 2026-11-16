@@ -46,7 +46,13 @@ from collections import Counter
 from pathlib import Path
 from typing import NamedTuple
 
-DEFAULT_ROOT = Path("/home/leo/src/dark-factory/.worktrees/.task-meta")
+import _checkout as _checkout
+from shared.project_layout import default_project_root
+
+
+def default_root() -> Path:
+    return default_project_root() / ".worktrees" / ".task-meta"
+
 
 #: The one place that knows the live tree's layout. Named rather than inlined
 #: because a zero-file census has to be able to SAY what it looked for: the
@@ -459,8 +465,9 @@ def validate_report(report: dict) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
-    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT,
-                        help="task-meta tree to census (default: %(default)s)")
+    parser.add_argument("--root", type=Path, default=None,
+                        help="task-meta tree to census (default: the main checkout's "
+                             ".worktrees/.task-meta)")
     parser.add_argument("--json", action="store_true", help="emit the census as JSON")
     parser.add_argument("--validate", type=Path, metavar="REPORT",
                         help="validate a triage report against its frozen roster")
@@ -473,9 +480,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{len(violations)} violation(s) in {args.validate}")
         return 1 if violations else 0
 
+    root = args.root if args.root is not None else default_root()
     try:
-        measured = census(args.root)
-        population = select_population(args.root)
+        measured = census(root)
+        population = select_population(root)
     except NotADirectoryError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -486,13 +494,13 @@ def main(argv: list[str] | None = None) -> int:
     # cannot re-derive.
     if args.json:
         print(json.dumps({
-            "root": str(args.root), "glob": VERDICT_GLOB,
+            "root": str(root), "glob": VERDICT_GLOB,
             **measured._asdict(),
             "triage_population": len(population.issues),
             "triage_unselectable": population.unselectable,
         }, indent=2))
     else:
-        print(f"root: {args.root}")
+        print(f"root: {root}")
         print(f"  glob: {VERDICT_GLOB}")
         for field, value in measured._asdict().items():
             print(f"  {field}: {value}")

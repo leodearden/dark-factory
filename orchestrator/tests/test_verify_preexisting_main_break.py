@@ -14,15 +14,15 @@ introduced by this task).  Tests are organised as:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import subprocess
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from _main_probe_doubles import PROBE_MODULES, MainProbeHarness
 
 from orchestrator import verify as verify_module
-from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, WorktreeKind
 from orchestrator.verify import VerifyResult
 
@@ -69,6 +69,17 @@ DIFFERENT_RESULT = VerifyResult(
     cause_hint='AssertionError in test_bar',
     category='test_failure',
 )
+
+
+def _seed_probe_verdict(failing: VerifyResult, verdict: bool) -> None:
+    """Pre-seed verify's signature-probe cache: *failing* on MAIN_SHA is *verdict*."""
+    import time as time_module
+
+    from orchestrator import verify as verify_module
+    from orchestrator.workflow import _normalize_cause_hint as _norm
+
+    key = (MAIN_SHA, failing.category or '', _norm(failing.cause_hint))
+    verify_module._PROBE_CACHE[key] = (time_module.monotonic(), verdict)
 
 
 def _make_config(tmp_path: Path) -> OrchestratorConfig:
@@ -886,101 +897,10 @@ class TestMainBaselineFailingIds:
 # registered (unchanged) command, all inside ONE MAIN_PROBE worktree.
 # ---------------------------------------------------------------------------
 
-RED_PROBE_MODULES = {
-    prefix: ModuleConfig(
-        prefix=prefix, test_command=f'pytest {prefix.lower()}/tests',
-        lint_command=None, type_check_command=None,
-    )
-    for prefix in ('A', 'B', 'C')
-}
-
-
-class _MainProbeHarness:
-    """Doubles for probing main: a recording MAIN_PROBE worktree, a per-module
-    main-side ``run_verification`` and a whole-tree ``run_scoped_verification``.
-
-    ``main_ids[prefix]`` is what that module fails on main: a list, ``None``
-    (no junit collected) or an exception to raise. ``whole_tree_ids`` left at
-    ``None`` means the whole-tree probe must not run.
-    """
-
-    def __init__(self, tmp_path: Path) -> None:
-        self.config = _make_config(tmp_path)
-        self.main_ids: dict[str, list[str] | None | Exception] = {}
-        self.whole_tree_ids: list[str] | None = None
-        self.worktrees: list[tuple[WorktreeKind, str, bool]] = []
-        self.module_runs: list[tuple[ModuleConfig, dict]] = []
-        self.whole_tree_runs: list[dict] = []
-        self.git_ops = MagicMock()
-        self.git_ops.ephemeral_worktree = self._ephemeral_worktree
-        self.git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
-        self._probe_dir = tmp_path / 'main-probe'
-        self._probe_dir.mkdir()
-        self._held: dict[str, tuple[asyncio.Event, asyncio.Event]] = {}
-
-    def hold(self, prefix: str) -> tuple[asyncio.Event, asyncio.Event]:
-        """Park *prefix*'s main-side runs; returns (entered, release).
-
-        *entered* is set once a run has parked, and setting *release* lets it answer.
-        """
-        entered, release = asyncio.Event(), asyncio.Event()
-        self._held[prefix] = (entered, release)
-        return entered, release
-
-    @contextlib.asynccontextmanager
-    async def _ephemeral_worktree(self, kind, sha, *, warm_seed=False):
-        self.worktrees.append((kind, sha, warm_seed))
-        yield self._probe_dir
-
-    async def run_verification(self, worktree, config, module_config=None, **kwargs):
-        assert module_config is not None
-        self.module_runs.append((module_config, kwargs))
-        if module_config.prefix in self._held:
-            entered, release = self._held[module_config.prefix]
-            entered.set()
-            await release.wait()
-        outcome = self.main_ids[module_config.prefix]
-        if isinstance(outcome, Exception):
-            raise outcome
-        return VerifyResult(
-            passed=not outcome, test_output='', lint_output='', type_output='',
-            summary='main side', failing_test_ids=outcome,
-            failing_test_ids_by_module=(
-                None if outcome is None else {module_config.prefix: outcome}
-            ),
-        )
-
-    async def run_scoped_verification(self, worktree, config, module_configs, task_files=None, **kwargs):
-        self.whole_tree_runs.append({'task_files': task_files, **kwargs})
-        if self.whole_tree_ids is None:
-            raise AssertionError('the whole-tree probe must not run on this path')
-        return VerifyResult(
-            passed=False, test_output='', lint_output='', type_output='',
-            summary='main side', failing_test_ids=self.whole_tree_ids,
-        )
-
-    async def probe(self, *red_module_prefixes: str) -> frozenset[str] | None:
-        return await verify_module.main_baseline_failing_ids(
-            self.config, list(RED_PROBE_MODULES.values()), self.git_ops, MAIN_SHA,
-            red_module_prefixes=frozenset(red_module_prefixes),
-        )
-
-    def baseline(self, *red_module_prefixes: str) -> frozenset[str] | None:
-        return asyncio.run(self.probe(*red_module_prefixes))
-
-    def probed_prefixes(self) -> list[str]:
-        return [mc.prefix for mc, _ in self.module_runs]
-
-
 @pytest.fixture
 def main_probe(tmp_path: Path):
-    harness = _MainProbeHarness(tmp_path)
-    with (
-        patch.object(verify_module, 'run_verification', side_effect=harness.run_verification),
-        patch.object(
-            verify_module, 'run_scoped_verification', side_effect=harness.run_scoped_verification,
-        ),
-    ):
+    harness = MainProbeHarness(_make_config(tmp_path), MAIN_SHA, tmp_path / 'main-probe')
+    with harness.patched():
         yield harness
 
 
@@ -989,7 +909,7 @@ class TestMainBaselineRedModuleProbe:
     with the command the branch gate ran, never an id-selected one."""
 
     def test_only_the_red_module_is_probed_with_its_registered_command(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.main_ids = {'B': ['b1']}
 
@@ -997,14 +917,14 @@ class TestMainBaselineRedModuleProbe:
 
         assert main_probe.worktrees == [(WorktreeKind.MAIN_PROBE, MAIN_SHA, True)]
         [(module_config, kwargs)] = main_probe.module_runs
-        assert module_config == RED_PROBE_MODULES['B']
+        assert module_config == PROBE_MODULES['B']
         assert module_config.test_command == 'pytest b/tests'
         assert kwargs.get('role') == 'merge'
         assert kwargs.get('max_retries') == 0
         assert kwargs.get('is_merge_verify') is not True
         assert main_probe.whole_tree_runs == []
 
-    def test_a_known_module_is_not_probed_again(self, main_probe: _MainProbeHarness) -> None:
+    def test_a_known_module_is_not_probed_again(self, main_probe: MainProbeHarness) -> None:
         main_probe.main_ids = {'B': ['b1'], 'C': ['c1']}
         main_probe.baseline('B')
 
@@ -1017,7 +937,7 @@ class TestMainBaselineRedModuleProbe:
         assert len(main_probe.worktrees) == 2
 
     def test_red_modules_share_one_worktree_and_their_ids_are_unioned(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.main_ids = {'A': ['a1'], 'C': ['c1', 'c2']}
 
@@ -1026,21 +946,21 @@ class TestMainBaselineRedModuleProbe:
         assert sorted(main_probe.probed_prefixes()) == ['A', 'C']
         assert len(main_probe.worktrees) == 1
 
-    def test_a_whole_tree_seed_answers_without_probing(self, main_probe: _MainProbeHarness) -> None:
+    def test_a_whole_tree_seed_answers_without_probing(self, main_probe: MainProbeHarness) -> None:
         verify_module.seed_main_baseline(MAIN_SHA, frozenset())
 
         assert main_probe.baseline('B') == frozenset()
         assert main_probe.worktrees == []
         assert main_probe.module_runs == []
 
-    def test_no_red_module_needs_no_probe(self, main_probe: _MainProbeHarness) -> None:
+    def test_no_red_module_needs_no_probe(self, main_probe: MainProbeHarness) -> None:
         assert main_probe.baseline() == frozenset()
         assert main_probe.worktrees == []
         assert main_probe.module_runs == []
         assert main_probe.whole_tree_runs == []
 
     def test_an_unregistered_prefix_falls_back_to_the_whole_tree_probe(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.whole_tree_ids = ['m::1']
 
@@ -1053,7 +973,7 @@ class TestMainBaselineRedModuleProbe:
         assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) == frozenset({'m::1'})
 
     def test_a_module_that_collects_nothing_degrades_and_is_not_cached(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.main_ids = {'B': None, 'C': ['c1']}
 
@@ -1067,7 +987,7 @@ class TestMainBaselineRedModuleProbe:
         assert len(main_probe.module_runs) == probes_so_far
 
     def test_a_probe_that_raises_degrades_and_caches_nothing(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.main_ids = {'B': RuntimeError('probe blew up')}
 
@@ -1077,7 +997,7 @@ class TestMainBaselineRedModuleProbe:
         assert main_probe.probed_prefixes() == ['B', 'B']
 
     def test_the_peek_answers_only_scopes_it_knows_completely(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         peek = verify_module.cached_main_baseline_failing_ids
         main_probe.main_ids = {'B': ['b1']}
@@ -1103,7 +1023,7 @@ class TestMainBaselineRedModuleProbe:
         assert verify_module.known_failing_ids_on_main(MAIN_SHA) == frozenset({'w'})
 
     def test_a_degraded_module_leaves_its_scope_unknown(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         peek = verify_module.cached_main_baseline_failing_ids
         main_probe.main_ids = {'B': None, 'C': ['c1']}
@@ -1115,12 +1035,12 @@ class TestMainBaselineRedModuleProbe:
         assert verify_module.known_failing_ids_on_main(MAIN_SHA) == frozenset({'c1'})
 
     def test_without_red_modules_the_whole_tree_probe_runs(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.whole_tree_ids = ['w1']
 
         served = asyncio.run(verify_module.main_baseline_failing_ids(
-            main_probe.config, list(RED_PROBE_MODULES.values()), main_probe.git_ops, MAIN_SHA,
+            main_probe.config, list(PROBE_MODULES.values()), main_probe.git_ops, MAIN_SHA,
         ))
 
         assert served == frozenset({'w1'})
@@ -1128,7 +1048,7 @@ class TestMainBaselineRedModuleProbe:
         assert main_probe.module_runs == []
 
     def test_concurrent_probes_of_one_sha_keep_each_others_modules(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.main_ids = {'B': ['b1'], 'C': ['c1']}
         b_entered, b_release = main_probe.hold('B')
@@ -1145,7 +1065,7 @@ class TestMainBaselineRedModuleProbe:
             MAIN_SHA, red_module_prefixes=frozenset({'B', 'C'}),
         ) == frozenset({'b1', 'c1'})
 
-    def test_a_seed_landing_mid_probe_is_kept(self, main_probe: _MainProbeHarness) -> None:
+    def test_a_seed_landing_mid_probe_is_kept(self, main_probe: MainProbeHarness) -> None:
         main_probe.main_ids = {'B': ['b1']}
         b_entered, b_release = main_probe.hold('B')
 
@@ -1207,17 +1127,17 @@ class TestPreexistingForkProbesOnlyRedModules:
 
     @staticmethod
     def _classify(
-        main_probe: _MainProbeHarness, tmp_path: Path, failing_result: VerifyResult,
+        main_probe: MainProbeHarness, tmp_path: Path, failing_result: VerifyResult,
     ) -> tuple[bool, str]:
         worktree = tmp_path / 'task-wt'
         worktree.mkdir()
         return asyncio.run(verify_module.verify_failure_is_preexisting_on_main(
-            worktree, main_probe.config, list(RED_PROBE_MODULES.values()),
+            worktree, main_probe.config, list(PROBE_MODULES.values()),
             ['b/src/x.py'], failing_result, main_probe.git_ops,
         ))
 
     def test_red_ids_wholly_on_main_in_their_one_module(
-        self, main_probe: _MainProbeHarness, tmp_path: Path,
+        self, main_probe: MainProbeHarness, tmp_path: Path,
     ) -> None:
         main_probe.main_ids = {'B': ['b1', 'b2']}
         branch = self._branch_red(['b1'], {'A': [], 'B': ['b1'], 'C': []})
@@ -1226,7 +1146,7 @@ class TestPreexistingForkProbesOnlyRedModules:
         assert main_probe.probed_prefixes() == ['B']
 
     def test_a_red_id_main_does_not_have_blames_the_branch(
-        self, main_probe: _MainProbeHarness, tmp_path: Path,
+        self, main_probe: MainProbeHarness, tmp_path: Path,
     ) -> None:
         main_probe.main_ids = {'B': []}
         branch = self._branch_red(['b1'], {'A': [], 'B': ['b1'], 'C': []})
@@ -1235,7 +1155,7 @@ class TestPreexistingForkProbesOnlyRedModules:
         assert main_probe.probed_prefixes() == ['B']
 
     def test_two_red_modules_are_answered_by_their_union(
-        self, main_probe: _MainProbeHarness, tmp_path: Path,
+        self, main_probe: MainProbeHarness, tmp_path: Path,
     ) -> None:
         main_probe.main_ids = {'A': ['a1'], 'C': ['c1']}
         branch = self._branch_red(['a1', 'c1'], {'A': ['a1'], 'C': ['c1']})
@@ -1254,7 +1174,7 @@ class TestPreexistingForkProbesOnlyRedModules:
     )
     def test_unattributable_red_ids_fall_back_to_the_whole_tree_probe(
         self,
-        main_probe: _MainProbeHarness,
+        main_probe: MainProbeHarness,
         tmp_path: Path,
         failing_test_ids: list[str],
         by_module: dict[str, list[str]] | None,
@@ -1269,7 +1189,7 @@ class TestPreexistingForkProbesOnlyRedModules:
         assert main_probe.module_runs == []
 
     def test_a_red_with_no_failing_ids_needs_no_probe(
-        self, main_probe: _MainProbeHarness, tmp_path: Path,
+        self, main_probe: MainProbeHarness, tmp_path: Path,
     ) -> None:
         branch = self._branch_red([], {'A': []})
 
@@ -2339,10 +2259,7 @@ class TestPreexistingVerdictDowngradedByIsolatedRerun:
     def test_cache_hit_path_untouched(self, tmp_path: Path) -> None:
         """(step-7d) A pre-seeded _PROBE_CACHE True entry short-circuits to
         (True, MAIN_SHA) without running the probe or the gate."""
-        import time as time_module
-
         from orchestrator import verify as verify_module
-        from orchestrator.workflow import _normalize_cause_hint as _norm
 
         config = _make_config(tmp_path)
         worktree = tmp_path / 'task-wt'
@@ -2351,9 +2268,7 @@ class TestPreexistingVerdictDowngradedByIsolatedRerun:
         mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
         mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
 
-        _norm_hint = _norm(FAILING_RESULT.cause_hint)
-        _cache_key = (MAIN_SHA, FAILING_RESULT.category or '', _norm_hint)
-        verify_module._PROBE_CACHE[_cache_key] = (time_module.monotonic(), True)
+        _seed_probe_verdict(FAILING_RESULT, True)
 
         scoped_probe_mock = AsyncMock(return_value=PASSING_RESULT)
         isolated_rerun_mock = AsyncMock(return_value=PASSING_RESULT)
@@ -2371,3 +2286,362 @@ class TestPreexistingVerdictDowngradedByIsolatedRerun:
         assert result == (True, MAIN_SHA), result
         scoped_probe_mock.assert_not_awaited()
         isolated_rerun_mock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Test 11 — step-11 (task 3226): the PARALLEL per-main-SHA SKIPPED-id baseline
+#           cache.  A skipped test id is evidence that main NEVER RAN that
+#           test — categorically different from "main ran it and it passed",
+#           which is all the failing-id baseline can express.  Without a
+#           second cache the bare-main probe's SKIP is indistinguishable from
+#           a PASS (the 2026-07-29 reify-allowlist incident's shape).
+#
+#           Deliberately a PARALLEL dict rather than a widened
+#           _BASELINE_FAILING_IDS_CACHE value tuple: the 2-tuple shape is
+#           pinned by test_merge_queue_main_health.py's
+#           _BASELINE_FAILING_IDS_CACHE['abcsha'] unpack, and
+#           seed_main_baseline's 2-arg call is pinned by every existing
+#           caller.
+# ---------------------------------------------------------------------------
+
+
+class TestMainBaselineSkippedIds:
+    """seed_main_baseline's *skipped* side and cached_main_baseline_skipped_ids
+    mirror the failing-side pair.  A skipped entry always describes the same
+    run as the failing entry seeded beside it; a run with no skip evidence
+    leaves the skipped side UNKNOWN (None), never a confident empty set."""
+
+    def test_seed_then_cached_round_trips_a_frozenset(self) -> None:
+        """seed_main_baseline(sha, ..., skipped=ids) -> cached_main_baseline_skipped_ids(sha)
+        returns exactly those ids as a frozenset."""
+        from orchestrator import verify as verify_module
+
+        verify_module.seed_main_baseline(MAIN_SHA, (), skipped=['t::a', 't::b', 't::a'])
+
+        got = verify_module.cached_main_baseline_skipped_ids(MAIN_SHA)
+        assert got == frozenset({'t::a', 't::b'}), f'expected the seeded ids; got {got!r}'
+        assert isinstance(got, frozenset), f'expected a frozenset; got {type(got).__name__}'
+
+    def test_unseeded_sha_returns_none(self) -> None:
+        """An sha that was never probed/seeded is None — NOT an empty set.  The
+        distinction matters: empty means "main was probed and skipped nothing",
+        None means "we know nothing about main", and only the former licenses
+        a confident task-fault verdict."""
+        from orchestrator import verify as verify_module
+
+        assert verify_module.cached_main_baseline_skipped_ids('neverseensha') is None
+
+    def test_entry_is_evicted_together_with_its_failing_side(self) -> None:
+        """A skipped entry leaves the cache with the failing entry it was seeded
+        beside — one recency bound for both sides, so a merge-seeded sha never
+        has a warm failing baseline and a forgotten skipped one."""
+        from orchestrator import verify as verify_module
+
+        verify_module.seed_main_baseline(MAIN_SHA, ['t::fails'], skipped=['t::stale'])
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) == frozenset({'t::stale'})
+
+        for n in range(1000):
+            verify_module.seed_main_baseline(f'sha-{n:04d}', frozenset())
+
+        assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) is None
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) is None, (
+            'an evicted sha must not keep a skipped entry'
+        )
+
+    def test_one_probe_seeds_both_caches(self, tmp_path: Path) -> None:
+        """A single cache-miss probe of bare main seeds the failing AND the
+        skipped baseline — one probe, two caches, so a later cache-only peek at
+        either side sees the same sha as probed."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        probe_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed',
+            failing_test_ids=['m::fails'],
+            skipped_test_ids=['m::skipped', 'm::also_skipped'],
+        )
+
+        async def _fake_verify(*args, **kwargs) -> VerifyResult:
+            return probe_result
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', side_effect=_fake_verify),
+            patch('orchestrator.git_ops._run', side_effect=_fake_git_run),
+        ):
+            failing = asyncio.run(
+                verify_module.main_baseline_failing_ids(config, [], git_ops, MAIN_SHA)
+            )
+
+        assert failing == frozenset({'m::fails'})
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) == frozenset(
+            {'m::skipped', 'm::also_skipped'}
+        ), 'the same probe must seed the skipped baseline'
+
+    def test_probe_with_no_skip_evidence_leaves_the_skipped_side_unknown(
+        self, tmp_path: Path,
+    ) -> None:
+        """A probe whose skipped_test_ids is None collected no skip evidence, so
+        the skipped side reads None ("unknown"), NOT frozenset() ("main skipped
+        nothing") — the latter is a claim that run never made."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        probe_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed',
+            failing_test_ids=['m::fails'],
+            skipped_test_ids=None,
+        )
+
+        async def _fake_verify(*args, **kwargs) -> VerifyResult:
+            return probe_result
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', side_effect=_fake_verify),
+            patch('orchestrator.git_ops._run', side_effect=_fake_git_run),
+        ):
+            asyncio.run(
+                verify_module.main_baseline_failing_ids(config, [], git_ops, MAIN_SHA)
+            )
+
+        assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) == frozenset({'m::fails'})
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) is None, (
+            'a None skipped_test_ids is unknown and must not seed a confident empty set'
+        )
+
+    def test_omitting_skipped_records_unknown_not_an_empty_set(self) -> None:
+        """A caller that forgets skipped= must not quietly record "main skipped
+        nothing"."""
+        from orchestrator import verify as verify_module
+
+        verify_module.seed_main_baseline(MAIN_SHA, ['t::fails'])
+
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) is None
+
+    def test_reseeding_without_skip_evidence_forgets_the_old_skipped_entry(self) -> None:
+        """The skipped entry describes the same run as the failing entry, or is
+        absent: a later seed with no skip evidence must not leave an earlier
+        run's skipped ids paired with its own failing ids."""
+        from orchestrator import verify as verify_module
+
+        verify_module.seed_main_baseline(MAIN_SHA, ['t::old'], skipped=['t::old_skip'])
+        verify_module.seed_main_baseline(MAIN_SHA, ['t::new'], skipped=None)
+
+        assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) == frozenset({'t::new'})
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) is None
+
+    def test_degraded_probe_seeds_neither_cache(self, tmp_path: Path) -> None:
+        """The B3 degrade (failing_test_ids is None) still caches nothing on
+        EITHER side — the early return above the seed call is untouched."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = GitOps(config.git, config.project_root)
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        opaque = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='opaque failure', failing_test_ids=None, skipped_test_ids=['m::s'],
+        )
+
+        async def _fake_verify(*args, **kwargs) -> VerifyResult:
+            return opaque
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', side_effect=_fake_verify),
+            patch('orchestrator.git_ops._run', side_effect=_fake_git_run),
+        ):
+            result = asyncio.run(
+                verify_module.main_baseline_failing_ids(config, [], git_ops, 'degradedsha')
+            )
+
+        assert result is None
+        assert verify_module.cached_main_baseline_skipped_ids('degradedsha') is None, (
+            'a degraded (B3) probe must not seed the skipped side either'
+        )
+
+    def test_the_two_populations_stay_apart(self) -> None:
+        """One seed fills both sides without mixing them: the failing ids read
+        back only as failing, the skipped ids only as skipped.  The 2-arg call
+        is itself the arity pin — every pre-3226 caller seeds positionally."""
+        from orchestrator import verify as verify_module
+
+        verify_module.seed_main_baseline(MAIN_SHA, ['t::fails'], skipped=['t::skips'])
+
+        assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) == frozenset({'t::fails'})
+        assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) == frozenset({'t::skips'})
+
+
+# ---------------------------------------------------------------------------
+# Test 12 — step-13 (task 3226): the id-diff fast path must not read a SKIP as
+#           a PASS.  `is_wholly_preexisting` returning False means "some
+#           branch-failing id is absent from main's FAILING baseline" — which
+#           conflates two very different worlds:
+#
+#             main RAN it and it passed  -> the branch broke it (task fault)
+#             main NEVER RAN it (skipped) -> the diff proves nothing
+#
+#           Only the first licenses the confident `(False, '')` task-fault
+#           verdict.  This is the exact shape of the 2026-07-29 incident: a
+#           guard that skips on one side of the comparison and is pass-shaped
+#           on the other.  When EVERY new id is unattributable the function
+#           must FALL THROUGH to the legacy (category, cause_hint) signature
+#           comparison instead of blaming the branch; one id main ran green
+#           is enough to blame it.
+# ---------------------------------------------------------------------------
+
+
+class TestIdDiffFastPathSkippedOnMainGuard:
+    """Cases seed BOTH real baselines (so main_baseline_failing_ids is a cache
+    hit and no probe worktree is ever minted) and seed _PROBE_CACHE with a
+    known signature verdict, so "did we fall through?" is observable in the
+    returned tuple rather than inferred."""
+
+    # A failing result whose (category, cause_hint) signature is what the
+    # seeded _PROBE_CACHE entries below are keyed on.
+    CATEGORY = 'test_failure'
+    CAUSE_HINT = 'AssertionError in t::x'
+
+    def _run(
+        self,
+        tmp_path: Path,
+        branch_ids: list[str],
+        main_failing: set[str],
+        main_skipped: set[str],
+        signature_verdict: bool,
+    ) -> tuple[tuple[bool, str], AsyncMock]:
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        worktree = tmp_path / 'task-wt'
+        worktree.mkdir()
+        mock_git_ops = GitOps(config.git, config.project_root)
+        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+
+        verify_module.seed_main_baseline(MAIN_SHA, main_failing, skipped=main_skipped)
+
+        failing_result = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed',
+            cause_hint=self.CAUSE_HINT, category=self.CATEGORY,
+            failing_test_ids=branch_ids,
+        )
+        _seed_probe_verdict(failing_result, signature_verdict)
+        # Would mint a probe worktree if the seeded _PROBE_CACHE entry were
+        # somehow missed — asserted un-awaited so a real probe can't hide.
+        legacy_probe_mock = AsyncMock(return_value=DIFFERENT_RESULT)
+
+        with (
+            patch.object(verify_module, 'run_scoped_verification', new=legacy_probe_mock),
+            patch.object(mock_git_ops, 'get_main_sha', new=AsyncMock(return_value=MAIN_SHA)),
+        ):
+            result = asyncio.run(
+                verify_module.verify_failure_is_preexisting_on_main(
+                    worktree, config, [], ['src/foo.py'], failing_result, mock_git_ops,
+                )
+            )
+        return result, legacy_probe_mock
+
+    def test_branch_failure_skipped_on_main_falls_through_not_task_fault(
+        self, tmp_path: Path,
+    ) -> None:
+        """THE BUG.  The branch fails t::skipped_on_main; main's FAILING
+        baseline lacks it but main's SKIPPED baseline has it.  Main never RAN
+        that test, so the id diff carries no evidence either way — the
+        confident task-fault verdict must NOT be returned from the diff."""
+        result, legacy_probe_mock = self._run(
+            tmp_path,
+            branch_ids=['t::skipped_on_main'],
+            main_failing=set(),
+            main_skipped={'t::skipped_on_main'},
+            signature_verdict=True,
+        )
+
+        assert result == (True, MAIN_SHA), (
+            'a branch-failing id that main SKIPPED is unattributable — the fast '
+            'path must fall through to the signature comparison (which here says '
+            f"preexisting), not return the task-fault verdict; got {result!r}"
+        )
+        legacy_probe_mock.assert_not_awaited()
+
+    def test_id_main_ran_and_passed_still_returns_task_fault(self, tmp_path: Path) -> None:
+        """Byte-identical to today: an id absent from BOTH baselines means main
+        RAN it and it passed, so the branch broke it.  The seeded _PROBE_CACHE
+        entry says (True, MAIN_SHA) — getting (False, '') proves the fast path
+        returned directly rather than falling through."""
+        result, legacy_probe_mock = self._run(
+            tmp_path,
+            branch_ids=['t::genuinely_new'],
+            main_failing=set(),
+            main_skipped={'t::unrelated_skip'},
+            signature_verdict=True,
+        )
+
+        assert result == (False, ''), (
+            f"an id main ran and passed must still blame the branch; got {result!r}"
+        )
+        legacy_probe_mock.assert_not_awaited()
+
+    def test_wholly_preexisting_is_unchanged(self, tmp_path: Path) -> None:
+        """Branch failures wholly contained in main's failing baseline still
+        return (True, main_sha) from the early return, untouched.  The seeded
+        signature verdict is False here, so a fall-through would show up as
+        (False, '')."""
+        result, legacy_probe_mock = self._run(
+            tmp_path,
+            branch_ids=['t::red_on_main'],
+            main_failing={'t::red_on_main', 't::other'},
+            main_skipped={'t::red_on_main'},
+            signature_verdict=False,
+        )
+
+        assert result == (True, MAIN_SHA), (
+            f'the wholly-preexisting early return must be untouched; got {result!r}'
+        )
+        legacy_probe_mock.assert_not_awaited()
+
+    def test_an_id_main_ran_green_blames_the_branch_beside_a_skipped_one(
+        self, tmp_path: Path,
+    ) -> None:
+        """A branch-failing set MIXING a genuinely-new id with a skipped-on-main
+        id is task fault: the id main ran green is positive evidence on its
+        own, and the skipped id cannot cancel it.  The seeded signature verdict
+        says preexisting, so a fall-through would show up as (True, MAIN_SHA).
+        This is the same partition the merge-queue block reason counts by."""
+        result, legacy_probe_mock = self._run(
+            tmp_path,
+            branch_ids=['t::genuinely_new', 't::skipped_on_main'],
+            main_failing=set(),
+            main_skipped={'t::skipped_on_main'},
+            signature_verdict=True,
+        )
+
+        assert result == (False, ''), (
+            f'an id main ran green must blame the branch; got {result!r}'
+        )
+        legacy_probe_mock.assert_not_awaited()
+
+    def test_only_the_new_ids_need_be_skipped_on_main_to_fall_through(
+        self, tmp_path: Path,
+    ) -> None:
+        """An id already red on main is not new; when every NEW id was skipped
+        on main the diff proves nothing and the signature comparison decides."""
+        result, legacy_probe_mock = self._run(
+            tmp_path,
+            branch_ids=['t::red_on_main', 't::skipped_on_main'],
+            main_failing={'t::red_on_main'},
+            main_skipped={'t::skipped_on_main'},
+            signature_verdict=True,
+        )
+
+        assert result == (True, MAIN_SHA), (
+            f'every new id was skipped on main, so the probe must decide; got {result!r}'
+        )
+        legacy_probe_mock.assert_not_awaited()

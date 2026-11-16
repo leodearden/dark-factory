@@ -7,6 +7,7 @@ fakes, passed through ``run_census``'s own parameters.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import random
@@ -16,23 +17,44 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import census as mod
 import pytest
 from legibility import (
     census_identity,
+    census_report,
+    census_run,
     census_window,
     config,
+    embeddings,
     inventory,
+    landing_gate,
     session_ledger,
     trickle_state,
     unlanded,
 )
 from legibility.session_ledger import CodedBy, LedgerRow, Outcome
+from legibility_census_scaffold import journaled, narrowing, with_seams
+from legibility_task_store_fake import FakeTaskStore
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _NOW = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
 _DATE = "2026-10-06"
 _RUN_ID = "census-p-20261006"
 _EMPTY_JUDGMENT = json.dumps({"matches": [], "candidates": []})
+_LANDED = unlanded.CommitResult(ok=True, sha="f" * 40, stderr="", attempts=1)
+_EMPTY_SYNTHESIS = json.dumps(
+    {"new": [], "re_observed": [], "phase_refinements": [], "corrections": [], "notes": []},
+)
+_ONE_HOT_AXES = itertools.count()
+
+
+def _distinct_one_hot_embed(texts, *, model):
+    """An embed_fn under which no two texts are ever similar: each text gets
+    a one-hot vector on an axis no earlier text was given."""
+    axes = [next(_ONE_HOT_AXES) for _ in texts]
+    width = max(axes, default=-1) + 1
+    return [[1.0 if index == axis else 0.0 for index in range(width)] for axis in axes]
 
 
 @pytest.fixture(autouse=True)
@@ -63,18 +85,15 @@ def _write_session(directory: Path, cwd: str, sid: str, *, day: date, signal: bo
 class _Recorder:
     """A seam fake that records its keyword calls and returns *result*."""
 
-    def __init__(self, result=None, *, raises: Exception | None = None, effect=None):
+    def __init__(self, result=None, *, effect=None):
         self.calls: list[dict[str, Any]] = []
         self._result = result
-        self._raises = raises
         self._effect = effect
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args, **kwargs) -> Any:
         self.calls.append(kwargs)
         if self._effect is not None:
             self._effect()
-        if self._raises is not None:
-            raise self._raises
         return self._result
 
 
@@ -91,6 +110,23 @@ class _Invoke:
 
     def mined(self, sessions) -> list[str]:
         return sorted(sid for sid in sessions for prompt in self.prompts if sid in prompt)
+
+
+class _DeletingInvoke(_Invoke):
+    """The miner/probe seam: *session*'s digest asks to delete an entry, every
+    other prompt gets an empty judgment."""
+
+    def __init__(self, session: str):
+        super().__init__()
+        self._session = session
+
+    def __call__(self, prompt, model):
+        if self._session not in prompt:
+            return super().__call__(prompt, model)
+        self.prompts.append(prompt)
+        return json.dumps({
+            "matches": [{"entry_id": "entry-a", "action": "delete"}], "candidates": [],
+        })
 
 
 class _Census:
@@ -139,17 +175,26 @@ class _Census:
         """``run_census`` keywords mining *source* (a fresh window source by
         default), whose selection ``selection_of`` reports."""
         source = source if source is not None else self.source()
-        kwargs: dict[str, Any] = dict(
+        effects = census_run.CensusEffects(
             batch_source=source,
             selection_of=lambda: source.selection,
             invoke=_Invoke(),
             verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
-            synthesize_fn=lambda verified, *, model: "No novel clusters this census.",
+            synthesize_fn=lambda brief, *, model: _EMPTY_SYNTHESIS,
+            embedder=embeddings.Embedder(
+                embed_fn=_distinct_one_hot_embed, cache_path=embeddings.cache_path("p"),
+            ),
             submit_fn=_Recorder({"ticket": "tkt_1"}),
-            escalate_fn=_Recorder(),
+            task_store=FakeTaskStore(),
             status_fetcher=lambda: {"statuses": {}},
-            commit=_Recorder(),
+            escalate_fn=_Recorder(),
+            gate=lambda: landing_gate.GateVerdict(landing_gate.GateStatus.PASSED, ("true",), 0),
+            commit=_Recorder(_LANDED),
             roll_back=_Recorder(unlanded.Rollback(quarantine_dir=None, paths=())),
+        )
+        effects, overrides = with_seams(effects, overrides)
+        kwargs: dict[str, Any] = dict(
+            effects=effects,
             codebook_dict={"version": 2, "entries": [], "candidates": []},
             config=self.cfg,
             project_root=self.cwd,
@@ -177,6 +222,11 @@ def census(tmp_path):
     return _Census(tmp_path)
 
 
+_done = narrowing(census_run.Done)
+_deferred = narrowing(census_run.Deferred)
+_unlanded = narrowing(census_run.Unlanded)
+
+
 def _record_of(report_path: Path) -> tuple[str, dict[str, Any]]:
     text = report_path.with_suffix(".json").read_text(encoding="utf-8")
     return text, json.loads(text)
@@ -186,16 +236,16 @@ def test_the_run_writes_its_record_first_and_renders_the_report_from_it(census):
     census.session("S-tango")
     kwargs = census.kwargs()
 
-    outcome = mod.run_census(**kwargs)
+    outcome = census_run.run_census(**kwargs)
 
-    assert outcome.status == "done"
+    outcome = _done(outcome)
     report_path = kwargs["report_path"]
     record_path = report_path.with_suffix(".json")
     assert outcome.record_path == str(record_path)
     text, record = _record_of(report_path)
-    assert report_path.read_text(encoding="utf-8") == mod.render_report(json.loads(text))
+    assert report_path.read_text(encoding="utf-8") == census_report.render_report(json.loads(text))
     assert record["run_id"] == _RUN_ID
-    [commit] = kwargs["commit"].calls
+    [commit] = kwargs["effects"].commit.calls
     assert set(commit["paths"]) >= {
         str(report_path), str(record_path), str(census.codebook_path), str(census.state_path),
     }
@@ -205,7 +255,7 @@ def test_the_method_records_the_selection_and_the_state_its_watermark(census):
     census.session("S-tango")
     source = census.source()
 
-    mod.run_census(**census.kwargs(source=source))
+    census_run.run_census(**census.kwargs(source=source))
 
     _, record = _record_of(census.report_path())
     selection = source.selection
@@ -230,9 +280,9 @@ def test_any_source_whose_selection_is_declared_is_ledgered(census):
     window_source = census.source()
     pre_rendered = list(window_source)
 
-    outcome = mod.run_census(**census.kwargs(source=window_source, batch_source=pre_rendered))
+    outcome = _done(census_run.run_census(**census.kwargs(source=window_source, batch_source=pre_rendered)))
 
-    assert outcome.ledger_rows_written == 1
+    assert outcome.ledger == census_run.Ledgered(rows=1)
     assert census.ledger_rows() == [("S-tango", "census", _RUN_ID)]
     state = json.loads(census.state_path.read_text(encoding="utf-8"))
     assert window_source.selection is not None
@@ -245,7 +295,7 @@ def test_row1_a_trickle_coded_session_is_skipped_and_the_rest_ledgered(census):
     census.trickle_row("S-sierra")
     invoke = _Invoke()
 
-    outcome = mod.run_census(**census.kwargs(invoke=invoke))
+    outcome = _done(census_run.run_census(**census.kwargs(invoke=invoke)))
 
     _, record = _record_of(census.report_path())
     assert record["method"]["evidence"]["skipped_coded"] == 1
@@ -254,8 +304,7 @@ def test_row1_a_trickle_coded_session_is_skipped_and_the_rest_ledgered(census):
         ("S-sierra", "trickle", "trickle-p-20261005"),
         ("S-tango", "census", _RUN_ID),
     ]
-    assert outcome.ledger_rows_written == 1
-    assert outcome.ledger_write_error is None
+    assert outcome.ledger == census_run.Ledgered(rows=1)
 
 
 def test_row2_a_capped_run_is_resumed_by_the_next(census):
@@ -263,9 +312,9 @@ def test_row2_a_capped_run_is_resumed_by_the_next(census):
     for sid in sessions:
         census.session(sid)
 
-    first = mod.run_census(**census.kwargs(
+    first = _done(census_run.run_census(**census.kwargs(
         source=census.source(batch_size=2), max_batches=1,
-    ))
+    )))
 
     assert first.stop_reason == "capped"
     first_rows = census.ledger_rows()
@@ -274,7 +323,7 @@ def test_row2_a_capped_run_is_resumed_by_the_next(census):
 
     second_invoke = _Invoke()
     second_report = census.report_path(f"confusion-census-{_DATE}-2")
-    mod.run_census(**census.kwargs(
+    census_run.run_census(**census.kwargs(
         source=census.source(batch_size=2),
         invoke=second_invoke,
         report_path=second_report,
@@ -294,7 +343,7 @@ def test_row4_a_zero_signal_session_is_never_mined(census):
     census.session("S-zulu", signal=False)
     invoke = _Invoke()
 
-    mod.run_census(**census.kwargs(invoke=invoke))
+    census_run.run_census(**census.kwargs(invoke=invoke))
 
     assert invoke.mined(["S-tango", "S-zulu"]) == ["S-tango"]
     _, record = _record_of(census.report_path())
@@ -305,26 +354,61 @@ def test_an_unlanded_commit_rolls_back_the_record_and_ledgers_nothing(census):
     census.session("S-tango")
     roll_back = _Recorder(unlanded.Rollback(quarantine_dir=None, paths=()))
     kwargs = census.kwargs(
-        commit=_Recorder(raises=RuntimeError("pre-commit refused")), roll_back=roll_back,
+        commit=_Recorder(unlanded.CommitResult(
+            ok=False, sha=None, stderr="pre-commit refused", attempts=1,
+        )),
+        roll_back=roll_back,
     )
 
-    outcome = mod.run_census(**kwargs)
+    outcome = census_run.run_census(**kwargs)
 
-    assert outcome.status == "unlanded"
-    assert outcome.record_path is None
+    outcome = _unlanded(outcome)
+    assert not hasattr(outcome, "record_path")
     [call] = roll_back.calls
     assert str(kwargs["report_path"].with_suffix(".json")) in call["paths"]
     assert census.ledger_rows() == []
 
 
+def test_row16_a_landed_run_ledgers_its_sessions_last(census):
+    census.session("S-tango")
+    kwargs = census.kwargs()
+    report_path = kwargs["report_path"]
+    journal: list[str] = []
+    kwargs["effects"] = journaled(
+        kwargs["effects"], journal,
+        labels={report_path.with_suffix(".json"): "write record", report_path: "write report"},
+    )
+
+    outcome = _done(census_run.run_census(**kwargs))
+
+    assert outcome.ledger == census_run.Ledgered(rows=1)
+    assert journal == [
+        "write record", "write report", "dump codebook", "advance state", "gate", "commit", "ledger",
+    ]
+
+
+def test_row3_a_deletion_shaped_coding_is_skipped_and_never_ledgered(census):
+    """A skipped coding was never merged, so its session is not marked coded:
+    the next census mines it again. The rest of the run lands and ledgers."""
+    census.session("S-sierra")
+    census.session("S-tango")
+
+    outcome = census_run.run_census(**census.kwargs(invoke=_DeletingInvoke("S-sierra")))
+
+    outcome = _done(outcome)
+    assert [skipped.session for skipped in outcome.skipped_deletions] == ["S-sierra"]
+    assert census.ledger_rows() == [("S-tango", "census", _RUN_ID)]
+    assert outcome.ledger == census_run.Ledgered(rows=1)
+
+
 def test_a_preflight_defer_ledgers_nothing(census):
     census.session("S-tango")
 
-    outcome = mod.run_census(**census.kwargs(
+    outcome = census_run.run_census(**census.kwargs(
         invoke=_Invoke("You have reached your usage limit for this period."),
     ))
 
-    assert outcome.status == "deferred"
+    outcome = _deferred(outcome)
     assert session_ledger.read_ledger(census.ledger_path).total_rows is None
 
 
@@ -335,12 +419,13 @@ def test_a_ledger_write_failure_after_the_commit_is_reported_not_raised(census, 
         census.ledger_path.write_bytes(b"this is not a sqlite database")
 
     with caplog.at_level(logging.WARNING):
-        outcome = mod.run_census(**census.kwargs(commit=_Recorder(effect=clobber_ledger)))
+        outcome = census_run.run_census(
+            **census.kwargs(commit=_Recorder(_LANDED, effect=clobber_ledger)),
+        )
 
-    assert outcome.status == "done"
-    assert outcome.ledger_rows_written is None
-    assert outcome.ledger_write_error is not None
-    assert str(census.ledger_path) in outcome.ledger_write_error
+    outcome = _done(outcome)
+    assert isinstance(outcome.ledger, census_run.LedgerFailed)
+    assert str(census.ledger_path) in outcome.ledger.error
     ledger_warnings = [
         r for r in caplog.records
         if r.levelno == logging.WARNING and str(census.ledger_path) in r.getMessage()
@@ -354,7 +439,7 @@ def test_row3_a_second_run_on_one_day_gets_its_own_identity_and_files(census):
     first = census_identity.allocate_run_identity(
         project_id="p", day=_NOW.date(), plans_dir=plans, taken_run_ids=frozenset(),
     )
-    mod.run_census(**census.kwargs(report_path=plans / f"{first.basename}.md", run_id=first.run_id))
+    census_run.run_census(**census.kwargs(report_path=plans / f"{first.basename}.md", run_id=first.run_id))
     first_files = [plans / f"{first.basename}{suffix}" for suffix in (".md", ".json")]
     first_bytes = [path.read_bytes() for path in first_files]
 
@@ -362,7 +447,7 @@ def test_row3_a_second_run_on_one_day_gets_its_own_identity_and_files(census):
     second = census_identity.allocate_run_identity(
         project_id="p", day=_NOW.date(), plans_dir=plans, taken_run_ids=frozenset({first.run_id}),
     )
-    mod.run_census(
+    census_run.run_census(
         **census.kwargs(report_path=plans / f"{second.basename}.md", run_id=second.run_id),
     )
 

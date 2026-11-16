@@ -16,7 +16,7 @@ from _fm_helpers import (
     make_zero_byte_task_store,
 )
 
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreUnpopulated
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_tasks.py'
 
@@ -407,7 +407,7 @@ class TestFindNearDuplicateGroupsEdgeCases:
 
     def test_result_is_deterministic(self):
         """Shuffling input order should yield the same groups (sorted by min ID)."""
-        import random  # noqa: PLC0415
+        import random
         tasks = [
             _task('170', 'Deploy backend service'),
             _task('171', 'Deploy backend services'),
@@ -543,7 +543,7 @@ class TestPickSurvivorEdgeCases:
 
     def test_deterministic_with_shuffled_input(self):
         """Shuffling input order always yields the same survivor."""
-        import random  # noqa: PLC0415
+        import random
         group = [
             _task('270', 'Work item', priority='high'),
             _task('271', 'Work item', priority='medium'),
@@ -702,7 +702,7 @@ class TestApplyChangesCancellations:
 
     async def test_set_task_status_called_once_per_cancellation(self):
         """Each cancellation ID triggers exactly one set_task_status('cancelled') call."""
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         backend = MagicMock()
         backend.set_task_status = AsyncMock(return_value={})
@@ -726,7 +726,7 @@ class TestApplyChangesCancellations:
 
     async def test_no_cancellations_set_task_status_not_called(self):
         """Empty cancellations list → set_task_status never awaited."""
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         backend = MagicMock()
         backend.set_task_status = AsyncMock(return_value={})
@@ -745,7 +745,7 @@ class TestApplyChangesDependencyUpdates:
 
     async def test_remove_dependency_called_per_update(self):
         """Each dep update triggers a remove_dependency call."""
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         backend = MagicMock()
         backend.set_task_status = AsyncMock(return_value={})
@@ -765,7 +765,7 @@ class TestApplyChangesDependencyUpdates:
 
     async def test_add_dependency_not_called_when_add_dep_is_none(self):
         """When add_dep is None, add_dependency must not be called."""
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         backend = MagicMock()
         backend.set_task_status = AsyncMock(return_value={})
@@ -789,7 +789,7 @@ class TestApplyChangesDependencyUpdates:
         Uses 2 cancellations and 2 dep updates so a single index check can't
         mask future interleaving: asserts max(cancel_indices) < min(dep_indices).
         """
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         call_order: list[str] = []
 
@@ -831,7 +831,7 @@ class TestApplyChangesDependencyUpdates:
 
     async def test_partial_failure_does_not_abort_remaining_ops(self):
         """A failing set_task_status should not prevent subsequent operations."""
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         backend = MagicMock()
         backend.set_task_status = AsyncMock(side_effect=RuntimeError('Taskmaster offline'))
@@ -859,7 +859,7 @@ class TestApplyChangesDependencyUpdates:
 
     async def test_remove_failure_skips_add_and_counts_one_error(self):
         """When remove_dependency raises, add_dependency must NOT be called and the error is counted once."""
-        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+        from unittest.mock import AsyncMock, MagicMock
 
         backend = MagicMock()
         backend.set_task_status = AsyncMock(return_value={})
@@ -1204,7 +1204,7 @@ class _RecordingBackendFactory:
     def __init__(self):
         self.constructions: list[object] = []
 
-    def __call__(self, taskmaster_config=None, **kwargs):  # noqa: ARG002
+    def __call__(self, taskmaster_config=None, **kwargs):
         self.constructions.append(taskmaster_config)
         return _FakeRunBackend()
 
@@ -1223,7 +1223,7 @@ class _FakeRunBackend:
     async def close(self):
         self.closed = True
 
-    async def get_tasks(self, project_root, tag=None):  # noqa: ARG002
+    async def get_tasks(self, project_root, tag=None):
         self.get_tasks_calls.append(project_root)
         return {'tasks': []}
 
@@ -1276,7 +1276,7 @@ class TestRunTargetStorePreflight:
             'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', factory,
         )
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_args(tmp_path, apply=apply))
 
         # Refused BEFORE the backend was constructed — reaching get_tasks is
@@ -1293,7 +1293,7 @@ class TestRunTargetStorePreflight:
             _RecordingBackendFactory(),
         )
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_args(tmp_path, apply=False))
 
         assert not (tmp_path / '.taskmaster').exists()
@@ -1313,7 +1313,7 @@ class TestRunTargetStorePreflight:
             'fused_memory.backends.sqlite_task_backend.SqliteTaskBackend', factory,
         )
 
-        with pytest.raises(TargetStoreMissing):
+        with pytest.raises(TargetStoreUnpopulated):
             await _mod._run(_args(tmp_path, apply=False))
 
         assert factory.constructions == []

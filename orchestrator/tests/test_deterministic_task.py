@@ -96,9 +96,12 @@ class _StoreScheduler:
         fields into task['metadata'] (async)
       - ``release(task_id, *, requeued=False)`` — no-op (sync)
       - ``is_deterministic`` — staticmethod delegating to Scheduler.is_deterministic
+      - ``is_paused`` / ``pause_reason`` — never paused (task 5311's re-pend flag reads them)
     """
 
     is_deterministic = staticmethod(Scheduler.is_deterministic)
+    is_paused = False
+    pause_reason: str | None = None
 
     def __init__(self) -> None:
         self._tasks: dict[str, dict] = {}
@@ -557,7 +560,7 @@ class TestB4Proceed:
         queue.resolve(pending[0].id, resolution='proceed')
 
         # Re-pend via the production resume path (stamps preserved — NOT cleared)
-        await h._action_teardown_and_set_status(task_id, 'pending', 'resume')
+        await h._action_teardown_and_set_status(task_id, 'pending', 'resume', escalation_id=f'esc-{task_id}-1')
 
     async def test_resume_dispatch_returns_done(self, det_harness: Harness) -> None:
         """Re-dispatch after resolve → report.outcome == DONE."""
@@ -657,7 +660,7 @@ class TestB5NoGo:
         gate_in_store.setdefault('dependencies', []).append({'id': str(n_id)})
 
         # Restart: clears gate_escalated_at + sets gate status to 'pending'
-        await h._action_teardown_and_set_status(gate_id, 'pending', 'restart')
+        await h._action_teardown_and_set_status(gate_id, 'pending', 'restart', escalation_id=f'esc-{gate_id}-1')
 
     async def test_restart_clears_gate_escalated_at(self, det_harness: Harness) -> None:
         """gate_escalated_at is cleared after restart (stamp-clear mechanism, I2/B5)."""

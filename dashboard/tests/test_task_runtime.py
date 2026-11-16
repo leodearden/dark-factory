@@ -476,8 +476,9 @@ class TestTransportErrorFamilyIsContained:
             httpx.ReadError('connection reset by peer'),
             httpx.RemoteProtocolError('server disconnected without response'),
             httpx.WriteError('broken pipe'),
+            OSError('network is unreachable'),
         ],
-        ids=['read_error', 'remote_protocol_error', 'write_error'],
+        ids=['read_error', 'remote_protocol_error', 'write_error', 'os_error'],
     )
     async def test_transport_error_degrades_only_that_project(self, exc):
         from dashboard.data.task_runtime import fetch_task_runtime
@@ -636,4 +637,48 @@ class TestProbeOneTimeoutBudget:
         assert timeouts == [5.0, 5.0, 5.0], (
             f"the probe budget must reach every post, not httpx's 10s "
             f'default, got {timeouts}'
+        )
+
+
+class TestSilentOrchestratorSessionEviction:
+    """A probe whose tools/call goes silent must not leave its session cached.
+
+    Composition guard over task 4958: ``_probe_one`` never invalidates a
+    session itself, so the eviction must come from ``mcp_tool_call`` whether
+    the hang surfaces as a cancellation (an equal outer bound) or as
+    ``httpx.ReadTimeout`` (an outer bound at ``enclosing_deadline``).
+    """
+
+    async def test_silent_orchestrator_is_reinitialised_on_the_next_poll(self):
+        from dashboard.data.task_runtime import fetch_task_runtime
+
+        handshakes = 0
+
+        async def silent_after_handshake(request: httpx.Request) -> httpx.Response:
+            nonlocal handshakes
+            body = json.loads(request.content)
+            method = body.get('method', '')
+            if method == 'initialize':
+                handshakes += 1
+                return mcp_init_response(body.get('id', 1))
+            if method.startswith('notifications/'):
+                return mcp_notify_response()
+            await asyncio.sleep(request.extensions['timeout']['read'])
+            raise httpx.ReadTimeout('')
+
+        transport = httpx.MockTransport(silent_after_handshake)
+        async with httpx.AsyncClient(transport=transport) as client:
+            polls = [
+                await fetch_task_runtime(
+                    client, _urls(8120), per_call_timeout=_PROBE_DEADLINE_SECONDS,
+                )
+                for _ in range(2)
+            ]
+
+        assert [p['proj8120'].offline_reason for p in polls] == [
+            'deadline_exceeded', 'deadline_exceeded',
+        ]
+        assert handshakes == 2, (
+            'the second poll must re-initialise rather than reuse the session '
+            f'whose tools/call went silent; saw {handshakes} initialize request(s)'
         )

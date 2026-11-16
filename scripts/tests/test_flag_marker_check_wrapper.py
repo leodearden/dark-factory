@@ -15,6 +15,13 @@ unit or before_done predicate wired to it today (the watch gate is retired,
 task 3923), so the defect was LATENT rather than observed here directly --
 these tests pin the same absolute-uv-resolution fix so a future re-wiring
 doesn't reinherit it.
+
+Task 3498 ratified this wrapper's surviving role (an ad-hoc census
+instrument) and made its read-only claim a property rather than prose: the
+wrapper refuses ``--apply`` with its own rc=3. Refusing that one literal is
+complete only because the sweep's parser rejects abbreviations of it, which
+fused-memory/tests/test_sweep_orphan_flag_markers_cli.py pins next to that
+parser.
 """
 from __future__ import annotations
 
@@ -156,16 +163,24 @@ def test_wrapper_passes_extra_args_through(tmp_path):
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
     argv = _recorded_calls(state_path)[0]
-    assert "--project-id" in argv and "reify" in argv, f"argv={argv!r}"
-    assert "--max-backlog" in argv and "0" in argv, f"argv={argv!r}"
+    assert argv[1:] == [
+        "--check", "--project-id", "reify", "--max-backlog", "0",
+    ], (
+        f"Expected --check injected ahead of the caller's args, with their "
+        f"relative order preserved; argv={argv!r}"
+    )
 
 
 def test_wrapper_propagates_nonzero_exit(tmp_path):
+    """Relayed verbatim, not merely non-zero: since task 3923 rc=1 is a
+    verdict (backlog over the ceiling, or an observed blind spot), and a
+    normalised code would make it indistinguishable from a crash."""
     result, _state_path = _run_wrapper(tmp_path, exit_code=1)
 
-    assert result.returncode != 0, (
-        f"Expected a non-zero wrapper exit when the check command fails; "
-        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == 1, (
+        f"Expected the sweep's own rc=1 relayed verbatim, got "
+        f"{result.returncode}; stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
     )
 
 
@@ -558,3 +573,76 @@ def test_wrapper_resolves_uv_after_sourcing_dotenv_so_env_can_supply_uv_bin(tmp_
         f"Expected the uv named by .env to actually be invoked; "
         f"stderr={result.stderr!r}"
     )
+
+
+
+
+# --------------------------------------------------------------------------
+# Task 3498: the advertised read-only contract, enforced.
+# --------------------------------------------------------------------------
+
+def test_check_wrapper_refuses_apply(tmp_path):
+    """`--check --apply` parses fine in the sweep, so without the guard an
+    `--apply --terminal-drain` through this "read-only" wrapper ran a
+    destructive drain. The refusal is the wrapper's own rc=3, raised before
+    the sweep is invoked at all.
+
+    Run under an empty PATH (see _empty_path_dir), with the recorder named
+    by an absolute interpreter so a regressed guard would still reach it:
+    the refusal diagnostic must name the wrapper without any external
+    binary."""
+    recorder = tmp_path / "bin" / "fake-check-recorder"
+    result, state_path = _run_wrapper(
+        tmp_path,
+        args=["--project-id", "reify", "--apply", "--terminal-drain"],
+        extra_env={
+            "PATH": _empty_path_dir(tmp_path),
+            "FLAG_MARKER_SWEEP_CMD": f"{sys.executable} {recorder}",
+        },
+    )
+
+    assert result.returncode == 3, (
+        f"Expected the wrapper's own rc=3 refusal, distinct from the sweep's "
+        f"0/1/2 verdict codes; got {result.returncode}; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert _recorded_calls(state_path) == [], (
+        f"Expected the sweep to NOT be invoked at all when --apply is "
+        f"refused; calls={_recorded_calls(state_path)!r}"
+    )
+    assert "fused-memory-flag-marker-check.sh refuses '--apply'" in result.stderr, (
+        f"Expected a diagnostic naming the wrapper and the offending "
+        f"argument; stderr={result.stderr!r}"
+    )
+    assert "fused-memory-flag-marker-sweep.sh" in result.stderr, (
+        f"Expected the diagnostic to point the operator at the destructive "
+        f"counterpart wrapper; stderr={result.stderr!r}"
+    )
+
+
+def test_check_wrapper_allows_non_apply_args(tmp_path):
+    """The refusal must match WHOLE arguments, never a substring:
+    --no-fail-on-blind-spot (census-only relaxation of task 3923's veto)
+    and a value that merely contains the text 'apply' both pass through
+    untouched."""
+    result, state_path = _run_wrapper(
+        tmp_path,
+        args=[
+            "--project-id", "apply-test",
+            "--max-backlog", "0",
+            "--no-fail-on-blind-spot",
+        ],
+    )
+
+    assert result.returncode == 0, (
+        f"Expected non---apply arguments to pass through untouched; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    calls = _recorded_calls(state_path)
+    assert len(calls) == 1, f"calls={calls!r}"
+    assert calls[0][1:] == [
+        "--check",
+        "--project-id", "apply-test",
+        "--max-backlog", "0",
+        "--no-fail-on-blind-spot",
+    ], f"argv={calls[0]!r}"

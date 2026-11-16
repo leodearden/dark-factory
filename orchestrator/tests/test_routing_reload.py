@@ -47,20 +47,7 @@ from orchestrator.config import (
     load_config,
 )
 
-
-@pytest.fixture(autouse=True)
-def _isolated_config_env(monkeypatch, tmp_path):
-    """Every OrchestratorConfig()/load_config() call in this module reads
-    ONLY the package's shipped defaults.yaml (plus, where applicable, this
-    test's own explicit YAML) -- no stray project config.yaml, no ambient
-    ORCH_CONFIG_PATH. Mirrors test_routing_resolver.py's per-module
-    convention. load_config(<explicit path>) always overwrites
-    ORCH_CONFIG_PATH itself before constructing, so this fixture's setenv is
-    only load-bearing for the direct OrchestratorConfig() construction calls
-    below.
-    """
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+pytestmark = pytest.mark.usefixtures("code_default_config")
 
 
 class TestRoutingNewLeavesAreReloadable:

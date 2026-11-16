@@ -23,6 +23,7 @@ import copy
 import json
 import logging
 from datetime import datetime, timedelta
+from unittest.mock import create_autospec
 
 import pytest
 import pytest_asyncio
@@ -32,7 +33,9 @@ from fused_memory.backends.sqlite_task_backend import (
     _MACHINE_AUTHORED_METADATA_KEYS,
     SqliteTaskBackend,
     stamp_pending_since,
+    task_timestamp_now,
 )
+from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.config.schema import TaskmasterConfig
 
 _LOGGER_NAME = 'fused_memory.backends.sqlite_task_backend'
@@ -727,18 +730,21 @@ class TestPendingSinceBatchIdentity:
     exactly what a tolerance-based assertion would wave through.
     """
 
-    async def _stack(self, tmp_path):
+    async def _interceptor_over(self, backend, tmp_path):
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.event_buffer import EventBuffer
 
-        cfg = TaskmasterConfig(project_root=str(tmp_path))
-        backend = SqliteTaskBackend(cfg)
-        await backend.start()
         event_buffer = EventBuffer(
             db_path=tmp_path / 'batch_eb.db', buffer_size_threshold=100,
         )
         await event_buffer.initialize()
-        interceptor = TaskInterceptor(backend, None, event_buffer)
+        return TaskInterceptor(backend, None, event_buffer), event_buffer
+
+    async def _stack(self, tmp_path):
+        cfg = TaskmasterConfig(project_root=str(tmp_path))
+        backend = SqliteTaskBackend(cfg)
+        await backend.start()
+        interceptor, event_buffer = await self._interceptor_over(backend, tmp_path)
         return interceptor, backend, event_buffer
 
     async def _anchors(self, backend, project_root, ids) -> list[str | None]:
@@ -843,6 +849,51 @@ class TestPendingSinceBatchIdentity:
         finally:
             await backend.close()
             await event_buffer.close()
+
+    @pytest.mark.asyncio
+    async def test_csv_flip_to_pending_runs_on_a_protocol_shaped_backend(self, tmp_path):
+        """Any backend implementing exactly TaskBackendProtocol survives the batch.
+
+        The double's call signatures are the protocol's own, so a keyword the
+        interceptor forwards without the protocol declaring it fails here.
+        """
+        statuses = {'1': TaskStatus.DEFERRED, '2': TaskStatus.DEFERRED}
+
+        async def get_task(task_id, project_root, tag=None):
+            return {'id': task_id, 'status': statuses[task_id], 'title': 't', 'metadata': {}}
+
+        async def set_task_status(task_id, status, project_root, tag=None, **_kw):
+            statuses[task_id] = status
+            return {
+                'message': 'ok',
+                'tasks': [{'taskId': task_id, 'oldStatus': 'deferred', 'newStatus': status}],
+            }
+
+        tm = create_autospec(TaskBackendProtocol, instance=True)
+        tm.get_task.side_effect = get_task
+        tm.set_task_status.side_effect = set_task_status
+        tm.get_tasks.return_value = {'tasks': []}
+
+        interceptor, event_buffer = await self._interceptor_over(tm, tmp_path)
+        try:
+            before = task_timestamp_now()
+            result = await interceptor.set_task_status('1,2', TaskStatus.PENDING, '/project')
+            after = task_timestamp_now()
+        finally:
+            await event_buffer.close()
+
+        assert result['success'] is True
+        assert all(one['result'].get('error') is None for one in result['results'])
+        assert statuses == {'1': TaskStatus.PENDING, '2': TaskStatus.PENDING}
+        batch_clocks = {
+            call.kwargs['pending_since_now'] for call in tm.set_task_status.call_args_list
+        }
+        assert len(batch_clocks) == 1
+        (batch_clock,) = batch_clocks
+        assert len(batch_clock) == len(before) and before <= batch_clock <= after, (
+            'the batch clock must be one task_timestamp_now() reading taken '
+            f'during the flip; got {batch_clock!r} outside [{before!r}, {after!r}]'
+        )
 
 
 class TestPendingSinceIsMachineAuthored:

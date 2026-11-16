@@ -14,17 +14,26 @@
 # maintenance action must run under the SERVICE env, not a bare shell, or the
 # census silently narrows), then passes caller args through -- e.g.
 # --project-id reify --max-backlog 0.
-# Exit code only: 0 = verdict holds; 1 = EITHER the residual source-tagged
-# backlog exceeds --max-backlog OR an OBSERVED enumeration blind spot vetoed
-# the verdict (see below). Both causes share rc=1 -- the emitted JSON's
-# cross_check block is what distinguishes them, so a consumer that needs to
-# tell them apart must read it rather than infer from the code alone. (A
-# distinct code for the veto was considered and declined: rc is
-# sweep_orphan_flag_markers.py's own, and the orchestrator's before_done
-# path renders any rc!=0 identically as a predicate violation, so a third
-# code would buy separability nowhere it is consumed.)
-# The VERDICT is the exit code; the orchestrator parses no
-# output to reach it. It does, however, READ the output: on rc=0 it extracts
+# Exit codes. 0/1/2 are sweep_orphan_flag_markers.py's own, relayed
+# verbatim: 0 = verdict holds; 1 = EITHER the residual source-tagged backlog
+# exceeds --max-backlog OR an OBSERVED enumeration blind spot vetoed the
+# verdict (see below); 2 = argparse rejected the arguments. The two rc=1
+# causes share one code -- the emitted JSON's cross_check block is what
+# distinguishes them, so a consumer that needs to tell them apart must read
+# it rather than infer from the code alone. (A distinct code for the VETO
+# specifically was considered and declined: rc is the sweep's own, and the
+# orchestrator's before_done path renders any rc!=0 identically as a
+# predicate violation, so splitting the verdict would buy separability
+# nowhere it is consumed.)
+# 3 = REFUSED (task 3498): an --apply spelling reached this read-only
+# wrapper. Unlike the codes above it is the WRAPPER's own, raised by the
+# guard below before the sweep is invoked at all -- so rc=3 is never a
+# verdict about the marker population and carries no census output. It sits
+# outside the sweep's 0/1/2 range deliberately, so a refusal cannot be
+# misread as a backlog verdict.
+#
+# The VERDICT is the exit code; the orchestrator parses no output to reach
+# it. It does, however, READ the output: on rc=0 it extracts
 # a bounded structured summary (a trailing JSON block, else one clean final
 # line, log lines dropped) into done_provenance.note, and on rc!=0 it carries
 # the output verbatim in the escalation detail. This header previously
@@ -59,11 +68,27 @@
 # emptiness fails forever -- the same footgun as --max-backlog 0 against
 # undated markers, below.
 #
-# Unlike the nightly sweep wrapper this performs NO deletions (--check
-# without --apply is a dry-run census + verdict), so resolve/resume re-runs
-# are harmless. It also means the verdict HERE compares before.total_source
-# -- the WHOLE enumerated residual, since nothing is deleted -- so a ceiling
-# tuned to the structural floor alone is not enough for this wrapper.
+# Unlike the nightly sweep wrapper this performs NO deletions, and since
+# task 3498 that is ENFORCED rather than merely documented: the guard below
+# REFUSES --apply, exiting 3 before the sweep is invoked at all. This
+# wrapper passes caller args straight through and the sweep accepts
+# --check --apply together, so the guard is what makes the no-deletions
+# claim true. Refusing the one literal is complete because
+# fused-memory/scripts/sweep_orphan_flag_markers.py::_build_parser sets
+# allow_abbrev=False, so a prefix such as --appl reaches the sweep only to
+# be rejected there with rc=2. Because no
+# argv this wrapper forwards can delete, resolve/resume re-runs of THIS
+# wrapper are harmless.
+#
+# Use scripts/fused-memory-flag-marker-sweep.sh for the deletion path. The
+# guard closes THIS entry point only: the nightly wrapper still execs the
+# same script with --apply --terminal-drain under the systemd timer, where
+# delete_orphan_markers' protected-record guards and tombstone write (task
+# 4435) are what bound it.
+#
+# Because nothing is deleted, the verdict HERE compares before.total_source
+# -- the WHOLE enumerated residual -- so a ceiling tuned to the structural
+# floor alone is not enough for this wrapper.
 # NOTE that floor: part of the enumerated population cannot be drained by
 # ANY invocation of the sweep, and since task 4436 the sweep CHECKS it
 # (structural_floor.gate_unsatisfiable in the JSON, plus an ERROR naming the
@@ -94,6 +119,19 @@ set +a
 export CONFIG_PATH="${CONFIG_PATH:-$FM/config/config.yaml}"
 export PROJECT_ROOT="${PROJECT_ROOT:-$REPO}"
 export FALKORDB_URI="${FALKORDB_URI:-redis://localhost:6379}"
+
+# Enforce the read-only contract this wrapper advertises (task 3498; see the
+# header for why the one literal suffices). Match WHOLE arguments, so a
+# value like `--project-id apply-test` passes through untouched.
+for arg in "$@"; do
+    if [ "$arg" = "--apply" ]; then
+        echo "ERROR: ${0##*/} refuses '--apply': this is the read-only" \
+             "census wrapper and performs no deletions." >&2
+        echo "       Use scripts/fused-memory-flag-marker-sweep.sh for the" \
+             "destructive drain path." >&2
+        exit 3
+    fi
+done
 
 if [ -n "${FLAG_MARKER_SWEEP_CMD:-}" ]; then
   # The documented test seam: an unquoted expansion so a multi-word prefix

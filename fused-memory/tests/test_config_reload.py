@@ -33,6 +33,7 @@ from fused_memory.config.schema import (
     FusedMemoryConfig,
 )
 from fused_memory.server.entity_mint_authz import resolve_entity_mint_authorization
+from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_guard_enabled,
     resolve_near_dup_threshold,
@@ -452,8 +453,17 @@ class TestReloadConfigTool:
         assert svc.config.reconciliation.stale_run_recovery_seconds == flagship_before
 
 
+
+def _refusal(svc: Any) -> str:
+    error = resolve_mem0_update_authorization(
+        svc, agent_id='rando', content_amend=True, metadata_patch=False,
+    ).error
+    assert isinstance(error, str)
+    return error
+
+
 class TestMem0UpdateLeavesAreGreenTier:
-    """All five mem0_update.* leaves must hot-apply (task 3088).
+    """Every mem0_update.* leaf must hot-apply (task 3088).
 
     Modelled on TestWriteTriageLeavesAreGreenTier below — the direct precedent
     for registering TOP-LEVEL (non-reconciliation.*) leaves. The existing
@@ -470,6 +480,7 @@ class TestMem0UpdateLeavesAreGreenTier:
         'mem0_update.enabled',
         'mem0_update.content_amend_allowed_agent_prefixes',
         'mem0_update.metadata_patch_allowed_agent_prefixes',
+        'mem0_update.agent_prefix_sanctioned_use',
         'mem0_update.storm_threshold',
         'mem0_update.storm_window_seconds',
     )
@@ -488,6 +499,10 @@ class TestMem0UpdateLeavesAreGreenTier:
             (
                 'mem0_update.metadata_patch_allowed_agent_prefixes',
                 ['recon-stage-', 'curator-', 'auditor-'],
+            ),
+            (
+                'mem0_update.agent_prefix_sanctioned_use',
+                {'auditor-': 'an audit sitting'},
             ),
             ('mem0_update.storm_threshold', 5),
             ('mem0_update.storm_window_seconds', 600.0),
@@ -508,13 +523,42 @@ class TestMem0UpdateLeavesAreGreenTier:
         assert d.applied_candidates[path] == {'old': old, 'new': new_value}
         assert path not in d.restart_required
 
+    @pytest.mark.asyncio
+    async def test_sanctioned_use_yaml_edit_is_rendered_live_via_reload_config(
+        self, tmp_path, monkeypatch,
+    ):
+        config_yaml = tmp_path / 'config.yaml'
+        config_yaml.write_text(yaml.safe_dump({'mem0_update': {
+            'agent_prefix_sanctioned_use': {
+                'recon-stage-': 'RECON-ROLE', 'curator-': 'OLD-CURATOR-ROLE',
+            },
+        }}))
+        monkeypatch.setenv('CONFIG_PATH', str(config_yaml))
+
+        svc = AsyncMock()
+        svc.config = FusedMemoryConfig()
+        assert "'curator-': OLD-CURATOR-ROLE" in _refusal(svc), (
+            'the seeded YAML must be rendered before the reload, or the test '
+            'cannot tell a reload from a schema default'
+        )
+        _edit_yaml(config_yaml, 'mem0_update.agent_prefix_sanctioned_use', {
+            'recon-stage-': 'RECON-ROLE', 'curator-': 'RELOADED-CURATOR-ROLE',
+        })
+
+        server = create_mcp_server(svc)
+        result = await server._tool_manager.call_tool('reload_config', {})
+
+        assert result['reloaded'] is True, result
+        assert 'mem0_update.agent_prefix_sanctioned_use' in result['applied'], result
+        assert 'mem0_update.agent_prefix_sanctioned_use' not in result['restart_required']
+        error = _refusal(svc)
+        assert "'curator-': RELOADED-CURATOR-ROLE" in error, error
+
     def test_kill_switch_flip_is_observed_live_without_a_restart(self):
         """A reload must be visible to the resolver through the SHARED config
         object — the precondition config/reload.py's reload-safety rule states
         before a leaf may be registered at all."""
         from types import SimpleNamespace
-
-        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 
         live = FusedMemoryConfig()
         svc = SimpleNamespace(config=live)
@@ -544,8 +588,6 @@ class TestMem0UpdateLeavesAreGreenTier:
         widening to it would be a vacuous no-op diff and the content-amend
         denial below would fail."""
         from types import SimpleNamespace
-
-        from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 
         live = FusedMemoryConfig()
         svc = SimpleNamespace(config=live)
@@ -633,7 +675,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
 
     The expected leaf set is DERIVED from ``WriteTriageConfig.model_fields``
     rather than listed by hand, and that inversion is the whole point: a
-    NINTH ``judge_*`` leaf added later without a reload registration fails
+    further ``judge_*`` leaf added later without a reload registration fails
     here instead of silently degrading to restart-only. ``config/reload.py``
     states the rule its own way — "anything absent from this frozenset
     silently degrades to restart-only" — and a kill switch that quietly needs
@@ -677,6 +719,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
             ('judge_accuracy_report_path', 'calibration/judge_report.json'),
             ('judge_reasoning_effort', 'low'),
             ('judge_field_chars', 1_200),
+            ('judge_api_url', 'http://localhost:8080/v1'),
         ],
     )
     def test_a_changed_judge_leaf_lands_in_applied_candidates(self, field, new_value):
@@ -703,6 +746,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
             ('judge_candidate_count', 'resolve_judge_candidate_count', 3),
             ('judge_reasoning_effort', 'resolve_judge_reasoning_effort', 'low'),
             ('judge_field_chars', 'resolve_judge_field_chars', 1_200),
+            ('judge_api_url', 'resolve_judge_api_url', 'http://localhost:8080/v1'),
         ],
     )
     def test_an_applied_reload_is_observed_by_the_live_resolver(
@@ -859,7 +903,7 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
 
     def test_iter_leaves_yields_the_map_as_exactly_one_whole_leaf(self):
         """Not one leaf per category — the map reloads all-or-nothing."""
-        from fused_memory.config.reload import _iter_leaves  # noqa: PLC0415
+        from fused_memory.config.reload import _iter_leaves
 
         config = FusedMemoryConfig()
         object.__setattr__(config.write_triage, 't_high_by_category', dict(self.SYNTHETIC))
@@ -898,7 +942,7 @@ class TestWriteTriagePerCategoryLeafIsGreenTierAndAtomic:
         calibrated it stopped deriving a cutoff for it — a stale number
         outliving its own evidence.
         """
-        from fused_memory.config.reload import apply_reload  # noqa: PLC0415
+        from fused_memory.config.reload import apply_reload
 
         live = FusedMemoryConfig()
         fresh = FusedMemoryConfig()
@@ -1045,7 +1089,7 @@ class TestConsolidationAutoLeavesAreGreenTier:
     Modelled on ``TestMem0UpdateLeavesAreGreenTier`` above, in the stronger
     ``TestWriteTriageJudgeLeavesAreGreenTier`` form: the expected leaf set is
     DERIVED from ``ConsolidationAutoConfig.model_fields`` rather than restated,
-    so a FOURTEENTH leaf added later without a ``reload.py`` registration fails
+    so a FIFTEENTH leaf added later without a ``reload.py`` registration fails
     HERE instead of silently degrading to restart-only.
 
     Two leaves make the section's green tier load-bearing rather than
@@ -1056,12 +1100,12 @@ class TestConsolidationAutoLeavesAreGreenTier:
     running server.
 
     UNLIKE its sibling classes here, this one does NOT pair the classification
-    with a live-read resolver test, because on this branch there is no consumer
-    to read: the executor is task delta, the proposal tool task gamma, the
-    provenance bar task epsilon. The live-read half of reload.py's
-    reload-safety rule is discharged by those tasks and their own tests. What
-    IS assertable now — and asserted below — is the diff/apply behaviour and
-    that a held reference to the shared submodel observes the flip.
+    with a live-read resolver test: the live-read consumer is
+    ``reconciliation/consolidation_auto_executor.py::run_auto_consolidation``
+    (with ``server/tools.py::propose_consolidation``), and the live-read half
+    of reload.py's reload-safety rule is discharged by their own tests. What
+    is asserted here is the diff/apply behaviour and that a held reference to
+    the shared submodel observes the flip.
     """
 
     #: Discovered rather than restated — see the class docstring.
@@ -1080,6 +1124,7 @@ class TestConsolidationAutoLeavesAreGreenTier:
         'max_auto_per_cycle': 1,
         'max_gate_filings_per_cycle': 0,
         'backlog_multiplier': 2,
+        'canonical_absent_bonus': 3.0,
         'refusal_streak_threshold': 3,
         'slug_collision_jaccard': 0.8,
         'proposal_ttl_hours': 24,
@@ -1092,7 +1137,7 @@ class TestConsolidationAutoLeavesAreGreenTier:
 
     def test_the_schema_actually_declares_the_leaves(self):
         """Guards the derivation itself: an empty set would pass vacuously."""
-        assert len(self.LEAVES) == 13, self.LEAVES
+        assert len(self.LEAVES) == 14, self.LEAVES
 
     def test_every_leaf_is_allowlisted(self):
         expected = {f'consolidation_auto.{name}' for name in self.LEAVES}
@@ -1225,3 +1270,33 @@ class TestConsolidationAutoLeavesAreGreenTier:
 
         assert d.applied_candidates[path] == {'old': ['orchestrator'], 'new': []}
         assert path not in d.restart_required
+
+
+@pytest.mark.parametrize(
+    ('leaf', 'new', 'expected_root'),
+    [
+        ('transcript_archive_enabled', False, None),
+        ('transcript_archive_root', 'elsewhere/archive', Path('elsewhere/archive')),
+    ],
+)
+def test_transcript_archive_reload_reaches_the_live_resolver(leaf, new, expected_root):
+    """The recon archive kill switch must reach a running server; a
+    restart-only kill switch is no kill switch (task 3972). The harness and
+    every stage resolve through the live reconciliation submodel, so the
+    reload must land on that same object."""
+    from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
+
+    live = FusedMemoryConfig()
+    reconciliation = live.reconciliation
+    fresh = FusedMemoryConfig()
+    object.__setattr__(fresh.reconciliation, leaf, new)
+    assert recon_archive_root(reconciliation) is not None
+
+    report = apply_reload(live, fresh)
+
+    path = f'reconciliation.{leaf}'
+    assert report['reloaded'] is True, report['error']
+    assert path in report['applied']
+    assert path not in report['restart_required']
+    assert live.reconciliation is reconciliation
+    assert recon_archive_root(reconciliation) == expected_root

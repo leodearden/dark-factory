@@ -1,8 +1,9 @@
 // Module-contract tests for memory_readings.js, the CLIENT reader of the two
 // memory payloads: the write-queue Datum served by /memory (server half
 // dashboard/src/dashboard/data/memory.py::write_queue_datum) and the MEMORY_OPS
-// block served by /memory-graphs (data/write_journal.py::get_memory_ops via
-// redux_api.shape_memory_graphs). MemoryTab, the Overview and the topbar read
+// block served by /memory-graphs, whose totals and newest_hour_total are served
+// Datums (data/write_journal.py::get_memory_ops via
+// redux_api.shape_memory_graphs; server half test_memory_graphs.py). MemoryTab, the Overview and the topbar read
 // both through this module, so the decisions it makes are asserted here, where
 // node can execute them. Their WIRING is pinned structurally in Python
 // (test_tab_memory.py, test_tab_overview.py, test_app_chrome_census.py).
@@ -43,7 +44,7 @@ const {
   opsTotalText,
   newestHourOps,
 } = readings;
-const { isDatum, EM_DASH } = datum;
+const { isDatum, datumView, EM_DASH } = datum;
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -85,19 +86,43 @@ function memoryData(stats, receipts = { [MEMORY_ENDPOINT]: RECEIPT }) {
   };
 }
 
-const MEMORY_OPS = Object.freeze({
-  labels: ['10:00', '11:00', '12:00'],
-  reads: [4, 3, 3],
-  writes: [1, 2, 2],
-  other: [0, 2, 0],
-  total: [5, 7, 5],
-  totals: { reads: 10, writes: 5, other: 2, total: 17 },
-  by_operation: [
-    { label: 'search', value: 10 },
-    { label: 'add_memory', value: 5 },
-    { label: 'compact', value: 2 },
-  ],
-});
+const OPS_TOTALS = Object.freeze({ reads: 10, writes: 5, other: 2, total: 17 });
+const OPS_REASON = 'the write journal query failed: OperationalError: database is locked';
+
+// A served MEMORY_OPS reading, honouring datum.py's unknown triad.
+function opsReading(state, value) {
+  if (state === 'unknown') {
+    return { value: null, as_of: null, state, reason: OPS_REASON, freshness_bound_seconds: 60 };
+  }
+  return { value, as_of: MEASURED_AT, state, reason: null, freshness_bound_seconds: 60 };
+}
+
+// The MEMORY_OPS block as shape_memory_graphs serves it: a hole serves no series.
+function memoryOps(state, newestHour = 5) {
+  if (state === 'unknown') {
+    return {
+      labels: [], reads: [], writes: [], other: [], total: [], by_operation: [],
+      totals: opsReading('unknown'),
+      newest_hour_total: opsReading('unknown'),
+    };
+  }
+  return {
+    labels: ['10:00', '11:00', '12:00'],
+    reads: [4, 3, 3],
+    writes: [1, 2, 2],
+    other: [0, 2, 0],
+    total: [5, 7, newestHour],
+    by_operation: [
+      { label: 'search', value: 10 },
+      { label: 'add_memory', value: 5 },
+      { label: 'compact', value: 2 },
+    ],
+    totals: opsReading(state, OPS_TOTALS),
+    newest_hour_total: opsReading(state, newestHour),
+  };
+}
+
+const MEMORY_OPS = Object.freeze(memoryOps('fresh'));
 
 function opsData(ops = MEMORY_OPS, receipts = { [MEMORY_GRAPHS_ENDPOINT]: RECEIPT }) {
   return { MEMORY_OPS: ops, __receipt: receipts };
@@ -167,7 +192,7 @@ test('queueHealth: a stale queue always warns', () => {
 // ── Memory ops (PRD sketch #11, at the client) ──────────────────────────────
 
 test('opsCaption: the three window totals the caption states', () => {
-  assert.equal(opsCaption(MEMORY_OPS.totals), '10 reads · 5 writes · 2 other');
+  assert.equal(opsCaption(OPS_TOTALS), '10 reads · 5 writes · 2 other');
 });
 
 test('opsTotalText: the donut centre is the served window total', () => {
@@ -179,29 +204,53 @@ test('the caption\'s three numbers sum to the donut\'s total', () => {
   assert.equal(String(captioned.reduce((sum, n) => sum + n, 0)), opsTotalText(opsData()));
 });
 
-test('before the /memory-graphs receipt the ops totals are not yet fetched', () => {
-  const data = opsData(MEMORY_OPS, {});
-  assert.equal(opsTotalText(data), EM_DASH);
-  const totals = opsTotals(data);
-  assert.equal(totals.state, 'unknown');
-  assert.equal(totals.reason, 'not yet fetched');
+test('opsTotals: fresh served totals are that Datum, stamped with the receipt', () => {
+  const totals = opsTotals(opsData());
+  assert.ok(isDatum(totals));
+  assert.equal(totals.state, 'fresh');
+  assert.deepEqual(totals.value, OPS_TOTALS);
+  assert.equal(totals.as_of, MEASURED_AT);
+  assert.equal(totals._served_at, SERVED_AT);
+  assert.equal(totals._received_at, RECEIVED_AT);
 });
 
-test('newestHourOps: the LAST hourly total, as a Datum', () => {
-  const newest = newestHourOps(opsData({ ...MEMORY_OPS, total: [5, 7, 9] }));
+test('opsTotals: served unknown totals keep the SERVER\'s reason, and the caption never runs over the hole', () => {
+  const data = opsData(memoryOps('unknown'));
+  const totals = opsTotals(data);
+  assert.equal(totals.state, 'unknown');
+  assert.equal(totals.value, null);
+  assert.equal(totals.reason, OPS_REASON);
+  assert.equal(opsTotalText(data), EM_DASH);
+  assert.equal(datumView(opsTotals(data), { format: opsCaption }).text, EM_DASH);
+});
+
+test('opsTotals: a delivered payload whose totals is not a Datum is a hole naming the /memory-graphs payload', () => {
+  const totals = opsTotals(opsData({ ...MEMORY_OPS, totals: { ...OPS_TOTALS } }));
+  assert.equal(totals.state, 'unknown');
+  assert.match(totals.reason, /\/memory-graphs payload/);
+});
+
+test('newestHourOps: the served newest_hour_total, as a Datum', () => {
+  const newest = newestHourOps(opsData(memoryOps('fresh', 9)));
   assert.ok(isDatum(newest));
   assert.equal(newest.state, 'fresh');
   assert.equal(newest.value, 9);
+  assert.equal(newest._served_at, SERVED_AT);
 });
 
-test('newestHourOps: an empty series with a receipt is a hole saying so', () => {
-  const newest = newestHourOps(opsData({ ...MEMORY_OPS, total: [] }));
+test('newestHourOps: a served unknown keeps the SERVER\'s reason, the same one the totals carry', () => {
+  const data = opsData(memoryOps('unknown'));
+  const newest = newestHourOps(data);
   assert.equal(newest.state, 'unknown');
-  assert.equal(newest.reason, 'no ops recorded in this window');
+  assert.equal(newest.reason, OPS_REASON);
+  assert.equal(newest.reason, opsTotals(data).reason);
 });
 
-test('newestHourOps: before the /memory-graphs receipt it is not yet fetched', () => {
-  const newest = newestHourOps(opsData(MEMORY_OPS, {}));
-  assert.equal(newest.state, 'unknown');
-  assert.equal(newest.reason, 'not yet fetched');
+test('before the /memory-graphs receipt both ops readings are not yet fetched', () => {
+  const data = opsData(MEMORY_OPS, {});
+  assert.equal(opsTotalText(data), EM_DASH);
+  for (const reading of [opsTotals(data), newestHourOps(data)]) {
+    assert.equal(reading.state, 'unknown');
+    assert.equal(reading.reason, 'not yet fetched');
+  }
 });

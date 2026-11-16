@@ -262,3 +262,5 @@ tasks:
       kind: manual
       reason: the gate is the executed test suite itself (INV-10); a presence grep
         cannot express 'twenty rows green'
+signal_leaves:
+- ω

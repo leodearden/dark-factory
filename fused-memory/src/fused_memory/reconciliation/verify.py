@@ -9,6 +9,7 @@ from shared.agent_result import extract_agent_verdict
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
 from fused_memory.reconciliation.agent_loop import AgentLoop, ToolDefinition
+from fused_memory.utils.clip_disclosure import elide_text, truncation_fields
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,9 @@ CODEBASE_ROOT_UNRESOLVED = 'codebase_root_unresolved'
 # not read-only (fused-memory/scripts/probe_schema_max_turns.py's docstring
 # records the measured `git log --output` write).
 _EXPLORE_CLI_TOOLS = ('Read', 'Grep', 'Glob')
+
+# Clears every ordinary commit's `git show --stat` measured at 2026-09/10.
+_GIT_SHOW_CHARS = 16_000
 
 
 # Sub-reasons for a refused root.  They discriminate the populations hiding
@@ -105,6 +109,40 @@ def _as_failure_token(value: object) -> str:
     if not isinstance(value, str):
         return ''
     return value.strip()[:_MAX_FAILURE_TOKEN_LEN]
+
+
+def _contained_path(root: Path, relpath: str) -> Path | None:
+    """``root / relpath`` if it resolves inside ``root``, else None; blocks on a stat/readlink per path component, so a coroutine must reach it through asyncio.to_thread."""
+    target = root / relpath
+    return target if target.resolve().is_relative_to(root) else None
+
+
+def _read_codebase_file(root: Path, path: str, max_lines: int) -> dict:
+    """The read_file tool's result for ``path`` under ``root``, at most ``max_lines`` lines; blocks on the path check and the file read, so a coroutine must reach it through asyncio.to_thread."""
+    target = _contained_path(root, path)
+    if target is None:
+        return {'error': 'Path outside codebase root'}
+    try:
+        content = target.read_text()
+        lines = content.splitlines()
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines.append(f'... ({len(content.splitlines()) - max_lines} more lines)')
+        return {'path': path, 'content': '\n'.join(lines), 'total_lines': len(content.splitlines())}
+    except FileNotFoundError:
+        return {'error': f'File not found: {path}'}
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def _glob_codebase(root: Path, pattern: str) -> dict:
+    """The glob_search tool's result for ``pattern`` under ``root``; blocks on a directory walk, so a coroutine must reach it through asyncio.to_thread."""
+    try:
+        matches = sorted(root.glob(pattern))
+        paths = [str(m.relative_to(root)) for m in matches[:50]]
+        return {'pattern': pattern, 'matches': paths, 'total': len(matches)}
+    except Exception as e:
+        return {'error': str(e)}
 
 
 EXPLORE_AGENT_SYSTEM_PROMPT = """\
@@ -223,20 +261,7 @@ class CodebaseVerifier:
 
         async def read_file(path: str, max_lines: int = 200) -> dict:
             """Read file contents."""
-            full_path = codebase_root / path
-            if not full_path.resolve().is_relative_to(codebase_root):
-                return {'error': 'Path outside codebase root'}
-            try:
-                content = full_path.read_text()
-                lines = content.splitlines()
-                if len(lines) > max_lines:
-                    lines = lines[:max_lines]
-                    lines.append(f'... ({len(content.splitlines()) - max_lines} more lines)')
-                return {'path': path, 'content': '\n'.join(lines), 'total_lines': len(content.splitlines())}
-            except FileNotFoundError:
-                return {'error': f'File not found: {path}'}
-            except Exception as e:
-                return {'error': str(e)}
+            return await asyncio.to_thread(_read_codebase_file, codebase_root, path, max_lines)
 
         tools['read_file'] = ToolDefinition(
             name='read_file',
@@ -254,13 +279,7 @@ class CodebaseVerifier:
 
         async def glob_search(pattern: str) -> dict:
             """Search for files matching a glob pattern."""
-            try:
-                matches = sorted(codebase_root.glob(pattern))
-                # Make relative and limit results
-                paths = [str(m.relative_to(codebase_root)) for m in matches[:50]]
-                return {'pattern': pattern, 'matches': paths, 'total': len(matches)}
-            except Exception as e:
-                return {'error': str(e)}
+            return await asyncio.to_thread(_glob_codebase, codebase_root, pattern)
 
         tools['glob_search'] = ToolDefinition(
             name='glob_search',
@@ -277,8 +296,8 @@ class CodebaseVerifier:
 
         async def grep_search(pattern: str, path: str = '.', max_results: int = 30) -> dict:
             """Search file contents with regex."""
-            search_path = codebase_root / path
-            if not search_path.resolve().is_relative_to(codebase_root):
+            search_path = await asyncio.to_thread(_contained_path, codebase_root, path)
+            if search_path is None:
                 return {'error': 'Path outside codebase root'}
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -373,8 +392,8 @@ class CodebaseVerifier:
                     stderr=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-                output = stdout.decode()[:3000]
-                return {'commit': commit, 'output': output}
+                clip = elide_text(stdout.decode(), _GIT_SHOW_CHARS, field='output')
+                return {'commit': commit, 'output': clip.text, **truncation_fields(clip.fact)}
             except Exception as e:
                 return {'error': str(e)}
 
@@ -458,7 +477,7 @@ Investigate this claim against the codebase and report your findings.
             cwd=codebase_root,
         )
 
-        result, _ = await agent.run(prompt)
+        result = await agent.run(prompt)
 
         verdict = extract_agent_verdict(
             result,

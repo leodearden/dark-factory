@@ -27,6 +27,9 @@ You have been invoked because a task transitioned to `blocked`. The caller has p
 - `worktree` — absolute path to the task's worktree (e.g. `.worktrees/<id>/`)
 - `reason` — the high-level block reason (e.g. "verify exhausted", "review failed", "merge conflict")
 - `detail` — additional context captured at the moment of blocking
+- `**Reviews directory:**` — the absolute path of the task's reviewer verdict files,
+  which live in task-scoped storage outside the worktree; `(unavailable: <reason>)`
+  means no such path exists for this task, so skip the reviews scan
 - the blocked task's own record, rendered as `**Title:**`, `**Description:**` and
   `**Details:**` — each capped per field, with an oversized field clipped and marked
   `... [<field> truncated] ...` so you can see when you are reading a partial value
@@ -54,19 +57,19 @@ Collect all available information **in parallel**:
 
 ### 1a. Worktree artifacts
 ```
-Read <worktree>/.task/metadata.json   # task identity, base commit, plan files
 Read <worktree>/.task/plan.json       # TDD plan: steps done/pending, design decisions
 Read <worktree>/.task/iterations.jsonl  # execution log: what each agent attempted
 ```
-Also scan `<worktree>/.task/reviews/` for reviewer verdict files (`*.json`).
+Also scan the `**Reviews directory:**` path from your prompt for reviewer verdict files (`*.json`).
 
 ### 1b. Git state (read-only commands only)
+You run with the task worktree as your working directory, and any command outside your read-only allowlist is denied without a prompt.
 ```bash
-git -C <worktree> log --oneline -15
-git -C <worktree> diff $(git -C <worktree> merge-base main HEAD)..HEAD --stat
-git -C <worktree> status --porcelain
+git log --oneline -15
+git diff main...HEAD --stat
+git status --porcelain
 ```
-Use the merge-base/three-dot form, not two-dot `main..HEAD` — two-dot charges everything that landed on main since the branch base to the task branch.
+Use the merge-base/three-dot form `main...HEAD`, not two-dot `main..HEAD` — two-dot charges everything that landed on main since the branch base to the task branch.
 
 ### 1c. Task metadata
 ```
@@ -76,8 +79,8 @@ Check `metadata.dry_run_proposals` — if prior proposals exist, note what was a
 
 ### 1d. Error context
 If `reason` contains "verify" or "test": read recent test output from iterations.jsonl.
-If `reason` contains "review": read `<worktree>/.task/reviews/*.json` for specific issues.
-If `reason` contains "merge": check `git -C <worktree> diff main --name-only` for conflict files.
+If `reason` contains "review": read the `*.json` files under the `**Reviews directory:**` path for specific issues.
+If `reason` contains "merge": check `git diff main --name-only` for conflict files.
 
 ---
 

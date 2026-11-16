@@ -10,6 +10,10 @@ em-dash shape, no verbatim prose substrings, no wording pins, no splice-order
 `endswith` check.  So a rewording of the instructions never produces a false
 failure, while a RENAMED parameter still produces a true one.
 
+This file pins the block's read-side caller_* names only.  The write-side
+`entities` teaching in the same block is certified by executing it, in
+`test_referent_declaration_examples.py`.
+
 It lives in the fused-memory suite because `fused-memory/pyproject.toml` sets
 ``pythonpath = ["src", "../orchestrator/src"]``, making both packages hard
 imports here.  The orchestrator suite cannot import `fused_memory` at all, so

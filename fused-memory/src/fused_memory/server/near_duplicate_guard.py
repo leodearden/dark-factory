@@ -25,6 +25,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
+from fused_memory.server.guard_excerpt import excerpt_fields
 
 if TYPE_CHECKING:
     from fused_memory.config.schema import ProceduralTopicCluster
@@ -198,6 +199,38 @@ def find_matching_topic_cluster(
         if matched and (len(matched) >= cluster.min_phrase_hits or matched & sufficient):
             return cluster, sorted(matched)
     return None
+
+
+def can_share_one_occurrence(first: str, second: str) -> bool:
+    """Whether one occurrence of some text could contain both phrases.
+
+    :func:`find_matching_topic_cluster` would then count that one occurrence
+    as two distinct hits. It can when one phrase nests in the other, or when
+    one phrase's end overlaps the other's start on a whole word. Compares
+    case-insensitively, like the matcher.
+    """
+    first, second = first.lower(), second.lower()
+    return (
+        first in second
+        or second in first
+        or _overlaps_on_a_whole_word(first, second)
+        or _overlaps_on_a_whole_word(second, first)
+    )
+
+
+def _overlaps_on_a_whole_word(head: str, tail: str) -> bool:
+    """Whether *head*'s end is *tail*'s start, the shared text being whole words on one side.
+
+    ``git add -f .task/`` and ``.task/plan.json is gitignored`` qualify (the
+    whole word ``.task/`` begins ``tail``'s first word), so the one
+    construction ``git add -f .task/plan.json is gitignored`` holds both. A
+    shared fragment inside a word on BOTH sides (``locks`` / ``set``) does not:
+    only a fused non-word could hold both.
+    """
+    return any(
+        head[-shared:] == tail[:shared] and (head[-shared - 1] == ' ' or tail[shared] == ' ')
+        for shared in range(1, min(len(head), len(tail)))
+    )
 
 
 def resolve_near_dup_threshold(memory_service: Any) -> float:
@@ -391,11 +424,10 @@ def build_near_duplicate_block(
         'error': 'procedural_knowledge_near_duplicate_write_blocked',
         'error_type': 'ProceduralKnowledgeNearDuplicateWriteRejected',
         'agent_id': agent_id,
-        'content_excerpt': content[:200],
+        **excerpt_fields(content_excerpt=content, matched_excerpt=match.content),
         'matched_memory_id': match.id,
         'similarity': cosine_of(match),
         'threshold': threshold,
-        'matched_excerpt': match.content[:200],
         'hint': _NEAR_DUPLICATE_HINT,
     }
 
@@ -427,7 +459,7 @@ def build_topic_cluster_block(
         'error': 'procedural_knowledge_known_topic_cluster_write_blocked',
         'error_type': 'ProceduralKnowledgeKnownTopicClusterWriteRejected',
         'agent_id': agent_id,
-        'content_excerpt': content[:200],
+        **excerpt_fields(content_excerpt=content),
         'topic_id': cluster.topic_id,
         'matched_phrases': matched_phrases,
         'hint': cluster.hint or _TOPIC_CLUSTER_DEFAULT_HINT,

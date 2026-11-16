@@ -1,0 +1,30 @@
+{
+  "task_id": "8525",
+  "reason": "review amendments, net-additive: a request's gate-retry count ends at _retire_item, the one terminal chokepoint, so a resubmission counts afresh; a gate-rebased head whose worktree cannot be made is re-queued instead of blocked",
+  "measures": [
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+      "baseline": 1939,
+      "current": 1947
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_dispatch_rebased_head",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "cognitive",
+      "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_retire_item",
+      "baseline": 2,
+      "current": 3
+    },
+    {
+      "measure": "total:cognitive",
+      "key": "<cluster>",
+      "baseline": 5134,
+      "current": 5138
+    }
+  ]
+}
