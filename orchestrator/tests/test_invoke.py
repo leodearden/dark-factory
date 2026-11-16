@@ -1913,6 +1913,7 @@ _STEWARD_4895 = '59607ecd-9ecd-4f90-9ce6-bc71a7fb33e9'
 
 
 @pytest.mark.asyncio
+@pytest.mark.spawns_agent_cli
 class TestClaudeResumePriorForwarding:
     """invoke_agent hands the resumed session's prior total to both claude sub-paths.
 

@@ -190,6 +190,7 @@ def _inline_value(argv: list[str], flag: str) -> str:
 
 
 @pytest.mark.asyncio
+@pytest.mark.spawns_agent_cli
 class TestInvokeZCode:
 
     async def test_the_result_is_parsed_from_the_json_zcode_prints(self, fake_zcode, worktree):
