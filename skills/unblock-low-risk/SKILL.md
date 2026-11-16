@@ -358,18 +358,22 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
          disposition a landed, correctly-credited task falls through to the polling exit below
          and gets abandoned as in-flight — see [Deriving the landed
          sha](#deriving-the-landed-sha)'s `coalesce-*` bullet for the full two-outcome split.
-       - **Not resolved yet** — the two exits in the next bullet.
+       - **Not resolved yet** — the single poll-then-hand-off exit in the next bullet.
 
        On the `coalesce-*` arm remember both carve-outs: **neither rc=1 nor rc=128-with-an-empty-marker is
        not-landed**, and **neither arm carries a self-stamp** — the scheduler status decides only
        which exit applies, never whether a write is permitted.
-     - **If it has not resolved yet, both available exits are non-failures.** Either keep polling
-       the **branch** handle (`mcp__escalation__merge_status(branch="task/<task_id>")`, same
-       clamped cadence) for whatever remains of step 8's polling deadline, re-running the
-       ancestry disposition on each tick; or, once that deadline is spent, **ABORT with an
-       explicitly non-failure disposition** — report the branch as *in flight on a successor*,
-       naming the `superseded_by` value, and leave the escalation pending for a human. In neither
-       case call `merge_cancel`, and in neither case claim a failure: this is **not** the plain
+     - **If it has not resolved yet, poll, then hand off — never a failure.** Keep polling the
+       **branch** handle (`mcp__escalation__merge_status(branch="task/<task_id>")`, same clamped
+       cadence), re-running the ancestry disposition on each tick, until step 8's polling
+       deadline. When the submission itself returned `superseded` in-window, step 8's poll loop
+       was never entered, so that deadline is 20 min from the `merge_request` call. If the
+       successor is still unresolved at the deadline, **HAND OFF**: return `outcome:
+       "handed_off"` carrying this run's `request_id` and the `superseded_by` value read above,
+       put the ladder's last verdict in `reason`, and leave the task status and the escalation
+       untouched. The escalation-watcher resumes it through [resume
+       mode](#resuming-a-handed-off-merge-resume-mode). This hand-off, like step 8's, is **not**
+       an ABORT. Never call `merge_cancel` and never claim a failure: this is **not** the plain
        abort-as-failure the `conflict` / `blocked` / `abandoned` arm above prescribes. Never
        resubmit and never direct-merge while the successor is unresolved.
 
