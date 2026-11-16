@@ -83,6 +83,15 @@ _ESC_433_1_CLAIM = (
 )
 
 
+# The claimed clause of scoping_intake esc-unverified-claim-506-1 (memory dd0410c1),
+# verbatim. 'task 506's merged tree' here is the branch tree with its work merged in.
+_ESC_506_1_CLAIM = (
+    "In scoping-intake, the README Checks' `uv run pytest` runs serially (pyproject sets no "
+    'xdist), and measured on 2026-11-02 the full suite on task 506\'s merged tree took 692 s '
+    'for 5778 tests under host load ~100 on 32 cores (604 s for 5737 at 17:20 the same day)'
+)
+
+
 def _extract(text: str, default_project_id: str = 'reify') -> list[CompletionClaim]:
     return extract_completion_claims(
         text,
@@ -576,6 +585,12 @@ class TestNonAssertiveScopes:
 
     def test_a_merge_into_main_is_still_a_claim(self):
         assert _triples('task 5422 was merged into main') == [('applied_work', 'task', '5422')]
+
+    def test_a_possessive_merged_tree_is_an_accepted_residual(self):
+        # Accepted residual (task 6824): over 93,986 Mem0 records (2026-11-16) about 39 of 42 possessive
+        # participle claims assert the landing ('task 4105's landed fix'), so the gate keeps the reading;
+        # see TestAttributiveMarkersBindForwardOnly::test_a_possessive_lead_still_claims_its_owner.
+        assert _triples(_ESC_506_1_CLAIM, 'scoping_intake') == [('applied_work', 'task', '506')]
 
 
 class TestPremiseNotesClaimTheirDependency:
