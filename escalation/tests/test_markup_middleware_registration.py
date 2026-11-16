@@ -993,10 +993,11 @@ class TestTheResidueProseMatchesItsKind:
 
     The sink receives ``mcp_markup_unrepairable`` (refused: nothing written,
     the caller was told, a retry may be coming) and
-    ``mcp_markup_unrecovered_param`` (FORWARDED: the call landed incomplete and
-    nobody was told, so no retry is coming and the stored record is already
-    wrong). This server is the only registration site that produces the second
-    kind, because ``_preserve_unrecovered`` is FORWARD_REPAIR-only.
+    ``mcp_markup_unrecovered_param`` (FORWARDED without the parameter and
+    nobody was told, so no retry is coming). The second kind's record is filed
+    before the forwarded call runs, so whether that call then succeeded is not
+    known to the sink. This server is the only registration site that produces
+    the second kind, because ``_preserve_unrecovered`` is FORWARD_REPAIR-only.
 
     One hardcoded "the call was refused" sentence made the forwarded record
     contradict its own summary three lines above it, and the false half is the
@@ -1087,6 +1088,38 @@ class TestTheResidueProseMatchesItsKind:
         assert UNTYPABLE_EVIDENCE in detail
         assert "field='evidence'" in detail
         assert f"subject_task_id={REQUIRED['task_id']!r}" in detail
+
+    @pytest.mark.asyncio
+    async def test_a_forwarded_call_the_tool_rejects_is_not_claimed_as_landed(
+        self, tmp_path: Path
+    ):
+        """The slice is filed before the call is forwarded.
+
+        So the sink cannot know whether the call then succeeds; here it does
+        not.
+        """
+        queue, server = build(tmp_path)
+        async with Client(server) as client:
+            result = await client.call_tool('escalate_info', {
+                **REQUIRED,
+                'category': 'not_a_registered_category',
+                'detail': _leak('Ill-formed.', 'evidence', UNTYPABLE_EVIDENCE),
+            })
+
+        assert 'error' in result.data, 'the forwarded call must fail in the tool'
+        assert queue.get_by_task(REQUIRED['task_id']) == [], (
+            'the rejected call must write nothing under the caller'
+        )
+        residues = [
+            esc for esc in queue.get_pending() if esc.category == RESIDUE_CATEGORY
+        ]
+        assert len(residues) == 1, (
+            f'the dropped slice must be preserved anyway, found {len(residues)}'
+        )
+        assert 'landed' not in residues[0].detail.lower(), (
+            'the residue claims a landing it cannot see: it is filed before '
+            'the forwarded call runs'
+        )
 
 
 class TestAnUnknownResidueKindIsFiledVisibly:
