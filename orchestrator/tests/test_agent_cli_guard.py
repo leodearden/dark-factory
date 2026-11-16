@@ -11,17 +11,52 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _agent_cli_guard import AgentCliSpawnGuard, agent_cli_in
+from _agent_cli_guard import AGENT_CLI_BINARIES, AgentCliSpawnGuard, agent_cli_in
+from _operator_home_fixture import OPERATOR_ENV_VARS, write_operator_home
+from _zcode_fixture import BASE_URL as ZCODE_BASE_URL
+from shared.backends import AGENT_CLI_BACKENDS
 from shared.cli_invoke import build_claude_argv
 
 import orchestrator.workflow
 from orchestrator.agents import invoke, sandbox_dispatch
 from orchestrator.agents.landlock import build_landlock_command
+from orchestrator.agents.mimo_backend import (
+    mimo_export_argv,
+    mimo_run_argv,
+    mimo_session_list_argv,
+)
+from orchestrator.agents.zcode_backend import ZCodeRunHome, zcode_argv
 
 _WORKSPACE_PACKAGES = ('shared', 'orchestrator')
+
+_ZCODE_HOME = ZCodeRunHome(
+    root=Path('/run-home'),
+    provider_config_path=Path('/run-home/provider_config.json'),
+    operator_home=Path('/home/op'),
+    workspace=Path('/run-home/workspace'),
+)
+
+_UNMOCKED_INVOKE_KWARGS: dict[str, dict[str, Any]] = {
+    'claude': {},
+    'codex': {},
+    'gemini': {},
+    'pi': {},
+    'zcode': {
+        'env_overrides': {'ANTHROPIC_BASE_URL': ZCODE_BASE_URL, 'ANTHROPIC_AUTH_TOKEN': 'k-secret'},
+        'timeout_seconds': 30.0,
+    },
+    'mimo': {
+        'env_overrides': {
+            'ANTHROPIC_BASE_URL': 'https://token-plan-ams.xiaomimimo.com/anthropic',
+            'ANTHROPIC_AUTH_TOKEN': 'k-secret',
+        },
+        'timeout_seconds': 30.0,
+    },
+}
 
 
 def _real_claude_argv() -> list[str]:
@@ -37,6 +72,9 @@ def _real_claude_argv() -> list[str]:
 
 
 class TestAgentCliIn:
+    def test_the_guard_covers_every_production_agent_cli_backend(self):
+        assert {backend.value for backend in AGENT_CLI_BACKENDS} == AGENT_CLI_BINARIES
+
     def test_production_claude_argv_is_classified_as_claude(self):
         assert agent_cli_in(_real_claude_argv()) == 'claude'
 
@@ -75,10 +113,14 @@ class TestAgentCliIn:
             (['codex', 'exec', '-'], 'codex'),
             (['gemini', '-p', 'x'], 'gemini'),
             (['pi', '--model', 'm'], 'pi'),
+            (zcode_argv('p', _ZCODE_HOME, None), 'zcode'),
+            (mimo_run_argv('mimo-v2.6-pro', Path('/wt'), 'high'), 'mimo'),
+            (mimo_session_list_argv(), 'mimo'),
+            (mimo_export_argv('ses-1'), 'mimo'),
         ],
-        ids=['codex', 'gemini', 'pi'],
+        ids=['codex', 'gemini', 'pi', 'zcode', 'mimo-run', 'mimo-session-list', 'mimo-export'],
     )
-    def test_every_backend_binary_is_classified(self, argv, expected):
+    def test_every_non_claude_backend_argv_is_classified(self, argv, expected):
         assert agent_cli_in(argv) == expected
 
     @pytest.mark.parametrize(
@@ -196,16 +238,21 @@ class TestForbidAgentCliSpawnFixture:
         assert _forbid_agent_cli_spawn.take_attempts() == [('claude', '--print')]
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('backend', ['claude', 'codex', 'gemini', 'pi'])
+    @pytest.mark.parametrize('backend', sorted(AGENT_CLI_BACKENDS))
     async def test_unmocked_invoke_agent_is_stopped_before_spawning(
-        self, _forbid_agent_cli_spawn, request, tmp_path, backend,
+        self, _forbid_agent_cli_spawn, request, monkeypatch, tmp_path, backend,
     ):
-        nice = {'DF_AGENT_CPU_NICE': '5'} if backend == 'claude' else None
+        empty_bin = tmp_path / 'empty-bin'
+        empty_bin.mkdir()
+        monkeypatch.setenv('PATH', str(empty_bin))
+        monkeypatch.setenv('HOME', str(write_operator_home(tmp_path / 'operator')))
+        for name in OPERATOR_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
 
         with pytest.raises(pytest.fail.Exception, match=re.escape(request.node.nodeid)):
             await invoke.invoke_agent(
                 prompt='p', system_prompt='s', cwd=tmp_path, backend=backend,
-                env_overrides=nice,
+                **_UNMOCKED_INVOKE_KWARGS[backend],
             )
 
         [attempt] = _forbid_agent_cli_spawn.take_attempts()
