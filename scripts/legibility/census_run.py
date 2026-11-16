@@ -37,6 +37,7 @@ from legibility import (
     landing_gate,
     prescreen,
     session_ledger,
+    sighting_fit,
     similarity,
     synthesis,
     task_store,
@@ -997,16 +998,22 @@ class _VerifiedPlacements:
     re_observed: tuple[prescreen.ReObserved, ...]
 
 
+def _entry_sighting_count(cb: dict, entry_id: str, *, kind: str) -> int:
+    entry = codebook.record_by_id(cb["entries"], entry_id, kind=kind)
+    return len(sighting_fit.counted_sessions(cb, entry))
+
+
 def _place_verified(
     cb: dict, clusters: Sequence[dict], *, run_id: str, instrument_findings: prescreen.InstrumentFindings,
 ) -> tuple[dict, _VerifiedPlacements]:
     """Promote, key-attach or drop each verified cluster, gating its filing at
-    the distinct sessions of the record it lands on."""
-    # Each verified cluster's filing is gated at the distinct sessions of the
-    # record it lands on: its candidate, counted BEFORE promotion so a withheld
-    # entry is marked as it is created; its entry, after a key attach; or the
-    # standing record a dropped verdict met. A structural cluster (contract
-    # §6, D6) is promoted but never filed.
+    the sessions the record it lands on counts."""
+    # Each verified cluster's filing is gated at the sessions of the record it
+    # lands on: its candidate's distinct sessions, counted BEFORE promotion so
+    # a withheld entry is marked as it is created; its entry's
+    # sighting_fit.counted_sessions, after a key attach; or the standing
+    # record a dropped verdict met. A structural cluster (contract §6, D6) is
+    # promoted but never filed.
     placed: list[tuple[dict, str | None]] = []
     fileable: list[tuple[dict, str | None]] = []
     held_back: list[tuple[filing_policy.WithheldCluster, str]] = []
@@ -1024,11 +1031,11 @@ def _place_verified(
                 verdict="verified", cluster=cluster, standing=candidate, contradicting_disposition="rejected",
             ))
             standing_entry_id = _promoted_entry_id(cb, candidate)
-            holder = (
-                candidate if standing_entry_id is None
-                else codebook.record_by_id(cb["entries"], standing_entry_id, kind="standing entry")
+            sighting_count = (
+                census_filing.distinct_sessions(candidate) if standing_entry_id is None
+                else _entry_sighting_count(cb, standing_entry_id, kind="standing entry")
             )
-            files, _ = census_filing.filing_gate(cluster, census_filing.distinct_sessions(holder))
+            files, _ = census_filing.filing_gate(cluster, sighting_count)
             if files:
                 fileable.append((cluster, standing_entry_id))
             continue
@@ -1047,8 +1054,9 @@ def _place_verified(
             )
             key_attaches.append(key_attach)
             entry_id = key_attach.entry_id
-            attached_entry = codebook.record_by_id(cb["entries"], entry_id, kind="key-attached entry")
-            files, held = census_filing.filing_gate(cluster, census_filing.distinct_sessions(attached_entry))
+            files, held = census_filing.filing_gate(
+                cluster, _entry_sighting_count(cb, entry_id, kind="key-attached entry"),
+            )
             if entry_id not in {adjudication.record_id for adjudication in promoted}:
                 promoted.append(census_findings.Adjudication(entry_id, found, cluster.get("cause")))
         else:
