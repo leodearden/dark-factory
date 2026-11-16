@@ -58,7 +58,7 @@ import types
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import openai
 
@@ -92,9 +92,12 @@ _SCRIPTS = Path(__file__).resolve().parent
 _PACKAGE_ROOT = _SCRIPTS.parent
 
 
-_freeze = load_script(
-    _SCRIPTS / 'freeze_write_triage_population.py', 'freeze_write_triage_population',
-)
+if TYPE_CHECKING:
+    import freeze_write_triage_population as _freeze
+else:
+    _freeze = load_script(
+        _SCRIPTS / 'freeze_write_triage_population.py', 'freeze_write_triage_population',
+    )
 _wording = load_script(_SCRIPTS / 'write_triage_judge_wording.py', 'write_triage_judge_wording')
 _scorer = load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
 _calibrate = load_script(_SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
