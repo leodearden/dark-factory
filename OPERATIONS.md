@@ -1100,12 +1100,11 @@ terminal tier's claimants through `set_task_claimant` (`--repair-hygiene`
 adds the hygiene tier). Exit 3 means nothing was read. Run the script
 directly, never via `python -m`.
 
-The census reports the raw terminal tier, ledgered rows included: unlike
-the gauge, it does not separate sanctioned C4-E2 exceptions (task 6777
-owns adding that). Before you
-treat a census terminal row as unledgered, or run `--apply`, check it
-against the gauge's `ledgered` flag or the row's
-`metadata.claimant_exception`.
+The census reports sanctioned C4-E2 exceptions separately: a terminal row
+whose `metadata.claimant_exception` names its claimant is tier `ledgered`.
+So the census `terminal` tier is the same set as the gauge's unledgered rows.
+`--apply` never writes a ledgered row. A row that becomes ledgered between
+the census and the write is skipped as `skipped_changed_under_us`.
 
 **The mint-time tripwire.** A `set_task_claimant` write that stamps a
 claimant onto a terminal row logs an ERROR whose discriminator is

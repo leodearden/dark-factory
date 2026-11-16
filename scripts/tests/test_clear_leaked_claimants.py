@@ -1,7 +1,8 @@
 """Tests for scripts/clear_leaked_claimants.py (task 4625).
 
 Every expectation is hand-derived from the tier table in
-docs/prds/claimant-invariant-enforcement.md D3, never computed by calling the
+docs/prds/claimant-invariant-enforcement.md D3 and the ledger of
+docs/prds/claimant-invariant-detection.md D-5, never computed by calling the
 shared predicates, and every store is a synthetic temp tasks.db.
 """
 from __future__ import annotations
@@ -56,11 +57,21 @@ def _claimed(task_id, status, claimant, heartbeat, **extra):
     }
 
 
+def _ledger(claimant: str) -> dict:
+    return {'claimant_exception': {
+        'claimant_run_id': claimant, 'target_status': 'done', 'agent_id': 'claude-interactive',
+        'tag': 'master', 'stamped_at': _iso(STALE),
+    }}
+
+
 POSITIVE_CONTROL = _claimed(4028, 'done', 'run-a/4028-x/pid=1', NOW - timedelta(days=50))
 FREEFORM_CANCELLED = _claimed(5225, 'cancelled', 'agent-esc-5053-2-docs-fix', None)
 FRESH_DONE = _claimed(101, 'done', 'run-c/101-x/pid=3', FRESH)
 STALE_PENDING = _claimed(103, 'pending', 'run-e/103-x/pid=5', STALE)
 STALE_MERGE_DEFERRED = _claimed(109, 'merge-deferred', 'run-k/109-x/pid=11', STALE)
+LEDGERED_DONE = _claimed(
+    111, 'done', 'run-l/111-x/pid=12', STALE, metadata=_ledger('run-l/111-x/pid=12'),
+)
 
 TIER_TABLE_ROWS = [
     POSITIVE_CONTROL,
@@ -75,6 +86,7 @@ TIER_TABLE_ROWS = [
     _claimed(108, 'deferred', 'run-j/108-x/pid=10', STALE, metadata={'infra_hold': True}),
     STALE_MERGE_DEFERRED,
     _claimed(110, 'pending', '  ', STALE),
+    LEDGERED_DONE,
 ]
 
 
@@ -129,6 +141,7 @@ class TestCensus:
             (101, Tier.TERMINAL),
             (103, Tier.HYGIENE),
             (109, Tier.HYGIENE),
+            (111, Tier.LEDGERED),
         }
 
     def test_violation_carries_the_row_verbatim_and_the_measurement_time(self, seed_root):
@@ -151,16 +164,17 @@ class TestCensus:
     def test_totals_by_tier_and_by_tier_and_status(self, seed_root):
         totals = take_census(seed_root(TIER_TABLE_ROWS), NOW).totals()
 
-        assert totals.by_tier == {Tier.TERMINAL: 3, Tier.HYGIENE: 2}
+        assert totals.by_tier == {Tier.TERMINAL: 3, Tier.HYGIENE: 2, Tier.LEDGERED: 1}
         assert totals.by_tier_status == {
             Tier.TERMINAL: {'done': 2, 'cancelled': 1},
             Tier.HYGIENE: {'pending': 1, 'merge-deferred': 1},
+            Tier.LEDGERED: {'done': 1},
         }
 
     def test_zero_tiers_are_reported_not_omitted(self, seed_root):
         totals = take_census(seed_root([POSITIVE_CONTROL]), NOW).totals()
 
-        assert totals.by_tier == {Tier.TERMINAL: 1, Tier.HYGIENE: 0}
+        assert totals.by_tier == {Tier.TERMINAL: 1, Tier.HYGIENE: 0, Tier.LEDGERED: 0}
 
     def test_an_empty_stub_store_is_unreadable_not_a_clean_zero(self, tmp_path):
         root = tmp_path / 'stub'
@@ -232,7 +246,7 @@ class TestDryRunCli:
         census = project['census']
         assert {'measured_at', 'rows_in_store', 'totals', 'violations'} <= census.keys()
         assert census['rows_in_store'] == len(CLI_ROWS)
-        assert census['totals']['by_tier'] == {'terminal': 2, 'hygiene': 1}
+        assert census['totals']['by_tier'] == {'terminal': 2, 'hygiene': 1, 'ledgered': 0}
         assert all(set(v) == VIOLATION_JSON_KEYS for v in census['violations'])
         by_id = {v['task_id']: v for v in census['violations']}
         assert by_id[4028]['tier'] == 'terminal'
@@ -307,6 +321,7 @@ TERMINAL_ONLY = frozenset({Tier.TERMINAL})
 BOTH_TIERS = frozenset({Tier.TERMINAL, Tier.HYGIENE})
 TERMINAL_IDS = {4028, 5225, 101}
 HYGIENE_IDS = {103, 109}
+LEDGERED_IDS = {111}
 
 
 def _apply(census, client, tiers=TERMINAL_ONLY, clock=lambda: NOW):
@@ -358,7 +373,7 @@ class TestApplyRepairs:
 
         verification = _verification(report)
         assert verification.totals().by_tier[Tier.TERMINAL] == 0
-        assert {v.task_id for v in verification.violations} == HYGIENE_IDS
+        assert {v.task_id for v in verification.violations} == HYGIENE_IDS | LEDGERED_IDS
 
     def test_freeform_claimant_with_no_heartbeat_is_repaired_not_skipped(self, seed_root):
         root = seed_root([FREEFORM_CANCELLED])
@@ -796,6 +811,100 @@ class TestApplyOutput:
         ]
         fields = {token.split('=', 1)[0] for token in skipped_line.split()}
         assert {'delta.status', 'delta.claimant_run_id'} <= fields
+
+
+def _tiers_by_id(census: Census) -> dict[int, Tier]:
+    return {v.task_id: v.tier for v in census.violations}
+
+
+class TestLedgeredRows:
+    def test_a_ledger_covered_done_row_is_reported_but_not_written(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server, tiers=BOTH_TIERS)
+
+        assert _tiers_by_id(census)[111] is Tier.LEDGERED
+        assert 111 not in server.written_ids()
+        assert 111 not in {outcome.violation.task_id for outcome in report.outcomes}
+        assert _claimants(root)[111] == _seeded_claimant(LEDGERED_DONE)
+        assert _tiers_by_id(_verification(report))[111] is Tier.LEDGERED
+
+    def test_a_ledger_naming_another_claimant_does_not_cover_the_row(self, seed_root):
+        restamped = _claimed(
+            112, 'done', 'run-m/112-x/pid=13', STALE, metadata=_ledger('run-old/112-w/pid=1'),
+        )
+        root = seed_root([restamped])
+        census = take_census(root, NOW)
+
+        report = _apply(census, _FakeClaimantServer())
+
+        assert _tiers_by_id(census) == {112: Tier.TERMINAL}
+        assert _buckets(report) == {112: Bucket.REPAIRED}
+        assert _claimants(root)[112] == (None, None)
+
+    def test_a_row_ledgered_after_the_census_is_skipped(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        _mutate_store(
+            root,
+            'UPDATE tasks SET metadata = ? WHERE id = 4028',
+            (json.dumps(_ledger(POSITIVE_CONTROL['claimant_run_id'])),),
+        )
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server)
+
+        assert 4028 not in server.written_ids()
+        assert _skip_delta(report, 4028) == {'tier': ('terminal', 'ledgered')}
+        assert _claimants(root)[4028] == _seeded_claimant(POSITIVE_CONTROL)
+
+    def test_a_row_unledgered_after_the_census_arrives_during_the_window(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        _mutate_store(root, 'UPDATE tasks SET metadata = NULL WHERE id = 111')
+        server = _FakeClaimantServer()
+
+        report = _apply(census, server, clock=_ticking_clock())
+
+        assert _tiers_by_id(census)[111] is Tier.LEDGERED
+        assert 111 not in server.written_ids()
+        assert _outcome_for(report, 111).bucket is Bucket.ARRIVED_DURING_WINDOW
+        assert _tiers_by_id(_verification(report))[111] is Tier.TERMINAL
+        assert _claimants(root)[111] == _seeded_claimant(LEDGERED_DONE)
+
+    def test_a_dry_run_reports_ledgered_rows_separately(self, seed_root):
+        result = _sweep([seed_root(TIER_TABLE_ROWS)], None, apply=False)
+
+        payload = json.loads(render_json(result))
+        census = payload['projects'][0]['census']
+        (ledgered,) = [v for v in census['violations'] if v['task_id'] == 111]
+        assert ledgered['tier'] == 'ledgered'
+        assert census['totals']['by_tier']['ledgered'] == 1
+        assert payload['repair_tiers'] == ['terminal']
+        text = render_text(result)
+        assert 'tier=ledgered' in _violation_line(text, 111).split()
+        assert 'ledgered=1' in text.split()
+
+    def test_apply_repairs_refuses_to_select_the_ledgered_tier(self, seed_root):
+        root = seed_root(TIER_TABLE_ROWS)
+        census = take_census(root, NOW)
+        before = _store_rows(root)
+        server = _FakeClaimantServer()
+
+        with pytest.raises(ValueError, match='ledgered'):
+            _apply(census, server, tiers=frozenset({Tier.TERMINAL, Tier.LEDGERED}))
+
+        assert server.calls == []
+        assert _store_rows(root) == before
+
+    def test_sweep_refuses_to_select_the_ledgered_tier_before_reading(self, tmp_path):
+        with pytest.raises(ValueError, match='ledgered'):
+            _sweep(
+                [str(tmp_path / 'missing')], None, apply=False,
+                tiers=frozenset({Tier.TERMINAL, Tier.LEDGERED}),
+            )
 
 
 class TestExitCode:
