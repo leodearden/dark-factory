@@ -44,8 +44,14 @@ from orchestrator.agents.briefing import (
 from orchestrator.agents.memory_recall import MEMORY_CONTEXT_CAVEAT
 from orchestrator.agents.roles import ARCHITECT, ARCHITECT_PLAN_TOOLS_RECIPE, ROLES
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.escalation_rulings import Ruling
 from orchestrator.mcp import plan_tools
-from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, check_done_step_integrity
+from orchestrator.plan_descope import (
+    DESCOPE_DISPOSITIONS,
+    DoneStepIntegrityVerdict,
+    check_done_step_integrity,
+)
+from orchestrator.review_lineage import RetiredReview
 
 
 @pytest.fixture
@@ -781,7 +787,7 @@ def _recipe_signature_spellings(text: str) -> list[str]:
 _SPOT_TASK = {
     'id': '5532',
     'title': 'Recipe single-home task',
-    'description': 'A task whose briefing renders every optional architect section.',
+    'description': 'The task every recipe single-home dispatch briefs.',
     'metadata': {
         'dry_run_proposals': [
             {
@@ -796,6 +802,42 @@ _SPOT_TASK = {
 }
 
 _SPOT_COMMITTED_WORK = [{'sha': 'a' * 40, 'subject': 'feat: an earlier attempt'}]
+
+_SPOT_RULINGS = (
+    Ruling(
+        escalation_id='esc-5532-9', level=2, summary='keep or drop the write-through cache?',
+        resolution='KEEP the write-through cache — operator ruling',
+        resolved_at='2026-10-18T00:00:00+00:00', resolved_by='interactive',
+        resolution_action='resume',
+    ),
+)
+
+_SPOT_RETIRED_REVIEWS = (
+    RetiredReview(
+        branch='refs/heads/task/5532-20261112T000000Z',
+        tip_sha='c' * 12,
+        parking='/q/5532-20261112T000000Z',
+        quarantined_at='2026-11-12T00:00:00+00:00',
+        amendment_rounds_total=1,
+        review_cycles_total=0,
+        archive=Path('/meta/task-5532/retired-reviews/5532-20261112T000000Z'),
+        suggestions=(
+            {
+                'reviewer': 'reviewer_comprehensive',
+                'location': 'orchestrator/x.py:12',
+                'category': 'correctness',
+                'description': 'the cache invalidation misses the delete path',
+                'suggested_fix': 'invalidate on delete as well as on write',
+            },
+        ),
+    ),
+)
+
+_SPOT_INTEGRITY_REFUSAL = DoneStepIntegrityVerdict(
+    undisposed_drops=(('s1', 'b' * 40),),
+    introduced_duplicates=(),
+    invalid_descope_records=(),
+)
 
 _SPOT_PLAN = {
     'files': ['a.py'],
@@ -813,19 +855,40 @@ _ARCHITECT_DISPATCHES: dict[str, _ArchitectDispatch] = {
     'fresh_with_optional_sections': _ArchitectDispatch(
         'build_architect_prompt',
         (_SPOT_TASK,),
-        {'include_prior_proposals': True, 'committed_work': _SPOT_COMMITTED_WORK},
+        {
+            'include_prior_proposals': True,
+            'committed_work': _SPOT_COMMITTED_WORK,
+            'rulings': _SPOT_RULINGS,
+            'retired_reviews': _SPOT_RETIRED_REVIEWS,
+        },
     ),
     'revalidation': _ArchitectDispatch(
         'build_revalidation_prompt', (_SPOT_TASK, _SPOT_PLAN, ['a.py']), {},
     ),
+    'revalidation_with_optional_sections': _ArchitectDispatch(
+        'build_revalidation_prompt',
+        (_SPOT_TASK, _SPOT_PLAN, ['a.py']),
+        {
+            'text_drift': TaskTextDrift.AMENDED,
+            'integrity_refusal': _SPOT_INTEGRITY_REFUSAL,
+            'rulings': _SPOT_RULINGS,
+            'retired_reviews': _SPOT_RETIRED_REVIEWS,
+        },
+    ),
     'completion': _ArchitectDispatch(
         'build_plan_completion_prompt', (_SPOT_TASK, _SPOT_PLAN), {},
+    ),
+    'completion_with_optional_sections': _ArchitectDispatch(
+        'build_plan_completion_prompt', (_SPOT_TASK, _SPOT_PLAN), {'rulings': _SPOT_RULINGS},
     ),
     'tightening': _ArchitectDispatch(
         'build_plan_tightening_prompt', (_SPOT_TASK, _SPOT_PLAN, ['a.py']), {},
     ),
     'schema_repair': _ArchitectDispatch('build_plan_schema_repair_prompt', (_SPOT_TASK,), {}),
     'replan': _ArchitectDispatch('build_replan_prompt', (_SPOT_TASK, 'REVIEW-FEEDBACK'), {}),
+    'replan_with_optional_sections': _ArchitectDispatch(
+        'build_replan_prompt', (_SPOT_TASK, 'REVIEW-FEEDBACK'), {'rulings': _SPOT_RULINGS},
+    ),
 }
 
 
