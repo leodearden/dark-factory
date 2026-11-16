@@ -716,6 +716,28 @@ class TestRunTaskFamilyCensusDelegation:
 
         mock_census.sweep.assert_awaited_once_with(group_id='know_live')
 
+    @pytest.mark.asyncio
+    async def test_opens_the_store_for_reads_only(self, make_fake_maintenance_service):
+        from fused_memory.maintenance._utils import ServiceOpen
+
+        mock_service = AsyncMock()
+        mock_service.graphiti = MagicMock()
+
+        with (
+            patch(
+                'fused_memory.maintenance.task_family_census.maintenance_service',
+                side_effect=make_fake_maintenance_service(MagicMock(), mock_service),
+            ) as entered,
+            patch(
+                'fused_memory.maintenance.task_family_census.TaskFamilyCensus'
+            ) as mock_census_cls,
+        ):
+            mock_census_cls.return_value.sweep = AsyncMock(return_value=MagicMock())
+
+            await run_task_family_census(config_path='/tmp/config.yaml')
+
+        entered.assert_called_once_with('/tmp/config.yaml', open_as=ServiceOpen.READS)
+
 
 class TestTheParserExposesNoWayToMutateTheGraph:
     """Read-only is this workstream's central promise, so it is asserted about

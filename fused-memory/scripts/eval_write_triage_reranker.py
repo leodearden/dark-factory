@@ -776,14 +776,10 @@ def _library_versions() -> dict[str, str | None]:
 
 @contextlib.asynccontextmanager
 async def _live_memory_service(config: Any) -> AsyncIterator[Any]:
-    from fused_memory.services.memory_service import MemoryService
+    from fused_memory.maintenance._utils import maintenance_service
 
-    memory = MemoryService(config)
-    await memory.initialize()
-    try:
+    async with maintenance_service(config=config) as (_, memory):
         yield memory
-    finally:
-        await memory.close()
 
 
 def run_cli(

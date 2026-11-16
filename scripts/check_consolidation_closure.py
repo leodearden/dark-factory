@@ -79,9 +79,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import sqlite3
 import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -275,20 +277,25 @@ async def scroll_cluster(
     }
 
 
-def build_memory_service() -> Any:
-    """``MemoryService(config)`` — the exact object the seam's scroll is bound to.
+@contextlib.asynccontextmanager
+async def open_memory_service() -> AsyncIterator[Any]:
+    """The live ``MemoryService`` — the exact object the seam's scroll is bound to.
 
-    ``initialize()`` is deliberately NOT awaited: ``MemoryService.__init__``
-    already constructs ``self.mem0 = Mem0Backend(config)``, whose Qdrant
-    client is lazy, and ``get_memories_by_metadata`` /
-    ``count_memories_by_metadata`` go straight through it. So this read-only
-    check needs neither FalkorDB/Graphiti nor an embedder / OPENAI_API_KEY —
-    the same argument ``census_memory_metadata.py::_build_backend`` makes.
+    Opened with ``ServiceOpen.NONE``: ``MemoryService.__init__`` already
+    constructs ``self.mem0 = Mem0Backend(config)``, whose Qdrant client is
+    lazy, and ``get_memories_by_metadata`` / ``count_memories_by_metadata`` go
+    straight through it. So this read-only check needs neither
+    FalkorDB/Graphiti nor an embedder / OPENAI_API_KEY — the same argument
+    ``census_memory_metadata.py::_build_backend`` makes. The shared close
+    still releases the lazy client on exit.
     """
     from fused_memory.config.schema import FusedMemoryConfig
-    from fused_memory.services.memory_service import MemoryService
+    from fused_memory.maintenance._utils import ServiceOpen, maintenance_service
 
-    return MemoryService(FusedMemoryConfig())
+    async with maintenance_service(
+        config=FusedMemoryConfig(), open_as=ServiceOpen.NONE,
+    ) as (_, memory):
+        yield memory
 
 
 # --------------------------------------------------------------------------- #
@@ -371,23 +378,23 @@ async def run(args: argparse.Namespace, *, memory: Any = None) -> int:
         return EXIT_USAGE
 
     topic = block["topic"]
-    if memory is None:
-        memory = build_memory_service()
-
     store_error: str | None = None
-    try:
-        scrolled = await scroll_cluster(
-            memory, project_id, topic, block=block
-        )
-    except Exception as exc:  # any store failure is "could not check"
-        store_error = f"{type(exc).__name__}: {exc}"
-        scrolled = {
-            "members": [],
-            "total": None,
-            "truncated": False,
-            "available": False,
-            "unstamped": (),
-        }
+    async with contextlib.AsyncExitStack() as stack:
+        if memory is None:
+            memory = await stack.enter_async_context(open_memory_service())
+        try:
+            scrolled = await scroll_cluster(
+                memory, project_id, topic, block=block
+            )
+        except Exception as exc:
+            store_error = f"{type(exc).__name__}: {exc}"
+            scrolled = {
+                "members": [],
+                "total": None,
+                "truncated": False,
+                "available": False,
+                "unstamped": (),
+            }
 
     verdict = evaluate_closure(
         block,

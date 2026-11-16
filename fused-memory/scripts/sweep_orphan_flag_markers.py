@@ -2323,10 +2323,9 @@ def main() -> int:
 
     async def _run_live() -> dict:
         from fused_memory.config.schema import FusedMemoryConfig
-        from fused_memory.services.memory_service import MemoryService
+        from fused_memory.maintenance._utils import maintenance_service
 
         config = FusedMemoryConfig()
-        memory = MemoryService(config)
         now_dt = datetime.now(UTC)
         if args.terminal_drain:
             terminal_task_ids, drain_mode = await _resolve_terminal_task_ids(
@@ -2345,14 +2344,10 @@ def main() -> int:
             args.project_id,
             _effective_mode_label(drain_mode, terminal_task_ids),
         )
-        try:
-            await memory.initialize()
+        async with maintenance_service(config=config) as (_, memory):
             return await run(
                 args, memory, now=now_dt, terminal_task_ids=terminal_task_ids,
             )
-        finally:
-            if hasattr(memory, 'close'):
-                await memory.close()
 
     try:
         report = asyncio.run(_run_live())

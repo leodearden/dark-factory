@@ -2252,15 +2252,10 @@ async def open_live_memory_service():
     never constructs a backend.
     """
     from fused_memory.config.schema import FusedMemoryConfig
-    from fused_memory.services.memory_service import MemoryService
+    from fused_memory.maintenance._utils import maintenance_service
 
-    memory = MemoryService(FusedMemoryConfig())
-    try:
-        await memory.initialize()
+    async with maintenance_service(config=FusedMemoryConfig()) as (_, memory):
         yield memory
-    finally:
-        if hasattr(memory, 'close'):
-            await memory.close()
 
 
 def open_mcp_client(server_url: str | None) -> Any:
