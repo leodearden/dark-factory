@@ -13,12 +13,16 @@ from unittest.mock import Mock
 import pytest
 
 from shared.account_reserve import (
+    ActiveReserve,
+    InvalidReserve,
     ReserveConfig,
     ReserveEvent,
+    ReserveState,
     ScheduleDrift,
     WorkClass,
     WorkKind,
     admits,
+    parse_reserve,
     resolve_work_class,
     schedule_drift,
 )
@@ -301,3 +305,51 @@ class TestScheduleDrift:
     def test_a_naive_banner_time_is_refused(self) -> None:
         with pytest.raises(ValueError, match='timezone-aware'):
             schedule_drift(reserve_config(), datetime(2026, 11, 23, 22))
+
+
+ROSTER = ['max-d', 'max-e', 'max-f', 'max-g', 'max-b', 'max-c', 'max-h']
+
+
+class TestParseReserve:
+    def test_the_prd_block_is_an_active_reserve(self) -> None:
+        reserve = parse_reserve(prd_block(), ROSTER)
+
+        assert isinstance(reserve, ActiveReserve)
+        assert reserve.state is ReserveState.ACTIVE
+        assert reserve.config.account == 'max-h'
+
+    @pytest.mark.parametrize(
+        ('block', 'cause'),
+        [
+            pytest.param(prd_block(colour='red'), 'colour', id='unknown-key'),
+            pytest.param(prd_block(account='max-z'), 'max-z', id='unlisted-account'),
+            pytest.param(prd_block(release_hours=0), 'release_hours', id='release-hours-0'),
+            pytest.param(prd_block(release_hours=168), 'release_hours', id='release-hours-168'),
+            pytest.param(
+                prd_block(weekly_reset_utc='funday 21:00'), 'weekly_reset_utc', id='unknown-day'
+            ),
+            pytest.param(
+                prd_block(weekly_reset_utc='mon 25:00'), 'weekly_reset_utc', id='hour-25'
+            ),
+            pytest.param(
+                prd_block(weekly_reset_utc='mon 21:60'), 'weekly_reset_utc', id='minute-60'
+            ),
+            pytest.param(prd_block(weekly_reset_utc='mon'), 'weekly_reset_utc', id='no-time'),
+            pytest.param(prd_block(weekly_reset_utc='21:00'), 'weekly_reset_utc', id='no-day'),
+            pytest.param(None, 'reserve: ', id='empty-block'),
+            pytest.param([prd_block()], 'reserve: ', id='list-block'),
+        ],
+    )
+    def test_a_bad_block_is_an_invalid_reserve_naming_its_cause(
+        self, block: object, cause: str
+    ) -> None:
+        reserve = parse_reserve(block, ROSTER)
+
+        assert isinstance(reserve, InvalidReserve)
+        assert reserve.state is ReserveState.INVALID
+        assert cause in reserve.reason
+
+    @pytest.mark.parametrize('reason', ['', '   '])
+    def test_an_invalid_reserve_always_carries_its_reason(self, reason: str) -> None:
+        with pytest.raises(ValueError, match='reason'):
+            InvalidReserve(reason)
