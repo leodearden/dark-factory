@@ -26,7 +26,7 @@ from orchestrator.config import (
     diff_config,
     load_config,
 )
-from orchestrator.lock_table import ModuleLockTable
+from orchestrator.lock_table import UNLIMITED_HOLDERS, ModuleLockTable
 
 pytestmark = pytest.mark.usefixtures('code_default_config')
 
@@ -221,6 +221,37 @@ class TestSnapshotsNameEveryHolder:
 
         assert table.snapshot_held_by_task() == {}
         assert table.snapshot_holders() == {}
+
+    def test_holder_limits_name_each_held_keys_limit(self):
+        table = _table(DOCS_AND_ROOT_MARKDOWN)
+        assert table.try_acquire('A', ['OPERATIONS.md', 'src/c.py'])
+        assert table.try_acquire('B', ['OPERATIONS.md'])
+
+        assert table.snapshot_holder_limits() == {
+            'OPERATIONS.md': UNLIMITED_HOLDERS,
+            'src/c.py': 1,
+        }
+
+    def test_an_exact_override_beats_the_rule_in_the_published_limit(self):
+        table = _table(DOCS_AND_ROOT_MARKDOWN, module_overrides={'docs/exclusive.md': 1})
+        assert table.try_acquire('A', ['docs/exclusive.md'])
+
+        assert table.snapshot_holder_limits() == {'docs/exclusive.md': 1}
+
+    def test_a_released_tasks_keys_leave_the_holder_limits(self):
+        table = _table(DOCS_AND_ROOT_MARKDOWN)
+        assert table.try_acquire('A', ['OPERATIONS.md', 'src/c.py'])
+        assert table.try_acquire('B', ['OPERATIONS.md'])
+
+        table.release('A')
+
+        assert table.snapshot_holder_limits() == {'OPERATIONS.md': UNLIMITED_HOLDERS}
+
+    def test_a_task_admitted_with_no_keys_publishes_no_limit(self):
+        table = _table(DOCS_AND_ROOT_MARKDOWN)
+        assert table.try_acquire('G', [])
+
+        assert table.snapshot_holder_limits() == {}
 
 
 class TestPrefixValidation:
