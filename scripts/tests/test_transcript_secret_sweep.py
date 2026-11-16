@@ -489,7 +489,7 @@ class TestMain:
         return json.loads(line)
 
     def test_a_sweep_with_nothing_to_redact_exits_0(self, secretless_environ, monkeypatch, tmp_path, capsys):
-        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', NON_LIVE + 'z' * 8)
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', 'sk-ant-oat01-' + 'Un' * 17 + 'U')
         tree = Tree(tmp_path)
 
         assert sweep.main(self._argv(tree, tmp_path)) == 0
