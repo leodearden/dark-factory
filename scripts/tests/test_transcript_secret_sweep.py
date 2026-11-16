@@ -10,11 +10,15 @@ is the 2026-10-11 one.
 from __future__ import annotations
 
 import datetime
+import getpass
 import gzip
+import hashlib
 import json
 import os
 import stat
+import tempfile
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -40,8 +44,12 @@ def _line_with(text: str) -> str:
 
 
 def _write(path: Path, lines: list[str], *, mtime_ns: int = OLD_MTIME_NS) -> Path:
+    return _write_raw(path, ''.join(f'{line}\n' for line in lines).encode(), mtime_ns=mtime_ns)
+
+
+def _write_raw(path: Path, data: bytes, *, mtime_ns: int = OLD_MTIME_NS) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(''.join(f'{line}\n' for line in lines).encode())
+    path.write_bytes(data)
     path.chmod(0o664)
     os.utime(path, ns=(mtime_ns, mtime_ns))
     return path
@@ -163,6 +171,56 @@ def logs(tmp_path: Path) -> LogTree:
     return LogTree(tmp_path)
 
 
+def _env_minus_zero(environ: Mapping[str, str]) -> bytes:
+    return b'\0'.join(f'{name}={value}'.encode() for name, value in environ.items())
+
+
+class PytestTmpTree:
+    """A pytest base temp as env-capturing tests leave it: raw environ dumps and JSON captures."""
+
+    def __init__(self, base: Path) -> None:
+        self.root = base / 'pytest-of-u'
+        test_dir = self.root / 'pytest-7' / 'popen-gw0' / 'test_x0'
+        raw = _env_minus_zero(ENVIRON)
+        self.env_dump = _write_raw(test_dir / 'env-dump', raw)
+        self.captured_env = _write_raw(test_dir / 'captured_env.bin', raw)
+        self.child_env = _write_raw(test_dir / 'child_env.bin', raw)
+        self.env_json = _write(test_dir / 'env.json', [json.dumps(ENVIRON)])
+        self.env_dump_json = _write(test_dir / 'env-dump.json', [json.dumps({'env': ENVIRON})])
+        self.capture_json = _write(test_dir / 'capture.json', json.dumps({'env': ENVIRON}, indent=2).splitlines())
+        self.capture_jsonl = _write(test_dir / 'capture.jsonl', [json.dumps({'argv': ['claude'], 'env': ENVIRON})])
+        self.runner_state = _write(
+            test_dir / 'fake-runner-state.json',
+            [json.dumps({'calls': [{'env': {'CLAUDE_OAUTH_TOKEN_A': POOL_A}}]})],
+        )
+        self.decoys = (
+            _write_raw(test_dir / 'seeded.bin', raw),
+            _write(test_dir / 'notes.txt', [f'token {POOL_A}']),
+            _write(test_dir / '.env', [f'CLAUDE_OAUTH_TOKEN_A={POOL_A}', f'OPENAI_API_KEY={OPENAI}']),
+        )
+        self.fresh = _write_raw(
+            self.root / 'pytest-8' / 'test_y0' / 'env-dump', raw, mtime_ns=FRESH_MTIME_NS,
+        )
+
+    def expected_counts(self) -> dict[Path, dict[str, int]]:
+        both = {'CLAUDE_OAUTH_TOKEN_A': 1, 'OPENAI_API_KEY': 1}
+        return {
+            self.env_dump: both,
+            self.captured_env: both,
+            self.child_env: both,
+            self.env_json: both,
+            self.env_dump_json: both,
+            self.capture_json: both,
+            self.capture_jsonl: both,
+            self.runner_state: {'CLAUDE_OAUTH_TOKEN_A': 1},
+        }
+
+    def config(self, base: Path) -> sweep.SweepConfig:
+        return sweep.SweepConfig(
+            trees=sweep.swept_trees([], base / 'no-claude', pytest_tmp_dir=self.root), now=NOW,
+        )
+
+
 def _identity(path: Path) -> tuple[int, int]:
     st = path.stat()
     return st.st_ino, st.st_mtime_ns
@@ -225,6 +283,80 @@ def test_swept_trees_are_each_projects_transcripts_verify_logs_and_offline_lane_
         sweep.SweptTree(claude, sweep.TRANSCRIPT_SUFFIXES),
     )
     assert {'.log', '.json', '.xml', '.xml.gz'} <= set(sweep.LOG_SUFFIXES)
+
+
+def test_the_pytest_base_temp_is_swept_last_and_only_for_env_dump_names(tree, tmp_path):
+    roots, claude = tree.project_roots, tree.claude_projects
+    pytest_tmp = tmp_path / 'pytest-of-u'
+
+    assert sweep.swept_trees(roots, claude, pytest_tmp_dir=pytest_tmp) == (
+        *sweep.swept_trees(roots, claude),
+        sweep.SweptTree(pytest_tmp, sweep.PYTEST_ENV_DUMP_SUFFIXES),
+    )
+
+
+def test_the_pytest_base_temp_is_pytests_own_per_user_dir():
+    assert sweep.pytest_base_temp() == Path(tempfile.gettempdir()) / f'pytest-of-{getpass.getuser()}'
+
+
+def test_one_sweep_redacts_the_env_dumps_a_pytest_base_temp_holds(tmp_path):
+    dumps = PytestTmpTree(tmp_path)
+    expected = dumps.expected_counts()
+    before = {path: path.stat() for path in expected}
+    decoys = {path: (path.read_bytes(), _identity(path)) for path in dumps.decoys}
+    poster = Recorder()
+
+    result = sweep.run(dumps.config(tmp_path), environ=ENVIRON, post_escalation=poster)
+
+    assert {hit.path: dict(hit.counts) for hit in result.redacted} == expected
+    for path in expected:
+        data = path.read_bytes()
+        after = path.stat()
+        _no_value_in(data.decode())
+        assert after.st_size == before[path].st_size
+        assert stat.S_IMODE(after.st_mode) == 0o664
+        assert after.st_mtime_ns == before[path].st_mtime_ns
+        if path.suffix == '.json':
+            json.loads(data)
+    for path, (content, identity) in decoys.items():
+        assert path.read_bytes() == content
+        assert _identity(path) == identity
+    assert result.deferred == (dumps.fresh,)
+    (arguments,) = poster.calls
+    for path in expected:
+        assert f'{path}: ' in arguments['detail']
+    _no_value_in(json.dumps(arguments))
+    _no_value_in(json.dumps(result.record()))
+
+
+def test_a_truncated_value_in_a_verify_log_and_a_gzipped_junit_is_redacted(tmp_path):
+    var = 'ANTHROPIC_API_KEY'
+    value = 'sk-ant-api03-' + hashlib.sha512(b'a live anthropic key').hexdigest()[:95]
+    attempt = verify_logs_dir(tmp_path / 'proj') / '10160'
+    log = _write(attempt / 'attempt-1.remote-laptop.test-X.log', [
+        f"E   AssertionError: {{'{var}': '{value[:95]}...', 'PATH': '/usr/bin'}}",
+        '1 failed in 0.42s',
+    ])
+    junit = _write_gzip(
+        attempt / 'attempt-1.orchestrator.junit-X.xml.gz',
+        _junit_lines(message=f'AssertionError: leaked {value[:40]}...', text='E   assert False'),
+    )
+    before = {path: (path.stat(), _decoded(path)) for path in (log, junit)}
+    config = sweep.SweepConfig(trees=sweep.swept_trees([tmp_path / 'proj'], tmp_path / 'no-claude'), now=NOW)
+    poster = Recorder()
+
+    result = sweep.run(config, environ={var: value}, post_escalation=poster)
+
+    assert {hit.path: dict(hit.counts) for hit in result.redacted} == {log: {var: 1}, junit: {var: 1}}
+    for path, (st, content) in before.items():
+        after = _decoded(path)
+        assert len(after) == len(content)
+        assert value[:40].encode() not in after
+        assert path.stat().st_mtime_ns == st.st_mtime_ns
+    assert f'<redacted:{var}>' in _readable_xml(_decoded(junit))
+    (arguments,) = poster.calls
+    for text in (json.dumps(arguments), json.dumps(result.record())):
+        assert value[:16] not in text
 
 
 def test_one_sweep_redacts_verify_and_offline_lane_logs(logs):
@@ -482,6 +614,7 @@ class TestMain:
             '--claude-projects-dir', str(tree.claude_projects),
             '--escalation-url', escalation_url,
             '--min-age-secs', '0',
+            '--pytest-tmp-dir', str(tmp_path / 'no-pytest'),
         ]
 
     def _record(self, capsys) -> dict:
@@ -547,3 +680,18 @@ class TestMain:
 
         assert POOL_A.encode() not in logs.verify_log.read_bytes()
         assert str(logs.verify_log) in {hit['path'] for hit in self._record(capsys)['redacted']}
+
+    def test_a_pytest_tmp_dir_is_swept(self, secretless_environ, monkeypatch, tmp_path, capsys):
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', POOL_A)
+        tree = Tree(tmp_path)
+        dumps = PytestTmpTree(tmp_path)
+
+        with StubMcpServer(stateful=True, payload={'id': 'esc-1', 'status': 'pending'}) as server:
+            argv = self._argv(tree, tmp_path, escalation_url=f'{server.url}/mcp')
+            assert sweep.main([*argv, '--pytest-tmp-dir', str(dumps.root)]) == 0
+
+        out, err = capsys.readouterr()
+        (line,) = out.splitlines()
+        assert str(dumps.env_dump) in {hit['path'] for hit in json.loads(line)['redacted']}
+        assert POOL_A.encode() not in dumps.env_dump.read_bytes()
+        assert POOL_A[:16] not in out + err
