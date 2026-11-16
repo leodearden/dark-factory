@@ -7,7 +7,8 @@ that seam.  Built on stdlib ``http.server`` for the reason
 ``_mock_openai_server.py`` gives: no HTTP-mock library is installed.
 
 Collection meta-ops (create) run one after another under a single lock, as a
-real Qdrant runs them.  The latency of a create, of a point upsert
+real Qdrant runs them.  The latency of a create, of a payload-index create
+(``PUT /collections/{name}/index``), of a point upsert
 (``PUT /collections/{name}/points``) and of a point retrieve
 (``POST /collections/{name}/points``) is set per collection; the latency of a
 collection list (``GET /collections``), which names no collection, is one
@@ -61,6 +62,7 @@ class StubQdrantServer:
         self,
         *,
         create_delay_s: Mapping[str, float],
+        index_delay_s: Mapping[str, float],
         upsert_delay_s: Mapping[str, float],
         retrieve_delay_s: Mapping[str, float],
         list_collections_delay_s: float,
@@ -72,6 +74,7 @@ class StubQdrantServer:
         self.release_event = threading.Event()
         """Set it to finish every pending and future delayed request without its delay."""
         self._create_delay_s = dict(create_delay_s)
+        self._index_delay_s = dict(index_delay_s)
         self._upsert_delay_s = dict(upsert_delay_s)
         self._retrieve_delay_s = dict(retrieve_delay_s)
         self._list_collections_delay_s = list_collections_delay_s
@@ -87,6 +90,7 @@ class StubQdrantServer:
         self._upserted: dict[str, threading.Event] = {}
         self._open_connections = 0
         self._collection_lists_in_flight = 0
+        self._index_creates_in_flight: Counter[str] = Counter()
         for name in preexisting:
             self._created_event(name).set()
 
@@ -119,6 +123,11 @@ class StubQdrantServer:
         """How many ``GET /collections`` requests the server is holding unanswered right now."""
         with self._state_lock:
             return self._collection_lists_in_flight
+
+    def index_creates_in_flight(self, name: str) -> int:
+        """How many ``PUT /collections/{name}/index`` requests the server is holding unanswered right now."""
+        with self._state_lock:
+            return self._index_creates_in_flight[name]
 
     def _connection_opened(self) -> None:
         with self._state_lock:
@@ -184,6 +193,16 @@ class StubQdrantServer:
             self._created_event(name).set()
             return 200, _ok(True)
 
+    def _create_index(self, name: str) -> tuple[int, dict[str, Any]]:
+        with self._state_lock:
+            self._index_creates_in_flight[name] += 1
+        try:
+            self.release_event.wait(self._index_delay_s.get(name, 0.0))
+            return 200, _ok({'operation_id': 0, 'status': 'completed'})
+        finally:
+            with self._state_lock:
+                self._index_creates_in_flight[name] -= 1
+
     def _upsert(self, name: str) -> tuple[int, dict[str, Any]]:
         with self._state_lock:
             self._upsert_requests[name] += 1
@@ -207,8 +226,8 @@ class StubQdrantServer:
                 return self._check_exists(name)
             case 'PUT', ['collections', name]:
                 return self._create(name, body)
-            case 'PUT', ['collections', _, 'index']:
-                return 200, _ok({'operation_id': 0, 'status': 'completed'})
+            case 'PUT', ['collections', name, 'index']:
+                return self._create_index(name)
             case 'PUT', ['collections', name, 'points']:
                 return self._upsert(name)
             case 'POST', ['collections', name, 'points']:
@@ -264,6 +283,7 @@ def stub_qdrant_server(
     *,
     host: str = '127.0.0.1',
     create_delay_s: Mapping[str, float] | None = None,
+    index_delay_s: Mapping[str, float] | None = None,
     upsert_delay_s: Mapping[str, float] | None = None,
     retrieve_delay_s: Mapping[str, float] | None = None,
     list_collections_delay_s: float = 0.0,
@@ -274,8 +294,9 @@ def stub_qdrant_server(
     """Serve the stub on an ephemeral port of loopback address *host*.
 
     *create_delay_s* is how long a create of each named collection takes, and
-    *upsert_delay_s* and *retrieve_delay_s* how long a point upsert into, or a
-    point retrieve from, it takes; a retrieve always answers no points.
+    *index_delay_s*, *upsert_delay_s* and *retrieve_delay_s* how long a
+    payload-index create on, a point upsert into, or a point retrieve from, it
+    takes; a retrieve always answers no points.
     *list_collections_delay_s* is how long every ``GET /collections`` takes.
     *preexisting* collections exist from the start.  A create of a collection
     in *conflict_on_create* answers 409 AND leaves it created, as when another
@@ -285,6 +306,7 @@ def stub_qdrant_server(
     """
     state = StubQdrantServer(
         create_delay_s=create_delay_s or {},
+        index_delay_s=index_delay_s or {},
         upsert_delay_s=upsert_delay_s or {},
         retrieve_delay_s=retrieve_delay_s or {},
         list_collections_delay_s=list_collections_delay_s,

@@ -395,11 +395,19 @@ class Mem0Backend:
         return await asyncio.shield(creation)
 
     async def _create_instance(self, scope: Scope) -> AsyncMemory:
+        """Build and cache *scope*'s instance; start afresh if :meth:`close` closed its client meanwhile.
+
+        mem0 swallows a failed payload-index create, so an instance built on a
+        client closed mid-build is returned as if whole and would fail every call.
+        """
         collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
         config_dict = self._build_config_dict(collection_name)
         await self._ensure_collection(collection_name)
-        config_dict['vector_store']['config']['client'] = self._get_vector_store_client()
+        client = self._get_vector_store_client()
+        config_dict['vector_store']['config']['client'] = client
         instance = await self._timed_write(asyncio.to_thread(AsyncMemory.from_config, config_dict), 'create_instance')
+        if client is not self._vector_store_client:
+            return await self._create_instance(scope)
         self._instances[scope.project_id] = instance
         logger.info(f'Mem0 instance created for project {scope.project_id} (collection: {collection_name})')
         return instance

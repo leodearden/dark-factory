@@ -120,6 +120,20 @@ async def test_a_backend_used_again_after_close_still_serves(config):
 
 
 @pytest.mark.asyncio
+async def test_a_close_while_mem0_builds_its_indexes_leaves_the_backend_serving(config, target):
+    with stub_qdrant_server(index_delay_s={target: 30.0}) as stub:
+        async with backend_against(stub.url, config) as backend:
+            first_touch = asyncio.create_task(backend.get(MEMORY_ID, SCOPE))
+            try:
+                await poll_until(lambda: stub.index_creates_in_flight(target) == 1)
+                await backend.close()
+            finally:
+                stub.release_event.set()
+            assert await first_touch is None
+            assert await backend.get(MEMORY_ID, SCOPE) is None
+
+
+@pytest.mark.asyncio
 async def test_a_first_touch_leaves_the_event_loop_free_while_mem0_lists_collections(config):
     with stub_qdrant_server(list_collections_delay_s=30.0) as stub:
         async with backend_against(stub.url, config) as backend:
