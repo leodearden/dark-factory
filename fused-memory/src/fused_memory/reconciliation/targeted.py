@@ -13,7 +13,12 @@ from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claima
 from shared.task_fields import dependency_ids as task_dependency_ids
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.memory_metadata import TARGETED_RECONCILIATION_SOURCE, normalize_supersedes
+from fused_memory.memory_metadata import (
+    RECONCILIATION_COMPLETION_ECHO_MARKER,
+    TARGETED_RECONCILIATION_SOURCE,
+    is_reconciliation_completion_echo,
+    normalize_supersedes,
+)
 from fused_memory.middleware.metadata_dict import raw_metadata_dict
 from fused_memory.middleware.task_interceptor import (
     _extract_metadata_files,
@@ -81,11 +86,6 @@ _SNAPSHOT_CONTRADICTING_TRANSITIONS: frozenset[str] = frozenset(
 # ``claimant_clear`` (see TargetedReconciler._clear_claimant_before_unblock).
 ClaimantClearOutcome = Literal['cleared', 'not_needed', 'claimant_live', 'rejected', 'failed']
 
-# The metadata `source` value stamped on the completion-echo memory written by
-# _on_task_done's fast path is memory_metadata.TARGETED_RECONCILIATION_SOURCE.
-# Single-sourced so _is_authoritative_resolution and the fast-path write can't
-# drift out of sync (task 1984).
-
 # Per-verdict framing for the codebase-verification memory written by
 # _on_task_done (task 4723 / PRD D7).  Both verdicts previously shared ONE
 # completion-framed template, so a `contradicted` verdict — the codebase
@@ -127,7 +127,7 @@ _AUTHORITATIVE_PRECHECK_LIMIT = 25
 # _delete_stale_completion_echoes (task 2433). Mirrors
 # _AUTHORITATIVE_PRECHECK_LIMIT's bounded-scroll rationale immediately above,
 # but narrower: the scroll's server-side filter already restricts matches to
-# source == TARGETED_RECONCILIATION_SOURCE AND transition == 'done' (task 2433 review
+# RECONCILIATION_COMPLETION_ECHO_MARKER (task 2433 review
 # amendment — efficiency_robustness), so this cap bounds ONLY this
 # reconciler's own completion echoes for the task, not every task_id-tagged
 # memory — memory_hints, stage1/stage2 markers, etc. never compete for the
@@ -630,9 +630,8 @@ class TargetedReconciler:
                         content += f"\nDetails: {fit_at_word(details, 500)}"
 
             write_metadata: dict[str, Any] = {
-                'source': TARGETED_RECONCILIATION_SOURCE,
+                **RECONCILIATION_COMPLETION_ECHO_MARKER,
                 'task_id': task_id,
-                'transition': 'done',
                 # Task 2642: seed Stage 2's "Completion-Note Suppression
                 # Pre-Check" count gate (prompts/stage2.py) on every
                 # completion echo, so a task completed via
@@ -1012,8 +1011,8 @@ class TargetedReconciler:
         cached value — that fix alone left the OLD echo behind; this sweep
         removes it.
 
-        Matches ONLY memories whose metadata carries both
-        ``source == TARGETED_RECONCILIATION_SOURCE`` and ``transition == 'done'`` — i.e.
+        Matches ONLY memories whose metadata carries
+        ``RECONCILIATION_COMPLETION_ECHO_MARKER`` — i.e.
         exactly the completion echoes `_on_task_done`'s fast path writes —
         so memory_hints, stage1/stage2 markers, and any other task_id-tagged
         memory are never touched. The match is enforced twice (task 2433
@@ -1021,7 +1020,7 @@ class TargetedReconciler:
         scroll's ``filters`` — Mem0 stores ``add_memory(metadata=...)`` keys
         as top-level Qdrant payload fields and ``scroll_by_metadata``
         matches ALL filter keys (see mem0_client.py's docstring), so passing
-        ``source``/``transition`` alongside ``task_id`` narrows the scroll
+        the marker's keys alongside ``task_id`` narrows the scroll
         itself rather than sharing ``_STALE_ECHO_DELETE_LIMIT`` with every
         other task_id-tagged memory; and client-side, as a cheap defensive
         re-check that costs nothing once the result set is already this
@@ -1032,14 +1031,12 @@ class TargetedReconciler:
         """
         memories = await self.memory.get_memories_by_metadata(
             project_id=scope.project_id,
-            filters={'task_id': task_id, 'source': TARGETED_RECONCILIATION_SOURCE, 'transition': 'done'},
+            filters={'task_id': task_id, **RECONCILIATION_COMPLETION_ECHO_MARKER},
             limit=_STALE_ECHO_DELETE_LIMIT,
         )
         stale = [
             m for m in memories
-            if isinstance(m, dict)
-            and (m.get('metadata') or {}).get('source') == TARGETED_RECONCILIATION_SOURCE
-            and (m.get('metadata') or {}).get('transition') == 'done'
+            if isinstance(m, dict) and is_reconciliation_completion_echo(m.get('metadata') or {})
         ]
         deleted_ids: list[str] = []
         for m in stale:

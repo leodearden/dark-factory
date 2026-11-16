@@ -25,6 +25,7 @@ from fused_memory.memory_metadata import (
     MemoryMetadataValidationError,
     is_completion_record,
     is_orchestrator_completion_record,
+    is_reconciliation_completion_echo,
     normalize_supersedes,
 )
 
@@ -1340,3 +1341,16 @@ class TestCompletionRecordRegistry:
     )
     def test_the_orchestrator_only_predicate_is_unchanged(self, meta, expected):
         assert is_orchestrator_completion_record(meta) is expected
+
+    @pytest.mark.parametrize(
+        ('meta', 'expected'),
+        [
+            (RECONCILIATION_ECHO, True),
+            ({'source': TARGETED_RECONCILIATION_SOURCE, 'verification_verdict': 'confirmed'}, False),
+            ({'source': 'stage2', 'transition': 'done'}, False),
+            (ORCHESTRATOR_RECORD, False),
+        ],
+        ids=['echo', 'verification-verdict-note', 'other-source-done', 'orchestrator'],
+    )
+    def test_the_echo_predicate_tells_the_echo_from_the_reconcilers_other_notes(self, meta, expected):
+        assert is_reconciliation_completion_echo(meta) is expected
