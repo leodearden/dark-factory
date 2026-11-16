@@ -17,11 +17,14 @@ the async owner corroboration is tested in ``test_flake_report_owner_liveness.py
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
+from shared.testing_mcp_stub import StubMcpServer
 
 from orchestrator.cli import main
 from orchestrator.flake_ledger import (
@@ -55,13 +58,6 @@ from orchestrator.flake_report import (
 from orchestrator.fm_retry import FM_NULL_SENTINEL_URL
 
 _NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
-
-
-@pytest.fixture(autouse=True)
-def _fused_memory_unreachable(monkeypatch):
-    # The command reads owners live, and the default fused_memory.url is the LIVE server;
-    # the null sentinel refuses at once with no retry window (mcp_lifecycle.fm_session).
-    monkeypatch.setenv('ORCH_FUSED_MEMORY__URL', FM_NULL_SENTINEL_URL)
 
 
 # Every ledger WRITE entry point; the read-only report must reach none of them.
@@ -1612,12 +1608,20 @@ class TestRenderReport:
         assert 'no ledger' in absent or 'not present' in absent, absent
 
 
-# The command's owner read is the real McpSession wire against the null sentinel above,
-# the case _live_mcp_guard.py names as a reason to opt out of forbid_live_mcp.
-@pytest.mark.real_mcp_session
 class TestFlakeLedgerCommand:
     """`orchestrator flake-ledger` end to end.  All sync — the command runs its own event
-    loop for the live owner read."""
+    loop for the live owner read.
+
+    A test whose ledger has an owned open row reads that owner over the real McpSession
+    wire, so it carries ``real_mcp_session``: against :class:`StubMcpServer`, or against
+    the null sentinel, which is all the default fused-memory URL ever reaches here.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fused_memory_unreachable(self, monkeypatch):
+        # The default fused_memory.url is the LIVE server; the null sentinel refuses at
+        # once with no retry window (mcp_lifecycle.fm_session).
+        monkeypatch.setenv('ORCH_FUSED_MEMORY__URL', FM_NULL_SENTINEL_URL)
 
     def _project(self, tmp_path: Path, *, seed: bool = True) -> tuple[Path, Path]:
         """Write a config YAML pointing at a tmp project; optionally seed its ledger.
@@ -1652,6 +1656,7 @@ class TestFlakeLedgerCommand:
     def test_the_command_is_registered(self):
         assert 'flake-ledger' in main.commands
 
+    @pytest.mark.real_mcp_session
     def test_it_prints_the_report_and_exits_zero(self, tmp_path):
         cfg, _ = self._project(tmp_path)
         result = CliRunner().invoke(main, ['flake-ledger', '--config', str(cfg)])
@@ -1679,6 +1684,7 @@ class TestFlakeLedgerCommand:
         assert not (project / 'data' / 'orchestrator' / 'runs.db').exists(), result.output
         assert not (project / 'data').exists(), result.output
 
+    @pytest.mark.real_mcp_session
     def test_every_writer_booby_trapped_and_the_command_still_succeeds(
         self, tmp_path, monkeypatch
     ):
@@ -1695,7 +1701,30 @@ class TestFlakeLedgerCommand:
         result = CliRunner().invoke(main, ['flake-ledger', '--config', str(cfg)])
         assert result.exit_code == 0, result.output
 
-    def test_it_reads_the_owners_live_and_says_when_it_could_not(self, tmp_path):
+    @pytest.mark.real_mcp_session
+    def test_it_reads_the_owners_from_the_configured_fused_memory(self, tmp_path, monkeypatch):
+        def tools(name: str, arguments: Mapping[str, Any]) -> Mapping[str, Any]:
+            return {'statuses': {'4242': 'done'}}
+
+        cfg, project = self._project(tmp_path)
+        with StubMcpServer(stateful=False, tools=tools) as fused_memory:
+            monkeypatch.setenv('ORCH_FUSED_MEMORY__URL', fused_memory.url)
+            result = CliRunner().invoke(main, ['flake-ledger', '--config', str(cfg)])
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        (row,) = [ln for ln in lines if 'tests/test_a.py::test_one' in ln and 'owner=' in ln]
+        assert 'owner=4242 *** OWNER DONE, DEBT CYCLE NOT CLOSED' in row, row
+        assert [ln for ln in lines if 'owner liveness: read live (1 owner(s))' in ln], lines
+        calls = [
+            r.body['params'] for r in fused_memory.requests
+            if isinstance(r.body, dict) and r.body.get('method') == 'tools/call'
+        ]
+        assert [
+            (c['name'], c['arguments']['project_root'], c['arguments']['ids']) for c in calls
+        ] == [('get_statuses', str(project), ['4242'])]
+
+    @pytest.mark.real_mcp_session
+    def test_an_unreachable_fused_memory_reads_as_read_failed(self, tmp_path):
         cfg, _ = self._project(tmp_path)
         result = CliRunner().invoke(main, ['flake-ledger', '--config', str(cfg)])
         assert result.exit_code == 0, result.output
