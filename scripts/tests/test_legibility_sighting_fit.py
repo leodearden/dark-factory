@@ -8,7 +8,7 @@ import json
 
 import pytest
 from legibility import codebook, filing_policy, sighting_fit
-from legibility.sighting_fit import FitVerdict, OfferedSighting, Standing
+from legibility.sighting_fit import FitReplyError, FitVerdict, OfferedSighting, Standing
 from legibility_sighting_fit_fixtures import (
     CAUSE,
     ENTRY_ID,
@@ -299,3 +299,100 @@ def test_a_fit_outcome_record_is_json_safe():
         "unchecked": [],
         "error": None,
     }
+
+
+# ---------------------------------------------------------------------------
+# step-7: the production fit_fn seam
+# ---------------------------------------------------------------------------
+
+def _fake_invoke(reply):
+    calls = []
+
+    def invoke(prompt, model):
+        calls.append((prompt, model))
+        return reply
+
+    invoke.calls = calls
+    return invoke
+
+
+def _reify_check():
+    cb = reify_codebook_with_quotes()
+    [check] = sighting_fit.at_stake(cb, [_entry(cb)])
+    return check
+
+
+def _encoded(text: str) -> str:
+    return json.dumps(text, ensure_ascii=False)
+
+
+def test_the_fit_prompt_carries_the_entry_and_the_verbatim_evidence_but_no_note():
+    invoke = _fake_invoke(json.dumps({"sightings": []}))
+
+    sighting_fit.build_fit_fn(invoke)(_reify_check(), model="m")
+
+    [(prompt, model)] = invoke.calls
+    assert model == "m"
+    for text in (TITLE, CAUSE, FOUNDING_EVIDENCE, *MISATTACHED_SESSIONS, *MISATTACHED_EVIDENCE.values()):
+        assert _encoded(text) in prompt, text
+    for note in MISATTACHED_NOTES.values():
+        assert note not in prompt
+        assert _encoded(note) not in prompt
+
+
+_REPLY = {
+    "sightings": [
+        {"session": MISATTACHED_SESSIONS[0], "exhibits": False, "reason": "stderr kept by 2>&1"},
+        {"session": MISATTACHED_SESSIONS[1], "exhibits": True, "reason": "same guessed probe"},
+    ]
+}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [json.dumps(_REPLY), "```json\n" + json.dumps(_REPLY) + "\n```"],
+    ids=["bare", "fenced"],
+)
+def test_a_fit_reply_parses_into_verdicts(raw):
+    verdicts = sighting_fit.build_fit_fn(_fake_invoke(raw))(_reify_check(), model="m")
+
+    assert tuple(verdicts) == (
+        FitVerdict(session=MISATTACHED_SESSIONS[0], exhibits=False, reason="stderr kept by 2>&1"),
+        FitVerdict(session=MISATTACHED_SESSIONS[1], exhibits=True, reason="same guessed probe"),
+    )
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"session": MISATTACHED_SESSIONS[0], "exhibits": "yes", "reason": "?"},
+        {"session": MISATTACHED_SESSIONS[0], "exhibits": 1, "reason": "?"},
+        {"session": 7, "exhibits": True, "reason": "?"},
+    ],
+    ids=["string-exhibits", "int-exhibits", "int-session"],
+)
+def test_a_malformed_fit_reply_item_is_dropped(item):
+    reply = {"sightings": [item, _REPLY["sightings"][1]]}
+
+    verdicts = sighting_fit.build_fit_fn(_fake_invoke(json.dumps(reply)))(_reify_check(), model="m")
+
+    assert [verdict.session for verdict in verdicts] == [MISATTACHED_SESSIONS[1]]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["no judgment here", json.dumps({"verdicts": []}), json.dumps({"sightings": {"a": 1}})],
+    ids=["unparseable", "no-sightings", "sightings-not-a-list"],
+)
+def test_a_fit_reply_that_is_no_judgment_raises(raw):
+    with pytest.raises(FitReplyError):
+        sighting_fit.build_fit_fn(_fake_invoke(raw))(_reify_check(), model="m")
+
+
+def test_check_leaves_an_entry_unchecked_when_the_fit_reply_is_no_judgment():
+    cb = reify_codebook_with_quotes()
+
+    _, [outcome] = _check(cb, sighting_fit.build_fit_fn(_fake_invoke("no judgment here")))
+
+    assert outcome.unchecked == MISATTACHED_SESSIONS
+    assert "FitReplyError" in outcome.error
