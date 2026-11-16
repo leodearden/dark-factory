@@ -78,11 +78,9 @@ from orchestrator.merge_lane.worker import (
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease
 
-# Liveness bound for a verify gate-entry wait (`gate_*_entered.wait()`): the
-# real git merge work before the first verify gate can take far longer than its
-# ~5s unloaded cost under full-suite xdist load (task 6436).  A hang still
-# fails, just later.
-GATE_ENTRY_TIMEOUT = 45.0
+# Names MERGE_RESULT_TIMEOUT for verify gate-entry waits (`gate_*_entered.wait()`)
+# (task 6436).  A hang still fails, just later.
+GATE_ENTRY_TIMEOUT = MERGE_RESULT_TIMEOUT
 
 # ---------------------------------------------------------------------------
 # (a) Temp-repo GitOps + branch-with-file builders
