@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from shared.account_reserve import ActiveReserve, InvalidReserve, parse_reserve
 
 __all__ = [
     'AccountConfig',
     'UsageCapConfig',
 ]
+
+logger = logging.getLogger(__name__)
 
 
 class AccountConfig(BaseModel):
@@ -103,6 +108,14 @@ class UsageCapConfig(BaseModel):
         default=None,
         description='Path to shared YAML file with accounts list (overrides inline accounts)',
     )
+    reserve: ActiveReserve | InvalidReserve | None = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "The accounts file's reserve: block, set by _load_accounts_file only; None means "
+            'no block (plans/allowance-reserve-by-account-prd.md §6.2).'
+        ),
+    )
     scoped_cap_models: list[str] = Field(
         default_factory=lambda: ['claude-fable-5'],
         description=(
@@ -110,6 +123,12 @@ class UsageCapConfig(BaseModel):
             '[] disables scoping entirely (kill switch).'
         ),
     )
+
+    @field_validator('reserve', mode='plain')
+    @classmethod
+    def _ignore_inline_reserve(cls, value: object) -> None:
+        logger.warning('usage_cap.reserve is read from the accounts file only; inline value ignored')
+        return None
 
     @model_validator(mode='after')
     def _load_accounts_file(self) -> UsageCapConfig:
@@ -120,13 +139,17 @@ class UsageCapConfig(BaseModel):
         if not path.is_absolute():
             path = path.resolve()
         if not path.exists():
-            import logging
-
-            logging.getLogger(__name__).warning(
-                f'accounts_file not found: {path} — using inline accounts'
-            )
+            logger.warning(f'accounts_file not found: {path} — using inline accounts')
             return self
         data = yaml.safe_load(path.read_text())
         entries = data.get('accounts', [])
         self.accounts = [AccountConfig(**entry) for entry in entries]
+        if 'reserve' in data:
+            self.reserve = parse_reserve(
+                data['reserve'], [account.name for account in self.accounts]
+            )
+            if isinstance(self.reserve, InvalidReserve):
+                logger.warning(
+                    f'accounts_file {path}: reserve is invalid and inert: {self.reserve.reason}'
+                )
         return self
