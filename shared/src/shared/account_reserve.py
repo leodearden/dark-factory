@@ -19,16 +19,20 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 
 __all__ = [
     'DEFAULT_ADMIT_TIERS',
+    'DRIFT_HORIZON',
+    'DRIFT_TOLERANCE',
     'TIER_WHEN_UNKNOWN',
     'AdmitTiers',
     'ReserveConfig',
     'ReserveEvent',
+    'ScheduleDrift',
     'WeeklyReset',
     'WorkClass',
     'WorkClassSource',
     'WorkKind',
     'admits',
     'resolve_work_class',
+    'schedule_drift',
 ]
 
 
@@ -189,3 +193,24 @@ def admits(config: ReserveConfig, work_class: WorkClass, now: datetime) -> bool:
             tier = work_class.tier or TIER_WHEN_UNKNOWN
             return tier in config.admit_tiers.for_project(work_class.project_id)
     assert_never(work_class.kind)
+
+
+DRIFT_TOLERANCE = timedelta(minutes=30)
+DRIFT_HORIZON = timedelta(hours=3)
+
+
+@dataclass(frozen=True)
+class ScheduleDrift:
+    configured_reset: datetime
+    observed_reset: datetime
+
+
+def schedule_drift(config: ReserveConfig, observed_reset: datetime) -> ScheduleDrift | None:
+    """The configured reset a banner's reset time drifted from, if it did (PRD §6.2 invariant 5)."""
+    observed = _as_utc(observed_reset)
+    following = config.next_reset(observed)
+    preceding = following - timedelta(days=7)
+    nearest = min(following, preceding, key=lambda reset: abs(observed - reset))
+    if DRIFT_TOLERANCE < abs(observed - nearest) <= DRIFT_HORIZON:
+        return ScheduleDrift(configured_reset=nearest, observed_reset=observed)
+    return None
