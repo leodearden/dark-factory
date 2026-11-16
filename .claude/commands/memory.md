@@ -240,7 +240,7 @@ To build a context briefing (at session start or before a complex task), run the
    search(query="<task title> <area words>", project_id="dark_factory")
    get_entity(name="Task 3127", project_id="dark_factory")
    ```
-3. **Task tree**: `get_tasks(project_root="/home/leo/src/dark-factory")`
+3. **Task state**, read narrowly. One task: `get_task(id="<id>", project_root="/home/leo/src/dark-factory")`. Was a task like X filed: `search_tasks(project_root="/home/leo/src/dark-factory", query="<paraphrase>")`. What is live now: `get_tasks(project_root="/home/leo/src/dark-factory", statuses=["in-progress", "blocked"], fields=["title", "status", "priority"])`. Every `get_tasks` call passes `statuses` and `fields` (and `page_size` for a large status such as `pending`): without them it returns every task in the store, tens of megabytes that no session can read. For a status census use `get_statuses` with `page_size` of at most 2000, paging on `has_more`. The allowed `fields` names are `fused-memory/src/fused_memory/backends/task_projection.py::TASK_ROW_KEYS`.
 4. **Recent activity**: `get_episodes(project_id="dark_factory", last_n=5)`. This is the recency read, because `search` has no recency predicate.
 
 Two queries are absent on purpose. There is no search for an overview of the project: memory holds no such entry, so read `CLAUDE.md`, `README.md` and `ARCHITECTURE.md` instead. There is no search for the latest decisions either: `search` cannot express recency, and that query measured 5/5 noise. The rationale lives in `shared/src/shared/briefing_queries.py::QUERY_SPECS`.
