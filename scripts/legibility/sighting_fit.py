@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import copy
 import enum
+import json
 import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from legibility import codebook, filing_policy, prescreen
+from legibility import codebook, coder, filing_policy, prescreen
 
 logger = logging.getLogger("legibility.census.sighting_fit")
 
@@ -233,3 +234,72 @@ def check(
         )
     codebook.assert_no_deletion(dict(cb), stamped)
     return stamped, tuple(outcomes)
+
+
+class FitReplyError(ValueError):
+    """A fit judge's reply that is no judgment of the offered sightings."""
+
+
+_REPLY_SHAPE = {"sightings": [{"session": "...", "exhibits": True, "reason": "..."}]}
+
+
+def _fit_prompt(fit_check: FitCheck) -> str:
+    """The judge's task and the check it judges. Asks for an observation from
+    the quoted text, never a diagnosis."""
+    payload = {
+        "entry_id": fit_check.entry_id,
+        "title": fit_check.title,
+        "cause": fit_check.cause,
+        "founding_evidence": list(fit_check.founding_evidence),
+        "sightings": [
+            {"session": offer.session, "evidence_quote": offer.evidence_quote} for offer in fit_check.offered
+        ],
+    }
+    return (
+        "You are the sighting fit judge for the dark-factory agent-confusion "
+        "codebook (plans/census-incremental-prd.md C1). The entry below names "
+        "one confusion mechanism in its title, and its founding evidence shows "
+        "that mechanism. Each sighting under it was attached to the entry by a "
+        "cheaper judgment. For each sighting, decide from its quoted evidence "
+        "alone whether it exhibits the mechanism the entry's title names, not "
+        "merely a related theme. Judge only what the quoted text shows: an "
+        "observation, never a diagnosis or a guess about what the session may "
+        "also have done. When the quote does not show the mechanism, exhibits "
+        "is false.\n\n"
+        "Respond with STRICT JSON ONLY (no prose, no markdown fences), one item "
+        "per sighting, exactly this shape:\n"
+        + json.dumps(_REPLY_SHAPE) + "\n\n"
+        "=== ENTRY AND SIGHTINGS ===\n" + json.dumps(payload, ensure_ascii=False)
+    )
+
+
+def _verdict(item: object) -> FitVerdict | None:
+    if not isinstance(item, dict):
+        return None
+    session, exhibits, reason = item.get("session"), item.get("exhibits"), item.get("reason")
+    if not isinstance(session, str) or not isinstance(exhibits, bool):
+        return None
+    return FitVerdict(session=session, exhibits=exhibits, reason=reason if isinstance(reason, str) else "")
+
+
+def _parse_reply(raw: str) -> tuple[FitVerdict, ...]:
+    try:
+        parsed = coder.parse_coder_output(raw)
+    except coder.CoderParseError as exc:
+        raise FitReplyError(f"the fit reply is no JSON object: {exc}") from exc
+    items = parsed.get("sightings")
+    if not isinstance(items, list):
+        raise FitReplyError(f"the fit reply's 'sightings' is {type(items).__name__}, not a list")
+    return tuple(verdict for item in items if (verdict := _verdict(item)) is not None)
+
+
+def build_fit_fn(invoke: Callable[[str, str], str]) -> FitFn:
+    """The production ``fit_fn(check, *, model)``: one *invoke(prompt, model)*
+    call per check, its reply parsed as coder.parse_coder_output parses the
+    coder's. An item that is no verdict is dropped; a reply that is no
+    judgment raises FitReplyError, which check() records as unchecked."""
+
+    def fit_fn(fit_check: FitCheck, *, model: str) -> tuple[FitVerdict, ...]:
+        return _parse_reply(invoke(_fit_prompt(fit_check), model))
+
+    return fit_fn
