@@ -4112,10 +4112,14 @@ async def fetch_arm(
     ``TimeoutError`` via ``await_within``) instead of returning ``{}``, so
     the same overload would now abort loudly with a ``TimeoutError`` rather
     than as an empty ranking.
-    The serial bound stays until someone re-measures the concurrent read path;
+    Reads stay serial until someone re-measures the concurrent read path;
     this script's whole posture is that an empty ranking must never be
-    published as a measured zero.  The write side keeps its bound because
-    ``add`` propagates its timeout too.
+    published as a measured zero.  Reads and writes now both raise on a
+    timeout, so propagation is not what separates them: the write side keeps
+    its ``SEED_CONCURRENCY`` concurrency bound because a full live run has
+    completed at that bound (``plans/e2-storage-shape-bakeoff-report.json``
+    records its ``seed_concurrency``), and the concurrent read path has no
+    such run.
 
     Re-derive before re-trying: a smaller bound, or a read timeout raised for
     the run, would both be defensible — but neither is worth a report that
