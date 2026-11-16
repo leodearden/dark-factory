@@ -13,12 +13,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
-from typing import TypeAlias
+from typing import TypeAlias, assert_never
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 __all__ = [
     'DEFAULT_ADMIT_TIERS',
+    'TIER_WHEN_UNKNOWN',
     'AdmitTiers',
     'ReserveConfig',
     'ReserveEvent',
@@ -26,6 +27,7 @@ __all__ = [
     'WorkClass',
     'WorkClassSource',
     'WorkKind',
+    'admits',
     'resolve_work_class',
 ]
 
@@ -169,3 +171,21 @@ class ReserveConfig(BaseModel):
 
     def in_release_window(self, now: datetime) -> bool:
         return self.release_at(now) <= _as_utc(now)
+
+
+TIER_WHEN_UNKNOWN = 'medium'
+
+
+def admits(config: ReserveConfig, work_class: WorkClass, now: datetime) -> bool:
+    """Whether ``work_class`` may use the reserve account at ``now`` (PRD §6.2 invariant 6)."""
+    if config.in_release_window(now):
+        return True
+    match work_class.kind:
+        case WorkKind.ESSENTIAL:
+            return True
+        case WorkKind.BACKGROUND:
+            return False
+        case WorkKind.TASK:
+            tier = work_class.tier or TIER_WHEN_UNKNOWN
+            return tier in config.admit_tiers.for_project(work_class.project_id)
+    assert_never(work_class.kind)
