@@ -63,6 +63,7 @@ def _fused_memory_unreachable(monkeypatch):
     # the null sentinel refuses at once with no retry window (mcp_lifecycle.fm_session).
     monkeypatch.setenv('ORCH_FUSED_MEMORY__URL', FM_NULL_SENTINEL_URL)
 
+
 # Every ledger WRITE entry point; the read-only report must reach none of them.
 _WRITERS = (
     'record_flake_occurrence',
@@ -1611,6 +1612,9 @@ class TestRenderReport:
         assert 'no ledger' in absent or 'not present' in absent, absent
 
 
+# The command's owner read is the real McpSession wire against the null sentinel above,
+# the case _live_mcp_guard.py names as a reason to opt out of forbid_live_mcp.
+@pytest.mark.real_mcp_session
 class TestFlakeLedgerCommand:
     """`orchestrator flake-ledger` end to end.  All sync — the command runs its own event
     loop for the live owner read."""
