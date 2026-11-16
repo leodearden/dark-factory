@@ -1983,3 +1983,23 @@ class TestKnownProjectIdsNarrowing:
         become the one a caller can pass positionally."""
         with pytest.raises(TypeError):
             resolve_referents(None, {}, 'mirrors reify:132', GROUP, self.REGISTRY)  # type: ignore[misc]
+
+
+class TestDerivedPathReadsTheScanFixes:
+    """The write path derives referents through the fixed scan (task 10082)."""
+
+    REGISTRY = {'dark_factory': '/src/dark-factory', 'reify': '/src/reify'}
+
+    def _derive(self, content, known_project_ids=REGISTRY):
+        return resolve_referents(
+            declared=None,
+            metadata={},
+            content=content,
+            group_id=GROUP,
+            known_project_ids=known_project_ids,
+        )
+
+    def test_a_commit_hash_after_the_task_word_derives_nothing(self):
+        resolution = self._derive('merged 8c7e163fcf for task 8c7e163fcf')
+        assert resolution.source == 'none'
+        assert resolution.referents == ()

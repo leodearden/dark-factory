@@ -1585,3 +1585,45 @@ class TestOneGrammar:
             assert any(part is shared for part in _parts_at_any_depth(parts)), (
                 f'{rule} spells {fragment} itself instead of composing the shared fragment'
             )
+
+
+def _node_names(referents):
+    return [referent.node_name for referent in referents]
+
+
+class TestWordGluedDigitsAreNotTaskNumbers:
+    """A digit run glued to a letter or underscore is a hash or an identifier,
+    not a task number: 'task 8c7e163fcf' once yielded Task 8 (task 10082)."""
+
+    @pytest.mark.parametrize(
+        'content',
+        [
+            'task 8c7e163fcf',
+            'see task-8c7e1 now',
+            'task #12ab',
+            'reify:8c7e163',
+            'Task 115e notes',
+            'task 5_retry',
+        ],
+    )
+    def test_glued_digits_yield_nothing(self, content):
+        scan = scan_content(content, group_id='dark_factory')
+        assert scan.refs == ()
+        assert scan.ambiguous == ()
+
+    def test_a_glued_run_does_not_hide_a_real_mention_beside_it(self):
+        scan = scan_content('task 8c7e163fcf and task 42', group_id='dark_factory')
+        assert _node_names(scan.refs) == ['Task 42']
+
+    @pytest.mark.parametrize(
+        ('content', 'expected'),
+        [
+            ("task-173's", ['Task 173']),
+            ('task 5.', ['Task 5']),
+            ('task 5181-fix', ['Task 5181']),
+            ('task/6059-entities', ['Task 6059']),
+            ('dark_factory:2500)', ['Task 2500']),
+        ],
+    )
+    def test_punctuation_after_the_digits_still_ends_them(self, content, expected):
+        assert _node_names(scan_content(content, group_id='dark_factory').refs) == expected
