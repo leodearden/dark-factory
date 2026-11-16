@@ -232,6 +232,12 @@ _EXTERNAL_TASK_REF_RE: re.Pattern[str] = re.compile(
     r'\b([A-Za-z][A-Za-z0-9_-]*)[:#](\d+)\b'
 )
 
+# A premise note names a dependency by number ('dependency 327 merged at a106cd8'), and
+# without this family the marker binds back to the branch task the note is written on
+# (solar esc-unverified-claim-432-2). A bare number only: 'dependency #N' is TASK_REF_RE's.
+# Pinned by tests/test_completion_claim_mood.py::TestPremiseNotesClaimTheirDependency.
+_DEPENDENCY_REF_RE: re.Pattern[str] = re.compile(r'\bdependency\s+(\d+)\b', re.IGNORECASE)
+
 APPLIED_WORK_RE: re.Pattern[str] = re.compile(
     r'\b(?:'
     # bare past-tense/participle completion words that read as a completion of
@@ -630,6 +636,7 @@ def _ref_mentions(
     mentions += [
         owned(m, 'task', _anchor_project(m, registry)) for m in TASK_REF_RE.finditer(clause)
     ]
+    mentions += [owned(m, 'task', None) for m in _DEPENDENCY_REF_RE.finditer(clause)]
     mentions += [
         _RefMention(
             phrase_start=m.start(), start=m.start(), end=m.end(),
