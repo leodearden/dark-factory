@@ -18,6 +18,10 @@ the task end, or learn that it would not, within a known time (task 6660). A
 single ``cancel()`` followed by an unbounded ``await`` hangs forever on a task
 that survives one cancel.
 
+:func:`gather_unwound` is ``asyncio.gather`` for children that own
+subprocesses: an exception, an outer cancel included, propagates only once
+every child has ended (task 7977).
+
 This module is intentionally NOT re-exported from ``shared/__init__.py``.
 Consumers import via the fully-qualified path
 (``from shared.asyncio_tasks import track_task``), consistent with the
@@ -28,9 +32,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
-__all__ = ['abandon_task', 'cancel_bounded', 'track_task']
+__all__ = ['abandon_task', 'cancel_bounded', 'gather_unwound', 'track_task']
 
 logger = logging.getLogger(__name__)
 
@@ -125,3 +130,28 @@ async def cancel_bounded(
             return True
     track_task(task, *registries)
     return False
+
+
+_Gathered = TypeVar('_Gathered')
+
+
+async def gather_unwound(*aws: Awaitable[_Gathered]) -> list[_Gathered]:
+    """``asyncio.gather``, except that it raises only once every child has ended.
+
+    A plain gather raises at its first cancelled or failed child, so a sibling
+    still killing its subprocess would outlive the verify that spawned it.
+    Here, as in a ``TaskGroup``, the other children are cancelled and awaited
+    first; the exception raised is the one the gather raised.  A child already
+    asked to cancel (a cancelled gather asks every child) is not asked again,
+    which would interrupt the kill it is awaiting.
+    """
+    children = [asyncio.ensure_future(aw) for aw in aws]
+    try:
+        return await asyncio.gather(*children)
+    except BaseException:
+        for child in children:
+            if not (isinstance(child, asyncio.Task) and child.cancelling()):
+                child.cancel()
+        if children:
+            await asyncio.wait(children)
+        raise
