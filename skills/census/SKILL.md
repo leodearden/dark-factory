@@ -64,8 +64,8 @@ uv run --directory <factory checkout>/shared python <factory checkout>/scripts/l
 
 ### Cost-control flags (each optional; omitted means unbounded)
 
-- **`--max-batches N`** stops mining after N batches (N ≥ 1). The report marks coverage as partial and `stop_reason=capped`. Sessions the cap left unmined are not in the session ledger, so the next run picks them up; `last_census_at` needs no rollback.
-- **`--max-verify-clusters N`** hands the verifier at most N novel clusters, in mining order. The rest merge as `pending` candidates, which the report's `## Adjudication` queue works through on later runs, a capped number of clusters per run.
+- **`--max-batches N`** stops mining after N batches (N ≥ 1). The report marks coverage as partial and `stop_reason=capped`. Sessions the cap left unmined are not in the session ledger, so the next run picks them up while they remain inside the `census.ledger_retention_days` window; `last_census_at` needs no rollback.
+- **`--max-verify-clusters N`** hands the verifier at most N novel clusters, in mining order. The rest merge as `pending` candidates. The report's `## Adjudication` queue takes up to `census.adjudication.max_clusters_per_run` (default 10) clusters per run, most-sighted and newest first, so a one-off may wait a long time or need adjudicating by hand.
 - **`--dry-run-filing`** writes every would-be `submit_task` payload to `plans/confusion-census-<date>-payloads.json` (or `…-payloads-2.json`, never overwritten) and files nothing. The codebook and census-state still advance, so filing that JSON by hand is the only way those tasks will ever land.
 
 For an attended first census, use all three:
@@ -107,13 +107,13 @@ Watch for the final line:
    - **Dispositions:** earlier tickets carried forward to their task outcomes. A done task triggers re-verification (`fixed` or re-filed), and a cancelled task with a reason makes its entry `accepted`.
    - **Cost.**
    The report has no per-stratum coverage section.
-2. **Resolve the tickets.** The `## Filed Tasks` table names the `task_id` of every finding the curator had already decided. Call `resolve_ticket` for each row that has only a ticket (its disposition reads `open … pending`; it resolves on the next run); for cross-project tickets, use the project root the report names. Triage or re-prioritise what landed: a ticket's priority is set from its cluster's severity (`scripts/legibility/census_filing.py`), so check that the severity fits.
+2. **Resolve the tickets.** The `## Filed Tasks` table names the `task_id` of every finding whose task is already known. Call `resolve_ticket` for each row that has only a ticket (its disposition reads `open … pending`; it resolves on the next run); for cross-project tickets, use the project root the report names. Triage or re-prioritise what landed: a ticket's priority is set from its cluster's severity (`scripts/legibility/census_filing.py`), so check that the severity fits.
 3. **Check `docs/legibility/census-state.json` advanced:**
    - `last_census_at` is this run's **date**, `YYYY-MM-DD` (date-only, not a timestamp).
    - `last_census_report` names the new report, repo-relative (e.g. `plans/confusion-census-2026-11-07.md`).
    - `last_census_run_id` names this run. It is what the next trigger's completion arm reads.
    - `last_census_as_of_sha` is the commit the run censused, and `session_watermark` is the exclusive end of the window this run mined; the trigger's floor is measured from it. The next run mines the last `census.ledger_retention_days` days (default 30), less the sessions already in the ledger.
-4. **If you ran `--dry-run-filing`,** file the payload JSON by hand. A later census will not re-file it, because those confusions now code as matches and the window has moved.
+4. **If you ran `--dry-run-filing`,** file the payload JSON by hand. A later census will not re-file it, because those confusions now code as matches and their sessions are ledgered as coded, so no later run re-mines them.
 
 ## Anchor seeding — when an equivalent manual survey already exists
 
@@ -134,9 +134,13 @@ Precedent: dark_factory was seeded this way in commit `0b99cf4ca2`, from `plans/
 
 ## Session ledger and the gate
 
-The trickle and the census record every coded session in a host-local session ledger. The census skips ledgered and zero-signal sessions. Check the ledger with `session_ledger.py stats --project-id <id>`.
+The trickle and the census record every coded session in a host-local session ledger. The census skips ledgered and zero-signal sessions. Check the ledger with:
 
-Gate leaf G (`scripts/legibility/check_census_report.py`, task 6409) checks the first automatic report after the batch. When it reports no conforming report yet, the remedy is a forced census with this skill.
+```bash
+uv run --directory <factory checkout>/shared python <factory checkout>/scripts/legibility/session_ledger.py stats --project-id <id>
+```
+
+Gate leaf G (`scripts/legibility/check_census_report.py`, task 6409) checks the first automatic report after the census-incremental batch (`plans/census-incremental-prd.md`) landed. When it reports no conforming report yet, the remedy is a forced census with this skill, then `resume` the gate's `milestone_check_failed` escalation.
 
 ## Out of scope
 
