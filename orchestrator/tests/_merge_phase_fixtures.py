@@ -309,7 +309,8 @@ def _submit_gating_l0(queue: EscalationQueue, task_id: str) -> Escalation:
 
     ``severity='blocking'`` + ``level=0`` is disjunct 1 of
     ``_is_gating_escalation``, and ``category='infra_issue'`` matches what
-    ``_escalate_scope_invariant_violation`` files 12 lines above the gate.
+    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._escalate_scope_invariant_violation``
+    files at merge entry, just before the gate.
     """
     esc = Escalation(
         id=queue.make_id(task_id),
