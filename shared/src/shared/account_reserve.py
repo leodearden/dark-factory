@@ -72,10 +72,7 @@ def resolve_work_class(source: WorkClassSource | None) -> WorkClass:
         return WorkClass(kind=WorkKind.BACKGROUND)
     if isinstance(source, WorkClass):
         return source
-    result = source()
-    if not isinstance(result, WorkClass):
-        raise TypeError(f'work class source returned {result!r}, not a WorkClass')
-    return result
+    return source()
 
 
 class ReserveEvent(StrEnum):

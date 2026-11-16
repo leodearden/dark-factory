@@ -10,7 +10,6 @@ import logging
 import re
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -78,12 +77,6 @@ class TestResolveWorkClass:
 
     def test_resolve_treats_none_as_background(self) -> None:
         assert resolve_work_class(None) == WorkClass(kind=WorkKind.BACKGROUND)
-
-    def test_resolve_rejects_a_function_returning_something_else(self) -> None:
-        returns_a_tier_name = Mock(return_value='high')
-
-        with pytest.raises(TypeError, match="'high'"):
-            resolve_work_class(returns_a_tier_name)
 
 
 def test_reserve_event_names() -> None:
