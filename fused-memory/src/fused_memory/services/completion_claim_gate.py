@@ -702,14 +702,20 @@ _CONTINGENCY_HEADS: str = (
     r'provid(?:ed|ing)(?:\s+that)?|assuming(?:\s+that)?|assum(?:e|es|ed)\s+that'
 )
 _NECESSITY_VERBS: str = r'need(?:s|ed)?|requir(?:e|es|ed|ing)|want(?:s|ed)?'
-_NON_ASSERTING_HEADS: tuple[str, ...] = (_CONTINGENCY_HEADS, _NECESSITY_VERBS)
+_SIMULATION_HEADS: str = (
+    r'(?:mock|simulation|stub|fake|dry[-\s]run|trial(?:\s+merge)?|prototype)s?\s+of'
+)
+_NON_ASSERTING_HEADS: tuple[str, ...] = (
+    _CONTINGENCY_HEADS, _NECESSITY_VERBS, _SIMULATION_HEADS,
+)
 
 # A ref that is the object of a head which does not assert its complement ('depends
 # on task N having landed') takes no backward-bound marker; a necessity verb's object
-# complement ('needs task N merged first') is a precondition, not a report. Forward
-# binding is untouched, so 'depends on cancelled task N' still claims N. 'pending' is
-# excluded by measurement (task 6824). Pinned by
-# tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
+# complement ('needs task N merged first') is a precondition, not a report, and a ref
+# inside a simulation of its work ('a mock of task N's planned edits merged') names a
+# stand-in, not the task's landing. Forward binding is untouched, so 'depends on
+# cancelled task N' still claims N. 'pending' is excluded by measurement (task 6824).
+# Pinned by tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
 _NON_ASSERTING_GOVERNOR_RE: re.Pattern[str] = re.compile(
     r'(?<![-\w])(?:' + '|'.join(_NON_ASSERTING_HEADS) + r')\s+(?:(?:the|a|an)\s+)?$',
     re.IGNORECASE,
