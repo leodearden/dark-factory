@@ -371,9 +371,11 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        successor is still unresolved at the deadline, **HAND OFF**: return `outcome:
        "handed_off"` carrying this run's `request_id` and the `superseded_by` value read above,
        put the ladder's last verdict in `reason`, and leave the task status and the escalation
-       untouched. The escalation-watcher resumes it through [resume
+       untouched. The escalation-watcher resumes the hand-off through [resume
        mode](#resuming-a-handed-off-merge-resume-mode). This hand-off, like step 8's, is **not**
-       an ABORT. Never call `merge_cancel` and never claim a failure: this is **not** the plain
+       an ABORT. A `coalesce-*` landing that signal (a) shows but the scheduler has not credited
+       is not unresolved: it takes the **landed-but-not-credited** report in [this skill's
+       dispositions](#ladder-dispositions) instead. Never call `merge_cancel` and never claim a failure: this is **not** the plain
        abort-as-failure the `conflict` / `blocked` / `abandoned` arm above prescribes. Never
        resubmit and never direct-merge while the successor is unresolved.
 
@@ -527,7 +529,16 @@ eyeballed listing.
     starts with `-`; leaving the ref in place is also fine.)
   - **Any other status** — `pending`, `merge-deferred`, anything else, including a status you
     cannot read — **never write**. Keep polling to step 8's polling deadline, then take the
-    **landed-but-not-credited** report, citing the tip merge sha and the current status.
+    **landed-but-not-credited** report, citing the tip merge sha and the current status. That
+    report is an ABORT taken **without** `merge_cancel`: a non-failure report that returns
+    `outcome: "aborted"`. It is **not** handed off: the work is already on main, and what is
+    missing is credit the orchestrator withheld for one of the causes
+    [merge-queue rule 2v](../merge-queue/SKILL.md#follow-the-superseded-successor) names, none
+    of which more polling changes. The one exception: take that report only once a tick
+    **after** the one on which signal (a) first fired has re-read a non-`done` status. If the
+    deadline arrives before such a tick, the asynchronous flip may still be in progress (rule
+    2v: it normally lands within a tick or two), so the arm counts as not resolved yet and
+    hands off per step 9's `superseded` arm.
 
   In **neither** case `merge_cancel`, and in neither case report not-landed. This is
   the one carve-out that most matters here: this skill is fully autonomous, so a wrong
