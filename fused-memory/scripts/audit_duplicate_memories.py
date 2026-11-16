@@ -194,6 +194,7 @@ import contextlib
 import difflib
 import json
 import logging
+import math
 import re
 import sys
 from collections.abc import Iterable, Iterator, Mapping
@@ -1278,6 +1279,19 @@ def ann_scores_for_pairs(
             scores[(left, right)] = max(found)
 
     return scores
+
+
+def ann_candidate_pairs(
+    memories: list[dict],
+    neighbors_by_id: dict[Any, list[dict]],
+    *,
+    top_k: int | None,
+) -> tuple[list[tuple[int, int]], dict[str, int]]:
+    """ANN as the candidate GENERATOR for an adjudicator: every hit is a pair.
+
+    No similarity cutoff applies; the disclosure is ``ann_pairs_from_neighbors``'s.
+    """
+    return ann_pairs_from_neighbors(memories, neighbors_by_id, -math.inf, top_k=top_k)
 
 
 def _created_at_sort_key(created_at: Any) -> tuple[int, float]:
