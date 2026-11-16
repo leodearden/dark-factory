@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _git_fixtures import LIB_FUNCTION_SEED, seed_repo
 from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.models import Escalation
@@ -41,19 +42,7 @@ from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
-    return repo
-
-
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'lib.py').write_text('def greet(name): return name\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+    return seed_repo(tmp_path / 'repo', LIB_FUNCTION_SEED)
 
 
 @pytest.fixture
