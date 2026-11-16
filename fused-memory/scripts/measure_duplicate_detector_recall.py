@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import logging
 import math
 import re
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
@@ -38,6 +39,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from shared.quality_series.stats import Z_95, wilson_interval
 
 from fused_memory.utils.script_loader import load_script
+
+logger = logging.getLogger(__name__)
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPTS = _PACKAGE_ROOT / 'scripts'
@@ -372,3 +375,260 @@ DETECTOR_ARMS: tuple[DetectorArm, ...] = (
         if spec.arm_class == _arms.ArmClass.local_cross_encoder
     ),
 )
+
+
+# ---------------------------------------------------------------------------
+# Measuring one arm, and the calibrated-ANN baseline
+# ---------------------------------------------------------------------------
+
+BASELINE_ARM = 'calibrated-ann'
+OPERATING_RULE_FLOOR = 'max_caught_at_precision_floor'
+OPERATING_RULE_BASELINE = 'calibrated_ann_cutoffs'
+
+
+@dataclass(frozen=True)
+class GateProposal:
+    """A recall-gate proposal: the bars, the date fixed, and why each bar sits where it does."""
+
+    precision_floor: float
+    min_paraphrase_band_recall: float
+    min_auc: float
+    proposed_on: str
+    basis: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AucBlock:
+    value: float | None
+    n_true: int
+    n_hard_negative: int
+    hanley_mcneil_95: tuple[float, float] | None
+
+
+def _auc_block(positives: Sequence[float], negatives: Sequence[float]) -> AucBlock:
+    value = _reranker.auc_true_vs_hard_negative(positives, negatives)
+    return AucBlock(
+        value=value, n_true=len(positives), n_hard_negative=len(negatives),
+        hanley_mcneil_95=auc_interval_95(value, len(positives), len(negatives)),
+    )
+
+
+def _operating_point_json(floor: float, point: OperatingPoint) -> dict[str, Any]:
+    return {
+        'precision_floor': floor,
+        'threshold': point.threshold,
+        'caught': point.caught,
+        'flagged': point.flagged,
+        'recall': _proportion_json(point.recall),
+        'precision': _proportion_json(point.precision),
+    }
+
+
+@dataclass(frozen=True)
+class DetectorRow:
+    """One detector's report row. A skipped row carries every metric as None, never 0."""
+
+    arm: str
+    arm_class: str
+    model: str
+    granularity: str
+    status: str
+    skip_reason: str | None = None
+    skip_detail: str | None = None
+    operating_rule: str | None = None
+    auc: AucBlock | None = None
+    operating_threshold: float | None = None
+    paraphrase_band_recall: Proportion | None = None
+    precision: Proportion | None = None
+    hard_negative_flagged: Proportion | None = None
+    recall_at_precision: Mapping[float, OperatingPoint] | None = None
+    pairs_scored: int | None = None
+    unscored_pairs: int | None = None
+    cost_usd: float | None = None
+    pairs_over_max_length: int | None = None
+    device: str | None = None
+    vram_peak_mib: float | None = None
+    max_length: int | None = None
+    scoring_seconds: float | None = None
+
+    @classmethod
+    def skipped(cls, arm: DetectorArm, reason: str, detail: str) -> DetectorRow:
+        return cls(
+            arm=arm.name, arm_class=str(arm.spec.arm_class), model=arm.spec.model,
+            granularity=str(arm.granularity), status=str(_arms.ArmStatus.skipped),
+            skip_reason=str(reason), skip_detail=detail,
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        points = self.recall_at_precision
+        return {
+            'arm': self.arm,
+            'arm_class': self.arm_class,
+            'model': self.model,
+            'granularity': self.granularity,
+            'status': self.status,
+            'skip_reason': self.skip_reason,
+            'skip_detail': self.skip_detail,
+            'operating_rule': self.operating_rule,
+            'auc': None if self.auc is None else asdict(self.auc),
+            'operating_threshold': self.operating_threshold,
+            'paraphrase_band_recall': _proportion_json(self.paraphrase_band_recall),
+            'precision': _proportion_json(self.precision),
+            'hard_negative_flagged': _proportion_json(self.hard_negative_flagged),
+            'recall_at_precision': None if points is None else [
+                _operating_point_json(floor, point) for floor, point in points.items()
+            ],
+            'pairs_scored': self.pairs_scored,
+            'unscored_pairs': self.unscored_pairs,
+            'cost_usd': self.cost_usd,
+            'pairs_over_max_length': self.pairs_over_max_length,
+            'device': self.device,
+            'vram_peak_mib': self.vram_peak_mib,
+            'max_length': self.max_length,
+            'scoring_seconds': self.scoring_seconds,
+        }
+
+
+class OverBudget(Exception):
+    pass
+
+
+class _MeteredSlateScorer:
+    """One arm run's Scorer as audit's SlateScorer, metering spend and truncation."""
+
+    def __init__(self, scorer: _arms.Scorer, max_spend_usd: float) -> None:
+        self._scorer = scorer
+        self._max_spend_usd = max_spend_usd
+        self.costs: list[float | None] = []
+        self.over_max_length: list[int | None] = []
+
+    def __call__(self, entry: str, candidate_texts: Sequence[str]) -> Sequence[float]:
+        slate = self._scorer.score(entry, candidate_texts)
+        self.costs.append(slate.cost_usd)
+        self.over_max_length.append(slate.pairs_over_max_length)
+        spent = sum(cost or 0.0 for cost in self.costs)
+        if spent > self._max_spend_usd:
+            raise OverBudget(f'spent {spent:.4f} USD, over the {self._max_spend_usd:.4f} USD ceiling')
+        return slate.scores
+
+
+def measure_detector_arm(
+    arm: DetectorArm,
+    memories: Sequence[Mapping[str, Any]],
+    candidates: Sequence[Pair],
+    pair_classes: Mapping[Pair, str],
+    *,
+    context: _arms.ArmContext,
+    max_spend_usd: float,
+    clock: Callable[[], float],
+    proposal: GateProposal,
+) -> DetectorRow:
+    """Adjudicate every candidate and labelled pair once with *arm*, and summarise it as a row.
+
+    Failure policy (as ``eval_write_triage_reranker.measure_arm``): an
+    unavailable arm, crossing *max_spend_usd* or any other exception yields a
+    skipped row, and whatever was measured before it is discarded.
+    """
+    try:
+        return _measure(
+            arm, memories, candidates, pair_classes,
+            context=context, max_spend_usd=max_spend_usd, clock=clock, proposal=proposal,
+        )
+    except _arms.ArmUnavailable as exc:
+        logger.warning('arm %s skipped (%s): %s', arm.name, exc.reason, exc.detail)
+        return DetectorRow.skipped(arm, exc.reason, exc.detail)
+    except OverBudget as exc:
+        logger.warning('arm %s skipped: %s', arm.name, exc)
+        return DetectorRow.skipped(arm, _arms.SkipReason.over_budget, str(exc))
+    except Exception as exc:
+        logger.exception('arm %s failed; recorded as skipped/error', arm.name)
+        return DetectorRow.skipped(arm, _arms.SkipReason.error, f'{type(exc).__name__}: {exc}')
+
+
+def _measure(
+    arm: DetectorArm,
+    memories: Sequence[Mapping[str, Any]],
+    candidates: Sequence[Pair],
+    pair_classes: Mapping[Pair, str],
+    *,
+    context: _arms.ArmContext,
+    max_spend_usd: float,
+    clock: Callable[[], float],
+    proposal: GateProposal,
+) -> DetectorRow:
+    true_pairs = _pairs_of(pair_classes, TRUE_DUP)
+    hard_negatives = _pairs_of(pair_classes, HARD_NEGATIVE)
+    union = sorted({*candidates, *true_pairs, *hard_negatives})
+    with open_detector_scorer(arm, context) as scorer:
+        metered = _MeteredSlateScorer(scorer, max_spend_usd)
+        started = clock()
+        scores = _audit.adjudicate_pairs([dict(m) for m in memories], union, metered)
+        seconds = clock() - started
+        facts = scorer.facts()
+
+    candidate_scores = {pair: scores[pair] for pair in candidates if pair in scores}
+    positives = set(true_pairs)
+    point = operating_point(candidate_scores, positives, len(true_pairs), proposal.precision_floor)
+    flagged = (
+        set() if point.threshold is None
+        else set(_audit.adjudicated_pairs(candidate_scores, point.threshold))
+    )
+    caught = len(flagged & positives)
+    return DetectorRow(
+        arm=arm.name,
+        arm_class=str(arm.spec.arm_class),
+        model=arm.spec.model,
+        granularity=str(arm.granularity),
+        status=str(_arms.ArmStatus.measured),
+        operating_rule=OPERATING_RULE_FLOOR,
+        auc=_auc_block(
+            [scores[p] for p in true_pairs if p in scores],
+            [scores[p] for p in hard_negatives if p in scores],
+        ),
+        operating_threshold=point.threshold,
+        paraphrase_band_recall=proportion(caught, len(true_pairs)),
+        precision=proportion(caught, len(flagged)),
+        hard_negative_flagged=proportion(len(flagged & set(hard_negatives)), len(hard_negatives)),
+        recall_at_precision=recall_at_precision(candidate_scores, positives, len(true_pairs)),
+        pairs_scored=2 * len(scores),
+        unscored_pairs=len(union) - len(scores),
+        cost_usd=_sum_or_none(metered.costs),
+        pairs_over_max_length=_sum_or_none(metered.over_max_length),
+        device=facts.device,
+        vram_peak_mib=facts.vram_peak_mib,
+        max_length=facts.max_length,
+        scoring_seconds=seconds,
+    )
+
+
+def measure_ann_baseline(
+    memories: Sequence[Mapping[str, Any]],
+    neighbors: Mapping[str, list[dict[str, Any]]],
+    cutoffs: Mapping[str, float],
+    pair_classes: Mapping[Pair, str],
+) -> DetectorRow:
+    """The existing detector: ANN hits at each category's calibrated cutoff, AUC over cosine."""
+    pairs, _ = _audit.ann_pairs_from_neighbors(
+        [dict(m) for m in memories], dict(neighbors), dict(cutoffs),
+    )
+    flagged = set(pairs)
+    true_pairs = _pairs_of(pair_classes, TRUE_DUP)
+    hard_negatives = _pairs_of(pair_classes, HARD_NEGATIVE)
+    caught = len(flagged & set(true_pairs))
+
+    def cosine(pair: Pair) -> float:
+        return _calibrate.cosine_similarity(memories[pair[0]]['vector'], memories[pair[1]]['vector'])
+
+    return DetectorRow(
+        arm=BASELINE_ARM,
+        arm_class='baseline',
+        model='cosine',
+        granularity=str(Granularity.full_text),
+        status=str(_arms.ArmStatus.measured),
+        operating_rule=OPERATING_RULE_BASELINE,
+        auc=_auc_block([cosine(p) for p in true_pairs], [cosine(p) for p in hard_negatives]),
+        operating_threshold=None,
+        paraphrase_band_recall=proportion(caught, len(true_pairs)),
+        precision=proportion(caught, len(flagged)),
+        hard_negative_flagged=proportion(len(flagged & set(hard_negatives)), len(hard_negatives)),
+    )
