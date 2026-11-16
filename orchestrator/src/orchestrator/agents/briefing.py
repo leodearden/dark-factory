@@ -714,7 +714,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
 {prior_proposal_section}{committed_section}
 {_retired_review_section(retired_reviews)}{render_rulings_section(rulings, RulingAudience.PLAN)}# Action
 
-Plan this task with the plan-tools MCP tools, following the plan-tools recipe and the rules in your role instructions.
+Build the plan using the plan-tools MCP tools, as your role instructions direct, and follow their rules.
 """
 
     async def build_revalidation_prompt(
