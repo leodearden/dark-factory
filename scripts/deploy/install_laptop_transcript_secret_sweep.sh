@@ -20,8 +20,12 @@ set -euo pipefail
 #   2. A read-only preflight on the host: the checkout carries this task's
 #      files (the wrapper is executable; the installer, both units and the
 #      drop-in exist), its .env exists (tested, never read), a systemd --user
-#      bus answers, ~/.config/orchestrator is a directory, and uv resolves on
-#      the PATH the committed service sets. --check / --dry-run stops here.
+#      bus answers, ~/.config/orchestrator is a directory, uv resolves on the
+#      PATH the committed service sets, and the sweep imports in the
+#      checkout's venv (the wrapper's own `uv run` with --help, which reads no
+#      .env and touches no swept file; the wrapper always exits 0, so a sweep
+#      that cannot import would otherwise fail silently every night).
+#      --check / --dry-run stops here.
 #   3. Install the drop-in FIRST, then run the checkout's own
 #      install-transcript-secret-sweep-timer.sh (copies both units,
 #      daemon-reloads, enables the timer, kicks no run), so the timer is never
@@ -78,7 +82,10 @@ systemctl --user show-environment >/dev/null 2>&1 || fail "no systemd --user bus
 service_path="$(sed -n 's/^Environment=PATH=//p' "$repo/scripts/$unit.service")"
 [ -n "$service_path" ] || fail "$repo/scripts/$unit.service sets no Environment=PATH="
 (PATH="$service_path"; command -v uv >/dev/null) || fail "uv does not resolve on the service's PATH ($service_path)"
-echo "preflight OK: $repo carries the laptop sweep; uv resolves on the service's PATH"
+(PATH="$service_path"; PYTHONDONTWRITEBYTECODE=1 \
+    uv run --no-sync --project "$repo/shared" python "$repo/scripts/transcript_secret_sweep.py" --help >/dev/null) \
+    || fail "the sweep does not import in $repo's venv (see above): sync it, then re-run"
+echo "preflight OK: $repo carries the laptop sweep, and it imports under the service's PATH"
 PREFLIGHT_EOF
 
 if [ "$MODE" = "check" ]; then

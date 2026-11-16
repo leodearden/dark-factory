@@ -62,6 +62,10 @@ SHIMS = {
 }
 READ_ONLY_SYSTEMCTL = ('--user show-environment', f'--user is-enabled {UNIT}.timer', '--user list-timers --all')
 
+# /bin/sh, not `env bash`: the preflight runs uv under the service's PATH,
+# which in the fake checkout is the fake home's .local/bin alone.
+FAKE_UV = '#!/bin/sh\nprintf \'%s\\n\' "$*" >>"$FAKE_STATE/uv.log"\nexit 0\n'
+
 
 def _directives(path: Path) -> dict[str, list[tuple[str, str]]]:
     """Parse a unit into ``{section: [(key, value), ...]}``: full-line comments skipped, duplicate keys kept.
@@ -102,7 +106,7 @@ def world(tmp_path: Path) -> dict[str, Path]:
     (home / '.config' / 'orchestrator').mkdir(parents=True)
     uv = home / '.local' / 'bin' / 'uv'
     uv.parent.mkdir(parents=True)
-    uv.write_text('#!/usr/bin/env bash\nexit 0\n')
+    uv.write_text(FAKE_UV)
     uv.chmod(0o755)
     repo = tmp_path / 'remote-dark-factory'
     for rel in SWEEP_FILES:
@@ -212,9 +216,29 @@ def test_apply_installs_the_drop_in_before_enabling_the_timer(world):
     assert installed_drop_in(world).read_bytes() == DROP_IN.read_bytes()
     for name in (f'{UNIT}.service', f'{UNIT}.timer'):
         assert (unit_dir(world) / name).read_bytes() == (world['repo'] / 'scripts' / name).read_bytes()
-    calls = dict(systemctl_calls(world))
-    assert '--user daemon-reload' in calls
-    assert calls[f'--user enable --now {UNIT}.timer'] == 'dropin'
+    calls = systemctl_calls(world)
+    reloads = {drop_in for call, drop_in in calls if call == '--user daemon-reload'}
+    assert reloads == {'dropin'}
+    assert dict(calls)[f'--user enable --now {UNIT}.timer'] == 'dropin'
+
+
+def test_the_preflight_imports_the_sweep_exactly_as_the_wrapper_runs_it(world):
+    assert run(world, '--check').returncode == 0
+    repo = world['repo']
+    wrapper_env = {
+        **{name: value for name, value in os.environ.items() if name != 'TRANSCRIPT_SECRET_SWEEP_CMD'},
+        'PATH': f'{world["uv"].parent}{os.pathsep}{os.environ["PATH"]}',
+        'REPO': str(repo),
+        'FAKE_STATE': str(world['state']),
+    }
+    wrapper = subprocess.run(
+        [str(repo / 'scripts' / f'{UNIT}.sh'), '--help'], env=wrapper_env, capture_output=True, text=True, timeout=60
+    )
+
+    assert wrapper.returncode == 0, wrapper.stderr
+    preflight_call, wrapper_call = (world['state'] / 'uv.log').read_text().splitlines()
+    assert preflight_call == wrapper_call
+    assert preflight_call == f'run --no-sync --project {repo}/shared python {repo}/scripts/transcript_secret_sweep.py --help'
 
 
 def test_a_second_apply_is_a_no_op_that_still_succeeds(world):
@@ -264,10 +288,17 @@ def _without_orchestrator_configs(world):
     (world['home'] / '.config' / 'orchestrator').rmdir()
 
 
+def _without_an_importable_sweep(world):
+    world['uv'].write_text('#!/bin/sh\necho "transcript_secret_sweep.py: No module named \'yaml\'" >&2\nexit 2\n')
+
+
 @pytest.mark.parametrize(
     'break_it',
-    [_without_drop_in, _without_env, _without_uv, _without_orchestrator_configs],
-    ids=['checkout-predates-the-drop-in', 'no-env', 'uv-not-on-the-service-path', 'no-host-configs'],
+    [_without_drop_in, _without_env, _without_uv, _without_orchestrator_configs, _without_an_importable_sweep],
+    ids=[
+        'checkout-predates-the-drop-in', 'no-env', 'uv-not-on-the-service-path', 'no-host-configs',
+        'sweep-does-not-import',
+    ],
 )
 def test_a_failed_preflight_refuses_and_installs_nothing(world, break_it):
     break_it(world)
