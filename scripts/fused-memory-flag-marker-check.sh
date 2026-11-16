@@ -142,8 +142,9 @@ else
   UV_RESOLVED="$(require_uv_bin)" || exit $?
   # Built literally (not via a \${X:-...} default inside an unquoted array
   # expansion) so "$FM" survives verbatim even when the repo path contains
-  # spaces.
-  CHECK_CMD=("$UV_RESOLVED" run --frozen --project "$FM" python)
+  # spaces. It passes --no-sync, not --frozen, so a check run never re-syncs
+  # the shared root .venv (tests/scripts/test_uv_run_venv_isolation.py).
+  CHECK_CMD=("$UV_RESOLVED" run --no-sync --project "$FM" python)
 fi
 
 exec "${CHECK_CMD[@]}" "$FM/scripts/sweep_orphan_flag_markers.py" --check "$@"

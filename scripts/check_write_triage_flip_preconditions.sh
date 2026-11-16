@@ -152,13 +152,13 @@ PROBE_PENDING_MARKER='PASS-NEEDS-CONFIRMATION'
 # exactly where the author put a boundary and nowhere else.
 if [ -n "${CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY:-}" ]; then
   # The ONE place word splitting is still wanted: the seam may carry
-  # `uv run --frozen --project <dir> python`. A bare interpreter path (what the
+  # `uv run --no-sync --project <dir> python`. A bare interpreter path (what the
   # hermetic tests pass) comes through as a single word unchanged.
   read -r -a PROBE_PY_CMD <<< "$CHECK_WRITE_TRIAGE_ATTACH_TARGET_PY"
 elif [ -x "$REPO/.venv/bin/python3" ]; then
   PROBE_PY_CMD=("$REPO/.venv/bin/python3")
 else
-  PROBE_PY_CMD=(uv run --frozen --project "$REPO/fused-memory" python)
+  PROBE_PY_CMD=(uv run --no-sync --project "$REPO/fused-memory" python)
 fi
 
 # Item 5's probe: the CONSUMPTION half. Its env seam mirrors item 1's exactly,
@@ -188,7 +188,7 @@ if [ -n "${CHECK_WRITE_TRIAGE_ATTACH_CONSUMPTION_PY:-}" ]; then
 elif [ -x "$REPO/.venv/bin/python3" ]; then
   PROBE5_PY_CMD=("$REPO/.venv/bin/python3")
 else
-  PROBE5_PY_CMD=(uv run --frozen --project "$REPO/fused-memory" python)
+  PROBE5_PY_CMD=(uv run --no-sync --project "$REPO/fused-memory" python)
 fi
 
 #: Wall-clock bound for EACH probe; both build their `timeout` from it.
