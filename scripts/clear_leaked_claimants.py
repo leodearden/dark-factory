@@ -64,6 +64,18 @@ class Tier(StrEnum):
     LEDGERED = 'ledgered'
 
 
+REPAIRABLE_TIERS: frozenset[Tier] = frozenset({Tier.TERMINAL, Tier.HYGIENE})
+
+
+def _require_repairable(tiers: frozenset[Tier]) -> None:
+    unrepairable = sorted(tier.value for tier in tiers - REPAIRABLE_TIERS)
+    if unrepairable:
+        raise ValueError(
+            f'tiers {unrepairable} cannot be selected for repair: ledgered rows are '
+            'sanctioned C4-E2 exceptions and are never written'
+        )
+
+
 def classify_tier(task: Mapping, now: datetime) -> Tier | None:
     # A claimant with no heartbeat and no pid (reify 5225's shape) needs no special case: the
     # terminal predicate takes no TTL, and a missing heartbeat is stranded per
@@ -326,6 +338,7 @@ async def apply_repairs(
     tiers: frozenset[Tier],
     clock: Callable[[], datetime],
 ) -> ApplyReport:
+    _require_repairable(tiers)
     if client is None:
         raise ValueError('apply_repairs writes through an MCP client; none was given')
     root = census.project_root
@@ -387,6 +400,7 @@ async def sweep(
     client: ToolClient | None,
     clock: Callable[[], datetime],
 ) -> SweepResult:
+    _require_repairable(tiers)
     if apply and client is None:
         raise ValueError('an applying sweep writes through an MCP client; none was given')
     projects: list[ProjectReport] = []
@@ -643,7 +657,7 @@ async def _applying_sweep(
 
 
 async def main_async(args: argparse.Namespace) -> int:
-    tiers = frozenset({Tier.TERMINAL, Tier.HYGIENE} if args.repair_hygiene else {Tier.TERMINAL})
+    tiers = REPAIRABLE_TIERS if args.repair_hygiene else frozenset({Tier.TERMINAL})
     if args.apply:
         result = await _applying_sweep(args.server_url, args.project_roots, tiers)
         if result is None:
