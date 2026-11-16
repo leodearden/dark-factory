@@ -15,8 +15,10 @@ scan.
 
 from __future__ import annotations
 
+import argparse
 import json
-from dataclasses import dataclass
+import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from escalation.models import Escalation
@@ -115,3 +117,104 @@ def absorbing_resolutions(escalations_dir: Path | str) -> AbsorptionReport:
         skipped_unreadable=skipped['unreadable'],
         skipped_unparsable=skipped['unparsable'],
     )
+
+
+_ROW = (
+    '{escalation_id:<32} {task_id:<16} {category:<28} {status:<10} {absorbed:>8} '
+    '{resolved_at:<32} {resolved_by:<24} {citation_sha}'
+)
+
+
+def _shown(value: str | None) -> str:
+    return '-' if value is None else value
+
+
+def _summary(report: AbsorptionReport) -> str:
+    return (
+        f'total_absorbed={report.total_absorbed} records={len(report.rows)} '
+        f'scanned={report.scanned} skipped_vanished={report.skipped_vanished} '
+        f'skipped_unreadable={report.skipped_unreadable} '
+        f'skipped_unparsable={report.skipped_unparsable}'
+    )
+
+
+def _as_table(report: AbsorptionReport) -> str:
+    """Render the listing, ending ALWAYS with the summary line.
+
+    The skip counts print even at zero, so a missing line never has to be read
+    as "nothing was lost".
+    """
+    if report.rows:
+        lines = [_ROW.format(
+            escalation_id='escalation_id', task_id='task_id', category='category',
+            status='status', absorbed='absorbed', resolved_at='resolved_at',
+            resolved_by='resolved_by', citation_sha='citation_sha',
+        )]
+        lines.extend(
+            _ROW.format(
+                escalation_id=row.escalation_id, task_id=row.task_id,
+                category=row.category, status=row.status,
+                absorbed=row.refiles_suppressed, resolved_at=_shown(row.resolved_at),
+                resolved_by=_shown(row.resolved_by), citation_sha=_shown(row.citation_sha),
+            )
+            for row in report.rows
+        )
+    else:
+        lines = ['no resolution has absorbed a refile']
+    lines.extend(['', _summary(report)])
+    return '\n'.join(lines)
+
+
+def _as_json(report: AbsorptionReport) -> str:
+    return json.dumps(
+        {
+            'rows': [asdict(row) for row in report.rows],
+            'total_absorbed': report.total_absorbed,
+            'scanned': report.scanned,
+            'skipped_vanished': report.skipped_vanished,
+            'skipped_unreadable': report.skipped_unreadable,
+            'skipped_unparsable': report.skipped_unparsable,
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: ``python -m escalation.refile_absorption``.
+
+    Invoked from the repo root as::
+
+        uv run --directory escalation python -m escalation.refile_absorption \\
+            --queue-dir <project_root>/data/escalations
+
+    Read-only: it opens escalation JSON and prints. It never resolves, bumps or
+    moves anything.
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            'List the resolved/dismissed escalations whose resolution has absorbed '
+            'identical refiles (refiles_suppressed > 0), largest count first.'
+        ),
+    )
+    parser.add_argument(
+        '--queue-dir', required=True, type=Path,
+        help='Path to the escalation queue directory (parent of archive/).',
+    )
+    parser.add_argument(
+        '--json', action='store_true', default=False,
+        help='Emit machine-readable JSON instead of the table.',
+    )
+    args = parser.parse_args(argv)
+
+    if not args.queue_dir.is_dir():
+        print(f'queue-dir is not a directory: {args.queue_dir}', file=sys.stderr)
+        return 2
+
+    report = absorbing_resolutions(args.queue_dir)
+    print(_as_json(report) if args.json else _as_table(report))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
