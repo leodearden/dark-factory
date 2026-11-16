@@ -9,9 +9,9 @@ tasks ζ and η are concurrently rewriting.
 
 STRUCTURAL CONSTRAINT — sync and async tests live in strictly separate classes.
 ``orchestrator/pyproject.toml`` sets no ``asyncio_mode`` (pytest-asyncio STRICT) and
-promotes the mark-mismatch warning to an ERROR-level filterwarning.  ι's report path is
-ENTIRELY synchronous, so every test here is a plain sync ``def test_`` and no class in
-this file carries ``@pytest.mark.asyncio``.
+promotes the mark-mismatch warning to an ERROR-level filterwarning.  Every test here is
+a plain sync ``def test_`` and no class in this file carries ``@pytest.mark.asyncio``;
+the async owner corroboration is tested in ``test_flake_report_owner_liveness.py``.
 """
 
 from __future__ import annotations
@@ -52,8 +52,16 @@ from orchestrator.flake_report import (
     probe_ledger,
     render_report,
 )
+from orchestrator.fm_retry import FM_NULL_SENTINEL_URL
 
 _NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _fused_memory_unreachable(monkeypatch):
+    # The command reads owners live, and the default fused_memory.url is the LIVE server;
+    # the null sentinel refuses at once with no retry window (mcp_lifecycle.fm_session).
+    monkeypatch.setenv('ORCH_FUSED_MEMORY__URL', FM_NULL_SENTINEL_URL)
 
 # Every ledger WRITE entry point; the read-only report must reach none of them.
 _WRITERS = (
@@ -1604,7 +1612,8 @@ class TestRenderReport:
 
 
 class TestFlakeLedgerCommand:
-    """`orchestrator flake-ledger` end to end.  All sync — the report path has no async."""
+    """`orchestrator flake-ledger` end to end.  All sync — the command runs its own event
+    loop for the live owner read."""
 
     def _project(self, tmp_path: Path, *, seed: bool = True) -> tuple[Path, Path]:
         """Write a config YAML pointing at a tmp project; optionally seed its ledger.
@@ -1681,6 +1690,16 @@ class TestFlakeLedgerCommand:
         cfg, _ = self._project(tmp_path)
         result = CliRunner().invoke(main, ['flake-ledger', '--config', str(cfg)])
         assert result.exit_code == 0, result.output
+
+    def test_it_reads_the_owners_live_and_says_when_it_could_not(self, tmp_path):
+        cfg, _ = self._project(tmp_path)
+        result = CliRunner().invoke(main, ['flake-ledger', '--config', str(cfg)])
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        assert [ln for ln in lines if 'owner liveness: READ FAILED' in ln], result.output
+        (row,) = [ln for ln in lines if 'tests/test_a.py::test_one' in ln and 'owner=' in ln]
+        assert 'owner=4242' in row, row
+        assert 'invariant breach' not in row, row
 
 
 def _seed_due(
