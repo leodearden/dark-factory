@@ -311,11 +311,19 @@ def _iter_clauses(text: str):
         yield text[pos:], pos
 
 
+# 'merged up to X' brings a branch up to date with X, a merge INTO the branch, so it
+# does not land the branch's task (solar esc-unverified-claim-195-2). Pinned by
+# tests/test_completion_claim_mood.py::TestNonAssertiveScopes.
+_CATCH_UP_MERGE_RE: re.Pattern[str] = re.compile(
+    r'\bmerged\s+up\s+(?:to|with)\b', re.IGNORECASE,
+)
+
 _EXEMPTION_STRIPPERS: tuple[re.Pattern[str], ...] = (
     NEGATED_TERMINAL_RE,
     _NEGATED_EXTENSION_RE,
     FUTURE_ASPIRATIONAL_RE,
     _GOVERNED_VERB_RE,
+    _CATCH_UP_MERGE_RE,
 )
 
 
