@@ -228,6 +228,18 @@ def auc_interval_95(
     return max(0.0, auc - half), min(1.0, auc + half)
 
 
+class PrecisionReading(StrEnum):
+    """Which precision an operating point holds at its floor: the rate, or its Wilson lower bound."""
+
+    point_estimate = 'point_estimate'
+    wilson_lower_bound = 'wilson_lower_bound'
+
+    def precision(self, caught: int, flagged: int) -> float:
+        if self is PrecisionReading.wilson_lower_bound:
+            return wilson_interval(caught, flagged)[0]
+        return caught / flagged
+
+
 @dataclass(frozen=True)
 class OperatingPoint:
     """The inclusive threshold chosen, with the pairs it flags; ``of`` is every true pair."""
@@ -236,6 +248,8 @@ class OperatingPoint:
     caught: int
     flagged: int
     of: int
+    floor: float
+    reading: PrecisionReading
 
     @property
     def recall(self) -> Proportion | None:
@@ -251,21 +265,28 @@ def operating_point(
     positives: Collection[Pair],
     n_positive: int,
     floor: float,
+    reading: PrecisionReading = PrecisionReading.point_estimate,
 ) -> OperatingPoint:
-    """The candidate-score threshold catching the most true pairs at precision >= *floor*.
+    """The candidate-score threshold catching the most true pairs with precision >= *floor*.
 
-    Only a threshold equal to some candidate's score is considered, and tied
-    scores are flagged together. A tie on caught goes to the higher threshold.
+    *reading* says which precision must reach the floor. Only a threshold
+    equal to some candidate's score is considered, and tied scores are
+    flagged together. A tie on caught goes to the higher threshold.
     """
-    best = OperatingPoint(threshold=None, caught=0, flagged=0, of=n_positive)
+    best = OperatingPoint(
+        threshold=None, caught=0, flagged=0, of=n_positive, floor=floor, reading=reading,
+    )
     flagged = caught = 0
     descending = sorted(candidate_scores.items(), key=lambda item: -item[1])
     for score, tied in itertools.groupby(descending, key=lambda item: item[1]):
         pairs = [pair for pair, _ in tied]
         flagged += len(pairs)
         caught += sum(pair in positives for pair in pairs)
-        if caught / flagged >= floor and caught > best.caught:
-            best = OperatingPoint(threshold=score, caught=caught, flagged=flagged, of=n_positive)
+        if reading.precision(caught, flagged) >= floor and caught > best.caught:
+            best = OperatingPoint(
+                threshold=score, caught=caught, flagged=flagged, of=n_positive,
+                floor=floor, reading=reading,
+            )
     return best
 
 
@@ -393,8 +414,11 @@ DETECTOR_ARMS: tuple[DetectorArm, ...] = (
 
 BASELINE_ARM = 'calibrated-ann'
 BASELINE_ARM_CLASS = 'baseline'
-OPERATING_RULE_FLOOR = 'max_caught_at_precision_floor'
-OPERATING_RULE_BASELINE = 'calibrated_ann_cutoffs'
+
+
+class OperatingRule(StrEnum):
+    max_caught_at_precision_floor = 'max_caught_at_precision_floor'
+    calibrated_ann_cutoffs = 'calibrated_ann_cutoffs'
 
 
 @dataclass(frozen=True)
@@ -424,9 +448,10 @@ def _auc_block(positives: Sequence[float], negatives: Sequence[float]) -> AucBlo
     )
 
 
-def _operating_point_json(floor: float, point: OperatingPoint) -> dict[str, Any]:
+def _operating_point_json(point: OperatingPoint) -> dict[str, Any]:
     return {
-        'precision_floor': floor,
+        'precision_floor': point.floor,
+        'precision_reading': str(point.reading),
         'threshold': point.threshold,
         'caught': point.caught,
         'flagged': point.flagged,
@@ -442,17 +467,18 @@ class DetectorRow:
     arm: str
     arm_class: str
     model: str
-    granularity: str
-    status: str
-    skip_reason: str | None = None
+    granularity: Granularity
+    status: _arms.ArmStatus
+    skip_reason: _arms.SkipReason | None = None
     skip_detail: str | None = None
-    operating_rule: str | None = None
+    operating_rule: OperatingRule | None = None
     auc: AucBlock | None = None
     operating_threshold: float | None = None
     paraphrase_band_recall: Proportion | None = None
     precision: Proportion | None = None
     hard_negative_flagged: Proportion | None = None
     recall_at_precision: Mapping[float, OperatingPoint] | None = None
+    lower_bound_operating_point: OperatingPoint | None = None
     pairs_scored: int | None = None
     unscored_pairs: int | None = None
     cost_usd: float | None = None
@@ -463,32 +489,35 @@ class DetectorRow:
     scoring_seconds: float | None = None
 
     @classmethod
-    def skipped(cls, arm: DetectorArm, reason: str, detail: str) -> DetectorRow:
+    def skipped(cls, arm: DetectorArm, reason: _arms.SkipReason, detail: str) -> DetectorRow:
         return cls(
             arm=arm.name, arm_class=str(arm.spec.arm_class), model=arm.spec.model,
-            granularity=str(arm.granularity), status=str(_arms.ArmStatus.skipped),
-            skip_reason=str(reason), skip_detail=detail,
+            granularity=arm.granularity, status=_arms.ArmStatus.skipped,
+            skip_reason=reason, skip_detail=detail,
         )
 
     def to_json(self) -> dict[str, Any]:
-        points = self.recall_at_precision
+        points, lower_bound = self.recall_at_precision, self.lower_bound_operating_point
         return {
             'arm': self.arm,
             'arm_class': self.arm_class,
             'model': self.model,
-            'granularity': self.granularity,
-            'status': self.status,
-            'skip_reason': self.skip_reason,
+            'granularity': str(self.granularity),
+            'status': str(self.status),
+            'skip_reason': None if self.skip_reason is None else str(self.skip_reason),
             'skip_detail': self.skip_detail,
-            'operating_rule': self.operating_rule,
+            'operating_rule': None if self.operating_rule is None else str(self.operating_rule),
             'auc': None if self.auc is None else asdict(self.auc),
             'operating_threshold': self.operating_threshold,
             'paraphrase_band_recall': _proportion_json(self.paraphrase_band_recall),
             'precision': _proportion_json(self.precision),
             'hard_negative_flagged': _proportion_json(self.hard_negative_flagged),
             'recall_at_precision': None if points is None else [
-                _operating_point_json(floor, point) for floor, point in points.items()
+                _operating_point_json(point) for point in points.values()
             ],
+            'lower_bound_operating_point': (
+                None if lower_bound is None else _operating_point_json(lower_bound)
+            ),
             'pairs_scored': self.pairs_scored,
             'unscored_pairs': self.unscored_pairs,
             'cost_usd': self.cost_usd,
@@ -590,9 +619,9 @@ def _measure(
         arm=arm.name,
         arm_class=str(arm.spec.arm_class),
         model=arm.spec.model,
-        granularity=str(arm.granularity),
-        status=str(_arms.ArmStatus.measured),
-        operating_rule=OPERATING_RULE_FLOOR,
+        granularity=arm.granularity,
+        status=_arms.ArmStatus.measured,
+        operating_rule=OperatingRule.max_caught_at_precision_floor,
         auc=_auc_block(
             [scores[p] for p in true_pairs if p in scores],
             [scores[p] for p in hard_negatives if p in scores],
@@ -602,6 +631,10 @@ def _measure(
         precision=proportion(caught, len(flagged)),
         hard_negative_flagged=proportion(len(flagged & set(hard_negatives)), len(hard_negatives)),
         recall_at_precision=recall_at_precision(candidate_scores, positives, len(true_pairs)),
+        lower_bound_operating_point=operating_point(
+            candidate_scores, positives, len(true_pairs), precision_floor,
+            PrecisionReading.wilson_lower_bound,
+        ),
         pairs_scored=2 * len(scores),
         unscored_pairs=len(union) - len(scores),
         cost_usd=_sum_or_none(metered.costs),
@@ -635,9 +668,9 @@ def measure_ann_baseline(
         arm=BASELINE_ARM,
         arm_class=BASELINE_ARM_CLASS,
         model='cosine',
-        granularity=str(Granularity.full_text),
-        status=str(_arms.ArmStatus.measured),
-        operating_rule=OPERATING_RULE_BASELINE,
+        granularity=Granularity.full_text,
+        status=_arms.ArmStatus.measured,
+        operating_rule=OperatingRule.calibrated_ann_cutoffs,
         auc=_auc_block([cosine(p) for p in true_pairs], [cosine(p) for p in hard_negatives]),
         operating_threshold=None,
         paraphrase_band_recall=proportion(caught, len(true_pairs)),
@@ -688,96 +721,138 @@ def gate_proposal_json(proposal: GateProposal) -> dict[str, Any]:
     return {**asdict(proposal), 'basis': list(proposal.basis)}
 
 
-def gate_verdict(row: Mapping[str, Any], proposal: GateProposal) -> dict[str, bool]:
-    """*row* against *proposal*, on point estimates and on interval lower bounds."""
-    recall, precision, auc = row['paraphrase_band_recall'], row['precision'], row['auc']
-    if (
-        row['operating_threshold'] is None or recall is None or precision is None
-        or auc is None or auc['value'] is None or auc['hanley_mcneil_95'] is None
-    ):
-        return {'on_point_estimates': False, 'on_lower_bounds': False}
-    return {
-        'on_point_estimates': bool(
-            recall['rate'] >= proposal.min_paraphrase_band_recall
-            and precision['rate'] >= proposal.precision_floor
-            and auc['value'] >= proposal.min_auc
-        ),
-        'on_lower_bounds': bool(
-            recall['wilson_95'][0] >= proposal.min_paraphrase_band_recall
-            and precision['wilson_95'][0] >= proposal.precision_floor
-            and auc['hanley_mcneil_95'][0] >= proposal.min_auc
-        ),
-    }
+@dataclass(frozen=True)
+class GateVerdict:
+    on_point_estimates: bool
+    on_lower_bounds: bool
 
 
-def choose_detector(rows: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+def _clears(recall: float, precision: float, auc: float, proposal: GateProposal) -> bool:
+    return (
+        recall >= proposal.min_paraphrase_band_recall
+        and precision >= proposal.precision_floor
+        and auc >= proposal.min_auc
+    )
+
+
+def gate_verdict(row: DetectorRow, proposal: GateProposal) -> GateVerdict:
+    """*row* against *proposal*, on point estimates and on interval lower bounds.
+
+    Each reading is judged at its own operating point. The point-estimate
+    reading uses the row's operating threshold. The lower-bound reading uses
+    ``lower_bound_operating_point``, where precision's Wilson lower bound meets
+    the floor. At the point-estimate threshold that bound is below the floor
+    by construction.
+    """
+    auc, recall, precision = row.auc, row.paraphrase_band_recall, row.precision
+    lower_bound = row.lower_bound_operating_point
+    lower_recall = None if lower_bound is None else lower_bound.recall
+    lower_precision = None if lower_bound is None else lower_bound.precision
+    return GateVerdict(
+        on_point_estimates=(
+            row.operating_threshold is not None and recall is not None
+            and precision is not None and auc is not None and auc.value is not None
+            and _clears(recall.rate, precision.rate, auc.value, proposal)
+        ),
+        on_lower_bounds=(
+            lower_recall is not None and lower_precision is not None
+            and auc is not None and auc.hanley_mcneil_95 is not None
+            and _clears(
+                lower_recall.wilson_95[0], lower_precision.wilson_95[0],
+                auc.hanley_mcneil_95[0], proposal,
+            )
+        ),
+    )
+
+
+def choose_detector(rows: Sequence[DetectorRow]) -> DetectorRow | None:
     """The row :data:`CHOICE_RULE` picks, or None when no arm was measured."""
+
+    def rank(index: int, row: DetectorRow, recall: Proportion) -> tuple[int, bool, float, int]:
+        auc = None if row.auc is None else row.auc.value
+        return (-recall.hits, auc is None, -(auc or 0.0), index)
+
     eligible = [
-        (index, row) for index, row in enumerate(rows)
-        if row['status'] == _arms.ArmStatus.measured
-        and row['arm_class'] != BASELINE_ARM_CLASS
-        and row['paraphrase_band_recall'] is not None
+        (rank(index, row, row.paraphrase_band_recall), row)
+        for index, row in enumerate(rows)
+        if row.status == _arms.ArmStatus.measured
+        and row.arm_class != BASELINE_ARM_CLASS
+        and row.paraphrase_band_recall is not None
     ]
     if not eligible:
         return None
-
-    def rank(item: tuple[int, Mapping[str, Any]]) -> tuple[int, bool, float, int]:
-        index, row = item
-        auc = row['auc']['value'] if row['auc'] else None
-        return (-row['paraphrase_band_recall']['hits'], auc is None, -(auc or 0.0), index)
-
-    return min(eligible, key=rank)[1]
+    return min(eligible, key=lambda ranked: ranked[0])[1]
 
 
-def recall_caveat_entry(report: Mapping[str, Any]) -> dict[str, Any] | None:
-    """The chosen arm as a ``recall_caveat.adjudicator_measurements`` entry, or None."""
-    chosen = report['chosen']
-    if chosen is None:
-        return None
-    (row,) = [row for row in report['arms'] if row['arm'] == chosen['arm']]
-    generated = report['candidate_generation']['true_caught']
-    recall, precision = row['paraphrase_band_recall'], row['precision']
-    hard, auc = row['hard_negative_flagged'], row['auc']
+def recall_caveat_entry(
+    row: DetectorRow,
+    verdict: GateVerdict,
+    generation: CandidateGeneration,
+    *,
+    records: int,
+    measured_at: str,
+) -> dict[str, Any]:
+    """The chosen *row* as a ``recall_caveat.adjudicator_measurements`` entry."""
+    recall, precision, hard, auc = (
+        row.paraphrase_band_recall, row.precision, row.hard_negative_flagged, row.auc,
+    )
+    generated = generation.true_caught
+    if (
+        recall is None or hard is None or generated is None
+        or auc is None or auc.value is None or auc.hanley_mcneil_95 is None
+    ):
+        raise ValueError(
+            f'{row.arm} lacks a recall, hard-negative, generation or AUC measurement to record',
+        )
     return {
-        'measured_at': report['provenance']['measured_at'],
-        'detector': row['arm'],
-        'scan_set': {'setting': report['setting']['scan_set'], 'records': report['setting']['records']},
+        'measured_at': measured_at,
+        'detector': row.arm,
+        'scan_set': {'setting': SCAN_SET, 'records': records},
         'candidate_generation': {
-            'top_k': report['setting']['top_k'], 'caught': generated['hits'], 'of': generated['total'],
+            'top_k': generation.top_k, 'caught': generated.hits, 'of': generated.total,
         },
-        'operating_threshold': row['operating_threshold'],
+        'operating_threshold': row.operating_threshold,
         'paraphrase_band_recall': {
-            'caught': recall['hits'], 'of': recall['total'],
-            'rate': recall['rate'], 'wilson_95': recall['wilson_95'],
+            'caught': recall.hits, 'of': recall.total,
+            'rate': recall.rate, 'wilson_95': recall.wilson_95,
         },
         'precision_at_operating_point': None if precision is None else {
-            'flagged': precision['total'], 'rate': precision['rate'],
-            'wilson_95': precision['wilson_95'],
+            'flagged': precision.total, 'rate': precision.rate,
+            'wilson_95': precision.wilson_95,
         },
-        'hard_negative_flagged': {'flagged': hard['hits'], 'of': hard['total']},
+        'hard_negative_flagged': {'flagged': hard.hits, 'of': hard.total},
         'auc_true_vs_hard_negative': {
-            'value': auc['value'], 'n_true': auc['n_true'],
-            'n_hard_negative': auc['n_hard_negative'], 'hanley_mcneil_95': auc['hanley_mcneil_95'],
+            'value': auc.value, 'n_true': auc.n_true,
+            'n_hard_negative': auc.n_hard_negative, 'hanley_mcneil_95': auc.hanley_mcneil_95,
         },
-        'meets_proposed_gate': chosen['verdict']['on_point_estimates'],
+        'meets_proposed_gate': verdict.on_point_estimates,
         'source': COMMITTED_SOURCE,
     }
 
 
-def caveats_for(report: Mapping[str, Any]) -> list[str]:
-    """What a reader must know to read the numbers, stated from the report's own data."""
-    setting = report['setting']
-    true_total = report['pair_counts'][TRUE_DUP]
-    floor = report['gate_proposal']['precision_floor']
+def caveats_for(
+    *,
+    records: int,
+    generation: CandidateGeneration,
+    true_total: int,
+    arm_rows: Sequence[DetectorRow],
+    proposal: GateProposal,
+) -> list[str]:
+    """What a reader must know to read the numbers, stated from the measurement itself."""
+    floor = proposal.precision_floor
     caveats = [
-        f'The scan set is the fixture alone ({setting["scan_set"]}, {setting["records"]} records): '
+        f'The scan set is the fixture alone ({SCAN_SET}, {records} records): '
         'the most favourable setting, with no live-corpus distractors competing for each '
-        f'record\'s top_k={setting["top_k"]} window.',
-        f'{report["candidate_generation"]["cross_category_true_pairs"]} of the {true_total} true '
+        f'record\'s top_k={generation.top_k} window.',
+        f'{generation.cross_category_true_pairs} of the {true_total} true '
         'pairs are cross-category. The per-category generator never forms them, so no '
         f'adjudicator over it can catch them; recall still divides by all {true_total}.',
-        f'Each arm\'s operating threshold is selected in-sample on these {setting["records"]} '
+        f'Each arm\'s operating threshold is selected in-sample on these {records} '
         f'records at the {floor:.2f} precision floor; nothing is held out.',
+        'The lower-bound verdict judges each arm at its own lower_bound_operating_point: the '
+        'most true pairs caught while precision\'s Wilson 95% lower bound stays at or above '
+        f'the {floor:.2f} floor. At the point-estimate operating point that bound sits below '
+        'the floor by construction, so it would carry no information.',
         'AUC is rank-based (Mann-Whitney, ties count half) over every true and hard-negative '
         'pair, including pairs the generator never forms; its interval is Hanley-McNeil (1982).',
         'A pair\'s adjudicator score is the mean of its two directional scores: the scorers are '
@@ -790,8 +865,8 @@ def caveats_for(report: Mapping[str, Any]) -> list[str]:
         'roughly a hundredfold.',
     ]
     truncation = [
-        f'{row["arm"]} at {row["max_length"]} tokens: {row["pairs_over_max_length"]} slate pair(s) over'
-        for row in report['arms'] if row['max_length'] is not None
+        f'{row.arm} at {row.max_length} tokens: {row.pairs_over_max_length} slate pair(s) over'
+        for row in arm_rows if row.max_length is not None
     ]
     if truncation:
         caveats.append(
@@ -799,8 +874,8 @@ def caveats_for(report: Mapping[str, Any]) -> list[str]:
             f'without the template): {"; ".join(truncation)}.',
         )
     caveats.extend(
-        f'{row["arm"]} was skipped ({row["skip_reason"]}): {row["skip_detail"]}'
-        for row in report['arms'] if row['status'] == _arms.ArmStatus.skipped
+        f'{row.arm} was skipped ({row.skip_reason}): {row.skip_detail}'
+        for row in arm_rows if row.status == _arms.ArmStatus.skipped
     )
     return caveats
 
@@ -816,33 +891,36 @@ def build_report(
     provenance: Mapping[str, Any],
     proposal: GateProposal = GATE_PROPOSAL,
 ) -> dict[str, Any]:
-    rows = [row.to_json() for row in arm_rows]
-    chosen = choose_detector(rows)
-    measured: dict[str, Any] = {
+    pair_counts = {
+        name: sum(cls == name for cls in pair_classes.values()) for name in PAIR_CLASSES
+    }
+    chosen = choose_detector(arm_rows)
+    choice: dict[str, Any] | None = None
+    entry: dict[str, Any] | None = None
+    if chosen is not None:
+        verdict = gate_verdict(chosen, proposal)
+        choice = {'arm': chosen.arm, 'rule': CHOICE_RULE, 'verdict': asdict(verdict)}
+        entry = recall_caveat_entry(
+            chosen, verdict, generation,
+            records=records, measured_at=str(provenance['measured_at']),
+        )
+    return {
         'setting': {
             'scan_set': SCAN_SET, 'records': records, 'top_k': generation.top_k,
             'per_category': True, 'embedder': dict(embedder),
         },
-        'pair_counts': {
-            name: sum(cls == name for cls in pair_classes.values()) for name in PAIR_CLASSES
-        },
+        'pair_counts': pair_counts,
         'candidate_generation': generation.to_json(),
         'baseline': baseline.to_json(),
-        'arms': rows,
-        'chosen': None if chosen is None else {
-            'arm': chosen['arm'], 'rule': CHOICE_RULE, 'verdict': gate_verdict(chosen, proposal),
-        },
+        'arms': [row.to_json() for row in arm_rows],
+        'chosen': choice,
         'gate_proposal': gate_proposal_json(proposal),
+        'recall_caveat_entry': entry,
+        'caveats': caveats_for(
+            records=records, generation=generation, true_total=pair_counts[TRUE_DUP],
+            arm_rows=arm_rows, proposal=proposal,
+        ),
         'provenance': dict(provenance),
-    }
-    return {
-        **{key: measured[key] for key in (
-            'setting', 'pair_counts', 'candidate_generation', 'baseline', 'arms', 'chosen',
-            'gate_proposal',
-        )},
-        'recall_caveat_entry': recall_caveat_entry(measured),
-        'caveats': caveats_for(measured),
-        'provenance': measured['provenance'],
     }
 
 

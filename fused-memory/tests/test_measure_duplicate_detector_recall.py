@@ -251,6 +251,27 @@ class TestOperatingPointAndIntervals:
 
         assert (point.threshold, point.caught, point.flagged) == (0.9, 1, 1)
 
+    def test_the_wilson_lower_bound_reading_holds_the_bound_at_the_floor(self):
+        # 40 true at 0.9, 2 false at 0.8, 2 true at 0.7. Wilson 95% lower
+        # bounds: 40/40 -> 40 / (40 + 1.96^2) = 0.912; 42/44 -> 0.849.
+        scores = {
+            **{(0, i): 0.9 for i in range(1, 41)},
+            (0, 41): 0.8, (0, 42): 0.8, (0, 43): 0.7, (0, 44): 0.7,
+        }
+        positives = frozenset(pair for pair in scores if pair not in {(0, 41), (0, 42)})
+        reading = _mod().PrecisionReading
+
+        point = self._point(scores, positives, 0.90, n_positive=42)
+        lower = _mod().operating_point(
+            scores, positives, 42, 0.90, reading.wilson_lower_bound,
+        )
+
+        assert (point.threshold, point.caught, point.flagged) == (0.7, 42, 44)
+        assert point.reading == reading.point_estimate
+        assert (lower.threshold, lower.caught, lower.flagged) == (0.9, 40, 40)
+        assert (lower.floor, lower.reading) == (0.90, reading.wilson_lower_bound)
+        assert lower.precision.wilson_95[0] >= 0.90 > point.precision.wilson_95[0]
+
     def test_recall_at_precision_reports_one_point_per_floor(self):
         points = _mod().recall_at_precision(self._SCORES, self._POSITIVES, 10)
 
@@ -449,6 +470,16 @@ class TestMeasureDetectorArm:
         assert (row.precision.hits, row.precision.total) == (2, 3)
         assert (row.hard_negative_flagged.hits, row.hard_negative_flagged.total) == (1, 2)
 
+    def test_the_lower_bound_operating_point_is_reported(self):
+        row = self._measure(_fake_arm(_yielding(self._scorer())))
+        reading = _mod().PrecisionReading.wilson_lower_bound
+
+        # One true pair at 0.9 has a Wilson lower bound of 0.207, under the 0.6 floor.
+        point = row.lower_bound_operating_point
+        assert (point.threshold, point.caught, point.flagged, point.of) == (None, 0, 0, 3)
+        assert (point.floor, point.reading) == (self._FLOOR, reading)
+        assert row.to_json()['lower_bound_operating_point']['precision_reading'] == reading
+
     def test_recall_at_each_precision_floor_is_reported(self):
         row = self._measure(_fake_arm(_yielding(self._scorer())))
 
@@ -549,11 +580,15 @@ class TestMeasureDetectorArm:
 
 
 def _row(name='arm-a', *, hits=3, total=4, flagged=3, auc: float | None = 0.85, auc_lo=0.81,
-         recall_lo=0.76, precision_lo=0.91, threshold: float | None = 0.5):
+         recall_lo=0.76, precision_lo=0.91, threshold: float | None = 0.5,
+         lower=(290, 300, 301)):
+    """A measured row; *lower* is the lower-bound operating point's (caught, flagged, of)."""
     m = _mod()
+    caught, lower_flagged, of = lower
     return m.DetectorRow(
-        arm=name, arm_class='local_cross_encoder', model='fake/model', granularity='full_text',
-        status='measured', operating_rule=m.OPERATING_RULE_FLOOR,
+        arm=name, arm_class='local_cross_encoder', model='fake/model',
+        granularity=m.Granularity.full_text, status=_arms().ArmStatus.measured,
+        operating_rule=m.OperatingRule.max_caught_at_precision_floor,
         auc=None if auc is None else m.AucBlock(
             value=auc, n_true=total, n_hard_negative=2, hanley_mcneil_95=(auc_lo, 1.0),
         ),
@@ -565,17 +600,23 @@ def _row(name='arm-a', *, hits=3, total=4, flagged=3, auc: float | None = 0.85, 
             hits=hits, total=flagged, rate=hits / flagged, wilson_95=(precision_lo, 1.0),
         ),
         hard_negative_flagged=m.Proportion(hits=1, total=2, rate=0.5, wilson_95=(0.09, 0.91)),
+        lower_bound_operating_point=m.OperatingPoint(
+            threshold=None if lower_flagged == 0 else 0.6, caught=caught, flagged=lower_flagged,
+            of=of, floor=0.90, reading=m.PrecisionReading.wilson_lower_bound,
+        ),
     )
 
 
 def _skipped(name='arm-skipped', reason='no_credential', detail='KEY unset'):
-    return _mod().DetectorRow.skipped(_fake_arm(_yielding(None), name=name), reason, detail)
+    return _mod().DetectorRow.skipped(
+        _fake_arm(_yielding(None), name=name), _arms().SkipReason(reason), detail,
+    )
 
 
 def _baseline(hits=10):
     row = _row(_mod().BASELINE_ARM, hits=hits, total=10, flagged=10)
     return dataclasses.replace(
-        row, arm_class='baseline', operating_rule=_mod().OPERATING_RULE_BASELINE,
+        row, arm_class='baseline', operating_rule=_mod().OperatingRule.calibrated_ann_cutoffs,
         operating_threshold=None,
     )
 
@@ -616,37 +657,51 @@ class TestReportAndProposal:
         assert proposal.basis and all(proposal.basis)
 
     def _verdict(self, row):
-        return _mod().gate_verdict(row.to_json(), _mod().GATE_PROPOSAL)
+        return _mod().gate_verdict(row, _mod().GATE_PROPOSAL)
+
+    def _readings(self, on_point_estimates, on_lower_bounds):
+        return _mod().GateVerdict(
+            on_point_estimates=on_point_estimates, on_lower_bounds=on_lower_bounds,
+        )
+
+    # The default lower-bound point (290 of 301 caught, 290 of 300 flagged) has
+    # Wilson 95% lower bounds of 0.936 on recall and 0.940 on precision.
 
     def test_a_row_exactly_at_every_bar_passes_both_readings(self):
-        row = _row(hits=3, total=4, auc=0.80, recall_lo=0.75, precision_lo=0.90, auc_lo=0.80)
+        row = _row(hits=9, total=12, flagged=10, auc=0.80, auc_lo=0.80)
 
-        assert self._verdict(row) == {'on_point_estimates': True, 'on_lower_bounds': True}
+        assert self._verdict(row) == self._readings(True, True)
 
     @pytest.mark.parametrize('changes', [
-        {'hits': 74, 'total': 100}, {'auc': 0.79},
+        {'hits': 74, 'total': 100}, {'flagged': 4}, {'auc': 0.79},
     ])
     def test_a_point_estimate_below_its_bar_fails_that_reading(self, changes):
-        row = _row(**{'recall_lo': 0.75, 'precision_lo': 0.9, 'auc_lo': 0.8, **changes})
+        row = _row(**{'auc_lo': 0.8, **changes})
 
-        assert self._verdict(row)['on_point_estimates'] is False
+        assert self._verdict(row).on_point_estimates is False
 
     @pytest.mark.parametrize('changes', [
-        {'recall_lo': 0.749}, {'precision_lo': 0.899}, {'auc_lo': 0.799},
+        {'lower': (200, 210, 301)}, {'lower': (290, 320, 301)}, {'auc_lo': 0.799},
+        {'lower': (0, 0, 301)},
     ])
     def test_a_lower_bound_below_its_bar_fails_that_reading(self, changes):
         row = _row(**{'hits': 3, 'total': 4, 'auc': 0.9, **changes})
 
-        assert self._verdict(row) == {'on_point_estimates': True, 'on_lower_bounds': False}
+        assert self._verdict(row) == self._readings(True, False)
+
+    def test_the_lower_bound_reading_ignores_the_point_operating_precision_bound(self):
+        row = _row(hits=3, total=4, auc=0.9, recall_lo=0.1, precision_lo=0.1)
+
+        assert self._verdict(row) == self._readings(True, True)
 
     def test_no_operating_point_fails_both_readings(self):
-        row = _row(threshold=None)
+        row = _row(threshold=None, lower=(0, 0, 4))
 
-        assert self._verdict(row) == {'on_point_estimates': False, 'on_lower_bounds': False}
+        assert self._verdict(row) == self._readings(False, False)
 
     def _chosen(self, rows):
-        chosen = _mod().choose_detector([row.to_json() for row in rows])
-        return None if chosen is None else chosen['arm']
+        chosen = _mod().choose_detector(rows)
+        return None if chosen is None else chosen.arm
 
     def test_the_most_true_pairs_caught_wins_and_the_baseline_never_does(self):
         rows = [
@@ -666,7 +721,7 @@ class TestReportAndProposal:
     def test_the_recall_caveat_entry_validates_against_the_config_schema(self):
         report = _report([_skipped(), _row('chosen-arm', hits=3, total=4)])
 
-        entry = _mod().recall_caveat_entry(report)
+        entry = report['recall_caveat_entry']
 
         model = _report_schema().AdjudicatorMeasurement.model_validate(entry)
         assert model.measured_at == '2099-01-02'
@@ -676,10 +731,14 @@ class TestReportAndProposal:
         )
         assert (model.paraphrase_band_recall.caught, model.paraphrase_band_recall.of) == (3, 4)
         assert (model.candidate_generation.caught, model.candidate_generation.of) == (1, 4)
+        assert model.meets_proposed_gate is report['chosen']['verdict']['on_point_estimates']
         assert list(entry) == list(_report_schema().AdjudicatorMeasurement.model_fields)
 
     def test_no_chosen_arm_is_no_entry(self):
-        assert _mod().recall_caveat_entry(_report([_skipped()])) is None
+        report = _report([_skipped()])
+
+        assert report['chosen'] is None
+        assert report['recall_caveat_entry'] is None
 
     def test_the_report_carries_setting_counts_rows_and_derived_caveats(self):
         report = _report([_skipped('arm-x', 'dependency_unavailable', 'no torch'), _row('a')])
@@ -697,6 +756,8 @@ class TestReportAndProposal:
         }
         assert report['chosen']['arm'] == 'a'
         assert set(report['chosen']['verdict']) == {'on_point_estimates', 'on_lower_bounds'}
+        assert type(report['arms'][0]['skip_reason']) is str
+        assert type(report['arms'][1]['operating_rule']) is str
         assert report['gate_proposal'] == _mod().gate_proposal_json(_mod().GATE_PROPOSAL)
         assert report['provenance'] == _PROVENANCE
         assert any(
@@ -706,6 +767,7 @@ class TestReportAndProposal:
         caveats = ' '.join(report['caveats'])
         assert 'arm-x' in caveats and 'dependency_unavailable' in caveats
         assert 'in-sample' in caveats
+        assert 'lower_bound_operating_point' in caveats
         assert 'fixture_only' in caveats
         assert 'jev-choice' in caveats
         json.dumps(report)
