@@ -112,7 +112,7 @@ Watch for the final line:
    - `last_census_at` is this run's **date**, `YYYY-MM-DD` (date-only, not a timestamp).
    - `last_census_report` names the new report, repo-relative (e.g. `plans/confusion-census-2026-11-07.md`).
    - `last_census_run_id` names this run. It is what the next trigger's completion arm reads.
-   - `last_census_as_of_sha` is the commit the run censused, and `session_watermark` is where the next run's transcript window starts (the floor is measured from it).
+   - `last_census_as_of_sha` is the commit the run censused, and `session_watermark` is the exclusive end of the window this run mined; the trigger's floor is measured from it. The next run mines the last `census.ledger_retention_days` days (default 30), less the sessions already in the ledger.
 4. **If you ran `--dry-run-filing`,** file the payload JSON by hand. A later census will not re-file it, because those confusions now code as matches and the window has moved.
 
 ## Anchor seeding — when an equivalent manual survey already exists
