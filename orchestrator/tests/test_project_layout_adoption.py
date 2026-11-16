@@ -345,37 +345,30 @@ class TestMainCheckoutDefaultsNameTheirOverrides:
         monkeypatch.setenv(rab.RUNS_DB_ENV_VAR, str(tmp_path / 'elsewhere.db'))
         assert rab.default_runs_db_path() == tmp_path / 'elsewhere.db'
 
-    @pytest.mark.parametrize(('cli', 'args', 'flag', 'env_var'), [
+    @pytest.mark.parametrize(('cli', 'args', 'flag'), [
         pytest.param(
             prompt_opt_cli,
             ['canary', '--deploy-at', '2026-06-15T00:00:00+00:00', '--project-id', 'dark_factory'],
-            '--runs-db', None, id='prompt-opt-canary',
+            '--runs-db', id='prompt-opt-canary',
         ),
         pytest.param(
-            prompt_opt_cli, ['build-curator-corpus'], '--db-path', None,
+            prompt_opt_cli, ['build-curator-corpus'], '--db-path',
             id='prompt-opt-build-curator-corpus',
         ),
         pytest.param(
-            reviewer_trial_cli, ['mine'], '--runs-db', None, id='reviewer-trial-mine',
+            reviewer_trial_cli, ['mine'], '--runs-db', id='reviewer-trial-mine',
         ),
         pytest.param(
-            reviewer_trial_cli, ['campaign', '--results-dir', 'results'], '--config', None,
+            reviewer_trial_cli, ['campaign', '--results-dir', 'results'], '--config',
             id='reviewer-trial-campaign',
         ),
         pytest.param(
-            orchestrator_cli, ['eval-sample', '--dry-run'], '--df-root', None, id='eval-sample',
+            orchestrator_cli, ['eval-sample', '--dry-run'], '--df-root', id='eval-sample',
         ),
     ])
-    def test_an_operator_command_answers_with_a_usage_error(
-        self, monkeypatch, cli, args, flag, env_var,
-    ):
-        if env_var is not None:
-            monkeypatch.delenv(env_var, raising=False)
-
+    def test_an_operator_command_answers_with_a_usage_error(self, cli, args, flag):
         result = CliRunner().invoke(cli, args)
 
         assert result.exit_code == 2, result.output
         assert isinstance(result.exception, SystemExit), result.exception
         assert f'pass {flag}' in result.output
-        if env_var is not None:
-            assert f'set ${env_var}' in result.output
