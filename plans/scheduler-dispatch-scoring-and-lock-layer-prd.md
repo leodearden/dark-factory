@@ -389,11 +389,18 @@ can point at something a human should look at. Code: `orchestrator/src/orchestra
   lock, and no member has a recorded blocker, the case the watchdog cannot explain. An empty
   lock table explains nothing, so it alarms nothing. That case is the first ticks after a
   restart, before holders re-dispatch.
-- *Liveness* (`orchestrator/src/orchestrator/blocker_liveness.py`). A HELD blocker's holder is
-  live iff it is in the tick's active task read, not terminal, not `blocked`, and
-  `shared.task_claimant.has_live_claimant` holds at `claimant_liveness_ttl_secs`, the dispatch
-  gate's own predicate and TTL. A workflow heartbeats for its whole slot, merge phase included,
-  so a slow holder reads live. A PARKED blocker's owner is followed to its own blockers, at most
+- *Liveness* (`orchestrator/src/orchestrator/blocker_liveness.py`). A HELD module's owner must
+  be a slot this scheduler process has dispatched and not released (`Scheduler._dispatched`);
+  otherwise the reason is `lock_without_slot`, a lock no running slot will release. A dispatched
+  owner with a live claimant is live: `shared.task_claimant.has_live_claimant` at
+  `claimant_liveness_ttl_secs`, the dispatch gate's own predicate and TTL. A workflow heartbeats
+  for its whole slot, merge phase included, so a slow holder reads live. Without a live claimant,
+  a dispatched owner is `no_live_claimant` when `in-progress` and `blocked` when `blocked`. It is
+  live when `pending` (dispatched, not yet claimed), terminal, or gone from the active read: its
+  slot is unwinding to its release. The slot's own exit path bounds that unwinding, and the
+  terminal-status watcher force-releases a slot that never unwinds
+  (`orchestrator/src/orchestrator/harness.py::Harness._force_release_wedged_slot`). The cap L1
+  reads the lock view and the in-flight set together, after the tick's awaits. A PARKED blocker's owner is followed to its own blockers, at most
   `PARK_FOLLOW_DEPTH` = 3 parks deep (park, park, park, holder). A cycle, a deeper chain, or an
   owner absent from the read or terminal is non-live. A park owner whose modules are all free
   waits only for a run slot, which is live.
