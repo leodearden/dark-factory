@@ -15,11 +15,16 @@ import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
-from _usage_gate_test_helpers import SCOPE, make_mock_cost_store
+from _usage_gate_test_helpers import (
+    SCOPE,
+    make_mock_cost_store,
+    ok_result,
+    scripted_invoke,
+)
 
 from shared.account_reserve import (
     ReserveRefusal,
@@ -28,10 +33,11 @@ from shared.account_reserve import (
     WorkClassSource,
     WorkKind,
 )
-from shared.cli_invoke import AllAccountsCappedException
+from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
 from shared.config_models import UsageCapConfig
 from shared.cost_store import CostStore
 from shared.invocation_outcome import OK, AuthFailed, CapHit
+from shared.testing import make_gate_mock
 from shared.testing_virtual_clock import virtual_clock_test
 from shared.usage_gate import AccountLease, InvokeSlot, PoolFrozen, UsageGate
 
@@ -1004,3 +1010,170 @@ class TestReserveServed:
                 pytest.fail('a refused caller was given a slot')
 
         assert raised.value.reserved_account == RESERVE
+
+
+class TodaysGateDouble:
+    """A hand-written gate double whose invoke_slot knows nothing of work_class."""
+
+    account_count = 1
+    soonest_resets_at = None
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        self.slot = MagicMock()
+        self.slot.account_name = 'double'
+        self.slot.token = None
+        self.slot.detect_cap_hit = MagicMock(return_value=False)
+
+    def invoke_slot(self, *args: object, **kwargs: object):
+        self.calls.append((args, kwargs))
+        return self._invoke_slot(*args, **kwargs)
+
+    @contextlib.asynccontextmanager
+    async def _invoke_slot(self, scope=None, *, park=True, max_wait_secs=None):
+        yield self.slot
+
+
+class ReserveAwareGateDouble(TodaysGateDouble):
+    @contextlib.asynccontextmanager
+    async def _invoke_slot(
+        self, scope=None, *, park=True, max_wait_secs=None, work_class=None
+    ):
+        yield self.slot
+
+
+class TestTheKeywordIsForwardedOnlyWhenGiven:
+    """B1 (call shape): a caller passing no class calls invoke_slot exactly as today."""
+
+    async def test_without_a_class_the_double_is_called_as_today(self) -> None:
+        double = TodaysGateDouble()
+
+        result = await invoke_with_cap_retry(
+            double,  # type: ignore[arg-type]
+            'L',
+            prompt='p',
+            model='m',
+            invoke_fn=scripted_invoke(ok_result()),
+        )
+
+        assert result.success
+        [(args, kwargs)] = double.calls
+        assert args == ()
+        assert set(kwargs) == {'scope', 'park', 'max_wait_secs'}
+
+    async def test_a_given_class_reaches_invoke_slot_as_the_same_object(self) -> None:
+        double = ReserveAwareGateDouble()
+
+        await invoke_with_cap_retry(
+            double,  # type: ignore[arg-type]
+            'L',
+            prompt='p',
+            model='m',
+            work_class=HIGH,
+            invoke_fn=scripted_invoke(ok_result()),
+        )
+
+        [(_, kwargs)] = double.calls
+        assert kwargs['work_class'] is HIGH
+
+
+class TestGateMock:
+    async def test_the_mock_forwards_a_given_class_and_mirrors_it_on_the_slot(self) -> None:
+        gate = make_gate_mock()
+
+        async with gate.invoke_slot(work_class=HIGH) as slot:
+            assert slot.work_class is HIGH
+
+        gate.before_invoke.assert_awaited_once_with(scope=None, work_class=HIGH)
+
+    async def test_without_a_class_before_invoke_is_awaited_as_today(self) -> None:
+        gate = make_gate_mock()
+
+        async with gate.invoke_slot() as slot:
+            assert slot.work_class is None
+
+        gate.before_invoke.assert_awaited_once_with(scope=None)
+
+
+class TestThroughTheRetryLoop:
+    """B9: a reserve refusal spends the caller's patience without reading as a cap."""
+
+    async def test_spent_patience_names_the_reserve_and_counts_no_cap(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        gate, _ = refused_state(tmp_path)
+        invoke = scripted_invoke(ok_result())
+        caplog.set_level(logging.ERROR, logger='shared.cli_invoke')
+
+        with pytest.raises(AllAccountsCappedException) as raised:
+            await asyncio.wait_for(
+                invoke_with_cap_retry(
+                    gate,
+                    'Task 7 [impl]',
+                    work_class=LOW,
+                    cap_wait_sanity_secs=0.05,
+                    max_cap_retries=1,
+                    invoke_fn=invoke,
+                    prompt='p',
+                    model='claude-opus-4-1',
+                ),
+                timeout=5,
+            )
+
+        assert raised.value.retries == 0
+        assert raised.value.pool_frozen is not None
+        assert raised.value.pool_frozen.reserved_account == RESERVE
+        assert 'refused the reserve' in str(raised.value)
+        assert RELEASE_AT.isoformat() in str(raised.value)
+        assert 'all accounts capped' not in str(raised.value).lower()
+        assert invoke.calls == []
+        [line] = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == 'shared.cli_invoke' and record.levelno == logging.ERROR
+        ]
+        assert 'refused the reserve' in line
+        assert 'cap-wait' not in line.lower()
+
+    async def test_without_parking_the_refusal_propagates(self, tmp_path: Path) -> None:
+        gate, _ = refused_state(tmp_path)
+
+        with pytest.raises(PoolFrozen) as raised:
+            await asyncio.wait_for(
+                invoke_with_cap_retry(
+                    gate,
+                    'Task 7 [impl]',
+                    work_class=LOW,
+                    park_on_frozen_pool=False,
+                    invoke_fn=scripted_invoke(ok_result()),
+                    prompt='p',
+                    model='claude-opus-4-1',
+                ),
+                timeout=5,
+            )
+
+        assert raised.value.reserved_account == RESERVE
+
+    async def test_an_admitted_call_is_served_and_recorded_with_its_cost(
+        self, tmp_path: Path
+    ) -> None:
+        gate, store = refused_state(tmp_path)
+        invoke = scripted_invoke(ok_result())
+
+        result = await asyncio.wait_for(
+            invoke_with_cap_retry(
+                gate,
+                'Task 8 [impl]',
+                work_class=HIGH,
+                invoke_fn=invoke,
+                prompt='p',
+                model='claude-opus-4-1',
+            ),
+            timeout=5,
+        )
+
+        assert result.success
+        assert invoke.calls[0]['oauth_token'] == f'fake-token-{RESERVE}'
+        assert await events(store, 'reserve_served') == [
+            (RESERVE, {**HIGH_SERVED, 'cost_usd': 0.5})
+        ]
