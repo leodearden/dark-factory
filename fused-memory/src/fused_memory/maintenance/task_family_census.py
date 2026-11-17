@@ -164,7 +164,8 @@ class TaskFamilyCensus:
         Membership and per-node provenance (edge count, mention count, rank)
         come from ONE group-scoped read, so they cannot disagree. A node whose
         group_id property names another project (task 2115's leak) is not a
-        member, matching every group-scoped collapse path. Why that read is a dedicated method rather than a
+        member, matching every group-scoped collapse path; such nodes are
+        counted by ``fused_memory/maintenance/cross_graph_leak_census.py``. Why that read is a dedicated method rather than a
         widened ``enumerate_entity_nodes``: task 5264, decision 7.
 
         Args:
