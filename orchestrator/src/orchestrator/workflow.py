@@ -19470,7 +19470,8 @@ class TaskWorkflow:
         record is found closed by a non-sweep resolver, else ``None``.
 
         A dedupe fold can make the awaited record ANOTHER task's.  Its close
-        while that task has an open L1 may be its steward's hand-off to a
+        while that task has an open L1 hand-off (:meth:`_open_l1_handoffs`;
+        an info L1 is never one) may be its steward's hand-off to a
         human (``steward.py::TaskSteward._auto_escalate_to_human`` files the
         L1, then dismisses the L0), not a resolution, so it never settles the
         wait.  This task's own hand-off always arrives as an in-scope envelope,
@@ -19483,9 +19484,7 @@ class TaskWorkflow:
         record = self.escalation_queue.get(escalation_id)
         if record is None or not closed_by_non_sweep_resolver(record):
             return None
-        if record.task_id != self.task_id and self.escalation_queue.has_open_l1(
-            record.task_id,
-        ):
+        if record.task_id != self.task_id and self._open_l1_handoffs(record.task_id):
             return None
         logger.info(
             'Task %s: awaited escalation %s found %s by %s with no outcome '
