@@ -1850,6 +1850,102 @@ class TestGateLockstepWriter:
         assert records['m2']['metadata']['topic'] == 'gate_topic'
 
 
+class TestUngatedGroupRollback:
+    """An ungated slug moves all-or-nothing too.
+
+    A split slug cannot be finished by re-running: the collision guard sees
+    the moved members as incumbents on the new slug.  So when a member is
+    left on the legacy value, the members this run moved are rolled back.
+    """
+
+    @staticmethod
+    def _plain_group() -> object:
+        return _one_group([
+            _mod.Rename('dark_factory', 'm1', 'plain_topic', 'plain-topic'),
+            _mod.Rename('dark_factory', 'm2', 'plain_topic', 'plain-topic'),
+        ])
+
+    @pytest.mark.asyncio
+    async def test_a_refused_member_rolls_the_moved_members_back(self):
+        records = _store(('m1', 'plain_topic'), ('m2', 'plain_topic'))
+        service = _stateful_service(records)
+        _refuse_writes_to(service, 'm2')
+
+        results, entry = await _mod.rename_group(
+            service, self._plain_group(), apply=True, client=None)
+
+        assert records['m1']['metadata']['topic'] == 'plain_topic'
+        assert records['m2']['metadata']['topic'] == 'plain_topic'
+        assert [(r['memory_id'], r['outcome'], r.get('undone')) for r in results] == [
+            ('m1', 'ungated_partial_rename', True),
+            ('m2', 'update_failed', None),
+        ]
+        assert {key: value for key, value in entry.items() if key != 'note'} == {
+            'reason': 'ungated_partial_rename',
+            'project_id': 'dark_factory',
+            'old_topic': 'plain_topic',
+            'new_topic': 'plain-topic',
+            'stood_memory_ids': ['m1'],
+            'failed_memory_ids': ['m2'],
+            'failed_outcomes': ['update_failed'],
+            'undo_failures': [],
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_failed_rollback_is_named_not_swallowed(self):
+        records = _store(('m1', 'plain_topic'), ('m2', 'plain_topic'))
+        service = _stateful_service(records)
+        _refuse_writes_to(service, 'm2')
+        _fail_writes_moving_back_to(service, 'm1', 'plain_topic')
+
+        results, entry = await _mod.rename_group(
+            service, self._plain_group(), apply=True, client=None)
+
+        assert records['m1']['metadata']['topic'] == 'plain-topic'
+        (m1_row,) = [r for r in results if r['memory_id'] == 'm1']
+        assert m1_row['undone'] is False
+        assert [failure['memory_id'] for failure in entry['undo_failures']] == ['m1']
+        assert 'undo failed' in str(entry['undo_failures'])
+
+    @pytest.mark.asyncio
+    async def test_a_vanished_straggler_does_not_roll_back_the_rest(self):
+        """A member that is gone splits nothing, so the good write stands."""
+        records = _store(('m1', 'plain_topic'))  # m2 is absent -> memory_not_found
+        service = _stateful_service(records)
+
+        results, entry = await _mod.rename_group(
+            service, self._plain_group(), apply=True, client=None)
+
+        assert records['m1']['metadata']['topic'] == 'plain-topic'
+        assert [(r['memory_id'], r['outcome']) for r in results] == [
+            ('m1', 'renamed'), ('m2', 'memory_not_found'),
+        ]
+        assert entry is None
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_predicts_the_hold_and_writes_nothing(self):
+        records = _store(('m1', 'plain_topic'), ('m2', 'plain_topic'))
+        service = _stateful_service(records)
+        forward = service.get_memory_by_id.side_effect
+
+        async def _read(**kwargs):
+            if kwargs['memory_id'] == 'm2':
+                raise RuntimeError('read failed')
+            return await forward(**kwargs)
+
+        service.get_memory_by_id = AsyncMock(side_effect=_read)
+
+        results, entry = await _mod.rename_group(
+            service, self._plain_group(), apply=False, client=None)
+
+        assert [(r['memory_id'], r['outcome']) for r in results] == [
+            ('m1', 'would_rename'), ('m2', 'rename_error'),
+        ]
+        assert entry['reason'] == 'ungated_partial_rename'
+        assert entry['undo_failures'] == []
+        service.update_memory.assert_not_awaited()
+
+
 class TestGateLockstepOutcomesAreGraded:
     """A held pair must fail the run — it is unfinished work, not a no-op."""
 
@@ -2197,6 +2293,23 @@ def _refuse_writes_to(service: MagicMock, *memory_ids: str) -> None:
     async def _update(**kwargs):
         if kwargs['memory_id'] in refused:
             return {'error_type': 'write_refused', 'error': 'refused by test'}
+        return await forward(**kwargs)
+
+    service.update_memory = AsyncMock(side_effect=_update)
+
+
+def _fail_writes_moving_back_to(service: MagicMock, memory_id: str, legacy_topic: str) -> None:
+    """Make *service* raise on the write that would put *memory_id* back on *legacy_topic*.
+
+    That write is the rollback of a rename, so this is how a failed undo is
+    staged; every other write is forwarded.
+    """
+    forward = service.update_memory.side_effect
+
+    async def _update(**kwargs):
+        if (kwargs['memory_id'], kwargs['metadata_patch'].get('topic')) == (
+                memory_id, legacy_topic):
+            raise RuntimeError('undo failed')
         return await forward(**kwargs)
 
     service.update_memory = AsyncMock(side_effect=_update)
@@ -2825,26 +2938,65 @@ class TestPartialUngatedGroup:
         section = _bucket_section(_mod.render_markdown(report), 'ungated_partial_rename')
         assert "'m2'" not in section
 
-    @pytest.mark.asyncio
-    async def test_a_split_slug_is_reported_and_a_re_run_refuses_the_straggler(self):
+    @staticmethod
+    def _split_corpus() -> tuple[MagicMock, _FakeCorpus]:
         service, corpus = _run_service({'dark_factory': [
             _crec('m1', 'legacy_topic'), _crec('m2', 'legacy_topic'),
         ]})
         _refuse_writes_to(service, 'm2')
+        return service, corpus
+
+    @staticmethod
+    def _held_group_entry(report: dict) -> dict:
+        (entry,) = [
+            e for e in report['skips']['ungated_partial_rename'] if 'stood_memory_ids' in e
+        ]
+        return entry
+
+    @pytest.mark.asyncio
+    async def test_a_partial_apply_rolls_back_and_a_second_apply_finishes_the_move(self):
+        service, corpus = self._split_corpus()
+
+        report = await run_sweep(service, projects=('dark_factory',), apply=True)
+
+        assert corpus.topic_of('dark_factory', 'm1') == 'legacy_topic'
+        assert corpus.topic_of('dark_factory', 'm2') == 'legacy_topic'
+        assert report['renamed_total'] == 0
+        held = report['skips']['ungated_partial_rename']
+        entry = self._held_group_entry(report)
+        (member,) = [e for e in held if 'stood_memory_ids' not in e]
+        assert (entry['stood_memory_ids'], entry['failed_memory_ids'], entry['undo_failures']) == (
+            ['m1'], ['m2'], [])
+        assert (member['memory_id'], member['undone']) == ('m1', True)
+        assert [e['memory_id'] for e in report['skips']['update_failed']] == ['m2']
+        assert [e['residue_count'] for e in report['skips']['legacy_slug_residue']] == [2]
+        assert report['gate_results'] == []
+        assert resolve_exit(report) == 1
+        _assert_outcomes_match_buckets(report)
+        section = _bucket_section(_mod.render_markdown(report), 'ungated_partial_rename')
+        assert "stood_memory_ids=['m1']" in section
+        assert 'undo_failures=[]' in section
+
+        second = await run_sweep(corpus.service(), projects=('dark_factory',), apply=True)
+
+        assert corpus.topic_of('dark_factory', 'm1') == 'legacy-topic'
+        assert corpus.topic_of('dark_factory', 'm2') == 'legacy-topic'
+        assert second['outcomes'] == {'renamed': 2}
+        assert second['skips']['slug_collision'] == []
+        assert resolve_exit(second) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failed_rollback_leaves_the_split_named_and_a_re_run_refuses_the_straggler(self):
+        """The documented residual: a double failure is reported, then finished by hand."""
+        service, corpus = self._split_corpus()
+        _fail_writes_moving_back_to(service, 'm1', 'legacy_topic')
 
         report = await run_sweep(service, projects=('dark_factory',), apply=True)
 
         assert corpus.topic_of('dark_factory', 'm1') == 'legacy-topic'
         assert corpus.topic_of('dark_factory', 'm2') == 'legacy_topic'
-        assert [
-            (e['stood_memory_ids'], e['failed_memory_ids'], e['failed_outcomes'])
-            for e in report['skips']['ungated_partial_rename']
-        ] == [(['m1'], ['m2'], ['update_failed'])]
-        assert report['outcomes'].get('ungated_partial_rename') == 1
-        assert resolve_exit(report) == 1
-        section = _bucket_section(_mod.render_markdown(report), 'ungated_partial_rename')
-        assert "stood_memory_ids=['m1']" in section
-        assert "failed_memory_ids=['m2']" in section
+        undo_failures = self._held_group_entry(report)['undo_failures']
+        assert [failure['memory_id'] for failure in undo_failures] == ['m1']
 
         second = await run_sweep(corpus.service(), projects=('dark_factory',), apply=True)
 
