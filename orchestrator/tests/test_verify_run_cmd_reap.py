@@ -39,7 +39,8 @@ def _leaker_pids(cwd: Path) -> tuple[int, int]:
 
 
 def _kill_leftovers(leader: int, child: int) -> None:
-    if wait_pids_exited({leader, child}, timeout=0):
+    survivors = wait_pids_exited({leader, child}, timeout=0)
+    if survivors:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(leader, signal.SIGKILL)
 
