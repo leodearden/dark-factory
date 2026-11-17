@@ -24,18 +24,19 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import _plan_markup_fixtures
 import pytest
 from _markup_helpers import INVOKE_CLOSER, LT, closer
-from _plan_markup_fixtures import (
-    corrupt_plan,
-    isolate_the_refusal_memo,  # noqa: F401 — autouse; pytest resolves it by name
-    plan_artifacts,  # noqa: F401 — a fixture, requested by test parameter name
-)
+from _plan_markup_fixtures import corrupt_plan
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, plan_markup_stamp, plan_tools
+
+#: pytest finds a fixture by its name in the requesting module's namespace.
+plan_artifacts = _plan_markup_fixtures.plan_artifacts
+isolate_the_refusal_memo = _plan_markup_fixtures.isolate_the_refusal_memo
 
 
 def _element(name: str, body: str) -> str:
