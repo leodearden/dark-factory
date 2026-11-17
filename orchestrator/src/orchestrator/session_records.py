@@ -299,7 +299,7 @@ class Question:
         return cls(text=data['text'], asked_at=data['asked_at'])
 
 
-def is_strict_int(value: object) -> TypeGuard[int]:
+def _is_strict_int(value: object) -> TypeGuard[int]:
     """An int that is not a bool: Python's ``True`` would otherwise pass as int 1."""
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -307,28 +307,28 @@ def is_strict_int(value: object) -> TypeGuard[int]:
 def _coerce_owner_pid(value: Any) -> int | None:
     """Read ``claude_owner_pid`` from a record body, tolerating junk.
 
-    Anything that is not a positive ``is_strict_int`` -- absent, null, a
+    Anything that is not a positive ``_is_strict_int`` -- absent, null, a
     bool, a string, a float, 0, a negative -- reads as None, i.e. "no owner
     pid bound". Never raises: this is on ``from_dict``'s path, and a
     hand-edited or older record body must not be what breaks a session hook.
     """
-    if not is_strict_int(value):
+    if not _is_strict_int(value):
         return None
     return value if value > 0 else None
 
 
 def _coerce_identity(value: Any, pid: Any) -> ProcessIdentity | None:
     """Read a stored ProcessIdentity naming *pid*; any other shape reads None. Never raises."""
-    if not isinstance(value, dict) or not is_strict_int(pid):
+    if not isinstance(value, dict) or not _is_strict_int(pid):
         return None
     identity_pid = value.get('pid')
     start_ticks = value.get('start_ticks')
     boot_id = value.get('boot_id')
     host = value.get('host')
     if not (
-        is_strict_int(identity_pid)
+        _is_strict_int(identity_pid)
         and identity_pid == pid
-        and is_strict_int(start_ticks)
+        and _is_strict_int(start_ticks)
         and isinstance(boot_id, str)
         and isinstance(host, str)
     ):

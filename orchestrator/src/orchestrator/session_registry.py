@@ -1158,7 +1158,7 @@ def run_reap(root: Path | str | None = None) -> ReapReport | None:
 # ---------------------------------------------------------------------------
 
 LEASE_NAME_SANITIZE_RE = re.compile(r'[^A-Za-z0-9._#-]')
-"""Unlike session_records._SLUG_SANITIZE_RE, this PRESERVES '#': task-scoped lease names
+"""Unlike session_records.sanitize_slug, this PRESERVES '#': task-scoped lease names
 (build_lease_name('unblock', project, task_id)) encode their task with a
 literal '#', which must survive into the .lease filename. Everything else
 outside [A-Za-z0-9._#-] (notably '/') maps to '-', so a malformed name can
@@ -1454,7 +1454,7 @@ class LeaseHolder:
     record_slug: str = ''
 
     def __post_init__(self) -> None:
-        if not session_records.is_strict_int(self.pid):
+        if isinstance(self.pid, bool) or not isinstance(self.pid, int):
             raise TypeError(f'LeaseHolder.pid must be an int (not a bool), got {self.pid!r}')
         for name in ('session_slug', 'start_ts', 'record_slug'):
             value = getattr(self, name)
