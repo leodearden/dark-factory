@@ -251,6 +251,47 @@ class TestVerifyScriptDelegate:
 
         assert entered_when_delegated == [True]
 
+    @pytest.mark.asyncio
+    async def test_a_delegate_with_a_release_runs_only_once_released(self):
+        release = asyncio.Event()
+        delegated = passes('from delegate').result
+        delegated_calls: list[object] = []
+
+        async def delegate(*args: object, **kwargs: object) -> VerifyResult:
+            delegated_calls.append(kwargs.get('task_id'))
+            return delegated
+
+        verifier = FakeVerifier(dataclasses.replace(delegates_to(delegate), release=release))
+        parked = asyncio.create_task(_verify(verifier, 't'))
+        try:
+            await wait_responsive(
+                verifier.await_entry(1), label='released-delegate verify entered',
+            )
+            assert not parked.done()
+            assert delegated_calls == []
+
+            release.set()
+            result = await wait_responsive(parked, label='released delegate returned')
+            assert delegated_calls == ['t']
+            assert result is delegated
+        finally:
+            parked.cancel()
+            await asyncio.gather(parked, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_an_error_the_delegate_raises_propagates_after_the_call_is_recorded(self):
+        async def delegate(*args: object, **kwargs: object) -> VerifyResult:
+            raise RuntimeError('delegate boom')
+
+        verifier = FakeVerifier(delegates_to(delegate))
+
+        with pytest.raises(RuntimeError, match='delegate boom'):
+            await _verify(verifier, 't')
+        assert verifier.verify_calls == [
+            ScopedVerifyCall(task_id='t', worktree=Path('wt-t'), module_configs=()),
+        ]
+        assert verifier.verified == ['t']
+
     def test_a_script_that_both_raises_and_delegates_is_rejected_at_construction(self):
         async def delegate(*args: object, **kwargs: object) -> VerifyResult:
             return passes().result
