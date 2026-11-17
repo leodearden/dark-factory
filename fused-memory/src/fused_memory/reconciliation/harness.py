@@ -2738,7 +2738,8 @@ class ReconciliationHarness:
 
         *liveness_unknown* says the target is filed because its liveness probe
         failed, not because it was confirmed not live (task 5370). It marks the
-        WARNING-level filed log line; the record's detail does not carry it.
+        WARNING-level filed log line, and the record's detail lists the target
+        under ``LIVENESS_UNKNOWN_DETAIL_KEY``.
         """
         # Mirrors _escalate's guard: on ImportError the module-level names are
         # left UNBOUND (not set to None as in targeted.py), so `HAS_ESCALATION`
@@ -2879,6 +2880,7 @@ class ReconciliationHarness:
                     run_id=run_id,
                     persistence=persistence,
                     finding_fingerprint=fingerprint,
+                    liveness_unknown_task_ids=[task_id] if liveness_unknown else (),
                 ),
             )
             esc_id: str = queue.submit(esc)

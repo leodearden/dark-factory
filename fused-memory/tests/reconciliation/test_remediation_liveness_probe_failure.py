@@ -5,9 +5,9 @@ the persistent-finding escalation, so LIVE is the permissive answer there. A
 probe that could not run — corroboration raised, the detector raised, or the
 corroboration inputs could not be read — is UNKNOWN: it never suppresses.
 The recon escalation it lets through names the CITED tasks whose liveness is
-unknown, rather than claiming they were confirmed not live. A routed target's
-unknown liveness is marked on the routed filing's log line; the routed
-record's own detail does not carry it.
+unknown, rather than claiming they were confirmed not live. A routed record
+whose target's liveness is unknown lists that target in its detail under the
+same key, and its filed log line is raised to WARNING.
 
 The fake detector models the lingering shape task 2963 exists for: a worktree
 registration or orchestrator lock that keeps asserting liveness with no recent
