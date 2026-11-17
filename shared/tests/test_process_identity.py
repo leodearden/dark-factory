@@ -333,6 +333,7 @@ def test_a_malformed_stat_is_unreadable_and_chained_from_the_shared_stat_parse(
         cause = raised.value.__cause__
         assert isinstance(cause, MalformedStatLine), name
         assert cause.path == raised.value.path, name
+        assert cause.reason in raised.value.cause, name
 
 
 def test_unreadable_is_not_an_os_error():

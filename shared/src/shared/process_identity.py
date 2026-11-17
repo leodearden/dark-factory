@@ -109,7 +109,7 @@ def _start_ticks(path: Path, text: str) -> int:
     try:
         return parse_start_ticks(path, text)
     except MalformedStatLine as exc:
-        raise ProcessIdentityUnreadable(path, f'malformed stat line {text!r}') from exc
+        raise ProcessIdentityUnreadable(path, f'{exc.reason}: {text!r}') from exc
 
 
 def _start_ticks_of_existing_pid(pid: int, proc_root: Path) -> int | None:
