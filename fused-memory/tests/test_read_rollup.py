@@ -17,9 +17,12 @@ from fused_memory.services.read_rollup import (
     COUNT_READ_SQL,
     DELETE_COUNT_ONLY_READS_SQL,
     FIRST_COUNT_ONLY_ROWID_SQL,
+    KEPT_OPERATION_READ_PREDICATE,
     PREWARM_PRIMARY_KEY_SQL,
     RAW_READS_BY_ROLLUP_KEY_SQL,
     READ_OP_COUNTS_SCHEMA_SQL,
+    READ_OPERATIONS_KEPT_PER_ROW,
+    UNKEPT_OPERATION_READ_PREDICATE,
     keeps_read_row,
 )
 from fused_memory.services.write_journal import SCHEMA_SQL as WRITE_OPS_SCHEMA_SQL
@@ -178,6 +181,32 @@ class TestCountOnlyPredicateAgreesWithKeepsReadRow:
 
         assert selected == expected_count_only
         assert expected_count_only
+
+
+class TestRetentionHorizonPredicatesPartitionReads:
+    def test_every_read_sits_on_exactly_one_horizon_and_no_write_on_either(self):
+        conn = sqlite3.connect(':memory:')
+        conn.execute('CREATE TABLE write_ops (kind TEXT, operation TEXT, success INTEGER)')
+        operations = [*sorted(READ_OPERATIONS_KEPT_PER_ROW), 'get_task', None]
+        for operation, success in itertools.product(operations, (0, 1)):
+            conn.execute(
+                "INSERT INTO write_ops VALUES ('read', ?, ?)", (operation, success)
+            )
+        conn.execute("INSERT INTO write_ops VALUES ('write', NULL, 1)")
+
+        def rowids(predicate: str) -> set[int]:
+            return {
+                row[0]
+                for row in conn.execute(f'SELECT rowid FROM write_ops WHERE {predicate}')
+            }
+
+        reads = rowids("kind = 'read'")
+        kept = rowids(KEPT_OPERATION_READ_PREDICATE)
+        unkept = rowids(UNKEPT_OPERATION_READ_PREDICATE)
+
+        assert not kept & unkept, 'a read sits on both retention horizons'
+        assert kept | unkept == reads, 'a read sits on neither horizon and is kept forever'
+        assert rowids(COUNT_ONLY_READ_PREDICATE) == unkept & rowids('success = 1')
 
 
 def _journal_db() -> sqlite3.Connection:
