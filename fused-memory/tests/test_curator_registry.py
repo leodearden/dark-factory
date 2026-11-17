@@ -38,7 +38,7 @@ class _ScriptedLoader:
     """A loader that plays *outcomes* in order (the last one repeats) and
     records each call's path and thread."""
 
-    def __init__(self, *outcomes: object) -> None:
+    def __init__(self, *outcomes: list | BaseException) -> None:
         self._outcomes = outcomes
         self.paths: list[Path] = []
         self.threads: list[int] = []
@@ -148,6 +148,7 @@ class TestCuratorRegistryLoad:
         health = registry.health()
         assert health.state is RegistryState.FAILED
         assert health.failures == 1
+        assert health.error is not None
         assert 'YamlListFileError' in health.error
         assert 'file not found' in health.error
         assert health.path == str(resolved)
