@@ -2,7 +2,7 @@ prd: plans/consolidation-adjudicator-prd.md
 schema_version: 1
 tasks:
 - label: α
-  task_id: null
+  task_id: 10605
   title: Predicate and ledger shape (K1 class table, K2 waivers, K6 ledger states and outcome fields)
   capabilities:
   - name: predicate-and-ledger-substrate
@@ -60,7 +60,7 @@ tasks:
       - fused-memory/src/fused_memory/reconciliation/consolidation_proposal.py
       expect: present
 - label: β
-  task_id: null
+  task_id: 10606
   title: Adjudicator, self-calibration, shared OpenAI helper, config (K3, K5, K7)
   capabilities:
   - name: transport-and-config-substrate
@@ -99,7 +99,7 @@ tasks:
       - fused-memory/src/fused_memory/config/schema.py
       expect: present
 - label: γ
-  task_id: null
+  task_id: 10607
   title: Executor flow (K4 memo, repair, adjudicate, apply, revert; K6 records and stats); gate filing removed
   capabilities:
   - name: executor-call-site
@@ -158,7 +158,7 @@ tasks:
       - fused-memory/src/fused_memory/config/reload.py
       expect: absent
 - label: η
-  task_id: null
+  task_id: 10608
   title: 'Integration gate: boundary rows A1–A21 as e2e tests through the real ledger, executor and calibration'
   capabilities:
   - name: executor-flow
@@ -210,7 +210,7 @@ tasks:
       kind: manual
       reason: Twenty-one present-greps would be disproportionate and the four above sample the contract; η's reviewer confirms all twenty-one prefixes and the merge gate runs the file.
 - label: χ
-  task_id: null
+  task_id: 10609
   title: 'Check surfaces: scripts/check_auto_consolidation.py (code-live, live-clean, rejections) and consolidation-review.yaml'
   capabilities:
   - name: real-ledger-harness
@@ -266,7 +266,7 @@ tasks:
       kind: manual
       reason: An expect-absent grep for third-party imports is vacuous while the file does not exist (polarity lint rejects it); χ's reviewer confirms the imports and Γ's subcheck exercises it under bare python3.
 - label: Γ
-  task_id: null
+  task_id: 10610
   title: 'Gate: the adjudicator code is the code running'
   note: Deterministic predicate task. Its before_done predicate is the same script with the same args as the delivered_check below; a re-base edits both.
   capabilities:
@@ -299,7 +299,7 @@ tasks:
       - 'hold: newest dark_factory Stage 1 cycle_summary lacks auto_consolidation_adjudicator_identity; the new code is not running'
       timeout_secs: 120
 - label: ε
-  task_id: null
+  task_id: 10611
   title: Switch on dark_factory
   capabilities:
   - name: commented-config-block
@@ -333,7 +333,7 @@ tasks:
       kind: manual
       reason: An 'enabled true' line under one block is a multi-line YAML fact git grep cannot anchor (other blocks carry the same line); ε's review confirms it, φ confirms the project is no longer skipped, and ρ1 reads the executed rows.
 - label: φ
-  task_id: null
+  task_id: 10612
   title: 'Gate: calibrated, live and clean'
   note: Deterministic predicate task. Its before_done predicate is the same script with the same args as the delivered_check below; a re-base edits both.
   capabilities:
@@ -366,7 +366,7 @@ tasks:
       - 'hold: the live-clean JSON line names the failing condition; never cancel this gate'
       timeout_secs: 120
 - label: ρ1
-  task_id: null
+  task_id: 10613
   title: First review of rejections and executions (one week after φ)
   capabilities:
   - name: report-json-with-shown-text
@@ -396,7 +396,7 @@ tasks:
       kind: manual
       reason: Memory writes and filed follow-ups are not repository content.
 - label: ρ3
-  task_id: null
+  task_id: 10614
   title: Second review (one month after ρ1)
   capabilities:
   - name: first-review-landed
@@ -418,7 +418,7 @@ tasks:
       kind: manual
       reason: A judgement plus an optional filed task; nothing in the repository to check.
 - label: ρ2
-  task_id: null
+  task_id: 10615
   title: Monthly rejection alarm (recurring chain consolidation-rejection-review)
   capabilities:
   - name: rejections-check-and-thresholds
