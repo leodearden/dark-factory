@@ -90,11 +90,13 @@ class TestQdrantHelpers:
 # Tests for the shared ensure_fresh_collection() helper (task 2773, item 3)
 # ---------------------------------------------------------------------------
 # Idempotent + 409-tolerant collection (re)creation, used by the qdrant
-# integration fixture. No real Qdrant is used here — the client is a
-# MagicMock and qdrant_client.http.exceptions.UnexpectedResponse is
-# constructed directly — so this suite runs in the default merge-verify lane
-# even though its one live consumer (the qdrant fixture) is integration-only.
-# Assertions are on call counts and ordering only, never on live Qdrant.
+# integration fixtures. No live Qdrant is used here, so this suite runs in the
+# default merge-verify lane even though the helper's live consumers are
+# integration-only. TestEnsureFreshCollection drives a MagicMock client,
+# constructs qdrant_client.http.exceptions.UnexpectedResponse directly and
+# asserts on call counts and ordering. The abandoned-meta-op classes (task
+# 10599) drive a real QdrantClient over a real socket against
+# _stub_qdrant_server and assert on the requests and state the stub records.
 
 class TestEnsureFreshCollection:
     """Unit tests for ensure_fresh_collection(client, collection_name, *, size, distance)."""

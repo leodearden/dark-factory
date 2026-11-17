@@ -1,4 +1,4 @@
-"""Tests for the bounded asyncio wait barriers in _fm_polling.py."""
+"""Tests for the bounded wait barriers in _fm_polling.py."""
 
 import pytest
 
