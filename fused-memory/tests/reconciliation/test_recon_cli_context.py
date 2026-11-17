@@ -29,9 +29,27 @@ from fused_memory.reconciliation import (
     RECONCILIATION_CLI_ENV_OVERRIDES,
     RECONCILIATION_CLI_SETTING_SOURCES,
 )
+from fused_memory.reconciliation.cli_stage_runner import (
+    DISALLOW_BUILTIN,
+    STAGE1_DISALLOWED,
+    STAGE2_DISALLOWED,
+    STAGE3_DISALLOWED,
+)
 from reconciliation.stubbed_stage_cli import run_stage, run_stage_answered_by
 
 _STAGE_REPORT = AgentResult(success=True, output='{"summary": "s"}')
+
+_BUILTINS_NO_STAGE_CALLS = (
+    'Agent', 'ListAgents', 'ReportFindings', 'ScheduleWakeup', 'Skill', 'Workflow',
+    'CronCreate', 'CronDelete', 'CronList', 'DesignSync', 'EnterWorktree', 'ExitWorktree',
+    'Monitor', 'PushNotification', 'RemoteTrigger', 'SendMessage', 'TaskStop', 'WebFetch',
+    'WebSearch',
+)
+_WRITE_BUILTINS = ('Bash', 'Edit', 'Write', 'NotebookEdit')
+_BUILTINS_STAGES_NEED = (
+    'Read', 'Grep', 'Glob', 'ToolSearch', 'StructuredOutput',
+    'ListMcpResourcesTool', 'ReadMcpResourceDirTool', 'ReadMcpResourceTool',
+)
 
 
 def test_recon_cli_context_constants_name_one_rule():
@@ -73,3 +91,10 @@ async def test_stage_runner_context_kwargs_survive_forwarding_to_invoke_claude_a
     assert kwargs['setting_sources'] == []
     assert kwargs['env_overrides'] == dict(RECONCILIATION_CLI_ENV_OVERRIDES)
     assert kwargs['strict_mcp_config'] is True
+
+
+def test_stages_are_denied_the_builtins_they_never_call():
+    assert set(_BUILTINS_NO_STAGE_CALLS + _WRITE_BUILTINS) <= set(DISALLOW_BUILTIN)
+    for stage_disallowed in (STAGE1_DISALLOWED, STAGE2_DISALLOWED, STAGE3_DISALLOWED):
+        assert set(_BUILTINS_NO_STAGE_CALLS) <= set(stage_disallowed)
+    assert not set(_BUILTINS_STAGES_NEED) & set(DISALLOW_BUILTIN)
