@@ -3524,3 +3524,72 @@ def test_validate_cli_fails_on_a_dangling_promoted_to(tmp_path, capsys):
 
     assert mod.main(["validate", str(path)]) != 0
     assert "entry-never-created" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# task 6787: a coder match quotes its evidence, and an entry records the
+# census's fit verdict on each attached sighting as a `sighting_fits` row.
+# ---------------------------------------------------------------------------
+
+_FIT_RUN = "census-dark_factory-20261116"
+
+
+def test_validate_coding_record_accepts_a_match_quoting_its_evidence():
+    record = _well_formed_record()
+    record["matches"][0]["evidence_quote"] = "ls scripts/legibility 2>/dev/null -> [exit 2]"
+
+    assert mod.validate_coding_record(record) == []
+
+
+def test_validate_coding_record_rejects_a_match_whose_evidence_quote_is_not_a_string():
+    record = _well_formed_record()
+    record["matches"][0]["evidence_quote"] = 7
+
+    assert [error for error in mod.validate_coding_record(record) if "matches/0/evidence_quote" in error]
+
+
+def _fit_row(**overrides) -> dict:
+    row = {"session": "sess-1", "exhibits": True, "run_id": _FIT_RUN, "reason": "same probe"}
+    row.update(overrides)
+    return {key: value for key, value in row.items() if value is not None}
+
+
+def _codebook_with_fit_rows(*rows: dict) -> dict:
+    codebook = _codebook_with_a_sighting()
+    codebook["entries"][0][mod.SIGHTING_FITS_KEY] = list(rows)
+    return codebook
+
+
+def test_validate_accepts_an_entry_whose_fit_row_names_its_own_sighting():
+    assert mod.validate(_codebook_with_fit_rows(_fit_row())) == []
+
+
+_MALFORMED_FIT_ROWS = [
+    pytest.param((_fit_row(session=None),), id="no-session"),
+    pytest.param((_fit_row(exhibits=None),), id="no-exhibits"),
+    pytest.param((_fit_row(run_id=None),), id="no-run-id"),
+    pytest.param((_fit_row(exhibits="yes"),), id="string-exhibits"),
+    pytest.param((_fit_row(exhibits=1),), id="int-exhibits"),
+    pytest.param((_fit_row(session="sess-never-sighted"),), id="unknown-session"),
+    pytest.param((_fit_row(), _fit_row(exhibits=False)), id="two-rows-one-session"),
+]
+
+
+@pytest.mark.parametrize("rows", _MALFORMED_FIT_ROWS)
+def test_validate_rejects_a_malformed_fit_row_naming_the_entry(rows):
+    assert _errors_naming(_codebook_with_fit_rows(*rows), "entry-a", mod.SIGHTING_FITS_KEY)
+
+
+@pytest.mark.parametrize("rows", _MALFORMED_FIT_ROWS)
+def test_sighting_fit_errors_states_the_row_invariant_for_the_entry_alone(rows):
+    codebook = _codebook_with_fit_rows(*rows)
+
+    errors = mod.sighting_fit_errors(codebook["entries"][0])
+
+    assert errors
+    assert all("entry-a" in error for error in errors)
+    assert set(errors) <= set(mod.validate(codebook))
+
+
+def test_sighting_fit_errors_accepts_an_entry_without_fit_rows():
+    assert mod.sighting_fit_errors(_codebook_with_a_sighting()["entries"][0]) == []
