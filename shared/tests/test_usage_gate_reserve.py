@@ -809,3 +809,103 @@ class TestReserveWaitWakes:
 
         assert raised.value.reserved_account == RESERVE
         assert raised.value.scope is None
+
+
+async def eventually(check: Callable[[], bool], *, within: float = 3.0) -> None:
+    """Poll *check* on a real loop; far below the 300 s re-poll, so a pass proves a wake."""
+    loop = asyncio.get_running_loop()
+    give_up_at = loop.time() + within
+    while not check():
+        assert loop.time() < give_up_at, f'not within {within}s'
+        await asyncio.sleep(0.01)
+
+
+def soon() -> datetime:
+    return datetime.now(UTC) + timedelta(seconds=0.1)
+
+
+class TestTransitionsWakeTheWait:
+    """PRD §6.3: another account opening, or the reserve failing, wakes a reserve wait."""
+
+    async def test_b7_another_account_reopening_serves_the_waiter(self, tmp_path: Path) -> None:
+        store = make_mock_cost_store()
+        gate = make_reserve_gate(
+            tmp_path, clock=FakeClock(), cost_store=store, wait_for_reset=True
+        )
+        cap_all_but(gate, 'max-d', RESERVE)
+        cap(gate, 'max-d', resets_at=soon())
+
+        waiter = asyncio.create_task(gate.before_invoke(work_class=LOW))
+        await let_run()
+        assert gate.reserve_waiters == 1
+
+        lease = await asyncio.wait_for(waiter, timeout=3)
+
+        assert lease is not None and lease.name == 'max-d'
+        [(_, ended)] = await events(store, 'reserve_wait_ended')
+        assert ended['ended_by'] == 'account_opened'
+        await gate.shutdown()
+
+    async def test_b8_the_reserves_own_probe_does_not_end_the_wait(
+        self, tmp_path: Path
+    ) -> None:
+        gate, store = refused_state(tmp_path)
+        cap(gate, RESERVE, resets_at=WEDNESDAY)
+        await gate.wait_for_open(timeout=0)
+
+        waiter = asyncio.create_task(gate.before_invoke(work_class=LOW))
+        await let_run()
+        lease = await asyncio.wait_for(gate.before_invoke(work_class=HIGH), timeout=1)
+        assert lease is not None and lease.name == RESERVE
+        await let_run()
+        InvokeSlot(gate, lease).confirm()
+        await let_run()
+
+        assert not waiter.done()
+        assert gate.reserve_waiters == 1
+        assert len(await events(store, 'reserve_wait_started')) == 1
+        assert await events(store, 'reserve_wait_ended') == []
+        await cancel(waiter)
+
+    async def test_b20_the_reserve_failing_sends_the_waiter_to_the_all_capped_path(
+        self, tmp_path: Path
+    ) -> None:
+        gate, store = refused_state(tmp_path)
+        waiter = asyncio.create_task(gate.before_invoke(work_class=LOW))
+        await let_run()
+        assert gate.reserve_waiters == 1
+
+        auth_fail(gate, RESERVE)
+        await eventually(lambda: gate.reserve_waiters == 0, within=1)
+
+        [(_, ended)] = await events(store, 'reserve_wait_ended')
+        assert ended['ended_by'] == 'reserve_unusable'
+        assert not waiter.done()
+        assert gate.is_paused is True
+        await cancel(waiter)
+
+    async def test_b10_when_the_reserve_reopens_only_the_admitted_caller_takes_it(
+        self, tmp_path: Path
+    ) -> None:
+        gate = make_reserve_gate(tmp_path, clock=FakeClock(), wait_for_reset=True)
+        gate._run_probe = AsyncMock(side_effect=lambda acct: acct.name == RESERVE)
+        cap_all_but(gate, RESERVE)
+        cap(gate, RESERVE, resets_at=soon())
+        paused_reason = gate.paused_reason
+        low = asyncio.create_task(gate.before_invoke(work_class=LOW))
+        high = asyncio.create_task(gate.before_invoke(work_class=HIGH))
+        await let_run()
+        assert gate.is_paused is True
+
+        lease = await asyncio.wait_for(high, timeout=3)
+        assert lease is not None and lease.name == RESERVE
+        InvokeSlot(gate, lease).confirm()
+        await eventually(lambda: gate.reserve_waiters == 1)
+
+        assert not low.done()
+        assert gate.is_paused is False
+        assert gate.paused_reason == paused_reason
+        served = await asyncio.wait_for(gate.before_invoke(work_class=ESSENTIAL), timeout=1)
+        assert served is not None and served.name == RESERVE
+        await cancel(low)
+        await gate.shutdown()
