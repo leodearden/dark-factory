@@ -635,6 +635,10 @@ class BriefingAssembler:
     ) -> str:
         """Build prompt for the architect agent.
 
+        The plan-tools recipe lives in
+        ``orchestrator/src/orchestrator/agents/roles.py::ARCHITECT_PLAN_TOOLS_RECIPE``,
+        which ARCHITECT.system_prompt carries, so this briefing only points at it.
+
         Args:
             include_prior_proposals: When True, surface the task's most
                 recent ``dry_run_proposals`` entry (if any) as a prior
@@ -710,15 +714,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
 {prior_proposal_section}{committed_section}
 {_retired_review_section(retired_reviews)}{render_rulings_section(rulings, RulingAudience.PLAN)}# Action
 
-1. Explore the codebase thoroughly — read relevant files, understand existing patterns and utilities.
-2. Produce a TDD implementation plan using the plan-tools MCP tools:
-   a. Call `create_plan(task_id, title, analysis, files)` with your analysis.
-   b. Call `add_prerequisite(prereq_id, description)` for any setup work needed before TDD steps.
-   c. Call `add_plan_step(step_id, step_type, description)` for each TDD step, in order. Alternate test/impl.
-   d. Call `add_design_decision(decision, rationale)` for non-obvious choices.
-   e. Call `add_reuse_item(what, where, how)` for existing code/patterns being reused.
-   f. Call `confirm_plan()` as your FINAL action, once every step is added, to mark the plan complete. Without it the plan is treated as incomplete and will not advance.
-3. List ALL files (or directory paths) you expect to create or modify in the `files` parameter of `create_plan` — this drives concurrency locks and the phantom-done gate, so be exhaustive and precise.
+Build the plan using the plan-tools MCP tools, as your role instructions direct, and follow their rules.
 """
 
     async def build_revalidation_prompt(
@@ -811,7 +807,7 @@ and either confirm it, update it, or recreate it from scratch.
    a. **Plan still valid**: call `confirm_plan()`.
    b. **Plan needs updates**: use `update_plan_metadata(files=...)`,
       `remove_plan_step(step_id)`, `replace_plan_step(step_id, step_type, description)`,
-      and/or `add_plan_step(step_id, step_type, description)` to adjust the plan in place.
+      and/or `add_plan_step(...)` to adjust the plan in place.
    c. **Plan is invalid**: call `create_plan(...)` to start fresh, then add steps as usual.
 4. Ensure the `files` list is exhaustive — it drives concurrency locks.
 5. Keep every step with status "done" with its commit. If the revised plan
@@ -1042,10 +1038,10 @@ here — read the file in full.
 
 1. Read `.task/plan.json` in full.
 2. Record its existing step content with the plan-tools:
-   `add_prerequisite(prereq_id, description)` for setup work and
-   `add_plan_step(step_id, step_type, description)` for each TDD step, in the
-   plan's own order, carrying each description across unchanged. If `files`
-   is missing or empty, set it with `update_plan_metadata(files=[...])`.
+   `add_prerequisite(...)` for setup work and `add_plan_step(...)` for each
+   TDD step, in the plan's own order, carrying each description across
+   unchanged. If `files` is missing or empty, set it with
+   `update_plan_metadata(files=[...])`.
 3. Restructure only: do not redesign the plan or explore beyond what
    restructuring needs. Do not call `create_plan` — it replaces the document
    wholesale and would discard the analysis and decisions you are
@@ -1088,9 +1084,8 @@ The implementation was reviewed and blocking issues were found.
 
 1. Read `.task/plan.json` for the current plan and each step's status — it
    is not reproduced here.
-2. Add the steps that address the blocking issues with
-   `add_plan_step(step_id, step_type, description)`, using step ids not
-   already in the plan. New steps are recorded as pending.
+2. Add the steps that address the blocking issues with `add_plan_step(...)`,
+   using step ids not already in the plan. New steps are recorded as pending.
 3. If those steps touch files the plan does not list, call
    `update_plan_metadata(files=[...])` with the full widened list.
 4. Keep every existing step in place, in order: do not remove or reorder
