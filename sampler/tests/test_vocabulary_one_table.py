@@ -245,3 +245,15 @@ class TestTheLiveTree:
             'metric names spelled outside sampler.metrics.METRIC_GROUPS; derive them '
             'from the table instead:\n' + '\n'.join(findings)
         )
+
+    def test_the_consumer_modules_are_scanned(self):
+        """They attribute and read the new figures, so a metric name spelled there is drift."""
+        scanned = {path.name for path, _declares_specs in _scope()}
+
+        assert {'consumers.py', 'host_memory.py'} <= scanned
+
+    def test_the_new_groups_names_are_scanned_for(self):
+        new = [g for g in METRIC_GROUPS if g.name in {GroupName.CONSUMERS, GroupName.VERIFY_SCOPES}]
+
+        assert len(new) == 2
+        assert {spec.name for group in new for spec in group.metrics} <= _LIVE_NAMES

@@ -13,7 +13,7 @@ import pytest
 from sampler.metrics import SampleKey
 
 RUNQ = SampleKey('runqueue_ratio')
-VERIFY = SampleKey('verify_concurrency')
+DEPTH = SampleKey('occt_queue_depth')
 PSI_CPU = SampleKey('psi_cpu_some_avg10')
 
 # ---------------------------------------------------------------------------
@@ -349,7 +349,7 @@ class TestLoadSampleStoreSchema:
         store = LoadSampleStore(db_path)
 
         ts = int(time.time())
-        store.insert_sample(ts, VERIFY, 3.0, window_mean=2.5, window_max=4.0)
+        store.insert_sample(ts, DEPTH, 3.0, window_mean=2.5, window_max=4.0)
 
         conn = sqlite3.connect(str(db_path))
         row = conn.execute(
@@ -519,12 +519,12 @@ class TestTrailingWindow:
         now = 1_000_000
 
         # Insert two prior values
-        store.insert_sample(now - 20, VERIFY, 10.0)
-        store.insert_sample(now - 10, VERIFY, 20.0)
+        store.insert_sample(now - 20, DEPTH, 10.0)
+        store.insert_sample(now - 10, DEPTH, 20.0)
 
         # trailing_window called with current value 30.0
         # -> window = [10.0, 20.0, 30.0], mean=20.0, max=30.0
-        mean, mx = store.trailing_window(VERIFY, 30.0)
+        mean, mx = store.trailing_window(DEPTH, 30.0)
         assert mean == pytest.approx(20.0)
         assert mx == pytest.approx(30.0)
 
@@ -536,8 +536,8 @@ class TestTrailingWindow:
 
         store.insert_sample(now - 10, SampleKey('other_metric'), 999.0)
 
-        # No prior rows for 'verify_concurrency'
-        mean, mx = store.trailing_window(VERIFY, 5.0)
+        # No prior rows for 'occt_queue_depth'
+        mean, mx = store.trailing_window(DEPTH, 5.0)
         assert mean == pytest.approx(5.0)
         assert mx == pytest.approx(5.0)
 
@@ -613,7 +613,7 @@ class TestTrailingWindow:
         [
             (SampleKey('own_cpu_some10', 'new.service'), SampleKey('own_cpu_some10', 'busy.service'), range(0)),
             (SampleKey('own_cpu_some10', 'back.service'), SampleKey('own_cpu_some10', 'busy.service'), range(3)),
-            (RUNQ, VERIFY, range(3)),
+            (RUNQ, DEPTH, range(3)),
         ],
         ids=['a-leaf-with-no-rows', 'a-leaf-with-fewer-rows-than-a-window', 'a-host-level-metric'],
     )
@@ -1277,7 +1277,7 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
             now,
             unwindowed={PSI_CPU: 1.0, SampleKey('psi_mem_full_avg10'): 2.0},
             windowed={
-                VERIFY: 3.0,
+                DEPTH: 3.0,
                 **{SampleKey('own_cpu_some10', f'leaf{i}'): float(i) for i in range(leaves)},
             },
         )
@@ -1406,7 +1406,7 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
         store.write_tick(
             1_000_000,
             unwindowed={PSI_CPU: 1.5},
-            windowed={VERIFY: 4.0},
+            windowed={DEPTH: 4.0},
         )
 
         conn = sqlite3.connect(str(store.db_path))
@@ -1420,7 +1420,7 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
         finally:
             conn.close()
         assert rows['psi_cpu_some_avg10'] == (None, None)
-        assert rows['verify_concurrency'] == (4.0, 4.0)
+        assert rows['occt_queue_depth'] == (4.0, 4.0)
 
     def test_the_batched_windows_agree_with_the_trailing_window_helper(
         self, tmp_path: Path
@@ -1435,11 +1435,11 @@ class TestWriteTickIsOneConnectionAndOneTransaction:
 
         store = LoadSampleStore(tmp_path / 'db.sqlite')
         for i in range(5):
-            store.insert_sample(1_000_000 + i, VERIFY, float(i))
-        expected = store.trailing_window(VERIFY, 99.0)
+            store.insert_sample(1_000_000 + i, DEPTH, float(i))
+        expected = store.trailing_window(DEPTH, 99.0)
 
         store.write_tick(
-            1_000_010, unwindowed={}, windowed={VERIFY: 99.0}
+            1_000_010, unwindowed={}, windowed={DEPTH: 99.0}
         )
 
         conn = sqlite3.connect(str(store.db_path))

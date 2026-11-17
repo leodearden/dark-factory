@@ -9,6 +9,8 @@ siblings under ``user@1000.service``.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from sampler.consumers import (
@@ -242,3 +244,157 @@ class TestResidualRules:
     )
     def test_residual_order(self, segments, consumer):
         assert classify_residual(segments) == consumer
+
+
+# ---------------------------------------------------------------------------
+# The collectors (sampler.metrics), over a fixture host
+# ---------------------------------------------------------------------------
+
+_T0 = 1_000_000
+_DUE = 30
+_GAUGE_NAMES = {
+    'consumer_memory_bytes', 'consumer_anon_bytes', 'consumer_file_bytes', 'consumer_swap_bytes',
+}
+_INCREMENT_NAMES = {
+    'consumer_cpu_usec', 'consumer_swapin_pages', 'consumer_reclaim_kswapd_pages',
+    'consumer_reclaim_direct_pages', 'consumer_refault_anon_pages',
+    'consumer_refault_file_pages', 'consumer_memory_high_events', 'consumer_memory_max_events',
+    'consumer_oom_kills', 'consumer_cpu_some_stall_seconds',
+    'consumer_memory_some_stall_seconds', 'consumer_memory_full_stall_seconds',
+    'consumer_io_some_stall_seconds',
+}
+_SERVICE = encode_consumer(Consumer(Role.SERVICE, 'orchestrator-reify.service'))
+_KERNEL = encode_consumer(Consumer(Role.KERNEL))
+
+
+@pytest.fixture
+def world(tmp_path):
+    from _consumer_world import consumer_world
+
+    return consumer_world(tmp_path)
+
+
+def _by_leaf(samples) -> dict[str | None, dict[str, float]]:
+    rows: dict[str | None, dict[str, float]] = {}
+    for key, value in samples.items():
+        rows.setdefault(key.leaf, {})[key.metric] = value
+    return rows
+
+
+class TestTheConsumerCollector:
+    def test_a_first_collection_writes_gauges_members_and_readability_but_no_increments(
+        self, world
+    ):
+        collected = world.collect_consumers(_T0, None)
+        rows = _by_leaf(collected.samples)
+
+        assert set(rows[_SERVICE]) == _GAUGE_NAMES | {'consumer_members', 'consumer_read_ok'}
+        assert rows[_SERVICE]['consumer_members'] == 1.0
+        assert rows[_SERVICE]['consumer_memory_bytes'] == 1_000.0
+        for leaf, metrics in rows.items():
+            assert not set(metrics) & _INCREMENT_NAMES, (leaf, metrics)
+
+    def test_every_leaf_is_an_encoded_consumer(self, world):
+        leaves = {key.leaf for key in world.collect_consumers(_T0, None).samples if key.leaf}
+
+        assert {encode_consumer(parse_consumer(leaf)) for leaf in leaves} == leaves
+        assert {
+            _SERVICE,
+            encode_consumer(Consumer(Role.VERIFY, 'dark-factory-c889f090')),
+            encode_consumer(Consumer(Role.VERIFY, 'x-1234abcd')),
+            encode_consumer(Consumer(Role.PROJECT, 'df-x.slice')),
+            _KERNEL,
+        } <= leaves
+
+    def test_the_host_level_rows_of_a_first_collection(self, world):
+        from _consumer_world import MEM_AVAILABLE_KIB, MEM_TOTAL_KIB
+
+        host = _by_leaf(world.collect_consumers(_T0, None).samples)[None]
+
+        assert host == {
+            'host_anon_bytes': 7_000.0,
+            'host_file_bytes': 3_000.0,
+            'host_used_bytes': float((MEM_TOTAL_KIB - MEM_AVAILABLE_KIB) * 1024),
+        }
+
+    def test_the_next_collection_yields_increments_from_the_carried_state(self, world):
+        from _consumer_world import DAEMON, KCOMPACTD_PID, KSWAPD_PID
+
+        first = world.collect_consumers(_T0, None)
+        world.cgroups.set(DAEMON, cpu_usec=4_000, memory_some=3_000_000, pgsteal_direct=5)
+        world.thread(KSWAPD_PID, 'kswapd0', 13)
+        world.thread(KCOMPACTD_PID, 'kcompactd0', 20)
+
+        second = world.collect_consumers(_T0 + _DUE, first.state)
+        rows = _by_leaf(second.samples)
+
+        assert set(rows[_SERVICE]) == (
+            _GAUGE_NAMES | _INCREMENT_NAMES | {'consumer_members', 'consumer_read_ok'}
+        )
+        assert rows[_SERVICE]['consumer_cpu_usec'] == 3_000.0
+        assert rows[_SERVICE]['consumer_reclaim_direct_pages'] == 5.0
+        assert rows[_SERVICE]['consumer_memory_some_stall_seconds'] == pytest.approx(3.0)
+        assert rows[_SERVICE]['consumer_read_ok'] == 1.0
+        host = rows[None]
+        assert host['consumer_interval_seconds'] == float(_DUE)
+        tick_usec = 1_000_000 / os.sysconf('SC_CLK_TCK')
+        assert host['reclaim_kswapd_cpu_usec'] == pytest.approx(3 * tick_usec)
+        assert host['reclaim_kcompactd_cpu_usec'] == 0.0
+
+    def test_a_gap_writes_the_interval_but_no_increments(self, world):
+        first = world.collect_consumers(_T0, None)
+
+        late = _by_leaf(world.collect_consumers(_T0 + 3 * _DUE, first.state).samples)
+
+        assert late[None]['consumer_interval_seconds'] == float(3 * _DUE)
+        assert 'reclaim_kswapd_cpu_usec' not in late[None]
+        assert late[_SERVICE]['consumer_read_ok'] == 0.0
+        assert not set(late[_SERVICE]) & _INCREMENT_NAMES
+
+    def test_a_corrupt_state_is_a_first_collection_not_an_exception(self, world):
+        rows = _by_leaf(world.collect_consumers(_T0, '{"version": 1, "tree": 7').samples)
+
+        assert not set(rows[_SERVICE]) & _INCREMENT_NAMES
+        assert 'consumer_interval_seconds' not in rows[None]
+
+    def test_a_consumer_that_does_not_exist_writes_no_rows(self, world):
+        from _consumer_world import APP_SCOPE
+
+        first = world.collect_consumers(_T0, None)
+        world.cgroups.remove(APP_SCOPE)
+
+        leaves = {key.leaf for key in world.collect_consumers(_T0 + _DUE, first.state).samples}
+
+        assert encode_consumer(Consumer(Role.VERIFY, 'dark-factory-c889f090')) not in leaves
+        assert encode_consumer(Consumer(Role.INTERACTIVE, 't3code')) not in leaves
+
+    def test_the_kernel_has_no_swap_row_rather_than_a_zero_one(self, world):
+        rows = _by_leaf(world.collect_consumers(_T0, None).samples)
+
+        assert 'consumer_memory_bytes' in rows[_KERNEL]
+        assert 'consumer_swap_bytes' not in rows[_KERNEL]
+
+
+class TestTheVerifyScopeCollector:
+    def test_it_counts_scopes_in_both_placements_and_sums_their_memory(self, world):
+        collected = world.collect_verify_scopes(_T0, None)
+
+        assert {key.metric: value for key, value in collected.samples.items()} == {
+            'verify_scopes_live': 2.0,
+            'verify_scope_memory_bytes': 5_000.0,
+        }
+        assert all(key.leaf is None for key in collected.samples)
+        assert collected.state is None
+
+    def test_with_none_live_it_writes_zero_and_zero(self, world):
+        from _consumer_world import APP_SCOPE, DF_SCOPE
+
+        world.cgroups.remove(APP_SCOPE)
+        world.cgroups.remove(DF_SCOPE)
+
+        samples = world.collect_verify_scopes(_T0, None).samples
+
+        assert {key.metric: value for key, value in samples.items()} == {
+            'verify_scopes_live': 0.0,
+            'verify_scope_memory_bytes': 0.0,
+        }
