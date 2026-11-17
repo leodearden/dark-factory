@@ -165,12 +165,12 @@ function projectBurndownBlock(data, projectId) {
 }
 
 function checkedLabelSpan(span, unionLength, projectId) {
-  const isPair = Array.isArray(span) && span.length === 2 && span.every(Number.isInteger);
-  if (!isPair || !(0 <= span[0] && span[0] < span[1] && span[1] <= unionLength)) {
-    throw new Error(
-      `burndown project ${projectId} has label_spans entry ${JSON.stringify(span)} ` +
-        `outside 0 <= start < stop <= ${unionLength} (union has ${unionLength} labels)`,
-    );
+  const entry = `burndown project ${projectId} has label_spans entry ${JSON.stringify(span)}`;
+  if (!(Array.isArray(span) && span.length === 2 && span.every(Number.isInteger))) {
+    throw new Error(`${entry} that is not a [start, stop) pair of ints (union has ${unionLength} labels)`);
+  }
+  if (!(0 <= span[0] && span[0] < span[1] && span[1] <= unionLength)) {
+    throw new Error(`${entry} outside 0 <= start < stop <= union length ${unionLength}`);
   }
   return span;
 }

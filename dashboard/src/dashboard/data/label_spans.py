@@ -47,7 +47,7 @@ def _checked_span(span: object, union_length: int) -> tuple[int, int]:
     if not 0 <= start < stop <= union_length:
         raise ValueError(
             f'label span {span!r} is outside 0 <= start < stop <= '
-            f'{union_length} (union has {union_length} labels)')
+            f'union length {union_length}')
     return start, stop
 
 

@@ -479,13 +479,18 @@ test('projectBurndownBlock: a block without label_spans is a loud contract break
   );
 });
 
-for (const [name, badSpan] of [
-  ['runs past the union', [4, 7]],
-  ['starts below 0', [-1, 2]],
-  ['is empty (start == stop)', [3, 3]],
-  ['is reversed (start > stop)', [4, 2]],
-  ['is not a two-int pair', [1]],
-  ['carries non-int bounds', ['0', '1']],
+// The violation each message reports, worded as label_spans.py::_checked_span
+// words it for the same span.
+const OUT_OF_RANGE = 'outside 0 <= start < stop';
+const NOT_A_PAIR = 'not a [start, stop) pair of ints';
+
+for (const [name, badSpan, violation] of [
+  ['runs past the union', [4, 7], OUT_OF_RANGE],
+  ['starts below 0', [-1, 2], OUT_OF_RANGE],
+  ['is empty (start == stop)', [3, 3], OUT_OF_RANGE],
+  ['is reversed (start > stop)', [4, 2], OUT_OF_RANGE],
+  ['is not a two-int pair', [1], NOT_A_PAIR],
+  ['carries non-int bounds', ['0', '1'], NOT_A_PAIR],
 ]) {
   test(`projectBurndownBlock: a span that ${name} is a loud contract break naming it`, () => {
     const data = servedBurndown({ alpha: servedProjectBlock([[0, 1], badSpan]) });
@@ -493,6 +498,7 @@ for (const [name, badSpan] of [
     assert.throws(
       () => projectBurndownBlock(data, 'alpha'),
       error => error instanceof Error
+        && error.message.includes(violation)
         && error.message.includes('label_spans')
         && error.message.includes('alpha')
         && error.message.includes(JSON.stringify(badSpan))

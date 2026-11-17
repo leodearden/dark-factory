@@ -70,6 +70,7 @@ def test_an_out_of_range_span_is_refused_naming_it_and_the_union_length(bad_span
         labels_from_spans([[0, 1], bad_span], union)
 
     message = str(refused.value)
+    assert 'outside 0 <= start < stop' in message
     assert str(bad_span) in message
     assert '3' in message.replace(str(bad_span), '')
 
@@ -88,5 +89,6 @@ def test_a_span_that_is_not_a_two_int_pair_is_refused_naming_it(bad_span):
         labels_from_spans([bad_span], ['a', 'b', 'c'])
 
     message = str(refused.value)
+    assert 'not a [start, stop) pair of ints' in message
     assert repr(bad_span) in message
     assert '3' in message.replace(repr(bad_span), '')
