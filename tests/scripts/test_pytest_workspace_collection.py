@@ -40,7 +40,9 @@ REPO_ROOT = Path(__file__).parents[2]
 # imported BY NAME from two test modules, so the insert is load-bearing rather than
 # latent — without it a repo-root multi-package run raises ModuleNotFoundError at
 # collection time (another subproject's tests dir wins sys.path[0]).
-_SUBPROJECTS_WITH_CONFTEST = ['dashboard', 'escalation', 'fused-memory', 'orchestrator', 'shared']
+# `cockpit` joined in task 6881 for the same reason: `cockpit/tests/_cockpit_session_records.py`
+# and `_cockpit_tree_snapshot.py` are imported BY NAME from several test modules.
+_SUBPROJECTS_WITH_CONFTEST = ['cockpit', 'dashboard', 'escalation', 'fused-memory', 'orchestrator', 'shared']
 
 # Regex matching either supported sys.path.insert pattern for the tests dir:
 #   fused-memory idiom : sys.path.insert(0, _tests_dir)
