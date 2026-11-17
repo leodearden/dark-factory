@@ -78,11 +78,14 @@ THE SIGNAL-BINDING CHECK (task 6582). A sidecar's ``signal_leaves`` names the
 blocks whose task status the dashboard reads as the PRD's signal
 (plans/dashboard-prd-lanes-prd.md §4.7, §5.2). A STALE SIGNAL BINDING is a
 signal leaf whose locally bound task is missing from this store, or whose own
-``prd_path`` is not this sidecar's ``prd``. Every such row makes a run dirty;
-what one means and how it is fixed is stated once, in
-``_SIGNAL_BINDING_CAVEAT``. How many leaves were named and how many could be
-checked is in the coverage block, so a run with no signal leaves to check
-never reads as one whose leaves all agreed.
+PRD field does not name this sidecar's ``prd``. Both are read as the
+dashboard's signal check reads them: the task's field by
+``dashboard/src/dashboard/data/prd_attribution.py::coalesce_prd``, then it
+and the sidecar's ``prd`` each keyed by ``::normalise_prd_key`` against the
+project root. Every such row makes a run dirty; what one means and how it is
+fixed is stated once, in ``_SIGNAL_BINDING_CAVEAT``. How many leaves were
+named and how many could be checked is in the coverage block, so a run with no
+signal leaves to check never reads as one whose leaves all agreed.
 """
 from __future__ import annotations
 
@@ -116,7 +119,7 @@ from _task_db_scan import (
     run_audit_cli,
     tasks_db_path,
 )
-from dashboard.data.prd_attribution import coalesce_prd
+from dashboard.data.prd_attribution import PrdKey, coalesce_prd, normalise_prd_key
 from shared.tasks_db_readonly import connect_ro
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
@@ -622,7 +625,7 @@ class StaleSignalBinding(NamedTuple):
 
     ``reason`` says which: ``'task_missing'`` (no row for ``task_id`` in this
     store, so ``task_prd`` is None) or ``'prd_mismatch'`` (the task's own PRD
-    field is not the sidecar's ``prd``). ``task_prd`` is that field as
+    field does not name the sidecar's ``prd``). ``task_prd`` is that field as
     ``dashboard/src/dashboard/data/prd_attribution.py::coalesce_prd`` reads it
     (``prd_path``, else ``prd``, else ``prd_ref``, with any ``#`` or ``§``
     suffix stripped), or None when the task names none. ``manifest`` is
@@ -650,13 +653,28 @@ def _locally_bound_signal_leaves(doc: CapabilityManifestDoc) -> list[tuple[str, 
     ]
 
 
+def _names_sidecar_prd(task_prd: str | None, sidecar_prd: str, project_root: str) -> bool:
+    """Whether *task_prd* and *sidecar_prd* key to the same PRD under
+    *project_root*, by ``dashboard/src/dashboard/data/prd_attribution.py::normalise_prd_key``.
+    A task naming no PRD, or one outside the root, names no sidecar's PRD."""
+    if task_prd is None:
+        return False
+    task_key = normalise_prd_key(task_prd, project_root)
+    return isinstance(task_key, PrdKey) and task_key == normalise_prd_key(
+        sidecar_prd, project_root)
+
+
 def _stale_signal_bindings(
     relpath: str, sidecar_prd: str, bound_leaves: list[tuple[str, int]],
-    scan: TaskStoreScan,
+    scan: TaskStoreScan, *, project_root: str,
 ) -> list[StaleSignalBinding]:
     """Every one of *bound_leaves* whose task is missing from *scan* or whose
-    PRD field (``TaskStoreScan.task_prds``) is not *sidecar_prd*, in the order
-    given, compared by exact string.
+    PRD field (``TaskStoreScan.task_prds``) does not name *sidecar_prd* under
+    *project_root*, in the order given.
+
+    *project_root* is the tasks.db owner, never a separate manifest root: an
+    absolute PRD path in a task names the primary checkout, which is the root
+    the dashboard keys a PRD against.
     """
     rows: list[StaleSignalBinding] = []
     for label, task_id in bound_leaves:
@@ -664,7 +682,7 @@ def _stale_signal_bindings(
             reason, task_prd = "task_missing", None
         else:
             task_prd = scan.task_prds.get(task_id)
-            if task_prd == sidecar_prd:
+            if _names_sidecar_prd(task_prd, sidecar_prd, project_root):
                 continue
             reason = "prd_mismatch"
         rows.append(StaleSignalBinding(
@@ -902,7 +920,8 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
         signal_leaves_named += len(doc.signal_leaves or ())
         signal_leaves_checked += len(bound_signal_leaves)
         stale_signal_bindings.extend(
-            _stale_signal_bindings(relpath, doc.prd, bound_signal_leaves, scan))
+            _stale_signal_bindings(
+                relpath, doc.prd, bound_signal_leaves, scan, project_root=root))
         for task in doc.tasks:
             if task.external_task_id is not None:
                 # ANOTHER project's registry, so absent from THIS project's
@@ -1104,7 +1123,8 @@ _UNBOUND_CAVEAT = (
 _SIGNAL_BINDING_CAVEAT = (
     "  STALE SIGNAL BINDINGS (a row is a signal leaf, named in the sidecar's "
     "signal_leaves, whose locally bound task is missing from this store or "
-    "whose own prd_path is not this sidecar's prd. Unbound and "
+    "whose own PRD field (prd_path, else prd, else prd_ref, read as the "
+    "dashboard reads it) does not name this sidecar's prd. Unbound and "
     "external_task_id leaves are not checked. Fixing a row is a separate, "
     "reviewed edit: re-bind the block's task_id, set the task's prd_path, or "
     "drop the label from signal_leaves):"
