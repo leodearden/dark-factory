@@ -136,7 +136,7 @@ def _load_state(path: Path) -> dict[str, Any]:
 
     Thin backward-compatible wrapper around _load_state_checked that discards
     the ok flag.  Retained **solely** as a test-suite helper — the ~18 call
-    sites in test_b3_gate.py use this shim so they do not need to unpack a
+    sites in test_b3_gate_state.py use this shim so they do not need to unpack a
     (state, ok) tuple.  There are **no production callers**: record_launch,
     charge, and run_check all call _load_state_checked directly so they can
     act on the ok flag and fail CLOSED on corruption.
