@@ -9,11 +9,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from shared.project_layout import escalation_queue_dir
 from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
+from shared.task_fields import dependency_ids as task_dependency_ids
 
 from fused_memory.config.schema import FusedMemoryConfig
-from fused_memory.memory_metadata import normalize_supersedes
+from fused_memory.memory_metadata import (
+    RECONCILIATION_COMPLETION_ECHO_MARKER,
+    TARGETED_RECONCILIATION_SOURCE,
+    is_reconciliation_completion_echo,
+    normalize_supersedes,
+)
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 from fused_memory.middleware.task_interceptor import (
     _extract_metadata_files,
     _missing_files,
@@ -29,6 +35,12 @@ from fused_memory.models.reconciliation import (
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.reconciler_escalation import (
+    INSTALLED_ESCALATION_QUEUE_FACTORY,
+    EscalationQueueFactory,
+    file_reconciler_l1,
+    pending_escalations,
+)
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     retire_flag_markers_for_terminal_task,
 )
@@ -44,21 +56,8 @@ from fused_memory.reconciliation.task_filter import (
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
-from fused_memory.utils.task_dependency_ids import task_dependency_ids
+from fused_memory.utils.clip_disclosure import fit_at_word
 from fused_memory.utils.validation import InputValidationError, require_project_root
-
-# Defensive import — escalation is an optional workspace package (mirrors
-# scope_violation_escalator.py:43-48).  When absent, L1 escalation degrades
-# to a logged no-op; the sweep still cancels deterministic orphans and
-# blocks ambiguous ones, so the dashboard still surfaces orphan state.
-try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-    _HAS_ESCALATION = True
-except ImportError:  # pragma: no cover — exercised only in minimal envs
-    Escalation = None  # type: ignore[assignment,misc]
-    EscalationQueue = None  # type: ignore[assignment,misc]
-    _HAS_ESCALATION = False
 
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -86,11 +85,6 @@ _SNAPSHOT_CONTRADICTING_TRANSITIONS: frozenset[str] = frozenset(
 # What the dependent-unblock claimant clear did, carried on the action as
 # ``claimant_clear`` (see TargetedReconciler._clear_claimant_before_unblock).
 ClaimantClearOutcome = Literal['cleared', 'not_needed', 'claimant_live', 'rejected', 'failed']
-
-# Metadata `source` value stamped on the completion-echo memory written by
-# _on_task_done's fast path.  Single-sourced so _is_authoritative_resolution
-# and the fast-path write can't drift out of sync (task 1984).
-_ECHO_SOURCE = 'targeted_reconciliation'
 
 # Per-verdict framing for the codebase-verification memory written by
 # _on_task_done (task 4723 / PRD D7).  Both verdicts previously shared ONE
@@ -133,7 +127,7 @@ _AUTHORITATIVE_PRECHECK_LIMIT = 25
 # _delete_stale_completion_echoes (task 2433). Mirrors
 # _AUTHORITATIVE_PRECHECK_LIMIT's bounded-scroll rationale immediately above,
 # but narrower: the scroll's server-side filter already restricts matches to
-# source == _ECHO_SOURCE AND transition == 'done' (task 2433 review
+# RECONCILIATION_COMPLETION_ECHO_MARKER (task 2433 review
 # amendment — efficiency_robustness), so this cap bounds ONLY this
 # reconciler's own completion echoes for the task, not every task_id-tagged
 # memory — memory_hints, stage1/stage2 markers, etc. never compete for the
@@ -162,11 +156,11 @@ _STALE_ECHO_DELETE_LIMIT = 25
 # drift if the prompt wording changes without a matching update here.
 #
 # Second writer (task 2642): _on_task_done's own fast-path completion echo
-# ALSO stamps this key unconditionally (source=_ECHO_SOURCE), so Stage 2's
+# ALSO stamps this key unconditionally (source=TARGETED_RECONCILIATION_SOURCE), so Stage 2's
 # count_memories_by_metadata({'task_id': ..., 'stage2_suppress': True}) gate
 # recognizes a targeted-reconciliation completion record and skips its own
 # redundant completion-summary write. _is_authoritative_resolution still
-# requires `source != _ECHO_SOURCE` for the stage2_suppress branch, so a
+# requires `source != TARGETED_RECONCILIATION_SOURCE` for the stage2_suppress branch, so a
 # targeted self-echo carrying this key satisfies Stage 2's external count
 # gate WITHOUT becoming authoritative to _on_task_done's own pre-echo guard
 # — preserving the task-1984 "a task's own earlier echoes never trigger
@@ -226,6 +220,10 @@ class TargetedReconciler:
         journal: ReconciliationJournal,
         config: FusedMemoryConfig,
         event_buffer: EventBuffer | None = None,
+        *,
+        escalation_queue_factory: EscalationQueueFactory | None = (
+            INSTALLED_ESCALATION_QUEUE_FACTORY
+        ),
     ):
         self.memory = memory_service
         self.taskmaster = taskmaster
@@ -233,6 +231,7 @@ class TargetedReconciler:
         self.config = config.reconciliation
         self.verifier = CodebaseVerifier(config.reconciliation)
         self.buffer = event_buffer
+        self._escalation_queue_factory = escalation_queue_factory
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         # Wire post-construction (mirroring the planned_episode_registry pattern) so that
         # _on_task_blocked routes metadata writes through the interceptor's write_lock.
@@ -628,18 +627,17 @@ class TargetedReconciler:
                         )
                     details = task.get('details', '')
                     if isinstance(details, str) and details:
-                        content += f"\nDetails: {_truncate_clean(details, 500)}"
+                        content += f"\nDetails: {fit_at_word(details, 500)}"
 
             write_metadata: dict[str, Any] = {
-                'source': _ECHO_SOURCE,
+                **RECONCILIATION_COMPLETION_ECHO_MARKER,
                 'task_id': task_id,
-                'transition': 'done',
                 # Task 2642: seed Stage 2's "Completion-Note Suppression
                 # Pre-Check" count gate (prompts/stage2.py) on every
                 # completion echo, so a task completed via
                 # TargetedReconciliation is recognized and Stage 2 skips
                 # writing its own redundant completion summary.
-                # _is_authoritative_resolution's source != _ECHO_SOURCE
+                # _is_authoritative_resolution's source != TARGETED_RECONCILIATION_SOURCE
                 # discriminator (above) keeps this self-stamp from making
                 # the echo authoritative to THIS reconciler's own pre-echo
                 # guard, preserving the task-1984 invariant.
@@ -907,15 +905,9 @@ class TargetedReconciler:
                         )
                         if esc_action is not None:
                             result['actions'].append(esc_action)
-                        # Deliberately NO add_run_action(run_id, 'verify',
-                        # 'codebase', ...) row here: task 4343's contract is
-                        # exactly ONE outcome row per invocation of this
-                        # branch, which is what makes the operator census
-                        # truthful by construction.  A second verify row would
-                        # double-count it.  The escalation's durable records
-                        # are its own JSON file plus the outcome row already
-                        # written above; the run-level signal is the
-                        # result['actions'] entry.
+                        # _escalate_contradicted_l1 journals the escalation as
+                        # a write|skip escalation/submit row, never as a verify
+                        # row, so task 4343's one-outcome-row census holds.
                     written = await self._fenced_add_memory(
                         content=_VERDICT_MEMORY_TEMPLATES[verification.verdict].format(
                             title=title, summary=verification.summary,
@@ -923,7 +915,7 @@ class TargetedReconciler:
                         category='observations_and_summaries',
                         project_id=scope.project_id,
                         metadata={
-                            'source': 'targeted_reconciliation',
+                            'source': TARGETED_RECONCILIATION_SOURCE,
                             'task_id': task_id,
                             'verification_verdict': verification.verdict,
                         },
@@ -1019,8 +1011,8 @@ class TargetedReconciler:
         cached value — that fix alone left the OLD echo behind; this sweep
         removes it.
 
-        Matches ONLY memories whose metadata carries both
-        ``source == _ECHO_SOURCE`` and ``transition == 'done'`` — i.e.
+        Matches ONLY memories whose metadata carries
+        ``RECONCILIATION_COMPLETION_ECHO_MARKER`` — i.e.
         exactly the completion echoes `_on_task_done`'s fast path writes —
         so memory_hints, stage1/stage2 markers, and any other task_id-tagged
         memory are never touched. The match is enforced twice (task 2433
@@ -1028,7 +1020,7 @@ class TargetedReconciler:
         scroll's ``filters`` — Mem0 stores ``add_memory(metadata=...)`` keys
         as top-level Qdrant payload fields and ``scroll_by_metadata``
         matches ALL filter keys (see mem0_client.py's docstring), so passing
-        ``source``/``transition`` alongside ``task_id`` narrows the scroll
+        the marker's keys alongside ``task_id`` narrows the scroll
         itself rather than sharing ``_STALE_ECHO_DELETE_LIMIT`` with every
         other task_id-tagged memory; and client-side, as a cheap defensive
         re-check that costs nothing once the result set is already this
@@ -1039,14 +1031,12 @@ class TargetedReconciler:
         """
         memories = await self.memory.get_memories_by_metadata(
             project_id=scope.project_id,
-            filters={'task_id': task_id, 'source': _ECHO_SOURCE, 'transition': 'done'},
+            filters={'task_id': task_id, **RECONCILIATION_COMPLETION_ECHO_MARKER},
             limit=_STALE_ECHO_DELETE_LIMIT,
         )
         stale = [
             m for m in memories
-            if isinstance(m, dict)
-            and (m.get('metadata') or {}).get('source') == _ECHO_SOURCE
-            and (m.get('metadata') or {}).get('transition') == 'done'
+            if isinstance(m, dict) and is_reconciliation_completion_echo(m.get('metadata') or {})
         ]
         deleted_ids: list[str] = []
         for m in stale:
@@ -1753,13 +1743,12 @@ class TargetedReconciler:
     ) -> dict | None:
         """File an L1 escalation for an ambiguous descendant when orch is live.
 
-        Journals the filing as write/skip under ``escalation``/``submit``,
-        symmetric with :meth:`_sweep_cancel_orphan` and
-        :meth:`_sweep_block_orphan`.
+        Journals the filing as write/skip under ``escalation``/``submit``
+        through :meth:`_journal_l1_filed` / :meth:`_journal_l1_failed`, symmetric with
+        :meth:`_sweep_cancel_orphan` and :meth:`_sweep_block_orphan`.
         """
-        # is-None narrows the optional types for pyright (mirrors
-        # stage1_stall_detector.py:241).  HAS_ESCALATION is informational.
-        if not _HAS_ESCALATION or Escalation is None or EscalationQueue is None:
+        factory = self._escalation_queue_factory
+        if factory is None:
             logger.debug(
                 'sweep: escalation pkg unavailable; cannot file L1 for orphan %s',
                 task_id,
@@ -1780,53 +1769,30 @@ class TargetedReconciler:
         if escalation_id:
             detail_lines.append(f'Originating review escalation: {escalation_id}')
         detail = '\n'.join(detail_lines)
+        filing = {
+            'task_id': task_id,
+            'parent_id': parent_id,
+            'type': 'descendant_escalated',
+        }
 
         try:
-            queue = EscalationQueue(escalation_queue_dir(project_root))
-            esc = Escalation(
-                id=queue.make_id(task_id),
+            esc_id = await asyncio.to_thread(
+                file_reconciler_l1, factory, project_root,
                 task_id=task_id,
-                agent_role='reconciler',
                 severity='blocking',
                 category='scope_violation',
                 summary=summary,
                 detail=detail,
                 suggested_action='expand_scope|abort_task',
-                level=1,
             )
-            esc_id = queue.submit(esc)
         except Exception as e:
             logger.warning(
                 'sweep: L1 escalate failed for orphan %s (parent %s): %s',
                 task_id, parent_id, e,
             )
-            await self.journal.add_run_action(
-                run_id, 'skip', 'escalation', 'submit',
-                {
-                    'task_id': task_id,
-                    'parent_id': parent_id,
-                    'type': 'descendant_escalated',
-                    'error': str(e)[:200],
-                },
-                causation_id=run_id,
-            )
+            await self._journal_l1_failed(run_id, filing, e)
             return None
-        await self.journal.add_run_action(
-            run_id, 'write', 'escalation', 'submit',
-            {
-                'task_id': task_id,
-                'parent_id': parent_id,
-                'type': 'descendant_escalated',
-                'escalation_id': esc_id,
-            },
-            causation_id=run_id,
-        )
-        return {
-            'type': 'descendant_escalated',
-            'task_id': task_id,
-            'parent_id': parent_id,
-            'escalation_id': esc_id,
-        }
+        return await self._journal_l1_filed(run_id, filing, esc_id)
 
     async def _escalate_contradicted_l1(
         self,
@@ -1881,31 +1847,26 @@ class TargetedReconciler:
           preferred over silently dropping the finding.
 
         Returns the action dict for `result['actions']`, or None when the
-        escalation package is unavailable.
+        escalation package is unavailable or the filing failed.  A filing is
+        journaled through :meth:`_journal_l1_filed` / :meth:`_journal_l1_failed`,
+        the same as in :meth:`_sweep_escalate_l1`; an unavailable package stays
+        journal-silent.
         """
-        # is-None narrows the optional types for pyright (mirrors
-        # _sweep_escalate_l1). _HAS_ESCALATION is informational.
-        if not _HAS_ESCALATION or Escalation is None or EscalationQueue is None:
+        factory = self._escalation_queue_factory
+        if factory is None:
             logger.debug(
                 'verify: escalation pkg unavailable; cannot file L1 for '
                 'contradicted task %s',
                 task_id,
             )
             return None
-        # Rebound to locals because pyright's narrowing above does NOT reach
-        # into the nested `_file` scope below: a module-level global could be
-        # reassigned between closure capture and call, so reading
-        # `Escalation`/`EscalationQueue` there re-widens to `... | None` and
-        # trips reportOptionalCall.  These locals are never reassigned, so the
-        # narrowed types survive into the closure.
-        esc_cls, queue_cls = Escalation, EscalationQueue
 
         # One line, and a free-text title must not be what breaks that
         # contract — hence both the newline scrub and the bounded truncate.
         flat_title = ' '.join(str(title).split())
         summary = (
             f'Codebase evidence contradicts the completion claim of task '
-            f'{task_id}: {_truncate_clean(flat_title, 120)}'
+            f'{task_id}: {fit_at_word(flat_title, 120)}'
         )
         # POINTERS ONLY (INV-9): no verifier summary, no evidence snippets.
         # The finding already has two homes; this says where they are so the
@@ -1931,59 +1892,58 @@ class TargetedReconciler:
             f'verify|codebase|contradicted audit row for run {run_id}.',
         ])
         detail = '\n'.join(detail_lines)
+        filing = {'task_id': task_id, 'type': 'verification_contradicted_escalated'}
 
-        def _file() -> str:
-            # Constructed HERE, not hoisted: EscalationQueue.__init__ does
-            # mkdir(parents=True, exist_ok=True), so building it outside the
-            # contradicted branch would create data/escalations/ in every
-            # target project as a side effect of an unrelated done
-            # transition — the trap _escalation_pin_index_for documents.
-            queue = queue_cls(escalation_queue_dir(project_root))
-            esc = esc_cls(
-                id=queue.make_id(task_id),
+        # Offloaded (INV-8): _on_task_done runs on the shared event loop.
+        # Contained HERE, not at the call site, which sits inside
+        # _on_task_done's broad verify `except`: an escaping raise would skip
+        # the contradiction memory write, emit a spurious `post_verify_error`
+        # row (double-counting task 4343's verify census and blaming the
+        # verifier for a queue failure), and log the misleading generic
+        # 'Verification failed for task'.  A broken escalation store must cost
+        # the escalation and nothing else, yet stay visible to an operator —
+        # hence warn, never a silent `pass`.
+        try:
+            esc_id = await asyncio.to_thread(
+                file_reconciler_l1, factory, project_root,
                 task_id=task_id,
-                agent_role='reconciler',
                 severity='info',
                 category='risk_identified',
                 summary=summary,
                 detail=detail,
                 suggested_action='reopen_task|create_followup_task|dismiss',
-                level=1,
             )
-            return queue.submit(esc)
-
-        # Offloaded because EscalationQueue is synchronous blocking filesystem
-        # I/O and _on_task_done runs on the shared fused-memory event loop
-        # (INV-8) — following _escalation_pin_index_for's precedent, not
-        # _sweep_escalate_l1's older un-offloaded inline call.
-        #
-        # Contained HERE rather than at the call site, and this placement is
-        # the whole point rather than a stylistic choice.  The call site sits
-        # inside _on_task_done's broad verify `except`, so an escaping raise
-        # would (a) skip the contradiction memory write entirely, costing the
-        # corpus its record over a filesystem outage, (b) emit a spurious
-        # `post_verify_error` row that both double-counts task 4343's verify
-        # census and blames the verifier for a queue failure, and (c) log the
-        # misleading generic 'Verification failed for task' message.  A broken
-        # escalation store must cost the escalation and nothing else — which is
-        # also why this is a warn-and-return-None arm (_sweep_escalate_l1's
-        # precedent) and not a silent `except Exception: pass`: the failure
-        # still has to be visible to an operator.
-        # asyncio.to_thread re-raises in the awaiting coroutine, so this one
-        # try covers construction, make_id and submit alike.
-        try:
-            esc_id = await asyncio.to_thread(_file)
         except Exception as e:
             logger.warning(
                 'verification_contradicted_escalate_failed task=%s project_root=%s: %s',
                 task_id, project_root, e,
             )
+            await self._journal_l1_failed(run_id, filing, e)
             return None
-        return {
-            'type': 'verification_contradicted_escalated',
-            'task_id': task_id,
-            'escalation_id': esc_id,
-        }
+        return await self._journal_l1_filed(run_id, filing, esc_id)
+
+    async def _journal_l1_filed(
+        self, run_id: str, filing: dict, esc_id: str,
+    ) -> dict:
+        """Journal a filed reconciler L1 as an ``escalation``/``submit`` write row.
+
+        Returns the row detail, which is also the action for ``result['actions']``.
+        """
+        action = {**filing, 'escalation_id': esc_id}
+        await self.journal.add_run_action(
+            run_id, 'write', 'escalation', 'submit', action, causation_id=run_id,
+        )
+        return action
+
+    async def _journal_l1_failed(
+        self, run_id: str, filing: dict, error: Exception,
+    ) -> None:
+        """Journal a failed reconciler-L1 filing as an ``escalation``/``submit`` skip row."""
+        await self.journal.add_run_action(
+            run_id, 'skip', 'escalation', 'submit',
+            {**filing, 'error': str(error)[:200]},
+            causation_id=run_id,
+        )
 
     async def _sweep_unblock_dependents(
         self,
@@ -2100,14 +2060,13 @@ class TargetedReconciler:
         dependent: both read the same ``queue_dir/esc-*.json`` glob and apply
         the same ``status == 'pending'`` filter, so one scan plus a dict
         lookup is equivalent to D scans while turning a D x E parse into
-        1 x E. The scan runs in ``asyncio.to_thread`` because
-        ``EscalationQueue`` is synchronous blocking filesystem I/O and this
-        coroutine runs on the shared fused-memory event loop.
+        1 x E. Construction and scan run in one ``asyncio.to_thread`` hop
+        because ``EscalationQueue`` is synchronous blocking filesystem I/O and
+        this coroutine runs on the shared fused-memory event loop.
 
-        Returns the index, or ``None`` when the store is unavailable -- the
-        ``escalation`` package isn't importable in this env (mirrors the
-        module's defensive import at the top of this file), construction
-        raised, or the scan itself raised (all logged at warning with
+        Returns the index, or ``None`` when the store is unavailable -- there
+        is no escalation-queue factory, construction raised, or the scan
+        itself raised (the latter two logged at warning with
         ``exc_info=True``). Every such arm vetoes rather than flips: a store
         you cannot read cannot prove "no open escalation", and a false
         negative would unblock a task the orchestrator (or a human)
@@ -2124,14 +2083,14 @@ class TargetedReconciler:
         """
         if queue_memo:
             return queue_memo[0]
-        if not _HAS_ESCALATION or EscalationQueue is None:
+        factory = self._escalation_queue_factory
+        if factory is None:
             queue_memo.append(None)
             return None
         index: dict[str, list[str]] | None
         try:
-            queue = EscalationQueue(escalation_queue_dir(project_root))
             index = {}
-            for esc in await asyncio.to_thread(queue.get_pending):
+            for esc in await asyncio.to_thread(pending_escalations, factory, project_root):
                 # str() both sides of what get_by_task compared with ==, so an
                 # int-typed task_id still pins its dependent rather than
                 # silently missing the lookup.
@@ -2617,18 +2576,12 @@ def _unblock_veto_reason(dependent: dict) -> str | None:
     BEFORE the escalation-store I/O, exactly as that sibling sweep orders
     them: a park that can be recognized for free must never cost a scan.
 
-    Reads metadata defensively: a JSON-string metadata value (as stored by
-    some callers) is tolerated the same way the rest of this module treats
-    task metadata, and anything else unparseable is treated as empty.
+    Reads metadata through
+    :func:`fused_memory.middleware.metadata_dict.raw_metadata_dict`: a
+    JSON-string value (as stored by some callers) is read like a dict, and
+    unreadable metadata is logged and read as empty, so it raises no veto.
     """
-    metadata = dependent.get('metadata')
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (TypeError, ValueError):
-            metadata = {}
-    if not isinstance(metadata, dict):
-        metadata = {}
+    metadata = raw_metadata_dict(dependent.get('metadata'), source='targeted._unblock_veto_reason')
 
     if metadata.get('parent_cancelled') or metadata.get('needs_recheck_against_main'):
         return 'parent_cancelled'
@@ -2689,7 +2642,7 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
       non-authoritative — a list whose only member is empty is not a
       supersession edge; or
     - a truthy ``_STAGE2_SUPPRESS_KEY`` (``stage2_suppress``) marker whose
-      ``source`` is NOT this reconciler's own echo (``source != _ECHO_SOURCE``)
+      ``source`` is NOT this reconciler's own echo (``source != TARGETED_RECONCILIATION_SOURCE``)
       — Stage 2's real, task_id-scoped "Completion-Note Suppression Pre-Check
       (stage2_suppress guard)" write side (prompts/stage2.py) is one writer of
       this key; TargetedReconciliation's own fast-path completion echo
@@ -2709,7 +2662,7 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     branch dead code (dead_trigger_correctness finding) — replaced here with
     the real ``stage2_suppress`` marker.
 
-    Plain prior targeted echoes (``source=_ECHO_SOURCE``, no ``supersedes``, no
+    Plain prior targeted echoes (``source=TARGETED_RECONCILIATION_SOURCE``, no ``supersedes``, no
     ``stage2_suppress``) are deliberately NOT authoritative, so a task's own
     earlier echoes never trigger suppression or oscillation — see
     _on_task_done's pre-echo guard (task 1984).
@@ -2722,8 +2675,8 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
     check, that would make a task's own prior echo authoritative to THIS
     pre-check too — silently regressing the task-1984 invariant above on a
     re-done transition. So the ``stage2_suppress`` branch requires
-    ``source != _ECHO_SOURCE``: Stage 2's real guard writes (which carry
-    ``stage2_suppress`` without ``source=_ECHO_SOURCE``) stay authoritative,
+    ``source != TARGETED_RECONCILIATION_SOURCE``: Stage 2's real guard writes (which carry
+    ``stage2_suppress`` without ``source=TARGETED_RECONCILIATION_SOURCE``) stay authoritative,
     while a targeted self-echo carrying ``stage2_suppress`` stays
     non-authoritative to this pre-check — even though it still satisfies
     Stage 2's separate, external count gate.
@@ -2732,43 +2685,7 @@ def _is_authoritative_resolution(metadata: dict) -> bool:
         return False
     if any(normalize_supersedes(metadata.get('supersedes'))):
         return True
-    return bool(metadata.get(_STAGE2_SUPPRESS_KEY)) and metadata.get('source') != _ECHO_SOURCE
-
-
-def _truncate_clean(text: str, limit: int) -> str:
-    """Truncate ``text`` to at most ``limit`` chars without splitting a word.
-
-    Task 2080: a naive ``text[:limit]`` slice (the previous behavior of both
-    ``_format_outcome_echo``'s note cap and ``_on_task_done``'s legacy
-    ``details[:500]`` append) cuts at a raw character count with no regard
-    for word/token boundaries — e.g. a dense CSV-like note's "8679,8680" was
-    silently garbled to "8679,868", and in the note+commit echo the
-    " (commit <sha>)" suffix then glued directly onto that broken fragment.
-
-    Contract:
-    - ``text`` at or under ``limit`` is returned unchanged (no ellipsis).
-    - Otherwise, one char of the budget is reserved for a trailing ellipsis
-      ('…', U+2026) and the cut backs up to the last whitespace boundary
-      within that budget — but ONLY when doing so retains more than half the
-      budget. This avoids collapsing the result to a handful of characters
-      when whitespace is sparse or sits only very early in the window; in
-      that case (or when there is no whitespace at all) it falls back to a
-      hard cut at the budget.
-
-    The result length is always <= ``limit``.
-    """
-    if len(text) <= limit:
-        return text
-    budget = limit - 1
-    window = text[:budget]
-    # Only the LAST whitespace in the window matters, so scan backwards and
-    # stop at the first match instead of a full forward pass over `window`.
-    last_ws = next(
-        (i for i in range(len(window) - 1, -1, -1) if window[i].isspace()),
-        -1,
-    )
-    head = text[:last_ws] if last_ws > budget // 2 else text[:budget]
-    return head.rstrip() + '…'
+    return bool(metadata.get(_STAGE2_SUPPRESS_KEY)) and metadata.get('source') != TARGETED_RECONCILIATION_SOURCE
 
 
 # Bounds on the evidence pointers carried by the contradicted-verdict L1
@@ -2818,9 +2735,9 @@ def _evidence_paths(
         stripped = raw.strip()
         if not stripped:
             continue
-        # _truncate_clean (task 2080) rather than a raw slice: a naive cut
-        # garbles a dense path mid-segment the same way it garbled a CSV note.
-        path = _truncate_clean(stripped, maxlen)
+        # utils/clip_disclosure.py::fit_at_word (task 2080) rather than a raw slice: a naive
+        # cut garbles a dense path mid-segment the same way it garbled a CSV note.
+        path = fit_at_word(stripped, maxlen)
         if path in seen:
             continue
         seen.add(path)
@@ -2848,8 +2765,9 @@ def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) 
       signalling the caller to fall back to the existing description+details
       append (preserves legacy/no-provenance behavior).
 
-    ``note`` is cleanly truncated (word-boundary cut, ``_truncate_clean``) to
-    ``max_note_chars`` to bound the memory write — mirroring the
+    ``note`` is cleanly truncated (word-boundary cut,
+    ``utils/clip_disclosure.py::fit_at_word``) to ``max_note_chars`` to
+    bound the memory write — mirroring the
     ``details[:500]`` cap in the fast-path append (also cleanly truncated,
     task 2080). A prior revision used a raw ``note[:max_note_chars]`` slice,
     which cut mid-word/mid-number (task 2054: "8679,8680" garbled to
@@ -2863,9 +2781,9 @@ def _format_outcome_echo(provenance: dict | None, *, max_note_chars: int = 500) 
     note = raw_note.strip() if isinstance(raw_note, str) else ''
     commit = raw_commit.strip() if isinstance(raw_commit, str) else ''
     if note and commit:
-        return f'{_truncate_clean(note, max_note_chars)} (commit {commit})'
+        return f'{fit_at_word(note, max_note_chars)} (commit {commit})'
     if note:
-        return _truncate_clean(note, max_note_chars)
+        return fit_at_word(note, max_note_chars)
     if commit:
         return f'Landed in commit {commit}.'
     return None

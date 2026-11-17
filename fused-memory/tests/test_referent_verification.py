@@ -2758,7 +2758,7 @@ class TestCorroboratedIsDerivedFromTheRecordedEvidence:
         carries. The two agree only while distinct referents cannot render
         alike, and `Referent.node_name` drops `kind` entirely for a FOREIGN
         referent (`f'{project_id}:{number}'`), so today's injectivity rests
-        wholly on `_KIND_LABELS` holding exactly one kind. Add a second and a
+        wholly on `KIND_LABELS` holding exactly one kind. Add a second and a
         foreign citation of the new kind corroborates a foreign 'task' endpoint
         of the same number: a genuine misattachment demoted to INFO and booked
         into the 'corroborated' counter axis.
@@ -2774,7 +2774,7 @@ class TestCorroboratedIsDerivedFromTheRecordedEvidence:
         a precondition of THIS property; task 4506 holds no lock on that file
         (esc-3671-3 amendment pass).
         """
-        kinds = sorted(canonical_labels._KIND_LABELS)
+        kinds = sorted(canonical_labels.KIND_LABELS)
         # BOTH renderings, because they fail differently: the local form
         # discriminates on the kind LABEL ('Task 2500' vs a second label) and
         # stays injective, while the foreign form drops the kind and is the one
@@ -3392,15 +3392,14 @@ class TestADegradedLookupIsDistinguishableFromAnAbsentNode:
     `new_endpoint_uuid=None` on purpose — leaf eta's `ensure_entity_node`
     resolves-or-mints and handles both identically. A transient backend error
     degrades to the same `None`, which is where the collapse stops being
-    deliberate: eta reads that field at exactly one site,
-    `minted=finding.new_endpoint_uuid is None`, so a FalkorDB blip books as
-    minted=True telemetry — a made-up node reported where an unavailable lookup
-    happened.
+    deliberate: read as "absent", it would mint, and book minted=True for a
+    node nobody showed was missing.
 
-    Zeta's job is to PRODUCE the discriminator; acting on it is eta's, and is
-    filed separately. Detection stays the primary result either way: the flag
-    EXTENDS `test_a_lookup_failure_never_loses_the_finding` rather than
-    replacing it, so the evidence still survives a backend that will not answer.
+    Zeta's job is to PRODUCE the discriminator; acting on it is eta's, pinned in
+    `tests/test_referent_repair.py::TestADegradedTargetLookupDefersTheRepair`.
+    Detection stays the primary result either way: the flag EXTENDS
+    `test_a_lookup_failure_never_loses_the_finding` rather than replacing it, so
+    the evidence still survives a backend that will not answer.
     """
 
     @pytest.mark.asyncio

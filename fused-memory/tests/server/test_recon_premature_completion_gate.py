@@ -18,8 +18,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _task_facts_rows import task_facts_rows
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from fused_memory.server.tools import create_mcp_server
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Frames task 5252 as complete in present tense ("has landed", "now enforces").
 _COMPLETION_CONTENT = 'task 5252 has landed and now enforces the manifest gate'
@@ -38,12 +42,14 @@ _KNOWN_PROJECTS = {'dark_factory': '/root'}
 
 
 def _server_with_statuses(mock_service, statuses):
-    """Build a server whose task_interceptor.get_statuses returns `statuses`.
+    """Build a server whose task store answers `statuses`, a string-keyed {id: status} map.
 
-    `statuses` is the string-keyed {id: status} map real get_statuses returns.
+    This gate reads get_statuses; the completion-claim gate that runs after it
+    reads get_task_facts, so both are stubbed from the same map.
     """
     task_interceptor = MagicMock()
     task_interceptor.get_statuses = AsyncMock(return_value=statuses)
+    task_interceptor.get_task_facts = AsyncMock(return_value=task_facts_rows(statuses))
     return create_mcp_server(
         mock_service,
         task_interceptor=task_interceptor,

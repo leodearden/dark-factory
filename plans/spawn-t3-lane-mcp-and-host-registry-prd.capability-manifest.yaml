@@ -1,0 +1,182 @@
+# Machine-readable twin of spawn-t3-lane-mcp-and-host-registry-prd.capability-manifest.md
+# Stamped by commit_planning (task_id values); comments survive the stamp.
+prd: plans/spawn-t3-lane-mcp-and-host-registry-prd.md
+schema_version: 1
+signal_leaves: ["ε"]
+tasks:
+  - label: "α"
+    task_id: 8122
+    title: "stdlib MCP client for T3's /mcp, pairing-code OAuth, credential file, pair/status verbs"
+    capabilities:
+      - name: "t3-mcp-client-module-exists"
+        binding: "capability→producer α (new file); absent on main (git ls-tree)"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["orchestrator/src/orchestrator/t3_mcp_client.py"]
+          expect: present
+      - name: "self-pair-refuses-cli-server-version-mismatch"
+        binding: "rejection mechanism built by α; verdict word fixed by PRD §6.1; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cli-version-mismatch"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "pairing-code-oauth-exchange-and-30-day-credential"
+        binding: "substrate present in T3 0.1.6 (environmentHttp.ts mcpOAuth register/decision/token; McpOAuth.ts::approve pairing-code branch; EnvironmentAuth.ts MCP_CLIENT_SESSION_TTL); client built by α, proven by B1/B2 against the fake server"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the exchange shape is proven by α's fake-server tests, not by a grep"
+  - label: "β"
+    task_id: 8123
+    title: "lane verbs over MCP; child join writes exited; refusals narrowed"
+    capabilities:
+      - name: "launch-binds-existing-worktree"
+        binding: "substrate present (project/tools.ts::ThreadLaunchTool workspaceStrategy; handlers.ts::assertProjectWorktree); lane mapping built by β; absent in the lane on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "existing_worktree"
+          paths: ["orchestrator/src/orchestrator/spawn_t3_lane.py"]
+          expect: present
+      - name: "worktree-refusal-named-not-parsed"
+        binding: "rejection mechanism: T3's invalid_request mapped only for an existing_worktree request (PRD D6); verdict reason fixed by §6.1; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "cwd-not-project-worktree"
+          paths: ["orchestrator/src/orchestrator/spawn_t3_lane.py", "skills/spawn/spawn-claude.sh"]
+          expect: present
+      - name: "private-sqlite-read-removed"
+        binding: "removal: spawn_t3_lane.py::registered_projects and its sqlite3 import go (PRD D1); present on main today"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "import sqlite3"
+          paths: ["orchestrator/src/orchestrator/spawn_t3_lane.py"]
+          expect: absent
+      - name: "child-join-writes-exited-through-the-exit-verb"
+        binding: "capability→producer β: one record_exit helper shared by finish() and join_t3_thread (PRD D4, INV-6); absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "record_exit"
+          paths: ["skills/spawn/spawn-claude.sh"]
+          expect: present
+      - name: "runtime-mode-from-skip-permissions"
+        binding: "substrate present (ThreadLaunchTool runtimeMode; providerPolicy.ts::RuntimeMode); mapping true→full-access, false→approval-required built by β, pinned by B3"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a two-valued mapping judged by B3's sent-input assertion, not a grep"
+  - label: "γ"
+    task_id: 8124
+    title: "bind records by T3CODE_THREAD_ID; sessions-by-t3-thread index; indexed env-qualified T3 sweep"
+    capabilities:
+      - name: "thread-pointer-index-exists"
+        binding: "capability→producer γ in the shape of session_registry.py::write_claude_session_pointer (present); the new dir name is absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "sessions-by-t3-thread"
+          paths: ["orchestrator/src/orchestrator/"]
+          expect: present
+      - name: "display-carries-t3-environment-id"
+        binding: "field population: stamped by β's launch from the unauthenticated descriptor (environmentHttp.ts descriptor) on the production path; field added by γ; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "t3_environment_id"
+          paths: ["orchestrator/src/orchestrator/session_registry.py"]
+          expect: present
+      - name: "hook-binds-via-thread-pointer-under-adopt-or-fork"
+        binding: "substrate present: T3CODE_THREAD_ID set per launch/resume (PortScanner.ts::AGENT_THREAD_ENV, ClaudeAdapterV2.ts); session_hooks.py::_pointer_resolution rules (present); proven by B6/B7"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "ownership adopt-or-fork is a behavioural property pinned by B6/B7, not a grep"
+  - label: "δ"
+    task_id: 8125
+    title: "host-qualified liveness: ProcessIdentity on launcher/owner pids, one predicate for every dead decision"
+    capabilities:
+      - name: "session-liveness-module-exists"
+        binding: "capability→producer δ (new file, homed in shared per Leo ruling A 2026-11-04 esc-8125-3, PRD D16) over shared/src/shared/process_identity.py::liveness (present, OTHER_HOST present); absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/session_liveness.py"]
+          expect: present
+      - name: "record-carries-launcher-identity"
+        binding: "field population: stamped by session_registry.py::_run_launching on the production path; field added by δ; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "launcher_identity"
+          paths: ["orchestrator/src/orchestrator/session_registry.py"]
+          expect: present
+      - name: "self-exit-refuses-other-host"
+        binding: "rejection mechanism: SelfExitRefusal.OTHER_HOST ahead of the pid comparison (session_self_exit.py::_first_refusal present); absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "OTHER_HOST"
+          paths: ["orchestrator/src/orchestrator/session_self_exit.py"]
+          expect: present
+      - name: "other-host-branch-proven-by-fixtures-only"
+        binding: "declared seam: no production producer on this host (PRD §3, §9); proven by B9 fake identities; consumer = future multi-host PRD"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "no live producer exists; B9 is the proof, by PRD decision"
+  - label: "ζ"
+    task_id: 8126
+    title: "T3 end-of-work acts (settle|archive) and the watcher handoff archive gated on the confirmed successor"
+    capabilities:
+      - name: "end-of-work-input-resolved-by-the-script"
+        binding: "capability→producer ζ; input name fixed by PRD §6.5; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "CLAUDE_SPAWN_T3_END"
+          paths: ["skills/spawn/spawn-claude.sh"]
+          expect: present
+      - name: "record-carries-t3-end"
+        binding: "field population: stamped by _run_launching from the resolved input; field added by ζ; absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "t3_end"
+          paths: ["orchestrator/src/orchestrator/session_registry.py"]
+          expect: present
+      - name: "ending-a-t3-session-procedure-has-one-home"
+        binding: "capability→producer ζ (SKILL.md §T3 lane subsection; INV-9 one home); heading absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "Ending a T3 session"
+          paths: ["skills/spawn/SKILL.md"]
+          expect: present
+      - name: "self-archive-and-self-settle-exist-in-t3"
+        binding: "substrate present in T3 0.1.6: thread/tools.ts::ThreadOrganizeTool actions archive|settle, threadId omitted = caller; McpToolAccess.ts::writesThreads skips the caller's own thread; settleThread byOwnAgent defers to turn end and applies only on a completed run"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "T3-side substrate, verified by source read (PRD §8); not a dark-factory grep"
+      - name: "handoff-archive-gated-on-the-named-successor-record"
+        binding: "rejection mechanism: no archive without a stamped successor record read from the sibling spawn's stdout line (PRD D15); proven by B11 (a)–(d)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "the gate is a procedure in SKILL.md exercised by B11's fake-lane rehearsal; the stdout line's tokens already occur in the script, so a grep would be vacuous"
+  - label: "ε"
+    task_id: 8127
+    title: "human-run live acceptance probe on the T3 server"
+    capabilities:
+      - name: "twelve-live-observations-recorded"
+        binding: "DAG-direction: every capability produced upstream (α pair, β launch/join, γ binding/sweep, δ identities, ζ acts/handoff); the task is the integration gate"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a human records the observations; the task is the check"

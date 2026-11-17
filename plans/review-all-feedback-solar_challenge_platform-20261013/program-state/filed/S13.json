@@ -1,0 +1,176 @@
+{
+ "stream": "S13",
+ "prd_path": "docs/prds/review-all-consent-purpose-catalogue-and-gate-decide.md",
+ "sidecar_path": "docs/prds/review-all-consent-purpose-catalogue-and-gate-decide.capability-manifest.yaml",
+ "filed": [
+  {
+   "label": "alpha",
+   "task_id": "1192",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-4cc553a4ea6f",
+    "fk-a10ea6217225",
+    "fk-be6b977957ce",
+    "fk-628ac7f86df6"
+   ],
+   "depends_on": []
+  },
+  {
+   "label": "beta",
+   "task_id": "1193",
+   "priority": "high",
+   "x_finding_key": [
+    "fk-acec2b429476",
+    "fk-a10ea6217225"
+   ],
+   "depends_on": [
+    "1192"
+   ]
+  },
+  {
+   "label": "gamma1",
+   "task_id": "1194",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-4cc553a4ea6f",
+    "fk-a10ea6217225"
+   ],
+   "depends_on": [
+    "1192"
+   ]
+  },
+  {
+   "label": "gamma2",
+   "task_id": "493",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-796ca07a0b4d",
+    "fk-4cc553a4ea6f",
+    "fk-a10ea6217225"
+   ],
+   "depends_on": [
+    "1192"
+   ],
+   "note": "gamma2, amended in place; priority low->medium"
+  },
+  {
+   "label": "gamma3",
+   "task_id": "1195",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-1f653708a862",
+    "fk-4cc553a4ea6f",
+    "fk-a10ea6217225"
+   ],
+   "depends_on": [
+    "1192",
+    "1174"
+   ]
+  },
+  {
+   "label": "delta1",
+   "task_id": "1196",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-8a853da6a191"
+   ],
+   "depends_on": [
+    "1192",
+    "1193",
+    "1078",
+    "1087",
+    "1089"
+   ]
+  },
+  {
+   "label": "delta2",
+   "task_id": "1197",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-8a853da6a191"
+   ],
+   "depends_on": [
+    "1196",
+    "1095",
+    "1098",
+    "1096"
+   ]
+  },
+  {
+   "label": "epsilon",
+   "task_id": "1198",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-9f40abc979b9"
+   ],
+   "depends_on": [
+    "1193"
+   ]
+  },
+  {
+   "label": "zeta",
+   "task_id": "1199",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-08ae391b9c3b"
+   ],
+   "depends_on": [
+    "1196"
+   ]
+  },
+  {
+   "label": "eta",
+   "task_id": "1200",
+   "priority": "medium",
+   "x_finding_key": [
+    "fk-a10ea6217225",
+    "fk-acec2b429476",
+    "fk-4cc553a4ea6f"
+   ],
+   "depends_on": [
+    "1193",
+    "1194",
+    "493",
+    "1195",
+    "1196",
+    "1066"
+   ],
+   "note": "INV-3 enforcing test"
+  },
+  {
+   "label": "theta",
+   "task_id": "1201",
+   "priority": "low",
+   "x_finding_key": [
+    "fk-21cfdda2e0b0"
+   ],
+   "depends_on": [],
+   "note": "acceptance record, cancelled by the lead"
+  },
+  {
+   "label": "582 (re-scoped in place, out of plan, no prd_task_label, no S13 key)",
+   "task_id": "582",
+   "priority": "high",
+   "x_finding_key": [],
+   "depends_on": [
+    "1192",
+    "1193"
+   ],
+   "note": "re-scoped in place; out of plan; no S13 key; 2026-10-16: lawful-basis table + basis branch (A-narrow), GET /consent/purposes moved to 618"
+  }
+ ],
+ "held_leaves": [],
+ "gate_dependencies_added": [
+  "1192",
+  "1193"
+ ],
+ "commit_planning_result": "success: 1192,1193,1194,1195,1196,1197,1198,1199,1200,582 deferred->pending; 493 no_op (already pending). The sidecar was stamped for all 10 labels (α..η) with no missing labels and no errors; delivered_checks were copied onto 1192(8), 1193(9), 1194(3), 493(7), 1195(4), 1196(5), 1198(2), 1199(2), 12",
+ "lead_rulings": [
+  "1201 (theta acceptance record) cancelled with x_acceptance_reason (module stays whole; placement half on S5 1191); 592 cancelled naming 1193; 583 already cancelled naming S5-epsilon 1174 (batch 8).",
+  "582 re-scoped in place to lawful basis + GET /consent/purposes (deps 1192 + 1193, pending); 968 -> 1193 edge; P-Member edges 617 -> 1192, 618 -> 1193, 619 -> 1198 + 1197, 620 -> 1196 with coordination notes; 972 -> 582 edge.",
+  "Open for Leo: whether 582 or 617 owns the lawful-basis branch (617 already depends on 582) together with esc-582-5.",
+  "PRD drift corrected by the lead before the sidecar commit: delta1/delta2/gamma3 are wired (1078/1087/1089, 1095/1098/1096, 1174), not held.",
+  "Briefing (interactive on main, after 1197): identity-consent decision 'ConsentStatus.EXPIRED is NEVER stored' -> 'stored ConsentStatus has no EXPIRED; liveness is EffectiveConsentStatus from effective_status'.",
+  "2026-10-16 (Leo): 582 vs 617 ruled A-narrow — 582 owns the lawful-basis table and the basis branch; 617 and 618 rewritten; edge 1200 -> 582; 617's edges to 442/461 removed by the lead (they served test flips that moved to 582)."
+ ]
+}

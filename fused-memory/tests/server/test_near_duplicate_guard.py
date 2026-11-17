@@ -34,6 +34,7 @@ from fused_memory.server.near_duplicate_guard import (
     _TOPIC_CLUSTER_DEFAULT_HINT,
     build_near_duplicate_block,
     build_topic_cluster_block,
+    can_share_one_occurrence,
     find_matching_topic_cluster,
     find_near_duplicate_memory,
     merge_topic_clusters,
@@ -474,6 +475,38 @@ class TestFindMatchingTopicClusterSufficientPhrases:
         assert match is not None
         assert match[0].topic_id == 'topic-b'
         assert match[1] == ['gamma']
+
+
+class TestCanShareOneOccurrence:
+    """Whether one occurrence of some text could score both phrases as distinct hits (task 5933)."""
+
+    @pytest.mark.parametrize(
+        ('first', 'second'),
+        [
+            pytest.param('ruff format', 'format-clean', id='whole-word-overlap'),
+            pytest.param(
+                'git add -f .task/', '.task/plan.json is gitignored', id='path-word-overlap'
+            ),
+            pytest.param('plan.json', '.task/plan.json', id='nesting'),
+            pytest.param('lane reseed', 'lane reseed', id='exact-duplicate'),
+            pytest.param('Ruff Format', 'format-clean', id='case-insensitive-like-the-matcher'),
+        ],
+    )
+    def test_pairs_one_occurrence_can_hold(self, first: str, second: str):
+        assert can_share_one_occurrence(first, second)
+        assert can_share_one_occurrence(second, first)
+
+    @pytest.mark.parametrize(
+        ('first', 'second'),
+        [
+            pytest.param('locks', 'set', id='fragment-inside-a-word-on-both-sides'),
+            pytest.param('ruff format', 'ruff check', id='disjoint'),
+            pytest.param('ruff format', 'not format-clean', id='ruff-format-seed-replacement'),
+        ],
+    )
+    def test_pairs_one_occurrence_cannot_hold(self, first: str, second: str):
+        assert not can_share_one_occurrence(first, second)
+        assert not can_share_one_occurrence(second, first)
 
 
 class TestResolveTopicGuardClusters:

@@ -1,10 +1,12 @@
-"""Merge-state wire vocabularies — the POLL and SUBMIT contracts.
+"""Merge-state wire vocabularies — the POLL, REASON and SUBMIT contracts.
 
 See PRD ``plans/merge-status-durable-non-landed-prd.md`` (contract D1,
-decision D3, behaviour B9).  ``MergeState`` is the vocabulary of
-``merge_status`` / ``merge_cancel``'s ``state`` field; ``MergeSubmitStatus``
-is the vocabulary of ``merge_request``'s ``status`` field.  They are TWO
-vocabularies, not one — see ``MergeSubmitStatus``'s docstring.
+decision D3, behaviour B9, open question 3).  ``MergeState`` is the vocabulary
+of ``merge_status`` / ``merge_cancel``'s ``state`` field; ``MergeReason`` is the
+closed ``reason`` companion that ``merge_status`` pairs with every EPISTEMIC
+``state``; ``MergeSubmitStatus`` is the vocabulary of ``merge_request``'s
+``status`` field.  They are THREE vocabularies, not one — see
+``MergeSubmitStatus``'s docstring.
 
 This module supersedes the hand-maintained enumerations previously duplicated
 across:
@@ -23,11 +25,11 @@ it must equal, and ``scripts/tests/test_merge_state_vocabulary_consistency.py``
 asserts set equality between every span and its partition.  Same convention as
 ``CONTRIBUTING.md``'s ``lint-command-mirror`` block.
 
-This module is intentionally PURE: it defines the two vocabularies and their
-derived partitions only.  It holds no mapping between them and no I/O — the
-raw-status -> ``MergeState`` collapse belongs to
-``escalation/src/escalation/server.py::_map_terminal_state``, and duplicating
-it here would create the second home this module exists to remove.
+This module is intentionally PURE: it defines the three vocabularies and the
+poll and submit partitions only.  It holds no mapping between them and no
+I/O — the raw-status -> ``MergeState`` collapse belongs to
+``escalation/src/escalation/merge_status_answer.py::map_terminal_state``, and
+duplicating it here would create the second home this module exists to remove.
 
 It is also intentionally STANDALONE-LOADABLE: stdlib imports only, no
 intra-package imports.  ``scripts/tests/test_merge_state_vocabulary_consistency.py``
@@ -51,6 +53,7 @@ import enum
 
 __all__ = [
     'MergeState',
+    'MergeReason',
     'LIVE_STATES',
     'TERMINAL_STATES',
     'OUTCOME_STATES',
@@ -76,8 +79,8 @@ class MergeState(enum.StrEnum):
     PRD's D1 contract block, whose member names ARE the values.
 
     ``already_merged`` is deliberately NOT a member: it is a SUBMIT-only value
-    that ``escalation/src/escalation/server.py::_map_terminal_state`` collapses
-    to ``done``.  It lives on ``MergeSubmitStatus``.
+    that ``escalation/src/escalation/merge_status_answer.py::map_terminal_state``
+    collapses to ``done``.  It lives on ``MergeSubmitStatus``.
     """
 
     # ── outcome states (PRD D1): what actually happened to the merge ──
@@ -94,9 +97,7 @@ class MergeState(enum.StrEnum):
     superseded = 'superseded'
 
     # ── epistemic states (PRD D1): what the SERVER KNOWS about the merge ──
-    # Landed here in alpha; nothing emits the first three until beta ships
-    # their emitters.  ``unknown`` is emitted today (Tier 4, and
-    # ``merge_cancel``'s no-live-waiter miss).
+    # Each is emitted with a MergeReason; ``unknown`` only with probe_failed.
     no_record = 'no_record'
     stale_record = 'stale_record'
     journaled = 'journaled'
@@ -125,7 +126,8 @@ LIVE_STATES = frozenset(
 )
 
 #: Settled states — the merge reached an outcome.
-#: escalation/src/escalation/server.py::_map_terminal_state emits exactly these.
+#: escalation/src/escalation/merge_status_answer.py::map_terminal_state emits
+#: exactly these.
 TERMINAL_STATES = frozenset(
     {
         MergeState.done,
@@ -146,19 +148,46 @@ OUTCOME_STATES = LIVE_STATES | TERMINAL_STATES
 EPISTEMIC_STATES = frozenset(MergeState) - OUTCOME_STATES
 
 #: What a REQUEST_ID/TASK_ID-scoped ``merge_status`` poll loop may stop on.
-POLL_STOP_STATES = TERMINAL_STATES | {MergeState.unknown}
+#: Every epistemic state is a stop because each one replaced an answer that
+#: used to read ``unknown``, which was already a stop on these arms.
+#: ``journaled`` is transient but stays a stop, so this flip changes no
+#: consumer's loop exit; its hint therefore asks for no re-poll.  Whether a
+#: consumer waits through recovery is decided on ``reason`` (PRD task δ).
+POLL_STOP_STATES = TERMINAL_STATES | EPISTEMIC_STATES
 
 #: Exactly what ``merge_cancel``'s ``state`` field can be.
 #:
-#: Its equality with POLL_STOP_STATES today is INCIDENTAL, not a shared
-#: definition — these are two facts with two homes, and they answer different
-#: questions ("what can merge_cancel report" vs "what may a poll loop stop
-#: on").  They are expected to DIVERGE: PRD D1 narrows ``unknown`` to
-#: probe-failure, so beta moves merge_cancel's no-record miss path to
-#: ``no_record`` while the poll-loop stop set is unaffected.  Do not collapse
-#: them into one constant — that would make the beta change silently mutate an
-#: unrelated pinned prose span.
-CANCEL_STATES = TERMINAL_STATES | {MergeState.unknown}
+#: merge_cancel's no-waiter path resolves through merge_status's walk, live
+#: tier first, so it can end in any state.  A live state means the worker owns
+#: the request but this server holds no waiter for it, so it cannot be
+#: cancelled here.  This and POLL_STOP_STATES are two facts with two homes
+#: ("what can merge_cancel report" vs "what may a poll loop stop on"); do not
+#: collapse them into one constant.
+CANCEL_STATES = OUTCOME_STATES | EPISTEMIC_STATES
+
+
+class MergeReason(enum.StrEnum):
+    """Closed REASON vocabulary — why ``merge_status`` answered an epistemic state.
+
+    Member names are the wire values (the ``MergeState`` convention).  It
+    shares no value with ``MergeState``: a reason qualifies a state, it is
+    never one.
+    """
+
+    #: Every tier missed cleanly and git established no landing.
+    never_submitted = 'never_submitted'
+    #: The newest durable row is from another run: history, not present truth.
+    prior_run_terminal = 'prior_run_terminal'
+    #: A durable journal entry exists with no live worker entry.
+    journaled_not_live = 'journaled_not_live'
+    #: The id resolves only as other rows' superseded_by; those member rows are
+    #: records, not this id's outcome.
+    coalesce_train_id = 'coalesce_train_id'
+    #: Git established the branch's work is on main but could not confirm
+    #: attribution or effect.
+    landing_unattributable = 'landing_unattributable'
+    #: A probe raised; the only reason ``unknown`` may carry.
+    probe_failed = 'probe_failed'
 
 
 class MergeSubmitStatus(enum.StrEnum):
@@ -184,7 +213,8 @@ class MergeSubmitStatus(enum.StrEnum):
 
     THE MAPPING TO ``MergeState``, stated as a POINTER not as data.  When a
     submit status is later served through the poll wire,
-    ``escalation/src/escalation/server.py::_map_terminal_state`` collapses it:
+    ``escalation/src/escalation/merge_status_answer.py::map_terminal_state``
+    collapses it:
     ``already_merged`` and ``done_wip_recovery`` -> ``MergeState.done``;
     ``wip_halted``, ``wip_recovery_no_advance``, ``unmerged_state``,
     ``stash_failed``, ``unknown_branch`` and ``error`` -> ``MergeState.blocked``.

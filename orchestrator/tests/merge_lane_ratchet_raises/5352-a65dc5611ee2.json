@@ -1,0 +1,48 @@
+{
+  "task_id": "5352",
+  "reason": "Re-recorded against current main after recovering 5352 from the coalesce-5352-7d6956da derail (the pre-train branch's own raises conflicted with the append-only ledger). Net-additive: the steward, coalesce, offline-lane and scheduler one-strike guards become restart-durable guard_state facades (TTL constants, persisted initialisers, corrected prose in merge_queue.py and offline_lane.py); private_reads rises because the cross-guard suite test_restart_durable_guards.py asserts against guard attributes that have no public accessor.",
+  "measures": [
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/merge_queue.py",
+      "baseline": 21614,
+      "current": 21646
+    },
+    {
+      "measure": "lines",
+      "key": "orchestrator/src/orchestrator/offline_lane.py",
+      "baseline": 1152,
+      "current": 1213
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/merge_queue.py",
+      "baseline": 12327,
+      "current": 12344
+    },
+    {
+      "measure": "prose_lines",
+      "key": "orchestrator/src/orchestrator/offline_lane.py",
+      "baseline": 612,
+      "current": 659
+    },
+    {
+      "measure": "total:lines",
+      "key": "<cluster>",
+      "baseline": 56027,
+      "current": 56120
+    },
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6533,
+      "current": 6604
+    },
+    {
+      "measure": "total:prose_lines",
+      "key": "<cluster>",
+      "baseline": 31428,
+      "current": 31492
+    }
+  ]
+}

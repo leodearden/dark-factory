@@ -16,6 +16,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
+import _checkout as _checkout
 from inline_suppression_consumers import Consumer, ConsumerModel
 from inline_suppression_key import key_for
 from inline_suppression_kinds import Kind, Site

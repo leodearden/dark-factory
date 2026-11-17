@@ -39,7 +39,8 @@ Design notes
 - Required directives are an explicit curated allow-list of host-INVARIANT safety
   switches. They are NOT auto-derived from the template, because some template lines
   are host-specific (e.g. Environment=...PREDONE_HOOK...) and would produce false
-  drift alarms on other machines.
+  drift alarms on other machines. Their Environment= part is
+  ``systemd_unit_parity.py::ENV_POLICY``'s required projection.
 - --fix only APPENDS missing directives; it never removes or reorders existing lines.
   This preserves intentionally host-specific lines (e.g. extra
   DASHBOARD_KNOWN_PROJECT_ROOTS entries) that live only in the installed unit.
@@ -64,6 +65,7 @@ Design notes
 
 import argparse
 import pathlib
+import re
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -75,7 +77,15 @@ from collections.abc import Sequence
 # ``scripts/`` explicitly (load-bearing, because pyproject sets
 # ``--import-mode=importlib``, under which pytest deliberately does not perform
 # that sys.path mutation itself).
-from systemd_unit_parity import ParityExit, emit, emit_block, find_dropins
+from systemd_unit_parity import (
+    ENV_POLICY,
+    SERVICE_SECTION,
+    ParityExit,
+    UnitFamily,
+    emit,
+    emit_block,
+    find_dropins,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -94,57 +104,10 @@ _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 
 # Host-invariant safety switches that MUST be present in [Service] as
-# non-comment directives.  Extend this list to guard additional safety flags.
+# non-comment directives. The Environment= entries are ENV_POLICY's required
+# projection; a host-local name cannot be one, because EnvPolicy raises at import
+# (B5, plans/review-all-s25-scripts-instruments-prd.md D5).
 #
-# BUT NEVER ADD A NAME THAT scripts/render_systemd_unit.py PRESERVES.
-# Concretely, today: never add `Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=...`.
-# The two mechanisms are incompatible by construction, and the failure is silent
-# in the worst way — it lands on the unit that governs RECONCILIATION.
-#
-# Since task 4796, setup-host.sh installs this unit through that renderer, which
-# reads the host's DASHBOARD_KNOWN_PROJECT_ROOTS off the installed unit and puts
-# it back into the fresh render. A host that registered nine project roots keeps
-# nine. Now suppose the single-root committed line were added to the list below:
-#
-#   1. find_drift tests EXACT WHOLE-LINE membership, so on that nine-root host
-#      the required single-root line reads as MISSING;
-#   2. --fix appends it after the LAST [Service] line;
-#   3. systemd applies Environment= in file order with LAST-WINS, so the
-#      appended single-root line BEATS the preserved one;
-#   4. the checker then reports parity and exits 0.
-#
-# Eight projects silently stop being known to reconciliation
-# (fused_memory/models/scope.py reads this variable as KNOWN_PROJECT_ROOTS_ENV;
-# reconciliation/harness.py raises UnknownProjectError for a project outside the
-# set), and nothing reports it. The remedy for a host-local value is NOT this
-# list — it is the renderer's preserve set.
-#
-# Held by tests/scripts/test_check_fused_memory_unit_parity.py::
-# test_preserved_names_are_disjoint_from_required_service_directives, with the
-# clobber demonstrated by ::test_a_required_known_project_roots_line_would_reclobber.
-# No code in either module can prevent an edit to a constant in the other, which
-# is why the guard is a cross-module test and this is a comment.
-#
-# PINNED FROM BOTH ENDS, and the second anchor is not redundant. The test above
-# derives its preserved set solely from render_systemd_unit.UNITS[*].
-# host_local_environment, so dropping the name from a UnitSpec while
-# fused_memory/models/scope.py still read it would make that test pass
-# VACUOUSLY — the intersection goes empty for the wrong reason and this hazard
-# is wide open again underneath a green suite. So the same suite also holds
-# ::test_scope_known_project_roots_env_is_disjoint_from_required_service_directives
-# (anchored on scope.py::KNOWN_PROJECT_ROOTS_ENV, the constant whose value is
-# what makes a clobber damaging) and
-# ::test_scope_known_project_roots_env_is_actually_preserved_by_the_renderer,
-# which is the join: it goes red exactly when the renderer stops preserving
-# what scope.py still reads.
-#
-# The constant's value lives in shared/src/shared/project_layout.py, which
-# scope.py imports. Those guards read scope.py with `ast` rather than importing
-# it, and that is MEASURED, not stylistic: fused_memory is not installed in the
-# `uv run --project shared` environment tests/scripts/ runs under
-# (scripts/orchestrator.yaml's test_command), so `import fused_memory` raises
-# ModuleNotFoundError. "Simplifying" the source read into an import turns the
-# guard into a collection error that says nothing about the invariant.
 # Restart=on-failure / RestartSec=5 / RestartSteps=4 / TimeoutStartSec=300 /
 # TimeoutStopSec=90 are host-invariant literal strings (already present
 # verbatim in scripts/fused-memory.service.template) — exact membership
@@ -159,15 +122,20 @@ _DEFAULT_TEMPLATE = _SCRIPT_DIR / "fused-memory.service.template"
 # no RestartSteps= setting. Ignoring." at load and moves on). An installed unit
 # missing this line therefore has no growing backoff at all, silently, and the
 # only way that gets corrected on the host is for this checker to report it.
+#
+# KillMode=mixed is host-invariant too (task 9493). Without it an installed unit
+# silently keeps the default control-group, where a restart double-signals the
+# server and SIGTERMs the subprocesses of live tool calls; listing it here is
+# what lets setup-host's parity gate report that and --fix append it in place.
 REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
-    "Environment=MEM0_TELEMETRY=false",
-    "Environment=PATH=%h/.local/bin:%h/bin:%h/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    *ENV_POLICY.required_directives(UnitFamily.FUSED_MEMORY),
     "WatchdogSec=120",
     "Restart=on-failure",
     "RestartSec=5",
     "RestartSteps=4",
     "TimeoutStartSec=300",
     "TimeoutStopSec=90",
+    "KillMode=mixed",
 )
 
 # Directive PREFIXES that MUST be present (as the start of some non-comment
@@ -178,6 +146,51 @@ REQUIRED_SERVICE_DIRECTIVES: tuple[str, ...] = (
 # deliberate stop; without it a stopped service is restarted by the next
 # connection to its still-listening port.
 REQUIRED_SERVICE_DIRECTIVE_PREFIXES: tuple[str, ...] = ("ExecStartPre=", "ExecStopPost=")
+
+# The backing stores must come up only through the FalkorDB AOF gate (task
+# 6330): a bare `docker compose ... up` ExecStartPre recreates falkordb onto
+# whatever AOF is on disk, and a stale one silently drops every later write.
+# Like the prefixes above, the gate's line carries host paths, so --fix can
+# only report these, never synthesize them.
+AOF_GATE_SCRIPT = "scripts/falkordb_aof_gate.py"
+AOF_GATE_DRIFT = f"ExecStartPre= running {AOF_GATE_SCRIPT} (task 6330)"
+# The compose services whose `up` cannot recreate falkordb, named as defined
+# in fused-memory/docker/docker-compose.yml. That holds only while none of them
+# declares a dependency, because compose starts a service's dependencies too;
+# tests/scripts/test_check_fused_memory_unit_parity.py::test_every_ungated_compose_service_starts_alone
+# pins it.
+UNGATED_COMPOSE_SERVICES: frozenset[str] = frozenset({"embedder"})
+BARE_COMPOSE_UP_DRIFT = (
+    "no ExecStartPre= running a `docker compose ... up` that names services beyond "
+    f"UNGATED_COMPOSE_SERVICES {sorted(UNGATED_COMPOSE_SERVICES)} "
+    f"(it could recreate falkordb without {AOF_GATE_SCRIPT})"
+)
+_COMPOSE_UP = re.compile(r"docker[ -]compose\b.*\sup(\s|$)")
+
+
+def compose_up_services(line: str) -> frozenset[str] | None:
+    """The services a compose `up` on *line* names, or None when it runs no compose `up`.
+
+    They are the `up`'s non-option tokens, so an option's separate value token
+    is read as a service too. An empty set means the `up` names none, which
+    brings up every service.
+    """
+    match = _COMPOSE_UP.search(line)
+    if match is None:
+        return None
+    return frozenset(token for token in line[match.end():].split() if not token.startswith("-"))
+
+
+def compose_up_bypasses_aof_gate(line: str) -> bool:
+    """True when *line* runs a compose `up` that could recreate falkordb.
+
+    Anything compose_up_services reads outside UNGATED_COMPOSE_SERVICES counts,
+    and so does naming no service, so an unrecognised `up` fails closed.
+    """
+    services = compose_up_services(line)
+    if services is None:
+        return False
+    return not services or not services <= UNGATED_COMPOSE_SERVICES
 
 
 def _log(message: str, *, stream=None) -> None:
@@ -229,6 +242,8 @@ def find_drift(
     unit_text: str,
     required: tuple[str, ...] = REQUIRED_SERVICE_DIRECTIVES,
     required_prefixes: tuple[str, ...] = REQUIRED_SERVICE_DIRECTIVE_PREFIXES,
+    *,
+    check_aof_gate: bool = True,
 ) -> list[str]:
     """Return required directives NOT present as non-comment lines in [Service].
 
@@ -240,6 +255,13 @@ def find_drift(
     [Service] line starts with it — used for directives whose full value is
     host-specific (e.g. ExecStartPre=) and therefore cannot be exact-matched.
     Prefix misses are appended, in order, after the exact-match misses.
+
+    With ``check_aof_gate``, a unit whose ExecStartPre= lines exist but none
+    runs AOF_GATE_SCRIPT reports AOF_GATE_DRIFT, and one with an ExecStartPre=
+    compose up naming services beyond UNGATED_COMPOSE_SERVICES (see
+    compose_up_bypasses_aof_gate) reports BARE_COMPOSE_UP_DRIFT, appended
+    last. A unit with no ExecStartPre= at all is already reported by its
+    prefix miss.
 
     Args:
         unit_text: The full text of the systemd unit file.
@@ -255,12 +277,48 @@ def find_drift(
         Empty if everything required is present.
     """
     sections = parse_unit_sections(unit_text)
-    service_lines = sections.get("Service", [])
+    service_lines = sections.get(SERVICE_SECTION, [])
     missing = [d for d in required if d not in service_lines]
     missing.extend(
         p for p in required_prefixes if not any(line.startswith(p) for line in service_lines)
     )
+    if check_aof_gate:
+        missing.extend(_aof_gate_drift(service_lines))
     return missing
+
+
+def _aof_gate_drift(service_lines: list[str]) -> list[str]:
+    exec_start_pre = [line for line in service_lines if line.startswith("ExecStartPre=")]
+    if not exec_start_pre:
+        return []
+    drift = []
+    if not any(AOF_GATE_SCRIPT in line for line in exec_start_pre):
+        drift.append(AOF_GATE_DRIFT)
+    if any(compose_up_bypasses_aof_gate(line) for line in exec_start_pre):
+        drift.append(BARE_COMPOSE_UP_DRIFT)
+    return drift
+
+
+def _compose_up_bypass_details(unit_text: str) -> list[str]:
+    """Name each ExecStartPre= line BARE_COMPOSE_UP_DRIFT flags, with the services read from it."""
+    service_lines = parse_unit_sections(unit_text).get(SERVICE_SECTION, [])
+    details = []
+    for line in service_lines:
+        if line.startswith("ExecStartPre=") and compose_up_bypasses_aof_gate(line):
+            services = sorted(compose_up_services(line) or ())
+            details.append(f"      {line}")
+            details.append(f"      read as services: {services or 'none, so every service'}")
+    return details
+
+
+def _drift_entries(drift: list[str], unit_text: str) -> str:
+    """One `  - ` line per drift entry, each BARE_COMPOSE_UP_DRIFT followed by its offending lines."""
+    entries = []
+    for entry in drift:
+        entries.append(f"  - {entry}")
+        if entry == BARE_COMPOSE_UP_DRIFT:
+            entries.extend(_compose_up_bypass_details(unit_text))
+    return "\n".join(entries)
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +349,7 @@ def fix_unit_text(
     Returns:
         Updated text string (or the original if nothing was missing).
     """
-    missing = find_drift(unit_text, required, required_prefixes=())
+    missing = find_drift(unit_text, required, required_prefixes=(), check_aof_gate=False)
     if not missing:
         return unit_text
 
@@ -308,7 +366,7 @@ def fix_unit_text(
                 # Hit the section after [Service]
                 next_section_idx = i
                 break
-            if stripped == "[Service]":
+            if stripped == f"[{SERVICE_SECTION}]":
                 in_service = True
 
     # Ensure the line just before the insertion point ends with '\n' so the
@@ -458,13 +516,9 @@ def main(argv: Sequence[str]) -> int:
         _log(f"[ok] {installed_path}: parity — all required directives present.")
         return ParityExit.PARITY
 
-    # rstrip: the joined list ends in a newline, which under a per-line _log
-    # would render one final line holding nothing but the tag.
     _log(
-        (
-            f"[drift] {installed_path}: missing required directives:\n"
-            + "".join(f"  - {d}\n" for d in drift)
-        ).rstrip("\n")
+        f"[drift] {installed_path}: missing required directives:\n"
+        + _drift_entries(drift, unit_text)
     )
 
     if args.fix:
@@ -473,7 +527,7 @@ def main(argv: Sequence[str]) -> int:
         # / host paths) cannot be guessed. So the count of lines actually
         # appended is the number of missing EXACT directives, NOT len(drift)
         # (which also counts un-synthesizable prefix misses).
-        appended = find_drift(unit_text, required_prefixes=())
+        appended = find_drift(unit_text, required_prefixes=(), check_aof_gate=False)
         fixed_text = fix_unit_text(unit_text)
         installed_path.write_text(fixed_text, encoding="utf-8")
         _log(f"[fixed] Appended {len(appended)} directive(s) to {installed_path}")
@@ -486,11 +540,9 @@ def main(argv: Sequence[str]) -> int:
         residual = find_drift(fixed_text)
         if residual:
             _log(
-                (
-                    f"[drift] {installed_path}: --fix cannot synthesize host-specific "
-                    f"directive(s) (value carries host paths — add them by hand):\n"
-                    + "".join(f"  - {d}\n" for d in residual)
-                ).rstrip("\n"),
+                f"[drift] {installed_path}: --fix cannot synthesize host-specific "
+                f"directive(s) (value carries host paths — add them by hand):\n"
+                + _drift_entries(residual, fixed_text),
                 stream=sys.stderr,
             )
             return ParityExit.FINDING

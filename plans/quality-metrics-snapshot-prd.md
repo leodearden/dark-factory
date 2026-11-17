@@ -175,6 +175,16 @@ enumeration (amended 2026-10-05: 5414 is done, `cdc15a6b56`).
    Only the first-party-dependent columns can move, and only for a test that imports a
    `scripts/legibility` module by its bare name. 5414 gets no `update_task` and no
    `add_dependency`. No report-only mode is added to `merge_lane_metrics.py`.
+   *Amended 2026-10-13 (task 6921):* a root `pyproject.toml` with no `[tool.uv.workspace]`
+   table is a single-package project. Its domain is one member named by `[project].name`,
+   whose `src` root is `src/` and whose `tests` root is `tests/` (the PyPA src layout),
+   followed only by the `scripts` pseudo-member: top-level `tests/` is the package's own,
+   so a `tests` pseudo-member would claim every test file twice. `src/` must hold tracked
+   `.py`, else the run exits 2; a flat layout would otherwise measure its tests only and
+   read complete. Build-backend package-dir settings (`[tool.setuptools.packages.find]`
+   and the hatch, poetry, flit and pdm equivalents) are not read. A workspace root that
+   also carries `[project]`, as this repo's does, stays a workspace. Found by
+   `review-all-solar_challenge-20261013`, whose run-local shim this replaces.
 4. **Measure the checked-out commit, refuse a dirty domain.** `as_of_sha` is
    `git rev-parse HEAD`; if `git status --porcelain` lists any path under the domain the
    run exits 2 naming the paths. Files are read from the work tree and measured with
@@ -187,6 +197,27 @@ enumeration (amended 2026-10-05: 5414 is done, `cdc15a6b56`).
    the remedy then is a cache keyed by `(blob sha, complexipy version, schema_version)`,
    never a "skip when nothing changed" rule (`plans/merge-lane-quality-prd.md`
    Correction 7's prohibition applies by analogy).
+
+   *Corrected 2026-11-04 (task 8463; `plans/quality-dashboard-prd.md` decisions 17–19; Leo's
+   ruling of 2026-11-04 accepting decision 18):* this decision forbids a "skip when nothing
+   changed" rule, and Correction 7's prohibition is of a content-heuristic skip whose "nothing
+   changed" premise nothing proves. `scripts/quality_snapshot_cadence.py` skips only when a
+   snapshot with the same measurement identity, (`as_of_sha`, `params`), already exists. The
+   identity test (`tests/scripts/test_quality_metrics_snapshot.py::TestMeasurementIdentity`)
+   proves that a second run at one identity is byte-identical below `run_id` and `cost`. It runs
+   each measurement in its own process with a different hash seed. So the
+   skip declines to re-measure an object already measured; it does not judge that nothing
+   changed. The skip is keyed on identity alone, and a changed `params` always re-measures. This
+   decision stands for everything else: no blob cache. Two contract updates. The snapshot is now
+   schema 3: `params` gains `python_version` and `instrument`, schemas 1 and 2 read their
+   `instrument` and `python_version` as unknown, `--diff` opens with a `params differ:` line
+   when any params key differs or is unknown. Because unknown equals nothing,
+   `measurement_identity` refuses a schema-1 or schema-2 snapshot, `identity_known` says so
+   beforehand, and the wrapper re-measures such a file. The fields are in
+   `plans/quality-dashboard-prd.md` §Contract (Snapshot identity). The command line gains
+   `--params` (print the params a measurement would record; measure nothing), so boundary row
+   14's "a `schema_version` of 3 … exit 2" now reads 4. Decision 8 is unchanged: the wrapper
+   writes uncommitted files under `data/quality-metrics/`.
 6. **The snapshot is a report: no verdicts, no ranking, no thresholds of its own.** It
    names exactly the doc's two heuristic-14 marks (1,500 and 2,000 raw lines), held as
    constants whose docstring points at heuristic 14 rather than restating it. It does not
@@ -199,7 +230,7 @@ enumeration (amended 2026-10-05: 5414 is done, `cdc15a6b56`).
    `merge_lane_metrics.py` module docstring): a domain file that cannot be read, parsed or
    measured is skipped and named in `evidence.unreadable`, and `evidence.complete`
    becomes `false`; tool-level faults (git absent, complexipy missing or outside the pin,
-   no workspace members, dirty domain) exit 2. `--diff` against an incomplete snapshot
+   neither workspace members nor a single src-layout package, dirty domain) exit 2. `--diff` against an incomplete snapshot
    prints the unreadable paths first and reports their measures as unknown, never as
    zero.
 8. **The script writes a file; the consuming skill commits it.** The script never

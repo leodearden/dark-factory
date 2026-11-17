@@ -342,7 +342,7 @@ class TestGroupedPayloadIsWhatIsSummarised:
         parent_id = '44444444-4444-4444-8444-444444444444'
         folded_child_id = '55555555-5555-4555-8555-555555555555'
 
-        async def _fake_group(_service, _project_id, _results):
+        async def _fake_group(_service, _project_id, _results, **_kwargs):
             return [
                 {
                     'id': parent_id,

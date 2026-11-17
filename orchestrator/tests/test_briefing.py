@@ -25,8 +25,10 @@ from _briefing_helpers import (
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
 )
+from _prompt_action_items import action_items
+from _roles_helpers import tool_is_granted
 from shared.capability_manifest import DeliveredCheckMeta
-from test_roles_ancestry_check import _tool_is_granted
+from shared.task_text_fingerprint import TaskTextDrift
 
 from orchestrator.agents.briefing import (
     DELIVERED_CHECK_BULLET_LIMIT,
@@ -37,6 +39,7 @@ from orchestrator.agents.memory_recall import MEMORY_CONTEXT_CAVEAT
 from orchestrator.agents.roles import ARCHITECT
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
+from orchestrator.plan_descope import DESCOPE_DISPOSITIONS, check_done_step_integrity
 
 
 @pytest.fixture
@@ -631,6 +634,17 @@ class TestBuildPlanTighteningPrompt:
         prompt = await _build_tightening_prompt(briefing)
         assert 'claude-task-2656-architect' in prompt
 
+    async def test_offers_the_exits_the_merge_gate_honours_and_forbids_the_rest(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await _build_tightening_prompt(briefing)
+        prescribed, heading, forbidden = prompt.partition(_FORBIDDEN_SECTION_HEADING)
+        assert heading
+        assert 'report_task_already_done' in prescribed
+        for discarded in ('report_ready_to_merge', 'report_blocking_dependency'):
+            assert discarded not in prescribed
+            assert discarded in forbidden
+
 
 @pytest.mark.asyncio
 class TestPlanTighteningPromptToolGrants:
@@ -665,7 +679,7 @@ class TestPlanTighteningPromptToolGrants:
         granted = set(ARCHITECT.allowed_tools)
         missing = sorted(
             qualified for qualified in (f'mcp__plan-tools__{n}' for n in named)
-            if not _tool_is_granted(qualified, granted)
+            if not tool_is_granted(qualified, granted)
         )
         assert not missing, (
             f'build_plan_tightening_prompt prescribes plan tools absent from '
@@ -833,6 +847,142 @@ class TestRevalidationPriorProposal:
 
 
 @pytest.mark.asyncio
+class TestRevalidationConfirms:
+    """Every step-set prompt ends in confirm_plan (S9 Q-C1 (a)): a step-set edit clears confirmation."""
+
+    async def test_revalidation_prompt_ends_by_confirming_the_plan(self, briefing: BriefingAssembler):
+        prompt = await briefing.build_revalidation_prompt(
+            {'id': '9170', 'title': 'T', 'description': 'd'},
+            existing_plan={'files': ['orchestrator'], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        items = action_items(prompt)
+        options = next(i for i, item in enumerate(items) if 'create_plan(' in item)
+        final = items[-1]
+        assert options < len(items) - 1
+        assert 'confirm_plan()' in final
+        assert 'FINAL' in final
+        for path in ('(a)', '(b)', '(c)', 'create_plan'):
+            assert path in final, path
+
+
+@pytest.mark.asyncio
+class TestRevalidationTextDriftNotice:
+    """Task 4031: a revalidating architect is told when the task text moved."""
+
+    async def _prompt(self, briefing: BriefingAssembler, text_drift: TaskTextDrift | None) -> str:
+        return await briefing.build_revalidation_prompt(
+            {'id': '4031', 'title': 'T', 'description': 'Amended: item 4 added'},
+            existing_plan={'files': ['orchestrator'], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+            text_drift=text_drift,
+        )
+
+    async def test_amended_text_is_announced_beside_the_amended_description(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await self._prompt(briefing, TaskTextDrift.AMENDED)
+        assert 'Amended: item 4 added' in prompt
+        assert '## The Task Text Has Changed' in prompt
+        assert prompt.index('## The Task Text Has Changed') < prompt.index(
+            '## Your Previous Plan',
+        )
+
+    async def test_unstamped_plan_is_announced_as_possibly_changed(
+        self, briefing: BriefingAssembler,
+    ):
+        prompt = await self._prompt(briefing, TaskTextDrift.UNSTAMPED)
+        assert '## The Task Text May Have Changed' in prompt
+        assert '## The Task Text Has Changed' not in prompt
+
+    @pytest.mark.parametrize('text_drift', [TaskTextDrift.AMENDED, TaskTextDrift.UNSTAMPED])
+    async def test_the_notice_confirms_after_an_edit_too(
+        self, briefing: BriefingAssembler, text_drift: TaskTextDrift,
+    ):
+        prompt = await self._prompt(briefing, text_drift)
+        notice = prompt.split('## The Task Text', 1)[1].split('## Your Previous Plan', 1)[0]
+        assert 'then call confirm_plan()' in notice
+        assert 'only if' not in notice
+
+    @pytest.mark.parametrize('text_drift', [None, TaskTextDrift.CURRENT])
+    async def test_current_text_adds_no_notice(
+        self, briefing: BriefingAssembler, text_drift: TaskTextDrift | None,
+    ):
+        prompt = await self._prompt(briefing, text_drift)
+        assert 'The Task Text' not in prompt
+        assert prompt == await self._prompt(briefing, None)
+
+
+def _done(step_id: str, commit: str) -> dict:
+    return {'id': step_id, 'description': step_id, 'status': 'done', 'commit': commit}
+
+
+_INTEGRITY_BEFORE = {
+    'files': ['orchestrator'],
+    'steps': [_done('step-1', 'abc1234def'), _done('step-2', 'ddd4444eee')],
+}
+_INTEGRITY_AFTER = {
+    'files': ['orchestrator'],
+    'steps': [
+        {'id': 'step-1', 'description': 'step-1', 'status': 'pending'},
+        _done('step-2', 'ddd4444eee'),
+        _done('step-3', 'ddd4444eee'),
+    ],
+}
+
+
+def _lines_naming(prompt: str, *needles: str) -> list[str]:
+    return [line for line in prompt.splitlines() if all(n in line for n in needles)]
+
+
+@pytest.mark.asyncio
+class TestRevalidationDoneStepIntegrity:
+    """Task 4032: a dropped done step has a sanctioned route, and a refusal names the pairs."""
+
+    async def _prompt(self, briefing: BriefingAssembler, **kwargs) -> str:
+        return await briefing.build_revalidation_prompt(
+            {'id': '4032', 'title': 'T', 'description': 'D'},
+            existing_plan=_INTEGRITY_AFTER,
+            changed_files=[],
+            worktree=None,
+            context='',
+            **kwargs,
+        )
+
+    async def test_action_list_names_the_record_tool_and_every_disposition(
+        self, briefing: BriefingAssembler,
+    ):
+        action = (await self._prompt(briefing)).split('## Action', 1)[1]
+        assert 'record_descoped_step' in action
+        for disposition in DESCOPE_DISPOSITIONS:
+            assert disposition in action
+
+    async def test_refusal_lists_the_undisposed_drop_and_the_introduced_duplicate(
+        self, briefing: BriefingAssembler,
+    ):
+        verdict = check_done_step_integrity(_INTEGRITY_BEFORE, _INTEGRITY_AFTER)
+        assert not verdict.passed
+
+        prompt = await self._prompt(briefing, integrity_refusal=verdict)
+
+        [drop_line] = _lines_naming(prompt, 'step-1', 'abc1234def')
+        [duplicate_line] = _lines_naming(prompt, 'ddd4444eee', 'step-2', 'step-3')
+        action_at = prompt.index('## Action')
+        assert prompt.index(drop_line) < action_at
+        assert prompt.index(duplicate_line) < action_at
+
+    async def test_no_refusal_renders_no_refusal_section(self, briefing: BriefingAssembler):
+        prompt = await self._prompt(briefing, integrity_refusal=None)
+        assert prompt == await self._prompt(briefing)
+        assert _lines_naming(prompt, 'step-1', 'abc1234def') == []
+        assert _lines_naming(prompt, 'ddd4444eee', 'step-2', 'step-3') == []
+
+
+@pytest.mark.asyncio
 class TestResumePriorProposal:
     """Resume golden test.
 
@@ -860,6 +1010,23 @@ class TestResumePriorProposal:
             'Root cause is a stale cache entry; fix by invalidating on write.'
             in prompt
         )
+
+
+@pytest.mark.asyncio
+class TestResumePromptArgumentPlacement:
+    """``escalation_summary`` and ``resolution`` are both positional ``str``,
+    and the template renders the issue before the resolution, so a swap shows
+    up as the two arguments arriving out of order."""
+
+    async def test_issue_renders_before_resolution(self, briefing: BriefingAssembler):
+        with patch.object(
+            BriefingAssembler, '_get_memory_context', return_value='# Context\n\n_stub_',
+        ):
+            prompt = await briefing.build_resume_prompt(
+                {'id': '3754', 'metadata': {}}, {}, 'ISSUE-SENTINEL', 'RESOLUTION-SENTINEL',
+            )
+
+        assert prompt.index('ISSUE-SENTINEL') < prompt.index('RESOLUTION-SENTINEL')
 
 
 class TestPriorProposalStaleness:
@@ -1024,6 +1191,68 @@ class TestPriorProposalStaleness:
         )
         assert isinstance(prompt, str)
         assert 'prior block-time investigation' not in prompt
+
+    # -- (f) rendered 'Investigated at' label --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_investigated_at_line_uses_investigated_at_when_timestamp_restamped(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {
+            'id': '9018',
+            'title': 'Re-affirmed proposal task',
+            'description': 'Demo',
+            'metadata': {
+                'dry_run_proposals': [
+                    {
+                        'proposal_text': 're-affirmed analysis text',
+                        'risk_label': 'low',
+                        'files_referenced': [],
+                        'timestamp': '2026-07-15T00:00:00+00:00',
+                        'investigated_at': '2026-07-13T10:00:00+00:00',
+                    },
+                ],
+                'last_blocked_at': '2026-07-14T00:00:00+00:00',
+            },
+        }
+        prompt = await briefing.build_revalidation_prompt(
+            task,
+            existing_plan={'files': [], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        assert 're-affirmed analysis text' in prompt
+        assert '**Investigated at:** 2026-07-13T10:00:00+00:00' in prompt
+        assert '2026-07-15T00:00:00+00:00' not in prompt
+
+    @pytest.mark.asyncio
+    async def test_investigated_at_line_falls_back_to_timestamp(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {
+            'id': '9019',
+            'title': 'Legacy proposal task',
+            'description': 'Demo',
+            'metadata': {
+                'dry_run_proposals': [
+                    {
+                        'proposal_text': 'legacy analysis text',
+                        'risk_label': 'low',
+                        'files_referenced': [],
+                        'timestamp': '2026-07-15T00:00:00+00:00',
+                    },
+                ],
+            },
+        }
+        prompt = await briefing.build_revalidation_prompt(
+            task,
+            existing_plan={'files': [], 'steps': []},
+            changed_files=[],
+            worktree=None,
+            context='',
+        )
+        assert '**Investigated at:** 2026-07-15T00:00:00+00:00' in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -1230,3 +1459,49 @@ class TestFormatTaskFieldSurface:
         assert not [line for line in rendered if line.startswith('**Files:**')]
         assert '**ID:** 3254' in rendered
         assert '**Dependencies:** 3659, 3212' in rendered
+
+
+@pytest.mark.asyncio
+class TestFormatTaskTestStrategy:
+    """``testStrategy`` is briefed to the context-complete reviewer only (task 5369).
+
+    ``review.reviewer_briefing`` is the switch that flips and kills the reviewer
+    change, so no role outside it may change with it. The architect briefing is
+    driven here as one of ``_format_task``'s other callers.
+    """
+
+    async def test_the_architect_briefing_renders_no_test_strategy(
+        self, briefing: BriefingAssembler,
+    ):
+        task = {'id': '5369', 'title': 'A task', 'testStrategy': 'Drive the seam with a real repo.'}
+
+        prompt = await briefing.build_architect_prompt(task, context='CTX')
+
+        assert 'Drive the seam with a real repo.' not in prompt
+
+
+@pytest.mark.asyncio
+class TestReviewerPromptDiffCap:
+    """The incumbent's 50,000-char diff cut is a keyword the trial can lift (task 5369)."""
+
+    async def test_a_zero_cap_inlines_a_long_diff_whole(self, briefing: BriefingAssembler):
+        diff = 'x' * 60_000 + 'TAIL'
+
+        prompt = await briefing.build_reviewer_prompt(
+            'reviewer_comprehensive', diff, context='CTX', diff_cap_chars=0,
+        )
+
+        assert diff in prompt
+        assert '[diff truncated]' not in prompt
+
+    async def test_the_default_still_truncates_at_fifty_thousand(
+        self, briefing: BriefingAssembler,
+    ):
+        diff = 'x' * 50_000 + 'TAIL'
+
+        prompt = await briefing.build_reviewer_prompt(
+            'reviewer_comprehensive', diff, context='CTX',
+        )
+
+        assert 'x' * 50_000 + '\n\n... [diff truncated] ...' in prompt
+        assert 'TAIL' not in prompt

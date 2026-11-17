@@ -43,6 +43,7 @@ from fused_memory.arm_harness.screening_evidence import (
     ScreeningEvidenceError,
     reported_evidence,
 )
+from fused_memory.arm_harness.usage_tap import StatusOrigin
 
 ENVELOPE = latency_envelope(120.0)
 QWEN = slate_arm()
@@ -179,6 +180,45 @@ def test_a_rejected_own_model_call_leaves_the_longest_prompt_unknown():
     assert '400' in result.detail
     assert 'maximum context length is 32768 tokens' in result.detail
     assert 'longest of the 1 reported: 500 tokens' in result.detail
+
+
+def test_an_unreported_call_the_tap_synthesized_is_named_as_such_in_the_unmeasured_detail():
+    synthesized = call(status=502, error_excerpt='upstream failed', status_origin=StatusOrigin.TAP)
+    calls = (call(prompt_tokens=500), synthesized)
+
+    result = context_gate(arm_evidence(QWEN, calls=calls))
+
+    assert result.verdict is GateVerdict.UNMEASURED
+    assert 'synthesized by the usage tap' in result.detail
+
+
+def test_a_server_rejection_is_named_as_the_servers_in_the_unmeasured_detail():
+    rejected = call(
+        status=400,
+        error_excerpt='maximum context length is 32768 tokens',
+        status_origin=StatusOrigin.UPSTREAM,
+    )
+    calls = (call(prompt_tokens=500), rejected)
+
+    result = context_gate(arm_evidence(QWEN, calls=calls))
+
+    assert result.verdict is GateVerdict.UNMEASURED
+    assert 'from the server' in result.detail
+    assert 'synthesized by the usage tap' not in result.detail
+
+
+def test_unreported_calls_sharing_a_status_and_excerpt_are_listed_once_per_origin():
+    calls = tuple(
+        call(status=502, error_excerpt='upstream failed', status_origin=origin)
+        for origin in (StatusOrigin.TAP, None, StatusOrigin.UPSTREAM)
+    )
+
+    result = context_gate(arm_evidence(QWEN, calls=calls))
+
+    assert result.verdict is GateVerdict.UNMEASURED
+    assert '1x status 502 (synthesized by the usage tap): upstream failed' in result.detail
+    assert '1x status 502 (from the server): upstream failed' in result.detail
+    assert '1x status 502: upstream failed' in result.detail
 
 
 def test_a_served_own_model_call_without_usage_leaves_the_longest_prompt_unknown():

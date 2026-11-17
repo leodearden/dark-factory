@@ -1,0 +1,12 @@
+{
+  "task_id": "8269",
+  "reason": "Net-additive tests for the new startup crash-loop breaker (plans/startup-hardening-prd.md task gamma). New file orchestrator/tests/test_startup_crash_loop_breaker.py drives the real Harness.run across consecutive starts over one project_root and injects one fault per start through the Harness step seams the shared startup fixtures already stub (_startup_harness.STUBBED_STEPS): _reap_orphan_worktrees (2e) twice, _recover_crashed_tasks (2c), _run_leftover_verify_scope_reaper_pass (1c1h), and _start_merge_worker (inside fatal step 1b). No existing path rose; total:private_reads 6475 -> 6480 is exactly that new file's 5.",
+  "measures": [
+    {
+      "measure": "total:private_reads",
+      "key": "<cluster>",
+      "baseline": 6475,
+      "current": 6480
+    }
+  ]
+}

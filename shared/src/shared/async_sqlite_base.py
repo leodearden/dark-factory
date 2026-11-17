@@ -170,6 +170,7 @@ class AtomicConnection:
         self._connection = connection
         self._lock = asyncio.Lock()
         self._holder: asyncio.Task | None = None
+        self._closed = False
 
     @property
     def connection(self) -> aiosqlite.Connection:
@@ -300,12 +301,22 @@ class AtomicConnection:
     async def close(self) -> None:
         """Truncate the WAL best-effort, then close the wrapped connection.
 
-        Taking the lock means a unit already in flight commits first rather
-        than being cut off mid-transaction.
+        A unit already in flight commits first.  A cancellation that lands
+        during the checkpoint (a caller's close budget running out on a loaded
+        host) still shuts the connection: ``stop()`` queues the close behind
+        the in-flight checkpoint without waiting for it.  Once a close has
+        taken the lock, a later close is a no-op.
         """
         async with self._held('close()'):
-            with contextlib.suppress(Exception):
-                await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                with contextlib.suppress(Exception):
+                    await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
+            except BaseException:
+                self._connection.stop()
+                raise
             await self._connection.close()
 
     @staticmethod

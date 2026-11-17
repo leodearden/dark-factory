@@ -14,14 +14,15 @@ from typing import Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _main_probe_doubles import MainProbeHarness
 from _merge_lane_fakes import FakeVerifier, VerifyScript
 from _orch_helpers import make_placeholder_future
 
-from orchestrator import verify
-from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
     MergeOutcome,
@@ -31,7 +32,6 @@ from orchestrator.merge_queue import (
     _MainHealthProbeHandles,
     _run_post_merge_verify,
 )
-from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import _PROBE_CACHE, VerifyResult
 from orchestrator.verify_runner import (
     FLOCK_CONTENTION_CATEGORY,
@@ -150,36 +150,10 @@ def _learn_main_module_baseline(
     Goes through the public narrowed probe, so the cache ends up holding only
     per-module verdicts and no whole-tree entry.
     """
-    module_configs = [
-        ModuleConfig(
-            prefix=prefix, test_command=f'pytest {prefix.lower()}/tests',
-            lint_command=None, type_check_command=None,
-        )
-        for prefix in ('A', 'B', 'C')
-    ]
-    probe_dir = tmp_path / 'learn-main-probe'
-    probe_dir.mkdir(exist_ok=True)
-
-    @contextlib.asynccontextmanager
-    async def _ephemeral_worktree(kind, sha, *, warm_seed=False):
-        yield probe_dir
-
-    async def _main_side_run(worktree, _config, module_config=None, **kwargs) -> VerifyResult:
-        assert module_config is not None
-        ids = main_ids[module_config.prefix]
-        return VerifyResult(
-            passed=not ids, test_output='', lint_output='', type_output='',
-            summary='main side', failing_test_ids=ids,
-            failing_test_ids_by_module={module_config.prefix: ids},
-        )
-
-    probe_git_ops = MagicMock()
-    probe_git_ops.ephemeral_worktree = _ephemeral_worktree
-    with patch.object(verify, 'run_verification', side_effect=_main_side_run):
-        learned = asyncio.run(verify.main_baseline_failing_ids(
-            config, module_configs, probe_git_ops, MAIN_SHA,
-            red_module_prefixes=frozenset(main_ids),
-        ))
+    harness = MainProbeHarness(config, MAIN_SHA, tmp_path / 'learn-main-probe')
+    harness.main_ids.update(main_ids)
+    with harness.patched():
+        learned = harness.baseline(*main_ids)
     assert learned == frozenset().union(*main_ids.values())
 
 
@@ -724,7 +698,7 @@ class TestClassifyFailSafeBranches:
 class TestMainHealthFingerprintWarning:
     """Step-11 (RED): when compute_preexisting_main_break_fingerprint raises,
     _main_health_fingerprint must return '' AND emit a WARNING at
-    'orchestrator.merge_queue'.
+    'orchestrator.merge_lane'.
 
     Before step-12 impl: the except block is silent (no WARNING) → RED.
     After step-12 impl: WARNING is emitted.
@@ -733,14 +707,14 @@ class TestMainHealthFingerprintWarning:
     def test_fingerprint_failure_emits_warning(self, caplog) -> None:
         import logging
 
-        from orchestrator.merge_queue import _main_health_fingerprint
+        from orchestrator.merge_lane.worker import _main_health_fingerprint
 
         with (
             patch(
                 'orchestrator.workflow.compute_preexisting_main_break_fingerprint',
                 side_effect=RuntimeError('fingerprint composition exploded'),
             ),
-            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_lane'),
         ):
             result = _main_health_fingerprint('compile_error', 'some hint', 'abc123')
 
@@ -752,7 +726,7 @@ class TestMainHealthFingerprintWarning:
             r.message for r in caplog.records if r.levelno >= logging.WARNING
         ]
         assert warning_texts, (
-            'Expected a WARNING at orchestrator.merge_queue; got no warnings'
+            'Expected a WARNING at orchestrator.merge_lane.worker; got no warnings'
         )
         assert any(
             'fingerprint' in t.lower() for t in warning_texts
@@ -1601,7 +1575,7 @@ class TestTrivialPassMainRedGate:
 
     def test_a_known_red_blocks_trivial_pass(self, tmp_path: Path) -> None:
         """seed red baseline + trivial pass -> blocked/MAIN_RED, worktree cleaned."""
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             TRIVIAL_PASS_MAIN_RED_REASON_PREFIX,
             MergeFailureDisposition,
         )
@@ -1689,7 +1663,7 @@ class TestTrivialPassMainRedGate:
         self, tmp_path: Path,
     ) -> None:
         """A red known only from one module's probe still blocks a trivial pass."""
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.worker import (
             TRIVIAL_PASS_MAIN_RED_REASON_PREFIX,
             MergeFailureDisposition,
         )

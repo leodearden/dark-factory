@@ -59,11 +59,13 @@ from __future__ import annotations
 import contextlib
 import enum
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
 import toolcall_markup_corpus_extract as extract
+from _schema_outage import assert_reported_once_by_shared_reader, install_schema_outage
 from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 
@@ -879,6 +881,48 @@ class TestB1PartialDrift:
 
         assert payload['matched_pattern'] == _closer('description')
         assert payload['misclose'] == _closer('description')
+
+
+class TestAnUnresolvableSchemaFailsSafe:
+    """The tool catalogue cannot be read: the guard falls back, never guesses."""
+
+    OVERRIDE_CALL = {
+        'title': 'A task',
+        'description': 'A wholly ordinary description.',
+        'metadata': {MARKUP_OVERRIDE_KEY: True},
+    }
+
+    async def test_the_override_takes_the_drop_branch(self):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        install_schema_outage(h.mcp)
+
+        await h.call('submit_task', self.OVERRIDE_CALL)
+
+        assert h.recorder.args['metadata'] is None
+
+    @BOTH_POLICIES
+    async def test_a_repairable_leak_is_refused_rather_than_repaired(self, policy):
+        h = build_harness(policy)
+        install_schema_outage(h.mcp)
+
+        with pytest.raises(ToolError) as excinfo:
+            await h.call(
+                'submit_task',
+                {'title': 'A task', 'description': TestB1PartialDrift.DESCRIPTION},
+            )
+
+        assert _reject_payload(excinfo)['outcome'] == 'unrepairable'
+        assert h.recorder.calls == []
+        assert [f['outcome'] for f in h.facts] == ['unrepairable']
+
+    async def test_the_failure_is_reported_once_by_the_shared_reader(self, caplog):
+        h = build_harness(RepairPolicy.REJECT_WITH_REPAIR)
+        install_schema_outage(h.mcp)
+
+        with caplog.at_level(logging.WARNING):
+            await h.call('submit_task', self.OVERRIDE_CALL)
+
+        assert_reported_once_by_shared_reader(caplog.records)
 
 
 class TestB2TotalDrift:

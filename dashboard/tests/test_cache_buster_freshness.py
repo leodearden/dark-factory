@@ -25,7 +25,7 @@ The split exists because on any healthy branch `merge-base(main, HEAD)` is
 main's tip and no redux asset is modified, so a base-relative rule is
 VACUOUSLY green against the real repo.  A genuine RED for this guard can only
 be constructed, never observed here — the same shape `test_jsx_source_helpers.py`
-uses to pin `_dashboard_helpers` against synthetic sources.
+uses to pin `_jsx_source_helpers` against synthetic sources.
 """
 
 from __future__ import annotations
@@ -516,7 +516,7 @@ class TestResolveReduxBaseStateWhenNoBaseRefResolves:
 # retirement observable rather than merely asserted.
 _REQUIRED_ASSETS = (
     'graph_layout.js',
-    'prd_grouping.js',
+    'prd_lanes_view.js',
     'runtime_format.js',
     'orch_filter.js',
     'esc_flow_layout.js',

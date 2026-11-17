@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from orchestrator import decision_registry as dr
 from orchestrator import session_registry as sr
 
 
@@ -38,7 +39,7 @@ def _make_decision(**overrides):
         'filed_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.DecisionRecord(**fields)
+    return dr.DecisionRecord(**fields)
 
 
 class TestMergeWeightEdits:
@@ -158,7 +159,7 @@ class TestKnownProjectsOffersCanonicalNamesOnly:
     as the reason it stopped short of this work.
 
     The fold is applied to all three input channels locally and is
-    deliberately redundant with the upstream folds: normalize_project_token
+    deliberately redundant with the upstream folds: fold_project_token
     is idempotent, so it costs nothing, and it makes the guarantee LOCAL to
     the picker rather than contingent on three remote callers (CockpitApp's
     scanner is a DI seam -- a fake or future scanner can hand this function

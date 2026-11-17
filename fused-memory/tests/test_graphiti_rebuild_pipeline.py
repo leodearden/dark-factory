@@ -21,10 +21,12 @@ from fused_memory.backends.graphiti_client import (
     EdgeDict,
     GraphitiBackend,
     ReadCompleteness,
+    StaleProbeResult,
     StaleSummaryResult,
 )
 
-#: The logger the service hands detect_stale_with_edges for the policy warning.
+#: The logger the service hands both stale probes, detect_stale_with_edges and
+#: detect_stale_dry_run, for the policy warning.
 _SERVICE_LOG = logging.getLogger('fused_memory.services.memory_service')
 
 
@@ -527,14 +529,16 @@ class TestRebuildEntitySummariesDataFlow:
         """force=False, dry_run=True: total_entities flows from the cheap dry_run probe.
 
         The force=False dry_run=True path routes through detect_stale_dry_run
-        (not detect_stale_with_edges). The probe returns a plain (stale_list, total_count)
-        tuple; total_entities in the final result must still come from total_count,
-        not from len(stale_list).
+        (not detect_stale_with_edges). The probe returns a StaleProbeResult;
+        total_entities in the final result must still come from its total_count,
+        not from len(stale).
         """
         svc = _make_svc(mock_config)
         stale_list = make_stale_list(alice_summary='old A', bob_summary='old B')
-        # Mock detect_stale_dry_run: returns (stale_list, total_count)
-        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=(stale_list, 7))
+        # Mock detect_stale_dry_run: total_count deliberately differs from len(stale)
+        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=StaleProbeResult(
+            stale=stale_list, total_count=7, entities_completeness=COMPLETE_READ,
+        ))
 
         result = await svc.rebuild_entity_summaries(project_id='test', force=False, dry_run=True)
 
@@ -552,7 +556,9 @@ class TestRebuildEntitySummariesDataFlow:
         the rebuild loop that would consume the edge map.
         """
         svc = _make_svc(mock_config)
-        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=([], 1))
+        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=StaleProbeResult(
+            stale=[], total_count=1, entities_completeness=COMPLETE_READ,
+        ))
         svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({}, complete_paged_read()))
 
         await svc.rebuild_entity_summaries(project_id='test', force=False, dry_run=True)
@@ -601,14 +607,18 @@ class TestRebuildEntitySummariesDataFlow:
         """
         svc = _make_svc(mock_config)
         stale_list = make_stale_list(alice_summary='some summary 1', bob_summary='some summary 2')
-        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=(stale_list, 2))
+        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=StaleProbeResult(
+            stale=stale_list, total_count=2, entities_completeness=COMPLETE_READ,
+        ))
         svc.graphiti.detect_stale_with_edges = AsyncMock()
         svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({}, complete_paged_read()))
 
         result = await svc.rebuild_entity_summaries(project_id='test', force=False, dry_run=True)
 
         # Service dispatches to detect_stale_dry_run for force=False+dry_run=True
-        svc.graphiti.detect_stale_dry_run.assert_awaited_once_with(group_id='test')
+        svc.graphiti.detect_stale_dry_run.assert_awaited_once_with(
+            group_id='test', log=_SERVICE_LOG
+        )
         svc.graphiti.detect_stale_with_edges.assert_not_awaited()
         # Bulk edge fetch must NOT be issued
         svc.graphiti.enumerate_all_valid_edges.assert_not_awaited()

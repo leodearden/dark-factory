@@ -18,12 +18,14 @@ violating one. A helper that only ever passes is indistinguishable from a
 helper that does nothing.
 
 Everything under test here is driven by SYNTHETIC fixtures — string literals
-and synthetic ``AgentRole`` mappings — never by a real prompt constant from
-``roles.py``, except ``GREP_LOOKAROUND_GUIDANCE``, imported only as the opaque
-landmark the preamble-tail order check anchors on and never asserted on. This
-file tests the HELPER; whether the real prompts satisfy the contract is the
-consumer modules' job, and duplicating that here would recreate the very clone
-this task is closing.
+and synthetic ``AgentRole`` mappings — never by a real prompt constant, except
+``GREP_LOOKAROUND_GUIDANCE`` from ``harness_guidance.py``, imported only as the
+opaque landmark the preamble-tail order check anchors on and never asserted on. One
+test also reads the real ``ROLES``, through ``UNPINNED_ROLES``: that derived set is
+the helper's own export, so it is pinned non-empty once here and no consumer
+re-asserts it. This file tests the HELPER; whether the real prompts satisfy the
+contract is the consumer modules' job, and duplicating that here would recreate
+the very clone this task is closing.
 """
 
 from __future__ import annotations
@@ -35,17 +37,20 @@ import pytest
 from _role_splice_contract import (
     BASH_CAPABLE_UNPINNED_ROLES,
     MARKDOWN_HEADING,
+    UNPINNED_ROLES,
     PreambleTailBlock,
     PreambleTailContractTests,
     SpliceContract,
     assert_brace_free,
     assert_nonempty,
+    assert_opens_own_section,
     bash_capable_unpinned,
     bash_capable_unpinned_contract,
 )
 from shared.prompt_artifact import PromptSpec
 
-from orchestrator.agents.roles import GREP_LOOKAROUND_GUIDANCE, ROLES, AgentRole
+from orchestrator.agents.harness_guidance import GREP_LOOKAROUND_GUIDANCE
+from orchestrator.agents.roles import ROLES, AgentRole
 
 # Synthetic remedy prose. The helper must render the caller's remedy into every
 # failure message: the consumers' remediation sentences ARE the diagnostic value
@@ -98,6 +103,36 @@ def test_assert_brace_free_fires_for_a_literal_brace(value: str) -> None:
     """
     with pytest.raises(AssertionError) as excinfo:
         assert_brace_free('SOME_CONSTANT', value, remedy=_REMEDY)
+
+    message = str(excinfo.value)
+    assert 'SOME_CONSTANT' in message
+    assert _REMEDY in message
+
+
+def test_assert_opens_own_section_passes_for_a_value_opening_its_own_section() -> None:
+    """A conforming value returns None, so the helper is not unconditionally loud."""
+    assert assert_opens_own_section('SOME_CONSTANT', _SPLICE, remedy=_REMEDY) is None
+
+
+@pytest.mark.parametrize(
+    'value',
+    [
+        'A paragraph with no heading at all.\n',
+        '## Heading\n\nBody.\n',
+        '\n### Sub-heading\n\nBody.\n',
+        'A lead-in paragraph.\n## Heading\n\nBody.\n',
+    ],
+    ids=['unheaded', 'heading-without-leading-newline', 'level-three-heading', 'heading-not-first'],
+)
+def test_assert_opens_own_section_fires_for_a_value_without_its_own_heading(value: str) -> None:
+    """Each case is a distinct way a block fails to own its section.
+
+    The near misses rule out looser checks: ``lstrip().startswith('## ')`` would
+    pass a heading with no leading newline, ``startswith('\\n##')`` a ``###``
+    sub-heading, and ``MARKDOWN_HEADING in value`` a heading that is not first.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        assert_opens_own_section('SOME_CONSTANT', value, remedy=_REMEDY)
 
     message = str(excinfo.value)
     assert 'SOME_CONSTANT' in message
@@ -325,6 +360,20 @@ def test_bash_capable_unpinned_contract_fires_when_a_role_gains_bash() -> None:
     assert "gained=['gamma']" in message
     assert 'BASH_CAPABLE_UNPINNED_ROLES' in message
     assert _REMEDY in message
+
+
+def test_unpinned_role_set_is_nonempty() -> None:
+    """No consumer splice test over `UNPINNED_ROLES` can pass vacuously over an emptied derivation.
+
+    `READ_ONLY_UNPINNED_ROLES` is deliberately not required non-empty: it
+    empties legitimately if `judge` ever gains unqualified `Bash`, and
+    test_roles_grep_lookaround.py's own tripwire fires for that change.
+    """
+    assert UNPINNED_ROLES, (
+        'No role has a literal system_prompt, so every consumer splice test over '
+        'UNPINNED_ROLES passes over an empty set. Check the `prompt_spec is None` '
+        'derivation in _role_splice_contract.py.'
+    )
 
 
 def test_every_role_carries_passes_when_the_whole_set_carries_the_constant() -> None:

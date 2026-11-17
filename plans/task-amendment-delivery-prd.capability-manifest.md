@@ -139,17 +139,19 @@ stamps every rebase-orphaned step onto the WIP tip.
 | `duplicate-done-step-shas-refused` | capability→producer (built by β). D6's cheap companion assertion; closes the hole where a set-based check is gamed by duplicating a sha. Covered by η's §10 row 10. | PASS |
 | `beta-refusal-routes-through-the-existing-bounded-hold` | INV-6/INV-7 via D13 — `_handle_no_plan_failure` (4 call sites) + `RetryLedger.consecutive_no_plan_failures`, escalating to a human at ≥2. **manual** — reuse of an existing path emits no new symbol; a `present` grep on `_handle_no_plan_failure` is vacuously green at 4 hits. | PASS |
 
-## γ — Converse merge gate at submission: branch commits ⊆ owned ∪ descoped
+## γ — Disposition gate at submission: no orphan/revert-descoped commit lands
 
-**Consumer:** η + the operator-visible merge-submission refusal naming the offending sha.
+*Rescoped 2026-11-01 (PRD D14, Leo's ruling on esc-4033-2). The original predicate was "branch commits ⊆ owned ∪ descoped". It would have refused at least 43% of real merges, because `amend:`, gate-fix and debugger commits have no owning step by design.*
+
+**Consumer:** η + the operator-visible merge-submission refusal naming the offending `(step_id, commit, disposition)`.
 **Prereq:** β (γ's `DESCOPED` set is β's `_descoped_steps`).
 
 | Capability | Evidence binding | Verdict |
 |---|---|---|
-| `gate-reads-the-descope-record` | capability→producer, DAG-direction: producer is **β, upstream**. Scoped to `merge_gates.py` so β's own `workflow.py` landing cannot vacuously green it. | PASS |
-| `commit-ownership-gate-at-the-sibling-gate-site` | capability→producer (wired). D9: `_check_plan_files_touched_in_branch` (`merge_gates.py:1333`) already runs inside `_submit_to_merge_queue` (`workflow.py:10090`) **before** `register_and_enqueue_merge_request`, with an in-place remedy-and-recheck precedent at `:10108`. γ goes at the same site. | PASS |
+| `gate-reads-the-descope-record` | capability→producer, DAG-direction: producer is **β, upstream**. Scoped to `merge_lane/gates.py` so β's own `workflow.py` landing cannot vacuously green it. Pattern `_descoped_steps\|DESCOPED_STEPS_KEY` (the SPOT spelling, added 2026-11-01). | PASS |
+| `disposition-gate-at-the-sibling-gate-site` | capability→producer (wired). D9: `orchestrator/src/orchestrator/merge_lane/gates.py::_check_plan_files_touched_in_branch` already runs inside `TaskWorkflow._submit_to_merge_queue` **before** `register_and_enqueue_merge_request`, with an in-place remedy-and-recheck precedent (`TaskWorkflow._try_narrow_plan`). γ goes at the same site. The grep is a five-way disjunction over descope-check namings, 0 hits in `merge_lane/gates.py` on 2026-11-01. | PASS |
 | `fail-open-branch-carries-a-storm-escape` | **G7 redesign (INV-4)** — the sibling convention is loud-log-only, no counter. **manual**: the counter's channel is not fixed by the PRD, and the sibling gates' own remedy is out of γ's scope. Pinned by γ's task text as a required conjunct. | PASS |
-| `commit-walk-is-loop-safe-and-bounded` | INV-8 / C6 — async runner (`git_ops._run`, `git_ops.py:1726`), loop-invariant probes hoisted, fan-out bounded by the branch's commit count. **manual**: `subprocess.run` already has **0** occurrences in `merge_gates.py`, so an `expect: absent` check would be vacuously green rather than a measurement. | PASS |
+| `commit-walk-is-loop-safe-and-bounded` | INV-8 / C6 — async runner (`orchestrator/src/orchestrator/git_ops.py::_run`), loop-invariant probes hoisted, fan-out bounded by \|CHECKED\| and the branch's commit count. **manual**: `subprocess.run` already has **0** occurrences in `merge_gates.py`, so an `expect: absent` check would be vacuously green rather than a measurement. | PASS |
 
 ## δ — Write-boundary amendment advisory + event
 
@@ -199,7 +201,7 @@ depends on η).
 
 | Capability | Evidence binding | Verdict |
 |---|---|---|
-| `orchestrator-side-boundary-rows-exercised` | capability→producer: rows 1–12 (fingerprint trigger, mid-EXECUTE non-refresh, whitespace-vs-case, descope accept/refuse, 2971 + 3143 replays, duplicate-sha, γ's two ride-along rows) are all delivered by α/β/γ, upstream. *Test-anchored by construction* — η's deliverable **is** tests. | PASS |
+| `orchestrator-side-boundary-rows-exercised` | capability→producer: rows 1–12 (fingerprint trigger, mid-EXECUTE non-refresh, whitespace-vs-case, descope accept/refuse, 2971 + 3143 replays, duplicate-sha, γ's two disposition rows) are all delivered by α/β/γ, upstream. *Test-anchored by construction* — η's deliverable **is** tests. | PASS |
 | `fused-memory-side-boundary-rows-exercised` | capability→producer: rows 13–16 (advisory returned, `task_text_amended` emitted, δ does no filesystem/git I/O, the two combine-refusal rows) delivered by δ/ε, upstream. | PASS |
 | `mid-execute-non-refresh-and-loop-safety-pinned` | the two rows the rest of the design silently depends on: row 3 (a mid-EXECUTE amendment must not self-clear via the per-iteration provenance re-stamp — the same shape that overwrote 2971's manual `_rescoped_at`) and row 14 (INV-8). **manual** — both are *negative* properties spread across α's and δ's production shapes; the positive anchors above already prove the test modules exist. | PASS |
 

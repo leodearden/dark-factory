@@ -190,6 +190,13 @@ title + `files` copy is refused with `DuplicateCandidateKeyError` (esc-4866-5).
 `recurrence.key`: every chain resolves to exactly one of
 `scheduled | overdue | paused | broken | ended`, and the endpoint enumerates all of them with
 `measured_at`. `broken` and `overdue` are the alarm-shaped states.
+*(Amended, task 8335.)* A link's fire time is its scheduled fire time: `milestone.at` until a
+predicate re-arm (`plans/completion-driven-triggers-prd.md` C1) advances `at` to the next
+check, and from then on `milestone.scheduled_fire_at`, which the first re-arm stamps and no later
+one moves. The C-3 run-label strip and the C-4 gauge both read it through
+`shared/src/shared/milestone_rearm.py::scheduled_fire_at`, so a re-armed link's successor
+carries exactly one run label, and a link still re-arming past its scheduled fire time plus
+grace reads `overdue`.
 
 **C-5 (category).** Every escalation a carrier's deterministic run files carries
 `category='milestone_check_failed'`, on both the predicate-failure and timeout legs.
@@ -297,6 +304,12 @@ path; the gauge computation is per-root, ms-scale, in the dashboard.
 
 1. **Overdue grace window size** (how far past `at` before `overdue`). Suggested: one full
    `interval_secs`, capped at 24h. Decide during r4.
+   **Resolved in r4 (task 4679):** grace = min(interval_secs, 24h); the 24h cap when the
+   link's recurrence does not validate. A current link that is neither blocked nor terminal
+   (in-progress, deferred, infra-hold, …) is read by its fire time like pending; one whose
+   dated `at` cannot be read is overdue, because the scheduler withholds a malformed
+   milestone indefinitely. Served by
+   `dashboard/src/dashboard/data/recurrence_gauge.py::chain_state`.
 2. **Whether the minted successor copies `metadata.files`** (lock-set inheritance).
    **Resolved in r2 (task 4866): yes, verbatim** — same job, same locks.
 3. **Seed cadences for r6's two chains.** Suggested: 24h both, matching their documented timer

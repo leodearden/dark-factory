@@ -9,6 +9,7 @@ shared/tests/test_invocation_outcome.py::TestParseResetsAt.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -1450,23 +1451,6 @@ class TestInvokeSlot:
         assert gate._accounts[0].probe_in_flight is False
 
 
-class TestReExportShimParity:
-    """`orchestrator.usage_gate` is a pure re-export shim over `shared.usage_gate`.
-
-    Task 4512. The shim (orchestrator/src/orchestrator/usage_gate.py) is a
-    `from shared.usage_gate import *` plus an explicit tuple of names — and the
-    star import only reaches what `shared.usage_gate.__all__` lists. A new
-    public name added to `shared` therefore does NOT automatically reach an
-    `orchestrator.usage_gate` importer unless `__all__` and this shim stay in
-    step. Pinning identity (not merely presence) also rules out the failure
-    where the shim grows its own divergent copy of the class: two distinct
-    `ProbeSpawnError` types would make `except ProbeSpawnError` silently miss
-    the one actually raised, restoring the swallow this task removes.
-    """
-
-    def test_probe_spawn_error_is_the_same_object_through_the_shim(self):
-        import shared.usage_gate as shared_usage_gate
-
-        import orchestrator.usage_gate as orch_usage_gate
-
-        assert orch_usage_gate.ProbeSpawnError is shared_usage_gate.ProbeSpawnError
+def test_orchestrator_usage_gate_shim_is_gone() -> None:
+    """Task 6641: shared.usage_gate is the only import path; do not restore the orchestrator re-export shim."""
+    assert importlib.util.find_spec('orchestrator.usage_gate') is None

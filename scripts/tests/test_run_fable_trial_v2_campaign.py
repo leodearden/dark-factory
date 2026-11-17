@@ -25,6 +25,9 @@ from pathlib import Path
 
 import pytest
 import run_fable_trial_v2_campaign as mod
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _PRE_SIGMA = (mod.MARKER_KEY,)
 """``drop_metrics`` argument for a cell that PREDATES eval-revival σ (task 3628).
@@ -40,9 +43,13 @@ inheriting it from the dataclass not yet having the field.
 """
 
 
+_CAP_HIT_RECORDS = [{'stage': 'architect', 'cause': 'cap_hit', 'reason': ''}]
+"""``invocation_errors`` of an architect cell refused by a cap hit."""
+
+
 def _cell(
     task_id, config_name, *, trial=1, plan_quality=None, plan_steps=0,
-    role_under_test='architect', cap_tainted=False, invocation_error=None,
+    role_under_test='architect', cap_tainted=False, invocation_errors=None,
     cost_usd=0.0, judge_cost_usd=0.0, extra_metrics=None, drop_metrics=(),
 ):
     """Build a synthetic ``EvalResult`` with a production-shaped metrics dict.
@@ -59,17 +66,19 @@ def _cell(
     that needs the pre-σ shape must therefore ask for it with
     ``drop_metrics=_PRE_SIGMA``. Do not pass the same key in both.
     """
-    from orchestrator.evals.metrics import EvalMetrics
+    from orchestrator.evals.metrics import EvalMetrics, RoleUnderTest
     from orchestrator.evals.results import EvalResult
 
     m = EvalMetrics(
         plan_quality=plan_quality,
-        role_under_test=role_under_test,
+        role_under_test=(
+            RoleUnderTest(role_under_test) if role_under_test is not None else None
+        ),
         plan_steps=plan_steps,
         cost_usd=cost_usd,
         judge_cost_usd=judge_cost_usd,
         cap_tainted=cap_tainted,
-        invocation_error=invocation_error,
+        invocation_errors=invocation_errors,
     )
     metrics = {**m.to_dict(), **(extra_metrics or {})}
     for key in drop_metrics:
@@ -94,7 +103,7 @@ def _mixed_results():
     return [
         # A: one transport refusal (never got to ask the model) + two scored cells.
         _cell('f1', 'architect-opus-max', cap_tainted=True,
-              invocation_error='architect: cap_hit', drop_metrics=_PRE_SIGMA),
+              invocation_errors=_CAP_HIT_RECORDS, drop_metrics=_PRE_SIGMA),
         _cell('f2', 'architect-opus-max', plan_quality=0.80, plan_steps=6,
               drop_metrics=_PRE_SIGMA),
         _cell('f3', 'architect-opus-max', plan_quality=0.60, plan_steps=4,
@@ -365,12 +374,13 @@ def test_summary_rows_match_the_report_layer_field_for_field():
 
     ``cap_excluded`` / ``no_plan`` / ``plan_rate`` / ``mean_plan_quality`` are
     the report layer's per-config accumulator (tasks 3118/3302/3379), built on
-    the SHARED ``_plan_rate`` and ``_mean_plan_quality`` reductions precisely so
-    two adjacent surfaces cannot give contradictory answers about the same
-    quantity. Re-deriving any of them in this driver would create exactly that
-    second surface. This test pins the equality field for field.
+    the SHARED ``cell_admission.plan_rate`` and
+    ``cell_admission.mean_plan_quality`` reductions precisely so two adjacent
+    surfaces cannot give contradictory answers about the same quantity.
+    Re-deriving any of them in this driver would create exactly that second
+    surface. This test pins the equality field for field.
     """
-    from orchestrator.evals.report import build_plan_quality_report
+    from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
     results = _mixed_results()
     rows = mod.summarize_candidates(results)
@@ -409,9 +419,9 @@ def test_no_scored_cells_reports_none_not_zero():
     """A candidate whose every cell was cap-tainted reports n=0, mean=None."""
     results = [
         _cell('f1', 'architect-opus-max', cap_tainted=True,
-              invocation_error='architect: cap_hit'),
+              invocation_errors=_CAP_HIT_RECORDS),
         _cell('f2', 'architect-opus-max', cap_tainted=True,
-              invocation_error='architect: cap_hit'),
+              invocation_errors=_CAP_HIT_RECORDS),
     ]
 
     row = mod.summarize_candidates(results)[0]
@@ -478,12 +488,15 @@ def test_marker_present_counts_per_candidate():
 
 
 def test_only_architect_cells_are_counted():
-    """An implementer cell carrying the marker is ignored, even under the same config.
+    """An implementer or end_to_end cell carrying the marker is ignored, even under the same config.
 
-    An implementer run never invokes the plan judge, so it cannot have been
-    judged without a reference; counting it would inflate the very number that
-    bounds how far ``plan_quality`` may be trusted.
+    Neither run invokes the plan judge, so it cannot have been judged without a
+    reference; counting it would inflate the very number that bounds how far
+    ``plan_quality`` may be trusted. An enum-valued architect cell counts like a
+    string-valued one.
     """
+    from orchestrator.evals.metrics import RoleUnderTest
+
     results = [
         _cell('f1', 'A', plan_quality=0.8, plan_steps=5,
               extra_metrics={'judged_without_reference': False}),
@@ -491,11 +504,15 @@ def test_only_architect_cells_are_counted():
               extra_metrics={'judged_without_reference': False}),
         _cell('f3', 'A', role_under_test='implementer',
               extra_metrics={'judged_without_reference': True}),
+        _cell('f4', 'A', role_under_test=RoleUnderTest.ARCHITECT, plan_quality=0.8,
+              plan_steps=5, extra_metrics={'judged_without_reference': True}),
+        _cell('f5', 'A', role_under_test=RoleUnderTest.END_TO_END,
+              extra_metrics={'judged_without_reference': True}),
     ]
 
     rows = {r['config_name']: r for r in mod.summarize_candidates(results)}
 
-    assert {name: row[mod.MARKER_KEY] for name, row in rows.items()} == {'A': 0}
+    assert {name: row[mod.MARKER_KEY] for name, row in rows.items()} == {'A': 1}
 
 
 def test_rendered_table_marks_unmeasured_loudly():
@@ -567,7 +584,7 @@ def test_cap_tainted_cell_bands_unmeasured():
     session-cap window — a property of the schedule, not of the candidate.
     """
     m = _metrics(plan_steps=5, plan_quality=0.95, cap_tainted=True,
-                 invocation_error='architect: cap_hit',
+                 invocation_errors=_CAP_HIT_RECORDS,
                  extra_metrics={'judged_without_reference': False})
 
     assert mod.band_for_cell(m, 0.80) == 'unmeasured'
@@ -602,7 +619,7 @@ def test_partition_is_exact():
         _cell('f3', 'A', plan_steps=0, plan_quality=0.0,
               extra_metrics={'judged_without_reference': False}),
         # unmeasured: cap-tainted.
-        _cell('f4', 'A', cap_tainted=True, invocation_error='architect: cap_hit',
+        _cell('f4', 'A', cap_tainted=True, invocation_errors=_CAP_HIT_RECORDS,
               extra_metrics={'judged_without_reference': False}),
     ]
 
@@ -801,7 +818,7 @@ _BAND_CELL_KWARGS = {
     'declined': dict(plan_steps=0, plan_quality=0.0,
                      extra_metrics={'judged_without_reference': False,
                                     'terminal_kind': 'false_premise'}),
-    'unmeasured': dict(cap_tainted=True, invocation_error='architect: cap_hit',
+    'unmeasured': dict(cap_tainted=True, invocation_errors=_CAP_HIT_RECORDS,
                        extra_metrics={'judged_without_reference': False,
                                       'terminal_kind': 'none'}),
 }
@@ -1336,14 +1353,14 @@ def test_uniform_corpora_are_unchanged():
 # recipe re-runs cap-tainted fixtures, so a post-σ re-run writes keyed cells
 # beside older keyless ones. Two operator-facing surfaces, built inside one
 # function from one input, contradicting each other about one quantity is exactly
-# what ``report.py``:334-340 and ``metrics.py`` assert three times over must not
-# happen — "two consumers of one field must not answer the same question
-# differently".
+# what ``cell_admission.py::judged_without_reference`` and ``metrics.py`` assert
+# three times over must not happen — "two consumers of one field must not answer
+# the same question differently".
 
 
 def _report_entries(results):
     """The report layer's per-config accumulator, keyed by ``config_name``."""
-    from orchestrator.evals.report import build_plan_quality_report
+    from orchestrator.evals.plan_quality_report import build_plan_quality_report
 
     return {c['config_name']: c for c in build_plan_quality_report(results)['configs']}
 
@@ -1366,7 +1383,7 @@ def _cap_tainted_keyless_corpus():
         _cell('f2', 'A', plan_quality=0.6, plan_steps=5,
               extra_metrics={mod.MARKER_KEY: False}),
         _cell('f3', 'A', plan_steps=5, cap_tainted=True,
-              invocation_error='architect: cap_hit', drop_metrics=_PRE_SIGMA),
+              invocation_errors=_CAP_HIT_RECORDS, drop_metrics=_PRE_SIGMA),
     ]
 
 
@@ -1455,7 +1472,7 @@ def test_an_empty_admitted_pool_answers_zero_on_both_surfaces():
     """
     results = [
         _cell('f1', 'A', plan_steps=5, cap_tainted=True,
-              invocation_error='architect: cap_hit',
+              invocation_errors=_CAP_HIT_RECORDS,
               extra_metrics={mod.MARKER_KEY: False}),
     ]
 

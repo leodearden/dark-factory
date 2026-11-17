@@ -1,0 +1,22 @@
+[Unit]
+Description=Nightly INV-12 owner sweep: every cited debt owner is still alive (task 5608)
+Documentation=file:///home/leo/src/dark-factory/scripts/exception_owner_sweep.py
+Documentation=file:///home/leo/src/dark-factory/plans/inv12-exceptions-owned-or-ratified-prd.md
+Documentation=file:///home/leo/src/dark-factory/OPERATIONS.md
+
+[Service]
+Type=oneshot
+# All logic lives in the committed wrapper, which always exits 0: a recurring
+# oneshot that fails stays failed and silently stops the timer. The sweep's
+# stamp, read by exception_register.py --report, carries its outcome instead.
+WorkingDirectory=/home/leo/src/dark-factory
+# The wrapper runs `uv`, which the user manager's minimal PATH does not reach
+# on a boot catch-up run. The fleet's one spelling, copied verbatim from
+# scripts/fused-memory-flag-marker-sweep.service.
+Environment=PATH=/home/leo/.cargo/bin:/home/leo/.local/npm-global/bin:/usr/local/cuda-12.6/bin:/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+ExecStart=/home/leo/src/dark-factory/scripts/exception-owner-sweep.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=timers.target

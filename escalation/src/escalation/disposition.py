@@ -99,6 +99,7 @@ class StatusInfo:
 @dataclass(frozen=True)
 class ConvertViaCurator:
     payload: CuratorCandidate
+    resolution_class: ClassVar[str] = 'converted'
 
 
 @dataclass(frozen=True)

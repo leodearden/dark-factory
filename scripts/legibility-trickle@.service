@@ -26,6 +26,9 @@ Environment=PATH=/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/b
 # next: OPERATIONS.md §"Legibility trickle accounts (03:00)". Optional ("-"):
 # a missing .env must not stop the unit starting -- build_pool loads it itself
 # and turns an empty pool into a recorded deferral (task 5635).
+# It also supplies OPENAI_API_KEY, which the census this unit launches needs
+# for its similarity stage (scripts/legibility/embeddings.py::openai_embed);
+# without it that stage is skipped and escalated, not the run.
 EnvironmentFile=-/home/leo/src/dark-factory/.env
 # Load-bearing: the CLI prefers an API key over the OAuth token, and the .env
 # above defines one.

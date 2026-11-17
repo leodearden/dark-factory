@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 
+from orchestrator import decision_registry as dr
 from orchestrator import session_registry as sr
 
 
@@ -53,7 +54,7 @@ def _make_decision(**overrides):
         'filed_at': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.DecisionRecord(**fields)
+    return dr.DecisionRecord(**fields)
 
 
 class TestScanSessions:
@@ -339,7 +340,7 @@ class TestProjectTokenCanonicalization:
     once, in registry_reader's module docstring.
 
     What these tests pin is the MECHANISM: every scanned record's .project
-    goes through session_registry.normalize_project_token (task 3807's one
+    goes through shared.project_id.fold_project_token (task 3807's one
     canonical fold) inside _read_record_soft -- the single parse step shared
     by scan_sessions and SessionScanner.scan -- so both scan paths, and the
     mtime cache behind SessionScanner, yield one bucket by construction.
@@ -411,7 +412,7 @@ class TestProjectTokenCanonicalization:
 
     def test_synthetic_and_basename_tail_tokens_stay_distinct(self, tmp_path):
         """Collapse guard, mirroring
-        test_normalize_project_token_does_not_merge_solar_challenge_platform:
+        shared/tests/test_project_id.py::TestFoldProjectToken::test_never_merges_two_projects_sharing_a_prefix:
         the fold merges SPELLINGS, never distinct projects. The registry's
         long tail of synthetic tokens (fm-neutral-classifier-cwd-*,
         _lane-<n>, run-<hex>, bare task ids) and cwd-basename tokens ('tmp',
@@ -503,7 +504,7 @@ class TestScanDecisions:
         from cockpit.registry_reader import scan_decisions
 
         for i, project in enumerate(('dark-factory', 'df', 'dark_factory')):
-            assert sr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
+            assert dr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
 
         result = scan_decisions(tmp_path)
 
@@ -520,13 +521,13 @@ class TestScanDecisions:
             project='DARK-Factory',
             text='Which port?',
             filed_at='2026-07-07T00:00:00+00:00',
-            state=sr.DecisionState.OPEN,
+            state=dr.DecisionState.OPEN,
             manual_boost=3,
             task_id='2085',
             escalation_id='esc-2085-1',
             severity='blocking',
         )
-        assert sr.write_decision(written, root=tmp_path)
+        assert dr.write_decision(written, root=tmp_path)
 
         (scanned,) = scan_decisions(tmp_path)
 
@@ -557,10 +558,10 @@ class TestScanDecisions:
         from cockpit.registry_reader import scan_decisions
 
         for i, project in enumerate(('dark-factory', 'df', 'dark_factory', 'other-project')):
-            assert sr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
+            assert dr.write_decision(_make_decision(id=f'dec-{i}', project=project), root=tmp_path)
 
         result = scan_decisions(tmp_path)
-        expected = sr.list_decisions(tmp_path)
+        expected = dr.list_decisions(tmp_path)
 
         assert [d.id for d in result] == [d.id for d in expected]
 

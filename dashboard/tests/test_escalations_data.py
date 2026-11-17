@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -42,257 +41,6 @@ def _write_esc(directory: Path, filename: str, data: dict) -> Path:
     path = directory / filename
     path.write_text(json.dumps(data))
     return path
-
-
-# ---------------------------------------------------------------------------
-# Tests for load_queue_escalations
-# ---------------------------------------------------------------------------
-
-class TestLoadQueueEscalations:
-    """Tests for load_queue_escalations(esc_dir: Path) -> list[dict]."""
-
-    def test_missing_directory_returns_empty(self, tmp_path):
-        from dashboard.data.escalations import load_queue_escalations
-
-        result = load_queue_escalations(tmp_path / 'nonexistent')
-        assert result == []
-
-    def test_non_directory_path_returns_empty(self, tmp_path):
-        """A file (not a directory) at the given path returns []."""
-        from dashboard.data.escalations import load_queue_escalations
-
-        fake_dir = tmp_path / 'not_a_dir.json'
-        fake_dir.write_text('{}')
-
-        result = load_queue_escalations(fake_dir)
-        assert result == []
-
-    def test_empty_directory_returns_empty(self, tmp_path):
-        from dashboard.data.escalations import load_queue_escalations
-
-        esc_dir = tmp_path / 'escalations'
-        esc_dir.mkdir()
-
-        result = load_queue_escalations(esc_dir)
-        assert result == []
-
-    def test_root_level_json_files_are_loaded(self, tmp_path):
-        """*.json files at the root of esc_dir are returned as dicts."""
-        from dashboard.data.escalations import load_queue_escalations
-
-        esc_dir = tmp_path / 'escalations'
-        esc_dir.mkdir()
-
-        esc1 = _esc('esc-1-1', task_id='1', level=0, status='pending')
-        esc2 = _esc('esc-2-1', task_id='2', level=1, status='resolved')
-        _write_esc(esc_dir, 'esc-1-1.json', esc1)
-        _write_esc(esc_dir, 'esc-2-1.json', esc2)
-
-        result = load_queue_escalations(esc_dir)
-        assert len(result) == 2
-        result_ids = {r['id'] for r in result}
-        assert result_ids == {'esc-1-1', 'esc-2-1'}
-
-    def test_archive_subdir_files_are_excluded(self, tmp_path):
-        """Files in archive/YYYY-MM-DD/ subdirs are NOT included (root-only glob)."""
-        from dashboard.data.escalations import load_queue_escalations
-
-        esc_dir = tmp_path / 'escalations'
-        esc_dir.mkdir()
-
-        # Root-level file — should be included
-        esc_root = _esc('esc-root-1', task_id='10')
-        _write_esc(esc_dir, 'esc-root-1.json', esc_root)
-
-        # Archive subtree — must NOT be included
-        archive_day = esc_dir / 'archive' / '2026-05-27'
-        archive_day.mkdir(parents=True)
-        esc_archived = _esc('esc-archived-1', task_id='20')
-        _write_esc(archive_day, 'esc-archived-1.json', esc_archived)
-
-        result = load_queue_escalations(esc_dir)
-        ids = {r['id'] for r in result}
-        assert 'esc-root-1' in ids
-        assert 'esc-archived-1' not in ids
-
-    def test_malformed_json_is_skipped_and_warning_emitted(self, tmp_path, caplog):
-        """A file with bad JSON is skipped; valid files are still returned.
-
-        Verifies that logger.warning is called for the bad file.
-        """
-        from dashboard.data.escalations import load_queue_escalations
-
-        esc_dir = tmp_path / 'escalations'
-        esc_dir.mkdir()
-
-        # Valid file
-        esc_valid = _esc('esc-good-1', task_id='1')
-        _write_esc(esc_dir, 'esc-good-1.json', esc_valid)
-
-        # Malformed JSON
-        (esc_dir / 'esc-bad-1.json').write_text('this is not json {{{')
-
-        with caplog.at_level(logging.WARNING, logger='dashboard.data.escalations'):
-            result = load_queue_escalations(esc_dir)
-
-        assert len(result) == 1
-        assert result[0]['id'] == 'esc-good-1'
-        assert caplog.records, 'Expected a WARNING log for the bad JSON file'
-        assert any('esc-bad-1.json' in rec.message or 'esc-bad-1' in rec.message
-                   for rec in caplog.records), 'WARNING should reference the bad file'
-
-    def test_fields_intact(self, tmp_path):
-        """Loaded dict has all original fields intact — nothing stripped or transformed."""
-        from dashboard.data.escalations import load_queue_escalations
-
-        esc_dir = tmp_path / 'escalations'
-        esc_dir.mkdir()
-
-        esc = _esc('esc-3-1', task_id='3', level=2, status='dismissed',
-                   worktree='/home/leo/src/proj/.worktrees/3')
-        esc['extra_field'] = 'should-survive'
-        _write_esc(esc_dir, 'esc-3-1.json', esc)
-
-        result = load_queue_escalations(esc_dir)
-        assert len(result) == 1
-        loaded = result[0]
-        assert loaded['id'] == 'esc-3-1'
-        assert loaded['task_id'] == '3'
-        assert loaded['level'] == 2
-        assert loaded['status'] == 'dismissed'
-        assert loaded['worktree'] == '/home/leo/src/proj/.worktrees/3'
-        assert loaded['extra_field'] == 'should-survive'
-
-    def test_non_escalation_json_resident_is_not_read(self, tmp_path):
-        """A well-formed non-``esc-*`` JSON file in the queue root is not an escalation.
-
-        The queue directory has a second writer:
-        ``orchestrator/src/orchestrator/b3_gate.py::STATE_REL_PATH`` keeps
-        ``b3-state.json`` there.  Read as an escalation it becomes a row with
-        no ``id``.  It is a permanent resident, not a read failure, so it is
-        not reported in *skipped* either.
-        """
-        from dashboard.data.escalations import load_queue_escalations
-
-        esc_dir = tmp_path / 'escalations'
-        esc_dir.mkdir()
-        good = _esc('esc-good-1', task_id='1', level=1, status='pending')
-        _write_esc(esc_dir, 'esc-good-1.json', good)
-        _write_esc(esc_dir, 'b3-state.json', {
-            'launches': [],
-            'charges': [{'task_id': '1615', 'charged_at': '2026-09-20T00:00:00+00:00'}],
-        })
-
-        skipped: list = []
-        result = load_queue_escalations(esc_dir, skipped=skipped)
-
-        assert result == [good]
-        assert skipped == []
-
-    # -- the opt-in ``skipped`` out-parameter -------------------------------
-    #
-    # Skipping an unparseable file is correct — one corrupt escalation must not
-    # crash a queue scan.  Doing it with no channel back to the caller is not:
-    # the reader holds both the path and the exception at the failure point and
-    # threw both away into a log line no payload consumer can read (INV-2,
-    # ``structured-facts-at-failure``).  ``skipped`` is that channel.
-
-    def test_skipped_out_parameter_records_unparseable_files(self, tmp_path):
-        """An opted-in caller learns WHICH file was dropped and WHY."""
-        from dashboard.data.escalations import load_queue_escalations
-
-        esc_dir = tmp_path / 'escalations'
-        esc_dir.mkdir()
-        _write_esc(esc_dir, 'esc-good-1.json', _esc('esc-good-1', task_id='1'))
-        bad = esc_dir / 'esc-bad-1.json'
-        bad.write_text('this is not json {{{')
-
-        skipped: list = []
-        result = load_queue_escalations(esc_dir, skipped=skipped)
-
-        # The return value is untouched — this is a second channel, not a
-        # change to what the reader yields.
-        assert len(result) == 1
-        assert result[0]['id'] == 'esc-good-1'
-        assert len(skipped) == 1
-        assert skipped[0]['path'] == bad
-        assert isinstance(skipped[0]['error'], str) and skipped[0]['error']
-
-    def test_skipped_records_os_errors_not_just_decode_errors(self, tmp_path):
-        """BOTH arms of ``except (JSONDecodeError, OSError)`` report, not just JSON.
-
-        ``Path.glob('esc-*.json')`` yields directories too, so a directory named
-        ``esc-weird.json`` makes ``read_text()`` raise ``IsADirectoryError`` — a
-        deterministic OSError needing no permission games or monkeypatching.
-        A reader that only reported the decode arm would still lose every
-        unreadable/permission-denied file silently, which is the more likely
-        production failure of the two.
-        """
-        from dashboard.data.escalations import load_queue_escalations
-
-        esc_dir = tmp_path / 'escalations'
-        esc_dir.mkdir()
-        _write_esc(esc_dir, 'esc-good-1.json', _esc('esc-good-1', task_id='1'))
-        weird = esc_dir / 'esc-weird.json'
-        weird.mkdir()
-
-        skipped: list = []
-        result = load_queue_escalations(esc_dir, skipped=skipped)
-
-        assert [r['id'] for r in result] == ['esc-good-1']
-        assert len(skipped) == 1
-        assert skipped[0]['path'] == weird
-        assert isinstance(skipped[0]['error'], str) and skipped[0]['error']
-
-    def test_skipped_accumulator_is_appended_not_replaced(self, tmp_path):
-        """Entries are APPENDED, so one list can span several queue dirs.
-
-        ``build_escalation_queues`` calls this reader once per orchestrator
-        root; a caller that wants the whole fleet's skips in one list must be
-        able to reuse the accumulator rather than merge N of them.
-        """
-        from dashboard.data.escalations import load_queue_escalations
-
-        esc_dir = tmp_path / 'escalations'
-        esc_dir.mkdir()
-        bad = esc_dir / 'esc-bad-1.json'
-        bad.write_text('this is not json {{{')
-
-        sentinel = {'path': tmp_path / 'from-an-earlier-dir.json', 'error': 'earlier'}
-        skipped: list = [sentinel]
-        load_queue_escalations(esc_dir, skipped=skipped)
-
-        assert len(skipped) == 2
-        assert skipped[0] is sentinel
-        assert skipped[1]['path'] == bad
-
-    def test_omitting_skipped_leaves_behaviour_unchanged(self, tmp_path, caplog):
-        """The default path is byte-identical to today — the back-compat pin.
-
-        Neither of the two ``build_escalation_queues`` call sites opts in, so
-        for the escalation views the WARNING log stays the only signal.  (Named
-        by function, not by line: a line-number citation in this file is stale
-        the moment anything above it moves — the diff that added this test
-        pushed those very calls down ~28 lines.)
-
-        This asserts the un-opted-in call still returns only the valid record,
-        still does not raise, and still logs — i.e. that the new keyword is
-        additive and no existing caller had to change.
-        """
-        from dashboard.data.escalations import load_queue_escalations
-
-        esc_dir = tmp_path / 'escalations'
-        esc_dir.mkdir()
-        _write_esc(esc_dir, 'esc-good-1.json', _esc('esc-good-1', task_id='1'))
-        (esc_dir / 'esc-bad-1.json').write_text('this is not json {{{')
-
-        with caplog.at_level(logging.WARNING, logger='dashboard.data.escalations'):
-            result = load_queue_escalations(esc_dir)
-
-        assert len(result) == 1
-        assert result[0]['id'] == 'esc-good-1'
-        assert any('esc-bad-1' in rec.message for rec in caplog.records), \
-            'the WARNING must survive for callers that do not opt in'
 
 
 # ---------------------------------------------------------------------------
@@ -668,8 +416,7 @@ class TestBuildEscalationQueuesSubsections:
 
         A directory named like a queue file makes ``read_text()`` raise
         ``IsADirectoryError``. It is named ``esc-*.json`` because the corpus
-        walks ``iter_all_escalation_paths``' ``esc-*.json`` glob — the
-        documented population change from ``load_queue_escalations``' ``*.json``.
+        walks ``iter_all_escalation_paths``' ``esc-*.json`` glob.
         """
         primary = tmp_path / 'primary'
         config = _config(primary)
@@ -705,6 +452,65 @@ class TestBuildEscalationQueuesSubsections:
 
         assert 'esc-bad-1.json' in encoded and 'esc-bad-2.json' in encoded
         assert shaped['ESCALATIONS']['summary']['skipped_count'] == 2
+
+
+def _dependency_capability_record(owner) -> dict:
+    """A ``dependency_capability`` escalation as orchestrator/src/orchestrator/harness.py files it."""
+    from escalation.models import Escalation
+
+    return Escalation(
+        id='esc-7600-1', task_id='7600', agent_role='orchestrator-scheduler',
+        severity='critical', category='dependency_capability',
+        summary='delivered check graph-index-provisioned fails on main', level=2,
+        timestamp='2026-09-01T00:00:00+00:00', delivered_check_owner=owner,
+    ).to_dict()
+
+
+def _served_rows(config) -> list[dict]:
+    """Every row of *config*'s corpus as ``/escalations`` serves it: shaped, then JSON round-tripped."""
+    from dashboard.data import redux_api
+    from dashboard.data.escalations import card_datums
+
+    built = _build(config)
+    body = json.loads(json.dumps(
+        redux_api.shape_escalations(built, card_datums(built, {}), served_at=NOW),
+    ))
+    return [row for sub in body['ESCALATIONS']['subsections'] for row in sub['escalations']]
+
+
+class TestDeliveredCheckOwnerReachesTheWire:
+    """Task 7725: a record's ``delivered_check_owner`` reaches the served row verbatim.
+
+    The sidebar renders the owning task, its declaration sites and the
+    sidecar's on_main state from this one field, so the data layer must carry
+    it whole. A record written before task 7514 still serves the key, as null.
+    """
+
+    @pytest.mark.parametrize('owner', [
+        {'task_id': '7514', 'check_name': 'graph-index-provisioned',
+         'sidecar': {'path': 'plans/x.capabilities.yaml', 'on_main': 'declares'}},
+        {'task_id': '7514', 'check_name': 'graph-index-provisioned', 'sidecar': None},
+    ], ids=['declaring-sidecar', 'no-sidecar'])
+    def test_the_owner_is_served_verbatim(self, tmp_path, owner):
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        _put(_queues_dir(primary), _dependency_capability_record(owner))
+
+        (row,) = _served_rows(config)
+
+        assert row['delivered_check_owner'] == owner
+
+    def test_a_record_written_without_the_key_serves_null(self, tmp_path):
+        primary = tmp_path / 'primary'
+        config = _config(primary)
+        record = _dependency_capability_record(None)
+        del record['delivered_check_owner']
+        _put(_queues_dir(primary), record)
+
+        (row,) = _served_rows(config)
+
+        assert 'delivered_check_owner' in row
+        assert row['delivered_check_owner'] is None
 
 
 class TestOwnerAttribution:
@@ -778,7 +584,7 @@ class TestOwnerAttribution:
 
         (row,) = _sub(_build(config, active), 'reconciliation')['escalations']
 
-        assert row['project'] == 'proj'
+        assert row['project'] == 'b/proj'
         assert row['project_root'] == str(other.resolve())
 
     def test_a_reconciliation_row_active_nowhere_has_no_owner(self, tmp_path):

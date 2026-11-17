@@ -26,7 +26,7 @@ from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.queue import EscalationQueue
 
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import MergeOutcome
+from orchestrator.merge_lane.worker import MergeOutcome
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -776,7 +776,7 @@ async def test_escalate_train_halt_releases_orphan_halt_on_submit_failure(
     workflow.escalation_queue.submit = _raise_on_submit  # type: ignore[method-assign]
 
     try:
-        with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'), \
+        with caplog.at_level(logging.INFO, logger='orchestrator.merge_lane'), \
                 pytest.raises(RuntimeError, match='disk full'):
             await workflow._escalate_train_halt(  # type: ignore[attr-defined]
                 MergeOutcome(status='wip_halted', overlap_files=['a.py']),

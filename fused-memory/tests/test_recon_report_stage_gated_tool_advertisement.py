@@ -7,15 +7,9 @@ contract equally invisible failures, and this module asserts BOTH:
 
 - DENIES => the stage's prompt must NOT name the tool. Telling a stage about an
   action it cannot take produces silence, not a refusal the agent could act on.
-  Already asserted, per (tool, stage), by
-  `test_recon_report_guidance_drift.py::test_stage_gated_tools_absent_from_denying_stage_prompts`
-  — restated here so this file reads as the WHOLE contract rather than half of
-  one, which is the discipline that module's own docstring states ("one contract
-  rather than two unrelated guards a future edit can quietly split").
-- HOLDS => the stage's prompt must NAME the tool. This is the converse the drift
-  guard deliberately declines to assert, naming task 4395 as its owner: a tool
-  the agent genuinely holds but that no prompt ever mentions is a tool the agent
-  simply never learns exists (the held-but-unadvertised defect esc-3391-1 /
+- HOLDS => the stage's prompt must NAME the tool: a tool the agent genuinely
+  holds but that no prompt ever mentions is a tool the agent simply never
+  learns exists (the held-but-unadvertised defect esc-3391-1 /
   test_recon_amend_tool_advertisement.py exists to catch, one namespace over).
 
 The stage-agnostic server-level listing (`RECON_REPORT_INSTRUCTIONS`) is NOT a
@@ -62,6 +56,12 @@ from fused_memory.reconciliation.prompts.stage2 import (
     build_stage2_system_prompt,
 )
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+from fused_memory.reconciliation.recon_self_model import (
+    ENTITY_STANDING_DECISIONS_HEADING,
+    INVESTIGATION_OUTCOME_RECORDS_HEADING,
+    render_entity_standing_decision_schema_section,
+    render_investigation_outcome_section,
+)
 from fused_memory.server.recon_report import (
     STAGE_GATED_REPORT_TOOLS,
     get_recon_report_tool_signatures,
@@ -158,9 +158,10 @@ def _stage_denies(tool_name: str, disallowed_attr: str) -> bool:
     """Does the stage gated by *disallowed_attr* deny *tool_name*?
 
     Reads the live disallow list and strips the `mcp__recon-report__` prefix
-    exactly as `test_recon_report_guidance_drift.py` does, so both guards answer
-    "may this stage call this tool?" from the same single source of truth — the
-    lists that actually render into `--disallowed-tools`.
+    exactly as
+    `test_recon_report_guidance_drift.py::test_stage_gated_matches_the_real_enforcement_surface`
+    does, so "may this stage call this tool?" is answered from the same single
+    source of truth — the lists that actually render into `--disallowed-tools`.
     """
     denied = {
         name.removeprefix('mcp__recon-report__')
@@ -210,6 +211,31 @@ class TestStageGatedToolAdvertisementMatchesTheDisallowLists:
             f'({disallowed_attr} in cli_stage_runner.py). Naming a denied tool in a stage '
             'prompt tells the agent about an action it cannot take, and the denial '
             'surfaces as a silently missing tool rather than an explanation.'
+        )
+
+    @pytest.mark.parametrize('tool_name', sorted(STAGE_GATED_REPORT_TOOLS))
+    def test_every_stage_gated_tool_is_denied_by_some_stage_and_held_by_another(
+        self, tool_name
+    ):
+        """Every stage-gated tool is denied by at least one stage and held by another.
+
+        That keeps BOTH arms above exercised for every tool, so a mis-scoped
+        absence arm contradicts the naming arm instead of passing silently.
+        """
+        denying = [
+            attr for _label, _text, attr in _STAGE_CASES if _stage_denies(tool_name, attr)
+        ]
+        assert denying, (
+            f'`{tool_name}` is denied by NO stage\'s live STAGE{{1,2,3}}_DISALLOWED '
+            '(cli_stage_runner.py), so it is not stage-gated. Reclassify it as shared '
+            'guidance in server/recon_report.py::STAGE_GATED_REPORT_TOOLS, or fold its '
+            'DISALLOW_RECON_REPORT_* sublist into the stage(s) meant to deny it.'
+        )
+        assert len(denying) < len(_STAGE_CASES), (
+            f'`{tool_name}` is denied by EVERY stage ({denying}), so no stage can call '
+            'it: the naming arm can never exercise it, and it is not "held by some '
+            'stages but denied in others". Un-deny it in the stage meant to hold it, or '
+            'stop registering it.'
         )
 
     @pytest.mark.parametrize('project_id', _STAGE2_PROJECT_IDS)
@@ -342,37 +368,43 @@ class TestStageGatedToolBlocksAreWiredNotRePasted:
         )
 
     @pytest.mark.parametrize(
-        'heading',
-        ['## Entity Standing Decisions', '## Investigation Outcome Records'],
+        'heading,owning_renderer',
+        [
+            pytest.param(
+                ENTITY_STANDING_DECISIONS_HEADING,
+                render_entity_standing_decision_schema_section,
+                id='entity_standing_decisions',
+            ),
+            pytest.param(
+                INVESTIGATION_OUTCOME_RECORDS_HEADING,
+                render_investigation_outcome_section,
+                id='investigation_outcome_records',
+            ),
+        ],
     )
     def test_headings_the_standing_decision_section_points_at_precede_it_in_stage2(
-        self, heading
+        self, heading, owning_renderer
     ):
-        """render_entity_standing_decision_write_section() deliberately POINTS AT
-        these two sections instead of re-pasting them — the grounds enum lives in
-        the first (rendered by render_entity_standing_decision_schema_section())
-        and the arm-2 record pool in the second (render_investigation_outcome_section()),
-        and each is single-sourced there.
-
-        Cross-referencing a heading that does not exist in the target prompt is
-        a recorded hazard: STALE_KNOWLEDGE_ANNOTATION_NORM's comment carries two
-        such MUST-NOTs, both for headings that exist in one stage prompt and not
-        another. That block avoids the hazard by naming no heading at all; this
-        one accepts it (it is Stage-2-only, so both headings are reachable) and
-        pays for it with this guard.
-
-        The POSITIONAL half is the part that actually bites. The section says
-        "above" of both headings, so mere membership is not enough: reordering
-        the Stage-2 sections, or moving this section earlier, leaves a
-        membership-only guard green while the prompt sends the agent scrolling
-        the wrong way for the grounds enum. Asserting the order turns that into
-        a test failure at the moment of the reorder.
+        """render_entity_standing_decision_write_section() POINTS AT these two
+        sections by heading and says they are "above". All three legs read the one
+        exported constant: the owning renderer opens with it, the pointer section
+        names it, and in STAGE2_SYSTEM_PROMPT it precedes the pointer section.
         """
         from fused_memory.reconciliation.prompts import (
             render_entity_standing_decision_write_section,
         )
 
+        assert owning_renderer().startswith(heading + '\n'), (
+            f'{owning_renderer.__name__}() no longer opens with {heading!r}, the heading '
+            'constant exported beside it in recon_self_model.py. Emit the constant, do '
+            'not re-type the heading.'
+        )
         block = render_entity_standing_decision_write_section()
+        assert heading in block, (
+            f'render_entity_standing_decision_write_section() no longer names {heading!r}, '
+            'so its "above" pointer aims at a heading no renderer emits. Interpolate the '
+            'recon_self_model.py constant rather than re-typing the heading.'
+        )
         assert heading in STAGE2_SYSTEM_PROMPT, (
             f'render_entity_standing_decision_write_section() points the agent at '
             f'{heading!r}, but no such heading is in STAGE2_SYSTEM_PROMPT. Either the '

@@ -29,10 +29,8 @@ import argparse
 import asyncio
 import collections
 import hashlib
-import importlib.util
 import json
 import os
-import sys
 import types
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -50,29 +48,12 @@ from fused_memory.server.write_triage import (
     resolve_bands,
     resolve_candidate_k,
 )
+from fused_memory.utils.script_loader import load_script
 
 _SCRIPTS = Path(__file__).resolve().parent
 
 
-def _load_script(path: Path, mod_name: str) -> types.ModuleType:
-    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
-    cached = sys.modules.get(mod_name)
-    if cached is not None:
-        return cached
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_retrieval = _load_script(
+_retrieval = load_script(
     _SCRIPTS / 'eval_write_triage_retrieval.py', 'eval_write_triage_retrieval',
 )
 
@@ -439,8 +420,8 @@ def _summary(snapshot: Mapping[str, Any], path: Path, sha256: str) -> dict[str, 
 
 
 async def _freeze_live(args: argparse.Namespace) -> dict[str, Any]:
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from fused_memory.config.schema import FusedMemoryConfig
+    from fused_memory.maintenance._utils import maintenance_service
 
     frozen_at = datetime.now(UTC)
     directory = snapshot_dir(args.out_root, frozen_at)
@@ -452,15 +433,11 @@ async def _freeze_live(args: argparse.Namespace) -> dict[str, Any]:
     config = FusedMemoryConfig()
     configured = types.SimpleNamespace(config=config)
     t_high, t_low = resolve_bands(configured)
-    memory = MemoryService(config)
-    await memory.initialize()
-    try:
+    async with maintenance_service(config=config) as (_, memory):
         snapshot = await freeze_snapshot(
             memory, projects=args.projects, since=args.since, frozen_at=frozen_at,
             k=resolve_candidate_k(configured), t_high=t_high, t_low=t_low,
         )
-    finally:
-        await memory.close()
     path = write_snapshot(args.out_root, snapshot)
     _, sha256 = load_snapshot(path)
     return _summary(snapshot, path, sha256)

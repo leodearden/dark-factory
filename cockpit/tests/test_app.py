@@ -14,14 +14,24 @@ test_ui_config.py.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shutil
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+from orchestrator import decision_registry as dr
 from orchestrator import session_registry as sr
 from textual.coordinate import Coordinate
+
+from cockpit.app import CockpitApp
+
+if TYPE_CHECKING:
+    from textual.pilot import Pilot
+
+    from cockpit.registry_reader import SessionScannerProtocol
 
 
 def _make_record(**overrides):
@@ -143,7 +153,6 @@ async def _assert_rebuilds_cost_one_write(tmp_path, monkeypatch, *, drive, round
     suppressed every write would leave ``[]``, and a write per rebuild would
     leave one entry per round.
     """
-    from cockpit.app import CockpitApp
     from cockpit.panes.detail_pane import DetailPane
     from cockpit.panes.session_table import SessionTable
 
@@ -238,10 +247,63 @@ class _BlockingScanner:
         self._release.set()
 
 
+class _HoldingDecisionsReader:
+    """A decisions_reader that reads the real registry, then holds any OFF-main-thread
+    caller until release().
+
+    That caller is a poll worker, held after its whole registry read, because
+    _scan_registry reads sessions before decisions. Main-thread reads (mount's
+    refresh_registry, a keypress's re-read) pass through, because holding one would
+    deadlock the event loop the pilot runs on. After release() every read passes
+    through.
+    """
+
+    def __init__(self) -> None:
+        self.held = threading.Event()
+        self._release = threading.Event()
+        self.held_result: list[dr.DecisionRecord] = []
+
+    def __call__(self, root):
+        from cockpit.registry_reader import scan_decisions
+
+        decisions = scan_decisions(root)
+        off_main_thread = threading.current_thread() is not threading.main_thread()
+        if off_main_thread and not self._release.is_set():
+            self.held_result = decisions
+            self.held.set()
+            self._release.wait()
+        return decisions
+
+    def release(self) -> None:
+        self._release.set()
+
+
+@contextlib.asynccontextmanager
+async def _poll_held_after_its_read(
+    app, reader: _HoldingDecisionsReader, *, reach_timeout_secs: float = 5.0
+):
+    """Run one real poll tick whose worker *reader* holds after its registry read.
+
+    Leaving the block releases the worker and waits for it, so the held poll has
+    landed through the real call_from_thread hand-off: call_from_thread blocks the
+    worker until _apply_scan has run on the loop. The release sits in a finally, so
+    a failing assertion inside the block never leaves the worker parked.
+    """
+    app._poll_registry()
+    try:
+        reached = await asyncio.to_thread(reader.held.wait, reach_timeout_secs)
+        assert reached, (
+            f'the poll worker never reached its decisions read within {reach_timeout_secs}s'
+        )
+        yield
+    finally:
+        reader.release()
+        await app.workers.wait_for_complete()
+
+
 class TestInitialRender:
     @pytest.mark.timeout(10)
     async def test_seeded_records_render_as_rows(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
@@ -273,7 +335,6 @@ class TestSessionTableDefaultFilter:
         "tens, not 10k" holds even when the registry carries stale history."""
         from textual.widgets.data_table import RowDoesNotExist
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
@@ -300,7 +361,6 @@ class TestToggleHistory:
         an in-memory-only toggle, re-rendered immediately (no poll tick)."""
         from textual.widgets.data_table import RowDoesNotExist
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
@@ -340,7 +400,6 @@ class TestToggleHistory:
         that hard-coded the filtered view inside _apply_scan, would only be
         caught by a test with an intervening scan -- pressing 'h' and
         asserting immediately (as above) is not enough."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
@@ -394,7 +453,6 @@ class TestPollRefresh:
         short real interval, an in-flight poll tick can race this exact
         write+refresh_registry() sequence under a loaded runner.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
@@ -427,7 +485,6 @@ class TestPollRefresh:
         call_from_thread) in between this test's own write and its direct
         refresh_registry() call.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable, state_glyph
 
         running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
@@ -449,21 +506,57 @@ class TestPollRefresh:
             assert state_glyph(sr.Status.RUNNING) not in row
 
 
-class TestTimerIntegration:
-    """The one test allowed to depend on real poll timing (see TestPollRefresh).
+class _ScanStartCountingScanner:
+    """Delegates to a real SessionScanner and counts scan() entries, so a test
+    can count the poll scans that began after a point in time. The app
+    serialises poll scans (TestScanBackpressure), so the plain int needs no lock.
+    """
 
-    Everything in TestPollRefresh now drives refresh_registry() directly
-    (deterministic, no sleeping across real ticks). This test alone proves
-    on_mount's set_interval(poll_interval, refresh_registry) is actually
-    wired end-to-end, so that guarantee isn't lost entirely to determinism.
+    def __init__(self, inner: SessionScannerProtocol) -> None:
+        self._inner = inner
+        self.starts = 0
+
+    def scan(self) -> list[sr.SessionRecord]:
+        self.starts += 1
+        return self._inner.scan()
+
+
+async def _wait_until_a_poll_scan_has_applied(
+    pilot: Pilot, scanner: _ScanStartCountingScanner, *, since: int, poll_interval: float
+) -> None:
+    """Return once the first poll scan to begin after *since* has been applied.
+
+    Poll scans never overlap, and each one's apply lands before the next can
+    begin, so by the time a second scan has begun after *since* the first has
+    been read and applied, unless it raised: the poll worker swallows errors
+    (exit_on_error=False), so a scan that raises still counts but is never
+    applied. The overlap and ordering rest on
+    cockpit/src/cockpit/app.py::CockpitApp._scan_registry_worker marshalling
+    _apply_scan BEFORE its finally clears _scan_in_flight. There is no time
+    bound here: *poll_interval* only paces the re-checks, and the calling
+    test's pytest timeout guards liveness only (a poll timer that never fires).
+    """
+    while scanner.starts < since + 2:
+        await pilot.pause(poll_interval)
+
+
+class TestTimerIntegration:
+    """The one test driven by the real set_interval poll timer (see TestPollRefresh).
+
+    Everything in TestPollRefresh drives refresh_registry() directly. This
+    test alone proves on_mount's set_interval wiring reaches disk end-to-end.
+    It waits on poll scans, not a wall-clock budget;
+    _wait_until_a_poll_scan_has_applied says why two post-write scan starts
+    bound the wait.
     """
 
     @pytest.mark.timeout(10)
     async def test_timer_tick_triggers_refresh(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
+        from cockpit.registry_reader import SessionScanner
 
-        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        scanner = _ScanStartCountingScanner(SessionScanner(tmp_path))
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, scanner=scanner)
         async with app.run_test() as pilot:
             await pilot.pause()
             table = app.query_one(SessionTable)
@@ -471,16 +564,22 @@ class TestTimerIntegration:
 
             record = _make_record(session_slug='timer-1', status=sr.Status.RUNNING)
             sr.write_record(record, root=tmp_path)
+            starts_at_write = scanner.starts
 
-            await pilot.pause(0.3)
+            await _wait_until_a_poll_scan_has_applied(
+                pilot, scanner, since=starts_at_write, poll_interval=app.poll_interval
+            )
 
-            assert table.row_count == 1
+            assert table.row_count == 1, (
+                f'row_count={table.row_count} after '
+                f'{scanner.starts - starts_at_write} poll scans began since the write; '
+                'a second post-write scan only begins once the first has been applied'
+            )
 
 
 class TestRowSelectionDetail:
     @pytest.mark.timeout(10)
     async def test_selecting_row_renders_detail(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.detail_pane import DetailPane
         from cockpit.panes.session_table import SessionTable
 
@@ -520,7 +619,6 @@ class TestReplaceRowsChildrenCountAgainstFullSet:
         the FULL scanned set, not just the (possibly filtered) visible
         `records` -- so a visible parent's non-terminal child is never
         undercounted just because the child itself is hidden from view."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import LiveSessions, SessionTable
 
         parent = _make_record(session_slug='parent-1', parent_session_id=None)
@@ -554,19 +652,19 @@ class TestWriteDiscipline:
         running the app end-to-end (mount, a poll tick, a row selection) must
         never create, modify, or delete a sessions/ or decisions/ file --
         those belong to spawn-claude.sh/T4-T7/C8/C5b, never the C5a view."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
+        from cockpit.registry_reader import SessionScanner
 
         record = _make_record(session_slug='write-disc-1', status=sr.Status.RUNNING)
         sr.write_record(record, root=tmp_path)
 
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-1',
             project='df',
             text='Which port?',
             filed_at='2026-07-07T00:00:00+00:00',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         before = _snapshot_tree(tmp_path)
         # sanity: prove the snapshot actually captured the seeded files, so a
@@ -574,12 +672,16 @@ class TestWriteDiscipline:
         assert any(path.startswith('sessions/') for path in before)
         assert any(path.startswith('decisions/') for path in before)
 
-        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
+        scanner = _ScanStartCountingScanner(SessionScanner(tmp_path))
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, scanner=scanner)
         async with app.run_test() as pilot:
             await pilot.pause()
             table = app.query_one(SessionTable)
+            starts_at_mount = scanner.starts
 
-            await pilot.pause(0.2)  # let at least one poll tick land
+            await _wait_until_a_poll_scan_has_applied(
+                pilot, scanner, since=starts_at_mount, poll_interval=app.poll_interval
+            )
 
             table.move_cursor(row=table.get_row_index('write-disc-1'))
             await pilot.pause()
@@ -603,7 +705,6 @@ class TestSelectedSlugRestore:
         ui_config's whole reason to exist. Both halves were unit-tested;
         the seam joining them was not. Also note here that the persisted
         poll_interval is deliberately inert (task 4054 scope)."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import load_ui_config
 
@@ -649,7 +750,6 @@ class TestSelectedSlugRestore:
         from disk INSIDE the app's lifetime -- after on_unmount the value is
         written either way, which is exactly the gap this pins.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import load_ui_config
@@ -706,7 +806,6 @@ class TestSelectedSlugRestore:
         cockpit must still mount and land on row 0. This test is a
         fail-soft regression guard, NOT a second proof of the restore --
         it passes with or without the restore branch, by design."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import CockpitUIConfig, save_ui_config
 
@@ -757,7 +856,6 @@ class TestUIConfigWriteDebounce:
     async def test_highlight_burst_writes_nothing_until_shutdown(self, tmp_path, monkeypatch):
         """A burst of cursor moves does ZERO I/O while the app runs; the one
         write that lands is on_unmount's, carrying the LAST slug."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import load_ui_config, ui_config_path
 
@@ -858,7 +956,6 @@ class TestUIConfigWriteDebounce:
         tick over an unchanged selection writes nothing more -- so this is a
         real debounce, not one-write-per-keypress traded for
         one-write-per-interval forever."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import load_ui_config
 
@@ -931,7 +1028,6 @@ class TestUIConfigWriteDebounce:
         synchronous atomic write back on every single tick -- reintroducing, in
         the worst case, exactly the per-tick I/O this debounce removed.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import ui_config_path
 
@@ -1006,7 +1102,6 @@ class TestUIConfigWriteDebounce:
         the busy-fleet case where the operator is most likely to be moving
         the cursor -- and the selection would sit unpersisted until unmount.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         running = _debounce_running_records()
@@ -1029,9 +1124,9 @@ class TestUIConfigWriteDebounce:
             try:
                 # Stand in for a slow 10k-session scan still running. The
                 # flag is documented main-thread-only, and this file already
-                # drives _poll_registry/_apply_scan/_next_scan_seq directly,
-                # so setting it beats parking a real worker thread that a
-                # failed assertion could leave wedged.
+                # drives _poll_registry directly, so setting it beats parking
+                # a real worker thread that a failed assertion could leave
+                # wedged.
                 app._scan_in_flight = True
                 app._poll_registry()
                 await pilot.pause()
@@ -1052,7 +1147,6 @@ class TestUIConfigWriteDebounce:
         gate asks "is the on-disk file stale", not "did the selection
         change", so a successful restore leaves the live selection already
         equal to the persisted one and the first tick writes nothing."""
-        from cockpit.app import CockpitApp
         from cockpit.ui_config import CockpitUIConfig, save_ui_config
 
         running = _seed_debounce_fleet(tmp_path)
@@ -1093,7 +1187,6 @@ class TestUIConfigWriteDebounce:
         test_mount_over_a_restored_selection_writes_nothing -- do not
         "simplify" it away as a duplicate.
         """
-        from cockpit.app import CockpitApp
         from cockpit.ui_config import CockpitUIConfig, load_ui_config, save_ui_config
 
         _seed_debounce_fleet(tmp_path)
@@ -1129,7 +1222,6 @@ class TestDecisionQueueRender:
         """
         from textual.widgets.data_table import RowDoesNotExist
 
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1142,14 +1234,14 @@ class TestDecisionQueueRender:
         for r in (running, awaiting):
             sr.write_record(r, root=tmp_path)
 
-        low = sr.DecisionRecord(
+        low = dr.DecisionRecord(
             id='dec-low',
             project='df',
             text='Low priority question?',
             filed_at='2026-07-07T00:00:00+00:00',
             manual_boost=0,
         )
-        high = sr.DecisionRecord(
+        high = dr.DecisionRecord(
             id='dec-high',
             project='df',
             text='High priority question?',
@@ -1157,7 +1249,7 @@ class TestDecisionQueueRender:
             manual_boost=5,
         )
         for d in (low, high):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
         async with app.run_test() as pilot:
@@ -1197,20 +1289,19 @@ class TestDecisionQueueRender:
         render '100d', widen the age column past its label and silently move
         this arithmetic by one.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
         long_question = 'Which port should the worker bind to, and why that one? ' * 6
         assert len(long_question) > 300
 
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-wide',
             project='df',
             text=long_question,
             filed_at=(datetime.now(UTC) - timedelta(days=3)).isoformat(),
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
         async with app.run_test(size=(200, 40)) as pilot:
@@ -1242,15 +1333,14 @@ class TestDecisionQueueRender:
         half of this that a formatter-only cap cannot do. Widths: 200 - 26
         fixed - 2 padding == 172, and 100 - 26 - 2 == 72.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
         long_question = 'Which port should the worker bind to, and why that one? ' * 6
         filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
         for decision_id, boost in (('dec-high', 5), ('dec-low', 0)):
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id=decision_id,
                     project='df',
                     text=long_question,
@@ -1314,7 +1404,6 @@ class TestDecisionQueueRender:
         Widths: 200 - 26 fixed - 2 padding == 172 with no scrollbar, 170 once
         two cells go to one.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1322,8 +1411,8 @@ class TestDecisionQueueRender:
         filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
 
         def write(index):
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id=f'dec-{index:02d}',
                     project='df',
                     text=long_question,
@@ -1366,15 +1455,14 @@ class TestDecisionQueueRender:
         derived bound -- is identical before and after; only the guard keeps
         the reflow from running anyway.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
         long_question = 'Which port should the worker bind to, and why that one? ' * 6
         filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
         for index in range(60):
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id=f'dec-{index:02d}',
                     project='df',
                     text=long_question,
@@ -1413,7 +1501,6 @@ class TestSignalDontMove:
         this path; a subsequent awaiting-input->idle transition clears the
         urgency hint.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1469,7 +1556,6 @@ class TestSharedTargetAttentionNotClearedPrematurely:
         incorrectly clear the shared target's urgency hint, even though a
         live ask (the session) still points at it.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
 
         display = sr.Display(kind='wm', wm_title='shared title')
@@ -1480,14 +1566,14 @@ class TestSharedTargetAttentionNotClearedPrematurely:
             question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
         )
         sr.write_record(awaiting, root=tmp_path)
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-shared',
             project='df',
             text='Proceed?',
             filed_at='2026-07-07T00:00:00+00:00',
             session_id='shared-1',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -1499,7 +1585,7 @@ class TestSharedTargetAttentionNotClearedPrematurely:
 
             # The decision resolves elsewhere (e.g. a C8 watcher answers it)
             # while the session it's linked to is STILL awaiting input.
-            sr.update_decision_state('dec-shared', sr.DecisionState.ANSWERED, root=tmp_path)
+            dr.update_decision_state('dec-shared', dr.DecisionState.ANSWERED, root=tmp_path)
 
             calls_before = len(backend.set_urgency_calls)
             app.refresh_registry()
@@ -1516,12 +1602,10 @@ class TestEnterFocus:
     async def test_enter_focuses_the_highlighted_row_not_row_zero(self, tmp_path):
         """Explicit-action focus (PRD §6.2/§9 C5b): pressing Enter on the
         DecisionQueue focuses the HIGHLIGHTED row's resolved target -- never
-        whatever happens to sit at row 0 -- and records that item's key in
-        the app's in-memory "handling" set. This is the ONLY place a focus()
+        whatever happens to sit at row 0. This is the ONLY place a focus()
         call may originate from (see TestSignalDontMove for the refresh
         path's complementary "never focus" half of the same invariant).
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1564,7 +1648,6 @@ class TestEnterFocus:
             await pilot.pause()
 
             assert backend.focus_calls == [DisplayTarget(kind='wm', wm_title='awaiting-b title')]
-            assert target_key in app._handling
 
     @pytest.mark.timeout(10)
     async def test_enter_on_unresolvable_target_is_fail_soft(self, tmp_path):
@@ -1573,17 +1656,16 @@ class TestEnterFocus:
         -- fail-soft, PRD §2. A gone/unlinked lead is still a no-op, never
         a crash.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        orphan = sr.DecisionRecord(
+        orphan = dr.DecisionRecord(
             id='dec-orphan',
             project='df',
             text='Orphaned decision?',
             filed_at='2026-07-07T00:00:00+00:00',
         )
-        assert sr.write_decision(orphan, root=tmp_path)
+        assert dr.write_decision(orphan, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -1609,7 +1691,7 @@ class TestEnterFocus:
             display=sr.Display(kind='wm', wm_title='escalation-watcher df'),
         )
         sr.write_record(watcher, root=root)
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='esc-4237-1',
             project='df',
             text='Adopt the plan?',
@@ -1617,12 +1699,11 @@ class TestEnterFocus:
             session_id='watcher-df-1348600',
             record_slug=record_slug,
         )
-        assert sr.write_decision(decision, root=root)
+        assert dr.write_decision(decision, root=root)
         return watcher, decision
 
     @pytest.mark.timeout(10)
     async def test_enter_on_a_watcher_filed_decision_focuses_the_watcher(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1652,7 +1733,6 @@ class TestEnterFocus:
         itself must see record_slug -- not only resolve_target."""
         from dataclasses import replace
 
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1663,7 +1743,7 @@ class TestEnterFocus:
         async with app.run_test() as pilot:
             await pilot.pause()
             linked = replace(unlinked, record_slug='session-dark-factory-sess-watcher')
-            assert sr.write_decision(linked, root=tmp_path)
+            assert dr.write_decision(linked, root=tmp_path)
             app.refresh_registry()
             await pilot.pause()
             queue = app.query_one(DecisionQueue)
@@ -1676,143 +1756,6 @@ class TestEnterFocus:
             assert backend.focus_calls == [
                 DisplayTarget(kind='wm', wm_title='escalation-watcher df')
             ]
-
-
-class TestHandlingExpiresWithTheAsk:
-    @pytest.mark.timeout(10)
-    async def test_handling_flag_does_not_stick_past_the_ask_it_was_set_for(self, tmp_path):
-        """self._handling is an in-memory 'already acted on' marker keyed by
-        QueueItem.key (PRD §9 C5b). For a SESSION-backed row the key is
-        stable for the session's whole lifetime, so once Enter marks it
-        handling, it must be cleared again once that ask resolves (the
-        session leaves the queue) -- otherwise a brand new question from
-        the SAME session would silently inherit a stale "already handled"
-        flag left over from a completely different, earlier ask.
-        """
-        from cockpit.app import CockpitApp
-        from cockpit.backends import FakeBackend
-
-        display = sr.Display(kind='wm', wm_title='handling title')
-        awaiting = _make_record(
-            session_slug='handling-1',
-            status=sr.Status.AWAITING_INPUT,
-            display=display,
-            question=sr.Question(text='First ask?', asked_at='2026-07-07T00:00:00+00:00'),
-        )
-        sr.write_record(awaiting, root=tmp_path)
-
-        backend = FakeBackend()
-        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-
-            key = 'session:handling-1'
-            await pilot.press('enter')
-            await pilot.pause()
-            assert key in app._handling
-
-            # The ask resolves -- the session leaves the queue entirely.
-            idle = _make_record(session_slug='handling-1', status=sr.Status.IDLE, display=display)
-            sr.write_record(idle, root=tmp_path)
-            app.refresh_registry()
-            await pilot.pause()
-
-            assert key not in app._handling
-
-            # A brand new question from the SAME session must not inherit
-            # the stale handling flag left by the earlier, resolved ask.
-            second_ask = _make_record(
-                session_slug='handling-1',
-                status=sr.Status.AWAITING_INPUT,
-                display=display,
-                question=sr.Question(text='Second ask?', asked_at='2026-07-08T00:00:00+00:00'),
-            )
-            sr.write_record(second_ask, root=tmp_path)
-            app.refresh_registry()
-            await pilot.pause()
-
-            assert app._queue_items_by_key[key].handling is False
-
-    @pytest.mark.timeout(10)
-    async def test_handling_expires_on_a_same_session_reask_without_a_status_change(self, tmp_path):
-        """Queue exit (above) is only one way an ask ends. self._handling is
-        a slug-stable in-memory "already acted on" marker, so it must also
-        expire when the ask is REPLACED while the key never leaves the queue.
-
-        Reachability: orchestrator/src/orchestrator/session_hooks.py::run_notification
-        writes status=AWAITING_INPUT plus a fresh Question on every
-        Notification hook, with no required intervening Stop hook (->
-        IDLE), so AWAITING_INPUT(Q1) -> AWAITING_INPUT(Q2) is a real
-        transition that never removes 'session:<slug>' from the queue.
-
-        The re-ask below deliberately repeats the question text verbatim --
-        the common production shape, for the reasons
-        test_dropped_session_key_expires_on_a_reask_with_identical_text
-        sets out (session_hooks._extract_question copies the hook message
-        into `text` and stamps a fresh `asked_at`). That puts the WHOLE
-        diff on registry_reader.build_snapshot's asked_at field, so this
-        also proves the wake-up trigger is strong enough for the prune to
-        run at all.
-        """
-        from cockpit.app import CockpitApp
-        from cockpit.backends import FakeBackend
-
-        display = sr.Display(kind='wm', wm_title='reask title')
-        first_ask = _make_record(
-            session_slug='reask-1',
-            status=sr.Status.AWAITING_INPUT,
-            display=display,
-            question=sr.Question(text='Continue?', asked_at='2026-07-07T00:00:00+00:00'),
-        )
-        sr.write_record(first_ask, root=tmp_path)
-
-        backend = FakeBackend()
-        app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-
-            key = 'session:reask-1'
-
-            # (a) Enter marks the row acknowledged.
-            await pilot.press('enter')
-            await pilot.pause()
-            assert key in app._handling
-
-            # (b) GUARD: a LIVE mark must survive an unrelated rebuild. This
-            # is the only clause that fails if action_focus_selected never
-            # records the ask identity -- without it every Enter's mark
-            # would evaporate on the next rebuild instead of on the re-ask.
-            other = _make_record(
-                session_slug='other-1',
-                status=sr.Status.AWAITING_INPUT,
-                display=sr.Display(kind='wm', wm_title='other title'),
-                question=sr.Question(text='Unrelated ask?', asked_at='2026-07-07T01:00:00+00:00'),
-            )
-            sr.write_record(other, root=tmp_path)
-            app.refresh_registry()
-            await pilot.pause()
-
-            assert key in app._handling
-            assert app._queue_items_by_key[key].handling is True
-
-            # (c) The re-ask: still AWAITING_INPUT, same canned text, only a
-            # fresh asked_at. A genuinely new ask must not inherit the mark.
-            second_ask = _make_record(
-                session_slug='reask-1',
-                status=sr.Status.AWAITING_INPUT,
-                display=display,
-                question=sr.Question(text='Continue?', asked_at='2026-07-08T00:00:00+00:00'),
-            )
-            sr.write_record(second_ask, root=tmp_path)
-            app.refresh_registry()
-            await pilot.pause()
-
-            assert key not in app._handling
-            assert app._queue_items_by_key[key].handling is False
-
-            # (d) The identity side-table is garbage-collected with the
-            # mark, rather than becoming the next leak.
-            assert app._overlay_asks == {}
 
 
 class TestBoostReordersAndPersists:
@@ -1830,21 +1773,20 @@ class TestBoostReordersAndPersists:
         comparison hermetic -- independent of wall-clock time and of
         whatever priorities.yaml (if any) happens to live on the host.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.priority import Priorities
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
 
-        older = sr.DecisionRecord(
+        older = dr.DecisionRecord(
             id='dec-a',
             project='df',
             text='A?',
             filed_at='2026-06-01T00:00:00+00:00',  # far enough back to saturate the age bonus
             manual_boost=0,
         )
-        newer = sr.DecisionRecord(
+        newer = dr.DecisionRecord(
             id='dec-b',
             project='df',
             text='B?',
@@ -1852,7 +1794,7 @@ class TestBoostReordersAndPersists:
             manual_boost=0,
         )
         for d in (older, newer):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(
@@ -1883,7 +1825,7 @@ class TestBoostReordersAndPersists:
             assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a')
 
             # (b) persisted via C1 -- disk reflects the raised boost.
-            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            persisted = {d.id: d for d in dr.list_decisions(root=tmp_path)}
             assert persisted['dec-b'].manual_boost == 3
             assert persisted['dec-a'].manual_boost == 0  # untouched
 
@@ -1892,7 +1834,7 @@ class TestBoostReordersAndPersists:
             await pilot.press('7')
             await pilot.pause()
 
-            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            persisted = {d.id: d for d in dr.list_decisions(root=tmp_path)}
             assert persisted['dec-b'].manual_boost == 7
 
 
@@ -1907,18 +1849,17 @@ class TestDropRemovesAndPersists:
         """
         from textual.widgets.data_table import RowDoesNotExist
 
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        first = sr.DecisionRecord(
+        first = dr.DecisionRecord(
             id='dec-1', project='df', text='First?', filed_at='2026-07-07T00:00:00+00:00'
         )
-        second = sr.DecisionRecord(
+        second = dr.DecisionRecord(
             id='dec-2', project='df', text='Second?', filed_at='2026-07-07T00:00:00+00:00'
         )
         for d in (first, second):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -1941,9 +1882,9 @@ class TestDropRemovesAndPersists:
             assert queue.get_row('decision:dec-2')
 
             # (b) persisted via C1.
-            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
-            assert persisted['dec-1'].state == sr.DecisionState.DROPPED
-            assert persisted['dec-2'].state == sr.DecisionState.OPEN  # untouched
+            persisted = {d.id: d for d in dr.list_decisions(root=tmp_path)}
+            assert persisted['dec-1'].state == dr.DecisionState.DROPPED
+            assert persisted['dec-2'].state == dr.DecisionState.OPEN  # untouched
 
     @pytest.mark.timeout(10)
     async def test_drop_session_row_removes_live_without_writing_the_session(self, tmp_path):
@@ -1951,7 +1892,6 @@ class TestDropRemovesAndPersists:
         ONLY -- sessions aren't cockpit-writable (PRD §2/§6.6), so this
         must not touch the session's record on disk, and must not raise.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -1996,22 +1936,21 @@ class TestDecisionProjectIsCanonicalAtEveryReadSite:
 
     @pytest.mark.timeout(10)
     async def test_project_stays_canonical_across_the_boost_and_drop_re_reads(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-1',
             project='df',
             text='Which port?',
             filed_at='2026-07-07T00:00:00+00:00',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
         # Baseline: the raw spelling is what is actually on disk, so each
         # re-read below really does read 'df' back and really does have to
         # fold it. (These are the legacy rows migrate_decision_project_tokens
         # has not been run over.)
-        assert [d.project for d in sr.list_decisions(root=tmp_path)] == ['df']
+        assert [d.project for d in dr.list_decisions(root=tmp_path)] == ['df']
 
         app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
         async with app.run_test() as pilot:
@@ -2027,7 +1966,7 @@ class TestDecisionProjectIsCanonicalAtEveryReadSite:
             # (2) the post-boost re-read (action_boost -> _apply_boost).
             await pilot.press('b')
             await pilot.pause()
-            persisted = sr.list_decisions(root=tmp_path)
+            persisted = dr.list_decisions(root=tmp_path)
             assert persisted[0].manual_boost != 0  # the write really happened
             assert persisted[0].project == 'df'  # ...and left the disk raw
             assert [d.project for d in app._decisions] == ['dark_factory']
@@ -2035,10 +1974,60 @@ class TestDecisionProjectIsCanonicalAtEveryReadSite:
             # (3) the post-drop re-read (action_drop).
             await pilot.press('x')
             await pilot.pause()
-            persisted = sr.list_decisions(root=tmp_path)
-            assert persisted[0].state == sr.DecisionState.DROPPED  # the write happened
+            persisted = dr.list_decisions(root=tmp_path)
+            assert persisted[0].state == dr.DecisionState.DROPPED  # the write happened
             assert persisted[0].project == 'df'  # ...and left the disk raw
             assert [d.project for d in app._decisions] == ['dark_factory']
+
+
+class TestInjectedDecisionsReaderIsEveryDecisionRead:
+    @pytest.mark.timeout(10)
+    async def test_a_decision_the_reader_hides_stays_hidden_after_a_keypress_re_read(
+        self, tmp_path
+    ):
+        """The decisions_reader kwarg is the app's only source of decisions, at the mount
+        scan and at a keypress's post-write re-read alike. A read site that bypassed it
+        would let a test fake see one registry while the app showed another."""
+        from textual.widgets.data_table import RowDoesNotExist
+
+        from cockpit.backends import FakeBackend
+        from cockpit.panes.decision_queue import DecisionQueue
+        from cockpit.registry_reader import scan_decisions
+
+        for decision_id in ('dec-shown', 'dec-hidden'):
+            assert dr.write_decision(
+                dr.DecisionRecord(
+                    id=decision_id,
+                    project='df',
+                    text=f'{decision_id}?',
+                    filed_at='2026-07-07T00:00:00+00:00',
+                ),
+                root=tmp_path,
+            )
+
+        def reader(root):
+            return [d for d in scan_decisions(root) if d.id != 'dec-hidden']
+
+        app = CockpitApp(
+            fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60, decisions_reader=reader
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            queue = app.query_one(DecisionQueue)
+            assert queue.row_count == 1
+            with pytest.raises(RowDoesNotExist):
+                queue.get_row_index('decision:dec-hidden')
+
+            queue.move_cursor(row=queue.get_row_index('decision:dec-shown'))
+            await pilot.pause()
+            await pilot.press('b')
+            await pilot.pause()
+
+            persisted = {d.id: d for d in dr.list_decisions(root=tmp_path)}
+            assert persisted['dec-shown'].manual_boost == 1
+            assert queue.row_count == 1
+            with pytest.raises(RowDoesNotExist):
+                queue.get_row_index('decision:dec-hidden')
 
 
 class TestDroppedOverlayExpiresWithTheAsk:
@@ -2052,14 +2041,13 @@ class TestDroppedOverlayExpiresWithTheAsk:
         suppressed for the cockpit's whole process lifetime, and the
         operator never learns an agent is blocked on them.
 
-        The prune deliberately CANNOT copy self._handling's
-        `&= self._queue_items_by_key.keys()` predicate: a dropped item is by
-        construction absent from the rebuilt queue, so queue membership
-        would clear every drop on the very rebuild action_drop itself
-        triggers. Clause (b) below is the standing guard against that
+        The prune deliberately CANNOT use queue membership
+        (`&= self._queue_items_by_key.keys()`) as its predicate: a dropped
+        item is by construction absent from the rebuilt queue, so queue
+        membership would clear every drop on the very rebuild action_drop
+        itself triggers. Clause (b) below is the standing guard against that
         mistake -- a live drop must survive an unrelated rebuild.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2145,7 +2133,6 @@ class TestDroppedOverlayExpiresWithTheAsk:
         still silently suppress Q2 -- the exact failure class this whole
         prune exists to kill.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2207,7 +2194,6 @@ class TestDroppedOverlayExpiresWithTheAsk:
         WAKE-UP TRIGGER (the snapshot) is at least as strong as the overlay
         identity (_ask_identity's `(question.text, question.asked_at)`).
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2267,7 +2253,6 @@ class TestDroppedOverlayExpiresWithTheAsk:
         identity itself (not the liveness gate) that has to do the work
         when the non-awaiting state is never observed.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2327,7 +2312,6 @@ class TestDroppedOverlayExpiresWithTheAsk:
         purely-time-passing tick diff). So this pins the IDENTITY's job,
         with the wake-up trigger supplied independently.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2379,7 +2363,6 @@ class TestBoostAndDeferOverlaysExpireWithTheAsk:
         rule -- and self._overlay_asks, the bookkeeping side-table, must be
         garbage-collected along with it rather than becoming the new leak.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
 
         display = sr.Display(kind='wm', wm_title='boost title')
@@ -2417,16 +2400,15 @@ class TestBoostAndDeferOverlaysExpireWithTheAsk:
         stamp must expire rather than sit in memory forever suppressing the
         effective age of whatever later reuses that id.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
 
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-defer',
             project='df',
             text='Proceed?',
             filed_at='2026-07-07T00:00:00+00:00',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -2438,7 +2420,7 @@ class TestBoostAndDeferOverlaysExpireWithTheAsk:
             assert 'decision:dec-defer' in app._deferred
 
             # Answered elsewhere (e.g. a C8 watcher) -- no longer OPEN.
-            sr.update_decision_state('dec-defer', sr.DecisionState.ANSWERED, root=tmp_path)
+            dr.update_decision_state('dec-defer', dr.DecisionState.ANSWERED, root=tmp_path)
             app.refresh_registry()
             await pilot.pause()
 
@@ -2467,7 +2449,6 @@ class TestReorderTargetsAreDeduped:
         Uses a tmux display because tmux is the only backend whose reorder
         is not a documented no-op.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2479,14 +2460,14 @@ class TestReorderTargetsAreDeduped:
             question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
         )
         sr.write_record(awaiting, root=tmp_path)
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-shared',
             project='df',
             text='Proceed?',
             filed_at='2026-07-07T00:00:00+00:00',
             session_id='shared-1',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -2529,7 +2510,6 @@ class TestReorderTargetsAreDeduped:
         through sess-a's own display -- target A, the same object the
         sess-a row resolves to.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2551,7 +2531,7 @@ class TestReorderTargetsAreDeduped:
             question=sr.Question(text='Older ask?', asked_at='2026-07-01T00:00:00+00:00'),
         )
         sr.write_record(sess_b, root=tmp_path)
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-a',
             project='df',
             text='Proceed?',
@@ -2559,7 +2539,7 @@ class TestReorderTargetsAreDeduped:
             session_id='sess-a',
             severity='urgent',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05, now_fn=lambda: now)
@@ -2618,11 +2598,10 @@ class TestCopyAction:
         touching sessions/ or decisions/ (mirrors TestWriteDiscipline's
         before/after _snapshot_tree diff).
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-1',
             project='df',
             text='Which port do we bind?',
@@ -2630,7 +2609,7 @@ class TestCopyAction:
             task_id='2517',
             escalation_id='esc-42',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         awaiting = _make_record(
             session_slug='awaiting-1',
@@ -2678,7 +2657,6 @@ class TestCopyAction:
         action_copy itself (reviewer_comprehensive test_coverage
         suggestion, test_app.py:911).
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2724,7 +2702,6 @@ class TestCopyAction:
         crash and must never reach the clipboard seam at all (no stray
         subprocess, no misleading toast for a row that doesn't exist).
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2799,7 +2776,7 @@ class ExplodingCopyRunner:
 
 def _write_copyable_decision(tmp_path):
     """One highlightable decision row, mirroring TestCopyAction's fixture."""
-    decision = sr.DecisionRecord(
+    decision = dr.DecisionRecord(
         id='dec-1',
         project='df',
         text='Which port do we bind?',
@@ -2807,7 +2784,7 @@ def _write_copyable_decision(tmp_path):
         task_id='2517',
         escalation_id='esc-42',
     )
-    assert sr.write_decision(decision, root=tmp_path)
+    assert dr.write_decision(decision, root=tmp_path)
 
 
 def _spy_on_clipboard_surface(monkeypatch, app):
@@ -2838,7 +2815,6 @@ class TestCopyFallbackAndFeedback:
         with the helper name dropped) would otherwise leave every test in
         this class green while telling the operator nothing useful.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
         from cockpit.panes.decision_queue import DecisionQueue
@@ -2872,7 +2848,6 @@ class TestCopyFallbackAndFeedback:
     @pytest.mark.timeout(10)
     async def test_no_local_helper_falls_back_to_osc52_and_warns(self, tmp_path, monkeypatch):
         """The over-SSH case: the same payload goes out as OSC 52, and the toast says so."""
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
         from cockpit.panes.decision_queue import DecisionQueue
@@ -2913,7 +2888,6 @@ class TestCopyFallbackAndFeedback:
         with the same payload, and the toast reports the failure rather than
         silently claiming success.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.clipboard import CopyAttempt, CopyOutcome, copy_feedback
         from cockpit.panes.decision_queue import DecisionQueue
@@ -2951,7 +2925,6 @@ class TestCopyFallbackAndFeedback:
     @pytest.mark.timeout(10)
     async def test_empty_queue_neither_falls_back_nor_toasts(self, tmp_path, monkeypatch):
         """No highlighted row: nothing was copied, so there is nothing to say about it."""
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -2990,21 +2963,20 @@ class TestDeferResetsAge:
         comparison hermetic -- independent of wall-clock time and of
         whatever priorities.yaml (if any) happens to live on the host.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.priority import Priorities
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
 
-        older = sr.DecisionRecord(
+        older = dr.DecisionRecord(
             id='dec-old',
             project='df',
             text='Old?',
             filed_at='2026-06-01T00:00:00+00:00',  # far enough back to saturate the age bonus
             manual_boost=0,
         )
-        newer = sr.DecisionRecord(
+        newer = dr.DecisionRecord(
             id='dec-new',
             project='df',
             text='New?',
@@ -3012,7 +2984,7 @@ class TestDeferResetsAge:
             manual_boost=0,
         )
         for d in (older, newer):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         before = _snapshot_tree(tmp_path)
         assert any(path.startswith('decisions/') for path in before)
@@ -3078,7 +3050,6 @@ class TestWeightEditorReordersAndPersists:
         -- the "another factor" a project-weight bump on 'beta' alone must
         overcome to flip the order.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.weight_editor import merge_weight_edits
@@ -3086,14 +3057,14 @@ class TestWeightEditorReordersAndPersists:
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
 
-        alpha = sr.DecisionRecord(
+        alpha = dr.DecisionRecord(
             id='alpha',
             project='alpha',
             text='Alpha?',
             filed_at='2026-07-07T00:00:00+00:00',
             manual_boost=0,
         )
-        beta = sr.DecisionRecord(
+        beta = dr.DecisionRecord(
             id='beta',
             project='beta',
             text='Beta?',
@@ -3101,7 +3072,7 @@ class TestWeightEditorReordersAndPersists:
             manual_boost=0,
         )
         for d in (alpha, beta):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(
@@ -3150,7 +3121,6 @@ class TestWeightEditorReordersAndPersists:
         code change -- cockpit.app.save_priorities is monkeypatched here to
         a no-op stand-in for the worst case, not to prove a NEW behavior.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.weight_editor import merge_weight_edits
@@ -3158,14 +3128,14 @@ class TestWeightEditorReordersAndPersists:
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
 
-        alpha = sr.DecisionRecord(
+        alpha = dr.DecisionRecord(
             id='alpha',
             project='alpha',
             text='Alpha?',
             filed_at='2026-07-07T00:00:00+00:00',
             manual_boost=0,
         )
-        beta = sr.DecisionRecord(
+        beta = dr.DecisionRecord(
             id='beta',
             project='beta',
             text='Beta?',
@@ -3173,7 +3143,7 @@ class TestWeightEditorReordersAndPersists:
             manual_boost=0,
         )
         for d in (alpha, beta):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         monkeypatch.setattr('cockpit.app.save_priorities', lambda *args, **kwargs: None)
 
@@ -3222,9 +3192,8 @@ class TestPrioritiesPathResolution:
         """
         from dataclasses import replace
 
-        from orchestrator.session_registry import fleet_root as resolve_fleet_root
+        from orchestrator.fleet_files import fleet_root as resolve_fleet_root
 
-        from cockpit.app import CockpitApp
         from cockpit.priority import Priorities, save_priorities
 
         seeded = replace(Priorities.default(), project_weights={'df': 7.0})
@@ -3245,7 +3214,6 @@ class TestWeightEditor:
     async def test_w_key_pushes_weight_editor_screen(self, tmp_path):
         """'w' (PRD §9 C9b weight editor) pushes a WeightEditorScreen (mirrors
         TestSpawnBar.test_new_session_key_pushes_spawn_screen)."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
@@ -3269,7 +3237,6 @@ class TestWeightEditor:
         """
         from textual.widgets import Input
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
         from cockpit.priority import Priorities
 
@@ -3311,7 +3278,6 @@ class TestWeightEditor:
         """
         from textual.widgets import Input
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
         from cockpit.priority import Priorities
 
@@ -3353,7 +3319,6 @@ class TestWeightEditor:
         cancel accidentally submit (or fail to dismiss) would leave
         *received* non-empty, or leave the screen on top, respectively.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
         from cockpit.priority import Priorities
 
@@ -3399,7 +3364,6 @@ class TestWeightEditor:
         """
         from textual.widgets import Input
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
         from cockpit.priority import Priorities
 
@@ -3446,7 +3410,6 @@ class TestWeightEditor:
         """
         from textual.widgets import Input
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
         from cockpit.priority import Priorities
 
@@ -3491,7 +3454,6 @@ class TestWeightEditor:
         """
         from textual.widgets import Input
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.weight_editor import WeightEditorScreen
         from cockpit.priority import Priorities
 
@@ -3530,7 +3492,6 @@ class TestSpawnBar:
     @pytest.mark.timeout(10)
     async def test_new_session_key_pushes_spawn_screen(self, tmp_path):
         """'n' (PRD §9 C5b spawn bar) pushes a SpawnScreen project/role/prompt picker."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05, spawn_runner=lambda argv: None)
@@ -3552,7 +3513,6 @@ class TestSpawnBar:
         runner is faked) -- driven directly per this task's plan, rather
         than through SpawnScreen's own Input/Select widgets.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import build_spawn_argv
 
         spawned: list[list[str]] = []
@@ -3582,8 +3542,6 @@ class TestSpawnBar:
         """spawn_session(..., skip_perms=True) (F9 fix, task 2518) threads
         through to build_spawn_argv, so argv[2] is the 'true' literal
         spawn-claude.sh's positional contract expects."""
-        from cockpit.app import CockpitApp
-
         spawned: list[list[str]] = []
         spawn_script = '/repo/skills/spawn/spawn-claude.sh'
 
@@ -3606,8 +3564,6 @@ class TestSpawnBar:
     async def test_spawn_session_forwards_skip_perms_false(self, tmp_path):
         """spawn_session(..., skip_perms=False) (F9 fix, task 2518) threads
         through to build_spawn_argv, so argv[2] is the 'false' literal."""
-        from cockpit.app import CockpitApp
-
         spawned: list[list[str]] = []
         spawn_script = '/repo/skills/spawn/spawn-claude.sh'
 
@@ -3634,7 +3590,6 @@ class TestSpawnBar:
         4th arg."""
         from textual.widgets import Checkbox
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
 
         calls: list[tuple[str, str, str, bool]] = []
@@ -3670,7 +3625,6 @@ class TestSpawnBar:
         env-configured default (F9 fix, task 2518)."""
         from textual.widgets import Checkbox
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
 
         calls: list[tuple[str, str, str, bool]] = []
@@ -3712,7 +3666,6 @@ class TestSpawnBar:
         expects at argv[2]."""
         from textual.widgets import Checkbox, Input
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
 
         monkeypatch.setenv('CLAUDE_SPAWN_SKIP_PERMS', 'true')
@@ -3754,7 +3707,6 @@ class TestSpawnBar:
         skip-perms Checkbox is seeded False -- the safe default."""
         from textual.widgets import Checkbox
 
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_bar import SpawnScreen
 
         monkeypatch.delenv('CLAUDE_SPAWN_SKIP_PERMS', raising=False)
@@ -3776,7 +3728,6 @@ class TestSpawnTree:
     async def test_toggle_key_pushes_tree_screen_with_structure(self, tmp_path):
         """'t' (Fleet Cockpit C9a spawn-tree toggle) pushes a SpawnTreeScreen
         rendering the parent_session_id parent→child session-tree structure."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
 
         parent = _make_record(session_slug='parent-1', parent_session_id=None)
@@ -3805,7 +3756,6 @@ class TestSpawnTree:
         """Outstanding (non-terminal) children are visually marked in the
         rendered tree (Fleet Cockpit C9a, PRD §9) -- pins the "outstanding
         children highlighted" half of the leaf signal at the widget level."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_tree import _OUTSTANDING_MARKER, SpawnTree, SpawnTreeScreen
 
         parent = _make_record(session_slug='parent-1', parent_session_id=None)
@@ -3849,7 +3799,6 @@ class TestSpawnTreeEnterFocus:
         the focus backend -- the C9a leaf signal (PRD §9), mirroring
         TestEnterFocus's decision-queue contract at the tree-toggle level.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
 
@@ -3889,7 +3838,6 @@ class TestSpawnTreeEnterFocus:
     async def test_enter_on_child_with_no_display_is_fail_soft(self, tmp_path):
         """A child with no Display resolves to no focus target -- pressing
         Enter on it must not focus anything and must not raise (PRD §2)."""
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
 
@@ -3927,7 +3875,6 @@ class TestSpawnTreeEnterFocus:
         opened tree's own snapshot, once stale) resolves to no record at all
         -- the `record is None` branch -- and must not raise or focus
         anything (PRD §2), mirroring the no-Display fail-soft case above."""
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
 
         some_record = _make_record(session_slug='parent-1', parent_session_id=None)
@@ -3956,7 +3903,6 @@ class TestSpawnTreeEnterFocus:
         alternate approach stops disk from still backing the child.
         Enter must still focus the original child's Display, exactly as if
         the poll tick had never landed."""
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
 
@@ -4014,7 +3960,6 @@ class TestSessionTableEnterFocus:
         mirroring TestSpawnTreeEnterFocus's contract at the top-level
         session-table Enter path.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.session_table import SessionTable
 
@@ -4060,7 +4005,6 @@ class TestSessionTableEnterFocus:
         """A session row with no Display resolves to no focus target --
         pressing Enter on it must not focus anything and must not raise
         (PRD §2), mirroring TestSpawnTreeEnterFocus's no-Display guard."""
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.session_table import SessionTable
 
@@ -4087,7 +4031,6 @@ class TestSpawnTreeToggle:
         """'t' toggles: pressing it again while the tree is open closes it
         (back to the default screen) rather than leaving it open or
         pushing a second modal on top (Fleet Cockpit C9a, PRD §9)."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_tree import SpawnTreeScreen
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
@@ -4106,7 +4049,6 @@ class TestSpawnTreeToggle:
     async def test_escape_closes_the_open_tree(self, tmp_path):
         """'escape' also dismisses the open spawn-tree modal, mirroring
         SpawnScreen.action_cancel's own escape-to-dismiss binding."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_tree import SpawnTreeScreen
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=0.05)
@@ -4142,7 +4084,6 @@ class TestRefreshWriteDiscipline:
         direct refresh_registry() call, so the diff below isolates exactly
         what the automatic refresh/diff path itself writes: nothing.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
@@ -4152,13 +4093,13 @@ class TestRefreshWriteDiscipline:
         )
         sr.write_record(running, root=tmp_path)
 
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-refresh-wd-1',
             project='df',
             text='Which port?',
             filed_at='2026-07-07T00:00:00+00:00',
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -4226,19 +4167,18 @@ class TestNonBlockingPoll:
 
     @pytest.mark.timeout(10)
     async def test_poll_scan_runs_off_thread_and_event_loop_stays_responsive(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.spawn_tree import SpawnTreeScreen
 
         scanner = _BlockingScanner()
         # A large poll_interval keeps on_mount's own set_interval timer from
         # firing (and launching a second, uncontrolled worker) during this
         # test -- the only scan driven here is the explicit
-        # _scan_registry_worker() call below.
+        # _poll_registry() call below.
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60, scanner=scanner)
         async with app.run_test() as pilot:
             await pilot.pause()  # on_mount's synchronous scan: call #1, non-blocking
 
-            app._scan_registry_worker(app._next_scan_seq())
+            app._poll_registry()
             while not scanner.started.is_set():
                 await asyncio.sleep(0.01)
 
@@ -4268,7 +4208,6 @@ class TestThreadedScanReachesUI:
 
     @pytest.mark.timeout(10)
     async def test_worker_result_reaches_table_and_writes_nothing(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         first = _make_record(session_slug='thread-1', status=sr.Status.RUNNING)
@@ -4276,7 +4215,7 @@ class TestThreadedScanReachesUI:
 
         # A large poll_interval keeps on_mount's own set_interval timer from
         # firing a second, uncontrolled worker mid-test -- the only scan
-        # driven here is the explicit _scan_registry_worker() call below.
+        # driven here is the explicit _poll_registry() call below.
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -4291,8 +4230,8 @@ class TestThreadedScanReachesUI:
             # so the "unchanged" assertion below isn't vacuously true.
             assert any(path.startswith('sessions/') for path in before)
 
-            worker = app._scan_registry_worker(app._next_scan_seq())
-            await worker.wait()
+            app._poll_registry()
+            await app.workers.wait_for_complete()
             await pilot.pause()
 
             # proves the off-thread -> call_from_thread(_apply_scan)
@@ -4394,8 +4333,6 @@ class TestScanBackpressure:
 
     @pytest.mark.timeout(10)
     async def test_overlapping_tick_is_dropped_while_scan_in_flight(self, tmp_path):
-        from cockpit.app import CockpitApp
-
         scanner = _BlockingCountingScanner()
         # A large poll_interval keeps on_mount's own set_interval timer from
         # firing an uncontrolled worker mid-test -- the only ticks driven
@@ -4427,8 +4364,6 @@ class TestScanBackpressure:
     async def test_scan_in_flight_clears_after_a_raising_scan(self, tmp_path):
         from textual.worker import WorkerFailed
 
-        from cockpit.app import CockpitApp
-
         scanner = _RaisingThenOkScanner()
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60, scanner=scanner)
         async with app.run_test() as pilot:
@@ -4443,87 +4378,41 @@ class TestScanBackpressure:
             assert scanner.calls == 3
 
 
-class TestStaleScanSequenceGuard:
-    """esc-2517-1 (task 2517 verify) / task 2606: a stale threaded-poll scan
-    result must never regress the view below whatever a fresher scan already
-    applied. The real hazard is a call_from_thread hand-off landing out of
-    order -- a genuine thread race, and thus inherently timing-dependent to
-    reproduce with real poll ticks (see TestPollRefresh's docstring, which
-    hits the identical hazard and, for the same reason, drives
-    refresh_registry() directly instead of racing the poll timer). This test
-    pins the guard deterministically at the _apply_scan seam instead, with
-    hand-chosen sequence numbers standing in for "which scan read the
-    registry first".
+class TestALatePollCannotRegressAFresherScan:
+    """esc-2517-1 / task 2606: a poll worker's call_from_thread hand-off that lands
+    after a fresher scan must not regress the view, replayed through a real held
+    worker. The last phase also proves the worker carries its own scan's freshness
+    across the thread boundary.
     """
 
     @pytest.mark.timeout(10)
-    async def test_stale_scan_result_is_ignored_by_apply_scan(self, tmp_path):
-        from cockpit.app import CockpitApp
+    async def test_a_poll_landing_after_a_fresher_scan_is_dropped_and_the_next_poll_applies(
+        self, tmp_path
+    ):
         from cockpit.panes.session_table import SessionTable
 
-        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
+        sr.write_record(_make_record(session_slug='r-1'), root=tmp_path)
+        reader = _HoldingDecisionsReader()
+        app = CockpitApp(fleet_root=tmp_path, poll_interval=60, decisions_reader=reader)
         async with app.run_test() as pilot:
             await pilot.pause()
             table = app.query_one(SessionTable)
+            assert table.row_count == 1
 
-            # FRESH: seq 100 applies cleanly.
-            fresh = [
-                _make_record(session_slug='fresh-1', status=sr.Status.RUNNING),
-                _make_record(session_slug='fresh-2', status=sr.Status.RUNNING),
-            ]
-            app._apply_scan(fresh, [], 100)
+            async with _poll_held_after_its_read(app, reader):
+                sr.write_record(_make_record(session_slug='r-2'), root=tmp_path)
+                app.refresh_registry()
+                await pilot.pause()
+                assert table.row_count == 2
+
             await pilot.pause()
-            assert table.row_count == 2
+            assert table.row_count == 2, 'the late poll regressed the view'
 
-            # STALE: seq 50 (< the 100 high-water mark) read the registry
-            # earlier and must be dropped -- not clobber fresh's 2 rows back
-            # down to 1.
-            stale = [_make_record(session_slug='stale-1', status=sr.Status.RUNNING)]
-            app._apply_scan(stale, [], 50)
+            sr.write_record(_make_record(session_slug='r-3'), root=tmp_path)
+            app._poll_registry()
+            await app.workers.wait_for_complete()
             await pilot.pause()
-            assert table.row_count == 2
-
-            # NEWER: seq 101 (> the 100 high-water mark) still applies --
-            # the guard blocks only stale results, never freezes the view.
-            newer = [
-                _make_record(session_slug='newer-1', status=sr.Status.RUNNING),
-                _make_record(session_slug='newer-2', status=sr.Status.RUNNING),
-                _make_record(session_slug='newer-3', status=sr.Status.RUNNING),
-            ]
-            app._apply_scan(newer, [], 101)
-            await pilot.pause()
-            assert table.row_count == 3
-
-    @pytest.mark.timeout(10)
-    async def test_scan_registry_worker_forwards_its_seq_to_apply_scan(self, tmp_path, monkeypatch):
-        """The seam test above proves _apply_scan's own drop/keep logic given
-        hand-picked seqs, but never exercises the real
-        _scan_registry_worker -> _call_from_thread_fail_soft(_apply_scan)
-        hand-off that carries *seq* across the thread boundary in
-        production. Patches _apply_scan with a spy and drives the worker
-        directly, closing that gap: proves the sequence number
-        _next_scan_seq() issues before launching the worker is the exact
-        same value that reaches _apply_scan on the far side of the
-        call_from_thread hand-off -- i.e. that the plumbing forwards seq
-        unchanged, not just that the seam's guard behaves given some seq.
-        """
-        from cockpit.app import CockpitApp
-
-        app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
-        async with app.run_test() as pilot:
-            await pilot.pause()  # on_mount's synchronous initial scan
-
-            recorded_seqs = []
-            monkeypatch.setattr(
-                app, '_apply_scan', lambda records, decisions, seq: recorded_seqs.append(seq)
-            )
-
-            issued = app._next_scan_seq()
-            worker = app._scan_registry_worker(issued)
-            await worker.wait()
-            await pilot.pause()
-
-            assert recorded_seqs == [issued]
+            assert table.row_count == 3, 'the stale guard froze the view'
 
 
 class TestInFlightScanCannotUndoAKeypressWrite:
@@ -4532,30 +4421,26 @@ class TestInFlightScanCannotUndoAKeypressWrite:
 
     _apply_boost and action_drop write a decision and then re-read
     decisions, but a poll scan issued BEFORE that write, whose registry read
-    predates it, can land AFTER it. As in TestStaleScanSequenceGuard, the
-    poll pipeline's two halves are driven by hand, because racing the real
-    timer is what made the original test flaky: _next_scan_seq() plus
-    _scan_registry() stand in for _poll_registry issuing a seq and its worker
-    reading the registry, and _apply_scan(records, decisions, seq) stands in
-    for the late call_from_thread hand-off. poll_interval=60 keeps a real
-    tick from landing mid-test.
+    predates it, can land AFTER it. Each replay holds a REAL poll worker
+    after its registry read (_HoldingDecisionsReader), interleaves the
+    keypress, then lets the worker land through the real call_from_thread
+    hand-off.
     """
 
     @pytest.mark.timeout(10)
     async def test_a_boost_survives_a_scan_issued_before_it(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.priority import Priorities
 
-        older = sr.DecisionRecord(
+        older = dr.DecisionRecord(
             id='dec-a',
             project='df',
             text='A?',
             filed_at='2026-06-01T00:00:00+00:00',
             manual_boost=0,
         )
-        newer = sr.DecisionRecord(
+        newer = dr.DecisionRecord(
             id='dec-b',
             project='df',
             text='B?',
@@ -4563,15 +4448,17 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             manual_boost=0,
         )
         for d in (older, newer):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+        reader = _HoldingDecisionsReader()
         app = CockpitApp(
             fleet_root=tmp_path,
             backend=FakeBackend(),
             poll_interval=60,
             now_fn=lambda: fixed_now,
             priorities=Priorities.default(),
+            decisions_reader=reader,
         )
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -4579,15 +4466,12 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             queue.move_cursor(row=queue.get_row_index('decision:dec-b'))
             await pilot.pause()
 
-            in_flight_seq = app._next_scan_seq()
-            records, decisions = app._scan_registry()
-            assert {d.id: d.manual_boost for d in decisions}['dec-b'] == 0
+            async with _poll_held_after_its_read(app, reader):
+                assert {d.id: d.manual_boost for d in reader.held_result}['dec-b'] == 0
+                await pilot.press('b')
+                await pilot.pause()
+                assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a')
 
-            await pilot.press('b')
-            await pilot.pause()
-            assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a')
-
-            app._apply_scan(records, decisions, in_flight_seq)
             await pilot.pause()
             assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a'), (
                 "the late scan reverted the keypress's persisted boost in the view"
@@ -4596,7 +4480,7 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             for _ in range(2):
                 await pilot.press('b')
                 await pilot.pause()
-            persisted = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+            persisted = {d.id: d for d in dr.list_decisions(root=tmp_path)}
             assert persisted['dec-b'].manual_boost == 3, (
                 'a press built on the reverted boost and was lost'
             )
@@ -4605,38 +4489,37 @@ class TestInFlightScanCannotUndoAKeypressWrite:
     async def test_a_drop_survives_a_scan_issued_before_it(self, tmp_path):
         from textual.widgets.data_table import RowDoesNotExist
 
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        first = sr.DecisionRecord(
+        first = dr.DecisionRecord(
             id='dec-1', project='df', text='First?', filed_at='2026-07-07T00:00:00+00:00'
         )
-        second = sr.DecisionRecord(
+        second = dr.DecisionRecord(
             id='dec-2', project='df', text='Second?', filed_at='2026-07-07T00:00:00+00:00'
         )
         for d in (first, second):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
-        app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
+        reader = _HoldingDecisionsReader()
+        app = CockpitApp(
+            fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60, decisions_reader=reader
+        )
         async with app.run_test() as pilot:
             await pilot.pause()
             queue = app.query_one(DecisionQueue)
             queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
             await pilot.pause()
 
-            in_flight_seq = app._next_scan_seq()
-            records, decisions = app._scan_registry()
-            assert {d.id: d.state for d in decisions} == {
-                'dec-1': sr.DecisionState.OPEN,
-                'dec-2': sr.DecisionState.OPEN,
-            }
+            async with _poll_held_after_its_read(app, reader):
+                assert {d.id: d.state for d in reader.held_result} == {
+                    'dec-1': dr.DecisionState.OPEN,
+                    'dec-2': dr.DecisionState.OPEN,
+                }
+                await pilot.press('x')
+                await pilot.pause()
+                assert queue.row_count == 1
 
-            await pilot.press('x')
-            await pilot.pause()
-            assert queue.row_count == 1
-
-            app._apply_scan(records, decisions, in_flight_seq)
             await pilot.pause()
             assert queue.row_count == 1, 'the late scan resurrected the dropped decision'
             with pytest.raises(RowDoesNotExist):
@@ -4650,20 +4533,19 @@ class TestInFlightScanCannotUndoAKeypressWrite:
         keypresses kept landing mid-scan -- on a large fleet, whose scan
         outlasts the gap between presses, a whole triage burst.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.session_table import SessionTable
         from cockpit.priority import Priorities
 
-        older = sr.DecisionRecord(
+        older = dr.DecisionRecord(
             id='dec-a',
             project='df',
             text='A?',
             filed_at='2026-06-01T00:00:00+00:00',
             manual_boost=0,
         )
-        newer = sr.DecisionRecord(
+        newer = dr.DecisionRecord(
             id='dec-b',
             project='df',
             text='B?',
@@ -4671,15 +4553,17 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             manual_boost=0,
         )
         for d in (older, newer):
-            assert sr.write_decision(d, root=tmp_path)
+            assert dr.write_decision(d, root=tmp_path)
 
         fixed_now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
+        reader = _HoldingDecisionsReader()
         app = CockpitApp(
             fleet_root=tmp_path,
             backend=FakeBackend(),
             poll_interval=60,
             now_fn=lambda: fixed_now,
             priorities=Priorities.default(),
+            decisions_reader=reader,
         )
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -4689,15 +4573,11 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             await pilot.pause()
 
             sr.write_record(_make_record(session_slug='running-1'), root=tmp_path)
-            in_flight_seq = app._next_scan_seq()
-            records, decisions = app._scan_registry()
-            assert [r.session_slug for r in records] == ['running-1']
+            async with _poll_held_after_its_read(app, reader):
+                await pilot.press('b')
+                await pilot.pause()
+                assert table.row_count == 0
 
-            await pilot.press('b')
-            await pilot.pause()
-            assert table.row_count == 0
-
-            app._apply_scan(records, decisions, in_flight_seq)
             await pilot.pause()
             assert table.row_count == 1, "the keypress's re-read voided the scan's sessions"
             assert queue.get_row_index('decision:dec-b') < queue.get_row_index('decision:dec-a'), (
@@ -4713,7 +4593,6 @@ class TestDecisionQueueDetail:
         full -- and syncing it there must not disturb the session table's own
         detail sync or the selected-slug restore seam.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -4745,17 +4624,17 @@ class TestDecisionQueueDetail:
             'queue, or leave it open for the watcher to re-file it?'
         )
         assert len(long_question) > 60
-        first = sr.DecisionRecord(
+        first = dr.DecisionRecord(
             id='dec-first', project='df', text='Short one?',
             filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
         )
-        target = sr.DecisionRecord(
+        target = dr.DecisionRecord(
             id='dec-second', project='df', text=long_question,
             filed_at='2026-07-07T00:00:00+00:00',
             task_id='5449', escalation_id='esc-5449-2', severity='blocking',
         )
         for decision in (first, target):
-            assert sr.write_decision(decision, root=tmp_path)
+            assert dr.write_decision(decision, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
         async with app.run_test() as pilot:
@@ -4801,7 +4680,6 @@ class TestDecisionQueueDetail:
         consistent alternative. The queue's session row still must not write
         _selected_slug: that restore seam is the session TABLE's alone.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -4830,11 +4708,11 @@ class TestDecisionQueueDetail:
             sr.write_record(record, root=tmp_path)
 
         # outscores the session row, so the session row is not highlighted at mount
-        decision = sr.DecisionRecord(
+        decision = dr.DecisionRecord(
             id='dec-first', project='df', text='Short one?',
             filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
         )
-        assert sr.write_decision(decision, root=tmp_path)
+        assert dr.write_decision(decision, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=0.05)
         async with app.run_test() as pilot:
@@ -4866,7 +4744,6 @@ class TestDecisionQueueDetail:
         own restore seam stays a function of the session table alone, rebuild
         or not.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -4883,16 +4760,16 @@ class TestDecisionQueueDetail:
             'Should the reaper close this decision against the other escalation '
             'queue, or leave it open for the watcher to re-file it?'
         )
-        first = sr.DecisionRecord(
+        first = dr.DecisionRecord(
             id='dec-first', project='df', text='Short one?',
             filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
         )
-        target = sr.DecisionRecord(
+        target = dr.DecisionRecord(
             id='dec-second', project='df', text=long_question,
             filed_at='2026-07-07T00:00:00+00:00',
         )
         for decision in (first, target):
-            assert sr.write_decision(decision, root=tmp_path)
+            assert dr.write_decision(decision, root=tmp_path)
 
         # a large poll_interval keeps on_mount's own timer from racing the
         # direct refresh_registry() below -- TestPollRefresh's convention
@@ -4944,7 +4821,6 @@ class TestDecisionQueueDetail:
         a regression of startup behaviour and of the cockpit-ui.json restore (the
         restored slug's own repost fires only when its row index changes).
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.detail_pane import DetailPane
         from cockpit.panes.session_table import SessionTable
@@ -4965,8 +4841,8 @@ class TestDecisionQueueDetail:
             _make_record(session_slug='session-other', start_ts='2026-07-07T00:01:00+00:00'),
             root=tmp_path,
         )
-        assert sr.write_decision(
-            sr.DecisionRecord(
+        assert dr.write_decision(
+            dr.DecisionRecord(
                 id='dec-low', project='df', text='ZZZ decision question?',
                 filed_at='2026-07-07T00:00:00+00:00',
             ),
@@ -4990,7 +4866,6 @@ class TestDecisionQueueDetail:
         filed while they read a session row shifts the queue's highlighted INDEX,
         and the resulting repost yanks the pane out from under them.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -5010,8 +4885,8 @@ class TestDecisionQueueDetail:
             ),
             root=tmp_path,
         )
-        assert sr.write_decision(
-            sr.DecisionRecord(
+        assert dr.write_decision(
+            dr.DecisionRecord(
                 id='dec-existing', project='df', text='Short one?',
                 filed_at='2026-07-07T00:00:00+00:00',
             ),
@@ -5037,8 +4912,8 @@ class TestDecisionQueueDetail:
             # a newly-filed, boosted decision lands ABOVE the existing one, so the
             # queue's highlighted row index genuinely shifts on the rebuild
             assert queue.get_row_index('decision:dec-existing') == 0
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id='dec-new', project='df', text='ZZZ brand new decision?',
                     filed_at='2026-07-07T00:02:00+00:00', manual_boost=9,
                 ),
@@ -5065,7 +4940,6 @@ class TestDecisionQueueDetail:
         that hands the pane to the queue mid-drag, off a session row the
         operator deliberately parked on.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -5088,8 +4962,8 @@ class TestDecisionQueueDetail:
         long_question = 'ZZZ decision question? ' + ('padded out to overflow the column. ' * 8)
         filed_at = (datetime.now(UTC) - timedelta(days=3)).isoformat()
         for decision_id, boost in (('dec-high', 5), ('dec-low', 0)):
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id=decision_id,
                     project='df',
                     text=long_question,
@@ -5145,7 +5019,6 @@ class TestDecisionQueueDetail:
         test that leaves both tables pointing at the same session passes for the
         wrong reason.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -5169,8 +5042,8 @@ class TestDecisionQueueDetail:
             root=tmp_path,
         )
         # outscores the session row, so the queue's session row is not row 0
-        assert sr.write_decision(
-            sr.DecisionRecord(
+        assert dr.write_decision(
+            dr.DecisionRecord(
                 id='dec-first', project='df', text='Short one?',
                 filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
             ),
@@ -5227,7 +5100,6 @@ class TestDecisionQueueDetail:
         stale self._decisions, since an unchanged question is exactly what a
         stale render shows.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -5243,16 +5115,16 @@ class TestDecisionQueueDetail:
             'queue, or leave it open for the watcher to re-file it?'
         )
         for decision in (
-            sr.DecisionRecord(
+            dr.DecisionRecord(
                 id='dec-first', project='df', text='Short one?',
                 filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
             ),
-            sr.DecisionRecord(
+            dr.DecisionRecord(
                 id='dec-second', project='df', text=long_question,
                 filed_at='2026-07-07T00:00:00+00:00',
             ),
         ):
-            assert sr.write_decision(decision, root=tmp_path)
+            assert dr.write_decision(decision, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, backend=FakeBackend(), poll_interval=60)
         async with app.run_test() as pilot:
@@ -5279,8 +5151,8 @@ class TestDecisionQueueDetail:
             # (_DECISION_SNAPSHOT_FIELDS), so this alone would trigger the
             # rebuild even without the session above
             revised_question = long_question.replace('re-file it?', 're-file it, REVISED?')
-            assert sr.write_decision(
-                sr.DecisionRecord(
+            assert dr.write_decision(
+                dr.DecisionRecord(
                     id='dec-second', project='df', text=revised_question,
                     filed_at='2026-07-07T00:00:00+00:00',
                 ),
@@ -5305,7 +5177,6 @@ class TestDecisionQueueDetail:
         longer exists with no rebuild able to clear it -- a wedged pane, not a
         transient miss. So an empty queue releases ownership.
         """
-        from cockpit.app import CockpitApp
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
         from cockpit.panes.detail_pane import DetailPane
@@ -5335,16 +5206,16 @@ class TestDecisionQueueDetail:
         # no RowHighlighted at all -- with one queue row the queue could never
         # take ownership and this test would pass vacuously.
         for decision in (
-            sr.DecisionRecord(
+            dr.DecisionRecord(
                 id='dec-top', project='df', text='Short one?',
                 filed_at='2026-07-07T00:00:00+00:00', manual_boost=5,
             ),
-            sr.DecisionRecord(
+            dr.DecisionRecord(
                 id='dec-read', project='df', text='ZZZ the decision being read?',
                 filed_at='2026-07-07T00:00:00+00:00',
             ),
         ):
-            assert sr.write_decision(decision, root=tmp_path)
+            assert dr.write_decision(decision, root=tmp_path)
 
         # a large poll_interval keeps on_mount's own timer from racing the
         # direct refresh_registry() below -- TestPollRefresh's convention
@@ -5366,8 +5237,8 @@ class TestDecisionQueueDetail:
             # a watcher answers every open decision -- the queue empties under
             # the operator's cursor
             for decision_id in ('dec-top', 'dec-read'):
-                assert sr.update_decision_state(
-                    decision_id, sr.DecisionState.ANSWERED, root=tmp_path
+                assert dr.update_decision_state(
+                    decision_id, dr.DecisionState.ANSWERED, root=tmp_path
                 )
             app.refresh_registry()
             await pilot.pause()
@@ -5406,7 +5277,6 @@ class TestSessionTableFocusCue:
 
     @pytest.mark.timeout(10)
     async def test_focusable_and_headless_rows_are_distinguishable(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable, focus_marker, state_glyph
 
         focusable = _make_record(
@@ -5466,7 +5336,6 @@ class TestSessionTableCapNotice:
 
     @pytest.mark.timeout(10)
     async def test_replace_rows_reports_and_clears_the_cap_notice(self, tmp_path):
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import LiveSessions, SessionTable
 
         records = [
@@ -5508,7 +5377,6 @@ class TestSessionTableCapNotice:
         the cap to bite, and this keeps the test in the same sub-second
         band as its neighbours.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, SessionTable
 
         over_cap = [
@@ -5532,7 +5400,6 @@ class TestSessionTableCapNotice:
     async def test_small_fleet_claims_no_truncation(self, tmp_path):
         """A fleet that fits stays quiet -- a complete table must not
         announce itself as capped."""
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
 
         records = [
@@ -5562,7 +5429,6 @@ class TestSessionTableCapNotice:
         live band does not) because with a small fleet an empty subtitle
         after 'h' is true no matter what the history branch reports.
         """
-        from cockpit.app import CockpitApp
         from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, SessionTable
 
         live = [

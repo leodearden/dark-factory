@@ -31,6 +31,9 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+
 REPO_ROOT = Path(__file__).parents[2]
 # APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
 # subproject directories resolve as namespace packages shadowing their own
@@ -44,6 +47,8 @@ from df_pytest_isolation import (  # noqa: E402
     PYTEST_SESSION_TOKEN_ENV,
     assert_synthetic_units,
 )
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 SCRIPT = REPO_ROOT / "scripts" / "restart-all-orchestrators.sh"
 # The ORIGINAL synthetic literal, and the precedent task 3799's allowlist prefix
@@ -167,6 +172,7 @@ def _run_script(
     lease_swap: dict | None = None,
     no_units: bool = False,
     extra_args: tuple[str, ...] = (),
+    subprocess_timeout: float = 30,
 ) -> subprocess.CompletedProcess[bytes]:
     bin_dir = tmp_path / "bin"
     _make_fake_systemctl(bin_dir)
@@ -210,7 +216,7 @@ def _run_script(
         [str(SCRIPT), *extra_args],
         env=env,
         capture_output=True,
-        timeout=30,
+        timeout=subprocess_timeout,
     )
 
 
@@ -263,8 +269,12 @@ def test_unit_fresh_only_during_grace_still_verifies_and_stamps(tmp_path: Path) 
 
     VERIFY_TIMEOUT=1 gives exactly one `show` call before the initial
     window expires (still stale, since FRESH_AFTER=2). The grace window
-    (5s) then gets several more 1/sec polls, flipping fresh on the third
-    call.
+    then gets several more 1/sec polls, flipping fresh on the third call.
+
+    The grace is a generous ceiling, not a duration (task 6446): the script
+    leaves the loop the moment the fake turns fresh, so the normal run still
+    takes a few seconds, while a heavily loaded xdist worker -- where every
+    poll spawns a bash shim -- cannot exhaust it before the flip.
     """
     clock_file = tmp_path / "last_redeploy_orchestrator.json"
 
@@ -273,8 +283,9 @@ def test_unit_fresh_only_during_grace_still_verifies_and_stamps(tmp_path: Path) 
         scenario="delayed-fresh",
         clock_file=clock_file,
         verify_timeout="1",
-        verify_grace="5",
+        verify_grace="60",
         fresh_after_calls="2",
+        subprocess_timeout=120,
     )
 
     stdout = result.stdout.decode(errors="replace")
@@ -407,10 +418,11 @@ def test_the_stamp_is_still_well_formed_json_for_a_hostile_token(
 
     printf cannot escape JSON, so an env value carrying a quote, a backslash, a
     newline or a brace could otherwise produce a syntactically broken file --
-    and _read_clock_epoch fails OPEN on a corrupt body, which would disarm the
-    very min-interval cap this stamp exists to arm. The token's exact value is
-    not asserted (it is unrepresentable here by construction), but its
-    EMPTINESS is: sanitising away a token that was genuinely present would
+    and scripts/_watchdog_state.py::read_clock_epoch fails OPEN on a corrupt
+    body, which would disarm the very min-interval cap this stamp exists to
+    arm. The token's exact value is not asserted (it is unrepresentable here
+    by construction), but its EMPTINESS is: sanitising away a token that was
+    genuinely present would
     forgive the very write it proves, since empty is what
     df_pytest_isolation.py::deploy_clock_change_report reads as "no pytest
     session was an ancestor of this write". So the sanitiser drops to a

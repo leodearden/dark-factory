@@ -42,6 +42,10 @@
 #           2026-08-27: the committed .md and .json disagree on column order, so
 #           the .md the flip operator reads is provably not the render of the
 #           committed .json. Values agree -- what is broken is traceability.
+#           Since task 5845 the outcome order is built in
+#           fused-memory/scripts/eval_write_triage_scoring.py::EVAL_OUTCOMES, so
+#           item 2 greps both that file and the CLI, and fails closed if either
+#           cannot be read.
 #   item 4  report_path.with_suffix('.md') means `--report-path foo.md` writes the
 #           JSON and then OVERWRITES it with the markdown, losing the JSON.
 #
@@ -102,7 +106,11 @@ REF="${WRITE_TRIAGE_GATE_REF:-main}"
 JUDGE='fused-memory/src/fused_memory/server/write_triage_judge.py'
 TRIAGE='fused-memory/src/fused_memory/server/write_triage.py'
 EVAL='fused-memory/scripts/eval_write_triage_judge.py'
+SCORING='fused-memory/scripts/eval_write_triage_scoring.py'
 CONF='fused-memory/config/config.yaml'
+
+# Item 2's defect, a direct iteration of the frozenset; read against $EVAL and $SCORING.
+ITEM2_PATTERN='dict\.fromkeys(TRIAGE_OUTCOMES\|list(TRIAGE_OUTCOMES)'
 
 # The item-1 probe, and the interpreter that runs it. The env seam mirrors
 # scripts/check_sandbox_soak.sh's CHECK_SANDBOX_SOAK_PY: it is what lets the
@@ -116,6 +124,14 @@ PROBE="$REPO/scripts/check_write_triage_attach_target.py"
 # scripts/tests/test_check_write_triage_flip_preconditions.py so the two
 # cannot drift apart silently.
 PROBE_PASS_MARKER='PASS  the judge path binds a verdict to a determinate candidate'
+
+# Both probes start every NOT-held and every UNVERIFIABLE verdict line with
+# this prefix. An exit 1 whose report carries no such line is no verdict: the
+# probe died before it could report -- a missing or broken
+# scripts/_write_triage_probe_common.py, which both probes import, or a crash
+# in the probe itself -- and Python's own exit 1 there leaves only a traceback
+# on stderr. Pinned from both ends by the hermetic tests, like PROBE_PASS_MARKER.
+PROBE_FAIL_PREFIX='FAIL  '
 
 # The probe's marker for a pass that rests partly on a PARAMETER NAME rather
 # than on behaviour alone (it accepts a target-named parameter that echoes its
@@ -372,7 +388,7 @@ elif [ "$EXTRACTED" -eq 1 ]; then
       note "              the invariant. Failing closed."
       record_fail 1
       show_probe_stderr=1
-    elif [ "$probe_rc" -eq 1 ]; then
+    elif [ "$probe_rc" -eq 1 ] && grep -q "^$PROBE_FAIL_PREFIX" <<<"$probe_out"; then
       # DELIBERATELY TERSE. The harm, BOTH accepted remedies and the
       # candidates[0] warning are all stated by the probe's own report,
       # printed directly below this and carrying the MEASURED slate. Stating
@@ -384,6 +400,11 @@ elif [ "$EXTRACTED" -eq 1 ]; then
       note "              The harm, BOTH accepted remedies and what was measured are in"
       note "              the probe's own report below."
       record_fail 1
+    elif [ "$probe_rc" -eq 1 ]; then
+      note "FAIL  item 1  UNVERIFIABLE: the probe exited 1 without reporting a verdict."
+      note "              It stopped before it could report (see its stderr below). Failing closed."
+      record_fail 1
+      show_probe_stderr=1
     else
       note "FAIL  item 1  UNVERIFIABLE: the probe could not be run (exit $probe_rc)."
       note "              Interpreter: ${PROBE_PY_CMD[*]}. Failing closed."
@@ -407,30 +428,46 @@ fi
 # --- item 2: the committed accuracy artifact must be reproducible -------------
 if read_ref_file "$EVAL"; then
   eval_src="$REF_CONTENT"
-  # Here-string, not a pipe -- same pipefail/SIGPIPE race as item 1 above, and
-  # here it fails the OTHER way: a spurious non-zero takes the else branch and
-  # prints `PASS item 2` for an eval script that still iterates the frozenset.
+  # Here-strings over the ref's eval sources, not pipes -- same pipefail/SIGPIPE
+  # race as item 1 above, and here it fails the OTHER way: a spurious non-zero
+  # takes the else branch and prints `PASS item 2` for an eval script that still
+  # iterates the frozenset.
   # Measured: a 960 KB $eval_src with the pattern first gives PIPESTATUS=(141 0)
   # piped -- grep matched, printf SIGPIPE-killed -- 200/200 spurious PASS piped
   # vs 0/200 here-string. Pinned by
   # scripts/tests/test_check_write_triage_flip_preconditions.py::TestItemsTwoAndFourReadingIsNotRaceProne
   # so the two cannot drift apart silently. Do not "tidy" this back into a pipe.
-  if grep -q 'dict\.fromkeys(TRIAGE_OUTCOMES\|list(TRIAGE_OUTCOMES)' <<<"$eval_src"; then
-    note "FAIL  item 2  $EVAL still iterates the TRIAGE_OUTCOMES frozenset directly"
-    note "              Column/key order is PYTHONHASHSEED-dependent, so the committed"
-    note "              JSON and markdown churn between identical runs. Measured"
-    note "              2026-08-27: the committed .md header order and the committed"
-    note "              .json confusion order DISAGREE, so the report the flip operator"
-    note "              reads is not the render of the committed JSON. Values agree —"
-    note "              it is traceability that is broken, and step 1 of this gate"
-    note "              rests on that artifact."
-    note "              Fix: a module-level EVAL_OUTCOMES = tuple(sorted(TRIAGE_OUTCOMES))"
-    note "              mirroring the existing EVAL_CLASSES tuple, used in both places."
-    note "              Precedent for pinning it (task 4012): assert"
-    note "              MD.read_text() == render_markdown(json.loads(JSON.read_text()))."
-    record_fail 2
+  if read_ref_file "$SCORING"; then
+    scoring_src="$REF_CONTENT"
+    item2_offenders=()
+    if grep -q "$ITEM2_PATTERN" <<<"$eval_src"; then
+      item2_offenders+=("$EVAL")
+    fi
+    if grep -q "$ITEM2_PATTERN" <<<"$scoring_src"; then
+      item2_offenders+=("$SCORING")
+    fi
+    if [ "${#item2_offenders[@]}" -gt 0 ]; then
+      for offender in "${item2_offenders[@]}"; do
+        note "FAIL  item 2  $offender still iterates the TRIAGE_OUTCOMES frozenset directly"
+      done
+      note "              Column/key order is PYTHONHASHSEED-dependent, so the committed"
+      note "              JSON and markdown churn between identical runs. Measured"
+      note "              2026-08-27: the committed .md header order and the committed"
+      note "              .json confusion order DISAGREE, so the report the flip operator"
+      note "              reads is not the render of the committed JSON. Values agree —"
+      note "              it is traceability that is broken, and step 1 of this gate"
+      note "              rests on that artifact."
+      note "              Fix: a module-level EVAL_OUTCOMES = tuple(sorted(TRIAGE_OUTCOMES))"
+      note "              mirroring the existing EVAL_CLASSES tuple, used in both places."
+      note "              Precedent for pinning it (task 4012): assert"
+      note "              MD.read_text() == render_markdown(json.loads(JSON.read_text()))."
+      record_fail 2
+    else
+      note "PASS  item 2  $EVAL and $SCORING no longer iterate the frozenset directly"
+    fi
   else
-    note "PASS  item 2  $EVAL no longer iterates the frozenset directly"
+    note "FAIL  item 2  UNVERIFIABLE: cannot read $SCORING at ref '$REF'. Failing closed."
+    record_fail 2
   fi
 
   # --- item 4: --report-path must not destroy its own JSON --------------------
@@ -506,7 +543,7 @@ elif [ "$EXTRACTED" -eq 1 ]; then
       note "              the invariant. Failing closed."
       record_fail 5
       show_probe5_stderr=1
-    elif [ "$probe5_rc" -eq 1 ]; then
+    elif [ "$probe5_rc" -eq 1 ] && grep -q "^$PROBE_FAIL_PREFIX" <<<"$probe5_out"; then
       # Terse, for item 1's reason: the harm, both accepted remedies and the
       # measured slate are all in the probe's own report printed directly below.
       note "FAIL  item 5  the judge-bound candidate is NOT consumed by the attach"
@@ -514,6 +551,11 @@ elif [ "$EXTRACTED" -eq 1 ]; then
       note "              What was measured, and every branch the probe evaluated, are"
       note "              in its own report below."
       record_fail 5
+    elif [ "$probe5_rc" -eq 1 ]; then
+      note "FAIL  item 5  UNVERIFIABLE: the probe exited 1 without reporting a verdict."
+      note "              It stopped before it could report (see its stderr below). Failing closed."
+      record_fail 5
+      show_probe5_stderr=1
     else
       note "FAIL  item 5  UNVERIFIABLE: the probe could not be run (exit $probe5_rc)."
       note "              Interpreter: ${PROBE5_PY_CMD[*]}. Failing closed."

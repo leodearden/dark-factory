@@ -35,7 +35,7 @@ def _isolate_caches():
     import dashboard.data.task_snapshot as snapshot_mod
 
     def _clear():
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
         task_lookup._lookup_cache_clear()
 
     _clear()
@@ -203,7 +203,7 @@ class TestBudget:
         canned = _canned((10, 'in-progress'), (3, 'done'))
         held, unread = TaskRef(root, 3), TaskRef(root, 10)
         await _lookup(canned, dummy_client, dashboard_config, [held])
-        snapshot_mod._snapshot_cache_clear()
+        snapshot_mod.clear_snapshot_cache()
         monkeypatch.setattr(task_lookup, 'LOOKUP_BUDGET_SECONDS', 0.2)
 
         async def _hung_snapshot(client, url, tool, args, **kwargs):

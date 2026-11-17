@@ -46,7 +46,7 @@ from backfill_decision_queue_stamp import (
 # tests/scripts/conftest.py puts on sys.path at collection time; scripts/ is
 # also in [tool.pyright] extraPaths (task 3456), so this resolves statically
 # too. `orchestrator` resolves via the workspace's editable install.
-from orchestrator import session_registry as sr
+from orchestrator import decision_registry as dr
 
 SCRIPT = Path(__file__).resolve().parent.parent.parent / 'scripts' / 'backfill_decision_queue_stamp.py'
 
@@ -78,7 +78,7 @@ def _make_queue(base: Path, name: str, *, root_ids: tuple[str, ...] = (),
     return queue
 
 
-def _record(**overrides: object) -> sr.DecisionRecord:
+def _record(**overrides: object) -> dr.DecisionRecord:
     """A DecisionRecord built straight from the library type.
 
     Deliberately NOT a copy of orchestrator/tests/test_session_registry.py's
@@ -93,10 +93,10 @@ def _record(**overrides: object) -> sr.DecisionRecord:
         'filed_at': '2026-01-01T00:00:00+00:00',
         'escalation_id': 'esc-1-1',
         'session_id': None,
-        'state': sr.DecisionState.OPEN,
+        'state': dr.DecisionState.OPEN,
     }
     fields.update(overrides)
-    return sr.DecisionRecord(**fields)
+    return dr.DecisionRecord(**fields)
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +214,7 @@ def test_resolve_no_escalation_id_is_unknown(tmp_path: Path) -> None:
             recon_queue=None,
             orch_queue_for_project={},
         )
-        assert resolved == sr.UNKNOWN_QUEUE
+        assert resolved == dr.UNKNOWN_QUEUE
         # No id means no lookup was even attempted, so the reported evidence
         # must be empty rather than whatever a queue happens to contain.
         assert holders == []
@@ -239,7 +239,7 @@ def test_resolve_single_holder_wins_outright(tmp_path: Path, tier: str) -> None:
         orch_queue_for_project={},
     )
 
-    assert resolved == sr.normalize_escalations_dir(q)
+    assert resolved == dr.normalize_escalations_dir(q)
 
 
 def test_resolve_zero_holders_is_unknown(tmp_path: Path) -> None:
@@ -255,7 +255,7 @@ def test_resolve_zero_holders_is_unknown(tmp_path: Path) -> None:
         orch_queue_for_project={'df': empty},
     )
 
-    assert resolved == sr.UNKNOWN_QUEUE
+    assert resolved == dr.UNKNOWN_QUEUE
     assert holders == []
 
 
@@ -279,7 +279,7 @@ def test_resolve_ambiguous_null_session_id_corroborated_picks_recon(tmp_path: Pa
         orch_queue_for_project={'df': orch},
     )
 
-    assert resolved == sr.normalize_escalations_dir(recon)
+    assert resolved == dr.normalize_escalations_dir(recon)
 
 
 def test_resolve_ambiguous_watcher_session_id_corroborated_picks_orch(tmp_path: Path) -> None:
@@ -297,7 +297,7 @@ def test_resolve_ambiguous_watcher_session_id_corroborated_picks_orch(tmp_path: 
         orch_queue_for_project={'df': orch},
     )
 
-    assert resolved == sr.normalize_escalations_dir(orch)
+    assert resolved == dr.normalize_escalations_dir(orch)
 
 
 def test_resolve_ambiguous_uncorroborated_inference_is_unknown(tmp_path: Path) -> None:
@@ -321,7 +321,7 @@ def test_resolve_ambiguous_uncorroborated_inference_is_unknown(tmp_path: Path) -
         orch_queue_for_project={'df': orch_without_the_id},
     )
 
-    assert resolved == sr.UNKNOWN_QUEUE
+    assert resolved == dr.UNKNOWN_QUEUE
 
 
 def test_resolve_ambiguous_uncorroborated_recon_inference_is_unknown(tmp_path: Path) -> None:
@@ -339,7 +339,7 @@ def test_resolve_ambiguous_uncorroborated_recon_inference_is_unknown(tmp_path: P
         orch_queue_for_project={},
     )
 
-    assert resolved == sr.UNKNOWN_QUEUE
+    assert resolved == dr.UNKNOWN_QUEUE
 
 
 def test_resolve_ambiguous_unrecognized_session_id_shape_is_unknown(tmp_path: Path) -> None:
@@ -361,7 +361,7 @@ def test_resolve_ambiguous_unrecognized_session_id_shape_is_unknown(tmp_path: Pa
         orch_queue_for_project={'df': orch},
     )
 
-    assert resolved == sr.UNKNOWN_QUEUE
+    assert resolved == dr.UNKNOWN_QUEUE
 
 
 def test_resolve_ambiguous_unmapped_project_is_unknown(tmp_path: Path) -> None:
@@ -384,7 +384,7 @@ def test_resolve_ambiguous_unmapped_project_is_unknown(tmp_path: Path) -> None:
         orch_queue_for_project={'df': a},
     )
 
-    assert resolved == sr.UNKNOWN_QUEUE
+    assert resolved == dr.UNKNOWN_QUEUE
 
 
 def test_resolve_returns_a_normalized_path(tmp_path: Path) -> None:
@@ -404,7 +404,7 @@ def test_resolve_returns_a_normalized_path(tmp_path: Path) -> None:
         orch_queue_for_project={},
     )
 
-    assert resolved == sr.normalize_escalations_dir(tmp_path / 'orch')
+    assert resolved == dr.normalize_escalations_dir(tmp_path / 'orch')
     assert Path(resolved).is_absolute()
     assert holders == [dotted]
 
@@ -434,7 +434,7 @@ def test_resolve_returns_the_holder_evidence_it_actually_used(tmp_path: Path) ->
         orch_queue_for_project={'df': orch},
     )
 
-    assert resolved == sr.normalize_escalations_dir(recon)
+    assert resolved == dr.normalize_escalations_dir(recon)
     assert holders == [orch, recon], 'both holders must be reported, in caller order'
     assert holders == queues_holding('esc-1-1', [orch, recon]), (
         'the returned evidence must equal what queues_holding reports for the '
@@ -490,13 +490,13 @@ def _fixture_fleet(tmp_path: Path) -> tuple[Path, Path, Path]:
         _record(id='dec-ambiguous', escalation_id='esc-amb-1',
                 session_id='unblock-df-2085-4242'),
         _record(id='dec-answered', escalation_id='esc-uni-1',
-                state=sr.DecisionState.ANSWERED),
+                state=dr.DecisionState.ANSWERED),
         _record(id='dec-dropped', escalation_id='esc-uni-1',
-                state=sr.DecisionState.DROPPED),
+                state=dr.DecisionState.DROPPED),
         _record(id='dec-prestamped', escalation_id='esc-uni-1',
-                escalations_dir=sr.normalize_escalations_dir(recon)),
+                escalations_dir=dr.normalize_escalations_dir(recon)),
     ):
-        assert sr.write_decision(rec, root=fleet)
+        assert dr.write_decision(rec, root=fleet)
     return fleet, orch, recon
 
 
@@ -510,7 +510,7 @@ def _queue_args(orch: Path, recon: Path) -> list[str]:
 
 
 def _stamps(fleet: Path) -> dict[str, str]:
-    return {d.id: d.escalations_dir for d in sr.list_decisions(root=fleet)}
+    return {d.id: d.escalations_dir for d in dr.list_decisions(root=fleet)}
 
 
 def _dispositions(stdout: str, tmp_root: Path) -> str:
@@ -542,7 +542,7 @@ def test_main_dry_run_is_the_default_and_writes_nothing(tmp_path: Path) -> None:
     for decision_id in ('dec-unique', 'dec-nothing', 'dec-ambiguous'):
         assert decision_id in proc.stdout
     assert str(orch) in proc.stdout
-    assert sr.UNKNOWN_QUEUE in proc.stdout
+    assert dr.UNKNOWN_QUEUE in proc.stdout
 
 
 def test_main_apply_stamps_exactly_what_the_dry_run_predicted(tmp_path: Path) -> None:
@@ -562,9 +562,9 @@ def test_main_apply_stamps_exactly_what_the_dry_run_predicted(tmp_path: Path) ->
     assert dry.returncode == 0, dry.stderr
     assert applied.returncode == 0, applied.stderr
     stamps = _stamps(fleet_b)
-    assert stamps['dec-unique'] == sr.normalize_escalations_dir(orch_b)
-    assert stamps['dec-nothing'] == sr.UNKNOWN_QUEUE
-    assert stamps['dec-ambiguous'] == sr.UNKNOWN_QUEUE
+    assert stamps['dec-unique'] == dr.normalize_escalations_dir(orch_b)
+    assert stamps['dec-nothing'] == dr.UNKNOWN_QUEUE
+    assert stamps['dec-ambiguous'] == dr.UNKNOWN_QUEUE
     # Every per-record DISPOSITION line matches, tmp-path-normalized. The mode
     # banner and the trailing dry-run notice are deliberately excluded -- those
     # SHOULD differ, and asserting on them would pin cosmetics instead of the
@@ -590,7 +590,7 @@ def test_main_apply_never_touches_out_of_scope_records(tmp_path: Path) -> None:
     """
     fleet, orch, recon = _fixture_fleet(tmp_path)
     paths = {
-        decision_id: sr.decision_path_for_id(decision_id, root=fleet)
+        decision_id: dr.decision_path_for_id(decision_id, root=fleet)
         for decision_id in ('dec-answered', 'dec-dropped', 'dec-prestamped')
     }
     before = {k: p.read_bytes() for k, p in paths.items()}
@@ -667,10 +667,10 @@ def test_main_reports_the_tiebreak_reasons_distinctly(tmp_path: Path) -> None:
     fleet = tmp_path / 'fleet'
     orch = _make_queue(tmp_path, 'orch', root_ids=('esc-t-1',))
     recon = _make_queue(tmp_path, 'recon', root_ids=('esc-t-1',))
-    assert sr.write_decision(
+    assert dr.write_decision(
         _record(id='dec-tb-recon', escalation_id='esc-t-1', session_id=None), root=fleet
     )
-    assert sr.write_decision(
+    assert dr.write_decision(
         _record(id='dec-tb-orch', escalation_id='esc-t-1', session_id='watcher-df-1'), root=fleet
     )
 
@@ -680,8 +680,8 @@ def test_main_reports_the_tiebreak_reasons_distinctly(tmp_path: Path) -> None:
     assert 'tiebreak-recon' in proc.stdout
     assert 'tiebreak-orch' in proc.stdout
     stamps = _stamps(fleet)
-    assert stamps['dec-tb-recon'] == sr.normalize_escalations_dir(recon)
-    assert stamps['dec-tb-orch'] == sr.normalize_escalations_dir(orch)
+    assert stamps['dec-tb-recon'] == dr.normalize_escalations_dir(recon)
+    assert stamps['dec-tb-orch'] == dr.normalize_escalations_dir(orch)
 
 
 def test_main_fail_soft_on_a_corrupt_decision_file(tmp_path: Path) -> None:
@@ -692,12 +692,12 @@ def test_main_fail_soft_on_a_corrupt_decision_file(tmp_path: Path) -> None:
     population half-stamped with no record of where it stopped.
     """
     fleet, orch, recon = _fixture_fleet(tmp_path)
-    (sr.decisions_dir(root=fleet) / 'corrupt.json').write_text('{not valid json')
+    (dr.decisions_dir(root=fleet) / 'corrupt.json').write_text('{not valid json')
 
     proc = _run(fleet, *_queue_args(orch, recon), '--apply')
 
     assert proc.returncode == 0, proc.stderr
-    assert _stamps(fleet)['dec-unique'] == sr.normalize_escalations_dir(orch)
+    assert _stamps(fleet)['dec-unique'] == dr.normalize_escalations_dir(orch)
 
 
 def test_main_requires_at_least_one_queue(tmp_path: Path) -> None:
@@ -874,4 +874,4 @@ def test_main_warns_but_does_not_refuse_for_an_unusable_tiebreak_queue(
     assert proc.returncode == EXIT_OK, proc.stderr
     assert f'UNUSABLE-TIEBREAK-QUEUE {typo}' in proc.stderr
     assert 'unusable tiebreak queues: 1' in proc.stdout
-    assert _stamps(fleet)['dec-unique'] == sr.normalize_escalations_dir(orch)
+    assert _stamps(fleet)['dec-unique'] == dr.normalize_escalations_dir(orch)

@@ -159,69 +159,61 @@ class TestGraphitiLLMPathReachesConfiguredEndpoint:
             assert body['response_format'] == {'type': 'json_object'}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('client_class', 'structured_output_mode', 'response_model'),
+        [
+            pytest.param('openai', 'auto', None, id='openai'),
+            pytest.param('openai_generic', 'auto', _Extraction, id='openai_generic/auto'),
+            pytest.param(
+                'openai_generic', 'json_object', _Extraction, id='openai_generic/json_object',
+            ),
+        ],
+    )
     async def test_configured_max_tokens_reaches_the_wire(
-        self, no_ambient_openai_env,
+        self, no_ambient_openai_env, client_class, structured_output_mode, response_model,
     ):
-        """The configured ``llm.max_tokens`` must actually leave the process.
+        """The configured ``llm.max_tokens`` must leave the process on every
+        OpenAI-shaped arm, which is why ``build_llm_client`` passes it as a
+        ``max_tokens=`` constructor kwarg as well as on ``GraphitiLLMConfig``.
 
-        ``OpenAIGenericClient.__init__`` re-assigns ``self.max_tokens`` from its
-        own parameter (default 16384) right after ``super().__init__`` took the
-        configured value off the config object, and ``_generate_response`` sends
-        ``self.max_tokens``. A construction-kwarg assertion alone cannot catch
-        that class of drop — same reason this whole file exists for base_url —
-        so this pins the recorded request body.
+        ``graphiti_core/llm_client/client.py::LLMClient.__init__`` sets
+        ``self.max_tokens`` from the config object. Then
+        ``graphiti_core/llm_client/openai_base_client.py::BaseOpenAIClient.__init__``
+        (the base of ``OpenAIClient``) and
+        ``graphiti_core/llm_client/openai_generic_client.py::OpenAIGenericClient.__init__``
+        each overwrite it from their own ``max_tokens`` constructor parameter,
+        which carries an upstream default. Their ``_generate_response`` sends
+        ``self.max_tokens``, so ``GraphitiLLMConfig(max_tokens=...)`` alone never
+        reaches the wire: the constructor kwarg is the only lever.
+
+        ``TokenRecordingOpenAIGenericClient`` forwards its constructor arguments
+        to ``OpenAIGenericClient.__init__`` unchanged, and
+        ``ForceJsonObjectOpenAIGenericClient`` overrides only
+        ``_generate_response``, so one construction call serves both modes. Both
+        modes are parametrized here so an arm that drifts goes red.
+
+        A constructed-attribute assertion cannot catch a value that is accepted
+        and then dropped, so this pins the recorded request body. The openai arm
+        passes no ``response_model`` because its structured path calls
+        ``/v1/responses``, which the mock does not serve; the same
+        ``self.max_tokens`` feeds both paths. 2048 is distinct from the schema
+        default and from upstream's.
         """
         with mock_openai_server() as server:
             server.chat_content = VALID_EXTRACTION
-            cfg = _config(server.base_url, server.base_url)
-            cfg.llm.max_tokens = 2048  # distinct from schema default 4096 and upstream 16384
-            client = build_llm_client(cfg)
-            assert client is not None
-
-            await client.generate_response(
-                [Message(role='user', content='Alice knows Bob.')],
-                response_model=_Extraction,
-            )
-
-            body = server.requests_to('/chat/completions')[0]['json_body']
-            assert body['max_tokens'] == 2048
-
-    @pytest.mark.asyncio
-    async def test_configured_max_tokens_reaches_the_wire_on_the_default_arm(
-        self, no_ambient_openai_env,
-    ):
-        """Same proof for the SHIPPED default arm (task 3864).
-
-        ``BaseOpenAIClient.__init__`` (openai_base_client.py:51-67) — the base
-        of graphiti's ``OpenAIClient`` — re-assigns ``self.max_tokens`` from its
-        own parameter (upstream's ``DEFAULT_MAX_TOKENS``) right after
-        ``super().__init__`` took the configured value off the config object,
-        and ``_generate_response`` then sends ``max_tokens or self.max_tokens``
-        (:176,187). A construction-kwarg assertion structurally cannot catch a
-        value that is accepted and then dropped — the same reason this whole
-        file exists for base_url — so this pins the recorded request body.
-
-        No ``response_model`` is passed, deliberately: that routes through
-        ``_create_completion`` → ``chat.completions``, which the mock server
-        serves, whereas the structured path calls ``client.responses.parse``
-        against ``/v1/responses``, which it does not. The same ``self.max_tokens``
-        feeds both paths, so the served path is a sound proof for both. The
-        mock's default ``chat_content`` (``{"ok": true}``) is a valid reply here
-        — with no response_model there is no envelope to violate.
-        """
-        with mock_openai_server() as server:
             cfg = _config(
                 server.base_url,
                 server.base_url,
-                client_class='openai',
-                structured_output_mode='auto',
+                client_class=client_class,
+                structured_output_mode=structured_output_mode,
             )
-            cfg.llm.max_tokens = 2048  # distinct from schema default 4096 and upstream's
+            cfg.llm.max_tokens = 2048
             client = build_llm_client(cfg)
             assert client is not None
 
             await client.generate_response(
                 [Message(role='user', content='Alice knows Bob.')],
+                response_model=response_model,
             )
 
             body = server.requests_to('/chat/completions')[0]['json_body']
@@ -333,17 +325,19 @@ class TestReindexEmbedderPathReachesConfiguredEndpoint:
                 ),
                 patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
             ):
+                # The REAL embedder run_reindex built is used while the run
+                # still owns it: run_reindex closes it on the way out.
+                async def embed_during_the_run(*_args, **_kwargs):
+                    embedder = mock_mgr_cls.call_args.kwargs['embedder']
+                    assert server.requests == [], 'no traffic expected before create()'
+                    await embedder.create(['some stale content'])
+                    return mock_result
+
                 mock_mgr = MagicMock()
-                mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+                mock_mgr.reindex_and_replay = AsyncMock(side_effect=embed_during_the_run)
                 mock_mgr_cls.return_value = mock_mgr
 
                 await run_reindex()
-
-            # Capture the REAL embedder run_reindex built and constructed.
-            embedder = mock_mgr_cls.call_args.kwargs['embedder']
-            assert server.requests == [], 'no traffic expected before create()'
-
-            await embedder.create(['some stale content'])
 
             embedding_requests = server.requests_to('/embeddings')
             assert len(embedding_requests) == 1, (
@@ -387,12 +381,14 @@ class TestIndependentLLMAndEmbedderEndpoints:
                 ),
                 patch('fused_memory.maintenance.reindex.ReindexManager') as mock_mgr_cls,
             ):
+                async def embed_during_the_run(*_args, **_kwargs):
+                    await mock_mgr_cls.call_args.kwargs['embedder'].create(['stale'])
+                    return mock_result
+
                 mock_mgr = MagicMock()
-                mock_mgr.reindex_and_replay = AsyncMock(return_value=mock_result)
+                mock_mgr.reindex_and_replay = AsyncMock(side_effect=embed_during_the_run)
                 mock_mgr_cls.return_value = mock_mgr
                 await run_reindex()
-
-            await mock_mgr_cls.call_args.kwargs['embedder'].create(['stale'])
 
             # Exact counts, not "contains" — a base_url that is plumbed but
             # ignored would show up as a server that saw nothing.

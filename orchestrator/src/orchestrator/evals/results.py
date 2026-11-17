@@ -6,12 +6,15 @@ import copy
 import dataclasses
 import json
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from shared.safe_io import atomic_write_text
+
+from .measurement import MeasurementStage, UnmeasuredCause, UnmeasuredRecord
+from .metrics import RoleUnderTest
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +95,58 @@ class MissingResultsDirError(ResultLoadError):
     """The results directory to load from does not exist."""
 
 
-LEGACY_METRIC_RULES: tuple[Callable[[dict[str, Any]], dict[str, Any]], ...] = ()
+_STAGES = frozenset(MeasurementStage)
+_CAUSES = frozenset(UnmeasuredCause)
+
+
+def _unclassified(reason: str) -> UnmeasuredRecord:
+    return {
+        'stage': MeasurementStage.ARCHITECT.value,
+        'cause': UnmeasuredCause.LEGACY_UNCLASSIFIED.value,
+        'reason': reason,
+    }
+
+
+def _record_from_marker(marker: str) -> UnmeasuredRecord:
+    first = marker.split(';')[0].strip()
+    stage_text, sep, rest = first.partition(':')
+    cause_text = rest.strip().partition(':')[0].strip() if sep else first
+    if stage_text not in _STAGES or cause_text not in _CAUSES:
+        return _unclassified(marker)
+    parts = marker.split(':', 2)
+    reason = parts[2].removeprefix(' ') if len(parts) == 3 else ''
+    return {'stage': stage_text, 'cause': cause_text, 'reason': reason}
+
+
+def _invocation_errors_from_marker(metrics: dict[str, Any]) -> dict[str, Any]:
+    """A pre-6734 ``invocation_error`` string as typed records (PRD §7 D3)."""
+    is_legacy = 'invocation_errors' not in metrics and (
+        'invocation_error' in metrics or metrics.get('cap_tainted')
+    )
+    if not is_legacy:
+        return dict(metrics)
+    normalized = dict(metrics)
+    marker = normalized.pop('invocation_error', None)
+    if marker:
+        normalized['invocation_errors'] = [_record_from_marker(marker)]
+    elif normalized.get('cap_tainted'):
+        normalized['invocation_errors'] = [_unclassified('')]
+    else:
+        normalized['invocation_errors'] = None
+    return normalized
+
+
+def _role_under_test_from_legacy(metrics: dict[str, Any]) -> dict[str, Any]:
+    """A pre-6738 roleless cell as the run_eval implementer cell it was (PRD §7 D3)."""
+    stored = metrics.get('role_under_test')
+    role = RoleUnderTest.IMPLEMENTER if stored is None else RoleUnderTest(stored)
+    return {**metrics, 'role_under_test': role}
+
+
+LEGACY_METRIC_RULES: tuple[Callable[[dict[str, Any]], dict[str, Any]], ...] = (
+    _invocation_errors_from_marker,
+    _role_under_test_from_legacy,
+)
 
 
 def normalize_legacy_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
@@ -109,6 +163,14 @@ def _load_cell(path: Path) -> EvalResult:
     data = json.loads(path.read_text())
     result = EvalResult(**{k: v for k, v in data.items() if k in _EVAL_RESULT_FIELDS})
     return dataclasses.replace(result, metrics=normalize_legacy_metrics(result.metrics))
+
+
+def load_result(path: Path) -> EvalResult:
+    """The cell persisted at *path*; one that cannot be read raises ResultLoadError naming it."""
+    try:
+        return _load_cell(path)
+    except (ValueError, OSError, TypeError, AttributeError) as e:
+        raise ResultLoadError(path, f'{type(e).__name__}: {e}') from e
 
 
 def _read_raw_cell(path: Path) -> dict[str, Any]:
@@ -146,16 +208,23 @@ class ResultStore:
             return []
         return sorted(p for p in self.directory.glob(f'*{_SUFFIX}') if p.is_file())
 
-    def paths_matching(self, task_id: str, config_name: str) -> list[Path]:
-        matches = []
+    def _named_cells(self) -> Iterator[tuple[Path, CellName]]:
         for path in self.cell_paths():
             try:
                 name = CellName.from_path(path)
             except ValueError:
                 continue
-            if (name.task_id, name.config_name) == (task_id, config_name):
-                matches.append(path)
-        return matches
+            yield path, name
+
+    def paths_for_task(self, task_id: str) -> list[Path]:
+        return [path for path, name in self._named_cells() if name.task_id == task_id]
+
+    def paths_matching(self, task_id: str, config_name: str) -> list[Path]:
+        return [
+            path
+            for path, name in self._named_cells()
+            if (name.task_id, name.config_name) == (task_id, config_name)
+        ]
 
     def exists(self, task_id: str, config_name: str) -> bool:
         return bool(self.paths_matching(task_id, config_name))
@@ -190,10 +259,4 @@ class ResultStore:
             raise MissingResultsDirError(
                 self.directory, 'results dir not found (or is not a directory)'
             )
-        results = []
-        for path in self.cell_paths():
-            try:
-                results.append(_load_cell(path))
-            except (ValueError, OSError, TypeError, AttributeError) as e:
-                raise ResultLoadError(path, f'{type(e).__name__}: {e}') from e
-        return results
+        return [load_result(path) for path in self.cell_paths()]

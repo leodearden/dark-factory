@@ -26,17 +26,23 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier
+from _merge_lane_fakes import FakeVerifier, lane_scene_config
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import (
+    InflightStatus,
+    InflightVerifyResult,
+    QueuedBranch,
+)
+from orchestrator.merge_lane.worker import (
     InflightEntry,
     MergedOk,
     MergeRequest,
@@ -44,24 +50,19 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     classify_and_merge,
 )
-from orchestrator.merge_types import (
-    InflightStatus,
-    InflightVerifyResult,
-    QueuedBranch,
-)
 from orchestrator.verify import VerifyResult
 
 
 def _sentinel_entry() -> InflightEntry:
-    """Opaque, identity-only stand-in for a real ``InflightEntry``.
+    """Stand-in for a frozen ``InflightEntry`` that is built on nothing.
 
-    Mirrors test_merge_queue_single_writer_asserts.py's ``_sentinel_entry``:
-    the tests below only care about the *count* of frozen entries
-    (``_verify_frontier_depth`` is a pure ``len()`` delegation), never their
-    fields, so a bare ``object()`` cast to ``InflightEntry`` is enough at
-    runtime without constructing a real merge-result/lease graph.
+    The tests below care about the *count* of frozen entries
+    (``_verify_frontier_depth`` is a pure ``len()`` delegation).  Dispatch
+    also reads each entry's ``item``, ``gate`` and ``chain`` for the bases a
+    new item may stack on; ``None`` for all three contributes no base commit,
+    so no real merge-result/lease graph is needed.
     """
-    return cast(InflightEntry, object())
+    return cast(InflightEntry, SimpleNamespace(item=None, gate=None, chain=None))
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +104,7 @@ def _make_git_ops_mock() -> MagicMock:
     mock.get_main_sha = AsyncMock(return_value='main-sha')
     mock.get_free_disk_bytes = AsyncMock(return_value=100 * 1024 ** 3)
     mock.cleanup_merge_worktree = AsyncMock()
-    mock.create_throwaway_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
+    mock.create_ephemeral_verify_worktree = AsyncMock(return_value='/repo/_throwaway')
     return mock
 
 
@@ -153,7 +154,7 @@ class TestRunPostMergeVerifyDepthPlumbing:
     async def test_depth_and_speculative_propagate_into_merge_verify_event(
         self, tmp_path: Path,
     ) -> None:
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _make_bare_config()
         req = _make_request('t-depth', 'task/t-depth', tmp_path, config)
@@ -177,7 +178,7 @@ class TestRunPostMergeVerifyDepthPlumbing:
         self, tmp_path: Path,
     ) -> None:
         """Legacy call form (no depth/speculative kwargs) -> both None in the event."""
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _make_bare_config()
         req = _make_request('t-nodepth', 'task/t-nodepth', tmp_path, config)
@@ -241,7 +242,7 @@ class TestRunPostMergeVerifyChainItemsPlumbing:
         *results* is consumed one per ``pool.dispatch`` call (the last is
         repeated if the code dispatches more times than scripted).
         """
-        from orchestrator.merge_queue import _run_post_merge_verify
+        from orchestrator.merge_lane.worker import _run_post_merge_verify
 
         config = _make_bare_config()
         req = _make_request('t-chain', 'task/t-chain', tmp_path, config)
@@ -462,7 +463,7 @@ class TestDispatchItemComputesTruthfulChainItems:
         )
 
         entry = await worker._dispatch_item(item)
-        if entry is not None and entry.verify_task is not None:
+        if isinstance(entry, InflightEntry) and entry.verify_task is not None:
             await entry.verify_task
         return captured
 
@@ -523,7 +524,7 @@ class TestDispatchItemComputesTruthfulChainItems:
         relabelled all the way to the probe's 5 while ``chain_items`` does not
         move off 1 — the two fields visibly answer different questions.
         """
-        from orchestrator.merge_queue import ProbePlacement
+        from orchestrator.merge_lane.worker import ProbePlacement
 
         captured = await self._dispatch_kwargs(
             tmp_path, frontier=1, speculative=True,
@@ -586,7 +587,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 async def _make_branch_with_file(

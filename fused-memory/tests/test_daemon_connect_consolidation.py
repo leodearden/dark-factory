@@ -55,7 +55,7 @@ def assert_connection_thread_is_daemon(conn: aiosqlite.Connection, label: str = 
 # ---------------------------------------------------------------------------
 
 
-async def _std_lifecycle(store, tmp_path: Path) -> None:  # noqa: ARG001
+async def _std_lifecycle(store, tmp_path: Path) -> None:
     """Standard initialize() lifecycle used by all stores except SqliteTaskBackend."""
     await store.initialize()
 
@@ -96,19 +96,19 @@ _DAEMON_CASES = [
         id='WriteJournal',
     ),
     pytest.param(
-        lambda tmp: EventBuffer(db_path=tmp / 'eb.db'),  # noqa: ARG005
+        lambda tmp: EventBuffer(db_path=tmp / 'eb.db'),
         _std_lifecycle,
         lambda store, _root: store._require_access().connection,
         id='EventBuffer',
     ),
     pytest.param(
-        lambda tmp: ReconciliationJournal(data_dir=tmp / 'journal'),  # noqa: ARG005
+        lambda tmp: ReconciliationJournal(data_dir=tmp / 'journal'),
         _std_lifecycle,
         lambda store, _root: store._require_access().connection,
         id='ReconciliationJournal',
     ),
     pytest.param(
-        lambda tmp: SqliteTaskBackend(),  # noqa: ARG005
+        lambda tmp: SqliteTaskBackend(),
         _backend_lifecycle,
         lambda store, root: store._write_accesses[root].connection,
         id='SqliteTaskBackend',

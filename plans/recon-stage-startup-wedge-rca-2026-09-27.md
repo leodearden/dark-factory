@@ -93,7 +93,8 @@ It took 10 Stage-1 flags over 6 days, plus log-diving, to find a cause the proce
 
 A Stage 1 flag relayed in a run whose Stage 2 agent died is never rendered to any Stage 2 LLM. The
 next cycle classes it as `Stage2FlagPartition.stale_mismatched_run_id_ids`, and only GC reaps it.
-This task does not fix that; see §9.
+Task 5982 did not fix that. Task 5984 closes it: such flags are carried forward until a Stage 2
+agent completes (§9).
 
 ## 7. Fix (task 5982)
 
@@ -182,7 +183,13 @@ After deploy, the grace in those lines should read `grace=450.0s`.
 - **No retry-once on `zero_output_timeout`.** The measured failure is a censoring bound, not a
   transient wedge. A blind retry would double the cost of every genuine wedge, now 450s, and would
   hide whether the grace change worked. Decide it on the §8 data.
-- **Flag carry-forward.** Flags relayed in a run whose Stage 2 died are still lost (§6). Filed as a
-  follow-up.
+- **Flag carry-forward.** Closed by task 5984 (§6): Stage 2 renders markers from the
+  trailing streak of runs whose Stage 2 agent did not complete
+  (`summary_pool.py::trailing_incomplete_agent_run_ids`), counted in
+  `stats.stage2_markers_carried_forward`. Two limits bound the carry. The marker GC
+  (`task_knowledge_sync.py::_sweep_stale_mem0_flag_for_stage2_markers`) still reaps a carried
+  marker once it is over 7 days old and its task is terminal, or over 30 days old if it cites no
+  task. And a run leaves the streak when its 30-day `cycle_summary` row expires. Past either
+  limit, the flag is lost as it was before.
 - **The shared watchdog.** Task 3326 owns its semantics: a load-aware two-regime grace, and
   truthful kill attribution. `shared/src/shared/cli_invoke.py`'s 120s default is unchanged here.

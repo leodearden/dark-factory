@@ -232,6 +232,65 @@ Six workstreams, each owning the files it touches:
   history (obsolete once α lands), `_task_db_scan`'s task-3817 narrative, and `verify_budget_census`'s
   false "COPIED, not imported" header. Nothing load-bearing is deleted without a home.
 
+### D5 policy rows
+
+The rows live in `scripts/systemd_unit_parity.py::ENV_POLICY`. Each column has one reader. The
+renderer reads `host_local` for both families, the dashboard checker reads `compared_cross_copy` for
+dashboard rows, and the fused-memory checker reads `required_value` for fused-memory rows. A row
+states only the columns it changes from their defaults, and a name with no row takes the defaults:
+not preserved, value-compared across copies, not required. Each row is what it is for these reasons,
+which used to live in the allowlist's value strings and the renderer's and fused-memory checker's
+comments.
+
+**dashboard `DASHBOARD_KNOWN_PROJECT_ROOTS`: host-local, not compared.** This is the gate's declared
+hole. Cost/burndown aggregation roots beyond this repo are a local setting: the committed unit's own
+comment says extra roots are added to the installed unit, not committed. Measured 2026-08-01, the
+installed unit carried 9 roots and the committed one carried 1. Value-comparing it would make the
+gate red on every correctly configured host, and a gate that is always red gets switched off. It is
+preserved because the old `sed ... > "$UNIT_DIR/..."` re-render collapsed the 9 roots to 1 (task
+4793), and the allowlist hid the loss. Presence is still compared, so a dropped line is still drift.
+
+**dashboard `DASHBOARD_PROJECT_ROOT`: not compared, and not host-local.** It is allowlisted because
+its value embeds the host's repo root: the committed unit hardcodes `/home/leo/src/dark-factory`, and
+setup-host.sh renders the installed copy with that host's `$REPO_ROOT`. It is still checked, within
+one copy, against that copy's `WorkingDirectory=`
+(`scripts/check_dashboard_unit_parity.py::UnitSpec.env_matches_directive`). It is rendered from
+`__REPO_ROOT__`, so preserving it would pin the data root at the previous checkout while
+`WorkingDirectory=` moved to the new one, which is exactly the intra-copy drift that check reports.
+
+**fused-memory `DASHBOARD_KNOWN_PROJECT_ROOTS`: host-local, not required.** On this
+unit the variable is `fused_memory/models/scope.py`'s `KNOWN_PROJECT_ROOTS_ENV`, and reconciliation
+raises `UnknownProjectError` for a project outside the set. Collapsing it therefore de-registers
+every other project from reconciliation (task 4796). The fused-memory checker cannot see that
+damage, because it checks only host-invariant safety lines.
+
+**fused-memory `MEM0_TELEMETRY` and `PATH`: required.** These are host-invariant safety lines (`%h`
+expands per user), so the checker exact-matches them and `--fix` may synthesize them. Rule B5 keeps
+them from being host-local.
+
+**No row.** `CONFIG_PATH`, `PROJECT_ROOT` and `TASKMASTER_DIR` are rendered from `__REPO_ROOT__`,
+so preserving them would pin the server at the old checkout, the `DASHBOARD_PROJECT_ROOT` hazard
+again. `FUSED_MEMORY_PREDONE_HOOK_REIFY` looks host-local because it carries a literal host path,
+but it is committed verbatim with no sentinel, so a re-render reproduces it byte for byte.
+Preserving it would pin a possibly stale hook path over the committed one. The default policy is
+right for all four.
+
+**The impossible rows.** `EnvPolicy.__post_init__` rejects them, so a module declaring one fails at
+import.
+- B5, `host_local` with a `required_value`. The fused-memory checker tests exact whole-line
+  membership, so a preserved multi-root line reads as the required line missing. `--fix` then
+  appends the required line after the last `[Service]` line, systemd's last-wins makes it beat the
+  preserved value, and the checker exits 0.
+  `tests/scripts/test_check_fused_memory_unit_parity.py::test_a_required_known_project_roots_line_would_reclobber`
+  demonstrates the clobber.
+- `host_local` with `compared_cross_copy` on a dashboard row. The dashboard checker would
+  value-compare a value the renderer deliberately keeps divergent, so the gate would be red on every
+  configured host. This rule is what makes "the renderer's dashboard preserve set is a subset of the
+  allowlist" hold by construction.
+- A column changed from its default on a family whose checker never reads it: `required_value` on a
+  dashboard row, or `compared_cross_copy=False` on a fused-memory row. The setting would do nothing,
+  and nothing would notice an author flipping it.
+
 ## Contracts (B+H)
 
 G5 fires: the stream reaches scripts, shared, fused-memory and orchestrator, it has six other

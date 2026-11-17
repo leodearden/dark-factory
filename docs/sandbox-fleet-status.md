@@ -74,8 +74,8 @@ in the installed `dark-factory-dashboard.service` (9 roots, primary included).
   registrations with no orchestrator config.
 - **solar-challenge path trap.** Its config is
   `/home/leo/src/solar-challenge/dark-factory-orchestrator.yaml`; "my-" survives
-  only in the legacy unit name `orchestrator-my-solar-challenge.service`, and
-  `/home/leo/src/my-solar-challenge` exists but holds no config.
+  only in the legacy unit name `orchestrator-my-solar-challenge.service`. The
+  old `/home/leo/src/my-solar-challenge` directory was removed on 2026-10-13.
 
 ```bash
 # Re-run the census:

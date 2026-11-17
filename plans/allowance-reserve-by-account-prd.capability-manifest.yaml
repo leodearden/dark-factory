@@ -1,0 +1,340 @@
+# Machine-readable twin of allowance-reserve-by-account-prd.capability-manifest.md
+prd: plans/allowance-reserve-by-account-prd.md
+schema_version: 1
+signal_leaves: ["7"]
+tasks:
+  - label: "1a"
+    task_id: 10428
+    title: "The reserve rule as a pure module, and the optional reserve: block in the shared accounts file"
+    note: "First half of the PRD's task 1, split at decompose for size (the overlay's band); 1b is the gate half."
+    capabilities:
+      - name: "accounts-loader-exists"
+        binding: "`grep:shared/src/shared/config_models.py::UsageCapConfig._load_accounts_file` reads only the accounts key today"
+        verdict: PASS
+      - name: "rule-module"
+        binding: "built here; path absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["shared/src/shared/account_reserve.py"]
+          expect: present
+      - name: "work-class"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "class WorkClass"
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "admission-rule"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def admits\\("
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "loader-reads-reserve-block"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "account_reserve"
+          paths: ["shared/src/shared/config_models.py"]
+          expect: present
+  - label: "1b"
+    task_id: 10429
+    title: "The usage gate applies the reserve: selection, reserve wait, refusal query, events, work_class keyword"
+    note: "Second half of the PRD's task 1. Tasks 9804 and 9846 (usage-gate refactor chain) depend on this block's task (R5)."
+    capabilities:
+      - name: "rule-and-config"
+        binding: "producer:task-1a upstream"
+        verdict: PASS
+      - name: "one-selection-walk"
+        binding: "`grep:shared/src/shared/usage_gate.py::UsageGate.before_invoke` wired: calls try_lease under the gate's lock"
+        verdict: PASS
+      - name: "phase-writer"
+        binding: "`grep:shared/src/shared/usage_gate.py::UsageGate._transition`"
+        verdict: PASS
+      - name: "single-event-writer"
+        binding: "`grep:shared/src/shared/usage_gate.py::UsageGate._fire_cost_event`"
+        verdict: PASS
+      - name: "slot-settle-knows-cost"
+        binding: "`grep:shared/src/shared/usage_gate.py::InvokeSlot.confirm`"
+        verdict: PASS
+      - name: "keyword-threads-through-retry-loop"
+        binding: "`grep:shared/src/shared/cli_invoke.py::invoke_with_cap_retry` wired: calls usage_gate.invoke_slot"
+        verdict: PASS
+      - name: "refusal-query"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def reserve_refusal\\("
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "store-attach-method"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def attach_cost_store\\("
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "pool-frozen-names-reserve"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "reserved_account"
+          paths: ["shared/src/shared/"]
+          expect: present
+      - name: "keyword-in-retry-loop"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "work_class"
+          paths: ["shared/src/shared/cli_invoke.py"]
+          expect: present
+      - name: "reserve-wait-never-freezes-pool"
+        binding: "built here; boundary rows B2 and B10 observe _open is not cleared"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "A behavioural property; boundary rows B2 and B10 in the task's test file assert it."
+  - label: "2"
+    task_id: 10430
+    title: "Every orchestrator call site declares its kind of work; the harness attaches the gate's store through the new method"
+    note: "The helper that builds a task's WorkClass moved here from task 3 at decompose: the task roles need it first."
+    capabilities:
+      - name: "gate-keyword-and-attach"
+        binding: "producer:task-1b upstream"
+        verdict: PASS
+      - name: "effective-tier-lookup"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler.task_priority`"
+        verdict: PASS
+      - name: "task-role-call-site"
+        binding: "`grep:orchestrator/src/orchestrator/workflow.py::TaskWorkflow._invoke`"
+        verdict: PASS
+      - name: "store-attached-by-private-write-today"
+        binding: "`grep:orchestrator/src/orchestrator/harness.py::Harness.run` writes usage_gate._cost_store"
+        verdict: PASS
+      - name: "task-roles-pass-class"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "work_class="
+          paths: ["orchestrator/src/orchestrator/workflow.py"]
+          expect: present
+      - name: "steward-passes-class"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "work_class="
+          paths: ["orchestrator/src/orchestrator/steward.py"]
+          expect: present
+      - name: "review-checkpoint-passes-class"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "work_class="
+          paths: ["orchestrator/src/orchestrator/review_checkpoint.py"]
+          expect: present
+      - name: "harness-attaches-store"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "attach_cost_store"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: present
+      - name: "private-store-write-gone"
+        binding: "built here; the private write is present on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "_cost_store = self\\.cost_store"
+          paths: ["orchestrator/src/orchestrator/harness.py"]
+          expect: absent
+  - label: "3"
+    task_id: 10431
+    title: "The scheduler does not start a task the reserve would refuse; slot-wait signal and escalation; tier names checked at start-up"
+    capabilities:
+      - name: "class-helper-and-gate-query"
+        binding: "producer:task-2 upstream; producer:task-1b upstream"
+        verdict: PASS
+      - name: "one-eligibility-test"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_build_candidates` wired: calls _eligible_for_dispatch; `grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._dispatch_candidacy` wired: calls _eligible_for_dispatch"
+        verdict: PASS
+      - name: "tier-computed-before-candidates"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_compute_priorities` runs before build_candidates in _TICK_PHASE_ORDER"
+        verdict: PASS
+      - name: "put-back-seams"
+        binding: "`grep:orchestrator/src/orchestrator/scheduler.py::Scheduler.release`, `grep:orchestrator/src/orchestrator/slot_lease.py::SlotLease.release`"
+        verdict: PASS
+      - name: "tier-vocabulary"
+        binding: "`grep:orchestrator/src/orchestrator/config.py::PRIORITY_TIERS`"
+        verdict: PASS
+      - name: "hold-event"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "dispatch_reserve_hold"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "slot-wait-event"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "reserve_slot_wait"
+          paths: ["orchestrator/src/orchestrator/event_store.py"]
+          expect: present
+      - name: "all-held-tick-is-not-drained"
+        binding: "built here; boundary row C4b"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "A behavioural property of the main loop; boundary row C4b in the task's test file asserts it."
+  - label: "4"
+    task_id: 10432
+    title: "The memory service and nightly jobs declare their kind of work; reconciliation steps aside while the reserve refuses it"
+    note: "At decompose: the curator gate's store moves to attach_cost_store; the backlog iterator's final consolidation is a third drain point; the mid-life judge recovery skips judges in flight."
+    capabilities:
+      - name: "gate-keyword-query-attach"
+        binding: "producer:task-1b upstream"
+        verdict: PASS
+      - name: "project-loop-drain-site"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._project_loop`"
+        verdict: PASS
+      - name: "backlog-drain-sites"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/harness.py::BacklogIterator.run` wired: calls _run_chunk and _run_final_consolidation, both drain"
+        verdict: PASS
+      - name: "judge-pending-marker-and-recovery"
+        binding: "`grep:fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._spawn_judge`, `grep:fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._recover_pending_judge_reviews`"
+        verdict: PASS
+      - name: "curator-gate-built-with-store"
+        binding: "`grep:fused-memory/src/fused_memory/server/main.py::_setup_curator_usage_gate`"
+        verdict: PASS
+      - name: "curator-passes-class"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "work_class="
+          paths: ["fused-memory/src/fused_memory/middleware/task_curator.py"]
+          expect: present
+      - name: "judge-passes-class"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "work_class="
+          paths: ["fused-memory/src/fused_memory/reconciliation/judge.py"]
+          expect: present
+      - name: "census-passes-class"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "work_class="
+          paths: ["scripts/legibility/session_runner.py"]
+          expect: present
+      - name: "curator-store-attached"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "attach_cost_store"
+          paths: ["fused-memory/src/fused_memory/server/main.py"]
+          expect: present
+  - label: "5"
+    task_id: 10433
+    title: "The weekly reserve report, and the dashboard's account-event list leaves out reserve_served"
+    note: "Depends on task 3 as well as 1b (added at decompose) so its tests read rows from the real producers of every event."
+    capabilities:
+      - name: "event-producers"
+        binding: "producer:task-1b upstream; producer:task-3 upstream"
+        verdict: PASS
+      - name: "recent-account-events-reader"
+        binding: "`grep:dashboard/src/dashboard/data/costs.py`"
+        verdict: PASS
+      - name: "project-store-path"
+        binding: "`grep:dashboard/src/dashboard/config.py` (runs_db: <root>/data/orchestrator/runs.db)"
+        verdict: PASS
+      - name: "report-script"
+        binding: "built here; path absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: path
+          paths: ["scripts/allowance_reserve_report.py"]
+          expect: present
+      - name: "dashboard-leaves-out-served-rows"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "reserve_served"
+          paths: ["dashboard/src/dashboard/data/costs.py"]
+          expect: present
+  - label: "6"
+    task_id: 10434
+    title: "Switch it on: the reserve: block in config/usage-accounts.yaml, header comment corrected, OPERATIONS.md section"
+    capabilities:
+      - name: "every-caller-classified"
+        binding: "producer:task-2 upstream; producer:task-3 upstream; producer:task-4 upstream"
+        verdict: PASS
+      - name: "accounts-file"
+        binding: "`grep:config/usage-accounts.yaml` (accounts list; max-h last)"
+        verdict: PASS
+      - name: "reserve-block"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "^reserve:"
+          paths: ["config/usage-accounts.yaml"]
+          expect: present
+      - name: "operator-section"
+        binding: "built here; grep absent on main 8806eb19eb"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "allowance_reserve_report"
+          paths: ["OPERATIONS.md"]
+          expect: present
+  - label: "7"
+    task_id: 10435
+    title: "Dated check, one day after the switch-on, that every orchestrator and the curator report an active reserve"
+    note: "Deterministic predicate on scripts/allowance_reserve_report.py --state. Filed as a pure gate, then switched to the predicate by update_task, because the script does not exist until task 5 lands."
+    capabilities:
+      - name: "report-state-mode"
+        binding: "producer:task-5 upstream"
+        verdict: PASS
+      - name: "reserve-switched-on"
+        binding: "producer:task-6 upstream"
+        verdict: PASS
+      - name: "fleet-reports-active"
+        binding: "built here; the deterministic runner's predicate verdict"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "The task is the check itself: the runner closes it on exit 0 and escalates to Leo otherwise."
+  - label: "8"
+    task_id: 10436
+    title: "Two-week reading of the reserve for Leo"
+    capabilities:
+      - name: "two-weeks-of-records"
+        binding: "producer:task-7 upstream"
+        verdict: PASS
+      - name: "reading-delivered"
+        binding: "built here; a pure gate's born-at-L2 escalation"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "A human gate: Leo receives the escalation with the two weeks' tables."

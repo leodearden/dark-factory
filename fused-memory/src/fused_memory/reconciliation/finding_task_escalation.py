@@ -15,10 +15,11 @@ choosing Option A, and an implementer then committed the opposite. Reconciliatio
 DID flag the divergence — and the flag went to a queue nobody reading task 4458
 would ever look at.
 
-This module supplies the three PURE parts of the fix: deciding WHICH task a
-finding names, building the escalation payload, and deciding whether a pending
-record already covers a finding. The impure half — queue construction, the
-pending scan and submit — lives on the harness as
+This module supplies the PURE parts of the fix: deciding WHICH task a
+finding names, building the escalation payload, deciding whether a pending
+record already covers a finding, and deciding whether a recent conversion of
+it holds a refile back. The impure half — queue construction, the record
+scans and submit — lives on the harness as
 ``ReconciliationHarness._file_finding_task_escalation``, because it needs the
 harness's ``_known_projects`` registry and its guarded ``HAS_ESCALATION``
 import.
@@ -30,7 +31,9 @@ DETECTION. This arm is the plumbing only.
 
 This module performs NO filesystem or network I/O and imports nothing from the
 ``escalation`` package (which is an optional workspace member — see the guarded
-imports in ``reconciliation/targeted.py`` and ``reconciliation/harness.py``).
+imports in ``reconciliation/reconciler_escalation.py`` and ``reconciliation/harness.py``).
+Its one side effect is the WARNING ``shared.timestamps.parse_timestamp_or_warn``
+logs for an unreadable stamp.
 That keeps it hermetically testable from plain dicts, mirroring the stated
 purity contract of the sibling module ``reconciliation/predicate_contradiction.py``.
 """
@@ -40,15 +43,21 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from datetime import datetime, timedelta
 from typing import Any, Protocol
+
+from shared.timestamps import parse_timestamp_or_warn
 
 __all__ = [
     'FINDING_TASK_ESCALATION_CATEGORY',
     'FINDING_TASK_ESCALATION_LEVEL',
     'RoutedRecordView',
+    'TerminalRoutedRecordView',
     'build_finding_task_escalation_kwargs',
     'is_routable_task_id',
+    'recent_conversion_suppresses_refile',
     'resolve_finding_task_target',
+    'routed_record_carries_finding',
     'routed_record_covers_finding',
 ]
 
@@ -85,20 +94,17 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 # collision — only the level can.  It is level-1-ONLY, so a level-0 record is
 # invisible to every one of them by construction:
 #
-#   - `orchestrator/harness.py::Harness._block_and_escalate_external_dep`, and
-#     its siblings `::Harness._block_and_escalate_cross_repo` and
-#     `::Harness._block_and_escalate_substrate_flip`, each of which SUPPRESSES
-#     its own human-facing L1 and downgrades to a WARNING log when one is
-#     already open;
-#   - `orchestrator/harness.py::Harness._reap_orphan_l0_escalations`, which
-#     DISMISSES a pending orphan L0 on the task rather than promoting it when
-#     an L1 is open;
 #   - `orchestrator/workflow.py::TaskWorkflow._wait_for_resolution`, which
 #     raises `_StewardReescalated` and diverts the workflow on the strength of
 #     an open L1;
 #   - `orchestrator/workflow.py::TaskWorkflow._await_steward_completion`, the
 #     requeue-diversion override, which holds a requeue-producing steward
 #     outcome back when an L1 is already open.
+#
+# The orphan-L0 reaper (`orchestrator/harness.py::Harness._reap_orphan_l0_escalations`)
+# is not a reader: since task 5223 its coverage rule is
+# `escalation/queue.py::EscalationQueue.dismiss_if_covered`, scoped to the L0's
+# own category, so an L1 of another category cannot hijack it.
 #
 # BOTH workflow.py sites are uncategorized, and an earlier revision of this
 # block listed only the first. That was a measurement error, corrected here
@@ -113,33 +119,40 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 # deliberately NOT in it, and were re-measured rather than assumed: the
 # sentinel filers (`_ARCHIVAL_STORM_SENTINEL`, `_SCHEDULER_PAUSE_SENTINEL`, the
 # `main-sweep-<sha12>` tip sweep, ...) key on SYNTHETIC ids that no real task id
-# can collide with, and the CATEGORIZED reads in `orchestrator/workflow.py`
-# pass their own `category=`, which `FINDING_TASK_ESCALATION_CATEGORY` never
-# matches.  Keep this list in `path::symbol` form (CLAUDE.md) — an earlier
-# revision carried bare line pins and two of them had already drifted onto
-# unrelated statements.  A passive observation must not start
+# can collide with, and the CATEGORIZED reads in `orchestrator/workflow.py` and
+# `orchestrator/harness.py` pass their own `category=`, which
+# `FINDING_TASK_ESCALATION_CATEGORY` never matches.  Those include
+# `orchestrator/harness.py::Harness._file_harness_l1`, through which the
+# external-dep, cross-repo and substrate-flip dispatch gates (and the re-cut
+# gate) file category-scoped since task 7170.  Keep this list in
+# `path::symbol` form (CLAUDE.md) — an earlier revision carried bare line pins
+# and two of them had already drifted onto unrelated statements.  A passive observation must not start
 # gating dispatch as a side effect of a PLUMBING change, and level 0 is the
 # only spelling that guarantees it — pinned executably by
 # `test_routed_record_is_invisible_to_the_orchestrator_l1_guards`.
 #
 # Routing note: filed at `severity='info', level=0`.  Level-0 records are
 # surfaced via the steward's pending-escalation view and any external monitor
-# polling the queue.  UNLIKE the notes on
+# polling the queue.  The notes on
 # `orchestrator/harness.py::_file_starvation_info` and
-# `::_file_warm_base_hard_down_notice`, which claim level-0 records "do NOT
-# auto-promote", this one does not: `Harness._reap_orphan_l0_escalations` DOES
-# promote a pending L0 to L1 once it is older than
-# `config.orphan_l0_timeout_secs`, gated on the task having no running workflow
-# (`_escalation_events`), not being `scheduler.is_actively_held`, and having no
-# already-open L1 — in which last case it DISMISSES the L0 instead, as a
-# duplicate of the record the human is already handling.
+# `::_file_warm_base_hard_down_notice` claim level-0 records "do NOT
+# auto-promote"; that does not hold for this one.  Once a routed L0 is aged and
+# unattended, `orchestrator/harness.py::Harness._reap_orphan_l0_escalations`
+# acts on it.  What the reaper does with it is the orchestrator's contract,
+# pinned there by
+# `orchestrator/tests/test_info_l0_router_harness.py::TestReaperRoutesInfoOrphans`
+# (info L0s, router on and off) and `::TestBlockingDedupIsCategoryScoped` (its
+# category-scoped coverage branch).  Read it there, not here.  This filer
+# relies on one property of it only: no L1 of another category closes a routed
+# L0, the same task-2757 scope `routed_record_covers_finding` applies.
 #
-# The consequence is the good one, and it is why no escalate-if-unattended
-# behaviour needs asserting here: an unattended routed finding reaches L1 on
-# its own, delivered by the component that OWNS strand-detection semantics
-# (liveness, hold state, duplicate suppression), while an attended one is
-# correctly folded away.  Re-deriving any of that at this filer would mean
-# re-deriving all three signals from a process that cannot see them.
+# That is why no escalate-if-unattended behaviour needs asserting here: an
+# unattended routed finding reaches a consumer on its own, delivered by the
+# component that OWNS strand-detection semantics (liveness, hold state,
+# duplicate suppression).  Re-deriving any of that at this filer would mean
+# re-deriving those signals from a process that cannot see them.  After the
+# info-L0 router converts a record, `recent_conversion_suppresses_refile` holds
+# the finding's refile back for the recon recurrence window (task 7894).
 #
 # PUBLIC (and in `__all__`), like `FINDING_TASK_ESCALATION_CATEGORY` above:
 # the level a routed record is filed at is part of this module's CROSS-MODULE
@@ -149,7 +162,7 @@ FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 # `test_routed_record_is_invisible_to_the_orchestrator_l1_guards` all reason
 # about.  A leading underscore would have signalled module-local and invited a
 # future reader to inline the literal — and, worse, to weaken it without
-# noticing the seven guard sites enumerated above.
+# noticing the guard sites enumerated above.
 FINDING_TASK_ESCALATION_LEVEL = 0
 
 # `severity='info'`, NOT the 'blocking' used by the `_sweep_escalate_l1`
@@ -439,25 +452,74 @@ def routed_record_covers_finding(
     every run.
 
     A record ABOVE ``FINDING_TASK_ESCALATION_LEVEL`` covers EVERY finding.  It
-    is a routed finding a human already holds, and
-    ``orchestrator/harness.py::Harness._reap_orphan_l0_escalations`` dismisses
-    any L0 on a task with an open L1 as covered, so filing one would only start
-    a file-dismiss-refile loop each cycle.  Promotion builds a new record that
-    keeps ``detail`` (with a suffix appended) but not ``dedupe_fingerprint``,
-    which is why the level alone decides here.
+    is a routed finding a human already holds, so a refile would only hand the
+    orphan reaper a duplicate to dispose of every cycle.  Promotion builds a
+    new record that keeps ``detail`` (with a suffix appended) but not
+    ``dedupe_fingerprint``, which is why the level alone decides here.
 
-    That closes the loop for a ROUTED L1 only.  The reaper's ``has_open_l1``
-    read ignores category, so an UNRELATED open L1 still dismisses each routed
-    L0 and the next cycle refiles it.  Folding behind any L1 would give up the
-    task-2757 property above; task 6341 owns that decision.
+    An L1 of another category covers nothing, here or in the orphan reaper,
+    which applies the same task-2757 category scope (task 6341).
 
     The caller passes PENDING records only, so a finding reaches the ladder
-    again once the covering record is adjudicated.
+    again once the covering record is closed, whether a human adjudicated it
+    or the info-L0 router (on by default) converted it to a task.  In the
+    second case :func:`recent_conversion_suppresses_refile` holds the refile
+    back for a window.
     """
     if record.category != FINDING_TASK_ESCALATION_CATEGORY:
         return False
     if record.level > FINDING_TASK_ESCALATION_LEVEL:
         return True
-    return bool(finding_fingerprint) and (
-        _finding_fingerprint_of(record.detail) == finding_fingerprint
+    return routed_record_carries_finding(record, finding_fingerprint)
+
+
+def routed_record_carries_finding(
+    record: RoutedRecordView,
+    finding_fingerprint: str,
+) -> bool:
+    """Whether *record* is a routed record of the finding *finding_fingerprint*.
+
+    Identity only, at any level and in any status.  A promoted record's
+    suffixed ``detail`` no longer parses, so it carries no finding.
+    """
+    return (
+        record.category == FINDING_TASK_ESCALATION_CATEGORY
+        and bool(finding_fingerprint)
+        and _finding_fingerprint_of(record.detail) == finding_fingerprint
     )
+
+
+class TerminalRoutedRecordView(Protocol):
+    """The fields of a closed routed record that the conversion hold reads."""
+
+    @property
+    def resolution_class(self) -> str | None: ...
+
+    @property
+    def resolved_at(self) -> object: ...
+
+
+def recent_conversion_suppresses_refile(
+    record: TerminalRoutedRecordView | None,
+    *,
+    converted_class: str,
+    now: datetime,
+    window: timedelta,
+) -> bool:
+    """Whether *record*, the finding's newest closed routed record, holds its refile back.
+
+    Only a conversion to a task, closed less than *window* before *now*, holds
+    it: an adjudication is newer information and lets the refile through, and
+    an unreadable ``resolved_at`` files rather than suppresses.  The stamp is
+    read by the same rule ``EscalationQueue.newest_terminal_by_task`` picked
+    the record by, so a naive stamp reads as UTC.
+
+    *converted_class* is ``escalation.disposition.ConvertViaCurator.resolution_class``,
+    passed in because this module imports nothing from ``escalation``.
+    """
+    if record is None or record.resolution_class != converted_class:
+        return False
+    resolved_at, readable = parse_timestamp_or_warn(
+        record.resolved_at, context='recon.conversion_hold',
+    )
+    return readable and now - resolved_at < window

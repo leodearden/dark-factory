@@ -4,11 +4,14 @@ Guards against:
   * Silent removal of the marked / DOMPurify CDN script tags (the MarkdownText
     component falls back to plain text when these are missing — works "well
     enough" that the regression can ship unnoticed).
+  * A silent reversion of the React CDN tags to the development build (every
+    tab still renders, just several times slower per re-render).
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -19,7 +22,7 @@ from _cache_buster_helpers import (
     resolve_redux_base_state,
     sole_cache_buster_version,
 )
-from _dashboard_helpers import assert_script_loads_before, find_script_position, strip_js_comments
+from _jsx_source_helpers import assert_script_loads_before, find_script_position, strip_js_comments
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -36,7 +39,7 @@ def test_static_index_html_serves_200(client):
     )
 
 
-_CDN_SCRIPT_CASES = [
+_MARKDOWN_CDN_CASES = [
     (
         'https://unpkg.com/marked@',
         'marked',
@@ -51,26 +54,53 @@ _CDN_SCRIPT_CASES = [
     ),
 ]
 
+_REACT_PREFIX = 'https://unpkg.com/react@'
+_REACT_DOM_PREFIX = 'https://unpkg.com/react-dom@'
+
+_CDN_SCRIPT_CASES = [
+    *_MARKDOWN_CDN_CASES,
+    (
+        _REACT_PREFIX,
+        'React',
+        'Every .jsx reads the global `React` — a missing or wrong integrity '
+        'either runs unverified CDN bytes or, on a hash mismatch, blocks the '
+        'whole dashboard.',
+    ),
+    (
+        _REACT_DOM_PREFIX,
+        'ReactDOM',
+        'app.jsx mounts the app through the global `ReactDOM.createRoot` — a '
+        'missing or wrong integrity either runs unverified CDN bytes or, on a '
+        'hash mismatch, leaves the page blank.',
+    ),
+]
+
+
+def _script_attrs(
+    index_html_body: str, src_prefix: str, consumer_note: str = ''
+) -> dict[str, str | None]:
+    result = find_script_position(index_html_body, src_prefix)
+    assert result is not None, (
+        f'No <script src="{src_prefix}..."> tag found in index.html. {consumer_note}'
+    ).rstrip()
+    return result[1]
+
 
 @pytest.mark.parametrize(
     'src_prefix, lib_name, consumer_note',
     _CDN_SCRIPT_CASES,
-    ids=['marked', 'dompurify'],
+    ids=['marked', 'dompurify', 'react', 'react-dom'],
 )
 def test_cdn_script_has_sri_integrity(
     index_html_body: str, src_prefix: str, lib_name: str, consumer_note: str
 ) -> None:
     """Each CDN <script> tag is present with a well-formed SRI integrity hash.
 
-    Parametrised over marked and DOMPurify — both are required by the
-    MarkdownText component in tab_tasks.jsx.
+    Parametrised over every CDN library the redux bundle needs except Babel,
+    whose pin the node suite's
+    dashboard/tests/js/_served_bundle.mjs::loadVendoredBabel already holds.
     """
-    result = find_script_position(index_html_body, src_prefix)
-    attrs = result[1] if result is not None else None
-    assert attrs is not None, (
-        f'No <script src="{src_prefix}..."> tag found in index.html. '
-        f'{consumer_note}'
-    )
+    attrs = _script_attrs(index_html_body, src_prefix, consumer_note)
     integrity = (attrs.get('integrity') or '').strip()
     assert integrity, (
         f'{lib_name} CDN tag has missing or empty integrity= attribute. '
@@ -79,6 +109,62 @@ def test_cdn_script_has_sri_integrity(
     assert _SRI_HASH_RE.match(integrity), (
         f'{lib_name} CDN tag integrity= is not a valid SRI hash '
         f'(expected sha256/384/512-<base64>): {integrity!r}'
+    )
+
+
+@dataclass(frozen=True)
+class UnpkgUmdTag:
+    package: str
+    version: str
+    build: str
+
+
+_UNPKG_UMD_SRC_RE = re.compile(
+    r'^https://unpkg\.com/(?P<package>react|react-dom)@(?P<version>[^/]+)'
+    r'/umd/(?P=package)\.(?P<build>[a-z.]+)\.js$'
+)
+
+
+def _parse_unpkg_umd_src(src: str) -> UnpkgUmdTag:
+    match = _UNPKG_UMD_SRC_RE.match(src)
+    assert match is not None, (
+        f'React CDN src {src!r} is not the expected shape '
+        'https://unpkg.com/<react|react-dom>@<version>/umd/<package>.<build>.js'
+    )
+    return UnpkgUmdTag(match['package'], match['version'], match['build'])
+
+
+def _react_umd_tag(index_html_body: str, src_prefix: str) -> UnpkgUmdTag:
+    return _parse_unpkg_umd_src(_script_attrs(index_html_body, src_prefix).get('src') or '')
+
+
+def test_react_cdn_tags_load_one_version_of_the_production_build(index_html_body: str) -> None:
+    """React and ReactDOM load the production UMD build, at one shared version.
+
+    The development build re-validates every element on every render; the page
+    still works, so a reversion would ship unnoticed while every poll-driven
+    re-render pays for it.
+
+    The production build is silent about missing keys and prop or hook misuse,
+    and reports render errors as "Minified React error #N". To get those
+    diagnostics back while debugging a .jsx change locally, point both tags at
+    umd/<package>.development.js and drop or re-derive their integrity= (SRI
+    blocks a mismatched hash). Do not commit that swap; this test fails on it.
+    dashboard/tests/js/dom_harness.mjs renders the tabs on the development build
+    of the same package, so jsx_render.test.mjs still fails on those warnings.
+    """
+    react = _react_umd_tag(index_html_body, _REACT_PREFIX)
+    react_dom = _react_umd_tag(index_html_body, _REACT_DOM_PREFIX)
+    for tag in (react, react_dom):
+        assert tag.build == 'production.min', (
+            f'{tag.package}@{tag.version} loads umd/{tag.package}.{tag.build}.js; '
+            f'expected umd/{tag.package}.production.min.js. The development build '
+            're-validates every element on every render, and task 5828 measured it '
+            '2-5x slower per dashboard re-render.'
+        )
+    assert react.version == react_dom.version, (
+        f'react@{react.version} and react-dom@{react_dom.version} differ; a '
+        'React/ReactDOM version mismatch breaks the app at runtime.'
     )
 
 
@@ -136,7 +222,7 @@ _TAB_TASKS_PREFIX = '/static/redux/tab_tasks.jsx'
 
 @pytest.mark.parametrize(
     'src_prefix, lib_name, consumer_note',
-    _CDN_SCRIPT_CASES,
+    _MARKDOWN_CDN_CASES,
     ids=['marked', 'dompurify'],
 )
 def test_cdn_script_loads_before_tab_tasks_jsx(
@@ -364,35 +450,6 @@ def test_graph_layout_js_loads_before_tab_tasks(index_html_body: str) -> None:
         consumer_note=(
             'tab_tasks.jsx destructures window.DF_GRAPH_LAYOUT at top level; '
             'graph_layout.js must define it first.'
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Regression guard: prd_grouping.js must load BEFORE tab_tasks.jsx (task 2530)
-# ---------------------------------------------------------------------------
-
-_PRD_GROUPING_PREFIX = '/static/redux/prd_grouping.js'
-
-
-def test_prd_grouping_js_loads_before_tab_tasks(index_html_body: str) -> None:
-    """prd_grouping.js must load as a classic synchronous script BEFORE
-    tab_tasks.jsx.
-
-    tab_tasks.jsx destructures window.DF_PRD_GROUPING at top-level execution
-    time — if prd_grouping.js loaded after (or not at all), that destructure
-    would silently produce undefined, and the "group by PRD" view would throw
-    the moment it tries to call one of those functions.
-    """
-    assert_script_loads_before(
-        index_html_body,
-        _PRD_GROUPING_PREFIX,
-        _TAB_TASKS_PREFIX,
-        before_label='prd_grouping.js',
-        after_label='tab_tasks.jsx',
-        consumer_note=(
-            'tab_tasks.jsx destructures window.DF_PRD_GROUPING at top level; '
-            'prd_grouping.js must define it first.'
         ),
     )
 
@@ -1279,23 +1336,33 @@ def test_task_snapshot_js_load_order(
     )
 
 
-# prd_grouping.js builds its PRD tally from the generated vocabulary and its
-# PRD-box count from datum.js::combinedDatum and task_snapshot.js's readings,
-# all destructured at module scope (task 5590). Its edge to tab_tasks.jsx is
-# test_prd_grouping_js_loads_before_tab_tasks.
-_PRD_GROUPING_ORDER_CASES = [
-    (_DATUM_PREFIX, 'datum.js', _PRD_GROUPING_PREFIX, 'prd_grouping.js', _READS_AT_MODULE_SCOPE),
-    (_TASK_VOCAB_PREFIX, 'task_vocab.js', _PRD_GROUPING_PREFIX, 'prd_grouping.js', _READS_AT_MODULE_SCOPE),
-    (_TASK_SNAPSHOT_PREFIX, 'task_snapshot.js', _PRD_GROUPING_PREFIX, 'prd_grouping.js', _READS_AT_MODULE_SCOPE),
+# prd_lanes_view.js stamps the /prds Datums through datum.js::servedDatum, and
+# prd_lanes.jsx renders the page through shell.jsx's readings, charts.jsx's
+# palette and prd_lanes_view.js's decisions; tab_tasks.jsx hosts it. Each
+# destructures the module before it at module scope (task 6585).
+_PRD_LANES_VIEW_PREFIX = '/static/redux/prd_lanes_view.js'
+_PRD_LANES_PREFIX = '/static/redux/prd_lanes.jsx'
+_PRD_LANES_ORDER_CASES = [
+    (_DATUM_PREFIX, 'datum.js', _PRD_LANES_VIEW_PREFIX, 'prd_lanes_view.js', _READS_AT_MODULE_SCOPE),
+    (_PRD_LANES_VIEW_PREFIX, 'prd_lanes_view.js', _PRD_LANES_PREFIX, 'prd_lanes.jsx', _READS_AT_MODULE_SCOPE),
+    (_SHELL_PREFIX, 'shell.jsx', _PRD_LANES_PREFIX, 'prd_lanes.jsx', _READS_AT_MODULE_SCOPE),
+    (_CHARTS_PREFIX, 'charts.jsx', _PRD_LANES_PREFIX, 'prd_lanes.jsx', _READS_AT_MODULE_SCOPE),
+    (_PRD_LANES_PREFIX, 'prd_lanes.jsx', _TAB_TASKS_PREFIX, 'tab_tasks.jsx', _READS_AT_MODULE_SCOPE),
 ]
 
 
 @pytest.mark.parametrize(
     'before_prefix, before_label, after_prefix, after_label, why',
-    _PRD_GROUPING_ORDER_CASES,
-    ids=['datum-before-prd-grouping', 'vocab-before-prd-grouping', 'snapshot-before-prd-grouping'],
+    _PRD_LANES_ORDER_CASES,
+    ids=[
+        'datum-before-prd-lanes-view',
+        'prd-lanes-view-before-prd-lanes',
+        'shell-before-prd-lanes',
+        'charts-before-prd-lanes',
+        'prd-lanes-before-tab-tasks',
+    ],
 )
-def test_prd_grouping_js_load_order(
+def test_prd_lanes_load_order(
     index_html_body: str,
     before_prefix: str,
     before_label: str,
@@ -1303,7 +1370,7 @@ def test_prd_grouping_js_load_order(
     after_label: str,
     why: str,
 ) -> None:
-    """The PRD grouping module loads after every module it reads."""
+    """The PRD lanes page's modules load after every module they read."""
     assert_script_loads_before(
         index_html_body,
         before_prefix,
@@ -1872,33 +1939,71 @@ def test_spend_readings_js_load_order(
 
 
 # ---------------------------------------------------------------------------
-# Regression guard: dependency-free classic modules are served, versioned, and
-# load before every .jsx that reads them (task 5743)
+# Regression guard: classic modules read at module scope are served, versioned,
+# and load after every module they read and before every consumer that reads
+# them (tasks 5743, 8461)
 #
-# A module in this table reads no window.DF_* global, so its only load-order
-# edges are to its consumers, each of which destructures the module's global
-# at module scope with no fallback. One row per module; each consumer is its
-# own case because each blanks a different surface.
+# A reader destructures the read module's global at module scope with no
+# fallback, so each edge blanks a different surface and is its own case. A row
+# names the modules its key reads and the consumers that read it; a module that
+# reads no window.DF_* global has reads=(). An edge between two modules that
+# both have rows is stated once, as the reader's `reads`
+# (test_module_table_states_each_edge_once). tab_quality.jsx's datum.js read is
+# pinned through data.js.
 # ---------------------------------------------------------------------------
 
-_DEPENDENCY_FREE_MODULES = {
-    'escalation_focus.js': ('tab_escalations.jsx',),
-    'persisted_state.js': (
+
+@dataclass(frozen=True)
+class _ModuleEdges:
+    reads: tuple[str, ...] = ()
+    consumers: tuple[str, ...] = ()
+
+
+_MODULE_EDGES = {
+    'escalation_focus.js': _ModuleEdges(consumers=('tab_escalations.jsx',)),
+    'escalation_check_owner.js': _ModuleEdges(consumers=('tab_escalations.jsx',)),
+    'persisted_state.js': _ModuleEdges(consumers=(
         'tab_memory_evals.jsx',
         'tabs.jsx',
         'tab_escalations.jsx',
         'tab_escalation_analytics.jsx',
+        'tab_tasks.jsx',
+    )),
+    'render_failure.js': _ModuleEdges(consumers=('app.jsx',)),
+    'poll_scope.js': _ModuleEdges(consumers=('data.js', 'app.jsx')),
+    'chart_marks.js': _ModuleEdges(consumers=('charts.jsx', 'tab_escalation_analytics.jsx')),
+    'quality_view.js': _ModuleEdges(reads=('chart_marks.js',)),
+    'tab_quality.jsx': _ModuleEdges(
+        reads=('charts.jsx', 'shell.jsx', 'data.js', 'window_chip.js', 'persisted_state.js', 'quality_view.js'),
+        consumers=('app.jsx',),
     ),
 }
-_DEPENDENCY_FREE_CONSUMER_CASES = [
-    (module, consumer)
-    for module, consumers in _DEPENDENCY_FREE_MODULES.items()
-    for consumer in consumers
+_LOAD_ORDER_EDGES = [
+    *((read, module) for module, edges in _MODULE_EDGES.items() for read in edges.reads),
+    *((module, consumer) for module, edges in _MODULE_EDGES.items() for consumer in edges.consumers),
 ]
 
 
-@pytest.mark.parametrize('module', list(_DEPENDENCY_FREE_MODULES))
-def test_dependency_free_module_is_served(client, module: str) -> None:
+def _readers_of(module: str) -> list[str]:
+    return [after for before, after in _LOAD_ORDER_EDGES if before == module]
+
+
+def test_module_table_states_each_edge_once() -> None:
+    """A consumer with a row of its own carries the edge in its `reads`."""
+    restated = [
+        (module, consumer)
+        for module, edges in _MODULE_EDGES.items()
+        for consumer in edges.consumers
+        if consumer in _MODULE_EDGES
+    ]
+    assert restated == [], (
+        f'{restated} are stated as consumers, but each consumer has a row of its '
+        "own: move the edge into that row's `reads`, so the edge has one home."
+    )
+
+
+@pytest.mark.parametrize('module', list(_MODULE_EDGES))
+def test_read_module_is_served(client, module: str) -> None:
     """The module is reachable at runtime, not merely tagged in index.html."""
     resp = client.get(f'/static/redux/{module}')
     assert resp.status_code == 200, (
@@ -1907,32 +2012,30 @@ def test_dependency_free_module_is_served(client, module: str) -> None:
     )
 
 
-@pytest.mark.parametrize('module', list(_DEPENDENCY_FREE_MODULES))
-def test_dependency_free_module_has_cache_buster(index_html_body: str, module: str) -> None:
+@pytest.mark.parametrize('module', list(_MODULE_EDGES))
+def test_read_module_has_cache_buster(index_html_body: str, module: str) -> None:
     """The module is present among the VERSIONED redux assets."""
     assert re.search(rf'/static/redux/{re.escape(module)}\?v=\d+', index_html_body), (
         f'{module} is not present among the versioned /static/redux/* assets in '
-        f'index.html — {", ".join(_DEPENDENCY_FREE_MODULES[module])} destructure its '
-        'global at top level with no fallback. Bump all /static/redux/* ?v= uniformly.'
+        f'index.html — {", ".join(_readers_of(module))} destructure '
+        'its global at top level with no fallback. Bump all /static/redux/* ?v= uniformly.'
     )
 
 
 @pytest.mark.parametrize(
-    'module, consumer',
-    _DEPENDENCY_FREE_CONSUMER_CASES,
-    ids=[f'{module}-before-{consumer}' for module, consumer in _DEPENDENCY_FREE_CONSUMER_CASES],
+    'before, after',
+    _LOAD_ORDER_EDGES,
+    ids=[f'{before}-before-{after}' for before, after in _LOAD_ORDER_EDGES],
 )
-def test_dependency_free_module_loads_before_its_consumers(
-    index_html_body: str, module: str, consumer: str,
-) -> None:
-    """The module defines its global before any consumer destructures it."""
+def test_read_module_load_order(index_html_body: str, before: str, after: str) -> None:
+    """Each read global is defined before the module that destructures it runs."""
     assert_script_loads_before(
         index_html_body,
-        f'/static/redux/{module}',
-        f'/static/redux/{consumer}',
-        before_label=module,
-        after_label=consumer,
-        consumer_note=f'{consumer} ' + _READS_AT_MODULE_SCOPE.format(before=module),
+        f'/static/redux/{before}',
+        f'/static/redux/{after}',
+        before_label=before,
+        after_label=after,
+        consumer_note=f'{after} ' + _READS_AT_MODULE_SCOPE.format(before=before),
     )
 
 
@@ -1979,8 +2082,8 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'graph_layout.js is not present among the versioned /static/redux/* '
         'assets in index.html.'
     )
-    assert re.search(r'/static/redux/prd_grouping\.js\?v=\d+', index_html_body), (
-        'prd_grouping.js is not present among the versioned /static/redux/* '
+    assert re.search(r'/static/redux/prd_lanes_view\.js\?v=\d+', index_html_body), (
+        'prd_lanes_view.js is not present among the versioned /static/redux/* '
         'assets in index.html.'
     )
     assert re.search(r'/static/redux/runtime_format\.js\?v=\d+', index_html_body), (
@@ -2035,6 +2138,7 @@ def redux_base_state() -> ReduxBaseState | None:
     return resolve_redux_base_state(REPO_ROOT)
 
 
+@pytest.mark.reads_git_history
 def test_redux_cache_buster_is_newer_than_merge_base(
     index_html_body: str,
     redux_base_state: ReduxBaseState | None,

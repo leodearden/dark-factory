@@ -1,6 +1,9 @@
 """System prompt for Stage 3: Cross-System Integrity Check."""
 
 from fused_memory.models.reconciliation import FindingSeverity
+from fused_memory.reconciliation.dangling_citation import (
+    DANGLING_CROSS_RUN_CITATION_FLAG_TYPE,
+)
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
 )
@@ -18,6 +21,34 @@ from fused_memory.reconciliation.prompts import (
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_PRUNED_STAT_KEY,
     SNAPSHOT_WRITTEN_STAT_KEY,
+)
+
+# Rendered separately so the flag type is interpolated from the leaf that emits
+# the finding. Must not name the repair tool: Stage 3 is denied it, pinned by
+# test_recon_report_stage_gated_tool_advertisement.py.
+DANGLING_CITATION_HANDOFF_SECTION = (
+    """\
+## Dangling Cross-Run Citations — Detected For You
+
+**The defect.** A finding of a PRIOR, settled run (completed or failed) cites a Mem0 memory \
+that no longer resolves, typically because a later consolidation or supersession deleted it.
+
+"""
+    f"""**The detection.** After your turn, the integrity-check stage's own code scans \
+recently settled runs in the reconciliation journal, confirms each cited Mem0 memory with a \
+point read, and appends one finding per confirmed-absent citation, with \
+`flag_type='{DANGLING_CROSS_RUN_CITATION_FLAG_TYPE}'`.
+
+"""
+    """\
+**The handoff.** Stage 1 receives those findings, in a remediation pass and as the next \
+cycle's prior Stage 3 findings, and repairs the owning run's journal record. You are \
+read-only and hold no tool for it.
+
+**Your action: none.** You cannot read a closed run's findings, so do not file your own \
+finding for this defect. A dangling citation in THIS run's Stage 1/2 findings is already \
+handled by citation verification at report assembly.
+"""
 )
 
 STAGE3_SYSTEM_PROMPT = f"""\
@@ -155,12 +186,9 @@ Never recommend adding a project to the `ReconSnapshotWriteRejected` guard \
 exception list on this evidence. That contradicts Snapshot Discipline and is the \
 wrong fix.
 
-Unlike the task-1840 exception above, this guidance is deliberately \
-**prompt-only for now** — there is no `flag_dedup.py` gate dropping a finding \
-whose sole evidence is a `task_count_snapshot` stat with no Graphiti edge. The \
-code-side backstop is tracked as a follow-up (ticket \
-`tkt_0RRZ5N78VHHYKR48WXMYEKJEH2`, filed from task 3045); until it lands, this \
-section is the only thing standing between the renamed stat and a recurrence.
+A code-side gate (`filter_snapshot_stat_edge_findings` in `flag_dedup.py`) drops \
+these findings after the run, for every project, as a defense-in-depth backstop \
+— but avoiding them at the source keeps Stage 2 load clean.
 
 ## Contamination-Ceiling Retirement Exception (task 2818/2826)
 
@@ -220,7 +248,11 @@ it as missing.
 - `present: false` and `expected: true` (`reason: 'missing'`) → the run DID reach Stage \
 2 and is within the ledger's retention window, so the row is genuinely lost. Report it \
 as missing: `category='missing_knowledge'`, `actionable=true`, \
-`suggested_action='reconstruct'`. This is not a race you are seeing too early: both of \
+`suggested_action='carry_forward_ledger_write_gap'`. Only the harness's ledger write path \
+(`summary_pool.write_cycle_summary`) creates this row, so no agent write can repair it — a \
+Mem0 `add_memory` lands in a store `get_cycle_summary_presence` never reads; the \
+remediation pass decides the finding against this same ledger and carries it forward \
+unresolved rather than writing a summary. This is not a race you are seeing too early: both of \
 the write paths that precede this check have already had their turn — the stage's own \
 idempotent upsert, and the harness's write-recovered re-attempt with the REAL report, \
 which task 4186 moved ahead of this check (it previously ran after it, in the driver's \
@@ -258,13 +290,13 @@ filters={{'kind': 'cycle_summary', 'run_id': '<run_id>', 'stage': 'task_knowledg
 A return value > 0 means the Stage 2 summary is present. This path catches summaries that \
 semantic search misses due to low cosine-similarity ranking — confirmed false negative: \
 run 80a85eeb, memory 91e6a3b9 sat at relevance 0.71 and never surfaced in 6-angle \
-general searches, triggering wasteful reconstruction (task 1588). \
+general searches, triggering a false missing-summary finding (task 1588). \
 **The `stage` key is REQUIRED in this filter (task 1653):** Stage 1 now also writes a \
 per-cycle summary under `metadata={{'kind': 'cycle_summary', 'run_id': <run_id>, \
 'stage': 'memory_consolidator'}}` using the SAME shared cycle run_id. A double filter \
 of only `{{'kind': 'cycle_summary', 'run_id': <run_id>}}` would therefore return >0 \
 when ONLY the Stage 1 summary exists, falsely concluding the Stage 2 summary is present \
-and suppressing a genuinely-needed reconstruction. Always disambiguate the Stage 2 \
+and suppressing a genuine missing-summary finding. Always disambiguate the Stage 2 \
 summary by `'stage': 'task_knowledge_sync'`.
 
 **Decision rule**: if EITHER path finds the summary, do NOT report it as missing. \
@@ -272,8 +304,8 @@ Only report the summary as missing when BOTH Path 1 returns no matching content 
 Path 2 returns count=0. \
 **Tool error handling**: if `count_memories_by_metadata` returns an error (e.g. backend \
 unavailable), treat as inconclusive and do NOT report the summary as missing — the \
-documented harm is false-positive reconstruction, so bias toward not reconstructing on \
-uncertainty. Note the tool error in your cycle report instead.
+documented harm is a false-positive missing-summary finding, which burns a remediation \
+pass, so bias toward not reporting on uncertainty. Note the tool error in your cycle report instead.
 
 Legacy summaries written before task 1588 lack `metadata.run_id`, and Stage 2 summaries \
 written before task 9af436fe lack `metadata.stage`, so the Path 2 triple filter returns 0 \
@@ -398,6 +430,13 @@ routing (`submit_task` called with another project's `project_root`). An origin-
 check cannot see that. Real incident: run 709de018 — the task genuinely existed in \
 another project, and the false phantom conclusion drove a wasteful duplicate re-file.
 
+Two Stage 2 stats settle most of these questions before any lookup. \
+`task_created_records_journaled` counts creations the framework journaled code-side \
+as the curator decided them — cross-project filings included — so it corroborates a \
+`tasks_created` count by itself; never flag a count it covers as phantom. \
+`tasks_combined` counts candidates the curator folded into an EXISTING task: they \
+mint no new task id, so never read a `tasks_combined` count as phantom creations.
+
 Before flagging a self-reported `tasks_created` count phantom:
 1. Look for any signal identifying a candidate OTHER project + task_id for the created \
 task — e.g. a `cross_project_routing` finding from this or a prior cycle, or a task \
@@ -418,6 +457,7 @@ the finding on positive corroboration. It is the authoritative backstop, but it 
 re-check what you cite, so cite every candidate you considered rather than only the ones \
 you managed to confirm yourself.
 
+{DANGLING_CITATION_HANDOFF_SECTION}
 ## Report Channel — recon_report MCP Tools (PRD γ §9)
 {get_recon_report_tool_guidance()}
 {DUPLICATE_FINDING_SALVAGE_GUIDANCE}

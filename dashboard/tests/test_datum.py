@@ -24,6 +24,7 @@ from dashboard.data.datum import (
     DatumInvariant,
     DatumState,
     aged_at,
+    map_datum,
     validate_datum,
 )
 
@@ -357,6 +358,57 @@ def test_unknown_datum_builds_the_triad_validate_accepts():
     assert (built.value, built.as_of, built.state) == (None, None, DatumState.UNKNOWN)
     assert (built.reason, built.freshness_bound_seconds) == ('the probe failed', 45)
     validate_datum(built, SERVED_AT)
+
+
+# ---------------------------------------------------------------------------
+# map_datum — the envelope's provenance over a projected value. A shaper that
+# serves a reshaped payload keeps the producer's as_of, state, reason and
+# bound; an unknown datum has no value to project and stays unknown.
+# ---------------------------------------------------------------------------
+
+
+def _never_called(value):
+    raise AssertionError(f'an unknown datum has no value to project, got {value!r}')
+
+
+def test_map_datum_projects_a_fresh_value_and_keeps_its_provenance():
+    datum = datum_measured_at(AS_OF)
+
+    mapped = map_datum(datum, lambda value: value * 10)
+
+    assert mapped.value == 50
+    assert (mapped.as_of, mapped.state, mapped.reason, mapped.freshness_bound_seconds) == (
+        AS_OF, DatumState.FRESH, None, BOUND_SECONDS,
+    )
+
+
+def test_map_datum_keeps_a_stale_datums_state_and_reason_verbatim():
+    datum = datum_measured_at(AS_OF, state=DatumState.STALE, reason='refresh failed')
+
+    mapped = map_datum(datum, str)
+
+    assert mapped.value == '5'
+    assert (mapped.state, mapped.reason) == (DatumState.STALE, 'refresh failed')
+
+
+def test_map_datum_never_projects_an_unknown_datum():
+    datum = datum_module.unknown_datum('no runs.db is open', 45)
+
+    mapped = map_datum(datum, _never_called)
+
+    assert (mapped.value, mapped.as_of, mapped.state) == (None, None, DatumState.UNKNOWN)
+    assert (mapped.reason, mapped.freshness_bound_seconds) == ('no runs.db is open', 45)
+
+
+@pytest.mark.parametrize('state', [DatumState.FRESH, DatumState.STALE, DatumState.UNKNOWN])
+def test_a_mapped_datum_validates_and_leaves_its_input_untouched(state):
+    datum = datum_in_state(state, None if state is DatumState.FRESH else 'refresh failed')
+    before = dataclasses.astuple(datum)
+
+    mapped = map_datum(datum, lambda value: {'wrapped': value})
+
+    validate_datum(mapped, AS_OF)
+    assert dataclasses.astuple(datum) == before
 
 
 # ---------------------------------------------------------------------------

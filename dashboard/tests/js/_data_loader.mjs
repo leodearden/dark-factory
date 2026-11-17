@@ -1,17 +1,24 @@
 // The data.js loader every data.js node suite shares: a fresh module per
-// call, against a shimmed browser-ish global, and a microtask drain.
+// call, against a shimmed browser-ish global, a microtask drain, and a
+// console.warn capture for the refreshes that warn by design.
 //
-// A helper module, not a test: the `*.test.mjs` glob skips it. Its importers
-// are data_poll.test.mjs and data_pause.test.mjs.
+// A helper module, not a test: the `*.test.mjs` glob skips it.
 //
 // A static ESM `import` of data.js is not an option: data.js assigns
 // `window.DF_DATA = {...}` at module scope, and an imported module's body runs
 // BEFORE the importer's, so `globalThis.window` would still be unset. Hence the
 // shim-then-require shape below.
+//
+// A suite may take pollKey once at file scope, `const { pollKey } =
+// loadDataJs().api;`: pollKey is pure, and each test's own loadDataJs()
+// re-installs the shim, so that throwaway load leaves nothing a later test can
+// observe.
 import { createRequire } from 'node:module';
 
 // The object datum.js reads at load; see loadDataJs's comment.
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
+// The maps data.js destructures at load for pollSetFor.
+import pollScope from '../../src/dashboard/static/redux/poll_scope.js';
 
 const MODULE_SPECIFIER = '../../src/dashboard/static/redux/data.js';
 const DATUM_MODULE_SPECIFIER = '../../src/dashboard/static/redux/datum.js';
@@ -25,8 +32,8 @@ const DATUM_MODULE_SPECIFIER = '../../src/dashboard/static/redux/datum.js';
 // from a previous test's shim (mirrors runtime_format.test.mjs:33-49).
 //
 // Deliberately does NOT set `globalThis.document`: index.html loads data.js
-// as a classic script where `document` always exists, but every test in
-// this file runs under node, so the auto-start guard must see no `document`
+// as a classic script where `document` always exists, but every suite that
+// imports it runs under node, so the auto-start guard must see no `document`
 // and stay inert, exactly like the real non-browser (node --test)
 // environment.
 //
@@ -47,8 +54,13 @@ export function loadDataJs({ fetchStub } = {}) {
   // shim so it can publish DF_DATUM, which data.js in turn destructures at
   // module scope. index.html gives them exactly this order —
   // endpoint_staleness.js -> datum.js -> data.js — and test_index_html.py pins
-  // both edges.
-  const win = { dispatchEvent: ev => events.push(ev), DF_ENDPOINT_STALENESS: staleness };
+  // both edges. DF_POLL_SCOPE is installed for data.js too, which destructures
+  // poll_scope.js's surface -> endpoint maps at module scope for pollSetFor.
+  const win = {
+    dispatchEvent: ev => events.push(ev),
+    DF_ENDPOINT_STALENESS: staleness,
+    DF_POLL_SCOPE: pollScope,
+  };
   globalThis.window = win;
   globalThis.fetch = (url, init) => {
     fetchCalls.push({ url, init });
@@ -89,4 +101,32 @@ export function loadDataJs({ fetchStub } = {}) {
 // completion before the next tick fires.
 export function drain() {
   return new Promise(resolve => setImmediate(resolve));
+}
+
+// Awaits *fn* with console.warn redirected to *sink*, and restores it however
+// fn ends. Awaiting is what lets one helper serve an async refresh as well as
+// a sync applyKey.
+async function withConsoleWarn(sink, fn) {
+  const original = console.warn;
+  console.warn = sink;
+  try {
+    return await fn();
+  } finally {
+    console.warn = original;
+  }
+}
+
+// Resolves to every console.warn call *fn* made, each as its argument list,
+// so a test can assert on the warning itself.
+export async function warningsFrom(fn) {
+  const calls = [];
+  await withConsoleWarn((...args) => calls.push(args), fn);
+  return calls;
+}
+
+// Resolves to *fn*'s result with its console.warn output dropped: for a test
+// that provokes a failure on purpose and asserts on something else, so the
+// expected warning does not bury the suite's output.
+export function quietly(fn) {
+  return withConsoleWarn(() => {}, fn);
 }

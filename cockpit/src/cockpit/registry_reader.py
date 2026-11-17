@@ -10,7 +10,7 @@ It is also the cockpit's PROJECT-TOKEN CANONICALIZATION BOUNDARY (task
 everything else that needs it points here. Read-only is unchanged --
 nothing here writes to disk -- but every record that enters the cockpit
 through this module leaves it with ``.project`` folded onto the one
-canonical spelling (``session_registry.normalize_project_token``, task
+canonical spelling (``shared.project_id.fold_project_token``, task
 3807). The reason the fold has to sit HERE, at the reader, rather than in
 the display or scoring adapters downstream: the cockpit unions its two
 record kinds -- sessions and decisions -- onto ONE ``project_weights`` key
@@ -31,8 +31,8 @@ import logging
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from orchestrator import session_registry
-from orchestrator.session_registry import normalize_project_token
+from orchestrator import decision_registry, session_registry
+from shared.project_id import fold_project_token
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ _SNAPSHOT_FIELDS = (
 
 
 def _canonicalize_project(
-    record: session_registry.SessionRecord | session_registry.DecisionRecord,
+    record: session_registry.SessionRecord | decision_registry.DecisionRecord,
 ) -> None:
     """Fold *record*'s ``.project`` onto its canonical spelling, in place.
 
@@ -72,7 +72,7 @@ def _canonicalize_project(
     ``record.project = ...`` idiom.
 
     The inequality guard mirrors that same function's already-canonical
-    test (``normalize_project_token(p) == p``): a record already spelled
+    test (``fold_project_token(p) == p``): a record already spelled
     canonically is left untouched rather than rebound to an equal string.
     What the guard elides is that attribute rebind and nothing more -- the
     fold has already run and already built its stripped/casefolded/
@@ -82,7 +82,7 @@ def _canonicalize_project(
     against 1,493 ``dark_factory``), which is NOT canonical, so a cold scan
     really does rewrite most of what it reads.
     """
-    canonical = normalize_project_token(record.project)
+    canonical = fold_project_token(record.project)
     if canonical != record.project:
         record.project = canonical
 
@@ -123,7 +123,7 @@ def _read_record_soft(
     return record
 
 
-def scan_decisions(root: Path | str | None = None) -> list[session_registry.DecisionRecord]:
+def scan_decisions(root: Path | str | None = None) -> list[decision_registry.DecisionRecord]:
     """Return every readable DecisionRecord, ``.project`` canonicalized.
 
     The decision-side twin of scan_sessions (task 3812), applying the same
@@ -133,7 +133,7 @@ def scan_decisions(root: Path | str | None = None) -> list[session_registry.Deci
     The whole READ -- and therefore the whole fail-soft policy: absent
     decisions/ dir -> [], a single corrupt or foreign ``*.json`` logged and
     skipped rather than aborting the rest -- is delegated to
-    ``session_registry.list_decisions``. This is a fold over that reader,
+    ``decision_registry.list_decisions``. This is a fold over that reader,
     never a second implementation of it, so its contract cannot drift away
     from the frozen one (pinned by
     test_returns_the_same_ids_in_the_same_order_as_list_decisions).
@@ -151,7 +151,7 @@ def scan_decisions(root: Path | str | None = None) -> list[session_registry.Deci
     in-memory only and are never written back (the cockpit never calls
     write_decision).
     """
-    decisions = session_registry.list_decisions(root)
+    decisions = decision_registry.list_decisions(root)
     for record in decisions:
         _canonicalize_project(record)
     return decisions

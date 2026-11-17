@@ -1,20 +1,18 @@
 """Dashboard data module for host load metrics — /api/load.
 
-Source-of-truth note
---------------------
-``LOAD_SAMPLES_SCHEMA`` is a copy of ``sampler.store._SCHEMA`` (task 1536).
-The dashboard tests run from the ``dashboard/`` subdir and must not take a
-runtime dependency on the sampler package.  If the sampler schema changes,
-this constant MUST be updated to stay aligned — the DB join columns (metric,
-ts, value, window_mean, window_max) are the consumer contract.
+The ``samples`` schema is owned by ``sampler/src/sampler/store.py::SCHEMA``.
 
-9-key allowlist
----------------
-``KNOWN_METRICS`` is the stable set of metric names the dashboard serves.
-Keys not in this tuple are filtered from query results, giving the frontend
-a fixed shape regardless of future sampler additions.  The response always
-contains all 9 keys; a known metric with nothing to serve returns the
-placeholder shape
+Served metrics
+--------------
+``KNOWN_METRICS`` is the sorted exact names of the sampler groups the
+dashboard serves, a projection of
+``sampler/src/sampler/metrics.py::METRIC_GROUPS``, so a metric added to a
+served group is served with no edit here (the Host load card's own
+presentation list in ``static/redux/tab_overview.jsx`` still needs an entry
+before it displays the metric).  Keys not in this tuple are
+filtered from query results, giving the frontend a fixed shape.  The
+response always contains every key; a known metric with nothing to serve
+returns the placeholder shape
 ``{current: null, sparkline: [], window_mean: null, window_max: null}``.
 
 TWO things produce that placeholder, and only the first is "absent from the
@@ -27,12 +25,12 @@ one home: ``dashboard/src/dashboard/data/load.py::_ANCHOR_SQL``.  Read that
 before changing the bound.  Pinned by
 ``test_a_group_that_stops_writing_blanks_while_its_siblings_keep_ticking``.
 
-PSI window columns
-------------------
-PSI metrics (``psi_*``) are kernel-windowed: the sampler writes NULL for
-``window_mean`` and ``window_max``.  The data module passes these NULLs
-through as Python ``None`` — callers must not expect numeric window values
-for PSI metrics.
+Unwindowed groups
+-----------------
+A group the sampler records unwindowed (PSI, which the kernel already
+windows) carries NULL ``window_mean`` and ``window_max`` columns.  The data
+module passes these NULLs through as Python ``None``, so callers must not
+expect numeric window values for those metrics.
 """
 
 from __future__ import annotations
@@ -41,56 +39,15 @@ import logging
 from typing import Any
 
 import aiosqlite
+from sampler.metrics import METRIC_GROUPS, GroupName, exact_metric_names
 
 from dashboard.data.db import with_db
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Schema (mirrors sampler.store._SCHEMA — keep in sync)
-# ---------------------------------------------------------------------------
+_SERVED_GROUPS = frozenset({GroupName.PSI, GroupName.PROCESS})
 
-LOAD_SAMPLES_SCHEMA: str = """\
-CREATE TABLE IF NOT EXISTS samples (
-    ts          INTEGER NOT NULL,
-    metric      TEXT    NOT NULL,
-    value       REAL    NOT NULL,
-    window_mean REAL,
-    window_max  REAL
-);
-
-CREATE INDEX IF NOT EXISTS idx_samples_metric_ts
-    ON samples (metric, ts);
-
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-"""
-
-# ---------------------------------------------------------------------------
-# Known metric allowlist
-# ---------------------------------------------------------------------------
-
-# PSI metrics: kernel-windowed; window_mean/window_max always NULL in DB.
-PSI_METRICS: frozenset[str] = frozenset({
-    'psi_cpu_some_avg10',
-    'psi_cpu_full_avg10',
-    'psi_mem_some_avg10',
-    'psi_mem_full_avg10',
-    'psi_io_some_avg10',
-    'psi_io_full_avg10',
-})
-
-# Process metrics: sampler-windowed; window_mean/window_max populated.
-PROCESS_METRICS: frozenset[str] = frozenset({
-    'occt_queue_depth',
-    'verify_concurrency',
-    'verify_rss_total_bytes',
-})
-
-# Stable ordered tuple — the frontend shape contract.
-KNOWN_METRICS: tuple[str, ...] = tuple(sorted(PSI_METRICS | PROCESS_METRICS))
+KNOWN_METRICS: tuple[str, ...] = exact_metric_names(METRIC_GROUPS, _SERVED_GROUPS)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +156,7 @@ _QUERY_PARAMS: dict[str, str] = {f'm{i}': m for i, m in enumerate(KNOWN_METRICS)
 async def get_load_metrics(
     db: aiosqlite.Connection | None,
 ) -> dict[str, dict[str, Any]]:
-    """Return the latest value + 60-sample sparkline for each of the 9 known metrics.
+    """Return the latest value + 60-sample sparkline for each metric in KNOWN_METRICS.
 
     Parameters
     ----------

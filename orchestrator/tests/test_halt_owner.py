@@ -3,7 +3,7 @@
 These tests target the phantom-L1 bug: previously, ANY `wip_conflict` resolve
 triggered `unhalt_wip()` — so an unrelated escalation's resolution released
 the halt while the real blocker stayed pending. The fix keys the un-halt on
-the escalation ID that owns the halt (MergeWorker._halt_owner_esc_id),
+the escalation ID that owns the halt (the merge worker's ``halt_owner_esc_id``),
 registered by the workflow handler right after submitting the escalation.
 
 These are regression guards — the test setup deliberately reproduces the
@@ -22,7 +22,7 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.harness import Harness
-from orchestrator.merge_queue import SpeculativeMergeWorker
+from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 
 @pytest.fixture
@@ -689,7 +689,7 @@ class TestHaltMergeQueue:
         status = harness.get_merge_halt_status()
         assert status['halted'] is True
         assert status['owner_esc_id'] is None
-        assert worker._operator_halt.is_set() is True  # noqa: SLF001
+        assert worker.is_operator_halted is True
 
         # The existing force_unhalt_merge_queue cleanly reverses it (no owner →
         # active-owner refusal does not fire) and clears the operator signal.
@@ -697,7 +697,7 @@ class TestHaltMergeQueue:
         assert unhalt['unhalted'] is True
         assert unhalt['prior_owner'] is None
         assert harness.get_merge_halt_status()['halted'] is False
-        assert worker._operator_halt.is_set() is False  # noqa: SLF001
+        assert worker.is_operator_halted is False
 
     def test_halt_when_already_halted_is_noop(self, harness: Harness):
         worker = SpeculativeMergeWorker(git_ops=MagicMock(), queue=asyncio.Queue())

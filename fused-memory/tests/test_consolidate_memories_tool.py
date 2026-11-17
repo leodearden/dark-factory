@@ -28,6 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pydantic_core
 import pytest
 from _fm_helpers import MCP_SAFE_RESPONSE_CHARS
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 import fused_memory.server.tools as tools_module
 from fused_memory.config.schema import Mem0UpdateConfig
@@ -36,6 +37,8 @@ from fused_memory.server.consolidation import build_consolidation_result
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.server.topic_cluster_store import TopicClusterStore
 from fused_memory.services.memory_service import DescendantScan
+
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 PROJECT_ID = 'dark_factory'
 # On the default allowlist for both mem0_update arms, so no case here can
@@ -82,10 +85,11 @@ def _parse_result(result):
 #                            (memory_service.py: "metadata is the FULL
 #                            unprocessed Qdrant payload") — NO top-level
 #                            `created_at`; the timestamp is a payload key.
-#   get_memories_by_metadata -> {'id', 'created_at', 'metadata'} — because
-#                            `Mem0Backend.scroll_by_metadata` explicitly LIFTS
-#                            it (`'created_at': payload.get('created_at')`),
-#                            which `get_point_by_id` does not do.
+#   get_memories_by_metadata -> {'id', 'created_at', 'metadata': <FULL raw payload>}
+#                            (backends/mem0_client.py::Mem0Backend._normalise_point)
+#                            — NO top-level `content`; the text is under
+#                            `metadata['data']`, and `created_at` is LIFTED as
+#                            a copy, not moved out of the payload.
 #
 # So they are kept as two helpers, deliberately named apart, so a later edit
 # cannot re-cross them and re-hide the same class of defect.
@@ -102,12 +106,16 @@ def _point_row(memory_id, *, content=None, **metadata):
 
 
 def _scroll_row(memory_id, *, content=None, **metadata):
-    """What `get_memories_by_metadata` returns: `created_at` LIFTED flat."""
+    """What `get_memories_by_metadata` returns: text only under `metadata['data']`."""
     return {
         'id': memory_id,
-        'content': f'record {memory_id}' if content is None else content,
         'created_at': CREATED_AT,
-        'metadata': {'topic': TOPIC, **metadata},
+        'metadata': {
+            'topic': TOPIC,
+            'created_at': CREATED_AT,
+            'data': f'record {memory_id}' if content is None else content,
+            **metadata,
+        },
     }
 
 
@@ -2254,6 +2262,7 @@ class TestConsolidationSeedsTheTopicGuard:
 
     @pytest.mark.asyncio
     async def test_the_closure_scroll_alone_is_enough_to_seed(self, cluster_store):
+        """Retain-only regression: with supersedes=[], members sharing a phrase seed from their scroll text alone."""
         svc = make_service(
             contents={RETAIN_1: _XDIST_1, RETAIN_2: _XDIST_2},
             topic_members=[CANONICAL, RETAIN_1, RETAIN_2],

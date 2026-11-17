@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any, NamedTuple, Protocol
 
 from graphiti_core.nodes import EpisodeType
+from shared.streak import KeyedStreaks
 
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
 from fused_memory.arm_harness.replay_types import (
@@ -85,30 +86,6 @@ class ReplayJournal(Protocol):
     ) -> None: ...
 
 
-class ConsecutiveFailureBreaker:
-    """Trips once ``limit`` failures arrive in a row; any success resets the streak."""
-
-    def __init__(self, *, arm_id: str, limit: int = MAX_CONSECUTIVE_FAILURES) -> None:
-        if limit < 1:
-            raise ValueError(f'breaker limit must be >= 1, got {limit}')
-        self._arm_id = arm_id
-        self._limit = limit
-        self._streak: list[tuple[str, str]] = []
-
-    def observe(self, episode_id: str, error_class: str | None) -> ArmAbort | None:
-        if error_class is None:
-            self._streak.clear()
-            return None
-        self._streak.append((episode_id, error_class))
-        if len(self._streak) < self._limit:
-            return None
-        return ArmAbort(
-            arm_id=self._arm_id,
-            item_ids=tuple(episode_id for episode_id, _ in self._streak),
-            error_classes=tuple(error_class for _, error_class in self._streak),
-        )
-
-
 async def replay_arm(
     spec: LlmArmSpec,
     items: Sequence[ReplayItem],
@@ -125,8 +102,9 @@ async def replay_arm(
         await _journal(journal, spec, item, outcome)
         return outcome
 
-    breaker = ConsecutiveFailureBreaker(arm_id=spec.arm_id)
-    outcomes, cancelled_ids, abort = await _dispatch(items, run_one, breaker, settings.concurrency)
+    outcomes, cancelled_ids, abort = await _dispatch(
+        items, run_one, spec.arm_id, settings.concurrency
+    )
     return ArmRunResult(
         arm_id=spec.arm_id, outcomes=outcomes, cancelled_ids=cancelled_ids, abort=abort
     )
@@ -145,10 +123,11 @@ _Finished = asyncio.Queue[EpisodeOutcome | Exception]
 async def _dispatch(
     items: Sequence[ReplayItem],
     run_one: Callable[[ReplayItem], Awaitable[EpisodeOutcome]],
-    breaker: ConsecutiveFailureBreaker,
+    arm_id: str,
     concurrency: int,
 ) -> tuple[tuple[EpisodeOutcome, ...], tuple[str, ...], ArmAbort | None]:
-    """Run items at most ``concurrency`` at a time, feeding the breaker in completion order."""
+    """Run items at most ``concurrency`` at a time, counting failures in completion order."""
+    failures: KeyedStreaks[None] = KeyedStreaks(threshold=MAX_CONSECUTIVE_FAILURES)
     pending = iter(items)
     finished: _Finished = asyncio.Queue()
     in_flight: dict[str, asyncio.Task[None]] = {}
@@ -167,13 +146,40 @@ async def _dispatch(
             outcome = _raise_if_error(await finished.get())
             del in_flight[outcome.episode_id]
             outcomes.append(outcome)
-            abort = breaker.observe(outcome.episode_id, outcome.error_class)
+            abort = _abort_if_tripped(failures, arm_id, outcomes)
             if abort is None:
                 launch_next()
     finally:
         cancelled_ids = await _cancel(in_flight)
     outcomes.extend(_drain(finished))
     return tuple(outcomes), cancelled_ids, abort
+
+
+def _abort_if_tripped(
+    failures: KeyedStreaks[None], arm_id: str, outcomes: Sequence[EpisodeOutcome]
+) -> ArmAbort | None:
+    """The abort when the latest outcome completes a run of failures, else ``None``."""
+    if outcomes[-1].error_class is None:
+        failures.success(None)
+        return None
+    step = failures.failure(None)
+    if not step.fired:
+        return None
+    run = outcomes[-step.count:]
+    return ArmAbort(
+        arm_id=arm_id,
+        item_ids=tuple(outcome.episode_id for outcome in run),
+        error_classes=tuple(_error_class_of_run_member(outcome) for outcome in run),
+    )
+
+
+def _error_class_of_run_member(outcome: EpisodeOutcome) -> str:
+    if outcome.error_class is None:
+        raise AssertionError(
+            'a failure streak of length n must be the last n outcomes, all failed; '
+            f'episode {outcome.episode_id!r} inside the run succeeded'
+        )
+    return outcome.error_class
 
 
 async def _report(

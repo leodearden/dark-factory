@@ -12,14 +12,14 @@ marker, so the merge lane's default selection runs them.
 """
 
 import json
-import shutil
-import subprocess
 from collections import Counter
 from functools import cache
 from pathlib import Path
 
 import pytest
+from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
+from arm_harness._lme_artifacts import REPO_ROOT, committed_run_dir, git
 from fused_memory.arm_harness.arm_spec import METERED_STACK, EmbeddingArmSpec, load_arm_spec
 from fused_memory.arm_harness.embedding_preregistration import (
     EMBEDDING_PREREGISTRATION_INPUTS_FILENAME,
@@ -44,7 +44,8 @@ from fused_memory.arm_harness.slate import (
     load_embedding_slate,
 )
 
-REPO_ROOT = Path(__file__).parents[3]
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 EMBEDDING_RELATIVE = 'plans/local-memory-models-eval-embedding'
 EMBEDDING = REPO_ROOT / EMBEDDING_RELATIVE
 PROBE_SET = EMBEDDING / 'probe-set.json'
@@ -67,39 +68,18 @@ ARMS = (*CONTROLS, *CANDIDATES)
 INCUMBENT_MODEL, INCUMBENT_DIM = 'text-embedding-3-small', 1536
 
 
-def _git(*args: str) -> subprocess.CompletedProcess[str]:
-    if shutil.which('git') is None:
-        pytest.skip('git is not available; cannot check the committed index')
-    inside = subprocess.run(
-        ['git', 'rev-parse', '--is-inside-work-tree'],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
-    )
-    if inside.returncode != 0:
-        pytest.skip('not a git working tree; cannot check the committed index')
-    return subprocess.run(
-        ['git', *args], cwd=REPO_ROOT, capture_output=True, text=True, check=False
-    )
-
-
 def _tracked() -> list[str]:
-    return _git('ls-files', '--', EMBEDDING_RELATIVE).stdout.splitlines()
-
-
-def _run_dir(arm_id: str) -> Path:
-    runs = EMBEDDING / 'runs' / arm_id
-    stamps = sorted(path for path in runs.iterdir() if path.is_dir()) if runs.is_dir() else []
-    assert len(stamps) == 1, f'{arm_id} must have exactly one committed stamp dir: {stamps}'
-    return stamps[0]
+    return git('ls-files', '--', EMBEDDING_RELATIVE).stdout.splitlines()
 
 
 @cache
 def _run(arm_id: str) -> EmbeddingRunManifest:
-    return load_embedding_run_manifest(_run_dir(arm_id) / RUN_MANIFEST_FILENAME)
+    return load_embedding_run_manifest(committed_run_dir(EMBEDDING, arm_id) / RUN_MANIFEST_FILENAME)
 
 
 @cache
 def _records(arm_id: str) -> tuple[MetricsRecord, ...]:
-    return load_metrics_records(_run_dir(arm_id))
+    return load_metrics_records(committed_run_dir(EMBEDDING, arm_id))
 
 
 def _spec(arm_id: str) -> EmbeddingArmSpec:
@@ -131,7 +111,7 @@ def test_exactly_the_six_arms_are_committed_each_with_one_run():
     for name in ('README.md', 'probe-set.json', EMBEDDING_PREREGISTRATION_INPUTS_FILENAME):
         assert f'{EMBEDDING_RELATIVE}/{name}' in tracked
     for arm_id in ARMS:
-        run_dir = _run_dir(arm_id)
+        run_dir = committed_run_dir(EMBEDDING, arm_id)
         assert (run_dir / RUN_MANIFEST_FILENAME).is_file()
         assert (run_dir / 'metrics').is_dir()
 
@@ -193,12 +173,13 @@ def test_each_control_is_the_metered_incumbent_embedder(arm_id, scratch):
     assert expected.preregistration_sha is None
 
 
+@pytest.mark.reads_git_history
 def test_the_candidates_preregistration_sha_carries_the_doc_and_precedes_head():
     assert {_run(arm_id).spec.preregistration_sha for arm_id in CANDIDATES} == {
         PREREGISTRATION_SHA
     }
-    assert _git('cat-file', '-e', f'{PREREGISTRATION_SHA}:{PREREGISTRATION_DOC_PATH}').returncode == 0
-    assert _git('merge-base', '--is-ancestor', PREREGISTRATION_SHA, 'HEAD').returncode == 0
+    assert git('cat-file', '-e', f'{PREREGISTRATION_SHA}:{PREREGISTRATION_DOC_PATH}').returncode == 0
+    assert git('merge-base', '--is-ancestor', PREREGISTRATION_SHA, 'HEAD').returncode == 0
 
 
 # --- order, checks and the pre-registration ---------------------------------------------

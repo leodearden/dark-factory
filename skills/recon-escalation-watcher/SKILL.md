@@ -33,9 +33,10 @@ Verify these before starting. If anything is missing, ask the user — don't gue
    `/home/leo/src/dark-factory`). The `escalation` package (watcher) lives here.
 2. **This session's `escalation` MCP must point at 8103**, and `fused-memory` at
    8002. The stock repo `.mcp.json` points `escalation` at 8102 — wrong queue.
-   Launch via the recon-watch config (see "Launching" below); confirm with
-   `mcp__escalation__get_pending_escalations()` returning recon findings
-   (ids like `esc-recon-<hex>-N`, categories `recon_*`).
+   Launch via the recon-watch config (see "Launching" below); confirm the
+   binding from the store-identity block on `get_pending_escalations` reading
+   `kind=reconciliation`, which holds even on an empty queue (how to read it:
+   the empty-result bullet in "Failure Modes" below).
 3. **The 8103 server is up** — it runs inside `fused-memory.service`. If
    `get_pending_escalations` errors, the service is down → tell the user
    (priority 1, system stability); do not try to start it yourself.
@@ -52,14 +53,13 @@ claude --strict-mcp-config --mcp-config "$DARK_FACTORY_ROOT/recon-watch/mcp.json
   "/recon-escalation-watcher"
 ```
 
-**Default lane: tmux.** This is a long-running loop session (PRD
-`plans/fleet-cockpit-prd.md` §3 fork 1) — run it in the crash-survivable, reattachable tmux lane
-by default: wrap the invocation above via `skills/spawn/spawn-claude.sh` with
-`CLAUDE_SPAWN_BACKEND=tmux` (see that script's header) so the session gets a `display.kind=tmux`
-session-registry record and a `tmux attach`-reattachable window. A killed watcher is reattachable
-with `tmux attach`, and its record persists across the crash. Interactive one-offs are unaffected
-— this watcher never spawns interactive sessions of its own (see the table above: no `/unblock`,
-no worktree).
+**Lane.** This is a long-running loop session (PRD `plans/fleet-cockpit-prd.md` §3 fork 1). The
+operator runs it as a **T3 Code thread** (hosted; no `CLAUDE_SPAWN_BACKEND` needed). Launched from a
+plain terminal, run it in the crash-survivable, reattachable tmux lane: wrap the invocation above via
+`skills/spawn/spawn-claude.sh` with `CLAUDE_SPAWN_BACKEND=tmux` (see that script's header) so the
+session gets a `display.kind=tmux` session-registry record and a `tmux attach`-reattachable window
+that persists across a crash. This watcher never spawns interactive sessions of its own (see the
+table above: no `/unblock`, no worktree).
 
 `recon-watch/mcp.json` (created by the setup; both servers required):
 
@@ -98,7 +98,8 @@ a supervised, always-on rotation rather than a single-owner actor. The lease nam
 2289 specified and that `build_lease_name('recon-watcher', '<project>')` already produces.
 
 **Do not assemble the slug (or the pid) in shell — the CLI owns both.** `--slug` is optional and
-defaults to `<--name>-$CLAUDE_PID`; `--pid` is optional and resolves the same way. Pass either only
+defaults to `<--name>-$CLAUDE_PID` (or `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID` under a
+`claude agents` host); `--pid` is optional and resolves the same way. Pass either only
 as a deliberate operator override. Both are derived rather than documented because the token is
 load-bearing on every heartbeat and on the final release, and must not depend on this document
 getting one shell token right (tasks 3994, 4248). It has to be **re-derivable**, not carried: each
@@ -111,6 +112,17 @@ call — hence the CLI re-derives it on every verb.
 the first already dead), so a slug built on it would not match your own later heartbeat. The
 long-lived `claude` process is `$CLAUDE_PID` — verify with `ps -o comm= -p "$CLAUDE_PID"`, which
 prints `claude`.
+
+**Under `claude agents`, `$CLAUDE_PID` is not yours alone.** `ps -o comm=` prints `claude` for a
+`claude agents` host too, so it cannot tell you: every session one `claude agents` process hosts
+shares that host's pid, which outlives each of them. The CLI detects a host (its argv is
+`claude agents ...`), records **pid 0** (heartbeat-only staleness, logged as DEGRADED) and derives
+the slug as `<--name>-$CLAUDE_PID-$CLAUDE_CODE_SESSION_ID`; without a usable
+`$CLAUDE_CODE_SESSION_ID` the lease verbs exit 2 (pass `--slug`). So a hosted holder reads
+`holder_liveness=orphaned` / `holder_pid=0` even while alive: its fresh heartbeat still forces
+stand-down, and once its heartbeat is past the TTL the reaper reclaims it. The per-cycle
+`lease-heartbeat` is the **only** liveness signal a hosted holder has
+(`orchestrator/src/orchestrator/session_registry.py::resolve_session_identity`).
 
 If `$CLAUDE_PID` is unresolvable **and** `--slug` is omitted, the lease verbs **exit 2** naming both,
 rather than silently drifting to a slug your own later heartbeat would fail to match; the CLI will
@@ -189,37 +201,10 @@ lease held by recon-watcher-df-1348600 (pid 1348600 is not running, but its hear
 A fresh heartbeat means you **stand down** even when the pid reads as not running: staleness needs
 BOTH a dead pid AND a heartbeat past the TTL.
 
-**A detached `recon-watch/loop.sh` tree on this queue is not a second closer (task 5876).** A
-process probe may show a `scripts/watcher-rearm.sh --queue-dir …/data/reconciliation/escalations`
-you did not start, with its `escalation.watcher` python child, under an ancestor
-`/bin/bash …/.claude/recon-watch/loop.sh`. That is a host-local helper **not tracked in this
-repo**; its own header is the only other statement of this contract. It is a detached re-arm loop,
-reparented away from any Claude session so it survives the harness background-task reaper, and it
-outlives the session that launched it — so a fresh watcher session routinely finds it already
-running. It only arms the watcher and journals fires under `~/.claude/recon-watch/` (`history.log`,
-`fired-*.json`). Its tree holds no `claude` process: it never calls `resolve_issue` and closes
-nothing. Two read-only inotify watchers on one queue are harmless redundancy — each fire is
-observed twice (once by your watcher, once journaled by the loop), and there is still exactly one
-closer.
-
-It **deliberately never heartbeats, claims or releases** the `recon-watcher-<project>` lease. A
-lease becomes reclaimable only when BOTH its holder pid is dead AND its heartbeat is past
-`orchestrator/src/orchestrator/session_registry.py::LEASE_HEARTBEAT_TTL`. A detached process that
-kept heartbeating after its owning session died would pin that lease at `holder_liveness=orphaned`
-indefinitely: every later watcher would take the orphaned stand-down above, and the 8103 queue
-would have no closer. So:
-- **A stale or reapable lease at startup while loop.sh runs is this contract working** — not a
-  fault, and nothing to report. `lease-reap`, then `lease-claim`, exactly as above.
-- **The heartbeat is yours alone.** The loop will never keep your lease alive — not even if you
-  read fires from its journal instead of re-arming your own watcher — so heartbeat every Main Loop
-  cycle regardless.
-- **Only the lease verdict says whether a second closer exists** (`lease-claim`'s `decision=` /
-  `holder_liveness=`), never the process table: a watcher tree with no `claude` process in it
-  cannot close anything.
-- **Do not stop or kill it.** You did not start it, so "Process safety" (under "Starting the
-  watcher") forbids it.
-- **Its `history.log` is corroboration only** — e.g. repeated re-fires of one id reveal a pending
-  record missing from the exclude file. The drain (`get_pending_escalations`) stays authoritative.
+**A leftover `loop.sh` never touches this lease (task 5885).** A `scripts/watcher-rearm.sh` tree
+under a `~/.claude/recon-watch/loop.sh` ancestor never claims, heartbeats or releases
+`recon-watcher-<project>`, so it changes no lease verdict; see "One watcher: the session's own"
+under "Starting the watcher".
 
 **Heartbeat + release.** Touch the lease every Main Loop cycle (see "Starting the watcher" below),
 and release it when the session ends. Both verbs act **only for the holder** — a mismatched slug is
@@ -246,47 +231,43 @@ show freshness, because the heartbeat is the file's mtime.
    orphans" below) — BEFORE every drain, so the drain never sees them
 1. Drain all pending recon escalations
 2. Start the watcher: `scripts/watcher-rearm.sh` (background task, recon queue
-   dir, NO --level, --timeout 3600)
-3. Wait for it to exit. THREE exit paths — tell them apart, don't assume a fire:
-     FIRED   (exit 0, escalation JSON on stdout) → go to 4
-     CEILING (exit 124, NO escalation payload)   → the bounded slice just
-             expired; SKIP step 4 and fall through to the drain (5)
-     KILLED / ERROR (any OTHER rc: 137|143|144, or 2 for a usage/env
-             failure) → STOP and report to the human; do NOT re-arm
+   dir, NO --level, --timeout 3600, with the Bash tool's `timeout` parameter set to 3660000)
+3. Wait for it to exit, then branch per "Distinguishing the exits at step 3"
+   below: FIRED → 4; CEILING → 5, skipping 4; KILLED / ERROR → that table's
+   row and its identical-retry cap
 4. Read the escalation from watcher output; fetch full detail via MCP
 5. Reap orphans again (step 0), then drain any other pending escalations
 6. Handle each
 7. Run `reap-decisions` to close any parked DecisionRecord whose escalation has since resolved
    (see "Filing Parked Decisions to the Cockpit Registry" below) — once per cycle
-8. Go to 2
+8. GET `/api/v2/dashboard/invariants` and digest every root's record (see "Reading the
+   invariants gauge" below) — once per cycle. Each `FINDING` line it prints (a chain gone
+   `overdue` or `broken` among them), and each `paused` line reading `pinned_by=[]`, is a
+   finding: triage it with The Action Set's judgement before re-arming (9)
+9. Go to 2
 ```
 
-**Distinguishing the exits at step 3.** The wrapper emits a machine-readable
-`WATCHER_REARM_OUTCOME: <FIRED|CEILING|KILLED|ERROR> exit=<rc>` line to
-**stderr** on every run — use it rather than inventing your own vocabulary. A
-`CEILING` wake carries no escalation payload; reading it as a fired-but-empty
-escalation is the mistake this step exists to prevent. It is not an error and
-needs no report — just re-drain and re-arm.
+**Distinguishing the exits at step 3.** The wrapper prints a machine-readable
+`WATCHER_REARM_OUTCOME: <OUTCOME> exit=<rc>` line to **stderr** on every watcher
+run — branch on it rather than inventing your own vocabulary, and check the exit
+**code** first (exit 2 prints no marker). A `CEILING` wake carries no escalation
+payload; reading it as a fired-but-empty escalation is the mistake this table
+exists to prevent.
 
-`KILLED` (137/143/144) and `ERROR` (any other rc) are **not** re-arm paths.
-Report to the human and stop the loop: something killed the watcher or the
-launch itself failed, and neither self-heals by trying again. The one you are
-most likely to hit is **exit 2** — a usage/env guard, most often an unset
-`DARK_FACTORY_ROOT` (thrice-observed startup failure,
-`plans/confusion-census-2026-07-24.md` §1.5). It returns *instantly*, before
-the watcher is ever invoked, so falling through to "re-drain and re-arm" turns
-a mis-configured launch into a hot busy-loop of failed invocations — and this
-queue's **sole closer** would never actually be watching. Note that exit 2
-prints a plain stderr diagnostic and **no** `WATCHER_REARM_OUTCOME` marker
-(`scripts/watcher-rearm.sh` header, lines 59-63), so check the exit **code**
-first; do not infer "no marker" means the run is still in flight.
+| Marker | Exit | Next |
+|---|---|---|
+| `WATCHER_REARM_OUTCOME: FIRED` | 0 | Go to step 4 and drain. Exit 0 with EMPTY stdout is a caught SIGTERM (`escalation.watcher` converts it to a clean `sys.exit(0)`; `scripts/watcher-rearm.sh` header), a non-fire that counts against the cap: this queue's **sole closer** must not silently skip a cycle on it. |
+| `WATCHER_REARM_OUTCOME: CEILING` | 124 | The bounded slice expired. Not an error, no report: skip step 4, re-drain and re-arm. The cap exempts it. |
+| `WATCHER_REARM_OUTCOME: KILLED` | 137 / 143 / 144 | Something reaped the background task (codebook `watcher-loop-harness-mismatch`). If the CLI's task notification says it stopped the command at its background time limit, the Bash `timeout` was missing or shorter than the slice: re-arm with the step-2 value, a material change (the sibling skill's "Diagnostic — an arm stopped from outside"). Re-touch the `recon-watcher-<project>` lease, then re-arm per the cap. Counts against the cap. |
+| `WATCHER_REARM_OUTCOME: ERROR` | any other; exit 2 prints NO marker | Read the stderr diagnostic before any retry. Exit 2 is a usage/env guard (most often an unset `DARK_FACTORY_ROOT`, `plans/confusion-census-2026-07-24.md` §1.5): it returns *instantly*, before the watcher runs (`scripts/watcher-rearm.sh` header), and recurs until the invocation is fixed, so fix it instead of spending the retry on it. Every other rc counts against the cap. |
 
-Also: **exit 0 with EMPTY stdout is a non-fire**, never proof an escalation was
-printed. `escalation.watcher` installs a SIGTERM handler that converts a
-SIGTERM into a clean `sys.exit(0)`, so a killed watcher surfaces as
-`FIRED exit=0` with nothing on stdout (`scripts/watcher-rearm.sh` header,
-lines 65-72). Check for non-empty stdout before treating exit 0 as a fire —
-this queue's **sole closer** must not silently skip a cycle on a caught signal.
+**Identical-retry cap: 1.** After KILLED, ERROR, a missing marker or an
+empty-stdout FIRED, re-issue the identical invocation (same script, flags,
+background launch and Bash `timeout`) at most once. If it fails again, change the invocation
+materially or stop the loop and report the outcome to the human; never loop on
+the identical call. Falling through to "re-drain and re-arm" on a failing
+launch turns a mis-configured launch into a hot busy-loop of failed invocations
+while this queue's sole closer is not actually watching.
 
 ### Reaping orphans (standing authorization — Leo, esc-5793-2, 2026-09-23)
 
@@ -344,9 +325,8 @@ cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
 
 **Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess, also touch the
 `recon-watcher-<project>` lease claimed at session startup, so a second session's `lease-claim`
-observes this one as alive and stands down. No other process heartbeats this lease — not even a
-running `recon-watch/loop.sh` (see "Claiming the Recon Watcher Lease" above) — so this call is its
-only keep-alive:
+observes this one as alive and stands down. No other process heartbeats this lease, so this call is
+its only keep-alive:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
@@ -420,14 +400,11 @@ is the only acceptable failure direction for this queue's sole closer (contrast
 `--baseline` below, which fails silent). Blank lines and `#` comments are
 skipped (`watcher.py:143-146`), so the file can be annotated.
 
-**Slice length (recon delta on the shared timeout rules).** In the background
-the wrapper is exempt from the Bash tool's foreground timeouts, so this skill
-uses the long canonical slice `--timeout 3600`: at most one heartbeat wake per
-hour (`CEILING`) while a real escalation still fires instantly via inotify. Only
-**foreground** calls (e.g. debugging) are governed by the harness timeouts —
-there, size the Bash `timeout` to at least `(--timeout + 60s) × 1000` ms, or cap
-the slice at `--timeout 540` on a machine without a raised `BASH_MAX_TIMEOUT_MS`;
-the sibling skill's §"Starting the watcher" has the full rules.
+**Slice length.** Use the long canonical slice `--timeout 3600`: at most one
+heartbeat wake per hour (`CEILING`) while a real escalation still fires at once
+via inotify. Pass the Bash `timeout` on the background call too (`3660000` for
+`--timeout 3600`); the rule and its reason are in the sibling skill's §"Starting
+the watcher" (Bash-tool timeout contract).
 
 **`--baseline` is NOT safe for this loop — do not reach for it here**,
 even though `escalation.watcher` accepts it as a flag. `_snapshot_pending_ids()`
@@ -469,7 +446,7 @@ count) — so hand-listing one `--exclude-id` per record does not scale; use
 `--exclude-file` for it, not `--baseline`. The sibling
 `skills/escalation-watcher/SKILL.md` documents `--baseline` as an available
 flag too, but that is not a counterexample: its Main Loop restarts the
-watcher *first* and drains only after confirming it's up, and its step 7 is
+watcher *first* and drains only after confirming it's up, and its last step is
 `Go to 1`, so **every** restart there is immediately followed by a fresh,
 authoritative drain — that skill says as much at its lines 93-94, that the
 fired escalation "is just the wake ... the drain re-finds it (still
@@ -483,9 +460,43 @@ default path `<queue-dir>/.watcher-rearm-exclude-l2` there,
 `<queue-dir>/.watcher-rearm-exclude` here). `--exclude-file` — not
 `--baseline` — is what is actually consistent across both watcher skills.
 
+**One watcher: the session's own (task 5885).** This skill runs exactly one watcher: the Main
+Loop's step-2 background task. The queue directory is the durable record and the drain is
+authoritative; the watcher is only a wake signal, so a detached re-arm loop whose fire journal no
+session reads adds nothing. The hand-written, never-tracked `~/.claude/recon-watch/loop.sh` was
+retired for that reason — do not recreate one. A watcher the harness reaps needs no second watcher
+to cover it, because step 3 sees the reap: as `KILLED`, or, when only the python child caught a
+SIGTERM, as the exit-0-with-empty-stdout non-fire (both under
+"Distinguishing the exits at step 3"). If a process probe still shows a `scripts/watcher-rearm.sh`
+on this queue under a `loop.sh` ancestor, it is that leftover. Its tree holds no `claude` process and closes nothing. Mention it to
+the human once and leave it running, per the rule below.
+
 **Process safety:** only stop watcher processes you started via background task
-controls. Never `pkill` by pattern. A `recon-watch/loop.sh` tree is not one you
-started, so this rule covers it too.
+controls. Never `pkill` by pattern.
+
+### Reading the invariants gauge
+
+The command, what counts as a finding (the chain rule included), change-only
+triage, the census follow-up, the broken-chain journal probe, the D-4 pointer and
+the filing store and keys live in
+[`skills/_shared/reading-the-invariants-gauge.md`](../_shared/reading-the-invariants-gauge.md).
+Read them there. This skill's deltas:
+
+- **Scope.** Omit the root argument, so every root in the roster is read:
+  fused-memory, like this queue, is fleet-wide. An escalation-watcher reads only
+  its own project.
+- **Handling.** At step 8, before re-arming: this loop already drains and handles
+  with the watcher down (steps 5 and 6). Apply The Action Set's judgement, but
+  there is NO escalation record, so never call `resolve_issue`. Note a
+  verify-fixed or accept-as-known finding in the accepted-as-known list kept in
+  top-level context ("Context Conservation"). file-a-real-task uses the shared
+  file's Case B keys in place of an escalation id. Tell the human about a finding
+  that needs one, and file no cockpit DecisionRecord: `reap-decisions` closes a
+  decision only once its escalation is terminal, so one with no escalation behind
+  it would stay open forever ("Closing parked decisions on resolve"). A `paused`
+  chain's pinning escalation is an orchestrator-queue L2 that the
+  escalation-watcher handles, not this queue's.
+- **A failed read** is reported to the human (Priority Hierarchy 1).
 
 ## The Action Set
 
@@ -533,11 +544,13 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
        # dead. This is a SUCCESS, not a failure: do NOT retry (a retry just
        # re-hits the same guard) and do NOT record a task id.
        resolve_issue(..., action='close_only', resolution="Ticket <res['reason']>")   # res["reason"] already reads "refused (no task created): ..."
+   elif res["status"] in ("pending", "awaiting_curation"):  # open — resolve the SAME ticket again, never re-submit (_shared/ticket-failure-handling.md)
+       # No task_id yet, NOT a failure. Still open after the re-resolve:
+       resolve_issue(..., action='resume', resolution="Queued for curation (ticket <sub['ticket']>)")
    elif res["status"] == "failed":
-       # Retryable (`server_restart`, `timeout`): apply
-       # _shared/ticket-failure-handling.md's retry policy (retry
-       # `resolve_ticket` first under `timeout`; re-submit the pair once
-       # under `server_restart`) within its 2-submit/2-resolve cap, then
+       # Retryable (`server_restart`): apply
+       # _shared/ticket-failure-handling.md's retry policy (re-submit the
+       # pair once) within its 2-submit/2-resolve cap, then
        # re-enter this dispatch on the retry's outcome. Once the reason is
        # terminal — or that budget is exhausted — do NOT call resolve_issue:
        # leave the escalation pending. Record res["reason"], tell the human,
@@ -547,9 +560,9 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
        # See _shared/ticket-failure-handling.md for the full retryable/
        # terminal reason matrix and R4 idempotency guidance.
    else:
-       # Unrecognized status (e.g. `cancelled`, written by cancel_ticket —
-       # the ticket status column has no CHECK constraint, and tools.py's
-       # docstring documents only the four statuses above). Same
+       # `cancelled` (withdrawn by cancel_ticket: terminal, no task_id) or a
+       # status outside _shared/ticket-failure-handling.md's vocabulary (the
+       # ticket status column has no CHECK constraint). Same
        # follow-through as the `failed` arm above (tell the human, file a
        # DecisionRecord, append this esc-id to the exclude file; do NOT call
        # resolve_issue) — plus record the raw `res`, since the status itself
@@ -607,6 +620,42 @@ check ran in. Single normative statement of the rule:
 - **`dependency_discovered`** — if a real prerequisite task exists, note it; else
   file-a-real-task. Then resolve.
 - **`cleanup_needed`** — file-a-real-task (two-phase), then resolve.
+- **`eval_regression`** (blocking) — filed at level 1 by the scheduled
+  memory-eval runner (`fused-memory/scripts/memory_eval_runner.py`, timer
+  `fused-memory-memory-eval.timer`, daily 03:15; OPERATIONS.md §"Scheduled
+  memory evals (03:15)"). The program never resolves its own escalations: you
+  are the sole closer. While a record is pending, the runner suppresses
+  re-filing its `dedupe_fingerprint`. Three shapes, told apart by summary:
+  - *Regression* — task id `memory-eval-<eval_id>`, summary `memory-eval
+    <eval_id>: <metric>[<item>] regressed at <stamp> ...`. **verify-fixed**
+    against `fused-memory/data/memory-evals/verdicts-current.json`: when its
+    `run_stamp` is later than the record's, and the entry whose `fingerprint`
+    equals this record's `dedupe_fingerprint` is no longer `alarm`,
+    `resolve_issue(..., action='resume', resolution="Verified fixed: <eval_id>
+    <metric> verdict=<v> at <run_stamp>")`. If it still alarms, or no newer run
+    carries the entry, file-a-real-task (for retrieval findings, link the
+    3111/3112/3200 fix lineage), `stamp_triage` the record with the filed task
+    id, and **leave it pending**. Never dismiss a still-alarming fingerprint:
+    the ratchet never grandfathers a regression, so the next run re-files it as
+    soon as the record closes.
+  - *Storm aggregate* — task id `memory-eval-program`, summary `memory-eval
+    storm at <stamp>: <n> alarms exceed K=<k>`. More alarms than K in one run
+    usually share one cause. **Infrastructure first**: check fused-memory,
+    Qdrant and FalkorDB health and read the run report the record names
+    before triaging any single metric. Tell the human, file a DecisionRecord
+    via `write-decision`, and leave it pending. Unlike the other two shapes,
+    its fingerprint is scoped to its run, so a storm that persists files one
+    new aggregate per run. Fold them: keep the oldest pending aggregate as the
+    one you triage, and dismiss each later one that has the same cause with
+    `resolve_issue(..., action='close_only', resolution="Same storm as
+    <oldest esc-id>")`. Dismissing one suppresses nothing, because no later run
+    reuses its fingerprint.
+  - *Runner failure* — task id `memory-eval-program`, summary `memory-eval
+    runner: <n> failure(s) at <stamp> (...)`. Handle it as `infra_issue`: tell
+    the human and leave it pending until a clean run. Its fingerprint carries
+    no stamp, so while it is pending a later failure files nothing: read the
+    journal (`journalctl --user -u fused-memory-memory-eval.service`) and the
+    run reports for those.
 - **`reconciliation_stale_gate_backlog`** (blocking) — a task has sat
   `blocked` on a human-gated milestone gate for 48h+ (Stage 1's aging
   detector, `fused-memory/src/fused_memory/reconciliation/stage1_stall_detector.py`).
@@ -716,7 +765,7 @@ check ran in. Single normative statement of the rule:
   re-derive it live. **Run from the project root** — `--queue-dir` defaults to
   the relative `./data/reconciliation/escalations`, so the cwd is what decides
   which queue is read; from anywhere else the script refuses with
-  `TargetStoreMissing` rather than manufacturing an empty queue and reporting a
+  `TargetStoreUnpopulated` rather than manufacturing an empty queue and reporting a
   false clean run (see
   `fused-memory/src/fused_memory/utils/target_store_preflight.py`). Pass an
   absolute `--queue-dir` if you cannot control the cwd.
@@ -966,7 +1015,7 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   `dark_factory`/`df`/`dark-factory`, each invisible to a reap scoped to either of the others).
   - **Caveat — check your project's existing rows before trusting the declared token.** Folding
     merges spellings that differ only by case or separator; only an entry in
-    `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
+    `shared.project_id.PROJECT_ID_ALIASES` can bridge a project whose filed decisions fold to something *other*
     than its declared `memory.project_id`, and today `df → dark_factory` is the only such entry.
     **solar-challenge is the known standing case**: its config declares `my_solar_challenge`, but
     its decisions are filed under `solar-challenge`/`solar_challenge` (which fold together, but
@@ -990,7 +1039,11 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   its lease-token shape is not a session-registry key. The cockpit's Enter-to-focus follows
   `record_slug`, your session record's key, which `write-decision` stamps itself from `$CLAUDE_PID`;
   there is no shell token to add. If it cannot be resolved the decision is still filed, just
-  unlinked.
+  unlinked, and the verb says so with a line on stderr that starts `write-decision --id <your id>`,
+  names `$CLAUDE_PID` and says `BLANK record_slug` (it carries no `WARNING` prefix). That line alone
+  is not a failed filing: an id on stdout still means the filing landed, and the row is only
+  unfocusable in the cockpit. Re-filing from the same session resolves the same way, so it does not
+  repair the link and is not called for.
 - **`--severity`**: pass through the parked escalation's own severity (`esc.severity` —
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
@@ -1010,7 +1063,7 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   pipeline stall): task 4835 decided against exempting them, because the same-queue custody hold
   keys on stamp equality, so an unstamped sentinel later re-filed with a stamp would re-open a row
   an operator had dropped.
-  There is a third value the field can hold: `<unknown>` (`session_registry.UNKNOWN_QUEUE`) —
+  There is a third value the field can hold: `<unknown>` (`decision_registry.UNKNOWN_QUEUE`) —
   "this record's owning queue was investigated and could not be determined". You never write it —
   and that is now enforced, not just asked: `write-decision` **rejects**
   `--escalations-dir <unknown>` outright, because a record stamped that way is refused by *every*
@@ -1171,8 +1224,13 @@ known so you don't re-investigate them each cycle.
 - **"Too many open files"** after many watcher restart cycles → fd pool
   exhaustion from accumulated background tasks; tell the user to start a fresh
   session.
-- **`get_pending_escalations` errors / empty when you expect items** → confirm
-  this session's `escalation` server points at **8103**, not 8102. The stock
-  repo `.mcp.json` is 8102.
+- **`get_pending_escalations` empty when you expect items** → read the
+  `THIS ENDPOINT SERVES:` block ending that tool's own description in your
+  tool listing (rendered by
+  `escalation/src/escalation/server.py::_render_store_identity_block`).
+  `kind=reconciliation` → this queue answered; nothing is pending.
+  `kind=project` (e.g. `project=dark_factory`) → wrong store, an orchestrator
+  queue: relaunch per "Launching" above. No block → the server cannot vouch
+  for its store; tell the human rather than read `[]` as absence.
 - **8103 server unreachable** → fused-memory.service is down. Priority 1: tell
   the human; do not start services yourself.
