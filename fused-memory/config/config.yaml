@@ -168,7 +168,6 @@ queue:
 # ─────────────────────────────────────────────────────────────────────────────
 taskmaster:
   project_root: "${PROJECT_ROOT:.}"
-  tool_mode: "all"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # write_journal — RED-TIER / restart-only. Every journal table with a horizon is

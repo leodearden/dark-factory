@@ -16,6 +16,7 @@ from pydantic_settings import (
 from shared.config_models import UsageCapConfig
 
 from fused_memory.config.checkout_anchor import anchor_at_checkout
+from fused_memory.config.retired_keys import drop_retired_keys
 
 # The ONE topic-slug namespace (task 3198, PRD D4). Imported from the
 # stdlib-only leaf, NOT from fused_memory.memory_metadata: that module
@@ -226,10 +227,21 @@ class ServerConfig(BaseModel):
 
 # --- LLM ---
 
+_RETIRED_OPENAI_PROVIDER_KEYS: frozenset[str] = frozenset({'organization_id'})
+
+
 class OpenAIProviderConfig(BaseModel):
     api_key: str | None = None
     api_url: str = 'https://api.openai.com/v1'
-    organization_id: str | None = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_retired_keys(cls, data: object) -> object:
+        return drop_retired_keys(
+            data,
+            section='llm.providers.openai or embedder.providers.openai',
+            retired=_RETIRED_OPENAI_PROVIDER_KEYS,
+        )
 
 
 class AnthropicProviderConfig(BaseModel):
@@ -571,22 +583,25 @@ class WriteJournalGrowthAlarmConfig(BaseModel):
 
 # --- Taskmaster ---
 
-class TaskmasterConfig(BaseModel):
-    """Configuration for the SQLite-backed task store.
+_RETIRED_TASKMASTER_KEYS: frozenset[str] = frozenset({
+    'transport', 'command', 'args', 'cwd', 'http_url', 'tool_mode',
+})
 
-    The class name is preserved for back-compat with consumers that still
-    import :class:`TaskmasterConfig`. Only ``project_root`` and
-    ``tool_mode`` are read by :class:`SqliteTaskBackend`; the other fields
-    are kept dormant so existing config files don't fail to load.
+
+class TaskmasterConfig(BaseModel):
+    """The server's primary project root, this section's only field.
+
+    ``fused_memory/models/scope.py::configured_primary_root`` normalises it. The
+    class and ``taskmaster:`` section names predate the SQLite cutover. Keys
+    retired with the Taskmaster subprocess are dropped at load with a warning.
     """
 
-    transport: str = Field(default='stdio', description='Unused after SQLite cutover')
-    command: str = Field(default='node', description='Unused after SQLite cutover')
-    args: list[str] = Field(default_factory=list, description='Unused after SQLite cutover')
-    cwd: str = Field(default='')
-    http_url: str = Field(default='')
     project_root: str = Field(default='.')
-    tool_mode: str = Field(default='all')
+
+    @model_validator(mode='before')
+    @classmethod
+    def _drop_retired_keys(cls, data: object) -> object:
+        return drop_retired_keys(data, section='taskmaster', retired=_RETIRED_TASKMASTER_KEYS)
 
 
 # --- Task metadata write-boundary validation (task 2162, W3-β) ---
