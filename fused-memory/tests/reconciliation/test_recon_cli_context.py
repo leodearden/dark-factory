@@ -19,12 +19,15 @@ auto-compaction off, and keeps its transcript. Each switch has one job:
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from shared.cli_invoke import AgentResult
+from shared.testing import make_gate_mock
 
 from fused_memory.config.schema import ReconciliationConfig
+from fused_memory.models.reconciliation import ReconciliationRun, RunStatus, RunType
 from fused_memory.reconciliation import (
     RECONCILIATION_CLI_ENV_OVERRIDES,
     RECONCILIATION_CLI_SETTING_SOURCES,
@@ -35,6 +38,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
 )
+from fused_memory.reconciliation.judge import Judge
 from reconciliation.stubbed_stage_cli import run_stage, run_stage_answered_by
 
 _STAGE_REPORT = AgentResult(success=True, output='{"summary": "s"}')
@@ -98,3 +102,50 @@ def test_stages_are_denied_the_builtins_they_never_call():
     for stage_disallowed in (STAGE1_DISALLOWED, STAGE2_DISALLOWED, STAGE3_DISALLOWED):
         assert set(_BUILTINS_NO_STAGE_CALLS) <= set(stage_disallowed)
     assert not set(_BUILTINS_STAGES_NEED) & set(DISALLOW_BUILTIN)
+
+
+def _journal_with_one_completed_run(run_id: str) -> MagicMock:
+    journal = MagicMock()
+    journal.get_run = AsyncMock(return_value=ReconciliationRun(
+        id=run_id,
+        project_id='p',
+        run_type=RunType.full,
+        trigger_reason='t',
+        started_at=datetime.now(UTC),
+        status=RunStatus.completed,
+    ))
+    journal.get_run_actions_combined = AsyncMock(return_value=[])
+    journal.get_recent_verdicts = AsyncMock(return_value=[])
+    journal.add_verdict = AsyncMock(return_value=None)
+    journal.record_judge_invocation = AsyncMock(return_value=None)
+    return journal
+
+
+@pytest.mark.asyncio
+async def test_judge_loads_no_settings_claude_md_or_memory_index(tmp_path, monkeypatch):
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(tmp_path / 'claude-config'))
+    config = ReconciliationConfig(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+        explore_codebase_root=str(tmp_path),
+    )
+    judge = Judge(
+        config=config,
+        journal=_journal_with_one_completed_run('run-ctx'),
+        usage_gate=make_gate_mock(),
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry', new_callable=AsyncMock,
+    ) as invoke:
+        invoke.return_value = AgentResult(
+            success=True, output='', structured_output={'severity': 'ok', 'findings': []},
+        )
+        await judge.review_run('run-ctx')
+
+    invoke.assert_awaited_once()
+    kwargs = invoke.call_args.kwargs
+    assert kwargs['setting_sources'] == []
+    assert kwargs['env_overrides'] == dict(RECONCILIATION_CLI_ENV_OVERRIDES)
+    assert kwargs['cwd'] == tmp_path
+    assert kwargs['strict_mcp_config'] is True
