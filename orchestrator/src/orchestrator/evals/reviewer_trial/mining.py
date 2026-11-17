@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.cli_invoke import no_mcp_servers_config
 from shared.merge_subject import MergeSubject, parse_merge_subject
 
 from orchestrator.agents.invoke import invoke_agent
@@ -480,10 +481,10 @@ async def propose_labels_frontier(
 ) -> Scored[list[GroundTruthIssue]] | Unmeasured:
     """Propose ground-truth issue labels for a mined diff via a frontier model.
 
-    Runs through ``measured_call`` like ``scorer.match_issues`` (no tools,
-    structured JSON output, spend always reported) but the frontier model
-    proposes NEW issues found in *diff_text* rather than matching against
-    existing ground truth.
+    Runs through ``measured_call`` like ``scorer.match_issues`` (built-in
+    tools denied, MCP scoped to no servers, structured JSON output, spend
+    always reported) but the frontier model proposes NEW issues found in
+    *diff_text* rather than matching against existing ground truth.
 
     Each proposed issue is mapped into a ``GroundTruthIssue``. Its ``id`` is
     always synthesized as ``"frontier_<n>"`` — never taken from the model's
@@ -509,8 +510,9 @@ async def propose_labels_frontier(
     *max_turns* defaults to 3 (matching ``match_issues``' turn budget), but
     empirically ``effort='high'`` needs materially more turns than a plain
     low-effort matcher call to reach a schema-conformant final answer — the
-    ``mine`` CLI passes a larger value (~15) to avoid a silent
-    ``error_max_turns`` (empty output, cost still billed).
+    ``mine`` CLI passes a larger value (~15) because a call that ends in
+    ``error_max_turns`` has empty output, is still billed, and so comes
+    back ``Unmeasured``.
     """
     diff_context = diff_text[:10_000] if len(diff_text) > 10_000 else diff_text
 
@@ -565,7 +567,12 @@ If there are no issues, return an empty issues list. Output your findings as JSO
         max_budget_usd=2.0,
         output_schema=_FRONTIER_LABEL_SCHEMA,
         effort='high',
-        allowed_tools=[],  # no tools needed — all context is in the prompt
+        # All context is in the prompt: deny the built-ins and scope MCP to an
+        # empty server set so the .mcp.json at cwd is never ambient-merged
+        # (allowed_tools=[] does not restrict under bypassPermissions).
+        disallowed_tools=['*'],
+        mcp_config=no_mcp_servers_config(),
+        strict_mcp_config=True,
         oauth_token=oauth_token,
     )
 
@@ -707,6 +714,11 @@ def admit_mined_diff(
     )
 
 
+@dataclass(frozen=True)
+class NoIssuesProposed:
+    """The proposer measured and proposed no issues, so ``admit_proposal`` admitted nothing."""
+
+
 def admit_proposal(
     manifest: CorpusManifest,
     log: AdjudicationLog,
@@ -717,13 +729,16 @@ def admit_proposal(
     escalation_refs: Sequence[EscalationRef],
     runs_db: Path,
     frontier_model: str,
-) -> CorpusDiff | None:
-    """Admit *recovered* labelled with *proposal*'s issues and return it.
+) -> CorpusDiff | Unmeasured | NoIssuesProposed:
+    """Admit *recovered* labelled with *proposal*'s issues and return the admitted diff.
 
-    Return None and admit nothing when the proposer did not measure or proposed no issues.
+    Admit nothing and return why when the proposer did not measure (its
+    ``Unmeasured``) or proposed no issues (``NoIssuesProposed``).
     """
-    if isinstance(proposal, Unmeasured) or not proposal.value:
-        return None
+    if isinstance(proposal, Unmeasured):
+        return proposal
+    if not proposal.value:
+        return NoIssuesProposed()
     diff = mined_corpus_diff(
         recovered, issues=proposal.value, description=description,
         escalation_refs=escalation_refs, runs_db=runs_db,

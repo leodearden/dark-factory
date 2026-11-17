@@ -23,7 +23,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, assert_never
 
 import click
 from shared import project_layout
@@ -589,7 +589,9 @@ def mine(
         )
 
         from .adjudication import AdjudicationLog
+        from .corpus import CorpusDiff
         from .mining import (
+            NoIssuesProposed,
             RecoveredCandidate,
             admit_proposal,
             audit_corpus,
@@ -680,25 +682,30 @@ def mine(
             tally.completed += 1
             tally.cost += cost
             progress = f'  [{tally.completed}/{tally.attempted}] {candidate.diff_id}:'
-            diff = admit_proposal(
+            outcome = admit_proposal(
                 manifest, log, item, proposal, description=description,
                 escalation_refs=esc_refs.get(candidate.task_id, []), runs_db=runs_db, frontier_model=model,
             )
-            if diff is not None:
-                save_corpus(manifest, log, seed=seed, manifest_path=_CORPUS_PATH, log_path=_ADJUDICATION_LOG_PATH)
-                tally.added += 1
-                click.echo(
-                    f'{progress} {len(diff.ground_truth)} issues added '
-                    f'(cost=${cost:.3f}, corpus now {len(manifest.diffs)})'
-                )
-            elif isinstance(proposal, Unmeasured):
-                tally.unmeasured += 1
-                click.echo(
-                    f'{progress} proposer did not measure ({proposal.cause}: {proposal.reason}) '
-                    f'-- skipping; the next run retries it (cost=${cost:.3f})'
-                )
-            else:
-                click.echo(f'{progress} no issues proposed -- skipping (cost=${cost:.3f})')
+            match outcome:
+                case CorpusDiff():
+                    save_corpus(
+                        manifest, log, seed=seed, manifest_path=_CORPUS_PATH, log_path=_ADJUDICATION_LOG_PATH,
+                    )
+                    tally.added += 1
+                    click.echo(
+                        f'{progress} {len(outcome.ground_truth)} issues added '
+                        f'(cost=${cost:.3f}, corpus now {len(manifest.diffs)})'
+                    )
+                case Unmeasured():
+                    tally.unmeasured += 1
+                    click.echo(
+                        f'{progress} proposer did not measure ({outcome.cause}: {outcome.reason}) '
+                        f'-- skipping; the next run retries it (cost=${cost:.3f})'
+                    )
+                case NoIssuesProposed():
+                    click.echo(f'{progress} no issues proposed -- skipping (cost=${cost:.3f})')
+                case _:
+                    assert_never(outcome)
 
         await asyncio.gather(*(_label(item) for item in pool))
 

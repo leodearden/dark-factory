@@ -32,6 +32,7 @@ from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest,
 from orchestrator.evals.reviewer_trial.mining import (
     EscalationRef,
     FnCandidate,
+    NoIssuesProposed,
     RecoveredCandidate,
     admit_mined_diff,
     admit_proposal,
@@ -416,6 +417,15 @@ class TestProposeLabelsFrontier:
             'CLAUDE_SPAWN_ROLE': 'eval_label_proposer', 'CLAUDE_SPAWN_PROJECT': 'dark_factory',
         }
         assert kwargs['oauth_token'] == 'tok-x'
+
+    @pytest.mark.asyncio
+    async def test_the_proposer_denies_tools_and_strict_scopes_mcp(self) -> None:
+        _, mock_invoke = await _propose(answered({'issues': []}))
+
+        kwargs = mock_invoke.call_args.kwargs
+        assert kwargs['disallowed_tools'] == ['*']
+        assert kwargs['strict_mcp_config'] is True
+        assert kwargs['mcp_config'] == {'mcpServers': {}}
 
 
 class TestAuditCorpus:
@@ -880,12 +890,13 @@ class TestAdmitMinedDiff:
 
 
 class TestAdmitProposal:
-    """admit_proposal admits a diff only when the proposer measured and proposed at least one issue."""
+    """admit_proposal admits a diff only when the proposer measured and proposed at least one issue,
+    and otherwise says why it admitted nothing."""
 
     @staticmethod
     def _admit(
         proposal: Scored[list[GroundTruthIssue]] | Unmeasured, tmp_path: Path,
-    ) -> tuple[CorpusDiff | None, CorpusManifest, AdjudicationLog]:
+    ) -> tuple[CorpusDiff | Unmeasured | NoIssuesProposed, CorpusManifest, AdjudicationLog]:
         manifest, log = CorpusManifest(diffs=[]), AdjudicationLog()
         recovered = RecoveredCandidate(_candidate('42', None), 'abc123', 'diff --git a/x.py b/x.py\n+x\n')
         admitted = admit_proposal(
@@ -894,18 +905,20 @@ class TestAdmitProposal:
         )
         return admitted, manifest, log
 
-    def test_an_unmeasured_proposal_admits_nothing(self, tmp_path: Path) -> None:
+    def test_an_unmeasured_proposal_admits_nothing_and_returns_the_unmeasured(self, tmp_path: Path) -> None:
         refused = Unmeasured(MeasurementStage.LABEL_PROPOSER, UnmeasuredCause.CAP_HIT, 'r', cost_usd=0.3)
 
-        admitted, manifest, log = self._admit(refused, tmp_path)
+        outcome, manifest, log = self._admit(refused, tmp_path)
 
-        assert admitted is None
+        assert outcome == refused
         assert (manifest.diffs, log.entries) == ([], [])
 
-    def test_a_measured_empty_proposal_admits_nothing(self, tmp_path: Path) -> None:
-        admitted, manifest, log = self._admit(Scored([], cost_usd=0.1), tmp_path)
+    def test_a_measured_empty_proposal_admits_nothing_and_says_no_issues_were_proposed(
+        self, tmp_path: Path,
+    ) -> None:
+        outcome, manifest, log = self._admit(Scored([], cost_usd=0.1), tmp_path)
 
-        assert admitted is None
+        assert outcome == NoIssuesProposed()
         assert (manifest.diffs, log.entries) == ([], [])
 
     def test_a_proposal_with_issues_is_admitted_and_logged(self, tmp_path: Path) -> None:
@@ -913,7 +926,7 @@ class TestAdmitProposal:
 
         admitted, manifest, log = self._admit(Scored(issues, cost_usd=0.1), tmp_path)
 
-        assert admitted is not None
+        assert isinstance(admitted, CorpusDiff)
         assert (admitted.diff_id, admitted.ground_truth) == ('mined_42', issues)
         assert manifest.diffs == [admitted]
         [entry] = log.entries
