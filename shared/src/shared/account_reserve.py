@@ -1,9 +1,10 @@
 """The reserve rule: which work may use the reserve account, and when.
 
 One account of the shared pool can be held back for urgent work until shortly before its weekly
-reset. This module is the rule of plans/allowance-reserve-by-account-prd.md §6.1-6.2 and the event
-names of §6.6, as pure functions of a config, a work class and a clock: nothing is stored here,
-and nothing here logs or does I/O.
+reset. This module is the rule of plans/allowance-reserve-by-account-prd.md §6.1-6.2, the
+reserve-refused definition of §6.3, and the event names and detail shapes of §6.6, as pure
+functions of a config, a work class and a clock: nothing is stored here, and nothing here logs or
+does I/O.
 """
 
 from __future__ import annotations
@@ -35,16 +36,24 @@ __all__ = [
     'Reserve',
     'ReserveConfig',
     'ReserveEvent',
+    'ReserveRefusal',
     'ReserveState',
+    'ReserveWaitEnd',
     'ScheduleDrift',
     'WeeklyReset',
     'WorkClass',
     'WorkClassSource',
     'WorkKind',
     'admits',
+    'config_event_details',
+    'first_choice',
     'parse_reserve',
+    'refusal',
+    'refuses_account',
     'resolve_work_class',
     'schedule_drift',
+    'wait_end_for_lease',
+    'work_class_details',
 ]
 
 
@@ -206,6 +215,76 @@ def admits(config: ReserveConfig, work_class: WorkClass, now: datetime) -> bool:
     assert_never(work_class.kind)
 
 
+def refuses_account(
+    config: ReserveConfig, account_name: str, work_class: WorkClass, now: datetime
+) -> bool:
+    """Whether selection must skip ``account_name`` for ``work_class`` at ``now``."""
+    now = _as_utc(now)
+    return account_name == config.account and not admits(config, work_class, now)
+
+
+@dataclass(frozen=True)
+class ReserveRefusal:
+    account: str
+    release_at: datetime
+
+
+def refusal(
+    config: ReserveConfig, open_accounts: Collection[str], work_class: WorkClass, now: datetime
+) -> ReserveRefusal | None:
+    """The refusal when every open account is the reserve and it is refused (PRD §6.3).
+
+    ``open_accounts`` names the accounts that are neither capped, probe-in-flight nor failing
+    authentication. With none open the caller is not reserve-refused: nothing at all is open.
+    """
+    now = _as_utc(now)
+    if not open_accounts or any(name != config.account for name in open_accounts):
+        return None
+    if not refuses_account(config, config.account, work_class, now):
+        return None
+    return ReserveRefusal(account=config.account, release_at=config.release_at(now))
+
+
+def first_choice(config: ReserveConfig, now: datetime) -> str | None:
+    """The account selection tries before the roster order: the reserve, once it is released."""
+    return config.account if config.in_release_window(now) else None
+
+
+class ReserveWaitEnd(StrEnum):
+    """How a reserve wait ended: PRD §6.6's five, and ``cancelled`` for a caller that gave up."""
+
+    ACCOUNT_OPENED = 'account_opened'
+    RELEASED = 'released'
+    ADMITTED = 'admitted'
+    RESERVE_UNUSABLE = 'reserve_unusable'
+    DEADLINE = 'deadline'
+    CANCELLED = 'cancelled'
+
+
+def wait_end_for_lease(
+    config: ReserveConfig, leased_account: str, now: datetime
+) -> ReserveWaitEnd:
+    """Why a waiting caller was served by ``leased_account``."""
+    now = _as_utc(now)
+    if leased_account != config.account:
+        return ReserveWaitEnd.ACCOUNT_OPENED
+    if config.in_release_window(now):
+        return ReserveWaitEnd.RELEASED
+    return ReserveWaitEnd.ADMITTED
+
+
+def work_class_details(work_class: WorkClass, *, unclassified: bool) -> dict[str, object]:
+    """A work class as the JSON details of the reserve's wait and served events."""
+    return {
+        'kind': work_class.kind.value,
+        'role': work_class.role,
+        'project_id': work_class.project_id,
+        'tier': work_class.tier,
+        'task_id': work_class.task_id,
+        'unclassified': unclassified,
+    }
+
+
 DRIFT_TOLERANCE = timedelta(minutes=30)
 DRIFT_HORIZON = timedelta(hours=3)
 
@@ -265,6 +344,31 @@ def parse_reserve(block: object, account_names: Collection[str]) -> Reserve:
             f'reserve.account {config.account!r} names no listed account (listed: {listed})'
         )
     return ActiveReserve(config)
+
+
+def config_event_details(reserve: Reserve, now: datetime) -> dict[str, object]:
+    """The JSON details of the ``reserve_config`` event for ``reserve`` as seen at ``now``."""
+    now = _as_utc(now)
+    match reserve:
+        case ActiveReserve(config=config):
+            return {
+                'state': reserve.state.value,
+                'reason': None,
+                'account': config.account,
+                'next_reset': config.next_reset(now).isoformat(),
+                'release_at': config.release_at(now).isoformat(),
+                'admit_tiers': config.admit_tiers.model_dump(mode='json'),
+            }
+        case InvalidReserve(reason=reason):
+            return {
+                'state': reserve.state.value,
+                'reason': reason,
+                'account': None,
+                'next_reset': None,
+                'release_at': None,
+                'admit_tiers': None,
+            }
+    assert_never(reserve)
 
 
 def _validation_reason(error: ValidationError) -> str:
