@@ -84,6 +84,7 @@ from fused_memory.middleware.curation_deferral import (
     dedupe_skipped_marker,
     pool_defer_reason,
 )
+from fused_memory.middleware.curator_registry import RegistryHealth
 from fused_memory.middleware.curator_types import (
     CandidateTask,
     CuratorDecision,
@@ -2377,6 +2378,16 @@ class TaskInterceptor:
             logger.warning('Failed to create TaskCurator', exc_info=True)
             self._curator_construction_error = exception_summary(exc)
             return None
+
+    def curator_registry_health(self) -> tuple[RegistryHealth, ...]:
+        """The curator's guard registry health; ``()`` when no curator exists.
+
+        Never constructs one, so a status read has none of _get_curator's
+        side effects.
+        """
+        if self._curator is None:
+            return ()
+        return self._curator.registry_health()
 
     def _curator_unavailable(self) -> CuratorUnavailable:
         """Why ``_get_curator()`` has no curator to hand out right now.
