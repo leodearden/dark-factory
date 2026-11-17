@@ -6,10 +6,11 @@ _fm_helpers' module docstring.
 """
 
 import contextlib
+from collections.abc import Callable
 from typing import Any
 
 import pytest
-from _fm_polling import poll_until
+from _fm_polling import poll_until, poll_until_sync
 
 # ---------------------------------------------------------------------------
 # Shared Qdrant test scaffolding (task 2277)
@@ -21,6 +22,9 @@ from _fm_polling import poll_until
 # ---------------------------------------------------------------------------
 
 QDRANT_URL = 'http://localhost:6333'
+
+#: Seconds an abandoned collection meta-op may take to show its effect (task 10599).
+META_OP_SETTLE_TIMEOUT_S = 15.0
 
 
 def _qdrant_available() -> bool:
@@ -59,12 +63,59 @@ def qdrant_skipif(reason: str = 'Qdrant not reachable'):
     return pytest.mark.skipif(not _qdrant_available(), reason=reason)
 
 
+def _run_meta_op(
+    request: Callable[[], Any],
+    *,
+    reached: Callable[[], bool],
+    describe: str,
+    timeout: float,
+) -> None:
+    """Send one collection meta-op; if its answer is abandoned on a read timeout, wait for *reached*.
+
+    A read timeout means the server has the request and may still be applying
+    it, so the outcome is judged by the observed state, never by re-sending.
+    Every other failure propagates unchanged.
+    """
+    import httpx
+    from qdrant_client.http.exceptions import ResponseHandlingException
+
+    try:
+        request()
+    except ResponseHandlingException as exc:
+        if not isinstance(exc.source, httpx.ReadTimeout):
+            raise
+        poll_until_sync(
+            reached,
+            timeout=timeout,
+            interval=0.05,
+            message=(
+                f'{describe}: the client stopped waiting for the answer '
+                f'({type(exc.source).__name__}: {exc.source}), and it had not '
+                f'taken effect {timeout}s later'
+            ),
+        )
+
+
+def _create_collection(
+    client: Any, collection_name: str, vectors_config: Any, *, settle_timeout: float,
+) -> None:
+    _run_meta_op(
+        lambda: client.create_collection(
+            collection_name=collection_name, vectors_config=vectors_config,
+        ),
+        reached=lambda: client.collection_exists(collection_name),
+        describe=f'create of collection {collection_name!r}',
+        timeout=settle_timeout,
+    )
+
+
 def ensure_fresh_collection(
     client: Any,
     collection_name: str,
     *,
     size: int,
     distance: Any = None,
+    settle_timeout: float = META_OP_SETTLE_TIMEOUT_S,
 ) -> None:
     """Idempotently (re)create *collection_name* as an empty size-*size* collection.
 
@@ -76,7 +127,8 @@ def ensure_fresh_collection(
     next run. This helper self-heals that case: if the create raises a 409
     ``UnexpectedResponse`` it deletes the stale collection and creates once more.
     Any other ``UnexpectedResponse`` (e.g. a genuine 500) is re-raised — fail
-    loud, no retry.
+    loud, no retry. A create whose answer the client abandons on a read timeout
+    is judged by whether the collection appears within *settle_timeout*.
 
     Imports ``VectorParams``/``Distance``/``UnexpectedResponse`` lazily inside
     the body, mirroring ``_qdrant_available``'s convention (see its docstring):
@@ -90,6 +142,7 @@ def ensure_fresh_collection(
         size: Vector dimensionality for the new collection.
         distance: Optional ``qdrant_client.models.Distance``; defaults to
             ``Distance.COSINE`` when None.
+        settle_timeout: Seconds to wait for an abandoned meta-op's effect.
     """
     from qdrant_client.http.exceptions import UnexpectedResponse
     from qdrant_client.models import Distance, VectorParams
@@ -99,8 +152,8 @@ def ensure_fresh_collection(
     if client.collection_exists(collection_name):
         client.delete_collection(collection_name)
     try:
-        client.create_collection(
-            collection_name=collection_name, vectors_config=vectors_config,
+        _create_collection(
+            client, collection_name, vectors_config, settle_timeout=settle_timeout,
         )
     except UnexpectedResponse as exc:
         if getattr(exc, 'status_code', None) != 409:
@@ -108,8 +161,8 @@ def ensure_fresh_collection(
         # Stale collection survived a swallowed teardown / lost create race:
         # delete it and create once more rather than propagating the conflict.
         client.delete_collection(collection_name)
-        client.create_collection(
-            collection_name=collection_name, vectors_config=vectors_config,
+        _create_collection(
+            client, collection_name, vectors_config, settle_timeout=settle_timeout,
         )
 
 
