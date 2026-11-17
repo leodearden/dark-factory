@@ -162,7 +162,11 @@ About its files (the dependent's declared lock set, taken all or nothing): every
 rule of section 5.2, and no other task's reservation covers any of them.
 
 About the rest of the queue (ruling 3). No early start if some task T exists with all of:
-- strictly higher effective tier than the dependent (a pinned task counts as higher than every tier);
+- strictly higher effective tier than the dependent (a pinned task counts as higher than every tier). Leo's
+  ruling of 2026-11-17, one order at every gate: an unfinished prerequisite of a pinned task counts as pinned
+  (once task 9939 of `plans/priority-at-later-gates-prd.md` adds that inheritance); between two pinned-tier
+  tasks the lower pin order counts as higher; and a pin set by the starvation watchdog counts as pinned here.
+  Tasks 10477 and 9939 carry this as dated notes;
 - T needs one of the dependent's keys;
 - T's dependencies are all done, **or** the predecessor is T's only unfinished dependency;
 - every key T needs is free or held only by the predecessor, and no other task's reservation covers it.
