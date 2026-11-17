@@ -2653,6 +2653,8 @@ async def test_harness_run_invokes_reconcile_before_scheduler_loop(
     config.review.enabled = False
     config.sandbox.backend = 'auto'
     config.max_concurrent_tasks = 2
+    # Harness.run builds RunSlots from this; a spec'd MagicMock raises TypeError in asyncio.Semaphore.
+    config.main_health_fix_reserved_slots = 1
     config.fused_memory.project_id = 'test'
     config.sandbox.backend = 'auto'
     point_harness_stores_at(config, tmp_path)

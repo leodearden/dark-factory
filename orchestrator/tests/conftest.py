@@ -1196,6 +1196,8 @@ def mock_orch_config(tmp_path: Path) -> MagicMock:
     # _claimant_heartbeat_loop (workflow.py:2113) under load-exposed
     # teardown ordering, raising TypeError.
     config.claimant_heartbeat_interval_secs = 60.0
+    # Harness.run builds RunSlots from this; a spec'd MagicMock raises TypeError in asyncio.Semaphore.
+    config.main_health_fix_reserved_slots = 1
     # Task 3540: harness._resume_repend_liveness feeds this straight into
     # timedelta(seconds=...); a spec_set MagicMock attribute raises
     # TypeError there. THIS is the single owner of the value for the suite —

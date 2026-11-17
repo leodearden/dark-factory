@@ -1678,15 +1678,19 @@ class Harness:
         from orchestrator.agents.sandbox_dispatch import set_backend
         set_backend(config.sandbox.backend)
         self.mcp = McpLifecycle(config)
-        # Size the warm-lane pool from max_concurrent_tasks (D9: read once at startup,
-        # single source of truth). Pass 0 when the knob is off so GitOps leaves
+        # Size the warm-lane pool from every run slot, the main-health-fix reserve
+        # included (D9: read once at startup). Pass 0 when the knob is off so GitOps leaves
         # warm_lane_pool=None — non-dispatch call sites (cli.py verify-merge,
         # recover_main.py, evals/runner.py) default to size=0 and stay on cold path.
         self.git_ops = GitOps(
             config.git,
             config.project_root,
             warm_lane_pool_size=(
-                (config.max_concurrent_tasks + config.git.spare_warm_lanes)
+                (
+                    config.max_concurrent_tasks
+                    + config.main_health_fix_reserved_slots
+                    + config.git.spare_warm_lanes
+                )
                 if config.git.warm_lane_pool else 0
             ),
             # Spec-pool size: K (same as speculation_depth), one warm lane per

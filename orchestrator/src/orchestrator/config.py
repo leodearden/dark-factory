@@ -2507,7 +2507,8 @@ class GitConfig(BaseModel):
         ge=0,
         description=(
             'Extra warm task-lanes allocated ABOVE the derived pool size '
-            '(max_concurrent_tasks); effective pool N = max_concurrent_tasks + '
+            '(max_concurrent_tasks + main_health_fix_reserved_slots); effective '
+            'pool N = max_concurrent_tasks + main_health_fix_reserved_slots + '
             'spare_warm_lanes when warm_lane_pool is on (read once at startup by '
             'Harness, passed to GitOps). Gives acquire headroom so a transient '
             'lane-leak / stuck-ASSIGNED lane does not exhaust the pool and force '
@@ -2523,7 +2524,8 @@ class GitConfig(BaseModel):
             'warm-lane pool on disk at startup (GitOps.prewarm_pool), instead of '
             'letting each _lane-k be created lazily on its first acquire.  Root '
             'cause it addresses: the pool is effective_N = max_concurrent_tasks + '
-            'spare_warm_lanes FREE lanes in memory, but the on-disk git worktree '
+            'main_health_fix_reserved_slots + spare_warm_lanes FREE lanes in '
+            'memory, but the on-disk git worktree '
             'add for each lane happens only in the acquire create-once branch, '
             'lowest-numbered-first — so on a host peaking below effective_N the '
             'spare lanes are never demanded, never created, and the intended '
@@ -3824,6 +3826,10 @@ class OrchestratorConfig(BaseSettings):
 
     # Concurrency
     max_concurrent_tasks: int = Field(default=3)
+    # Run slots outside max_concurrent_tasks that only a main-health fix task may
+    # take, used when every general slot is held; 0 disables. Restart-only (not in
+    # RELOADABLE_FIELDS). Rationale: docs/main-health-fix-run-slot-reserve.md.
+    main_health_fix_reserved_slots: int = Field(default=1, ge=0)
     max_per_module: int = Field(default=1)
     lock_depth: int = Field(default=2)
     module_overrides: dict[str, int] = Field(default_factory=dict)
