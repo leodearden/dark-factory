@@ -1,5 +1,8 @@
 """Contract tests for ``_seed_script_stubs.seed_default_warm_base``: the warm base
 and ``.pool-root`` sentinel it writes are the ones GitOps itself reads.
+
+GitOps exposes no public base-health seam, so these pin the base's path and
+that it is non-empty, not the ``WarmBaseHealth.OK`` predicate itself.
 """
 from __future__ import annotations
 
