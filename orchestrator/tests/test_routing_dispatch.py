@@ -21,6 +21,7 @@ every test below fails at import.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,9 +29,10 @@ from _orch_helpers import pydantic_spec, stamp_stock_routing_config
 from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.event_store import EventType
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.routing import RoleDefaults, RoutingDecision
 from orchestrator.routing_dispatch import resolve_and_record_route
+from orchestrator.workflow_types import WorkflowState
 
 _HELPER = 'orchestrator.routing_dispatch'
 
@@ -192,6 +194,42 @@ class TestAppliedBudgetAnnotation:
         # Byte-equivalent event at every non-steward site: no annotation keys.
         assert 'applied_budget_usd' not in data
         assert 'budget_usd_advisory' not in data
+
+
+@pytest.mark.asyncio
+class TestEmitsPhase:
+    """A per-task caller's workflow phase lands on the persisted
+    routing_decision row's phase column, matching the site's own
+    invocation_end row; project-level/batch callers pass none and the column
+    stays NULL (task 5350)."""
+
+    async def _emit(self, store: EventStore, **phase_kwarg: WorkflowState) -> None:
+        with patch(f'{_HELPER}.resolve_route', return_value=_fake_decision()):
+            await resolve_and_record_route(
+                role_name='steward',
+                role_defaults=_STEWARD_DEFAULTS,
+                config=_mk_cfg(),
+                task_id='5350',
+                task_metadata={},
+                event_store=store,
+                **phase_kwarg,
+            )
+
+    async def test_phase_is_stamped_on_the_event_row(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-test')
+        await self._emit(store, phase=WorkflowState.BLOCKED)
+
+        rows = store.fetch_events_by_type(EventType.routing_decision)
+        assert len(rows) == 1, rows
+        assert rows[0]['phase'] == 'blocked'
+
+    async def test_no_phase_leaves_column_null(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-test')
+        await self._emit(store)
+
+        rows = store.fetch_events_by_type(EventType.routing_decision)
+        assert len(rows) == 1, rows
+        assert rows[0]['phase'] is None
 
 
 @pytest.mark.asyncio
