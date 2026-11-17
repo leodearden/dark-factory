@@ -1053,6 +1053,15 @@ def _item_order(item: str | None) -> tuple[bool, str]:
     return item is not None, item or ''
 
 
+def _carried_by_open_escalation(fingerprint: Any, escalations: Mapping[str, Escalation]) -> bool:
+    """Whether an open escalation carries *fingerprint*: the one rule for "can this entry claim anything".
+
+    The type guard comes first, so a malformed (unhashable) fingerprint read
+    off the artifact answers False rather than raising on the lookup.
+    """
+    return isinstance(fingerprint, str) and bool(fingerprint) and fingerprint in escalations
+
+
 def _join_escalation(
     fingerprint: Any,
     sources: _JoinSources,
@@ -1067,7 +1076,7 @@ def _join_escalation(
     fingerprint links only its first claimer; ``_name_shared_fingerprints``
     names the sharing.
     """
-    if not (isinstance(fingerprint, str) and fingerprint) or fingerprint not in sources.escalations:
+    if not _carried_by_open_escalation(fingerprint, sources.escalations):
         return None, claims
     if sources.storm is not None:
         return None, claims.with_suppressed(fingerprint)
@@ -1076,10 +1085,14 @@ def _join_escalation(
     return sources.escalations[fingerprint], claims.with_link(fingerprint)
 
 
-# A tripwire item in one of these states has no escalation to show and
-# nothing to look up: its detail is the producer's template over (item,
-# verdict) (shared/src/shared/memory_eval_verdicts.py::_tripwire_entries) and
-# its fingerprint joins nothing.  Its entry ships only the badge fields.
+# A tripwire item is quiet only when its parity is in this set AND no open
+# escalation carries its fingerprint.  A storm suppression or a
+# shared-fingerprint second claimer leaves 'clear'/'grandfathered' parity on
+# an item an escalation still names, and ``unmatched_escalations``'
+# ``storm_suppressed`` reason (``_unmatched_projection``) promises a row
+# claims that fingerprint.  A quiet item's detail is the producer's template
+# over (item, verdict) (shared/src/shared/memory_eval_verdicts.py::_tripwire_entries),
+# so its entry ships only the badge fields.
 _QUIET_ITEM_PARITIES = frozenset({'clear', 'grandfathered'})
 
 
@@ -1090,12 +1103,16 @@ def _verdict_fields(
     matched: Escalation | None,
     storm_triggered: bool,
     issues: list[dict[str, Any]],
+    *,
+    carried: bool,
 ) -> dict[str, Any]:
     """One verdict entry of a metric row: *entry*'s judgement, its escalation link and its parity.
 
     The fields are passed through UNMAPPED from the sole verdict source.  A
-    quiet item (see ``_QUIET_ITEM_PARITIES``) omits ``verdict_detail`` and
-    ``fingerprint``; every other entry, item-less ones included, carries both.
+    quiet item (one whose parity is in ``_QUIET_ITEM_PARITIES`` and whose
+    fingerprint no open escalation carries, per *carried*) omits
+    ``verdict_detail`` and ``fingerprint``; every other entry, item-less ones
+    included, carries both.
     """
     # Absent verdict == absent, never defaulted to 'no_alarm'.  The empty
     # dict makes every verdict field read as None below without a second
@@ -1137,7 +1154,8 @@ def _verdict_fields(
         else _parity(verdict_class, escalation)
     )
     fields = {'item': item, 'verdict': verdict, 'parity': parity, 'escalation': escalation}
-    if item is None or parity not in _QUIET_ITEM_PARITIES:
+    quiet_item = item is not None and not carried and parity in _QUIET_ITEM_PARITIES
+    if not quiet_item:
         fields |= {'verdict_detail': judged.get('detail'), 'fingerprint': judged.get('fingerprint')}
     return fields
 
@@ -1352,10 +1370,12 @@ def _build_metric_row(
     verdicts: list[dict[str, Any]] = []
     # A metric no entry judges still gets its one (unjudged) verdict entry.
     for entry in entries or [None]:
-        matched, claims = _join_escalation((entry or {}).get('fingerprint'), sources, claims)
-        verdicts.append(
-            _verdict_fields(entry, metric_id, eval_dir, matched, sources.storm is not None, issues),
-        )
+        fingerprint = (entry or {}).get('fingerprint')
+        matched, claims = _join_escalation(fingerprint, sources, claims)
+        verdicts.append(_verdict_fields(
+            entry, metric_id, eval_dir, matched, sources.storm is not None, issues,
+            carried=_carried_by_open_escalation(fingerprint, sources.escalations),
+        ))
     return {
         **_metric_fields(metric_id, series.runs, rule_kind),
         **_metric_scoped_verdict_fields(entries, metric_id, eval_dir, issues),
