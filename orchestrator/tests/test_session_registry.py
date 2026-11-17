@@ -1,11 +1,10 @@
 """Tests for orchestrator.session_registry module.
 
-Covers: schema/contract round-trip (SCHEMA_VERSION, Status enum, SessionRecord
-to/from dict/json); slug sanitization + path/transcript encoding; single-writer
-atomic write/read/update; TTL/pid stale-record reaper matrix; CLI subcommands
-+ fail-soft; and the G5 two-way boundary test (write by a real spawn -> refresh
-by a simulated hook -> reap), exercised jointly with
-tests/scripts/test_spawn_claude.py's bash-level harness.
+Covers: TTL/pid stale-record reaper matrix; the leases; CLI subcommands +
+fail-soft; the bare-shell entrypoint registry; and the G5 two-way boundary
+test (write by a real spawn -> refresh by a simulated hook -> reap), exercised
+jointly with tests/scripts/test_spawn_claude.py's bash-level harness. The
+record schema and store are covered in test_session_records.py.
 """
 
 from __future__ import annotations
@@ -32,7 +31,7 @@ import pytest
 from _decision_fixtures import EVIDENCE, make_decision
 from _process_identity_variants import IdentityVariant, own_identity
 from _reap_report_wait import await_reap_report
-from _utf8_codec import names_the_utf8_codec
+from _session_record_fixtures import make_record
 from shared import proc_liveness
 from shared.process_identity import ProcessIdentity
 from shared.project_id import PROJECT_ID_ALIASES, fold_project_token
@@ -44,61 +43,6 @@ from orchestrator import session_registry as sr
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
-
-
-def _make_record(**overrides: object) -> sr.SessionRecord:
-    """Build a fully-populated SessionRecord for round-trip/identity tests.
-
-    Every field is given a concrete, distinguishable value so a round-trip
-    test can catch a field being dropped/mis-typed; ``overrides`` lets a
-    test tweak just the field(s) it cares about. Includes the C1 schema
-    extensions (parent_session_id/spawn_mode/display/question) and the
-    task-4193 hook-owner binding (claude_session_id, claude_owner_pid)
-    alongside the original rail fields.
-    """
-    # Declared as a bare `dict` (not `dict[str, object]`) so pyright treats it
-    # as dict[Unknown, Unknown] at the **fields unpack below -- mirrors
-    # test_merge_types_invariants.py's _real_kwargs/_decided_kwargs/_entry_kwargs,
-    # the established idiom in this suite for a kwargs-builder helper whose
-    # result is unpacked into a strictly-typed constructor.
-    fields: dict = {
-        'session_slug': 'unblock-df-2085-4242',
-        'status': sr.Status.LAUNCHING,
-        'title': 'unblock:df#2085 routing-mechanism',
-        'role': 'unblock',
-        'project': 'df',
-        'task_id': '2085',
-        'escalation_id': 'esc-1',
-        'prompt': '/unblock 2085',
-        'cwd': '/home/leo/src/dark-factory',
-        'launcher_pid': 4242,
-        'start_ts': '2026-07-07T00:00:00+00:00',
-        'exit_code': None,
-        'result_file': None,
-        'transcript_path': '~/.claude/projects/-home-leo-src-dark-factory',
-        'parent_session_id': 'root-df-1-1',
-        'spawn_mode': 'sibling',
-        'display': sr.Display(
-            kind='wm', wm_title='unblock:df#2085 slug', wm_window_id='0x1a', tmux_target=None
-        ),
-        'question': sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00'),
-        'claude_session_id': 'uuid-claude-abc123',
-        'claude_launch_session_id': 'uuid-claude-launch-0',
-        'claude_owner_pid': 424242,
-        'self_exit': True,
-        't3_end': sr.T3End.SETTLE,
-        'exit_request': sr.ExitRequest(
-            state=sr.ExitRequestState.ATTEMPTED,
-            reason=None,
-            pid=424242,
-            at='2026-07-07T00:00:00+00:00',
-            marker_session_id='uuid-claude-abc123',
-        ),
-        'exit_requested_at': '2026-07-07T00:00:00+00:00',
-    }
-    fields.update(overrides)
-    return sr.SessionRecord(**fields)
-
 
 # A pid virtually guaranteed dead on any host (matches the convention in
 # shared/tests/test_proc_liveness.py: 2**31 - 1).
@@ -114,775 +58,6 @@ def _set_mtime(path: Path, now: datetime, age: timedelta) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step-1: schema / contract
-# ---------------------------------------------------------------------------
-
-
-def test_schema_version_is_int() -> None:
-    assert isinstance(sr.SCHEMA_VERSION, int)
-
-
-def test_status_enum_has_exact_six_wire_values() -> None:
-    assert issubclass(sr.Status, str)
-    values = {member.value for member in sr.Status}
-    assert values == {
-        'launching',
-        'running',
-        'awaiting-input',
-        'idle',
-        'exited',
-        'failed-to-start',
-    }
-    assert len(list(sr.Status)) == 6
-    # Spot-check the documented wire-value <-> member mapping.
-    assert sr.Status('launching') is sr.Status.LAUNCHING
-    assert sr.Status('running') is sr.Status.RUNNING
-    assert sr.Status('awaiting-input') is sr.Status.AWAITING_INPUT
-    assert sr.Status('idle') is sr.Status.IDLE
-    assert sr.Status('exited') is sr.Status.EXITED
-    assert sr.Status('failed-to-start') is sr.Status.FAILED_TO_START
-
-
-def test_session_record_schema_version_defaults_to_schema_version() -> None:
-    r = _make_record()
-    assert r.schema_version == sr.SCHEMA_VERSION
-
-
-def test_session_record_dict_round_trip_is_lossless() -> None:
-    r = _make_record()
-    assert sr.SessionRecord.from_dict(r.to_dict()) == r
-
-
-def test_session_record_json_round_trip_is_lossless() -> None:
-    r = _make_record()
-    assert sr.SessionRecord.from_json(r.to_json()) == r
-
-
-def test_session_record_json_round_trip_with_null_fields() -> None:
-    """exit_code/result_file/task_id/escalation_id may legitimately be None
-    (a freshly-launched record has no exit code yet); the round trip must
-    preserve that, not coerce it to a string or drop the key.
-    """
-    r = _make_record(
-        task_id=None,
-        escalation_id=None,
-        exit_code=None,
-        result_file=None,
-        transcript_path=None,
-    )
-    assert sr.SessionRecord.from_json(r.to_json()) == r
-
-
-# ---------------------------------------------------------------------------
-# Step-1: SessionRecord C1 schema extensions (B1) -- Fleet Cockpit
-# parent_session_id/spawn_mode/display/question, SCHEMA_MINOR, SpawnMode,
-# DisplayKind, Display, Question. Additive + migration-free: a rail-vintage
-# dict (no C1 keys) must still parse, defaulting the new fields.
-# ---------------------------------------------------------------------------
-
-
-def test_session_record_round_trip_includes_new_c1_fields() -> None:
-    r = _make_record()
-    assert sr.SessionRecord.from_dict(r.to_dict()) == r
-    assert sr.SessionRecord.from_json(r.to_json()) == r
-
-    # A display whose optional wm_window_id/tmux_target are both None must
-    # also round-trip losslessly (None-safe nested (dis)assembly).
-    r_none_optionals = _make_record(
-        display=sr.Display(
-            kind='wm', wm_title='unblock:df#2085 slug', wm_window_id=None, tmux_target=None
-        ),
-    )
-    assert sr.SessionRecord.from_dict(r_none_optionals.to_dict()) == r_none_optionals
-    assert sr.SessionRecord.from_json(r_none_optionals.to_json()) == r_none_optionals
-
-    # A record with no parent/display/question at all (the common
-    # human-launched-root shape) must also round-trip losslessly.
-    r_all_none = _make_record(parent_session_id=None, display=None, question=None)
-    assert sr.SessionRecord.from_dict(r_all_none.to_dict()) == r_all_none
-    assert sr.SessionRecord.from_json(r_all_none.to_json()) == r_all_none
-
-
-def test_session_record_parses_rail_vintage_dict_migration_free() -> None:
-    """A dict written by the pre-C1 (rail) module -- containing only the
-    original schema keys, no parent_session_id/spawn_mode/display/question --
-    must still parse via from_dict without raising, defaulting the new C1
-    fields to None/'child'/None/None (migration-free additive contract).
-    """
-    rail_vintage = {
-        'schema_version': 1,
-        'session_slug': 'unblock-df-2085-4242',
-        'title': 'unblock:df#2085 routing-mechanism',
-        'role': 'unblock',
-        'project': 'df',
-        'task_id': '2085',
-        'escalation_id': 'esc-1',
-        'prompt': '/unblock 2085',
-        'cwd': '/home/leo/src/dark-factory',
-        'launcher_pid': 4242,
-        'start_ts': '2026-07-07T00:00:00+00:00',
-        'status': 'launching',
-        'exit_code': None,
-        'result_file': None,
-        'transcript_path': '~/.claude/projects/-home-leo-src-dark-factory',
-    }
-    record = sr.SessionRecord.from_dict(rail_vintage)
-    assert record.parent_session_id is None
-    assert record.spawn_mode == sr.SpawnMode.CHILD
-    assert record.display is None
-    assert record.question is None
-    # Task 4193's additive hook-owner binding: absent on disk -> None, no
-    # migration required.
-    assert record.claude_session_id is None
-    assert record.launcher_identity is None
-    assert record.claude_owner_identity is None
-
-
-def test_schema_minor_is_int_bumped() -> None:
-    assert isinstance(sr.SCHEMA_MINOR, int)
-    assert sr.SCHEMA_MINOR >= 1
-    # The PERSISTED major must stay migration-free: bumping it would make
-    # rail-vintage and C1 records version-distinguishable on disk.
-    assert sr.SCHEMA_VERSION == 1
-
-
-# ---------------------------------------------------------------------------
-# Task 4193: SessionRecord.claude_session_id (hook-owner binding)
-# ---------------------------------------------------------------------------
-
-
-def test_session_record_round_trip_includes_claude_session_id() -> None:
-    r = _make_record()
-    assert sr.SessionRecord.from_dict(r.to_dict()) == r
-    assert sr.SessionRecord.from_json(r.to_json()) == r
-    # The wire key is pinned by name: session_hooks reads it back off disk.
-    assert r.to_dict()['claude_session_id'] == 'uuid-claude-abc123'
-
-    # The unbound shape a spawn-claude.sh `launching` write produces (no hook
-    # has claimed the slug yet) must round-trip just as losslessly.
-    r_unbound = _make_record(claude_session_id=None)
-    assert sr.SessionRecord.from_dict(r_unbound.to_dict()) == r_unbound
-    assert sr.SessionRecord.from_json(r_unbound.to_json()) == r_unbound
-    assert r_unbound.to_dict()['claude_session_id'] is None
-
-
-def test_session_record_defaults_claude_session_id_to_none() -> None:
-    record = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING)
-    assert record.claude_session_id is None
-
-
-def test_session_record_round_trip_includes_claude_owner_pid() -> None:
-    # esc-4193-11 suggestion 3: to_dict/from_dict must actually carry
-    # claude_owner_pid -- without a non-None value in _make_record's fields,
-    # the round-trip pin above is vacuous (both sides default to None even
-    # if to_dict silently dropped the key).
-    r = _make_record()
-    assert r.claude_owner_pid == 424242
-    assert r.to_dict()['claude_owner_pid'] == 424242
-    assert sr.SessionRecord.from_dict(r.to_dict()) == r
-    assert sr.SessionRecord.from_json(r.to_json()) == r
-
-
-@pytest.mark.parametrize(
-    ('raw', 'expected'),
-    [
-        (True, None),  # bool is an int subclass; must be rejected before the int check
-        ('x', None),
-        (3.0, None),
-        (0, None),
-        (-1, None),
-        (None, None),
-        (4242, 4242),
-    ],
-)
-def test_coerce_owner_pid(raw: object, expected: int | None) -> None:
-    assert sr._coerce_owner_pid(raw) == expected
-
-
-@pytest.mark.parametrize(
-    ('raw', 'expected'),
-    [
-        (True, None),
-        (123, None),
-        (3.0, None),
-        (None, None),
-        ('', None),
-        ('   ', None),
-        ('uuid-claude-abc123', 'uuid-claude-abc123'),
-        ('  uuid-claude-abc123  ', 'uuid-claude-abc123'),
-    ],
-)
-def test_coerce_session_id(raw: object, expected: str | None) -> None:
-    assert sr._coerce_session_id(raw) == expected
-
-
-def test_session_record_from_dict_coerces_non_str_claude_session_id() -> None:
-    # esc-4193-11 suggestion 2: a hand-edited or future-writer record body
-    # carrying a non-string claude_session_id must not survive into the
-    # SessionRecord -- session_hooks does `(record.claude_session_id or
-    # '').strip()` outside a try/except, so a raw int here would raise
-    # AttributeError and lose the whole hook event.
-    data = _make_record().to_dict()
-    data['claude_session_id'] = 123
-    record = sr.SessionRecord.from_dict(data)
-    assert record.claude_session_id is None
-
-
-def test_session_record_from_dict_coerces_non_int_claude_owner_pid() -> None:
-    # Sibling to the claude_session_id regression test above (task 4660
-    # review follow-up): pins the from_dict call site for claude_owner_pid
-    # too, so replacing `_coerce_owner_pid(data.get(...))` with a bare
-    # `data.get(...)` cannot go unnoticed. True is an int subclass and would
-    # otherwise survive as a real-looking pid, which could silently compare
-    # equal to a real pid in session_hooks._env_slug_ownership
-    # (session_hooks.py:329).
-    data = _make_record().to_dict()
-    data['claude_owner_pid'] = True
-    record = sr.SessionRecord.from_dict(data)
-    assert record.claude_owner_pid is None
-
-
-# ---------------------------------------------------------------------------
-# Task 8125: SessionRecord.launcher_identity and claude_owner_identity
-# ---------------------------------------------------------------------------
-
-_IDENTITY_FIELDS = ('launcher_identity', 'claude_owner_identity')
-_RECORD_PID = 1
-
-
-def _identity_wire(**overrides: object) -> dict[str, object]:
-    return {'pid': _RECORD_PID, 'start_ticks': 11, 'boot_id': 'boot-a', 'host': 'host-a', **overrides}
-
-
-def _record_dict_with_pids(pid: int) -> dict[str, Any]:
-    return _make_record(launcher_pid=pid, claude_owner_pid=pid).to_dict()
-
-
-def test_session_record_round_trip_includes_both_identities() -> None:
-    r = _make_record(
-        launcher_pid=4242,
-        launcher_identity=ProcessIdentity(4242, 11, 'boot-a', 'host-a'),
-        claude_owner_pid=424242,
-        claude_owner_identity=ProcessIdentity(424242, 12, 'boot-a', 'host-a'),
-    )
-
-    assert sr.SessionRecord.from_dict(r.to_dict()) == r
-    assert sr.SessionRecord.from_json(r.to_json()) == r
-    # The wire keys are pinned by name: watchers read them back off disk.
-    assert r.to_dict()['launcher_identity'] == {
-        'pid': 4242,
-        'start_ticks': 11,
-        'boot_id': 'boot-a',
-        'host': 'host-a',
-    }
-    assert r.to_dict()['claude_owner_identity'] == {
-        'pid': 424242,
-        'start_ticks': 12,
-        'boot_id': 'boot-a',
-        'host': 'host-a',
-    }
-
-
-def test_session_record_defaults_both_identities_to_none() -> None:
-    record = sr.SessionRecord(session_slug='s', status=sr.Status.LAUNCHING)
-
-    assert record.launcher_identity is None
-    assert record.claude_owner_identity is None
-
-
-@pytest.mark.parametrize('identity_field', _IDENTITY_FIELDS)
-def test_a_well_formed_identity_naming_its_pid_reads_back(identity_field: str) -> None:
-    data = _record_dict_with_pids(_RECORD_PID)
-    data[identity_field] = _identity_wire()
-
-    record = sr.SessionRecord.from_dict(data)
-
-    assert getattr(record, identity_field) == ProcessIdentity(_RECORD_PID, 11, 'boot-a', 'host-a')
-
-
-@pytest.mark.parametrize('identity_field', _IDENTITY_FIELDS)
-@pytest.mark.parametrize(
-    'junk',
-    [
-        pytest.param('host-a', id='str'),
-        pytest.param(_RECORD_PID, id='int'),
-        pytest.param(list(_identity_wire().values()), id='list'),
-        pytest.param(
-            {k: v for k, v in _identity_wire().items() if k != 'host'}, id='missing-host'
-        ),
-        pytest.param(_identity_wire(pid=True), id='bool-pid'),
-        pytest.param(_identity_wire(start_ticks='11'), id='str-start-ticks'),
-        pytest.param(_identity_wire(start_ticks=-1), id='negative-start-ticks'),
-        pytest.param(_identity_wire(boot_id=''), id='empty-boot-id'),
-        pytest.param(_identity_wire(host=''), id='empty-host'),
-        pytest.param(_identity_wire(pid=_RECORD_PID + 1), id='names-another-pid'),
-    ],
-)
-def test_a_junk_identity_reads_none(identity_field: str, junk: object) -> None:
-    data = _record_dict_with_pids(_RECORD_PID)
-    data[identity_field] = junk
-
-    assert getattr(sr.SessionRecord.from_dict(data), identity_field) is None
-
-
-@pytest.mark.parametrize(
-    ('identity_field', 'pid_field'),
-    [('launcher_identity', 'launcher_pid'), ('claude_owner_identity', 'claude_owner_pid')],
-)
-def test_an_identity_on_a_record_without_its_pid_reads_none(
-    identity_field: str, pid_field: str
-) -> None:
-    data = _record_dict_with_pids(_RECORD_PID)
-    del data[pid_field]
-    data[identity_field] = _identity_wire()
-
-    assert getattr(sr.SessionRecord.from_dict(data), identity_field) is None
-
-
-def test_spawn_mode_enum_values() -> None:
-    assert issubclass(sr.SpawnMode, str)
-    assert {m.value for m in sr.SpawnMode} == {'child', 'sibling', 'detached'}
-    assert sr.SpawnMode.CHILD.value == 'child'
-    assert sr.SpawnMode.SIBLING.value == 'sibling'
-    assert sr.SpawnMode.DETACHED.value == 'detached'
-
-
-def test_display_kind_enum_values() -> None:
-    assert issubclass(sr.DisplayKind, str)
-    assert {m.value for m in sr.DisplayKind} == {'wm', 'tmux', 't3'}
-    assert sr.DisplayKind.WM.value == 'wm'
-    assert sr.DisplayKind.TMUX.value == 'tmux'
-    assert sr.DisplayKind.T3.value == 't3'
-
-
-def test_display_round_trip() -> None:
-    with_optionals = sr.Display(
-        kind='wm', wm_title='unblock:df#2085 slug', wm_window_id='0x1a', tmux_target=None
-    )
-    assert sr.Display.from_dict(with_optionals.to_dict()) == with_optionals
-
-    without_optionals = sr.Display(
-        kind='tmux', wm_title='', wm_window_id=None, tmux_target='session:0.1'
-    )
-    assert sr.Display.from_dict(without_optionals.to_dict()) == without_optionals
-
-    t3 = sr.Display(kind=sr.DisplayKind.T3.value, wm_title='unblock:df#7489', t3_thread_id='th-1')
-    assert sr.Display.from_dict(t3.to_dict()) == t3
-
-
-def test_display_from_a_body_without_t3_thread_id_reads_none() -> None:
-    assert sr.Display.from_dict({'kind': 'wm'}).t3_thread_id is None
-
-
-def test_question_round_trip() -> None:
-    q = sr.Question(text='approve rollout?', asked_at='2026-07-07T00:00:00+00:00')
-    assert sr.Question.from_dict(q.to_dict()) == q
-
-
-# ---------------------------------------------------------------------------
-# Step-3: identity, paths, transcript encoding
-# ---------------------------------------------------------------------------
-
-
-def test_build_session_slug_joins_role_project_task_pid() -> None:
-    assert sr.build_session_slug('unblock', 'df', '2085', 4242) == 'unblock-df-2085-4242'
-
-
-@pytest.mark.parametrize('task_id', [None, ''])
-def test_build_session_slug_omits_task_segment_when_absent(task_id: str | None) -> None:
-    assert sr.build_session_slug('unblock', 'df', task_id, 4242) == 'unblock-df-4242'
-
-
-def test_build_session_slug_sanitizes_special_chars() -> None:
-    slug = sr.build_session_slug('un block', 'df/prod', '20#85', 4242)
-    assert slug == 'un-block-df-prod-20-85-4242'
-    assert re.fullmatch(r'[A-Za-z0-9._-]+', slug)
-
-
-# ---------------------------------------------------------------------------
-# Task 2511 step-1: sanitize_slug (shared filesystem-safe-slug normalizer)
-# ---------------------------------------------------------------------------
-
-
-def test_sanitize_slug_leaves_already_safe_slug_unchanged() -> None:
-    assert sr.sanitize_slug('session-cockpit-3215033') == 'session-cockpit-3215033'
-
-
-def test_sanitize_slug_maps_unsafe_chars_to_dash() -> None:
-    # '/' and '#' fall outside [A-Za-z0-9._-] (record_path_for_slug's
-    # path-escape guard) and are mapped to '-'; '.' is itself in the allowed
-    # set (mirrors _SLUG_SANITIZE_RE, the idiom this delegates to), so a
-    # path separator can never escape sessions_dir via record_path_for_slug.
-    slug = sr.sanitize_slug('weird/id#x.y')
-    assert slug == 'weird-id-x.y'
-    assert re.fullmatch(r'[A-Za-z0-9._-]+', slug)
-
-
-def test_sanitize_slug_matches_build_session_slug_regression() -> None:
-    # Pins build_session_slug's output as byte-identical to today once it
-    # delegates to sanitize_slug (step-2's behavior-preserving refactor).
-    assert sr.build_session_slug('unblock', 'df', '2085', 4242) == 'unblock-df-2085-4242'
-    slug = sr.build_session_slug('un block', 'df/prod', '20#85', 4242)
-    assert slug == 'un-block-df-prod-20-85-4242'
-    assert slug == sr.sanitize_slug('un block-df/prod-20#85-4242')
-
-
-@pytest.mark.parametrize(
-    ('raw', 'expected'),
-    [('.', '-'), ('..', '--'), ('...', '---')],
-)
-def test_sanitize_slug_collapses_all_dots_slug(raw: str, expected: str) -> None:
-    # Task 4112: the all-dots branch is the SOLE guard against a path escape
-    # out of sessions_dir. '.' is inside _SLUG_SANITIZE_RE's allowed class, so
-    # the character substitution alone passes '..' straight through, and
-    # record_path_for_slug is a bare join that sanitizes nothing of its own --
-    # so an unguarded '..' would be handed to the filesystem as a traversal
-    # segment. Every '.' maps to '-', so length is preserved.
-    slug = sr.sanitize_slug(raw)
-    assert slug == expected
-    assert re.fullmatch(r'[A-Za-z0-9._-]+', slug)
-
-
-@pytest.mark.parametrize('raw', ['..foo', 'foo..', 'a.b', '.hidden-x'])
-def test_sanitize_slug_leaves_partially_dotted_slug_untouched(raw: str) -> None:
-    # The guard's LOWER edge: a value that merely CONTAINS dots alongside other
-    # characters is a literal, non-traversing directory name (sanitize_slug's
-    # docstring says so) and must pass through byte-identical. Pinning only the
-    # collapse direction would leave a future "hardening" free to over-broaden
-    # into stripping every dot, silently mangling ordinary slugs like 'a.b'.
-    assert sr.sanitize_slug(raw) == raw
-
-
-def test_record_path_for_slug(tmp_path: Path) -> None:
-    path = sr.record_path_for_slug('unblock-df-2085-4242', root=tmp_path)
-    assert path == tmp_path / 'sessions' / 'unblock-df-2085-4242' / 'record.json'
-
-
-def test_record_path_for_slug_all_dots_slug_stays_under_sessions_dir(tmp_path: Path) -> None:
-    # Task 4112: the containment property sanitize_slug's all-dots branch buys.
-    # resolve() + is_relative_to, NOT a string prefix check -- str(root/'sessions'
-    # /'..'/'record.json') startswith str(root/'sessions') is TRUE, so a prefix
-    # check would pass for the very path that escapes. resolve() is non-strict
-    # (these paths do not exist) and collapses '..' with the exact filesystem
-    # semantics under defense.
-    sessions = sr.sessions_dir(root=tmp_path).resolve()
-    # '..' is the ONLY genuine escape vector in this loop; '.' and '...' are
-    # non-traversing CONTROLS, not extra attack coverage. Unsanitized,
-    # 'sessions/./record.json' still resolves under sessions_dir and '...' is a
-    # literal POSIX dirname resolve() leaves in place -- so only the '..'
-    # iteration discriminates against a guard-deleted build.
-    for raw in ('.', '..', '...'):
-        slug = sr.sanitize_slug(raw)
-        path = sr.record_path_for_slug(slug, root=tmp_path)
-        assert path.resolve().is_relative_to(sessions)
-
-    # NON-VACUITY COUNTERFACTUAL: the UNsanitized token genuinely escapes, i.e.
-    # record_path_for_slug performs NO sanitization of its own (it is a bare
-    # join) -- which is exactly why sanitize_slug has to be the chokepoint.
-    # Without this, the assertions above could pass for the wrong reason if
-    # record_path_for_slug's shape ever changed, and nobody would notice the
-    # test had stopped proving anything.
-    assert not sr.record_path_for_slug('..', root=tmp_path).resolve().is_relative_to(sessions)
-
-
-def test_transcript_path_for_cwd_encodes_slash() -> None:
-    assert (
-        sr.transcript_path_for_cwd('/home/leo/src/dark-factory')
-        == '~/.claude/projects/-home-leo-src-dark-factory'
-    )
-
-
-def test_transcript_path_for_cwd_encodes_dot() -> None:
-    # Regression fixture confirmed against a real ~/.claude/projects/ dir
-    # (plans/session-attention-rail-prd.md §3): '.' -> '-' too, so a cwd
-    # component starting with '.' yields a doubled '--' (one dash from the
-    # preceding '/', one from the '.').
-    assert (
-        sr.transcript_path_for_cwd('/home/leo/.openclaw-workspace')
-        == '~/.claude/projects/-home-leo--openclaw-workspace'
-    )
-
-
-def test_transcript_path_for_cwd_encodes_underscore() -> None:
-    # The third character (task 3272). Derived from 738 real (encoded-dir,
-    # decoded-cwd) pairs sampled off a live ~/.claude/projects tree, where
-    # two thirds of the dirs carried an underscore — the former two-character
-    # rule mismatched 492 of the 738.
-    assert (
-        sr.transcript_path_for_cwd('/media/leo/data_lv_1/leo/reify-build')
-        == '~/.claude/projects/-media-leo-data-lv-1-leo-reify-build'
-    )
-
-
-def test_encode_cwd_returns_bare_dir_name() -> None:
-    # encode_cwd is the bare encoded dir name — no '~/.claude/projects/'
-    # prefix — so callers that need a lookup key (not a display path) have
-    # one canonical source instead of string-slicing the prefix back off.
-    assert sr.encode_cwd('/home/leo/src/dark-factory') == '-home-leo-src-dark-factory'
-
-
-def test_encode_cwd_preserves_case() -> None:
-    # A real on-disk dir name with its capitals intact — the encoder does NOT
-    # lowercase, which rules out a case-folding step in the rule.
-    assert sr.encode_cwd('/opt/Auto-Claude/resources/backend') == (
-        '-opt-Auto-Claude-resources-backend'
-    )
-
-
-def test_encode_cwd_maps_all_three_characters() -> None:
-    # '/' , '.' and '_' all collapse to '-'; a leading '_' on a path component
-    # yields a doubled '--' just as a leading '.' does.
-    assert sr.encode_cwd('/home/leo/src/warm-lanes/worktrees/_lane-39') == (
-        '-home-leo-src-warm-lanes-worktrees--lane-39'
-    )
-    assert sr.encode_cwd('/home/leo/src/dark-factory/.eval-worktrees/df_task_12') == (
-        '-home-leo-src-dark-factory--eval-worktrees-df-task-12'
-    )
-
-
-def test_transcript_path_for_cwd_is_prefix_plus_encoding() -> None:
-    # Pins the '~/.claude/projects/' prefix AND the encoding together over a
-    # cwd exercising all three characters, as a hard-coded literal.
-    #
-    # Asserting `== f'~/.claude/projects/{sr.encode_cwd(cwd)}'` instead would
-    # be a character-for-character restatement of the one-line implementation
-    # — it could not fail while the implementation keeps that shape, so it
-    # would pin nothing. That is the same self-consistency trap task 3272
-    # calls out for fixtures built with the encoder under test.
-    assert (
-        sr.transcript_path_for_cwd('/home/leo/src/dark-factory/.eval-worktrees/df_task_12')
-        == '~/.claude/projects/-home-leo-src-dark-factory--eval-worktrees-df-task-12'
-    )
-
-
-# ---------------------------------------------------------------------------
-# Step-5: single-writer atomic write / read / update
-# ---------------------------------------------------------------------------
-
-
-def test_write_record_creates_record_json_matching_the_record(tmp_path: Path) -> None:
-    r = _make_record()
-    sr.write_record(r, root=tmp_path)
-    path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
-    assert path.is_file()
-    assert sr.SessionRecord.from_json(path.read_text()) == r
-
-
-def test_write_record_leaves_no_leftover_tmp_file(tmp_path: Path) -> None:
-    r = _make_record()
-    sr.write_record(r, root=tmp_path)
-    slug_dir = sr.record_path_for_slug(r.session_slug, root=tmp_path).parent
-    leftovers = [p for p in slug_dir.iterdir() if p.suffix == '.tmp']
-    assert leftovers == []
-
-
-def test_read_record_returns_equal_record(tmp_path: Path) -> None:
-    r = _make_record()
-    sr.write_record(r, root=tmp_path)
-    assert sr.read_record(r.session_slug, root=tmp_path) == r
-
-
-def test_read_record_decodes_with_an_explicit_utf8_encoding(tmp_path, monkeypatch):
-    """The READ half of task 3387's round-trip names utf-8 too.
-
-    Pinning only ``fleet_files.atomic_write_text`` left the round-trip ASYMMETRIC: on a
-    genuinely non-UTF-8 host a record holding non-ASCII bytes was written
-    correctly and then failed to DECODE on the way back in, and because
-    ``UnicodeDecodeError`` subclasses ``ValueError`` it lands in
-    ``read_record``'s ``except`` clause and resurfaces as
-    ``CorruptSessionRecord`` — the exact unreadable-record outcome the write
-    fix exists to prevent. Every ``read_text`` in the module is now explicit;
-    this pins the one on the primary read path.
-
-    A BOUNDARY SPY rather than a write-then-read-back round-trip, for the same
-    measured reason the write pins in test_fleet_files.py are shaped the way they are:
-    ``Path.read_text()`` with no encoding resolves its codec through the
-    C-level locale (``io.text_encoding()`` returns the ``"locale"`` sentinel),
-    unreachable from an in-process monkeypatch, and under this suite's UTF-8
-    ambient locale a round-trip passes either way. Spying the argument fails on
-    EVERY host instead: a locale-dependent read passes no ``encoding`` kwarg at
-    all. (``test_fleet_files.py::TestAtomicWriteSemantics``'s strict child covers the write half
-    end-to-end; a second child for the read half would buy nothing this does
-    not already localise.)
-    """
-    r = _make_record()
-    sr.write_record(r, root=tmp_path)
-
-    seen: list[dict] = []
-    real_read_text = Path.read_text
-
-    def _spy(self, *args, **kwargs):
-        seen.append(dict(kwargs))
-        return real_read_text(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, 'read_text', _spy)
-
-    # The spy delegates, so the read really completed — this pin cannot pass
-    # by disabling the thing it is measuring.
-    assert sr.read_record(r.session_slug, root=tmp_path) == r
-
-    assert len(seen) == 1, f'expected exactly one read_text call, recorded {seen}'
-    encoding = seen[0].get('encoding')
-    assert encoding is not None, (
-        'the record was read with no encoding= argument, so it decodes in '
-        'whatever the ambient locale happens to be — the task 3387 bug, '
-        'mirrored onto the read half'
-    )
-    assert names_the_utf8_codec(encoding), (
-        f'JSON on disk is utf-8 (RFC 8259) and must be decoded as utf-8 '
-        f'regardless of ambient locale (task 3387); got encoding={encoding!r}'
-    )
-
-
-def test_update_status_mutates_status_and_exit_code_in_place(tmp_path: Path) -> None:
-    r = _make_record(status=sr.Status.LAUNCHING, exit_code=None)
-    sr.write_record(r, root=tmp_path)
-
-    sr.update_status(r.session_slug, root=tmp_path, status=sr.Status.EXITED, exit_code=3)
-
-    reread = sr.read_record(r.session_slug, root=tmp_path)
-    assert reread.status == sr.Status.EXITED
-    assert reread.exit_code == 3
-    # Every other field survives the read-modify-write untouched.
-    assert reread.session_slug == r.session_slug
-    assert reread.title == r.title
-
-
-def test_refresh_record_updates_existing_record_under_same_key(tmp_path: Path) -> None:
-    r = _make_record(status=sr.Status.LAUNCHING)
-    sr.write_record(r, root=tmp_path)
-
-    sr.refresh_record(r.session_slug, root=tmp_path, status=sr.Status.RUNNING)
-
-    path_before = sr.record_path_for_slug(r.session_slug, root=tmp_path)
-    reread = sr.read_record(r.session_slug, root=tmp_path)
-    assert reread.status == sr.Status.RUNNING
-    assert sr.record_path_for_slug(r.session_slug, root=tmp_path) == path_before
-
-
-# ---------------------------------------------------------------------------
-# apply_refresh -- the PURE (no-I/O) half of refresh_record (task 4662)
-#
-# session_hooks performs three reads of one record.json per hook event; the
-# third is refresh_record's own internal read. Splitting the upsert body out
-# as a pure function lets a caller that ALREADY holds the record produce the
-# refreshed body without a second read, so one event can settle on ONE
-# snapshot and ONE write. These tests pin that the split half is genuinely
-# I/O-free and that refresh_record, re-expressed on top of it, is unchanged.
-# ---------------------------------------------------------------------------
-
-
-def _no_io(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make ANY registry filesystem access explode.
-
-    apply_refresh is the seam session_hooks needs precisely because it
-    touches no disk; asserting "we passed no root" would not catch an
-    implementation that reached for the default root, so the read/write
-    entry points are booby-trapped instead.
-    """
-
-    def _boom(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError('apply_refresh must perform no filesystem access')
-
-    monkeypatch.setattr(sr, 'read_record', _boom)
-    monkeypatch.setattr(sr, 'write_record', _boom)
-
-
-def test_apply_refresh_updates_prior_in_place_and_does_no_io(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    prior = _make_record(status=sr.Status.LAUNCHING)
-    before = prior.to_dict()
-    _no_io(monkeypatch)
-
-    result = sr.apply_refresh('unblock-df-2085-4242', prior, status=sr.Status.IDLE)
-
-    # In-place read-modify, exactly like refresh_record/update_status today.
-    assert result is prior
-    assert result.status is sr.Status.IDLE
-    # Every other field survives byte-identical.
-    after = result.to_dict()
-    del before['status'], after['status']
-    assert after == before
-
-
-def test_apply_refresh_with_no_status_is_a_pure_heartbeat(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """status=None must leave the prior status alone.
-
-    This is the case the launch-window withhold path relies on: it wants the
-    mtime heartbeat bumped without promoting a still-LAUNCHING record.
-    """
-    prior = _make_record(status=sr.Status.LAUNCHING)
-    _no_io(monkeypatch)
-
-    result = sr.apply_refresh('unblock-df-2085-4242', prior, status=None)
-
-    assert result is prior
-    assert result.status is sr.Status.LAUNCHING
-
-
-def test_apply_refresh_synthesizes_a_well_formed_record_when_prior_is_none(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _no_io(monkeypatch)
-
-    result = sr.apply_refresh('hand-launched-slug', None, status=sr.Status.RUNNING)
-
-    assert result.session_slug == 'hand-launched-slug'
-    assert result.status is sr.Status.RUNNING
-    assert result.schema_version == sr.SCHEMA_VERSION
-    # A parseable ISO-8601 start_ts, not merely a non-empty string.
-    assert result.start_ts
-    assert datetime.fromisoformat(result.start_ts)
-
-
-def test_apply_refresh_synthesis_defaults_to_launching(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """LAUNCHING is refresh_record's documented default for a new record."""
-    _no_io(monkeypatch)
-
-    result = sr.apply_refresh('hand-launched-slug', None, status=None)
-
-    assert result.status is sr.Status.LAUNCHING
-
-
-@pytest.mark.parametrize('status', [sr.Status.RUNNING, None])
-def test_refresh_record_equals_read_apply_write(
-    tmp_path: Path, status: sr.Status | None
-) -> None:
-    """refresh_record(...) == write_record(apply_refresh(read_record(...))).
-
-    The equivalence is the whole point of the split: session_hooks composes
-    the second spelling from a snapshot it already holds, so it must produce
-    a byte-identical body to the one refresh_record writes today.
-    """
-    seed = _make_record(status=sr.Status.LAUNCHING)
-    sr.write_record(seed, root=tmp_path)
-    via_refresh = sr.refresh_record(seed.session_slug, root=tmp_path, status=status)
-    refreshed_bytes = sr.record_path_for_slug(
-        seed.session_slug, root=tmp_path
-    ).read_text(encoding='utf-8')
-
-    # Re-seed and take the composed route over the same starting body.
-    sr.write_record(_make_record(status=sr.Status.LAUNCHING), root=tmp_path)
-    composed = sr.apply_refresh(
-        seed.session_slug,
-        sr.read_record(seed.session_slug, root=tmp_path),
-        status=status,
-    )
-    sr.write_record(composed, root=tmp_path)
-    composed_bytes = sr.record_path_for_slug(
-        seed.session_slug, root=tmp_path
-    ).read_text(encoding='utf-8')
-
-    assert composed_bytes == refreshed_bytes
-    assert composed.to_dict() == via_refresh.to_dict()
-
-
-# ---------------------------------------------------------------------------
 # Step-7: TTL / pid stale-record reaper matrix
 # ---------------------------------------------------------------------------
 
@@ -893,7 +68,7 @@ def test_ttl_constants_are_module_level_timedeltas() -> None:
 
 
 def test_reap_removes_terminal_record_past_ttl(tmp_path: Path) -> None:
-    r = _make_record(status=sr.Status.EXITED, launcher_pid=os.getpid())
+    r = make_record(status=sr.Status.EXITED, launcher_pid=os.getpid())
     sr.write_record(r, root=tmp_path)
     record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
     _set_mtime(record_path, _NOW, sr.TERMINAL_TTL + timedelta(hours=1))
@@ -908,7 +83,7 @@ def test_reap_removes_terminal_record_past_ttl(tmp_path: Path) -> None:
 
 
 def test_reap_keeps_terminal_record_within_ttl(tmp_path: Path) -> None:
-    r = _make_record(status=sr.Status.EXITED, launcher_pid=os.getpid())
+    r = make_record(status=sr.Status.EXITED, launcher_pid=os.getpid())
     sr.write_record(r, root=tmp_path)
     record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
     _set_mtime(record_path, _NOW, sr.TERMINAL_TTL - timedelta(hours=1))
@@ -920,7 +95,7 @@ def test_reap_keeps_terminal_record_within_ttl(tmp_path: Path) -> None:
 
 
 def test_reap_removes_non_terminal_dead_pid_past_heartbeat_ttl(tmp_path: Path) -> None:
-    r = _make_record(status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID)
+    r = make_record(status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID)
     sr.write_record(r, root=tmp_path)
     record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
     _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
@@ -934,7 +109,7 @@ def test_reap_removes_non_terminal_dead_pid_past_heartbeat_ttl(tmp_path: Path) -
 
 
 def test_reap_keeps_non_terminal_live_pid_regardless_of_age(tmp_path: Path) -> None:
-    r = _make_record(status=sr.Status.RUNNING, launcher_pid=os.getpid())
+    r = make_record(status=sr.Status.RUNNING, launcher_pid=os.getpid())
     sr.write_record(r, root=tmp_path)
     record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
     _set_mtime(record_path, _NOW, timedelta(days=30))  # past both TTLs
@@ -946,7 +121,7 @@ def test_reap_keeps_non_terminal_live_pid_regardless_of_age(tmp_path: Path) -> N
 
 
 def test_reap_keeps_non_terminal_dead_pid_within_heartbeat_ttl(tmp_path: Path) -> None:
-    r = _make_record(status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID)
+    r = make_record(status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID)
     sr.write_record(r, root=tmp_path)
     record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
     _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1))
@@ -958,7 +133,7 @@ def test_reap_keeps_non_terminal_dead_pid_within_heartbeat_ttl(tmp_path: Path) -
 
 
 def test_reap_removes_corrupt_body_past_heartbeat_ttl(tmp_path: Path) -> None:
-    r = _make_record(status=sr.Status.LAUNCHING, launcher_pid=os.getpid())
+    r = make_record(status=sr.Status.LAUNCHING, launcher_pid=os.getpid())
     sr.write_record(r, root=tmp_path)
     record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
     record_path.write_text('{not valid json')
@@ -974,7 +149,7 @@ def test_reap_removes_corrupt_body_past_heartbeat_ttl(tmp_path: Path) -> None:
 
 def test_reap_removes_missing_body_past_heartbeat_ttl(tmp_path: Path) -> None:
     """A slug dir with no record.json at all is still reaped by path identity."""
-    r = _make_record(status=sr.Status.LAUNCHING, launcher_pid=os.getpid())
+    r = make_record(status=sr.Status.LAUNCHING, launcher_pid=os.getpid())
     sr.write_record(r, root=tmp_path)
     record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
     record_path.unlink()
@@ -993,16 +168,16 @@ def test_reap_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
     a kept/terminal_ttl/stale_pid/corrupt mix in a single sessions dir reaps
     exactly the expected subset in one call and leaves survivors untouched.
     """
-    kept_running = _make_record(
+    kept_running = make_record(
         session_slug='kept-running', status=sr.Status.RUNNING, launcher_pid=os.getpid()
     )
-    kept_recent_terminal = _make_record(
+    kept_recent_terminal = make_record(
         session_slug='kept-recent-terminal', status=sr.Status.EXITED, launcher_pid=os.getpid()
     )
-    reap_terminal = _make_record(
+    reap_terminal = make_record(
         session_slug='reap-terminal', status=sr.Status.EXITED, launcher_pid=os.getpid()
     )
-    reap_stale = _make_record(
+    reap_stale = make_record(
         session_slug='reap-stale-pid', status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID
     )
 
@@ -1059,8 +234,8 @@ def test_reap_continues_sweep_when_one_directory_fails_to_remove(
     ENOTEMPTY race with a concurrent writer) must not abort the sweep -- a
     later stale directory in the same sessions dir is still reaped.
     """
-    poison = _make_record(session_slug='poison', status=sr.Status.EXITED, launcher_pid=os.getpid())
-    victim = _make_record(session_slug='victim', status=sr.Status.EXITED, launcher_pid=os.getpid())
+    poison = make_record(session_slug='poison', status=sr.Status.EXITED, launcher_pid=os.getpid())
+    victim = make_record(session_slug='victim', status=sr.Status.EXITED, launcher_pid=os.getpid())
     for r in (poison, victim):
         sr.write_record(r, root=tmp_path)
         _set_mtime(
@@ -1099,7 +274,7 @@ def test_reap_continues_sweep_when_one_directory_fails_to_remove(
 def test_mark_orphaned_marks_non_terminal_dead_pid_past_heartbeat_ttl(
     status: sr.Status, tmp_path: Path
 ) -> None:
-    r = _make_record(session_slug='orphan-1', status=status, launcher_pid=_DEAD_PID, exit_code=None)
+    r = make_record(session_slug='orphan-1', status=status, launcher_pid=_DEAD_PID, exit_code=None)
     sr.write_record(r, root=tmp_path)
     record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
     _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL + timedelta(minutes=1))
@@ -1115,7 +290,7 @@ def test_mark_orphaned_marks_non_terminal_dead_pid_past_heartbeat_ttl(
 
 
 def test_mark_orphaned_keeps_non_terminal_live_pid_regardless_of_age(tmp_path: Path) -> None:
-    r = _make_record(session_slug='kept-live', status=sr.Status.RUNNING, launcher_pid=os.getpid())
+    r = make_record(session_slug='kept-live', status=sr.Status.RUNNING, launcher_pid=os.getpid())
     sr.write_record(r, root=tmp_path)
     record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
     _set_mtime(record_path, _NOW, timedelta(days=30))  # past both TTLs
@@ -1127,7 +302,7 @@ def test_mark_orphaned_keeps_non_terminal_live_pid_regardless_of_age(tmp_path: P
 
 
 def test_mark_orphaned_keeps_non_terminal_dead_pid_within_heartbeat_ttl(tmp_path: Path) -> None:
-    r = _make_record(session_slug='kept-recent', status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID)
+    r = make_record(session_slug='kept-recent', status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID)
     sr.write_record(r, root=tmp_path)
     record_path = sr.record_path_for_slug(r.session_slug, root=tmp_path)
     _set_mtime(record_path, _NOW, sr.NON_TERMINAL_HEARTBEAT_TTL - timedelta(minutes=1))
@@ -1139,7 +314,7 @@ def test_mark_orphaned_keeps_non_terminal_dead_pid_within_heartbeat_ttl(tmp_path
 
 
 def test_mark_orphaned_leaves_already_terminal_record_untouched(tmp_path: Path) -> None:
-    r = _make_record(
+    r = make_record(
         session_slug='already-exited', status=sr.Status.EXITED, exit_code=0, launcher_pid=_DEAD_PID
     )
     sr.write_record(r, root=tmp_path)
@@ -1155,7 +330,7 @@ def test_mark_orphaned_leaves_already_terminal_record_untouched(tmp_path: Path) 
 
 
 def test_mark_orphaned_preserves_all_other_fields(tmp_path: Path) -> None:
-    r = _make_record(
+    r = make_record(
         session_slug='orphan-fields',
         status=sr.Status.RUNNING,
         launcher_pid=_DEAD_PID,
@@ -1183,16 +358,16 @@ def test_mark_orphaned_preserves_all_other_fields(tmp_path: Path) -> None:
 
 
 def test_mark_orphaned_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
-    marked_orphan = _make_record(
+    marked_orphan = make_record(
         session_slug='will-be-marked', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID
     )
-    kept_live = _make_record(
+    kept_live = make_record(
         session_slug='kept-live-mix', status=sr.Status.RUNNING, launcher_pid=os.getpid()
     )
-    kept_recent = _make_record(
+    kept_recent = make_record(
         session_slug='kept-recent-mix', status=sr.Status.LAUNCHING, launcher_pid=_DEAD_PID
     )
-    kept_terminal = _make_record(
+    kept_terminal = make_record(
         session_slug='kept-terminal-mix',
         status=sr.Status.EXITED,
         exit_code=0,
@@ -1254,7 +429,7 @@ def _launcher_identities() -> dict[str, ProcessIdentity | None]:
 
 def _seed_stale_launchers(root: Path) -> None:
     for slug, identity in _launcher_identities().items():
-        record = _make_record(
+        record = make_record(
             session_slug=slug,
             status=sr.Status.RUNNING,
             launcher_pid=os.getpid(),
@@ -1407,7 +582,7 @@ def test_wmctrl_live_window_ids_titleless_short_line_still_contributes_id() -> N
 
 
 def test_mark_windowless_marks_wm_record_whose_window_id_is_absent(tmp_path: Path) -> None:
-    r = _make_record(
+    r = make_record(
         session_slug='windowless-1',
         status=sr.Status.AWAITING_INPUT,
         display=sr.Display(kind='wm', wm_title='some title', wm_window_id='0x1a'),
@@ -1431,7 +606,7 @@ def test_mark_windowless_keeps_decimal_captured_id_matching_padded_hex_live_wind
 ) -> None:
     # DECIMAL-vs-hex KEEP: '26' (decimal) is the SAME window as the live,
     # zero-padded-hex '0x0000001a' wmctrl reports -- must NOT be reaped.
-    r = _make_record(
+    r = make_record(
         session_slug='decimal-kept',
         status=sr.Status.RUNNING,
         display=sr.Display(kind='wm', wm_title='t', wm_window_id='26'),
@@ -1446,7 +621,7 @@ def test_mark_windowless_keeps_decimal_captured_id_matching_padded_hex_live_wind
 
 
 def test_mark_windowless_preserves_all_other_fields(tmp_path: Path) -> None:
-    r = _make_record(
+    r = make_record(
         session_slug='windowless-fields',
         status=sr.Status.IDLE,
         role='unblock',
@@ -1478,7 +653,7 @@ def test_mark_windowless_preserves_all_other_fields(tmp_path: Path) -> None:
 
 
 def test_mark_windowless_fail_soft_when_wmctrl_unavailable(tmp_path: Path) -> None:
-    r = _make_record(
+    r = make_record(
         session_slug='no-wmctrl',
         status=sr.Status.AWAITING_INPUT,
         display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
@@ -1495,7 +670,7 @@ def test_mark_windowless_fail_soft_when_wmctrl_unavailable(tmp_path: Path) -> No
 
 
 def test_mark_windowless_never_touches_tmux_display(tmp_path: Path) -> None:
-    r = _make_record(
+    r = make_record(
         session_slug='tmux-session',
         status=sr.Status.RUNNING,
         display=sr.Display(kind='tmux', wm_title='', wm_window_id=None, tmux_target='fleet-df:2'),
@@ -1510,7 +685,7 @@ def test_mark_windowless_never_touches_tmux_display(tmp_path: Path) -> None:
 
 
 def test_mark_windowless_never_touches_displayless_record(tmp_path: Path) -> None:
-    r = _make_record(session_slug='headless', status=sr.Status.RUNNING, display=None)
+    r = make_record(session_slug='headless', status=sr.Status.RUNNING, display=None)
     sr.write_record(r, root=tmp_path)
     run = _fake_wmctrl_run(['0x99  0 host  unrelated'])
 
@@ -1521,7 +696,7 @@ def test_mark_windowless_never_touches_displayless_record(tmp_path: Path) -> Non
 
 
 def test_mark_windowless_leaves_already_terminal_wm_record_untouched(tmp_path: Path) -> None:
-    r = _make_record(
+    r = make_record(
         session_slug='already-exited-wm',
         status=sr.Status.EXITED,
         exit_code=0,
@@ -1544,7 +719,7 @@ def test_mark_windowless_leaves_already_terminal_wm_record_untouched(tmp_path: P
 def test_mark_windowless_skips_unparseable_or_missing_window_id(
     wm_window_id: str | None, tmp_path: Path
 ) -> None:
-    r = _make_record(
+    r = make_record(
         session_slug='no-id',
         status=sr.Status.RUNNING,
         display=sr.Display(kind='wm', wm_title='t', wm_window_id=wm_window_id),
@@ -1563,7 +738,7 @@ def test_mark_windowless_reaps_regardless_of_live_pid_and_fresh_age(tmp_path: Pa
     launcher_pid liveness or record age -- proving this sweep reaps exactly
     the zombies mark_orphaned_sessions_exited's pid/TTL guards currently keep.
     """
-    r = _make_record(
+    r = make_record(
         session_slug='live-pid-fresh-but-windowless',
         status=sr.Status.AWAITING_INPUT,
         launcher_pid=os.getpid(),  # ALIVE
@@ -1583,23 +758,23 @@ def test_mark_windowless_reaps_regardless_of_live_pid_and_fresh_age(tmp_path: Pa
 
 
 def test_mark_windowless_handles_mixed_population_in_one_sweep(tmp_path: Path) -> None:
-    windowless_wm = _make_record(
+    windowless_wm = make_record(
         session_slug='mix-windowless',
         status=sr.Status.RUNNING,
         display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
     )
-    present_window_wm = _make_record(
+    present_window_wm = make_record(
         session_slug='mix-present',
         status=sr.Status.RUNNING,
         display=sr.Display(kind='wm', wm_title='t2', wm_window_id='0x99'),
     )
-    tmux_session = _make_record(
+    tmux_session = make_record(
         session_slug='mix-tmux',
         status=sr.Status.RUNNING,
         display=sr.Display(kind='tmux', wm_title='', wm_window_id=None, tmux_target='fleet-df:2'),
     )
-    headless = _make_record(session_slug='mix-headless', status=sr.Status.RUNNING, display=None)
-    terminal_wm = _make_record(
+    headless = make_record(session_slug='mix-headless', status=sr.Status.RUNNING, display=None)
+    terminal_wm = make_record(
         session_slug='mix-terminal',
         status=sr.Status.EXITED,
         exit_code=0,
@@ -1649,7 +824,7 @@ def test_mark_windowless_keeps_a_window_that_appears_after_the_first_probe(
 ) -> None:
     def _set_display_lands() -> None:
         sr.write_record(
-            _make_record(
+            make_record(
                 session_slug='late-window',
                 status=sr.Status.RUNNING,
                 display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
@@ -1671,7 +846,7 @@ def test_mark_windowless_keeps_a_window_that_appears_after_the_first_probe(
 
 def test_mark_windowless_marks_nothing_when_the_confirming_probe_fails(tmp_path: Path) -> None:
     sr.write_record(
-        _make_record(
+        make_record(
             session_slug='unconfirmed',
             status=sr.Status.RUNNING,
             display=sr.Display(kind='wm', wm_title='t', wm_window_id='0x1a'),
@@ -1693,7 +868,7 @@ def test_mark_windowless_leaves_a_record_rebound_to_a_live_window_after_the_pass
 ) -> None:
     def _write_wm_record(window_id: str) -> None:
         sr.write_record(
-            _make_record(
+            make_record(
                 session_slug='rebound',
                 status=sr.Status.RUNNING,
                 display=sr.Display(kind='wm', wm_title='t', wm_window_id=window_id),
@@ -2111,7 +1286,7 @@ def test_launching_returns_while_a_reap_holds_the_lock_and_its_detached_reap_dra
     stdout or stderr would keep ``run`` from returning: either way it times out.
     """
     sr.write_record(
-        _make_record(
+        make_record(
             session_slug='orphan-o', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID, display=None
         ),
         root=tmp_path,
@@ -2218,7 +1393,7 @@ def test_main_reap_marks_then_deletes(
     # A fresh stale orphan: non-terminal, dead pid, past the heartbeat TTL --
     # this pass must MARK it exited (its mtime is bumped by the mark, so it
     # is not also independently terminal_ttl-stale in this SAME pass).
-    fresh_orphan = _make_record(
+    fresh_orphan = make_record(
         session_slug='fresh-orphan', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID
     )
     sr.write_record(fresh_orphan, root=tmp_path)
@@ -2230,7 +1405,7 @@ def test_main_reap_marks_then_deletes(
 
     # A separately-aged terminal record, well past TERMINAL_TTL -- this pass
     # must DELETE it (reason='terminal_ttl'), unchanged from today.
-    old_terminal = _make_record(
+    old_terminal = make_record(
         session_slug='old-terminal', status=sr.Status.EXITED, exit_code=0, launcher_pid=os.getpid()
     )
     sr.write_record(old_terminal, root=tmp_path)
@@ -2254,7 +1429,7 @@ def test_main_reap_marks_then_deletes(
 
 def _write_aged_exited(slug: str, root: Path) -> None:
     sr.write_record(
-        _make_record(session_slug=slug, status=sr.Status.EXITED, exit_code=0), root=root
+        make_record(session_slug=slug, status=sr.Status.EXITED, exit_code=0), root=root
     )
     _set_mtime(
         sr.record_path_for_slug(slug, root=root),
@@ -2273,7 +1448,7 @@ def test_main_reap_drains_every_eligible_record_in_one_call(
     for slug in aged_slugs:
         _write_aged_exited(slug, tmp_path)
     sr.write_record(
-        _make_record(session_slug='drain-orphan', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID),
+        make_record(session_slug='drain-orphan', status=sr.Status.RUNNING, launcher_pid=_DEAD_PID),
         root=tmp_path,
     )
     _set_mtime(
@@ -2394,7 +1569,7 @@ def test_main_reap_marks_windowless_wm_session_before_deleting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-    windowless = _make_record(
+    windowless = make_record(
         session_slug='reap-windowless',
         status=sr.Status.AWAITING_INPUT,
         launcher_pid=os.getpid(),  # ALIVE -- the pid/TTL sweep alone would never catch this
@@ -3679,7 +2854,7 @@ class TestLeaseSlugIsNotASessionRecordKey:
         # A well-formed record IS written for this notional session, under the
         # slug the registry actually keys on...
         record_slug = self._record_slug()
-        sr.write_record(_make_record(session_slug=record_slug), root=tmp_path)
+        sr.write_record(make_record(session_slug=record_slug), root=tmp_path)
         assert sr.read_record(record_slug, root=tmp_path).session_slug == record_slug
 
         # ...and read_record(<lease slug>) STILL raises FileNotFoundError. That
@@ -3693,7 +2868,7 @@ class TestLeaseSlugIsNotASessionRecordKey:
         pid = 1894895
         record_slug = self._record_slug()
         sr.write_record(
-            _make_record(session_slug=record_slug, claude_owner_pid=pid), root=tmp_path
+            make_record(session_slug=record_slug, claude_owner_pid=pid), root=tmp_path
         )
         sr.write_session_pointer(pid, record_slug, root=tmp_path)
 
@@ -4577,20 +3752,6 @@ def test_project_token_aliases_maps_folded_to_folded() -> None:
         assert fold_project_token(canonical) == canonical
 
 
-def test_write_record_creates_missing_nested_dir_and_round_trips(tmp_path):
-    """End-to-end: write_record into a non-existent nested root still works."""
-    root = tmp_path / 'does' / 'not' / 'exist'
-    assert not root.exists()
-
-    record = _make_record(session_slug='sess-3223', task_id='3223')
-    sr.write_record(record, root=root)
-
-    loaded = sr.read_record('sess-3223', root=root)
-    assert loaded is not None
-    assert loaded.session_slug == 'sess-3223'
-    assert loaded.task_id == '3223'
-
-
 #: Repo root of this worktree, resolved from THIS FILE so the subprocess
 #: contract test below is CWD-independent (the suite is run from
 #: ``<worktree>/orchestrator``, but a scratch-CWD run must behave identically).
@@ -4801,6 +3962,24 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
         ),
     ),
     _BareShellEntrypoint(
+        name='session_records.py (tier-1: bare shell, NO PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_records.py',
+        pythonpath=(),
+        shape=_EntrypointShape.SCRIPT,
+        argv=(),
+        probe='from orchestrator import stop_instruction',
+        callers=(
+            'session_registry.py imports this module at module scope as a bare '
+            'sibling when skills/spawn/spawn-claude.sh and the SKILL.md verb lines '
+            'run session_registry.py by absolute path with no venv, no install and '
+            'no PYTHONPATH; tests/scripts/review_all_program_fixture.py::'
+            'load_session_records loads it by path under a foreign module name; and '
+            'session_hooks, spawn_t3_lane, the cockpit and the scripts import '
+            'orchestrator.session_records. A non-stdlib import here breaks every '
+            'registry verb, and with it every record write a spawn makes.'
+        ),
+    ),
+    _BareShellEntrypoint(
         name='session_hooks.py (tier-2: bare shell + PYTHONPATH)',
         path=_SR_PKG_ROOT / 'orchestrator' / 'session_hooks.py',
         # A THIRD distinct shape: script-by-absolute-path WITH PYTHONPATH. Not
@@ -4932,6 +4111,8 @@ _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
     ('decision_cli.py', 'from orchestrator import stop_instruction'),
     ('session_identity.py', 'import pydantic'),
     ('session_identity.py', 'from orchestrator import stop_instruction'),
+    ('session_records.py', 'import pydantic'),
+    ('session_records.py', 'from orchestrator import stop_instruction'),
 )
 
 
@@ -5166,12 +4347,13 @@ def _first_bare_importable_sibling(probes: _BareShellProbes) -> str | None:
 
 #: The line a payload is injected after, per entrypoint; any other entrypoint
 #: uses ``from __future__ import annotations``.  session_registry's,
-#: decision_registry's and decision_cli's payloads go after their last shared
-#: import, so each is judged with the module's own shared/src bootstrap already
-#: applied: that is the environment a later module-scope import in that file
-#: really runs in.
+#: session_records', decision_registry's and decision_cli's payloads go after
+#: their last shared import, so each is judged with the module's own shared/src
+#: bootstrap already applied: that is the environment a later module-scope
+#: import in that file really runs in.
 _INJECTION_ANCHORS: dict[str, str] = {
     'session_registry.py': 'from shared.session_liveness import ',
+    'session_records.py': 'from shared.process_identity import ',
     'decision_registry.py': 'from shared.project_id import ',
     'decision_cli.py': 'from shared.project_id import ',
 }
@@ -5278,7 +4460,8 @@ class TestStdlibOnlySelfContainment:
 
     (a) bare-shell executability — ``session_registry``, ``fleet_files``,
         ``decision_registry``, ``decision_cli``, ``session_identity``,
-        ``session_hooks``, ``session_ownership_probes``, ``session_self_exit``;
+        ``session_records``, ``session_hooks``, ``session_ownership_probes``,
+        ``session_self_exit``;
     (b) layering / cycle avoidance — ``routing``, ``stop_instruction``,
         ``fm_retry``, ``agents/triage``, ``fused_memory/config``/``schema``,
         where importing an intra-package sibling is perfectly fine;
@@ -5447,8 +4630,8 @@ class TestStdlibOnlySelfContainment:
     def test_the_extracted_modules_import_only_downward(self):
         """Each module extracted from session_registry imports only below it, never session_registry.
 
-        fleet_files <- decision_registry <- decision_cli, and session_identity
-        is a leaf.
+        fleet_files <- decision_registry <- decision_cli; session_identity is a
+        leaf; and fleet_files, session_identity <- session_records.
 
         Under tier-1 session_registry is ``__main__``, so a module below it
         that imported it back would silently load a second copy rather than
@@ -5485,11 +4668,12 @@ class TestStdlibOnlySelfContainment:
             'decision_registry': {'fleet_files'},
             'decision_cli': {'decision_registry'},
             'session_identity': set(),
+            'session_records': {'fleet_files', 'session_identity'},
         }
 
         assert {module: sibling_imports(module) for module in expected} == expected
 
-    @pytest.mark.parametrize('extracted', ['session_identity'])
+    @pytest.mark.parametrize('extracted', ['session_identity', 'session_records'])
     def test_no_extracted_name_is_re_exported_from_session_registry(self, extracted):
         """A name moved out of session_registry no longer resolves through it.
 
@@ -5514,22 +4698,41 @@ class TestStdlibOnlySelfContainment:
         assert bound
         assert sorted(name for name in bound if getattr(sr, name, absent) is getattr(module, name)) == []
 
-    def test_loads_by_path_under_a_foreign_dotless_module_name(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ('filename', 'siblings', 'module_siblings'),
+        [
+            pytest.param(
+                'session_registry.py',
+                ('decision_cli', 'decision_registry', 'fleet_files', 'session_identity', 'session_records'),
+                ('decision_cli', 'session_identity', 'session_records'),
+                id='session_registry',
+            ),
+            pytest.param(
+                'session_records.py',
+                ('fleet_files', 'session_identity'),
+                ('session_identity',),
+                id='session_records',
+            ),
+        ],
+    )
+    def test_loads_by_path_under_a_foreign_dotless_module_name(
+        self, monkeypatch, filename, siblings, module_siblings
+    ):
         """The third load mode: by path, under a module name outside the package.
 
-        tests/scripts/review_all_program_fixture.py::load_session_registry loads
-        this checkout's session_registry.py with ``spec_from_file_location``
+        tests/scripts/review_all_program_fixture.py::load_session_records loads
+        this checkout's session_records.py with ``spec_from_file_location``
         under a dotless name, without putting its directory on ``sys.path``, so
-        that a suite takes the registry from this checkout rather than from
-        whichever ``orchestrator`` the venv resolves. There ``__package__`` is
-        ``''``, so no relative sibling import resolves. The siblings must come
-        from this file's own directory too, and that directory must not be left
-        on the importer's ``sys.path``.
+        that a suite takes the record schema from this checkout rather than from
+        whichever ``orchestrator`` the venv resolves; session_registry.py must
+        load the same way. There ``__package__`` is ``''``, so no relative
+        sibling import resolves. The siblings must come from the file's own
+        directory too, and that directory must not be left on the importer's
+        ``sys.path``.
         """
         name = 'sr_foreign_dotless_load_probe'
-        path = _SR_PKG_ROOT / 'orchestrator' / 'session_registry.py'
+        path = _SR_PKG_ROOT / 'orchestrator' / filename
         assert str(path.parent) not in sys.path
-        siblings = ('decision_cli', 'decision_registry', 'fleet_files', 'session_identity')
         assert not any(sibling in sys.modules for sibling in siblings)
         spec = importlib.util.spec_from_file_location(name, path)
         assert spec is not None and spec.loader is not None
@@ -5545,8 +4748,9 @@ class TestStdlibOnlySelfContainment:
             assert {sibling: Path(sys.modules[sibling].__file__ or '') for sibling in siblings} == {
                 sibling: path.parent / f'{sibling}.py' for sibling in siblings
             }
-            assert module.decision_cli is sys.modules['decision_cli']
-            assert module.session_identity is sys.modules['session_identity']
+            assert {sibling: getattr(module, sibling) for sibling in module_siblings} == {
+                sibling: sys.modules[sibling] for sibling in module_siblings
+            }
             assert module.fleet_root is sys.modules['fleet_files'].fleet_root
         finally:
             for sibling in siblings:
@@ -5731,7 +4935,7 @@ _SID = '0b6a3c1e-1111-4222-8333-444455556666'
 
 
 def _bound_record(tmp_path: Path, slug: str, session_id: str | None) -> sr.SessionRecord:
-    record = _make_record(session_slug=slug, claude_session_id=session_id)
+    record = make_record(session_slug=slug, claude_session_id=session_id)
     sr.write_record(record, root=tmp_path)
     return record
 
@@ -5802,7 +5006,7 @@ def _t3_record(
     pointer: bool = False,
 ) -> None:
     sr.write_record(
-        _make_record(
+        make_record(
             session_slug=slug,
             status=status,
             cwd=cwd,
@@ -6209,27 +5413,10 @@ class TestT3RecordsAreExemptFromPidSweeps:
 
 
 def test_mark_session_folded_stamps_the_fold_code_once(tmp_path: Path) -> None:
-    sr.write_record(_make_record(session_slug='hand', status=sr.Status.RUNNING), root=tmp_path)
+    sr.write_record(make_record(session_slug='hand', status=sr.Status.RUNNING), root=tmp_path)
 
     folded = sr.mark_session_folded('hand', root=tmp_path)
 
     assert folded is not None
     assert (folded.status, folded.exit_code) == (sr.Status.EXITED, sr.FOLDED_EXIT_CODE)
     assert sr.mark_session_folded('hand', root=tmp_path) is None
-
-
-def test_is_t3_record_reads_the_display_kind() -> None:
-    t3 = _make_record(display=sr.Display(kind=sr.DisplayKind.T3.value, t3_thread_id='th-1'))
-
-    assert sr.is_t3_record(t3)
-    assert not sr.is_t3_record(_make_record())
-    assert not sr.is_t3_record(_make_record(display=None))
-
-
-def test_pid_alive_is_the_public_liveness_probe() -> None:
-    assert sr.pid_alive(os.getpid())
-    assert not sr.pid_alive(_DEAD_PID)
-    assert not sr.pid_alive(0)
-    assert not sr.pid_alive(True)
-    assert not sr.pid_alive(None)
-    assert sr.pid_alive is proc_liveness.pid_alive
