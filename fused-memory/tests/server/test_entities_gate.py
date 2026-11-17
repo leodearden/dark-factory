@@ -407,6 +407,34 @@ class TestHonestMixedDeclarationsAreAccepted:
         assert block['conflicts'] == ['Task 3129'], f'{block!r}'
 
 
+class TestProseColonNumberIsNotAForeignRef:
+    """Prose 'word: N' names no project, so declaring N beside it is honest
+    (task 6826); a tight 'project:N' still contests the declared number."""
+
+    @pytest.mark.parametrize(
+        'content,declared',
+        [
+            pytest.param('Follow-ups: 6035', 6035, id='sighting-follow-ups'),
+            pytest.param('Related owners: 5308', 5308, id='sighting-owners'),
+            pytest.param('Task 6183 at the time: 394 linked records', 394, id='sighting-time'),
+            pytest.param('matched the live plan exactly: 15+4 detaches', 15, id='sighting-exactly'),
+        ],
+    )
+    def test_the_live_sighting_is_accepted(self, content, declared):
+        assert entities_gate(
+            [{'kind': 'task', 'id': declared}], content=content, group_id=GROUP,
+        ) is None
+
+    def test_a_tight_foreign_ref_still_conflicts(self):
+        block = entities_gate(
+            [{'kind': 'task', 'id': 2500}], content='blocked on reify:2500', group_id=GROUP,
+        )
+
+        assert isinstance(block, dict), f'the tight foreign ref was not caught: {block!r}'
+        assert block['error_type'] == 'DeclaredReferentConflictRejected', f'{block!r}'
+        assert block['conflicts'] == ['Task 2500'], f'{block!r}'
+
+
 class TestADiscardedDeclarationIsShapeCheckedOnly:
     """A declaration the write will not record can buy no attribution, so it
     is never conflict-rejected; a malformed one is still a wiring bug."""

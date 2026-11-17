@@ -68,8 +68,6 @@ class TestFindCrossProjectTaskRefsMatches:
             # Qualifier canonicalization: hyphens -> underscores, lowercased.
             ('see Dark-Factory:2500 for context', 'dark_factory', '2500'),
             ('see DARK_FACTORY:2500 for context', 'dark_factory', '2500'),
-            # Tolerant of whitespace around the separator.
-            ('see dark_factory : 2500 for context', 'dark_factory', '2500'),
             # Start of content, and end of content with no trailing punctuation.
             ('dark_factory:2500 is the upstream', 'dark_factory', '2500'),
             ('the upstream is dark_factory:2500', 'dark_factory', '2500'),
@@ -317,17 +315,14 @@ class TestTaskColonMentionsCreateAmbiguity:
         assert scan.ambiguous == ()
 
 
-class TestShapeValidProseMatchesRelyOnDownstreamGuards:
-    """Prose that happens to have the '<word>: <number>' shape DOES match — the
-    scanner is deliberately whitespace-tolerant, because that is how humans
-    write a qualified reference. Precision for these comes from the consumer's
-    decisive guard: it splits only when the episode ALSO touched a node named
-    'Task N', which a stray 'Total: 42' essentially never coincides with (and,
-    when a known-projects registry is wired, from the allowlist as well)."""
+class TestProseColonNumberIsNotARef:
+    """Prose with the '<word>: <number>' shape is not a ref: a qualified ref is
+    written tight, 'proj:N', so a blank beside the colon refuses the match
+    without help from any registry (task 6826)."""
 
-    def test_prose_colon_number_matches_shape_only(self):
+    def test_prose_colon_number_is_not_a_ref(self):
         scan = find_cross_project_task_refs('Total: 42 items', group_id='reify')
-        assert [r.entity_name for r in scan.refs] == ['total:42']
+        assert scan.refs == ()
 
     def test_allowlist_removes_the_prose_match(self):
         scan = find_cross_project_task_refs(
@@ -337,20 +332,16 @@ class TestShapeValidProseMatchesRelyOnDownstreamGuards:
 
 
 class TestQualifiedRefNeverSpansALineBreak:
-    """Whitespace-tolerant does NOT extend across a line break. The class above
-    accepts the '<word>: <number>' shape on ONE line because that is how humans
-    write a qualified reference; a qualifier and a number separated by a
-    newline is not that shape at all — it is a YAML/'key: value' block or
-    hard-wrapped prose, both routine in episode bodies."""
+    """A qualifier and a number separated by a newline is not a qualified ref
+    either: it is a YAML/'key: value' block or hard-wrapped prose, both routine
+    in episode bodies. A qualified ref is the tight 'proj:N' on one line."""
 
     def test_colon_followed_by_newline_is_not_a_ref(self):
         scan = find_cross_project_task_refs('Notes:\n2500 items', group_id='reify')
         assert scan.refs == ()
 
-    def test_the_same_line_spelling_is_unaffected(self):
-        """Guard: the narrowing is across newlines ONLY, not a tightening of the
-        spacing humans write."""
-        scan = find_cross_project_task_refs('Notes: 2500 items', group_id='reify')
+    def test_the_tight_same_line_spelling_is_unaffected(self):
+        scan = find_cross_project_task_refs('notes:2500 items', group_id='reify')
         assert [r.entity_name for r in scan.refs] == ['notes:2500']
 
 

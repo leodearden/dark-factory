@@ -110,7 +110,7 @@ class TestRegistry:
 
     def test_without_a_registry_the_own_project_still_qualifies(self):
         bindings = bind_tasks(
-            [_note('n1', 'see dark_factory: 12')], project_id=PROJECT, known_projects={},
+            [_note('n1', 'see dark_factory:12')], project_id=PROJECT, known_projects={},
         )
         assert _refs(bindings) == [_local('12')]
 
