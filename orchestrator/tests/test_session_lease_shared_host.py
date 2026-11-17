@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator import session_identity
+from orchestrator import session_identity, session_records
 from orchestrator import session_registry as sr
 
 pytestmark = pytest.mark.skipif(
@@ -100,17 +100,17 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
 
 def _seed_sibling_record(tmp_path: Path, host: int) -> None:
     """Point the host pid's sessions-by-pid entry at a record the host owns."""
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug='sibling-hosted-record',
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             claude_session_id='claude-session-uuid',
             claude_owner_pid=host,
         ),
         root=tmp_path,
     )
-    sr.write_session_pointer(host, 'sibling-hosted-record', root=tmp_path)
-    assert sr.resolve_session_slug_for_pid(host, root=tmp_path) == 'sibling-hosted-record'
+    session_records.write_session_pointer(host, 'sibling-hosted-record', root=tmp_path)
+    assert session_records.resolve_session_slug_for_pid(host, root=tmp_path) == 'sibling-hosted-record'
 
 
 # --- resolution layer --------------------------------------------------------

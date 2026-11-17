@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest  # pyright: ignore[reportMissingImports]
 
 from orchestrator import session_hooks as sh
+from orchestrator import session_records
 from orchestrator import session_registry as sr
 
 _SPAWN_ENV_VARS = (
@@ -162,9 +163,9 @@ def test_launching_names_the_record_for_the_main_checkout(
     rc = sr.main(['launching'])
 
     assert rc == 0
-    slug = sr.build_session_slug('session', 'acme', None, 4242)
+    slug = session_records.build_session_slug('session', 'acme', None, 4242)
     assert Path(capsys.readouterr().out.strip()).name == slug
-    assert sr.read_record(slug, root=fleet).project == 'acme'
+    assert session_records.read_record(slug, root=fleet).project == 'acme'
 
 
 def test_hand_launched_hooks_converge_on_one_record_named_for_the_repo(acme: Path, tmp_path: Path) -> None:
@@ -175,8 +176,8 @@ def test_hand_launched_hooks_converge_on_one_record_named_for_the_repo(acme: Pat
     sh.run_session_start({'session_id': 'sess-5181', 'cwd': str(start_cwd)}, env={}, root=fleet)
     sh.run_stop({'session_id': 'sess-5181', 'cwd': str(stop_cwd)}, env={}, root=fleet)
 
-    slug = sr.build_session_slug('session', 'acme', None, 'sess-5181')  # type: ignore[arg-type]
-    assert [entry.name for entry in sr.sessions_dir(fleet).iterdir()] == [slug]
-    record = sr.read_record(slug, root=fleet)
+    slug = session_records.build_session_slug('session', 'acme', None, 'sess-5181')  # type: ignore[arg-type]
+    assert [entry.name for entry in session_records.sessions_dir(fleet).iterdir()] == [slug]
+    record = session_records.read_record(slug, root=fleet)
     assert record.project == 'acme'
-    assert record.status == sr.Status.IDLE
+    assert record.status == session_records.Status.IDLE

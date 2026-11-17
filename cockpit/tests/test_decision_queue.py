@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from typing import cast
 
 from orchestrator import decision_registry as dr
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 
 from cockpit.panes.decision_queue import QueueItem, _QueueRowLike
 
@@ -79,7 +79,7 @@ def _make_session(**overrides):
     """Mirrors test_app.py/test_registry_reader.py's _make_record convention."""
     fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
-        'status': sr.Status.RUNNING,
+        'status': session_records.Status.RUNNING,
         'title': 'unblock:df#2085 slug',
         'role': 'unblock',
         'project': 'df',
@@ -87,7 +87,7 @@ def _make_session(**overrides):
         'start_ts': '2026-07-07T00:00:00+00:00',
     }
     fields.update(overrides)
-    return sr.SessionRecord(**fields)
+    return session_records.SessionRecord(**fields)
 
 
 class TestScoringAdapters:
@@ -154,9 +154,9 @@ class TestScoringAdapters:
         from cockpit.panes.decision_queue import session_to_scoring_item
 
         session = _make_session(
-            status=sr.Status.AWAITING_INPUT,
+            status=session_records.Status.AWAITING_INPUT,
             project='df',
-            question=sr.Question(text='Which port?', asked_at='2026-07-05T00:00:00+00:00'),
+            question=session_records.Question(text='Which port?', asked_at='2026-07-05T00:00:00+00:00'),
         )
 
         item = session_to_scoring_item(session, now=_NOW)
@@ -172,7 +172,7 @@ class TestScoringAdapters:
         from cockpit.panes.decision_queue import session_to_scoring_item
 
         session = _make_session(
-            status=sr.Status.AWAITING_INPUT,
+            status=session_records.Status.AWAITING_INPUT,
             question=None,
             start_ts='2026-07-03T00:00:00+00:00',
         )
@@ -184,7 +184,7 @@ class TestScoringAdapters:
     def test_session_to_scoring_item_empty_start_ts_degrades_to_now(self):
         from cockpit.panes.decision_queue import session_to_scoring_item
 
-        session = _make_session(status=sr.Status.AWAITING_INPUT, question=None, start_ts='')
+        session = _make_session(status=session_records.Status.AWAITING_INPUT, question=None, start_ts='')
 
         item = session_to_scoring_item(session, now=_NOW)
 
@@ -194,7 +194,7 @@ class TestScoringAdapters:
         from cockpit.panes.decision_queue import session_to_scoring_item
 
         session = _make_session(
-            status=sr.Status.AWAITING_INPUT, question=None, start_ts='not-a-timestamp'
+            status=session_records.Status.AWAITING_INPUT, question=None, start_ts='not-a-timestamp'
         )
 
         item = session_to_scoring_item(session, now=_NOW)
@@ -603,8 +603,8 @@ class TestOrderQueue:
         open_decision = _make_decision(id='dec-open', state=dr.DecisionState.OPEN)
         dropped_decision = _make_decision(id='dec-dropped', state=dr.DecisionState.DROPPED)
         answered_decision = _make_decision(id='dec-answered', state=dr.DecisionState.ANSWERED)
-        awaiting_session = _make_session(session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT)
-        running_session = _make_session(session_slug='running-1', status=sr.Status.RUNNING)
+        awaiting_session = _make_session(session_slug='awaiting-1', status=session_records.Status.AWAITING_INPUT)
+        running_session = _make_session(session_slug='running-1', status=session_records.Status.RUNNING)
 
         items = order_queue(
             [open_decision, dropped_decision, answered_decision],
@@ -648,7 +648,7 @@ class TestOrderQueue:
             _make_decision(id='dec-a', manual_boost=1),
             _make_decision(id='dec-b', manual_boost=3),
         ]
-        sessions = [_make_session(session_slug='s-1', status=sr.Status.AWAITING_INPUT)]
+        sessions = [_make_session(session_slug='s-1', status=session_records.Status.AWAITING_INPUT)]
 
         first = order_queue(decisions, sessions, Priorities.default(), _NOW)
         second = order_queue(decisions, sessions, Priorities.default(), _NOW)
@@ -661,9 +661,9 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        display = sr.Display(kind='wm', wm_title='unblock:df#2085 slug')
+        display = session_records.Display(kind='wm', wm_title='unblock:df#2085 slug')
         session = _make_session(
-            session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT, display=display
+            session_slug='awaiting-1', status=session_records.Status.AWAITING_INPUT, display=display
         )
 
         items = order_queue([], [session], Priorities.default(), _NOW)
@@ -676,9 +676,9 @@ class TestOrderQueue:
         from cockpit.panes.decision_queue import order_queue
         from cockpit.priority import Priorities
 
-        display = sr.Display(kind='tmux', tmux_target='fleet-df:3')
+        display = session_records.Display(kind='tmux', tmux_target='fleet-df:3')
         linked_session = _make_session(
-            session_slug='linked-1', status=sr.Status.RUNNING, display=display
+            session_slug='linked-1', status=session_records.Status.RUNNING, display=display
         )
         decision = _make_decision(session_id='linked-1', state=dr.DecisionState.OPEN)
 
@@ -757,7 +757,7 @@ class TestOrderQueue:
             id='dec-2', state=dr.DecisionState.OPEN, escalation_id=None
         )
         session = _make_session(
-            session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT, escalation_id='esc-7'
+            session_slug='awaiting-1', status=session_records.Status.AWAITING_INPUT, escalation_id='esc-7'
         )
 
         items = order_queue(
@@ -784,7 +784,7 @@ class TestOrderQueue:
         )
         stale_session = _make_session(
             session_slug='stale-1',
-            status=sr.Status.AWAITING_INPUT,
+            status=session_records.Status.AWAITING_INPUT,
             question=None,
             start_ts=(_NOW - timedelta(days=8)).isoformat(),
         )
@@ -808,7 +808,7 @@ class TestOrderQueue:
         )
         stale_session = _make_session(
             session_slug='stale-1',
-            status=sr.Status.AWAITING_INPUT,
+            status=session_records.Status.AWAITING_INPUT,
             question=None,
             start_ts=(_NOW - timedelta(days=8)).isoformat(),
         )
@@ -886,7 +886,7 @@ class TestQueueItemSessionSlug:
         from cockpit.priority import Priorities
 
         decision = _make_decision(id='dec-1', state=dr.DecisionState.OPEN)
-        sessions = [_make_session(session_slug='awaiting-1', status=sr.Status.AWAITING_INPUT)]
+        sessions = [_make_session(session_slug='awaiting-1', status=session_records.Status.AWAITING_INPUT)]
 
         items = order_queue([decision], sessions, Priorities.default(), _NOW)
 
@@ -905,11 +905,11 @@ class TestResolveTargetLinksThroughRecordSlug:
     _WATCHER_SLUG = 'session-dark-factory-sess-watcher'
     _LEASE_TOKEN = 'watcher-df-1348600'
 
-    def _sessions(self, *sessions: sr.SessionRecord) -> dict[str, sr.SessionRecord]:
+    def _sessions(self, *sessions: session_records.SessionRecord) -> dict[str, session_records.SessionRecord]:
         return {session.session_slug: session for session in sessions}
 
-    def _watcher(self, **overrides) -> sr.SessionRecord:
-        display = sr.Display(kind='wm', wm_title='escalation-watcher df')
+    def _watcher(self, **overrides) -> session_records.SessionRecord:
+        display = session_records.Display(kind='wm', wm_title='escalation-watcher df')
         return _make_session(
             **{'session_slug': self._WATCHER_SLUG, 'display': display, **overrides}
         )
@@ -930,7 +930,7 @@ class TestResolveTargetLinksThroughRecordSlug:
 
         other = _make_session(
             session_slug='other-session',
-            display=sr.Display(kind='tmux', tmux_target='fleet-df:9'),
+            display=session_records.Display(kind='tmux', tmux_target='fleet-df:9'),
         )
         decision = _make_decision(session_id='other-session', record_slug=self._WATCHER_SLUG)
 

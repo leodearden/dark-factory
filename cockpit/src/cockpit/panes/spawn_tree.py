@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from orchestrator.session_registry import TERMINAL_STATUSES, SessionRecord, Status
+from orchestrator.session_records import TERMINAL_STATUSES, SessionRecord, Status
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import ModalScreen

@@ -7,7 +7,7 @@ The detector cross-checks fleet session-registry records
 spawn-launched interactive session produced no plausibly-matching
 transcript (the "session ran, no transcript" regression).
 
-Every test injects a tmp ``fleet_root`` (so ``session_registry`` never
+Every test injects a tmp ``fleet_root`` (so ``session_records`` never
 touches the real ``~/.claude`` tree), a tmp ``projects_root``, a FIXED
 ``now``, a written fixture ``legibility.yaml``, and a fake ``poster`` — no
 real ``~/.claude`` and no live escalation server. Every preventer-guard test
@@ -26,7 +26,7 @@ import pytest
 from legibility import check_transcript_persistence as mod
 from legibility.config import load_config
 
-from orchestrator import session_registry
+from orchestrator import session_records
 
 SCRIPT = Path(__file__).parent.parent / "legibility" / "check_transcript_persistence.py"
 
@@ -59,14 +59,14 @@ def _write_session_record(
     fleet_root: Path,
     slug: str,
     *,
-    status: session_registry.Status,
+    status: session_records.Status,
     prompt: str,
     cwd: str = "/home/leo/src/dark-factory",
     start_ts: datetime | None = None,
     exit_code: int | None = 0,
-) -> session_registry.SessionRecord:
+) -> session_records.SessionRecord:
     """Write a SessionRecord under *fleet_root* via the canonical writer."""
-    rec = session_registry.SessionRecord(
+    rec = session_records.SessionRecord(
         session_slug=slug,
         status=status,
         prompt=prompt,
@@ -74,7 +74,7 @@ def _write_session_record(
         start_ts=_iso(start_ts) if start_ts is not None else _iso(FIXED_NOW),
         exit_code=exit_code,
     )
-    session_registry.write_record(rec, root=fleet_root)
+    session_records.write_record(rec, root=fleet_root)
     return rec
 
 
@@ -128,30 +128,30 @@ def test_find_completed_spawn_records_filters(tmp_path):
 
     # (KEEP) a completed EXITED spawn with a usable prompt, in window.
     _write_session_record(
-        fleet, "good-exited", status=session_registry.Status.EXITED,
+        fleet, "good-exited", status=session_records.Status.EXITED,
         prompt="Investigate the flaky merge on task 2500 and report back.",
         start_ts=FIXED_NOW - timedelta(hours=1),
     )
     # (KEEP) FAILED_TO_START is also terminal.
     _write_session_record(
-        fleet, "good-failed", status=session_registry.Status.FAILED_TO_START,
+        fleet, "good-failed", status=session_records.Status.FAILED_TO_START,
         prompt="Run the unblock skill for df#2085.",
         start_ts=FIXED_NOW - timedelta(hours=5),
     )
     # (EXCLUDE) empty prompt.
     _write_session_record(
-        fleet, "empty-prompt", status=session_registry.Status.EXITED,
+        fleet, "empty-prompt", status=session_records.Status.EXITED,
         prompt="", start_ts=FIXED_NOW - timedelta(hours=1),
     )
     # (EXCLUDE) non-terminal (RUNNING) — transcript may still be flushing.
     _write_session_record(
-        fleet, "still-running", status=session_registry.Status.RUNNING,
+        fleet, "still-running", status=session_records.Status.RUNNING,
         prompt="A long-running interactive session.",
         start_ts=FIXED_NOW - timedelta(hours=1),
     )
     # (EXCLUDE) terminal but older than the 48h lookback window.
     _write_session_record(
-        fleet, "too-old", status=session_registry.Status.EXITED,
+        fleet, "too-old", status=session_records.Status.EXITED,
         prompt="An old completed session outside the window.",
         start_ts=FIXED_NOW - timedelta(hours=72),
     )
@@ -191,9 +191,9 @@ def _spawn_record(
     claude_session_id: str | None = None,
     claude_launch_session_id: str | None = None,
 ):
-    return session_registry.SessionRecord(
+    return session_records.SessionRecord(
         session_slug=slug,
-        status=session_registry.Status.EXITED,
+        status=session_records.Status.EXITED,
         prompt=prompt,
         cwd=cwd,
         start_ts=_iso(FIXED_NOW - timedelta(hours=start_offset_hours)),
@@ -348,9 +348,9 @@ def test_find_missing_transcripts_end_to_end(tmp_path):
     missing = _spawn_record("sess-missing", member_missing, missing_prompt)
 
     # (c) in-flight (non-terminal) spawn with no transcript -> tolerated.
-    inflight = session_registry.SessionRecord(
+    inflight = session_records.SessionRecord(
         session_slug="sess-inflight",
-        status=session_registry.Status.RUNNING,
+        status=session_records.Status.RUNNING,
         prompt="An in-flight interactive session still running.",
         cwd=member_present,
         start_ts=_iso(FIXED_NOW - timedelta(hours=1)),
@@ -1080,7 +1080,7 @@ def _build_fleet_and_projects(tmp_path, *, include_lost: bool):
 
     # completed + transcript present (strong match) -> no finding.
     _write_session_record(
-        fleet, "sess-present", status=session_registry.Status.EXITED,
+        fleet, "sess-present", status=session_records.Status.EXITED,
         prompt=_USABLE_PROMPT, cwd=member_present,
         start_ts=FIXED_NOW - timedelta(hours=1),
     )
@@ -1088,21 +1088,21 @@ def _build_fleet_and_projects(tmp_path, *, include_lost: bool):
 
     # in-flight (non-terminal) -> tolerated, no finding.
     _write_session_record(
-        fleet, "sess-inflight", status=session_registry.Status.RUNNING,
+        fleet, "sess-inflight", status=session_records.Status.RUNNING,
         prompt="An in-flight interactive session still running right now.",
         cwd=member_present, start_ts=FIXED_NOW - timedelta(hours=1),
     )
 
     # foreign-project completed spawn -> excluded (not is_member).
     _write_session_record(
-        fleet, "sess-foreign", status=session_registry.Status.EXITED,
+        fleet, "sess-foreign", status=session_records.Status.EXITED,
         prompt="A completed spawn in a different project entirely, not a member here.",
         cwd=foreign_cwd, start_ts=FIXED_NOW - timedelta(hours=1),
     )
 
     if include_lost:
         _write_session_record(
-            fleet, "sess-lost", status=session_registry.Status.EXITED,
+            fleet, "sess-lost", status=session_records.Status.EXITED,
             prompt=(
                 "Diagnose the stuck reconciliation on task 2701 and summarise "
                 "the root cause."

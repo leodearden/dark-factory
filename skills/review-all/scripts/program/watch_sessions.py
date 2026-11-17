@@ -30,7 +30,7 @@ from shared import safe_io
 
 sys.path.insert(0, str(state.CHECKOUT_ROOT / 'orchestrator' / 'src'))
 
-from orchestrator.session_registry import (
+from orchestrator.session_records import (
     RESULT_FILENAME,
     TERMINAL_RESULT_OUTCOMES,
     TERMINAL_STATUSES,
@@ -38,11 +38,11 @@ from orchestrator.session_registry import (
     ResultOutcome,
     SessionRecord,
     parse_result_outcome,
-    parse_spawn_identity,
     read_record,
     record_path_for_slug,
     sessions_dir,
 )
+from orchestrator.session_registry import parse_spawn_identity
 
 APPLIED_BY = 'watch_sessions.py'
 

@@ -19,7 +19,7 @@ from shared.process_identity import ProcessIdentity
 
 from orchestrator import decision_registry as dr
 from orchestrator import session_hooks as sh
-from orchestrator import session_identity
+from orchestrator import session_identity, session_records
 from orchestrator import session_registry as sr
 
 # A pid virtually guaranteed dead on any host (the suite-wide idiom; see
@@ -36,10 +36,10 @@ def _record(
     slug: str,
     *,
     owner_pid: int | None,
-    status: sr.Status = sr.Status.RUNNING,
+    status: session_records.Status = session_records.Status.RUNNING,
     owner_identity: ProcessIdentity | None = None,
-) -> sr.SessionRecord:
-    return sr.SessionRecord(
+) -> session_records.SessionRecord:
+    return session_records.SessionRecord(
         session_slug=slug,
         status=status,
         claude_session_id='claude-session-uuid',
@@ -50,64 +50,64 @@ def _record(
 
 class TestSessionPointerPaths:
     def test_pointer_dir_is_a_sibling_of_the_sessions_dir(self, tmp_path: Path) -> None:
-        pointers = sr.session_pointers_dir(tmp_path)
+        pointers = session_records.session_pointers_dir(tmp_path)
 
         assert pointers == tmp_path / 'sessions-by-pid'
-        assert not pointers.is_relative_to(sr.sessions_dir(tmp_path))
+        assert not pointers.is_relative_to(session_records.sessions_dir(tmp_path))
 
     def test_pointer_path_is_named_by_the_pid(self, tmp_path: Path) -> None:
-        assert sr.session_pointer_path_for_pid(1234, root=tmp_path) == (
-            sr.session_pointers_dir(tmp_path) / '1234'
+        assert session_records.session_pointer_path_for_pid(1234, root=tmp_path) == (
+            session_records.session_pointers_dir(tmp_path) / '1234'
         )
 
     def test_write_creates_the_dir_and_stores_exactly_the_slug(self, tmp_path: Path) -> None:
-        assert sr.write_session_pointer(1234, 'role-proj-uuid', root=tmp_path) is True
+        assert session_records.write_session_pointer(1234, 'role-proj-uuid', root=tmp_path) is True
 
-        path = sr.session_pointer_path_for_pid(1234, root=tmp_path)
+        path = session_records.session_pointer_path_for_pid(1234, root=tmp_path)
         assert path.read_text(encoding='utf-8') == 'role-proj-uuid'
 
     def test_a_second_write_for_the_same_pid_wins(self, tmp_path: Path) -> None:
-        sr.write_session_pointer(1234, 'first-slug', root=tmp_path)
-        assert sr.write_session_pointer(1234, 'second-slug', root=tmp_path) is True
+        session_records.write_session_pointer(1234, 'first-slug', root=tmp_path)
+        assert session_records.write_session_pointer(1234, 'second-slug', root=tmp_path) is True
 
-        path = sr.session_pointer_path_for_pid(1234, root=tmp_path)
+        path = session_records.session_pointer_path_for_pid(1234, root=tmp_path)
         assert path.read_text(encoding='utf-8') == 'second-slug'
 
     def test_rewriting_the_slug_a_pointer_already_holds_leaves_the_file_untouched(
         self, tmp_path: Path
     ) -> None:
-        sr.write_session_pointer(1234, 'role-proj-uuid', root=tmp_path)
-        path = sr.session_pointer_path_for_pid(1234, root=tmp_path)
+        session_records.write_session_pointer(1234, 'role-proj-uuid', root=tmp_path)
+        path = session_records.session_pointer_path_for_pid(1234, root=tmp_path)
         inode_before = path.stat().st_ino
 
-        assert sr.write_session_pointer(1234, 'role-proj-uuid', root=tmp_path) is True
+        assert session_records.write_session_pointer(1234, 'role-proj-uuid', root=tmp_path) is True
 
         assert path.stat().st_ino == inode_before
         assert _pointer_files(tmp_path) == [path]
 
     def test_non_positive_pids_are_refused_without_writing(self, tmp_path: Path) -> None:
-        assert sr.write_session_pointer(0, 'role-proj-uuid', root=tmp_path) is False
-        assert sr.write_session_pointer(-1, 'role-proj-uuid', root=tmp_path) is False
-        assert not sr.session_pointers_dir(tmp_path).exists()
+        assert session_records.write_session_pointer(0, 'role-proj-uuid', root=tmp_path) is False
+        assert session_records.write_session_pointer(-1, 'role-proj-uuid', root=tmp_path) is False
+        assert not session_records.session_pointers_dir(tmp_path).exists()
 
     def test_slugs_that_are_not_record_keys_are_refused_without_writing(
         self, tmp_path: Path
     ) -> None:
         for slug in ('', '..', 'a/b'):
-            assert sr.write_session_pointer(1234, slug, root=tmp_path) is False, slug
-        assert not sr.session_pointers_dir(tmp_path).exists()
+            assert session_records.write_session_pointer(1234, slug, root=tmp_path) is False, slug
+        assert not session_records.session_pointers_dir(tmp_path).exists()
 
     def test_an_unwritable_pointer_dir_returns_false_instead_of_raising(
         self, tmp_path: Path
     ) -> None:
-        sr.session_pointers_dir(tmp_path).write_text('not a directory', encoding='utf-8')
+        session_records.session_pointers_dir(tmp_path).write_text('not a directory', encoding='utf-8')
 
-        assert sr.write_session_pointer(1234, 'role-proj-uuid', root=tmp_path) is False
-        assert sr.session_pointers_dir(tmp_path).read_text(encoding='utf-8') == 'not a directory'
+        assert session_records.write_session_pointer(1234, 'role-proj-uuid', root=tmp_path) is False
+        assert session_records.session_pointers_dir(tmp_path).read_text(encoding='utf-8') == 'not a directory'
 
 
 def _write_pointer_raw(pid: int, content: str | bytes, root: Path) -> Path:
-    path = sr.session_pointer_path_for_pid(pid, root=root)
+    path = session_records.session_pointer_path_for_pid(pid, root=root)
     path.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(content, bytes):
         path.write_bytes(content)
@@ -121,13 +121,13 @@ class TestResolveSessionSlugForPid:
     _SLUG = 'role-proj-uuid'
 
     def test_no_pointer_file(self, tmp_path: Path) -> None:
-        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+        assert session_records.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
 
     @pytest.mark.parametrize('content', ['', '   \n'])
     def test_blank_pointer(self, tmp_path: Path, content: str) -> None:
         _write_pointer_raw(self._PID, content, tmp_path)
 
-        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+        assert session_records.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
 
     @pytest.mark.parametrize(
         ('content', 'traversal_target'),
@@ -141,7 +141,7 @@ class TestResolveSessionSlugForPid:
         self, tmp_path: Path, content: str, traversal_target: Path
     ) -> None:
         root = tmp_path / 'fleet'
-        sr.sessions_dir(root).mkdir(parents=True)
+        session_records.sessions_dir(root).mkdir(parents=True)
         sentinel = tmp_path / traversal_target / 'record.json'
         sentinel.parent.mkdir(parents=True, exist_ok=True)
         sentinel.write_text(
@@ -149,58 +149,58 @@ class TestResolveSessionSlugForPid:
         )
         _write_pointer_raw(self._PID, content, root)
 
-        assert sr.resolve_session_slug_for_pid(self._PID, root=root) is None
+        assert session_records.resolve_session_slug_for_pid(self._PID, root=root) is None
 
     def test_dangling_pointer(self, tmp_path: Path) -> None:
-        sr.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
+        session_records.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
 
-        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+        assert session_records.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
 
     def test_record_that_is_not_json(self, tmp_path: Path) -> None:
-        path = sr.record_path_for_slug(self._SLUG, root=tmp_path)
+        path = session_records.record_path_for_slug(self._SLUG, root=tmp_path)
         path.parent.mkdir(parents=True)
         path.write_text('{not json', encoding='utf-8')
-        sr.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
+        session_records.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
 
-        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+        assert session_records.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
 
     def test_record_owned_by_a_different_pid(self, tmp_path: Path) -> None:
-        sr.write_record(_record(self._SLUG, owner_pid=self._PID + 1), root=tmp_path)
-        sr.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
+        session_records.write_record(_record(self._SLUG, owner_pid=self._PID + 1), root=tmp_path)
+        session_records.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
 
-        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+        assert session_records.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
 
     def test_record_with_no_owner_pid_no_longer_vouches_for_the_pid(
         self, tmp_path: Path
     ) -> None:
-        sr.write_record(_record(self._SLUG, owner_pid=None), root=tmp_path)
-        sr.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
+        session_records.write_record(_record(self._SLUG, owner_pid=None), root=tmp_path)
+        session_records.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
 
-        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+        assert session_records.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
 
     def test_record_owned_by_the_pid_resolves_to_its_slug(self, tmp_path: Path) -> None:
-        sr.write_record(_record(self._SLUG, owner_pid=self._PID), root=tmp_path)
-        sr.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
+        session_records.write_record(_record(self._SLUG, owner_pid=self._PID), root=tmp_path)
+        session_records.write_session_pointer(self._PID, self._SLUG, root=tmp_path)
 
-        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) == self._SLUG
+        assert session_records.resolve_session_slug_for_pid(self._PID, root=tmp_path) == self._SLUG
 
     def test_directory_in_the_pointer_files_place(self, tmp_path: Path) -> None:
-        sr.session_pointer_path_for_pid(self._PID, root=tmp_path).mkdir(parents=True)
+        session_records.session_pointer_path_for_pid(self._PID, root=tmp_path).mkdir(parents=True)
 
-        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+        assert session_records.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
 
     def test_pointer_that_is_not_utf8(self, tmp_path: Path) -> None:
-        sr.write_record(_record(self._SLUG, owner_pid=self._PID), root=tmp_path)
+        session_records.write_record(_record(self._SLUG, owner_pid=self._PID), root=tmp_path)
         _write_pointer_raw(self._PID, b'\xff\xfe' + self._SLUG.encode(), tmp_path)
 
-        assert sr.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
+        assert session_records.resolve_session_slug_for_pid(self._PID, root=tmp_path) is None
 
     @pytest.mark.parametrize('pid', [0, -1])
     def test_non_positive_pid_never_touches_the_filesystem(
         self, tmp_path: Path, pid: int
     ) -> None:
-        assert sr.resolve_session_slug_for_pid(pid, root=tmp_path) is None
-        assert not sr.session_pointers_dir(tmp_path).exists()
+        assert session_records.resolve_session_slug_for_pid(pid, root=tmp_path) is None
+        assert not session_records.session_pointers_dir(tmp_path).exists()
 
 
 class TestResolveOwnRecordSlug:
@@ -208,8 +208,8 @@ class TestResolveOwnRecordSlug:
     _SLUG = 'role-proj-uuid'
 
     def _link(self, root: Path) -> None:
-        sr.write_record(_record(self._SLUG, owner_pid=self._PID), root=root)
-        sr.write_session_pointer(self._PID, self._SLUG, root=root)
+        session_records.write_record(_record(self._SLUG, owner_pid=self._PID), root=root)
+        session_records.write_session_pointer(self._PID, self._SLUG, root=root)
 
     def test_resolves_the_claude_pid_from_env(self, tmp_path: Path) -> None:
         self._link(tmp_path)
@@ -259,28 +259,28 @@ class TestReapStaleSessionPointers:
     _SLUG = 'role-proj-uuid'
 
     def _pointer_path(self, name: str, root: Path) -> Path:
-        return sr.session_pointers_dir(root) / name
+        return session_records.session_pointers_dir(root) / name
 
     def test_a_live_pids_pointer_to_an_existing_record_is_kept(self, tmp_path: Path) -> None:
-        sr.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
-        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+        session_records.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
+        session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
 
         assert sr.reap_stale_session_pointers(root=tmp_path) == []
-        assert sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
+        assert session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
 
     def test_a_dead_pids_pointer_is_removed_even_though_its_record_exists(
         self, tmp_path: Path
     ) -> None:
-        sr.write_record(_record(self._SLUG, owner_pid=_DEAD_PID), root=tmp_path)
-        sr.write_session_pointer(_DEAD_PID, self._SLUG, root=tmp_path)
-        pointer = sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path)
+        session_records.write_record(_record(self._SLUG, owner_pid=_DEAD_PID), root=tmp_path)
+        session_records.write_session_pointer(_DEAD_PID, self._SLUG, root=tmp_path)
+        pointer = session_records.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path)
 
         assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
 
     def test_a_live_pids_pointer_to_a_reaped_record_is_removed(self, tmp_path: Path) -> None:
-        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
-        pointer = sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path)
+        session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+        pointer = session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path)
 
         assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
@@ -298,7 +298,7 @@ class TestReapStaleSessionPointers:
     def test_a_file_not_named_by_a_positive_pid_is_removed(
         self, tmp_path: Path, name: str
     ) -> None:
-        sr.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
+        session_records.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
         pointer = self._pointer_path(name, tmp_path)
         pointer.parent.mkdir(parents=True)
         pointer.write_text(self._SLUG, encoding='utf-8')
@@ -332,9 +332,9 @@ class TestReapStaleSessionPointers:
         self, tmp_path: Path, variant: IdentityVariant
     ) -> None:
         owner = _record(self._SLUG, owner_pid=os.getpid(), owner_identity=own_identity(variant))
-        sr.write_record(owner, root=tmp_path)
-        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
-        pointer = sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path)
+        session_records.write_record(owner, root=tmp_path)
+        session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+        pointer = session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path)
         removed = variant.judged_dead
 
         assert sr.reap_stale_session_pointers(root=tmp_path) == ([pointer] if removed else [])
@@ -344,9 +344,9 @@ class TestReapStaleSessionPointers:
         self, tmp_path: Path
     ) -> None:
         owner = _record(self._SLUG, owner_pid=os.getpid(), owner_identity=own_identity())
-        sr.write_record(owner, root=tmp_path)
-        sr.write_session_pointer(_DEAD_PID, self._SLUG, root=tmp_path)
-        pointer = sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path)
+        session_records.write_record(owner, root=tmp_path)
+        session_records.write_session_pointer(_DEAD_PID, self._SLUG, root=tmp_path)
+        pointer = session_records.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path)
 
         assert sr.reap_stale_session_pointers(root=tmp_path) == [pointer]
         assert not pointer.exists()
@@ -356,22 +356,22 @@ class TestReapStaleSessionPointers:
     ) -> None:
         elsewhere = dataclasses.replace(own_identity(), pid=_DEAD_PID)
         owner = _record(self._SLUG, owner_pid=_DEAD_PID, owner_identity=elsewhere)
-        sr.write_record(owner, root=tmp_path)
-        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+        session_records.write_record(owner, root=tmp_path)
+        session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
 
         assert sr.reap_stale_session_pointers(root=tmp_path) == []
-        assert sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
+        assert session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
 
     def test_a_corrupt_record_reads_unqualified_so_a_live_pids_pointer_is_kept(
         self, tmp_path: Path
     ) -> None:
-        record_path = sr.record_path_for_slug(self._SLUG, root=tmp_path)
+        record_path = session_records.record_path_for_slug(self._SLUG, root=tmp_path)
         record_path.parent.mkdir(parents=True)
         record_path.write_text('{not json', encoding='utf-8')
-        sr.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
+        session_records.write_session_pointer(os.getpid(), self._SLUG, root=tmp_path)
 
         assert sr.reap_stale_session_pointers(root=tmp_path) == []
-        assert sr.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
+        assert session_records.session_pointer_path_for_pid(os.getpid(), root=tmp_path).is_file()
 
     def test_an_entry_that_cannot_be_removed_is_skipped_and_the_pass_continues(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -408,10 +408,10 @@ class TestPointerSweepDrivers:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
-        sr.write_session_pointer(_DEAD_PID, 'role-proj-uuid', root=tmp_path)
+        session_records.write_session_pointer(_DEAD_PID, 'role-proj-uuid', root=tmp_path)
 
         assert sr.main(['reap']) == 0
-        assert not sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path).exists()
+        assert not session_records.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path).exists()
 
     def test_every_spawn_removes_a_dead_pids_pointer_and_still_prints_only_its_record_dir(
         self,
@@ -421,22 +421,22 @@ class TestPointerSweepDrivers:
     ) -> None:
         for key, value in _launching_env(tmp_path).items():
             monkeypatch.setenv(key, value)
-        sr.write_session_pointer(_DEAD_PID, 'role-proj-uuid', root=tmp_path)
+        session_records.write_session_pointer(_DEAD_PID, 'role-proj-uuid', root=tmp_path)
 
         assert sr.main(['launching']) == 0
 
-        slug = sr.build_session_slug('unblock', 'df', '2085', 4242)
-        expected_dir = sr.record_path_for_slug(slug, root=tmp_path).parent
+        slug = session_records.build_session_slug('unblock', 'df', '2085', 4242)
+        expected_dir = session_records.record_path_for_slug(slug, root=tmp_path).parent
         assert capsys.readouterr().out == f'{expected_dir}\n'
         await_reap_report(tmp_path)
-        assert not sr.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path).exists()
+        assert not session_records.session_pointer_path_for_pid(_DEAD_PID, root=tmp_path).exists()
 
 
 _CWD = '/home/leo/src/dark-factory'
 
 
 def _pointer_files(root: Path) -> list[Path]:
-    pointers = sr.session_pointers_dir(root)
+    pointers = session_records.session_pointers_dir(root)
     return sorted(pointers.iterdir()) if pointers.is_dir() else []
 
 
@@ -453,7 +453,7 @@ class TestSessionStartStampsPointer:
             process_tree=claude_process_tree(self._OWNER),
         )
 
-        assert sr.resolve_session_slug_for_pid(self._OWNER, root=tmp_path) == record.session_slug
+        assert session_records.resolve_session_slug_for_pid(self._OWNER, root=tmp_path) == record.session_slug
 
     def test_the_pointer_is_keyed_on_the_claude_pid_not_the_launcher_pid(
         self, tmp_path: Path
@@ -466,7 +466,7 @@ class TestSessionStartStampsPointer:
         )
 
         assert record.launcher_pid != self._OWNER
-        assert sr.resolve_session_slug_for_pid(record.launcher_pid, root=tmp_path) is None
+        assert session_records.resolve_session_slug_for_pid(record.launcher_pid, root=tmp_path) is None
 
     def test_an_unresolvable_claude_pid_writes_the_record_but_no_pointer(
         self, tmp_path: Path
@@ -478,7 +478,7 @@ class TestSessionStartStampsPointer:
             process_tree=claude_process_tree(None),
         )
 
-        assert sr.read_record(record.session_slug, root=tmp_path) == record
+        assert session_records.read_record(record.session_slug, root=tmp_path) == record
         assert _pointer_files(tmp_path) == []
 
     def test_a_session_that_never_binds_gets_no_pointer(
@@ -497,7 +497,7 @@ class TestSessionStartStampsPointer:
     def test_an_unwritable_pointer_dir_never_breaks_the_hook(
         self, tmp_path: Path
     ) -> None:
-        sr.session_pointers_dir(tmp_path).write_text('not a directory', encoding='utf-8')
+        session_records.session_pointers_dir(tmp_path).write_text('not a directory', encoding='utf-8')
 
         record = sh.run_session_start(
             {'session_id': 'sess-hl', 'cwd': _CWD},
@@ -506,7 +506,7 @@ class TestSessionStartStampsPointer:
             process_tree=claude_process_tree(self._OWNER),
         )
 
-        assert sr.read_record(record.session_slug, root=tmp_path) == record
+        assert session_records.read_record(record.session_slug, root=tmp_path) == record
 
 
 class TestRefreshEventsStampPointer:
@@ -515,10 +515,10 @@ class TestRefreshEventsStampPointer:
 
     def _bound_hand_launched_record(self, root: Path) -> str:
         slug = sh.hook_session_slug(self._HOOK_INPUT, {}, root=root)
-        sr.write_record(
-            sr.SessionRecord(
+        session_records.write_record(
+            session_records.SessionRecord(
                 session_slug=slug,
-                status=sr.Status.RUNNING,
+                status=session_records.Status.RUNNING,
                 claude_session_id='sess-hl',
                 claude_owner_pid=self._OWNER,
             ),
@@ -537,21 +537,21 @@ class TestRefreshEventsStampPointer:
         slug = self._bound_hand_launched_record(linked_root)
         unwritable_root = tmp_path / 'unwritable'
         self._bound_hand_launched_record(unwritable_root)
-        sr.session_pointers_dir(unwritable_root).write_text('x', encoding='utf-8')
+        session_records.session_pointers_dir(unwritable_root).write_text('x', encoding='utf-8')
 
         retitle = handler(self._HOOK_INPUT, {}, root=linked_root, process_tree=tree)
 
-        assert sr.resolve_session_slug_for_pid(self._OWNER, root=linked_root) == slug
+        assert session_records.resolve_session_slug_for_pid(self._OWNER, root=linked_root) == slug
         assert retitle == handler(self._HOOK_INPUT, {}, root=unwritable_root, process_tree=tree)
 
     def test_a_withheld_launch_window_event_stamps_nothing(
         self, tmp_path: Path
     ) -> None:
         slug = 'session-cockpit-4237001'
-        sr.write_record(
-            sr.SessionRecord(
+        session_records.write_record(
+            session_records.SessionRecord(
                 session_slug=slug,
-                status=sr.Status.LAUNCHING,
+                status=session_records.Status.LAUNCHING,
                 launcher_pid=4237001,
                 start_ts=datetime.now(UTC).isoformat(),
             ),
@@ -565,24 +565,24 @@ class TestRefreshEventsStampPointer:
             process_tree=claude_process_tree(self._OWNER),
         )
 
-        assert sr.read_record(slug, root=tmp_path).status == sr.Status.LAUNCHING
-        assert not sr.session_pointer_path_for_pid(self._OWNER, root=tmp_path).exists()
+        assert session_records.read_record(slug, root=tmp_path).status == session_records.Status.LAUNCHING
+        assert not session_records.session_pointer_path_for_pid(self._OWNER, root=tmp_path).exists()
 
     def test_a_nested_claude_points_at_its_forked_record_never_its_spawners(
         self, tmp_path: Path
     ) -> None:
         spawner_pid, nested_pid = 4_237_100, 4_237_200
         spawner_slug = 'session-cockpit-4237100'
-        sr.write_record(
-            sr.SessionRecord(
+        session_records.write_record(
+            session_records.SessionRecord(
                 session_slug=spawner_slug,
-                status=sr.Status.RUNNING,
+                status=session_records.Status.RUNNING,
                 claude_session_id='uuid-spawner',
                 claude_owner_pid=spawner_pid,
             ),
             root=tmp_path,
         )
-        sr.write_session_pointer(spawner_pid, spawner_slug, root=tmp_path)
+        session_records.write_session_pointer(spawner_pid, spawner_slug, root=tmp_path)
 
         forked = sh.run_session_start(
             {'session_id': 'uuid-nested', 'cwd': _CWD},
@@ -592,8 +592,8 @@ class TestRefreshEventsStampPointer:
         )
 
         assert forked.session_slug != spawner_slug
-        assert sr.resolve_session_slug_for_pid(nested_pid, root=tmp_path) == forked.session_slug
-        assert sr.resolve_session_slug_for_pid(spawner_pid, root=tmp_path) == spawner_slug
+        assert session_records.resolve_session_slug_for_pid(nested_pid, root=tmp_path) == forked.session_slug
+        assert session_records.resolve_session_slug_for_pid(spawner_pid, root=tmp_path) == spawner_slug
 
 
 _T3_SESSION_ID = 'sess-t3'
@@ -605,10 +605,10 @@ def _pre_pointer_record(root: Path, env: Mapping[str, str], *, owner: int = _DEA
     slug = sh.hook_session_slug(
         _T3_HOOK_INPUT, env, root=root, process_tree=claude_process_tree(None)
     )
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=slug,
-            status=sr.Status.IDLE,
+            status=session_records.Status.IDLE,
             cwd=_CWD,
             claude_session_id=_T3_SESSION_ID,
             claude_owner_pid=owner,
@@ -627,10 +627,10 @@ def _hand_launched_env(root: Path) -> dict[str, str]:
 
 def _forked_inheritor_env(root: Path) -> dict[str, str]:
     """Seed a spawner bound to another session, so the inherited ``CLAUDE_SPAWN_SESSION_ID`` is disowned."""
-    sr.write_record(
-        sr.SessionRecord(
+    session_records.write_record(
+        session_records.SessionRecord(
             session_slug=_DISOWNED_SPAWNER,
-            status=sr.Status.RUNNING,
+            status=session_records.Status.RUNNING,
             claude_session_id='uuid-spawner',
         ),
         root=root,
@@ -664,16 +664,16 @@ class TestResumedSessionIdKeyedRecordIsRelinked:
     ) -> None:
         env = lane_env(tmp_path)
         slug = _pre_pointer_record(tmp_path, env)
-        records_before = sorted(sr.sessions_dir(tmp_path).iterdir())
+        records_before = sorted(session_records.sessions_dir(tmp_path).iterdir())
 
         handler(hook_input, env, root=tmp_path, process_tree=claude_process_tree(self._RESUMED))
 
-        assert sr.read_record(slug, root=tmp_path).claude_owner_pid == self._RESUMED
-        assert sr.resolve_session_slug_for_pid(self._RESUMED, root=tmp_path) == slug
+        assert session_records.read_record(slug, root=tmp_path).claude_owner_pid == self._RESUMED
+        assert session_records.resolve_session_slug_for_pid(self._RESUMED, root=tmp_path) == slug
         assert (
-            sr.resolve_session_slug_for_claude_session_id(_T3_SESSION_ID, root=tmp_path) == slug
+            session_records.resolve_session_slug_for_claude_session_id(_T3_SESSION_ID, root=tmp_path) == slug
         )
-        assert sorted(sr.sessions_dir(tmp_path).iterdir()) == records_before
+        assert sorted(session_records.sessions_dir(tmp_path).iterdir()) == records_before
 
     def test_a_live_recorded_owner_is_left_in_place(self, tmp_path: Path) -> None:
         slug = _pre_pointer_record(tmp_path, {}, owner=os.getpid())
@@ -685,8 +685,8 @@ class TestResumedSessionIdKeyedRecordIsRelinked:
             process_tree=claude_process_tree(self._RESUMED, os.getpid()),
         )
 
-        assert sr.read_record(slug, root=tmp_path).claude_owner_pid == os.getpid()
-        assert sr.resolve_session_slug_for_pid(self._RESUMED, root=tmp_path) is None
+        assert session_records.read_record(slug, root=tmp_path).claude_owner_pid == os.getpid()
+        assert session_records.resolve_session_slug_for_pid(self._RESUMED, root=tmp_path) is None
 
 
 _T0 = datetime(2026, 9, 25, 12, 0, 0, tzinfo=UTC)
@@ -761,24 +761,24 @@ class TestHolderRecordState:
 
         assert state is sr.HolderRecordState.ABSENT
 
-    @pytest.mark.parametrize('status', sorted(set(sr.Status) - sr.TERMINAL_STATUSES))
-    def test_a_non_terminal_record_is_active(self, tmp_path: Path, status: sr.Status) -> None:
-        sr.write_record(_record(self._SLUG, owner_pid=1, status=status), root=tmp_path)
+    @pytest.mark.parametrize('status', sorted(set(session_records.Status) - session_records.TERMINAL_STATUSES))
+    def test_a_non_terminal_record_is_active(self, tmp_path: Path, status: session_records.Status) -> None:
+        session_records.write_record(_record(self._SLUG, owner_pid=1, status=status), root=tmp_path)
 
         state = sr.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
 
         assert state is sr.HolderRecordState.ACTIVE
 
-    @pytest.mark.parametrize('status', sorted(sr.TERMINAL_STATUSES))
-    def test_a_terminal_record_is_exited(self, tmp_path: Path, status: sr.Status) -> None:
-        sr.write_record(_record(self._SLUG, owner_pid=1, status=status), root=tmp_path)
+    @pytest.mark.parametrize('status', sorted(session_records.TERMINAL_STATUSES))
+    def test_a_terminal_record_is_exited(self, tmp_path: Path, status: session_records.Status) -> None:
+        session_records.write_record(_record(self._SLUG, owner_pid=1, status=status), root=tmp_path)
 
         state = sr.holder_record_state(_holder(record_slug=self._SLUG), root=tmp_path)
 
         assert state is sr.HolderRecordState.EXITED
 
     def test_a_corrupt_record_is_unreadable(self, tmp_path: Path) -> None:
-        path = sr.record_path_for_slug(self._SLUG, root=tmp_path)
+        path = session_records.record_path_for_slug(self._SLUG, root=tmp_path)
         path.parent.mkdir(parents=True)
         path.write_text('{not json', encoding='utf-8')
 
@@ -818,7 +818,7 @@ class TestLeaseClaimHolderRecordState:
     def test_an_acquired_claim_reports_the_claimants_own_linked_record(
         self, tmp_path: Path
     ) -> None:
-        sr.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
+        session_records.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
 
         claim = sr.claim_lease(_LEASE, holder=_holder(record_slug=self._SLUG), root=tmp_path)
 
@@ -833,8 +833,8 @@ class TestLeaseClaimHolderRecordState:
     def test_a_contended_claim_reports_the_existing_holders_record(
         self, tmp_path: Path
     ) -> None:
-        sr.write_record(
-            _record(self._SLUG, owner_pid=1, status=sr.Status.EXITED), root=tmp_path
+        session_records.write_record(
+            _record(self._SLUG, owner_pid=1, status=session_records.Status.EXITED), root=tmp_path
         )
         _seed_lease(tmp_path, _holder(record_slug=self._SLUG))
 
@@ -870,8 +870,8 @@ class TestHolderRecordIsAnAdditiveAxis:
         verdicts = []
         for record_slug in ('', self._SLUG):
             root = tmp_path / (record_slug or 'unlinked')
-            sr.write_record(
-                _record(self._SLUG, owner_pid=1, status=sr.Status.EXITED), root=root
+            session_records.write_record(
+                _record(self._SLUG, owner_pid=1, status=session_records.Status.EXITED), root=root
             )
             if existing == 'unreadable':
                 _seed_lease(root, '{not json')
@@ -885,8 +885,8 @@ class TestHolderRecordIsAnAdditiveAxis:
     def test_a_dead_holder_whose_record_exited_still_stands_down_on_a_fresh_heartbeat(
         self, tmp_path: Path
     ) -> None:
-        sr.write_record(
-            _record(self._SLUG, owner_pid=_DEAD_PID, status=sr.Status.EXITED), root=tmp_path
+        session_records.write_record(
+            _record(self._SLUG, owner_pid=_DEAD_PID, status=session_records.Status.EXITED), root=tmp_path
         )
         _seed_lease(tmp_path, _holder(pid=_DEAD_PID, record_slug=self._SLUG))
 
@@ -907,7 +907,7 @@ class TestLeaseShowHolderRecord:
     _SLUG = 'role-proj-uuid'
 
     def test_lease_status_carries_the_holders_record_link(self, tmp_path: Path) -> None:
-        sr.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
+        session_records.write_record(_record(self._SLUG, owner_pid=os.getpid()), root=tmp_path)
         _seed_lease(tmp_path, _holder(record_slug=self._SLUG))
 
         status = sr.lease_status(_LEASE, root=tmp_path, now=_T0)
@@ -937,8 +937,8 @@ class TestLeaseShowHolderRecord:
     def test_a_linked_lease_appends_both_keys_after_the_existing_ones(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        sr.write_record(
-            _record(self._SLUG, owner_pid=1, status=sr.Status.EXITED), root=tmp_path
+        session_records.write_record(
+            _record(self._SLUG, owner_pid=1, status=session_records.Status.EXITED), root=tmp_path
         )
         _seed_lease(tmp_path, _holder(record_slug=self._SLUG))
 
@@ -981,8 +981,8 @@ class TestLeaseShowHolderRecord:
 
 
 def _link_pid(pid: int, slug: str, root: Path) -> None:
-    sr.write_record(_record(slug, owner_pid=pid), root=root)
-    sr.write_session_pointer(pid, slug, root=root)
+    session_records.write_record(_record(slug, owner_pid=pid), root=root)
+    session_records.write_session_pointer(pid, slug, root=root)
 
 
 def _lease_body(root: Path) -> sr.LeaseHolder:
@@ -1117,16 +1117,16 @@ class TestALeaseFollowsItsHoldersRecordAcrossARemint:
         )
         sh.run_stop({'session_id': 'sid-after', 'cwd': _CWD}, env, root=tmp_path, process_tree=tree)
 
-        live = sr.resolve_session_slug_for_claude_session_id('sid-after', root=tmp_path)
+        live = session_records.resolve_session_slug_for_claude_session_id('sid-after', root=tmp_path)
         assert live is not None
         status = sr.lease_status(_LEASE, root=tmp_path)
         assert (status.holder_record_slug, status.holder_record_state) == (
             live,
             sr.HolderRecordState.ACTIVE,
         )
-        assert sr.resolve_session_slug_for_pid(_REMINT_OWNER, root=tmp_path) == live
-        record = sr.read_record(live, root=tmp_path)
-        assert (record.claude_session_id, record.status) == ('sid-after', sr.Status.IDLE)
+        assert session_records.resolve_session_slug_for_pid(_REMINT_OWNER, root=tmp_path) == live
+        record = session_records.read_record(live, root=tmp_path)
+        assert (record.claude_session_id, record.status) == ('sid-after', session_records.Status.IDLE)
 
 
 def _claim_lines(capsys: pytest.CaptureFixture[str], *extra: str) -> list[str]:
@@ -1187,8 +1187,8 @@ class TestLeaseClaimPrintsHolderRecordLast:
         holder_pid: int,
         liveness: str,
     ) -> None:
-        sr.write_record(
-            _record(self._HOLDER_SLUG, owner_pid=holder_pid, status=sr.Status.EXITED),
+        session_records.write_record(
+            _record(self._HOLDER_SLUG, owner_pid=holder_pid, status=session_records.Status.EXITED),
             root=tmp_path,
         )
         _seed_fresh_lease(tmp_path, _holder(pid=holder_pid, record_slug=self._HOLDER_SLUG))
@@ -1337,8 +1337,8 @@ class TestDecisionRecordSlug:
         assert merged.manual_boost == 7
 
 
-def _registry(root: Path) -> dict[str, sr.SessionRecord]:
-    records = (sr.read_record(d.name, root=root) for d in sr.sessions_dir(root).iterdir())
+def _registry(root: Path) -> dict[str, session_records.SessionRecord]:
+    records = (session_records.read_record(d.name, root=root) for d in session_records.sessions_dir(root).iterdir())
     return {record.session_slug: record for record in records}
 
 
@@ -1354,8 +1354,8 @@ def _set_claude_pid_with_an_unvouched_pointer(
     monkeypatch: pytest.MonkeyPatch, root: Path, pid: int
 ) -> None:
     monkeypatch.setenv('CLAUDE_PID', str(pid))
-    sr.write_record(_record('another-sessions-record', owner_pid=pid + 1), root=root)
-    sr.write_session_pointer(pid, 'another-sessions-record', root=root)
+    session_records.write_record(_record('another-sessions-record', owner_pid=pid + 1), root=root)
+    session_records.write_session_pointer(pid, 'another-sessions-record', root=root)
 
 
 class TestWriteDecisionRecordSlug:

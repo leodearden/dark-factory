@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from orchestrator.session_registry import SessionRecord, parse_result_outcome
+from orchestrator.session_records import SessionRecord, parse_result_outcome
 from review_all_program_fixture import (
     FIXTURE_DIR,
     PROGRAM_DIR,

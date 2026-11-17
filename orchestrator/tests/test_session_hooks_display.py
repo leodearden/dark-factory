@@ -9,7 +9,7 @@ import pytest
 from _session_hook_fixtures import assert_hook_env_isolated, isolate_hook_env
 
 from orchestrator import session_hooks as sh
-from orchestrator import session_registry as sr
+from orchestrator import session_records
 
 
 @pytest.fixture(autouse=True)
@@ -225,7 +225,7 @@ def test_run_session_start_tmux_env_stamps_tmux_display(tmp_path: Path) -> None:
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.display is not None
     # Assert on the wire value directly -- a StrEnum-vs-str choice can't drift.
     assert record.display.kind == 'tmux'
@@ -239,7 +239,7 @@ def test_run_session_start_windowid_env_stamps_wm_display(tmp_path: Path) -> Non
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.display is not None
     assert record.display.kind == 'wm'
     assert record.display.wm_window_id == '0x03200007'
@@ -258,7 +258,7 @@ def test_run_session_start_decimal_windowid_stamps_canonical_hex_display(tmp_pat
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.display is not None
     assert record.display.kind == 'wm'
     assert record.display.wm_window_id == '0x03200007'
@@ -275,7 +275,7 @@ def test_run_session_start_tmux_takes_precedence_over_windowid(tmp_path: Path) -
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.display is not None
     assert record.display.kind == 'tmux'
 
@@ -287,7 +287,7 @@ def test_run_session_start_no_tmux_or_windowid_leaves_display_none(tmp_path: Pat
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.display is None
 
 
@@ -295,9 +295,9 @@ def test_run_session_start_display_stamping_applies_on_refresh_path(tmp_path: Pa
     hook_input = {'session_id': 'sess-d5', 'cwd': '/home/leo/src/dark-factory'}
     env = {'WINDOWID': '0x3200007'}
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.LAUNCHING,
+        status=session_records.Status.LAUNCHING,
         title='unblock:df#2085 routing-mechanism',
         role='unblock',
         project='df',
@@ -305,12 +305,12 @@ def test_run_session_start_display_stamping_applies_on_refresh_path(tmp_path: Pa
         cwd='/home/leo/src/dark-factory',
         prompt='/unblock 2085',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     assert record.display is not None
     assert record.display.kind == 'wm'
     assert record.display.wm_window_id == '0x03200007'
@@ -340,7 +340,7 @@ def test_run_session_start_marker_title_env_stamps_wm_display_via_resolver(
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.display is not None
     assert record.display.kind == 'wm'
     assert record.display.wm_window_id == '0x03200007'
@@ -360,7 +360,7 @@ def test_run_session_start_marker_title_resolver_miss_leaves_display_none(
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.display is None
 
 
@@ -379,7 +379,7 @@ def test_run_session_start_windowid_wins_over_marker_title_resolver_not_called(
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.display is not None
     assert record.display.kind == 'wm'
     assert record.display.wm_window_id == '0x03200007'
@@ -404,7 +404,7 @@ def test_run_session_start_tmux_wins_over_marker_title_resolver_not_called(
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.display is not None
     assert record.display.kind == 'tmux'
 
@@ -417,9 +417,9 @@ def test_run_session_start_marker_title_stamping_applies_on_refresh_path(
     env = {'CLAUDE_SPAWN_WM_TITLE': 'focus:df#2510 alpha'}
     monkeypatch.setattr(sh, '_resolve_wm_window_id', lambda title: '0x03200007')
     slug = sh.hook_session_slug(hook_input, env)
-    existing = sr.SessionRecord(
+    existing = session_records.SessionRecord(
         session_slug=slug,
-        status=sr.Status.LAUNCHING,
+        status=session_records.Status.LAUNCHING,
         title='unblock:df#2085 routing-mechanism',
         role='unblock',
         project='df',
@@ -427,12 +427,12 @@ def test_run_session_start_marker_title_stamping_applies_on_refresh_path(
         cwd='/home/leo/src/dark-factory',
         prompt='/unblock 2085',
     )
-    sr.write_record(existing, root=tmp_path)
+    session_records.write_record(existing, root=tmp_path)
 
     sh.run_session_start(hook_input, env, root=tmp_path)
 
-    record = sr.read_record(slug, root=tmp_path)
-    assert record.status == sr.Status.RUNNING
+    record = session_records.read_record(slug, root=tmp_path)
+    assert record.status == session_records.Status.RUNNING
     assert record.display is not None
     assert record.display.kind == 'wm'
     assert record.display.wm_window_id == '0x03200007'
@@ -462,5 +462,5 @@ def test_run_session_start_no_marker_title_resolver_never_invoked(
     sh.run_session_start(hook_input, env, root=tmp_path)
 
     slug = sh.hook_session_slug(hook_input, env)
-    record = sr.read_record(slug, root=tmp_path)
+    record = session_records.read_record(slug, root=tmp_path)
     assert record.display is None

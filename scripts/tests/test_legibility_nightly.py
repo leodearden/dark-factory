@@ -136,7 +136,7 @@ def _encode_cwd(cwd: str) -> str:
 
     '/', '.' and '_' all map to '-'. "Independent" means SEPARATELY WRITTEN,
     not unchecked: test_legibility_inventory.py's TestEncoderLockstep pins
-    this copy to the canonical (orchestrator.session_registry.encode_cwd) and
+    this copy to the canonical (orchestrator.session_records.encode_cwd) and
     to real on-disk dir names (task 3272, which found this fixture and three
     production copies all missing the '_' rule at once). Deliberately does
     NOT import the canonical -- a fixture that calls the code under test

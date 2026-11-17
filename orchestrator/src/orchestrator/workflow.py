@@ -220,7 +220,7 @@ from orchestrator.scope_drift import (
     build_scope_drift_report,
     pending_scope_paths,
 )
-from orchestrator.session_registry import build_session_slug
+from orchestrator.session_records import build_session_slug
 from orchestrator.stranded_verified_green import (
     DURABLE_MERGE_FAILURE_STATUSES,
     SUCCESS_TRANSIENT_MERGE_STATUSES,
