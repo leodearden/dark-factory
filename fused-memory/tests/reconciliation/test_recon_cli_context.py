@@ -19,10 +19,19 @@ auto-compaction off, and keeps its transcript. Each switch has one job:
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
+import pytest
+from shared.cli_invoke import AgentResult
+
+from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.reconciliation import (
     RECONCILIATION_CLI_ENV_OVERRIDES,
     RECONCILIATION_CLI_SETTING_SOURCES,
 )
+from reconciliation.stubbed_stage_cli import run_stage, run_stage_answered_by
+
+_STAGE_REPORT = AgentResult(success=True, output='{"summary": "s"}')
 
 
 def test_recon_cli_context_constants_name_one_rule():
@@ -34,3 +43,33 @@ def test_recon_cli_context_constants_name_one_rule():
         'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE': '1',
     }
     assert not hasattr(RECONCILIATION_CLI_ENV_OVERRIDES, '__setitem__')
+
+
+@pytest.mark.asyncio
+async def test_stage_runner_loads_no_settings_claude_md_or_memory_index(tmp_path):
+    _, invoke = await run_stage_answered_by(_STAGE_REPORT, cwd=tmp_path)
+
+    kwargs = invoke.call_args.kwargs
+    assert kwargs['setting_sources'] == []
+    assert kwargs['env_overrides'] == dict(RECONCILIATION_CLI_ENV_OVERRIDES)
+    assert isinstance(kwargs['env_overrides'], dict)
+    assert kwargs['strict_mcp_config'] is True
+    assert kwargs.get('available_tools') is None
+    assert kwargs['cwd'] == tmp_path
+    assert kwargs['permission_mode'] == 'bypassPermissions'
+
+
+@pytest.mark.asyncio
+async def test_stage_runner_context_kwargs_survive_forwarding_to_invoke_claude_agent(tmp_path):
+    """``usage_gate=None`` runs invoke_with_cap_retry's real forwarding layer, and
+    the autospec'd mock rejects any keyword the real invoke_claude_agent lacks."""
+    with patch(
+        'shared.cli_invoke.invoke_claude_agent', autospec=True, return_value=_STAGE_REPORT,
+    ) as mock_agent:
+        await run_stage(ReconciliationConfig(sandbox_recon_agents=False), tmp_path)
+
+    mock_agent.assert_called_once()
+    kwargs = mock_agent.call_args.kwargs
+    assert kwargs['setting_sources'] == []
+    assert kwargs['env_overrides'] == dict(RECONCILIATION_CLI_ENV_OVERRIDES)
+    assert kwargs['strict_mcp_config'] is True
