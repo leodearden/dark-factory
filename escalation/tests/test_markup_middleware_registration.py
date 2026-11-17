@@ -1224,6 +1224,7 @@ class TestAQuotedHtmlBlockIsFiledVerbatim:
     async def test_a_summary_element_is_still_refused_where_summary_is_a_parameter(
         self, tmp_path: Path, field: str,
     ):
+        """Pins the known false positive task 10551 exists to remove; expected to flip when it lands."""
         _, server = build(tmp_path)
 
         async with Client(server) as client:

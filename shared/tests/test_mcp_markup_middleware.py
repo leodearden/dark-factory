@@ -540,7 +540,7 @@ class TestB7ExemptTool:
     async def test_an_exempt_tool_emits_no_fact(self, policy):
         h = build_harness(policy, exempt_tools=frozenset({'scan_memory_content'}))
 
-        await h.call('scan_memory_content', {'needle': _closer('content')})
+        await h.call('scan_memory_content', {'needle': _closer('content') + INVOKE_CLOSER})
 
         assert h.facts == [], (
             'an exemption is a declaration that this is not a leak, so it must '
@@ -2963,7 +2963,9 @@ class TestB10StormEscape:
         )
 
         for _ in range(6):
-            await h.call('scan_memory_content', {'needle': _closer('content')})
+            await h.call(
+                'scan_memory_content', {'needle': _closer('content') + INVOKE_CLOSER}
+            )
             await h.call(
                 'submit_task',
                 {
