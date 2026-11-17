@@ -39,7 +39,9 @@ from shared.sqlite_column_migration import add_column_if_missing
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
 from fused_memory.services.read_rollup import (
     COUNT_READ_SQL,
+    KEPT_OPERATION_READ_PREDICATE,
     READ_OP_COUNTS_SCHEMA_SQL,
+    UNKEPT_OPERATION_READ_PREDICATE,
     keeps_read_row,
 )
 
@@ -328,8 +330,8 @@ def _prune_batch_sql(horizon_rows: str) -> str:
 #: ``(resume_from, cutoff, limit)``. Each range-seeks idx_wo_kind_time, and
 #: INDEXED BY pins it, so a missing index errors instead of scanning.
 WRITE_OPS_PRUNE_BATCH_SQL: Mapping[str, str] = MappingProxyType({
-    'read': _prune_batch_sql("kind = 'read' AND operation <> 'search'"),
-    'search': _prune_batch_sql("kind = 'read' AND operation = 'search'"),
+    'read': _prune_batch_sql(UNKEPT_OPERATION_READ_PREDICATE),
+    'search': _prune_batch_sql(KEPT_OPERATION_READ_PREDICATE),
     'write': _prune_batch_sql("kind = 'write'"),
 })
 
