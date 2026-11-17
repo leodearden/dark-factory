@@ -54,6 +54,7 @@ if TYPE_CHECKING:
 
     from orchestrator.config import OrchestratorConfig
     from orchestrator.routing import PlanShape, RoleDefaults, RoutingDecision
+    from orchestrator.workflow_types import WorkflowState
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +143,7 @@ async def resolve_and_record_route(
     in_memory_task: dict | None = None,
     cost_store: Any | None = None,
     applied_budget_usd: float | None = None,
+    phase: WorkflowState | None = None,
 ) -> RoutingDecision:
     """Resolve one out-of-band invocation's route and record the decision.
 
@@ -192,6 +194,11 @@ async def resolve_and_record_route(
         reading the advisory ``budget_usd`` as the enforced ceiling. ``None``
         (every other site) → the applied cap IS ``decision.budget_usd`` → no
         annotation, byte-equivalent event.
+    phase:
+        The workflow phase the dispatch runs in, stamped on the
+        ``routing_decision`` event row's ``phase`` column to match the site's
+        own ``invocation_end`` row. ``None`` (project-level deep_reviewer,
+        batch module_tagger) leaves the column NULL.
     """
     md: Mapping[str, Any] = task_metadata or {}
     routing_state = RoutingState.from_metadata(dict(md))
@@ -255,6 +262,7 @@ async def resolve_and_record_route(
         event_store.emit(
             EventType.routing_decision,
             task_id=task_id,
+            phase=phase.value if phase is not None else None,
             role=role_name,
             data=event_data,
         )
