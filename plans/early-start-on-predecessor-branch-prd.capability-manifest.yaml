@@ -46,11 +46,11 @@ tasks:
       - orchestrator/src/orchestrator/scheduler.py
       expect: present
   - name: early-start-config-group
-    binding: built here; the early_start group with its eight keys, enabled off in the code until T7 (contract, Config)
+    binding: built here; the early_start group with its seven keys, enabled off in the code until T7 (contract, Config)
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: max_stops_per_pair
+      pattern: stop_streak_pause
       paths:
       - orchestrator/src/orchestrator/config.py
       expect: present
@@ -401,15 +401,6 @@ tasks:
     delivered_check:
       kind: manual
       reason: Behavioural (tests 22, 31); no name marks it.
-  - name: stops-per-pair-refusal
-    binding: built here; the selection refuses a dependent with max_stops_per_pair early_start_stopped events for the pair (stop_limit, test 45); the count is read from the events
-    verdict: PASS
-    delivered_check:
-      kind: grep
-      pattern: \.max_stops_per_pair
-      paths:
-      - orchestrator/src/orchestrator/
-      expect: present
   - name: work-in-progress-committed-at-stop
     binding: built here; the stop commits the dependent's uncommitted work before the workflow exits (test 48)
     verdict: PASS

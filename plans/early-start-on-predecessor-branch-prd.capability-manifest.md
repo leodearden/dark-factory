@@ -34,8 +34,8 @@ Signal leaves: T8 and T9 (T9 carries the end-to-end proof if T8 closed without a
   - delivered_check: grep present, pattern `[Ss]uccessor`, paths `orchestrator/src/orchestrator/lock_table.py`
 - `successor-of-on-lock-event` → built here; lock_acquired for the dependent carries successor_of (contract, Events). **PASS**.
   - delivered_check: grep present, pattern `successor_of`, paths `orchestrator/src/orchestrator/scheduler.py`
-- `early-start-config-group` → built here; the early_start group with its eight keys, enabled off in the code until T7 (contract, Config). **PASS**.
-  - delivered_check: grep present, pattern `max_stops_per_pair`, paths `orchestrator/src/orchestrator/config.py`
+- `early-start-config-group` → built here; the early_start group with its seven keys, enabled off in the code until T7 (contract, Config). **PASS**.
+  - delivered_check: grep present, pattern `stop_streak_pause`, paths `orchestrator/src/orchestrator/config.py`
 - `early-start-group-hot-reloadable` → built here; early_start added to RELOADABLE_FIELDS (contract, Config: hot-reloadable). **PASS**.
   - delivered_check: grep present, pattern `["']early_start["']`, paths `orchestrator/src/orchestrator/config.py`
 - `early-start-dependency-answer` → built here; deps_verdict's opt-in input of waiting predecessors and its not-satisfied answer naming the predecessor (contract, Dependency test). **PASS**.
@@ -172,8 +172,6 @@ Signal leaves: T8 and T9 (T9 carries the end-to-end proof if T8 closed without a
   - delivered_check: grep present, pattern `\.stop_hard_cancel_secs`, paths `orchestrator/src/orchestrator/`
 - `stop-not-counted-and-shutdown-excluded` → built here; the stop is a requeue that does not count; a shutdown emits and counts nothing. **PASS**.
   - delivered_check: manual. Behavioural (tests 22, 31); no name marks it.
-- `stops-per-pair-refusal` → built here; the selection refuses a dependent with max_stops_per_pair early_start_stopped events for the pair (stop_limit, test 45); the count is read from the events. **PASS**.
-  - delivered_check: grep present, pattern `\.max_stops_per_pair`, paths `orchestrator/src/orchestrator/`
 - `work-in-progress-committed-at-stop` → built here; the stop commits the dependent's uncommitted work before the workflow exits (test 48). **PASS**.
   - delivered_check: manual. Behavioural; test 48 proves it.
 - `unknown-at-slot-end-re-asked` → built here; an unknown answer at slot end is asked again on the timer, with one escalation after unknown_streak_alert in a row (test 18 (i)). **PASS**.
