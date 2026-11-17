@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _open_l1_fixtures import submit_l1
 from _orch_helpers import pydantic_spec
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -228,20 +229,6 @@ def _submit_l0(queue: EscalationQueue, task_id: str = '2248') -> Escalation:
     return esc
 
 
-def _submit_l1(
-    queue: EscalationQueue, severity: str, agent_role: str = 'harness-info-l0-router',
-    task_id: str = '2248',
-) -> Escalation:
-    """Submit a pending level-1 record of the shape ``escalation_router._promote`` files."""
-    esc = Escalation(
-        id=queue.make_id(task_id), task_id=task_id, agent_role=agent_role,
-        severity=severity, category='design_concern',
-        summary=f'a {severity!r} L1 open on the task', level=1,
-    )
-    queue.submit(esc)
-    return esc
-
-
 def _workflow_on_a_real_queue(
     tmp_path: Path,
 ) -> tuple[TaskWorkflow, EscalationQueue, asyncio.Queue[PublishedStewardOutcome]]:
@@ -273,7 +260,7 @@ class TestAwaitStewardCompletionOverrideDismissesOrphanL0:
     ):
         wf, queue, channel = _workflow_on_a_real_queue(tmp_path)
         pending_l0 = _submit_l0(queue)
-        l1 = _submit_l1(queue, 'blocking', agent_role='steward')
+        l1 = submit_l1(queue, wf.task_id, 'blocking', agent_role='steward')
         channel.put_nowait(PublishedStewardOutcome(
             pending_l0.id, StewardInterrupted('attempt_cap', wip_commits_present=True),
         ))
@@ -295,7 +282,7 @@ class TestAwaitStewardCompletionOverrideDismissesOrphanL0:
         the wip-present ``StewardInterrupted`` case only."""
         wf, queue, channel = _workflow_on_a_real_queue(tmp_path)
         pending_l0 = _submit_l0(queue)
-        l1 = _submit_l1(queue, 'blocking', agent_role='steward')
+        l1 = submit_l1(queue, wf.task_id, 'blocking', agent_role='steward')
         channel.put_nowait(PublishedStewardOutcome(
             pending_l0.id, StewardResolved(resolution_text='fixed it'),
         ))
@@ -318,7 +305,7 @@ class TestRequeueOverrideIgnoresInfoL1:
     async def test_an_info_l1_leaves_a_resolution_to_requeue(self, tmp_path: Path):
         wf, queue, channel = _workflow_on_a_real_queue(tmp_path)
         awaited = _submit_l0(queue)
-        _submit_l1(queue, 'info')
+        submit_l1(queue, wf.task_id, 'info', agent_role='harness-info-l0-router')
         channel.put_nowait(PublishedStewardOutcome(awaited.id, StewardResolved('fixed it')))
 
         outcome = await wf._await_steward_completion(escalation_id=awaited.id)
@@ -330,7 +317,7 @@ class TestRequeueOverrideIgnoresInfoL1:
     ):
         wf, queue, channel = _workflow_on_a_real_queue(tmp_path)
         awaited = _submit_l0(queue)
-        _submit_l1(queue, 'info')
+        submit_l1(queue, wf.task_id, 'info', agent_role='harness-info-l0-router')
         interrupted = StewardInterrupted('attempt_cap', wip_commits_present=True)
         channel.put_nowait(PublishedStewardOutcome(awaited.id, interrupted))
 
@@ -341,13 +328,20 @@ class TestRequeueOverrideIgnoresInfoL1:
         assert still is not None
         assert still.status == 'pending'
 
-    async def test_the_override_names_the_hand_off_not_the_info_l1(
+    async def test_the_override_names_the_hand_off_not_an_info_l1(
         self, tmp_path: Path,
     ):
+        """Several info L1s surround the hand-off because ``get_by_task``
+        returns records in unsorted directory order: a regression naming the
+        first open L1 rather than the first hand-off then almost always names
+        an info id."""
         wf, queue, channel = _workflow_on_a_real_queue(tmp_path)
         awaited = _submit_l0(queue)
-        _submit_l1(queue, 'info')
-        hand_off = _submit_l1(queue, 'blocking', agent_role='steward')
+        for _ in range(3):
+            submit_l1(queue, wf.task_id, 'info', agent_role='harness-info-l0-router')
+        hand_off = submit_l1(queue, wf.task_id, 'blocking', agent_role='steward')
+        for _ in range(2):
+            submit_l1(queue, wf.task_id, 'info', agent_role='harness-info-l0-router')
         channel.put_nowait(PublishedStewardOutcome(awaited.id, StewardResolved('fixed it')))
 
         outcome = await wf._await_steward_completion(escalation_id=awaited.id)
@@ -360,7 +354,7 @@ class TestRequeueOverrideIgnoresInfoL1:
     ):
         wf, queue, channel = _workflow_on_a_real_queue(tmp_path)
         awaited = _submit_l0(queue)
-        l1 = _submit_l1(queue, severity)
+        l1 = submit_l1(queue, wf.task_id, severity, agent_role='harness-info-l0-router')
         channel.put_nowait(PublishedStewardOutcome(awaited.id, StewardResolved('fixed it')))
 
         outcome = await wf._await_steward_completion(escalation_id=awaited.id)
@@ -694,7 +688,7 @@ class TestScopedWaitSettlesOnTheAwaitedRecord:
             severity='blocking', category='task_failure', summary='main is red',
         )
         queue.submit(foreign_parent)
-        _submit_l1(queue, 'info', task_id='99')
+        submit_l1(queue, '99', 'info', agent_role='harness-info-l0-router')
         queue.resolve(
             foreign_parent.id, 'main fixed upstream',
             resolved_by='claude-task-99-steward',

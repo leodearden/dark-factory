@@ -28,6 +28,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _open_l1_fixtures import submit_l1
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     MOCK_WORKFLOW_PROJECT_ROOT,
@@ -36,7 +37,6 @@ from _orch_helpers import (
 )
 from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
-from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
 
@@ -2789,17 +2789,6 @@ class TestAwaitStewardCompletionReturnsOutcome:
 # ---------------------------------------------------------------------------
 
 
-def _submit_hand_off_l1(queue: EscalationQueue, task_id: str) -> Escalation:
-    """Submit the pending blocking L1 a steward files when it hands off to a human."""
-    esc = Escalation(
-        id=queue.make_id(task_id), task_id=task_id, agent_role='steward',
-        severity='blocking', category='task_failure',
-        summary='steward gave up on a chained L0', level=1,
-    )
-    queue.submit(esc)
-    return esc
-
-
 @pytest.mark.asyncio
 class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
     """Closes the multi-outcome silent-requeue gap: the steward processes
@@ -2859,7 +2848,7 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         """A lone StewardResolved is overridden by an open L1 — the
         source-of-truth backstop for the publish-timing race."""
         wf, queue = self._workflow(tmp_path, StewardResolved(resolution_text='fixed it'))
-        l1 = _submit_hand_off_l1(queue, wf.task_id)
+        l1 = submit_l1(queue, wf.task_id, 'blocking', agent_role='steward')
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 
@@ -2885,7 +2874,7 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf, queue = self._workflow(
             tmp_path, StewardInterrupted('attempt_cap', wip_commits_present=True),
         )
-        l1 = _submit_hand_off_l1(queue, wf.task_id)
+        l1 = submit_l1(queue, wf.task_id, 'blocking', agent_role='steward')
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 
@@ -2899,7 +2888,7 @@ class TestAwaitStewardCompletionDrainsAndGatesOnOpenL1:
         wf, queue = self._workflow(
             tmp_path, StewardResolved(resolution_text='fixed it'), status='done',
         )
-        _submit_hand_off_l1(queue, wf.task_id)
+        submit_l1(queue, wf.task_id, 'blocking', agent_role='steward')
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 

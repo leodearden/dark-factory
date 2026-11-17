@@ -36,6 +36,7 @@ from _merge_phase_fixtures import config as config
 from _merge_phase_fixtures import git_ops as git_ops
 from _merge_phase_fixtures import git_repo as git_repo
 from _merge_phase_fixtures import task_assignment as task_assignment
+from _open_l1_fixtures import submit_l1
 from _workflow_helpers import (
     AgentStub,
     _build_workflow_with_escalation,
@@ -75,24 +76,6 @@ def _submit_l2(queue: EscalationQueue, task_id: str, severity: str) -> Escalatio
         summary=f'a {severity!r} L2 open at merge entry',
         detail='a cluster the watcher promoted for a human',
         level=2,
-    )
-    queue.submit(esc)
-    return esc
-
-
-def _submit_l1(
-    queue: EscalationQueue, task_id: str, severity: str,
-    agent_role: str = 'harness-orphan-reaper',
-) -> Escalation:
-    """Submit a pending level-1 record at *severity*, as an earlier incarnation left it."""
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role=agent_role,
-        severity=severity,
-        category='design_concern',
-        summary=f'a {severity!r} L1 left by an earlier incarnation',
-        level=1,
     )
     queue.submit(esc)
     return esc
@@ -215,7 +198,7 @@ class TestInfoL1DoesNotHandOffAtTheWaitTail:
         )
         _wire_resolve_callback(queue, wf)
         submit = _stub_merge_internals(wf, monkeypatch)
-        info_l1 = _submit_l1(queue, task_id, 'info')
+        info_l1 = submit_l1(queue, task_id, 'info', agent_role='harness-orphan-reaper')
         _submit_gating_l0(queue, task_id)
         wf._steward_factory = _make_resolving_steward(queue, task_id)
 
@@ -239,7 +222,7 @@ class TestInfoL1DoesNotDivertTheStewardRequeue:
     ):
         queue = EscalationQueue(tmp_path / 'queue')
         task_id = task_assignment.task_id
-        l1 = _submit_l1(queue, task_id, severity, agent_role='harness-info-l0-router')
+        l1 = submit_l1(queue, task_id, severity, agent_role='harness-info-l0-router')
         workflow, scheduler, _ = _build_workflow_with_escalation(
             config, git_ops, task_assignment, AgentStub(), tmp_path,
             spawn_merge_worker=False,
@@ -304,7 +287,7 @@ class TestTheWaitTailNamesWhoActed:
 
         async def _escalate_once():
             if not stale and stale_l1_role is not None:
-                stale.append(_submit_l1(queue, task_id, 'blocking', stale_l1_role))
+                stale.append(submit_l1(queue, task_id, 'blocking', agent_role=stale_l1_role))
             _submit_gating_l0(queue, task_id)
             return WorkflowOutcome.ESCALATED
 
