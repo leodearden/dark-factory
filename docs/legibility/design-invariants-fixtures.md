@@ -42,10 +42,23 @@ gate consumers stay calibrated against one shared meaning per slug:
   `flag: <slug>` — plus the redesign that clears it, so the fixture also
   demonstrates the fix, not just the failure.
 - Code-snippet-shaped fixtures are annotated with the expected `/review`
-  Step 5.5 finding: an `invariant_findings` entry
-  `{"invariant": <slug>, "file": ..., "line": ..., "issue": ..., "severity": ...}`
-  (schema per phase2-architecture.md Step 8), with `severity` drawn from
-  `{high, warning, info}`.
+  Step 5.5 finding: a `findings` entry (schema
+  `skills/review/references/run-record.md` §Findings, fields per
+  `docs/quality-findings-contract.md` §1) restricted to the fields Step 5.5
+  decides —
+  `{"anchor": "<path>::<symbol>", "tags": ["inv-<n>"], "severity": ..., "statement": ...}`,
+  plus `proposal` where the fixture has one. `tags` shows only the lens,
+  `tags[0]`, which resolves to the expected slug through the normative
+  doc's `## INV-<n>` heading. The heuristic tag Step 5.5 appends when
+  `docs/code-quality.md` §"Relationship to the design invariants" names
+  one, and the `kind:` tag from run-record.md, are derived from those homes
+  and not copied here. `severity` is one of the contract §4 values
+  `high | medium | low`. `key`, `area`, `verdict`, `disposition` and the
+  run-record's other bookkeeping fields are omitted: they are minted or set
+  downstream of Step 5.5, and the fixture paths are illustrative, so no
+  real area or key exists. Verdict cells from walks before 2026-10-04 name
+  an `invariant_findings` entry: that is what Step 5.5 recorded until the
+  findings-contract rewrite (commit `20a3ed0ece`).
 
 **Rehearsal verdict-table legend.** The table at the end of this doc walks
 the AS-LANDED G7 text against every PRD-leaf-shaped fixture, and the
@@ -57,7 +70,7 @@ records the verdict each yields against the expected slug. Columns:
 | Fixture ID | `<INV-n>-<PRD\|CODE>` — identifies the fixture block and shape below |
 | Shape | `PRD` (walked against G7) or `CODE` (walked against Step 5.5) |
 | Invariant | The numeric alias + slug being targeted |
-| Expected slug | The exact slug string the gate/review text should emit |
+| Expected slug | The slug the G7 disposition names (PRD), or the slug the Step 5.5 finding's `inv-<n>` lens resolves to through the normative `## INV-<n>` heading (CODE) |
 | Verdict | The disposition the as-landed gate/review text actually yields when walked against the fixture |
 | Match | `Y` if the verdict's slug equals the expected slug, else `N` |
 
@@ -98,10 +111,10 @@ def dispatch_next(tasks):
     return tasks[0] if tasks else None
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "contracts-machine-checked", "file": "orchestrator/src/orchestrator/priority_router.py", "line": 5, "issue": "priority_boost routing contract lives only in a dispatcher-internal special-case and prose comment, not a declared/validated schema field", "severity": "high"}
+{"anchor": "orchestrator/src/orchestrator/priority_router.py::dispatch_next", "tags": ["inv-1"], "severity": "high", "statement": "priority_boost routing contract lives only in a dispatcher-internal special-case and prose comment, not a declared/validated schema field"}
 ```
 
 ## INV-2 `structured-facts-at-failure`
@@ -138,10 +151,10 @@ def handle_failure(log_text):
     escalate(f"{step} failed with {code}")
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "structured-facts-at-failure", "file": "orchestrator/src/orchestrator/step_reporter.py", "line": 11, "issue": "handle_failure regexes a printed log line to recover the step name and exit code that run_step already held in local variables", "severity": "high"}
+{"anchor": "orchestrator/src/orchestrator/step_reporter.py::handle_failure", "tags": ["inv-2"], "severity": "high", "statement": "handle_failure regexes a printed log line to recover the step name and exit code that run_step already held in local variables"}
 ```
 
 ## INV-3 `corroborate-before-acting`
@@ -171,10 +184,10 @@ def nightly_cleanup(snapshot):
             remove_task(row.task_id)
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "corroborate-before-acting", "file": "scripts/nightly_task_sweep.py", "line": 6, "issue": "remove_task is called from a cached snapshot row with no re-read of live task status immediately before the delete", "severity": "high"}
+{"anchor": "scripts/nightly_task_sweep.py::nightly_cleanup", "tags": ["inv-3"], "severity": "high", "statement": "remove_task is called from a cached snapshot row with no re-read of live task status immediately before the delete"}
 ```
 
 ## INV-4 `storm-escape-required`
@@ -206,10 +219,10 @@ def maybe_suppress_escalation(esc):
     return esc
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "storm-escape-required", "file": "escalation/src/escalation/dedup_filter.py", "line": 6, "issue": "_suppressed_count is incremented on every duplicate but never compared against a rate/streak threshold — no escalation path if suppression fires continuously", "severity": "high"}
+{"anchor": "escalation/src/escalation/dedup_filter.py::maybe_suppress_escalation", "tags": ["inv-4"], "severity": "high", "statement": "_suppressed_count is incremented on every duplicate but never compared against a rate/streak threshold — no escalation path if suppression fires continuously"}
 ```
 
 ## INV-5 `no-lockstep-duplication`
@@ -233,8 +246,9 @@ need to diverge intentionally.
 ### Code-snippet-shaped (`INV-5-CODE`)
 
 This fixture is deliberately distinct from the classifier.py/router.py
-category-table example in phase2-architecture.md's own Step 8 sample, so
-it is a genuine calibration rather than an echo of the doc's sample. (It
+category-table example that phase2-architecture.md's Step 8 sample carried
+before the findings-contract rewrite, so it is a genuine calibration
+rather than an echo of that sample. (It
 is also deliberately NOT about a retry/backoff schedule — a duplicated
 retry-absorb mechanism would read as an INV-4 `storm-escape-required`
 concern too and defeat the single-invariant requirement below.)
@@ -253,10 +267,10 @@ File `webhooks/src/webhooks/validator.py` (new, the violation):
 ALLOWED_EVENT_TYPES = ["task.created", "task.done", "task.blocked", "escalation.filed"]
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "no-lockstep-duplication", "file": "webhooks/src/webhooks/validator.py", "line": 2, "issue": "ALLOWED_EVENT_TYPES hand-copied from orchestrator/src/orchestrator/events.py (line 1) — no shared helper or import ties the two lists together, so they must be kept byte-for-byte identical by hand", "severity": "warning"}
+{"anchor": "webhooks/src/webhooks/validator.py::ALLOWED_EVENT_TYPES", "tags": ["inv-5"], "severity": "medium", "statement": "ALLOWED_EVENT_TYPES hand-copied from orchestrator/src/orchestrator/events.py::ALLOWED_EVENT_TYPES — no shared helper or import ties the two lists together, so they must be kept byte-for-byte identical by hand"}
 ```
 
 ## INV-6 `status-matches-liveness`
@@ -286,10 +300,10 @@ async def _bail_on_pressure(self) -> Outcome:
     return Outcome.CONTINUE
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "status-matches-liveness", "file": "orchestrator/src/orchestrator/pressure_bail.py", "line": 5, "issue": "the ABORTED exit releases the slot without writing a successor status, leaving an in-progress row with no live claimant and delegating its recovery to the stranded sweep by design", "severity": "high"}
+{"anchor": "orchestrator/src/orchestrator/pressure_bail.py::_bail_on_pressure", "tags": ["inv-6"], "severity": "high", "statement": "the ABORTED exit releases the slot without writing a successor status, leaving an in-progress row with no live claimant and delegating its recovery to the stranded sweep by design"}
 ```
 
 ## INV-7 `holds-owned-and-bounded`
@@ -320,10 +334,10 @@ def maybe_skip_recovery(task, open_escalations):
     return plan_recovery(task)
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "holds-owned-and-bounded", "file": "orchestrator/src/orchestrator/recovery_skip.py", "line": 5, "issue": "an open escalation vetoes recovery with no structured fact naming the pinning record, no streak counter, and no bound — the hold has no visible owner and can persist indefinitely in silence", "severity": "high"}
+{"anchor": "orchestrator/src/orchestrator/recovery_skip.py::maybe_skip_recovery", "tags": ["inv-7"], "severity": "high", "statement": "an open escalation vetoes recovery with no structured fact naming the pinning record, no streak counter, and no bound — the hold has no visible owner and can persist indefinitely in silence"}
 ```
 
 ## INV-8 `loop-thread-occupancy-bounded`
@@ -361,10 +375,10 @@ async def build_status_payload(board) -> dict:
     return {"badges": badges}
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "loop-thread-occupancy-bounded", "file": "dashboard/src/dashboard/status_badges.py", "line": 5, "issue": "build_status_payload runs a blocking git subprocess per task on the event-loop thread over the uncapped active_tasks set — nothing offloads the call and nothing bounds the item count, so worst-case occupancy scales with board size", "severity": "high"}
+{"anchor": "dashboard/src/dashboard/status_badges.py::build_status_payload", "tags": ["inv-8"], "severity": "high", "statement": "build_status_payload runs a blocking git subprocess per task on the event-loop thread over the uncapped active_tasks set — nothing offloads the call and nothing bounds the item count, so worst-case occupancy scales with board size"}
 ```
 
 ## INV-9 `one-fact-one-home`
@@ -402,10 +416,10 @@ def record_ruling(task, ruling: str) -> None:
     # nothing links the copies or says which one wins
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "one-fact-one-home", "file": "orchestrator/src/orchestrator/ruling_writer.py", "line": 3, "issue": "record_ruling writes the same ruling as independent prose into the task description and the PRD while the escalation record that owns the question is never updated — three copies, no designated home, no pointers, no reconciler, so the copies drift the moment any one is corrected", "severity": "warning"}
+{"anchor": "orchestrator/src/orchestrator/ruling_writer.py::record_ruling", "tags": ["inv-9"], "severity": "medium", "statement": "record_ruling writes the same ruling as independent prose into the task description and the PRD while the escalation record that owns the question is never updated — three copies, no designated home, no pointers, no reconciler, so the copies drift the moment any one is corrected"}
 ```
 
 ## INV-10 `guards-exercise-behaviour`
@@ -438,10 +452,10 @@ def test_runbook_derivation_is_task_scoped():
         assert _SCOPED_RE.search(cmd), f"unscoped SHA derivation: {cmd}"
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "guards-exercise-behaviour", "file": "tests/scripts/test_runbook_sha_derivation.py", "line": 1, "issue": "the guard asserts on the SPELLING of a documented command rather than on what the command resolves to: its character class excludes the hyphen, so orchestrate's `task/<task-id>` placeholder makes every CORRECT instruction in that runbook fail, while nothing here would notice a well-spelled command that returns the wrong commit — the derivation is runnable against a fixture repo and should be run", "severity": "warning"}
+{"anchor": "tests/scripts/test_runbook_sha_derivation.py::_SCOPED_RE", "tags": ["inv-10"], "severity": "medium", "statement": "the guard asserts on the SPELLING of a documented command rather than on what the command resolves to: its character class excludes the hyphen, so orchestrate's `task/<task-id>` placeholder makes every CORRECT instruction in that runbook fail, while nothing here would notice a well-spelled command that returns the wrong commit", "proposal": "Run the documented derivation against a fixture repo and assert it resolves this task's merge commit rather than main's tip."}
 ```
 
 ## INV-11 `no-silent-fail-soft`
@@ -480,10 +494,10 @@ def census(path: Path) -> int:
     return len(load_records(path))
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "no-silent-fail-soft", "file": "fused-memory/scripts/transcript_window_census.py", "line": 7, "issue": "load_records drops unparseable lines and returns a plain list, so census() returns a count its caller cannot distinguish from a complete one — the only trace of the shortfall is a debug log the caller never reads, and neither the return value nor the exit code carries it", "severity": "high"}
+{"anchor": "fused-memory/scripts/transcript_window_census.py::load_records", "tags": ["inv-11"], "severity": "high", "statement": "load_records drops unparseable lines and returns a plain list, so census() returns a count its caller cannot distinguish from a complete one — the only trace of the shortfall is a debug log the caller never reads, and neither the return value nor the exit code carries it"}
 ```
 
 ## INV-12 `exceptions-owned-or-ratified`
@@ -513,10 +527,10 @@ def convert(value):
     return int(value)  # type: ignore[arg-type]
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "exceptions-owned-or-ratified", "file": "orchestrator/src/orchestrator/coerce.py", "line": 2, "issue": "the type: ignore[arg-type] suppression carries no debt or ratified disposition in its trailing comment — no owning task/ticket, no ratification-table id — so nothing notices if this exemption should already have expired", "severity": "warning"}
+{"anchor": "orchestrator/src/orchestrator/coerce.py::convert", "tags": ["inv-12"], "severity": "medium", "statement": "the type: ignore[arg-type] suppression carries no debt or ratified disposition in its trailing comment — no owning task/ticket, no ratification-table id — so nothing notices if this exemption should already have expired"}
 ```
 
 ## INV-13 `readers-prove-their-producer`
@@ -549,10 +563,10 @@ def render_health(open_rows: list[DebtRow]) -> str:
     return f'non-convergence: open={len(open_rows)} unowned={unowned}'
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "readers-prove-their-producer", "file": "orchestrator/src/orchestrator/debt_report.py", "line": 3, "issue": "an empty debt table renders as status=ok, but nothing in this package writes a debt row — the counter is derived from rows that no producer creates, so a ledger with no producer is indistinguishable from a healthy one", "severity": "warning"}
+{"anchor": "orchestrator/src/orchestrator/debt_report.py::render_health", "tags": ["inv-13"], "severity": "medium", "statement": "an empty debt table renders as status=ok, but nothing in this package writes a debt row — the counter is derived from rows that no producer creates, so a ledger with no producer is indistinguishable from a healthy one"}
 ```
 
 ## INV-14 `sampler-vocabulary-one-table`
@@ -598,10 +612,10 @@ def test_gpu_admission_matches_collector() -> None:
     assert {key.metric for key in collect_gpu_metrics(lambda: 0.5)} == _GPU_METRICS
 ```
 
-**Expected `invariant_findings` entry**:
+**Expected `findings` entry**:
 
 ```json
-{"invariant": "sampler-vocabulary-one-table", "file": "sampler/src/sampler/gpu.py", "line": 1, "issue": "the admission set _GPU_METRICS and collect_gpu_metrics each spell gpu_busy_avg10 and gpu_read_ok, and neither is computed from sampler.metrics.METRIC_GROUPS — two homes for one vocabulary, held together only by a parity test", "severity": "warning"}
+{"anchor": "sampler/src/sampler/gpu.py::_GPU_METRICS", "tags": ["inv-14"], "severity": "medium", "statement": "the admission set _GPU_METRICS and collect_gpu_metrics each spell gpu_busy_avg10 and gpu_read_ok, and neither is computed from sampler.metrics.METRIC_GROUPS — two homes for one vocabulary, held together only by a parity test"}
 ```
 
 ## Rehearsal verdict table
@@ -875,10 +889,11 @@ Step 5.5 has itself changed since the INV-13 walk. The findings-contract
 rewrite (commit `20a3ed0ece`, 2026-10-04) has it record each violation as
 a `findings` entry whose lens, `tags[0]`, is `inv-<n>`, followed by the
 heuristic the invariant encodes when the quality doc names one; it no
-longer emits an `invariant_findings` entry. The expected entry under
-`INV-14-CODE` keeps the legend's `invariant_findings` shape so every CODE
-fixture reads alike, and the Verdict column below records what the current
-text yields.
+longer emits an `invariant_findings` entry. The Verdict column below
+records what the current text yields; its closing "in the legend's shape"
+clause restates the result in the `invariant_findings` shape the legend
+used until task 6891 realigned every CODE fixture's expected entry to the
+`findings` shape.
 
 The same snapshot caveat applies: the Verdict column transcribes phrasing
 as it read on 2026-10-12, not a live pin.
