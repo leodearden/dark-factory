@@ -1,4 +1,4 @@
-"""The consolidation-proposal ledger row: one vocabulary for its writer and its reader.
+"""The auto-consolidation ledger vocabulary: the proposal row and the two rows beside it.
 
 Recon Stage 1 emits a proposal through ``server/tools.py::propose_consolidation``
 and the auto-consolidation executor reads it back. Both go through this module,
@@ -12,7 +12,10 @@ moves it on with :func:`record_outcome`, rather than growing a second reader.
 The outcome also records what the adjudicator flow did to a proposal (PRD
 ``plans/consolidation-adjudicator-prd.md`` K6). Its decision and reason code
 are stored as the strings recorded, so an aged row still decodes after the
-adjudicator's vocabulary changes.
+adjudicator's vocabulary changes. Beside the proposal row that flow keeps an
+attempt row per members key (:func:`adjudication_attempt_key`, K4) and a
+calibration row per adjudicator identity (:func:`adjudicator_calibration_key`,
+K5); this module defines their identities, and their writers own the rest.
 
 Clock-injected like :mod:`fused_memory.reconciliation.recon_ledger`: the
 builder takes ``now`` and an outcome carries a caller-supplied ``acted_at``
@@ -36,9 +39,17 @@ from typing import Any, TypeVar
 
 from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation.consolidation_auto import AutoOutcome
-from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
+from fused_memory.reconciliation.recon_ledger import (
+    SERVICE_SCOPE_PROJECT_ID,
+    ReconLedgerRecord,
+    ReconLedgerStore,
+)
 
 RECORD_KIND_CONSOLIDATION_PROPOSAL = 'consolidation_proposal'
+#: One row per (project, members key): the adjudicator flow's bounded retry (PRD K4).
+RECORD_KIND_ADJUDICATION_ATTEMPT = 'consolidation_adjudication_attempt'
+#: One row per adjudicator identity, belonging to no project (PRD K5).
+RECORD_KIND_ADJUDICATOR_CALIBRATION = 'consolidation_adjudicator_calibration'
 
 #: The one caller that may propose (PRD D12): recon Stage 1. The stage deny
 #: lists enforce the same rule from the other side.
@@ -578,6 +589,40 @@ def members_key(member_ids: Sequence[str], members: Mapping[str, object]) -> str
     """
     pairs = sorted((member_id, content_sha256(members.get(member_id))) for member_id in member_ids)
     return hashlib.sha256(json.dumps(pairs, separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+def adjudication_attempt_key(project_id: str, members_key: str) -> dict[str, str]:
+    """The attempt row's identity, usable as ``ReconLedgerStore.get_by_identity(**key)``.
+
+    Its payload, states and expiry are its writer's (the executor).
+    """
+    if not project_id or project_id == SERVICE_SCOPE_PROJECT_ID:
+        raise ValueError(f'project_id must name a real project, got {project_id!r}')
+    if not members_key:
+        raise ValueError('members_key must not be blank')
+    return {
+        'project_id': project_id,
+        'record_kind': RECORD_KIND_ADJUDICATION_ATTEMPT,
+        'task_id': '',
+        'flag_type': members_key,
+        'run_id': '',
+    }
+
+
+def adjudicator_calibration_key(identity: str) -> dict[str, str]:
+    """The calibration row's identity, under :data:`SERVICE_SCOPE_PROJECT_ID`.
+
+    Its payload, states and expiry are its writer's (the calibration).
+    """
+    if not identity:
+        raise ValueError('identity must not be blank')
+    return {
+        'project_id': SERVICE_SCOPE_PROJECT_ID,
+        'record_kind': RECORD_KIND_ADJUDICATOR_CALIBRATION,
+        'task_id': '',
+        'flag_type': identity,
+        'run_id': '',
+    }
 
 
 def _payload_object(record: ReconLedgerRecord) -> dict[str, Any]:
