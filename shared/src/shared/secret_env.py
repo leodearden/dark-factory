@@ -17,7 +17,8 @@ view: ``OPERATIONS.md``.
 
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 
 from shared.python_env import without_python_env_selection
 
@@ -36,6 +37,7 @@ AGENT_CREDENTIAL_VAR = 'CLAUDE_CODE_OAUTH_TOKEN'
 AGENT_ENDPOINT_VARS = frozenset({'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN'})
 
 _SECRET_SUFFIXES = ('_API_KEY', '_TOKEN')
+_SESSION_CREDENTIALS = frozenset({AGENT_CREDENTIAL_VAR})
 
 
 def _is_pool_token_name(name: str) -> bool:
@@ -59,7 +61,7 @@ def _without_agent_endpoint_vars(environ: Mapping[str, str]) -> dict[str, str]:
 
 
 def agent_subprocess_env(
-    environ: Mapping[str, str], *, credentials: Collection[str] = (AGENT_CREDENTIAL_VAR,)
+    environ: Mapping[str, str], *, credentials: AbstractSet[str] = _SESSION_CREDENTIALS
 ) -> dict[str, str]:
     pool_names = sorted(name for name in credentials if _is_pool_token_name(name))
     if pool_names:

@@ -144,7 +144,7 @@ class TestAgentSubprocessEnv:
             assert child[name] == value
 
     def test_empty_credentials_keep_no_secret(self):
-        child = agent_subprocess_env(_environ_with_secrets(), credentials=())
+        child = agent_subprocess_env(_environ_with_secrets(), credentials=frozenset())
         assert {k for k in child if is_secret_env_name(k)} == set()
 
     def test_naming_a_credential_that_is_absent_adds_nothing(self):
