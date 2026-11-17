@@ -3,10 +3,16 @@
 import logging
 from pathlib import Path
 
+import pydantic
 import pytest
 import yaml
 
-from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig, TaskmasterConfig
+from fused_memory.config.schema import (
+    FusedMemoryConfig,
+    MemoryMetadataConfig,
+    OpenAIProviderConfig,
+    TaskmasterConfig,
+)
 
 _RETIRED_TASKMASTER_KEYS = ('transport', 'command', 'args', 'cwd', 'http_url', 'tool_mode')
 
@@ -92,7 +98,35 @@ class TestOpenAIProviderConfigRetiredKeys:
         assert any('organization_id' in message for message in _retired_warnings(caplog))
 
 
-@pytest.mark.parametrize('model', [TaskmasterConfig, OpenAIProviderConfig])
+class TestMemoryMetadataConfigRetiredKeys:
+    def test_enforce_kind_registry_is_dropped_and_named(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            cfg = MemoryMetadataConfig.model_validate({'enforce': False, 'enforce_kind_registry': True})
+
+        assert 'enforce_kind_registry' not in cfg.model_dump()
+        assert cfg.enforce is False
+        warnings = [
+            message for message in _retired_warnings(caplog)
+            if 'memory_metadata' in message and 'enforce_kind_registry' in message
+        ]
+        assert len(warnings) == 1, warnings
+
+    def test_yaml_section_with_the_retired_key_still_loads(self, tmp_path, monkeypatch, caplog):
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(yaml.safe_dump({'memory_metadata': {'enforce_kind_registry': False}}))
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+
+        with caplog.at_level(logging.WARNING):
+            FusedMemoryConfig()
+
+        assert any('enforce_kind_registry' in message for message in _retired_warnings(caplog))
+
+    def test_a_misspelt_retired_key_is_still_forbidden(self):
+        with pytest.raises(pydantic.ValidationError):
+            MemoryMetadataConfig.model_validate({'enforce_kind_regsitry': True})
+
+
+@pytest.mark.parametrize('model', [TaskmasterConfig, OpenAIProviderConfig, MemoryMetadataConfig])
 def test_no_live_field_is_dropped_as_retired(model, caplog):
     every_live_field = model().model_dump()
 
