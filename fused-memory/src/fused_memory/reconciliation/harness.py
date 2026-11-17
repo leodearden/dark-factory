@@ -66,6 +66,7 @@ from fused_memory.reconciliation.escalation_archive import (
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.finding_task_escalation import (
     FINDING_TASK_ESCALATION_CATEGORY,
+    LIVENESS_UNKNOWN_DETAIL_KEY,
     build_finding_task_escalation_kwargs,
     is_routable_task_id,
     recent_conversion_suppresses_refile,
@@ -271,11 +272,6 @@ _DEAD_OWNER_STORM_FINDING: dict[str, Any] = {
 # escalates within a watchable window (≈ 10–180 minutes depending on cycle
 # duration), long enough to filter transient findings.
 _INTEGRITY_FINDING_RECURRENCE_THRESHOLD = 4
-
-#: Detail key on a persistent-finding escalation listing the cited task ids
-#: whose liveness probe failed: the escalation filed because none was confirmed
-#: live, not because each was confirmed not live (task 5370).
-LIVENESS_UNKNOWN_DETAIL_KEY = 'liveness_unknown_task_ids'
 
 # Task 3049 amendment: hard ceiling on the EFFECTIVE value of
 # config.max_backlog_remediation_deferrals, derived from the threshold above so
