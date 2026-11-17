@@ -125,10 +125,9 @@ _VACUOUS_PASS = (
 )
 
 
-# The extraPaths entry the declared type gate depends on, and flat names that
-# stop resolving without it. Task 3456 added it, beside a scripts/legibility
-# entry task 6645 dropped once every legibility module was reached as
-# `legibility.<mod>`.
+# The extraPaths entry the root-run type gates depend on, and flat names that
+# stop resolving without it: measured at task 6645 (pyright 1.1.408) by deleting
+# the entry, when `pyright tests/scripts/` reported both as reportMissingImports.
 _REQUIRED_EXTRA_PATHS = ('scripts',)
 _UNRESOLVED_WITHOUT = ('legibility', 'source_measures')
 
@@ -1048,45 +1047,24 @@ def test_scripts_diff_is_lint_gated(
 def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
     """The ROOT ``[tool.pyright] extraPaths`` must carry scripts/.
 
-    A PRECONDITION for the type gate, not a general pyright-config preference,
-    which is why it lives beside the gate it protects rather than in its own
-    file. The declared ``type_check_command`` is
-    ``uv run --project shared pyright scripts/`` (task 4358; it was
-    ``npx pyright scripts/`` when this test was written): it carries no
-    ``--directory``, so it runs from the repo root either way and resolves
-    against the ROOT ``[tool.pyright]`` table — NOT against any per-package
-    pyproject.toml, and NOT against ``shared/``'s, since ``--project shared``
-    selects only the environment pyright is resolved from.
+    The declared ``type_check_command`` of this module
+    (``uv run --project shared pyright scripts/``, task 4358) and of the
+    ``tests/scripts`` module next door
+    (``uv run --project shared pyright tests/scripts/``, task 3842) carry no
+    ``--directory``, so both run from the repo root and resolve against the ROOT
+    ``[tool.pyright]`` table — not a per-package pyproject.toml, and not
+    ``shared/``'s, since ``--project shared`` selects only the environment
+    pyright is resolved from.
 
-    ``scripts/tests/conftest.py`` inserts ``scripts/`` onto sys.path at
-    runtime, so the test modules import flat names (``import source_measures``,
-    ``from legibility import census``) that only resolve for pyright if the
-    same directory is on extraPaths. Measured at the commit before task 3456
-    added it (beside a since-dropped ``scripts/legibility``), with the command
-    declared AT THAT TIME (``npx pyright scripts/``): exactly 9
-    reportMissingImports. The gate would then be RED for reasons unrelated to
-    any diff — an unresolved import is not a finding about the change under
-    review, and a permanently-red gate gets suppressed or ignored, which is how
-    a gate dies. ``scripts/legibility/`` stays absent so a bare sibling name is
-    reportMissingImports (scripts/tests/test_legibility_import_spelling.py).
-
-    TWO module gates depend on this entry, not one. The ``tests/scripts``
-    module config next door declares its own
-    ``uv run --project shared pyright tests/scripts/`` (task 3842), which also
-    runs from the repo root against this same root table, and five
-    of its modules import flat ``scripts/`` names. Those imports used to carry
-    ``# pyright: ignore[reportMissingImports]``; task 3456 dropped the pragmas
-    precisely BECAUSE the extraPaths entries made them resolve, so the masking
-    is gone and the dependency is now live. RE-MEASURED at task 3456's tip by
-    deleting its entries and re-running each command — under the npx-fronted
-    declarations both configs carried at that time, which changes which pyright
-    BINARY ran but not which config table it read: ``pyright scripts/`` ->
-    23 errors, 9 of them reportMissingImports; ``pyright tests/scripts/`` -> 8
-    errors, ALL reportMissingImports, naming migrate_metadata_modules_to_files,
-    drain_check, audit_wiped_metadata_files, repair_wiped_metadata_files,
-    reviewer_redundancy_diagnostic and trial_module_tagger_haiku. Removing the
-    entry is therefore a two-gate outage; this test failing alone would
-    under-report it.
+    The ``scripts`` entry resolves the flat names the conftests put on sys.path
+    at runtime (``import source_measures``, ``from legibility import census``).
+    Measured at task 6645 (pyright 1.1.408) by deleting it:
+    ``pyright tests/scripts/`` reported those names as reportMissingImports,
+    while ``pyright scripts/`` stayed clean. Task 3456 dropped the
+    ``# pyright: ignore[reportMissingImports]`` pragmas in ``tests/scripts``
+    because this entry made them resolve, so restoring the entry, not the
+    pragmas, is the fix. ``scripts/legibility/`` stays absent so a bare sibling
+    name is reportMissingImports (scripts/tests/test_legibility_import_spelling.py).
 
     MEMBERSHIP, never list equality or a length pin: adding a future entry is
     a legitimate change, not a regression, and an equality assertion would
@@ -1099,24 +1077,15 @@ def test_root_pyright_extrapaths_resolves_scripts_imports() -> None:
         assert required in extra_paths, (
             f'{required!r} missing from ROOT [tool.pyright] extraPaths = '
             f'{extra_paths!r} in {REPO_ROOT / "pyproject.toml"} (task 3456). '
-            f'The declared type gate for the {MODULE_PREFIX} module runs '
-            f'`uv run --project shared pyright {MODULE_PREFIX}/` FROM THE REPO '
-            f'ROOT (no --directory), so it resolves against this root table. '
-            f'Without it, pyright cannot resolve the flat names '
-            f'{list(_UNRESOLVED_WITHOUT)!r} that {MODULE_PREFIX}/tests/conftest.py '
-            f'puts on sys.path at runtime, and the gate reports RED for reasons '
-            f'unrelated to any diff, which is how a gate gets suppressed and dies. '
-            f'BLAST RADIUS IS TWO GATES, NOT ONE: the {SIBLING_PREFIX} module '
-            f'config declares its own '
-            f'`uv run --project shared pyright {SIBLING_PREFIX}/`, which '
-            f'also runs from the repo root against this same table, and task '
-            f'3456 dropped the `# pyright: ignore[reportMissingImports]` '
-            f'pragmas that were masking its five modules\' flat '
-            f'{MODULE_PREFIX}/ imports. Re-measured at task 3456\'s tip with '
-            f'its entries deleted: `pyright {MODULE_PREFIX}/` -> 23 errors '
-            f'(9 reportMissingImports), `pyright {SIBLING_PREFIX}/` -> 8 '
-            f'errors, ALL reportMissingImports. Restoring the entry is the '
-            f'fix for BOTH; re-adding pragmas to {SIBLING_PREFIX} is not'
+            f'The declared type gates of the {MODULE_PREFIX} and {SIBLING_PREFIX} '
+            f'modules run `uv run --project shared pyright <dir>/` FROM THE REPO '
+            f'ROOT (no --directory), so they resolve against this root table. '
+            f'Without the entry, `pyright {SIBLING_PREFIX}/` cannot resolve flat '
+            f'{MODULE_PREFIX}/ names such as {list(_UNRESOLVED_WITHOUT)!r} '
+            f'(measured at task 6645) and reports RED for reasons unrelated to any '
+            f'diff, which is how a gate gets suppressed and dies. Restoring the '
+            f'entry is the fix; re-adding `# pyright: ignore[reportMissingImports]` '
+            f'pragmas to {SIBLING_PREFIX} is not'
         )
 
 
