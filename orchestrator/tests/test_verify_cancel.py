@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
-from shared.proc_group import pid_running
+from df_pytest_isolation import read_proc_state, wait_pids_exited
 
 from orchestrator.verify_runner import HEARTBEAT_STOP_JOIN_SECS
 
@@ -1788,37 +1788,13 @@ time.sleep(300)
 '''
 
 
-def _is_running(pid: int) -> bool:
-    """Return True if *pid* is alive AND not a zombie.
-
-    ``os.kill(pid, 0)`` succeeding is not enough: it also returns success for
-    zombies (state 'Z') and for processes that were just SIGKILLed but not
-    yet torn down — both are still visible in /proc even though they have
-    already been killed. SIGKILL delivery, orphan reparenting, and the final
-    reap are all asynchronous, so treating a zombie as "alive" turns this
-    check into a wall-clock race under host load rather than a test of
-    whether reaping actually happened. A zombie has already been killed; its
-    lingering /proc entry just means its parent hasn't called wait() yet.
-    """
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        # Covers ProcessLookupError (no such pid) — a subclass of OSError —
-        # alongside PermissionError and friends.
-        return False
-    return pid_running(pid)
-
-
 def _poll_until(predicate, timeout, interval=0.1):
     """Poll *predicate* (a zero-arg callable) until truthy, or *timeout* expires.
 
     Checks immediately, then every *interval* seconds; returns True the
     moment *predicate()* is truthy, False once *timeout* elapses first. This
-    is the one poll/backoff primitive for the module — both
-    :func:`_wait_for_file` and :func:`_wait_until_all_dead` are expressed in
-    terms of it, rather than each hand-rolling its own deadline loop (the
-    same shape recurs as ``_wait_until`` in test_harness_resume_scheduler.py
-    and ``wait_until`` in test_lane_lock_leak_guard.py).
+    is the module's file-wait poll primitive, behind :func:`_wait_for_file`;
+    pid-exit waits use ``df_pytest_isolation.py::wait_pids_exited`` instead.
     """
     import time
     deadline = time.monotonic() + timeout
@@ -1832,22 +1808,6 @@ def _poll_until(predicate, timeout, interval=0.1):
 def _wait_for_file(path, timeout=10.0, interval=0.1):
     """Poll until *path* exists or *timeout* expires. Return True if found."""
     return _poll_until(path.exists, timeout, interval)
-
-
-def _wait_until_all_dead(pids, timeout=5.0, interval=0.02):
-    """Poll until every pid in *pids* is dead per :func:`_is_running`.
-
-    Returns whatever pids are still alive once *timeout* expires (empty if
-    all died sooner). Used instead of a fixed sleep so the check only waits
-    as long as the async SIGKILL/reparent/reap sequence actually takes on
-    this host, while still failing loudly if a pid never dies: a genuinely
-    un-reaped ``start_new_session`` escapee keeps sleeping (state 'S'/'R')
-    and will still be in the returned list at the deadline.
-    """
-    _poll_until(
-        lambda: not any(_is_running(pid) for pid in pids), timeout, interval
-    )
-    return [pid for pid in pids if _is_running(pid)]
 
 
 @pytest.mark.timeout(60)
@@ -1888,7 +1848,10 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     all_pids = collect_descendants(pgid, ppid_map) | {pgid}
 
     # Verify the tree is alive before cancelling
-    assert _is_running(pgid), f'root pid {pgid} not running before cancel'
+    root_state = read_proc_state(pgid)
+    assert root_state is not None and not root_state.exited, (
+        f'root pid {pgid} not running before cancel (state={root_state})'
+    )
 
     # Run cancel_request (uses real /proc walk internally)
     rc = cancel_request(pgid_file_path)
@@ -1896,25 +1859,14 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     assert rc == 0, f'cancel_request returned {rc}, expected 0'
     assert not pgid_file_path.exists(), 'pgid file must be removed on success'
 
-    # Reap the root zombie so this pytest process doesn't leak a child entry,
-    # and to confirm root actually exited (rather than merely left the
-    # tracked-pid set for some other reason). Note this is no longer
-    # load-bearing for the alive check below: _is_running already treats
-    # state 'Z' as dead, so a not-yet-reaped root zombie wouldn't be
-    # misreported as alive even without this wait.
+    # Reap root so this pytest process doesn't leak a child entry. The bounded
+    # poll counts a zombie as exited (df_pytest_isolation.py::wait_pids_exited).
     root_proc.wait(timeout=5)
 
-    # Poll (rather than sleep a fixed amount) until every tracked pid is
-    # confirmed dead. SIGKILL delivery, orphan reparenting to init, and the
-    # final reap are all asynchronous — a fixed sleep races host scheduling
-    # load, while a bounded poll only waits as long as actually needed and
-    # still fails loudly if a pid is never reaped (see _wait_until_all_dead).
-    # timeout is intentionally left at _wait_until_all_dead's own default
-    # (single source of truth) rather than repeated here.
-    still_alive = _wait_until_all_dead(all_pids)
-    assert still_alive == [], (
+    still_running = wait_pids_exited(all_pids, timeout=5.0)
+    assert still_running == {}, (
         f'These pids survived cancel_request (start_new_session escapes not reaped?): '
-        f'{still_alive}. (On the off chance one of these pid numbers was '
+        f'{still_running}. (On the off chance one of these pid numbers was '
         f'recycled by the host to an unrelated process during the poll '
         f'window rather than being a genuine escapee, cross-check it '
         f'against read_ppid_map() output captured around this time.)'
