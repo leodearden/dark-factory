@@ -1183,6 +1183,7 @@ def _derive_fallback_runs(
     worktree_reader: Callable[[str], str | None],
     *,
     role: Literal['merge', 'task'] = 'task',
+    fallback_test_floor: bool = True,
 ) -> list[PlannedRun]:
     """Derive the fallback (no-module_configs) branch's PlannedRuns.
 
@@ -1202,7 +1203,8 @@ def _derive_fallback_runs(
 
     The fallback test floor (``orchestrator/src/orchestrator/verify_fallback_floor.py::fallback_test_floor_reason``)
     then replaces that pytest decision with ``config.test_command`` run whole
-    for *role*; rationale: docs/fallback-test-floor.md.
+    for *role* (unless *fallback_test_floor* is False); rationale:
+    docs/fallback-test-floor.md.
 
     Fidelity caveat: this derives an IDEALIZED D1/D2 record against the flat
     *existing_files* list and *config*'s global commands — it does NOT model
@@ -1311,13 +1313,14 @@ def _derive_fallback_runs(
         ))
 
     pytest_run = _fallback_pytest_decision(kinds, test_command)
-    floor = fallback_test_floor_reason(
-        existing_files, test_command, role, derived_target=pytest_run.cmd is not None,
-    )
-    if floor is not None:
-        pytest_run = PlannedRun(
-            _FALLBACK_PREFIX, parse_config_command(test_command), ScopeKind.FULL_SUITE, floor,
+    if fallback_test_floor:
+        floor = fallback_test_floor_reason(
+            existing_files, test_command, role, derived_target=pytest_run.cmd is not None,
         )
+        if floor is not None:
+            pytest_run = PlannedRun(
+                _FALLBACK_PREFIX, parse_config_command(test_command), ScopeKind.FULL_SUITE, floor,
+            )
     runs.append(pytest_run)
 
     return runs
@@ -1419,6 +1422,7 @@ def derive_verify_plan(
     role: Literal['merge', 'task'] = 'task',
     *,
     list_pkg_tests: Callable[[str], list[str]] | None = None,
+    fallback_test_floor: bool = True,
 ) -> VerifyPlan:
     """Derive the declarative VerifyPlan for one verify attempt (PRD task γ).
 
@@ -1452,7 +1456,10 @@ def derive_verify_plan(
 
     Fallback branch (*module_configs* empty): a single synthetic
     ``'__fallback__'`` module is derived from *config*'s global commands via
-    :func:`_derive_fallback_runs`.
+    :func:`_derive_fallback_runs`. *fallback_test_floor* False returns the
+    fallback branch's pytest decision before the test floor;
+    ``verify.py::_safe_derive_executed_fallback_plan`` passes it because the
+    executed record takes its floor from the execution layer alone.
 
     Fidelity: this plan is no longer just a decision record on either branch
     (task κ, verify-scope-inversion-prd.md) — by the time it reaches
@@ -1493,6 +1500,7 @@ def derive_verify_plan(
         return VerifyPlan(runs=tuple(runs))
     return VerifyPlan(runs=tuple(_derive_fallback_runs(
         existing_files, config, worktree_reader, role=role,
+        fallback_test_floor=fallback_test_floor,
     )))
 
 

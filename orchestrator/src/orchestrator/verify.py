@@ -9123,7 +9123,10 @@ def _safe_derive_executed_fallback_plan(
     path — it is meaningless without an *executed_fallback* to reconcile
     against): it is ``widen_fallback_for_marker_deselection``'s or the fallback
     test floor's reason, which :func:`_executed_fallback_plan` needs in order to
-    record a pytest-slot rewrite the executed config already applied. A bug in the
+    record a pytest-slot rewrite the executed config already applied. With an
+    *executed_fallback* the decision is derived before its test floor, so the
+    executed record takes its floor from the execution layer alone; without one
+    the floored decision is returned. A bug in the
     decision layer or this reconciliation — an unforeseen ``VerifyCmd``/
     dataclass edge — must never fail an otherwise-passing verify attempt
     just because its plan couldn't be built. Catches broadly and logs a
@@ -9133,6 +9136,7 @@ def _safe_derive_executed_fallback_plan(
     try:
         plan = verify_plan.derive_verify_plan(
             existing_files, module_configs, config, worktree_reader, role=role,
+            fallback_test_floor=executed_fallback is None,
         )
         if executed_fallback is not None:
             plan = _executed_fallback_plan(
