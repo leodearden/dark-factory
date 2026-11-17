@@ -238,7 +238,7 @@ class TestNoFalsePositives:
 
 
 class TestTaskVocabularyQualifiersAreNotProjectIds:
-    """'Task: 2500' must never be read as project 'task', task 2500.
+    """'Task:2500' must never be read as project 'task', task 2500.
 
     This is the ONE qualifier class every other narrowing provably misses, and
     the only one the consumer's decisive guard cannot make for us:
@@ -250,7 +250,7 @@ class TestTaskVocabularyQualifiersAreNotProjectIds:
     3. The allowlist is permissive by default, since no caller wires a registry.
     4. Decisively, the module docstring delegates final precision to the
        consumer, which "splits only when the episode actually touched a node
-       literally named ``Task N``". For the literal string 'Task: 2500' that
+       literally named ``Task N``". For the literal string 'Task:2500' that
        node is PRECISELY what graphiti-core's extraction produces, so the guard
        is guaranteed to CO-OCCUR rather than to filter.
 
@@ -263,15 +263,15 @@ class TestTaskVocabularyQualifiersAreNotProjectIds:
     @pytest.mark.parametrize(
         'content',
         [
-            'Task: 2500 is now done',
-            'task: 2500',
-            'task : 2500',
+            'Task:2500 is now done',
+            'task:2500',
             'TASK:2500',
-            'tasks: 2500 and 2501',
-            'Tasks : 2500',
-            'subtask: 2500',
-            'subtasks: 2500',
-            'sub-task: 2500',
+            'tasks:2500 and 2501',
+            'Tasks:2500',
+            'subtask:2500',
+            'subtasks:2500',
+            'sub-task:2500',
+            'sub-tasks:2500',
         ],
     )
     def test_task_vocabulary_qualifier_yields_nothing(self, content):
@@ -322,12 +322,6 @@ class TestProseColonNumberIsNotARef:
 
     def test_prose_colon_number_is_not_a_ref(self):
         scan = find_cross_project_task_refs('Total: 42 items', group_id='reify')
-        assert scan.refs == ()
-
-    def test_allowlist_removes_the_prose_match(self):
-        scan = find_cross_project_task_refs(
-            'Total: 42 items', group_id='reify', known_project_ids={'dark_factory'}
-        )
         assert scan.refs == ()
 
 

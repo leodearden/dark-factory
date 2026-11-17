@@ -103,7 +103,7 @@ class TestRegistry:
     )
     def test_without_a_usable_registry_a_text_qualifier_binds_nothing(self, known_projects):
         bindings = bind_tasks(
-            [_note('n1', 'Total: 42 and localhost:6379')],
+            [_note('n1', 'total:42 and localhost:6379')],
             project_id=PROJECT, known_projects=known_projects,
         )
         assert bindings.tasks == ()
