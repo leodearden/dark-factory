@@ -18,11 +18,11 @@ BARE_PYTEST_DEFAULT = 'pytest'
 
 # Every reason starts with 'pytest:': verify_plan.planned_run_leg routes a
 # PlannedRun to its test slot by that prefix.
-_CONFIGURED_SUITE_REASON = (
+CONFIGURED_SUITE_REASON = (
     'pytest: no test target derivable from the touched .py file(s) — configured '
     'test_command runs verbatim as the fallback floor (task 7041)'
 )
-_MERGE_BARE_DEFAULT_REASON = (
+MERGE_BARE_DEFAULT_REASON = (
     "pytest: no test target derivable and only the bare 'pytest' default is "
     'configured — the merge role runs it whole, so a tree with no tests fails '
     '(rc=5) instead of reading green (task 7041)'
@@ -33,7 +33,7 @@ def has_configured_suite(test_command: str | None) -> bool:
     return bool(test_command) and test_command != BARE_PYTEST_DEFAULT
 
 
-def _non_python_reason(path: str) -> str:
+def non_python_reason(path: str) -> str:
     return (
         f'pytest: diff carries non-Python source ({path}) that no Python-derived '
         'target covers — configured test_command runs verbatim (task 8714)'
@@ -51,13 +51,13 @@ def fallback_test_floor_reason(
         return None
     non_python = next((f for f in files if f.endswith(NON_PYTHON_SOURCE_EXTENSIONS)), None)
     if non_python is not None:
-        return _non_python_reason(non_python)
+        return non_python_reason(non_python)
     if derived_target:
         return None
     if has_configured_suite(test_command):
-        return _CONFIGURED_SUITE_REASON
+        return CONFIGURED_SUITE_REASON
     if role == 'merge':
-        return _MERGE_BARE_DEFAULT_REASON
+        return MERGE_BARE_DEFAULT_REASON
     return None
 
 

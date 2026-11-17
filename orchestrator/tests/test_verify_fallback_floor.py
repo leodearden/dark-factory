@@ -16,12 +16,22 @@ import pytest
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify_cmd import parse_config_command
+from orchestrator.verify_evidence import Leg
 from orchestrator.verify_fallback_floor import (
+    CONFIGURED_SUITE_REASON,
+    MERGE_BARE_DEFAULT_REASON,
     apply_fallback_test_floor,
     fallback_test_floor_reason,
     has_configured_suite,
+    non_python_reason,
 )
-from orchestrator.verify_plan import PlannedRun, ScopeKind, VerifyPlan, derive_verify_plan
+from orchestrator.verify_plan import (
+    PlannedRun,
+    ScopeKind,
+    VerifyPlan,
+    derive_verify_plan,
+    planned_run_leg,
+)
 
 REIFY_TEST_COMMAND = './scripts/verify.sh test --scope branch --include-infra'
 
@@ -61,9 +71,7 @@ class TestFallbackTestFloorDecision:
         after, reason = apply_fallback_test_floor(before, REIFY_9839_FILES, REIFY_TEST_COMMAND, role)
 
         assert after.test_command == REIFY_TEST_COMMAND
-        assert reason is not None
-        assert reason.startswith('pytest:')
-        assert '7041' in reason
+        assert reason == CONFIGURED_SUITE_REASON
         _assert_only_test_slot_moved(before, after)
 
     @pytest.mark.parametrize('role', ROLES)
@@ -73,9 +81,7 @@ class TestFallbackTestFloorDecision:
         after, reason = apply_fallback_test_floor(before, REIFY_9761_FILES, REIFY_TEST_COMMAND, role)
 
         assert after.test_command == REIFY_TEST_COMMAND
-        assert reason is not None
-        assert reason.startswith('pytest:')
-        assert REIFY_9761_RS_FILE in reason
+        assert reason == non_python_reason(REIFY_9761_RS_FILE)
         _assert_only_test_slot_moved(before, after)
 
     @pytest.mark.parametrize('role', ROLES)
@@ -86,8 +92,7 @@ class TestFallbackTestFloorDecision:
         after, reason = apply_fallback_test_floor(before, files, REIFY_TEST_COMMAND, role)
 
         assert after.test_command == REIFY_TEST_COMMAND
-        assert reason is not None
-        assert 'crates/a/src/lib.rs' in reason
+        assert reason == non_python_reason('crates/a/src/lib.rs')
         _assert_only_test_slot_moved(before, after)
 
     @pytest.mark.parametrize('role', ROLES)
@@ -114,8 +119,7 @@ class TestFallbackTestFloorDecision:
         after, reason = apply_fallback_test_floor(before, ['pkg/helpers.py'], 'pytest', 'merge')
 
         assert after.test_command == 'pytest'
-        assert reason is not None
-        assert reason.startswith('pytest:')
+        assert reason == MERGE_BARE_DEFAULT_REASON
         _assert_only_test_slot_moved(before, after)
 
     def test_bare_default_polyglot_never_yields_no_test_command(self):
@@ -125,8 +129,7 @@ class TestFallbackTestFloorDecision:
         after, reason = apply_fallback_test_floor(before, files, 'pytest', 'task')
 
         assert after.test_command == 'pytest'
-        assert reason is not None
-        assert reason.startswith('pytest:')
+        assert reason == non_python_reason('crates/a/src/lib.rs')
 
     @pytest.mark.parametrize('test_command', [None, ''])
     @pytest.mark.parametrize('files', [REIFY_9839_FILES, REIFY_9761_FILES])
@@ -149,6 +152,14 @@ class TestFallbackTestFloorDecision:
 
         assert reason is None
 
+    @pytest.mark.parametrize('reason', [
+        CONFIGURED_SUITE_REASON, MERGE_BARE_DEFAULT_REASON, non_python_reason('crates/a/src/lib.rs'),
+    ])
+    def test_every_floor_reason_routes_to_the_test_leg(self, reason):
+        run = PlannedRun('__fallback__', parse_config_command('pytest'), ScopeKind.FULL_SUITE, reason)
+
+        assert planned_run_leg(run) is Leg.TEST
+
     @pytest.mark.parametrize('test_command', [None, '', 'pytest'])
     def test_has_configured_suite_rejects_absent_and_bare_default(self, test_command):
         assert has_configured_suite(test_command) is False
@@ -168,9 +179,18 @@ def _config(test_command: str) -> OrchestratorConfig:
 
 
 def _fallback_plan(
-    files: list[str], test_command: str, role: Literal['merge', 'task'],
+    files: list[str], test_command: str, role: Literal['merge', 'task'], *, floor: bool = True,
 ) -> VerifyPlan:
-    return derive_verify_plan(files, [], _config(test_command), lambda _path: None, role=role)
+    return derive_verify_plan(
+        files, [], _config(test_command), lambda _path: None, role=role,
+        fallback_test_floor=floor,
+    )
+
+
+def _unfloored_pytest_run(
+    files: list[str], test_command: str, role: Literal['merge', 'task'],
+) -> PlannedRun:
+    return _run_for(_fallback_plan(files, test_command, role, floor=False), 'pytest:')
 
 
 def _run_for(plan: VerifyPlan, leg_prefix: str) -> PlannedRun:
@@ -189,7 +209,7 @@ class TestFallbackPlanRecordsFloor:
         assert run.scope_kind is ScopeKind.FULL_SUITE
         assert run.cmd == parse_config_command(REIFY_TEST_COMMAND)
         assert run.scoped_targets == ()
-        assert '7041' in run.reason
+        assert run.reason == CONFIGURED_SUITE_REASON
 
     @pytest.mark.parametrize('role', ROLES)
     def test_reify_9761_polyglot_records_non_python_floor(self, role):
@@ -197,32 +217,33 @@ class TestFallbackPlanRecordsFloor:
 
         assert run.scope_kind is ScopeKind.FULL_SUITE
         assert run.cmd == parse_config_command(REIFY_TEST_COMMAND)
-        assert REIFY_9761_RS_FILE in run.reason
+        assert run.reason == non_python_reason(REIFY_9761_RS_FILE)
 
     def test_bare_default_source_only_runs_whole_at_merge_role(self):
         run = _run_for(_fallback_plan(['pkg/helpers.py'], 'pytest', 'merge'), 'pytest:')
 
         assert run.scope_kind is ScopeKind.FULL_SUITE
         assert run.cmd == parse_config_command('pytest')
+        assert run.reason == MERGE_BARE_DEFAULT_REASON
 
     def test_bare_default_source_only_keeps_the_task_role_skip(self):
         run = _run_for(_fallback_plan(['pkg/helpers.py'], 'pytest', 'task'), 'pytest:')
 
         assert run.scope_kind is ScopeKind.SKIPPED
-        assert run.cmd is None
-        assert run.reason == 'pytest: no collectable test files touched — nothing to run'
+        assert run == _unfloored_pytest_run(['pkg/helpers.py'], 'pytest', 'task')
 
     def test_bare_default_data_module_runs_whole_at_merge_role(self):
         run = _run_for(_fallback_plan(['tests/some_data.py'], 'pytest', 'merge'), 'pytest:')
 
         assert run.scope_kind is ScopeKind.FULL_SUITE
         assert run.cmd == parse_config_command('pytest')
+        assert run.reason == MERGE_BARE_DEFAULT_REASON
 
     def test_bare_default_data_module_keeps_the_task_1852_skip(self):
         run = _run_for(_fallback_plan(['tests/some_data.py'], 'pytest', 'task'), 'pytest:')
 
         assert run.scope_kind is ScopeKind.SKIPPED
-        assert '1852' in run.reason
+        assert run == _unfloored_pytest_run(['tests/some_data.py'], 'pytest', 'task')
 
     @pytest.mark.parametrize('role', ROLES)
     def test_configured_suite_with_collectable_test_keeps_its_verbatim_reason(self, role):
@@ -230,8 +251,7 @@ class TestFallbackPlanRecordsFloor:
 
         assert run.scope_kind is ScopeKind.FULL_SUITE
         assert run.cmd == parse_config_command(REIFY_TEST_COMMAND)
-        assert 'verbatim' in run.reason
-        assert '7041' not in run.reason
+        assert run == _unfloored_pytest_run(['tests/test_widget.py'], REIFY_TEST_COMMAND, role)
 
     @pytest.mark.parametrize('leg_prefix', ['lint:', 'pyright:'])
     @pytest.mark.parametrize('files', [REIFY_9839_FILES, REIFY_9761_FILES])
@@ -298,7 +318,7 @@ class TestRunScopedVerificationFallbackFloor:
         assert run['scope_kind'] == 'full_suite'
         assert run['module_prefix'] == executed.prefix
         assert run['cmd']['raw'] == REIFY_TEST_COMMAND
-        assert '7041' in run['reason']
+        assert run['reason'] == CONFIGURED_SUITE_REASON
 
     @pytest.mark.parametrize('role', ROLES)
     async def test_reify_9761_polyglot_executes_configured_command(self, tmp_path, role):
@@ -309,7 +329,7 @@ class TestRunScopedVerificationFallbackFloor:
         assert executed.test_command == REIFY_TEST_COMMAND
         assert run['scope_kind'] == 'full_suite'
         assert run['cmd']['raw'] == REIFY_TEST_COMMAND
-        assert REIFY_9761_RS_FILE in run['reason']
+        assert run['reason'] == non_python_reason(REIFY_9761_RS_FILE)
 
     async def test_pure_subproject_source_diff_executes_configured_command(self, tmp_path):
         _write_files(tmp_path, ['backend/pyproject.toml', 'backend/app/x.py'])
@@ -370,5 +390,6 @@ class TestRunScopedVerificationFallbackFloor:
         )
 
         assert executed.test_command == REIFY_TEST_COMMAND
-        assert 'verbatim' in run['reason']
-        assert '7041' not in run['reason']
+        assert run['reason'] == _unfloored_pytest_run(
+            ['tests/test_widget.py'], REIFY_TEST_COMMAND, role,
+        ).reason
