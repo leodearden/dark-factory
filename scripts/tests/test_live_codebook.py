@@ -8,6 +8,7 @@ merger's own unit tests stay in test_codebook.py.
 """
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -20,26 +21,35 @@ from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
-
-# ---------------------------------------------------------------------------
-# step-17: RED (live-file guard, PRD §11 γ observable) — committed codebook
-# ---------------------------------------------------------------------------
-
 # scripts/tests/test_live_codebook.py -> scripts/tests/ -> scripts/ -> repo root
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _LIVE_CODEBOOK_PATH = _REPO_ROOT / "docs" / "legibility" / "confusion-codebook.yaml"
 
 
-def test_live_codebook_is_v2_and_validates_green():
+@pytest.fixture(scope="module")
+def _loaded_live_codebook() -> dict:
+    return mod.load(_LIVE_CODEBOOK_PATH)
+
+
+@pytest.fixture
+def live_codebook(_loaded_live_codebook: dict) -> dict:
+    """The committed codebook, parsed once per module; each test gets its own
+    deep copy, so no guard can see another's mutation."""
+    return copy.deepcopy(_loaded_live_codebook)
+
+
+# ---------------------------------------------------------------------------
+# The committed codebook as a whole
+# ---------------------------------------------------------------------------
+
+def test_live_codebook_is_v2_and_validates_green(live_codebook):
     """Pins that the committed registry conforms post-migration and guards
-    future hand-edits: version == 2 and validate() returns zero errors.
-    RED until the in-place v1->v2 migration lands (file is still v1)."""
-    codebook = mod.load(_LIVE_CODEBOOK_PATH)
-    assert codebook["version"] == 2
-    assert mod.validate(codebook) == []
+    future hand-edits: version == 2 and validate() returns zero errors."""
+    assert live_codebook["version"] == 2
+    assert mod.validate(live_codebook) == []
 
 
-def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate():
+def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate(live_codebook):
     """Live-file guard against the resurrection that already happened.
 
     (a) is the resurrection signature: the merger fabricated a *pending* twin
@@ -60,10 +70,8 @@ def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate():
     resurrected record, so the repair can only restore its verdict, not erase
     it, and a "no duplicate titles" assertion could never go green.
     """
-    codebook = mod.load(_LIVE_CODEBOOK_PATH)
-
     by_title = {}
-    for candidate in codebook.get("candidates") or []:
+    for candidate in live_codebook.get("candidates") or []:
         by_title.setdefault(candidate.get("title"), []).append(candidate)
 
     def _describe(title):
@@ -103,7 +111,7 @@ def test_live_codebook_has_no_pending_twin_of_an_adjudicated_candidate():
 
 # ---------------------------------------------------------------------------
 # Shared machinery for the live-file guards below (tasks 4892, 5198, 5687,
-# 5729).
+# 5729, 7448).
 # Each asserts that a committed §7.3 coding record and the merger-owned
 # registry still agree; the comparison itself is single-sourced here, so each
 # guard states only what is distinctive about its own correction and a fix to
@@ -186,6 +194,7 @@ def _assert_sighting_carries(record: dict, payload: dict, holder: dict) -> None:
 
 
 def _assert_correction_absorbed(
+    codebook: dict,
     record_path: Path,
     session: str,
     entry_id: str,
@@ -195,7 +204,7 @@ def _assert_correction_absorbed(
     original_sightings: dict[str, str],
 ) -> tuple[dict, dict, dict]:
     """Assert the *session* correction committed in *record_path* is fully
-    absorbed by the committed registry, and hand back its
+    absorbed by *codebook*, the committed registry, and hand back its
     ``(record, correction, entry)`` triple for whatever else a caller pins.
 
     A correction REWRITES merger-owned fields in place — the one op in the
@@ -250,7 +259,6 @@ def _assert_correction_absorbed(
     correction = corrections[0]
     assert correction.get("entry_id") == entry_id
 
-    codebook = mod.load(_LIVE_CODEBOOK_PATH)
     entry = _live_entry(codebook, entry_id)
 
     # (1) AGREEMENT — entry fields, then the provenance sighting.
@@ -338,7 +346,7 @@ def _t4892_carriers(codebook: dict, record: dict):
         ]
 
 
-def test_live_codebook_carries_the_task_4892_corrections():
+def test_live_codebook_carries_the_task_4892_corrections(live_codebook):
     """The committed §7.3 record and the committed registry still agree.
 
     Both corrections went through the sole writer, which can only APPEND: the
@@ -380,15 +388,13 @@ def test_live_codebook_carries_the_task_4892_corrections():
         f"{sorted(sessions)}"
     )
 
-    codebook = mod.load(_LIVE_CODEBOOK_PATH)
-
     # (1) AGREEMENT — the record is carried verbatim, once, by one holder.
     for record in records:
         session = record.get("session")
         assert mod.validate_coding_record(record) == [], (
             f"invalid §7.3 coding record for session {session!r}"
         )
-        for key, payload, holders in _t4892_carriers(codebook, record):
+        for key, payload, holders in _t4892_carriers(live_codebook, record):
             carrying = [h for h in holders if _sightings_for(h, session)]
             assert len(carrying) == 1, (
                 f"expected exactly one live record under {key!r} to carry a "
@@ -411,7 +417,7 @@ def test_live_codebook_carries_the_task_4892_corrections():
             )
 
     # (2) NEVER-DELETE and (3) ORDER, on the annotated entry.
-    entries = [e for e in codebook.get("entries") or [] if e.get("id") == _T4892_ENTRY_ID]
+    entries = [e for e in live_codebook.get("entries") or [] if e.get("id") == _T4892_ENTRY_ID]
     assert len(entries) == 1, f"expected exactly one {_T4892_ENTRY_ID!r} entry"
     sightings = entries[0].get("sightings") or []
     order = {s.get("session"): i for i, s in enumerate(sightings)}
@@ -433,6 +439,7 @@ def test_live_codebook_carries_the_task_4892_corrections():
 
     # (4) NO-OP — the record is already fully absorbed, so re-running the sole
     #     writer over it appends nothing.
+    codebook = live_codebook
     for record in records:
         merge = merge_one(codebook, record)
         codebook = merge.codebook
@@ -468,7 +475,7 @@ _T5198_ORIGINAL_SIGHTINGS = {
 _T5198_REFUTED_TOKENS = ("glob miss", "JSONDecodeError")
 
 
-def test_live_codebook_withdraws_the_refuted_task_5120_framing():
+def test_live_codebook_withdraws_the_refuted_task_5120_framing(live_codebook):
     """The committed §7.3 record and the committed registry still agree, and
     the refuted framing is no longer asserted to the coder.
 
@@ -481,6 +488,7 @@ def test_live_codebook_withdraws_the_refuted_task_5120_framing():
     about this correction is distinctive enough to assert beyond it.
     """
     _assert_correction_absorbed(
+        live_codebook,
         _T5198_RECORD_PATH,
         _T5198_CORRECTION_SESSION,
         _T5198_ENTRY_ID,
@@ -537,7 +545,7 @@ _T5687_REFUTED_TOKENS = ("em-dash", "em dash", "u+2014", "unicode")
 _T5687_RENDERED_CAUSE_PREFIX_LEN = 80
 
 
-def test_live_codebook_withdraws_the_refuted_em_dash_framing():
+def test_live_codebook_withdraws_the_refuted_em_dash_framing(live_codebook):
     """`_assert_correction_absorbed` pins the mechanics; this adds the three
     things distinctive to withdrawing a refuted SYMPTOM from a still-open
     entry.
@@ -572,6 +580,7 @@ def test_live_codebook_withdraws_the_refuted_em_dash_framing():
         policed.
     """
     _, _, entry = _assert_correction_absorbed(
+        live_codebook,
         _T5687_RECORD_PATH,
         _T5687_CORRECTION_SESSION,
         _T5687_ENTRY_ID,
@@ -646,7 +655,7 @@ _T5729_MISFILED_NOTE = (
 )
 
 
-def test_live_codebook_reroutes_the_misfiled_census_verifier_sighting():
+def test_live_codebook_reroutes_the_misfiled_census_verifier_sighting(live_codebook):
     """The misfiled sighting is annotated where it was filed and re-routed to
     the entry whose mechanism it shows, both through the sole writer.
 
@@ -661,6 +670,7 @@ def test_live_codebook_reroutes_the_misfiled_census_verifier_sighting():
     (6) ROUTE NO-OP — re-applying the route changes nothing.
     """
     _, correction, entry = _assert_correction_absorbed(
+        live_codebook,
         _T5729_RECORD_PATH,
         _T5729_ANNOTATION_SESSION,
         _T5687_ENTRY_ID,
@@ -713,11 +723,10 @@ def test_live_codebook_reroutes_the_misfiled_census_verifier_sighting():
         "was misfiled and still stands"
     )
 
-    codebook = mod.load(_LIVE_CODEBOOK_PATH)
-    _assert_sighting_carries(route, match, _live_entry(codebook, _T5729_HOME_ENTRY_ID))
+    _assert_sighting_carries(route, match, _live_entry(live_codebook, _T5729_HOME_ENTRY_ID))
 
     # (6) ROUTE NO-OP.
-    merge = merge_one(codebook, route)
+    merge = merge_one(live_codebook, route)
     assert merge_report(merge) == clean_merge_report(), (
         f"re-applying the route changed something — the committed codebook has "
         f"not fully absorbed it: {merge.summary()}"
@@ -753,13 +762,14 @@ def _t7448_refuting_verdict(project_root: str) -> verdict.Verdict:
     )
 
 
-def test_live_codebook_records_task_5687_as_a_correction_and_never_projects_it_fixed():
+def test_live_codebook_records_task_5687_as_a_correction_and_never_projects_it_fixed(live_codebook):
     """(a) The note-only correction naming task 5687 in `outcome_of_task` is
     absorbed, and the entry stays open. (b) A done 5687 queues no re-verify.
     (c) Even a GONE re-verify against 5687 projects no fix: this reproduces the
     2026-10-24 re-flip over the committed codebook."""
     # (a)
     _, correction, entry = _assert_correction_absorbed(
+        live_codebook,
         _T7448_RECORD_PATH,
         _T7448_SESSION,
         _T5687_ENTRY_ID,
@@ -782,15 +792,14 @@ def test_live_codebook_records_task_5687_as_a_correction_and_never_projects_it_f
     }
 
     # (b)
-    live = mod.load(_LIVE_CODEBOOK_PATH)
     statuses = {
         str(row["task_id"]): "done"
-        for listed in live.get("entries") or []
+        for listed in live_codebook.get("entries") or []
         for row in listed.get("filed_tickets") or []
         if row.get("task_id") is not None
     }
     outcomes = disposition.read_outcomes(
-        live, statuses=statuses, statuses_error=None, observed_root=root, store=FakeTaskStore(),
+        live_codebook, statuses=statuses, statuses_error=None, observed_root=root, store=FakeTaskStore(),
     )
     assert _T5687_ENTRY_ID not in {due.entry_id for due in outcomes.due}
 
@@ -802,7 +811,7 @@ def test_live_codebook_records_task_5687_as_a_correction_and_never_projects_it_f
         found=_t7448_refuting_verdict(root),
     )
     projected, changes = disposition.project(
-        live, outcomes, {_T5687_ENTRY_ID: gone}, as_of_sha="c" * 40,
+        live_codebook, outcomes, {_T5687_ENTRY_ID: gone}, as_of_sha="c" * 40,
     )
     after = _live_entry(projected, _T5687_ENTRY_ID)
     assert (after["status"], after.get("fixed_at_sha")) == ("open", None)
