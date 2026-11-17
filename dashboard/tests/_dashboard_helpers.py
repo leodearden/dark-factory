@@ -478,11 +478,11 @@ class DualEscalationTree:
 
     config: DashboardConfig
     linked_id: str
-    """Reaches ``evals[i].metrics[j].escalation`` — its fingerprint matches a verdict.
+    """Reaches ``evals[i].metrics[j].verdicts[k].escalation`` — its fingerprint matches a verdict.
 
     In ``storm=True`` mode it reaches ``unmatched_escalations`` instead, with
     reason ``storm_suppressed``: a triggered storm collapses per-metric links
-    into the aggregate, so the row renders none.  Same record, different reach
+    into the aggregate, so the verdict entry renders none.  Same record, different reach
     path — which is exactly the behaviour the two modes exist to cover.
     """
 
@@ -617,7 +617,7 @@ def build_dual_escalation_tree(tmp_path: Path, *, storm: bool = False) -> DualEs
     consults the escalation index only when the program-wide storm block is
     ``None``, so a triggered storm empties EVERY per-metric link and moves
     those fingerprints to ``unmatched_escalations`` with reason
-    ``storm_suppressed``.  ``evals[i].metrics[j].escalation`` and
+    ``storm_suppressed``.  ``evals[i].metrics[j].verdicts[k].escalation`` and
     ``storm_escape.escalation`` therefore cannot both be populated in one
     payload — the storm exists precisely to collapse the per-metric links into
     one aggregate filing.  Covering both reach paths takes two trees; a caller
