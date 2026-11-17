@@ -50,7 +50,7 @@ from orchestrator.merge_lane.completion import merge_completion_eligible
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
 from orchestrator.unblock_types import BlockClass, BlockRecord, classify_block_reason
-from orchestrator.workflow_types import BlockDisposition, classify_failure
+from orchestrator.workflow_types import BlockDisposition, WorkflowState, classify_failure
 
 logger = logging.getLogger(__name__)
 
@@ -727,6 +727,7 @@ async def run_dry_run_unblock(
             event_store=event_store,
             scheduler=scheduler,
             cost_store=cost_store,
+            phase=WorkflowState.BLOCKED,
         )
 
         async def _one_attempt(session_id: str) -> Any:
@@ -1086,7 +1087,7 @@ async def run_dry_run_unblock(
             event_store.emit(
                 EventType.invocation_end,
                 task_id=task_id,
-                phase='blocked',
+                phase=WorkflowState.BLOCKED.value,
                 role='unblock_auto',
                 cost_usd=getattr(result, 'cost_usd', 0.0),
                 duration_ms=getattr(result, 'duration_ms', int((time.monotonic() - start_time) * 1000)),

@@ -71,6 +71,7 @@ from orchestrator.workflow_types import (
     StewardInterrupted,
     StewardReescalatedL1,
     StewardResolved,
+    WorkflowState,
     classify_failure,
 )
 
@@ -688,7 +689,7 @@ class TaskSteward:
         if self.event_store:
             self.event_store.emit(
                 EventType.invocation_end,
-                task_id=self.task_id, phase='escalated', role='steward',
+                task_id=self.task_id, phase=WorkflowState.ESCALATED.value, role='steward',
                 cost_usd=result.cost_usd, duration_ms=result.duration_ms,
                 data={
                     'turns': result.turns, 'success': result.success,
@@ -896,6 +897,7 @@ class TaskSteward:
             event_store=self.event_store,
             cost_store=self.cost_store,
             applied_budget_usd=per_invocation_budget,
+            phase=WorkflowState.ESCALATED,
         )
         kwargs: dict = dict(
             prompt=prompt,
@@ -1047,6 +1049,7 @@ class TaskSteward:
             in_memory_task=self.task,
             event_store=self.event_store,
             cost_store=self.cost_store,
+            phase=WorkflowState.ESCALATED,
         )
         remaining = self._remaining_lifetime_budget()
         if remaining <= decision.budget_usd:
