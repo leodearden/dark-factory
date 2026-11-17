@@ -22,7 +22,12 @@ from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from shared.psi import PsiSample
 
-from orchestrator.config import OrchestratorConfig, PsiAdmissionConfig, StarvationWatchdogConfig
+from orchestrator.config import (
+    OrchestratorConfig,
+    PsiAdmissionConfig,
+    StarvationWatchdogConfig,
+    apply_reload,
+)
 from orchestrator.eligibility_clock import EligibilityClockStore
 from orchestrator.event_store import EventStore
 from orchestrator.overrides import OverrideSource, OverrideStore
@@ -62,6 +67,7 @@ class _Rig:
     overrides: OverrideStore
     live_status: dict[str, str]
     status_faults: list[Exception]
+    live_holders: set[str] = field(default_factory=set)
     _low_seq: list[int] = field(default_factory=lambda: [1000])
 
     def advance(self, secs: float) -> None:
@@ -76,7 +82,16 @@ class _Rig:
         n = self._low_seq[0]
         return _task(str(n), 'low', f'free/{n}.py', **metadata)
 
+    def _heartbeat(self) -> None:
+        """Each running live holder's workflow stamps its claimant heartbeat, as every tick."""
+        for task in self.tasks:
+            tid = str(task['id'])
+            if tid in self.live_holders and task['status'] == 'in-progress':
+                task['claimant_run_id'] = f'run-{tid}'
+                task['heartbeat_at'] = self.wall[0].isoformat()
+
     async def tick(self) -> TaskAssignment | None:
+        self._heartbeat()
         assignment = await self.scheduler.acquire_next()
         if assignment is not None:
             for task in self.tasks:
@@ -483,7 +498,7 @@ async def _three_starve_behind_a_cap_of_two(rig: _Rig, *extra: dict) -> Escalati
     """
     queue = EscalationQueue(rig.scheduler.config.project_root / 'esc')
     rig.scheduler.escalation_queue = queue
-    seed = _task('0', 'critical', 'hot/a.py', 'hot/b.py', 'hot/c.py', 'hot/d.py')
+    seed = _task('0', 'critical', 'hot/a.py', 'hot/b.py', 'hot/c.py', 'hot/d.py', 'hot/e.py')
     s3 = _task('S3', 'medium', 'hot/d.py')
     s3['dependencies'] = ['0']
     rig.set_tasks([
@@ -900,3 +915,134 @@ async def test_an_announced_task_is_not_reannounced_after_a_restart(tmp_path: Pa
 
     assert '2' not in second.warned_ids()
     assert len(second.detected('2')) == 1
+
+
+# ---------------------------------------------------------------------------
+# The cap L1 reports a change, and only behind a non-live holder (task 9636)
+# ---------------------------------------------------------------------------
+
+
+async def _capped_after_a_human_close(rig: _Rig, late: dict) -> EscalationQueue:
+    """The cohort's L1 is filed and closed by a human; then *late* starves onto the full cap."""
+    queue = await _three_starve_behind_a_cap_of_two(rig, late)
+    [cap_l1] = _open_cap_l1s(queue)
+    queue.resolve(cap_l1.id, 'wait', resolved_by='human')
+    rig.advance(FLOOR)
+    await rig.tick_with_low_winner()
+    [capped] = rig.detected(str(late['id']))
+    assert capped['disposition'] == 'cap_reached'
+    return queue
+
+
+@pytest.mark.asyncio
+async def test_a_new_first_blocker_module_files_a_new_cap_l1(tmp_path: Path) -> None:
+    rig = _rig(tmp_path, **CAP_OF_TWO)
+    queue = await _capped_after_a_human_close(rig, _task('S5', 'medium', 'hot/e.py'))
+
+    [cap_l1] = _open_cap_l1s(queue)
+    assert cap_l1.agent_role == STARVATION_WATCHDOG_ROLE
+    assert 'task S5' in cap_l1.detail
+    assert 'hot/e.py' in cap_l1.detail
+
+
+@pytest.mark.asyncio
+async def test_a_standing_cohort_files_nothing_after_a_human_close(tmp_path: Path) -> None:
+    rig = _rig(tmp_path, **CAP_OF_TWO)
+    queue = await _capped_after_a_human_close(rig, _task('S4', 'medium', 'hot/d.py'))
+
+    assert _open_cap_l1s(queue) == []
+
+
+@pytest.mark.asyncio
+async def test_the_open_cap_l1_is_refreshed_in_place_as_the_cohort_changes(tmp_path: Path) -> None:
+    rig = _rig(tmp_path, **CAP_OF_TWO)
+    queue = await _three_starve_behind_a_cap_of_two(rig, _task('S4', 'medium', 'hot/d.py'))
+    [filed] = _open_cap_l1s(queue)
+
+    rig.advance(FLOOR)
+    await rig.tick_with_low_winner()
+
+    [grown] = _open_cap_l1s(queue)
+    assert grown.id == filed.id
+    assert grown.dedupe_count == 1
+    assert 'task S3' in grown.detail
+    assert 'task S4' in grown.detail
+
+    rig.set_status('S1', 'blocked')
+    await rig.tick()
+
+    assert 'S3' in rig.watchdog_pins()
+    [shrunk] = _open_cap_l1s(queue)
+    assert shrunk.id == filed.id
+    assert 'task S3' not in shrunk.detail
+    assert 'task S4' in shrunk.detail
+
+
+def _reloaded(rig: _Rig, **watchdog: Any) -> None:
+    live = rig.scheduler.config
+    fresh = live.model_copy(
+        update={'starvation_watchdog': live.starvation_watchdog.model_copy(update=watchdog)},
+    )
+    report = apply_reload(live, fresh)
+    assert report['reloaded'], report
+    assert {f'starvation_watchdog.{key}' for key in watchdog} <= set(report['applied'])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reload', ['skip_threshold', 'enabled', 'idle_only_secs'])
+@pytest.mark.parametrize('skip_threshold', [50, 150])
+async def test_a_reload_that_stops_the_cohort_firing_resolves_the_cap_l1(
+    tmp_path: Path, skip_threshold: int, reload: str,
+) -> None:
+    _prior_cohort_refusals(tmp_path, skip_threshold)
+    rig = _rig(tmp_path, skip_threshold=skip_threshold, **CAP_OF_TWO)
+    queue = await _three_starve_behind_a_cap_of_two(rig)
+    [cap_l1] = _open_cap_l1s(queue)
+
+    _reloaded(rig, **{
+        'skip_threshold': {'skip_threshold': 3 * skip_threshold},
+        'enabled': {'enabled': False},
+        'idle_only_secs': {'idle_only_secs': 10 * FLOOR},
+    }[reload])
+    await rig.tick_with_low_winner()
+
+    assert _open_cap_l1s(queue) == []
+    resolved = queue.get(cap_l1.id)
+    assert resolved is not None
+    assert resolved.resolved_by == STARVATION_WATCHDOG_ROLE
+
+    rig.set_status('S1', 'blocked')
+    await rig.tick()
+    await rig.tick()
+
+    assert 'S3' not in rig.watchdog_pins()
+    assert len(rig.detected('S3')) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_live_holder_caps_the_cohort_without_an_l1(tmp_path: Path) -> None:
+    rig = _rig(tmp_path, **CAP_OF_TWO)
+    rig.live_holders.add('0')
+    queue = await _three_starve_behind_a_cap_of_two(rig)
+
+    [capped] = rig.detected('S3')
+    assert capped['disposition'] == 'cap_reached'
+    assert queue.get_by_task(AUTO_PIN_CAP_SENTINEL) == []
+
+
+@pytest.mark.asyncio
+async def test_a_holder_that_stops_heartbeating_files_one_cap_l1(tmp_path: Path) -> None:
+    rig = _rig(tmp_path, **CAP_OF_TWO)
+    rig.live_holders.add('0')
+    queue = await _three_starve_behind_a_cap_of_two(rig)
+    assert queue.get_by_task(AUTO_PIN_CAP_SENTINEL) == []
+
+    rig.live_holders.discard('0')
+    rig.advance(rig.scheduler.config.claimant_liveness_ttl_secs + 1)
+    await rig.tick_with_low_winner()
+    await rig.tick_with_low_winner()
+
+    [cap_l1] = _open_cap_l1s(queue)
+    for text in (cap_l1.summary, cap_l1.detail):
+        assert 'task 0' in text
+        assert 'no_live_claimant' in text
