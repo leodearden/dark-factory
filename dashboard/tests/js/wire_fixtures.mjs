@@ -82,8 +82,9 @@ function sampleLabels(count, stepMinutes = 60) {
   return Array.from({ length: count }, (_, i) => new Date(newest - (count - 1 - i) * stepMinutes * 60_000).toISOString());
 }
 
-// One burndown block, as data/redux_api.py::shape_burndown serves BURNDOWN and
-// each BURNDOWN_BY_PROJECT entry. It holds:
+// The aggregate burndown block, as data/redux_api.py::shape_burndown serves
+// BURNDOWN; burndownProjectBlock below builds a BURNDOWN_BY_PROJECT entry from
+// it. It holds:
 //   - `sampleCount` labels;
 //   - a non-empty series per census member, so every band draws;
 //   - the rows' in-progress split;
@@ -114,6 +115,15 @@ export function burndownBlock(vocab, sampleCount, { alarm, cap, peak, breachCoun
     parity_breach_count: breachCount,
     ...(projects === undefined ? {} : { parity_projects: projects }),
   };
+}
+
+// One BURNDOWN_BY_PROJECT entry: burndownBlock's series, Datums and parity
+// fields, with its label row sent as label_spans over an aggregate block of
+// `unionSampleCount` labels. Both rows end at WIRE_AS_OF, so the project's
+// `sampleCount` labels are the union's newest ones: one span over its tail.
+export function burndownProjectBlock(vocab, sampleCount, unionSampleCount, verdict) {
+  const { labels, ...block } = burndownBlock(vocab, sampleCount, verdict);
+  return { ...block, label_spans: [[unionSampleCount - labels.length, unionSampleCount]] };
 }
 
 // One open escalation, as data/escalation_analytics.py::_lifespan_block lists

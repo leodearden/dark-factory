@@ -31,6 +31,7 @@ import {
 import { seedDashboardData } from './dom_harness.mjs';
 import {
   burndownBlock,
+  burndownProjectBlock,
   escalationAnalytics,
   escalationRow,
   escalationsPayload,
@@ -179,7 +180,7 @@ function seedBurndown(window, { alarm }) {
   seedDashboardData(window, {
     PROJECTS: [projectRow(PROJECT)],
     BURNDOWN: burndownBlock(vocab, AGGREGATE_SAMPLES, { ...verdict, projects: [PROJECT] }),
-    BURNDOWN_BY_PROJECT: { [PROJECT]: burndownBlock(vocab, PROJECT_SAMPLES, verdict) },
+    BURNDOWN_BY_PROJECT: { [PROJECT]: burndownProjectBlock(vocab, PROJECT_SAMPLES, AGGREGATE_SAMPLES, verdict) },
     __receipt: receiptsFor(window.DF_DATA_LOADER, ['BURNDOWN', 'PROJECTS']),
   });
 }
@@ -192,13 +193,16 @@ function statusMixPanel(container) {
   return panels[0];
 }
 
-// Each view: how to reach it, which block it draws, and the projects its call
-// site hands parityBannerState.
+// Each view: how to reach it, which block it draws, the sample labels its chart
+// lays that block over, and the projects its call site hands parityBannerState.
+// The project's labels are the union's newest PROJECT_SAMPLES, stated here from
+// the seed rather than through the label_spans decoder under test.
 const BURN_VIEWS = [
   {
     view: 'aggregate',
     show() {},
     block: window => window.DF_DATA.BURNDOWN,
+    sampleLabels: window => window.DF_DATA.BURNDOWN.labels,
     bannerProjects: window => window.DF_DATA.BURNDOWN.parity_projects,
   },
   {
@@ -209,6 +213,7 @@ const BURN_VIEWS = [
       click(window, button);
     },
     block: window => window.DF_DATA.BURNDOWN_BY_PROJECT[PROJECT],
+    sampleLabels: window => window.DF_DATA.BURNDOWN.labels.slice(AGGREGATE_SAMPLES - PROJECT_SAMPLES),
     bannerProjects: () => null,
   },
 ];
@@ -231,7 +236,7 @@ function filledPathColors(panel) {
   return [...panel.querySelectorAll('svg path')].map(path => path.getAttribute('fill')).filter(Boolean);
 }
 
-for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
+for (const { view, show, block, sampleLabels, bannerProjects } of BURN_VIEWS) {
   test(`tabs.jsx::BurnTab ${view} view renders one legend entry per burndownLegend item`, t => {
     const harness = openWindow(t);
     seedBurndown(harness.window, { alarm: false });
@@ -261,9 +266,8 @@ for (const { view, show, block, bannerProjects } of BURN_VIEWS) {
     );
 
     const { fmtDateTime } = harness.window.DF_SHELL;
-    const { BURNDOWN, BURNDOWN_BY_PROJECT } = harness.window.DF_DATA;
-    const anySampleLabel = new Set([...BURNDOWN.labels, ...BURNDOWN_BY_PROJECT[PROJECT].labels].map(fmtDateTime));
-    const ownLabels = Array.from(block(harness.window).labels, fmtDateTime);
+    const anySampleLabel = new Set(Array.from(harness.window.DF_DATA.BURNDOWN.labels, fmtDateTime));
+    const ownLabels = Array.from(sampleLabels(harness.window), fmtDateTime);
     assert.deepEqual(
       [...panel.querySelectorAll('svg text')].map(text => text.textContent).filter(text => anySampleLabel.has(text)),
       ownLabels,
