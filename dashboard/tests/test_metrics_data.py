@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -498,6 +498,111 @@ async def test_memory_24h_ago_uses_provided_now(metrics_db_path: Path):
     finally:
         await db.close()
     assert result['proj-a']['graphiti_nodes'] == 100
+
+
+_TARGET_24H_AGO = FIXED_NOW - timedelta(hours=24)
+_TOLERANCE = timedelta(hours=2)
+_NEAR_TARGET_PROJECTS = [f'proj-{p}' for p in range(5)]
+
+
+def _insert_memory_snapshots(
+    db_path: Path, rows: list[tuple[str, datetime, int, int]]
+) -> None:
+    conn = sqlite3.connect(str(db_path))
+    conn.executemany(
+        'INSERT INTO memory_snapshots (ts, project_id, graphiti_nodes, mem0_memories) '
+        'VALUES (?, ?, ?, ?)',
+        [(ts.isoformat(), pid, gn, mm) for pid, ts, gn, mm in rows],
+    )
+    conn.commit()
+    conn.close()
+
+
+def _rows_near_the_24h_target() -> list[tuple[str, datetime, int, int]]:
+    return [
+        (pid, _TARGET_24H_AGO + timedelta(minutes=offset), p * 100 + offset, p * 200 + offset)
+        for p, pid in enumerate(_NEAR_TARGET_PROJECTS)
+        for offset in (-90, -10, 40)
+    ]
+
+
+def _rows_outside_the_tolerance_window() -> list[tuple[str, datetime, int, int]]:
+    older = [
+        _TARGET_24H_AGO - timedelta(days=3) - i * (timedelta(days=86) / 200)
+        for i in range(200)
+    ]
+    newer = [
+        _TARGET_24H_AGO + timedelta(hours=3) + i * (timedelta(hours=21) / 200)
+        for i in range(200)
+    ]
+    return [(pid, ts, 999, 999) for pid in _NEAR_TARGET_PROJECTS for ts in older + newer]
+
+
+async def _memory_24h_ago_and_vm_steps(
+    db_path: Path, now: datetime
+) -> tuple[dict[str, dict], int]:
+    steps = 0
+
+    def count_step() -> int:
+        nonlocal steps
+        steps += 1
+        return 0
+
+    db = await aiosqlite.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        await db.set_progress_handler(count_step, 1)
+        result = await get_memory_24h_ago(db, now=now)
+    finally:
+        await db.close()
+    return result, steps
+
+
+@pytest.mark.asyncio
+async def test_memory_24h_ago_cost_does_not_grow_with_out_of_window_history(
+    metrics_db_path: Path,
+):
+    _insert_memory_snapshots(metrics_db_path, _rows_near_the_24h_target())
+    near_only, near_only_steps = await _memory_24h_ago_and_vm_steps(metrics_db_path, FIXED_NOW)
+
+    _insert_memory_snapshots(metrics_db_path, _rows_outside_the_tolerance_window())
+    with_history, with_history_steps = await _memory_24h_ago_and_vm_steps(
+        metrics_db_path, FIXED_NOW
+    )
+
+    assert near_only == {
+        pid: {'graphiti_nodes': p * 100 - 10, 'mem0_memories': p * 200 - 10}
+        for p, pid in enumerate(_NEAR_TARGET_PROJECTS)
+    }
+    assert with_history == near_only
+    assert with_history_steps <= 1.5 * near_only_steps, (near_only_steps, with_history_steps)
+
+
+@pytest.mark.asyncio
+async def test_memory_24h_ago_keeps_rows_at_the_exact_tolerance_edges(metrics_db_path: Path):
+    _insert_memory_snapshots(
+        metrics_db_path,
+        [
+            ('at-lower-edge', _TARGET_24H_AGO - _TOLERANCE, 1, 1),
+            ('at-upper-edge', _TARGET_24H_AGO + _TOLERANCE, 2, 2),
+            ('past-upper-edge', _TARGET_24H_AGO + _TOLERANCE + timedelta(seconds=1), 3, 3),
+        ],
+    )
+
+    result, _ = await _memory_24h_ago_and_vm_steps(metrics_db_path, FIXED_NOW)
+
+    assert set(result) == {'at-lower-edge', 'at-upper-edge'}
+
+
+@pytest.mark.asyncio
+async def test_memory_24h_ago_reads_a_non_utc_now_as_the_same_instant(metrics_db_path: Path):
+    _insert_memory_snapshots(metrics_db_path, _rows_near_the_24h_target())
+    now_at_plus_five = FIXED_NOW.astimezone(timezone(timedelta(hours=5)))
+
+    from_utc, _ = await _memory_24h_ago_and_vm_steps(metrics_db_path, FIXED_NOW)
+    from_plus_five, _ = await _memory_24h_ago_and_vm_steps(metrics_db_path, now_at_plus_five)
+
+    assert from_utc
+    assert from_plus_five == from_utc
 
 
 @pytest.mark.asyncio
