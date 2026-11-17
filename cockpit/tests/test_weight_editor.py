@@ -2,9 +2,10 @@
 helpers (Fleet Cockpit C9b, PRD §9).
 
 Pure, deterministic unit tests only -- no Textual import, no pilot. The
-WeightEditorScreen(ModalScreen) widget itself is covered by test_app.py's
-pilot tests instead, mirroring test_decision_queue.py/test_spawn_bar.py's own
-split between fast pure-helper tests here and slower app-level pilot tests.
+WeightEditorScreen(ModalScreen) widget itself is covered by
+test_app_weight_editor.py's pilot tests instead, mirroring
+test_decision_queue.py/test_spawn_bar.py's own split between fast pure-helper
+tests here and slower app-level pilot tests.
 """
 
 from __future__ import annotations
