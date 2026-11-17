@@ -14,6 +14,6 @@ RECONCILIATION_CLI_SETTING_SOURCES: tuple[str, ...] = ()
 RECONCILIATION_CLI_ENV_OVERRIDES: Mapping[str, str] = MappingProxyType({
     'CLAUDE_CODE_DISABLE_CLAUDE_MDS': '1',  # every CLAUDE.md, ancestor walk included
     'CLAUDE_CODE_DISABLE_AUTO_MEMORY': '1',  # MEMORY.md
-    'DISABLE_AUTO_COMPACT': '1',  # compaction stays off without settings.json
+    'DISABLE_AUTO_COMPACT': '1',  # compaction off
     'CLAUDE_CODE_FORCE_SESSION_PERSISTENCE': '1',  # transcripts kept
 })

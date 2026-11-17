@@ -7,12 +7,15 @@ auto-compaction off, and keeps its transcript. Each switch has one job:
 - Empty setting sources keep out the settings files: hooks, permission rules,
   settings env and ``.mcp.json`` approvals.
 - ``CLAUDE_CODE_DISABLE_CLAUDE_MDS`` keeps out every CLAUDE.md, including the
-  ancestor-directory walk, which ``--setting-sources ''`` does not cover for the
-  user file reached through /home/leo.
+  ancestor-directory walk that reaches /home/leo/.claude/CLAUDE.md under a
+  per-run config dir. The settings-source probe did not exercise that route,
+  so this switch covers it.
 - ``CLAUDE_CODE_DISABLE_AUTO_MEMORY`` keeps out MEMORY.md, which
   ``--setting-sources ''`` was measured not to stop.
-- ``DISABLE_AUTO_COMPACT`` keeps compaction off, as ``autoCompactEnabled`` in
-  ~/.claude/settings.json did before the settings files were dropped.
+- ``DISABLE_AUTO_COMPACT`` keeps compaction off. Stages and the judge keep it
+  off as before, when ``autoCompactEnabled`` in ~/.claude/settings.json did it.
+  The verify loop, which read no settings file already and so compacted by the
+  CLI default, now has compaction off too, by choice.
 - ``CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`` keeps transcripts if a child-session
   marker is ever inherited.
 """
@@ -43,8 +46,6 @@ from fused_memory.reconciliation.judge import Judge
 from fused_memory.reconciliation.verify import CodebaseVerifier
 from reconciliation.stubbed_stage_cli import run_stage, run_stage_answered_by
 
-_STAGE_REPORT = AgentResult(success=True, output='{"summary": "s"}')
-
 _BUILTINS_NO_STAGE_CALLS = (
     'Agent', 'ListAgents', 'ReportFindings', 'ScheduleWakeup', 'Skill', 'Workflow',
     'CronCreate', 'CronDelete', 'CronList', 'DesignSync', 'EnterWorktree', 'ExitWorktree',
@@ -56,6 +57,10 @@ _BUILTINS_STAGES_NEED = (
     'Read', 'Grep', 'Glob', 'ToolSearch', 'StructuredOutput',
     'ListMcpResourcesTool', 'ReadMcpResourceDirTool', 'ReadMcpResourceTool',
 )
+
+
+def _stage_report() -> AgentResult:
+    return AgentResult(success=True, output='{"summary": "s"}')
 
 
 def test_recon_cli_context_constants_name_one_rule():
@@ -71,7 +76,7 @@ def test_recon_cli_context_constants_name_one_rule():
 
 @pytest.mark.asyncio
 async def test_stage_runner_loads_no_settings_claude_md_or_memory_index(tmp_path):
-    _, invoke = await run_stage_answered_by(_STAGE_REPORT, cwd=tmp_path)
+    _, invoke = await run_stage_answered_by(_stage_report(), cwd=tmp_path)
 
     kwargs = invoke.call_args.kwargs
     assert kwargs['setting_sources'] == []
@@ -88,7 +93,7 @@ async def test_stage_runner_context_kwargs_survive_forwarding_to_invoke_claude_a
     """``usage_gate=None`` runs invoke_with_cap_retry's real forwarding layer, and
     the autospec'd mock rejects any keyword the real invoke_claude_agent lacks."""
     with patch(
-        'shared.cli_invoke.invoke_claude_agent', autospec=True, return_value=_STAGE_REPORT,
+        'shared.cli_invoke.invoke_claude_agent', autospec=True, return_value=_stage_report(),
     ) as mock_agent:
         await run_stage(ReconciliationConfig(sandbox_recon_agents=False), tmp_path)
 
