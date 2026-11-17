@@ -86,9 +86,9 @@ class LabelLeak:
 
 @dataclass(frozen=True)
 class GraphLeaks:
-    """Every label's leak count in one graph; ``complete`` is False if any label's is not."""
+    """Every label's leak count in the graph named ``graph_key``; ``complete`` is False if any label's is not."""
 
-    group_id: str
+    graph_key: str
     labels: tuple[LabelLeak, ...]
     complete: bool
 
@@ -145,19 +145,19 @@ def _incompleteness(leaked: int | None, breakdown_sum: int) -> str | None:
     return None
 
 
-def _log_label(group_id: str, leak: LabelLeak) -> None:
+def _log_label(graph_key: str, leak: LabelLeak) -> None:
     breakdown = _describe_breakdown(leak.by_group_id)
     if leak.leaked:
         logger.warning(
             'cross-graph leak in graph %r: %d %s node(s) carry another graph\'s group_id '
             'or none — %s',
-            group_id, leak.leaked, leak.label, breakdown,
+            graph_key, leak.leaked, leak.label, breakdown,
         )
     if not leak.complete:
         logger.error(
             'COVERAGE SHORTFALL: graph %r %s leak count is incomplete (%s): proven total %s, '
             'breakdown sums to %d — %s',
-            group_id, leak.label, leak.incomplete_kind, leak.leaked,
+            graph_key, leak.label, leak.incomplete_kind, leak.leaked,
             sum(g.nodes for g in leak.by_group_id), breakdown,
         )
 
@@ -165,33 +165,33 @@ def _log_label(group_id: str, leak: LabelLeak) -> None:
 class CrossGraphLeakCensus:
     """Counts leaked nodes graph by graph. Never writes.
 
-    Each graph is read through ``graphs.graph(key)`` with the RAW graph key,
-    never a canonicalized one: the comparison against that key is the whole
-    point, and an alias-named graph would otherwise be compared against a
-    different graph's name.
+    Each graph is read through ``graph_access.graph(graph_key)`` with the RAW
+    graph key, never a canonicalized one: the comparison against that key is
+    the whole point, and an alias-named graph would otherwise be compared
+    against a different graph's name.
     """
 
-    def __init__(self, *, graphs: GraphAccess):
-        self.graphs = graphs
+    def __init__(self, *, graph_access: GraphAccess):
+        self.graph_access = graph_access
 
-    async def run(self, group_id: str) -> GraphLeaks:
+    async def run(self, graph_key: str) -> GraphLeaks:
         """Count one graph's leaked nodes, one ``LabelLeak`` per entry in ``LEAK_LABELS``."""
-        handle = self.graphs.graph(group_id)
+        handle = self.graph_access.graph(graph_key)
         labels = []
         for label in LEAK_LABELS:
-            leak = await self._read_label(handle, group_id, label)
-            _log_label(group_id, leak)
+            leak = await self._read_label(handle, graph_key, label)
+            _log_label(graph_key, leak)
             labels.append(leak)
         return GraphLeaks(
-            group_id=group_id,
+            graph_key=graph_key,
             labels=tuple(labels),
             complete=all(leak.complete for leak in labels),
         )
 
     @staticmethod
-    async def _read_label(handle: GraphHandle, group_id: str, label: str) -> LabelLeak:
+    async def _read_label(handle: GraphHandle, graph_key: str, label: str) -> LabelLeak:
         """The proven total FIRST, then the grouped breakdown checked against it."""
-        params = {'graph_key': group_id}
+        params = {'graph_key': graph_key}
         leaked = await census_count(
             OpBoundReader(handle, 'cross_graph_leak_count'), _COUNT_CYPHER[label], params,
         )
@@ -256,16 +256,16 @@ class CrossGraphLeakCensus:
 
 async def run_cross_graph_leak_census(
     config_path: str | None = None,
-    group_id: str | None = None,
+    graph_key: str | None = None,
 ) -> LeakSweep:
     """Open the store for reads only, sweep one graph or every listed graph, close.
 
     The listing is ``GraphitiBackend.list_graphs``, which keeps its own filter
-    of non-project graphs; supplying *group_id* skips the listing entirely.
+    of non-project graphs; supplying *graph_key* skips the listing entirely.
     """
     async with maintenance_service(config_path, open_as=ServiceOpen.READS) as (_config, service):
-        keys = [group_id] if group_id is not None else await service.graphiti.list_graphs()
-        census = CrossGraphLeakCensus(graphs=service.graphiti.graph_access)
+        keys = [graph_key] if graph_key is not None else await service.graphiti.list_graphs()
+        census = CrossGraphLeakCensus(graph_access=service.graphiti.graph_access)
         return await census.sweep(keys)
 
 
@@ -285,7 +285,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--group-id', default=None,
-        help='Read only this graph. Default: every graph in the store.',
+        help='Read only the graph with this key. Default: every graph in the store.',
     )
     parser.add_argument(
         '--json', action='store_true',
@@ -309,7 +309,7 @@ def _format_summary(sweep: LeakSweep) -> str:
         f'complete={sweep.complete} elapsed_ms={sweep.elapsed_ms:.1f}'
     ]
     lines.extend(
-        f'  {graph.group_id}: ' + ' '.join(_describe_label(leak) for leak in graph.labels)
+        f'  {graph.graph_key}: ' + ' '.join(_describe_label(leak) for leak in graph.labels)
         for graph in sweep.graphs
         if not graph.complete or any(leak.leaked for leak in graph.labels)
     )
@@ -331,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO)
 
     sweep = asyncio.run(
-        run_cross_graph_leak_census(config_path=args.config, group_id=args.group_id)
+        run_cross_graph_leak_census(config_path=args.config, graph_key=args.group_id)
     )
 
     if args.json:

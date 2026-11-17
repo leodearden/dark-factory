@@ -117,9 +117,9 @@ HOME_NODES = [
 CLEAN_NODES = [*nodes_of('Entity', 'home', 5), *nodes_of('Episodic', 'home', 2)]
 
 
-async def census_of(raw: LeakGraph, group_id: str = 'home') -> GraphLeaks:
-    return await CrossGraphLeakCensus(graphs=FakeGraphAccess({group_id: raw})).run(
-        group_id=group_id,
+async def census_of(raw: LeakGraph, graph_key: str = 'home') -> GraphLeaks:
+    return await CrossGraphLeakCensus(graph_access=FakeGraphAccess({graph_key: raw})).run(
+        graph_key=graph_key,
     )
 
 
@@ -133,7 +133,7 @@ class TestCrossGraphLeakCensusRun:
     async def test_counts_foreign_nodes_per_label_in_leak_labels_order(self):
         leaks = await census_of(LeakGraph(HOME_NODES))
 
-        assert leaks.group_id == 'home'
+        assert leaks.graph_key == 'home'
         assert LEAK_LABELS == ('Entity', 'Episodic')
         assert [entry.label for entry in leaks.labels] == list(LEAK_LABELS)
         entity = label_of(leaks, 'Entity')
@@ -335,7 +335,7 @@ CLEAN_GRAPH_NODES = [*nodes_of('Entity', 'clean', 3), *nodes_of('Episodic', 'cle
 
 
 async def sweep_of(graphs: dict[str, LeakGraph], keys: list[str] | None = None) -> LeakSweep:
-    census = CrossGraphLeakCensus(graphs=SweepOnlyAccess(graphs))
+    census = CrossGraphLeakCensus(graph_access=SweepOnlyAccess(graphs))
     return await census.sweep(list(graphs) if keys is None else keys)
 
 
@@ -352,7 +352,7 @@ class TestCrossGraphLeakCensusSweep:
 
         sweep = await sweep_of(graphs, ['other', 'clean', 'home'])
 
-        assert [graph.group_id for graph in sweep.graphs] == ['other', 'clean', 'home']
+        assert [graph.graph_key for graph in sweep.graphs] == ['other', 'clean', 'home']
         assert unread.ro_calls == []
 
     @pytest.mark.asyncio
@@ -387,7 +387,7 @@ class TestCrossGraphLeakCensusSweep:
             'clean': LeakGraph(CLEAN_GRAPH_NODES),
         })
 
-        assert [graph.group_id for graph in sweep.graphs] == ['home', 'clean']
+        assert [graph.graph_key for graph in sweep.graphs] == ['home', 'clean']
         assert sweep.failures == (
             GraphFailure(group_id='broken', error='RuntimeError: FalkorDB connection reset'),
         )
@@ -456,7 +456,7 @@ class TestRunCrossGraphLeakCensus:
         entered.assert_called_once_with('/tmp/config.yaml', open_as=ServiceOpen.READS)
 
     @pytest.mark.asyncio
-    async def test_without_a_group_id_sweeps_every_graph_the_backend_lists(
+    async def test_without_a_graph_key_sweeps_every_graph_the_backend_lists(
         self, make_fake_maintenance_service,
     ):
         unlisted = LeakGraph(HOME_NODES)
@@ -470,11 +470,11 @@ class TestRunCrossGraphLeakCensus:
         ):
             sweep = await run_cross_graph_leak_census()
 
-        assert [graph.group_id for graph in sweep.graphs] == ['home', 'other']
+        assert [graph.graph_key for graph in sweep.graphs] == ['home', 'other']
         assert unlisted.ro_calls == []
 
     @pytest.mark.asyncio
-    async def test_a_group_id_reads_only_that_graph_and_lists_nothing(
+    async def test_a_graph_key_reads_only_that_graph_and_lists_nothing(
         self, make_fake_maintenance_service,
     ):
         other = LeakGraph(OTHER_NODES)
@@ -483,9 +483,9 @@ class TestRunCrossGraphLeakCensus:
         with patch(
             _ENTRYPOINT_SEAM, side_effect=make_fake_maintenance_service(MagicMock(), service),
         ):
-            sweep = await run_cross_graph_leak_census(group_id='home')
+            sweep = await run_cross_graph_leak_census(graph_key='home')
 
-        assert [graph.group_id for graph in sweep.graphs] == ['home']
+        assert [graph.graph_key for graph in sweep.graphs] == ['home']
         assert other.ro_calls == []
         service.graphiti.list_graphs.assert_not_awaited()
 
@@ -636,7 +636,7 @@ class TestCrossGraphLeakCensusLiveFalkorDB:
 
         leaks = await CrossGraphLeakCensus(
             graphs=FakeGraphAccess({live.name: live.graph}),
-        ).run(group_id=live.name)
+        ).run(graph_key=live.name)
 
         entity = label_of(leaks, 'Entity')
         assert entity.leaked == 3
