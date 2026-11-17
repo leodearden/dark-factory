@@ -159,7 +159,7 @@ def _markup_fact_warnings(caplog) -> list[str]:
         record.getMessage() for record in caplog.records
         if record.name == plan_tools.logger.name
         and record.levelno == logging.WARNING
-        and plan_tools._MARKUP_FACT_EVENT in record.getMessage()
+        and plan_tools.MARKUP_FACT_EVENT in record.getMessage()
     ]
 
 

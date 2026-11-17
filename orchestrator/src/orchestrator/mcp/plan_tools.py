@@ -808,7 +808,7 @@ def _repair_plan_fields(plan: dict) -> tuple[dict, list[dict[str, Any]]]:
 #: stdio subprocess with no event bus reachable, so the log IS the channel — and
 #: for that to be usable the WHOLE message must be the payload. One line, one
 #: fact, ``json.loads``-able; never a value a consumer has to regex out of prose.
-_MARKUP_FACT_EVENT = 'plan_markup_repaired'
+MARKUP_FACT_EVENT = 'plan_markup_repaired'
 
 #: Stable event name for a repair that could not be PERSISTED. Deliberately
 #: distinct from the fact event: the repair itself succeeded and was served, so
@@ -888,7 +888,7 @@ def _report_markup_facts(
     reportable: list[dict[str, Any]] = []
     for fact in facts:
         payload = json.dumps({
-            'event': _MARKUP_FACT_EVENT,
+            'event': MARKUP_FACT_EVENT,
             'path': str(plan_path),
             **fact,
         })
