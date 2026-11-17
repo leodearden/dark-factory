@@ -74,6 +74,7 @@ class Harness:
     async def call(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         async with Client(self.server) as client:
             result = await client.call_tool(tool, arguments)
+        assert result.structured_content is not None
         return result.structured_content
 
     async def create_plan(self) -> dict[str, Any]:
