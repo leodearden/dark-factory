@@ -2546,7 +2546,7 @@ class TestCiteTaskFoldPurgeRecord(_FoldPurgeRecordHarness):
         from fused_memory.server.recon_report import (
             MAX_FINDING_TEXT_CHARS,
             MAX_PURGED_TEXT_CHARS,
-            TRUNCATION_MARKER,
+            RECON_TEXT_TRUNCATION_MARKER,
         )
 
         state, _ = self._make_state(store)
@@ -2563,8 +2563,8 @@ class TestCiteTaskFoldPurgeRecord(_FoldPurgeRecordHarness):
 
         assert folded.get('existing_finding_id') == anchor_id, folded
         (record,) = _persisted_purge_record_rows(store, 'run-1')['reconciler']['purged_findings']
-        assert record['finding']['description'] == 'x' * MAX_PURGED_TEXT_CHARS + TRUNCATION_MARKER
-        assert record['finding']['suggested_action'] == 'y' * MAX_PURGED_TEXT_CHARS + TRUNCATION_MARKER
+        assert record['finding']['description'] == 'x' * MAX_PURGED_TEXT_CHARS + RECON_TEXT_TRUNCATION_MARKER
+        assert record['finding']['suggested_action'] == 'y' * MAX_PURGED_TEXT_CHARS + RECON_TEXT_TRUNCATION_MARKER
         assert record['truncated_fields'] == ['description', 'suggested_action']
 
     @pytest.mark.asyncio

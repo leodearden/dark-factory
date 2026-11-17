@@ -3298,9 +3298,7 @@ class TestReconReportFlagTypeInheritance:
 
 
 # ---------------------------------------------------------------------------
-# task-2410 step-1: Overlength description/suggested_action truncation —
-# RED until step-2 adds MAX_FINDING_TEXT_CHARS / TRUNCATION_MARKER and
-# wires truncate+warn into ReconReportState.add_finding.
+# Overlength description/suggested_action/category truncation (task-2410)
 # ---------------------------------------------------------------------------
 
 
@@ -3320,7 +3318,7 @@ class TestReconReportOverlengthTruncation:
     def test_overlength_description_is_truncated_with_warning(self):
         from fused_memory.server.recon_report import (
             MAX_FINDING_TEXT_CHARS,
-            TRUNCATION_MARKER,
+            RECON_TEXT_TRUNCATION_MARKER,
         )
 
         state, _ = self._make_state()
@@ -3342,13 +3340,13 @@ class TestReconReportOverlengthTruncation:
         report = state.get_assembled_report('r1', 's1')
         assert report is not None
         item = report['flagged_items'][0]
-        assert item['description'] == 'x' * MAX_FINDING_TEXT_CHARS + TRUNCATION_MARKER
+        assert item['description'] == 'x' * MAX_FINDING_TEXT_CHARS + RECON_TEXT_TRUNCATION_MARKER
         assert item['suggested_action'] == 'a'
 
     def test_overlength_suggested_action_is_truncated_with_warning(self):
         from fused_memory.server.recon_report import (
             MAX_FINDING_TEXT_CHARS,
-            TRUNCATION_MARKER,
+            RECON_TEXT_TRUNCATION_MARKER,
         )
 
         state, _ = self._make_state()
@@ -3370,7 +3368,7 @@ class TestReconReportOverlengthTruncation:
         report = state.get_assembled_report('r1', 's1')
         assert report is not None
         item = report['flagged_items'][0]
-        assert item['suggested_action'] == 'y' * MAX_FINDING_TEXT_CHARS + TRUNCATION_MARKER
+        assert item['suggested_action'] == 'y' * MAX_FINDING_TEXT_CHARS + RECON_TEXT_TRUNCATION_MARKER
         assert item['description'] == 'd'
 
     def test_overlength_category_is_truncated_with_warning(self):
@@ -3381,7 +3379,7 @@ class TestReconReportOverlengthTruncation:
         """
         from fused_memory.server.recon_report import (
             MAX_FINDING_TEXT_CHARS,
-            TRUNCATION_MARKER,
+            RECON_TEXT_TRUNCATION_MARKER,
         )
 
         state, _ = self._make_state()
@@ -3403,7 +3401,7 @@ class TestReconReportOverlengthTruncation:
         report = state.get_assembled_report('r1', 's1')
         assert report is not None
         item = report['flagged_items'][0]
-        assert item['category'] == 'z' * MAX_FINDING_TEXT_CHARS + TRUNCATION_MARKER
+        assert item['category'] == 'z' * MAX_FINDING_TEXT_CHARS + RECON_TEXT_TRUNCATION_MARKER
         assert item['description'] == 'd'
         assert item['suggested_action'] == 'a'
 
@@ -3454,7 +3452,7 @@ class TestReconReportOverlengthTruncation:
     def test_text_one_char_over_the_cap_is_cut_to_the_cap_and_marked(self):
         from fused_memory.server.recon_report import (
             MAX_FINDING_TEXT_CHARS,
-            TRUNCATION_MARKER,
+            RECON_TEXT_TRUNCATION_MARKER,
         )
 
         state, _ = self._make_state()
@@ -3473,7 +3471,7 @@ class TestReconReportOverlengthTruncation:
         report = state.get_assembled_report('r1', 's1')
         assert report is not None
         item = report['flagged_items'][0]
-        assert item['description'] == 'x' * MAX_FINDING_TEXT_CHARS + TRUNCATION_MARKER
+        assert item['description'] == 'x' * MAX_FINDING_TEXT_CHARS + RECON_TEXT_TRUNCATION_MARKER
 
     def test_overlength_null_null_findings_dedup_on_truncated_text(self):
         """Two null-null findings whose descriptions are identical for the

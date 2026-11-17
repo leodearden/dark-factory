@@ -18,7 +18,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
 from graphiti_core.errors import EdgeNotFoundError
 
@@ -197,28 +197,28 @@ def _apply_cross_project_routing_guard(finding: dict) -> dict:
 # description/suggested_action/category) is ever capped.  severity is not
 # capped because it is not free text: add_finding rejects any value outside
 # FINDING_SEVERITY_SET, so a length cap on it would be moot.
-MAX_FINDING_TEXT_CHARS = 10_000
-TRUNCATION_MARKER = '…[truncated]'
+MAX_FINDING_TEXT_CHARS: Final = 10_000
+RECON_TEXT_TRUNCATION_MARKER: Final = '…[truncated]'
 # Cap on description/suggested_action inside a cite_task fold's purge record
 # (task 4865).  Deliberately far below the finding cap: _persist_run
 # re-serializes every reachable entry of the run on EVERY mutation, so each
 # record's text is rewritten to SQLite again on every later write.
-MAX_PURGED_TEXT_CHARS = 2_000
+MAX_PURGED_TEXT_CHARS: Final = 2_000
 # Records kept per entry before later purges only count as overflow.  Worst
 # case ~20 x 2 x 2_000 chars of text per entry, plus citation lists; the
 # fold's WARNING stays the unbounded channel, firing for every purge.
-MAX_PURGED_FINDINGS = 20
+MAX_PURGED_FINDINGS: Final = 20
 
 
 def _truncate_field(value: str, cap: int, *, field: str) -> tuple[str, bool]:
-    """``(value cut by clip_text, was_truncated)``, marked with the uncounted ``TRUNCATION_MARKER``.
+    """``(value cut by clip_text, was_truncated)``, marked with the uncounted ``RECON_TEXT_TRUNCATION_MARKER``.
 
     The marker stays uncounted because truncated text is persisted and feeds the null-null description dedup hash.
     """
     clip = clip_text(value, cap, field=field)
     if clip.fact is None:
         return clip.text, False
-    return clip.text + TRUNCATION_MARKER, True
+    return clip.text + RECON_TEXT_TRUNCATION_MARKER, True
 
 
 # ---------------------------------------------------------------------------
