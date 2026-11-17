@@ -24,6 +24,7 @@ only ``claim`` does.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -545,6 +546,38 @@ def newest_per_topic(
     keep = tuple(r for r in records if id(r) in kept)
     superseded = tuple(r for r in records if id(r) not in kept)
     return keep, superseded
+
+
+#: :func:`content_sha256` of a record the store does not have. Never a hex digest.
+MISSING_CONTENT_SHA256 = 'missing'
+#: :func:`content_sha256` of a read that did not answer or answered garbage. Never a hex digest.
+UNREADABLE_CONTENT_SHA256 = 'unreadable'
+
+
+def content_sha256(record: object) -> str:
+    """The hash of one member read's content (PRD K4, K6).
+
+    The one content hash behind :func:`members_key`, the adjudicator's context
+    key and :attr:`ShownMember.content_sha256`. ``UNREADABLE``, like any read
+    that is not a record with text content, hashes as unreadable.
+    """
+    if record is None:
+        return MISSING_CONTENT_SHA256
+    content = record.get('content') if isinstance(record, Mapping) else None
+    if not isinstance(content, str):
+        return UNREADABLE_CONTENT_SHA256
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+
+def members_key(member_ids: Sequence[str], members: Mapping[str, object]) -> str:
+    """Which records a proposal names and what they say, in any order (PRD K4).
+
+    No topic and no claim: the proposer words those freshly each cycle. An id
+    absent from *members* reads as missing, as the predicate reads it, and a
+    repeated id stays in the key.
+    """
+    pairs = sorted((member_id, content_sha256(members.get(member_id))) for member_id in member_ids)
+    return hashlib.sha256(json.dumps(pairs, separators=(',', ':')).encode('utf-8')).hexdigest()
 
 
 def _payload_object(record: ReconLedgerRecord) -> dict[str, Any]:
