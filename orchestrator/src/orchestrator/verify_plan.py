@@ -1094,9 +1094,9 @@ def effective_merge_module_configs(
     no subprojects" value), routing that case to the INV-1 global gate.
 
     Breadth is asked of :func:`_merge_breadth_is_full` rather than re-read
-    from ``config`` here, so there stays exactly one breadth predicate in the
-    tree (and a ``None`` config keeps degrading to the shipped 'scoped'
-    default instead of raising).
+    from ``config`` here, so this module keeps one breadth predicate (and a
+    ``None`` config, which carries no registry to widen to, returns the
+    passed set unchanged instead of raising).
     """
     if not _merge_breadth_is_full(config):
         return module_configs
