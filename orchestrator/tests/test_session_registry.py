@@ -3707,19 +3707,6 @@ class TestLeaseSlugIsNotASessionRecordKey:
 # --- resolve_session_pid (task 3994 defect 2) ------------------------------
 
 
-def test_session_pid_env_names_claude_pid() -> None:
-    assert sr.SESSION_PID_ENV == 'CLAUDE_PID'
-
-
-def test_resolve_session_pid_prefers_claude_pid(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level(logging.WARNING):
-        pid = sr.resolve_session_pid({'CLAUDE_PID': '1348600'})
-
-    assert pid == 1348600
-    # The happy path is silent: a resolvable session pid is not a degradation.
-    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
-
-
 @pytest.mark.parametrize(
     'env',
     [
@@ -3753,12 +3740,7 @@ def test_resolve_session_pid_falls_back_loudly_to_a_provably_dead_pid(
     assert 'degraded' in blob
 
 
-def test_resolve_session_pid_defaults_to_os_environ(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv('CLAUDE_PID', '424242')
-    assert sr.resolve_session_pid() == 424242
-
-
-# --- default_lease_slug (task 4248) ----------------------------------------
+# --- default_lease_slug (task 4248)----------------------------------------
 #
 # 3994 moved the lease PID into code because it depended on every skill doc
 # getting one shell token right. The SLUG stayed in shell -- and 3994 then made
@@ -4804,6 +4786,21 @@ _BARE_SHELL_ENTRYPOINTS: tuple[_BareShellEntrypoint, ...] = (
         ),
     ),
     _BareShellEntrypoint(
+        name='session_identity.py (tier-1: bare shell, NO PYTHONPATH)',
+        path=_SR_PKG_ROOT / 'orchestrator' / 'session_identity.py',
+        pythonpath=(),
+        shape=_EntrypointShape.SCRIPT,
+        argv=(),
+        probe='from orchestrator import stop_instruction',
+        callers=(
+            'session_registry.py imports this module at module scope as a bare '
+            'sibling when skills/spawn/spawn-claude.sh and the SKILL.md verb lines '
+            'run session_registry.py by absolute path with no venv, no install and '
+            'no PYTHONPATH. A non-stdlib import here breaks every registry verb, '
+            'the lease verbs that resolve the session identity included.'
+        ),
+    ),
+    _BareShellEntrypoint(
         name='session_hooks.py (tier-2: bare shell + PYTHONPATH)',
         path=_SR_PKG_ROOT / 'orchestrator' / 'session_hooks.py',
         # A THIRD distinct shape: script-by-absolute-path WITH PYTHONPATH. Not
@@ -4933,6 +4930,8 @@ _MUST_BE_REJECTED: tuple[tuple[str, str], ...] = (
     ('decision_registry.py', 'from orchestrator import stop_instruction'),
     ('decision_cli.py', 'import pydantic'),
     ('decision_cli.py', 'from orchestrator import stop_instruction'),
+    ('session_identity.py', 'import pydantic'),
+    ('session_identity.py', 'from orchestrator import stop_instruction'),
 )
 
 
@@ -5278,8 +5277,8 @@ class TestStdlibOnlySelfContainment:
     different contracts in this repo, and only the first is what these rows pin:
 
     (a) bare-shell executability — ``session_registry``, ``fleet_files``,
-        ``decision_registry``, ``decision_cli``, ``session_hooks``,
-        ``session_ownership_probes``, ``session_self_exit``;
+        ``decision_registry``, ``decision_cli``, ``session_identity``,
+        ``session_hooks``, ``session_ownership_probes``, ``session_self_exit``;
     (b) layering / cycle avoidance — ``routing``, ``stop_instruction``,
         ``fm_retry``, ``agents/triage``, ``fused_memory/config``/``schema``,
         where importing an intra-package sibling is perfectly fine;
@@ -5445,8 +5444,11 @@ class TestStdlibOnlySelfContainment:
         if final_state is not None:
             assert [decision.state for decision in dr.list_decisions(root=fleet)] == [final_state]
 
-    def test_the_decision_modules_import_only_downward(self):
-        """fleet_files <- decision_registry <- decision_cli, and none of them imports session_registry.
+    def test_the_extracted_modules_import_only_downward(self):
+        """Each module extracted from session_registry imports only below it, never session_registry.
+
+        fleet_files <- decision_registry <- decision_cli, and session_identity
+        is a leaf.
 
         Under tier-1 session_registry is ``__main__``, so a module below it
         that imported it back would silently load a second copy rather than
@@ -5478,11 +5480,39 @@ class TestStdlibOnlySelfContainment:
                             found.add(head[0])
             return found
 
-        assert {module: sibling_imports(module) for module in ('fleet_files', 'decision_registry', 'decision_cli')} == {
+        expected = {
             'fleet_files': set(),
             'decision_registry': {'fleet_files'},
             'decision_cli': {'decision_registry'},
+            'session_identity': set(),
         }
+
+        assert {module: sibling_imports(module) for module in expected} == expected
+
+    @pytest.mark.parametrize('extracted', ['session_identity'])
+    def test_no_extracted_name_is_re_exported_from_session_registry(self, extracted):
+        """A name moved out of session_registry no longer resolves through it.
+
+        session_registry imports each extracted module AS A MODULE, so a
+        consumer left pointing at ``session_registry.<moved name>`` fails
+        loudly instead of reaching the moved object through a silent shim.
+        Compared by identity, so session_registry's own same-named ``logger``
+        is not a leak.
+        """
+        module = importlib.import_module(f'orchestrator.{extracted}')
+        tree = ast.parse(Path(module.__file__ or '').read_text(encoding='utf-8'))
+        bound: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bound.add(node.name)
+            elif isinstance(node, ast.Assign):
+                bound.update(t.id for t in node.targets if isinstance(t, ast.Name))
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                bound.add(node.target.id)
+        absent = object()
+
+        assert bound
+        assert sorted(name for name in bound if getattr(sr, name, absent) is getattr(module, name)) == []
 
     def test_loads_by_path_under_a_foreign_dotless_module_name(self, monkeypatch):
         """The third load mode: by path, under a module name outside the package.
@@ -5499,7 +5529,7 @@ class TestStdlibOnlySelfContainment:
         name = 'sr_foreign_dotless_load_probe'
         path = _SR_PKG_ROOT / 'orchestrator' / 'session_registry.py'
         assert str(path.parent) not in sys.path
-        siblings = ('decision_cli', 'decision_registry', 'fleet_files')
+        siblings = ('decision_cli', 'decision_registry', 'fleet_files', 'session_identity')
         assert not any(sibling in sys.modules for sibling in siblings)
         spec = importlib.util.spec_from_file_location(name, path)
         assert spec is not None and spec.loader is not None
@@ -5516,6 +5546,7 @@ class TestStdlibOnlySelfContainment:
                 sibling: path.parent / f'{sibling}.py' for sibling in siblings
             }
             assert module.decision_cli is sys.modules['decision_cli']
+            assert module.session_identity is sys.modules['session_identity']
             assert module.fleet_root is sys.modules['fleet_files'].fleet_root
         finally:
             for sibling in siblings:
