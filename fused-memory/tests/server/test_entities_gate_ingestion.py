@@ -30,14 +30,7 @@ import pytest
 
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.utils.referent_resolution import _DECLARED_REFERENT_HINT
-
-# The malformed-shape corpus, IMPORTED rather than re-spelled. The unit tests
-# pin what the pure gate answers for each shape; this module pins what an agent
-# actually receives for the same shape. Two copies of the list would let those
-# two claims drift — a shape added to one and not the other is silently
-# unchecked at the seam that matters — which is the whole point of the
-# single-list amendment (see `_MALFORMED_SHAPES`' own comment).
-from server.test_entities_gate import _MALFORMED_SHAPES
+from server.entities_declaration_shapes import MALFORMED_SHAPES
 
 # The shared write-triage harness, imported rather than re-derived: reaching
 # `add_memory`'s SECOND service call site needs write triage enabled with a
@@ -575,7 +568,7 @@ class TestEveryMalformedShapeReachesTheGate:
     """
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
+    @pytest.mark.parametrize('declared', MALFORMED_SHAPES)
     async def test_add_memory_answers_with_the_hinted_block(self, declared):
         mock_service = AsyncMock()
         configure_pass_through_add_memory(mock_service)
@@ -590,7 +583,7 @@ class TestEveryMalformedShapeReachesTheGate:
         mock_service.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('declared', _MALFORMED_SHAPES)
+    @pytest.mark.parametrize('declared', MALFORMED_SHAPES)
     async def test_add_episode_answers_with_the_hinted_block(self, declared):
         mock_service = AsyncMock()
         _pass_through_episode(mock_service)
