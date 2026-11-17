@@ -8779,7 +8779,7 @@ class TestBuildSpawnEnv:
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            'arch-uuid-xyz',  # type: ignore[arg-type]  # deliberate str in launcher_pid slot; see session_hooks.hook_session_slug
+            'arch-uuid-xyz',
         )
 
     async def test_architect_still_receives_workflow_root_when_stashed(
@@ -8830,11 +8830,12 @@ class TestBuildSpawnEnv:
         implementer_kwargs = captured_calls[1]
         implementer_spawn_env = implementer_kwargs['spawn_env']
         assert implementer_spawn_env['CLAUDE_SPAWN_ROLE'] == 'implementer'
+        assert workflow._architect_spawn_session_id is not None
         assert implementer_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == session_records.build_session_slug(
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            workflow._architect_spawn_session_id,  # type: ignore[arg-type]  # deliberate str in launcher_pid slot; see session_hooks.hook_session_slug
+            workflow._architect_spawn_session_id,
         )
 
 

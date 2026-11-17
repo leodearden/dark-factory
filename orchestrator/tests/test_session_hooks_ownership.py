@@ -217,7 +217,7 @@ def test_hook_session_slug_forks_when_binding_mismatches(tmp_path: Path) -> None
         'unblock',
         'df',
         '2085',
-        'uuid-nested',  # type: ignore[arg-type]
+        'uuid-nested',
     )
     assert forked != slug
 
@@ -575,7 +575,7 @@ def test_hand_launched_session_unaffected_by_ownership_probe(
         'session',
         'dark-factory',
         None,
-        'sess-hand',  # type: ignore[arg-type]
+        'sess-hand',
     )
     assert len(list(session_records.sessions_dir(root=tmp_path).iterdir())) == 1
 

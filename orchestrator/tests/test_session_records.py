@@ -405,6 +405,10 @@ def test_build_session_slug_sanitizes_special_chars() -> None:
     assert re.fullmatch(r'[A-Za-z0-9._-]+', slug)
 
 
+def test_build_session_slug_accepts_a_session_id_token() -> None:
+    assert session_records.build_session_slug('session', 'dark-factory', None, 'abc-123') == 'session-dark-factory-abc-123'
+
+
 # ---------------------------------------------------------------------------
 # Task 2511 step-1: sanitize_slug (shared filesystem-safe-slug normalizer)
 # ---------------------------------------------------------------------------

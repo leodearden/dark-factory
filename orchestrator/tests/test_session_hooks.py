@@ -94,13 +94,11 @@ def test_resolve_hook_identity_uses_os_getcwd_when_cwd_absent(
 def test_hook_session_slug_keyed_on_session_id_hand_launched() -> None:
     hook_input = {'session_id': 'abc-123', 'cwd': '/home/leo/src/dark-factory'}
     slug = sh.hook_session_slug(hook_input, env={})
-    # session_id ('abc-123', a str) fills the launcher_pid slot deliberately;
-    # see session_hooks.hook_session_slug's docstring.
     assert slug == session_records.build_session_slug(
         'session',
         'dark-factory',
         None,
-        'abc-123',  # type: ignore[arg-type]
+        'abc-123',
     )
 
 
@@ -116,7 +114,7 @@ def test_hook_session_slug_keyed_on_session_id_spawned() -> None:
         'unblock',
         'df',
         '2085',
-        'abc-123',  # type: ignore[arg-type]
+        'abc-123',
     )
 
 
@@ -143,7 +141,7 @@ def test_hook_session_slug_uses_cwd_fallback_when_absent(
         'session',
         tmp_path.name,
         None,
-        'sess-3',  # type: ignore[arg-type]
+        'sess-3',
     )
 
 
@@ -181,7 +179,7 @@ def test_hook_session_slug_falls_back_when_claude_spawn_session_id_absent(
         'session',
         'dark-factory',
         None,
-        'abc-123',  # type: ignore[arg-type]
+        'abc-123',
     )
 
 

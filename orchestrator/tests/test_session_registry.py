@@ -2822,8 +2822,8 @@ class TestLeaseSlugIsNotASessionRecordKey:
     """
 
     # A hand-launched session's uniqueness token: hook_session_slug passes the
-    # hook's `session_id` (a UUID string) into build_session_slug's
-    # launcher_pid slot. Kept literal so the test is deterministic.
+    # hook's `session_id` (a UUID string) to build_session_slug as that token.
+    # Kept literal so the test is deterministic.
     SESSION_UUID = '25737ee4-3b1e-4a7f-9f0e-6a1c2d3e4f50'
 
     def _lease_slug(self, project: str = 'df', pid: int = 1894895) -> str:
@@ -2844,7 +2844,7 @@ class TestLeaseSlugIsNotASessionRecordKey:
             'session',
             project,
             None,
-            self.SESSION_UUID,  # type: ignore[arg-type]
+            self.SESSION_UUID,
         )
 
     def test_a_real_record_provably_does_not_live_under_its_lease_slug(
