@@ -27,6 +27,7 @@ from orchestrator.eligibility_clock import EligibilityClockStore
 from orchestrator.event_store import EventStore
 from orchestrator.overrides import OverrideSource, OverrideStore
 from orchestrator.scheduler import Scheduler, SchedulerCallbacks, TaskAssignment
+from orchestrator.starvation_state import StarvationStateStore
 from orchestrator.starvation_watchdog import AUTO_PIN_CAP_SENTINEL, STARVATION_WATCHDOG_ROLE
 
 T0 = datetime(2026, 10, 1, tzinfo=UTC)
@@ -470,6 +471,10 @@ async def test_an_operator_row_is_never_touched(tmp_path: Path, override: dict) 
     assert rig.warned_ids() == ['2']
 
 
+_COHORT_SCANS = 4
+CAP_OF_TWO: dict[str, Any] = {'auto_pin_max_concurrent': 2, 'auto_pin_ttl_secs': 10 * FLOOR}
+
+
 async def _three_starve_behind_a_cap_of_two(rig: _Rig, *extra: dict) -> EscalationQueue:
     """S1 and S2 starve first and take both watchdog pins; the cap turns S3 away."""
     queue = EscalationQueue(rig.scheduler.config.project_root / 'esc')
@@ -482,9 +487,25 @@ async def _three_starve_behind_a_cap_of_two(rig: _Rig, *extra: dict) -> Escalati
     assert await rig.tick() is None
     rig.advance(FLOOR)
     rig.tasks.extend([_task('1', 'high', 'hot/a.py'), *extra])
-    for _ in range(4):
+    for _ in range(_COHORT_SCANS):
         await rig.tick_with_low_winner()
     return queue
+
+
+def _prior_cohort_refusals(tmp_path: Path, skip_threshold: int) -> None:
+    """Refusals a previous process left for S1-S3, so the cohort forms in the usual scans.
+
+    A scan is one tick, and accruing a production-sized threshold one tick at
+    a time costs minutes on a loaded host; the durable state is the seam a
+    previous process writes anyway.
+    """
+    store = StarvationStateStore(tmp_path / 'scheduler_eligibility.db')
+    for _ in range(skip_threshold - (_COHORT_SCANS - 1)):
+        store.note_scan(str(tmp_path), ['S1', 'S2', 'S3'])
+
+
+def _open_cap_l1s(queue: EscalationQueue) -> list[Escalation]:
+    return queue.get_by_task(AUTO_PIN_CAP_SENTINEL, status='pending', level=1)
 
 
 @pytest.mark.asyncio
@@ -788,3 +809,86 @@ async def test_leaving_pending_resolves_the_escalation(tmp_path: Path, status: s
     await rig.tick()
 
     assert [str(c.args[0]) for c in rig.resolve.call_args_list] == ['2']
+
+
+# ---------------------------------------------------------------------------
+# Restart safety (task 9636): the watchdog's inputs and announcements are durable
+# ---------------------------------------------------------------------------
+
+
+def _restart(
+    rig: _Rig, tmp_path: Path, queue: EscalationQueue | None = None, **settings: Any,
+) -> _Rig:
+    """A second process on the same stores and task list, built with *settings*.
+
+    Its lock table starts empty, so the seed is put back to pending and pinned
+    at the head of the pin queue (a surviving watchdog pin would otherwise
+    outrank it), which makes the seed the first dispatch and the holder again.
+    """
+    rig.set_status('0', 'pending')
+    rig.overrides.set_override(rig.root, '0', pinned=True)
+    pinned = [tid for tid, _ in rig.overrides.get_pin_queue(rig.root) if tid != '0']
+    rig.overrides.reorder_pin_queue(rig.root, ['0', *pinned])
+    second = _rig(tmp_path, tasks=rig.tasks, wall=rig.wall, **settings)
+    second.scheduler.escalation_queue = queue
+    return second
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('skip_threshold', [50, 150])
+async def test_a_closed_cap_l1_is_not_refiled_after_a_restart(
+    tmp_path: Path, skip_threshold: int,
+) -> None:
+    settings = {'skip_threshold': skip_threshold, **CAP_OF_TWO}
+    _prior_cohort_refusals(tmp_path, skip_threshold)
+    rig = _rig(tmp_path, **settings)
+    queue = await _three_starve_behind_a_cap_of_two(rig)
+    [cap_l1] = _open_cap_l1s(queue)
+    queue.resolve(cap_l1.id, 'wait', resolved_by='human')
+
+    second = _restart(rig, tmp_path, queue, **settings)
+    assert await second.tick_id() == '0'
+    for _ in range(_COHORT_SCANS):
+        await second.tick_with_low_winner()
+
+    assert _open_cap_l1s(queue) == []
+    assert len(second.detected('S3')) == 1
+
+
+@pytest.mark.asyncio
+async def test_lock_refusals_survive_a_restart(tmp_path: Path) -> None:
+    rig = _rig(tmp_path)
+    rig.set_tasks([_seed(), _task('2', 'medium', 'hot/b.py')])
+    assert await rig.tick_id() == '0'
+    rig.advance(FLOOR)
+    rig.tasks.append(_task('1', 'high', 'hot/a.py'))
+    for _ in range(2):
+        await rig.tick_with_low_winner()
+
+    second = _restart(rig, tmp_path)
+    assert await second.tick_id() == '0'
+    await second.tick_with_low_winner()
+    assert second.detected('2') == []
+    await second.tick()
+
+    [event] = second.detected('2')
+    assert event['gate'] == 'lock_refused'
+    assert event['lock_refusals'] == 3
+
+
+@pytest.mark.asyncio
+async def test_an_announced_task_is_not_reannounced_after_a_restart(tmp_path: Path) -> None:
+    rig = _rig(tmp_path)
+    await _refused_while_lows_dispatch(rig)
+    # A boost, not a pin: a pinned task leaves the scored scan and accrues no refusals.
+    rig.overrides.set_override(rig.root, '2', boost_tier='high')
+    await rig.tick_with_low_winner()
+    assert rig.warned_ids() == ['2']
+
+    second = _restart(rig, tmp_path)
+    assert await second.tick_id() == '0'
+    for _ in range(4):
+        await second.tick_with_low_winner()
+
+    assert '2' not in second.warned_ids()
+    assert len(second.detected('2')) == 1
