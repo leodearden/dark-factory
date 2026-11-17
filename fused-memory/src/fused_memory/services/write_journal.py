@@ -39,9 +39,9 @@ from shared.sqlite_column_migration import add_column_if_missing
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
 from fused_memory.services.read_rollup import (
     COUNT_READ_SQL,
-    KEPT_OPERATION_READ_PREDICATE,
+    NON_PER_ROW_OPERATION_READ_PREDICATE,
+    PER_ROW_OPERATION_READ_PREDICATE,
     READ_OP_COUNTS_SCHEMA_SQL,
-    UNKEPT_OPERATION_READ_PREDICATE,
     keeps_read_row,
 )
 
@@ -315,12 +315,14 @@ CREATE INDEX IF NOT EXISTS idx_rf_group_time ON referent_findings(group_id, crea
 """
 
 
+KIND_TIME_INDEX = 'idx_wo_kind_time'
+
 #: The read horizon's partial index. ``WriteJournal._migrate`` creates it, not
 #: ``SCHEMA_SQL``, because its WHERE needs the ``kind`` column.
 READ_HORIZON_INDEX = 'idx_wo_read_horizon_time'
 READ_HORIZON_INDEX_SQL = (
     f'CREATE INDEX {READ_HORIZON_INDEX} ON write_ops(created_at) '
-    f'WHERE {UNKEPT_OPERATION_READ_PREDICATE}'
+    f'WHERE {NON_PER_ROW_OPERATION_READ_PREDICATE}'
 )
 
 
@@ -361,9 +363,9 @@ def _prune_batch_sql(horizon_rows: str, index: str) -> str:
 #: names, so a missing index errors instead of scanning. The read horizon's
 #: partial index holds only that horizon's rows.
 WRITE_OPS_PRUNE_BATCH_SQL: Mapping[str, str] = MappingProxyType({
-    'read': _prune_batch_sql(UNKEPT_OPERATION_READ_PREDICATE, READ_HORIZON_INDEX),
-    'search': _prune_batch_sql(KEPT_OPERATION_READ_PREDICATE, 'idx_wo_kind_time'),
-    'write': _prune_batch_sql("kind = 'write'", 'idx_wo_kind_time'),
+    'read': _prune_batch_sql(NON_PER_ROW_OPERATION_READ_PREDICATE, READ_HORIZON_INDEX),
+    'search': _prune_batch_sql(PER_ROW_OPERATION_READ_PREDICATE, KIND_TIME_INDEX),
+    'write': _prune_batch_sql("kind = 'write'", KIND_TIME_INDEX),
 })
 
 #: One batch of ``WriteJournal.prune_backend_ops``. It takes the same
@@ -654,7 +656,7 @@ class WriteJournal:
 
             # Indexes on new columns (safe after migration ensures columns exist)
             await db.execute(
-                'CREATE INDEX IF NOT EXISTS idx_wo_kind_time ON write_ops(kind, created_at)'
+                f'CREATE INDEX IF NOT EXISTS {KIND_TIME_INDEX} ON write_ops(kind, created_at)'
             )
             await db.execute(
                 'CREATE INDEX IF NOT EXISTS idx_wo_agent_time ON write_ops(agent_id, created_at)'

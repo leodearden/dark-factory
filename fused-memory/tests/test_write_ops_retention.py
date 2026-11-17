@@ -18,20 +18,20 @@ from fused_memory.services.write_ops_retention import (
     run_periodic_write_ops_prune,
 )
 
-_KIND_TIME_RANGE_SEEK = (
+_KIND_TIME_SEEK_AND_WHY = (
     'SEARCH write_ops USING INDEX idx_wo_kind_time (kind=? AND created_at>? AND created_at<?)',
     'unless the (kind, created_at) seek is bounded on both sides, a batch re-walks every '
     'row an earlier batch passed over, which measured 9.4 s cold in one statement on the '
     'live journal',
 )
-_RANGE_SEEK_BY_HORIZON = {
+_SEEK_AND_WHY_BY_HORIZON = {
     'read': (
         'SEARCH write_ops USING INDEX idx_wo_read_horizon_time (created_at>? AND created_at<?)',
         'a kind_time seek visits every kept search row in range, which measured 40 s cold '
         'on the live journal on 2026-11-17',
     ),
-    'search': _KIND_TIME_RANGE_SEEK,
-    'write': _KIND_TIME_RANGE_SEEK,
+    'search': _KIND_TIME_SEEK_AND_WHY,
+    'write': _KIND_TIME_SEEK_AND_WHY,
 }
 
 
@@ -52,7 +52,7 @@ async def test_every_prune_batch_seeks_between_its_resume_point_and_cutoff(journ
             ('2026-01-01T00:00:00+00:00', '2026-02-01T00:00:00+00:00', 1),
         ).fetchall()
     details = [row[3] for row in plan]
-    expected_seek, why = _RANGE_SEEK_BY_HORIZON[horizon]
+    expected_seek, why = _SEEK_AND_WHY_BY_HORIZON[horizon]
     assert expected_seek in details, f'the {horizon} batch plans as {details}: {why}'
     assert not any('TEMP B-TREE' in detail for detail in details), (
         f'the {horizon} batch sorts instead of reading created_at order off the index'
@@ -185,12 +185,12 @@ async def test_each_horizon_resumes_where_the_last_pass_drained_it(journal):
     ('dropped_index', 'seeded', 'config'),
     [
         (
-            'idx_wo_read_horizon_time',
+            write_journal.READ_HORIZON_INDEX,
             {'operation': 'get_task', 'kind': 'read', 'success': False},
             WriteJournalConfig(read_retention_days=10),
         ),
         (
-            'idx_wo_kind_time',
+            write_journal.KIND_TIME_INDEX,
             {'operation': 'search', 'kind': 'read'},
             WriteJournalConfig(read_retention_days=10, search_retention_days=15),
         ),
