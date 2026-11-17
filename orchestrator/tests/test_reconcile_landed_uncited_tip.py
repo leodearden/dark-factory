@@ -173,6 +173,13 @@ class TestBranchTipLanded:
 
         assert await branch_tip_landed(git_ops, 'task/704', tip, landing_sha='0' * 40) is False
 
+    async def test_no_attributed_landing_falls_back_to_the_branch_merge_marker(
+        self, repo: _Repo, git_ops: GitOps,
+    ) -> None:
+        _, tip, _ = land_uncited_tip(repo, '701')
+
+        assert await branch_tip_landed(git_ops, 'task/701', tip, landing_sha=None) is True
+
 
 # ---------------------------------------------------------------------------
 # The reconcile sweep over real git.  Only the warm-lane script is stubbed: it
@@ -261,3 +268,29 @@ class TestReconcileSweepOverUncitedLandedTip:
 
         scheduler_double.set_task_status.assert_any_await('702', 'pending')
         scheduler_double.mark_done.assert_not_awaited()
+
+    async def test_citation_disabled_reseeded_foreign_tip_still_reverts(
+        self, repo: _Repo, harness: Harness, scheduler_double: MagicMock,
+    ) -> None:
+        harness.git_ops.config.commit_citation_pattern = ''
+        land_then_reseed_foreign_tip(repo, '702')
+        stage_in_progress(scheduler_double, '702', {})
+
+        await run_mid_run_sweep(harness)
+
+        scheduler_double.set_task_status.assert_any_await('702', 'pending')
+        scheduler_double.mark_done.assert_not_awaited()
+
+    async def test_citation_disabled_landed_uncited_tip_is_marked_done_via_its_merge_marker(
+        self, repo: _Repo, harness: Harness, scheduler_double: MagicMock,
+    ) -> None:
+        harness.git_ops.config.commit_citation_pattern = ''
+        fork_point, tip, _ = land_uncited_tip(repo, '701')
+        stage_in_progress(scheduler_double, '701', {'branch_base_sha': fork_point})
+
+        await run_mid_run_sweep(harness)
+
+        scheduler_double.mark_done.assert_awaited_once()
+        assert scheduler_double.mark_done.await_args.kwargs['kind'] == 'found_on_main'
+        assert scheduler_double.mark_done.await_args.kwargs['sha'] == tip
+        assert call('701', 'pending') not in scheduler_double.set_task_status.await_args_list
