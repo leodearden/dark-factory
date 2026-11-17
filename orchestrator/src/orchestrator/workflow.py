@@ -518,6 +518,14 @@ def _is_gating_escalation(e: Escalation) -> bool:
     return (e.severity == 'blocking' and e.level == 0) or needs_human(e)
 
 
+def _is_l1_handoff(e: Escalation) -> bool:
+    """An open L1 hands the task to a human unless
+    :func:`escalation.pins.is_queue_handoff` says otherwise: info never does,
+    an unknown severity fails safe (plans/info-l0-disposition-router-prd.md D3).
+    """
+    return e.level == 1 and is_queue_handoff(e)
+
+
 def _format_reescalation_detail(escalations: list[Escalation]) -> str:
     """Render the payload carried by a ``_HumanHandoff`` into a rich
     ``_mark_blocked(detail=...)`` string (task 2553).
@@ -15925,7 +15933,7 @@ class TaskWorkflow:
         open_at_tail = self.escalation_queue.get_by_task(self.task_id, status='pending')
         handoffs = [
             e for e in open_at_tail
-            if needs_human(e) or (e.level == 1 and is_queue_handoff(e))
+            if needs_human(e) or _is_l1_handoff(e)
         ]
         if handoffs:
             steward_filed_one = any(
@@ -19109,8 +19117,9 @@ class TaskWorkflow:
         ranks only publications about its own escalation, and no current
         steward producer publishes twice for one escalation.  The task-2248
         case of a follow-on L0 the steward chained and gave up on is foreign
-        to a scoped wait; the ``has_open_l1`` override in
-        :meth:`_await_steward_completion` covers it, not this ranking.
+        to a scoped wait; the open-L1 hand-off override
+        (:meth:`_open_l1_handoffs`) in :meth:`_await_steward_completion`
+        covers it, not this ranking.
 
         Higher wins: an L1 hand-off outranks budget exhaustion,
         which outranks a no-wip interruption, which outranks a wip-present
@@ -19132,9 +19141,10 @@ class TaskWorkflow:
         """True for the ``StewardOutcome`` variants that lead ``_mark_blocked``
         to re-pend the task: a clean ``StewardResolved``, or a
         ``StewardInterrupted`` with WIP present (the task-2060 resume-plan
-        branch).  These are exactly the outcomes the ``has_open_l1``
-        source-of-truth override in :meth:`_await_steward_completion` must
-        gate — a requeue must never race past an L1 that is already open.
+        branch).  These are exactly the outcomes the open-L1 hand-off
+        override (:meth:`_open_l1_handoffs`) in
+        :meth:`_await_steward_completion` must gate — a requeue must never
+        race past an L1 hand-off that is already open.
         """
         if isinstance(outcome, StewardResolved):
             return True
@@ -19154,6 +19164,17 @@ class TaskWorkflow:
                 self.task_id, status='pending', level=0,
             )
             if not router_owns(esc, enabled=self.config.info_l0_router_enabled)
+        ]
+
+    def _open_l1_handoffs(self, task_id: str) -> list[Escalation]:
+        """*task_id*'s pending level-1 records that hand it to a human (:func:`_is_l1_handoff`)."""
+        if self.escalation_queue is None:
+            return []
+        return [
+            esc for esc in self.escalation_queue.get_by_task(
+                task_id, status='pending', level=1,
+            )
+            if _is_l1_handoff(esc)
         ]
 
     def _l0s_holding_the_wait(self) -> list[Escalation]:
@@ -19373,7 +19394,7 @@ class TaskWorkflow:
         value.**  Every actionable variant is already fully determined by the
         escalation-queue state ``_wait_for_resolution``'s tail reads:
         ``StewardReescalatedL1``/``StewardBudgetExhausted`` ⇒ the L0 is
-        dismissed and an L1 is open ⇒ ``has_open_l1``; ``StewardResolved`` ⇒
+        dismissed and an L1 is open ⇒ an open L1 hand-off; ``StewardResolved`` ⇒
         the L0 is resolved; ``StewardInterrupted`` ⇒ the L0 is dismissed by the
         producer-side give-up contract with no L1.  Routing here would add a
         SECOND parallel outcome contract on a path that has none — precisely
@@ -19578,7 +19599,7 @@ class TaskWorkflow:
         this channel — the dismissal is the only thing that wakes it — so a new
         steward early return that publishes without dismissing would satisfy
         this waiter while stranding that one.  The dismissal loops on this path
-        (``_mark_blocked``'s, and the ``has_open_l1`` override's below) are
+        (``_mark_blocked``'s, and the open-L1 hand-off override's below) are
         idempotent backstops over an already-dismissed record, not the primary
         mechanism.
 
@@ -19627,15 +19648,16 @@ class TaskWorkflow:
         reduced to the most severe via :meth:`_outcome_severity`.
 
         The multi-outcome silent-requeue gap (task 2248 review fix) is closed
-        by the ``has_open_l1`` source-of-truth override.  That gap is the
+        by the open-L1 hand-off override (:meth:`_open_l1_handoffs`).  That gap is the
         steward resolving this L0, then chaining a follow-on L0 and handing
         THAT one to a human.  In a scoped wait the follow-on's outcome is
         foreign and discarded, so the override is the only layer that sees
         it.  Before a requeue-producing outcome (:meth:`_outcome_requeues`)
-        is returned, the escalation queue's ``has_open_l1`` is re-checked,
+        is returned, the escalation queue's open L1 hand-offs are re-read,
         which also catches the publish-timing race where the follow-on L1 was
         filed but its outcome has not yet landed on the channel.  When an L1
-        is open, ``StewardReescalatedL1`` is returned instead.  If the
+        hand-off is open, ``StewardReescalatedL1`` naming it is returned
+        instead; an info L1 is never one.  If the
         overridden outcome was a wip-present ``StewardInterrupted``, the
         still-pending L0 it never dismissed is dismissed here too: that
         publisher deliberately skips ``_auto_escalate_to_human``, so the
@@ -19666,7 +19688,7 @@ class TaskWorkflow:
         if status in TERMINAL_STATUSES or status == 'deferred':
             return StewardTerminalDecision(new_status=TaskStatus(status))
         if outcome is not None:
-            # has_open_l1 source-of-truth override (review fix): a
+            # Open-L1 hand-off override (_open_l1_handoffs, review fix): a
             # requeue-producing outcome must not race past an L1 that is
             # already open — one the steward filed for a follow-on L0, whose
             # outcome was discarded as foreign to this scoped wait or has not
@@ -19676,11 +19698,8 @@ class TaskWorkflow:
             if (
                 self._outcome_requeues(outcome)
                 and self.escalation_queue is not None
-                and self.escalation_queue.has_open_l1(self.task_id)
+                and (handoffs := self._open_l1_handoffs(self.task_id))
             ):
-                open_l1 = self.escalation_queue.get_by_task(
-                    self.task_id, status='pending', level=1,
-                )
                 if isinstance(outcome, StewardInterrupted) and outcome.wip_commits_present:
                     # Amendment (review fix — orphan_resource_leak): the
                     # wip-present StewardInterrupted publisher deliberately
@@ -19713,9 +19732,7 @@ class TaskWorkflow:
                             'ESCALATED by an already-open L1',
                             self.task_id, len(orphan_l0),
                         )
-                return StewardReescalatedL1(
-                    esc_id=open_l1[0].id if open_l1 else '',
-                )
+                return StewardReescalatedL1(esc_id=handoffs[0].id)
             return outcome
         return StewardInterrupted(
             'timeout',

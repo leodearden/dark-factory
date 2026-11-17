@@ -1503,7 +1503,7 @@ class TestStewardOutcomeRouting:
         """The SINGLE isinstance dispatch (workflow.py:8685-8759):
         StewardResolved -> REQUEUED via ``_requeue()``/pending, with NO
         timestamp-window/queue-forensics read — ``escalation_queue.get_by_task``
-        is never consulted for this outcome."""
+        is consulted only for the open-L1 hand-off override's level-1 read."""
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
         wf._steward_outcome_channel = asyncio.Queue()
@@ -1518,7 +1518,8 @@ class TestStewardOutcomeRouting:
         wf.scheduler.set_task_status.assert_any_call(  # type: ignore[attr-defined]
             wf.task_id, 'pending',
         )
-        wf.escalation_queue.get_by_task.assert_not_called()  # type: ignore[union-attr]
+        reads = wf.escalation_queue.get_by_task.call_args_list  # type: ignore[union-attr]
+        assert all(c.kwargs.get('level') == 1 for c in reads), reads
 
     # -- Row 8: StewardTerminalDecision --------------------------------------
 
@@ -1645,7 +1646,8 @@ class TestStewardOutcomeRouting:
         filed at level 1 — now possible via ``escalate_blocker(level=1)`` —
         survives it BY CONSTRUCTION, with no ``agent_role`` predicate to
         defeat.  This pins that structural property against a future widening
-        of the sweep's scope.
+        of the sweep's scope.  The L1 is info so the open-L1 hand-off override
+        lets the requeue reach the sweep; a blocking one would divert it.
         """
         wf = _make_workflow(tmp_path=tmp_path, with_escalation_queue=True)
         wf._steward = MagicMock()
@@ -1656,7 +1658,7 @@ class TestStewardOutcomeRouting:
         wf.scheduler.get_status = AsyncMock(return_value='blocked')
         l0 = _make_escalation(id='esc-42-1', level=0, agent_role='orchestrator')
         l1 = _make_escalation(
-            id='esc-42-2', level=1, agent_role='steward',
+            id='esc-42-2', level=1, agent_role='steward', severity='info',
             category='infra_issue', summary='steward re-escalation',
         )
         wf.escalation_queue.get_by_task.side_effect = (  # type: ignore[union-attr]
