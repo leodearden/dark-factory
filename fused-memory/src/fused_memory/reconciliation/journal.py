@@ -294,10 +294,9 @@ class ReconciliationJournal:
             # by a fresh instance — see _recover_stale_runs.
             await add_column_if_missing(db, 'runs', 'instance_id', 'TEXT')
 
-            # Safe migration: add session-capture columns to existing DBs (task 2744).
-            # session_id / stage_cursor snapshot the in-flight stage subprocess's CLI
-            # session (cleared between stages); attempt is a monotonic count of
-            # stage-subprocess launches, kept as durable launch history.
+            # Legacy columns (task 2744): BaseStage.run's session snapshot wrote
+            # them until task 8745 retired it. Nothing writes them now; they stay
+            # so pre-8745 rows still decode.
             await add_column_if_missing(db, 'runs', 'session_id', 'TEXT')
             await add_column_if_missing(db, 'runs', 'stage_cursor', 'TEXT')
             await add_column_if_missing(db, 'runs', 'attempt', 'INTEGER DEFAULT 0')
@@ -533,47 +532,6 @@ class ReconciliationJournal:
             # Read rowcount inside the write unit, before it commits.
             applied = cursor.rowcount == 1
         return applied
-
-    async def record_run_session(
-        self, run_id: str, *, session_id: str, stage_cursor: str
-    ) -> None:
-        """Snapshot the in-flight stage's minted CLI session onto the run row.
-
-        Called by ``BaseStage.run`` right before it launches a stage subprocess
-        (mint-before-spawn). ``attempt`` auto-increments atomically in SQL so the
-        run row carries a monotonic count of stage invocations with no
-        read-modify-write race.
-
-        Best-effort snapshot — may be STALE after an internal cap retry: the
-        persisted ``session_id`` is the value ``BaseStage.run`` *minted* before
-        the launch, but ``invoke_with_cap_retry`` regenerates its own session id
-        internally on a cap retry (shared/src/shared/cli_invoke.py), so after
-        such a retry the CLI's live session differs from the value stored here.
-        Note too that ``attempt`` counts ``BaseStage.run`` stage invocations, not
-        the underlying subprocess spawns — a cap retry spawns again without
-        bumping ``attempt``. Any reader must therefore treat this snapshot as
-        best-effort rather than as the CLI's live session id.
-        """
-        async with self._require_access().write() as db:
-            await db.execute(
-                """UPDATE runs
-                   SET session_id = ?, stage_cursor = ?, attempt = COALESCE(attempt, 0) + 1
-                   WHERE id = ?""",
-                (session_id, stage_cursor, run_id),
-            )
-
-    async def clear_run_session(self, run_id: str) -> None:
-        """Clear the in-flight session snapshot after a stage subprocess exits.
-
-        Nulls ``session_id``/``stage_cursor`` (so the row shows a session only
-        while a stage is actually in flight) but retains ``attempt`` as durable
-        launch history.
-        """
-        async with self._require_access().write() as db:
-            await db.execute(
-                'UPDATE runs SET session_id = NULL, stage_cursor = NULL WHERE id = ?',
-                (run_id,),
-            )
 
     async def get_run(self, run_id: str) -> ReconciliationRun | None:
         row = await self._require_access().read_one(
