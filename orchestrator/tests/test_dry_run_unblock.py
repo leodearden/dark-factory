@@ -182,7 +182,8 @@ def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
                        stderr='', turns=0, api_error_status=None,
                        schema_salvaged=False, output_tokens=None,
                        ended_awaiting_background=False):
-    # NOTE: duplicated verbatim in test_b3_gate.py (task 2020 review:
+    # NOTE: duplicated verbatim as
+    # orchestrator/tests/_b3_gate_fixtures.py::make_agent_result (task 2020 review:
     # code_duplication). Both copies must be extended together whenever
     # shared.cli_invoke.AgentResult gains/renames a field consumed by
     # classify_agent_failure(). Out of this task's locked scope: hoisting

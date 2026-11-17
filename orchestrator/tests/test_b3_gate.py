@@ -15,96 +15,22 @@ import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
+from _b3_gate_fixtures import (
+    LOW_RISK_ENTRY,
+    diverge_feature_branch,
+    fake_git_diff_fails,
+    fake_git_fresh,
+    fake_git_never_called,
+    make_agent_result,
+)
+from _git_fixtures import seed_repo
 from shared.tasks_db_readonly import TaskDbProblem, TaskDbUnreadable
 
 # ---------------------------------------------------------------------------
 # Shared helpers (adapted from test_dry_run_unblock.py)
 # ---------------------------------------------------------------------------
-
-def _init_git_repo(path: Path) -> str:
-    """Init a minimal git repo at *path* (on 'main' branch), return HEAD sha."""
-    p = str(path)
-    subprocess.run(['git', 'init', '-b', 'main', p], check=True, capture_output=True)
-    subprocess.run(['git', '-C', p, 'config', 'user.name', 'Test User'],
-                   check=True, capture_output=True)
-    subprocess.run(['git', '-C', p, 'config', 'user.email', 'test@example.com'],
-                   check=True, capture_output=True)
-    (path / 'README.md').write_text('init')
-    subprocess.run(['git', '-C', p, 'add', '.'], check=True, capture_output=True)
-    subprocess.run(['git', '-C', p, 'commit', '-m', 'initial commit'],
-                   check=True, capture_output=True)
-    result = subprocess.run(['git', '-C', p, 'rev-parse', 'HEAD'],
-                            check=True, capture_output=True, text=True)
-    return result.stdout.strip()
-
-
-def _diverge_feature_branch(path: Path) -> str:
-    """Create a feature branch with one extra commit so HEAD != main.
-
-    Returns the new HEAD sha (feature commit).
-    """
-    p = str(path)
-    subprocess.run(['git', '-C', p, 'checkout', '-b', 'feature'],
-                   check=True, capture_output=True)
-    (path / 'extra.txt').write_text('feature work')
-    subprocess.run(['git', '-C', p, 'add', '.'], check=True, capture_output=True)
-    subprocess.run(['git', '-C', p, 'commit', '-m', 'feature commit'],
-                   check=True, capture_output=True)
-    result = subprocess.run(['git', '-C', p, 'rev-parse', 'HEAD'],
-                            check=True, capture_output=True, text=True)
-    return result.stdout.strip()
-
-
-def _make_agent_result(*, success=True, cost_usd=0.50, structured_output=None,
-                       subtype='', output='', duration_ms=1000,
-                       timed_out=False, transcript_turns=None, session_id='',
-                       stderr='', turns=0, api_error_status=None,
-                       schema_salvaged=False, output_tokens=None,
-                       ended_awaiting_background=False):
-    """Create a minimal MagicMock AgentResult stand-in for _build_entry tests.
-
-    NOTE: duplicated verbatim in test_dry_run_unblock.py (task 2020 review:
-    code_duplication). Both copies must be extended together whenever
-    shared.cli_invoke.AgentResult gains/renames a field consumed by
-    classify_agent_failure(). Out of this task's locked scope: hoisting both
-    into the existing orchestrator/tests/_orch_helpers.py shared-helper
-    module (the established convention for cross-suite test helpers in this
-    package) is a follow-up.
-    """
-    r = MagicMock()
-    r.success = success
-    r.cost_usd = cost_usd
-    r.structured_output = structured_output
-    r.subtype = subtype
-    r.output = output
-    r.duration_ms = duration_ms
-    # Faithful diagnostic-field defaults (mirrors shared.cli_invoke.AgentResult).
-    # A bare MagicMock auto-vivifies every unset attribute as a truthy
-    # MagicMock, which would silently corrupt classify_agent_failure()'s
-    # decision rules: .timed_out truthy -> misclassifies every failure as
-    # TIMED_OUT -> infra; .schema_salvaged truthy -> misclassifies a generic
-    # failure as STRUCTURAL instead of UNKNOWN. Setting explicit defaults for
-    # every field classify_agent_failure() consults (including
-    # .output_tokens, read when formatting the MAX_TURNS summary) keeps
-    # these mocks faithful stand-ins for its decision rules.
-    r.timed_out = timed_out
-    r.transcript_turns = transcript_turns
-    r.session_id = session_id
-    r.stderr = stderr
-    r.turns = turns
-    r.api_error_status = api_error_status
-    r.schema_salvaged = schema_salvaged
-    r.output_tokens = output_tokens
-    # task 2761: classify_agent_failure now reads .ended_awaiting_background
-    # (rule 2, above the timed_out rule). A bare MagicMock auto-vivifies it as
-    # a truthy stand-in, which would misclassify every failure as
-    # ENDED_AWAITING_BACKGROUND -> investigation_failed. Default it False.
-    r.ended_awaiting_background = ended_awaiting_background
-    return r
-
 
 def _seed_tasks_db(
     project_root: Path, task_id: int, proposals: list, *, description: str = '',
@@ -480,36 +406,6 @@ class TestChargeConcurrency:
 # step-9: check_proposal mechanical classification (fake git runner)
 # ---------------------------------------------------------------------------
 
-def _fake_git_fresh(args, cwd):
-    """Fake git runner: HEAD == recorded sha, diff is empty (fresh)."""
-    if 'rev-parse' in args:
-        return (0, 'aaabbbccc')
-    return (0, '')  # diff empty
-
-
-def _fake_git_never_called(args, cwd):
-    raise AssertionError(f'git should not have been called; args={args}')
-
-
-def _fake_git_diff_fails(args, cwd):
-    """Fake git runner: rev-parse HEAD succeeds (P1 passes), but diff returns non-zero rc."""
-    if 'rev-parse' in args:
-        return (0, 'aaabbbccc')
-    # diff call fails (e.g. bad revision, transient error)
-    return (128, 'fatal: bad revision dddeeefff..main')
-
-
-_LOW_RISK_ENTRY = {
-    'proposal_text': 'Fix it',
-    'risk_label': 'low',
-    'files_referenced': ['foo.py'],
-    'block_reason': 'test',
-    'investigated_at': '2026-06-04T09:00:00+00:00',
-    'head_sha': 'aaabbbccc',
-    'main_sha': 'dddeeefff',
-}
-
-
 class TestCheckProposalMechanical:
     _NOW = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
 
@@ -517,37 +413,37 @@ class TestCheckProposalMechanical:
         from orchestrator.b3_gate import ABORT, check_proposal
         result = check_proposal(
             None, worktree='/tmp', category=None,
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT
         assert 'proposal' in result['reason'].lower()
 
     def test_medium_risk_aborts(self):
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'risk_label': 'medium'}
+        entry = {**LOW_RISK_ENTRY, 'risk_label': 'medium'}
         result = check_proposal(entry, worktree='/tmp', category=None,
-                                run_git=_fake_git_never_called, now=self._NOW)
+                                run_git=fake_git_never_called, now=self._NOW)
         assert result['verdict'] == ABORT
 
     def test_human_review_risk_aborts(self):
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'risk_label': 'human-review-required'}
+        entry = {**LOW_RISK_ENTRY, 'risk_label': 'human-review-required'}
         result = check_proposal(entry, worktree='/tmp', category=None,
-                                run_git=_fake_git_never_called, now=self._NOW)
+                                run_git=fake_git_never_called, now=self._NOW)
         assert result['verdict'] == ABORT
 
     def test_status_key_present_aborts(self):
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'status': 'investigation_failed'}
+        entry = {**LOW_RISK_ENTRY, 'status': 'investigation_failed'}
         result = check_proposal(entry, worktree='/tmp', category=None,
-                                run_git=_fake_git_never_called, now=self._NOW)
+                                run_git=fake_git_never_called, now=self._NOW)
         assert result['verdict'] == ABORT
 
     def test_invalid_category_aborts(self):
         from orchestrator.b3_gate import ABORT, check_proposal
         result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category='infra_issue',
-            run_git=_fake_git_never_called, now=self._NOW,
+            LOW_RISK_ENTRY, worktree='/tmp', category='infra_issue',
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT
 
@@ -556,8 +452,8 @@ class TestCheckProposalMechanical:
         for cat in ('task_failure', 'review_issues'):
             # Should NOT abort on category check (may abort/drift/fresh for other reasons)
             result = check_proposal(
-                _LOW_RISK_ENTRY, worktree='/tmp', category=cat,
-                run_git=_fake_git_fresh, now=self._NOW,
+                LOW_RISK_ENTRY, worktree='/tmp', category=cat,
+                run_git=fake_git_fresh, now=self._NOW,
             )
             # Category check passes -> proceeds to freshness check -> fresh
             assert result['verdict'] != ABORT or 'category' not in result['reason'].lower(), \
@@ -567,35 +463,35 @@ class TestCheckProposalMechanical:
         from orchestrator.b3_gate import check_proposal
         # category=None -> skip category check entirely -> proceeds to freshness
         result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         # Should not abort on category; may be fresh or drift depending on git
         assert 'verdict' in result
 
     def test_missing_head_sha_drifts(self):
         from orchestrator.b3_gate import DRIFT, check_proposal
-        entry = {**_LOW_RISK_ENTRY}
+        entry = {**LOW_RISK_ENTRY}
         del entry['head_sha']
         result = check_proposal(entry, worktree='/tmp', category=None,
-                                run_git=_fake_git_never_called, now=self._NOW)
+                                run_git=fake_git_never_called, now=self._NOW)
         assert result['verdict'] == DRIFT
         assert 'sha anchor' in result['reason'].lower()
 
     def test_missing_main_sha_drifts(self):
         from orchestrator.b3_gate import DRIFT, check_proposal
-        entry = {**_LOW_RISK_ENTRY}
+        entry = {**LOW_RISK_ENTRY}
         del entry['main_sha']
         result = check_proposal(entry, worktree='/tmp', category=None,
-                                run_git=_fake_git_never_called, now=self._NOW)
+                                run_git=fake_git_never_called, now=self._NOW)
         assert result['verdict'] == DRIFT
         assert 'sha anchor' in result['reason'].lower()
 
     def test_none_head_sha_drifts(self):
         from orchestrator.b3_gate import DRIFT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'head_sha': None}
+        entry = {**LOW_RISK_ENTRY, 'head_sha': None}
         result = check_proposal(entry, worktree='/tmp', category=None,
-                                run_git=_fake_git_never_called, now=self._NOW)
+                                run_git=fake_git_never_called, now=self._NOW)
         assert result['verdict'] == DRIFT
 
     # step-21: P2 diff failure must not fall through to fresh (fail-closed)
@@ -604,13 +500,13 @@ class TestCheckProposalMechanical:
 
         Pin the fail-closed contract: a git failure (unreachable main_sha, missing
         'main' ref, transient git error) must never fall through to a merge-authorizing
-        FRESH verdict.  _LOW_RISK_ENTRY has files_referenced=['foo.py'] so the diff IS
-        invoked; _fake_git_diff_fails returns rc=128 for the diff call.
+        FRESH verdict.  LOW_RISK_ENTRY has files_referenced=['foo.py'] so the diff IS
+        invoked; fake_git_diff_fails returns rc=128 for the diff call.
         """
         from orchestrator.b3_gate import DRIFT, check_proposal
         result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
-            run_git=_fake_git_diff_fails, now=self._NOW,
+            LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=fake_git_diff_fails, now=self._NOW,
         )
         assert result['verdict'] == DRIFT, (
             f'expected DRIFT when git diff fails, got {result["verdict"]!r}: {result}'
@@ -653,18 +549,18 @@ class TestAgeStateThreeState:
     def test_valid_aware_timestamp_is_parsed(self):
         from orchestrator.b3_gate import AGE_PARSED, check_proposal
         result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         assert result['age_state'] == AGE_PARSED, result
         assert result['age_seconds'] == 10800.0, result
 
     def test_unparseable_timestamp_is_distinguished(self):
         from orchestrator.b3_gate import AGE_UNPARSEABLE, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'investigated_at': 'not-a-date'}
+        entry = {**LOW_RISK_ENTRY, 'investigated_at': 'not-a-date'}
         result = check_proposal(
             entry, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         assert result['age_state'] == AGE_UNPARSEABLE, result
         assert result['age_seconds'] is None, result
@@ -673,10 +569,10 @@ class TestAgeStateThreeState:
         """The TypeError branch — a DIFFERENT cause from the ValueError above,
         and the one most likely to arise from a real producer bug."""
         from orchestrator.b3_gate import AGE_UNPARSEABLE, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'investigated_at': '2026-06-04T09:00:00'}
+        entry = {**LOW_RISK_ENTRY, 'investigated_at': '2026-06-04T09:00:00'}
         result = check_proposal(
             entry, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         assert result['age_state'] == AGE_UNPARSEABLE, result
         assert result['age_seconds'] is None, result
@@ -688,8 +584,8 @@ class TestAgeStateThreeState:
         TypeError, same state, opposite culprit from the test above."""
         from orchestrator.b3_gate import AGE_UNPARSEABLE, check_proposal
         result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=datetime(2026, 6, 4, 12, 0, 0),
+            LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=datetime(2026, 6, 4, 12, 0, 0),
         )
         assert result['age_state'] == AGE_UNPARSEABLE, result
         assert result['age_seconds'] is None, result
@@ -705,8 +601,8 @@ class TestAgeStateThreeState:
 
         with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
             check_proposal(
-                _LOW_RISK_ENTRY, worktree='/tmp', category=None,
-                run_git=_fake_git_fresh, now=naive_now,
+                LOW_RISK_ENTRY, worktree='/tmp', category=None,
+                run_git=fake_git_fresh, now=naive_now,
             )
 
         messages = [
@@ -714,34 +610,34 @@ class TestAgeStateThreeState:
             if r.levelno == _logging.WARNING and r.name == 'orchestrator.b3_gate'
         ]
         assert len(messages) == 1, messages
-        assert _LOW_RISK_ENTRY['investigated_at'] in messages[0], messages[0]
+        assert LOW_RISK_ENTRY['investigated_at'] in messages[0], messages[0]
         assert repr(naive_now) in messages[0], messages[0]
 
     def test_missing_timestamp_key_is_absent(self):
         from orchestrator.b3_gate import AGE_ABSENT, check_proposal
-        entry = {**_LOW_RISK_ENTRY}
+        entry = {**LOW_RISK_ENTRY}
         del entry['investigated_at']
         result = check_proposal(
             entry, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         assert result['age_state'] == AGE_ABSENT, result
         assert result['age_seconds'] is None, result
 
     def test_empty_timestamp_is_absent(self):
         from orchestrator.b3_gate import AGE_ABSENT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'investigated_at': ''}
+        entry = {**LOW_RISK_ENTRY, 'investigated_at': ''}
         result = check_proposal(
             entry, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         assert result['age_state'] == AGE_ABSENT, result
 
     def test_no_clock_is_its_own_state(self):
         from orchestrator.b3_gate import AGE_NO_CLOCK, check_proposal
         result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=None,
+            LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=None,
         )
         assert result['age_state'] == AGE_NO_CLOCK, result
         assert result['age_seconds'] is None, result
@@ -752,7 +648,7 @@ class TestAgeStateThreeState:
         from orchestrator.b3_gate import AGE_ABSENT, check_proposal
         result = check_proposal(
             None, worktree='/tmp', category=None,
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['age_state'] == AGE_ABSENT, result
         assert result['age_state'] in self._states(), result
@@ -762,12 +658,12 @@ class TestAgeStateThreeState:
         import logging as _logging
 
         from orchestrator.b3_gate import check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'investigated_at': 'not-a-date'}
+        entry = {**LOW_RISK_ENTRY, 'investigated_at': 'not-a-date'}
 
         with caplog.at_level(_logging.WARNING, logger='orchestrator.b3_gate'):
             check_proposal(
                 entry, worktree='/tmp', category=None,
-                run_git=_fake_git_fresh, now=self._NOW,
+                run_git=fake_git_fresh, now=self._NOW,
             )
 
         warn_records = [
@@ -802,19 +698,19 @@ class TestFreshRequiresParsedAge:
         from orchestrator.b3_gate import check_proposal
         return check_proposal(
             entry, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=now,
+            run_git=fake_git_fresh, now=now,
         )
 
     def test_parsed_age_still_certifies_fresh(self):
         """POSITIVE CONTROL — the gate is not made vacuous by the guard."""
         from orchestrator.b3_gate import AGE_PARSED, FRESH
-        result = self._check(_LOW_RISK_ENTRY, now=self._NOW)
+        result = self._check(LOW_RISK_ENTRY, now=self._NOW)
         assert result['verdict'] == FRESH, result
         assert result['age_state'] == AGE_PARSED, result
 
     def test_unparseable_timestamp_aborts(self):
         from orchestrator.b3_gate import ABORT, AGE_UNPARSEABLE
-        entry = {**_LOW_RISK_ENTRY, 'investigated_at': 'not-a-date'}
+        entry = {**LOW_RISK_ENTRY, 'investigated_at': 'not-a-date'}
         result = self._check(entry, now=self._NOW)
         assert result['verdict'] == ABORT, result
         assert result['age_state'] == AGE_UNPARSEABLE, result
@@ -824,7 +720,7 @@ class TestFreshRequiresParsedAge:
 
     def test_absent_timestamp_aborts(self):
         from orchestrator.b3_gate import ABORT, AGE_ABSENT
-        entry = {**_LOW_RISK_ENTRY}
+        entry = {**LOW_RISK_ENTRY}
         del entry['investigated_at']
         result = self._check(entry, now=self._NOW)
         assert result['verdict'] == ABORT, result
@@ -833,7 +729,7 @@ class TestFreshRequiresParsedAge:
 
     def test_no_clock_aborts(self):
         from orchestrator.b3_gate import ABORT, AGE_NO_CLOCK
-        result = self._check(_LOW_RISK_ENTRY, now=None)
+        result = self._check(LOW_RISK_ENTRY, now=None)
         assert result['verdict'] == ABORT, result
         assert result['age_state'] == AGE_NO_CLOCK, result
         assert 'age' in result['reason'].lower(), result['reason']
@@ -842,12 +738,6 @@ class TestFreshRequiresParsedAge:
 # ---------------------------------------------------------------------------
 # step-11: freshness P1/P2 against a REAL git fixture
 # ---------------------------------------------------------------------------
-
-def _run_git_real(args, cwd):
-    """Real git runner for freshness tests."""
-    from orchestrator.b3_gate import _run_git
-    return _run_git(args, cwd)
-
 
 class TestCheckProposalFreshness:
     """P1 (HEAD moved -> abort) and P2 (file-scoped main drift -> drift)."""
@@ -869,7 +759,7 @@ class TestCheckProposalFreshness:
         """Create repo: main at initial commit, feature branch diverges; add foo.py."""
         repo = tmp_path / 'repo'
         repo.mkdir()
-        main_sha = _init_git_repo(repo)
+        seed_repo(repo)
         # Create foo.py on main so it has a history
         (repo / 'foo.py').write_text('original content')
         p = str(repo)
@@ -881,7 +771,7 @@ class TestCheckProposalFreshness:
             check=True, capture_output=True, text=True,
         ).stdout.strip()
         # Diverge feature branch
-        head_sha = _diverge_feature_branch(repo)
+        head_sha = diverge_feature_branch(repo)
         assert head_sha != main_sha
         return repo, head_sha, main_sha
 
@@ -1304,8 +1194,8 @@ class TestCLIMain:
         """
         repo = tmp_path / 'repo'
         repo.mkdir()
-        _init_git_repo(repo)
-        head_sha = _diverge_feature_branch(repo)
+        seed_repo(repo)
+        head_sha = diverge_feature_branch(repo)
         # main sha is the sha before we diverged
         main_sha = subprocess.run(
             ['git', '-C', str(repo), 'rev-parse', 'main'],
@@ -1469,7 +1359,7 @@ class TestTwoWayBoundary:
         """
         repo = tmp_path / 'repo'
         repo.mkdir()
-        _init_git_repo(repo)
+        seed_repo(repo)
         p = str(repo)
         # Add foo.py on main so it exists in the diff history
         (repo / 'foo.py').write_text('original content')
@@ -1481,14 +1371,14 @@ class TestTwoWayBoundary:
             check=True, capture_output=True, text=True,
         ).stdout.strip()
         # Diverge feature branch from main
-        head_sha = _diverge_feature_branch(repo)
+        head_sha = diverge_feature_branch(repo)
         assert head_sha != main_sha
         return repo, head_sha, main_sha
 
     def _make_success_entry(self, head_sha, main_sha, files=None):
         """Build a genuine _build_entry output then mirror T1 sha-stamping."""
         from orchestrator.dry_run_unblock import _build_entry
-        agent_result = _make_agent_result(
+        agent_result = make_agent_result(
             success=True,
             structured_output={
                 'proposal_text': 'Fix the bug in foo.py',
@@ -1552,7 +1442,7 @@ class TestTwoWayBoundary:
         from orchestrator.b3_gate import DRIFT, _run_git, check_proposal
         from orchestrator.dry_run_unblock import _build_entry
         repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
-        agent_result = _make_agent_result(
+        agent_result = make_agent_result(
             success=True,
             structured_output={
                 'proposal_text': 'Fix the bug',
@@ -1577,7 +1467,7 @@ class TestTwoWayBoundary:
         from orchestrator.dry_run_unblock import _build_entry
         repo, head_sha, main_sha = self._setup_boundary_repo(tmp_path)
         # Build a failure entry
-        fail_agent = _make_agent_result(success=False, subtype='error', output='boom')
+        fail_agent = make_agent_result(success=False, subtype='error', output='boom')
         fail_entry = _build_entry(fail_agent, reason='blocked', budget_usd=5.0)
         # Mirror T1 stamping (failure entries also get stamped)
         fail_entry['head_sha'] = head_sha
@@ -1602,7 +1492,7 @@ class TestTwoWayBoundary:
 
         # Wedge: pre-turn-1 kill at the 600s UnblockAutoConfig timeout
         # ceiling -> empty stdout + timed_out=True.
-        wedge_agent = _make_agent_result(
+        wedge_agent = make_agent_result(
             success=False,
             subtype='error_empty_output',
             output='Agent produced no output',
@@ -1619,7 +1509,7 @@ class TestTwoWayBoundary:
 
         # Substantive: agent ran and concluded a human must look — not timed
         # out, not empty output.
-        substantive_agent = _make_agent_result(
+        substantive_agent = make_agent_result(
             success=False, subtype='error_max_turns', output='Exceeded max turns',
         )
         substantive_entry = _build_entry(substantive_agent, reason='blocked', budget_usd=5.0)
@@ -1659,10 +1549,10 @@ class TestPostMergeRedMainAbort:
     def test_low_risk_post_merge_reason_aborts_without_git(self):
         """Case 1: low-risk entry with post-merge block_reason -> ABORT, no git called."""
         from orchestrator.b3_gate import ABORT, POST_MERGE_RED_MAIN_REASON_PREFIX, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_reason': self._PM_REASON}
+        entry = {**LOW_RISK_ENTRY, 'block_reason': self._PM_REASON}
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
         reason_lower = result['reason'].lower()
@@ -1679,13 +1569,13 @@ class TestPostMergeRedMainAbort:
         """
         from orchestrator.b3_gate import ABORT, check_proposal
         entry = {
-            **_LOW_RISK_ENTRY,
+            **LOW_RISK_ENTRY,
             'risk_label': 'human-review-required',
             'block_reason': self._PM_REASON,
         }
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, (
             f'expected ABORT for human-review-required post-merge entry, got {result}'
@@ -1696,10 +1586,10 @@ class TestPostMergeRedMainAbort:
         post-merge abort — reaches FRESH exactly as before this change.
         """
         from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_reason': 'verify exhausted'}
+        entry = {**LOW_RISK_ENTRY, 'block_reason': 'verify exhausted'}
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_fresh, now=self._NOW,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         assert result['verdict'] == FRESH, (
             f'non-post-merge reason must NOT be caught by post-merge branch; got {result}'
@@ -1714,7 +1604,7 @@ class TestPostMergeRedMainAbort:
         from orchestrator.dry_run_unblock import _build_entry
 
         reason = POST_MERGE_RED_MAIN_REASON_PREFIX + ' on main: foo.py'
-        agent_result = _make_agent_result(
+        agent_result = make_agent_result(
             success=True,
             structured_output={
                 'proposal_text': 'Fix the type error in foo.py',
@@ -1729,7 +1619,7 @@ class TestPostMergeRedMainAbort:
 
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, (
             f'expected ABORT for post-merge low-risk boundary entry, got {result}'
@@ -1764,10 +1654,10 @@ class TestPostMergeRedMainAbort:
             + ': post-merge unscoped type-check failed for orchestrator'
             + ' on abc123456789. error: Type "int | None" is not assignable to "int"'
         )
-        entry = {**_LOW_RISK_ENTRY, 'block_reason': production_reason}
+        entry = {**LOW_RISK_ENTRY, 'block_reason': production_reason}
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, (
             f'expected ABORT for production-format post-merge reason, got {result}'
@@ -1791,10 +1681,10 @@ class TestStopInstructionAbort:
     def test_stop_instruction_in_proposal_text_aborts_without_git(self):
         """Case (a): proposal_text carries 'do not apply' -> ABORT, no git called."""
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'proposal_text': 'Fix it — do not apply until reviewed'}
+        entry = {**LOW_RISK_ENTRY, 'proposal_text': 'Fix it — do not apply until reviewed'}
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
         assert 'stop instruction' in result['reason'].lower(), (
@@ -1804,10 +1694,10 @@ class TestStopInstructionAbort:
     def test_stop_instruction_in_block_reason_aborts_without_git(self):
         """Case (b): block_reason carries 'human rehearsal' -> ABORT, no git called."""
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_reason': 'this fix requires human rehearsal before merging'}
+        entry = {**LOW_RISK_ENTRY, 'block_reason': 'this fix requires human rehearsal before merging'}
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
         assert 'stop instruction' in result['reason'].lower(), (
@@ -1819,8 +1709,8 @@ class TestStopInstructionAbort:
         block_reason are benign) -> ABORT, no git called."""
         from orchestrator.b3_gate import ABORT, check_proposal
         result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
+            LOW_RISK_ENTRY, worktree='/tmp', category='task_failure',
+            run_git=fake_git_never_called, now=self._NOW,
             extra_texts=['Task description: please do not apply this change yet.'],
         )
         assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
@@ -1833,10 +1723,10 @@ class TestStopInstructionAbort:
         phrase in proposal_text -> ABORT (stop wins over fresh), and still consumes
         no git (fires before the P1/P2 freshness checks)."""
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'proposal_text': 'Fix it — do not apply until reviewed'}
+        entry = {**LOW_RISK_ENTRY, 'proposal_text': 'Fix it — do not apply until reviewed'}
         result = check_proposal(
             entry, worktree='/tmp', category=None,
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, (
             f'stop instruction must win over an otherwise-fresh entry: {result}'
@@ -1846,8 +1736,8 @@ class TestStopInstructionAbort:
         """Regression: benign extra_texts under a fresh low-risk entry -> FRESH (unchanged)."""
         from orchestrator.b3_gate import FRESH, check_proposal
         result = check_proposal(
-            _LOW_RISK_ENTRY, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            LOW_RISK_ENTRY, worktree='/tmp', category=None,
+            run_git=fake_git_fresh, now=self._NOW,
             extra_texts=['deploy the service'],
         )
         assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
@@ -1881,7 +1771,7 @@ class TestStopScanExcludesCapturedOutput:
 
     def _merge_verify_red_entry(self, block_reason):
         return {
-            **_LOW_RISK_ENTRY,
+            **LOW_RISK_ENTRY,
             'block_class': 'merge_verify_red',
             'block_reason': block_reason,
         }
@@ -1895,7 +1785,7 @@ class TestStopScanExcludesCapturedOutput:
         result = check_proposal(
             self._merge_verify_red_entry(self._RATCHET_RED_BLOCK_REASON),
             worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
         assert 'stop instruction' not in result['reason']
@@ -1909,7 +1799,7 @@ class TestStopScanExcludesCapturedOutput:
         }
         result = check_proposal(
             entry, worktree='/tmp', category=None,
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
         assert 'stop instruction' in result['reason']
@@ -1925,7 +1815,7 @@ class TestStopScanExcludesCapturedOutput:
         result = check_proposal(
             self._merge_verify_red_entry(block_reason),
             worktree='/tmp', category=None,
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
         assert 'hold for human' in result['reason']
@@ -1940,7 +1830,7 @@ class TestStopScanExcludesCapturedOutput:
         result = check_proposal(
             self._merge_verify_red_entry(truncated),
             worktree='/tmp', category=None,
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
         assert 'do not run' in result['reason']
@@ -1969,7 +1859,7 @@ class TestStopScanExcludesCapturedOutput:
         result = check_proposal(
             self._merge_verify_red_entry(block_reason),
             worktree='/tmp', category=None,
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
         assert 'hold for human' in result['reason']
@@ -2011,7 +1901,7 @@ class TestStopScanExcludesCapturedOutput:
         result = check_proposal(
             self._merge_verify_red_entry(block_reason),
             worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
 
@@ -2041,14 +1931,14 @@ class TestCheckProposalBlockClass:
         from orchestrator.b3_gate import ABORT, check_proposal
         for risk_label in ('low', 'human-review-required'):
             entry = {
-                **_LOW_RISK_ENTRY,
+                **LOW_RISK_ENTRY,
                 'block_class': 'post_merge_red_main',
                 'block_reason': 'verify exhausted',
                 'risk_label': risk_label,
             }
             result = check_proposal(
                 entry, worktree='/tmp', category='task_failure',
-                run_git=_fake_git_never_called, now=self._NOW,
+                run_git=fake_git_never_called, now=self._NOW,
             )
             assert result['verdict'] == ABORT, (
                 f'risk_label={risk_label!r}: expected ABORT, got {result}'
@@ -2060,10 +1950,10 @@ class TestCheckProposalBlockClass:
         fresh git and category=None.
         """
         from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_class': 'merge_verify_red'}
+        entry = {**LOW_RISK_ENTRY, 'block_class': 'merge_verify_red'}
         result = check_proposal(
             entry, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
 
@@ -2074,14 +1964,14 @@ class TestCheckProposalBlockClass:
         """
         from orchestrator.b3_gate import ABORT, check_proposal
         entry = {
-            **_LOW_RISK_ENTRY,
+            **LOW_RISK_ENTRY,
             'block_class': 'agent_failure',
             'status': 'investigation_failed',
             'risk_label': 'human-review-required',
         }
         result = check_proposal(
             entry, worktree='/tmp', category=None,
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
         assert 'risk_label' in result['reason'], (
@@ -2096,14 +1986,14 @@ class TestCheckProposalBlockClass:
         """
         from orchestrator.b3_gate import FRESH, check_proposal
         entry = {
-            **_LOW_RISK_ENTRY,
+            **LOW_RISK_ENTRY,
             'block_class': 'merge_verify_red',
             'status': 'x',
             'risk_label': 'low',
         }
         result = check_proposal(
             entry, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         assert result['verdict'] == FRESH, (
             f'status-key presence must not abort the typed path, got {result}'
@@ -2114,10 +2004,10 @@ class TestCheckProposalBlockClass:
         exactly like today's low-risk fresh entry.
         """
         from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_class': 'agent_failure'}
+        entry = {**LOW_RISK_ENTRY, 'block_class': 'agent_failure'}
         result = check_proposal(
             entry, worktree='/tmp', category=None,
-            run_git=_fake_git_fresh, now=self._NOW,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
 
@@ -2142,8 +2032,8 @@ class TestRunCheckStopInstruction:
         """
         repo = tmp_path / 'repo'
         repo.mkdir()
-        _init_git_repo(repo)
-        head_sha = _diverge_feature_branch(repo)
+        seed_repo(repo)
+        head_sha = diverge_feature_branch(repo)
         main_sha = subprocess.run(
             ['git', '-C', str(repo), 'rev-parse', 'main'],
             check=True, capture_output=True, text=True,
@@ -2228,8 +2118,8 @@ class TestRunCheckSharedConnection:
 
         repo = tmp_path / 'repo'
         repo.mkdir()
-        _init_git_repo(repo)
-        head_sha = _diverge_feature_branch(repo)
+        seed_repo(repo)
+        head_sha = diverge_feature_branch(repo)
         main_sha = subprocess.run(
             ['git', '-C', str(repo), 'rev-parse', 'main'],
             check=True, capture_output=True, text=True,
@@ -2313,13 +2203,13 @@ class TestMergeCompletionConsumptionContract:
         """
         from orchestrator.b3_gate import ABORT, check_proposal
         entry = {
-            **_LOW_RISK_ENTRY,
+            **LOW_RISK_ENTRY,
             'block_class': 'merge_verify_red',
             'risk_label': 'human-review-required',
         }
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
 
@@ -2331,24 +2221,24 @@ class TestMergeCompletionConsumptionContract:
         file, workflow.py:8608) — is consumable end-to-end at the gate.
         """
         from orchestrator.b3_gate import FRESH, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_class': 'merge_verify_red'}
+        entry = {**LOW_RISK_ENTRY, 'block_class': 'merge_verify_red'}
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_fresh, now=self._NOW,
+            run_git=fake_git_fresh, now=self._NOW,
         )
         assert result['verdict'] == FRESH, f'expected FRESH, got {result}'
 
     def test_post_merge_red_main_entry_hard_aborts(self):
         """(iii) task 1680 retained VERBATIM: a POST_MERGE_RED_MAIN entry
         hard-aborts before risk_label/git checks even with risk_label='low'
-        (_LOW_RISK_ENTRY's default) — the merge-completion mode must never
+        (LOW_RISK_ENTRY's default) — the merge-completion mode must never
         weaken this highest-blast-radius safety rail.
         """
         from orchestrator.b3_gate import ABORT, check_proposal
-        entry = {**_LOW_RISK_ENTRY, 'block_class': 'post_merge_red_main'}
+        entry = {**LOW_RISK_ENTRY, 'block_class': 'post_merge_red_main'}
         result = check_proposal(
             entry, worktree='/tmp', category='task_failure',
-            run_git=_fake_git_never_called, now=self._NOW,
+            run_git=fake_git_never_called, now=self._NOW,
         )
         assert result['verdict'] == ABORT, f'expected ABORT, got {result}'
         assert 'post-merge red-main fix-forward class' in result['reason'], (
