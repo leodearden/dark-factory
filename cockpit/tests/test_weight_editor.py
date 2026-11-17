@@ -16,7 +16,7 @@ from orchestrator import session_registry as sr
 
 
 def _make_session(**overrides):
-    """Mirrors test_app.py/test_decision_queue.py's _make_record convention."""
+    """Mirrors _cockpit_session_records.py::make_record and test_decision_queue.py::_make_session."""
     fields: dict = {
         'session_slug': 'unblock-df-2085-4242',
         'status': sr.Status.RUNNING,

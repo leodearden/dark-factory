@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from _cockpit_session_records import make_record
+from _cockpit_tree_snapshot import snapshot_tree
 from orchestrator import decision_registry as dr
 from orchestrator import session_registry as sr
 from textual.coordinate import Coordinate
@@ -34,45 +36,13 @@ if TYPE_CHECKING:
     from cockpit.registry_reader import SessionScannerProtocol
 
 
-def _make_record(**overrides):
-    """Mirrors test_registry_reader.py's _make_record convention."""
-    fields: dict = {
-        'session_slug': 'unblock-df-2085-4242',
-        'status': sr.Status.RUNNING,
-        'title': 'unblock:df#2085 slug',
-        'role': 'unblock',
-        'project': 'df',
-        'task_id': '2085',
-        'start_ts': '2026-07-07T00:00:00+00:00',
-    }
-    fields.update(overrides)
-    return sr.SessionRecord(**fields)
-
-
-def _snapshot_tree(base: Path) -> dict[str, tuple[int, bytes]]:
-    """Map every file under *base* (relative path -> (mtime_ns, bytes)).
-
-    Used to prove the cockpit's write discipline by diffing this snapshot
-    across an app run: an absent path is not a KeyError, it's just missing
-    from the mapping, so a deleted-or-never-written file shows up as a plain
-    dict-equality mismatch rather than needing special-casing.
-    """
-    if not base.is_dir():
-        return {}
-    return {
-        str(path.relative_to(base)): (path.stat().st_mtime_ns, path.read_bytes())
-        for path in base.rglob('*')
-        if path.is_file()
-    }
-
-
 def _count_ui_config_writes(monkeypatch) -> list[str | None]:
     """Record every save_ui_config call app.py makes, delegating to the real one.
 
     Returns the live list of persisted selected_slug values, newest last.
     The property under test in TestUIConfigWriteDebounce is a COUNT ("one
     write per burst", "zero per idle rebuild"), and an mtime/bytes diff via
-    _snapshot_tree cannot tell one write from four when every write carries
+    snapshot_tree cannot tell one write from four when every write carries
     identical content inside the same mtime granule -- exactly the shape of
     the repeated-rebuild case. Patching the name in cockpit.app (not in
     cockpit.ui_config) is what intercepts _persist_ui_config: app.py binds
@@ -102,7 +72,7 @@ def _debounce_running_records() -> list:
     an injected _CountingRecordsScanner.
     """
     return [
-        _make_record(
+        make_record(
             session_slug=f'debounce-run-{n}',
             status=sr.Status.RUNNING,
             start_ts=f'2026-07-07T0{n}:00:00+00:00',
@@ -121,7 +91,7 @@ def _seed_debounce_fleet(tmp_path: Path) -> list:
     row.
     """
     sr.write_record(
-        _make_record(session_slug='debounce-blocked', status=sr.Status.AWAITING_INPUT),
+        make_record(session_slug='debounce-blocked', status=sr.Status.AWAITING_INPUT),
         root=tmp_path,
     )
     running = _debounce_running_records()
@@ -191,7 +161,7 @@ async def _assert_rebuilds_cost_one_write(tmp_path, monkeypatch, *, drive, round
             # title change alone would show up nowhere and the sanity check
             # would be vacuous.
             sr.write_record(
-                _make_record(
+                make_record(
                     session_slug=parked.session_slug,
                     status=parked.status,
                     start_ts=parked.start_ts,
@@ -306,8 +276,8 @@ class TestInitialRender:
     async def test_seeded_records_render_as_rows(self, tmp_path):
         from cockpit.panes.session_table import SessionTable
 
-        r1 = _make_record(session_slug='a-1', status=sr.Status.RUNNING)
-        r2 = _make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT)
+        r1 = make_record(session_slug='a-1', status=sr.Status.RUNNING)
+        r2 = make_record(session_slug='b-2', status=sr.Status.AWAITING_INPUT)
         for r in (r1, r2):
             sr.write_record(r, root=tmp_path)
 
@@ -337,8 +307,8 @@ class TestSessionTableDefaultFilter:
 
         from cockpit.panes.session_table import SessionTable
 
-        live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
-        dead = _make_record(session_slug='dead-1', status=sr.Status.EXITED)
+        live = make_record(session_slug='live-1', status=sr.Status.RUNNING)
+        dead = make_record(session_slug='dead-1', status=sr.Status.EXITED)
         for r in (live, dead):
             sr.write_record(r, root=tmp_path)
 
@@ -363,8 +333,8 @@ class TestToggleHistory:
 
         from cockpit.panes.session_table import SessionTable
 
-        live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
-        dead = _make_record(session_slug='dead-1', status=sr.Status.EXITED)
+        live = make_record(session_slug='live-1', status=sr.Status.RUNNING)
+        dead = make_record(session_slug='dead-1', status=sr.Status.EXITED)
         for r in (live, dead):
             sr.write_record(r, root=tmp_path)
 
@@ -402,8 +372,8 @@ class TestToggleHistory:
         asserting immediately (as above) is not enough."""
         from cockpit.panes.session_table import SessionTable
 
-        live = _make_record(session_slug='live-1', status=sr.Status.RUNNING)
-        dead = _make_record(session_slug='dead-1', status=sr.Status.EXITED)
+        live = make_record(session_slug='live-1', status=sr.Status.RUNNING)
+        dead = make_record(session_slug='dead-1', status=sr.Status.EXITED)
         for r in (live, dead):
             sr.write_record(r, root=tmp_path)
 
@@ -418,7 +388,7 @@ class TestToggleHistory:
             assert table.get_row('dead-1')
             assert table.row_count == 2
 
-            live2 = _make_record(session_slug='live-2', status=sr.Status.RUNNING)
+            live2 = make_record(session_slug='live-2', status=sr.Status.RUNNING)
             sr.write_record(live2, root=tmp_path)
             app.refresh_registry()
             await pilot.pause()
@@ -455,7 +425,7 @@ class TestPollRefresh:
         """
         from cockpit.panes.session_table import SessionTable
 
-        running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
+        running = make_record(session_slug='running-1', status=sr.Status.RUNNING)
         sr.write_record(running, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
@@ -464,7 +434,7 @@ class TestPollRefresh:
             table = app.query_one(SessionTable)
             assert table.row_count == 1
 
-            blocked = _make_record(session_slug='blocked-1', status=sr.Status.AWAITING_INPUT)
+            blocked = make_record(session_slug='blocked-1', status=sr.Status.AWAITING_INPUT)
             sr.write_record(blocked, root=tmp_path)
 
             app.refresh_registry()
@@ -487,7 +457,7 @@ class TestPollRefresh:
         """
         from cockpit.panes.session_table import SessionTable, state_glyph
 
-        running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
+        running = make_record(session_slug='running-1', status=sr.Status.RUNNING)
         sr.write_record(running, root=tmp_path)
 
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60)
@@ -562,7 +532,7 @@ class TestTimerIntegration:
             table = app.query_one(SessionTable)
             assert table.row_count == 0
 
-            record = _make_record(session_slug='timer-1', status=sr.Status.RUNNING)
+            record = make_record(session_slug='timer-1', status=sr.Status.RUNNING)
             sr.write_record(record, root=tmp_path)
             starts_at_write = scanner.starts
 
@@ -587,8 +557,8 @@ class TestRowSelectionDetail:
         # cursor -- the assertions below only pass if selecting target-1
         # actually drives the detail pane, not just whatever's highlighted
         # by default after mount.
-        other = _make_record(session_slug='other-1', status=sr.Status.AWAITING_INPUT)
-        target = _make_record(
+        other = make_record(session_slug='other-1', status=sr.Status.AWAITING_INPUT)
+        target = make_record(
             session_slug='target-1',
             status=sr.Status.RUNNING,
             task_id='2085',
@@ -621,8 +591,8 @@ class TestReplaceRowsChildrenCountAgainstFullSet:
         undercounted just because the child itself is hidden from view."""
         from cockpit.panes.session_table import LiveSessions, SessionTable
 
-        parent = _make_record(session_slug='parent-1', parent_session_id=None)
-        running_child = _make_record(
+        parent = make_record(session_slug='parent-1', parent_session_id=None)
+        running_child = make_record(
             session_slug='child-running',
             parent_session_id='parent-1',
             status=sr.Status.RUNNING,
@@ -655,7 +625,7 @@ class TestWriteDiscipline:
         from cockpit.panes.session_table import SessionTable
         from cockpit.registry_reader import SessionScanner
 
-        record = _make_record(session_slug='write-disc-1', status=sr.Status.RUNNING)
+        record = make_record(session_slug='write-disc-1', status=sr.Status.RUNNING)
         sr.write_record(record, root=tmp_path)
 
         decision = dr.DecisionRecord(
@@ -666,7 +636,7 @@ class TestWriteDiscipline:
         )
         assert dr.write_decision(decision, root=tmp_path)
 
-        before = _snapshot_tree(tmp_path)
+        before = snapshot_tree(tmp_path)
         # sanity: prove the snapshot actually captured the seeded files, so a
         # later "unchanged" assertion isn't vacuously true over an empty dict.
         assert any(path.startswith('sessions/') for path in before)
@@ -686,7 +656,7 @@ class TestWriteDiscipline:
             table.move_cursor(row=table.get_row_index('write-disc-1'))
             await pilot.pause()
 
-        after = _snapshot_tree(tmp_path)
+        after = snapshot_tree(tmp_path)
 
         for path, value in before.items():
             assert after.get(path) == value, f'{path} was created/modified/removed by the cockpit'
@@ -711,8 +681,8 @@ class TestSelectedSlugRestore:
         # blocked-1 is AWAITING_INPUT, so order_sessions makes IT the
         # default row-0 cursor -- target-1 can only be highlighted on the
         # second mount if the restore branch actually ran.
-        blocked = _make_record(session_slug='blocked-1', status=sr.Status.AWAITING_INPUT)
-        target = _make_record(session_slug='target-1', status=sr.Status.RUNNING)
+        blocked = make_record(session_slug='blocked-1', status=sr.Status.AWAITING_INPUT)
+        target = make_record(session_slug='target-1', status=sr.Status.RUNNING)
         for r in (blocked, target):
             sr.write_record(r, root=tmp_path)
 
@@ -756,7 +726,7 @@ class TestSelectedSlugRestore:
 
         for slug, start in (('session-a', '00:00:00'), ('session-b', '00:01:00')):
             sr.write_record(
-                _make_record(session_slug=slug, start_ts=f'2026-07-07T{start}+00:00'),
+                make_record(session_slug=slug, start_ts=f'2026-07-07T{start}+00:00'),
                 root=tmp_path,
             )
 
@@ -782,7 +752,7 @@ class TestSelectedSlugRestore:
             # view and the rebuild's cursor lands on a DIFFERENT slug -- a move
             # no operator made, and no RowHighlighted now reports
             sr.write_record(
-                _make_record(
+                make_record(
                     session_slug='session-b',
                     status=sr.Status.EXITED,
                     start_ts='2026-07-07T00:01:00+00:00',
@@ -814,8 +784,8 @@ class TestSelectedSlugRestore:
         # RUNNING), so "landed on row 0" is actually observable below -- with
         # only one record, row 0 is the only row and the assertion would pass
         # no matter where the cursor really landed.
-        live = _make_record(session_slug='live-1', status=sr.Status.AWAITING_INPUT)
-        other = _make_record(session_slug='live-2', status=sr.Status.RUNNING)
+        live = make_record(session_slug='live-1', status=sr.Status.AWAITING_INPUT)
+        other = make_record(session_slug='live-2', status=sr.Status.RUNNING)
         for r in (live, other):
             sr.write_record(r, root=tmp_path)
 
@@ -1225,8 +1195,8 @@ class TestDecisionQueueRender:
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        running = _make_record(session_slug='running-1', status=sr.Status.RUNNING)
-        awaiting = _make_record(
+        running = make_record(session_slug='running-1', status=sr.Status.RUNNING)
+        awaiting = make_record(
             session_slug='awaiting-1',
             status=sr.Status.AWAITING_INPUT,
             question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
@@ -1505,7 +1475,7 @@ class TestSignalDontMove:
         from cockpit.panes.decision_queue import DecisionQueue
 
         display = sr.Display(kind='wm', wm_title='unblock:df#2085 slug')
-        running = _make_record(session_slug='running-1', status=sr.Status.RUNNING, display=display)
+        running = make_record(session_slug='running-1', status=sr.Status.RUNNING, display=display)
         sr.write_record(running, root=tmp_path)
 
         backend = FakeBackend()
@@ -1515,7 +1485,7 @@ class TestSignalDontMove:
             queue = app.query_one(DecisionQueue)
             assert queue.row_count == 0
 
-            awaiting = _make_record(
+            awaiting = make_record(
                 session_slug='running-1',
                 status=sr.Status.AWAITING_INPUT,
                 display=display,
@@ -1532,7 +1502,7 @@ class TestSignalDontMove:
             assert backend.focus_calls == []
             assert backend.tile_calls == []
 
-            idle = _make_record(session_slug='running-1', status=sr.Status.IDLE, display=display)
+            idle = make_record(session_slug='running-1', status=sr.Status.IDLE, display=display)
             sr.write_record(idle, root=tmp_path)
 
             app.refresh_registry()
@@ -1559,7 +1529,7 @@ class TestSharedTargetAttentionNotClearedPrematurely:
         from cockpit.backends import DisplayTarget, FakeBackend
 
         display = sr.Display(kind='wm', wm_title='shared title')
-        awaiting = _make_record(
+        awaiting = make_record(
             session_slug='shared-1',
             status=sr.Status.AWAITING_INPUT,
             display=display,
@@ -1611,13 +1581,13 @@ class TestEnterFocus:
 
         display_a = sr.Display(kind='wm', wm_title='awaiting-a title')
         display_b = sr.Display(kind='wm', wm_title='awaiting-b title')
-        awaiting_a = _make_record(
+        awaiting_a = make_record(
             session_slug='awaiting-a',
             status=sr.Status.AWAITING_INPUT,
             display=display_a,
             question=sr.Question(text='A?', asked_at='2026-07-07T00:00:00+00:00'),
         )
-        awaiting_b = _make_record(
+        awaiting_b = make_record(
             session_slug='awaiting-b',
             status=sr.Status.AWAITING_INPUT,
             display=display_b,
@@ -1686,7 +1656,7 @@ class TestEnterFocus:
         session_id is the watcher's lease token -- never a registry key -- so
         only record_slug can link the row to the session.
         """
-        watcher = _make_record(
+        watcher = make_record(
             session_slug='session-dark-factory-sess-watcher',
             display=sr.Display(kind='wm', wm_title='escalation-watcher df'),
         )
@@ -1895,7 +1865,7 @@ class TestDropRemovesAndPersists:
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        awaiting = _make_record(
+        awaiting = make_record(
             session_slug='awaiting-1',
             status=sr.Status.AWAITING_INPUT,
             question=sr.Question(text='Which port?', asked_at='2026-07-07T00:00:00+00:00'),
@@ -2052,7 +2022,7 @@ class TestDroppedOverlayExpiresWithTheAsk:
         from cockpit.panes.decision_queue import DecisionQueue
 
         display = sr.Display(kind='wm', wm_title='drop title')
-        first_ask = _make_record(
+        first_ask = make_record(
             session_slug='drop-1',
             status=sr.Status.AWAITING_INPUT,
             display=display,
@@ -2077,7 +2047,7 @@ class TestDroppedOverlayExpiresWithTheAsk:
             # (b) GUARD: an unrelated session appears and forces a real
             # rebuild. The live drop must SURVIVE it -- this is exactly what
             # a copied `&= queue keys` prune would break.
-            other = _make_record(
+            other = make_record(
                 session_slug='other-1',
                 status=sr.Status.AWAITING_INPUT,
                 display=sr.Display(kind='wm', wm_title='other title'),
@@ -2092,7 +2062,7 @@ class TestDroppedOverlayExpiresWithTheAsk:
 
             # (c) the dropped session's ask resolves -- it stops awaiting
             # input entirely, so the overlay has nothing left to suppress.
-            answered = _make_record(
+            answered = make_record(
                 session_slug='drop-1', status=sr.Status.RUNNING, display=display
             )
             sr.write_record(answered, root=tmp_path)
@@ -2103,7 +2073,7 @@ class TestDroppedOverlayExpiresWithTheAsk:
 
             # (d) the SAME session asks something brand new. It is a
             # different ask, so it must be visible to the operator again.
-            second_ask = _make_record(
+            second_ask = make_record(
                 session_slug='drop-1',
                 status=sr.Status.AWAITING_INPUT,
                 display=display,
@@ -2137,7 +2107,7 @@ class TestDroppedOverlayExpiresWithTheAsk:
         from cockpit.panes.decision_queue import DecisionQueue
 
         display = sr.Display(kind='wm', wm_title='renew title')
-        first_ask = _make_record(
+        first_ask = make_record(
             session_slug='renew-1',
             status=sr.Status.AWAITING_INPUT,
             display=display,
@@ -2158,7 +2128,7 @@ class TestDroppedOverlayExpiresWithTheAsk:
 
             # A second Notification hook: STILL awaiting input (no Stop hook
             # in between), but asking something completely different.
-            second_ask = _make_record(
+            second_ask = make_record(
                 session_slug='renew-1',
                 status=sr.Status.AWAITING_INPUT,
                 display=display,
@@ -2198,7 +2168,7 @@ class TestDroppedOverlayExpiresWithTheAsk:
         from cockpit.panes.decision_queue import DecisionQueue
 
         display = sr.Display(kind='wm', wm_title='same title')
-        first_ask = _make_record(
+        first_ask = make_record(
             session_slug='same-1',
             status=sr.Status.AWAITING_INPUT,
             display=display,
@@ -2221,7 +2191,7 @@ class TestDroppedOverlayExpiresWithTheAsk:
             # The next Notification hook: still AWAITING_INPUT, the very same
             # canned message text, only a fresh asked_at stamp. It is a
             # genuinely new ask and must be visible to the operator again.
-            second_ask = _make_record(
+            second_ask = make_record(
                 session_slug='same-1',
                 status=sr.Status.AWAITING_INPUT,
                 display=display,
@@ -2257,7 +2227,7 @@ class TestDroppedOverlayExpiresWithTheAsk:
         from cockpit.panes.decision_queue import DecisionQueue
 
         display = sr.Display(kind='wm', wm_title='quiet title')
-        awaiting = _make_record(
+        awaiting = make_record(
             session_slug='qless-1', status=sr.Status.AWAITING_INPUT, display=display
         )
         assert awaiting.question is None
@@ -2275,7 +2245,7 @@ class TestDroppedOverlayExpiresWithTheAsk:
             assert queue.row_count == 0
             assert 'session:qless-1' in app._dropped
 
-            idle = _make_record(session_slug='qless-1', status=sr.Status.IDLE, display=display)
+            idle = make_record(session_slug='qless-1', status=sr.Status.IDLE, display=display)
             sr.write_record(idle, root=tmp_path)
             app.refresh_registry()
             await pilot.pause()
@@ -2316,7 +2286,7 @@ class TestDroppedOverlayExpiresWithTheAsk:
         from cockpit.panes.decision_queue import DecisionQueue
 
         display = sr.Display(kind='wm', wm_title='recycled title')
-        first = _make_record(
+        first = make_record(
             session_slug='recycled-1',
             status=sr.Status.AWAITING_INPUT,
             display=display,
@@ -2338,7 +2308,7 @@ class TestDroppedOverlayExpiresWithTheAsk:
             assert queue.row_count == 0
             assert 'session:recycled-1' in app._dropped
 
-            second = _make_record(
+            second = make_record(
                 session_slug='recycled-1',
                 status=sr.Status.AWAITING_INPUT,
                 display=display,
@@ -2366,7 +2336,7 @@ class TestBoostAndDeferOverlaysExpireWithTheAsk:
         from cockpit.backends import FakeBackend
 
         display = sr.Display(kind='wm', wm_title='boost title')
-        awaiting = _make_record(
+        awaiting = make_record(
             session_slug='boost-1',
             status=sr.Status.AWAITING_INPUT,
             display=display,
@@ -2384,7 +2354,7 @@ class TestBoostAndDeferOverlaysExpireWithTheAsk:
             assert 'session:boost-1' in app._boosts
 
             # The ask resolves -- the session leaves the queue entirely.
-            idle = _make_record(session_slug='boost-1', status=sr.Status.IDLE, display=display)
+            idle = make_record(session_slug='boost-1', status=sr.Status.IDLE, display=display)
             sr.write_record(idle, root=tmp_path)
             app.refresh_registry()
             await pilot.pause()
@@ -2453,7 +2423,7 @@ class TestReorderTargetsAreDeduped:
         from cockpit.panes.decision_queue import DecisionQueue
 
         display = sr.Display(kind='tmux', tmux_target='s:1')
-        awaiting = _make_record(
+        awaiting = make_record(
             session_slug='shared-1',
             status=sr.Status.AWAITING_INPUT,
             display=display,
@@ -2517,14 +2487,14 @@ class TestReorderTargetsAreDeduped:
         target_a = DisplayTarget(kind='tmux', tmux_target='s:0')
         target_b = DisplayTarget(kind='tmux', tmux_target='s:1')
 
-        sess_a = _make_record(
+        sess_a = make_record(
             session_slug='sess-a',
             status=sr.Status.AWAITING_INPUT,
             display=sr.Display(kind='tmux', tmux_target='s:0'),
             question=sr.Question(text='Newest ask?', asked_at='2026-07-10T00:00:00+00:00'),
         )
         sr.write_record(sess_a, root=tmp_path)
-        sess_b = _make_record(
+        sess_b = make_record(
             session_slug='sess-b',
             status=sr.Status.AWAITING_INPUT,
             display=sr.Display(kind='tmux', tmux_target='s:1'),
@@ -2596,7 +2566,7 @@ class TestCopyAction:
         clipboard seam (cockpit.clipboard::copy_to_system_clipboard in
         production, a recorder here), and is strictly READ-ONLY, never
         touching sessions/ or decisions/ (mirrors TestWriteDiscipline's
-        before/after _snapshot_tree diff).
+        before/after snapshot_tree diff).
         """
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
@@ -2611,7 +2581,7 @@ class TestCopyAction:
         )
         assert dr.write_decision(decision, root=tmp_path)
 
-        awaiting = _make_record(
+        awaiting = make_record(
             session_slug='awaiting-1',
             status=sr.Status.AWAITING_INPUT,
             question=sr.Question(text='Which host?', asked_at='2026-07-07T00:00:00+00:00'),
@@ -2631,7 +2601,7 @@ class TestCopyAction:
             queue.move_cursor(row=queue.get_row_index('decision:dec-1'))
             await pilot.pause()
 
-            before = _snapshot_tree(tmp_path)
+            before = snapshot_tree(tmp_path)
 
             await pilot.press('y')
             await pilot.pause()
@@ -2644,7 +2614,7 @@ class TestCopyAction:
             assert '2517' in payload
 
             # (b) strictly read-only -- no sessions/ or decisions/ write.
-            after = _snapshot_tree(tmp_path)
+            after = snapshot_tree(tmp_path)
             assert after == before
 
     @pytest.mark.timeout(10)
@@ -2660,7 +2630,7 @@ class TestCopyAction:
         from cockpit.backends import FakeBackend
         from cockpit.panes.decision_queue import DecisionQueue
 
-        awaiting = _make_record(
+        awaiting = make_record(
             session_slug='awaiting-99',
             status=sr.Status.AWAITING_INPUT,
             question=sr.Question(text='Which region?', asked_at='2026-07-07T00:00:00+00:00'),
@@ -2680,7 +2650,7 @@ class TestCopyAction:
             queue.move_cursor(row=queue.get_row_index('session:awaiting-99'))
             await pilot.pause()
 
-            before = _snapshot_tree(tmp_path)
+            before = snapshot_tree(tmp_path)
 
             await pilot.press('y')
             await pilot.pause()
@@ -2692,7 +2662,7 @@ class TestCopyAction:
             assert 'awaiting-99' in payload
 
             # (b) strictly read-only -- a session is never cockpit-written.
-            after = _snapshot_tree(tmp_path)
+            after = snapshot_tree(tmp_path)
             assert after == before
 
     @pytest.mark.timeout(10)
@@ -2957,7 +2927,7 @@ class TestDeferResetsAge:
         ONLY: DecisionRecord.filed_at (provenance -- when a decision was
         actually filed) is NEVER rewritten, so the defer must leave every
         sessions/ and decisions/ file on disk byte-identical (mirrors
-        TestWriteDiscipline's _snapshot_tree before/after convention).
+        TestWriteDiscipline's snapshot_tree before/after convention).
 
         A fixed now_fn + an explicit Priorities.default() keep the score
         comparison hermetic -- independent of wall-clock time and of
@@ -2986,7 +2956,7 @@ class TestDeferResetsAge:
         for d in (older, newer):
             assert dr.write_decision(d, root=tmp_path)
 
-        before = _snapshot_tree(tmp_path)
+        before = snapshot_tree(tmp_path)
         assert any(path.startswith('decisions/') for path in before)
 
         backend = FakeBackend()
@@ -3026,7 +2996,7 @@ class TestDeferResetsAge:
         # defer). Taken after the app has unmounted, so this also covers
         # on_unmount's own _persist_ui_config write -- which never touches
         # sessions/ or decisions/ either way.
-        after = _snapshot_tree(tmp_path)
+        after = snapshot_tree(tmp_path)
         for path, value in before.items():
             assert after.get(path) == value, f'{path} was created/modified/removed by the defer'
         new_paths = set(after) - set(before)
@@ -3730,8 +3700,8 @@ class TestSpawnTree:
         rendering the parent_session_id parent→child session-tree structure."""
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
 
-        parent = _make_record(session_slug='parent-1', parent_session_id=None)
-        child = _make_record(session_slug='child-1', parent_session_id='parent-1')
+        parent = make_record(session_slug='parent-1', parent_session_id=None)
+        child = make_record(session_slug='child-1', parent_session_id='parent-1')
         for r in (parent, child):
             sr.write_record(r, root=tmp_path)
 
@@ -3758,13 +3728,13 @@ class TestSpawnTree:
         children highlighted" half of the leaf signal at the widget level."""
         from cockpit.panes.spawn_tree import _OUTSTANDING_MARKER, SpawnTree, SpawnTreeScreen
 
-        parent = _make_record(session_slug='parent-1', parent_session_id=None)
-        running_child = _make_record(
+        parent = make_record(session_slug='parent-1', parent_session_id=None)
+        running_child = make_record(
             session_slug='child-running',
             parent_session_id='parent-1',
             status=sr.Status.RUNNING,
         )
-        exited_child = _make_record(
+        exited_child = make_record(
             session_slug='child-exited',
             parent_session_id='parent-1',
             status=sr.Status.EXITED,
@@ -3804,10 +3774,10 @@ class TestSpawnTreeEnterFocus:
 
         parent_display = sr.Display(kind='wm', wm_title='parent title')
         child_display = sr.Display(kind='wm', wm_title='child title')
-        parent = _make_record(
+        parent = make_record(
             session_slug='parent-1', parent_session_id=None, display=parent_display
         )
-        child = _make_record(
+        child = make_record(
             session_slug='child-1', parent_session_id='parent-1', display=child_display
         )
         for r in (parent, child):
@@ -3841,8 +3811,8 @@ class TestSpawnTreeEnterFocus:
         from cockpit.backends import FakeBackend
         from cockpit.panes.spawn_tree import SpawnTree, SpawnTreeScreen
 
-        parent = _make_record(session_slug='parent-1', parent_session_id=None)
-        child = _make_record(
+        parent = make_record(session_slug='parent-1', parent_session_id=None)
+        child = make_record(
             session_slug='child-1', parent_session_id='parent-1', display=None
         )
         for r in (parent, child):
@@ -3877,7 +3847,7 @@ class TestSpawnTreeEnterFocus:
         anything (PRD §2), mirroring the no-Display fail-soft case above."""
         from cockpit.backends import FakeBackend
 
-        some_record = _make_record(session_slug='parent-1', parent_session_id=None)
+        some_record = make_record(session_slug='parent-1', parent_session_id=None)
 
         backend = FakeBackend()
         app = CockpitApp(fleet_root=tmp_path, backend=backend, poll_interval=0.05)
@@ -3908,10 +3878,10 @@ class TestSpawnTreeEnterFocus:
 
         parent_display = sr.Display(kind='wm', wm_title='parent title')
         child_display = sr.Display(kind='wm', wm_title='child title')
-        parent = _make_record(
+        parent = make_record(
             session_slug='parent-1', parent_session_id=None, display=parent_display
         )
-        child = _make_record(
+        child = make_record(
             session_slug='child-1', parent_session_id='parent-1', display=child_display
         )
         for r in (parent, child):
@@ -3963,13 +3933,13 @@ class TestSessionTableEnterFocus:
         from cockpit.backends import DisplayTarget, FakeBackend
         from cockpit.panes.session_table import SessionTable
 
-        session_a = _make_record(
+        session_a = make_record(
             session_slug='session-a',
             status=sr.Status.RUNNING,
             start_ts='2026-07-07T00:00:00+00:00',
             display=sr.Display(kind='wm', wm_title='session-a title'),
         )
-        session_b = _make_record(
+        session_b = make_record(
             session_slug='session-b',
             status=sr.Status.RUNNING,
             start_ts='2026-07-07T01:00:00+00:00',
@@ -4008,7 +3978,7 @@ class TestSessionTableEnterFocus:
         from cockpit.backends import FakeBackend
         from cockpit.panes.session_table import SessionTable
 
-        only_session = _make_record(session_slug='no-display-1', status=sr.Status.RUNNING)
+        only_session = make_record(session_slug='no-display-1', status=sr.Status.RUNNING)
         sr.write_record(only_session, root=tmp_path)
 
         backend = FakeBackend()
@@ -4088,7 +4058,7 @@ class TestRefreshWriteDiscipline:
         from cockpit.panes.decision_queue import DecisionQueue
 
         display = sr.Display(kind='wm', wm_title='unblock:df#2085 slug')
-        running = _make_record(
+        running = make_record(
             session_slug='refresh-wd-1', status=sr.Status.RUNNING, display=display
         )
         sr.write_record(running, root=tmp_path)
@@ -4108,7 +4078,7 @@ class TestRefreshWriteDiscipline:
             queue = app.query_one(DecisionQueue)
             assert queue.row_count == 1  # the open decision only; session is still just RUNNING
 
-            awaiting = _make_record(
+            awaiting = make_record(
                 session_slug='refresh-wd-1',
                 status=sr.Status.AWAITING_INPUT,
                 display=display,
@@ -4116,7 +4086,7 @@ class TestRefreshWriteDiscipline:
             )
             sr.write_record(awaiting, root=tmp_path)
 
-            before = _snapshot_tree(tmp_path)
+            before = snapshot_tree(tmp_path)
             # sanity: prove the snapshot actually captured the seeded files,
             # so the "unchanged" assertion below isn't vacuously true.
             assert any(path.startswith('sessions/') for path in before)
@@ -4130,7 +4100,7 @@ class TestRefreshWriteDiscipline:
             assert queue.row_count == 2
             assert backend.set_urgency_calls
 
-        after = _snapshot_tree(tmp_path)
+        after = snapshot_tree(tmp_path)
 
         # Scoped to sessions/decisions -- unlike TestWriteDiscipline/
         # TestDeferResetsAge's whole-lifecycle before/after (taken pre-mount,
@@ -4210,7 +4180,7 @@ class TestThreadedScanReachesUI:
     async def test_worker_result_reaches_table_and_writes_nothing(self, tmp_path):
         from cockpit.panes.session_table import SessionTable
 
-        first = _make_record(session_slug='thread-1', status=sr.Status.RUNNING)
+        first = make_record(session_slug='thread-1', status=sr.Status.RUNNING)
         sr.write_record(first, root=tmp_path)
 
         # A large poll_interval keeps on_mount's own set_interval timer from
@@ -4222,10 +4192,10 @@ class TestThreadedScanReachesUI:
             table = app.query_one(SessionTable)
             assert table.row_count == 1
 
-            second = _make_record(session_slug='thread-2', status=sr.Status.AWAITING_INPUT)
+            second = make_record(session_slug='thread-2', status=sr.Status.AWAITING_INPUT)
             sr.write_record(second, root=tmp_path)
 
-            before = _snapshot_tree(tmp_path)
+            before = snapshot_tree(tmp_path)
             # sanity: prove the snapshot actually captured the seeded files,
             # so the "unchanged" assertion below isn't vacuously true.
             assert any(path.startswith('sessions/') for path in before)
@@ -4238,7 +4208,7 @@ class TestThreadedScanReachesUI:
             # hand-off actually reached the live SessionTable.
             assert table.row_count == 2
 
-        after = _snapshot_tree(tmp_path)
+        after = snapshot_tree(tmp_path)
         for path, value in before.items():
             if path.startswith(('sessions/', 'decisions/')):
                 assert after.get(path) == value, (
@@ -4391,7 +4361,7 @@ class TestALatePollCannotRegressAFresherScan:
     ):
         from cockpit.panes.session_table import SessionTable
 
-        sr.write_record(_make_record(session_slug='r-1'), root=tmp_path)
+        sr.write_record(make_record(session_slug='r-1'), root=tmp_path)
         reader = _HoldingDecisionsReader()
         app = CockpitApp(fleet_root=tmp_path, poll_interval=60, decisions_reader=reader)
         async with app.run_test() as pilot:
@@ -4400,7 +4370,7 @@ class TestALatePollCannotRegressAFresherScan:
             assert table.row_count == 1
 
             async with _poll_held_after_its_read(app, reader):
-                sr.write_record(_make_record(session_slug='r-2'), root=tmp_path)
+                sr.write_record(make_record(session_slug='r-2'), root=tmp_path)
                 app.refresh_registry()
                 await pilot.pause()
                 assert table.row_count == 2
@@ -4408,7 +4378,7 @@ class TestALatePollCannotRegressAFresherScan:
             await pilot.pause()
             assert table.row_count == 2, 'the late poll regressed the view'
 
-            sr.write_record(_make_record(session_slug='r-3'), root=tmp_path)
+            sr.write_record(make_record(session_slug='r-3'), root=tmp_path)
             app._poll_registry()
             await app.workers.wait_for_complete()
             await pilot.pause()
@@ -4572,7 +4542,7 @@ class TestInFlightScanCannotUndoAKeypressWrite:
             queue.move_cursor(row=queue.get_row_index('decision:dec-b'))
             await pilot.pause()
 
-            sr.write_record(_make_record(session_slug='running-1'), root=tmp_path)
+            sr.write_record(make_record(session_slug='running-1'), root=tmp_path)
             async with _poll_held_after_its_read(app, reader):
                 await pilot.press('b')
                 await pilot.pause()
@@ -4602,10 +4572,10 @@ class TestDecisionQueueDetail:
         # awaiting-input ones only), and the older start_ts takes session-table
         # row 0, so moving to session-target is a real move -- a move onto the
         # already-highlighted row posts no RowHighlighted at all.
-        other_session = _make_record(
+        other_session = make_record(
             session_slug='session-other', start_ts='2026-07-07T00:00:00+00:00'
         )
-        target_session = _make_record(
+        target_session = make_record(
             session_slug='session-target',
             start_ts='2026-07-07T00:01:00+00:00',
             task_id='7001',
@@ -4687,7 +4657,7 @@ class TestDecisionQueueDetail:
         # Both awaiting, so both are queue rows; session-other's older start_ts
         # takes session-table row 0, so at mount the pane shows session-other and
         # the queue move below genuinely has to change it.
-        awaiting = _make_record(
+        awaiting = make_record(
             session_slug='session-awaiting',
             status=sr.Status.AWAITING_INPUT,
             start_ts='2026-07-07T00:01:00+00:00',
@@ -4697,7 +4667,7 @@ class TestDecisionQueueDetail:
                 asked_at='2026-07-07T00:01:00+00:00',
             ),
         )
-        other_session = _make_record(
+        other_session = make_record(
             session_slug='session-other',
             status=sr.Status.AWAITING_INPUT,
             start_ts='2026-07-07T00:00:00+00:00',
@@ -4752,7 +4722,7 @@ class TestDecisionQueueDetail:
 
         for slug, start in (('session-a', '00:00:00'), ('session-b', '00:01:00')):
             sr.write_record(
-                _make_record(session_slug=slug, start_ts=f'2026-07-07T{start}+00:00'),
+                make_record(session_slug=slug, start_ts=f'2026-07-07T{start}+00:00'),
                 root=tmp_path,
             )
 
@@ -4788,7 +4758,7 @@ class TestDecisionQueueDetail:
             # an awaiting-input session order_sessions ranks first, so the
             # highlighted session row's INDEX genuinely shifts on rebuild
             sr.write_record(
-                _make_record(
+                make_record(
                     session_slug='session-new',
                     status=sr.Status.AWAITING_INPUT,
                     start_ts='2026-07-06T00:00:00+00:00',
@@ -4828,7 +4798,7 @@ class TestDecisionQueueDetail:
         # the older start_ts takes session-table row 0, so this is the session
         # whose detail the pane must be showing when the app settles
         sr.write_record(
-            _make_record(
+            make_record(
                 session_slug='session-row0',
                 start_ts='2026-07-07T00:00:00+00:00',
                 question=sr.Question(
@@ -4838,7 +4808,7 @@ class TestDecisionQueueDetail:
             root=tmp_path,
         )
         sr.write_record(
-            _make_record(session_slug='session-other', start_ts='2026-07-07T00:01:00+00:00'),
+            make_record(session_slug='session-other', start_ts='2026-07-07T00:01:00+00:00'),
             root=tmp_path,
         )
         assert dr.write_decision(
@@ -4872,11 +4842,11 @@ class TestDecisionQueueDetail:
         from cockpit.panes.session_table import SessionTable
 
         sr.write_record(
-            _make_record(session_slug='session-a', start_ts='2026-07-07T00:00:00+00:00'),
+            make_record(session_slug='session-a', start_ts='2026-07-07T00:00:00+00:00'),
             root=tmp_path,
         )
         sr.write_record(
-            _make_record(
+            make_record(
                 session_slug='session-parked',
                 start_ts='2026-07-07T00:01:00+00:00',
                 question=sr.Question(
@@ -4946,11 +4916,11 @@ class TestDecisionQueueDetail:
         from cockpit.panes.session_table import SessionTable
 
         sr.write_record(
-            _make_record(session_slug='session-a', start_ts='2026-07-07T00:00:00+00:00'),
+            make_record(session_slug='session-a', start_ts='2026-07-07T00:00:00+00:00'),
             root=tmp_path,
         )
         sr.write_record(
-            _make_record(
+            make_record(
                 session_slug='session-parked',
                 start_ts='2026-07-07T00:01:00+00:00',
                 question=sr.Question(
@@ -5024,7 +4994,7 @@ class TestDecisionQueueDetail:
         from cockpit.panes.detail_pane import DetailPane
         from cockpit.panes.session_table import SessionTable
 
-        awaiting = _make_record(
+        awaiting = make_record(
             session_slug='session-awaiting',
             status=sr.Status.AWAITING_INPUT,
             start_ts='2026-07-07T00:01:00+00:00',
@@ -5033,7 +5003,7 @@ class TestDecisionQueueDetail:
         )
         sr.write_record(awaiting, root=tmp_path)
         sr.write_record(
-            _make_record(
+            make_record(
                 session_slug='session-other',
                 start_ts='2026-07-07T00:00:00+00:00',
                 task_id='7003',
@@ -5071,7 +5041,7 @@ class TestDecisionQueueDetail:
             # the queue's own row gets FRESH data on a rebuild -- neither stolen
             # by the session table's cursor nor left stale
             sr.write_record(
-                _make_record(
+                make_record(
                     session_slug='session-awaiting',
                     status=sr.Status.AWAITING_INPUT,
                     start_ts='2026-07-07T00:01:00+00:00',
@@ -5107,7 +5077,7 @@ class TestDecisionQueueDetail:
 
         for slug, start in (('session-a', '00:00:00'), ('session-b', '00:01:00')):
             sr.write_record(
-                _make_record(session_slug=slug, start_ts=f'2026-07-07T{start}+00:00'),
+                make_record(session_slug=slug, start_ts=f'2026-07-07T{start}+00:00'),
                 root=tmp_path,
             )
         long_question = (
@@ -5140,7 +5110,7 @@ class TestDecisionQueueDetail:
             # an awaiting-input session order_sessions ranks first, so the
             # highlighted session row's INDEX genuinely shifts on rebuild
             sr.write_record(
-                _make_record(
+                make_record(
                     session_slug='session-new',
                     status=sr.Status.AWAITING_INPUT,
                     start_ts='2026-07-06T00:00:00+00:00',
@@ -5186,7 +5156,7 @@ class TestDecisionQueueDetail:
         # cursor move and the fallback render below is a specific session, not
         # just "whatever was already there".
         sr.write_record(
-            _make_record(
+            make_record(
                 session_slug='session-first',
                 start_ts='2026-07-07T00:00:00+00:00',
                 question=sr.Question(text='Unrelated?', asked_at='2026-07-07T00:00:00+00:00'),
@@ -5194,7 +5164,7 @@ class TestDecisionQueueDetail:
             root=tmp_path,
         )
         sr.write_record(
-            _make_record(
+            make_record(
                 session_slug='session-parked',
                 start_ts='2026-07-07T00:01:00+00:00',
                 task_id='7004',
@@ -5250,7 +5220,7 @@ class TestDecisionQueueDetail:
             # and the pane is not merely cleared once: the session table can
             # reach it again, so a later rebuild still refreshes it
             sr.write_record(
-                _make_record(
+                make_record(
                     session_slug='session-parked',
                     start_ts='2026-07-07T00:01:00+00:00',
                     task_id='7004',
@@ -5279,12 +5249,12 @@ class TestSessionTableFocusCue:
     async def test_focusable_and_headless_rows_are_distinguishable(self, tmp_path):
         from cockpit.panes.session_table import SessionTable, focus_marker, state_glyph
 
-        focusable = _make_record(
+        focusable = make_record(
             session_slug='focusable-1',
             status=sr.Status.RUNNING,
             display=sr.Display(kind='wm', wm_title='focusable title'),
         )
-        headless = _make_record(
+        headless = make_record(
             session_slug='headless-1', status=sr.Status.RUNNING, display=None
         )
         for r in (focusable, headless):
@@ -5339,7 +5309,7 @@ class TestSessionTableCapNotice:
         from cockpit.panes.session_table import LiveSessions, SessionTable
 
         records = [
-            _make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(3)
+            make_record(session_slug=f's-{i}', status=sr.Status.RUNNING) for i in range(3)
         ]
         now = datetime.fromisoformat('2026-07-07T00:00:00+00:00')
 
@@ -5380,7 +5350,7 @@ class TestSessionTableCapNotice:
         from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, SessionTable
 
         over_cap = [
-            _make_record(session_slug=f'over-{i}', status=sr.Status.RUNNING)
+            make_record(session_slug=f'over-{i}', status=sr.Status.RUNNING)
             for i in range(_DEFAULT_VISIBLE_CAP + 5)
         ]
 
@@ -5403,8 +5373,8 @@ class TestSessionTableCapNotice:
         from cockpit.panes.session_table import SessionTable
 
         records = [
-            _make_record(session_slug='small-0', status=sr.Status.RUNNING),
-            _make_record(session_slug='small-1', status=sr.Status.IDLE),
+            make_record(session_slug='small-0', status=sr.Status.RUNNING),
+            make_record(session_slug='small-1', status=sr.Status.IDLE),
         ]
 
         app = CockpitApp(
@@ -5432,11 +5402,11 @@ class TestSessionTableCapNotice:
         from cockpit.panes.session_table import _DEFAULT_VISIBLE_CAP, SessionTable
 
         live = [
-            _make_record(session_slug=f'live-{i}', status=sr.Status.RUNNING)
+            make_record(session_slug=f'live-{i}', status=sr.Status.RUNNING)
             for i in range(_DEFAULT_VISIBLE_CAP + 5)
         ]
         exited = [
-            _make_record(session_slug=f'exited-{i}', status=sr.Status.EXITED)
+            make_record(session_slug=f'exited-{i}', status=sr.Status.EXITED)
             for i in range(3)
         ]
         notice = f'showing {_DEFAULT_VISIBLE_CAP} of {_DEFAULT_VISIBLE_CAP + 5}'
