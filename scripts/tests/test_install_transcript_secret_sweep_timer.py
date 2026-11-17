@@ -309,6 +309,7 @@ def test_the_wrapper_runs_the_sweep_from_its_repo(tmp_path):
     completed, recorded = _run_wrapper(tmp_path)
 
     assert completed.returncode == 0, completed.stderr
+    assert recorded is not None, completed.stderr
     assert recorded['argv'] == [f'{tmp_path / "repo"}/scripts/transcript_secret_sweep.py']
 
 
@@ -316,6 +317,7 @@ def test_the_wrapper_sources_the_repo_env_so_the_sweep_sees_live_values(tmp_path
     completed, recorded = _run_wrapper(tmp_path)
 
     assert completed.returncode == 0, completed.stderr
+    assert recorded is not None, completed.stderr
     assert recorded['saw_pool_var'] is True
     assert 'fake-wrapper-token' not in completed.stdout + completed.stderr
 
