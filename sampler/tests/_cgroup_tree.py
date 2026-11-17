@@ -84,7 +84,6 @@ class CgroupTree:
         self.root = root
         self._counters: dict[str, Counters] = {}
         self._omitted: dict[str, frozenset[str]] = {}
-        root.mkdir()
         self.set('', omit=ROOT_ABSENT)
 
     def path(self, rel: str) -> Path:
