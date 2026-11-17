@@ -70,7 +70,7 @@ class _Tick:
 class _Board:
     """The task list, the merge-waiter slots, and a record of every dispatch tick."""
 
-    def __init__(self, scheduler: Scheduler, tasks: list[dict]) -> None:
+    def __init__(self, scheduler: Scheduler, tasks: list[dict], monkeypatch: pytest.MonkeyPatch) -> None:
         self.scheduler = scheduler
         self.tasks = list(tasks)
         self.epoch = 0
@@ -90,7 +90,7 @@ class _Board:
 
         scheduler.get_tasks = AsyncMock(side_effect=lambda **_: list(self.tasks))
         scheduler.get_statuses = AsyncMock(return_value=({}, None))
-        scheduler.acquire_next = recorded_acquire  # type: ignore[method-assign]
+        monkeypatch.setattr(scheduler, 'acquire_next', recorded_acquire)
 
     def mark(self) -> int:
         """Start a new epoch; every tick that begins from now on is recorded in it."""
@@ -149,7 +149,9 @@ async def _settle() -> None:
     await asyncio.sleep(_TICK * _SETTLE_TICKS)
 
 
-def _harness(tmp_path: Path, *, reserve: int, tasks: list[dict]) -> tuple[Harness, _Board]:
+def _harness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, reserve: int, tasks: list[dict],
+) -> tuple[Harness, _Board]:
     config = OrchestratorConfig(
         project_root=tmp_path,
         max_concurrent_tasks=_GENERAL_SLOTS,
@@ -160,7 +162,7 @@ def _harness(tmp_path: Path, *, reserve: int, tasks: list[dict]) -> tuple[Harnes
         psi_admission=PsiAdmissionConfig(enabled=False),
     )
     scheduler = Scheduler(config, mcp_session=HermeticMcpSession())
-    board = _Board(scheduler, tasks)
+    board = _Board(scheduler, tasks, monkeypatch)
     with patch('orchestrator.harness.McpLifecycle') as mcp_cls, \
          patch('orchestrator.harness.Scheduler', return_value=scheduler), \
          patch('orchestrator.harness.BriefingAssembler'):
@@ -178,13 +180,17 @@ def _harness(tmp_path: Path, *, reserve: int, tasks: list[dict]) -> tuple[Harnes
     h.usage_gate = None
     h.review_checkpoint = None
 
-    h._start_escalation_server = AsyncMock()  # type: ignore[method-assign]
-    h._start_merge_worker = AsyncMock()  # type: ignore[method-assign]
-    h._dismiss_stale_escalations = AsyncMock()  # type: ignore[method-assign]
-    h._recover_crashed_tasks = AsyncMock()  # type: ignore[method-assign]
-    h._reconcile_lane_checkouts = AsyncMock()  # type: ignore[method-assign]
-    h._reconcile_stranded_in_progress = AsyncMock(return_value=0)  # type: ignore[method-assign]
-    h._run_slot = board.run_slot  # type: ignore[method-assign]
+    stubs: tuple[tuple[str, object], ...] = (
+        ('_start_escalation_server', AsyncMock()),
+        ('_start_merge_worker', AsyncMock()),
+        ('_dismiss_stale_escalations', AsyncMock()),
+        ('_recover_crashed_tasks', AsyncMock()),
+        ('_reconcile_lane_checkouts', AsyncMock()),
+        ('_reconcile_stranded_in_progress', AsyncMock(return_value=0)),
+        ('_run_slot', board.run_slot),
+    )
+    for name, stub in stubs:
+        monkeypatch.setattr(h, name, stub)
     return h, board
 
 
@@ -220,9 +226,9 @@ async def _saturate(board: _Board) -> None:
 class TestMainHealthFixReserve:
 
     async def test_fix_filed_while_every_general_slot_holds_a_merge_waiter_dispatches_next_tick(
-        self, tmp_path: Path,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        h, board = _harness(tmp_path, reserve=1, tasks=_merge_waiters())
+        h, board = _harness(tmp_path, monkeypatch, reserve=1, tasks=_merge_waiters())
 
         async def drive() -> None:
             await _saturate(board)
@@ -239,8 +245,10 @@ class TestMainHealthFixReserve:
 
         await _run_driven(h, board, drive)
 
-    async def test_loop_picks_nothing_while_every_slot_is_held(self, tmp_path: Path) -> None:
-        h, board = _harness(tmp_path, reserve=1, tasks=_merge_waiters())
+    async def test_loop_picks_nothing_while_every_slot_is_held(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        h, board = _harness(tmp_path, monkeypatch, reserve=1, tasks=_merge_waiters())
 
         async def drive() -> None:
             await _saturate(board)
@@ -261,8 +269,10 @@ class TestMainHealthFixReserve:
 
         await _run_driven(h, board, drive)
 
-    async def test_reserve_disabled_keeps_the_old_cap(self, tmp_path: Path) -> None:
-        h, board = _harness(tmp_path, reserve=0, tasks=_merge_waiters())
+    async def test_reserve_disabled_keeps_the_old_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        h, board = _harness(tmp_path, monkeypatch, reserve=0, tasks=_merge_waiters())
 
         async def drive() -> None:
             await _saturate(board)
@@ -275,8 +285,10 @@ class TestMainHealthFixReserve:
 
         await _run_driven(h, board, drive)
 
-    async def test_a_second_fix_does_not_take_a_second_extra_slot(self, tmp_path: Path) -> None:
-        h, board = _harness(tmp_path, reserve=1, tasks=_merge_waiters())
+    async def test_a_second_fix_does_not_take_a_second_extra_slot(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        h, board = _harness(tmp_path, monkeypatch, reserve=1, tasks=_merge_waiters())
 
         async def drive() -> None:
             await _saturate(board)
