@@ -17,7 +17,10 @@ importable-by-sibling-scripts only. It hosts three tiers:
   :func:`discover_or_report_no_default_root`) — adopted by ALL
   FOUR sweep scripts, plus ``census_tagger_debris.py`` (task 4525). The store
   paths and the known/default roots delegate to ``shared.project_layout``
-  (task 6713). :func:`decode_metadata` is the exception to "adopted by all four": it is
+  (task 6713). :func:`discover_or_report_no_default_root` is the CLI-side guard
+  that Tiers 2 and 3, the census and the repair script wrap around discovery,
+  reporting on stderr rather than discovering.
+  :func:`decode_metadata` is the exception to "adopted by all four": it is
   adopted by the scripts that decode a ``metadata`` column, among them the
   audit scripts ``audit_combine_gate_marker_loss.py`` and
   ``audit_manifest_descriptor_drift.py`` (task 4782) and
