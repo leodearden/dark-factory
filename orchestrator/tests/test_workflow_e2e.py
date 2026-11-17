@@ -8830,12 +8830,13 @@ class TestBuildSpawnEnv:
         implementer_kwargs = captured_calls[1]
         implementer_spawn_env = implementer_kwargs['spawn_env']
         assert implementer_spawn_env['CLAUDE_SPAWN_ROLE'] == 'implementer'
-        assert workflow._architect_spawn_session_id is not None
+        architect_session_id = workflow._architect_spawn_session_id
+        assert architect_session_id is not None
         assert implementer_spawn_env['CLAUDE_SPAWN_PARENT_ID'] == session_records.build_session_slug(
             'architect',
             workflow.config.fused_memory.project_id,
             str(workflow.task_id),
-            workflow._architect_spawn_session_id,
+            architect_session_id,
         )
 
 
