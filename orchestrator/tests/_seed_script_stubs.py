@@ -1,4 +1,5 @@
-"""Real-git fixtures plus stubs of reify's ``seed-warm-lane.sh`` contracts.
+"""Real-git fixtures plus stubs of reify's ``seed-warm-lane.sh`` contracts,
+and the default warm base every warm-lane acquire test seeds.
 
 Shared by the lane-lock re-entrancy, main-tip-sweep seed-mode and spec-lane
 re-acquire suites, so the one model of how today's seed script takes, refuses
@@ -13,7 +14,8 @@ from pathlib import Path
 from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig
-from orchestrator.git_ops import _run
+from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, _run
+from orchestrator.lane_lifecycle import POOL_ROOT_SENTINEL
 
 # Models TODAY's reify script (post-5354 + post-5568): it takes
 # ${LANE_DIR}.lock itself unless told the caller already holds it, and refuses
@@ -80,13 +82,28 @@ def warm_pool_git_config() -> GitConfig:
     )
 
 
+def seed_default_warm_base(repo: Path, *, pool_root: bool = True) -> None:
+    """Pre-create the DEFAULT derived warm-lane base under ``repo``.
+
+    The base is non-empty, so ``acquire_warm_lane``'s pre-acquire base-health
+    gate (task 2061) reports ``WarmBaseHealth.OK``.  Unless ``pool_root`` is
+    False it also writes the ``.pool-root`` sentinel, so the create-once
+    mount-presence guard (task 2099) reads the host as an already-running
+    warm-lane host; ``pool_root=False`` leaves the first-seed bootstrap state.
+    """
+    worktree_base = repo / '.worktrees'
+    base = worktree_base / PERSISTENT_MERGE_WORKTREE_NAME / 'target'
+    base.mkdir(parents=True, exist_ok=True)
+    (base / '.keep').write_text('warm base sentinel\n')
+    if pool_root:
+        (worktree_base / POOL_ROOT_SENTINEL).touch()
+
+
 def make_seed_test_repo(tmp_path: Path, *, warm_base: bool = True) -> Path:
     """A committed repo under ``tmp_path``, optionally with a resolvable warm base."""
     repo = seed_repo(tmp_path / 'repo')
     if warm_base:
-        base = repo / '.worktrees' / '_merge-verify' / 'target'
-        base.mkdir(parents=True, exist_ok=True)
-        (base / '.keep').write_text('warm base sentinel\n')
+        seed_default_warm_base(repo, pool_root=False)
     return repo
 
 
