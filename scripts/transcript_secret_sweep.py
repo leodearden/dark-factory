@@ -17,9 +17,10 @@ same-length placeholders. It reads only regular files, and skips those
 modified within ``min_age_secs``, which a live session or test run may still
 be appending to. A sweep that redacted or refused anything files one
 ``risk_identified`` info escalation, and a sweep that could not run, found a
-required root absent or could not read an orchestrator unit files one
-``infra_issue`` info escalation naming each shortfall. Nothing it prints or
-files carries a value. Operator view: ``OPERATIONS.md`` §12.
+required root absent, could not read an orchestrator unit or found no unit
+naming a project root files one ``infra_issue`` info escalation naming each
+shortfall. Nothing it prints or files carries a value. Operator view:
+``OPERATIONS.md`` §12.
 """
 
 from __future__ import annotations
@@ -72,7 +73,7 @@ except ImportError as exc:
 AGENT_ROLE = 'transcript-secret-sweep'
 DEFAULT_MIN_AGE_SECS = 900.0
 ESCALATION_TIMEOUT_SECS = 30.0
-MAX_DETAIL_FILES = 200
+MAX_DETAIL_LINES = 200
 NO_SECRETS_CAUSE = 'no secret-bearing values in the environment'
 SHORTFALL_TASK_ID = 'transcript-secret-sweep-shortfall'
 TRANSCRIPT_SUFFIXES = ('.jsonl', '.jsonl' + STAGING_SUFFIX)
@@ -179,11 +180,10 @@ def run(
     post_escalation: PostEscalation,
 ) -> SweepResult:
     result = _sweep(config, environ)
-    errors = [
-        error
-        for arguments in _escalations(result, config.now)
-        if (error := _posting_error(post_escalation, arguments)) is not None
-    ]
+    errors: list[str] = []
+    for arguments in _escalations(result, config.now):
+        if (error := _posting_error(post_escalation, arguments)) is not None:
+            errors.append(error)
     return dataclasses.replace(result, escalation_error='; '.join(errors) or None)
 
 
@@ -299,10 +299,10 @@ def _counts_label(counts: Mapping[str, int]) -> str:
 
 
 def _bounded(lines: list[str]) -> list[str]:
-    if len(lines) <= MAX_DETAIL_FILES:
+    if len(lines) <= MAX_DETAIL_LINES:
         return lines
-    overflow = len(lines) - MAX_DETAIL_FILES
-    return [*lines[:MAX_DETAIL_FILES], f'... and {overflow} more file(s): see the sweep\'s journal record']
+    overflow = len(lines) - MAX_DETAIL_LINES
+    return [*lines[:MAX_DETAIL_LINES], f'... and {overflow} more line(s): see the sweep\'s journal record']
 
 
 def _escalation_arguments(result: SweepResult, now: datetime.datetime) -> dict[str, object]:
@@ -340,9 +340,10 @@ def _shortfall_arguments(result: SweepResult, now: datetime.datetime) -> dict[st
         'summary': summary,
         'detail': '\n'.join(_bounded(list(result.shortfall))),
         'suggested_action': (
-            'Check that $REPO/.env exists and still defines the secret-bearing variables, that each '
-            "project's transcript archive exists at its default root, and that the orchestrator unit "
-            'files are readable.'
+            'Check that $REPO/.env exists and still defines the secret-bearing variables, and that the '
+            'orchestrator unit files are readable and name each project. A missing transcript archive '
+            'means its project archives somewhere other than the default root, or has not yet archived '
+            'its first transcript; the latter clears itself once one is archived.'
         ),
         'evidence': [{'observation': summary, 'measured_at': now.isoformat(), 'ref': SHORTFALL_TASK_ID}],
     }
@@ -357,6 +358,15 @@ def _post_escalate_info(url: str | None, arguments: dict[str, object]) -> object
     base_url = mcp_server_base(url or escalation_url())
     with SyncMcpSession(base_url, client_name='transcript-secret-sweep', timeout=ESCALATION_TIMEOUT_SECS) as session:
         return session.call_tool('escalate_info', arguments)
+
+
+def _unit_shortfall(
+    targets: Sequence[orchestrator_projects.ProjectTarget],
+    unit_scan: orchestrator_projects.UnitScan,
+    units_dir: Path,
+) -> tuple[str, ...]:
+    unenumerated = () if targets else (f'{units_dir}: no orchestrator unit names a project root to sweep',)
+    return (*unit_scan.problems, *unenumerated)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -399,7 +409,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         trees=swept_trees([target.root for target in targets], claude_projects),
         now=datetime.datetime.now(datetime.UTC),
         min_age_secs=args.min_age_secs,
-        unswept=unit_scan.problems,
+        unswept=_unit_shortfall(targets, unit_scan, args.units_dir),
     )
     result = run(
         config,

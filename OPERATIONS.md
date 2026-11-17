@@ -4129,12 +4129,15 @@ everything already on disk.
   record line and left as found.
 - **What it files when it cannot cover its roots.** When the sweep cannot run
   (no secret-bearing values in its environment, e.g. `.env` moved or its
-  variables renamed), cannot find a required root, or cannot read an
-  orchestrator unit, it files one `infra_issue` info escalation (task_id
+  variables renamed), cannot find a required root, cannot read an
+  orchestrator unit, or finds no unit naming a project root (a renamed or
+  moved unit), it files one `infra_issue` info escalation (task_id
   `transcript-secret-sweep-shortfall`) naming each shortfall, and exits 2.
   The wrapper still exits 0, as every §12 job does, so the escalation is the
   signal. A failing night re-files: one escalation per night until it is
-  fixed. The wrapper resolves `uv` via `scripts/lib/resolve_uv.sh`, so a
+  fixed. The archive directory is created when a project archives its first
+  transcript, so a newly onboarded project reports its archive missing until
+  then; that shortfall clears itself. The wrapper resolves `uv` via `scripts/lib/resolve_uv.sh`, so a
   boot catch-up run without the login PATH still finds it.
 - **What it skips.** Files modified in the last 15 minutes, which a live
   session or test run may still be appending to. The next night picks them up.

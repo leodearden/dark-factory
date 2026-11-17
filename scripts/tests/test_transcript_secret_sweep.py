@@ -15,6 +15,7 @@ import json
 import os
 import stat
 import xml.etree.ElementTree as ET
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -433,6 +434,19 @@ def test_a_shortfall_escalation_that_cannot_be_filed_is_reported(tree):
     assert result.escalation_error == 'ConnectionError: escalation server unreachable'
 
 
+def test_when_both_escalations_fail_each_error_is_reported(tree):
+    config = sweep.SweepConfig(
+        trees=sweep.swept_trees(tree.project_roots, tree.claude_projects),
+        now=NOW,
+        unswept=('units dir: cannot list units: boom',),
+    )
+
+    result = sweep.run(config, environ=ENVIRON, post_escalation=FailingPoster())
+
+    unreachable = 'ConnectionError: escalation server unreachable'
+    assert result.escalation_error == f'{unreachable}; {unreachable}'
+
+
 def test_a_refused_line_is_escalated_and_the_rest_of_its_file_is_redacted(tmp_path):
     value = '00e9' + 'X' * 44
     project = tmp_path / 'proj'
@@ -554,11 +568,15 @@ class TestMain:
         *,
         escalation_url: str = 'http://127.0.0.1:1/mcp',
         claude_projects: Path | None = None,
+        units_dir: Path | None = None,
+        project_roots: Sequence[Path] | None = None,
     ) -> list[str]:
-        units_dir = tmp_path / 'units'
-        units_dir.mkdir(exist_ok=True)
+        if units_dir is None:
+            units_dir = tmp_path / 'units'
+            units_dir.mkdir(exist_ok=True)
+        roots = tree.project_roots if project_roots is None else project_roots
         return [
-            *(arg for root in tree.project_roots for arg in ('--project-root', str(root))),
+            *(arg for root in roots for arg in ('--project-root', str(root))),
             '--units-dir', str(units_dir),
             '--claude-projects-dir', str(claude_projects or tree.claude_projects),
             '--escalation-url', escalation_url,
@@ -625,6 +643,43 @@ class TestMain:
         assert str(absent_claude) in json.loads(line)['missing']
         assert str(absent_claude) in err
         assert POOL_A not in out + err
+
+    def test_an_unlistable_units_dir_files_one_shortfall_and_exits_2(
+        self, secretless_environ, monkeypatch, tmp_path, capsys
+    ):
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', NON_LIVE + 'z' * 8)
+        tree = Tree(tmp_path)
+        absent_units = tmp_path / 'absent-units'
+
+        with StubMcpServer(stateful=True, payload={'id': 'esc-1', 'status': 'pending'}) as server:
+            argv = self._argv(tree, tmp_path, escalation_url=f'{server.url}/mcp', units_dir=absent_units)
+            assert sweep.main(argv) == 2
+
+        (problem,) = self._record(capsys)['unswept']
+        assert problem.startswith(f'{absent_units}: cannot list units')
+        ((name, arguments),) = _served_tool_calls(server)
+        assert name == 'escalate_info'
+        assert arguments['category'] == 'infra_issue'
+        assert problem in arguments['detail']
+
+    def test_units_naming_no_project_root_file_one_shortfall_and_exit_2(
+        self, secretless_environ, monkeypatch, tmp_path, capsys
+    ):
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', NON_LIVE + 'z' * 8)
+        tree = Tree(tmp_path)
+
+        with StubMcpServer(stateful=True, payload={'id': 'esc-1', 'status': 'pending'}) as server:
+            argv = self._argv(tree, tmp_path, escalation_url=f'{server.url}/mcp', project_roots=())
+            assert sweep.main(argv) == 2
+
+        record = self._record(capsys)
+        assert record['ok'] is True
+        (problem,) = record['unswept']
+        assert problem.startswith(f'{tmp_path / "units"}: no orchestrator unit names a project root')
+        ((name, arguments),) = _served_tool_calls(server)
+        assert name == 'escalate_info'
+        assert arguments['category'] == 'infra_issue'
+        assert problem in arguments['detail']
 
     def test_an_escalation_that_cannot_be_filed_exits_2(self, secretless_environ, monkeypatch, tmp_path, capsys):
         monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', POOL_A)
