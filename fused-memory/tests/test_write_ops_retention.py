@@ -167,8 +167,7 @@ async def test_each_horizon_resumes_where_the_last_pass_drained_it(journal):
     behind = await _seed(journal, operation='get_task', kind='read', success=False, age_days=30)
 
     assert await prune_write_ops_pass(journal, config) == 0, (
-        'the second pass re-walked the range the first one drained; on the live '
-        'journal that range holds every kept search row, 9.4 s cold in one statement'
+        'the second pass re-walked the range the first one drained'
     )
     assert behind in _surviving_ids(journal)
 
