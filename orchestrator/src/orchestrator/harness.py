@@ -69,6 +69,7 @@ from shared.transcript_archive import (
     durable_archive_path,
     set_archival_failure_hook,
 )
+from shared.usage_gate import UsageGate
 
 from orchestrator import (
     cross_repo_gate,
@@ -277,7 +278,6 @@ from orchestrator.task_status import (
     is_infra_held,
 )
 from orchestrator.task_verify_dispatch import TaskVerifyDispatcher, policy_from_config
-from orchestrator.usage_gate import UsageGate
 from orchestrator.verify_admission_watch import ADMISSION_WATCH_INTERVAL_SECS, AdmissionWatch
 from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_hosts import HostPool, remote_runner_factory, task_verify_hosts

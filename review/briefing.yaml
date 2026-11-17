@@ -230,8 +230,9 @@ subprojects:
     purpose: >
       Internal library providing the Claude CLI invocation wrapper and the multi-account
       usage gate (OAuth failover across Max subscription accounts). Exists so fused-memory
-      and orchestrator share this code without circular dependencies. It is now the SINGLE
-      source of truth: orchestrator/usage_gate.py is a thin re-export shim.
+      and orchestrator share this code without circular dependencies. shared.usage_gate is
+      the SINGLE source of truth and the orchestrator imports it directly (task 6641 deleted
+      the orchestrator/usage_gate.py re-export shim).
 
     key_scenarios:
       - "invoke_claude_agent shells out to Claude CLI and returns structured AgentResult"
@@ -256,8 +257,8 @@ subprojects:
       - decision: "HTTP 429 classifies as cap-hit, not auth_failed"
         why: "cli_invoke's auth predicate is narrowed to {401, 403}; _run_probe also demotes auth_failed→capped on cap prefix as belt-and-braces"
 
-      - decision: "shared.usage_gate is canonical; orchestrator/usage_gate.py is a `from shared.usage_gate import *` shim"
-        why: "The old 'not yet unified' gap is closed — there is one implementation (~1376 lines in shared), no drift risk"
+      - decision: "shared.usage_gate is canonical, with no orchestrator re-export"
+        why: "One implementation and one import spelling. The old `from shared.usage_gate import *` shim reached only what `__all__` listed, so it was a lockstep site; task 6641 removed it"
 
     known_gaps:
       - what: "No cross-process usage gate coordination"
