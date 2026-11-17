@@ -21,9 +21,10 @@ if str(_ROOT) not in sys.path:
 
 # Suite-wide isolation (git ceiling: task 3355, incident esc-3072-3; deploy-clock
 # guard: task 3797; leaked-drain-process guard: task 3798; live-fleet-dir
-# redirect: task 3799). The fixture imports are what arm the session
-# GIT_CEILING_DIRECTORIES ceiling, the deploy-clock guard, the
-# leaked-drain-process guard and the ORCH_FLEET_DIR redirect; pytest only
+# redirect: task 3799; mock-derived stray-dir guard: task 5145). The fixture
+# imports are what arm the session GIT_CEILING_DIRECTORIES ceiling, the
+# deploy-clock guard, the leaked-drain-process guard, the ORCH_FLEET_DIR
+# redirect and the mock-derived stray-dir guard; pytest only
 # collects fixtures bound into a conftest's namespace, so the F401 bindings are
 # load-bearing.
 from df_pytest_isolation import (  # noqa: E402
@@ -33,6 +34,7 @@ from df_pytest_isolation import (  # noqa: E402
     _df_git_ceiling_at_basetemp,  # noqa: F401
     _df_git_env_hermetic,  # noqa: F401
     _df_no_leaked_drain_processes,  # noqa: F401
+    _df_no_mock_derived_stray_dirs,  # noqa: F401  # debt: task 6997
     _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401
     reject_unsafe_basetemp,
 )
