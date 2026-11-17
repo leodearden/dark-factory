@@ -77,7 +77,7 @@
     "complete": true
   },
   "files": {
-    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1538, "function_local_imports": 4, "lines": 16919, "prose_lines": 9592, "reexport_names": 1},
+    "orchestrator/src/orchestrator/git_ops.py": {"cognitive": 1538, "function_local_imports": 4, "lines": 16928, "prose_lines": 9597, "reexport_names": 1},
     "orchestrator/src/orchestrator/lane_lifecycle.py": {"cognitive": 58, "function_local_imports": 1, "lines": 868, "prose_lines": 359, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/__init__.py": {"cognitive": 1, "function_local_imports": 0, "lines": 205, "prose_lines": 22, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/chain_reservation.py": {"cognitive": 24, "function_local_imports": 0, "lines": 167, "prose_lines": 19, "reexport_names": 0},
@@ -1463,6 +1463,7 @@
     "orchestrator/tests/test_git_ops.py": {"patch_targets": [], "private_reads": 101},
     "orchestrator/tests/test_git_ops_checked_lookups.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_git_ops_citation_pattern.py": {"patch_targets": [], "private_reads": 0},
+    "orchestrator/tests/test_git_ops_commit_staging.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_git_ops_no_op_landing.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/test_git_ops_rebased_citation.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_git_ops_train_solo.py": {"patch_targets": [], "private_reads": 0},

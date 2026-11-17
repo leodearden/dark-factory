@@ -118,6 +118,7 @@ from orchestrator.quarantine_provenance import (
 )
 from orchestrator.recut_ruling import ParkedIncarnation, RecutRuling, RecutRulingViolation
 from orchestrator.script_warnings import log_warnings_despite_success
+from orchestrator.staged_gitlinks import unstage_new_gitlinks
 from orchestrator.teardown import complete_despite_cancellation, path_confirmed_absent
 from orchestrator.tree_removal import remove_tree
 from orchestrator.verify_cancel import (
@@ -9677,12 +9678,20 @@ class GitOps:
         conflicted tree (which may contain literal conflict markers) is
         never snapshotted.  All WIP-save call sites funnel through this
         method, so this single guard covers every one of them.
+
+        Embedded git repositories stay out of the commit: ``--ignore-errors``
+        stops a commit-less one aborting the whole ``git add``, and
+        ``orchestrator/src/orchestrator/staged_gitlinks.py::unstage_new_gitlinks``
+        unstages the gitlink of any other.
         """
         conflicted = await self._detect_unmerged_paths(worktree)
         if conflicted:
             raise WorktreeConflictError(worktree, conflicted)
 
-        await _run(['git', 'add', '-A', '--', '.', ':!.claude'], cwd=worktree)
+        await _run(
+            ['git', 'add', '-A', '--ignore-errors', '--', '.', ':!.claude'], cwd=worktree,
+        )
+        await unstage_new_gitlinks(worktree, _run)
 
         # Check for changes
         rc, _, _ = await _run(['git', 'diff', '--cached', '--quiet'], cwd=worktree)
