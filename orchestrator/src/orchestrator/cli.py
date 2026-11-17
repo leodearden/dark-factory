@@ -408,18 +408,30 @@ def flake_ledger_cmd(config_path: Path | None):
 
     READ ONLY. This command opens no debt, files no task, resolves nothing and
     escalates nothing, and it will NOT create a ledger DB for a project that has
-    none — it reports the absence instead.
+    none — it reports the absence instead. It also reads each open row's owner
+    status live from fused-memory, and says READ FAILED when it cannot.
     """
     # Named flake_ledger_cmd so the function does not shadow the flake_ledger module.
     from orchestrator.flake_ledger import ledger_db_path
-    from orchestrator.flake_report import build_report, render_report
+    from orchestrator.flake_report import build_report, corroborate_owners, render_report
 
     try:
         config = load_config(config_path)
     except ConfigRequiredError as e:
         click.echo(f'Error: {e}', err=True)
         sys.exit(1)
-    click.echo(render_report(build_report(ledger_db_path(Path(config.project_root)))))
+
+    # Built only when there are owners to read, so an absent ledger never builds one.
+    async def read_statuses(ids: list[str]) -> tuple[dict[str, str], Exception | None]:
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        from orchestrator.scheduler import Scheduler
+
+        client = SchedulerChronicFlakeTaskClient(Scheduler(config), config.project_root)
+        return await client.get_statuses(ids)
+
+    report = build_report(ledger_db_path(Path(config.project_root)))
+    report = asyncio.run(corroborate_owners(report, read_statuses))
+    click.echo(render_report(report))
 
 
 @main.group('verify-cache')
