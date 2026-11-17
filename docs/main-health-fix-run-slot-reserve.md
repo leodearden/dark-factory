@@ -113,7 +113,13 @@ From `docs/code-quality.md`:
 - A fix whose planned files overlap a merge-waiter's held modules, or a pin
   head's reservation, still waits on module locks. That lock precedence is owned
   by 10399 item (3) and by 8795.
-- The PSI admission gate still applies to fixes.
+- The PSI admission gate still applies to fixes. Under a PSI hold with
+  `in_flight` at or above `psi_admission.min_inflight_floor`, which a full
+  general pool always meets, `_phase_select_scored` defers a fix on the reserve
+  just like any non-deterministic candidate. The fix is the exit owner of every
+  merge-waiter hold, so a saturated host can still stall the heal. Follow-up
+  ticket `tkt_0RX3ADTKWNEXGTDSQRCK2E6NND` owns deciding whether an admitted fix
+  is exempt, as deterministic tasks are (DA-D4), or recording why it is not.
 - While the general pool is full and the reserve is free, a tick runs every
   `idle_poll_secs`, at the same cadence and cost as an idle tick
   (INV-8 `loop-thread-occupancy-bounded`). A general slot that frees during
