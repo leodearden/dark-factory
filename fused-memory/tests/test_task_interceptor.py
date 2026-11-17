@@ -2536,7 +2536,7 @@ async def test_event_project_id_is_resolved(interceptor, event_buffer):
 async def test_event_payload_contains_project_root(interceptor, event_buffer):
     """Event payload should include _project_root with original filesystem path."""
     await interceptor.set_task_status('1', 'in-progress', '/home/leo/src/dark-factory')
-    events = await event_buffer.drain('dark_factory')
+    events = await event_buffer.drain('dark_factory', run_id='R1')
     assert len(events) == 1
     assert events[0].payload['_project_root'] == '/home/leo/src/dark-factory'
 
@@ -2577,7 +2577,7 @@ async def test_event_roundtrip_preserves_both_ids(taskmaster, event_buffer, tmp_
         assert stats['size'] == 3
 
         # Drain by resolved id
-        events = await event_buffer.drain('dark_factory')
+        events = await event_buffer.drain('dark_factory', run_id='R1')
         assert len(events) == 3
 
         for ev in events:

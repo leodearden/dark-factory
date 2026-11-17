@@ -144,7 +144,7 @@ async def test_drain_clears_buffer(event_buffer):
     await event_buffer.push(_make_event())
     await event_buffer.push(_make_event())
 
-    events = await event_buffer.drain('test-project')
+    events = await event_buffer.drain('test-project', run_id='R1')
     assert len(events) == 2
 
     # Should be empty now
@@ -20221,9 +20221,9 @@ async def test_run_full_cycle_attributes_drained_events_to_run_id(
         f'2 events it drained via buffer.drain(); restore_drained(run_id=run_a.id) '
         f'restored {restored_a}'
     )
-    # Drain them back out (no run_id — mirrors an untracked legacy drain) so
-    # the next scenario starts from an empty 'buffered' set.
-    await event_buffer.drain('test-project')
+    # Drain them back out so the next scenario starts from an empty
+    # 'buffered' set.
+    await event_buffer.drain('test-project', run_id='scenario-a-cleanup')
 
     # (b) Iterator-fed path: events pre-drained by the caller must be
     # attributed via buffer.mark_drained_run_id(project_id, event_ids, run_id).
@@ -20233,8 +20233,9 @@ async def test_run_full_cycle_attributes_drained_events_to_run_id(
     pre_drained = [_make_event(), _make_event()]
     for e in pre_drained:
         await event_buffer.push(e)
-    # Pre-drain with no run_id, so only run_full_cycle can attribute them.
-    await event_buffer.drain('test-project')
+    # Pre-drained under another run's id, as BacklogIterator's drain_by_ids
+    # does; run_full_cycle must re-attribute them to its own run.
+    await event_buffer.drain('test-project', run_id='pre-drain-chunk')
 
     run_b = await harness.run_full_cycle(
         'test-project', 'backlog_chunk:1:2', events=pre_drained,
