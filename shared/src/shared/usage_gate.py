@@ -29,6 +29,17 @@ from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
+from shared.account_reserve import (
+    ActiveReserve,
+    ReserveConfig,
+    ReserveRefusal,
+    ReserveState,
+    WorkClassSource,
+    first_choice,
+    refusal,
+    refuses_account,
+    resolve_work_class,
+)
 from shared.cli_invoke import (
     BUDGET_EXHAUSTED_SUBTYPE,
     AgentResult,
@@ -64,7 +75,7 @@ from shared.proc_group import terminate_process_group
 from shared.secret_env import agent_subprocess_env
 
 if TYPE_CHECKING:
-    from collections.abc import Collection
+    from collections.abc import Callable, Collection
 
     from shared.cost_store import CostStore
 
@@ -826,8 +837,21 @@ class UsageGate:
     _park_last_logged_at: float | None = None
     _park_waiters: int = 0
 
-    def __init__(self, config: UsageCapConfig, *, cost_store: CostStore | None = None):
+    # The allowance reserve's clock (plans/allowance-reserve-by-account-prd.md
+    # §6.2-6.3): read by reserve decisions only, never by the cap timers, which
+    # keep the wall clock. Declared on the class for the same `__new__` reason
+    # as the park clock above.
+    _reserve_clock: Callable[[], datetime] | None = None
+
+    def __init__(
+        self,
+        config: UsageCapConfig,
+        *,
+        cost_store: CostStore | None = None,
+        reserve_clock: Callable[[], datetime] | None = None,
+    ):
         self._config: UsageCapConfig = config
+        self._reserve_clock = reserve_clock
         self._open = asyncio.Event()
         self._open.set()  # start open
         self._lock = asyncio.Lock()
@@ -1149,6 +1173,7 @@ class UsageGate:
         *,
         scope: str | None = None,
         exclude: Collection[str] | None = None,
+        work_class: WorkClassSource | None = None,
     ) -> AccountLease | None:
         """Select an admissible account and return its lease, or ``None`` —
         SYNCHRONOUSLY, and WITHOUT ever blocking.
@@ -1203,8 +1228,29 @@ class UsageGate:
         selection runs out after at most one pass per account. It is opt-in
         and ``before_invoke`` never passes it, so the blocking policy and the
         orchestrator's ordering are unchanged.
+
+        *work_class* is the caller's class for the allowance reserve
+        (plans/allowance-reserve-by-account-prd.md §6.3), a ``WorkClass`` or a
+        function returning one, resolved once per call; ``None`` is background.
+        With an active reserve, the reserve account is skipped for a class the
+        rule refuses, and in the release window it is tried first. Without
+        one, nothing is resolved and the walk is today's.
         """
-        for acct in self._accounts:
+        refused: frozenset[str] = frozenset()
+        walk = self._accounts
+        rule = self._active_reserve_config()
+        if rule is not None:
+            now = self._reserve_now()
+            caller = resolve_work_class(work_class)
+            refused = frozenset(
+                acct.name
+                for acct in self._accounts
+                if refuses_account(rule, acct.name, caller, now)
+            )
+            first = first_choice(rule, now)
+            if first is not None:
+                walk = sorted(self._accounts, key=lambda acct: acct.name != first)
+        for acct in walk:
             if acct.capped or acct.probe_in_flight or acct.auth_failed:
                 continue
             if exclude and acct.name in exclude:
@@ -1214,6 +1260,11 @@ class UsageGate:
                 # the pool less available the harder a caller bounded itself.
                 # Guarded on a truthy `exclude` so the None/empty path stays
                 # byte-identical for every existing caller.
+                continue
+            if acct.name in refused:
+                # Also BEFORE the probe claim, for the same reason: a caller
+                # the reserve refuses must not take a probing reserve's one
+                # probe slot (PRD §6.3).
                 continue
             if scope is not None and self._scope_capped_at(acct, scope, datetime.now(UTC)):
                 # Scope-capped for this model (S2): skip for this scope
@@ -1415,6 +1466,39 @@ class UsageGate:
             logger.info('All accounts capped — waiting for any to reopen')
             self._open.clear()
             await self._wait_for_any_account_to_reopen(park_deadline)
+
+    def _reserve_now(self) -> datetime:
+        clock = self._reserve_clock
+        return clock() if clock is not None else datetime.now(UTC)
+
+    def _active_reserve_config(self) -> ReserveConfig | None:
+        """The reserve rule in force, or None: the one gate-side test of "the rule applies"."""
+        reserve = self._config.reserve
+        return reserve.config if isinstance(reserve, ActiveReserve) else None
+
+    def reserve_refusal(self, work_class: WorkClassSource | None) -> ReserveRefusal | None:
+        """The refusal an unscoped caller of *work_class* would meet now, or None.
+
+        PRD §6.4: a refusal exactly when every account that is neither capped,
+        probe-in-flight nor failing authentication is the reserve, and the rule
+        refuses this class; None when nothing at all is open. It changes
+        nothing and claims nothing.
+        """
+        rule = self._active_reserve_config()
+        if rule is None:
+            return None
+        open_names = [
+            acct.name
+            for acct in self._accounts
+            if not (acct.capped or acct.probe_in_flight or acct.auth_failed)
+        ]
+        return refusal(rule, open_names, resolve_work_class(work_class), self._reserve_now())
+
+    @property
+    def reserve_state(self) -> ReserveState | None:
+        """Whether the accounts file's reserve is active or invalid; None without a block."""
+        reserve = self._config.reserve
+        return None if reserve is None else reserve.state
 
     def _pool_frozen(self, scope: str | None) -> PoolFrozen:
         """The :class:`PoolFrozen` describing this gate right now."""
