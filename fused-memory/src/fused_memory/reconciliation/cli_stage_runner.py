@@ -20,7 +20,11 @@ from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.transcript_archive import archive_before_delete, resolve_archive_root
 
 from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, StageAgentOutcome
-from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+from fused_memory.reconciliation import (
+    _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+    RECONCILIATION_CLI_ENV_OVERRIDES,
+    RECONCILIATION_CLI_SETTING_SOURCES,
+)
 from fused_memory.reconciliation.sandbox_guard import (
     RemediationSandboxUnavailable,
     resolve_recon_sandbox_wrap,
@@ -950,6 +954,10 @@ async def run_stage_via_cli(
             max_budget_usd=5.0,
             disallowed_tools=disallowed_tools,
             mcp_config=mcp_config,
+            # Only the servers BaseStage._build_mcp_config names, never the checkout's .mcp.json.
+            strict_mcp_config=True,
+            setting_sources=list(RECONCILIATION_CLI_SETTING_SOURCES),
+            env_overrides=dict(RECONCILIATION_CLI_ENV_OVERRIDES),
             output_schema=output_schema,  # PRD γ: pass None straight through when caller opts out
             permission_mode='bypassPermissions',
             timeout_seconds=float(config.stage_timeout_seconds),
