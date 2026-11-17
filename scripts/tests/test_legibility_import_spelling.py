@@ -11,11 +11,13 @@ import ast
 import json
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from source_measures import PSEUDO_MEMBERS
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
@@ -75,4 +77,25 @@ def test_a_direct_run_layout_loads_each_legibility_module_once(tmp_path):
     assert json.loads(probe.stdout) == [], (
         "these legibility modules were also loaded under their bare name, "
         "a second module object beside legibility.<mod>"
+    )
+
+
+def test_no_declared_import_root_makes_a_legibility_module_importable_by_its_bare_name():
+    with (LEGIBILITY.parents[1] / "pyproject.toml").open("rb") as fh:
+        pyright_extra_paths = tomllib.load(fh)["tool"]["pyright"]["extraPaths"]
+    scripts = next(member for member in PSEUDO_MEMBERS if member.name == "scripts")
+    declared = {
+        "scripts test harness sys.path": [
+            entry for entry in sys.path if Path(entry).resolve() == LEGIBILITY
+        ],
+        "root pyproject.toml [tool.pyright] extraPaths": [
+            path for path in pyright_extra_paths if path == "scripts/legibility"
+        ],
+        "source_measures scripts extra_import_roots": [
+            root for root in scripts.extra_import_roots if root == "scripts/legibility"
+        ],
+    }
+    assert {layout: hits for layout, hits in declared.items() if hits} == {}, (
+        "scripts/legibility as an import root gives each legibility module a second, "
+        "bare name and so a second module object; declare scripts/ only"
     )
