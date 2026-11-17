@@ -1765,13 +1765,11 @@ on the drain; `pin_declared_reason` (the free-text why) is only on the full reco
 exists to spend a pin deliberately, not to clear an inconvenient error. None of that changes this
 check: it stays REPORT-ONLY, and an **unmarked** record is still not proof that nothing relies on
 it — the marker is opt-in, so absence means "not declared", not "safe". Reading the record and its
-companions before proposing any disposition remains the protection. Note also who can WRITE the
-marker: `declare_pin` is held by the steward role
-(`orchestrator/src/orchestrator/agents/roles.py::STEWARD`) and by interactive sessions such as this
-one, and not by the escalation-watcher-auto rotation
-(`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`) — so when this probe finds a
-likely pin that carries no `pin_declared_by`, the output is a REPORTED *candidate pin* naming what
-appears to rely on it, for the human to ratify and declare. esc-3105-3 itself is still in that
+companions before proposing any disposition remains the protection. This session can run
+`declare_pin` (who may declare is stated once, in `skills/escalation-watcher-auto/SKILL.md`
+"Declared pins"), but this check is REPORT-ONLY and declaring is a human ratification: when the
+probe finds a likely pin that carries no `pin_declared_by`, report it as a *candidate pin* naming
+what appears to rely on it, for the human to ratify and declare. esc-3105-3 itself is still in that
 state.
 
 **Carve-out: mechanically actioning a ruling Leo has ALREADY made.** You do not need Leo's

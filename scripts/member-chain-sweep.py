@@ -34,9 +34,9 @@ action on it -- and on any L2 whose cascade would close it -- with
 disposition. It does NOT make this output actionable: the marker is
 opt-in, so an EMPTY `pin_declared_by` means "not declared", not "safe" --
 esc-3105-3 is exactly the shape that would be lost to that assumption,
-and it is itself still undeclared (the `declare_pin` MCP tool that
-writes the marker is held by the steward role and interactive sessions;
-the escalation-watcher-auto rotation does not hold it).
+and it is itself still undeclared (who may write the marker with the
+`declare_pin` MCP tool is stated in skills/escalation-watcher-auto/SKILL.md
+"Declared pins").
 
 Usage:
     member-chain-sweep.py                 # sweep the default fleet queues

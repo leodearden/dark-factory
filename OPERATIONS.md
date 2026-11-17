@@ -1163,10 +1163,6 @@ An orchestrator-spawned agent's escalation tools are the ones its grant
 names: the steward's in
 `orchestrator/src/orchestrator/agents/roles.py::STEWARD`, the L1
 rotation's in `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`.
-`declare_pin` (marks a pending record load-bearing, so `resolve_issue`
-refuses every non-`park` close; task 4377) is held by the steward and by
-interactive sessions; the L1 rotation promotes a candidate pin to L2
-instead (`skills/escalation-watcher-auto/SKILL.md` "Declared pins").
 
 ### Is reconciliation halted, or just behind?
 
