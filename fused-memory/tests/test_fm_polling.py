@@ -127,6 +127,73 @@ class TestPollUntil:
             await poll_until(lambda: False, timeout=0.05, interval=0.01)
 
 
+class TestPollUntilSync:
+    """poll_until's contract for a synchronous caller, pinned with call counts and raises only."""
+
+    def test_already_truthy_predicate_is_called_once_and_returned_verbatim(self):
+        from _fm_polling import poll_until_sync
+
+        payload = {'done': True}
+        calls = 0
+
+        def predicate():
+            nonlocal calls
+            calls += 1
+            return payload
+
+        result = poll_until_sync(predicate, timeout=5.0)
+
+        assert result is payload
+        assert calls == 1, f'expected exactly 1 call, got {calls}'
+
+    def test_predicate_turning_truthy_on_nth_call_is_called_exactly_n_times(self):
+        from _fm_polling import poll_until_sync
+
+        calls = 0
+        n = 4
+
+        def predicate():
+            nonlocal calls
+            calls += 1
+            return calls >= n
+
+        result = poll_until_sync(predicate, timeout=5.0, interval=0.001)
+
+        assert result is True
+        assert calls == n, f'expected exactly {n} calls, got {calls}'
+
+    def test_never_truthy_predicate_raises_with_the_caller_message(self):
+        from _fm_polling import poll_until_sync
+
+        with pytest.raises(AssertionError, match='custom diagnostic xyz'):
+            poll_until_sync(
+                lambda: False, timeout=0.05, interval=0.001, message='custom diagnostic xyz',
+            )
+
+    def test_default_message_names_the_timeout(self):
+        from _fm_polling import poll_until_sync
+
+        with pytest.raises(AssertionError, match='0.05'):
+            poll_until_sync(lambda: False, timeout=0.05, interval=0.001)
+
+    def test_an_exception_from_the_predicate_propagates_on_the_first_call(self):
+        from _fm_polling import poll_until_sync
+
+        calls = 0
+
+        class _Boom(Exception):
+            pass
+
+        def predicate():
+            nonlocal calls
+            calls += 1
+            raise _Boom('predicate failed')
+
+        with pytest.raises(_Boom, match='predicate failed'):
+            poll_until_sync(predicate, timeout=5.0, interval=0.001)
+        assert calls == 1, f'expected exactly 1 call, got {calls}'
+
+
 # ---------------------------------------------------------------------------
 # Tests for the shared poll_until_dead() dead-letter waiter (task 4847)
 # ---------------------------------------------------------------------------
