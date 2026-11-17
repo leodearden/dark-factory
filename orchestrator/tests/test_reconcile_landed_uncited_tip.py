@@ -107,6 +107,7 @@ def land_then_reseed_foreign_tip(repo: _Repo, tid: str) -> tuple[str, str]:
     return later, landing
 
 
+@pytest.mark.asyncio
 class TestBranchTipLanded:
     async def test_no_ff_landing_of_an_uncited_tip_is_landed(
         self, repo: _Repo, git_ops: GitOps,

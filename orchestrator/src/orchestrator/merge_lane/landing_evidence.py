@@ -391,6 +391,7 @@ __all__ = [
     'PatchContainment',
     'RangePatchIds',
     'branch_is_degenerate',
+    'branch_tip_landed',
     'branch_work_landed',
     'classify_containment',
     'file_landing_git_error_storm_escalation',
@@ -764,6 +765,35 @@ async def branch_is_degenerate(
     if branch_tip_sha is None:
         branch_tip_sha = await git_ops.resolve_branch_sha(branch)
     return branch_tip_sha is not None and branch_tip_sha == branch_base_sha
+
+
+async def _landing_introduces_tip(
+    git_ops: GitOps, landing_sha: str | None, branch_tip_sha: str | None,
+) -> bool:
+    if landing_sha is None or branch_tip_sha is None:
+        return False
+    if await git_ops.is_ancestor_checked(branch_tip_sha, landing_sha) is not True:
+        return False
+    return await git_ops.is_ancestor_checked(branch_tip_sha, f'{landing_sha}^1') is False
+
+
+async def branch_tip_landed(
+    git_ops: GitOps, branch: str, branch_tip_sha: str | None,
+    *, landing_sha: str | None,
+) -> bool:
+    """Return True iff *branch_tip_sha* is among the commits a landing brought onto main.
+
+    The landing is *landing_sha*, else *branch*'s own ``Merge <branch> into
+    main`` marker; the tip lies in ``landing^1..landing`` of one of them, so
+    the branch carries landed work whatever its tip subject says.  Any git
+    error answers False.
+    """
+    if await _landing_introduces_tip(git_ops, landing_sha, branch_tip_sha):
+        return True
+    marker = await git_ops.find_merge_marker(branch, gate_on_existing_ref=False)
+    if marker is None or marker == landing_sha:
+        return False
+    return await _landing_introduces_tip(git_ops, marker, branch_tip_sha)
 
 
 @dataclass(frozen=True)
