@@ -867,7 +867,9 @@ def build_kind_registry_drift(
         for entry in entries
         if not _is_registered(entry.get('value'), registry)
     ]
-    measured_str = {entry.get('value') for entry in entries if isinstance(entry.get('value'), str)}
+    measured_str = {
+        value for value in (entry.get('value') for entry in entries) if isinstance(value, str)
+    }
     absent = sorted(registry - measured_str)
     return {
         'registry_total': len(registry),
