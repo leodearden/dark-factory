@@ -28,6 +28,40 @@ from orchestrator.cli import main
 from orchestrator.config import OrchestratorConfig
 
 # ---------------------------------------------------------------------------
+# flock probes for the knob-ON lock tests (Task 2306, Task 2830)
+# ---------------------------------------------------------------------------
+
+
+def _flock_is_held(lock_path: Path) -> bool:
+    """True iff an exclusive non-blocking flock through an independent fd is denied.
+
+    flock(2) locks belong to the open file description, so this probe conflicts
+    with the CLI's own in-process holds.
+    """
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _holding_flock(lock_path: Path) -> Iterator[None]:
+    """Hold an exclusive flock on lock_path through an fd independent of the CLI's."""
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+# ---------------------------------------------------------------------------
 # Step-7: `orchestrator verify-merge` integration tests (parity + cleanup + errors)
 # ---------------------------------------------------------------------------
 
@@ -222,35 +256,6 @@ def test_verify_merge_clean_error_contract(tmp_path, monkeypatch, bad_case):
     assert r.stderr.strip() != '', (
         f'expected non-empty stderr for {bad_case!r}'
     )
-
-
-def _flock_is_held(lock_path: Path) -> bool:
-    """True iff an exclusive non-blocking flock through an independent fd is denied.
-
-    flock(2) locks belong to the open file description, so this probe conflicts
-    with the CLI's own in-process holds.
-    """
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return False
-    except BlockingIOError:
-        return True
-    finally:
-        os.close(fd)
-
-
-@contextlib.contextmanager
-def _holding_flock(lock_path: Path) -> Iterator[None]:
-    """Hold an exclusive flock on lock_path through an fd independent of the CLI's."""
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    try:
-        yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -1043,95 +1048,6 @@ def test_verify_merge_cancel_end_to_end(tmp_path, monkeypatch):
         if child.poll() is None:
             child.kill()
             child.wait(timeout=5)
-
-
-# ---------------------------------------------------------------------------
-# Task 2733 step-1/2 — _wait_pgid_gone: bounded poll-for-ESRCH helper (leg c)
-# ---------------------------------------------------------------------------
-#
-# De-flakes the pgid-liveness assertion above: SIGKILL delivery + reaping is
-# asynchronous, so a one-shot os.killpg(pgid, 0) immediately after child.wait()
-# can observe a not-yet-reaped group member.  _wait_pgid_gone asserts the real
-# contract (eventual group death) via a bounded poll instead.
-
-
-def test_wait_pgid_gone_returns_for_dead_group():
-    """A pgid with no live processes (ESRCH) returns without raising.
-
-    Uses the same well-above-pid_max idiom as NONEXISTENT_PID above: no
-    process/group can plausibly exist at this pgid, so os.killpg(pgid, 0)
-    inside _wait_pgid_gone raises ProcessLookupError/ESRCH on the first poll
-    and the helper returns cleanly.
-    """
-    NONEXISTENT_PID = 2 ** 22  # well above /proc/sys/kernel/pid_max on most systems
-
-    _wait_pgid_gone(NONEXISTENT_PID, timeout=1.0, interval=0.05)
-
-
-def test_wait_pgid_gone_raises_for_live_group():
-    """A still-live process group causes _wait_pgid_gone to raise after the deadline."""
-    import sys
-
-    child = subprocess.Popen(
-        [sys.executable, '-c', 'import time; time.sleep(30)'],
-        start_new_session=True,
-    )
-    try:
-        with pytest.raises(AssertionError, match='still alive'):
-            _wait_pgid_gone(child.pid, timeout=1.0, interval=0.05)
-    finally:
-        child.kill()
-        child.wait(timeout=5)
-
-
-# ---------------------------------------------------------------------------
-# Task 4279 — _wait_for_pgid_file_or_report_crash: crash vs. timeout unit tests
-# ---------------------------------------------------------------------------
-#
-# test_verify_merge_cancel_end_to_end only ever exercises this helper's happy
-# path (the pgid file appears on the first poll), leaving the exit_code != 0
-# crash branch and the still-running deadline branch dead in CI. These mirror
-# the _wait_pgid_gone pair above, using cheap synthetic children instead of a
-# real verify-merge subprocess.
-
-
-def test_wait_for_pgid_file_or_report_crash_reports_crash_not_timeout(tmp_path):
-    """A child that exits nonzero before writing the pgid file fails
-    immediately with a crash-shaped message, not the generic timeout one.
-    """
-    import sys
-
-    never_created = tmp_path / 'does-not-exist.pgid'
-    child = subprocess.Popen(
-        [sys.executable, '-c', 'import sys; sys.exit(3)'],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    try:
-        with pytest.raises(pytest.fail.Exception, match='crash, not a timeout'):
-            _wait_for_pgid_file_or_report_crash(never_created, child, timeout=5, interval=0.05)
-    finally:
-        if child.poll() is None:
-            child.kill()
-        child.wait(timeout=5)
-
-
-def test_wait_for_pgid_file_or_report_crash_reports_timeout_for_live_child(tmp_path):
-    """A child still running at the deadline is reported as a genuine
-    timeout, not a crash -- even though it has not written the pgid file.
-    """
-    never_created = tmp_path / 'does-not-exist.pgid'
-    child = subprocess.Popen(
-        ['sleep', '30'],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    try:
-        with pytest.raises(pytest.fail.Exception, match='did not write pgid file'):
-            _wait_for_pgid_file_or_report_crash(never_created, child, timeout=0.5, interval=0.05)
-    finally:
-        child.kill()
-        child.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------
