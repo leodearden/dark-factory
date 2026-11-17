@@ -6,8 +6,9 @@ above the transport.  Only a server that is genuinely slow to answer exercises
 that seam.  Built on stdlib ``http.server`` for the reason
 ``_mock_openai_server.py`` gives: no HTTP-mock library is installed.
 
-Collection meta-ops (create) run one after another under a single lock, as a
-real Qdrant runs them.  The latency of a create, of a payload-index create
+Collection meta-ops (create and delete) run one after another under a single
+lock, as a real Qdrant runs them.  The latency of a create, of a delete
+(``DELETE /collections/{name}``), of a payload-index create
 (``PUT /collections/{name}/index``), of a point upsert
 (``PUT /collections/{name}/points``) and of a point retrieve
 (``POST /collections/{name}/points``) is set per collection; the latency of a
@@ -62,6 +63,7 @@ class StubQdrantServer:
         self,
         *,
         create_delay_s: Mapping[str, float],
+        delete_delay_s: Mapping[str, float],
         index_delay_s: Mapping[str, float],
         upsert_delay_s: Mapping[str, float],
         retrieve_delay_s: Mapping[str, float],
@@ -74,6 +76,7 @@ class StubQdrantServer:
         self.release_event = threading.Event()
         """Set it to finish every pending and future delayed request without its delay."""
         self._create_delay_s = dict(create_delay_s)
+        self._delete_delay_s = dict(delete_delay_s)
         self._index_delay_s = dict(index_delay_s)
         self._upsert_delay_s = dict(upsert_delay_s)
         self._retrieve_delay_s = dict(retrieve_delay_s)
@@ -83,6 +86,7 @@ class StubQdrantServer:
         self._state_lock = threading.Lock()
         self._meta_op_lock = threading.Lock()
         self._create_requests: Counter[str] = Counter()
+        self._delete_requests: Counter[str] = Counter()
         self._exists_requests: Counter[str] = Counter()
         self._upsert_requests: Counter[str] = Counter()
         self._create_bodies: dict[str, list[dict[str, Any]]] = {}
@@ -98,6 +102,11 @@ class StubQdrantServer:
         """How many ``PUT /collections/{name}`` requests the server has received."""
         with self._state_lock:
             return self._create_requests[name]
+
+    def deletes(self, name: str) -> int:
+        """How many ``DELETE /collections/{name}`` requests the server has received."""
+        with self._state_lock:
+            return self._delete_requests[name]
 
     def create_bodies(self, name: str) -> list[dict[str, Any]]:
         """The parsed JSON body of every ``PUT /collections/{name}``, in arrival order."""
@@ -193,6 +202,15 @@ class StubQdrantServer:
             self._created_event(name).set()
             return 200, _ok(True)
 
+    def _delete(self, name: str) -> tuple[int, dict[str, Any]]:
+        with self._state_lock:
+            self._delete_requests[name] += 1
+        with self._meta_op_lock:
+            self.release_event.wait(self._delete_delay_s.get(name, 0.0))
+            existed = self._exists(name)
+            self._created_event(name).clear()
+            return 200, _ok(existed)
+
     def _create_index(self, name: str) -> tuple[int, dict[str, Any]]:
         with self._state_lock:
             self._index_creates_in_flight[name] += 1
@@ -226,6 +244,8 @@ class StubQdrantServer:
                 return self._check_exists(name)
             case 'PUT', ['collections', name]:
                 return self._create(name, body)
+            case 'DELETE', ['collections', name]:
+                return self._delete(name)
             case 'PUT', ['collections', name, 'index']:
                 return self._create_index(name)
             case 'PUT', ['collections', name, 'points']:
@@ -263,7 +283,7 @@ def _make_handler(state: StubQdrantServer) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(payload)
 
-        do_GET = do_PUT = do_POST = _serve
+        do_GET = do_PUT = do_POST = do_DELETE = _serve
 
     return Handler
 
@@ -283,6 +303,7 @@ def stub_qdrant_server(
     *,
     host: str = '127.0.0.1',
     create_delay_s: Mapping[str, float] | None = None,
+    delete_delay_s: Mapping[str, float] | None = None,
     index_delay_s: Mapping[str, float] | None = None,
     upsert_delay_s: Mapping[str, float] | None = None,
     retrieve_delay_s: Mapping[str, float] | None = None,
@@ -293,10 +314,11 @@ def stub_qdrant_server(
 ) -> Iterator[StubQdrantServer]:
     """Serve the stub on an ephemeral port of loopback address *host*.
 
-    *create_delay_s* is how long a create of each named collection takes, and
-    *index_delay_s*, *upsert_delay_s* and *retrieve_delay_s* how long a
-    payload-index create on, a point upsert into, or a point retrieve from, it
-    takes; a retrieve always answers no points.
+    *create_delay_s* is how long a create of each named collection takes,
+    *delete_delay_s* how long a delete of it takes, and *index_delay_s*,
+    *upsert_delay_s* and *retrieve_delay_s* how long a payload-index create on,
+    a point upsert into, or a point retrieve from, it takes; a retrieve always
+    answers no points.
     *list_collections_delay_s* is how long every ``GET /collections`` takes.
     *preexisting* collections exist from the start.  A create of a collection
     in *conflict_on_create* answers 409 AND leaves it created, as when another
@@ -306,6 +328,7 @@ def stub_qdrant_server(
     """
     state = StubQdrantServer(
         create_delay_s=create_delay_s or {},
+        delete_delay_s=delete_delay_s or {},
         index_delay_s=index_delay_s or {},
         upsert_delay_s=upsert_delay_s or {},
         retrieve_delay_s=retrieve_delay_s or {},

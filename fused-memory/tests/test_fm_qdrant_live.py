@@ -225,6 +225,47 @@ class TestEnsureFreshCollectionOutlastsAnAbandonedCreate:
         assert client.collection_exists.call_count == 1
 
 
+class TestEnsureFreshCollectionOutlastsAnAbandonedDelete:
+    """A delete the client stops waiting for is judged by whether the collection disappears.
+
+    The same real-socket setup as the abandoned-create cases; the stub runs a
+    delete under the same meta-op lock as a create, as Qdrant serialises them.
+    """
+
+    def test_a_delete_finished_after_the_read_timeout_is_accepted_without_reissuing_it(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from _stub_qdrant_server import stub_qdrant_server
+        from qdrant_client import QdrantClient
+
+        with stub_qdrant_server(preexisting=['c'], delete_delay_s={'c': 2.5}) as server:
+            client = QdrantClient(url=server.url, timeout=1)
+            try:
+                ensure_fresh_collection(client, 'c', size=8)
+            finally:
+                client.close()
+
+            assert server.deletes('c') == 1
+            assert server.creates('c') == 1
+            assert server.wait_created('c', 0) is True
+
+    def test_a_delete_that_never_lands_fails_naming_the_collection_and_the_delete(self):
+        from _fm_qdrant_live import ensure_fresh_collection
+        from _stub_qdrant_server import stub_qdrant_server
+        from qdrant_client import QdrantClient
+
+        with stub_qdrant_server(preexisting=['c'], delete_delay_s={'c': 3600}) as server:
+            client = QdrantClient(url=server.url, timeout=1)
+            try:
+                with pytest.raises(AssertionError) as excinfo:
+                    ensure_fresh_collection(client, 'c', size=8, settle_timeout=0.5)
+            finally:
+                client.close()
+
+            assert "'c'" in str(excinfo.value)
+            assert 'delete' in str(excinfo.value)
+            assert server.deletes('c') == 1
+
+
 # ---------------------------------------------------------------------------
 # Tests for the shared collection_vector_size() helper (task 2773, item 4)
 # ---------------------------------------------------------------------------
