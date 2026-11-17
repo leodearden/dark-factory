@@ -29,6 +29,8 @@ ROWS = [
     ('scan_provenance_note_log_leaks', NO_DB_RESOLVED_MESSAGE),
     ('audit_wiped_metadata_files', NO_PROJECT_ROOT_RESOLVED_MESSAGE),
     ('audit_combine_gate_marker_loss', NO_PROJECT_ROOT_RESOLVED_MESSAGE),
+    ('census_tagger_debris', NO_PROJECT_ROOT_RESOLVED_MESSAGE),
+    ('repair_wiped_metadata_files', NO_PROJECT_ROOT_RESOLVED_MESSAGE),
 ]
 
 
