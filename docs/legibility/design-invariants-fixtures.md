@@ -17,7 +17,10 @@ task/escalation state-graph invariants; INV-8 fixtures were added
 added 2026-08-30 with the guards-exercise-behaviour invariant (task 4666);
 INV-11 fixtures were added with the promotion of `no-silent-fail-soft`;
 INV-12 fixtures were added 2026-09-18 with the exceptions-owned-or-ratified
-invariant (task 5599; `plans/inv12-exceptions-owned-or-ratified-prd.md`).
+invariant (task 5599; `plans/inv12-exceptions-owned-or-ratified-prd.md`);
+INV-13 fixtures were added 2026-09-25 with the readers-prove-their-producer
+invariant; INV-14 fixtures were added 2026-10-12 with the
+sampler-vocabulary-one-table invariant (task 6773).
 
 **Two fixture shapes.** Each invariant below carries exactly two seeded
 violations — both expressions of the SAME underlying violation, so the two
