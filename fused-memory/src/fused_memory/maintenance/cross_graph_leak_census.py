@@ -10,6 +10,8 @@ manifest and the remedy are ``scripts/migrate_cross_graph_leak.py``'s dry run.
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from fused_memory.backends.graph_access import GraphAccess, GraphHandle, OpBoundReader
@@ -19,6 +21,7 @@ from fused_memory.backends.paged_read import (
     INCOMPLETE_SHORT_READ,
     census_count,
 )
+from fused_memory.maintenance.graph_sweep import GraphFailure, read_each_graph
 
 logger = logging.getLogger(__name__)
 
@@ -84,10 +87,43 @@ class GraphLeaks:
     complete: bool
 
 
+@dataclass(frozen=True)
+class LabelTotal:
+    """One label's leaked nodes summed over the graphs read, unknown counts adding nothing."""
+
+    label: str
+    leaked: int
+
+
+@dataclass(frozen=True)
+class LeakSweep:
+    """What a sweep over one or more graphs found.
+
+    ``totals`` and ``complete`` summarise ``graphs`` and ``failures``. They are
+    stored rather than derived on access so that ``--json`` emits them
+    (``dataclasses.asdict`` sees fields, not properties), and they cannot drift
+    from what they summarise because :meth:`CrossGraphLeakCensus.sweep` is this
+    type's only constructor.
+
+    ``complete`` is the flag to read before trusting ``totals``: it is False if
+    ANY graph's count was not whole OR any graph could not be read at all.
+    """
+
+    graphs: tuple[GraphLeaks, ...]
+    failures: tuple[GraphFailure, ...]
+    totals: tuple[LabelTotal, ...]
+    complete: bool
+    elapsed_ms: float
+
+
 def _describe_breakdown(groups: tuple[ForeignGroup, ...]) -> str:
     return ', '.join(
         f'{"<none>" if g.node_group_id is None else g.node_group_id}={g.nodes}' for g in groups
     ) or '(empty breakdown)'
+
+
+def _describe_totals(totals: tuple[LabelTotal, ...]) -> str:
+    return ' '.join(f'{total.label}={total.leaked}' for total in totals)
 
 
 def _incompleteness(leaked: int | None, breakdown_sum: int) -> str | None:
@@ -173,4 +209,40 @@ class CrossGraphLeakCensus:
             by_group_id=groups,
             complete=kind is None,
             incomplete_kind=kind,
+        )
+
+    async def sweep(self, graph_keys: Sequence[str]) -> LeakSweep:
+        """Count every graph in *graph_keys*, in order; one unreadable graph costs only itself.
+
+        Returns:
+            A :class:`LeakSweep`. Read its ``complete`` flag before trusting
+            ``totals``.
+        """
+        start = time.monotonic()
+        graphs, failures = await read_each_graph(
+            graph_keys, self.run, what='cross-graph leak census',
+        )
+        elapsed_ms = (time.monotonic() - start) * 1000
+        totals = tuple(
+            LabelTotal(
+                label=label,
+                leaked=sum(
+                    leak.leaked or 0
+                    for graph in graphs for leak in graph.labels if leak.label == label
+                ),
+            )
+            for label in LEAK_LABELS
+        )
+        complete = not failures and all(graph.complete for graph in graphs)
+        logger.info(
+            'cross-graph leak census complete: graphs_read=%d graphs_failed=%d %s '
+            'complete=%s elapsed_ms=%.1f',
+            len(graphs), len(failures), _describe_totals(totals), complete, elapsed_ms,
+        )
+        return LeakSweep(
+            graphs=graphs,
+            failures=failures,
+            totals=totals,
+            complete=complete,
+            elapsed_ms=elapsed_ms,
         )
