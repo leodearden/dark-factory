@@ -26,11 +26,14 @@ from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.memory_metadata import SUPERSEDED_BY_METADATA_KEY
 from fused_memory.reconciliation.consolidation_auto import (
     CORRECTION_METADATA_KEYS,
+    REASON_CODE_CLASSES,
     UNREADABLE,
     AutoOutcome,
     AutoProposal,
     AutoReasonCode,
     AutoVerdict,
+    FlowReasonCode,
+    ReasonCodeClass,
     build_auto_canonical,
     evaluate_auto_predicate,
 )
@@ -1648,3 +1651,75 @@ class TestEveryReasonCodeIsExercised:
         verdict = REASON_CODE_FIXTURES[code]()
 
         assert code in _codes(verdict), verdict
+
+
+class TestReasonCodeClasses:
+    """Who decides each reason code: PRD ``plans/consolidation-adjudicator-prd.md`` K1.
+
+    ``REASON_CODE_CLASSES`` is the one home of the partition, and these tests pin
+    it to K1's table. The flow codes are the reasons the rules AROUND the
+    predicate give, so they are a separate vocabulary that shares the ledger
+    row's flat ``reason_codes`` tuple with the predicate's codes.
+    """
+
+    def test_every_reason_code_is_classified(self):
+        assert set(REASON_CODE_CLASSES) == set(AutoReasonCode)
+
+    def test_the_partition_is_k1s_table(self):
+        k1 = {
+            ReasonCodeClass.NO_OP: (
+                AutoReasonCode.already_gated,
+                AutoReasonCode.already_consolidated,
+                AutoReasonCode.incumbent_canonical_stripped,
+            ),
+            ReasonCodeClass.REPAIR: (
+                AutoReasonCode.member_not_found,
+                AutoReasonCode.member_different_topic,
+                AutoReasonCode.member_already_canonical,
+                AutoReasonCode.proposal_category_mismatch,
+            ),
+            ReasonCodeClass.RETRY: (
+                AutoReasonCode.member_unreadable,
+                AutoReasonCode.canonical_count_unavailable,
+            ),
+            ReasonCodeClass.REFUSE: (
+                AutoReasonCode.member_id_repeated,
+                AutoReasonCode.no_retained_members,
+                AutoReasonCode.mixed_category,
+                AutoReasonCode.canonical_category_mismatch,
+                AutoReasonCode.multiple_canonicals,
+                AutoReasonCode.canonical_count_contradicted,
+                AutoReasonCode.member_carries_correction_metadata,
+                AutoReasonCode.canonical_carries_correction,
+                AutoReasonCode.slug_near_collision,
+            ),
+            ReasonCodeClass.ADJUDICATOR: (
+                AutoReasonCode.member_carries_correction_banner,
+            ),
+        }
+        expected = {code: cls for cls, codes in k1.items() for code in codes}
+
+        assert dict(REASON_CODE_CLASSES) == expected
+
+    def test_the_classes_are_k1s_five(self):
+        assert {cls.value for cls in ReasonCodeClass} == {
+            'no_op', 'repair', 'retry', 'refuse', 'adjudicator',
+        }
+
+    def test_flow_codes_are_k1_and_k4s(self):
+        """The report and check scripts read these values back off ledger rows."""
+        assert {code.value for code in FlowReasonCode} == {
+            'too_few_members_after_repair',
+            'too_many_members_to_adjudicate',
+            'too_few_kept',
+            'closure_failed_previously',
+            'unreadable',
+            'adjudicator_failed',
+        }
+
+    def test_flow_codes_never_collide_with_a_predicate_code(self):
+        """Both land in ``ProposalOutcome.reason_codes``, one flat string tuple."""
+        flow = {code.value for code in FlowReasonCode}
+        predicate = {code.value for code in AutoReasonCode}
+
+        assert flow.isdisjoint(predicate)
