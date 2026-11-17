@@ -66,9 +66,9 @@ from fused_memory.reconciliation.escalation_archive import (
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.finding_task_escalation import (
     FINDING_TASK_ESCALATION_CATEGORY,
-    LIVENESS_UNKNOWN_DETAIL_KEY,
     build_finding_task_escalation_kwargs,
     is_routable_task_id,
+    liveness_unknown_detail,
     recent_conversion_suppresses_refile,
     resolve_finding_task_target,
     routed_record_carries_finding,
@@ -2880,7 +2880,7 @@ class ReconciliationHarness:
                     run_id=run_id,
                     persistence=persistence,
                     finding_fingerprint=fingerprint,
-                    liveness_unknown_task_ids=[task_id] if liveness_unknown else (),
+                    target_liveness_unknown=liveness_unknown,
                 ),
             )
             esc_id: str = queue.submit(esc)
@@ -5880,11 +5880,12 @@ class ReconciliationHarness:
                                 },
                             )
                         else:
-                            escalation_detail = {**finding, 'persistence': persistence}
+                            escalation_detail = {
+                                **finding,
+                                'persistence': persistence,
+                                **liveness_unknown_detail(liveness_unknown),
+                            }
                             if liveness_unknown:
-                                escalation_detail[LIVENESS_UNKNOWN_DETAIL_KEY] = sorted(
-                                    liveness_unknown
-                                )
                                 logger.warning(
                                     'reconciliation.integrity_escalation_liveness_unknown',
                                     extra={

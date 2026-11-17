@@ -42,7 +42,8 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
@@ -56,6 +57,7 @@ __all__ = [
     'TerminalRoutedRecordView',
     'build_finding_task_escalation_kwargs',
     'is_routable_task_id',
+    'liveness_unknown_detail',
     'recent_conversion_suppresses_refile',
     'resolve_finding_task_target',
     'routed_record_carries_finding',
@@ -194,6 +196,15 @@ _FINDING_FINGERPRINT_KEY = 'finding_fingerprint'
 #: record was filed because no id was confirmed live, not because each was
 #: confirmed not live (task 5370).
 LIVENESS_UNKNOWN_DETAIL_KEY = 'liveness_unknown_task_ids'
+
+
+def liveness_unknown_detail(task_ids: AbstractSet[str]) -> dict[str, list[str]]:
+    """The detail entries recording *task_ids* as liveness-unknown.
+
+    *task_ids* sorted under ``LIVENESS_UNKNOWN_DETAIL_KEY``, or no entry at all
+    when it is empty, so a record whose probes all ran carries no such key.
+    """
+    return {LIVENESS_UNKNOWN_DETAIL_KEY: sorted(task_ids)} if task_ids else {}
 
 _ROUTABLE_TASK_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
 
@@ -342,7 +353,7 @@ def build_finding_task_escalation_kwargs(
     run_id: str,
     persistence: int,
     finding_fingerprint: str,
-    liveness_unknown_task_ids: Sequence[str] = (),
+    target_liveness_unknown: bool = False,
 ) -> dict[str, Any]:
     """Build the ``Escalation(...)`` keyword arguments for *finding*.
 
@@ -378,8 +389,9 @@ def build_finding_task_escalation_kwargs(
       exists to decide.  The finding's OWN ``suggested_action`` text is carried
       in ``detail``.
 
-    A non-empty *liveness_unknown_task_ids* is listed, sorted, in ``detail``
-    under ``LIVENESS_UNKNOWN_DETAIL_KEY``; an empty one leaves the key absent.
+    *target_liveness_unknown* records that *task_id*'s liveness probe failed:
+    ``detail`` then lists it per :func:`liveness_unknown_detail`.  A routed
+    record is about its one target, so no other id can be marked.
 
     Pure: no I/O, and *finding* is not mutated.
     """
@@ -403,9 +415,8 @@ def build_finding_task_escalation_kwargs(
         'project_id': project_id,
         'persistence': persistence,
         _FINDING_FINGERPRINT_KEY: finding_fingerprint,
+        **liveness_unknown_detail({task_id} if target_liveness_unknown else frozenset()),
     }
-    if liveness_unknown_task_ids:
-        detail_dict[LIVENESS_UNKNOWN_DETAIL_KEY] = sorted(liveness_unknown_task_ids)
     detail = json.dumps(detail_dict, default=str, indent=2)
 
     return {
