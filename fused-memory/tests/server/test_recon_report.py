@@ -3299,7 +3299,7 @@ class TestReconReportFlagTypeInheritance:
 
 # ---------------------------------------------------------------------------
 # task-2410 step-1: Overlength description/suggested_action truncation —
-# RED until step-2 adds _MAX_FINDING_TEXT_CHARS / _TRUNCATION_MARKER and
+# RED until step-2 adds MAX_FINDING_TEXT_CHARS / TRUNCATION_MARKER and
 # wires truncate+warn into ReconReportState.add_finding.
 # ---------------------------------------------------------------------------
 
@@ -3319,14 +3319,14 @@ class TestReconReportOverlengthTruncation:
 
     def test_overlength_description_is_truncated_with_warning(self):
         from fused_memory.server.recon_report import (
-            _MAX_FINDING_TEXT_CHARS,
-            _TRUNCATION_MARKER,
+            MAX_FINDING_TEXT_CHARS,
+            TRUNCATION_MARKER,
         )
 
         state, _ = self._make_state()
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
 
-        overlength = 'x' * (_MAX_FINDING_TEXT_CHARS + 500)
+        overlength = 'x' * (MAX_FINDING_TEXT_CHARS + 500)
         result = state.add_finding(
             run_id='r1',
             severity='minor',
@@ -3342,19 +3342,19 @@ class TestReconReportOverlengthTruncation:
         report = state.get_assembled_report('r1', 's1')
         assert report is not None
         item = report['flagged_items'][0]
-        assert item['description'] == 'x' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
+        assert item['description'] == 'x' * MAX_FINDING_TEXT_CHARS + TRUNCATION_MARKER
         assert item['suggested_action'] == 'a'
 
     def test_overlength_suggested_action_is_truncated_with_warning(self):
         from fused_memory.server.recon_report import (
-            _MAX_FINDING_TEXT_CHARS,
-            _TRUNCATION_MARKER,
+            MAX_FINDING_TEXT_CHARS,
+            TRUNCATION_MARKER,
         )
 
         state, _ = self._make_state()
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
 
-        overlength = 'y' * (_MAX_FINDING_TEXT_CHARS + 500)
+        overlength = 'y' * (MAX_FINDING_TEXT_CHARS + 500)
         result = state.add_finding(
             run_id='r1',
             severity='minor',
@@ -3370,7 +3370,7 @@ class TestReconReportOverlengthTruncation:
         report = state.get_assembled_report('r1', 's1')
         assert report is not None
         item = report['flagged_items'][0]
-        assert item['suggested_action'] == 'y' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
+        assert item['suggested_action'] == 'y' * MAX_FINDING_TEXT_CHARS + TRUNCATION_MARKER
         assert item['description'] == 'd'
 
     def test_overlength_category_is_truncated_with_warning(self):
@@ -3380,14 +3380,14 @@ class TestReconReportOverlengthTruncation:
         description/suggested_action.
         """
         from fused_memory.server.recon_report import (
-            _MAX_FINDING_TEXT_CHARS,
-            _TRUNCATION_MARKER,
+            MAX_FINDING_TEXT_CHARS,
+            TRUNCATION_MARKER,
         )
 
         state, _ = self._make_state()
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
 
-        overlength = 'z' * (_MAX_FINDING_TEXT_CHARS + 500)
+        overlength = 'z' * (MAX_FINDING_TEXT_CHARS + 500)
         result = state.add_finding(
             run_id='r1',
             severity='minor',
@@ -3403,7 +3403,7 @@ class TestReconReportOverlengthTruncation:
         report = state.get_assembled_report('r1', 's1')
         assert report is not None
         item = report['flagged_items'][0]
-        assert item['category'] == 'z' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
+        assert item['category'] == 'z' * MAX_FINDING_TEXT_CHARS + TRUNCATION_MARKER
         assert item['description'] == 'd'
         assert item['suggested_action'] == 'a'
 
@@ -3428,12 +3428,12 @@ class TestReconReportOverlengthTruncation:
         assert item['suggested_action'] == 'a'
 
     def test_text_exactly_at_the_cap_is_stored_whole_without_warnings(self):
-        from fused_memory.server.recon_report import _MAX_FINDING_TEXT_CHARS
+        from fused_memory.server.recon_report import MAX_FINDING_TEXT_CHARS
 
         state, _ = self._make_state()
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
 
-        at_cap = 'x' * _MAX_FINDING_TEXT_CHARS
+        at_cap = 'x' * MAX_FINDING_TEXT_CHARS
         result = state.add_finding(
             run_id='r1',
             severity='minor',
@@ -3453,8 +3453,8 @@ class TestReconReportOverlengthTruncation:
 
     def test_text_one_char_over_the_cap_is_cut_to_the_cap_and_marked(self):
         from fused_memory.server.recon_report import (
-            _MAX_FINDING_TEXT_CHARS,
-            _TRUNCATION_MARKER,
+            MAX_FINDING_TEXT_CHARS,
+            TRUNCATION_MARKER,
         )
 
         state, _ = self._make_state()
@@ -3464,30 +3464,30 @@ class TestReconReportOverlengthTruncation:
             run_id='r1',
             severity='minor',
             category='c',
-            description='x' * (_MAX_FINDING_TEXT_CHARS + 1),
+            description='x' * (MAX_FINDING_TEXT_CHARS + 1),
             suggested_action='a',
         )
         assert 'finding_id' in result, f'add_finding failed: {result}'
-        assert result['warnings'] == [f'description truncated to {_MAX_FINDING_TEXT_CHARS} chars']
+        assert result['warnings'] == [f'description truncated to {MAX_FINDING_TEXT_CHARS} chars']
 
         report = state.get_assembled_report('r1', 's1')
         assert report is not None
         item = report['flagged_items'][0]
-        assert item['description'] == 'x' * _MAX_FINDING_TEXT_CHARS + _TRUNCATION_MARKER
+        assert item['description'] == 'x' * MAX_FINDING_TEXT_CHARS + TRUNCATION_MARKER
 
     def test_overlength_null_null_findings_dedup_on_truncated_text(self):
         """Two null-null findings whose descriptions are identical for the
-        first _MAX_FINDING_TEXT_CHARS chars but differ only in the
+        first MAX_FINDING_TEXT_CHARS chars but differ only in the
         (truncated-away) tail must collapse to ONE finding — pins the
         add_finding ordering guarantee that dedup hashes the POST-truncation
         string, not the raw input (truncation runs BEFORE dedup hashing).
         """
-        from fused_memory.server.recon_report import _MAX_FINDING_TEXT_CHARS
+        from fused_memory.server.recon_report import MAX_FINDING_TEXT_CHARS
 
         state, _ = self._make_state()
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
 
-        shared_prefix = 'x' * _MAX_FINDING_TEXT_CHARS
+        shared_prefix = 'x' * MAX_FINDING_TEXT_CHARS
         first = state.add_finding(
             run_id='r1',
             severity='minor',
@@ -3523,7 +3523,7 @@ class TestReconReportOverlengthTruncation:
         though no new row is stored, so the truncate+warn contract must not
         go silent on the duplicate short-circuit path.
         """
-        from fused_memory.server.recon_report import _MAX_FINDING_TEXT_CHARS
+        from fused_memory.server.recon_report import MAX_FINDING_TEXT_CHARS
 
         state, _ = self._make_state()
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
@@ -3539,7 +3539,7 @@ class TestReconReportOverlengthTruncation:
         )
         assert 'finding_id' in first, f'first add_finding failed: {first}'
 
-        overlength = 'z' * (_MAX_FINDING_TEXT_CHARS + 500)
+        overlength = 'z' * (MAX_FINDING_TEXT_CHARS + 500)
         dup = state.add_finding(
             run_id='r1',
             severity='minor',
@@ -3559,12 +3559,12 @@ class TestReconReportOverlengthTruncation:
         dedup path: an overlength duplicate must still surface 'warnings'
         even though no new finding is stored.
         """
-        from fused_memory.server.recon_report import _MAX_FINDING_TEXT_CHARS
+        from fused_memory.server.recon_report import MAX_FINDING_TEXT_CHARS
 
         state, _ = self._make_state()
         state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
 
-        shared = 'q' * (_MAX_FINDING_TEXT_CHARS + 500)
+        shared = 'q' * (MAX_FINDING_TEXT_CHARS + 500)
         first = state.add_finding(
             run_id='r1',
             severity='minor',
