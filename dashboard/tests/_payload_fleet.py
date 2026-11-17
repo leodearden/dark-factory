@@ -48,8 +48,10 @@ from _payload_fleet_history import (
 from _payload_fleet_seed import (
     CostShape,
     EscalationShape,
+    MemoryEvalShape,
     seed_account_events,
     seed_invocations,
+    seed_memory_evals,
     seed_merge_events,
     seed_pending_escalations,
     seed_resolved_history,
@@ -182,6 +184,16 @@ class FleetCensus:
     fleet spreads each root's PRD-naming rows across that many PRDs and
     serves about 481,000 bytes; it seeds no blocker or followup links.
 
+    The memory-eval tree was re-measured live on 2026-11-17 (task 10137) from
+    fused-memory/data/memory-evals: six eval dirs, two of them holding no run.
+    e1 has 5 window metrics and a 34-item tripwire over 6 runs; e4 has 4
+    window metrics and a 76-item tripwire over 5 runs; e6 has 44 window
+    metrics over 2 runs; e7 has 1 window metric over 5 runs. Item keys average
+    31 (e1) and 27 (e4) characters, window details 54 to 89, and the newest
+    runs carry 17, 30, 3 and 16 corpus counters. 43 of the 110 items are
+    grandfathered, the rest pass. The fleet seeds these beside the dual
+    escalation tree's own eval, under distinct eval ids.
+
     Re-grow this census, rather than loosening a budget, whenever a budget
     raised for real growth would otherwise trip the sweep's slack rule.
     """
@@ -208,6 +220,8 @@ class FleetCensus:
     recon: ReconShape
     memory_ops: MemoryOpsShape
     quality: QualityShape
+    memory_evals: tuple[MemoryEvalShape, ...]
+    runless_memory_evals: int
 
 
 CENSUS = FleetCensus(
@@ -346,6 +360,25 @@ CENSUS = FleetCensus(
         ('update_edge', 'write'), ('remove_dependency', 'write'),
     )),
     quality=QualityShape(landings=3736, modules=338, snapshot_diff_chars=470_807),
+    memory_evals=(
+        MemoryEvalShape(
+            'e1-retrieval-fleet', window_metrics=5, tripwire_items=34, runs=6,
+            item_key_len=31, detail_len=56, corpus_counts=17,
+        ),
+        MemoryEvalShape(
+            'e4-staleness-fleet', window_metrics=4, tripwire_items=76, runs=5,
+            item_key_len=27, detail_len=89, corpus_counts=30,
+        ),
+        MemoryEvalShape(
+            'e6-corpus-health-fleet', window_metrics=44, tripwire_items=0, runs=2,
+            item_key_len=0, detail_len=80, corpus_counts=3,
+        ),
+        MemoryEvalShape(
+            'e7-write-after-miss-fleet', window_metrics=1, tripwire_items=0, runs=5,
+            item_key_len=0, detail_len=54, corpus_counts=16,
+        ),
+    ),
+    runless_memory_evals=2,
 )
 
 TERMINAL_WINDOW_ROOT = 'dark-factory'
@@ -827,6 +860,8 @@ def _seed_ledgers_and_stores(
     A task store holds the root's whole tree. Its first ``claimed_terminal``
     finished tasks still carry a claimant: the violations /invariants lists.
     Only a root whose orchestrator runs bills invocations and account events.
+    The memory-eval tree is the dual escalation tree, then the census's evals
+    seeded beside it, their verdicts appended to its root verdicts artifact.
     """
     stale = (now - timedelta(hours=6)).isoformat()
     paths = [config.project_root, *config.known_project_roots]
@@ -852,6 +887,9 @@ def _seed_ledgers_and_stores(
     curator_pairs = [('opus', role) for role in fleet.costs.curator_roles]
     seed_invocations(config.curator_events_db, 'dark_factory', fleet.costs, curator_pairs, 0, now=now)
     build_dual_escalation_tree(config.project_root)
+    seed_memory_evals(
+        config.memory_evals_dir, fleet.memory_evals, runless_evals=fleet.runless_memory_evals, now=now,
+    )
 
 
 def _seed_histories(
