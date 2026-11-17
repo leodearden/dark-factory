@@ -203,6 +203,19 @@ def read_session_id(entry: Path) -> int | None:
         return None
 
 
+def parse_start_ticks(path: Path, text: str) -> int:
+    """Start time (stat field 22, clock ticks after boot) of *text*, read from *path*.
+
+    Raises MalformedStatLine unless the field is a non-negative decimal integer.
+    """
+    _comm, fields = _stat_tail(path, text)
+    # stat field 22, counted from the pid; fields[0] is field 3, state.
+    start_ticks = fields[19] if len(fields) > 19 else ''
+    if not start_ticks.isdecimal():
+        raise MalformedStatLine(path, text)
+    return int(start_ticks)
+
+
 def unified_cgroup_path(cgroup_text: str) -> str | None:
     """The cgroup path on the unified (``0::``) line of a ``/proc/<pid>/cgroup`` text.
 
