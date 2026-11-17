@@ -19,6 +19,8 @@ from typing import Any, NamedTuple, Self
 
 import aiosqlite
 
+from shared.sqlite_durability import DURABILITY_TRIAD, require_wal_journal_mode
+
 __all__ = [
     'apply_wal_pragmas',
     'apply_full_durability_pragmas',
@@ -59,9 +61,7 @@ async def apply_wal_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int)
     """
     async with conn.execute('PRAGMA journal_mode=WAL') as cur:
         row = await cur.fetchone()
-    if row is None or row[0] != 'wal':
-        got = row[0] if row is not None else None
-        raise RuntimeError(f'Failed to enable WAL journal mode (got {got!r})')
+    require_wal_journal_mode(row)
     if busy_timeout_ms != 0:
         await conn.execute(f'PRAGMA busy_timeout={busy_timeout_ms}')
 
@@ -71,19 +71,8 @@ async def apply_full_durability_pragmas(
 ) -> None:
     """Configure WAL mode, busy_timeout, and the Phase 3 durability triad.
 
-    Delegates to ``apply_wal_pragmas`` for WAL + busy_timeout, then sets the
-    three additional PRAGMAs that harden crash durability across all
-    fused-memory SQLite stores:
-
-    - ``synchronous=FULL`` (2): fsync per-commit; eliminates corruption on
-      unexpected shutdown without relying on WAL-checkpoint timing.
-    - ``wal_autocheckpoint=100``: auto-checkpoint after every 100 WAL pages to
-      bound WAL growth under normal load.
-    - ``journal_size_limit=67108864`` (64 MiB): caps the WAL file size to
-      prevent unbounded disk use during high-write bursts.
-
-    See ``docs/task-recovery-2026-05-13/`` for the production incident that
-    drove this convention across all fused-memory SQLite stores.
+    Delegates to ``apply_wal_pragmas`` for WAL + busy_timeout, then applies
+    ``shared/src/shared/sqlite_durability.py::DURABILITY_TRIAD``.
 
     Args:
         conn: An open aiosqlite connection.
@@ -91,13 +80,8 @@ async def apply_full_durability_pragmas(
             Pass 0 to skip setting the busy_timeout pragma entirely.
     """
     await apply_wal_pragmas(conn, busy_timeout_ms=busy_timeout_ms)
-    # synchronous=FULL: per-commit fsync. Cost is ~1-5ms/commit; the
-    # win is crash durability without relying on WAL checkpoints. See
-    # docs/task-recovery-2026-05-13/ for the prod incident that drove
-    # this change across all fused-memory SQLite stores.
-    await conn.execute('PRAGMA synchronous=FULL')
-    await conn.execute('PRAGMA wal_autocheckpoint=100')
-    await conn.execute('PRAGMA journal_size_limit=67108864')
+    for pragma in DURABILITY_TRIAD:
+        await conn.execute(pragma.statement)
 
 
 async def connect_daemon(database: str | Path, **kwargs) -> aiosqlite.Connection:
@@ -355,12 +339,11 @@ class AsyncSqliteBase(abc.ABC):
             ...
 
     **Durability**: ``open()`` calls :func:`apply_full_durability_pragmas` on
-    every subclass, applying the Phase 3 triad (``synchronous=FULL``,
-    ``wal_autocheckpoint=100``, ``journal_size_limit=64 MiB``) — see
-    ``docs/task-recovery-2026-05-13/`` for the production incident that
-    mandated this convention.  A future subclass that needs WAL-only semantics
-    (e.g. an ephemeral or test store) must override ``open()`` and bypass
-    ``apply_full_durability_pragmas``; no class-level opt-out toggle exists.
+    every subclass, applying
+    ``shared/src/shared/sqlite_durability.py::DURABILITY_TRIAD``.  A future
+    subclass that needs WAL-only semantics (e.g. an ephemeral or test store)
+    must override ``open()`` and bypass ``apply_full_durability_pragmas``; no
+    class-level opt-out toggle exists.
     """
 
     def __init__(self, db_path: Path, *, busy_timeout_ms: int = 5000) -> None:
