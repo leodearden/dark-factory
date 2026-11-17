@@ -865,6 +865,26 @@ class TestQualifiedRefColonIsUnpadded:
         assert scan.refs == ()
 
     @pytest.mark.parametrize(
+        'known_project_ids',
+        [pytest.param(None, id='permissive'), pytest.param({'dark_factory', 'reify'}, id='registry')],
+    )
+    def test_a_spaced_genuine_ref_no_longer_contests_its_bare_mention_DELIBERATE_trade(
+        self, known_project_ids
+    ):
+        """Unlike a registry-dropped candidate (:class:`TestNarrowingIsStrictlySubtractive`),
+        a grammar-refused one contests nothing. Measured before this rule, the
+        content scanned as ambiguous ['reify:2500', 'Task 2500'], a no-op for
+        every consumer; now the bare mention stands alone in ``.refs``. Accepted
+        because none of the 1,098 spaced matches in the live corpus was a genuine ref."""
+        scan = scan_content(
+            'reify: 2500 blocks task 2500',
+            group_id='dark_factory',
+            known_project_ids=known_project_ids,
+        )
+        assert [r.node_name for r in scan.refs] == ['Task 2500']
+        assert scan.ambiguous == ()
+
+    @pytest.mark.parametrize(
         ('content', 'expected'),
         [
             pytest.param('see reify:132', ['reify:132'], id='tight-foreign'),
