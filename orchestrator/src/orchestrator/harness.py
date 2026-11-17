@@ -206,6 +206,7 @@ from orchestrator.recovery_pins import records_pin_recovery
 from orchestrator.review_checkpoint import ReviewCheckpoint, ReviewReport
 from orchestrator.routing import RoleDefaults
 from orchestrator.routing_dispatch import resolve_and_record_route
+from orchestrator.run_slots import DispatchScope, RunSlots
 from orchestrator.run_store import RunExitReason, RunStore
 from orchestrator.scheduled_deploy_settle import ScheduledDeploySettler
 from orchestrator.scheduler import (
@@ -2967,7 +2968,10 @@ class Harness:
             await self._launch_merge_worker_loop()
 
             # 3. Run workflow slots
-            sem = asyncio.Semaphore(self.config.max_concurrent_tasks)
+            slots = RunSlots(
+                self.config.max_concurrent_tasks,
+                self.config.main_health_fix_reserved_slots,
+            )
 
             while True:
                 # If a review checkpoint is running, don't acquire new tasks —
@@ -2978,13 +2982,20 @@ class Harness:
                     )
                     continue
 
+                # A slot is taken before a task is picked, so no picked task
+                # holds its module locks while waiting for one (task 8480).
+                scope = slots.free_scope()
+                if scope is None:
+                    await self._wait_for_slot_turnover()
+                    continue
+
                 # Check daily cost ceilings before dispatching the next task.
                 # On breach, pause_scheduler() is called and acquire_next()
                 # returns None (task-1322 machinery), draining in-flight work
                 # and exiting the run loop cleanly.  Task 1323.
                 await self._enforce_cost_ceilings()
 
-                assignment = await self.scheduler.acquire_next()
+                assignment = await self.scheduler.acquire_next(scope)
 
                 if assignment is None:
                     if not self._live_tasks:
@@ -3078,16 +3089,16 @@ class Harness:
                         finally:
                             self._idle_poll_sleeping = False
                         continue
-                    # Wait for any live task to complete, then retry.
-                    # Timeout ensures newly-added tasks are discovered
-                    # within 15s even when no running task completes.
-                    await asyncio.wait(
-                        set(self._live_tasks), return_when=asyncio.FIRST_COMPLETED,
-                        timeout=15,
-                    )
+                    await self._wait_for_slot_turnover()
                     continue
 
-                await sem.acquire()
+                sem = await slots.claim(scope, assignment.task)
+                if scope is DispatchScope.MAIN_HEALTH_FIX:
+                    logger.info(
+                        'Task %s dispatched on the main-health-fix reserved run '
+                        'slot: every general run slot is held',
+                        assignment.task_id,
+                    )
                 self._launch_slot(assignment, sem, task_reports)
 
             self._compute_tallies(task_reports)
@@ -14698,6 +14709,17 @@ class Harness:
             causes = {}
             self._workflow_cancel_causes = causes
         return causes
+
+    async def _wait_for_slot_turnover(self) -> None:
+        """Wait for a live slot to end, at most idle_poll_secs, so newly filed work is still seen every poll."""
+        live = set(self._live_tasks)
+        if live:
+            await asyncio.wait(
+                live, return_when=asyncio.FIRST_COMPLETED,
+                timeout=self.config.idle_poll_secs,
+            )
+        else:
+            await asyncio.sleep(self.config.idle_poll_secs)
 
     def _launch_slot(
         self, assignment, sem: asyncio.Semaphore, task_reports: list[TaskReport],
