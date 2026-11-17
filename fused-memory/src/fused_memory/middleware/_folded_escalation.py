@@ -90,8 +90,12 @@ def file_folded_escalation(
         log_label: The caller's grep token, prefixed onto every emitted
             message.
         level: Escalation level; defaults to 1.  Callers file under synthetic
-            anchors that no steward ever claims, so an L0 record only waits
-            for ``HarnessRunner._reap_orphan_l0_escalations`` to promote it.
+            anchors that no steward ever claims, so an L0 record is left to
+            ``orchestrator/src/orchestrator/harness.py::Harness._reap_orphan_l0_escalations``:
+            a non-``'info'`` L0 is promoted to L1 after a delay, and an
+            ``'info'`` L0 goes to the info-L0 router
+            (``orchestrator/src/orchestrator/escalation_router.py::router_owns``),
+            which converts it into a curator task.
         dedupe: Fold into an already-open escalation under *anchor_task_id*
             instead of filing a duplicate.  Pass false when each record holds
             a distinct payload that a fold would discard.
