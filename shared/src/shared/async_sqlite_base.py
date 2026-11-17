@@ -13,7 +13,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Iterable, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple, Self
 
@@ -46,8 +46,16 @@ class CheckpointResult(NamedTuple):
     checkpointed: int
 
     @classmethod
+    def from_pragma_rows(cls, rows: Iterable[Sequence[Any]]) -> CheckpointResult:
+        """The one parser of the pragma's result, and the one home of the no-row policy."""
+        row = next(iter(rows), None)
+        if row is None:
+            raise RuntimeError('PRAGMA wal_checkpoint returned no rows')
+        return cls(int(row[0]), int(row[1]), int(row[2]))
+
+    @classmethod
     def unavailable(cls) -> CheckpointResult:
-        """No checkpoint ran: the store has no open connection, or the pragma returned no row."""
+        """No checkpoint ran: the store has no open connection."""
         return cls(-1, -1, -1)
 
 
@@ -260,27 +268,13 @@ class AtomicConnection:
     async def checkpoint(self) -> CheckpointResult:
         """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` as one atomic access.
 
-        Returns :meth:`CheckpointResult.unavailable` when the pragma yields no
-        row.  This family — the fused-memory stores driven by
-        ``fused-memory/src/fused_memory/server/main.py::_run_checkpoint_cycle`` —
-        answers "no checkpoint ran" with that sentinel, never a raise: the cycle
-        unpacks the tuple and logs raises separately, so a benign empty result
-        must not read as a checkpoint failure on every affected tick.
-
-        :meth:`AsyncSqliteBase.checkpoint` (dashboard, ``cost_store``) raises
-        ``RuntimeError`` on the identical condition instead, and both live in
-        this one module.  Read both before moving a store from one to the other:
-        the swap turns "raises on an impossible pragma result" into "returns a
-        sentinel that unpacks as three ints" with no type or test signal.
+        Raises ``RuntimeError`` when the pragma yields no row, the same as
+        :meth:`AsyncSqliteBase.checkpoint`.  A store that is not open is
+        answered by :meth:`checkpoint_or_unavailable`.
         """
         async with self._held('checkpoint()'):
-            rows = list(
-                await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
-            )
-        if not rows:
-            return CheckpointResult.unavailable()
-        row = rows[0]
-        return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))
+            rows = await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
+        return CheckpointResult.from_pragma_rows(rows)
 
     async def close(self) -> None:
         """Truncate the WAL best-effort, then close the wrapped connection.
@@ -415,17 +409,7 @@ class AsyncSqliteBase(abc.ABC):
             RuntimeError: If the store has not been opened.
             RuntimeError: If ``PRAGMA wal_checkpoint(TRUNCATE)`` returns no rows
                 (unexpected; SQLite always returns a row for this pragma).
-
-        Note:
-            :meth:`AtomicConnection.checkpoint` — the fused-memory store family
-            — answers that same no-rows case with
-            :meth:`CheckpointResult.unavailable` instead.  Two opposite
-            contracts under one name in one module: a store moving between
-            them changes behaviour silently, so read both first.
         """
-        conn = self._require_conn()
-        async with conn.execute('PRAGMA wal_checkpoint(TRUNCATE)') as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            raise RuntimeError('PRAGMA wal_checkpoint returned no rows')
-        return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))
+        return CheckpointResult.from_pragma_rows(
+            await self._require_conn().execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
+        )
