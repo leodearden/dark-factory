@@ -860,14 +860,7 @@ class MarkupGuardMiddleware(Middleware):
         defect in the caller's own text emission, so it can only ever land in a
         string.
 
-        The first NON-INERT hit is handled, and only that one, because the
-        repair is defined against ONE absorbing parameter — the argument whose
-        value swallowed the rest of the envelope. A second hit downstream of it
-        is either the same leak seen twice or a value that repair() will refuse
-        anyway. An INERT hit — a value repair() declines that carries only
-        quoted HTML closers (task **10396**) — is skipped as if it carried no
-        needle, so a real leak in a later argument is still reached; see
-        :meth:`_first_live_markup`.
+        Which hit is handled is decided by :meth:`_first_live_markup`.
 
         PARAMETER-AWARE, and free (task **4696**). The scan asks
         :func:`~shared.toolcall_markup.detect_for` with the argument's OWN
@@ -910,13 +903,20 @@ class MarkupGuardMiddleware(Middleware):
     ) -> _MarkupHit | None:
         """The first hit of :meth:`_markup_arguments` that is a real event.
 
+        That hit is handled, and only that one, because the repair is defined
+        against ONE absorbing parameter — the argument whose value swallowed
+        the rest of the envelope. A second hit downstream of it is either the
+        same leak seen twice or a value that repair() will refuse anyway.
+
         The schema is read once, lazily, on the first hit, so a clean call
         still pays no ``get_tool``. Each hit is offered to
         :func:`~shared.toolcall_markup.repair` FIRST; only a hit it declines is
         asked :func:`~shared.toolcall_markup.only_inert_html_closers`, so every
-        value repair() can fix is handled exactly as before. An inert hit is
-        skipped: it is a quoted HTML block, not a leak, and earns no fact, no
-        storm count and no residue, like a clean argument.
+        value repair() can fix is handled exactly as before. An INERT hit (task
+        **10396**) is skipped as if it carried no needle: it is a quoted HTML
+        block, not a leak, and earns no fact, no storm count and no residue,
+        like a clean argument, so a real leak in a later argument is still
+        reached.
         """
         properties: Mapping[str, Any] | None = None
         for param, value, pattern in self._markup_arguments(arguments):
