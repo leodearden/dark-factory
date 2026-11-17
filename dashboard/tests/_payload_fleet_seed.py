@@ -325,7 +325,8 @@ class MemoryEvalShape:
 _EVAL_STAMP_FORMAT = '%Y%m%dT%H%M%SZ'
 _EVAL_ALPHA = 0.002777777777777778
 _TRIPWIRE_METRIC = 'tripwire-items-present'
-# Two items in five are grandfathered, the live share (43 of 107).
+# Two items in five are grandfathered, near the live share that
+# _payload_fleet.py::FleetCensus records.
 _GRANDFATHERED_PER_5 = 2
 
 

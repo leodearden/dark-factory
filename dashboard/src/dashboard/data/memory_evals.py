@@ -1062,12 +1062,27 @@ def _carried_by_open_escalation(fingerprint: Any, escalations: Mapping[str, Esca
     return isinstance(fingerprint, str) and bool(fingerprint) and fingerprint in escalations
 
 
+@dataclass(frozen=True, slots=True)
+class _EscalationJoin:
+    """How one verdict entry's fingerprint joined the open escalations.
+
+    ``linked``: the escalation the entry links, if any.  ``carried``: an open
+    escalation carries the fingerprint, whether or not the entry links it.
+    ``storm_triggered``: a triggered storm collapsed every per-metric link
+    into one aggregate, so no entry links even when carried.
+    """
+
+    linked: Escalation | None
+    carried: bool
+    storm_triggered: bool
+
+
 def _join_escalation(
     fingerprint: Any,
     sources: _JoinSources,
     claims: _RowClaims,
-) -> tuple[Escalation | None, _RowClaims]:
-    """The escalation a verdict entry carrying *fingerprint* links, and *claims* extended by its claim.
+) -> tuple[_EscalationJoin, _RowClaims]:
+    """How a verdict entry carrying *fingerprint* joins, and *claims* extended by its claim.
 
     Whole-string equality, NOT gated on the verdict: a recovered metric whose
     escalation is still open keeps its link.  A triggered storm filed one
@@ -1076,13 +1091,16 @@ def _join_escalation(
     fingerprint links only its first claimer; ``_name_shared_fingerprints``
     names the sharing.
     """
+    storm_triggered = sources.storm is not None
     if not _carried_by_open_escalation(fingerprint, sources.escalations):
-        return None, claims
-    if sources.storm is not None:
-        return None, claims.with_suppressed(fingerprint)
+        return _EscalationJoin(None, carried=False, storm_triggered=storm_triggered), claims
+    unlinked = _EscalationJoin(None, carried=True, storm_triggered=storm_triggered)
+    if storm_triggered:
+        return unlinked, claims.with_suppressed(fingerprint)
     if fingerprint in claims.linked:
-        return None, claims
-    return sources.escalations[fingerprint], claims.with_link(fingerprint)
+        return unlinked, claims
+    linked = _EscalationJoin(sources.escalations[fingerprint], carried=True, storm_triggered=False)
+    return linked, claims.with_link(fingerprint)
 
 
 # A tripwire item is quiet only when its parity is in this set AND no open
@@ -1100,17 +1118,14 @@ def _verdict_fields(
     entry: dict[str, Any] | None,
     metric_id: str,
     eval_dir: Path,
-    matched: Escalation | None,
-    storm_triggered: bool,
+    join: _EscalationJoin,
     issues: list[dict[str, Any]],
-    *,
-    carried: bool,
 ) -> dict[str, Any]:
     """One verdict entry of a metric row: *entry*'s judgement, its escalation link and its parity.
 
     The fields are passed through UNMAPPED from the sole verdict source.  A
     quiet item (one whose parity is in ``_QUIET_ITEM_PARITIES`` and whose
-    fingerprint no open escalation carries, per *carried*) omits
+    fingerprint no open escalation carries, per *join*) omits
     ``verdict_detail`` and ``fingerprint``; every other entry, item-less ones
     included, carries both.
     """
@@ -1118,7 +1133,7 @@ def _verdict_fields(
     # dict makes every verdict field read as None below without a second
     # code path.
     judged: dict[str, Any] = entry or {}
-    escalation = _escalation_projection(matched) if matched is not None else None
+    escalation = _escalation_projection(join.linked) if join.linked is not None else None
 
     # Classified ONCE and reused for both the parity badge and the
     # unrenderable-value check below, so the membership rule lives in
@@ -1150,11 +1165,11 @@ def _verdict_fields(
 
     parity = (
         'storm_collapsed'
-        if storm_triggered and verdict == 'alarm'
+        if join.storm_triggered and verdict == 'alarm'
         else _parity(verdict_class, escalation)
     )
     fields = {'item': item, 'verdict': verdict, 'parity': parity, 'escalation': escalation}
-    quiet_item = item is not None and not carried and parity in _QUIET_ITEM_PARITIES
+    quiet_item = item is not None and not join.carried and parity in _QUIET_ITEM_PARITIES
     if not quiet_item:
         fields |= {'verdict_detail': judged.get('detail'), 'fingerprint': judged.get('fingerprint')}
     return fields
@@ -1370,12 +1385,8 @@ def _build_metric_row(
     verdicts: list[dict[str, Any]] = []
     # A metric no entry judges still gets its one (unjudged) verdict entry.
     for entry in entries or [None]:
-        fingerprint = (entry or {}).get('fingerprint')
-        matched, claims = _join_escalation(fingerprint, sources, claims)
-        verdicts.append(_verdict_fields(
-            entry, metric_id, eval_dir, matched, sources.storm is not None, issues,
-            carried=_carried_by_open_escalation(fingerprint, sources.escalations),
-        ))
+        join, claims = _join_escalation((entry or {}).get('fingerprint'), sources, claims)
+        verdicts.append(_verdict_fields(entry, metric_id, eval_dir, join, issues))
     return {
         **_metric_fields(metric_id, series.runs, rule_kind),
         **_metric_scoped_verdict_fields(entries, metric_id, eval_dir, issues),
