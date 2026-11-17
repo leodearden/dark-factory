@@ -302,6 +302,42 @@ for (const { view, show, block, sampleLabels, bannerProjects } of BURN_VIEWS) {
   });
 }
 
+function summaryTrendCell(container, projectId) {
+  const table = panelTitled(container, 'Per project · summary').querySelector('table');
+  const trendColumn = [...table.querySelectorAll('thead th')].findIndex(th => th.textContent === 'Trend');
+  assert.ok(trendColumn >= 0, 'the Per project summary table has no Trend column');
+  const row = [...table.querySelectorAll('tbody tr')].find(tr => tr.querySelector('td')?.textContent === projectId);
+  assert.ok(row, `the Per project summary table has no row for ${projectId}`);
+  return row.querySelectorAll('td')[trendColumn];
+}
+
+function pathData(root) {
+  return [...root.querySelectorAll('svg path')].map(path => path.getAttribute('d'));
+}
+
+// The Trend sparkline derives velocity from the project's done series over its
+// labels, and deriveVelocitySeries draws nothing for a missing or mismatched
+// label row, so only a call site that decoded label_spans draws this spark.
+test('tabs.jsx::BurnTab aggregate summary table draws each project Trend sparkline over its own labels', t => {
+  const harness = openWindow(t);
+  seedBurndown(harness.window, { alarm: false });
+  const { container } = harness.mount(harness.window.DF_TABS.BurnTab, BURN_PROPS);
+
+  const { Sparkline, PALETTE, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds } = harness.window.DF_CHARTS;
+  const ownLabels = harness.window.DF_DATA.BURNDOWN.labels.slice(AGGREGATE_SAMPLES - PROJECT_SAMPLES);
+  const smoothSecs = smoothingLabelToSeconds(defaultSmoothingForWindow(BURN_PROPS.displayWindow));
+  const velocity = deriveVelocitySeries(harness.window.DF_DATA.BURNDOWN_BY_PROJECT[PROJECT].done, ownLabels, smoothSecs);
+  assert.equal(velocity.length, PROJECT_SAMPLES, 'the seeded project must have a velocity sample per own label');
+  const expected = pathData(harness.mount(Sparkline, { values: velocity, color: PALETTE.accent }).container);
+  assert.ok(expected.length > 0, 'a Sparkline of the project velocity drew nothing, so a match proves nothing');
+
+  assert.deepEqual(
+    pathData(summaryTrendCell(container, PROJECT)),
+    expected,
+    `the ${PROJECT} Trend cell must draw the velocity of its ${PROJECT_SAMPLES} own samples`,
+  );
+});
+
 // ── Decision 3: the PINNING chip (pins_recovery.js::pinningBadgeState) ──
 // pins_recovery is three-state on the wire: true, false, or ABSENT (unknown).
 // Only true draws the chip.
