@@ -541,9 +541,7 @@ def routes_to_mem0(payload: dict) -> tuple[bool, str]:
     return True, ''
 
 
-def metadata_accepted(
-    metadata: dict, *, enforce: bool, enforce_kind_registry: bool
-) -> tuple[bool, str]:
+def metadata_accepted(metadata: dict, *, enforce: bool) -> tuple[bool, str]:
     """Return (True, '') only when the re-add's metadata would survive validation.
 
     Pure, no I/O -- ``validate_memory_metadata`` is a synchronous SHAPE check
@@ -555,26 +553,23 @@ def metadata_accepted(
     ``memory_metadata.enforce`` is on and at least one violation is fatal. The
     corpus this sweep walks is precisely the OLD, harness-corrupted one, so a
     record whose carried metadata predates the task-3195 vocabulary can be
-    fatal-invalid TODAY -- an unknown ``kind`` under ``enforce_kind_registry``,
-    a scalar-but-malformed ``supersedes`` member, a non-bool ``canonical``. The
-    add would then throw AFTER the delete already landed, and the record would
-    become ``content_lost_in_flight`` with the text surviving only on stdout.
-    Checking first turns that into a no-op skip.
+    fatal-invalid TODAY -- a scalar-but-malformed ``supersedes`` member, a
+    non-bool ``canonical``. The add would then throw AFTER the delete already
+    landed, and the record would become ``content_lost_in_flight`` with the
+    text surviving only on stdout. Checking first turns that into a no-op skip.
+    An unknown ``kind`` is never fatal (PRD §10 OQ1, option (b)), so it never
+    skips a repair.
 
     ``enforce`` is honoured rather than assumed: under warn-mode (the shipped
     default) a fatal violation does NOT reject the write, so skipping on it
-    would refuse repairs the store would happily have accepted -- and unknown
-    ``kind`` values are the common case, not the exception (242 of 329 live
-    values are singletons).
+    would refuse repairs the store would happily have accepted.
 
     *metadata* is never mutated: ``validate_memory_metadata`` normalizes
     ``supersedes`` in place, so it is handed a COPY.
     """
     if not enforce:
         return True, ''
-    violations = validate_memory_metadata(
-        dict(metadata), enforce_kind_registry=enforce_kind_registry
-    )
+    violations = validate_memory_metadata(dict(metadata), enforce_kind_registry=False)
     fatal = [violation for violation in violations if violation.fatal]
     if not fatal:
         return True, ''
@@ -585,34 +580,32 @@ def metadata_accepted(
     )
 
 
-def resolve_metadata_enforcement(memory_service: Any) -> tuple[bool, bool]:
-    """Read the ACTIVE ``(enforce, enforce_kind_registry)`` off *memory_service*.
+def resolve_metadata_enforcement(memory_service: Any) -> bool:
+    """Read the ACTIVE ``memory_metadata.enforce`` off *memory_service*.
 
-    Pure w.r.t. the store -- attribute reads only. The flags come from the live
-    ``config.memory_metadata`` rather than being assumed, because they decide
+    Pure w.r.t. the store -- attribute reads only. The flag comes from the live
+    ``config.memory_metadata`` rather than being assumed, because it decides
     whether :func:`metadata_accepted` may block a repair, and guessing either
     way is wrong: guessing OFF re-opens the post-delete rejection this
     pre-flight exists to close, guessing ON refuses repairs the store would
     have accepted.
 
-    When they cannot be read as real bools the answer is the FAIL-SAFE one --
-    both ON, so a questionable record is skipped rather than deleted -- and it
-    is logged, never silent. A live ``MemoryService`` always carries a real
+    When it cannot be read as a real bool the answer is the FAIL-SAFE one --
+    ON, so a questionable record is skipped rather than deleted -- and it is
+    logged, never silent. A live ``MemoryService`` always carries a real
     ``FusedMemoryConfig``, so this branch means a stub, not a supported mode.
     """
     section = getattr(getattr(memory_service, 'config', None), 'memory_metadata', None)
     enforce = getattr(section, 'enforce', None)
-    enforce_kind_registry = getattr(section, 'enforce_kind_registry', None)
-    if isinstance(enforce, bool) and isinstance(enforce_kind_registry, bool):
-        return enforce, enforce_kind_registry
+    if isinstance(enforce, bool):
+        return enforce
     logger.warning(
-        'sweep_toolcall_xml_leak: could not read config.memory_metadata enforcement '
-        'flags off the memory service (enforce=%r, enforce_kind_registry=%r). '
-        'Assuming BOTH ON, so a record whose carried metadata looks invalid is '
-        'skipped rather than deleted-then-rejected.',
-        enforce, enforce_kind_registry,
+        'sweep_toolcall_xml_leak: could not read config.memory_metadata.enforce '
+        'off the memory service (enforce=%r). Assuming ON, so a record whose '
+        'carried metadata looks invalid is skipped rather than deleted-then-rejected.',
+        enforce,
     )
-    return True, True
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -748,7 +741,7 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
     # Resolved ONCE, before any mutation, so every record in a run is judged
     # against the same enforcement setting even if the config object is edited
     # mid-sweep.
-    enforcement = resolve_metadata_enforcement(memory_service)
+    enforce = resolve_metadata_enforcement(memory_service)
 
     # Fail-CLOSED capability preflight, one probe per run, BEFORE the scan.
     #
@@ -833,7 +826,7 @@ async def run(args: Any, memory_service: Any, progress: dict | None = None) -> d
         try:
             if not dry_run and classification in (REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE):
                 await _repair_record(
-                    memory_service, args, match, payload, record, enforcement=enforcement
+                    memory_service, args, match, payload, record, enforce=enforce
                 )
             elif not dry_run and classification == MANUAL_REVIEW:
                 logger.warning(
@@ -885,7 +878,7 @@ async def _repair_record(
     payload: dict,
     record: dict,
     *,
-    enforcement: tuple[bool, bool] = (False, False),
+    enforce: bool = False,
 ) -> None:
     """Delete the corrupted point, then re-add the repaired text.
 
@@ -900,7 +893,7 @@ async def _repair_record(
         that would not be re-written to mem0 is skipped entirely -- no delete,
         no add -- and flagged ``skipped_not_mem0_routed``.
       * :func:`metadata_accepted` must vouch for the metadata the re-add would
-        carry, under the *enforcement* flags resolved for this run. A record
+        carry, under the *enforce* flag resolved for this run. A record
         whose carried metadata would be REJECTED by ``add_memory``'s own
         validation is flagged ``skipped_metadata_would_be_rejected``. Without
         this the rejection lands AFTER the delete, and a record the sweep was
@@ -968,10 +961,7 @@ async def _repair_record(
     record['metadata_preserved'] = sorted(set(payload) - _MEM0_OWNED_KEYS)
     record['metadata_dropped'] = dropped
 
-    enforce, enforce_kind_registry = enforcement
-    accepted, metadata_reason = metadata_accepted(
-        metadata, enforce=enforce, enforce_kind_registry=enforce_kind_registry
-    )
+    accepted, metadata_reason = metadata_accepted(metadata, enforce=enforce)
     if not accepted:
         record[SKIPPED_METADATA_WOULD_BE_REJECTED] = True
         record['error'] = metadata_reason
