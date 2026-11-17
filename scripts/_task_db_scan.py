@@ -466,7 +466,9 @@ def run_scan_cli(
     """
     args = parser.parse_args(argv)
 
-    db_paths = discover_db_paths(explicit_dbs=args.dbs, project_roots=args.project_roots)
+    db_paths = discover_or_report_no_default_root(
+        lambda: discover_db_paths(explicit_dbs=args.dbs, project_roots=args.project_roots)
+    )
     if not db_paths:
         print(NO_DB_RESOLVED_MESSAGE, file=sys.stderr)
         return 2
@@ -646,7 +648,9 @@ def run_audit_cli(
     args = parser.parse_args(argv)
 
     # dest="project_roots" is the PARSER CONTRACT above, not an accident.
-    roots = discover_project_roots(project_roots=args.project_roots)
+    roots = discover_or_report_no_default_root(
+        lambda: discover_project_roots(project_roots=args.project_roots)
+    )
 
     if on_roots is not None:
         on_roots(roots, args)
