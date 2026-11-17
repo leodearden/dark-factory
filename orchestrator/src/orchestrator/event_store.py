@@ -376,6 +376,16 @@ class EventType(StrEnum):
     # escalation (task 2757; Reify 5120 RCA RC-2).  task_id-keyed; payload shape:
     # {reason, category, failure_category, cause_hint}.
     merge_blocked = 'merge_blocked'
+    # A resumed task branch whose HEAD does not merge cleanly onto main, found at
+    # dispatch start before planning (task 7736).  Sole emit site:
+    # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._settle_conflicting_base,
+    # once per such dispatch.  task_id-keyed.  data, written by
+    # orchestrator/src/orchestrator/dispatch_base.py::BaseConflict.to_event_payload:
+    #   {main_sha, head_sha, conflicted_paths, conflicted_paths_total,
+    #    counterpart_task_ids}
+    # in task 7302's ConflictEvidence spelling; counterpart_task_ids is [] because
+    # the conflict is against main itself.
+    dispatch_base_conflict = 'dispatch_base_conflict'
     # PRD merge-worktree-lifecycle-integrity §4 C4 (task 2930/η): the serial-lane
     # TRIPWIRE — a second concurrent LOCAL merge verify was dispatched while the
     # _MERGE_AHEAD_BOUND-derived per-host in-flight bound is 1.  DETECTION ONLY:

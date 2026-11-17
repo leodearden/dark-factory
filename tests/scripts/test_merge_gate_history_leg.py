@@ -76,6 +76,7 @@ READS_ONLY_THROWAWAY_REPOS: Mapping[str, str] = {
     'fused-memory/tests/test_live_workflow_detector.py': (
         'run_git is patched; each git argv is a mocked CompletedProcess or side-effect input'
     ),
+    'orchestrator/tests/_dispatch_base_scene.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_atomic_train_merge.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_branch_base.py': _SEEDS_ITS_OWN_REPO,
     'orchestrator/tests/test_branch_stack.py': _SEEDS_ITS_OWN_REPO,
