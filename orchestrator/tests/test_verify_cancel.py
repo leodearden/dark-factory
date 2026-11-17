@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
-from df_pytest_isolation import read_proc_state, wait_pids_exited
+from df_pytest_isolation import read_leaked_pid, read_proc_state, wait_pids_exited
 
 from orchestrator.verify_runner import HEARTBEAT_STOP_JOIN_SECS
 
@@ -1788,28 +1788,6 @@ time.sleep(300)
 '''
 
 
-def _poll_until(predicate, timeout, interval=0.1):
-    """Poll *predicate* (a zero-arg callable) until truthy, or *timeout* expires.
-
-    Checks immediately, then every *interval* seconds; returns True the
-    moment *predicate()* is truthy, False once *timeout* elapses first. This
-    is the module's file-wait poll primitive, behind :func:`_wait_for_file`;
-    pid-exit waits use ``df_pytest_isolation.py::wait_pids_exited`` instead.
-    """
-    import time
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval)
-    return False
-
-
-def _wait_for_file(path, timeout=10.0, interval=0.1):
-    """Poll until *path* exists or *timeout* expires. Return True if found."""
-    return _poll_until(path.exists, timeout, interval)
-
-
 @pytest.mark.timeout(60)
 def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
     """cancel_request reaps root AND start_new_session-escaped descendants.
@@ -1833,18 +1811,15 @@ def test_cancel_request_reaps_start_new_session_escapes(tmp_path):
         [sys.executable, '-c', _ESCAPE_TREE_SCRIPT, str(pgid_file_path)],
     )
 
-    # Wait for root to write its pgid file (means setsid + child spawned)
-    assert _wait_for_file(pgid_file_path, timeout=10), (
-        'root process did not write pgid file within 10s'
-    )
+    # Root writes its pgid after setsid, before spawning the child
+    pgid = read_leaked_pid(pgid_file_path, timeout=10.0)
 
-    # Give the child a moment to spawn the grandchild
+    # Give root a moment to spawn the child, and the child the grandchild
     time.sleep(0.5)
 
     # Take a PPID snapshot to find escaped descendants BEFORE killing
     from orchestrator.verify_cancel import collect_descendants, read_ppid_map
     ppid_map = read_ppid_map()
-    pgid = int(pgid_file_path.read_text().strip())
     all_pids = collect_descendants(pgid, ppid_map) | {pgid}
 
     # Verify the tree is alive before cancelling
