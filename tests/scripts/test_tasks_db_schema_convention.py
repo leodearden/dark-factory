@@ -35,7 +35,6 @@ this guard runs under FULL_SUITE and merge-role ``merge_verify_breadth: full``.
 from __future__ import annotations
 
 import pathlib
-import re
 import shlex
 import sqlite3
 import subprocess
@@ -73,27 +72,6 @@ _FIXTURE_COLUMNS = ("id", "status")
 _FIXTURE_DDL = "CREATE TABLE tasks (id INTEGER NOT NULL PRIMARY KEY, status TEXT NOT NULL)"
 
 
-def _marked_command(markdown_text, marker, bullet_label, doc_name):
-    """The command on the *bullet_label* bullet between *marker*'s begin/end comments.
-
-    ``verify_command_invariants.marked_span`` owns the loud marker checks, and
-    every failure names *doc_name*. This guard supplies only the pattern, keyed
-    on the bullet's label rather than on backticks so that inline code in the
-    begin comment is never extracted.
-    """
-    bullet = re.compile(r"- \*\*" + re.escape(bullet_label) + r"\*\*: `([^`]+)`")
-    return vci.marked_span(
-        markdown_text,
-        begin=f"{marker}:begin",
-        end=f"{marker}:end",
-        pattern=bullet,
-        what=f"`- **{bullet_label}**: <command>` bullet",
-        source=doc_name,
-        label=f"the {bullet_label!r} command",
-        task="5330",
-    ).strip()
-
-
 _HAPPY_DOC = """\
 Ask the store what shape it is; never guess a column name or a value type.
 
@@ -110,24 +88,6 @@ Writes still go through the fused-memory MCP tools.
 _HAPPY_COMMAND = "python scripts/tasks_db_schema.py"
 
 _SELF_TEST_DOC_NAME = "self-test-doc.md"
-
-_NO_MARKER_DOC = """\
-- **Task store shape**: `python scripts/tasks_db_schema.py`
-
-Somewhere else entirely, an unmarked mention of `.taskmaster/tasks/tasks.db`.
-"""
-
-_DUPLICATE_MARKER_DOC = """\
-<!-- tasks-db-schema-lookup:begin -->
-- **Task store shape**: `python scripts/tasks_db_schema.py`
-<!-- tasks-db-schema-lookup:end -->
-
-## Some later section
-
-<!-- tasks-db-schema-lookup:begin -->
-- **Task store shape**: `python scripts/tasks_db_schema.py --db /elsewhere.db`
-<!-- tasks-db-schema-lookup:end -->
-"""
 
 _DECOY_DOC = """\
 The store is at `.taskmaster/tasks/tasks.db`, never inside your worktree.
@@ -147,36 +107,15 @@ Afterwards, `SELECT` against the columns it printed.
 def test_marked_command_extracts_the_marked_span():
     """Only the marked bullet's command is returned, backticks stripped."""
     assert (
-        _marked_command(
-            _HAPPY_DOC, SHAPE_LOOKUP_MARKER, SHAPE_LOOKUP_LABEL, _SELF_TEST_DOC_NAME
+        vci.marked_bullet_command(
+            _HAPPY_DOC,
+            slug=SHAPE_LOOKUP_MARKER,
+            bullet_label=SHAPE_LOOKUP_LABEL,
+            source=_SELF_TEST_DOC_NAME,
+            task="5330",
         )
         == _HAPPY_COMMAND
     )
-
-
-@pytest.mark.parametrize(
-    ("markdown_text", "case"),
-    [
-        (_NO_MARKER_DOC, "missing"),
-        (_DUPLICATE_MARKER_DOC, "duplicated"),
-    ],
-)
-def test_marked_command_fails_loudly_on_a_broken_marker(markdown_text, case):
-    """A missing or duplicated marker RAISES — never '' or None.
-
-    Missing is the vacuity hazard: an extractor that silently returns nothing
-    turns every downstream assertion green while executing nothing at all.
-    Duplicated is the same failure one level down — silently taking the first
-    leaves the second copy unexecuted and free to rot.
-    """
-    with pytest.raises(AssertionError) as excinfo:
-        _marked_command(
-            markdown_text, SHAPE_LOOKUP_MARKER, SHAPE_LOOKUP_LABEL, _SELF_TEST_DOC_NAME
-        )
-
-    message = str(excinfo.value)
-    assert SHAPE_LOOKUP_MARKER in message, case
-    assert _SELF_TEST_DOC_NAME in message, case
 
 
 def test_marked_command_is_immune_to_inline_code_in_the_begin_comment():
@@ -187,8 +126,12 @@ def test_marked_command_is_immune_to_inline_code_in_the_begin_comment():
     so the mistake would survive review and then be executed as a command.
     """
     assert (
-        _marked_command(
-            _DECOY_DOC, SHAPE_LOOKUP_MARKER, SHAPE_LOOKUP_LABEL, _SELF_TEST_DOC_NAME
+        vci.marked_bullet_command(
+            _DECOY_DOC,
+            slug=SHAPE_LOOKUP_MARKER,
+            bullet_label=SHAPE_LOOKUP_LABEL,
+            source=_SELF_TEST_DOC_NAME,
+            task="5330",
         )
         == _HAPPY_COMMAND
     )
@@ -262,11 +205,12 @@ def test_documented_store_shape_lookup_reports_the_stores_real_shape(doc_path, t
     the claim the doc is making to every agent that reads it.
     """
     doc_name = doc_path.relative_to(REPO_ROOT).as_posix()
-    command = _marked_command(
+    command = vci.marked_bullet_command(
         doc_path.read_text(encoding="utf-8"),
-        SHAPE_LOOKUP_MARKER,
-        SHAPE_LOOKUP_LABEL,
-        doc_name,
+        slug=SHAPE_LOOKUP_MARKER,
+        bullet_label=SHAPE_LOOKUP_LABEL,
+        source=doc_name,
+        task="5330",
     )
     argv = _documented_tool_argv(command, doc_name)
     root = _seeded_project_root(tmp_path)
