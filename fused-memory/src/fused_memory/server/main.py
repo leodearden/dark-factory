@@ -41,7 +41,9 @@ from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
 from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
     closure_exists_probe,
 )
-from fused_memory.server.boundary_guards import install_boundary_guards  # noqa: E402
+from fused_memory.server.boundary_guards import (  # noqa: E402  # debt: task 10130
+    install_boundary_guards,
+)
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
     create_mcp_server,
