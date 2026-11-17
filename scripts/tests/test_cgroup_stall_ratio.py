@@ -125,6 +125,21 @@ def test_agents_and_the_orchestrator_in_the_df_unit_never_count_as_verify_work(f
     assert _populated(headline) == ({'df_agents'} if family == 'claude-cli' else set())
 
 
+@pytest.mark.parametrize('family', ['claude-cli', 'orch-main'])
+@pytest.mark.parametrize(
+    ('nice', 'expected_class'),
+    [(5, 'df_merge_workers'), (15, 'df_task_workers'), (19, 'df_background_workers')],
+)
+def test_a_df_verify_scope_holds_no_agents_so_an_agent_family_there_is_verify_work(
+    family: str, nice: int, expected_class: str,
+) -> None:
+    """The fake `claude` binaries tests/scripts/test_spawn_claude.py spawns classify as 'claude-cli'."""
+    headline = _headline((stall_ratio.bucket(DF_SCOPE), family, nice))
+
+    assert headline[expected_class] == EVEN_SPLIT
+    assert _populated(headline) == {expected_class}
+
+
 def test_verify_scopes_of_two_projects_stay_in_their_own_classes() -> None:
     headline = _headline(
         (stall_ratio.bucket(DF_SCOPE), 'xdist-worker', 5),
