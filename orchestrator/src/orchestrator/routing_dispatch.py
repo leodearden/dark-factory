@@ -196,9 +196,11 @@ async def resolve_and_record_route(
         annotation, byte-equivalent event.
     phase:
         The workflow phase the dispatch runs in, stamped on the
-        ``routing_decision`` event row's ``phase`` column to match the site's
-        own ``invocation_end`` row. ``None`` (project-level deep_reviewer,
-        batch module_tagger) leaves the column NULL.
+        ``routing_decision`` event row's ``phase`` column. A caller that also
+        emits its own ``invocation_end`` row (steward, unblock_auto) passes the
+        phase that row carries. Triage emits no ``invocation_end`` row.
+        ``None`` (project-level deep_reviewer, batch module_tagger) leaves
+        the column NULL.
     """
     md: Mapping[str, Any] = task_metadata or {}
     routing_state = RoutingState.from_metadata(dict(md))

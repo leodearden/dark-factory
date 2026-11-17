@@ -518,7 +518,7 @@ async def _skip_covered_reblock(
         event_store.emit(
             EventType.phase_skipped,
             task_id=task_id,
-            phase='blocked',
+            phase=WorkflowState.BLOCKED.value,
             role='unblock_auto',
             data={
                 'reason': 'dry_run_covered',

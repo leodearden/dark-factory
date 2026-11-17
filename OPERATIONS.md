@@ -2366,9 +2366,12 @@ rejections) and mirrors the latest decision onto the task's own
 and a `simple_saturated` flag. The event row's `phase` column carries the
 workflow phase the invocation ran in (the live phase inside a task
 workflow, `escalated` for steward and triage, `blocked` for unblock_auto),
-matching that invocation's `invocation_end` row, so a per-role cap or cost
-cohort splits by phase from `runs.db` alone; it is NULL for the
-project-level deep_reviewer and the batch module_tagger. Today this is
+so a per-role cap or cost cohort splits by phase from `runs.db` alone; it
+is NULL for the project-level deep_reviewer and the batch module_tagger.
+In-workflow roles, the steward and unblock_auto also emit an
+`invocation_end` row with the same phase. Triage emits none, and its
+`routing_decision` row is written before the lifetime-budget check, so the
+row also exists when that check skips the triage. Today this is
 what you read directly (`routing_decision` events, `metadata.routing` per
 task) — there is not
 yet an auto-escalating retry ladder or a rendered rollup panel; see below.
