@@ -1,6 +1,7 @@
 """What the merge-lane ratchet suites share: the instrument, the one seed report,
-the throwaway repo the git-driving suites build history in, and what a gate
-copied into that repo needs beside it.
+the cluster paths and ledger helpers more than one suite asserts on, the
+throwaway repo the git-driving suites build history in, and what a gate copied
+into that repo needs beside it.
 
 The ``scripts/`` modules are imported HERE, once, so no suite carries its own
 ``sys.path`` bootstrap; orchestrator/pyproject.toml's [tool.pyright] extraPaths

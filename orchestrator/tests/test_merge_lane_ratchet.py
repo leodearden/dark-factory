@@ -3,8 +3,9 @@
 PRD ``plans/merge-lane-quality-prd.md`` task alpha. The instrument itself lives
 in ``scripts/merge_lane_cluster.py`` (measurement), ``scripts/merge_lane_ratchet.py``
 (verdict) and ``scripts/merge_lane_metrics.py`` (command line); this module hosts
-the measurement-stratum unit tests, the command-line tests and the real
-tree-scanning gate. The synthetic unit tests of the write gate, and of the
+the measurement-stratum unit tests, the derived-totals and stored-enumeration
+tests, the command-line tests and the real tree-scanning gate. The synthetic
+unit tests of the write gate, of the rest of the baseline rendering, and of the
 comparator it shares with ``--check``, are in
 ``test_merge_lane_ratchet_write_gate.py``.
 
@@ -1187,8 +1188,7 @@ class TestTestTreeSweep:
 
 
 # ---------------------------------------------------------------------------
-# Baseline serialization, and the per-path LINE LOCALITY that makes ten
-# parallel gamma branches rebase without conflicting.
+# Baseline serialization of the enumeration block.
 
 
 class TestStoredEnumerationIsChurnFree:
