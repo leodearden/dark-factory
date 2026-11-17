@@ -1501,6 +1501,122 @@ class TestStartupSelfCheck:
         curator = TaskCurator(config=_make_config(), taskmaster=None)
         assert await curator.startup_self_check(project_id='p', project_root='/x') is False
 
+    @staticmethod
+    def _resolvable_binary(tmp_path, monkeypatch) -> None:
+        binary = tmp_path / 'claude'
+        binary.write_text('#!/bin/sh\nexit 0\n')
+        binary.chmod(0o755)
+        monkeypatch.setenv('CLAUDE_BINARY', str(binary))
+
+    @staticmethod
+    def _registry_config(
+        *,
+        blocklist: Path | None = None,
+        premise: Path | None = None,
+        operational: Path | None = None,
+    ) -> FusedMemoryConfig:
+        cfg = FusedMemoryConfig()
+        cfg.curator = CuratorConfig(
+            cancelled_premise_blocklist_path=None if blocklist is None else str(blocklist),
+            recon_code_fix_premise_registry_path=None if premise is None else str(premise),
+            operational_ask_registry_path=None if operational is None else str(operational),
+        )
+        return cfg
+
+    @staticmethod
+    def _registry_escalator() -> AsyncMock:
+        escalator = AsyncMock()
+        escalator.report_backend_binary_unresolvable = AsyncMock(return_value=None)
+        escalator.report_registry_load_failed = AsyncMock(return_value=None)
+        return escalator
+
+    @pytest.mark.asyncio
+    async def test_failed_registry_load_is_reported_and_escalated(
+        self, tmp_path, monkeypatch, caplog,
+    ):
+        self._resolvable_binary(tmp_path, monkeypatch)
+        escalator = self._registry_escalator()
+        curator = TaskCurator(
+            config=self._registry_config(blocklist=tmp_path / 'missing.yaml'),
+            taskmaster=None, cwd=tmp_path, escalator=escalator,
+        )
+
+        with caplog.at_level(logging.ERROR):
+            ok = await curator.startup_self_check(project_id='p', project_root='/x')
+
+        assert ok is False
+        escalator.report_backend_binary_unresolvable.assert_not_awaited()
+        escalator.report_registry_load_failed.assert_awaited_once()
+        kwargs = escalator.report_registry_load_failed.await_args.kwargs
+        assert kwargs['project_id'] == 'p'
+        assert kwargs['project_root'] == '/x'
+        assert kwargs['health'].label == 'blocklist'
+        assert kwargs['health'].state is RegistryState.FAILED
+        assert any(
+            'blocklist' in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.ERROR
+        )
+
+    @pytest.mark.asyncio
+    async def test_valid_registries_pass_and_are_warmed(self, tmp_path, monkeypatch):
+        self._resolvable_binary(tmp_path, monkeypatch)
+        escalator = self._registry_escalator()
+        config = self._registry_config(
+            blocklist=_make_blocklist_yaml(tmp_path, title_subs=['x'], desc_subs=['y']),
+            premise=_make_premise_registry_yaml(
+                tmp_path, title_subs=['x'], desc_subs=['y'], source_assertions=[],
+            ),
+            operational=_make_operational_registry_yaml(
+                tmp_path, title_subs=['x'], desc_subs=['y'],
+            ),
+        )
+        curator = TaskCurator(
+            config=config, taskmaster=None, cwd=tmp_path, escalator=escalator,
+        )
+
+        ok = await curator.startup_self_check(project_id='p', project_root='/x')
+
+        assert ok is True
+        escalator.report_registry_load_failed.assert_not_awaited()
+        assert [h.state for h in curator.registry_health()] == [RegistryState.LOADED] * 3
+
+    @pytest.mark.asyncio
+    async def test_each_failed_registry_is_escalated(self, tmp_path, monkeypatch):
+        self._resolvable_binary(tmp_path, monkeypatch)
+        escalator = self._registry_escalator()
+        config = self._registry_config(
+            blocklist=tmp_path / 'missing-blocklist.yaml',
+            premise=_make_premise_registry_yaml(
+                tmp_path, title_subs=['x'], desc_subs=['y'], source_assertions=[],
+            ),
+            operational=tmp_path / 'missing-operational.yaml',
+        )
+        curator = TaskCurator(
+            config=config, taskmaster=None, cwd=tmp_path, escalator=escalator,
+        )
+
+        ok = await curator.startup_self_check(project_id='p', project_root='/x')
+
+        assert ok is False
+        labels = [
+            call.kwargs['health'].label
+            for call in escalator.report_registry_load_failed.await_args_list
+        ]
+        assert labels == ['blocklist', 'operational-ask']
+
+    @pytest.mark.asyncio
+    async def test_failed_registry_without_escalator_returns_false(
+        self, tmp_path, monkeypatch,
+    ):
+        self._resolvable_binary(tmp_path, monkeypatch)
+        curator = TaskCurator(
+            config=self._registry_config(blocklist=tmp_path / 'missing.yaml'),
+            taskmaster=None, cwd=tmp_path,
+        )
+
+        assert await curator.startup_self_check(project_id='p', project_root='/x') is False
+
 
 _GOLDEN_FILES = ['src/parser.py', 'tests/test_parser.py']
 _GOLDEN_CANDIDATE = CandidateTask(
