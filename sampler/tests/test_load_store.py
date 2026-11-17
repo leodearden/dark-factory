@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS meta (
 
 _LegacyRow = tuple[int, str, float, float | None, float | None]
 
-_LEAF_INDEXES = ['idx_samples_metric_leaf_ts', 'idx_samples_metric_ts_leaf']
+_CURRENT_INDEXES = ['idx_samples_metric_leaf_ts', 'idx_samples_metric_ts_leaf', 'idx_samples_ts']
 
 
 def _legacy_store(db_path: Path, rows: list[_LegacyRow]) -> None:
@@ -254,7 +254,7 @@ class TestLoadSampleStoreSchema:
             'ts', 'metric', 'value', 'window_mean', 'window_max', 'leaf'
         ]
 
-    def test_the_indexes_are_metric_ts_leaf_and_a_per_leaf_metric_leaf_ts(
+    def test_the_indexes_are_metric_ts_leaf_a_per_leaf_metric_leaf_ts_and_ts(
         self, tmp_path: Path
     ):
         from sampler.store import LoadSampleStore
@@ -263,7 +263,7 @@ class TestLoadSampleStoreSchema:
         LoadSampleStore(db_path)
 
         _columns, indexes = _shape(db_path)
-        assert indexes == _LEAF_INDEXES
+        assert indexes == _CURRENT_INDEXES
         conn = sqlite3.connect(str(db_path))
         try:
             indexed = {
@@ -278,10 +278,12 @@ class TestLoadSampleStoreSchema:
         assert indexed == {
             'idx_samples_metric_leaf_ts': ['metric', 'leaf', 'ts'],
             'idx_samples_metric_ts_leaf': ['metric', 'ts', 'leaf'],
+            'idx_samples_ts': ['ts'],
         }
         assert partial == {
             'idx_samples_metric_leaf_ts': True,
             'idx_samples_metric_ts_leaf': False,
+            'idx_samples_ts': False,
         }
 
     def test_SCHEMA_on_a_blank_file_has_the_shape_the_store_creates(self, tmp_path: Path):
@@ -495,7 +497,7 @@ class TestLeafMigration:
 
         columns, indexes = _shape(legacy)
         assert columns[-1][1] == 'leaf', 'the next construction did not retry the migration'
-        assert indexes == _LEAF_INDEXES
+        assert indexes == _CURRENT_INDEXES
 
 
 # ---------------------------------------------------------------------------
@@ -924,43 +926,17 @@ class TestThirtyDayRetention:
 class TestCleanupIsIntervalGated:
     """Why this gate exists, pinned so it cannot be "simplified" away.
 
-    The retention DELETE cannot use either index — both lead with metric, and a
-    leading-column index does not serve a bare-ts predicate — so every call is
-    a full table SCAN. Measured at 2.5M rows, a NO-OP cleanup (nothing
-    old enough to delete) costs 106.7 ms; extrapolated to the 12.96M-row
-    30-day steady state that is ~550 ms every 5 s, forever, to delete nothing.
+    Task 3592 measured the retention DELETE as a full table SCAN: at 2.5M
+    rows a NO-OP cleanup cost 106.7 ms, ~550 ms at the then 30-day steady
+    state, every 5 s, forever, to delete nothing. The gate amortises that to
+    once per interval, and it still caps the cleanup at once a day.
 
-    Two fixes were measured. Adding idx_samples_ts makes the plan an index
-    SEARCH at ~0 ms but grew the probe file 33% (98 -> 130 MB, i.e. 1.62 ->
-    ~2.15 GB at 30 d). The interval gate amortises the same scan to once per
-    interval, where 550 ms is irrelevant, and costs zero bytes. The gate wins
-    on 530 MB and on reusing the should_vacuum/last_vacuum_ts machinery next
-    door; its only cost is up to one interval of over-retention, which is
-    meaningless for a calibration corpus. Doing both would make the index dead
-    weight, so exactly one is taken.
+    Task 10456 added idx_samples_ts as well, which task 3592 had declined for
+    its file growth: at the 2026-11 corpus (26.6M rows) the once-a-day scan
+    took 70.2 s, and the per-consumer group multiplies the table about 8x.
+    The DELETE is now an index search
+    (sampler/tests/test_due_groups.py::TestTheCleanupDeleteIsAnIndexSearch).
     """
-
-    def test_the_cleanup_delete_is_still_a_full_scan(self, tmp_path: Path):
-        """The measured fact the gate is the answer to — read off the schema."""
-        from sampler.store import LoadSampleStore
-
-        db_path = tmp_path / 'db.sqlite'
-        LoadSampleStore(db_path)
-
-        conn = sqlite3.connect(str(db_path))
-        try:
-            plan = ' '.join(
-                str(row[3])
-                for row in conn.execute(
-                    'EXPLAIN QUERY PLAN DELETE FROM samples WHERE ts < ? OR ts > ?',
-                    (0, 0),
-                ).fetchall()
-            )
-        finally:
-            conn.close()
-
-        assert 'SCAN samples' in plan, plan
-        assert 'USING INDEX' not in plan, plan
 
     def test_virgin_store_is_due_and_running_prunes_and_stamps(self, tmp_path: Path):
         from sampler.store import LoadSampleStore

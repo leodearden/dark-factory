@@ -10,6 +10,9 @@ samples(ts, metric, value, window_mean, window_max, leaf)
     idx_samples_metric_ts_leaf ON samples(metric, ts, leaf) serves every read
     by metric. idx_samples_metric_leaf_ts ON samples(metric, leaf, ts), partial
     on ``leaf IS NOT NULL``, serves the per-leaf trailing window.
+    idx_samples_ts ON samples(ts) serves the retention cutoff. Every index is
+    created if missing whenever a store is built, so an older file gains a new
+    one on its first construction.
 
 meta(key, value)
     Two independent clocks: last_cleanup_ts for the retention gate and
@@ -40,9 +43,10 @@ collector's state never runs ahead of, or behind, the rows computed from it.
 Retention
 ---------
 ``cleanup_old`` keeps the rows within ±30 days of now and runs at most once a
-day. ``maybe_vacuum`` runs at most once a day, and only when the reclaimable
-fraction of the file is worth a whole-file rewrite. Both gates treat a stamp in
-the future as due.
+day; its DELETE (``RETENTION_DELETE_SQL``) is two range searches of
+idx_samples_ts, not a table scan. ``maybe_vacuum`` runs at most once a day,
+and only when the reclaimable fraction of the file is worth a whole-file
+rewrite. Both gates treat a stamp in the future as due.
 
 Trailing window
 ---------------
@@ -70,7 +74,15 @@ from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
 from sampler.metrics import SampleKey, Samples
 
-__all__ = ['SCHEMA', 'Connect', 'GroupRecord', 'LoadSampleStore', 'connect_durably', 'stamp_is_due']
+__all__ = [
+    'RETENTION_DELETE_SQL',
+    'SCHEMA',
+    'Connect',
+    'GroupRecord',
+    'LoadSampleStore',
+    'connect_durably',
+    'stamp_is_due',
+]
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +108,7 @@ _INDEXES_DDL = (
     'CREATE INDEX IF NOT EXISTS idx_samples_metric_ts_leaf ON samples (metric, ts, leaf)',
     'CREATE INDEX IF NOT EXISTS idx_samples_metric_leaf_ts ON samples (metric, leaf, ts)'
     ' WHERE leaf IS NOT NULL',
+    'CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples (ts)',
 )
 
 SCHEMA: str = '\n'.join([_TABLES_DDL, *(f'{ddl};' for ddl in _INDEXES_DDL)]) + '\n'
@@ -116,6 +129,9 @@ _VACUUM_MIN_RECLAIMABLE_FRACTION = 0.10
 _TRAILING_WINDOW_SAMPLES = 60
 
 _SET_META_SQL = 'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)'
+
+# Bound to (oldest kept ts, newest kept ts); both arms search idx_samples_ts.
+RETENTION_DELETE_SQL = 'DELETE FROM samples WHERE ts < ? OR ts > ?'
 
 _GET_META_SQL = 'SELECT value FROM meta WHERE key = ?'
 
@@ -458,18 +474,15 @@ class LoadSampleStore:
         would ever reach. Both bounds are exclusive — a row at exactly
         ``now ± retain_seconds`` survives.
 
-        The DELETE is a full table scan, since no index leads with ``ts``,
-        which is why it runs at most once per interval. The interval is stamped
-        only after the DELETE commits, so a failure is retried on the next tick.
+        The DELETE searches idx_samples_ts from each end, so it costs the rows
+        it removes rather than the table. The interval is stamped only after
+        the DELETE commits, so a failure is retried on the next tick.
         """
         if not self.should_cleanup(now, interval_seconds=interval_seconds):
             return
         conn = self._connect()
         try:
-            conn.execute(
-                'DELETE FROM samples WHERE ts < ? OR ts > ?',
-                (now - retain_seconds, now + retain_seconds),
-            )
+            conn.execute(RETENTION_DELETE_SQL, (now - retain_seconds, now + retain_seconds))
             conn.commit()
         finally:
             conn.close()
