@@ -166,6 +166,65 @@ class TestParsePressureFileBothWindows:
         }
 
 
+class TestParsePressureTotals:
+    """The cumulative ``total=`` stall (µs) — a second projection of one scan.
+
+    PRD ``plans/per-consumer-resource-recording-prd.md`` D7 reads cgroup
+    pressure files for their totals; ``parse_pressure_file`` keeps its
+    four-key averages shape, pinned by the classes above.
+    """
+
+    def test_both_lines(self):
+        from shared.psi import parse_pressure_totals
+
+        assert parse_pressure_totals(PSI_CPU_TEXT) == {
+            'some_total': 123456,
+            'full_total': 9876,
+        }
+
+    def test_missing_full_line_defaults_to_zero(self):
+        from shared.psi import parse_pressure_totals
+
+        assert parse_pressure_totals(PSI_MEM_TEXT) == {
+            'some_total': 654321,
+            'full_total': 0,
+        }
+
+    @pytest.mark.parametrize(
+        'text',
+        ['', 'garbage line\n', 'some avg10=1.50 avg60=0.20 avg300=0.10\n', 'total=5\n'],
+    )
+    def test_no_total_returns_none(self, text):
+        from shared.psi import parse_pressure_totals
+
+        assert parse_pressure_totals(text) is None
+
+    def test_averages_are_never_mistaken_for_totals(self):
+        from shared.psi import parse_pressure_totals
+
+        assert parse_pressure_totals(
+            'some avg10=1.00 avg60=2.00 avg300=3.00 total=5\n'
+        ) == {'some_total': 5, 'full_total': 0}
+
+    def test_averages_shape_is_unchanged_by_the_totals_projection(self):
+        from shared.psi import parse_pressure_file
+
+        for text in (PSI_CPU_TEXT, PSI_MEM_TEXT, PSI_IO_TEXT):
+            result = parse_pressure_file(text)
+            assert result is not None
+            assert set(result) == {
+                'some_avg10',
+                'some_avg60',
+                'full_avg10',
+                'full_avg60',
+            }
+
+    def test_exported(self):
+        import shared.psi
+
+        assert 'parse_pressure_totals' in shared.psi.__all__
+
+
 class TestPsiSampleV2Fields:
     """PRD `plans/load-throttle-harmonisation-prd.md` §6.1 — the v2 field surface.
 

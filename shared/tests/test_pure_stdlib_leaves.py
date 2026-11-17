@@ -63,6 +63,7 @@ PURE_STDLIB_LEAVES = (
     'asyncio_tasks',
     'backends',
     'branch_names',
+    'cgroup_stats',
     'cli_boundary',
     'config_dir',
     'escalation_layout',
