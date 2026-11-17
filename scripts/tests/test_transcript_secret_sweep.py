@@ -71,6 +71,14 @@ class Recorder:
         self.calls.append(arguments)
         return {'status': 'queued'}
 
+    @property
+    def findings(self) -> list[dict]:
+        return [arguments for arguments in self.calls if arguments['category'] == 'risk_identified']
+
+    @property
+    def shortfalls(self) -> list[dict]:
+        return [arguments for arguments in self.calls if arguments['category'] == 'infra_issue']
+
 
 class FailingPoster:
     def __call__(self, arguments: dict) -> dict:
@@ -119,6 +127,8 @@ class LogTree:
         self.project = base / 'proj'
         self.project_roots = (self.project,)
         self.claude_projects = base / 'home' / '.claude' / 'projects'
+        agent_transcripts_dir(self.project).mkdir(parents=True)
+        self.claude_projects.mkdir(parents=True)
         attempt = verify_logs_dir(self.project) / '6828'
         lane_pass = offline_lane_dir(self.project) / 'qdrant-integration' / '20261020T013000Z'
         self.verify_log = _write(attempt / 'attempt-1.remote-laptop.test-X.log', [
@@ -216,13 +226,13 @@ def test_swept_trees_are_each_projects_transcripts_verify_logs_and_offline_lane_
     a, b, claude = tree.project_a, tree.project_b, tree.claude_projects
 
     assert sweep.swept_trees([a, b], claude) == (
-        sweep.SweptTree(agent_transcripts_dir(a), sweep.TRANSCRIPT_SUFFIXES),
-        sweep.SweptTree(verify_logs_dir(a), sweep.LOG_SUFFIXES),
-        sweep.SweptTree(offline_lane_dir(a), sweep.LOG_SUFFIXES),
-        sweep.SweptTree(agent_transcripts_dir(b), sweep.TRANSCRIPT_SUFFIXES),
-        sweep.SweptTree(verify_logs_dir(b), sweep.LOG_SUFFIXES),
-        sweep.SweptTree(offline_lane_dir(b), sweep.LOG_SUFFIXES),
-        sweep.SweptTree(claude, sweep.TRANSCRIPT_SUFFIXES),
+        sweep.SweptTree(agent_transcripts_dir(a), sweep.TRANSCRIPT_SUFFIXES, required=True),
+        sweep.SweptTree(verify_logs_dir(a), sweep.LOG_SUFFIXES, required=False),
+        sweep.SweptTree(offline_lane_dir(a), sweep.LOG_SUFFIXES, required=False),
+        sweep.SweptTree(agent_transcripts_dir(b), sweep.TRANSCRIPT_SUFFIXES, required=True),
+        sweep.SweptTree(verify_logs_dir(b), sweep.LOG_SUFFIXES, required=False),
+        sweep.SweptTree(offline_lane_dir(b), sweep.LOG_SUFFIXES, required=False),
+        sweep.SweptTree(claude, sweep.TRANSCRIPT_SUFFIXES, required=True),
     )
     assert {'.log', '.json', '.xml', '.xml.gz'} <= set(sweep.LOG_SUFFIXES)
 
@@ -243,7 +253,7 @@ def test_one_sweep_redacts_verify_and_offline_lane_logs(logs):
     assert logs.notes.read_bytes() == notes
     assert result.deferred == (logs.fresh,)
     assert result.unreadable == ()
-    (arguments,) = poster.calls
+    (arguments,) = poster.findings
     for path, counts in expected.items():
         ((var, n),) = counts.items()
         assert f'{path}: {var}×{n}' in arguments['detail']
@@ -318,7 +328,7 @@ def test_one_sweep_redacts_every_live_value_and_files_one_escalation(tree):
     assert result.deferred == (tree.fresh,)
     assert result.clean == 2
 
-    (arguments,) = poster.calls
+    (arguments,) = poster.findings
     assert arguments['category'] == 'risk_identified'
     assert arguments['task_id'] == 'transcript-secret-sweep'
     assert arguments['agent_role'] == 'transcript-secret-sweep'
@@ -346,7 +356,7 @@ def test_a_second_sweep_changes_nothing_and_posts_nothing(tree):
     assert {path: _identity(path) for path in tree.files()} == identities
 
 
-def test_an_environment_without_secrets_cannot_run(tree):
+def test_an_environment_without_secrets_files_one_shortfall_escalation(tree):
     contents = {path: path.read_bytes() for path in tree.files()}
     poster = Recorder()
 
@@ -355,8 +365,72 @@ def test_an_environment_without_secrets_cannot_run(tree):
     assert not result.ok
     assert 'no secret-bearing values in the environment' in (result.cause or '')
     assert result.redacted == () and result.clean == 0 and result.deferred == ()
-    assert poster.calls == []
+    (arguments,) = poster.calls
+    assert arguments['category'] == 'infra_issue'
+    assert arguments['task_id'] == sweep.SHORTFALL_TASK_ID
+    assert sweep.SHORTFALL_TASK_ID != 'transcript-secret-sweep'
+    assert arguments['agent_role'] == 'transcript-secret-sweep'
+    assert 'no secret-bearing values in the environment' in arguments['detail']
+    (evidence,) = arguments['evidence']
+    assert set(evidence) == {'observation', 'measured_at', 'ref'}
     assert {path: path.read_bytes() for path in tree.files()} == contents
+
+
+def test_a_missing_transcript_archive_is_a_shortfall_and_the_rest_is_still_swept(tmp_path):
+    project = tmp_path / 'proj'
+    claude_projects = tmp_path / 'claude'
+    claude_projects.mkdir()
+    log = _write(verify_logs_dir(project) / '6900' / 'attempt-1.test-M.log', [f'E   {POOL_A}'])
+    config = sweep.SweepConfig(trees=sweep.swept_trees([project], claude_projects), now=NOW)
+    poster = Recorder()
+
+    result = sweep.run(config, environ=ENVIRON, post_escalation=poster)
+
+    assert result.ok
+    assert result.missing == (agent_transcripts_dir(project),)
+    assert POOL_A.encode() not in log.read_bytes()
+    assert len(poster.findings) == 1
+    (shortfall,) = poster.shortfalls
+    assert str(agent_transcripts_dir(project)) in shortfall['detail']
+    assert result.record()['missing'] == [str(agent_transcripts_dir(project))]
+    _no_value_in(json.dumps(poster.calls))
+    _no_value_in(json.dumps(result.record()))
+
+
+def test_absent_verify_log_and_offline_lane_dirs_are_not_a_shortfall(tmp_path):
+    project = tmp_path / 'proj'
+    claude_projects = tmp_path / 'claude'
+    claude_projects.mkdir()
+    _write(agent_transcripts_dir(project) / '7003' / '-enc' / 'sid.jsonl', [_line_with('nothing to see')])
+    config = sweep.SweepConfig(trees=sweep.swept_trees([project], claude_projects), now=NOW)
+    poster = Recorder()
+
+    result = sweep.run(config, environ=ENVIRON, post_escalation=poster)
+
+    assert result.missing == ()
+    assert poster.calls == []
+
+
+def test_unswept_problems_are_a_shortfall(tree):
+    config = sweep.SweepConfig(
+        trees=sweep.swept_trees(tree.project_roots, tree.claude_projects),
+        now=NOW,
+        unswept=('units dir: cannot list units: boom',),
+    )
+    poster = Recorder()
+
+    sweep.run(config, environ=ENVIRON, post_escalation=poster)
+
+    (shortfall,) = poster.shortfalls
+    assert 'cannot list units: boom' in shortfall['detail']
+    assert len(poster.findings) == 1
+    _no_value_in(json.dumps(poster.calls))
+
+
+def test_a_shortfall_escalation_that_cannot_be_filed_is_reported(tree):
+    result = sweep.run(tree.config(), environ={'PATH': '/usr/bin'}, post_escalation=FailingPoster())
+
+    assert result.escalation_error == 'ConnectionError: escalation server unreachable'
 
 
 def test_a_refused_line_is_escalated_and_the_rest_of_its_file_is_redacted(tmp_path):
@@ -380,7 +454,7 @@ def test_a_refused_line_is_escalated_and_the_rest_of_its_file_is_redacted(tmp_pa
     assert held_refused_line == refused_line
     assert value.encode() not in held_safe_line
     assert len(held_safe_line) == len(safe_line)
-    (arguments,) = poster.calls
+    (arguments,) = poster.findings
     assert '1 line(s) in 1 file(s) refused' in arguments['summary']
     assert f'{held}: refused (CLAUDE_OAUTH_TOKEN_B on line 2), left un-redacted' in arguments['detail']
     assert f'{held}: CLAUDE_OAUTH_TOKEN_B×1' in arguments['detail']
@@ -474,12 +548,19 @@ class TestMain:
                 monkeypatch.delenv(name)
 
     def _argv(
-        self, tree: Tree | LogTree, tmp_path: Path, *, escalation_url: str = 'http://127.0.0.1:1/mcp'
+        self,
+        tree: Tree | LogTree,
+        tmp_path: Path,
+        *,
+        escalation_url: str = 'http://127.0.0.1:1/mcp',
+        claude_projects: Path | None = None,
     ) -> list[str]:
+        units_dir = tmp_path / 'units'
+        units_dir.mkdir(exist_ok=True)
         return [
             *(arg for root in tree.project_roots for arg in ('--project-root', str(root))),
-            '--units-dir', str(tmp_path / 'no-units'),
-            '--claude-projects-dir', str(tree.claude_projects),
+            '--units-dir', str(units_dir),
+            '--claude-projects-dir', str(claude_projects or tree.claude_projects),
             '--escalation-url', escalation_url,
             '--min-age-secs', '0',
         ]
@@ -520,9 +601,30 @@ class TestMain:
     def test_an_environment_without_secrets_exits_2(self, secretless_environ, tmp_path, capsys):
         tree = Tree(tmp_path)
 
-        assert sweep.main(self._argv(tree, tmp_path)) == 2
+        with StubMcpServer(stateful=True, payload={'id': 'esc-1', 'status': 'pending'}) as server:
+            assert sweep.main(self._argv(tree, tmp_path, escalation_url=f'{server.url}/mcp')) == 2
 
-        assert self._record(capsys)['ok'] is False
+        record = self._record(capsys)
+        assert record['ok'] is False
+        assert record['escalation_error'] is None
+        ((name, arguments),) = _served_tool_calls(server)
+        assert name == 'escalate_info'
+        assert arguments['category'] == 'infra_issue'
+
+    def test_a_missing_required_root_exits_2(self, secretless_environ, monkeypatch, tmp_path, capsys):
+        monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', POOL_A)
+        tree = Tree(tmp_path)
+        absent_claude = tmp_path / 'absent-claude'
+
+        with StubMcpServer(stateful=True, payload={'id': 'esc-1', 'status': 'pending'}) as server:
+            argv = self._argv(tree, tmp_path, escalation_url=f'{server.url}/mcp', claude_projects=absent_claude)
+            assert sweep.main(argv) == 2
+
+        out, err = capsys.readouterr()
+        (line,) = out.splitlines()
+        assert str(absent_claude) in json.loads(line)['missing']
+        assert str(absent_claude) in err
+        assert POOL_A not in out + err
 
     def test_an_escalation_that_cannot_be_filed_exits_2(self, secretless_environ, monkeypatch, tmp_path, capsys):
         monkeypatch.setenv('CLAUDE_OAUTH_TOKEN_A', POOL_A)
