@@ -102,7 +102,7 @@ from shared.mcp_markup_middleware import (
 )
 from shared.mcp_missing_arguments import MissingArgumentMiddleware
 from shared.plan_deviation import DeviationRecord, UnknownDeviationKind
-from shared.toolcall_markup import detect_for, repair
+from shared.toolcall_markup import detect_for, only_inert_html_closers, repair
 
 from orchestrator import plan_descope, quarantine_provenance
 from orchestrator.artifacts import Plan, PlanConfirmation, PlanState, TaskArtifacts
@@ -481,7 +481,8 @@ def _repair_one_field(
 
     *holder* is the plan dict itself for a top-level record, or one item of
     ``plan[record.collection]`` otherwise. ``None`` means nothing to report:
-    the value is absent, is not a str, or carries no envelope literal at all.
+    the value is absent, is not a str, carries no envelope literal at all, or
+    carries only quoted HTML closers (see below).
 
     THE CONTRACT IS BINARY. ``repair()`` validates -> the field becomes
     ``clean_value``. ``repair()`` declines -> the field is left BYTE-IDENTICAL
@@ -494,7 +495,9 @@ def _repair_one_field(
     and opening tags in ordinary sentences. A trailing-only sanitize would
     silently mutilate that authored text, which is the same class of
     silent-wrong-value damage this whole PRD exists to end. Never partial,
-    never guessed.
+    never guessed. A declined value whose every needle is a quoted HTML closer
+    is no fact at all, by the same predicate the write boundary asks:
+    ``shared/src/shared/toolcall_markup.py::only_inert_html_closers``.
 
     THE ONE ACCEPTED TRUNCATION, AND WHY IT IS ASYMMETRIC. A value ending in
     the field's OWN closer is cut at that tag with nothing recovered, and
@@ -593,6 +596,8 @@ def _repair_one_field(
         supplied=supplied,
     )
     if result is None:
+        if only_inert_html_closers(value, record.field, record.schema_params):
+            return None
         return {
             'tool': _COLLECTION_SCHEMA_TOOL[record.collection],
             'also_written_by': list(record.also_written_by),
