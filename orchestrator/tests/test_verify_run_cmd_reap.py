@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
-from shared.proc_group import pid_running
+from df_pytest_isolation import wait_pids_exited
 
 from orchestrator.verify import _run_cmd
 
@@ -32,15 +32,6 @@ _LEAKER = (
 )
 
 
-async def _wait_all_dead(pids: list[int], timeout: float = 10.0) -> bool:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while any(pid_running(pid) for pid in pids):
-        if asyncio.get_running_loop().time() >= deadline:
-            return False
-        await asyncio.sleep(0.05)
-    return True
-
-
 def _leaker_pids(cwd: Path) -> tuple[int, int]:
     leader = int((cwd / 'leader.pid').read_text())
     child = int((cwd / 'child.pid').read_text())
@@ -48,7 +39,7 @@ def _leaker_pids(cwd: Path) -> tuple[int, int]:
 
 
 def _kill_leftovers(leader: int, child: int) -> None:
-    if pid_running(leader) or pid_running(child):
+    if wait_pids_exited({leader, child}, timeout=0):
         with contextlib.suppress(ProcessLookupError):
             os.killpg(leader, signal.SIGKILL)
 
@@ -106,8 +97,11 @@ async def test_log_flush_failure_reaps_process_group(tmp_path: Path):
     leader, child = _leaker_pids(tmp_path)
     try:
         _assert_command_failed(rc, out, timed_out)
-        assert await _wait_all_dead([leader, child]), (
-            f'leader {leader} / child {child} outlived _run_cmd'
+        survivors = await asyncio.to_thread(
+            wait_pids_exited, {leader, child}, timeout=10.0,
+        )
+        assert survivors == {}, (
+            f'leader {leader} / child {child} outlived _run_cmd: {survivors}'
         )
     finally:
         _kill_leftovers(leader, child)
@@ -133,8 +127,11 @@ async def test_log_flush_failure_under_cgroup_scope_kills_scope_then_group(
             f'--user kill --signal=SIGKILL {unit}',
             f'--user stop {unit}',
         ]
-        assert await _wait_all_dead([leader, child]), (
-            f'leader {leader} / child {child} outlived _run_cmd'
+        survivors = await asyncio.to_thread(
+            wait_pids_exited, {leader, child}, timeout=10.0,
+        )
+        assert survivors == {}, (
+            f'leader {leader} / child {child} outlived _run_cmd: {survivors}'
         )
     finally:
         _kill_leftovers(leader, child)
