@@ -13,7 +13,11 @@ samples(ts, metric, value, window_mean, window_max, leaf)
 
 meta(key, value)
     Two independent clocks: last_cleanup_ts for the retention gate and
-    last_vacuum_ts for the VACUUM gate.
+    last_vacuum_ts for the VACUUM gate. And one ``GroupRecord`` per collection
+    group, under ``group:<name>:attempted``, ``:state`` and ``:log``: the
+    group's last attempted collection, the state its collector carries to the
+    next one, and its log throttle. Every tick is a process of its own, so
+    whatever a group remembers between ticks lives here.
 
 Migration
 ---------
@@ -30,7 +34,8 @@ default, and lives for one call.
 Writing
 -------
 The unit of writing is the TICK: ``write_tick`` lands a whole tick in one
-transaction, or none of it.
+transaction, or none of it — its rows and its group records together, so a
+collector's state never runs ahead of, or behind, the rows computed from it.
 
 Retention
 ---------
@@ -53,7 +58,11 @@ import contextlib
 import logging
 import sqlite3
 import statistics
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol
 
 from shared.sqlite_column_migration import add_column_if_missing_sync
@@ -61,7 +70,7 @@ from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 
 from sampler.metrics import SampleKey, Samples
 
-__all__ = ['SCHEMA', 'Connect', 'LoadSampleStore', 'connect_durably']
+__all__ = ['SCHEMA', 'Connect', 'GroupRecord', 'LoadSampleStore', 'connect_durably']
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +117,8 @@ _TRAILING_WINDOW_SAMPLES = 60
 
 _SET_META_SQL = 'INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)'
 
+_GET_META_SQL = 'SELECT value FROM meta WHERE key = ?'
+
 _INSERT_SQL = (
     'INSERT INTO samples (ts, metric, leaf, value, window_mean, window_max)'
     ' VALUES (?, ?, ?, ?, ?, ?)'
@@ -123,6 +134,63 @@ _HOST_WINDOW_SQL = (
 _LEAF_WINDOW_SQL = (
     'SELECT value FROM samples WHERE metric = ? AND leaf = ? ORDER BY ts DESC LIMIT ?'
 )
+
+
+@dataclass(frozen=True)
+class GroupRecord:
+    """What the store keeps for one collection group between ticks.
+
+    ``attempted_at`` is the group's due clock, ``state`` is its collector's
+    opaque carry-over, ``log_throttle`` its failure-log throttle. A field left
+    None in a write leaves the stored value unchanged; a field never written
+    reads back as None.
+    """
+
+    attempted_at: int | None = None
+    state: str | None = None
+    log_throttle: str | None = None
+
+
+class _GroupField(StrEnum):
+    ATTEMPTED = 'attempted'
+    STATE = 'state'
+    LOG = 'log'
+
+
+def _group_meta_key(name: str, field: _GroupField) -> str:
+    return f'group:{name}:{field}'
+
+
+def _stored_fields(record: GroupRecord) -> dict[_GroupField, str | None]:
+    attempted = record.attempted_at
+    return {
+        _GroupField.ATTEMPTED: None if attempted is None else str(attempted),
+        _GroupField.STATE: record.state,
+        _GroupField.LOG: record.log_throttle,
+    }
+
+
+def _record_from(stored: Mapping[_GroupField, str | None]) -> GroupRecord:
+    attempted = stored[_GroupField.ATTEMPTED]
+    return GroupRecord(
+        attempted_at=None if attempted is None else int(attempted),
+        state=stored[_GroupField.STATE],
+        log_throttle=stored[_GroupField.LOG],
+    )
+
+
+def _group_meta_rows(records: Mapping[str, GroupRecord]) -> list[tuple[str, str]]:
+    return [
+        (_group_meta_key(name, field), value)
+        for name, record in records.items()
+        for field, value in _stored_fields(record).items()
+        if value is not None
+    ]
+
+
+def _meta_value(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute(_GET_META_SQL, (key,)).fetchone()
+    return row[0] if row else None
 
 
 class Connect(Protocol):
@@ -232,6 +300,7 @@ class LoadSampleStore:
         *,
         unwindowed: Samples,
         windowed: Samples,
+        records: Mapping[str, GroupRecord] = MappingProxyType({}),
         window: int = _TRAILING_WINDOW_SAMPLES,
     ) -> None:
         """Write one whole tick on ONE connection inside ONE transaction.
@@ -249,8 +318,12 @@ class LoadSampleStore:
         whole tick or none of it: the corpus never holds half a tick. The
         connection and commit cost is one per tick, whatever the metric count;
         each windowed metric still costs one indexed window read.
+
+        *records* are upserted into meta in the same transaction, keyed by
+        group name, so a group's state commits with its rows or not at all. A
+        tick with records and no rows still writes them.
         """
-        if not unwindowed and not windowed:
+        if not unwindowed and not windowed and not records:
             return
         conn = self._connect()
         try:
@@ -267,6 +340,7 @@ class LoadSampleStore:
                 )
                 rows.append((ts, key.metric, key.leaf, value, window_mean, window_max))
             conn.executemany(_INSERT_SQL, rows)
+            conn.executemany(_SET_META_SQL, _group_meta_rows(records))
             conn.commit()
         finally:
             conn.close()
@@ -315,6 +389,34 @@ class LoadSampleStore:
             return self._trailing_window(conn, key, current_value, window=window)
         finally:
             conn.close()
+
+    # ------------------------------------------------------------------
+    # Group records
+    # ------------------------------------------------------------------
+
+    def read_group_records(self, names: Iterable[str]) -> dict[str, GroupRecord]:
+        """Every named group's record, all read on ONE connection.
+
+        A group never written reads as an empty ``GroupRecord()``.
+        """
+        conn = self._connect()
+        try:
+            return {
+                name: _record_from(
+                    {field: _meta_value(conn, _group_meta_key(name, field)) for field in _GroupField}
+                )
+                for name in names
+            }
+        finally:
+            conn.close()
+
+    def is_group_due(self, name: str, now: int, due_seconds: int) -> bool:
+        """True when *name* was never attempted, or its attempt is ``due_seconds`` old.
+
+        The same clock as the retention and VACUUM gates, so an attempt stamped
+        in the future is due too.
+        """
+        return self._is_due(_group_meta_key(name, _GroupField.ATTEMPTED), now, due_seconds)
 
     # ------------------------------------------------------------------
     # Retention
@@ -374,10 +476,9 @@ class LoadSampleStore:
     def _get_meta(self, key: str) -> str | None:
         conn = self._connect()
         try:
-            row = conn.execute('SELECT value FROM meta WHERE key = ?', (key,)).fetchone()
+            return _meta_value(conn, key)
         finally:
             conn.close()
-        return row[0] if row else None
 
     def _set_meta(self, key: str, value: str) -> None:
         conn = self._connect()
