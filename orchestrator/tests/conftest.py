@@ -87,6 +87,7 @@ from df_pytest_isolation import (  # noqa: E402
     _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
+    _df_no_mock_derived_stray_dirs,  # noqa: F401  — the binding IS the wiring  # debt: task 6997
     _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — the binding IS the wiring
     arm_leaked_drain_process_guard,
     arm_usage_gate_sweep_confinement,
@@ -459,52 +460,6 @@ def _isolate_warm_lane_script_dir(monkeypatch):
     """
     monkeypatch.setenv(
         "ORCH_WARM_LANE_SCRIPT_DIR", _ABSENT_WARM_LANE_SCRIPT_DIR,
-    )
-
-
-@pytest.fixture(autouse=True)
-def _no_mock_derived_stray_dirs(request):
-    """Fail any test that leaves a ``MagicMock/`` DIRECTORY in the process CWD.
-
-    **Mechanism.**  ``unittest.mock.MagicMock`` configures ``__fspath__`` as a
-    supported magic method whose default return value is a genuine ``str``.  A
-    MagicMock is therefore a *fully valid* ``os.PathLike[str]``, and
-    ``os.fspath()`` of one is derived from its repr, so it ALWAYS begins with a
-    literal ``MagicMock`` path component::
-
-        os.fspath(MagicMock().project_root / 'data' / 'x.json')
-        # -> 'MagicMock/mock.project_root.__truediv__()...()/1404727137'
-
-    Any production code that coerces such an object with ``Path()`` and then
-    creates directories materialises that tree for real, relative to the
-    process CWD.  Task 3223 hit exactly this: ``merge_queue`` read
-    ``project_root`` off a MagicMock, handed the derived path to
-    ``LandedOutbox``, and ``shared.safe_io.atomic_write_text(..., mkdir=True)``
-    dutifully created it — landing a junk tree in a commit.  The write
-    primitive cannot detect this (there is no type-level signal separating a
-    mock from a genuine relative path), so the fence belongs here.
-
-    The fixture REMOVES the tree as well as failing, so a single polluting test
-    does not cascade into a failure for every subsequent test sharing the same
-    xdist worker's CWD.
-
-    **``os.fspath()`` shape only.**  This covers the ``MagicMock/`` tree; the
-    sibling :func:`_no_mock_repr_stray_entries` covers any file or directory
-    named by a mock's ``str()``/repr, ``<MagicMock name='...' id='...'>``.
-    """
-    yield
-    stray = Path.cwd() / "MagicMock"
-    if not stray.exists():
-        return
-    shutil.rmtree(stray, ignore_errors=True)
-    pytest.fail(
-        f"{request.node.nodeid} left a mock-derived directory at {stray}. "
-        "A MagicMock is a valid os.PathLike[str] whose os.fspath() is "
-        "repr-derived, so passing one where real code calls Path(...).mkdir() "
-        "creates a real tree under the CWD. Give the mock a genuine path "
-        "(e.g. `git_ops.project_root = tmp_path`) rather than leaving the "
-        "attribute to auto-spec into a child mock. The stray tree has been "
-        "removed so following tests are unaffected."
     )
 
 

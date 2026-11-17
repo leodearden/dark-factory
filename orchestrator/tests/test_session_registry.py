@@ -5036,7 +5036,7 @@ def _run_row(
     # The canonical test_command runs ``cd orchestrator && pytest tests/``, so it
     # only bit an ad-hoc ``pytest orchestrator/tests/...`` from the root — which
     # is exactly what someone checking this one file types.  A neutral cwd holds
-    # either way.  (conftest.py's autouse ``_no_mock_derived_stray_dirs`` is a
+    # either way.  (conftest.py's autouse ``_df_no_mock_derived_stray_dirs`` is a
     # second reason never to let a subprocess inherit the suite's cwd.)
     return subprocess.run(
         argv,
