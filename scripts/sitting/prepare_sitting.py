@@ -46,7 +46,7 @@ from orchestrator.decision_registry import (  # noqa: E402  # debt: task 6760
     list_decisions,
 )
 from orchestrator.fleet_files import fleet_root  # noqa: E402  # debt: task 6760
-from orchestrator.session_records import sessions_dir  # noqa: E402
+from orchestrator.session_records import sessions_dir  # noqa: E402  # debt: task 6760
 from sitting import brief, gates, inventory, ownership, payloads  # noqa: E402
 from sitting import ledger as ledgers  # noqa: E402
 from sitting import preparation as preparations  # noqa: E402

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest  # pyright: ignore[reportMissingImports]
 
@@ -176,7 +177,8 @@ def test_hand_launched_hooks_converge_on_one_record_named_for_the_repo(acme: Pat
     sh.run_session_start({'session_id': 'sess-5181', 'cwd': str(start_cwd)}, env={}, root=fleet)
     sh.run_stop({'session_id': 'sess-5181', 'cwd': str(stop_cwd)}, env={}, root=fleet)
 
-    slug = session_records.build_session_slug('session', 'acme', None, 'sess-5181')  # type: ignore[arg-type]
+    session_id_in_pid_slot: Any = 'sess-5181'
+    slug = session_records.build_session_slug('session', 'acme', None, session_id_in_pid_slot)
     assert [entry.name for entry in session_records.sessions_dir(fleet).iterdir()] == [slug]
     record = session_records.read_record(slug, root=fleet)
     assert record.project == 'acme'

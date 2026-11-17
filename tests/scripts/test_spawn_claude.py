@@ -56,7 +56,7 @@ from df_pytest_isolation import (
 )
 from orchestrator import (
     session_hooks,  # pyright: ignore[reportAttributeAccessIssue]
-    session_records,  # pyright: ignore[reportAttributeAccessIssue]
+    session_records,
     session_registry,  # pyright: ignore[reportAttributeAccessIssue]
 )
 
