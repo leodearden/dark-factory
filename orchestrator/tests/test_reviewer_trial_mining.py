@@ -24,6 +24,7 @@ from _reviewer_trial_mining_fixtures import (
 from click.testing import CliRunner
 from shared.cli_invoke import AgentResult
 
+from orchestrator.evals.measurement import MeasurementStage, Scored, Unmeasured, UnmeasuredCause
 from orchestrator.evals.reviewer_trial.__main__ import cli
 from orchestrator.evals.reviewer_trial.adjudication import AdjudicationLog, select_spot_check_subset
 from orchestrator.evals.reviewer_trial.corpus import CorpusDiff, CorpusManifest, GroundTruthIssue
@@ -32,6 +33,7 @@ from orchestrator.evals.reviewer_trial.mining import (
     FnCandidate,
     RecoveredCandidate,
     admit_mined_diff,
+    admit_proposal,
     assign_split,
     audit_corpus,
     backfill_hand_authored,
@@ -871,3 +873,44 @@ class TestAdmitMinedDiff:
             'mined_42', 'opus', [asdict(gt) for gt in diff.ground_truth], False,
         )
         assert '42' in entry.notes
+
+
+class TestAdmitProposal:
+    """admit_proposal admits a diff only when the proposer measured and proposed at least one issue."""
+
+    @staticmethod
+    def _admit(
+        proposal: Scored[list[GroundTruthIssue]] | Unmeasured, tmp_path: Path,
+    ) -> tuple[CorpusDiff | None, CorpusManifest, AdjudicationLog]:
+        manifest, log = CorpusManifest(diffs=[]), AdjudicationLog()
+        recovered = RecoveredCandidate(_candidate('42', None), 'abc123', 'diff --git a/x.py b/x.py\n+x\n')
+        admitted = admit_proposal(
+            manifest, log, recovered, proposal,
+            description='desc', escalation_refs=[], runs_db=tmp_path / 'runs.db', frontier_model='opus',
+        )
+        return admitted, manifest, log
+
+    def test_an_unmeasured_proposal_admits_nothing(self, tmp_path: Path) -> None:
+        refused = Unmeasured(MeasurementStage.LABEL_PROPOSER, UnmeasuredCause.CAP_HIT, 'r', cost_usd=0.3)
+
+        admitted, manifest, log = self._admit(refused, tmp_path)
+
+        assert admitted is None
+        assert (manifest.diffs, log.entries) == ([], [])
+
+    def test_a_measured_empty_proposal_admits_nothing(self, tmp_path: Path) -> None:
+        admitted, manifest, log = self._admit(Scored([], cost_usd=0.1), tmp_path)
+
+        assert admitted is None
+        assert (manifest.diffs, log.entries) == ([], [])
+
+    def test_a_proposal_with_issues_is_admitted_and_logged(self, tmp_path: Path) -> None:
+        issues = [_issue('mined_42')]
+
+        admitted, manifest, log = self._admit(Scored(issues, cost_usd=0.1), tmp_path)
+
+        assert admitted is not None
+        assert (admitted.diff_id, admitted.ground_truth) == ('mined_42', issues)
+        assert manifest.diffs == [admitted]
+        [entry] = log.entries
+        assert (entry.diff_id, entry.frontier_model) == ('mined_42', 'opus')
