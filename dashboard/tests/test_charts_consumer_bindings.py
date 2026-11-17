@@ -7,9 +7,10 @@ it is exactly what made HBarChart look like it had five call sites when it had
 two (task 3681, which closed out that component's null-sample defects and found
 the stale imports while measuring its real blast radius).
 
-SCOPED TO THE DESTRUCTURE SHAPE ONLY — deliberate, not an oversight.  Nine .jsx
-files under static/redux/ touch ``window.DF_CHARTS``, but only five reach it by
-a ``const { ... } = window.DF_CHARTS`` destructure.  The others use:
+SCOPED TO THE DESTRUCTURE SHAPE ONLY — deliberate, not an oversight.  Not every
+.jsx under static/redux/ that reads ``window.DF_CHARTS`` reaches it by a
+``const { ... } = window.DF_CHARTS`` destructure (``_destructure_consumers``
+below is the live list of those that do).  The others use:
 
   - a NAMESPACE binding (``const C = window.DF_CHARTS;`` —
     esc_flow_diagram.jsx, tab_escalation_analytics.jsx, tab_escalations.jsx)
