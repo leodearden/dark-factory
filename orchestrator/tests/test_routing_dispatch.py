@@ -203,7 +203,9 @@ class TestEmitsPhase:
     invocation_end row; project-level/batch callers pass none and the column
     stays NULL (task 5350)."""
 
-    async def _emit(self, store: EventStore, **phase_kwarg: WorkflowState) -> None:
+    async def _emit(
+        self, store: EventStore, phase: WorkflowState | None = None,
+    ) -> None:
         with patch(f'{_HELPER}.resolve_route', return_value=_fake_decision()):
             await resolve_and_record_route(
                 role_name='steward',
@@ -212,7 +214,7 @@ class TestEmitsPhase:
                 task_id='5350',
                 task_metadata={},
                 event_store=store,
-                **phase_kwarg,
+                phase=phase,
             )
 
     async def test_phase_is_stamped_on_the_event_row(self, tmp_path: Path) -> None:
