@@ -46,6 +46,7 @@ from escalation.pins import classify_pins
 from escalation.queue import EscalationQueue
 
 from orchestrator.agents.roles import STEWARD
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import _is_gating_escalation
 from orchestrator.workflow_types import WorkflowOutcome
@@ -225,6 +226,56 @@ class TestInfoL1DoesNotHandOffAtTheWaitTail:
         assert 'blocked' not in scheduler.statuses.get(task_id, [])
         still_pending = queue.get_by_task(task_id, status='pending', level=1)
         assert [e.id for e in still_pending] == [info_l1.id]
+
+
+@pytest.mark.asyncio
+class TestInfoL1DoesNotDivertTheStewardRequeue:
+    """``_mark_blocked``'s steward wait: an info L1 left on the task never
+    turns the steward's resolution into a ``blocked`` park; a blocking one
+    still does (PRD D3)."""
+
+    async def _mark_blocked_with_l1_open(
+        self, config, git_ops, task_assignment, tmp_path, severity: str,
+    ):
+        queue = EscalationQueue(tmp_path / 'queue')
+        task_id = task_assignment.task_id
+        l1 = _submit_l1(queue, task_id, severity, agent_role='harness-info-l0-router')
+        workflow, scheduler, _ = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, AgentStub(), tmp_path,
+            spawn_merge_worker=False,
+            steward_factory=_make_resolving_steward(queue, task_id),
+            queue=queue,
+        )
+        wt = (await git_ops.create_worktree(task_id)).path
+        workflow.worktree = wt
+        workflow.artifacts = TaskArtifacts(wt)
+
+        outcome = await asyncio.wait_for(
+            workflow._mark_blocked('architect produced no plan.json'), 20,
+        )
+        open_l1 = queue.get_by_task(task_id, status='pending', level=1)
+        return outcome, scheduler.statuses.get(task_id, []), open_l1, l1
+
+    async def test_an_info_l1_left_open_requeues_once_the_steward_resolves(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        outcome, statuses, open_l1, info_l1 = await self._mark_blocked_with_l1_open(
+            config, git_ops, task_assignment, tmp_path, 'info',
+        )
+
+        assert outcome == WorkflowOutcome.REQUEUED, f'an info L1 must not hand off; got {outcome}'
+        assert statuses[-1] == 'pending', statuses
+        assert [e.id for e in open_l1] == [info_l1.id]
+
+    async def test_a_blocking_l1_left_open_still_parks_the_task(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        outcome, statuses, _, _ = await self._mark_blocked_with_l1_open(
+            config, git_ops, task_assignment, tmp_path, 'blocking',
+        )
+
+        assert outcome == WorkflowOutcome.ESCALATED
+        assert statuses[-1] == 'blocked', statuses
 
 
 @pytest.mark.asyncio

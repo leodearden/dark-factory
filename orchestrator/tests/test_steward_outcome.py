@@ -218,9 +218,47 @@ class TestAwaitStewardCompletionCancelSafety:
         assert outcome == StewardInterrupted('timeout', wip_commits_present=True)
 
 
+def _submit_l0(queue: EscalationQueue, task_id: str = '2248') -> Escalation:
+    """Submit the pending blocking L0 a ``_mark_blocked`` wait is scoped to."""
+    esc = Escalation(
+        id=queue.make_id(task_id), task_id=task_id, agent_role='implementer',
+        severity='blocking', category='task_failure', summary='architect produced no plan',
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _submit_l1(
+    queue: EscalationQueue, severity: str, agent_role: str = 'harness-info-l0-router',
+    task_id: str = '2248',
+) -> Escalation:
+    """Submit a pending level-1 record of the shape ``escalation_router._promote`` files."""
+    esc = Escalation(
+        id=queue.make_id(task_id), task_id=task_id, agent_role=agent_role,
+        severity=severity, category='design_concern',
+        summary=f'a {severity!r} L1 open on the task', level=1,
+    )
+    queue.submit(esc)
+    return esc
+
+
+def _workflow_on_a_real_queue(
+    tmp_path: Path,
+) -> tuple[TaskWorkflow, EscalationQueue, asyncio.Queue[PublishedStewardOutcome]]:
+    wf = _make_workflow(tmp_path=tmp_path)
+    wf.config.steward_completion_timeout = 5.0
+    queue = EscalationQueue(tmp_path / 'queue')
+    wf.escalation_queue = queue
+    channel: asyncio.Queue[PublishedStewardOutcome] = asyncio.Queue()
+    wf._steward_outcome_channel = channel
+    wf.scheduler.get_status = AsyncMock(return_value='blocked')
+    wf._worktree_has_wip_commits = AsyncMock(return_value=False)
+    return wf, queue, channel
+
+
 @pytest.mark.asyncio
 class TestAwaitStewardCompletionOverrideDismissesOrphanL0:
-    """Amendment (review fix — ``orphan_resource_leak``): the ``has_open_l1``
+    """Amendment (review fix — ``orphan_resource_leak``): the open-L1 hand-off
     override that substitutes a requeue-producing outcome with
     ``StewardReescalatedL1`` must dismiss the still-pending L0 when the
     substituted outcome was a wip-present ``StewardInterrupted`` — that
@@ -233,34 +271,20 @@ class TestAwaitStewardCompletionOverrideDismissesOrphanL0:
     async def test_wip_interrupted_override_dismisses_pending_l0(
         self, tmp_path: Path,
     ):
-        wf = _make_workflow(tmp_path=tmp_path)
-        wf.config.steward_completion_timeout = 5.0
-        wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-orig-0', StewardInterrupted('attempt_cap', wip_commits_present=True),
+        wf, queue, channel = _workflow_on_a_real_queue(tmp_path)
+        pending_l0 = _submit_l0(queue)
+        l1 = _submit_l1(queue, 'blocking', agent_role='steward')
+        channel.put_nowait(PublishedStewardOutcome(
+            pending_l0.id, StewardInterrupted('attempt_cap', wip_commits_present=True),
         ))
-        wf.scheduler.get_status = AsyncMock(return_value='blocked')
-        wf.escalation_queue = MagicMock()
-        wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
-        pending_l0 = MagicMock(id='esc-orig-0')
-
-        def _get_by_task(task_id, *, status, level):
-            if level == 1:
-                return [MagicMock(id='L1')]
-            assert level == 0
-            assert status == 'pending'
-            return [pending_l0]
-
-        wf.escalation_queue.get_by_task = MagicMock(side_effect=_get_by_task)
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 
-        assert outcome == StewardReescalatedL1(esc_id='L1')
-        wf.escalation_queue.resolve.assert_called_once()
-        call = wf.escalation_queue.resolve.call_args
-        assert call.args[0] == 'esc-orig-0'
-        assert call.kwargs.get('dismiss') is True
-        assert call.kwargs.get('resolved_by') == 'auto-dismissed'
+        assert outcome == StewardReescalatedL1(esc_id=l1.id)
+        dismissed = queue.get(pending_l0.id)
+        assert dismissed is not None
+        assert dismissed.status == 'dismissed'
+        assert dismissed.resolved_by == 'auto-dismissed'
 
     async def test_resolved_override_does_not_touch_l0(
         self, tmp_path: Path,
@@ -269,23 +293,79 @@ class TestAwaitStewardCompletionOverrideDismissesOrphanL0:
         must NOT run the new dismissal loop — that outcome's own L0 is
         already resolved by the steward itself; this amendment is scoped to
         the wip-present ``StewardInterrupted`` case only."""
-        wf = _make_workflow(tmp_path=tmp_path)
-        wf.config.steward_completion_timeout = 5.0
-        wf._steward_outcome_channel = asyncio.Queue()
-        wf._steward_outcome_channel.put_nowait(PublishedStewardOutcome(
-            'esc-orig-0', StewardResolved(resolution_text='fixed it'),
+        wf, queue, channel = _workflow_on_a_real_queue(tmp_path)
+        pending_l0 = _submit_l0(queue)
+        l1 = _submit_l1(queue, 'blocking', agent_role='steward')
+        channel.put_nowait(PublishedStewardOutcome(
+            pending_l0.id, StewardResolved(resolution_text='fixed it'),
         ))
-        wf.scheduler.get_status = AsyncMock(return_value='blocked')
-        wf.escalation_queue = MagicMock()
-        wf.escalation_queue.has_open_l1 = MagicMock(return_value=True)
-        wf.escalation_queue.get_by_task = MagicMock(
-            return_value=[MagicMock(id='L1')],
-        )
 
         outcome = await wf._await_steward_completion(escalation_id=None)
 
-        assert outcome == StewardReescalatedL1(esc_id='L1')
-        wf.escalation_queue.resolve.assert_not_called()
+        assert outcome == StewardReescalatedL1(esc_id=l1.id)
+        untouched = queue.get(pending_l0.id)
+        assert untouched is not None
+        assert untouched.status == 'pending'
+
+
+@pytest.mark.asyncio
+class TestRequeueOverrideIgnoresInfoL1:
+    """An info L1 never diverts ``_mark_blocked``'s steward requeue
+    (plans/info-l0-disposition-router-prd.md D3): the open-L1 hand-off
+    override counts only the L1s ``escalation.pins.is_queue_handoff`` calls a
+    hand-off, and an unknown severity still fails safe."""
+
+    async def test_an_info_l1_leaves_a_resolution_to_requeue(self, tmp_path: Path):
+        wf, queue, channel = _workflow_on_a_real_queue(tmp_path)
+        awaited = _submit_l0(queue)
+        _submit_l1(queue, 'info')
+        channel.put_nowait(PublishedStewardOutcome(awaited.id, StewardResolved('fixed it')))
+
+        outcome = await wf._await_steward_completion(escalation_id=awaited.id)
+
+        assert outcome == StewardResolved('fixed it')
+
+    async def test_an_info_l1_leaves_a_wip_interruption_and_its_l0_alone(
+        self, tmp_path: Path,
+    ):
+        wf, queue, channel = _workflow_on_a_real_queue(tmp_path)
+        awaited = _submit_l0(queue)
+        _submit_l1(queue, 'info')
+        interrupted = StewardInterrupted('attempt_cap', wip_commits_present=True)
+        channel.put_nowait(PublishedStewardOutcome(awaited.id, interrupted))
+
+        outcome = await wf._await_steward_completion(escalation_id=awaited.id)
+
+        assert outcome == interrupted
+        still = queue.get(awaited.id)
+        assert still is not None
+        assert still.status == 'pending'
+
+    async def test_the_override_names_the_hand_off_not_the_info_l1(
+        self, tmp_path: Path,
+    ):
+        wf, queue, channel = _workflow_on_a_real_queue(tmp_path)
+        awaited = _submit_l0(queue)
+        _submit_l1(queue, 'info')
+        hand_off = _submit_l1(queue, 'blocking', agent_role='steward')
+        channel.put_nowait(PublishedStewardOutcome(awaited.id, StewardResolved('fixed it')))
+
+        outcome = await wf._await_steward_completion(escalation_id=awaited.id)
+
+        assert outcome == StewardReescalatedL1(esc_id=hand_off.id)
+
+    @pytest.mark.parametrize('severity', ['blocking', 'warn'])
+    async def test_a_non_info_l1_still_diverts_the_requeue(
+        self, tmp_path: Path, severity: str,
+    ):
+        wf, queue, channel = _workflow_on_a_real_queue(tmp_path)
+        awaited = _submit_l0(queue)
+        l1 = _submit_l1(queue, severity)
+        channel.put_nowait(PublishedStewardOutcome(awaited.id, StewardResolved('fixed it')))
+
+        outcome = await wf._await_steward_completion(escalation_id=awaited.id)
+
+        assert outcome == StewardReescalatedL1(esc_id=l1.id)
 
 
 @pytest.mark.asyncio
