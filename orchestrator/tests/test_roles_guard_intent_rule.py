@@ -3,12 +3,11 @@
 Sibling of ``test_roles_merge_conflict_rule.py`` and the rest of the
 ``test_roles_*.py`` family.
 
-THE STUDY. ``plans/unreviewed-merge-changes-study-2026-11-16/REPORT.md`` found
-four steward merge-phase changes that got past a failing repo guard at a cost
-to the design: an allowlist row, an exemption for the task's own writer, a
-staged writer split into separate writes, and a git call hidden from the
-history-leg check. Steward merge-phase changes land without review, so nothing
-downstream catches such a change.
+THE STUDY behind task 10464 found four steward merge-phase changes that got
+past a failing repo guard at a cost to the design: an allowlist row, an
+exemption for the task's own writer, a staged writer split into separate
+writes, and a git call hidden from the history-leg check. Steward merge-phase
+changes land without review, so nothing downstream catches such a change.
 
 Every assertion below is a containment or identity check against a named
 constant, never a string literal pinned against the rule's prose; the reason
@@ -20,6 +19,8 @@ from __future__ import annotations
 from orchestrator.agents.detector_guidance import (
     STEWARD_GUARD_INTENT_RULE,
     STEWARD_SUPPRESSION_RULES,
+    SUPPRESSION_RULES,
+    SUPPRESSION_SECTION_TITLE,
 )
 from orchestrator.agents.merge_conflict_guidance import STEWARD_MERGE_CONFLICT_RULE
 from orchestrator.agents.roles import ROLES, STEWARD
@@ -50,8 +51,19 @@ def test_guard_intent_rule_follows_rule_7_in_steward_prompt() -> None:
 def test_guard_intent_rule_sits_directly_above_the_suppression_rules() -> None:
     assert STEWARD_GUARD_INTENT_RULE + STEWARD_SUPPRESSION_RULES in STEWARD.system_prompt, (
         "STEWARD's system_prompt does not carry STEWARD_SUPPRESSION_RULES "
-        'directly after STEWARD_GUARD_INTENT_RULE, so the rule\'s pointer to '
-        'the suppression section below it no longer resolves.'
+        'directly after STEWARD_GUARD_INTENT_RULE, so the section the rule '
+        'points "below" to is no longer below it.'
+    )
+
+
+def test_guard_intent_rule_points_at_the_suppression_section_heading() -> None:
+    headings = [line for line in SUPPRESSION_RULES.splitlines() if line.startswith('#')]
+    assert SUPPRESSION_SECTION_TITLE.strip()
+    assert SUPPRESSION_SECTION_TITLE in STEWARD_GUARD_INTENT_RULE
+    assert any(SUPPRESSION_SECTION_TITLE in heading for heading in headings), (
+        f'No heading of SUPPRESSION_RULES ({headings}) carries '
+        'SUPPRESSION_SECTION_TITLE, so the pointer to it in '
+        'STEWARD_GUARD_INTENT_RULE names a section the steward cannot find.'
     )
 
 

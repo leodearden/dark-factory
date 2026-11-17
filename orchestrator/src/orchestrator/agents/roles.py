@@ -18,6 +18,7 @@ from orchestrator.agents.detector_guidance import (
     IMPLEMENTER_SUPPRESSION_RULES,
     STEWARD_GUARD_INTENT_RULE,
     STEWARD_SUPPRESSION_RULES,
+    TYPE_ESCAPES,
 )
 from orchestrator.agents.deviation_doctrine import render_deviation_doctrine
 from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
@@ -1171,7 +1172,7 @@ the severity rules below say:
    (`git branch --show-current`).
 2. **Unrelated citation** — a marker cites a task or ticket that has nothing to do
    with the debt it excuses.
-3. **Type contortion** — an Any or cast introduced in place of a scoped ignore
+3. **Type contortion** — an """ + TYPE_ESCAPES + """ introduced in place of a scoped ignore
    (or in place of fixing the type).
 4. **Baseline growth** — any added line in the inline baseline
    (`scripts/inline_suppression_baseline.json`).

@@ -19,6 +19,7 @@ from orchestrator.agents.detector_guidance import (
     IMPLEMENTER_SUPPRESSION_RULES,
     STEWARD_SUPPRESSION_RULES,
     SUPPRESSION_RULES,
+    TYPE_ESCAPES,
 )
 from orchestrator.agents.roles import (
     IMPLEMENTER,
@@ -30,8 +31,6 @@ from orchestrator.agents.roles import (
 _SUPPRESSION_READERS = pytest.mark.parametrize(
     'role', [IMPLEMENTER, STEWARD], ids=lambda role: role.name,
 )
-
-_TYPE_ESCAPES = ('Any', 'cast')
 
 
 @_SUPPRESSION_READERS
@@ -61,10 +60,10 @@ def test_each_role_carries_only_its_own_closing():
     assert IMPLEMENTER_SUPPRESSION_RULES != STEWARD_SUPPRESSION_RULES
 
 
-@pytest.mark.parametrize('escape', _TYPE_ESCAPES)
-def test_shared_rules_name_the_type_escapes_the_reviewer_blocks(escape):
-    assert escape in REVIEWER_INV12_BLOCKERS
-    assert escape in SUPPRESSION_RULES
+def test_shared_rules_name_the_type_escapes_the_reviewer_blocks():
+    assert TYPE_ESCAPES.strip()
+    assert TYPE_ESCAPES in REVIEWER_INV12_BLOCKERS
+    assert TYPE_ESCAPES in SUPPRESSION_RULES
 
 
 def test_the_reviewer_blockers_sit_in_the_contract_a_pinned_artifact_cannot_replace():
