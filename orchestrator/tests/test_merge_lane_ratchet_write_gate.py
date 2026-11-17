@@ -2,8 +2,9 @@
 
 The baseline ``write_baseline`` renders and reads, its refusal of an unauthorized
 raise, the authorized-raise ledger it appends to, and the comparator that both
-the write gate and ``--check`` run. The live gate, the measurement stratum and the
-command line are in ``test_merge_lane_ratchet.py``; the commit-time gate is in
+the write gate and ``--check`` run. The live gate, the measurement stratum, the
+derived totals, the stored enumeration block and the command line are in
+``test_merge_lane_ratchet.py``; the commit-time gate is in
 ``test_merge_lane_ratchet_commit_delta.py`` and ``test_merge_lane_ratchet_commit_gate.py``.
 """
 from __future__ import annotations
@@ -26,6 +27,66 @@ from _merge_lane_ratchet_fixtures import (
     synthetic_report,
 )
 
+# ---------------------------------------------------------------------------
+# The seed baseline the write-gate, authorized-raise and comparator tests share:
+# each one mutates a deep copy of it.
+
+_VERIFIER_LOOP = f'{WORKER_RELPATH}::SpeculativeMergeWorker::_verifier_loop'
+_TEST_FILE = 'orchestrator/tests/test_merge_queue.py'
+
+
+def _ratchet_baseline() -> dict:
+    """A miniature but REAL-SHAPED baseline: real paths, real measured numbers."""
+    return {
+        'schema_version': 1,
+        'params': {
+            'complexipy_version': '6.2.0',
+            'cluster_paths': list(lane_cluster.CLUSTER_PATHS),
+            'file_line_ceiling': lane_cluster.FILE_LINE_CEILING,
+            'new_function_cognitive_ceiling': (
+                lane_cluster.NEW_FUNCTION_COGNITIVE_CEILING
+            ),
+        },
+        # REAL-SHAPED means the STORED shape, which has no `test_tree` key: the
+        # test-tree counts are live-only, and this fixture stands in for a
+        # committed baseline that the comparator reads.
+        'enumeration': {
+            'requested': [WORKER_RELPATH, GIT_OPS_RELPATH],
+            'resolved': [WORKER_RELPATH, GIT_OPS_RELPATH],
+            'unreadable': [],
+            'complete': True,
+        },
+        'files': {
+            WORKER_RELPATH: {
+                'lines': 21550,
+                'prose_lines': 9000,
+                'cognitive': 2133,
+                'function_local_imports': 12,
+                'reexport_names': 9,
+            },
+            GIT_OPS_RELPATH: {
+                'lines': 14721,
+                'prose_lines': 6000,
+                'cognitive': 1361,
+                'function_local_imports': 5,
+                'reexport_names': 2,
+            },
+        },
+        'functions': {_VERIFIER_LOOP: 245, f'{GIT_OPS_RELPATH}::GitOps::advance_main': 108},
+        'tests': {
+            _TEST_FILE: {
+                'patch_targets': ['run_scoped_verification', 'time'],
+                'private_reads': 300,
+            },
+        },
+    }
+
+
+def _grow_worker_size(current: dict) -> None:
+    """The real task-5342 size shape: worker.py 103 lines and 50 prose lines longer."""
+    current['files'][WORKER_RELPATH]['lines'] += 103
+    current['files'][WORKER_RELPATH]['prose_lines'] += 50
+
 
 class TestRenderBaseline:
     def test_round_trips_without_dropping_a_measure(self) -> None:
@@ -45,7 +106,7 @@ class TestRenderBaseline:
         # THE PARALLELISM PROPERTY. PRD gamma1..gamma10 run concurrently and each
         # lowers only its own group's numbers, rebasing through the merge lane.
         # One path per LINE makes those ten edits disjoint hunks; json.dumps(
-        # indent=2) would spread merge_queue.py's five measures over six lines
+        # indent=2) would spread one file's five measures over six lines
         # and put two branches' unrelated edits inside one conflicting hunk.
         report = synthetic_report()
         rendered = ratchet.render_baseline(report)
@@ -280,7 +341,7 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         target = self._seeded(tmp_path)
         ledger = tmp_path / 'raises'
         current = copy.deepcopy(_ratchet_baseline())
-        _grow_mq_size(current)
+        _grow_worker_size(current)
         current['files'][self._NEW_PATH] = blank_file_entry(lines=1400, prose_lines=600)
 
         written = ratchet.write_baseline(target, current, ledger=ledger)
@@ -553,7 +614,7 @@ class TestAuthorizedRaise:
     ) -> None:
         target, ledger = self._seeded(tmp_path)
         current = self._raised()
-        _grow_mq_size(current)
+        _grow_worker_size(current)
 
         ratchet.write_baseline(
             target, current, authorization=self._authorization(), ledger=ledger
@@ -776,56 +837,6 @@ class TestAuthorizedRaiseLedger:
 # seeded-fixture self-test run in microseconds AND lets the CLI's --check reuse
 # the identical code path this test asserts on (SPOT: one ratchet, not two).
 
-_VERIFIER_LOOP = f'{WORKER_RELPATH}::SpeculativeMergeWorker::_verifier_loop'
-_TEST_FILE = 'orchestrator/tests/test_merge_queue.py'
-
-
-def _ratchet_baseline() -> dict:
-    """A miniature but REAL-SHAPED baseline: real paths, real measured numbers."""
-    return {
-        'schema_version': 1,
-        'params': {
-            'complexipy_version': '6.2.0',
-            'cluster_paths': list(lane_cluster.CLUSTER_PATHS),
-            'file_line_ceiling': lane_cluster.FILE_LINE_CEILING,
-            'new_function_cognitive_ceiling': (
-                lane_cluster.NEW_FUNCTION_COGNITIVE_CEILING
-            ),
-        },
-        # REAL-SHAPED means the STORED shape, which has no `test_tree` key: the
-        # test-tree counts are live-only, and this fixture stands in for a
-        # committed baseline that the comparator reads.
-        'enumeration': {
-            'requested': [WORKER_RELPATH, GIT_OPS_RELPATH],
-            'resolved': [WORKER_RELPATH, GIT_OPS_RELPATH],
-            'unreadable': [],
-            'complete': True,
-        },
-        'files': {
-            WORKER_RELPATH: {
-                'lines': 21550,
-                'prose_lines': 9000,
-                'cognitive': 2133,
-                'function_local_imports': 12,
-                'reexport_names': 9,
-            },
-            GIT_OPS_RELPATH: {
-                'lines': 14721,
-                'prose_lines': 6000,
-                'cognitive': 1361,
-                'function_local_imports': 5,
-                'reexport_names': 2,
-            },
-        },
-        'functions': {_VERIFIER_LOOP: 245, f'{GIT_OPS_RELPATH}::GitOps::advance_main': 108},
-        'tests': {
-            _TEST_FILE: {
-                'patch_targets': ['run_scoped_verification', 'time'],
-                'private_reads': 300,
-            },
-        },
-    }
-
 
 def _bump_file(measure: str):
     def mutate(current: dict) -> None:
@@ -844,12 +855,6 @@ def _add_file(measure: str):
         )
 
     return mutate
-
-
-def _grow_mq_size(current: dict) -> None:
-    """The real task-5342 size shape: worker.py 103 lines and 50 prose lines longer."""
-    current['files'][WORKER_RELPATH]['lines'] += 103
-    current['files'][WORKER_RELPATH]['prose_lines'] += 50
 
 
 #: (test id, mutation, expected violation measure, expected violation key).
@@ -934,7 +939,7 @@ _SIZE_ONLY_SEEDS = [
     ('files.prose_lines', _bump_file('prose_lines')),
     ('total.lines', _add_file('lines')),
     ('total.prose_lines', _add_file('prose_lines')),
-    ('files.task_5342_shape', _grow_mq_size),
+    ('files.task_5342_shape', _grow_worker_size),
 ]
 
 
@@ -975,7 +980,7 @@ class TestCheckAgainstBaseline:
     def test_a_structural_rise_beside_a_size_rise_is_reported_alone(self) -> None:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
-        _grow_mq_size(current)
+        _grow_worker_size(current)
         current['files'][WORKER_RELPATH]['function_local_imports'] += 1
 
         violations = ratchet.check_against_baseline(current, baseline)
@@ -1033,7 +1038,7 @@ class TestCeilingsApplyOnlyToNewKeys:
             if v.measure == 'new_file_over_ceiling'
         ]
 
-    def test_grandfathered_merge_queue_is_not_a_ceiling_violation(self) -> None:
+    def test_a_grandfathered_oversized_file_is_not_a_ceiling_violation(self) -> None:
         # 21,550 lines, fourteen times the ceiling, and clean -- because the
         # ceiling applies only to paths ABSENT from the baseline. That is what
         # makes this a ratchet whose grandfathering can only ever shrink.
@@ -1111,8 +1116,8 @@ class TestCeilingsApplyOnlyToNewKeys:
 
 class TestComparatorPreconditions:
     def test_a_complexipy_version_drift_is_a_hard_failure(self) -> None:
-        # Cognitive numbers are version-dependent: the SAME merge_queue.py
-        # measures 2031 at complexipy 3.0.0, 2092 at 5.0.0 and 2133 at 6.x/7.x.
+        # Cognitive numbers are version-dependent: the SAME source file
+        # measured 2031 at complexipy 3.0.0, 2092 at 5.0.0 and 2133 at 6.x/7.x.
         # A silent version drift would rewrite every number at once and leave a
         # green ratchet comparing two incomparable measurements.
         baseline = _ratchet_baseline()
