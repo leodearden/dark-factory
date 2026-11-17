@@ -251,6 +251,40 @@ class TestCuratorRegistryLoad:
             if r.levelno == logging.WARNING
         )
 
+    async def test_relative_path_without_cwd_warns_once_across_retries(self, caplog):
+        loader = _ScriptedLoader(_not_found(Path('rel/registry.yaml')))
+        registry = _registry(loader, path='rel/registry.yaml', cwd=None, retry_seconds=0)
+
+        with caplog.at_level(logging.WARNING):
+            await registry.entries()
+            await registry.entries()
+
+        assert loader.calls == 2
+        relative_path_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and CONFIG_KEY in r.getMessage()
+        ]
+        assert len(relative_path_warnings) == 1
+
+    async def test_a_changed_configured_path_is_resolved_afresh(self, tmp_path):
+        configured = ['first.yaml']
+        loader = _ScriptedLoader(_not_found(tmp_path / 'first.yaml'), ['entry'])
+        registry = CuratorRegistry(
+            label=LABEL,
+            config_key=CONFIG_KEY,
+            loader=loader,
+            configured_path=lambda: configured[0],
+            cwd=tmp_path,
+            retry_seconds=0,
+            clock=_Clock(),
+        )
+
+        await registry.entries()
+        configured[0] = 'second.yaml'
+
+        assert await registry.entries() == ['entry']
+        assert loader.paths == [tmp_path / 'first.yaml', tmp_path / 'second.yaml']
+
 
 class TestRegistryHealth:
     @pytest.mark.parametrize(
@@ -261,6 +295,18 @@ class TestRegistryHealth:
             (dict(state=RegistryState.FAILED, error='boom'), 'failed', 'failures=0'),
             (dict(state=RegistryState.NOT_LOADED, error='boom'), 'not_loaded', "error='boom'"),
             (dict(state=RegistryState.UNCONFIGURED, entry_count=3), 'unconfigured', 'entry_count=3'),
+            (dict(state=RegistryState.NOT_LOADED, failures=2), 'not_loaded', 'failures=2'),
+            (dict(state=RegistryState.UNCONFIGURED, failures=1), 'unconfigured', 'failures=1'),
+            (
+                dict(state=RegistryState.LOADED, entry_count=0, failures=-1),
+                'loaded',
+                'failures=-1',
+            ),
+            (
+                dict(state=RegistryState.FAILED, error='boom', failures=1, entry_count=2),
+                'failed',
+                'entry_count=2',
+            ),
         ],
         ids=[
             'loaded-without-count',
@@ -268,6 +314,10 @@ class TestRegistryHealth:
             'failed-with-zero-failures',
             'not-loaded-with-error',
             'unconfigured-with-count',
+            'not-loaded-with-failures',
+            'unconfigured-with-failures',
+            'loaded-with-negative-failures',
+            'failed-with-count',
         ],
     )
     def test_state_field_invariant_is_enforced(self, fields, state_value, offending):

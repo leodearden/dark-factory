@@ -27,14 +27,6 @@ class RegistryState(StrEnum):
     FAILED = 'failed'
 
 
-_STATE_RULE: dict[RegistryState, str] = {
-    RegistryState.UNCONFIGURED: 'needs entry_count and error both None',
-    RegistryState.NOT_LOADED: 'needs entry_count and error both None',
-    RegistryState.LOADED: 'needs an entry_count and error None',
-    RegistryState.FAILED: 'needs an error and failures >= 1',
-}
-
-
 @dataclass(frozen=True)
 class RegistryHealth:
     """One guard registry's load state, as reported to operators."""
@@ -48,19 +40,13 @@ class RegistryHealth:
     failures: int = 0
 
     def __post_init__(self) -> None:
-        if not self._fields_fit_state():
+        fits, rule = _STATE_RULES[self.state]
+        if not fits(self):
             raise ValueError(
-                f'RegistryHealth {self.label!r}: state={self.state.value} '
-                f'{_STATE_RULE[self.state]}, got entry_count={self.entry_count!r}, '
-                f'error={self.error!r}, failures={self.failures!r}'
+                f'RegistryHealth {self.label!r}: state={self.state.value} {rule}, '
+                f'got entry_count={self.entry_count!r}, error={self.error!r}, '
+                f'failures={self.failures!r}'
             )
-
-    def _fields_fit_state(self) -> bool:
-        if self.state is RegistryState.LOADED:
-            return self.entry_count is not None and self.error is None
-        if self.state is RegistryState.FAILED:
-            return self.error is not None and self.failures >= 1
-        return self.entry_count is None and self.error is None
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -72,6 +58,26 @@ class RegistryHealth:
             'error': self.error,
             'failures': self.failures,
         }
+
+
+def _before_any_load(h: RegistryHealth) -> bool:
+    return h.entry_count is None and h.error is None and h.failures == 0
+
+
+_BEFORE_ANY_LOAD_RULE = 'needs entry_count None, error None and failures 0'
+
+_STATE_RULES: dict[RegistryState, tuple[Callable[[RegistryHealth], bool], str]] = {
+    RegistryState.UNCONFIGURED: (_before_any_load, _BEFORE_ANY_LOAD_RULE),
+    RegistryState.NOT_LOADED: (_before_any_load, _BEFORE_ANY_LOAD_RULE),
+    RegistryState.LOADED: (
+        lambda h: h.entry_count is not None and h.error is None and h.failures >= 0,
+        'needs an entry_count, error None and failures >= 0',
+    ),
+    RegistryState.FAILED: (
+        lambda h: h.entry_count is None and h.error is not None and h.failures >= 1,
+        'needs entry_count None, an error and failures >= 1',
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -116,6 +122,7 @@ class CuratorRegistry(Generic[E]):
         self._retry_seconds = retry_seconds
         self._clock = clock
         self._outcome: _Outcome[E] = _Outcome()
+        self._resolved: tuple[str, Path] | None = None
         self._lock = asyncio.Lock()
 
     async def entries(self) -> list[E] | None:
@@ -165,7 +172,7 @@ class CuratorRegistry(Generic[E]):
                 failures=previous.failures + 1, failed_at=self._clock(),
             )
             logger.warning(
-                'task_curator: %s registry load failed for %s, failing open '
+                'curator_registry: %s registry load failed for %s, failing open '
                 '(guard disabled) until a retry in %.0fs succeeds: %s',
                 self._label, path, self._retry_seconds, error,
             )
@@ -175,13 +182,18 @@ class CuratorRegistry(Generic[E]):
         self._outcome = _Outcome(entries=loaded, path=path, failures=previous.failures)
 
     def _resolve(self, cfg_path: str) -> Path:
+        if self._resolved is None or self._resolved[0] != cfg_path:
+            self._resolved = (cfg_path, self._resolve_uncached(cfg_path))
+        return self._resolved[1]
+
+    def _resolve_uncached(self, cfg_path: str) -> Path:
         raw_path = Path(cfg_path)
         if raw_path.is_absolute():
             return raw_path
         if self._cwd is not None:
             return self._cwd / raw_path
         logger.warning(
-            'task_curator: %s %r is relative but TaskCurator was constructed '
+            'curator_registry: %s %r is relative but TaskCurator was constructed '
             'without cwd — resolving against process CWD which may be '
             'incorrect; use an absolute path in CuratorConfig',
             self._config_key, cfg_path,

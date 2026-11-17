@@ -84,7 +84,7 @@ from fused_memory.backends.sdk_client_lifecycle import close_wrapped_sdk_clients
 from fused_memory.backends.task_backend_errors import TaskNotFoundError
 from fused_memory.backends.task_backend_types import MetadataLookupRow
 from fused_memory.mcp_tools.scheduler_state import effective_lock_depth
-from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+from fused_memory.middleware.cancelled_premise_blocklist import BlocklistEntry, load_blocklist
 from fused_memory.middleware.cancelled_premise_blocklist import (
     match_candidate as match_blocklisted_premise,
 )
@@ -120,7 +120,10 @@ from fused_memory.middleware.curator_types import (
     render_declared_scope,
 )
 from fused_memory.middleware.followup_hold import is_holder
-from fused_memory.middleware.operational_ask_registry import load_operational_registry
+from fused_memory.middleware.operational_ask_registry import (
+    OperationalAskEntry,
+    load_operational_registry,
+)
 from fused_memory.middleware.operational_ask_registry import (
     match_candidate as match_operational_ask,
 )
@@ -131,6 +134,7 @@ from fused_memory.middleware.recon_claim_verification_guard import (
     verify_attributed_claims,
 )
 from fused_memory.middleware.recon_code_fix_premise_guard import (
+    PremiseEntry,
     load_premise_registry,
     verify_premise_refuted,
 )
@@ -151,6 +155,8 @@ if TYPE_CHECKING:
     from fused_memory.middleware.curator_escalator import CuratorEscalator
 
 logger = logging.getLogger(__name__)
+
+_RegistryEntry = TypeVar('_RegistryEntry')
 
 
 _STATUS_RANK = {
@@ -811,33 +817,14 @@ class TaskCurator:
         # Catches the common "two triages race to create identical tasks"
         # case cheaply — skips embedding + LLM entirely on the second call.
         self._recent_creates: dict[str, dict[str, tuple[str, float]]] = {}
-        registry_retry_seconds = config.curator.registry_load_retry_seconds
-        self._blocklist = CuratorRegistry(
-            label='blocklist',
-            config_key='cancelled_premise_blocklist_path',
-            loader=load_blocklist,
-            configured_path=lambda: self._config.curator.cancelled_premise_blocklist_path,
-            cwd=cwd,
-            retry_seconds=registry_retry_seconds,
-            clock=time.monotonic,
+        self._blocklist = self._guard_registry(
+            'blocklist', 'cancelled_premise_blocklist_path', load_blocklist,
         )
-        self._premise_registry = CuratorRegistry(
-            label='recon-premise',
-            config_key='recon_code_fix_premise_registry_path',
-            loader=load_premise_registry,
-            configured_path=lambda: self._config.curator.recon_code_fix_premise_registry_path,
-            cwd=cwd,
-            retry_seconds=registry_retry_seconds,
-            clock=time.monotonic,
+        self._premise_registry = self._guard_registry(
+            'recon-premise', 'recon_code_fix_premise_registry_path', load_premise_registry,
         )
-        self._operational_registry = CuratorRegistry(
-            label='operational-ask',
-            config_key='operational_ask_registry_path',
-            loader=load_operational_registry,
-            configured_path=lambda: self._config.curator.operational_ask_registry_path,
-            cwd=cwd,
-            retry_seconds=registry_retry_seconds,
-            clock=time.monotonic,
+        self._operational_registry = self._guard_registry(
+            'operational-ask', 'operational_ask_registry_path', load_operational_registry,
         )
         # Consecutive-ZOT circuit breaker (task 1743): counts only ZOTs; a
         # non-ZOT failure neither increments nor resets it.
@@ -1043,7 +1030,28 @@ class TaskCurator:
         bucket = self._recent_creates.setdefault(project_id, {})
         bucket[key] = (task_id, time.monotonic())
 
-    def _registries(self) -> tuple[CuratorRegistry[Any], ...]:
+    def _guard_registry(
+        self, label: str, config_key: str, loader: Callable[[Path], list[_RegistryEntry]],
+    ) -> CuratorRegistry[_RegistryEntry]:
+        """A guard registry whose path is the CuratorConfig field *config_key*,
+        read at each call; that one key is also the field health reports."""
+        if config_key not in type(self._config.curator).model_fields:
+            raise ValueError(f'CuratorConfig has no registry path field {config_key!r}')
+        return CuratorRegistry(
+            label=label,
+            config_key=config_key,
+            loader=loader,
+            configured_path=lambda: getattr(self._config.curator, config_key),
+            cwd=self._cwd,
+            retry_seconds=self._config.curator.registry_load_retry_seconds,
+            clock=time.monotonic,
+        )
+
+    def _registries(self) -> tuple[
+        CuratorRegistry[BlocklistEntry],
+        CuratorRegistry[PremiseEntry],
+        CuratorRegistry[OperationalAskEntry],
+    ]:
         return (self._blocklist, self._premise_registry, self._operational_registry)
 
     def registry_health(self) -> tuple[RegistryHealth, ...]:
