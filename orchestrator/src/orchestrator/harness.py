@@ -6817,14 +6817,16 @@ class Harness:
             # warm-lane script judges a landed tip by its subject alone, so it
             # can call a genuinely merged branch degenerate (reify 6828,
             # uncited `amend:` tips). branch_tip_landed is the veto that still
-            # marks such a branch done; see its docstring.
+            # marks such a branch done; see its docstring. The landing it
+            # consults is BranchState.landing_sha, never a branch tip
+            # (orchestrator/src/orchestrator/task_ground_truth.py::BranchState.landing_sha).
             if (
                 await self._branch_is_degenerate(branch, metadata)
                 or (
                     await self.git_ops.warm_lane_ref_is_degenerate(tid)
                     and not await branch_tip_landed(
                         self.git_ops, branch, branch_tip_sha,
-                        landing_sha=report.branch_state.sha,
+                        landing_sha=report.branch_state.landing_sha,
                     )
                 )
             ):
