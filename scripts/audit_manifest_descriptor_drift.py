@@ -116,6 +116,7 @@ from _task_db_scan import (
     run_audit_cli,
     tasks_db_path,
 )
+from dashboard.data.prd_attribution import coalesce_prd
 from shared.tasks_db_readonly import connect_ro
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
@@ -244,15 +245,17 @@ class TaskStoreScan(NamedTuple):
     ``manifest_bindings`` feeds the label-binding direction: every task the
     stamper would admit, sorted by numeric task id.
 
-    ``prd_paths`` (each task's non-empty string ``prd_path``) feeds the
-    signal-binding check, taken in the same scan for the same no-straddle
-    reason.
+    ``task_prds`` feeds the signal-binding check, taken in the same scan for
+    the same no-straddle reason. It holds each task's PRD field as
+    ``dashboard/src/dashboard/data/prd_attribution.py::coalesce_prd`` reads it
+    (``prd_path``, else ``prd``, else ``prd_ref``, with any ``#`` or ``§``
+    suffix stripped); a task naming no PRD has no entry.
     """
 
     row_ids: frozenset[int]
     delivered_checks: dict[int, dict[str, dict]]
     manifest_bindings: tuple[ManifestBinding, ...]
-    prd_paths: dict[int, str]
+    task_prds: dict[int, str]
 
 
 def _delivered_check_entries(metadata: dict) -> dict[str, dict]:
@@ -357,7 +360,7 @@ def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
     row_ids: set[int] = set()
     delivered_checks: dict[int, dict[str, dict]] = {}
     bindings: list[ManifestBinding] = []
-    prd_paths: dict[int, str] = {}
+    task_prds: dict[int, str] = {}
     conn = connect_ro(tasks_db_path)
     try:
         cursor = conn.execute("SELECT id, status, metadata FROM tasks WHERE tag = 'master'")
@@ -374,9 +377,9 @@ def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
             binding = _manifest_binding(tid, status, decoded)
             if binding is not None:
                 bindings.append(binding)
-            prd_path = decoded.get("prd_path")
-            if isinstance(prd_path, str) and prd_path:
-                prd_paths[tid] = prd_path
+            task_prd = coalesce_prd(decoded)
+            if task_prd is not None:
+                task_prds[tid] = task_prd
     finally:
         conn.close()
     bindings.sort(key=lambda binding: binding.task_id)
@@ -384,7 +387,7 @@ def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
         row_ids=frozenset(row_ids),
         delivered_checks=delivered_checks,
         manifest_bindings=tuple(bindings),
-        prd_paths=prd_paths,
+        task_prds=task_prds,
     )
 
 
@@ -615,12 +618,15 @@ class UnboundLabel(NamedTuple):
 
 class StaleSignalBinding(NamedTuple):
     """A signal leaf whose locally bound task is missing from this store or
-    carries another ``prd_path`` (plans/dashboard-prd-lanes-prd.md §5.2).
+    names another PRD (plans/dashboard-prd-lanes-prd.md §5.2).
 
     ``reason`` says which: ``'task_missing'`` (no row for ``task_id`` in this
-    store, so ``task_prd`` is None) or ``'prd_mismatch'`` (the task's own
-    ``prd_path``, None when it has none, is not the sidecar's ``prd``).
-    ``manifest`` is repo-relative. ``_asdict()`` feeds the JSON writer.
+    store, so ``task_prd`` is None) or ``'prd_mismatch'`` (the task's own PRD
+    field is not the sidecar's ``prd``). ``task_prd`` is that field as
+    ``dashboard/src/dashboard/data/prd_attribution.py::coalesce_prd`` reads it
+    (``prd_path``, else ``prd``, else ``prd_ref``, with any ``#`` or ``§``
+    suffix stripped), or None when the task names none. ``manifest`` is
+    repo-relative. ``_asdict()`` feeds the JSON writer.
     """
 
     manifest: str
@@ -649,18 +655,15 @@ def _stale_signal_bindings(
     scan: TaskStoreScan,
 ) -> list[StaleSignalBinding]:
     """Every one of *bound_leaves* whose task is missing from *scan* or whose
-    ``prd_path`` is not *sidecar_prd*, in the order given.
-
-    The task's PRD is its raw ``prd_path`` compared by exact string: ``prd``
-    and ``prd_ref`` are not read, and no ``#anchor`` or ``§section`` suffix is
-    stripped.
+    PRD field (``TaskStoreScan.task_prds``) is not *sidecar_prd*, in the order
+    given, compared by exact string.
     """
     rows: list[StaleSignalBinding] = []
     for label, task_id in bound_leaves:
         if task_id not in scan.row_ids:
             reason, task_prd = "task_missing", None
         else:
-            task_prd = scan.prd_paths.get(task_id)
+            task_prd = scan.task_prds.get(task_id)
             if task_prd == sidecar_prd:
                 continue
             reason = "prd_mismatch"
