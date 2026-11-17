@@ -302,7 +302,7 @@ filing.* The ledger never marks a task done, never blocks one, never reprioritis
 task's lifecycle belongs to the orchestrator; the ledger only observes it.
 
 **"Removing the test from the ledger" is the ledger's act, not the agent's.** The de-flake task's
-text (`flake_ledger.py::RESPONSIBILITY_REMOVE_FROM_LEDGER`) tells the agent the ledger closes the cycle
+text (`flake_ledger.py::RESPONSIBILITY_KEEP_NODE_ID_STABLE`) tells the agent the ledger closes the cycle
 itself once it observes the task `done`. The agent cannot do it: the ledger is the main checkout's
 `data/orchestrator/runs.db` (`flake_ledger.py::ledger_db_path`), outside the task worktree the agent
 works in, and the agent's own task is not `done` while it runs. The close is `resolve_debt`'s, on a
