@@ -73,7 +73,7 @@ census:
       - -p
       - "no:cacheprovider"
       - --timeout=300
-      - scripts/tests/test_codebook.py
+      - scripts/tests/test_live_codebook.py
       - scripts/tests/test_legibility_coder.py
     timeout_secs: 900
 models:
