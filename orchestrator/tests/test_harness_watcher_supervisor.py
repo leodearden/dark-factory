@@ -3220,25 +3220,29 @@ class TestWatcherAllowedTools:
         )
 
     def test_escalation_record_and_merge_state_reads_are_granted(self) -> None:
-        """The skill prescribes these reads: the single-record read and the
-        merge_status.failure_diagnostic RCA read (task 3176)."""
+        """SKILL.md's Read-only investigation toolset lists these reads; its
+        single-record read calls get_escalation and its task_failure handler
+        reads merge_status.failure_diagnostic (task 3176)."""
         for tool in _RECORD_AND_MERGE_STATE_READS:
             assert tool in _WATCHER_ALLOWED_TOOLS, (
-                f'{tool} must be in _WATCHER_ALLOWED_TOOLS: SKILL.md prescribes '
-                f'it (task 3176); current list: {_WATCHER_ALLOWED_TOOLS}'
+                f'{tool} must be in _WATCHER_ALLOWED_TOOLS: SKILL.md\'s Read-only '
+                f'investigation toolset lists it (task 3176); current list: '
+                f'{_WATCHER_ALLOWED_TOOLS}'
             )
             assert tool not in _WATCHER_DISALLOWED_TOOLS, (
-                f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS — SKILL.md '
-                f'prescribes it (task 3176); current list: {_WATCHER_DISALLOWED_TOOLS}'
+                f'{tool} must not be in _WATCHER_DISALLOWED_TOOLS: SKILL.md\'s '
+                f'Read-only investigation toolset lists it (task 3176); current '
+                f'list: {_WATCHER_DISALLOWED_TOOLS}'
             )
 
     def test_declare_pin_is_not_granted(self) -> None:
-        """The rotation promotes a candidate pin for a human to declare
-        (SKILL.md "Declared pins"); task 3176 decided it is not a declarer."""
-        assert 'mcp__escalation__declare_pin' not in _WATCHER_ALLOWED_TOOLS, (
-            'mcp__escalation__declare_pin must not be granted to the rotation: '
-            'a declaration has no un-declare verb, so the rotation promotes a '
-            'candidate pin to L2 for a human to declare (task 3176); '
+        """Wildcard-aware: an `mcp__escalation__*` grant would cover it too."""
+        assert not tool_is_granted(
+            'mcp__escalation__declare_pin', set(_WATCHER_ALLOWED_TOOLS),
+        ), (
+            'mcp__escalation__declare_pin must not be granted to the rotation, '
+            'directly or by an mcp__escalation__* wildcard: see '
+            'skills/escalation-watcher-auto/SKILL.md "Declared pins" (task 3176); '
             f'current list: {_WATCHER_ALLOWED_TOOLS}'
         )
 

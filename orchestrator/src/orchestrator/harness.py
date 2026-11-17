@@ -668,10 +668,10 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     # pending L1/L2 it assessed (task 2555) so future rotations can skip
     # re-deriving the same disposition every rotation.
     'mcp__escalation__stamp_triage',
-    # Read-only escalation-record and merge-state reads the skill prescribes
-    # (task 3176); the skill's merge-queue constraint forbids mutation only.
-    # declare_pin is deliberately absent: the rotation promotes a candidate pin
-    # for a human to declare (skills/escalation-watcher-auto/SKILL.md "Declared pins").
+    # Read-only escalation-record and merge-state reads the skill's Read-only
+    # investigation toolset lists (task 3176); its merge-queue constraint
+    # forbids mutation only. declare_pin is deliberately absent:
+    # skills/escalation-watcher-auto/SKILL.md "Declared pins".
     'mcp__escalation__get_escalation',
     'mcp__escalation__get_task_escalation_history',
     'mcp__escalation__merge_status',
