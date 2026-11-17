@@ -100,7 +100,7 @@ SCRIPT_COVERAGE = {
     'provision-warm-lane-fs.sh': 'test_provision_warm_lane_fs.sh',
 }
 
-#: Minimum ``Results: N passed`` count each ported suite must report.  The floor
+#: Minimum ``Results: N passed`` count each bash suite must report.  The floor
 #: is the count guaranteed on ANY host that satisfies ``REQUIRED_HOST_TOOLS``,
 #: i.e. the measured count minus the asserts in blocks whose skip guards are
 #: enumerated below.  Exit status alone cannot see a block that skipped: reify's
@@ -418,10 +418,10 @@ def test_every_invocable_script_has_ported_coverage() -> None:
     )
     unported = {
         script: test for script, test in SCRIPT_COVERAGE.items()
-        if test not in BASH_SUITES
+        if test not in PORTED_TESTS
     }
     assert not unported, (
-        f'SCRIPT_COVERAGE names bash tests that are not in BASH_SUITES: {unported}'
+        f'SCRIPT_COVERAGE names bash tests that are not in PORTED_TESTS: {unported}'
     )
 
 
