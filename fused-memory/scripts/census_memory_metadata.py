@@ -103,6 +103,7 @@ from fused_memory.backends.mem0_client import (
     ScrollPageBudgetExhausted,
 )
 from fused_memory.eval.topic_registry import TopicRegistry, load_topic_registry
+from fused_memory.memory_metadata import KIND_REGISTRY
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
 # THE shared slug predicate and fold, imported and called -- never
@@ -836,6 +837,43 @@ def _records_by_folded_slug(census: CategoryCensus) -> Counter[str]:
         if slug is not None:
             folded[slug] += count
     return folded
+
+
+def build_kind_registry_drift(
+    kind_entries: list[dict[str, Any]] | None,
+    registry: frozenset[str] = KIND_REGISTRY,
+) -> dict[str, Any]:
+    """Score the live ``kind`` population against the frozen registry.
+
+    A DELTA on the nightly cadence, never a gate: PRD §10 open question 1
+    ruled option (b), so ``kind`` never rejects a write. It replaced a test
+    tripwire over the live artifact, which a nightly-regenerated artifact made
+    impossible to keep green. Why the baseline is frozen and append-only:
+    ``fused_memory.memory_metadata.KIND_REGISTRY``.
+    """
+    entries = kind_entries or []
+    unregistered = [
+        {'value': entry.get('value'), 'count': entry.get('count') or 0}
+        for entry in entries
+        if not _is_registered(entry.get('value'), registry)
+    ]
+    measured_str = {entry.get('value') for entry in entries if isinstance(entry.get('value'), str)}
+    absent = sorted(registry - measured_str)
+    return {
+        'registry_total': len(registry),
+        'measured_distinct': len(entries),
+        'measured_records': sum(entry.get('count') or 0 for entry in entries),
+        'registered_distinct': len(entries) - len(unregistered),
+        'unregistered_distinct': len(unregistered),
+        'unregistered_records': sum(row['count'] for row in unregistered),
+        'absent_from_corpus_distinct': len(absent),
+        'unregistered': unregistered,
+        'absent_from_corpus': absent,
+    }
+
+
+def _is_registered(value: Any, registry: frozenset[str]) -> bool:
+    return isinstance(value, str) and value in registry
 
 
 def read_canonical_uniqueness_enforced(config: Any | None = None) -> bool | None:
