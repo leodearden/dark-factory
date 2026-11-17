@@ -822,9 +822,9 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (r'\bev\s*\.\s*metrics\b',),
     ),
     (
-        'per-metric escalation guard',
-        r'm\.escalation\s*&&',
-        (r'm\s*\.\s*escalation\s*&&\s*\(',),
+        'per-verdict escalation guard',
+        r'\bverdict\.escalation\s*&&',
+        (r'\bverdict\s*\.\s*escalation\s*&&\s*\(',),
     ),
     (
         # The producer end of the escalation-link contract, and the exact site
@@ -1827,13 +1827,15 @@ def test_verdict_badges_driven_by_persisted_verdict(
     #      read as coverage.
 
 
-# The six pure helpers task 3481 moved out of the .jsx into memory_evals_fmt.js.
+# The pure helpers the .jsx consumes from memory_evals_fmt.js: the six task 3481
+# moved out of it, plus splitVerdicts (task 10137).
 _FMT_HELPERS = (
     'chartForKind',
     'trendGaps',
     'dash',
     'ageText',
     'verdictBadge',
+    'splitVerdicts',
     'unmatchedReasonText',
 )
 
@@ -1842,7 +1844,7 @@ def test_pure_helpers_are_consumed_from_the_fmt_module(
     tab_memory_evals_jsx_code: str,
     memory_evals_fmt_js_code: str,
 ) -> None:
-    """The .jsx must CONSUME the six pure helpers, never redefine them.
+    """The .jsx must CONSUME the pure fmt helpers, never redefine them.
 
     Task 3481 moved them into a plain-JS classic script so `node --test` can
     execute their branching (dashboard/tests/js/memory_evals_fmt.test.mjs)
@@ -1853,7 +1855,7 @@ def test_pure_helpers_are_consumed_from_the_fmt_module(
     """
     code = tab_memory_evals_jsx_code
 
-    # (1) One module-top-level destructure naming all six.
+    # (1) One module-top-level destructure naming all of them.
     destructure = re.search(
         r'const\s*\{([^}]*)\}\s*=\s*window\.DF_MEMORY_EVALS_FMT\s*;', code
     )
@@ -1871,7 +1873,7 @@ def test_pure_helpers_are_consumed_from_the_fmt_module(
             'is a ReferenceError at render time.'
         )
 
-    # (2) None of the six may be REDEFINED here.
+    # (2) None of them may be REDEFINED here.
     for helper in _FMT_HELPERS:
         assert not re.search(rf'\bfunction\s+{helper}\s*\(', code), (
             f'tab_memory_evals.jsx still defines `function {helper}(...)`. It '
@@ -2507,10 +2509,10 @@ def test_escalation_links_and_storm_aggregate_banner(
     """
     code = tab_memory_evals_jsx_code
 
-    # (a) a metric row carrying an escalation renders a link, guarded so a null
-    #     projection renders no dead control.
+    # (a) a verdict entry carrying an escalation renders a link, guarded so a
+    #     null projection renders no dead control.
     assert 'data-testid="memory-eval-escalation-link"' in code, (
-        'a metric row carrying `m.escalation` must render a '
+        'a verdict entry carrying `verdict.escalation` must render a '
         'data-testid="memory-eval-escalation-link" control.'
     )
     assert re.search(r'\{\s*escalation\.id\b', code), (
@@ -2523,10 +2525,10 @@ def test_escalation_links_and_storm_aggregate_banner(
         'the JSX expression position, not a bare name grep.'
     )
     assert re.search(
-        _presence_pattern('per-metric escalation guard', code), code, re.MULTILINE
+        _presence_pattern('per-verdict escalation guard', code), code, re.MULTILINE
     ), (
-        'the escalation control must be guarded by `m.escalation &&` so a null '
-        'projection renders nothing rather than a dead control.'
+        'the escalation control must be guarded by `verdict.escalation &&` so a '
+        'null projection renders nothing rather than a dead control.'
     )
 
     # (b) built from `id` only — the projection has no `url` field.
