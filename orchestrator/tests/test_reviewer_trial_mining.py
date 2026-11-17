@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _eval_refusal import REFUSAL_COST_USD, answered, refused_agent_result
 from _reviewer_trial_mining_fixtures import (
     build_synthetic_runs_db,
     make_git_repo_with_merge,
@@ -308,110 +309,111 @@ class TestAssignSplit:
         assert abs(counts['test'] / n - 0.7) < 0.05
 
 
-def _make_frontier_result(
-    cost_usd: float = 0.15,
-    structured: dict | None = None,
-    output: str = '',
-) -> AgentResult:
-    """Build a real AgentResult for invoke_agent in propose_labels_frontier.
+def _proposed_issue(location: str = 'src/foo.py:10') -> dict[str, str]:
+    return {
+        'location': location,
+        'category': 'off_by_one',
+        'severity': 'blocking',
+        'description': 'Loop bound is off by one.',
+        'mutation_type': 'logic',
+    }
 
-    Mirrors _make_matcher_result in test_reviewer_trial_scorer.py — uses the
-    actual AgentResult dataclass so field-shape drift is caught at test time.
-    """
-    return AgentResult(
-        success=True,
-        output=output,
-        cost_usd=cost_usd,
-        structured_output=structured,
-    )
+
+async def _propose(
+    result: AgentResult, **kwargs: str,
+) -> tuple[Scored[list[GroundTruthIssue]] | Unmeasured, AsyncMock]:
+    with patch('orchestrator.evals.reviewer_trial.mining.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+        mock_invoke.return_value = result
+        outcome = await propose_labels_frontier('diff text', model='opus', description='d', **kwargs)
+    return outcome, mock_invoke
 
 
 class TestProposeLabelsFrontier:
-    """propose_labels_frontier maps a frontier model's structured output into
-    GroundTruthIssue objects tagged with adjudication provenance (an id
-    namespaced 'frontier_*' rather than a hand-authored corpus id), and never
-    raises on unparseable output."""
+    """propose_labels_frontier maps a frontier model's answer into GroundTruthIssue
+    objects tagged with adjudication provenance (an id namespaced 'frontier_*'
+    rather than a hand-authored corpus id). A refused call, or an answer with no
+    usable issues list, is Unmeasured with its spend, never an empty label set."""
 
     @pytest.mark.asyncio
     async def test_maps_structured_output_to_ground_truth_issues(self) -> None:
-        fake_result = _make_frontier_result(
-            cost_usd=0.15,
-            structured={
-                'issues': [
-                    {
-                        'location': 'src/foo.py:10',
-                        'category': 'off_by_one',
-                        'severity': 'blocking',
-                        'description': 'Loop bound is off by one.',
-                        'mutation_type': 'logic',
-                    },
-                ],
-            },
-        )
+        outcome, _ = await _propose(answered({'issues': [_proposed_issue()]}, cost_usd=0.15))
 
-        with patch('orchestrator.evals.reviewer_trial.mining.invoke_agent', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = fake_result
-            issues, cost = await propose_labels_frontier(
-                'diff text', model='opus', description='a mined diff',
-            )
-
-        assert cost == pytest.approx(0.15)
-        assert len(issues) == 1
-        issue = issues[0]
+        assert isinstance(outcome, Scored)
+        assert outcome.cost_usd == pytest.approx(0.15)
+        [issue] = outcome.value
         assert isinstance(issue, GroundTruthIssue)
         assert issue.location == 'src/foo.py:10'
         assert issue.category == 'off_by_one'
         assert issue.severity == 'blocking'
         assert issue.description == 'Loop bound is off by one.'
         assert issue.mutation_type == 'logic'
-        # id is synthesized (never hallucinated by the model) and tagged so
-        # a frontier-proposed label is distinguishable from a hand-authored one.
         assert issue.id.startswith('frontier_')
 
     @pytest.mark.asyncio
     async def test_maps_multiple_issues_with_distinct_ids(self) -> None:
-        fake_result = _make_frontier_result(structured={
-            'issues': [
-                {
-                    'location': 'a.py:1', 'category': 'bug', 'severity': 'blocking',
-                    'description': 'First.', 'mutation_type': 'logic',
-                },
-                {
-                    'location': 'b.py:2', 'category': 'style', 'severity': 'suggestion',
-                    'description': 'Second.', 'mutation_type': 'style',
-                },
-            ],
-        })
+        outcome, _ = await _propose(answered({'issues': [_proposed_issue('a.py:1'), _proposed_issue('b.py:2')]}))
 
-        with patch('orchestrator.evals.reviewer_trial.mining.invoke_agent', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = fake_result
-            issues, _cost = await propose_labels_frontier('diff text', model='opus', description='d')
-
-        assert len(issues) == 2
-        assert len({i.id for i in issues}) == 2  # ids are distinct
+        assert isinstance(outcome, Scored)
+        assert len(outcome.value) == 2
+        assert len({i.id for i in outcome.value}) == 2
 
     @pytest.mark.asyncio
-    async def test_returns_empty_list_on_unparseable_output_without_raising(self) -> None:
-        fake_result = _make_frontier_result(cost_usd=0.05, structured=None, output='not json at all')
+    async def test_an_empty_issues_list_is_a_measured_clean_diff(self) -> None:
+        outcome, _ = await _propose(answered({'issues': []}, cost_usd=0.1))
 
-        with patch('orchestrator.evals.reviewer_trial.mining.invoke_agent', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = fake_result
-            issues, cost = await propose_labels_frontier('diff text', model='opus', description='d')
-
-        assert issues == []
-        # Cost is still reported — the tokens were billed regardless (mirrors
-        # match_issues' unparseable-output-still-reports-cost behaviour).
-        assert cost == pytest.approx(0.05)
+        assert isinstance(outcome, Scored)
+        assert outcome.value == []
+        assert outcome.cost_usd == pytest.approx(0.1)
 
     @pytest.mark.asyncio
-    async def test_returns_empty_list_when_issues_key_missing(self) -> None:
-        fake_result = _make_frontier_result(structured={'not_issues': []})
+    async def test_unparseable_output_is_unmeasured_with_its_cost(self) -> None:
+        unparseable = AgentResult(success=True, output='not json at all', cost_usd=0.05, structured_output=None)
 
-        with patch('orchestrator.evals.reviewer_trial.mining.invoke_agent', new_callable=AsyncMock) as mock_invoke:
-            mock_invoke.return_value = fake_result
-            issues, _cost = await propose_labels_frontier('diff text', model='opus', description='d')
+        outcome, _ = await _propose(unparseable)
 
-        assert issues == []
+        assert isinstance(outcome, Unmeasured)
+        assert (outcome.stage, outcome.cause) == (MeasurementStage.LABEL_PROPOSER, UnmeasuredCause.UNPARSEABLE)
+        assert outcome.cost_usd == pytest.approx(0.05)
+
+    @pytest.mark.asyncio
+    async def test_an_answer_without_an_issues_list_is_unmeasured(self) -> None:
+        outcome, _ = await _propose(answered({'not_issues': []}))
+
+        assert isinstance(outcome, Unmeasured)
+        assert outcome.cause is UnmeasuredCause.UNPARSEABLE
+
+    @pytest.mark.asyncio
+    async def test_a_refused_call_is_unmeasured_not_clean(self) -> None:
+        outcome, _ = await _propose(refused_agent_result())
+
+        assert isinstance(outcome, Unmeasured)
+        assert (outcome.stage, outcome.cause) == (MeasurementStage.LABEL_PROPOSER, UnmeasuredCause.CAP_HIT)
+        assert outcome.cost_usd == pytest.approx(REFUSAL_COST_USD)
+
+    @pytest.mark.asyncio
+    async def test_issues_with_none_well_formed_is_unmeasured(self) -> None:
+        outcome, _ = await _propose(answered({'issues': [{'location': 'a.py:1'}]}))
+
+        assert isinstance(outcome, Unmeasured)
+        assert outcome.cause is UnmeasuredCause.UNPARSEABLE
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_issue_beside_good_ones_is_skipped(self) -> None:
+        outcome, _ = await _propose(answered({'issues': [_proposed_issue(), {'location': 'x'}]}))
+
+        assert isinstance(outcome, Scored)
+        [issue] = outcome.value
+        assert issue.location == 'src/foo.py:10'
+
+    @pytest.mark.asyncio
+    async def test_the_call_files_as_the_label_proposer_and_forwards_the_oauth_token(self) -> None:
+        _, mock_invoke = await _propose(answered({'issues': []}), oauth_token='tok-x')
+
+        kwargs = mock_invoke.call_args.kwargs
+        assert kwargs['spawn_env'] == {
+            'CLAUDE_SPAWN_ROLE': 'eval_label_proposer', 'CLAUDE_SPAWN_PROJECT': 'dark_factory',
+        }
+        assert kwargs['oauth_token'] == 'tok-x'
 
 
 class TestAuditCorpus:
