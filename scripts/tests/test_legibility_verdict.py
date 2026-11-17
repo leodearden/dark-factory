@@ -14,9 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-import codebook
 import pytest
-from legibility import verdict
+from legibility import codebook, verdict
 from shared.whole_tree_guard_family import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
